@@ -1,0 +1,162 @@
+# ===================================================================
+# TSViT 完整配置文件 - 所有参数统一管理
+# ===================================================================
+
+model:
+  name: tsvit
+  module: src.models.transformer.tsvit.tsvit.TSViT
+
+  # ===== 数据维度 =====
+  T: null                             # 时间序列长度 (默认: 自动检测)
+  D: null                             # 特征维度 (默认: null, 自动检测)
+  lead: 10                            # 预测领先期 (默认: 10)
+
+  # ===== Patch 嵌入 =====
+  P: 10                                # patch大小 (与实验配置保持一致)
+  S: 10                                # patch步长 (与实验配置保持一致)
+  pre_keep_len: 10                    # 序列末尾（最近）的原始时间步数（不下采样），0 表示关闭
+  patch_mode: flatten                 # patch模式 (默认: separable_conv)
+                                      # 可选: flatten | separable_linear | separable_conv | multiscale_separable_conv
+  hidden_size: 64                    # 隐藏维度 (默认: 64)
+  dt: 8                               # separable时间投影维度 (默认: 8)
+  share_timeproj: true                # separable_linear是否共享时间投影 (默认: true)
+  ms_branches: []                     # multiscale分支配置 (默认: [])
+                                      # 例如: [[16,8,8],[32,16,8]]
+
+  # ===== 位置编码 =====
+  pos_encoding: sinus                 # 位置编码类型 (默认: rope)
+                                      # 可选: none | abs | rope | rpb | rope_rpb | sinus
+  rope_pct: 1.0                       # RoPE应用比例 (默认: 1.0)
+  rope_theta: 10000.0                 # RoPE周期基数 (默认: 10000.0)
+  rpb_max_dist: 128                   # RPB最大距离 (默认: 128)  rbp我用的是t5
+  pos_dropout: 0.0                    # 位置dropout (默认: 0.0)
+
+  # ===== Transformer编码器 =====
+  nheads: 4                           # 注意力头数 (默认: 8)
+  num_layers: 4                       # Transformer层数 (默认: 6)
+  ffn_mult: 4                         # FFN隐藏层倍数 (默认: 4)
+  dropout: 0.2                        # 通用dropout (默认: 0.1)
+  attn_dropout: 0.1                   # 注意力dropout (默认: 0.0)
+  norm_first: true                    # PreNorm vs PostNorm (默认: true)
+  drop_path_rate: 0                 # DropPath最大比例 (默认: 0.1)
+  encoder_impl: auto                  # 编码器实现 (默认: auto)
+                                      # 可选: auto | native | custom
+
+  # ===== 输出头和正则化 =====
+  head_type: cosine_mean                      # 输出头类型 (默认: query)
+                                      # 稳定头: cosine_mean | pool | cls | query | baseline
+                                      # 显式头: pma | pool_stable | cls_stable
+                                      # 特殊头: softmax_pool | gated_mix
+  token_drop_p: 0.0                   # token级dropout (默认: 0.0)
+  fv_bn: true                         # 特征向量是否使用BatchNorm (仅baseline使用)
+  
+  # 头部额外参数
+  head_cls_use_cosine: false          # CLS头是否使用余弦打分 (默认: false)
+  head_temperature: 1.0               # 余弦打分/softmax池化温度 (默认: 1.0)
+  head_pool_use_rff: false            # Pool头是否使用轻量rFF (默认: false)
+  head_pma_k: 1                       # PMA头的seed数量 (默认: 1)
+  head_pma_use_rff_kv: false          # PMA头KV是否使用rFF (默认: false)
+  
+  # ===== 预测归一化（横截面） =====
+  # pred_norm: none | batchnorm | zscore
+  pred_norm: batchnorm                # 默认使用BatchNorm1d（不学习参数、无running stats）
+  pred_norm_affine: false             # 是否学习缩放与平移参数（默认否）
+  pred_norm_eps: 1.0e-6               # 数值稳定项
+
+# ===== 训练参数 =====
+train:
+  optimizer: adamw                    # 优化器 (默认: adamw)
+  lr: 2.0e-5                          # 学习率 (与实验配置保持一致: 4e-05)
+  weight_decay: 1.0                   # 权重衰减 (与实验配置保持一致)
+  # 分组权重衰减因子（相对 main wd，可微调不同模块的WD强度）
+  wd_factor_attention: 0.3           # Attention 组 WD = main_wd * 0.2（默认比 backbone 弱）
+  wd_factor_head: 0.5                # Head 组 WD = main_wd * 0.5
+  wd_factor_patch_embed: 0.5         # Patch-Embed 组 WD = main_wd * 0.5
+  # 优化器参数
+  batch_size: 4096                    # 批次大小 (与实验配置保持一致: 4096)
+  epochs: 250                         # 训练轮数 (与实验配置保持一致: 250)
+  grad_clip: 1.0                      # 梯度裁剪 (默认: 1.0)
+  
+  # 调度器
+  scheduler:
+    name: warm_cos                    # 调度器类型 (warm_cos=warmup+cosine)
+    warmup_epochs: 5                  # 预热轮数 (默认: 5)
+    warmup_start_factor: 0.1          # warmup起始因子 (默认: 0.1)
+    min_lr: 1.0e-6                    # 余弦最小学习率 (默认: 1e-5)
+  
+  # 训练设置
+  use_amp: true                       # 混合精度 (默认: true)
+  force_cpu: false                    # 强制CPU (默认: false)
+  patience: 20                        # 早停patience (默认: 20)
+  seed: 64                            # 随机种子 (默认: 64)
+
+# ===== 数据加载 =====
+data:
+  dataset_path: data/Dataset/pv_v6    # 数据集路径
+  num_workers: 0                      # 数据加载进程数（TwoStagePrefetcher已异步，必须为0）
+  shuffle: false                      # 是否打乱 (默认: false)
+  chunk_size: 4096                    # 每个batch的样本数（控制Dataset输出的batch大小，默认4096）
+  memory_limit: 32GB                  # DuckDB内存限制 (默认: 16GB)
+  use_fixed_indices: true             # 固定索引 (默认: true)
+  prefetch_factor: 2                  # 多worker时降低预取，减少内存抢占
+  pin_memory: true                    # 启用 pinned memory（GPU 训练建议开启）
+  persistent_workers: true            # 持久化 worker（多进程下建议开启）
+  duck_threads: 16                    # ⭐ DuckDB worker 线程（已优化到16，充分利用CPU）
+  duck_memory: 32GB                   # ⭐ DuckDB 内存限制（充足内存避免磁盘spill）
+  duck_cache: 8GB                     # DuckDB 对象缓存大小
+  duck_materialize: true              # 首次物化 JOIN+投影结果，后续 epoch 直接 SELECT *
+  duck_persist_conn: true             # 持久化每-worker连接（需 persistent_workers=true）
+  duck_max_temp: 128GB                # DuckDB 临时目录大小上限（避免大查询排序/物化时 OOM）
+  skip_order_by: true                 # 在 chunk 模式下跳过 ORDER BY，纯流式以降低内存占用
+  
+  # 日期范围
+  use_custom_splits: true             # 使用自定义日期分割 (默认: true)
+  date_ranges:
+    train: ["20080101", "20181231"]   # 训练集日期范围
+    valid: ["20190101", "20211231"]   # 验证集日期范围
+    test: ["20220101", "20250731"]    # 测试集日期范围
+  
+  # 特征选择 (null表示使用全部特征)
+  selected_factors: null              # 选择的特征列表 (默认: null)
+  
+  # batch分组方式
+  batch_by: chunk                     # batch分组方式：'date'=按日期分组（单日batch），'chunk'=按样本数分组（默认）
+  
+  # ===== 数据加载优化参数（新增） =====
+  cpu_queue_size: 4                   # TwoStagePrefetcher CPU预取队列深度（推荐2-4，过大占用pinned内存）
+  io_half: true                       # ⭐ 启用fp16 I/O传输（H2D时自动转换为fp16，带宽减半，强烈推荐）
+  opt_log_freq: 1000                  # 优化器统计日志频率（降低以减少CPU开销）
+  step_log_freq: 200                  # 训练步日志频率（降低以减少CPU开销）
+  days_per_fetch: 20                  # Streaming dataset一次读取的交易日数量（逐日处理，此参数影响不大）
+  part_pad: auto                      # 宽表分区目录是否补零（auto/padded/unpadded）
+  
+  # 数据限制 (用于调试)
+  max_samples_train: null             # 训练集样本限制 (默认: null)
+  max_samples_valid: null             # 验证集样本限制 (默认: null)
+  max_samples_test: null              # 测试集样本限制 (默认: null)
+
+# ===== 损失函数 =====
+loss:
+  wic_mode: corr                     # wIC 模式：corr（相关系数）| cov（协方差）- 保持corr避免尺度无限放大
+  delta: 1.0                          # Huber损失delta (从2.0降到1.0，低误差区更敏感，便于精细校准)
+  lambda_wic: 1                   # 🎯 组合损失中"加权相关系数"项权重 (从0.5降到0.35，让分位Huber更主导"偏多头"信号)
+  tau: 0.6                            # 分位（偏置）Huber 的 tau (从0.6提高到0.8，显著加重"低估"的惩罚，多头友好)
+  focus: symmetric                    # 🎯 损失聚焦策略，决定样本权重分配方式
+                                      # 可选项详解：
+                                      # - symmetric: 均匀权重，所有样本等权重（传统方式）
+                                      # - long_top: 按预测值排序线性加权，高预测值→高权重（预测驱动，易"自嗨"）
+                                      # - topk: 仅关注预测值前topk%的样本，其余权重为0（硬截断）
+                                      # - label_pos: 基于真实标签的正向权重，w=relu(label)+floor（标签驱动，多头友好）⭐推荐
+                                      # - baseline: 基线模式，使用传统线性加权协方差
+  topk: 0.2                           # focus=topk 时使用；比例(0~1)或个数(>1)
+  use_orthogonality_penalty: false    # 🎯 暂时关闭正交惩罚，排查pred_std塌缩问题
+  alpha_corr: 0.001                   # 🎯 正交惩罚权重大幅降低 (从0.01降到0.001)
+
+# ===== 评估指标 =====
+metrics:
+  - name: mse                         # 均方误差
+  - name: mae                         # 平均绝对误差
+
+# ===== 输出设置 =====
+output:
+  output_root: outputs/TSViT_MODEL    # 输出根目录 (默认: outputs/TSViT_MODEL)

@@ -1,0 +1,49 @@
+# ResNet CNN模型配置
+version: "1.0"  # 添加版本字段
+model_type: "CNN"
+model_name: "resnet_cnn"
+description: "基于ResNet结构的CNN模型，用于时间序列预测"
+
+# 模型架构
+architecture:
+  input_channels: 1           # 输入通道数
+  base_filters: 64            # 基础滤波器数量
+  kernel_size: 3              # 卷积核大小
+  stride: 1                   # 步长
+  blocks:                      # ResNet块配置
+    - num_layers: 2           # 块内层数
+      filters: 64             # 滤波器数量
+      downsample: false       # 是否下采样
+    - num_layers: 2
+      filters: 128
+      downsample: true
+    - num_layers: 2
+      filters: 256
+      downsample: true
+  global_pool: "avg"          # 全局池化类型: avg或max
+  dropout: 0.2                # Dropout比率
+  fc_layers: [128]            # 全连接层大小
+  output_size: 1              # 输出维度
+
+# 训练特定设置
+training:
+  batch_size: 32              # 批次大小
+  epochs: 100                 # 训练轮次
+  optimizer:
+    type: "Adam"              # 优化器类型
+    learning_rate: 0.001      # 学习率
+    weight_decay: 0.0001      # 权重衰减
+  scheduler:
+    type: "StepLR"            # 学习率调度器
+    step_size: 30             # 调度步长
+    gamma: 0.1                # 衰减率
+  loss_function: "MSE"        # 损失函数
+  early_stopping:
+    patience: 20              # 早停等待轮次
+    monitor: "val_loss"       # 监控指标
+
+# 评估配置
+evaluation:
+  metrics: ["MSE", "MAE", "RANK_IC", "Sharpe", "MaxDrawdown"]
+  validation_split: 0.1
+  validation_frequency: 1 

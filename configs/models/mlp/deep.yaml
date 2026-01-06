@@ -1,0 +1,48 @@
+# 深层MLP模型配置
+version: "1.0"  # 添加版本字段
+model_type: "MLP"
+model_name: "mlp_deep"
+description: "深层多层感知机模型，使用更多层和正则化技术"
+
+# 模型架构
+architecture:
+  input_size: 100               # 输入特征维度
+  hidden_layers: [512, 256, 128, 64, 32]  # 隐藏层大小
+  dropout: 0.3                  # Dropout比率
+  batch_norm: true              # 是否使用批量归一化
+  activation: "leaky_relu"      # 激活函数
+  output_size: 1                # 输出维度
+  output_activation: "linear"   # 输出层激活函数
+  layer_norm: true              # 是否使用层归一化
+  skip_connections: true        # 是否使用跳跃连接
+
+# 训练特定设置
+training:
+  batch_size: 128               # 批次大小
+  epochs: 150                   # 训练轮次
+  optimizer:
+    type: "AdamW"               # 优化器类型
+    learning_rate: 0.0005       # 学习率
+    weight_decay: 0.001         # 权重衰减
+  scheduler:
+    type: "CosineAnnealingLR"   # 学习率调度器
+    T_max: 50                   # 周期
+    eta_min: 0.00001            # 最小学习率
+  loss_function: "Huber"        # 损失函数
+  loss_parameters:
+    delta: 1.0                  # Huber损失参数
+  early_stopping:
+    patience: 20                # 早停等待轮次
+    monitor: "val_loss"         # 监控指标
+  
+  # 正则化设置
+  regularization:
+    l1: 0.0                     # L1正则化强度
+    l2: 0.001                   # L2正则化强度
+    gradient_clip: 1.0          # 梯度裁剪值
+
+# 评估配置
+evaluation:
+  metrics: ["MSE", "MAE", "RANK_IC", "Sharpe", "MaxDrawdown"]
+  validation_split: 0.1
+  validation_frequency: 1 

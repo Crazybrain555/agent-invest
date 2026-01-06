@@ -1,0 +1,46 @@
+corr_tool:
+  version: 0.1
+
+  output:
+    root: "data/factor_correlation"
+    progress_bar: true
+
+  compute:
+    method: "cross_sectional"     # cross_sectional | time_series
+    corr_type: "spearman"         # pearson | spearman
+    min_periods: 30
+    high_corr_threshold_abs: 0.7
+    use_gpu: false           # YAML boolean: use true/false. Currently not wired to GPU in code.
+    max_factors_full_matrix: 400
+    debug_check_duplicates: false
+
+  sampling:
+    mode: "fixed_years"           # fixed_years | recent_n_years | date_range
+    years: [2012, 2015, 2018, 2020, 2022, 2024]
+    day_picker: "random_k_per_year"
+    random_seed: 42
+    random_days_per_year: 60
+    auto_days_per_year: true  # Auto-scale days when years <= 5
+    random_stocks_per_date: 2000
+    apply_sampling_on_target_df: true  # Apply sampling selection to target_df dates
+    trade_date_chunk_size: 30
+
+  universe:
+    exclude_forbid_pool: true
+    forbid_pool_table: "ai_is.forbid_pool_comprehensive"
+
+  sources:
+    include_tables_ref: "configs/tools/corr/tables.yaml"
+    exclude_tables:
+      - "ai_is.inter_train_factors_mkt_processed_v1"
+      - "ai_is.inter_train_factors_mkt_processed_v3"
+
+  naming:
+    strict_name: false
+    factor_key:
+      include_source_table: true
+
+  cache:
+    enable: true
+    registry_path: "data/factor_correlation/cache/factor_registry.parquet"
+    edges_cache_path: "data/factor_correlation/cache/corr_edges.parquet"

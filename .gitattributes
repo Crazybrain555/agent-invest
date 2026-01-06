@@ -1,0 +1,70 @@
+# ============================================================
+# Git 行尾规范配置
+# ============================================================
+# 默认：所有文本文件使用 LF（Unix 风格）
+# 这样在 Windows + WSL 混用环境下保持一致
+# ============================================================
+
+# 自动检测文本文件，统一使用 LF
+* text=auto eol=lf
+
+# ============================================================
+# Windows 特定脚本：保留 CRLF
+# ============================================================
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# ============================================================
+# 明确标记常见文本文件类型
+# ============================================================
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.sh text eol=lf
+*.sql text eol=lf
+*.toml text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf
+
+# ============================================================
+# 二进制文件：不做任何转换
+# ============================================================
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar.gz binary
+*.gz binary
+*.7z binary
+*.rar binary
+
+# 模型和数据文件
+*.pth binary
+*.pt binary
+*.ckpt binary
+*.h5 binary
+*.hdf5 binary
+*.pkl binary
+*.pickle binary
+*.parquet binary
+*.feather binary
+*.arrow binary
+*.duckdb binary
+*.db binary
+*.sqlite binary
+
+# Office 文件
+*.xlsx binary
+*.xls binary
+*.doc binary
+*.docx binary
+*.ppt binary
+*.pptx binary
+

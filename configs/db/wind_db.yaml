@@ -1,0 +1,9 @@
+version: "1.0"
+env: "prod"
+host: v-wind
+user: trade
+password: trade
+database: wind_quant
+charset: cp936
+driver: mssql+pymssql
+connection_string: mssql+pymssql://trade:trade@v-wind/wind_quant?charset=cp936 

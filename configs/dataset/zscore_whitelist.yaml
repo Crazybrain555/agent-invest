@@ -1,0 +1,29 @@
+# -*- coding: utf-8 -*-
+# Z-score 白名单配置
+# 
+# 用于处理在统计表中缺失但需要保持原值的特殊因子
+# 这些因子在严格模式下会被允许通过，保持原值不做 zscore 变换
+
+# 白名单因子列表
+# 格式: factor_base 或 factor_base_w{window}
+whitelist_factors:
+  # 涨跌停状态因子 - 离散值，不需要 zscore
+  - up_down_limit_status
+  
+  # 可以添加更多特殊因子
+  # - another_special_factor
+  # - discrete_indicator_factor
+
+# 白名单规则说明
+rules:
+  description: |
+    白名单中的因子在 zscore 严格模式下会被特殊处理：
+    1. 如果因子在统计表中缺失，不会触发错误
+    2. 这些因子会保持原值，不进行 zscore 变换
+    3. 适用于离散值、标志位等不需要标准化的因子
+  
+  # 匹配模式：exact（精确匹配）或 prefix（前缀匹配）
+  match_mode: "exact"
+  
+  # 是否启用白名单功能
+  enabled: true

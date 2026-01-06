@@ -1,0 +1,13 @@
+# 基金数据字段映射
+fund_data:
+  # 净值相关 样例 这是瞎编的
+  nav:
+    value_name: F_INFO_NETNAV
+    data_source: wind
+    table: wind_quant.dbo.ChinaMutualFundNAV
+    description: "单位净值"
+    data_type: price
+    unit: "元"
+    is_lag: true
+    
+ 

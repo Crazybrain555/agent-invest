@@ -1,0 +1,54 @@
+# 标准Transformer模型配置
+model_type: "Transformer"
+model_name: "transformer_vanilla"
+description: "标准Transformer模型，使用自注意力机制进行时间序列预测"
+
+# 模型架构
+architecture:
+  input_size: 100            # 输入特征维度
+  d_model: 512               # 模型维度
+  nhead: 8                   # 注意力头数
+  num_encoder_layers: 6      # 编码器层数
+  num_decoder_layers: 0      # 解码器层数（0表示只使用编码器）
+  dim_feedforward: 2048      # 前馈网络维度
+  dropout: 0.1               # Dropout比率
+  activation: "gelu"         # 激活函数
+  output_size: 1             # 输出维度
+  positional_encoding: true  # 使用位置编码
+  max_seq_length: 60         # 最大序列长度
+
+# 训练特定设置
+training:
+  batch_size: 32             # 批次大小
+  epochs: 100                # 训练轮次
+  sequence_length: 60        # 序列长度
+  optimizer:
+    type: "Adam"             # 优化器类型
+    learning_rate: 0.0001    # 学习率
+    weight_decay: 0.0001     # 权重衰减
+    beta1: 0.9               # Beta1
+    beta2: 0.999             # Beta2
+  scheduler:
+    type: "CosineAnnealingWarmRestarts"  # 学习率调度器
+    T_0: 10                  # 初始周期
+    T_mult: 2                # 周期倍数
+  loss_function: "MSE"       # 损失函数
+  warm_up:
+    enabled: true            # 启用预热
+    steps: 1000              # 预热步数
+  early_stopping:
+    patience: 20             # 早停等待轮次
+    monitor: "val_loss"      # 监控指标
+    
+# 评估配置
+evaluation:
+  metrics: ["MSE", "MAE", "RANK_IC", "Sharpe", "MaxDrawdown"]
+  validation_split: 0.1
+  validation_frequency: 1
+
+# 保存配置
+saving:
+  save_dir: "data/strategies/transformer/models"
+  checkpoint_format: "transformer_{epoch}_{val_loss:.4f}.h5"
+  save_frequency: 10
+  max_saved_models: 5 

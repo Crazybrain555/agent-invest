@@ -1,0 +1,26 @@
+# 字段映射主配置文件
+# 引用各个子配置文件
+imports:
+  - db/table_config.yaml
+  - field_mappings/market_data.yaml
+  - field_mappings/financial_data.yaml
+  - field_mappings/macro_data.yaml
+  - field_mappings/index_data.yaml
+  - field_mappings/fund_data.yaml
+
+# 全局配置
+global:
+  # 默认数据源
+  default_data_source: wind
+  
+  # 默认滞后特征设置
+  # 例如：feature_lag=30 表示生成 lag0 到 lag29 的特征
+  default_feature_lag: 30
+  
+  # 数据更新频率
+  update_frequency:
+    market_data: daily
+    financial_data: quarterly
+    macro_data: monthly
+    index_data: daily
+    fund_data: daily

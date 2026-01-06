@@ -1,0 +1,9 @@
+version: "1.0"
+env: "prod"
+host: p-ma-mars
+user: sig
+password: sig
+database: FundRiskControl2
+charset: cp936
+driver: mssql+pymssql
+connection_string: mssql+pymssql://sig:sig@p-ma-mars/FundRiskControl2?charset=cp936 

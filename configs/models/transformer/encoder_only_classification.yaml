@@ -1,0 +1,373 @@
+architecture:
+  activation: gelu
+  d_model: 128
+  dim_feedforward: 512
+  dropout: 0.1
+  embedding_type: linear
+  feature_dim: 64
+  input_size: 37
+  nhead: 8
+  norm_first: true
+  norm_type: layer
+  num_classes: 5
+  num_encoder_layers: 4
+  pooling: mean
+  positional_encoding: true
+  seq_length: 30
+data:
+  chunk_size: 8192
+  classification_label_name: classification_label_11_quantile
+  dataset_path: data/Dataset/pv_v5_pv_v5_pvhflow_solid30
+  date_ranges:
+    test:
+    - '20220101'
+    - '20241231'
+    train:
+    - '20080101'
+    - '20181231'
+    valid:
+    - '20190101'
+    - '20211231'
+  duck_cache: 4GB
+  duck_memory: 16GB
+  duck_threads: 16
+  label_type: classification
+  memory_limit: 16GB
+  prefetch_factor: 4
+  reverse_seq: false
+  selected_factors:
+  - adj_close_mar_w1
+  - adj_open_mar_w1
+  - adj_high_mar_w1
+  - adj_low_mar_w1
+  - vwap_mar_w1
+  - vwap_mar_w30
+  - amount_mar_w30
+  - swing_w0
+  - High_PVcor_w0
+  - MinuVol_call_w0
+  - amresid_amount_w0
+  - apm_w0
+  - high_pvi_w0
+  - high_vol_close_w0
+  - high_vol_open_w0
+  - high_vr_w0
+  - price2vol_w0
+  - residpos_amount_pm_w0
+  - up_down_limit_status_w0
+  use_custom_splits: true
+  use_fixed_indices: true
+description: 仅使用编码器的Transformer分类模型，适用于时间序列分类任务
+model_name: encoder_only_transformer_classification
+model_type: EncoderOnlyTransformerClassification
+preset: custom
+presets:
+  binary:
+    architecture:
+      activation: gelu
+      d_model: 64
+      dim_feedforward: 128
+      dropout: 0.15
+      embedding_type: linear
+      feature_dim: 32
+      input_size: 19
+      nhead: 4
+      norm_first: true
+      norm_type: layer
+      num_classes: 2
+      num_encoder_layers: 4
+      pooling: mean
+      positional_encoding: true
+      seq_length: 30
+    data:
+      classification_label_name: classification_label_2
+    description: 二分类模型 - 用于买入/卖出信号
+    training:
+      batch_size: 2048
+      class_weights:
+      - 0.5
+      - 0.5
+      early_stopping:
+        min_delta: 1e-4
+        monitor: val_accuracy
+        patience: 20
+      epochs: 100
+      focal_alpha: 1.0
+      focal_gamma: 2.0
+      grad_clip_norm: 1.0
+      label_smoothing: 0.0
+      noise:
+        apply_to_features: false
+        enabled: false
+        gaussian_std: 0.01
+      optimizer:
+        beta1: 0.9
+        beta2: 0.999
+        learning_rate: 1e-4
+        type: AdamW
+        weight_decay: 1e-4
+      scheduler:
+        factor: 0.9
+        lr_scheduler_warmup_epochs: 5
+        min_lr: 1e-6
+        patience: 10
+        type: ReduceLROnPlateau
+      use_focal_loss: false
+      use_return_based_ic: false
+  custom:
+    architecture:
+      activation: gelu
+      d_model: 64
+      dim_feedforward: 128
+      dropout: 0.15
+      embedding_type: linear
+      feature_dim: 32
+      input_size: 19
+      nhead: 4
+      norm_first: true
+      norm_type: layer
+      num_classes: 11
+      num_encoder_layers: 6
+      pooling: mean
+      positional_encoding: true
+      seq_length: 30
+    data:
+      classification_label_name: classification_label_11_quantile
+    description: 自定义分类模型 - 用于多类别预测 (使用序数MSE损失)
+    training:
+      batch_size: 2048
+      class_weights: null
+      distance_ce_temperature: 1.0
+      early_stopping:
+        min_delta: 1e-4
+        monitor: val_accuracy
+        patience: 500
+      epochs: 100
+      focal_alpha: 1.0
+      focal_gamma: 2.0
+      grad_clip_norm: 1.0
+      label_smoothing: 0
+      loss_type: distance_weighted_cross_entropy
+      noise:
+        apply_to_features: false
+        apply_to_labels: false
+        enabled: false
+        gaussian_std: 0.05
+      optimizer:
+        beta1: 0.9
+        beta2: 0.999
+        learning_rate: 6e-5
+        type: AdamW
+        weight_decay: 5e-5
+      ordinal_huber_delta: 0.1
+      ordinal_weight: 0.5
+      ranking_margin: 0.1
+      scheduler:
+        factor: 0.9
+        lr_scheduler_warmup_epochs: 5
+        min_lr: 5e-6
+        patience: 5
+        type: warm_cos
+      use_focal_loss: false
+      use_return_based_ic: true
+  large:
+    architecture:
+      activation: gelu
+      d_model: 256
+      dim_feedforward: 1024
+      dropout: 0.1
+      embedding_type: linear
+      feature_dim: 128
+      input_size: 37
+      nhead: 8
+      norm_first: true
+      norm_type: layer
+      num_classes: 10
+      num_encoder_layers: 6
+      pooling: mean
+      positional_encoding: true
+      seq_length: 30
+    data:
+      classification_label_name: classification_label_10
+    description: 大型分类模型 - 最高性能和细粒度分类 (十分位数序数MSE损失)
+    training:
+      batch_size: 1024
+      class_weights: null
+      distance_ce_temperature: 1.0
+      early_stopping:
+        min_delta: 1e-4
+        monitor: val_accuracy
+        patience: 25
+      epochs: 150
+      focal_alpha: 1.0
+      focal_gamma: 2.0
+      grad_clip_norm: 1.0
+      label_smoothing: 0.1
+      loss_type: ordinal_mse
+      noise:
+        apply_to_features: true
+        enabled: false
+        gaussian_std: 0.01
+      optimizer:
+        beta1: 0.9
+        beta2: 0.999
+        learning_rate: 5e-5
+        type: AdamW
+        weight_decay: 1e-3
+      ordinal_huber_delta: 0.1
+      ordinal_weight: 0.5
+      ranking_margin: 0.1
+      scheduler:
+        factor: 0.9
+        lr_scheduler_warmup_epochs: 10
+        min_lr: 1e-7
+        patience: 15
+        type: warm_cos
+      use_focal_loss: false
+      use_return_based_ic: true
+  medium:
+    architecture:
+      activation: gelu
+      d_model: 128
+      dim_feedforward: 512
+      dropout: 0.1
+      embedding_type: linear
+      feature_dim: 64
+      input_size: 37
+      nhead: 8
+      norm_first: true
+      norm_type: layer
+      num_classes: 5
+      num_encoder_layers: 4
+      pooling: mean
+      positional_encoding: true
+      seq_length: 30
+    data:
+      classification_label_name: classification_label_5
+    description: 中型分类模型 - 平衡性能和效率 (五分位数序数MSE损失)
+    training:
+      batch_size: 2048
+      class_weights: null
+      distance_ce_temperature: 1.0
+      early_stopping:
+        min_delta: 1e-4
+        monitor: val_accuracy
+        patience: 20
+      epochs: 100
+      focal_alpha: 1.0
+      focal_gamma: 2.0
+      grad_clip_norm: 1.0
+      label_smoothing: 0.05
+      loss_type: ordinal_mse
+      noise:
+        apply_to_features: true
+        enabled: false
+        gaussian_std: 0.01
+      optimizer:
+        beta1: 0.9
+        beta2: 0.999
+        learning_rate: 1e-4
+        type: AdamW
+        weight_decay: 1e-4
+      ordinal_huber_delta: 0.1
+      ordinal_weight: 0.5
+      ranking_margin: 0.1
+      scheduler:
+        factor: 0.9
+        lr_scheduler_warmup_epochs: 5
+        min_lr: 1e-7
+        patience: 10
+        type: ReduceLROnPlateau
+      use_focal_loss: false
+      use_return_based_ic: true
+  small:
+    architecture:
+      activation: gelu
+      d_model: 64
+      dim_feedforward: 128
+      dropout: 0.1
+      embedding_type: linear
+      feature_dim: 32
+      input_size: 37
+      nhead: 4
+      norm_first: true
+      norm_type: layer
+      num_classes: 3
+      num_encoder_layers: 2
+      pooling: mean
+      positional_encoding: true
+      seq_length: 30
+    data:
+      classification_label_name: classification_label_3
+    description: 小型分类模型 - 快速训练和推理
+    training:
+      batch_size: 2048
+      class_weights: null
+      early_stopping:
+        min_delta: 1e-4
+        monitor: val_accuracy
+        patience: 10
+      epochs: 50
+      focal_alpha: 1.0
+      focal_gamma: 2.0
+      grad_clip_norm: 1.0
+      label_smoothing: 0.0
+      noise:
+        apply_to_features: true
+        enabled: false
+        gaussian_std: 0.01
+      optimizer:
+        beta1: 0.9
+        beta2: 0.999
+        learning_rate: 1e-4
+        type: Adam
+        weight_decay: 1e-4
+      scheduler:
+        factor: 0.9
+        lr_scheduler_warmup_epochs: 0
+        min_lr: 1e-6
+        patience: 5
+        type: ReduceLROnPlateau
+      use_focal_loss: false
+      use_return_based_ic: false
+saving:
+  checkpoint_format: encoder_only_classification_{epoch}_{val_accuracy:.4f}.pth
+  max_saved_models: 5
+  save_dir: outputs/encoder_only_transformer_classification
+  save_frequency: 10
+  tensorboard_in_experiment_dir: false
+training:
+  batch_size: 2048
+  class_weights: null
+  distance_ce_temperature: 1.0
+  early_stopping:
+    min_delta: 1e-4
+    monitor: val_accuracy
+    patience: 20
+  epochs: 100
+  focal_alpha: 1.0
+  focal_gamma: 2.0
+  grad_clip_norm: 1.0
+  label_smoothing: 0.05
+  loss_type: ordinal_mse
+  noise:
+    apply_to_features: true
+    enabled: false
+    gaussian_std: 0.01
+  optimizer:
+    beta1: 0.9
+    beta2: 0.999
+    learning_rate: 1e-4
+    type: AdamW
+    weight_decay: 1e-4
+  ordinal_huber_delta: 0.1
+  ordinal_weight: 0.5
+  ranking_margin: 0.1
+  scheduler:
+    factor: 0.9
+    lr_scheduler_warmup_epochs: 5
+    min_lr: 1e-7
+    patience: 10
+    type: ReduceLROnPlateau
+  use_focal_loss: false
+  use_return_based_ic: false

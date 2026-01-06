@@ -1,0 +1,23 @@
+# Transformer基类通用配置
+# 包含所有Transformer类模型共享的基础配置
+
+# 数据处理配置
+data:
+  sequence_length: 60      # 序列长度
+  feature_lag: 30          # 特征滞后期
+  padding_type: "causal"   # 填充类型: causal或same
+
+# 通用训练配置
+training:
+  batch_size: 32
+  gradient_accumulation_steps: 1
+  weight_init_type: "xavier"  # 权重初始化方法
+  optimizer:
+    warmup_steps: 1000     # 预热步数
+
+# 通用Transformer参数
+transformer_params:
+  positional_encoding: true   # 是否使用位置编码
+  embedding_type: "linear"    # 嵌入类型: linear或conv
+  norm_type: "layer"          # 归一化类型: layer或batch
+  activation: "gelu"          # 激活函数 

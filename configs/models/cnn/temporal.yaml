@@ -1,0 +1,55 @@
+version: "1.0"  # 添加版本字段
+# 时序CNN模型配置
+model_type: "CNN"
+model_name: "temporal_cnn"
+description: "用于时间序列预测的CNN模型，使用时间卷积网络"
+
+# 模型架构
+architecture:
+  input_channels: 1           # 输入通道数
+  conv_layers:                # 卷积层配置
+    - filters: 32             # 滤波器数量
+      kernel_size: 3          # 卷积核大小
+      dilation_rate: 1        # 扩张率
+      stride: 1               # 步长
+      padding: "causal"       # 填充类型
+      activation: "relu"      # 激活函数
+    - filters: 64
+      kernel_size: 3
+      dilation_rate: 2
+      stride: 1
+      padding: "causal"
+      activation: "relu"
+    - filters: 128
+      kernel_size: 3
+      dilation_rate: 4
+      stride: 1
+      padding: "causal"
+      activation: "relu"
+  dropout: 0.2                # Dropout比率
+  fc_layers: [64]             # 全连接层大小
+  output_size: 1              # 输出维度
+
+# 训练特定设置
+training:
+  batch_size: 32              # 批次大小
+  epochs: 100                 # 训练轮次
+  optimizer:
+    type: "Adam"              # 优化器类型
+    learning_rate: 0.001      # 学习率
+    weight_decay: 0.0001      # 权重衰减
+  scheduler:
+    type: "ReduceLROnPlateau"  # 学习率调度器
+    factor: 0.5               # 学习率衰减因子
+    patience: 5               # 等待轮次
+    min_lr: 0.00001           # 最小学习率
+  loss_function: "MSE"        # 损失函数
+  early_stopping:
+    patience: 20              # 早停等待轮次
+    monitor: "val_loss"       # 监控指标
+
+# 评估配置
+evaluation:
+  metrics: ["MSE", "MAE", "RANK_IC", "Sharpe", "MaxDrawdown"]
+  validation_split: 0.1
+  validation_frequency: 1 

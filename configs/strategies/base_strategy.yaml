@@ -1,0 +1,34 @@
+# 基础策略配置
+strategy_type: "Base"
+strategy_name: "base_strategy"
+description: "基础策略类，定义策略的基本接口和通用功能"
+
+# 策略参数
+parameters:
+  initial_capital: 1000000.0  # 初始资金
+  position_size: 0.1          # 单个持仓比例
+  max_positions: 10           # 最大持仓数量
+  rebalance_frequency: "daily"  # 调仓频率: daily, weekly, monthly
+  transaction_cost: 0.0003    # 交易成本率
+
+# 风险控制
+risk_control:
+  max_drawdown: 0.2           # 最大回撤限制
+  var_limit: 0.05            # VaR限制
+  volatility_limit: 0.3      # 波动率限制
+  position_limit: 0.2        # 单个持仓上限
+  sector_limit: 0.4          # 行业持仓上限
+
+# 信号生成
+signal_generation:
+  lookback_period: 20        # 回看周期
+  signal_threshold: 0.5      # 信号阈值
+  signal_smoothing: true     # 是否平滑信号
+  smoothing_window: 5        # 平滑窗口大小
+
+# 交易执行
+execution:
+  slippage: 0.0001           # 滑点率
+  min_trade_size: 100        # 最小交易数量
+  max_trade_size: 10000      # 最大交易数量
+  price_impact: 0.0002       # 价格冲击系数 

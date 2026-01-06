@@ -1,0 +1,41 @@
+version: "1.0"  # 添加版本字段
+# 带注意力机制的LSTM模型配置
+model_type: "LSTM"
+model_name: "lstm_attention"
+description: "带注意力机制的LSTM模型，增强长序列建模能力"
+
+# 模型架构
+architecture:
+  input_size: 100          # 输入特征维度
+  hidden_size: 256         # 隐藏层大小
+  num_layers: 2            # LSTM层数
+  dropout: 0.2             # Dropout比率
+  bidirectional: false     # 是否双向
+  output_size: 1           # 输出维度
+  attention: true          # 使用注意力机制
+  attention_params:
+    attention_type: "dot"  # 注意力类型: dot, general, concat
+    attention_dim: 64      # 注意力维度
+    use_tanh: true         # 是否使用tanh激活
+
+# 训练特定设置
+training:
+  batch_size: 32           # 批次大小
+  epochs: 150              # 训练轮次
+  optimizer:
+    type: "Adam"           # 优化器类型
+    learning_rate: 0.0005  # 学习率
+    weight_decay: 0.0001   # 权重衰减
+  scheduler:
+    type: "CosineAnnealingLR"  # 学习率调度器
+    T_max: 50              # 周期
+    eta_min: 0.00001       # 最小学习率
+  loss_function: "MSE"     # 损失函数
+  early_stopping:
+    patience: 25           # 早停等待轮次
+    monitor: "val_loss"    # 监控指标
+
+# 评估配置
+evaluation:
+  metrics: ["MSE", "MAE", "RANK_IC", "Sharpe", "MaxDrawdown"]
+  validation_frequency: 1   # 每轮验证频率 

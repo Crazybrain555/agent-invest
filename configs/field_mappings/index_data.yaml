@@ -1,0 +1,38 @@
+# 指数数据字段映射
+index_data:
+  index_close:
+    value_name: S_DQ_CLOSE
+    data_source: wind
+    table: wind_quant.dbo.AIndexEODPrices
+    description: "指数收盘点位"
+    data_type: index_price
+    unit: "点"
+    is_lag: true
+
+  index_preclose:
+    value_name: S_DQ_PRECLOSE
+    data_source: wind
+    table: wind_quant.dbo.AIndexEODPrices
+    description: "指数昨收盘点位"
+    data_type: index_price
+    unit: "点"
+    is_lag: true
+
+  index_pct_change:
+    value_name: S_DQ_PCTCHANGE
+    data_source: wind
+    table: wind_quant.dbo.AIndexEODPrices
+    description: "指数日涨跌幅(%)"
+    data_type: index_return
+    unit: "%"
+    is_lag: true
+
+  index_amount:
+    value_name: S_DQ_AMOUNT
+    data_source: wind
+    table: wind_quant.dbo.AIndexEODPrices
+    description: "指数成交金额(千元)"
+    data_type: amount
+    unit: "千元"
+    is_lag: true
+  

@@ -1,0 +1,12 @@
+# 宏观数据字段映射 样例 这是瞎编的
+macro_data:
+  # 利率相关
+  shibor_1m:
+    value_name: M0067875
+    data_source: wind
+    table: wind_quant.dbo.CN_Macro
+    description: "1个月SHIBOR"
+    data_type: rate
+    unit: "%"
+    is_lag: true
+   

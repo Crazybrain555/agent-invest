@@ -1,0 +1,163 @@
+# 代码格式转换规则
+code_format_rules:
+  # 数据库格式转换规则（用于SQL查询）
+  db_format:
+    # 移除后缀规则（用于将用户输入的带后缀代码转换为数据库格式）
+    remove_suffix:
+      type: remove_suffix
+      suffixes: [".SZ", ".SH"]
+    
+    # 添加后缀规则（用于将数据库代码转换为数据库查询格式）
+    add_suffix:
+      type: add_suffix
+      rules:
+        - pattern: "^6"
+          suffix: ".SH"
+        - pattern: "^0|^3"
+          suffix: ".SZ"
+    
+    # Wind专用规则
+    remove_suffix_wind:
+      type: 'remove_suffix'
+      description: '移除Wind股票代码的市场后缀(.SZ/.SH)'
+      suffixes: ['.SZ', '.SH', '.BJ', '.SHE', '.SHA']
+    
+    # 聚源专用规则
+    remove_suffix_all:
+      type: 'remove_suffix'
+      description: '移除所有市场后缀，确保纯数字格式'
+      suffixes: ['.SZ', '.SH', '.BJ', '.SHE', '.SHA', 'SZ', 'SH', 'BJ']
+    
+    # 确保6位数格式(聚源可能需要)
+    ensure_6digits:
+      type: 'pad_zeros'
+      description: '确保股票代码为6位数字格式'
+      length: 6
+  
+  # 输出格式转换规则（用于统一输出格式）
+  output_format:
+    # 移除所有后缀，统一为6位数字格式
+    standardize:
+      type: remove_suffix
+      suffixes: [".SZ", ".SH", ".BJ", ".SHE", ".SHA", "SZ", "SH", "BJ"]
+    
+    # 添加后缀规则（如果需要带后缀的输出）
+    add_market_suffix:
+      type: 'add_suffix'
+      description: '根据股票代码规则添加正确的市场后缀'
+      rules:
+        - pattern: '^(00|30)\\d{4}$'  # 深市股票
+          suffix: '.SZ'
+        - pattern: '^(60|68)\\d{4}$'  # 上市股票
+          suffix: '.SH'
+        - pattern: '^(83|43)\\d{4}$'  # 北交所
+          suffix: '.BJ'
+    
+    # 移除后缀，保持纯数字
+    remove_all_suffix:
+      type: 'remove_suffix'
+      description: '移除所有后缀，保持纯数字格式作为标准输出'
+      suffixes: ['.SZ', '.SH', '.BJ', '.SHE', '.SHA', 'SZ', 'SH', 'BJ', '.WI', '.CSI']
+
+# 数据库表配置
+tables:
+  # Wind数据库表
+  wind_quant.dbo.AShareCalendar:
+    date_field: TRADE_DAYS
+    code_field: S_INFO_WINDCODE
+    code_transform_sequence: []  # Wind数据库不需要转换，保持原样
+    description: "中国A股交易日历表"
+    database_type: 'wind'
+    output_transform_sequence:
+      - 'output_format.remove_all_suffix'  # DB转输出: 移除所有后缀
+    
+  wind_quant.dbo.AShareEODPrices:
+    date_field: TRADE_DT
+    code_field: S_INFO_WINDCODE
+    code_transform_sequence: []  # Wind数据库不需要转换，保持原样
+    description: "A股日线行情表"
+    database_type: 'wind'
+    output_transform_sequence:
+      - 'output_format.remove_all_suffix'  # DB转输出: 移除所有后缀
+
+  wind_quant.dbo.AIndexEODPrices:
+    date_field: TRADE_DT
+    code_field: S_INFO_WINDCODE
+    code_transform_sequence: []  # Wind指数代码直接使用，例如 000300.SH
+    description: "中国A股指数日行情表"
+    database_type: 'wind'
+    output_transform_sequence:
+      - 'output_format.remove_all_suffix'  # DB转输出: 移除所有后缀
+
+  wind_quant.dbo.AShareEODDerivativeIndicator:
+    date_field: TRADE_DT
+    code_field: S_INFO_WINDCODE
+    code_transform_sequence: []  # Wind数据库不需要转换，保持原样
+    description: "A股日行情估值指标表"
+    database_type: 'wind'
+    output_transform_sequence:
+      - 'output_format.remove_all_suffix'  # DB转输出: 移除所有后缀
+    
+  wind_quant.dbo.AShareValuationIndicator:
+    date_field: TRADE_DT
+    code_field: S_INFO_WINDCODE
+    code_transform_sequence: []  # Wind数据库不需要转换，保持原样
+    description: "中国A股估值指标表(含负值)"
+    database_type: 'wind'
+    output_transform_sequence:
+      - 'output_format.remove_all_suffix'  # DB转输出: 移除所有后缀
+
+  wind_quant.dbo.AShareL2Indicators:
+    date_field: TRADE_DT
+    code_field: S_INFO_WINDCODE
+    code_transform_sequence: []  # Wind数据库不需要转换，保持原样
+    description: "中国A股Level2指标表"
+    database_type: 'wind'
+    output_transform_sequence:
+      - 'output_format.remove_all_suffix'  # DB转输出: 移除所有后缀
+
+  wind_quant.dbo.AShareMoneyFlow:
+    date_field: TRADE_DT
+    code_field: S_INFO_WINDCODE
+    code_transform_sequence: []  # Wind数据库不需要转换，保持原样
+    description: "中国A股资金流向数据表"
+    database_type: 'wind'
+    output_transform_sequence:
+      - 'output_format.remove_all_suffix'  # DB转输出: 移除所有后缀
+
+  wind_quant.dbo.AShareswingReversetrendADJ:
+    date_field: TRADE_DT
+    code_field: S_INFO_WINDCODE
+    code_transform_sequence: []  # Wind数据库不需要转换，保持原样
+    description: "中国A股摆动与反趋向技术指标(后复权)"
+    database_type: 'wind'
+    output_transform_sequence:
+      - 'output_format.remove_all_suffix'  # DB转输出: 移除所有后缀
+    
+  # 聚源数据库表
+  FundRiskControl2.dbo.con_forecast_roll_stk:
+    date_field: con_date
+    code_field: stock_code
+    code_transform_sequence: 
+      - 'db_format.remove_suffix_all'  # 输入转DB: 确保无后缀
+      - 'db_format.ensure_6digits'     # 输入转DB: 确保6位数格式
+    description: "一致预期净利润表"
+    database_type: 'gogoal'
+    output_transform_sequence:
+      - 'output_format.remove_all_suffix'  # DB转输出: 移除所有后缀
+    
+  # 聚源数据库表配置示例
+  juyuan.dbo.SomeTable:
+    code_field: STK_CODE  # 聚源的股票代码字段
+    date_field: TRADE_DATE  # 聚源的日期字段
+    database_type: 'juyuan'
+    code_transform_sequence:
+      - 'db_format.remove_suffix_all'  # 输入转DB: 确保无后缀
+      - 'db_format.ensure_6digits'     # 输入转DB: 确保6位数格式
+    output_transform_sequence:
+      - 'output_format.remove_all_suffix'  # DB转输出: 移除所有后缀
+    
+  # 可以继续添加其他表的配置... 
+
+# 全局输出格式设置
+default_output_format: 'remove_all_suffix'  # 默认输出格式: 不带后缀的6位数字 

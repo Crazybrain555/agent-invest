@@ -1,0 +1,6 @@
+LD_LIBRARY_PATH=/usr/local/boost/lib:$LD_LIBRARY_PATH
+
+# lic crontab
+50 3 * * 1-6 /usr/bin/bash /data/lic/pvnet/run_product.sh > /data/lic/pvnet/log_product.txt 2>&1
+30 4 1 1 *   /usr/bin/bash /data/lic/pvnet/run_retrain.sh > /data/lic/pvnet/log_retrain.txt 2>&1
+

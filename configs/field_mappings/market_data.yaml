@@ -1,0 +1,833 @@
+# 市场数据字段映射
+
+
+market_data:
+
+
+  # 价格相关
+  adj_close:
+    value_name: S_DQ_ADJCLOSE
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "日收盘价(后复权)"
+    data_type: price
+    unit: "元"
+    is_lag: true
+
+  adj_open:
+    value_name: S_DQ_ADJOPEN
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "日开盘价(后复权)"
+    data_type: price
+    unit: "元"
+    is_lag: true
+
+  adj_high:
+    value_name: S_DQ_ADJHIGH
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "日最高价(后复权)"
+    data_type: price
+    unit: "元"
+    is_lag: true
+
+  adj_low:
+    value_name: S_DQ_ADJLOW
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "日最低价(后复权)"
+    data_type: price
+    unit: "元"
+    is_lag: true
+
+  adj_preclose:
+    value_name: S_DQ_ADJPRECLOSE
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "复权昨收盘价(0元)"
+    data_type: price
+    unit: "元"
+    is_lag: true
+  close:
+    value_name: S_DQ_CLOSE
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "收盘价"
+    data_type: price
+    unit: "元"
+    is_lag: true
+    
+  open:
+    value_name: S_DQ_OPEN
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "开盘价"
+    data_type: price
+    unit: "元"
+    is_lag: true
+    
+  high:
+    value_name: S_DQ_HIGH
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "最高价"
+    data_type: price
+    unit: "元"
+    is_lag: true
+    
+  low:
+    value_name: S_DQ_LOW
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "最低价"
+    data_type: price
+    unit: "元"
+    is_lag: true
+    
+  # 交易量相关
+  volume:
+    value_name: S_DQ_VOLUME
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "成交量"
+    data_type: volume
+    unit: "股"
+    is_lag: true
+    
+  amount:
+    value_name: S_DQ_AMOUNT
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "成交金额"
+    data_type: amount
+    unit: "千元"
+    is_lag: true
+    
+  # 涨跌幅相关
+  change:
+    value_name: S_DQ_CHANGE
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "涨跌"
+    data_type: change
+    unit: "元"
+    is_lag: true
+    
+  pct_change:
+    value_name: S_DQ_PCTCHANGE
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "涨跌幅"
+    data_type: percentage
+    unit: "%"
+    is_lag: true
+    
+  # 复权因子
+  adj_factor:
+    value_name: S_DQ_ADJFACTOR
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "复权因子"
+    data_type: factor
+    unit: "无"
+    is_lag: true
+    
+  # 均价
+  vwap:
+    value_name: S_DQ_AVGPRICE
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "均价(VWAP)"
+    data_type: price
+    unit: "元"
+    is_lag: true
+    
+  # 交易状态
+  trade_status:
+    value_name: S_DQ_TRADESTATUSCODE
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "交易状态代码(-1:正常交易,其他:异常状态)"
+    data_type: status
+    unit: "无"
+    is_lag: false
+    
+  # 涨跌停
+  limit_up:
+    value_name: S_DQ_LIMIT
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "涨停价"
+    data_type: price
+    unit: "元"
+    is_lag: true
+    
+  limit_down:
+    value_name: S_DQ_STOPPING
+    data_source: wind
+    table: wind_quant.dbo.AShareEODPrices
+    description: "跌停价"
+    data_type: price
+    unit: "元"
+    is_lag: true
+
+  # 一致预期相关
+  consensus_np:
+    value_name: con_np_roll
+    data_source: gogoal
+    table: FundRiskControl2.dbo.con_forecast_roll_stk
+    description: "一致预期净利润"
+    data_type: forecast
+    unit: "万元"
+    is_lag: true
+
+  consensus_np_growth_2y:
+    value_name: con_npcgrate_2y_roll
+    data_source: gogoal
+    table: FundRiskControl2.dbo.con_forecast_roll_stk
+    description: "一致预期净利润两年复合增长率"
+    data_type: forecast
+    unit: "%"
+    is_lag: true
+
+  # 聚源数据示例
+  consensus_forecast:
+    value_name: con_np_roll
+    data_source: gogoal
+    table: FundRiskControl2.dbo.con_forecast_roll_stk
+    description: "共识预测净利润"
+    data_type: forecast
+    unit: "万元"
+    is_lag: true
+
+  # 估值指标相关
+  market_cap:
+    value_name: S_VAL_MV
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "总市值"
+    data_type: value
+    unit: "亿元"
+    is_lag: true
+
+  float_market_cap:
+    value_name: S_DQ_MV
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "流通市值"
+    data_type: value
+    unit: "亿元"
+    is_lag: true
+
+  pe_ratio:
+    value_name: S_VAL_PE_LYR_ARD
+    data_source: wind
+    table: wind_quant.dbo.AShareValuationIndicator
+    description: "市盈率(LYR,含负值)"
+    data_type: ratio
+    unit: "倍"
+    is_lag: true
+
+  pb_ratio:
+    value_name: S_VAL_PB_LF
+    data_source: wind
+    table: wind_quant.dbo.AShareValuationIndicator
+    description: "市净率(LF,含负值)"
+    data_type: ratio
+    unit: "倍"
+    is_lag: true
+
+  pe_ttm:
+    value_name: S_VAL_PE_TTM
+    data_source: wind
+    table: wind_quant.dbo.AShareValuationIndicator
+    description: "市盈率(TTM,含负值)"
+    data_type: ratio
+    unit: "倍"
+    is_lag: true
+
+  pcf_ocf_ttm:
+    value_name: S_VAL_PCF_OCFTTM
+    data_source: wind
+    table: wind_quant.dbo.AShareValuationIndicator
+    description: "市现率(经营现金流TTM,含负值)"
+    data_type: ratio
+    unit: "倍"
+    is_lag: true
+
+  pcf_ncf_ttm:
+    value_name: S_VAL_PCF_NCFTTM
+    data_source: wind
+    table: wind_quant.dbo.AShareValuationIndicator
+    description: "市现率(现金净流量TTM,含负值)"
+    data_type: ratio
+    unit: "倍"
+    is_lag: true
+
+  ps_ttm:
+    value_name: S_VAL_PS_TTM
+    data_source: wind
+    table: wind_quant.dbo.AShareValuationIndicator
+    description: "市销率(TTM,含负值)"
+    data_type: ratio
+    unit: "倍"
+    is_lag: true
+
+  # 新增估值指标（含负值）
+  pe_deducted_ttm:
+    value_name: S_VAL_PE_DEDUCTED_TTM
+    data_source: wind
+    table: wind_quant.dbo.AShareValuationIndicator
+    description: "市盈率(TTM,扣非,含负值)"
+    data_type: ratio
+    unit: "倍"
+    is_lag: true
+
+  ps_lyr:
+    value_name: S_VAL_PS_LYR_ARD
+    data_source: wind
+    table: wind_quant.dbo.AShareValuationIndicator
+    description: "市销率(LYR,含负值)"
+    data_type: ratio
+    unit: "倍"
+    is_lag: true
+
+  pcf_ncf_lyr:
+    value_name: S_VAL_PCF_NFLYR_ARD
+    data_source: wind
+    table: wind_quant.dbo.AShareValuationIndicator
+    description: "市现率(现金净流量LYR,含负值)"
+    data_type: ratio
+    unit: "倍"
+    is_lag: true
+
+  pcf_ocf_lyr:
+    value_name: S_VAL_PCF_OCFLYR_ARD
+    data_source: wind
+    table: wind_quant.dbo.AShareValuationIndicator
+    description: "市现率(经营现金流LYR,含负值)"
+    data_type: ratio
+    unit: "倍"
+    is_lag: true
+
+  pb_mrq:
+    value_name: PB_MRQ
+    data_source: wind
+    table: wind_quant.dbo.AShareValuationIndicator
+    description: "市净率(MRQ,含负值)"
+    data_type: ratio
+    unit: "倍"
+    is_lag: true
+
+  dividend_yield_12m:
+    value_name: S_VAL_DIVIDENDYIELD2
+    data_source: wind
+    table: wind_quant.dbo.AShareValuationIndicator
+    description: "股息率(近12个月)"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  turnover_rate:
+    value_name: S_DQ_TURN
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "换手率"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  free_turnover_rate:
+    value_name: S_DQ_FREETURNOVER
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "换手率(自由流通股本)"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  price_dividend_ratio:
+    value_name: S_PRICE_DIV_DPS
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "股价/每股派息"
+    data_type: ratio
+    unit: "倍"
+    is_lag: true
+
+  free_shares:
+    value_name: FREE_SHARES_TODAY
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "自由流通股本"
+    data_type: shares
+    unit: "万股"
+    is_lag: true
+
+  net_profit_ttm:
+    value_name: NET_PROFIT_PARENT_COMP_TTM
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "归属母公司净利润(TTM)"
+    data_type: profit
+    unit: "万元"
+    is_lag: true
+
+  operating_cash_flow_ttm:
+    value_name: NET_CASH_FLOWS_OPER_ACT_TTM
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "经营活动产生的现金流量净额(TTM)"
+    data_type: cash_flow
+    unit: "万元"
+    is_lag: true
+
+  operating_revenue_ttm:
+    value_name: OPER_REV_TTM
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "营业收入(TTM)"
+    data_type: revenue
+    unit: "万元"
+    is_lag: true
+
+  net_cash_increase_ttm:
+    value_name: NET_INCR_CASH_CASH_EQU_TTM
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "现金及现金等价物净增加额(TTM)"
+    data_type: cash_flow
+    unit: "万元"
+    is_lag: true
+
+  # Level2指标 - 主买卖相关
+  initiative_buy_rate:
+    value_name: S_LI_INITIATIVEBUYRATE
+    data_source: wind
+    table: wind_quant.dbo.AShareL2Indicators
+    description: "主买比率"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  initiative_buy_money:
+    value_name: S_LI_INITIATIVEBUYMONEY
+    data_source: wind
+    table: wind_quant.dbo.AShareL2Indicators
+    description: "主买总额"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  initiative_sell_rate:
+    value_name: S_LI_INITIATIVESELLRATE
+    data_source: wind
+    table: wind_quant.dbo.AShareL2Indicators
+    description: "主卖比率"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  initiative_sell_money:
+    value_name: S_LI_INITIATIVESELLMONEY
+    data_source: wind
+    table: wind_quant.dbo.AShareL2Indicators
+    description: "主卖总额"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  # Level2指标 - 大单相关
+  large_buy_rate:
+    value_name: S_LI_LARGEBUYRATE
+    data_source: wind
+    table: wind_quant.dbo.AShareL2Indicators
+    description: "大买比率"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  large_buy_money:
+    value_name: S_LI_LARGEBUYMONEY
+    data_source: wind
+    table: wind_quant.dbo.AShareL2Indicators
+    description: "大买总额"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  large_sell_rate:
+    value_name: S_LI_LARGESELLRATE
+    data_source: wind
+    table: wind_quant.dbo.AShareL2Indicators
+    description: "大卖比率"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  large_sell_money:
+    value_name: S_LI_LARGESELLMONEY
+    data_source: wind
+    table: wind_quant.dbo.AShareL2Indicators
+    description: "大卖总额"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  # Level2指标 - 委托相关
+  entrust_rate:
+    value_name: S_LI_ENTRUSTRATE
+    data_source: wind
+    table: wind_quant.dbo.AShareL2Indicators
+    description: "总委比"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  # 涨跌停状态
+  up_down_limit_status:
+    value_name: UP_DOWN_LIMIT_STATUS
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "涨跌停状态(0:正常,1:涨停,-1:跌停)"
+    data_type: status
+    unit: "无"
+    is_lag: false
+
+  # 振幅
+  swing:
+    value_name: SWING
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "振幅"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  # 最近3个月平均成交量
+  avg_volume_3m:
+    value_name: AVGVOLUME_3M
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "最近3个月平均成交量"
+    data_type: volume
+    unit: "股"
+    is_lag: true
+
+  # 最高最低价状态
+  lowest_highest_status:
+    value_name: LOWEST_HIGHEST_STATUS
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "最高最低价状态"
+    data_type: status
+    unit: "无"
+    is_lag: false
+
+  # 总股本
+  total_shares:
+    value_name: TOT_SHR_TODAY
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "当日总股本"
+    data_type: shares
+    unit: "万股"
+    is_lag: true
+
+  # 流通股本
+  float_shares:
+    value_name: FLOAT_A_SHR_TODAY
+    data_source: wind
+    table: wind_quant.dbo.AShareEODDerivativeIndicator
+    description: "当日流通股本"
+    data_type: shares
+    unit: "万股"
+    is_lag: true
+
+  # 资金流向 - 机构/大户/中户/散户
+  inst_buy_value:
+    value_name: BUY_VALUE_EXLARGE_ORDER
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "机构买入金额(万元)，和larege buy monmey不在一张表上，尚不知道区别"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  inst_sell_value:
+    value_name: SELL_VALUE_EXLARGE_ORDER
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "机构卖出金额(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  large_buy_value:
+    value_name: BUY_VALUE_LARGE_ORDER
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "大户买入金额(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  large_sell_value:
+    value_name: SELL_VALUE_LARGE_ORDER
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "大户卖出金额(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  med_buy_value:
+    value_name: BUY_VALUE_MED_ORDER
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "中户买入金额(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  med_sell_value:
+    value_name: SELL_VALUE_MED_ORDER
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "中户卖出金额(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  small_buy_value:
+    value_name: BUY_VALUE_SMALL_ORDER
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "散户买入金额(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  small_sell_value:
+    value_name: SELL_VALUE_SMALL_ORDER
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "散户卖出金额(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  # 资金流向 - 净流入相关
+  net_inflow:
+    value_name: S_MFD_INFLOW
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "净流入金额(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  net_inflow_rate:
+    value_name: NET_INFLOW_RATE_VALUE
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "流入率(金额)"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  # 资金流向 - 开盘/尾盘
+  open_net_inflow:
+    value_name: S_MFD_INFLOW_OPEN
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "开盘资金流入金额(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  open_net_inflow_rate:
+    value_name: OPEN_NET_INFLOW_RATE_VALUE
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "开盘资金流入率(金额)"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  close_net_inflow:
+    value_name: S_MFD_INFLOW_CLOSE
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "尾盘资金流入金额(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  close_net_inflow_rate:
+    value_name: CLOSE_NET_INFLOW_RATE_VALUE
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "尾盘资金流入率(金额)"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  # 资金流向 - 占比
+  moneyflow_pct:
+    value_name: MONEYFLOW_PCT_VALUE
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "资金流向占比(金额)记录该只股票当日净主动买入量占比，资金净流入量/流通股本*100，仅主动"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  open_moneyflow_pct:
+    value_name: OPEN_MONEYFLOW_PCT_VALUE
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "开盘资金流向占比(金额)"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  close_moneyflow_pct:
+    value_name: CLOSE_MONEYFLOW_PCT_VALUE
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "尾盘资金流向占比(金额)"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  # 资金流向 - 大单
+  large_net_inflow:
+    value_name: S_MFD_INFLOW_LARGE_ORDER
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "大单净流入金额(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  large_open_net_inflow:
+    value_name: S_MFD_INFLOW_OPEN_LARGE_ORDER
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "大单开盘资金流入金额(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  large_open_moneyflow_pct:
+    value_name: OPEN_MONEYFLOW_PCT_VALUE_L
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "大单开盘资金流向占比(金额)"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  large_close_net_inflow:
+    value_name: S_MFD_INFLOW_CLOSE_LARGE_ORDER
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "大单尾盘资金流入金额(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  large_close_moneyflow_pct:
+    value_name: CLOSE_MONEYFLOW_PCT_VOLUME_L
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "大单尾盘资金流向占比(量)"
+    data_type: ratio
+    unit: "%"
+    is_lag: true
+
+  # 资金流向 - 仅主动
+  inst_buy_value_act:
+    value_name: BUY_VALUE_EXLARGE_ORDER_ACT
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "机构买入金额(仅主动)(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  inst_sell_value_act:
+    value_name: SELL_VALUE_EXLARGE_ORDER_ACT
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "机构卖出金额(仅主动)(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  large_buy_value_act:
+    value_name: BUY_VALUE_LARGE_ORDER_ACT
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "大户买入金额(仅主动)(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  large_sell_value_act:
+    value_name: SELL_VALUE_LARGE_ORDER_ACT
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "大户卖出金额(仅主动)(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  med_buy_value_act:
+    value_name: BUY_VALUE_MED_ORDER_ACT
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "中户买入金额(仅主动)(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  med_sell_value_act:
+    value_name: SELL_VALUE_MED_ORDER_ACT
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "中户卖出金额(仅主动)(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  small_buy_value_act:
+    value_name: BUY_VALUE_SMALL_ORDER_ACT
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "散户买入金额(仅主动)(万元)"
+    data_type: amount
+    unit: "万元"
+    is_lag: true
+
+  # 资金流向 - 核心指标
+  TRADES_COUNT:
+    value_name: TRADES_COUNT
+    data_source: wind
+    table: wind_quant.dbo.AShareMoneyFlow
+    description: "成交笔数(笔)"
+    data_type: volume
+    unit: "笔"
+    is_lag: true
+
+  # 价格变化率指标 - 摆动与反趋向指标
+  rc_50d:
+    value_name: RC_50D
+    data_source: wind
+    table: wind_quant.dbo.AShareswingReversetrendADJ
+    description: "RC变化率指数(50日) - RC=收盘价/PREF(收盘价,50日)*100"
+    data_type: price_change
+    unit: "%"
+    is_lag: true 
