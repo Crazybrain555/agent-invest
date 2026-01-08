@@ -452,6 +452,51 @@ def _append_evidence_record(
     append_evidence(evidence_path, record)
 
 
+def _persist_inputs(
+    run_dir: Path,
+    *,
+    filings_payloads: list[Any],
+    filing_content_payload: Any | None,
+    news_payload: Any | None,
+    papers_payload: Any | None,
+) -> list[str]:
+    inputs_dir = run_dir / "inputs"
+    persisted: list[str] = []
+    if filings_payloads:
+        atomic_write_json(
+            inputs_dir / "filings_payloads.json",
+            filings_payloads,
+            ensure_ascii=False,
+            default=str,
+        )
+        persisted.append("inputs/filings_payloads.json")
+    if filing_content_payload is not None:
+        atomic_write_json(
+            inputs_dir / "filing_content_payload.json",
+            filing_content_payload,
+            ensure_ascii=False,
+            default=str,
+        )
+        persisted.append("inputs/filing_content_payload.json")
+    if news_payload is not None:
+        atomic_write_json(
+            inputs_dir / "news_payload.json",
+            news_payload,
+            ensure_ascii=False,
+            default=str,
+        )
+        persisted.append("inputs/news_payload.json")
+    if papers_payload is not None:
+        atomic_write_json(
+            inputs_dir / "papers_payload.json",
+            papers_payload,
+            ensure_ascii=False,
+            default=str,
+        )
+        persisted.append("inputs/papers_payload.json")
+    return persisted
+
+
 def _resolve_filing_payload_map(payload: Any | None) -> dict[str, Any]:
     if payload is None:
         return {}
@@ -509,6 +554,7 @@ def run(
     papers_query: str | None = None,
     demo: bool = False,
     timezone_name: str = DEFAULT_TIMEZONE,
+    persist_inputs: bool = False,
 ) -> dict[str, Any]:
     ticker = ticker.upper()
     as_of_value = as_of or date.today()
@@ -522,6 +568,17 @@ def run(
     outputs_dir = run_dir / "outputs"
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
+    filings_payloads = filings_payloads or []
+    persisted_inputs: list[str] = []
+    if persist_inputs and not demo:
+        persisted_inputs = _persist_inputs(
+            run_dir,
+            filings_payloads=filings_payloads,
+            filing_content_payload=filing_content_payload,
+            news_payload=news_payload,
+            papers_payload=papers_payload,
+        )
+
     meta = build_run_meta(
         skill=SKILL_NAME,
         ticker=ticker,
@@ -533,6 +590,7 @@ def run(
         papers_mode=papers_mode,
         force_refresh=force_refresh,
         forms=DEFAULT_FORMS,
+        inputs_persisted=persisted_inputs,
     )
     write_meta(run_dir, meta)
 
@@ -571,7 +629,6 @@ def run(
     cik = str(company.get("cik"))
     company_name = company.get("company_name") or ticker
 
-    filings_payloads = filings_payloads or []
     filing_content_map = _resolve_filing_payload_map(filing_content_payload)
 
     existing_index = _load_yaml(paths.current_dir / "filings_index.yaml")
@@ -890,6 +947,11 @@ def main() -> int:
     parser.add_argument("--papers-path", type=Path, help="Path to papers payload")
     parser.add_argument("--papers-query", help="Query string used for papers search")
     parser.add_argument("--demo", action="store_true", help="Use demo data instead of MCP results")
+    parser.add_argument(
+        "--persist-inputs",
+        action="store_true",
+        help="Persist input payloads under runs/{run_id}/inputs",
+    )
     parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
     args = parser.parse_args()
 
@@ -923,6 +985,7 @@ def main() -> int:
         papers_query=args.papers_query,
         demo=args.demo,
         timezone_name=args.timezone,
+        persist_inputs=args.persist_inputs,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0

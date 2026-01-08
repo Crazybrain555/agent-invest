@@ -16,6 +16,7 @@ Build a stable, incremental, and traceable evidence pool by collecting SEC filin
 - lookback_days_news (optional, default 180)
 - papers_mode (optional, auto|on|off, default auto)
 - force_refresh (optional, default false)
+- persist_inputs (optional, default false; when true, store input payloads under runs/{run_id}/inputs)
 
 ## Hard dependencies
 - company/{TICKER}/company.yaml with a valid cik
@@ -66,4 +67,6 @@ Build a stable, incremental, and traceable evidence pool by collecting SEC filin
 
 ## Script
 - scripts/run.py implements the workflow and accepts optional JSON inputs for tool results.
+- Prefer inline JSON flags to avoid temporary files; inputs are not persisted by default.
+- If you must keep raw inputs for reproducibility, use --persist-inputs (keep payloads small).
 - references/query_templates.md provides optional query templates for news/papers.

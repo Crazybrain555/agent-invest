@@ -12,6 +12,7 @@ Initialize the company research tree, resolve identity, and capture a market sna
 - ticker (required)
 - as_of (optional, default today)
 - force_refresh (optional, default false)
+- persist_inputs (optional, default false; when true, store input payloads under runs/{run_id}/inputs)
 
 ## Outputs
 - company/{TICKER}/company.yaml
@@ -40,3 +41,5 @@ Initialize the company research tree, resolve identity, and capture a market sna
 
 ## Script
 - `scripts/run.py` implements the workflow and accepts optional JSON inputs for tool results.
+- Prefer `--identity-json/--market-json` to avoid writing temporary files. Inputs are not persisted by default.
+- If you must retain raw inputs for reproducibility, use `--persist-inputs` (keep payloads small).

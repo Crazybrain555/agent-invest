@@ -14,6 +14,7 @@ Build a minimal Statement Atlas (v0.1) to unblock recast-economic-statements. Us
 - lookback_years (optional, default 10)
 - force_refresh (optional, default false)
 - financials payloads from sec_edgar_mcp.get_financials (preferred)
+- persist_inputs (optional, default false; when true, store input payloads under runs/{run_id}/inputs)
 
 ## Hard dependencies
 - current/filings_index.yaml preferred (for accession -> period_end mapping)
@@ -58,6 +59,8 @@ Build a minimal Statement Atlas (v0.1) to unblock recast-economic-statements. Us
 
 ## Scripts
 - scripts/run.py implements the workflow and accepts JSON payloads for tool results.
+- Prefer inline JSON flags to avoid temporary files; inputs are not persisted by default.
+- If you must keep raw inputs for reproducibility, use --persist-inputs (keep payloads small).
 - scripts/build_atlas_minimal.py builds the v0.1 atlas from payloads.
 - scripts/build_atlas_full.py is a placeholder for v0.2 linkbase parsing.
 

@@ -32,6 +32,7 @@ if str(REPO_ROOT) not in sys.path:
 from company_research_runtime import (  # noqa: E402
     append_evidence,
     append_question,
+    atomic_write_json,
     atomic_write_parquet,
     atomic_write_yaml,
     build_needs,
@@ -123,6 +124,23 @@ def _append_evidence_record(
     append_evidence(evidence_path, record)
 
 
+def _persist_inputs(
+    run_dir: Path,
+    *,
+    payloads: list[Any],
+) -> list[str]:
+    if not payloads:
+        return []
+    inputs_dir = run_dir / "inputs"
+    atomic_write_json(
+        inputs_dir / "financials_payloads.json",
+        payloads,
+        ensure_ascii=False,
+        default=str,
+    )
+    return ["inputs/financials_payloads.json"]
+
+
 def _demo_payload(ticker: str, period_end: str) -> dict[str, Any]:
     accession = "0000000000-00-000000"
     return {
@@ -185,6 +203,7 @@ def run(
     financials_payloads: Iterable[Any] | None = None,
     demo: bool = False,
     timezone_name: str = DEFAULT_TIMEZONE,
+    persist_inputs: bool = False,
 ) -> dict[str, Any]:
     ticker = ticker.upper()
     as_of_value = as_of or date.today()
@@ -197,17 +216,6 @@ def run(
     run_dir = paths.run_dir(run_id)
     outputs_dir = run_dir / "outputs"
     outputs_dir.mkdir(parents=True, exist_ok=True)
-
-    meta = build_run_meta(
-        skill=SKILL_NAME,
-        ticker=ticker,
-        run_id=run_id,
-        as_of=as_of_value,
-        timezone=timezone_name,
-        lookback_years=lookback_years,
-        force_refresh=force_refresh,
-    )
-    write_meta(run_dir, meta)
 
     warnings: list[str] = []
     missing: list[str] = []
@@ -228,6 +236,22 @@ def run(
     payloads = _collect_payloads(financials_payloads or [])
     if demo and not payloads:
         payloads = [_demo_payload(ticker, as_of_label)]
+
+    persisted_inputs: list[str] = []
+    if persist_inputs and not demo:
+        persisted_inputs = _persist_inputs(run_dir, payloads=payloads)
+
+    meta = build_run_meta(
+        skill=SKILL_NAME,
+        ticker=ticker,
+        run_id=run_id,
+        as_of=as_of_value,
+        timezone=timezone_name,
+        lookback_years=lookback_years,
+        force_refresh=force_refresh,
+        inputs_persisted=persisted_inputs,
+    )
+    write_meta(run_dir, meta)
 
     if not payloads and facts_path.exists() and not force_refresh:
         status = "skipped"
@@ -446,6 +470,11 @@ def main() -> int:
     parser.add_argument("--financials-json", action="append", help="Inline JSON payload for financials")
     parser.add_argument("--financials-path", action="append", type=Path, help="Path to financials payload")
     parser.add_argument("--demo", action="store_true", help="Use demo data instead of MCP results")
+    parser.add_argument(
+        "--persist-inputs",
+        action="store_true",
+        help="Persist input payloads under runs/{run_id}/inputs",
+    )
     parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
     args = parser.parse_args()
 
@@ -469,6 +498,7 @@ def main() -> int:
         financials_payloads=payloads,
         demo=args.demo,
         timezone_name=args.timezone,
+        persist_inputs=args.persist_inputs,
     )
     return 0
 

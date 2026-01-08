@@ -31,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from company_research_runtime import (  # noqa: E402
     append_evidence,
+    atomic_write_json,
     atomic_write_yaml,
     build_needs,
     build_run_meta,
@@ -138,6 +139,23 @@ def _append_evidence_record(
     append_evidence(evidence_path, record)
 
 
+def _persist_inputs(
+    run_dir: Path,
+    *,
+    identity_payload: dict[str, Any] | None,
+    market_payload: dict[str, Any] | None,
+) -> list[str]:
+    inputs_dir = run_dir / "inputs"
+    persisted: list[str] = []
+    if identity_payload is not None:
+        atomic_write_json(inputs_dir / "identity_payload.json", identity_payload, ensure_ascii=False)
+        persisted.append("inputs/identity_payload.json")
+    if market_payload is not None:
+        atomic_write_json(inputs_dir / "market_payload.json", market_payload, ensure_ascii=False)
+        persisted.append("inputs/market_payload.json")
+    return persisted
+
+
 def run(
     ticker: str,
     *,
@@ -147,6 +165,7 @@ def run(
     market_payload: dict[str, Any] | None = None,
     demo: bool = False,
     timezone_name: str = DEFAULT_TIMEZONE,
+    persist_inputs: bool = False,
 ) -> dict[str, Any]:
     ticker = ticker.upper()
     as_of_value = as_of or date.today()
@@ -160,6 +179,14 @@ def run(
     outputs_dir = run_dir / "outputs"
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
+    persisted_inputs: list[str] = []
+    if persist_inputs and not demo:
+        persisted_inputs = _persist_inputs(
+            run_dir,
+            identity_payload=identity_payload,
+            market_payload=market_payload,
+        )
+
     meta = build_run_meta(
         skill=SKILL_NAME,
         ticker=ticker,
@@ -167,6 +194,7 @@ def run(
         as_of=as_of_value,
         timezone=timezone_name,
         force_refresh=force_refresh,
+        inputs_persisted=persisted_inputs,
     )
     write_meta(run_dir, meta)
 
@@ -326,6 +354,11 @@ def main() -> int:
     parser.add_argument("--identity-path", type=Path, help="Path to identity payload (json/yaml)")
     parser.add_argument("--market-path", type=Path, help="Path to market payload (json/yaml)")
     parser.add_argument("--demo", action="store_true", help="Use demo data instead of MCP results")
+    parser.add_argument(
+        "--persist-inputs",
+        action="store_true",
+        help="Persist input payloads under runs/{run_id}/inputs",
+    )
     parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
     args = parser.parse_args()
 
@@ -341,6 +374,7 @@ def main() -> int:
         market_payload=market_payload,
         demo=args.demo,
         timezone_name=args.timezone,
+        persist_inputs=args.persist_inputs,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
