@@ -105,7 +105,7 @@ Always run commands in UTF-8 terminals.
 - CMD:
   - `chcp 65001 >NUL`
 
-When reading/writing text files: always set `encoding=\"utf-8\"` (or `utf-8-sig` for Excel-friendly CSVs).
+When reading/writing text files: always set `encoding="utf-8"` (or `utf-8-sig` for Excel-friendly CSVs).
 
 ### 3.2 VS Code / Cursor tasks
 If present, common tasks live in `.vscode/tasks.json`. Run via Terminal -> Run Task...
