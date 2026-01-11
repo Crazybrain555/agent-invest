@@ -36,7 +36,7 @@ Build a stable, incremental, and traceable evidence pool by collecting SEC filin
 - sec_edgar_mcp.get_recent_filings
 - sec_edgar_mcp.get_filing_content
 - sec_edgar_mcp.get_filing_sections
-- gdelt.search_articles
+- gdelt.gdelt_search_articles
 - openalex.search_works (plus arxiv/pubmed when relevant)
 - fs
 

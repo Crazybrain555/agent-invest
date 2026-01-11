@@ -883,7 +883,7 @@ def run(
             evidence_path=paths.evidence_jsonl,
             ticker=ticker,
             claim=f"Captured {len(normalized_news)} news articles for {ticker}",
-            sources=[{"type": "gdelt", "tool": "search_articles", "count": len(normalized_news)}],
+            sources=[{"type": "gdelt", "tool": "gdelt_search_articles", "count": len(normalized_news)}],
             confidence=0.8,
         )
     if papers_records:

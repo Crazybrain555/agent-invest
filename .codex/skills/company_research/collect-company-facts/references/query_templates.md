@@ -1,6 +1,6 @@
 # Query templates for collect-company-facts
 
-## News (gdelt.search_articles)
+## News (gdelt.gdelt_search_articles)
 - Base: "{ticker}" OR "{company_name}"
 - With disambiguation: "{ticker}" OR "{company_name}" AND (earnings OR acquisition OR product OR lawsuit)
 - Example: "AAPL" OR "Apple Inc" AND (earnings OR guidance OR product)
