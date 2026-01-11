@@ -10,7 +10,7 @@ import sys
 import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import yaml
 
@@ -52,7 +52,7 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         return yaml.safe_load(handle) or {}
 
 
-def _load_payload(path: Path | None, inline_json: str | None) -> dict[str, Any] | None:
+def _load_payload(path: Path | None, inline_json: str | None) -> dict[str, Any] | list[Any] | None:
     if inline_json:
         return json.loads(inline_json)
     if path is None:
@@ -96,21 +96,217 @@ def _normalize_company_data(ticker: str, payload: dict[str, Any] | None) -> dict
         "currency": info.get("currency") or "USD",
     }
 
+def _parse_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip().replace(",", "").replace("$", "")
+    if not text or text.lower() in {"nan", "none", "null", "n/a"}:
+        return None
+    multiplier = 1.0
+    suffix = text[-1].upper()
+    if suffix in {"K", "M", "B", "T"}:
+        multiplier = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}[suffix]
+        text = text[:-1].strip()
+    try:
+        return float(text) * multiplier
+    except ValueError:
+        return None
 
-def _normalize_market_snapshot(payload: dict[str, Any] | None, as_of: str) -> dict[str, Any]:
-    data = payload or {}
+
+def _get_nested(payload: dict[str, Any], *keys: str) -> Any:
+    current: Any = payload
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+        if current is None:
+            return None
+    return current
+
+
+def _coerce_payload_list(payloads: Any) -> list[dict[str, Any]]:
+    if payloads is None:
+        return []
+    if isinstance(payloads, list):
+        merged: list[dict[str, Any]] = []
+        for item in payloads:
+            if isinstance(item, dict):
+                merged.append(item)
+            elif isinstance(item, list):
+                merged.extend(entry for entry in item if isinstance(entry, dict))
+        return merged
+    if isinstance(payloads, dict):
+        return [payloads]
+    return []
+
+
+def _infer_source_label(payload: dict[str, Any]) -> str | None:
+    source = payload.get("source")
+    if source:
+        return str(source)
+    if "fundamentals" in payload:
+        return "trading_mcp.get_fundamental_stock_metrics"
+    if any(key in payload for key in ("currentPrice", "regularMarketPrice", "quoteSourceName", "financialCurrency")):
+        return "yfinance.get_stock_info"
+    if any(key in payload for key in ("latest_trade", "latestTrade", "latest_quote", "latestQuote")):
+        return "alpaca.get_stock_snapshot"
+    if "facts" in payload:
+        return "sec_edgar_mcp.get_company_facts"
+    return None
+
+
+def _extract_price(payload: dict[str, Any]) -> Any:
+    fundamentals = payload.get("fundamentals", {}) if isinstance(payload.get("fundamentals"), dict) else {}
+    price = (
+        payload.get("price")
+        or payload.get("currentPrice")
+        or payload.get("regularMarketPrice")
+        or fundamentals.get("price")
+        or fundamentals.get("currentPrice")
+    )
+    if price is not None:
+        return price
+    trade = payload.get("latest_trade") or payload.get("latestTrade") or payload.get("trade")
+    if isinstance(trade, dict):
+        return trade.get("p") or trade.get("price")
+    quote = payload.get("latest_quote") or payload.get("latestQuote") or payload.get("quote")
+    if isinstance(quote, dict):
+        bid = quote.get("bp") or quote.get("bid_price") or quote.get("bidPrice")
+        ask = quote.get("ap") or quote.get("ask_price") or quote.get("askPrice")
+        bid_val = _parse_number(bid)
+        ask_val = _parse_number(ask)
+        if bid_val is not None and ask_val is not None:
+            return (bid_val + ask_val) / 2
+        return bid or ask
+    bar = payload.get("minute_bar") or payload.get("daily_bar")
+    if isinstance(bar, dict):
+        return bar.get("c") or bar.get("close")
+    return None
+
+
+def _extract_shares_outstanding(payload: dict[str, Any]) -> Any:
+    fundamentals = payload.get("fundamentals", {}) if isinstance(payload.get("fundamentals"), dict) else {}
+    return (
+        payload.get("shares_outstanding")
+        or payload.get("sharesOutstanding")
+        or payload.get("impliedSharesOutstanding")
+        or fundamentals.get("shares_outstanding")
+        or fundamentals.get("sharesOutstanding")
+    )
+
+
+def _extract_shares_float(payload: dict[str, Any]) -> Any:
+    fundamentals = payload.get("fundamentals", {}) if isinstance(payload.get("fundamentals"), dict) else {}
+    return (
+        payload.get("shares_float")
+        or payload.get("sharesFloat")
+        or payload.get("floatShares")
+        or fundamentals.get("shares_float")
+        or fundamentals.get("sharesFloat")
+    )
+
+
+def _extract_market_cap(payload: dict[str, Any]) -> Any:
+    fundamentals = payload.get("fundamentals", {}) if isinstance(payload.get("fundamentals"), dict) else {}
+    return payload.get("market_cap") or payload.get("marketCap") or fundamentals.get("marketCap")
+
+
+def _extract_enterprise_value(payload: dict[str, Any]) -> Any:
+    fundamentals = payload.get("fundamentals", {}) if isinstance(payload.get("fundamentals"), dict) else {}
+    return payload.get("enterprise_value") or payload.get("enterpriseValue") or fundamentals.get("enterpriseValue")
+
+
+def _extract_net_debt(payload: dict[str, Any]) -> Any:
+    fundamentals = payload.get("fundamentals", {}) if isinstance(payload.get("fundamentals"), dict) else {}
+    return payload.get("net_debt") or fundamentals.get("net_debt")
+
+
+def _build_source_label(sources: Iterable[str], primary: str | None) -> str:
+    unique = [value for value in dict.fromkeys([s for s in sources if s])]
+    if not unique and primary:
+        return primary
+    if not unique:
+        return "unknown"
+    if len(unique) == 1:
+        return unique[0]
+    return "mixed:" + "+".join(sorted(unique))
+
+
+def _normalize_market_snapshot(payloads: dict[str, Any] | list[dict[str, Any]] | None, as_of: str) -> dict[str, Any]:
+    data_sources = _coerce_payload_list(payloads)
+    sources_used: list[str] = []
+    price_source: str | None = None
+
+    price: float | None = None
+    shares_outstanding: float | None = None
+    shares_float: float | None = None
+    market_cap: float | None = None
+    enterprise_value: float | None = None
+    net_debt: float | None = None
+
+    for payload in data_sources:
+        source_label = _infer_source_label(payload)
+        if price is None:
+            price_value = _parse_number(_extract_price(payload))
+            if price_value is not None:
+                price = price_value
+                price_source = source_label
+                if source_label:
+                    sources_used.append(source_label)
+        if shares_outstanding is None:
+            shares_value = _parse_number(_extract_shares_outstanding(payload))
+            if shares_value is not None:
+                shares_outstanding = shares_value
+                if source_label:
+                    sources_used.append(source_label)
+        if shares_float is None:
+            float_value = _parse_number(_extract_shares_float(payload))
+            if float_value is not None:
+                shares_float = float_value
+                if source_label:
+                    sources_used.append(source_label)
+        if market_cap is None:
+            market_value = _parse_number(_extract_market_cap(payload))
+            if market_value is not None:
+                market_cap = market_value
+                if source_label:
+                    sources_used.append(source_label)
+        if enterprise_value is None:
+            ev_value = _parse_number(_extract_enterprise_value(payload))
+            if ev_value is not None:
+                enterprise_value = ev_value
+                if source_label:
+                    sources_used.append(source_label)
+        if net_debt is None:
+            net_debt_value = _parse_number(_extract_net_debt(payload))
+            if net_debt_value is not None:
+                net_debt = net_debt_value
+                if source_label:
+                    sources_used.append(source_label)
+
+    if market_cap is None and price is not None and shares_outstanding is not None:
+        market_cap = price * shares_outstanding
+    if enterprise_value is None and market_cap is not None and net_debt is not None:
+        enterprise_value = market_cap + net_debt
+    if net_debt is None and enterprise_value is not None and market_cap is not None:
+        net_debt = enterprise_value - market_cap
+
     snapshot = {
         "as_of": as_of,
-        "price": data.get("price"),
-        "shares_outstanding": data.get("shares_outstanding") or data.get("sharesOutstanding"),
-        "shares_float": data.get("shares_float") or data.get("sharesFloat"),
-        "market_cap": data.get("market_cap") or data.get("marketCap"),
-        "enterprise_value": data.get("enterprise_value") or data.get("enterpriseValue"),
-        "net_debt": data.get("net_debt"),
-        "source": data.get("source") or "trading_mcp.get_fundamental_stock_metrics",
+        "price": price,
+        "shares_outstanding": shares_outstanding,
+        "shares_float": shares_float,
+        "market_cap": market_cap,
+        "enterprise_value": enterprise_value,
+        "net_debt": net_debt,
+        "source": _build_source_label(sources_used, price_source),
     }
-    if snapshot["net_debt"] is None and snapshot["enterprise_value"] is not None and snapshot["market_cap"] is not None:
-        snapshot["net_debt"] = snapshot["enterprise_value"] - snapshot["market_cap"]
     return snapshot
 
 
@@ -139,11 +335,30 @@ def _append_evidence_record(
     append_evidence(evidence_path, record)
 
 
+def _source_label_to_evidence_sources(source: str | None) -> list[dict[str, Any]]:
+    if not source:
+        return [{"type": "unknown", "tool": "unknown"}]
+    if source.startswith("mixed:"):
+        items = source.replace("mixed:", "", 1).split("+")
+        sources: list[dict[str, Any]] = []
+        for item in items:
+            if "." in item:
+                namespace, tool = item.split(".", 1)
+                sources.append({"type": namespace, "tool": tool})
+            else:
+                sources.append({"type": "unknown", "tool": item})
+        return sources or [{"type": "unknown", "tool": "unknown"}]
+    if "." in source:
+        namespace, tool = source.split(".", 1)
+        return [{"type": namespace, "tool": tool}]
+    return [{"type": "unknown", "tool": source}]
+
+
 def _persist_inputs(
     run_dir: Path,
     *,
     identity_payload: dict[str, Any] | None,
-    market_payload: dict[str, Any] | None,
+    market_payload: dict[str, Any] | list[Any] | None,
 ) -> list[str]:
     inputs_dir = run_dir / "inputs"
     persisted: list[str] = []
@@ -162,7 +377,7 @@ def run(
     as_of: date | str | None = None,
     force_refresh: bool = False,
     identity_payload: dict[str, Any] | None = None,
-    market_payload: dict[str, Any] | None = None,
+    market_payload: dict[str, Any] | list[dict[str, Any]] | None = None,
     demo: bool = False,
     timezone_name: str = DEFAULT_TIMEZONE,
     persist_inputs: bool = False,
@@ -309,7 +524,7 @@ def run(
             evidence_path=paths.evidence_jsonl,
             ticker=ticker,
             claim=f"Captured market snapshot for {ticker} as of {as_of_label}",
-            sources=[{"type": "trading_mcp", "tool": "get_fundamental_stock_metrics"}],
+            sources=_source_label_to_evidence_sources(market_data.get("source")),
             confidence=0.9,
         )
 
@@ -350,9 +565,18 @@ def main() -> int:
     parser.add_argument("--as-of", dest="as_of", help="Snapshot date YYYY-MM-DD")
     parser.add_argument("--force-refresh", action="store_true")
     parser.add_argument("--identity-json", help="Inline JSON from identity tool calls")
-    parser.add_argument("--market-json", help="Inline JSON from trading_mcp tool call")
+    parser.add_argument(
+        "--market-json",
+        action="append",
+        help="Inline JSON payload (repeat to merge multiple sources in priority order)",
+    )
     parser.add_argument("--identity-path", type=Path, help="Path to identity payload (json/yaml)")
-    parser.add_argument("--market-path", type=Path, help="Path to market payload (json/yaml)")
+    parser.add_argument(
+        "--market-path",
+        action="append",
+        type=Path,
+        help="Path to market payload (json/yaml); repeat to merge multiple sources",
+    )
     parser.add_argument("--demo", action="store_true", help="Use demo data instead of MCP results")
     parser.add_argument(
         "--persist-inputs",
@@ -363,7 +587,16 @@ def main() -> int:
     args = parser.parse_args()
 
     identity_payload = _load_payload(args.identity_path, args.identity_json)
-    market_payload = _load_payload(args.market_path, args.market_json)
+    market_payloads: list[Any] = []
+    if args.market_json:
+        market_payloads.extend(_load_payload(None, item) for item in args.market_json)
+    if args.market_path:
+        market_payloads.extend(_load_payload(item, None) for item in args.market_path)
+    market_payload: dict[str, Any] | list[dict[str, Any]] | None
+    if market_payloads:
+        market_payload = market_payloads
+    else:
+        market_payload = None
     as_of_value = _parse_as_of(args.as_of)
 
     result = run(

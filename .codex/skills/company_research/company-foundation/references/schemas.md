@@ -34,6 +34,10 @@ Required keys:
 - net_debt: number or null
 - source: string
 
+Notes:
+- `source` may be a single tool label (e.g., `alpaca.get_stock_snapshot`) or a mixed label
+  like `mixed:alpaca.get_stock_snapshot+yfinance.get_stock_info` when multiple sources were merged.
+
 Example:
 ```yaml
 as_of: "2026-01-06"

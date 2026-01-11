@@ -108,8 +108,12 @@ Always run commands in UTF-8 terminals.
 When reading/writing text files: always set `encoding="utf-8"` (or `utf-8-sig` for Excel-friendly CSVs).
 
 ### 3.2 Python environment (skills)
-- Use `python` (Python 3.10+ recommended) and install deps from `requirements.txt` when running skill scripts locally.
-- Quick sanity check: `python -c "import yaml, pandas, pyarrow"`.
+- Prefer the pre-provisioned sandbox Python environment (this repo is typically run inside `aiquantlab` conda env).
+- Do **not** default to ad-hoc `pip install` / reading `requirements.txt` during agent runs; only install packages if:
+  - the user explicitly asks, or
+  - a required import is missing and there is no simpler in-repo alternative.
+- Quick sanity check (non-destructive): `python -V` and `python -c "import yaml, pandas, pyarrow"`.
+- If a dependency is missing, report the exact `ImportError` and propose the smallest change (prefer using the existing env, not creating a new one).
 
 ### 3.3 VS Code / Cursor tasks
 If present, common tasks live in `.vscode/tasks.json`. Run via Terminal -> Run Task...
