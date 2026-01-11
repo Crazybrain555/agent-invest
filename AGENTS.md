@@ -107,10 +107,14 @@ Always run commands in UTF-8 terminals.
 
 When reading/writing text files: always set `encoding="utf-8"` (or `utf-8-sig` for Excel-friendly CSVs).
 
-### 3.2 VS Code / Cursor tasks
+### 3.2 Python environment (skills)
+- Use `python` (Python 3.10+ recommended) and install deps from `requirements.txt` when running skill scripts locally.
+- Quick sanity check: `python -c "import yaml, pandas, pyarrow"`.
+
+### 3.3 VS Code / Cursor tasks
 If present, common tasks live in `.vscode/tasks.json`. Run via Terminal -> Run Task...
 
-### 3.3 Proxy note (WSL)
+### 3.4 Proxy note (WSL)
 If WSL prints localhost proxy warnings in NAT mode:
 - disable proxy envs in `~/.bashrc`, or
 - switch WSL to mirrored networking on Windows: `wsl --set-default-networking-mode mirrored`,
@@ -124,6 +128,7 @@ Primary working areas:
 - `.codex/skills/`: skill definitions and scripts; start from the relevant `SKILL.md`.
 - `.codex/skills/public/`: reusable public skills (e.g., stock pool).
 - `.codex/skills/company_research/`: company research skills and scripts.
+- `company_research_runtime/`: shared runtime helpers used by company research skills (do not delete).
 - Root docs: `README.md`, `AGENTS.md`, `CLAUDE.md`, and planning notes (`stock_skills_*.md`, `Phase 1 核心估值链 Codex Skills 实施指南.md`, `CORR_TOOL_CORE_API_PLAN.md`).
 
 Notes:
