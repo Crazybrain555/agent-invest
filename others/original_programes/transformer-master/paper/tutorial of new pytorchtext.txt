@@ -1,2 +1,0 @@
-the tutorial document for new vision of pytorchtext package
-https://github.com/pytorch/text/blob/master/examples/legacy_tutorial/migration_tutorial.ipynb

@@ -1,7 +1,0 @@
-python run_space_data_pipeline.py  --latest --range-days 30  --data-type signals     #  这个是按照文件夹的文件循环的
-
-python run_space_data_pipeline.py  --start-date 20020101  --end-date  20031231 --category sentiment --custom-table  quantitative_sentiment_signals # 
- 这个是按照ymal sentiment类的文件  quantitative_sentiment_signals 可以自定义 不加默认quantitative_sentiment_signals，方便测试
-
-
-python run_space_data_pipeline.py  --start-date 20020101  --end-date  20250826  --category growth --custom-table  quantitative_growth_signals

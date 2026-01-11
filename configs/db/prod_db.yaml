@@ -1,9 +1,0 @@
-version: "1.0"
-env: "prod"
-host: 10.23.5.103
-port: 1521
-user: quant
-password: Rgznz123456_
-database: qfdb
-driver: oracle
-connection_string: oracle://quant:Rgznz123456_@10.23.5.103:1521/qfdb 

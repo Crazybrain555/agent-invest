@@ -1,9 +1,0 @@
-version: "1.0"
-env: "test"
-host: 10.18.37.30
-port: 11033
-user: ai_is
-password: MjTlahb3bEYf5
-database: ai_is
-driver: postgresql+psycopg2
-connection_string: postgresql://ai_is:MjTlahb3bEYf5@10.18.37.30:11033/ai_is?sslmode=disable
