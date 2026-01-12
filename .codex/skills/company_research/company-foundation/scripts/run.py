@@ -80,19 +80,151 @@ def _as_of_str(value: date | str | None) -> str:
     return str(value)
 
 
-def _normalize_company_data(ticker: str, payload: dict[str, Any] | None) -> dict[str, Any]:
+def _normalize_exchange(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if "AssetExchange." in text:
+        text = text.split("AssetExchange.", 1)[1]
+    upper = text.upper()
+    code_map = {
+        "NYQ": "NYSE",
+        "NMS": "NASDAQ",
+        "NAS": "NASDAQ",
+        "NGS": "NASDAQ",
+        "NGM": "NASDAQ",
+        "NCM": "NASDAQ",
+        "ASE": "NYSEAMERICAN",
+    }
+    if upper in code_map:
+        return code_map[upper]
+    if upper.startswith("NASDAQ"):
+        return "NASDAQ"
+    if upper.startswith("NYSE"):
+        return "NYSE"
+    return upper
+
+
+def _parse_mm_dd(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if len(text) == 5 and text[2] == "-" and text[:2].isdigit() and text[3:].isdigit():
+            return text
+        iso_part = text.split("T", 1)[0].split(" ", 1)[0]
+        try:
+            parsed = date.fromisoformat(iso_part)
+            return parsed.strftime("%m-%d")
+        except ValueError:
+            pass
+        for fmt in ("%B %d, %Y", "%b %d, %Y"):
+            try:
+                parsed_dt = datetime.strptime(text, fmt)
+                return parsed_dt.date().strftime("%m-%d")
+            except ValueError:
+                continue
+    return None
+
+
+def _extract_period_of_report_mm_dd(payload: dict[str, Any]) -> str | None:
+    direct = payload.get("period_of_report") or payload.get("periodOfReport")
+    mm_dd = _parse_mm_dd(direct)
+    if mm_dd:
+        return mm_dd
+    filings = payload.get("filings")
+    if isinstance(filings, list):
+        for item in filings:
+            if not isinstance(item, dict):
+                continue
+            mm_dd = _parse_mm_dd(item.get("period_of_report") or item.get("periodOfReport"))
+            if mm_dd:
+                return mm_dd
+    return None
+
+
+def _extract_document_period_end_mm_dd(payload: dict[str, Any]) -> str | None:
+    concepts = payload.get("concepts")
+    if isinstance(payload.get("xbrl_concepts"), dict) and not isinstance(concepts, dict):
+        concepts = payload["xbrl_concepts"].get("concepts")
+    if not isinstance(concepts, dict):
+        return None
+    entry = concepts.get("DocumentPeriodEndDate")
+    if isinstance(entry, dict):
+        for key in ("period", "raw_value", "value"):
+            mm_dd = _parse_mm_dd(entry.get(key))
+            if mm_dd:
+                return mm_dd
+    return _parse_mm_dd(entry)
+
+
+def _normalize_company_data(
+    ticker: str,
+    payload: dict[str, Any] | None,
+    *,
+    supplemental_payloads: Any = None,
+) -> dict[str, Any]:
     data = payload or {}
     info = data.get("company_info") or data
     cik_value = data.get("cik") or info.get("cik") or info.get("cik_number")
     if isinstance(cik_value, dict):
         cik_value = cik_value.get("cik")
+    if isinstance(cik_value, int):
+        cik_value = f"{cik_value:010d}"
+    elif isinstance(cik_value, str) and cik_value.isdigit() and len(cik_value) < 10:
+        cik_value = cik_value.zfill(10)
+    supplemental_list = _coerce_payload_list(supplemental_payloads)
+
+    exchange = _normalize_exchange(info.get("exchange"))
+    if not exchange:
+        best: tuple[int, str] | None = None
+        for item in supplemental_list:
+            source_label = _infer_source_label(item) or ""
+            candidate = _normalize_exchange(item.get("exchange")) or _normalize_exchange(item.get("fullExchangeName"))
+            if not candidate:
+                continue
+            priority = 0 if source_label.startswith("alpaca") else 1
+            choice = (priority, candidate)
+            if best is None or choice < best:
+                best = choice
+        if best is not None:
+            exchange = best[1]
+
+    fiscal_year_end = _parse_mm_dd(info.get("fiscal_year_end") or info.get("fiscalYearEnd"))
+    if fiscal_year_end is None:
+        best_mm_dd: str | None = None
+        for item in supplemental_list:
+            source_label = _infer_source_label(item) or ""
+            if not source_label.startswith("sec_edgar_mcp.get_recent_filings"):
+                continue
+            best_mm_dd = _extract_period_of_report_mm_dd(item)
+            if best_mm_dd:
+                break
+        if best_mm_dd is None:
+            for item in supplemental_list:
+                best_mm_dd = _extract_period_of_report_mm_dd(item)
+                if best_mm_dd:
+                    break
+        if best_mm_dd is None:
+            for item in supplemental_list:
+                best_mm_dd = _extract_document_period_end_mm_dd(item)
+                if best_mm_dd:
+                    break
+        fiscal_year_end = best_mm_dd
+
     return {
         "ticker": ticker,
         "company_name": info.get("company_name") or info.get("name"),
         "cik": cik_value,
-        "exchange": info.get("exchange"),
+        "exchange": exchange,
         "sic": info.get("sic"),
-        "fiscal_year_end": info.get("fiscal_year_end") or info.get("fiscalYearEnd"),
+        "fiscal_year_end": fiscal_year_end,
         "currency": info.get("currency") or "USD",
     }
 
@@ -217,15 +349,15 @@ def _extract_market_cap(payload: dict[str, Any]) -> Any:
     return payload.get("market_cap") or payload.get("marketCap") or fundamentals.get("marketCap")
 
 
-def _extract_enterprise_value(payload: dict[str, Any]) -> Any:
+def _extract_enterprise_value(payload: dict[str, Any]) -> tuple[Any, str]:
     fundamentals = payload.get("fundamentals", {}) if isinstance(payload.get("fundamentals"), dict) else {}
-    return payload.get("enterprise_value") or payload.get("enterpriseValue") or fundamentals.get("enterpriseValue")
-
-
-def _extract_net_debt(payload: dict[str, Any]) -> Any:
-    fundamentals = payload.get("fundamentals", {}) if isinstance(payload.get("fundamentals"), dict) else {}
-    return payload.get("net_debt") or fundamentals.get("net_debt")
-
+    if "enterprise_value" in payload:
+        return payload.get("enterprise_value"), "normalized"
+    if "enterpriseValue" in payload:
+        return payload.get("enterpriseValue"), "raw"
+    if "enterpriseValue" in fundamentals:
+        return fundamentals.get("enterpriseValue"), "raw"
+    return None, "missing"
 
 def _build_source_label(sources: Iterable[str], primary: str | None) -> str:
     unique = [value for value in dict.fromkeys([s for s in sources if s])]
@@ -238,17 +370,55 @@ def _build_source_label(sources: Iterable[str], primary: str | None) -> str:
     return "mixed:" + "+".join(sorted(unique))
 
 
-def _normalize_market_snapshot(payloads: dict[str, Any] | list[dict[str, Any]] | None, as_of: str) -> dict[str, Any]:
+def _extract_fx_rate(payload: dict[str, Any]) -> tuple[str, str, float] | None:
+    fx_from = payload.get("fx_from")
+    fx_to = payload.get("fx_to")
+    fx_rate = payload.get("fx_rate")
+    if isinstance(payload.get("fx"), dict):
+        fx_from = fx_from or payload["fx"].get("from")
+        fx_to = fx_to or payload["fx"].get("to")
+        fx_rate = fx_rate or payload["fx"].get("rate")
+    if not fx_from or not fx_to:
+        return None
+    rate_value = _parse_number(fx_rate)
+    if rate_value is None or rate_value == 0:
+        return None
+    return str(fx_from).upper(), str(fx_to).upper(), float(rate_value)
+
+
+def _build_fx_table(payloads: list[dict[str, Any]]) -> tuple[dict[tuple[str, str], float], dict[tuple[str, str], str]]:
+    table: dict[tuple[str, str], float] = {}
+    sources: dict[tuple[str, str], str] = {}
+    for payload in payloads:
+        extracted = _extract_fx_rate(payload)
+        if extracted is None:
+            continue
+        fx_from, fx_to, rate = extracted
+        source_label = payload.get("source") or _infer_source_label(payload) or "fx"
+        table[(fx_from, fx_to)] = rate
+        sources[(fx_from, fx_to)] = str(source_label)
+        if rate != 0:
+            table[(fx_to, fx_from)] = 1.0 / rate
+            sources[(fx_to, fx_from)] = str(source_label)
+    return table, sources
+
+
+def _normalize_market_snapshot(
+    payloads: dict[str, Any] | list[dict[str, Any]] | None,
+    as_of: str,
+) -> dict[str, Any]:
+    market_cap_rel_diff_threshold = 0.10
     data_sources = _coerce_payload_list(payloads)
+    fx_table, fx_sources = _build_fx_table(data_sources)
     sources_used: list[str] = []
     price_source: str | None = None
+    desired_currency = "USD"
 
     price: float | None = None
     shares_outstanding: float | None = None
     shares_float: float | None = None
-    market_cap: float | None = None
+    market_cap_extracted: float | None = None
     enterprise_value: float | None = None
-    net_debt: float | None = None
 
     for payload in data_sources:
         source_label = _infer_source_label(payload)
@@ -271,40 +441,77 @@ def _normalize_market_snapshot(payloads: dict[str, Any] | list[dict[str, Any]] |
                 shares_float = float_value
                 if source_label:
                     sources_used.append(source_label)
-        if market_cap is None:
+        if market_cap_extracted is None:
             market_value = _parse_number(_extract_market_cap(payload))
             if market_value is not None:
-                market_cap = market_value
+                market_currency = payload.get("currency") or payload.get("quoteCurrency")
+                if market_currency and str(market_currency).upper() != desired_currency:
+                    rate = fx_table.get((str(market_currency).upper(), desired_currency))
+                    if rate is None:
+                        continue
+                    market_value = market_value * rate
+                    fx_source = fx_sources.get((str(market_currency).upper(), desired_currency))
+                    if fx_source:
+                        sources_used.append(fx_source)
+                market_cap_extracted = market_value
                 if source_label:
                     sources_used.append(source_label)
         if enterprise_value is None:
-            ev_value = _parse_number(_extract_enterprise_value(payload))
+            ev_raw, ev_kind = _extract_enterprise_value(payload)
+            ev_value = _parse_number(ev_raw)
             if ev_value is not None:
-                enterprise_value = ev_value
-                if source_label:
-                    sources_used.append(source_label)
-        if net_debt is None:
-            net_debt_value = _parse_number(_extract_net_debt(payload))
-            if net_debt_value is not None:
-                net_debt = net_debt_value
-                if source_label:
-                    sources_used.append(source_label)
+                if ev_kind == "normalized":
+                    enterprise_value = ev_value
+                    if source_label:
+                        sources_used.append(source_label)
+                else:
+                    financial_currency = payload.get("financialCurrency") or payload.get("financial_currency")
+                    listing_currency = payload.get("currency") or payload.get("quoteCurrency")
+                    value_currency = (str(financial_currency).upper() if financial_currency else None) or (
+                        str(listing_currency).upper() if listing_currency else None
+                    )
+                    if value_currency and value_currency != desired_currency:
+                        rate = fx_table.get((value_currency, desired_currency))
+                        if rate is not None:
+                            enterprise_value = ev_value * rate
+                            if source_label:
+                                sources_used.append(source_label)
+                            fx_source = fx_sources.get((value_currency, desired_currency))
+                            if fx_source:
+                                sources_used.append(fx_source)
+                        else:
+                            continue
+                    else:
+                        enterprise_value = ev_value
+                        if source_label:
+                            sources_used.append(source_label)
 
-    if market_cap is None and price is not None and shares_outstanding is not None:
-        market_cap = price * shares_outstanding
-    if enterprise_value is None and market_cap is not None and net_debt is not None:
-        enterprise_value = market_cap + net_debt
-    if net_debt is None and enterprise_value is not None and market_cap is not None:
-        net_debt = enterprise_value - market_cap
+    market_cap_derived: float | None = None
+    if price is not None and shares_outstanding is not None:
+        market_cap_derived = price * shares_outstanding
+    market_cap = market_cap_extracted
+    if market_cap is None:
+        market_cap = market_cap_derived
+    elif market_cap_derived is not None and market_cap not in (0, None):
+        rel_diff = abs(market_cap - market_cap_derived) / abs(market_cap)
+        if rel_diff >= market_cap_rel_diff_threshold:
+            market_cap = market_cap_derived
+
+    if shares_float is not None and shares_outstanding is not None:
+        if shares_float <= 0:
+            shares_float = None
+        elif shares_float > shares_outstanding * 1.1:
+            shares_float = None
+    # Do not auto-derive enterprise_value here; currency alignment (especially ADRs) can be ambiguous.
 
     snapshot = {
         "as_of": as_of,
+        "currency": desired_currency,
         "price": price,
         "shares_outstanding": shares_outstanding,
         "shares_float": shares_float,
         "market_cap": market_cap,
         "enterprise_value": enterprise_value,
-        "net_debt": net_debt,
         "source": _build_source_label(sources_used, price_source),
     }
     return snapshot
@@ -429,7 +636,7 @@ def run(
             },
         )
     else:
-        company_data = _normalize_company_data(ticker, identity_payload)
+        company_data = _normalize_company_data(ticker, identity_payload, supplemental_payloads=market_payload)
 
     existing_market = _load_yaml(paths.current_dir / "market_snapshot.yaml")
     market_skipped = (
@@ -451,7 +658,10 @@ def run(
             as_of_label,
         )
     else:
-        market_data = _normalize_market_snapshot(market_payload, as_of_label)
+        market_data = _normalize_market_snapshot(
+            market_payload,
+            as_of_label,
+        )
 
     identity_status = "skipped" if identity_skipped else "ok" if company_data.get("cik") else "blocked"
     market_complete = market_data.get("price") is not None and market_data.get("shares_outstanding") is not None

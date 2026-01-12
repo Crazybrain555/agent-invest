@@ -189,22 +189,19 @@ exchange: "NYSE"
 sic: "1234"
 fiscal_year_end: "12-31"
 currency: "USD"
-identity_sources:
-  - type: sec
-    ref: "CIK lookup"
 ```
 
 ### 5.2 market_snapshot.yaml
 
 ```yaml
 as_of: 2026-01-04
+currency: USD                 # 当前强制以 USD 输出
 price: 12.34
 shares_outstanding: 100000000
 shares_float: 80000000          # 若可取到，否则 null
 market_cap: 1234000000
-enterprise_value: 1500000000    # 若能算
-net_debt: 266000000
-source: "trading_mcp.get_fundamental_stock_metrics"
+enterprise_value: 1500000000    # 若能取到/能换算到 USD；否则 null
+source: "mixed:alpaca.get_stock_latest_trade+yfinance.get_stock_info"
 ```
 
 ### 5.3 filings_index.yaml
@@ -339,17 +336,19 @@ links:
 
 ## 六、九个 Skills 总览
 
-| # | Skill | 职责 | 对"利润×质量"贡献 |
-|---|-------|------|------------------|
-| 1 | `company-foundation` | 身份 + 市场口径（含 shares） | 估值分母/每股化基座 |
-| 2 | `collect-company-facts` | filings + 新闻 + 论文 | 证据池 |
-| 3 | `extract-xbrl-timeseries` | 报表图谱（树+事实+溯源） | 利润事实底座 |
-| 4 | `recast-economic-statements` | 经济三表 + 核心指标 | Owner Earnings / ROIC |
-| 5 | `profit-quality-and-risk` | 财报质量/操纵风险/利润可持续性 | 质量系数与情景下界 |
-| 6 | `growth-driver-explorer` | 增长来源与 ROIIC/生命周期 | 未来利润路径 |
-| 7 | `moat-inferencer` | 护城河 → 优势期 → 质量系数映射 | 质量系数主体 |
-| 8 | `valuation-and-margin-of-safety` | 估值区间 + MOS + 敏感性 | 输出 IV vs 市场 |
-| 9 | `cross-examination-audit` | 反问审计：找矛盾/遗漏/为什么便宜 | 提高确定性，防大错 |
+> 注：本 v2 规划目标是 9 个 Skills；当前 Phase 1 v0.1 已实现 5 个（其余为 roadmap）。
+
+| # | Skill | 状态 | 职责 | 对"利润×质量"贡献 |
+|---|-------|------|------|------------------|
+| 1 | `company-foundation` | 已实现 | 身份 + 市场口径（含 shares） | 估值分母/每股化基座 |
+| 2 | `collect-company-facts` | 已实现 | filings + 新闻 + 论文 | 证据池 |
+| 3 | `extract-xbrl-timeseries` | 已实现 | 报表图谱（树+事实+溯源） | 利润事实底座 |
+| 4 | `recast-economic-statements` | 已实现 | 经济三表 + 核心指标 | Owner Earnings / ROIC |
+| 5 | `profit-quality-and-risk` | 规划中 | 财报质量/操纵风险/利润可持续性 | 质量系数与情景下界 |
+| 6 | `growth-driver-explorer` | 规划中 | 增长来源与 ROIIC/生命周期 | 未来利润路径 |
+| 7 | `moat-inferencer` | 规划中 | 护城河 → 优势期 → 质量系数映射 | 质量系数主体 |
+| 8 | `valuation-and-margin-of-safety` | 已实现 | 估值区间 + MOS + 敏感性 | 输出 IV vs 市场 |
+| 9 | `cross-examination-audit` | 规划中 | 反问审计：找矛盾/遗漏/为什么便宜 | 提高确定性，防大错 |
 
 ---
 
@@ -391,7 +390,11 @@ links:
 
 1. 确保目录树存在（current/raw/runs）
 2. 身份解析：SEC CIK、公司名、FY end、货币等
-3. 市场口径：调用 `trading_mcp` 拿 price、shares outstanding、float（若有）、market cap、债务现金（能算 EV 就算）
+3. 市场口径：
+   - `alpaca` 优先提供 `price`（低频量价数据更稳定）
+   - shares / market cap / EV：优先 trading_mcp/SEC，其次 Yahoo 兜底
+   - `market_cap` 默认用来源值（如 Yahoo `marketCap`），并用 `price * shares_outstanding` 交叉验证（差异过大才切换到派生值）
+   - `enterprise_value` 以 USD 输出；若 ADR 出现 `financialCurrency != USD`（如 BABA 的 CNY），需 FX payload 才能换算
 4. 写 evidence（身份来源、市场数据来源）
 
 **查漏补缺规则**
@@ -412,7 +415,7 @@ links:
 **职责边界**
 
 - 拉 SEC filings 原文 + XBRL（按 form、lookback）
-- 拉新闻事件（gdelt/rss）并生成 digest
+- 拉新闻事件（优先 `gdelt.gdelt_search_articles`；必要时可用 rss 作为补充）并生成 digest
 - 拉论文/技术资料（openalex/arxiv/pubmed），生成 digest
 - **增量更新**：已有 accession 不重复下载
 
@@ -1153,9 +1156,3 @@ version: v0.1
 | `cross-examination-audit` | 反问审计，防大错 |
 
 **第二阶段产出**：显著提升"错杀 vs 价值陷阱"的分辨能力。
-
-
-
-
-
-##十二 各个skill搭建的具体方法清单

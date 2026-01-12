@@ -25,9 +25,11 @@ Initialize the company research tree, resolve identity, and capture a market sna
 ## MCP tools
 - sec_edgar_mcp.get_cik_by_ticker
 - sec_edgar_mcp.get_company_info
+- sec_edgar_mcp.get_recent_filings (annual form period_of_report → fiscal_year_end)
 - sec_edgar_mcp.get_xbrl_concepts (optional shares outstanding fallback)
 - trading_mcp.get_fundamental_stock_metrics
 - alpaca.get_stock_latest_trade / alpaca.get_stock_snapshot (price)
+- alpaca.get_asset (exchange fallback)
 - yfinance.get_stock_info (fallback for shares/market cap/EV)
 - fs (write under /home/help/mcp/work/company_research)
 
@@ -36,8 +38,9 @@ Initialize the company research tree, resolve identity, and capture a market sna
 2. Skip identity when company.yaml has a valid cik and force_refresh is false.
 3. Skip market snapshot when as_of matches and price + shares_outstanding exist.
 4. Resolve identity via SEC tools; use fallback only if needed.
-5. Fetch market snapshot with a multi-source chain; compute market_cap/EV/net_debt when possible.
-6. Write run outputs, promote to current on ok/partial, update artifacts_state, append evidence.
+5. Fetch market snapshot with a multi-source chain; keep `market_cap` from a primary source and cross-check vs `price*shares_outstanding` (switch only on large divergence); fill `enterprise_value` in USD when currency is aligned (or FX-converted).
+6. Fill `company.yaml.exchange` via Alpaca asset exchange (preferred) with Yahoo fallback; infer `company.yaml.fiscal_year_end` from SEC annual filing `period_of_report`.
+7. Write run outputs, promote to current on ok/partial, update artifacts_state, append evidence.
 
 ## Market snapshot sourcing (recommended)
 Priority order (use whichever data you can fetch; earlier sources fill missing fields first):
@@ -49,8 +52,22 @@ Priority order (use whichever data you can fetch; earlier sources fill missing f
 
 Notes:
 - Alpaca does not provide shares outstanding; use trading_mcp/SEC/Yahoo for share counts.
+- `market_cap` is taken from the first available `marketCap` (e.g., Yahoo), and cross-checked against
+  `price*shares_outstanding`. Only switch to derived when the relative gap is large.
 - For ADRs (e.g., BABA), Yahoo's `enterpriseValue` can be in financial currency (CNY) while `marketCap` is USD.
-  Treat `enterprise_value` as optional unless you confirm currency alignment.
+  Use an FX payload to convert, or treat `enterprise_value` as optional unless you confirm currency alignment.
+- `market_snapshot.yaml` is USD-denominated (`currency: USD`). Values in other currencies should be converted before writing.
+
+## company.yaml fields (recommended)
+- `exchange`: primary listing exchange (prefer `alpaca.get_asset`, fallback to `yfinance.get_stock_info` exchange fields).
+- `fiscal_year_end`: derived from the most recent annual SEC filing `period_of_report` (10-K / 20-F).
+
+### FX payload (optional, for ADRs)
+If your market payload includes `enterpriseValue` with `financialCurrency != currency`, you can pass an FX payload:
+```json
+{"fx_from":"USD","fx_to":"CNY","fx_rate":6.9831,"source":"yfinance.get_stock_info"}
+```
+The runner will invert the rate as needed (e.g., CNY→USD) to normalize `enterprise_value`.
 
 ## References
 - `references/schemas.md` for company.yaml and market_snapshot.yaml schemas.

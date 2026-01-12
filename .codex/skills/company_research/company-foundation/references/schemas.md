@@ -26,12 +26,12 @@ currency: USD
 
 Required keys:
 - as_of: string (YYYY-MM-DD)
+- currency: string (currently always USD)
 - price: number or null
 - shares_outstanding: number or null
 - shares_float: number or null
 - market_cap: number or null
 - enterprise_value: number or null
-- net_debt: number or null
 - source: string
 
 Notes:
@@ -41,11 +41,11 @@ Notes:
 Example:
 ```yaml
 as_of: "2026-01-06"
+currency: USD
 price: 187.25
 shares_outstanding: 15400000000
 shares_float: 15300000000
 market_cap: 2883650000000
 enterprise_value: 2900000000000
-net_debt: 16350000000
 source: trading_mcp.get_fundamental_stock_metrics
 ```

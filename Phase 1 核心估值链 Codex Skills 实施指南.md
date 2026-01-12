@@ -365,13 +365,17 @@ version: v0.1
 ## What This Skill Does
 1. Create folder tree under /home/help/mcp/work/company_research/company/{TICKER}/
 2. Resolve identity via SEC EDGAR (ticker to CIK, company name, exchange, FY end)
-3. Fetch market snapshot via trading_mcp (price, shares, market cap, EV)
+3. Fetch market snapshot via multi-source chain (Alpaca price; shares/marketCap/EV from trading_mcp/SEC/Yahoo)
 4. Write to runs/{run_id}/ then atomically promote to current/
 
 ## MCP Tools
 - sec_edgar_mcp.get_cik_by_ticker - resolve CIK from ticker
 - sec_edgar_mcp.get_company_info - get company details
-- trading_mcp.get_fundamental_stock_metrics - get price shares market_cap enterprise_value
+- sec_edgar_mcp.get_recent_filings - infer fiscal year end from annual filing period_of_report
+- alpaca.get_stock_latest_trade / alpaca.get_stock_snapshot - price (USD)
+- alpaca.get_asset - exchange fallback
+- trading_mcp.get_fundamental_stock_metrics - (optional) shares / marketCap / EV
+- yfinance.get_stock_info - fallback shares / marketCap / EV (ADRs may need FX conversion)
 - fs - write files
 
 ## Inputs
@@ -419,36 +423,38 @@ if existing.get("cik") and not force_refresh:
 # Call MCP tool
 cik_result = sec_edgar_mcp.get_cik_by_ticker(ticker=ticker)
 company_info = sec_edgar_mcp.get_company_info(identifier=ticker)
+annual = sec_edgar_mcp.get_recent_filings(identifier=ticker, form_type="10-K", days=3650, limit=1)
 
 company_data = {
     "ticker": ticker.upper(),
     "company_name": company_info.get("name"),
     "cik": cik_result.get("cik"),
-    "exchange": company_info.get("exchange"),
+    # Prefer Alpaca asset exchange; SEC company_info.exchange is often null
+    "exchange": normalize_exchange(alpaca.get_asset(symbol=ticker).get("exchange")) if use_alpaca else None,
     "sic": company_info.get("sic"),
-    "fiscal_year_end": company_info.get("fiscal_year_end", "12-31"),
+    # Prefer annual filing period_of_report (10-K / 20-F) to infer fiscal year end MM-DD
+    "fiscal_year_end": extract_mm_dd(annual["filings"][0]["period_of_report"]) if annual.get("filings") else None,
     "currency": "USD",
 }
 ```
 
-### Step 4 - Fetch market snapshot via trading_mcp
+### Step 4 - Fetch market snapshot (USD) via multi-source chain
 ```python
-metrics = trading_mcp.get_fundamental_stock_metrics(ticker=ticker)
+trade = alpaca.get_stock_latest_trade(symbol_or_symbols=ticker)
+yahoo = yfinance.get_stock_info(ticker=ticker)
 
 market_snapshot = {
     "as_of": str(as_of),
-    "price": metrics.get("price"),
-    "shares_outstanding": metrics.get("sharesOutstanding"),
-    "shares_float": metrics.get("sharesFloat"),  # may be null
-    "market_cap": metrics.get("marketCap"),
-    "enterprise_value": metrics.get("enterpriseValue"),
-    "net_debt": None,  # calculated if EV and market_cap present
-    "source": "trading_mcp.get_fundamental_stock_metrics",
+    "currency": "USD",
+    "price": trade.get("price") or yahoo.get("regularMarketPrice"),
+    "shares_outstanding": yahoo.get("sharesOutstanding"),
+    "shares_float": yahoo.get("floatShares"),  # may be null (ADRs might be inconsistent)
+    # market_cap: keep source value by default; cross-check vs price*shares_outstanding and only switch on large divergence
+    "market_cap": yahoo.get("marketCap"),
+    # enterprise_value: for ADRs, enterpriseValue may be in financialCurrency (e.g., CNY); require FX payload to normalize
+    "enterprise_value": yahoo.get("enterpriseValue"),
+    "source": "mixed:alpaca.get_stock_latest_trade+yfinance.get_stock_info",
 }
-
-# Calculate net_debt if possible
-if market_snapshot["enterprise_value"] and market_snapshot["market_cap"]:
-    market_snapshot["net_debt"] = market_snapshot["enterprise_value"] - market_snapshot["market_cap"]
 ```
 
 ### Step 5 - Write outputs
@@ -576,15 +582,15 @@ def run(ticker: str, as_of: date = None, force_refresh: bool = False):
         # NOTE: Codex will call trading_mcp.get_fundamental_stock_metrics
         market_data = {
             "as_of": str(as_of),
+            "currency": "USD",
             "price": None,
             "shares_outstanding": None,
             "shares_float": None,
             "market_cap": None,
             "enterprise_value": None,
-            "net_debt": None,
-            "source": "trading_mcp.get_fundamental_stock_metrics",
+            "source": "mixed:alpaca.get_stock_latest_trade+yfinance.get_stock_info",
         }
-        print("TODO: Call trading_mcp.get_fundamental_stock_metrics")
+        print("TODO: Call alpaca.get_stock_latest_trade + trading_mcp/SEC/Yahoo for shares/marketCap/EV")
     
     # Step 5: Determine status
     if identity_skipped and market_skipped:
@@ -658,7 +664,7 @@ version: v0.1
 ## What This Skill Does
 1. Fetch SEC filings list via sec_edgar_mcp (10-K, 10-Q, 8-K, DEF14A)
 2. Download filing content to raw/sec/{accession}/
-3. Fetch news via gdelt.search_articles
+3. Fetch news via gdelt.gdelt_search_articles
 4. Fetch papers via openalex.search_works (if relevant industry)
 5. Generate digests under current/
 
@@ -666,7 +672,7 @@ version: v0.1
 - sec_edgar_mcp.get_recent_filings - list filings by CIK
 - sec_edgar_mcp.get_filing_content - download filing text
 - sec_edgar_mcp.get_filing_sections - get specific sections
-- gdelt.search_articles - news search
+- gdelt.gdelt_search_articles - news search
 - openalex.search_works - paper search
 - fs - write files
 
@@ -778,7 +784,7 @@ atomic_io.atomic_write_yaml(
 ```python
 query = f'"{ticker}" OR "{company_name}"'
 
-articles = gdelt.search_articles(
+articles = gdelt.gdelt_search_articles(
     query=query,
     # timespan based on lookback_days_news
 )
@@ -2122,7 +2128,8 @@ def run(ticker: str, model_type: str = "hybrid", force_refresh: bool = False):
             "margin_of_safety": margin_of_safety,
         },
         "downside_protection": {
-            "net_cash_per_share": market.get("net_debt", 0) / shares * -1 if market.get("net_debt") else None,
+            # Phase 1 v0.1: net_debt is intentionally not part of market_snapshot.yaml (derive later from filings/economic layer).
+            "net_cash_per_share": None,
         },
     }
     
