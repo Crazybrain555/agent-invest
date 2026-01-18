@@ -35,11 +35,63 @@
 ├── registry.jsonl
 ├── value_summary.csv
 └── company/{TICKER}/
-    ├── company.yaml
-    ├── latest.json
-    ├── current/
-    ├── raw/
-    └── runs/
+    ├── company.yaml                       # Skill1: 公司身份信息
+    ├── latest.json                        # 最新运行状态快照
+    │
+    ├── current/                           # 当前状态层（可查询）
+    │   ├── artifacts_state.yaml           # 产物状态追踪
+    │   ├── evidence.jsonl                 # 证据账本
+    │   ├── questions.jsonl                # 待解问题
+    │   ├── market_snapshot.yaml           # Skill1: 市场数据快照
+    │   │
+    │   │   # --- SEC 证据池 ---
+    │   ├── filings_index.yaml             # 契约文件（含VMF筛选字段 + FPI 6-K 归类结果）
+    │   ├── filings_index.parquet          # 分析层（同schema）
+    │   │
+    │   │   # --- News 证据池 ---
+    │   ├── news_digest.yaml               # 摘要 + 高影响事件
+    │   ├── news_index.parquet             # 标准化索引
+    │   │
+    │   │   # --- Papers 证据池 ---
+    │   ├── papers_digest.yaml             # 摘要
+    │   ├── papers_index.parquet           # 标准化索引
+    │   │
+    │   │   # --- 下游 Skills ---
+    │   ├── xbrl_atlas/                    # Skill3: 报表图谱
+    │   ├── economic/                      # Skill4: 经济报表
+    │   ├── diagnostics/                   # 诊断信息
+    │   └── valuation/                     # Skill5: 估值结果
+    │
+    ├── raw/                               # 原始材料层（不可变、可追溯）
+    │   ├── sec/                           # SEC filings
+    │   │   └── {accession}/               # 每个 filing 一个目录
+    │   │       ├── meta.yaml              # 元数据（含VMF信息）
+    │   │       ├── manifest.yaml          # 下载清单 + hash + 完整性
+    │   │       ├── primary_document.html  # 主文档
+    │   │       ├── primary_document.txt   # 纯文本版
+    │   │       ├── sections/              # 关键段落
+    │   │       │   ├── mdna.md
+    │   │       │   ├── risk_factors.md
+    │   │       │   └── business.md
+    │   │       ├── xbrl/                  # XBRL 包（周期性filing）
+    │   │       │   ├── *.xml
+    │   │       │   └── *.xsd
+    │   │       └── exhibits/              # 高价值附件（VMF筛选）
+    │   │           ├── exhibit_99_1.html  # 新闻稿/业绩公告
+    │   │           ├── exhibit_10_1.html  # 重大合同
+    │   │           └── exhibit_2_1.html   # 并购协议
+    │   │
+    │   ├── news/                          # 新闻（按日分区，gzip压缩）
+    │   │   └── YYYY/MM/news_YYYY-MM-DD.jsonl.gz
+    │   │
+    │   └── papers/                        # 论文（按月分区，gzip压缩）
+    │       └── YYYY/MM/papers_YYYY-MM.jsonl.gz
+    │
+    └── runs/{run_id}/                     # 运行记录
+        ├── meta.yaml                      # 输入参数
+        ├── result.yaml                    # 运行结果
+        ├── needs.yaml                     # blocked时的依赖说明
+        └── outputs/                       # 本次产物快照
 ```
 
 ### 0.2 创建目录
@@ -518,7 +570,7 @@ from datetime import date
 from pathlib import Path
 
 # Add runtime to path
-sys.path.insert(0, str(Path(__file__).parents[4]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
 from company_research_runtime import (
     paths, atomic_io, runlog, artifacts_state, evidence
@@ -648,276 +700,817 @@ if __name__ == "__main__":
 
 ---
 
-## 三、Skill 2: collect-company-facts
+## 三、Skill 2: collect-company-facts (v0.3 VMF版)
 
 ### 3.1 SKILL.md
 
 ```markdown
 ---
 name: collect-company-facts
-description: "Collect SEC filings news and papers for a ticker. Use when building evidence pool or need filings_index.yaml news_digest.yaml papers_digest.yaml updated."
-version: v0.1
+description: "Ingest and maintain evidence pool for a ticker: SEC filings with XBRL and VMF-filtered events, news, papers. Produces partitioned raw stores plus searchable indices and digests. Supports init and maintenance modes."
+version: v0.3
 ---
 
 # collect-company-facts
 
-## What This Skill Does
-1. Fetch SEC filings list via sec_edgar_mcp (10-K, 10-Q, 8-K, DEF14A)
-2. Download filing content to raw/sec/{accession}/
-3. Fetch news via gdelt.gdelt_search_articles
-4. Fetch papers via openalex.search_works (if relevant industry)
-5. Generate digests under current/
+## Purpose
+**Evidence Ingestion + Maintenance Layer** supporting valuation chain:
+- **Profit side**: periodic filings (Domestic: 10-K/10-Q; FPI: 20-F + 6-K interim results) + XBRL for financial reconstruction
+- **Quality/uncertainty side**: event filings (Domestic: 8-K; FPI: 6-K other) filtered by VMF, governance (DEF14A), news and papers
 
-## MCP Tools
-- sec_edgar_mcp.get_recent_filings - list filings by CIK
-- sec_edgar_mcp.get_filing_content - download filing text
-- sec_edgar_mcp.get_filing_sections - get specific sections
-- gdelt.gdelt_search_articles - news search
-- openalex.search_works - paper search
-- fs - write files
+Two modes (auto-detected):
+- **Init mode**: target files don't exist → full backfill
+- **Maintenance mode**: target files exist → incremental update anchored to last indexed date (SEC: max filed_at; News: max published_at) with overlap_days backfill; Papers uses staleness/refresh_days
+
+Data layering contract (raw vs index/digest):
+- `raw/` is immutable replay store: **source + envelope only** (no regenerable fields like tags/score/classification)
+- `current/*` (index/digest) is query/summary layer: **keys must exist; values may be null**; Parquet timestamps are enforced as **UTC typed** columns
+- Index/Digest write path follows “runs → promote”: write `runs/{run_id}/outputs/current/*` first, then atomically replace `current/*` (Raw is append-only evidence store).
+- Raw `.jsonl.gz` append uses `gzip.open(..., "at")` which creates multi-member gzip; most readers handle it, but some strict readers may only read the first member. Phase1 ok; for strict compatibility prefer “per-day/per-run new files → later compaction”.
+- Phase1 News relevance: produce deterministic, explainable, versioned `relevance_score` in index (aboutness, not impact), with `relevance_version` + `relevance_reasons` (later skills may override/recompute).
 
 ## Inputs
-- ticker (required)
-- lookback_years (optional, default 10)
-- lookback_days_news (optional, default 180)
-- papers_mode (optional, auto|on|off, default auto)
-- force_refresh (optional)
+
+### Core
+- `ticker` (required)
+- `as_of` (optional, default today)
+- `force_refresh` (optional, default false)
+
+### Window Parameters
+- `lookback_years` (default 10) - Init mode: SEC backfill years
+- `lookback_days_news` (default 5) - Init mode: news backfill days
+- `lookback_days_papers` (default 180) - Init mode: papers backfill days
+- `overlap_days` (default **2**) - Maintenance mode: 以 anchor 回抓的 overlap 天数（SEC: max filed_at; News: max published_at，用于补齐间隔天数 + 防止边界缺失）
+- `papers_refresh_days` (default 30) - Papers staleness threshold
+
+### SEC VMF Parameters
+- `vmf_score_threshold` (default 8) - Score threshold for event download
+- `vmf_annual_budget` (default 20) - Max events per year (hard triggers exempt)
+- `download_xbrl` (default true)
+- `download_sections` (default true)
+
+### News Parameters
+- `news_max_per_day` (default 100) - **每天**最大抓取数，防止长窗口漏数据
+- `news_langs` (default ["en", "zh"]) - 语言过滤列表（支持多语言）
+
+### Papers Parameters
+- `papers_mode` (default auto) - auto|on|off
+- `papers_max_results` (default 200)
 
 ## Hard Dependencies
-- company/{TICKER}/company.yaml with valid cik
+- `company/{TICKER}/company.yaml` with valid `cik`
 
 ## Outputs
-- current/filings_index.yaml
-- raw/sec/{accession}/...
-- raw/news/news.jsonl
-- current/news_digest.yaml
-- raw/papers/papers.jsonl
-- current/papers_digest.yaml
+
+### SEC
+- `current/filings_index.yaml` - 契约文件（含 issuer_type + sixk_classifier_version + vmf_version）
+- `current/filings_index.parquet` - 分析层
+- `raw/sec/{accession}/`
+  - `meta.yaml` - filing元数据
+  - `manifest.yaml` - 下载清单+hash
+  - `primary_document.html`
+  - `sections/` - MD&A/Risk Factors
+  - `xbrl/` - XBRL包
+  - `exhibits/` - 高价值附件（99.*/10.1/2.1）
+
+### News
+- `raw/news/YYYY/MM/news_YYYY-MM-DD.jsonl.gz` - 按日分区
+- `current/news_digest.yaml` - 摘要
+- `current/news_index.parquet` - 索引（含 `raw_path` 指针 + `relevance_score`/`relevance_version`/`relevance_reasons` + `impact_score`(Phase2；Phase1 默认 NaN)）
+
+### Papers
+- `raw/papers/YYYY/MM/papers_YYYY-MM.jsonl.gz` - 按月分区
+- `current/papers_digest.yaml` - 摘要
+- `current/papers_index.parquet` - 索引（含 `raw_path` 指针）
+
+### Events Candidates（推荐）
+
+> 候选事件指针池（不是 evidence claim/结论）。下游 Phase2 分析类 skills 从这里挑选事件并写入 `current/evidence.jsonl`。
+
+- `current/events_index.parquet` - `news:{article_id}` / `sec:{accession}` 的候选事件索引（含 raw_path/local_dir 等可追溯指针）
+
+## SEC Download Strategy: VMF (Valuation Materiality Filter)
+
+### Periodic Core (10年全量下载)
+
+| 发行人类型 | Forms |
+|-----------|-------|
+| Domestic | 10-K, 10-K/A, 10-Q, 10-Q/A, DEF14A |
+| FPI | 20-F, 20-F/A, 6-K (Interim Financials/Results subset) |
+
+下载内容：primary_document + xbrl + sections + meta + manifest
+FPI 6-K（Interim Financials/Results）：必须下载 exhibits/99.*（结果公告/演示材料/摘要财务报表常在此承载）
+
+### Event Stream (全量索引 + VMF筛选下载)
+
+Forms: 8-K, 8-K/A (Domestic) | 6-K (FPI, excluding Interim Financials/Results subset)
+
+#### FPI 6-K Split (Periodic vs Event)
+
+- 6-K (Interim Financials/Results) → Periodic Core（10年全量下载）
+- 6-K (Other events) → Event Stream（全量索引 + VMF 选择性下载）
+
+v0.2 启发式（更严格：period AND results，避免把非财报 6-K 误判为 periodic）：
+- Period 信号：three months ended / six months ended / quarter ended / quarter / half-year / interim report / interim financial statements / unaudited interim / q1-q4
+- Results 信号：results / earnings / financial results / financial statements / interim results / unaudited / condensed consolidated
+- 判定规则：(title/description 命中 period AND results) OR (exhibits 99.* 描述命中 period AND results)
+- 明确禁止：guidance/outlook/presentation-only 不能判为 6-K-Periodic（它们只作为“已判为 periodic 后的结果包附带材料”下载）
+
+Sanity checks（6-K 分类验收）：
+- 6-K 标题/附件描述同时含“期间口径”与“财务结果/报表”，且常见 `exhibits 99.*` → 必须归入 6-K-Periodic（Periodic Core，全量下载）
+- 6-K 仅为 monthly return/股本变动/治理等事项 → 必须归入 6-K-Event（Event Stream，走 VMF）
+- 仅出现 presentation/guidance 但没有期间口径/中期报表信号 → 必须归入 6-K-Event（不能当 periodic）
+
+VMF 仅作用于 Event Stream（Domestic: 8-K/8-K/A；FPI: 6-K-Event）。6-K-Periodic 不进入 VMF（已归入 Periodic Core）。
+
+VMF三层筛选：
+
+#### 层1 硬触发（不受预算限制）
+
+**8-K Items**: 2.02(Earnings), 4.01/4.02(Auditor), 2.04(Default), 2.06(Impairment), 2.01(M&A)
+
+**附件模式**: exhibit 99.*, "earnings release", "guidance", "investor presentation"
+
+**关键词**: restatement, material weakness, default, covenant, bankruptcy, impairment, guidance
+
+#### 层2 打分筛选
+
+| 维度 | 关键词 | 权重 |
+|------|--------|------|
+| 现金流/融资 | liquidity, refinancing, default, covenant | 5 |
+| 盈利/指引 | earnings, results, guidance, outlook | 4 |
+| 财务质量 | restatement, auditor, material weakness | 3 |
+| 资产质量 | impairment, restructuring | 3 |
+| 并购 | acquisition, merger, disposition | 2 |
+
+条件: score >= vmf_score_threshold (default 8)
+
+#### 层3 年度预算
+
+每年最多 vmf_annual_budget (default 20) 个事件；硬触发不受限
+
+### 事件Filing下载内容
+
+- primary_document.html - 永远下载
+- exhibits/99.* - 永远下载
+- exhibits/10.1 - 命中融资/M&A关键词时
+- exhibits/2.1 - 命中2.01或M&A关键词时
+
+## Mode Detection Logic
+
+```python
+# SEC
+if not filings_index.yaml exists or force_refresh:
+    mode = "init"
+    fetch_start = as_of - timedelta(days=lookback_years * 365)
+else:
+    mode = "maintenance"
+    last_filed_at = max_date(filings_index.filings[].filed_at)  # latest filed_at in current index
+    fetch_start = last_filed_at - timedelta(days=overlap_days)
+
+fetch_end = as_of
+sec_days = (fetch_end - fetch_start).days + 1
+
+# News
+if not news_index.parquet exists or force_refresh:
+    mode = "init"
+    fetch_start = as_of - timedelta(days=lookback_days_news)
+else:
+    mode = "maintenance"
+    last_published_at = max_date(news_index.published_at)        # timestamp in UTC
+    fetch_start = last_published_at.date() - timedelta(days=overlap_days)
+
+fetch_end = as_of
+news_window_days = (fetch_end - fetch_start).days + 1
+
+# Papers
+if not papers_index.parquet exists or force_refresh:
+    mode = "init"  # lookback_days_papers
+else:
+    if days_since_last >= papers_refresh_days:
+        mode = "maintenance"
+    else:
+        mode = "skip"
+```
 
 ## Blocked Conditions
-- company.yaml missing or cik empty -> blocked, needs company-foundation
-
-## Workflow
-
-### Step 1 - Load company.yaml and check CIK
-```python
-company_path = paths.get_company_dir(ticker) / "company.yaml"
-company = atomic_io.load_yaml(company_path)
-
-if not company.get("cik"):
-    # Write needs.yaml pointing to company-foundation
-    runlog.write_needs(run_dir,
-        blocked_by=[{"artifact": "company.yaml", "producer_skill": "company-foundation", 
-                     "reason": "Missing CIK"}],
-        suggested_plan=["company-foundation"])
-    return {"status": "blocked"}
-
-cik = company["cik"]
-company_name = company.get("company_name", ticker)
-```
-
-### Step 2 - Fetch SEC filings
-```python
-# Get existing accessions to avoid re-download
-existing_index = atomic_io.load_yaml(paths.get_current_dir(ticker) / "filings_index.yaml")
-existing_accessions = {f["accession"] for f in existing_index.get("filings", [])}
-
-# Call sec_edgar_mcp for each form type
-forms = ["10-K", "10-Q", "8-K", "DEF14A"]
-all_filings = []
-
-for form in forms:
-    filings = sec_edgar_mcp.get_recent_filings(
-        identifier=cik,
-        form_type=form,
-        # Note: adjust params based on actual tool schema
-    )
-    all_filings.extend(filings)
-
-# Filter to new filings only
-new_filings = [f for f in all_filings if f["accession"] not in existing_accessions]
-```
-
-### Step 3 - Download new filings
-```python
-for filing in new_filings:
-    accession = filing["accession"]
-    raw_dir = paths.get_raw_dir(ticker) / "sec" / accession
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Get filing content (Phase 1: just get sections, not full XBRL)
-    content = sec_edgar_mcp.get_filing_content(
-        identifier=cik,
-        accession_number=accession
-    )
-    
-    # Save to raw
-    with open(raw_dir / "content.txt", "w") as f:
-        f.write(content)
-```
-
-### Step 4 - Build filings_index.yaml
-```python
-filings_index = {
-    "as_of": str(date.today()),
-    "filings": [
-        {
-            "form": f.get("form"),
-            "filed_at": f.get("filed_at"),
-            "period_end": f.get("period_of_report"),
-            "accession": f.get("accession"),
-            "has_xbrl": f.get("has_xbrl", False),
-            "local_dir": f"raw/sec/{f.get('accession')}/",
-        }
-        for f in all_filings
-    ]
-}
-filings_index["filings"].sort(key=lambda x: x.get("filed_at", ""), reverse=True)
-
-atomic_io.atomic_write_yaml(
-    paths.get_current_dir(ticker) / "filings_index.yaml",
-    filings_index
-)
-```
-
-### Step 5 - Fetch news via gdelt
-```python
-query = f'"{ticker}" OR "{company_name}"'
-
-articles = gdelt.gdelt_search_articles(
-    query=query,
-    # timespan based on lookback_days_news
-)
-
-# Dedupe by URL
-seen_urls = set()
-unique_articles = []
-for a in articles:
-    if a.get("url") not in seen_urls:
-        seen_urls.add(a.get("url"))
-        unique_articles.append(a)
-
-# Save raw
-atomic_io.atomic_write_jsonl(
-    paths.get_raw_dir(ticker) / "news" / "news.jsonl",
-    unique_articles
-)
-
-# Generate digest
-news_digest = generate_news_digest(unique_articles)
-atomic_io.atomic_write_yaml(
-    paths.get_current_dir(ticker) / "news_digest.yaml",
-    news_digest
-)
-```
-
-### Step 6 - Fetch papers (if papers_mode allows)
-```python
-if papers_mode == "off":
-    papers_digest = {"as_of": str(date.today()), "total_papers": 0, "relevant_papers": []}
-else:
-    # Determine if relevant industry
-    sic = company.get("sic", "")
-    tech_sics = ["3571", "3572", "3674", "3825", "2834", "2836"]  # tech, pharma, etc.
-    
-    if papers_mode == "auto" and sic[:4] not in tech_sics:
-        papers_digest = {"as_of": str(date.today()), "total_papers": 0, "skipped": "not_relevant_industry"}
-    else:
-        papers = openalex.search_works(query=company_name)
-        # Process and save...
-        papers_digest = generate_papers_digest(papers)
-
-atomic_io.atomic_write_yaml(
-    paths.get_current_dir(ticker) / "papers_digest.yaml",
-    papers_digest
-)
-```
-
-## Incremental Update Rules
-- Compare existing accessions in filings_index, only download new
-- News: if last fetch within 1 day and not force_refresh, skip or fetch incremental
-- Papers: 30-90 day staleness check
+- company.yaml missing cik → blocked
+- SEC metadata unavailable AND no existing filings_index → blocked
 
 ## Definition of Done
-- current/filings_index.yaml with at least 1 filing
-- raw/sec/{accession}/ directories exist for each filing
-- current/news_digest.yaml exists (may have 0 articles)
-- current/papers_digest.yaml exists (may be empty)
+- `filings_index.yaml/parquet` with periodic filings + VMF-indexed events
+- `raw/sec/{accession}/` with meta + manifest (+ downloads per VMF)
+- `news_index.parquet` + `news_digest.yaml`
+- `papers_index.parquet` + `papers_digest.yaml`
+- `events_index.parquet` (event candidates pointers; not evidence claims)
+
+## Result Observability (components)
+`runs/{run_id}/result.yaml` SHOULD include `components` for orchestrator/debug (without increasing skill count):
+
+```yaml
+components:
+  sec: {status, mode, window, totals, warnings, errors}
+  news: {status, mode, window, totals, warnings, errors}
+  papers: {status, mode, reason, window, totals, warnings, errors}
 ```
 
-### 3.2 scripts/run.py
+Rollup (orchestrator-friendly):
+1) `sec.status in {blocked, error}` → skill `status = blocked/error`
+2) any other `*.status=error` → skill `status = partial`
+3) any `*.status=partial` → skill `status = partial`
+4) `sec ok` + `news ok` + `papers ok/skipped` → skill `status = ok`
+5) all components skipped + input fingerprint unchanged → skill `status = skipped` (optional)
+```
+
+### 3.1.1 Artifact Ownership Matrix（产物归属与依赖）
+
+| Artifact | Producer | Consumer（典型） | 用途 |
+|---|---|---|---|
+| `company/{TICKER}/company.yaml` | Skill1 `company-foundation` | Skill2 `collect-company-facts` | CIK/公司身份（SEC 抓取前置条件） |
+| `company/{TICKER}/current/market_snapshot.yaml` | Skill1 `company-foundation` | Skill5 `valuation-and-margin-of-safety` | 市场口径（price/shares/EV 等） |
+| `company/{TICKER}/current/filings_index.yaml` + `.parquet` | Skill2 `collect-company-facts` | Skill3 `extract-xbrl-timeseries` / Skill5 `valuation-and-margin-of-safety` | SEC 索引（含 bucket、6-K 分类、VMF、download 状态） |
+| `company/{TICKER}/raw/sec/{accession}/...` | Skill2 `collect-company-facts` | Skill3 `extract-xbrl-timeseries` | 原始证据池（可回放/可追溯） |
+| `company/{TICKER}/current/news_index.parquet` + `news_digest.yaml` | Skill2 `collect-company-facts` | 下游 memo/事件时间线 | 新闻证据池（去重、标签、摘要） |
+| `company/{TICKER}/current/papers_index.parquet` + `papers_digest.yaml` | Skill2 `collect-company-facts` | 下游 memo/技术评估 | 论文证据池（去重、标签、摘要） |
+| `company/{TICKER}/current/events_index.parquet` | Skill2 `collect-company-facts` | Phase2 分析类 skills（growth/audit/moat 等） | 事件候选池（可追溯指针 + 初筛标签；用于后续生成 evidence claims） |
+| `company/{TICKER}/current/xbrl_atlas/*` | Skill3 `extract-xbrl-timeseries` | Skill4 `recast-economic-statements` | XBRL 报表图谱与 facts 底座 |
+| `company/{TICKER}/current/economic/*` | Skill4 `recast-economic-statements` | Skill5 `valuation-and-margin-of-safety` | 经济三表与核心指标（ROIC/FCF 等） |
+| `company/{TICKER}/current/valuation/*` | Skill5 `valuation-and-margin-of-safety` | 下游决策/报告 | 估值输出（value_state 等） |
+
+### 3.2 scripts/run.py (v0.3)
 
 ```python
 #!/usr/bin/env python3
-"""collect-company-facts skill runner."""
+"""
+collect-company-facts skill runner (v0.3 VMF edition).
+Usage: python run.py TICKER [--as-of DATE] [--force-refresh]
+"""
 import sys
 import argparse
-from datetime import date
+import gzip
+import json
+import hashlib
+import re
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from collections import Counter
+from dataclasses import dataclass
+from typing import List, Set, Optional, Tuple
+import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).parents[4]))
+# Add runtime to path
+sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
 from company_research_runtime import (
     paths, atomic_io, runlog, artifacts_state, evidence
 )
+from company_research_runtime.paths import TZ
 
 SKILL_NAME = "collect-company-facts"
 
-def generate_news_digest(articles: list) -> dict:
-    """Generate news digest from articles."""
-    if not articles:
-        return {"as_of": str(date.today()), "total_articles": 0}
-    
+# ===== VMF Configuration =====
+
+@dataclass
+class VMFConfig:
+    score_threshold: int = 8
+    annual_budget: int = 20
+
+    # Hard trigger items (8-K)
+    hard_trigger_items: Set[str] = None
+
+    # Hard trigger keywords
+    hard_trigger_keywords: List[str] = None
+
+    # Scoring weights
+    score_weights: dict = None
+
+    def __post_init__(self):
+        if self.hard_trigger_items is None:
+            self.hard_trigger_items = {"2.01", "2.02", "2.04", "2.06", "4.01", "4.02"}
+
+        if self.hard_trigger_keywords is None:
+            self.hard_trigger_keywords = [
+                "restatement", "material weakness", "auditor", "going concern",
+                "default", "covenant", "bankruptcy", "restructuring",
+                "impairment", "write-down", "guidance", "outlook", "earnings", "results"
+            ]
+
+        if self.score_weights is None:
+            self.score_weights = {
+                "liquidity": 5, "refinancing": 5, "credit facility": 5,
+                "default": 5, "covenant": 5,
+                "earnings": 4, "results": 4, "guidance": 4, "outlook": 4, "margin": 4,
+                "restatement": 3, "auditor": 3, "material weakness": 3,
+                "impairment": 3, "restructuring": 3,
+                "acquisition": 2, "merger": 2, "disposition": 2
+            }
+
+@dataclass
+class VMFResult:
+    triggered: bool
+    hard_triggered: bool
+    reasons: List[str]
+    score: int
+
+def apply_vmf(filing: dict, config: VMFConfig) -> VMFResult:
+    """Apply Valuation Materiality Filter to an event filing."""
+    reasons = []
+    score = 0
+    hard_triggered = False
+
+    form = filing.get("form", "")
+    items = filing.get("items", [])
+    title = (filing.get("title") or filing.get("description") or "").lower()
+    exhibits = filing.get("exhibits", [])
+
+    # Layer 1: Hard triggers
+
+    # A) 8-K Item hard triggers
+    for item in items:
+        item_clean = item.replace("Item ", "").strip()
+        if item_clean in config.hard_trigger_items:
+            hard_triggered = True
+            reasons.append(f"item_{item_clean}")
+
+    # B) Exhibit type hard triggers (99.*)
+    for exhibit in exhibits:
+        exhibit_num = str(exhibit.get("number", ""))
+        exhibit_desc = (exhibit.get("description") or "").lower()
+
+        if exhibit_num.startswith("99"):
+            hard_triggered = True
+            reasons.append(f"exhibit_{exhibit_num}")
+
+        if any(kw in exhibit_desc for kw in ["earnings release", "results", "guidance", "investor presentation"]):
+            hard_triggered = True
+            reasons.append(f"exhibit_desc:{exhibit_num}")
+
+    # C) Keyword hard triggers
+    for kw in config.hard_trigger_keywords:
+        if kw in title:
+            hard_triggered = True
+            reasons.append(f"keyword:{kw}")
+            break  # One is enough for hard trigger
+
+    # Layer 2: Scoring (if not hard triggered)
+    if not hard_triggered:
+        for keyword, weight in config.score_weights.items():
+            if keyword in title:
+                score += weight
+                if len(reasons) < 5:  # Limit reason list
+                    reasons.append(f"score:{keyword}")
+
+    triggered = hard_triggered or (score >= config.score_threshold)
+
+    return VMFResult(
+        triggered=triggered,
+        hard_triggered=hard_triggered,
+        reasons=reasons,
+        score=score
+    )
+
+def is_6k_interim_results(filing: dict) -> Tuple[bool, List[str]]:
+    """Return (is_interim_results, reasons) for FPI 6-K.
+
+    STRICT rule: require (period AND results) signals; guidance/outlook/presentation-only must NOT classify as interim.
+    """
+    if (filing.get("form") or "").upper() != "6-K":
+        return (False, [])
+
+    title_desc = " ".join([
+        filing.get("title") or "",
+        filing.get("description") or "",
+    ]).lower()
+
+    period_signals = [
+        "three months ended", "six months ended", "quarter ended",
+        "quarter", "half-year", "interim report", "interim financial statements",
+        "unaudited interim", "q1", "q2", "q3", "q4",
+    ]
+    results_signals = [
+        "financial results", "results", "earnings",
+        "financial statements", "interim results",
+        "unaudited", "condensed consolidated",
+    ]
+
+    def _hits(signals: List[str], text: str) -> List[str]:
+        return [s for s in signals if s in (text or "")]
+
+    title_period = _hits(period_signals, title_desc)
+    title_results = _hits(results_signals, title_desc)
+
+    ex99_text = " ".join([
+        (ex.get("description") or "").lower()
+        for ex in (filing.get("exhibits", []) or [])
+        if str(ex.get("number", "")).startswith("99")
+    ])
+    ex_period = _hits(period_signals, ex99_text)
+    ex_results = _hits(results_signals, ex99_text)
+
+    is_interim = (bool(title_period) and bool(title_results)) or (bool(ex_period) and bool(ex_results))
+    if not is_interim:
+        return (False, ["no_periodic_signals"])
+
+    reasons: List[str] = []
+    if title_period:
+        reasons.append(f"title_period:{title_period[0]}")
+    if title_results:
+        reasons.append(f"title_results:{title_results[0]}")
+    if ex_period:
+        reasons.append(f"ex99_period:{ex_period[0]}")
+    if ex_results:
+        reasons.append(f"ex99_results:{ex_results[0]}")
+
+    return (True, reasons[:10])
+
+# ===== Utility Functions =====
+
+def canonical_url(url: str) -> str:
+    """Canonicalize URL for deduplication."""
+    if not url:
+        return ""
+
+    parsed = urlparse(url.lower())
+
+    # Remove tracking parameters
+    if parsed.query:
+        params = parse_qs(parsed.query)
+        tracking_params = {'utm_source', 'utm_medium', 'utm_campaign', 'utm_content',
+                          'utm_term', 'fbclid', 'gclid', '_ga', 'ref'}
+        clean_params = {k: v for k, v in params.items() if k not in tracking_params}
+
+        if clean_params:
+            query = urlencode(sorted(clean_params.items()), doseq=True)
+        else:
+            query = ""
+    else:
+        query = ""
+
+    return urlunparse((
+        parsed.scheme or "https",
+        parsed.netloc,
+        parsed.path.rstrip('/'),
+        parsed.params,
+        query,
+        ""
+    ))
+
+def generate_article_id(article: dict) -> str:
+    """Generate stable article ID."""
+    url = article.get("url", "")
+    if url:
+        canon = canonical_url(url)
+        return hashlib.sha1(canon.encode()).hexdigest()[:16]
+    else:
+        fallback = f"{article.get('title', '')}|{article.get('published_at', '')}|{article.get('source', '')}"
+        return hashlib.sha1(fallback.encode()).hexdigest()[:16]
+
+def extract_event_tags(article: dict) -> List[str]:
+    """Extract event tags from article."""
+    tags = []
+    title = (article.get("title") or "").lower()
+
+    if any(kw in title for kw in ["earning", "revenue", "profit", "quarter", "fiscal"]):
+        tags.append("earnings")
+    if any(kw in title for kw in ["acquisition", "merger", "deal", "acquire"]):
+        tags.append("m_and_a")
+    if any(kw in title for kw in ["lawsuit", "sec", "investigation", "fraud"]):
+        tags.append("legal")
+    if any(kw in title for kw in ["ceo", "executive", "appoint", "resign"]):
+        tags.append("management")
+    if any(kw in title for kw in ["guidance", "forecast", "outlook", "expect"]):
+        tags.append("guidance")
+    if any(kw in title for kw in ["dividend", "buyback", "repurchase"]):
+        tags.append("capital_return")
+
+    return tags
+
+TRUSTED_NEWS_DOMAINS = {
+    "reuters.com",
+    "bloomberg.com",
+    "wsj.com",
+    "ft.com",
+    "sec.gov",
+}
+
+def score_news_relevance(article: dict, *, ticker: str, company_name: str) -> tuple[float, list[str], dict]:
+    """
+    Phase1: rule-based, explainable aboutness score (relevance ≠ impact/materiality).
+    Returns: (score_0_1, reasons, features)
+    """
+    title = (article.get("title") or "")
+    snippet = (article.get("snippet") or "")
+    source = (article.get("source") or article.get("domain") or "")
+    text = f"{title} {snippet}".lower()
+
+    reasons: list[str] = []
+    features: dict = {}
+
+    score = 0.05
+
+    ticker_lower = (ticker or "").lower()
+    ticker_hit = bool(re.search(rf"\\b{re.escape(ticker_lower)}\\b", text)) if ticker_lower else False
+    features["ticker_hit"] = ticker_hit
+    if ticker_hit:
+        score += 0.35
+        reasons.append("ticker_hit")
+
+    company_lower = (company_name or "").lower()
+    company_tokens = [t for t in re.findall(r"[a-z0-9]+", company_lower) if t not in {"inc", "corp", "ltd", "plc", "co", "sa", "ag"}]
+    core_token = company_tokens[0] if company_tokens else ""
+    name_hit = (company_lower in text) or (core_token and core_token in text)
+    features["name_hit"] = bool(name_hit)
+    if name_hit:
+        score += 0.25
+        reasons.append(f"name_hit:{core_token or company_lower[:20]}")
+
+    source_domain = source.lower()
+    trusted_source = any(d in source_domain for d in TRUSTED_NEWS_DOMAINS)
+    features["trusted_source"] = trusted_source
+    if trusted_source:
+        score += 0.10
+        reasons.append(f"trusted_source:{source_domain}")
+
+    title_lower = title.lower()
+    strong_context_terms = ["shares", "stock", "ceo", "cfo", "quarter", "earnings", "results", "guidance", "outlook"]
+    strong_context = any(t in title_lower for t in strong_context_terms) and (ticker_hit or name_hit)
+    features["strong_context"] = strong_context
+    if strong_context:
+        score += 0.10
+        reasons.append("strong_context:title")
+
+    market_narrative_terms = ["sector", "market", "index", "futures"]
+    market_narrative = any(t in text for t in market_narrative_terms) and (not ticker_hit) and (not name_hit)
+    features["market_narrative"] = market_narrative
+    if market_narrative:
+        score -= 0.15
+        reasons.append("penalty:market_narrative")
+
+    listicle_terms = ["top stocks", "morning news", "5 things", "what to watch"]
+    listicle = any(t in title_lower for t in listicle_terms)
+    features["listicle"] = listicle
+    if listicle and ("earnings" not in text) and ("guidance" not in text) and ("acquisition" not in text):
+        score -= 0.10
+        reasons.append("penalty:listicle")
+
+    score = max(0.0, min(1.0, score))
+    features["score"] = score
+    return (score, reasons, features)
+
+def generate_news_digest(
+    new_articles: list,
+    *,
+    fetched: int,
+    deduped_new: int,
+    stored_total: int,
+    window_start: date,
+    window_end: date,
+    as_of: date,
+    mode: str,
+) -> dict:
+    """Generate news digest for this run window."""
     themes = Counter()
-    for a in articles:
-        title = (a.get("title") or "").lower()
-        if any(kw in title for kw in ["earning", "revenue", "profit", "quarter"]):
-            themes["earnings"] += 1
-        if any(kw in title for kw in ["acquisition", "merger", "deal"]):
-            themes["m_and_a"] += 1
-        if any(kw in title for kw in ["lawsuit", "sec", "investigation"]):
-            themes["legal"] += 1
-        if any(kw in title for kw in ["ceo", "executive", "appoint"]):
-            themes["management"] += 1
-    
-    dates = [a.get("date") or a.get("published_at") for a in articles if a.get("date") or a.get("published_at")]
-    
+    high_impact = []
+
+    for a in new_articles:
+        tags = a.get("event_tags", [])
+        for tag in tags:
+            themes[tag] += 1
+
+        # High impact: earnings + guidance
+        if "earnings" in tags and "guidance" in tags:
+            high_impact.append({
+                "article_id": a.get("article_id"),
+                "published_at": a.get("published_at"),
+                "title": a.get("title"),
+                "url": a.get("url"),
+                "tags": tags,
+                "impact_hint": "可能影响未来利润预期/折现率",
+                "confidence": 0.8
+            })
+        elif "m_and_a" in tags:
+            high_impact.append({
+                "article_id": a.get("article_id"),
+                "published_at": a.get("published_at"),
+                "title": a.get("title"),
+                "url": a.get("url"),
+                "tags": tags,
+                "impact_hint": "可能改变未来现金流路径",
+                "confidence": 0.7
+            })
+
+    window_days = (window_end - window_start).days + 1
     return {
-        "as_of": str(date.today()),
-        "total_articles": len(articles),
-        "date_range": [min(dates), max(dates)] if dates else [],
+        "as_of": str(as_of),
+        "window": {
+            "mode": mode,
+            "lookback_days": window_days,
+            "start": str(window_start),
+            "end": str(window_end),
+        },
+        "totals": {
+            "fetched": fetched,
+            "deduped_new": deduped_new,
+            "stored_total": stored_total,
+        },
         "top_themes": [{"theme": t, "count": c} for t, c in themes.most_common(5)],
-        "key_events": [
-            {"date": a.get("date"), "title": a.get("title"), "source": a.get("source")}
-            for a in sorted(articles, key=lambda x: x.get("date") or "", reverse=True)[:10]
-        ]
+        "high_impact_events": high_impact[:10],
     }
 
-def run(ticker: str, lookback_years: int = 10, lookback_days_news: int = 180,
-        papers_mode: str = "auto", force_refresh: bool = False):
+def generate_papers_digest(
+    new_papers: list,
+    *,
+    papers_mode: str,
+    window_mode: str,
+    lookback_days: int,
+    fetched: int,
+    deduped_new: int,
+    stored_total: int,
+    as_of: date,
+) -> dict:
+    """Generate papers digest for this run window."""
+
+    top_relevant = []
+    for p in new_papers[:5]:
+        top_relevant.append({
+            "paper_id": p.get("paper_id"),
+            "title": p.get("title"),
+            "year": p.get("year"),
+            "why_relevant": "Keyword match with company/industry",
+            "confidence": 0.5
+        })
+
+    return {
+        "as_of": str(as_of),
+        "mode": papers_mode,
+        "status": "ok",
+        "reason": None,
+        "window": {
+            "mode": window_mode,
+            "lookback_days": lookback_days,
+        },
+        "totals": {
+            "fetched": fetched,
+            "deduped_new": deduped_new,
+            "stored_total": stored_total,
+        },
+        "top_relevant": top_relevant
+    }
+
+def write_skipped_digest(
+    path: Path,
+    reason: str,
+    as_of: date,
+    *,
+    papers_mode: str,
+    stored_total: int | None = None,
+):
+    """Write a skipped papers digest."""
+    digest = {
+        "as_of": str(as_of),
+        "mode": papers_mode,
+        "status": "skipped",
+        "reason": reason,
+        "window": {"mode": None, "lookback_days": None},
+        "totals": {"fetched": 0, "deduped_new": 0, "stored_total": stored_total},
+        "top_relevant": []
+    }
+    atomic_io.atomic_write_yaml(path, digest)
+
+def is_relevant_industry(sic: str) -> bool:
+    """Check if SIC indicates tech/pharma/relevant industry for papers."""
+    tech_sics = ["3571", "3572", "3674", "3825", "2834", "2836", "7370", "7371", "7372", "7373"]
+    return sic[:4] in tech_sics if sic else False
+
+def probe_issuer_type(cik: str) -> str:
+    """Init probe to avoid misclassifying FPI as domestic when filings index is empty."""
+    # Keep it lightweight: only probe a short recent window and minimal hits.
+    if sec_edgar_mcp.get_recent_filings(identifier=cik, form_type="20-F", days=365, limit=5).get("filings"):
+        return "fpi"
+    if sec_edgar_mcp.get_recent_filings(identifier=cik, form_type="10-Q", days=365, limit=5).get("filings"):
+        return "domestic"
+    if sec_edgar_mcp.get_recent_filings(identifier=cik, form_type="6-K", days=365, limit=5).get("filings"):
+        return "fpi"
+    return "domestic"
+
+def determine_issuer_type(company: dict, filings: list = None, *, cik: str | None = None) -> str:
+    """Determine issuer_type via observed forms (preferred over unreliable flags)."""
+    forms = {(f.get("form") or "").upper() for f in (filings or [])}
+
+    # Init edge case: empty forms → probe via small queries to avoid missing FPI logic
+    if (not forms) and cik:
+        return probe_issuer_type(cik)
+
+    # FPI: 20-F is definitive; 6-K without 10-Q is strong fallback
+    if any(form.startswith("20-F") for form in forms):
+        return "fpi"
+    if any(form.startswith("10-Q") for form in forms):
+        return "domestic"
+    if any(form.startswith("6-K") for form in forms) and not any(form.startswith("10-Q") for form in forms):
+        return "fpi"
+
+    return "domestic"
+
+def stable_paper_id(paper: dict) -> str:
+    """Stable prefixed paper_id (supports multi-source fusion without collisions)."""
+    doi = (paper.get("doi") or "").strip()
+    openalex_id = (paper.get("openalex_id") or "").strip()
+    arxiv_id = (paper.get("arxiv_id") or "").strip()
+    pubmed_id = (paper.get("pubmed_id") or "").strip()
+    title = (paper.get("title") or "").strip()
+
+    if doi:
+        return f"doi:{doi}"
+    if openalex_id:
+        return f"openalex:{openalex_id}"
+    if arxiv_id:
+        return f"arxiv:{arxiv_id}"
+    if pubmed_id:
+        return f"pubmed:{pubmed_id}"
+    return f"sha1:{hashlib.sha1(title.encode('utf-8')).hexdigest()[:16]}"
+
+def append_to_gzip_jsonl(path: Path, record: dict):
+    """Append a record to gzip JSONL file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "at", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
+
+# ===== Main Run Function =====
+
+def run(ticker: str,
+        as_of: date = None,
+        force_refresh: bool = False,
+        # Window params
+        lookback_years: int = 10,
+        lookback_days_news: int = 5,
+        lookback_days_papers: int = 180,
+        overlap_days: int = 2,
+        papers_refresh_days: int = 30,
+        # VMF params
+        vmf_score_threshold: int = 8,
+        vmf_annual_budget: int = 20,
+        download_xbrl: bool = True,
+        download_sections: bool = True,
+        # News params
+        news_max_per_day: int = 100,
+        news_langs: List[str] = None,  # default ["en", "zh"]
+        # Papers params
+        papers_mode: str = "auto",
+        papers_max_results: int = 200):
+
     ticker = ticker.upper()
-    
-    # Initialize
+    as_of = as_of or date.today()
+    news_langs = news_langs or ["en", "zh"]
+
+    vmf_config = VMFConfig(
+        score_threshold=vmf_score_threshold,
+        annual_budget=vmf_annual_budget
+    )
+
+    # ===== Step 0: Initialize =====
+    print(f"=== collect-company-facts v0.3 for {ticker} ===")
+    print(f"as_of: {as_of}, force_refresh: {force_refresh}")
+
     paths.ensure_dirs(ticker)
     run_id = paths.generate_run_id()
     run_dir = paths.get_run_dir(ticker, run_id)
     run_dir.mkdir(parents=True)
-    
+    run_outputs_current = run_dir / "outputs" / "current"
+    run_outputs_current.mkdir(parents=True, exist_ok=True)
+
     runlog.write_meta(run_dir, ticker, SKILL_NAME, {
         "ticker": ticker,
+        "as_of": str(as_of),
+        "force_refresh": force_refresh,
         "lookback_years": lookback_years,
+        "overlap_days": overlap_days,
+        "vmf_score_threshold": vmf_score_threshold,
+        "vmf_annual_budget": vmf_annual_budget,
         "lookback_days_news": lookback_days_news,
         "papers_mode": papers_mode,
+        "version": "v0.3"
     })
-    
+
     warnings = []
     outputs = []
-    
+    sec_status = "ok"
+    news_status = "ok"
+    papers_status = "ok"
+    sec_warnings, sec_errors = [], []
+    news_warnings, news_errors = [], []
+    papers_warnings, papers_errors = [], []
+    current_dir = paths.get_current_dir(ticker)
+    raw_dir = paths.get_raw_dir(ticker)
+
+    # Skill2 is ingestion: do not emit evidence claims here; only ensure ledgers exist (empty is OK).
+    evidence.ensure_jsonl(current_dir / "evidence.jsonl")
+    evidence.ensure_jsonl(current_dir / "questions.jsonl")
+
     # Check hard dependency
     company_path = paths.get_company_dir(ticker) / "company.yaml"
     company = atomic_io.load_yaml(company_path)
-    
+
     if not company.get("cik"):
         runlog.write_needs(run_dir,
             blocked_by=[{
@@ -926,78 +1519,818 @@ def run(ticker: str, lookback_years: int = 10, lookback_days_news: int = 180,
                 "reason": "Missing CIK needed to query SEC filings"
             }],
             suggested_plan=["company-foundation", "collect-company-facts"])
-        
+
         runlog.write_result(run_dir, ticker, SKILL_NAME, "blocked",
             missing=["company.yaml with cik"])
         print("BLOCKED: Missing company.yaml with CIK")
         return {"status": "blocked"}
-    
+
     cik = company["cik"]
     company_name = company.get("company_name", ticker)
-    print(f"Using CIK={cik}, company_name={company_name}")
-    
-    # TODO: Actual MCP calls would happen here
-    # For now, create placeholder outputs
-    
-    # Filings index (placeholder)
+    sic = company.get("sic", "")
+    print(f"CIK={cik}, company_name={company_name}, sic={sic}")
+
+    # ===== Step 1: SEC Pipeline =====
+    print("\n=== SEC Pipeline ===")
+
+    filings_index_path = current_dir / "filings_index.yaml"
+    filings_parquet_path = current_dir / "filings_index.parquet"
+    existing_index = atomic_io.load_yaml(filings_index_path)
+
+    # Determine mode + fetch window (Maintenance must fill gaps; not just overlap_days)
+    if not existing_index.get("filings") or force_refresh:
+        sec_mode = "init"
+        fetch_start = as_of - timedelta(days=lookback_years * 365)
+        print(f"Mode: INIT ({lookback_years} years)")
+    else:
+        sec_mode = "maintenance"
+        last_filed_at = max(
+            (date.fromisoformat(f.get("filed_at")) for f in existing_index.get("filings", []) if f.get("filed_at")),
+            default=as_of,
+        )
+        fetch_start = last_filed_at - timedelta(days=overlap_days)
+        print(f"Mode: MAINTENANCE (anchor last_filed_at={last_filed_at}, overlap_days={overlap_days})")
+
+    fetch_end = as_of
+    sec_window_days = (fetch_end - fetch_start).days + 1
+
+    # Determine issuer type
+    issuer_type = determine_issuer_type(company, existing_index.get("filings", []), cik=cik)
+    print(f"Issuer type: {issuer_type}")
+
+    # Periodic core + Event stream forms by issuer type
+    if issuer_type == "domestic":
+        periodic_forms = ["10-K", "10-K/A", "10-Q", "10-Q/A", "DEF14A"]
+        event_forms = ["8-K", "8-K/A"]
+    else:
+        periodic_forms = ["20-F", "20-F/A"]
+        event_forms = ["6-K"]  # FPI: will be split into 6-K-Periodic vs 6-K-Event
+
+    # TODO: Call sec_edgar_mcp.get_recent_filings
+    # Placeholder for periodic filings
+    periodic_filings = []
+    print(f"TODO: Fetch periodic filings {periodic_forms} for {sec_window_days} days ({fetch_start}→{fetch_end})")
+
+    # TODO: Fetch event stream filings (and split FPI 6-K first)
+    event_filings = []
+    if issuer_type == "domestic":
+        print(f"TODO: Fetch event filings {event_forms} for {sec_window_days} days ({fetch_start}→{fetch_end})")
+    else:
+        sixk_filings = []
+        print(f"TODO: Fetch 6-K filings for {sec_window_days} days ({fetch_start}→{fetch_end}), then split 6-K-Periodic vs 6-K-Event")
+
+        sixk_periodic = []
+        sixk_event = []
+        for filing in sixk_filings:
+            is_interim, reasons = is_6k_interim_results(filing)
+            filing["sixk_class"] = "interim_results" if is_interim else "other_event"
+            filing["sixk_reasons"] = reasons
+
+            if is_interim:
+                filing["bucket"] = "periodic_core"
+                filing["is_event_stream"] = False
+                sixk_periodic.append(filing)  # Interim Financials/Results → Periodic Core
+            else:
+                filing["bucket"] = "event_stream"
+                filing["is_event_stream"] = True
+                sixk_event.append(filing)     # Other events → Event Stream
+
+        periodic_filings.extend(sixk_periodic)
+        event_filings = sixk_event
+
+    # Apply VMF to event filings
+    vmf_triggered_count = 0
+    vmf_hard_triggered_count = 0
+    year_budgets = {}
+
+    for filing in event_filings:
+        vmf_result = apply_vmf(filing, vmf_config)
+        filing["bucket"] = "event_stream"
+        filing["is_event_stream"] = True
+        filing.setdefault("sixk_class", None)
+        filing.setdefault("sixk_reasons", [])
+
+        filing["source"] = filing.get("source") or "sec_edgar_mcp.get_recent_filings"
+        filing["primary_doc"] = filing.get("primary_doc") or "primary_document.html"
+        filing["filing_url"] = filing.get("filing_url") or filing.get("url")
+        filing["items"] = filing.get("items")
+
+        filing["vmf_triggered"] = vmf_result.triggered
+        filing["vmf_hard_triggered"] = vmf_result.hard_triggered
+        filing["vmf_reasons"] = vmf_result.reasons
+        filing["vmf_score"] = vmf_result.score
+
+        if vmf_result.triggered:
+            vmf_triggered_count += 1
+            if vmf_result.hard_triggered:
+                vmf_hard_triggered_count += 1
+                # Hard triggered: always download
+                filing["downloaded"] = True
+                filing["download_level"] = "primary_plus_exhibits"
+            else:
+                # Check budget
+                year = filing.get("filed_at", "2020")[:4]
+                if year_budgets.get(year, 0) < vmf_config.annual_budget:
+                    filing["downloaded"] = True
+                    filing["download_level"] = "primary_plus_exhibits"
+                    year_budgets[year] = year_budgets.get(year, 0) + 1
+                else:
+                    filing["downloaded"] = False
+                    filing["download_level"] = "metadata_only"
+        else:
+            filing["downloaded"] = False
+            filing["download_level"] = "metadata_only"
+
+    print(f"VMF: {vmf_triggered_count} triggered ({vmf_hard_triggered_count} hard) out of {len(event_filings)} events")
+
+    # TODO: Download periodic filings
+    for filing in periodic_filings:
+        filing["bucket"] = "periodic_core"
+        filing["is_event_stream"] = False
+        filing.setdefault("sixk_class", None)
+        filing.setdefault("sixk_reasons", [])
+
+        filing["vmf_triggered"] = None
+        filing["vmf_hard_triggered"] = None
+        filing["vmf_reasons"] = []
+        filing["vmf_score"] = None
+
+        filing["source"] = filing.get("source") or "sec_edgar_mcp.get_recent_filings"
+        filing["primary_doc"] = filing.get("primary_doc") or "primary_document.html"
+        filing["filing_url"] = filing.get("filing_url") or filing.get("url")
+        filing["items"] = filing.get("items")
+
+        filing["downloaded"] = True
+        filing["download_level"] = "primary_plus_exhibits"
+
+        # Create accession directory
+        accession = filing.get("accession", "PLACEHOLDER")
+        accession_dir = raw_dir / "sec" / accession
+        accession_dir.mkdir(parents=True, exist_ok=True)
+        (accession_dir / "xbrl").mkdir(exist_ok=True)
+        (accession_dir / "sections").mkdir(exist_ok=True)
+        (accession_dir / "exhibits").mkdir(exist_ok=True)
+
+        # Write meta.yaml
+        meta = {
+            "form": filing.get("form"),
+            "filed_at": filing.get("filed_at"),
+            "period_end": filing.get("period_end"),
+            "accession": accession,
+            "cik": cik,
+            "company_name": company_name,
+            "has_xbrl": filing.get("has_xbrl", False),
+            "is_amendment": "/A" in filing.get("form", ""),
+            "vmf": None
+        }
+        atomic_io.atomic_write_yaml(accession_dir / "meta.yaml", meta)
+
+        # Write manifest.yaml
+        manifest = {
+            "downloaded_at": datetime.now(TZ).isoformat(),
+            "download_level": "primary_plus_exhibits",
+            "files": {},
+            "completeness": {
+                "has_primary_doc": False,  # TODO: set after download
+                "has_sections": False,
+                "has_exhibits": False,
+                "has_xbrl": False
+            }
+        }
+        atomic_io.atomic_write_yaml(accession_dir / "manifest.yaml", manifest)
+
+    # TODO: Download VMF-triggered event filings
+    for filing in event_filings:
+        if filing.get("downloaded"):
+            accession = filing.get("accession", "PLACEHOLDER")
+            accession_dir = raw_dir / "sec" / accession
+            accession_dir.mkdir(parents=True, exist_ok=True)
+            (accession_dir / "exhibits").mkdir(exist_ok=True)
+
+            # Write meta.yaml with VMF info
+            meta = {
+                "form": filing.get("form"),
+                "filed_at": filing.get("filed_at"),
+                "period_end": filing.get("period_end"),
+                "accession": accession,
+                "cik": cik,
+                "company_name": company_name,
+                "has_xbrl": False,
+                "items": filing.get("items", []),
+                "vmf": {
+                    "triggered": filing["vmf_triggered"],
+                    "hard_triggered": filing["vmf_hard_triggered"],
+                    "reasons": filing["vmf_reasons"],
+                    "score": filing["vmf_score"]
+                }
+            }
+            atomic_io.atomic_write_yaml(accession_dir / "meta.yaml", meta)
+
+            # Write manifest.yaml
+            manifest = {
+                "downloaded_at": datetime.now(TZ).isoformat(),
+                "download_level": filing["download_level"],
+                "files": {},
+                "completeness": {}
+            }
+            atomic_io.atomic_write_yaml(accession_dir / "manifest.yaml", manifest)
+
+    # Merge existing and new filings (upsert by accession to allow updating historical fields)
+    existing_filings = existing_index.get("filings", []) or []
+    by_accession = {f.get("accession"): f for f in existing_filings if f.get("accession")}
+    existing_accessions = set(by_accession.keys())
+
+    fetched = len(periodic_filings) + len(event_filings)
+    deduped_new = 0
+
+    for f in periodic_filings + event_filings:
+        record = {
+            "form": f.get("form"),
+            "filed_at": f.get("filed_at"),
+            "period_end": f.get("period_end"),  # SEC period_of_report; for 6-K often null unless parsed
+            "accession": f.get("accession"),
+            "has_xbrl": f.get("has_xbrl", False),
+            "local_dir": f"raw/sec/{f.get('accession')}/",
+            "is_amendment": "/A" in (f.get("form") or ""),
+            "primary_doc": f.get("primary_doc") or "primary_document.html",
+            "filing_url": f.get("filing_url") or f.get("url"),
+
+            # Bucketing / 6-K classification
+            "bucket": f.get("bucket") or ("event_stream" if f.get("is_event_stream") else "periodic_core"),
+            "sixk_class": f.get("sixk_class"),             # interim_results | other_event | None
+            "sixk_reasons": f.get("sixk_reasons", []),     # list[str]
+
+            # Event Stream / VMF (nullable for periodic core)
+            "is_event_stream": f.get("is_event_stream", False),
+            "vmf_triggered": f.get("vmf_triggered"),
+            "vmf_hard_triggered": f.get("vmf_hard_triggered"),
+            "vmf_reasons": f.get("vmf_reasons", []),
+            "vmf_score": f.get("vmf_score"),
+
+            # 8-K only (nullable)
+            "items": f.get("items"),
+
+            "downloaded": f.get("downloaded", False),
+            "download_level": f.get("download_level", "metadata_only"),
+
+            "source": f.get("source") or "sec_edgar_mcp.get_recent_filings",
+        }
+
+        accession = record.get("accession")
+        if not accession:
+            continue
+        if accession not in existing_accessions:
+            deduped_new += 1
+        by_accession[accession] = record  # upsert（允许修正历史字段：downloaded/vmf/sixk_class/...）
+
+    all_filings = sorted(by_accession.values(), key=lambda x: x.get("filed_at", ""), reverse=True)
+
     filings_index = {
-        "as_of": str(date.today()),
-        "filings": []  # Will be populated by MCP calls
+        "as_of": str(as_of),
+        "issuer_type": issuer_type,
+        "sixk_classifier_version": "v0.2",
+        "vmf_version": "v0.1",
+        "window": {
+            "mode": sec_mode,
+            "start": str(fetch_start),
+            "end": str(fetch_end),
+            "overlap_days": overlap_days,
+            "lookback_years": lookback_years,
+        },
+        "totals": {
+            "fetched": fetched,
+            "deduped_new": deduped_new,
+            "stored_total": len(all_filings),
+        },
+        "filings": all_filings,
     }
-    atomic_io.atomic_write_yaml(
-        paths.get_current_dir(ticker) / "filings_index.yaml",
-        filings_index
-    )
+    atomic_io.atomic_write_yaml(run_outputs_current / "filings_index.yaml", filings_index)
+    atomic_io.atomic_write_yaml(filings_index_path, filings_index)
     outputs.append("current/filings_index.yaml")
-    
-    # News digest (placeholder)
-    news_digest = generate_news_digest([])
-    atomic_io.atomic_write_yaml(
-        paths.get_current_dir(ticker) / "news_digest.yaml",
-        news_digest
+    print(f"Updated filings_index.yaml: {len(all_filings)} total filings")
+
+    # Write parquet version
+    if all_filings:
+        filings_df = pd.DataFrame(all_filings)
+        atomic_io.atomic_write_parquet(run_outputs_current / "filings_index.parquet", filings_df)
+        atomic_io.atomic_write_parquet(filings_parquet_path, filings_df)
+        outputs.append("current/filings_index.parquet")
+
+    sec_status = "ok" if all_filings else "partial"
+    if sec_status == "partial":
+        warnings.append("SEC: no filings returned (check MCP calls / window)")
+
+    # ===== Step 2: News Pipeline =====
+    print("\n=== News Pipeline ===")
+
+    news_index_path = current_dir / "news_index.parquet"
+    news_digest_path = current_dir / "news_digest.yaml"
+
+    # Determine mode + fetch window
+    existing_df = None
+    if not news_index_path.exists() or force_refresh:
+        news_mode = "init"
+        fetch_start = as_of - timedelta(days=lookback_days_news)
+        print(f"Mode: INIT (lookback_days_news={lookback_days_news})")
+    else:
+        news_mode = "maintenance"
+        existing_df = pd.read_parquet(news_index_path)
+        if existing_df.empty or "published_at" not in existing_df.columns:
+            fetch_start = as_of - timedelta(days=overlap_days)
+        else:
+            last_published = pd.to_datetime(existing_df["published_at"], utc=True, errors="coerce").max()
+            last_covered_day = last_published.date() if pd.notnull(last_published) else as_of
+            fetch_start = last_covered_day - timedelta(days=overlap_days)
+        print(f"Mode: MAINTENANCE (overlap_days={overlap_days})")
+
+    fetch_end = as_of
+    news_window_days = (fetch_end - fetch_start).days + 1
+    print(f"Fetching news from {fetch_start} to {fetch_end}")
+
+    # TODO: Call gdelt.gdelt_search_articles
+    # 按天循环，每天最多 news_max_per_day 篇
+    articles = []  # Placeholder
+    total_cap = news_max_per_day * news_window_days
+    print(f"TODO: Query GDELT for '{ticker}' OR '{company_name}'")
+    print(f"  - langs: {news_langs}, max_per_day: {news_max_per_day}, total_cap: {total_cap}")
+
+    # Normalize and dedupe
+    new_raw_articles = []
+    new_index_articles = []
+    if existing_df is not None and (not existing_df.empty) and "article_id" in existing_df.columns:
+        existing_ids = set(existing_df["article_id"].tolist())
+    else:
+        existing_ids = set()
+
+    for article in articles:
+        article_id = generate_article_id(article)
+        if article_id not in existing_ids:
+            raw_record = dict(article)
+            raw_record["article_id"] = article_id
+            raw_record["canonical_url"] = canonical_url(raw_record.get("url", ""))
+            raw_record["ticker"] = ticker
+            raw_record["query"] = f'"{ticker}" OR "{company_name}"'
+            raw_record["retrieved_at"] = datetime.now(timezone.utc).isoformat()
+
+            pub_date_str = raw_record.get("published_at", str(as_of))
+            try:
+                pub_date = datetime.fromisoformat(pub_date_str.replace('Z', '+00:00')).date()
+            except Exception:
+                pub_date = as_of
+            raw_path = f"raw/news/{pub_date.strftime('%Y/%m')}/news_{pub_date.strftime('%Y-%m-%d')}.jsonl.gz"
+
+            index_record = dict(raw_record)
+            index_record["raw_path"] = raw_path
+            index_record["event_tags"] = extract_event_tags(index_record)
+            score, reasons, features = score_news_relevance(index_record, ticker=ticker, company_name=company_name)
+            index_record["relevance_score"] = score
+            index_record["relevance_version"] = "rule_v0.1"
+            index_record["relevance_reasons"] = reasons
+            index_record["relevance_features_json"] = json.dumps(features, ensure_ascii=False, sort_keys=True)
+            index_record["impact_score"] = None  # Phase2: placeholder (default NaN)
+
+            new_raw_articles.append(raw_record)
+            new_index_articles.append(index_record)
+            existing_ids.add(article_id)
+
+    print(f"Deduped to {len(new_index_articles)} new articles")
+
+    # Append to partitioned raw store
+    for article in new_raw_articles:
+        pub_date_str = article.get("published_at", str(as_of))
+        try:
+            pub_date = datetime.fromisoformat(pub_date_str.replace('Z', '+00:00')).date()
+        except:
+            pub_date = as_of
+
+        file_path = raw_dir / "news" / pub_date.strftime("%Y/%m") / f"news_{pub_date.strftime('%Y-%m-%d')}.jsonl.gz"
+        append_to_gzip_jsonl(file_path, article)
+
+    # Update news_index.parquet
+    if news_mode == "init":
+        if new_index_articles:
+            news_index_df = pd.DataFrame(new_index_articles)
+        else:
+            news_index_df = pd.DataFrame(columns=[
+                "article_id", "published_at", "retrieved_at", "title", "source",
+                "url", "canonical_url", "lang", "snippet", "query", "ticker",
+                "raw_path",
+                "relevance_score", "relevance_version", "relevance_reasons", "relevance_features_json", "impact_score",
+                "event_tags"
+            ])
+    else:
+        if new_index_articles:
+            new_df = pd.DataFrame(new_index_articles)
+            if news_index_path.exists():
+                existing_df = pd.read_parquet(news_index_path)
+                news_index_df = pd.concat([existing_df, new_df], ignore_index=True)
+            else:
+                news_index_df = new_df
+        else:
+            news_index_df = pd.read_parquet(news_index_path) if news_index_path.exists() else pd.DataFrame()
+
+    # Parquet：强制 UTC timestamp 类型（避免 object/string 漂移）
+    if "published_at" in news_index_df.columns:
+        news_index_df["published_at"] = pd.to_datetime(news_index_df["published_at"], utc=True, errors="coerce")
+    if "retrieved_at" in news_index_df.columns:
+        news_index_df["retrieved_at"] = pd.to_datetime(news_index_df["retrieved_at"], utc=True, errors="coerce")
+
+    atomic_io.atomic_write_parquet(run_outputs_current / "news_index.parquet", news_index_df)
+    atomic_io.atomic_write_parquet(news_index_path, news_index_df)
+    outputs.append("current/news_index.parquet")
+
+    # Generate digest
+    news_digest = generate_news_digest(
+        new_articles=new_index_articles,
+        fetched=len(articles),
+        deduped_new=len(new_index_articles),
+        stored_total=len(news_index_df),
+        window_start=fetch_start,
+        window_end=fetch_end,
+        as_of=as_of,
+        mode=news_mode,
     )
+    atomic_io.atomic_write_yaml(run_outputs_current / "news_digest.yaml", news_digest)
+    atomic_io.atomic_write_yaml(news_digest_path, news_digest)
     outputs.append("current/news_digest.yaml")
-    
-    # Papers digest (placeholder)
-    papers_digest = {"as_of": str(date.today()), "total_papers": 0, "relevant_papers": []}
-    atomic_io.atomic_write_yaml(
-        paths.get_current_dir(ticker) / "papers_digest.yaml",
-        papers_digest
-    )
-    outputs.append("current/papers_digest.yaml")
-    
-    # Determine status
-    if len(filings_index.get("filings", [])) == 0:
+    print(f"Generated news_digest.yaml")
+
+    # ===== Step 3: Papers Pipeline =====
+    print("\n=== Papers Pipeline ===")
+
+    papers_index_path = current_dir / "papers_index.parquet"
+    papers_digest_path = current_dir / "papers_digest.yaml"
+
+    if papers_mode == "off":
+        stored_total = None
+        if papers_index_path.exists():
+            try:
+                stored_total = len(pd.read_parquet(papers_index_path))
+            except Exception:
+                stored_total = None
+        write_skipped_digest(
+            run_outputs_current / "papers_digest.yaml",
+            "user_disabled",
+            as_of,
+            papers_mode=papers_mode,
+            stored_total=stored_total,
+        )
+        write_skipped_digest(
+            papers_digest_path,
+            "user_disabled",
+            as_of,
+            papers_mode=papers_mode,
+            stored_total=stored_total,
+        )
+        outputs.append("current/papers_digest.yaml")
+        papers_status = "skipped"
+        print("Mode: OFF (user disabled)")
+    elif papers_mode == "auto" and not is_relevant_industry(sic):
+        stored_total = None
+        if papers_index_path.exists():
+            try:
+                stored_total = len(pd.read_parquet(papers_index_path))
+            except Exception:
+                stored_total = None
+        write_skipped_digest(
+            run_outputs_current / "papers_digest.yaml",
+            "not_relevant_industry",
+            as_of,
+            papers_mode=papers_mode,
+            stored_total=stored_total,
+        )
+        write_skipped_digest(
+            papers_digest_path,
+            "not_relevant_industry",
+            as_of,
+            papers_mode=papers_mode,
+            stored_total=stored_total,
+        )
+        outputs.append("current/papers_digest.yaml")
+        papers_status = "skipped"
+        print(f"Mode: AUTO → SKIPPED (SIC {sic} not relevant)")
+    else:
+        # Determine mode
+        if not papers_index_path.exists() or force_refresh:
+            papers_mode_actual = "init"
+            papers_window_days = lookback_days_papers
+            print(f"Mode: INIT ({lookback_days_papers} days)")
+        else:
+            # Staleness check
+            existing_digest = atomic_io.load_yaml(papers_digest_path)
+            last_fetch_str = existing_digest.get("as_of")
+
+            if last_fetch_str:
+                try:
+                    last_fetch = datetime.fromisoformat(last_fetch_str).date()
+                    days_since = (as_of - last_fetch).days
+                    if days_since < papers_refresh_days:
+                        print(f"Mode: SKIP (last fetch {days_since} days ago < {papers_refresh_days}d threshold)")
+                        stored_total = None
+                        if papers_index_path.exists():
+                            try:
+                                stored_total = len(pd.read_parquet(papers_index_path))
+                            except Exception:
+                                stored_total = None
+                        write_skipped_digest(
+                            run_outputs_current / "papers_digest.yaml",
+                            "too_fresh",
+                            as_of,
+                            papers_mode=papers_mode,
+                            stored_total=stored_total,
+                        )
+                        write_skipped_digest(
+                            papers_digest_path,
+                            "too_fresh",
+                            as_of,
+                            papers_mode=papers_mode,
+                            stored_total=stored_total,
+                        )
+                        outputs.append("current/papers_digest.yaml")
+                        papers_status = "skipped"
+                        # Skip to finalization
+                        papers_mode_actual = "skip"
+                    else:
+                        papers_mode_actual = "maintenance"
+                        papers_window_days = papers_refresh_days
+                        print(f"Mode: MAINTENANCE (refresh after {days_since} days)")
+                except:
+                    papers_mode_actual = "maintenance"
+                    papers_window_days = papers_refresh_days
+            else:
+                papers_mode_actual = "maintenance"
+                papers_window_days = papers_refresh_days
+
+        if papers_mode_actual != "skip":
+            # TODO: Call openalex.search_works
+            papers = []  # Placeholder
+            print(f"TODO: Query OpenAlex for '{company_name}'")
+
+            # Dedupe
+            new_raw_papers = []
+            new_index_papers = []
+            if papers_mode_actual == "maintenance" and papers_index_path.exists():
+                existing_df = pd.read_parquet(papers_index_path)
+                existing_ids = set(existing_df["paper_id"].tolist())
+            else:
+                existing_ids = set()
+
+            for paper in papers:
+                paper_id = stable_paper_id(paper)  # doi:/openalex:/arxiv:/pubmed:/sha1:
+                if paper_id not in existing_ids:
+                    raw_record = dict(paper)
+                    raw_record["paper_id"] = paper_id
+                    raw_record["ticker"] = ticker
+                    raw_record["retrieved_at"] = datetime.now(timezone.utc).isoformat()
+
+                    raw_path = f"raw/papers/{as_of.year}/{as_of.month:02d}/papers_{as_of.year}-{as_of.month:02d}.jsonl.gz"
+
+                    index_record = dict(raw_record)
+                    index_record["raw_path"] = raw_path
+                    index_record["tags"] = []  # TODO: extract tags
+                    index_record["relevance_score"] = 0.5  # TODO: implement
+
+                    new_raw_papers.append(raw_record)
+                    new_index_papers.append(index_record)
+                    existing_ids.add(paper_id)
+
+            print(f"Deduped to {len(new_index_papers)} new papers")
+
+            # Append to partitioned raw store
+            year = as_of.year
+            month = as_of.month
+            for paper in new_raw_papers:
+                file_path = raw_dir / "papers" / f"{year}/{month:02d}" / f"papers_{year}-{month:02d}.jsonl.gz"
+                append_to_gzip_jsonl(file_path, paper)
+
+            # Update papers_index.parquet
+            if papers_mode_actual == "init":
+                if new_index_papers:
+                    papers_index_df = pd.DataFrame(new_index_papers)
+                else:
+                    papers_index_df = pd.DataFrame(columns=[
+                        "paper_id", "doi", "openalex_id", "title", "year",
+                        "authors", "venue", "url", "abstract", "retrieved_at",
+                        "ticker", "raw_path", "relevance_score", "tags"
+                    ])
+            else:
+                if new_index_papers:
+                    new_df = pd.DataFrame(new_index_papers)
+                    if papers_index_path.exists():
+                        existing_df = pd.read_parquet(papers_index_path)
+                        papers_index_df = pd.concat([existing_df, new_df], ignore_index=True)
+                    else:
+                        papers_index_df = new_df
+                else:
+                    papers_index_df = pd.read_parquet(papers_index_path) if papers_index_path.exists() else pd.DataFrame()
+
+            # Parquet：强制 UTC timestamp 类型（避免 object/string 漂移）
+            if "retrieved_at" in papers_index_df.columns:
+                papers_index_df["retrieved_at"] = pd.to_datetime(papers_index_df["retrieved_at"], utc=True, errors="coerce")
+
+            atomic_io.atomic_write_parquet(run_outputs_current / "papers_index.parquet", papers_index_df)
+            atomic_io.atomic_write_parquet(papers_index_path, papers_index_df)
+            outputs.append("current/papers_index.parquet")
+
+            # Generate digest
+            papers_digest = generate_papers_digest(
+                new_papers=new_index_papers,
+                papers_mode=papers_mode,
+                window_mode=papers_mode_actual,
+                lookback_days=papers_window_days,
+                fetched=len(papers),
+                deduped_new=len(new_index_papers),
+                stored_total=len(papers_index_df),
+                as_of=as_of,
+            )
+            atomic_io.atomic_write_yaml(run_outputs_current / "papers_digest.yaml", papers_digest)
+            atomic_io.atomic_write_yaml(papers_digest_path, papers_digest)
+            outputs.append("current/papers_digest.yaml")
+            papers_status = "ok"
+            print(f"Generated papers_digest.yaml")
+
+    # ===== Step 4: Finalize =====
+    print("\n=== Finalizing ===")
+
+    # Load digests for components (skipped branches also write digest files)
+    papers_digest = atomic_io.load_yaml(papers_digest_path) if papers_digest_path.exists() else {}
+
+    # Build events candidates index (events_index.parquet) instead of writing evidence claims here
+    events = []
+    for e in (news_digest.get("high_impact_events") or []):
+        published_at = e.get("published_at")
+        try:
+            pub_dt = datetime.fromisoformat((published_at or "").replace('Z', '+00:00'))
+            pub_date = pub_dt.date()
+        except Exception:
+            pub_date = as_of
+        raw_path = f"raw/news/{pub_date.strftime('%Y/%m')}/news_{pub_date.strftime('%Y-%m-%d')}.jsonl.gz"
+        events.append({
+            "event_id": f"news:{e.get('article_id')}",
+            "event_type": "news",
+            "occurred_at": published_at,
+            "ticker": ticker,
+            "headline": e.get("title"),
+            "tags": e.get("tags", []),
+            "materiality_hint": e.get("impact_hint"),
+            "score_hint": None,  # Phase1: aboutness score != materiality/impact score
+            "impact_score": None,  # Phase2: placeholder (default NaN)
+            "source_ref_json": json.dumps({"url": e.get("url"), "raw_path": raw_path}, ensure_ascii=False, sort_keys=True),
+            "anchors_json": json.dumps({"snippet": e.get("snippet")}, ensure_ascii=False, sort_keys=True),
+        })
+
+    for f in all_filings:
+        if f.get("bucket") != "event_stream":
+            continue
+        if not f.get("vmf_triggered"):
+            continue
+        events.append({
+            "event_id": f"sec:{f.get('accession')}",
+            "event_type": "sec",
+            "occurred_at": f.get("filed_at"),
+            "ticker": ticker,
+            "headline": f"{f.get('form')} {f.get('accession')}",
+            "tags": (f.get("vmf_reasons") or []) + (f.get("items") or []),
+            "materiality_hint": "vmf_triggered_event",
+            "score_hint": f.get("vmf_score"),
+            "impact_score": None,  # Phase2: placeholder (default NaN)
+            "source_ref_json": json.dumps({"local_dir": f.get("local_dir"), "filing_url": f.get("filing_url")}, ensure_ascii=False, sort_keys=True),
+            "anchors_json": json.dumps({"items": f.get("items")}, ensure_ascii=False, sort_keys=True),
+        })
+
+    events_df = pd.DataFrame(events)
+    if events_df.empty:
+        events_df = pd.DataFrame(columns=[
+            "event_id", "event_type", "occurred_at", "ticker", "headline",
+            "tags", "materiality_hint", "score_hint", "impact_score", "source_ref_json", "anchors_json"
+        ])
+    else:
+        events_df["occurred_at"] = pd.to_datetime(events_df["occurred_at"], utc=True, errors="coerce")
+
+    atomic_io.atomic_write_parquet(run_outputs_current / "events_index.parquet", events_df)
+    atomic_io.atomic_write_parquet(current_dir / "events_index.parquet", events_df)
+    outputs.append("current/events_index.parquet")
+    print("Generated events_index.parquet")
+
+    # Update artifacts_state (align with component status; avoid blindly writing ok)
+    if sec_status in ["ok", "partial", "skipped"]:
+        artifacts_state.update_artifacts_state(ticker, "filings_index.yaml", sec_status, run_id)
+        if "current/filings_index.parquet" in outputs:
+            artifacts_state.update_artifacts_state(ticker, "filings_index.parquet", sec_status, run_id)
+
+    if news_status in ["ok", "partial", "skipped"]:
+        artifacts_state.update_artifacts_state(ticker, "news_digest.yaml", news_status, run_id)
+        if "current/news_index.parquet" in outputs:
+            artifacts_state.update_artifacts_state(ticker, "news_index.parquet", news_status, run_id)
+
+    if papers_status in ["ok", "partial", "skipped"]:
+        artifacts_state.update_artifacts_state(ticker, "papers_digest.yaml", papers_status, run_id)
+        if "current/papers_index.parquet" in outputs:
+            artifacts_state.update_artifacts_state(ticker, "papers_index.parquet", papers_status, run_id)
+
+    if "current/events_index.parquet" in outputs:
+        artifacts_state.update_artifacts_state(ticker, "events_index.parquet", "ok", run_id)
+
+    components = {
+        "sec": {
+            "status": sec_status,
+            "mode": filings_index.get("window", {}).get("mode"),
+            "window": filings_index.get("window", {}),
+            "totals": filings_index.get("totals", {}),
+            "warnings": sec_warnings,
+            "errors": sec_errors,
+        },
+        "news": {
+            "status": news_status,
+            "mode": news_digest.get("window", {}).get("mode"),
+            "window": news_digest.get("window", {}),
+            "totals": news_digest.get("totals", {}),
+            "warnings": news_warnings,
+            "errors": news_errors,
+        },
+        "papers": {
+            "status": papers_status,
+            "mode": papers_digest.get("window", {}).get("mode"),
+            "reason": papers_digest.get("reason"),
+            "window": papers_digest.get("window", {}),
+            "totals": papers_digest.get("totals", {}),
+            "warnings": papers_warnings,
+            "errors": papers_errors,
+        },
+    }
+
+    # Rollup status (orchestrator-friendly)
+    # - sec blocked/error -> skill blocked/error
+    # - any other error -> partial
+    # - any partial -> partial
+    # - sec ok + news ok + papers ok/skipped -> ok
+    # - all skipped + input fingerprint unchanged -> skipped (optional)
+    if sec_status in ["blocked", "error"]:
+        status = sec_status
+    elif news_status == "error" or papers_status == "error":
         status = "partial"
-        warnings.append("No filings retrieved - MCP tools need to be called")
+    elif sec_status == "partial" or news_status == "partial" or papers_status == "partial":
+        status = "partial"
+    elif sec_status == "skipped" and news_status == "skipped" and papers_status == "skipped":
+        status = "skipped"
     else:
         status = "ok"
-    
-    # Update artifacts
-    artifacts_state.update_artifacts_state(ticker, "filings_index.yaml", status, run_id)
-    artifacts_state.update_artifacts_state(ticker, "news_digest.yaml", status, run_id)
-    artifacts_state.update_artifacts_state(ticker, "papers_digest.yaml", status, run_id)
-    
+
     result = runlog.write_result(run_dir, ticker, SKILL_NAME, status,
-        outputs=outputs, warnings=warnings)
-    
+        outputs=outputs, warnings=warnings, as_of=str(as_of),
+        components=components)
+
     print(f"\n=== Result: {status} ===")
+    print(f"Run: {run_dir}")
+    print(f"Outputs: {outputs}")
+
     return result
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("ticker")
-    parser.add_argument("--lookback-years", type=int, default=10)
-    parser.add_argument("--lookback-days-news", type=int, default=180)
-    parser.add_argument("--papers-mode", choices=["auto", "on", "off"], default="auto")
+    parser = argparse.ArgumentParser(description="Collect company facts v0.3 (VMF)")
+    parser.add_argument("ticker", help="Stock ticker")
+    parser.add_argument("--as-of", type=date.fromisoformat)
     parser.add_argument("--force-refresh", action="store_true")
+
+    # Window params
+    parser.add_argument("--lookback-years", type=int, default=10, help="Init: SEC lookback years")
+    parser.add_argument("--lookback-days-news", type=int, default=5, help="Init: news lookback days")
+    parser.add_argument("--lookback-days-papers", type=int, default=180, help="Init: papers lookback days")
+    parser.add_argument("--overlap-days", type=int, default=2, help="Maintenance: overlap window days")
+    parser.add_argument("--papers-refresh-days", type=int, default=30, help="Papers staleness threshold")
+
+    # VMF params
+    parser.add_argument("--vmf-score-threshold", type=int, default=8)
+    parser.add_argument("--vmf-annual-budget", type=int, default=20)
+
+    # News params
+    parser.add_argument("--news-max-per-day", type=int, default=100,
+                        help="Max articles per day (prevents data loss on long windows)")
+    parser.add_argument("--news-langs", nargs="+", default=["en", "zh"],
+                        help="Language filter list")
+
+    # Papers params
+    parser.add_argument("--papers-mode", default="auto", choices=["auto", "on", "off"])
+    parser.add_argument("--papers-max-results", type=int, default=200)
+
     args = parser.parse_args()
-    
-    run(args.ticker, args.lookback_years, args.lookback_days_news, 
-        args.papers_mode, args.force_refresh)
+
+    run(args.ticker,
+        as_of=args.as_of,
+        force_refresh=args.force_refresh,
+        lookback_years=args.lookback_years,
+        lookback_days_news=args.lookback_days_news,
+        lookback_days_papers=args.lookback_days_papers,
+        overlap_days=args.overlap_days,
+        papers_refresh_days=args.papers_refresh_days,
+        vmf_score_threshold=args.vmf_score_threshold,
+        vmf_annual_budget=args.vmf_annual_budget,
+        news_max_per_day=args.news_max_per_day,
+        news_langs=args.news_langs,
+        papers_mode=args.papers_mode,
+        papers_max_results=args.papers_max_results)
 ```
 
----
 
 ## 四、Skill 3: extract-xbrl-timeseries (v0.1 浅树版)
 
@@ -1185,7 +2518,7 @@ from datetime import date
 from pathlib import Path
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).parents[4]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
 from company_research_runtime import (
     paths, atomic_io, runlog, artifacts_state, evidence
@@ -1589,7 +2922,7 @@ from datetime import date
 from pathlib import Path
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).parents[4]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
 from company_research_runtime import (
     paths, atomic_io, runlog, artifacts_state, evidence
@@ -1996,7 +3329,7 @@ from datetime import date
 from pathlib import Path
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).parents[4]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
 from company_research_runtime import (
     paths, atomic_io, runlog, artifacts_state, evidence
