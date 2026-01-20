@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""collect-company-facts skill runner."""
+"""collect-company-facts skill runner (SEC-only for Phase 1)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import argparse
 import json
 import sys
 import uuid
-from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -34,7 +33,7 @@ if str(REPO_ROOT) not in sys.path:
 from company_research_runtime import (  # noqa: E402
     append_evidence,
     atomic_write_json,
-    atomic_write_jsonl,
+    atomic_write_parquet,
     atomic_write_text,
     atomic_write_yaml,
     build_needs,
@@ -42,6 +41,7 @@ from company_research_runtime import (  # noqa: E402
     build_run_result,
     company_paths,
     default_run_id,
+    ensure_jsonl,
     update_artifacts_state,
     write_meta,
     write_needs,
@@ -222,243 +222,11 @@ def _filing_sort_key(filing: dict[str, Any]) -> str:
     return str(filing.get("filed_at") or filing.get("period_end") or "")
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    records: list[dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return records
-
-
-def _dedupe_records(records: Iterable[dict[str, Any]], key_fn) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    unique: list[dict[str, Any]] = []
-    for record in records:
-        key = key_fn(record)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        unique.append(record)
-    return unique
-
-
-def _article_published_at(article: dict[str, Any]) -> str | None:
-    return (
-        article.get("published_at")
-        or article.get("seendate")
-        or article.get("date")
-        or article.get("publishedAt")
-    )
-
-
-def _article_key(article: dict[str, Any]) -> str | None:
-    url = article.get("url") or article.get("source_url")
-    if url:
-        return str(url)
-    title = article.get("title") or ""
-    published_at = _article_published_at(article) or ""
-    key = f"{title}|{published_at}".strip("|")
-    return key or None
-
-
-def _normalize_article(article: dict[str, Any], fetched_at: str, query: str | None) -> dict[str, Any]:
-    normalized = dict(article)
-    if "published_at" not in normalized:
-        published_at = _article_published_at(article)
-        if published_at:
-            normalized["published_at"] = published_at
-    normalized["fetched_at"] = fetched_at
-    if query:
-        normalized["query"] = query
-    return normalized
-
-
-def _generate_news_digest(articles: list[dict[str, Any]], as_of_label: str) -> dict[str, Any]:
-    if not articles:
-        return {"as_of": as_of_label, "total_articles": 0, "top_themes": [], "key_events": []}
-
-    themes = Counter()
-    for article in articles:
-        title = (article.get("title") or "").lower()
-        if any(word in title for word in ("earning", "revenue", "profit", "quarter", "guidance")):
-            themes["earnings"] += 1
-        if any(word in title for word in ("acquisition", "merger", "deal", "buyout")):
-            themes["m_and_a"] += 1
-        if any(word in title for word in ("lawsuit", "sec", "investigation", "fraud")):
-            themes["legal"] += 1
-        if any(word in title for word in ("ceo", "cfo", "chief", "executive", "appoint")):
-            themes["management"] += 1
-        if any(word in title for word in ("product", "launch", "release", "upgrade")):
-            themes["product"] += 1
-        if any(word in title for word in ("regulation", "antitrust", "doj", "ftc")):
-            themes["regulatory"] += 1
-
-    published_dates = [
-        article.get("published_at") or article.get("seendate")
-        for article in articles
-        if article.get("published_at") or article.get("seendate")
-    ]
-
-    key_events = [
-        {
-            "published_at": article.get("published_at") or article.get("seendate"),
-            "title": article.get("title"),
-            "url": article.get("url") or article.get("source_url"),
-            "source": article.get("source") or article.get("domain"),
-        }
-        for article in sorted(articles, key=lambda item: str(_article_published_at(item) or ""), reverse=True)[:10]
-    ]
-
-    digest = {
-        "as_of": as_of_label,
-        "total_articles": len(articles),
-        "date_range": [min(published_dates), max(published_dates)] if published_dates else [],
-        "top_themes": [
-            {"theme": theme, "count": count} for theme, count in themes.most_common(6)
-        ],
-        "key_events": key_events,
-    }
-    return digest
-
-
-def _paper_key(paper: dict[str, Any]) -> str | None:
-    doi = paper.get("doi") or paper.get("DOI")
-    if doi:
-        return str(doi)
-    paper_id = paper.get("id") or paper.get("openalex_id")
-    if paper_id:
-        return str(paper_id)
-    title = paper.get("title") or paper.get("display_name") or ""
-    year = paper.get("publication_year") or paper.get("year") or ""
-    key = f"{title}|{year}".strip("|")
-    return key or None
-
-
-def _normalize_paper(paper: dict[str, Any], fetched_at: str, query: str | None) -> dict[str, Any]:
-    normalized = dict(paper)
-    normalized["fetched_at"] = fetched_at
-    if query:
-        normalized["query"] = query
-    return normalized
-
-
-def _paper_score(paper: dict[str, Any]) -> float:
-    score = paper.get("relevance_score")
-    if isinstance(score, (int, float)):
-        return float(score)
-    cited = paper.get("cited_by_count") or paper.get("citedByCount")
-    if isinstance(cited, (int, float)):
-        return float(cited)
-    year = paper.get("publication_year") or paper.get("year")
-    if isinstance(year, (int, float)):
-        return float(year)
-    return 0.0
-
-
-def _generate_papers_digest(papers: list[dict[str, Any]], as_of_label: str) -> dict[str, Any]:
-    if not papers:
-        return {"as_of": as_of_label, "total_papers": 0, "relevant_papers": []}
-
-    def extract_title(paper: dict[str, Any]) -> str | None:
-        return paper.get("title") or paper.get("display_name") or paper.get("name")
-
-    def extract_url(paper: dict[str, Any]) -> str | None:
-        return (
-            paper.get("url")
-            or paper.get("landing_page_url")
-            or paper.get("id")
-            or paper.get("openalex_id")
-            or paper.get("doi")
-        )
-
-    def extract_venue(paper: dict[str, Any]) -> str | None:
-        if isinstance(paper.get("host_venue"), dict):
-            return paper.get("host_venue", {}).get("display_name")
-        return paper.get("journal") or paper.get("venue")
-
-    ranked = sorted(papers, key=_paper_score, reverse=True)
-    selected = ranked[:20]
-    digest_items: list[dict[str, Any]] = []
-    for paper in selected:
-        digest_items.append(
-            {
-                "title": extract_title(paper),
-                "year": paper.get("publication_year") or paper.get("year"),
-                "venue": extract_venue(paper),
-                "url": extract_url(paper),
-                "doi": paper.get("doi") or paper.get("DOI"),
-                "cited_by_count": paper.get("cited_by_count") or paper.get("citedByCount"),
-                "summary": paper.get("summary") or paper.get("abstract"),
-                "score": _paper_score(paper),
-            }
-        )
-
-    return {
-        "as_of": as_of_label,
-        "total_papers": len(papers),
-        "relevant_papers": digest_items,
-    }
-
-
-def _is_relevant_for_papers(company: dict[str, Any]) -> bool:
-    sic = str(company.get("sic") or "")
-    if sic and sic[:2] in {"28", "35", "36", "38", "73"}:
-        return True
-    name = (company.get("company_name") or "").lower()
-    keywords = [
-        "biotech",
-        "pharma",
-        "pharmaceutical",
-        "semiconductor",
-        "software",
-        "technology",
-        "medical",
-        "diagnostic",
-        "materials",
-    ]
-    return any(keyword in name for keyword in keywords)
-
-
-def _generate_evidence_id(prefix: str = "E") -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return f"{prefix}_{stamp}_{uuid.uuid4().hex[:6]}"
-
-
-def _append_evidence_record(
-    *,
-    evidence_path: Path,
-    ticker: str,
-    claim: str,
-    sources: list[dict[str, Any]],
-    confidence: float = 0.85,
-) -> None:
-    record = {
-        "id": _generate_evidence_id("E"),
-        "created_at": datetime.now(timezone.utc).date().isoformat(),
-        "ticker": ticker,
-        "skill": SKILL_NAME,
-        "claim": claim,
-        "confidence": confidence,
-        "sources": sources,
-    }
-    append_evidence(evidence_path, record)
-
-
 def _persist_inputs(
     run_dir: Path,
     *,
     filings_payloads: list[Any],
     filing_content_payload: Any | None,
-    news_payload: Any | None,
-    papers_payload: Any | None,
 ) -> list[str]:
     inputs_dir = run_dir / "inputs"
     persisted: list[str] = []
@@ -478,22 +246,6 @@ def _persist_inputs(
             default=str,
         )
         persisted.append("inputs/filing_content_payload.json")
-    if news_payload is not None:
-        atomic_write_json(
-            inputs_dir / "news_payload.json",
-            news_payload,
-            ensure_ascii=False,
-            default=str,
-        )
-        persisted.append("inputs/news_payload.json")
-    if papers_payload is not None:
-        atomic_write_json(
-            inputs_dir / "papers_payload.json",
-            papers_payload,
-            ensure_ascii=False,
-            default=str,
-        )
-        persisted.append("inputs/papers_payload.json")
     return persisted
 
 
@@ -527,7 +279,7 @@ def _write_filing_raw(
 
     if isinstance(content_payload, dict):
         if "sections" in content_payload:
-            atomic_write_json(target_dir / "sections.json", content_payload["sections"])
+            atomic_write_json(target_dir / "sections.json", content_payload["sections"], ensure_ascii=False)
         if "content" in content_payload:
             atomic_write_text(target_dir / "content.txt", str(content_payload["content"]))
         if "html" in content_payload:
@@ -538,20 +290,101 @@ def _write_filing_raw(
         atomic_write_text(target_dir / "content.txt", content_payload)
 
 
+def _generate_evidence_id(prefix: str = "E") -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return f"{prefix}_{stamp}_{uuid.uuid4().hex[:6]}"
+
+
+def _append_evidence_record(
+    *,
+    evidence_path: Path,
+    ticker: str,
+    claim: str,
+    sources: list[dict[str, Any]],
+    confidence: float = 0.85,
+) -> None:
+    record = {
+        "id": _generate_evidence_id("E"),
+        "created_at": datetime.now(timezone.utc).date().isoformat(),
+        "ticker": ticker,
+        "skill": SKILL_NAME,
+        "claim": claim,
+        "confidence": confidence,
+        "sources": sources,
+    }
+    append_evidence(evidence_path, record)
+
+
+def _build_events_index(
+    filings: Iterable[dict[str, Any]],
+    *,
+    ticker: str,
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for filing in filings:
+        accession = filing.get("accession")
+        form = filing.get("form")
+        if not accession or not isinstance(form, str):
+            continue
+        if not (form.startswith("8-K") or form.startswith("6-K")):
+            continue
+        events.append(
+            {
+                "event_id": f"sec:{accession}",
+                "event_type": "sec",
+                "occurred_at": filing.get("filed_at"),
+                "ticker": ticker,
+                "headline": f"{form} {accession}",
+                "tags": [],
+                "materiality_hint": None,
+                "score_hint": None,
+                "impact_score": None,  # Phase2 placeholder
+                "source_ref_json": json.dumps(
+                    {"local_dir": filing.get("local_dir")},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                "anchors_json": json.dumps({}, ensure_ascii=False, sort_keys=True),
+            }
+        )
+    return events
+
+
+def _write_parquet_pair(
+    *,
+    run_path: Path,
+    current_path: Path,
+    records: list[dict[str, Any]],
+    timestamp_cols: list[str] | None,
+    warnings: list[str],
+    label: str,
+) -> bool:
+    if not records:
+        return False
+    try:
+        import pandas as pd
+    except ImportError:
+        warnings.append(f"Skipped {label} parquet: pandas not available")
+        return False
+
+    frame = pd.DataFrame(records)
+    for col in timestamp_cols or []:
+        if col in frame.columns:
+            frame[col] = pd.to_datetime(frame[col], utc=True, errors="coerce")
+
+    atomic_write_parquet(run_path, frame)
+    atomic_write_parquet(current_path, frame)
+    return True
+
+
 def run(
     ticker: str,
     *,
     as_of: date | str | None = None,
     lookback_years: int = 10,
-    lookback_days_news: int = 180,
-    papers_mode: str = "auto",
     force_refresh: bool = False,
     filings_payloads: list[Any] | None = None,
     filing_content_payload: Any | None = None,
-    news_payload: Any | None = None,
-    papers_payload: Any | None = None,
-    news_query: str | None = None,
-    papers_query: str | None = None,
     demo: bool = False,
     timezone_name: str = DEFAULT_TIMEZONE,
     persist_inputs: bool = False,
@@ -575,8 +408,6 @@ def run(
             run_dir,
             filings_payloads=filings_payloads,
             filing_content_payload=filing_content_payload,
-            news_payload=news_payload,
-            papers_payload=papers_payload,
         )
 
     meta = build_run_meta(
@@ -586,8 +417,6 @@ def run(
         as_of=as_of_value,
         timezone=timezone_name,
         lookback_years=lookback_years,
-        lookback_days_news=lookback_days_news,
-        papers_mode=papers_mode,
         force_refresh=force_refresh,
         forms=DEFAULT_FORMS,
         inputs_persisted=persisted_inputs,
@@ -627,11 +456,10 @@ def run(
         return result
 
     cik = str(company.get("cik"))
-    company_name = company.get("company_name") or ticker
-
     filing_content_map = _resolve_filing_payload_map(filing_content_payload)
 
-    existing_index = _load_yaml(paths.current_dir / "filings_index.yaml")
+    current_filings_path = paths.current_dir / "filings_index.yaml"
+    existing_index = _load_yaml(current_filings_path)
     existing_filings = existing_index.get("filings") if isinstance(existing_index, dict) else []
     existing_filings = existing_filings if isinstance(existing_filings, list) else []
     existing_accessions = {
@@ -657,9 +485,8 @@ def run(
     normalized_filings = [filing for filing in normalized_filings if filing.get("accession")]
 
     filings_skipped = False
-    new_accessions: set[str] = set()
     if not normalized_filings and existing_filings and not force_refresh:
-        filings_index = existing_index
+        filings_index: dict[str, Any] = existing_index
         filings_skipped = True
     else:
         merged_filings = _merge_filings(existing_filings, normalized_filings)
@@ -668,13 +495,22 @@ def run(
             as_of=as_of_value if isinstance(as_of_value, date) else date.today(),
             lookback_years=lookback_years,
         )
-        filings_index = {"as_of": as_of_label, "filings": merged_filings}
-
-    if not isinstance(filings_index, dict):
-        filings_index = {"as_of": as_of_label, "filings": []}
+        new_accessions_count = len({f.get("accession") for f in normalized_filings if f.get("accession")} - existing_accessions)
+        filings_index = {
+            "as_of": as_of_label,
+            "cik": cik,
+            "totals": {
+                "fetched": len(raw_filings),
+                "deduped_new": new_accessions_count,
+                "stored_total": len(merged_filings),
+            },
+            "filings": merged_filings,
+        }
 
     filings_list = filings_index.get("filings") if isinstance(filings_index, dict) else []
     filings_list = filings_list if isinstance(filings_list, list) else []
+
+    new_accessions: set[str] = set()
     for filing in filings_list:
         if not isinstance(filing, dict):
             continue
@@ -694,142 +530,53 @@ def run(
             content_payload = _resolve_filing_content(filing_content_map, accession)
             _write_filing_raw(raw_sec_dir=raw_sec_dir, filing=filing, content_payload=content_payload)
 
-    if isinstance(filings_index, dict):
-        filings_index["filings"] = [
+    # Attach local_dir and sort.
+    enriched_filings: list[dict[str, Any]] = []
+    for filing in filings_list:
+        if not isinstance(filing, dict):
+            continue
+        enriched_filings.append(
             {
                 **filing,
                 "local_dir": f"raw/sec/{filing.get('accession')}/" if filing.get("accession") else None,
             }
-            for filing in filings_list
-            if isinstance(filing, dict)
-        ]
-        filings_index["filings"].sort(key=_filing_sort_key, reverse=True)
+        )
+    enriched_filings.sort(key=_filing_sort_key, reverse=True)
+    filings_index["filings"] = enriched_filings
 
-    filings_output_path = outputs_dir / "filings_index.yaml"
-    atomic_write_yaml(filings_output_path, filings_index)
-
-    current_filings_path = paths.current_dir / "filings_index.yaml"
-    if filings_list and not filings_skipped:
-        atomic_write_yaml(current_filings_path, filings_index)
-    elif filings_list and not current_filings_path.exists():
-        atomic_write_yaml(current_filings_path, filings_index)
+    ensure_jsonl(paths.evidence_jsonl)
+    ensure_jsonl(paths.questions_jsonl)
 
     filings_status = "skipped" if filings_skipped else "ok"
-    if not filings_list:
+    if not enriched_filings:
         filings_status = "blocked"
         warnings.append("SEC filings list unavailable or empty")
         missing.append("current/filings_index.yaml")
 
-    news_articles_raw: list[dict[str, Any]] = []
-    if isinstance(news_payload, list):
-        news_articles_raw = [item for item in news_payload if isinstance(item, dict)]
-    elif isinstance(news_payload, dict):
-        for key in ("articles", "results", "data"):
-            value = news_payload.get(key)
-            if isinstance(value, list):
-                news_articles_raw = [item for item in value if isinstance(item, dict)]
-                break
+    # Persist outputs (runs → current).
+    run_filings_yaml = outputs_dir / "filings_index.yaml"
+    atomic_write_yaml(run_filings_yaml, filings_index)
+    if (not filings_skipped) or not current_filings_path.exists():
+        atomic_write_yaml(current_filings_path, filings_index)
 
-    if demo and not news_articles_raw:
-        news_articles_raw = [
-            {
-                "title": f"{ticker} announces demo earnings",
-                "url": "https://example.com/demo",
-                "seendate": as_of_label,
-                "source": "demo",
-            }
-        ]
+    filings_parquet_written = _write_parquet_pair(
+        run_path=outputs_dir / "filings_index.parquet",
+        current_path=paths.current_dir / "filings_index.parquet",
+        records=enriched_filings,
+        timestamp_cols=None,
+        warnings=warnings,
+        label="filings_index",
+    )
 
-    raw_news_path = paths.raw_dir / "news" / "news.jsonl"
-    existing_news = _read_jsonl(raw_news_path)
-    fetched_at = _now_iso()
-
-    normalized_news = [
-        _normalize_article(article, fetched_at=fetched_at, query=news_query) for article in news_articles_raw
-    ]
-    merged_news = normalized_news if force_refresh else existing_news + normalized_news
-    merged_news = _dedupe_records(merged_news, _article_key)
-
-    news_skipped = False
-    if not normalized_news and existing_news and not force_refresh:
-        news_skipped = True
-        news_digest = _load_yaml(paths.current_dir / "news_digest.yaml")
-        if not news_digest:
-            news_digest = _generate_news_digest([], as_of_label)
-    else:
-        atomic_write_jsonl(raw_news_path, merged_news)
-        news_digest = _generate_news_digest(merged_news, as_of_label)
-
-    news_output_path = outputs_dir / "news_digest.yaml"
-    atomic_write_yaml(news_output_path, news_digest)
-    current_news_path = paths.current_dir / "news_digest.yaml"
-    if (not news_skipped) or not current_news_path.exists():
-        atomic_write_yaml(current_news_path, news_digest)
-
-    news_status = "skipped" if news_skipped else "ok"
-    if not merged_news and not news_skipped:
-        warnings.append("No news articles captured")
-
-    raw_papers_path = paths.raw_dir / "papers" / "papers.jsonl"
-    existing_papers = _read_jsonl(raw_papers_path)
-
-    papers_skipped = False
-    papers_digest: dict[str, Any]
-    papers_records: list[dict[str, Any]] = []
-
-    if papers_mode == "off":
-        papers_skipped = True
-        papers_digest = {"as_of": as_of_label, "total_papers": 0, "relevant_papers": [], "skipped": "off"}
-        if not raw_papers_path.exists():
-            atomic_write_jsonl(raw_papers_path, [])
-    else:
-        relevant = _is_relevant_for_papers(company)
-        if papers_mode == "auto" and not relevant:
-            papers_skipped = True
-            papers_digest = {
-                "as_of": as_of_label,
-                "total_papers": 0,
-                "relevant_papers": [],
-                "skipped": "not_relevant_industry",
-            }
-            if not raw_papers_path.exists():
-                atomic_write_jsonl(raw_papers_path, [])
-        else:
-            papers_payload_data = papers_payload
-            if isinstance(papers_payload_data, dict):
-                for key in ("results", "data", "papers"):
-                    value = papers_payload_data.get(key)
-                    if isinstance(value, list):
-                        papers_payload_data = value
-                        break
-            if isinstance(papers_payload_data, list):
-                papers_records = [item for item in papers_payload_data if isinstance(item, dict)]
-            if demo and not papers_records:
-                papers_records = [
-                    {
-                        "title": f"{company_name} demo research",
-                        "publication_year": date.today().year,
-                        "doi": "10.0000/demo",
-                    }
-                ]
-
-            normalized_papers = [
-                _normalize_paper(paper, fetched_at=fetched_at, query=papers_query) for paper in papers_records
-            ]
-            merged_papers = normalized_papers if force_refresh else existing_papers + normalized_papers
-            merged_papers = _dedupe_records(merged_papers, _paper_key)
-            atomic_write_jsonl(raw_papers_path, merged_papers)
-            papers_digest = _generate_papers_digest(merged_papers, as_of_label)
-
-    papers_output_path = outputs_dir / "papers_digest.yaml"
-    atomic_write_yaml(papers_output_path, papers_digest)
-    current_papers_path = paths.current_dir / "papers_digest.yaml"
-    if (not papers_skipped) or not current_papers_path.exists():
-        atomic_write_yaml(current_papers_path, papers_digest)
-
-    papers_status = "skipped" if papers_skipped else "ok"
-    if not papers_records and not papers_skipped:
-        warnings.append("No papers captured")
+    events = _build_events_index(enriched_filings, ticker=ticker)
+    events_parquet_written = _write_parquet_pair(
+        run_path=outputs_dir / "events_index.parquet",
+        current_path=paths.current_dir / "events_index.parquet",
+        records=events,
+        timestamp_cols=["occurred_at"],
+        warnings=warnings,
+        label="events_index",
+    )
 
     if filings_status == "blocked":
         needs = build_needs(
@@ -851,24 +598,26 @@ def run(
         run_id=run_id,
         skill=SKILL_NAME,
         file_path=current_filings_path if current_filings_path.exists() else None,
-        extra={"status": filings_status, "count": len(filings_list)},
+        extra={"status": filings_status, "count": len(enriched_filings)},
     )
-    update_artifacts_state(
-        paths.artifacts_state_yaml,
-        artifact="current/news_digest.yaml",
-        run_id=run_id,
-        skill=SKILL_NAME,
-        file_path=current_news_path if current_news_path.exists() else None,
-        extra={"status": news_status, "count": len(merged_news) if not news_skipped else 0},
-    )
-    update_artifacts_state(
-        paths.artifacts_state_yaml,
-        artifact="current/papers_digest.yaml",
-        run_id=run_id,
-        skill=SKILL_NAME,
-        file_path=current_papers_path if current_papers_path.exists() else None,
-        extra={"status": papers_status, "count": len(papers_records)},
-    )
+    if filings_parquet_written:
+        update_artifacts_state(
+            paths.artifacts_state_yaml,
+            artifact="current/filings_index.parquet",
+            run_id=run_id,
+            skill=SKILL_NAME,
+            file_path=paths.current_dir / "filings_index.parquet",
+            extra={"status": filings_status, "count": len(enriched_filings)},
+        )
+    if events_parquet_written:
+        update_artifacts_state(
+            paths.artifacts_state_yaml,
+            artifact="current/events_index.parquet",
+            run_id=run_id,
+            skill=SKILL_NAME,
+            file_path=paths.current_dir / "events_index.parquet",
+            extra={"status": "ok", "count": len(events)},
+        )
 
     if new_accessions:
         _append_evidence_record(
@@ -878,32 +627,22 @@ def run(
             sources=[{"type": "sec_edgar_mcp", "tool": "get_recent_filings", "count": len(new_accessions)}],
             confidence=0.9,
         )
-    if normalized_news:
-        _append_evidence_record(
-            evidence_path=paths.evidence_jsonl,
-            ticker=ticker,
-            claim=f"Captured {len(normalized_news)} news articles for {ticker}",
-            sources=[{"type": "gdelt", "tool": "gdelt_search_articles", "count": len(normalized_news)}],
-            confidence=0.8,
-        )
-    if papers_records:
-        _append_evidence_record(
-            evidence_path=paths.evidence_jsonl,
-            ticker=ticker,
-            claim=f"Captured {len(papers_records)} papers for {ticker}",
-            sources=[{"type": "openalex", "tool": "search_works", "count": len(papers_records)}],
-            confidence=0.75,
-        )
 
     status: str
     if filings_status == "blocked":
         status = "blocked"
-    elif filings_status == "skipped" and news_status == "skipped" and papers_status == "skipped":
+    elif filings_status == "skipped":
         status = "skipped"
-    elif "No news articles captured" in warnings or "No papers captured" in warnings:
+    elif warnings:
         status = "partial"
     else:
         status = "ok"
+
+    outputs: list[str] = ["current/filings_index.yaml"]
+    if filings_parquet_written:
+        outputs.append("current/filings_index.parquet")
+    if events_parquet_written:
+        outputs.append("current/events_index.parquet")
 
     result = build_run_result(
         skill=SKILL_NAME,
@@ -914,14 +653,8 @@ def run(
         timezone=timezone_name,
         missing=missing,
         warnings=warnings,
-        outputs=[
-            "current/filings_index.yaml",
-            "current/news_digest.yaml",
-            "current/papers_digest.yaml",
-        ],
+        outputs=outputs,
         filings_skipped=filings_skipped,
-        news_skipped=news_skipped,
-        papers_skipped=papers_skipped,
         cik=cik,
     )
     write_result(run_dir, result)
@@ -929,23 +662,15 @@ def run(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="collect-company-facts runner")
+    parser = argparse.ArgumentParser(description="collect-company-facts runner (SEC-only)")
     parser.add_argument("ticker", help="Stock ticker symbol")
     parser.add_argument("--as-of", dest="as_of", help="Snapshot date YYYY-MM-DD")
     parser.add_argument("--lookback-years", type=int, default=10)
-    parser.add_argument("--lookback-days-news", type=int, default=180)
-    parser.add_argument("--papers-mode", choices=["auto", "on", "off"], default="auto")
     parser.add_argument("--force-refresh", action="store_true")
     parser.add_argument("--filings-json", action="append", help="Inline JSON payload for filings")
     parser.add_argument("--filings-path", action="append", type=Path, help="Path to filings payload")
     parser.add_argument("--filing-content-json", help="Inline JSON map accession->content")
     parser.add_argument("--filing-content-path", type=Path, help="Path to filing content map")
-    parser.add_argument("--news-json", help="Inline JSON payload for news articles")
-    parser.add_argument("--news-path", type=Path, help="Path to news payload")
-    parser.add_argument("--news-query", help="Query string used for news search")
-    parser.add_argument("--papers-json", help="Inline JSON payload for papers")
-    parser.add_argument("--papers-path", type=Path, help="Path to papers payload")
-    parser.add_argument("--papers-query", help="Query string used for papers search")
     parser.add_argument("--demo", action="store_true", help="Use demo data instead of MCP results")
     parser.add_argument(
         "--persist-inputs",
@@ -966,23 +691,15 @@ def main() -> int:
                 filings_payloads.append(payload)
 
     filing_content_payload = _load_payload(args.filing_content_path, args.filing_content_json)
-    news_payload = _load_payload(args.news_path, args.news_json)
-    papers_payload = _load_payload(args.papers_path, args.papers_json)
     as_of_value = _parse_as_of(args.as_of)
 
     result = run(
         args.ticker,
         as_of=as_of_value,
         lookback_years=args.lookback_years,
-        lookback_days_news=args.lookback_days_news,
-        papers_mode=args.papers_mode,
         force_refresh=args.force_refresh,
         filings_payloads=filings_payloads,
         filing_content_payload=filing_content_payload,
-        news_payload=news_payload,
-        papers_payload=papers_payload,
-        news_query=args.news_query,
-        papers_query=args.papers_query,
         demo=args.demo,
         timezone_name=args.timezone,
         persist_inputs=args.persist_inputs,

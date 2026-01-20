@@ -208,19 +208,18 @@ None
   SKILL.md
   scripts/
     run.py
-  references/
-    query_templates.md     # 可选：新闻/论文检索 query 模板
+  references/              # 可选：预留（Phase1 不使用）
 ```
 
 ## 3.2 SKILL.md（要点）
 
-* description 明确：拉 filings + news + papers，并写 `filings_index.yaml/news_digest.yaml/papers_digest.yaml`
+* description 明确：仅拉 SEC filings，并写 `filings_index.yaml`（可选：events_index 作为候选事件池）
 * body 里写清：filings 要哪些 form；lookback；增量逻辑；“已有 accession 不重复下载”
 
 ```md
 ---
 name: collect-company-facts
-description: "Collect SEC filings plus news and papers for a ticker and write filings_index.yaml and digests under current/."
+description: "Collect SEC filings for a ticker and write filings_index.yaml under current/."
 version: v0.1
 ---
 ...
@@ -246,28 +245,9 @@ version: v0.1
 
 > 这里我建议你先用档 1 把整条链跑通（Phase 1 的目标是先有可复算 IV），然后再升级到档 2。
 
-### (B) 新闻：gdelt + rss
+### (B) News / Papers（Phase1 暂停）
 
-你启用了 `gdelt.search_articles`（工具在 config 里明确）。
-实现建议：
-
-1. query = `"{ticker}" OR "{company_name}"`（再加一些 disambiguation，比如加行业关键词）
-2. 时间窗：`lookback_days_news`
-3. 结果落盘：
-
-   * `raw/news/news.jsonl`（每条一行，保留原字段 + 拉取时间）
-   * `current/news_digest.yaml`（聚类：财报/产品/监管/并购/诉讼…）
-4. 去重：按 `url` 或 `title+published_at` hash
-
-### (C) 论文：openalex / arxiv / pubmed（Phase 1 可以做“轻量版”）
-
-* openalex 的 tool 你已启用 `search_works/get_work/get_related_works...`
-* pubmed/arxiv 也已配好
-
-Phase 1 的建议：
-
-* `papers_mode=auto`：只要公司是科技/医药/材料这种技术驱动，就抓；否则生成空 digest 但文件必须存在（契约）
-* 输出 `current/papers_digest.yaml` 最小化即可：列出 5-20 篇最相关 + 主题 + 可能影响增长/护城河的点
+按当前阶段目标（先把估值链跑通），News / Papers 建议抽离为独立信息服务/数据库（embedding + LLM rerank）并通过 MCP 查询；本 Skill 暂不产出相关 artifacts。
 
 ## 3.4 blocked / needs.yaml 规则（照你 v2）
 

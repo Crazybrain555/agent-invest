@@ -68,14 +68,6 @@
         filings_index.yaml                 # SEC filings 元数据索引（含VMF筛选字段）
         filings_index.parquet              # 分析层（同schema）
 
-        # --- News 证据池 ---
-        news_digest.yaml                   # 摘要 + 高影响事件列表
-        news_index.parquet                 # 标准化索引（稳定ID、去重、标签）
-
-        # --- Papers 证据池 ---
-        papers_digest.yaml                 # 摘要
-        papers_index.parquet               # 标准化索引（doi/openalexid 去重）
-
         # --- 报表图谱（替代固定 tag 集）---
         xbrl_atlas/
           periods.yaml                     # 每个 period 用哪个 accession
@@ -124,10 +116,6 @@
               exhibit_99_1.html            # 新闻稿/业绩公告
               exhibit_10_1.html            # 重大合同
               exhibit_2_1.html             # 并购协议
-        news/                              # 新闻（按日分区，gzip压缩）
-          YYYY/MM/news_YYYY-MM-DD.jsonl.gz
-        papers/                            # 论文（按月分区，gzip压缩）
-          YYYY/MM/papers_YYYY-MM.jsonl.gz
         web/...                            # 网页快照（未来扩展）
 
       runs/{run_id}/                       # 历史快照
@@ -175,7 +163,7 @@ outputs:
   - <path>
 
 # 可选：Skill 自定义扩展字段（推荐用于 ingestion / multi-stage skills）
-# 例如 Skill2 会写 components.sec/news/papers 的子状态，便于编排与排障
+# 例如 Skill2 会写 components.sec 的子状态，便于编排与排障
 components: {}
 ```
 
@@ -239,8 +227,7 @@ source: "mixed:alpaca.get_stock_latest_trade+yfinance.get_stock_info"
 >
 > Skill 2 产出的核心索引与摘要文件：
 > - `filings_index.yaml` + `filings_index.parquet`：SEC filing 索引（含 VMF 筛选字段）
-> - `news_index.parquet` + `news_digest.yaml`：新闻索引与摘要
-> - `papers_index.parquet` + `papers_digest.yaml`：学术论文索引与摘要
+> - `events_index.parquet`：候选事件指针索引（SEC 事件流；供 Phase2 挑选并写 evidence claims）
 >
 > 所有字段均为**强制字段**（无 optional/recommended）
 
@@ -368,7 +355,7 @@ links:
 | # | Skill | 状态 | 职责 | 对"利润×质量"贡献 |
 |---|-------|------|------|------------------|
 | 1 | `company-foundation` | 已实现 | 身份 + 市场口径（含 shares） | 估值分母/每股化基座 |
-| 2 | `collect-company-facts` | 已实现 | filings + 新闻 + 论文 | 证据池 |
+| 2 | `collect-company-facts` | 已实现 | SEC filings（含事件流） | 证据池（SEC） |
 | 3 | `extract-xbrl-timeseries` | 已实现 | 报表图谱（树+事实+溯源） | 利润事实底座 |
 | 4 | `recast-economic-statements` | 已实现 | 经济三表 + 核心指标 | Owner Earnings / ROIC |
 | 5 | `profit-quality-and-risk` | 规划中 | 财报质量/操纵风险/利润可持续性 | 质量系数与情景下界 |
@@ -437,7 +424,7 @@ links:
 
 ### Skill 2: `collect-company-facts`
 
-> **证据池采集与维护**：SEC filings (raw + XBRL) / 新闻 / 论文
+> **证据池采集与维护**：SEC filings（raw + XBRL + 事件流/VMF）
 
 **设计理念**
 
@@ -462,16 +449,7 @@ links:
     - Domestic：8-K/8-K/A
     - FPI：6-K（排除已归入 Periodic Core 的 “Interim Financials/Results” 子集后的剩余 6-K）
   - 发行人类型自动适配（Domestic vs FPI；FPI 不提交 10-Q，中期/季度信息常在 6-K 附件 99.*）
-- **News**：
-  - Init 模式：`lookback_days_news`（默认 5 天）
-  - Maintenance 模式：`overlap_days`（默认 2 天）
-  - 稳定去重（canonical_url hash）+ 分区存储
-  - 高影响事件识别（规则先行）
-- **Papers**：
-  - Init 模式：`lookback_days_papers`（默认 180 天）
-  - Maintenance 模式：每 `papers_refresh_days`（默认 30 天）检查一次
-  - auto gating：根据 SIC/行业决定是否抓取
-  - 稳定ID/去重：`paper_id = doi:/openalex:/arxiv:/pubmed:/sha1:`（多源融合不冲突）
+  - News / Papers：Phase1 暂不在本 Skill 内实现（后续计划抽离为独立信息服务/数据库 + MCP 查询）。
 
 ---
 
@@ -490,10 +468,7 @@ links:
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `lookback_years` | int | 10 | **Init 模式**：SEC 回溯年数 |
-| `lookback_days_news` | int | 5 | **Init 模式**：新闻回溯天数 |
-| `lookback_days_papers` | int | 180 | **Init 模式**：论文回溯天数 |
-| `overlap_days` | int | **2** | **Maintenance 模式**：重叠回抓天数（SEC/News 共用） |
-| `papers_refresh_days` | int | 30 | **Maintenance 模式**：论文刷新间隔天数 |
+| `overlap_days` | int | **2** | **Maintenance 模式**：重叠回抓天数（用于补齐窗口边界） |
 
 **模式判断逻辑**：
 ```python
@@ -507,25 +482,6 @@ else:
     fetch_start = last_filed_at - timedelta(days=overlap_days)
 fetch_end = as_of
 sec_days = (fetch_end - fetch_start).days + 1
-
-# News
-if not news_index.parquet exists or force_refresh:
-    mode = "init"  # start = as_of - lookback_days_news
-else:
-    mode = "maintenance"
-    last_covered_day = max_date(news_index.parquet.published_at)
-    start = last_covered_day - timedelta(days=overlap_days)
-end = as_of
-
-# Papers
-if not papers_index.parquet exists or force_refresh:
-    mode = "init"  # 用 lookback_days_papers
-else:
-    # 检查 staleness
-    if days_since_last_fetch >= papers_refresh_days:
-        mode = "maintenance"  # 执行增量
-    else:
-        mode = "skip"  # 太新，跳过
 ```
 
 #### SEC 参数（无 download_policy，改用 VMF）
@@ -536,25 +492,6 @@ else:
 | `vmf_annual_budget` | int | 20 | 每自然年事件下载上限（硬触发不受限） |
 | `download_xbrl` | bool | true | 下载周期性 filing 的 XBRL 包 |
 | `download_sections` | bool | true | 下载并存储关键 sections（MD&A/Risk Factors） |
-
-#### News 参数
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `news_max_per_day` | int | 100 | **每天**最大抓取文章数（防止长窗口漏数据） |
-| `news_langs` | list | `["en", "zh"]` | 语言过滤列表（支持多语言） |
-
-**说明**：
-- `news_max_per_day` 是 **按“自然日”** 的抓取上限：窗口跨越多少天，就对每一天分别应用这个上限
-- Maintenance 模式抓取窗口为 `[last_covered_day - overlap_days, as_of]`（`last_covered_day` 从 `current/news_index.parquet` 的 `published_at` 最大日期推断），因此间隔多天也会自动补齐
-- 实际抓取量取决于数据源返回；上限用于防止单日爆量
-
-#### Papers 参数
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `papers_mode` | enum | auto | auto/on/off（auto 根据行业判断） |
-| `papers_max_results` | int | 200 | 最大结果数 |
 
 ---
 
@@ -578,23 +515,11 @@ else:
   - `xbrl/`：XBRL 包（*.xml / *.xsd）
   - `exhibits/`：高价值附件（99.* / 10.1 / 2.1 等）
 
-### News 输出
-
-- `raw/news/YYYY/MM/news_YYYY-MM-DD.jsonl.gz`：按日分区
-- `current/news_digest.yaml`：轻量摘要 + 高影响事件列表
-- `current/news_index.parquet`：标准化索引
-
-### Papers 输出
-
-- `raw/papers/YYYY/MM/papers_YYYY-MM.jsonl.gz`：按月分区
-- `current/papers_digest.yaml`：摘要
-- `current/papers_index.parquet`：索引
-
 ### Events Candidates 输出（推荐）
 
 > 说明：这是“候选事件指针池”，不是 evidence claim（结论）。下游分析类 skills 从这里挑事件，再生成 `current/evidence.jsonl` 的结论型记录。
 
-- `current/events_index.parquet`：候选事件索引（`news:{article_id}` / `sec:{accession}`），含 `raw_path/local_dir` 等可追溯指针
+- `current/events_index.parquet`：候选事件索引（`sec:{accession}`），含 `local_dir` 等可追溯指针
 
 ### Run metadata
 
@@ -610,8 +535,6 @@ else:
 | `company/{TICKER}/current/market_snapshot.yaml` | Skill1 `company-foundation` | Skill5 `valuation-and-margin-of-safety` | 市场口径（price/shares/EV 等） |
 | `company/{TICKER}/current/filings_index.yaml` + `.parquet` | Skill2 `collect-company-facts` | Skill3 `extract-xbrl-timeseries` / Skill5 `valuation-and-margin-of-safety` | SEC 索引（含 bucket、6-K 分类、VMF、download 状态） |
 | `company/{TICKER}/raw/sec/{accession}/...` | Skill2 `collect-company-facts` | Skill3 `extract-xbrl-timeseries` | 原始证据池（可回放/可追溯） |
-| `company/{TICKER}/current/news_index.parquet` + `news_digest.yaml` | Skill2 `collect-company-facts` | 下游 memo/事件时间线 | 新闻证据池（去重、标签、摘要） |
-| `company/{TICKER}/current/papers_index.parquet` + `papers_digest.yaml` | Skill2 `collect-company-facts` | 下游 memo/技术评估 | 论文证据池（去重、标签、摘要） |
 | `company/{TICKER}/current/events_index.parquet` | Skill2 `collect-company-facts` | Phase2 分析类 skills（growth/audit/moat 等） | 事件候选池（可追溯指针 + 初筛标签；用于后续生成 evidence claims） |
 | `company/{TICKER}/current/xbrl_atlas/*` | Skill3 `extract-xbrl-timeseries` | Skill4 `recast-economic-statements` | XBRL 报表图谱与 facts 底座 |
 | `company/{TICKER}/current/economic/*` | Skill4 `recast-economic-statements` | Skill5 `valuation-and-margin-of-safety` | 经济三表与核心指标（ROIC/FCF 等） |
@@ -977,140 +900,6 @@ completeness:
   all_required_present: true
 ```
 
-### news_index.parquet
-
-```
-# 路径: current/news_index.parquet
-# 格式: Parquet (pyarrow)
-# 压缩: snappy
-
-Column Schema:
-| 字段名 | 类型 | Nullable | 说明 |
-|--------|------|----------|------|
-| article_id | string | N | 稳定ID (sha1(canonical_url)[:16]) |
-| published_at | timestamp[us, tz=UTC] | Y | 发布时间 |
-| retrieved_at | timestamp[us, tz=UTC] | N | 抓取时间 |
-| title | string | Y | 标题 |
-| source | string | Y | 媒体/域名 |
-| url | string | Y | 原始 URL |
-| canonical_url | string | Y | 规范化 URL |
-| lang | string | Y | 语言代码 |
-| snippet | string | Y | 摘要/正文片段（前500字符） |
-| query | string | N | 使用的搜索 query（便于复现） |
-| ticker | string | N | 归属 ticker |
-| raw_path | string | N | 对应 raw 文件指针（相对路径，如 raw/news/2026/01/news_2026-01-14.jsonl.gz） |
-| relevance_score | float32 | Y | **Aboutness**：是否“在讲这家公司”（0-1，可解释、可版本化；≠ impact/materiality） |
-| relevance_version | string | Y | relevance 规则/模型版本（如 rule_v0.1） |
-| relevance_reasons | list[string] | Y | 解释 reasons（可用于排障/回放） |
-| relevance_features_json | string | Y | 特征/命中信息（JSON string，便于 debug/回测） |
-| impact_score | float32 | Y | Phase2：materiality/impact 评分（对估值可能重要的概率/强度，0-1）；Phase1 站位，默认 NaN |
-| event_tags | list[string] | Y | 事件标签 ["earnings","guidance","m_and_a",...] |
-```
-
-### news_digest.yaml
-
-```yaml
-# 路径: current/news_digest.yaml
-# 编码: UTF-8
-
-as_of: "2026-01-14"
-window:
-  mode: "maintenance"                # init | maintenance
-  lookback_days: 2                   # 实际使用的窗口
-  start: "2026-01-12"
-  end: "2026-01-14"
-
-totals:
-  fetched: 120                       # 本次抓取数
-  deduped_new: 35                    # 去重后新增数
-  stored_total: 2400                 # 累计存储总数
-
-top_themes:
-  - theme: "earnings"
-    count: 8
-  - theme: "m_and_a"
-    count: 2
-  - theme: "guidance"
-    count: 3
-
-high_impact_events:
-  - article_id: "a1b2c3d4e5f6..."
-    published_at: "2026-01-13T14:23:00Z"
-    title: "Company announces Q4 earnings beat and raises guidance"
-    url: "https://..."
-    tags: ["earnings", "guidance"]
-    impact_hint: "可能影响未来利润预期/折现率"
-    confidence: 0.8
-  - article_id: "b2c3d4e5f6g7..."
-    published_at: "2026-01-12T09:15:00Z"
-    title: "Company announces strategic acquisition"
-    url: "https://..."
-    tags: ["m_and_a"]
-    impact_hint: "可能改变未来现金流路径"
-    confidence: 0.7
-```
-
-### papers_index.parquet
-
-```
-# 路径: current/papers_index.parquet
-# 格式: Parquet (pyarrow)
-# 压缩: snappy
-
-Column Schema:
-| 字段名 | 类型 | Nullable | 说明 |
-|--------|------|----------|------|
-| paper_id | string | N | 稳定ID（带前缀 doi:/openalex:/arxiv:/pubmed:/sha1:；多源融合不冲突） |
-| doi | string | Y | DOI |
-| openalex_id | string | Y | OpenAlex ID |
-| arxiv_id | string | Y | arXiv ID |
-| pubmed_id | string | Y | PubMed ID |
-| title | string | N | 标题 |
-| year | int32 | Y | 发表年份 |
-| authors | list[string] | Y | 作者列表 |
-| venue | string | Y | 期刊/会议 |
-| url | string | Y | 链接 |
-| abstract | string | Y | 摘要（前1000字符） |
-| retrieved_at | timestamp[us, tz=UTC] | N | 抓取时间 |
-| ticker | string | N | 归属 ticker |
-| raw_path | string | N | 对应 raw 文件指针（相对路径，如 raw/papers/2026/01/papers_2026-01.jsonl.gz） |
-| relevance_score | float32 | Y | 相关性评分（0-1） |
-| tags | list[string] | Y | 标签 ["battery","llm","drug",...] |
-```
-
-### papers_digest.yaml
-
-```yaml
-# 路径: current/papers_digest.yaml
-# 编码: UTF-8
-
-as_of: "2026-01-14"
-mode: "auto"                         # auto | on | off
-status: "ok"                         # ok | skipped
-reason: null                         # skipped 时的原因: "not_relevant_industry" | "user_disabled" | "too_fresh"
-
-window:
-  mode: "init"                       # init | maintenance
-  lookback_days: 180
-
-totals:
-  fetched: 45
-  deduped_new: 40
-  stored_total: 120
-
-top_relevant:
-  - paper_id: "doi:10.1234/xxxx"
-    title: "Advances in Battery Technology for Electric Vehicles"
-    year: 2025
-    why_relevant: "可能影响产品路线/成本曲线"
-    confidence: 0.7
-  - paper_id: "openalex:W1234567890"
-    title: "Machine Learning in Drug Discovery"
-    year: 2025
-    why_relevant: "可能加速研发管线"
-    confidence: 0.6
-```
-
 ### events_index.parquet（候选事件池）
 
 > 说明：这不是 evidence claim（结论），而是“候选事件指针”。后续分析类 skills 从这里挑选事件，写入 `current/evidence.jsonl`（带引用锚点与置信度）。
@@ -1123,90 +912,18 @@ top_relevant:
 Column Schema:
 | 字段名 | 类型 | Nullable | 说明 |
 |--------|------|----------|------|
-| event_id | string | N | 稳定ID：`news:{article_id}` / `sec:{accession}` |
-| event_type | string | N | news | sec |
-| occurred_at | timestamp[us, tz=UTC] | Y | news=published_at；sec=filed_at（统一写 UTC timestamp） |
+| event_id | string | N | 稳定ID：`sec:{accession}` |
+| event_type | string | N | sec |
+| occurred_at | timestamp[us, tz=UTC] | Y | sec=filed_at（统一写 UTC timestamp） |
 | ticker | string | N | 归属 ticker |
-| headline | string | Y | news=title；sec=form + 可选简述 |
-| tags | list[string] | Y | news=event_tags；sec=vmf_reasons/items 等抽象主题 |
-| materiality_hint | string | Y | 轻量提示（例如 digest.high_impact_events 的 impact_hint） |
-| score_hint | float32 | Y | Phase1 可选数值提示：news=relevance_score；sec=vmf_score（可为空） |
+| headline | string | Y | sec=form + 可选简述 |
+| tags | list[string] | Y | sec=vmf_reasons/items 等抽象主题 |
+| materiality_hint | string | Y | 轻量提示（例如 vmf_triggered_event） |
+| score_hint | float32 | Y | Phase1 可选数值提示：sec=vmf_score（可为空） |
 | impact_score | float32 | Y | Phase2：事件 materiality/impact score（0-1）；Phase1 站位，默认 NaN |
-| source_ref_json | string | Y | JSON：news={canonical_url, raw_path}；sec={local_dir, filing_url} |
-| anchors_json | string | Y | JSON：sec={items, exhibits}；news={snippet}（可选） |
+| source_ref_json | string | Y | JSON：sec={local_dir, filing_url} |
+| anchors_json | string | Y | JSON：sec={items, exhibits}（可选） |
 ```
-
-### raw/news/YYYY/MM/news_YYYY-MM-DD.jsonl.gz
-
-```
-# 路径: raw/news/2026/01/news_2026-01-14.jsonl.gz
-# 格式: JSONL (每行一个 JSON 对象), gzip 压缩
-# 编码: UTF-8
-
-每行记录 Schema:
-{
-  "article_id": "a1b2c3d4e5f6...",          // string: 稳定ID
-  "published_at": "2026-01-14T10:30:00Z",   // ISO timestamp with timezone
-  "retrieved_at": "2026-01-14T12:00:00Z",   // ISO timestamp
-  "title": "Company Q4 Results...",         // string
-  "source": "reuters.com",                  // string
-  "url": "https://www.reuters.com/...",     // string: 原始URL
-  "canonical_url": "https://www.reuters.com/...",  // string: 规范化URL
-  "lang": "en",                             // string
-  "snippet": "The company reported...",     // string: 前500字符
-  "query": "\"AAPL\" OR \"Apple Inc.\"",    // string: 使用的搜索query
-  "ticker": "AAPL",                         // string
-
-  // GDELT 原始字段（保留）
-  "domain": "reuters.com",
-  "tone": -2.5,
-  "image_url": "https://...",
-  "socialimage": "https://..."
-
-  // 注意：raw 层只存 source+envelope，不写入可再生加工字段（event_tags/relevance_score）
-  // 这些字段仅写入 index（current/news_index.parquet）与 digest（current/news_digest.yaml）
-}
-```
-
-### raw/papers/YYYY/MM/papers_YYYY-MM.jsonl.gz
-
-```
-# 路径: raw/papers/2026/01/papers_2026-01.jsonl.gz
-# 格式: JSONL (每行一个 JSON 对象), gzip 压缩
-# 编码: UTF-8
-
-每行记录 Schema:
-{
-  "paper_id": "doi:10.1234/xxxx",           // string: 稳定ID
-  "doi": "10.1234/xxxx",                    // string | null
-  "openalex_id": "W1234567890",             // string | null
-  "arxiv_id": "2301.12345",                 // string | null
-  "pubmed_id": "12345678",                  // string | null
-  "title": "Advances in...",                // string
-  "year": 2025,                             // int
-  "authors": ["John Smith", "Jane Doe"],    // list[string]
-  "venue": "Nature",                        // string | null
-  "url": "https://doi.org/10.1234/xxxx",    // string
-  "abstract": "This paper presents...",     // string: 前1000字符
-  "retrieved_at": "2026-01-14T12:00:00Z",   // ISO timestamp
-  "ticker": "AAPL",                         // string
-
-  // OpenAlex 原始字段（保留关键的）
-  "cited_by_count": 150,
-  "type": "article",
-  "is_oa": true,
-  "concepts": [
-    {"id": "C12345", "display_name": "Machine Learning", "score": 0.9}
-  ]
-
-  // 注意：raw 层只存 source+envelope，不写入可再生加工字段（tags/relevance_score）
-  // 这些字段仅写入 index（current/papers_index.parquet）与 digest（current/papers_digest.yaml）
-}
-```
-
----
-
-> ⚠️ gzip 追加写（`gzip.open(..., "at")`）会生成 multi-member `.gz`。大多数解压器可读，但部分严格 reader（例如某些 Spark/Hadoop 读法）可能只读到第一个 member。Phase1 可接受；若未来需要严格兼容，建议“每日日志文件不追加（按 run 或按天新文件）→ 后续 compaction 合并”。
 
 **内部步骤**
 
@@ -1371,276 +1088,11 @@ atomic_io.atomic_write_yaml(filings_index_path, filings_index_payload)
 atomic_io.atomic_write_parquet(current_dir / "filings_index.parquet", pd.DataFrame(all_filings))
 ```
 
-### Step 2 - News 管道
-
-#### 2.0 relevance_score（Phase1：规则版、可解释、可版本化）
-
-> 目标：在 ingestion 层给 index 提供一个“能用的基础排序信号”，同时保证 **可解释、可版本化、可被后续覆盖**。  
-> 注意：`relevance_score` 是 **aboutness（是否在讲这家公司）**，不是 impact/materiality（对估值是否重要）。  
-> Phase1 继续用 `event_tags/high_impact_events` 做轻量事件提示；同时在 index 里**预留** `impact_score`（默认 NaN），Phase2 再计算/覆盖（可用 LLM/embedding/事件抽取等）。
-
-建议接口（纯函数 + 轻量 cfg）：
-
-```python
-def score_news_relevance(article: dict, company: dict, cfg: dict) -> tuple[float, list[str], dict]:
-    """
-    return: (score_0_1, reasons, features)
-    reasons: list[str] 解释
-    features: dict 方便 debug/回测
-    """
-```
-
-Phase1 推荐规则（`relevance_version="rule_v0.1"`，确定性、低成本）：
-- base：`score=0.05`
-- 正向：
-  - ticker 精确命中（边界匹配）`+0.35`
-  - company_name / 核心 token 命中 `+0.25`
-  - 高可信来源域名（reuters/bloomberg/sec.gov/wsj/ft 等）`+0.10`
-  - title 出现强公司指代词（shares/stock/CEO/CFO/quarter/guidance…）且同时命中 ticker/name `+0.10`
-- 负向（轻扣，避免误杀）：
-  - 仅大盘/行业叙事（market/sector/index/futures…）且 ticker/name 命中弱 `-0.15`
-  - 列表/盘点/合集（top stocks/morning news/5 things…）且无财务事件词 `-0.10`
-- clamp：`score = max(0.0, min(1.0, score))`
-
-存储建议（index 层）：
-- `relevance_score`（float32）
-- `relevance_version`（string）
-- `relevance_reasons`（list[string]）
-- `relevance_features_json`（string，JSON）
-- `impact_score`（float32，Phase2；Phase1 默认 NaN）
-
-#### 2.1 确定运行模式
-
-```python
-news_index_path = current_dir / "news_index.parquet"
-if not news_index_path.exists() or force_refresh:
-    mode = "init"
-    fetch_start = as_of - timedelta(days=lookback_days_news)
-else:
-    mode = "maintenance"
-    last_covered_day = max_date(pd.read_parquet(news_index_path)["published_at"])
-    fetch_start = last_covered_day - timedelta(days=overlap_days)
-
-fetch_end = as_of
-```
-
-#### 2.2 获取新闻
-
-```python
-query = f'"{ticker}" OR "{company_name}"'
-articles = []
-for day in date_range(fetch_start, fetch_end):
-    articles.extend(gdelt.gdelt_search_articles(
-        query=query,
-        start_date=day,
-        end_date=day + timedelta(days=1),
-        max_records=news_max_per_day,
-        langs=news_langs,
-    ))
-```
-
-#### 2.3 标准化与去重
-
-```python
-new_raw_records = []
-new_index_records = []
-existing_ids = load_existing_article_ids(news_index_path) if mode == "maintenance" else set()
-
-for article in articles:
-    article_id = generate_article_id(article)
-    if article_id not in existing_ids:
-        canonical = canonical_url(article.get("url", ""))
-        retrieved_at = datetime.now(timezone.utc).isoformat()
-        pub_date = parse_date(article.get("published_at")) or as_of
-        raw_path = f"raw/news/{pub_date.strftime('%Y/%m')}/news_{pub_date.strftime('%Y-%m-%d')}.jsonl.gz"
-
-        # raw：只存 source+envelope（不包含可再生加工字段）
-        raw_record = {
-            **article,
-            "article_id": article_id,
-            "canonical_url": canonical,
-            "ticker": ticker,
-            "query": query,
-            "retrieved_at": retrieved_at,
-        }
-
-        # index：可以存加工字段（可再生，可重算）
-        # Phase1：relevance_score 做 aboutness（是否在讲公司），并产出可解释 reasons/features + version
-        score, reasons, features = score_news_relevance(raw_record, company, cfg)  # rule_v0.1
-        index_record = {
-            **raw_record,
-            "raw_path": raw_path,
-            "event_tags": extract_event_tags(article),
-            "relevance_score": score,
-	            "relevance_version": "rule_v0.1",
-	            "relevance_reasons": reasons,
-	            "relevance_features_json": json.dumps(features, ensure_ascii=False, sort_keys=True),
-	            "impact_score": None,  # Phase2: placeholder (default NaN)
-	        }
-
-        new_raw_records.append(raw_record)
-        new_index_records.append(index_record)
-        existing_ids.add(article_id)
-```
-
-#### 2.4 追加到分区存储 + 更新索引
-
-```python
-# 追加到 raw
-for article in new_raw_records:
-    pub_date = parse_date(article["published_at"])
-    partition_dir = raw_dir / "news" / pub_date.strftime("%Y/%m")
-    file_path = partition_dir / f"news_{pub_date.strftime('%Y-%m-%d')}.jsonl.gz"
-    append_to_gzip_jsonl(file_path, article)
-
-# 更新 index
-if mode == "init":
-    news_index_df = pd.DataFrame(new_index_records)
-else:
-    existing_df = pd.read_parquet(news_index_path)
-    news_index_df = pd.concat([existing_df, pd.DataFrame(new_index_records)], ignore_index=True)
-
-# Parquet：强制 UTC timestamp 类型（避免 object/string 漂移）
-news_index_df["published_at"] = pd.to_datetime(news_index_df["published_at"], utc=True, errors="coerce")
-news_index_df["retrieved_at"] = pd.to_datetime(news_index_df["retrieved_at"], utc=True, errors="coerce")
-
-run_outputs_current = run_dir / "outputs" / "current"
-atomic_io.atomic_write_parquet(run_outputs_current / "news_index.parquet", news_index_df)
-atomic_io.atomic_write_parquet(news_index_path, news_index_df)
-
-# 生成 digest
-news_digest = generate_news_digest(
-    new_articles=new_index_records,
-    fetched=len(articles),
-    deduped_new=len(new_index_records),
-    stored_total=len(news_index_df),
-    window_start=fetch_start,
-    window_end=fetch_end,
-    as_of=as_of,
-    mode=mode,
-)
-atomic_io.atomic_write_yaml(run_outputs_current / "news_digest.yaml", news_digest)
-atomic_io.atomic_write_yaml(current_dir / "news_digest.yaml", news_digest)
-```
-
-### Step 3 - Papers 管道
-
-#### 3.1 确定运行模式
-
-```python
-papers_index_path = current_dir / "papers_index.parquet"
-papers_digest_path = current_dir / "papers_digest.yaml"
-
-if papers_mode == "off":
-    write_skipped_digest(papers_digest_path, "user_disabled")
-    return
-
-if papers_mode == "auto" and not is_relevant_industry(sic):
-    write_skipped_digest(papers_digest_path, "not_relevant_industry")
-    return
-
-if not papers_index_path.exists() or force_refresh:
-    mode = "init"
-    papers_window_days = lookback_days_papers
-else:
-    # Staleness 检查
-    existing_digest = atomic_io.load_yaml(papers_digest_path)
-    days_since = (as_of - parse_date(existing_digest.get("as_of"))).days
-    if days_since < papers_refresh_days:
-        write_skipped_digest(papers_digest_path, "too_fresh")
-        return
-    mode = "maintenance"
-    papers_window_days = papers_refresh_days
-```
-
-#### 3.2 获取论文
-
-```python
-papers = openalex.search_works(
-    query=company_name,
-    max_results=papers_max_results
-)
-```
-
-#### 3.3 去重与标准化
-
-```python
-new_raw_records = []
-new_index_records = []
-existing_ids = load_existing_paper_ids(papers_index_path) if mode == "maintenance" else set()
-
-for paper in papers:
-    paper_id = stable_paper_id(paper)  # doi:/openalex:/arxiv:/pubmed:/sha1:
-    if paper_id not in existing_ids:
-        retrieved_at = datetime.now(timezone.utc).isoformat()
-        raw_path = f"raw/papers/{as_of.year}/{as_of.month:02d}/papers_{as_of.year}-{as_of.month:02d}.jsonl.gz"
-
-        # raw：只存 source+envelope（不包含可再生加工字段）
-        raw_record = {
-            **paper,
-            "paper_id": paper_id,
-            "ticker": ticker,
-            "retrieved_at": retrieved_at,
-        }
-
-        # index：可以存加工字段（可再生，可重算）
-        index_record = {
-            **raw_record,
-            "raw_path": raw_path,
-            "tags": extract_paper_tags(paper),
-            "relevance_score": calculate_paper_relevance(paper),
-        }
-
-        new_raw_records.append(raw_record)
-        new_index_records.append(index_record)
-        existing_ids.add(paper_id)
-```
-
-#### 3.4 追加到分区存储 + 更新索引
-
-```python
-# 追加到 raw
-year = as_of.year
-month = as_of.month
-for paper in new_raw_records:
-    partition_dir = raw_dir / "papers" / f"{year}/{month:02d}"
-    file_path = partition_dir / f"papers_{year}-{month:02d}.jsonl.gz"
-    append_to_gzip_jsonl(file_path, paper)
-
-# 更新 index
-if mode == "init":
-    papers_index_df = pd.DataFrame(new_index_records)
-else:
-    existing_df = pd.read_parquet(papers_index_path)
-    papers_index_df = pd.concat([existing_df, pd.DataFrame(new_index_records)], ignore_index=True)
-
-# Parquet：强制 UTC timestamp 类型（避免 object/string 漂移）
-papers_index_df["retrieved_at"] = pd.to_datetime(papers_index_df["retrieved_at"], utc=True, errors="coerce")
-
-run_outputs_current = run_dir / "outputs" / "current"
-atomic_io.atomic_write_parquet(run_outputs_current / "papers_index.parquet", papers_index_df)
-atomic_io.atomic_write_parquet(papers_index_path, papers_index_df)
-
-# 生成 digest
-papers_digest = generate_papers_digest(
-    new_papers=new_index_records,
-    fetched=len(papers),
-    deduped_new=len(new_index_records),
-    stored_total=len(papers_index_df),
-    as_of=as_of,
-    mode=mode,
-)
-atomic_io.atomic_write_yaml(run_outputs_current / "papers_digest.yaml", papers_digest)
-atomic_io.atomic_write_yaml(papers_digest_path, papers_digest)
-```
-
-### Step 4 - Events candidates + artifacts_state + result
+### Step 2 - Events candidates + artifacts_state + result
 
 ```python
 # 子管道状态（必须写入 result.yaml: components，便于编排/排障）
 sec_status = "ok" | "partial" | "blocked" | "skipped" | "error"
-news_status = "ok" | "partial" | "blocked" | "skipped" | "error"
-papers_status = "ok" | "partial" | "skipped" | "error"
 
 # Skill2 是 ingestion：不写 evidence claim（结论），只保证 ledger 文件存在（空文件也可）
 evidence.ensure_jsonl(current_dir / "evidence.jsonl")
@@ -1648,24 +1100,6 @@ evidence.ensure_jsonl(current_dir / "questions.jsonl")
 
 # 生成候选事件池（events_index.parquet）：供 Phase2 分析类 skills 挑选并写 evidence claims
 events = []
-
-# from news_digest.high_impact_events（候选新闻事件）
-for e in news_digest.get("high_impact_events", []):
-    pub_date = parse_date(e.get("published_at")) or as_of
-    raw_path = f"raw/news/{pub_date.strftime('%Y/%m')}/news_{pub_date.strftime('%Y-%m-%d')}.jsonl.gz"
-    events.append({
-        "event_id": f"news:{e.get('article_id')}",
-        "event_type": "news",
-        "occurred_at": e.get("published_at"),
-        "ticker": ticker,
-        "headline": e.get("title"),
-        "tags": e.get("tags", []),
-        "materiality_hint": e.get("impact_hint"),
-        "score_hint": None,  # Phase1: aboutness score != materiality/impact
-        "impact_score": None,  # Phase2: placeholder (default NaN)
-        "source_ref_json": json.dumps({"url": e.get("url"), "raw_path": raw_path}, ensure_ascii=False, sort_keys=True),
-        "anchors_json": json.dumps({"snippet": e.get("snippet")}, ensure_ascii=False, sort_keys=True),
-    })
 
 # from SEC event_stream（候选 SEC 事件；通常用 VMF-triggered/downloaded 的 event filings）
 for f in all_filings:
@@ -1700,8 +1134,6 @@ atomic_io.atomic_write_parquet(run_outputs_current / "events_index.parquet", eve
 atomic_io.atomic_write_parquet(current_dir / "events_index.parquet", events_df)
 
 sec_warnings, sec_errors = [], []
-news_warnings, news_errors = [], []
-papers_warnings, papers_errors = [], []
 
 # artifacts_state：尽量与 components.*.status 一致（避免“最后统一 ok”误导）
 # - index/digest 若本次落盘（即使内容为空）→ 更新 artifacts_state
@@ -1710,16 +1142,6 @@ if sec_status in ["ok", "partial", "skipped"]:
     artifacts_state.update_artifacts_state(ticker, "filings_index.yaml", sec_status, run_id)
     if sec_status in ["ok", "partial"]:
         artifacts_state.update_artifacts_state(ticker, "filings_index.parquet", sec_status, run_id)
-
-if news_status in ["ok", "partial", "skipped"]:
-    artifacts_state.update_artifacts_state(ticker, "news_digest.yaml", news_status, run_id)
-    if news_status in ["ok", "partial"]:
-        artifacts_state.update_artifacts_state(ticker, "news_index.parquet", news_status, run_id)
-
-if papers_status in ["ok", "partial", "skipped"]:
-    artifacts_state.update_artifacts_state(ticker, "papers_digest.yaml", papers_status, run_id)
-    if papers_status in ["ok", "partial"]:
-        artifacts_state.update_artifacts_state(ticker, "papers_index.parquet", papers_status, run_id)
 
 # events candidates（派生索引）：落盘成功则记为 ok（即使为空也 ok）
 artifacts_state.update_artifacts_state(ticker, "events_index.parquet", "ok", run_id)
@@ -1734,39 +1156,14 @@ components = {
         "warnings": sec_warnings,
         "errors": sec_errors,
     },
-    "news": {
-        "status": news_status,
-        "mode": news_digest.get("window", {}).get("mode"),
-        "window": news_digest.get("window", {}),
-        "totals": news_digest.get("totals", {}),
-        "warnings": news_warnings,
-        "errors": news_errors,
-    },
-    "papers": {
-        "status": papers_status,
-        "mode": papers_digest.get("window", {}).get("mode"),  # init | maintenance | null（skipped）
-        "reason": papers_digest.get("reason"),
-        "window": papers_digest.get("window", {}),
-        "totals": papers_digest.get("totals", {}),
-        "warnings": papers_warnings,
-        "errors": papers_errors,
-    },
 }
 
 # Rollup status（更无歧义，编排器可直接用）
 # 1) sec blocked/error → skill blocked/error
-# 2) 其它任一组件 error → skill partial
-# 3) 任一 partial → skill partial
-# 4) sec ok + news ok + papers ok/skipped → skill ok
-# 5) 三者都 skipped 且 inputs fingerprint 未变 → skill skipped（可选：结合 artifacts_state.fingerprint）
-if sec_status in ["blocked", "error"]:
-    status = sec_status
-elif news_status == "error" or papers_status == "error":
-    status = "partial"
-elif sec_status == "partial" or news_status == "partial" or papers_status == "partial":
-    status = "partial"
-else:
-    status = "ok"
+# 2) sec partial → skill partial
+# 3) sec skipped → skill skipped
+# 4) sec ok → skill ok
+status = sec_status
 
 # Write result
 runlog.write_result(run_dir, ticker, SKILL_NAME, status,
@@ -1783,8 +1180,7 @@ runlog.write_result(run_dir, ticker, SKILL_NAME, status,
 
 **partial 条件**
 
-- SEC ok 但 news 失败 → `partial`
-- News ok 但 papers 失败 → `partial`
+- SEC 管道部分失败/降级（例如部分 accession 下载失败）→ `partial`
 
 ---
 
@@ -1795,20 +1191,6 @@ runlog.write_result(run_dir, ticker, SKILL_NAME, status,
 - Init 模式：10年全量（周期性全下，事件流 VMF 筛选下载）
 - Maintenance 模式：以 `current/filings_index.yaml` 的最新 `filed_at` 为锚点，回退 `overlap_days` 再抓取到 `as_of`，用于补齐间隔天数 + 防止边界缺失
 - 周期性 filing 永远下载；事件 filing 永远 VMF 筛选
-
-### News
-
-- Init 模式：`lookback_days_news`（默认5天）
-- Maintenance 模式：以 `current/news_index.parquet` 的最新 `published_at` 为锚点，回退 `overlap_days` 再抓取到 `as_of`
-- `news_max_per_day` 为单日上限（不是整个窗口上限）
-- 按 article_id 自动去重
-
-### Papers
-
-- Init 模式：`lookback_days_papers`（默认180天）
-- Maintenance 模式：每 `papers_refresh_days`（默认30天）检查一次
-- Staleness 检查：若太新则 skip
-- 按 paper_id 自动去重
 
 
 ---
@@ -2048,8 +1430,6 @@ suggested_valuation_adjustments:
 
 - `current/diagnostics/profit_quality.yaml`
 - `current/diagnostics/profit_risk_forecast.yaml`
-- `current/news_digest.yaml`
-- `current/papers_digest.yaml`
 - `current/filings_index.yaml`
 - `raw/sec/`
 
@@ -2108,8 +1488,6 @@ assumptions_for_valuation:
 
 - `current/diagnostics/growth_drivers.yaml`
 - `current/diagnostics/profit_quality.yaml`
-- `current/news_digest.yaml`
-- `current/papers_digest.yaml`
 - `current/filings_index.yaml`
 - `raw/sec/`
 
@@ -2256,7 +1634,7 @@ downside_protection:
 
 **职责边界**
 
-- 对比：管理层叙事（MD&A/风险因素/新闻） vs 数字（经济三表）
+- 对比：管理层叙事（MD&A/风险因素） vs 数字（经济三表）
 - 找矛盾：需求强 → 但库存/应收恶化；"一次性"常态化等
 - 输出"反向思维审计清单"：
   - **What did I miss?**（Munger 反向思维）
@@ -2279,7 +1657,6 @@ downside_protection:
 - `current/diagnostics/quality_coefficient.yaml`
 - `current/diagnostics/profit_quality.yaml`
 - `current/diagnostics/growth_drivers.yaml`
-- `current/news_digest.yaml`
 - `current/filings_index.yaml`
 - `raw/sec/`
 
@@ -2506,3 +1883,6 @@ version: v0.1
 | `cross-examination-audit` | 反问审计，防大错 |
 
 **第二阶段产出**：显著提升"错杀 vs 价值陷阱"的分辨能力。
+
+
+
