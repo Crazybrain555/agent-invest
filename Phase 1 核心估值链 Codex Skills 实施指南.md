@@ -65,7 +65,7 @@
     │   │       │   ├── mdna.md
     │   │       │   ├── risk_factors.md
     │   │       │   └── business.md
-    │   │       ├── xbrl/                  # XBRL 原始包（可选；Phase1 不要求；如后续需要由 Skill3 补齐）
+    │   │       ├── xbrl/                  # XBRL 包（周期性filing）
     │   │       │   ├── *.xml
     │   │       │   └── *.xsd
     │   │       └── exhibits/              # 高价值附件（VMF筛选）
@@ -393,7 +393,7 @@ def should_skip(ticker: str, artifact_name: str, current_fingerprint: str,
 ---
 name: company-foundation
 description: "Initialize ticker research folder with company.yaml and market_snapshot.yaml. Use when starting coverage or refreshing shares price EV for any ticker."
-version: v0.1
+revision: "<YYYY-MM-DD>"   # optional
 ---
 
 # company-foundation
@@ -684,7 +684,7 @@ if __name__ == "__main__":
 
 ---
 
-## 三、Skill 2: collect-company-facts (v0.3 VMF版)
+## 三、Skill 2: collect-company-facts（SEC 证据池 + VMF）
 
 ### 3.1 SKILL.md
 
@@ -692,14 +692,14 @@ if __name__ == "__main__":
 ---
 name: collect-company-facts
 description: "Ingest and maintain SEC evidence pool for a ticker: filings + raw/sec snapshots + filings_index under current/. Supports init and maintenance modes."
-version: v0.4
+revision: "<YYYY-MM-DD>"   # optional
 ---
 
 # collect-company-facts
 
 ## Purpose
 **SEC Evidence Ingestion + Maintenance Layer** supporting valuation chain:
-- Periodic core filings (Domestic: 10-K/10-Q/DEF14A; FPI: 20-F + 6-K interim results) for downstream statement extraction (Skill3)
+- Periodic core filings (Domestic: 10-K/10-Q/DEF14A; FPI: 20-F + 6-K interim results) + XBRL for reconstruction
 - Event filings (Domestic: 8-K; FPI: 6-K other) filtered by VMF, for quality/uncertainty signals
 
 Two modes (auto-detected):
@@ -725,9 +725,18 @@ Data layering contract (raw vs index):
 ### SEC VMF Parameters
 - `vmf_score_threshold` (default 8) - Score threshold for event download
 - `vmf_annual_budget` (default 20) - Max events per year (hard triggers exempt)
-- `download_sections` (default true) - Prefer local parse from `primary_document` (via `sec_edgar_mcp.get_filing_content`); do not rely on `get_filing_sections` for 10-Q/20-F
+- `download_sections` (default true) - Prefer local parse from persisted `primary_document.html`; do not rely on `get_filing_sections` for 10-Q/20-F/20-F
 
-> 注：Phase 1 的 Skill3（`extract-xbrl-timeseries`）默认通过 `sec_edgar_mcp.get_financials` 直接构建 `current/xbrl_atlas/`，不要求 Skill2 预先下载 XBRL 原始包，因此 Skill2 不单独暴露 `download_xbrl` 参数。
+**Section extraction（本地解析）**：
+- 数据源：`raw/sec/{accession}/primary_document.html`（按 SEC Archives `index.json` 落盘的主文档；必要时可用 `primary_document.txt` 辅助）。
+- 规则（best-effort）：
+  - `10-K`：优先抽取 `Item 7 (MD&A)`、`Item 1A (Risk Factors)`、`Item 1 (Business)`
+  - `10-Q`：优先抽取 `Part I Item 2 (MD&A)`、`Part II Item 1A (Risk Factors)`
+  - `20-F`：优先抽取 `Item 5 (Operating and Financial Review and Prospects)`、`Item 3.D (Risk Factors)`
+- 输出：写入 `raw/sec/{accession}/sections/{mdna.md,risk_factors.md,business.md}`；未命中则允许缺失并在 manifest/warnings 记录原因。
+
+**XBRL 落盘（不做成开关）**：
+- 对 Periodic Core（10-K/10-Q/20-F/6-K-Periodic）若 `has_xbrl=true`：下载并“解包式”落盘 as-filed XBRL 文件集到 `raw/sec/{accession}/xbrl/`（instance + `.xsd` + linkbases），优先不保留 `*-xbrl.zip`。
 
 ## Hard Dependencies
 - `company/{TICKER}/company.yaml` with valid `cik`
@@ -737,7 +746,7 @@ Data layering contract (raw vs index):
 ### SEC
 - `current/filings_index.yaml` - contract file (issuer_type + sixk_classifier_version + vmf_version)
 - `current/filings_index.parquet` - analysis layer
-- `raw/sec/{accession}/...` - meta + manifest + primary doc (+ downloads per VMF)
+- `raw/sec/{accession}/...` - meta + manifest + primary doc (+ sections) (+ `xbrl/` for periodic filings) (+ exhibits per VMF)
 - `current/events_index.parquet` - candidate SEC events pointers (`sec:{accession}`; not evidence claims)
 
 ## Mode Detection Logic
@@ -794,12 +803,12 @@ Rollup (orchestrator-friendly):
 | `company/{TICKER}/current/economic/*` | Skill4 `recast-economic-statements` | Skill5 `valuation-and-margin-of-safety` | 经济三表与核心指标（ROIC/FCF 等） |
 | `company/{TICKER}/current/valuation/*` | Skill5 `valuation-and-margin-of-safety` | 下游决策/报告 | 估值输出（value_state 等） |
 
-### 3.2 scripts/run.py (v0.3)
+### 3.2 scripts/run.py
 
 Implementation: see `.codex/skills/company_research/collect-company-facts/scripts/run.py` (SEC-only for Phase 1; News/Papers deferred to a future evidence DB/MCP).
 
 
-## 四、Skill 3: extract-xbrl-timeseries (v0.1 浅树版)
+## 四、Skill 3: extract-xbrl-timeseries
 
 ### 4.1 SKILL.md
 
@@ -807,23 +816,22 @@ Implementation: see `.codex/skills/company_research/collect-company-facts/script
 ---
 name: extract-xbrl-timeseries
 description: "Extract XBRL data into Statement Atlas with facts.parquet nodes edges paths. Use when building financial data foundation from SEC filings for recast."
-version: v0.1-phase1
+revision: "<YYYY-MM-DD>"   # optional
 ---
 
 # extract-xbrl-timeseries
 
-## What This Skill Does (v0.1 Phase 1)
-Build minimal Statement Atlas to unblock recast-economic-statements:
-1. Use sec_edgar_mcp.get_financials to get IS/BS/CF line items
-2. Build facts.parquet with all financial facts
-3. Build shallow nodes/edges/paths (depth=1 tree)
-4. Save to current/xbrl_atlas/
+## What This Skill Does
+Build Statement Atlas（树 + facts + 溯源）：
+1. 从 `current/filings_index.yaml` 选取 `has_xbrl=true` 的周期性 filings（10-K/10-Q/20-F/6-K-Periodic）
+2. 解析 `raw/sec/{accession}/xbrl/` 的 as-filed XBRL（instance + `.xsd` + linkbases）
+3. 产出完整的 `current/xbrl_atlas/*`（facts/nodes/edges/paths/periods）
+4. （可选降级）当本地 XBRL 缺失或解析失败时，可用 SEC “已抽取”XBRL / `sec_edgar_mcp.get_financials` 做 bootstrap，但必须在 result/manifest 中记录降级原因
 
 ## MCP Tools
-- sec_edgar_mcp.get_financials - get financial statements
-- sec_edgar_mcp.discover_xbrl_concepts - list available concepts
-- sec_edgar_mcp.get_xbrl_concepts - get specific concept values
-- fs - write files
+- fs - read/write files
+- (fallback) sec_edgar_mcp.get_financials - get financial statements
+- (fallback) sec_edgar_mcp.get_xbrl_concepts / discover_xbrl_concepts - extracted facts/concepts
 
 ## Inputs
 - ticker (required)
@@ -831,8 +839,8 @@ Build minimal Statement Atlas to unblock recast-economic-statements:
 - force_refresh (optional)
 
 ## Hard Dependencies
-- current/filings_index.yaml with has_xbrl filings
-- OR sec_edgar_mcp.get_financials available
+- current/filings_index.yaml with `has_xbrl=true` periodic filings
+- raw/sec/{accession}/xbrl/ materialized by Skill2/downloader (preferred)
 
 ## Outputs
 - current/xbrl_atlas/periods.yaml
@@ -841,9 +849,9 @@ Build minimal Statement Atlas to unblock recast-economic-statements:
 - current/xbrl_atlas/facts.parquet
 - current/xbrl_atlas/paths.parquet
 
-## v0.1 Strategy (快速跑通)
-Use sec_edgar_mcp.get_financials instead of parsing raw XBRL.
-This gives us line items directly without XBRL parsing complexity.
+## Fallback Strategy（bootstrap via extracted statements）
+Use SEC “已抽取”的结构化报表（例如 `sec_edgar_mcp.get_financials`）替代本地 as-filed XBRL 解析。
+仅用于兜底/快速跑通；必须记录为降级路径（facts 的 `role_uri/context_id/dimensions` 可能缺失）。
 
 ### Step 1 - Get financials via MCP
 ```python
@@ -865,7 +873,7 @@ for item in data:
         "period_end": period_end,
         "fiscal_period": fiscal_period,  # FY or Q1/Q2/Q3/Q4
         "statement_type": map_statement_type(statement_type),  # IS/BS/CF
-        "role_uri": None,  # Not available in v0.1
+        "role_uri": None,  # Not available in fallback path
         "concept": item.get("concept") or f"synthetic:{slugify(item['label'])}",
         "label": item["label"],
         "value": item["value"],
@@ -957,27 +965,35 @@ for period_end in facts_df["period_end"].unique():
 atomic_io.atomic_write_yaml(atlas_dir / "periods.yaml", {"periods": periods})
 ```
 
-## v0.2 Upgrade Path (后续)
-Replace get_financials with actual XBRL parsing:
-1. Download raw XBRL from raw/sec/{accession}/
-2. Parse presentation/calculation linkbase
-3. Build real tree structure
-4. Keep same output schema
+## Primary Strategy（as-filed XBRL parsing）
+Use本地 as-filed XBRL（由 Skill2/downloader 通过 SEC Archives `index.json` 落盘）：
+1. 逐个 accession 读取 `raw/sec/{accession}/xbrl/`
+2. 识别 instance：
+   - iXBRL 常见 `*_htm.xml`（文件名不一定与 `.xsd` 同名）
+   - 传统 XBRL 常见 `{stem}.xml`
+3. 解析 instance facts：`concept/name` + `contextRef` + `unitRef` + `decimals` + `value`
+4. 解析 schema/linkbases：
+   - `*_pre.xml`（presentation）→ 报表树（nodes/edges + `role_uri`）
+   - `*_cal.xml`（calculation）→ 加总关系（用于校验/一致性）
+   - `*_def.xml`（definition）→ 维度/成员（写入 facts 的 `dimensions`）
+   - `*_lab.xml`（label）→ 标签（facts.label 与 nodes.label）
+5. 产出 Statement Atlas：`facts/nodes/edges/paths/periods`，保留 `accession` 溯源
 
 ## Blocked Conditions
 - filings_index.yaml missing -> blocked, needs collect-company-facts
-- sec_edgar_mcp.get_financials returns empty for all periods -> blocked
+- 对所有候选 periods 都找不到可解析的本地 XBRL instance -> blocked（除非显式启用 fallback）
 
 ## Partial Conditions
-- Some periods missing data -> partial, log warnings
-- Some statement types empty -> partial
+- 部分 accession 缺 XBRL 或 instance 不可解析 -> partial（其余 periods 继续产出）
+- linkbases 不完整（例如缺 calculation/definition）-> partial（树/维度信息不完整）
+- 触发 fallback -> partial，并在 result/manifest 记录降级原因
 ```
 
 ### 4.2 scripts/run.py
 
 ```python
 #!/usr/bin/env python3
-"""extract-xbrl-timeseries skill runner (v0.1 shallow)."""
+"""extract-xbrl-timeseries skill runner."""
 import sys
 import re
 import argparse
@@ -1019,7 +1035,7 @@ def run(ticker: str, lookback_years: int = 10, force_refresh: bool = False):
     runlog.write_meta(run_dir, ticker, SKILL_NAME, {
         "ticker": ticker,
         "lookback_years": lookback_years,
-        "version": "v0.1-phase1",
+        "implementation_id": "bootstrap_get_financials",
     })
     
     warnings = []
@@ -1169,12 +1185,12 @@ if __name__ == "__main__":
 ---
 name: recast-economic-statements
 description: "Transform GAAP statements to economic statements with NOPAT ROIC FCF Owner Earnings. Use when need economic profit metrics from xbrl_atlas."
-version: v0.1-phase1
+revision: "<YYYY-MM-DD>"   # optional
 ---
 
 # recast-economic-statements
 
-## What This Skill Does (v0.1 Phase 1)
+## What This Skill Does
 1. Map GAAP line items to economic concepts via label matching
 2. Calculate core metrics: NOPAT, ROIC, FCF, Owner Earnings
 3. Save recast_policy.yaml for traceability
@@ -1185,7 +1201,7 @@ version: v0.1-phase1
 
 ## Inputs
 - ticker (required)
-- policy_version (optional, default v0.1)
+- policy_version (optional, default "default")
 - force_refresh (optional)
 
 ## Hard Dependencies
@@ -1197,7 +1213,7 @@ version: v0.1-phase1
 - current/economic/economic_statements.parquet
 - current/economic/core_metrics.parquet
 
-## v0.1 Strategy (Phase 1 最小可用)
+## Strategy（best-effort label matching）
 Focus on 3 必出指标 first:
 - owner_earnings = CFO - maintenance_capex
 - fcf = CFO - capex
@@ -1343,7 +1359,7 @@ core_df = pd.DataFrame(core_metrics)
 ### Step 5 - Write recast_policy for traceability
 ```python
 recast_policy = {
-    "policy_version": "v0.1",
+    "policy_version": "default",
     "created_at": str(date.today()),
     "mapping_rules": [],
     "maintenance_capex_method": {
@@ -1382,7 +1398,7 @@ atomic_io.atomic_write_yaml(economic_dir / "recast_policy.yaml", recast_policy)
 
 ```python
 #!/usr/bin/env python3
-"""recast-economic-statements skill runner (v0.1)."""
+"""recast-economic-statements skill runner."""
 import sys
 import argparse
 from datetime import date
@@ -1449,7 +1465,7 @@ def calc_metrics(row, floor_ratio=0.8):
         "owner_earnings": cfo - maint_capex,
     }
 
-def run(ticker: str, policy_version: str = "v0.1", force_refresh: bool = False):
+def run(ticker: str, policy_version: str = "default", force_refresh: bool = False):
     ticker = ticker.upper()
     
     paths.ensure_dirs(ticker)
@@ -1561,7 +1577,7 @@ def run(ticker: str, policy_version: str = "v0.1", force_refresh: bool = False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("ticker")
-    parser.add_argument("--policy-version", default="v0.1")
+    parser.add_argument("--policy-version", default="default")
     parser.add_argument("--force-refresh", action="store_true")
     args = parser.parse_args()
     
@@ -1578,7 +1594,7 @@ if __name__ == "__main__":
 ---
 name: valuation-and-margin-of-safety
 description: "Calculate intrinsic value via EPV DCF and margin of safety. Use when need valuation estimate or investment memo for any ticker."
-version: v0.1-phase1
+revision: "<YYYY-MM-DD>"   # optional
 ---
 
 # valuation-and-margin-of-safety
@@ -1842,7 +1858,7 @@ def run(ticker: str, model_type: str = "hybrid", force_refresh: bool = False):
     run_dir.mkdir(parents=True)
     
     runlog.write_meta(run_dir, ticker, SKILL_NAME, {
-        "ticker": ticker, "model_type": model_type, "version": "v0.1-phase1"
+        "ticker": ticker, "model_type": model_type, "implementation_id": "baseline"
     })
     
     warnings = []
@@ -1928,7 +1944,7 @@ def run(ticker: str, model_type: str = "hybrid", force_refresh: bool = False):
             "margin_of_safety": margin_of_safety,
         },
         "downside_protection": {
-            # Phase 1 v0.1: net_debt is intentionally not part of market_snapshot.yaml (derive later from filings/economic layer).
+            # net_debt is intentionally not part of market_snapshot.yaml (derive later from filings/economic layer).
             "net_cash_per_share": None,
         },
     }
@@ -2003,7 +2019,7 @@ Using conservative defaults. Full analysis requires:
 - [ ] cross-examination-audit
 
 ---
-*Generated by valuation-and-margin-of-safety v0.1-phase1*
+*Generated by valuation-and-margin-of-safety*
 """
     
     # Save outputs
@@ -2237,7 +2253,7 @@ if __name__ == "__main__":
   - scripts/run.py
   - 测试: 验证 filings_index.yaml
 
-□ Step 4: 部署 Skill 3 - extract-xbrl-timeseries (v0.1)
+□ Step 4: 部署 Skill 3 - extract-xbrl-timeseries
   - SKILL.md
   - scripts/run.py
   - 测试: 验证 facts.parquet (可以是空但结构对)
@@ -2303,6 +2319,6 @@ codex "Run full Phase 1 analysis for AAPL"
 **关键改进**:
 - Description 单行、无冒号（避免 YAML 解析问题）
 - 共享 runtime 减少重复代码
-- v0.1 浅树策略（先跑通再完善）
+- 优先 as-filed XBRL 解析；必要时允许 fallback（需记录降级原因）
 - 项目级 Skills（git 可管理）
 - sec_edgar_mcp 具体工具映射

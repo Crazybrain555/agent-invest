@@ -262,7 +262,7 @@ source: "mixed:alpaca.get_stock_latest_trade+yfinance.get_stock_info"
 **recast_policy.yaml：**
 
 ```yaml
-policy_version: "v0.1"
+policy_version: "default"
 mapping_rules:
   - target: revenue
     selector:
@@ -350,7 +350,7 @@ links:
 
 ## 六、九个 Skills 总览
 
-> 注：本 v2 规划目标是 9 个 Skills；当前 Phase 1 v0.1 已实现 5 个（其余为 roadmap）。
+> 注：本 v2 规划目标是 9 个 Skills；目前已实现 5 个（其余为 roadmap）。
 
 | # | Skill | 状态 | 职责 | 对"利润×质量"贡献 |
 |---|-------|------|------|------------------|
@@ -490,8 +490,7 @@ sec_days = (fetch_end - fetch_start).days + 1
 |------|------|--------|------|
 | `vmf_score_threshold` | int | 8 | VMF 打分阈值（>=8 才下载） |
 | `vmf_annual_budget` | int | 20 | 每自然年事件下载上限（硬触发不受限） |
-| `download_xbrl` | bool | true | 下载周期性 filing 的 XBRL 包 |
-| `download_sections` | bool | true | 下载并存储关键 sections（MD&A/Risk Factors） |
+| `download_sections` | bool | true | 对已落盘的 `primary_document.html` 本地解析抽取并存储关键 sections（MD&A/Risk Factors/Business 等；best-effort） |
 
 ---
 
@@ -511,8 +510,8 @@ sec_days = (fetch_end - fetch_start).days + 1
   - `meta.yaml`：filing 元数据
   - `manifest.yaml`：下载清单 + hash + 完整性标记
   - `primary_document.html` / `.txt`：主文档
-  - `sections/`：存储关键段落（MD&A/Risk Factors）
-  - `xbrl/`：XBRL 包（*.xml / *.xsd）
+  - `sections/`：存储关键段落（由 `primary_document` 本地解析抽取，例如 MD&A/Risk Factors）
+  - `xbrl/`：as-filed XBRL 文件集（instance + `.xsd` + linkbases；优先不保留 `*-xbrl.zip`）
   - `exhibits/`：高价值附件（99.* / 10.1 / 2.1 等）
 
 ### Events Candidates 输出（推荐）
@@ -565,7 +564,7 @@ sec_days = (fetch_end - fetch_start).days + 1
 **下载内容（全部）**：
 - `primary_document.html`：永远下载
 - `xbrl/`：若 `has_xbrl=true`
-- `sections/`：MD&A / Risk Factors / Business Description
+- `sections/`：MD&A / Risk Factors / Business Description（由 `primary_document` 本地解析抽取；不依赖 `get_filing_sections`）
 - `meta.yaml` + `manifest.yaml`：元数据与完整性追踪
 - **FPI 的 6-K（Interim Financials/Results）额外规则**：必须下载 `exhibits/99.*`（结果公告/演示材料/摘要财务报表通常在此承载）
 
@@ -585,7 +584,7 @@ sec_days = (fetch_end - fetch_start).days + 1
 > - 6-K（Interim Financials/Results）→ 归入 Periodic Core（10年全量下载）
 > - 6-K（Other events）→ 归入 Event Stream（全量索引 + VMF 选择性下载）
 
-**v0.2 启发式（更严格，避免把非财报 6-K 误判为 periodic）**：
+**严格启发式（更严格，避免把非财报 6-K 误判为 periodic）**：
 - Period 信号（任一，来自标题/描述或 exhibits 描述）：`three months ended`, `six months ended`, `quarter ended`, `quarter`, `half-year`, `interim report`, `interim financial statements`, `unaudited interim`, `q1/q2/q3/q4`
 - Results 信号（任一，来自标题/描述或 exhibits 描述）：`results`, `earnings`, `financial results`, `financial statements`, `interim results`, `unaudited`, `condensed consolidated`
 - 判定规则：`(period AND results)`（标题/描述命中或 exhibits 99.* 描述命中均可）
@@ -705,8 +704,8 @@ for filing in event_filings_sorted_by_score_desc:
 
 as_of: "2026-01-14"                    # ISO date string
 issuer_type: "fpi"                     # domestic | fpi
-sixk_classifier_version: "v0.2"
-vmf_version: "v0.1"
+sixk_classifier_version: "strict_period_and_results"
+vmf_version: "standard"
 
 window:
   mode: "maintenance"                  # init | maintenance
@@ -1001,7 +1000,7 @@ else:
     sixk_periodic = []
     sixk_event = []
     for filing in sixk_all:
-        sixk_class, reasons = classify_6k_periodic_vs_event(filing)  # v0.2：period AND results（不允许 guidance/presentation-only）
+        sixk_class, reasons = classify_6k_periodic_vs_event(filing)  # strict：period AND results（不允许 guidance/presentation-only）
         filing["sixk_class"] = sixk_class
         filing["sixk_reasons"] = reasons
 
@@ -1062,8 +1061,8 @@ all_filings = sorted(by_accession.values(), key=lambda f: f["filed_at"], reverse
 filings_index_payload = {
     "as_of": str(as_of),
     "issuer_type": issuer_type,
-    "sixk_classifier_version": "v0.2",
-    "vmf_version": "v0.1",
+    "sixk_classifier_version": "strict_period_and_results",
+    "vmf_version": "standard",
     "window": {
         "mode": mode,
         "start": str(fetch_start),
@@ -1280,7 +1279,7 @@ runlog.write_result(run_dir, ticker, SKILL_NAME, status,
 |------|------|------|--------|------|
 | `ticker` | string | ✓ | - | 股票代码 |
 | `as_of` | date | - | 当天 | 数据截止日 |
-| `policy_version` | string | - | "v0.1" | 重铸策略版本 |
+| `policy_version` | string | - | "default" | 重铸策略标识（rulebook id） |
 | `force_refresh` | bool | - | false | 强制刷新 |
 
 **Hard 依赖**
@@ -1800,7 +1799,7 @@ generate_value_summary()
 ---
 name: <skill-name>
 description: <一句话：做什么，为估值服务的哪一层>
-version: v0.1
+revision: "<YYYY-MM-DD>"   # optional
 ---
 
 # <Skill Name>
@@ -1883,6 +1882,3 @@ version: v0.1
 | `cross-examination-audit` | 反问审计，防大错 |
 
 **第二阶段产出**：显著提升"错杀 vs 价值陷阱"的分辨能力。
-
-
-
