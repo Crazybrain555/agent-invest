@@ -8,7 +8,7 @@
 
 我们在做一个“公司研究证据池”工程，需要从 SEC EDGAR **长期、可追溯**地获取并落盘：
 
-1. **Filing 本体（人读）**：10-K / 10-Q / 20-F / 6-K 等申报文件的“主文档”和关键附件（exhibits）。
+1. **Filing 本体（人读）**：10-K / 10-Q / 20-F / 40-F / 6-K 等申报文件的“主文档”和关键附件（exhibits）。
 2. **XBRL 数据（机读）**：同一份 filing 附带的结构化可机读数据（传统 XBRL 或 Inline XBRL/iXBRL）。
 
 核心诉求：
@@ -68,7 +68,7 @@ https://www.sec.gov/Archives/edgar/data/{CIK}/{ACCESSION_NO_NO_DASHES}/
 
 通常包含：
 
-- **主文档（primary document）**：`.htm` / `.html`（浏览器打开就是你看到的 10-K/10-Q/20-F 正文）
+- **主文档（primary document）**：`.htm` / `.html`（浏览器打开就是你看到的 10-K/10-Q/20-F/40-F 正文）
 - **submission text**：`{accession}.txt`（一整个“submission 包”，包含多个 `<DOCUMENT>`；用于强追溯/离线解析）
 - **附件/Exhibits**：`.htm`、`.pdf`、`.jpg/.png` 等
 
@@ -136,10 +136,14 @@ XBRL 的核心是“**标签化的事实（facts）+ 上下文（context）+ 单
 这里能拿到近年 filing 的：
 
 - `accessionNumber`
-- `form`（10-K/10-Q/20-F/6-K…）
+- `form`（10-K/10-Q/20-F/40-F/6-K…）
 - `filingDate`
 - `reportDate`
 - `primaryDocument`（非常关键：主文档文件名）
+
+**补充：边界样例**
+- 加拿大 MJDS 常见年度表单为 `40-F`（替代 `20-F`）。
+- 部分 FPI 的 `6-K` 也会带 iXBRL（例如中期业绩或更新），因此不要假定 `6-K` 一定无 XBRL；以 `isXBRL / isInlineXBRL` 为准。
 
 > 十年+：如果 `recent` 不足以覆盖，可结合 `/Archives/edgar/full-index` / `daily-index` 回溯构建 accession 列表（代价更大，但官方可行）。
 

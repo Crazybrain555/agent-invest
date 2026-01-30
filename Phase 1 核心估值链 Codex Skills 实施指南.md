@@ -468,7 +468,7 @@ company_data = {
     # Prefer Alpaca asset exchange; SEC company_info.exchange is often null
     "exchange": normalize_exchange(alpaca.get_asset(symbol=ticker).get("exchange")) if use_alpaca else None,
     "sic": company_info.get("sic"),
-    # Prefer annual filing period_of_report (10-K / 20-F) to infer fiscal year end MM-DD
+    # Prefer annual filing period_of_report (10-K / 20-F / 40-F) to infer fiscal year end MM-DD
     "fiscal_year_end": extract_mm_dd(annual["filings"][0]["period_of_report"]) if annual.get("filings") else None,
     "currency": "USD",
 }
@@ -699,7 +699,7 @@ revision: "<YYYY-MM-DD>"   # optional
 
 ## Purpose
 **SEC Evidence Ingestion + Maintenance Layer** supporting valuation chain:
-- Periodic core filings (Domestic: 10-K/10-Q/DEF14A; FPI: 20-F + 6-K interim results) + XBRL for reconstruction
+- Periodic core filings (Domestic: 10-K/10-Q/DEF14A; FPI/MJDS: 20-F/40-F + 6-K interim results) + XBRL for reconstruction
 - Event filings (Domestic: 8-K; FPI: 6-K other) filtered by VMF, for quality/uncertainty signals
 
 Two modes (auto-detected):
@@ -725,18 +725,18 @@ Data layering contract (raw vs index):
 ### SEC VMF Parameters
 - `vmf_score_threshold` (default 8) - Score threshold for event download
 - `vmf_annual_budget` (default 20) - Max events per year (hard triggers exempt)
-- `download_sections` (default true) - Prefer local parse from persisted `primary_document.html`; do not rely on `get_filing_sections` for 10-Q/20-F/20-F
+- `download_sections` (default true) - Prefer local parse from persisted `primary_document.html`; do not rely on `get_filing_sections` for 10-Q/20-F/40-F
 
 **Section extraction（本地解析）**：
 - 数据源：`raw/sec/{accession}/primary_document.html`（按 SEC Archives `index.json` 落盘的主文档；必要时可用 `primary_document.txt` 辅助）。
 - 规则（best-effort）：
   - `10-K`：优先抽取 `Item 7 (MD&A)`、`Item 1A (Risk Factors)`、`Item 1 (Business)`
   - `10-Q`：优先抽取 `Part I Item 2 (MD&A)`、`Part II Item 1A (Risk Factors)`
-  - `20-F`：优先抽取 `Item 5 (Operating and Financial Review and Prospects)`、`Item 3.D (Risk Factors)`
+  - `20-F/40-F`：优先抽取 `Item 5 (Operating and Financial Review and Prospects)`、`Item 3.D (Risk Factors)`（40-F 往往以年报/附表形式存在，best-effort）
 - 输出：写入 `raw/sec/{accession}/sections/{mdna.md,risk_factors.md,business.md}`；未命中则允许缺失并在 manifest/warnings 记录原因。
 
 **XBRL 落盘（不做成开关）**：
-- 对 Periodic Core（10-K/10-Q/20-F/6-K-Periodic）若 `has_xbrl=true`：下载并“解包式”落盘 as-filed XBRL 文件集到 `raw/sec/{accession}/xbrl/`（instance + `.xsd` + linkbases），优先不保留 `*-xbrl.zip`。
+- 对 Periodic Core（10-K/10-Q/20-F/40-F/6-K-Periodic）若 `has_xbrl=true`：下载并“解包式”落盘 as-filed XBRL 文件集到 `raw/sec/{accession}/xbrl/`（instance + `.xsd` + linkbases），优先不保留 `*-xbrl.zip`。
 
 ## Hard Dependencies
 - `company/{TICKER}/company.yaml` with valid `cik`
@@ -823,7 +823,7 @@ revision: "<YYYY-MM-DD>"   # optional
 
 ## What This Skill Does
 Build Statement Atlas（树 + facts + 溯源）：
-1. 从 `current/filings_index.yaml` 选取 `has_xbrl=true` 的周期性 filings（10-K/10-Q/20-F/6-K-Periodic）
+1. 从 `current/filings_index.yaml` 选取 `has_xbrl=true` 的周期性 filings（10-K/10-Q/20-F/40-F/6-K-Periodic）
 2. 解析 `raw/sec/{accession}/xbrl/` 的 as-filed XBRL（instance + `.xsd` + linkbases）
 3. 产出完整的 `current/xbrl_atlas/*`（facts/nodes/edges/paths/periods）
 4. （可选降级）当本地 XBRL 缺失或解析失败时，可用 SEC “已抽取”XBRL / `sec_edgar_mcp.get_financials` 做 bootstrap，但必须在 result/manifest 中记录降级原因

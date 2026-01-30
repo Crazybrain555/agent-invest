@@ -444,7 +444,7 @@ links:
 - **SEC**：
   - **周期性核心（Periodic Core）**：10年全量下载（必须）
     - Domestic：10-K/10-Q/DEF14A
-    - FPI：20-F **+ 6-K（Interim Financials/Results 子集：季度/半年中期业绩材料）**
+    - FPI / MJDS（加拿大）：20-F/40-F **+ 6-K（Interim Financials/Results 子集：季度/半年中期业绩材料）**
   - **事件流（Event Stream）**：10年全量索引 + VMF 选择性下载
     - Domestic：8-K/8-K/A
     - FPI：6-K（排除已归入 Periodic Core 的 “Interim Financials/Results” 子集后的剩余 6-K）
@@ -546,8 +546,8 @@ sec_days = (fetch_end - fetch_start).days + 1
 ### 0. 发行人类型识别（Domestic vs FPI）
 
 - 不依赖 “CIK 有 FPI 标记” 这类不稳定信号；以近年 filings 的 forms 推断 `issuer_type`
-- **Init 首跑且 forms 为空时**：做一次轻量 probe（推荐顺序：试查 `20-F` → `10-Q` → `6-K`，每次只查近 1 年/少量条数），以避免误判为 domestic
-- 若出现 `20-F`/`20-F/A` → `issuer_type=fpi`
+- **Init 首跑且 forms 为空时**：做一次轻量 probe（推荐顺序：试查 `20-F`/`40-F` → `10-Q` → `6-K`，每次只查近 1 年/少量条数），以避免误判为 domestic
+- 若出现 `20-F`/`20-F/A`/`40-F`/`40-F/A` → `issuer_type=fpi`
 - 若出现 `10-Q`/`10-Q/A` → `issuer_type=domestic`
 - 若主要为 `6-K` 且无 `10-Q`/`10-Q/A` → `issuer_type=fpi`（兜底）
 - 推断结果写入 `current/filings_index.yaml: issuer_type`
@@ -559,7 +559,7 @@ sec_days = (fetch_end - fetch_start).days + 1
 | 发行人类型 | 识别方式（forms 推断） | 下载 Forms |
 |-----------|----------|-----------|
 | Domestic（美国国内）| 近年 filings 存在 10-K/10-Q（且无 20-F） | 10-K, 10-K/A, 10-Q, 10-Q/A, DEF14A |
-| FPI（外国私人发行人）| 近年 filings 存在 20-F 或主要为 6-K 且无 10-Q | 20-F, 20-F/A, 6-K（仅 Interim Financials/Results 子集） |
+| FPI（外国私人发行人）| 近年 filings 存在 20-F/40-F 或主要为 6-K 且无 10-Q | 20-F, 20-F/A, 40-F, 40-F/A, 6-K（仅 Interim Financials/Results 子集） |
 
 **下载内容（全部）**：
 - `primary_document.html`：永远下载
@@ -720,7 +720,7 @@ totals:
   stored_total: 5420                   # 写入后累计 accession 总数
 filings:
   # --- FPI 6-K-Periodic（Interim Financials/Results）：进入 Periodic Core，全量下载 ---
-  - form: "6-K"                         # string: 10-K, 10-Q, 8-K, DEF14A, 20-F, 6-K, etc.
+  - form: "6-K"                         # string: 10-K, 10-Q, 8-K, DEF14A, 20-F, 40-F, 6-K, etc.
     filed_at: "2024-08-15"              # ISO date string
     period_end: null                    # SEC period_of_report（周期性=财务期末；事件=事件/报告日期；6-K 往往需后续解析）
     accession: "0001104659-24-090102"   # SEC accession number (unique ID)
@@ -958,7 +958,7 @@ sec_days = (fetch_end - fetch_start).days + 1
 if issuer_type == "domestic":
     periodic_forms = ["10-K", "10-K/A", "10-Q", "10-Q/A", "DEF14A"]
 else:  # fpi
-    periodic_forms = ["20-F", "20-F/A"]
+    periodic_forms = ["20-F", "20-F/A", "40-F", "40-F/A"]
 
 # 周期性核心：在 [fetch_start, fetch_end] 窗口内拉取并补齐缺口（init=10年；maintenance=间隔天数+overlap）
 periodic_filings = []
