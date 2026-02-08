@@ -6,6 +6,15 @@ repo invariants, operational gotchas, and "how we do changes safely".
 
 ---
 
+## Doc Roles (AGENTS.md vs CLAUDE.md)
+
+- `AGENTS.md`: cross-agent invariants and safety rules for this repo (tool-agnostic).
+- `CLAUDE.md`: Claude Code specific operating contract + how to run the Phase 1 skills chain in this repo.
+- Conflict resolution: **filesystem truth / real commands win**. When unsure, defer to `Phase 1 核心估值链 Codex Skills 实施指南.md`.
+- If the user corrects a mistake: propose concrete text to add to `CLAUDE.md` and/or `AGENTS.md` so the repo learns the rule (do not silently "remember it").
+
+---
+
 ## 0) Continuity Ledger (compaction-safe)
 
 Maintain a single Continuity Ledger for this workspace in `CONTINUITY.md` (repo root).
@@ -69,6 +78,8 @@ If a tool response may be huge (logs, big diffs, data dumps), keep outputs small
 - Do not "fix" by broad try/except or silent fallbacks; surface failures with actionable logs.
 - Preserve existing behavior by default; gate behavior changes behind config/flags when possible.
 - Keep UTF-8 explicit for file/log I/O (`encoding="utf-8"`).
+- After the user corrects a mistake: propose a specific doc update to `CLAUDE.md` and/or `AGENTS.md` (exact text), so it doesn't recur.
+- When a rule is stable/repeated: prefer writing it into repo docs over relying on chat context or memory.
 
 ### Presenting results
 - Be concise. Reference paths as inline code (e.g. `.codex/skills/company_research/collect-company-facts/SKILL.md`).
@@ -138,6 +149,21 @@ Primary working areas:
 Notes:
 - This LLM branch is intentionally trimmed; traditional pipelines/tools are removed.
 - Keep edits focused on skill workflows and documentation.
+
+### 4.1 Runtime Output Directory (运行产物目录)
+
+All Phase 1 runs write outputs under:
+- `/home/help/mcp/work/company_research/company/{TICKER}/`
+
+Invariants (do not break):
+- `raw/` is immutable evidence (append-only, traceable).
+- `current/` is the query layer (latest promoted state).
+- `runs/{run_id}/` records each execution (meta/result/needs + outputs snapshot).
+
+Operational notes:
+- Skills write `company.yaml`, `current/*`, and `raw/sec/{accession}/...` here; the repo itself stays mostly code + docs.
+- When reporting results, always reference the exact output paths under `/home/help/mcp/work/company_research/...` (not hypothetical `./outputs`).
+- If something is blocked, `runs/{run_id}/needs.yaml` should point to the missing upstream artifact (typically `company-foundation` before SEC/XBRL skills).
 
 ---
 

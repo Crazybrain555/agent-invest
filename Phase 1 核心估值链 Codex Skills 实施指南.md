@@ -61,14 +61,14 @@
     │   │       ├── manifest.yaml          # 下载清单 + hash + 完整性
     │   │       ├── primary_document.html  # 主文档
     │   │       ├── primary_document.txt   # 纯文本版
-    │   │       ├── sections/              # 关键段落（从主文档抽取）
+    │   │       ├── sections/              # 关键段落（主文档抽取；必要时从 exhibits fallback）
     │   │       │   ├── mdna.md
     │   │       │   ├── risk_factors.md
     │   │       │   └── business.md
     │   │       ├── xbrl/                  # XBRL 包（周期性filing）
     │   │       │   ├── *.xml
     │   │       │   └── *.xsd
-    │   │       └── exhibits/              # 高价值附件（VMF筛选）
+    │   │       └── exhibits/              # 默认落盘 EX-*（排除 EX-101.*：XBRL exhibits，统一落到 xbrl/），后续再做 VMF/高价值筛选
     │   │           ├── exhibit_99_1.html  # 新闻稿/业绩公告
     │   │           ├── exhibit_10_1.html  # 重大合同
     │   │           └── exhibit_2_1.html   # 并购协议
@@ -725,14 +725,16 @@ Data layering contract (raw vs index):
 ### SEC VMF Parameters
 - `vmf_score_threshold` (default 8) - Score threshold for event download
 - `vmf_annual_budget` (default 20) - Max events per year (hard triggers exempt)
-- `download_sections` (default true) - Prefer local parse from persisted `primary_document.html`; do not rely on `get_filing_sections` for 10-Q/20-F/40-F
+- `download_sections` (default true) - Prefer local parse from persisted `primary_document.html`; use “最长匹配 + 最小长度阈值”避免 TOC；必要时从 `exhibits/EX-*` fallback
 
 **Section extraction（本地解析）**：
 - 数据源：`raw/sec/{accession}/primary_document.html`（按 SEC Archives `index.json` 落盘的主文档；必要时可用 `primary_document.txt` 辅助）。
 - 规则（best-effort）：
   - `10-K`：优先抽取 `Item 7 (MD&A)`、`Item 1A (Risk Factors)`、`Item 1 (Business)`
-  - `10-Q`：优先抽取 `Part I Item 2 (MD&A)`、`Part II Item 1A (Risk Factors)`
+  - `10-Q`：优先抽取 `Part I Item 2 (MD&A)`、`Part II Item 1A (Risk Factors)`（10-Q 通常无 Business 章节，因此 `business.md` 常缺失属正常）
   - `20-F/40-F`：优先抽取 `Item 5 (Operating and Financial Review and Prospects)`、`Item 3.D (Risk Factors)`（40-F 往往以年报/附表形式存在，best-effort）
+- **避免 TOC 误判**：采用“**最长匹配** + **最小长度阈值**”策略；过短段落视为 TOC 噪声，触发 fallback。
+- **Exhibits fallback**：若主文档未命中，可在 `exhibits/EX-*` 里重复同样的 heading 搜索并补齐。
 - 输出：写入 `raw/sec/{accession}/sections/{mdna.md,risk_factors.md,business.md}`；未命中则允许缺失并在 manifest/warnings 记录原因。
 
 **XBRL 落盘（不做成开关）**：
@@ -746,7 +748,8 @@ Data layering contract (raw vs index):
 ### SEC
 - `current/filings_index.yaml` - contract file (issuer_type + sixk_classifier_version + vmf_version)
 - `current/filings_index.parquet` - analysis layer
-- `raw/sec/{accession}/...` - meta + manifest + primary doc (+ sections) (+ `xbrl/` for periodic filings) (+ exhibits per VMF)
+- `raw/sec/{accession}/...` - meta + manifest + primary doc (+ sections) (+ `xbrl/` for periodic filings) (+ exhibits default EX-*)
+- `raw/sec/{accession}/exhibits/` - 解析 `{accession}-index.html` 的 DocType，默认抓取全部 `EX-*`（排除 `EX-101.*`：XBRL exhibits，统一落到 `xbrl/`）；后续再做 VMF/高价值裁剪
 - `current/events_index.parquet` - candidate SEC events pointers (`sec:{accession}`; not evidence claims)
 
 ## Mode Detection Logic

@@ -169,6 +169,28 @@ XBRL 的核心是“**标签化的事实（facts）+ 上下文（context）+ 单
 - 写 `meta.yaml`（ticker/cik/form/filed/report_date/is_ixbrl/primary_doc_original/xbrl_instance_file 等）
 - 生成 `primary_document.txt`（本地 HTML→text；用于搜索、切段、LLM）
 - `sections/`（本地解析抽取；best-effort）
+- `exhibits/`（按 `index.json` 类型字段选择性下载；见下节）
+
+### Step E：sections / exhibits 提取（best-effort）
+
+**关键前提：DocType 只能从 `*-index.html` 得到**  
+`index.json` 只有文件名与大小，并不包含 DocType；因此需要抓取 `{accession}-index.html`（或 `index.html`）并解析表格 `Document / Type`。
+
+**Exhibits 下载规则（推荐默认：更“全”，后续再过滤）**
+- 解析 `*-index.html`，抓取 **所有 `EX-*`** 附件（排除 `EX-101.*`：它本质是 XBRL exhibits（schema/linkbase/instance），我们会统一落到 `xbrl/`；不在 `exhibits/` 里重复保存，避免重复与混淆）。
+- 若要缩小范围，可在后续阶段做策略筛选（如仅保留 `EX-99.*`、`EX-10.*`、`EX-2.*`、`EX-13` 等）。
+- 注意：10-Q 往往只有 `EX-31` / `EX-32` 之类认证文件，属于“低价值但完整性要求”场景。
+
+**Sections 抽取逻辑（示例）**
+- 优先从 `primary_document.html` 解析（本地 HTML→text）：
+  - 10-K：`Item 1 (Business)`、`Item 1A (Risk Factors)`、`Item 7 (MD&A)`
+  - 10-Q：`Part I Item 2 (MD&A)`、`Part II Item 1A (Risk Factors)`（注意 `Item 2` 在 Part II 也有出现；且 **10-Q 通常没有 Business 章节**，因此 `business.md` 常常不存在属于正常情况）
+  - 20-F / 40-F：`Item 5 (Operating and Financial Review and Prospects)`、`Item 3.D (Risk Factors)`、`Item 4 (Information on the Company)`
+  - 6-K / 其他：无固定 Item，改用 **标题关键词**（Operating/Financial Review, Results of Operations, Management Report 等）
+- **避免 TOC 误判**：对同一 heading 可能出现多次（目录 + 正文），用“**最长匹配段落**”策略；若长度过短（如 <800 字符），视为 TOC 噪声，触发 fallback。
+- **Exhibits fallback**：若主文档未命中，或长度过短，可在 `exhibits/EX-*` 中重复同样的 heading 搜索并补齐。
+
+> 实践结论：很多 FPI 的中期财报正文在 `EX-99.*`，尤其是 6-K；因此 sections 抽取一定要支持 exhibits fallback；并接受“部分段落被引用而非正文披露”的情况（例如 20-F 引用本地年报）。
 
 ---
 

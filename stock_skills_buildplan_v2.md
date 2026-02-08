@@ -105,14 +105,14 @@
             manifest.yaml                  # 下载清单 + hash + 完整性标记
             primary_document.html          # 主文档
             primary_document.txt           # 纯文本版
-            sections/                      # 关键段落
+            sections/                      # 关键段落（主文档抽取；必要时从 exhibits fallback）
               mdna.md
               risk_factors.md
               business.md
             xbrl/                          # XBRL 包（周期性filing）
               *.xml
               *.xsd
-            exhibits/                      # 高价值附件（VMF筛选）
+            exhibits/                      # 默认落盘 EX-*（排除 EX-101.*：XBRL exhibits，统一落到 xbrl/），后续再做 VMF/高价值筛选
               exhibit_99_1.html            # 新闻稿/业绩公告
               exhibit_10_1.html            # 重大合同
               exhibit_2_1.html             # 并购协议
@@ -490,7 +490,7 @@ sec_days = (fetch_end - fetch_start).days + 1
 |------|------|--------|------|
 | `vmf_score_threshold` | int | 8 | VMF 打分阈值（>=8 才下载） |
 | `vmf_annual_budget` | int | 20 | 每自然年事件下载上限（硬触发不受限） |
-| `download_sections` | bool | true | 对已落盘的 `primary_document.html` 本地解析抽取并存储关键 sections（MD&A/Risk Factors/Business 等；best-effort） |
+| `download_sections` | bool | true | 对已落盘的 `primary_document.html` 本地解析抽取并存储关键 sections（MD&A/Risk Factors/Business；用“最长匹配 + 最小长度阈值”避免 TOC；必要时从 `exhibits/EX-*` fallback） |
 
 ---
 
@@ -510,9 +510,9 @@ sec_days = (fetch_end - fetch_start).days + 1
   - `meta.yaml`：filing 元数据
   - `manifest.yaml`：下载清单 + hash + 完整性标记
   - `primary_document.html` / `.txt`：主文档
-  - `sections/`：存储关键段落（由 `primary_document` 本地解析抽取，例如 MD&A/Risk Factors）
+  - `sections/`：存储关键段落（由 `primary_document` 本地解析抽取；必要时从 `exhibits/EX-*` fallback；10-Q 通常无 Business 章节，因此 business.md 常缺失属正常）
   - `xbrl/`：as-filed XBRL 文件集（instance + `.xsd` + linkbases；优先不保留 `*-xbrl.zip`）
-  - `exhibits/`：高价值附件（99.* / 10.1 / 2.1 等）
+  - `exhibits/`：默认落盘 **全部 `EX-*`（排除 `EX-101.*`）**；后续再做 VMF/高价值筛选
 
 ### Events Candidates 输出（推荐）
 
@@ -564,7 +564,7 @@ sec_days = (fetch_end - fetch_start).days + 1
 **下载内容（全部）**：
 - `primary_document.html`：永远下载
 - `xbrl/`：若 `has_xbrl=true`
-- `sections/`：MD&A / Risk Factors / Business Description（由 `primary_document` 本地解析抽取；不依赖 `get_filing_sections`）
+- `sections/`：MD&A / Risk Factors / Business Description（由 `primary_document` 本地解析抽取；**最长匹配** + **最小长度阈值** 避免 TOC；必要时从 `exhibits/EX-*` 补齐；10-Q 通常无 Business）
 - `meta.yaml` + `manifest.yaml`：元数据与完整性追踪
 - **FPI 的 6-K（Interim Financials/Results）额外规则**：必须下载 `exhibits/99.*`（结果公告/演示材料/摘要财务报表通常在此承载）
 
@@ -684,9 +684,10 @@ for filing in event_filings_sorted_by_score_desc:
 | 内容 | 下载条件 |
 |------|---------|
 | `primary_document.html` | 永远下载 |
-| `exhibits/99.*` | 永远下载（业绩/新闻稿） |
-| `exhibits/10.1`（重大合同）| 命中 liquidity/financing/M&A 关键词时 |
-| `exhibits/2.1`（并购协议）| 命中 2.01 item 或 M&A 关键词时 |
+| `exhibits/EX-*`（排除 `EX-101.*`） | 默认全部下载；后续再做 VMF/高价值裁剪 |
+| `exhibits/99.*` | 最低集合：永远保留（业绩/新闻稿/结果公告） |
+| `exhibits/10.*`（重大合同）| 可在 VMF/事件识别阶段做强化保留 |
+| `exhibits/2.*`（并购协议）| 可在 VMF/事件识别阶段做强化保留 |
 | 其他附件 | 不下载 |
 
 ---
