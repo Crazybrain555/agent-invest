@@ -316,3 +316,53 @@ python master_scheduler.py
 说明：
 - 仅重启 VS Code/Cursor 通常不会导致挂载丢失；但**新开一个终端**需要重新 `export NAS_BASE_PATH=...`（建议写到 `~/.bashrc`）。
 - 如果 `mount` 报协议/认证错误，可尝试把 `vers=3.0` 改为 `vers=2.1`，或查看 `dmesg | tail` 的 CIFS 日志定位原因。
+
+## Codex MCP 依赖说明
+
+### 3.1 MCP 清单表格
+
+| 名称 | 用途 | 类型 | 安装来源 | Phase 1 必需 |
+| --- | --- | --- | --- | --- |
+| context7 | 库文档查询 | HTTP | `https://mcp.context7.com/mcp` | 可选 |
+| sec_edgar_mcp | SEC EDGAR 文件检索 | stdio | `python -m sec_edgar_mcp.server`（aiquantlab 环境） | 必需 |
+| fs | MCP 文件系统访问 | stdio | `npx -y @modelcontextprotocol/server-filesystem` | 必需 |
+| fetch | 网页抓取 | stdio | `.venvs/mcp-fetch` + `python -m mcp_server_fetch` | 可选 |
+| alpaca | Alpaca 市场数据/交易 | stdio | `alpaca-mcp-server` 本地可执行文件 | 必需 |
+| rss | RSS 新闻订阅 | stdio | 本地 `rss-mcp` Node 服务 | 可选 |
+| gdelt | GDELT 新闻/事件搜索 | stdio | 本地 `GDELT-mcp` Node 服务 | 可选 |
+| trading_mcp | 股票筛选/基本面指标 | stdio | 本地 `trading-mcp` Node 服务 | 必需 |
+| search | DuckDuckGo 搜索/网页提取 | stdio | `.venvs/mcp-search` + `mcp-search-server` | 可选 |
+| openalex | 学术论文检索 | stdio | 本地 `openalex-research-mcp` Node 服务 | 可选 |
+| crossref | 学术文献 DOI 查询 | stdio | `npx -y @botanicastudios/crossref-mcp` | 可选 |
+| pubmed | 医学文献检索 | stdio | `.venvs/pubmed-mcp` + `pubmed_server.py` | 可选 |
+| arxiv | arXiv 论文检索 | stdio | 本地 `arxiv-mcp-server` 可执行文件 | 可选 |
+| yfinance | Yahoo Finance 数据 | stdio | `uv --directory ... run server.py` | 必需 |
+| github | GitHub API 操作 | stdio | `npx -y @modelcontextprotocol/server-github` | 可选 |
+| git | 本地 Git 操作 | stdio | `.venvs/mcp-git` + `python -m mcp_server_git` | 可选 |
+| playwright | 浏览器自动化 | stdio | `npx @playwright/mcp@latest` | 可选 |
+
+### 3.2 环境变量说明
+
+完整环境变量快照见项目根目录 `.env.template`（包含 Alpaca/GitHub/Proxy 的可直接参考值）。
+
+- `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` / `ALPACA_PAPER_TRADE`：Alpaca MCP 认证与纸盘开关。
+- `GITHUB_PERSONAL_ACCESS_TOKEN` / `GITHUB_HOST`：GitHub MCP 所需凭据与域名。
+- `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 及小写版本：所有 MCP 的代理透传变量。
+- 其余写在 `.codex/config.toml` 的 `[mcp_servers.xxx.env]`（如 `SEC_EDGAR_USER_AGENT`、`OPENALEX_EMAIL`、`GDELT_USER_AGENT`），不需要额外 `export`。
+
+### 3.3 安装注意事项
+
+1. Python/conda 路径一致性：`/home/help/miniconda3/envs/aiquantlab/bin/python` 和各 `.venvs/*` 路径要存在。
+2. Node.js/npx 路径确认：`/home/help/mcp/tools/node/bin/node` 和 `/home/help/mcp/tools/bin/npx` 需可执行。
+3. uv 工具安装：`/home/help/mcp/tools/uv/uv` 需可执行（`yfinance` 依赖）。
+4. 代理变量配置：有代理时同时设置大写/小写变量；无代理可留空。
+5. `config.toml` 路径存在性检查：`command`、`args`、`cwd` 中所有绝对路径都要落地。
+6. `enabled_tools` 与 Skill 依赖对齐：若工具裁剪，需确认不会影响 Phase 1 技能链。
+
+### 3.4 Phase 1 技能链 -> MCP 映射
+
+- `company-foundation -> sec_edgar_mcp, alpaca, trading_mcp, yfinance`
+- `collect-company-facts -> sec_edgar_mcp, fs`
+- `extract-xbrl-timeseries -> sec_edgar_mcp, fs`
+- `recast-economic-statements -> fs`
+- `valuation-and-margin-of-safety -> fs, yfinance, alpaca`

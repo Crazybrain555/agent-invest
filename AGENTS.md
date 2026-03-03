@@ -140,6 +140,7 @@ If WSL prints localhost proxy warnings in NAT mode:
 ## 4) LLM Repo Layout (current)
 
 Primary working areas:
+- `.codex/config.toml`: project-scoped MCP server declarations (paths are machine-specific, see README for setup on new machines).
 - `.codex/skills/`: skill definitions and scripts; start from the relevant `SKILL.md`.
 - `.codex/skills/public/`: reusable public skills (e.g., stock pool).
 - `.codex/skills/company_research/`: company research skills and scripts.

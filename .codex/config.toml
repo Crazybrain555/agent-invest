@@ -1,0 +1,367 @@
+# ============================================================
+# Project-scoped MCP server declarations for my-quant-project
+# - This file only contains [mcp_servers.*] sections.
+# - Paths reflect the current development machine layout.
+# - Adjust machine-specific paths/env on new machines per README.
+# - User-level settings (model/projects/sandbox/etc.) are intentionally excluded.
+# ============================================================
+
+[mcp_servers.context7]
+url = "https://mcp.context7.com/mcp"
+http_headers = { "CONTEXT7_API_KEY" = "ctx7sk-cbeaba35-419c-4bc1-bd90-3830b9cbba21" }
+
+
+[mcp_servers.sec_edgar_mcp]
+command = "/home/help/miniconda3/envs/aiquantlab/bin/python"
+args = ["-m", "sec_edgar_mcp.server"]
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+[mcp_servers.sec_edgar_mcp.env]
+SEC_EDGAR_USER_AGENT = "yuye zhang (zhangyuye555@gmail.com)"
+SEC_EDGAR_RATE_LIMIT = "8"
+SEC_EDGAR_TIMEOUT = "60"
+# SEC_EDGAR_CACHE_DIR = "/home/yuye/.cache/sec-edgar"
+
+[mcp_servers.fs]
+command = "/home/help/mcp/tools/bin/npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/help/mcp/work"]
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+
+[mcp_servers.fetch]
+command = "/home/help/.venvs/mcp-fetch/bin/python"
+args = [
+  "-m",
+  "mcp_server_fetch",
+  "--user-agent=yuye zhang zhangyuye555@gmail.com",
+  "--ignore-robots-txt"
+]
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+[mcp_servers.alpaca]
+command = "/home/help/mcp/servers/alpaca-mcp-server/.venv/bin/alpaca-mcp-server"
+args = ["serve"]
+startup_timeout_sec = 60
+tool_timeout_sec = 120
+env_vars = [
+  "ALPACA_API_KEY",
+  "ALPACA_SECRET_KEY",
+  "ALPACA_PAPER_TRADE",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+cwd = "/home/help/mcp/servers/alpaca-mcp-server"
+
+
+[mcp_servers.rss]
+command = "/home/help/mcp/tools/node/bin/node"
+args = ["/home/help/mcp/servers/rss-mcp/dist/index.js"]
+startup_timeout_sec = 60
+tool_timeout_sec = 120
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+[mcp_servers.gdelt]
+command = "/home/help/mcp/tools/node/bin/node"
+args = ["/home/help/mcp/servers/GDELT-mcp/dist/index.js"]
+cwd = "/home/help/mcp/servers/GDELT-mcp"
+startup_timeout_sec = 60
+tool_timeout_sec = 180
+enabled_tools = [
+  "gdelt_search_articles",
+  "gdelt_timeline",
+  "gdelt_tone_chart",
+  "gdelt_geo_search",
+  "gdelt_image_search",
+  "gdelt_monitor"
+]
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+[mcp_servers.gdelt.env]
+GDELT_USER_AGENT = "yuye zhang (zhangyuye555@gmail.com) gdelt-mcp"
+GDELT_API_TIMEOUT = "60000"
+LOG_LEVEL = "info"
+# GDELT_API_BASE_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+# GDELT_DEFAULT_TIMESPAN = "7d"
+# GDELT_DEFAULT_MAX_RECORDS = "50"
+
+
+
+
+# ------------------------------------------------------------
+# Trading MCP: Demo 模式（当前仅做筛股/基础面，不配置 OpenAI/Reddit）
+# - screen_stocks_advanced_filters：Finviz 筛选（本 Demo 只用这个就够）
+# - get_fundamental_stock_metrics / compare_stock_valuations：基础面补充
+#
+# 以后要启用【新闻分析 / 社媒情绪】再做：
+# 1) 配 OPENAI_API_KEY（新闻/情绪分析需要）
+# 2) 配 Reddit 账号与 client_id/secret（社媒研究需要）
+# 3) 把 enabled_tools 扩展加入：
+#    - analyze_news_and_market_context
+#    - discover_trending_stocks
+#    - analyze_reddit_sentiment
+#    - comprehensive_stock_analysis
+# ------------------------------------------------------------
+
+
+[mcp_servers.trading_mcp]
+command = "/home/help/mcp/tools/node/bin/node"
+args = ["/home/help/mcp/servers/trading-mcp/dist/bootstrap.js"]
+cwd = "/home/help/mcp/servers/trading-mcp"
+startup_timeout_sec = 60
+tool_timeout_sec = 120
+enabled_tools = [
+  "screen_stocks_advanced_filters",
+  "get_fundamental_stock_metrics",
+  "compare_stock_valuations"
+]
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+[mcp_servers.trading_mcp.env]
+NODE_OPTIONS = "--trace-uncaught --trace-warnings --unhandled-rejections=strict"
+
+
+
+
+#[mcp_servers.notion]
+#url = "https://mcp.notion.com/mcp"
+
+
+[mcp_servers.search]
+command = "/home/help/.venvs/mcp-search/bin/mcp-search-server"
+cwd = "/home/help/mcp/servers/mcp-search-server"
+startup_timeout_sec = 60
+tool_timeout_sec = 180
+enabled_tools = [
+  "search_duckduckgo",
+  "extract_webpage_content",
+  "parse_pdf",
+  "search_tools",
+  "get_tool_info"
+]
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+# [mcp_servers.semanticscholar]
+# command = "/home/help/.venvs/semanticscholar-mcp/bin/python"
+# args = ["/home/help/mcp/servers/semanticscholar-mcp/semantic_scholar_server.py"]
+# cwd = "/home/help/mcp/servers/semanticscholar-mcp"
+# startup_timeout_sec = 60
+# tool_timeout_sec = 180
+# enabled_tools = [
+#   "search_semantic_scholar",
+#   "get_semantic_scholar_paper_details",
+#   "get_semantic_scholar_author_details",
+#   "get_semantic_scholar_citations_and_references"
+# ]
+
+[mcp_servers.openalex]
+command = "/home/help/mcp/tools/node/bin/node"
+args = ["/home/help/mcp/servers/openalex-research-mcp/build/index.js"]
+cwd = "/home/help/mcp/servers/openalex-research-mcp"
+startup_timeout_sec = 60
+tool_timeout_sec = 240
+enabled_tools = [
+  "search_works",
+  "get_work",
+  "get_related_works",
+  "get_work_citations",
+  "get_work_references",
+  "get_citation_network",
+  "search_authors",
+  "get_author_works",
+  "search_institutions"
+]
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+[mcp_servers.openalex.env]
+OPENALEX_EMAIL = "zhangyuye555@gmail.com"
+
+[mcp_servers.crossref]
+command = "/home/help/mcp/tools/bin/npx"
+args = ["-y", "@botanicastudios/crossref-mcp"]
+startup_timeout_sec = 60
+tool_timeout_sec = 180
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+[mcp_servers.pubmed]
+command = "/home/help/.venvs/pubmed-mcp/bin/python"
+args = ["/home/help/mcp/servers/pubmed-mcp/pubmed_server.py"]
+cwd = "/home/help/mcp/servers/pubmed-mcp"
+startup_timeout_sec = 60
+tool_timeout_sec = 240
+enabled_tools = [
+  "search_pubmed_key_words",
+  "search_pubmed_advanced",
+  "get_pubmed_article_metadata",
+  "download_pubmed_pdf",
+  "deep_paper_analysis"
+]
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+[mcp_servers.arxiv]
+command = "/home/help/.local/bin/arxiv-mcp-server"
+args = ["--storage-path", "/home/help/mcp/data/arxiv_papers"]
+startup_timeout_sec = 60
+tool_timeout_sec = 300
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+[mcp_servers.arxiv.env]
+PYMUPDF_SUGGEST_LAYOUT_ANALYZER = "0"
+
+[mcp_servers.yfinance]
+command = "/home/help/mcp/tools/uv/uv"
+args = ["--directory", "/home/help/mcp/servers/yahoo-finance-mcp", "run", "server.py"]
+cwd = "/home/help/mcp/servers/yahoo-finance-mcp"
+startup_timeout_sec = 60
+tool_timeout_sec = 120
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+
+# ------------------------------------------------------------
+# GitHub / Git MCP
+#
+# 1) GitHub MCP server (deprecated package, but easiest local setup via npx)
+#    Requires: export GITHUB_PERSONAL_ACCESS_TOKEN=...
+#
+# 2) Git MCP server (local git repo ops)
+# ------------------------------------------------------------
+
+[mcp_servers.github]
+command = "/home/help/mcp/tools/bin/npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+startup_timeout_sec = 60
+tool_timeout_sec = 240
+enabled_tools = [
+  # repo read/write
+  "get_file_contents",
+  "create_or_update_file",
+  "push_files",
+  "create_branch",
+  "list_commits",
+  # PR/issue basics
+  "create_pull_request",
+  "get_pull_request",
+  "list_pull_requests",
+  "create_issue",
+  "add_issue_comment",
+  # search
+  "search_repositories",
+  "search_code",
+  "search_issues",
+  "search_users"
+]
+env_vars = [
+  "GITHUB_PERSONAL_ACCESS_TOKEN",
+  "GITHUB_HOST",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+[mcp_servers.git]
+command = "/home/help/.venvs/mcp-git/bin/python"
+args = ["-m", "mcp_server_git", "--repository", "/mnt/d/python_project/Golden_price_prediction"]
+startup_timeout_sec = 60
+tool_timeout_sec = 180
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
+
+[mcp_servers.playwright]
+args = ["@playwright/mcp@latest"]
+command = "npx"

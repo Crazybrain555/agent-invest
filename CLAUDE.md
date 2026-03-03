@@ -46,6 +46,7 @@ This repo is intentionally trimmed and centered around Phase 1 skills + a shared
 Do not assume `src/`, schedulers, data pipelines, or other AIQuantLab production code exists here.
 
 Primary working areas:
+
 - `.codex/skills/`:
   - `company_research/*/SKILL.md` defines each skill contract and how to run it.
   - `company_research/*/scripts/run.py` are the canonical runners.
