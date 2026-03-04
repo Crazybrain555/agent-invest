@@ -59,6 +59,11 @@ env_vars = [
   "no_proxy"
 ]
 
+[mcp_servers.fetch.env]
+SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt"
+REQUESTS_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+CURL_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+
 [mcp_servers.alpaca]
 command = "/home/help/mcp/servers/alpaca-mcp-server/.venv/bin/alpaca-mcp-server"
 args = ["serve"]
@@ -106,14 +111,6 @@ enabled_tools = [
   "gdelt_image_search",
   "gdelt_monitor"
 ]
-env_vars = [
-  "HTTP_PROXY",
-  "HTTPS_PROXY",
-  "NO_PROXY",
-  "http_proxy",
-  "https_proxy",
-  "no_proxy"
-]
 
 [mcp_servers.gdelt.env]
 GDELT_USER_AGENT = "yuye zhang (zhangyuye555@gmail.com) gdelt-mcp"
@@ -122,6 +119,7 @@ LOG_LEVEL = "info"
 # GDELT_API_BASE_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 # GDELT_DEFAULT_TIMESPAN = "7d"
 # GDELT_DEFAULT_MAX_RECORDS = "50"
+NODE_USE_ENV_PROXY = "1"
 
 
 
@@ -140,8 +138,6 @@ LOG_LEVEL = "info"
 #    - analyze_reddit_sentiment
 #    - comprehensive_stock_analysis
 # ------------------------------------------------------------
-
-
 [mcp_servers.trading_mcp]
 command = "/home/help/mcp/tools/node/bin/node"
 args = ["/home/help/mcp/servers/trading-mcp/dist/bootstrap.js"]
@@ -350,7 +346,7 @@ env_vars = [
 
 [mcp_servers.git]
 command = "/home/help/.venvs/mcp-git/bin/python"
-args = ["-m", "mcp_server_git", "--repository", "/mnt/d/python_project/Golden_price_prediction"]
+args = ["-m", "mcp_server_git", "--repository", "/mnt/d/python_project/my-quant-project"]
 startup_timeout_sec = 60
 tool_timeout_sec = 180
 env_vars = [
@@ -363,5 +359,10 @@ env_vars = [
 ]
 
 [mcp_servers.playwright]
-args = ["@playwright/mcp@latest"]
 command = "npx"
+args = [
+  "@playwright/mcp@latest",
+  "--executable-path",
+  "/home/help/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome",
+  "--headless"
+]
