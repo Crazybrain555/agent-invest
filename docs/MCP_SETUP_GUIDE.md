@@ -31,17 +31,17 @@
 |------|------|--------|---------|-------------|
 | `sec_edgar_mcp` | SEC EDGAR 文件检索 | Python (conda) | `pip install sec-edgar-mcp`（在 aiquantlab 环境中） | **必需** |
 | `alpaca` | Alpaca 市场数据/纸盘交易 | Python (venv) | `pip install alpaca-mcp-server` 或 clone 后 `pip install -e .` | **必需** |
-| `trading_mcp` | Finviz 股票筛选/基本面指标 | Node.js | clone [trading-mcp](https://github.com/...) → `npm install && npm run build` | **必需** |
-| `yfinance` | Yahoo Finance 数据 | Python (uv) | clone [yahoo-finance-mcp](https://github.com/...) → `uv sync` | **必需** |
+| `trading_mcp` | Finviz 股票筛选/基本面指标 | Node.js | clone [trading-mcp](https://github.com/netanelavr/trading-mcp) → `npm install && npm run build` | **必需** |
+| `yfinance` | Yahoo Finance 数据 | Python (uv) | clone [yahoo-finance-mcp](https://github.com/Alex2Yang97/yahoo-finance-mcp) → `uv sync` | **必需** |
 | `fs` | MCP 文件系统访问 | Node.js (npx) | 无需安装，`npx -y @modelcontextprotocol/server-filesystem <路径>` | **必需** |
 | `context7` | 库文档实时查询 | HTTP | 无需安装，直接连 `https://mcp.context7.com/mcp` | 可选 |
 | `fetch` | 通用网页抓取 | Python (venv) | `pip install mcp-server-fetch` | 可选 |
-| `rss` | RSS 新闻订阅 | Node.js | clone [rss-mcp](https://github.com/...) → `npm install && npm run build` | 可选 |
-| `gdelt` | GDELT 全球新闻/事件 | Node.js | clone [GDELT-mcp](https://github.com/...) → `npm install && npm run build` | 可选 |
+| `rss` | RSS 新闻订阅 | Node.js | clone [rss-mcp](https://github.com/veithly/rss-mcp) → `npm install && npm run build` | 可选 |
+| `gdelt` | GDELT 全球新闻/事件 | Node.js | clone [GDELT-mcp](https://github.com/anysiteio/GDELT-mcp) → `npm install && npm run build` | 可选 |
 | `search` | DuckDuckGo 搜索 | Python (venv) | `pip install mcp-search-server` | 可选 |
-| `openalex` | OpenAlex 学术论文 | Node.js | clone [openalex-research-mcp](https://github.com/...) → `npm install && npm run build` | 可选 |
+| `openalex` | OpenAlex 学术论文 | Node.js | clone [openalex-research-mcp](https://github.com/oksure/openalex-research-mcp) → `npm install && npm run build` | 可选 |
 | `crossref` | Crossref 文献 DOI | Node.js (npx) | 无需安装，`npx -y @botanicastudios/crossref-mcp` | 可选 |
-| `pubmed` | PubMed 医学文献 | Python (venv) | clone [pubmed-mcp](https://github.com/...) → `pip install -r requirements.txt` | 可选 |
+| `pubmed` | PubMed 医学文献 | Python (venv) | clone [PubMed-MCP-Server](https://github.com/JackKuo666/PubMed-MCP-Server) → `pip install -r requirements.txt` | 可选 |
 | `arxiv` | arXiv 论文检索 | Python (uv) | `uv tool install arxiv-mcp-server` | 可选 |
 | `github` | GitHub API | Node.js (npx) | 无需安装，`npx -y @modelcontextprotocol/server-github` | 可选 |
 | `git` | 本地 Git 操作 | Python (venv) | `pip install mcp-server-git` | 可选 |
@@ -130,12 +130,12 @@ cd alpaca-mcp-server && pip install -e .
 
 # trading_mcp
 cd ~/mcp/servers
-git clone <trading-mcp-repo>
+git clone https://github.com/netanelavr/trading-mcp.git
 cd trading-mcp && npm install && npm run build
 
 # yfinance
 cd ~/mcp/servers
-git clone <yahoo-finance-mcp-repo>
+git clone https://github.com/Alex2Yang97/yahoo-finance-mcp.git
 cd yahoo-finance-mcp && uv sync
 
 # fs — 无需安装，npx 自动拉取
@@ -155,6 +155,9 @@ cd yahoo-finance-mcp && uv sync
 | `/home/help/.venvs/<name>/bin/...` | 你的 venv 路径 |
 | `/home/help/mcp/work` | 技能链输出目录（fs MCP 的 allowed dir） |
 | `/home/help/mcp/data/arxiv_papers` | arXiv 论文缓存目录 |
+| `/home/help/.local/bin/arxiv-mcp-server` | arxiv 可执行文件（`uv tool install` 安装位置） |
+| `/home/help/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome` | Playwright Chromium 路径（版本号会变，用 `ls ~/.cache/ms-playwright/` 查找） |
+| `/mnt/d/python_project/my-quant-project` | git MCP 的 `--repository` 参数（改为你的项目路径） |
 
 **修改哪个文件取决于你用哪个 agent：**
 - Claude Code → 改 `.mcp.json` + 全局 `~/.claude/settings.json`

@@ -111,6 +111,14 @@ enabled_tools = [
   "gdelt_image_search",
   "gdelt_monitor"
 ]
+env_vars = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+]
 
 [mcp_servers.gdelt.env]
 GDELT_USER_AGENT = "yuye zhang (zhangyuye555@gmail.com) gdelt-mcp"
@@ -359,7 +367,7 @@ env_vars = [
 ]
 
 [mcp_servers.playwright]
-command = "npx"
+command = "/home/help/mcp/tools/bin/npx"
 args = [
   "@playwright/mcp@latest",
   "--executable-path",
