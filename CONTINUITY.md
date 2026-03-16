@@ -1,55 +1,70 @@
 Goal (incl. success criteria):
-- Strengthen `CLAUDE.md` + `AGENTS.md` so agents stop assuming a full AIQuantLab codebase and instead follow this repo's Phase 1 skills workflow.
-- Success = `CLAUDE.md` contains only real repo structure/commands; documents `/home/help/mcp/work/company_research/company/{TICKER}/...` outputs and `raw/current/runs` invariants; adds a self-evolving doc rule (propose writing corrections back); optional Claude Code project commands/hooks added.
+- Verify Claude-side fixes are correctly landed:
+  - `.codex/config.toml` gdelt proxy passthrough + playwright absolute npx
+  - `docs/MCP_SETUP_GUIDE.md` real clone URLs + missing path rows
+- Re-run full MCP smoke validation and report deterministic results.
 
 Constraints/Assumptions:
-- approval_policy=never; sandbox_mode=danger-full-access; network_access=enabled.
-- Follow AGENTS.md continuity rules; keep this ledger concise.
-- Prefer in-repo patterns; avoid ad-hoc dependency installs.
-- UTF-8 for file I/O.
-- Docs: English-first for agent compatibility; keep key path notes in Chinese where helpful.
+- Keep scope focused on MCP startup/config only.
+- Global config edits are allowed (user explicitly requested earlier).
+- Prefer official OpenAI/Codex documentation for format updates.
 
 Key decisions:
-- XBRL ownership: Skill2 (or a dedicated downloader module) downloads and materializes as-filed XBRL into `raw/sec/{accession}/xbrl/`; Skill3 consumes local XBRL to build `current/xbrl_atlas/`.
-- `sec_edgar_mcp.get_filing_content` is acceptable for quick/normalized text, but not canonical (can truncate); canonical persistence is via Archives artifacts.
-- Use `index.json` to enumerate artifacts; do not rely on `*-xbrl.zip` alone (zip may omit files like `*_htm.xml` and `FilingSummary.xml`).
-- iXBRL nuance: instance file may be `*_htm.xml` and may not share the schema stem (e.g., JD).
-- Exhibits DocType must be parsed from `{accession}-index.html`; `index.json` does not include DocType.
-- Claude Code: custom project slash commands can live in `.claude/commands/*.md`, and hooks can live in `.claude/settings.json` (both are optional; this repo is not versioning them yet).
+- Use project file `.codex/config.toml` as source-of-truth for this validation run.
+- Treat "success" as practical callability (not just `enabled` listing).
+- Keep `fs` rooted at `/home/help/mcp/work` (runtime output invariant), not repo root.
 
 State:
-- Docs updated: `CLAUDE.md` now reflects the skills-only Phase 1 repo; `AGENTS.md` clarifies doc roles + runtime output invariants; optional Claude Code project commands/hooks scaffold added under `.claude/`.
+- Completed.
 
 Done:
-- Added `SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md`.
-- Updated `SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md` to the “recommended route” (Skill2/downloader owns as-filed materialization; Skill3 consumes local XBRL).
-- Updated `stock_skills_buildplan_v2.md` to remove `download_xbrl` + all `v0.*` wording; codified `raw/sec/{accession}/xbrl/` as extracted as-filed file set (no zip retention).
-- Updated `Phase 1 核心估值链 Codex Skills 实施指南.md` to remove `download_xbrl` + all `v0.*` wording; rewrote Skill3 guidance to primary as-filed parsing + optional fallback.
-- Added `_sec_downloads/materialize_company_samples.py`; fixed JD iXBRL instance discovery (`*_htm.xml`); default no longer downloads `*-xbrl.zip`.
-- Extended sample downloader to auto-resolve tickers → latest XBRL filings via `company_tickers.json` + submissions JSON; adds on-disk XBRL validation summary.
-- Ran broader sampling (Canada/Europe/South America/small caps) and validated XBRL instance+schema presence for all samples.
-- Updated docs to include `40-F` (MJDS/Canada) and note that some `6-K` carry iXBRL.
-- Rebuilt `_sec_downloads/company/` and re-sampled multiple regions/sizes; regenerated `_sec_downloads/sections_exhibits_summary.yaml`.
-- Fixed regex escaping in section extraction; switched to longest-match + min-length threshold to avoid TOC/Part-II overlaps (notably 10-Q Item 2).
-- Added 6-K/other fallback headings for MD&A-like sections.
-- Exhibits download now captures all `EX-*` except `EX-101.*` using DocType from `{accession}-index.html`.
-- Verified sections extraction works on AAPL 10-K/10-Q, ASML/BABA/JD 20-F, and AZN 6-K; exhibits are populated when EX-* exist.
-- Updated `SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md`, `stock_skills_buildplan_v2.md`, and `Phase 1 核心估值链 Codex Skills 实施指南.md` to reflect DocType parsing, full EX-* capture, and improved sections logic.
-- Rewrote `CLAUDE.md` to remove non-existent full-codebase layout/commands and document the Phase 1 skills workflow + output invariants.
-- Updated `AGENTS.md` to add doc roles, runtime output directory invariants, and self-evolving docs rules.
-- Decided to **defer** versioning `.claude/commands/` and `.claude/settings.json` until the 5 skills stabilize.
+- Added user-provided GitHub PAT to local shell startup files (non-repo):
+  - `/home/help/.bashrc`
+  - `/home/help/.profile`
+  - Also set `GITHUB_HOST=github.com`.
+- Verified PAT validity directly via GitHub API:
+  - Authenticated `GET /rate_limit` returns `200`.
+  - Private repo `Crazybrain555/my-quant-project`: unauthenticated `404`, authenticated `200`.
+- Verified GitHub MCP works in a fresh Claude process:
+  - `claude -p` could read private repo `README.md` via github MCP and returned `PASS`.
+- Re-tested both target MCP tools in current Codex session:
+  - `github/search_repositories` for `owner:Crazybrain555` returns repositories successfully.
+  - `gdelt/gdelt_search_articles` returns news results successfully.
+- Ran full 17-server smoke validation in current Codex session:
+  - PASS: `context7`, `sec_edgar_mcp`, `fs`, `fetch`, `alpaca`, `rss`, `gdelt`, `trading_mcp`, `search`, `openalex`, `crossref`, `pubmed`, `arxiv`, `yfinance`, `github`, `git`, `playwright`.
+  - GitHub private repo read (`get_file_contents` on `Crazybrain555/my-quant-project`) also passed.
+- Cleaned accidental config pollution caused by an interrupted bulk edit:
+  - Removed stray root-level `HTTP_PROXY/HTTPS_PROXY/NO_PROXY/...` keys from:
+    - `.codex/config.toml`
+    - `/home/help/.codex/config.toml`
+  - Re-validated TOML parsing for both files.
+- Confirmed `docs/MCP_SETUP_GUIDE.md` already contains troubleshooting sections for:
+  - GDELT connectivity diagnosis and HTTP/HTTPS fallback.
+  - GitHub `Bad credentials` + WSL/PowerShell environment inheritance notes.
+- Updated `docs/MCP_SETUP_GUIDE.md` with a new full validation section:
+  - Added `## 8. 全量 MCP 冒烟验收模板（17 项）`
+  - Included per-server minimal call + pass criteria + note on sibling tool-call cascading errors.
+- Re-verified user-mentioned fix points:
+  - `.codex/config.toml` gdelt has `env_vars` proxy passthrough (HTTP/HTTPS/NO_PROXY + lowercase).
+  - `.codex/config.toml` playwright uses absolute `/home/help/mcp/tools/bin/npx` (not bare `npx`).
+  - `docs/MCP_SETUP_GUIDE.md` MCP table now uses real GitHub URLs for trading/yfinance/rss/gdelt/openalex/pubmed.
+  - `docs/MCP_SETUP_GUIDE.md` path table includes arxiv binary path, playwright chromium path, and git `--repository` path.
+- Re-ran full MCP smoke checks in current session: all 17 passed.
+  - Confirmed GitHub private repo read via `github/get_file_contents` on `Crazybrain555/my-quant-project`.
 
 Now:
-- Validate behavior in Claude Code: run `/init` and confirm it no longer assumes a full AIQuantLab codebase.
+- Report final verification results to user.
 
 Next:
-- If `/init` proposes improvements: apply minimal diffs to `CLAUDE.md`/`AGENTS.md` and keep them consistent with `Phase 1 核心估值链 Codex Skills 实施指南.md`.
-
-Open questions (UNCONFIRMED if needed):
 - None.
 
+Open questions (UNCONFIRMED if needed):
+- UNCONFIRMED: long-term stability of GDELT endpoint behavior (network/egress conditions can vary by time and proxy exit).
+
 Working set (files/ids/commands):
+- `.mcp.json`
+- `.codex/config.toml`
+- `/home/help/.claude/settings.json`
+- `/home/help/.bashrc`
+- `/home/help/.profile`
 - `CONTINUITY.md`
-- `CLAUDE.md`
-- `AGENTS.md`
-- `.claude/settings.local.json`

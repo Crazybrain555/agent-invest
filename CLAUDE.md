@@ -1,12 +1,12 @@
-# CLAUDE.md - Claude Code Agent Guide (Phase 1 Skills Repo)
+# CLAUDE.md - Claude Code Agent Guide (Skills Repo)
 
-**Last Updated:** 2026-02-07
-**Scope:** This repository is a **skills-only** Phase 1 company research/valuation pipeline (not the full AIQuantLab codebase).
+**Last Updated:** 2026-03-15
+**Scope:** This repository is a **skills-only** company research/valuation pipeline (not the full AIQuantLab codebase).
 
 This file is optimized for Claude Code (and other coding agents). It records agent-critical truth:
-repo reality, where outputs go, and how to run the Phase 1 skill chain safely.
+repo reality, where outputs go, and how to run the skill chain safely.
 
-If anything here conflicts with the filesystem or with `Phase 1 核心估值链 Codex Skills 实施指南.md`,
+If anything here conflicts with the filesystem or with `docs/MASTER_PLAN.md`,
 the **real repo structure / real commands win**.
 
 ---
@@ -42,7 +42,7 @@ These are behavioral constraints for Claude Code sessions in this repo:
 
 ## 2) Repo Reality (actual structure)
 
-This repo is intentionally trimmed and centered around Phase 1 skills + a shared runtime.
+This repo is intentionally trimmed and centered around skills + a shared runtime.
 Do not assume `src/`, schedulers, data pipelines, or other AIQuantLab production code exists here.
 
 Primary working areas:
@@ -53,11 +53,12 @@ Primary working areas:
 - `company_research_runtime/`: shared runtime utilities used by skills (do not delete).
 - `_sec_downloads/`: sample SEC download/materialization utilities and specimens (if present).
 - `.mcp.json`: Claude Code 项目级 MCP 声明（路径为当前开发机布局，迁移时需调整）。
-- Root docs (source of truth for Phase 1 workflow):
-  - `Phase 1 核心估值链 Codex Skills 实施指南.md`
-  - `stock_skills_buildplan_v2.md`
-  - `SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md`
+- Docs (source of truth for workflow):
+  - `docs/MASTER_PLAN.md` (architecture, protocols, shared schemas)
+  - `docs/skills/` (per-skill specifications + README index)
+  - `docs/references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md`
   - `AGENTS.md` (cross-agent invariants)
+  - `docs/archive/` (Phase 1 implementation guide, early notes — for reference only)
 
 ---
 
@@ -96,7 +97,7 @@ Minimal shape (not exhaustive):
 
 ---
 
-## 4) Phase 1 Skill Chain (canonical order + commands)
+## 4) Skill Chain (canonical order + commands)
 
 Canonical execution order:
 1. `company-foundation`
@@ -138,8 +139,9 @@ If a skill is blocked, it should write `runs/{run_id}/needs.yaml` and point to t
 Prefer explicitly attaching the most relevant sources instead of describing them:
 - `@CONTINUITY.md`
 - `@AGENTS.md`
-- `@Phase 1 核心估值链 Codex Skills 实施指南.md`
-- `@SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md`
+- `@docs/MASTER_PLAN.md`
+- `@docs/skills/<skill-doc>.md`
+- `@docs/references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md`
 - `@.codex/skills/company_research/<skill>/SKILL.md`
 - `@company_research_runtime/`
 
@@ -194,6 +196,8 @@ For large tasks, prefer parallel sessions in separate worktrees to avoid cross-t
 
 - `AGENTS.md` (cross-agent invariants and safe editing rules)
 - `CONTINUITY.md` (canonical session ledger)
-- `Phase 1 核心估值链 Codex Skills 实施指南.md` (Phase 1 end-to-end workflow)
-- `stock_skills_buildplan_v2.md` (planning notes)
-- `SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md` (SEC/XBRL artifact handling specifics)
+- `docs/MASTER_PLAN.md` (architecture, execution protocol, shared schemas)
+- `docs/skills/README.md` (skills overview index + implementation status)
+- `docs/skills/skill*.md` (per-skill specifications)
+- `docs/references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md` (SEC/XBRL artifact handling specifics)
+- `docs/archive/Phase_1_implementation_guide.md` (archived Phase 1 guide — for reference)

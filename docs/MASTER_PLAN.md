@@ -1,8 +1,17 @@
-# 公司研究 Skills 体系规划 v2
+# 公司研究 Skills 体系总规划
 
 > **核心公式：估值 = 利润 × 质量系数**
 >
 > 一切分析围绕两个因素展开：**未来可持续的经济利润（Owner Earnings）** 和 **对这个利润的确定性系数（Quality Coefficient）**
+
+---
+
+## 文档索引
+
+- **Skills 总览与实施状态**：[docs/skills/README.md](skills/README.md)
+- **Per-skill 详细规格**：[docs/skills/](skills/)
+- **SEC/XBRL 技术参考**：[docs/references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md](references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md)
+- **MCP 配置指南**：[docs/MCP_SETUP_GUIDE.md](MCP_SETUP_GUIDE.md)
 
 ---
 
@@ -45,8 +54,6 @@
 - 发现缺口时写 `needs.yaml`，由编排器决定下一步跑哪个 Skill
 
 ### 2.3 三层数据架构（raw / events / current）
-
-> 这是 v2 的核心架构升级。
 
 1. **raw 只做"证据镜像"**：保存 SEC 给你的原件集合（尽量保留原文件名），加上我们自己的 `meta.yaml` / `manifest.yaml` / `index.*` / `submission.txt`，做到可追溯可复现；raw 里绝不出现研究拆解（sections/canon 文本/表格抽取结果）。
 2. **events 是未来数据库化的核心层**：以"事件"为主键（event_id），统一做分类（taxonomy）与清洗归档（canonical buckets）。下游 skills 只消费 events，不再直接读 raw 的复杂结构。
@@ -299,12 +306,6 @@ priority: high
 约束：
 - 仅出现 `presentation / outlook / guidance` **不能**单独判为财报事件；只能作为已判为财报事件后的附带材料
 
-#### 验收用例（6-K 分类）
-
-- **季度/半年业绩材料（应归入 financial_report）**：标题/附件描述同时出现"期间口径"与"财务结果/报表"，且常伴随 exhibits 99.*
-- **非财报事项（应归入其他 taxonomy 类别）**：例如 monthly return、股本变动/治理/合规披露等
-- **"presentation/guidance" 不能单独触发 financial_report**：如果仅出现 deck/指引更新但没有明确期间口径/中期报表信号，应归入 `earnings_release_guidance` 或 `other_material`
-
 ---
 
 ## 六、Canonical Content Buckets（16 个）
@@ -339,10 +340,6 @@ priority: high
 Skill2 必须先做：构建"source document catalog"（每个事件都一样），来自 raw 的 `meta.yaml: documents[]`：
 - 包含每个原始文件：filename、doc_type、description、category
 - 然后按 bucket 的需求做"选择 + 抽取"
-
-这会自然覆盖：
-- AAPL 10-K：primary doc 就是主体
-- SNDL 40-F：primary doc 可能是"外壳"，但 EX-99.2（FS）、EX-99.3（MD&A）会被 bucket 规则选中
 
 #### 6.1.2 财报事件 Bucket 映射规则
 
@@ -432,7 +429,7 @@ cik: "0000950170"
 ticker: "SNDL"
 form: "40-F"
 filed_at: "2025-03-28"
-report_date: "2024-12-31"          # 若 SEC 可提供；否则 null
+report_date: "2024-12-31"
 primary_document:
   filename: "sndl-20241231.htm"
   doc_type: "40-F"
@@ -447,22 +444,7 @@ documents:
     doc_type: "EX-99.2"
     description: "Financial Statements"
     category: "exhibits"
-  - filename: "sndl-ex99_3.htm"
-    doc_type: "EX-99.3"
-    description: "Management's Discussion and Analysis"
-    category: "exhibits"
-  - filename: "sndl-20241231_htm.xml"
-    doc_type: "XML"
-    description: "XBRL INSTANCE DOCUMENT"
-    category: "xbrl"
-  - filename: "sndl-20241231.xsd"
-    doc_type: "EX-101.SCH"
-    description: "XBRL TAXONOMY EXTENSION SCHEMA"
-    category: "xbrl"
-  - filename: "FilingSummary.xml"
-    doc_type: "XML"
-    description: "Filing Summary"
-    category: "xbrl"
+  # ...
 
 xbrl:
   has_xbrl: true
@@ -482,24 +464,20 @@ source:
 downloaded_at: "2026-03-01T12:34:56-05:00"
 files:
   index/index.json: {bytes: 1234, sha256: "...", url: ".../index.json"}
-  index/0000950170-25-040545-index.html: {bytes: 5678, sha256: "...", url: "...-index.html"}
-  submission/0000950170-25-040545.txt: {bytes: 9012, sha256: "...", url: ".../0000950170-25-040545.txt"}
-  documents/sndl-20241231.htm: {bytes: ..., sha256: "...", url: ".../sndl-20241231.htm"}
-  exhibits/sndl-ex99_2.htm: {bytes: ..., sha256: "...", url: ".../sndl-ex99_2.htm"}
-  xbrl/sndl-20241231_htm.xml: {bytes: ..., sha256: "...", url: ".../sndl-20241231_htm.xml"}
+  # ...
 completeness:
   has_index_json: true
   has_filing_index_html: true
   has_submission_txt: true
   has_primary_document: true
-  has_xbrl_package: true          # 对 has_xbrl=true 的 filing 必须为 true
+  has_xbrl_package: true
 ```
 
 ### 7.5 events/sec/ingest_state.yaml
 
 ```yaml
 as_of: "2026-01-14"
-issuer_type: "fpi"                     # domestic | fpi
+issuer_type: "fpi"
 sixk_classifier_version: "strict_period_and_results"
 vmf_version: "standard"
 window:
@@ -517,10 +495,8 @@ totals:
   financial_report_events: 42
 ```
 
-### 7.6 events/sec/filings_index.parquet
+### 7.6 filings_index.parquet Schema
 
-```
-Column Schema:
 | 字段名 | 类型 | Nullable | 说明 |
 |--------|------|----------|------|
 | accession | string | N | SEC accession number（primary key） |
@@ -532,50 +508,34 @@ Column Schema:
 | primary_doc | string | N | 主文档原始文件名 |
 | filing_url | string | N | SEC 原始 URL |
 | local_dir | string | N | raw 本地目录相对路径 |
-| event_id | string | Y | 关联的 event_id（可能后续分配） |
+| event_id | string | Y | 关联的 event_id |
 | bucket | string | N | periodic_core / event_stream |
 | sixk_class | string | Y | interim_results / other_event（非6-K为空） |
-| sixk_reasons | list[string] | Y | 6-K 分类命中原因 |
-| is_event_stream | bool | N | 是否事件流 |
 | vmf_triggered | bool | Y | 是否通过 VMF |
-| vmf_hard_triggered | bool | Y | 是否硬触发 |
-| vmf_reasons | list[string] | Y | 触发原因列表 |
 | vmf_score | int32 | Y | VMF 打分 |
 | items | list[string] | Y | 8-K items |
 | downloaded | bool | N | 是否已下载 |
-| download_level | string | N | metadata_only / primary / primary_plus_exhibits |
-| source | string | N | 元数据来源 |
-```
 
-### 7.7 events/sec/events_index.parquet
+### 7.7 events_index.parquet Schema
 
-```
-Column Schema:
 | 字段名 | 类型 | Nullable | 说明 |
 |--------|------|----------|------|
-| event_id | string | N | 事件主键（文件系统安全字符） |
+| event_id | string | N | 事件主键 |
 | ticker | string | N | 股票 |
 | source | string | N | 固定 sec_edgar |
 | category | string | N | taxonomy 主类 |
 | subtype | string | Y | 表单/子类 |
-| issuer_type | string | Y | domestic/fpi/unknown |
-| occurred_at | date32 | Y | 财报事件=period_end；其他事件=filed_at |
+| occurred_at | date32 | Y | 事件日期 |
 | filed_at | date32 | Y | SEC filed date |
 | period_end | date32 | Y | 财报事件必须 |
-| fiscal_period | string | Y | FY/Q1/Q2/Q3/Q4/H1/H2/unknown |
+| fiscal_period | string | Y | FY/Q1/Q2/Q3/Q4/H1/H2 |
 | primary_accession | string | Y | 主 accession |
 | accessions | list[string] | Y | 关联 filings 列表 |
-| forms | list[string] | Y | 对应 forms |
-| raw_manifest_ref | string | Y | 指向 raw manifest.yaml |
-| tags | list[string] | Y | 标签 |
-| importance_hint | float32 | Y | 0~1 |
-| buckets_present | list[string] | Y | 本事件已产出的 buckets |
-| buckets_digest_json | string | Y | JSON：bucket -> {sha256, status} |
+| buckets_present | list[string] | Y | 已产出的 buckets |
 | status_rollup | string | N | ok/partial/blocked/error/skipped |
-| updated_at | timestamp[us, tz=UTC] | N | 事件索引更新时间 |
-```
+| updated_at | timestamp[us, tz=UTC] | N | 更新时间 |
 
-### 7.8 events/sec/events/{event_id}/event.yaml
+### 7.8 event.yaml
 
 ```yaml
 event_id: "sec_fr_2024-12-31_FY"
@@ -584,10 +544,8 @@ source: "sec_edgar"
 category: "financial_report"
 subtype: "40-F"
 issuer_type: "fpi"
-
 occurred_at: "2024-12-31"
 filed_at: "2025-03-28"
-
 period_end: "2024-12-31"
 fiscal_period: "FY"
 fiscal_year_end: "12-31"
@@ -597,24 +555,6 @@ primary_filing:
   form: "40-F"
   raw_dir: "raw/sec/accessions/0000950170-25-040545"
 related_filings: []
-
-raw_refs:
-  - accession: "0000950170-25-040545"
-    filing_index_html: "raw/sec/accessions/.../index/0000950170-25-040545-index.html"
-    submission_txt: "raw/sec/accessions/.../submission/0000950170-25-040545.txt"
-    primary_document:
-      filename: "sndl-20241231.htm"
-      path: "raw/sec/accessions/.../documents/sndl-20241231.htm"
-      sha256: "..."
-    selected_materials:
-      - role: "financial_statements"
-        filename: "sndl-ex99_2.htm"
-        path: "raw/sec/accessions/.../exhibits/sndl-ex99_2.htm"
-        sha256: "..."
-      - role: "mdna"
-        filename: "sndl-ex99_3.htm"
-        path: "raw/sec/accessions/.../exhibits/sndl-ex99_3.htm"
-        sha256: "..."
 
 tags: ["mjds", "ex99_fs", "ex99_mdna"]
 importance_hint: 0.8
@@ -690,7 +630,6 @@ as_of: 2026-01-04
 market:
   price: 12.34
   shares_outstanding: 100000000
-  shares_float: 80000000
   market_cap: 1234000000
   enterprise_value: 1500000000
 
@@ -702,18 +641,11 @@ profit:
   invested_capital: 1200000000
   roic: 0.175
   fcf: 160000000
-  maintenance_capex_estimate: 60000000
 
 quality:
   coefficient_base: 0.72
-  implied_multiple_base: 14.0
   advantage_period_years: 8
   discount_rate_base: 0.105
-  components:
-    financial_quality: 0..5
-    moat: 0..5
-    governance_capital_allocation: 0..5
-    balance_sheet_resilience: 0..5
   confidence: 0..1
 
 valuation:
@@ -722,597 +654,63 @@ valuation:
     base: 20.0
     bull: 30.0
   margin_of_safety_base: 0.62
-  sensitivity_keys:
-    - discount_rate
-    - advantage_period_years
-    - owner_earnings_margin
-    - reinvestment_rate
-
-audit:
-  key_challenges_count: 7
-  open_questions_count: 12
 
 links:
   memo: "current/outputs/investment_memo.md"
   valuation_yaml: "current/analytics/valuation/valuation.yaml"
-  audit_yaml: "current/analytics/diagnostics/audit.yaml"
   evidence_jsonl: "current/analytics/evidence/evidence.jsonl"
 ```
 
 ### 7.12 questions.jsonl / evidence.jsonl
 
-路径：`current/gaps/questions.jsonl`、`current/analytics/evidence/evidence.jsonl`
-
 ```json
-{"id":"Q_20260105_001","created_at":"2026-01-05","skill":"moat-inferencer","priority":"high","question":"客户集中度是否来自单一合同？续约条款是什么？","status":"open","related_artifacts":["current/analytics/diagnostics/moat.yaml"],"notes":""}
+{"id":"Q_20260105_001","skill":"moat-inferencer","priority":"high","question":"客户集中度是否来自单一合同？","status":"open"}
 ```
 
 ```json
-{"id":"E_20260105_010","created_at":"2026-01-05","skill":"profit-quality-and-risk","claim":"应收增长显著快于收入，但主要来自并购并表","confidence":0.6,"sources":[{"type":"sec","accession":"...","event_id":"sec_fr_2024-12-31_FY","anchor":"MD&A"},{"type":"data","path":"current/analysis_data/economic/core_metrics.parquet","fields":["revenue","ar"]}]}
+{"id":"E_20260105_010","skill":"profit-quality-and-risk","claim":"应收增长显著快于收入","confidence":0.6,"sources":[{"type":"sec","accession":"...","event_id":"..."}]}
 ```
 
 ---
 
-## 八、九个 Skills 总览
+## 八、SEC 下载策略：VMF（Valuation Materiality Filter）
 
-> 注：本 v2 规划目标是 9 个 Skills；Phase 1 实现 5 个（其余为 roadmap）。
+### 8.1 发行人类型识别（Domestic vs FPI）
 
-| # | Skill | 状态 | 职责 | 对"利润×质量"贡献 |
-|---|-------|------|------|------------------|
-| 1 | `company-foundation` | 已实现 | 身份 + 市场口径（含 shares） | 估值分母/每股化基座 |
-| 2 | `sec-ingest-and-materialize-events` | 重构中 | raw ingest + events materialize（含财报 buckets） | 证据池 + 事件数据库 |
-| 3 | `xbrl-parse-financial-report-events` | 重构中 | per-event XBRL 解析 + 全局 atlas | 利润事实底座 |
-| 4 | `recast-economic-statements` | 已实现 | 经济三表 + 核心指标 | Owner Earnings / ROIC |
-| 5 | `profit-quality-and-risk` | 规划中 | 财报质量/操纵风险/利润可持续性 | 质量系数与情景下界 |
-| 6 | `growth-driver-explorer` | 规划中 | 增长来源与 ROIIC/生命周期 | 未来利润路径 |
-| 7 | `moat-inferencer` | 规划中 | 护城河 → 优势期 → 质量系数映射 | 质量系数主体 |
-| 8 | `valuation-and-margin-of-safety` | 已实现 | 估值区间 + MOS + 敏感性 | 输出 IV vs 市场 |
-| 9 | `cross-examination-audit` | 规划中 | 反问审计：找矛盾/遗漏/为什么便宜 | 提高确定性，防大错 |
-
----
-
-## 九、Skill 详细规格
-
----
-
-### Skill 1: `company-foundation`
-
-> 合并：init-company-dossier + resolve-company-identity + update-market-snapshot
-
-**职责边界**
-
-- 初始化目录（如不存在）
-- 解析 ticker → CIK/公司名/交易所等身份信息
-- 拉取 market snapshot（price、shares outstanding、float、EV 等）
-- **查漏补缺**：已有且新 → 跳过
-
-**输入参数**
-
-| 参数 | 类型 | 必需 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `ticker` | string | Y | - | 股票代码 |
-| `as_of` | date | - | 当天 | 数据截止日 |
-| `force_refresh` | bool | - | false | 强制刷新 |
-
-**Hard 依赖**
-
-- 无（这是链条起点）
-
-**输出**
-
-- `company/{ticker}/company.yaml`
-- `company/{ticker}/current/analysis_data/market_snapshot.yaml`
-- `company/{ticker}/current/gaps/artifacts_state.yaml`（更新）
-- `runs/{run_id}/meta.yaml`, `result.yaml`
-
-**内部步骤**
-
-1. 确保目录树存在（raw/events/current/runs + current 子目录）
-2. 身份解析：SEC CIK、公司名、FY end、货币等
-3. 市场口径：
-   - `alpaca` 优先提供 `price`
-   - shares / market cap / EV：优先 trading_mcp/SEC，其次 Yahoo 兜底
-   - `market_cap` 默认用来源值，并用 `price * shares_outstanding` 交叉验证
-   - `enterprise_value` 以 USD 输出
-4. 写 evidence（身份来源、市场数据来源）
-
-**查漏补缺规则**
-
-- identity：若 `company.yaml` 已有 cik 且未 `force_refresh` → `skipped`
-- market_snapshot：若 `as_of` 相同且文件存在且字段齐全 → `skipped`
-
-**blocked 条件**
-
-- 只有在"外部源完全不可用导致无法生成最小 company.yaml/market_snapshot.yaml"才 `blocked`
-
----
-
-### Skill 2: `sec-ingest-and-materialize-events`
-
-> **替代旧 Skill2 `collect-company-facts`**：raw ingest + events materialize
-
-**职责边界（严格）**
-
-- 下载/落盘 raw as-filed（不做投研拆解）
-- 解析 filing index page（{accession}-index.html）建立 doc map
-- 构建 filing 索引（events/sec/filings_index.parquet）与 event 索引（events/sec/events_index.parquet）
-- **对每个 event 做 canonical buckets 归档**：
-  - 财报事件：bucket 要尽可能完整（mdna/risk/business/notes/...）
-  - 非财报事件：框架统一，内容允许渐进补齐
-- 只做 **轻量** XBRL 发现与完整性校验（记录 instance/xsd/linkbases 是否存在），不做事实级解析
-
-**输入参数**
-
-| 参数 | 类型 | 必需 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `ticker` | string | Y | - | 股票代码 |
-| `as_of` | date | - | today | 窗口终点 |
-| `lookback_years` | int | - | 10 | init 回溯 |
-| `overlap_days` | int | - | 2 | maintenance overlap |
-| `force_refresh` | bool | - | false | 强制重建索引/重下 |
-| `download_policy` | enum | - | `periodic_full__events_vmf` | 周期性全量；事件按 VMF/预算 |
-
-**Hard 依赖**
-
-- `company/{TICKER}/company.yaml`（必须有 `cik`、`fiscal_year_end`）
-
-**输出（必须）**
-
-- raw：`raw/sec/accessions/{accession}/...`
-- events：
-  - `events/sec/ingest_state.yaml`
-  - `events/sec/filings_index.parquet`
-  - `events/sec/events_index.parquet`
-  - `events/sec/events/{event_id}/event.yaml`
-  - `events/sec/events/{event_id}/{bucket}/...`（至少 event_overview + exhibits_index；财报事件做完整）
-- current/gaps：确保存在 `current/gaps/*`（可为空但文件要存在）
-
-**模式判断逻辑**
-
-```python
-filings_parquet_path = events_sec_dir / "filings_index.parquet"
-if not filings_parquet_path.exists() or force_refresh:
-    mode = "init"
-    fetch_start = as_of - timedelta(days=lookback_years * 365)
-else:
-    mode = "maintenance"
-    existing_df = pd.read_parquet(filings_parquet_path)
-    last_filed_at = existing_df["filed_at"].max()
-    fetch_start = last_filed_at - timedelta(days=overlap_days)
-
-fetch_end = as_of
-sec_days = (fetch_end - fetch_start).days + 1
-```
-
-**内部步骤（概要）**
-
-1. **Step 0 - 初始化 + 身份检查**
-   - 确保 ticker 目录结构存在
-   - 加载 `company.yaml` 并验证 `cik`
-   - 判断 `issuer_type`（domestic vs fpi）
-
-2. **Step 1 - SEC raw ingest**
-   - 确定运行模式（init/maintenance）
-   - 获取周期性核心 filings（含 FPI 6-K-Interim）
-   - 获取事件流（Domestic: 8-K；FPI: 6-K-Event）
-   - 对每个 accession：
-     - 下载 index.json、{accession}-index.html
-     - 解析 doc table → 构建 meta.yaml（documents 列表）
-     - 分类下载文件到 documents/ / exhibits/ / xbrl/ / other/
-     - 下载 submission.txt（如配置）
-     - 写 manifest.yaml
-   - VMF 筛选（仅事件流）
-
-3. **Step 2 - Event taxonomy 分类**
-   - 对每个 filing 确定 taxonomy category
-   - 对 6-K 执行 `period AND results` 严格分类
-   - 构建 event_id：
-     - 财报事件：`sec_fr_{period_end}_{fiscal_period}`
-     - 其他事件：`sec_{category_short}_{filed_at}_{accession_suffix}`
-
-4. **Step 3 - Event materialization（buckets）**
-   - 对每个事件构建 source document catalog（从 meta.yaml: documents[]）
-   - 按 bucket 映射规则抽取内容
-   - 写 event.yaml、raw_refs.json、bucket_manifest.json
-   - 写各 bucket 目录内容
-
-5. **Step 4 - 更新索引**
-   - 写 events/sec/filings_index.parquet
-   - 写 events/sec/events_index.parquet
-   - 写 events/sec/ingest_state.yaml
-   - 更新 current/gaps/artifacts_state.yaml
-
-**event_id 生成规则**
-
-```python
-def generate_event_id(category, filing):
-    if category == "financial_report":
-        period_end = filing.get("period_end") or filing.get("report_date") or filing["filed_at"]
-        fiscal_period = infer_fiscal_period(period_end, company_fye)
-        return f"sec_fr_{period_end}_{fiscal_period}"
-    else:
-        # 非财报事件：用 filed_at + accession 后6位避免碰撞
-        acc_suffix = filing["accession"].replace("-", "")[-6:]
-        cat_short = category[:8]  # 截断到8字符
-        return f"sec_{cat_short}_{filing['filed_at']}_{acc_suffix}"
-```
-
-**blocked 判定**
-
-- `company.yaml` 缺 CIK → blocked
-- SEC 拉取失败且本地无可用 filings_index.parquet → blocked
-
-**partial 判定**
-
-- 任一 accession raw 下载不完整 → partial
-- 财报事件 period_end 无法识别 → partial + 写 gap
-- buckets materialize 失败/缺关键 bucket → partial + 写 gap
-
-**result.yaml components**
-
-```yaml
-components:
-  sec_ingest:
-    mode: init|maintenance
-    window: {start: "...", end: "..."}
-    totals: {filings_fetched: 0, accessions_new: 0, accessions_downloaded: 0}
-    warnings: [...]
-    errors: [...]
-  events_materialize:
-    totals: {events_upserted: 0, financial_report_events: 0}
-    bucket_coverage: {mdna: 0.0, risk_factors: 0.0, ...}
-```
-
----
-
-### Skill 3: `xbrl-parse-financial-report-events`
-
-> **替代旧 Skill3 `extract-xbrl-timeseries`**：per-event XBRL 解析 + 全局 atlas
-
-**职责边界（严格）**
-
-- 只处理 `events/sec/events_index.parquet` 中 `category=financial_report` 的事件
-- 对每个财报事件：
-  - 从 raw_refs 定位 raw/xbrl 文件集合
-  - 深解析 XBRL/iXBRL（instance + linkbases），构建 per-event atlas
-  - 落盘到该事件对象目录：`events/sec/events/{event_id}/structured_data/xbrl_atlas/*`
-- 同时维护全局合并 atlas：`current/analysis_data/xbrl_atlas/*`
-
-**输入参数**
-
-| 参数 | 类型 | 必需 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `ticker` | string | Y | - | 股票代码 |
-| `as_of` | date | - | 当天 | 数据截止日 |
-| `lookback_years` | int | - | 10 | 回溯年数 |
-| `force_refresh` | bool | - | false | 强制刷新 |
-
-**Hard 依赖**
-
-- `events/sec/events_index.parquet`
-- 对于目标财报事件：其 `event.yaml` 与 `raw_refs` 指向的 raw/xbrl 必须存在
-- `company.yaml`（用于 fiscal_period 推断/校验）
-
-**输出**
-
-- per-event：`events/sec/events/{event_id}/structured_data/xbrl_atlas/*`
-  - `periods.yaml`、`facts.parquet`、`nodes.parquet`、`edges.parquet`、`paths.parquet`
-- global：`current/analysis_data/xbrl_atlas/*`
-  - 合并所有财报事件的 atlas 产物
-- gaps：对缺失/无法解析的事件写入 `current/gaps/missing_data.yaml`
-
-**内部步骤**
-
-1. 读取 events_index，筛选 `category=financial_report` 且窗口内的事件
-2. 对每个事件（增量模式：跳过已解析且 raw 未变化的）：
-   - 从 event.yaml 的 raw_refs 定位 raw/xbrl 文件集
-   - 识别 instance（iXBRL 常见 `*_htm.xml`；传统 `{stem}.xml`）
-   - 解析 instance facts：concept + contextRef + unitRef + decimals + value
-   - 解析 schema/linkbases：
-     - `*_pre.xml`（presentation）→ 报表树（nodes/edges + role_uri）
-     - `*_cal.xml`（calculation）→ 加总关系
-     - `*_def.xml`（definition）→ 维度/成员
-     - `*_lab.xml`（label）→ 标签
-   - 产出 per-event atlas：facts/nodes/edges/paths/periods
-3. 合并全局 atlas（append + 去重 fact_id）
-4. 更新 event.yaml 的 `parse_status.xbrl_parsed`
-
-**增量策略**
-
-- 以事件的 `lineage.raw_manifest_sha256` + `xbrl.instance_filename sha256` 作为 cache key
-- 未变化 → per-event 跳过
-- 新事件/变化事件 → 只解析增量
-- 全局 atlas 用"append + 去重（fact_id）"合并；并更新 periods.yaml
-
-**Fallback 策略**
-
-- 当本地 XBRL 缺失或解析失败时，可用 SEC "已抽取"XBRL / `sec_edgar_mcp.get_financials` 做 bootstrap
-- 必须在 result/manifest 中记录降级原因
-
-**blocked 判定**
-
-- events_index 缺失 → blocked
-- 目标窗口内财报事件全部无可解析 XBRL → blocked
-
-**partial 判定**
-
-- 部分事件 XBRL 缺失/解析失败，但至少一个事件成功 → partial（全局 atlas 仍更新可用部分）
-
----
-
-### Skill 4: `recast-economic-statements`
-
-> 三表重铸与核心指标（经济报表层）
-
-**职责边界**
-
-- 从 xbrl_atlas 出发，重铸：
-  - operating vs financing 拆分
-  - NOPAT、Invested Capital、ROIC
-  - FCF、Owner Earnings（含 maintenance capex 估计）
-- 输出"经济三表 + 指标宽表"
-- 记录重铸规则与映射（recast_policy），用于可追溯与可迭代
-
-**输入参数**
-
-| 参数 | 类型 | 必需 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `ticker` | string | Y | - | 股票代码 |
-| `as_of` | date | - | 当天 | 数据截止日 |
-| `policy_version` | string | - | "default" | 重铸策略标识 |
-| `force_refresh` | bool | - | false | 强制刷新 |
-
-**Hard 依赖**
-
-- `current/analysis_data/xbrl_atlas/nodes.parquet`
-- `current/analysis_data/xbrl_atlas/edges.parquet`
-- `current/analysis_data/xbrl_atlas/facts.parquet`
-- `current/analysis_data/xbrl_atlas/periods.yaml`
-
-**输出**
-
-- `current/analysis_data/economic/recast_policy.yaml`
-- `current/analysis_data/economic/economic_statements.parquet`
-- `current/analysis_data/economic/core_metrics.parquet`
-- evidence
-
-**核心指标输出**
-
-| 指标 | 说明 |
-|------|------|
-| `revenue` | 主营业收入 |
-| `nopat` | 税后经营利润 |
-| `invested_capital` | 投入资本 |
-| `roic` | 投入资本回报率 |
-| `cfo` | 经营现金流 |
-| `capex` | 资本支出 |
-| `maintenance_capex` | 维护性资本支出（估计） |
-| `fcf` | 自由现金流 |
-| `owner_earnings` | 股东盈余 |
-
-**查漏补缺规则**
-
-- policy_version 与输入未变 + atlas 未变 + 输出存在 → `skipped`
-- policy_version 或 atlas 更新 → 重跑
-
-**blocked 条件**
-
-- atlas 缺失/不完整到无法产出最小 economic_statements → `blocked`
-
----
-
-### Skill 5: `profit-quality-and-risk`
-
-> 基于财报，发现风险，预测未来利润
-
-**职责边界**
-
-- 基于 economic_statements/core_metrics 做：
-  - 利润质量（现金支撑、应计质量、操纵风险）
-  - 财务风险（杠杆、流动性、表外压力）
-  - 对未来 3-5 年经济利润的**风险拆解**
-- 参考框架：Sloan、Piotroski、Beneish、Dechow、Financial Shenanigans
-
-**Hard 依赖**
-
-- `current/analysis_data/economic/economic_statements.parquet`
-- `current/analysis_data/economic/core_metrics.parquet`
-- `events/sec/events_index.parquet`
-- `raw/sec/`（用于引用审计意见、会计政策、风险因素）
-
-**输出**
-
-- `current/analytics/diagnostics/profit_quality.yaml`
-- `current/analytics/diagnostics/profit_risk_forecast.yaml`
-- questions/evidence
-
-**blocked 条件**
-
-- economic/core 缺失 → `blocked`
-
----
-
-### Skill 6: `growth-driver-explorer`
-
-> 成长性进一步探索
-
-**职责边界**
-
-- 把增长拆成"能解释"的驱动：量/价/结构/地区/新产品/会计口径/并购 vs 内生
-- 输出：再投资率、ROIIC、生命周期阶段
-
-**Hard 依赖**
-
-- `current/analytics/diagnostics/profit_quality.yaml`
-- `current/analytics/diagnostics/profit_risk_forecast.yaml`
-- `events/sec/events_index.parquet`
-- `raw/sec/`
-
-**输出**
-
-- `current/analytics/diagnostics/growth_drivers.yaml`
-- questions/evidence
-
-**blocked 条件**
-
-- 缺任一 hard 产物 → `blocked`
-
----
-
-### Skill 7: `moat-inferencer`
-
-> 护城河推断器 → 质量系数
-
-**职责边界**
-
-- 用可追溯证据识别护城河来源：Greenwald、Porter、Morningstar、Mauboussin
-- 产出 **quality_coefficient**：把证据映射成估值参数
-
-**Hard 依赖**
-
-- `current/analytics/diagnostics/growth_drivers.yaml`
-- `current/analytics/diagnostics/profit_quality.yaml`
-- `events/sec/events_index.parquet`
-- `raw/sec/`
-
-**输出**
-
-- `current/analytics/diagnostics/moat.yaml`
-- `current/analytics/diagnostics/quality_coefficient.yaml`
-- evidence/questions
-
-**blocked 条件**
-
-- 任一 hard 缺失 → `blocked`
-
----
-
-### Skill 8: `valuation-and-margin-of-safety`
-
-> 估值与安全边际
-
-**职责边界**
-
-- 以"经济利润 × 质量系数"组织估值：EPV / DCF / Residual Income
-- 输出：bear/base/bull 估值区间、敏感性、下行保护来源
-
-**Hard 依赖**
-
-- `current/analysis_data/market_snapshot.yaml`
-- `current/analysis_data/economic/core_metrics.parquet`
-- `current/analysis_data/economic/economic_statements.parquet`
-- `current/analytics/diagnostics/profit_risk_forecast.yaml`
-- `current/analytics/diagnostics/growth_drivers.yaml`
-- `current/analytics/diagnostics/quality_coefficient.yaml`
-
-**输出**
-
-- `current/analytics/valuation/valuation.yaml`
-- `current/analytics/valuation/valuation_model.csv`
-- `current/outputs/value_state.yaml`
-- `current/outputs/investment_memo.md`
-- evidence
-
-**blocked 条件**
-
-- 任一 hard 缺失 → `blocked`
-
----
-
-### Skill 9: `cross-examination-audit`
-
-> 反问和审计
-
-**职责边界**
-
-- 对比：管理层叙事（MD&A/风险因素） vs 数字（经济三表）
-- 找矛盾、反向思维审计清单
-- 明确：这会如何影响估值参数
-
-**Hard 依赖**
-
-- `current/outputs/value_state.yaml`
-- `current/analytics/valuation/valuation.yaml`
-- `current/analytics/diagnostics/quality_coefficient.yaml`
-- `current/analytics/diagnostics/profit_quality.yaml`
-- `current/analytics/diagnostics/growth_drivers.yaml`
-- `events/sec/events_index.parquet`
-- `raw/sec/`
-
-**输出**
-
-- `current/analytics/diagnostics/audit.yaml`
-- `current/gaps/questions.jsonl`（追加）
-- `current/analytics/evidence/evidence.jsonl`（追加）
-
-**blocked 条件**
-
-- 任一 hard 缺失 → `blocked`
-
----
-
-## 十、SEC 下载策略：VMF（Valuation Materiality Filter）
-
-### 10.0 发行人类型识别（Domestic vs FPI）
-
-- 不依赖"CIK 有 FPI 标记"这类不稳定信号；以近年 filings 的 forms 推断 `issuer_type`
-- **Init 首跑且 forms 为空时**：做一次轻量 probe（推荐顺序：试查 20-F/40-F → 10-Q → 6-K）
-- 若出现 `20-F`/`20-F/A`/`40-F`/`40-F/A` → `issuer_type=fpi`
-- 若出现 `10-Q`/`10-Q/A` → `issuer_type=domestic`
-- 若主要为 `6-K` 且无 `10-Q`/`10-Q/A` → `issuer_type=fpi`（兜底）
+- 以近年 filings 的 forms 推断 `issuer_type`
+- 若出现 `20-F`/`40-F` → `issuer_type=fpi`
+- 若出现 `10-Q` → `issuer_type=domestic`
 - 推断结果写入 `events/sec/ingest_state.yaml: issuer_type`
 
-### 10.1 周期性核心（Periodic Core）- 10年全量下载
+### 8.2 周期性核心（Periodic Core）- 10年全量下载
 
-**按发行人类型自动适配**：
+| 发行人类型 | 下载 Forms |
+|-----------|-----------|
+| Domestic | 10-K, 10-K/A, 10-Q, 10-Q/A, DEF14A |
+| FPI | 20-F, 20-F/A, 40-F, 40-F/A, 6-K（仅 Interim Financials/Results 子集） |
 
-| 发行人类型 | 识别方式 | 下载 Forms |
-|-----------|----------|-----------|
-| Domestic | 近年 filings 存在 10-K/10-Q（且无 20-F） | 10-K, 10-K/A, 10-Q, 10-Q/A, DEF14A |
-| FPI | 近年 filings 存在 20-F/40-F 或主要为 6-K 且无 10-Q | 20-F, 20-F/A, 40-F, 40-F/A, 6-K（仅 Interim Financials/Results 子集） |
+### 8.3 事件流（Event Stream）- 全量索引 + VMF 筛选下载
 
-**下载内容（全部）**：
-- `primary_document`（原始文件名落到 documents/）：永远下载
-- `xbrl/`：若 `has_xbrl=true`
-- `meta.yaml` + `manifest.yaml`：元数据与完整性追踪
-- `index/`：index.json + {accession}-index.html
-- `submission/`：{accession}.txt
-- `exhibits/`：EX-*（排除 EX-101.*）
-- **FPI 的 6-K（Interim）额外规则**：必须下载 exhibits/99.*
-
-### 10.2 事件流（Event Stream）- 全量索引 + VMF 筛选下载
-
-**事件流定义**：
 - Domestic：8-K, 8-K/A
 - FPI：6-K（排除 Periodic Core 的 Interim 子集）
-
-**策略**：
-- **索引**：10年全量（所有 accession 都记录到 filings_index.parquet）
+- **索引**：10年全量
 - **下载**：只下载通过 VMF 筛选的 filings
 
-### 10.3 VMF 三层筛选规则（仅事件流）
+### 8.4 VMF 三层筛选规则
 
-#### 层 1：硬触发（Hard Trigger）— 命中即下载，不受预算限制
+#### 层 1：硬触发（Hard Trigger）— 命中即下载
 
-**A) 8-K Item 硬触发**（仅 Domestic）：
+**8-K Item 硬触发**（仅 Domestic）：
 
-| Item | 名称 | 估值材料性 |
-|------|------|-----------|
-| 2.02 | Results of Operations / Earnings | 直接影响 EPS/指引预期 |
-| 4.01 | Auditor Change | 财务质量与可信度 |
-| 4.02 | Non-Reliance / Restatement | 财务质量与可信度 |
-| 2.04 | Default / Covenant breach | 现金流/折现率/生存概率 |
-| 2.06 | Impairments | 盈利质量、资产质量 |
-| 2.01 | Acquisition / Disposition | 未来现金流路径改变 |
+| Item | 估值材料性 |
+|------|-----------|
+| 2.02 | 直接影响 EPS/指引预期 |
+| 4.01 / 4.02 | 财务质量与可信度 |
+| 2.04 | 现金流/折现率/生存概率 |
+| 2.06 | 盈利质量、资产质量 |
+| 2.01 | 未来现金流路径改变 |
 
-**B) 附件类型硬触发**：
-
-| 附件模式 | 说明 |
-|---------|------|
-| `exhibit 99.*` | 新闻稿/业绩公告/演示材料 |
-| 附件描述含 "earnings release / results / guidance / investor presentation" | 业绩相关 |
-
-**C) 标题/摘要关键词硬触发**：
+**标题/摘要关键词硬触发**：
 
 ```python
 HARD_TRIGGER_KEYWORDS = [
@@ -1323,7 +721,7 @@ HARD_TRIGGER_KEYWORDS = [
 ]
 ```
 
-#### 层 2：打分筛选（Scoring）— 阈值控制
+#### 层 2：打分筛选
 
 | 维度 | 关键词 | 权重 |
 |------|--------|------|
@@ -1333,32 +731,32 @@ HARD_TRIGGER_KEYWORDS = [
 | 资产质量与周期拐点 | impairment, restructuring | 3 |
 | 并购/剥离 | acquisition, merger, disposition | 2 |
 
-#### 层 3：年度预算 — 防过载
+#### 层 3：年度预算
 
 硬触发永远不受预算限制；每自然年最多下载 `vmf_annual_budget` 个评分事件（默认 20）。
 
 ---
 
-## 十一、Artifact Ownership Matrix（产物归属与依赖）
+## 九、Artifact Ownership Matrix（产物归属与依赖）
 
 | Artifact | Producer | Consumer | 用途 |
 |---|---|---|---|
-| `company/{TICKER}/company.yaml` | Skill1 | Skill2 | CIK/公司身份 |
-| `current/analysis_data/market_snapshot.yaml` | Skill1 | Skill8 | 市场口径 |
-| `raw/sec/accessions/{accession}/...` | Skill2 | Skill3 | 原始证据池 |
-| `events/sec/filings_index.parquet` | Skill2 | Skill3 | filing 索引 |
-| `events/sec/events_index.parquet` | Skill2 | Skill3/Phase2 skills | 事件索引 |
-| `events/sec/events/{event_id}/...` | Skill2（buckets）/ Skill3（structured_data） | Phase2 skills | 事件数据包 |
-| `current/analysis_data/xbrl_atlas/*` | Skill3 | Skill4 | 全局 XBRL atlas |
-| `current/analysis_data/economic/*` | Skill4 | Skill8 | 经济三表与核心指标 |
-| `current/analytics/diagnostics/*` | Skill5-7 | Skill8/9 | 诊断产物 |
-| `current/outputs/value_state.yaml` | Skill8 | Skill9/编排器 | 估值底座总表 |
+| `company.yaml` | Skill1 | Skill2 | CIK/公司身份 |
+| `market_snapshot.yaml` | Skill1 | Skill8 | 市场口径 |
+| `raw/sec/accessions/...` | Skill2 | Skill3 | 原始证据池 |
+| `filings_index.parquet` | Skill2 | Skill3 | filing 索引 |
+| `events_index.parquet` | Skill2 | Skill3+ | 事件索引 |
+| `events/{event_id}/...` | Skill2/3 | Skill5+ | 事件数据包 |
+| `xbrl_atlas/*` | Skill3 | Skill4 | 全局 XBRL atlas |
+| `economic/*` | Skill4 | Skill8 | 经济三表与核心指标 |
+| `diagnostics/*` | Skill5-7 | Skill8/9 | 诊断产物 |
+| `value_state.yaml` | Skill8 | Skill9 | 估值底座总表 |
 
 ---
 
-## 十二、编排器流程
+## 十、编排器流程
 
-### 12.1 固定队列
+### 10.1 固定队列
 
 ```
 1. company-foundation
@@ -1372,7 +770,7 @@ HARD_TRIGGER_KEYWORDS = [
 9. cross-examination-audit
 ```
 
-### 12.2 执行策略
+### 10.2 执行策略
 
 ```
 for ticker in pool:
@@ -1406,43 +804,7 @@ generate_value_summary()
 
 ---
 
-## 十三、验收标准（TODO — 后续实现）
-
-> 验收样本应覆盖：10-Q、10-K、20-F、40-F、6-K interim、8-K（至少 Item 2.02 或 4.02）
-
-### 可机读指标
-
-- `raw_completeness_rate`：完整 accessions / 目标 accessions
-- `xbrl_package_ok_rate`：xbrl_ok accessions / has_xbrl accessions
-- `taxonomy_precision`：分类正确率
-- `bucket_coverage_by_category`：每类事件各 bucket 覆盖率
-- `event_xbrl_parse_success_rate`：XBRL 解析成功率
-- `atlas_period_coverage_years`：覆盖年份跨度
-- `incremental_skip_ratio`：增量跳过比例
-
----
-
-## 十四、扩展插槽
-
-后续优化落在这 4 个插槽里，不改目录和 Skill 关系：
-
-### 14.1 Atlas 层增强（Skill 3）
-- 更好的 statement_type 识别
-- 更完整的维度/分部展开
-
-### 14.2 经济重铸策略（Skill 4）
-- maintenance capex 估计方法库
-- operating vs financing 分类规则库
-
-### 14.3 质量系数映射（Skill 7/8）
-- 把"证据 → 参数"做成显式函数
-
-### 14.4 审计问题库（Skill 9）
-- "反问模板"做成 rule library
-
----
-
-## 十五、SKILL.md 写作模板
+## 十一、SKILL.md 写作模板
 
 每个 Skill 的 SKILL.md 按以下模板：
 
@@ -1450,7 +812,7 @@ generate_value_summary()
 ---
 name: <skill-name>
 description: <一句话：做什么，为估值服务的哪一层>
-revision: "<YYYY-MM-DD>"   # optional
+revision: "<YYYY-MM-DD>"
 ---
 
 # <Skill Name>
@@ -1482,35 +844,21 @@ revision: "<YYYY-MM-DD>"   # optional
 
 ## 输出 Schema
 ### <file1>
-```yaml
-# 字段说明
-```
+(yaml/schema 说明)
 ```
 
 ---
 
-## 十六、实施路径
+## 十二、扩展插槽
 
-### 第一阶段：核心估值链（5 个 Skill）
+后续优化落在这 4 个插槽里，不改目录和 Skill 关系：
 
-| 顺序 | Skill | 产出 |
-|------|-------|------|
-| 1 | `company-foundation` | 身份 + 市场口径 |
-| 2 | `sec-ingest-and-materialize-events` | raw + events + buckets |
-| 3 | `xbrl-parse-financial-report-events` | per-event + 全局 atlas |
-| 4 | `recast-economic-statements` | 经济三表 + Owner Earnings |
-| 5 | `valuation-and-margin-of-safety` | 估值区间 + value_state |
-
-### 第二阶段：分析能力补齐（4 个 Skill）
-
-| Skill | 提升能力 |
-|-------|---------|
-| `profit-quality-and-risk` | 财务质量/操纵风险 |
-| `growth-driver-explorer` | 成长性拆解 |
-| `moat-inferencer` | 护城河 → 质量系数 |
-| `cross-examination-audit` | 反问审计，防大错 |
+1. **Atlas 层增强（Skill 3）**：更好的 statement_type 识别、更完整的维度/分部展开
+2. **经济重铸策略（Skill 4）**：maintenance capex 估计方法库、operating vs financing 分类规则库
+3. **质量系数映射（Skill 7/8）**：把"证据 → 参数"做成显式函数
+4. **审计问题库（Skill 9）**："反问模板"做成 rule library
 
 ---
 
-**文档版本**: v2.1 (raw/events 解耦 + event taxonomy + canonical buckets)
-**更新日期**: 2026-03-02
+**文档版本**: v3.0 (docs reorganization — 去 phase 化)
+**更新日期**: 2026-03-15

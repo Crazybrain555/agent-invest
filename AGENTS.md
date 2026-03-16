@@ -9,8 +9,8 @@ repo invariants, operational gotchas, and "how we do changes safely".
 ## Doc Roles (AGENTS.md vs CLAUDE.md)
 
 - `AGENTS.md`: cross-agent invariants and safety rules for this repo (tool-agnostic).
-- `CLAUDE.md`: Claude Code specific operating contract + how to run the Phase 1 skills chain in this repo.
-- Conflict resolution: **filesystem truth / real commands win**. When unsure, defer to `Phase 1 核心估值链 Codex Skills 实施指南.md`.
+- `CLAUDE.md`: Claude Code specific operating contract + how to run the skills chain in this repo.
+- Conflict resolution: **filesystem truth / real commands win**. When unsure, defer to `docs/MASTER_PLAN.md`.
 - If the user corrects a mistake: propose concrete text to add to `CLAUDE.md` and/or `AGENTS.md` so the repo learns the rule (do not silently "remember it").
 
 ---
@@ -145,7 +145,8 @@ Primary working areas:
 - `.codex/skills/public/`: reusable public skills (e.g., stock pool).
 - `.codex/skills/company_research/`: company research skills and scripts.
 - `company_research_runtime/`: shared runtime helpers used by company research skills (do not delete).
-- Root docs: `README.md`, `AGENTS.md`, `CLAUDE.md`, and planning notes (`stock_skills_*.md`, `Phase 1 核心估值链 Codex Skills 实施指南.md`, `CORR_TOOL_CORE_API_PLAN.md`).
+- Root docs: `README.md`, `AGENTS.md`, `CLAUDE.md`.
+- Planning & specs: `docs/MASTER_PLAN.md`, `docs/skills/` (per-skill specs), `docs/references/`, `docs/archive/`.
 
 Notes:
 - This LLM branch is intentionally trimmed; traditional pipelines/tools are removed.
