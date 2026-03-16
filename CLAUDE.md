@@ -140,7 +140,7 @@ Prefer explicitly attaching the most relevant sources instead of describing them
 - `@CONTINUITY.md`
 - `@AGENTS.md`
 - `@docs/MASTER_PLAN.md`
-- `@docs/skills/<skill-doc>.md`
+- `@docs/skills/specs/<skill-doc>.md`
 - `@docs/references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md`
 - `@.codex/skills/company_research/<skill>/SKILL.md`
 - `@company_research_runtime/`
@@ -198,6 +198,6 @@ For large tasks, prefer parallel sessions in separate worktrees to avoid cross-t
 - `CONTINUITY.md` (canonical session ledger)
 - `docs/MASTER_PLAN.md` (architecture, execution protocol, shared schemas)
 - `docs/skills/README.md` (skills overview index + implementation status)
-- `docs/skills/skill*.md` (per-skill specifications)
+- `docs/skills/specs/skill*.md` (per-skill specifications)
 - `docs/references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md` (SEC/XBRL artifact handling specifics)
 - `docs/archive/Phase_1_implementation_guide.md` (archived Phase 1 guide — for reference)

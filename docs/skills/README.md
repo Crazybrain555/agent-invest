@@ -6,15 +6,15 @@
 
 | # | Skill | 文档 | 状态 | 职责 | 对"利润×质量"贡献 |
 |---|-------|------|------|------|------------------|
-| 1 | `company-foundation` | [skill1](skill1-company-foundation.md) | 已实现 | 身份 + 市场口径（含 shares） | 估值分母/每股化基座 |
-| 2 | `sec-ingest-and-materialize-events` | [skill2](skill2-sec-ingest-and-materialize-events.md) | 开发中 | raw ingest + events materialize（含财报 buckets） | 证据池 + 事件数据库 |
-| 3 | `xbrl-parse-financial-report-events` | [skill3](skill3-xbrl-parse-financial-report-events.md) | 待开发 | per-event XBRL 解析 + 全局 atlas | 利润事实底座 |
-| 4 | `recast-economic-statements` | [skill4](skill4-recast-economic-statements.md) | 待开发 | 经济三表 + 核心指标 | Owner Earnings / ROIC |
-| 5 | `profit-quality-and-risk` | [skill5](skill5-profit-quality-and-risk.md) | 规划中 | 财报质量/操纵风险/利润可持续性 | 质量系数与情景下界 |
-| 6 | `growth-driver-explorer` | [skill6](skill6-growth-driver-explorer.md) | 规划中 | 增长来源与 ROIIC/生命周期 | 未来利润路径 |
-| 7 | `moat-inferencer` | [skill7](skill7-moat-inferencer.md) | 规划中 | 护城河 → 优势期 → 质量系数映射 | 质量系数主体 |
-| 8 | `valuation-and-margin-of-safety` | [skill8](skill8-valuation-and-margin-of-safety.md) | 待开发 | 估值区间 + MOS + 敏感性 | 输出 IV vs 市场 |
-| 9 | `cross-examination-audit` | [skill9](skill9-cross-examination-audit.md) | 规划中 | 反问审计：找矛盾/遗漏/为什么便宜 | 提高确定性，防大错 |
+| 1 | `company-foundation` | [skill1](specs/skill1-company-foundation.md) | 已实现 | 身份 + 市场口径（含 shares） | 估值分母/每股化基座 |
+| 2 | `sec-ingest-and-materialize-events` | [skill2](specs/skill2-sec-ingest-and-materialize-events.md) | 开发中 | raw ingest + events materialize（含财报 buckets） | 证据池 + 事件数据库 |
+| 3 | `xbrl-parse-financial-report-events` | [skill3](specs/skill3-xbrl-parse-financial-report-events.md) | 待开发 | per-event XBRL 解析 + 全局 atlas | 利润事实底座 |
+| 4 | `recast-economic-statements` | [skill4](specs/skill4-recast-economic-statements.md) | 待开发 | 经济三表 + 核心指标 | Owner Earnings / ROIC |
+| 5 | `profit-quality-and-risk` | [skill5](specs/skill5-profit-quality-and-risk.md) | 规划中 | 财报质量/操纵风险/利润可持续性 | 质量系数与情景下界 |
+| 6 | `growth-driver-explorer` | [skill6](specs/skill6-growth-driver-explorer.md) | 规划中 | 增长来源与 ROIIC/生命周期 | 未来利润路径 |
+| 7 | `moat-inferencer` | [skill7](specs/skill7-moat-inferencer.md) | 规划中 | 护城河 → 优势期 → 质量系数映射 | 质量系数主体 |
+| 8 | `valuation-and-margin-of-safety` | [skill8](specs/skill8-valuation-and-margin-of-safety.md) | 待开发 | 估值区间 + MOS + 敏感性 | 输出 IV vs 市场 |
+| 9 | `cross-examination-audit` | [skill9](specs/skill9-cross-examination-audit.md) | 规划中 | 反问审计：找矛盾/遗漏/为什么便宜 | 提高确定性，防大错 |
 
 ## 执行顺序
 
