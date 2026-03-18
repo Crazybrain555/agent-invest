@@ -8,10 +8,10 @@
 
 ## 文档索引
 
-- **Skills 总览与实施状态**：[docs/skills/README.md](skills/README.md)
-- **Per-skill 详细规格**：[docs/skills/](skills/)
-- **SEC/XBRL 技术参考**：[docs/references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md](references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md)
-- **MCP 配置指南**：[docs/MCP_SETUP_GUIDE.md](MCP_SETUP_GUIDE.md)
+- **Skills 总览与实施状态**：[docs/skills/README.md](README.md)
+- **Per-skill 详细规格**：[docs/skills/specs/](specs/)
+- **SEC/XBRL 技术参考**：[docs/skills/references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md](references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md)
+- **MCP 配置指南**：[docs/MCP_SETUP_GUIDE.md](../MCP_SETUP_GUIDE.md)
 
 ---
 
@@ -97,7 +97,7 @@
 
       events/                              # 事件级数据层（可数据库化；下游 skills 直接消费）
         sec/
-          ingest_state.yaml                # 元数据（issuer_type/vmf_version/classifier_version/window/totals）
+          ingest_state.yaml                # 元数据（issuer_type/classifier_version/window/totals）
           filings_index.parquet            # 必须：filing 粒度索引（accession 为主键）
           events_index.parquet             # 必须：event 粒度索引（event_id 为主键）
           events/
@@ -133,8 +133,6 @@
                 restructuring.md
               legal_and_regulatory/
                 legal.md
-              sustainability_esg/
-                esg.md
               exhibits_and_material_contracts/
                 contracts_index.json
               structured_data/             # Skill3 写入（财报事件为主）
@@ -268,127 +266,137 @@ priority: high
 
 ---
 
-## 五、Event Taxonomy（事件主分类 — 12 类）
+## 五、Event Taxonomy（subtype + 7 topic families）
 
-> 投研检索友好（按日期+主类），覆盖跨表单差异；Skill2 能用稳定规则自动分类。
+> Skill 2 采用两层分类体系：**subtype（操作层）** + **topic family（检索层）**。
+> 所有操作逻辑（action / merge / bucket plan）挂在 subtype 上，topic family 只做检索和索引。
+> 详细分类器设计见 [Skill 2 规格](specs/skill2-sec-ingest-and-materialize-events.md)。
 
-### 5.1 Taxonomy 列表
+### 5.1 Topic Families（7）
 
-| category_id | 名称 | 定义 | 识别信号（优先级从高到低） | raw 典型材料位置 |
-|---|---|---|---|---|
-| `financial_report` | 财报事件 | 周期性财报披露：10-K/10-Q/20-F/40-F + FPI 6-K interim results | form in {10-K,10-Q,20-F,40-F, *-A}；或 6-K 且"period+results"信号成立 | primary doc；或 EX-99.*（40-F/6-K 常见）+ xbrl/ |
-| `earnings_release_guidance` | 业绩公告/指引 | 非完整财报但影响预期：业绩快报、指引更新 | 8-K Item 2.02；或 exhibits 描述含 earnings/results/guidance；或 6-K + EX-99.* 且 results/guidance | EX-99.* |
-| `mna` | 并购/剥离 | 收购、合并、资产出售、重大重组交易 | 8-K Item 2.01；或 EX-2.*；或 merger/acquisition/disposition 关键词 | primary + EX-2.* + EX-99.* |
-| `financing_liquidity` | 融资/流动性 | 债务/股权融资、信贷额度、再融资 | 8-K Item 2.03 / 1.01 / 3.02；或 EX-10.*(credit agreement) | EX-10.* + press release |
-| `default_covenant` | 违约/契约 | covenant breach、default、going concern | 8-K Item 2.04 / 2.05；或 default/covenant 关键词 | primary + EX-99.* |
-| `auditor_restatement` | 审计/重述 | 审计师变更、非依赖、重述、重大内控缺陷 | 8-K Item 4.01 / 4.02；或 restatement/material weakness/auditor | primary + auditor letter |
-| `impairment_restructuring` | 减值/重组 | impairment、资产减记、重组/裁员/退出业务 | 8-K Item 2.06 / 2.05；或 impairment/restructuring | primary + EX-99.* |
-| `governance_management` | 治理/高管 | 董监高变动、章程变更 | 8-K Item 5.02 / 5.03；或 DEF14A | primary + proxy materials |
-| `capital_return_equity` | 资本回报/股本 | 回购、分红、拆股、增发 | EX-99.* + buyback/dividend/split 关键词；或 8-K Item 3.03 / 3.01 | press release + agreements |
-| `legal_regulatory` | 诉讼/监管 | 重大诉讼、调查、监管处罚 | lawsuit/investigation/settlement/SEC/DOJ 关键词；或 8-K Item 8.01 | primary + exhibits |
-| `shareholder_meeting_proxy` | 股东大会/代理 | DEF14A、投票结果、提案 | form=DEF14A/DEFA14A；或 meeting/vote 关键词 | proxy docs |
-| `other_material` | 其他重大事项 | 不属于以上但仍应归档的重大披露 | 8-K Item 8.01；或 6-K other event | primary + exhibits |
+| topic_family | 含义 |
+|---|---|
+| `periodic_core` | 周期性财报披露（annual / quarterly / interim） |
+| `earnings_market_communication` | 业绩公告、指引、投资者沟通 |
+| `transaction_balance_sheet` | M&A、融资、违约、破产等资产负债表事件 |
+| `accounting_quality` | 审计师变更、重述、减值、重组 |
+| `governance_shareholder` | 治理、高管变动、proxy、股东大会 |
+| `capital_equity_mechanics` | 回购、分红、拆股、月度回报 |
+| `legal_catchall` | 法律、监管、上市合规、其他重大事项 |
 
-### 5.2 FPI 6-K Interim Results 识别规则
+### 5.2 Subtypes（完整列表）
 
-用于把 6-K 分成：
-- `financial_report`（interim results）：进入"财报事件"
-- 其他 taxonomy 类别：走普通事件流
+| topic family | subtypes |
+|---|---|
+| `periodic_core` | `annual_report`, `quarterly_report`, `interim_financial_report`, `annual_report_attachment` |
+| `earnings_market_communication` | `earnings_results_announcement`, `guidance_update`, `investor_presentation` |
+| `transaction_balance_sheet` | `mna_announcement`, `mna_proxy_material`, `financing_offering`, `debt_pricing_or_completion`, `credit_agreement_or_refinancing`, `default_or_covenant_breach`, `bankruptcy_or_receivership` |
+| `accounting_quality` | `auditor_change`, `non_reliance_or_restatement`, `impairment_charge`, `restructuring_program` |
+| `governance_shareholder` | `director_or_officer_change`, `charter_or_bylaw_change`, `compensation_or_equity_award`, `annual_meeting_proxy`, `proxy_supplement`, `meeting_vote_results` |
+| `capital_equity_mechanics` | `share_repurchase_update`, `dividend_announcement`, `stock_split_or_rights_change`, `monthly_return` |
+| `legal_catchall` | `listing_status_or_noncompliance`, `legal_or_regulatory_matter`, `other_material_event` |
 
-**严格规则（唯一规则，避免误判）：**
+### 5.3 主题优先级（多信号冲突时）
 
-- Period 信号：`three months ended / six months ended / quarter ended / interim / half-year / unaudited interim / condensed consolidated` 等
-- Results 信号：`results / earnings / financial statements / interim results` 等
-- 判定：**(period AND results)**，来源可来自：
-  - 6-K filing title/description（来自 SEC metadata）
-  - exhibits 描述（尤其 EX-99.*）
+```text
+accounting_quality
+  > distress (bankruptcy/default) within transaction_balance_sheet
+  > transaction_balance_sheet
+  > periodic_core
+  > earnings_market_communication
+  > governance_shareholder
+  > capital_equity_mechanics
+  > legal_catchall
+```
 
-约束：
-- 仅出现 `presentation / outlook / guidance` **不能**单独判为财报事件；只能作为已判为财报事件后的附带材料
+越靠前，越直接影响**利润可信度、存续概率、资本结构、未来路径**。
+
+### 5.4 Event 归并的 5 种 group_type
+
+| group_type | 适用情形 | group_key |
+|---|---|---|
+| `cycle` | annual / quarterly / interim / earnings / guidance / deck | `cycle:{period_end}:{fiscal_period}` |
+| `meeting` | proxy / supplement / vote results | `meeting:{meeting_date}` |
+| `transaction` | M&A / financing / default / bankruptcy | `transaction:{subfamily}:{hash(transaction_key)}` |
+| `calendar_period` | monthly return / monthly buyback updates | `calendar_period:{subtype}:{YYYY-MM}` |
+| `filing` | governance / legal / catch-all 单次事件 | `filing:{filed_at}:{accession_suffix}` |
+
+### 5.5 event_id 生成规则
+
+**event_id 不编码 topic / subtype**，只编码稳定 group key：
+
+```python
+def generate_event_id(group_type: str, group_key: str) -> str:
+    safe = normalize_group_key(group_key)
+    return f"sec_{group_type}_{safe}"
+```
+
+示例：`sec_cycle_2025-12-31_FY`、`sec_meeting_2026-05-07`、`sec_transaction_6f3a4e0bcb1d`
 
 ---
 
-## 六、Canonical Content Buckets（16 个）
+## 六、Canonical Content Buckets（14 个活跃 + 2 个保留）
 
 > 所有事件统一一套 bucket 名字；缺失允许不生成；任何下游 skill 只读 buckets，不关心表单差异。
+> bucket 设计原则：**服务下游估值研究问题**，不 mirror topic family。
 
-| bucket_name | 用途（对估值/投研的价值） | 典型内容 |
+### 6.1 活跃 Buckets
+
+#### universal buckets（所有 event 都有）
+
+| bucket_name | 服务的研究问题 | 典型内容 |
 |---|---|---|
-| `event_overview` | 统一入口：事件摘要、关键时间线 | `overview.md`, `timeline.json`, `classification.json` |
-| `press_release` | 快速拿到"市场叙事/指引/要点" | `press_release.md`, `qa_highlights.jsonl` |
-| `presentation_slides` | investor deck / 会议材料 | `deck_ref.json`, `slides_text.md`（可选） |
-| `financial_statements` | 人读财务报表/摘要（XBRL 数字由 structured_data 提供） | `narrative.md`, `tables/*.csv`（可选） |
-| `notes_and_accounting` | 会计政策、关键估计、footnotes | `notes.md`, `critical_accounting.md` |
-| `mdna_operating_review` | 经营回顾（增长驱动、利润变化） | `mdna.md` |
-| `risk_factors` | 风险因素（折现率/情景权重的重要证据） | `risk_factors.md` |
-| `business_and_strategy` | 业务结构、竞争、产品、地区 | `business.md`, `segments_overview.md` |
-| `governance_and_compensation` | 治理与激励 | `governance.md`, `compensation.md` |
-| `capital_structure_and_liquidity` | 资本结构、债务、流动性 | `liquidity.md`, `debt_summary.json`（可选） |
-| `mna_and_integration` | 并购/剥离的交易条款与整合影响 | `mna.md`, `proforma_refs.json` |
-| `restructuring_and_impairment` | 重组/减值 | `restructuring.md` |
-| `legal_and_regulatory` | 诉讼/监管 | `legal.md` |
-| `sustainability_esg` | ESG/可持续 | `esg.md` |
-| `exhibits_and_material_contracts` | 合同/协议/附件索引（证据入口） | `exhibits_index.json`, `contracts_index.json` |
-| `structured_data` | 结构化数据出口（Skill3 的 XBRL atlas） | `xbrl_atlas/*` + 未来 `normalized_tables/*` |
+| `event_overview` | 发生了什么、何时发生、证据在哪 | `overview.md`, `timeline.json` |
+| `exhibits_and_material_contracts` | 原始合同与材料入口，保证可审计性 | `exhibits_index.json`, `contracts_index.json` |
 
-> `structured_data` 由 **Skill3 写入**；Skill2 只负责把 raw_xbrl refs 以及"是否可解析"的状态写进 event.yaml / bucket_manifest。
+#### core valuation buckets
 
-### 6.1 财报事件 Buckets 映射与抽取规则
+| bucket_name | 服务的研究问题 | 典型内容 |
+|---|---|---|
+| `financial_statements` | 收入/利润/现金流/资产负债的核心结构 | `narrative.md`, `tables/*.csv`（可选） |
+| `notes_and_accounting` | 会计政策、估计、重述、或有事项、利润质量 | `notes.md` |
+| `mdna_operating_review` | 增长驱动、利润变化、经营解释 | `mdna.md` |
+| `risk_factors` | 折现率、情景权重、下行风险 | `risk_factors.md` |
+| `business_and_strategy` | 商业模式、分部结构、竞争位置、护城河线索 | `business.md` |
+| `capital_structure_and_liquidity` | 杠杆、再融资、稀释、回购、分红、流动性 | `liquidity.md` |
+| `governance_and_compensation` | 激励一致性、治理约束、资本配置质量 | `governance.md` |
+| `legal_and_regulatory` | 罚款、许可、诉讼、经营约束 | `legal.md` |
 
-#### 6.1.1 解决"财报不在 primary document"的统一机制
+#### situation buckets
 
-Skill2 必须先做：构建"source document catalog"（每个事件都一样），来自 raw 的 `meta.yaml: documents[]`：
-- 包含每个原始文件：filename、doc_type、description、category
-- 然后按 bucket 的需求做"选择 + 抽取"
+| bucket_name | 服务的研究问题 | 典型内容 |
+|---|---|---|
+| `press_release` | 市场叙事、短期预期、管理层 framing | `press_release.md` |
+| `presentation_slides` | KPI、分部、战略口径、投资者沟通素材 | `deck_ref.json` |
+| `mna_and_integration` | 并购经济学、协同、整合、交易条款 | `mna.md` |
+| `restructuring_and_impairment` | 一次性 vs 结构性恶化、利润质量、margin reset | `restructuring.md` |
 
-#### 6.1.2 财报事件 Bucket 映射规则
+### 6.2 保留 / 延后 Buckets
 
-**(1) `financial_statements` / `notes_and_accounting`**
+| bucket_name | 归属 | 说明 |
+|---|---|---|
+| `structured_data` | **Skill 3 拥有** | Skill 2 只写 raw_xbrl refs 和 parse readiness |
+| `sustainability_esg` | **移出 Skill 2** | 如原始 filing 含 ESG 材料，仅在 `exhibits_and_material_contracts` 建引用 + `event.yaml.tags` 加 `esg_available` |
 
-优先来源：
-1. 若 `xbrl.has_xbrl=true`：数字由 Skill3 的 `structured_data` 提供；Skill2 在 `financial_statements/narrative.md` 里放人读版摘要 + raw_refs 指向"包含 FS/notes 的主要文件"
-2. 对 40-F / 6-K interim（FS 常在 EX-99.*）：选择 exhibits 中 description/doc_type 命中 `financial statements`, `audited`, `unaudited interim`, `condensed consolidated` 等；多份命中时按 bytes 降序取前 1~2 份
+### 6.3 Bucket Manifest 状态
 
-**(2) `mdna_operating_review`**
+每个 event 的 `bucket_manifest.json` 必须对每个 bucket 标注状态：
 
-优先来源：
-1. exhibits 中 description 命中：`management's discussion`, `MD&A`, `operating and financial review`, `OFR`
-2. 否则 primary doc 按表单 heading 抽取：
-   - 10-K：Item 7
-   - 10-Q：Part I Item 2（**排除 Part II Item 2**）
-   - 20-F：Item 5
-   - 40-F：通常从 EX-99.*（MD&A/AIF）抽取
-3. 6-K interim：从 EX-99.* 或 primary 按 heading 兜底
+| 状态 | 含义 |
+|---|---|
+| `present` | 已完整产出 |
+| `partial` | 有内容但不完整 |
+| `ref_only` | 只有引用，无提取内容 |
+| `not_applicable` | 此 event 不需要此 bucket |
+| `missing_expected` | 预期存在但未能产出 |
 
-**(3) `risk_factors`**
+### 6.4 Bucket Plan 推导规则
 
-- 10-K：Item 1A
-- 10-Q：Part II Item 1A（若无则为空）
-- 20-F：Item 3.D
-- 40-F：通常来自 AIF（EX-99.*）
+default bucket plan 由 event 的 **`subtypes_present` 的 union** 推导，而不是只看 primary_subtype 或 topic family。详见 [Skill 2 规格 §11.4](specs/skill2-sec-ingest-and-materialize-events.md)。
 
-**(4) `business_and_strategy`**
+### 6.5 Bucket 抽取通用规则
 
-- 10-K：Item 1
-- 20-F：Item 4
-- **10-Q：通常没有 Business（这是现实，不是漏抓）**
-- 40-F：通常在 AIF（EX-99.*）
-
-**(5) `governance_and_compensation`**
-
-- 通常来自 DEF14A（它本身也是一个事件）
-- 财报事件目录里可以只放 ref，不强制复制
-
-### 6.2 非财报事件 Buckets 抽取规则
-
-统一策略（Skill2）：
-1. 每个事件至少产出：`event_overview/overview.md` + `exhibits_and_material_contracts/exhibits_index.json`
-2. 按 taxonomy 额外产出对应 buckets：
-   - `earnings_release_guidance` → press_release + presentation_slides + mdna（如有）
-   - `mna` → mna_and_integration + exhibits（EX-2.*, EX-10.*）
-   - `financing_liquidity` / `default_covenant` → capital_structure_and_liquidity
-   - `auditor_restatement` → notes_and_accounting + risk_factors
-3. 对 PDF/图片等：不强制 OCR；放引用 + 可选纯文本提取；parse_status 标记 `partial`，写 gap
+Skill2 必须先构建 `source_document_catalog`（来自 raw `meta.yaml: documents[]`），然后按 bucket 需求做选择 + 抽取。详细规则见 [Skill 2 规格 §12](specs/skill2-sec-ingest-and-materialize-events.md)。
 
 ---
 
@@ -478,8 +486,10 @@ completeness:
 ```yaml
 as_of: "2026-01-14"
 issuer_type: "fpi"
-sixk_classifier_version: "strict_period_and_results"
-vmf_version: "standard"
+classifier_version: "topic7_subtype_v1"
+taxonomy_version: "topic7_v1"
+merge_policy_version: "v1"
+bucket_plan_version: "v1"
 window:
   mode: "maintenance"
   start: "2026-01-08"
@@ -499,51 +509,86 @@ totals:
 
 | 字段名 | 类型 | Nullable | 说明 |
 |--------|------|----------|------|
-| accession | string | N | SEC accession number（primary key） |
-| form | string | N | 表单类型 |
-| filed_at | date32 | N | 提交日期 |
-| period_end | date32 | Y | SEC period_of_report |
-| has_xbrl | bool | N | 是否有 XBRL |
-| is_amendment | bool | N | 是否修订版 |
-| primary_doc | string | N | 主文档原始文件名 |
-| filing_url | string | N | SEC 原始 URL |
-| local_dir | string | N | raw 本地目录相对路径 |
-| event_id | string | Y | 关联的 event_id |
-| bucket | string | N | periodic_core / event_stream |
-| sixk_class | string | Y | interim_results / other_event（非6-K为空） |
-| vmf_triggered | bool | Y | 是否通过 VMF |
-| vmf_score | int32 | Y | VMF 打分 |
-| items | list[string] | Y | 8-K items |
-| downloaded | bool | N | 是否已下载 |
+| `accession` | string | N | SEC accession number（primary key） |
+| `form` | string | N | 表单类型 |
+| `filed_at` | date32 | N | 提交日期 |
+| `period_end` | date32 | Y | SEC period_of_report |
+| `has_xbrl` | bool | N | 是否有 XBRL |
+| `is_amendment` | bool | N | 是否修订版 |
+| `primary_doc` | string | N | 主文档原始文件名 |
+| `filing_url` | string | N | SEC 原始 URL |
+| `local_dir` | string | N | raw 本地目录相对路径 |
+| `filing_action` | string | N | excluded/index_only/full_download/attach_only |
+| `download_scope` | string | Y | full/scaffold/none |
+| `primary_subtype` | string | Y | 分类结果 subtype |
+| `primary_topic` | string | Y | topic family |
+| `secondary_topics` | list[string] | Y | 次要 topics |
+| `reason_codes` | list[string] | Y | 分类依据 |
+| `classifier_version` | string | Y | 分类器版本 |
+| `group_type_hint` | string | Y | 预计 group type |
+| `group_key_candidate` | string | Y | 预计 group key |
+| `event_id` | string | Y | 关联的 event_id |
+| `attach_target_event_id` | string | Y | attach 目标 event_id |
+| `filing_role` | string | Y | primary/related/attachment/amendment |
+| `items` | list[string] | Y | 8-K items |
+| `downloaded` | bool | N | 是否已下载 |
 
 ### 7.7 events_index.parquet Schema
 
 | 字段名 | 类型 | Nullable | 说明 |
 |--------|------|----------|------|
-| event_id | string | N | 事件主键 |
-| ticker | string | N | 股票 |
-| source | string | N | 固定 sec_edgar |
-| category | string | N | taxonomy 主类 |
-| subtype | string | Y | 表单/子类 |
-| occurred_at | date32 | Y | 事件日期 |
-| filed_at | date32 | Y | SEC filed date |
-| period_end | date32 | Y | 财报事件必须 |
-| fiscal_period | string | Y | FY/Q1/Q2/Q3/Q4/H1/H2 |
-| primary_accession | string | Y | 主 accession |
-| accessions | list[string] | Y | 关联 filings 列表 |
-| buckets_present | list[string] | Y | 已产出的 buckets |
-| status_rollup | string | N | ok/partial/blocked/error/skipped |
-| updated_at | timestamp[us, tz=UTC] | N | 更新时间 |
+| `event_id` | string | N | 事件主键 |
+| `ticker` | string | N | 股票 |
+| `source` | string | N | 固定 sec_edgar |
+| `primary_topic` | string | N | topic family |
+| `primary_subtype` | string | N | 操作 subtype |
+| `secondary_topics` | list[string] | Y | 次要 topics |
+| `subtypes_present` | list[string] | Y | event 包含的所有 subtypes |
+| `group_type` | string | N | cycle/meeting/transaction/calendar_period/filing |
+| `group_key` | string | N | 归并键 |
+| `occurred_at` | date32 | Y | 事件日期 |
+| `filed_at` | date32 | Y | SEC filed date |
+| `period_end` | date32 | Y | 财报事件必须 |
+| `fiscal_period` | string | Y | FY/Q1/Q2/Q3/Q4/H1/H2 |
+| `primary_accession` | string | Y | 主 accession |
+| `accessions` | list[string] | Y | 关联 filings 列表 |
+| `buckets_present` | list[string] | Y | 已产出的 buckets |
+| `classifier_version` | string | Y | 分类器版本 |
+| `bucket_plan_version` | string | Y | bucket plan 版本 |
+| `merge_policy_version` | string | Y | 归并策略版本 |
+| `status_rollup` | string | N | ok/partial/blocked/error/skipped |
+| `updated_at` | timestamp[us, tz=UTC] | N | 更新时间 |
 
 ### 7.8 event.yaml
 
 ```yaml
-event_id: "sec_fr_2024-12-31_FY"
+event_id: "sec_cycle_2024-12-31_FY"
 ticker: "SNDL"
 source: "sec_edgar"
-category: "financial_report"
-subtype: "40-F"
 issuer_type: "fpi"
+
+classification:
+  primary_subtype: "annual_report"
+  primary_topic: "periodic_core"
+  secondary_topics: ["earnings_market_communication"]
+  subtypes_present:
+    - "annual_report"
+    - "annual_report_attachment"
+  classifier_version: "topic7_subtype_v1"
+  taxonomy_version: "topic7_v1"
+  reason_codes:
+    - "FORM_40F"
+    - "ANNUAL_REPORT_CYCLE"
+  evidence:
+    - source_type: "form"
+      signal: "40-F"
+      strength: "definitive"
+
+grouping:
+  group_type: "cycle"
+  group_key: "cycle:2024-12-31:FY"
+  grouping_basis: "period_end+fiscal_period"
+
 occurred_at: "2024-12-31"
 filed_at: "2025-03-28"
 period_end: "2024-12-31"
@@ -554,10 +599,11 @@ primary_filing:
   accession: "0000950170-25-040545"
   form: "40-F"
   raw_dir: "raw/sec/accessions/0000950170-25-040545"
+  filing_role: "primary"
 related_filings: []
 
 tags: ["mjds", "ex99_fs", "ex99_mdna"]
-importance_hint: 0.8
+
 parse_status:
   raw_ingest: "ok"
   buckets_materialized: "ok"
@@ -673,7 +719,11 @@ links:
 
 ---
 
-## 八、SEC 下载策略：VMF（Valuation Materiality Filter）
+## 八、SEC Filing Universe 与下载策略
+
+> VMF（Valuation Materiality Filter）已从系统中**彻底删除**。
+> Skill 2 采用**确定性策略栈**替代 VMF 的打分 + 年度预算机制。
+> 详细策略设计见 [Skill 2 规格 §4-5](specs/skill2-sec-ingest-and-materialize-events.md)。
 
 ### 8.1 发行人类型识别（Domestic vs FPI）
 
@@ -682,58 +732,31 @@ links:
 - 若出现 `10-Q` → `issuer_type=domestic`
 - 推断结果写入 `events/sec/ingest_state.yaml: issuer_type`
 
-### 8.2 周期性核心（Periodic Core）- 10年全量下载
+### 8.2 Filing Universe（确定性白名单）
 
-| 发行人类型 | 下载 Forms |
-|-----------|-----------|
-| Domestic | 10-K, 10-K/A, 10-Q, 10-Q/A, DEF14A |
-| FPI | 20-F, 20-F/A, 40-F, 40-F/A, 6-K（仅 Interim Financials/Results 子集） |
+**Domestic**：`10-K`, `10-K/A`, `10-Q`, `10-Q/A`, `8-K`, `8-K/A`, `DEF14A`, `DEFA14A`, `DEFR14A`, `PRE14A`, `DEFM14A`, `PREM14A`
 
-### 8.3 事件流（Event Stream）- 全量索引 + VMF 筛选下载
+**FPI**：`20-F`, `20-F/A`, `40-F`, `40-F/A`, `6-K`, `6-K/A`
 
-- Domestic：8-K, 8-K/A
-- FPI：6-K（排除 Periodic Core 的 Interim 子集）
-- **索引**：10年全量
-- **下载**：只下载通过 VMF 筛选的 filings
+### 8.3 核心原则
 
-### 8.4 VMF 三层筛选规则
+**一旦 filing 进入 discovery whitelist，默认立场是"收集"，不是"节约下载"。**
 
-#### 层 1：硬触发（Hard Trigger）— 命中即下载
+- 白名单内 filing 默认 `full_download`
+- 只对少数确定性场景（如 `PRE14A` 等 definitive 前）使用 `index_only`
+- 不存在因"预算不够"被降级的情况
 
-**8-K Item 硬触发**（仅 Domestic）：
+### 8.4 确定性策略栈（替代 VMF）
 
-| Item | 估值材料性 |
-|------|-----------|
-| 2.02 | 直接影响 EPS/指引预期 |
-| 4.01 / 4.02 | 财务质量与可信度 |
-| 2.04 | 现金流/折现率/生存概率 |
-| 2.06 | 盈利质量、资产质量 |
-| 2.01 | 未来现金流路径改变 |
+Skill 2 的行为由 5 个版本化策略面控制，每个策略面可独立升级：
 
-**标题/摘要关键词硬触发**：
+1. **`filing_universe_policy`** — discovery 白名单、排除列表
+2. **`subtype_registry`** — subtype → action / topic / group_type / bucket_plan 映射
+3. **`classifier_rulepack`** — 8-K item / 6-K signal / proxy family 分类规则
+4. **`merge_policy`** — cycle / meeting / transaction 归并规则
+5. **`bucket_plan_registry`** — bucket 期待值与选择规则
 
-```python
-HARD_TRIGGER_KEYWORDS = [
-    "restatement", "material weakness", "auditor", "going concern",
-    "default", "covenant", "bankruptcy", "restructuring",
-    "impairment", "write-down",
-    "guidance", "outlook", "earnings", "results"
-]
-```
-
-#### 层 2：打分筛选
-
-| 维度 | 关键词 | 权重 |
-|------|--------|------|
-| 现金流/融资与生存 | liquidity, refinancing, credit facility, default, covenant | 5 |
-| 盈利/EPS/指引 | earnings, results, guidance, outlook, margin | 4 |
-| 财务质量/会计可靠性 | restatement, auditor, material weakness | 3 |
-| 资产质量与周期拐点 | impairment, restructuring | 3 |
-| 并购/剥离 | acquisition, merger, disposition | 2 |
-
-#### 层 3：年度预算
-
-硬触发永远不受预算限制；每自然年最多下载 `vmf_annual_budget` 个评分事件（默认 20）。
+**核心优势**：同一 accession 在同一 `policy_version` 下，结果完全可复现。没有年度路径依赖。
 
 ---
 
@@ -860,5 +883,5 @@ revision: "<YYYY-MM-DD>"
 
 ---
 
-**文档版本**: v3.0 (docs reorganization — 去 phase 化)
-**更新日期**: 2026-03-15
+**文档版本**: v4.0 (删除 VMF，采用 subtype + 7 topic families，bucket 重构为估值消费接口)
+**更新日期**: 2026-03-17
