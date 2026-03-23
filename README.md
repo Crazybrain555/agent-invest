@@ -333,11 +333,11 @@ python master_scheduler.py
 | trading_mcp | 股票筛选/基本面指标 | stdio | 本地 `trading-mcp` Node 服务 | 必需 |
 | search | DuckDuckGo 搜索/网页提取 | stdio | `.venvs/mcp-search` + `mcp-search-server` | 可选 |
 | openalex | 学术论文检索 | stdio | 本地 `openalex-research-mcp` Node 服务 | 可选 |
-| crossref | 学术文献 DOI 查询 | stdio | `npx -y @botanicastudios/crossref-mcp` | 可选 |
+| crossref | 学术文献 DOI 查询 | stdio | WSL 本地固定安装 `@botanicastudios/crossref-mcp` | 可选 |
 | pubmed | 医学文献检索 | stdio | `.venvs/pubmed-mcp` + `pubmed_server.py` | 可选 |
 | arxiv | arXiv 论文检索 | stdio | 本地 `arxiv-mcp-server` 可执行文件 | 可选 |
 | yfinance | Yahoo Finance 数据 | stdio | `uv --directory ... run server.py` | 必需 |
-| github | GitHub API 操作 | stdio | `npx -y @modelcontextprotocol/server-github` | 可选 |
+| github | GitHub API 操作 | stdio | WSL 本地固定安装 `@modelcontextprotocol/server-github` | 可选 |
 | git | 本地 Git 操作 | stdio | `.venvs/mcp-git` + `python -m mcp_server_git` | 可选 |
 | playwright | 浏览器自动化 | stdio | `npx @playwright/mcp@latest` | 可选 |
 
@@ -355,7 +355,7 @@ python master_scheduler.py
 1. Python/conda 路径一致性：`/home/help/miniconda3/envs/aiquantlab/bin/python` 和各 `.venvs/*` 路径要存在。
 2. Node.js/npx 路径确认：`/home/help/mcp/tools/node/bin/node` 和 `/home/help/mcp/tools/bin/npx` 需可执行。
 3. uv 工具安装：`/home/help/mcp/tools/uv/uv` 需可执行（`yfinance` 依赖）。
-4. 代理变量配置：有代理时同时设置大写/小写变量；无代理可留空。
+4. 代理变量配置：有代理时同时设置大写/小写变量；无代理可留空。对于 Windows Codex App 的 `wsl.exe` bridge，Node HTTPS MCP（如 `github`/`crossref`）不要直接用 `npx -y`，优先走本地固定安装 + 代理 launcher。
 5. `config.toml` 路径存在性检查：`command`、`args`、`cwd` 中所有绝对路径都要落地。
 6. `enabled_tools` 与 Skill 依赖对齐：若工具裁剪，需确认不会影响 Phase 1 技能链。
 

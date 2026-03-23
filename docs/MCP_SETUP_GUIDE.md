@@ -17,11 +17,20 @@
 
 | 文件 | 格式 | 作用 | 谁读 |
 |------|------|------|------|
-| `.mcp.json` | JSON | 项目级 MCP 声明 | Claude Code |
+| `~/.claude.json` | JSON | **用户级 MCP 声明（Claude Code 实际读取的文件）** | Claude Code |
+| `~/.claude/settings.json` | JSON | Claude Code 偏好设置（model、plugins 等），**不是** MCP 配置的主文件 | Claude Code |
+| `.mcp.json` | JSON | 项目级 MCP 声明（可选，会覆盖同名用户级配置） | Claude Code |
 | `.codex/config.toml` | TOML | 项目级 MCP 声明 | OpenAI Codex |
+| `~/.codex/config.toml` | TOML | 用户级 MCP 声明 | OpenAI Codex |
 | `.env.template` | shell | 环境变量参考模板 | 人 |
 
-两份配置声明的是**同一组 MCP server**，只是格式不同。路径是当前开发机的绝对路径，新机器需要调整。
+> **重要区分**：Claude Code 有两个容易混淆的配置文件：
+> - `~/.claude.json` — 运行时状态 + **MCP server 定义**（`mcpServers` 字段在这里）
+> - `~/.claude/settings.json` — 偏好设置（model、plugins、alwaysThinkingEnabled 等）
+>
+> 手动编辑 `~/.claude/settings.json` 中的 `mcpServers` **不会生效**。必须通过 `claude mcp add-json` 命令操作 `~/.claude.json`，或者直接编辑 `~/.claude.json`。
+
+路径是当前开发机的绝对路径，新机器需要调整。
 
 ---
 
@@ -40,10 +49,10 @@
 | `gdelt` | GDELT 全球新闻/事件 | Node.js | clone [GDELT-mcp](https://github.com/anysiteio/GDELT-mcp) → `npm install && npm run build` | 可选 |
 | `search` | DuckDuckGo 搜索 | Python (venv) | `pip install mcp-search-server` | 可选 |
 | `openalex` | OpenAlex 学术论文 | Node.js | clone [openalex-research-mcp](https://github.com/oksure/openalex-research-mcp) → `npm install && npm run build` | 可选 |
-| `crossref` | Crossref 文献 DOI | Node.js (npx) | 无需安装，`npx -y @botanicastudios/crossref-mcp` | 可选 |
+| `crossref` | Crossref 文献 DOI | Node.js | 本地固定安装 `@botanicastudios/crossref-mcp`（不要用 `npx -y`） | 可选 |
 | `pubmed` | PubMed 医学文献 | Python (venv) | clone [PubMed-MCP-Server](https://github.com/JackKuo666/PubMed-MCP-Server) → `pip install -r requirements.txt` | 可选 |
 | `arxiv` | arXiv 论文检索 | Python (uv) | `uv tool install arxiv-mcp-server` | 可选 |
-| `github` | GitHub API | Node.js (npx) | 无需安装，`npx -y @modelcontextprotocol/server-github` | 可选 |
+| `github` | GitHub API | Node.js | 本地固定安装 `@modelcontextprotocol/server-github`（不要用 `npx -y`） | 可选 |
 | `git` | 本地 Git 操作 | Python (venv) | `pip install mcp-server-git` | 可选 |
 | `playwright` | 浏览器自动化 | Node.js (npx) | `npx @playwright/mcp@latest`（若无系统 Chrome，请改用 `--executable-path ~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome`） | 可选 |
 
@@ -160,8 +169,10 @@ cd yahoo-finance-mcp && uv sync
 | `/mnt/d/python_project/my-quant-project` | git MCP 的 `--repository` 参数（改为你的项目路径） |
 
 **修改哪个文件取决于你用哪个 agent：**
-- Claude Code → 改 `.mcp.json` + 全局 `~/.claude/settings.json`
+- Claude Code → 用 `claude mcp add-json <name> '<json>' -s user` 写入 `~/.claude.json`（推荐），或手动编辑 `~/.claude.json` 的 `mcpServers` 字段
 - Codex → 改 `.codex/config.toml` + 全局 `~/.codex/config.toml`
+
+> **不要**手动编辑 `~/.claude/settings.json` 来配置 MCP — Claude Code 不从那里读 MCP 定义（详见第 1 节说明）。
 
 ---
 
@@ -178,6 +189,7 @@ Claude Code 会将项目级 `.mcp.json` 中的 filesystem MCP **沙箱化到项�
 - **Codex**: 使用 `env_vars = ["HTTP_PROXY", ...]` 自动从 shell 透传，无需在 config 中写值
 - **Claude Code**: 需要在 `.mcp.json` 的 `"env"` 中显式写 `"HTTP_PROXY": "${HTTP_PROXY}"`（支持 `${VAR}` 展开）
 - 如果某个 MCP 的网络请求失败（如 GDELT fetch failed），优先检查该 MCP 的 env 中是否传了代理变量
+- **Windows Codex App + `wsl.exe` bridge**: 这是第三种情况。`command = "wsl.exe"` + `bash -lic` 的 Node MCP，不能简单照搬 `env_vars`/`npx -y` 方案。对于走 HTTPS 的 Node `fetch`（如 `github`/`crossref`），实测会出现 `UND_ERR_CONNECT_TIMEOUT`；优先用本地固定安装 + 代理 launcher，不要用浮动 `npx -y`
 
 ### 5.3 项目级配置覆盖全局配置
 
@@ -247,11 +259,19 @@ curl -4 -m 15 -x http://127.0.0.1:10808 "http://api.gdeltproject.org/api/v2/doc/
 
 | 现象 | 根因 | 修复 |
 |------|------|------|
-| HTTPS 超时（port 443 无响应） | GDELT TLS 端口间歇性故障 | 改源码 `https://` → `http://`，重新 `npm run build`。改动位于 `GDELT-mcp/src/gdelt/client.ts` 的 `DOC_API_URL` 和 `GEO_API_URL` |
-| HTTP 直连超时但走代理正常 | 本地网络无法直达 GDELT（如中国大陆网络环境） | 确保 MCP env 中传入 `HTTP_PROXY`、`http_proxy` |
-| HTTP 走代理也超时 | 代理出口 IP 被 GDELT CDN 限速/拒绝，或代理本身故障 | 换代理节点或等待恢复 |
+| HTTPS 直连超时，但 `curl -x proxy https://...` 返回 200 | 本地网络到 `api.gdeltproject.org:443` 直连不稳定；代理路径可用 | 保持 `GDELT-mcp` 使用 upstream `https://` 端点，不要再强制改 `http://`；同时像 `github/crossref` 一样通过 `launch_with_proxy.mjs` 启动，让 Node `fetch()` 真正走代理 |
+| `curl` 走代理 HTTPS 能通，但 Node `fetch()` 仍报 `UND_ERR_CONNECT_TIMEOUT` | Node 原生 `fetch()` 没有正确套用环境代理 | 不要只设 `HTTP_PROXY` / `NODE_USE_ENV_PROXY`；要用 `undici.setGlobalDispatcher(new ProxyAgent(...))` 的 launcher 包一层 |
+| HTTP 返回 `429 Too Many Requests` | GDELT DOC HTTP 端点当前更容易触发限流 | 优先尝试 HTTPS + proxy launcher；如果仍遇到 429，调用间隔至少 5 秒，必要时更换代理节点 |
 
 > **提示**: GDELT DNS 仅解析到 IPv4，不存在 IPv6 路由问题。不需要加 `NODE_OPTIONS=--dns-result-order=ipv4first`。
+>
+> **2026-03-23 当前机器复核：**
+> - `curl --noproxy '*' https://api.gdeltproject.org/...` -> 超时
+> - `curl -x http://127.0.0.1:10808 https://api.gdeltproject.org/...` -> `200 OK`
+> - Node 原生 `fetch('https://...')` -> `UND_ERR_CONNECT_TIMEOUT`
+> - Node + `launch_with_proxy.mjs` / `ProxyAgent` -> 可命中上游，返回 `200` 或 `429`
+>
+> 结论：当前突破口不是“重装 GitHub 仓库”，而是“让 GDELT 和 `github` / `crossref` 一样通过代理 launcher 跑 HTTPS”。
 
 ### 5.8 GitHub MCP "Bad credentials" 排障
 
@@ -292,6 +312,70 @@ source ~/.bashrc
 
 **关键点：** MCP server 的 `${ENV_VAR}` 展开发生在 **server 启动时**。修改环境变量后必须重启 VSCode，让 MCP server 进程重新启动并读取新值。仅 `source ~/.bashrc` 不够——它只影响当前 shell，不影响已运行的 MCP server 进程。
 
+### 5.9 GitHub / Crossref 的 `fetch failed`（Windows bridge / Node HTTPS）
+
+如果满足下面 3 个条件：
+
+- `curl https://api.github.com/rate_limit` 或 `curl https://api.crossref.org/...` 能通
+- token 有效（GitHub `rate_limit` 返回 200）
+- MCP 仍然报 `fetch failed` / `UND_ERR_CONNECT_TIMEOUT`
+
+那么根因通常不是 token，而是 **Node 进程直连 443 超时**。实测现象是：
+
+- `curl` 走代理正常
+- Node 原生 `fetch()` 直连 `api.github.com:443` / `api.crossref.org:443` 超时
+- `gdelt` 如果继续用裸 Node `fetch()` 打 `https://api.gdeltproject.org/...`，也会遇到同类直连超时问题
+
+稳定做法：
+
+1. 不要再用 `npx -y @modelcontextprotocol/server-github`
+2. 不要再用 `npx -y @botanicastudios/crossref-mcp`
+3. 在 WSL 本地固定安装包
+4. 用一个代理 launcher 先执行 `undici.setGlobalDispatcher(new ProxyAgent(...))`，再 import 真正的 MCP 入口
+5. `gdelt` 在需要走 HTTPS 时，也使用同一个 launcher；不要只依赖 `NODE_USE_ENV_PROXY=1`
+
+当前本机落地路径：
+
+- launcher: `/home/help/mcp/servers/_mcp_wrappers/launch_with_proxy.mjs`
+- github: `/home/help/mcp/servers/github-mcp-local/node_modules/@modelcontextprotocol/server-github/dist/index.js`
+- crossref: `/home/help/mcp/servers/crossref-mcp-local/node_modules/@botanicastudios/crossref-mcp/mcp-server.js`
+- gdelt: `/home/help/mcp/servers/GDELT-mcp/dist/index.js`
+
+这条规则同样适用于 Windows Codex App 的 `wsl.exe -> bash -lic` bridge 配置。
+
+### 5.10 Claude Code MCP 配置文件陷阱（`~/.claude.json` vs `~/.claude/settings.json`）
+
+Claude Code 有**两个**看起来都像全局配置的 JSON 文件，但它们的作用完全不同：
+
+| 文件 | 实际作用 | MCP 定义是否在这里 |
+|------|---------|-------------------|
+| `~/.claude.json` | 运行时状态 + MCP server 注册 | **是** ✅ |
+| `~/.claude/settings.json` | 偏好设置（model、plugins、proxy env 等） | **否** ❌ |
+
+**常见踩坑场景：**
+
+1. 你手动编辑了 `~/.claude/settings.json` 里的 `mcpServers`，重启后发现 MCP 没变
+2. 你用 `claude mcp add` 注册了新 server，但去 `~/.claude/settings.json` 里找不到——因为它写入的是 `~/.claude.json`
+3. 两个文件里都有 `mcpServers` 字段（历史遗留），但 Claude Code **只读 `~/.claude.json`** 中的
+
+**正确的操作方式：**
+
+```bash
+# 查看当前 MCP 配置
+claude mcp list
+
+# 添加/替换 MCP server（写入 ~/.claude.json）
+claude mcp add-json <name> '<json>' -s user
+
+# 删除 MCP server
+claude mcp remove <name> -s user
+
+# 查看单个 server 配置
+claude mcp get <name>
+```
+
+> **Mac / Linux / WSL 都适用**：这不是 WSL 特有问题。所有平台的 Claude Code 都从 `~/.claude.json` 读 MCP 配置。如果你之前在 `~/.claude/settings.json` 里配了 MCP，需要迁移到 `~/.claude.json`（推荐用 `claude mcp add-json` 命令）。
+
 ---
 
 ## 6. Phase 1 技能链 → MCP 依赖映射
@@ -322,6 +406,7 @@ valuation-and-margin-of-safety → fs, yfinance, alpaca
 5. **HTTPS vs HTTP** — 若 HTTPS 超时但 HTTP 正常，可能是上游 TLS 故障（如 GDELT，详见 5.7）
 6. **trust（Codex）** — 项目是否标记为 trusted？
 7. **同名覆盖** — 项目级是否覆盖了全局配置？项目级配置是否完整？
+8. **Node HTTPS 直连超时** — 若 `curl` 正常但 Node MCP 仍报 `fetch failed` / `UND_ERR_CONNECT_TIMEOUT`，优先排查是否仍在用 `npx -y` 或未经过代理 launcher（详见 5.9）
 
 ---
 
@@ -329,7 +414,7 @@ valuation-and-margin-of-safety → fs, yfinance, alpaca
 
 以下模板用于快速确认“服务已启动”之外的“工具可调用”状态。建议每个 server 至少跑 1 个轻量调用。
 
-> 2026-03-04 本机实测：17/17 通过（含 `github` 私有仓库读取、`gdelt` 新闻检索）。
+> 2026-03-22 本机实测：17/17 通过。`github`/`crossref` 走 proxy launcher 恢复；`gdelt` 配置正常（`timeline`/`tone_chart` 可用，`search_articles` 受上游 429 限流）。
 
 | MCP | 最小调用示例 | 通过标准 |
 |-----|--------------|----------|
@@ -339,7 +424,7 @@ valuation-and-margin-of-safety → fs, yfinance, alpaca
 | `fetch` | `fetch("https://httpbin.org/get")` | 返回页面/JSON 内容 |
 | `alpaca` | `get_clock()` | 返回 market clock |
 | `rss` | `get_feed("https://hnrss.org/frontpage", count=1)` | 返回至少 1 条 item |
-| `gdelt` | `gdelt_search_articles("nvidia earnings", "1d", 2)` | 返回 `articles/count` |
+| `gdelt` | `gdelt_timeline("nvidia earnings", "1d", "volume")` | 返回 timeline 数据（**默认验收口径**）。不要用 `search_articles`/`monitor` 做 smoke（DOC API 易触发 `429`），不要用 `geo_search`（返回 `404`） |
 | `trading_mcp` | `get_fundamental_stock_metrics("AAPL")` | 返回 fundamentals 字段 |
 | `search` | `search_duckduckgo("OpenAI Codex MCP", 1)` | 返回搜索结果列表 |
 | `openalex` | `search_works("deep learning finance", per_page=1)` | 返回 `meta/results` |

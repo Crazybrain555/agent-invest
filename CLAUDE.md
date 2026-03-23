@@ -52,7 +52,6 @@ Primary working areas:
   - `company_research/*/scripts/run.py` are the canonical runners.
 - `company_research_runtime/`: shared runtime utilities used by skills (do not delete).
 - `_sec_downloads/`: sample SEC download/materialization utilities and specimens (if present).
-- `.mcp.json`: Claude Code 项目级 MCP 声明（路径为当前开发机布局，迁移时需调整）。
 - Docs (source of truth for workflow):
   - `docs/MASTER_PLAN.md` (architecture, protocols, shared schemas)
   - `docs/skills/` (per-skill specifications + README index)
