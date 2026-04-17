@@ -180,7 +180,7 @@ cd yahoo-finance-mcp && uv sync
 
 ### 5.1 fs MCP 不能放在项目级配置中（Claude Code）
 
-Claude Code 会将项目级 `.mcp.json` 中的 filesystem MCP **沙箱化到项目目录**。如果你需要访问项目外的路径（如技能链输出目录 `/home/help/mcp/work`），`fs` 必须配置在全局 `~/.claude/settings.json` 中，**不能**放在 `.mcp.json`。
+Claude Code 会将项目级 `.mcp.json` 中的 filesystem MCP **沙箱化到项目目录**。如果你需要访问项目外的路径（如技能链输出目录 `/home/help/mcp/work`），`fs` 必须配置在全局 `~/.claude.json` 的 `mcpServers` 中，**不能**放在 `.mcp.json`。
 
 当前 `.mcp.json` 已移除 `fs`，全局配置中保留。
 
@@ -194,7 +194,7 @@ Claude Code 会将项目级 `.mcp.json` 中的 filesystem MCP **沙箱化到项�
 ### 5.3 项目级配置覆盖全局配置
 
 **同名 MCP server，项目级会覆盖全局**（不是合并）。这意味着：
-- 如果 `.mcp.json` 和 `~/.claude/settings.json` 都定义了 `gdelt`，项目级的生效
+- 如果 `.mcp.json` 和 `~/.claude.json` 的 `mcpServers` 都定义了 `gdelt`，项目级的生效
 - 如果项目级的配置缺少某些字段（如 env），全局的那些字段不会补上
 
 建议：项目级配置要写完整，不要依赖全局补齐。
