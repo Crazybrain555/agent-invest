@@ -4,13 +4,13 @@
 
 ## 当前仓库实际状态
 
-当前 `.codex/skills/company_research/` 目录下，实际存在的可运行 skill 只有：
+当前 `.agents/skills/company_research/` 目录下，实际存在的可运行 skill 只有：
 
 | Asset | 路径 | 当前状态 | 说明 |
 |---|---|---|---|
-| `collect-company-facts` | `.codex/skills/company_research/collect-company-facts/` | 可运行 | 当前仓库中实际保留的 skill runner，用于收集 SEC filings / `filings_index.yaml` / raw snapshots |
+| `collect-company-facts` | `.agents/skills/company_research/collect-company-facts/` | 可运行 | 当前仓库中实际保留的 skill runner，用于收集 SEC filings / `filings_index.yaml` / raw snapshots |
 
-> 说明：本仓库是裁剪后的 skills/workflow 仓库，不是完整实现仓库。很多能力目前只有规格文档，还没有对应的 in-repo `scripts/run.py`。
+> 说明：本仓库是裁剪后的 skills/workflow 仓库，不是完整实现仓库。很多能力目前只有规格文档，还没有对应的 in-repo `scripts/run.py`。官方/本机安装的 skill 继续位于 `~/.codex/skills/`，不作为本仓库自定义 skill 的主路径。
 
 ## 9-Skill 目标架构规格索引
 

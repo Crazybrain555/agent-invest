@@ -47,9 +47,11 @@ Do not assume `src/`, schedulers, data pipelines, or other AIQuantLab production
 
 Primary working areas:
 
-- `.codex/skills/`:
+- `.agents/skills/`:
   - `company_research/*/SKILL.md` defines each skill contract and how to run it.
   - `company_research/*/scripts/run.py` are the canonical runners.
+- `~/.codex/skills/`: official or locally installed Codex skills outside this repo.
+- `.codex/config.toml`: project-scoped Codex/MCP configuration.
 - `company_research_runtime/`: shared runtime utilities used by skills (do not delete).
 - `_sec_downloads/`: sample SEC download/materialization utilities and specimens (if present).
 - Docs (source of truth for workflow):
@@ -108,19 +110,19 @@ Canonical execution order:
 Canonical commands (copy/paste):
 ```bash
 # 1) Identity + market snapshot denominators
-python .codex/skills/company_research/company-foundation/scripts/run.py AAPL
+python .agents/skills/company_research/company-foundation/scripts/run.py AAPL
 
 # 2) SEC evidence pool (filings_index + raw/sec snapshots)
-python .codex/skills/company_research/collect-company-facts/scripts/run.py AAPL
+python .agents/skills/company_research/collect-company-facts/scripts/run.py AAPL
 
 # 3) XBRL timeseries -> Statement Atlas
-python .codex/skills/company_research/extract-xbrl-timeseries/scripts/run.py AAPL
+python .agents/skills/company_research/extract-xbrl-timeseries/scripts/run.py AAPL
 
 # 4) GAAP -> economic statements (NOPAT/ROIC/FCF/etc)
-python .codex/skills/company_research/recast-economic-statements/scripts/run.py AAPL
+python .agents/skills/company_research/recast-economic-statements/scripts/run.py AAPL
 
 # 5) Valuation + margin of safety
-python .codex/skills/company_research/valuation-and-margin-of-safety/scripts/run.py AAPL --model-type hybrid
+python .agents/skills/company_research/valuation-and-margin-of-safety/scripts/run.py AAPL --model-type hybrid
 ```
 
 Shared flags:
@@ -141,7 +143,7 @@ Prefer explicitly attaching the most relevant sources instead of describing them
 - `@docs/MASTER_PLAN.md`
 - `@docs/skills/specs/<skill-doc>.md`
 - `@docs/references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md`
-- `@.codex/skills/company_research/<skill>/SKILL.md`
+- `@.agents/skills/company_research/<skill>/SKILL.md`
 - `@company_research_runtime/`
 
 ### 5.2 `/clear` reset rule

@@ -82,7 +82,7 @@ If a tool response may be huge (logs, big diffs, data dumps), keep outputs small
 - When a rule is stable/repeated: prefer writing it into repo docs over relying on chat context or memory.
 
 ### Presenting results
-- Be concise. Reference paths as inline code (e.g. `.codex/skills/company_research/collect-company-facts/SKILL.md`).
+- Be concise. Reference paths as inline code (e.g. `.agents/skills/company_research/collect-company-facts/SKILL.md`).
 - When you changed code: explain what + why + how to verify.
 
 ---
@@ -141,15 +141,17 @@ If WSL prints localhost proxy warnings in NAT mode:
 
 Primary working areas:
 - `.codex/config.toml`: project-scoped MCP server declarations (paths are machine-specific, see README for setup on new machines).
-- `.codex/skills/`: skill definitions and scripts; start from the relevant `SKILL.md`.
-- `.codex/skills/public/`: reusable public skills (e.g., stock pool).
-- `.codex/skills/company_research/`: company research skills and scripts.
+- `.agents/skills/`: repo-shared custom skill definitions and scripts; start from the relevant `SKILL.md`.
+- `.agents/skills/public/`: reusable repo-shared skills (if present).
+- `.agents/skills/company_research/`: company research skills and scripts tracked with this repo.
+- `~/.codex/skills/`: official or locally installed Codex skills outside the repo working tree.
 - `company_research_runtime/`: shared runtime helpers used by company research skills (do not delete).
 - Root docs: `README.md`, `AGENTS.md`, `CLAUDE.md`.
 - Planning & specs: `docs/MASTER_PLAN.md`, `docs/skills/` (per-skill specs), `docs/references/`, `docs/archive/`.
 
 Notes:
 - This LLM branch is intentionally trimmed; traditional pipelines/tools are removed.
+- Keep repo custom skills under `.agents/skills`; do not treat `.codex/skills` as the repo-local skill home.
 - Keep edits focused on skill workflows and documentation.
 
 ### 4.1 Runtime Output Directory (运行产物目录)
