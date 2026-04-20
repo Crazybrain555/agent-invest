@@ -64,7 +64,7 @@ company-foundation
 
 不变量：
 - `raw/` **只写不删**，不在里面做研究拆解。
-- `events/` 是未来数据库化的核心。财报事件是第一优先级，要能处理"正文在 EX-99.\*"的现实。
+- `events/` 是未来数据库化的核心。财报事件是第一优先级，要能处理"正文在 EX-99.*"的现实。
 - `current/` 是下游和 UI 消费的唯一查询点。
 
 ### 2.3 Skills 不互相调用
@@ -81,24 +81,25 @@ company-foundation
 
 | Skill | 路径 | 状态 |
 |---|---|---|
-| `company-foundation` | `.agents/skills/company_research/company-foundation/` | 预留路径，当前仓库未跟踪 runner |
 | `collect-company-facts` | [.agents/skills/company_research/collect-company-facts/](.agents/skills/company_research/collect-company-facts/) | 有 `SKILL.md` + `scripts/`，生成 `filings_index.yaml` 和 `raw/sec` 快照 |
 
-其余 **7 个 skill 目前只有规格文档**（见 [docs/skills/specs/](docs/skills/specs/)），仓库里还没有对应的 `scripts/run.py`。不要把"规格已定义"误读为"代码已实现"。
+其余 **8 个 skill 目前只有规格文档**（见 [docs/skills/specs/](docs/skills/specs/)），仓库里还没有对应的 in-repo `scripts/run.py`。不要把"规格已定义"误读为"代码已实现"。
 
 ### 3.2 支持设施
 
 - [company_research_runtime/](company_research_runtime/) — 共享运行时工具（各 skill 复用，不要删）
-- [CONTINUITY.md](CONTINUITY.md) — 跨会话的连续性账本（抗 compaction 的会话简报）
+- [docs/agent/Status.md](docs/agent/Status.md) / [docs/agent/Plan.md](docs/agent/Plan.md) / [docs/agent/Implement.md](docs/agent/Implement.md) — 当前 durable workflow 的恢复入口、milestone 计划和执行 runbook
 - [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md) — agent 协作契约与仓库不变量
 - [docs/MCP_SETUP_GUIDE.md](docs/MCP_SETUP_GUIDE.md) — MCP 工具配置指南
 
+旧的 `CONTINUITY.md` 不再是当前仓库的主恢复入口；恢复长任务时以 `docs/agent/Status.md` 为准。
+
 ### 3.3 下一步优先级
 
-1. 把 `company-foundation` 和 `collect-company-facts` 的契约固化，`filings_index` / `company.yaml` 产物稳定。
-2. 启动 `xbrl-parse-financial-report-events`（Statement Atlas）—— 利润事实底座。
-3. 然后是 `recast-economic-statements`（Owner Earnings / NOPAT / ROIC），打通到估值前的最后一步。
-4. 估值链 `valuation-and-margin-of-safety` 先跑 demo / 占位，等上游数据到位后换真数据。
+1. 先把 `collect-company-facts` 的 blocked/demo/输出契约硬化，确保当前唯一 runner 的行为和文档一致。
+2. 再决定下一步先实现 `company-foundation`，还是先把当前 runner 迁移到目标 Skill 2（`sec-ingest-and-materialize-events`）契约。
+3. 启动 `xbrl-parse-financial-report-events`（Statement Atlas）—— 利润事实底座。
+4. 然后是 `recast-economic-statements` 和 `valuation-and-margin-of-safety`，等上游产物稳定后逐步打通。
 
 ---
 
@@ -108,13 +109,11 @@ company-foundation
 quanti/
   CLAUDE.md                         # Claude Code 专用操作契约
   AGENTS.md                         # 跨 agent 不变量与安全规则
-  CONTINUITY.md                     # 会话连续性账本
   README.md                         # 本文件
 
   .agents/
     skills/company_research/
-      company-foundation/           # 预留路径（当前未跟踪 runner）
-      collect-company-facts/        # 实际存在（SKILL.md + scripts/）
+      collect-company-facts/        # 当前唯一实际存在的 in-repo skill runner
 
   .codex/
     config.toml                     # 项目级 Codex / MCP 配置
@@ -124,6 +123,12 @@ quanti/
   company_research_runtime/         # 各 skill 共享的运行时工具
 
   docs/
+    agent/
+      Prompt.md
+      Plan.md
+      Status.md
+      Implement.md
+      Documentation.md
     MCP_SETUP_GUIDE.md
     skills/
       MASTER_PLAN.md                # 核心公式 / 设计原则 / 产物 schema
@@ -150,6 +155,10 @@ quanti/
 pip install -r requirements.txt
 ```
 
+说明：
+- `requirements.txt` 目前更像历史占位清单，不是完整的运行时锁定文件。
+- 如果运行 `collect-company-facts` 时遇到缺少模块的报错，需要按实际 import 补装依赖，后续再在专门里程碑中统一整理。
+
 ### 5.2 当前仓库实际可跑的命令
 
 ```bash
@@ -157,12 +166,11 @@ pip install -r requirements.txt
 python .agents/skills/company_research/collect-company-facts/scripts/run.py AAPL
 ```
 
-常用 flag（skill 规格中约定的通用开关）：
-- `--demo`：离线 demo 模式（内置 demo 负载）
-- `--force-refresh`：即使 `current/` 看起来已完整也重算
-- `--as-of YYYY-MM-DD`：锁定快照日期（默认今天）
-
-skill 被阻塞时会在 `runs/{run_id}/needs.yaml` 里说明缺的上游依赖，不会抛脏数据到 `current/`。
+补充说明：
+- 这是当前仓库里唯一实际存在的 in-repo runner。
+- 它的 hard dependency 是 `${COMPANY_RESEARCH_ROOT}/company/{TICKER}/company.yaml` 里有有效 `cik`。
+- 缺依赖时，预期行为是写 `runs/{run_id}/needs.yaml` 并返回 `blocked`，而不是把脏数据写进 `current/`。
+- flag 与输入契约以对应的 [SKILL.md](.agents/skills/company_research/collect-company-facts/SKILL.md) 和本地 `--help` 为准。
 
 ---
 
@@ -170,11 +178,11 @@ skill 被阻塞时会在 `runs/{run_id}/needs.yaml` 里说明缺的上游依赖�
 
 本仓库的 skill 链依赖一组 MCP 服务（SEC EDGAR、yfinance、alpaca、trading_mcp 等）。完整清单和安装/环境变量说明在 [docs/MCP_SETUP_GUIDE.md](docs/MCP_SETUP_GUIDE.md)。
 
-Phase 1 技能链 → MCP 映射：
+目标 skill 链 → MCP 映射（架构规划；当前 in-repo 只有 `collect-company-facts` 已实现）：
 
 - `company-foundation` → `sec_edgar_mcp, alpaca, trading_mcp, yfinance`
 - `collect-company-facts` → `sec_edgar_mcp, fs`
-- `extract-xbrl-timeseries` → `sec_edgar_mcp, fs`
+- `xbrl-parse-financial-report-events` → `sec_edgar_mcp, fs`
 - `recast-economic-statements` → `fs`
 - `valuation-and-margin-of-safety` → `fs, yfinance, alpaca`
 
@@ -215,7 +223,8 @@ export NAS_BASE_PATH=/mnt/space/forbid
 - [docs/skills/README.md](docs/skills/README.md) — 9-skill 索引与实现状态
 - [docs/skills/specs/](docs/skills/specs/) — 每个 skill 的详细规格
 - [docs/skills/references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md](docs/skills/references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md) — SEC/XBRL 技术参考
+- [docs/agent/Status.md](docs/agent/Status.md) — 当前 durable workflow 的短恢复指针
+- [docs/agent/Plan.md](docs/agent/Plan.md) — 当前 milestone、验收标准与验证命令
 - [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md) — agent 协作与安全规则
-- [CONTINUITY.md](CONTINUITY.md) — 当前会话状态
 
 > 如果本 README 与文件系统、`docs/skills/MASTER_PLAN.md` 冲突，以 **真实仓库状态 / MASTER_PLAN** 为准。

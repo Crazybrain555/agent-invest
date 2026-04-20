@@ -5,69 +5,50 @@ Updated by: Codex
 
 ## Current state
 
-Current milestone: M1 — Repo reality reconciliation
+Current milestone: M2 — Harden `collect-company-facts`
 Status: `ready_to_start`
 
-One-sentence summary: The Codex harness foundation is in place, and the live repo plus `quanti_codex_harness_final_overlay.zip` are now aligned on the same concise 5-mode router with detailed execution kept in `docs/agent/Implement.md`.
+One-sentence summary: M1 is complete: the human-facing docs now match the trimmed repo reality, `CONTINUITY.md` is retired from the active workflow, and the next step is to harden the current `collect-company-facts` runner.
 
-Next action: Start M1 by checking `README.md`, `docs/skills/README.md`, `docs/skills/MASTER_PLAN.md`, `CLAUDE.md`, and `CONTINUITY.md` for claims that no longer match the trimmed repo or the new `docs/agent/` workflow.
+Next action: Start M2 by inspecting `.agents/skills/company_research/collect-company-facts/SKILL.md`, `.agents/skills/company_research/collect-company-facts/scripts/run.py`, and `company_research_runtime/` for blocked/demo/output-contract mismatches before any code edits.
 
 ## Recently completed
 
-- Applied the harness foundation files in the live repository:
-  - `.codex/config.toml`
-  - `AGENTS.md`
-  - `docs/agent/Prompt.md`
-  - `docs/agent/Plan.md`
-  - `docs/agent/Status.md`
-  - `docs/agent/Implement.md`
-  - `docs/agent/Documentation.md`
-- Simplified task routing to five modes:
-  1. Quick task.
-  2. Plan or replan durable work.
-  3. Execute an approved durable milestone.
-  4. Resume durable work.
-  5. Harness or agent-policy maintenance.
-- Tightened the harness so `AGENTS.md` stays focused on routing and stable rules, while `docs/agent/Implement.md` carries the detailed execution loop.
-- Synced the live repo files and the exported overlay archive to the same final harness version.
-- Preserved environment-backed Context7 MCP headers instead of hard-coding a key.
-- Left `CONTINUITY.md` in place as a legacy continuity file pending M1.
+- Completed M1 — Repo reality reconciliation.
+- Updated `README.md` so it no longer claims `company-foundation/` exists in the worktree and no longer treats `CONTINUITY.md` as the active resume file.
+- Rewrote `CLAUDE.md` to use `docs/agent/Status.md` / `Plan.md` / `Implement.md` as the active durable workflow references.
+- Confirmed `docs/skills/README.md` and `docs/skills/MASTER_PLAN.md` already matched current implementation-vs-target distinctions and did not require edits.
+- Kept the current `CONTINUITY.md` deletion state untouched and documented the repo decision to retire it from the active workflow.
 
 ## Current blockers
 
-- No blocker for M0; the harness foundation is in place.
-- If Context7 MCP is needed immediately, the local Codex environment must have `CONTEXT7_API_KEY` set.
-- A non-interactive `codex exec` smoke test was previously inconclusive in this shell because Codex CLI hit external `403 Forbidden` plugin/analytics warnings before producing a final answer.
+- Local runtime validation for M2 is currently limited because `python .agents/skills/company_research/collect-company-facts/scripts/run.py --help` fails with `ModuleNotFoundError: No module named 'yaml'`.
+- M2 still needs an explicit decision on whether `--demo` should require `company.yaml.cik` or support a true dependency-light demo path.
 
 ## Files changed in current task
 
-- `quanti_codex_harness_final_overlay.zip`
-- `AGENTS.md`
-- `docs/agent/Prompt.md`
+- `README.md`
+- `CLAUDE.md`
+- `docs/MCP_SETUP_GUIDE.md`
 - `docs/agent/Plan.md`
+- `docs/agent/Prompt.md`
 - `docs/agent/Status.md`
-- `docs/agent/Implement.md`
 - `docs/agent/Documentation.md`
+- `docs/skills/references/SEC_EDGAR_FILING_XBRL_DOWNLOAD_SPEC.md`
 
 ## Latest validation
 
 | Command | Result | Notes |
 | --- | --- | --- |
-| TOML parse of `.codex/config.toml` | pass | Parsed successfully with `tomllib`. |
-| `find docs/agent -maxdepth 1 -type f \| sort` | pass | All 5 durable workflow files are present. |
-| `rg -n 'Mode 1\|Mode 2\|Mode 3\|Mode 4\|Mode 5\|Keep this file concise' AGENTS.md` | pass | Confirmed the 5-mode router and AGENTS/Implement split are explicit. |
-| `zipinfo -1 quanti_codex_harness_final_overlay.zip \| sort` | pass | Confirmed the rebuilt archive contains only the intended overlay files. |
-| Overlay content sync check | pass | Rebuilt archive matches the live repo files byte-for-byte for all exported harness files. |
-| Runtime code validation | not_run | No business code or skill runner code changed in this milestone. |
+| `find . -maxdepth 4 -type f \( -name '*.md' -o -name '*.py' \) \| sort` | pass | Confirmed the trimmed repo shape used for M1 doc reconciliation. |
+| `rg -n "docs/MASTER_PLAN\|extract-xbrl-timeseries\|company-foundation/scripts/run.py\|valuation-and-margin-of-safety/scripts/run.py\|CONTINUITY" README.md AGENTS.md CLAUDE.md docs \|\| true` | pass | Active entry docs were cleaned; remaining matches are deliberate retirement notes, historical aliases in references, or archive/history files. |
+| `python .agents/skills/company_research/collect-company-facts/scripts/run.py --help` | fail | Local environment is missing `yaml` (`ModuleNotFoundError`), so M2 runtime validation is currently blocked on dependency setup. |
 
 ## Important decisions since last update
 
-- Keep task routing to 5 modes rather than 7-8 modes to reduce ambiguity and prompt overhead.
-- Merge simple read-only inspection and simple bounded edits into Mode 1.
-- Merge new-plan and replan/scope-change behavior into Mode 2.
-- Keep resume as its own mode because session interruption and compaction are common failure points.
-- Keep harness/policy maintenance as its own mode because it changes how future Codex sessions behave.
-- Keep `AGENTS.md` concise and let `docs/agent/Implement.md` carry the detailed run loop.
+- Treat `docs/agent/Status.md` as the active durable resume file across agents.
+- Retire `CONTINUITY.md` from the active workflow instead of restoring it implicitly.
+- Keep `CLAUDE.md` as Claude-specific guidance only; implementation truth lives in the filesystem, `AGENTS.md`, `docs/agent/*`, and `docs/skills/*`.
 - Treat `docs/agent/Status.md` as the short session-resume file.
 - Treat `docs/agent/Documentation.md` as longer audit/operator memory.
 

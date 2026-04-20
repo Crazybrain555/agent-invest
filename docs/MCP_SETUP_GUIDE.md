@@ -383,11 +383,11 @@ claude mcp get <name>
 只需安装对应行的 MCP 即可运行该技能：
 
 ```
-company-foundation           → sec_edgar_mcp, alpaca, trading_mcp, yfinance
-collect-company-facts        → sec_edgar_mcp, fs
-extract-xbrl-timeseries      → sec_edgar_mcp, fs
-recast-economic-statements   → fs
-valuation-and-margin-of-safety → fs, yfinance, alpaca
+company-foundation               → sec_edgar_mcp, alpaca, trading_mcp, yfinance
+collect-company-facts            → sec_edgar_mcp, fs
+xbrl-parse-financial-report-events → sec_edgar_mcp, fs
+recast-economic-statements       → fs
+valuation-and-margin-of-safety   → fs, yfinance, alpaca
 ```
 
 **最小安装集**（跑完整 Phase 1 链路）：`sec_edgar_mcp` + `alpaca` + `trading_mcp` + `yfinance` + `fs`

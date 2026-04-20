@@ -48,9 +48,9 @@ This repository does **not** currently contain a complete production scheduler, 
 
 ## Current durable task brief
 
-Current task: Codex-native harness foundation and policy simplification for Quanti.
+Current task: Stabilize the Codex-native harness and the first in-repo runner contract for Quanti.
 
-Purpose: make Codex easier to operate from natural-language prompts by keeping the repo policy concise, reducing task routing to five modes, and preserving durable project memory under `docs/agent/`.
+Purpose: keep Codex easy to operate from natural-language prompts, preserve durable project memory under `docs/agent/`, align docs with repo reality, and harden the current `collect-company-facts` runner contract before adding more in-repo skills.
 
 Goals:
 
@@ -58,14 +58,16 @@ Goals:
 - Use a 5-mode task router in `AGENTS.md` rather than many fine-grained modes.
 - Keep `AGENTS.md` focused on routing, hard rules, and stable repository facts.
 - Keep detailed execution steps in `docs/agent/Implement.md` rather than repeating them in `AGENTS.md`.
+- Keep human-facing docs aligned with the actual trimmed repo state.
 - Keep `Status.md` short enough for session start/resume.
 - Keep `Plan.md` as the source of truth for milestones and validation.
 - Keep `Implement.md` as the runbook rather than duplicating detailed execution logic in `AGENTS.md`.
+- Make the current `collect-company-facts` runner behavior explicit around blocked dependencies, validation, and artifact outputs.
 
 Non-goals:
 
 - Do not add hooks, subagents, or new skills in this phase.
-- Do not change runtime/business code as part of harness maintenance unless explicitly requested.
+- Do not broaden into full multi-skill implementation before the current runner contract is stable.
 - Do not overfit `AGENTS.md` to one prompt template.
 
 ## Deliverables
@@ -80,12 +82,14 @@ Non-goals:
 
 ## Done when
 
-The harness foundation is done when:
+This stabilization phase is done when:
 
 - Codex can start from the repo root and understand the repo is skills-only.
 - Codex can distinguish implemented skill assets from target specs.
 - `AGENTS.md` routes common requests into five clear modes.
 - `AGENTS.md` stays concise enough to fit the project-doc budget and defers detailed run loops to `Implement.md`.
+- Human docs no longer imply missing repo paths or obsolete continuity files are active.
+- The current `collect-company-facts` runner contract is explicit about dependencies, blocked behavior, validation, and output locations.
 - Long tasks have a file-based startup/resume protocol.
 - Validation commands and blocked-environment handling are explicit.
 - `Status.md` is short enough to read at every session start.
@@ -99,6 +103,5 @@ The harness foundation is done when:
 
 ## Open questions
 
-- Should the old `CONTINUITY.md` be retired, or kept only for Claude-specific continuity?
 - Should `company-foundation` be implemented next, or should `collect-company-facts` be renamed/migrated toward the target Skill 2 contract first?
 - Should the runner dependency set be formalized in `requirements.txt` or a future `pyproject.toml`?

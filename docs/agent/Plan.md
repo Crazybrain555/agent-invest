@@ -4,7 +4,7 @@ This file is the source of truth for current long-horizon work. Keep it updated 
 
 ## Task
 
-Short name: Codex-native harness foundation for Quanti
+Short name: Stabilize Codex harness and current in-repo runner for Quanti
 
 Related specification:
 
@@ -21,19 +21,19 @@ Related specification:
 
 ## Current milestone
 
-Milestone: M1 — Repo reality reconciliation
+Milestone: M2 — Harden `collect-company-facts`
 
 Status: `ready_to_start`
 
-Next action: Run a targeted doc-reality pass across `README.md`, `docs/skills/README.md`, `docs/skills/MASTER_PLAN.md`, `CLAUDE.md`, and the new durable workflow docs so Codex and human-facing docs agree on what is actually implemented today.
+Next action: Inspect `.agents/skills/company_research/collect-company-facts/` and `company_research_runtime/` so the current runner behavior, blocked conditions, and validation expectations match the documented contract.
 
 ## Milestone overview
 
 | ID | Milestone | Scope | Acceptance criteria | Validation | Status |
 | --- | --- | --- | --- | --- | --- |
 | M0 | Harness foundation | `.codex/config.toml`, `AGENTS.md`, `docs/agent/*` | Codex has concise repo policy, 5-mode router, durable state, runbook, and validation protocol | TOML parse; path/routing checks | completed |
-| M1 | Repo reality reconciliation | `README.md`, `docs/skills/README.md`, `docs/skills/MASTER_PLAN.md`, maybe `CLAUDE.md` | Human docs and agent docs agree on current implemented assets | Manual doc review; path checks | ready_to_start |
-| M2 | Harden `collect-company-facts` | skill definition + runner + runtime helpers | Runner behavior matches documented contract; blocked/demo behavior is explicit | `compileall`, `--help`, focused run when artifacts exist | not_started |
+| M1 | Repo reality reconciliation | `README.md`, `docs/skills/README.md`, `docs/skills/MASTER_PLAN.md`, maybe `CLAUDE.md` | Human docs and agent docs agree on current implemented assets | Manual doc review; path checks | completed |
+| M2 | Harden `collect-company-facts` | skill definition + runner + runtime helpers | Runner behavior matches documented contract; blocked/demo behavior is explicit | `compileall`, `--help`, focused run when artifacts exist | ready_to_start |
 | M3 | Decide next first-class skill | specs + plan only, likely `company-foundation` or Skill 2 migration | A self-contained implementation plan exists before code edits | Plan review | not_started |
 | M4 | Implement next runner in small slice | selected skill path + runtime helpers | New runner writes meta/result/needs and one useful artifact | compile/help/focused run | not_started |
 | M5 | Add lightweight validation harness | scripts or docs, not external wrapper yet | Repeated checks are copy-pasteable and reliable | Run validation commands | not_started |
@@ -130,7 +130,10 @@ Expected evidence:
 
 Status notes:
 
-- Not started.
+- Completed on 2026-04-20.
+- `README.md` now reflects that only `collect-company-facts` exists in-repo today.
+- `CLAUDE.md` now points Claude sessions at `docs/agent/Status.md` instead of a missing `CONTINUITY.md`.
+- No change was required in `docs/skills/README.md` or `docs/skills/MASTER_PLAN.md`.
 
 ### M2 — Harden `collect-company-facts`
 
@@ -260,7 +263,7 @@ This is deliberately not an external orchestrator. It is a file-based harness fo
 | Long docs overwhelm context | Codex may read too much and drift | Start from `Status.md`, then active milestone only | active |
 | Machine-specific MCP config breaks elsewhere | `.codex/config.toml` uses absolute local paths | Keep config machine-local; use env vars for secrets | active |
 | Demo path requires `company.yaml` | A nominal demo can block if CIK is missing | Document current behavior or change intentionally in M2 | active |
-| `CONTINUITY.md` conflicts with new durable state | Multiple state files confuse future sessions | Decide in M1 whether to retire or repurpose it | active |
+| `CONTINUITY.md` conflicts with new durable state | Multiple state files confuse future sessions | Retire `CONTINUITY.md` from the active workflow and use `docs/agent/Status.md` instead | mitigated |
 
 ## Decision log
 

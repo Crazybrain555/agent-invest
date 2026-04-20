@@ -20,7 +20,7 @@ The applied harness deliberately uses native Codex mechanisms first:
 
 No hooks, subagents, or new skills are part of the first phase.
 
-The active next step is `M1 — Repo reality reconciliation`.
+The active next step is `M2 — Harden collect-company-facts`.
 
 ## How to prompt Codex for this repo
 
@@ -113,6 +113,14 @@ Rationale: Recent OpenAI/Codex guidance and public OpenAI repository examples co
 
 Consequences: Future harness edits should resist turning `AGENTS.md` into a second `Implement.md`. If routing or policy changes, update both files together and preserve the separation of responsibilities.
 
+### 2026-04-20 — Retire `CONTINUITY.md` from the active workflow
+
+Decision: Treat `docs/agent/Status.md` as the canonical resume file for current long-horizon work and stop documenting `CONTINUITY.md` as an active repo requirement.
+
+Rationale: The file is already absent from the current worktree, while the new durable workflow is present and in active use. Restoring `CONTINUITY.md` implicitly would create a second, conflicting state source.
+
+Consequences: `README.md` and `CLAUDE.md` now point agents to `docs/agent/Status.md`, `Plan.md`, and `Implement.md`. If a Claude-specific continuity ledger is ever needed again, it should be reintroduced explicitly rather than inferred from stale docs.
+
 ### 2026-04-20 — Simplify task routing to five modes
 
 Decision: Replace the earlier fine-grained router with five primary modes: quick task, plan/replan durable work, execute approved milestone, resume durable work, and harness/policy maintenance.
@@ -174,6 +182,9 @@ Consequences: If Codex repeatedly forgets to update `Status.md` or run validatio
 | 2026-04-20 | M0 | overlay content sync check | pass | Confirmed the archive matches the live repo byte-for-byte for the exported harness files. |
 | 2026-04-20 | M0 | `codex --version` | pass | Local CLI available as `codex-cli 0.121.0`. |
 | 2026-04-20 | M0 | `codex exec --ephemeral --sandbox read-only ...` | inconclusive | CLI session stalled after external `403 Forbidden` warnings during plugin/analytics traffic and produced no final answer. |
+| 2026-04-20 | M1 | `find . -maxdepth 4 -type f \( -name '*.md' -o -name '*.py' \) \| sort` | pass | Confirmed the trimmed repo shape used for doc reconciliation. |
+| 2026-04-20 | M1 | `rg -n "docs/MASTER_PLAN\|extract-xbrl-timeseries\|company-foundation/scripts/run.py\|valuation-and-margin-of-safety/scripts/run.py\|CONTINUITY" README.md AGENTS.md CLAUDE.md docs \|\| true` | pass | Active entry docs were cleaned; remaining matches are deliberate retirement notes, historical aliases in references, or archive/history files. |
+| 2026-04-20 | M1 | `python .agents/skills/company_research/collect-company-facts/scripts/run.py --help` | fail | Local environment lacks `PyYAML`, so even CLI help is currently blocked on dependency setup. |
 
 ## Known issues
 
@@ -181,7 +192,6 @@ Consequences: If Codex repeatedly forgets to update `Status.md` or run validatio
 | --- | --- | --- |
 | Non-interactive `codex exec` smoke test was inconclusive in this shell | Could not fully verify the first-prompt behavior from CLI automation | Retry from the normal Codex app/CLI environment after confirming auth/session health; M0 file-level validation is still complete. |
 | Existing `.mcp.json` in uploaded archive contained a hard-coded Context7 key | Secret hygiene risk if shared | Prefer env vars; consider rotating the key and updating `.mcp.json` separately. |
-| Existing `CLAUDE.md` references some paths/commands that may not exist in the trimmed repo | Claude/Codex docs can diverge | Handle in M1 repo reality reconciliation. |
 | `collect-company-facts --demo` still appears to require `company.yaml.cik` | A demo run may block unexpectedly | Document current behavior or modify intentionally in M2. |
 | `requirements.txt` is mostly commented and may not install all imports used by runners | Fresh setup may fail on missing packages such as YAML support | Decide in a later milestone whether to formalize dependencies. |
 
@@ -191,5 +201,6 @@ Consequences: If Codex repeatedly forgets to update `Status.md` or run validatio
 - [x] Simplify task routing to five modes.
 - [ ] Export `CONTEXT7_API_KEY` locally if Context7 MCP is needed.
 - [x] Run TOML parse validation.
-- [ ] Ask Codex to perform M1 repo reality reconciliation.
-- [ ] Decide whether `CONTINUITY.md` should be retired or aligned with `docs/agent/Status.md`.
+- [x] Ask Codex to perform M1 repo reality reconciliation.
+- [x] Retire `CONTINUITY.md` from the active workflow in favor of `docs/agent/Status.md`.
+- [ ] Start M2 on `collect-company-facts` blocked/demo/runtime contract hardening.

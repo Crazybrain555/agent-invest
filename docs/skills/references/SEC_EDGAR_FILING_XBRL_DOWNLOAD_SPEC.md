@@ -221,7 +221,7 @@ company/{TICKER}/raw/sec/{accession}/
     - `raw/sec/{accession}/xbrl/`：instance + `.xsd` + linkbases（优先不保留 `*-xbrl.zip`）
     - `sections/`：从 `primary_document` 本地 best-effort 抽取（MD&A / Risk Factors / Business 等）
     - `meta.yaml` / `manifest.yaml`：来源 URL + hash + 完整性标记
-- Skill3（`extract-xbrl-timeseries`）负责 **消费本地 XBRL → 构建 Statement Atlas**：
+- Skill3（`xbrl-parse-financial-report-events`，历史上也叫 `extract-xbrl-timeseries`）负责 **消费本地 XBRL → 构建 Statement Atlas**：
   - 读取 `raw/sec/{accession}/xbrl/` 解析 instance + linkbases
   - 产出 `current/xbrl_atlas/*`（facts/nodes/edges/paths/periods），并保留 `accession` 溯源
 - 可选 fallback（仅兜底）：当本地 XBRL 缺失/异常时，可临时用 SEC “已抽取”的 XBRL（例如 `sec_edgar_mcp.get_financials` / `companyfacts`）bootstrap，但必须在结果中明确标记为降级路径
