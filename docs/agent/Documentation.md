@@ -1,206 +1,216 @@
 # Documentation.md — Quanti Agent Audit Log and Operator Notes
 
-This file is durable audit memory for long-horizon Codex work. It may grow over time. Keep `Status.md` short; put long history, decisions, run instructions, and known issues here.
+This file is the long-form memory for durable Codex work in this repository. Keep `Status.md` short; put longer decisions, validation history, review history, and operator notes here.
 
 ## Current feature / task overview
 
-The Codex-native harness foundation has now been applied in this repository, simplified to a 5-mode task router, and synchronized with the exported overlay archive.
+The current task is to stabilize a Codex-native harness for a skills-only company research workspace, then use that harness to harden the currently implemented `collect-company-facts` runner and future company research skills.
 
-The repository is a company research / valuation skills workspace. Its target architecture is a 9-skill chain that produces evidence-backed valuation outputs, but the current checkout only has one implemented in-repo runner: `collect-company-facts`.
+The harness is deliberately file-based and native to Codex app/CLI usage:
 
-The applied harness deliberately uses native Codex mechanisms first:
+- `AGENTS.md` defines stable repo policy, the three-mode router, and task-relationship handling.
+- `Prompt.md` freezes goals, non-goals, constraints, deliverables, and done criteria.
+- `Plan.md` tracks milestones, progress, active working checklist/todos, decisions, risk, and validation.
+- `Status.md` is the short current-task and continuation vector for new sessions.
+- `Implement.md` is the detailed runbook.
+- `code_review.md` defines independent review behavior.
+- `.codex/agents/quanti_reviewer.toml` defines the read-only reviewer subagent.
 
-- `.codex/config.toml` for session-level behavior and machine-specific MCP configuration.
-- `AGENTS.md` for concise repo operating policy and task routing.
-- `docs/agent/Prompt.md` for goals and constraints.
-- `docs/agent/Plan.md` for milestones and validation.
-- `docs/agent/Implement.md` for the execution loop.
-- `docs/agent/Status.md` for short resume state.
-- this file for audit history and operator notes.
+The current active product milestone remains `M2 — Harden collect-company-facts`. The 2026-04-21 harness migration changed workflow semantics and review policy, but it did not advance or replace `M2`.
 
-No hooks, subagents, or new skills are part of the first phase.
+## Operating model
 
-The active next step is `M2 — Harden collect-company-facts`.
-
-## How to prompt Codex for this repo
-
-The user does not need to write rigid workflow prompts. Natural prompts are expected; `AGENTS.md` routes them.
-
-### Quick task
+The preferred durable workflow is:
 
 ```text
-Check whether README mentions any runner command that does not exist. Do not edit yet; just report findings.
+Classify task relationship -> plan/replan if needed -> execute active milestone -> validate -> independent review -> fix accepted findings -> update Status/Documentation -> continue or stop
 ```
 
-### New durable task / plan first
+The task relationship can be:
 
 ```text
-I want to implement company-foundation next. First inspect the relevant specs and current repo status, then update Prompt.md, Plan.md, and Status.md. Do not write runtime code yet.
+new durable task | revision of current durable task | continuation/execution of current durable task
 ```
 
-### Execute approved milestone
+Interruption recovery is not a separate project mode. It is an expected property of durable files:
 
 ```text
-Continue the durable workflow. Execute the active milestone only, validate it, and update Status.md and Documentation.md before reporting back.
+Read Status.md -> read active Plan.md milestone/progress/checklist -> read Implement.md -> continue safely
 ```
 
-### Resume
+If a new session cannot continue from these files, the harness failed to externalize enough state. Update the durable files before proceeding.
 
-```text
-Resume from docs/agent/Status.md. Tell me the current milestone, next action, blockers, and latest validation; then continue with the next safe action.
-```
+## How to run current checks
 
-### Harness maintenance
+TOML parse for reviewer config:
 
-```text
-Tighten AGENTS.md routing without changing product code. Validate config/docs consistency and update Status.md/Documentation.md.
-```
-
-## How to validate the harness files
-
-After changing the harness foundation, parse the Codex config:
-
-```text
+```bash
 python - <<'PY'
 import pathlib
 try:
     import tomllib
 except ModuleNotFoundError:
     import tomli as tomllib
-p = pathlib.Path('.codex/config.toml')
-tomllib.loads(p.read_text(encoding='utf-8'))
-print('config.toml parses')
+for p in ['.codex/config.toml', '.codex/agents/quanti_reviewer.toml']:
+    tomllib.loads(pathlib.Path(p).read_text(encoding='utf-8'))
+    print(f'{p} parses')
 PY
 ```
 
-Check routing and durable docs:
+Harness routing check:
 
-```text
-rg -n 'Mode 1|Mode 2|Mode 3|Mode 4|Mode 5' AGENTS.md
-find docs/agent -maxdepth 1 -type f | sort
+```bash
+rg -n 'Mode 1|Mode 2|Mode 3|Branch A|Branch B|Branch C|independent review gate|task relationship' AGENTS.md docs/agent/Implement.md docs/agent/code_review.md docs/agent/Plan.md docs/agent/Status.md
 ```
 
-After changing Python runtime or runner code:
+Old router should not remain active in current guidance:
 
-```text
+```bash
+legacy_router_pattern='5''-mode|five primary ''modes|Mode ''4|Mode ''5|Resume durable ''work|Plan or replan durable ''work|Execute an approved durable ''milestone'
+rg -n "$legacy_router_pattern" AGENTS.md docs/agent/Prompt.md docs/agent/Plan.md docs/agent/Implement.md docs/agent/Documentation.md
+```
+
+Default lightweight runner validation after Python/runtime changes:
+
+```bash
 python -m compileall company_research_runtime .agents/skills/company_research/collect-company-facts/scripts/run.py
 python .agents/skills/company_research/collect-company-facts/scripts/run.py --help
 ```
 
-Optional functional check when a valid company artifact exists:
+Functional runner validation only when `COMPANY_RESEARCH_ROOT/company/AAPL/company.yaml` exists with `cik`:
 
-```text
+```bash
 python .agents/skills/company_research/collect-company-facts/scripts/run.py AAPL --demo
 ```
 
-## Important repository facts
+## Review protocol notes
 
-- Current actual skill runner: `.agents/skills/company_research/collect-company-facts/scripts/run.py`.
-- Current actual skill definition: `.agents/skills/company_research/collect-company-facts/SKILL.md`.
-- Shared runtime: `company_research_runtime/`.
-- Target architecture docs: `docs/skills/MASTER_PLAN.md` and `docs/skills/specs/`.
-- Implementation status index: `docs/skills/README.md`.
-- Production artifact root: `${COMPANY_RESEARCH_ROOT:-/home/help/mcp/work/company_research}`.
-- `raw/` evidence is append-only.
+`/review` is a user/interface slash workflow. It should not be written as something the agent silently performs on the user's behalf.
+
+For native automated review inside the durable workflow, use:
+
+```text
+Spawn the read-only quanti_reviewer subagent to review the current milestone diff using docs/agent/code_review.md. The reviewer must not edit files. Return only material findings.
+```
+
+If the user manually runs `/review`, the main agent can consume that report as the independent review evidence.
+
+Reviewer findings are not accepted truth. The main agent should accept only material, evidence-backed findings and should record only accepted findings/fixes in durable state.
 
 ## Decisions
 
-### 2026-04-20 — Keep `AGENTS.md` concise and push detailed execution to `Implement.md`
+### 2026-04-20 — Use `docs/agent/` as durable project memory
 
-Decision: Keep `AGENTS.md` focused on stable repository facts, routing, validation entrypoints, and hard rules; keep the detailed per-mode execution loop in `docs/agent/Implement.md`.
+Decision:
+Use markdown files under `docs/agent/` for long-horizon state instead of relying on chat history.
 
-Rationale: Recent OpenAI/Codex guidance and public OpenAI repository examples consistently treat `AGENTS.md` as a concise project guide, while detailed execution, verification, or living-plan behavior is delegated to dedicated runbooks or plan files. This reduces instruction load and makes routing easier for the model.
+Rationale:
+Codex sessions can be interrupted, resumed, or compacted. File-based state makes work recoverable.
 
-Consequences: Future harness edits should resist turning `AGENTS.md` into a second `Implement.md`. If routing or policy changes, update both files together and preserve the separation of responsibilities.
+Consequences:
+New durable tasks should update `Prompt.md`, `Plan.md`, and `Status.md` before implementation.
 
-### 2026-04-20 — Retire `CONTINUITY.md` from the active workflow
+### 2026-04-20 — Retire `CONTINUITY.md` from active workflow
 
-Decision: Treat `docs/agent/Status.md` as the canonical resume file for current long-horizon work and stop documenting `CONTINUITY.md` as an active repo requirement.
+Decision:
+Use `docs/agent/Status.md` as the active continuation state.
 
-Rationale: The file is already absent from the current worktree, while the new durable workflow is present and in active use. Restoring `CONTINUITY.md` implicitly would create a second, conflicting state source.
+Rationale:
+`Status.md` is shorter, clearer, and agent-agnostic.
 
-Consequences: `README.md` and `CLAUDE.md` now point agents to `docs/agent/Status.md`, `Plan.md`, and `Implement.md`. If a Claude-specific continuity ledger is ever needed again, it should be reintroduced explicitly rather than inferred from stale docs.
+Consequences:
+README/Claude docs should not direct active work to `CONTINUITY.md` unless it is explicitly restored for a separate purpose.
 
-### 2026-04-20 — Simplify task routing to five modes
+### 2026-04-20 — Earlier router revision is now superseded
 
-Decision: Replace the earlier fine-grained router with five primary modes: quick task, plan/replan durable work, execute approved milestone, resume durable work, and harness/policy maintenance.
+Decision:
+An earlier harness revision used more top-level routing categories and separated continuation handling more explicitly.
 
-Rationale: Too many modes make routing itself a cognitive burden for the model. Five modes preserve the important control points while keeping `AGENTS.md` easier to follow.
+Rationale:
+That revision improved the repo over the original broad router, but it still made routing heavier than necessary.
 
-Consequences: Simple read-only inspection and simple bounded edits are merged into Mode 1. Plan creation and plan revision are merged into Mode 2. Review/audit-only work should usually use Mode 1 unless it belongs to an active durable milestone.
+Consequences:
+It is no longer the active workflow model. Current guidance is defined by the three-mode router plus task-relationship handling adopted on 2026-04-21.
 
-### 2026-04-20 — Apply the harness foundation in the live repo
+### 2026-04-21 — Treat independent review as a completion gate, not a top-level mode
 
-Decision: Land the overlay into the real repository and immediately promote the active milestone to `M1 — Repo reality reconciliation`.
+Decision:
+Review belongs inside durable execution and harness/policy completion protocols, not as a separate mode.
 
-Rationale: The durable workflow files only become useful once they are the in-repo source of truth. Leaving them in a pre-application state would make the status docs stale on day one.
+Rationale:
+Review is a gate on durable work completion. Making it a top-level router mode increases cognitive load and ambiguity.
 
-Consequences: Future Codex runs should treat M0 as complete and start from M1 unless the user explicitly reopens the foundation milestone.
+Consequences:
+Complex milestones should validate and review before being marked complete.
 
-### 2026-04-20 — Raise reasoning effort, but keep verbosity within valid bounds
+### 2026-04-21 — Collapse the active router to three top-level modes
 
-Decision: Set `model_reasoning_effort = "xhigh"` and `plan_mode_reasoning_effort = "xhigh"`, while setting `model_verbosity = "high"`.
+Decision:
+Use three top-level modes: quick standalone task, durable workflow, and harness/policy maintenance.
 
-Rationale: The user wants maximum reasoning effort. OpenAI's Codex config reference supports `xhigh` for reasoning effort on supported models, but `model_verbosity` only supports `low | medium | high`.
+Rationale:
+Too many modes make the agent spend context and reasoning on routing.
 
-Consequences: Codex should think harder by default, while response detail is increased to the highest supported verbosity rather than an invalid `xhigh` value.
+Consequences:
+`AGENTS.md` is simpler; `Implement.md` carries the detailed protocols.
 
-### 2026-04-20 — Keep Context7 environment-backed in Codex config
+### 2026-04-21 — Treat continuation as durable-state recovery, not a workflow phase
 
-Decision: Keep `env_http_headers = { "CONTEXT7_API_KEY" = "CONTEXT7_API_KEY" }` in `.codex/config.toml`.
+Decision:
+Remove continuation as a separate durable phase. First classify whether the user is starting a new durable task, revising the current durable task, or continuing/executing the current durable task. A new session or compaction should recover from `Status.md`, `Plan.md`, and `Implement.md`.
 
-Rationale: Repo operating rules prefer environment-backed secrets over hard-coded API keys, even in machine-local config files.
+Rationale:
+Users naturally alternate between continuing, interrupting, revising, and starting new work. Treating continuation as a mode makes routing brittle. Durable files should make continuation natural.
 
-Consequences: If Context7 is needed in a session, the launching shell or app environment must provide `CONTEXT7_API_KEY`.
+Consequences:
+`AGENTS.md` now uses task-relationship routing inside Mode 2. `Status.md` records current task identity and continuation instructions. `Plan.md` owns milestones and active todos.
 
-### 2026-04-19 — Use `docs/agent/` as Codex durable memory
+### 2026-04-21 — Add dynamic working checklist/todos to `Plan.md`
 
-Decision: Add a dedicated `docs/agent/` directory for Codex long-horizon state.
+Decision:
+Keep milestones narrative and stable, but track small changing todos in an active working checklist.
 
-Rationale: The existing `CONTINUITY.md` appears to be a session-specific continuity ledger and currently describes a completed git cleanup task. A dedicated durable workflow directory gives Codex a cleaner state source for future work.
+Rationale:
+Milestones explain the story and acceptance proof; granular todos evolve during implementation and validation.
 
-Consequences: Future Codex sessions should read `docs/agent/Status.md` first. A later cleanup milestone should decide whether to retire, rewrite, or keep `CONTINUITY.md` for Claude-only workflows.
+Consequences:
+Codex should update the active working checklist as steps complete, split, or become obsolete.
 
-### 2026-04-19 — Keep the first phase native and minimal
+### 2026-04-21 — Apply harness v4 using Merge Keep State
 
-Decision: Start with `.codex/config.toml`, `AGENTS.md`, and durable markdown state only.
+Decision:
+Adopt the v4 router/review structure without rolling back current repo state.
 
-Rationale: Hooks, subagents, and new skills add complexity. The first goal is to observe how well native Codex follows a concise policy plus file-based state.
+Rationale:
+`Prompt.md`, `Plan.md`, `Status.md`, and `Documentation.md` are live state, not static scaffolding. Literal overwrite would have regressed the active milestone, blockers, and M1 completion state.
 
-Consequences: If Codex repeatedly forgets to update `Status.md` or run validation, add hooks in a later phase.
+Consequences:
+`M1` remains complete, `M2` remains current, known local blockers remain visible, and `CONTINUITY.md` stays retired from active workflow.
 
 ## Validation history
 
-| Date | Milestone | Command | Result | Notes |
+| Date | Area | Command / Check | Result | Notes |
 | --- | --- | --- | --- | --- |
-| 2026-04-19 | M0 | Static archive inspection | pass | Repository shape, docs, config, and runner inspected. |
-| 2026-04-19 | M0 | Generated overlay files | pass | No product code changed. |
-| 2026-04-20 | M0 | `python - <<'PY' ... tomllib ... PY` | pass | The applied `.codex/config.toml` parses successfully. |
-| 2026-04-20 | M0 | `find docs/agent -maxdepth 1 -type f \| sort` | pass | Confirmed all 5 durable workflow docs exist. |
-| 2026-04-20 | M0 | `rg -n 'Mode 1\|Mode 2\|Mode 3\|Mode 4\|Mode 5\|Keep this file concise' AGENTS.md` | pass | Confirmed simplified 5-mode router exists and that detailed execution is delegated to `Implement.md`. |
-| 2026-04-20 | M0 | `zipinfo -1 quanti_codex_harness_final_overlay.zip \| sort` | pass | Confirmed the rebuilt archive contains only the intended overlay files. |
-| 2026-04-20 | M0 | overlay content sync check | pass | Confirmed the archive matches the live repo byte-for-byte for the exported harness files. |
-| 2026-04-20 | M0 | `codex --version` | pass | Local CLI available as `codex-cli 0.121.0`. |
-| 2026-04-20 | M0 | `codex exec --ephemeral --sandbox read-only ...` | inconclusive | CLI session stalled after external `403 Forbidden` warnings during plugin/analytics traffic and produced no final answer. |
-| 2026-04-20 | M1 | `find . -maxdepth 4 -type f \( -name '*.md' -o -name '*.py' \) \| sort` | pass | Confirmed the trimmed repo shape used for doc reconciliation. |
-| 2026-04-20 | M1 | `rg -n "docs/MASTER_PLAN\|extract-xbrl-timeseries\|company-foundation/scripts/run.py\|valuation-and-margin-of-safety/scripts/run.py\|CONTINUITY" README.md AGENTS.md CLAUDE.md docs \|\| true` | pass | Active entry docs were cleaned; remaining matches are deliberate retirement notes, historical aliases in references, or archive/history files. |
-| 2026-04-20 | M1 | `python .agents/skills/company_research/collect-company-facts/scripts/run.py --help` | fail | Local environment lacks `PyYAML`, so even CLI help is currently blocked on dependency setup. |
+| 2026-04-20 | M1 docs | `rg` checks for stale runner/path claims | pass with follow-ups | Major stale claims were fixed. |
+| 2026-04-20 | Runtime env | `python .agents/skills/company_research/collect-company-facts/scripts/run.py --help` | fail | Missing `yaml` package. |
+| 2026-04-21 | Harness v4 migration | Merge Keep State structural file application | pass | `AGENTS.md`, `Implement.md`, `code_review.md`, and `quanti_reviewer.toml` updated to v4 structure. |
+| 2026-04-21 | Harness v4 migration | Live-state file merge | pass | `Prompt.md`, `Plan.md`, `Status.md`, and `Documentation.md` were moved to the new router semantics without regressing current repo state. |
+| 2026-04-21 | Harness v4 migration | Companion setup-doc sync | pass | `docs/MCP_SETUP_GUIDE.md` wording was narrowed so target MCP mapping is not mistaken for currently implemented runners. |
+| 2026-04-21 | Harness v4 migration | `python - <<'PY' ... tomllib ... PY` for `.codex/agents/quanti_reviewer.toml` | pass | Reviewer config parses. |
+| 2026-04-21 | Harness v4 migration | Router/review structure `rg` check | pass | Active router and review-gate terms are present where expected. |
+| 2026-04-21 | Harness v4 migration | Legacy-router `rg` check | pass | No old router terminology remains active in current guidance files. |
+| 2026-04-21 | Harness v4 migration | Independent review via read-only `quanti_reviewer` | pass | Verdict `pass`, confidence `high`, no material findings. |
 
 ## Known issues
 
 | Issue | Impact | Workaround / next step |
 | --- | --- | --- |
-| Non-interactive `codex exec` smoke test was inconclusive in this shell | Could not fully verify the first-prompt behavior from CLI automation | Retry from the normal Codex app/CLI environment after confirming auth/session health; M0 file-level validation is still complete. |
-| Existing `.mcp.json` in uploaded archive contained a hard-coded Context7 key | Secret hygiene risk if shared | Prefer env vars; consider rotating the key and updating `.mcp.json` separately. |
-| `collect-company-facts --demo` still appears to require `company.yaml.cik` | A demo run may block unexpectedly | Document current behavior or modify intentionally in M2. |
-| `requirements.txt` is mostly commented and may not install all imports used by runners | Fresh setup may fail on missing packages such as YAML support | Decide in a later milestone whether to formalize dependencies. |
+| `requirements.txt` may not install `yaml` / PyYAML | Fresh checkout may fail runner help command | Clarify setup docs or add dependency management in M2. |
+| `--demo` dependency semantics are still unclear | Demo may not be useful without existing `company.yaml.cik` | Decide and document/fix in M2. |
+| Reviewer can over-report | Noise can pollute workflow | Use `code_review.md` materiality gate; record only accepted findings. |
 
 ## Follow-ups
 
-- [x] Apply overlay files to the real repo.
-- [x] Simplify task routing to five modes.
-- [ ] Export `CONTEXT7_API_KEY` locally if Context7 MCP is needed.
-- [x] Run TOML parse validation.
-- [x] Ask Codex to perform M1 repo reality reconciliation.
-- [x] Retire `CONTINUITY.md` from the active workflow in favor of `docs/agent/Status.md`.
+- [x] Run static checks for the v4 Merge Keep State migration.
+- [x] Run independent review gate on the harness migration and stop after reporting findings.
 - [ ] Start M2 on `collect-company-facts` blocked/demo/runtime contract hardening.

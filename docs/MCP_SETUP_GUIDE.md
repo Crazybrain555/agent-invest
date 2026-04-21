@@ -380,7 +380,7 @@ claude mcp get <name>
 
 ## 6. Phase 1 技能链 → MCP 依赖映射
 
-只需安装对应行的 MCP 即可运行该技能：
+下面是目标 skill-chain 的 MCP 依赖映射。当前 in-repo 实际可运行的只有 `collect-company-facts`，不要把下面的映射误读为这些技能今天都已经在仓库里实现完成：
 
 ```
 company-foundation               → sec_edgar_mcp, alpaca, trading_mcp, yfinance
@@ -390,7 +390,7 @@ recast-economic-statements       → fs
 valuation-and-margin-of-safety   → fs, yfinance, alpaca
 ```
 
-**最小安装集**（跑完整 Phase 1 链路）：`sec_edgar_mcp` + `alpaca` + `trading_mcp` + `yfinance` + `fs`
+**最小安装集**（规划上打通完整 Phase 1 链路）：`sec_edgar_mcp` + `alpaca` + `trading_mcp` + `yfinance` + `fs`
 
 ---
 
