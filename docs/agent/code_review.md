@@ -34,7 +34,7 @@ The reviewer should inspect only:
 
 - `AGENTS.md`,
 - `docs/agent/Prompt.md`,
-- the active milestone, `Progress`, and working checklist in `docs/agent/Plan.md`,
+- the active milestone, `Progress`, `Surprises & Discoveries`, `Decision Log`, and working checklist in `docs/agent/Plan.md`,
 - `docs/agent/Status.md`,
 - `docs/agent/Implement.md`,
 - this file,
@@ -63,6 +63,18 @@ Report a finding only if all of these are true:
 
 If uncertain, do not report the finding.
 
+## Acceptance-oriented review
+
+Before reporting a finding, ask:
+
+- Does this prevent the active milestone acceptance criteria from being true?
+- Would a user following the documented command or setup step fail or be materially misled?
+- Does it weaken artifact traceability, blocked-state safety, or evidence integrity?
+- Does it make the durable workflow harder to resume or objectively verify?
+- Does it expose credentials or encourage hard-coding secrets?
+
+If the answer is "no" to all of these, do not report it.
+
 ## Do not report
 
 Do not report:
@@ -73,14 +85,14 @@ Do not report:
 - broad cleanup unrelated to the active milestone,
 - pre-existing issues not worsened by this diff,
 - issues already clearly recorded as current blockers in `Status.md`, unless the diff made them worse,
-- missing tests for docs-only or harness-only changes unless the change affects validation commands, setup, or future agent behavior,
+- missing tests for docs-only or harness-only changes unless the change affects validation commands, setup, credentials, or future agent behavior,
 - duplicate comments already covered by deterministic validation, formatter, or compile/lint output.
 
 ## Severity
 
 Use these severities:
 
-- `high`: likely broken runtime behavior, data/evidence corruption, destructive risk, security risk, or false completion of a milestone.
+- `high`: likely broken runtime behavior, data/evidence corruption, destructive risk, credential exposure, security risk, or false completion of a milestone.
 - `medium`: user-facing setup/command guidance is materially misleading, validation is unreliable, durable workflow can drift, or implementation-status claims are wrong.
 - `low`: real and actionable but low impact; fix if cheap, otherwise record as follow-up.
 

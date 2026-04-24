@@ -671,7 +671,11 @@ def main() -> int:
     parser.add_argument("--filings-path", action="append", type=Path, help="Path to filings payload")
     parser.add_argument("--filing-content-json", help="Inline JSON map accession->content")
     parser.add_argument("--filing-content-path", type=Path, help="Path to filing content map")
-    parser.add_argument("--demo", action="store_true", help="Use demo data instead of MCP results")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Use built-in demo filings when no filings payload is provided; still requires company.yaml.cik",
+    )
     parser.add_argument(
         "--persist-inputs",
         action="store_true",

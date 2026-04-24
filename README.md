@@ -156,8 +156,9 @@ pip install -r requirements.txt
 ```
 
 说明：
-- `requirements.txt` 目前更像历史占位清单，不是完整的运行时锁定文件。
-- 如果运行 `collect-company-facts` 时遇到缺少模块的报错，需要按实际 import 补装依赖，后续再在专门里程碑中统一整理。
+- `requirements.txt` 现在声明的是当前唯一 in-repo runner 的最小基线依赖：`PyYAML`、`pandas`、`pyarrow`。
+- 它仍然不是完整锁定文件，但 fresh checkout 至少应该能通过当前 runner 的基础 import / `--help` 验证。
+- 如果你的本机不使用默认的 `COMPANY_RESEARCH_ROOT=/home/help/mcp/work/company_research`，运行前先显式设置这个环境变量。
 
 ### 5.2 当前仓库实际可跑的命令
 
@@ -169,6 +170,7 @@ python .agents/skills/company_research/collect-company-facts/scripts/run.py AAPL
 补充说明：
 - 这是当前仓库里唯一实际存在的 in-repo runner。
 - 它的 hard dependency 是 `${COMPANY_RESEARCH_ROOT}/company/{TICKER}/company.yaml` 里有有效 `cik`。
+- `--demo` 也不会绕过这个 hard dependency；它只是在没有传入 filings payload 时，改用内置的最小 demo filings 数据。
 - 缺依赖时，预期行为是写 `runs/{run_id}/needs.yaml` 并返回 `blocked`，而不是把脏数据写进 `current/`。
 - flag 与输入契约以对应的 [SKILL.md](.agents/skills/company_research/collect-company-facts/SKILL.md) 和本地 `--help` 为准。
 

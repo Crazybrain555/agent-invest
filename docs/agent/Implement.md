@@ -15,6 +15,20 @@ A fresh session should be able to read:
 
 and continue safely without relying on the previous conversation.
 
+## Mandatory trigger protocol
+
+Before editing, check whether any mandatory trigger in `AGENTS.md` applies.
+
+If a trigger applies:
+
+1. Update the active milestone or active working checklist in `Plan.md` before implementation if the current plan does not already cover the change.
+2. Identify the contract boundary: runner behavior, artifact schema, setup command, MCP assumption, validation command, or agent-policy rule.
+3. Define the smallest observable validation that can prove the change.
+4. Plan to run the independent review gate before declaring the milestone complete.
+5. Record validation and review outcomes in `Status.md` and `Documentation.md`.
+
+Do not treat these triggers as optional style guidance. They are the project's lightweight substitute for an external harness.
+
 ## Request relationship protocol
 
 Before editing, decide how the current user request relates to durable state.
@@ -26,7 +40,7 @@ Use when the user says “continue”, “next”, “resume”, “current mile
 Protocol:
 
 1. Read `Status.md` first.
-2. Read the active milestone, `Progress`, and active working checklist in `Plan.md`.
+2. Read the active milestone, `Progress`, `Surprises & Discoveries`, `Decision Log`, and active working checklist in `Plan.md`.
 3. State the current milestone, next action, blockers, latest validation, and review state briefly.
 4. Continue only if the next action is safe and unambiguous.
 5. If state is incomplete or contradictory, update `Status.md` and/or `Plan.md` before proceeding.
@@ -40,7 +54,7 @@ Protocol:
 1. Treat the user’s latest instruction as the current steering signal.
 2. Decide the smallest durable state update required:
    - Update `Prompt.md` if the task goal, non-goal, hard constraint, deliverable, or done criteria changed.
-   - Update `Plan.md` if milestones, active checklist/todos, acceptance criteria, validation commands, risk, or execution order changed.
+   - Update `Plan.md` if milestones, active checklist/todos, acceptance criteria, validation commands, risk, discoveries, decisions, outcomes, or execution order changed.
    - Update `Status.md` if current milestone, next action, blockers, validation, or review state changed.
    - Update `Documentation.md` if the change is a decision future sessions need.
 3. Do not keep implementing against a plan the user just invalidated.
@@ -54,7 +68,7 @@ Protocol:
 
 1. Preserve any useful handoff from the previous task in `Documentation.md` before replacing current-task state.
 2. Reinitialize current-task sections of `Prompt.md`, `Plan.md`, and `Status.md`.
-3. Draft a milestone-based plan with acceptance criteria and validation commands.
+3. Draft a milestone-based plan with acceptance criteria, validation commands, progress checklist, discovery log, decision log, and outcome/retrospective placeholders.
 4. Do not edit runtime/product code until the new plan is clear and accepted, unless the user explicitly asks to plan and implement in the same turn.
 
 ## Durable execution loop
@@ -66,13 +80,15 @@ For the active milestone:
 3. Inspect code with targeted search before opening broad files.
 4. Make the smallest coherent implementation or doc change.
 5. Update the active working checklist in `Plan.md` as steps complete, split, or become obsolete.
-6. Run the milestone validation commands.
-7. If validation fails, repair the current milestone or mark it blocked before moving on.
-8. Run the independent review gate when required.
-9. Fix accepted material findings or record them as explicit follow-ups/blockers.
-10. Update `Status.md`.
-11. Update `Documentation.md` if decisions, commands, behavior, validation history, review history, or known issues changed.
-12. Do not move to the next milestone unless the user asked for multi-milestone execution.
+6. Update `Surprises & Discoveries` when observed behavior differs from the plan, docs, or assumptions.
+7. Update `Decision Log` when choosing between material alternatives.
+8. Run the milestone validation commands.
+9. If validation fails, repair the current milestone or mark it blocked before moving on.
+10. Run the independent review gate when required.
+11. Fix accepted material findings or record them as explicit follow-ups/blockers.
+12. Update `Status.md`.
+13. Update `Documentation.md` if decisions, commands, behavior, validation history, review history, or known issues changed.
+14. Do not move to the next milestone unless the user asked for multi-milestone execution.
 
 ## Active working checklist discipline
 
@@ -96,6 +112,18 @@ Checklist rules:
 - Mark obsolete items as obsolete rather than pretending they were completed.
 - Do not copy the entire checklist into `Status.md`; `Status.md` should only keep the current pointer and next action.
 
+## Living-plan sections
+
+Keep these sections current in `Plan.md`:
+
+- `Progress`: timestamped or dated checklist of real execution state.
+- `Active working checklist`: granular todos for the current milestone.
+- `Surprises & Discoveries`: unexpected facts with evidence, especially command output or file-path reality that contradicts older docs.
+- `Decision Log`: material choices with rationale and date.
+- `Outcomes & Retrospective`: what was achieved, what remains, and lessons after a milestone or task closes.
+
+If work pauses, update at least `Progress`, `Status.md`, and the active checklist. If scope shifts, rewrite affected plan sections so future sessions can continue without the old chat.
+
 ## Planning protocol
 
 When creating or revising a durable plan:
@@ -108,12 +136,14 @@ When creating or revising a durable plan:
    - current milestone,
    - progress,
    - active working checklist,
+   - surprises/discoveries,
    - milestone overview,
    - milestone details,
    - acceptance criteria,
    - validation commands,
    - risks,
-   - decisions.
+   - decisions,
+   - outcomes/retrospective placeholder.
 5. Update `Status.md` with the new current milestone and next action.
 6. Stop for user review if implementation direction is material or risky.
 
@@ -134,14 +164,15 @@ When fixing a bug:
 When creating or changing a company-research skill runner:
 
 1. Read the relevant `docs/skills/specs/skill*.md` and existing `SKILL.md`.
-2. Identify hard input dependencies and blocked conditions before implementation.
-3. Use `company_research_runtime` helpers for paths, atomic writes, evidence, hashing, status, and artifact state when applicable.
-4. Do not fabricate output artifacts when hard dependencies are missing. Write `needs.yaml` and return a blocked status.
-5. Write run outputs under `COMPANY_RESEARCH_ROOT`, not the repo.
-6. Keep `--help` useful and accurate.
-7. Keep demo behavior explicit. If `--demo` requires real artifacts such as `company.yaml.cik`, document that clearly; if it should be dependency-light, implement that deliberately.
-8. Validate with `compileall` and `--help`; run focused functional validation only when required artifacts exist.
-9. Run independent review gate before marking the milestone complete.
+2. Identify hard input dependencies, blocked conditions, output artifacts, and status codes before implementation.
+3. Decide whether the change affects a durable artifact or CLI contract; if yes, update `Plan.md` and `Documentation.md` before implementation.
+4. Use `company_research_runtime` helpers for paths, atomic writes, evidence, hashing, status, and artifact state when applicable.
+5. Do not fabricate output artifacts when hard dependencies are missing. Write `needs.yaml` and return a blocked status.
+6. Write run outputs under `COMPANY_RESEARCH_ROOT`, not the repo.
+7. Keep `--help` useful and accurate.
+8. Keep demo behavior explicit. If `--demo` requires real artifacts such as `company.yaml.cik`, document that clearly; if it should be dependency-light, implement that deliberately.
+9. Validate with `compileall` and `--help`; run focused functional validation only when required artifacts exist.
+10. Run independent review gate before marking the milestone complete.
 
 ## Independent review protocol
 

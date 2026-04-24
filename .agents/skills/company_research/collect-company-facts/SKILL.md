@@ -22,6 +22,7 @@ News and papers are **out of scope for Phase 1** (planned to be handled by a sta
 
 ## Hard dependencies
 - company/{TICKER}/company.yaml with a valid cik
+- `--demo` does not bypass `company.yaml.cik`; it only injects a minimal built-in filing when no filings payload is provided.
 
 ## Outputs
 - current/filings_index.yaml
@@ -57,5 +58,6 @@ News and papers are **out of scope for Phase 1** (planned to be handled by a sta
 
 ## Script
 - scripts/run.py implements the workflow and accepts optional JSON inputs for tool results.
+- `--demo` keeps the real ticker/company dependency and is best treated as a lightweight data path, not a dependency-free mode.
 - Prefer inline JSON flags to avoid temporary files; inputs are not persisted by default.
 - If you must keep raw inputs for reproducibility, use --persist-inputs (keep payloads small).

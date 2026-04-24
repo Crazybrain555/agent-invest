@@ -1,6 +1,6 @@
 # Plan.md — Quanti Durable Execution Plan
 
-This file is the source of truth for current long-horizon work. Keep it updated whenever scope, milestone order, acceptance criteria, validation, blockers, progress, or working todos change.
+This file is the source of truth for current long-horizon work. Keep it updated whenever scope, milestone order, acceptance criteria, validation, blockers, progress, working todos, discoveries, decisions, or outcomes change.
 
 ## Task
 
@@ -25,9 +25,9 @@ Related specification:
 
 Milestone: M2 — Harden `collect-company-facts`
 
-Status: `ready_to_start`
+Status: `in_progress`
 
-Next action: Inspect `.agents/skills/company_research/collect-company-facts/` and `company_research_runtime/` so the current runner behavior, blocked conditions, demo expectations, and validation expectations match the documented contract.
+Next action: Finalize the current M2 hardening slice by documenting the demo/dependency contract, preserving unique run directories across close-start runs, and recording the new real-input validation evidence.
 
 Note: The 2026-04-21 harness v4 migration updated workflow semantics and review policy, but it did not change the active product milestone. `M2` remains current.
 
@@ -35,9 +35,12 @@ Note: The 2026-04-21 harness v4 migration updated workflow semantics and review 
 
 Progress and milestones are distinct. Milestones describe the big story and acceptance proof; this section tracks granular execution.
 
-- [x] M0 — Install Codex-native durable workflow foundation.
-- [x] M1 — Reconcile current repo docs with implementation reality.
+- [x] 2026-04-20 — M0 — Install Codex-native durable workflow foundation.
+- [x] 2026-04-20 — M1 — Reconcile current repo docs with implementation reality.
+- [x] 2026-04-23 — Tighten the harness with explicit mandatory triggers, living-plan sections, and acceptance-oriented review guidance.
 - [ ] M2 — Harden `collect-company-facts` runner behavior and contract.
+- [x] 2026-04-24 — Began M2 inspection, installed the current runner baseline dependencies, and collected real AAPL validation inputs outside the repo.
+- [x] 2026-04-24 — Fixed second-level `run_id` collisions and re-ran parallel AAPL validation with distinct run directories.
 - [ ] M3 — Choose the next first-class skill and produce an approved implementation plan.
 - [ ] M4 — Implement the next runner in a small verified slice.
 - [ ] M5 — Add a lightweight validation harness only after repeated checks are stable.
@@ -46,14 +49,26 @@ Progress and milestones are distinct. Milestones describe the big story and acce
 
 For M2, update this checklist as implementation proceeds. Split, add, or mark obsolete todos as new evidence appears.
 
-- [ ] Inspect `collect-company-facts/SKILL.md` and `scripts/run.py` for actual CLI, dependency, blocked, and demo behavior.
-- [ ] Inspect `company_research_runtime/` helpers used by the runner.
-- [ ] Decide whether `--demo` should still require `company.yaml.cik` or support a dependency-light demonstration path.
-- [ ] Decide whether the local `yaml`/PyYAML failure should be addressed through setup docs, dependency declaration, or both.
-- [ ] Align `SKILL.md`, setup docs, and runner behavior.
-- [ ] Run compile/help validation or record exact environment blockers.
+- [x] Confirm which mandatory triggers apply to M2: implementation strategy, verification, and independent review.
+- [x] Inspect `collect-company-facts/SKILL.md` and `scripts/run.py` for actual CLI, dependency, blocked, and demo behavior.
+- [x] Inspect `company_research_runtime/` helpers used by the runner.
+- [x] Decide whether `--demo` should still require `company.yaml.cik` or support a dependency-light demonstration path.
+- [x] Decide whether the local `yaml`/PyYAML failure should be addressed through setup docs, dependency declaration, or both.
+- [x] Align `SKILL.md`, setup docs, and runner behavior.
+- [x] Run compile/help validation or record exact environment blockers.
+- [x] Re-run focused validation after fixing second-level `run_id` collisions in `company_research_runtime.default_run_id`.
 - [ ] Run independent review gate before marking M2 complete.
-- [ ] Update `Status.md` and `Documentation.md` with validation and review outcome.
+- [x] Update `Status.md` and `Documentation.md` with validation and review outcome.
+
+## Surprises & Discoveries
+
+Record unexpected facts with short evidence. Keep this section factual, not speculative.
+
+- 2026-04-20 — `python .agents/skills/company_research/collect-company-facts/scripts/run.py --help` can fail before argument parsing if `yaml` / PyYAML is not installed. Evidence: local `ModuleNotFoundError: No module named 'yaml'`.
+- 2026-04-20 — The current checkout contains only one implemented in-repo runner even though the target architecture describes nine skills. Evidence: `docs/skills/README.md` and `.agents/skills/company_research/` paths.
+- 2026-04-24 — `--demo` still enforces `company.yaml.cik`; it only injects a built-in demo filings list when no filings payload is passed. Evidence: `scripts/run.py` loads `company.yaml` and returns `blocked` before the `demo and not raw_filings` branch.
+- 2026-04-24 — Parallel validations that start within the same second can collide on `runs/{run_id}` because `default_run_id()` was second-granular. Evidence: concurrent `AAPL --demo` and `AAPL --filings-path /tmp/quanti_aapl_recent_filings.json` runs both produced `run_id=20260423_123007`.
+- 2026-04-24 — After adding microsecond precision plus a short suffix to `default_run_id()`, the same parallel AAPL validations produced distinct `run_id` values (`20260423_123307_757233_8c6731` and `20260423_123307_757234_dc4dd3`). Evidence: post-fix validation output.
 
 ## Milestone overview
 
@@ -94,6 +109,8 @@ Acceptance criteria:
 - `docs/agent/Status.md` can orient a fresh session quickly.
 - `docs/agent/code_review.md` defines an independent review gate.
 - `.codex/agents/quanti_reviewer.toml` defines a read-only reviewer subagent.
+- `AGENTS.md` contains explicit mandatory triggers for planning, implementation strategy, verification, review, and credential hygiene.
+- `Plan.md` contains living sections for `Progress`, `Active working checklist`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective`.
 - No API key is hard-coded in Codex config.
 
 Validation commands:
@@ -110,7 +127,24 @@ for p in ['.codex/config.toml', '.codex/agents/quanti_reviewer.toml']:
     print(f'{p} parses')
 PY
 
-rg -n 'Mode 1|Mode 2|Mode 3|Branch A|Branch B|Branch C|independent review gate|task relationship' AGENTS.md docs/agent/Implement.md docs/agent/code_review.md docs/agent/Plan.md docs/agent/Status.md
+rg -n '^## 2\\. Policies and mandatory triggers$' AGENTS.md
+rg -n '^### Step 1 — Decide task relationship$' AGENTS.md
+rg -n '^### Mode 1 — Quick standalone task$' AGENTS.md
+rg -n '^### Mode 2 — Durable workflow$' AGENTS.md
+rg -n '^#### Branch A — New durable task$' AGENTS.md
+rg -n '^#### Branch B — Revise current durable task$' AGENTS.md
+rg -n '^#### Branch C — Execute current durable task$' AGENTS.md
+rg -n '^### Mode 3 — Harness or agent-policy maintenance$' AGENTS.md
+rg -n '^## Progress$' docs/agent/Plan.md
+rg -n '^## Active working checklist$' docs/agent/Plan.md
+rg -n '^## Surprises & Discoveries$' docs/agent/Plan.md
+rg -n '^## Decision log$' docs/agent/Plan.md
+rg -n '^## Outcomes & Retrospective$' docs/agent/Plan.md
+rg -n '^## Mandatory trigger protocol$' docs/agent/Implement.md
+rg -n '^## Living-plan sections$' docs/agent/Implement.md
+rg -n '^## Acceptance-oriented review$' docs/agent/code_review.md
+rg -n '^Current milestone:' docs/agent/Status.md
+rg -n '^Latest independent review:' docs/agent/Status.md
 find docs/agent -maxdepth 1 -type f | sort
 ```
 
@@ -120,6 +154,7 @@ Status notes:
 - Workflow semantics were revised on 2026-04-21 to use three top-level modes plus task-relationship routing inside Mode 2.
 - Continuation/recovery now comes from durable files, not a separate router mode.
 - The independent review gate is now part of the harness foundation.
+- 2026-04-23 tightened the harness with explicit mandatory triggers and fully explicit living-plan sections.
 
 ### M1 — Repo reality reconciliation
 
@@ -193,9 +228,10 @@ python .agents/skills/company_research/collect-company-facts/scripts/run.py AAPL
 
 Status notes:
 
-- Not started.
-- Current known local blocker: `python .agents/skills/company_research/collect-company-facts/scripts/run.py --help` fails with `ModuleNotFoundError: No module named 'yaml'`.
-- Current open product decision: whether `--demo` should remain dependent on `company.yaml.cik` or become dependency-light.
+- In progress.
+- `requirements.txt` now needs to carry the current runner baseline dependencies so fresh-checkout help validation is reproducible.
+- `--demo` is now intentionally treated as a lightweight data path that still requires a real `company.yaml.cik`.
+- The second-level `run_id` collision has been fixed locally and validated; M2 still needs the required review gate before the milestone can close.
 
 ### M3 — Decide next first-class skill
 
@@ -282,12 +318,26 @@ Status notes:
 | 2026-04-21 | Treat independent review as a milestone completion gate | Review is valuable but should not become another top-level mode | Durable execution must validate, review, then update durable state |
 | 2026-04-21 | Collapse the active router to three top-level modes | Fewer routing branches reduce model confusion | Durable work now uses task-relationship routing inside Mode 2 |
 | 2026-04-21 | Treat continuation as durable-state recovery, not a separate workflow phase | Users naturally continue, interrupt, revise, and restart work | `Status.md`, `Plan.md`, and `Implement.md` must be sufficient to resume safely |
+| 2026-04-23 | Add explicit mandatory triggers | Concrete triggers are easier for Codex to follow than broad principles | `AGENTS.md` now has planning, strategy, verification, review, and credential-hygiene triggers |
+| 2026-04-23 | Keep living-plan sections explicit | Milestones and progress are distinct; discoveries/decisions/outcomes must survive context resets | `Plan.md` now makes those sections first-class durable state |
+| 2026-04-24 | Keep `--demo` dependent on `company.yaml.cik` | The user wants validation to use real listed-company inputs, and the existing runner already treats `company.yaml.cik` as a hard dependency | Docs/help should clarify that demo only substitutes filings payloads, not company identity |
+| 2026-04-24 | Formalize the current runner baseline dependencies in `requirements.txt` | Fresh-checkout `--help` should not fail on missing `yaml`, and parquet outputs depend on the common data stack | Minimal baseline is now `PyYAML`, `pandas`, and `pyarrow` |
+| 2026-04-24 | Make `run_id` unique beyond second-level precision | Real parallel validations showed that second-granular IDs can overwrite the immutable per-run audit directory | `default_run_id()` now needs timestamp precision plus a uniqueness suffix |
+
+## Outcomes & Retrospective
+
+Update this after a milestone or task closes.
+
+- M0 outcome: Codex-native durable state exists and can be resumed from checked-in docs.
+- M1 outcome: Docs distinguish the actual implemented runner from the target 9-skill architecture.
+- Harness outcome so far: The workflow now uses three top-level modes, task-relationship routing, explicit mandatory triggers, living-plan sections, and a read-only independent review gate.
+- Remaining gap: M2 still needs the required review gate before closure.
 
 ## Risk register
 
 | Risk | Why it matters | Mitigation | Status |
 | --- | --- | --- | --- |
 | Reviewer over-reports low-value issues | Noise can waste time and pollute durable docs | Use `code_review.md` materiality gate; record accepted findings only | active |
-| `yaml` dependency missing locally | Runner help/validation fails before behavior can be tested | Fix setup docs or dependency file before deeper runner validation | active |
-| `--demo` contract is unclear | Demo runs may block unexpectedly or mislead users | Decide and document/fix in M2 | active |
+| Current runner baseline dependencies are not formalized | Fresh-checkout help validation can fail before behavior can be tested | Update `requirements.txt` and setup docs, then validate in a clean-ish local environment | mitigated |
+| `run_id` collisions can overwrite per-run audit state | Concurrent or near-concurrent runs violate the immutability expectation of `runs/{run_id}` | Change `default_run_id()` and rerun parallel validation | mitigated |
 | Setup docs drift from implemented runner reality | Users may assume target skills are runnable | Keep M1 doc reconciliation complete and recheck setup docs when commands change | active |

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -14,9 +15,9 @@ from .atomic_io import atomic_write_yaml
 
 
 def default_run_id(timezone: str = "America/New_York", now: datetime | None = None) -> str:
-    """Return a timestamp-based run id (YYYYMMDD_HHMMSS)."""
+    """Return a readable run id with timestamp precision plus a short unique suffix."""
     current = now or datetime.now(ZoneInfo(timezone))
-    return current.strftime("%Y%m%d_%H%M%S")
+    return f"{current.strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:6]}"
 
 
 def _normalize_as_of(as_of: date | str | None, timezone: str) -> str:

@@ -13,7 +13,7 @@ Read and follow:
 - AGENTS.md
 - docs/agent/code_review.md
 - docs/agent/Prompt.md
-- docs/agent/Plan.md
+- docs/agent/Plan.md, especially the active milestone, Progress, Surprises & Discoveries, Decision Log, and Active working checklist
 - docs/agent/Status.md
 - docs/agent/Implement.md
 - the current git diff and changed files
@@ -23,6 +23,7 @@ Do not modify files.
 Do not update docs/agent files.
 Do not propose broad rewrites.
 Do not comment on style, naming, or prose polish unless it can materially mislead a user or break validation/workflow.
+Do not treat known blockers already recorded in Status.md as new findings unless the current diff made them worse.
 
 Report only material, actionable issues introduced or worsened by the current diff. Use the exact output format in docs/agent/code_review.md. If no material findings exist, say so.
 """

@@ -56,6 +56,7 @@ Purpose: keep Codex easy to operate from natural-language prompts, preserve dura
 Goals:
 
 - Keep `AGENTS.md`, `docs/agent/*`, and reviewer policy files consistent.
+- Add explicit mandatory triggers in `AGENTS.md` for durable planning, implementation strategy, verification, independent review, and credential hygiene.
 - Use a three-mode router in `AGENTS.md`:
   1. Quick standalone task.
   2. Durable workflow.
@@ -67,12 +68,13 @@ Goals:
 - Treat continuation/recovery as reading `Status.md`, `Plan.md`, and `Implement.md`, not as a separate top-level mode.
 - Keep `AGENTS.md` focused on routing, hard rules, and stable repository facts.
 - Keep detailed execution steps in `docs/agent/Implement.md` rather than repeating them in `AGENTS.md`.
-- Keep `Plan.md` as the source of truth for milestones, progress, active working checklist, validation, and risks.
+- Keep `Plan.md` as the source of truth for milestones, progress, active working checklist, validation, risks, discoveries, decisions, and outcomes.
 - Keep `Status.md` short enough for session start and continuation.
 - Keep `Documentation.md` as the longer audit and decision log.
 - Keep human-facing docs aligned with the actual trimmed repo state.
 - Make the current `collect-company-facts` runner behavior explicit around blocked dependencies, validation, demo semantics, and artifact outputs.
 - Add an explicit independent review gate through `docs/agent/code_review.md` and the read-only `quanti_reviewer` subagent.
+- Keep the review rubric acceptance-oriented so it reports only material, evidence-backed findings.
 
 Non-goals:
 
@@ -86,7 +88,7 @@ Non-goals:
 - `.codex/config.toml`: project-scoped Codex behavior and MCP config.
 - `AGENTS.md`: concise operating contract and three-mode router.
 - `docs/agent/Prompt.md`: standing goals plus current durable task brief.
-- `docs/agent/Plan.md`: current milestones, progress, active checklist, and validation.
+- `docs/agent/Plan.md`: current milestones, progress, active checklist, discoveries, decisions, outcomes, and validation.
 - `docs/agent/Status.md`: short continuation state.
 - `docs/agent/Implement.md`: execution runbook.
 - `docs/agent/Documentation.md`: audit log and operator notes.
@@ -100,8 +102,10 @@ This stabilization phase is done when:
 - Codex can start from the repo root and understand the repo is skills-only.
 - Codex can distinguish implemented skill assets from target specs.
 - `AGENTS.md` routes common requests into the three active top-level modes above.
+- `AGENTS.md` contains explicit mandatory triggers for planning, implementation strategy, verification, review, and credential hygiene.
 - Durable work uses task-relationship handling and file-based continuation instead of a separate resume mode.
 - `AGENTS.md` stays concise enough to fit the project-doc budget and defers detailed run loops to `Implement.md`.
+- `Plan.md` keeps living sections for progress, active checklist, discoveries, decisions, and outcomes.
 - `code_review.md` and `.codex/agents/quanti_reviewer.toml` define a usable independent review gate.
 - Human docs no longer imply missing repo paths or obsolete continuity files are active.
 - The current `collect-company-facts` runner contract is explicit about dependencies, blocked behavior, validation, demo semantics, and output locations.
@@ -119,5 +123,5 @@ This stabilization phase is done when:
 ## Open questions
 
 - Should `company-foundation` be implemented next, or should `collect-company-facts` be renamed or migrated toward the target Skill 2 contract first?
-- Should the runner dependency set be formalized in `requirements.txt` or a future `pyproject.toml`?
-- Should `--demo` remain dependent on `company.yaml.cik`, or should M2 add a true dependency-light demonstration path?
+- Should the current minimal dependency declaration stay in `requirements.txt`, or should a future cleanup move runtime dependencies into `pyproject.toml`?
+- Should `collect-company-facts` eventually gain a true dependency-light demonstration path, or should `--demo` remain explicitly tied to a real `company.yaml.cik` contract?
