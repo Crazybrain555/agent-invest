@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Run python inside the project-preferred conda env (avoid relying on shell activation).
-export PYTHONUTF8=1
-export PYTHONIOENCODING=UTF-8
-
-exec conda run -n aiquantlab python "$@"
-
