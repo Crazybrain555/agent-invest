@@ -76,6 +76,21 @@ Default to simple, surgical, verifiable changes:
 Review hidden-failure paths, speculative defensive code, unrelated churn, and missing test/spec updates as
 material issues when they affect runtime behavior, validation reliability, or durable workflow correctness.
 
+### Durable progress trigger
+
+For Mode 2 durable work, bias toward observable progress without pretending the harness is an unattended
+watchdog system:
+
+- If the user says "continue", "next", "resume", or equivalent and `Plan.md` has an active unchecked item,
+  execute the next safe in-scope item before responding unless a real blocker or user decision is required.
+- Do not end an execution turn with only a status summary when the next edit, command, or validation step is
+  already defined and safe to run.
+- Treat two consecutive no-progress attempts on the same checklist item, validation failure, or review finding
+  as a stall. Before trying again, record the tried direction in `Plan.md` and pivot a structural constraint,
+  such as the milestone slice, fixture/sample, contract boundary, validation command, or implementation path.
+- Do not add heartbeat, cron, fresh-session orchestration, or zero-interaction promises unless the user
+  explicitly asks for that infrastructure and it is actually implemented and validated.
+
 ## 3. Repository reality
 
 Retained areas:
@@ -164,11 +179,12 @@ Use when the user interrupts, dislikes the current direction, adds a new idea wi
 Use when `Plan.md` already contains an active milestone and the user asks to continue, implement, run the next step, fix the active item, or execute the approved plan.
 
 1. Confirm the current milestone and active checklist from `Plan.md`.
-2. Make only the smallest coherent change needed for the active milestone or active todo.
-3. Keep `Plan.md` and `Status.md` current as steps complete, split, or become obsolete.
-4. Run the milestone validation.
-5. Run the independent review gate when required.
-6. Update `docs/agent/Status.md` and `Documentation.md` before responding.
+2. Execute the next safe in-scope active todo rather than only restating the plan.
+3. Make only the smallest coherent change needed for the active milestone or active todo.
+4. Keep `Plan.md` and `Status.md` current as steps complete, split, stall, or become obsolete.
+5. Run the milestone validation.
+6. Run the independent review gate when required.
+7. Update `docs/agent/Status.md` and `Documentation.md` before responding.
 
 ### Mode 3 — Harness or agent-policy maintenance
 

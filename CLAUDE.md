@@ -27,7 +27,9 @@ Do not rely on deleted historical files such as `docs/skills/*`, `.agents/skills
    persist failure status, clean up, or re-raise with useful context.
 5. After code changes, update or add the relevant tests. If behavior, schema, command, or public contract
    changes, update the matching spec/docs.
-6. If the user corrects a workflow rule, propose a concrete `CLAUDE.md` or `AGENTS.md` update before treating
+6. When the user asks to continue an active durable task, advance the next safe checklist item before replying
+   unless a concrete blocker or user decision is required.
+7. If the user corrects a workflow rule, propose a concrete `CLAUDE.md` or `AGENTS.md` update before treating
    it as permanent.
 
 ## 2. Current Repo Reality

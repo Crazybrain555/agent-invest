@@ -283,3 +283,92 @@ REST、MCP 以后在这两个接口外加适配，不重新设计数据库。
         → 可按 公司/报告期/公告类型/heading_path/semantic_key/title/unit_id 查询
 两条路径在 L2 汇合，抽取 claim / 事件 / 口径 / 冲突。
 ```
+
+## 附录：外部项目参考与设计取舍
+
+本项目是面向二级市场基本面研究的持续运行财务预测引擎，不是通用 RAG、问答系统或知识图谱 demo。外部项目只作为工程设计参照，不作为架构依赖。当前核心原则仍然是：L1 可以现实地轻一些，但 L2 观测证据、L3 派生证据、L5 预测快照、L6 调度脊柱必须做硬；系统控制逻辑也不能绑定 Claude、Codex、MCP、某个 web search 工具或某个 agent harness。
+
+### A. L1 来源资产与可追溯单元
+
+#### 1. Microsoft GraphRAG
+
+GraphRAG 的主要参考价值在于它把输入语料切成 TextUnits，并在 TextUnits 上抽取 entities、relationships 和 key claims；TextUnits 同时承担细粒度来源引用的作用。这个设计支持本项目的两个判断：第一，L1 需要有可追溯的 document_unit / source unit；第二，L2 的 claim、实体、关系抽取必须绑定原始来源单元，而不能只保存一段模型总结。GraphRAG 的文档也明确描述了从 TextUnits 抽取实体、关系和关键 claims 的流程。
+
+但本项目不照搬 GraphRAG。GraphRAG 更偏向通用文本知识图谱与检索增强，本项目的目标是财务预测。因此本项目不追求一开始构建完整全局知识图谱，也不追求把所有文本都图谱化。claim 抽取应该是高价值、预测相关、可冲突、可复盘的选择性抽取，而不是逐句全量抽取。
+
+#### 2. Unstructured
+
+Unstructured 的参考价值在 L1。它不是简单把 PDF、HTML、PPT、Word 等文件切成纯文本，而是先识别 document elements，并保留 metadata，再基于这些 elements 做 chunking。这个思路支持本项目把 L1 定义为“来源资产层”：L1 不做投资语义判断，但要尽量保留标题、段落、表格、Q&A、页码、表头、章节路径、相邻关系等结构上下文。
+
+因此，本项目可以借鉴 Unstructured 的“结构先于语义”思路：公告、财报、人工纪要、表格、转写材料进入系统后，L1 应尽量输出带结构上下文的 document_unit，而不是只输出裸文本。但 L1 不应提前判断“这是订单 claim”“这是 Rubin 主题”“这是高价值预测变量”，这些属于 L2 的语义处理范围。
+
+### B. L2 观测证据、抽取骨架与多通道入口
+
+#### 3. LlamaIndex Property Graph Index
+
+LlamaIndex 的 Property Graph Index 参考价值在 L2。它对每个 chunk 运行一个或多个 extractor，把 entities 和 relations 附着到节点元数据上，并支持不同强度的 schema 约束。这支持本项目采用“稳定骨架 + 可扩展分类”的 claim 抽取方式。
+
+本项目不应该一开始写死全部实体类型、关系类型和指标类型，因为投研语料高度非标准化。但也不能完全自由抽取。合理方式是：保留少量稳定字段，例如主体域、主体、指标、事件、时间、单位、口径、性质、来源、置信度、冲突状态；同时保留开放标签和候选相关主体，供后续主题扩散、检索和 L3 派生使用。
+
+#### 4. Haystack
+
+Haystack 的参考价值在于 metadata-based routing。Haystack 的 MetadataRouter 可以根据文档或 byte stream 的 metadata 把输入路由到不同输出连接。这个思路支持本项目把 L2 设计成“多通道证据入口”，而不是把所有来源都硬塞进同一条文本 claim 抽取流水线。
+
+在本项目中，不同来源应该先通过 source_ref + evidence_input 进入系统，再根据 payload 类型路由：公告 / 财报 / 人工纪要走文档通道；Wind / iFinD / Choice / Tushare 等标准结构化数据走结构化观测通道；web / MCP / news / forum / Claude 或 Codex search 结果走轻载外部来源通道；人工 Excel 或自有整理表走人工资料通道。这样 L2 才能处理真实复杂来源，而不是默认所有数据都是 PDF document_unit。
+
+### C. 结构化数据契约与 L3 派生资产
+
+#### 5. dlt
+
+dlt 的 schema contract 和 schema evolution 参考价值在标准结构化数据接入。dlt 支持让目标端 schema 随抽取数据结构演进，也支持通过 schema contract 控制哪些变化允许、哪些变化冻结或阻断。
+
+本项目可借鉴这一点处理 Wind、iFinD、Choice、Tushare、券商数据库、行业数据库等结构化来源。标准结构化数据不应该走 LLM claim 抽取，而应该走 L2 的 structured observation 通道：记录 provider、dataset key、查询参数、字段版本、期间、单位、币种、口径、返回 hash 和 as-of 时间，再由 L3 做财务重构、口径转换、对账和派生。这样可以避免外部 API 字段变化、口径变化或供应商修订悄悄污染预测。
+
+#### 6. Dagster Software-defined Assets
+
+Dagster 的 software-defined assets 参考价值在 L3。Dagster 把数据资产定义为有上游依赖、可计算、可物化的对象。这个思想适合本项目的 L3 派生证据层：derived claim、对账后事实、口径重构值、财务比率、主题暴露度、供应链派生图，都应该被视为“有输入、有规则、有版本、有失效条件的派生资产”。
+
+本项目不需要直接采用 Dagster，但应借鉴其资产思路：L3 不是临时缓存，也不是第二套真相。每个 L3 derived claim 必须知道它依赖哪些 L2 claims、哪版当前采信视图、哪版口径契约、哪版规则 / 框架、哪个 as-of 时点；当上游 claim、规则、口径或人工裁决变化时，L3 对象应能被标记 stale 并局部重算。
+
+### D. 模型输出约束
+
+#### 7. OpenAI Structured Outputs
+
+OpenAI Structured Outputs 的参考价值在 L2 / L3 的模型输出约束。Structured Outputs 用 JSON Schema 约束模型输出格式，能降低模型漏字段、枚举乱写、结构不合规的问题。
+
+但结构化输出只保证格式，不保证事实正确。因此本项目可以用类似机制要求模型输出 claim candidate、关系型 claim、抽取结果、校验结果、待办候选等结构化对象；同时必须保留原文锚、source_ref、document_unit、exact_span、model version、prompt version、schema version、validator version 和 extraction_run_id。模型输出不能直接等于 accepted claim，仍然需要规则校验、来源追溯、冲突检测、披露锚对账和必要的人工裁决。
+
+### E. 对本项目的最终取舍
+
+综合以上项目，本项目采用以下设计原则：
+
+1. 借鉴 GraphRAG 的 TextUnit → Entity / Relationship / Claim 思路，但不构建通用全局知识图谱。
+2. 借鉴 Unstructured 的 document elements 和 metadata 思路，把 L1 的 document_unit 做成带结构上下文的可追溯单元。
+3. 借鉴 LlamaIndex Property Graph 的 extractor 和 schema 约束思路，在 L2 采用“稳定骨架 + 开放标签”的 claim 分类体系。
+4. 借鉴 Haystack 的 metadata routing 思路，把 L2 设计成多通道证据入口，而不是单一文本处理链。
+5. 借鉴 dlt 的 schema contract / schema evolution 思路，为结构化数据接入设置字段、口径、单位、期间和供应商版本契约。
+6. 借鉴 Dagster 的 software-defined asset 思路，把 L3 derived claims 视为有血缘、有规则、有版本、有失效条件的派生资产。
+7. 借鉴 OpenAI Structured Outputs 的 schema 约束思路，但不把模型结构化输出等同于事实采信。
+
+本项目明确不采纳以下做法：
+
+- 不把所有资料都强制落成自有 raw data lake；
+- 不把所有文本逐句抽成 claim；
+- 不把所有外部搜索结果直接变成 accepted claim；
+- 不把 L4 做成静态事实库；
+- 不让 L3 变成脱离 L2 来源证据的第二套真相；
+- 不让系统控制逻辑绑定 Claude、Codex、MCP、web search 或某个具体 agent harness；
+- 不把通用 RAG 的回答链路当作财务预测引擎的主架构。
+
+最终结论是：外部项目提供的是工程参照，不是系统边界。本项目真正要固化的是自己的证据链、派生链、预测链和复盘链：
+
+```text
+source_ref / evidence_input
+→ L2 observed evidence
+→ L3 derived evidence
+→ L5 assumptions / forecast nodes
+→ snapshot
+→ financial-report backtest / error attribution
+```
+
+只要某条信息进入预测，它就必须能解释来源、追溯原文或数据服务、说明抽取模型和规则版本、参与冲突检测、触发派生重算，并在财报季被复盘。
