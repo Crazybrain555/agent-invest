@@ -1,17 +1,18 @@
 ---
 id: disclosure_anchor
 title: disclosure_anchor 服务目的
-contract_version: v1.0
+contract_version: v1.1
 status: canonical
 layer: L1
 layer_name: 披露文件接入与结构化准备层
-reference: docs/reference/投研预测引擎顶层框架协议_v0.5.md
+reference: docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md
 delivers_to: L2
 scope: self_maintained_exchange_disclosures
 output_kind: l2_ready_document_units
 output_form: queryable_database_plus_filing_api
 unit_kinds: [text, table, qa]
-query_keys: [company, report_period, disclosed_at, filing_type, document_id, unit_kind, heading_path, semantic_key, title, unit_id]
+payload_kinds: [text, table, qa]
+query_keys: [company_ref, security_ref, report_period, announcement_date, filing_type, document_id, unit_id, payload_kind, heading_path, semantic_key, quality_status, content_hash, source_ref, producer_action_ref]
 core_objects: [company, security, source_access, document, processing_run, document_unit]
 optional_objects: [source_checkpoint]
 primary_store: postgresql
@@ -43,7 +44,8 @@ not_produces: [standard_financial_dataset, event_fact, metric_observation, claim
 + 可复现的处理记录
 ```
 
-然后交给 `L2` 抽取 claim、识别事件、判断重要性并进入证据账本。
+然后交给 `L2` 做高价值证据化：抽取 observed claims、登记 numeric observations、识别事件候选、
+判断重要性并进入观测证据账本。
 
 它不是 PDF 文件夹，不是 RAG 知识库，不是财务数据仓库，也不是事实层。
 
@@ -58,9 +60,9 @@ not_produces: [standard_financial_dataset, event_fact, metric_observation, claim
 | L1 标准数据侧 | L1 披露文件侧（本服务） | L1 其他来源（非标，旁路） |
 | --- | --- | --- |
 | Wind / Tushare / 同花顺 iFinD / Choice / API | CNINFO / 交易所 PDF | 非标 API / MCP / Web / 搜索 |
-| `Dataset API` | `disclosure_anchor` → `document` / `document_unit` → `Filing API` | 通用 `source_access`（直接进 L2，不建 `document_unit`） |
+| `Dataset API` | `disclosure_anchor` → `document` / `document_unit` → `Filing API` | 其他 L1 adapter → `data_asset` / `source_access` |
 
-三条路径最终都在 `L2` 汇合 →（抽取 claim / 事件 / 口径 / 冲突）→ `L3` 证据账本。
+三条路径最终都在 `L2` 汇合 →（证据化 / 口径归一 / 冲突 / 采信）→ `L3` 派生证据。
 
 本服务只负责其中的披露文件侧（自维护公告 / 财报 PDF）。
 
@@ -70,26 +72,29 @@ not_produces: [standard_financial_dataset, event_fact, metric_observation, claim
 - **标准数据侧是 provider 无关的。** Wind 只是首版示例，可整体或按 dataset 替换 / 并存为 Tushare、同花顺 iFinD、Choice 等；抽象由 `dataset_registry + provider_adapter` 承担，`dataset_key` 不绑定具体 provider。
 - 标准数据 provider 已稳定覆盖的标准财务数据，通过 `Dataset API` 使用，不复制成 `document_unit`。
 - PDF 中 provider 未覆盖、但对预测有价值的表格和文本，由本服务处理成 `document_unit`。
-- 非标准 API、MCP、Web 查询、搜索、新闻等一次性来源，通过通用 `source_access` 直接进入 `L2`；第一版不要求把它们转成 `document_unit`，也不由本服务承担（详见《财报与披露数据接入及切分方案》§1.2）。
+- 非标准 API、MCP、Web 查询、搜索、新闻等一次性来源，由对应 L1 adapter 登记为 `data_asset` 或
+  `source_access` 后进入 `L2`；第一版不要求把它们转成 `document_unit`，也不由本服务承担（详见
+  《财报与披露数据接入及切分方案》§1.2）。
 - 上述路径都在 `L2` 汇合，不在底层强行统一原始形态。
 
 ## 1.2 与 L2 的分界
 
-本服务做的是**文档结构切分**；`L2` 做的是**信息与 claim 切分**。
+本服务做的是**文档结构切分与载体规范化**；`L2` 做的是**高价值证据化与语义归一**。
 
 ```text
 L1 disclosure_anchor
 PDF → 章节 / 子标题 / 完整表格 / 完整问答
 
 L2
-一个 document_unit → 0 到多条 claims / 事件 / 指标候选
+一个 document_unit → 0 到多条 evidence_record（observed_claim / relation_claim / numeric_observation 等）
 ```
 
 因此：
 
 > `document_unit` 是最小的 L1 可寻址文档单元，不是最小事实，也不是 claim。
 
-一个完整问答、一个经营分析小节或一张应收账款账龄表，都可能在 `L2` 中产生多条 claims。
+一个完整问答、一个经营分析小节或一张应收账款账龄表，都可能在 `L2` 中产生多条
+`evidence_record`。
 
 ---
 
@@ -304,7 +309,15 @@ qa
 一个完整 Question + Answer
 ```
 
-没有 `event_unit`。短公告中的事件字段由 `L2` 从 `text/table` 单元中抽取，形成 event claim 或事件对象。
+没有 `event_unit`。短公告中的事件字段由 `L2` 从 `text/table` 单元中抽取，形成事件类
+`evidence_record` 或后续派生对象。
+
+术语对齐顶层 v0.7：
+
+- 本服务内部和已落地数据库字段继续使用 `unit_kind`；
+- 顶层协议统一称 `payload_kind`；
+- 当 `asset_kind = document_unit` 时，`unit_kind` 与 `payload_kind` 完全等价；
+- 对外 public view / API 可同时暴露二者，旧调用方读 `unit_kind`，新调用方读 `payload_kind`。
 
 ---
 
@@ -319,6 +332,7 @@ document_unit_id
 所属 document
 所属 processing_run
 unit_kind
+payload_kind（对外别名，等价于 unit_kind）
 heading_path
 title
 order_index
@@ -429,7 +443,7 @@ artifact_locator（可选）
 
 > 示例取自美的集团（000333）2025 年 4 月 11 日投资者关系活动记录表（2024 年度业绩说明会，编号 2025-2）的第 1 问。
 
-一个回答即使很长，也不按 token 拆碎。L2 可以从中抽取多条 claims。
+一个回答即使很长，也不按 token 拆碎。L2 可以从中抽取多条 `evidence_record`。
 
 ---
 
@@ -763,13 +777,65 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - 公告日期；
 - 报告期；
 - 公告类型；
-- `unit_kind`；
+- `payload_kind`（兼容返回 `unit_kind`）；
 - `heading_path`；
 - `semantic_key`；
+- `quality_status`；
+- `content_hash`；
+- `source_ref`；
+- `producer_action_ref`；
 - 标题；
 - `document_unit_id`。
 
 全文关键词检索可以后加，但不是证据对象，也不要求向量化。
+
+## 12.1 Public view 读契约
+
+跨服务读侧只经 `disclosure_public.*_v1` 或等价 Filing API 暴露，不要求下游理解
+`disclosure_core` / `disclosure_ops` 私有表。
+
+`document_units_v1` 必须保留足够的 unit 级 scope keys：
+
+```text
+company_ref
+security_ref
+filing_type
+report_period
+announcement_date
+payload_kind
+heading_path
+semantic_key
+quality_status
+content_hash
+contract_version
+producer_action_ref
+source_ref
+parent_ref
+order_index
+```
+
+映射关系：
+
+- `company_ref` = `document.company_id`；
+- `security_ref` = `document.security_id`；
+- `payload_kind` = `document_unit.unit_kind`；
+- `producer_action_ref` = `processing_run_id`，即顶层 `action_log` 的 L1 特化；
+- `parent_ref` = 所属 `document_id`；
+- `source_ref` = `source_access_id`，完整 source reference 可由 `source_refs_v1` 或
+  `GET /v1/units/{id}/source-ref` 派生。
+
+## 12.2 Change feed 读契约
+
+`disclosure_ops.outbox_event` 是本服务的写侧 outbox，内部字段仍为 `event_type`。
+
+对外 `change_events_v1` / 未来 `GET /v1/changes?after_seq=...` 使用顶层协议口径：
+
+- `event_kind` 是对外事件名，当前映射自内部 `event_type`；
+- `change_kind` 只有 `observed` / `materialized` 两类；
+- 未显式声明 `change_kind` 的历史事件默认是 `materialized`；
+- `observed` 表示巡检或来源观察到了对象但没有产生可消费内容变化；
+- `materialized` 表示 public read model 可见内容发生变化，才允许触发下游失效 / 重算；
+- `GET /v1/changes` 是 Phase005+ 的 Filing API 目标契约；当前阶段先保证 outbox 与 public view 语义。
 
 ---
 
@@ -802,7 +868,8 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 
 第一版不建设旧 unit 到新 unit 的几何对齐系统。
 
-旧 claim 继续引用当时的 `processing_run + document_unit + exact snapshot`。新 run 产生新单元，必要时由 L2 重新评估。
+旧证据记录继续引用当时的 `processing_run + document_unit + exact snapshot`。新 run 产生新单元，
+必要时由 L2 重新评估。
 
 ---
 
@@ -826,7 +893,7 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - 所有 PDF 表与标准数据 provider 双源核验；
 - 所有异常自动裁决。
 
-重要表格在 L2 真正用于 claim 时，可以触发更严格复核。
+重要表格在 L2 真正用于证据入账时，可以触发更严格复核。
 
 ---
 
@@ -844,7 +911,7 @@ L2 收到一个 unit 后负责：
 
 ```text
 主体 / 时间 / 指标 / 事件识别
-→ claim 抽取
+→ 高价值 evidence_record 抽取 / 登记
 → 口径和单位处理
 → 去重、对账、冲突检测
 → 置信度与重要性判断
@@ -891,10 +958,15 @@ L2 收到一个 unit 后负责：
 
 # 18. 对上位协议的兼容说明
 
-`投研预测引擎顶层框架协议_v0.5.md` 后续应按本文件统一两处表述：
+本文件已对齐 `投研预测引擎顶层框架协议_v0.7修订最终版本.md`，尤其是 §3.10
+对 `disclosure_anchor` 的三点补强：
 
-1. `L1` 对披露文件可以做**文档结构切分**；`L2` 继续负责**信息与 claim 切分**，二者不冲突。
-2. 披露侧 `G0` 应从“必须有页码和表格位置”调整为：
+1. `document_units_v1` 保留 unit 级 scope keys，方便 L2 / MCP / API 检索；
+2. `unit_kind ≡ payload_kind`、`processing_run` 是 `action_log` 的 L1 特化、
+   `event_type` 对外映射为 `event_kind`；
+3. change feed 以 `change_events_v1` / 未来 `GET /v1/changes` 暴露，区分 observed / materialized。
+
+披露侧 `G0` 采用：
 
 ```text
 自维护原文件
