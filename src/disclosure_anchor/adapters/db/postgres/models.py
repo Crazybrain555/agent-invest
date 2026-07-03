@@ -247,7 +247,7 @@ class DocumentUnit(Base):
     __tablename__ = "document_unit"
     __table_args__ = (
         CheckConstraint(
-            "unit_kind in ('text','table','qa')", name="ck_document_unit_kind"
+            "payload_kind in ('text','table','qa')", name="ck_document_unit_payload_kind"
         ),
         UniqueConstraint(
             "processing_run_id", "order_index", name="uq_document_unit_run_order"
@@ -258,7 +258,7 @@ class DocumentUnit(Base):
         {"schema": CORE_SCHEMA},
     )
 
-    document_unit_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     document_id: Mapped[str] = mapped_column(
         ForeignKey(f"{CORE_SCHEMA}.document.document_id"), nullable=False
     )
@@ -266,7 +266,7 @@ class DocumentUnit(Base):
         ForeignKey(f"{CORE_SCHEMA}.processing_run.processing_run_id"), nullable=False
     )
     provider_document_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
-    unit_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     heading_path: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
@@ -294,10 +294,10 @@ class OutboxEvent(Base):
 
     seq: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     event_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
-    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_kind: Mapped[str] = mapped_column(String(64), nullable=False)
     document_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     processing_run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    document_unit_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    asset_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     payload: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

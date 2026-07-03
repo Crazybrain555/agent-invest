@@ -206,7 +206,7 @@ class ParseDocumentTests(unittest.TestCase):
                 exchange="LOCAL",
                 filing_type="annual_report",
                 title="Phase 04 local PDF",
-                disclosed_at=date(2026, 6, 29),
+                announcement_date=date(2026, 6, 29),
                 report_period="2025A",
                 provider_document_id=provider_document_id,
             )

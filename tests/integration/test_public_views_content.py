@@ -22,7 +22,7 @@ class PublicViewContentTests(unittest.TestCase):
         self.source_access_id = ids.new_source_access_id()
         self.document_id = ids.new_document_id()
         self.run_id = ids.new_processing_run_id()
-        self.unit_id = ids.new_document_unit_id()
+        self.unit_id = ids.new_asset_id()
         self.event_id = ids.new_outbox_event_id()
         self.observed_event_id = ids.new_outbox_event_id()
 
@@ -39,7 +39,7 @@ class PublicViewContentTests(unittest.TestCase):
                 },
             )
             conn.execute(
-                text("DELETE FROM disclosure_core.document_unit WHERE document_unit_id = :v"),
+                text("DELETE FROM disclosure_core.document_unit WHERE asset_id = :v"),
                 {"v": self.unit_id},
             )
             conn.execute(
@@ -117,10 +117,10 @@ class PublicViewContentTests(unittest.TestCase):
             )
             uow.document_units.add(
                 e.DocumentUnit(
-                    document_unit_id=self.unit_id,
+                    asset_id=self.unit_id,
                     document_id=self.document_id,
                     processing_run_id=self.run_id,
-                    unit_kind="table",
+                    payload_kind="table",
                     order_index=0,
                     heading_path=["第八节 财务报告", "应收账款"],
                     semantic_key="receivable_aging",
@@ -131,7 +131,7 @@ class PublicViewContentTests(unittest.TestCase):
             uow.outbox.add(
                 e.OutboxEvent(
                     event_id=self.event_id,
-                    event_type="document_registered",
+                    event_kind="document_registered",
                     document_id=self.document_id,
                     payload={"change_kind": "materialized"},
                 )
@@ -139,7 +139,7 @@ class PublicViewContentTests(unittest.TestCase):
             uow.outbox.add(
                 e.OutboxEvent(
                     event_id=self.observed_event_id,
-                    event_type="document_observed",
+                    event_kind="document_observed",
                     document_id=self.document_id,
                 )
             )
@@ -150,15 +150,14 @@ class PublicViewContentTests(unittest.TestCase):
         with self.engine.connect() as conn:
             unit_row = conn.execute(
                 text(
-                    "SELECT unit_kind, payload_kind, contract_version, company_ref, "
+                    "SELECT payload_kind, contract_version, company_ref, "
                     "security_ref, security_code, filing_type, report_period, "
                     "source_ref, producer_action_ref, parent_ref, semantic_key, payload "
                     "FROM disclosure_public.document_units_v1 "
-                    "WHERE document_unit_id = :v"
+                    "WHERE asset_id = :v"
                 ),
                 {"v": self.unit_id},
             ).mappings().one()
-            self.assertEqual(unit_row["unit_kind"], "table")
             self.assertEqual(unit_row["payload_kind"], "table")
             self.assertEqual(unit_row["contract_version"], "document_unit.v1")
             self.assertEqual(unit_row["company_ref"], self.company_id)
@@ -176,7 +175,7 @@ class PublicViewContentTests(unittest.TestCase):
                 text(
                     "SELECT service, contract_version, provider, provider_document_id, raw_file_hash, "
                     "unit_content_hash FROM disclosure_public.source_refs_v1 "
-                    "WHERE document_unit_id = :v"
+                    "WHERE asset_id = :v"
                 ),
                 {"v": self.unit_id},
             ).mappings().one()
@@ -200,7 +199,7 @@ class PublicViewContentTests(unittest.TestCase):
 
             change_rows = conn.execute(
                 text(
-                    "SELECT event_id, event_type, event_kind, change_kind "
+                    "SELECT event_id, event_kind, change_kind "
                     "FROM disclosure_public.change_events_v1 "
                     "WHERE event_id IN (:event_id, :observed_event_id)"
                 ),

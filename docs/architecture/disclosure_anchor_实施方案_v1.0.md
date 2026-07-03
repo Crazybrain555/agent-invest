@@ -19,7 +19,7 @@ primary_store: postgresql
 raw_store: filesystem
 parser_artifact_store: filesystem
 public_output: document_and_document_unit
-unit_kinds: [text, table, qa]
+payload_kinds: [text, table, qa]
 implementation_style: modular_monolith_with_ports_and_adapters
 ---
 
@@ -124,7 +124,7 @@ AI coding agent 在每次实现前必须：
 
 方向正确，可以继续作为 canonical contract，但编码前必须修正或在实现中消除以下歧义：
 
-1. front matter 的 `unit_id` 应统一为 `document_unit_id`；
+1. front matter 的 `unit_id` 应统一为 `asset_id`；
 2. CNINFO `textid` 不能直接作为内部 `document_id`；
 3. `cninfo:p_info3015` 是接口/操作标识，不是一条具体访问记录的 `source_access_id`；
 4. `heading_path` 是查询和导航字段，不是跨 parser 稳定 ID，也不是唯一键；
@@ -492,7 +492,7 @@ API 不直接查询 ORM session
 - source_access_id
 - document_id
 - processing_run_id
-- document_unit_id
+- asset_id
 
 外部 ID
 - provider_document_id
@@ -618,7 +618,7 @@ byte_version
 raw_filing_type
 filing_type
 title
-disclosed_at
+announcement_date
 report_period_end（可空）
 report_period_type（可空）
 event_date（可空）
@@ -726,10 +726,10 @@ profile 名称和规则由版本化 registry 管理，不写成不可扩展的�
 最低字段语义：
 
 ```text
-document_unit_id
+asset_id
 document_id
 processing_run_id
-unit_kind                 text / table / qa
+payload_kind                 text / table / qa
 order_index
 heading_path
 title
@@ -809,7 +809,7 @@ updated_at
 
 ```text
 outbox_event_id
-event_type
+event_kind
 aggregate_type
 aggregate_id
 payload
@@ -1288,7 +1288,7 @@ artifact_hash
   parser / IR / artifact 文件内容
 
 content_hash
-  unit_kind + canonical payload，代表业务内容
+  payload_kind + canonical payload，代表业务内容
 
 structure_hash
   normalized title + heading_path，代表文档结构和导航
@@ -1302,7 +1302,7 @@ structure_hash
 
 包含：
 
-- unit_kind；
+- payload_kind；
 - canonical payload。
 
 排除：
@@ -1603,12 +1603,12 @@ filing = client.filings.latest(
 
 units = client.units.list(
     document_id=filing.document_id,
-    unit_kind="table",
+    payload_kind="table",
     semantic_key="receivable_aging",
 )
 
-unit = client.units.get(document_unit_id)
-context = client.units.context(document_unit_id, max_chars=12000)
+unit = client.units.get(asset_id)
+context = client.units.context(asset_id, max_chars=12000)
 ```
 
 可以额外提供 EdgarTools 风格 façade：
@@ -1632,8 +1632,8 @@ GET  /v1/filings
 GET  /v1/filings/{document_id}
 GET  /v1/filings/{document_id}/runs
 GET  /v1/filings/{document_id}/units
-GET  /v1/units/{document_unit_id}
-GET  /v1/units/{document_unit_id}/context
+GET  /v1/units/{asset_id}
+GET  /v1/units/{asset_id}/context
 GET  /v1/processing-runs/{processing_run_id}
 POST /v1/filings/{document_id}/reprocess
 POST /v1/filings/{document_id}/rebuild-units
@@ -1650,15 +1650,15 @@ GET  /v1/change-events
 company / ticker
 filing_type
 report_period_end / report_period_type
-disclosed_at range
+announcement_date range
 document_id
 processing_run_id
 profile
-unit_kind
+payload_kind
 heading_path exact/prefix
 semantic_key
 title contains
-document_unit_id
+asset_id
 quality_status
 ```
 
@@ -1666,7 +1666,7 @@ quality_status
 
 - 只读取 active published `research_default` run；
 - 排除已 superseded 的 document；
-- `latest()` 使用稳定排序：`disclosed_at DESC, byte_version DESC, document_id DESC`；
+- `latest()` 使用稳定排序：`announcement_date DESC, byte_version DESC, document_id DESC`；
 - 调用方可显式指定 profile、processing_run_id 或历史 document 版本。
 
 `heading_path` prefix 查询只是候选过滤，不承诺唯一结果。
@@ -1693,17 +1693,17 @@ DocumentPublished / DocumentUnitsChanged event
 
 ```json
 {
-  "event_type": "document_run_published",
+  "event_kind": "document_run_published",
   "document_id": "...",
   "profile": "research_default",
   "processing_run_id": "...",
   "previous_processing_run_id": "...",
   "raw_sha256": "...",
   "changes": {
-    "added": ["unit-id"],
-    "removed": ["old-unit-id"],
+    "added": ["asset-id"],
+    "removed": ["old-asset-id"],
     "content_changed": [
-      {"old_unit_id": "...", "new_unit_id": "..."}
+      {"old_asset_id": "...", "new_asset_id": "..."}
     ],
     "structure_only_changed": [],
     "routing_only_changed": [],
@@ -1961,12 +1961,12 @@ disclosure-anchor replay-outbox
 ```text
 security(market, ticker)
 document(source_provider, provider_document_id, raw_sha256)
-document(company_id, disclosed_at desc)
+document(company_id, announcement_date desc)
 document(filing_type, report_period_end, report_period_type)
 processing_run(document_id, created_at desc)
 partial unique: processing_run(document_id, profile) where is_active = true
 document_unit(processing_run_id, order_index)
-document_unit(document_id, unit_kind)
+document_unit(document_id, payload_kind)
 document_unit(semantic_key)
 document_unit(content_hash)
 source_access(request_fingerprint, started_at desc)

@@ -243,8 +243,8 @@ class DocumentUnitRepository:
         self._session.flush()
         return mappers.document_unit_to_entity(row)
 
-    def get(self, document_unit_id: str) -> Optional[e.DocumentUnit]:
-        row = self._session.get(models.DocumentUnit, document_unit_id)
+    def get(self, asset_id: str) -> Optional[e.DocumentUnit]:
+        row = self._session.get(models.DocumentUnit, asset_id)
         return mappers.document_unit_to_entity(row) if row is not None else None
 
 

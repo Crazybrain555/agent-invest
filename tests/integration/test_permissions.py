@@ -43,10 +43,18 @@ class PermissionTests(unittest.TestCase):
                 trans = conn.begin()
                 try:
                     conn.execute(text(f'SET ROLE "{role}"'))
-                    # Must not raise; result may be empty.
-                    conn.execute(
-                        text("SELECT * FROM disclosure_public.documents_v1 LIMIT 1")
-                    ).all()
+                    # Must not raise; results may be empty. Covers the views that
+                    # 0006 recreated via DROP+CREATE, whose grants depend on the
+                    # owner-role default privileges from 0001.
+                    for view in (
+                        "documents_v1",
+                        "document_units_v1",
+                        "source_refs_v1",
+                        "change_events_v1",
+                    ):
+                        conn.execute(
+                            text(f"SELECT * FROM disclosure_public.{view} LIMIT 1")
+                        ).all()
                 finally:
                     trans.rollback()
 
@@ -94,7 +102,7 @@ class PermissionTests(unittest.TestCase):
                 conn.execute(
                     text(
                         "INSERT INTO disclosure_ops.outbox_event "
-                        "(event_id, event_type) VALUES ('oe_app_probe', 'probe')"
+                        "(event_id, event_kind) VALUES ('oe_app_probe', 'probe')"
                     )
                 )
             finally:

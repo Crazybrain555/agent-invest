@@ -345,7 +345,7 @@ source_item_index
 `content_hash` 建议基于：
 
 ```text
-unit_kind
+payload_kind
 heading_path
 title
 canonical payload text/table/qa 内容

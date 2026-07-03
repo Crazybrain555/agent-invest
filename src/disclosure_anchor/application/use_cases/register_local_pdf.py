@@ -29,7 +29,7 @@ class RegisterLocalPdfCommand:
     exchange: str
     filing_type: str
     title: str
-    disclosed_at: date
+    announcement_date: date
     report_period: str
     provider_document_id: str
     provider: str = "local"
@@ -69,7 +69,7 @@ class RegisterLocalPdf:
             raw = self._raw_store.put_raw_document(
                 provider=command.provider,
                 security_code=command.security_code,
-                year=command.disclosed_at.year,
+                year=command.announcement_date.year,
                 provider_document_id=command.provider_document_id,
                 input_file=command.file_path,
                 expected_raw_file_hash=command.expected_raw_file_hash,
@@ -182,7 +182,7 @@ class RegisterLocalPdf:
                     provider_document_id=command.provider_document_id,
                     title=command.title,
                     filing_type=command.filing_type,
-                    announcement_date=command.disclosed_at,
+                    announcement_date=command.announcement_date,
                     report_period=command.report_period,
                     raw_file_relpath=str(raw.relpath),
                     raw_file_hash=raw.raw_file_hash,
@@ -193,7 +193,7 @@ class RegisterLocalPdf:
             event = uow.outbox.add(
                 e.OutboxEvent(
                     event_id=ids.new_outbox_event_id(),
-                    event_type="document_registered",
+                    event_kind="document_registered",
                     document_id=document.document_id,
                     payload={
                         "provider": command.provider,

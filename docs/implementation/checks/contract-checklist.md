@@ -40,8 +40,8 @@ GET /v1/documents
 GET /v1/documents/{document_id}
 GET /v1/documents/{document_id}/runs
 GET /v1/documents/{document_id}/units
-GET /v1/units/{document_unit_id}
-GET /v1/units/{document_unit_id}/source-ref
+GET /v1/units/{asset_id}
+GET /v1/units/{asset_id}/source-ref
 GET /v1/filings/latest
 GET /v1/changes
 ```
@@ -92,8 +92,8 @@ provider
 provider_document_id
 raw_file_hash
 processing_run_id
-document_unit_id
-unit_kind
+asset_id
+payload_kind
 heading_path
 title
 unit_content_hash

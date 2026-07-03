@@ -7,7 +7,7 @@ from disclosure_anchor.domain.ids import (
     is_ulid,
     new_company_id,
     new_document_id,
-    new_document_unit_id,
+    new_asset_id,
     new_id,
     new_outbox_event_id,
     new_processing_run_id,
@@ -64,7 +64,7 @@ class TypedIdHelperTests(unittest.TestCase):
             "sc": new_source_checkpoint_id,
             "doc": new_document_id,
             "run": new_processing_run_id,
-            "du": new_document_unit_id,
+            "du": new_asset_id,
             "oe": new_outbox_event_id,
         }
         for prefix, factory in cases.items():

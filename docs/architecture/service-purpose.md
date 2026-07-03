@@ -1,7 +1,7 @@
 ---
 id: disclosure_anchor
 title: disclosure_anchor 服务目的
-contract_version: v1.1
+contract_version: v1.2
 status: canonical
 layer: L1
 layer_name: 披露文件接入与结构化准备层
@@ -10,9 +10,8 @@ delivers_to: L2
 scope: self_maintained_exchange_disclosures
 output_kind: l2_ready_document_units
 output_form: queryable_database_plus_filing_api
-unit_kinds: [text, table, qa]
 payload_kinds: [text, table, qa]
-query_keys: [company_ref, security_ref, report_period, announcement_date, filing_type, document_id, unit_id, payload_kind, heading_path, semantic_key, quality_status, content_hash, source_ref, producer_action_ref]
+query_keys: [company_ref, security_ref, report_period, announcement_date, filing_type, document_id, asset_id, payload_kind, heading_path, semantic_key, quality_status, content_hash, source_ref, producer_action_ref]
 core_objects: [company, security, source_access, document, processing_run, document_unit]
 optional_objects: [source_checkpoint]
 primary_store: postgresql
@@ -312,12 +311,11 @@ qa
 没有 `event_unit`。短公告中的事件字段由 `L2` 从 `text/table` 单元中抽取，形成事件类
 `evidence_record` 或后续派生对象。
 
-术语对齐顶层 v0.7：
+术语对齐顶层 v0.7（已完成收敛，迁移 `0006_v07_terminology_convergence`）：
 
-- 本服务内部和已落地数据库字段继续使用 `unit_kind`；
-- 顶层协议统一称 `payload_kind`；
-- 当 `asset_kind = document_unit` 时，`unit_kind` 与 `payload_kind` 完全等价；
-- 对外 public view / API 可同时暴露二者，旧调用方读 `unit_kind`，新调用方读 `payload_kind`。
+- 本服务代码、数据库列与 public view 统一使用 `payload_kind`；`unit_kind` 为曾用名，不再出现在任何契约面；
+- 当 `asset_kind = document_unit` 时，`payload_kind` 即顶层协议的同名字段，无需映射；
+- `document_unit` 的稳定 ID 统一为 `asset_id`（曾用名 `document_unit_id` / fixture `unit_id`），ID 取值不变。
 
 ---
 
@@ -328,11 +326,10 @@ qa
 一个 `document_unit` 至少具有以下语义：
 
 ```text
-document_unit_id
+asset_id
 所属 document
 所属 processing_run
-unit_kind
-payload_kind（对外别名，等价于 unit_kind）
+payload_kind
 heading_path
 title
 order_index
@@ -363,7 +360,7 @@ artifact_locator（可选）
 
 ```json
 {
-  "unit_kind": "text",
+  "payload_kind": "text",
   "heading_path": [
     "第三节 管理层讨论与分析",
     "一、报告期内公司从事的主要业务"
@@ -393,7 +390,7 @@ artifact_locator（可选）
 
 ```json
 {
-  "unit_kind": "table",
+  "payload_kind": "table",
   "heading_path": [
     "第八节 财务报告",
     "财务报表附注",
@@ -430,7 +427,7 @@ artifact_locator（可选）
 
 ```json
 {
-  "unit_kind": "qa",
+  "payload_kind": "qa",
   "heading_path": ["投资者关系活动主要内容介绍"],
   "title": "美国加征关税对公司有什么影响？",
   "semantic_key": "tariff_exposure",
@@ -493,7 +490,7 @@ artifact_locator（可选）
 - 去重和候选匹配；
 - 人类理解上下文。
 
-`section_path` 可以作为旧字段别名，但新文档统一使用 `heading_path`，避免被误解为文件系统路径。
+`section_path` 是已废弃的曾用名，统一使用 `heading_path`，避免被误解为文件系统路径。
 
 ## 7.2 artifact_locator
 
@@ -528,7 +525,7 @@ source_access_id    = cninfo:p_info3015
 document_id         = 1225087169        # CNINFO textid
 raw_file_hash       = sha256:7c73103aa3c93778d2d1d18bcf55a2f76413887a8aa3f6b50f0749038edc19b3
 processing_run_id   = run_20260618_v3
-document_unit_id    = du_receivable_aging_002484_2025
+asset_id            = du_receivable_aging_002484_2025
 exact table snapshot= {"账龄":"1 年以内（含1 年）","期末账面余额":"1,765,831,017.43", ...}
 ```
 
@@ -709,7 +706,7 @@ exact table snapshot= {"账龄":"1 年以内（含1 年）","期末账面余额"
 
 保存当前 run 生成的 `text/table/qa` 单元。
 
-`document_unit_id` 在对应 run 内不可变，但不承诺跨 parser 版本保持同一 ID。
+`asset_id` 在对应 run 内不可变，但不承诺跨 parser 版本保持同一 ID。
 
 ## 10.6 source_checkpoint（可选）
 
@@ -777,7 +774,7 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - 公告日期；
 - 报告期；
 - 公告类型；
-- `payload_kind`（兼容返回 `unit_kind`）；
+- `payload_kind`；
 - `heading_path`；
 - `semantic_key`；
 - `quality_status`；
@@ -785,7 +782,7 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - `source_ref`；
 - `producer_action_ref`；
 - 标题；
-- `document_unit_id`。
+- `asset_id`。
 
 全文关键词检索可以后加，但不是证据对象，也不要求向量化。
 
@@ -818,7 +815,7 @@ order_index
 
 - `company_ref` = `document.company_id`；
 - `security_ref` = `document.security_id`；
-- `payload_kind` = `document_unit.unit_kind`；
+- `payload_kind` = `document_unit.payload_kind`（0006 起列名已收敛，不再映射）；
 - `producer_action_ref` = `processing_run_id`，即顶层 `action_log` 的 L1 特化；
 - `parent_ref` = 所属 `document_id`；
 - `source_ref` = `source_access_id`，完整 source reference 可由 `source_refs_v1` 或
@@ -826,11 +823,11 @@ order_index
 
 ## 12.2 Change feed 读契约
 
-`disclosure_ops.outbox_event` 是本服务的写侧 outbox，内部字段仍为 `event_type`。
+`disclosure_ops.outbox_event` 是本服务的写侧 outbox，字段已收敛为 `event_kind`（曾用名 `event_type`）。
 
 对外 `change_events_v1` / 未来 `GET /v1/changes?after_seq=...` 使用顶层协议口径：
 
-- `event_kind` 是对外事件名，当前映射自内部 `event_type`；
+- `event_kind` 是对外事件名，与 outbox 列同名，无需映射；
 - `change_kind` 只有 `observed` / `materialized` 两类；
 - 未显式声明 `change_kind` 的历史事件默认是 `materialized`；
 - `observed` 表示巡检或来源观察到了对象但没有产生可消费内容变化；
@@ -962,8 +959,8 @@ L2 收到一个 unit 后负责：
 对 `disclosure_anchor` 的三点补强：
 
 1. `document_units_v1` 保留 unit 级 scope keys，方便 L2 / MCP / API 检索；
-2. `unit_kind ≡ payload_kind`、`processing_run` 是 `action_log` 的 L1 特化、
-   `event_type` 对外映射为 `event_kind`；
+2. 术语已收敛：`document_unit_id → asset_id`、`unit_kind → payload_kind`、outbox
+   `event_type → event_kind`；`processing_run` 保留为 `action_log` 的 L1 特化；
 3. change feed 以 `change_events_v1` / 未来 `GET /v1/changes` 暴露，区分 observed / materialized。
 
 披露侧 `G0` 采用：

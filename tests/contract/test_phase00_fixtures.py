@@ -45,11 +45,11 @@ UNIT_REQUIRED_KEYS = {
     "quality_status",
     "semantic_key",
     "title",
-    "unit_id",
-    "unit_kind",
+    "asset_id",
+    "payload_kind",
 }
 
-ALLOWED_UNIT_KINDS = {"text", "table", "qa"}
+ALLOWED_PAYLOAD_KINDS = {"text", "table", "qa"}
 
 
 def _is_relative_locator(value: str) -> bool:
@@ -100,7 +100,7 @@ class Phase00FixtureContractTests(unittest.TestCase):
             units = _read_jsonl(FIXTURE_ROOT / key / "document_units.v1.jsonl")
             self.assertGreater(len(units), 0, key)
 
-            seen_unit_ids: set[str] = set()
+            seen_asset_ids: set[str] = set()
             last_order = 0
             for unit in units:
                 missing = UNIT_REQUIRED_KEYS - unit.keys()
@@ -109,13 +109,13 @@ class Phase00FixtureContractTests(unittest.TestCase):
                 # document_id is consistent with the normalized IR header.
                 self.assertEqual(unit["document_id"], ir["document_id"], key)
 
-                # unit_id is non-empty and unique within the document.
-                unit_id = unit["unit_id"]
-                self.assertTrue(unit_id)
-                self.assertNotIn(unit_id, seen_unit_ids, f"duplicate unit_id {unit_id}")
-                seen_unit_ids.add(unit_id)
+                # asset_id is non-empty and unique within the document.
+                asset_id = unit["asset_id"]
+                self.assertTrue(asset_id)
+                self.assertNotIn(asset_id, seen_asset_ids, f"duplicate asset_id {asset_id}")
+                seen_asset_ids.add(asset_id)
 
-                self.assertIn(unit["unit_kind"], ALLOWED_UNIT_KINDS, key)
+                self.assertIn(unit["payload_kind"], ALLOWED_PAYLOAD_KINDS, key)
                 self.assertIsInstance(unit["heading_path"], list)
                 self.assertIsInstance(unit["payload"], dict)
                 artifact_path = unit["artifact_locator"].get("artifact_path")

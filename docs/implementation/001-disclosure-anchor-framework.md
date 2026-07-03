@@ -142,7 +142,7 @@ raw PDF bytes
 + source_access_id
 + document_id
 + processing_run_id
-+ document_unit_id
++ asset_id
 + unit content_hash
 + exact payload snapshot
 ```
@@ -164,8 +164,8 @@ source_ref 逻辑格式：
   "provider_document_id": "1225087169",
   "raw_file_hash": "sha256:...",
   "processing_run_id": "run_01J...",
-  "document_unit_id": "du_01J...",
-  "unit_kind": "table",
+  "asset_id": "du_01J...",
+  "payload_kind": "table",
   "heading_path": ["第八节 财务报告", "财务报表附注", "应收账款", "按账龄披露"],
   "title": "应收账款按账龄披露",
   "unit_content_hash": "sha256:...",
@@ -611,7 +611,7 @@ M-LOG 全局执行日志
 | `raw_file_hash` | 原始 PDF bytes | G0 原文锚 |
 | `artifact_hash` | parser artifact / normalized IR | parser 输出可复现 |
 | `content_hash` | unit canonical payload | 判断 L2 是否重处理 |
-| `structure_hash` | heading_path、unit_kind、order、边界结构 | 判断结构变化 |
+| `structure_hash` | heading_path、payload_kind、order、边界结构 | 判断结构变化 |
 | `content_hash_aggregate` | run 下所有 unit content_hash 聚合 | 判断 run 内容整体变化 |
 
 触发规则：
@@ -650,8 +650,8 @@ GET  /v1/documents
 GET  /v1/documents/{document_id}
 GET  /v1/documents/{document_id}/runs
 GET  /v1/documents/{document_id}/units
-GET  /v1/units/{document_unit_id}
-GET  /v1/units/{document_unit_id}/source-ref
+GET  /v1/units/{asset_id}
+GET  /v1/units/{asset_id}/source-ref
 GET  /v1/filings/latest?security_code=002484&period=2025A&filing_type=annual_report
 GET  /v1/changes?after_seq=12345&limit=500
 POST /v1/admin/documents/register-local-pdf

@@ -52,7 +52,7 @@ file_path
 company/security metadata
 filing_type
 title
-disclosed_at
+announcement_date
 report_period
 provider/local ref
 ```

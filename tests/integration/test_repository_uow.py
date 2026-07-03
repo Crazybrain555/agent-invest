@@ -28,7 +28,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
     def _delete(self, created: dict[str, str]) -> None:
         """Best-effort cleanup of rows a committing test created."""
         order = [
-            ("disclosure_core.document_unit", "document_unit_id", "unit"),
+            ("disclosure_core.document_unit", "asset_id", "unit"),
             ("disclosure_ops.outbox_event", "event_id", "event"),
             ("disclosure_core.processing_run", "processing_run_id", "run"),
             ("disclosure_core.document", "document_id", "document"),
@@ -120,10 +120,10 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
 
                 unit = uow.document_units.add(
                     e.DocumentUnit(
-                        document_unit_id=ids.new_document_unit_id(),
+                        asset_id=ids.new_asset_id(),
                         document_id=document.document_id,
                         processing_run_id=run.processing_run_id,
-                        unit_kind="table",
+                        payload_kind="table",
                         order_index=0,
                         heading_path=["第八节 财务报告", "应收账款", "按账龄披露"],
                         title="应收账款按账龄披露",
@@ -133,12 +133,12 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                         artifact_locator={"artifact_kind": "normalized_ir", "order_index": 312},
                     )
                 )
-                created["unit"] = unit.document_unit_id
+                created["unit"] = unit.asset_id
 
                 event = uow.outbox.add(
                     e.OutboxEvent(
                         event_id=ids.new_outbox_event_id(),
-                        event_type="run_published",
+                        event_kind="run_published",
                         document_id=document.document_id,
                         processing_run_id=run.processing_run_id,
                     )
@@ -159,7 +159,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                 self.assertTrue(got_run.parser_artifact_relpath.startswith("parser_artifacts/"))
                 self.assertEqual(got_unit.semantic_key, "receivable_aging")
                 self.assertEqual(got_unit.heading_path[0], "第八节 财务报告")
-                self.assertEqual(uow.outbox.get(created["event"]).event_type, "run_published")
+                self.assertEqual(uow.outbox.get(created["event"]).event_kind, "run_published")
         finally:
             self._delete(created)
 

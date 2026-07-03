@@ -4,7 +4,7 @@ from disclosure_anchor.domain.ids import (
     is_internal_id,
     is_ulid,
     new_document_id,
-    new_document_unit_id,
+    new_asset_id,
     new_id,
     new_processing_run_id,
     new_source_access_id,
@@ -23,7 +23,7 @@ class IdTests(unittest.TestCase):
             new_source_access_id(),
             new_document_id(),
             new_processing_run_id(),
-            new_document_unit_id(),
+            new_asset_id(),
         ):
             self.assertTrue(is_internal_id(str(value)))
 

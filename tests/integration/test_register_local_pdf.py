@@ -127,7 +127,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
             exchange="LOCAL",
             filing_type="annual_report",
             title="Phase 03 local PDF",
-            disclosed_at=date(2026, 6, 29),
+            announcement_date=date(2026, 6, 29),
             report_period="2025A",
             provider_document_id=provider_document_id,
         )
@@ -157,9 +157,9 @@ class RegisterLocalPdfTests(unittest.TestCase):
                 ),
                 {"id": result.document_id},
             ).one()
-            event_type = conn.execute(
+            event_kind = conn.execute(
                 text(
-                    "SELECT event_type FROM disclosure_ops.outbox_event "
+                    "SELECT event_kind FROM disclosure_ops.outbox_event "
                     "WHERE document_id = :id"
                 ),
                 {"id": result.document_id},
@@ -167,7 +167,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(row.raw_file_relpath, result.raw_file_relpath)
         self.assertEqual(row.raw_file_hash, result.raw_file_hash)
         self.assertEqual(row.status, "registered")
-        self.assertEqual(event_type, "document_registered")
+        self.assertEqual(event_kind, "document_registered")
 
     def test_duplicate_same_file_reuses_document(self) -> None:
         provider_document_id = "local-" + new_ulid()

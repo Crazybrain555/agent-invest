@@ -118,10 +118,10 @@ class ProcessingRun:
 
 @dataclass
 class DocumentUnit:
-    document_unit_id: str
+    asset_id: str
     document_id: str
     processing_run_id: str
-    unit_kind: str
+    payload_kind: str
     order_index: int
     payload: dict[str, Any]
     content_hash: str
@@ -138,11 +138,11 @@ class DocumentUnit:
 @dataclass
 class OutboxEvent:
     event_id: str
-    event_type: str
+    event_kind: str
     seq: Optional[int] = None
     document_id: Optional[str] = None
     processing_run_id: Optional[str] = None
-    document_unit_id: Optional[str] = None
+    asset_id: Optional[str] = None
     payload: Optional[dict[str, Any]] = None
     occurred_at: Optional[datetime] = None
     created_at: Optional[datetime] = None

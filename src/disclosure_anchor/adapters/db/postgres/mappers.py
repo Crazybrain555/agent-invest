@@ -226,11 +226,11 @@ def processing_run_to_entity(row: m.ProcessingRun) -> e.ProcessingRun:
 
 def document_unit_to_model(entity: e.DocumentUnit) -> m.DocumentUnit:
     return m.DocumentUnit(
-        document_unit_id=entity.document_unit_id,
+        asset_id=entity.asset_id,
         document_id=entity.document_id,
         processing_run_id=entity.processing_run_id,
         provider_document_id=entity.provider_document_id,
-        unit_kind=entity.unit_kind,
+        payload_kind=entity.payload_kind,
         heading_path=entity.heading_path,
         title=entity.title,
         order_index=entity.order_index,
@@ -245,11 +245,11 @@ def document_unit_to_model(entity: e.DocumentUnit) -> m.DocumentUnit:
 
 def document_unit_to_entity(row: m.DocumentUnit) -> e.DocumentUnit:
     return e.DocumentUnit(
-        document_unit_id=row.document_unit_id,
+        asset_id=row.asset_id,
         document_id=row.document_id,
         processing_run_id=row.processing_run_id,
         provider_document_id=row.provider_document_id,
-        unit_kind=row.unit_kind,
+        payload_kind=row.payload_kind,
         heading_path=list(row.heading_path or []),
         title=row.title,
         order_index=row.order_index,
@@ -266,10 +266,10 @@ def document_unit_to_entity(row: m.DocumentUnit) -> e.DocumentUnit:
 def outbox_event_to_model(entity: e.OutboxEvent) -> m.OutboxEvent:
     return m.OutboxEvent(
         event_id=entity.event_id,
-        event_type=entity.event_type,
+        event_kind=entity.event_kind,
         document_id=entity.document_id,
         processing_run_id=entity.processing_run_id,
-        document_unit_id=entity.document_unit_id,
+        asset_id=entity.asset_id,
         payload=entity.payload,
     )
 
@@ -277,11 +277,11 @@ def outbox_event_to_model(entity: e.OutboxEvent) -> m.OutboxEvent:
 def outbox_event_to_entity(row: m.OutboxEvent) -> e.OutboxEvent:
     return e.OutboxEvent(
         event_id=row.event_id,
-        event_type=row.event_type,
+        event_kind=row.event_kind,
         seq=row.seq,
         document_id=row.document_id,
         processing_run_id=row.processing_run_id,
-        document_unit_id=row.document_unit_id,
+        asset_id=row.asset_id,
         payload=row.payload,
         occurred_at=row.occurred_at,
         created_at=row.created_at,

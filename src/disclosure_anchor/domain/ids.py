@@ -19,7 +19,7 @@ SourceAccessId = NewType("SourceAccessId", str)
 SourceCheckpointId = NewType("SourceCheckpointId", str)
 DocumentId = NewType("DocumentId", str)
 ProcessingRunId = NewType("ProcessingRunId", str)
-DocumentUnitId = NewType("DocumentUnitId", str)
+AssetId = NewType("AssetId", str)
 OutboxEventId = NewType("OutboxEventId", str)
 
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -87,8 +87,8 @@ def new_processing_run_id() -> ProcessingRunId:
     return ProcessingRunId(new_id("run"))
 
 
-def new_document_unit_id() -> DocumentUnitId:
-    return DocumentUnitId(new_id("du"))
+def new_asset_id() -> AssetId:
+    return AssetId(new_id("du"))
 
 
 def new_outbox_event_id() -> OutboxEventId:

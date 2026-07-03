@@ -35,8 +35,8 @@ GET /v1/documents
 GET /v1/documents/{document_id}
 GET /v1/documents/{document_id}/runs
 GET /v1/documents/{document_id}/units
-GET /v1/units/{document_unit_id}
-GET /v1/units/{document_unit_id}/source-ref
+GET /v1/units/{asset_id}
+GET /v1/units/{asset_id}/source-ref
 GET /v1/filings/latest
 GET /v1/changes
 POST /v1/admin/documents/register-local-pdf

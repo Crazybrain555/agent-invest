@@ -64,7 +64,7 @@ DuckDB, optional
 - 完整结构的 `table` 单元（表名、单位、表头、行数据、脚注、原始字符串）；
 - 完整问答的 `qa` 单元；
 - 哪次 `processing_run` 成功或失败、用哪个 parser 版本、哪个是 active run；
-- L2 能按 公司 / 报告期 / 公告类型 / `unit_kind` / `heading_path` / `semantic_key` / 标题 / `document_unit_id` 直接查询。
+- L2 能按 公司 / 报告期 / 公告类型 / `payload_kind` / `heading_path` / `semantic_key` / 标题 / `asset_id` 直接查询。
 
 > 标准财务数据（标准数据 provider 的三大表、财务指标、审计意见等）不入本库，走 `Dataset API`；本库只承载自维护披露文件的 `document` / `document_unit`。两条路径在 L2 汇合（见 canonical §1.1）。
 
@@ -112,7 +112,7 @@ CNINFO 字段、MinerU `content_list.json`、DoclingDocument、表格解析结�
 
 本项目建议：
 
-- **稳定查询字段升成列**：`document_id`、`company_id`、`disclosed_at`、`report_period`、`filing_type`、`unit_kind`、`heading_path`、`semantic_key`、`order_index`、`content_hash`、`quality_status`、`processor`、`processor_version`、`is_active_run`。
+- **稳定查询字段升成列**：`document_id`、`company_id`、`announcement_date`、`report_period`、`filing_type`、`payload_kind`、`heading_path`、`semantic_key`、`order_index`、`content_hash`、`quality_status`、`processor`、`processor_version`、`is_active_run`。
 - **原始/变动字段进 `jsonb`**：CNINFO 原始 payload、`source_access.query_params`、`document_unit.payload`（text 的正文 / table 的 headers+rows+notes / qa 的 question+answer）、parser metadata。
 - **大文件不要塞 DB**：PDF、完整 parser artifact、表格 HTML 等放文件系统，DB 存路径、哈希和摘要字段。
 
