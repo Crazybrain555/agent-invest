@@ -18,6 +18,7 @@ docs/implementation/
   001-disclosure-anchor-framework.md
   002-implementation-roadmap.md
   003-agent-execution-rules.md
+  disclosure_anchor_phase000_004_final_merged_review.md   # phase000–004 审查意见（历史记录）
   milestones/
     00-local-environment-and-parser-validation.md
     01-code-skeleton-and-config.md

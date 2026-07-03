@@ -30,7 +30,7 @@ created_at: 2026-06-26
 | A18 | 投关完整 qa unit 可查询 | 05/06 | fixture/API test | pending |
 | A19 | document_unit.payload 保存快照本身 | 05 | DB check | pending |
 | A20 | active run 发布不删除历史 run | 05 | integration test | pending |
-| A21 | content_hash 变化产生 change_event | 05/06 | integration test | pending |
+| A21 | unit content_hash / quality_status 变化产生 materialized change_event；内容不变的重跑只记 observed，不触发下游失效 | 05/06 | integration test | pending |
 | A22 | `GET /v1/filings/latest` 可用 | 06 | API test | pending |
 | A23 | `GET /v1/units/{id}/source-ref` 可用 | 06 | API test | pending |
 | A24 | `GET /v1/changes` 可增量读取 | 06 | API test | pending |
@@ -41,5 +41,6 @@ created_at: 2026-06-26
 | A29 | `make worker-once` 可从 pending 跑到 active run | 08 | end-to-end | pending |
 | A30 | worker 崩溃不破坏 raw archive | 08 | failure test | pending |
 | A31 | 外置盘未挂载时服务 fail closed | 01/08 | doctor/startup test | pass |
+| A32 | document_units_v1 保留 15 个 unit 级 scope keys + asset_id；契约名收敛为 asset_id/payload_kind/event_kind | 02/06 | integration test | pass |
 
 状态枚举：`pending / pass / fail / blocked / intentionally-deferred`。

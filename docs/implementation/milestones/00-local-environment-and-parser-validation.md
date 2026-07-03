@@ -82,7 +82,7 @@ document_units.v1.jsonl
 
 ## 5. Definition of Done
 
-- 有一份 `reports/phase00-parser-validation.md`。
+- 有一份 `tests/fixtures/phase00/phase00-parser-validation.md`。
 - 3 个样本 fixture 可被后续测试使用。
 - 外置盘目录和模型缓存路径确认无误。
 - PostgreSQL native cluster 可启动。

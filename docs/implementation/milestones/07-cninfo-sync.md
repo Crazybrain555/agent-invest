@@ -64,11 +64,16 @@ provider ref
 6. rate_limit 和 retry 不使用外部队列。
 7. 查空也写 source_access。
 8. token 刷新、HTTP status、`resultcode`、行数、耗时可以记录；token、secret 和完整敏感响应不得写日志或入库。
+9. company / security 建档遵守主体匹配键采集义务（service-purpose §10.1 / 顶层协议 §6.5.1 规则 4、5）：
+   统一社会信用代码有则必填（use case 入参 `company_credit_code`，scheme=uscc，对应 DB 列
+   `unified_social_credit_code`）；`(exchange, security_code)` 必填；CNINFO orgId 等 provider ID
+   只作 provider 侧标识，不作内部主键；identifier 校验 / 富化数据只经定时本地快照消费，
+   不得在同步链路实时调用外部 identifier API。
 
 
 ## 4. 检查点
 
-- 指定 10 家公司可稳定同步公告索引。
+- 指定 10 家公司可稳定同步公告索引（10 家为验收样本规模；生产 tracked_companies 为 ≥500 精选池，见 service-purpose §4.1）。
 - 指定公告类型可下载 PDF。
 - 下载结果进入 raw archive。
 - 查空有 source_access。

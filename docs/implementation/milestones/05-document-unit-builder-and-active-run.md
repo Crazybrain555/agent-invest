@@ -10,7 +10,7 @@ created_at: 2026-06-26
 
 ## 1. 目标
 
-从 NormalizedIR 生成 L2-ready document_unit，完成 A 类确定性清洗、质量标记、unit snapshot、active run 发布和 change_event。
+从 NormalizedIR 生成 L2-ready document_unit，完成载体规范化（carrier normalization，顶层协议 §3.5）、质量标记、unit snapshot、active run 发布和 change_event。
 
 ## 2. 范围
 
@@ -18,7 +18,7 @@ created_at: 2026-06-26
 
 - heading tree builder。
 - text/table/qa unit builder。
-- A 类清洗规则。
+- 载体规范化规则（只处理结构与载体、稳定噪声，不做投资语义）。
 - retention rules。
 - quality checks。
 - document_unit 写库。
@@ -31,7 +31,7 @@ created_at: 2026-06-26
 
 1. 读取 normalized_ir。
 2. 构建 heading_path。
-3. 生成三类 unit：
+3. 生成三类 unit（`payload_kind` 取值）：
 
 ```text
 text
@@ -39,7 +39,12 @@ table
 qa
 ```
 
-4. 执行 A 类确定性清洗。
+4. 执行载体规范化（顶层协议 §3.5，替代旧“A 类确定性清洗”叫法）：只处理结构和载体，不做投资语义——
+   - 页眉页脚、页码、水印、控制字符等稳定噪声处理；
+   - 段落 / 标题 / 表格 / Q&A 按业务结构切分；表格标题、表头、行头、单位、脚注保留在同一 unit，Q&A 问题与回答绑定；
+   - heading_path / order_index / semantic_key / content_hash 生成。
+
+   安全红线（顶层协议 §3.5 / 硬边界 9）：不得因“像套话”删除可能含实质风险、业绩变化、会计政策、重大事项的信息；只允许标记 quality_status 或不为其生成 unit（原始 PDF 与 parser artifact 仍保留、规则升级后可重处理），不得让下游永久不可见；“重要提示”这类常含退市风险、业绩大变的板块，不得按标签整段跳过。保留 / 跳过取舍按 service-purpose §9（有实质信息就保留，拿不准倾向保留）。
 5. 计算：
 
 ```text
@@ -78,6 +83,7 @@ quality_status_changed
 每条事件同时写 `change_kind`（service-purpose §12.2）：凡引起 public read model 可见内容变化
 （发布、unit 内容 / 质量状态变化）为 `materialized`；仅巡检 / 来源观察且无可消费变化为 `observed`。
 下游失效只由 `materialized` 触发。
+重跑发布但全部 unit `content_hash` / `quality_status` 不变时，事件按 `observed` 记录（顶层协议 §2.8：parser 升级但内容快照不变，不触发 L3）。
 
 
 ## 4. 检查点
@@ -116,6 +122,6 @@ quality_status_changed
 
 ## 8. 常见失败与处理
 
-- A 类清洗误删实质内容：立即降级规则，倾向保留。
+- 载体规范化误删实质内容：立即降级规则，倾向保留；原文与 parser artifact 必须仍可重处理（安全红线）。
 - 表格跨页合并失败：标记 needs_review，不阻塞 text/qa。
 - Q&A 边界不稳：保存为 text 或 needs_review，不自由拆 claim。

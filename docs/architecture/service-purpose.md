@@ -659,6 +659,15 @@ exact table snapshot= {"账龄":"1 年以内（含1 年）","期末账面余额"
 
 维护公司主体与证券标识。公司和证券分开，允许一家公司对应多个证券。
 
+主体匹配键采集义务（顶层协议 §6.5.1 主体匹配键规范在本服务的落地）：
+
+- `company_id` 是本服务铸造的本地不透明 ID；L4 Subject Registry 上线前不承诺全局主体身份，
+  届时按强键 crosswalk 回填 `subject_ref`（视图加列，兼容变更），`company_ref` 语义不变；
+- 强键"有则必填"：中国注册实体的统一社会信用代码经 `company_credit_code` 采集（scheme = uscc）；
+  `(exchange, security_code)` 已必填（证券级中键）；美股 / 港股主体接入时同规范采集
+  sec_cik / hk_cr / lei；
+- 规范化名称 + 辖区只作弱键，仅产生合并候选，不得自动合并主体。
+
 ## 10.2 source_access
 
 记录一次远端访问或文件获取：
@@ -813,13 +822,21 @@ order_index
 
 映射关系：
 
-- `company_ref` = `document.company_id`；
+- `company_ref` = `document.company_id`（本地不透明 ID，见 §10.1 主体匹配键采集义务）；
 - `security_ref` = `document.security_id`；
 - `payload_kind` = `document_unit.payload_kind`（0006 起列名已收敛，不再映射）；
 - `producer_action_ref` = `processing_run_id`，即顶层 `action_log` 的 L1 特化；
 - `parent_ref` = 所属 `document_id`；
 - `source_ref` = `source_access_id`，完整 source reference 可由 `source_refs_v1` 或
   `GET /v1/units/{id}/source-ref` 派生。
+
+`asset://` URI（顶层协议 §2.3）只在序列化边界派生，不落存储：
+
+- 形式：`asset://disclosure_anchor/v1/document_unit/{asset_id}`；
+- Filing API 响应以派生字段 `asset_uri` 返回（随 Phase006 落地）；MCP 包装时以该 URI 作为
+  resource key（`resources/read` 按 URI 取回，协议 §3.11）；
+- 数据库表与 `*_v1` 视图不存储 URI：它是 (service, kind, asset_id) 的纯投影，存储即冗余，且会随
+  scheme / 契约版本演进漂移（业界先例：Kubernetes 因同样原因弃用并移除了 `metadata.selfLink`）。
 
 ## 12.2 Change feed 读契约
 
@@ -833,6 +850,19 @@ order_index
 - `observed` 表示巡检或来源观察到了对象但没有产生可消费内容变化；
 - `materialized` 表示 public read model 可见内容发生变化，才允许触发下游失效 / 重算；
 - `GET /v1/changes` 是 Phase005+ 的 Filing API 目标契约；当前阶段先保证 outbox 与 public view 语义。
+
+## 12.3 对外错误模型
+
+HTTP / MCP 读侧错误码枚举至少包含（顶层协议 §3.11）：
+
+```text
+L1_PROCESSING_REQUIRED      请求对象仅有 raw 登记、尚未完成载体规范化（L1 读侧语义）
+NOT_FOUND                   对象不存在
+CONTRACT_VERSION_MISMATCH   请求契约版本与服务暴露版本不一致
+GONE_SUPERSEDED             对象已被新版本取代，响应携带 superseded_by 指引
+```
+
+错误响应不含内部堆栈与绝对路径。随 Phase006 Filing API 落地。
 
 ---
 

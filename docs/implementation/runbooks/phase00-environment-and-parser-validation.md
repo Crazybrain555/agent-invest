@@ -2,10 +2,12 @@
 id: disclosure_anchor_runbook_phase00
 project: disclosure_anchor
 title: Phase 00 执行清单（环境与样本 parser 验证）
-status: ready-to-run
+status: complete
 relates_to: docs/implementation/milestones/00-local-environment-and-parser-validation.md
 created_at: 2026-06-26
 ---
+
+> 已执行完成：A01–A05 均为 pass，fixtures 与报告见 `tests/fixtures/phase00/`。本文保留为历史执行记录。
 
 # Phase 00 执行清单：环境与样本 parser 验证
 

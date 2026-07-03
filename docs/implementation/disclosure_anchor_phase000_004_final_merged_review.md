@@ -3,6 +3,11 @@
 审查对象：`disclosure_anchor(2).zip` 及另一份 `disclosure_anchor_phase004_code_review.md` 建议  
 结论性质：在前两版审查意见基础上，只吸收确有工程价值的增量，不做不必要大改。
 
+> 【历史记录注（2026-07）】本文为 Phase004 审查时点的意见记录，文中"当前 / 现状"均指 0004 migration
+> 之前的代码。A1、A2、A3、A4、A6、A7、A8 已随 migrations 0004–0005 与 Phase004.5 hardening 落地；
+> 0006 已完成术语收敛（asset_id / payload_kind / event_kind）。A5、A9 与 PR-5（Phase005
+> document_unit builder 与 active-run 发布事务）仍未开始。
+
 ---
 
 ## 1. 总结论

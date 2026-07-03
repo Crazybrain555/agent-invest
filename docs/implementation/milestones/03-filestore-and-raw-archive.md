@@ -63,7 +63,7 @@ provider/local ref
 source_access
 document
 raw file
-outbox_event(document_downloaded 或 document_registered)
+outbox_event(document_registered；document_downloaded 留给 Phase 07 下载路径)
 ```
 
 6. 重复导入策略：

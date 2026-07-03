@@ -118,16 +118,16 @@ action:
 第 3 节是目标分层，下面是当前仓库的实际落地与入口命令。
 
 ```text
-tests/unit/          已实现  settings / ids / value_objects / PathBuilder / raw store / doctor / health / app startup
-tests/contract/      已实现  phase00 golden fixture 结构（document_unit 字段、content_hash、order_index、IR↔unit 一致性）
+tests/unit/          已实现  settings / ids / value_objects / PathBuilder / raw store / MinerU adapter / artifact store / doctor / health / app startup
+tests/contract/      已实现  phase00 golden fixture 结构 + NormalizedIR v1 契约（document_unit 字段、content_hash、order_index、IR↔unit 一致性）
 tests/sample_corpus/ 已实现  tmp/sample_filings manifest 完整性 + 真实 ID/hash 走 PathBuilder
-tests/integration/   已实现  Phase 02 PG + Phase 03 register_local_pdf / raw-hash doctor 检查
+tests/integration/   已实现  Phase 02 PG schema/权限/views + Phase 03 register_local_pdf / raw-hash doctor + Phase 04 ParseDocument + 0005/0006 public view scope 与术语契约
 ```
 
 入口命令（Makefile）：
 
 ```bash
-make test              # 跑全部分层（当前 64 个；无 DB 环境时 22 个 integration skip）
+make test              # 跑全部分层（当前 82 个；无 DB 环境时 26 个 integration skip）
 make test-unit         # 仅 tests/unit
 make test-contract     # 仅 tests/contract
 make test-data         # 仅 tests/sample_corpus

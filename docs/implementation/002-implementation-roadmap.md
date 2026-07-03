@@ -19,7 +19,7 @@ created_at: 2026-06-26
 | 02 | PostgreSQL 与 migrations | database、schema、roles、核心表、public views、repositories | 否 |
 | 03 | 文件存储与 raw archive | raw store、atomic write、hash、register local PDF | 否 |
 | 04 | MinerU adapter 与 NormalizedIR | parser_artifacts、MinerU mapper、normalized_ir | 否 |
-| 05 | document_unit builder 与 active run | text/table/qa units、A 类清洗、publish run、outbox | 否 |
+| 05 | document_unit builder 与 active run | text/table/qa units、载体规范化（确定性噪声处理）、publish run、outbox | 否 |
 | 06 | Filing API 与 public contracts | API、OpenAPI、source_ref、changes、contract tests | 否 |
 | 07 | CNINFO 增量同步 | source adapter、index sync、download、checkpoint、重试 | 是 |
 | 08 | worker loop 与本地运行 | worker-once/loop、locks、reports、运行闭环 | 可选 |

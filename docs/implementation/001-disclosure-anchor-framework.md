@@ -49,7 +49,7 @@ disclosure_anchor
 
 一句话定义：
 
-> `disclosure_anchor` 是投研预测引擎 L1 中负责交易所披露文件的接入、归档、解析、结构切分、A 类确定性清洗和 L2-ready document units 发布的独立服务。
+> `disclosure_anchor` 是投研预测引擎 L1 中负责交易所披露文件的接入、归档、解析、结构切分、载体规范化和 L2-ready document units 发布的独立服务。
 
 处理链：
 
@@ -60,7 +60,7 @@ CNINFO / 交易所 / 本地 PDF
 → raw PDF immutable archive
 → MinerU parser artifact
 → parser-neutral normalized IR
-→ A 类确定性清洗
+→ 载体规范化（确定性噪声处理）
 → document_unit(text/table/qa)
 → active processing_run
 → Filing API / public read view / source_ref / change_event
@@ -78,7 +78,7 @@ CNINFO / 交易所 / 本地 PDF
 6. 调用 MinerU 解析 PDF。
 7. 保存 parser artifacts。
 8. 将 MinerU 输出转成 parser-neutral `NormalizedIR`。
-9. 做 A 类确定性清洗。
+9. 做载体规范化的确定性噪声处理。
 10. 按标题树、完整表格、完整问答生成 `document_unit`。
 11. 标记质量状态。
 12. 发布 active `processing_run`。
@@ -178,12 +178,12 @@ source_ref 逻辑格式：
 }
 ```
 
-L2 claim 应保存：
+L2 evidence_record 应保存：
 
 ```text
 source_ref
 + exact snapshot 或 snapshot_hash
-+ L2 自己引用的派生视图版本，如有
++ primary_asset_ref + exact_span 定位与 producer_action_ref 一跳引用
 ```
 
 ---
@@ -589,7 +589,7 @@ rule artifact
 framework entry
 scheduler lineage graph
 human todo
-M-LOG 全局执行日志
+action_log 全局执行账本（曾用名 M-LOG）
 ```
 
 ### 6.3 核心对象
@@ -642,6 +642,8 @@ v1 只监听本机：
 127.0.0.1:8711
 ```
 
+错误模型（协议 §3.11）：错误码枚举至少含 `L1_PROCESSING_REQUIRED`（请求对象仅有 raw 登记、尚未完成载体规范化）、`NOT_FOUND`、`CONTRACT_VERSION_MISMATCH`、`GONE_SUPERSEDED`。
+
 最小 endpoint：
 
 ```text
@@ -676,7 +678,7 @@ disclosure_public.change_events_v1
 v1 不上 Kafka。使用 PG outbox + polling：
 
 ```text
-disclosure_core.outbox_event
+disclosure_ops.outbox_event
 → disclosure_public.change_events_v1
 → GET /v1/changes?after_seq=...
 ```
@@ -711,9 +713,9 @@ Phase 0 可以每份文档 subprocess。v1 使用 batch worker。只有在频繁
 
 ---
 
-## 9. A 类确定性清洗
+## 9. 载体规范化（确定性噪声处理）
 
-L1 只做 A 类确定性清洗：
+L1 只做载体规范化中的确定性噪声处理：
 
 ```text
 页眉页脚
@@ -724,14 +726,15 @@ L1 只做 A 类确定性清洗：
 可稳定识别且基本不含实质信息的模板噪声
 ```
 
-不得在 L1 做 B 类语义判断型清洗。不得让 LLM 自由判断“是否有投资价值”。
+不得在 L1 做语义判断型取舍；语义归一属于 L2 证据化。不得让 LLM 自由判断“是否有投资价值”。
 
 关键约束：
 
 - 清洗的是派生 `document_unit`，不改 raw PDF。
 - 不确定时倾向保留。
 - “重要提示”“风险提示”这类可能含实质信息的板块，不能按标题整段删除。
-- B 类派生视图未来由 L2 生成并引用不可变 unit。
+- 可以不为稳定噪声生成 unit，但原文与 parser artifact 必须保留、可重处理，不得让实质信息对下游永久不可见（协议 §3.5 安全红线）。
+- 不存在“语义清洗后文本”派生视图资产；L2 通过选择性证据化提纯，evidence_record 引用不可变 unit 并以 primary_asset_ref + exact_span 定位（协议 §3.5、附录 B）。
 
 ---
 

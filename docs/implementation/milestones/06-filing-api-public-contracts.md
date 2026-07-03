@@ -66,6 +66,17 @@ change_event.v1.json
 8. changes DTO 与 `change_event.v1.json` 必须携带 `event_kind`（对外事件名）与
    `change_kind`（仅 `observed` / `materialized` 两值，未显式声明的历史事件默认
    `materialized`），语义遵循 service-purpose §12.2：下游失效只由 `materialized` 触发。
+   消费协定遵循顶层协议 §2.8：`seq` 单调递增作游标可断点续读；at-least-once 投递 + 消费端幂等；
+   同一 subject（document / asset）内保序。
+9. unit 级 DTO 携带派生字段 `asset_uri` = `asset://disclosure_anchor/v1/document_unit/{asset_id}`，
+   仅在 API 序列化层计算，不入库、不进 `*_v1` 视图（service-purpose §12.1）；后续 MCP 包装以该
+   URI 作为 resource key。
+10. 错误模型遵循顶层协议 §3.11：错误码枚举至少含 `L1_PROCESSING_REQUIRED`（请求对象仅有 raw
+    登记、尚未完成载体规范化）、`NOT_FOUND`、`CONTRACT_VERSION_MISMATCH`、`GONE_SUPERSEDED`；
+    错误响应不含内部堆栈。
+11. list endpoint（documents / units / filings/latest / changes）支持按 scope keys 过滤（公司 /
+    report_period / filing_type / payload_kind / heading_path / semantic_key / quality_status）
+    与游标分页；这是顶层协议 §3.11 的契约义务，不是可选优化。
 
 
 ## 4. 检查点
@@ -76,6 +87,7 @@ change_event.v1.json
 - `GET /v1/changes?after_seq=0` 可用，事件含 `event_kind` 与 `change_kind`（observed/materialized）。
 - API 不返回绝对路径。
 - API 不返回 private state / 内部异常堆栈。
+- 四个错误码（L1_PROCESSING_REQUIRED / NOT_FOUND / CONTRACT_VERSION_MISMATCH / GONE_SUPERSEDED）有 contract test。
 - contract tests 通过。
 
 

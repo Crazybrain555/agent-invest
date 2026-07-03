@@ -5,12 +5,12 @@
 > **对齐说明**：本文结论（PostgreSQL 主库 + 文件系统 + 可选 DuckDB）不变，但第一版的对象模型已按
 > `service-purpose.md` 和 `财报与披露数据接入及切分方案.md` 收缩为 `document_unit` 体系。原稿中的
 > `filing_text_block` / `filing_text_chunk` / `filing_table` / `filing_table_cell` / `page_idx` / `bbox` /
-> 独立 embedding 字段**不再是第一版核心对象**，相关段落已重写。术语和硬决策以 canonical 两文为准。
+> 独立 embedding 字段**不再是第一版核心对象**，相关段落已重写。术语和硬决策以 `service-purpose.md`（canonical 契约）为准，实施细则见《财报与披露数据接入及切分方案》（implementation_plan）。
 
 输入文档：
 
 - `docs/architecture/service-purpose.md`（canonical 契约）
-- `docs/architecture/财报与披露数据接入及切分方案.md`（canonical 方向）
+- `docs/architecture/财报与披露数据接入及切分方案.md`（实施方案，status: implementation_plan）
 - `docs/architecture/pdf-parsing-investigation.md`
 - `docs/architecture/cninfo-webapi-usage-reference.md`
 
@@ -152,7 +152,7 @@ quality_status != unusable
 但**第一版的决策是不建 embedding 列、不建 chunk 表**（见 canonical §11、财报方案 §11.9）：
 
 - 向量索引一定是派生物，且当前还没有证据证明本地 filings 文本规模需要它；
-- 真要做时，它是 `document_unit` payload 之上的派生索引，按 财报方案 §5 Phase 5“只对明确瓶颈增加全文或语义检索”引入；
+- 真要做时，它是 `document_unit` payload 之上的派生索引，按 财报方案 §16 Phase 6“只对明确瓶颈增加全文或语义检索”引入；
 - pgvector 的 HNSW 查询性能好但建索引慢、占内存；IVFFlat 建索引更轻但召回/速度取舍不同；
 - pgvector 不替代 chunking、embedding model、reranker、评测集；这些 AI 质量问题不由数据库自动解决。
 

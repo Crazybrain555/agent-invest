@@ -99,6 +99,12 @@ data/derived/normalized_ir/<provider>/<security>/<provider_doc_id>/run_<run_id>/
 - processing_run parse 状态。
 
 
+## 8. 常见失败与处理
+
+- MinerU 输出格式变化：只改 mapper，不改 domain。
+- 单份 PDF 解析超时：记录 failed，不阻塞其他任务。
+- IR 过大：记录大小，暂不优化存储。
+
 ## 9. 独立 testing 验证
 
 验证环境：
@@ -117,7 +123,7 @@ MinerU: /Volumes/AgentSSD/agent_system/services/disclosure_anchor/runtime/venvs/
 make test-unit                                    38 tests, OK
 make test-contract                                6 tests, OK
 make test                                         no DB env: 73 tests, OK (skipped=24)
-make migrate                                      pass, head=0003_parser_run_metadata
+make migrate                                      pass, head=0003_parser_run_metadata（当时 head；现已推进至 0006）
 make test-integration                             24 tests, OK
 make test                                         DB env: 73 tests, OK
 make doctor                                       pass
@@ -127,7 +133,7 @@ git diff --check                                  pass
 SQL 点检：
 
 ```text
-alembic=0003_parser_run_metadata
+alembic=0003_parser_run_metadata（当时 head；现已推进至 0006）
 processing_run Phase 04 cols=3
 public relpath cols=0
 processing_runs_v1 parser metadata cols=2
@@ -146,10 +152,3 @@ processing_runs_v1 parser metadata cols=2
 - A14：domain/application 不直接读取 MinerU raw JSON；application 只依赖 parser port，MinerU raw reader/mapper
   位于 adapter 层。
 - A15：parser failure 会写入新的 failed parse run，既有 active run 保持 `succeeded/is_active=true`。
-
-
-## 8. 常见失败与处理
-
-- MinerU 输出格式变化：只改 mapper，不改 domain。
-- 单份 PDF 解析超时：记录 failed，不阻塞其他任务。
-- IR 过大：记录大小，暂不优化存储。

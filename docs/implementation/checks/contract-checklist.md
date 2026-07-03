@@ -54,6 +54,9 @@ GET /v1/changes
 分页参数存在
 错误响应不泄露内部堆栈
 响应不含绝对路径
+错误码枚举：L1_PROCESSING_REQUIRED / NOT_FOUND / CONTRACT_VERSION_MISMATCH / GONE_SUPERSEDED
+unit 级 DTO 携带派生字段 asset_uri（仅 API 序列化层派生，不入库、不进 *_v1 视图）
+scope keys 过滤参数可用（filing_type / payload_kind / heading_path / semantic_key / quality_status 等）
 ```
 
 ## 3. Public view 检查
@@ -123,4 +126,7 @@ limit 生效
 事件 payload 不含 private details
 事件携带 event_kind（与 outbox 列同名）
 事件携带 change_kind，取值仅 observed / materialized（历史事件默认 materialized）
+at-least-once 投递 + 消费端幂等（重复投递不产生重复消费效果；“无重复事件”指 feed 内 seq 不重复）
+同一 subject（document / asset）内事件保序
+下游失效只由 change_kind=materialized 触发
 ```

@@ -7,7 +7,7 @@
 > **对齐说明**：原稿把第一版存储定为“硬盘 + SQLite 索引”、对象用 `filing_text` / `filing_table` / `filing_table_cell`，
 > 并把 Docling 作为默认 parser——这些都已过时。按 `service-purpose.md` / `财报与披露数据接入及切分方案.md` /
 > `database-selection.md`，第一版**主库为 PostgreSQL**、对象为 `document_unit`（text/table/qa）、**默认 parser 为 MinerU**。
-> 本文同时补入真正塑造 v1.0 的几个架构参考（OpenBB / dlt / CocoIndex），它们在原稿里缺失。术语与硬决策以 canonical 两文为准。
+> 本文同时补入真正塑造 v1.0 的几个架构参考（OpenBB / dlt / CocoIndex），它们在原稿里缺失。术语与硬决策以 `service-purpose.md`（canonical）为准；《财报与披露数据接入及切分方案》为实施方案（implementation_plan）。
 
 ## 结论
 
@@ -298,7 +298,7 @@ GraphRAG 的主要参考价值在于它把输入语料切成 TextUnits，并在 
 
 #### 2. Unstructured
 
-Unstructured 的参考价值在 L1。它不是简单把 PDF、HTML、PPT、Word 等文件切成纯文本，而是先识别 document elements，并保留 metadata，再基于这些 elements 做 chunking。这个思路支持本项目把 L1 定义为“来源资产层”：L1 不做投资语义判断，但要尽量保留标题、段落、表格、Q&A、页码、表头、章节路径、相邻关系等结构上下文。
+Unstructured 的参考价值在 L1。它不是简单把 PDF、HTML、PPT、Word 等文件切成纯文本，而是先识别 document elements，并保留 metadata，再基于这些 elements 做 chunking。这个思路支持本项目把 L1 定义为“来源资产层”：L1 不做投资语义判断，但要尽量保留标题、段落、表格、Q&A、表头、标题路径（heading_path）、相邻关系等结构上下文（页码 / bbox 只留在 parser artifact，不进入 `document_unit` 契约）。
 
 因此，本项目可以借鉴 Unstructured 的“结构先于语义”思路：公告、财报、人工纪要、表格、转写材料进入系统后，L1 应尽量输出带结构上下文的 document_unit，而不是只输出裸文本。但 L1 不应提前判断“这是订单 claim”“这是 Rubin 主题”“这是高价值预测变量”，这些属于 L2 的语义处理范围。
 
@@ -314,7 +314,7 @@ LlamaIndex 的 Property Graph Index 参考价值在 L2。它对每个 chunk 运�
 
 Haystack 的参考价值在于 metadata-based routing。Haystack 的 MetadataRouter 可以根据文档或 byte stream 的 metadata 把输入路由到不同输出连接。这个思路支持本项目把 L2 设计成“多通道证据入口”，而不是把所有来源都硬塞进同一条文本 claim 抽取流水线。
 
-在本项目中，不同来源应该先通过 source_ref + evidence_input 进入系统，再根据 payload 类型路由：公告 / 财报 / 人工纪要走文档通道；Wind / iFinD / Choice / Tushare 等标准结构化数据走结构化观测通道；web / MCP / news / forum / Claude 或 Codex search 结果走轻载外部来源通道；人工 Excel 或自有整理表走人工资料通道。这样 L2 才能处理真实复杂来源，而不是默认所有数据都是 PDF document_unit。
+在本项目中，不同来源应先由对应 L1 adapter 登记为 `data_asset`（携带 `source_ref` provenance）进入系统，再根据 payload 类型路由：公告 / 财报 / 人工纪要走文档通道；Wind / iFinD / Choice / Tushare 等标准结构化数据走结构化观测通道；web / MCP / news / forum / Claude 或 Codex search 结果走轻载外部来源通道；人工 Excel 或自有整理表走人工资料通道。这样 L2 才能处理真实复杂来源，而不是默认所有数据都是 PDF document_unit。
 
 ### C. 结构化数据契约与 L3 派生资产
 
@@ -336,7 +336,7 @@ Dagster 的 software-defined assets 参考价值在 L3。Dagster 把数据资产
 
 OpenAI Structured Outputs 的参考价值在 L2 / L3 的模型输出约束。Structured Outputs 用 JSON Schema 约束模型输出格式，能降低模型漏字段、枚举乱写、结构不合规的问题。
 
-但结构化输出只保证格式，不保证事实正确。因此本项目可以用类似机制要求模型输出 claim candidate、关系型 claim、抽取结果、校验结果、待办候选等结构化对象；同时必须保留原文锚、source_ref、document_unit、exact_span、model version、prompt version、schema version、validator version 和 extraction_run_id。模型输出不能直接等于 accepted claim，仍然需要规则校验、来源追溯、冲突检测、披露锚对账和必要的人工裁决。
+但结构化输出只保证格式，不保证事实正确。因此本项目可以用类似机制要求模型输出 claim candidate、关系型 claim、抽取结果、校验结果、待办候选等结构化对象；同时必须保留原文锚、source_ref、document_unit、exact_span、model version、prompt version、schema version、validator version 和 `action_log` 动作记录（对外即 `producer_action_ref`；v0.7 已用 `action_log` 取代 extraction_run / derivation_run）。模型输出不能直接等于 accepted claim，仍然需要规则校验、来源追溯、冲突检测、披露锚对账和必要的人工裁决。
 
 ### E. 对本项目的最终取舍
 
@@ -363,8 +363,8 @@ OpenAI Structured Outputs 的参考价值在 L2 / L3 的模型输出约束。Str
 最终结论是：外部项目提供的是工程参照，不是系统边界。本项目真正要固化的是自己的证据链、派生链、预测链和复盘链：
 
 ```text
-source_ref / evidence_input
-→ L2 observed evidence
+L1 data_asset（含 source_ref provenance）
+→ L2 evidence_record（observed evidence）
 → L3 derived evidence
 → L5 assumptions / forecast nodes
 → snapshot

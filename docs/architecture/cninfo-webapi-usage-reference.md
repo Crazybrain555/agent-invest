@@ -391,6 +391,8 @@ https://webapi.cninfo.com.cn/#/interface?packageId=22&apiId=a0fec4cde3bf4f83821f
 
 ### 本地表/对象建议
 
+> 注（2026-07）：本节是 canonical 收敛前的建模草案。实际落地对象以 `service-purpose.md` §10–§11 为准（source_access / document / source_checkpoint 等）；`cninfo_request_log` 对应 `source_access`，公告索引字段作为 `document` / `source_access` 的元数据与 payload 保存，不另建 `cninfo_*` 镜像表。CNINFO 字段名保持 provider 原名。
+
 最小本地对象：
 
 - `cninfo_security`：来自 `p_stock2101`。

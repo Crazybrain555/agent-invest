@@ -1,9 +1,10 @@
 ---
 id: disclosure_anchor_implementation_plan
 title: disclosure_anchor 实施方案（AI Agent 编码指导）
-version: v1.0
-status: implementation_canonical
-date: 2026-06-23
+version: v1.1
+status: implementation_plan
+date: 2026-07-04
+canonical_contract: docs/architecture/service-purpose.md
 audience: ai_coding_agent
 service: disclosure_anchor
 layer: L1
@@ -48,7 +49,8 @@ implementation_style: modular_monolith_with_ports_and_adapters
 - 服务范围和 L1/L2 边界以 `service-purpose.md` 为准；
 - 数据接入、保留和切分边界以《财报与披露数据接入及切分方案》为准；
 - 本文件只能细化实现，不能反向修改前两份 canonical 需求；
-- 不应为了迎合旧调研文档而恢复 page、bbox、持久化 chunk、table_cell 或 event_unit。
+- 不应为了迎合旧调研文档而恢复 page、bbox、持久化 chunk、table_cell 或 event_unit；
+- 术语、信封字段、change feed、追溯等级与主体匹配键等跨层规范以《投研预测引擎顶层框架协议 v0.7》§2 / §2.8 / §2.9 / §6.5.1 为准（协议 §2 是字段与命名的唯一权威）；本文与之冲突时，修订本文。
 
 ## 0.2 AI coding agent 的工作方式
 
@@ -169,13 +171,13 @@ PostgreSQL + filesystem 的结论正确。需要加强：
 
 ### `投研预测引擎顶层框架协议_v0.7修订最终版本.md`
 
-旧版协议（v0.5 前）存在一处真实冲突（把 G0 写成“PDF + 页码 + 段落/表格位置”，并把信息单元切分全部放在 L2），**已在协议修订中收敛（现行 v0.7）**，按以下 canonical 设计落地（见 §2.1 / §2.2 / §2.5 / §3.1–3.3 / §9.1）：
+旧版协议（v0.5 前）存在一处真实冲突（把 G0 写成“PDF + 页码 + 段落/表格位置”，并把信息单元切分全部放在 L2），**已在协议修订中收敛（现行 v0.7）**，按以下 canonical 设计落地（协议 §2.9、§3.4–§3.5、§3.10、§17.2）：
 
-- **L1 统一完成文档结构切分与 A 类规则确定性清洗，适用于全部来源**，不再以 PDF 为特例；PDF 额外包含解析，其余来源依既有结构切分；L2 直接接收 `document_unit` 进行语义处理。
-- **G0 身份锚 = 原文件 + 文件哈希 + 不可变 `document_unit` 快照 + 来源链**；page/bbox 仅为可选复核信息。
-- **清洗按规则稳定性分两类**：A 类——可由稳定、可枚举规则识别且基本不含实质信息者（版面噪声，及法律声明/释义/目录/签署页等固定板式套话）——在 L1 直接清除，损失轻度且可回 raw；唯对可能含实质信息的板块（如“重要提示”，常含退市风险、业绩大幅变动）不得按标签整段清除。B 类——需依据上下文判断信息价值、判定标准随时间演进、无法由稳定规则覆盖者——不进 L1，由 L2 生成**版本化派生视图、指回不可变 unit**，规模最小、v1 可暂缓。
-- **raw 原文件以原始字节保真留存 + 哈希为兜底**：A 类损失仅发生于 `document_unit` 派生结构、不影响 archive，必要时可与 raw 比对并还原；但 raw 兜底仅支持人工复核，不支持自动抽取（故见上一条板块清除限制）。
-- **双存储**：不可变锚（raw + 哈希 + 不可变 unit）与版本化派生工件（parser artifact、normalized IR、B 类清洗视图）分开存放；claim 记录所引用的派生视图版本以保证可复现。
+- **L1 统一完成文档结构切分与载体规范化（carrier normalization），适用于全部来源**，不再以 PDF 为特例；PDF 额外包含解析，其余来源依既有结构切分；L2 直接接收 `document_unit` 进行语义处理。载体规范化只处理结构和载体（解析、按业务结构切分、表格与 Q&A 结构保留、heading_path / order_index / semantic_key / content_hash 生成、页眉页脚等稳定噪声处理），不做投资语义判断。
+- **G0 身份锚 = 自维护原文 + 文件哈希 + 不可变 `document_unit` 快照 + 来源链**；page/bbox 仅为可选复核信息。
+- **安全红线**：L1 不得因“像套话”让可能含实质信息的内容（如“重要提示”，常含退市风险、业绩大幅变动）对下游永久不可见。可以标记质量或不为其生成 unit（原文与 parser artifact 仍保留、可重处理），但不得按标签整段清除；raw 兜底仅支持人工复核、不支持自动抽取，故不能以“可回 raw”为由清除实质板块。
+- **语义层取舍归 L2**：v0.7 已删除“A 类 / B 类清洗”的叫法，并否决“B 类语义清洗视图”这类二级资产（协议附录 B）。需按上下文判断信息价值的内容不产生独立“语义清洗后文本”，由 L2 通过高价值选择性证据化处理：证据指回不可变 unit（primary_asset_ref + exact_span），语义归一并入证据化动作。
+- **双存储**：不可变锚（raw + 哈希 + 不可变 unit）与版本化派生工件（parser artifact、normalized IR）分开存放；证据可复现依赖 `producer_action_ref` 一跳引用与 exact snapshot，不依赖任何“清洗视图”版本。
 
 本服务实施时按此执行。
 
@@ -195,9 +197,9 @@ PostgreSQL + filesystem 的结论正确。需要加强：
 10. 增量同步使用重叠回看窗口，checkpoint 只是优化游标，不是完整性证明；
 11. published/referenced artifacts 不得因为“理论上可重跑”而被删除；
 12. 人工重跑、发布切换和正式文件补录必须留下服务内 operation log；
-13. L1 统一完成文档结构切分与 A 类规则确定性清洗，适用于全部来源（不再以 PDF 为特例）；L2 直接接收 `document_unit` 进行语义处理；
-14. 清洗按规则稳定性分两类：A 类——可由稳定、可枚举规则识别且基本不含实质信息者（版面噪声，及法律声明/释义/目录/签署页等固定板式套话）——在 L1 直接清除，损失轻度且以 raw 兜底；唯对可能含实质信息的板块（如“重要提示”）不得按标签整段清除（被清除内容下游 claim 抽取无法看到，raw 兜底不支持自动抽取）。B 类——需依据上下文判断信息价值、判定标准随时间演进、无法由稳定规则覆盖者——不进 L1，由 L2 生成版本化派生视图并指回不可变 unit，规模最小、v1 可暂缓；
-15. 双存储与处理分界：不可变锚（raw + 文件哈希 + 不可变 unit）与版本化派生工件（parser artifact、normalized IR、B 类清洗视图）分开存放；“自维护原文 vs 仅登记来源”是真正的处理分界，取代“PDF / 非 PDF”；claim 须记录所引用的派生视图版本以保证可复现。
+13. L1 统一完成文档结构切分与载体规范化（carrier normalization），适用于全部来源（不再以 PDF 为特例）；L2 直接接收 `document_unit` 进行语义处理；
+14. 载体规范化只处理结构和载体，不做投资语义：稳定版面噪声（页眉页脚、页码、水印、目录点线、纯排版元素）与明确模板套话可确定性抑制、不生成 unit；安全红线是不得让可能含实质信息的板块（如“重要提示”）对下游永久不可见——被抑制内容下游 claim 抽取无法看到，raw 兜底不支持自动抽取，故拿不准时倾向保留。需按上下文判断信息价值者不在 L1 处理，由 L2 高价值选择性证据化（证据指回不可变 unit，不产生独立“语义清洗后文本”资产）；
+15. 双存储与处理分界：不可变锚（raw + 文件哈希 + 不可变 unit）与版本化派生工件（parser artifact、normalized IR）分开存放；“自维护原文 vs 仅登记来源”是真正的处理分界，取代“PDF / 非 PDF”；L2 证据以 producer_action_ref 与 exact snapshot 保证可复现。
 
 ---
 
@@ -528,7 +530,7 @@ operation            = p_info3015
 ```text
 company_id
 canonical_name
-organization_code（可空）
+company_credit_code（可空；统一社会信用代码，主体匹配键 scheme = uscc，中国注册实体“有则必填”，DB 列 unified_social_credit_code）
 status
 provider_metadata
 created_at
@@ -567,7 +569,7 @@ provider_metadata
 - 官方 URL 获取；
 - 人工补录的正式披露文件。
 
-Wind / Tushare / iFinD / Choice 的访问记录归 Dataset API 所属模块；Web、MCP、新闻和研报等非披露来源归 L2 或公共来源服务。本服务可以共享 `SourceRef` 协议，但不得把自己的 `source_access` 扩成整个 L1 的万能访问表。
+Wind / Tushare / iFinD / Choice 的访问记录归 Dataset API 所属模块；Web、MCP、新闻和研报等轻载外部来源归对应的 L1 轻载外部 adapter（登记为 `data_asset(tool_result)` 或 `source_access`，协议 §3.1 / §3.3），不归 L2，也不属于本服务。本服务可以共享 `source_ref` 引用规范（provenance 引用，可由视图 / endpoint 派生，不要求独立主表），但不得把自己的 `source_access` 扩成整个 L1 的万能访问表。
 
 最低字段语义：
 
@@ -612,7 +614,7 @@ source_access_document
 document_id
 company_id
 security_id（可空）
-source_provider
+provider
 provider_document_id
 byte_version
 raw_filing_type
@@ -621,10 +623,10 @@ title
 announcement_date
 report_period_end（可空）
 report_period_type（可空）
-event_date（可空）
+event_time（可空；业务发生时点，日期或时刻，协议 §2.4）
 source_url
 raw_storage_key
-raw_sha256
+raw_file_hash
 raw_size
 mime_type
 raw_status
@@ -643,14 +645,14 @@ created_at
 3. 同一 provider_document_id 后续返回不同字节时，创建新 document，递增 `byte_version`，并通过 `supersedes_document_id` 或版本关系连接；
 4. `raw_status = available` 后原文件字段不能覆盖；
 5. raw blob 可以按 sha256 物理去重，但来源 document 记录仍分别存在；
-6. canonical 报告期使用 `report_period_end + report_period_type`，例如 `2025-12-31 + FY`；`2025A`、`2026Q1` 仅为展示标签；
+6. canonical 报告期使用 `report_period_end + report_period_type`，例如 `2025-12-31 + FY`；`2025A`、`2026Q1` 是其 label 形态。对外 `*_v1` 视图与检索键仍暴露 `report_period`（label 形态，协议 §2.5），与内部 canonical 表示由同一规则互相派生，不得从 public 契约移除；
 7. 非定期报告允许报告期为空；
 8. provider 原始分类必须保留，规范化 filing_type 由版本化 registry 映射。
 
 建议约束：
 
 ```text
-已下载版本唯一：(source_provider, provider_document_id, raw_sha256)
+已下载版本唯一：(provider, provider_document_id, raw_file_hash)
 待下载 provisional 记录：同一 provider + provider_document_id 同时最多一条
 ```
 
@@ -658,7 +660,7 @@ created_at
 
 定义：对一个已经固化的 document 执行一次完整的“解析 → IR 规范化 → unitization → policy → quality → publish”运行。
 
-下载不属于 processing_run；下载属于 source access 和 document raw lifecycle。这样 run 的输入始终是一个确定的 raw_sha256。
+下载不属于 processing_run；下载属于 source access 和 document raw lifecycle。这样 run 的输入始终是一个确定的 raw_file_hash（processing_run.input_sha256 的值即所解析 raw 的 raw_file_hash）。
 
 最低字段语义：
 
@@ -684,7 +686,7 @@ output_hash（可空）
 artifact_prefix
 artifact_manifest
 status                     queued / running / succeeded / failed / published / rejected
-quality_status             usable / needs_review / unusable
+quality_status             ok / needs_review / unusable（协议 §3.2 信封枚举；empty 仅用于查空访问记录，不用于 document_unit）
 quality_summary
 started_at
 finished_at
@@ -808,6 +810,7 @@ updated_at
 为保证“发布 run”和“通知 L2”不丢失，增加内部 transactional outbox：
 
 ```text
+seq（单调递增，change feed 游标；现实现为 bigserial 主键，可与 outbox_event_id 合一）
 outbox_event_id
 event_kind
 aggregate_type
@@ -818,6 +821,8 @@ published_at（可空）
 attempt_count
 last_error（可空）
 ```
+
+`seq` 是对外 change feed（`change_events_v1` / `GET /v1/changes?after_seq`）的单调游标；消费协定为 at-least-once 投递 + 消费端幂等 + 同一 subject 内保序（协议 §2.8）。
 
 它不是 L1 业务对象，不进入 Filing API；只用于可靠交接。
 
@@ -847,7 +852,7 @@ created_at
 - active run 切换；
 - 手工重试、放弃或隔离异常文档。
 
-它不是上位系统完整 M-LOG，但必须能解释本服务内部是谁、何时、为什么做了什么。人工命令不得直接改表绕过 application service。
+它不是上位系统完整 `action_log`（曾用名 M-LOG），但必须能解释本服务内部是谁、何时、为什么做了什么。人工命令不得直接改表绕过 application service。
 
 ---
 
@@ -1281,7 +1286,7 @@ official filing fallback
 ## 11.1 四类 hash
 
 ```text
-raw_sha256
+raw_file_hash
   原始文件字节
 
 artifact_hash
@@ -1367,7 +1372,7 @@ ambiguous
 判断 change class 时必须同时考虑：
 
 ```text
-raw_sha256
+raw_file_hash
 profile
 run_reason
 parser / adapter / unitizer version
@@ -1436,7 +1441,7 @@ read source_checkpoint
 - 初次历史回填按时间窗口拆批，避免单次结果上限；
 - 任一分页失败、返回总数不一致或部分提交时，不推进 checkpoint；
 - 重复返回只更新 `last_seen_at` 和来源关系，不重复创建 document；
-- 幂等身份以 provider + provider_document_id 为基础；下载后再用 raw_sha256 和 byte_version 区分真实文件版本。
+- 幂等身份以 provider + provider_document_id 为基础；下载后再用 raw_file_hash 和 byte_version 区分真实文件版本。
 
 ## 12.3 下载
 
@@ -1531,7 +1536,7 @@ rejected
 `quality_status` 独立于运行状态：
 
 ```text
-usable
+ok
 needs_review
 unusable
 ```
@@ -1580,7 +1585,8 @@ StorageIntegrityError
 - 默认只读 active run；
 - 可显式指定 processing_run_id 读取历史快照；
 - 所有列表接口使用稳定 cursor pagination；
-- unit payload 必须完整可取，不能只返回搜索摘要。
+- unit payload 必须完整可取，不能只返回搜索摘要；
+- HTTP 读侧语义与 `disclosure_public.*_v1` 一致；unit 响应携带派生字段 `asset_uri`（仅序列化层派生，不落库）。
 
 ## 14.2 Python API 形态
 
@@ -1671,6 +1677,17 @@ quality_status
 
 `heading_path` prefix 查询只是候选过滤，不承诺唯一结果。
 
+## 14.5 对外错误模型
+
+HTTP / MCP 读侧错误码至少包含（协议 §3.11）：
+
+```text
+L1_PROCESSING_REQUIRED      请求对象仅有 raw 登记、尚未完成载体规范化（L1 读侧语义）
+NOT_FOUND                   对象不存在
+CONTRACT_VERSION_MISMATCH   请求契约版本与服务暴露版本不一致
+GONE_SUPERSEDED             对象已被新版本取代，响应携带 superseded_by 指引
+```
+
 ---
 
 # 15. L2 交接
@@ -1680,7 +1697,7 @@ quality_status
 L2 消费：
 
 ```text
-DocumentPublished / DocumentUnitsChanged event
+document_run_published / document_units_changed 等 outbox 事件（event_kind，snake_case）
 + Filing API document metadata
 + exact document_unit payload
 ```
@@ -1698,7 +1715,7 @@ DocumentPublished / DocumentUnitsChanged event
   "profile": "research_default",
   "processing_run_id": "...",
   "previous_processing_run_id": "...",
-  "raw_sha256": "...",
+  "raw_file_hash": "...",
   "changes": {
     "added": ["asset-id"],
     "removed": ["old-asset-id"],
@@ -1863,7 +1880,7 @@ qa：
 - 问答顺序合理；
 - 无法确认时降级 text。
 
-质量结果除 `usable / needs_review / unusable` 外，还必须保存机器可读 issue codes，例如：
+质量结果除 `ok / needs_review / unusable` 外，还必须保存机器可读 issue codes，例如：
 
 ```text
 empty_text
@@ -1965,7 +1982,7 @@ disclosure-anchor replay-outbox
 
 ```text
 security(market, ticker)
-document(source_provider, provider_document_id, raw_sha256)
+document(provider, provider_document_id, raw_file_hash)
 document(company_id, announcement_date desc)
 document(filing_type, report_period_end, report_period_type)
 processing_run(document_id, created_at desc)
@@ -1999,11 +2016,31 @@ operation_log(target_type, target_id, created_at desc)
 
 不得把所有字段都塞进一个万能 JSONB。
 
+## 18.4 Schema 分层与 public 读契约
+
+数据库按三 schema 分层（协议 §3.10、service-purpose §12.1；迁移 0001–0006 已落地）：
+
+```text
+disclosure_core     私有写侧表（company / security / source_access / document /
+                    processing_run / document_unit …）
+disclosure_public   只读视图 *_v1（documents_v1 / document_units_v1 /
+                    source_refs_v1 / change_events_v1），跨服务唯一读契约
+disclosure_ops      outbox_event 与迁移记录
+```
+
+规则：
+
+- 跨服务与 L2 只经 `disclosure_public.*_v1` 或等价 Filing API 消费，不回读私有表（协议硬边界 40）；
+- `document_units_v1` 必须保留 service-purpose §12.1 的全部 unit 级 scope keys（company_ref、security_ref、filing_type、report_period、announcement_date、payload_kind、heading_path、semantic_key、quality_status、content_hash、contract_version、producer_action_ref、source_ref、parent_ref、order_index）与 `contract_version = document_unit.v1`；
+- `source_ref` 由 `source_refs_v1` / `GET /v1/units/{id}/source-ref` 派生，不建独立 source_ref 主表；
+- `asset://` URI 只在 API / MCP 序列化边界派生为 `asset_uri` 字段，不落数据库列与视图；
+- 视图破坏性变更走 v2 并行 + 弃用期（协议 §2.7）。
+
 ---
 
 # 19. 实施顺序
 
-不按工时拆分，按可运行纵向闭环推进。
+不按工时拆分，按可运行纵向闭环推进。本节是目标蓝图，不反映当前进度；进度与 Stage↔Phase 对应关系以 `docs/agent/Status.md` / `Plan.md` 为准。
 
 ## Stage 1：工程骨架与持久化
 

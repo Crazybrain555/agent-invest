@@ -10,7 +10,7 @@
 > **对齐说明**：框架选型结论（默认 MinerU，Docling/Camelot/pdfplumber 按需）不变；但解析的**入库目标**已按
 > `service-purpose.md` 和 `财报与披露数据接入及切分方案.md` 改为 `document_unit`（text/table/qa），不再以复制
 > parser 的 `page/block/cell` 为目标。表格“双解析对账”从“第一版每张财报页必做”改为**按需触发**（默认单 parser）。
-> 服务边界以 canonical 两文为准。
+> 服务边界以 `service-purpose.md`（canonical）为准，实施顺序与取舍见《财报与披露数据接入及切分方案》（implementation_plan）。
 >
 > 服务目的见 `service-purpose.md`：我们要的不是“把 PDF 下载到文件夹”，也不是镜像 parser 的每一页每一格，而是把
 > 正文、完整表格、完整问答切成 L2 可直接使用的 `document_unit`。解析格式必须服务于这套结构，而不是只产出一坨给人看的文本。
@@ -152,7 +152,7 @@ artifact_locator(可选): artifact_path + artifact_unit_ref + order_index   # �
 
 ## 七、第一版建议路线
 
-1. **闭环先跑通一份真实 PDF**：用仓库里已有的样本（如 `三川智慧_300066_2026年一季度报告.pdf`）跑 MinerU pipeline 后端，落地 `*.md` + `content_list.json` 到 `parser_artifacts/`，再切出 `document_unit(text/table)`，肉眼核对章节切分与目标表格。
+1. **闭环先跑通一份真实 PDF（已完成，对应仓库 Phase 00 / 04）**：本地样本语料位于 `tmp/sample_filings/`（机器本地、git-ignored：江海股份 002484 / 美的集团 000333 / 海星股份 603115），已用 MinerU pipeline 后端落地 `*.md` + `content_list.json` 并映射为 NormalizedIR；`document_unit` 切分入库属仓库 Phase 005，尚未开始。
 2. **分流策略**：有文本层 → pipeline/pdfplumber；扫描/复杂 → VLM 后端（macOS 上 `vlm-mlx`，有 GPU 用 GPU）。
 3. **表格复核按需**：默认单 parser；仅在第五节列出的触发条件下用 Camelot/pdfplumber 二次解析与关键数字比对。
 4. **入库**：按第六节映射写 `document_unit` / `processing_run`，parser artifact 留文件系统，必要时记 `artifact_locator`。
