@@ -10,7 +10,7 @@ layer: L1
 requirements:
   - docs/architecture/service-purpose.md
   - docs/architecture/财报与披露数据接入及切分方案.md
-  - docs/reference/投研预测引擎顶层框架协议_v0.5.md
+  - docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md
 references:
   - docs/architecture/database-selection.md
   - docs/architecture/pdf-parsing-investigation.md
@@ -40,7 +40,7 @@ implementation_style: modular_monolith_with_ports_and_adapters
 1. `service-purpose.md`：决定本服务做什么、不做什么，是业务边界的 canonical contract；
 2. `财报与披露数据接入及切分方案.md`：决定标准数据 provider 与 PDF 的分工、保留范围和切分方向；
 3. 本实施方案：在前两份需求契约之下，决定这些需求如何落成代码；
-4. `投研预测引擎顶层框架协议_v0.5.md`：决定上位系统目标和 L1/L2/L3 关系；
+4. `投研预测引擎顶层框架协议_v0.7修订最终版本.md`：决定上位系统目标和 L1/L2/L3 关系；
 5. `database-selection.md`、`pdf-parsing-investigation.md`、`open-source-references.md`：作为论证与参考，不直接约束代码细节。
 
 出现冲突时：
@@ -124,7 +124,7 @@ AI coding agent 在每次实现前必须：
 
 方向正确，可以继续作为 canonical contract，但编码前必须修正或在实现中消除以下歧义：
 
-1. front matter 的 `unit_id` 应统一为 `asset_id`；
+1. front matter 的 `unit_id` 应统一为 `asset_id`（已随迁移 0006 / service-purpose v1.2 落地）；
 2. CNINFO `textid` 不能直接作为内部 `document_id`；
 3. `cninfo:p_info3015` 是接口/操作标识，不是一条具体访问记录的 `source_access_id`；
 4. `heading_path` 是查询和导航字段，不是跨 parser 稳定 ID，也不是唯一键；
@@ -167,9 +167,9 @@ PostgreSQL + filesystem 的结论正确。需要加强：
 
 参考方向正确，但应补入 `Unstructured` 的“partition elements 与 chunking 分离”思想，并把 `DoclingDocument` 视为 normalized IR 的重要参考。OpenBB、EdgarTools、secfsdstools、dlt 和 CocoIndex 仍是本项目最值得借鉴的五类架构模式。
 
-### `投研预测引擎顶层框架协议_v0.5.md`
+### `投研预测引擎顶层框架协议_v0.7修订最终版本.md`
 
-原存在一处真实冲突（旧文把 G0 写成“PDF + 页码 + 段落/表格位置”，并把信息单元切分全部放在 L2），**已在 v0.5 修订**，按以下 canonical 设计落地（见 §2.1 / §2.2 / §2.5 / §3.1–3.3 / §9.1）：
+旧版协议（v0.5 前）存在一处真实冲突（把 G0 写成“PDF + 页码 + 段落/表格位置”，并把信息单元切分全部放在 L2），**已在协议修订中收敛（现行 v0.7）**，按以下 canonical 设计落地（见 §2.1 / §2.2 / §2.5 / §3.1–3.3 / §9.1）：
 
 - **L1 统一完成文档结构切分与 A 类规则确定性清洗，适用于全部来源**，不再以 PDF 为特例；PDF 额外包含解析，其余来源依既有结构切分；L2 直接接收 `document_unit` 进行语义处理。
 - **G0 身份锚 = 原文件 + 文件哈希 + 不可变 `document_unit` 快照 + 来源链**；page/bbox 仅为可选复核信息。
@@ -1197,7 +1197,7 @@ Filing API 提供临时上下文包装能力：
 ```text
 完整 unit
 → 按 max_chars / max_tokens 临时摘取
-→ 返回 unit_id + start/end + exact excerpt + excerpt_hash
+→ 返回 asset_id + start/end + exact excerpt + excerpt_hash
 ```
 
 该结果不写入 `document_unit` 表，不成为证据身份。L2 若使用摘录，应在 claim 中保存摘录快照。
@@ -1213,7 +1213,7 @@ Filing API 提供临时上下文包装能力：
 ```text
 filing type
 + heading/title pattern
-+ unit kind
++ payload_kind
 + provider coverage
 + table signature
 → publish / suppress / review
@@ -1637,7 +1637,7 @@ GET  /v1/units/{asset_id}/context
 GET  /v1/processing-runs/{processing_run_id}
 POST /v1/filings/{document_id}/reprocess
 POST /v1/filings/{document_id}/rebuild-units
-GET  /v1/change-events
+GET  /v1/changes?after_seq=...
 ```
 
 写操作需要管理权限；读取 raw/artifact 不直接暴露文件路径，可通过受控 endpoint 或签名/内部 URI 获取。
@@ -1715,6 +1715,11 @@ DocumentPublished / DocumentUnitsChanged event
 ```
 
 L2 收到后按需查询完整 payload。
+
+对外 change feed（`change_events_v1` / `GET /v1/changes`）在事件上还携带 `change_kind`，仅有
+`observed` / `materialized` 两个值（service-purpose §12.2）。上例 `changes` 内的 diff 类别是
+`event_kind` 层面的内部分类，凡引起 public read model 可见变化者均映射为
+`change_kind=materialized`；仅巡检 / 来源观察而无可消费变化的事件为 `observed`。
 
 ## 15.3 exact snapshot 的责任
 

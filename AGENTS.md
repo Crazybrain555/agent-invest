@@ -2,7 +2,7 @@
 
 This checkout contains the **disclosure_anchor** service implementation plus a Codex / Claude harness. The old company-research skills, runtime helpers, and planning documents have been intentionally removed so the user can rebuild from a clean base.
 
-Keep this file concise. Put durable task state in `docs/agent/Status.md`, current plans in `docs/agent/Plan.md`, execution details in `docs/agent/Implement.md`, and long notes in `docs/agent/Documentation.md`.
+Keep this file concise. Put durable task state in `docs/agent/Status.md`, current plans in `docs/agent/Plan.md`, execution details in `docs/agent/Implement.md`, and long notes in `docs/agent/Documentation.md`. Closed-milestone history lives in `docs/agent/archive/` (see the durable-docs size trigger).
 
 ## 1. Source-of-truth hierarchy
 
@@ -15,6 +15,14 @@ When files disagree, prefer current filesystem truth and runnable commands over 
 5. `docs/MCP_SETUP_GUIDE.md`, `.codex/config.toml`, and `.mcp.json` for MCP setup only.
 6. `.env.template` / `.env.example` for disclosure_anchor service environment placeholders only.
 7. `CLAUDE.md` for Claude Code-specific behavior only; do not treat it as Codex policy unless the user asks.
+
+`docs/agent/archive/` holds dated snapshots of rotated durable files. It is history/evidence for on-demand
+reading, not active policy or state; never treat it as the current plan.
+
+`docs/agent/` (including `archive/` and future `notes/`) is gitignored, machine-local working memory (user
+decision 2026-07-03): it does not travel with clones, PRs, or reviews. Policy that must survive a fresh
+checkout belongs in tracked `AGENTS.md` / `CLAUDE.md`; if durable files are missing, rebuild them from
+repository truth instead of assuming prior state.
 
 Do not rely on deleted historical docs such as `docs/skills/*`, old skill runners, or `company_research_runtime/*`.
 
@@ -91,6 +99,24 @@ watchdog system:
 - Do not add heartbeat, cron, fresh-session orchestration, or zero-interaction promises unless the user
   explicitly asks for that infrastructure and it is actually implemented and validated.
 
+### Durable-docs size trigger
+
+Long always-read files measurably degrade LLM instruction-following ("context rot"), so durable docs carry
+active content only, under these line budgets:
+
+- `docs/agent/Status.md` ≤ 120 — current task, next action, latest validation/review only.
+- `docs/agent/Plan.md` ≤ 300 — active milestone, open checklist, still-operative facts only.
+- `docs/agent/Documentation.md` ≤ 200 — index, durable decisions, and open follow-ups only.
+- `AGENTS.md` ≤ 350 / `CLAUDE.md` ≤ 120 — hard ceilings checked in section 8; when touched, prefer trimming
+  over growing.
+
+Rotation rule: when a milestone closes or a budget is exceeded, snapshot the whole file to
+`docs/agent/archive/<File>-<YYYY-MM-DD>.md`; if that name already exists (multiple rotations in one day),
+append `-2`, `-3`, … — never overwrite an existing archive file. Then rewrite the live file keeping only
+active content plus one-line pointers into the archive. Rewrite, do not append. Long-form topic notes go to
+`docs/agent/notes/<topic>.md` and are indexed from `Documentation.md`. Archives and notes are read on demand,
+never part of the default resume set.
+
 ## 3. Repository reality
 
 Retained areas:
@@ -160,7 +186,9 @@ Use for complex implementation, multi-step work, multi-file work, architectural 
 
 Use when the user gives a materially new goal that replaces the current task or has no approved plan yet.
 
-1. Record any useful old-task handoff in `docs/agent/Documentation.md` before overwriting current-task state.
+1. Preserve any useful old-task handoff by rotating per the durable-docs size trigger (snapshot to
+   `docs/agent/archive/`) before overwriting current-task state; leave at most a one-line pointer in
+   `Documentation.md`.
 2. Create or replace current-task sections of `docs/agent/Prompt.md`, `Plan.md`, and `Status.md`.
 3. Inspect only enough repository context to draft a correct plan.
 4. Do not edit runtime/product code unless the user explicitly asked to plan and implement in the same turn.
@@ -184,7 +212,8 @@ Use when `Plan.md` already contains an active milestone and the user asks to con
 4. Keep `Plan.md` and `Status.md` current as steps complete, split, stall, or become obsolete.
 5. Run the milestone validation.
 6. Run the independent review gate when required.
-7. Update `docs/agent/Status.md` and `Documentation.md` before responding.
+7. Update `docs/agent/Status.md` (and `Documentation.md` only for durable decisions or open follow-ups)
+   before responding.
 
 ### Mode 3 — Harness or agent-policy maintenance
 
@@ -197,7 +226,8 @@ Protocol:
 3. After config edits, validate TOML/JSON files with a parser.
 4. Validate that `AGENTS.md`, `Plan.md`, `Status.md`, `Implement.md`, and `code_review.md` agree on workflow names and paths.
 5. Run the independent review gate before marking the change complete.
-6. Update `docs/agent/Status.md` and `Documentation.md` with validation and review evidence.
+6. Record validation and review outcomes in `docs/agent/Status.md`. Add to `Documentation.md` only durable
+   decisions or open follow-ups; command-level evidence rotates to `docs/agent/archive/`.
 
 ## 5. Context discipline
 
@@ -276,6 +306,11 @@ rg -n '^## Living-plan sections$' docs/agent/Implement.md
 rg -n '^## Acceptance-oriented review$' docs/agent/code_review.md
 rg -n '^Current milestone:' docs/agent/Status.md
 rg -n '^Latest independent review:' docs/agent/Status.md
+awk 'END{exit NR>120}' docs/agent/Status.md
+awk 'END{exit NR>300}' docs/agent/Plan.md
+awk 'END{exit NR>200}' docs/agent/Documentation.md
+awk 'END{exit NR>350}' AGENTS.md
+awk 'END{exit NR>120}' CLAUDE.md
 test ! -e .agents/skills
 test ! -e .claude/skills
 test ! -e .claude/worktrees
@@ -305,4 +340,5 @@ For a durable milestone, done means:
 - The independent review gate ran when required, or the reason it was skipped is recorded.
 - Accepted reviewer findings were fixed or recorded as follow-up/blockers.
 - `Status.md` reflects current task identity, current milestone, next action, latest validation, and review outcome.
-- `Documentation.md` records important decisions, validation/review history, and known issues.
+- `Documentation.md` stays a compact index: durable decisions, open follow-ups, and archive pointers. Latest
+  validation/review evidence lives in `Status.md`; history lives in `docs/agent/archive/`.

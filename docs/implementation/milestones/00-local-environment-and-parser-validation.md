@@ -2,11 +2,14 @@
 id: disclosure_anchor_milestone_00_local-environment-and-parser-validation
 project: disclosure_anchor
 title: 本地环境与样本 parser 验证
-status: ready-for-implementation
+status: complete
 created_at: 2026-06-26
 ---
 
 # Milestone 00: 本地环境与样本 parser 验证
+
+> 实施状态：已完成（acceptance-matrix A01–A05 pass；Phase 00 产出的样本解析 fixtures
+> 由 Phase 03/04 测试持续消费，runbook 见 `runbooks/phase00-environment-and-parser-validation.md`）。
 
 ## 1. 目标
 

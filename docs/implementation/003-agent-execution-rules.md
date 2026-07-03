@@ -13,11 +13,14 @@ created_at: 2026-06-26
 每次开始实现前，agent 必须读取：
 
 ```text
+docs/architecture/service-purpose.md
 docs/implementation/001-disclosure-anchor-framework.md
 docs/implementation/002-implementation-roadmap.md
 docs/implementation/milestones/<current>.md
 docs/implementation/checks/acceptance-matrix.md
 ```
+
+`service-purpose.md` 是 canonical 契约；实施文档与它冲突时以它为准。
 
 如果实现涉及 API、DB、doctor、contract，还必须读取对应 checklist。
 

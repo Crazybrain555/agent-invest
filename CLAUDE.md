@@ -11,8 +11,13 @@ Start multi-step work by reading:
 
 - `AGENTS.md`
 - `docs/agent/Status.md`
-- `docs/agent/Plan.md`
-- `docs/agent/Implement.md`
+- the active milestone and checklist in `docs/agent/Plan.md`
+
+Read `docs/agent/Implement.md` before running the durable execution loop. Read `docs/agent/Documentation.md`
+and `docs/agent/archive/` only when the task needs decisions or history. Durable docs have line budgets and a
+snapshot-rotation rule — see the durable-docs size trigger in `AGENTS.md`. `docs/agent/` is gitignored
+machine-local working memory; if it is missing in a fresh checkout, rebuild it from `AGENTS.md` and
+repository truth.
 
 Do not rely on deleted historical files such as `docs/skills/*`, `.agents/skills/*`, or `company_research_runtime/*`.
 
@@ -78,5 +83,7 @@ Use `docs/MCP_SETUP_GUIDE.md` for local MCP setup notes. Treat it as a setup che
 - `docs/agent/Status.md` — short current state
 - `docs/agent/Plan.md` — active durable plan/checklist
 - `docs/agent/Implement.md` — execution runbook
+- `docs/agent/Documentation.md` — durable notes index (decisions, follow-ups, archive index)
+- `docs/agent/archive/` — dated snapshots of rotated durable files; read on demand only
 - `docs/agent/code_review.md` — independent review rubric
 - `AGENTS.md` independent-review trigger — use the read-only reviewer gate when required

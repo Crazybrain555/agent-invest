@@ -280,7 +280,7 @@ REST、MCP 以后在这两个接口外加适配，不重新设计数据库。
 标准数据：dataset_registry → provider adapter（首版 Wind）→ Dataset API → source_access（+ as-of 快照）
 披露文件：巨潮公告列表 → PDF 下载 → 原文保存(+hash) → document/processing_run
         → MinerU 解析 → 切成 document_unit(text/table/qa)
-        → 可按 公司/报告期/公告类型/heading_path/semantic_key/title/unit_id 查询
+        → 可按 公司/报告期/公告类型/heading_path/semantic_key/title/asset_id 查询
 两条路径在 L2 汇合，抽取 claim / 事件 / 口径 / 冲突。
 ```
 

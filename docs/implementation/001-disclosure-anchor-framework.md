@@ -681,6 +681,10 @@ disclosure_core.outbox_event
 → GET /v1/changes?after_seq=...
 ```
 
+事件携带 `event_kind`（对外事件名，与 outbox 列同名）和 `change_kind`（仅
+`observed` / `materialized` 两值，service-purpose §12.2）；下游失效只由 `materialized` 触发，
+parser 升级但内容快照不变属于 `observed`。
+
 ---
 
 ## 8. MinerU 集成

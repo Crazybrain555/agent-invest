@@ -121,4 +121,6 @@ limit 生效
 可从 0 全量拉取
 可从 last_seq 增量拉取
 事件 payload 不含 private details
+事件携带 event_kind（与 outbox 列同名）
+事件携带 change_kind，取值仅 observed / materialized（历史事件默认 materialized）
 ```

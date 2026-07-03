@@ -357,7 +357,8 @@ canonical payload text/table/qa 内容
 quality_status_changed
 ```
 
-change_event 建议至少区分：
+change_event 建议至少区分（下列均为 `event_kind` 层面的分类，不与 `change_kind` 竞争；
+它们全部映射为 `change_kind=materialized`，`observed`/`materialized` 二分见 service-purpose §12.2）：
 
 ```text
 content_changed        # L2 必须重处理
@@ -365,7 +366,9 @@ structure_changed      # L2 可能需要重排引用
 quality_status_changed # L2 需要看是否降级/恢复
 ```
 
-表格 payload 第一版不要假装全结构化。如果 MinerU 稳定产出的是 `table_html`，就先接受：
+表格 payload 第一版不要假装全结构化。如果 MinerU 稳定产出的是 `table_html`，就先接受下面这种
+**过渡形态**（目标契约仍是 service-purpose §6.3 的 unit/headers/rows 结构表，此形态应标记
+`needs_review` 类质量状态，不是长期表契约）：
 
 ```json
 {

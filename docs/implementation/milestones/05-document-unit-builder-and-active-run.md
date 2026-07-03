@@ -65,7 +65,7 @@ unusable
 旧 run 保留
 ```
 
-10. 产生 outbox_event：
+10. 产生 outbox_event（下列为 `event_kind` 取值）：
 
 ```text
 processing_run_created
@@ -74,6 +74,10 @@ document_unit_created
 document_unit_changed
 quality_status_changed
 ```
+
+每条事件同时写 `change_kind`（service-purpose §12.2）：凡引起 public read model 可见内容变化
+（发布、unit 内容 / 质量状态变化）为 `materialized`；仅巡检 / 来源观察且无可消费变化为 `observed`。
+下游失效只由 `materialized` 触发。
 
 
 ## 4. 检查点

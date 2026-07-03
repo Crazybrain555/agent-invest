@@ -146,7 +146,7 @@ make test-integration  # 仅 tests/integration（需要本地 PG + migration 到
 
 ```bash
 make migrate                         # 连续运行，幂等
-.venv/bin/python -m alembic current  # 0002_harden_ops_permissions (head)
+.venv/bin/python -m alembic current  # 0002_harden_ops_permissions (当时 head；现已推进至 0006)
 make test-integration                # 16 tests, OK
 make test                            # DB env: 54 tests, OK
 env -u DISCLOSURE_MIGRATION_DATABASE_URL -u DATABASE_URL -u DISCLOSURE_ADMIN_DATABASE_URL make test
@@ -209,7 +209,7 @@ Alembic、SQL 点检和 integration tests，PG doctor 输出项后续单独补�
 make test-unit                    # 38 tests, OK
 make test-contract                # 6 tests, OK
 make test                         # no DB env: 73 tests, OK (skipped=24)
-make migrate                      # head=0003_parser_run_metadata
+make migrate                      # head=0003_parser_run_metadata（当时；现已推进至 0006）
 make test-integration             # DB env: 24 tests, OK
 make test                         # DB env: 73 tests, OK
 make doctor                       # DB env + AgentSSD runtime paths, pass

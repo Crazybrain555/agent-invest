@@ -148,7 +148,7 @@ database: disclosure_anchor
 
 ```text
 make migrate                         pass，重复运行 pass
-.venv/bin/python -m alembic current  0002_harden_ops_permissions (head)
+.venv/bin/python -m alembic current  0002_harden_ops_permissions (当时 head；现已推进至 0006)
 make test-integration                16 tests, OK
 make test                            DB env: 54 tests, OK
 make test                            no DB env: 54 tests, OK (skipped=16)

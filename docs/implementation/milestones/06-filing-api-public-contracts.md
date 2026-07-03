@@ -58,6 +58,14 @@ change_event.v1.json
 ```
 
 6. public views 与 API DTO 字段含义保持一致。
+7. units 读契约以 `document_units_v1` 的 unit 级 scope keys 为准（service-purpose §12.1 的 15 键：
+   company_ref、security_ref、filing_type、report_period、announcement_date、payload_kind、
+   heading_path、semantic_key、quality_status、content_hash、contract_version、
+   producer_action_ref、source_ref、parent_ref、order_index），DTO 与 `document_unit.v1.json`
+   不得缺列或改名。
+8. changes DTO 与 `change_event.v1.json` 必须携带 `event_kind`（对外事件名）与
+   `change_kind`（仅 `observed` / `materialized` 两值，未显式声明的历史事件默认
+   `materialized`），语义遵循 service-purpose §12.2：下游失效只由 `materialized` 触发。
 
 
 ## 4. 检查点
@@ -65,7 +73,7 @@ change_event.v1.json
 - `GET /v1/filings/latest` 可用。
 - `GET /v1/documents/{id}/units` 可用。
 - `GET /v1/units/{id}/source-ref` 可用。
-- `GET /v1/changes?after_seq=0` 可用。
+- `GET /v1/changes?after_seq=0` 可用，事件含 `event_kind` 与 `change_kind`（observed/materialized）。
 - API 不返回绝对路径。
 - API 不返回 private state / 内部异常堆栈。
 - contract tests 通过。
