@@ -153,9 +153,15 @@ def _parse_table(html: str) -> tuple[dict[str, Any], bool]:
         parser = _TableParser()
         parser.feed(html)
         parser.finish()
-        return _table_grid(parser.rows), False
+        table = _table_grid(parser.rows)
     except Exception:
         return {"headers": [], "rows": []}, True
+    # Non-empty HTML that yields no cells means the carrier was not a
+    # recognizable table; flag it so the builder falls back to raw_html
+    # instead of silently emitting an empty grid.
+    if not table.get("headers") and not table.get("rows"):
+        return table, True
+    return table, False
 
 
 def _table_grid(source_rows: list[list[_TableCell]]) -> dict[str, Any]:
@@ -191,9 +197,13 @@ def _table_grid(source_rows: list[list[_TableCell]]) -> dict[str, Any]:
             [occupied.get((row_index, col_index), "") for col_index in range(max_col + 1)]
             for row_index in range(max_row + 1)
         ]
+        # Headers only on <th> evidence. MinerU emits plain <td> tables, so
+        # headers is usually empty and the full grid stays in rows; promoting
+        # the first row to a header is a business rule that belongs to the
+        # unit builder (05-S5, after cross-page merge) — forcing it here
+        # mislabels continuation pages and key-value tables (real-data audit:
+        # 25/398 tables had data rows promoted to headers).
         first_row_is_header = bool(source_rows and any(cell.is_header for cell in source_rows[0]))
-        if not first_row_is_header and grid:
-            first_row_is_header = True
         if first_row_is_header:
             table = {"headers": grid[0], "rows": grid[1:]}
         else:

@@ -203,17 +203,19 @@ heading_path = 祖先标题原文列表（保留编号前缀，与 golden fixtur
   "rows":     IR 结构化 rows,
   "notes":    table_footnote 列表原样
 }
-title = caption 首项或最近标题。headers 保留多行表头（header_rows）；merged_cells 保留
-row_span/col_span；空单元格、"-"、"—"、"不适用" 原样区分不归一。单位说明与脚注**绝不作为
-噪声丢弃**（脚注常含追溯调整/会计政策，红线）。IR 带 table_parse_failed → payload 落
-{caption, raw_html, notes} 并 quality_status='needs_review'。跨页表合并：相邻 table 元素间
-无非噪声元素、列数相同、后表无独立 caption → 合并 rows，**识别并删除续页重复表头**
-（与首页 headers 逐行相等的行不得当数据行），payload 记 `merge_reason='continued_table'`
-与 page span（artifact_locator）；合并失败标 needs_review，不阻塞其他 unit（不确定即不合并）。
-"列数相同"定死：列数 = len(headers[0])，headers 为空时取 len(rows[0])；前后表该值相等才允许
-合并。后表 headers 非空：与前表 headers 逐行（每 cell str.strip() 后）相等 → 丢弃后表
-headers 并合并；不相等 → 不合并（不打 needs_review，各自成 unit）。后表 headers 为空：
-其 rows 前 len(前表.headers) 行若与前表 headers 逐行相等则删除后再并入。
+title = caption 首项或最近标题。**payload.headers 的来源（表头提升规则，04R-R5.2 定死
+IR headers 只含 `<th>` 证据、MinerU 下通常为空）**：跨页合并**完成后**，IR headers 非空
+（th 证据）→ 直接采用；为空 → 将合并后网格的首行提升为 payload.headers（先合并后提升，
+防续页首行被错标；KV 形态首行被提升属可接受粗糙，数据完整保留在 payload）。
+merged_cells 保留 row_span/col_span；空单元格、"-"、"—"、"不适用" 原样区分不归一。
+单位说明与脚注**绝不作为噪声丢弃**（脚注常含追溯调整/会计政策，红线）。
+IR 带 table_parse_failed → payload 落 {caption, raw_html, notes} 并
+quality_status='needs_review'。跨页表合并：相邻 table 元素间无非噪声元素、列数相同、
+后表无独立 caption → 合并 rows，**识别并删除续页重复表头行**（与首表首行——即待提升的
+表头候选行——逐 cell str.strip() 相等的行不得当数据行），payload 记
+`merge_reason='continued_table'` 与 page span（artifact_locator）；合并失败标 needs_review，
+不阻塞其他 unit（不确定即不合并）。"列数相同"定死：列数 = len(rows[0])（IR headers 非空时
+= len(headers)）；前后表该值相等才允许合并。
 ```
 
 **S6 保留/跳过（service-purpose §9 + 红线）**：规则表驱动，首版跳过规则封闭定死：

@@ -260,10 +260,14 @@ class NormalizedIRContractTests(unittest.TestCase):
         headers = table.get("headers") or []
         rows = table.get("rows") or []
         if require_content:
-            self.assertGreater(len(headers), 0, label)
+            # Headers carry <th> evidence only (MinerU emits td-only tables),
+            # so content presence is asserted on rows; header promotion is a
+            # 05 builder rule, not an IR fact.
             self.assertGreater(len(rows), 0, label)
-        for row in rows:
-            self.assertEqual(len(row), len(headers), label)
+        widths = {len(row) for row in rows}
+        if headers:
+            widths.add(len(headers))
+        self.assertLessEqual(len(widths), 1, label)
 
 
 if __name__ == "__main__":

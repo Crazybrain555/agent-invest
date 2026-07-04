@@ -17,8 +17,8 @@ PGSOCKET_DIR ?= /Volumes/AgentSSD/agent_system/postgres/sockets
 PGLOG ?= /Volumes/AgentSSD/agent_system/postgres/logs/disclosure-anchor-pg18.log
 PGPORT ?= 55432
 
-.PHONY: doctor test test-unit test-contract test-data test-integration api \
-	archive pg-init pg-start pg-stop pg-status db-create migrate
+.PHONY: doctor test test-unit test-contract test-data test-integration \
+	test-mineru-smoke api archive pg-init pg-start pg-stop pg-status db-create migrate
 
 doctor:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -37,6 +37,12 @@ test-data:
 
 test-integration:
 	@PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m unittest discover -s tests/integration -t . -p 'test_*.py' || [ $$? -eq 5 ]
+
+# Explicit opt-in real-MinerU end-to-end smoke (not collected by `make test`).
+# Requires DISCLOSURE_MIGRATION_DATABASE_URL, DISCLOSURE_MINERU_BIN and the
+# local short_announcement sample PDF; skips cleanly when any is absent.
+test-mineru-smoke:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m unittest tests.integration.smoke_real_mineru -v
 
 api:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m uvicorn disclosure_anchor.main:create_app --factory --host $(API_HOST) --port $(API_PORT)

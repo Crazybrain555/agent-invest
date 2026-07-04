@@ -308,7 +308,8 @@ class RegisterLocalPdf:
                     error=reason,
                     result_snapshot={
                         "quarantine_reason": quarantine.reason,
-                        "quarantine_path": str(quarantine.path),
+                        # basename only: absolute paths stay out of the DB
+                        "quarantine_filename": quarantine.path.name,
                         "byte_count": quarantine.byte_count,
                     },
                 )

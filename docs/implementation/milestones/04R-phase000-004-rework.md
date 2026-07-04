@@ -361,8 +361,11 @@ tests/contract 两个测试文件的 SCHEMA/FIXTURE 路径与断言键同步改�
    {'type':'text','text_level':1}→heading/1；{'type':'text'}→text/None）。
 2. **表结构化**：mapper 内做 rowspan/colspan 感知的 HTML→grid 解析，table 元素增加
    `table: {headers: [...], rows: [[...]], merged_cells?: [...]}`；`table_html` 保留作
-   fallback；解析失败置元素级 `table_parse_failed: true`（05 据此打 needs_review）。
-   "单位"识别是业务规则，留给 05，不进 mapper。
+   fallback；解析失败、或非空 HTML 解析不出任何 cell，均置元素级
+   `table_parse_failed: true`（05 据此打 needs_review / fallback raw_html）。
+   **headers 只在 `<th>` 证据存在时非空**（MinerU 实际输出纯 `<td>`，headers 通常为空、
+   全网格在 rows）——表头提升与"单位"识别同理是业务规则，留给 05-S5（合并后提升），
+   不进 mapper（强制首行当表头会错标续页表与 KV 表，2026-07-05 实测 25/398）。
 3. **heading 信号归一**：MinerU `text_level` / `type=header` 归一为元素级
    `heading_level: int|null`（kind=heading 时尽量给出层级）。text_level 覆盖率实测的
    着陆点定死：`scripts/regen_phase00_fixtures.py` 再生成时逐 sample_key 统计并打印三个数
@@ -460,10 +463,11 @@ label 约定（R2.6）；§12.1 补 0007 新增 6 列（含 query_projection_has
 4. mapper：断言放 tests/contract（`make test-contract` 承载）：
    (a) ir_activity v2 fixture 中 order_index 最小的 kind=='table' 元素 table.rows 非空，
        且全部 cell 文本拼接含全角 '？'（该表即嵌 Q&A 的活动记录表）；
-   (b) annual_report_excerpt v2 fixture 的唯一 table 元素 headers 与 rows 均非空，
-       否则必须带 table_parse_failed==true（不允许既无 grid 又无失败标记）；
-       annual_report 本地全量 fixture（gitignored）存在时套用同断言 +
-       "未标 table_parse_failed 的 table 元素占比 ≥95% 且 headers 与各 row 列数一致"，缺失 skip。
+   (b) annual_report_excerpt v2 fixture 的唯一 table 元素 rows 非空（headers 仅在
+       `<th>` 证据时非空——R5.2），否则必须带 table_parse_failed==true
+       （不允许既无 grid 又无失败标记）；annual_report 本地全量 fixture（gitignored）
+       存在时套用同断言 + "未标 table_parse_failed 的 table 元素占比 ≥95% 且各 row
+       宽度一致（headers 非空时与其宽度一致）"，缺失 skip。
 5. 全套测试双绿：按 §6.1 的 no-DB 与 live-DB 两种模式命令与绿判据执行；`git diff --check` 干净。
 
 ## 4. Definition of Done

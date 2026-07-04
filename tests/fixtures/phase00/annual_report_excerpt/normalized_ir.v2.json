@@ -1,6 +1,6 @@
 {
   "contract_version": "normalized_ir.v2",
-  "created_at": "2026-07-04T16:34:52.466493+00:00",
+  "created_at": "2026-07-04T17:49:55.267827+00:00",
   "document_id": "phase00_annual_report_excerpt",
   "source_pdf": "raw_documents/cninfo/002484/2026/1225087169/sha256_excerpt.pdf",
   "title": "江海股份 2025 年年度报告 excerpt",
@@ -719,12 +719,13 @@
       "table_footnote": [],
       "table_html": "<table><tr><td rowspan=1 colspan=1>释义项</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>释义内容</td></tr><tr><td rowspan=1 colspan=1>公司、本公司、江海股份</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>南通江海电容器股份有限公司</td></tr><tr><td rowspan=1 colspan=1>内蒙古海立</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>内蒙古海立电子材料有限公司</td></tr><tr><td rowspan=1 colspan=1>凤翔海源</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>凤翔海源储能材料有限公司</td></tr><tr><td rowspan=1 colspan=1>江苏荣生</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>江苏荣生电子有限公司</td></tr><tr><td rowspan=1 colspan=1>南通海立</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>南通海立电子有限公司</td></tr><tr><td rowspan=1 colspan=1>新江海动力</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>南通新江海动力电子有限公司</td></tr><tr><td rowspan=1 colspan=1>优普电子、苏州优普</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>优普电子（苏州）有限公司</td></tr><tr><td rowspan=1 colspan=1>海成电子</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>湖北海成电子有限公司</td></tr><tr><td rowspan=1 colspan=1>海美电子</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>南通海美电子有限公司</td></tr><tr><td rowspan=1 colspan=1>天津百纳</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>天津百纳能源科技有限公司</td></tr><tr><td rowspan=1 colspan=1>昊海电子</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>南通昊海电器有限公司</td></tr><tr><td rowspan=1 colspan=1>江海香港</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>江海香港有限公司</td></tr><tr><td rowspan=1 colspan=1>AICtech</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>日本 AICtechInc</td></tr><tr><td rowspan=1 colspan=1>江海有限</td><td rowspan=1 colspan=1>指</td><td rowspan=1 colspan=1>南通江海电容器有限公司</td></tr></table>",
       "table": {
-        "headers": [
-          "释义项",
-          "指",
-          "释义内容"
-        ],
+        "headers": [],
         "rows": [
+          [
+            "释义项",
+            "指",
+            "释义内容"
+          ],
           [
             "公司、本公司、江海股份",
             "指",

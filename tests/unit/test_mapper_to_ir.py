@@ -70,8 +70,11 @@ class MapperToIRTests(unittest.TestCase):
         table = element["table"]
         self.assertEqual(element["kind"], "table")
         self.assertEqual(element["raw_kind"], "table")
-        self.assertEqual(table["headers"], ["问题", "回答", "回答"])
-        self.assertEqual(table["rows"][0], ["收入是否增长？", "是", "10%"])
+        # td-only tables carry no header evidence: the full grid stays in
+        # rows and header promotion is the unit builder's business rule.
+        self.assertEqual(table["headers"], [])
+        self.assertEqual(table["rows"][0], ["问题", "回答", "回答"])
+        self.assertEqual(table["rows"][1], ["收入是否增长？", "是", "10%"])
         self.assertIn("收入是否增长？", "".join("".join(row) for row in table["rows"]))
         self.assertEqual(
             table["merged_cells"],
@@ -80,6 +83,49 @@ class MapperToIRTests(unittest.TestCase):
                 {"row": 1, "col": 0, "rowspan": 2, "colspan": 1},
             ],
         )
+
+    def test_th_evidence_populates_headers(self) -> None:
+        normalized = MinerUToNormalizedIRMapper().map_content_list(
+            content_list=[
+                {
+                    "type": "table",
+                    "page_idx": 0,
+                    "table_body": (
+                        "<table><tr><th>项目</th><th>金额</th></tr>"
+                        "<tr><td>收入</td><td>10</td></tr></table>"
+                    ),
+                }
+            ],
+            parser_info=_parser_info(),
+            document_metadata={
+                "document_id": "doc_th",
+                "source_pdf": "raw/doc.pdf",
+                "title": "sample",
+            },
+        )
+        table = normalized["elements"][0]["table"]
+        self.assertEqual(table["headers"], ["项目", "金额"])
+        self.assertEqual(table["rows"], [["收入", "10"]])
+
+    def test_nonempty_html_without_cells_flags_table_parse_failed(self) -> None:
+        normalized = MinerUToNormalizedIRMapper().map_content_list(
+            content_list=[
+                {
+                    "type": "table",
+                    "page_idx": 0,
+                    "table_body": "<div>不是表格的载体</div>",
+                }
+            ],
+            parser_info=_parser_info(),
+            document_metadata={
+                "document_id": "doc_bad_table",
+                "source_pdf": "raw/doc.pdf",
+                "title": "sample",
+            },
+        )
+        element = normalized["elements"][0]
+        self.assertTrue(element.get("table_parse_failed"))
+        self.assertEqual(element["table"], {"headers": [], "rows": []})
 
 
 if __name__ == "__main__":

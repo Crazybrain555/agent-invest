@@ -70,6 +70,13 @@ integration
   MinerU adapter with fixture
   document_unit builder
 
+smoke（显式运行，不进 make test 默认发现）
+  tests/integration/smoke_real_mineru.py：真 MinerU CLI + 真样本 PDF 的
+  register→parse 全链（`make test-mineru-smoke`；三重门控：DB 可达 +
+  DISCLOSURE_MINERU_BIN 指向可执行 CLI + 本地样本 PDF 存在，缺一 skip。
+  文件名不带 test_ 前缀是刻意的——保持 §6.1 双模式绿判据（live-DB 不带
+  skipped 的 OK）不被未开启的冒烟 skip 污染）
+
 contract
   API DTO
   public view columns
