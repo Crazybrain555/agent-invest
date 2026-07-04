@@ -194,6 +194,9 @@ class RegisterLocalPdf:
                             f"{identifier.company_id}"
                         )
                     if company.legal_name != command.company_legal_name:
+                        identifier.status = "contested"
+                        uow.company_identifiers.update(identifier)
+                        uow.commit()
                         raise SubjectIdentityConflictError(
                             "subject legal_name mismatch: "
                             f"uscc belongs to {company.legal_name!r}, "
