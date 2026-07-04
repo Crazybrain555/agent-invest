@@ -119,6 +119,12 @@ never part of the default resume set.
 
 ## 3. Repository reality
 
+Per-directory code maps: key source directories (`src/disclosure_anchor` and its
+domain/application/adapters subtrees, `tests/`) each carry an `AGENTS.md` directory map
+(layer duties, hard rules, authority-doc pointers); the sibling `CLAUDE.md` is a symlink to it.
+Nearest file wins. Keep them norms+pointers only and update them when a directory's
+structure or hard rules change.
+
 Retained areas:
 
 - `AGENTS.md`

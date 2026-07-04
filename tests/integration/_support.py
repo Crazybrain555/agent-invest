@@ -62,4 +62,25 @@ def engine_or_skip() -> "Engine":
         raise unittest.SkipTest(
             "database is not migrated; run `make db-create migrate` first"
         )
+    _acquire_suite_lock(url)
     return engine
+
+
+# Integration tests write fixed identifiers into the shared local database, so
+# two concurrent runs (e.g. the VSCode Testing panel racing a terminal run)
+# violate unique constraints against each other's rows. A process-wide session
+# advisory lock serializes whole runs instead: the second run waits, it does
+# not fail. The lock lives on a dedicated connection and is released when the
+# test process exits. 815003 = test-suite namespace (worker uses 815001/815002).
+_SUITE_LOCK_NS = 815003
+_suite_lock_conn = None
+
+
+def _acquire_suite_lock(url: str) -> None:
+    global _suite_lock_conn
+    if _suite_lock_conn is not None:
+        return
+    engine = create_db_engine(url)
+    conn = engine.connect()
+    conn.execute(text("SELECT pg_advisory_lock(:ns, 0)"), {"ns": _SUITE_LOCK_NS})
+    _suite_lock_conn = conn

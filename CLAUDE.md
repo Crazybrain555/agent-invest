@@ -77,6 +77,13 @@ MCP config is machine-specific and may stay in this checkout while the user deci
 
 Use `docs/MCP_SETUP_GUIDE.md` for local MCP setup notes. Treat it as a setup checklist, not as a product architecture plan.
 
+## 3.5 Per-Directory Code Maps
+
+关键代码目录（src/disclosure_anchor 及其 domain/application/adapters 子目录、tests/）各有一份
+AGENTS.md 目录地图（分层职责、硬规则、权威文档指针），同目录的 CLAUDE.md 是指向它的 symlink——
+Claude 进入该目录读文件时按需加载，Codex 按就近优先读取。改动某目录的结构、硬规则或入口时，
+同步更新该目录的 AGENTS.md（内容保持 norms + pointers，不写行号与易腐 API 清单）。
+
 ## 4. Reference Files
 
 - `AGENTS.md` — cross-agent operating contract
