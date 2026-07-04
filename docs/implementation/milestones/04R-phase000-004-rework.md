@@ -590,8 +590,10 @@ tests/contract/test_normalized_ir_contract.py 的 SCHEMA_PATH 改名；(2) 再�
 对 4 个 sample_key（annual_report_excerpt / ir_activity / short_announcement / annual_report），
 读 `tests/fixtures/phase00/<key>/parser_artifacts_ref.txt` 中 "Content list: " 行的路径
 （**特例 annual_report_excerpt**：其 ref 是占位符、盘上无独立产物——输入 = annual_report
-的 content_list 过滤 `page_idx <= 1`（即第 1–2 页，与现 fixture parsed_pages 一致），
-parsed_pages 写 {start:1, end:2, full_pdf:false}；再生成时把该 ref 文件更新为指向
+的 content_list 过滤 `page_idx <= 6`（即第 1–7 页；窗口按盘上产物实测选定：恰含 1 个
+table 元素（第 7 页释义表，40 元素），从而同时满足 §3 检查点 4(b) 的"唯一 table 元素"断言；
+第 1–2 页无 table，旧 v1 fixture 的表来自手工裁剪产物，不可复现），
+parsed_pages 写 {start:1, end:7, full_pdf:false}；再生成时把该 ref 文件更新为指向
 annual_report 产物 + 页范围说明），
 经 MinerUArtifactReader.read_content_list + MinerUToNormalizedIRMapper.map_content_list
 生成 v2 IR；sample_key=<key>、sample_role 与 document_id 由**脚本注入**（不再由 mapper 注入），
