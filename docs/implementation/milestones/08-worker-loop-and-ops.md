@@ -17,37 +17,50 @@ worker 只做扫描、加锁、调用、重试和报告，不含业务逻辑。
 
 ## 1. 状态模型（04R-D4 枚举是唯一事实源）
 
-worker 队列直接由 DB 状态派生，**不建独立任务表**：
+worker 队列直接由 DB 状态派生，**不建独立任务表**；判定 SQL 固化为 `ops.*_v1` 内部视图
+（0007-R1 第 10 条，S4）——worker / doctor / 人工排查共用同一套定义，杜绝状态机漂移：
 
 ```text
-队列                    判定（SQL）
-sync_due               source_checkpoint 窗口上界落后于 now - sync_interval 的 tracked_company
-pending_download       07 的候选（索引已见、raw 未归档）——由 sync 产出，检查点重叠窗口内自然重现
-pending_parse          document.status = 'registered'
-parse_retry            document.status = 'parse_failed' 且最新 run 结构化 error.retryable = true
-                       且重试次数（该 document 的 failed run 计数）< MAX_PARSE_RETRIES(默认 3)
-pending_build_publish  document.status = 'parsed'（有 succeeded run、无 active run）
-stale_running          processing_run.status = 'running' 且 started_at < now - STALE_RUN_THRESHOLD
-                       （默认 2×parse timeout）→ 标记 failed(error_code='stale_reclaimed',
-                       retryable=true)，进 parse_retry
+队列（ops 视图）          判定
+sync_due                source_checkpoint 窗口上界落后于 now - sync_interval 的 tracked_company
+pending_download_v1     source_access.result_snapshot.candidates 中"未注册 document、
+                        未终态失败"的候选（B6：候选已持久化，crash 后自然恢复）
+pending_parse_v1        document.status IN ('registered','parse_failed') 且无 running run
+                        且（parse_failed 时）最新 failed run 的 error.retryable=true
+                        且 failed run 计数 < MAX_PARSE_RETRIES(默认 3)
+pending_build_v1        processing_run.status='succeeded'
+                        且 unit_build_status IN ('not_started','failed')
+                        且 unit_build_attempt_count < MAX_BUILD_RETRIES(默认 3)
+pending_publish_v1      processing_run.status='succeeded' 且 unit_build_status='succeeded'
+                        且 is_active=false 且（该 run 晚于 document 当前 active run）
+retryable_failed_run_v1 供报告/人工：可重试失败 run 明细
+stale_running_run_v1    processing_run.status='running' 且 started_at < now - STALE_RUN_THRESHOLD
+                        （默认 2×parse timeout）→ 回收：标 failed(error_code='stale_reclaimed',
+                        retryable=true)
 ```
 
-`non_retryable` 与超次失败停在 `parse_failed`，只进报告与人工待办，不再自动重试。
+注意（B1）：published 文档的重解析失败**不出现**在 pending_parse 的降级路径里——document.status
+保持 published，重试判定基于 run 层状态；`non_retryable` 与超次失败只进报告与人工待办。
 
 ## 2. 并发与锁
 
-- **worker 单例锁**：PG advisory lock（`pg_try_advisory_lock(常量 key)`），拿不到即退出
-  （防止两个 worker-loop 并发）；进程崩溃锁自动释放，无 stale 锁文件问题。
-- **document 级锁**：处理单个 document 前 `pg_try_advisory_xact_lock(hashtext(document_id))`，
-  拿不到跳过本轮（另一进程正在处理）。
-- 不引入 Redis/文件锁；锁的生命周期与连接/事务绑定，天然无泄漏。
+- **worker 单例锁**：进程持有一条**专用连接**（不走连接池），其上
+  `pg_try_advisory_lock(WORKER_NS, 0)`（session 级），拿不到即退出；连接随进程存活，
+  进程崩溃锁自动释放。专用连接是关键——池化连接的 session 锁会泄漏（E6）。
+- **document 级锁**：两参形式 `pg_try_advisory_xact_lock(DOC_NS, stable_hash(document_id))`，
+  `stable_hash` 用 Python 侧 crc32（显式、跨版本稳定，不用 PG `hashtext` 内部函数）；
+  在每个**改写该 document 状态的事务内**获取（register 复用 / finish_run / publish），
+  事务结束自动释放。跨事务的整文档互斥由单例锁 + status 声明式判定保证，不做长持锁。
+- 不引入 Redis/文件锁。
 
 ## 3. 实施细则
 
 1. `application/worker/worker.py`：`run_once(limits) -> WorkerReport`——按 §1 队列顺序
-   （stale 回收 → sync → download → parse/retry → build+publish）各处理至多 N 个
-   （settings：`WORKER_BATCH_*`，默认 sync 5 / download 10 / parse 3 / publish 10；
-   parse 串行执行，MinerU 吃满单机资源）。
+   （stale 回收 → sync → download → parse/retry → build → publish）各处理至多 N 个
+   （settings：`WORKER_BATCH_*`，默认 sync 5 / download 10 / parse 3 / build 10 / publish 10；
+   parse 串行执行，MinerU 吃满单机资源）。**每个 document 的处理包裹在 try/except**：
+   use case 异常（含 re-raise 的未知异常）记入报告失败清单后继续下一个——
+   一个坏 PDF 不得打死整个 loop（04R-R4 的异常分型保证 run 已持久化 failed 状态）。
 2. `worker-loop`：`run_once` + sleep（`WORKER_LOOP_INTERVAL_SECONDS` 默认 900）循环；
    SIGINT/SIGTERM 优雅退出（完成当前 document 后停）。
 3. 重试策略只读结构化错误：`error.retryable`（04R-R4 已收紧分类）+ 次数上限；
@@ -65,6 +78,8 @@ stale_running          processing_run.status = 'running' 且 started_at < now - 
 ## 4. 检查点
 
 - `make worker-once` 能把一个 pending document 从 registered 跑到 active run（含 05 process）。
+- 队列视图与 worker 行为一致（对 ops.*_v1 视图行断言，同一 SQL 定义）。
+- 注入抛异常的坏 PDF：该 document 进失败清单，loop 继续处理后续 document。
 - 两个并发 worker-once：第二个立即退出（单例锁）；同一 document 不被并发处理（文档锁）。
 - worker 崩溃（kill -9 注入）后：raw archive 完好、无僵尸锁、stale run 下轮被回收重试。
 - retryable=false 的失败不再重试且出现在报告失败清单。
@@ -90,6 +105,6 @@ stale 回收、崩溃恢复（事务中断后状态一致）。
 ## 8. 常见失败与处理
 
 - worker 重复处理：先查两级锁与 document.status 事务顺序。
-- publish 中断：旧 active run 保持（05 事务保证）；下轮 pending_build_publish 重入。
+- publish 中断：旧 active run 保持（05 事务保证）；下轮 pending_publish_v1 重入。
 - 长时间卡住：stale_running 回收 + 报告可见；人工 `make doctor-full` 定位。
 - MinerU 内存压力：parse 串行 + 超时（04R-R4）兜底；必要时调小 WORKER_BATCH_PARSE。

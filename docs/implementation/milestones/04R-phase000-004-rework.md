@@ -34,14 +34,29 @@ canonical 契约（`service-purpose.md` v1.2 + 顶层协议 v0.7）的深度评�
 - **D3 change_kind 落列**：`ops.outbox_event` 加 `change_kind` 列（NOT NULL DEFAULT
   'materialized' + CHECK），写侧显式必填；`change_events_v1` 直接投影，删除
   `LIKE '%observed%'` 启发式 CASE。
-- **D4 document.status 生命周期枚举定死**：`registered → parsed | parse_failed →（05）published`。
-  `parse_document._finish_run` 同事务更新 document.status；加 CHECK 约束。08 的 worker
-  队列扫描直接建立在该枚举上。
-- **D5 主体解析顺序（协议 §6.5.1 规则 1/4 落地）**：`(exchange, security_code)` 命中 →
-  沿 security 取 company；否则 USCC 强键查找（新增 `get_by_credit_code`）；都未命中才新建。
-  `legal_name` 只作一致性校验：命中主体后名称不一致 → 抛 `RegistrationMetadataError`
-  （弱键不得自动合并）；既有公司缺 USCC 而命令带 USCC → 同事务回填；USCC 冲突（同码不同司
-  或同司不同码）→ 抛错，不静默。
+- **D4 document.status = public availability state（与 run/build 状态解耦）**：枚举
+  `registered / parsed / parse_failed / published`（CHECK 约束；archived 预留不入枚举）。
+  语义：status 只回答"public 契约下这份文档现在可消费吗"，**不**代表最近一次 run 的结果——
+  已 published 的文档重解析失败**不得降级**（旧 active run 继续可用）：
+  `parse success：无 current run → parsed；有 → 保持 published`；
+  `parse failed：无 current run → parse_failed；有 → 保持 published，只记 failed run + observed 事件`；
+  `publish success → published`。builder 自身的状态放 processing_run（新增
+  unit_build_status not_started/running/succeeded/failed + unit_build_error jsonb +
+  unit_build_attempt_count + unit_built_at），parse run 的 status 仍只表示解析生命周期。
+  08 的队列同时依据 document.status 与 run.unit_build_status（见 08 §1）。
+  latest run 不落列，由 run 表按 started_at 派生。
+- **D5 主体解析 + typed identifier ledger（协议 §6.5.1 规则 1/4 落地）**：新建
+  `core.company_identifier` 账本表（identifier_id / company_id / scheme / raw_value /
+  normalized_value / jurisdiction / source_access_id / status active|retired|contested /
+  valid_from / valid_to / observed_at / created_at；强键 partial unique：
+  `(scheme, normalized_value) WHERE scheme IN ('uscc','lei','sec_cik','hk_cr') AND status='active'`）。
+  scheme 含 provider 侧 `cninfo_org_id`（仅 provider 命名空间内稳定，不等同法律身份）。
+  解析顺序：`(exchange, security_code)` 命中 → 沿 security 取 company；否则强键
+  （uscc/lei/…）查 ledger；都未命中才新建（company + 相应 identifier 行）。命中后交叉校验：
+  另一强键或 `legal_name` 不一致 → 该 identifier 置 `contested` 并抛
+  `RegistrationMetadataError`，**绝不自动合并**；既有公司缺某强键而命令携带 → 同事务补 ledger 行。
+  红筹/VIE 边界写入规格：开曼/香港上市主体 ≠ 境内 USCC 运营实体，identifier 不得跨主体挂接。
+  `company.unified_social_credit_code` 列保留并与 ledger 同步写（迁移时从该列回填 ledger）。
 - **D6 outbox 事件构造惯例**：domain 层提供事件工厂（`domain/entities/outbox_events.py`），
   统一填 `event_kind`（snake_case）、`change_kind`、`occurred_at`（use case 时钟，不依赖
   server default）。register 的 `document_registered` = materialized；重复登记复用已有
@@ -56,10 +71,14 @@ canonical 契约（`service-purpose.md` v1.2 + 顶层协议 v0.7）的深度评�
   `run_kind='rebuild_units'`（从既有 IR 重建 unit 而不重新解析）作为保留值写入契约，
   05 不实现。
 - **D9 NormalizedIR 升 v2：parser 中立元素分类**：IR 的 `kind` 不再透传 MinerU 原始 type，
-  归一为 parser 中立枚举 `text / heading / table / image / page_furniture / unknown`
-  （`page_furniture` = 页眉/页脚/页码等版面件），原始类型保留在 `raw_kind`。
-  没有消费者，直接升 `normalized_ir.v2`，golden fixtures 全量再生成——05 的噪声抑制与
-  heading builder 只依赖中立分类，不依赖任何 MinerU 命名。
+  归一为 parser 中立枚举 `text / heading / table / image / equation / page_furniture / unknown`
+  （`page_furniture` = 页眉/页脚/页码等版面件；`equation` 为 MinerU 实际会产出的类型），
+  原始类型保留在 `raw_kind`。**任何 kind 都不得静默消失**：builder 不生成 unit 的元素必须
+  进入 build 统计（丢弃计数按 kind 分桶），image 类见 05-S1 的保留规则。评审建议的
+  list/chart/code/footnote 枚举值不采纳——parser 不产出这些类型（list 以 text 形态出现、
+  chart 即 image、footnote 已在 table_footnote 通道），为不存在的输入建枚举是投机；
+  若未来 parser 升级产出新类型，落 `unknown + raw_kind` 并触发契约升版讨论。
+  没有消费者，直接升 `normalized_ir.v2`，golden fixtures 全量再生成。
 - **D10 注册核心与主体解析服务化（为 07 复用而设计）**：主体解析（D5 顺序）抽成独立的
   `SubjectResolver`（application service，输入证券/公司标识候选，输出已解析或新建的
   company+security，含回填与冲突语义）；文档注册抽成 `register_document` 核心
@@ -88,42 +107,64 @@ canonical 契约（`service-purpose.md` v1.2 + 顶层协议 v0.7）的深度评�
 新建 `0007_envelope_and_feed_hardening.py`（0001–0006 不动），内容：
 
 ```text
-1. ops.outbox_event 加列：
-   change_kind varchar(16) NOT NULL DEFAULT 'materialized'
-     CHECK (change_kind IN ('observed','materialized'))
-   回填：UPDATE ... SET change_kind = payload->>'change_kind'
-         WHERE payload->>'change_kind' IN ('observed','materialized')
-2. core.processing_run 加列：parser_method varchar(16)、parser_language varchar(16)
-3. core.document 加 status CHECK：
-   status IN ('registered','parsed','parse_failed','published')
-   （先核对存量值；现库只有 'registered'）
-   core.document_unit 加 quality_status CHECK：IN ('ok','needs_review','unusable')
-4. 索引：
+1. ops.outbox_event 加列（E1/E2：最终不留 DEFAULT，写侧必须显式传）：
+   ADD COLUMN change_kind varchar(16)
+   回填：SET change_kind = CASE WHEN payload->>'change_kind' IN ('observed','materialized')
+         THEN payload->>'change_kind' ELSE 'materialized' END
+   然后 SET NOT NULL + CHECK (change_kind IN ('observed','materialized'))，不加 DEFAULT
+   ADD COLUMN subject_kind varchar(32)、subject_ref varchar(64)（事件工厂显式填；
+   历史行回填 CASE：asset_id 非空→('document_unit', asset_id)，processing_run_id 非空→
+   ('processing_run', ...)，否则 ('document', document_id)）
+2. core.processing_run 加列：parser_method varchar(16)、parser_language varchar(16)、
+   unit_build_status varchar(16) NOT NULL DEFAULT 'not_started'
+     CHECK IN ('not_started','running','succeeded','failed')、
+   unit_build_error jsonb NULL、unit_build_attempt_count int NOT NULL DEFAULT 0、
+   unit_built_at timestamptz NULL（D4/B1：builder 状态与 parse status 解耦）
+3. core.document 加 status CHECK：IN ('registered','parsed','parse_failed','published')
+   （先核对存量值；现库只有 'registered'）；
+   加 provider_metadata jsonb NOT NULL DEFAULT '{}'（E10：只放稳定、小体积、无敏感信息的
+   provider 元数据如 orgId/原始分类；完整 index response 留在 source_access.result_snapshot）；
+   core.document_unit 加 quality_status CHECK：IN ('ok','needs_review','unusable')、
+   加 query_projection_hash varchar(128) NULL（05-U3 三哈希分层）
+4. core.company_identifier 新表（D5 ledger，全列见 D5）+ 强键 partial unique index；
+   从 company.unified_social_credit_code 回填 uscc 行
+5. 索引：
    ix_document_company_period_type   ON document (company_id, report_period, filing_type)
    ix_document_announcement_date     ON document (announcement_date)
-   ix_document_unit_document_kind    ON document_unit (document_id, payload_kind)
+   ix_document_unit_run_order        ON document_unit (document_id, processing_run_id,
+                                                       order_index, asset_id)  ← 06 热路径
    ix_document_unit_content_hash     ON document_unit (content_hash)
    ix_document_unit_heading_path     ON document_unit USING gin (heading_path jsonb_path_ops)
-5. document_units_v1 重建（drop + create，追加列、不删不改名）：
+   （GIN 保留：heading_path 过滤是 §3.11 契约义务；若后续证明 v1 只按序读取可在 0009 撤）
+6. document_units_v1 重建（drop + create，追加列、不删不改名）：
    + 'document_unit'::text AS asset_kind
    + u.created_at          AS observed_at
    + CASE WHEN d.filing_type IN ('investor_relations','performance_briefing')
           THEN 'tier_0b' ELSE 'tier_0a' END AS source_tier
+     （E3 的 provider guard 在写侧落实：register/07 只接受官方披露 provider 白名单，
+      故视图不引入协议外的 tier_unknown 值）
    + 'G0'::text            AS trace_level
    + d.raw_file_hash
-6. change_events_v1 重建：投影 e.change_kind（删 LIKE CASE），追加
-   'disclosure_anchor'::text AS source、'change_event.v1'::text AS contract_version、
-   COALESCE(e.asset_id, e.processing_run_id, e.document_id) AS subject_ref（协议 §2.8 事件形状）
-7. documents_v1 重建：追加 'document.v1'::text AS contract_version、company_ref、
+   + u.query_projection_hash
+7. change_events_v1 重建：投影 e.change_kind / e.subject_kind / e.subject_ref（真实列，
+   不用 COALESCE 猜），追加 'disclosure_anchor'::text AS source、
+   'change_event.v1'::text AS contract_version
+8. documents_v1 重建：追加 'document.v1'::text AS contract_version、company_ref、
    security_ref、source_ref、supersedes_document_id、correction_of_document_id、
-   superseded_by_document_id（自联派生：谁的 supersedes 指向我）
-8. processing_runs_v1 重建：追加 parser_method、parser_language
+   superseded_by_document_id（自联派生）、provider_metadata
+9. processing_runs_v1 重建：追加 parser_method、parser_language、unit_build_status、
+   unit_build_attempt_count、unit_built_at
+10. ops 内部队列视图（S4，非 public 契约，worker/doctor/人工共用同一套 SQL）：
+    ops.pending_parse_v1 / ops.pending_build_v1 / ops.pending_publish_v1 /
+    ops.retryable_failed_run_v1 / ops.stale_running_run_v1（定义见 08 §1）
 downgrade：逆序还原至 0006 形状。授权依赖 0001 default privileges（0006 已验证），
-权限测试需覆盖重建的全部视图。
+权限测试需覆盖重建的全部视图；ops 队列视图只授 app 角色。
 ```
 
-模型/mapper/实体同步加 `change_kind`、`parser_method`、`parser_language`；models.py 的
-document.status 与 outbox.change_kind 加同样 CHECK。
+模型/mapper/实体同步加全部新列（change_kind/subject_kind/subject_ref、unit_build_*、
+provider_metadata、query_projection_hash、CompanyIdentifier 实体+仓储）；models.py 加同样 CHECK。
+`report_period` 语义修订（B8）：DB 列本就 nullable，保持；必填性按 filing_type 在命令校验层
+执行（见 R2.6）。
 
 ### R2 — 主体解析服务化 + 注册核心重构（D5/D7/D10；评审项 A1/A6/A7/A10/A11/B18/B19）
 
@@ -142,13 +183,19 @@ document.status 与 outbox.change_kind 加同样 CHECK。
    （observed）事件（D6），本次获取可查询。
 6. 命令边界校验：`domain/value_objects` 加 `ReportPeriod.parse`
    （regex `^\d{4}(A|Q[1-4])$`，协议 §2.5 label 形态）与 filing_type 词表校验（D7），
-   register 入口 fail fast。
+   register 入口 fail fast。**`report_period` 改为 `ReportPeriod | None`（B8）**，
+   必填性按 filing_type：annual/semiannual/quarterly_report 必填；performance_forecast/
+   performance_flash/performance_briefing 建议填、缺失记 warning 不阻断；其余（investor_relations/
+   inquiry_reply/other 等临时公告）可空。public view 的 `report_period` 保留且允许 null。
 7. quarantine 的 `reason` 收敛为枚举（防任意字符串使隔离本身抛 PathSafety 错）。
 
 ### R3 — outbox 事件惯例与 parse 事件（D3/D6；A3/A4/B12）
 
 1. 新建 `domain/entities/outbox_events.py` 事件工厂；register/parse 全部改用工厂构造。
-2. mapper 修复：`outbox_event_to_model` 映射 `occurred_at`（现被静默丢弃）与 `change_kind`。
+   工厂必填 `subject_kind + subject_ref`（E2：document / processing_run / document_unit /
+   source_access 四值，精确指事件主体，不做 COALESCE 推断）。
+2. mapper 修复：`outbox_event_to_model` 映射 `occurred_at`（现被静默丢弃）、`change_kind`、
+   `subject_kind`、`subject_ref`。
 3. `parse_document._prepare_run` 事务内写 `processing_run_created`（observed）；
    `_finish_run` 失败分支写 `processing_run_failed`（observed，payload 含结构化错误）。
 
@@ -162,15 +209,23 @@ document.status 与 outbox.change_kind 加同样 CHECK。
    parse 失败（不再吞成 'unknown' 继续）；删除 IR 顶层 `warnings` 旁路。
 3. `_finish_run` 记录 `parser_method` / `parser_language`（R1 列）；失败 run 也要落
    parser 身份（`_prepare_run` 时即从 adapter 元数据落 parser_name/version，失败可归因）。
-4. retryable 映射收紧：显式捕 `ParserError`/`OSError`/`TimeoutExpired` 分类映射；
-   未知异常持久化 failed run（retryable=false）后 re-raise（不伪装成可重试）。
+4. parser 异常分型（E4）：adapter 抛 typed 层级
+   `ParserTimeoutError / ParserInvocationError / ParserVersionProbeError /
+   ParserOutputContractError / ParserUnknownError`；use case 只按类型映射
+   stage/error_code/retryable（timeout/invocation → retryable=true，
+   version_probe/output_contract → false）；未知异常持久化 failed run
+   （retryable=false）后 re-raise——worker（08）在循环层 catch 保证单个坏 PDF
+   不打死 loop。
 5. 两个 except 块去重：`except Exception` 归一为构造 `_ParseRunFailure` 走同一失败出口。
 6. `parser_result.normalized_ir` 禁止就地改写：ParseDocument 先算 artifact relpaths
    再传入 mapper 一次成型（顺带消灭 `artifact_relpath_map` 双份死代码）。
 7. `parsed_pages.full_pdf` 如实：ParserOptions 的 start/end 传入 mapper，
    `full_pdf = start_page is None and end_page is None`。
-8. D4 落地：`_finish_run` 同事务更新 `document.status`（succeeded→'parsed'，
-   failed→'parse_failed'）。
+8. D4 落地（B1 解耦语义）：`_finish_run` 同事务更新 `document.status`，但**只在
+   `current_processing_run_id IS NULL` 时**（succeeded→'parsed'，failed→'parse_failed'）；
+   已 published 的文档保持 published，失败只留 failed run + observed 事件，读侧不降级。
+9. `ids.py` docstring 修正（S3）：ULID 是"毫秒级时间有序"，同毫秒内非严格单调——
+   不得声称 strict monotonic，排序一律用显式键（created_at+id / order_index+asset_id / seq）。
 
 ### R5 — mapper / NormalizedIR v2（D9；B2/B3/B4/B21/B20）
 
@@ -199,10 +254,13 @@ IR 契约直接升 `normalized_ir.v2`（无消费者，schema 文件同步，gol
 1. startup preflight 与深检分离：`create_app` 只做快检（env/路径/DB ping/migration head）；
    全量 raw 重哈希移到 CLI doctor 且默认抽样（`--full` 才全量）。
 2. API 服务态把 DB 缺配作 FAIL（现在 database_url=None 直接跳过 DB 检查）；CLI doctor 降 WARN。
-3. doctor 补 doctor-checklist §2/§5：PG 连通、migration head、三 schema、角色权限、
-   normalized_ir_relpath 存在、每 document 最多一个 active run、outbox seq 单调、
-   stale running run（status='running' 且 started_at 超阈值）告警、孤儿 raw 文件报告；
-   CheckResult 增加 WARN 态。
+3. doctor 补 doctor-checklist §2/§5，并按 run 结局区分要求（E11）：
+   succeeded run → normalized_ir_relpath 必须存在且 artifact_hash 匹配；
+   failed run → 只要求结构化 error 存在，不报 artifact 缺失；
+   unit_build_status='succeeded' → document_units_relpath 存在且快照哈希与 DB 聚合一致。
+   另补：PG 连通、migration head、三 schema、角色权限、每 document 最多一个 active run、
+   outbox seq 单调、stale running run 告警、孤儿 raw/artifact 文件报告（B9 的 orphan 是
+   合法状态，报告不报错）；CheckResult 增加 WARN 态。
 4. 生产 wiring 收敛为单 engine：`unit_of_work_from_settings` 每调用新建 engine 的形态废弃，
    app/worker 统一"进程级单 engine + `lambda: SqlAlchemyUnitOfWork(engine=engine)`"。
 
@@ -212,11 +270,13 @@ IR 契约直接升 `normalized_ir.v2`（无消费者，schema 文件同步，gol
 
 ```text
 register：supersedes 链（同 pid 不同 hash）/ 竞态恢复 / expected_raw_file_hash 不匹配隔离 /
-         USCC 落库+回填+冲突 / legal_name 不一致拒绝 / ReportPeriod 与 filing_type 校验 /
+         identifier ledger 落行+回填+contested 冲突 / legal_name 不一致拒绝 /
+         ReportPeriod 按 filing_type 必填性（非 period 公告 report_period=null 可注册）/
          quarantine 落 source_access / 复用路径 observed 事件
 parse：  raw_missing 与 raw_hash_mismatch 分支 / 缺 metadata 拒绝 / 二次 parse 独立 run /
-         超时→failed(retryable) / 版本探测失败→失败 / 未知异常 re-raise /
-         document.status 变迁 / 事件含 change_kind 与 occurred_at
+         typed exception → error_code/retryable 映射 / 版本探测失败→失败 / 未知异常 re-raise /
+         document.status 变迁含 **published 文档重解析失败不降级** /
+         事件含 change_kind、occurred_at、subject_kind+subject_ref
 mapper： kind 中立分类（header/page_number→page_furniture）/ rowspan/colspan 表结构化 /
          Q&A-in-table cell 可取 / heading_level 归一 / full_pdf 随切页取值 /
          raw_kind 保留（ir_activity fixture 已有素材）

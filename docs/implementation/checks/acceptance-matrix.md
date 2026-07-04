@@ -43,7 +43,7 @@ created_at: 2026-06-26
 | A31 | 外置盘未挂载时服务 fail closed | 01/08 | doctor/startup test | pass |
 | A32 | document_units_v1 保留 15 个 unit 级 scope keys + asset_id；契约名收敛为 asset_id/payload_kind/event_kind | 02/06 | integration test | pass |
 | A33 | 0007：信封最小核视图列（asset_kind/observed_at/source_tier/trace_level/raw_file_hash）+ source_tier 按 filing_type 映射 | 04R | contract test | pending |
-| A34 | 主体解析走强键顺序（security→uscc→新建），legal_name 只校验不合并；USCC 回填与冲突拒绝 | 04R | unit test | pending |
+| A34 | 主体解析走 identifier ledger 强键顺序（security→强键→新建），legal_name 只校验不合并；冲突置 contested 并拒绝 | 04R | unit test | pending |
 | A35 | change_kind 落列且写侧必填；事件工厂统一 event_kind/change_kind/occurred_at | 04R | integration test | pending |
 | A36 | parse 超时/探测失败 fail-closed/未知异常 re-raise；document.status 生命周期随 run 变迁 | 04R | unit+integration test | pending |
 | A37 | NormalizedIR v2：parser 中立 kind 分类、结构化表、heading_level；golden fixtures 再生成 | 04R | contract test | pending |

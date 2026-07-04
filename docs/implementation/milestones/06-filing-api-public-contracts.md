@@ -33,7 +33,10 @@ GET /v1/documents                  过滤：company_ref / security_code / filing
 GET /v1/documents/{document_id}    单档；被取代时正常返回但携带 superseded_by_document_id
 GET /v1/documents/{id}/runs        该 document 全部 processing_run（历史可见）
 GET /v1/documents/{id}/units       默认 active run 的 units；?processing_run_id= 读历史快照
-GET /v1/units/{asset_id}           单 unit 全量（payload 完整返回，不截断）
+GET /v1/units/{asset_id}           单 unit 全量（payload 完整返回，不截断）。unit 不可变、
+                                   旧引用永远可解析（协议 §2.6）：历史 run 的 unit 照常返回，
+                                   响应携带 is_active_run: bool——不做"默认只返回 active"
+                                   （E12 评审建议被否：会打断 L2 已持有 asset_id 的解引用）
 GET /v1/units/{asset_id}/source-ref source_refs_v1 单行投影
 GET /v1/filings/latest             过滤同 /v1/documents；每 (company_ref, filing_type,
                                    report_period) 取 announcement_date 最新且未被取代的一份
@@ -54,9 +57,12 @@ POST /v1/admin/runs/{processing_run_id}/publish 触发 PublishRun（05）
 1. **DTO = 视图列**：`document_unit.v1.json` 等 schema 从 0007 后的视图列生成，逐列同名同义；
    不得缺列、不得改名。unit 级 DTO 额外携带序列化层派生字段
    `asset_uri = "asset://disclosure_anchor/v1/document_unit/{asset_id}"`（不入库不进视图）。
-2. **游标分页**：列表接口统一 keyset 分页——响应携带 `next_cursor`（base64(JSON) 不透明游标，
-   内容为排序键值），请求带 `cursor=`；排序键：documents 按 (announcement_date DESC,
-   document_id DESC)，units 按 (order_index ASC)，changes 直接用 `after_seq`。
+2. **游标分页（live keyset，语义显式声明）**：列表接口统一 keyset 分页——响应携带
+   `next_cursor`（base64(JSON) 不透明游标），请求带 `cursor=`；稳定排序键：
+   documents 按 (announcement_date DESC NULLS LAST, document_id DESC)，
+   units 按 (order_index ASC, asset_id ASC)，changes 按 (seq ASC)。
+   承诺：同一查询同一方向下**无重复、不漏翻页开始前已存在的行**；
+   **不承诺**翻页过程中看见新插入的数据——增量由 change feed 补齐，不引入 snapshot_seq。
    禁止 offset 分页。scope-key 过滤 + 游标分页是契约义务（协议 §3.11 第 3 条）。
 3. **错误模型（service-purpose §12.3）**，响应体统一
    `{"error_code": ..., "message": ..., "detail": {...}}`：
@@ -65,8 +71,12 @@ POST /v1/admin/runs/{processing_run_id}/publish 触发 PublishRun（05）
 NOT_FOUND                  → 404
 GONE_SUPERSEDED            → 410，detail.superseded_by = superseded_by_document_id
                              （仅当请求方显式 ?reject_superseded=true 时触发；默认正常返回旧档）
-L1_PROCESSING_REQUIRED     → 409，document.status ∈ {registered, parse_failed} 或无 active run
-                             时请求 units；detail.status 携带当前状态
+L1_PROCESSING_REQUIRED     → 409，仅当 document **无 active run**（status ∈ {registered,
+                             parsed, parse_failed} 且 current_processing_run_id IS NULL）时
+                             请求 units；detail.status 携带当前状态。
+                             有 active run 但最新 run 失败 → 200 正常返回旧 active 数据 +
+                             响应头/字段 warning=LATEST_PROCESSING_FAILED（B1：published
+                             不因重解析失败降级）
 CONTRACT_VERSION_MISMATCH  → 400，请求头 X-Contract-Version 显式指定且不受支持时
 ```
 
@@ -91,7 +101,9 @@ CONTRACT_VERSION_MISMATCH  → 400，请求头 X-Contract-Version 显式指定�
 - 四个错误码各有 contract test；GONE_SUPERSEDED 携带 superseded_by。
 - unit 响应携带 asset_uri 且视图/表无此列。
 - API 不返回绝对路径 / 私有状态 / 内部异常堆栈；reader 角色连接无法写。
-- 分页游标在数据插入期间稳定（keyset 无重复/遗漏）。
+- 分页游标语义符合 live keyset 承诺（无重复、不漏存量；新插入不承诺，测试按此断言）。
+- 已 published 文档最新 run 失败：units 返回 200 + LATEST_PROCESSING_FAILED warning。
+- 历史 run 的 unit 按 asset_id 可取回且 is_active_run=false。
 
 ## 5. 测试要求
 

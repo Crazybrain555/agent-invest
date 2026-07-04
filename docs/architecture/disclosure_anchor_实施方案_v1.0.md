@@ -1712,12 +1712,15 @@ L2 可按 unit 精确失效）：
 
 ```text
 processing_run_published   发布 1 条；materialized ⇔ content_hash_aggregate 变化，否则 observed
-document_unit_created      新增内容的 unit 每个 1 条（materialized）
-document_unit_removed      消失内容的 unit 每个 1 条（materialized）
-quality_status_changed     内容同、质量变的 unit 每个 1 条（materialized）
+document_unit_created      新增内容的 unit 每个 1 条（materialized，payload 携带 new_asset_id）
+document_unit_removed      消失内容的 unit 每个 1 条（materialized，payload 携带 old_asset_id——
+                           L2 持有旧 asset_id，只给 content_hash 无法撤销）
+document_unit_projection_changed
+                           内容同、投影（title/heading_path/semantic_key/quality_status）变的
+                           unit 每个 1 条（materialized，携带 old/new asset_id 与 changed_fields）
 ```
 
-一次内容修改 = removed + created 两条事件，不做模糊配对。L2 收到后按需查询完整 payload。
+diff 按 multiset + 稳定配对计算（重复内容不丢计数，milestone 05 §2-U5）；一次内容修改 = removed + created 两条事件。L2 收到后按需查询完整 payload。
 `change_kind` 是 outbox 真实列（0007 起），仅 `observed` / `materialized` 两值
 （service-purpose §12.2）；下游失效只由 materialized 触发。
 

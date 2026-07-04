@@ -291,11 +291,18 @@ tracked_companies
 - 文件哈希是什么；
 - 当前是否下载、解析和发布成功。
 
-`document.status` 生命周期枚举（04R-D4，随 0007 加 CHECK）：
+`document.status` 是 **public availability state**（04R-D4/B1，随 0007 加 CHECK）——只回答
+"public 契约下这份文档现在可消费吗"，不代表最近一次 run 的结果：
 
 ```text
 registered → parsed | parse_failed →（发布后）published
+published 后重解析失败不降级：status 保持 published，旧 active run 继续可读，
+失败只体现在 processing_run 层（unit_build_status / failed run + observed 事件）
 ```
+
+`report_period` 可空（B8）：定期报告（annual/semiannual/quarterly_report）必填；
+业绩预告/快报/说明会建议填；临时公告（investor_relations/inquiry_reply/other 等）可为 null，
+public view 保留该列且允许 null，不得伪造 period。
 
 `filing_type` 初始词表（04R-D7；新增值走契约升版，禁止自由字符串）：
 
