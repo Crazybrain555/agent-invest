@@ -26,19 +26,27 @@ def _create_roots(root: Path) -> None:
 
 
 class AppStartupTests(unittest.TestCase):
-    def _create_app_or_skip(self, settings: Settings):
+    def _create_app_or_skip(self, settings: Settings, *, validate_runtime: bool = True):
         try:
             from disclosure_anchor.main import create_app
         except MissingDependencyError as exc:
             self.skipTest(str(exc))
-        return create_app(settings)
+        return create_app(settings, validate_runtime=validate_runtime)
 
-    def test_create_app_passes_with_valid_runtime(self) -> None:
+    def test_create_app_can_skip_runtime_validation_for_unit_tests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _create_roots(root)
-            app = self._create_app_or_skip(_settings(root))
+            app = self._create_app_or_skip(_settings(root), validate_runtime=False)
             self.assertEqual(app.title, "disclosure_anchor")
+
+    def test_create_app_fails_closed_without_database_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            with self.assertRaises(ConfigurationError) as caught:
+                self._create_app_or_skip(_settings(root))
+            self.assertIn("DATABASE_URL", str(caught.exception))
 
     def test_create_app_fails_closed_without_sentinel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

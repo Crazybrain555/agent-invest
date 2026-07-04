@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from disclosure_anchor.adapters.runtime.doctor import run_doctor
+from disclosure_anchor.adapters.runtime.doctor import run_doctor, run_startup_preflight
 from disclosure_anchor.settings import SENTINEL_NAME, Settings
 
 
@@ -37,6 +37,19 @@ class DoctorTests(unittest.TestCase):
                 "raw archive filesystem",
                 [result.name for result in report.results],
             )
+            self.assertIn(
+                "DATABASE_URL",
+                [result.name for result in report.results if result.status == "WARN"],
+            )
+
+    def test_startup_preflight_fails_when_database_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            report = run_startup_preflight(_settings(root))
+            self.assertFalse(report.ok)
+            failed = {result.name for result in report.results if not result.ok}
+            self.assertIn("DATABASE_URL", failed)
 
     def test_fails_closed_when_sentinel_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

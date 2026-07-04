@@ -7,16 +7,13 @@ rolls back, so use cases must commit deliberately.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Optional
 
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from disclosure_anchor.adapters.db.postgres.connection import (
-    app_database_url,
-    create_db_engine,
-    create_session_factory,
-)
+from disclosure_anchor.adapters.db.postgres.connection import create_session_factory
 from disclosure_anchor.adapters.db.postgres.repositories import (
     CompanyIdentifierRepository,
     CompanyRepository,
@@ -94,8 +91,7 @@ class SqlAlchemyUnitOfWork:
         self.session.flush()
 
 
-def unit_of_work_from_settings(settings) -> SqlAlchemyUnitOfWork:  # noqa: ANN001
-    """Build a UnitOfWork bound to an engine created from the app DATABASE_URL."""
+def unit_of_work_factory(engine: Engine) -> Callable[[], SqlAlchemyUnitOfWork]:
+    """Build UnitOfWork instances from a process-level engine."""
 
-    engine = create_db_engine(app_database_url(settings))
-    return SqlAlchemyUnitOfWork(engine=engine)
+    return lambda: SqlAlchemyUnitOfWork(engine=engine)
