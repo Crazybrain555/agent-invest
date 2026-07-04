@@ -118,7 +118,7 @@ class FileStorePathBuilder:
             / "normalized_ir"
             / _safe_component(document_id, label="document_id")
             / _safe_component(processing_run_id, label="processing_run_id")
-            / "normalized_ir.v1.json"
+            / "normalized_ir.v2.json"
         )
         return _assert_relative(relpath)
 
@@ -137,7 +137,7 @@ class FileStorePathBuilder:
             / _safe_component(security_code, label="security_code")
             / _safe_component(provider_document_id, label="provider_document_id")
             / _safe_component(processing_run_id, label="processing_run_id")
-            / "normalized_ir.v1.json"
+            / "normalized_ir.v2.json"
         )
         return _assert_relative(relpath)
 

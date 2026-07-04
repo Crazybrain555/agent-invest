@@ -131,7 +131,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                         ),
                         normalized_ir_relpath=(
                             "derived/normalized_ir/cninfo/002484/1225087169/"
-                            "run_01K0000000000000000000000/normalized_ir.v1.json"
+                            "run_01K0000000000000000000000/normalized_ir.v2.json"
                         ),
                         error={"stage": "parse", "error_code": "noop", "retryable": False},
                     )

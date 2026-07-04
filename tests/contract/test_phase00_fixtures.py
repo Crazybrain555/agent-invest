@@ -80,14 +80,14 @@ class Phase00FixtureContractTests(unittest.TestCase):
     def test_every_sample_has_the_expected_artifacts(self) -> None:
         for key in CLEAN_CHECKOUT_SAMPLE_KEYS:
             sample_dir = FIXTURE_ROOT / key
-            self.assertTrue((sample_dir / "normalized_ir.v1.json").is_file(), key)
+            self.assertTrue((sample_dir / "normalized_ir.v2.json").is_file(), key)
             self.assertTrue((sample_dir / "document_units.v1.jsonl").is_file(), key)
             self.assertTrue((sample_dir / "manual_review.md").is_file(), key)
             self.assertTrue((sample_dir / "parser_artifacts_ref.txt").is_file(), key)
 
     def test_normalized_ir_has_required_keys_and_matching_sample_key(self) -> None:
         for key in CLEAN_CHECKOUT_SAMPLE_KEYS:
-            data = json.loads((FIXTURE_ROOT / key / "normalized_ir.v1.json").read_text("utf-8"))
+            data = json.loads((FIXTURE_ROOT / key / "normalized_ir.v2.json").read_text("utf-8"))
             missing = NORMALIZED_IR_REQUIRED_KEYS - data.keys()
             self.assertFalse(missing, f"{key} missing keys: {sorted(missing)}")
             self.assertEqual(data["sample_key"], key)
@@ -96,7 +96,7 @@ class Phase00FixtureContractTests(unittest.TestCase):
 
     def test_document_units_are_well_formed(self) -> None:
         for key in CLEAN_CHECKOUT_SAMPLE_KEYS:
-            ir = json.loads((FIXTURE_ROOT / key / "normalized_ir.v1.json").read_text("utf-8"))
+            ir = json.loads((FIXTURE_ROOT / key / "normalized_ir.v2.json").read_text("utf-8"))
             units = _read_jsonl(FIXTURE_ROOT / key / "document_units.v1.jsonl")
             self.assertGreater(len(units), 0, key)
 
@@ -139,7 +139,7 @@ class Phase00FixtureContractTests(unittest.TestCase):
     def test_optional_full_annual_fixture_is_valid_when_present(self) -> None:
         for key in OPTIONAL_LOCAL_SAMPLE_KEYS:
             sample_dir = FIXTURE_ROOT / key
-            if not (sample_dir / "normalized_ir.v1.json").is_file():
+            if not (sample_dir / "normalized_ir.v2.json").is_file():
                 self.skipTest(f"optional local fixture absent: {key}")
             self.assertTrue((sample_dir / "document_units.v1.jsonl").is_file(), key)
             self.assertTrue((sample_dir / "manual_review.md").is_file(), key)

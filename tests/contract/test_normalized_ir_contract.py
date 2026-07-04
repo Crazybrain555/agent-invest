@@ -1,4 +1,4 @@
-"""NormalizedIR v1 contract checks."""
+"""NormalizedIR v2 contract checks."""
 
 import json
 import unittest
@@ -13,7 +13,7 @@ from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCHEMA_PATH = REPO_ROOT / "contracts" / "normalized_ir" / "normalized_ir.v1.json"
+SCHEMA_PATH = REPO_ROOT / "contracts" / "normalized_ir" / "normalized_ir.v2.json"
 PHASE00_ROOT = REPO_ROOT / "tests" / "fixtures" / "phase00"
 CLEAN_CHECKOUT_SAMPLE_KEYS = (
     "annual_report_excerpt",
@@ -75,14 +75,29 @@ class NormalizedIRContractTests(unittest.TestCase):
         element_required = set(schema["properties"]["elements"]["items"]["required"])
         self.assertEqual(
             element_required,
-            {"ir_id", "kind", "order_index", "source_item_index"},
+            {"ir_id", "kind", "raw_kind", "order_index", "source_item_index"},
+        )
+        kind_enum = set(
+            schema["properties"]["elements"]["items"]["properties"]["kind"]["enum"]
+        )
+        self.assertEqual(
+            kind_enum,
+            {
+                "text",
+                "heading",
+                "table",
+                "image",
+                "equation",
+                "page_furniture",
+                "unknown",
+            },
         )
         Draft202012Validator.check_schema(schema)
 
     def test_clean_checkout_phase00_fixtures_validate_against_schema(self) -> None:
         for sample_key in CLEAN_CHECKOUT_SAMPLE_KEYS:
             data = json.loads(
-                (PHASE00_ROOT / sample_key / "normalized_ir.v1.json").read_text(
+                (PHASE00_ROOT / sample_key / "normalized_ir.v2.json").read_text(
                     encoding="utf-8"
                 )
             )
@@ -90,7 +105,7 @@ class NormalizedIRContractTests(unittest.TestCase):
             self.assertGreater(len(data["elements"]), 0, sample_key)
 
     def test_optional_full_annual_fixture_validates_when_present(self) -> None:
-        path = PHASE00_ROOT / "annual_report" / "normalized_ir.v1.json"
+        path = PHASE00_ROOT / "annual_report" / "normalized_ir.v2.json"
         if not path.is_file():
             self.skipTest("optional full annual_report normalized_ir fixture is absent")
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -99,7 +114,7 @@ class NormalizedIRContractTests(unittest.TestCase):
     def test_parser_artifacts_reject_extra_absolute_paths(self) -> None:
         data = json.loads(
             (
-                PHASE00_ROOT / "short_announcement" / "normalized_ir.v1.json"
+                PHASE00_ROOT / "short_announcement" / "normalized_ir.v2.json"
             ).read_text(encoding="utf-8")
         )
         data["parser_artifacts"]["legacy_root"] = "/Volumes/AgentSSD/leak"
@@ -132,7 +147,6 @@ class NormalizedIRContractTests(unittest.TestCase):
                 "document_id": "phase04_real_mapper_smoke",
                 "source_pdf": "tmp/sample_filings/real.pdf",
                 "title": "real mapper smoke",
-                "sample_key": "short_announcement",
             },
             parser_artifacts={
                 "artifact_root_relpath": "parser_artifacts/short",
@@ -142,6 +156,7 @@ class NormalizedIRContractTests(unittest.TestCase):
         self._assert_valid(normalized, label="real_mapper_smoke")
         self.assertEqual(len(normalized["elements"]), len(content_list))
         self.assertEqual(normalized["elements"][0]["text"], content_list[0]["text"])
+        self.assertIn("raw_kind", normalized["elements"][0])
         self.assertEqual(normalized["parsed_pages"]["start_page_no"], 1)
         self.assertGreaterEqual(normalized["parsed_pages"]["end_page_no"], 1)
 
@@ -149,7 +164,14 @@ class NormalizedIRContractTests(unittest.TestCase):
         normalized = MinerUToNormalizedIRMapper().map_content_list(
             content_list=[
                 {"type": "text", "text": "正文", "page_idx": 0},
-                {"type": "table", "page_idx": 0, "table_body": "<table></table>"},
+                {
+                    "type": "table",
+                    "page_idx": 0,
+                    "table_body": (
+                        "<table><tr><th>项目</th><th>金额</th></tr>"
+                        "<tr><td>收入</td><td>10</td></tr></table>"
+                    ),
+                },
             ],
             parser_info=MinerUParserInfo(
                 name="MinerU",
@@ -173,6 +195,13 @@ class NormalizedIRContractTests(unittest.TestCase):
             },
         )
         self._assert_valid(normalized, label="synthetic_mapper")
+        self.assertEqual(normalized["contract_version"], "normalized_ir.v2")
+        self.assertEqual(normalized["elements"][0]["raw_kind"], "text")
+        self.assertEqual(normalized["elements"][1]["kind"], "table")
+        self.assertEqual(
+            normalized["elements"][1]["table"],
+            {"headers": ["项目", "金额"], "rows": [["收入", "10"]]},
+        )
 
 
 if __name__ == "__main__":

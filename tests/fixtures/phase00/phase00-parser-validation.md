@@ -16,6 +16,15 @@
 | ir_activity | 1-24 (full) | 131 | {'table': 2, 'text': 46, 'qa': 36} | needs_rule_adjustment |
 | annual_report | 1-209 (full) | 2697 | {'text': 1144, 'table': 473} | pass |
 
+## IR v2 heading_level coverage
+
+| sample | kind==heading elements | heading_level non-null | total elements |
+|---|---:|---:|---:|
+| annual_report_excerpt | 6 | 6 | 16 |
+| ir_activity | 39 | 39 | 131 |
+| short_announcement | 6 | 6 | 31 |
+| annual_report | 655 | 655 | 2697 |
+
 ## Known Risks
 
 - IR first Q&A is embedded in the initial activity table; formal mapper needs table-body Q&A extraction.

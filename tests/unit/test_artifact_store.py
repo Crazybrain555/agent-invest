@@ -27,8 +27,8 @@ class ArtifactStoreTests(unittest.TestCase):
             store = ArtifactStore(paths)
 
             result = store.write_json_atomic(
-                relpath=Path("derived/sample/normalized_ir.v1.json"),
-                payload={"contract_version": "normalized_ir.v1", "items": [1, 2]},
+                relpath=Path("derived/sample/normalized_ir.v2.json"),
+                payload={"contract_version": "normalized_ir.v2", "items": [1, 2]},
             )
 
             final_path = paths.data_path(result.relpath)

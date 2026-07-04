@@ -57,20 +57,32 @@ class MinerUArtifactReaderTests(unittest.TestCase):
 
 
 class MinerUMapperTests(unittest.TestCase):
-    def test_maps_text_table_and_page_number_items(self) -> None:
+    def test_maps_neutral_kinds_and_structured_tables(self) -> None:
         mapper = MinerUToNormalizedIRMapper()
         normalized = mapper.map_content_list(
             content_list=[
-                {"type": "text", "text": "正文", "page_idx": 0, "bbox": [1, 2, 3, 4]},
+                {
+                    "type": "text",
+                    "text": "一、标题",
+                    "page_idx": 0,
+                    "bbox": [1, 2, 3, 4],
+                    "text_level": 1,
+                },
+                {"type": "text", "text": "正文", "page_idx": 0},
                 {"type": "page_number", "text": "1 / 2", "page_idx": 0},
                 {
                     "type": "table",
                     "page_idx": 1,
                     "table_caption": ["表 1"],
                     "table_footnote": ["注"],
-                    "table_body": "<table></table>",
+                    "table_body": (
+                        "<table><tr><th rowspan=\"2\">项目</th><th>金额</th></tr>"
+                        "<tr><td>10</td></tr></table>"
+                    ),
                     "img_path": "images/a.jpg",
                 },
+                {"type": "equation", "text": "E=mc^2", "page_idx": 1},
+                {"type": "mystery", "text": "保留未知类型", "page_idx": 1},
             ],
             parser_info=MinerUParserInfo(
                 name="MinerU",
@@ -91,11 +103,23 @@ class MinerUMapperTests(unittest.TestCase):
                 "content_list_relpath": "parser_artifacts/sample/sample.json",
             },
         )
-        self.assertEqual(normalized["contract_version"], "normalized_ir.v1")
+        self.assertEqual(normalized["contract_version"], "normalized_ir.v2")
         self.assertEqual(normalized["parsed_pages"]["start_page_no"], 1)
         self.assertEqual(normalized["parsed_pages"]["end_page_no"], 2)
-        self.assertEqual([item["kind"] for item in normalized["elements"]], ["text", "page_number", "table"])
-        self.assertEqual(normalized["elements"][2]["table_html"], "<table></table>")
+        self.assertEqual(
+            [item["kind"] for item in normalized["elements"]],
+            ["heading", "text", "page_furniture", "table", "equation", "unknown"],
+        )
+        self.assertEqual(normalized["elements"][0]["raw_kind"], "text")
+        self.assertEqual(normalized["elements"][0]["heading_level"], 1)
+        self.assertEqual(normalized["elements"][2]["raw_kind"], "page_number")
+        self.assertEqual(normalized["elements"][3]["table"]["headers"], ["项目", "金额"])
+        self.assertEqual(normalized["elements"][3]["table"]["rows"], [["项目", "10"]])
+        self.assertEqual(
+            normalized["elements"][3]["table"]["merged_cells"],
+            [{"row": 0, "col": 0, "rowspan": 2, "colspan": 1}],
+        )
+        self.assertEqual(normalized["elements"][5]["raw_kind"], "mystery")
         json.dumps(normalized, ensure_ascii=False)
 
 

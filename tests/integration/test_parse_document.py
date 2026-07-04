@@ -85,7 +85,7 @@ class FakeParser:
             content_list_path=content_list,
             markdown_path=markdown,
             normalized_ir={
-                "contract_version": "normalized_ir.v1",
+                "contract_version": "normalized_ir.v2",
                 "created_at": "2026-06-29T00:00:00+00:00",
                 "document_id": document_metadata["document_id"],
                 "source_pdf": document_metadata["source_pdf"],
@@ -105,10 +105,12 @@ class FakeParser:
                     {
                         "ir_id": "fake_ir_0000",
                         "kind": "text",
+                        "raw_kind": "text",
                         "order_index": 0,
                         "source_item_index": 0,
                         "page_idx": 0,
                         "page_no": 1,
+                        "heading_level": None,
                         "text": "真实解析烟测",
                     }
                 ],

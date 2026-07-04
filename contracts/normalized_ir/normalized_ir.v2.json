@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://local.disclosure-anchor/contracts/normalized_ir.v1.json",
-  "title": "NormalizedIR v1",
+  "$id": "https://local.disclosure-anchor/contracts/normalized_ir.v2.json",
+  "title": "NormalizedIR v2",
   "type": "object",
   "additionalProperties": true,
   "$defs": {
@@ -24,6 +24,54 @@
           }
         ]
       }
+    },
+    "table_grid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["headers", "rows"],
+      "properties": {
+        "headers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "merged_cells": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["row", "col", "rowspan", "colspan"],
+            "properties": {
+              "row": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "col": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "rowspan": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "colspan": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        }
+      }
     }
   },
   "required": [
@@ -39,7 +87,7 @@
   ],
   "properties": {
     "contract_version": {
-      "const": "normalized_ir.v1"
+      "const": "normalized_ir.v2"
     },
     "created_at": {
       "type": "string",
@@ -137,12 +185,24 @@
       "items": {
         "type": "object",
         "additionalProperties": true,
-        "required": ["ir_id", "kind", "order_index", "source_item_index"],
+        "required": ["ir_id", "kind", "raw_kind", "order_index", "source_item_index"],
         "properties": {
           "ir_id": {
             "type": "string"
           },
           "kind": {
+            "type": "string",
+            "enum": [
+              "text",
+              "heading",
+              "table",
+              "image",
+              "equation",
+              "page_furniture",
+              "unknown"
+            ]
+          },
+          "raw_kind": {
             "type": "string"
           },
           "order_index": {
@@ -161,8 +221,17 @@
             "type": "integer",
             "minimum": 1
           },
+          "heading_level": {
+            "type": ["integer", "null"]
+          },
           "text": {
             "type": "string"
+          },
+          "table": {
+            "$ref": "#/$defs/table_grid"
+          },
+          "table_parse_failed": {
+            "type": "boolean"
           },
           "table_html": {
             "type": "string"

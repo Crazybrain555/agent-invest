@@ -1,0 +1,324 @@
+{
+  "contract_version": "normalized_ir.v2",
+  "created_at": "2026-07-04T16:02:59.329480+00:00",
+  "document_id": "phase00_annual_report_excerpt",
+  "source_pdf": "raw_documents/cninfo/002484/2026/1225087169/sha256_excerpt.pdf",
+  "title": "江海股份 2025 年年度报告 excerpt",
+  "parser": {
+    "name": "MinerU",
+    "package_version": "3.4.0",
+    "backend": "pipeline",
+    "method": "auto",
+    "language": "ch",
+    "formula": false,
+    "table": true
+  },
+  "parser_artifacts": {
+    "artifact_root_relpath": "parser_artifacts/_phase00/annual_report_full/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169/auto",
+    "content_list_relpath": "parser_artifacts/_phase00/annual_report_full/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169/auto/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169_content_list.json",
+    "markdown_relpath": "parser_artifacts/_phase00/annual_report_full/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169/auto/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169.md"
+  },
+  "parsed_pages": {
+    "start_page_no": 1,
+    "end_page_no": 2,
+    "full_pdf": false
+  },
+  "elements": [
+    {
+      "ir_id": "annual_report_excerpt_ir_0000",
+      "kind": "heading",
+      "raw_kind": "text",
+      "order_index": 0,
+      "source_item_index": 0,
+      "heading_level": 1,
+      "page_idx": 0,
+      "bbox": [
+        290,
+        243,
+        689,
+        268
+      ],
+      "text_level": 1,
+      "page_no": 1,
+      "text": "南通江海电容器股份有限公司",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0001",
+      "kind": "heading",
+      "raw_kind": "text",
+      "order_index": 1,
+      "source_item_index": 1,
+      "heading_level": 1,
+      "page_idx": 0,
+      "bbox": [
+        388,
+        326,
+        591,
+        347
+      ],
+      "text_level": 1,
+      "page_no": 1,
+      "text": "2025 年年度报告",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0002",
+      "kind": "text",
+      "raw_kind": "text",
+      "order_index": 2,
+      "source_item_index": 2,
+      "heading_level": null,
+      "page_idx": 0,
+      "bbox": [
+        366,
+        551,
+        615,
+        572
+      ],
+      "page_no": 1,
+      "text": "【2026 年 4 月 10 日】",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0003",
+      "kind": "page_furniture",
+      "raw_kind": "header",
+      "order_index": 3,
+      "source_item_index": 3,
+      "heading_level": null,
+      "page_idx": 0,
+      "bbox": [
+        561,
+        49,
+        907,
+        64
+      ],
+      "page_no": 1,
+      "text": "南通江海电容器股份有限公司 2025 年年度报告全文",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0004",
+      "kind": "page_furniture",
+      "raw_kind": "page_number",
+      "order_index": 4,
+      "source_item_index": 4,
+      "heading_level": null,
+      "page_idx": 0,
+      "bbox": [
+        895,
+        928,
+        904,
+        939
+      ],
+      "page_no": 1,
+      "text": "1",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0005",
+      "kind": "heading",
+      "raw_kind": "text",
+      "order_index": 5,
+      "source_item_index": 5,
+      "heading_level": 2,
+      "page_idx": 1,
+      "bbox": [
+        351,
+        81,
+        628,
+        110
+      ],
+      "text_level": 2,
+      "page_no": 2,
+      "text": "2025 年年度报告",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0006",
+      "kind": "heading",
+      "raw_kind": "text",
+      "order_index": 6,
+      "source_item_index": 6,
+      "heading_level": 2,
+      "page_idx": 1,
+      "bbox": [
+        304,
+        149,
+        677,
+        172
+      ],
+      "text_level": 2,
+      "page_no": 2,
+      "text": "第一节 重要提示、目录和释义",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0007",
+      "kind": "text",
+      "raw_kind": "text",
+      "order_index": 7,
+      "source_item_index": 7,
+      "heading_level": null,
+      "page_idx": 1,
+      "bbox": [
+        87,
+        206,
+        878,
+        295
+      ],
+      "page_no": 2,
+      "text": "公司董事会及董事、高级管理人员保证年度报告内容的真实、准确、完整，不存在虚假记载、误导性陈述或重大遗漏，并承担个别和连带的法律责任。",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0008",
+      "kind": "text",
+      "raw_kind": "text",
+      "order_index": 8,
+      "source_item_index": 8,
+      "heading_level": null,
+      "page_idx": 1,
+      "bbox": [
+        87,
+        309,
+        902,
+        364
+      ],
+      "page_no": 2,
+      "text": "公司负责人陈卫东、主管会计工作负责人黄仕毅及会计机构负责人（会计主管人员）朱烨梅声明：保证本年度报告中财务报告的真实、准确、完整。",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0009",
+      "kind": "text",
+      "raw_kind": "text",
+      "order_index": 9,
+      "source_item_index": 9,
+      "heading_level": null,
+      "page_idx": 1,
+      "bbox": [
+        136,
+        376,
+        628,
+        396
+      ],
+      "page_no": 2,
+      "text": "所有董事均已出席了审议本报告的董事会会议。",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0010",
+      "kind": "heading",
+      "raw_kind": "text",
+      "order_index": 10,
+      "source_item_index": 10,
+      "heading_level": 2,
+      "page_idx": 1,
+      "bbox": [
+        144,
+        413,
+        331,
+        433
+      ],
+      "text_level": 2,
+      "page_no": 2,
+      "text": "1、市场竞争风险",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0011",
+      "kind": "text",
+      "raw_kind": "text",
+      "order_index": 11,
+      "source_item_index": 11,
+      "heading_level": null,
+      "page_idx": 1,
+      "bbox": [
+        87,
+        456,
+        885,
+        627
+      ],
+      "page_no": 2,
+      "text": "电容器行业下游应用领域广泛，市场竞争较为激烈。公司在技术能力储备、客户资源积累、产品门类、产能规模以及供应链等多方面均具有竞争优势，并且将深耕战略客户、积极融入新兴产业、新应用及客户新产品联合开发，加快研发及产品设计等领域的速度，持续为客户提供增值服务，积极应对市场竞争。",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0012",
+      "kind": "heading",
+      "raw_kind": "text",
+      "order_index": 12,
+      "source_item_index": 12,
+      "heading_level": 2,
+      "page_idx": 1,
+      "bbox": [
+        142,
+        647,
+        519,
+        667
+      ],
+      "text_level": 2,
+      "page_no": 2,
+      "text": "2、进入新市场及开发新产品的风险",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0013",
+      "kind": "text",
+      "raw_kind": "text",
+      "order_index": 13,
+      "source_item_index": 13,
+      "heading_level": null,
+      "page_idx": 1,
+      "bbox": [
+        87,
+        690,
+        900,
+        897
+      ],
+      "page_no": 2,
+      "text": "公司多类产品已开拓和根植于汽车电子、工业自动化、新能源及储能、服务器电源等新应用领域，相关客户在产品技术和质量以及管理体系要求上，标准越来越严苛。公司将坚持以客户为中心，深入理解客户需求和应用场景，积极对标全球行业标杆，快速建立起兼具质量与成本优势的生产供应能力。并且已投保相关责任保险，与之深度交融的公司研发、运营和服务的团队日臻成熟，从而有效应对风险。",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0014",
+      "kind": "page_furniture",
+      "raw_kind": "header",
+      "order_index": 14,
+      "source_item_index": 14,
+      "heading_level": null,
+      "page_idx": 1,
+      "bbox": [
+        559,
+        49,
+        909,
+        64
+      ],
+      "page_no": 2,
+      "text": "南通江海电容器股份有限公司 2025 年年度报告全文",
+      "document_id": "phase00_annual_report_excerpt"
+    },
+    {
+      "ir_id": "annual_report_excerpt_ir_0015",
+      "kind": "page_furniture",
+      "raw_kind": "page_number",
+      "order_index": 15,
+      "source_item_index": 15,
+      "heading_level": null,
+      "page_idx": 1,
+      "bbox": [
+        894,
+        927,
+        907,
+        939
+      ],
+      "page_no": 2,
+      "text": "2",
+      "document_id": "phase00_annual_report_excerpt"
+    }
+  ],
+  "sample_key": "annual_report_excerpt",
+  "sample_role": "clean_checkout_fixture"
+}

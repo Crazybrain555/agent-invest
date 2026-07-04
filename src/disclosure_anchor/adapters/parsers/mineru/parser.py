@@ -70,7 +70,6 @@ class MinerUDocumentParser:
             content_list=content_list,
             parser_info=parser_info,
             document_metadata=document_metadata,
-            parser_artifacts={},
         )
         return ParserResult(
             parser_name=parser_info.name,
