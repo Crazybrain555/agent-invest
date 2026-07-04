@@ -45,6 +45,20 @@ class SubjectResolver:
                 if candidate.credit_code
                 else None
             )
+            if company.legal_name != candidate.legal_name and candidate.credit_code:
+                if identifier is not None:
+                    identifier.status = "contested"
+                    uow.company_identifiers.update(identifier)
+                else:
+                    self._add_contested_uscc_identifier(
+                        uow, company, candidate.credit_code
+                    )
+                uow.commit()
+                raise SubjectIdentityConflictError(
+                    "subject legal_name mismatch: "
+                    f"{candidate.security_code}.{candidate.exchange} belongs to "
+                    f"{company.legal_name!r}, got {candidate.legal_name!r}"
+                )
             company = self._sync_uscc_identifier(uow, company, candidate.credit_code)
             self._validate_legal_name(
                 company=company, candidate=candidate, identifier=identifier, uow=uow

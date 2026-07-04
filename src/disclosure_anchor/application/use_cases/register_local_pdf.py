@@ -234,6 +234,21 @@ class RegisterLocalPdf:
                             "candidate uscc"
                         ),
                     )
+                if (
+                    security_company is not None
+                    and security_company.legal_name != command.company_legal_name
+                ):
+                    self._add_contested_identifier_and_raise(
+                        uow,
+                        company=security_company,
+                        credit_code=command.company_credit_code,
+                        message=(
+                            "security/company mismatch: "
+                            f"{command.security_code}.{command.exchange} belongs to "
+                            f"{security_company.legal_name!r}, "
+                            f"got {command.company_legal_name!r}"
+                        ),
+                    )
             if (
                 security_company is not None
                 and security_company.legal_name != command.company_legal_name

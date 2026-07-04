@@ -454,6 +454,84 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(status, "contested")
         self.assertEqual(document_count, 0)
 
+    def test_security_legal_name_mismatch_records_new_contested_identifier(self) -> None:
+        provider_document_id = "local-" + new_ulid()
+        self.provider_document_ids.append(provider_document_id)
+        credit_code = "USCC" + new_ulid()
+        company_id = "co_" + new_ulid()
+        security_id = "sec_" + new_ulid()
+        self.extra_company_ids.append(company_id)
+        self.extra_security_ids.append(security_id)
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company "
+                    "(company_id, legal_name) VALUES (:company_id, :legal_name)"
+                ),
+                {"company_id": company_id, "legal_name": "Canonical No USCC Co"},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.security "
+                    "(security_id, company_id, security_code, exchange) "
+                    "VALUES (:security_id, :company_id, :security_code, :exchange)"
+                ),
+                {
+                    "security_id": security_id,
+                    "company_id": company_id,
+                    "security_code": "SNU" + provider_document_id[-4:],
+                    "exchange": "LOCAL",
+                },
+            )
+        command = self._command(
+            provider_document_id, self._pdf("security-new-uscc-contested.pdf")
+        )
+        command = RegisterLocalPdfCommand(
+            file_path=command.file_path,
+            company_legal_name="Conflicting No USCC Co",
+            security_code="SNU" + provider_document_id[-4:],
+            exchange="LOCAL",
+            filing_type=command.filing_type,
+            title=command.title,
+            announcement_date=command.announcement_date,
+            provider_document_id=command.provider_document_id,
+            provider=command.provider,
+            report_period=command.report_period,
+            company_credit_code=credit_code,
+        )
+
+        with self.assertRaises(SubjectIdentityConflictError):
+            self.use_case.execute(command)
+
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT status, raw_value, normalized_value "
+                    "FROM disclosure_core.company_identifier "
+                    "WHERE company_id = :company_id "
+                    "AND normalized_value = :normalized_value"
+                ),
+                {"company_id": company_id, "normalized_value": credit_code},
+            ).mappings().one()
+            company_credit_code = conn.execute(
+                text(
+                    "SELECT unified_social_credit_code "
+                    "FROM disclosure_core.company WHERE company_id = :company_id"
+                ),
+                {"company_id": company_id},
+            ).scalar_one()
+            document_count = conn.execute(
+                text(
+                    "SELECT count(*) FROM disclosure_core.document "
+                    "WHERE provider = 'cninfo' AND provider_document_id = :pid"
+                ),
+                {"pid": provider_document_id},
+            ).scalar_one()
+        self.assertEqual(row["status"], "contested")
+        self.assertEqual(row["raw_value"], credit_code)
+        self.assertIsNone(company_credit_code)
+        self.assertEqual(document_count, 0)
+
     def test_identifier_legal_name_mismatch_marks_identifier_contested(self) -> None:
         provider_document_id = "local-" + new_ulid()
         self.provider_document_ids.append(provider_document_id)
