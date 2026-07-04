@@ -588,7 +588,11 @@ tests/contract/test_normalized_ir_contract.py 的 SCHEMA_PATH 改名；(2) 再�
 
 再生成脚本**需新建**：`scripts/regen_phase00_fixtures.py`（scripts/ 目录一并新建）。行为规格：
 对 4 个 sample_key（annual_report_excerpt / ir_activity / short_announcement / annual_report），
-读 `tests/fixtures/phase00/<key>/parser_artifacts_ref.txt` 中 "Content list: " 行的路径，
+读 `tests/fixtures/phase00/<key>/parser_artifacts_ref.txt` 中 "Content list: " 行的路径
+（**特例 annual_report_excerpt**：其 ref 是占位符、盘上无独立产物——输入 = annual_report
+的 content_list 过滤 `page_idx <= 1`（即第 1–2 页，与现 fixture parsed_pages 一致），
+parsed_pages 写 {start:1, end:2, full_pdf:false}；再生成时把该 ref 文件更新为指向
+annual_report 产物 + 页范围说明），
 经 MinerUArtifactReader.read_content_list + MinerUToNormalizedIRMapper.map_content_list
 生成 v2 IR；sample_key=<key>、sample_role 与 document_id 由**脚本注入**（不再由 mapper 注入），
 document_id 必须保持既有值 `"phase00_"+<key>`（document_units.v1.jsonl 的 document_id
