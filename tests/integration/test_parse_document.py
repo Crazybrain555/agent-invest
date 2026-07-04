@@ -245,6 +245,15 @@ class ParseDocumentTests(unittest.TestCase):
                 ),
                 {"id": result.processing_run_id},
             ).one()
+            event = conn.execute(
+                text(
+                    "SELECT event_kind, change_kind, subject_kind, subject_ref "
+                    "FROM disclosure_ops.outbox_event "
+                    "WHERE processing_run_id = :id "
+                    "AND event_kind = 'processing_run_created'"
+                ),
+                {"id": result.processing_run_id},
+            ).one()
         self.assertEqual(row.status, "succeeded")
         self.assertEqual(row.parser_name, "MinerU")
         self.assertEqual(row.parser_version, "3.4.0")
@@ -254,6 +263,10 @@ class ParseDocumentTests(unittest.TestCase):
         self.assertEqual(row.normalized_ir_relpath, result.normalized_ir_relpath)
         self.assertTrue(row.artifact_hash.startswith("sha256:"))
         self.assertFalse(row.is_active)
+        self.assertEqual(event.event_kind, "processing_run_created")
+        self.assertEqual(event.change_kind, "observed")
+        self.assertEqual(event.subject_kind, "processing_run")
+        self.assertEqual(event.subject_ref, result.processing_run_id)
 
     def test_parser_failure_records_failed_run_without_disturbing_active_run(self) -> None:
         document_id = self._register_document()
@@ -297,10 +310,25 @@ class ParseDocumentTests(unittest.TestCase):
                 ),
                 {"id": result.processing_run_id},
             ).one()
+            events = conn.execute(
+                text(
+                    "SELECT event_kind, change_kind, subject_kind, subject_ref, payload "
+                    "FROM disclosure_ops.outbox_event "
+                    "WHERE processing_run_id = :id ORDER BY event_kind"
+                ),
+                {"id": result.processing_run_id},
+            ).mappings().all()
         self.assertEqual(active_status.status, "succeeded")
         self.assertTrue(active_status.is_active)
         self.assertEqual(failed_status.status, "failed")
         self.assertFalse(failed_status.is_active)
+        by_kind = {row["event_kind"]: row for row in events}
+        self.assertEqual(by_kind["processing_run_created"]["change_kind"], "observed")
+        failed_event = by_kind["processing_run_failed"]
+        self.assertEqual(failed_event["change_kind"], "observed")
+        self.assertEqual(failed_event["subject_kind"], "processing_run")
+        self.assertEqual(failed_event["subject_ref"], result.processing_run_id)
+        self.assertEqual(failed_event["payload"]["error"]["error_code"], "ParserError")
 
     def test_raw_hash_mismatch_fails_before_parser_is_called(self) -> None:
         document_id = self._register_document()

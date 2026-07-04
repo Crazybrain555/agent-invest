@@ -313,17 +313,20 @@ def document_unit_to_entity(row: m.DocumentUnit) -> e.DocumentUnit:
 
 
 def outbox_event_to_model(entity: e.OutboxEvent) -> m.OutboxEvent:
-    return m.OutboxEvent(
-        event_id=entity.event_id,
-        event_kind=entity.event_kind,
-        change_kind=entity.change_kind,
-        subject_kind=entity.subject_kind,
-        subject_ref=entity.subject_ref,
-        document_id=entity.document_id,
-        processing_run_id=entity.processing_run_id,
-        asset_id=entity.asset_id,
-        payload=entity.payload,
-    )
+    values = {
+        "event_id": entity.event_id,
+        "event_kind": entity.event_kind,
+        "change_kind": entity.change_kind,
+        "subject_kind": entity.subject_kind,
+        "subject_ref": entity.subject_ref,
+        "document_id": entity.document_id,
+        "processing_run_id": entity.processing_run_id,
+        "asset_id": entity.asset_id,
+        "payload": entity.payload,
+    }
+    if entity.occurred_at is not None:
+        values["occurred_at"] = entity.occurred_at
+    return m.OutboxEvent(**values)
 
 
 def outbox_event_to_entity(row: m.OutboxEvent) -> e.OutboxEvent:

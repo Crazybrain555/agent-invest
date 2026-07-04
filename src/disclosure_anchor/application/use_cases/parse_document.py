@@ -16,6 +16,7 @@ from disclosure_anchor.application.ports.file_store import (
 from disclosure_anchor.application.ports.parser import DocumentParserPort, ParserOptions
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.domain import entities as e
+from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import ParseDocumentError
 
@@ -186,6 +187,13 @@ class ParseDocument:
                     is_active=False,
                 )
             )
+            uow.outbox.add(
+                outbox_events.processing_run_created(
+                    document_id=document.document_id,
+                    processing_run_id=run.processing_run_id,
+                    occurred_at=now,
+                )
+            )
             uow.commit()
 
         return {
@@ -289,8 +297,18 @@ class ParseDocument:
             run.normalized_ir_relpath = normalized_ir_relpath or run.normalized_ir_relpath
             run.artifact_hash = artifact_hash or run.artifact_hash
             run.error = error
-            run.finished_at = datetime.now(timezone.utc)
+            finished_at = datetime.now(timezone.utc)
+            run.finished_at = finished_at
             updated = uow.processing_runs.update(run)
+            if status == "failed" and error is not None:
+                uow.outbox.add(
+                    outbox_events.processing_run_failed(
+                        document_id=run.document_id,
+                        processing_run_id=run.processing_run_id,
+                        error=error,
+                        occurred_at=finished_at,
+                    )
+                )
             uow.commit()
             return updated
 

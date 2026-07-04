@@ -9,6 +9,7 @@ from disclosure_anchor.application.ports.file_store import RawDocumentWriteResul
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.services.subject_resolver import ResolvedSubject
 from disclosure_anchor.domain import entities as e
+from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.value_objects import ReportPeriod
 
@@ -59,19 +60,12 @@ def register_document(
     )
     if existing is not None:
         event = uow.outbox.add(
-            e.OutboxEvent(
-                event_id=ids.new_outbox_event_id(),
-                event_kind="document_observed",
-                change_kind="observed",
-                subject_kind="document",
-                subject_ref=existing.document_id,
+            outbox_events.document_observed(
                 document_id=existing.document_id,
-                payload={
-                    "provider": doc_meta.provider,
-                    "provider_document_id": doc_meta.provider_document_id,
-                    "raw_file_hash": raw.raw_file_hash,
-                    "source_access_id": source_access.source_access_id,
-                },
+                provider=doc_meta.provider,
+                provider_document_id=doc_meta.provider_document_id,
+                raw_file_hash=raw.raw_file_hash,
+                source_access_id=source_access.source_access_id,
                 occurred_at=now,
             )
         )
@@ -106,18 +100,11 @@ def register_document(
         )
     )
     event = uow.outbox.add(
-        e.OutboxEvent(
-            event_id=ids.new_outbox_event_id(),
-            event_kind="document_registered",
-            change_kind="materialized",
-            subject_kind="document",
-            subject_ref=document.document_id,
+        outbox_events.document_registered(
             document_id=document.document_id,
-            payload={
-                "provider": doc_meta.provider,
-                "provider_document_id": doc_meta.provider_document_id,
-                "raw_file_hash": raw.raw_file_hash,
-            },
+            provider=doc_meta.provider,
+            provider_document_id=doc_meta.provider_document_id,
+            raw_file_hash=raw.raw_file_hash,
             occurred_at=now,
         )
     )
