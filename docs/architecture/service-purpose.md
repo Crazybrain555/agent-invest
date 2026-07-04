@@ -145,6 +145,11 @@ parser block
 
 agent 运行时为了控制上下文长度，可以临时合并、截取或拆分内容；这是 context packaging，不是持久化证据对象。
 
+检索策略同理分两层：`document_unit` 是证据锚点（durable semantic retrieval anchor），
+其上可叠加 retrieval/search projection 派生发现层（heading_path_text、keywords、search_text、
+可选 summary），帮助 AI/L2 按语义找到 unit。投影不进 content_hash、不替代 payload、不作为
+证据；不引入 persistent chunk / RAG node / 独立向量库（边界与实现见 milestone 05-U7 / 06R）。
+
 ## 2.4 表格先保留完整结构，不急于全市场标准化
 
 PDF 表格默认保存为完整 `table` 单元：
@@ -859,7 +864,9 @@ order_index
 
 0007 迁移起，`document_units_v1` 以派生投影补齐协议 §3.2 信封最小核（04R-D1，不加存储列）：
 `asset_kind`（常量 document_unit）、`observed_at`（= created_at 别名）、`source_tier`
-（按 §5.1 映射 CASE 派生）、`trace_level`（常量 G0）、`raw_file_hash`（join document）。
+（按 §5.1 映射 CASE 派生）、`trace_level`（常量 G0）、`raw_file_hash`（join document）；
+另投影 `query_projection_hash`（document_unit 存储列，05-U2 查询投影哈希）——0007 新增共
+6 列，32 列全集以 04R-R7 为准。
 
 `asset://` URI（顶层协议 §2.3）只在序列化边界派生，不落存储：
 

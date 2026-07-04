@@ -58,26 +58,33 @@ MODELSCOPE_CACHE 指向外置盘
 
 ## 5. 数据一致性抽样检查
 
-至少支持：
+抽样参数：默认 `--sample 20`（按 raw_file_relpath 排序取前 N ∪ 最新 N），`--full` 全量
+（04R-R6.1）。至少支持：
 
 ```text
 抽样 document.raw_file_relpath 是否存在
 抽样 document.raw_file_hash 是否与文件 bytes 一致
-抽样 processing_run.normalized_ir_relpath 是否存在
+按 run 结局区分（04R-R6.3 / E11）：
+  succeeded run → normalized_ir_relpath 存在且 artifact_hash 匹配
+  failed run    → 只要求结构化 error 存在（合法 JSON），不报 artifact 缺失
+  unit_build_status='succeeded' → document_units_relpath 存在且快照哈希与 DB 聚合一致
 抽样 document_unit.artifact_locator 是否可回指
 每个 document 最多一个 current active run
-outbox seq 单调递增
+outbox seq 单调递增（空洞 → WARN）
+stale running run（超龄阈值经 queries.py helper 施加）→ WARN
+孤儿 raw/artifact 文件 → 报告不报错（05-S8 的 FS-先行 orphan 是合法状态）
 ```
 
-## 6. 输出格式
+## 6. 输出格式与分级
 
-建议输出：
+FAIL/WARN 封闭分级表与退出码以 **milestone 08 §3.6 为唯一权威**
+（FAIL→退出码 1，仅 WARN→0）。建议输出：
 
 ```text
 [PASS] mount sentinel
 [PASS] pg connection
 [FAIL] raw hash mismatch: document_id=...
-[WARN] stale lock: lock=..., age=...
+[WARN] stale running run: processing_run_id=..., age=...
 ```
 
 doctor 失败时不得自动修复数据。自动修复必须单独命令，并需要显式确认。

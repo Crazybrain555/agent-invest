@@ -42,24 +42,31 @@ GET /v1/documents/{document_id}/runs
 GET /v1/documents/{document_id}/units
 GET /v1/units/{asset_id}
 GET /v1/units/{asset_id}/source-ref
+GET /v1/units/{asset_id}/context
 GET /v1/filings/latest
 GET /v1/changes
 ```
 
-检查项：
+检查项（语义细则以 milestone 06 为唯一权威，本清单只列覆盖面）：
 
 ```text
 默认返回 active run
-显式 processing_run_id 可查历史 run
-分页参数存在
+显式 processing_run_id 可查历史 run；单 asset_id 解引用永远可用并携带 is_active_run
+分页参数存在（limit 默认 100 / 上限 1000；keyset 游标语义见 06 §3.2）
 错误响应不泄露内部堆栈
 响应不含绝对路径
-错误码枚举：L1_PROCESSING_REQUIRED / NOT_FOUND / CONTRACT_VERSION_MISMATCH / GONE_SUPERSEDED
-unit 级 DTO 携带派生字段 asset_uri（仅 API 序列化层派生，不入库、不进 *_v1 视图）
-scope keys 过滤参数可用（filing_type / payload_kind / heading_path / semantic_key / quality_status 等）
-0007 起 document_units_v1 追加信封最小核列：asset_kind / observed_at / source_tier / trace_level / raw_file_hash
-0007 起 change_events_v1 追加 change_kind（真实列）/ source / contract_version / subject_ref
-0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref / supersedes 链 / superseded_by_document_id
+错误码枚举：L1_PROCESSING_REQUIRED / NOT_FOUND / CONTRACT_VERSION_MISMATCH /
+           GONE_SUPERSEDED / VALIDATION_ERROR（触发条件见 06 §3.3）
+unit 级 DTO 派生字段全集 = {asset_uri, is_active_run}（仅 API 序列化层派生，
+  不入库、不进 *_v1 视图；schema 收录二者，三方一致断言按 DERIVED 白名单排除）
+scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（数组前缀语义，
+  见 06 §3.8）/ semantic_key / quality_status 等）
+0007 起 document_units_v1 追加 6 列：asset_kind / observed_at / source_tier /
+  trace_level / raw_file_hash / query_projection_hash（32 列全集见 04R-R7）
+0007 起 change_events_v1 追加 change_kind（真实列）/ subject_kind / subject_ref /
+  source / contract_version
+0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref /
+  supersedes 链 / superseded_by_document_id / provider_metadata
 ```
 
 ## 3. Public view 检查

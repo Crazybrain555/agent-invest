@@ -46,8 +46,9 @@ short_announcement.pdf   短公告，验证少量事项型 text/table
 
 ```text
 mineru_raw 或简化 parser output
-normalized_ir.v1.json
-document_units.v1.jsonl
+normalized_ir.v2.json（04R-R5 起；R5 前为 .v1。再生成协议 = 04R §6.4，
+  脚本 scripts/regen_phase00_fixtures.py，document_id 保持 phase00_<key> 不变）
+document_units.v1.jsonl（unit builder 到 05 才存在，04R 阶段禁止再生成）
 manual_review.md
 ```
 

@@ -17,84 +17,170 @@ worker 只做扫描、加锁、调用、重试和报告，不含业务逻辑。
 
 ## 1. 状态模型（04R-D4 枚举是唯一事实源）
 
-worker 队列直接由 DB 状态派生，**不建独立任务表**；判定 SQL 固化为 `ops.*_v1` 内部视图
-（0007-R1 第 10 条，S4）——worker / doctor / 人工排查共用同一套定义，杜绝状态机漂移：
+worker 队列直接由 DB 状态派生，**不建独立任务表**；判定 SQL 固化为 `ops.*_v1` 内部视图，
+worker / doctor / 人工排查共用同一套定义，杜绝状态机漂移。**SQL 权威与迁移归属**：
+五个 0007 视图（pending_parse / pending_build / pending_publish / retryable_failed_run /
+stale_running_run）的完整 SQL 以 **04R-R1 第 10 条为唯一权威**，0007 迁移逐字复制；
+另两个视图 `ops.sync_due_v1` / `ops.pending_download_v1` 由**本 milestone 新建迁移**
+`src/…/migrations/versions/0009_ops_sync_queue_views.py`
+（down_revision="0008_unit_builder_provenance"）创建，只授 app 角色，downgrade 删两视图，
+SQL 定死：
 
 ```text
-队列（ops 视图）          判定
-sync_due                source_checkpoint 窗口上界落后于 now - sync_interval 的 tracked_company
-pending_download_v1     source_access.result_snapshot.candidates 中"未注册 document、
-                        未终态失败"的候选（B6：候选已持久化，crash 后自然恢复）
-pending_parse_v1        document.status IN ('registered','parse_failed') 且无 running run
-                        且（parse_failed 时）最新 failed run 的 error.retryable=true
-                        且 failed run 计数 < MAX_PARSE_RETRIES(默认 3)
-pending_build_v1        processing_run.status='succeeded'
-                        且 unit_build_status IN ('not_started','failed')
-                        且 unit_build_attempt_count < MAX_BUILD_RETRIES(默认 3)
-pending_publish_v1      processing_run.status='succeeded' 且 unit_build_status='succeeded'
-                        且 is_active=false 且（该 run 晚于 document 当前 active run）
-retryable_failed_run_v1 供报告/人工：可重试失败 run 明细
-stale_running_run_v1    processing_run.status='running' 且 started_at < now - STALE_RUN_THRESHOLD
-                        （默认 2×parse timeout）→ 回收：标 failed(error_code='stale_reclaimed',
-                        retryable=true)
+sync_due_v1:
+  SELECT tc.tracked_company_id, tc.company_id, tc.security_id,
+         sc.cursor->>'window_end' AS window_end
+  FROM core.tracked_company tc
+  LEFT JOIN core.source_checkpoint sc
+    ON sc.provider='cninfo' AND sc.scope_key = tc.company_id || ':p_info3015'
+  WHERE tc.status='active'
+  （无 checkpoint 行 → window_end 为 NULL → 视为 due；键名与 07 的写侧格式逐字一致）
+pending_download_v1:
+  候选集 = source_access(provider='cninfo',
+           provider_interface='cninfo:p_info3015', status='ok') 的
+           jsonb_array_elements(result_snapshot->'candidates') AS c，
+           按 c->>'provider_document_id' 去重取 accessed_at 最新一份
+  过滤：NOT EXISTS (SELECT 1 FROM core.document d WHERE d.provider='cninfo'
+        AND d.provider_document_id = c->>'provider_document_id')
+    AND NOT 终态失败（= 存在 provider_interface='cninfo:download_pdf' 且
+        error->>'retryable'='false' 的失败行，或该 provider_document_id 的
+        download 失败行数 ≥ 3——视图暴露 failed_download_count 列，
+        ≥3 的截断由调用方施加）
+  输出列：provider_document_id, download_url, title, announcement_date,
+          source_access_id, failed_download_count
 ```
+
+语义表（0007 五视图，权威 SQL 见 04R-R1.10）：
+
+```text
+pending_parse_v1        document.status IN ('registered','parse_failed') 且无 running run；
+                        暴露 failed_parse_count 与 last_failed_retryable 事实列
+pending_build_v1        run.status='succeeded' 且 unit_build_status IN ('not_started','failed')；
+                        暴露 unit_build_attempt_count
+pending_publish_v1      run.status='succeeded' 且 unit_build_status='succeeded' 且
+                        is_active=false 且晚于当前 active run（无 active run 时恒入队，
+                        COALESCE '-infinity' 已处理）；worker 对同一 document 只处理
+                        started_at 最新一行（ORDER BY started_at DESC, processing_run_id DESC）
+retryable_failed_run_v1 可重试失败 run 明细（error 为 jsonb——0007 已 ALTER）
+stale_running_run_v1    status='running' 的 run 全集，暴露 started_at
+```
+
+**阈值策略（与 04R-R1.10 一致）**：视图只暴露事实列，不内嵌阈值；阈值全部来自 settings——
+`DISCLOSURE_MAX_PARSE_RETRIES=3`、`DISCLOSURE_MAX_BUILD_RETRIES=3`、
+`DISCLOSURE_STALE_RUN_THRESHOLD_SECONDS=3600`（=2×parse timeout 默认值的固定折算）、
+`DISCLOSURE_SYNC_INTERVAL_SECONDS=86400`（首版忽略 tracked_company.sync_frequency 列，
+全局间隔统一生效）。防漂移：阈值过滤统一实现在 `application/worker/queries.py` 的查询
+helper（每视图一个函数，SELECT … FROM ops.<view> WHERE <阈值谓词>），worker 与 doctor
+都只经该 helper 读队列，禁止各自手写判定。
 
 注意（B1）：published 文档的重解析失败**不出现**在 pending_parse 的降级路径里——document.status
 保持 published，重试判定基于 run 层状态；`non_retryable` 与超次失败只进报告与人工待办。
+stale 回收的执行载体定死：run_once 第一步经 queries.py 执行单条 UPDATE——
+`UPDATE core.processing_run SET status='failed', finished_at=now(),
+ error='{"stage":"parse","error_code":"stale_reclaimed","retryable":true}'::jsonb
+ WHERE processing_run_id IN (SELECT processing_run_id FROM ops.stale_running_run_v1
+ WHERE started_at < now() - make_interval(secs => :threshold))`；回收数计入 WorkerReport。
 
 ## 2. 并发与锁
 
 - **worker 单例锁**：进程持有一条**专用连接**（不走连接池），其上
   `pg_try_advisory_lock(WORKER_NS, 0)`（session 级），拿不到即退出；连接随进程存活，
-  进程崩溃锁自动释放。专用连接是关键——池化连接的 session 锁会泄漏（E6）。
-- **document 级锁**：两参形式 `pg_try_advisory_xact_lock(DOC_NS, stable_hash(document_id))`，
-  `stable_hash` 用 Python 侧 crc32（显式、跨版本稳定，不用 PG `hashtext` 内部函数）；
+  进程崩溃锁自动释放。专用连接的获得方式定死（E6：从业务 engine 取连接会随归还回池而
+  泄漏 session 锁）：`create_engine(url, poolclass=sqlalchemy.pool.NullPool)` 上
+  `engine.connect()` 一条，由 cli/worker.py 持有至进程退出；禁止使用业务 engine 的池化连接。
+- **document 级锁**：两参形式 `pg_try_advisory_xact_lock(DOC_NS, stable_hash(document_id))`；
+  常量定死（worker.py 顶部导出，测试/doctor 按 pg_locks.classid 断言同值）：
+  `WORKER_NS = 815001`、`DOC_NS = 815002`。stable_hash 定死（crc32 是无符号 0..2^32-1，
+  直接传 int4 会 integer out of range）：
+  `h = zlib.crc32(document_id.encode('utf-8')); return h - 2**32 if h >= 2**31 else h`。
   在每个**改写该 document 状态的事务内**获取（register 复用 / finish_run / publish），
   事务结束自动释放。跨事务的整文档互斥由单例锁 + status 声明式判定保证，不做长持锁。
 - 不引入 Redis/文件锁。
 
 ## 3. 实施细则
 
-1. `application/worker/worker.py`：`run_once(limits) -> WorkerReport`——按 §1 队列顺序
-   （stale 回收 → sync → download → parse/retry → build → publish）各处理至多 N 个
-   （settings：`WORKER_BATCH_*`，默认 sync 5 / download 10 / parse 3 / build 10 / publish 10；
-   parse 串行执行，MinerU 吃满单机资源）。**每个 document 的处理包裹在 try/except**：
-   use case 异常（含 re-raise 的未知异常）记入报告失败清单后继续下一个——
-   一个坏 PDF 不得打死整个 loop（04R-R4 的异常分型保证 run 已持久化 failed 状态）。
+1. `application/worker/worker.py`：`run_once(limits, deps) -> WorkerReport`——按 §1 队列顺序
+   （stale 回收 → sync → download → parse → build → publish）各处理至多 N 个。
+   既有空包 src/disclosure_anchor/worker/（Phase01 骨架遗留）删除，实现统一放
+   application/worker/。类型定死：WorkerLimits 与 WorkerReport 定义在
+   `application/dto/worker_report.py`——WorkerLimits{sync, download, parse, build,
+   publish: int}（由 settings 组装：WORKER_BATCH_SYNC=5 / WORKER_BATCH_DOWNLOAD=10 /
+   WORKER_BATCH_PARSE=3 / WORKER_BATCH_BUILD=10 / WORKER_BATCH_PUBLISH=10，按 settings.py
+   现有"小写字段 + AliasChoices 大写别名"模式，同步 .env.template）；
+   WorkerReport{started_at, duration_seconds, stale_reclaimed, synced_companies,
+   candidates_discovered, downloaded, parsed, built, published, failed,
+   failures: list[WorkerFailure]}，WorkerFailure={stage, document_id|item_ref, error_code}。
+   依赖注入定死：deps = WorkerDeps{engine, source_port_factory, parser_factory, clock}，
+   生产 wiring 在 cli/worker.py 经 bootstrap 组装；集成测试注入 FakeCninfoSource 与
+   fake parser，全程不出网。
+   阶段↔use case 接法定死：parse 阶段对 pending_parse 的每个 document 调 **05 的 process**
+   （parse→build→publish 串行——检查点"含 05 process"即此意）；build/publish 队列只消化
+   process 中断留下的残留，分别调 build_units / publish_run。parse 串行执行，
+   MinerU 吃满单机资源。
+   异常隔离粒度按阶段定死：sync=每 tracked_company、download=每候选、
+   parse/build/publish=每 document；单项异常记入失败清单（含 stage 与标识）后 continue——
+   一个坏项不得打死整个 loop（04R-R4 的异常分型保证 run 已持久化 failed 状态）。
 2. `worker-loop`：`run_once` + sleep（`WORKER_LOOP_INTERVAL_SECONDS` 默认 900）循环；
    SIGINT/SIGTERM 优雅退出（完成当前 document 后停）。
 3. 重试策略只读结构化错误：`error.retryable`（04R-R4 已收紧分类）+ 次数上限；
    worker 不自行解释错误文本。
-4. 报告：每轮写 `runtime/reports/worker/<date>.md`（发现/下载/解析/发布/失败计数、
-   失败清单含 document_id + error_code、耗时）；`runtime/reports/parse_quality/<date>.md`
-   （needs_review/unusable unit 统计、builder 跳过统计——05 的 build 统计直接汇入）。
-   报告目录在 `DISCLOSURE_RUNTIME_ROOT` 下，不进 git。
-5. 命令：`make worker-once` / `make worker-loop`；`python -m disclosure_anchor.cli.worker`。
-6. doctor 深检（04R-R6 的抽样一致性 + stale run + 孤儿文件）建议每日一次：
-   `make doctor-full`，可与 worker-loop 独立运行。
-7. launchd plist 示例（`docs/implementation/runbooks/` 附带，默认不启用）：worker-once
-   定时执行样式，符合协议 §15"定时批处理、人工拉起"。
+4. 报告路径与写入语义定死：`<DISCLOSURE_RUNTIME_ROOT>/reports/worker/YYYY-MM-DD.md` 与
+   `<DISCLOSURE_RUNTIME_ROOT>/reports/parse_quality/YYYY-MM-DD.md`（date = 本地时区的轮次
+   开始日期；**同日多轮追加写入**，每轮一个 `## run <ISO8601 开始时间>` 小节——覆盖式写法会让
+   挂机一晚只剩最后一轮）。内容：WorkerReport 全字段 + 失败清单（document_id + error_code）；
+   parse_quality 汇入 05 的 build_stats.v1.json 统计。不进 git。
+5. CLI 与 Makefile 定死：cli/worker.py 用 argparse 子命令 `once|loop`；Makefile 追加
+   （并入 .PHONY）：
+   `worker-once:` → `PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker once`
+   `worker-loop:` → `PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker loop`
+   `doctor-full:` → `PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor --full`
+   拿不到单例锁的行为定死：stdout 打印 `[skip] another worker holds the singleton lock`，
+   **退出码 0**（launchd/make 不得把正常互斥当失败），不写报告文件。
+6. doctor 深检建议每日一次（可与 worker-loop 独立运行）。FAIL/WARN 分级封闭表：
+   FAIL = PG 不通 / migration 非 head / 三 schema 或角色权限缺 / 同 document >1 active run /
+   succeeded run 缺 normalized_ir 或 artifact_hash 不匹配 / unit_build_status='succeeded'
+   但快照文件缺失；
+   WARN = stale running run 存在 / 孤儿 raw、artifact 文件 / outbox seq 有空洞 /
+   failed run 的 error 非合法 JSON。
+   退出码：有 FAIL→1，仅 WARN→0。
+7. launchd plist 示例定死：`docs/implementation/runbooks/
+   com.agentinvest.disclosure-anchor.worker-once.plist`（Label 同文件名去 .plist，
+   ProgramArguments 调 make worker-once，StartCalendarInterval 每日 07:30；默认不启用），
+   符合协议 §15"定时批处理、人工拉起"。
 
 ## 4. 检查点
 
 - `make worker-once` 能把一个 pending document 从 registered 跑到 active run（含 05 process）。
-- 队列视图与 worker 行为一致（对 ops.*_v1 视图行断言，同一 SQL 定义）。
+- 队列视图与 worker 行为一致（对 ops.*_v1 视图行断言；worker 只经 queries.py helper 读队列）。
 - 注入抛异常的坏 PDF：该 document 进失败清单，loop 继续处理后续 document。
-- 两个并发 worker-once：第二个立即退出（单例锁）；同一 document 不被并发处理（文档锁）。
-- worker 崩溃（kill -9 注入）后：raw archive 完好、无僵尸锁、stale run 下轮被回收重试。
+- 两个并发 worker-once：第二个 returncode==0、stdout 含 `[skip] another worker holds the
+  singleton lock`、reports/worker/ 无新增小节；同一 document 不被并发处理（文档锁）。
+- kill -9 注入程序定死：subprocess.Popen 启 worker once（注入 sleep 的 fake parser 使 run
+  停在 running），os.kill(pid, SIGKILL)；随后新连接断言
+  `SELECT count(*)=0 FROM pg_locks WHERE locktype='advisory'`；doctor raw hash 检查 PASS；
+  用 UPDATE started_at 提前模拟超龄后再跑 run_once，该 run status='failed' 且
+  error_code='stale_reclaimed'。
 - retryable=false 的失败不再重试且出现在报告失败清单。
-- 报告数字与 DB 实际状态一致（对账测试）。
-- doctor 能发现 active run 冲突与 stale running run。
+- 对账断言组定死（run_once 前后各查一次）：report.parsed == status='succeeded' run 行数增量；
+  report.failed == status='failed' 行数增量；report.published == 本轮新置 is_active=true 的
+  run 数；report.downloaded == 本轮新增 document 行数。
+- doctor 能发现 active run 冲突（FAIL）与 stale running run（WARN），退出码符合 §3.6。
 
 ## 5. 测试要求
 
-单测：队列判定 SQL（各状态样本）、重试次数/门槛、报告聚合。
-集成（DB-gated）：run_once 全链（用 fake parser 加速）、并发锁语义（两连接）、
-stale 回收、崩溃恢复（事务中断后状态一致）。
+队列判定测试放 **tests/integration/test_ops_queue_views.py（DB-gated）**——视图是 DB 对象，
+no-DB 单测测不到：为每个视图构造正/反例行（必含三个反例：pending_publish 无 active run 的
+文档恒入队、pending_parse retryable=false 被 helper 阈值排除、超次数被排除），断言视图行集。
+tests/unit 只测 run_once 的调度/报告聚合（fake 队列结果）与 stable_hash 有符号转换。
+集成（DB-gated）：run_once 全链（注入 WorkerDeps 的 FakeCninfoSource + fake parser，
+全程不出网）、并发锁语义（两连接断言 classid=815001/815002）、stale 回收、
+崩溃恢复（事务中断后状态一致）、0009 迁移往返（照 04R §6.2 命令样式）。
 
 ## 6. Definition of Done
 
-- 本地运行闭环成立：`worker-loop` 挂机一晚（或模拟等价），10 家样本池增量公告自动到 active run；
+- 本地运行闭环成立：`worker-loop` 挂机一晚，或模拟等价（定义定死：
+  WORKER_LOOP_INTERVAL_SECONDS=60 连续运行 ≥30 分钟，期间分两批注入 ≥3 个新候选
+  （fake source 或本地 register），全部自动到 active run 且报告文件含 ≥3 个轮次小节）；
 - 失败可恢复、可定位；acceptance-matrix A29/A30 置 pass。
 
 ## 7. 明确不做
