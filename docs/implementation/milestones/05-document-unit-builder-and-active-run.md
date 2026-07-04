@@ -215,7 +215,10 @@ quality_status='needs_review'。跨页表合并：相邻 table 元素间无非�
 表头候选行——逐 cell str.strip() 相等的行不得当数据行），payload 记
 `merge_reason='continued_table'` 与 page span（artifact_locator）；合并失败标 needs_review，
 不阻塞其他 unit（不确定即不合并）。"列数相同"定死：列数 = len(rows[0])（IR headers 非空时
-= len(headers)）；前后表该值相等才允许合并。
+= len(headers)）；前后表该值相等才允许合并。**空表元素在合并判定中视为噪声**（headers 与
+rows 均空且 table_html 为空——2026-07-05 实测这是 MinerU 在续页页首表头带产出的无内容碎片，
+真实年报 75/473、审计报告 55/256）：跳过它、不阻断其前后真实表段的相邻性，计入 build 统计
+（dropped_by_kind.table_empty），不生成 unit。
 ```
 
 **S6 保留/跳过（service-purpose §9 + 红线）**：规则表驱动，首版跳过规则封闭定死：
