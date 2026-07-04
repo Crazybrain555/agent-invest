@@ -11,7 +11,7 @@ from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
 from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
 from disclosure_anchor.application.ports.parser import ParserOptions
-from disclosure_anchor.domain.errors import ParserError
+from disclosure_anchor.domain.errors import ParserVersionProbeError
 
 
 class MinerUProcessTests(unittest.TestCase):
@@ -100,7 +100,7 @@ class MinerUMapperTests(unittest.TestCase):
 
 
 class MinerUDocumentParserTests(unittest.TestCase):
-    def test_version_probe_failure_does_not_fail_successful_parse(self) -> None:
+    def test_version_probe_failure_fails_closed(self) -> None:
         class VersionFailingProcess:
             def run(self, *, input_pdf: Path, output_dir: Path, options: ParserOptions):
                 nested = output_dir / "sample" / "auto"
@@ -111,7 +111,7 @@ class MinerUDocumentParserTests(unittest.TestCase):
                 )
 
             def version(self) -> str:
-                raise ParserError("version failed")
+                raise ParserVersionProbeError("version failed")
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -119,20 +119,17 @@ class MinerUDocumentParserTests(unittest.TestCase):
             input_pdf.write_bytes(b"%PDF-1.4\nsample\n%%EOF\n")
             parser = MinerUDocumentParser(process=VersionFailingProcess())
 
-            result = parser.parse(
-                input_pdf=input_pdf,
-                output_dir=root / "out",
-                options=ParserOptions(),
-                document_metadata={
-                    "document_id": "doc_01K0000000000000000000000",
-                    "source_pdf": "raw_documents/local/sample.pdf",
-                    "title": "sample",
-                },
-            )
-
-        self.assertEqual(result.parser_version, "unknown")
-        self.assertEqual(result.normalized_ir["warnings"], ["version_probe_failed"])
-        self.assertEqual(result.normalized_ir["elements"][0]["text"], "hello")
+            with self.assertRaises(ParserVersionProbeError):
+                parser.parse(
+                    input_pdf=input_pdf,
+                    output_dir=root / "out",
+                    options=ParserOptions(),
+                    document_metadata={
+                        "document_id": "doc_01K0000000000000000000000",
+                        "source_pdf": "raw_documents/local/sample.pdf",
+                        "title": "sample",
+                    },
+                )
 
 
 if __name__ == "__main__":

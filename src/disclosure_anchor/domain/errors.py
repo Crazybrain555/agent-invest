@@ -43,5 +43,25 @@ class ParserError(DisclosureAnchorError):
     """Raised when parser execution or artifact mapping fails."""
 
 
+class ParserTimeoutError(ParserError):
+    """Raised when parser execution exceeds the configured timeout."""
+
+
+class ParserInvocationError(ParserError):
+    """Raised when parser process invocation fails."""
+
+
+class ParserVersionProbeError(ParserError):
+    """Raised when parser version probing fails."""
+
+
+class ParserOutputContractError(ParserError):
+    """Raised when parser output artifacts violate the adapter contract."""
+
+
+class ParserUnknownError(ParserError):
+    """Raised when a parser adapter wraps an unexpected parser failure."""
+
+
 class ParseDocumentError(DisclosureAnchorError):
     """Raised when a document cannot be parsed under the current contract."""

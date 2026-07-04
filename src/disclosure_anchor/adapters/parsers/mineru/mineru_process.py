@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from disclosure_anchor.application.ports.parser import ParserOptions
-from disclosure_anchor.domain.errors import ParserError
+from disclosure_anchor.domain.errors import (
+    ParserInvocationError,
+    ParserTimeoutError,
+    ParserVersionProbeError,
+)
 
 
 @dataclass(frozen=True)
@@ -66,15 +70,21 @@ class MinerUProcess:
                 env=self._env(),
             )
         except (OSError, subprocess.CalledProcessError) as exc:
-            raise ParserError(f"MinerU version probe failed: {self._executable}") from exc
+            raise ParserVersionProbeError(
+                f"MinerU version probe failed: {self._executable}"
+            ) from exc
         output = (completed.stdout or completed.stderr).strip()
-        return output or "unknown"
+        if not output:
+            raise ParserVersionProbeError(
+                f"MinerU version probe returned no output: {self._executable}"
+            )
+        return output
 
     def run(
         self, *, input_pdf: Path, output_dir: Path, options: ParserOptions
     ) -> MinerUProcessResult:
         if not input_pdf.is_file():
-            raise ParserError(f"parser input PDF is missing: {input_pdf}")
+            raise ParserInvocationError(f"parser input PDF is missing: {input_pdf}")
         output_dir.mkdir(parents=True, exist_ok=True)
         try:
             completed = subprocess.run(
@@ -86,11 +96,13 @@ class MinerUProcess:
                 env=self._env(),
             )
         except subprocess.TimeoutExpired as exc:
-            raise ParserError(f"MinerU timed out after {options.timeout_seconds}s") from exc
+            raise ParserTimeoutError(
+                f"MinerU timed out after {options.timeout_seconds}s"
+            ) from exc
         except (OSError, subprocess.CalledProcessError) as exc:
             stderr = getattr(exc, "stderr", None)
             detail = f": {stderr.strip()}" if stderr else ""
-            raise ParserError(f"MinerU parse failed{detail}") from exc
+            raise ParserInvocationError(f"MinerU parse failed{detail}") from exc
         return MinerUProcessResult(
             output_dir=output_dir,
             stdout=completed.stdout,

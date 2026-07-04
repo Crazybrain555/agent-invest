@@ -25,11 +25,21 @@ class ParserOptions:
 
 
 @dataclass(frozen=True)
+class ParserIdentity:
+    name: str
+    version: str
+    backend: str
+    method: str
+    language: str
+
+
+@dataclass(frozen=True)
 class ParserResult:
     parser_name: str
     parser_version: str
     parser_backend: str
     parser_method: str
+    parser_language: str
     artifact_root: Path
     content_list_path: Path
     markdown_path: Path | None
@@ -37,6 +47,9 @@ class ParserResult:
 
 
 class DocumentParserPort(Protocol):
+    def identity(self) -> ParserIdentity:
+        ...
+
     def parse(
         self,
         *,

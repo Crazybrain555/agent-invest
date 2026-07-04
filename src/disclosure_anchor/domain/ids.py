@@ -37,7 +37,7 @@ def _encode_crockford(value: int, length: int) -> str:
 
 
 def new_ulid() -> str:
-    """Create a monotonic-sortable ULID string using stdlib primitives."""
+    """Create a millisecond time-sortable ULID string using stdlib primitives."""
 
     timestamp_ms = int(time.time() * 1000)
     if timestamp_ms >= 1 << 48:

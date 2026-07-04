@@ -58,6 +58,17 @@ class Settings(BaseSettings):
     modelscope_cache: Path = Field(
         validation_alias=AliasChoices("MODELSCOPE_CACHE", "modelscope_cache")
     )
+    disclosure_parse_timeout_seconds: int = Field(
+        default=1800,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_PARSE_TIMEOUT_SECONDS",
+            "disclosure_parse_timeout_seconds",
+        ),
+    )
+    disclosure_mineru_bin: Optional[Path] = Field(
+        default=None,
+        validation_alias=AliasChoices("DISCLOSURE_MINERU_BIN", "disclosure_mineru_bin"),
+    )
     cninfo_access_key: Optional[SecretStr] = Field(
         default=None,
         validation_alias=AliasChoices("CNINFO_ACCESS_KEY", "cninfo_access_key"),

@@ -15,7 +15,11 @@ from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOf
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
-from disclosure_anchor.application.ports.parser import ParserOptions, ParserResult
+from disclosure_anchor.application.ports.parser import (
+    ParserIdentity,
+    ParserOptions,
+    ParserResult,
+)
 from disclosure_anchor.application.use_cases.parse_document import (
     ParseDocument,
     ParseDocumentCommand,
@@ -26,7 +30,7 @@ from disclosure_anchor.application.use_cases.register_local_pdf import (
 )
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
-from disclosure_anchor.domain.errors import ParserError
+from disclosure_anchor.domain.errors import ParserInvocationError, ParserVersionProbeError
 from disclosure_anchor.settings import Settings
 from tests.integration._support import engine_or_skip
 
@@ -45,6 +49,15 @@ def _settings(root: Path) -> Settings:
 
 
 class FakeParser:
+    def identity(self) -> ParserIdentity:
+        return ParserIdentity(
+            name="MinerU",
+            version="3.4.0",
+            backend="pipeline",
+            method="auto",
+            language="ch",
+        )
+
     def parse(
         self,
         *,
@@ -67,6 +80,7 @@ class FakeParser:
             parser_version="3.4.0",
             parser_backend=options.backend,
             parser_method=options.method,
+            parser_language=options.language,
             artifact_root=nested,
             content_list_path=content_list,
             markdown_path=markdown,
@@ -103,8 +117,29 @@ class FakeParser:
 
 
 class FailingParser:
+    def identity(self) -> ParserIdentity:
+        return ParserIdentity(
+            name="MinerU",
+            version="3.4.0",
+            backend="pipeline",
+            method="auto",
+            language="ch",
+        )
+
     def parse(self, **_: Any) -> ParserResult:
-        raise ParserError("parser failed for test")
+        raise ParserInvocationError("parser failed for test")
+
+
+class IdentityFailingParser:
+    def __init__(self) -> None:
+        self.called = False
+
+    def identity(self) -> ParserIdentity:
+        raise ParserVersionProbeError("version probe failed for test")
+
+    def parse(self, **_: Any) -> ParserResult:
+        self.called = True
+        raise AssertionError("parse must not run after identity probe failure")
 
 
 class TrackingParser(FakeParser):
@@ -239,7 +274,8 @@ class ParseDocumentTests(unittest.TestCase):
             row = conn.execute(
                 text(
                     "SELECT status, parser_name, parser_version, parser_backend, "
-                    "input_raw_file_hash, parser_artifact_relpath, normalized_ir_relpath, "
+                    "parser_method, parser_language, input_raw_file_hash, "
+                    "parser_artifact_relpath, normalized_ir_relpath, "
                     "artifact_hash, is_active "
                     "FROM disclosure_core.processing_run WHERE processing_run_id = :id"
                 ),
@@ -254,10 +290,19 @@ class ParseDocumentTests(unittest.TestCase):
                 ),
                 {"id": result.processing_run_id},
             ).one()
+            document_status = conn.execute(
+                text(
+                    "SELECT status FROM disclosure_core.document "
+                    "WHERE document_id = :id"
+                ),
+                {"id": document_id},
+            ).scalar_one()
         self.assertEqual(row.status, "succeeded")
         self.assertEqual(row.parser_name, "MinerU")
         self.assertEqual(row.parser_version, "3.4.0")
         self.assertEqual(row.parser_backend, "pipeline")
+        self.assertEqual(row.parser_method, "auto")
+        self.assertEqual(row.parser_language, "ch")
         self.assertTrue(row.input_raw_file_hash.startswith("sha256:"))
         self.assertEqual(row.parser_artifact_relpath, result.parser_artifact_relpath)
         self.assertEqual(row.normalized_ir_relpath, result.normalized_ir_relpath)
@@ -267,6 +312,7 @@ class ParseDocumentTests(unittest.TestCase):
         self.assertEqual(event.change_kind, "observed")
         self.assertEqual(event.subject_kind, "processing_run")
         self.assertEqual(event.subject_ref, result.processing_run_id)
+        self.assertEqual(document_status, "parsed")
 
     def test_parser_failure_records_failed_run_without_disturbing_active_run(self) -> None:
         document_id = self._register_document()
@@ -281,6 +327,10 @@ class ParseDocumentTests(unittest.TestCase):
                     is_active=True,
                 )
             )
+            document = uow.documents.get(document_id)
+            document.status = "published"
+            document.current_processing_run_id = active_run_id
+            uow.documents.update(document)
             uow.commit()
 
         use_case = ParseDocument(
@@ -318,17 +368,82 @@ class ParseDocumentTests(unittest.TestCase):
                 ),
                 {"id": result.processing_run_id},
             ).mappings().all()
+            document_status = conn.execute(
+                text(
+                    "SELECT status, current_processing_run_id "
+                    "FROM disclosure_core.document WHERE document_id = :id"
+                ),
+                {"id": document_id},
+            ).one()
         self.assertEqual(active_status.status, "succeeded")
         self.assertTrue(active_status.is_active)
         self.assertEqual(failed_status.status, "failed")
         self.assertFalse(failed_status.is_active)
+        self.assertEqual(document_status.status, "published")
+        self.assertEqual(document_status.current_processing_run_id, active_run_id)
         by_kind = {row["event_kind"]: row for row in events}
         self.assertEqual(by_kind["processing_run_created"]["change_kind"], "observed")
         failed_event = by_kind["processing_run_failed"]
         self.assertEqual(failed_event["change_kind"], "observed")
         self.assertEqual(failed_event["subject_kind"], "processing_run")
         self.assertEqual(failed_event["subject_ref"], result.processing_run_id)
-        self.assertEqual(failed_event["payload"]["error"]["error_code"], "ParserError")
+        self.assertEqual(
+            failed_event["payload"]["error"]["error_code"], "parser_invocation_failed"
+        )
+
+    def test_parser_identity_probe_failure_fails_closed_before_parse(self) -> None:
+        document_id = self._register_document()
+        parser = IdentityFailingParser()
+        use_case = ParseDocument(
+            parser=parser,
+            path_builder=self.paths,
+            raw_store=self.raw_store,
+            artifact_store=self.artifact_store,
+            uow_factory=lambda: SqlAlchemyUnitOfWork(engine=self.engine),
+        )
+
+        result = use_case.execute(ParseDocumentCommand(document_id=document_id))
+
+        self.assertEqual(result.status, "failed")
+        self.assertFalse(parser.called)
+        self.assertIsNotNone(result.error)
+        self.assertEqual(result.error["stage"], "parser_identity")
+        self.assertEqual(result.error["error_code"], "parser_version_probe_failed")
+        self.assertFalse(result.error["retryable"])
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT status, parser_name, parser_version, parser_backend, "
+                    "parser_method, parser_language, error "
+                    "FROM disclosure_core.processing_run WHERE processing_run_id = :id"
+                ),
+                {"id": result.processing_run_id},
+            ).mappings().one()
+            document_status = conn.execute(
+                text(
+                    "SELECT status FROM disclosure_core.document "
+                    "WHERE document_id = :id"
+                ),
+                {"id": document_id},
+            ).scalar_one()
+            event_count = conn.execute(
+                text(
+                    "SELECT count(*) FROM disclosure_ops.outbox_event "
+                    "WHERE processing_run_id = :id "
+                    "AND event_kind IN "
+                    "('processing_run_created', 'processing_run_failed')"
+                ),
+                {"id": result.processing_run_id},
+            ).scalar_one()
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["parser_name"], "IdentityFailingParser")
+        self.assertIsNone(row["parser_version"])
+        self.assertEqual(row["parser_backend"], "pipeline")
+        self.assertEqual(row["parser_method"], "auto")
+        self.assertEqual(row["parser_language"], "ch")
+        self.assertEqual(row["error"]["error_code"], "parser_version_probe_failed")
+        self.assertEqual(document_status, "parse_failed")
+        self.assertEqual(event_count, 2)
 
     def test_raw_hash_mismatch_fails_before_parser_is_called(self) -> None:
         document_id = self._register_document()

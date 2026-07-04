@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,7 +18,14 @@ from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain import ids
-from disclosure_anchor.domain.errors import ParseDocumentError
+from disclosure_anchor.domain.errors import (
+    ParseDocumentError,
+    ParserInvocationError,
+    ParserOutputContractError,
+    ParserTimeoutError,
+    ParserUnknownError,
+    ParserVersionProbeError,
+)
 
 
 @dataclass(frozen=True)
@@ -56,21 +63,34 @@ class ParseDocument:
         raw_store: RawDocumentStorePort,
         artifact_store: ArtifactStorePort,
         uow_factory: Callable[[], UnitOfWork],
+        default_timeout_seconds: int = 1800,
     ) -> None:
         self._parser = parser
         self._paths = path_builder
         self._raw_store = raw_store
         self._artifact_store = artifact_store
         self._uow_factory = uow_factory
+        self._default_timeout_seconds = default_timeout_seconds
 
     def execute(self, command: ParseDocumentCommand) -> ParseDocumentResult:
-        context = self._prepare_run(command.document_id)
+        options = self._effective_options(command.options)
+        context = self._prepare_run(command.document_id, options)
+        if context.get("prepare_failed"):
+            run = context["run"]
+            return ParseDocumentResult(
+                processing_run_id=run.processing_run_id,
+                status=run.status,
+                parser_artifact_relpath=run.parser_artifact_relpath,
+                normalized_ir_relpath=run.normalized_ir_relpath,
+                artifact_hash=run.artifact_hash,
+                error=run.error,
+            )
         try:
             self._verify_raw_document(context)
             parser_result = self._parser.parse(
                 input_pdf=context["input_pdf"],
                 output_dir=context["artifact_root_path"],
-                options=command.options,
+                options=options,
                 document_metadata=context["document_metadata"],
             )
             artifact_relpaths = self._artifact_relpaths(
@@ -80,27 +100,36 @@ class ParseDocument:
                 content_list_path=parser_result.content_list_path,
                 markdown_path=parser_result.markdown_path,
             )
-            parser_result.normalized_ir["parser_artifacts"] = artifact_relpath_map(
+            normalized_ir = dict(parser_result.normalized_ir)
+            normalized_ir["parser_artifacts"] = artifact_relpath_map(
                 artifact_root_relpath=artifact_relpaths["artifact_root"],
                 content_list_relpath=artifact_relpaths["content_list"],
                 markdown_relpath=artifact_relpaths["markdown"],
             )
+            parsed_pages = dict(normalized_ir.get("parsed_pages") or {})
+            parsed_pages["full_pdf"] = (
+                options.start_page is None and options.end_page is None
+            )
+            normalized_ir["parsed_pages"] = parsed_pages
             normalized_ir_result = self._artifact_store.write_json_atomic(
                 relpath=context["normalized_ir_relpath"],
-                payload=parser_result.normalized_ir,
+                payload=normalized_ir,
             )
             normalized_ir_hash = normalized_ir_result.artifact_hash
-        except _ParseRunFailure as exc:
-            run = self._finish_run(
-                processing_run_id=context["processing_run_id"],
-                status="failed",
-                error=self._structured_error(
-                    stage=exc.stage,
-                    error_code=exc.error_code,
-                    retryable=exc.retryable,
-                    message=exc.message,
-                ),
+        except (
+            _ParseRunFailure,
+            ParserTimeoutError,
+            ParserInvocationError,
+            ParserVersionProbeError,
+            ParserOutputContractError,
+            ParserUnknownError,
+        ) as exc:
+            failure = (
+                exc
+                if isinstance(exc, _ParseRunFailure)
+                else self._parser_failure_from_exception(exc)
             )
+            run = self._finish_failed_run(context=context, failure=failure)
             return ParseDocumentResult(
                 processing_run_id=run.processing_run_id,
                 status=run.status,
@@ -110,24 +139,16 @@ class ParseDocument:
                 error=run.error,
             )
         except Exception as exc:
-            run = self._finish_run(
-                processing_run_id=context["processing_run_id"],
-                status="failed",
-                error=self._structured_error(
+            self._finish_failed_run(
+                context=context,
+                failure=_ParseRunFailure(
                     stage="parse",
                     error_code=exc.__class__.__name__,
-                    retryable=True,
+                    retryable=False,
                     message=str(exc),
                 ),
             )
-            return ParseDocumentResult(
-                processing_run_id=run.processing_run_id,
-                status=run.status,
-                parser_artifact_relpath=run.parser_artifact_relpath,
-                normalized_ir_relpath=run.normalized_ir_relpath,
-                artifact_hash=run.artifact_hash,
-                error=run.error,
-            )
+            raise
 
         run = self._finish_run(
             processing_run_id=context["processing_run_id"],
@@ -135,6 +156,8 @@ class ParseDocument:
             parser_name=parser_result.parser_name,
             parser_version=parser_result.parser_version,
             parser_backend=parser_result.parser_backend,
+            parser_method=parser_result.parser_method,
+            parser_language=parser_result.parser_language,
             input_raw_file_hash=context["document"].raw_file_hash,
             parser_artifact_relpath=str(artifact_relpaths["artifact_root"]),
             normalized_ir_relpath=str(context["normalized_ir_relpath"]),
@@ -148,7 +171,12 @@ class ParseDocument:
             artifact_hash=run.artifact_hash,
         )
 
-    def _prepare_run(self, document_id: str) -> dict[str, Any]:
+    def _effective_options(self, options: ParserOptions) -> ParserOptions:
+        if options.timeout_seconds is not None:
+            return options
+        return replace(options, timeout_seconds=self._default_timeout_seconds)
+
+    def _prepare_run(self, document_id: str, options: ParserOptions) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         processing_run_id = ids.new_processing_run_id()
         with self._uow_factory() as uow:
@@ -174,16 +202,37 @@ class ParseDocument:
                 provider_document_id=document.provider_document_id,
                 processing_run_id=processing_run_id,
             )
+            prepare_error: dict[str, Any] | None = None
+            try:
+                identity = self._parser.identity()
+                parser_name = identity.name
+                parser_version = identity.version
+            except ParserVersionProbeError as exc:
+                parser_name = self._parser.__class__.__name__
+                parser_version = None
+                prepare_error = self._structured_error(
+                    stage="parser_identity",
+                    error_code="parser_version_probe_failed",
+                    retryable=False,
+                    message=str(exc),
+                )
             run = uow.processing_runs.add(
                 e.ProcessingRun(
                     processing_run_id=processing_run_id,
                     document_id=document.document_id,
                     run_kind="parse",
-                    status="running",
+                    status="failed" if prepare_error else "running",
+                    parser_name=parser_name,
+                    parser_version=parser_version,
+                    parser_backend=options.backend,
+                    parser_method=options.method,
+                    parser_language=options.language,
                     input_raw_file_hash=document.raw_file_hash,
                     parser_artifact_relpath=str(artifact_root_relpath),
                     normalized_ir_relpath=str(normalized_ir_relpath),
                     started_at=now,
+                    finished_at=now if prepare_error else None,
+                    error=prepare_error,
                     is_active=False,
                 )
             )
@@ -194,10 +243,24 @@ class ParseDocument:
                     occurred_at=now,
                 )
             )
+            if prepare_error is not None:
+                self._update_document_status_for_run(
+                    uow=uow, document_id=document.document_id, status="failed"
+                )
+                uow.outbox.add(
+                    outbox_events.processing_run_failed(
+                        document_id=document.document_id,
+                        processing_run_id=run.processing_run_id,
+                        error=prepare_error,
+                        occurred_at=now,
+                    )
+                )
             uow.commit()
 
         return {
             "document": document,
+            "run": run,
+            "prepare_failed": prepare_error is not None,
             "processing_run_id": run.processing_run_id,
             "input_pdf": self._paths.data_path(Path(document.raw_file_relpath)),
             "artifact_root_relpath": artifact_root_relpath,
@@ -276,6 +339,8 @@ class ParseDocument:
         parser_name: str | None = None,
         parser_version: str | None = None,
         parser_backend: str | None = None,
+        parser_method: str | None = None,
+        parser_language: str | None = None,
         input_raw_file_hash: str | None = None,
         parser_artifact_relpath: str | None = None,
         normalized_ir_relpath: str | None = None,
@@ -290,6 +355,8 @@ class ParseDocument:
             run.parser_name = parser_name or run.parser_name
             run.parser_version = parser_version or run.parser_version
             run.parser_backend = parser_backend or run.parser_backend
+            run.parser_method = parser_method or run.parser_method
+            run.parser_language = parser_language or run.parser_language
             run.input_raw_file_hash = input_raw_file_hash or run.input_raw_file_hash
             run.parser_artifact_relpath = (
                 parser_artifact_relpath or run.parser_artifact_relpath
@@ -300,6 +367,9 @@ class ParseDocument:
             finished_at = datetime.now(timezone.utc)
             run.finished_at = finished_at
             updated = uow.processing_runs.update(run)
+            self._update_document_status_for_run(
+                uow=uow, document_id=run.document_id, status=status
+            )
             if status == "failed" and error is not None:
                 uow.outbox.add(
                     outbox_events.processing_run_failed(
@@ -312,6 +382,34 @@ class ParseDocument:
             uow.commit()
             return updated
 
+    def _finish_failed_run(
+        self, *, context: dict[str, Any], failure: _ParseRunFailure
+    ) -> e.ProcessingRun:
+        return self._finish_run(
+            processing_run_id=context["processing_run_id"],
+            status="failed",
+            error=self._structured_error(
+                stage=failure.stage,
+                error_code=failure.error_code,
+                retryable=failure.retryable,
+                message=failure.message,
+            ),
+        )
+
+    def _update_document_status_for_run(
+        self, *, uow: UnitOfWork, document_id: str, status: str
+    ) -> None:
+        document = uow.documents.get(document_id)
+        if document is None or document.current_processing_run_id is not None:
+            return
+        if status == "succeeded":
+            document.status = "parsed"
+        elif status == "failed":
+            document.status = "parse_failed"
+        else:
+            return
+        uow.documents.update(document)
+
     def _structured_error(
         self, *, stage: str, error_code: str, retryable: bool, message: str
     ) -> dict[str, Any]:
@@ -321,6 +419,44 @@ class ParseDocument:
             "retryable": retryable,
             "message": message,
         }
+
+    def _parser_failure_from_exception(self, exc: Exception) -> _ParseRunFailure:
+        if isinstance(exc, ParserTimeoutError):
+            return _ParseRunFailure(
+                stage="parse",
+                error_code="parse_timeout",
+                retryable=True,
+                message=str(exc),
+            )
+        if isinstance(exc, ParserInvocationError):
+            return _ParseRunFailure(
+                stage="parse",
+                error_code="parser_invocation_failed",
+                retryable=True,
+                message=str(exc),
+            )
+        if isinstance(exc, ParserVersionProbeError):
+            return _ParseRunFailure(
+                stage="parser_identity",
+                error_code="parser_version_probe_failed",
+                retryable=False,
+                message=str(exc),
+            )
+        if isinstance(exc, ParserOutputContractError):
+            return _ParseRunFailure(
+                stage="parse_output",
+                error_code="parser_output_contract_failed",
+                retryable=False,
+                message=str(exc),
+            )
+        if isinstance(exc, ParserUnknownError):
+            return _ParseRunFailure(
+                stage="parse",
+                error_code="parser_unknown_failed",
+                retryable=False,
+                message=str(exc),
+            )
+        raise TypeError(f"unsupported parser failure type: {type(exc)!r}")
 
 
 def artifact_relpath_map(
