@@ -291,6 +291,26 @@ tracked_companies
 - 文件哈希是什么；
 - 当前是否下载、解析和发布成功。
 
+`document.status` 生命周期枚举（04R-D4，随 0007 加 CHECK）：
+
+```text
+registered → parsed | parse_failed →（发布后）published
+```
+
+`filing_type` 初始词表（04R-D7；新增值走契约升版，禁止自由字符串）：
+
+```text
+annual_report / semiannual_report / quarterly_report / performance_forecast /
+performance_flash / investor_relations / performance_briefing / inquiry_reply / other
+```
+
+`source_tier` 派生映射（04R-D2，协议 §2.9；视图 CASE 派生，本表是唯一权威）：
+
+```text
+filing_type ∈ {investor_relations, performance_briefing} → tier_0b（软披露锚）
+其余                                                      → tier_0a（硬披露锚）
+```
+
 ## 5.2 文档单元结果
 
 `document_unit` 表示这份文档中供 L2 直接使用的结构单元。
@@ -621,7 +641,7 @@ exact table snapshot= {"账龄":"1 年以内（含1 年）","期末账面余额"
 以下内容仍保留在原始 PDF 和 parser artifact，但默认不生成 `document_unit`：
 
 - 封面、扉页、目录、页眉、页脚和页码；
-- 释义、重要提示和固定责任声明（董监高保证真实准确完整等套话）；
+- 释义和固定责任声明（董监高保证真实准确完整等套话）；「重要提示」板块**不得按标签整段跳过**（协议 §3.5 安全红线：常含退市风险、业绩大幅变动等实质内容，按 9.1 保留），仅其中纯模板句可跳过；
 - 签章、签字页、盖章、联系方式和备查文件目录；
 - 空表，以及只有表头、单位而无实质数据的表；
 - 只有“适用 / 不适用”“是 / 否”勾选而无实质内容的模板项；
@@ -829,6 +849,10 @@ order_index
 - `parent_ref` = 所属 `document_id`；
 - `source_ref` = `source_access_id`，完整 source reference 可由 `source_refs_v1` 或
   `GET /v1/units/{id}/source-ref` 派生。
+
+0007 迁移起，`document_units_v1` 以派生投影补齐协议 §3.2 信封最小核（04R-D1，不加存储列）：
+`asset_kind`（常量 document_unit）、`observed_at`（= created_at 别名）、`source_tier`
+（按 §5.1 映射 CASE 派生）、`trace_level`（常量 G0）、`raw_file_hash`（join document）。
 
 `asset://` URI（顶层协议 §2.3）只在序列化边界派生，不落存储：
 

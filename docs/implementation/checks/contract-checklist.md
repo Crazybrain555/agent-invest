@@ -57,6 +57,9 @@ GET /v1/changes
 错误码枚举：L1_PROCESSING_REQUIRED / NOT_FOUND / CONTRACT_VERSION_MISMATCH / GONE_SUPERSEDED
 unit 级 DTO 携带派生字段 asset_uri（仅 API 序列化层派生，不入库、不进 *_v1 视图）
 scope keys 过滤参数可用（filing_type / payload_kind / heading_path / semantic_key / quality_status 等）
+0007 起 document_units_v1 追加信封最小核列：asset_kind / observed_at / source_tier / trace_level / raw_file_hash
+0007 起 change_events_v1 追加 change_kind（真实列）/ source / contract_version / subject_ref
+0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref / supersedes 链 / superseded_by_document_id
 ```
 
 ## 3. Public view 检查

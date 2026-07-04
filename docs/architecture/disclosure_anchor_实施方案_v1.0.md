@@ -1706,37 +1706,20 @@ document_run_published / document_units_changed 等 outbox 事件（event_kind�
 
 ## 15.2 outbox event
 
-建议事件：
+事件模型按 milestone 05 §2-U5 定案：**逐 unit 细粒度事件，不用单事件携带 changes 字典**
+（早期草案的聚合 changes 结构已废弃——每事件一个 subject_ref 才符合协议 §2.8 的事件形状，
+L2 可按 unit 精确失效）：
 
-```json
-{
-  "event_kind": "document_run_published",
-  "document_id": "...",
-  "profile": "research_default",
-  "processing_run_id": "...",
-  "previous_processing_run_id": "...",
-  "raw_file_hash": "...",
-  "changes": {
-    "added": ["asset-id"],
-    "removed": ["old-asset-id"],
-    "content_changed": [
-      {"old_asset_id": "...", "new_asset_id": "..."}
-    ],
-    "structure_only_changed": [],
-    "routing_only_changed": [],
-    "quality_changed": [],
-    "policy_visibility_changed": [],
-    "ambiguous": []
-  }
-}
+```text
+processing_run_published   发布 1 条；materialized ⇔ content_hash_aggregate 变化，否则 observed
+document_unit_created      新增内容的 unit 每个 1 条（materialized）
+document_unit_removed      消失内容的 unit 每个 1 条（materialized）
+quality_status_changed     内容同、质量变的 unit 每个 1 条（materialized）
 ```
 
-L2 收到后按需查询完整 payload。
-
-对外 change feed（`change_events_v1` / `GET /v1/changes`）在事件上还携带 `change_kind`，仅有
-`observed` / `materialized` 两个值（service-purpose §12.2）。上例 `changes` 内的 diff 类别是
-`event_kind` 层面的内部分类，凡引起 public read model 可见变化者均映射为
-`change_kind=materialized`；仅巡检 / 来源观察而无可消费变化的事件为 `observed`。
+一次内容修改 = removed + created 两条事件，不做模糊配对。L2 收到后按需查询完整 payload。
+`change_kind` 是 outbox 真实列（0007 起），仅 `observed` / `materialized` 两值
+（service-purpose §12.2）；下游失效只由 materialized 触发。
 
 ## 15.3 exact snapshot 的责任
 

@@ -25,6 +25,7 @@ docs/implementation/
     02-postgres-and-migrations.md
     03-filestore-and-raw-archive.md
     04-mineru-adapter-and-normalized-ir.md
+    04R-phase000-004-rework.md
     05-document-unit-builder-and-active-run.md
     06-filing-api-public-contracts.md
     07-cninfo-sync.md

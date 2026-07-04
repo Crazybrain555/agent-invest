@@ -19,14 +19,16 @@ created_at: 2026-06-26
 | 02 | PostgreSQL 与 migrations | database、schema、roles、核心表、public views、repositories | 否 |
 | 03 | 文件存储与 raw archive | raw store、atomic write、hash、register local PDF | 否 |
 | 04 | MinerU adapter 与 NormalizedIR | parser_artifacts、MinerU mapper、normalized_ir | 否 |
-| 05 | document_unit builder 与 active run | text/table/qa units、载体规范化（确定性噪声处理）、publish run、outbox | 否 |
+| 04R | Phase000–004 返工 | 0007/0008 迁移、主体解析服务化、注册核心、IR v2、事件惯例、parse 加固、doctor | 否 |
+| 05 | document_unit builder 与 active run | text/table/qa units、载体规范化、publish 原子事务、diff 事件 | 否 |
 | 06 | Filing API 与 public contracts | API、OpenAPI、source_ref、changes、contract tests | 否 |
 | 07 | CNINFO 增量同步 | source adapter、index sync、download、checkpoint、重试 | 是 |
 | 08 | worker loop 与本地运行 | worker-once/loop、locks、reports、运行闭环 | 可选 |
 
 ## 1. 实施原则
 
-1. 先本地样本闭环，再接 CNINFO。
+1. 先本地样本闭环，再接 CNINFO。当前进度：00–04 已完成；下一步按 04R → 05 → 06 → 07 → 08 执行，
+   04R 是 05 的硬前置（IR v2、change_kind 列、事件惯例、注册核心都在 04R 交付）。
 2. 先 raw archive，再 parser，再 unit，再 API。
 3. 每个阶段都要有测试或可复核产物。
 4. 不为了后续 L2-L6 预先实现它们的数据结构。
