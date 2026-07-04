@@ -20,7 +20,7 @@
 
 | sample | kind==heading elements | heading_level non-null | total elements |
 |---|---:|---:|---:|
-| annual_report_excerpt | 6 | 6 | 16 |
+| annual_report_excerpt | 10 | 10 | 40 |
 | ir_activity | 39 | 39 | 131 |
 | short_announcement | 6 | 6 | 31 |
 | annual_report | 655 | 655 | 2697 |

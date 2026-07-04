@@ -1,5 +1,5 @@
 Parser artifacts root: /Volumes/AgentSSD/agent_system/services/disclosure_anchor/data/parser_artifacts/_phase00/annual_report_full/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169/auto
 Content list: /Volumes/AgentSSD/agent_system/services/disclosure_anchor/data/parser_artifacts/_phase00/annual_report_full/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169/auto/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169_content_list.json
 Markdown: /Volumes/AgentSSD/agent_system/services/disclosure_anchor/data/parser_artifacts/_phase00/annual_report_full/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169/auto/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169.md
-Page range: page_idx <= 1 (pages 1-2) from annual_report content_list
+Page range: page_idx <= 6 (pages 1-7) from annual_report content_list
 Note: excerpt fixture is regenerated from the full annual_report artifact.

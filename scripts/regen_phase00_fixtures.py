@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +122,7 @@ def _content_list_for_sample(sample_key: str) -> tuple[list[dict[str, Any]], Pat
         content_list = [
             item
             for item in content_list
-            if isinstance(item.get("page_idx"), int) and item["page_idx"] <= 1
+            if isinstance(item.get("page_idx"), int) and item["page_idx"] <= 6
         ]
     return content_list, path
 
@@ -143,7 +144,7 @@ def _write_excerpt_ref(content_list_path: Path) -> None:
                 f"Parser artifacts root: {annual_values.get('Parser artifacts root', content_list_path.parent)}",
                 f"Content list: {content_list_path}",
                 f"Markdown: {annual_values.get('Markdown', '')}",
-                "Page range: page_idx <= 1 (pages 1-2) from annual_report content_list",
+                "Page range: page_idx <= 6 (pages 1-7) from annual_report content_list",
                 "Note: excerpt fixture is regenerated from the full annual_report artifact.",
                 "",
             ]
@@ -180,7 +181,7 @@ def regenerate_sample(sample_key: str) -> str:
     if sample_key == "annual_report_excerpt":
         normalized["parsed_pages"] = {
             "start_page_no": 1,
-            "end_page_no": 2,
+            "end_page_no": 7,
             "full_pdf": False,
         }
         _write_excerpt_ref(content_list_path)
@@ -197,8 +198,17 @@ def regenerate_sample(sample_key: str) -> str:
     return _coverage_line(sample_key, normalized)
 
 
-def main() -> int:
-    for sample_key in SAMPLE_KEYS:
+def _selected_sample_keys(argv: list[str]) -> tuple[str, ...]:
+    if not argv:
+        return SAMPLE_KEYS
+    unknown = sorted(set(argv) - set(SAMPLE_KEYS))
+    if unknown:
+        raise SystemExit(f"unknown sample_key(s): {', '.join(unknown)}")
+    return tuple(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    for sample_key in _selected_sample_keys(sys.argv[1:] if argv is None else argv):
         print(regenerate_sample(sample_key))
     return 0
 
