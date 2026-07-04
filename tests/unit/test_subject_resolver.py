@@ -113,6 +113,40 @@ class SubjectResolverTests(unittest.TestCase):
                 ),
             )
 
+    def test_security_uscc_conflict_is_contested_before_name_rejection(self) -> None:
+        company = self.uow.companies.add(
+            e.Company(
+                company_id="co_1",
+                legal_name="Old Name",
+                unified_social_credit_code="OLD-USCC",
+            )
+        )
+        self.uow.securities.add(
+            e.Security(
+                security_id="sec_1",
+                company_id=company.company_id,
+                security_code="002484",
+                exchange="SZSE",
+            )
+        )
+
+        with self.assertRaises(SubjectIdentityConflictError):
+            self.resolver.resolve(
+                self.uow,
+                SubjectCandidate(
+                    security_code="002484",
+                    exchange="SZSE",
+                    legal_name="New Name",
+                    credit_code="NEW-USCC",
+                ),
+            )
+
+        identifiers = self.uow.company_identifiers.all()
+        self.assertEqual(len(identifiers), 1)
+        self.assertEqual(identifiers[0].status, "contested")
+        self.assertEqual(identifiers[0].normalized_value, "NEW-USCC")
+        self.assertEqual(self.uow.commit_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

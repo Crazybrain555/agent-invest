@@ -45,10 +45,10 @@ class SubjectResolver:
                 if candidate.credit_code
                 else None
             )
+            company = self._sync_uscc_identifier(uow, company, candidate.credit_code)
             self._validate_legal_name(
                 company=company, candidate=candidate, identifier=identifier, uow=uow
             )
-            company = self._sync_uscc_identifier(uow, company, candidate.credit_code)
             return ResolvedSubject(company=company, security=security)
 
         if candidate.credit_code:
