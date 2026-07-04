@@ -103,6 +103,7 @@ class SubjectResolver:
         if identifier is not None and uow is not None:
             identifier.status = "contested"
             uow.company_identifiers.update(identifier)
+            uow.commit()
         raise SubjectIdentityConflictError(
             "subject legal_name mismatch: "
             f"{candidate.security_code}.{candidate.exchange} belongs to "
@@ -119,6 +120,7 @@ class SubjectResolver:
         if active is not None and active.company_id != company.company_id:
             active.status = "contested"
             uow.company_identifiers.update(active)
+            uow.commit()
             raise SubjectIdentityConflictError(
                 "uscc strong identifier belongs to a different company"
             )
@@ -127,6 +129,7 @@ class SubjectResolver:
             and _normalize_identifier(company.unified_social_credit_code) != normalized
         ):
             self._add_contested_uscc_identifier(uow, company, credit_code)
+            uow.commit()
             raise SubjectIdentityConflictError(
                 "company unified_social_credit_code conflicts with candidate uscc"
             )

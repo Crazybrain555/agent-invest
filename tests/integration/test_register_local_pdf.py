@@ -369,7 +369,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
     def test_identifier_legal_name_mismatch_marks_identifier_contested(self) -> None:
         provider_document_id = "local-" + new_ulid()
         self.provider_document_ids.append(provider_document_id)
-        credit_code = "91320600REVIEWFIX1"
+        credit_code = "USCC" + new_ulid()
         company_id = "co_" + new_ulid()
         identifier_id = "ci_" + new_ulid()
         self.extra_company_ids.append(company_id)
@@ -437,6 +437,173 @@ class RegisterLocalPdfTests(unittest.TestCase):
                 {"pid": provider_document_id},
             ).scalar_one()
         self.assertEqual(status, "contested")
+        self.assertEqual(document_count, 0)
+
+    def test_security_uscc_owner_mismatch_marks_identifier_contested(self) -> None:
+        provider_document_id = "local-" + new_ulid()
+        self.provider_document_ids.append(provider_document_id)
+        credit_code = "USCC" + new_ulid()
+        security_company_id = "co_" + new_ulid()
+        identifier_company_id = "co_" + new_ulid()
+        security_id = "sec_" + new_ulid()
+        identifier_id = "ci_" + new_ulid()
+        self.extra_company_ids.extend([security_company_id, identifier_company_id])
+        self.extra_security_ids.append(security_id)
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company (company_id, legal_name) "
+                    "VALUES (:company_id, :legal_name)"
+                ),
+                {"company_id": security_company_id, "legal_name": "Shared Review Co"},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company (company_id, legal_name) "
+                    "VALUES (:company_id, :legal_name)"
+                ),
+                {"company_id": identifier_company_id, "legal_name": "Shared Review Co"},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.security "
+                    "(security_id, company_id, security_code, exchange) "
+                    "VALUES (:security_id, :company_id, :security_code, :exchange)"
+                ),
+                {
+                    "security_id": security_id,
+                    "company_id": security_company_id,
+                    "security_code": "RFX" + provider_document_id[-4:],
+                    "exchange": "LOCAL",
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company_identifier "
+                    "(identifier_id, company_id, scheme, raw_value, normalized_value, "
+                    "jurisdiction, status, observed_at) "
+                    "VALUES (:identifier_id, :company_id, 'uscc', :raw_value, "
+                    ":normalized_value, 'CN', 'active', now())"
+                ),
+                {
+                    "identifier_id": identifier_id,
+                    "company_id": identifier_company_id,
+                    "raw_value": credit_code,
+                    "normalized_value": credit_code,
+                },
+            )
+        command = self._command(
+            provider_document_id, self._pdf("identifier-owner-contested.pdf")
+        )
+        command = RegisterLocalPdfCommand(
+            file_path=command.file_path,
+            company_legal_name="Shared Review Co",
+            security_code="RFX" + provider_document_id[-4:],
+            exchange="LOCAL",
+            filing_type=command.filing_type,
+            title=command.title,
+            announcement_date=command.announcement_date,
+            provider_document_id=command.provider_document_id,
+            provider=command.provider,
+            report_period=command.report_period,
+            company_credit_code=credit_code,
+        )
+
+        with self.assertRaises(SubjectIdentityConflictError):
+            self.use_case.execute(command)
+
+        with self.engine.connect() as conn:
+            status = conn.execute(
+                text(
+                    "SELECT status FROM disclosure_core.company_identifier "
+                    "WHERE identifier_id = :identifier_id"
+                ),
+                {"identifier_id": identifier_id},
+            ).scalar_one()
+            document_count = conn.execute(
+                text(
+                    "SELECT count(*) FROM disclosure_core.document "
+                    "WHERE provider = 'cninfo' AND provider_document_id = :pid"
+                ),
+                {"pid": provider_document_id},
+            ).scalar_one()
+        self.assertEqual(status, "contested")
+        self.assertEqual(document_count, 0)
+
+    def test_company_uscc_conflict_records_contested_identifier(self) -> None:
+        provider_document_id = "local-" + new_ulid()
+        self.provider_document_ids.append(provider_document_id)
+        old_credit_code = "OLD" + new_ulid()
+        new_credit_code = "NEW" + new_ulid()
+        company_id = "co_" + new_ulid()
+        security_id = "sec_" + new_ulid()
+        self.extra_company_ids.append(company_id)
+        self.extra_security_ids.append(security_id)
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company "
+                    "(company_id, legal_name, unified_social_credit_code) "
+                    "VALUES (:company_id, :legal_name, :credit_code)"
+                ),
+                {
+                    "company_id": company_id,
+                    "legal_name": "USCC Conflict Review Co",
+                    "credit_code": old_credit_code,
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.security "
+                    "(security_id, company_id, security_code, exchange) "
+                    "VALUES (:security_id, :company_id, :security_code, :exchange)"
+                ),
+                {
+                    "security_id": security_id,
+                    "company_id": company_id,
+                    "security_code": "RCF" + provider_document_id[-4:],
+                    "exchange": "LOCAL",
+                },
+            )
+        command = self._command(
+            provider_document_id, self._pdf("company-uscc-contested.pdf")
+        )
+        command = RegisterLocalPdfCommand(
+            file_path=command.file_path,
+            company_legal_name="USCC Conflict Review Co",
+            security_code="RCF" + provider_document_id[-4:],
+            exchange="LOCAL",
+            filing_type=command.filing_type,
+            title=command.title,
+            announcement_date=command.announcement_date,
+            provider_document_id=command.provider_document_id,
+            provider=command.provider,
+            report_period=command.report_period,
+            company_credit_code=new_credit_code,
+        )
+
+        with self.assertRaises(SubjectIdentityConflictError):
+            self.use_case.execute(command)
+
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT status, raw_value, normalized_value "
+                    "FROM disclosure_core.company_identifier "
+                    "WHERE company_id = :company_id "
+                    "AND normalized_value = :normalized_value"
+                ),
+                {"company_id": company_id, "normalized_value": new_credit_code},
+            ).mappings().one()
+            document_count = conn.execute(
+                text(
+                    "SELECT count(*) FROM disclosure_core.document "
+                    "WHERE provider = 'cninfo' AND provider_document_id = :pid"
+                ),
+                {"pid": provider_document_id},
+            ).scalar_one()
+        self.assertEqual(row["status"], "contested")
+        self.assertEqual(row["raw_value"], new_credit_code)
         self.assertEqual(document_count, 0)
 
     def test_doctor_detects_raw_hash_mismatch(self) -> None:

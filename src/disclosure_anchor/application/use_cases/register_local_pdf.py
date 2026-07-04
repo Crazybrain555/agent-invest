@@ -175,16 +175,18 @@ class RegisterLocalPdf:
 
     def _preflight_existing_subject(self, command: RegisterLocalPdfCommand) -> None:
         with self._uow_factory() as uow:
+            security_company: e.Company | None = None
             security = uow.securities.get_by_code_exchange(
                 command.security_code, command.exchange
             )
             if security is not None:
-                self._company_for_existing_security(
+                security_company = self._company_for_existing_security(
                     uow=uow, command=command, security=security
                 )
-            if command.company_credit_code:
+            normalized_credit_code = _normalize_credit_code(command.company_credit_code)
+            if normalized_credit_code:
                 identifier = uow.company_identifiers.get_by_scheme_value(
-                    "uscc", command.company_credit_code.strip().upper()
+                    "uscc", normalized_credit_code
                 )
                 if identifier is not None:
                     company = uow.companies.get(identifier.company_id)
@@ -193,15 +195,72 @@ class RegisterLocalPdf:
                             "company identifier references missing company "
                             f"{identifier.company_id}"
                         )
-                    if company.legal_name != command.company_legal_name:
-                        identifier.status = "contested"
-                        uow.company_identifiers.update(identifier)
-                        uow.commit()
-                        raise SubjectIdentityConflictError(
-                            "subject legal_name mismatch: "
-                            f"uscc belongs to {company.legal_name!r}, "
-                            f"got {command.company_legal_name!r}"
+                    if (
+                        security_company is not None
+                        and identifier.company_id != security_company.company_id
+                    ):
+                        self._contest_identifier_and_raise(
+                            uow,
+                            identifier=identifier,
+                            message=(
+                                "uscc strong identifier belongs to a different company"
+                            ),
                         )
+                    if company.legal_name != command.company_legal_name:
+                        self._contest_identifier_and_raise(
+                            uow,
+                            identifier=identifier,
+                            message=(
+                                "subject legal_name mismatch: "
+                                f"uscc belongs to {company.legal_name!r}, "
+                                f"got {command.company_legal_name!r}"
+                            ),
+                        )
+                if (
+                    security_company is not None
+                    and security_company.unified_social_credit_code
+                    and _normalize_credit_code(
+                        security_company.unified_social_credit_code
+                    )
+                    != normalized_credit_code
+                ):
+                    self._add_contested_identifier_and_raise(
+                        uow,
+                        company=security_company,
+                        credit_code=command.company_credit_code,
+                        message=(
+                            "company unified_social_credit_code conflicts with "
+                            "candidate uscc"
+                        ),
+                    )
+
+    @staticmethod
+    def _contest_identifier_and_raise(
+        uow: UnitOfWork, *, identifier: e.CompanyIdentifier, message: str
+    ) -> None:
+        identifier.status = "contested"
+        uow.company_identifiers.update(identifier)
+        uow.commit()
+        raise SubjectIdentityConflictError(message)
+
+    @staticmethod
+    def _add_contested_identifier_and_raise(
+        uow: UnitOfWork, *, company: e.Company, credit_code: str, message: str
+    ) -> None:
+        uow.company_identifiers.add(
+            e.CompanyIdentifier(
+                identifier_id=ids.new_company_identifier_id(),
+                company_id=company.company_id,
+                scheme="uscc",
+                raw_value=credit_code,
+                normalized_value=_normalize_credit_code(credit_code) or credit_code,
+                jurisdiction="CN",
+                status="contested",
+                observed_at=company.created_at or datetime.now(timezone.utc),
+            )
+        )
+        uow.commit()
+        raise SubjectIdentityConflictError(message)
 
     def _record_quarantine_source_access(
         self, *, command: RegisterLocalPdfCommand, reason: str, quarantine
@@ -251,3 +310,7 @@ class RegisterLocalPdf:
                 f"{company.legal_name!r}, got {command.company_legal_name!r}"
             )
         return company
+
+
+def _normalize_credit_code(value: str | None) -> str | None:
+    return value.strip().upper() if value else None
