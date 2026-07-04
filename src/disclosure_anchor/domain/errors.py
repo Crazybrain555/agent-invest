@@ -35,6 +35,10 @@ class SubjectIdentityConflictError(RegistrationMetadataError):
     """Raised when subject identifiers or securities conflict."""
 
 
+class SubjectIdentityRaceError(SubjectIdentityConflictError):
+    """Raised when a subject unique constraint race should be retried once."""
+
+
 class DocumentIdentityConflictError(DisclosureAnchorError):
     """Raised when a document identity unique constraint is hit."""
 

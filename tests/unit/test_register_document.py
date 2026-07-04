@@ -19,6 +19,8 @@ from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.errors import (
     DocumentIdentityConflictError,
     InvalidRawDocumentError,
+    SubjectIdentityConflictError,
+    SubjectIdentityRaceError,
 )
 from disclosure_anchor.domain.value_objects import ReportPeriod
 from tests.unit._fakes import FakeUnitOfWork
@@ -63,6 +65,28 @@ class _SubjectResolver:
         self.subject = subject
 
     def resolve(self, *_):
+        return self.subject
+
+
+class _FailingSubjectResolver:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    def resolve(self, *_):
+        self.calls += 1
+        raise self.exc
+
+
+class _RacingSubjectResolver:
+    def __init__(self, subject: ResolvedSubject) -> None:
+        self.subject = subject
+        self.calls = 0
+
+    def resolve(self, *_):
+        self.calls += 1
+        if self.calls == 1:
+            raise SubjectIdentityRaceError("raced subject unique")
         return self.subject
 
 
@@ -187,6 +211,61 @@ class RegisterDocumentTests(unittest.TestCase):
         self.assertTrue(result.reused_existing_document)
         self.assertEqual(result.document_id, "doc_raced")
         self.assertEqual(uow.commit_count, 1)
+
+    def test_register_local_pdf_retries_subject_identity_race_only(self) -> None:
+        uow = FakeUnitOfWork()
+        subject = _subject(uow)
+        resolver = _RacingSubjectResolver(subject)
+        use_case = RegisterLocalPdf(
+            raw_store=_RawStore(),
+            uow_factory=lambda: uow,
+            subject_resolver=resolver,
+        )
+
+        result = use_case.execute(
+            RegisterLocalPdfCommand(
+                file_path=Path("sample.pdf"),
+                company_legal_name="江海股份",
+                security_code="002484",
+                exchange="SZSE",
+                filing_type="other",
+                title="公告",
+                announcement_date=date(2026, 7, 5),
+                provider_document_id="pid_1",
+                provider="cninfo",
+            )
+        )
+
+        self.assertIsNotNone(result.document_id)
+        self.assertEqual(resolver.calls, 2)
+
+    def test_register_local_pdf_does_not_retry_semantic_subject_conflict(self) -> None:
+        uow = FakeUnitOfWork()
+        resolver = _FailingSubjectResolver(
+            SubjectIdentityConflictError("semantic identity conflict")
+        )
+        use_case = RegisterLocalPdf(
+            raw_store=_RawStore(),
+            uow_factory=lambda: uow,
+            subject_resolver=resolver,
+        )
+
+        with self.assertRaises(SubjectIdentityConflictError):
+            use_case.execute(
+                RegisterLocalPdfCommand(
+                    file_path=Path("sample.pdf"),
+                    company_legal_name="江海股份",
+                    security_code="002484",
+                    exchange="SZSE",
+                    filing_type="other",
+                    title="公告",
+                    announcement_date=date(2026, 7, 5),
+                    provider_document_id="pid_1",
+                    provider="cninfo",
+                )
+            )
+
+        self.assertEqual(resolver.calls, 1)
 
     def test_hash_mismatch_is_quarantined_and_records_failed_source_access(self) -> None:
         uow = FakeUnitOfWork()

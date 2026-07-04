@@ -27,6 +27,7 @@ from disclosure_anchor.domain.errors import (
     InvalidRawDocumentError,
     RegistrationMetadataError,
     SubjectIdentityConflictError,
+    SubjectIdentityRaceError,
 )
 from disclosure_anchor.domain.value_objects import (
     ReportPeriod,
@@ -131,7 +132,7 @@ class RegisterLocalPdf:
     ) -> RegisterLocalPdfResult:
         try:
             return self._register_after_raw_archive(command=command, raw=raw)
-        except (DocumentIdentityConflictError, SubjectIdentityConflictError):
+        except (DocumentIdentityConflictError, SubjectIdentityRaceError):
             return self._register_after_raw_archive(command=command, raw=raw)
 
     def _register_after_raw_archive(

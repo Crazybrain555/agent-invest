@@ -17,6 +17,7 @@ from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.errors import (
     DocumentIdentityConflictError,
     SubjectIdentityConflictError,
+    SubjectIdentityRaceError,
 )
 
 
@@ -32,7 +33,7 @@ class CompanyRepository:
         except IntegrityError as exc:
             detail = str(getattr(exc, "orig", exc))
             if "unified_social_credit_code" in detail:
-                raise SubjectIdentityConflictError(
+                raise SubjectIdentityRaceError(
                     "company unified_social_credit_code already exists"
                 ) from exc
             raise
@@ -82,7 +83,7 @@ class CompanyIdentifierRepository:
         except IntegrityError as exc:
             detail = str(getattr(exc, "orig", exc))
             if "uq_company_identifier_strong_key" in detail:
-                raise SubjectIdentityConflictError(
+                raise SubjectIdentityRaceError(
                     "company identifier strong key already exists"
                 ) from exc
             raise
@@ -144,7 +145,7 @@ class SecurityRepository:
         except IntegrityError as exc:
             detail = str(getattr(exc, "orig", exc))
             if "uq_security_code_exchange" in detail:
-                raise SubjectIdentityConflictError(
+                raise SubjectIdentityRaceError(
                     "security code/exchange already exists"
                 ) from exc
             raise
