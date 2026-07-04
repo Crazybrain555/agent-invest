@@ -307,7 +307,8 @@ published 后重解析失败不降级：status 保持 published，旧 active run
 
 `report_period` 可空（B8）：定期报告（annual/semiannual/quarterly_report）必填；
 业绩预告/快报/说明会建议填；临时公告（investor_relations/inquiry_reply/other 等）可为 null，
-public view 保留该列且允许 null，不得伪造 period。
+public view 保留该列且允许 null，不得伪造 period。半年报按顶层协议 §2.5 的 period label
+词表登记为 `YYYYQ2`（例如 2025 年半年报为 `2025Q2`），不引入 `YYYYH1` 形态。
 
 `filing_type` 初始词表（04R-D7；新增值走契约升版，禁止自由字符串）：
 

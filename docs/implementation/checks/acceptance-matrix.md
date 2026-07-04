@@ -42,11 +42,11 @@ created_at: 2026-06-26
 | A30 | worker 崩溃不破坏 raw archive | 08 | failure test | pending |
 | A31 | 外置盘未挂载时服务 fail closed | 01/08 | doctor/startup test | pass |
 | A32 | document_units_v1 保留 15 个 unit 级 scope keys + asset_id；契约名收敛为 asset_id/payload_kind/event_kind | 02/06 | integration test | pass |
-| A33 | 0007：信封最小核视图列（asset_kind/observed_at/source_tier/trace_level/raw_file_hash）+ source_tier 按 filing_type 映射 | 04R | contract test | pending |
-| A34 | 主体解析走 identifier ledger 强键顺序（security→强键→新建），legal_name 只校验不合并；冲突置 contested 并拒绝 | 04R | unit test | pending |
-| A35 | change_kind 落列且写侧必填；事件工厂统一 event_kind/change_kind/occurred_at | 04R | integration test | pending |
-| A36 | parse 超时/探测失败 fail-closed/未知异常 re-raise；document.status 生命周期随 run 变迁 | 04R | unit+integration test | pending |
-| A37 | NormalizedIR v2：parser 中立 kind 分类、结构化表、heading_level；golden fixtures 再生成 | 04R | contract test | pending |
+| A33 | 0007：信封最小核视图列（asset_kind/observed_at/source_tier/trace_level/raw_file_hash）+ source_tier 按 filing_type 映射 | 04R | contract test | pass |
+| A34 | 主体解析走 identifier ledger 强键顺序（security→强键→新建），legal_name 只校验不合并；冲突置 contested 并拒绝 | 04R | unit test | pass |
+| A35 | change_kind 落列且写侧必填；事件工厂统一 event_kind/change_kind/occurred_at | 04R | integration test | pass |
+| A36 | parse 超时/探测失败 fail-closed/未知异常 re-raise；document.status 生命周期随 run 变迁 | 04R | unit+integration test | pass |
+| A37 | NormalizedIR v2：parser 中立 kind 分类、结构化表、heading_level；golden fixtures 再生成 | 04R | contract test | pass |
 | A38 | retrieval projection 派生层：published unit 的 search projection（heading_path_text/display_subtitle/search_text/controlled_keywords/extractive_keywords/retrieval_rules_version，字段族=05-U7）全部可由已持久化数据确定性再生 | 06R | integration test | pending |
 | A39 | 检索 smoke：自然语言关键词（应收账款账龄 / 关税影响 / 退市风险）可召回已知样本 unit | 06R | API test | pending |
 | A40 | search projection 不污染证据：summary/keywords 不进 content_hash；payload 不变时投影重建不产生 materialized 事件、不触发 L3 失效 | 06R | integration test | pending |
