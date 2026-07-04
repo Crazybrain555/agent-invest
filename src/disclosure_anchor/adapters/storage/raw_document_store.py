@@ -15,6 +15,7 @@ from disclosure_anchor.application.ports.file_store import (
 from disclosure_anchor.application.ports.file_store import FileStorePathPort
 from disclosure_anchor.domain.errors import InvalidRawDocumentError, RawDocumentError
 from disclosure_anchor.domain.ids import new_ulid
+from disclosure_anchor.domain.value_objects import QuarantineReason
 
 
 _CHUNK_SIZE = 1024 * 1024
@@ -185,7 +186,7 @@ class RawDocumentStore:
         provider: str,
         provider_document_id: str,
         input_file: Path,
-        reason: str,
+        reason: QuarantineReason,
     ) -> QuarantineResult:
         copy_error = None
         if not input_file.exists():

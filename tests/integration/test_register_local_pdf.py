@@ -77,7 +77,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
                 text(
                     "SELECT document_id, source_access_id, company_id, security_id "
                     "FROM disclosure_core.document "
-                    "WHERE provider = 'local' AND provider_document_id = :pid"
+                    "WHERE provider = 'cninfo' AND provider_document_id = :pid"
                 ),
                 {"pid": provider_document_id},
             ).all()
@@ -103,10 +103,26 @@ class RegisterLocalPdfTests(unittest.TestCase):
                     ),
                     {"id": source_access_id},
                 )
+            conn.execute(
+                text(
+                    "DELETE FROM disclosure_core.source_access "
+                    "WHERE provider = 'cninfo' "
+                    "AND query_params ->> 'provider_document_id' = :pid"
+                ),
+                {"pid": provider_document_id},
+            )
             for security_id in security_ids:
                 conn.execute(
                     text("DELETE FROM disclosure_core.security WHERE security_id = :id"),
                     {"id": security_id},
+                )
+            for company_id in company_ids:
+                conn.execute(
+                    text(
+                        "DELETE FROM disclosure_core.company_identifier "
+                        "WHERE company_id = :id"
+                    ),
+                    {"id": company_id},
                 )
             for company_id in company_ids:
                 conn.execute(
@@ -130,6 +146,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
             announcement_date=date(2026, 6, 29),
             report_period="2025A",
             provider_document_id=provider_document_id,
+            provider="cninfo",
         )
 
     def test_register_local_pdf_writes_raw_and_db_metadata(self) -> None:
@@ -143,7 +160,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertIsNotNone(result.document_id)
         self.assertFalse(result.reused_existing_document)
         self.assertIsNone(result.quarantined_path)
-        self.assertTrue(result.raw_file_relpath.startswith("raw_documents/local/"))
+        self.assertTrue(result.raw_file_relpath.startswith("raw_documents/cninfo/"))
         self.assertTrue(result.raw_file_hash.startswith("sha256:"))
         self.assertTrue(
             (self.settings.disclosure_data_root / "data" / result.raw_file_relpath).is_file()
@@ -157,17 +174,21 @@ class RegisterLocalPdfTests(unittest.TestCase):
                 ),
                 {"id": result.document_id},
             ).one()
-            event_kind = conn.execute(
+            event_row = conn.execute(
                 text(
-                    "SELECT event_kind FROM disclosure_ops.outbox_event "
+                    "SELECT event_kind, change_kind, subject_kind, subject_ref "
+                    "FROM disclosure_ops.outbox_event "
                     "WHERE document_id = :id"
                 ),
                 {"id": result.document_id},
-            ).scalar_one()
+            ).one()
         self.assertEqual(row.raw_file_relpath, result.raw_file_relpath)
         self.assertEqual(row.raw_file_hash, result.raw_file_hash)
         self.assertEqual(row.status, "registered")
-        self.assertEqual(event_kind, "document_registered")
+        self.assertEqual(event_row.event_kind, "document_registered")
+        self.assertEqual(event_row.change_kind, "materialized")
+        self.assertEqual(event_row.subject_kind, "document")
+        self.assertEqual(event_row.subject_ref, result.document_id)
 
     def test_duplicate_same_file_reuses_document(self) -> None:
         provider_document_id = "local-" + new_ulid()
@@ -183,11 +204,43 @@ class RegisterLocalPdfTests(unittest.TestCase):
             count = conn.execute(
                 text(
                     "SELECT count(*) FROM disclosure_core.document "
-                    "WHERE provider = 'local' AND provider_document_id = :pid"
+                    "WHERE provider = 'cninfo' AND provider_document_id = :pid"
                 ),
                 {"pid": provider_document_id},
             ).scalar_one()
         self.assertEqual(count, 1)
+
+    def test_duplicate_import_records_observed_event_and_source_access(self) -> None:
+        provider_document_id = "local-" + new_ulid()
+        self.provider_document_ids.append(provider_document_id)
+        file_path = self._pdf("duplicate-observed.pdf")
+
+        first = self.use_case.execute(self._command(provider_document_id, file_path))
+        second = self.use_case.execute(self._command(provider_document_id, file_path))
+
+        self.assertTrue(second.reused_existing_document)
+        self.assertEqual(second.document_id, first.document_id)
+        self.assertNotEqual(second.source_access_id, first.source_access_id)
+        self.assertIsNotNone(second.outbox_event_id)
+        with self.engine.connect() as conn:
+            observed = conn.execute(
+                text(
+                    "SELECT event_kind, change_kind FROM disclosure_ops.outbox_event "
+                    "WHERE event_id = :id"
+                ),
+                {"id": second.outbox_event_id},
+            ).one()
+            access_count = conn.execute(
+                text(
+                    "SELECT count(*) FROM disclosure_core.source_access "
+                    "WHERE provider = 'cninfo' "
+                    "AND query_params ->> 'provider_document_id' = :pid"
+                ),
+                {"pid": provider_document_id},
+            ).scalar_one()
+        self.assertEqual(observed.event_kind, "document_observed")
+        self.assertEqual(observed.change_kind, "observed")
+        self.assertEqual(access_count, 2)
 
     def test_invalid_pdf_goes_to_quarantine_without_document(self) -> None:
         provider_document_id = "local-" + new_ulid()
@@ -204,11 +257,34 @@ class RegisterLocalPdfTests(unittest.TestCase):
             count = conn.execute(
                 text(
                     "SELECT count(*) FROM disclosure_core.document "
-                    "WHERE provider = 'local' AND provider_document_id = :pid"
+                    "WHERE provider = 'cninfo' AND provider_document_id = :pid"
                 ),
                 {"pid": provider_document_id},
             ).scalar_one()
         self.assertEqual(count, 0)
+
+    def test_quarantine_records_failed_source_access(self) -> None:
+        provider_document_id = "local-" + new_ulid()
+        self.provider_document_ids.append(provider_document_id)
+        bad_file = self.root / "quarantine-trace.pdf"
+        bad_file.write_bytes(b"not pdf")
+
+        result = self.use_case.execute(self._command(provider_document_id, bad_file))
+
+        self.assertIsNone(result.document_id)
+        self.assertIsNotNone(result.source_access_id)
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT status, error, query_params "
+                    "FROM disclosure_core.source_access "
+                    "WHERE source_access_id = :id"
+                ),
+                {"id": result.source_access_id},
+            ).mappings().one()
+        self.assertEqual(row["status"], "failed")
+        self.assertTrue(row["error"])
+        self.assertEqual(row["query_params"]["provider_document_id"], provider_document_id)
 
     def test_missing_pdf_goes_to_quarantine_without_document(self) -> None:
         provider_document_id = "local-" + new_ulid()
@@ -225,7 +301,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
             count = conn.execute(
                 text(
                     "SELECT count(*) FROM disclosure_core.document "
-                    "WHERE provider = 'local' AND provider_document_id = :pid"
+                    "WHERE provider = 'cninfo' AND provider_document_id = :pid"
                 ),
                 {"pid": provider_document_id},
             ).scalar_one()
@@ -275,7 +351,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
             count = conn.execute(
                 text(
                     "SELECT count(*) FROM disclosure_core.document "
-                    "WHERE provider = 'local' AND provider_document_id = :pid"
+                    "WHERE provider = 'cninfo' AND provider_document_id = :pid"
                 ),
                 {"pid": provider_document_id},
             ).scalar_one()

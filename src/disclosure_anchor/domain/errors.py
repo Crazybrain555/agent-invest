@@ -31,6 +31,10 @@ class RegistrationMetadataError(DisclosureAnchorError):
     """Raised when registration metadata conflicts with existing records."""
 
 
+class SubjectIdentityConflictError(RegistrationMetadataError):
+    """Raised when subject identifiers or securities conflict."""
+
+
 class DocumentIdentityConflictError(DisclosureAnchorError):
     """Raised when a document identity unique constraint is hit."""
 

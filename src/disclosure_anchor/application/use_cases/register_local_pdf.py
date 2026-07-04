@@ -11,6 +11,14 @@ from disclosure_anchor.application.ports.file_store import (
     RawDocumentStorePort,
     RawDocumentWriteResult,
 )
+from disclosure_anchor.application.services.register_document import (
+    DocumentRegistration,
+    register_document,
+)
+from disclosure_anchor.application.services.subject_resolver import (
+    SubjectCandidate,
+    SubjectResolver,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
@@ -18,6 +26,13 @@ from disclosure_anchor.domain.errors import (
     DocumentIdentityConflictError,
     InvalidRawDocumentError,
     RegistrationMetadataError,
+    SubjectIdentityConflictError,
+)
+from disclosure_anchor.domain.value_objects import (
+    ReportPeriod,
+    validate_filing_type,
+    validate_official_provider,
+    validate_report_period_for_filing_type,
 )
 
 
@@ -30,12 +45,23 @@ class RegisterLocalPdfCommand:
     filing_type: str
     title: str
     announcement_date: date
-    report_period: str
     provider_document_id: str
-    provider: str = "local"
+    provider: str
+    report_period: ReportPeriod | None = None
     board: str | None = None
     company_credit_code: str | None = None
     expected_raw_file_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_official_provider(self.provider)
+        validate_filing_type(self.filing_type)
+        report_period = self.report_period
+        if isinstance(report_period, str):
+            report_period = ReportPeriod.parse(report_period)
+            object.__setattr__(self, "report_period", report_period)
+        validate_report_period_for_filing_type(
+            filing_type=self.filing_type, report_period=report_period
+        )
 
 
 @dataclass(frozen=True)
@@ -58,12 +84,14 @@ class RegisterLocalPdf:
         *,
         raw_store: RawDocumentStorePort,
         uow_factory: Callable[[], UnitOfWork],
+        subject_resolver: SubjectResolver | None = None,
     ) -> None:
         self._raw_store = raw_store
         self._uow_factory = uow_factory
+        self._subject_resolver = subject_resolver or SubjectResolver()
 
     def execute(self, command: RegisterLocalPdfCommand) -> RegisterLocalPdfResult:
-        self._preflight_existing_security(command)
+        self._preflight_existing_subject(command)
 
         try:
             raw = self._raw_store.put_raw_document(
@@ -81,70 +109,102 @@ class RegisterLocalPdf:
                 input_file=command.file_path,
                 reason="invalid_raw_document",
             )
+            source_access = self._record_quarantine_source_access(
+                command=command,
+                reason=str(exc),
+                quarantine=quarantine,
+            )
             return RegisterLocalPdfResult(
                 document_id=None,
                 raw_file_relpath=None,
                 raw_file_hash=None,
-                source_access_id=None,
+                source_access_id=source_access.source_access_id,
                 outbox_event_id=None,
                 quarantined_path=quarantine.path,
-                quarantine_reason=str(exc),
+                quarantine_reason=quarantine.reason,
             )
 
+        return self._register_after_raw_archive_with_retry(command=command, raw=raw)
+
+    def _register_after_raw_archive_with_retry(
+        self, *, command: RegisterLocalPdfCommand, raw: RawDocumentWriteResult
+    ) -> RegisterLocalPdfResult:
         try:
             return self._register_after_raw_archive(command=command, raw=raw)
-        except DocumentIdentityConflictError:
-            with self._uow_factory() as uow:
-                existing = uow.documents.get_by_provider_document_and_hash(
-                    provider=command.provider,
-                    provider_document_id=command.provider_document_id,
-                    raw_file_hash=raw.raw_file_hash,
-                )
-                if existing is not None:
-                    return self._reused_existing_result(existing)
-            raise
+        except (DocumentIdentityConflictError, SubjectIdentityConflictError):
+            return self._register_after_raw_archive(command=command, raw=raw)
 
     def _register_after_raw_archive(
         self, *, command: RegisterLocalPdfCommand, raw: RawDocumentWriteResult
     ) -> RegisterLocalPdfResult:
-        now = datetime.now(timezone.utc)
         with self._uow_factory() as uow:
-            existing = uow.documents.get_by_provider_document_and_hash(
-                provider=command.provider,
-                provider_document_id=command.provider_document_id,
-                raw_file_hash=raw.raw_file_hash,
+            subject = self._subject_resolver.resolve(
+                uow,
+                SubjectCandidate(
+                    security_code=command.security_code,
+                    exchange=command.exchange,
+                    board=command.board,
+                    legal_name=command.company_legal_name,
+                    credit_code=command.company_credit_code,
+                ),
             )
-            if existing is not None:
-                return self._reused_existing_result(existing)
+            outcome = register_document(
+                uow,
+                subject=subject,
+                doc_meta=DocumentRegistration(
+                    provider=command.provider,
+                    provider_document_id=command.provider_document_id,
+                    title=command.title,
+                    filing_type=command.filing_type,
+                    announcement_date=command.announcement_date,
+                    report_period=command.report_period,
+                    filename=command.file_path.name,
+                ),
+                raw=raw,
+            )
+            uow.commit()
 
-            company = uow.companies.get_by_legal_name(command.company_legal_name)
+        return RegisterLocalPdfResult(
+            document_id=outcome.document.document_id,
+            raw_file_relpath=outcome.document.raw_file_relpath,
+            raw_file_hash=outcome.document.raw_file_hash,
+            source_access_id=outcome.source_access.source_access_id,
+            outbox_event_id=outcome.outbox_event.event_id,
+            reused_existing_document=outcome.reused_existing_document,
+        )
+
+    def _preflight_existing_subject(self, command: RegisterLocalPdfCommand) -> None:
+        with self._uow_factory() as uow:
             security = uow.securities.get_by_code_exchange(
                 command.security_code, command.exchange
             )
             if security is not None:
-                company = self._company_for_existing_security(
+                self._company_for_existing_security(
                     uow=uow, command=command, security=security
                 )
-            else:
-                if company is None:
-                    company = uow.companies.add(
-                        e.Company(
-                            company_id=ids.new_company_id(),
-                            legal_name=command.company_legal_name,
-                            unified_social_credit_code=command.company_credit_code,
-                        )
-                    )
-                security = uow.securities.add(
-                    e.Security(
-                        security_id=ids.new_security_id(),
-                        company_id=company.company_id,
-                        security_code=command.security_code,
-                        exchange=command.exchange,
-                        board=command.board,
-                        status="active",
-                    )
+            if command.company_credit_code:
+                identifier = uow.company_identifiers.get_by_scheme_value(
+                    "uscc", command.company_credit_code.strip().upper()
                 )
+                if identifier is not None:
+                    company = uow.companies.get(identifier.company_id)
+                    if company is None:
+                        raise RegistrationMetadataError(
+                            "company identifier references missing company "
+                            f"{identifier.company_id}"
+                        )
+                    if company.legal_name != command.company_legal_name:
+                        raise SubjectIdentityConflictError(
+                            "subject legal_name mismatch: "
+                            f"uscc belongs to {company.legal_name!r}, "
+                            f"got {command.company_legal_name!r}"
+                        )
 
+    def _record_quarantine_source_access(
+        self, *, command: RegisterLocalPdfCommand, reason: str, quarantine
+    ):
+        now = datetime.now(timezone.utc)
+        with self._uow_factory() as uow:
             source_access = uow.source_accesses.add(
                 e.SourceAccess(
                     source_access_id=ids.new_source_access_id(),
@@ -156,86 +216,17 @@ class RegisterLocalPdf:
                         "filename": command.file_path.name,
                     },
                     accessed_at=now,
-                    status="ok",
-                    result_hash=raw.raw_file_hash,
+                    status="failed",
+                    error=reason,
                     result_snapshot={
-                        "byte_count": raw.byte_count,
-                        "raw_created": raw.created,
-                    },
-                    company_id=company.company_id,
-                    security_id=security.security_id,
-                )
-            )
-
-            latest = uow.documents.latest_by_provider_document(
-                provider=command.provider,
-                provider_document_id=command.provider_document_id,
-            )
-            document = uow.documents.add(
-                e.Document(
-                    document_id=ids.new_document_id(),
-                    status="registered",
-                    company_id=company.company_id,
-                    security_id=security.security_id,
-                    source_access_id=source_access.source_access_id,
-                    provider=command.provider,
-                    provider_document_id=command.provider_document_id,
-                    title=command.title,
-                    filing_type=command.filing_type,
-                    announcement_date=command.announcement_date,
-                    report_period=command.report_period,
-                    raw_file_relpath=str(raw.relpath),
-                    raw_file_hash=raw.raw_file_hash,
-                    supersedes_document_id=latest.document_id if latest else None,
-                )
-            )
-
-            event = uow.outbox.add(
-                e.OutboxEvent(
-                    event_id=ids.new_outbox_event_id(),
-                    event_kind="document_registered",
-                    change_kind="materialized",
-                    subject_kind="document",
-                    subject_ref=document.document_id,
-                    document_id=document.document_id,
-                    payload={
-                        "provider": command.provider,
-                        "provider_document_id": command.provider_document_id,
-                        "raw_file_hash": raw.raw_file_hash,
+                        "quarantine_reason": quarantine.reason,
+                        "quarantine_path": str(quarantine.path),
+                        "byte_count": quarantine.byte_count,
                     },
                 )
             )
             uow.commit()
-
-        return RegisterLocalPdfResult(
-            document_id=document.document_id,
-            raw_file_relpath=document.raw_file_relpath,
-            raw_file_hash=document.raw_file_hash,
-            source_access_id=source_access.source_access_id,
-            outbox_event_id=event.event_id,
-            reused_existing_document=False,
-        )
-
-    def _preflight_existing_security(self, command: RegisterLocalPdfCommand) -> None:
-        with self._uow_factory() as uow:
-            security = uow.securities.get_by_code_exchange(
-                command.security_code, command.exchange
-            )
-            if security is not None:
-                self._company_for_existing_security(
-                    uow=uow, command=command, security=security
-                )
-
-    @staticmethod
-    def _reused_existing_result(existing: e.Document) -> RegisterLocalPdfResult:
-        return RegisterLocalPdfResult(
-            document_id=existing.document_id,
-            raw_file_relpath=existing.raw_file_relpath,
-            raw_file_hash=existing.raw_file_hash,
-            source_access_id=existing.source_access_id,
-            outbox_event_id=None,
-            reused_existing_document=True,
-        )
+            return source_access
 
     @staticmethod
     def _company_for_existing_security(
@@ -251,7 +242,7 @@ class RegisterLocalPdf:
                 f"{security.company_id}"
             )
         if company.legal_name != command.company_legal_name:
-            raise RegistrationMetadataError(
+            raise SubjectIdentityConflictError(
                 "security/company mismatch: "
                 f"{command.security_code}.{command.exchange} belongs to "
                 f"{company.legal_name!r}, got {command.company_legal_name!r}"

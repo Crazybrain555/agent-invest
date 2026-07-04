@@ -14,7 +14,10 @@ from sqlalchemy.orm import Session
 
 from disclosure_anchor.adapters.db.postgres import mappers, models
 from disclosure_anchor.domain import entities as e
-from disclosure_anchor.domain.errors import DocumentIdentityConflictError
+from disclosure_anchor.domain.errors import (
+    DocumentIdentityConflictError,
+    SubjectIdentityConflictError,
+)
 
 
 class CompanyRepository:
@@ -24,7 +27,15 @@ class CompanyRepository:
     def add(self, company: e.Company) -> e.Company:
         row = mappers.company_to_model(company)
         self._session.add(row)
-        self._session.flush()
+        try:
+            self._session.flush()
+        except IntegrityError as exc:
+            detail = str(getattr(exc, "orig", exc))
+            if "unified_social_credit_code" in detail:
+                raise SubjectIdentityConflictError(
+                    "company unified_social_credit_code already exists"
+                ) from exc
+            raise
         return mappers.company_to_entity(row)
 
     def get(self, company_id: str) -> Optional[e.Company]:
@@ -66,7 +77,15 @@ class CompanyIdentifierRepository:
     def add(self, identifier: e.CompanyIdentifier) -> e.CompanyIdentifier:
         row = mappers.company_identifier_to_model(identifier)
         self._session.add(row)
-        self._session.flush()
+        try:
+            self._session.flush()
+        except IntegrityError as exc:
+            detail = str(getattr(exc, "orig", exc))
+            if "uq_company_identifier_strong_key" in detail:
+                raise SubjectIdentityConflictError(
+                    "company identifier strong key already exists"
+                ) from exc
+            raise
         return mappers.company_identifier_to_entity(row)
 
     def get(self, identifier_id: str) -> Optional[e.CompanyIdentifier]:
@@ -81,6 +100,7 @@ class CompanyIdentifierRepository:
             .filter(
                 models.CompanyIdentifier.scheme == scheme,
                 models.CompanyIdentifier.normalized_value == normalized_value,
+                models.CompanyIdentifier.status == "active",
             )
             .order_by(
                 models.CompanyIdentifier.created_at.desc(),
@@ -119,7 +139,15 @@ class SecurityRepository:
     def add(self, security: e.Security) -> e.Security:
         row = mappers.security_to_model(security)
         self._session.add(row)
-        self._session.flush()
+        try:
+            self._session.flush()
+        except IntegrityError as exc:
+            detail = str(getattr(exc, "orig", exc))
+            if "uq_security_code_exchange" in detail:
+                raise SubjectIdentityConflictError(
+                    "security code/exchange already exists"
+                ) from exc
+            raise
         return mappers.security_to_entity(row)
 
     def get(self, security_id: str) -> Optional[e.Security]:

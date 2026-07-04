@@ -7,6 +7,8 @@ from typing import Protocol
 
 from dataclasses import dataclass
 
+from disclosure_anchor.domain.value_objects import QuarantineReason
+
 
 @dataclass(frozen=True)
 class RawDocumentWriteResult:
@@ -28,7 +30,7 @@ class RawDocumentVerification:
 @dataclass(frozen=True)
 class QuarantineResult:
     path: Path
-    reason: str
+    reason: QuarantineReason
     byte_count: int
 
 
@@ -128,7 +130,7 @@ class RawDocumentStorePort(Protocol):
         provider: str,
         provider_document_id: str,
         input_file: Path,
-        reason: str,
+        reason: QuarantineReason,
     ) -> QuarantineResult:
         ...
 

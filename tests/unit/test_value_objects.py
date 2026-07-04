@@ -1,8 +1,15 @@
-"""Unit tests for domain value objects (ContentHash, ProviderRef)."""
+"""Unit tests for domain value objects."""
 
 import unittest
 
-from disclosure_anchor.domain.value_objects.common import ContentHash, ProviderRef
+from disclosure_anchor.domain.value_objects.common import (
+    ContentHash,
+    ProviderRef,
+    ReportPeriod,
+    validate_filing_type,
+    validate_official_provider,
+    validate_report_period_for_filing_type,
+)
 
 
 class ContentHashTests(unittest.TestCase):
@@ -39,6 +46,31 @@ class ProviderRefTests(unittest.TestCase):
     def test_provider_document_id_is_required(self) -> None:
         with self.assertRaises(ValueError):
             ProviderRef(provider="cninfo", provider_document_id="")
+
+
+class ReportPeriodTests(unittest.TestCase):
+    def test_parse_accepts_contract_labels(self) -> None:
+        self.assertEqual(str(ReportPeriod.parse("2025A")), "2025A")
+        self.assertEqual(str(ReportPeriod.parse("2025Q2")), "2025Q2")
+
+    def test_parse_rejects_non_contract_labels(self) -> None:
+        for value in ("2025H1", "25A", "2025Q5"):
+            with self.assertRaises(ValueError):
+                ReportPeriod.parse(value)
+
+    def test_filing_type_and_provider_vocabularies_are_closed(self) -> None:
+        self.assertEqual(validate_filing_type("annual_report"), "annual_report")
+        self.assertEqual(validate_official_provider("cninfo"), "cninfo")
+        with self.assertRaises(ValueError):
+            validate_filing_type("free_text")
+        with self.assertRaises(ValueError):
+            validate_official_provider("local")
+
+    def test_period_required_for_regular_reports(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_report_period_for_filing_type(
+                filing_type="annual_report", report_period=None
+            )
 
 
 if __name__ == "__main__":

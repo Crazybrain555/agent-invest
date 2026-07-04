@@ -139,7 +139,7 @@ class ParseDocumentTests(unittest.TestCase):
                 text(
                     "SELECT document_id, source_access_id, company_id, security_id "
                     "FROM disclosure_core.document "
-                    "WHERE provider = 'local' AND provider_document_id = :pid"
+                    "WHERE provider = 'cninfo' AND provider_document_id = :pid"
                 ),
                 {"pid": provider_document_id},
             ).all()
@@ -209,6 +209,7 @@ class ParseDocumentTests(unittest.TestCase):
                 announcement_date=date(2026, 6, 29),
                 report_period="2025A",
                 provider_document_id=provider_document_id,
+                provider="cninfo",
             )
         )
         return result.document_id
@@ -226,8 +227,8 @@ class ParseDocumentTests(unittest.TestCase):
         result = use_case.execute(ParseDocumentCommand(document_id=document_id))
 
         self.assertEqual(result.status, "succeeded")
-        self.assertTrue(result.parser_artifact_relpath.startswith("parser_artifacts/local/"))
-        self.assertTrue(result.normalized_ir_relpath.startswith("derived/normalized_ir/local/"))
+        self.assertTrue(result.parser_artifact_relpath.startswith("parser_artifacts/cninfo/"))
+        self.assertTrue(result.normalized_ir_relpath.startswith("derived/normalized_ir/cninfo/"))
         normalized_path = self.settings.disclosure_data_root / "data" / result.normalized_ir_relpath
         self.assertTrue(normalized_path.is_file())
         normalized = json.loads(normalized_path.read_text(encoding="utf-8"))
