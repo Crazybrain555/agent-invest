@@ -279,7 +279,8 @@ class ParseDocumentTests(unittest.TestCase):
         result = use_case.execute(ParseDocumentCommand(document_id=document_id))
 
         self.assertEqual(result.status, "failed")
-        self.assertIn("parser failed", result.error)
+        self.assertIsNotNone(result.error)
+        self.assertIn("parser failed", result.error["message"])
         with self.engine.connect() as conn:
             active_status = conn.execute(
                 text(
@@ -322,7 +323,8 @@ class ParseDocumentTests(unittest.TestCase):
 
         self.assertEqual(result.status, "failed")
         self.assertFalse(parser.called)
-        self.assertIn("raw_hash_mismatch", result.error)
+        self.assertIsNotNone(result.error)
+        self.assertEqual(result.error["error_code"], "raw_hash_mismatch")
 
 
 if __name__ == "__main__":

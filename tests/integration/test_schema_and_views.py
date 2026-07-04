@@ -17,6 +17,7 @@ from tests.integration._support import engine_or_skip
 
 EXPECTED_CORE_TABLES = {
     "company",
+    "company_identifier",
     "security",
     "tracked_company",
     "source_access",
@@ -81,7 +82,7 @@ class SchemaShapeTests(unittest.TestCase):
                 text(f"SELECT version_num FROM {ALEMBIC_VERSION_TABLE_SCHEMA}.alembic_version")
             ).scalar()
         self.assertEqual(schema, ALEMBIC_VERSION_TABLE_SCHEMA)
-        self.assertEqual(version, "0006_v07_terminology_convergence")
+        self.assertEqual(version, "0007_envelope_and_feed_hardening")
 
     def test_document_provider_hash_unique_index_exists(self) -> None:
         with self.engine.connect() as conn:

@@ -21,6 +21,22 @@ class Company:
 
 
 @dataclass
+class CompanyIdentifier:
+    identifier_id: str
+    company_id: str
+    scheme: str
+    raw_value: str
+    normalized_value: str
+    observed_at: datetime
+    jurisdiction: Optional[str] = None
+    source_access_id: Optional[str] = None
+    status: str = "active"
+    valid_from: Optional[date] = None
+    valid_to: Optional[date] = None
+    created_at: Optional[datetime] = None
+
+
+@dataclass
 class Security:
     security_id: str
     company_id: str
@@ -86,6 +102,7 @@ class Document:
     report_period: Optional[str] = None
     raw_file_relpath: Optional[str] = None
     raw_file_hash: Optional[str] = None
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
     current_processing_run_id: Optional[str] = None
     supersedes_document_id: Optional[str] = None
     correction_of_document_id: Optional[str] = None
@@ -102,6 +119,8 @@ class ProcessingRun:
     parser_name: Optional[str] = None
     parser_version: Optional[str] = None
     parser_backend: Optional[str] = None
+    parser_method: Optional[str] = None
+    parser_language: Optional[str] = None
     input_raw_file_hash: Optional[str] = None
     parser_artifact_relpath: Optional[str] = None
     artifact_hash: Optional[str] = None
@@ -110,9 +129,13 @@ class ProcessingRun:
     content_hash_aggregate: Optional[str] = None
     structure_hash: Optional[str] = None
     is_active: bool = False
+    unit_build_status: str = "not_started"
+    unit_build_error: Optional[dict[str, Any]] = None
+    unit_build_attempt_count: int = 0
+    unit_built_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
-    error: Optional[str] = None
+    error: Optional[dict[str, Any]] = None
     created_at: Optional[datetime] = None
 
 
@@ -130,6 +153,7 @@ class DocumentUnit:
     semantic_key: Optional[str] = None
     structure_hash: Optional[str] = None
     quality_status: str = "ok"
+    query_projection_hash: Optional[str] = None
     provider_document_id: Optional[str] = None
     artifact_locator: Optional[dict[str, Any]] = None
     created_at: Optional[datetime] = None
@@ -139,6 +163,9 @@ class DocumentUnit:
 class OutboxEvent:
     event_id: str
     event_kind: str
+    change_kind: str
+    subject_kind: str
+    subject_ref: str
     seq: Optional[int] = None
     document_id: Optional[str] = None
     processing_run_id: Optional[str] = None

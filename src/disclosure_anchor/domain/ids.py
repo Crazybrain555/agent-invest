@@ -21,6 +21,7 @@ DocumentId = NewType("DocumentId", str)
 ProcessingRunId = NewType("ProcessingRunId", str)
 AssetId = NewType("AssetId", str)
 OutboxEventId = NewType("OutboxEventId", str)
+CompanyIdentifierId = NewType("CompanyIdentifierId", str)
 
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _ULID_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
@@ -93,3 +94,7 @@ def new_asset_id() -> AssetId:
 
 def new_outbox_event_id() -> OutboxEventId:
     return OutboxEventId(new_id("oe"))
+
+
+def new_company_identifier_id() -> CompanyIdentifierId:
+    return CompanyIdentifierId(new_id("ci"))

@@ -5,6 +5,7 @@ from disclosure_anchor.domain.ids import (
     is_ulid,
     new_document_id,
     new_asset_id,
+    new_company_identifier_id,
     new_id,
     new_processing_run_id,
     new_source_access_id,
@@ -21,6 +22,7 @@ class IdTests(unittest.TestCase):
     def test_prefixed_ids_are_internal_ids(self) -> None:
         for value in (
             new_source_access_id(),
+            new_company_identifier_id(),
             new_document_id(),
             new_processing_run_id(),
             new_asset_id(),

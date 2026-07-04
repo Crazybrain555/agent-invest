@@ -194,6 +194,9 @@ class RegisterLocalPdf:
                 e.OutboxEvent(
                     event_id=ids.new_outbox_event_id(),
                     event_kind="document_registered",
+                    change_kind="materialized",
+                    subject_kind="document",
+                    subject_ref=document.document_id,
                     document_id=document.document_id,
                     payload={
                         "provider": command.provider,

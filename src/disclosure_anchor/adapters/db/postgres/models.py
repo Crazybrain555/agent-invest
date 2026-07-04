@@ -52,6 +52,48 @@ class Company(Base):
     )
 
 
+class CompanyIdentifier(Base):
+    __tablename__ = "company_identifier"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active','retired','contested')",
+            name="ck_company_identifier_status",
+        ),
+        Index(
+            "uq_company_identifier_strong_key",
+            "scheme",
+            "normalized_value",
+            unique=True,
+            postgresql_where=text(
+                "scheme IN ('uscc','lei','sec_cik','hk_cr') AND status='active'"
+            ),
+        ),
+        Index("ix_company_identifier_company", "company_id"),
+        {"schema": CORE_SCHEMA},
+    )
+
+    identifier_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    company_id: Mapped[str] = mapped_column(
+        ForeignKey(f"{CORE_SCHEMA}.company.company_id"), nullable=False
+    )
+    scheme: Mapped[str] = mapped_column(String(32), nullable=False)
+    raw_value: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_value: Mapped[str] = mapped_column(String(128), nullable=False)
+    jurisdiction: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    source_access_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey(f"{CORE_SCHEMA}.source_access.source_access_id"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'active'")
+    )
+    valid_from: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    valid_to: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class Security(Base):
     __tablename__ = "security"
     __table_args__ = (
@@ -151,11 +193,17 @@ class SourceCheckpoint(Base):
 class Document(Base):
     __tablename__ = "document"
     __table_args__ = (
+        CheckConstraint(
+            "status IN ('registered','parsed','parse_failed','published')",
+            name="ck_document_status",
+        ),
         Index("ix_document_company", "company_id"),
         Index("ix_document_security", "security_id"),
         Index("ix_document_source_access", "source_access_id"),
         Index("ix_document_provider_ref", "provider", "provider_document_id"),
         Index("ix_document_raw_hash", "raw_file_hash"),
+        Index("ix_document_company_period_type", "company_id", "report_period", "filing_type"),
+        Index("ix_document_announcement_date", "announcement_date"),
         Index(
             "uq_document_provider_doc_hash",
             "provider",
@@ -190,6 +238,9 @@ class Document(Base):
     raw_file_relpath: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     raw_file_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_metadata: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
     # Pointer to the current default run; intentionally not a hard FK to avoid a
     # cycle with processing_run.document_id.
     current_processing_run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
@@ -206,6 +257,10 @@ class Document(Base):
 class ProcessingRun(Base):
     __tablename__ = "processing_run"
     __table_args__ = (
+        CheckConstraint(
+            "unit_build_status IN ('not_started','running','succeeded','failed')",
+            name="ck_processing_run_unit_build_status",
+        ),
         Index("ix_processing_run_document", "document_id"),
         Index(
             "uq_processing_run_one_active_per_document",
@@ -225,6 +280,8 @@ class ProcessingRun(Base):
     parser_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     parser_version: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     parser_backend: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    parser_method: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    parser_language: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     input_raw_file_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     parser_artifact_relpath: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     artifact_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
@@ -235,9 +292,19 @@ class ProcessingRun(Base):
     is_active: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+    unit_build_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'not_started'")
+    )
+    unit_build_error: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+    unit_build_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    unit_built_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -249,12 +316,30 @@ class DocumentUnit(Base):
         CheckConstraint(
             "payload_kind in ('text','table','qa')", name="ck_document_unit_payload_kind"
         ),
+        CheckConstraint(
+            "quality_status IN ('ok','needs_review','unusable')",
+            name="ck_document_unit_quality_status",
+        ),
         UniqueConstraint(
             "processing_run_id", "order_index", name="uq_document_unit_run_order"
         ),
         Index("ix_document_unit_document", "document_id"),
         Index("ix_document_unit_run", "processing_run_id"),
         Index("ix_document_unit_semantic_key", "semantic_key"),
+        Index(
+            "ix_document_unit_run_order",
+            "document_id",
+            "processing_run_id",
+            "order_index",
+            "asset_id",
+        ),
+        Index("ix_document_unit_content_hash", "content_hash"),
+        Index(
+            "ix_document_unit_heading_path",
+            "heading_path",
+            postgresql_using="gin",
+            postgresql_ops={"heading_path": "jsonb_path_ops"},
+        ),
         {"schema": CORE_SCHEMA},
     )
 
@@ -279,6 +364,7 @@ class DocumentUnit(Base):
     quality_status: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default=text("'ok'")
     )
+    query_projection_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     artifact_locator: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -288,6 +374,14 @@ class DocumentUnit(Base):
 class OutboxEvent(Base):
     __tablename__ = "outbox_event"
     __table_args__ = (
+        CheckConstraint(
+            "change_kind IN ('observed','materialized')",
+            name="ck_outbox_event_change_kind",
+        ),
+        CheckConstraint(
+            "subject_kind IN ('document','processing_run','document_unit','source_access')",
+            name="ck_outbox_event_subject_kind",
+        ),
         Index("ix_outbox_event_document", "document_id"),
         {"schema": OPS_SCHEMA},
     )
@@ -295,6 +389,9 @@ class OutboxEvent(Base):
     seq: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     event_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     event_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    change_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    subject_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    subject_ref: Mapped[str] = mapped_column(String(64), nullable=False)
     document_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     processing_run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     asset_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)

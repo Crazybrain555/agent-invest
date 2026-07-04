@@ -15,6 +15,7 @@ from sqlalchemy.exc import ProgrammingError
 from disclosure_anchor.adapters.db.postgres.schema import (
     APP_ROLE,
     FUTURE_L2_READER_ROLE,
+    PUBLIC_VIEWS,
     READER_ROLE,
 )
 from tests.integration._support import engine_or_skip
@@ -43,15 +44,9 @@ class PermissionTests(unittest.TestCase):
                 trans = conn.begin()
                 try:
                     conn.execute(text(f'SET ROLE "{role}"'))
-                    # Must not raise; results may be empty. Covers the views that
-                    # 0006 recreated via DROP+CREATE, whose grants depend on the
-                    # owner-role default privileges from 0001.
-                    for view in (
-                        "documents_v1",
-                        "document_units_v1",
-                        "source_refs_v1",
-                        "change_events_v1",
-                    ):
+                    # Must not raise; results may be empty. Covers views recreated
+                    # by 0007 via DROP+CREATE plus the retained source_refs_v1.
+                    for view in PUBLIC_VIEWS:
                         conn.execute(
                             text(f"SELECT * FROM disclosure_public.{view} LIMIT 1")
                         ).all()
@@ -102,11 +97,28 @@ class PermissionTests(unittest.TestCase):
                 conn.execute(
                     text(
                         "INSERT INTO disclosure_ops.outbox_event "
-                        "(event_id, event_kind) VALUES ('oe_app_probe', 'probe')"
+                        "(event_id, event_kind, change_kind, subject_kind, subject_ref) "
+                        "VALUES ('oe_app_probe', 'probe', 'observed', 'source_access', 'sa_probe')"
                     )
                 )
             finally:
                 trans.rollback()
+
+    def test_app_can_read_ops_queue_views(self) -> None:
+        for view in (
+            "pending_parse_v1",
+            "pending_build_v1",
+            "pending_publish_v1",
+            "retryable_failed_run_v1",
+            "stale_running_run_v1",
+        ):
+            with self.engine.connect() as conn:
+                trans = conn.begin()
+                try:
+                    conn.execute(text(f'SET ROLE "{APP_ROLE}"'))
+                    conn.execute(text(f"SELECT * FROM disclosure_ops.{view} LIMIT 1")).all()
+                finally:
+                    trans.rollback()
 
     def test_app_cannot_modify_alembic_version(self) -> None:
         with self.engine.connect() as conn:

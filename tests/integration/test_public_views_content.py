@@ -126,12 +126,16 @@ class PublicViewContentTests(unittest.TestCase):
                     semantic_key="receivable_aging",
                     payload={"unit": "元", "rows": [["合计", "1"]]},
                     content_hash="sha256:unit",
+                    query_projection_hash="sha256:query",
                 )
             )
             uow.outbox.add(
                 e.OutboxEvent(
                     event_id=self.event_id,
                     event_kind="document_registered",
+                    change_kind="materialized",
+                    subject_kind="document",
+                    subject_ref=self.document_id,
                     document_id=self.document_id,
                     payload={"change_kind": "materialized"},
                 )
@@ -140,6 +144,9 @@ class PublicViewContentTests(unittest.TestCase):
                 e.OutboxEvent(
                     event_id=self.observed_event_id,
                     event_kind="document_observed",
+                    change_kind="observed",
+                    subject_kind="document",
+                    subject_ref=self.document_id,
                     document_id=self.document_id,
                 )
             )
@@ -152,7 +159,8 @@ class PublicViewContentTests(unittest.TestCase):
                 text(
                     "SELECT payload_kind, contract_version, company_ref, "
                     "security_ref, security_code, filing_type, report_period, "
-                    "source_ref, producer_action_ref, parent_ref, semantic_key, payload "
+                    "source_ref, producer_action_ref, parent_ref, semantic_key, payload, "
+                    "asset_kind, source_tier, trace_level, raw_file_hash, query_projection_hash "
                     "FROM disclosure_public.document_units_v1 "
                     "WHERE asset_id = :v"
                 ),
@@ -170,6 +178,11 @@ class PublicViewContentTests(unittest.TestCase):
             self.assertEqual(unit_row["parent_ref"], self.document_id)
             self.assertEqual(unit_row["semantic_key"], "receivable_aging")
             self.assertEqual(unit_row["payload"], {"unit": "元", "rows": [["合计", "1"]]})
+            self.assertEqual(unit_row["asset_kind"], "document_unit")
+            self.assertEqual(unit_row["source_tier"], "tier_0a")
+            self.assertEqual(unit_row["trace_level"], "G0")
+            self.assertEqual(unit_row["raw_file_hash"], "sha256:abc")
+            self.assertEqual(unit_row["query_projection_hash"], "sha256:query")
 
             ref_row = conn.execute(
                 text(
@@ -188,18 +201,26 @@ class PublicViewContentTests(unittest.TestCase):
 
             doc_row = conn.execute(
                 text(
-                    "SELECT status, raw_file_hash FROM disclosure_public.documents_v1 "
+                    "SELECT status, raw_file_hash, contract_version, company_ref, "
+                    "security_ref, source_ref, provider_metadata "
+                    "FROM disclosure_public.documents_v1 "
                     "WHERE document_id = :v"
                 ),
                 {"v": self.document_id},
             ).mappings().one()
             self.assertEqual(doc_row["status"], "published")
+            self.assertEqual(doc_row["contract_version"], "document.v1")
+            self.assertEqual(doc_row["company_ref"], self.company_id)
+            self.assertEqual(doc_row["security_ref"], self.security_id)
+            self.assertEqual(doc_row["source_ref"], self.source_access_id)
+            self.assertEqual(doc_row["provider_metadata"], {})
             # raw_file_relpath must not be a column in the view.
             self.assertNotIn("raw_file_relpath", doc_row)
 
             change_rows = conn.execute(
                 text(
-                    "SELECT event_id, event_kind, change_kind "
+                    "SELECT event_id, event_kind, change_kind, subject_kind, subject_ref, "
+                    "source, contract_version "
                     "FROM disclosure_public.change_events_v1 "
                     "WHERE event_id IN (:event_id, :observed_event_id)"
                 ),
@@ -213,6 +234,10 @@ class PublicViewContentTests(unittest.TestCase):
                 change_by_id[self.event_id]["event_kind"], "document_registered"
             )
             self.assertEqual(change_by_id[self.event_id]["change_kind"], "materialized")
+            self.assertEqual(change_by_id[self.event_id]["subject_kind"], "document")
+            self.assertEqual(change_by_id[self.event_id]["subject_ref"], self.document_id)
+            self.assertEqual(change_by_id[self.event_id]["source"], "disclosure_anchor")
+            self.assertEqual(change_by_id[self.event_id]["contract_version"], "change_event.v1")
             self.assertEqual(
                 change_by_id[self.observed_event_id]["event_kind"], "document_observed"
             )

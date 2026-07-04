@@ -34,6 +34,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
             ("disclosure_core.document", "document_id", "document"),
             ("disclosure_core.source_access", "source_access_id", "source_access"),
             ("disclosure_core.security", "security_id", "security"),
+            ("disclosure_core.company_identifier", "identifier_id", "identifier"),
             ("disclosure_core.company", "company_id", "company"),
         ]
         with self.engine.begin() as conn:
@@ -49,9 +50,25 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
         try:
             with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
                 company = uow.companies.add(
-                    e.Company(company_id=ids.new_company_id(), legal_name="江海股份")
+                    e.Company(
+                        company_id=ids.new_company_id(),
+                        legal_name="江海股份",
+                        unified_social_credit_code="9132060013834673X9",
+                    )
                 )
                 created["company"] = company.company_id
+                identifier = uow.company_identifiers.add(
+                    e.CompanyIdentifier(
+                        identifier_id=ids.new_company_identifier_id(),
+                        company_id=company.company_id,
+                        scheme="uscc",
+                        raw_value="9132060013834673X9",
+                        normalized_value="9132060013834673X9",
+                        jurisdiction="CN",
+                        observed_at=_now(),
+                    )
+                )
+                created["identifier"] = identifier.identifier_id
 
                 security = uow.securities.add(
                     e.Security(
@@ -105,6 +122,8 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                         parser_name="mineru",
                         parser_version="3.4.0",
                         parser_backend="pipeline",
+                        parser_method="auto",
+                        parser_language="ch",
                         input_raw_file_hash="sha256:7c73103aa3c9",
                         parser_artifact_relpath=(
                             "parser_artifacts/cninfo/002484/1225087169/"
@@ -114,6 +133,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                             "derived/normalized_ir/cninfo/002484/1225087169/"
                             "run_01K0000000000000000000000/normalized_ir.v1.json"
                         ),
+                        error={"stage": "parse", "error_code": "noop", "retryable": False},
                     )
                 )
                 created["run"] = run.processing_run_id
@@ -130,6 +150,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                         semantic_key="receivable_aging",
                         payload={"unit": "元", "headers": ["账龄"], "rows": [["合计"]]},
                         content_hash="sha256:unit",
+                        query_projection_hash="sha256:query",
                         artifact_locator={"artifact_kind": "normalized_ir", "order_index": 312},
                     )
                 )
@@ -139,6 +160,9 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                     e.OutboxEvent(
                         event_id=ids.new_outbox_event_id(),
                         event_kind="run_published",
+                        change_kind="materialized",
+                        subject_kind="processing_run",
+                        subject_ref=run.processing_run_id,
                         document_id=document.document_id,
                         processing_run_id=run.processing_run_id,
                     )
@@ -152,13 +176,28 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
             with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
                 self.assertEqual(uow.companies.get(created["company"]).legal_name, "江海股份")
                 self.assertEqual(uow.documents.get(created["document"]).report_period, "2025A")
+                self.assertEqual(
+                    uow.company_identifiers.get(created["identifier"]).scheme, "uscc"
+                )
+                self.assertEqual(
+                    uow.company_identifiers.get_by_scheme_value(
+                        "uscc", "9132060013834673X9"
+                    ).company_id,
+                    created["company"],
+                )
                 got_unit = uow.document_units.get(created["unit"])
                 got_run = uow.processing_runs.get(created["run"])
                 self.assertEqual(got_run.parser_backend, "pipeline")
+                self.assertEqual(got_run.parser_method, "auto")
+                self.assertEqual(got_run.parser_language, "ch")
                 self.assertEqual(got_run.input_raw_file_hash, "sha256:7c73103aa3c9")
                 self.assertTrue(got_run.parser_artifact_relpath.startswith("parser_artifacts/"))
+                self.assertEqual(got_run.unit_build_status, "not_started")
+                self.assertEqual(got_run.unit_build_attempt_count, 0)
+                self.assertEqual(got_run.error["error_code"], "noop")
                 self.assertEqual(got_unit.semantic_key, "receivable_aging")
                 self.assertEqual(got_unit.heading_path[0], "第八节 财务报告")
+                self.assertEqual(got_unit.query_projection_hash, "sha256:query")
                 self.assertEqual(uow.outbox.get(created["event"]).event_kind, "run_published")
         finally:
             self._delete(created)

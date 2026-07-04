@@ -6,6 +6,7 @@ from disclosure_anchor.domain.ids import (
     is_internal_id,
     is_ulid,
     new_company_id,
+    new_company_identifier_id,
     new_document_id,
     new_asset_id,
     new_id,
@@ -58,6 +59,7 @@ class TypedIdHelperTests(unittest.TestCase):
     def test_each_helper_uses_its_prefix_and_a_valid_payload(self) -> None:
         cases = {
             "co": new_company_id,
+            "ci": new_company_identifier_id,
             "sec": new_security_id,
             "tc": new_tracked_company_id,
             "sa": new_source_access_id,

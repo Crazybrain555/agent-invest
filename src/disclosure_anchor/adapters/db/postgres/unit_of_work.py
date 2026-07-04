@@ -18,6 +18,7 @@ from disclosure_anchor.adapters.db.postgres.connection import (
     create_session_factory,
 )
 from disclosure_anchor.adapters.db.postgres.repositories import (
+    CompanyIdentifierRepository,
     CompanyRepository,
     DocumentRepository,
     DocumentUnitRepository,
@@ -66,6 +67,7 @@ class SqlAlchemyUnitOfWork:
 
     def _bind_repositories(self, session: Session) -> None:
         self.companies = CompanyRepository(session)
+        self.company_identifiers = CompanyIdentifierRepository(session)
         self.securities = SecurityRepository(session)
         self.tracked_companies = TrackedCompanyRepository(session)
         self.source_accesses = SourceAccessRepository(session)

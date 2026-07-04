@@ -29,6 +29,39 @@ def company_to_entity(row: m.Company) -> e.Company:
     )
 
 
+def company_identifier_to_model(entity: e.CompanyIdentifier) -> m.CompanyIdentifier:
+    return m.CompanyIdentifier(
+        identifier_id=entity.identifier_id,
+        company_id=entity.company_id,
+        scheme=entity.scheme,
+        raw_value=entity.raw_value,
+        normalized_value=entity.normalized_value,
+        jurisdiction=entity.jurisdiction,
+        source_access_id=entity.source_access_id,
+        status=entity.status,
+        valid_from=entity.valid_from,
+        valid_to=entity.valid_to,
+        observed_at=entity.observed_at,
+    )
+
+
+def company_identifier_to_entity(row: m.CompanyIdentifier) -> e.CompanyIdentifier:
+    return e.CompanyIdentifier(
+        identifier_id=row.identifier_id,
+        company_id=row.company_id,
+        scheme=row.scheme,
+        raw_value=row.raw_value,
+        normalized_value=row.normalized_value,
+        jurisdiction=row.jurisdiction,
+        source_access_id=row.source_access_id,
+        status=row.status,
+        valid_from=row.valid_from,
+        valid_to=row.valid_to,
+        observed_at=row.observed_at,
+        created_at=row.created_at,
+    )
+
+
 def security_to_model(entity: e.Security) -> m.Security:
     return m.Security(
         security_id=entity.security_id,
@@ -148,6 +181,7 @@ def document_to_model(entity: e.Document) -> m.Document:
         raw_file_relpath=entity.raw_file_relpath,
         raw_file_hash=entity.raw_file_hash,
         status=entity.status,
+        provider_metadata=entity.provider_metadata,
         current_processing_run_id=entity.current_processing_run_id,
         supersedes_document_id=entity.supersedes_document_id,
         correction_of_document_id=entity.correction_of_document_id,
@@ -169,6 +203,7 @@ def document_to_entity(row: m.Document) -> e.Document:
         raw_file_relpath=row.raw_file_relpath,
         raw_file_hash=row.raw_file_hash,
         status=row.status,
+        provider_metadata=row.provider_metadata,
         current_processing_run_id=row.current_processing_run_id,
         supersedes_document_id=row.supersedes_document_id,
         correction_of_document_id=row.correction_of_document_id,
@@ -186,6 +221,8 @@ def processing_run_to_model(entity: e.ProcessingRun) -> m.ProcessingRun:
         parser_name=entity.parser_name,
         parser_version=entity.parser_version,
         parser_backend=entity.parser_backend,
+        parser_method=entity.parser_method,
+        parser_language=entity.parser_language,
         input_raw_file_hash=entity.input_raw_file_hash,
         parser_artifact_relpath=entity.parser_artifact_relpath,
         artifact_hash=entity.artifact_hash,
@@ -194,6 +231,10 @@ def processing_run_to_model(entity: e.ProcessingRun) -> m.ProcessingRun:
         content_hash_aggregate=entity.content_hash_aggregate,
         structure_hash=entity.structure_hash,
         is_active=entity.is_active,
+        unit_build_status=entity.unit_build_status,
+        unit_build_error=entity.unit_build_error,
+        unit_build_attempt_count=entity.unit_build_attempt_count,
+        unit_built_at=entity.unit_built_at,
         started_at=entity.started_at,
         finished_at=entity.finished_at,
         error=entity.error,
@@ -209,6 +250,8 @@ def processing_run_to_entity(row: m.ProcessingRun) -> e.ProcessingRun:
         parser_name=row.parser_name,
         parser_version=row.parser_version,
         parser_backend=row.parser_backend,
+        parser_method=row.parser_method,
+        parser_language=row.parser_language,
         input_raw_file_hash=row.input_raw_file_hash,
         parser_artifact_relpath=row.parser_artifact_relpath,
         artifact_hash=row.artifact_hash,
@@ -217,6 +260,10 @@ def processing_run_to_entity(row: m.ProcessingRun) -> e.ProcessingRun:
         content_hash_aggregate=row.content_hash_aggregate,
         structure_hash=row.structure_hash,
         is_active=row.is_active,
+        unit_build_status=row.unit_build_status,
+        unit_build_error=row.unit_build_error,
+        unit_build_attempt_count=row.unit_build_attempt_count,
+        unit_built_at=row.unit_built_at,
         started_at=row.started_at,
         finished_at=row.finished_at,
         error=row.error,
@@ -239,6 +286,7 @@ def document_unit_to_model(entity: e.DocumentUnit) -> m.DocumentUnit:
         content_hash=entity.content_hash,
         structure_hash=entity.structure_hash,
         quality_status=entity.quality_status,
+        query_projection_hash=entity.query_projection_hash,
         artifact_locator=entity.artifact_locator,
     )
 
@@ -258,6 +306,7 @@ def document_unit_to_entity(row: m.DocumentUnit) -> e.DocumentUnit:
         content_hash=row.content_hash,
         structure_hash=row.structure_hash,
         quality_status=row.quality_status,
+        query_projection_hash=row.query_projection_hash,
         artifact_locator=row.artifact_locator,
         created_at=row.created_at,
     )
@@ -267,6 +316,9 @@ def outbox_event_to_model(entity: e.OutboxEvent) -> m.OutboxEvent:
     return m.OutboxEvent(
         event_id=entity.event_id,
         event_kind=entity.event_kind,
+        change_kind=entity.change_kind,
+        subject_kind=entity.subject_kind,
+        subject_ref=entity.subject_ref,
         document_id=entity.document_id,
         processing_run_id=entity.processing_run_id,
         asset_id=entity.asset_id,
@@ -278,6 +330,9 @@ def outbox_event_to_entity(row: m.OutboxEvent) -> e.OutboxEvent:
     return e.OutboxEvent(
         event_id=row.event_id,
         event_kind=row.event_kind,
+        change_kind=row.change_kind,
+        subject_kind=row.subject_kind,
+        subject_ref=row.subject_ref,
         seq=row.seq,
         document_id=row.document_id,
         processing_run_id=row.processing_run_id,

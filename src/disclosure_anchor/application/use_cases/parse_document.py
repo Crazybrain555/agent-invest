@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,7 +33,7 @@ class ParseDocumentResult:
     parser_artifact_relpath: str | None = None
     normalized_ir_relpath: str | None = None
     artifact_hash: str | None = None
-    error: str | None = None
+    error: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -273,7 +272,7 @@ class ParseDocument:
         parser_artifact_relpath: str | None = None,
         normalized_ir_relpath: str | None = None,
         artifact_hash: str | None = None,
-        error: str | None = None,
+        error: dict[str, Any] | None = None,
     ) -> e.ProcessingRun:
         with self._uow_factory() as uow:
             run = uow.processing_runs.get(processing_run_id)
@@ -297,17 +296,13 @@ class ParseDocument:
 
     def _structured_error(
         self, *, stage: str, error_code: str, retryable: bool, message: str
-    ) -> str:
-        return json.dumps(
-            {
-                "stage": stage,
-                "error_code": error_code,
-                "retryable": retryable,
-                "message": message,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+    ) -> dict[str, Any]:
+        return {
+            "stage": stage,
+            "error_code": error_code,
+            "retryable": retryable,
+            "message": message,
+        }
 
 
 def artifact_relpath_map(

@@ -40,6 +40,77 @@ class CompanyRepository:
         )
         return mappers.company_to_entity(row) if row is not None else None
 
+    def get_by_credit_code(self, uscc: str) -> Optional[e.Company]:
+        row = (
+            self._session.query(models.Company)
+            .filter(models.Company.unified_social_credit_code == uscc)
+            .one_or_none()
+        )
+        return mappers.company_to_entity(row) if row is not None else None
+
+    def update(self, company: e.Company) -> e.Company:
+        row = self._session.get(models.Company, company.company_id)
+        if row is None:
+            raise KeyError(f"company not found: {company.company_id}")
+        updated = mappers.company_to_model(company)
+        for column in ("legal_name", "unified_social_credit_code"):
+            setattr(row, column, getattr(updated, column))
+        self._session.flush()
+        return mappers.company_to_entity(row)
+
+
+class CompanyIdentifierRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, identifier: e.CompanyIdentifier) -> e.CompanyIdentifier:
+        row = mappers.company_identifier_to_model(identifier)
+        self._session.add(row)
+        self._session.flush()
+        return mappers.company_identifier_to_entity(row)
+
+    def get(self, identifier_id: str) -> Optional[e.CompanyIdentifier]:
+        row = self._session.get(models.CompanyIdentifier, identifier_id)
+        return mappers.company_identifier_to_entity(row) if row is not None else None
+
+    def get_by_scheme_value(
+        self, scheme: str, normalized_value: str
+    ) -> Optional[e.CompanyIdentifier]:
+        row = (
+            self._session.query(models.CompanyIdentifier)
+            .filter(
+                models.CompanyIdentifier.scheme == scheme,
+                models.CompanyIdentifier.normalized_value == normalized_value,
+            )
+            .order_by(
+                models.CompanyIdentifier.created_at.desc(),
+                models.CompanyIdentifier.identifier_id.desc(),
+            )
+            .first()
+        )
+        return mappers.company_identifier_to_entity(row) if row is not None else None
+
+    def update(self, identifier: e.CompanyIdentifier) -> e.CompanyIdentifier:
+        row = self._session.get(models.CompanyIdentifier, identifier.identifier_id)
+        if row is None:
+            raise KeyError(f"company identifier not found: {identifier.identifier_id}")
+        updated = mappers.company_identifier_to_model(identifier)
+        for column in (
+            "company_id",
+            "scheme",
+            "raw_value",
+            "normalized_value",
+            "jurisdiction",
+            "source_access_id",
+            "status",
+            "valid_from",
+            "valid_to",
+            "observed_at",
+        ):
+            setattr(row, column, getattr(updated, column))
+        self._session.flush()
+        return mappers.company_identifier_to_entity(row)
+
 
 class SecurityRepository:
     def __init__(self, session: Session) -> None:
@@ -152,6 +223,7 @@ class DocumentRepository:
             "raw_file_relpath",
             "raw_file_hash",
             "status",
+            "provider_metadata",
             "current_processing_run_id",
             "supersedes_document_id",
             "correction_of_document_id",
@@ -216,6 +288,8 @@ class ProcessingRunRepository:
             "parser_name",
             "parser_version",
             "parser_backend",
+            "parser_method",
+            "parser_language",
             "input_raw_file_hash",
             "parser_artifact_relpath",
             "artifact_hash",
@@ -224,6 +298,10 @@ class ProcessingRunRepository:
             "content_hash_aggregate",
             "structure_hash",
             "is_active",
+            "unit_build_status",
+            "unit_build_error",
+            "unit_build_attempt_count",
+            "unit_built_at",
             "started_at",
             "finished_at",
             "error",

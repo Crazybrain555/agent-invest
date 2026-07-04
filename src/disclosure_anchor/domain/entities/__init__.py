@@ -2,6 +2,7 @@
 
 from disclosure_anchor.domain.entities.core import (
     Company,
+    CompanyIdentifier,
     Document,
     DocumentUnit,
     OutboxEvent,
@@ -14,6 +15,7 @@ from disclosure_anchor.domain.entities.core import (
 
 __all__ = [
     "Company",
+    "CompanyIdentifier",
     "Document",
     "DocumentUnit",
     "OutboxEvent",

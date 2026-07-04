@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from disclosure_anchor.application.ports.repositories import (
+    CompanyIdentifierRepository,
     CompanyRepository,
     DocumentRepository,
     DocumentUnitRepository,
@@ -25,6 +26,7 @@ from disclosure_anchor.application.ports.repositories import (
 @runtime_checkable
 class UnitOfWork(Protocol):
     companies: CompanyRepository
+    company_identifiers: CompanyIdentifierRepository
     securities: SecurityRepository
     tracked_companies: TrackedCompanyRepository
     source_accesses: SourceAccessRepository
