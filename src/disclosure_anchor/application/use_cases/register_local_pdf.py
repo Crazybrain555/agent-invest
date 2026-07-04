@@ -182,7 +182,7 @@ class RegisterLocalPdf:
             )
             if security is not None:
                 security_company = self._company_for_existing_security(
-                    uow=uow, command=command, security=security
+                    uow=uow, security=security
                 )
             normalized_credit_code = _normalize_credit_code(command.company_credit_code)
             if normalized_credit_code:
@@ -234,6 +234,16 @@ class RegisterLocalPdf:
                             "candidate uscc"
                         ),
                     )
+            if (
+                security_company is not None
+                and security_company.legal_name != command.company_legal_name
+            ):
+                raise SubjectIdentityConflictError(
+                    "security/company mismatch: "
+                    f"{command.security_code}.{command.exchange} belongs to "
+                    f"{security_company.legal_name!r}, "
+                    f"got {command.company_legal_name!r}"
+                )
 
     @staticmethod
     def _contest_identifier_and_raise(
@@ -295,7 +305,6 @@ class RegisterLocalPdf:
     def _company_for_existing_security(
         *,
         uow: UnitOfWork,
-        command: RegisterLocalPdfCommand,
         security: e.Security,
     ) -> e.Company:
         company = uow.companies.get(security.company_id)
@@ -303,12 +312,6 @@ class RegisterLocalPdf:
             raise RegistrationMetadataError(
                 f"security {security.security_id} references missing company "
                 f"{security.company_id}"
-            )
-        if company.legal_name != command.company_legal_name:
-            raise SubjectIdentityConflictError(
-                "security/company mismatch: "
-                f"{command.security_code}.{command.exchange} belongs to "
-                f"{company.legal_name!r}, got {command.company_legal_name!r}"
             )
         return company
 

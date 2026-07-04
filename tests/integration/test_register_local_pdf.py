@@ -366,6 +366,94 @@ class RegisterLocalPdfTests(unittest.TestCase):
             ).scalar_one()
         self.assertEqual(count, 0)
 
+    def test_security_legal_name_mismatch_marks_identifier_contested(self) -> None:
+        provider_document_id = "local-" + new_ulid()
+        self.provider_document_ids.append(provider_document_id)
+        credit_code = "USCC" + new_ulid()
+        company_id = "co_" + new_ulid()
+        security_id = "sec_" + new_ulid()
+        identifier_id = "ci_" + new_ulid()
+        self.extra_company_ids.append(company_id)
+        self.extra_security_ids.append(security_id)
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company "
+                    "(company_id, legal_name, unified_social_credit_code) "
+                    "VALUES (:company_id, :legal_name, :credit_code)"
+                ),
+                {
+                    "company_id": company_id,
+                    "legal_name": "Canonical Security Co",
+                    "credit_code": credit_code,
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.security "
+                    "(security_id, company_id, security_code, exchange) "
+                    "VALUES (:security_id, :company_id, :security_code, :exchange)"
+                ),
+                {
+                    "security_id": security_id,
+                    "company_id": company_id,
+                    "security_code": "SLM" + provider_document_id[-4:],
+                    "exchange": "LOCAL",
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company_identifier "
+                    "(identifier_id, company_id, scheme, raw_value, normalized_value, "
+                    "jurisdiction, status, observed_at) "
+                    "VALUES (:identifier_id, :company_id, 'uscc', :raw_value, "
+                    ":normalized_value, 'CN', 'active', now())"
+                ),
+                {
+                    "identifier_id": identifier_id,
+                    "company_id": company_id,
+                    "raw_value": credit_code,
+                    "normalized_value": credit_code,
+                },
+            )
+        command = self._command(
+            provider_document_id, self._pdf("security-legal-contested.pdf")
+        )
+        command = RegisterLocalPdfCommand(
+            file_path=command.file_path,
+            company_legal_name="Conflicting Security Co",
+            security_code="SLM" + provider_document_id[-4:],
+            exchange="LOCAL",
+            filing_type=command.filing_type,
+            title=command.title,
+            announcement_date=command.announcement_date,
+            provider_document_id=command.provider_document_id,
+            provider=command.provider,
+            report_period=command.report_period,
+            company_credit_code=credit_code,
+        )
+
+        with self.assertRaises(SubjectIdentityConflictError):
+            self.use_case.execute(command)
+
+        with self.engine.connect() as conn:
+            status = conn.execute(
+                text(
+                    "SELECT status FROM disclosure_core.company_identifier "
+                    "WHERE identifier_id = :identifier_id"
+                ),
+                {"identifier_id": identifier_id},
+            ).scalar_one()
+            document_count = conn.execute(
+                text(
+                    "SELECT count(*) FROM disclosure_core.document "
+                    "WHERE provider = 'cninfo' AND provider_document_id = :pid"
+                ),
+                {"pid": provider_document_id},
+            ).scalar_one()
+        self.assertEqual(status, "contested")
+        self.assertEqual(document_count, 0)
+
     def test_identifier_legal_name_mismatch_marks_identifier_contested(self) -> None:
         provider_document_id = "local-" + new_ulid()
         self.provider_document_ids.append(provider_document_id)
