@@ -32,6 +32,18 @@ def _content_list_from_ref(sample_key: str) -> Path | None:
     return None
 
 
+def _load_fixture(sample_key: str) -> dict:
+    return json.loads(
+        (PHASE00_ROOT / sample_key / "normalized_ir.v2.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+def _table_elements(payload: dict) -> list[dict]:
+    return [element for element in payload["elements"] if element["kind"] == "table"]
+
+
 class NormalizedIRContractTests(unittest.TestCase):
     def _schema(self) -> dict:
         return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -202,6 +214,56 @@ class NormalizedIRContractTests(unittest.TestCase):
             normalized["elements"][1]["table"],
             {"headers": ["项目", "金额"], "rows": [["收入", "10"]]},
         )
+
+    def test_ir_activity_first_table_preserves_embedded_qa_text(self) -> None:
+        data = _load_fixture("ir_activity")
+        first_table = min(_table_elements(data), key=lambda item: item["order_index"])
+        rows = first_table["table"]["rows"]
+
+        self.assertGreater(len(rows), 0)
+        joined_cells = "".join(cell for row in rows for cell in row)
+        self.assertIn("？", joined_cells)
+
+    def test_annual_report_excerpt_has_one_structured_table(self) -> None:
+        data = _load_fixture("annual_report_excerpt")
+        tables = _table_elements(data)
+
+        self.assertEqual(len(tables), 1)
+        self._assert_table_structured_or_failed(
+            tables[0], label="annual_excerpt", require_content=True
+        )
+
+    def test_optional_annual_report_tables_are_structured_when_present(self) -> None:
+        path = PHASE00_ROOT / "annual_report" / "normalized_ir.v2.json"
+        if not path.is_file():
+            self.skipTest("optional full annual_report normalized_ir fixture is absent")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        tables = _table_elements(data)
+        if not tables:
+            self.skipTest("optional full annual_report fixture has no table elements")
+
+        unfailed = [
+            table for table in tables if not table.get("table_parse_failed", False)
+        ]
+        self.assertGreaterEqual(len(unfailed) / len(tables), 0.95)
+        for index, table in enumerate(unfailed):
+            self._assert_table_structured_or_failed(
+                table, label=f"annual_report_table_{index}", require_content=False
+            )
+
+    def _assert_table_structured_or_failed(
+        self, element: dict, *, label: str, require_content: bool
+    ) -> None:
+        if element.get("table_parse_failed"):
+            return
+        table = element.get("table") or {}
+        headers = table.get("headers") or []
+        rows = table.get("rows") or []
+        if require_content:
+            self.assertGreater(len(headers), 0, label)
+            self.assertGreater(len(rows), 0, label)
+        for row in rows:
+            self.assertEqual(len(row), len(headers), label)
 
 
 if __name__ == "__main__":

@@ -192,7 +192,7 @@ def _table_grid(source_rows: list[list[_TableCell]]) -> dict[str, Any]:
             for row_index in range(max_row + 1)
         ]
         first_row_is_header = bool(source_rows and any(cell.is_header for cell in source_rows[0]))
-        if not first_row_is_header and len(grid) > 1:
+        if not first_row_is_header and grid:
             first_row_is_header = True
         if first_row_is_header:
             table = {"headers": grid[0], "rows": grid[1:]}
