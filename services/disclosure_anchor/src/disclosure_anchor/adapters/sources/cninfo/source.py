@@ -9,6 +9,7 @@ from disclosure_anchor.adapters.sources.cninfo.client import CninfoClient
 from disclosure_anchor.adapters.sources.cninfo.mapper import (
     CninfoCompanyProfile,
     category_prefix_matches,
+    derive_report_period,
     load_filing_type_rule_bundle,
     map_filing_type,
     map_p_info3015_record,
@@ -53,13 +54,17 @@ class CninfoSource:
             if not isinstance(record, dict):
                 continue
             mapped = map_p_info3015_record(record)
+            filing_type = map_filing_type(
+                mapped.raw_category,
+                category_names_by_code=names,
+                rule_bundle=self._rule_bundle,
+            )
             refs.append(
                 replace(
                     mapped,
-                    filing_type=map_filing_type(
-                        mapped.raw_category,
-                        category_names_by_code=names,
-                        rule_bundle=self._rule_bundle,
+                    filing_type=filing_type,
+                    report_period=derive_report_period(
+                        mapped.title, filing_type=filing_type
                     ),
                 )
             )

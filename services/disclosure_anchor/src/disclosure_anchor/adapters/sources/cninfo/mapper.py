@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 import json
 from importlib import resources
+import re
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
@@ -15,7 +16,7 @@ from disclosure_anchor.application.ports.disclosure_source import (
     SourceCompanyProfile,
 )
 from disclosure_anchor.domain.errors import DisclosureAnchorError
-from disclosure_anchor.domain.value_objects import validate_filing_type
+from disclosure_anchor.domain.value_objects import ReportPeriod, validate_filing_type
 
 
 CNINFO_PROVIDER = "cninfo"
@@ -102,6 +103,42 @@ def map_filing_type(
             if _rule_matches(rule=rule, haystacks=haystacks):
                 return rule.filing_type
     return "other"
+
+
+_TITLE_YEAR_RE = re.compile(r"(20\d{2})\s*年")
+_TITLE_QUARTER_RE = re.compile(r"第?([一二三四1-4])季")
+_QUARTER_BY_TOKEN = {"一": "1", "二": "2", "三": "3", "四": "4", "1": "1", "2": "2", "3": "3", "4": "4"}
+
+
+def derive_report_period(title: str, *, filing_type: str) -> str | None:
+    """Derive report_period from the announcement title (07 §3.2 closed rule).
+
+    p_info3015 has no report-period field, so the fiscal period comes from the
+    title text only — never from the announcement date (annual reports are
+    published the following year). Underivable titles return None; a null
+    period must not block registration.
+    """
+
+    year_match = _TITLE_YEAR_RE.search(title)
+    if year_match is None:
+        return None
+    year = year_match.group(1)
+    if filing_type == "annual_report":
+        label = f"{year}A"
+    elif filing_type == "semiannual_report":
+        label = f"{year}Q2"
+    elif filing_type == "quarterly_report":
+        quarter_match = _TITLE_QUARTER_RE.search(title)
+        if quarter_match is None:
+            return None
+        label = f"{year}Q{_QUARTER_BY_TOKEN[quarter_match.group(1)]}"
+    else:
+        return None
+    try:
+        ReportPeriod.parse(label)
+    except ValueError:
+        return None
+    return label
 
 
 def split_category_segments(raw_category: str) -> list[str]:

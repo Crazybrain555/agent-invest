@@ -34,6 +34,7 @@ from disclosure_anchor.domain.errors import (
     RegistrationMetadataError,
     SourceRequestError,
 )
+from disclosure_anchor.domain.value_objects import ReportPeriod
 
 
 DOWNLOAD_INTERFACE = "cninfo:download_pdf"
@@ -176,7 +177,7 @@ class DownloadDocument:
                     title=ref.title,
                     filing_type=_candidate_str(candidate, "filing_type", default="other"),
                     announcement_date=ref.announcement_date,
-                    report_period=None,
+                    report_period=_candidate_report_period(candidate),
                     filename=f"{ref.provider_document_id}.pdf",
                     provider_metadata=_provider_metadata(
                         candidate, oversized_kb=command.oversized_kb
@@ -294,6 +295,17 @@ def _provider_metadata(
     if isinstance(file_size, (int, float)) and file_size > oversized_kb:
         metadata["oversized"] = True
     return metadata
+
+
+def _candidate_report_period(candidate: Mapping[str, object]) -> ReportPeriod | None:
+    value = candidate.get("report_period")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return ReportPeriod.parse(value)
+    except ValueError:
+        # Null report_period must never block registration (07 §3.2).
+        return None
 
 
 def _candidate_mapping(candidate: Mapping[str, object], key: str) -> Mapping[str, object]:

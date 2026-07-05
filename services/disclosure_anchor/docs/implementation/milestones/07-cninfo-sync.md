@@ -89,6 +89,14 @@ core.tracked_company（0001 已有表，单数名；≥500 精选池，本期验
    原始分类 / orgId 等稳定小体积 provider 元数据落 `document.provider_metadata`（0007 列，
    E10）；完整 index response 留在 `source_access.result_snapshot`，两者分工不重叠。
    临时公告 `report_period=null` 合法（B8），不得为凑格式伪造 period。
+   **report_period 推导（2026-07-05 评审补充；官方 p_info3015 无报告期字段，只能从标题推导）**：
+   filing_type 映射完成后按类型施加封闭规则（实现在 adapter mapper，随 AnnouncementRef 进候选）：
+   - `annual_report`：标题匹配 `(20\d{2})\s*年` 取首个年份 → `{year}A`；
+   - `semiannual_report`：同上取年份 → `{year}Q2`；
+   - `quarterly_report`：年份 + `第?([一二三四1-4])季` → `{year}Q{n}`（一/1→Q1…四/4→Q4）；
+   - 其余 filing_type 不推导。任一步提取失败或 `ReportPeriod.parse` 不通过 → null，
+   **null 一律照常入库不阻断**（规则随观察渐进收紧，禁止因缺 period 拒绝登记）。
+   推导只依据标题字面，不用公告日期猜财年（年报在次年发布，日期推导必错）。
 3. **主体建档**：走 `SubjectResolver`（D5 顺序 + identifier ledger）。orgId/USCC 的取得通道
    定死（p_info3015 响应**没有** ORGID/USCC，它们在 p_stock2100）：每次 sync 开始对目标公司调
    一次 p_stock2100（scode 传入，写 source_access，provider_interface='cninfo:p_stock2100'），

@@ -10,6 +10,7 @@ import unittest
 from disclosure_anchor.adapters.sources.cninfo.mapper import (
     CninfoMappingError,
     category_prefix_matches,
+    derive_report_period,
     load_filing_type_rule_bundle,
     map_filing_type,
     map_p_info3015_record,
@@ -72,6 +73,36 @@ class CninfoMapperTests(unittest.TestCase):
             map_filing_type("第一季度报告", category_names_by_code={}),
             "quarterly_report",
         )
+
+    def test_report_period_derivation_from_real_title_shapes(self) -> None:
+        cases = [
+            ("江海股份：2025年年度报告", "annual_report", "2025A"),
+            ("2025年年度报告（更正后）", "annual_report", "2025A"),
+            ("平安银行：2025年半年度报告", "semiannual_report", "2025Q2"),
+            ("贵州茅台：2026年第一季度报告", "quarterly_report", "2026Q1"),
+            ("比亚迪：2026年一季度报告", "quarterly_report", "2026Q1"),
+            ("某公司：2025年第三季度报告", "quarterly_report", "2025Q3"),
+            ("某公司：2026年1季度报告", "quarterly_report", "2026Q1"),
+        ]
+        for title, filing_type, expected in cases:
+            self.assertEqual(
+                derive_report_period(title, filing_type=filing_type), expected, title
+            )
+
+    def test_report_period_underivable_returns_none_and_never_raises(self) -> None:
+        cases = [
+            # No year in title.
+            ("半年报董事会决议公告", "semiannual_report"),
+            # Chinese-numeral year (H-share style) is out of the closed rule.
+            ("H股公告（二零二五年年度业绩公布）", "annual_report"),
+            # Quarterly without a quarter token.
+            ("2026年报告", "quarterly_report"),
+            # Non-periodic filing types never derive.
+            ("2025年年度权益分派实施公告", "other"),
+            ("关于2026年度担保计划的公告", "investor_relations"),
+        ]
+        for title, filing_type in cases:
+            self.assertIsNone(derive_report_period(title, filing_type=filing_type), title)
 
     def test_filing_type_mapping_returns_first_non_other_match(self) -> None:
         filing_type = map_filing_type(

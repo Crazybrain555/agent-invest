@@ -49,6 +49,7 @@ class AnnouncementRef:
     file_size: int | float | str | None
     index_updated_at: datetime | None
     filing_type: str | None = None
+    report_period: str | None = None
     object_id: int | str | None = None
     rec_id: str | None = None
     format: str | None = None
