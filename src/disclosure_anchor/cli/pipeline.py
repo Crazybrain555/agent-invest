@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, is_dataclass
 from datetime import date
+import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -204,10 +206,20 @@ def _register_command(args: argparse.Namespace) -> RegisterLocalPdfCommand:
         filing_type=args.filing_type,
         title=args.title,
         announcement_date=date.fromisoformat(args.announcement_date),
-        provider_document_id=args.provider_document_id or args.file.stem,
+        provider_document_id=args.provider_document_id
+        or _default_provider_document_id(args.file),
         provider=args.provider,
         report_period=report_period,
     )
+
+
+def _default_provider_document_id(file_path: Path) -> str:
+    stem = file_path.stem
+    suffix = stem.rsplit("__", 1)[-1]
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", suffix):
+        return suffix
+    digest = hashlib.sha256(stem.encode("utf-8")).hexdigest()[:16]
+    return f"local-{digest}"
 
 
 def _stage_succeeded(stage: str, result: Any) -> bool:

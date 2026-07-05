@@ -27,12 +27,12 @@ class PipelineCliTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(parser.parse_args(argv).command, command)
 
-    def test_register_command_defaults_provider_document_id_to_file_stem(self) -> None:
+    def test_register_command_defaults_provider_document_id_to_safe_suffix(self) -> None:
         args = pipeline._parser().parse_args(
             [
                 "register",
                 "--file",
-                "sample.pdf",
+                "2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169.pdf",
                 "--provider",
                 "cninfo",
                 "--security-code",
@@ -52,10 +52,56 @@ class PipelineCliTests(unittest.TestCase):
 
         command = pipeline._register_command(args)
 
-        self.assertEqual(command.file_path, Path("sample.pdf"))
-        self.assertEqual(command.provider_document_id, "sample")
+        self.assertEqual(
+            command.file_path,
+            Path("2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169.pdf"),
+        )
+        self.assertEqual(command.provider_document_id, "1225087169")
         self.assertEqual(str(command.report_period), "2025A")
         self.assertEqual(command.company_legal_name, command.title)
+
+    def test_register_command_defaults_provider_document_id_to_hash_fallback(self) -> None:
+        args = pipeline._parser().parse_args(
+            [
+                "register",
+                "--file",
+                "样本公告.pdf",
+                "--provider",
+                "cninfo",
+                "--security-code",
+                "002484",
+                "--exchange",
+                "szse",
+                "--filing-type",
+                "other",
+                "--title",
+                "样本公告",
+                "--announcement-date",
+                "2026-04-10",
+            ]
+        )
+
+        command = pipeline._register_command(args)
+
+        self.assertRegex(command.provider_document_id, r"^local-[a-f0-9]{16}$")
+
+    def test_parse_failed_result_returns_nonzero(self) -> None:
+        deps = _deps_type(
+            parse_result=ParseDocumentResult(
+                processing_run_id="run_1",
+                status="failed",
+                error={"error_code": "parser_invocation_failed"},
+            )
+        )
+
+        code, stdout, stderr = _run_main(["parse", "--document-id", "doc_1"], deps)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["stage"], "parse")
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["result"]["error"]["error_code"], "parser_invocation_failed")
 
     def test_build_units_failed_result_returns_nonzero(self) -> None:
         deps = _deps_type(
@@ -77,6 +123,26 @@ class PipelineCliTests(unittest.TestCase):
         self.assertEqual(payload["stage"], "build-units")
         self.assertEqual(payload["status"], "failed")
         self.assertEqual(payload["result"]["error"]["error_code"], "ARTIFACT_WRITE_FAILED")
+
+    def test_process_stops_after_parse_failed_result(self) -> None:
+        deps = _deps_type(
+            parse_result=ParseDocumentResult(
+                processing_run_id="run_1",
+                status="failed",
+                error={"error_code": "parser_invocation_failed"},
+            ),
+            build_result=AssertionError("build-units must not run"),
+            publish_result=AssertionError("publish must not run"),
+        )
+
+        code, stdout, stderr = _run_main(["process", "--document-id", "doc_1"], deps)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["stage"], "parse")
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["result"]["error"]["error_code"], "parser_invocation_failed")
 
     def test_process_stops_after_build_failed_result(self) -> None:
         deps = _deps_type(
