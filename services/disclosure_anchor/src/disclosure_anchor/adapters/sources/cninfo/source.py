@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import replace
+from datetime import date, timedelta
+import json
+from importlib import resources
 
 from disclosure_anchor.adapters.sources.cninfo.client import CninfoClient
 from disclosure_anchor.adapters.sources.cninfo.mapper import (
@@ -20,6 +23,13 @@ from disclosure_anchor.application.ports.disclosure_source import (
     DisclosureWindow,
     SourceSecurity,
 )
+from disclosure_anchor.domain.errors import SourceRequestError
+
+
+# Observed 2026-07-06: the gateway intermittently rejects large-span windows
+# with 403 HTML pages; the official doc also recommends small windows. Chunking
+# keeps each request well inside safe territory.
+INDEX_WINDOW_CHUNK_DAYS = 30
 
 
 class CninfoSource:
@@ -36,38 +46,45 @@ class CninfoSource:
         window: DisclosureWindow,
         categories: Sequence[str] | None = None,
     ) -> list[AnnouncementRef]:
-        response = self._client.get_json(
-            provider_interface="cninfo:p_info3015",
-            path="/api/info/p_info3015",
-            params={
-                "scode": security.security_code,
-                "sdate": window.start.isoformat(),
-                "edate": window.end.isoformat(),
-            },
-        )
-        records = response.payload.get("records", [])
-        if not isinstance(records, list):
-            return []
         names = self._category_names_cached()
         refs: list[AnnouncementRef] = []
-        for record in records:
-            if not isinstance(record, dict):
+        seen_provider_document_ids: set[str] = set()
+        for chunk_start, chunk_end in _window_chunks(
+            window.start, window.end, INDEX_WINDOW_CHUNK_DAYS
+        ):
+            response = self._client.get_json(
+                provider_interface="cninfo:p_info3015",
+                path="/api/info/p_info3015",
+                params={
+                    "scode": security.security_code,
+                    "sdate": chunk_start.isoformat(),
+                    "edate": chunk_end.isoformat(),
+                },
+            )
+            records = response.payload.get("records", [])
+            if not isinstance(records, list):
                 continue
-            mapped = map_p_info3015_record(record)
-            filing_type = map_filing_type(
-                mapped.raw_category,
-                category_names_by_code=names,
-                rule_bundle=self._rule_bundle,
-            )
-            refs.append(
-                replace(
-                    mapped,
-                    filing_type=filing_type,
-                    report_period=derive_report_period(
-                        mapped.title, filing_type=filing_type
-                    ),
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                mapped = map_p_info3015_record(record)
+                if mapped.provider_document_id in seen_provider_document_ids:
+                    continue
+                seen_provider_document_ids.add(mapped.provider_document_id)
+                filing_type = map_filing_type(
+                    mapped.raw_category,
+                    category_names_by_code=names,
+                    rule_bundle=self._rule_bundle,
                 )
-            )
+                refs.append(
+                    replace(
+                        mapped,
+                        filing_type=filing_type,
+                        report_period=derive_report_period(
+                            mapped.title, filing_type=filing_type
+                        ),
+                    )
+                )
         return [
             ref
             for ref in refs
@@ -75,8 +92,20 @@ class CninfoSource:
         ]
 
     def _category_names_cached(self) -> dict[str, str]:
+        """Fetch live category names; fall back to the shipped snapshot.
+
+        filing_type classification depends on code→name resolution, so a
+        transient p_info3005 outage must degrade to the snapshot instead of
+        classifying every announcement as `other`.
+        """
+
         if self._category_names is None:
-            self._category_names = self.category_names_by_code()
+            try:
+                self._category_names = self.category_names_by_code()
+            except SourceRequestError:
+                self._category_names = {}
+            if not self._category_names:
+                self._category_names = _fallback_category_names()
         return self._category_names
 
     def profile_for_security(self, security_code: str) -> CninfoCompanyProfile | None:
@@ -119,3 +148,30 @@ class CninfoSource:
             params={},
         )
         return payload
+
+
+def _window_chunks(
+    start: date, end: date, chunk_days: int
+) -> Iterator[tuple[date, date]]:
+    """Split [start, end] (inclusive) into consecutive chunks of chunk_days."""
+
+    cursor = start
+    while cursor <= end:
+        chunk_end = min(cursor + timedelta(days=chunk_days - 1), end)
+        yield cursor, chunk_end
+        cursor = chunk_end + timedelta(days=1)
+
+
+def _fallback_category_names() -> dict[str, str]:
+    raw = (
+        resources.files("disclosure_anchor.adapters.sources.cninfo")
+        .joinpath("category_names_fallback.json")
+        .read_text(encoding="utf-8")
+    )
+    payload = json.loads(raw)
+    names = payload.get("names", {})
+    return {
+        str(code): str(name)
+        for code, name in names.items()
+        if isinstance(code, str) and isinstance(name, str)
+    }

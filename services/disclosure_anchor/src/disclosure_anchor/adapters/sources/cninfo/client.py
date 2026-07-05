@@ -205,7 +205,15 @@ class CninfoClient:
                 retryable=response.status_code == 429 or response.status_code >= 500,
                 audit=audit,
             )
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise CninfoClientError(
+                "CNINFO token response body is not JSON",
+                error_code="non_json_response",
+                retryable=True,
+                audit=audit,
+            ) from exc
         token = payload.get("access_token")
         if not isinstance(token, str) or not token:
             raise CninfoClientError(
@@ -226,11 +234,18 @@ class CninfoClient:
         attempt = 0
         refreshed_after_token_error = False
         while True:
-            response = self._request_json_once(
-                provider_interface=provider_interface,
-                path=path,
-                params=params,
-            )
+            try:
+                response = self._request_json_once(
+                    provider_interface=provider_interface,
+                    path=path,
+                    params=params,
+                )
+            except CninfoClientError as exc:
+                if not exc.retryable or attempt >= self._max_retries:
+                    raise
+                self._sleep(self._next_delay(attempt))
+                attempt += 1
+                continue
             resultcode = response.audit.resultcode
             if response.audit.http_status < 400 and resultcode == 200:
                 return response
@@ -271,7 +286,7 @@ class CninfoClient:
         self._bucket.take()
         http_response = self._client.get(url, params=_http_params(params))
         elapsed_ms = _elapsed_ms(started)
-        payload = _json_payload(http_response)
+        payload = _json_payload(http_response, provider_interface=provider_interface)
         resultcode = _resultcode(payload)
         audit = RequestAudit(
             provider_interface=provider_interface,
@@ -369,10 +384,25 @@ def _elapsed_ms(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
 
 
-def _json_payload(response: httpx.Response) -> dict[str, Any]:
+def _json_payload(response: httpx.Response, *, provider_interface: str) -> dict[str, Any]:
+    """Parse a JSON body; non-JSON (e.g. gateway 403 HTML pages) is retryable.
+
+    Observed 2026-07-06: the CNINFO gateway intermittently answers otherwise
+    valid requests with an HTML block page, so a non-JSON body means "try
+    again", not "bad contract".
+    """
+
     if not response.content:
         return {}
-    payload = response.json()
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise CninfoClientError(
+            f"CNINFO returned a non-JSON body for {provider_interface} "
+            f"(http_status={response.status_code})",
+            error_code="non_json_response",
+            retryable=True,
+        ) from exc
     if not isinstance(payload, dict):
         raise CninfoClientError(
             "CNINFO response JSON root must be an object",

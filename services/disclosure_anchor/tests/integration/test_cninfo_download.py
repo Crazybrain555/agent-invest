@@ -63,9 +63,16 @@ class CninfoDownloadIntegrationTests(unittest.TestCase):
             path_builder=FileStorePathBuilder(self.settings),
             uow_factory=lambda: SqlAlchemyUnitOfWork(engine=self.engine),
         )
-        pending = downloader.list_pending_candidates(
-            max_retries=3, overlap_start=date(2026, 6, 25)
-        )
+        pending = [
+            candidate
+            for candidate in downloader.list_pending_candidates(
+                max_retries=3, overlap_start=date(2026, 6, 25)
+            )
+            # The shared live DB may hold real cninfo candidates; only this
+            # test's namespaced fixtures may be driven through the fake source.
+            if str(candidate.get("provider_document_id", "")).startswith("cninfo-test-")
+        ]
+        self.assertTrue(pending, "expected the test fixture candidate to be pending")
 
         result = downloader.execute(DownloadDocumentCommand(candidate=pending[0]))
 
@@ -186,6 +193,11 @@ class FakeCninfoSource:
         return self.refs
 
     def download_pdf(self, ref: AnnouncementRef) -> bytes:
+        owned = {item.provider_document_id for item in self.refs}
+        if ref.provider_document_id not in owned:
+            raise AssertionError(
+                f"fake source asked to download foreign ref {ref.provider_document_id}"
+            )
         return self.pdf_bytes
 
 
