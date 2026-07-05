@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -90,6 +91,23 @@ def _normalized_ir() -> dict:
     }
 
 
+def _image_ir() -> dict:
+    return {
+        **_normalized_ir(),
+        "elements": [
+            {
+                "ir_id": "ir_image",
+                "kind": "image",
+                "raw_kind": "image",
+                "order_index": 1,
+                "source_item_index": 1,
+                "caption": "股权结构图",
+                "image_path": "images/plot.png",
+            }
+        ],
+    }
+
+
 def _uow(root: Path, *, contract_version: str = "normalized_ir.v2") -> tuple[FakeUnitOfWork, Path]:
     uow = FakeUnitOfWork()
     company = uow.companies.add(e.Company(company_id="co_1", legal_name="江海股份"))
@@ -164,6 +182,34 @@ class BuildUnitsTests(unittest.TestCase):
             stats_path = snapshot_path.parent / "build_stats.v1.json"
             stats = json.loads(stats_path.read_text(encoding="utf-8"))
             self.assertEqual(stats["generated_by_kind"]["text"], 1)
+
+    def test_build_resolves_non_hash_image_from_parser_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_bytes = b"not already content addressed"
+            uow, ir_relpath = _uow(root)
+            image_path = root / "parser/a/images/plot.png"
+            image_path.parent.mkdir(parents=True)
+            image_path.write_bytes(image_bytes)
+            (root / ir_relpath).write_text(
+                json.dumps(_image_ir(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            paths = _PathBuilder(root)
+            use_case = BuildUnits(
+                path_builder=paths,
+                artifact_store=ArtifactStore(paths),
+                uow_factory=lambda: uow,
+            )
+
+            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+            self.assertEqual(result.status, "succeeded")
+            units = uow.document_units.list_by_processing_run("run_1")
+            self.assertEqual(len(units), 1)
+            digest = hashlib.sha256(image_bytes).hexdigest()
+            self.assertEqual(units[0].payload["image_ref"], f"images/{digest}.png")
+            self.assertEqual(units[0].quality_status, "needs_review")
 
     def test_rejects_old_ir_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

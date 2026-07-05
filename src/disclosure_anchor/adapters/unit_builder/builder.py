@@ -41,6 +41,7 @@ class UnitDraft:
     payload_kind: str
     payload: dict[str, Any]
     source_order: int
+    intra_order: int = 0
     heading_path: list[str] = field(default_factory=list)
     title: str | None = None
     semantic_key: str | None = None
@@ -292,7 +293,8 @@ def s4_build_qa_units(text: str, *, source: UnitDraft) -> QaParseResult:
                     "answer": answer,
                     "raw_text": "\n".join(raw_lines).strip(),
                 },
-                source_order=source.source_order + len(units),
+                source_order=source.source_order,
+                intra_order=source.intra_order + len(units),
                 heading_path=list(source.heading_path),
                 title=source.title,
                 quality_status=source.quality_status,
@@ -458,9 +460,13 @@ def build_unit_drafts_s1_s7(
     text_units = replace_text_units_with_qa_where_stable(s3_build_text_units(placed))
     table_units = s5_build_table_units(placed, s1.stats)
     table_qa_units = _qa_units_from_tables(table_units)
-    units = sorted([*text_units, *table_units, *table_qa_units], key=lambda item: item.source_order)
+    units = sorted([*text_units, *table_units, *table_qa_units], key=_unit_sort_key)
     kept = s6_filter_units(units, s1.stats)
     return s7_finalize_units(kept, filing_type=filing_type, stats=s1.stats), s1.stats
+
+
+def _unit_sort_key(unit: UnitDraft) -> tuple[int, int]:
+    return (unit.source_order, unit.intra_order)
 
 
 def semantic_key_for_unit(unit: UnitDraft, *, filing_type: str | None) -> str | None:
@@ -600,7 +606,8 @@ def _split_numbered_text_block(
             UnitDraft(
                 payload_kind="text",
                 payload={"text": line},
-                source_order=source.order_index + offset,
+                source_order=source.order_index,
+                intra_order=offset,
                 heading_path=list(source.heading_path),
                 title=source.title,
                 quality_status=quality_status,
@@ -853,7 +860,8 @@ def _qa_units_from_tables(table_units: Iterable[UnitDraft]) -> list[UnitDraft]:
                     UnitDraft(
                         **{
                             **unit.__dict__,
-                            "source_order": table.source_order + offset + len(units),
+                            "source_order": table.source_order,
+                            "intra_order": table.intra_order + offset + len(units),
                         }
                     )
                 )

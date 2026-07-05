@@ -13,6 +13,7 @@ from typing import Any
 from disclosure_anchor.adapters.unit_builder import rules
 from disclosure_anchor.adapters.unit_builder.builder import (
     BuildStats,
+    ImageBytesResolver,
     UnitDraft,
     build_unit_drafts_s1_s7,
 )
@@ -80,6 +81,7 @@ class BuildUnits:
         drafts, stats = build_unit_drafts_s1_s7(
             normalized_ir,
             filing_type=context["document"].filing_type,
+            image_bytes_resolver=self._image_bytes_resolver(normalized_ir),
         )
         units, snapshot_rows = self._materialize_units(
             drafts=drafts,
@@ -228,6 +230,21 @@ class BuildUnits:
                 )
             )
         return payload
+
+    def _image_bytes_resolver(
+        self, normalized_ir: dict[str, Any]
+    ) -> ImageBytesResolver | None:
+        parser_artifacts = normalized_ir.get("parser_artifacts") or {}
+        artifact_root = parser_artifacts.get("artifact_root_relpath")
+        if not artifact_root:
+            return None
+        artifact_root_relpath = Path(str(artifact_root))
+
+        def resolve(image_path: str) -> bytes:
+            relpath = artifact_root_relpath / Path(image_path)
+            return self._paths.data_path(relpath).read_bytes()
+
+        return resolve
 
     def _materialize_units(
         self,

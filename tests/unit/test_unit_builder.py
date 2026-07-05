@@ -138,6 +138,73 @@ class UnitBuilderTests(unittest.TestCase):
         self.assertEqual(len(units), 3)
         self.assertTrue(all(unit.payload_kind == "text" for unit in units))
 
+    def test_full_s1_s7_split_numbered_text_stays_before_following_table(self) -> None:
+        long_items = "\n".join(
+            f"{idx}、" + "经营情况说明" * 12
+            for idx in range(1, 4)
+        )
+
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": long_items,
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 2,
+                        "table_caption": ["收入表"],
+                        "table": {"headers": ["项目"], "rows": [["收入"]]},
+                    },
+                ]
+            },
+            filing_type="other",
+        )
+
+        self.assertEqual(
+            [unit.payload_kind for unit in units],
+            ["text", "text", "text", "table"],
+        )
+        self.assertEqual(units[0].payload["text"].split("、", 1)[0], "1")
+        self.assertEqual(units[1].payload["text"].split("、", 1)[0], "2")
+        self.assertEqual(units[2].payload["text"].split("、", 1)[0], "3")
+
+    def test_full_s1_s7_table_qa_stays_before_following_text(self) -> None:
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 1,
+                        "table_caption": ["投关问答"],
+                        "table": {
+                            "headers": ["内容"],
+                            "rows": [["问:产能如何？\n答:产能稳定。"]],
+                        },
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "后续正文。",
+                    },
+                ]
+            },
+            filing_type="investor_relations",
+        )
+
+        self.assertEqual(
+            [unit.payload_kind for unit in units],
+            ["table", "qa", "text"],
+        )
+        self.assertEqual(units[1].payload["question"], "产能如何？")
+        self.assertEqual(units[2].payload["text"], "后续正文。")
+
     def test_s4_parses_chinese_qa_and_rejects_unstable_boundaries(self) -> None:
         source = UnitDraft(
             payload_kind="text",
