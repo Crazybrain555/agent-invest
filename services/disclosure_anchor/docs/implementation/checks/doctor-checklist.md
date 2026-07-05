@@ -28,7 +28,7 @@ DISCLOSURE_RUNTIME_ROOT 指向 /Volumes/AgentSSD/agent_system/services/disclosur
 
 ```text
 PG localhost TCP（127.0.0.1:55432）或 AgentSSD socket 可连接
-当前 database 是 disclosure_anchor
+当前 database 是 invest_engine（monorepo 共库，本服务只拥有 disclosure_* schema）
 migration version 最新
 disclosure_core / disclosure_public / disclosure_ops 存在
 当前 app role 权限正确

@@ -1,6 +1,6 @@
 """Shared helpers for Phase 02 PostgreSQL integration tests.
 
-Integration tests require a migrated local ``disclosure_anchor`` database. When
+Integration tests require a migrated local ``invest_engine`` database. When
 the database URL is absent or the cluster is unreachable / unmigrated, tests skip
 cleanly so the suite stays green without external resources.
 """

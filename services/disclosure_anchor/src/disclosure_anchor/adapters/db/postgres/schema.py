@@ -6,7 +6,7 @@ ORM models and tests so the names never drift across the codebase.
 
 from __future__ import annotations
 
-# Schemas inside the disclosure_anchor database.
+# Schemas owned by this service inside the shared agent-invest database.
 CORE_SCHEMA = "disclosure_core"
 PUBLIC_SCHEMA = "disclosure_public"
 OPS_SCHEMA = "disclosure_ops"
@@ -22,8 +22,8 @@ FUTURE_L2_READER_ROLE = "future_l2_reader"
 ALL_ROLES = (OWNER_ROLE, APP_ROLE, READER_ROLE, FUTURE_L2_READER_ROLE)
 READ_ONLY_PUBLIC_ROLES = (READER_ROLE, FUTURE_L2_READER_ROLE)
 
-# Default database name owned by this service.
-DATABASE_NAME = "disclosure_anchor"
+# Shared monorepo database; this service owns only the disclosure_* schemas in it.
+DATABASE_NAME = "invest_engine"
 
 # Alembic version table lives in the ops schema, not the implicit public schema.
 ALEMBIC_VERSION_TABLE = "alembic_version"
