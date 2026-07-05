@@ -299,6 +299,32 @@ class UnitBuilderTests(unittest.TestCase):
         self.assertEqual(units[0].payload, {"caption": ["失败表"], "raw_html": "<table>", "notes": ["注"]})
         self.assertEqual(units[0].quality_status, "needs_review")
 
+    def test_full_s1_s7_preserves_table_parse_failed_raw_html(self) -> None:
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 1,
+                        "table_caption": ["失败表"],
+                        "table_footnote": ["注"],
+                        "table_html": "<table>",
+                        "table_parse_failed": True,
+                        "table": {"headers": [], "rows": []},
+                    }
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].payload_kind, "table")
+        self.assertEqual(units[0].payload, {"caption": ["失败表"], "raw_html": "<table>", "notes": ["注"]})
+        self.assertEqual(units[0].quality_status, "needs_review")
+        self.assertEqual(stats.generated_by_kind["table"], 1)
+        self.assertEqual(stats.dropped_by_kind["table_empty"], 0)
+
     def test_payload_inner_key_contracts_by_kind(self) -> None:
         text_unit = s3_build_text_units(
             [PreparedElement(kind="text", order_index=1, text="正文")]

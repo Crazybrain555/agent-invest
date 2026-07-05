@@ -87,10 +87,16 @@ def main(argv: list[str] | None = None) -> int:
             result = deps.register().execute(_register_command(args))
         elif args.command == "parse":
             result = deps.parse().execute(ParseDocumentCommand(document_id=args.document_id))
+            if not _stage_succeeded("parse", result):
+                _print_failed_stage("parse", result)
+                return 1
         elif args.command == "build-units":
             result = deps.build_units().execute(
                 BuildUnitsCommand(document_id=args.document_id)
             )
+            if not _stage_succeeded("build-units", result):
+                _print_failed_stage("build-units", result)
+                return 1
         elif args.command == "publish":
             result = deps.publish().execute(
                 PublishRunCommand(
@@ -99,13 +105,22 @@ def main(argv: list[str] | None = None) -> int:
                     reason=args.reason,
                 )
             )
+            if not _stage_succeeded("publish", result):
+                _print_failed_stage("publish", result)
+                return 1
         elif args.command == "process":
             parse_result = deps.parse().execute(
                 ParseDocumentCommand(document_id=args.document_id)
             )
+            if not _stage_succeeded("parse", parse_result):
+                _print_failed_stage("parse", parse_result)
+                return 1
             build_result = deps.build_units().execute(
                 BuildUnitsCommand(processing_run_id=parse_result.processing_run_id)
             )
+            if not _stage_succeeded("build-units", build_result):
+                _print_failed_stage("build-units", build_result)
+                return 1
             publish_result = deps.publish().execute(
                 PublishRunCommand(
                     processing_run_id=parse_result.processing_run_id,
@@ -113,6 +128,9 @@ def main(argv: list[str] | None = None) -> int:
                     reason=args.reason,
                 )
             )
+            if not _stage_succeeded("publish", publish_result):
+                _print_failed_stage("publish", publish_result)
+                return 1
             result = {
                 "parse": _jsonable(parse_result),
                 "build_units": _jsonable(build_result),
@@ -190,6 +208,20 @@ def _register_command(args: argparse.Namespace) -> RegisterLocalPdfCommand:
         provider=args.provider,
         report_period=report_period,
     )
+
+
+def _stage_succeeded(stage: str, result: Any) -> bool:
+    expected = "published" if stage == "publish" else "succeeded"
+    return getattr(result, "status", None) == expected
+
+
+def _print_failed_stage(stage: str, result: Any) -> None:
+    payload = {
+        "stage": stage,
+        "status": getattr(result, "status", None),
+        "result": _jsonable(result),
+    }
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True), file=sys.stderr)
 
 
 def _jsonable(value: Any) -> Any:

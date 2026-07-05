@@ -795,6 +795,8 @@ def _matching_skip_title(unit: UnitDraft) -> str | None:
 
 
 def _table_payload_is_empty(payload: dict[str, Any]) -> bool:
+    if str(payload.get("raw_html") or "").strip():
+        return False
     rows = payload.get("rows") or []
     if not rows:
         return True
@@ -831,6 +833,8 @@ def _main_text(unit: UnitDraft) -> str:
     if unit.payload_kind == "qa":
         return str(unit.payload.get("question") or "") + str(unit.payload.get("answer") or "")
     if unit.payload_kind == "table":
+        if "raw_html" in unit.payload:
+            return str(unit.payload.get("raw_html") or "")
         rows = unit.payload.get("rows") or []
         headers = unit.payload.get("headers") or []
         return " ".join(

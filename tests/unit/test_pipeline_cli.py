@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
+import io
+import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from disclosure_anchor.cli import pipeline
+from disclosure_anchor.application.use_cases.build_units import BuildUnitsResult
+from disclosure_anchor.application.use_cases.parse_document import ParseDocumentResult
 
 
 class PipelineCliTests(unittest.TestCase):
@@ -50,6 +56,95 @@ class PipelineCliTests(unittest.TestCase):
         self.assertEqual(command.provider_document_id, "sample")
         self.assertEqual(str(command.report_period), "2025A")
         self.assertEqual(command.company_legal_name, command.title)
+
+    def test_build_units_failed_result_returns_nonzero(self) -> None:
+        deps = _deps_type(
+            build_result=BuildUnitsResult(
+                processing_run_id="run_1",
+                status="failed",
+                error={"error_code": "ARTIFACT_WRITE_FAILED"},
+            )
+        )
+
+        code, stdout, stderr = _run_main(
+            ["build-units", "--document-id", "doc_1"],
+            deps,
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["stage"], "build-units")
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["result"]["error"]["error_code"], "ARTIFACT_WRITE_FAILED")
+
+    def test_process_stops_after_build_failed_result(self) -> None:
+        deps = _deps_type(
+            parse_result=ParseDocumentResult(
+                processing_run_id="run_1",
+                status="succeeded",
+            ),
+            build_result=BuildUnitsResult(
+                processing_run_id="run_1",
+                status="failed",
+                error={"error_code": "DB_WRITE_FAILED"},
+            ),
+            publish_result=AssertionError("publish must not run"),
+        )
+
+        code, stdout, stderr = _run_main(["process", "--document-id", "doc_1"], deps)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["stage"], "build-units")
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["result"]["error"]["error_code"], "DB_WRITE_FAILED")
+
+
+class _UseCase:
+    def __init__(self, result: object) -> None:
+        self.result = result
+
+    def execute(self, command):  # noqa: ANN001
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+def _deps_type(
+    *,
+    parse_result: object | None = None,
+    build_result: object | None = None,
+    publish_result: object | None = None,
+):
+    class _FakeDeps:
+        def __init__(self, settings) -> None:  # noqa: ANN001
+            self.settings = settings
+
+        def parse(self) -> _UseCase:
+            return _UseCase(parse_result)
+
+        def build_units(self) -> _UseCase:
+            return _UseCase(build_result)
+
+        def publish(self) -> _UseCase:
+            return _UseCase(publish_result)
+
+    return _FakeDeps
+
+
+def _run_main(argv: list[str], deps) -> tuple[int, str, str]:  # noqa: ANN001
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with (
+        patch.object(pipeline, "load_settings", return_value=object()),
+        patch.object(pipeline, "_Deps", deps),
+        redirect_stdout(stdout),
+        redirect_stderr(stderr),
+    ):
+        code = pipeline.main(argv)
+    return code, stdout.getvalue(), stderr.getvalue()
 
 
 if __name__ == "__main__":
