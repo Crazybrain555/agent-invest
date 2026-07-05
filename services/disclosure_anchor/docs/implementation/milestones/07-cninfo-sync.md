@@ -181,6 +181,24 @@ supersedes。真实 API 冒烟（人工触发、不进 CI）：1 家公司 1 窗
 - 失败状态可定位（source_access + 结构化错误）；
 - acceptance-matrix A25/A26/A27 置 pass（A28 此前已 pass，不重复认领）。
 
+## 6.5 实施后修订（2026-07-06，真实 API 验收期间定案）
+
+- **网关行为加固**：CNINFO 网关对合法请求间歇返回 403+HTML（实测 90d 通/91d 挡/92d 通，
+  与跨度无严格规则）——client 把非 JSON 响应作为可重试错误退避重试；索引查询按 ≤30 天分片
+  （TEXTID 去重合并）；p_info3005 失败退 adapter 内置分类名快照，避免整轮 filing_type
+  退化为 other。
+- **免凭据兜底通道**（用户决策：配额不可查，建保险通道）：`adapters/sources/cninfo/web_source.py`
+  走官网 hisAnnouncement/query + szse_stock.json(code→orgId)。同 provider 命名空间——实测
+  announcementId==TEXTID、adjunctSize==F005N(KB)，去重键/文件签名跨通道通用；无档案
+  (SubjectCandidate.legal_name=None="无名称主张"，resolver 不视为冲突)、无 F006V
+  (filing_type 从标题走同一规则包)。CLI：`sync --channel api|web`（默认 api）；
+  provenance 词表新增 `cninfo:hisAnnouncement`，待下载队列同时消费两通道候选。
+- **验收证据**（A25/A26/A27 pass）：10/10 家真实同步共 464 份，核心字段零空值；年报 15 份
+  全带 2025A、一季报 10 份全带 2026Q1；oversized 护栏真实拦截 14 份 >10MB 巨型文件
+  （最大 91MB 万科可持续发展报告）；查空/断点续跑/跨通道幂等均在真实数据上验证；
+  真实全链 sync→…→publish 打通（平安董事会决议 1225406051 → 1 unit published，
+  doctor 深检 aggregate ok）。中芯国际(688981)无 USCC 属正确现实（开曼红筹主体，D5 边界）。
+
 ## 7. 明确不做
 
 - 不抓全市场；不做复杂 anti-bot 规避；不做标准数据 provider；不做 L2 claim；

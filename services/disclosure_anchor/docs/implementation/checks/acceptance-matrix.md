@@ -34,9 +34,9 @@ created_at: 2026-06-26
 | A22 | `GET /v1/filings/latest` 可用 | 06 | API test | pass |
 | A23 | `GET /v1/units/{id}/source-ref` 可用 | 06 | API test | pass |
 | A24 | `GET /v1/changes` 可增量读取 | 06 | API test | pass |
-| A25 | CNINFO 指定 10 家公司可同步公告索引 | 07 | integration/manual | pending |
-| A26 | CNINFO PDF 下载进入 raw archive | 07 | integration/manual | pending |
-| A27 | 查空写 source_access | 07 | DB check | pending |
+| A25 | CNINFO 指定 10 家公司可同步公告索引 | 07 | integration/manual | pass (2026-07-06 真实 API：10/10 家、464 份公告，字段零空值) |
+| A26 | CNINFO PDF 下载进入 raw archive | 07 | integration/manual | pass (2026-07-06：464 份 PDF 不可变归档，跨通道 hash 幂等吸收) |
+| A27 | 查空写 source_access | 07 | DB check | pass (2026-07-06：600519 checkpoint 续跑真实空窗口 result='empty' 落库) |
 | A28 | CNINFO 凭据只从环境变量进入 settings，且不写入 repo、DB、artifact 或日志 | 01/07 | settings test + review | pass |
 | A29 | `make worker-once` 可从 pending 跑到 active run | 08 | end-to-end | pending |
 | A30 | worker 崩溃不破坏 raw archive | 08 | failure test | pending |

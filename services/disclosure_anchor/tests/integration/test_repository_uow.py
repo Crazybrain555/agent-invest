@@ -25,6 +25,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
         # partial unique index on (scheme, normalized_value) or company uscc.
         self.uscc = f"913206{ids.new_ulid()[-12:].upper()}"
         self.pid = f"uow{ids.new_ulid()[-10:].lower()}"
+        self.security_code = f"T{ids.new_ulid()[-6:]}"
 
     def tearDown(self) -> None:
         self.engine.dispose()
@@ -78,7 +79,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                     e.Security(
                         security_id=ids.new_security_id(),
                         company_id=company.company_id,
-                        security_code="002484",
+                        security_code=self.security_code,
                         exchange="SZSE",
                     )
                 )
@@ -108,7 +109,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                         filing_type="annual_report",
                         report_period="2025A",
                         raw_file_relpath=(
-                            f"raw_documents/cninfo/002484/2025/{self.pid}/"
+                            f"raw_documents/cninfo/{self.security_code}/2025/{self.pid}/"
                             "sha256_7c73.pdf"
                         ),
                         raw_file_hash="sha256:7c73103aa3c9",
@@ -130,11 +131,11 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                         parser_language="ch",
                         input_raw_file_hash="sha256:7c73103aa3c9",
                         parser_artifact_relpath=(
-                            f"parser_artifacts/cninfo/002484/{self.pid}/"
+                            f"parser_artifacts/cninfo/{self.security_code}/{self.pid}/"
                             "run_01K0000000000000000000000"
                         ),
                         normalized_ir_relpath=(
-                            f"derived/normalized_ir/cninfo/002484/{self.pid}/"
+                            f"derived/normalized_ir/cninfo/{self.security_code}/{self.pid}/"
                             "run_01K0000000000000000000000/normalized_ir.v2.json"
                         ),
                         builder_rules_version="ub-2026.07-1",
