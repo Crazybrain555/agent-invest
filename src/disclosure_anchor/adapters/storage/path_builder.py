@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from pathlib import Path
 
 from disclosure_anchor.domain.errors import PathSafetyError
@@ -17,6 +18,20 @@ def _safe_component(value: str, *, label: str) -> str:
         raise PathSafetyError(f"unsafe {label}: {value!r}")
     if value in {".", ".."}:
         raise PathSafetyError(f"unsafe {label}: {value!r}")
+    return value
+
+
+def _safe_provider_document_id(value: str) -> str:
+    if _SAFE_COMPONENT_RE.fullmatch(value):
+        return value
+    if not value or value in {".", ".."}:
+        raise PathSafetyError(f"unsafe provider_document_id: {value!r}")
+    if "/" in value or "\\" in value or "\x00" in value:
+        raise PathSafetyError(f"unsafe provider_document_id: {value!r}")
+    if value[0] == ".":
+        raise PathSafetyError(f"unsafe provider_document_id: {value!r}")
+    if any(unicodedata.category(char).startswith("C") for char in value):
+        raise PathSafetyError(f"unsafe provider_document_id: {value!r}")
     return value
 
 
@@ -67,9 +82,7 @@ class FileStorePathBuilder:
         provider_part = _safe_component(provider, label="provider")
         security_part = _safe_component(security_code, label="security_code")
         year_part = _safe_component(str(year), label="year")
-        provider_document_part = _safe_component(
-            provider_document_id, label="provider_document_id"
-        )
+        provider_document_part = _safe_provider_document_id(provider_document_id)
         digest = _hash_digest(raw_file_hash)
         relpath = (
             Path("raw_documents")
@@ -107,7 +120,7 @@ class FileStorePathBuilder:
             Path("parser_artifacts")
             / _safe_component(provider, label="provider")
             / _safe_component(security_code, label="security_code")
-            / _safe_component(provider_document_id, label="provider_document_id")
+            / _safe_provider_document_id(provider_document_id)
             / _safe_component(processing_run_id, label="processing_run_id")
         )
         return _assert_relative(relpath)
@@ -135,7 +148,7 @@ class FileStorePathBuilder:
             / "normalized_ir"
             / _safe_component(provider, label="provider")
             / _safe_component(security_code, label="security_code")
-            / _safe_component(provider_document_id, label="provider_document_id")
+            / _safe_provider_document_id(provider_document_id)
             / _safe_component(processing_run_id, label="processing_run_id")
             / "normalized_ir.v2.json"
         )
@@ -154,7 +167,7 @@ class FileStorePathBuilder:
             / "document_unit_snapshots"
             / _safe_component(provider, label="provider")
             / _safe_component(security_code, label="security_code")
-            / _safe_component(provider_document_id, label="provider_document_id")
+            / _safe_provider_document_id(provider_document_id)
             / _safe_component(processing_run_id, label="processing_run_id")
             / "document_units.v1.jsonl"
         )
@@ -180,7 +193,7 @@ class FileStorePathBuilder:
         path = (
             quarantine_root
             / _safe_component(provider, label="provider")
-            / _safe_component(provider_document_id, label="provider_document_id")
+            / _safe_provider_document_id(provider_document_id)
             / _safe_component(name, label="quarantine_name")
         )
         if not _is_relative_to(path, quarantine_root):

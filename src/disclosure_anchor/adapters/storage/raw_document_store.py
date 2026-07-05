@@ -96,9 +96,7 @@ class RawDocumentStore:
                 created=False,
             )
 
-        tmp_path = self._paths.runtime_tmp_path(
-            f"raw_{provider_document_id}_{new_ulid()}.tmp"
-        )
+        tmp_path = self._paths.runtime_tmp_path(f"raw_{new_ulid()}.tmp")
         tmp_path.parent.mkdir(parents=True, exist_ok=True)
         final_path.parent.mkdir(parents=True, exist_ok=True)
 

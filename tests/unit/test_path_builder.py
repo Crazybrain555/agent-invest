@@ -113,6 +113,33 @@ class PathBuilderTests(unittest.TestCase):
                 / relpath,
             )
 
+    def test_provider_document_id_allows_cninfo_filename_stem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            builder = FileStorePathBuilder(_settings(Path(tmp)))
+            digest = "c" * 64
+            provider_document_id = (
+                "2026-06-18__risk_or_forecast__002484__江海股份："
+                "南通江海电容器股份有限公司关于股票交易异常波动的公告__1225376481"
+            )
+
+            relpath = builder.raw_document_relpath(
+                provider="cninfo",
+                security_code="002484",
+                year="2026",
+                provider_document_id=provider_document_id,
+                raw_file_hash=f"sha256:{digest}",
+            )
+
+            self.assertIn(provider_document_id, relpath.parts)
+            with self.assertRaises(PathSafetyError):
+                builder.raw_document_relpath(
+                    provider="cninfo",
+                    security_code="002484",
+                    year="2026",
+                    provider_document_id="../" + provider_document_id,
+                    raw_file_hash=f"sha256:{digest}",
+                )
+
     def test_phase04_parser_and_normalized_ir_run_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             builder = FileStorePathBuilder(_settings(Path(tmp)))
