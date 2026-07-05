@@ -15,7 +15,7 @@ turn normal answers into long operation manuals.
    `docs/agent/`; if cross-service durable state becomes necessary, propose it to the user first.
 4. `docs/archive/pre-restart/` is frozen Quant_agent-era history — read on demand only, never as policy.
 5. The engine protocol (v0.7) lives at
-   `services/disclosure_anchor/docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md`.
+   `docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md`.
 
 ## Preferences (inherited from disclosure_anchor practice)
 

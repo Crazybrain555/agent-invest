@@ -26,9 +26,8 @@ Rules:
 
 ## 2. Authority documents
 
-- Engine architecture: `services/disclosure_anchor/docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md`
-  (engine-wide protocol; currently homed inside disclosure_anchor — lifting engine-wide docs to root
-  `docs/` is an open follow-up, do it deliberately with pointer updates, not casually).
+- Engine architecture: `docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md`
+  (engine-wide protocol, homed at root `docs/reference/` alongside prior versions).
 - L1 disclosure service contract: `services/disclosure_anchor/AGENTS.md` and its `docs/` tree.
 
 ## 3. Cross-service hard rules

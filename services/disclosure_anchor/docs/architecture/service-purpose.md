@@ -5,7 +5,7 @@ contract_version: v1.2
 status: canonical
 layer: L1
 layer_name: 披露文件接入与结构化准备层
-reference: docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md
+reference: ../../docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md
 delivers_to: L2
 scope: self_maintained_exchange_disclosures
 output_kind: l2_ready_document_units

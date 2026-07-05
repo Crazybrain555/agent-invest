@@ -11,7 +11,7 @@ layer: L1
 requirements:
   - docs/architecture/service-purpose.md
   - docs/architecture/财报与披露数据接入及切分方案.md
-  - docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md
+  - ../../docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md
 references:
   - docs/architecture/database-selection.md
   - docs/architecture/pdf-parsing-investigation.md
