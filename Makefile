@@ -18,7 +18,8 @@ PGLOG ?= /Volumes/AgentSSD/agent_system/postgres/logs/disclosure-anchor-pg18.log
 PGPORT ?= 55432
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
-	test-mineru-smoke api archive pg-init pg-start pg-stop pg-status db-create migrate
+	test-mineru-smoke api archive pg-init pg-start pg-stop pg-status db-create migrate \
+	register parse build-units publish process
 
 doctor:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -78,3 +79,20 @@ db-create:
 
 migrate:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m alembic upgrade head
+
+# --- Single-document pipeline ------------------------------------------------
+
+register:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline register --file "$(FILE)" --provider "$(PROVIDER)" --security-code "$(SECURITY_CODE)" --exchange "$(EXCHANGE)" --filing-type "$(FILING_TYPE)" --title "$(TITLE)" --announcement-date "$(ANNOUNCEMENT_DATE)" $(if $(REPORT_PERIOD),--report-period "$(REPORT_PERIOD)") $(if $(PROVIDER_DOCUMENT_ID),--provider-document-id "$(PROVIDER_DOCUMENT_ID)") $(if $(COMPANY_LEGAL_NAME),--company-legal-name "$(COMPANY_LEGAL_NAME)")
+
+parse:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline parse --document-id "$(DOC)"
+
+build-units:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline build-units --document-id "$(DOC)"
+
+publish:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline publish --processing-run-id "$(RUN)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
+
+process:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline process --document-id "$(DOC)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
