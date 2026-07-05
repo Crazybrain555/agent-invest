@@ -329,11 +329,35 @@ class ParseDocumentTests(unittest.TestCase):
                     is_active=True,
                 )
             )
+            uow.document_units.add_many(
+                [
+                    e.DocumentUnit(
+                        asset_id=ids.new_asset_id(),
+                        document_id=document_id,
+                        processing_run_id=active_run_id,
+                        payload_kind="text",
+                        order_index=1,
+                        payload={"text": "active projection remains readable"},
+                        content_hash="sha256:active_content",
+                        structure_hash="sha256:active_structure",
+                        query_projection_hash="sha256:active_projection",
+                        title="active",
+                    )
+                ]
+            )
             document = uow.documents.get(document_id)
             document.status = "published"
             document.current_processing_run_id = active_run_id
             uow.documents.update(document)
             uow.commit()
+        with self.engine.connect() as conn:
+            before_public_count = conn.execute(
+                text(
+                    "SELECT count(*) FROM disclosure_public.document_units_v1 "
+                    "WHERE document_id = :id"
+                ),
+                {"id": document_id},
+            ).scalar_one()
 
         use_case = ParseDocument(
             parser=FailingParser(),
@@ -377,12 +401,21 @@ class ParseDocumentTests(unittest.TestCase):
                 ),
                 {"id": document_id},
             ).one()
+            after_public_count = conn.execute(
+                text(
+                    "SELECT count(*) FROM disclosure_public.document_units_v1 "
+                    "WHERE document_id = :id"
+                ),
+                {"id": document_id},
+            ).scalar_one()
         self.assertEqual(active_status.status, "succeeded")
         self.assertTrue(active_status.is_active)
         self.assertEqual(failed_status.status, "failed")
         self.assertFalse(failed_status.is_active)
         self.assertEqual(document_status.status, "published")
         self.assertEqual(document_status.current_processing_run_id, active_run_id)
+        self.assertEqual(before_public_count, 1)
+        self.assertEqual(after_public_count, before_public_count)
         by_kind = {row["event_kind"]: row for row in events}
         self.assertEqual(by_kind["processing_run_created"]["change_kind"], "observed")
         failed_event = by_kind["processing_run_failed"]

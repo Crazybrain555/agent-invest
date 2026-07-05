@@ -232,6 +232,60 @@ class UnitBuilderTests(unittest.TestCase):
         self.assertEqual(units[0].payload, {"caption": ["失败表"], "raw_html": "<table>", "notes": ["注"]})
         self.assertEqual(units[0].quality_status, "needs_review")
 
+    def test_payload_inner_key_contracts_by_kind(self) -> None:
+        text_unit = s3_build_text_units(
+            [PreparedElement(kind="text", order_index=1, text="正文")]
+        )[0]
+        qa_unit = s4_build_qa_units(
+            "问:问题？\n答:答案",
+            source=UnitDraft(payload_kind="text", payload={"text": ""}, source_order=2),
+        ).units[0]
+        image_unit = s1_preprocess_elements(
+            [
+                {
+                    "kind": "image",
+                    "raw_kind": "image",
+                    "order_index": 3,
+                    "image_path": f"images/{'c' * 64}.jpg",
+                    "caption": "股权结构图",
+                }
+            ]
+        ).elements[0]
+        table_unit = s5_build_table_units(
+            [
+                PreparedElement(
+                    kind="table",
+                    order_index=4,
+                    table_caption=["应收账款账龄"],
+                    table_footnote=["含追溯调整。"],
+                    table={"headers": ["账龄"], "rows": [["合计"]]},
+                )
+            ],
+            BuildStats(),
+        )[0]
+        failed_table = s5_build_table_units(
+            [
+                PreparedElement(
+                    kind="table",
+                    order_index=5,
+                    table_caption=["失败表"],
+                    table_footnote=["注"],
+                    table={"headers": [], "rows": []},
+                    table_html="<table>",
+                    table_parse_failed=True,
+                )
+            ],
+            BuildStats(),
+        )[0]
+
+        self.assertEqual(set(text_unit.payload), {"text"})
+        self.assertEqual(set(qa_unit.payload), {"question", "answer", "raw_text"})
+        self.assertEqual(set(image_unit.payload), {"image_ref", "caption", "context"})
+        self.assertEqual(image_unit.quality_status, "needs_review")
+        self.assertEqual(set(table_unit.payload), {"caption", "unit", "headers", "rows", "notes"})
+        self.assertIn("追溯调整", table_unit.payload["notes"][0])
+        self.assertEqual(set(failed_table.payload), {"caption", "raw_html", "notes"})
+
     def test_s6_skips_only_closed_skip_sections(self) -> None:
         stats = BuildStats()
         kept = s6_filter_units(
@@ -341,6 +395,69 @@ class UnitBuilderTests(unittest.TestCase):
         self.assertEqual(units[0].title, "重要提示")
         self.assertIn("退市风险", units[0].payload["text"])
         self.assertEqual(stats.dropped_by_kind["page_furniture"], 1)
+
+    def test_full_s1_s7_redline_important_and_risk_tip_positive(self) -> None:
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "重要提示",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "公司存在退市风险，请投资者注意。",
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 3,
+                        "heading_level": 1,
+                        "text": "风险提示",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 4,
+                        "text": "原材料价格波动可能影响公司业绩。",
+                    },
+                ]
+            },
+            filing_type="other",
+        )
+
+        self.assertEqual([unit.title for unit in units], ["重要提示", "风险提示"])
+        self.assertIn("退市风险", units[0].payload["text"])
+        self.assertIn("原材料价格波动", units[1].payload["text"])
+
+    def test_full_s1_s7_redline_important_tip_repeated_header_negative(self) -> None:
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "page_furniture",
+                        "raw_kind": "header",
+                        "order_index": 1,
+                        "text": "重要提示",
+                    },
+                    {
+                        "kind": "page_furniture",
+                        "raw_kind": "header",
+                        "order_index": 2,
+                        "text": "风险提示",
+                    },
+                ]
+            },
+            filing_type="other",
+        )
+
+        self.assertEqual(units, [])
+        self.assertEqual(stats.dropped_by_kind["page_furniture"], 2)
 
 
 if __name__ == "__main__":
