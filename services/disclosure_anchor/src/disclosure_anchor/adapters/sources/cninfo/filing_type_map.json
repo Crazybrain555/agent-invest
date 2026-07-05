@@ -1,0 +1,45 @@
+{
+  "version": "2026-07",
+  "rules": [
+    {
+      "filing_type": "annual_report",
+      "keywords": ["年度报告"],
+      "match": "any"
+    },
+    {
+      "filing_type": "semiannual_report",
+      "keywords": ["半年度报告"],
+      "match": "any"
+    },
+    {
+      "filing_type": "quarterly_report",
+      "keywords": ["季度报告"],
+      "match": "any"
+    },
+    {
+      "filing_type": "performance_forecast",
+      "keywords": ["业绩预告"],
+      "match": "any"
+    },
+    {
+      "filing_type": "performance_flash",
+      "keywords": ["业绩快报"],
+      "match": "any"
+    },
+    {
+      "filing_type": "investor_relations",
+      "keywords": ["投资者关系"],
+      "match": "any"
+    },
+    {
+      "filing_type": "performance_briefing",
+      "keywords": ["说明会"],
+      "match": "any"
+    },
+    {
+      "filing_type": "inquiry_reply",
+      "keywords": ["问询", "回复"],
+      "match": "all"
+    }
+  ]
+}

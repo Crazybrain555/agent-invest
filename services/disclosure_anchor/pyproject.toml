@@ -32,6 +32,9 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"disclosure_anchor.adapters.sources.cninfo" = ["filing_type_map.json"]
+
 [tool.ruff]
 target-version = "py311"
 src = ["src", "tests"]
