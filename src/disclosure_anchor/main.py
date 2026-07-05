@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from disclosure_anchor.api.errors import install_error_handlers
+from disclosure_anchor.api.routers.admin import router as admin_router
 from disclosure_anchor.api.routers.changes import router as changes_router
 from disclosure_anchor.api.routers.documents import router as documents_router
 from disclosure_anchor.api.routers.filings import router as filings_router
@@ -74,4 +75,6 @@ def create_app(settings: Settings | None = None, *, validate_runtime: bool = Tru
         app.include_router(units_router)
     if changes_router is not None:
         app.include_router(changes_router)
+    if admin_router is not None:
+        app.include_router(admin_router)
     return app
