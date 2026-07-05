@@ -1,0 +1,110 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "asset_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Asset Id"
+    },
+    "change_kind": {
+      "title": "Change Kind",
+      "type": "string"
+    },
+    "contract_version": {
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "document_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Document Id"
+    },
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "event_kind": {
+      "title": "Event Kind",
+      "type": "string"
+    },
+    "occurred_at": {
+      "format": "date-time",
+      "title": "Occurred At",
+      "type": "string"
+    },
+    "payload": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Payload"
+    },
+    "processing_run_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Processing Run Id"
+    },
+    "seq": {
+      "title": "Seq",
+      "type": "integer"
+    },
+    "source": {
+      "title": "Source",
+      "type": "string"
+    },
+    "subject_kind": {
+      "title": "Subject Kind",
+      "type": "string"
+    },
+    "subject_ref": {
+      "title": "Subject Ref",
+      "type": "string"
+    }
+  },
+  "required": [
+    "seq",
+    "event_id",
+    "event_kind",
+    "document_id",
+    "processing_run_id",
+    "asset_id",
+    "payload",
+    "occurred_at",
+    "change_kind",
+    "subject_kind",
+    "subject_ref",
+    "source",
+    "contract_version",
+    "created_at"
+  ],
+  "title": "ChangeEventV1",
+  "type": "object"
+}

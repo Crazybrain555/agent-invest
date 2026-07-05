@@ -1,0 +1,5 @@
+Parser artifacts root: /Volumes/AgentSSD/agent_system/services/disclosure_anchor/data/parser_artifacts/_phase00/annual_report_full/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169/auto
+Content list: /Volumes/AgentSSD/agent_system/services/disclosure_anchor/data/parser_artifacts/_phase00/annual_report_full/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169/auto/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169_content_list.json
+Markdown: /Volumes/AgentSSD/agent_system/services/disclosure_anchor/data/parser_artifacts/_phase00/annual_report_full/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169/auto/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169.md
+Source PDF: /Users/zhang/dev/agent-invest/services/disclosure_anchor/tmp/sample_filings/002484_江海股份/2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169.pdf
+Parsed pages: 1-209 full

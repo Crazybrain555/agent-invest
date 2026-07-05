@@ -1,0 +1,990 @@
+{
+  "_about": "CNINFO WebAPI 第一阶段 4 接口的机器可读契约。供 client / router / 同步任务直接 import。",
+  "see_also": {
+    "human_doc": "cninfo-webapi-usage-reference.md（人读说明，配合本文件看）",
+    "verification": "cninfo-webapi-verification.md（实测记录）",
+    "announcement_categories": "cninfo-announcement-categories.json（公告类型全量 2135 条可选值，F006V 翻译用）",
+    "securities_universe": "cninfo-securities.json（SECCODE/证券 全市场 7274 条清单）"
+  },
+  "meta": {
+    "source": "https://webapi.cninfo.com.cn/#/apiDoc",
+    "verified_date": "2026-06-15",
+    "verified_method": "对每个接口实发 API 调用确认参数与行为（探针股票 300066）",
+    "phase": 1
+  },
+  "auth": {
+    "token_endpoint": "https://webapi.cninfo.com.cn/api-cloud-platform/oauth2/token",
+    "token_method": "POST",
+    "token_body": {
+      "grant_type": "client_credentials",
+      "client_id": "${CNINFO_ACCESS_KEY}",
+      "client_secret": "${CNINFO_ACCESS_SECRET}"
+    },
+    "credentials_env": [
+      "CNINFO_ACCESS_KEY",
+      "CNINFO_ACCESS_SECRET",
+      "CNINFO_ACCESS_TOKEN"
+    ],
+    "access_token_param": {
+      "name": "access_token",
+      "location": "query"
+    },
+    "token_ttl_seconds_observed": [
+      2685,
+      2985,
+      3599
+    ],
+    "notes": [
+      "凭证只从环境变量/.env 读取，不入库不入仓",
+      "token 过期 405 / 无效 404，过期后用 key/secret 重换"
+    ]
+  },
+  "result_envelope": {
+    "resultcode": "int — 业务状态码，成功为 200",
+    "resultmsg": "string",
+    "total": "int — 命中总数（不受 @limit 影响）",
+    "count": "int — 本次返回条数",
+    "records": "array",
+    "success_rule": "以 resultcode==200 为准，不要只看 HTTP status"
+  },
+  "common_query_params": [
+    {
+      "name": "format",
+      "cn": "结果集格式",
+      "type": "string",
+      "required": false,
+      "enum": [
+        "xml",
+        "json",
+        "csv",
+        "dbf"
+      ],
+      "default": "json",
+      "example": "json",
+      "note": "本服务默认 json"
+    },
+    {
+      "name": "@column",
+      "cn": "结果列选择",
+      "type": "string",
+      "required": false,
+      "example": "SECCODE,SECNAME,F001D",
+      "note": "多列逗号分隔"
+    },
+    {
+      "name": "@limit",
+      "cn": "结果条数限制",
+      "type": "int",
+      "required": false,
+      "example": 100,
+      "note": "截断本次返回条数；实测不改变 total"
+    },
+    {
+      "name": "@orderby",
+      "cn": "结果集排序",
+      "type": "string",
+      "required": false,
+      "example": "F001D:desc",
+      "note": "如 id:desc / id:asc"
+    }
+  ],
+  "error_codes": {
+    "-1": "系统繁忙（重试）",
+    "200": "success",
+    "401": "未经授权的访问",
+    "402": "不合法的参数 / 缺少必须传输参数（无 scode 调 p_stock2100 实测返回此码）",
+    "403": "脚本服务器异常",
+    "404": "token 无效（重取）",
+    "405": "token 过期（重取）",
+    "406": "用户已被禁用",
+    "407": "免费试用次数已用完",
+    "408": "用户没有余额",
+    "409": "验证权限错误",
+    "410": "验证权限异常",
+    "411": "获取用户信息失败",
+    "412": "包时长已超期"
+  },
+  "enumerations": {
+    "_note": "常见筛选参数的可选值数据。小枚举内联；大表（公告分类2135 / 证券7274）放独立文件，见 see_also。",
+    "交易市场_market": {
+      "012001": "上交所",
+      "012029": "上交所科创板",
+      "012002": "深交所主板",
+      "012015": "深交所创业板",
+      "012046": "北交所",
+      "_note": "012046 北交所来自 p_stock2101 实测；p_info3015 文档原只列前 4 个，北交所未单独压测但编码同体系"
+    },
+    "证券类别_F002V": {
+      "001001": "A股",
+      "001002": "B股",
+      "001013": "CDR"
+    },
+    "上市状态_F010V": {
+      "013001": "正常上市",
+      "013010": "进入退市整理期",
+      "013005": "*ST",
+      "013004": "ST",
+      "013011": "暂缓发行",
+      "013006": "已发行未上市",
+      "013009": "发行失败",
+      "013008": "未过会"
+    },
+    "公告分类_常见": {
+      "_note": "速查；'业绩预告'=012111 很可能就是你说的“预期公告”。全量见 cninfo-announcement-categories.json",
+      "items": [
+        {
+          "sortcode": "012111",
+          "sortname": "业绩预告"
+        },
+        {
+          "sortcode": "01211160",
+          "sortname": "业绩快报"
+        },
+        {
+          "sortcode": "010301",
+          "sortname": "年度报告"
+        },
+        {
+          "sortcode": "010303",
+          "sortname": "半年度报告"
+        },
+        {
+          "sortcode": "010305",
+          "sortname": "一季度报告"
+        },
+        {
+          "sortcode": "010307",
+          "sortname": "三季度报告"
+        },
+        {
+          "sortcode": "0113",
+          "sortname": "权益分派与限制出售股份上市"
+        },
+        {
+          "sortcode": "0120",
+          "sortname": "投资者关系信息"
+        },
+        {
+          "sortcode": "01151301",
+          "sortname": "股份回购预案"
+        },
+        {
+          "sortcode": "014123",
+          "sortname": "重大事项停牌公告"
+        },
+        {
+          "sortcode": "010203",
+          "sortname": "招股说明书"
+        },
+        {
+          "sortcode": "0121",
+          "sortname": "澄清、风险提示、业绩预告事项"
+        }
+      ]
+    },
+    "公告分类_全量": {
+      "file": "cninfo-announcement-categories.json",
+      "total": 2135,
+      "usage": "p_info3015.F006V 用 || 分隔，逐段匹配 sortcode → sortname",
+      "f006v_subtree": "实测 F006V 编码全部落在 01… 子树（公司公告披露分类）；2135 全量含其它命名空间(N0xx/2507xx 等)，做 F006V 翻译/筛选时只看 01… 段"
+    },
+    "SECCODE_域": {
+      "file": "cninfo-securities.json",
+      "total": 7274,
+      "examples": [
+        "300066",
+        "300077",
+        "000001",
+        "600000",
+        "688981"
+      ],
+      "usage": "全市场证券代码清单；p_stock2101 不传 scode 即可整表拉取"
+    }
+  },
+  "interfaces": {
+    "p_stock2100": {
+      "cn_name": "公司基本信息",
+      "package": 13,
+      "role": "公司维表",
+      "url": "https://webapi.cninfo.com.cn/api/stock/p_stock2100",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "max_records": 20000,
+      "params": [
+        {
+          "name": "scode",
+          "cn": "股票代码",
+          "type": "string",
+          "required": true,
+          "example": "300066",
+          "constraint": "<=50 只，逗号分隔，如 000001,600000"
+        }
+      ],
+      "outputs": [
+        {
+          "field": "ORGID",
+          "cn": "机构ID",
+          "type": "varchar(11)"
+        },
+        {
+          "field": "ORGNAME",
+          "cn": "机构名称",
+          "type": "varchar(100)"
+        },
+        {
+          "field": "SECCODE",
+          "cn": "证券代码",
+          "type": "varchar(10)"
+        },
+        {
+          "field": "SECNAME",
+          "cn": "证券简称",
+          "type": "varchar(40)"
+        },
+        {
+          "field": "F001V",
+          "cn": "英文名称",
+          "type": "varchar(100)"
+        },
+        {
+          "field": "F002V",
+          "cn": "英文简称",
+          "type": "varchar(40)"
+        },
+        {
+          "field": "F003V",
+          "cn": "法人代表",
+          "type": "varchar(40)"
+        },
+        {
+          "field": "F004V",
+          "cn": "注册地址",
+          "type": "varchar(100)"
+        },
+        {
+          "field": "F005V",
+          "cn": "办公地址",
+          "type": "varchar(150)"
+        },
+        {
+          "field": "F006V",
+          "cn": "邮政编码",
+          "type": "varchar(10)"
+        },
+        {
+          "field": "F007N",
+          "cn": "注册资金",
+          "type": "numeric(14,4)"
+        },
+        {
+          "field": "F008V",
+          "cn": "货币编码",
+          "type": "varchar(12)"
+        },
+        {
+          "field": "F009V",
+          "cn": "货币名称",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F010D",
+          "cn": "成立日期",
+          "type": "DATE"
+        },
+        {
+          "field": "F011V",
+          "cn": "机构网址",
+          "type": "varchar(80)"
+        },
+        {
+          "field": "F012V",
+          "cn": "电子信箱",
+          "type": "varchar(80)"
+        },
+        {
+          "field": "F013V",
+          "cn": "联系电话",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F014V",
+          "cn": "联系传真",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F015V",
+          "cn": "主营业务",
+          "type": "varchar(500)"
+        },
+        {
+          "field": "F016V",
+          "cn": "经营范围",
+          "type": "varchar(4000)"
+        },
+        {
+          "field": "F017V",
+          "cn": "机构简介/公司成立概况",
+          "type": "varchar(2000)"
+        },
+        {
+          "field": "F018V",
+          "cn": "董事会秘书",
+          "type": "varchar(40)"
+        },
+        {
+          "field": "F019V",
+          "cn": "董秘联系电话",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F020V",
+          "cn": "董秘联系传真",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F021V",
+          "cn": "董秘电子邮箱",
+          "type": "varchar(80)"
+        },
+        {
+          "field": "F022V",
+          "cn": "证券事务代表",
+          "type": "varchar(40)"
+        },
+        {
+          "field": "F023V",
+          "cn": "上市状态编码",
+          "type": "varchar(12)"
+        },
+        {
+          "field": "F024V",
+          "cn": "上市状态",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F025V",
+          "cn": "所属省份编码",
+          "type": "varchar(12)"
+        },
+        {
+          "field": "F026V",
+          "cn": "所属省份",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F027V",
+          "cn": "所属城市编码",
+          "type": "varchar(12)"
+        },
+        {
+          "field": "F028V",
+          "cn": "所属城市",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F029V",
+          "cn": "中上协一级行业编码",
+          "type": "varchar(12)"
+        },
+        {
+          "field": "F030V",
+          "cn": "中上协一级行业名称",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F031V",
+          "cn": "中上协二级行业编码",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F032V",
+          "cn": "中上协二级行业名称",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F033V",
+          "cn": "申万行业分类一级编码",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F034V",
+          "cn": "申万行业分类一级名称",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F035V",
+          "cn": "申万行业分类二级编码",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F036V",
+          "cn": "申万行业分类二级名称",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F037V",
+          "cn": "申万行业分类三级编码",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F038V",
+          "cn": "申万行业分类三级名称",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F039V",
+          "cn": "会计师事务所",
+          "type": "varchar(200)"
+        },
+        {
+          "field": "F040V",
+          "cn": "律师事务所",
+          "type": "varchar(200)"
+        },
+        {
+          "field": "F041V",
+          "cn": "董事长",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F042V",
+          "cn": "总经理",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F043V",
+          "cn": "公司独立董事(现任)",
+          "type": "varchar(100)",
+          "note": "多名"
+        },
+        {
+          "field": "F044V",
+          "cn": "入选指数",
+          "type": "varchar(1000)",
+          "note": "多个"
+        },
+        {
+          "field": "F045V",
+          "cn": "最新报告预约日期",
+          "type": "varchar(50)"
+        },
+        {
+          "field": "F046V",
+          "cn": "保荐机构",
+          "type": "varchar(500)",
+          "note": "多个"
+        },
+        {
+          "field": "F047V",
+          "cn": "主承销商",
+          "type": "varchar(500)"
+        },
+        {
+          "field": "F048V",
+          "cn": "PEVC标记",
+          "type": "varchar(12)"
+        },
+        {
+          "field": "F049V",
+          "cn": "注册国家",
+          "type": "varchar(200)"
+        },
+        {
+          "field": "F050V",
+          "cn": "统一社会信用代码",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F051V",
+          "cn": "工商ID",
+          "type": "varchar(60)"
+        },
+        {
+          "field": "F052V",
+          "cn": "可转债",
+          "type": "varchar(100)"
+        },
+        {
+          "field": "F053V",
+          "cn": "CDR",
+          "type": "varchar(100)"
+        },
+        {
+          "field": "F054V",
+          "cn": "企业规模",
+          "type": "varchar(20)"
+        }
+      ],
+      "verified": [
+        "无 scode → resultcode=402 缺少必须传输参数（确认 scode 必填）",
+        "scode=300066 → total=1"
+      ],
+      "example_request": "GET /api/stock/p_stock2100?scode=300066&format=json&access_token=...",
+      "example_record": {
+        "F040V": "北京市君致律师事务所",
+        "SECNAME": "三川智慧",
+        "F008V": "006001",
+        "F016V": "机械水表、智能水表、仪器仪表、管材管件、阀门、净水设备的研发、生产、销售；通讯设备、电子配件、无线数据终端的生产、组装和销售；计算机软硬件及信息集成系统、公用事…",
+        "F028V": "鹰潭市",
+        "F004V": "江西省鹰潭高新区龙岗片区三川水工产业园",
+        "F036V": "通用设备",
+        "F048V": null,
+        "F012V": "webmaster@ytsanchuan.com",
+        "F024V": "正常上市",
+        "F032V": "仪器仪表制造业",
+        "F044V": "国证2000,国证Ａ指",
+        "F052V": null,
+        "F020V": "0701-6318013",
+        "ORGID": "9900010587",
+        "F051V": "2862",
+        "SECCODE": "300066",
+        "F019V": "0701-6318013",
+        "F027V": "360600",
+        "F039V": "北京兴华会计师事务所(特殊普通合伙)",
+        "F015V": "各种水表产品的研发、生产和销售",
+        "F047V": "国信证券股份有限公司",
+        "F003V": "李建林",
+        "F023V": "013001",
+        "F035V": "S6401",
+        "F011V": "www.ytsanchuan.com",
+        "F043V": "曹元坤,刘泽民,金学军",
+        "F031V": "C40",
+        "F050V": "91360600759986995D",
+        "ORGNAME": "三川智慧科技股份有限公司",
+        "F007N": 104003.3262,
+        "F018V": "倪国强",
+        "F006V": "335200",
+        "F038V": "仪器仪表",
+        "F014V": "0701-6318013",
+        "F026V": "江西",
+        "F002V": "Sanchuan Wisdom",
+        "F034V": "机械设备",
+        "F046V": "国信证券股份有限公司,浙商证券股份有限公司",
+        "F054V": "大型",
+        "F022V": "刘佳",
+        "F030V": "制造业",
+        "F042V": "李强祖",
+        "F010D": "2004-05-13",
+        "F009V": "人民币",
+        "F029V": "C",
+        "F017V": "本公司系根据江西省股份制改革和股票发行联审小组赣股[2004]1号《关于同意发起设立江西三川水表股份有限公司的批复》，由江西省鹰潭市三川有限公司联合自然人童保华…",
+        "F049V": "中国大陆",
+        "F005V": "江西省鹰潭高新区龙岗片区三川水工产业园",
+        "F025V": "360000",
+        "F037V": "S640107",
+        "F013V": "0701-6318013",
+        "F045V": "2026年一季报：2026-04-25",
+        "F001V": "Sanchuan Wisdom Technology Co., Ltd.",
+        "F021V": "ytngq@aliyun.com",
+        "F033V": "S64",
+        "F041V": "李建林",
+        "F053V": null
+      }
+    },
+    "p_stock2101": {
+      "cn_name": "股票基本信息",
+      "package": 13,
+      "role": "证券维表",
+      "url": "https://webapi.cninfo.com.cn/api/stock/p_stock2101",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "max_records": 20000,
+      "params": [
+        {
+          "name": "scode",
+          "cn": "股票代码",
+          "type": "string",
+          "required": false,
+          "example": "300066",
+          "constraint": "<=50 只，逗号分隔；省略则返回全市场"
+        }
+      ],
+      "outputs": [
+        {
+          "field": "ORGNAME",
+          "cn": "机构名称",
+          "type": "varchar"
+        },
+        {
+          "field": "SECCODE",
+          "cn": "证券代码",
+          "type": "varchar"
+        },
+        {
+          "field": "SECNAME",
+          "cn": "证券简称",
+          "type": "varchar"
+        },
+        {
+          "field": "F001V",
+          "cn": "拼音简称",
+          "type": "varchar"
+        },
+        {
+          "field": "F002V",
+          "cn": "证券类别编码",
+          "type": "varchar"
+        },
+        {
+          "field": "F003V",
+          "cn": "证券类别",
+          "type": "varchar"
+        },
+        {
+          "field": "F004V",
+          "cn": "交易市场编码",
+          "type": "varchar"
+        },
+        {
+          "field": "F005V",
+          "cn": "交易市场",
+          "type": "varchar"
+        },
+        {
+          "field": "F006D",
+          "cn": "上市日期",
+          "type": "datetime"
+        },
+        {
+          "field": "F007N",
+          "cn": "初始上市数量",
+          "type": "decimal",
+          "unit": "股"
+        },
+        {
+          "field": "F008V",
+          "cn": "代码属性编码",
+          "type": "varchar"
+        },
+        {
+          "field": "F009V",
+          "cn": "代码属性",
+          "type": "varchar"
+        },
+        {
+          "field": "F010V",
+          "cn": "上市状态编码",
+          "type": "varchar"
+        },
+        {
+          "field": "F011V",
+          "cn": "上市状态",
+          "type": "varchar"
+        },
+        {
+          "field": "F012N",
+          "cn": "面值",
+          "type": "decimal",
+          "unit": "元"
+        },
+        {
+          "field": "F013V",
+          "cn": "ISIN",
+          "type": "varchar"
+        }
+      ],
+      "verified": [
+        "无 scode → total=7274（全市场证券，scode 可选）",
+        "scode=300066 → total=1"
+      ],
+      "example_request": "GET /api/stock/p_stock2101?scode=300066&format=json&access_token=...",
+      "example_record": {
+        "SECNAME": "三川智慧",
+        "F006D": "2010-03-26",
+        "ORGNAME": "三川智慧科技股份有限公司",
+        "SECCODE": "300066",
+        "F007N": 10400000.0,
+        "F009V": "行情代码",
+        "F012N": 1.0,
+        "F008V": "014001",
+        "F005V": "深交所创业板",
+        "F004V": "012015",
+        "F003V": "A股",
+        "F002V": "001001",
+        "F013V": "CNE100000MP8",
+        "F001V": "sczh",
+        "F011V": "正常上市",
+        "F010V": "013001"
+      }
+    },
+    "p_info3005": {
+      "cn_name": "公告分类信息",
+      "package": 22,
+      "role": "公告分类字典（维表）",
+      "url": "https://webapi.cninfo.com.cn/api/info/p_info3005",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "max_records": 20000,
+      "params": [
+        {
+          "name": "sortcode",
+          "cn": "分类编码",
+          "type": "string",
+          "required": false,
+          "example": "012111",
+          "constraint": "只能查一个分类，返回该单条"
+        },
+        {
+          "name": "parentcode",
+          "cn": "父类编码",
+          "type": "string",
+          "required": false,
+          "example": "01",
+          "constraint": "返回其直接子级；顶级父类为 01"
+        }
+      ],
+      "outputs": [
+        {
+          "field": "SORTCODE",
+          "cn": "类目编码",
+          "type": "VARCHAR",
+          "note": "主键；被 p_info3015.F006V 引用"
+        },
+        {
+          "field": "PARENTCODE",
+          "cn": "父类编码",
+          "type": "VARCHAR",
+          "note": "自关联，指向上一级 SORTCODE；顶级为 01"
+        },
+        {
+          "field": "SORTNAME",
+          "cn": "类目名称",
+          "type": "VARCHAR"
+        },
+        {
+          "field": "F001D",
+          "cn": "启用时间",
+          "type": "DATE"
+        },
+        {
+          "field": "F002D",
+          "cn": "停用时间",
+          "type": "DATE"
+        }
+      ],
+      "verified": [
+        "不传参 → total=2135（一次返回全量字典，无需递归）",
+        "parentcode=01 → 31（顶级直接子级）",
+        "sortcode=010113 → 1（单条）",
+        "parentcode=010113 → 0（parentcode 只返回直接子级）"
+      ],
+      "recommended_sync": "不传参拉全量 2135 条建字典，建 SORTCODE→SORTNAME 映射及 PARENTCODE 父链",
+      "example_request": "GET /api/info/p_info3005?format=json&access_token=...   (不传参=全量字典)",
+      "example_record": {
+        "SORTCODE": "010113",
+        "SORTNAME": "沪市主板公告",
+        "F002D": null,
+        "F001D": "2006-06-15 08:52:14",
+        "PARENTCODE": "0101"
+      }
+    },
+    "p_info3015": {
+      "cn_name": "公告基本信息",
+      "package": 22,
+      "role": "公告索引（事实表）",
+      "url": "https://webapi.cninfo.com.cn/api/info/p_info3015",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "max_records": 20000,
+      "params": [
+        {
+          "name": "scode",
+          "cn": "股票代码",
+          "type": "string",
+          "required": false,
+          "example": "300066",
+          "constraint": "输入 1 个股票；省略且 edate 省略时默认最近 100 条；仅传 scode 返回该股全历史"
+        },
+        {
+          "name": "sdate",
+          "cn": "开始查询时间",
+          "type": "string",
+          "required": false,
+          "example": "20260101",
+          "format": [
+            "20161101",
+            "2016-11-01",
+            "2016/11/01"
+          ]
+        },
+        {
+          "name": "edate",
+          "cn": "结束查询时间",
+          "type": "string",
+          "required": false,
+          "example": "20260615",
+          "note": "scode 空且 edate 非空时取 edate 当天"
+        },
+        {
+          "name": "market",
+          "cn": "市场",
+          "type": "string",
+          "required": false,
+          "example": "012015",
+          "enum_ref": "enumerations.交易市场_market"
+        },
+        {
+          "name": "maxid",
+          "cn": "增量起始ID",
+          "type": "int",
+          "required": false,
+          "example": 48494924,
+          "note": "返回 OBJECTID 严格大于 maxid 的记录（小写；兼容大写 maxID）"
+        },
+        {
+          "name": "textid",
+          "cn": "正文ID",
+          "type": "string",
+          "required": false,
+          "example": "1225175168"
+        },
+        {
+          "name": "page",
+          "cn": "页码",
+          "type": "int",
+          "required": false,
+          "example": 1
+        },
+        {
+          "name": "pagesize",
+          "cn": "分页大小",
+          "type": "int",
+          "required": false,
+          "example": 30
+        }
+      ],
+      "outputs": [
+        {
+          "field": "TEXTID",
+          "cn": "正文ID",
+          "type": "VARCHAR",
+          "note": "= 巨潮 PDF 文件名主键，去重/下载用"
+        },
+        {
+          "field": "RECID",
+          "cn": "主体ID",
+          "type": "VARCHAR"
+        },
+        {
+          "field": "SECCODE",
+          "cn": "证券代码",
+          "type": "VARCHAR"
+        },
+        {
+          "field": "SECNAME",
+          "cn": "证券简称",
+          "type": "VARCHAR"
+        },
+        {
+          "field": "F001D",
+          "cn": "公告日期",
+          "type": "DATE"
+        },
+        {
+          "field": "F002V",
+          "cn": "公告标题",
+          "type": "VARCHAR"
+        },
+        {
+          "field": "F003V",
+          "cn": "公告地址",
+          "type": "VARCHAR",
+          "note": "实测 http://static.cninfo.com.cn/finalpage/<date>/<TEXTID>.PDF"
+        },
+        {
+          "field": "F004V",
+          "cn": "公告格式",
+          "type": "VARCHAR",
+          "note": "通常 PDF"
+        },
+        {
+          "field": "F005N",
+          "cn": "公告大小",
+          "type": "DECIMAL",
+          "unit": "KB",
+          "note": "实测=KB：F005N=186→189589B，F005N=104→105817B（≈bytes/1024 取整）"
+        },
+        {
+          "field": "F006V",
+          "cn": "信息分类",
+          "type": "VARCHAR",
+          "note": "分类编码串，|| 分隔，每段查 p_info3005.SORTCODE 翻译；外键关联点"
+        },
+        {
+          "field": "F007V",
+          "cn": "证券类别编码",
+          "type": "VARCHAR"
+        },
+        {
+          "field": "F008V",
+          "cn": "证券类别名称",
+          "type": "VARCHAR"
+        },
+        {
+          "field": "F009V",
+          "cn": "证券市场编码",
+          "type": "VARCHAR"
+        },
+        {
+          "field": "F010V",
+          "cn": "证券市场名称",
+          "type": "VARCHAR"
+        },
+        {
+          "field": "OBJECTID",
+          "cn": "OBJECTID",
+          "type": "BIGINT",
+          "note": "增量游标；maxid 按此字段做增量"
+        },
+        {
+          "field": "RECTIME",
+          "cn": "发布时间",
+          "type": "DATETIME"
+        }
+      ],
+      "relations": {
+        "F006V -> p_info3005.SORTCODE": "F006V 是 || 分隔的分类编码串，逐段查 p_info3005 翻译为分类名"
+      },
+      "verified": [
+        "不传参 → total=100（默认最近 100 条）",
+        "仅 scode=300066 → total=1450（返回该股全历史，不是 100）",
+        "market=012015 + sdate=edate=20260603 → total=444 且 SECCODE 全为 30xxxx，含 300066",
+        "scode=300066 + 日期窗 + maxid=48494924 → 23 条且 OBJECTID 全 >48494924（前向增量游标）",
+        "PDF：F003V 直链下载 HTTP 200（一季报 1225175168.PDF / IR 1225309371.PDF）"
+      ],
+      "doc_conflict": "文档表格『最大记录数』显示 1，与说明(20000)及实测矛盾；以说明+实测为准并保留告警",
+      "sync_strategy": [
+        "全市场：按 market + 单日窗口拉",
+        "单股回补：scode 单传拿全历史",
+        "增量：存每批最大 OBJECTID，下次传 maxid 续拉"
+      ],
+      "example_request": "GET /api/info/p_info3015?scode=300066&sdate=20260101&edate=20260615&format=json&access_token=...",
+      "example_record": {
+        "TEXTID": 1225175168,
+        "SECNAME": "三川智慧",
+        "RECID": 66021192,
+        "F001D": "2026-04-25 00:00:00",
+        "RECTIME": "2026-04-24 15:58:24",
+        "SECCODE": "300066",
+        "F005N": 186,
+        "OBJECTID": 48575960,
+        "F009V": "012015",
+        "F008V": "A股",
+        "F007V": "001001",
+        "F006V": "01010503||010112||010115||010305",
+        "F004V": "PDF",
+        "F003V": "http://static.cninfo.com.cn/finalpage/2026-04-25/1225175168.PDF",
+        "F002V": "三川智慧：2026年一季度报告",
+        "F010V": "深交所创业板"
+      }
+    }
+  }
+}

@@ -1,0 +1,252 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.disclosure-anchor/contracts/normalized_ir.v2.json",
+  "title": "NormalizedIR v2",
+  "type": "object",
+  "additionalProperties": true,
+  "$defs": {
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "^/"
+          },
+          {
+            "pattern": "^[A-Za-z]:[\\\\/]"
+          },
+          {
+            "pattern": "\\.\\."
+          },
+          {
+            "pattern": "^file:"
+          }
+        ]
+      }
+    },
+    "table_grid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["headers", "rows"],
+      "properties": {
+        "headers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "merged_cells": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["row", "col", "rowspan", "colspan"],
+            "properties": {
+              "row": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "col": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "rowspan": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "colspan": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "required": [
+    "contract_version",
+    "created_at",
+    "document_id",
+    "elements",
+    "parsed_pages",
+    "parser",
+    "parser_artifacts",
+    "source_pdf",
+    "title"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "normalized_ir.v2"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "document_id": {
+      "type": "string"
+    },
+    "source_pdf": {
+      "type": "string"
+    },
+    "title": {
+      "type": ["string", "null"]
+    },
+    "sample_key": {
+      "type": ["string", "null"]
+    },
+    "sample_role": {
+      "type": ["string", "null"]
+    },
+    "parser": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name", "package_version", "backend", "method", "language", "formula", "table"],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "package_version": {
+          "type": "string"
+        },
+        "backend": {
+          "type": "string",
+          "enum": [
+            "pipeline",
+            "vlm-engine",
+            "vlm-http-client",
+            "hybrid-engine",
+            "hybrid-http-client"
+          ]
+        },
+        "method": {
+          "type": "string",
+          "enum": ["auto", "txt", "ocr"]
+        },
+        "language": {
+          "type": "string"
+        },
+        "formula": {
+          "type": "boolean"
+        },
+        "table": {
+          "type": "boolean"
+        }
+      }
+    },
+    "parser_artifacts": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/relative_path"
+      },
+      "required": ["artifact_root_relpath", "content_list_relpath"],
+      "properties": {
+        "artifact_root_relpath": {
+          "$ref": "#/$defs/relative_path"
+        },
+        "content_list_relpath": {
+          "$ref": "#/$defs/relative_path"
+        },
+        "markdown_relpath": {
+          "$ref": "#/$defs/relative_path"
+        }
+      }
+    },
+    "parsed_pages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_page_no", "end_page_no", "full_pdf"],
+      "properties": {
+        "start_page_no": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "end_page_no": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "full_pdf": {
+          "type": "boolean"
+        }
+      }
+    },
+    "elements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["ir_id", "kind", "raw_kind", "order_index", "source_item_index"],
+        "properties": {
+          "ir_id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "text",
+              "heading",
+              "table",
+              "image",
+              "equation",
+              "page_furniture",
+              "unknown"
+            ]
+          },
+          "raw_kind": {
+            "type": "string"
+          },
+          "order_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "source_item_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page_idx": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page_no": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "heading_level": {
+            "type": ["integer", "null"]
+          },
+          "text": {
+            "type": "string"
+          },
+          "table": {
+            "$ref": "#/$defs/table_grid"
+          },
+          "table_parse_failed": {
+            "type": "boolean"
+          },
+          "table_html": {
+            "type": "string"
+          },
+          "table_caption": {
+            "type": "array"
+          },
+          "table_footnote": {
+            "type": "array"
+          },
+          "image_path": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

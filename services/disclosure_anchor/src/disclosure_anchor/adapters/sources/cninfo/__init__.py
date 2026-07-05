@@ -1,0 +1,1 @@
+"""CNINFO adapter placeholders."""

@@ -1,0 +1,195 @@
+# ============================================================
+# Python 字节码 & 缓存
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.obsidian
+
+# Python build artifacts
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ============================================================
+# 虚拟环境
+# ============================================================
+.env
+.venv/
+.venv_wsl/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ============================================================
+# IDE / 编辑器
+# ============================================================
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ============================================================
+# Jupyter Notebook
+# ============================================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# ============================================================
+# 日志 & 临时文件
+# ============================================================
+*.log
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp
+*.temp
+*~
+
+# ============================================================
+# 数据目录 & 数据文件
+# ============================================================
+# 数据目录（重要！防止大量数据文件进入 Git）
+data/
+.data/
+signal_data/
+forbid_data/
+
+
+# 数据文件类型
+*.parquet
+*.h5
+*.hdf5
+*.feather
+*.arrow
+*.duckdb
+*.db
+*.sqlite
+
+# CSV/Excel（根据项目需要，可选择性注释部分行）
+# *.csv
+# *.xlsx
+# *.xls
+
+# ============================================================
+# 模型 & 实验输出
+# ============================================================
+# 实验输出目录
+outputs/
+runs/
+wandb/
+analysis_output/
+gradient_analysis_output/
+temp_benchmark/
+visualizations/
+logs/
+
+# 模型文件（通常很大，不应进入 Git）
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.pickle
+*.joblib
+*.model
+
+# TensorBoard
+events.out.tfevents.*
+tensorboard/
+
+# ============================================================
+# 临时 & 测试文件
+# ============================================================
+.tmp/
+tmp/
+temp/
+test_output/
+scratch/
+__codex_diagnostics__/
+
+# Phase 00 全量解析转储：体积大、含整篇年报内容、内嵌本机绝对路径，且可由 *_ref.txt 重新生成。
+# 仅本地保留，不入库。小体量 fixture（manual_review / *_ref.txt / 校验报告）照常跟踪。
+tests/fixtures/phase00/annual_report/document_units.v1.jsonl
+tests/fixtures/phase00/annual_report/normalized_ir.v2.json
+
+# ============================================================
+# 生产管道 & 调度器
+# ============================================================
+# 管道日志（根目录下的日志文件）
+master_scheduler.log
+nas_pipeline_*.log
+space_pipeline_*.log
+daily_pipeline_*.log
+
+# ============================================================
+# 操作系统
+# ============================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ============================================================
+# MCP 配置（机器特定路径，不跟踪）
+# ============================================================
+.mcp.json
+.playwright-mcp/
+# Codex reads global config from ~/.codex/config.toml AND this repo-local, project-scoped
+# .codex/config.toml (trusted projects, deep-merged over global). It holds the machine-specific
+# dbhub server (project ledger DSN), so it stays gitignored like .mcp.json.
+.codex/config.toml
+dbhub.toml
+
+# Codex/agent working state (local, session-specific)
+docs/agent/
+
+
+# ============================================================
+# 其他
+# ============================================================
+# 密钥 & 配置（如果有敏感信息）
+*.env
+.env.local
+.env.*.local
+secrets.yaml
+credentials.json
+
+# 压缩文件
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# 备份文件
+*.backup
+*.old

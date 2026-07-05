@@ -1,0 +1,88 @@
+[
+  {
+    "name": "text",
+    "input": {
+      "payload_kind": "text",
+      "payload": {
+        "text": "重要提示：公司存在退市风险。"
+      },
+      "title": "重要提示",
+      "heading_path": [
+        "重要提示"
+      ],
+      "semantic_key": null,
+      "quality_status": "ok",
+      "order_index": 1
+    },
+    "expected": {
+      "content_hash": "sha256:0035f7615fda3c2fff4fe93799edd2999987ffc7afc8067d78f19ef8c4797ea7",
+      "query_projection_hash": "sha256:17259e05d6732e56c696cafce52785a118900472578a13503e13e46aa4c97c64",
+      "structure_hash": "sha256:c4948f9f2d03c7edbb3a51e3699092ec3f5102f09b4f788268989e1a3994ac74"
+    }
+  },
+  {
+    "name": "table",
+    "input": {
+      "payload_kind": "table",
+      "payload": {
+        "caption": [
+          "应收账款账龄披露"
+        ],
+        "unit": "元",
+        "headers": [
+          "账龄",
+          "期末余额"
+        ],
+        "rows": [
+          [
+            "1年以内",
+            "100.00"
+          ],
+          [
+            "合计",
+            "100.00"
+          ]
+        ],
+        "notes": [
+          "含追溯调整。"
+        ]
+      },
+      "title": "应收账款账龄披露",
+      "heading_path": [
+        "第八节 财务报告",
+        "应收账款"
+      ],
+      "semantic_key": "receivable_aging",
+      "quality_status": "ok",
+      "order_index": 2
+    },
+    "expected": {
+      "content_hash": "sha256:15af01ea5e919319fdff7c394486f50ec0e0955a5cbbc200ed13936265f8c17b",
+      "query_projection_hash": "sha256:17318a307d1b350ce5600256f85ca464954ca37741e404a3403afb609225b39a",
+      "structure_hash": "sha256:a7d7c814b0ad54d6d775238b6e978f246e6c5b3eb3841e007e75aa25ca8f0598"
+    }
+  },
+  {
+    "name": "qa",
+    "input": {
+      "payload_kind": "qa",
+      "payload": {
+        "question": "公司海外收入占比是多少？",
+        "answer": "公司将按定期报告披露相关情况。",
+        "raw_text": "问：公司海外收入占比是多少？\n答：公司将按定期报告披露相关情况。"
+      },
+      "title": "投资者关系活动主要内容介绍",
+      "heading_path": [
+        "投资者关系活动记录表"
+      ],
+      "semantic_key": null,
+      "quality_status": "needs_review",
+      "order_index": 3
+    },
+    "expected": {
+      "content_hash": "sha256:a137877582f5c9df33aca0e546d7969943878adcf2482bd949370406dcf870cd",
+      "query_projection_hash": "sha256:be67042b2e394489e9a6fda2a20bab78959791321ca5126980cc99044814466a",
+      "structure_hash": "sha256:5e2f1e49a3347c836fd41ba97f69540746fc40d55abf750b08d28d5e50eca1eb"
+    }
+  }
+]

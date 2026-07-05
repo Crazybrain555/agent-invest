@@ -1,0 +1,433 @@
+"""SQLAlchemy repository implementations.
+
+Each repository adds domain entities into the active session (mapping them to ORM
+models) and loads them back as entities. They never commit; the UnitOfWork owns
+the transaction boundary.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from disclosure_anchor.adapters.db.postgres import mappers, models
+from disclosure_anchor.domain import entities as e
+from disclosure_anchor.domain.errors import (
+    DocumentIdentityConflictError,
+    SubjectIdentityRaceError,
+)
+
+
+class CompanyRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, company: e.Company) -> e.Company:
+        row = mappers.company_to_model(company)
+        self._session.add(row)
+        try:
+            self._session.flush()
+        except IntegrityError as exc:
+            detail = str(getattr(exc, "orig", exc))
+            if "unified_social_credit_code" in detail:
+                raise SubjectIdentityRaceError(
+                    "company unified_social_credit_code already exists"
+                ) from exc
+            raise
+        return mappers.company_to_entity(row)
+
+    def get(self, company_id: str) -> Optional[e.Company]:
+        row = self._session.get(models.Company, company_id)
+        return mappers.company_to_entity(row) if row is not None else None
+
+    def get_by_legal_name(self, legal_name: str) -> Optional[e.Company]:
+        row = (
+            self._session.query(models.Company)
+            .filter(models.Company.legal_name == legal_name)
+            .order_by(models.Company.created_at.desc(), models.Company.company_id.desc())
+            .first()
+        )
+        return mappers.company_to_entity(row) if row is not None else None
+
+    def get_by_credit_code(self, uscc: str) -> Optional[e.Company]:
+        row = (
+            self._session.query(models.Company)
+            .filter(models.Company.unified_social_credit_code == uscc)
+            .one_or_none()
+        )
+        return mappers.company_to_entity(row) if row is not None else None
+
+    def update(self, company: e.Company) -> e.Company:
+        row = self._session.get(models.Company, company.company_id)
+        if row is None:
+            raise KeyError(f"company not found: {company.company_id}")
+        updated = mappers.company_to_model(company)
+        for column in ("legal_name", "unified_social_credit_code"):
+            setattr(row, column, getattr(updated, column))
+        self._session.flush()
+        return mappers.company_to_entity(row)
+
+
+class CompanyIdentifierRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, identifier: e.CompanyIdentifier) -> e.CompanyIdentifier:
+        row = mappers.company_identifier_to_model(identifier)
+        self._session.add(row)
+        try:
+            self._session.flush()
+        except IntegrityError as exc:
+            detail = str(getattr(exc, "orig", exc))
+            if "uq_company_identifier_strong_key" in detail:
+                raise SubjectIdentityRaceError(
+                    "company identifier strong key already exists"
+                ) from exc
+            raise
+        return mappers.company_identifier_to_entity(row)
+
+    def get(self, identifier_id: str) -> Optional[e.CompanyIdentifier]:
+        row = self._session.get(models.CompanyIdentifier, identifier_id)
+        return mappers.company_identifier_to_entity(row) if row is not None else None
+
+    def get_by_scheme_value(
+        self, scheme: str, normalized_value: str
+    ) -> Optional[e.CompanyIdentifier]:
+        row = (
+            self._session.query(models.CompanyIdentifier)
+            .filter(
+                models.CompanyIdentifier.scheme == scheme,
+                models.CompanyIdentifier.normalized_value == normalized_value,
+                models.CompanyIdentifier.status == "active",
+            )
+            .order_by(
+                models.CompanyIdentifier.created_at.desc(),
+                models.CompanyIdentifier.identifier_id.desc(),
+            )
+            .first()
+        )
+        return mappers.company_identifier_to_entity(row) if row is not None else None
+
+    def update(self, identifier: e.CompanyIdentifier) -> e.CompanyIdentifier:
+        row = self._session.get(models.CompanyIdentifier, identifier.identifier_id)
+        if row is None:
+            raise KeyError(f"company identifier not found: {identifier.identifier_id}")
+        updated = mappers.company_identifier_to_model(identifier)
+        for column in (
+            "company_id",
+            "scheme",
+            "raw_value",
+            "normalized_value",
+            "jurisdiction",
+            "source_access_id",
+            "status",
+            "valid_from",
+            "valid_to",
+            "observed_at",
+        ):
+            setattr(row, column, getattr(updated, column))
+        self._session.flush()
+        return mappers.company_identifier_to_entity(row)
+
+
+class SecurityRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, security: e.Security) -> e.Security:
+        row = mappers.security_to_model(security)
+        self._session.add(row)
+        try:
+            self._session.flush()
+        except IntegrityError as exc:
+            detail = str(getattr(exc, "orig", exc))
+            if "uq_security_code_exchange" in detail:
+                raise SubjectIdentityRaceError(
+                    "security code/exchange already exists"
+                ) from exc
+            raise
+        return mappers.security_to_entity(row)
+
+    def get(self, security_id: str) -> Optional[e.Security]:
+        row = self._session.get(models.Security, security_id)
+        return mappers.security_to_entity(row) if row is not None else None
+
+    def get_by_code_exchange(self, security_code: str, exchange: str) -> Optional[e.Security]:
+        row = (
+            self._session.query(models.Security)
+            .filter(
+                models.Security.security_code == security_code,
+                models.Security.exchange == exchange,
+            )
+            .one_or_none()
+        )
+        return mappers.security_to_entity(row) if row is not None else None
+
+
+class TrackedCompanyRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, tracked_company: e.TrackedCompany) -> e.TrackedCompany:
+        row = mappers.tracked_company_to_model(tracked_company)
+        self._session.add(row)
+        self._session.flush()
+        return mappers.tracked_company_to_entity(row)
+
+    def get(self, tracked_company_id: str) -> Optional[e.TrackedCompany]:
+        row = self._session.get(models.TrackedCompany, tracked_company_id)
+        return mappers.tracked_company_to_entity(row) if row is not None else None
+
+
+class SourceAccessRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, source_access: e.SourceAccess) -> e.SourceAccess:
+        row = mappers.source_access_to_model(source_access)
+        self._session.add(row)
+        self._session.flush()
+        return mappers.source_access_to_entity(row)
+
+    def get(self, source_access_id: str) -> Optional[e.SourceAccess]:
+        row = self._session.get(models.SourceAccess, source_access_id)
+        return mappers.source_access_to_entity(row) if row is not None else None
+
+
+class SourceCheckpointRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, checkpoint: e.SourceCheckpoint) -> e.SourceCheckpoint:
+        row = mappers.source_checkpoint_to_model(checkpoint)
+        self._session.add(row)
+        self._session.flush()
+        return mappers.source_checkpoint_to_entity(row)
+
+    def get(self, source_checkpoint_id: str) -> Optional[e.SourceCheckpoint]:
+        row = self._session.get(models.SourceCheckpoint, source_checkpoint_id)
+        return mappers.source_checkpoint_to_entity(row) if row is not None else None
+
+
+class DocumentRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, document: e.Document) -> e.Document:
+        row = mappers.document_to_model(document)
+        self._session.add(row)
+        try:
+            self._session.flush()
+        except IntegrityError as exc:
+            detail = str(getattr(exc, "orig", exc))
+            if "uq_document_provider_doc_hash" in detail:
+                raise DocumentIdentityConflictError(
+                    "document provider/document/hash already exists"
+                ) from exc
+            raise
+        return mappers.document_to_entity(row)
+
+    def get(self, document_id: str) -> Optional[e.Document]:
+        row = self._session.get(models.Document, document_id)
+        return mappers.document_to_entity(row) if row is not None else None
+
+    def get_for_update(self, document_id: str) -> Optional[e.Document]:
+        row = (
+            self._session.query(models.Document)
+            .filter(models.Document.document_id == document_id)
+            .with_for_update()
+            .one_or_none()
+        )
+        return mappers.document_to_entity(row) if row is not None else None
+
+    def update(self, document: e.Document) -> e.Document:
+        row = self._session.get(models.Document, document.document_id)
+        if row is None:
+            raise KeyError(f"document not found: {document.document_id}")
+        updated = mappers.document_to_model(document)
+        for column in (
+            "company_id",
+            "security_id",
+            "source_access_id",
+            "provider",
+            "provider_document_id",
+            "title",
+            "filing_type",
+            "announcement_date",
+            "report_period",
+            "raw_file_relpath",
+            "raw_file_hash",
+            "status",
+            "provider_metadata",
+            "current_processing_run_id",
+            "supersedes_document_id",
+            "correction_of_document_id",
+        ):
+            setattr(row, column, getattr(updated, column))
+        self._session.flush()
+        return mappers.document_to_entity(row)
+
+    def get_by_provider_document_and_hash(
+        self, *, provider: str, provider_document_id: str, raw_file_hash: str
+    ) -> Optional[e.Document]:
+        row = (
+            self._session.query(models.Document)
+            .filter(
+                models.Document.provider == provider,
+                models.Document.provider_document_id == provider_document_id,
+                models.Document.raw_file_hash == raw_file_hash,
+            )
+            .order_by(models.Document.created_at.desc(), models.Document.document_id.desc())
+            .first()
+        )
+        return mappers.document_to_entity(row) if row is not None else None
+
+    def latest_by_provider_document(
+        self, *, provider: str, provider_document_id: str
+    ) -> Optional[e.Document]:
+        row = (
+            self._session.query(models.Document)
+            .filter(
+                models.Document.provider == provider,
+                models.Document.provider_document_id == provider_document_id,
+            )
+            .order_by(models.Document.created_at.desc(), models.Document.document_id.desc())
+            .first()
+        )
+        return mappers.document_to_entity(row) if row is not None else None
+
+
+class ProcessingRunRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, run: e.ProcessingRun) -> e.ProcessingRun:
+        row = mappers.processing_run_to_model(run)
+        self._session.add(row)
+        self._session.flush()
+        return mappers.processing_run_to_entity(row)
+
+    def get(self, processing_run_id: str) -> Optional[e.ProcessingRun]:
+        row = self._session.get(models.ProcessingRun, processing_run_id)
+        return mappers.processing_run_to_entity(row) if row is not None else None
+
+    def latest_succeeded_parse_for_document(
+        self, document_id: str
+    ) -> Optional[e.ProcessingRun]:
+        row = (
+            self._session.query(models.ProcessingRun)
+            .filter(
+                models.ProcessingRun.document_id == document_id,
+                models.ProcessingRun.run_kind == "parse",
+                models.ProcessingRun.status == "succeeded",
+            )
+            .order_by(
+                models.ProcessingRun.started_at.desc().nullslast(),
+                models.ProcessingRun.processing_run_id.desc(),
+            )
+            .first()
+        )
+        return mappers.processing_run_to_entity(row) if row is not None else None
+
+    def update(self, run: e.ProcessingRun) -> e.ProcessingRun:
+        row = self._session.get(models.ProcessingRun, run.processing_run_id)
+        if row is None:
+            raise KeyError(f"processing_run not found: {run.processing_run_id}")
+        updated = mappers.processing_run_to_model(run)
+        for column in (
+            "document_id",
+            "run_kind",
+            "status",
+            "parser_name",
+            "parser_version",
+            "parser_backend",
+            "parser_method",
+            "parser_language",
+            "input_raw_file_hash",
+            "parser_artifact_relpath",
+            "artifact_hash",
+            "normalized_ir_relpath",
+            "document_units_relpath",
+            "content_hash_aggregate",
+            "structure_hash",
+            "builder_rules_version",
+            "is_active",
+            "unit_build_status",
+            "unit_build_error",
+            "unit_build_attempt_count",
+            "unit_built_at",
+            "started_at",
+            "finished_at",
+            "error",
+        ):
+            setattr(row, column, getattr(updated, column))
+        self._session.flush()
+        return mappers.processing_run_to_entity(row)
+
+
+class DocumentUnitRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, unit: e.DocumentUnit) -> e.DocumentUnit:
+        row = mappers.document_unit_to_model(unit)
+        self._session.add(row)
+        self._session.flush()
+        return mappers.document_unit_to_entity(row)
+
+    def add_many(self, units: list[e.DocumentUnit]) -> list[e.DocumentUnit]:
+        rows = [mappers.document_unit_to_model(unit) for unit in units]
+        self._session.add_all(rows)
+        self._session.flush()
+        return [mappers.document_unit_to_entity(row) for row in rows]
+
+    def get(self, asset_id: str) -> Optional[e.DocumentUnit]:
+        row = self._session.get(models.DocumentUnit, asset_id)
+        return mappers.document_unit_to_entity(row) if row is not None else None
+
+    def list_by_processing_run(self, processing_run_id: str) -> list[e.DocumentUnit]:
+        rows = (
+            self._session.query(models.DocumentUnit)
+            .filter(models.DocumentUnit.processing_run_id == processing_run_id)
+            .order_by(models.DocumentUnit.order_index, models.DocumentUnit.asset_id)
+            .all()
+        )
+        return [mappers.document_unit_to_entity(row) for row in rows]
+
+    def list_by_document_active(self, document_id: str) -> list[e.DocumentUnit]:
+        rows = (
+            self._session.query(models.DocumentUnit)
+            .join(
+                models.ProcessingRun,
+                models.DocumentUnit.processing_run_id
+                == models.ProcessingRun.processing_run_id,
+            )
+            .filter(
+                models.DocumentUnit.document_id == document_id,
+                models.ProcessingRun.is_active.is_(True),
+            )
+            .order_by(models.DocumentUnit.order_index, models.DocumentUnit.asset_id)
+            .all()
+        )
+        return [mappers.document_unit_to_entity(row) for row in rows]
+
+
+class OutboxRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, event: e.OutboxEvent) -> e.OutboxEvent:
+        row = mappers.outbox_event_to_model(event)
+        self._session.add(row)
+        self._session.flush()
+        return mappers.outbox_event_to_entity(row)
+
+    def get(self, event_id: str) -> Optional[e.OutboxEvent]:
+        row = (
+            self._session.query(models.OutboxEvent)
+            .filter(models.OutboxEvent.event_id == event_id)
+            .one_or_none()
+        )
+        return mappers.outbox_event_to_entity(row) if row is not None else None

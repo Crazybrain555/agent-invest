@@ -1,0 +1,8 @@
+# Default non-secret service config placeholder.
+#
+# Runtime paths and credentials are injected through environment variables and
+# loaded by disclosure_anchor.settings.Settings.
+service:
+  name: disclosure_anchor
+  api_host: 127.0.0.1
+  api_port: 8711
