@@ -1,0 +1,111 @@
+# A股日行情:不复权 OHLCV + 复权因子。framework v1.2 §5.1;列名/单位均经 2026-07-06 实测核实。
+schema_version: dataset_registry.v1
+dataset_key: cn_equity.eod_quote
+dataset_contract_version: 1
+status: active
+
+semantic_contract:
+  description: A股日行情(不复权 OHLCV + 复权因子);qfq/hfq 是消费端派生视图,不是 L1 canonical。
+  asset_kind: dataset_snapshot
+  payload_kind: recordset
+  material_type: market_quote
+  source_tier: tier_1
+  trace_level: G1
+  query_params:
+    security:  {type: security_code, required: true, description: 如 000001.SZ}
+    start_date: {type: date, required: true, format: YYYY-MM-DD}
+    end_date:   {type: date, required: true, format: YYYY-MM-DD}
+    price_adjustment:
+      type: enum
+      required: false
+      default: raw_plus_factor
+      allowed: [raw_plus_factor]
+      description: 口径显式化;qfq/hfq 永不作为 L1 canonical(F3)
+  primary_key: [security, trade_date]
+  time_semantics:
+    event_time_from: trade_date
+    published_at_rule: trade_date 收盘后(16:00 Asia/Shanghai)可得
+    provider_as_of_required: true
+  subject_semantics:
+    subject_candidates_from:
+      - {field: security, subject_kind: security}
+  scope_semantics:
+    market: cn_equity
+    currency: CNY
+    price_adjustment: raw_plus_factor
+    adjustment_factor_asof_grade: latest_recomputed   # F3:禁止当 as-of-safe 回测结果
+  fields:
+    - {name: security,   dtype: string,  required: true}
+    - {name: trade_date, dtype: date,    required: true}
+    - {name: open,       dtype: decimal, unit: CNY_per_share, required: true}
+    - {name: high,       dtype: decimal, unit: CNY_per_share, required: true}
+    - {name: low,        dtype: decimal, unit: CNY_per_share, required: true}
+    - {name: close,      dtype: decimal, unit: CNY_per_share, required: true}
+    - {name: pre_close,  dtype: decimal, unit: CNY_per_share}
+    - {name: volume,     dtype: decimal, unit: share, required: true}
+    - {name: amount,     dtype: decimal, unit: CNY, required: true}
+    - {name: adj_factor, dtype: decimal, unit: dimensionless, required: true, as_of_sensitive: true,
+       description: provider 相对值;跨 provider 绝对值不可比(实测 Wind 85.33 vs tushare 139.008)}
+    - {name: row_published_at, dtype: datetime, derived: true,
+       description: 按 time_semantics 规则由 adapter 派生}
+
+providers:
+  wind_rds:
+    table_alias: eod_prices
+    field_map:
+      security:   {column: S_INFO_WINDCODE}
+      trade_date: {column: TRADE_DT, transform: {type: yyyymmdd_to_date}}
+      open:       {column: S_DQ_OPEN}
+      high:       {column: S_DQ_HIGH}
+      low:        {column: S_DQ_LOW}
+      close:      {column: S_DQ_CLOSE}
+      pre_close:  {column: S_DQ_PRECLOSE}
+      volume:     {column: S_DQ_VOLUME, provider_unit: lot,
+                   transform: {type: multiply, factor: 100, target_unit: share}}
+      amount:     {column: S_DQ_AMOUNT, provider_unit: thousand_CNY,
+                   transform: {type: multiply, factor: 1000, target_unit: CNY}}
+      adj_factor: {column: S_DQ_ADJFACTOR}
+    sql_templates:
+      eod_by_security_range:
+        statement: |
+          SELECT TOP (:max_rows)
+              S_INFO_WINDCODE, TRADE_DT, S_DQ_OPEN, S_DQ_HIGH, S_DQ_LOW, S_DQ_CLOSE,
+              S_DQ_PRECLOSE, S_DQ_VOLUME, S_DQ_AMOUNT, S_DQ_ADJFACTOR
+          FROM {{table}}
+          WHERE S_INFO_WINDCODE = :wind_code
+            AND TRADE_DT BETWEEN :start_yyyymmdd AND :end_yyyymmdd
+          ORDER BY TRADE_DT ASC
+        params:
+          wind_code:      {type: wind_code, source: query.security}
+          start_yyyymmdd: {type: yyyymmdd, source: query.start_date}
+          end_yyyymmdd:   {type: yyyymmdd, source: query.end_date}
+          max_rows:       {type: int, default: 8000, max: 8000}
+        required_predicates: [S_INFO_WINDCODE, TRADE_DT]
+        max_rows: 8000
+        timeout_seconds: 30
+        result_order: [TRADE_DT]
+  tushare_api:
+    endpoints_join: {left: daily, right: adj_factor, join_on: [ts_code, trade_date]}
+    field_map:
+      security:   {endpoint: daily, column: ts_code}
+      trade_date: {endpoint: daily, column: trade_date, transform: {type: yyyymmdd_to_date}}
+      open:       {endpoint: daily, column: open}
+      high:       {endpoint: daily, column: high}
+      low:        {endpoint: daily, column: low}
+      close:      {endpoint: daily, column: close}
+      pre_close:  {endpoint: daily, column: pre_close}
+      volume:     {endpoint: daily, column: vol, provider_unit: lot,
+                   transform: {type: multiply, factor: 100, target_unit: share}}
+      amount:     {endpoint: daily, column: amount, provider_unit: thousand_CNY,
+                   transform: {type: multiply, factor: 1000, target_unit: CNY}}
+      adj_factor: {endpoint: adj_factor, column: adj_factor}
+
+validation:
+  row_checks: ["high >= low", "volume >= 0", "amount >= 0"]
+  duplicate_policy: {keys: [security, trade_date], action: fail}
+
+dedup:
+  semantic_key_fields: [dataset_key, security, start_date, end_date, price_adjustment]
+  content_hash:
+    sort_by: [security, trade_date]
+    include_fields: [security, trade_date, open, high, low, close, pre_close, volume, amount, adj_factor]

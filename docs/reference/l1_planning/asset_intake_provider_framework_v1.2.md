@@ -46,6 +46,11 @@ GPT-Pro 二轮评审独立取舍**)。形成过程与取舍全记录见 §9;实�
 - **F11 provider_priority 是服务级配置,不进 dataset_key**:默认 A 股四条数据集均
   `[wind_rds, tushare_api]`(Wind SQL 主通道、tushare 备用/交叉校验;两通道均已实测可用,
   见 §11);用户改优先级 = 改一行配置。
+- **F12 配置预检 fail-fast(用户 2026-07-06 追加拍板)**:换源的理想路径是"改几个配置参数
+  就能用"——因此 adapter 启动/doctor 必须先跑**配置预检**:活源探测 active table/endpoint
+  存在性、required_columns 齐全性、freshness;**缺必要表/列/端点 = 显式报错并列出缺什么**,
+  绝不静默降级、绝不部分工作。预检通过才允许 fetch。未来非结构化源(web search / MCP / API)
+  接入 tool_result 路径时沿用同一原则:source catalog 配置 + 预检 fail-fast,一切皆配置。
 
 ## 2. 分层与写权边界
 

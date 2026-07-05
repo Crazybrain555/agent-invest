@@ -1,0 +1,207 @@
+# A股三大表事实(仅 income/balance/cashflow;指标类走 cn_equity.fin_metric)。
+# framework v1.2 §5.2;列名/单位经 2026-07-06 实测:Wind 与 tushare 金额单位均为元(同值勾稽);
+# 本 RDS 的 STATEMENT_TYPE 是中文标签(如 "合并报表"/"合并报表(调整)"),不是数字码。
+schema_version: dataset_registry.v1
+dataset_key: cn_equity.fin_statement
+dataset_contract_version: 1
+status: active
+
+semantic_contract:
+  description: A股三大表(利润表/资产负债表/现金流量表)原始披露事实,合并口径默认。
+  asset_kind: dataset_snapshot
+  payload_kind: recordset
+  material_type: financial_statement
+  source_tier: tier_1
+  trace_level: G1
+  query_params:
+    security:     {type: security_code, required: true}
+    start_period: {type: period_yyyymmdd, required: true, description: "报告期下界,如 20240331"}
+    end_period:   {type: period_yyyymmdd, required: true}
+    statement:    {type: enum, required: true, allowed: [income, balance, cashflow]}
+    report_scope: {type: enum, required: false, default: consolidated, allowed: [consolidated]}
+  primary_key: [security, report_period]
+  time_semantics:
+    event_time_from: report_period
+    published_at_rule: 行级 = ANN_DT / ann_date(公告日);同期多行取 latest(ANN_DT DESC, OPDATE DESC)
+    provider_as_of_required: true
+  subject_semantics:
+    subject_candidates_from:
+      - {field: security, subject_kind: security}
+  scope_semantics:
+    report_scope: consolidated
+  fields:
+    - {name: security,      dtype: string, required: true}
+    - {name: report_period, dtype: string, required: true}
+    - {name: published_at,  dtype: date,   required: true, description: 公告日}
+    # income
+    - {name: total_revenue,            dtype: decimal, unit: CNY, required: true,  group: income}
+    - {name: revenue,                  dtype: decimal, unit: CNY,                  group: income}
+    - {name: operate_profit,           dtype: decimal, unit: CNY, required: true,  group: income}
+    - {name: total_profit,             dtype: decimal, unit: CNY, required: true,  group: income}
+    - {name: net_profit_incl_min,      dtype: decimal, unit: CNY,                  group: income}
+    - {name: net_profit_attr_parent,   dtype: decimal, unit: CNY, required: true,  group: income}
+    - {name: net_profit_deducted,      dtype: decimal, unit: CNY,                  group: income,
+       description: "扣非归母;tushare income 无此列(在 fin_metric 里),故非必填"}
+    - {name: eps_basic,                dtype: decimal, unit: CNY_per_share,        group: income}
+    # balance
+    - {name: total_assets,             dtype: decimal, unit: CNY, required: true,  group: balance}
+    - {name: total_liab,               dtype: decimal, unit: CNY, required: true,  group: balance}
+    - {name: equity_attr_parent,       dtype: decimal, unit: CNY, required: true,  group: balance}
+    - {name: accounts_receivable,      dtype: decimal, unit: CNY,                  group: balance}
+    - {name: inventories,              dtype: decimal, unit: CNY,                  group: balance}
+    - {name: contract_liabilities,     dtype: decimal, unit: CNY,                  group: balance}
+    # cashflow
+    - {name: net_cash_flows_oper,      dtype: decimal, unit: CNY, required: true,  group: cashflow}
+    - {name: capex_paid,               dtype: decimal, unit: CNY,                  group: cashflow,
+       description: 购建固定/无形/长期资产支付的现金(资本开支代理)}
+    - {name: depr_amort,               dtype: decimal, unit: CNY,                  group: cashflow}
+
+providers:
+  wind_rds:
+    variants:
+      - when: {statement: income}
+        table_alias: fin_income
+        scope_filter: {STATEMENT_TYPE: ["合并报表", "合并报表(调整)"]}
+        field_map:
+          security:      {column: S_INFO_WINDCODE}
+          report_period: {column: REPORT_PERIOD}
+          published_at:  {column: ANN_DT, transform: {type: yyyymmdd_to_date}}
+          total_revenue: {column: TOT_OPER_REV}
+          revenue:       {column: OPER_REV}
+          operate_profit: {column: OPER_PROFIT}
+          total_profit:  {column: TOT_PROFIT}
+          net_profit_incl_min:    {column: NET_PROFIT_INCL_MIN_INT_INC}
+          net_profit_attr_parent: {column: NET_PROFIT_EXCL_MIN_INT_INC}
+          net_profit_deducted:    {column: NET_PROFIT_AFTER_DED_NR_LP}
+          eps_basic:     {column: S_FA_EPS_BASIC}
+        sql_templates:
+          income_by_security_period_range:
+            statement: |
+              SELECT TOP (:max_rows)
+                  S_INFO_WINDCODE, REPORT_PERIOD, ANN_DT, STATEMENT_TYPE, OPDATE,
+                  TOT_OPER_REV, OPER_REV, OPER_PROFIT, TOT_PROFIT,
+                  NET_PROFIT_INCL_MIN_INT_INC, NET_PROFIT_EXCL_MIN_INT_INC,
+                  NET_PROFIT_AFTER_DED_NR_LP, S_FA_EPS_BASIC
+              FROM {{table}}
+              WHERE S_INFO_WINDCODE = :wind_code
+                AND REPORT_PERIOD BETWEEN :start_period AND :end_period
+              ORDER BY REPORT_PERIOD ASC, ANN_DT ASC
+            params:
+              wind_code:    {type: wind_code, source: query.security}
+              start_period: {type: yyyymmdd, source: query.start_period}
+              end_period:   {type: yyyymmdd, source: query.end_period}
+              max_rows:     {type: int, default: 2000, max: 2000}
+            required_predicates: [S_INFO_WINDCODE, REPORT_PERIOD]
+            max_rows: 2000
+            timeout_seconds: 30
+      - when: {statement: balance}
+        table_alias: fin_balance
+        scope_filter: {STATEMENT_TYPE: ["合并报表", "合并报表(调整)"]}
+        field_map:
+          security:      {column: S_INFO_WINDCODE}
+          report_period: {column: REPORT_PERIOD}
+          published_at:  {column: ANN_DT, transform: {type: yyyymmdd_to_date}}
+          total_assets:  {column: TOT_ASSETS}
+          total_liab:    {column: TOT_LIAB}
+          equity_attr_parent:   {column: TOT_SHRHLDR_EQY_EXCL_MIN_INT}
+          accounts_receivable:  {column: ACCT_RCV}
+          inventories:          {column: INVENTORIES}
+          contract_liabilities: {column: CONTRACT_LIABILITIES}
+        sql_templates:
+          balance_by_security_period_range:
+            statement: |
+              SELECT TOP (:max_rows)
+                  S_INFO_WINDCODE, REPORT_PERIOD, ANN_DT, STATEMENT_TYPE, OPDATE,
+                  TOT_ASSETS, TOT_LIAB, TOT_SHRHLDR_EQY_EXCL_MIN_INT,
+                  ACCT_RCV, INVENTORIES, CONTRACT_LIABILITIES
+              FROM {{table}}
+              WHERE S_INFO_WINDCODE = :wind_code
+                AND REPORT_PERIOD BETWEEN :start_period AND :end_period
+              ORDER BY REPORT_PERIOD ASC, ANN_DT ASC
+            params:
+              wind_code:    {type: wind_code, source: query.security}
+              start_period: {type: yyyymmdd, source: query.start_period}
+              end_period:   {type: yyyymmdd, source: query.end_period}
+              max_rows:     {type: int, default: 2000, max: 2000}
+            required_predicates: [S_INFO_WINDCODE, REPORT_PERIOD]
+            max_rows: 2000
+            timeout_seconds: 30
+      - when: {statement: cashflow}
+        table_alias: fin_cashflow
+        scope_filter: {STATEMENT_TYPE: ["合并报表", "合并报表(调整)"]}
+        field_map:
+          security:      {column: S_INFO_WINDCODE}
+          report_period: {column: REPORT_PERIOD}
+          published_at:  {column: ANN_DT, transform: {type: yyyymmdd_to_date}}
+          net_cash_flows_oper: {column: NET_CASH_FLOWS_OPER_ACT}
+          capex_paid:    {column: CASH_PAY_ACQ_CONST_FIOLTA}
+          depr_amort:    {column: DEPR_FA_COGA_DPBA}
+        sql_templates:
+          cashflow_by_security_period_range:
+            statement: |
+              SELECT TOP (:max_rows)
+                  S_INFO_WINDCODE, REPORT_PERIOD, ANN_DT, STATEMENT_TYPE, OPDATE,
+                  NET_CASH_FLOWS_OPER_ACT, CASH_PAY_ACQ_CONST_FIOLTA, DEPR_FA_COGA_DPBA
+              FROM {{table}}
+              WHERE S_INFO_WINDCODE = :wind_code
+                AND REPORT_PERIOD BETWEEN :start_period AND :end_period
+              ORDER BY REPORT_PERIOD ASC, ANN_DT ASC
+            params:
+              wind_code:    {type: wind_code, source: query.security}
+              start_period: {type: yyyymmdd, source: query.start_period}
+              end_period:   {type: yyyymmdd, source: query.end_period}
+              max_rows:     {type: int, default: 2000, max: 2000}
+            required_predicates: [S_INFO_WINDCODE, REPORT_PERIOD]
+            max_rows: 2000
+            timeout_seconds: 30
+  tushare_api:
+    variants:
+      - when: {statement: income}
+        endpoints: [income]
+        field_map:
+          security:      {endpoint: income, column: ts_code}
+          report_period: {endpoint: income, column: end_date}
+          published_at:  {endpoint: income, column: ann_date, transform: {type: yyyymmdd_to_date}}
+          total_revenue: {endpoint: income, column: total_revenue}
+          revenue:       {endpoint: income, column: revenue}
+          operate_profit: {endpoint: income, column: operate_profit}
+          total_profit:  {endpoint: income, column: total_profit}
+          net_profit_incl_min:    {endpoint: income, column: n_income}
+          net_profit_attr_parent: {endpoint: income, column: n_income_attr_p}
+          eps_basic:     {endpoint: income, column: basic_eps}
+      - when: {statement: balance}
+        endpoints: [balancesheet]
+        field_map:
+          security:      {endpoint: balancesheet, column: ts_code}
+          report_period: {endpoint: balancesheet, column: end_date}
+          published_at:  {endpoint: balancesheet, column: ann_date, transform: {type: yyyymmdd_to_date}}
+          total_assets:  {endpoint: balancesheet, column: total_assets}
+          total_liab:    {endpoint: balancesheet, column: total_liab}
+          equity_attr_parent:   {endpoint: balancesheet, column: total_hldr_eqy_exc_min_int}
+          accounts_receivable:  {endpoint: balancesheet, column: accounts_receiv}
+          inventories:          {endpoint: balancesheet, column: inventories}
+          contract_liabilities: {endpoint: balancesheet, column: contract_liab}
+      - when: {statement: cashflow}
+        endpoints: [cashflow]
+        field_map:
+          security:      {endpoint: cashflow, column: ts_code}
+          report_period: {endpoint: cashflow, column: end_date}
+          published_at:  {endpoint: cashflow, column: ann_date, transform: {type: yyyymmdd_to_date}}
+          net_cash_flows_oper: {endpoint: cashflow, column: n_cashflow_act}
+          capex_paid:    {endpoint: cashflow, column: c_pay_acq_const_fiolta}
+          depr_amort:    {endpoint: cashflow, column: depr_fa_coga_dpba}
+
+validation:
+  row_checks: []
+  duplicate_policy: {keys: [security, report_period], action: keep_latest}
+
+dedup:
+  semantic_key_fields: [dataset_key, security, start_period, end_period, statement, report_scope]
+  content_hash:
+    sort_by: [security, report_period]
+    include_fields: [security, report_period, published_at,
+                     total_revenue, revenue, operate_profit, total_profit,
+                     net_profit_incl_min, net_profit_attr_parent, net_profit_deducted, eps_basic,
+                     total_assets, total_liab, equity_attr_parent, accounts_receivable,
+                     inventories, contract_liabilities,
+                     net_cash_flows_oper, capex_paid, depr_amort]

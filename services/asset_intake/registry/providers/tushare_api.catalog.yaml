@@ -1,0 +1,31 @@
+# tushare pro HTTP API 物理 catalog。framework v1.2 §4.2。
+# 事实来源:2026-07-06 活 API 探测(定稿 §11):八个 endpoint 当前 token 全部可用。
+# 角色:备用 / 交叉校验通道(F11);凭证只走环境变量 TUSHARE_TOKEN。
+schema_version: provider_catalog.v1
+provider: tushare_api
+provider_kind: http_api
+connection_profile: TUSHARE    # env: TUSHARE_TOKEN
+base_url: https://api.tushare.pro
+
+default_safety:
+  readonly_required: true
+  single_statement_only: true
+  require_bound_params: true
+  forbid_select_star: true
+  deny_tokens: []
+  default_timeout_seconds: 30
+  default_max_rows: 6000       # probed: daily 单次行数上限约 6000
+
+rate_limit:
+  min_interval_ms: 300
+  retry_backoff_seconds: [1, 5, 15]
+
+endpoints:
+  daily:          {api_name: daily,          note: "未复权日行情;vol=手 amount=千元(与 Wind 同值同单位)"}
+  adj_factor:     {api_name: adj_factor,     note: "复权因子;基准与 Wind 不同,跨 provider 绝对值不可比"}
+  income:         {api_name: income,         note: "金额单位=元;含 ann_date/f_ann_date/report_type/update_flag"}
+  balancesheet:   {api_name: balancesheet,   note: "金额单位=元"}
+  cashflow:       {api_name: cashflow,       note: "金额单位=元"}
+  fina_indicator: {api_name: fina_indicator, note: "自带 ann_date;比率字段单位=percent"}
+  forecast:       {api_name: forecast,       note: "金额单位=万元;type 为中文标签;可按 ann_date 全市场查"}
+  express:        {api_name: express,        note: "金额单位=元"}

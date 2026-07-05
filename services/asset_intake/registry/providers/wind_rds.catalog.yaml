@@ -1,0 +1,135 @@
+# Wind 阿里云 RDS (SQL Server) 物理 catalog。framework v1.2 §4.2。
+# 事实来源:2026-07-06 活库探测(定稿 §11)。凭证只走环境变量组 WIND_RDS,绝不入 YAML。
+schema_version: provider_catalog.v1
+provider: wind_rds
+provider_kind: sql_server_rds
+connection_profile: WIND_RDS   # env: WIND_HOST / WIND_PORT / WIND_USER / WIND_PASSWORD / WIND_DB
+
+default_safety:
+  readonly_required: true
+  single_statement_only: true
+  require_bound_params: true
+  forbid_select_star: true
+  deny_tokens: [";", "INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "ALTER", "EXEC", "OPENROWSET"]
+  default_timeout_seconds: 30
+  default_max_rows: 10000
+
+index_discipline:
+  required_prefix_predicates: [S_INFO_WINDCODE]
+  date_columns_are_varchar8: true
+  note: 日期列按 YYYYMMDD 字符串比较;SQL 内禁 CONVERT 破坏索引,日期转换在 adapter 出口做。
+
+table_aliases:
+  eod_prices:
+    semantic_datasets: [cn_equity.eod_quote]
+    active_table: AShareEODPrices    # probed 2026-07-06: fresh through last trading day
+    activation_rule: [table_exists, required_columns_present]
+    candidates:
+      - table: AShareEODPrices
+        role: active
+        key_columns: [S_INFO_WINDCODE, TRADE_DT]
+        date_column: TRADE_DT
+        required_columns: [S_INFO_WINDCODE, TRADE_DT, S_DQ_OPEN, S_DQ_HIGH, S_DQ_LOW,
+                           S_DQ_CLOSE, S_DQ_PRECLOSE, S_DQ_VOLUME, S_DQ_AMOUNT, S_DQ_ADJFACTOR]
+    freshness_check:
+      sql: "SELECT MAX(TRADE_DT) FROM {{table}} WHERE S_INFO_WINDCODE = :probe_code"
+
+  fin_income:
+    semantic_datasets: [cn_equity.fin_statement]
+    active_table: AShareIncome       # probed: ANN_DT through 20260425; amounts in CNY (=tushare)
+    activation_rule: [table_exists, required_columns_present]
+    candidates:
+      - table: AShareIncome
+        role: active
+        key_columns: [S_INFO_WINDCODE, REPORT_PERIOD]
+        date_column: ANN_DT
+        required_columns: [S_INFO_WINDCODE, REPORT_PERIOD, ANN_DT, STATEMENT_TYPE, OPDATE,
+                           TOT_OPER_REV, OPER_REV, OPER_PROFIT, TOT_PROFIT,
+                           NET_PROFIT_INCL_MIN_INT_INC, NET_PROFIT_EXCL_MIN_INT_INC,
+                           NET_PROFIT_AFTER_DED_NR_LP, S_FA_EPS_BASIC]
+
+  fin_balance:
+    semantic_datasets: [cn_equity.fin_statement]
+    active_table: AShareBalancesheet  # probed: this RDS spells it lowercase-s
+    activation_rule: [table_exists, required_columns_present]
+    candidates:
+      - table: AShareBalancesheet
+        role: active
+        key_columns: [S_INFO_WINDCODE, REPORT_PERIOD]
+        date_column: ANN_DT
+        required_columns: [S_INFO_WINDCODE, REPORT_PERIOD, ANN_DT, STATEMENT_TYPE, OPDATE,
+                           TOT_ASSETS, TOT_LIAB, TOT_SHRHLDR_EQY_EXCL_MIN_INT,
+                           ACCT_RCV, INVENTORIES, CONTRACT_LIABILITIES]
+
+  fin_cashflow:
+    semantic_datasets: [cn_equity.fin_statement]
+    active_table: AShareCashflow      # probed: lowercase-f in this RDS
+    activation_rule: [table_exists, required_columns_present]
+    candidates:
+      - table: AShareCashflow
+        role: active
+        key_columns: [S_INFO_WINDCODE, REPORT_PERIOD]
+        date_column: ANN_DT
+        required_columns: [S_INFO_WINDCODE, REPORT_PERIOD, ANN_DT, STATEMENT_TYPE, OPDATE,
+                           NET_CASH_FLOWS_OPER_ACT, CASH_PAY_ACQ_CONST_FIOLTA, DEPR_FA_COGA_DPBA]
+
+  fin_indicator:
+    semantic_datasets: [cn_equity.fin_metric]
+    active_table: AShareFinancialIndicator  # probed: 169 cols, has OPDATE but NO ANN_DT
+    activation_rule: [table_exists, required_columns_present]
+    candidates:
+      - table: AShareFinancialIndicator
+        role: active
+        key_columns: [S_INFO_WINDCODE, REPORT_PERIOD]
+        date_column: REPORT_PERIOD
+        required_columns: [S_INFO_WINDCODE, REPORT_PERIOD, OPDATE,
+                           S_FA_EPS_BASIC, S_FA_DEDUCTEDPROFIT, S_FA_ROE, S_FA_ROE_DEDUCTED,
+                           S_FA_GROSSPROFITMARGIN, S_FA_NETPROFITMARGIN, S_FA_ASSETSTURN]
+
+  earnings_forecast:
+    semantic_datasets: [cn_equity.earnings_event]
+    # probed 2026-07-06: NoticeNew 362,681 rows / max ann 20260706 (live);
+    # AShareProfitNotice 121,776 rows / max 20240905 (stale in THIS rds) — kept as candidate,
+    # activation by freshness so a different sync package still works (F12).
+    active_table: AShareProfitNoticeNew
+    activation_rule: [table_exists, required_columns_present, max_date_freshness]
+    candidates:
+      - table: AShareProfitNoticeNew
+        role: active
+        key_columns: [S_INFO_WINDCODE, S_PROFITNOTICE_DATE, S_PROFITNOTICE_PERIOD]
+        date_column: S_PROFITNOTICE_DATE
+        required_columns: [S_INFO_WINDCODE, S_PROFITNOTICE_DATE, S_PROFITNOTICE_PERIOD,
+                           S_PROFITNOTICE_STYLE, S_PROFITNOTICE_NETPROFITMIN,
+                           S_PROFITNOTICE_NETPROFITMAX, S_PROFITNOTICE_FIRSTANNDATE]
+      - table: AShareProfitNotice
+        role: stale_candidate
+        key_columns: [S_INFO_WINDCODE, S_PROFITNOTICE_DATE, S_PROFITNOTICE_PERIOD]
+        date_column: S_PROFITNOTICE_DATE
+        required_columns: [S_INFO_WINDCODE, S_PROFITNOTICE_DATE, S_PROFITNOTICE_PERIOD,
+                           S_PROFITNOTICE_STYLE, S_PROFITNOTICE_NETPROFITMIN,
+                           S_PROFITNOTICE_NETPROFITMAX, S_PROFITNOTICE_FIRSTANNDATE]
+        note: probed stale at 20240905 in this RDS; other sync packages may differ
+    freshness_check:
+      sql: "SELECT MAX(S_PROFITNOTICE_DATE) FROM {{table}}"
+
+  earnings_express:
+    semantic_datasets: [cn_equity.earnings_event]
+    active_table: AShareProfitExpress  # probed: global max ANN_DT 20260507; amounts in CNY
+    activation_rule: [table_exists, required_columns_present]
+    candidates:
+      - table: AShareProfitExpress
+        role: active
+        key_columns: [S_INFO_WINDCODE, REPORT_PERIOD]
+        date_column: ANN_DT
+        required_columns: [S_INFO_WINDCODE, REPORT_PERIOD, ANN_DT, OPER_REV, OPER_PROFIT,
+                           TOT_PROFIT, NET_PROFIT_EXCL_MIN_INT_INC, EPS_DILUTED,
+                           TOT_ASSETS, NET_ASSETS]
+
+  trading_calendar:
+    semantic_datasets: []   # infra alias: incremental driver, not a dataset source
+    active_table: AShareCalendar   # probed: trade days through 20271231
+    activation_rule: [table_exists]
+    candidates:
+      - table: AShareCalendar
+        role: active
+        date_column: TRADE_DAYS

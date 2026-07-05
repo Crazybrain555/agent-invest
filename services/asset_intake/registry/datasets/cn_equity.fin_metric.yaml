@@ -1,0 +1,107 @@
+# A股财务指标(provider 计算/公布口径,非三大表原始事实)。framework v1.2 §5.3。
+# 2026-07-06 实测:Wind AShareFinancialIndicator 169 列、无 ANN_DT(有 OPDATE);
+# tushare fina_indicator 自带 ann_date。官方字典的 ANN/derivative/TTM 表本 RDS 不存在(roadmap)。
+schema_version: dataset_registry.v1
+dataset_key: cn_equity.fin_metric
+dataset_contract_version: 1
+status: active
+
+semantic_contract:
+  description: provider 计算的财务指标(ROE/利润率/周转/扣非等);metric_origin 防止与三大表原始事实混淆。
+  asset_kind: dataset_snapshot
+  payload_kind: recordset
+  material_type: financial_metric
+  source_tier: tier_1
+  trace_level: G1
+  query_params:
+    security:     {type: security_code, required: true}
+    start_period: {type: period_yyyymmdd, required: true}
+    end_period:   {type: period_yyyymmdd, required: true}
+    metric_set:   {type: enum, required: true, allowed: [financial_indicator]}
+  primary_key: [security, report_period]
+  time_semantics:
+    event_time_from: report_period
+    published_at_rule: wind 侧无 ANN_DT,join AShareIncome.ANN_DT(同 code+period)缺失退 OPDATE;tushare 侧用 ann_date
+    provider_as_of_required: true
+  subject_semantics:
+    subject_candidates_from:
+      - {field: security, subject_kind: security}
+  scope_semantics:
+    metric_origin_default: provider_derived
+  fields:
+    - {name: security,      dtype: string, required: true}
+    - {name: report_period, dtype: string, required: true}
+    - {name: published_at,  dtype: date,
+       description: wind 需 join 派生故非必填;tushare 直接映射}
+    - {name: metric_origin, dtype: string, required: true, derived: true,
+       description: 按 metric_set 注入常量(financial_indicator → provider_derived)}
+    - {name: eps_basic,           dtype: decimal, unit: CNY_per_share, group: financial_indicator}
+    - {name: profit_deducted,     dtype: decimal, unit: CNY, required: true, group: financial_indicator,
+       description: 扣非归母净利}
+    - {name: roe,                 dtype: decimal, unit: percent, required: true, group: financial_indicator}
+    - {name: roe_deducted,        dtype: decimal, unit: percent, group: financial_indicator}
+    - {name: gross_profit_margin, dtype: decimal, unit: percent, group: financial_indicator,
+       description: "银行等无毛利率,可空"}
+    - {name: net_profit_margin,   dtype: decimal, unit: percent, group: financial_indicator}
+    - {name: assets_turn,         dtype: decimal, unit: dimensionless, group: financial_indicator}
+
+providers:
+  wind_rds:
+    variants:
+      - when: {metric_set: financial_indicator}
+        table_alias: fin_indicator
+        field_map:
+          security:      {column: S_INFO_WINDCODE}
+          report_period: {column: REPORT_PERIOD}
+          eps_basic:           {column: S_FA_EPS_BASIC}
+          profit_deducted:     {column: S_FA_DEDUCTEDPROFIT}
+          roe:                 {column: S_FA_ROE}
+          roe_deducted:        {column: S_FA_ROE_DEDUCTED}
+          gross_profit_margin: {column: S_FA_GROSSPROFITMARGIN}
+          net_profit_margin:   {column: S_FA_NETPROFITMARGIN}
+          assets_turn:         {column: S_FA_ASSETSTURN}
+        sql_templates:
+          fin_indicator_by_security_period_range:
+            statement: |
+              SELECT TOP (:max_rows)
+                  S_INFO_WINDCODE, REPORT_PERIOD, OPDATE,
+                  S_FA_EPS_BASIC, S_FA_DEDUCTEDPROFIT, S_FA_ROE, S_FA_ROE_DEDUCTED,
+                  S_FA_GROSSPROFITMARGIN, S_FA_NETPROFITMARGIN, S_FA_ASSETSTURN
+              FROM {{table}}
+              WHERE S_INFO_WINDCODE = :wind_code
+                AND REPORT_PERIOD BETWEEN :start_period AND :end_period
+              ORDER BY REPORT_PERIOD ASC
+            params:
+              wind_code:    {type: wind_code, source: query.security}
+              start_period: {type: yyyymmdd, source: query.start_period}
+              end_period:   {type: yyyymmdd, source: query.end_period}
+              max_rows:     {type: int, default: 2000, max: 2000}
+            required_predicates: [S_INFO_WINDCODE, REPORT_PERIOD]
+            max_rows: 2000
+            timeout_seconds: 30
+  tushare_api:
+    variants:
+      - when: {metric_set: financial_indicator}
+        endpoints: [fina_indicator]
+        field_map:
+          security:      {endpoint: fina_indicator, column: ts_code}
+          report_period: {endpoint: fina_indicator, column: end_date}
+          published_at:  {endpoint: fina_indicator, column: ann_date, transform: {type: yyyymmdd_to_date}}
+          eps_basic:           {endpoint: fina_indicator, column: eps}
+          profit_deducted:     {endpoint: fina_indicator, column: profit_dedt}
+          roe:                 {endpoint: fina_indicator, column: roe}
+          roe_deducted:        {endpoint: fina_indicator, column: roe_dt}
+          gross_profit_margin: {endpoint: fina_indicator, column: grossprofit_margin}
+          net_profit_margin:   {endpoint: fina_indicator, column: netprofit_margin}
+          assets_turn:         {endpoint: fina_indicator, column: assets_turn}
+
+validation:
+  row_checks: []
+  duplicate_policy: {keys: [security, report_period], action: keep_latest}
+
+dedup:
+  semantic_key_fields: [dataset_key, security, start_period, end_period, metric_set]
+  content_hash:
+    sort_by: [security, report_period]
+    include_fields: [security, report_period, published_at, eps_basic, profit_deducted,
+                     roe, roe_deducted, gross_profit_margin, net_profit_margin, assets_turn]

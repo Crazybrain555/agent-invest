@@ -1,0 +1,203 @@
+# A股业绩预告/快报(披露事件,非期间报表事实)。framework v1.2 §5.4。
+# 2026-07-06 实测:Wind 活表 = AShareProfitNoticeNew(24 列,数据到当天;金额=万元);
+# AShareProfitExpress 活(金额=元,与 tushare 同值);tushare forecast type 为中文标签(万元)。
+# 预告类型:Wind 数字码 / tushare 中文标签,首发保留 provider 原值(style_provider_raw),
+# 归一枚举待码表核实后加 code_map(roadmap)。
+schema_version: dataset_registry.v1
+dataset_key: cn_equity.earnings_event
+dataset_contract_version: 1
+status: active
+
+semantic_contract:
+  description: 业绩预告(forecast)与业绩快报(express)披露事件;修正/多次预告 = 新行。
+  asset_kind: dataset_snapshot
+  payload_kind: recordset
+  material_type: earnings_event
+  source_tier: tier_1
+  trace_level: G1
+  query_params:
+    security:       {type: security_code, required: true}
+    start_ann_date: {type: date, required: true, description: 公告日下界}
+    end_ann_date:   {type: date, required: true}
+    event_type:     {type: enum, required: true, allowed: [forecast, express]}
+  primary_key: [security, report_period, published_at]
+  time_semantics:
+    event_time_from: report_period
+    published_at_rule: 行级 = 最新公告日(S_PROFITNOTICE_DATE / ANN_DT / ann_date)
+    provider_as_of_required: true
+  subject_semantics:
+    subject_candidates_from:
+      - {field: security, subject_kind: security}
+  scope_semantics: {}
+  fields:
+    - {name: security,      dtype: string, required: true}
+    - {name: report_period, dtype: string, required: true}
+    - {name: published_at,  dtype: date,   required: true}
+    # forecast(预告)
+    - {name: first_ann_date,       dtype: date,                          group: forecast}
+    - {name: style_provider_raw,   dtype: string, required: true,        group: forecast,
+       description: "Wind 数字码(如 454010000)/ tushare 中文标签,原值保留不猜"}
+    - {name: sign_change,          dtype: string,                        group: forecast}
+    - {name: net_profit_min,       dtype: decimal, unit: CNY,            group: forecast}
+    - {name: net_profit_max,       dtype: decimal, unit: CNY,            group: forecast}
+    - {name: change_min_pct,       dtype: decimal, unit: percent,        group: forecast}
+    - {name: change_max_pct,       dtype: decimal, unit: percent,        group: forecast}
+    - {name: last_year_net_profit_parent, dtype: decimal, unit: CNY,     group: forecast}
+    - {name: net_profit_deducted_min, dtype: decimal, unit: CNY,         group: forecast}
+    - {name: net_profit_deducted_max, dtype: decimal, unit: CNY,         group: forecast}
+    - {name: eps_min,              dtype: decimal, unit: CNY_per_share,  group: forecast}
+    - {name: eps_max,              dtype: decimal, unit: CNY_per_share,  group: forecast}
+    - {name: notice_number,        dtype: decimal,                       group: forecast,
+       description: 公布次数;tushare 无此列}
+    - {name: abstract,             dtype: string,                        group: forecast}
+    - {name: reason,               dtype: string,                        group: forecast,
+       description: "业绩变动原因(≤3000 字文本,对 L2 抽取有价值)"}
+    # express(快报)
+    - {name: oper_rev,             dtype: decimal, unit: CNY, group: express}
+    - {name: oper_profit,          dtype: decimal, unit: CNY, group: express}
+    - {name: tot_profit,           dtype: decimal, unit: CNY, group: express}
+    - {name: net_profit_attr_parent, dtype: decimal, unit: CNY, required: true, group: express}
+    - {name: eps_diluted,          dtype: decimal, unit: CNY_per_share, group: express}
+    - {name: roe_diluted,          dtype: decimal, unit: percent, group: express}
+    - {name: tot_assets,           dtype: decimal, unit: CNY, group: express}
+    - {name: net_assets,           dtype: decimal, unit: CNY, group: express}
+    - {name: brief_performance,    dtype: string, group: express}
+
+providers:
+  wind_rds:
+    variants:
+      - when: {event_type: forecast}
+        table_alias: earnings_forecast
+        field_map:
+          security:      {column: S_INFO_WINDCODE}
+          report_period: {column: S_PROFITNOTICE_PERIOD}
+          published_at:  {column: S_PROFITNOTICE_DATE, transform: {type: yyyymmdd_to_date}}
+          first_ann_date: {column: S_PROFITNOTICE_FIRSTANNDATE, transform: {type: yyyymmdd_to_date}}
+          style_provider_raw: {column: S_PROFITNOTICE_STYLE}
+          sign_change:   {column: S_PROFITNOTICE_SIGNCHANGE}
+          net_profit_min: {column: S_PROFITNOTICE_NETPROFITMIN, provider_unit: wan_CNY,
+                           transform: {type: multiply, factor: 10000, target_unit: CNY}}
+          net_profit_max: {column: S_PROFITNOTICE_NETPROFITMAX, provider_unit: wan_CNY,
+                           transform: {type: multiply, factor: 10000, target_unit: CNY}}
+          change_min_pct: {column: S_PROFITNOTICE_CHANGEMIN}
+          change_max_pct: {column: S_PROFITNOTICE_CHANGEMAX}
+          last_year_net_profit_parent: {column: S_PROFITNOTICE_NET_PARENT_FIRM, provider_unit: wan_CNY,
+                                        transform: {type: multiply, factor: 10000, target_unit: CNY}}
+          net_profit_deducted_min: {column: S_PROFITNOTICE_NI_MIN_DED, provider_unit: wan_CNY,
+                                    transform: {type: multiply, factor: 10000, target_unit: CNY}}
+          net_profit_deducted_max: {column: S_PROFITNOTICE_NI_MAX_DED, provider_unit: wan_CNY,
+                                    transform: {type: multiply, factor: 10000, target_unit: CNY}}
+          eps_min:       {column: S_PROFITNOTICE_BASICEARNMIN}
+          eps_max:       {column: S_PROFITNOTICE_BASICEARNMAX}
+          notice_number: {column: S_PROFITNOTICE_NUMBER}
+          abstract:      {column: S_PROFITNOTICE_ABSTRACT}
+          reason:        {column: S_PROFITNOTICE_REASON}
+        sql_templates:
+          forecast_by_security_ann_range:
+            statement: |
+              SELECT TOP (:max_rows)
+                  S_INFO_WINDCODE, S_PROFITNOTICE_DATE, S_PROFITNOTICE_PERIOD,
+                  S_PROFITNOTICE_STYLE, S_PROFITNOTICE_SIGNCHANGE,
+                  S_PROFITNOTICE_CHANGEMIN, S_PROFITNOTICE_CHANGEMAX,
+                  S_PROFITNOTICE_NETPROFITMIN, S_PROFITNOTICE_NETPROFITMAX,
+                  S_PROFITNOTICE_NUMBER, S_PROFITNOTICE_FIRSTANNDATE,
+                  S_PROFITNOTICE_ABSTRACT, S_PROFITNOTICE_REASON,
+                  S_PROFITNOTICE_NET_PARENT_FIRM,
+                  S_PROFITNOTICE_NI_MIN_DED, S_PROFITNOTICE_NI_MAX_DED,
+                  S_PROFITNOTICE_BASICEARNMIN, S_PROFITNOTICE_BASICEARNMAX
+              FROM {{table}}
+              WHERE S_INFO_WINDCODE = :wind_code
+                AND S_PROFITNOTICE_DATE BETWEEN :start_yyyymmdd AND :end_yyyymmdd
+              ORDER BY S_PROFITNOTICE_DATE ASC
+            params:
+              wind_code:      {type: wind_code, source: query.security}
+              start_yyyymmdd: {type: yyyymmdd, source: query.start_ann_date}
+              end_yyyymmdd:   {type: yyyymmdd, source: query.end_ann_date}
+              max_rows:       {type: int, default: 1000, max: 1000}
+            required_predicates: [S_INFO_WINDCODE, S_PROFITNOTICE_DATE]
+            max_rows: 1000
+            timeout_seconds: 30
+      - when: {event_type: express}
+        table_alias: earnings_express
+        field_map:
+          security:      {column: S_INFO_WINDCODE}
+          report_period: {column: REPORT_PERIOD}
+          published_at:  {column: ANN_DT, transform: {type: yyyymmdd_to_date}}
+          oper_rev:      {column: OPER_REV}
+          oper_profit:   {column: OPER_PROFIT}
+          tot_profit:    {column: TOT_PROFIT}
+          net_profit_attr_parent: {column: NET_PROFIT_EXCL_MIN_INT_INC}
+          eps_diluted:   {column: EPS_DILUTED}
+          roe_diluted:   {column: ROE_DILUTED}
+          tot_assets:    {column: TOT_ASSETS}
+          net_assets:    {column: NET_ASSETS}
+          brief_performance: {column: BRIEF_PERFORMANCE}
+        sql_templates:
+          express_by_security_ann_range:
+            statement: |
+              SELECT TOP (:max_rows)
+                  S_INFO_WINDCODE, REPORT_PERIOD, ANN_DT,
+                  OPER_REV, OPER_PROFIT, TOT_PROFIT, NET_PROFIT_EXCL_MIN_INT_INC,
+                  EPS_DILUTED, ROE_DILUTED, TOT_ASSETS, NET_ASSETS, BRIEF_PERFORMANCE
+              FROM {{table}}
+              WHERE S_INFO_WINDCODE = :wind_code
+                AND ANN_DT BETWEEN :start_yyyymmdd AND :end_yyyymmdd
+              ORDER BY ANN_DT ASC
+            params:
+              wind_code:      {type: wind_code, source: query.security}
+              start_yyyymmdd: {type: yyyymmdd, source: query.start_ann_date}
+              end_yyyymmdd:   {type: yyyymmdd, source: query.end_ann_date}
+              max_rows:       {type: int, default: 500, max: 500}
+            required_predicates: [S_INFO_WINDCODE, ANN_DT]
+            max_rows: 500
+            timeout_seconds: 30
+  tushare_api:
+    variants:
+      - when: {event_type: forecast}
+        endpoints: [forecast]
+        field_map:
+          security:      {endpoint: forecast, column: ts_code}
+          report_period: {endpoint: forecast, column: end_date}
+          published_at:  {endpoint: forecast, column: ann_date, transform: {type: yyyymmdd_to_date}}
+          first_ann_date: {endpoint: forecast, column: first_ann_date, transform: {type: yyyymmdd_to_date}}
+          style_provider_raw: {endpoint: forecast, column: type}
+          net_profit_min: {endpoint: forecast, column: net_profit_min, provider_unit: wan_CNY,
+                           transform: {type: multiply, factor: 10000, target_unit: CNY}}
+          net_profit_max: {endpoint: forecast, column: net_profit_max, provider_unit: wan_CNY,
+                           transform: {type: multiply, factor: 10000, target_unit: CNY}}
+          change_min_pct: {endpoint: forecast, column: p_change_min}
+          change_max_pct: {endpoint: forecast, column: p_change_max}
+          last_year_net_profit_parent: {endpoint: forecast, column: last_parent_net, provider_unit: wan_CNY,
+                                        transform: {type: multiply, factor: 10000, target_unit: CNY}}
+          abstract:      {endpoint: forecast, column: summary}
+          reason:        {endpoint: forecast, column: change_reason}
+      - when: {event_type: express}
+        endpoints: [express]
+        field_map:
+          security:      {endpoint: express, column: ts_code}
+          report_period: {endpoint: express, column: end_date}
+          published_at:  {endpoint: express, column: ann_date, transform: {type: yyyymmdd_to_date}}
+          oper_rev:      {endpoint: express, column: revenue}
+          oper_profit:   {endpoint: express, column: operate_profit}
+          tot_profit:    {endpoint: express, column: total_profit}
+          net_profit_attr_parent: {endpoint: express, column: n_income}
+          eps_diluted:   {endpoint: express, column: diluted_eps}
+          roe_diluted:   {endpoint: express, column: diluted_roe}
+          tot_assets:    {endpoint: express, column: total_assets}
+          net_assets:    {endpoint: express, column: total_hldr_eqy_exc_min_int}
+          brief_performance: {endpoint: express, column: perf_summary}
+
+validation:
+  row_checks: []
+  duplicate_policy: {keys: [security, report_period, published_at], action: fail}
+
+dedup:
+  semantic_key_fields: [dataset_key, security, start_ann_date, end_ann_date, event_type]
+  content_hash:
+    sort_by: [security, report_period, published_at]
+    include_fields: [security, report_period, published_at, first_ann_date, style_provider_raw,
+                     sign_change, net_profit_min, net_profit_max, change_min_pct, change_max_pct,
+                     last_year_net_profit_parent, net_profit_deducted_min, net_profit_deducted_max,
+                     eps_min, eps_max, notice_number, abstract, reason,
+                     oper_rev, oper_profit, tot_profit, net_profit_attr_parent, eps_diluted,
+                     roe_diluted, tot_assets, net_assets, brief_performance]
