@@ -869,6 +869,9 @@ order_index
 另投影 `query_projection_hash`（document_unit 存储列，05-U2 查询投影哈希）——0007 新增共
 6 列，32 列全集以 04R-R7 为准。
 
+0008 迁移起，`processing_runs_v1` 投影 `builder_rules_version`，用于 05-U6 builder 规则
+归因；历史 run 可为 NULL，05 builder 成功落库的 run 必须等于当前 `rules.RULES_VERSION`。
+
 `asset://` URI（顶层协议 §2.3）只在序列化边界派生，不落存储：
 
 - 形式：`asset://disclosure_anchor/v1/document_unit/{asset_id}`；

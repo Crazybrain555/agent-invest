@@ -28,9 +28,9 @@ created_at: 2026-06-26
 | A16 | 年报经营分析 text unit 可查询 | 05/06 | fixture/API test | pending |
 | A17 | 年报完整 table unit 可查询 | 05/06 | fixture/API test | pending |
 | A18 | 投关完整 qa unit 可查询 | 05/06 | fixture/API test | pending |
-| A19 | document_unit.payload 保存快照本身 | 05 | DB check | pending |
-| A20 | active run 发布不删除历史 run | 05 | integration test | pending |
-| A21 | unit content_hash / quality_status 变化产生 materialized change_event；内容不变的重跑只记 observed，不触发下游失效 | 05/06 | integration test | pending |
+| A19 | document_unit.payload 保存快照本身 | 05 | DB check | pass |
+| A20 | active run 发布不删除历史 run | 05 | integration test | pass |
+| A21 | unit content_hash / quality_status 变化产生 materialized change_event；内容不变的重跑只记 observed，不触发下游失效 | 05/06 | integration test | pass |
 | A22 | `GET /v1/filings/latest` 可用 | 06 | API test | pending |
 | A23 | `GET /v1/units/{id}/source-ref` 可用 | 06 | API test | pending |
 | A24 | `GET /v1/changes` 可增量读取 | 06 | API test | pending |
