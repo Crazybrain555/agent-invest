@@ -96,6 +96,11 @@ stale 回收的执行载体定死：run_once 第一步经 queries.py 执行单�
   在每个**改写该 document 状态的事务内**获取（register 复用 / finish_run / publish），
   事务结束自动释放。跨事务的整文档互斥由单例锁 + status 声明式判定保证，不做长持锁。
 - 不引入 Redis/文件锁。
+- **MinerU 子进程组清理（2026-07-05 实战新增，定点加固既有 adapter，不与 04R §1 清单冲突）**：
+  MinerU 3.4 CLI 会拉起本机 fast_api 后端子进程；`subprocess.run(timeout=…)` 超时只杀直接
+  子进程，fast_api 孤儿会常驻（实测泄漏 1.8GB 内存并抢占后续解析算力）。08 实施时改
+  `MinerUProcess.run`：`start_new_session=True` 起进程组，超时/异常路径 `os.killpg` 全组清理；
+  worker 每轮开始前的 stale 回收顺带检查无残留 mineru 进程（doctor WARN 项）。
 
 ## 3. 实施细则
 
@@ -109,10 +114,13 @@ stale 回收的执行载体定死：run_once 第一步经 queries.py 执行单�
    现有"小写字段 + AliasChoices 大写别名"模式，同步 .env.template）；
    WorkerReport{started_at, duration_seconds, stale_reclaimed, synced_companies,
    candidates_discovered, downloaded, parsed, built, published, failed,
-   failures: list[WorkerFailure]}，WorkerFailure={stage, document_id|item_ref, error_code}。
+   skipped_oversized, failures: list[WorkerFailure]}，
+   WorkerFailure={stage, document_id|item_ref, error_code}。
    依赖注入定死：deps = WorkerDeps{engine, source_port_factory, parser_factory, clock}，
    生产 wiring 在 cli/worker.py 经 bootstrap 组装；集成测试注入 FakeCninfoSource 与
    fake parser，全程不出网。
+   parse 阶段跳过 `provider_metadata.oversized=true` 的 document（07 §3.9 护栏；
+   计入 skipped_oversized 并出现在报告，人工单跑提高 timeout 处理）。
    阶段↔use case 接法定死：parse 阶段对 pending_parse 的每个 document 调 **05 的 process**
    （parse→build→publish 串行——检查点"含 05 process"即此意）；build/publish 队列只消化
    process 中断留下的残留，分别调 build_units / publish_run。parse 串行执行，
@@ -178,6 +186,7 @@ tests/unit 只测 run_once 的调度/报告聚合（fake 队列结果）与 stab
 
 ## 6. Definition of Done
 
+- 每包提交门禁 = `make agent-check` + live-DB `make test`（04R §6.1 2026-07-05 修订）；
 - 本地运行闭环成立：`worker-loop` 挂机一晚，或模拟等价（定义定死：
   WORKER_LOOP_INTERVAL_SECONDS=60 连续运行 ≥30 分钟，期间分两批注入 ≥3 个新候选
   （fake source 或本地 register），全部自动到 active run 且报告文件含 ≥3 个轮次小节）；

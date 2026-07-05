@@ -198,14 +198,17 @@ filings/latest 的取代/最新/同日 tie-break 语义；changes 幂等重读�
 admin POST 全链（register→parse→build→publish→units 可读）；权限（reader 只读）。
 全链测试的输入与门控定死：测试 PDF 从
 tests/fixtures/phase00/short_announcement/parser_artifacts_ref.txt 的 `Source PDF:` 行读取；
-该路径不存在或 MinerU 不可用（settings.disclosure_mineru_bin 与 PATH 均无 mineru）→
-unittest.SkipTest（新增 helper `require_mineru_and_sample()`，与 _support.engine_or_skip 同型）。
+该路径不存在或 MinerU 不可用 → unittest.SkipTest。门控**复用 05 已交付的实现**：
+tests/integration/smoke_real_mineru_build_publish.py 的 `_mineru_bin_or_skip()` 与样本缺失
+skip 逻辑（可提炼到 tests/integration/_support.py 共享），不重造同型 helper。
 register 参数用 05 §5 三样本表的对应值（short_announcement：security_code=002484、
 exchange=szse、filing_type=other、report_period 省略、provider=cninfo、
 provider_document_id=文件名去后缀）。
 
 ## 6. Definition of Done
 
+- 每包提交门禁 = `make agent-check`（lint+严格 mypy+no-DB test+diff check，零违例基线）
+  + live-DB `make test`（04R §6.1 2026-07-05 修订）；
 - 三个本地样本经 admin API 全链处理后，units/changes/source-ref 均可经 HTTP 读取；
 - OpenAPI 与五个 JSON schema 提交并有 contract test 守护；
 - acceptance-matrix A16/A17/A18/A22/A23/A24/A41 置 pass

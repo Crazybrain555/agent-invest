@@ -5,7 +5,7 @@ title: CNINFO 增量同步
 status: ready-for-implementation
 created_at: 2026-06-26
 updated_at: 2026-07-04
-depends_on: milestone 04R（注册核心 / SubjectResolver）、milestone 05（可选并行，publish 由 08 串联）
+depends_on: milestone 04R（注册核心 / SubjectResolver）、milestone 05（已完成 2026-07-05）
 delivers_to: milestone 08
 ---
 
@@ -20,9 +20,8 @@ checkpoint / 重试进入正式管道。下载后的登记**必须复用 04R-D10
 - 04R：`register_document` 核心、`SubjectResolver`、filing_type 词表（D7）、
   `ReportPeriod` 校验、`DISCLOSURE_PARSE_TIMEOUT_SECONDS`、隔离/查空落 source_access 的惯例；
 - 凭据经 `settings.py` 注入（`CNINFO_ACCESS_KEY/SECRET/TOKEN`），adapter 外不得读 env；
-- 与 05 的顺序关系：若 05 未先行，07 自建 `src/disclosure_anchor/cli/pipeline.py` 并只注册
-  sync 子命令（05 在同一模块加其余子命令）；§6 DoD 的 parse→build→publish 段在 05 完成后
-  补验，§4 前 6 项检查点不依赖 05。
+- 05 已完成（2026-07-05）：`cli/pipeline.py` 已存在，sync 子命令直接加入该模块；
+  §6 DoD 的全链段可直接验证。
 
 ## 2. 组件与数据流
 
@@ -129,6 +128,14 @@ core.tracked_company（0001 已有表，单数名；≥500 精选池，本期验
    `PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline sync --company $(COMPANY) $(if $(WINDOW),--window $(WINDOW))`
    （加入 .PHONY）。首次对某公司 sync 时经 SubjectResolver 建 company/security 并
    upsert core.tracked_company(status='active')——这也是验收样本池的种子方式。
+9. **巨型文档护栏（2026-07-05 实战新增）**：F005N > `CNINFO_OVERSIZED_KB`（settings，
+   默认 10240 即 10MB）的候选**照常下载归档与登记**（原文不可变原则不受影响），但
+   register 时在 `document.provider_metadata` 记 `"oversized": true`；08 的 parse 批次
+   跳过 oversized 文档（见 08 §3.1），人工用 `make parse DOC=<id>` 配更高
+   DISCLOSURE_PARSE_TIMEOUT_SECONDS 单独跑。依据：比亚迪 H 股年度业绩公布实测
+   21MB/368 页 A3 双语 ≈4.1s/页，必超 1800s 默认超时，MAX_PARSE_RETRIES=3 会烧 90 分钟
+   worker 时间。双上市公司（池内 002594）的 H 股公告类也可在
+   tracked_company.filing_categories 客户端过滤中直接排除（更源头的选项，运营配置决定）。
 
 ## 4. 检查点
 
@@ -160,8 +167,9 @@ supersedes。真实 API 冒烟（人工触发、不进 CI）：1 家公司 1 窗
 
 ## 6. Definition of Done
 
-- 10 家样本池 sync→download→register 段跑通（不依赖 05）；parse→build→publish 段在 05
-  完成后补验（手动串行）；
+- 每包提交门禁 = `make agent-check` + live-DB `make test`（04R §6.1 2026-07-05 修订）；
+- 10 家样本池 sync→download→register→parse→build→publish 全链跑通（05 已完成，直接验证；
+  oversized 文档按 §3.9 跳过 parse 属预期）；
 - 失败状态可定位（source_access + 结构化错误）；
 - acceptance-matrix A25/A26/A27 置 pass（A28 此前已 pass，不重复认领）。
 
