@@ -107,6 +107,67 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias=AliasChoices("CNINFO_OVERSIZED_KB", "cninfo_oversized_kb"),
     )
+    disclosure_max_parse_retries: int = Field(
+        default=3,
+        ge=0,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MAX_PARSE_RETRIES", "disclosure_max_parse_retries"
+        ),
+    )
+    disclosure_max_build_retries: int = Field(
+        default=3,
+        ge=0,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MAX_BUILD_RETRIES", "disclosure_max_build_retries"
+        ),
+    )
+    disclosure_stale_run_threshold_seconds: int = Field(
+        default=3600,
+        ge=1,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_STALE_RUN_THRESHOLD_SECONDS",
+            "disclosure_stale_run_threshold_seconds",
+        ),
+    )
+    disclosure_sync_interval_seconds: int = Field(
+        default=86400,
+        ge=1,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_SYNC_INTERVAL_SECONDS", "disclosure_sync_interval_seconds"
+        ),
+    )
+    worker_batch_sync: int = Field(
+        default=5,
+        ge=0,
+        validation_alias=AliasChoices("WORKER_BATCH_SYNC", "worker_batch_sync"),
+    )
+    worker_batch_download: int = Field(
+        default=10,
+        ge=0,
+        validation_alias=AliasChoices("WORKER_BATCH_DOWNLOAD", "worker_batch_download"),
+    )
+    worker_batch_parse: int = Field(
+        default=3,
+        ge=0,
+        validation_alias=AliasChoices("WORKER_BATCH_PARSE", "worker_batch_parse"),
+    )
+    worker_batch_build: int = Field(
+        default=10,
+        ge=0,
+        validation_alias=AliasChoices("WORKER_BATCH_BUILD", "worker_batch_build"),
+    )
+    worker_batch_publish: int = Field(
+        default=10,
+        ge=0,
+        validation_alias=AliasChoices("WORKER_BATCH_PUBLISH", "worker_batch_publish"),
+    )
+    worker_loop_interval_seconds: int = Field(
+        default=900,
+        ge=1,
+        validation_alias=AliasChoices(
+            "WORKER_LOOP_INTERVAL_SECONDS", "worker_loop_interval_seconds"
+        ),
+    )
 
     @property
     def agent_system_root(self) -> Path:

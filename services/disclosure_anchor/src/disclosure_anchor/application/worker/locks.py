@@ -1,0 +1,46 @@
+"""Worker advisory-lock namespaces and the document-level lock (08 §2).
+
+Constants are asserted by tests/doctor against pg_locks.classid, so they must
+never drift. The document lock is transaction-scoped and taken inside every
+transaction that rewrites a document's state (register reuse, parse finish,
+publish); it guards against a manual CLI run racing the worker on the same
+document — cross-worker exclusion is already the singleton lock's job.
+"""
+
+from __future__ import annotations
+
+import zlib
+
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+WORKER_NS = 815001
+DOC_NS = 815002
+
+
+def stable_document_hash(document_id: str) -> int:
+    """crc32 folded into signed int4 range (crc32 is unsigned 0..2^32-1)."""
+
+    h = zlib.crc32(document_id.encode("utf-8"))
+    return h - 2**32 if h >= 2**31 else h
+
+
+def acquire_document_xact_lock(session: Session, document_id: str) -> None:
+    """Blocking xact-scoped lock; released automatically at commit/rollback."""
+
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:ns, :h)"),
+        {"ns": DOC_NS, "h": stable_document_hash(document_id)},
+    )
+
+
+def maybe_lock_document(uow: object, document_id: str) -> None:
+    """Take the document lock when the UnitOfWork is SQL-backed.
+
+    In-memory fakes used by unit tests expose no session; absence of a
+    session means absence of concurrency, so skipping is correct there.
+    """
+
+    session = getattr(uow, "session", None)
+    if isinstance(session, Session):
+        acquire_document_xact_lock(session, document_id)

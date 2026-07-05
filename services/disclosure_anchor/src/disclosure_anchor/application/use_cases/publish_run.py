@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.worker.locks import maybe_lock_document
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain.errors import PublishRunError
@@ -65,6 +66,7 @@ class PublishRun:
                     )
                 )
             _validate_publishable(run)
+            maybe_lock_document(uow, run.document_id)
             document = uow.documents.get_for_update(run.document_id)
             if document is None:
                 raise PublishRunError(

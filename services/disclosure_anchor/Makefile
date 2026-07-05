@@ -19,7 +19,7 @@ PGPORT ?= 55432
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	test-mineru-smoke lint typecheck agent-check api archive pg-init pg-start pg-stop \
-	pg-status db-create migrate register parse build-units publish process sync
+	pg-status db-create migrate register parse build-units publish process sync worker-once worker-loop doctor-full
 
 doctor:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -115,3 +115,12 @@ process:
 sync:
 	@test -n "$(COMPANY)" || (echo 'usage: make sync COMPANY=<scode> [WINDOW=N]' && exit 2); \
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline sync --company $(COMPANY) $(if $(WINDOW),--window $(WINDOW))
+
+worker-once:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker once
+
+worker-loop:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker loop
+
+doctor-full:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor --full

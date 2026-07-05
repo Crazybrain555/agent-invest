@@ -15,6 +15,7 @@ from disclosure_anchor.application.ports.file_store import (
 )
 from disclosure_anchor.application.ports.parser import DocumentParserPort, ParserOptions
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.worker.locks import maybe_lock_document
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain import ids
@@ -364,6 +365,7 @@ class ParseDocument:
             run = uow.processing_runs.get(processing_run_id)
             if run is None:
                 raise ParseDocumentError(f"processing run not found: {processing_run_id}")
+            maybe_lock_document(uow, run.document_id)
             run.status = status
             run.parser_name = parser_name or run.parser_name
             run.parser_version = parser_version or run.parser_version

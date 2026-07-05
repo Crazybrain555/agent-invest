@@ -235,7 +235,8 @@ def _ref_from_candidate(candidate: Mapping[str, object]) -> AnnouncementRef:
         provider_document_id=_candidate_str(candidate, "provider_document_id"),
         title=_candidate_str(candidate, "title"),
         download_url=_candidate_str(candidate, "download_url"),
-        raw_category=_candidate_str(candidate, "raw_category"),
+        # Empty on the web fallback channel (no F006V categories there).
+        raw_category=_candidate_optional_str(candidate.get("raw_category")) or "",
         announcement_date=date.fromisoformat(_candidate_str(candidate, "announcement_date")),
         security_code=_candidate_str(candidate, "security_code"),
         security_name=_candidate_optional_str(candidate.get("security_name")),
@@ -286,7 +287,7 @@ def _provider_metadata(
 ) -> dict[str, object]:
     signature = dict(_candidate_mapping(candidate, "file_signature_hint"))
     metadata: dict[str, object] = {
-        "raw_category": _candidate_str(candidate, "raw_category"),
+        "raw_category": _candidate_optional_str(candidate.get("raw_category")) or "",
         "provider_org_id": candidate.get("provider_org_id"),
         "object_id": candidate.get("object_id"),
         "rec_id": candidate.get("rec_id"),

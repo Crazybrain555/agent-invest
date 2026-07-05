@@ -8,6 +8,7 @@ from datetime import date, datetime, timezone
 from disclosure_anchor.application.ports.file_store import RawDocumentWriteResult
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.services.subject_resolver import ResolvedSubject
+from disclosure_anchor.application.worker.locks import maybe_lock_document
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain import ids
@@ -59,6 +60,7 @@ def register_document(
         now=now,
     )
     if existing is not None:
+        maybe_lock_document(uow, existing.document_id)
         event = uow.outbox.add(
             outbox_events.document_observed(
                 document_id=existing.document_id,
