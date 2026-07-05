@@ -158,7 +158,10 @@ class _Engine:
 
 
 def _request(engine: _Engine) -> SimpleNamespace:
-    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(reader_db_engine=engine)))
+    return SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(reader_db_engine=engine)),
+        query_params={},
+    )
 
 
 class FilingApiUnitTests(unittest.TestCase):
@@ -209,6 +212,18 @@ class FilingApiUnitTests(unittest.TestCase):
         self.assertEqual(response.items[0].processing_run_id, "run_old")
         self.assertFalse(response.items[0].is_active_run)
         self.assertIn("processing_run_id = :processing_run_id", engine.statements[1])
+
+    def test_document_units_without_active_run_returns_l1_required(self) -> None:
+        document = _document_row()
+        document["status"] = "parsed"
+        document["current_processing_run_id"] = None
+
+        with self.assertRaises(HTTPException) as caught:
+            list_document_units("doc_1", _request(_Engine([[document]])))
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(caught.exception.detail["error_code"], "L1_PROCESSING_REQUIRED")
+        self.assertEqual(caught.exception.detail["detail"], {"status": "parsed"})
 
     def test_heading_prefix_uses_candidate_and_exact_prefix_predicates(self) -> None:
         engine = _Engine(
@@ -281,6 +296,7 @@ class FilingApiUnitTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as caught:
             get_unit_context("asset_1", _request(_Engine([])), max_chars=-1)
         self.assertEqual(caught.exception.status_code, 422)
+        self.assertEqual(caught.exception.detail["error_code"], "VALIDATION_ERROR")
 
 
 if __name__ == "__main__":

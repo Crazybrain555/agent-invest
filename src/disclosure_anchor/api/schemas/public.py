@@ -116,6 +116,23 @@ class SourceRefV1(PublicModel):
     artifact_locator: dict[str, Any] | None
 
 
+class ChangeEventV1(PublicModel):
+    seq: int
+    event_id: str
+    event_kind: str
+    document_id: str | None
+    processing_run_id: str | None
+    asset_id: str | None
+    payload: dict[str, Any] | None
+    occurred_at: datetime
+    change_kind: str
+    subject_kind: str
+    subject_ref: str
+    source: str
+    contract_version: str
+    created_at: datetime
+
+
 class DocumentListResponse(PublicModel):
     items: list[DocumentV1]
     next_cursor: str | None
@@ -125,6 +142,11 @@ class UnitListResponse(PublicModel):
     items: list[DocumentUnitV1]
     next_cursor: str | None
     warning: str | None = None
+
+
+class ChangeListResponse(PublicModel):
+    items: list[ChangeEventV1]
+    next_cursor: str | None
 
 
 class UnitContextResponse(PublicModel):

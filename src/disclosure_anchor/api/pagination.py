@@ -8,10 +8,7 @@ from datetime import date
 import json
 from typing import Any
 
-try:
-    from fastapi import HTTPException
-except ModuleNotFoundError:  # pragma: no cover - exercised by app-start validation
-    HTTPException = None  # type: ignore[assignment, misc]
+from disclosure_anchor.api.errors import validation_error as api_validation_error
 
 
 MAX_LIMIT = 1000
@@ -30,6 +27,11 @@ class UnitCursor:
     asset_id: str
 
 
+@dataclass(frozen=True)
+class ChangeCursor:
+    seq: int
+
+
 def encode_document_cursor(cursor: DocumentCursor) -> str:
     payload = {
         "announcement_date": cursor.announcement_date.isoformat()
@@ -43,6 +45,12 @@ def encode_document_cursor(cursor: DocumentCursor) -> str:
 
 def encode_unit_cursor(cursor: UnitCursor) -> str:
     payload = {"order_index": cursor.order_index, "asset_id": cursor.asset_id}
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
+
+
+def encode_change_cursor(cursor: ChangeCursor) -> str:
+    payload = {"seq": cursor.seq}
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base64.b64encode(raw).decode("ascii")
 
@@ -86,6 +94,22 @@ def decode_unit_cursor(value: str | None) -> UnitCursor | None:
     return UnitCursor(order_index=order_index, asset_id=asset_id)
 
 
+def decode_change_cursor(value: str | None) -> ChangeCursor | None:
+    if value is None:
+        return None
+    try:
+        decoded = base64.b64decode(value.encode("ascii"), validate=True)
+        payload = json.loads(decoded.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("cursor payload must be an object")
+        seq = payload.get("seq")
+        if not isinstance(seq, int):
+            raise ValueError("seq must be an integer")
+    except Exception as exc:
+        raise validation_error("cursor", "invalid change cursor") from exc
+    return ChangeCursor(seq=seq)
+
+
 def validate_limit(limit: int) -> int:
     if limit < 1:
         raise validation_error("limit", "must be greater than or equal to 1")
@@ -95,12 +119,7 @@ def validate_limit(limit: int) -> int:
 
 
 def validation_error(field: str, message: str) -> Exception:
-    if HTTPException is None:  # pragma: no cover
-        return ValueError(f"{field}: {message}")
-    return HTTPException(
-        status_code=422,
-        detail={"errors": [{"field": field, "message": message}]},
-    )
+    return api_validation_error(field, message)
 
 
 def document_cursor_from_row(row: dict[str, Any]) -> DocumentCursor:
@@ -115,3 +134,7 @@ def document_cursor_from_row(row: dict[str, Any]) -> DocumentCursor:
 
 def unit_cursor_from_row(row: dict[str, Any]) -> UnitCursor:
     return UnitCursor(order_index=int(row["order_index"]), asset_id=str(row["asset_id"]))
+
+
+def change_cursor_from_row(row: dict[str, Any]) -> ChangeCursor:
+    return ChangeCursor(seq=int(row["seq"]))

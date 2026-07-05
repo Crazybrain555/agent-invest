@@ -9,6 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from disclosure_anchor.api.db import reader_engine_from_request
+from disclosure_anchor.api.errors import gone_superseded, not_found
 from disclosure_anchor.api.pagination import (
     DEFAULT_LIMIT,
     DocumentCursor,
@@ -117,6 +118,10 @@ def get_document(document_id: str, request: Request) -> DocumentV1:
     row = _select_one_document(engine=engine, document_id=document_id)
     if row is None:
         raise_not_found()
+    if row["superseded_by_document_id"] is not None:
+        reject_superseded = _bool_query_param(request, "reject_superseded")
+        if reject_superseded:
+            gone_superseded(str(row["superseded_by_document_id"]))
     return DocumentV1.model_validate(row)
 
 
@@ -261,10 +266,13 @@ def _document_list_response(
     )
 
 
+def _bool_query_param(request: Request, name: str) -> bool:
+    value = request.query_params.get(name)
+    return value in {"1", "true", "True", "yes", "on"}
+
+
 def raise_not_found() -> NoReturn:
-    if HTTPException is None:  # pragma: no cover
-        raise RuntimeError("not found")
-    raise HTTPException(status_code=404, detail="NOT_FOUND")
+    not_found()
 
 
 router: Any

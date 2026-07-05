@@ -9,6 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from disclosure_anchor.api.db import reader_engine_from_request
+from disclosure_anchor.api.errors import gone_superseded, l1_processing_required
 from disclosure_anchor.api.pagination import (
     DEFAULT_LIMIT,
     UnitCursor,
@@ -19,6 +20,7 @@ from disclosure_anchor.api.pagination import (
     validation_error,
 )
 from disclosure_anchor.api.routers.documents import (
+    _bool_query_param,
     _select_one_document,
     raise_not_found,
 )
@@ -116,10 +118,14 @@ def list_document_units(
     document = _select_one_document(engine=engine, document_id=document_id)
     if document is None:
         raise_not_found()
+    if document["superseded_by_document_id"] is not None and _bool_query_param(
+        request, "reject_superseded"
+    ):
+        gone_superseded(str(document["superseded_by_document_id"]))
     active_run_id = document["current_processing_run_id"]
     selected_run_id = processing_run_id or active_run_id
     if selected_run_id is None:
-        raise_l1_required(document["status"])
+        raise_l1_required(str(document["status"]))
     if processing_run_id is not None and not _run_belongs_to_document(
         engine=engine, document_id=document_id, processing_run_id=processing_run_id
     ):
@@ -396,9 +402,7 @@ def _unit_list_response(
 
 
 def raise_l1_required(status: str) -> NoReturn:
-    if HTTPException is None:  # pragma: no cover
-        raise RuntimeError("L1 processing required")
-    raise HTTPException(status_code=409, detail={"status": status})
+    l1_processing_required(status)
 
 
 router: Any

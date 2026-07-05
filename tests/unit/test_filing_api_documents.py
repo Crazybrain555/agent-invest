@@ -115,7 +115,17 @@ class _Engine:
 
 
 def _request(engine: _Engine) -> SimpleNamespace:
-    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(reader_db_engine=engine)))
+    return SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(reader_db_engine=engine)),
+        query_params={},
+    )
+
+
+def _request_with_query(engine: _Engine, query_params: dict[str, str]) -> SimpleNamespace:
+    return SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(reader_db_engine=engine)),
+        query_params=query_params,
+    )
 
 
 class FilingApiDocumentTests(unittest.TestCase):
@@ -188,11 +198,33 @@ class FilingApiDocumentTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as caught:
             list_documents(_request(_Engine([])), limit=1001)
         self.assertEqual(caught.exception.status_code, 422)
+        self.assertEqual(caught.exception.detail["error_code"], "VALIDATION_ERROR")
+
+    def test_documents_bad_cursor_returns_422(self) -> None:
+        with self.assertRaises(HTTPException) as caught:
+            list_documents(_request(_Engine([])), cursor="not-base64")
+        self.assertEqual(caught.exception.status_code, 422)
+        self.assertEqual(caught.exception.detail["error_code"], "VALIDATION_ERROR")
 
     def test_get_document_404s_when_missing(self) -> None:
         with self.assertRaises(HTTPException) as caught:
             get_document("doc_missing", _request(_Engine([])))
         self.assertEqual(caught.exception.status_code, 404)
+        self.assertEqual(caught.exception.detail["error_code"], "NOT_FOUND")
+
+    def test_get_document_reject_superseded_returns_410(self) -> None:
+        row = _document_row("doc_old", date(2026, 7, 5))
+        row["superseded_by_document_id"] = "doc_new"
+
+        with self.assertRaises(HTTPException) as caught:
+            get_document(
+                "doc_old",
+                _request_with_query(_Engine([row]), {"reject_superseded": "true"}),
+            )
+
+        self.assertEqual(caught.exception.status_code, 410)
+        self.assertEqual(caught.exception.detail["error_code"], "GONE_SUPERSEDED")
+        self.assertEqual(caught.exception.detail["detail"], {"superseded_by": "doc_new"})
 
     def test_document_runs_order_is_pinned(self) -> None:
         engine = _Engine([_run_row("run_2"), _run_row("run_1")])

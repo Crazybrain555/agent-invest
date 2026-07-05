@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from disclosure_anchor.api.errors import install_error_handlers
+from disclosure_anchor.api.routers.changes import router as changes_router
 from disclosure_anchor.api.routers.documents import router as documents_router
 from disclosure_anchor.api.routers.filings import router as filings_router
 from disclosure_anchor.api.routers.health import router as health_router
@@ -54,6 +56,7 @@ def create_app(settings: Settings | None = None, *, validate_runtime: bool = Tru
         reader_engine = app_engine
 
     app = FastAPI(title="disclosure_anchor", version="0.1.0")
+    install_error_handlers(app)
     app.state.settings = resolved_settings
     if app_engine is not None:
         app.state.app_db_engine = app_engine
@@ -69,4 +72,6 @@ def create_app(settings: Settings | None = None, *, validate_runtime: bool = Tru
         app.include_router(filings_router)
     if units_router is not None:
         app.include_router(units_router)
+    if changes_router is not None:
+        app.include_router(changes_router)
     return app
