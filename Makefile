@@ -1,10 +1,12 @@
-# Root Makefile: delegate gates to each service. Add new services to SERVICES as they land.
+# Root Makefile: delegate gates to each component. Add new services/packages to the lists as they land.
 SERVICES := services/disclosure_anchor
+PACKAGES := packages/envelope_kernel
+COMPONENTS := $(SERVICES) $(PACKAGES)
 
-.PHONY: agent-check test $(SERVICES)
+.PHONY: agent-check test
 
 agent-check:
-	@for s in $(SERVICES); do $(MAKE) -C $$s agent-check || exit 1; done
+	@for c in $(COMPONENTS); do $(MAKE) -C $$c agent-check || exit 1; done
 
 test:
-	@for s in $(SERVICES); do $(MAKE) -C $$s test || exit 1; done
+	@for c in $(COMPONENTS); do $(MAKE) -C $$c test || exit 1; done
