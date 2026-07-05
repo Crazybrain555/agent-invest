@@ -124,7 +124,7 @@ class CninfoClient:
         self._bucket = bucket or TokenBucket(max_qps=max_qps, sleep=sleep)
         self._sleep = sleep or time.sleep
         self._jitter = jitter or (lambda upper: random.uniform(0.0, upper))
-        self._client = httpx.Client(transport=transport, timeout=30.0)
+        self._client = httpx.Client(transport=transport, timeout=30.0, trust_env=False)
 
     @classmethod
     def from_settings(
