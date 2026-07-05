@@ -137,6 +137,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                             f"derived/normalized_ir/cninfo/002484/{self.pid}/"
                             "run_01K0000000000000000000000/normalized_ir.v2.json"
                         ),
+                        builder_rules_version="ub-2026.07-1",
                         error={"stage": "parse", "error_code": "noop", "retryable": False},
                     )
                 )
@@ -198,6 +199,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                 self.assertTrue(got_run.parser_artifact_relpath.startswith("parser_artifacts/"))
                 self.assertEqual(got_run.unit_build_status, "not_started")
                 self.assertEqual(got_run.unit_build_attempt_count, 0)
+                self.assertEqual(got_run.builder_rules_version, "ub-2026.07-1")
                 self.assertEqual(got_run.error["error_code"], "noop")
                 self.assertEqual(got_unit.semantic_key, "receivable_aging")
                 self.assertEqual(got_unit.heading_path[0], "第八节 财务报告")

@@ -289,6 +289,7 @@ class ProcessingRun(Base):
     document_units_relpath: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     content_hash_aggregate: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     structure_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    builder_rules_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     is_active: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )

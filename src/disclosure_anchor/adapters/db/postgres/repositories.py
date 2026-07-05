@@ -326,6 +326,7 @@ class ProcessingRunRepository:
             "document_units_relpath",
             "content_hash_aggregate",
             "structure_hash",
+            "builder_rules_version",
             "is_active",
             "unit_build_status",
             "unit_build_error",

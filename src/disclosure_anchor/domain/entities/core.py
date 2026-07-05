@@ -128,6 +128,7 @@ class ProcessingRun:
     document_units_relpath: Optional[str] = None
     content_hash_aggregate: Optional[str] = None
     structure_hash: Optional[str] = None
+    builder_rules_version: Optional[str] = None
     is_active: bool = False
     unit_build_status: str = "not_started"
     unit_build_error: Optional[dict[str, Any]] = None
