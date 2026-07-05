@@ -1,0 +1,421 @@
+{
+  "$defs": {
+    "AssetKind": {
+      "enum": [
+        "document_unit",
+        "dataset_snapshot",
+        "tool_result",
+        "artifact_unit"
+      ],
+      "title": "AssetKind",
+      "type": "string"
+    },
+    "PayloadKind": {
+      "enum": [
+        "text",
+        "table",
+        "qa",
+        "recordset",
+        "search_result",
+        "api_response",
+        "page_snippet",
+        "calculation_table",
+        "model_table",
+        "checklist",
+        "note"
+      ],
+      "title": "PayloadKind",
+      "type": "string"
+    },
+    "QualityStatus": {
+      "description": "解析 / 登记质量（§3.2 state 组）。",
+      "enum": [
+        "ok",
+        "needs_review",
+        "unusable",
+        "empty"
+      ],
+      "title": "QualityStatus",
+      "type": "string"
+    },
+    "SourceTier": {
+      "description": "来源分级（§2.9）；string values follow the disclosure_anchor public contract (tier_0a).",
+      "enum": [
+        "tier_0a",
+        "tier_0b",
+        "tier_1",
+        "tier_2",
+        "tier_3",
+        "tier_f"
+      ],
+      "title": "SourceTier",
+      "type": "string"
+    },
+    "TraceLevel": {
+      "description": "追溯等级（§2.9）。",
+      "enum": [
+        "G0",
+        "G1",
+        "G2",
+        "G3",
+        "G4"
+      ],
+      "title": "TraceLevel",
+      "type": "string"
+    }
+  },
+  "$id": "data_asset.v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "adapter": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Adapter"
+    },
+    "asset_id": {
+      "title": "Asset Id",
+      "type": "string"
+    },
+    "asset_kind": {
+      "$ref": "#/$defs/AssetKind"
+    },
+    "change_seq": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Change Seq"
+    },
+    "content_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Content Hash"
+    },
+    "contract_version": {
+      "default": "data_asset.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "event_time": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "format": "date",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Event Time"
+    },
+    "heading_path": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Heading Path"
+    },
+    "is_active": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Is Active"
+    },
+    "locator": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Locator"
+    },
+    "material_type": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Material Type"
+    },
+    "observed_at": {
+      "format": "date-time",
+      "title": "Observed At",
+      "type": "string"
+    },
+    "order_index": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Order Index"
+    },
+    "parent_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Parent Ref"
+    },
+    "payload": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Payload"
+    },
+    "payload_kind": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PayloadKind"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "producer_action_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Producer Action Ref"
+    },
+    "provider": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Provider"
+    },
+    "published_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Published At"
+    },
+    "quality_status": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/QualityStatus"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "query_params": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Query Params"
+    },
+    "raw_asset_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Raw Asset Ref"
+    },
+    "report_period": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Report Period"
+    },
+    "semantic_key": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Semantic Key"
+    },
+    "sensitivity": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Sensitivity"
+    },
+    "source_ref": {
+      "title": "Source Ref",
+      "type": "string"
+    },
+    "source_tier": {
+      "$ref": "#/$defs/SourceTier"
+    },
+    "subject_candidates": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Subject Candidates"
+    },
+    "superseded_by": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Superseded By"
+    },
+    "title": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Title"
+    },
+    "tool": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tool"
+    },
+    "trace_level": {
+      "$ref": "#/$defs/TraceLevel"
+    }
+  },
+  "required": [
+    "asset_id",
+    "asset_kind",
+    "observed_at",
+    "source_ref",
+    "source_tier",
+    "trace_level"
+  ],
+  "title": "DataAsset",
+  "type": "object"
+}
