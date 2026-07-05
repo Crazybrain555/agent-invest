@@ -29,6 +29,9 @@ from disclosure_anchor.domain.errors import DisclosureAnchorError, SourceRequest
 CNINFO_PROVIDER = "cninfo"
 PROFILE_INTERFACE = "cninfo:p_stock2100"
 INDEX_INTERFACE = "cninfo:p_info3015"
+# Credential-free public-website channel (same provider namespace; see
+# adapters/sources/cninfo/web_source.py for the verified id/size equivalence).
+WEB_INDEX_INTERFACE = "cninfo:hisAnnouncement"
 
 
 class SyncDisclosureIndexError(DisclosureAnchorError):
@@ -65,11 +68,13 @@ class SyncDisclosureIndex:
         profile_loader: Callable[[str], SourceCompanyProfile | None],
         uow_factory: Callable[[], UnitOfWork],
         subject_resolver: SubjectResolver | None = None,
+        index_interface: str = INDEX_INTERFACE,
     ) -> None:
         self._source = source
         self._profile_loader = profile_loader
         self._uow_factory = uow_factory
         self._subject_resolver = subject_resolver or SubjectResolver()
+        self._index_interface = index_interface
 
     def execute(self, command: SyncDisclosureIndexCommand) -> SyncDisclosureIndexResult:
         window = DisclosureWindow(command.window_start, command.window_end)
@@ -209,7 +214,9 @@ class SyncDisclosureIndex:
         command: SyncDisclosureIndexCommand,
         profile: SourceCompanyProfile | None,
     ) -> Any:
-        legal_name = profile.legal_name if profile else f"CNINFO {command.security_code}"
+        # No profile (e.g. web fallback channel) → no legal-name claim; the
+        # resolver treats None as "unknown", never as a conflicting name.
+        legal_name = profile.legal_name if profile else None
         return self._subject_resolver.resolve(
             uow,
             SubjectCandidate(
@@ -306,7 +313,7 @@ class SyncDisclosureIndex:
             e.SourceAccess(
                 source_access_id=ids.new_source_access_id(),
                 provider=CNINFO_PROVIDER,
-                provider_interface=INDEX_INTERFACE,
+                provider_interface=self._index_interface,
                 dataset_key="p_info3015",
                 query_params=_index_query_params(command),
                 accessed_at=now,
@@ -332,7 +339,7 @@ class SyncDisclosureIndex:
             e.SourceAccess(
                 source_access_id=ids.new_source_access_id(),
                 provider=CNINFO_PROVIDER,
-                provider_interface=INDEX_INTERFACE,
+                provider_interface=self._index_interface,
                 dataset_key="p_info3015",
                 query_params=_index_query_params(command),
                 accessed_at=now,

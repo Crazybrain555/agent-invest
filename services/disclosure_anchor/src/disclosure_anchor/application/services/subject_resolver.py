@@ -16,9 +16,13 @@ from disclosure_anchor.domain.errors import (
 
 @dataclass(frozen=True)
 class SubjectCandidate:
+    # legal_name=None means the caller makes no legal-name claim (e.g. the
+    # credential-free web channel has no company profile); absence of a claim
+    # is not a conflict, and a placeholder is used only if a company must be
+    # created.
     security_code: str
     exchange: str
-    legal_name: str
+    legal_name: str | None
     board: str | None = None
     credit_code: str | None = None
 
@@ -45,7 +49,11 @@ class SubjectResolver:
                 if candidate.credit_code
                 else None
             )
-            if company.legal_name != candidate.legal_name and candidate.credit_code:
+            if (
+                candidate.legal_name is not None
+                and company.legal_name != candidate.legal_name
+                and candidate.credit_code
+            ):
                 if identifier is not None:
                     identifier.status = "contested"
                     uow.company_identifiers.update(identifier)
@@ -93,7 +101,8 @@ class SubjectResolver:
         company = uow.companies.add(
             e.Company(
                 company_id=ids.new_company_id(),
-                legal_name=candidate.legal_name,
+                legal_name=candidate.legal_name
+                or f"PENDING_LEGAL_NAME {candidate.security_code}.{candidate.exchange}",
                 unified_social_credit_code=candidate.credit_code,
             )
         )
@@ -119,7 +128,7 @@ class SubjectResolver:
         identifier: e.CompanyIdentifier | None = None,
         uow: UnitOfWork | None = None,
     ) -> None:
-        if company.legal_name == candidate.legal_name:
+        if candidate.legal_name is None or company.legal_name == candidate.legal_name:
             return
         if identifier is not None and uow is not None:
             identifier.status = "contested"

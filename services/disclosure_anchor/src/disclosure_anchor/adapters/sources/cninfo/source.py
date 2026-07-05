@@ -40,6 +40,9 @@ class CninfoSource:
         self._rule_bundle = load_filing_type_rule_bundle()
         self._category_names: dict[str, str] | None = None
 
+    def close(self) -> None:
+        self._client.close()
+
     def search_announcements(
         self,
         security: SourceSecurity,

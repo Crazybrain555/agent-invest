@@ -7,7 +7,7 @@ the transaction boundary.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import date
 import json
 from typing import Optional
@@ -248,7 +248,7 @@ class SourceAccessRepository:
         self,
         *,
         provider: str,
-        index_interface: str,
+        index_interfaces: Sequence[str],
         download_interface: str,
         max_retries: int,
         overlap_start: object,
@@ -258,7 +258,7 @@ class SourceAccessRepository:
             self._session.query(models.SourceAccess)
             .filter(
                 models.SourceAccess.provider == provider,
-                models.SourceAccess.provider_interface == index_interface,
+                models.SourceAccess.provider_interface.in_(list(index_interfaces)),
                 models.SourceAccess.status == "ok",
             )
             .order_by(models.SourceAccess.accessed_at.asc())

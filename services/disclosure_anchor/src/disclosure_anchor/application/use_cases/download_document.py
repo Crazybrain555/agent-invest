@@ -26,6 +26,7 @@ from disclosure_anchor.application.services.subject_resolver import (
 from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     CNINFO_PROVIDER,
     INDEX_INTERFACE,
+    WEB_INDEX_INTERFACE,
 )
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
@@ -81,7 +82,7 @@ class DownloadDocument:
         with self._uow_factory() as uow:
             return uow.source_accesses.list_pending_download_candidates(
                 provider=CNINFO_PROVIDER,
-                index_interface=INDEX_INTERFACE,
+                index_interfaces=(INDEX_INTERFACE, WEB_INDEX_INTERFACE),
                 download_interface=DOWNLOAD_INTERFACE,
                 max_retries=max_retries,
                 overlap_start=overlap_start,

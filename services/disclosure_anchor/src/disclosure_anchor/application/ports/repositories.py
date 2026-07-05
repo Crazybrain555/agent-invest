@@ -6,6 +6,8 @@ Repositories persist and load domain entities. Concrete implementations live in
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from typing import Optional, Protocol
 
 from disclosure_anchor.domain.entities import (
@@ -62,7 +64,7 @@ class SourceAccessRepository(Protocol):
         self,
         *,
         provider: str,
-        index_interface: str,
+        index_interfaces: Sequence[str],
         download_interface: str,
         max_retries: int,
         overlap_start: object,

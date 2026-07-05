@@ -25,6 +25,7 @@ from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_fac
 from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
 from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
+from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
@@ -50,6 +51,8 @@ from disclosure_anchor.application.use_cases.register_local_pdf import (
     RegisterLocalPdfCommand,
 )
 from disclosure_anchor.application.use_cases.sync_disclosure_index import (
+    INDEX_INTERFACE,
+    WEB_INDEX_INTERFACE,
     SyncDisclosureIndex,
     SyncDisclosureIndexCommand,
 )
@@ -93,6 +96,12 @@ def _parser() -> argparse.ArgumentParser:
     sync = subparsers.add_parser("sync")
     sync.add_argument("--company", required=True)
     sync.add_argument("--window", type=int)
+    sync.add_argument(
+        "--channel",
+        choices=("api", "web"),
+        default="api",
+        help="api = WebAPI p_info3015 (credentialed); web = credential-free public fallback",
+    )
     return parser
 
 
@@ -218,13 +227,22 @@ class _Deps:
             today=today,
             overlap_days=self.settings.cninfo_overlap_days,
         )
-        client = CninfoClient.from_settings(self.settings)
-        source = CninfoSource(client)
+        channel = getattr(args, "channel", "api")
+        if channel == "web":
+            source: CninfoSource | CninfoWebSource = CninfoWebSource(
+                max_qps=self.settings.cninfo_max_qps,
+                max_retries=self.settings.cninfo_max_retries,
+            )
+            index_interface = WEB_INDEX_INTERFACE
+        else:
+            source = CninfoSource(CninfoClient.from_settings(self.settings))
+            index_interface = INDEX_INTERFACE
         try:
             sync_use_case = SyncDisclosureIndex(
                 source=source,
                 profile_loader=source.profile_for_security,
                 uow_factory=self.uow_factory,
+                index_interface=index_interface,
             )
             sync_result = sync_use_case.execute(
                 SyncDisclosureIndexCommand(
@@ -258,7 +276,7 @@ class _Deps:
                 for candidate in pending
             ]
         finally:
-            client.close()
+            source.close()
         return {
             "company": company,
             "window": {

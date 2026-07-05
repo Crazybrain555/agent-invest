@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Generic, TypeVar
 
 from disclosure_anchor.domain import entities as e
@@ -115,14 +115,14 @@ class SourceAccessRepo(_Repo[e.SourceAccess]):
         self,
         *,
         provider: str,
-        index_interface: str,
+        index_interfaces: Sequence[str],
         download_interface: str,
         max_retries: int,
         overlap_start: object,
     ) -> list[dict[str, object]]:
         candidates: list[dict[str, object]] = []
         for item in self.items.values():
-            if item.provider != provider or item.provider_interface != index_interface:
+            if item.provider != provider or item.provider_interface not in index_interfaces:
                 continue
             if not isinstance(item.result_snapshot, dict):
                 continue

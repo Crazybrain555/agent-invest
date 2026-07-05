@@ -33,6 +33,38 @@ class SubjectResolverTests(unittest.TestCase):
         self.assertEqual(identifiers[0].scheme, "uscc")
         self.assertEqual(identifiers[0].normalized_value, "USCC-1")
 
+    def test_no_legal_name_claim_resolves_existing_company_without_conflict(self) -> None:
+        first = self.resolver.resolve(
+            self.uow,
+            SubjectCandidate(
+                security_code="000001",
+                exchange="SZSE",
+                legal_name="平安银行股份有限公司",
+                credit_code="uscc-pab",
+            ),
+        )
+
+        # Web fallback channel: no profile, hence no legal-name claim.
+        again = self.resolver.resolve(
+            self.uow,
+            SubjectCandidate(
+                security_code="000001", exchange="SZSE", legal_name=None
+            ),
+        )
+
+        self.assertEqual(again.company.company_id, first.company.company_id)
+        self.assertEqual(again.company.legal_name, "平安银行股份有限公司")
+
+    def test_no_legal_name_claim_creates_placeholder_company(self) -> None:
+        result = self.resolver.resolve(
+            self.uow,
+            SubjectCandidate(security_code="300999", exchange="SZSE", legal_name=None),
+        )
+
+        self.assertEqual(
+            result.company.legal_name, "PENDING_LEGAL_NAME 300999.SZSE"
+        )
+
     def test_security_match_backfills_missing_uscc_ledger(self) -> None:
         company = self.uow.companies.add(
             e.Company(company_id="co_1", legal_name="江海股份")
