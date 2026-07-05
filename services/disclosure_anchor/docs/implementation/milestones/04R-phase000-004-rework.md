@@ -505,7 +505,7 @@ env -u DATABASE_URL -u DISCLOSURE_MIGRATION_DATABASE_URL make test
 # 绿判据：末行 OK (skipped=N)。返工前基线：Ran 82 tests / OK (skipped=26)（已实测）；
 # 每新增一个 DB-gated 测试 N+1；出现 FAILED/ERROR 即红。
 # 2) live-DB 模式（DSN 见 §6.3；socket 免密码）
-export DISCLOSURE_MIGRATION_DATABASE_URL='postgresql+psycopg://disclosure_anchor@/disclosure_anchor?host=/Volumes/AgentSSD/agent_system/postgres/sockets&port=55432'
+export DISCLOSURE_MIGRATION_DATABASE_URL='postgresql+psycopg://disclosure_anchor@/invest_engine?host=/Volumes/AgentSSD/agent_system/postgres/sockets&port=55432'
 make test
 # 绿判据：末行为不带 skipped 的 OK（基线：Ran 82 tests / OK，已实测）。
 # 3) git diff --check   # 输出必须为空
@@ -584,7 +584,7 @@ C. 权限完好判据：`PYTHONPATH=src .venv/bin/python -m unittest tests.integ
 禁止用 .env.example 的 TCP DSN（密码是占位符）；本机 socket DSN 免密码：
 
 ```bash
-export DISCLOSURE_MIGRATION_DATABASE_URL='postgresql+psycopg://disclosure_anchor@/disclosure_anchor?host=/Volumes/AgentSSD/agent_system/postgres/sockets&port=55432'
+export DISCLOSURE_MIGRATION_DATABASE_URL='postgresql+psycopg://disclosure_anchor@/invest_engine?host=/Volumes/AgentSSD/agent_system/postgres/sockets&port=55432'
 # 确认 skip 清零（返工前基线 26 个 skip；此命令输出必须为 0）：
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests/integration -t . -p 'test_*.py' -v 2>&1 | grep -c "skipped"
 ```
