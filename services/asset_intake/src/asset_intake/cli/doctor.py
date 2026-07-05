@@ -41,6 +41,7 @@ def collect_checks(settings: Settings) -> list[Check]:
         ("database_url", settings.database_url),
         ("migration_database_url", settings.migration_database_url),
         ("reader_database_url", settings.reader_database_url),
+        ("admin_database_url", settings.admin_database_url),
     ):
         checks.append(
             Check(name, value is not None, "set" if value is not None else "unset (live-DB steps unavailable)")

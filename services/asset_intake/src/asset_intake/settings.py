@@ -45,6 +45,12 @@ class Settings(BaseSettings):
             "ASSET_INTAKE_READER_DATABASE_URL", "reader_database_url"
         ),
     )
+    admin_database_url: Optional[SecretStr] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ASSET_INTAKE_ADMIN_DATABASE_URL", "admin_database_url"
+        ),
+    )
     tushare_token: Optional[SecretStr] = Field(
         default=None,
         validation_alias=AliasChoices("TUSHARE_TOKEN", "tushare_token"),

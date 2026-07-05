@@ -21,7 +21,13 @@ class DoctorTests(unittest.TestCase):
 
     def test_unset_dsns_warn_but_are_reported(self) -> None:
         checks = {c.name: c for c in collect_checks(_settings())}
-        for name in ("database_url", "migration_database_url", "reader_database_url", "tushare_token"):
+        for name in (
+            "database_url",
+            "migration_database_url",
+            "reader_database_url",
+            "admin_database_url",
+            "tushare_token",
+        ):
             self.assertFalse(checks[name].ok)
             self.assertIn("unset", checks[name].detail)
 
@@ -34,6 +40,7 @@ class DoctorTests(unittest.TestCase):
                     ASSET_INTAKE_DATABASE_URL="postgresql+psycopg://intake_app@/invest_engine",
                     ASSET_INTAKE_MIGRATION_DATABASE_URL="postgresql+psycopg://intake_owner@/invest_engine",
                     ASSET_INTAKE_READER_DATABASE_URL="postgresql+psycopg://intake_reader@/invest_engine",
+                    ASSET_INTAKE_ADMIN_DATABASE_URL="postgresql+psycopg://admin@/invest_engine",
                     TUSHARE_TOKEN="t",
                 )
             )
