@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any
+from typing import Any, NoReturn
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -261,7 +261,7 @@ def _document_list_response(
     )
 
 
-def raise_not_found() -> None:
+def raise_not_found() -> NoReturn:
     if HTTPException is None:  # pragma: no cover
         raise RuntimeError("not found")
     raise HTTPException(status_code=404, detail="NOT_FOUND")

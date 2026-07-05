@@ -5,6 +5,7 @@ from __future__ import annotations
 from disclosure_anchor.api.routers.documents import router as documents_router
 from disclosure_anchor.api.routers.filings import router as filings_router
 from disclosure_anchor.api.routers.health import router as health_router
+from disclosure_anchor.api.routers.units import router as units_router
 from disclosure_anchor.adapters.db.postgres.connection import (
     app_database_url,
     create_db_engine,
@@ -66,4 +67,6 @@ def create_app(settings: Settings | None = None, *, validate_runtime: bool = Tru
         app.include_router(documents_router)
     if filings_router is not None:
         app.include_router(filings_router)
+    if units_router is not None:
+        app.include_router(units_router)
     return app
