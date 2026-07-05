@@ -69,3 +69,11 @@ class ParserUnknownError(ParserError):
 
 class ParseDocumentError(DisclosureAnchorError):
     """Raised when a document cannot be parsed under the current contract."""
+
+
+class BuildUnitsError(DisclosureAnchorError):
+    """Raised when document_unit building fails under the current contract."""
+
+    def __init__(self, error: dict) -> None:
+        self.error = error
+        super().__init__(str(error))

@@ -305,6 +305,24 @@ class ProcessingRunRepository:
         row = self._session.get(models.ProcessingRun, processing_run_id)
         return mappers.processing_run_to_entity(row) if row is not None else None
 
+    def latest_succeeded_parse_for_document(
+        self, document_id: str
+    ) -> Optional[e.ProcessingRun]:
+        row = (
+            self._session.query(models.ProcessingRun)
+            .filter(
+                models.ProcessingRun.document_id == document_id,
+                models.ProcessingRun.run_kind == "parse",
+                models.ProcessingRun.status == "succeeded",
+            )
+            .order_by(
+                models.ProcessingRun.started_at.desc().nullslast(),
+                models.ProcessingRun.processing_run_id.desc(),
+            )
+            .first()
+        )
+        return mappers.processing_run_to_entity(row) if row is not None else None
+
     def update(self, run: e.ProcessingRun) -> e.ProcessingRun:
         row = self._session.get(models.ProcessingRun, run.processing_run_id)
         if row is None:
@@ -351,9 +369,41 @@ class DocumentUnitRepository:
         self._session.flush()
         return mappers.document_unit_to_entity(row)
 
+    def add_many(self, units: list[e.DocumentUnit]) -> list[e.DocumentUnit]:
+        rows = [mappers.document_unit_to_model(unit) for unit in units]
+        self._session.add_all(rows)
+        self._session.flush()
+        return [mappers.document_unit_to_entity(row) for row in rows]
+
     def get(self, asset_id: str) -> Optional[e.DocumentUnit]:
         row = self._session.get(models.DocumentUnit, asset_id)
         return mappers.document_unit_to_entity(row) if row is not None else None
+
+    def list_by_processing_run(self, processing_run_id: str) -> list[e.DocumentUnit]:
+        rows = (
+            self._session.query(models.DocumentUnit)
+            .filter(models.DocumentUnit.processing_run_id == processing_run_id)
+            .order_by(models.DocumentUnit.order_index, models.DocumentUnit.asset_id)
+            .all()
+        )
+        return [mappers.document_unit_to_entity(row) for row in rows]
+
+    def list_by_document_active(self, document_id: str) -> list[e.DocumentUnit]:
+        rows = (
+            self._session.query(models.DocumentUnit)
+            .join(
+                models.ProcessingRun,
+                models.DocumentUnit.processing_run_id
+                == models.ProcessingRun.processing_run_id,
+            )
+            .filter(
+                models.DocumentUnit.document_id == document_id,
+                models.ProcessingRun.is_active.is_(True),
+            )
+            .order_by(models.DocumentUnit.order_index, models.DocumentUnit.asset_id)
+            .all()
+        )
+        return [mappers.document_unit_to_entity(row) for row in rows]
 
 
 class OutboxRepository:

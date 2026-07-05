@@ -135,10 +135,55 @@ class ProcessingRunRepo(_Repo[e.ProcessingRun]):
     def _key(self, item: e.ProcessingRun) -> str:
         return item.processing_run_id
 
+    def latest_succeeded_parse_for_document(self, document_id: str) -> e.ProcessingRun | None:
+        matches = [
+            item
+            for item in self.items.values()
+            if item.document_id == document_id
+            and item.run_kind == "parse"
+            and item.status == "succeeded"
+        ]
+        matches.sort(key=lambda item: (item.started_at is not None, item.started_at, item.processing_run_id))
+        return matches[-1] if matches else None
+
 
 class DocumentUnitRepo(_Repo[e.DocumentUnit]):
+    def __init__(self, items: Iterable[e.DocumentUnit] = ()) -> None:
+        self.processing_runs: ProcessingRunRepo | None = None
+        super().__init__(items)
+
     def _key(self, item: e.DocumentUnit) -> str:
         return item.asset_id
+
+    def add_many(self, items: list[e.DocumentUnit]) -> list[e.DocumentUnit]:
+        return [self.add(item) for item in items]
+
+    def list_by_processing_run(self, processing_run_id: str) -> list[e.DocumentUnit]:
+        return sorted(
+            (
+                item
+                for item in self.items.values()
+                if item.processing_run_id == processing_run_id
+            ),
+            key=lambda item: (item.order_index, item.asset_id),
+        )
+
+    def list_by_document_active(self, document_id: str) -> list[e.DocumentUnit]:
+        active_run_ids = set()
+        if self.processing_runs is not None:
+            active_run_ids = {
+                item.processing_run_id
+                for item in self.processing_runs.items.values()
+                if item.is_active
+            }
+        return sorted(
+            (
+                item
+                for item in self.items.values()
+                if item.document_id == document_id and item.processing_run_id in active_run_ids
+            ),
+            key=lambda item: (item.order_index, item.asset_id),
+        )
 
 
 class OutboxRepo(_Repo[e.OutboxEvent]):
@@ -167,6 +212,7 @@ class FakeUnitOfWork:
         self.documents = DocumentRepo()
         self.processing_runs = ProcessingRunRepo()
         self.document_units = DocumentUnitRepo()
+        self.document_units.processing_runs = self.processing_runs
         self.outbox = OutboxRepo()
         self.commit_count = 0
         self.rollback_count = 0
