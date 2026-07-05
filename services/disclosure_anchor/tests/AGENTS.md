@@ -17,7 +17,8 @@ integration/smoke_real_mineru.py  真 MinerU 全链冒烟，**不进默认发现
 运行：`make test`（全量）/ `make test-unit|test-contract|test-data|test-integration`；
 **`make agent-check`** = lint(ruff) + typecheck(mypy 全仓严格) + no-DB test + git diff --check
 ——AI 改完代码的默认提交门禁（06 起写入 milestone 协议）。
-绿判据：no-DB 模式末行 `OK (skipped=N)`；live-DB 模式不带 skipped 的 `OK`
+绿判据：no-DB 模式末行 `OK (skipped=N)`；live-DB 模式 `OK`——若未设 DISCLOSURE_MINERU_BIN
+则为 `OK (skipped=1)`（06 的 admin 全链测试三重门控 skip，属合法绿；配上 MINERU_BIN 才是零 skip）。
 （socket DSN 见 04R §6.3，免密码）。政策与 fixture 规范：
 `docs/implementation/checks/fixture-and-test-policy.md`；再生成协议：04R §6.4。
 集成测试写真库必须在 tearDown 清理自己的行；固定标识要选可清理、不与生产样本冲突的值。
