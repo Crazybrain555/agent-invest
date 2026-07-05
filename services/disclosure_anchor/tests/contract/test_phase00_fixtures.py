@@ -118,7 +118,7 @@ class Phase00FixtureContractTests(unittest.TestCase):
                 self.assertIn(unit["payload_kind"], ALLOWED_PAYLOAD_KINDS, key)
                 self.assertIsInstance(unit["heading_path"], list)
                 self.assertIsInstance(unit["payload"], dict)
-                artifact_path = unit["artifact_locator"].get("artifact_path")
+                artifact_path = (unit["artifact_locator"] or {}).get("artifact_path")
                 if artifact_path is not None:
                     self.assertTrue(
                         _is_relative_locator(artifact_path),

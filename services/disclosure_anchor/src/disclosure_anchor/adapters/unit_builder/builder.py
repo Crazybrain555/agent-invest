@@ -55,6 +55,7 @@ class BuildStats:
     dropped_by_kind: Counter[str] = field(default_factory=Counter)
     dropped_unknown_by_raw_kind: Counter[str] = field(default_factory=Counter)
     skipped_sections: list[str] = field(default_factory=list)
+    dropped_cover_prelude: int = 0
     merged_tables: int = 0
     needs_review_count: int = 0
     unusable_count: int = 0
@@ -65,6 +66,7 @@ class BuildStats:
             "dropped_by_kind": dict(self.dropped_by_kind),
             "dropped_unknown_by_raw_kind": dict(self.dropped_unknown_by_raw_kind),
             "skipped_sections": list(self.skipped_sections),
+            "dropped_cover_prelude": self.dropped_cover_prelude,
             "merged_tables": self.merged_tables,
             "needs_review_count": self.needs_review_count,
             "unusable_count": self.unusable_count,
@@ -431,10 +433,16 @@ def s7_finalize_units(
         if quality_status == "unusable":
             stats.unusable_count += 1
         stats.generated_by_kind[unit.payload_kind] += 1
+        payload = unit.payload
+        if unit.payload_kind == "text":
+            applicability = rules.detect_applicability(str(payload.get("text", "")))
+            if applicability is not None:
+                payload = {**payload, "applicability": applicability}
         finalized.append(
             UnitDraft(
                 **{
                     **unit.__dict__,
+                    "payload": payload,
                     "semantic_key": semantic_key,
                     "quality_status": quality_status,
                 }
@@ -453,8 +461,9 @@ def build_unit_drafts_s1_s7(
         normalized_ir.get("elements", []),
         image_bytes_resolver=image_bytes_resolver,
     )
+    elements = _drop_cover_prelude(s1.elements, stats=s1.stats)
     placed = s2_apply_heading_tree(
-        s1.elements,
+        elements,
         qa_heading_mode=filing_type in {"investor_relations", "performance_briefing"},
     )
     text_units = replace_text_units_with_qa_where_stable(s3_build_text_units(placed))
@@ -463,6 +472,47 @@ def build_unit_drafts_s1_s7(
     units = sorted([*text_units, *table_units, *table_qa_units], key=_unit_sort_key)
     kept = s6_filter_units(units, s1.stats)
     return s7_finalize_units(kept, filing_type=filing_type, stats=s1.stats), s1.stats
+
+
+def _drop_cover_prelude(
+    elements: list[PreparedElement], *, stats: BuildStats
+) -> list[PreparedElement]:
+    """Drop cover-page text/headings before the first structural L1 section.
+
+    Cover identity (company name, report title, announcement date, stock code)
+    is already document metadata inherited by every unit, so repeating it as
+    units is pure noise (protocol §3.5 稳定噪声). Only active when the document
+    has a structural L1 heading at all — short announcements without 第X节
+    structure are never touched. Drops are counted, never silent (D9).
+    """
+
+    first_structural = next(
+        (
+            index
+            for index, element in enumerate(elements)
+            if element.kind == "heading" and _is_structural_l1(element)
+        ),
+        None,
+    )
+    if not first_structural:
+        return elements
+    kept: list[PreparedElement] = []
+    for index, element in enumerate(elements):
+        if index < first_structural and element.kind in {"heading", "text"}:
+            stats.dropped_cover_prelude += 1
+            continue
+        kept.append(element)
+    return kept
+
+
+def _is_structural_l1(element: PreparedElement) -> bool:
+    text = (element.text or "").strip()
+    if not text:
+        return False
+    if _normalized_title(text) in rules.FIXED_L1_TITLES:
+        return True
+    level_one_pattern = rules.HEADING_PATTERNS[0][1]
+    return bool(level_one_pattern.match(text))
 
 
 def _unit_sort_key(unit: UnitDraft) -> tuple[int, int]:

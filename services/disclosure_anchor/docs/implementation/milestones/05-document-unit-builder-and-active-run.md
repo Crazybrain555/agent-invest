@@ -385,6 +385,20 @@ phase00 fixtures 的 payload 内层是 v1 历史形态（{format,page_no,text} �
 - 三个本地样本 raw → parse → build → publish 全链跑通，§6 检查点全过；
 - `make test` no-DB 与 live-DB 双绿；acceptance-matrix A19/A20/A21 置 pass。
 
+## 8.5 实施后修订（2026-07-06，rule bundle ub-2026.07-2）
+
+用户裁决 + 协议 §3.5 核对后新增两条封闭规则（fixtures 已随规则重生成为真 golden，
+再生成脚本 scripts/regen_phase00_fixtures.py 现在同时产出 document_units.v1.jsonl）：
+
+- **封面前言噪音（cover prelude）**：文档存在结构性一级标题（第X节 或 重要提示/释义/目录/
+  备查文件）时，首个一级标题之前的 heading/text 元素不生成 unit 也不进标题树，计数入
+  build_stats.dropped_cover_prelude（D9：不静默消失）。理由：封面的公司名/标题/日期/代码
+  已是 document 元数据（§3.6 继承），unit 重复即纯噪音。短公告无节结构 → 规则不激活，零误伤。
+- **适用性声明标志（applicability）**：text unit 内出现"√适用 □不适用"/"□适用 √不适用"
+  声明行（勾选框实测含 MinerU 的 U+F052 私有区字形；允许粘连在标题行尾，行尾锚定匹配）时，
+  payload 增加可选键 `applicability: applicable|not_applicable`。"不适用"=该节声明豁免，
+  是信息不是噪音，保留原文并结构化供 L2 过滤（江海年报实测 38 applicable + 97 not_applicable）。
+
 ## 9. 明确不做
 
 - 不抽取 claim；不做 table_cell / page-bbox 核心索引；不做 LLM 语义价值判断；

@@ -24,7 +24,7 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-1")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-2")
         self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v1")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
@@ -455,6 +455,127 @@ class UnitBuilderTests(unittest.TestCase):
             semantic_key_for_unit(unit, filing_type="other"),
             "tariff_exposure",
         )
+
+    def test_cover_prelude_dropped_before_first_structural_section(self) -> None:
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "某某股份有限公司",
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "heading_level": 1,
+                        "text": "2025 年年度报告",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 3,
+                        "text": "股票代码：000000 股票简称：某某股份",
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 4,
+                        "heading_level": 1,
+                        "text": "第一节 重要提示",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 5,
+                        "text": "公司存在退市风险，请投资者注意。",
+                    },
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].heading_path, ["第一节 重要提示"])
+        self.assertEqual(stats.dropped_cover_prelude, 3)
+
+    def test_cover_prelude_inactive_without_structural_sections(self) -> None:
+        # Short announcements have no 第X节 structure; nothing may be dropped.
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "某某股份有限公司董事会决议公告",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "本公司董事会于近日审议通过如下议案。",
+                    },
+                ]
+            },
+            filing_type="other",
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(stats.dropped_cover_prelude, 0)
+
+    def test_applicability_marker_becomes_payload_flag(self) -> None:
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "第五节 重要事项",
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "heading_level": 2,
+                        "text": "一、破产重整相关事项",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 3,
+                        "text": "□适用 √不适用",
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 4,
+                        "heading_level": 2,
+                        "text": "二、重大诉讼事项",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 5,
+                        "text": "√适用 □不适用\n公司报告期内存在如下诉讼。",
+                    },
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        by_path = {tuple(unit.heading_path): unit for unit in units}
+        bankruptcy = by_path[("第五节 重要事项", "一、破产重整相关事项")]
+        litigation = by_path[("第五节 重要事项", "二、重大诉讼事项")]
+        self.assertEqual(bankruptcy.payload["applicability"], "not_applicable")
+        self.assertEqual(litigation.payload["applicability"], "applicable")
+        self.assertIn("诉讼", litigation.payload["text"])
 
     def test_full_s1_s7_redline_important_tip(self) -> None:
         units, stats = build_unit_drafts_s1_s7(

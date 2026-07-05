@@ -6,9 +6,35 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-1"
+RULES_VERSION = "ub-2026.07-2"
 HEADING_RULESET_ID = "cn_a_v1"
 GIBBERISH_RATIO_MAX = 0.30
+
+# A-share applicability declaration lines ("√适用 □不适用" / "□适用 √不适用").
+# A not-applicable mark is information (the section is declared exempt), so it
+# becomes a structured payload flag for L2 filtering instead of being dropped.
+#  is the private-use checked-box glyph MinerU emits for the ticked box
+# (observed 154x in the 江海 annual report corpus); the marker may be glued to
+# the end of a heading line, so matching is end-anchored.
+_CHECKED = "√☑✓"
+_UNCHECKED = "□☐"
+APPLICABLE_MARK_RE = re.compile(
+    rf"[{_CHECKED}]\s*适\s*用\s*[{_UNCHECKED}]\s*不\s*适\s*用\s*[。.]?\s*$"
+)
+NOT_APPLICABLE_MARK_RE = re.compile(
+    rf"[{_UNCHECKED}]\s*适\s*用\s*[{_CHECKED}]\s*不\s*适\s*用\s*[。.]?\s*$"
+)
+
+
+def detect_applicability(text: str) -> str | None:
+    """Return 'applicable' / 'not_applicable' when a marker line is present."""
+
+    for line in text.splitlines():
+        if APPLICABLE_MARK_RE.search(line):
+            return "applicable"
+        if NOT_APPLICABLE_MARK_RE.search(line):
+            return "not_applicable"
+    return None
 
 NOISE_SEPARATOR_RE = re.compile(r"^[\s\-—―=_·•\*~～]{3,}$")
 NOISE_LINE_PATTERNS: tuple[re.Pattern[str], ...] = ()
