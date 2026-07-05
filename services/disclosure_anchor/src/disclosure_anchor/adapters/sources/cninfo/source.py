@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 
 from disclosure_anchor.adapters.sources.cninfo.client import CninfoClient
 from disclosure_anchor.adapters.sources.cninfo.mapper import (
     CninfoCompanyProfile,
     category_prefix_matches,
+    load_filing_type_rule_bundle,
+    map_filing_type,
     map_p_info3015_record,
     map_p_stock2100_record,
 )
@@ -23,6 +26,8 @@ class CninfoSource:
 
     def __init__(self, client: CninfoClient) -> None:
         self._client = client
+        self._rule_bundle = load_filing_type_rule_bundle()
+        self._category_names: dict[str, str] | None = None
 
     def search_announcements(
         self,
@@ -42,16 +47,32 @@ class CninfoSource:
         records = response.payload.get("records", [])
         if not isinstance(records, list):
             return []
-        refs = [
-            map_p_info3015_record(record)
-            for record in records
-            if isinstance(record, dict)
-        ]
+        names = self._category_names_cached()
+        refs: list[AnnouncementRef] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            mapped = map_p_info3015_record(record)
+            refs.append(
+                replace(
+                    mapped,
+                    filing_type=map_filing_type(
+                        mapped.raw_category,
+                        category_names_by_code=names,
+                        rule_bundle=self._rule_bundle,
+                    ),
+                )
+            )
         return [
             ref
             for ref in refs
             if category_prefix_matches(ref.raw_category, categories)
         ]
+
+    def _category_names_cached(self) -> dict[str, str]:
+        if self._category_names is None:
+            self._category_names = self.category_names_by_code()
+        return self._category_names
 
     def profile_for_security(self, security_code: str) -> CninfoCompanyProfile | None:
         response = self._client.get_json(

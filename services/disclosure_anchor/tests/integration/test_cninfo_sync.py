@@ -228,12 +228,6 @@ def _command() -> SyncDisclosureIndexCommand:
         window_start=date(2026, 7, 1),
         window_end=date(2026, 7, 2),
         categories=("0103", "0120"),
-        category_names_by_code={
-            "010301": "年度报告",
-            "010112": "深市公司公告",
-            "0120": "投资者关系",
-            "012001": "投资者关系信息",
-        },
     )
 
 

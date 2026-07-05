@@ -43,6 +43,29 @@ class DocumentIdentityConflictError(DisclosureAnchorError):
     """Raised when a document identity unique constraint is hit."""
 
 
+class SourceRequestError(DisclosureAnchorError):
+    """Raised when a provider source request fails under the retry policy.
+
+    Provider adapters raise a subclass; use cases persist ``to_error`` output
+    without importing adapter modules.
+    """
+
+    def __init__(self, message: str, *, error_code: str, retryable: bool) -> None:
+        self.error_code = error_code
+        self.retryable = retryable
+        super().__init__(message)
+
+    def to_error(
+        self, *, stage: str, provider_document_id: str | None = None
+    ) -> dict[str, object]:
+        return {
+            "stage": stage,
+            "error_code": self.error_code,
+            "retryable": self.retryable,
+            "provider_document_id": provider_document_id,
+        }
+
+
 class ParserError(DisclosureAnchorError):
     """Raised when parser execution or artifact mapping fails."""
 

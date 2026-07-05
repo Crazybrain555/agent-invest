@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from disclosure_anchor.domain.errors import ConfigurationError, DisclosureAnchorError
+from disclosure_anchor.domain.errors import ConfigurationError, SourceRequestError
 from disclosure_anchor.settings import Settings
 
 
@@ -44,7 +44,7 @@ class CninfoResponse:
     audit: RequestAudit
 
 
-class CninfoClientError(DisclosureAnchorError):
+class CninfoClientError(SourceRequestError):
     """Raised when a CNINFO request cannot be completed under retry policy."""
 
     def __init__(
@@ -55,18 +55,8 @@ class CninfoClientError(DisclosureAnchorError):
         retryable: bool,
         audit: RequestAudit | None = None,
     ) -> None:
-        self.error_code = error_code
-        self.retryable = retryable
         self.audit = audit
-        super().__init__(message)
-
-    def to_error(self, *, stage: str, provider_document_id: str | None = None) -> dict[str, object]:
-        return {
-            "stage": stage,
-            "error_code": self.error_code,
-            "retryable": self.retryable,
-            "provider_document_id": provider_document_id,
-        }
+        super().__init__(message, error_code=error_code, retryable=retryable)
 
 
 class TokenBucket:
@@ -180,7 +170,10 @@ class CninfoClient:
         self._client.close()
 
     def _ensure_token(self) -> str:
-        if self._access_key and self._access_secret:
+        # Reuse the cached token; expiry is handled by the refresh-on-resultcode
+        # path in _request_json_with_retries, so fetching per call would only
+        # double traffic against the token endpoint.
+        if not self._access_token and self._access_key and self._access_secret:
             self._access_token = self._fetch_token()
         if not self._access_token:
             raise ConfigurationError("CNINFO access token is missing")
@@ -250,7 +243,8 @@ class CninfoClient:
                 and self._access_key
                 and self._access_secret
             ):
-                params = {**dict(params), "access_token": self._fetch_token()}
+                self._access_token = self._fetch_token()
+                params = {**dict(params), "access_token": self._access_token}
                 refreshed_after_token_error = True
                 retryable = True
             if not retryable or attempt >= self._max_retries:

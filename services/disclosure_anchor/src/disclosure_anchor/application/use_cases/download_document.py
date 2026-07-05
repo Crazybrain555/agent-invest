@@ -8,11 +8,9 @@ from datetime import date, datetime, timezone
 import json
 from pathlib import Path
 
-from disclosure_anchor.adapters.sources.cninfo.mapper import CNINFO_PROVIDER
 from disclosure_anchor.application.ports.disclosure_source import AnnouncementRef, DisclosureSourcePort
 from disclosure_anchor.application.ports.file_store import (
     FileStorePathPort,
-    QuarantineResult,
     RawDocumentStorePort,
     RawDocumentWriteResult,
 )
@@ -25,10 +23,17 @@ from disclosure_anchor.application.services.subject_resolver import (
     SubjectCandidate,
     SubjectResolver,
 )
-from disclosure_anchor.application.use_cases.sync_disclosure_index import INDEX_INTERFACE
+from disclosure_anchor.application.use_cases.sync_disclosure_index import (
+    CNINFO_PROVIDER,
+    INDEX_INTERFACE,
+)
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
-from disclosure_anchor.domain.errors import InvalidRawDocumentError, RegistrationMetadataError
+from disclosure_anchor.domain.errors import (
+    InvalidRawDocumentError,
+    RegistrationMetadataError,
+    SourceRequestError,
+)
 
 
 DOWNLOAD_INTERFACE = "cninfo:download_pdf"
@@ -87,7 +92,24 @@ class DownloadDocument:
         tmp_path = self._paths.runtime_tmp_path(f"cninfo_{ids.new_ulid()}.pdf")
         tmp_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            tmp_path.write_bytes(self._source.download_pdf(ref))
+            try:
+                payload = self._source.download_pdf(ref)
+            except SourceRequestError as exc:
+                source_access = self._record_failed_download(
+                    candidate=candidate,
+                    error=exc.to_error(
+                        stage="download",
+                        provider_document_id=ref.provider_document_id,
+                    ),
+                    snapshot={"reason": str(exc)},
+                )
+                return DownloadDocumentResult(
+                    provider_document_id=ref.provider_document_id,
+                    document_id=None,
+                    source_access_id=source_access.source_access_id,
+                    raw_file_hash=None,
+                )
+            tmp_path.write_bytes(payload)
             try:
                 raw = self._raw_store.put_raw_document(
                     provider=CNINFO_PROVIDER,
@@ -105,8 +127,17 @@ class DownloadDocument:
                 )
                 source_access = self._record_failed_download(
                     candidate=candidate,
-                    reason=str(exc),
-                    quarantine=quarantine,
+                    error={
+                        "stage": "download",
+                        "error_code": "invalid_raw_document",
+                        "retryable": False,
+                        "provider_document_id": ref.provider_document_id,
+                    },
+                    snapshot={
+                        "reason": str(exc),
+                        "quarantine_filename": quarantine.path.name,
+                        "byte_count": quarantine.byte_count,
+                    },
                 )
                 return DownloadDocumentResult(
                     provider_document_id=ref.provider_document_id,
@@ -168,8 +199,8 @@ class DownloadDocument:
         self,
         *,
         candidate: Mapping[str, object],
-        reason: str,
-        quarantine: QuarantineResult,
+        error: Mapping[str, object],
+        snapshot: Mapping[str, object],
     ) -> e.SourceAccess:
         with self._uow_factory() as uow:
             source_access = uow.source_accesses.add(
@@ -186,21 +217,8 @@ class DownloadDocument:
                     },
                     accessed_at=datetime.now(timezone.utc),
                     status="failed",
-                    error=_json(
-                        {
-                            "stage": "download",
-                            "error_code": "invalid_raw_document",
-                            "retryable": False,
-                            "provider_document_id": _candidate_str(
-                                candidate, "provider_document_id"
-                            ),
-                        }
-                    ),
-                    result_snapshot={
-                        "reason": reason,
-                        "quarantine_filename": quarantine.path.name,
-                        "byte_count": quarantine.byte_count,
-                    },
+                    error=_json(error),
+                    result_snapshot=dict(snapshot),
                 )
             )
             uow.commit()

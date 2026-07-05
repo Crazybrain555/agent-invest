@@ -25,7 +25,7 @@ class CninfoMapperTests(unittest.TestCase):
     def test_filing_type_rule_bundle_has_required_seed_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
 
-        self.assertEqual(bundle.version, "2026-07")
+        self.assertEqual(bundle.version, "2026-07-r2")
         self.assertEqual(
             {rule.filing_type for rule in bundle.rules},
             {
@@ -54,6 +54,23 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertEqual(
             split_category_segments("01010503||010112||010301"),
             ["01010503", "010112", "010301"],
+        )
+
+    def test_semiannual_is_not_shadowed_by_annual_substring(self) -> None:
+        # "半年度报告" contains the substring "年度报告"; rule order in the
+        # bundle must classify it as semiannual, never annual.
+        for raw in ("半年度报告", "2025年半年度报告", "公告||半年度报告全文"):
+            self.assertEqual(
+                map_filing_type(raw, category_names_by_code={}),
+                "semiannual_report",
+                raw,
+            )
+        self.assertEqual(
+            map_filing_type("年度报告", category_names_by_code={}), "annual_report"
+        )
+        self.assertEqual(
+            map_filing_type("第一季度报告", category_names_by_code={}),
+            "quarterly_report",
         )
 
     def test_filing_type_mapping_returns_first_non_other_match(self) -> None:

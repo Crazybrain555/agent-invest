@@ -31,7 +31,12 @@ class DisclosureWindow:
 
 @dataclass(frozen=True)
 class AnnouncementRef:
-    """Standardized announcement candidate returned by a source adapter."""
+    """Standardized announcement candidate returned by a source adapter.
+
+    ``filing_type`` is mapped by the source adapter (provider vocabularies stay
+    in the adapter layer); ``None`` means unmapped and consumers fall back to
+    ``"other"``.
+    """
 
     provider: str
     provider_document_id: str
@@ -43,6 +48,7 @@ class AnnouncementRef:
     security_name: str | None
     file_size: int | float | str | None
     index_updated_at: datetime | None
+    filing_type: str | None = None
     object_id: int | str | None = None
     rec_id: str | None = None
     format: str | None = None
@@ -50,6 +56,17 @@ class AnnouncementRef:
     market_name: str | None = None
     provider_org_id: str | None = None
     raw_record: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SourceCompanyProfile:
+    """Provider company profile used for subject resolution during sync."""
+
+    security_code: str
+    security_name: str
+    legal_name: str
+    provider_org_id: str | None
+    uscc: str | None
 
 
 class DisclosureSourcePort(Protocol):

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 import json
 from pathlib import Path
 import unittest
 
 from disclosure_anchor.adapters.sources.cninfo.mapper import (
+    map_filing_type,
     map_p_info3015_record,
     map_p_stock2100_record,
 )
@@ -144,20 +146,30 @@ def _command() -> SyncDisclosureIndexCommand:
         window_start=date(2026, 7, 1),
         window_end=date(2026, 7, 2),
         categories=("0103", "0120"),
-        category_names_by_code={
-            "010301": "年度报告",
-            "010112": "深市公司公告",
-            "0120": "投资者关系",
-            "012001": "投资者关系信息",
-        },
     )
+
+
+CATEGORY_NAMES = {
+    "010301": "年度报告",
+    "010112": "深市公司公告",
+    "0120": "投资者关系",
+    "012001": "投资者关系信息",
+}
 
 
 def _refs() -> list[AnnouncementRef]:
     payload = json.loads(
         (FIXTURE_ROOT / "p_info3015_sample.json").read_text(encoding="utf-8")
     )
-    return [map_p_info3015_record(record) for record in payload["records"]]
+    return [
+        replace(
+            ref,
+            filing_type=map_filing_type(
+                ref.raw_category, category_names_by_code=CATEGORY_NAMES
+            ),
+        )
+        for ref in (map_p_info3015_record(record) for record in payload["records"])
+    ]
 
 
 def _profile() -> object:

@@ -21,6 +21,29 @@ ACCESS_TOKEN = "unit-access-token"
 
 
 class CninfoClientTests(unittest.TestCase):
+    def test_token_is_cached_across_requests(self) -> None:
+        token_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal token_calls
+            if request.url.path.endswith("/oauth2/token"):
+                token_calls += 1
+                return httpx.Response(200, json={"access_token": ACCESS_TOKEN})
+            return httpx.Response(
+                200,
+                json={"resultcode": 200, "resultmsg": "success", "count": 0, "records": []},
+            )
+
+        client = _client(handler)
+        for _ in range(3):
+            client.get_json(
+                provider_interface="cninfo:p_info3015",
+                path="/api/info/p_info3015",
+                params={"scode": "000001"},
+            )
+
+        self.assertEqual(token_calls, 1)
+
     def test_fetches_token_before_json_request(self) -> None:
         requests: list[httpx.Request] = []
 

@@ -375,9 +375,11 @@ def _should_download_candidate(
     )
     if signature_state == "different":
         return True
+    # Inside the overlap verification window a matching signature is not
+    # trusted (F005N is KB-granular); re-download and let raw_file_hash decide.
     announcement_date = _candidate_announcement_date(candidate)
     if announcement_date is not None and announcement_date >= overlap_start:
-        return signature_state == "unreliable"
+        return True
     return False
 
 

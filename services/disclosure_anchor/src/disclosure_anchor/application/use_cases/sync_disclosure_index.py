@@ -9,15 +9,11 @@ import hashlib
 import json
 from typing import Any
 
-from disclosure_anchor.adapters.sources.cninfo.mapper import (
-    CNINFO_PROVIDER,
-    CninfoCompanyProfile,
-    map_filing_type,
-)
 from disclosure_anchor.application.ports.disclosure_source import (
     AnnouncementRef,
     DisclosureSourcePort,
     DisclosureWindow,
+    SourceCompanyProfile,
     SourceSecurity,
 )
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
@@ -27,9 +23,10 @@ from disclosure_anchor.application.services.subject_resolver import (
 )
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
-from disclosure_anchor.domain.errors import DisclosureAnchorError
+from disclosure_anchor.domain.errors import DisclosureAnchorError, SourceRequestError
 
 
+CNINFO_PROVIDER = "cninfo"
 PROFILE_INTERFACE = "cninfo:p_stock2100"
 INDEX_INTERFACE = "cninfo:p_info3015"
 
@@ -45,7 +42,6 @@ class SyncDisclosureIndexCommand:
     window_start: date
     window_end: date
     categories: tuple[str, ...] | None = None
-    category_names_by_code: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -66,7 +62,7 @@ class SyncDisclosureIndex:
         self,
         *,
         source: DisclosureSourcePort,
-        profile_loader: Callable[[str], CninfoCompanyProfile | None],
+        profile_loader: Callable[[str], SourceCompanyProfile | None],
         uow_factory: Callable[[], UnitOfWork],
         subject_resolver: SubjectResolver | None = None,
     ) -> None:
@@ -136,7 +132,6 @@ class SyncDisclosureIndex:
                 company_id=subject.company.company_id,
                 security_id=subject.security.security_id,
                 provider_org_id=profile.provider_org_id if profile else None,
-                category_names_by_code=command.category_names_by_code or {},
                 now=now,
             )
             checkpoint = self._upsert_checkpoint(
@@ -179,7 +174,7 @@ class SyncDisclosureIndex:
         *,
         uow: UnitOfWork,
         command: SyncDisclosureIndexCommand,
-        profile: CninfoCompanyProfile | None,
+        profile: SourceCompanyProfile | None,
         now: datetime,
     ) -> e.SourceAccess:
         snapshot: dict[str, object]
@@ -212,7 +207,7 @@ class SyncDisclosureIndex:
         *,
         uow: UnitOfWork,
         command: SyncDisclosureIndexCommand,
-        profile: CninfoCompanyProfile | None,
+        profile: SourceCompanyProfile | None,
     ) -> Any:
         legal_name = profile.legal_name if profile else f"CNINFO {command.security_code}"
         return self._subject_resolver.resolve(
@@ -291,7 +286,6 @@ class SyncDisclosureIndex:
         company_id: str,
         security_id: str,
         provider_org_id: str | None,
-        category_names_by_code: Mapping[str, str],
         now: datetime,
     ) -> e.SourceAccess:
         candidates = [
@@ -299,7 +293,6 @@ class SyncDisclosureIndex:
                 ref,
                 exchange=command.exchange,
                 provider_org_id=provider_org_id,
-                category_names_by_code=category_names_by_code,
             )
             for ref in refs
         ]
@@ -345,7 +338,9 @@ class SyncDisclosureIndex:
                 accessed_at=now,
                 status="failed",
                 error=_json(
-                    {
+                    error.to_error(stage="index")
+                    if isinstance(error, SourceRequestError)
+                    else {
                         "stage": "index",
                         "error_code": type(error).__name__,
                         "retryable": False,
@@ -382,7 +377,6 @@ def _candidate_snapshot(
     *,
     exchange: str,
     provider_org_id: str | None,
-    category_names_by_code: Mapping[str, str],
 ) -> dict[str, object]:
     index_updated_at = (
         ref.index_updated_at.isoformat() if ref.index_updated_at is not None else None
@@ -392,9 +386,7 @@ def _candidate_snapshot(
         "title": ref.title,
         "download_url": ref.download_url,
         "raw_category": ref.raw_category,
-        "filing_type": map_filing_type(
-            ref.raw_category, category_names_by_code=category_names_by_code
-        ),
+        "filing_type": ref.filing_type or "other",
         "announcement_date": ref.announcement_date.isoformat(),
         "security_code": ref.security_code,
         "exchange": exchange,

@@ -232,7 +232,6 @@ class _Deps:
                     exchange=exchange,
                     window_start=window_start,
                     window_end=window_end,
-                    category_names_by_code=source.category_names_by_code(),
                 )
             )
             downloader = DownloadDocument(

@@ -10,7 +10,10 @@ from importlib import resources
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
-from disclosure_anchor.application.ports.disclosure_source import AnnouncementRef
+from disclosure_anchor.application.ports.disclosure_source import (
+    AnnouncementRef,
+    SourceCompanyProfile,
+)
 from disclosure_anchor.domain.errors import DisclosureAnchorError
 from disclosure_anchor.domain.value_objects import validate_filing_type
 
@@ -36,13 +39,8 @@ class FilingTypeRuleBundle:
     rules: tuple[FilingTypeRule, ...]
 
 
-@dataclass(frozen=True)
-class CninfoCompanyProfile:
-    security_code: str
-    security_name: str
-    legal_name: str
-    provider_org_id: str | None
-    uscc: str | None
+# CNINFO profiles use the provider-neutral port DTO directly.
+CninfoCompanyProfile = SourceCompanyProfile
 
 
 def load_filing_type_rule_bundle() -> FilingTypeRuleBundle:

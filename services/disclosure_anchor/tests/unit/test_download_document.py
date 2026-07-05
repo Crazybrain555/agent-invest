@@ -25,7 +25,7 @@ from disclosure_anchor.application.use_cases.download_document import (
 from disclosure_anchor.application.use_cases.sync_disclosure_index import INDEX_INTERFACE
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
-from disclosure_anchor.domain.errors import InvalidRawDocumentError
+from disclosure_anchor.domain.errors import InvalidRawDocumentError, SourceRequestError
 from tests.unit._fakes import FakeUnitOfWork
 
 
@@ -119,6 +119,47 @@ class DownloadDocumentTests(unittest.TestCase):
         self.assertEqual(source_access.status, "failed")
         self.assertEqual(source_access.query_params["provider_document_id"], "pid-1")
         self.assertIn('"retryable":false', source_access.error)
+
+    def test_download_http_failure_records_failed_source_access(self) -> None:
+        uow = _uow_with_subject()
+        use_case = DownloadDocument(
+            source=FailingDownloadSource(
+                SourceRequestError(
+                    "CNINFO download request failed",
+                    error_code="http_404",
+                    retryable=True,
+                )
+            ),
+            raw_store=FakeRawStore(),
+            path_builder=FakePathBuilder(),
+            uow_factory=lambda: uow,
+        )
+
+        result = use_case.execute(DownloadDocumentCommand(candidate=_candidate()))
+
+        self.assertIsNone(result.document_id)
+        self.assertIsNone(result.quarantined_path)
+        source_access = uow.source_accesses.get(result.source_access_id)
+        self.assertEqual(source_access.status, "failed")
+        self.assertIn('"error_code":"http_404"', source_access.error)
+        self.assertIn('"retryable":true', source_access.error)
+        self.assertIn('"stage":"download"', source_access.error)
+
+
+class FailingDownloadSource:
+    def __init__(self, error: SourceRequestError) -> None:
+        self._error = error
+
+    def search_announcements(
+        self,
+        security: SourceSecurity,
+        window: DisclosureWindow,
+        categories: tuple[str, ...] | None = None,
+    ) -> list[AnnouncementRef]:
+        raise AssertionError("download use case must not search")
+
+    def download_pdf(self, ref: AnnouncementRef) -> bytes:
+        raise self._error
 
 
 class FakeDownloadSource:
