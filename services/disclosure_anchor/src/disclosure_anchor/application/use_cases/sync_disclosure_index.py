@@ -297,6 +297,7 @@ class SyncDisclosureIndex:
         candidates = [
             _candidate_snapshot(
                 ref,
+                exchange=command.exchange,
                 provider_org_id=provider_org_id,
                 category_names_by_code=category_names_by_code,
             )
@@ -379,6 +380,7 @@ class SyncDisclosureIndex:
 def _candidate_snapshot(
     ref: AnnouncementRef,
     *,
+    exchange: str,
     provider_org_id: str | None,
     category_names_by_code: Mapping[str, str],
 ) -> dict[str, object]:
@@ -395,6 +397,7 @@ def _candidate_snapshot(
         ),
         "announcement_date": ref.announcement_date.isoformat(),
         "security_code": ref.security_code,
+        "exchange": exchange,
         "security_name": ref.security_name,
         "provider_org_id": provider_org_id,
         "object_id": ref.object_id,

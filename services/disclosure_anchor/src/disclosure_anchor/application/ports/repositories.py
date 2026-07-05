@@ -58,6 +58,15 @@ class SourceAccessRepository(Protocol):
     def list_candidate_snapshots(
         self, *, provider: str, provider_interface: str, company_id: str
     ) -> list[dict[str, object]]: ...
+    def list_pending_download_candidates(
+        self,
+        *,
+        provider: str,
+        index_interface: str,
+        download_interface: str,
+        max_retries: int,
+        overlap_start: object,
+    ) -> list[dict[str, object]]: ...
 
 
 class SourceCheckpointRepository(Protocol):

@@ -88,6 +88,10 @@ class SecurityRepo(_Repo[e.Security]):
 
 
 class SourceAccessRepo(_Repo[e.SourceAccess]):
+    def __init__(self, items: Iterable[e.SourceAccess] = ()) -> None:
+        self.documents: DocumentRepo | None = None
+        super().__init__(items)
+
     def _key(self, item: e.SourceAccess) -> str:
         return item.source_access_id
 
@@ -106,6 +110,29 @@ class SourceAccessRepo(_Repo[e.SourceAccess]):
             ):
                 snapshots.append(item.result_snapshot)
         return snapshots
+
+    def list_pending_download_candidates(
+        self,
+        *,
+        provider: str,
+        index_interface: str,
+        download_interface: str,
+        max_retries: int,
+        overlap_start: object,
+    ) -> list[dict[str, object]]:
+        candidates: list[dict[str, object]] = []
+        for item in self.items.values():
+            if item.provider != provider or item.provider_interface != index_interface:
+                continue
+            if not isinstance(item.result_snapshot, dict):
+                continue
+            snapshot = item.result_snapshot
+            raw_candidates = snapshot.get("candidates")
+            if isinstance(raw_candidates, list):
+                candidates.extend(
+                    item for item in raw_candidates if isinstance(item, dict)
+                )
+        return candidates
 
 
 class SourceCheckpointRepo(_Repo[e.SourceCheckpoint]):
@@ -245,6 +272,7 @@ class FakeUnitOfWork:
         self.source_accesses = SourceAccessRepo()
         self.source_checkpoints = SourceCheckpointRepo()
         self.documents = DocumentRepo()
+        self.source_accesses.documents = self.documents
         self.processing_runs = ProcessingRunRepo()
         self.document_units = DocumentUnitRepo()
         self.document_units.processing_runs = self.processing_runs

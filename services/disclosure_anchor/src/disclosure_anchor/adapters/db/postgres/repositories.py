@@ -7,6 +7,9 @@ the transaction boundary.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from datetime import date
+import json
 from typing import Optional
 
 from sqlalchemy.exc import IntegrityError
@@ -240,6 +243,170 @@ class SourceAccessRepository:
             if isinstance(snapshot, dict) and isinstance(snapshot.get("candidates"), list):
                 snapshots.append(snapshot)
         return snapshots
+
+    def list_pending_download_candidates(
+        self,
+        *,
+        provider: str,
+        index_interface: str,
+        download_interface: str,
+        max_retries: int,
+        overlap_start: object,
+    ) -> list[dict[str, object]]:
+        overlap_date = _coerce_date(overlap_start)
+        candidates = _candidate_rows(
+            self._session.query(models.SourceAccess)
+            .filter(
+                models.SourceAccess.provider == provider,
+                models.SourceAccess.provider_interface == index_interface,
+                models.SourceAccess.status == "ok",
+            )
+            .order_by(models.SourceAccess.accessed_at.asc())
+            .all()
+        )
+        pending: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            provider_document_id = candidate.get("provider_document_id")
+            if not isinstance(provider_document_id, str) or provider_document_id in seen:
+                continue
+            seen.add(provider_document_id)
+            if self._terminal_download_failure(
+                provider=provider,
+                download_interface=download_interface,
+                provider_document_id=provider_document_id,
+                max_retries=max_retries,
+            ):
+                continue
+            document = self._latest_document(
+                provider=provider, provider_document_id=provider_document_id
+            )
+            if _should_download_candidate(
+                candidate=candidate,
+                document=document,
+                overlap_start=overlap_date,
+            ):
+                pending.append(candidate)
+        return pending
+
+    def _terminal_download_failure(
+        self,
+        *,
+        provider: str,
+        download_interface: str,
+        provider_document_id: str,
+        max_retries: int,
+    ) -> bool:
+        rows = (
+            self._session.query(models.SourceAccess)
+            .filter(
+                models.SourceAccess.provider == provider,
+                models.SourceAccess.provider_interface == download_interface,
+                models.SourceAccess.status == "failed",
+                models.SourceAccess.query_params.op("->>")("provider_document_id")
+                == provider_document_id,
+            )
+            .all()
+        )
+        if len(rows) >= max_retries:
+            return True
+        return any(_error_retryable(row.error) is False for row in rows)
+
+    def _latest_document(
+        self, *, provider: str, provider_document_id: str
+    ) -> Optional[e.Document]:
+        row = (
+            self._session.query(models.Document)
+            .filter(
+                models.Document.provider == provider,
+                models.Document.provider_document_id == provider_document_id,
+            )
+            .order_by(models.Document.created_at.desc(), models.Document.document_id.desc())
+            .first()
+        )
+        return mappers.document_to_entity(row) if row is not None else None
+
+
+def _candidate_rows(rows: list[models.SourceAccess]) -> list[dict[str, object]]:
+    candidates: list[dict[str, object]] = []
+    for row in rows:
+        snapshot = row.result_snapshot
+        if not isinstance(snapshot, dict):
+            continue
+        raw_candidates = snapshot.get("candidates")
+        if not isinstance(raw_candidates, list):
+            continue
+        candidates.extend(item for item in raw_candidates if isinstance(item, dict))
+    return candidates
+
+
+def _coerce_date(value: object) -> date:
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        return date.fromisoformat(value)
+    raise TypeError(f"overlap_start must be date or ISO string, got {type(value).__name__}")
+
+
+def _error_retryable(error: str | None) -> bool | None:
+    if not error:
+        return None
+    try:
+        payload = json.loads(error)
+    except json.JSONDecodeError:
+        return None
+    retryable = payload.get("retryable")
+    return retryable if isinstance(retryable, bool) else None
+
+
+def _should_download_candidate(
+    *,
+    candidate: dict[str, object],
+    document: e.Document | None,
+    overlap_start: date,
+) -> bool:
+    if document is None:
+        return True
+    if _has_correction_signal(candidate.get("title")):
+        return True
+    signature_state = _signature_state(
+        candidate.get("file_signature_hint"),
+        document.provider_metadata.get("file_signature"),
+    )
+    if signature_state == "different":
+        return True
+    announcement_date = _candidate_announcement_date(candidate)
+    if announcement_date is not None and announcement_date >= overlap_start:
+        return signature_state == "unreliable"
+    return False
+
+
+def _has_correction_signal(title: object) -> bool:
+    if not isinstance(title, str):
+        return False
+    return any(signal in title for signal in ("更正", "修订", "更新后", "补充", "取消"))
+
+
+def _candidate_announcement_date(candidate: Mapping[str, object]) -> date | None:
+    value = candidate.get("announcement_date")
+    if not isinstance(value, str):
+        return None
+    return date.fromisoformat(value)
+
+
+def _signature_state(left: object, right: object) -> str:
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return "unreliable"
+    comparable = False
+    for field in ("file_size", "etag", "last_modified"):
+        left_value = left.get(field)
+        right_value = right.get(field)
+        if left_value is None or right_value is None:
+            continue
+        comparable = True
+        if left_value != right_value:
+            return "different"
+    return "same" if comparable else "unreliable"
 
 
 class SourceCheckpointRepository:
