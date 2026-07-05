@@ -617,8 +617,12 @@ class WorkerRunOnceIntegrationTests(unittest.TestCase):
                 with self.engine.connect() as conn:
                     remaining = conn.execute(
                         text(
+                            # pg_locks is cluster-wide; scope to this scratch DB
+                            # or a worker on another database trips the assert.
                             "SELECT count(*) FROM pg_locks "
-                            "WHERE locktype='advisory' AND classid IN (:w, :d)"
+                            "WHERE locktype='advisory' AND classid IN (:w, :d) "
+                            "AND database = (SELECT oid FROM pg_database "
+                            "                WHERE datname = current_database())"
                         ),
                         {"w": WORKER_NS, "d": DOC_NS},
                     ).scalar_one()
