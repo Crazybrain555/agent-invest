@@ -1,0 +1,11 @@
+# Root-level safety net; each service carries its own .gitignore with the full set.
+.DS_Store
+._*
+.env
+.env.*
+!.env.template
+!.env.example
+.venv/
+__pycache__/
+.mcp.json
+.claude/settings.local.json
