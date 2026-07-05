@@ -87,6 +87,26 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("CNINFO_ACCESS_TOKEN", "cninfo_access_token"),
     )
+    cninfo_max_qps: float = Field(
+        default=1.0,
+        gt=0,
+        validation_alias=AliasChoices("CNINFO_MAX_QPS", "cninfo_max_qps"),
+    )
+    cninfo_max_retries: int = Field(
+        default=3,
+        ge=0,
+        validation_alias=AliasChoices("CNINFO_MAX_RETRIES", "cninfo_max_retries"),
+    )
+    cninfo_overlap_days: int = Field(
+        default=7,
+        ge=0,
+        validation_alias=AliasChoices("CNINFO_OVERLAP_DAYS", "cninfo_overlap_days"),
+    )
+    cninfo_oversized_kb: int = Field(
+        default=10240,
+        ge=0,
+        validation_alias=AliasChoices("CNINFO_OVERSIZED_KB", "cninfo_oversized_kb"),
+    )
 
     @property
     def agent_system_root(self) -> Path:

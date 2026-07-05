@@ -30,6 +30,10 @@ class SettingsTests(unittest.TestCase):
             self.assertIsNone(settings.cninfo_access_key)
             self.assertEqual(settings.disclosure_parse_timeout_seconds, 1800)
             self.assertIsNone(settings.disclosure_mineru_bin)
+            self.assertEqual(settings.cninfo_max_qps, 1.0)
+            self.assertEqual(settings.cninfo_max_retries, 3)
+            self.assertEqual(settings.cninfo_overlap_days, 7)
+            self.assertEqual(settings.cninfo_oversized_kb, 10240)
 
     def test_secrets_are_optional_and_masked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -42,6 +46,10 @@ class SettingsTests(unittest.TestCase):
                     ),
                     "CNINFO_ACCESS_KEY": "key",
                     "CNINFO_ACCESS_SECRET": "<set-in-private-env>",
+                    "CNINFO_MAX_QPS": "2.5",
+                    "CNINFO_MAX_RETRIES": "5",
+                    "CNINFO_OVERLAP_DAYS": "14",
+                    "CNINFO_OVERSIZED_KB": "20480",
                     "DISCLOSURE_PARSE_TIMEOUT_SECONDS": "42",
                     "DISCLOSURE_MINERU_BIN": "/opt/mineru/bin/mineru",
                 }
@@ -62,6 +70,10 @@ class SettingsTests(unittest.TestCase):
                 self.assertEqual(
                     settings.disclosure_mineru_bin, Path("/opt/mineru/bin/mineru")
                 )
+                self.assertEqual(settings.cninfo_max_qps, 2.5)
+                self.assertEqual(settings.cninfo_max_retries, 5)
+                self.assertEqual(settings.cninfo_overlap_days, 14)
+                self.assertEqual(settings.cninfo_oversized_kb, 20480)
 
 
 if __name__ == "__main__":
