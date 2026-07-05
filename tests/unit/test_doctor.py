@@ -4,6 +4,7 @@ from pathlib import Path
 
 from disclosure_anchor.adapters.runtime.doctor import run_doctor, run_startup_preflight
 from disclosure_anchor.settings import SENTINEL_NAME, Settings
+from tests.unit._env import without_db_env
 
 
 def _settings(root: Path, *, bad_cache: bool = False) -> Settings:
@@ -28,7 +29,7 @@ def _create_roots(root: Path) -> None:
 
 class DoctorTests(unittest.TestCase):
     def test_passes_with_sentinel_writable_roots_and_external_caches(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with without_db_env(), tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _create_roots(root)
             report = run_doctor(_settings(root))
@@ -43,7 +44,7 @@ class DoctorTests(unittest.TestCase):
             )
 
     def test_startup_preflight_fails_when_database_is_missing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with without_db_env(), tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _create_roots(root)
             report = run_startup_preflight(_settings(root))

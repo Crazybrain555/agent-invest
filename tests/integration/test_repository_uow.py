@@ -21,6 +21,10 @@ def _now() -> datetime:
 class RepositoryUnitOfWorkTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = engine_or_skip()
+        # Run-unique strong keys: crash residue must never collide with the
+        # partial unique index on (scheme, normalized_value) or company uscc.
+        self.uscc = f"913206{ids.new_ulid()[-12:].upper()}"
+        self.pid = f"uow{ids.new_ulid()[-10:].lower()}"
 
     def tearDown(self) -> None:
         self.engine.dispose()
@@ -53,7 +57,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                     e.Company(
                         company_id=ids.new_company_id(),
                         legal_name="江海股份",
-                        unified_social_credit_code="9132060013834673X9",
+                        unified_social_credit_code=self.uscc,
                     )
                 )
                 created["company"] = company.company_id
@@ -62,8 +66,8 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                         identifier_id=ids.new_company_identifier_id(),
                         company_id=company.company_id,
                         scheme="uscc",
-                        raw_value="9132060013834673X9",
-                        normalized_value="9132060013834673X9",
+                        raw_value=self.uscc,
+                        normalized_value=self.uscc,
                         jurisdiction="CN",
                         observed_at=_now(),
                     )
@@ -99,12 +103,12 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                         security_id=security.security_id,
                         source_access_id=source_access.source_access_id,
                         provider="cninfo",
-                        provider_document_id="1225087169",
+                        provider_document_id=self.pid,
                         title="2025 年年度报告",
                         filing_type="annual_report",
                         report_period="2025A",
                         raw_file_relpath=(
-                            "raw_documents/cninfo/002484/2025/1225087169/"
+                            f"raw_documents/cninfo/002484/2025/{self.pid}/"
                             "sha256_7c73.pdf"
                         ),
                         raw_file_hash="sha256:7c73103aa3c9",
@@ -126,11 +130,11 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                         parser_language="ch",
                         input_raw_file_hash="sha256:7c73103aa3c9",
                         parser_artifact_relpath=(
-                            "parser_artifacts/cninfo/002484/1225087169/"
+                            f"parser_artifacts/cninfo/002484/{self.pid}/"
                             "run_01K0000000000000000000000"
                         ),
                         normalized_ir_relpath=(
-                            "derived/normalized_ir/cninfo/002484/1225087169/"
+                            f"derived/normalized_ir/cninfo/002484/{self.pid}/"
                             "run_01K0000000000000000000000/normalized_ir.v2.json"
                         ),
                         error={"stage": "parse", "error_code": "noop", "retryable": False},
@@ -181,7 +185,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     uow.company_identifiers.get_by_scheme_value(
-                        "uscc", "9132060013834673X9"
+                        "uscc", self.uscc
                     ).company_id,
                     created["company"],
                 )

@@ -17,6 +17,11 @@ from tests.integration._support import engine_or_skip
 class PublicViewContentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = engine_or_skip()
+        # Dedup-key values are run-unique so crash residue from a killed test
+        # process can never collide with a later run (uq_document_provider_doc_hash).
+        self.pid = f"pvc{ids.new_ulid()[-10:].lower()}"
+        self.hash_a = f"sha256:abc{ids.new_ulid()[-8:].lower()}"
+        self.hash_b = f"sha256:def{ids.new_ulid()[-8:].lower()}"
         self.company_id = ids.new_company_id()
         self.security_id = ids.new_security_id()
         self.security_code = f"T{self.security_id[-6:]}"
@@ -197,12 +202,12 @@ class PublicViewContentTests(unittest.TestCase):
                     security_id=self.security_id,
                     source_access_id=self.source_access_id,
                     provider="cninfo",
-                    provider_document_id="1225087169",
+                    provider_document_id=self.pid,
                     filing_type="annual_report",
                     report_period="2025A",
-                    raw_file_hash="sha256:abc",
+                    raw_file_hash=self.hash_a,
                     raw_file_relpath=(
-                        "raw_documents/cninfo/002484/2025/1225087169/"
+                        f"raw_documents/cninfo/002484/2025/{self.pid}/"
                         "sha256_abcdef.pdf"
                     ),
                 )
@@ -282,7 +287,7 @@ class PublicViewContentTests(unittest.TestCase):
             self.assertEqual(unit_row["asset_kind"], "document_unit")
             self.assertEqual(unit_row["source_tier"], "tier_0a")
             self.assertEqual(unit_row["trace_level"], "G0")
-            self.assertEqual(unit_row["raw_file_hash"], "sha256:abc")
+            self.assertEqual(unit_row["raw_file_hash"], self.hash_a)
             self.assertEqual(unit_row["query_projection_hash"], "sha256:query")
 
             ref_row = conn.execute(
@@ -296,8 +301,8 @@ class PublicViewContentTests(unittest.TestCase):
             self.assertEqual(ref_row["service"], "disclosure_anchor")
             self.assertEqual(ref_row["contract_version"], "source_ref.v1")
             self.assertEqual(ref_row["provider"], "cninfo")
-            self.assertEqual(ref_row["provider_document_id"], "1225087169")
-            self.assertEqual(ref_row["raw_file_hash"], "sha256:abc")
+            self.assertEqual(ref_row["provider_document_id"], self.pid)
+            self.assertEqual(ref_row["raw_file_hash"], self.hash_a)
             self.assertEqual(ref_row["unit_content_hash"], "sha256:unit")
 
             doc_row = conn.execute(
@@ -424,9 +429,9 @@ class PublicViewContentTests(unittest.TestCase):
                     "provider, provider_document_id, filing_type, report_period, "
                     "raw_file_hash, raw_file_relpath, supersedes_document_id) "
                     "VALUES (:document_id, 'registered', :company_id, :security_id, "
-                    ":source_access_id, 'cninfo', '1225087169', 'annual_report', "
-                    "'2025A', 'sha256:def', "
-                    "'raw_documents/cninfo/002484/2025/1225087169/sha256_def.pdf', "
+                    ":source_access_id, 'cninfo', :pid, 'annual_report', "
+                    "'2025A', :hash_b, "
+                    ":raw_relpath, "
                     ":supersedes_document_id)"
                 ),
                 {
@@ -435,6 +440,9 @@ class PublicViewContentTests(unittest.TestCase):
                     "security_id": self.security_id,
                     "source_access_id": self.source_access_id,
                     "supersedes_document_id": self.document_id,
+                    "pid": self.pid,
+                    "hash_b": self.hash_b,
+                    "raw_relpath": f"raw_documents/cninfo/002484/2025/{self.pid}/sha256_def.pdf",
                 },
             )
 

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from disclosure_anchor.domain.errors import ConfigurationError, MissingDependencyError
 from disclosure_anchor.settings import SENTINEL_NAME, Settings
+from tests.unit._env import without_db_env
 
 
 def _settings(root: Path) -> Settings:
@@ -41,7 +42,7 @@ class AppStartupTests(unittest.TestCase):
             self.assertEqual(app.title, "disclosure_anchor")
 
     def test_create_app_fails_closed_without_database_url(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with without_db_env(), tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _create_roots(root)
             with self.assertRaises(ConfigurationError) as caught:
