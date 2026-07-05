@@ -107,6 +107,7 @@ def list_document_units(
     document_id: str,
     request: Request,
     processing_run_id: str | None = None,
+    reject_superseded: bool = False,
     payload_kind: str | None = None,
     semantic_key: str | None = None,
     quality_status: str | None = None,
@@ -118,8 +119,8 @@ def list_document_units(
     document = _select_one_document(engine=engine, document_id=document_id)
     if document is None:
         raise_not_found()
-    if document["superseded_by_document_id"] is not None and _bool_query_param(
-        request, "reject_superseded"
+    if document["superseded_by_document_id"] is not None and (
+        reject_superseded or _bool_query_param(request, "reject_superseded")
     ):
         gone_superseded(str(document["superseded_by_document_id"]))
     active_run_id = document["current_processing_run_id"]

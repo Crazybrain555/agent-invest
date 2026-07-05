@@ -43,15 +43,59 @@ class MinerUGate:
     sample_pdf: Path
 
 
-def require_mineru_and_sample() -> MinerUGate:
+@dataclass(frozen=True)
+class AdminSample:
+    label: str
+    company_legal_name: str
+    security_code: str
+    exchange: str
+    filing_type: str
+    title: str
+    announcement_date: date
+    report_period: str | None = None
+
+
+ADMIN_SAMPLES = (
+    AdminSample(
+        label="annual_report",
+        company_legal_name="南通江海电容器股份有限公司",
+        security_code="002484",
+        exchange="szse",
+        filing_type="annual_report",
+        title="江海股份：2025年年度报告",
+        announcement_date=date(2026, 4, 10),
+        report_period="2025A",
+    ),
+    AdminSample(
+        label="ir_activity",
+        company_legal_name="美的集团股份有限公司",
+        security_code="000333",
+        exchange="szse",
+        filing_type="investor_relations",
+        title="美的集团：2025年4月11日投资者关系活动记录表",
+        announcement_date=date(2025, 4, 11),
+    ),
+    AdminSample(
+        label="short_announcement",
+        company_legal_name="南通江海电容器股份有限公司",
+        security_code="002484",
+        exchange="szse",
+        filing_type="other",
+        title="江海股份：关于股票交易异常波动的公告",
+        announcement_date=date(2026, 6, 18),
+    ),
+)
+
+
+def require_mineru_and_sample(sample: AdminSample) -> MinerUGate:
     engine = engine_or_skip()
     mineru = _mineru_bin_or_skip()
-    sample_pdf = _short_announcement_pdf_or_skip()
+    sample_pdf = _sample_pdf_or_skip(sample.label)
     return MinerUGate(engine=engine, mineru=mineru, sample_pdf=sample_pdf)
 
 
-def _short_announcement_pdf_or_skip() -> Path:
-    ref = Path("tests/fixtures/phase00/short_announcement/parser_artifacts_ref.txt")
+def _sample_pdf_or_skip(label: str) -> Path:
+    ref = Path("tests/fixtures/phase00") / label / "parser_artifacts_ref.txt"
     try:
         lines = ref.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
@@ -767,10 +811,9 @@ class FilingApiRuntimeTests(unittest.TestCase):
 
 class FilingApiAdminFullChainTests(unittest.TestCase):
     def setUp(self) -> None:
-        gate = require_mineru_and_sample()
+        gate = require_mineru_and_sample(ADMIN_SAMPLES[0])
         self.engine = gate.engine
         self.mineru = gate.mineru
-        self.sample_pdf = gate.sample_pdf
         self.tmpdir = tempfile.TemporaryDirectory(prefix="m06-api-admin-")
         self.settings = _settings(Path(self.tmpdir.name), mineru=self.mineru)
         self.app = _create_test_app(self.settings, self.engine)
@@ -782,8 +825,14 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
         self.engine.dispose()
         self.tmpdir.cleanup()
 
-    def test_admin_short_announcement_chain_is_http_readable(self) -> None:
-        provider_document_id = self.sample_pdf.stem
+    def test_admin_three_sample_chain_is_http_readable(self) -> None:
+        for sample in ADMIN_SAMPLES:
+            with self.subTest(sample=sample.label):
+                sample_pdf = _sample_pdf_or_skip(sample.label)
+                self._run_admin_sample(sample=sample, sample_pdf=sample_pdf)
+
+    def _run_admin_sample(self, *, sample: AdminSample, sample_pdf: Path) -> None:
+        provider_document_id = sample_pdf.stem
         self._assert_provider_document_id_available(provider_document_id)
 
         registered = _api_request(
@@ -791,15 +840,16 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
             "POST",
             "/v1/admin/documents/register-local-pdf",
             json_body={
-                "file_path": str(self.sample_pdf),
-                "company_legal_name": "南通江海电容器股份有限公司",
-                "security_code": "002484",
-                "exchange": "szse",
-                "filing_type": "other",
-                "title": "江海股份：关于股票交易异常波动的公告",
-                "announcement_date": "2026-06-18",
+                "file_path": str(sample_pdf),
+                "company_legal_name": sample.company_legal_name,
+                "security_code": sample.security_code,
+                "exchange": sample.exchange,
+                "filing_type": sample.filing_type,
+                "title": sample.title,
+                "announcement_date": sample.announcement_date.isoformat(),
                 "provider_document_id": provider_document_id,
                 "provider": "cninfo",
+                **({"report_period": sample.report_period} if sample.report_period else {}),
             },
         )
         self.assertEqual(registered.status_code, 200, registered.body)
@@ -846,11 +896,12 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
             self.app,
             "GET",
             f"/v1/documents/{document_id}/units",
-            query={"limit": 1},
+            query={"limit": 1000},
         )
         self.assertEqual(units.status_code, 200, units.body)
         units_payload = units.json()
-        self.assertEqual(len(units_payload["items"]), 1)
+        self.assertGreater(len(units_payload["items"]), 0)
+        self._assert_sample_units(sample=sample, units=units_payload["items"])
         asset_id = units_payload["items"][0]["asset_id"]
 
         source_ref = _api_request(
@@ -887,6 +938,41 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
         ):
             _assert_no_leaks(self, self.settings, payload)
 
+    def _assert_sample_units(
+        self, *, sample: AdminSample, units: list[dict[str, Any]]
+    ) -> None:
+        if sample.label == "annual_report":
+            self.assertTrue(
+                any(
+                    unit["payload_kind"] == "text"
+                    and "管理层讨论与分析" in " ".join(unit["heading_path"])
+                    and unit["payload"].get("text")
+                    for unit in units
+                )
+            )
+            receivable_tables = [
+                unit
+                for unit in units
+                if unit["payload_kind"] == "table"
+                and unit["semantic_key"] == "receivable_aging"
+            ]
+            self.assertTrue(receivable_tables)
+            self.assertTrue(
+                any(unit["payload"].get("headers") for unit in receivable_tables)
+            )
+            self.assertTrue(any(unit["payload"].get("rows") for unit in receivable_tables))
+            self.assertTrue(any(unit["payload"].get("unit") for unit in receivable_tables))
+        elif sample.label == "ir_activity":
+            qa_units = [unit for unit in units if unit["payload_kind"] == "qa"]
+            self.assertGreaterEqual(len(qa_units), 30)
+            self.assertTrue(
+                any(
+                    "美国加征关税" in unit["payload"].get("question", "")
+                    and "美国收入占比很低" in unit["payload"].get("answer", "")
+                    for unit in qa_units
+                )
+            )
+
     def _assert_provider_document_id_available(self, provider_document_id: str) -> None:
         with self.engine.connect() as conn:
             existing = conn.execute(
@@ -898,7 +984,7 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
             ).scalar_one_or_none()
         self.assertIsNone(
             existing,
-            "short_announcement fixed provider_document_id already exists",
+            "fixed provider_document_id already exists",
         )
 
     def _seq_before_document_changes(self, document_id: str) -> int:

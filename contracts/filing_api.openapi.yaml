@@ -1,4 +1,14 @@
 components:
+  parameters:
+    XContractVersion:
+      description: Supported contract version. Omit to use v1.
+      in: header
+      name: X-Contract-Version
+      required: false
+      schema:
+        enum:
+        - v1
+        type: string
   schemas:
     BuildUnitsResponse:
       additionalProperties: false
@@ -436,14 +446,27 @@ components:
       - provider_metadata
       title: DocumentV1
       type: object
-    HTTPValidationError:
+    ErrorEnvelope:
+      additionalProperties: false
       properties:
         detail:
-          items:
-            $ref: '#/components/schemas/ValidationError'
-          title: Detail
-          type: array
-      title: HTTPValidationError
+          additionalProperties: true
+          type: object
+        error_code:
+          enum:
+          - NOT_FOUND
+          - GONE_SUPERSEDED
+          - L1_PROCESSING_REQUIRED
+          - CONTRACT_VERSION_MISMATCH
+          - VALIDATION_ERROR
+          type: string
+        message:
+          type: string
+      required:
+      - error_code
+      - message
+      - detail
+      title: ErrorEnvelope
       type: object
     HealthResponse:
       properties:
@@ -983,32 +1006,6 @@ components:
       - next_cursor
       title: UnitListResponse
       type: object
-    ValidationError:
-      properties:
-        ctx:
-          title: Context
-          type: object
-        input:
-          title: Input
-        loc:
-          items:
-            anyOf:
-            - type: string
-            - type: integer
-          title: Location
-          type: array
-        msg:
-          title: Message
-          type: string
-        type:
-          title: Error Type
-          type: string
-      required:
-      - loc
-      - msg
-      - type
-      title: ValidationError
-      type: object
 info:
   title: disclosure_anchor
   version: 0.1.0
@@ -1017,6 +1014,9 @@ paths:
   /v1/admin/documents/register-local-pdf:
     post:
       operationId: register_local_pdf_v1_admin_documents_register_local_pdf_post
+      parameters:
+      - &id002
+        $ref: '#/components/parameters/XContractVersion'
       requestBody:
         content:
           application/json:
@@ -1030,12 +1030,17 @@ paths:
               schema:
                 $ref: '#/components/schemas/RegisterLocalPdfResponse'
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: &id001
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Contract version mismatch
         '422':
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-          description: Validation Error
+              schema: *id001
+          description: Validation error
       summary: Register Local Pdf
   /v1/admin/documents/{document_id}/build-units:
     post:
@@ -1047,6 +1052,7 @@ paths:
         schema:
           title: Document Id
           type: string
+      - *id002
       responses:
         '200':
           content:
@@ -1054,12 +1060,21 @@ paths:
               schema:
                 $ref: '#/components/schemas/BuildUnitsResponse'
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '404':
+          content:
+            application/json:
+              schema: *id001
+          description: Not found
         '422':
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-          description: Validation Error
+              schema: *id001
+          description: Validation error
       summary: Build Document Units
   /v1/admin/documents/{document_id}/parse:
     post:
@@ -1071,6 +1086,7 @@ paths:
         schema:
           title: Document Id
           type: string
+      - *id002
       requestBody:
         content:
           application/json:
@@ -1084,12 +1100,21 @@ paths:
               schema:
                 $ref: '#/components/schemas/ParseDocumentResponse'
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '404':
+          content:
+            application/json:
+              schema: *id001
+          description: Not found
         '422':
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-          description: Validation Error
+              schema: *id001
+          description: Validation error
       summary: Parse Document
   /v1/admin/runs/{processing_run_id}/publish:
     post:
@@ -1101,6 +1126,7 @@ paths:
         schema:
           title: Processing Run Id
           type: string
+      - *id002
       requestBody:
         content:
           application/json:
@@ -1114,12 +1140,21 @@ paths:
               schema:
                 $ref: '#/components/schemas/PublishRunResponse'
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '404':
+          content:
+            application/json:
+              schema: *id001
+          description: Not found
         '422':
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-          description: Validation Error
+              schema: *id001
+          description: Validation error
       summary: Publish Run
   /v1/changes:
     get:
@@ -1148,6 +1183,7 @@ paths:
           default: 100
           title: Limit
           type: integer
+      - *id002
       responses:
         '200':
           content:
@@ -1155,12 +1191,16 @@ paths:
               schema:
                 $ref: '#/components/schemas/ChangeListResponse'
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
         '422':
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-          description: Validation Error
+              schema: *id001
+          description: Validation error
       summary: List Changes
   /v1/documents:
     get:
@@ -1239,6 +1279,7 @@ paths:
           default: 100
           title: Limit
           type: integer
+      - *id002
       responses:
         '200':
           content:
@@ -1246,12 +1287,16 @@ paths:
               schema:
                 $ref: '#/components/schemas/DocumentListResponse'
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
         '422':
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-          description: Validation Error
+              schema: *id001
+          description: Validation error
       summary: List Documents
   /v1/documents/{document_id}:
     get:
@@ -1263,6 +1308,14 @@ paths:
         schema:
           title: Document Id
           type: string
+      - in: query
+        name: reject_superseded
+        required: false
+        schema:
+          default: false
+          title: Reject Superseded
+          type: boolean
+      - *id002
       responses:
         '200':
           content:
@@ -1270,12 +1323,26 @@ paths:
               schema:
                 $ref: '#/components/schemas/DocumentV1'
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '404':
+          content:
+            application/json:
+              schema: *id001
+          description: Not found
+        '410':
+          content:
+            application/json:
+              schema: *id001
+          description: Gone superseded
         '422':
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-          description: Validation Error
+              schema: *id001
+          description: Validation error
       summary: Get Document
   /v1/documents/{document_id}/runs:
     get:
@@ -1287,6 +1354,7 @@ paths:
         schema:
           title: Document Id
           type: string
+      - *id002
       responses:
         '200':
           content:
@@ -1298,12 +1366,21 @@ paths:
                   Get
                 type: array
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '404':
+          content:
+            application/json:
+              schema: *id001
+          description: Not found
         '422':
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-          description: Validation Error
+              schema: *id001
+          description: Validation error
       summary: List Document Runs
   /v1/documents/{document_id}/units:
     get:
@@ -1323,6 +1400,13 @@ paths:
           - type: string
           - type: 'null'
           title: Processing Run Id
+      - in: query
+        name: reject_superseded
+        required: false
+        schema:
+          default: false
+          title: Reject Superseded
+          type: boolean
       - in: query
         name: payload_kind
         required: false
@@ -1372,6 +1456,7 @@ paths:
           default: 100
           title: Limit
           type: integer
+      - *id002
       responses:
         '200':
           content:
@@ -1379,12 +1464,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/UnitListResponse'
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '404':
+          content:
+            application/json:
+              schema: *id001
+          description: Not found
+        '409':
+          content:
+            application/json:
+              schema: *id001
+          description: L1 processing required
+        '410':
+          content:
+            application/json:
+              schema: *id001
+          description: Gone superseded
         '422':
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-          description: Validation Error
+              schema: *id001
+          description: Validation error
       summary: List Document Units
   /v1/filings/latest:
     get:
@@ -1463,6 +1567,7 @@ paths:
           default: 100
           title: Limit
           type: integer
+      - *id002
       responses:
         '200':
           content:
@@ -1470,16 +1575,22 @@ paths:
               schema:
                 $ref: '#/components/schemas/DocumentListResponse'
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
         '422':
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-          description: Validation Error
+              schema: *id001
+          description: Validation error
       summary: Latest Filings
   /v1/health:
     get:
       operationId: get_health_v1_health_get
+      parameters:
+      - *id002
       responses:
         '200':
           content:
@@ -1487,6 +1598,16 @@ paths:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '422':
+          content:
+            application/json:
+              schema: *id001
+          description: Validation error
       summary: Get Health
   /v1/units/{asset_id}:
     get:
@@ -1498,6 +1619,7 @@ paths:
         schema:
           title: Asset Id
           type: string
+      - *id002
       responses:
         '200':
           content:
@@ -1505,12 +1627,21 @@ paths:
               schema:
                 $ref: '#/components/schemas/DocumentUnitV1'
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '404':
+          content:
+            application/json:
+              schema: *id001
+          description: Not found
         '422':
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-          description: Validation Error
+              schema: *id001
+          description: Validation error
       summary: Get Unit
   /v1/units/{asset_id}/context:
     get:
@@ -1530,6 +1661,7 @@ paths:
           - type: integer
           - type: 'null'
           title: Max Chars
+      - *id002
       responses:
         '200':
           content:
@@ -1537,12 +1669,21 @@ paths:
               schema:
                 $ref: '#/components/schemas/UnitContextResponse'
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '404':
+          content:
+            application/json:
+              schema: *id001
+          description: Not found
         '422':
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-          description: Validation Error
+              schema: *id001
+          description: Validation error
       summary: Get Unit Context
   /v1/units/{asset_id}/source-ref:
     get:
@@ -1554,6 +1695,7 @@ paths:
         schema:
           title: Asset Id
           type: string
+      - *id002
       responses:
         '200':
           content:
@@ -1561,10 +1703,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/SourceRefV1'
           description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '404':
+          content:
+            application/json:
+              schema: *id001
+          description: Not found
         '422':
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-          description: Validation Error
+              schema: *id001
+          description: Validation error
       summary: Get Unit Source Ref

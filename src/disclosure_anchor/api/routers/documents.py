@@ -113,14 +113,15 @@ def list_documents(
     return _document_list_response(rows=rows, limit=limit)
 
 
-def get_document(document_id: str, request: Request) -> DocumentV1:
+def get_document(
+    document_id: str, request: Request, reject_superseded: bool = False
+) -> DocumentV1:
     engine = reader_engine_from_request(request)
     row = _select_one_document(engine=engine, document_id=document_id)
     if row is None:
         raise_not_found()
     if row["superseded_by_document_id"] is not None:
-        reject_superseded = _bool_query_param(request, "reject_superseded")
-        if reject_superseded:
+        if reject_superseded or _bool_query_param(request, "reject_superseded"):
             gone_superseded(str(row["superseded_by_document_id"]))
     return DocumentV1.model_validate(row)
 
