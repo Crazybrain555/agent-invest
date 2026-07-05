@@ -16,13 +16,9 @@ When files disagree, prefer current filesystem truth and runnable commands over 
 6. `.env.template` / `.env.example` for disclosure_anchor service environment placeholders only.
 7. `CLAUDE.md` for Claude Code-specific behavior only; do not treat it as Codex policy unless the user asks.
 
-`docs/agent/archive/` holds dated snapshots of rotated durable files. It is history/evidence for on-demand
-reading, not active policy or state; never treat it as the current plan.
+`docs/agent/archive/` holds dated snapshots of rotated durable files. It is history/evidence for on-demand reading, not active policy or state; never treat it as the current plan.
 
-`docs/agent/` (including `archive/` and future `notes/`) is gitignored, machine-local working memory (user
-decision 2026-07-03): it does not travel with clones, PRs, or reviews. Policy that must survive a fresh
-checkout belongs in tracked `AGENTS.md` / `CLAUDE.md`; if durable files are missing, rebuild them from
-repository truth instead of assuming prior state.
+`docs/agent/` (including `archive/` and future `notes/`) is gitignored, machine-local working memory (user decision 2026-07-03): it does not travel with clones, PRs, or reviews. Policy that must survive a fresh checkout belongs in tracked `AGENTS.md` / `CLAUDE.md`; if durable files are missing, rebuild them from repository truth instead of assuming prior state.
 
 Do not rely on deleted historical docs such as `docs/skills/*`, old skill runners, or `company_research_runtime/*`.
 
@@ -119,11 +115,7 @@ never part of the default resume set.
 
 ## 3. Repository reality
 
-Per-directory code maps: key source directories (`src/disclosure_anchor` and its
-domain/application/adapters subtrees, `tests/`) each carry an `AGENTS.md` directory map
-(layer duties, hard rules, authority-doc pointers); the sibling `CLAUDE.md` is a symlink to it.
-Nearest file wins. Keep them norms+pointers only and update them when a directory's
-structure or hard rules change.
+Per-directory code maps: key source directories (`src/disclosure_anchor` and its domain/application/adapters subtrees, `tests/`) each carry an `AGENTS.md` directory map (layer duties, hard rules, authority-doc pointers); the sibling `CLAUDE.md` is a symlink to it. Nearest file wins. Keep them norms+pointers only and update them when a directory's structure or hard rules change.
 
 Retained areas:
 

@@ -875,7 +875,7 @@ order_index
 `asset://` URI（顶层协议 §2.3）只在序列化边界派生，不落存储：
 
 - 形式：`asset://disclosure_anchor/v1/document_unit/{asset_id}`；
-- Filing API 响应以派生字段 `asset_uri` 返回（随 Phase006 落地）；MCP 包装时以该 URI 作为
+- Filing API 响应以派生字段 `asset_uri` 返回（Phase006 落地）；MCP 包装时以该 URI 作为
   resource key（`resources/read` 按 URI 取回，协议 §3.11）；
 - 数据库表与 `*_v1` 视图不存储 URI：它是 (service, kind, asset_id) 的纯投影，存储即冗余，且会随
   scheme / 契约版本演进漂移（业界先例：Kubernetes 因同样原因弃用并移除了 `metadata.selfLink`）。
@@ -884,14 +884,14 @@ order_index
 
 `disclosure_ops.outbox_event` 是本服务的写侧 outbox，字段已收敛为 `event_kind`（曾用名 `event_type`）。
 
-对外 `change_events_v1` / 未来 `GET /v1/changes?after_seq=...` 使用顶层协议口径：
+对外 `change_events_v1` / `GET /v1/changes?after_seq=...` 使用顶层协议口径：
 
 - `event_kind` 是对外事件名，与 outbox 列同名，无需映射；
 - `change_kind` 只有 `observed` / `materialized` 两类；
 - 未显式声明 `change_kind` 的历史事件默认是 `materialized`；
 - `observed` 表示巡检或来源观察到了对象但没有产生可消费内容变化；
 - `materialized` 表示 public read model 可见内容发生变化，才允许触发下游失效 / 重算；
-- `GET /v1/changes` 是 Phase005+ 的 Filing API 目标契约；当前阶段先保证 outbox 与 public view 语义。
+- `GET /v1/changes` 是 Phase006 Filing API 契约，按 `seq > after_seq` 或 cursor 增量读取。
 
 ## 12.3 对外错误模型
 
@@ -902,9 +902,10 @@ L1_PROCESSING_REQUIRED      请求对象仅有 raw 登记、尚未完成载体�
 NOT_FOUND                   对象不存在
 CONTRACT_VERSION_MISMATCH   请求契约版本与服务暴露版本不一致
 GONE_SUPERSEDED             对象已被新版本取代，响应携带 superseded_by 指引
+VALIDATION_ERROR            参数、过滤值或游标校验失败
 ```
 
-错误响应不含内部堆栈与绝对路径。随 Phase006 Filing API 落地。
+错误响应不含内部堆栈与绝对路径。Phase006 Filing API 已落地该 envelope。
 
 ---
 
@@ -1033,7 +1034,7 @@ L2 收到一个 unit 后负责：
 1. `document_units_v1` 保留 unit 级 scope keys，方便 L2 / MCP / API 检索；
 2. 术语已收敛：`document_unit_id → asset_id`、`unit_kind → payload_kind`、outbox
    `event_type → event_kind`；`processing_run` 保留为 `action_log` 的 L1 特化；
-3. change feed 以 `change_events_v1` / 未来 `GET /v1/changes` 暴露，区分 observed / materialized。
+3. change feed 以 `change_events_v1` / `GET /v1/changes` 暴露，区分 observed / materialized。
 
 披露侧 `G0` 采用：
 
