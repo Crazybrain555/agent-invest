@@ -234,6 +234,15 @@ class DocumentRepository:
         row = self._session.get(models.Document, document_id)
         return mappers.document_to_entity(row) if row is not None else None
 
+    def get_for_update(self, document_id: str) -> Optional[e.Document]:
+        row = (
+            self._session.query(models.Document)
+            .filter(models.Document.document_id == document_id)
+            .with_for_update()
+            .one_or_none()
+        )
+        return mappers.document_to_entity(row) if row is not None else None
+
     def update(self, document: e.Document) -> e.Document:
         row = self._session.get(models.Document, document.document_id)
         if row is None:

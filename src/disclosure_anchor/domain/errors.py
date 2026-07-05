@@ -77,3 +77,11 @@ class BuildUnitsError(DisclosureAnchorError):
     def __init__(self, error: dict) -> None:
         self.error = error
         super().__init__(str(error))
+
+
+class PublishRunError(DisclosureAnchorError):
+    """Raised when active-run publication fails under the current contract."""
+
+    def __init__(self, error: dict) -> None:
+        self.error = error
+        super().__init__(str(error))

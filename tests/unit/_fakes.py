@@ -130,6 +130,9 @@ class DocumentRepo(_Repo[e.Document]):
         ]
         return matches[-1] if matches else None
 
+    def get_for_update(self, document_id: str) -> e.Document | None:
+        return self.get(document_id)
+
 
 class ProcessingRunRepo(_Repo[e.ProcessingRun]):
     def _key(self, item: e.ProcessingRun) -> str:
