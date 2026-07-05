@@ -399,6 +399,14 @@ phase00 fixtures 的 payload 内层是 v1 历史形态（{format,page_no,text} �
   payload 增加可选键 `applicability: applicable|not_applicable`。"不适用"=该节声明豁免，
   是信息不是噪音，保留原文并结构化供 L2 过滤（江海年报实测 38 applicable + 97 not_applicable）。
 
+### ub-2026.07-3（2026-07-06 切分审计追加）
+
+第三方审计（真实江海年报 908 units）发现 21% 的 text 单元是独立成行的"单位：元/股"声明——
+该信息 S5 已从元素流提取进表格 payload.unit，text 单元属纯冗余。新规则：S3 输出时丢弃
+**整体恰为**单位声明的 text 单元（`^单位[：:]\S{1,8}$`，与正文合并出现则保留），
+计数入 build_stats.dropped_unit_declarations。实测 908→712；"无/不适用/□是 否"类
+声明照旧保留（有信息量）。
+
 ## 9. 明确不做
 
 - 不抽取 claim；不做 table_cell / page-bbox 核心索引；不做 LLM 语义价值判断；

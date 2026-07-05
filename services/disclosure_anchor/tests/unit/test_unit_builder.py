@@ -24,7 +24,7 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-2")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-3")
         self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v1")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
@@ -527,6 +527,59 @@ class UnitBuilderTests(unittest.TestCase):
 
         self.assertEqual(len(units), 1)
         self.assertEqual(stats.dropped_cover_prelude, 0)
+
+    def test_standalone_unit_declaration_is_dropped_and_counted(self) -> None:
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "第二节 主要财务指标",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "单位：元",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 3,
+                        "table": {"headers": ["项目"], "rows": [["营业收入"]]},
+                    },
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        kinds = [unit.payload_kind for unit in units]
+        self.assertEqual(kinds, ["table"])
+        self.assertEqual(stats.dropped_unit_declarations, 1)
+        # The declaration still reaches the table payload via the element stream.
+        self.assertEqual(units[0].payload["unit"], "元")
+
+    def test_unit_declaration_merged_with_content_is_kept(self) -> None:
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": "单位：元\n下表列示了主要科目变动。",
+                    },
+                ]
+            },
+            filing_type="other",
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertIn("单位：元", units[0].payload["text"])
+        self.assertEqual(stats.dropped_unit_declarations, 0)
 
     def test_applicability_marker_becomes_payload_flag(self) -> None:
         units, _ = build_unit_drafts_s1_s7(

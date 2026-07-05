@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-2"
+RULES_VERSION = "ub-2026.07-3"
 HEADING_RULESET_ID = "cn_a_v1"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -24,6 +24,13 @@ APPLICABLE_MARK_RE = re.compile(
 NOT_APPLICABLE_MARK_RE = re.compile(
     rf"[{_UNCHECKED}]\s*适\s*用\s*[{_CHECKED}]\s*不\s*适\s*用\s*[。.]?\s*$"
 )
+
+
+# Standalone table-unit declarations ("单位：元" on its own line). S5 already
+# extracts the value into table payload `unit` from the element stream, so a
+# text unit carrying only this line is pure duplication (audited: 194 of 908
+# units in a real annual report).
+UNIT_DECLARATION_RE = re.compile(r"^\s*单\s*位\s*[：:]\s*\S{1,8}\s*$")
 
 
 def detect_applicability(text: str) -> str | None:

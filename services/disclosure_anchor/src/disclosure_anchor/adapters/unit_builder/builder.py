@@ -56,6 +56,7 @@ class BuildStats:
     dropped_unknown_by_raw_kind: Counter[str] = field(default_factory=Counter)
     skipped_sections: list[str] = field(default_factory=list)
     dropped_cover_prelude: int = 0
+    dropped_unit_declarations: int = 0
     merged_tables: int = 0
     needs_review_count: int = 0
     unusable_count: int = 0
@@ -67,6 +68,7 @@ class BuildStats:
             "dropped_unknown_by_raw_kind": dict(self.dropped_unknown_by_raw_kind),
             "skipped_sections": list(self.skipped_sections),
             "dropped_cover_prelude": self.dropped_cover_prelude,
+            "dropped_unit_declarations": self.dropped_unit_declarations,
             "merged_tables": self.merged_tables,
             "needs_review_count": self.needs_review_count,
             "unusable_count": self.unusable_count,
@@ -231,7 +233,9 @@ def s2_apply_heading_tree(
     return placed
 
 
-def s3_build_text_units(elements: Iterable[PreparedElement]) -> list[UnitDraft]:
+def s3_build_text_units(
+    elements: Iterable[PreparedElement], *, stats: BuildStats | None = None
+) -> list[UnitDraft]:
     units: list[UnitDraft] = []
     buffer: list[PreparedElement] = []
 
@@ -239,6 +243,12 @@ def s3_build_text_units(elements: Iterable[PreparedElement]) -> list[UnitDraft]:
         if not buffer:
             return
         text = "\n".join(item.text or "" for item in buffer if item.text).strip()
+        if text and rules.UNIT_DECLARATION_RE.fullmatch(text):
+            # The value already lives in the following table's payload.unit.
+            if stats is not None:
+                stats.dropped_unit_declarations += 1
+            buffer.clear()
+            return
         if text:
             quality = "needs_review" if any(item.quality_status == "needs_review" for item in buffer) else "ok"
             units.extend(_split_numbered_text_block(buffer[0], text, quality_status=quality))
@@ -466,7 +476,9 @@ def build_unit_drafts_s1_s7(
         elements,
         qa_heading_mode=filing_type in {"investor_relations", "performance_briefing"},
     )
-    text_units = replace_text_units_with_qa_where_stable(s3_build_text_units(placed))
+    text_units = replace_text_units_with_qa_where_stable(
+        s3_build_text_units(placed, stats=s1.stats)
+    )
     table_units = s5_build_table_units(placed, s1.stats)
     table_qa_units = _qa_units_from_tables(table_units)
     units = sorted([*text_units, *table_units, *table_qa_units], key=_unit_sort_key)
