@@ -91,15 +91,47 @@ class SourceAccessRepo(_Repo[e.SourceAccess]):
     def _key(self, item: e.SourceAccess) -> str:
         return item.source_access_id
 
+    def list_candidate_snapshots(
+        self, *, provider: str, provider_interface: str, company_id: str
+    ) -> list[dict[str, object]]:
+        snapshots: list[dict[str, object]] = []
+        for item in self.items.values():
+            if (
+                item.provider == provider
+                and item.provider_interface == provider_interface
+                and item.company_id == company_id
+                and item.status == "ok"
+                and isinstance(item.result_snapshot, dict)
+                and isinstance(item.result_snapshot.get("candidates"), list)
+            ):
+                snapshots.append(item.result_snapshot)
+        return snapshots
+
 
 class SourceCheckpointRepo(_Repo[e.SourceCheckpoint]):
     def _key(self, item: e.SourceCheckpoint) -> str:
         return item.source_checkpoint_id
 
+    def get_by_scope(self, provider: str, scope_key: str) -> e.SourceCheckpoint | None:
+        return next(
+            (
+                item
+                for item in self.items.values()
+                if item.provider == provider and item.scope_key == scope_key
+            ),
+            None,
+        )
+
 
 class TrackedCompanyRepo(_Repo[e.TrackedCompany]):
     def _key(self, item: e.TrackedCompany) -> str:
         return item.tracked_company_id
+
+    def get_by_company_id(self, company_id: str) -> e.TrackedCompany | None:
+        return next(
+            (item for item in self.items.values() if item.company_id == company_id),
+            None,
+        )
 
 
 class DocumentRepo(_Repo[e.Document]):

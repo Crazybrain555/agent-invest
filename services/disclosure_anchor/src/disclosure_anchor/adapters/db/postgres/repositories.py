@@ -180,6 +180,31 @@ class TrackedCompanyRepository:
         row = self._session.get(models.TrackedCompany, tracked_company_id)
         return mappers.tracked_company_to_entity(row) if row is not None else None
 
+    def get_by_company_id(self, company_id: str) -> Optional[e.TrackedCompany]:
+        row = (
+            self._session.query(models.TrackedCompany)
+            .filter(models.TrackedCompany.company_id == company_id)
+            .one_or_none()
+        )
+        return mappers.tracked_company_to_entity(row) if row is not None else None
+
+    def update(self, tracked_company: e.TrackedCompany) -> e.TrackedCompany:
+        row = self._session.get(models.TrackedCompany, tracked_company.tracked_company_id)
+        if row is None:
+            raise KeyError(f"tracked company not found: {tracked_company.tracked_company_id}")
+        updated = mappers.tracked_company_to_model(tracked_company)
+        for column in (
+            "company_id",
+            "security_id",
+            "status",
+            "lookback",
+            "filing_categories",
+            "sync_frequency",
+        ):
+            setattr(row, column, getattr(updated, column))
+        self._session.flush()
+        return mappers.tracked_company_to_entity(row)
+
 
 class SourceAccessRepository:
     def __init__(self, session: Session) -> None:
@@ -195,6 +220,27 @@ class SourceAccessRepository:
         row = self._session.get(models.SourceAccess, source_access_id)
         return mappers.source_access_to_entity(row) if row is not None else None
 
+    def list_candidate_snapshots(
+        self, *, provider: str, provider_interface: str, company_id: str
+    ) -> list[dict[str, object]]:
+        rows = (
+            self._session.query(models.SourceAccess)
+            .filter(
+                models.SourceAccess.provider == provider,
+                models.SourceAccess.provider_interface == provider_interface,
+                models.SourceAccess.company_id == company_id,
+                models.SourceAccess.status == "ok",
+            )
+            .order_by(models.SourceAccess.accessed_at.asc())
+            .all()
+        )
+        snapshots: list[dict[str, object]] = []
+        for row in rows:
+            snapshot = row.result_snapshot
+            if isinstance(snapshot, dict) and isinstance(snapshot.get("candidates"), list):
+                snapshots.append(snapshot)
+        return snapshots
+
 
 class SourceCheckpointRepository:
     def __init__(self, session: Session) -> None:
@@ -209,6 +255,28 @@ class SourceCheckpointRepository:
     def get(self, source_checkpoint_id: str) -> Optional[e.SourceCheckpoint]:
         row = self._session.get(models.SourceCheckpoint, source_checkpoint_id)
         return mappers.source_checkpoint_to_entity(row) if row is not None else None
+
+    def get_by_scope(self, provider: str, scope_key: str) -> Optional[e.SourceCheckpoint]:
+        row = (
+            self._session.query(models.SourceCheckpoint)
+            .filter(
+                models.SourceCheckpoint.provider == provider,
+                models.SourceCheckpoint.scope_key == scope_key,
+            )
+            .one_or_none()
+        )
+        return mappers.source_checkpoint_to_entity(row) if row is not None else None
+
+    def update(self, checkpoint: e.SourceCheckpoint) -> e.SourceCheckpoint:
+        row = self._session.get(models.SourceCheckpoint, checkpoint.source_checkpoint_id)
+        if row is None:
+            raise KeyError(f"source checkpoint not found: {checkpoint.source_checkpoint_id}")
+        updated = mappers.source_checkpoint_to_model(checkpoint)
+        row.provider = updated.provider
+        row.scope_key = updated.scope_key
+        row.cursor = updated.cursor
+        self._session.flush()
+        return mappers.source_checkpoint_to_entity(row)
 
 
 class DocumentRepository:
