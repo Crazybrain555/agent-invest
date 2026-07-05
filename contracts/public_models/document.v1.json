@@ -1,0 +1,235 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "announcement_date": {
+      "anyOf": [
+        {
+          "format": "date",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Announcement Date"
+    },
+    "company_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Company Ref"
+    },
+    "contract_version": {
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "correction_of_document_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Correction Of Document Id"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "current_processing_run_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Current Processing Run Id"
+    },
+    "document_id": {
+      "title": "Document Id",
+      "type": "string"
+    },
+    "exchange": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Exchange"
+    },
+    "filing_type": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Filing Type"
+    },
+    "provider": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Provider"
+    },
+    "provider_document_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Provider Document Id"
+    },
+    "provider_metadata": {
+      "additionalProperties": true,
+      "title": "Provider Metadata",
+      "type": "object"
+    },
+    "raw_file_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Raw File Hash"
+    },
+    "report_period": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Report Period"
+    },
+    "security_code": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Security Code"
+    },
+    "security_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Security Ref"
+    },
+    "source_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Source Ref"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "superseded_by_document_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Superseded By Document Id"
+    },
+    "supersedes_document_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Supersedes Document Id"
+    },
+    "title": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Title"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "document_id",
+    "provider",
+    "provider_document_id",
+    "security_code",
+    "exchange",
+    "filing_type",
+    "title",
+    "announcement_date",
+    "report_period",
+    "raw_file_hash",
+    "status",
+    "current_processing_run_id",
+    "created_at",
+    "updated_at",
+    "contract_version",
+    "company_ref",
+    "security_ref",
+    "source_ref",
+    "supersedes_document_id",
+    "correction_of_document_id",
+    "superseded_by_document_id",
+    "provider_metadata"
+  ],
+  "title": "DocumentV1",
+  "type": "object"
+}

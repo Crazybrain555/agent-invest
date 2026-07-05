@@ -1,0 +1,292 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "announcement_date": {
+      "anyOf": [
+        {
+          "format": "date",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Announcement Date"
+    },
+    "artifact_locator": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Artifact Locator"
+    },
+    "asset_id": {
+      "title": "Asset Id",
+      "type": "string"
+    },
+    "asset_kind": {
+      "title": "Asset Kind",
+      "type": "string"
+    },
+    "asset_uri": {
+      "title": "Asset Uri",
+      "type": "string"
+    },
+    "company_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Company Ref"
+    },
+    "content_hash": {
+      "title": "Content Hash",
+      "type": "string"
+    },
+    "contract_version": {
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "document_id": {
+      "title": "Document Id",
+      "type": "string"
+    },
+    "exchange": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Exchange"
+    },
+    "filing_type": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Filing Type"
+    },
+    "heading_path": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Heading Path",
+      "type": "array"
+    },
+    "is_active_run": {
+      "title": "Is Active Run",
+      "type": "boolean"
+    },
+    "observed_at": {
+      "format": "date-time",
+      "title": "Observed At",
+      "type": "string"
+    },
+    "order_index": {
+      "title": "Order Index",
+      "type": "integer"
+    },
+    "parent_ref": {
+      "title": "Parent Ref",
+      "type": "string"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "title": "Payload",
+      "type": "object"
+    },
+    "payload_kind": {
+      "title": "Payload Kind",
+      "type": "string"
+    },
+    "processing_run_id": {
+      "title": "Processing Run Id",
+      "type": "string"
+    },
+    "producer_action_ref": {
+      "title": "Producer Action Ref",
+      "type": "string"
+    },
+    "provider_document_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Provider Document Id"
+    },
+    "quality_status": {
+      "title": "Quality Status",
+      "type": "string"
+    },
+    "query_projection_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Query Projection Hash"
+    },
+    "raw_file_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Raw File Hash"
+    },
+    "report_period": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Report Period"
+    },
+    "security_code": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Security Code"
+    },
+    "security_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Security Ref"
+    },
+    "semantic_key": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Semantic Key"
+    },
+    "source_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Source Ref"
+    },
+    "source_tier": {
+      "title": "Source Tier",
+      "type": "string"
+    },
+    "structure_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Structure Hash"
+    },
+    "title": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Title"
+    },
+    "trace_level": {
+      "title": "Trace Level",
+      "type": "string"
+    }
+  },
+  "required": [
+    "asset_id",
+    "document_id",
+    "processing_run_id",
+    "provider_document_id",
+    "payload_kind",
+    "heading_path",
+    "title",
+    "order_index",
+    "semantic_key",
+    "payload",
+    "content_hash",
+    "structure_hash",
+    "quality_status",
+    "artifact_locator",
+    "created_at",
+    "contract_version",
+    "company_ref",
+    "security_ref",
+    "security_code",
+    "exchange",
+    "filing_type",
+    "report_period",
+    "announcement_date",
+    "producer_action_ref",
+    "source_ref",
+    "parent_ref",
+    "asset_kind",
+    "observed_at",
+    "source_tier",
+    "trace_level",
+    "raw_file_hash",
+    "query_projection_hash",
+    "asset_uri",
+    "is_active_run"
+  ],
+  "title": "DocumentUnitV1",
+  "type": "object"
+}

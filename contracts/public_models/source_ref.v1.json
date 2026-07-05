@@ -1,0 +1,130 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "artifact_locator": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Artifact Locator"
+    },
+    "asset_id": {
+      "title": "Asset Id",
+      "type": "string"
+    },
+    "contract_version": {
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "document_id": {
+      "title": "Document Id",
+      "type": "string"
+    },
+    "heading_path": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Heading Path",
+      "type": "array"
+    },
+    "payload_kind": {
+      "title": "Payload Kind",
+      "type": "string"
+    },
+    "processing_run_id": {
+      "title": "Processing Run Id",
+      "type": "string"
+    },
+    "provider": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Provider"
+    },
+    "provider_document_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Provider Document Id"
+    },
+    "quality_status": {
+      "title": "Quality Status",
+      "type": "string"
+    },
+    "raw_file_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Raw File Hash"
+    },
+    "service": {
+      "title": "Service",
+      "type": "string"
+    },
+    "source_access_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Source Access Id"
+    },
+    "title": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Title"
+    },
+    "unit_content_hash": {
+      "title": "Unit Content Hash",
+      "type": "string"
+    }
+  },
+  "required": [
+    "service",
+    "contract_version",
+    "asset_id",
+    "source_access_id",
+    "document_id",
+    "provider",
+    "provider_document_id",
+    "raw_file_hash",
+    "processing_run_id",
+    "payload_kind",
+    "heading_path",
+    "title",
+    "unit_content_hash",
+    "quality_status",
+    "artifact_locator"
+  ],
+  "title": "SourceRefV1",
+  "type": "object"
+}

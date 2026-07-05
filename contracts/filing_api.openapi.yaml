@@ -1,0 +1,1570 @@
+components:
+  schemas:
+    BuildUnitsResponse:
+      additionalProperties: false
+      properties:
+        processing_run_id:
+          title: Processing Run Id
+          type: string
+        unit_build_status:
+          title: Unit Build Status
+          type: string
+        unit_count:
+          title: Unit Count
+          type: integer
+      required:
+      - processing_run_id
+      - unit_build_status
+      - unit_count
+      title: BuildUnitsResponse
+      type: object
+    ChangeEventV1:
+      additionalProperties: false
+      properties:
+        asset_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Asset Id
+        change_kind:
+          title: Change Kind
+          type: string
+        contract_version:
+          title: Contract Version
+          type: string
+        created_at:
+          format: date-time
+          title: Created At
+          type: string
+        document_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Document Id
+        event_id:
+          title: Event Id
+          type: string
+        event_kind:
+          title: Event Kind
+          type: string
+        occurred_at:
+          format: date-time
+          title: Occurred At
+          type: string
+        payload:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Payload
+        processing_run_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Processing Run Id
+        seq:
+          title: Seq
+          type: integer
+        source:
+          title: Source
+          type: string
+        subject_kind:
+          title: Subject Kind
+          type: string
+        subject_ref:
+          title: Subject Ref
+          type: string
+      required:
+      - seq
+      - event_id
+      - event_kind
+      - document_id
+      - processing_run_id
+      - asset_id
+      - payload
+      - occurred_at
+      - change_kind
+      - subject_kind
+      - subject_ref
+      - source
+      - contract_version
+      - created_at
+      title: ChangeEventV1
+      type: object
+    ChangeListResponse:
+      additionalProperties: false
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ChangeEventV1'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      required:
+      - items
+      - next_cursor
+      title: ChangeListResponse
+      type: object
+    DocumentListResponse:
+      additionalProperties: false
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/DocumentV1'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+      required:
+      - items
+      - next_cursor
+      title: DocumentListResponse
+      type: object
+    DocumentUnitV1:
+      additionalProperties: false
+      properties:
+        announcement_date:
+          anyOf:
+          - format: date
+            type: string
+          - type: 'null'
+          title: Announcement Date
+        artifact_locator:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Artifact Locator
+        asset_id:
+          title: Asset Id
+          type: string
+        asset_kind:
+          title: Asset Kind
+          type: string
+        asset_uri:
+          title: Asset Uri
+          type: string
+        company_ref:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Company Ref
+        content_hash:
+          title: Content Hash
+          type: string
+        contract_version:
+          title: Contract Version
+          type: string
+        created_at:
+          format: date-time
+          title: Created At
+          type: string
+        document_id:
+          title: Document Id
+          type: string
+        exchange:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Exchange
+        filing_type:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Filing Type
+        heading_path:
+          items:
+            type: string
+          title: Heading Path
+          type: array
+        is_active_run:
+          title: Is Active Run
+          type: boolean
+        observed_at:
+          format: date-time
+          title: Observed At
+          type: string
+        order_index:
+          title: Order Index
+          type: integer
+        parent_ref:
+          title: Parent Ref
+          type: string
+        payload:
+          additionalProperties: true
+          title: Payload
+          type: object
+        payload_kind:
+          title: Payload Kind
+          type: string
+        processing_run_id:
+          title: Processing Run Id
+          type: string
+        producer_action_ref:
+          title: Producer Action Ref
+          type: string
+        provider_document_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Provider Document Id
+        quality_status:
+          title: Quality Status
+          type: string
+        query_projection_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Query Projection Hash
+        raw_file_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Raw File Hash
+        report_period:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Report Period
+        security_code:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Security Code
+        security_ref:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Security Ref
+        semantic_key:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Semantic Key
+        source_ref:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source Ref
+        source_tier:
+          title: Source Tier
+          type: string
+        structure_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Structure Hash
+        title:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Title
+        trace_level:
+          title: Trace Level
+          type: string
+      required:
+      - asset_id
+      - document_id
+      - processing_run_id
+      - provider_document_id
+      - payload_kind
+      - heading_path
+      - title
+      - order_index
+      - semantic_key
+      - payload
+      - content_hash
+      - structure_hash
+      - quality_status
+      - artifact_locator
+      - created_at
+      - contract_version
+      - company_ref
+      - security_ref
+      - security_code
+      - exchange
+      - filing_type
+      - report_period
+      - announcement_date
+      - producer_action_ref
+      - source_ref
+      - parent_ref
+      - asset_kind
+      - observed_at
+      - source_tier
+      - trace_level
+      - raw_file_hash
+      - query_projection_hash
+      - asset_uri
+      - is_active_run
+      title: DocumentUnitV1
+      type: object
+    DocumentV1:
+      additionalProperties: false
+      properties:
+        announcement_date:
+          anyOf:
+          - format: date
+            type: string
+          - type: 'null'
+          title: Announcement Date
+        company_ref:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Company Ref
+        contract_version:
+          title: Contract Version
+          type: string
+        correction_of_document_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Correction Of Document Id
+        created_at:
+          format: date-time
+          title: Created At
+          type: string
+        current_processing_run_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Current Processing Run Id
+        document_id:
+          title: Document Id
+          type: string
+        exchange:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Exchange
+        filing_type:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Filing Type
+        provider:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Provider
+        provider_document_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Provider Document Id
+        provider_metadata:
+          additionalProperties: true
+          title: Provider Metadata
+          type: object
+        raw_file_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Raw File Hash
+        report_period:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Report Period
+        security_code:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Security Code
+        security_ref:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Security Ref
+        source_ref:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source Ref
+        status:
+          title: Status
+          type: string
+        superseded_by_document_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Superseded By Document Id
+        supersedes_document_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Supersedes Document Id
+        title:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Title
+        updated_at:
+          format: date-time
+          title: Updated At
+          type: string
+      required:
+      - document_id
+      - provider
+      - provider_document_id
+      - security_code
+      - exchange
+      - filing_type
+      - title
+      - announcement_date
+      - report_period
+      - raw_file_hash
+      - status
+      - current_processing_run_id
+      - created_at
+      - updated_at
+      - contract_version
+      - company_ref
+      - security_ref
+      - source_ref
+      - supersedes_document_id
+      - correction_of_document_id
+      - superseded_by_document_id
+      - provider_metadata
+      title: DocumentV1
+      type: object
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          title: Detail
+          type: array
+      title: HTTPValidationError
+      type: object
+    HealthResponse:
+      properties:
+        data_root_mounted:
+          title: Data Root Mounted
+          type: boolean
+        migration_head:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Migration Head
+        service:
+          title: Service
+          type: string
+        status:
+          enum:
+          - ok
+          - degraded
+          title: Status
+          type: string
+        version:
+          title: Version
+          type: string
+      required:
+      - status
+      - service
+      - version
+      - migration_head
+      - data_root_mounted
+      title: HealthResponse
+      type: object
+    ParseDocumentResponse:
+      additionalProperties: false
+      properties:
+        artifact_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Artifact Hash
+        error:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Error
+        normalized_ir_relpath:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Normalized Ir Relpath
+        parser_artifact_relpath:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parser Artifact Relpath
+        processing_run_id:
+          title: Processing Run Id
+          type: string
+        status:
+          title: Status
+          type: string
+      required:
+      - processing_run_id
+      - status
+      title: ParseDocumentResponse
+      type: object
+    ParserOptionsRequest:
+      additionalProperties: false
+      properties:
+        backend:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Backend
+        end_page:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: End Page
+        formula:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Formula
+        language:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Language
+        method:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Method
+        start_page:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Start Page
+        table:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Table
+        timeout_seconds:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Timeout Seconds
+      title: ParserOptionsRequest
+      type: object
+    ProcessingRunV1:
+      additionalProperties: false
+      properties:
+        artifact_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Artifact Hash
+        builder_rules_version:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Builder Rules Version
+        content_hash_aggregate:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Content Hash Aggregate
+        created_at:
+          format: date-time
+          title: Created At
+          type: string
+        document_id:
+          title: Document Id
+          type: string
+        finished_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Finished At
+        input_raw_file_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Input Raw File Hash
+        is_active:
+          title: Is Active
+          type: boolean
+        parser_backend:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parser Backend
+        parser_language:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parser Language
+        parser_method:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parser Method
+        parser_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parser Name
+        parser_version:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parser Version
+        processing_run_id:
+          title: Processing Run Id
+          type: string
+        run_kind:
+          title: Run Kind
+          type: string
+        started_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Started At
+        status:
+          title: Status
+          type: string
+        structure_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Structure Hash
+        unit_build_attempt_count:
+          title: Unit Build Attempt Count
+          type: integer
+        unit_build_status:
+          title: Unit Build Status
+          type: string
+        unit_built_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Unit Built At
+      required:
+      - processing_run_id
+      - document_id
+      - run_kind
+      - status
+      - parser_name
+      - parser_version
+      - artifact_hash
+      - content_hash_aggregate
+      - structure_hash
+      - is_active
+      - started_at
+      - finished_at
+      - created_at
+      - parser_backend
+      - input_raw_file_hash
+      - parser_method
+      - parser_language
+      - unit_build_status
+      - unit_build_attempt_count
+      - unit_built_at
+      - builder_rules_version
+      title: ProcessingRunV1
+      type: object
+    PublishRunRequest:
+      additionalProperties: false
+      properties:
+        allow_empty:
+          default: false
+          title: Allow Empty
+          type: boolean
+        reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Reason
+      title: PublishRunRequest
+      type: object
+    PublishRunResponse:
+      additionalProperties: false
+      properties:
+        document_id:
+          title: Document Id
+          type: string
+        is_active:
+          title: Is Active
+          type: boolean
+        processing_run_id:
+          title: Processing Run Id
+          type: string
+      required:
+      - document_id
+      - processing_run_id
+      - is_active
+      title: PublishRunResponse
+      type: object
+    RegisterLocalPdfRequest:
+      additionalProperties: false
+      properties:
+        announcement_date:
+          format: date
+          title: Announcement Date
+          type: string
+        board:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Board
+        company_credit_code:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Company Credit Code
+        company_legal_name:
+          title: Company Legal Name
+          type: string
+        exchange:
+          title: Exchange
+          type: string
+        expected_raw_file_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Expected Raw File Hash
+        file_path:
+          format: path
+          title: File Path
+          type: string
+        filing_type:
+          title: Filing Type
+          type: string
+        provider:
+          title: Provider
+          type: string
+        provider_document_id:
+          title: Provider Document Id
+          type: string
+        report_period:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Report Period
+        security_code:
+          title: Security Code
+          type: string
+        title:
+          title: Title
+          type: string
+      required:
+      - file_path
+      - company_legal_name
+      - security_code
+      - exchange
+      - filing_type
+      - title
+      - announcement_date
+      - provider_document_id
+      - provider
+      title: RegisterLocalPdfRequest
+      type: object
+    RegisterLocalPdfResponse:
+      additionalProperties: false
+      properties:
+        document_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Document Id
+        outbox_event_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Outbox Event Id
+        quarantine_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Quarantine Reason
+        quarantined_path:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Quarantined Path
+        raw_file_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Raw File Hash
+        raw_file_relpath:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Raw File Relpath
+        reused_existing_document:
+          default: false
+          title: Reused Existing Document
+          type: boolean
+        source_access_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source Access Id
+      required:
+      - document_id
+      - raw_file_relpath
+      - raw_file_hash
+      - source_access_id
+      - outbox_event_id
+      title: RegisterLocalPdfResponse
+      type: object
+    SourceRefV1:
+      additionalProperties: false
+      properties:
+        artifact_locator:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Artifact Locator
+        asset_id:
+          title: Asset Id
+          type: string
+        contract_version:
+          title: Contract Version
+          type: string
+        document_id:
+          title: Document Id
+          type: string
+        heading_path:
+          items:
+            type: string
+          title: Heading Path
+          type: array
+        payload_kind:
+          title: Payload Kind
+          type: string
+        processing_run_id:
+          title: Processing Run Id
+          type: string
+        provider:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Provider
+        provider_document_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Provider Document Id
+        quality_status:
+          title: Quality Status
+          type: string
+        raw_file_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Raw File Hash
+        service:
+          title: Service
+          type: string
+        source_access_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source Access Id
+        title:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Title
+        unit_content_hash:
+          title: Unit Content Hash
+          type: string
+      required:
+      - service
+      - contract_version
+      - asset_id
+      - source_access_id
+      - document_id
+      - provider
+      - provider_document_id
+      - raw_file_hash
+      - processing_run_id
+      - payload_kind
+      - heading_path
+      - title
+      - unit_content_hash
+      - quality_status
+      - artifact_locator
+      title: SourceRefV1
+      type: object
+    UnitContextResponse:
+      additionalProperties: false
+      properties:
+        asset_id:
+          title: Asset Id
+          type: string
+        asset_uri:
+          title: Asset Uri
+          type: string
+        document:
+          $ref: '#/components/schemas/DocumentV1'
+        end:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: End
+        excerpt:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Excerpt
+        excerpt_hash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Excerpt Hash
+        heading_path:
+          items:
+            type: string
+          title: Heading Path
+          type: array
+        is_active_run:
+          title: Is Active Run
+          type: boolean
+        payload:
+          additionalProperties: true
+          title: Payload
+          type: object
+        start:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Start
+        title:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Title
+      required:
+      - asset_id
+      - asset_uri
+      - is_active_run
+      - document
+      - heading_path
+      - title
+      - payload
+      title: UnitContextResponse
+      type: object
+    UnitListResponse:
+      additionalProperties: false
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/DocumentUnitV1'
+          title: Items
+          type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+        warning:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Warning
+      required:
+      - items
+      - next_cursor
+      title: UnitListResponse
+      type: object
+    ValidationError:
+      properties:
+        ctx:
+          title: Context
+          type: object
+        input:
+          title: Input
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          title: Location
+          type: array
+        msg:
+          title: Message
+          type: string
+        type:
+          title: Error Type
+          type: string
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+      type: object
+info:
+  title: disclosure_anchor
+  version: 0.1.0
+openapi: 3.1.0
+paths:
+  /v1/admin/documents/register-local-pdf:
+    post:
+      operationId: register_local_pdf_v1_admin_documents_register_local_pdf_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterLocalPdfRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterLocalPdfResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Register Local Pdf
+  /v1/admin/documents/{document_id}/build-units:
+    post:
+      operationId: build_document_units_v1_admin_documents__document_id__build_units_post
+      parameters:
+      - in: path
+        name: document_id
+        required: true
+        schema:
+          title: Document Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BuildUnitsResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Build Document Units
+  /v1/admin/documents/{document_id}/parse:
+    post:
+      operationId: parse_document_v1_admin_documents__document_id__parse_post
+      parameters:
+      - in: path
+        name: document_id
+        required: true
+        schema:
+          title: Document Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ParserOptionsRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParseDocumentResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Parse Document
+  /v1/admin/runs/{processing_run_id}/publish:
+    post:
+      operationId: publish_run_v1_admin_runs__processing_run_id__publish_post
+      parameters:
+      - in: path
+        name: processing_run_id
+        required: true
+        schema:
+          title: Processing Run Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishRunRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublishRunResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Publish Run
+  /v1/changes:
+    get:
+      operationId: list_changes_v1_changes_get
+      parameters:
+      - in: query
+        name: after_seq
+        required: false
+        schema:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: After Seq
+      - in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: List Changes
+  /v1/documents:
+    get:
+      operationId: list_documents_v1_documents_get
+      parameters:
+      - in: query
+        name: company_ref
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Company Ref
+      - in: query
+        name: security_code
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Security Code
+      - in: query
+        name: filing_type
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Filing Type
+      - in: query
+        name: report_period
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Report Period
+      - in: query
+        name: announcement_date_from
+        required: false
+        schema:
+          anyOf:
+          - format: date
+            type: string
+          - type: 'null'
+          title: Announcement Date From
+      - in: query
+        name: announcement_date_to
+        required: false
+        schema:
+          anyOf:
+          - format: date
+            type: string
+          - type: 'null'
+          title: Announcement Date To
+      - in: query
+        name: status
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Status
+      - in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: List Documents
+  /v1/documents/{document_id}:
+    get:
+      operationId: get_document_v1_documents__document_id__get
+      parameters:
+      - in: path
+        name: document_id
+        required: true
+        schema:
+          title: Document Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentV1'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get Document
+  /v1/documents/{document_id}/runs:
+    get:
+      operationId: list_document_runs_v1_documents__document_id__runs_get
+      parameters:
+      - in: path
+        name: document_id
+        required: true
+        schema:
+          title: Document Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/ProcessingRunV1'
+                title: Response List Document Runs V1 Documents  Document Id  Runs
+                  Get
+                type: array
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: List Document Runs
+  /v1/documents/{document_id}/units:
+    get:
+      operationId: list_document_units_v1_documents__document_id__units_get
+      parameters:
+      - in: path
+        name: document_id
+        required: true
+        schema:
+          title: Document Id
+          type: string
+      - in: query
+        name: processing_run_id
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Processing Run Id
+      - in: query
+        name: payload_kind
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Payload Kind
+      - in: query
+        name: semantic_key
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Semantic Key
+      - in: query
+        name: quality_status
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Quality Status
+      - in: query
+        name: heading_prefix
+        required: false
+        schema:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Heading Prefix
+      - in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnitListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: List Document Units
+  /v1/filings/latest:
+    get:
+      operationId: latest_filings_v1_filings_latest_get
+      parameters:
+      - in: query
+        name: company_ref
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Company Ref
+      - in: query
+        name: security_code
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Security Code
+      - in: query
+        name: filing_type
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Filing Type
+      - in: query
+        name: report_period
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Report Period
+      - in: query
+        name: announcement_date_from
+        required: false
+        schema:
+          anyOf:
+          - format: date
+            type: string
+          - type: 'null'
+          title: Announcement Date From
+      - in: query
+        name: announcement_date_to
+        required: false
+        schema:
+          anyOf:
+          - format: date
+            type: string
+          - type: 'null'
+          title: Announcement Date To
+      - in: query
+        name: status
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Status
+      - in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentListResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Latest Filings
+  /v1/health:
+    get:
+      operationId: get_health_v1_health_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+          description: Successful Response
+      summary: Get Health
+  /v1/units/{asset_id}:
+    get:
+      operationId: get_unit_v1_units__asset_id__get
+      parameters:
+      - in: path
+        name: asset_id
+        required: true
+        schema:
+          title: Asset Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentUnitV1'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get Unit
+  /v1/units/{asset_id}/context:
+    get:
+      operationId: get_unit_context_v1_units__asset_id__context_get
+      parameters:
+      - in: path
+        name: asset_id
+        required: true
+        schema:
+          title: Asset Id
+          type: string
+      - in: query
+        name: max_chars
+        required: false
+        schema:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Max Chars
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnitContextResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get Unit Context
+  /v1/units/{asset_id}/source-ref:
+    get:
+      operationId: get_unit_source_ref_v1_units__asset_id__source_ref_get
+      parameters:
+      - in: path
+        name: asset_id
+        required: true
+        schema:
+          title: Asset Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourceRefV1'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get Unit Source Ref

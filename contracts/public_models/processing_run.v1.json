@@ -1,0 +1,209 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "artifact_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Artifact Hash"
+    },
+    "builder_rules_version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Builder Rules Version"
+    },
+    "content_hash_aggregate": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Content Hash Aggregate"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "document_id": {
+      "title": "Document Id",
+      "type": "string"
+    },
+    "finished_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Finished At"
+    },
+    "input_raw_file_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Input Raw File Hash"
+    },
+    "is_active": {
+      "title": "Is Active",
+      "type": "boolean"
+    },
+    "parser_backend": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Parser Backend"
+    },
+    "parser_language": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Parser Language"
+    },
+    "parser_method": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Parser Method"
+    },
+    "parser_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Parser Name"
+    },
+    "parser_version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Parser Version"
+    },
+    "processing_run_id": {
+      "title": "Processing Run Id",
+      "type": "string"
+    },
+    "run_kind": {
+      "title": "Run Kind",
+      "type": "string"
+    },
+    "started_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Started At"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "structure_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Structure Hash"
+    },
+    "unit_build_attempt_count": {
+      "title": "Unit Build Attempt Count",
+      "type": "integer"
+    },
+    "unit_build_status": {
+      "title": "Unit Build Status",
+      "type": "string"
+    },
+    "unit_built_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Unit Built At"
+    }
+  },
+  "required": [
+    "processing_run_id",
+    "document_id",
+    "run_kind",
+    "status",
+    "parser_name",
+    "parser_version",
+    "artifact_hash",
+    "content_hash_aggregate",
+    "structure_hash",
+    "is_active",
+    "started_at",
+    "finished_at",
+    "created_at",
+    "parser_backend",
+    "input_raw_file_hash",
+    "parser_method",
+    "parser_language",
+    "unit_build_status",
+    "unit_build_attempt_count",
+    "unit_built_at",
+    "builder_rules_version"
+  ],
+  "title": "ProcessingRunV1",
+  "type": "object"
+}
