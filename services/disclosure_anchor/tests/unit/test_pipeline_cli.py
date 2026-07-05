@@ -22,6 +22,7 @@ class PipelineCliTests(unittest.TestCase):
             "build-units": ["build-units", "--document-id", "doc_1"],
             "publish": ["publish", "--processing-run-id", "run_1"],
             "process": ["process", "--document-id", "doc_1"],
+            "sync": ["sync", "--company", "000001", "--window", "7"],
         }
         for command, argv in cases.items():
             with self.subTest(command=command):
@@ -167,6 +168,33 @@ class PipelineCliTests(unittest.TestCase):
         self.assertEqual(payload["status"], "failed")
         self.assertEqual(payload["result"]["error"]["error_code"], "DB_WRITE_FAILED")
 
+    def test_sync_command_prints_json_result(self) -> None:
+        deps = _deps_type(sync_result={"company": "000001", "download_count": 0})
+
+        code, stdout, stderr = _run_main(["sync", "--company", "000001", "--window", "7"], deps)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(payload["company"], "000001")
+
+    def test_sync_command_missing_checkpoint_returns_exit_2(self) -> None:
+        deps = _deps_type(sync_result=ValueError("first sync requires explicit --window"))
+
+        code, stdout, stderr = _run_main(["sync", "--company", "000001"], deps)
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("first sync requires explicit --window", stderr)
+
+    def test_makefile_sync_target_has_required_usage(self) -> None:
+        makefile = Path("Makefile").read_text(encoding="utf-8")
+
+        self.assertIn(".PHONY:", makefile)
+        self.assertIn("sync", makefile)
+        self.assertIn("usage: make sync COMPANY=<scode> [WINDOW=N]", makefile)
+        self.assertIn("disclosure_anchor.cli.pipeline sync --company $(COMPANY)", makefile)
+
 
 class _UseCase:
     def __init__(self, result: object) -> None:
@@ -183,6 +211,7 @@ def _deps_type(
     parse_result: object | None = None,
     build_result: object | None = None,
     publish_result: object | None = None,
+    sync_result: object | None = None,
 ):
     class _FakeDeps:
         def __init__(self, settings) -> None:  # noqa: ANN001
@@ -196,6 +225,11 @@ def _deps_type(
 
         def publish(self) -> _UseCase:
             return _UseCase(publish_result)
+
+        def sync(self, args):  # noqa: ANN001
+            if isinstance(sync_result, Exception):
+                raise sync_result
+            return sync_result
 
     return _FakeDeps
 

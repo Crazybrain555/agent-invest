@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
 import re
 import sys
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
@@ -22,12 +24,17 @@ from disclosure_anchor.adapters.db.postgres.connection import (
 from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
 from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
+from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
 from disclosure_anchor.application.use_cases.build_units import (
     BuildUnits,
     BuildUnitsCommand,
+)
+from disclosure_anchor.application.use_cases.download_document import (
+    DownloadDocument,
+    DownloadDocumentCommand,
 )
 from disclosure_anchor.application.use_cases.parse_document import (
     ParseDocument,
@@ -37,9 +44,14 @@ from disclosure_anchor.application.use_cases.publish_run import (
     PublishRun,
     PublishRunCommand,
 )
+from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.use_cases.register_local_pdf import (
     RegisterLocalPdf,
     RegisterLocalPdfCommand,
+)
+from disclosure_anchor.application.use_cases.sync_disclosure_index import (
+    SyncDisclosureIndex,
+    SyncDisclosureIndexCommand,
 )
 from disclosure_anchor.domain.errors import BuildUnitsError, ConfigurationError, PublishRunError
 from disclosure_anchor.domain.value_objects import ReportPeriod
@@ -77,6 +89,10 @@ def _parser() -> argparse.ArgumentParser:
     process.add_argument("--document-id", required=True)
     process.add_argument("--allow-empty", action="store_true")
     process.add_argument("--reason")
+
+    sync = subparsers.add_parser("sync")
+    sync.add_argument("--company", required=True)
+    sync.add_argument("--window", type=int)
     return parser
 
 
@@ -139,6 +155,8 @@ def main(argv: list[str] | None = None) -> int:
                 "build_units": _jsonable(build_result),
                 "publish": _jsonable(publish_result),
             }
+        elif args.command == "sync":
+            result = deps.sync(args)
         else:
             raise AssertionError(f"unhandled command: {args.command}")
     except (BuildUnitsError, PublishRunError) as exc:
@@ -188,11 +206,112 @@ class _Deps:
     def publish(self) -> PublishRun:
         return PublishRun(uow_factory=self.uow_factory)
 
+    def sync(self, args: argparse.Namespace) -> dict[str, object]:
+        company = args.company
+        exchange = _exchange_for_scode(company)
+        today = datetime_today_shanghai()
+        window_start, window_end = _sync_window(
+            uow_factory=self.uow_factory,
+            company=company,
+            exchange=exchange,
+            explicit_window_days=args.window,
+            today=today,
+            overlap_days=self.settings.cninfo_overlap_days,
+        )
+        client = CninfoClient.from_settings(self.settings)
+        source = CninfoSource(client)
+        try:
+            sync_use_case = SyncDisclosureIndex(
+                source=source,
+                profile_loader=source.profile_for_security,
+                uow_factory=self.uow_factory,
+            )
+            sync_result = sync_use_case.execute(
+                SyncDisclosureIndexCommand(
+                    security_code=company,
+                    exchange=exchange,
+                    window_start=window_start,
+                    window_end=window_end,
+                    category_names_by_code=source.category_names_by_code(),
+                )
+            )
+            downloader = DownloadDocument(
+                source=source,
+                raw_store=RawDocumentStore(self.paths),
+                path_builder=self.paths,
+                uow_factory=self.uow_factory,
+            )
+            pending = [
+                candidate
+                for candidate in downloader.list_pending_candidates(
+                    max_retries=self.settings.cninfo_max_retries,
+                    overlap_start=today - timedelta(days=self.settings.cninfo_overlap_days),
+                )
+                if candidate.get("security_code") == company
+            ]
+            downloads = [
+                downloader.execute(
+                    DownloadDocumentCommand(
+                        candidate=candidate,
+                        oversized_kb=self.settings.cninfo_oversized_kb,
+                    )
+                )
+                for candidate in pending
+            ]
+        finally:
+            client.close()
+        return {
+            "company": company,
+            "window": {
+                "start": window_start.isoformat(),
+                "end": window_end.isoformat(),
+            },
+            "sync": _jsonable(sync_result),
+            "download_count": len(downloads),
+            "downloads": _jsonable(downloads),
+        }
+
 
 def _database_url(settings: Settings) -> str:
     if settings.database_url is not None:
         return app_database_url(settings)
     return migration_database_url(settings)
+
+
+def datetime_today_shanghai() -> date:
+    return datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+
+def _sync_window(
+    *,
+    uow_factory: Callable[[], UnitOfWork],
+    company: str,
+    exchange: str,
+    explicit_window_days: int | None,
+    today: date,
+    overlap_days: int,
+) -> tuple[date, date]:
+    if explicit_window_days is not None:
+        if explicit_window_days < 0:
+            raise ValueError("--window must be non-negative")
+        return today - timedelta(days=explicit_window_days), today
+    with uow_factory() as uow:
+        security = uow.securities.get_by_code_exchange(company, exchange)
+        if security is None:
+            raise ValueError("first sync requires explicit --window")
+        checkpoint = uow.source_checkpoints.get_by_scope(
+            "cninfo", f"{security.company_id}:p_info3015"
+        )
+        if checkpoint is None or not checkpoint.cursor:
+            raise ValueError("first sync requires explicit --window")
+        window_end = checkpoint.cursor.get("window_end")
+        if not isinstance(window_end, str):
+            raise ValueError("checkpoint cursor missing window_end")
+        return date.fromisoformat(window_end) - timedelta(days=overlap_days), today
+
+
+def _exchange_for_scode(scode: str) -> str:
+    return "SSE" if scode.startswith("6") else "SZSE"
 
 
 def _register_command(args: argparse.Namespace) -> RegisterLocalPdfCommand:

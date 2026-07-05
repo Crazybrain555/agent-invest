@@ -20,6 +20,7 @@ from disclosure_anchor.adapters.sources.cninfo.mapper import (
     map_p_stock2100_record,
     split_category_segments,
 )
+from disclosure_anchor.adapters.sources.cninfo.source import CninfoSource
 
 __all__ = [
     "CNINFO_PROVIDER",
@@ -28,6 +29,7 @@ __all__ = [
     "CninfoCompanyProfile",
     "CninfoMappingError",
     "CninfoResponse",
+    "CninfoSource",
     "FilingTypeRuleBundle",
     "RequestAudit",
     "TokenBucket",
