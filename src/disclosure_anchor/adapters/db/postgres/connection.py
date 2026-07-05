@@ -63,8 +63,8 @@ def create_db_engine(
         safe_role = '"' + set_role.replace('"', '""') + '"'
 
         @event.listens_for(engine, "connect")
-        def _apply_set_role(dbapi_connection, _connection_record):  # noqa: ANN001
-            cursor = dbapi_connection.cursor()
+        def _apply_set_role(dbapi_connection: object, _connection_record: object) -> None:
+            cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
             try:
                 cursor.execute(f"SET ROLE {safe_role}")
             finally:

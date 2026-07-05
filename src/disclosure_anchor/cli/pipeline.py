@@ -85,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings = load_settings()
         deps = _Deps(settings)
+        result: Any
         if args.command == "register":
             result = deps.register().execute(_register_command(args))
         elif args.command == "parse":
@@ -237,7 +238,7 @@ def _print_failed_stage(stage: str, result: Any) -> None:
 
 
 def _jsonable(value: Any) -> Any:
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return _jsonable(asdict(value))
     if isinstance(value, dict):
         return {key: _jsonable(item) for key, item in value.items()}

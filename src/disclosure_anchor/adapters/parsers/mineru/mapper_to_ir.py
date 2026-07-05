@@ -123,7 +123,7 @@ class _TableParser(HTMLParser):
             self._current_row = None
 
     def _finish_cell(self) -> None:
-        if self._cell_attrs is None:
+        if self._cell_attrs is None or self._current_row is None:
             return
         rowspan, colspan, is_header = self._cell_attrs
         self._current_row.append(
@@ -190,6 +190,7 @@ def _table_grid(source_rows: list[list[_TableCell]]) -> dict[str, Any]:
                     max_row = max(max_row, target[0])
                     max_col = max(max_col, target[1])
             col_index += cell.colspan
+    table: dict[str, Any]
     if max_row < 0 or max_col < 0:
         table = {"headers": [], "rows": []}
     else:

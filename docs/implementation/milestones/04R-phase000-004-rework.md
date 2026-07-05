@@ -509,6 +509,9 @@ make test
 # 3) git diff --check   # 输出必须为空
 ```
 
+2026-07-05 起（06 及以后 milestone 适用）：提交门禁第 1 步改用 `make agent-check`
+（= ruff lint + mypy 严格类型 + no-DB make test + git diff --check 一条命令；
+lint/typecheck 必须零违例——存量已清零，新改动不得引入）；live-DB make test 仍单独跑。
 追加规则：R1 完成后加跑 §6.2；R5 完成后加跑 §6.4 + `make test-contract`；
 R7 期间可用 `make test-unit` / `make test-contract` / `make test-integration` 单层快循环，
 但提交门禁只认上面 1)–3)。live-DB 连接失败先 `make pg-status`，

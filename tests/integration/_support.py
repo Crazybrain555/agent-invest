@@ -18,8 +18,6 @@ try:
     from disclosure_anchor.adapters.db.postgres.connection import create_db_engine
     from disclosure_anchor.adapters.db.postgres.schema import (
         CORE_SCHEMA,
-        OPS_SCHEMA,
-        PUBLIC_SCHEMA,
     )
 
     _IMPORT_ERROR: Optional[Exception] = None

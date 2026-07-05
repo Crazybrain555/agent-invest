@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from pathlib import Path
 from typing import Protocol
 
@@ -140,7 +142,7 @@ class ArtifactStorePort(Protocol):
         ...
 
     def write_jsonl_atomic(
-        self, *, relpath: Path, rows: list[object]
+        self, *, relpath: Path, rows: Sequence[object]
     ) -> ArtifactWriteResult:
         ...
 

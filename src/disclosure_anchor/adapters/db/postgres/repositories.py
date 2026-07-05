@@ -16,7 +16,6 @@ from disclosure_anchor.adapters.db.postgres import mappers, models
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.errors import (
     DocumentIdentityConflictError,
-    SubjectIdentityConflictError,
     SubjectIdentityRaceError,
 )
 

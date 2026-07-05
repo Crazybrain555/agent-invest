@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from disclosure_anchor.application.ports.file_store import (
     ArtifactStorePort,
@@ -42,6 +42,13 @@ class ParseDocumentResult:
     normalized_ir_relpath: str | None = None
     artifact_hash: str | None = None
     error: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _ArtifactRelpaths:
+    artifact_root: Path
+    content_list: Path
+    markdown: Path | None
 
 
 @dataclass(frozen=True)
@@ -102,9 +109,9 @@ class ParseDocument:
             )
             normalized_ir = dict(parser_result.normalized_ir)
             normalized_ir["parser_artifacts"] = artifact_relpath_map(
-                artifact_root_relpath=artifact_relpaths["artifact_root"],
-                content_list_relpath=artifact_relpaths["content_list"],
-                markdown_relpath=artifact_relpaths["markdown"],
+                artifact_root_relpath=artifact_relpaths.artifact_root,
+                content_list_relpath=artifact_relpaths.content_list,
+                markdown_relpath=artifact_relpaths.markdown,
             )
             parsed_pages = dict(normalized_ir.get("parsed_pages") or {})
             parsed_pages["full_pdf"] = (
@@ -159,7 +166,7 @@ class ParseDocument:
             parser_method=parser_result.parser_method,
             parser_language=parser_result.parser_language,
             input_raw_file_hash=context["document"].raw_file_hash,
-            parser_artifact_relpath=str(artifact_relpaths["artifact_root"]),
+            parser_artifact_relpath=str(artifact_relpaths.artifact_root),
             normalized_ir_relpath=str(context["normalized_ir_relpath"]),
             artifact_hash=normalized_ir_hash,
         )
@@ -184,22 +191,28 @@ class ParseDocument:
             if document is None:
                 raise ParseDocumentError(f"document not found: {document_id}")
             self._validate_document(document)
-            security = uow.securities.get(document.security_id)
+            security = (
+                uow.securities.get(document.security_id)
+                if document.security_id is not None
+                else None
+            )
             if security is None:
                 raise ParseDocumentError(
                     f"document security not found: {document.security_id}"
                 )
 
+            provider = cast(str, document.provider)
+            provider_document_id = cast(str, document.provider_document_id)
             artifact_root_relpath = self._paths.parser_run_artifacts_relpath(
-                provider=document.provider,
+                provider=provider,
                 security_code=security.security_code,
-                provider_document_id=document.provider_document_id,
+                provider_document_id=provider_document_id,
                 processing_run_id=processing_run_id,
             )
             normalized_ir_relpath = self._paths.normalized_ir_run_relpath(
-                provider=document.provider,
+                provider=provider,
                 security_code=security.security_code,
-                provider_document_id=document.provider_document_id,
+                provider_document_id=provider_document_id,
                 processing_run_id=processing_run_id,
             )
             prepare_error: dict[str, Any] | None = None
@@ -262,7 +275,7 @@ class ParseDocument:
             "run": run,
             "prepare_failed": prepare_error is not None,
             "processing_run_id": run.processing_run_id,
-            "input_pdf": self._paths.data_path(Path(document.raw_file_relpath)),
+            "input_pdf": self._paths.data_path(Path(cast(str, document.raw_file_relpath))),
             "artifact_root_relpath": artifact_root_relpath,
             "artifact_root_path": self._paths.data_path(artifact_root_relpath),
             "normalized_ir_relpath": normalized_ir_relpath,
@@ -321,15 +334,15 @@ class ParseDocument:
         artifact_root: Path,
         content_list_path: Path,
         markdown_path: Path | None,
-    ) -> dict[str, Path | None]:
+    ) -> _ArtifactRelpaths:
         def relpath(path: Path) -> Path:
             return artifact_root_relpath / path.relative_to(artifact_root_path)
 
-        return {
-            "artifact_root": relpath(artifact_root),
-            "content_list": relpath(content_list_path),
-            "markdown": relpath(markdown_path) if markdown_path is not None else None,
-        }
+        return _ArtifactRelpaths(
+            artifact_root=relpath(artifact_root),
+            content_list=relpath(content_list_path),
+            markdown=relpath(markdown_path) if markdown_path is not None else None,
+        )
 
     def _finish_run(
         self,

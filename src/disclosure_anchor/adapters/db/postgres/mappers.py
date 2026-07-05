@@ -7,6 +7,8 @@ entity after flush when available.
 
 from __future__ import annotations
 
+from typing import Any
+
 from disclosure_anchor.adapters.db.postgres import models as m
 from disclosure_anchor.domain import entities as e
 
@@ -315,7 +317,7 @@ def document_unit_to_entity(row: m.DocumentUnit) -> e.DocumentUnit:
 
 
 def outbox_event_to_model(entity: e.OutboxEvent) -> m.OutboxEvent:
-    values = {
+    values: dict[str, Any] = {
         "event_id": entity.event_id,
         "event_kind": entity.event_kind,
         "change_kind": entity.change_kind,

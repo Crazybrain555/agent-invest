@@ -14,6 +14,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from disclosure_anchor.adapters.db.postgres.connection import create_session_factory
+from disclosure_anchor.application.ports import repositories as ports_repos
+from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.adapters.db.postgres.repositories import (
     CompanyIdentifierRepository,
     CompanyRepository,
@@ -30,6 +32,20 @@ from disclosure_anchor.adapters.db.postgres.repositories import (
 
 class SqlAlchemyUnitOfWork:
     """Transaction boundary backed by a single SQLAlchemy session."""
+
+    # Attributes are declared with the *port* types so the concrete class
+    # satisfies the UnitOfWork protocol (protocol attributes are invariant;
+    # adapters speak to callers in contract types, not implementation types).
+    companies: ports_repos.CompanyRepository
+    company_identifiers: ports_repos.CompanyIdentifierRepository
+    securities: ports_repos.SecurityRepository
+    tracked_companies: ports_repos.TrackedCompanyRepository
+    source_accesses: ports_repos.SourceAccessRepository
+    source_checkpoints: ports_repos.SourceCheckpointRepository
+    documents: ports_repos.DocumentRepository
+    processing_runs: ports_repos.ProcessingRunRepository
+    document_units: ports_repos.DocumentUnitRepository
+    outbox: ports_repos.OutboxRepository
 
     def __init__(
         self,
@@ -50,7 +66,12 @@ class SqlAlchemyUnitOfWork:
         self._bind_repositories(self._session)
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> None:
         try:
             if exc_type is not None:
                 self.rollback()
@@ -91,7 +112,7 @@ class SqlAlchemyUnitOfWork:
         self.session.flush()
 
 
-def unit_of_work_factory(engine: Engine) -> Callable[[], SqlAlchemyUnitOfWork]:
+def unit_of_work_factory(engine: Engine) -> Callable[[], UnitOfWork]:
     """Build UnitOfWork instances from a process-level engine."""
 
     return lambda: SqlAlchemyUnitOfWork(engine=engine)

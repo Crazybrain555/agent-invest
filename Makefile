@@ -18,11 +18,26 @@ PGLOG ?= /Volumes/AgentSSD/agent_system/postgres/logs/disclosure-anchor-pg18.log
 PGPORT ?= 55432
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
-	test-mineru-smoke api archive pg-init pg-start pg-stop pg-status db-create migrate \
-	register parse build-units publish process
+	test-mineru-smoke lint typecheck agent-check api archive pg-init pg-start pg-stop \
+	pg-status db-create migrate register parse build-units publish process
 
 doctor:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
+
+lint:
+	$(PYTHON) -m ruff check src tests scripts
+
+typecheck:
+	$(PYTHON) -m mypy
+
+# Aggregate deterministic gate for AI-agent edits: lint + types + no-DB tests +
+# diff hygiene in one command. Live-DB tests and migration round trips stay in
+# the milestone protocol (04R section 6).
+agent-check:
+	$(MAKE) lint
+	$(MAKE) typecheck
+	env -u DATABASE_URL -u DISCLOSURE_MIGRATION_DATABASE_URL $(MAKE) test
+	git diff --check
 
 test:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m unittest discover -s tests -t . -p 'test_*.py'

@@ -70,18 +70,25 @@ class SubjectResolver:
                 "uscc", _normalize_identifier(candidate.credit_code)
             )
             if identifier is not None:
-                company = uow.companies.get(identifier.company_id)
-                if company is None:
+                ledger_company = uow.companies.get(identifier.company_id)
+                if ledger_company is None:
                     raise RegistrationMetadataError(
                         "company identifier references missing company "
                         f"{identifier.company_id}"
                     )
                 self._validate_legal_name(
-                    company=company, candidate=candidate, identifier=identifier, uow=uow
+                    company=ledger_company,
+                    candidate=candidate,
+                    identifier=identifier,
+                    uow=uow,
                 )
-                company = self._sync_uscc_identifier(uow, company, candidate.credit_code)
-                security = self._add_security(uow, company=company, candidate=candidate)
-                return ResolvedSubject(company=company, security=security)
+                ledger_company = self._sync_uscc_identifier(
+                    uow, ledger_company, candidate.credit_code
+                )
+                security = self._add_security(
+                    uow, company=ledger_company, candidate=candidate
+                )
+                return ResolvedSubject(company=ledger_company, security=security)
 
         company = uow.companies.add(
             e.Company(

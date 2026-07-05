@@ -100,7 +100,7 @@ class Settings(BaseSettings):
 
 
 def load_settings() -> Settings:
-    return Settings()
+    return Settings()  # type: ignore[call-arg]  # pydantic-settings 从环境变量填充
 
 
 @lru_cache(maxsize=1)

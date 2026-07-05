@@ -14,7 +14,9 @@ integration/smoke_real_mineru.py  真 MinerU 全链冒烟，**不进默认发现
                显式跑：make test-mineru-smoke（三重门控：DB + DISCLOSURE_MINERU_BIN + 样本 PDF）
 ```
 
-运行：`make test`（全量）/ `make test-unit|test-contract|test-data|test-integration`。
+运行：`make test`（全量）/ `make test-unit|test-contract|test-data|test-integration`；
+**`make agent-check`** = lint(ruff) + typecheck(mypy 全仓严格) + no-DB test + git diff --check
+——AI 改完代码的默认提交门禁（06 起写入 milestone 协议）。
 绿判据：no-DB 模式末行 `OK (skipped=N)`；live-DB 模式不带 skipped 的 `OK`
 （socket DSN 见 04R §6.3，免密码）。政策与 fixture 规范：
 `docs/implementation/checks/fixture-and-test-policy.md`；再生成协议：04R §6.4。

@@ -6,8 +6,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import cast
 
 from disclosure_anchor.application.ports.file_store import (
+    QuarantineResult,
     RawDocumentStorePort,
     RawDocumentWriteResult,
 )
@@ -228,7 +230,7 @@ class RegisterLocalPdf:
                     self._add_contested_identifier_and_raise(
                         uow,
                         company=security_company,
-                        credit_code=command.company_credit_code,
+                        credit_code=cast(str, command.company_credit_code),
                         message=(
                             "company unified_social_credit_code conflicts with "
                             "candidate uscc"
@@ -241,7 +243,7 @@ class RegisterLocalPdf:
                     self._add_contested_identifier_and_raise(
                         uow,
                         company=security_company,
-                        credit_code=command.company_credit_code,
+                        credit_code=cast(str, command.company_credit_code),
                         message=(
                             "security/company mismatch: "
                             f"{command.security_code}.{command.exchange} belongs to "
@@ -289,8 +291,12 @@ class RegisterLocalPdf:
         raise SubjectIdentityConflictError(message)
 
     def _record_quarantine_source_access(
-        self, *, command: RegisterLocalPdfCommand, reason: str, quarantine
-    ):
+        self,
+        *,
+        command: RegisterLocalPdfCommand,
+        reason: str,
+        quarantine: QuarantineResult,
+    ) -> e.SourceAccess:
         now = datetime.now(timezone.utc)
         with self._uow_factory() as uow:
             source_access = uow.source_accesses.add(

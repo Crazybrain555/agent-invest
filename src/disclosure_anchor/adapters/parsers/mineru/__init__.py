@@ -1,4 +1,3 @@
-"""MinerU adapter placeholders."""
 """MinerU parser adapter package."""
 
 from disclosure_anchor.adapters.parsers.mineru.artifact_reader import (

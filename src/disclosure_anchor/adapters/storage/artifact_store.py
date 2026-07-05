@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import hashlib
 import json
 import os
@@ -35,7 +37,7 @@ class ArtifactStore:
         return self._write_bytes_atomic(relpath=relpath, payload=raw)
 
     def write_jsonl_atomic(
-        self, *, relpath: Path, rows: list[object]
+        self, *, relpath: Path, rows: Sequence[object]
     ) -> ArtifactWriteResult:
         raw = "".join(
             json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows

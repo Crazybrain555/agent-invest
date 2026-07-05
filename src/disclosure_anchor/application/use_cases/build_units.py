@@ -12,7 +12,6 @@ from typing import Any
 
 from disclosure_anchor.adapters.unit_builder import rules
 from disclosure_anchor.adapters.unit_builder.builder import (
-    BuildStats,
     ImageBytesResolver,
     UnitDraft,
     build_unit_drafts_s1_s7,
@@ -191,7 +190,11 @@ class BuildUnits:
                         message=f"run document not found: {run.document_id}",
                     )
                 )
-            security = uow.securities.get(document.security_id)
+            security = (
+                uow.securities.get(document.security_id)
+                if document.security_id is not None
+                else None
+            )
             if security is None:
                 raise BuildUnitsError(
                     self._structured_error(
