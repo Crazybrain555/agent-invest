@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from collections.abc import Iterable
@@ -29,6 +30,7 @@ from disclosure_anchor.adapters.db.postgres.schema import (
 )
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
+from disclosure_anchor.domain.services.unit_hashing import content_hash_aggregate
 from disclosure_anchor.settings import Settings
 
 
@@ -496,12 +498,11 @@ def _processing_run_checks(settings: Settings, engine: Engine) -> list[CheckResu
                 )
         if row["unit_build_status"] == "succeeded":
             checks.append(
-                _check_artifact_hash(
+                _check_unit_snapshot_aggregate(
                     settings=settings,
-                    name="document unit snapshot",
                     object_id=run_id,
                     relpath=row["document_units_relpath"],
-                    expected_hash=row["content_hash_aggregate"],
+                    expected_aggregate=row["content_hash_aggregate"],
                 )
             )
     return checks
@@ -526,6 +527,52 @@ def _check_artifact_hash(
     if actual_hash == expected_hash:
         return _pass(name, f"{object_id} hash ok")
     return _fail(name, f"{object_id} hash mismatch: {actual_hash} != {expected_hash}")
+
+
+def _check_unit_snapshot_aggregate(
+    *,
+    settings: Settings,
+    object_id: str,
+    relpath: str | None,
+    expected_aggregate: str | None,
+) -> CheckResult:
+    """Recompute content_hash_aggregate from snapshot rows.
+
+    The aggregate hashes the sorted unit content hashes, not the snapshot
+    file's bytes, so a plain file hash can never match it.
+    """
+
+    name = "document unit snapshot"
+    if not relpath:
+        return _fail(name, f"{object_id} missing relpath")
+    if not expected_aggregate:
+        return _fail(name, f"{object_id} missing expected aggregate")
+    path = settings.disclosure_data_root / "data" / relpath
+    if not path.is_file():
+        return _fail(name, f"{object_id} missing file: {relpath}")
+    hashes: list[str] = []
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line_number, line in enumerate(fh, start=1):
+                if not line.strip():
+                    continue
+                unit_row = json.loads(line)
+                unit_content_hash = unit_row.get("content_hash")
+                if not isinstance(unit_content_hash, str):
+                    return _fail(
+                        name,
+                        f"{object_id} snapshot line {line_number} missing content_hash",
+                    )
+                hashes.append(unit_content_hash)
+    except (OSError, json.JSONDecodeError) as exc:
+        return _fail(name, f"{object_id} unreadable snapshot: {exc}")
+    actual_aggregate = content_hash_aggregate(hashes)
+    if actual_aggregate == expected_aggregate:
+        return _pass(name, f"{object_id} aggregate ok ({len(hashes)} units)")
+    return _fail(
+        name,
+        f"{object_id} aggregate mismatch: {actual_aggregate} != {expected_aggregate}",
+    )
 
 
 def _document_unit_locator_checks(

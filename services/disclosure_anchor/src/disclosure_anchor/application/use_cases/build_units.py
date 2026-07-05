@@ -25,7 +25,10 @@ from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import BuildUnitsError
-from disclosure_anchor.domain.services.unit_hashing import compute_unit_hashes
+from disclosure_anchor.domain.services.unit_hashing import (
+    compute_unit_hashes,
+    content_hash_aggregate,
+)
 
 
 SNAPSHOT_KEYS = {
@@ -404,7 +407,7 @@ class BuildUnits:
 
 
 def _content_hash_aggregate(units: list[e.DocumentUnit]) -> str:
-    return _sha256_prefixed("\n".join(sorted(unit.content_hash for unit in units)))
+    return content_hash_aggregate(unit.content_hash for unit in units)
 
 
 def _structure_hash_aggregate(units: list[e.DocumentUnit]) -> str:

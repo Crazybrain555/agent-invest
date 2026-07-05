@@ -389,7 +389,9 @@ tests/contract 两个测试文件的 SCHEMA/FIXTURE 路径与断言键同步改�
 3. doctor 补 doctor-checklist §2/§5，并按 run 结局区分要求（E11）：
    succeeded run → normalized_ir_relpath 必须存在且 artifact_hash 匹配；
    failed run → 只要求结构化 error 存在，不报 artifact 缺失；
-   unit_build_status='succeeded' → document_units_relpath 存在且快照哈希与 DB 聚合一致。
+   unit_build_status='succeeded' → document_units_relpath 存在，且**从快照行的 content_hash
+   重算聚合**（sorted+保留重复，同 unit_hashing.content_hash_aggregate）与 DB 的
+   content_hash_aggregate 一致——聚合不是快照文件的字节哈希，不能拿文件哈希直接比对。
    另补：PG 连通、migration head、三 schema、角色权限、每 document 最多一个 active run、
    outbox seq 单调、stale running run 告警、孤儿 raw/artifact 文件报告（B9 的 orphan 是
    合法状态，报告不报错）；CheckResult 增加 WARN 态。

@@ -1,9 +1,15 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from disclosure_anchor.adapters.runtime.doctor import run_doctor, run_startup_preflight
+from disclosure_anchor.adapters.runtime.doctor import (
+    _check_unit_snapshot_aggregate,
+    run_doctor,
+    run_startup_preflight,
+)
+from disclosure_anchor.domain.services.unit_hashing import content_hash_aggregate
 from disclosure_anchor.settings import SENTINEL_NAME, Settings
 from tests.unit._env import without_db_env
 
@@ -117,6 +123,74 @@ class DoctorTests(unittest.TestCase):
             self.assertIn("MINERU_MODEL_CACHE", failed)
             self.assertIn("HF_HOME", failed)
             self.assertIn("MODELSCOPE_CACHE", failed)
+
+
+class UnitSnapshotAggregateCheckTests(unittest.TestCase):
+    RELPATH = "derived/document_unit_snapshots/x/y/z/run/document_units.v1.jsonl"
+
+    def _write_snapshot(self, root: Path, rows: list[dict[str, object]]) -> None:
+        path = (
+            root / "services" / "disclosure_anchor" / "data" / Path(self.RELPATH)
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+
+    def test_passes_when_recomputed_aggregate_matches(self) -> None:
+        hashes = ["sha256:bbb", "sha256:aaa", "sha256:aaa"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            self._write_snapshot(root, [{"content_hash": value} for value in hashes])
+            result = _check_unit_snapshot_aggregate(
+                settings=_settings(root),
+                object_id="run_x",
+                relpath=self.RELPATH,
+                expected_aggregate=content_hash_aggregate(hashes),
+            )
+            self.assertEqual(result.status, "PASS", result.message)
+
+    def test_fails_on_aggregate_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            self._write_snapshot(root, [{"content_hash": "sha256:aaa"}])
+            result = _check_unit_snapshot_aggregate(
+                settings=_settings(root),
+                object_id="run_x",
+                relpath=self.RELPATH,
+                expected_aggregate=content_hash_aggregate(["sha256:other"]),
+            )
+            self.assertFalse(result.ok)
+            self.assertIn("aggregate mismatch", result.message)
+
+    def test_fails_when_snapshot_row_lacks_content_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            self._write_snapshot(root, [{"asset_id": "du_x"}])
+            result = _check_unit_snapshot_aggregate(
+                settings=_settings(root),
+                object_id="run_x",
+                relpath=self.RELPATH,
+                expected_aggregate="sha256:whatever",
+            )
+            self.assertFalse(result.ok)
+            self.assertIn("missing content_hash", result.message)
+
+    def test_fails_when_snapshot_file_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            result = _check_unit_snapshot_aggregate(
+                settings=_settings(root),
+                object_id="run_x",
+                relpath=self.RELPATH,
+                expected_aggregate="sha256:whatever",
+            )
+            self.assertFalse(result.ok)
+            self.assertIn("missing file", result.message)
 
 
 if __name__ == "__main__":

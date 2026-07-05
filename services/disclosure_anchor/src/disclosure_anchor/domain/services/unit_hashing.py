@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 import hashlib
 import json
@@ -26,6 +27,16 @@ def canonical_json(value: dict[str, Any]) -> str:
 
 def sha256_prefixed(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def content_hash_aggregate(content_hashes: Iterable[str]) -> str:
+    """Run-level aggregate over unit content hashes (sorted, duplicates kept).
+
+    This hashes the joined hash list, not any snapshot file's bytes; verifiers
+    must recompute it from unit rows rather than hashing the snapshot file.
+    """
+
+    return sha256_prefixed("\n".join(sorted(content_hashes)))
 
 
 def content_hash(*, payload_kind: str, payload: dict[str, Any]) -> str:
