@@ -1,8 +1,9 @@
-# asset_intake provider 框架定稿 v1.0
+# asset_intake provider 框架定稿 v1.1
 
-状态:定稿(2026-07-06)。取代 v0.1 讨论稿(见 git 历史)。形成过程:v0.1 → 独立答案底稿 →
-GPT-Pro 外部评审 → 以协议 v0.7 与已落库代码为准独立取舍(取舍记录见 §9)。P3 起的实现以本文为准;
-修改本文需说明与协议 §2.1 扩展纪律、§16 硬边界的一致性。
+状态:定稿(v1.0 2026-07-06;v1.1 同日按用户提供的 Wind 官方数据字典事实修订 §5/§9/§11)。
+取代 v0.1 讨论稿(见 git 历史)。形成过程:v0.1 → 独立答案底稿 → GPT-Pro 外部评审 →
+以协议 v0.7 与已落库代码为准独立取舍(取舍记录见 §9)→ Wind 官方字典事实核正。
+P3 起的实现以本文为准;修改本文需说明与协议 §2.1 扩展纪律、§16 硬边界的一致性。
 
 ## 1. 定案清单
 
@@ -152,9 +153,14 @@ provider 原始多余字段不进 semantic fields。物理表/列名在写实际
 ### 5.2 cn_equity.fin_statement
 
 - params:`security`、`report_period`、`statement=income|balance|cashflow|indicator`。
+- Wind 侧源表(官方字典已核实拼写):`AShareIncome` / `AShareBalanceSheet` / `AShareCashFlow` /
+  `AShareFinancialIndicator`(Wind 计算口径,按 R5 标注 provider-derived)。候选备注:
+  `AShareANNFinancialIndicator` 是公司**公布**口径重要指标(as-announced),与 indicator 的
+  Wind 计算口径不同,将来需要按公布口径对账时再增设,不进首发;`AShareTTMAndMRQ` 只有最新
+  报告期、无历史,不适合回填,不进首发。
 - 首发字段=预测主链最小集(收入/营业利润/净利/归母净利/EPS;总资产/负债/归母权益/应收/存货/
   合同负债;经营现金流/资本开支代理/折旧摊销;毛利率/净利率/ROE/周转类),写条目时逐个核实
-  provider 字段名。
+  provider 字段名(权威链见 §9-R4)。
 - 口径规则:合并报表口径为默认 scope(Wind STATEMENT_TYPE=408001000 或 tushare report_type 对应),
   其他口径显式 scope,不混入;同 (security, report_period) 多行取 latest
   (按 ann_date/opdate 降序),重述 → 新 content_hash → materialized + supersede。
@@ -163,8 +169,20 @@ provider 原始多余字段不进 semantic fields。物理表/列名在写实际
 ### 5.3 cn_equity.earnings_event
 
 - params:`security`、`report_period?`、`event_type=forecast|express`、`ann_date range`。
-- fields:event_type、report_period、published_at(=公告日)、forecast/express 的
-  值或区间(net_profit_low/high 或点值)、类型、原文描述。
+- Wind 侧源表(官方字典已核实):`AShareProfitNotice`(业绩预告)/ `AShareProfitExpress`
+  (业绩快报)。评审所给 `AShareProfitNoticeNew` 表名有误——R4 的核实纪律由此实证。
+- provider 业务主键(AShareProfitNotice):S_INFO_WINDCODE + S_PROFITNOTICE_DATE(最新公告日)
+  + S_PROFITNOTICE_PERIOD(报告期)——**修正/多次预告 = 新行**(配 S_PROFITNOTICE_NUMBER
+  公布次数、FIRSTANNDATE 首次公告日),与 §6 的 materialized/supersede 语义直接对应。
+- 首发语义字段(按官方字典覆盖率取舍,低覆盖字段一律 required=false):event_type、
+  report_period、published_at(=最新公告日)、first_ann_date、notice_style_code(**保留原始
+  数字代码**,如 454010000;label 走 registry code_map 确定性映射,未知代码保留原码不猜)、
+  净利润预告区间(low/high)、扣非净利润区间、营收预告区间、EPS 预告区间、上年同期归母净利/
+  扣非净利/营收、是否变脸(sign_change)、abstract(摘要)、reason(业绩变动原因,
+  VARCHAR2(3000) 文本,对 L2 抽取有价值,原样入 payload)。
+- 单位事实(确定性 transform):净利润/营收类字段 Wind 原始单位是**万元**(×10000 → 元);
+  EPS 为元/股;变动幅度为百分数;日期均为 VARCHAR2(8) YYYYMMDD → date。
+- 官方字典脚注纪律:未列入字典的字段是 Wind 内部字段,**禁止映射**。
 - 预告被修正/正式财报出来 → 各自新资产;跨 dataset 的"预告 vs 正式"验证关系是 L2 的事。
 
 ## 6. 幂等、去重、取代与 as-of
@@ -236,8 +254,11 @@ row_published_at、DatasetResult 加 warnings/stats、text-to-DatasetRequest 定
   版本变内容不变时强制 materialized 会无谓触发下游失效(违 §2.8 语义)。版本走 provenance。
 - **R3 registry 目录放服务内**(评审建议根级 registries/):协议 §3.7 定位是 L1 adapter 配置
   清单,归属 asset_intake;根 docs/reference 只放引擎级文档。
-- **R4 评审 YAML 中的具体 Wind 列名/表名仅作参考**,落条目时逐个对 `aliyun-wind-rds/references/`
-  速查核实——评审引用与真实 schema 可能有出入,字典是契约,错一个字段名污染全链。
+- **R4 评审 YAML 中的具体 Wind 列名/表名仅作参考,已实证**(评审给的 `AShareProfitNoticeNew`
+  实为 `AShareProfitNotice`)。物理映射三级权威链:① **同事 RDS 实际 schema**(最终权威——RDS
+  是 Wind 的 50 张表导出**子集**,官方字典有的表 RDS 未必有,写条目前先核实存在性与列清单)
+  > ② Wind 官方数据字典(wds.wind.com.cn,用户已提供关键表,见 §11)> ③ 任何评审/记忆。
+  官方字典未列出的字段是 Wind 内部字段,禁止映射。
 - **R5 `statement=indicator` 保留但标注**:fina_indicator 类是 provider 预计算的派生指标,
   仍按 tier_1/G1 数据服务登记,与"系统自算派生进 L3"不冲突;字典 description 必须注明
   provider-derived,防止 L2/L3 把它当原始报表事实对账。
@@ -245,6 +266,26 @@ row_published_at、DatasetResult 加 warnings/stats、text-to-DatasetRequest 定
 ## 10. 待决与 roadmap
 
 - 通道确认(用户,数周内):SQL(阿里云 Wind RDS)vs API(tushare 官方)→ 决定 P-通道先做哪个 adapter。
+- 用户将提供基于 Wind 字典事实的新版 GPT-Pro 评审:届时同流程处理(独立对比→取舍入 §9),
+  不自动采纳。
 - roadmap:source_checkpoint 表与调度驱动(理想:财务增量由 disclosure_anchor change feed 触发,
   写进 M-D 规划)、fetch_iter 分页、双 provider 并存验证、text-to-DatasetRequest planner、
   L2 numeric_observation mapper(属 L2 里程碑)。
+
+## 11. 已核实的 Wind 物理事实(2026-07-06,来源:用户提供的 wds.wind.com.cn 官方数据字典)
+
+写 registry 条目时的核实底稿;RDS 实际 schema 仍为最终权威(§9-R4)。
+
+- 财务模块相关表(拼写以此为准):AShareBalanceSheet、AShareIncome、AShareCashFlow、
+  AShareProfitExpress、AShareProfitNotice、AShareFinancialIndicator(Wind 计算)、
+  AShareANNFinancialIndicator(公司公布口径)、AShareFinancialderivative(国际准则)、
+  AShareReportperiodindex(Wind 调整后)、AShareTTMAndMRQ(仅最新期)、AShareTTMHis(TTM 历史)、
+  AShareIssuingDatePredict(预计披露日)、AShareAuditOpinion(审计意见)。
+- AShareProfitNotice 要点:历史 15+ 年,覆盖沪深北;业务主键 = S_INFO_WINDCODE +
+  S_PROFITNOTICE_DATE + S_PROFITNOTICE_PERIOD;日期字段 VARCHAR2(8) YYYYMMDD;
+  金额类单位**万元**、EPS 元/股、幅度为 %;S_PROFITNOTICE_STYLE 为数字代码(样例
+  454010000/454004000);高覆盖字段:类型/变脸/净利区间(77–88%)/摘要/首次公告日;
+  低覆盖:扣非区间(≈19%)、EPS 区间(≈9%)、营收区间(≈4%)、权益预告(≈1%)——
+  registry 中一律 required=false;S_PROFITNOTICE_REASON 为最长 3000 字文本。
+- 字典脚注:未列出的字段为 Wind 系统内部字段,随时可能变更,禁止使用。
+- 行情/衍生/融资融券/权益(含 PIT)模块存在但未取字典明细;用到时再核实,不预登记(F4)。
