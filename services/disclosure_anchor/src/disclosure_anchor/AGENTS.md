@@ -7,7 +7,7 @@ domain/        实体、ids（ULID+前缀）、typed errors、value objects（�
 application/   ports（抽象接口）+ services（SubjectResolver/register_document 核心）
                + use_cases（RegisterLocalPdf/ParseDocument…，经 UoW 编排）
 adapters/      db/postgres（迁移/模型/仓储/UoW）、parsers/mineru、storage、runtime(doctor)
-cli/           db.py(bootstrap) / doctor.py；pipeline.py 到 milestone 05 才创建
+cli/           db.py(bootstrap) / doctor.py / pipeline.py / worker.py（once|loop，单例锁在专用 NullPool 连接上，拿不到锁打印 [skip] 并退出 0）
 api/           FastAPI 骨架（Filing API 到 milestone 06 才实现）
 settings.py    fail-closed pydantic settings（缺 env 即抛错；env_file=None 不自动读 .env）
 main.py        create_app：快检 preflight + 进程级单 engine

@@ -3,7 +3,7 @@
 ```text
 schema.py          三 schema（disclosure_core/public/ops）+ 四角色常量（owner/app/reader/l2_reader）
 migrations/        alembic；文件名即 revision（0001…0007）；0001–0007 已冻结不改，
-                   新改动一律开新迁移（0008=unit builder provenance 归 05，0009=队列视图归 08）
+                   新改动一律开新迁移（0008=unit builder provenance 归 05，0009=sync/download 队列视图已落地——op.execute 内字面冒号要 \: 转义，source_access.error 是 Text 需 ::jsonb cast）
 models.py          SQLAlchemy 模型 + 与迁移同名的 CheckConstraint（两边必须同名同义）
 repositories.py    仓储实现；unique 冲突翻译成领域错误（DocumentIdentityConflictError 等）
 mappers.py         entity ↔ model 全字段映射（新加列两边都要动）

@@ -21,4 +21,8 @@ integration/smoke_real_mineru.py  真 MinerU 全链冒烟，**不进默认发现
 则为 `OK (skipped=1)`（06 的 admin 全链测试三重门控 skip，属合法绿；配上 MINERU_BIN 才是零 skip）。
 （socket DSN 见 04R §6.3，免密码）。政策与 fixture 规范：
 `docs/implementation/checks/fixture-and-test-policy.md`；再生成协议：04R §6.4。
-集成测试写真库必须在 tearDown 清理自己的行；固定标识要选可清理、不与生产样本冲突的值。
+集成测试写真库必须在 tearDown 清理自己的行；固定标识要选可清理、不与生产样本冲突的值
+（run-unique 后缀，参考 test_public_views_content 的 T{ulid} 模式）。
+**会消费全局队列的测试（worker run_once 类）必须建独立 scratch database**
+（模式见 test_worker_integration.setUpClass：CREATE DATABASE + ensure_schemas + alembic 子进程），
+共享真库上跑 run_once 会把真实 pending 文档灌进 fake——已实测踩过。

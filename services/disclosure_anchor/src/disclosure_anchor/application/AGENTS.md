@@ -10,6 +10,13 @@ services/register_document.py  注册核心：去重键(provider,pid,raw_hash)�
                supersedes 链、source_access、document_registered/observed 事件；
                07 的 provider 下载路径必须复用它，不得重实现
 use_cases/register_local_pdf.py  preflight 冲突检查 → 归档 → 核心；竞态只重试一次
+worker/queries.py     队列读取唯一入口（视图 facts + 阈值谓词都在这；worker/doctor 共用，
+               禁止旁路手写判定）；reclaim_stale_runs 是钉死的回收 UPDATE
+worker/worker.py      run_once 纯调度壳（stale→sync→download→parse(=05 process 串行)→build→publish，
+               单项异常隔离；业务动作全是既有 use case）；worker/locks.py 定义
+               WORKER_NS=815001/DOC_NS=815002 与文档级 xact 锁（register 复用/parse finish/
+               publish 三事务内注入，内存 fake 无 session 自动跳过）
+dto/worker_report.py  WorkerLimits/WorkerReport/WorkerFailure（08 报告契约）
 use_cases/parse_document.py      run 生命周期：prepare(落 run+created 事件) → 真解析 →
                finish（同事务更新 document.status；published 永不降级；
                typed 异常 → 结构化 error{stage,error_code,retryable}；未知异常持久化后 re-raise）

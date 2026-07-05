@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -148,6 +149,25 @@ def _environment_checks(settings: Settings) -> list[CheckResult]:
     return checks
 
 
+def _mineru_orphan_check() -> CheckResult:
+    """WARN when MinerU processes linger (08 §2: killed runs must not leak).
+
+    The observed leak is the fast_api backend MinerU 3.4 spawns; a resident
+    one holds ~1.8GB and steals compute from the next parse.
+    """
+
+    try:
+        result = subprocess.run(
+            ["pgrep", "-fl", "mineru"], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return _warn("mineru orphans", "pgrep unavailable; cannot check")
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if lines:
+        return _warn("mineru orphans", f"count={len(lines)} (residual mineru processes)")
+    return _pass("mineru orphans", "none")
+
+
 def _reader_database_url_checks(settings: Settings) -> list[CheckResult]:
     if uses_reader_database_url_fallback(settings):
         return [
@@ -192,6 +212,7 @@ def run_doctor(
 
     checks = _environment_checks(settings)
     checks.extend(_reader_database_url_checks(settings))
+    checks.append(_mineru_orphan_check())
     if settings.database_url is None:
         checks.append(_warn("DATABASE_URL", "missing; DB-backed doctor checks skipped"))
         return DoctorReport(results=tuple(checks))

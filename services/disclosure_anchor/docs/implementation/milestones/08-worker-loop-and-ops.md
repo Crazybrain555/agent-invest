@@ -192,6 +192,28 @@ tests/unit 只测 run_once 的调度/报告聚合（fake 队列结果）与 stab
   （fake source 或本地 register），全部自动到 active run 且报告文件含 ≥3 个轮次小节）；
 - 失败可恢复、可定位；acceptance-matrix A29/A30 置 pass。
 
+## 6.5 实施后修订（2026-07-06，Claude 实现 / Codex 终审，实施中定案）
+
+- **WorkerDeps 实际字段**超出 §3.1 四字段草案：run_once 组装 use case 需要
+  uow_factory / path_builder / raw_store / artifact_store / profile_loader_factory /
+  parse_timeout_seconds / config(WorkerConfig 阈值集合)；生产 wiring 仍全部在 cli/worker.py。
+- **pending_download_v1**：候选来源含 web 兜底通道（provider_interface IN
+  ('cninfo:p_info3015','cninfo:hisAnnouncement')），并额外暴露 company_id 与完整 candidate
+  jsonb 列（下载复用 07 候选协议所需）；仍为 facts-only。
+- **queries.sync_due** 在 helper 层 join core.security 取 scode/exchange；worker 对
+  从未同步过的公司只做 overlap 回看（历史回填仍是显式 `make sync WINDOW=N` 人工步骤）。
+- **文档级锁**取阻塞形态 `pg_advisory_xact_lock`，经 locks.maybe_lock_document 注入
+  register 复用 / parse finish / publish 三个事务（无 session 的内存 fake 自动跳过）；
+  常量 815001/815002 从 application/worker/locks.py 导出，worker.py 再导出。
+- **op.execute 的 SQL 里字面冒号必须 `\:` 转义**（':p_info3015'、'"retryable":true' 两处实坑）；
+  source_access.error 为 Text 列，视图内 `(error)::jsonb` 显式 cast。
+- **web 通道候选 raw_category=''**：下载侧候选重建与 provider_metadata 改为可选处理
+  （worker 全链测试抓到的 07 缺陷）。
+- **worker 集成测试必须用独立 scratch database**（每类 CREATE DATABASE + bootstrap + alembic）：
+  队列是全局的，在共享真库上跑 run_once 会把真实 pending 文档灌进测试 fake
+  （实测 3 份真实文档被记了 raw_missing 失败 run，已外科清理）。共享库只跑视图行级断言。
+- parse_quality 日报聚合 run 内存中的 build_stats（不回读 artifact）。
+
 ## 7. 明确不做
 
 - 不引入 Celery / Redis / Airflow / Prefect / Dagster；不建全局 L6 调度脊柱；

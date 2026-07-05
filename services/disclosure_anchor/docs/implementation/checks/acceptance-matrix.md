@@ -38,8 +38,8 @@ created_at: 2026-06-26
 | A26 | CNINFO PDF 下载进入 raw archive | 07 | integration/manual | pass (2026-07-06：464 份 PDF 不可变归档，跨通道 hash 幂等吸收) |
 | A27 | 查空写 source_access | 07 | DB check | pass (2026-07-06：600519 checkpoint 续跑真实空窗口 result='empty' 落库) |
 | A28 | CNINFO 凭据只从环境变量进入 settings，且不写入 repo、DB、artifact 或日志 | 01/07 | settings test + review | pass |
-| A29 | `make worker-once` 可从 pending 跑到 active run | 08 | end-to-end | pending |
-| A30 | worker 崩溃不破坏 raw archive | 08 | failure test | pending |
+| A29 | `make worker-once` 可从 pending 跑到 active run | 08 | end-to-end | pass (2026-07-06 真实语料 2 docs parse→build→publish 27s；scratch 库全链集成含对账断言) |
+| A30 | worker 崩溃不破坏 raw archive | 08 | failure test | pass (2026-07-06 kill -9 advisory 锁全释放；stale 回收 retryable=true；raw 归档只读校验不受影响) |
 | A31 | 外置盘未挂载时服务 fail closed | 01/08 | doctor/startup test | pass |
 | A32 | document_units_v1 保留 15 个 unit 级 scope keys + asset_id；契约名收敛为 asset_id/payload_kind/event_kind | 02/06 | integration test | pass |
 | A33 | 0007：信封最小核视图列（asset_kind/observed_at/source_tier/trace_level/raw_file_hash）+ source_tier 按 filing_type 映射 | 04R | contract test | pass |
