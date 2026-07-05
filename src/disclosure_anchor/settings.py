@@ -39,6 +39,12 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("DATABASE_URL", "database_url"),
     )
+    disclosure_reader_database_url: Optional[SecretStr] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_READER_DATABASE_URL", "disclosure_reader_database_url"
+        ),
+    )
     disclosure_admin_database_url: Optional[SecretStr] = Field(
         default=None,
         validation_alias=AliasChoices(

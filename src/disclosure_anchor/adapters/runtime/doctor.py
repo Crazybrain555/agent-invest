@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from disclosure_anchor.adapters.db.postgres.connection import create_db_engine
+from disclosure_anchor.adapters.db.postgres.connection import uses_reader_database_url_fallback
 from disclosure_anchor.adapters.db.postgres.schema import (
     ALEMBIC_VERSION_TABLE,
     ALEMBIC_VERSION_TABLE_SCHEMA,
@@ -145,12 +146,26 @@ def _environment_checks(settings: Settings) -> list[CheckResult]:
     return checks
 
 
+def _reader_database_url_checks(settings: Settings) -> list[CheckResult]:
+    if uses_reader_database_url_fallback(settings):
+        return [
+            _warn(
+                "DISCLOSURE_READER_DATABASE_URL",
+                "missing; read API will use DATABASE_URL fallback",
+            )
+        ]
+    if settings.disclosure_reader_database_url is not None:
+        return [_pass("DISCLOSURE_READER_DATABASE_URL", "configured")]
+    return []
+
+
 def run_startup_preflight(
     settings: Settings, *, engine: Engine | None = None
 ) -> DoctorReport:
     """Run only fast checks suitable for API startup."""
 
     checks = _environment_checks(settings)
+    checks.extend(_reader_database_url_checks(settings))
     if settings.database_url is None:
         checks.append(_fail("DATABASE_URL", "missing for API startup"))
         return DoctorReport(results=tuple(checks))
@@ -174,6 +189,7 @@ def run_doctor(
     """Run CLI doctor checks without creating or repairing external state."""
 
     checks = _environment_checks(settings)
+    checks.extend(_reader_database_url_checks(settings))
     if settings.database_url is None:
         checks.append(_warn("DATABASE_URL", "missing; DB-backed doctor checks skipped"))
         return DoctorReport(results=tuple(checks))

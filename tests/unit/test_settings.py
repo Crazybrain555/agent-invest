@@ -37,6 +37,9 @@ class SettingsTests(unittest.TestCase):
             env.update(
                 {
                     "DATABASE_URL": "postgresql://user:<set-in-private-env>@127.0.0.1:55432/db",
+                    "DISCLOSURE_READER_DATABASE_URL": (
+                        "postgresql://reader:<set-in-private-env>@127.0.0.1:55432/db"
+                    ),
                     "CNINFO_ACCESS_KEY": "key",
                     "CNINFO_ACCESS_SECRET": "<set-in-private-env>",
                     "DISCLOSURE_PARSE_TIMEOUT_SECONDS": "42",
@@ -46,7 +49,15 @@ class SettingsTests(unittest.TestCase):
             with patch.dict(os.environ, env, clear=True):
                 settings = load_settings()
                 self.assertNotIn("<set-in-private-env>", repr(settings.database_url))
+                self.assertNotIn(
+                    "<set-in-private-env>",
+                    repr(settings.disclosure_reader_database_url),
+                )
                 self.assertEqual(settings.cninfo_access_key.get_secret_value(), "key")
+                self.assertEqual(
+                    settings.disclosure_reader_database_url.get_secret_value(),
+                    "postgresql://reader:<set-in-private-env>@127.0.0.1:55432/db",
+                )
                 self.assertEqual(settings.disclosure_parse_timeout_seconds, 42)
                 self.assertEqual(
                     settings.disclosure_mineru_bin, Path("/opt/mineru/bin/mineru")

@@ -29,6 +29,16 @@ def app_database_url(settings: Settings) -> str:
     return _require_url(url, name="DATABASE_URL")
 
 
+def reader_database_url(settings: Settings) -> str:
+    secret = settings.disclosure_reader_database_url or settings.database_url
+    url = secret.get_secret_value() if secret else None
+    return _require_url(url, name="DISCLOSURE_READER_DATABASE_URL or DATABASE_URL")
+
+
+def uses_reader_database_url_fallback(settings: Settings) -> bool:
+    return settings.disclosure_reader_database_url is None and settings.database_url is not None
+
+
 def admin_database_url(settings: Settings) -> str:
     secret = settings.disclosure_admin_database_url
     url = secret.get_secret_value() if secret else None
