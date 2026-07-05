@@ -1,0 +1,44 @@
+{
+  "resultcode": 200,
+  "resultmsg": "success",
+  "total": 2,
+  "count": 2,
+  "records": [
+    {
+      "TEXTID": "cninfo-test-000001-20260701-annual",
+      "RECID": "rec-test-000001-1",
+      "SECCODE": "000001",
+      "SECNAME": "平安银行",
+      "F001D": "2026-07-01 00:00:00",
+      "F002V": "平安银行：2026年年度报告",
+      "F003V": "https://static.cninfo.example/finalpage/2026-07-01/cninfo-test-000001-20260701-annual.PDF",
+      "F004V": "PDF",
+      "F005N": 512,
+      "F006V": "010301||010112",
+      "F007V": "001001",
+      "F008V": "A股",
+      "F009V": "012002",
+      "F010V": "深交所主板",
+      "OBJECTID": 90000001,
+      "RECTIME": "2026-07-01 18:30:00"
+    },
+    {
+      "TEXTID": "cninfo-test-000001-20260702-ir",
+      "RECID": "rec-test-000001-2",
+      "SECCODE": "000001",
+      "SECNAME": "平安银行",
+      "F001D": "2026-07-02 00:00:00",
+      "F002V": "平安银行：投资者关系活动记录表",
+      "F003V": "https://static.cninfo.example/finalpage/2026-07-02/cninfo-test-000001-20260702-ir.PDF",
+      "F004V": "PDF",
+      "F005N": 96,
+      "F006V": "0120||012001",
+      "F007V": "001001",
+      "F008V": "A股",
+      "F009V": "012002",
+      "F010V": "深交所主板",
+      "OBJECTID": 90000002,
+      "RECTIME": "2026-07-02 12:05:30"
+    }
+  ]
+}
