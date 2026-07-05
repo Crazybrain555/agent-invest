@@ -1,0 +1,359 @@
+{
+  "$defs": {
+    "EndpointSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "api_name": {
+          "title": "Api Name",
+          "type": "string"
+        },
+        "note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Note"
+        }
+      },
+      "required": [
+        "api_name"
+      ],
+      "title": "EndpointSpec",
+      "type": "object"
+    },
+    "FreshnessCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "endpoint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Endpoint"
+        },
+        "sql": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sql"
+        }
+      },
+      "title": "FreshnessCheck",
+      "type": "object"
+    },
+    "IndexDiscipline": {
+      "additionalProperties": false,
+      "properties": {
+        "date_columns_are_varchar8": {
+          "default": false,
+          "title": "Date Columns Are Varchar8",
+          "type": "boolean"
+        },
+        "note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Note"
+        },
+        "required_prefix_predicates": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Prefix Predicates",
+          "type": "array"
+        }
+      },
+      "title": "IndexDiscipline",
+      "type": "object"
+    },
+    "RateLimit": {
+      "additionalProperties": false,
+      "properties": {
+        "min_interval_ms": {
+          "title": "Min Interval Ms",
+          "type": "integer"
+        },
+        "retry_backoff_seconds": {
+          "default": [],
+          "items": {
+            "type": "integer"
+          },
+          "title": "Retry Backoff Seconds",
+          "type": "array"
+        }
+      },
+      "required": [
+        "min_interval_ms"
+      ],
+      "title": "RateLimit",
+      "type": "object"
+    },
+    "SafetySpec": {
+      "additionalProperties": false,
+      "properties": {
+        "default_max_rows": {
+          "default": 10000,
+          "title": "Default Max Rows",
+          "type": "integer"
+        },
+        "default_timeout_seconds": {
+          "default": 30,
+          "title": "Default Timeout Seconds",
+          "type": "integer"
+        },
+        "deny_tokens": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Deny Tokens",
+          "type": "array"
+        },
+        "forbid_select_star": {
+          "default": true,
+          "title": "Forbid Select Star",
+          "type": "boolean"
+        },
+        "readonly_required": {
+          "default": true,
+          "title": "Readonly Required",
+          "type": "boolean"
+        },
+        "require_bound_params": {
+          "default": true,
+          "title": "Require Bound Params",
+          "type": "boolean"
+        },
+        "single_statement_only": {
+          "default": true,
+          "title": "Single Statement Only",
+          "type": "boolean"
+        }
+      },
+      "title": "SafetySpec",
+      "type": "object"
+    },
+    "TableAlias": {
+      "additionalProperties": false,
+      "properties": {
+        "activation_rule": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Activation Rule",
+          "type": "array"
+        },
+        "active_table": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Active Table"
+        },
+        "candidates": {
+          "items": {
+            "$ref": "#/$defs/TableCandidate"
+          },
+          "title": "Candidates",
+          "type": "array"
+        },
+        "freshness_check": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FreshnessCheck"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "semantic_datasets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Semantic Datasets",
+          "type": "array"
+        }
+      },
+      "required": [
+        "semantic_datasets",
+        "candidates"
+      ],
+      "title": "TableAlias",
+      "type": "object"
+    },
+    "TableCandidate": {
+      "additionalProperties": false,
+      "properties": {
+        "date_column": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Date Column"
+        },
+        "key_columns": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Key Columns",
+          "type": "array"
+        },
+        "note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Note"
+        },
+        "required_columns": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Columns",
+          "type": "array"
+        },
+        "role": {
+          "title": "Role",
+          "type": "string"
+        },
+        "table": {
+          "title": "Table",
+          "type": "string"
+        }
+      },
+      "required": [
+        "table",
+        "role"
+      ],
+      "title": "TableCandidate",
+      "type": "object"
+    }
+  },
+  "$id": "provider_catalog.v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "base_url": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Base Url"
+    },
+    "connection_profile": {
+      "title": "Connection Profile",
+      "type": "string"
+    },
+    "default_safety": {
+      "$ref": "#/$defs/SafetySpec"
+    },
+    "endpoints": {
+      "additionalProperties": {
+        "$ref": "#/$defs/EndpointSpec"
+      },
+      "default": {},
+      "title": "Endpoints",
+      "type": "object"
+    },
+    "index_discipline": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/IndexDiscipline"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "provider": {
+      "title": "Provider",
+      "type": "string"
+    },
+    "provider_kind": {
+      "title": "Provider Kind",
+      "type": "string"
+    },
+    "rate_limit": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RateLimit"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "schema_version": {
+      "const": "provider_catalog.v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "table_aliases": {
+      "additionalProperties": {
+        "$ref": "#/$defs/TableAlias"
+      },
+      "default": {},
+      "title": "Table Aliases",
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "provider",
+    "provider_kind",
+    "connection_profile",
+    "default_safety"
+  ],
+  "title": "ProviderCatalog",
+  "type": "object"
+}

@@ -9,28 +9,10 @@ from datetime import UTC, datetime
 
 from sqlalchemy import text
 
+from asset_intake.contracts import PUBLIC_VIEW_COLUMNS as EXPECTED_VIEW_COLUMNS
+
 ADMIN_URL = os.environ.get("ASSET_INTAKE_ADMIN_DATABASE_URL")
 MIGRATION_URL = os.environ.get("ASSET_INTAKE_MIGRATION_DATABASE_URL")
-
-EXPECTED_VIEW_COLUMNS = {
-    "data_assets_v1": [
-        "asset_id", "asset_uri", "asset_kind", "payload_kind", "contract_version",
-        "content_hash", "subject_candidates", "title", "semantic_key", "material_type",
-        "event_time", "published_at", "report_period", "observed_at", "source_ref",
-        "provider", "adapter", "tool", "source_tier", "trace_level", "locator",
-        "raw_asset_ref", "producer_action_ref", "sensitivity", "payload",
-        "quality_status", "is_active", "superseded_by",
-    ],
-    "source_accesses_v1": [
-        "access_id", "provider", "adapter", "adapter_version", "dataset_key", "tool",
-        "query_params", "query_params_hash", "provider_as_of", "observed_at",
-        "result_status", "result_count", "producer_action_ref",
-    ],
-    "change_events_v1": [
-        "change_seq", "event_id", "source", "event_kind", "subject_ref", "asset_id",
-        "processing_run_id", "payload", "occurred_at",
-    ],
-}
 
 
 @unittest.skipUnless(

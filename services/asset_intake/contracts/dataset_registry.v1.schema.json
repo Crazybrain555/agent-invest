@@ -1,0 +1,805 @@
+{
+  "$defs": {
+    "ContentHashSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "include_fields": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Include Fields",
+          "type": "array"
+        },
+        "sort_by": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Sort By",
+          "type": "array"
+        }
+      },
+      "required": [
+        "sort_by",
+        "include_fields"
+      ],
+      "title": "ContentHashSpec",
+      "type": "object"
+    },
+    "DedupSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "content_hash": {
+          "$ref": "#/$defs/ContentHashSpec"
+        },
+        "semantic_key_fields": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Semantic Key Fields",
+          "type": "array"
+        }
+      },
+      "required": [
+        "semantic_key_fields",
+        "content_hash"
+      ],
+      "title": "DedupSpec",
+      "type": "object"
+    },
+    "DuplicatePolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "fail",
+            "keep_latest"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "keys": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Keys",
+          "type": "array"
+        }
+      },
+      "required": [
+        "keys",
+        "action"
+      ],
+      "title": "DuplicatePolicy",
+      "type": "object"
+    },
+    "EndpointJoin": {
+      "additionalProperties": false,
+      "properties": {
+        "join_on": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Join On",
+          "type": "array"
+        },
+        "join_type": {
+          "const": "inner",
+          "default": "inner",
+          "title": "Join Type",
+          "type": "string"
+        },
+        "left": {
+          "title": "Left",
+          "type": "string"
+        },
+        "right": {
+          "title": "Right",
+          "type": "string"
+        }
+      },
+      "required": [
+        "left",
+        "right",
+        "join_on"
+      ],
+      "title": "EndpointJoin",
+      "type": "object"
+    },
+    "FieldMap": {
+      "additionalProperties": false,
+      "properties": {
+        "column": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Column"
+        },
+        "endpoint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Endpoint"
+        },
+        "provider_unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider Unit"
+        },
+        "transform": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TransformSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "FieldMap",
+      "type": "object"
+    },
+    "FieldSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "as_of_sensitive": {
+          "default": false,
+          "title": "As Of Sensitive",
+          "type": "boolean"
+        },
+        "derived": {
+          "default": false,
+          "title": "Derived",
+          "type": "boolean"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "dtype": {
+          "title": "Dtype",
+          "type": "string"
+        },
+        "group": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Group"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "required": {
+          "default": false,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        }
+      },
+      "required": [
+        "name",
+        "dtype"
+      ],
+      "title": "FieldSpec",
+      "type": "object"
+    },
+    "MappingVariant": {
+      "additionalProperties": false,
+      "properties": {
+        "endpoints": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Endpoints"
+        },
+        "endpoints_join": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EndpointJoin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "field_map": {
+          "additionalProperties": {
+            "$ref": "#/$defs/FieldMap"
+          },
+          "title": "Field Map",
+          "type": "object"
+        },
+        "scope_filter": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Scope Filter"
+        },
+        "sql_templates": {
+          "additionalProperties": {
+            "$ref": "#/$defs/SqlTemplate"
+          },
+          "default": {},
+          "title": "Sql Templates",
+          "type": "object"
+        },
+        "table_alias": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Table Alias"
+        },
+        "when": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "When",
+          "type": "object"
+        }
+      },
+      "required": [
+        "when",
+        "field_map"
+      ],
+      "title": "MappingVariant",
+      "type": "object"
+    },
+    "ProviderMapping": {
+      "additionalProperties": false,
+      "properties": {
+        "endpoints": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Endpoints"
+        },
+        "endpoints_join": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EndpointJoin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "field_map": {
+          "additionalProperties": {
+            "$ref": "#/$defs/FieldMap"
+          },
+          "default": {},
+          "title": "Field Map",
+          "type": "object"
+        },
+        "sql_templates": {
+          "additionalProperties": {
+            "$ref": "#/$defs/SqlTemplate"
+          },
+          "default": {},
+          "title": "Sql Templates",
+          "type": "object"
+        },
+        "table_alias": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Table Alias"
+        },
+        "variants": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MappingVariant"
+          },
+          "title": "Variants",
+          "type": "array"
+        }
+      },
+      "title": "ProviderMapping",
+      "type": "object"
+    },
+    "QueryParamSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allowed"
+        },
+        "default": {
+          "default": null,
+          "title": "Default"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "format": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Format"
+        },
+        "required": {
+          "default": false,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "QueryParamSpec",
+      "type": "object"
+    },
+    "SemanticContract": {
+      "additionalProperties": false,
+      "properties": {
+        "asset_kind": {
+          "const": "dataset_snapshot",
+          "title": "Asset Kind",
+          "type": "string"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "fields": {
+          "items": {
+            "$ref": "#/$defs/FieldSpec"
+          },
+          "title": "Fields",
+          "type": "array"
+        },
+        "material_type": {
+          "title": "Material Type",
+          "type": "string"
+        },
+        "payload_kind": {
+          "const": "recordset",
+          "title": "Payload Kind",
+          "type": "string"
+        },
+        "primary_key": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Primary Key",
+          "type": "array"
+        },
+        "query_params": {
+          "additionalProperties": {
+            "$ref": "#/$defs/QueryParamSpec"
+          },
+          "title": "Query Params",
+          "type": "object"
+        },
+        "scope_semantics": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "title": "Scope Semantics",
+          "type": "object"
+        },
+        "source_tier": {
+          "title": "Source Tier",
+          "type": "string"
+        },
+        "subject_semantics": {
+          "$ref": "#/$defs/SubjectSemantics"
+        },
+        "time_semantics": {
+          "$ref": "#/$defs/TimeSemantics"
+        },
+        "trace_level": {
+          "title": "Trace Level",
+          "type": "string"
+        }
+      },
+      "required": [
+        "description",
+        "asset_kind",
+        "payload_kind",
+        "material_type",
+        "source_tier",
+        "trace_level",
+        "query_params",
+        "primary_key",
+        "time_semantics",
+        "subject_semantics",
+        "fields"
+      ],
+      "title": "SemanticContract",
+      "type": "object"
+    },
+    "SqlTemplate": {
+      "additionalProperties": false,
+      "properties": {
+        "max_rows": {
+          "title": "Max Rows",
+          "type": "integer"
+        },
+        "params": {
+          "additionalProperties": {
+            "$ref": "#/$defs/SqlTemplateParam"
+          },
+          "title": "Params",
+          "type": "object"
+        },
+        "required_predicates": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Predicates",
+          "type": "array"
+        },
+        "result_order": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Result Order",
+          "type": "array"
+        },
+        "statement": {
+          "title": "Statement",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "title": "Timeout Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "statement",
+        "params",
+        "required_predicates",
+        "max_rows",
+        "timeout_seconds"
+      ],
+      "title": "SqlTemplate",
+      "type": "object"
+    },
+    "SqlTemplateParam": {
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "default": null,
+          "title": "Default"
+        },
+        "max": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "SqlTemplateParam",
+      "type": "object"
+    },
+    "SubjectFrom": {
+      "additionalProperties": false,
+      "properties": {
+        "field": {
+          "title": "Field",
+          "type": "string"
+        },
+        "subject_kind": {
+          "title": "Subject Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "field",
+        "subject_kind"
+      ],
+      "title": "SubjectFrom",
+      "type": "object"
+    },
+    "SubjectSemantics": {
+      "additionalProperties": false,
+      "properties": {
+        "subject_candidates_from": {
+          "items": {
+            "$ref": "#/$defs/SubjectFrom"
+          },
+          "title": "Subject Candidates From",
+          "type": "array"
+        }
+      },
+      "required": [
+        "subject_candidates_from"
+      ],
+      "title": "SubjectSemantics",
+      "type": "object"
+    },
+    "TimeSemantics": {
+      "additionalProperties": false,
+      "properties": {
+        "event_time_from": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Event Time From"
+        },
+        "provider_as_of_required": {
+          "default": true,
+          "title": "Provider As Of Required",
+          "type": "boolean"
+        },
+        "published_at_rule": {
+          "title": "Published At Rule",
+          "type": "string"
+        }
+      },
+      "required": [
+        "published_at_rule"
+      ],
+      "title": "TimeSemantics",
+      "type": "object"
+    },
+    "TransformSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "factor": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Factor"
+        },
+        "target_unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Unit"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "TransformSpec",
+      "type": "object"
+    },
+    "ValidationSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "duplicate_policy": {
+          "$ref": "#/$defs/DuplicatePolicy"
+        },
+        "row_checks": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Row Checks",
+          "type": "array"
+        }
+      },
+      "required": [
+        "duplicate_policy"
+      ],
+      "title": "ValidationSpec",
+      "type": "object"
+    }
+  },
+  "$id": "dataset_registry.v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "dataset_contract_version": {
+      "title": "Dataset Contract Version",
+      "type": "integer"
+    },
+    "dataset_key": {
+      "title": "Dataset Key",
+      "type": "string"
+    },
+    "dedup": {
+      "$ref": "#/$defs/DedupSpec"
+    },
+    "providers": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ProviderMapping"
+      },
+      "title": "Providers",
+      "type": "object"
+    },
+    "schema_version": {
+      "const": "dataset_registry.v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "semantic_contract": {
+      "$ref": "#/$defs/SemanticContract"
+    },
+    "status": {
+      "enum": [
+        "active",
+        "draft",
+        "deprecated"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "validation": {
+      "$ref": "#/$defs/ValidationSpec"
+    }
+  },
+  "required": [
+    "schema_version",
+    "dataset_key",
+    "dataset_contract_version",
+    "status",
+    "semantic_contract",
+    "providers",
+    "validation",
+    "dedup"
+  ],
+  "title": "DatasetEntry",
+  "type": "object"
+}

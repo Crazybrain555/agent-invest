@@ -34,8 +34,15 @@ Live-DB 验证必须附带 `disclosure_*` 对象零变化断言。
 ## Layout
 
 ```text
-src/asset_intake/settings.py   环境配置（唯一读 env 的模块）
-src/asset_intake/cli/doctor.py 环境体检
-tests/unit/                    no-DB 单元测试
-tests/integration/             live-DB 测试（DSN 缺失时 skip）
+src/asset_intake/settings.py            环境配置（唯一读 env 的模块）
+src/asset_intake/cli/                   doctor / db create / export_contracts
+src/asset_intake/db/                    schema 常量、bootstrap、models、migrations（intake_* only）
+src/asset_intake/providers/             端口(port.py)、双层配置加载校验(registry.py)、SQL 白名单(sql_template.py)
+src/asset_intake/application/           registrar（唯一写 DB 的地方）
+src/asset_intake/domain/errors.py       §3.11 错误码
+src/asset_intake/contracts.py           公共契约定义与导出（make export-contracts,禁止手写 contracts/）
+registry/datasets/*.yaml                语义数据集契约（v1.2 F4）
+registry/providers/*.catalog.yaml       provider 物理 catalog（候选表 + activation,F12 fail-fast）
+contracts/                              导出物,契约测试守护 byte-for-byte
+tests/unit|contract|integration/        no-DB / 契约 / live-DB(缺 DSN skip)
 ```

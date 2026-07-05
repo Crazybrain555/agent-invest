@@ -5,7 +5,7 @@ PYTHON ?= /opt/miniconda3/bin/python3
 endif
 PYTHONPATH ?= src
 
-.PHONY: venv doctor lint typecheck test agent-check db-create migrate
+.PHONY: venv doctor lint typecheck test agent-check db-create migrate export-contracts
 
 venv:
 	python3 -m venv .venv
@@ -36,3 +36,6 @@ db-create:
 
 migrate:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m alembic upgrade head
+
+export-contracts:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m asset_intake.cli.export_contracts
