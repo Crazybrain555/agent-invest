@@ -11,10 +11,10 @@ service's own `AGENTS.md`.
 
 ```text
 services/disclosure_anchor/   L1 披露 PDF 路径服务（live；也是新服务的复用蓝图）
+services/asset_intake/        L1 dataset_snapshot + tool_result 轻登记服务（M-C 立项中）
 packages/envelope_kernel/     跨服务共享代码：data_asset 信封核（字段模型、kind 矩阵、asset:// URI、契约 schema）
 docs/reference/               引擎级协议文档（v0.7 现行 + v0.6 沿革）
 docs/archive/pre-restart/     Quant_agent 时代冻结存档（协议 v0.4/v0.5、旧 harness 文档）——历史证据，非现行政策
-（规划中）services/asset_intake/     L1 dataset_snapshot + tool_result 轻登记服务
 （规划中）services/upload_service/   L1 人工上传服务（独立服务，最后立项）
 ```
 

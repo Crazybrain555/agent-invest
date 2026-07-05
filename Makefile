@@ -1,5 +1,5 @@
 # Root Makefile: delegate gates to each component. Add new services/packages to the lists as they land.
-SERVICES := services/disclosure_anchor
+SERVICES := services/disclosure_anchor services/asset_intake
 PACKAGES := packages/envelope_kernel
 COMPONENTS := $(SERVICES) $(PACKAGES)
 

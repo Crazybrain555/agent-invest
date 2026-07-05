@@ -1,0 +1,45 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.ruff_cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.env
+.env.*
+!.env.template
+.venv/
+env/
+venv/
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+._*
+
+# Data / runtime (belongs on AgentSSD, never in the repo)
+data/
+runtime/
+*.parquet
+*.db
+*.sqlite
+logs/
+*.log
+
+# Machine-specific harness/MCP config
+.mcp.json
+.codex/config.toml
+
+# Agent working state (machine-local, session-specific)
+docs/agent/

@@ -11,7 +11,7 @@
 | `docs/reference/` | 引擎级协议文档（v0.7 现行 + v0.6 沿革） |
 | `docs/archive/pre-restart/` | Quant_agent 时代冻结存档（协议 v0.4/v0.5、旧 harness 文档），仅作历史证据 |
 | `packages/envelope_kernel/` | 跨服务共享代码：data_asset 信封核（字段模型、kind 矩阵、asset:// URI、契约 schema） |
-| `services/asset_intake/`（规划中） | L1 标准数据 + 工具结果轻登记服务 |
+| `services/asset_intake/` | L1 标准数据 + 工具结果轻登记服务（M-C 立项中） |
 | `services/upload_service/`（规划中） | L1 人工上传服务（独立服务，最后立项） |
 
 ## 约定
