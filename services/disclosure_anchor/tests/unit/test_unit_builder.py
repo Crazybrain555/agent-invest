@@ -24,8 +24,8 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-6")
-        self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v3")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-7")
+        self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v4")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
 
@@ -312,6 +312,121 @@ class UnitBuilderTests(unittest.TestCase):
             [part["heading_path"] for part in units[0].payload["parts"]],
             [["第一章 总则"], ["第二章 附则"]],
         )
+
+    def test_s2_unnumbered_heading_nests_under_numbered_parent(self) -> None:
+        # Codex round5: "与回购公司股份相关的会计处理方法" (MinerU heading,
+        # level 2, no numbering) must stay inside 42、其他重要的会计政策, and
+        # the following numbered sibling 43、 must return to the 42、 level.
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(kind="heading", order_index=1, heading_level=1,
+                                text="第八节 财务报告"),
+                PreparedElement(kind="heading", order_index=2, heading_level=2,
+                                text="42、其他重要的会计政策和会计估计"),
+                PreparedElement(kind="heading", order_index=3, heading_level=2,
+                                text="与回购公司股份相关的会计处理方法"),
+                PreparedElement(kind="text", order_index=4,
+                                text="按实际支付的金额作为库存股处理。"),
+                PreparedElement(kind="heading", order_index=5, heading_level=2,
+                                text="43、重要会计政策和会计估计变更"),
+                PreparedElement(kind="text", order_index=6, text="无变更。"),
+            ]
+        )
+
+        self.assertEqual(
+            placed[0].heading_path,
+            ["第八节 财务报告", "42、其他重要的会计政策和会计估计",
+             "与回购公司股份相关的会计处理方法"],
+        )
+        self.assertEqual(
+            placed[1].heading_path,
+            ["第八节 财务报告", "43、重要会计政策和会计估计变更"],
+        )
+
+    def test_s2_ordinal_continuity_repairs_mislevelled_heading(self) -> None:
+        # Codex round5 / real 江海 annual p.187: the filing itself prints
+        # 三、（市场风险） where （三）市场风险 was meant. Ordinal 3 continues
+        # the open (一)(二) sequence, so it must not evict 十二、金融工具风险.
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(kind="heading", order_index=1, heading_level=1,
+                                text="第八节 财务报告"),
+                PreparedElement(kind="heading", order_index=2, heading_level=2,
+                                text="十二、与金融工具相关的风险"),
+                PreparedElement(kind="heading", order_index=3, heading_level=2,
+                                text="(一) 信用风险"),
+                PreparedElement(kind="text", order_index=4, text="信用风险管理。"),
+                PreparedElement(kind="heading", order_index=5, heading_level=2,
+                                text="(二) 流动性风险"),
+                PreparedElement(kind="text", order_index=6, text="流动性管理。"),
+                PreparedElement(kind="heading", order_index=7, heading_level=2,
+                                text="三、（市场风险）"),
+                PreparedElement(kind="text", order_index=8, text="市场风险说明。"),
+            ]
+        )
+
+        market = placed[-1]
+        self.assertEqual(
+            market.heading_path,
+            ["第八节 财务报告", "十二、与金融工具相关的风险", "三、（市场风险）"],
+        )
+
+    def test_s2_footnote_line_never_becomes_heading(self) -> None:
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(kind="heading", order_index=1, heading_level=1,
+                                text="十一、关联方及关联交易"),
+                PreparedElement(kind="heading", order_index=2, heading_level=2,
+                                text="[注] 该金额系双方 2025 年 1-2 月交易金额"),
+                PreparedElement(kind="text", order_index=3, text="承租情况如下。"),
+            ]
+        )
+
+        self.assertEqual(placed[0].text, "[注] 该金额系双方 2025 年 1-2 月交易金额")
+        self.assertEqual(placed[0].kind, "text")
+        self.assertEqual(placed[0].heading_path, ["十一、关联方及关联交易"])
+        self.assertEqual(placed[1].heading_path, ["十一、关联方及关联交易"])
+
+    def test_boilerplate_guarantee_line_is_dropped_and_counted(self) -> None:
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {"kind": "heading", "raw_kind": "text", "order_index": 1,
+                     "heading_level": 1, "text": "重要提示"},
+                    {"kind": "text", "raw_kind": "text", "order_index": 2,
+                     "text": ("本公司董事会及全体董事保证本公告内容不存在任何虚假记载、"
+                              "误导性陈述或者重大遗漏，并对其内容的真实性、准确性和完整性"
+                              "承担法律责任。\n公司存在退市风险，请投资者注意。")},
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].payload["text"], "公司存在退市风险，请投资者注意。")
+        self.assertEqual(stats.dropped_boilerplate_lines, 1)
+
+    def test_blank_rows_dropped_and_merged_cells_reindexed(self) -> None:
+        stats = BuildStats()
+        units = s5_build_table_units(
+            [
+                PreparedElement(
+                    kind="table",
+                    order_index=1,
+                    table={
+                        "headers": ["项目", "金额"],
+                        "rows": [["收入", "100"], ["", " "], ["成本", "60"]],
+                        "merged_cells": [{"row": 2, "col": 0, "rowspan": 1, "colspan": 2}],
+                    },
+                )
+            ],
+            stats,
+        )
+
+        self.assertEqual(units[0].payload["rows"], [["收入", "100"], ["成本", "60"]])
+        self.assertEqual(stats.dropped_blank_table_rows, 1)
+        locator = units[0].artifact_locator or {}
+        self.assertEqual(locator["merged_cells"], [{"row": 1, "col": 0, "rowspan": 1, "colspan": 2}])
 
     def test_full_s1_s7_oversized_leaf_still_merges_whole(self) -> None:
         # Splitting one topic by payload kind is the defect — an oversized

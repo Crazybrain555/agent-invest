@@ -6,8 +6,8 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-6"
-HEADING_RULESET_ID = "cn_a_v3"
+RULES_VERSION = "ub-2026.07-7"
+HEADING_RULESET_ID = "cn_a_v4"
 GIBBERISH_RATIO_MAX = 0.30
 
 # A-share applicability declaration lines ("√适用 □不适用" / "□适用 √不适用").
@@ -124,6 +124,20 @@ SECTION_GROUP_MAX_CHARS = 8000
 
 NOISE_SEPARATOR_RE = re.compile(r"^[\s\-—―=_·•\*~～]{3,}$")
 NOISE_LINE_PATTERNS: tuple[re.Pattern[str], ...] = ()
+
+# Table/figure footnote lines ("[注1] 该金额系…", "注：…"). They are footnotes
+# of the preceding table, never section headings (observed promoted to a
+# root-level unit title on the real audit report, Codex round5).
+FOOTNOTE_LINE_RE = re.compile(r"^\s*(?:[\[［]\s*注\s*\d*\s*[\]］]|注\s*[：:])")
+
+# The fixed board-guarantee legalese (§3.5 稳定噪声, user-authorized drop
+# 2026-07-06). Anchored and keyword-complete so any sentence carrying real
+# content fails the match and is kept (red line).
+BOILERPLATE_GUARANTEE_RE = re.compile(
+    r"^\s*本?公司?(?:董事会|监事会)?[、及和]*(?:全体)?(?:董事|监事|高级管理人员|及|、)*"
+    r"保证(?:本公告|本报告|年度报告|半年度报告|季度报告|报告)?(?:内容)?[^。]{0,40}?"
+    r"(?:真实|虚假记载)[^。]{0,80}?(?:重大遗漏|连带责任|法律责任)[。.]?\s*$"
+)
 
 # Canonical CN filing hierarchy: 节/章 > 一、 > （一） > 1、 > （1） > ①.
 # Both full-width and half-width parens per level: MinerU flattens audit-note

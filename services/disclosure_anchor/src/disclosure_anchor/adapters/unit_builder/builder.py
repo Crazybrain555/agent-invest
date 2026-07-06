@@ -63,6 +63,7 @@ class BuildStats:
     stripped_header_lines: int = 0
     merged_tables: int = 0
     dropped_blank_table_rows: int = 0
+    dropped_boilerplate_lines: int = 0
     grouped_proposal_units: int = 0
     grouped_section_units: int = 0
     collapsed_documents: int = 0
@@ -82,6 +83,7 @@ class BuildStats:
             "stripped_header_lines": self.stripped_header_lines,
             "merged_tables": self.merged_tables,
             "dropped_blank_table_rows": self.dropped_blank_table_rows,
+            "dropped_boilerplate_lines": self.dropped_boilerplate_lines,
             "grouped_proposal_units": self.grouped_proposal_units,
             "grouped_section_units": self.grouped_section_units,
             "collapsed_documents": self.collapsed_documents,
@@ -219,11 +221,12 @@ def s2_apply_heading_tree(
     *,
     qa_heading_mode: bool = False,
 ) -> list[PreparedElement]:
-    stack: list[tuple[int, str]] = []
+    # (level, title, ordinal) — the ordinal drives numbering-continuity repair.
+    stack: list[tuple[int, str, int | None]] = []
     placed: list[PreparedElement] = []
     for element in elements:
         if qa_heading_mode and element.kind == "heading" and _numbered_line(element.text or ""):
-            heading_path = [title for _, title in stack]
+            heading_path = [title for _, title, _ in stack]
             placed.append(
                 PreparedElement(
                     **{
@@ -237,12 +240,26 @@ def s2_apply_heading_tree(
             continue
         level = _heading_level_for(element)
         if level is not None:
-            candidate_path = [title for _, title in stack if _ < level] + [element.text or ""]
+            text = (element.text or "").strip()
+            ordinal = _heading_ordinal(text)
+            if _pattern_heading_level(text) is not None or _normalized_title(text) in rules.FIXED_L1_TITLES:
+                level = _repair_level_by_continuity(stack, level, ordinal)
+            elif element.heading_level == 1:
+                # An explicit MinerU level-1 heading is a document-top block
+                # (title page, 重要提示-class): keep it top-level.
+                level = 1
+            else:
+                # Unnumbered MinerU heading (sub-label like 安全生产费): its
+                # raw heading_level is unreliable (flattened to 2 on real
+                # filings) and used to evict the numbered parent — nest under
+                # the current context instead (Codex round5).
+                level = (stack[-1][0] if stack else 0) + 1
+            candidate_path = [title for lvl, title, _ in stack if lvl < level] + [element.text or ""]
             if len(candidate_path) <= 4:
-                stack = [(existing_level, title) for existing_level, title in stack if existing_level < level]
-                stack.append((level, element.text or ""))
+                stack = [entry for entry in stack if entry[0] < level]
+                stack.append((level, element.text or "", ordinal))
                 continue
-        heading_path = [title for _, title in stack]
+        heading_path = [title for _, title, _ in stack]
         title = element.title or (heading_path[-1] if heading_path else None)
         element_values = dict(element.__dict__)
         if element.kind == "heading":
@@ -257,6 +274,83 @@ def s2_apply_heading_tree(
             )
         )
     return placed
+
+
+_CN_NUMERALS = {c: i for i, c in enumerate("零一二三四五六七八九", start=0)}
+
+
+def _cn_ordinal(text: str) -> int | None:
+    """Parse 一/十/十二/二十一/百-scale Chinese ordinals."""
+
+    if not text:
+        return None
+    total, unit_value, digit = 0, 0, 0
+    for char in text:
+        if char in _CN_NUMERALS:
+            digit = _CN_NUMERALS[char]
+        elif char == "十":
+            unit_value = (digit or 1) * 10
+            total += unit_value
+            digit = 0
+        elif char == "百":
+            total += (digit or 1) * 100
+            digit = 0
+        else:
+            return None
+    return total + digit or None
+
+
+_ORDINAL_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^第([一二三四五六七八九十百]+)[节章]"),
+    re.compile(r"^([一二三四五六七八九十百]+)、"),
+    re.compile(r"^[（(]([一二三四五六七八九十百]+)[）)]"),
+    re.compile(r"^[（(](\d+)[）)]"),
+    re.compile(r"^(\d+)[.、．)）\s]"),
+)
+
+
+def _heading_ordinal(text: str) -> int | None:
+    for pattern in _ORDINAL_RES:
+        match = pattern.match(text)
+        if match:
+            token = match.group(1)
+            return int(token) if token.isdigit() else _cn_ordinal(token)
+    return None
+
+
+def _pattern_heading_level(text: str) -> int | None:
+    for level, pattern in rules.HEADING_PATTERNS:
+        if pattern.match(text):
+            return level
+    return None
+
+
+def _repair_level_by_continuity(
+    stack: list[tuple[int, str, int | None]], level: int, ordinal: int | None
+) -> int:
+    """Re-level a numbered heading whose ordinal breaks its own sequence.
+
+    Real filings misnumber: the 江海 annual prints 三、（市场风险） where
+    （三）市场风险 was meant, and the L2-style prefix used to evict the open
+    十二、金融工具风险 section. If the ordinal does not continue the open
+    sequence at its pattern level but exactly continues another OPEN level's
+    sequence, the heading belongs there. Ordinal 1 always starts a fresh
+    sequence at its own level. Repair is DEMOTION-ONLY: a heading may sink
+    into a deeper open sequence, never rise above its pattern level — the
+    附注科目 chain (9、…44、) would otherwise latch onto 第八节's ordinal 8
+    at level 1 and evict the whole tree (observed on the real 江海 annual).
+    """
+
+    if ordinal is None or ordinal <= 1:
+        return level
+    at_level = {lvl: ord_ for lvl, _, ord_ in stack}
+    own = at_level.get(level)
+    if own is not None and ordinal == own + 1:
+        return level
+    for lvl, _, ord_ in reversed(stack):
+        if lvl > level and ord_ is not None and ordinal == ord_ + 1:
+            return lvl
+    return level
 
 
 def s3_build_text_units(
@@ -427,11 +521,29 @@ def replace_text_units_with_qa_where_stable(units: Iterable[UnitDraft]) -> list[
     return output
 
 
-def _drop_blank_rows(rows: list[list[str]], stats: BuildStats | None) -> list[list[str]]:
-    kept = [row for row in rows if any(str(cell).strip() for cell in row)]
+def _drop_blank_rows_adjusting(
+    rows: list[list[str]],
+    merged_cells: list[dict[str, int]],
+    stats: BuildStats | None,
+) -> tuple[list[list[str]], list[dict[str, int]]]:
+    """Drop all-blank rows; merged_cells row indices shift with the kept rows."""
+
+    kept: list[list[str]] = []
+    index_map: dict[int, int] = {}
+    for index, row in enumerate(rows):
+        if any(str(cell).strip() for cell in row):
+            index_map[index] = len(kept)
+            kept.append(row)
     if stats is not None:
         stats.dropped_blank_table_rows += len(rows) - len(kept)
-    return kept
+    if len(kept) == len(rows):
+        return rows, merged_cells
+    adjusted = [
+        {**cell, "row": index_map[int(cell["row"])]}
+        for cell in merged_cells
+        if int(cell["row"]) in index_map
+    ]
+    return kept, adjusted
 
 
 def s5_build_table_units(elements: Iterable[PreparedElement], stats: BuildStats) -> list[UnitDraft]:
@@ -1153,6 +1265,10 @@ def _heading_level_for(element: PreparedElement) -> int | None:
     # corpus, 2026-07-06).
     if rules.is_declaration_line(text):
         return None
+    # Table footnotes ([注1] …, 注：…) belong to the preceding table and must
+    # never become headings (Codex round5: promoted to a unit title).
+    if rules.FOOTNOTE_LINE_RE.match(text):
+        return None
     normalized_title = _normalized_title(text)
     if normalized_title in rules.FIXED_L1_TITLES:
         return 1
@@ -1201,6 +1317,11 @@ def _strip_declaration_lines(
         if rules.UNIT_DECLARATION_RE.fullmatch(line):
             if stats is not None:
                 stats.dropped_unit_declarations += 1
+            continue
+        if rules.BOILERPLATE_GUARANTEE_RE.match(line):
+            # Fixed board-guarantee legalese (§3.5 稳定噪声, user-authorized).
+            if stats is not None:
+                stats.dropped_boilerplate_lines += 1
             continue
         header_replacement = rules.strip_header_kv_line(line)
         if header_replacement is not None:
@@ -1357,10 +1478,7 @@ def _table_group_to_unit(
         )
 
     headers, rows, merged_cells = _merged_table_grid(group)
-    if not merged_cells:
-        # Blank rows are noise (Codex round4 P2#1); kept when merged_cells
-        # exist because those reference rows by index.
-        rows = _drop_blank_rows(rows, stats)
+    rows, merged_cells = _drop_blank_rows_adjusting(rows, merged_cells, stats)
     payload = {
         "caption": list(first.table_caption),
         "unit": _detect_unit(first, headers=headers, previous_text=previous_text),
