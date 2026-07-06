@@ -47,10 +47,16 @@ class RegisterDatasetSnapshotTests(unittest.TestCase):
             [".venv/bin/python", "-m", "alembic", "upgrade", "head"],
             cwd=service_root, env=env, check=True, capture_output=True,
         )
+        from tests.integration._cleanup import purge_test_rows
+
+        purge_test_rows(cls.engine)
         admin.dispose()
 
     @classmethod
     def tearDownClass(cls) -> None:
+        from tests.integration._cleanup import purge_test_rows
+
+        purge_test_rows(cls.engine)
         cls.engine.dispose()
 
     def setUp(self) -> None:

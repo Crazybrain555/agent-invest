@@ -39,9 +39,15 @@ class PublicViewTests(unittest.TestCase):
             cwd=service_root, env=dict(os.environ, PYTHONPATH="src"), check=True,
             capture_output=True,
         )
+        from tests.integration._cleanup import purge_test_rows
+
+        purge_test_rows(cls.engine)
 
     @classmethod
     def tearDownClass(cls) -> None:
+        from tests.integration._cleanup import purge_test_rows
+
+        purge_test_rows(cls.engine)
         cls.engine.dispose()
 
     def test_view_columns_match_contract(self) -> None:

@@ -36,9 +36,15 @@ class RegisterToolResultTests(unittest.TestCase):
             cwd=service_root, env=dict(os.environ, PYTHONPATH="src"), check=True,
             capture_output=True,
         )
+        from tests.integration._cleanup import purge_test_rows
+
+        purge_test_rows(cls.engine)
 
     @classmethod
     def tearDownClass(cls) -> None:
+        from tests.integration._cleanup import purge_test_rows
+
+        purge_test_rows(cls.engine)
         cls.engine.dispose()
 
     def _submission(self, items, query=None):
