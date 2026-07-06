@@ -58,7 +58,7 @@ npx -y playwright@1 install chromium   # browser for Playwright MCP (shared ms-p
 |---|---|---|---|
 | context7 | `@upstash/context7-mcp@3.2.1` | Version-accurate docs for MinerU/Docling/PyMuPDF/SQLModel/FastAPI/etc. | `CONTEXT7_API_KEY` (optional; runs keyless) |
 | playwright | `@playwright/mcp@0.0.76` | Recon cninfo/HKEXnews pages: real XHR, `hisAnnouncement/query` params, PDF URL patterns | none |
-| dbhub | `@bytebase/dbhub@0.22.3` | Read-only introspection of the SQLite evidence ledger the service writes | none (local file) |
+| dbhub | `@bytebase/dbhub@0.22.3` | Read-only introspection of the `invest_engine` Postgres DB the service writes | password (local dev DB; DSN in gitignored `dbhub.toml`) |
 
 GitHub is **not** added as an MCP: Codex already has the `github` plugin and Claude Code has
 the `gh` CLI. Optional snippet in §6 if you want the dedicated server later.
@@ -104,9 +104,8 @@ file only needs to add its extra servers (it does not replace the global `mcp_se
 # <repo>/.codex/config.toml
 [mcp_servers.dbhub]
 enabled = true
-command = "/Users/zhang/.local/bin/npx"
-args = ["-y", "@bytebase/dbhub@0.22.3", "--transport", "stdio",
-        "--config", "/Users/zhang/dev/agent-invest/services/disclosure_anchor/dbhub.toml"]
+command = "/Users/zhang/.config/agent-invest/disclosure_anchor/dbhub-mcp"
+args = []
 startup_timeout_sec = 120
 tool_timeout_sec = 60
 enabled_tools = ["execute_sql"]
@@ -115,24 +114,34 @@ enabled_tools = ["execute_sql"]
 Verify: from this repo, `codex mcp list` shows `dbhub` plus the global servers; run it from
 elsewhere (e.g. `~`) and `dbhub` is absent — confirming it is project-scoped, not global.
 
-## 5. DBHub read-only ledger — `dbhub.toml` (this repo, gitignored)
+## 5. DBHub source — `dbhub.toml` (this repo, gitignored)
 
-DBHub 0.22.x dropped the `--readonly` flag in favor of a config file:
+DBHub 0.22.x dropped the `--readonly` flag in favor of a config file. The service moved off the
+early SQLite ledger to a local Postgres DB (`invest_engine` on `127.0.0.1:55432`, role
+`disclosure_anchor`, Postgres 18 via Homebrew), so the single source points there:
 
 ```toml
 [[sources]]
-id = "ledger"
-dsn = "sqlite:///Volumes/AgentSSD/disclosure_anchor/ledger.db"   # sqlite:/// + absolute path with its leading slash dropped (3rd slash = root) → opens /Volumes/...
-
-[[tools]]
-name = "execute_sql"
-source = "ledger"
-readonly = true
+id = "invest_engine"
+type = "postgres"
+host = "127.0.0.1"
+port = 55432
+user = "disclosure_anchor"
+password = "${DISCLOSURE_ANCHOR_DB_PASSWORD}"
+database = "invest_engine"
+sslmode = "disable"
 ```
 
-The ledger lives on AgentSSD (`/Volumes/AgentSSD/disclosure_anchor/ledger.db`). A valid empty
-SQLite db was seeded so the server starts before the service builds the real schema. Point the
-DSN at wherever the service finally writes the ledger.
+- `sslmode=disable`: the local Postgres serves no TLS cert; this matches DBHub's own local-postgres
+  DSN example and both `psql` and DBHub connect cleanly with it.
+- Build-phase access is read-write by user decision on 2026-07-06: without a `[[tools]]` block,
+  DBHub auto-registers its default tools and `execute_sql` can run DDL/DML. Add a per-tool
+  `readonly = true` block once schema-building access is no longer needed.
+- Secret: do not put the password in repo-local config. The wrapper at
+  `/Users/zhang/.config/agent-invest/disclosure_anchor/dbhub-mcp` loads
+  `/Users/zhang/.config/agent-invest/disclosure_anchor/dbhub.env` and then starts DBHub; keep that
+  env file private (`0600`). The wrapper executes the locally cached DBHub package directly, avoiding
+  `npx` registry access during MCP startup. Claude and Codex both read the same `dbhub.toml` path.
 
 ## 6. Secrets & optional servers
 
