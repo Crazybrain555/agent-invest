@@ -24,8 +24,8 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-5")
-        self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v2")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-6")
+        self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v3")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
 
@@ -245,6 +245,73 @@ class UnitBuilderTests(unittest.TestCase):
         )
         self.assertEqual(rnd.title, "二、研发投入")
         self.assertEqual(stats.grouped_section_units, 1)
+
+    def test_mixed_section_aggregates_part_semantic_keys(self) -> None:
+        # Codex round4 P1#1: grouping must not swallow recall keys — parts
+        # keep their own semantic_key and the unit exposes the full set.
+        filler = "业务概况说明。" * 1300
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {"kind": "heading", "raw_kind": "text", "order_index": 1,
+                     "heading_level": 1, "text": "第三节 管理层讨论与分析"},
+                    {"kind": "heading", "raw_kind": "text", "order_index": 2,
+                     "heading_level": 2, "text": "一、业务概况"},
+                    {"kind": "text", "raw_kind": "text", "order_index": 3, "text": filler},
+                    {"kind": "heading", "raw_kind": "text", "order_index": 4,
+                     "heading_level": 2, "text": "二、主营业务分析"},
+                    {"kind": "text", "raw_kind": "text", "order_index": 5,
+                     "text": "报告期内经营情况如下。"},
+                    {"kind": "table", "raw_kind": "table", "order_index": 6,
+                     "table_caption": ["营业收入构成"],
+                     "table": {"headers": ["项目", "金额"], "rows": [["主营", "100"]]}},
+                    {"kind": "table", "raw_kind": "table", "order_index": 7,
+                     "table_caption": ["存货分类构成"],
+                     "table": {"headers": ["类别", "金额"], "rows": [["原材料", "10"]]}},
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        by_path = {tuple(unit.heading_path): unit for unit in units}
+        section = by_path[("第三节 管理层讨论与分析", "二、主营业务分析")]
+        self.assertEqual(section.payload_kind, "mixed")
+        # Payload stays pure: no rules-derived keys inside parts (U2).
+        self.assertTrue(
+            all("semantic_key" not in part for part in section.payload["parts"])
+        )
+        self.assertEqual(
+            section.semantic_keys, ["inventory_breakdown", "revenue_breakdown"]
+        )
+
+    def test_collapsed_document_title_uses_registry_title(self) -> None:
+        # Codex round4 P1#4: the in-PDF document-name line is often dropped as
+        # cover prelude, so 第一章 must not become the document unit's title.
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {"kind": "heading", "raw_kind": "text", "order_index": 1,
+                     "heading_level": 1, "text": "第一章 总则"},
+                    {"kind": "text", "raw_kind": "text", "order_index": 2,
+                     "text": "第一条 为完善治理结构，制定本办法。"},
+                    {"kind": "heading", "raw_kind": "text", "order_index": 3,
+                     "heading_level": 1, "text": "第二章 附则"},
+                    {"kind": "text", "raw_kind": "text", "order_index": 4,
+                     "text": "第二条 本办法自发布之日起施行。"},
+                ]
+            },
+            filing_type="other",
+            document_title="贵州茅台：董事、高级管理人员考核和薪酬管理办法",
+        )
+
+        self.assertEqual([unit.payload_kind for unit in units], ["mixed"])
+        self.assertEqual(
+            units[0].title, "贵州茅台：董事、高级管理人员考核和薪酬管理办法"
+        )
+        self.assertEqual(
+            [part["heading_path"] for part in units[0].payload["parts"]],
+            [["第一章 总则"], ["第二章 附则"]],
+        )
 
     def test_full_s1_s7_oversized_leaf_still_merges_whole(self) -> None:
         # Splitting one topic by payload kind is the defect — an oversized

@@ -16,7 +16,7 @@
     },
     "expected": {
       "content_hash": "sha256:0035f7615fda3c2fff4fe93799edd2999987ffc7afc8067d78f19ef8c4797ea7",
-      "query_projection_hash": "sha256:fecc615bd2409a579df5d550ed4835e10ddd56b6ae73520fc232393ebdb1ce48",
+      "query_projection_hash": "sha256:5a5b7c9804ed527f92309f371d8b1111b784fb4594ae551a2d5857fa83f817b5",
       "structure_hash": "sha256:c4948f9f2d03c7edbb3a51e3699092ec3f5102f09b4f788268989e1a3994ac74"
     }
   },
@@ -58,7 +58,7 @@
     },
     "expected": {
       "content_hash": "sha256:15af01ea5e919319fdff7c394486f50ec0e0955a5cbbc200ed13936265f8c17b",
-      "query_projection_hash": "sha256:1cf4066dbb749f3d8cc33e22ff5e619c040f3aba82772bbabf40224821151f16",
+      "query_projection_hash": "sha256:9d66fc0d81448ce591301b407fc8b91a870e236085e5109a826f405cef8375f9",
       "structure_hash": "sha256:a7d7c814b0ad54d6d775238b6e978f246e6c5b3eb3841e007e75aa25ca8f0598"
     }
   },
@@ -81,7 +81,7 @@
     },
     "expected": {
       "content_hash": "sha256:a137877582f5c9df33aca0e546d7969943878adcf2482bd949370406dcf870cd",
-      "query_projection_hash": "sha256:5424950c8f90594f8302c2f6010721656030686cfbe4e33552fea7ce81c17358",
+      "query_projection_hash": "sha256:6d3dd67000e5e0ed7bf328df443c28dce7cd7d235d63aca6d2c7459703428e1c",
       "structure_hash": "sha256:5e2f1e49a3347c836fd41ba97f69540746fc40d55abf750b08d28d5e50eca1eb"
     }
   }

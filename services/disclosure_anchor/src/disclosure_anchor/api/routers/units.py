@@ -53,6 +53,7 @@ UNIT_COLUMNS = (
     "title",
     "order_index",
     "semantic_key",
+    "semantic_keys",
     "payload",
     "content_hash",
     "structure_hash",

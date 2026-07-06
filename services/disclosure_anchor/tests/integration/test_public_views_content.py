@@ -361,6 +361,7 @@ class PublicViewContentTests(unittest.TestCase):
             "title",
             "order_index",
             "semantic_key",
+            "semantic_keys",
             "payload",
             "content_hash",
             "structure_hash",
@@ -400,7 +401,7 @@ class PublicViewContentTests(unittest.TestCase):
             }
 
         self.assertEqual(columns, expected)
-        self.assertEqual(len(columns), 35)
+        self.assertEqual(len(columns), 36)
 
     def test_source_tier_mapping_contract(self) -> None:
         self._seed()

@@ -231,6 +231,20 @@
       ],
       "title": "Semantic Key"
     },
+    "semantic_keys": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Semantic Keys"
+    },
     "source_ref": {
       "anyOf": [
         {
@@ -283,6 +297,7 @@
     "title",
     "order_index",
     "semantic_key",
+    "semantic_keys",
     "payload",
     "content_hash",
     "structure_hash",

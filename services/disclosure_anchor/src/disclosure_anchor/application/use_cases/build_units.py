@@ -44,6 +44,7 @@ SNAPSHOT_KEYS = {
     "payload_kind",
     "quality_status",
     "semantic_key",
+    "semantic_keys",
     "title",
 }
 
@@ -85,6 +86,7 @@ class BuildUnits:
         drafts, stats = build_unit_drafts_s1_s7(
             normalized_ir,
             filing_type=context["document"].filing_type,
+            document_title=context["document"].title,
             image_bytes_resolver=self._image_bytes_resolver(normalized_ir),
         )
         units, snapshot_rows = self._materialize_units(
@@ -273,6 +275,7 @@ class BuildUnits:
                 quality_status=draft.quality_status,
                 order_index=order_index,
                 applicability=draft.applicability,
+                semantic_keys=draft.semantic_keys,
             )
             unit = e.DocumentUnit(
                 asset_id=ids.new_asset_id(),
@@ -284,6 +287,7 @@ class BuildUnits:
                 title=draft.title,
                 order_index=order_index,
                 semantic_key=draft.semantic_key,
+                semantic_keys=draft.semantic_keys,
                 payload=draft.payload,
                 content_hash=hashes.content_hash,
                 structure_hash=hashes.structure_hash,
@@ -307,6 +311,7 @@ class BuildUnits:
                 "payload_kind": unit.payload_kind,
                 "quality_status": unit.quality_status,
                 "semantic_key": unit.semantic_key,
+                "semantic_keys": unit.semantic_keys,
                 "title": unit.title,
             }
             if set(row) != SNAPSHOT_KEYS:

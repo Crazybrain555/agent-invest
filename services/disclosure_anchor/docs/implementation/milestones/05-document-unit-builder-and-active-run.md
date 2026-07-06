@@ -471,6 +471,25 @@ part 形状复用各 kind payload schema；见 service-purpose §6.5）。S8 语
 10. 计数：grouped_proposal_units / grouped_section_units / collapsed_documents /
    anchored_header_units 进 build_stats。
 
+### ub-2026.07-6（2026-07-06 Codex round4 复审后）
+
+复审依据：Codex 对 phase008 round3 修复的独立 DB 终审（no-go 判定的四条 P1，其中
+P1#3 "local_heading 字符串化数组" 经 jsonb_typeof 复核为假阳性——`->>` 把数组渲染成
+文本后被正则误判，实际 614/614 均为真 JSON 数组，未采纳）。落地三条：
+
+1. **semantic_keys 召回列**（P1#1）：mixed 分组曾吞掉成员的 semantic_key（年报 22 keyed
+   → 12）。现在每个 part 计算并携带自己的 semantic_key；单元级新增 `semantic_keys`
+   （jsonb 数组 = 自身 key ∪ parts keys，0013 迁移 + GIN 部分索引，视图 36 列 + API/契约
+   同步）；纳入 query_projection_hash 与 PROJECTION_FIELDS。单值 semantic_key 保留原语义。
+2. **半角括号层级**（P1#2 根因）：MinerU 把审计报告附注标题一律标 heading_level=2，
+   半角 `(1)`/`(一)` 不在层级表时落回 level 2 并把科目父节点挤出栈。cn_a_v3：
+   L3 增加 `\(一\)` 形态、L5 增加 `\(1\)` 形态。
+3. **坍缩单元 title 用登记文档标题**（P1#4）：PDF 内文档名行常被封面剥离，第一章 曾成为
+   document 单元 title。builder 增加 document_title 传参（build_units 从 document.title
+   注入），坍缩单元 title/heading_path 用它；parts 保留各章 heading_path。
+4. 附带（P2#1 部分）：表格纯空行在网格合并后剥除（有 merged_cells 时保守保留，
+   计数 dropped_blank_table_rows）；分组标签行治理仍留 P2。
+
 ## 9. 明确不做
 
 - 不抽取 claim；不做 table_cell / page-bbox 核心索引；不做 LLM 语义价值判断；

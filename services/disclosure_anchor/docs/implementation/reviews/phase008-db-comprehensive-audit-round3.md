@@ -526,6 +526,23 @@ All five should be zero for the rebuilt acceptance corpus, or every non-zero row
   P2#11 residual flat-numbering drift inside 审计报告-style notes, P2#12 leak gate
   assertion, P2#13 locator JSON null.
 
+## Round4 (Codex independent re-audit, 2026-07-06) — resolution
+
+- Verdict was no-go with 4 P1s; verification outcome:
+  - P1#1 semantic_key swallowed by grouping — CONFIRMED → fixed in ub-2026.07-6:
+    part-level semantic_key + unit `semantic_keys` jsonb column (0013, GIN, view 36 cols,
+    projection hash + PROJECTION_FIELDS + contracts).
+  - P1#2 note heading drift — CONFIRMED, root cause found: half-width parens ((1)/(一))
+    were unmapped so MinerU's flat heading_level=2 evicted the 科目 parent → cn_a_v3
+    adds both paren styles at L3/L5.
+  - P1#3 local_heading "stringified array" — FALSE POSITIVE: jsonb_typeof shows 'array'
+    for all 614 parts; the review SQL used `->>` which renders arrays as text.
+  - P1#4 collapsed unit titled 第一章 总则 — CONFIRMED → collapse now uses the registry
+    document title (threaded from document.title into the builder).
+  - P2#1 table blank rows — blank rows now dropped at grid merge (kept when merged_cells
+    reference row indices); group-label rows remain open P2.
+  - P2#13 cleared (0 JSON-null locators on regenerated data); Status.md updated.
+
 ## Bottom Line
 
 当前最大问题不是 worker loop，而是 DB 成品的语义形状。`document_unit` 不能只是 MinerU 元素加一点 heading 的技术切片；它必须是 L2 能直接使用的披露语义证据。股东会议案这个例子说明：text/table 混合才是一个业务 unit，硬按 payload kind 切会让后续 L2 做大量脆弱拼接。先把 unit 边界从“技术块”升级成“业务语义块”，再谈 schema polish。

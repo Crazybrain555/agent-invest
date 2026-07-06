@@ -45,6 +45,7 @@ class UnitDraft:
     heading_path: list[str] = field(default_factory=list)
     title: str | None = None
     semantic_key: str | None = None
+    semantic_keys: list[str] | None = None
     quality_status: str = "ok"
     applicability: str | None = None
     artifact_locator: dict[str, Any] | None = None
@@ -61,6 +62,7 @@ class BuildStats:
     stripped_marker_lines: int = 0
     stripped_header_lines: int = 0
     merged_tables: int = 0
+    dropped_blank_table_rows: int = 0
     grouped_proposal_units: int = 0
     grouped_section_units: int = 0
     collapsed_documents: int = 0
@@ -79,6 +81,7 @@ class BuildStats:
             "stripped_marker_lines": self.stripped_marker_lines,
             "stripped_header_lines": self.stripped_header_lines,
             "merged_tables": self.merged_tables,
+            "dropped_blank_table_rows": self.dropped_blank_table_rows,
             "grouped_proposal_units": self.grouped_proposal_units,
             "grouped_section_units": self.grouped_section_units,
             "collapsed_documents": self.collapsed_documents,
@@ -424,6 +427,13 @@ def replace_text_units_with_qa_where_stable(units: Iterable[UnitDraft]) -> list[
     return output
 
 
+def _drop_blank_rows(rows: list[list[str]], stats: BuildStats | None) -> list[list[str]]:
+    kept = [row for row in rows if any(str(cell).strip() for cell in row)]
+    if stats is not None:
+        stats.dropped_blank_table_rows += len(rows) - len(kept)
+    return kept
+
+
 def s5_build_table_units(elements: Iterable[PreparedElement], stats: BuildStats) -> list[UnitDraft]:
     items = list(elements)
     units: list[UnitDraft] = []
@@ -452,7 +462,7 @@ def s5_build_table_units(elements: Iterable[PreparedElement], stats: BuildStats)
                 continue
             break
         previous_text = _previous_text_before(items, element.order_index)
-        units.append(_table_group_to_unit(group, previous_text=previous_text))
+        units.append(_table_group_to_unit(group, previous_text=previous_text, stats=stats))
     return units
 
 
@@ -479,6 +489,9 @@ def s7_finalize_units(
     finalized: list[UnitDraft] = []
     for unit in units:
         semantic_key = unit.semantic_key or semantic_key_for_unit(unit, filing_type=filing_type)
+        keys = set(unit.semantic_keys or ())
+        if semantic_key:
+            keys.add(semantic_key)
         quality_status = _final_quality_status(unit)
         if quality_status == "needs_review":
             stats.needs_review_count += 1
@@ -490,6 +503,7 @@ def s7_finalize_units(
                 **{
                     **unit.__dict__,
                     "semantic_key": semantic_key,
+                    "semantic_keys": sorted(keys) or None,
                     "quality_status": quality_status,
                 }
             )
@@ -501,6 +515,7 @@ def build_unit_drafts_s1_s7(
     normalized_ir: dict[str, Any],
     *,
     filing_type: str | None,
+    document_title: str | None = None,
     image_bytes_resolver: ImageBytesResolver | None = None,
 ) -> tuple[list[UnitDraft], BuildStats]:
     s1 = s1_preprocess_elements(
@@ -521,7 +536,9 @@ def build_unit_drafts_s1_s7(
     units = _sink_leading_applicable(units)
     kept = s6_filter_units(units, s1.stats)
     kept = _anchor_headerless_units(kept, stats=s1.stats)
-    kept = s8_group_semantic_units(kept, filing_type=filing_type, stats=s1.stats)
+    kept = s8_group_semantic_units(
+        kept, filing_type=filing_type, document_title=document_title, stats=s1.stats
+    )
     return s7_finalize_units(kept, filing_type=filing_type, stats=s1.stats), s1.stats
 
 
@@ -554,7 +571,11 @@ def _anchor_headerless_units(
 
 
 def s8_group_semantic_units(
-    units: list[UnitDraft], *, filing_type: str | None, stats: BuildStats
+    units: list[UnitDraft],
+    *,
+    filing_type: str | None,
+    document_title: str | None = None,
+    stats: BuildStats,
 ) -> list[UnitDraft]:
     """Regroup technical slices into business-semantic units (round3 P0#1).
 
@@ -567,16 +588,18 @@ def s8_group_semantic_units(
     if filing_type in {"investor_relations", "performance_briefing"}:
         return units
     grouped, made_proposals = _group_proposal_units(
-        _split_units_at_proposal_anchors(units), stats=stats
+        _split_units_at_proposal_anchors(units), filing_type=filing_type, stats=stats
     )
     if made_proposals:
         # Proposals are done; the surrounding units (会议召开情况, 律师意见)
         # still deserve section grouping — mixed units never regroup.
-        return _group_section_units(grouped, stats=stats)
-    collapsed = _collapse_short_document(grouped, filing_type=filing_type, stats=stats)
+        return _group_section_units(grouped, filing_type=filing_type, stats=stats)
+    collapsed = _collapse_short_document(
+        grouped, filing_type=filing_type, document_title=document_title, stats=stats
+    )
     if collapsed is not None:
         return collapsed
-    return _group_section_units(grouped, stats=stats)
+    return _group_section_units(grouped, filing_type=filing_type, stats=stats)
 
 
 def _split_units_at_proposal_anchors(units: list[UnitDraft]) -> list[UnitDraft]:
@@ -620,7 +643,7 @@ def _split_units_at_proposal_anchors(units: list[UnitDraft]) -> list[UnitDraft]:
 
 
 def _group_proposal_units(
-    units: list[UnitDraft], *, stats: BuildStats
+    units: list[UnitDraft], *, filing_type: str | None, stats: BuildStats
 ) -> tuple[list[UnitDraft], bool]:
     out: list[UnitDraft] = []
     current: dict[str, Any] | None = None
@@ -630,7 +653,7 @@ def _group_proposal_units(
     def close() -> None:
         nonlocal current
         if current is not None:
-            out.append(_proposal_to_unit(current, stats=stats))
+            out.append(_proposal_to_unit(current, filing_type=filing_type, stats=stats))
             current = None
 
     for unit in units:
@@ -703,7 +726,9 @@ def _joins_proposal(unit: UnitDraft, parent_path: list[str]) -> bool:
     return normalized[: len(parent_path)] == parent_path
 
 
-def _proposal_to_unit(current: dict[str, Any], *, stats: BuildStats) -> UnitDraft:
+def _proposal_to_unit(
+    current: dict[str, Any], *, filing_type: str | None, stats: BuildStats
+) -> UnitDraft:
     members = [
         member for member in current["members"] if not _is_blank_text_unit(member)
     ]
@@ -726,19 +751,26 @@ def _proposal_to_unit(current: dict[str, Any], *, stats: BuildStats) -> UnitDraf
         payload_kind="mixed",
         payload={
             "semantic_type": "meeting_proposal",
-            "parts": [_unit_part(member, include_heading=False) for member in members],
+            "parts": [
+                _unit_part(member, include_heading=False) for member in members
+            ],
         },
         source_order=first.source_order,
         intra_order=first.intra_order,
         heading_path=heading_path,
         title=title,
+        semantic_keys=_member_semantic_keys(members, filing_type=filing_type),
         quality_status=_worst_quality(members),
         artifact_locator=_merged_locator(members),
     )
 
 
 def _collapse_short_document(
-    units: list[UnitDraft], *, filing_type: str | None, stats: BuildStats
+    units: list[UnitDraft],
+    *,
+    filing_type: str | None,
+    document_title: str | None = None,
+    stats: BuildStats,
 ) -> list[UnitDraft] | None:
     """Collapse a short filing into one document-level unit, or None to decline."""
 
@@ -749,7 +781,7 @@ def _collapse_short_document(
         return None
     if sum(len(_main_text(unit)) for unit in real) > rules.SHORT_DOC_CONTENT_CHARS:
         return None
-    title = next(
+    title = document_title or next(
         (
             unit.heading_path[0]
             for unit in real
@@ -765,12 +797,15 @@ def _collapse_short_document(
             payload_kind="mixed",
             payload={
                 "semantic_type": "document",
-                "parts": [_unit_part(unit, include_heading=True) for unit in real],
+                "parts": [
+                    _unit_part(unit, include_heading=True) for unit in real
+                ],
             },
             source_order=first.source_order,
             intra_order=first.intra_order,
             heading_path=[title] if title else [rules.DOCUMENT_HEADER_ANCHOR],
             title=title,
+            semantic_keys=_member_semantic_keys(real, filing_type=filing_type),
             quality_status=_worst_quality(real),
             artifact_locator=_merged_locator(real),
         )
@@ -778,7 +813,7 @@ def _collapse_short_document(
 
 
 def _group_section_units(
-    units: list[UnitDraft], *, stats: BuildStats
+    units: list[UnitDraft], *, filing_type: str | None, stats: BuildStats
 ) -> list[UnitDraft]:
     """Merge each business section's text/table/image slices into one unit.
 
@@ -819,7 +854,11 @@ def _group_section_units(
     def close() -> None:
         nonlocal group
         if group:
-            out.extend(_section_group_to_units(group, list(group_key), stats=stats))
+            out.extend(
+                _section_group_to_units(
+                    group, list(group_key), filing_type=filing_type, stats=stats
+                )
+            )
             group = []
 
     for unit in units:
@@ -837,7 +876,11 @@ def _group_section_units(
 
 
 def _section_group_to_units(
-    members_all: list[UnitDraft], key: list[str], *, stats: BuildStats
+    members_all: list[UnitDraft],
+    key: list[str],
+    *,
+    filing_type: str | None,
+    stats: BuildStats,
 ) -> list[UnitDraft]:
     members = [unit for unit in members_all if not _is_blank_text_unit(unit)]
     if not members:
@@ -860,11 +903,32 @@ def _section_group_to_units(
             intra_order=first.intra_order,
             heading_path=list(key),
             title=key[-1] if key else first.title,
+            semantic_keys=_member_semantic_keys(members, filing_type=filing_type),
             quality_status=_worst_quality(members),
             applicability=_uniform_applicability(members),
             artifact_locator=_merged_locator(members),
         )
     ]
+
+
+def _member_semantic_keys(
+    members: list[UnitDraft], *, filing_type: str | None
+) -> list[str] | None:
+    """Recall keys of the grouped members — column-bound, never in payload.
+
+    Embedding keys in parts would push a rules-derived value into content_hash
+    (U2 forbids rule upgrades masquerading as content changes).
+    """
+
+    keys = {
+        key
+        for member in members
+        if (
+            key := member.semantic_key
+            or semantic_key_for_unit(member, filing_type=filing_type)
+        )
+    }
+    return sorted(keys) or None
 
 
 def _uniform_applicability(members: list[UnitDraft]) -> str | None:
@@ -1273,7 +1337,9 @@ def _previous_text_before(elements: list[PreparedElement], order_index: int) -> 
     return ""
 
 
-def _table_group_to_unit(group: list[PreparedElement], *, previous_text: str) -> UnitDraft:
+def _table_group_to_unit(
+    group: list[PreparedElement], *, previous_text: str, stats: BuildStats | None = None
+) -> UnitDraft:
     first = group[0]
     if first.table_parse_failed:
         return UnitDraft(
@@ -1291,6 +1357,10 @@ def _table_group_to_unit(group: list[PreparedElement], *, previous_text: str) ->
         )
 
     headers, rows, merged_cells = _merged_table_grid(group)
+    if not merged_cells:
+        # Blank rows are noise (Codex round4 P2#1); kept when merged_cells
+        # exist because those reference rows by index.
+        rows = _drop_blank_rows(rows, stats)
     payload = {
         "caption": list(first.table_caption),
         "unit": _detect_unit(first, headers=headers, previous_text=previous_text),

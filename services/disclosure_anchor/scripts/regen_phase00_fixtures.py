@@ -247,6 +247,7 @@ def _write_document_units(
                 "payload_kind": draft.payload_kind,
                 "quality_status": draft.quality_status,
                 "semantic_key": draft.semantic_key,
+                "semantic_keys": draft.semantic_keys,
                 "title": draft.title,
             }
         )

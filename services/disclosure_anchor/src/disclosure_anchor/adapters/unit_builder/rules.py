@@ -6,8 +6,8 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-5"
-HEADING_RULESET_ID = "cn_a_v2"
+RULES_VERSION = "ub-2026.07-6"
+HEADING_RULESET_ID = "cn_a_v3"
 GIBBERISH_RATIO_MAX = 0.30
 
 # A-share applicability declaration lines ("√适用 □不适用" / "□适用 √不适用").
@@ -126,6 +126,9 @@ NOISE_SEPARATOR_RE = re.compile(r"^[\s\-—―=_·•\*~～]{3,}$")
 NOISE_LINE_PATTERNS: tuple[re.Pattern[str], ...] = ()
 
 # Canonical CN filing hierarchy: 节/章 > 一、 > （一） > 1、 > （1） > ①.
+# Both full-width and half-width parens per level: MinerU flattens audit-note
+# headings to heading_level=2, so an unmatched "(1) 明细情况" used to enter at
+# level 2 and evict its 科目 parent from the stack (Codex round4 P1#2).
 # Digit-paren (（1）/1）) forms were previously unmapped, so MinerU's own
 # heading_level placed them right under the 节 and they swallowed sibling
 # 1、-level topics as children (round3 P1#11 drift; observed merging 研发投入
@@ -134,9 +137,9 @@ NOISE_LINE_PATTERNS: tuple[re.Pattern[str], ...] = ()
 HEADING_PATTERNS: tuple[tuple[int, re.Pattern[str]], ...] = (
     (1, re.compile(r"^第[一二三四五六七八九十百]+[节章]")),
     (2, re.compile(r"^[一二三四五六七八九十]+、")),
-    (3, re.compile(r"^（[一二三四五六七八九十]+）")),
+    (3, re.compile(r"^（[一二三四五六七八九十]+）|^\([一二三四五六七八九十]+\)")),
     (4, re.compile(r"^\d+([.、．]|\s)")),
-    (5, re.compile(r"^（\d+）|^\d+[)）]")),
+    (5, re.compile(r"^（\d+）|^\(\d+\)|^\d+[)）]")),
     (6, re.compile(r"^[①②③④⑤⑥⑦⑧⑨⑩]")),
 )
 FIXED_L1_TITLES = {"重要提示", "释义", "目录", "备查文件"}

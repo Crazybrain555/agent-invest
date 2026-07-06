@@ -71,6 +71,7 @@ class DocumentUnitV1(PublicModel):
     title: str | None
     order_index: int
     semantic_key: str | None
+    semantic_keys: list[str] | None
     payload: dict[str, Any]
     content_hash: str
     structure_hash: str | None

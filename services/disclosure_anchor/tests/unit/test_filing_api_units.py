@@ -64,6 +64,7 @@ def _unit_row(
         "title": "风险提示",
         "order_index": order_index,
         "semantic_key": "risk",
+        "semantic_keys": ["risk"],
         "payload": {"b": 2, "a": "披露"},
         "content_hash": "sha256:" + "b" * 64,
         "structure_hash": "sha256:" + "c" * 64,

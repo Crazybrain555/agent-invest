@@ -22,6 +22,7 @@ PROJECTION_FIELDS = (
     "title",
     "heading_path",
     "semantic_key",
+    "semantic_keys",
     "quality_status",
     "applicability",
 )
