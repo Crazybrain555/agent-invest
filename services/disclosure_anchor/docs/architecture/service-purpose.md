@@ -11,9 +11,9 @@ scope: self_maintained_exchange_disclosures
 output_kind: l2_ready_document_units
 output_form: queryable_database_plus_filing_api
 payload_kinds: [text, table, qa, mixed]
-query_keys: [company_ref, security_ref, report_period, announcement_date, filing_type, document_id, asset_id, payload_kind, heading_path, semantic_key, quality_status, content_hash, source_ref, producer_action_ref]
+query_keys: [company_ref, security_ref, report_period, announcement_date, filing_type, document_id, asset_id, payload_kind, heading_path, semantic_key, semantic_keys, applicability, page_no, quality_status, content_hash, source_ref, producer_action_ref]
 core_objects: [company, security, source_access, document, processing_run, document_unit]
-optional_objects: [source_checkpoint]
+optional_objects: [source_checkpoint, provider_category]
 primary_store: postgresql
 raw_store: filesystem
 parser_artifact_store: filesystem
@@ -160,7 +160,8 @@ agent 运行时为了控制上下文长度，可以临时合并、截取或拆�
 检索策略同理分两层：`document_unit` 是证据锚点（durable semantic retrieval anchor），
 其上可叠加 retrieval/search projection 派生发现层（heading_path_text、keywords、search_text、
 可选 summary），帮助 AI/L2 按语义找到 unit。投影不进 content_hash、不替代 payload、不作为
-证据；不引入 persistent chunk / RAG node / 独立向量库（边界与实现见 milestone 05-U7 / 06R）。
+证据；不引入 persistent chunk / RAG node / 独立向量库（边界与实现见 milestone 05-U7 / 06R；
+06R 为规划中的检索投影里程碑，规格文档尚未编写）。
 
 ## 2.4 表格先保留完整结构，不急于全市场标准化
 
@@ -340,7 +341,7 @@ filing_type ∈ {investor_relations, performance_briefing} → tier_0b（软披�
 
 `document_unit` 表示这份文档中供 L2 直接使用的结构单元。
 
-第一版只有三种：
+第一版有四种（`mixed` 自迁移 0011 起加入，见 §6.5）：
 
 ```text
 text
@@ -351,12 +352,15 @@ table
 
 qa
 一个完整 Question + Answer
+
+mixed
+一个业务语义块内 text/table 交替的有序组合（议案、短公告整体、业务小节），定义见 §6.5
 ```
 
 没有 `event_unit`。短公告中的事件字段由 `L2` 从 `text/table` 单元中抽取，形成事件类
 `evidence_record` 或后续派生对象。
 
-术语对齐顶层 v0.7（已完成收敛，迁移 `0006_v07_terminology_convergence`）：
+术语对齐顶层协议（收敛完成于 v0.7 时期，迁移 `0006_v07_terminology_convergence`；现行 v0.8 同口径）：
 
 - 本服务代码、数据库列与 public view 统一使用 `payload_kind`；`unit_kind` 为曾用名，不再出现在任何契约面；
 - 当 `asset_kind = document_unit` 时，`payload_kind` 即顶层协议的同名字段，无需映射；
@@ -859,6 +863,10 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - `payload_kind`；
 - `heading_path`；
 - `semantic_key`；
+- `semantic_keys`（0013 起的 jsonb 数组列；**mixed 单元的召回必须用它**——单值
+  `semantic_key` 查不到并入 parts 的 key）；
+- `applicability`（0010 起，节适用性一等筛选列）；
+- `page_no`（0010 起，定位与审查的一等筛选参数）；
 - `quality_status`；
 - `content_hash`；
 - `source_ref`；
@@ -866,12 +874,29 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - 标题；
 - `asset_id`。
 
+查询面说明：上述键在 `disclosure_public.*_v1` 视图上全部可作谓词（DB 直读满足全集）；
+Filing API 首版只暴露其中一部分为查询参数（documents：company_ref / security_code /
+filing_type / report_period / announcement_date_from,to / status；units：payload_kind /
+semantic_key / quality_status / heading_prefix），其余键经 DB 视图直读或后续 API 升版满足。
+
 全文关键词检索可以后加，但不是证据对象，也不要求向量化。
 
 ## 12.1 Public view 读契约
 
 跨服务读侧只经 `disclosure_public.*_v1` 或等价 Filing API 暴露，不要求下游理解
 `disclosure_core` / `disclosure_ops` 私有表。
+
+当前 public view 全集（与 `contract-checklist.md` §3 一致）：
+
+```text
+documents_v1 / document_units_v1 / document_categories_v1 /
+processing_runs_v1 / source_refs_v1 / change_events_v1
+```
+
+`document_categories_v1`（0012 迁移，contract_version `document_category.v1`）暴露 provider
+原生分类维表：CNINFO F006V 段 × `provider_category` 字典（p_info3005 快照 seed）；facet
+语义只给 ordinal、不造 is_primary；`filing_type` 仍是 §5.1 的 9 值粗桶契约词表，原始分类
+语义经该视图完整可查。
 
 `document_units_v1` 必须保留足够的 unit 级 scope keys：
 
@@ -907,10 +932,21 @@ order_index
 `asset_kind`（常量 document_unit）、`observed_at`（= created_at 别名）、`source_tier`
 （按 §5.1 映射 CASE 派生）、`trace_level`（常量 G0）、`raw_file_hash`（join document）；
 另投影 `query_projection_hash`（document_unit 存储列，05-U2 查询投影哈希）——0007 新增共
-6 列，32 列全集以 04R-R7 为准。
+6 列，至 04R-R7 为 32 列。
 
 0008 迁移起，`processing_runs_v1` 投影 `builder_rules_version`，用于 05-U6 builder 规则
 归因；历史 run 可为 NULL，05 builder 成功落库的 run 必须等于当前 `rules.RULES_VERSION`。
+
+0010–0013 迁移起的 `document_units_v1` 增量列（列全集 = 04R-R7 的 32 列 +
+0010 `applicability`/`page_no` + 0011 `is_active_run` + 0013 `semantic_keys` = **36 列**，
+以 `docs/implementation/checks/contract-checklist.md` §2 为准）：
+
+- 0010：`applicability`（'applicable'|'not_applicable'|NULL，节适用性一等筛选列，部分索引）
+  与 `page_no`（artifact_locator 首页码提升列）；
+- 0011：`is_active_run` 成为 `document_units_v1` / `source_refs_v1` 的真实视图列
+  （DB 直读方可直接过滤 active run）；同迁移将 `payload_kind` CHECK 扩为含 `mixed`（§6.5）；
+- 0013：`semantic_keys`（jsonb 数组 = 单元自身 `semantic_key` ∪ mixed parts 的 key，
+  GIN 部分索引；纳入 `query_projection_hash` 与 outbox 投影字段）。
 
 `asset://` URI（顶层协议 §2.3）只在序列化边界派生，不落存储：
 

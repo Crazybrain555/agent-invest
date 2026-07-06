@@ -1,0 +1,9 @@
+# disclosure_anchor company watchlist (the ONLY human-maintained input).
+# Apply with: make track   (idempotent upsert into tracked_company)
+# Columns: security_code,exchange(optional: SSE|SZSE, default by code),lookback_days(optional),sync_frequency(optional: hourly|daily|weekly),note
+security_code,exchange,lookback_days,sync_frequency,note
+600519,SSE,,,贵州茅台
+002484,SZSE,,,江海股份
+000001,SZSE,,,平安银行
+000333,SZSE,,,美的集团
+600036,SSE,,,招商银行

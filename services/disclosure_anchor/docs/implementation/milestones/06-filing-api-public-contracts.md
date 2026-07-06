@@ -2,9 +2,9 @@
 id: disclosure_anchor_milestone_06_filing-api-public-contracts
 project: disclosure_anchor
 title: Filing API 与 public 契约
-status: ready-for-implementation
+status: complete
 created_at: 2026-06-26
-updated_at: 2026-07-04
+updated_at: 2026-07-07
 depends_on: milestone 05
 delivers_to: milestone 07 / L2 / MCP 包装
 ---
@@ -171,7 +171,8 @@ VALIDATION_ERROR           → 422，参数/游标校验失败（坏 base64/JSON
    `quality_status` / `heading_prefix` 过滤；`heading_prefix` 语义 = heading_path **数组前缀
    匹配**（实现：GIN jsonb_path_ops containment 作候选过滤，命中后精确校验前缀，不把
    containment 当长期方案）。全文/向量检索不在本期：`GET /v1/search/units`
-   （PostgreSQL FTS/pg_trgm + retrieval projection 派生层，边界见 05-U7）保留给 06R，
+   （PostgreSQL FTS/pg_trgm + retrieval projection 派生层，边界见 05-U7）保留给 06R
+   （06R 为规划中的检索投影里程碑，规格文档尚未编写），
    本期 DTO 与游标契约不得阻断其后续加入。
 
 ## 4. 检查点
@@ -226,3 +227,16 @@ provider_document_id=文件名去后缀）。
 - 视图列与 schema 漂移：contract test 先红——先改视图迁移或 schema，再改代码。
 - 大 payload 响应慢：payload 完整返回是契约，不截断；必要时上游加 `fields=` 白名单参数（可选）。
 - L1_PROCESSING_REQUIRED 误报：判定只依赖 document.status + active run 存在性，不看文件系统。
+
+## 9. 实施后修订（2026-07-07 记录）
+
+- **DERIVED 集收缩为 `{asset_uri}`**（0011 迁移定案，phase008 round3 P1#7）：`is_active_run`
+  自 0011 起是 `document_units_v1` / `source_refs_v1` 的**真实视图列**，不再是 API 派生字段。
+  §3.1 的 "派生字段全集 = {asset_uri, is_active_run}、均不入库不进视图" 与 §3.5 的
+  `DERIVED = {"asset_uri","is_active_run"}` 以本条为准修正：unit 级 DTO 派生字段全集 =
+  `{asset_uri}`；`document_unit.v1.json` 的 properties 同时收录 asset_uri（派生）与
+  is_active_run（视图列）；三方一致断言按 `DERIVED = {"asset_uri"}` 执行
+  （tests/integration/test_filing_api_views_contract.py 与 contract-checklist §2 已同步）。
+- §1 的 "32 列全集见 04R-R7" 是本文编写时口径：0010–0013 迁移后 `document_units_v1`
+  为 36 列（+applicability/page_no/is_active_run/semantic_keys），列全集以
+  contract-checklist §2 为准。

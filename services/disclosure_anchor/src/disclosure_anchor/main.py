@@ -75,6 +75,8 @@ def create_app(settings: Settings | None = None, *, validate_runtime: bool = Tru
         app.include_router(units_router)
     if changes_router is not None:
         app.include_router(changes_router)
-    if admin_router is not None:
+    if admin_router is not None and resolved_settings.disclosure_enable_admin_api:
+        # Unauthenticated local-ops surface: explicitly opt-in, never on the
+        # L2-facing deployment (round8 audit blocker).
         app.include_router(admin_router)
     return app

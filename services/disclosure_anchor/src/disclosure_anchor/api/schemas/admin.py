@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Literal, Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -41,9 +41,11 @@ class RegisterLocalPdfResponse(AdminModel):
 
 
 class ParserOptionsRequest(AdminModel):
-    method: str | None = None
-    backend: str | None = None
-    language: str | None = None
+    # Closed vocabularies: these values become MinerU argv; free strings
+    # starting with '-' would inject CLI flags into the subprocess.
+    method: Literal["auto", "txt", "ocr"] | None = None
+    backend: Literal["pipeline", "vlm-transformers", "vlm-sglang-engine"] | None = None
+    language: Literal["ch", "en"] | None = None
     formula: bool | None = None
     table: bool | None = None
     start_page: int | None = None

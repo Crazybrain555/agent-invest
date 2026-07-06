@@ -53,3 +53,6 @@ created_at: 2026-06-26
 | A41 | Filing API 错误码（NOT_FOUND/GONE_SUPERSEDED/L1_PROCESSING_REQUIRED/CONTRACT_VERSION_MISMATCH/VALIDATION_ERROR）contract test 全绿 | 06 | contract test | pass |
 
 状态枚举：`pending / pass / fail / blocked / intentionally-deferred`。
+
+注：A38–A40 的对应阶段 "06R"（检索投影派生层）是规划中的里程碑，规格文档尚未编写
+（`docs/implementation/milestones/` 下暂无 06R 文件）；三行在其立项前保持 pending。

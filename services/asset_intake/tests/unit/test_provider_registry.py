@@ -32,9 +32,16 @@ class RegistryLoadingTests(unittest.TestCase):
     def test_cross_references_pass(self) -> None:
         validate_cross_references(ENTRIES, CATALOGS)
 
-    def test_all_first_wave_entries_active(self) -> None:
-        for entry in ENTRIES.values():
-            self.assertEqual(entry.status, "active", entry.dataset_key)
+    def test_first_wave_statuses(self) -> None:
+        # 2026-07-07 用户裁定:行情/复权移出当前范围,eod_quote 以 status 开关退场。
+        expected = {
+            "cn_equity.earnings_event": "active",
+            "cn_equity.eod_quote": "deprecated",
+            "cn_equity.fin_metric": "active",
+            "cn_equity.fin_statement": "active",
+        }
+        for key, entry in ENTRIES.items():
+            self.assertEqual(entry.status, expected[key], key)
 
     def test_wind_catalog_pins_probed_active_tables(self) -> None:
         aliases = CATALOGS["wind_rds"].table_aliases
@@ -151,8 +158,10 @@ class ActivationTests(unittest.TestCase):
         with self.assertRaises(RegistryError) as ctx:
             preflight_provider(catalog, ENTRIES, FakeProber({}))
         message = str(ctx.exception)
-        for alias in ("eod_prices", "fin_income", "earnings_forecast"):
+        for alias in ("fin_income", "fin_indicator", "earnings_forecast"):
             self.assertIn(alias, message)
+        # deprecated 数据集(eod_quote)不参与 preflight——status 开关生效的行为钉住。
+        self.assertNotIn("eod_prices", message)
 
 
 if __name__ == "__main__":

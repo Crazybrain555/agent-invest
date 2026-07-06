@@ -72,6 +72,11 @@ class WorkerConfig:
     cninfo_overlap_days: int
     cninfo_max_retries: int
     cninfo_oversized_kb: int
+    # First-sync historical backfill (user decision: 三年是底线).
+    initial_lookback_days: int = 1095
+    # None → parse everything; a prefix tuple → 'other' docs need a matching
+    # F006V category segment (parse scope 'core').
+    parse_scope_category_prefixes: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -167,8 +172,13 @@ def _sync_stage(
             )
             continue
         window_start = _sync_window_start(
-            row.get("window_end"), today=today, overlap_days=deps.config.cninfo_overlap_days
+            row.get("window_end"),
+            today=today,
+            overlap_days=deps.config.cninfo_overlap_days,
+            initial_lookback_days=deps.config.initial_lookback_days,
+            lookback=row.get("lookback"),
         )
+        categories = row.get("filing_categories")
         try:
             result = use_case.execute(
                 SyncDisclosureIndexCommand(
@@ -176,6 +186,7 @@ def _sync_stage(
                     exchange=str(exchange),
                     window_start=window_start,
                     window_end=today,
+                    categories=tuple(categories) if categories else None,
                 )
             )
         except Exception as exc:
@@ -192,12 +203,24 @@ def _sync_stage(
         report.candidates_discovered += result.candidate_count
 
 
-def _sync_window_start(window_end: object, *, today: date, overlap_days: int) -> date:
+def _sync_window_start(
+    window_end: object,
+    *,
+    today: date,
+    overlap_days: int,
+    initial_lookback_days: int = 1095,
+    lookback: object = None,
+) -> date:
     if isinstance(window_end, str) and window_end:
         return date.fromisoformat(window_end) - timedelta(days=overlap_days)
-    # Never synced through the worker yet: incremental lookback only; the
-    # historical backfill is an explicit `make sync COMPANY=… WINDOW=N` step.
-    return today - timedelta(days=overlap_days)
+    # Never synced: default historical backfill (user decision 2026-07-06,
+    # 三年是底线), with an optional per-company tracked override {"days": N}.
+    days = initial_lookback_days
+    if isinstance(lookback, dict):
+        override = lookback.get("days")
+        if isinstance(override, int) and override >= 0:
+            days = override
+    return today - timedelta(days=days)
 
 
 def _download_stage(
@@ -270,7 +293,10 @@ def _parse_stage(
 
     with deps.engine.connect() as conn:
         pending = queries.pending_parse(
-            conn, max_retries=deps.config.max_parse_retries, limit=limit
+            conn,
+            max_retries=deps.config.max_parse_retries,
+            limit=limit,
+            scope_category_prefixes=deps.config.parse_scope_category_prefixes,
         )
     parse_use_case = ParseDocument(
         parser=deps.parser_factory(),

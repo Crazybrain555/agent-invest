@@ -207,15 +207,17 @@ def regenerate_sample(sample_key: str) -> str:
     return _coverage_line(sample_key, normalized)
 
 
-def _write_document_units(
-    sample_key: str, normalized: dict[str, Any], sample_dir: Path
-) -> None:
-    """Regenerate the golden unit fixture from the current builder rules.
+def render_document_units_jsonl(
+    *, normalized_ir: dict[str, Any], sample_key: str
+) -> str:
+    """Render the golden unit fixture from the current builder rules.
 
     Deterministic ids ({sample_key}_{kind}_{seq:04d}) keep diffs reviewable
-    when the rule bundle version changes.
+    when the rule bundle version changes. Shared by the regen script and the
+    fixture-determinism contract test.
     """
 
+    normalized = normalized_ir
     drafts, _stats = build_unit_drafts_s1_s7(
         normalized,
         filing_type=SAMPLE_METADATA[sample_key].get("filing_type"),
@@ -251,9 +253,17 @@ def _write_document_units(
                 "title": draft.title,
             }
         )
+    return "".join(
+        json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows
+    )
+
+
+def _write_document_units(
+    sample_key: str, normalized: dict[str, Any], sample_dir: Path
+) -> None:
     units_path = sample_dir / "document_units.v1.jsonl"
     units_path.write_text(
-        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows),
+        render_document_units_jsonl(normalized_ir=normalized, sample_key=sample_key),
         encoding="utf-8",
     )
 

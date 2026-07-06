@@ -2,8 +2,9 @@
 id: disclosure_anchor_milestone_04R_phase000_004_rework
 project: disclosure_anchor
 title: Phase000–004 返工（契约与行为收敛）
-status: ready-for-implementation
+status: complete
 created_at: 2026-07-04
+updated_at: 2026-07-07
 depends_on: milestones 00–04（已完成）
 delivers_to: milestone 05
 ---
@@ -98,7 +99,8 @@ canonical 契约（`service-purpose.md` v1.2 + 顶层协议 v0.7）的深度评�
 5. UoW 默认回滚语义；parse 前 raw hash 校验、失败 run 不扰动 active run；
 6. `uq_processing_run_one_active_per_document` 与 `uq_document_unit_run_order` 索引；
 7. 结构化错误 JSON（stage/error_code/retryable）；公共面无路径泄漏；
-8. 三 schema + 四角色权限模型；迁移 0001–0006 冻结不改；
+8. 三 schema + 四角色权限模型；迁移 0001–0006 冻结不改（编写本文时的口径；冻结前沿随发布推进，
+   现行策略见 `src/disclosure_anchor/adapters/db/postgres/AGENTS.md`：已应用迁移一律冻结）；
 9. `document_units_v1` 的 15 个 §12.1 scope keys；asset_uri 不落库；
 10. MinerU 代理环境剥离（Phase00 验证过的刻意行为）。
 

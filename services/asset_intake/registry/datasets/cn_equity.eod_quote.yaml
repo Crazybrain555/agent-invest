@@ -2,7 +2,7 @@
 schema_version: dataset_registry.v1
 dataset_key: cn_equity.eod_quote
 dataset_contract_version: 1
-status: active
+status: deprecated   # 2026-07-07 用户裁定:行情/复权移出当前范围(价格属后续支线);preflight 不再启用
 
 semantic_contract:
   description: A股日行情(不复权 OHLCV + 复权因子);qfq/hfq 是消费端派生视图,不是 L1 canonical。

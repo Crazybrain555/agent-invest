@@ -1,10 +1,16 @@
 # disclosure-anchor
 
-A local disclosure raw-data service for financial reports, announcements, provenance tracking, parsing, storage, and downstream L2/L3 evidence pipelines.
+Local L1 disclosure-file service for the investment-research prediction engine: it watches a
+hand-maintained tracked-company list, syncs CNINFO disclosure indexes, archives immutable raw PDFs,
+parses them with MinerU, slices them into L2-ready `document_unit` rows, and publishes the active
+processing run behind stable public read contracts.
 
-## Phase 01 local commands
+Pipeline: sync (CNINFO index, API/web channels) → download (immutable raw archive) → parse
+(MinerU → NormalizedIR v2) → build units (S1–S8 semantic slicing; payload kinds
+text/table/qa/mixed) → publish active run (+ change events). A worker loop drives the queues;
+the Filing API exposes the `disclosure_public.*_v1` views; DB migrations run 0001–0013.
 
-Create a local ignored virtual environment and install declared dependencies:
+## Setup
 
 ```bash
 /opt/miniconda3/bin/python3 -m venv .venv
@@ -14,22 +20,24 @@ Create a local ignored virtual environment and install declared dependencies:
 Set service runtime paths in your shell or a private env file outside this checkout. `.env.template` and
 `.env.example` show the expected disclosure_anchor variables and keep all credentials as placeholders.
 
-Run the Phase 01 checks:
+## Common commands
 
 ```bash
-make test-unit
-make doctor
-make api
+make db-create migrate    # bootstrap roles/database, apply migrations 0001-0013
+make track FILE=...       # upsert the tracked-company watchlist (offline, idempotent)
+make sync COMPANY=<scode> [WINDOW=n]   # sync one company's disclosure index
+make worker-once          # one worker round: sync -> download -> parse -> build -> publish
+make worker-loop          # continuous worker (singleton advisory lock)
+make api                  # Filing API on 127.0.0.1:8711 (fails closed without env/mount sentinel)
+make doctor               # environment + data integrity checks
+make agent-check          # lint + strict mypy + no-DB tests + diff check
+make test                 # live-DB gates
+make archive              # clean source archive from tracked files (git archive)
 ```
 
-`make api` starts a local uvicorn app factory on `127.0.0.1:8711` and refuses to boot when required runtime
-environment variables, the external root, or the mount sentinel are missing.
+## Pointers
 
-Create a clean source archive from tracked files only:
-
-```bash
-make archive
-```
-
-The archive target uses `git archive`, so ignored local state such as `.env`, `.venv`, `tmp/`, `__pycache__/`,
-and large parser artifacts are not packaged.
+- Canonical contract: `docs/architecture/service-purpose.md`
+- Milestone specs and acceptance: `docs/implementation/milestones/`, `docs/implementation/checks/`
+- Code map: `src/disclosure_anchor/AGENTS.md` (per-directory AGENTS.md, nearest wins)
+- Cross-agent operating contract: `AGENTS.md`

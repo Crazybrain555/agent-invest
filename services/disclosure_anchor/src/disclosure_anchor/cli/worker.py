@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from importlib import resources
+
 import argparse
 import signal
 import time
@@ -166,9 +169,24 @@ def _deps(settings: Settings, engine: Engine) -> WorkerDeps:
             cninfo_overlap_days=settings.cninfo_overlap_days,
             cninfo_max_retries=settings.cninfo_max_retries,
             cninfo_oversized_kb=settings.cninfo_oversized_kb,
+            initial_lookback_days=settings.disclosure_initial_lookback_days,
+            parse_scope_category_prefixes=_parse_scope_prefixes(settings),
         ),
         clock=lambda: datetime.now(timezone.utc),
     )
+
+
+def _parse_scope_prefixes(settings: Settings) -> tuple[str, ...] | None:
+    """None = parse everything; tuple = 'core' scope prefixes for 'other' docs."""
+
+    if settings.disclosure_parse_scope == "all":
+        return None
+    payload = json.loads(
+        resources.files("disclosure_anchor.application.worker")
+        .joinpath("parse_scope.json")
+        .read_text(encoding="utf-8")
+    )
+    return tuple(str(p) for p in payload["core_other_category_prefixes"])
 
 
 def _append_reports(settings: Settings, report: WorkerReport) -> None:

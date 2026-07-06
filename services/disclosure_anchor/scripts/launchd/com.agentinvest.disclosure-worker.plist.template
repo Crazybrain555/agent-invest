@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.agentinvest.disclosure-worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>__REPO__/scripts/run_worker_once.sh</string>
+  </array>
+  <key>StartInterval</key><integer>7200</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>__RUNTIME__/logs/launchd-worker.out</string>
+  <key>StandardErrorPath</key><string>__RUNTIME__/logs/launchd-worker.err</string>
+</dict>
+</plist>

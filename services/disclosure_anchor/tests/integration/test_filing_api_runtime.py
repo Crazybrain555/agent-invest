@@ -113,6 +113,7 @@ def _settings(root: Path, *, mineru: Path | None = None) -> Settings:
     data_root = root / "services" / "disclosure_anchor"
     shared_root = root / "shared"
     return Settings(
+        disclosure_enable_admin_api=True,
         disclosure_data_root=data_root,
         disclosure_shared_root=shared_root,
         disclosure_runtime_root=data_root / "runtime",
@@ -204,6 +205,24 @@ def _api_request(
         headers=response_headers,
         body=b"".join(chunks),
     )
+
+
+def _unit_texts(unit: dict[str, Any]) -> str:
+    payload = unit.get("payload") or {}
+    if unit.get("payload_kind") == "mixed":
+        return " ".join(
+            str(part.get("text") or "") for part in payload.get("parts", [])
+        ).strip()
+    return str(payload.get("text") or "").strip()
+
+
+def _unit_table_parts(unit: dict[str, Any]) -> list[dict[str, Any]]:
+    payload = unit.get("payload") or {}
+    if unit.get("payload_kind") == "table":
+        return [payload]
+    if unit.get("payload_kind") == "mixed":
+        return [p for p in payload.get("parts", []) if p.get("kind") == "table"]
+    return []
 
 
 def _assert_no_leaks(test: unittest.TestCase, settings: Settings, payload: Any) -> None:
@@ -964,26 +983,30 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
         self, *, sample: AdminSample, units: list[dict[str, Any]]
     ) -> None:
         if sample.label == "annual_report":
+            # ub-2026.07-5+ semantic grouping: business sections are mixed
+            # units with ordered parts; recall keys live in semantic_keys.
             self.assertTrue(
                 any(
-                    unit["payload_kind"] == "text"
-                    and "管理层讨论与分析" in " ".join(unit["heading_path"])
-                    and unit["payload"].get("text")
+                    "管理层讨论与分析" in " ".join(unit["heading_path"])
+                    and _unit_texts(unit)
                     for unit in units
                 )
             )
-            receivable_tables = [
+            receivable_units = [
                 unit
                 for unit in units
-                if unit["payload_kind"] == "table"
-                and unit["semantic_key"] == "receivable_aging"
+                if "receivable_aging" in (unit.get("semantic_keys") or [])
+                or unit.get("semantic_key") == "receivable_aging"
             ]
-            self.assertTrue(receivable_tables)
-            self.assertTrue(
-                any(unit["payload"].get("headers") for unit in receivable_tables)
-            )
-            self.assertTrue(any(unit["payload"].get("rows") for unit in receivable_tables))
-            self.assertTrue(any(unit["payload"].get("unit") for unit in receivable_tables))
+            self.assertTrue(receivable_units)
+            tables = [
+                part
+                for unit in receivable_units
+                for part in _unit_table_parts(unit)
+            ]
+            self.assertTrue(any(part.get("headers") for part in tables))
+            self.assertTrue(any(part.get("rows") for part in tables))
+            self.assertTrue(any(part.get("unit") for part in tables))
         elif sample.label == "ir_activity":
             qa_units = [unit for unit in units if unit["payload_kind"] == "qa"]
             self.assertGreaterEqual(len(qa_units), 30)

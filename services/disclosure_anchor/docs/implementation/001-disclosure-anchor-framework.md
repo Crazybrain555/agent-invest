@@ -61,7 +61,7 @@ CNINFO / 交易所 / 本地 PDF
 → MinerU parser artifact
 → parser-neutral normalized IR
 → 载体规范化（确定性噪声处理）
-→ document_unit(text/table/qa)
+→ document_unit(text/table/qa/mixed)
 → active processing_run
 → Filing API / public read view / source_ref / change_event
 ```
@@ -115,7 +115,7 @@ Wind / iFinD / Choice / Tushare 标准数据仓库
 | 对象 | 用途 | 典型消费者 |
 |---|---|---|
 | `document` | 一份披露文件版本的元数据、来源、raw hash、状态 | L2、人工工具 |
-| `document_unit` | L2 可直接消费的 text/table/qa 结构单元 | L2 |
+| `document_unit` | L2 可直接消费的 text/table/qa/mixed 结构单元 | L2 |
 | `processing_run` | 一次解析、清洗、切分运行版本 | L2、复盘、人工诊断 |
 | `source_ref` | 下游 claim 可引用的披露来源锚 | L2/L3 |
 | `change_event` | 新增、重跑、内容变化、active run 切换 | L2/L6 |
@@ -600,7 +600,7 @@ action_log 全局执行账本（曾用名 M-LOG）
 
 `processing_run` 记录一次 parse / normalize / build_units / publish 运行。历史 run 不回改。
 
-`document_unit` 保存某个 run 生成的 text/table/qa 单元。`payload` 保存快照本身，不只是 locator。
+`document_unit` 保存某个 run 生成的 text/table/qa/mixed 单元（mixed 自迁移 0011 起，见 service-purpose §6.5）。`payload` 保存快照本身，不只是 locator。
 
 `outbox_event` 提供 `seq`，供 L2 增量读取。
 

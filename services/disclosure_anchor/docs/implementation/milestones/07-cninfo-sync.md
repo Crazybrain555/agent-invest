@@ -2,9 +2,9 @@
 id: disclosure_anchor_milestone_07_cninfo-sync
 project: disclosure_anchor
 title: CNINFO 增量同步
-status: ready-for-implementation
+status: complete
 created_at: 2026-06-26
-updated_at: 2026-07-04
+updated_at: 2026-07-07
 depends_on: milestone 04R（注册核心 / SubjectResolver）、milestone 05（已完成 2026-07-05）
 delivers_to: milestone 08
 ---

@@ -15,24 +15,45 @@ from sqlalchemy.engine import Connection
 from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA, OPS_SCHEMA
 
 
+# Closed vocabulary for tracked_company.sync_frequency; unknown/null values
+# fall back to the global interval.
+SYNC_FREQUENCY_SECONDS = {"hourly": 3600, "daily": 86400, "weekly": 604800}
+
+
 def sync_due(
     conn: Connection, *, interval_seconds: int, limit: int
 ) -> list[dict[str, Any]]:
-    """Companies whose checkpoint window_end is older than the sync interval.
+    """Companies due for an index sync.
 
-    window_end is NULL for never-synced companies → always due.
+    Due-ness compares the checkpoint's updated_at TIMESTAMP against the
+    per-company effective interval (sync_frequency vocabulary, else the
+    global default) — the old window_end::date comparison truncated both
+    sides to dates and stretched a daily cadence to every-other-day.
+    Never-synced companies (no checkpoint) are always due. The tracked row's
+    lookback/filing_categories overrides ride along for the caller.
     """
 
     rows = conn.execute(
         text(
             f"""
             SELECT v.tracked_company_id, v.company_id, v.security_id, v.window_end,
-                   s.security_code, s.exchange
+                   s.security_code, s.exchange,
+                   tc.lookback, tc.filing_categories, tc.sync_frequency,
+                   sc.updated_at AS last_synced_at
               FROM {OPS_SCHEMA}.sync_due_v1 v
               LEFT JOIN {CORE_SCHEMA}.security s ON s.security_id = v.security_id
-             WHERE v.window_end IS NULL
-                OR v.window_end::date < (now() - make_interval(secs => :interval))::date
-             ORDER BY v.window_end NULLS FIRST, v.company_id
+              JOIN {CORE_SCHEMA}.tracked_company tc
+                ON tc.tracked_company_id = v.tracked_company_id
+              LEFT JOIN {CORE_SCHEMA}.source_checkpoint sc
+                ON sc.provider = 'cninfo'
+               AND sc.scope_key = v.company_id || '\:p_info3015'
+             WHERE sc.updated_at IS NULL
+                OR sc.updated_at < now() - make_interval(secs => CASE tc.sync_frequency
+                       WHEN 'hourly' THEN 3600
+                       WHEN 'daily' THEN 86400
+                       WHEN 'weekly' THEN 604800
+                       ELSE :interval END)
+             ORDER BY sc.updated_at NULLS FIRST, v.company_id
              LIMIT :limit
             """
         ),
@@ -61,14 +82,33 @@ def pending_downloads(
 
 
 def pending_parse(
-    conn: Connection, *, max_retries: int, limit: int
+    conn: Connection,
+    *,
+    max_retries: int,
+    limit: int,
+    scope_category_prefixes: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Documents awaiting parse, excluding non-retryable and exhausted ones.
 
-    The oversized flag rides along so the worker can skip 07 §3.9 documents
-    without a second query.
+    Oversized documents (07 §3.9) are excluded in SQL: they used to be
+    LIMIT-selected first and then skipped, permanently occupying every batch
+    slot (round8 audit blocker). With scope_category_prefixes set (parse
+    scope 'core'), 'other' documents are parsed only when an F006V category
+    segment matches a configured prefix; every non-other filing_type always
+    parses. None → parse everything ('all').
     """
 
+    scope_sql = ""
+    params: dict[str, Any] = {"max_retries": max_retries, "limit": limit}
+    if scope_category_prefixes is not None:
+        scope_sql = """
+               AND (d.filing_type <> 'other' OR EXISTS (
+                   SELECT 1
+                     FROM unnest(string_to_array(
+                              coalesce(d.provider_metadata->>'raw_category', ''), '||'
+                          )) AS seg(category_code)
+                    WHERE seg.category_code LIKE ANY(:scope_prefixes)))"""
+        params["scope_prefixes"] = [f"{p}%" for p in scope_category_prefixes]
     rows = conn.execute(
         text(
             f"""
@@ -80,11 +120,13 @@ def pending_parse(
               JOIN {CORE_SCHEMA}.document d ON d.document_id = q.document_id
              WHERE COALESCE(q.last_failed_retryable, true)
                AND q.failed_parse_count < :max_retries
+               AND NOT COALESCE((d.provider_metadata->>'oversized')::boolean, false)
+               {scope_sql}
              ORDER BY q.document_id
              LIMIT :limit
             """
         ),
-        {"max_retries": max_retries, "limit": limit},
+        params,
     ).mappings()
     return [dict(row) for row in rows]
 

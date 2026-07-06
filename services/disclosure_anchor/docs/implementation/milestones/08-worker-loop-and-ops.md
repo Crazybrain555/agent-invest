@@ -2,9 +2,9 @@
 id: disclosure_anchor_milestone_08_worker-loop-and-ops
 project: disclosure_anchor
 title: worker loop 与本地运行
-status: ready-for-implementation
+status: complete
 created_at: 2026-06-26
-updated_at: 2026-07-04
+updated_at: 2026-07-07
 depends_on: milestones 04R / 05 / 07
 delivers_to: 常态运行（demo 期定时批处理，协议 §15）
 ---

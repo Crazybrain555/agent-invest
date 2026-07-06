@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timedelta
@@ -49,6 +50,11 @@ from disclosure_anchor.application.use_cases.rebuild_units import (
     RebuildUnits,
     RebuildUnitsCommand,
 )
+from disclosure_anchor.application.use_cases.track_companies import (
+    TrackCompanies,
+    TrackCompaniesCommand,
+    TrackEntry,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.use_cases.register_local_pdf import (
     RegisterLocalPdf,
@@ -91,6 +97,13 @@ def _parser() -> argparse.ArgumentParser:
     publish.add_argument("--processing-run-id", required=True)
     publish.add_argument("--allow-empty", action="store_true")
     publish.add_argument("--reason")
+
+    track = subparsers.add_parser(
+        "track",
+        help="upsert the company watchlist into tracked_company (offline, idempotent)",
+    )
+    track.add_argument("--file", help="watchlist CSV (default: config/watchlist.csv)")
+    track.add_argument("--codes", help="comma-separated security codes (ad-hoc adds)")
 
     rebuild = subparsers.add_parser(
         "rebuild-units",
@@ -148,6 +161,9 @@ def main(argv: list[str] | None = None) -> int:
             if not _stage_succeeded("publish", result):
                 _print_failed_stage("publish", result)
                 return 1
+        elif args.command == "track":
+            entries = _track_entries(args)
+            result = deps.track().execute(TrackCompaniesCommand(entries=entries))
         elif args.command == "rebuild-units":
             rebuild_result = deps.rebuild_units().execute(
                 RebuildUnitsCommand(document_id=args.document_id)
@@ -255,6 +271,9 @@ class _Deps:
     def rebuild_units(self) -> RebuildUnits:
         return RebuildUnits(uow_factory=self.uow_factory)
 
+    def track(self) -> TrackCompanies:
+        return TrackCompanies(uow_factory=self.uow_factory)
+
     def sync(self, args: argparse.Namespace) -> dict[str, object]:
         company = args.company
         exchange = _exchange_for_scode(company)
@@ -266,6 +285,7 @@ class _Deps:
             explicit_window_days=args.window,
             today=today,
             overlap_days=self.settings.cninfo_overlap_days,
+            initial_lookback_days=self.settings.disclosure_initial_lookback_days,
         )
         channel = getattr(args, "channel", "api")
         if channel == "web":
@@ -347,6 +367,7 @@ def _sync_window(
     explicit_window_days: int | None,
     today: date,
     overlap_days: int,
+    initial_lookback_days: int = 1095,
 ) -> tuple[date, date]:
     if explicit_window_days is not None:
         if explicit_window_days < 0:
@@ -355,16 +376,58 @@ def _sync_window(
     with uow_factory() as uow:
         security = uow.securities.get_by_code_exchange(company, exchange)
         if security is None:
-            raise ValueError("first sync requires explicit --window")
+            # First contact: default historical backfill (user decision
+            # 2026-07-06, 三年是底线); --window stays the explicit override.
+            return today - timedelta(days=initial_lookback_days), today
         checkpoint = uow.source_checkpoints.get_by_scope(
             "cninfo", f"{security.company_id}:p_info3015"
         )
         if checkpoint is None or not checkpoint.cursor:
-            raise ValueError("first sync requires explicit --window")
+            tracked = uow.tracked_companies.get_by_company_id(security.company_id)
+            days = initial_lookback_days
+            if tracked and isinstance(tracked.lookback, dict):
+                override = tracked.lookback.get("days")
+                if isinstance(override, int) and override >= 0:
+                    days = override
+            return today - timedelta(days=days), today
         window_end = checkpoint.cursor.get("window_end")
         if not isinstance(window_end, str):
             raise ValueError("checkpoint cursor missing window_end")
         return date.fromisoformat(window_end) - timedelta(days=overlap_days), today
+
+
+def _track_entries(args: argparse.Namespace) -> tuple[TrackEntry, ...]:
+    entries: list[TrackEntry] = []
+    if args.codes:
+        for code in str(args.codes).split(","):
+            code = code.strip()
+            if code:
+                entries.append(
+                    TrackEntry(security_code=code, exchange=_exchange_for_scode(code))
+                )
+    if args.file or not entries:
+        path = Path(args.file or "config/watchlist.csv")
+        with path.open(encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(
+                line for line in handle if not line.lstrip().startswith("#")
+            ):
+                code = (row.get("security_code") or "").strip()
+                if not code:
+                    continue
+                lookback_raw = (row.get("lookback_days") or "").strip()
+                frequency = (row.get("sync_frequency") or "").strip() or None
+                entries.append(
+                    TrackEntry(
+                        security_code=code,
+                        exchange=(row.get("exchange") or "").strip()
+                        or _exchange_for_scode(code),
+                        lookback_days=int(lookback_raw) if lookback_raw else None,
+                        sync_frequency=frequency,
+                    )
+                )
+    if not entries:
+        raise ValueError("watchlist is empty: nothing to track")
+    return tuple(entries)
 
 
 def _exchange_for_scode(scode: str) -> str:

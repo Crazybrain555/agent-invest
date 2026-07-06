@@ -35,9 +35,15 @@ docs/implementation/
     doctor-checklist.md
     contract-checklist.md
     fixture-and-test-policy.md
+  reviews/
+    phase008-db-comprehensive-audit-round3.md
   runbooks/
     phase00-environment-and-parser-validation.md
+    com.agentinvest.disclosure-anchor.worker-once.plist
 ```
+
+里程碑 00–08（含 04R）均已实施完成（frontmatter status 与 `checks/acceptance-matrix.md` 为准）；
+06R（检索投影派生层）为规划中里程碑，规格文档尚未编写。
 
 `milestones/` 讲每阶段"做什么/为什么/验收口径"；`runbooks/` 讲"具体敲什么命令、产物落哪、每步怎么自检"，照着跑即可。
 

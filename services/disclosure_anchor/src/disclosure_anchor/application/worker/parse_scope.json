@@ -1,0 +1,42 @@
+{
+  "version": "2026-07-r1",
+  "_about": "Worker parse-layer scope (user decision 2026-07-06: 全量登记+分层解析). Scope 'core' parses every non-other filing_type plus 'other' documents whose F006V category segments match these prefixes. Scope 'all' parses everything. Tune prefixes here; this file is versioned config, changes need no code.",
+  "core_other_category_prefixes": [
+    "011301",
+    "011513",
+    "0119",
+    "01239901",
+    "N003001",
+    "N003002",
+    "012325",
+    "352325",
+    "250752",
+    "012327",
+    "011711",
+    "011701",
+    "011703",
+    "011503",
+    "011505",
+    "351501",
+    "250744"
+  ],
+  "_prefix_names": {
+    "011301": "权益分派预案及实施",
+    "011513": "股份回购（含预案/进展/结果）",
+    "0119": "股东大会（通知/决议/法律意见）",
+    "01239901": "其它董事会（决议）公告",
+    "N003001": "董事会决议公告",
+    "N003002": "监事会决议公告",
+    "012325": "股权激励",
+    "352325": "股权激励（增补）",
+    "250752": "股权激励",
+    "012327": "重大合同",
+    "011711": "担保",
+    "011701": "收购出售资产",
+    "011703": "债务重组",
+    "011503": "股权收购",
+    "011505": "要约收购",
+    "351501": "大股东/董监高增减持",
+    "250744": "股份增减持"
+  }
+}

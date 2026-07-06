@@ -14,6 +14,12 @@ from disclosure_anchor.domain.errors import (
 )
 
 
+# Offline batch intake (pipeline track) creates companies before any provider
+# profile is fetched; the placeholder upgrades in place on the first sync that
+# supplies a real legal name — it must never count as a conflicting name.
+PENDING_LEGAL_NAME_PREFIX = "PENDING_LEGAL_NAME "
+
+
 @dataclass(frozen=True)
 class SubjectCandidate:
     # legal_name=None means the caller makes no legal-name claim (e.g. the
@@ -42,6 +48,7 @@ class SubjectResolver:
         )
         if security is not None:
             company = self._company_for_security(uow, security)
+            company = self._upgrade_placeholder_name(uow, company, candidate)
             identifier = (
                 uow.company_identifiers.get_by_scheme_value(
                     "uscc", _normalize_identifier(candidate.credit_code)
@@ -102,7 +109,7 @@ class SubjectResolver:
             e.Company(
                 company_id=ids.new_company_id(),
                 legal_name=candidate.legal_name
-                or f"PENDING_LEGAL_NAME {candidate.security_code}.{candidate.exchange}",
+                or f"{PENDING_LEGAL_NAME_PREFIX}{candidate.security_code}.{candidate.exchange}",
                 unified_social_credit_code=candidate.credit_code,
             )
         )
@@ -120,6 +127,17 @@ class SubjectResolver:
             )
         return company
 
+    def _upgrade_placeholder_name(
+        self, uow: UnitOfWork, company: e.Company, candidate: SubjectCandidate
+    ) -> e.Company:
+        if (
+            candidate.legal_name
+            and company.legal_name.startswith(PENDING_LEGAL_NAME_PREFIX)
+        ):
+            company.legal_name = candidate.legal_name
+            return uow.companies.update(company)
+        return company
+
     def _validate_legal_name(
         self,
         *,
@@ -129,6 +147,8 @@ class SubjectResolver:
         uow: UnitOfWork | None = None,
     ) -> None:
         if candidate.legal_name is None or company.legal_name == candidate.legal_name:
+            return
+        if company.legal_name.startswith(PENDING_LEGAL_NAME_PREFIX):
             return
         if identifier is not None and uow is not None:
             identifier.status = "contested"

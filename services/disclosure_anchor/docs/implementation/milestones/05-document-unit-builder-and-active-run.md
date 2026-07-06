@@ -2,9 +2,9 @@
 id: disclosure_anchor_milestone_05_document-unit-builder-and-active-run
 project: disclosure_anchor
 title: document_unit builder 与 active run
-status: ready-for-implementation
+status: complete
 created_at: 2026-06-26
-updated_at: 2026-07-04
+updated_at: 2026-07-07
 depends_on: milestone 04R（必须先完成）
 delivers_to: milestone 06
 ---
@@ -530,11 +530,38 @@ p.102）后定案，全部为标题树进栈规则问题，cn_a_v4：
    title + local_heading，不阻塞）；structure_status / 分组标签行 / 金融工具风险次级
    层级完美化 维持开放。
 
+### ub-2026.07-9（2026-07-06 round7：新公司 + 默认参数真实用法试用后）
+
+Codex 以"新增公司、默认参数"的预期生产用法测试，对照真实 PDF 确认三个切分缺陷，全部修复：
+
+1. **第二种议案锚点**（`PROPOSAL_APPROVAL_RE`）：平安银行董事会决议用"一、审议通过了
+   《…议案》"句式，原 `议案名称：` 锚点（`PROPOSAL_ANCHOR_RE`）不命中，整场会议坍缩成
+   一个 blob；现两种锚点并行，每项"审议通过 + 表决行"独立成 meeting_proposal unit
+   （实测该公告 4 项议案恢复）。
+2. **表格 caption 参与锚点探测**：招商银行股东会第 8/10 项议案消失——MinerU 把
+   "8.议案名称：…"挂成表决表格的 caption，而锚点探测只扫 text 行与标题；caption 现在
+   也是锚点探针（实测 1–13 全序列恢复，15 units）。
+3. **全平文档锚定到登记文档标题 + 碎裂问答表 needs_review**：美的投关记录表解析为
+   全平裸表格文档，曾产出 title=NULL / heading_path=[]；全平文档现以 registry 的
+   document.title 为锚。被 MinerU 把整句碎进单元格的问答表 build 期不可恢复，按
+   `QA_TABLE_CONTENT_MIN_CHARS` / `QA_TABLE_MARKER_RE` 判定并标 needs_review
+   （不再 ok；parser 级修复留账）。
+4. **rebuild 源 run 查询放宽**：prune-history 删除被取代的 parse run 后，原 rebuild 源
+   查询只认 run_kind='parse'，rebuild-units 断链；现任何携带 normalized_ir_relpath 的
+   succeeded run（rebuild_units run 复制该字段，自身即合法源）都可作 rebuild 源，
+   provenance 链自愈。
+
+语料（25 docs，含 Codex 新增的平安/招商/美的样本）经快速路径 8s 重建为单一
+ub-2026.07-9 代并 prune；门禁全绿。
+
 ## 9. 明确不做
 
 - 不抽取 claim；不做 table_cell / page-bbox 核心索引；不做 LLM 语义价值判断；
-- 不实现 `rebuild_units`；不做 Filing API（06）；不做批量调度（08）；
-- 不生成 search projection artifact / 检索字段（U7 边界：06R 派生层，builder 不耦合检索规则）。
+- 不实现 `rebuild_units`（后由 §8.5 ub-2026.07-8 修订案推翻，2026-07-06 已落地）；
+  不做 Filing API（本 milestone 范围外，后由 milestone 06 交付）；
+  不做批量调度（本 milestone 范围外，后由 milestone 08 交付）；
+- 不生成 search projection artifact / 检索字段（U7 边界：06R 派生层，builder 不耦合检索规则；
+  06R 为规划中里程碑，规格文档尚未编写）。
 
 ## 10. 交付给下一阶段
 

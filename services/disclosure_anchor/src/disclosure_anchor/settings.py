@@ -102,6 +102,33 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias=AliasChoices("CNINFO_OVERLAP_DAYS", "cninfo_overlap_days"),
     )
+    # First-sync historical backfill (user decision 2026-07-06: 三年是底线 —
+    # three years of financial reports plus the important announcements).
+    disclosure_initial_lookback_days: int = Field(
+        default=1095,
+        ge=0,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_INITIAL_LOOKBACK_DAYS", "disclosure_initial_lookback_days"
+        ),
+    )
+    # Parse-layer scope: 'core' = every non-other filing_type + 'other' docs
+    # matching config/parse_scope.json prefixes; 'all' = parse everything
+    # (user decision 2026-07-06: 全量登记+分层解析).
+    # /v1/admin/* are unauthenticated local-ops write endpoints; production
+    # deployments must keep them off the L2-facing app (round8 audit blocker).
+    disclosure_enable_admin_api: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_ENABLE_ADMIN_API", "disclosure_enable_admin_api"
+        ),
+    )
+    disclosure_parse_scope: str = Field(
+        default="core",
+        pattern="^(core|all)$",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_PARSE_SCOPE", "disclosure_parse_scope"
+        ),
+    )
     cninfo_oversized_kb: int = Field(
         default=10240,
         ge=0,

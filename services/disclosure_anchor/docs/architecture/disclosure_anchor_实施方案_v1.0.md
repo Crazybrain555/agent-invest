@@ -20,7 +20,7 @@ primary_store: postgresql
 raw_store: filesystem
 parser_artifact_store: filesystem
 public_output: document_and_document_unit
-payload_kinds: [text, table, qa]
+payload_kinds: [text, table, qa, mixed]
 implementation_style: modular_monolith_with_ports_and_adapters
 ---
 
@@ -29,6 +29,8 @@ implementation_style: modular_monolith_with_ports_and_adapters
 > 本文件把现有需求文档转成可直接指导 AI coding agent 生成代码的实施设计。
 >
 > 它定义代码边界、模块职责、数据对象、解析适配层、运行管道、发布语义、API 和实施顺序；不定义详细测试方案。测试策略、测试样本矩阵和验收用例将在独立文档中编写。
+>
+> 漂移说明（2026-07-07）：payload kinds 自迁移 0011 起为 text/table/qa/mixed；本文其余 text/table/qa 表述与 `service-purpose.md` 冲突处，以后者（canonical）为准。
 
 ---
 
@@ -50,7 +52,7 @@ implementation_style: modular_monolith_with_ports_and_adapters
 - 数据接入、保留和切分边界以《财报与披露数据接入及切分方案》为准；
 - 本文件只能细化实现，不能反向修改前两份 canonical 需求；
 - 不应为了迎合旧调研文档而恢复 page、bbox、持久化 chunk、table_cell 或 event_unit；
-- 术语、信封字段、change feed、追溯等级与主体匹配键等跨层规范以《投研预测引擎顶层框架协议 v0.7》§2 / §2.8 / §2.9 / §6.5.1 为准（协议 §2 是字段与命名的唯一权威）；本文与之冲突时，修订本文。
+- 术语、信封字段、change feed、追溯等级与主体匹配键等跨层规范以《投研预测引擎顶层框架协议 v0.8》§2 / §2.8 / §2.9 / §6.5.1 为准（协议 §2 是字段与命名的唯一权威）；本文与之冲突时，修订本文。
 
 ## 0.2 AI coding agent 的工作方式
 
@@ -112,7 +114,7 @@ AI coding agent 在每次实现前必须：
 
 - PostgreSQL 是主库，原始文件和 parser artifact 放文件系统；
 - `document_unit` 是文档结构单元，不是 claim；
-- unit 第一版只有 `text / table / qa`；
+- unit 第一版只有 `text / table / qa`（0011 迁移起增加 `mixed` 业务语义块，以 service-purpose §6.5 为准）；
 - 不按 page、固定 token 或 overlap 形成持久化单元；
 - provider 已覆盖的标准财务数据不从 PDF 重建第二套标准仓库；
 - L1 做确定性的结构化准备，L2 做信息抽取、事件识别和判断；
@@ -171,7 +173,7 @@ PostgreSQL + filesystem 的结论正确。需要加强：
 
 ### `投研预测引擎顶层框架协议_v0.8.md`
 
-旧版协议（v0.5 前）存在一处真实冲突（把 G0 写成“PDF + 页码 + 段落/表格位置”，并把信息单元切分全部放在 L2），**已在协议修订中收敛（现行 v0.7）**，按以下 canonical 设计落地（协议 §2.9、§3.4–§3.5、§3.10、§17.2）：
+旧版协议（v0.5 前）存在一处真实冲突（把 G0 写成“PDF + 页码 + 段落/表格位置”，并把信息单元切分全部放在 L2），**已在协议修订中收敛（现行 v0.8）**，按以下 canonical 设计落地（协议 §2.9、§3.4–§3.5、§3.10、§17.2）：
 
 - **L1 统一完成文档结构切分与载体规范化（carrier normalization），适用于全部来源**，不再以 PDF 为特例；PDF 额外包含解析，其余来源依既有结构切分；L2 直接接收 `document_unit` 进行语义处理。载体规范化只处理结构和载体（解析、按业务结构切分、表格与 Q&A 结构保留、heading_path / order_index / semantic_key / content_hash 生成、页眉页脚等稳定噪声处理），不做投资语义判断。
 - **G0 身份锚 = 自维护原文 + 文件哈希 + 不可变 `document_unit` 快照 + 来源链**；page/bbox 仅为可选复核信息。
@@ -731,7 +733,7 @@ profile 名称和规则由版本化 registry 管理，不写成不可扩展的�
 asset_id
 document_id
 processing_run_id
-payload_kind                 text / table / qa
+payload_kind                 text / table / qa / mixed（0011 起，见 service-purpose §6.5）
 order_index
 heading_path
 title
