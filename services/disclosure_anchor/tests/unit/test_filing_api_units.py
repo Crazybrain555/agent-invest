@@ -68,6 +68,8 @@ def _unit_row(
         "content_hash": "sha256:" + "b" * 64,
         "structure_hash": "sha256:" + "c" * 64,
         "quality_status": "ok",
+        "applicability": None,
+        "page_no": None,
         "artifact_locator": None,
         "created_at": now,
         "contract_version": "document_unit.v1",
@@ -108,6 +110,8 @@ def _source_ref_row() -> dict:
         "title": "风险提示",
         "unit_content_hash": "sha256:" + "b" * 64,
         "quality_status": "ok",
+        "applicability": None,
+        "page_no": None,
         "artifact_locator": None,
     }
 

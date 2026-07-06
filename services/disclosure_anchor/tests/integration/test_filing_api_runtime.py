@@ -744,6 +744,21 @@ class FilingApiRuntimeTests(unittest.TestCase):
     def _cleanup_rows(self) -> None:
         with self.engine.begin() as conn:
             if self.document_ids:
+                # Register-path documents create company/security rows through
+                # SubjectResolver; harvest them before deleting the documents
+                # or they leak into the shared corpus (observed 2026-07-06).
+                for row in conn.execute(
+                    text(
+                        "SELECT DISTINCT company_id, security_id "
+                        "FROM disclosure_core.document "
+                        "WHERE document_id = ANY(:ids)"
+                    ),
+                    {"ids": self.document_ids},
+                ).all():
+                    if row.company_id and row.company_id not in self.company_ids:
+                        self.company_ids.append(row.company_id)
+                    if row.security_id and row.security_id not in self.security_ids:
+                        self.security_ids.append(row.security_id)
                 conn.execute(
                     text(
                         "DELETE FROM disclosure_ops.outbox_event "
@@ -800,6 +815,13 @@ class FilingApiRuntimeTests(unittest.TestCase):
                     {"ids": self.security_ids},
                 )
             if self.company_ids:
+                conn.execute(
+                    text(
+                        "DELETE FROM disclosure_core.company_identifier "
+                        "WHERE company_id = ANY(:ids)"
+                    ),
+                    {"ids": self.company_ids},
+                )
                 conn.execute(
                     text(
                         "DELETE FROM disclosure_core.company "
@@ -1001,6 +1023,16 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
 
     def _cleanup_rows(self) -> None:
         with self.engine.begin() as conn:
+            # Harvest SubjectResolver-created company/security rows before the
+            # documents disappear — the register path creates them and this
+            # class leaked one company per zero-skip suite run (2026-07-06).
+            subject_rows = conn.execute(
+                text(
+                    "SELECT DISTINCT company_id, security_id "
+                    "FROM disclosure_core.document WHERE document_id = ANY(:ids)"
+                ),
+                {"ids": list(self.document_ids)},
+            ).all() if self.document_ids else []
             for document_id in self.document_ids:
                 conn.execute(
                     text("DELETE FROM disclosure_ops.outbox_event WHERE document_id=:id"),
@@ -1029,6 +1061,38 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
                     ),
                     {"id": source_access_id},
                 )
+            for row in subject_rows:
+                if row.security_id:
+                    conn.execute(
+                        text(
+                            "DELETE FROM disclosure_core.security "
+                            "WHERE security_id=:id AND NOT EXISTS ("
+                            "  SELECT 1 FROM disclosure_core.document d "
+                            "  WHERE d.security_id=:id)"
+                        ),
+                        {"id": row.security_id},
+                    )
+                if row.company_id:
+                    conn.execute(
+                        text(
+                            "DELETE FROM disclosure_core.company_identifier "
+                            "WHERE company_id=:id AND NOT EXISTS ("
+                            "  SELECT 1 FROM disclosure_core.document d "
+                            "  WHERE d.company_id=:id)"
+                        ),
+                        {"id": row.company_id},
+                    )
+                    conn.execute(
+                        text(
+                            "DELETE FROM disclosure_core.company "
+                            "WHERE company_id=:id AND NOT EXISTS ("
+                            "  SELECT 1 FROM disclosure_core.document d "
+                            "  WHERE d.company_id=:id) AND NOT EXISTS ("
+                            "  SELECT 1 FROM disclosure_core.security s "
+                            "  WHERE s.company_id=:id)"
+                        ),
+                        {"id": row.company_id},
+                    )
 
 
 if __name__ == "__main__":

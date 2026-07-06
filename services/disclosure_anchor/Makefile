@@ -19,7 +19,7 @@ PGPORT ?= 55432
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	test-mineru-smoke lint typecheck agent-check api archive pg-init pg-start pg-stop \
-	pg-status db-create migrate register parse build-units publish process sync worker-once worker-loop doctor-full
+	pg-status db-create migrate register parse build-units publish process sync worker-once worker-loop doctor-full wipe-test-data
 
 doctor:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -124,3 +124,7 @@ worker-loop:
 
 doctor-full:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor --full
+
+wipe-test-data:
+	@test "$(WIPE)" = "YES" || (echo 'usage: make wipe-test-data WIPE=YES  (test-phase only!)' && exit 2)
+	WIPE=YES ./scripts/wipe_test_data.sh

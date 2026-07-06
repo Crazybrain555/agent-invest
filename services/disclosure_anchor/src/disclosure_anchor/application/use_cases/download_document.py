@@ -288,6 +288,7 @@ def _provider_metadata(
     signature = dict(_candidate_mapping(candidate, "file_signature_hint"))
     metadata: dict[str, object] = {
         "raw_category": _candidate_optional_str(candidate.get("raw_category")) or "",
+        "category_names": candidate.get("category_names"),
         "provider_org_id": candidate.get("provider_org_id"),
         "object_id": candidate.get("object_id"),
         "rec_id": candidate.get("rec_id"),

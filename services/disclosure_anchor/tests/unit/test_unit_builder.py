@@ -24,7 +24,7 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-3")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-4")
         self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v1")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
@@ -578,8 +578,141 @@ class UnitBuilderTests(unittest.TestCase):
         )
 
         self.assertEqual(len(units), 1)
-        self.assertIn("单位：元", units[0].payload["text"])
-        self.assertEqual(stats.dropped_unit_declarations, 0)
+        # -4: declaration lines are stripped line-level even inside merged text.
+        self.assertEqual(units[0].payload["text"], "下表列示了主要科目变动。")
+        self.assertEqual(stats.dropped_unit_declarations, 1)
+
+    def test_single_line_header_combo_keeps_announce_no(self) -> None:
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": "证券代码：600519 证券简称：贵州茅台 公告编号：临 2026-027",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "分红实施公告正文。",
+                    },
+                ]
+            },
+            filing_type="other",
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(
+            units[0].payload["text"], "公告编号：临 2026-027\n分红实施公告正文。"
+        )
+        self.assertEqual(stats.stripped_header_lines, 1)
+
+    def test_text_units_carry_page_no_via_locator(self) -> None:
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "page_no": 3,
+                        "ir_id": "x_ir_0001",
+                        "artifact_locator": {"page_no": 3},
+                        "text": "第三页的正文内容。",
+                    },
+                ]
+            },
+            filing_type="other",
+        )
+
+        self.assertEqual(len(units), 1)
+        locator = units[0].artifact_locator or {}
+        self.assertEqual(locator.get("page_no"), 3)
+
+    def test_marker_line_never_becomes_heading(self) -> None:
+        # MinerU sometimes tags the marker with text_level>=1 (kind=heading);
+        # it must stay out of the heading tree and strip like normal text.
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 2,
+                        "text": "二、非经常性损益",
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "heading_level": 3,
+                        "text": "□适用 √不适用",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 3,
+                        "text": "公司不存在其他符合非经常性损益定义的损益项目。",
+                    },
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].heading_path, ["二、非经常性损益"])
+        self.assertNotIn("适用", units[0].title or "")
+        self.assertEqual(units[0].applicability, "not_applicable")
+        self.assertIn("非经常性损益", units[0].payload["text"])
+
+    def test_header_kv_lines_stripped_but_announce_no_kept(self) -> None:
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": "证券代码：600519\n证券简称：贵州茅台\n公告编号：临 2026-006",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "本公司董事会保证公告内容真实、准确、完整。",
+                    },
+                ]
+            },
+            filing_type="other",
+        )
+
+        # 同属空 heading 的两段被 S3 正常合并为一个 unit。
+        self.assertEqual(len(units), 1)
+        # 代码/简称是 document 元数据的重复；公告编号是独有信息，必须保留。
+        self.assertEqual(
+            units[0].payload["text"],
+            "公告编号：临 2026-006\n本公司董事会保证公告内容真实、准确、完整。",
+        )
+        self.assertEqual(stats.stripped_header_lines, 2)
+        # 正文中出现的"被担保人证券代码"这类行不受影响。
+        units2, stats2 = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": "被担保人证券代码：600000，担保金额如下。",
+                    },
+                ]
+            },
+            filing_type="other",
+        )
+        self.assertIn("被担保人证券代码", units2[0].payload["text"])
+        self.assertEqual(stats2.stripped_header_lines, 0)
 
     def test_applicability_marker_becomes_payload_flag(self) -> None:
         units, _ = build_unit_drafts_s1_s7(
@@ -626,9 +759,166 @@ class UnitBuilderTests(unittest.TestCase):
         by_path = {tuple(unit.heading_path): unit for unit in units}
         bankruptcy = by_path[("第五节 重要事项", "一、破产重整相关事项")]
         litigation = by_path[("第五节 重要事项", "二、重大诉讼事项")]
-        self.assertEqual(bankruptcy.payload["applicability"], "not_applicable")
-        self.assertEqual(litigation.payload["applicability"], "applicable")
-        self.assertIn("诉讼", litigation.payload["text"])
+        # Column-destined field, never a payload key (user decision 2026-07-06).
+        self.assertEqual(bankruptcy.applicability, "not_applicable")
+        self.assertNotIn("applicability", bankruptcy.payload)
+        self.assertIn("不适用", bankruptcy.payload["text"])
+        self.assertEqual(litigation.applicability, "applicable")
+        self.assertNotIn("applicability", litigation.payload)
+        # The leading marker line is stripped; the prose remains.
+        self.assertEqual(litigation.payload["text"], "公司报告期内存在如下诉讼。")
+
+    def test_dangling_applicable_marker_sinks_onto_following_table(self) -> None:
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 2,
+                        "text": "4、研发投入",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "√适用 □不适用",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 3,
+                        "table": {"headers": ["项目"], "rows": [["研发投入金额"]]},
+                    },
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        # The bare marker must not survive as its own unit (user decision).
+        self.assertEqual([unit.payload_kind for unit in units], ["table"])
+        self.assertEqual(units[0].applicability, "applicable")
+        self.assertEqual(stats.stripped_marker_lines, 1)
+
+    def test_dangling_applicable_marker_sinks_onto_following_text(self) -> None:
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 2,
+                        "text": "五、重大合同",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "√适用 □不适用",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 3,
+                        "text": "公司与某客户签署了重大销售合同。",
+                    },
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        # Text followers receive the flag exactly like tables do.
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].payload_kind, "text")
+        self.assertEqual(units[0].applicability, "applicable")
+        self.assertEqual(units[0].payload["text"], "公司与某客户签署了重大销售合同。")
+
+    def test_dangling_applicable_marker_sinks_into_child_section(self) -> None:
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 2,
+                        "text": "十六、募集资金使用情况",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "√适用 □不适用",
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 3,
+                        "heading_level": 3,
+                        "text": "（一） 募集资金总体使用情况",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 4,
+                        "table": {"headers": ["项目"], "rows": [["募集总额"]]},
+                    },
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        # The follower opens a CHILD heading — still this section's content.
+        self.assertEqual([unit.payload_kind for unit in units], ["table"])
+        self.assertEqual(units[0].applicability, "applicable")
+
+    def test_dangling_applicable_without_sibling_keeps_declaration(self) -> None:
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 2,
+                        "text": "一、孤例小节",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "√适用 □不适用",
+                    },
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].payload["text"], "适用")
+        self.assertEqual(units[0].applicability, "applicable")
+
+    def test_label_then_marker_composite_is_flagged_but_untouched(self) -> None:
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": "主要客户其他情况说明\n□适用 √不适用",
+                    },
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].applicability, "not_applicable")
+        self.assertIn("主要客户其他情况说明", units[0].payload["text"])
+        self.assertIn("不适用", units[0].payload["text"])
 
     def test_full_s1_s7_redline_important_tip(self) -> None:
         units, stats = build_unit_drafts_s1_s7(

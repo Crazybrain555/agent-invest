@@ -1,6 +1,17 @@
 {
   "additionalProperties": false,
   "properties": {
+    "applicability": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Applicability"
+    },
     "artifact_locator": {
       "anyOf": [
         {
@@ -31,6 +42,17 @@
       },
       "title": "Heading Path",
       "type": "array"
+    },
+    "page_no": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Page No"
     },
     "payload_kind": {
       "title": "Payload Kind",
@@ -123,6 +145,8 @@
     "title",
     "unit_content_hash",
     "quality_status",
+    "applicability",
+    "page_no",
     "artifact_locator"
   ],
   "title": "SourceRefV1",

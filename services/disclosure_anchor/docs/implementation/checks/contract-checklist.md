@@ -61,8 +61,10 @@ unit 级 DTO 派生字段全集 = {asset_uri, is_active_run}（仅 API 序列化
   不入库、不进 *_v1 视图；schema 收录二者，三方一致断言按 DERIVED 白名单排除）
 scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（数组前缀语义，
   见 06 §3.8）/ semantic_key / quality_status 等）
+0010 起 document_units_v1 追加 applicability 列（'applicable'|'not_applicable'|NULL，
+节适用性声明的一等筛选列；payload 保持纯原文，部分索引 ix_document_unit_applicability）。
 0007 起 document_units_v1 追加 6 列：asset_kind / observed_at / source_tier /
-  trace_level / raw_file_hash / query_projection_hash（32 列全集见 04R-R7）
+  trace_level / raw_file_hash / query_projection_hash（33 列全集（0010 起含 applicability）见 04R-R7）
 0007 起 change_events_v1 追加 change_kind（真实列）/ subject_kind / subject_ref /
   source / contract_version
 0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref /

@@ -75,6 +75,8 @@ class DocumentUnitV1(PublicModel):
     content_hash: str
     structure_hash: str | None
     quality_status: str
+    applicability: str | None
+    page_no: int | None
     artifact_locator: dict[str, Any] | None
     created_at: datetime
     contract_version: str
@@ -113,6 +115,8 @@ class SourceRefV1(PublicModel):
     title: str | None
     unit_content_hash: str
     quality_status: str
+    applicability: str | None
+    page_no: int | None
     artifact_locator: dict[str, Any] | None
 
 

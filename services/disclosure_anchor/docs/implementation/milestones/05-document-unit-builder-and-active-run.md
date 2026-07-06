@@ -407,6 +407,37 @@ phase00 fixtures 的 payload 内层是 v1 历史形态（{format,page_no,text} �
 计数入 build_stats.dropped_unit_declarations。实测 908→712；"无/不适用/□是 否"类
 声明照旧保留（有信息量）。
 
+### ub-2026.07-4（2026-07-06 用户数据审查后定案）
+
+用户裁决三条（数据库直查发现）：
+1. **applicability 是一等列不是 payload 键**：payload 只放原文；新列
+   `document_unit.applicability`（0010 迁移，CHECK + 部分索引，视图/API/契约同步升级），
+   并纳入 query_projection_hash 输入（U3 修订）。
+2. **√适用 声明行不得独立成 unit**（"用完直接往下走"）：S3 行级剥离——单位声明行一律剥除；
+   首行为纯标记行 → 剥除并记 applicability（not_applicable 保留该行为 unit 原文，因为它就是
+   该节的全部披露；applicable 且无剩余正文 → 占位下沉，标志落到同节紧随的下一个 unit 上，
+   无后继时保留"适用"兜底）；短标签+次行标记的复合单元只打标不改文（原文中心）。
+3. 计数：stripped_marker_lines 进 build_stats；实测年报 712 → 688。
+
+同日数据复审追加（同属 ub-2026.07-4）：
+4. **applicable 下沉放宽为前缀匹配**：声明后紧随的单元若进入子标题（heading_path 以声明节为
+   前缀）仍属该节内容，照常下沉（实测收掉"十六、募集资金"的孤行"适用"；无后继才保留兜底）。
+5. **标记行禁止进标题树**：MinerU 偶发给标记行标 text_level>=1，_heading_level_for 对
+   纯标记行返回 None（实测年报有 1 处 "□适用 √不适用" 曾成为 heading_path 分量与 title）。
+6a. **page_no 列**（用户裁决 2026-07-06）：document_unit 增加 page_no 列（源自 artifact_locator
+   的首页码，0010 迁移；视图/API/契约同列），定位与审查的一等筛选参数；不入任何哈希（provenance）。
+6b. **category_names 存证**：候选与 document.provider_metadata 增加 category_names
+   （adapter 用 p_info3005 解码 F006V 的中文分类名数组；web 通道为 null）——filing_type
+   保持 9 类契约粒度，原始分类语义完整可查。
+6c. **测试轮数据纪律**（用户指示）：每轮新测试用 `make wipe-test-data WIPE=YES` 全清业务数据
+   （DB TRUNCATE + 磁盘 cninfo 归档/derived/quarantine；_phase00 fixture 产物保留），
+   不得新老数据混跑；投产前同样全清。历史 run 保留策略（retention）为投产后议题。
+
+6. **公告眉头 KV 行剥离**：`证券/股票/债券/[ABH]股 + 代码/简称：值` 整行剥除
+   （值即 document/security 元数据，同"单位：元"逻辑），计数 stripped_header_lines；
+   **公告编号行保留**——provider 公告编号是元数据里没有的独有信息。正文中
+   "被担保人证券代码"等前缀不同的行不受影响。实测年报 908 → 687（-2 起累计）。
+
 ## 9. 明确不做
 
 - 不抽取 claim；不做 table_cell / page-bbox 核心索引；不做 LLM 语义价值判断；

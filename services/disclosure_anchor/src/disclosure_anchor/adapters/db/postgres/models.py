@@ -321,6 +321,10 @@ class DocumentUnit(Base):
             "quality_status IN ('ok','needs_review','unusable')",
             name="ck_document_unit_quality_status",
         ),
+        CheckConstraint(
+            "applicability IN ('applicable','not_applicable')",
+            name="ck_document_unit_applicability",
+        ),
         UniqueConstraint(
             "processing_run_id", "order_index", name="uq_document_unit_run_order"
         ),
@@ -365,6 +369,8 @@ class DocumentUnit(Base):
     quality_status: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default=text("'ok'")
     )
+    applicability: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    page_no: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     query_projection_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     artifact_locator: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

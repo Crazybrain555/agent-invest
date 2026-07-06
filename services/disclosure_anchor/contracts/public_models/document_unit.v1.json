@@ -13,6 +13,17 @@
       ],
       "title": "Announcement Date"
     },
+    "applicability": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Applicability"
+    },
     "artifact_locator": {
       "anyOf": [
         {
@@ -106,6 +117,17 @@
     "order_index": {
       "title": "Order Index",
       "type": "integer"
+    },
+    "page_no": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Page No"
     },
     "parent_ref": {
       "title": "Parent Ref",
@@ -265,6 +287,8 @@
     "content_hash",
     "structure_hash",
     "quality_status",
+    "applicability",
+    "page_no",
     "artifact_locator",
     "created_at",
     "contract_version",

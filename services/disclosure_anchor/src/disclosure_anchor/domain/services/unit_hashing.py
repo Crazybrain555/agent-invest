@@ -52,6 +52,7 @@ def query_projection_hash(
     heading_path: list[str],
     semantic_key: str | None,
     quality_status: str,
+    applicability: str | None = None,
 ) -> str:
     return sha256_prefixed(
         canonical_json(
@@ -61,6 +62,7 @@ def query_projection_hash(
                 "heading_path": heading_path,
                 "semantic_key": semantic_key,
                 "quality_status": quality_status,
+                "applicability": applicability,
             }
         )
     )
@@ -92,6 +94,7 @@ def compute_unit_hashes(
     semantic_key: str | None,
     quality_status: str,
     order_index: int,
+    applicability: str | None = None,
 ) -> UnitHashes:
     return UnitHashes(
         content_hash=content_hash(payload_kind=payload_kind, payload=payload),
@@ -101,6 +104,7 @@ def compute_unit_hashes(
             heading_path=heading_path,
             semantic_key=semantic_key,
             quality_status=quality_status,
+            applicability=applicability,
         ),
         structure_hash=structure_hash(
             payload_kind=payload_kind,

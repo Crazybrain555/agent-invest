@@ -364,6 +364,8 @@ class PublicViewContentTests(unittest.TestCase):
             "content_hash",
             "structure_hash",
             "quality_status",
+            "applicability",
+            "page_no",
             "artifact_locator",
             "created_at",
             "contract_version",
@@ -397,7 +399,7 @@ class PublicViewContentTests(unittest.TestCase):
             }
 
         self.assertEqual(columns, expected)
-        self.assertEqual(len(columns), 32)
+        self.assertEqual(len(columns), 34)
 
     def test_source_tier_mapping_contract(self) -> None:
         self._seed()

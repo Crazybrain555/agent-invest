@@ -46,6 +46,7 @@ class UnitDraft:
     title: str | None = None
     semantic_key: str | None = None
     quality_status: str = "ok"
+    applicability: str | None = None
     artifact_locator: dict[str, Any] | None = None
 
 
@@ -57,6 +58,8 @@ class BuildStats:
     skipped_sections: list[str] = field(default_factory=list)
     dropped_cover_prelude: int = 0
     dropped_unit_declarations: int = 0
+    stripped_marker_lines: int = 0
+    stripped_header_lines: int = 0
     merged_tables: int = 0
     needs_review_count: int = 0
     unusable_count: int = 0
@@ -69,6 +72,8 @@ class BuildStats:
             "skipped_sections": list(self.skipped_sections),
             "dropped_cover_prelude": self.dropped_cover_prelude,
             "dropped_unit_declarations": self.dropped_unit_declarations,
+            "stripped_marker_lines": self.stripped_marker_lines,
+            "stripped_header_lines": self.stripped_header_lines,
             "merged_tables": self.merged_tables,
             "needs_review_count": self.needs_review_count,
             "unusable_count": self.unusable_count,
@@ -117,6 +122,7 @@ def s1_preprocess_elements(
                 page_no=page_no,
                 heading_level=_int_or_none(element.get("heading_level")),
                 text=text,
+                artifact_locator=_artifact_locator(element),
             )
             prepared.append(item)
             previous_non_furniture = item
@@ -135,6 +141,7 @@ def s1_preprocess_elements(
                 heading_level=_int_or_none(element.get("heading_level")),
                 text=text,
                 quality_status="needs_review",
+                artifact_locator=_artifact_locator(element),
             )
             prepared.append(item)
             previous_non_furniture = item
@@ -243,15 +250,27 @@ def s3_build_text_units(
         if not buffer:
             return
         text = "\n".join(item.text or "" for item in buffer if item.text).strip()
-        if text and rules.UNIT_DECLARATION_RE.fullmatch(text):
-            # The value already lives in the following table's payload.unit.
-            if stats is not None:
-                stats.dropped_unit_declarations += 1
-            buffer.clear()
-            return
+        text, applicability = _strip_declaration_lines(text, stats=stats)
         if text:
             quality = "needs_review" if any(item.quality_status == "needs_review" for item in buffer) else "ok"
-            units.extend(_split_numbered_text_block(buffer[0], text, quality_status=quality))
+            units.extend(
+                _split_numbered_text_block(
+                    buffer[0], text, quality_status=quality, applicability=applicability
+                )
+            )
+        elif applicability == "applicable":
+            # Placeholder so _sink_leading_applicable can move the flag onto
+            # the section content that follows (usually a table).
+            units.append(
+                UnitDraft(
+                    payload_kind="text",
+                    payload={"text": ""},
+                    source_order=buffer[0].order_index,
+                    heading_path=list(buffer[0].heading_path),
+                    title=buffer[0].title,
+                    applicability="applicable",
+                )
+            )
         buffer.clear()
 
     for element in elements:
@@ -443,16 +462,10 @@ def s7_finalize_units(
         if quality_status == "unusable":
             stats.unusable_count += 1
         stats.generated_by_kind[unit.payload_kind] += 1
-        payload = unit.payload
-        if unit.payload_kind == "text":
-            applicability = rules.detect_applicability(str(payload.get("text", "")))
-            if applicability is not None:
-                payload = {**payload, "applicability": applicability}
         finalized.append(
             UnitDraft(
                 **{
                     **unit.__dict__,
-                    "payload": payload,
                     "semantic_key": semantic_key,
                     "quality_status": quality_status,
                 }
@@ -482,6 +495,7 @@ def build_unit_drafts_s1_s7(
     table_units = s5_build_table_units(placed, s1.stats)
     table_qa_units = _qa_units_from_tables(table_units)
     units = sorted([*text_units, *table_units, *table_qa_units], key=_unit_sort_key)
+    units = _sink_leading_applicable(units)
     kept = s6_filter_units(units, s1.stats)
     return s7_finalize_units(kept, filing_type=filing_type, stats=s1.stats), s1.stats
 
@@ -631,6 +645,11 @@ def _heading_level_for(element: PreparedElement) -> int | None:
         return None
     if text.endswith(("?", "？")) or rules.QUESTION_START_RE.match(text):
         return None
+    # MinerU occasionally tags applicability markers with text_level>=1; a
+    # declaration line must never enter the heading tree (observed polluting
+    # heading_path/title in the real annual corpus, 2026-07-06).
+    if rules.is_pure_marker_line(text):
+        return None
     normalized_title = _normalized_title(text)
     if normalized_title in rules.FIXED_L1_TITLES:
         return 1
@@ -660,6 +679,7 @@ def _split_numbered_text_block(
     text: str,
     *,
     quality_status: str,
+    applicability: str | None = None,
 ) -> list[UnitDraft]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     numbered = [line for line in lines if re.match(r"^\d+[、.．]\s*", line)]
@@ -673,6 +693,8 @@ def _split_numbered_text_block(
                 heading_path=list(source.heading_path),
                 title=source.title,
                 quality_status=quality_status,
+                applicability=applicability if offset == 0 else None,
+                artifact_locator=source.artifact_locator,
             )
             for offset, line in enumerate(lines)
         ]
@@ -684,8 +706,107 @@ def _split_numbered_text_block(
             heading_path=list(source.heading_path),
             title=source.title,
             quality_status=quality_status,
+            applicability=applicability,
+            artifact_locator=source.artifact_locator,
         )
     ]
+
+
+def _strip_declaration_lines(
+    text: str, *, stats: BuildStats | None
+) -> tuple[str, str | None]:
+    """Strip unit-declaration lines and a leading applicability marker.
+
+    Returns the remaining text and the section applicability. A leading
+    not_applicable marker with no other content keeps the marker line as the
+    unit text (that IS the section's disclosure); a leading applicable marker
+    with no other content returns empty text — the flag is sunk onto the next
+    unit of the same section by _sink_leading_applicable.
+
+    A marker on line two directly after a short label line (…说明 style) flags
+    the unit without stripping, so composite declarations keep their prose.
+    """
+
+    if not text:
+        return text, None
+    lines = text.splitlines()
+    kept: list[str] = []
+    applicability: str | None = None
+    for index, line in enumerate(lines):
+        if rules.UNIT_DECLARATION_RE.fullmatch(line):
+            if stats is not None:
+                stats.dropped_unit_declarations += 1
+            continue
+        header_replacement = rules.strip_header_kv_line(line)
+        if header_replacement is not None:
+            if stats is not None:
+                stats.stripped_header_lines += 1
+            if header_replacement:
+                kept.append(header_replacement)
+            continue
+        if (
+            applicability is None
+            and index == 0
+            and rules.is_pure_marker_line(line)
+        ):
+            applicability = rules.classify_marker_line(line)
+            if stats is not None:
+                stats.stripped_marker_lines += 1
+            if applicability == "not_applicable":
+                kept.append(line.strip())
+            continue
+        if (
+            applicability is None
+            and index == 1
+            and rules.is_pure_marker_line(line)
+            and len(lines[0].strip()) <= 24
+            and not lines[0].strip().endswith(("。", "；"))
+        ):
+            # Label-then-marker composite: flag it, keep the text intact.
+            applicability = rules.classify_marker_line(line)
+            kept.append(line)
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip(), applicability
+
+
+def _same_or_child_section(candidate: list[str], section: list[str]) -> bool:
+    """Child headings still belong to the declared section (prefix match)."""
+
+    return candidate[: len(section)] == section
+
+
+def _sink_leading_applicable(units: list[UnitDraft]) -> list[UnitDraft]:
+    """Attach dangling √适用 declarations to the section content they open.
+
+    An applicable marker with no prose means "content follows" (usually a
+    table); the marker line itself must not survive as a unit (user decision
+    2026-07-06) — the flag moves onto the immediately following unit of the
+    same section. With no such sibling the declaration stays as its own unit.
+    """
+
+    out = list(units)
+    dropped: set[int] = set()
+    for index, unit in enumerate(out):
+        dangling = (
+            unit.payload_kind == "text"
+            and unit.applicability == "applicable"
+            and not str(unit.payload.get("text", "")).strip()
+        )
+        if not dangling:
+            continue
+        follower = index + 1
+        if follower < len(out) and _same_or_child_section(
+            out[follower].heading_path, unit.heading_path
+        ):
+            if out[follower].applicability is None:
+                out[follower] = UnitDraft(
+                    **{**out[follower].__dict__, "applicability": "applicable"}
+                )
+            dropped.add(index)
+        else:
+            out[index] = UnitDraft(**{**unit.__dict__, "payload": {"text": "适用"}})
+    return [unit for index, unit in enumerate(out) if index not in dropped]
 
 
 def _qa_lines(text: str) -> list[str]:

@@ -154,6 +154,10 @@ class DocumentUnit:
     semantic_key: Optional[str] = None
     structure_hash: Optional[str] = None
     quality_status: str = "ok"
+    # Section applicability declared by √适用/□不适用 marker lines (05 §8.5).
+    applicability: Optional[str] = None
+    # First source page of the unit (from the parser artifact locator).
+    page_no: Optional[int] = None
     query_projection_hash: Optional[str] = None
     provider_document_id: Optional[str] = None
     artifact_locator: Optional[dict[str, Any]] = None

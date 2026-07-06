@@ -32,6 +32,8 @@ from disclosure_anchor.domain.services.unit_hashing import (
 
 
 SNAPSHOT_KEYS = {
+    "applicability",
+    "page_no",
     "artifact_locator",
     "asset_id",
     "content_hash",
@@ -270,6 +272,7 @@ class BuildUnits:
                 semantic_key=draft.semantic_key,
                 quality_status=draft.quality_status,
                 order_index=order_index,
+                applicability=draft.applicability,
             )
             unit = e.DocumentUnit(
                 asset_id=ids.new_asset_id(),
@@ -285,11 +288,15 @@ class BuildUnits:
                 content_hash=hashes.content_hash,
                 structure_hash=hashes.structure_hash,
                 quality_status=draft.quality_status,
+                applicability=draft.applicability,
+                page_no=_locator_page_no(draft.artifact_locator),
                 query_projection_hash=hashes.query_projection_hash,
                 artifact_locator=draft.artifact_locator,
             )
             units.append(unit)
             row = {
+                "applicability": unit.applicability,
+                "page_no": unit.page_no,
                 "artifact_locator": unit.artifact_locator,
                 "asset_id": unit.asset_id,
                 "content_hash": unit.content_hash,
@@ -404,6 +411,13 @@ class BuildUnits:
             "retryable": False,
             "message": message,
         }
+
+
+def _locator_page_no(locator: dict[str, Any] | None) -> int | None:
+    if not locator:
+        return None
+    value = locator.get("page_no")
+    return value if isinstance(value, int) else None
 
 
 def _content_hash_aggregate(units: list[e.DocumentUnit]) -> str:

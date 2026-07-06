@@ -290,6 +290,8 @@ def document_unit_to_model(entity: e.DocumentUnit) -> m.DocumentUnit:
         content_hash=entity.content_hash,
         structure_hash=entity.structure_hash,
         quality_status=entity.quality_status,
+        applicability=entity.applicability,
+        page_no=entity.page_no,
         query_projection_hash=entity.query_projection_hash,
         artifact_locator=entity.artifact_locator,
     )
@@ -310,6 +312,8 @@ def document_unit_to_entity(row: m.DocumentUnit) -> e.DocumentUnit:
         content_hash=row.content_hash,
         structure_hash=row.structure_hash,
         quality_status=row.quality_status,
+        applicability=row.applicability,
+        page_no=row.page_no,
         query_projection_hash=row.query_projection_hash,
         artifact_locator=row.artifact_locator,
         created_at=row.created_at,

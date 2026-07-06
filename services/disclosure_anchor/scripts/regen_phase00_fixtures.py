@@ -227,6 +227,12 @@ def _write_document_units(
         counters[draft.payload_kind] += 1
         rows.append(
             {
+                "applicability": draft.applicability,
+                "page_no": (
+                    draft.artifact_locator.get("page_no")
+                    if isinstance(draft.artifact_locator, dict)
+                    else None
+                ),
                 "artifact_locator": draft.artifact_locator,
                 "asset_id": (
                     f"{sample_key}_{draft.payload_kind}_{counters[draft.payload_kind]:04d}"

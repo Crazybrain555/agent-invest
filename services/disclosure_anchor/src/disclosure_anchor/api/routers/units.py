@@ -57,6 +57,8 @@ UNIT_COLUMNS = (
     "content_hash",
     "structure_hash",
     "quality_status",
+    "applicability",
+    "page_no",
     "artifact_locator",
     "created_at",
     "contract_version",
@@ -93,6 +95,8 @@ SOURCE_REF_COLUMNS = (
     "title",
     "unit_content_hash",
     "quality_status",
+    "applicability",
+    "page_no",
     "artifact_locator",
 )
 

@@ -393,6 +393,7 @@ def _candidate_snapshot(
         "title": ref.title,
         "download_url": ref.download_url,
         "raw_category": ref.raw_category,
+        "category_names": ref.category_names,
         "filing_type": ref.filing_type or "other",
         "report_period": ref.report_period,
         "announcement_date": ref.announcement_date.isoformat(),

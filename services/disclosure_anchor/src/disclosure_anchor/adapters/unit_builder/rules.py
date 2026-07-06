@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-3"
+RULES_VERSION = "ub-2026.07-4"
 HEADING_RULESET_ID = "cn_a_v1"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -26,6 +26,34 @@ NOT_APPLICABLE_MARK_RE = re.compile(
 )
 
 
+# Announcement header KV lines (证券代码：600519 / 证券简称：贵州茅台). The
+# values are already document metadata (security join), so the lines are pure
+# duplication — but 公告编号 lines are NOT stripped: the provider announcement
+# number exists nowhere else in our metadata.
+_HEADER_KV_SEG = r"(?:[ABH]\s*股|证\s*券|股\s*票|债\s*券)\s*(?:代\s*码|简\s*称)\s*[：:]\s*\S{1,24}"
+HEADER_KV_LINE_RE = re.compile(rf"^\s*{_HEADER_KV_SEG}\s*$")
+# One line may carry several KV segments plus the announcement number
+# ("证券代码：600519 证券简称：贵州茅台 公告编号：临 2026-027"): strip the KV
+# segments, keep the announcement number (unique information).
+HEADER_KV_COMBO_RE = re.compile(
+    rf"^\s*(?:{_HEADER_KV_SEG}\s*){{1,4}}(?P<keep>公告编号\s*[：:].{{1,30}}?)?\s*$"
+)
+
+
+def strip_header_kv_line(line: str) -> str | None:
+    """Return the replacement for a header KV line, or None to keep it as-is.
+
+    '' means the whole line is metadata duplication and should be dropped;
+    a non-empty string keeps only the announcement-number segment.
+    """
+
+    match = HEADER_KV_COMBO_RE.fullmatch(line)
+    if match is None:
+        return None
+    keep = match.group("keep")
+    return keep.strip() if keep else ""
+
+
 # Standalone table-unit declarations ("单位：元" on its own line). S5 already
 # extracts the value into table payload `unit` from the element stream, so a
 # text unit carrying only this line is pure duplication (audited: 194 of 908
@@ -33,15 +61,24 @@ NOT_APPLICABLE_MARK_RE = re.compile(
 UNIT_DECLARATION_RE = re.compile(r"^\s*单\s*位\s*[：:]\s*\S{1,8}\s*$")
 
 
-def detect_applicability(text: str) -> str | None:
-    """Return 'applicable' / 'not_applicable' when a marker line is present."""
+def classify_marker_line(line: str) -> str | None:
+    """Classify one line as an applicability declaration (end-anchored)."""
 
-    for line in text.splitlines():
-        if APPLICABLE_MARK_RE.search(line):
-            return "applicable"
-        if NOT_APPLICABLE_MARK_RE.search(line):
-            return "not_applicable"
+    if APPLICABLE_MARK_RE.search(line):
+        return "applicable"
+    if NOT_APPLICABLE_MARK_RE.search(line):
+        return "not_applicable"
     return None
+
+
+def is_pure_marker_line(line: str) -> bool:
+    """True when the whole line is nothing but the declaration itself."""
+
+    stripped = line.strip()
+    if not stripped:
+        return False
+    match = APPLICABLE_MARK_RE.search(stripped) or NOT_APPLICABLE_MARK_RE.search(stripped)
+    return match is not None and match.start() == 0
 
 NOISE_SEPARATOR_RE = re.compile(r"^[\s\-—―=_·•\*~～]{3,}$")
 NOISE_LINE_PATTERNS: tuple[re.Pattern[str], ...] = ()

@@ -13,6 +13,7 @@ from disclosure_anchor.adapters.sources.cninfo.mapper import (
     CninfoCompanyProfile,
     category_prefix_matches,
     derive_report_period,
+    split_category_segments,
     load_filing_type_rule_bundle,
     map_filing_type,
     map_p_info3015_record,
@@ -79,6 +80,10 @@ class CninfoSource:
                     category_names_by_code=names,
                     rule_bundle=self._rule_bundle,
                 )
+                segments = split_category_segments(mapped.raw_category)
+                category_names = [
+                    names[segment] for segment in segments if segment in names
+                ]
                 refs.append(
                     replace(
                         mapped,
@@ -86,6 +91,7 @@ class CninfoSource:
                         report_period=derive_report_period(
                             mapped.title, filing_type=filing_type
                         ),
+                        category_names=category_names or None,
                     )
                 )
         return [
