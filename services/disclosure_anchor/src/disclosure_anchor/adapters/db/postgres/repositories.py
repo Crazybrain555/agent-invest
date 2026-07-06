@@ -557,8 +557,12 @@ class ProcessingRunRepository:
             self._session.query(models.ProcessingRun)
             .filter(
                 models.ProcessingRun.document_id == document_id,
-                models.ProcessingRun.run_kind == "parse",
+                # rebuild_units runs copy the parse artifacts references, so
+                # they are equally valid rebuild sources (prune-history may
+                # have removed the original parse run; provenance chains).
+                models.ProcessingRun.run_kind.in_(("parse", "rebuild_units")),
                 models.ProcessingRun.status == "succeeded",
+                models.ProcessingRun.normalized_ir_relpath.isnot(None),
             )
             .order_by(
                 models.ProcessingRun.started_at.desc().nullslast(),

@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-8"
+RULES_VERSION = "ub-2026.07-9"
 HEADING_RULESET_ID = "cn_a_v4"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -108,7 +108,25 @@ def is_declaration_line(line: str) -> bool:
 # 会议决定) is ONE unit with ordered parts, and a short filing without proposal
 # structure is ONE document-level unit. Thresholds follow the phase008 round3
 # over-fragmentation audit.
+# Two real proposal-line styles (Codex round7, 平安/招商 board & shareholder
+# resolutions): "N.议案名称：…" and "一、审议通过了《…议案》".
 PROPOSAL_ANCHOR_RE = re.compile(r"^\s*\d{1,3}\s*[.、．]?\s*议案名称\s*[：:]")
+PROPOSAL_APPROVAL_RE = re.compile(
+    r"^\s*[一二三四五六七八九十]+、\s*(?:会议)?审议(?:并)?通过了?\s*《"
+)
+
+
+def match_proposal_anchor(line: str) -> bool:
+    return bool(PROPOSAL_ANCHOR_RE.match(line) or PROPOSAL_APPROVAL_RE.match(line))
+
+
+# QA-mode filings (投资者关系/业绩说明会) whose Q&A transcript got detected as
+# a TABLE by MinerU arrive with sentences shredded across cells (observed on
+# the real 美的 记录表, Codex round7). Deterministic recovery is impossible at
+# build time — such units are flagged needs_review instead of ok so L2 never
+# consumes the soup silently (§3.5: mark quality, keep raw, reprocessable).
+QA_TABLE_CONTENT_MIN_CHARS = 500
+QA_TABLE_MARKER_RE = re.compile(r"[？?]|答\s*[：:]")
 SHORT_DOC_CONTENT_CHARS = 8000
 COLLAPSIBLE_FILING_TYPES = frozenset(
     {"other", "performance_forecast", "performance_flash"}

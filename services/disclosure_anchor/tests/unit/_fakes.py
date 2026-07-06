@@ -202,8 +202,9 @@ class ProcessingRunRepo(_Repo[e.ProcessingRun]):
             item
             for item in self.items.values()
             if item.document_id == document_id
-            and item.run_kind == "parse"
+            and item.run_kind in ("parse", "rebuild_units")
             and item.status == "succeeded"
+            and item.normalized_ir_relpath is not None
         ]
         matches.sort(key=lambda item: (item.started_at is not None, item.started_at, item.processing_run_id))
         return matches[-1] if matches else None

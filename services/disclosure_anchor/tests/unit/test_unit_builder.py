@@ -24,7 +24,7 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-8")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-9")
         self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v4")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
@@ -427,6 +427,92 @@ class UnitBuilderTests(unittest.TestCase):
         self.assertEqual(stats.dropped_blank_table_rows, 1)
         locator = units[0].artifact_locator or {}
         self.assertEqual(locator["merged_cells"], [{"row": 1, "col": 0, "rowspan": 1, "colspan": 2}])
+
+    def test_board_resolution_approval_style_proposals_group(self) -> None:
+        # Codex round7 平安董事会决议: "一、审议通过了《…议案》" style + 表决行
+        # must become one proposal unit each, not one blob.
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {"kind": "text", "raw_kind": "text", "order_index": 1,
+                     "text": ("本行第十三届董事会第五次会议以书面传签方式召开。\n"
+                              "本次会议审议通过了如下议案：\n"
+                              "一、审议通过了《关于修订董事会专门委员会工作细则的议案》。\n"
+                              "本议案同意票12票，反对票0票，弃权票0票。\n"
+                              "二、审议通过了《关于修订商业行为和道德守则的议案》。\n"
+                              "本议案同意票12票，反对票0票，弃权票0票。")},
+                ]
+            },
+            filing_type="other",
+        )
+
+        proposals = [u for u in units if u.payload_kind == "mixed"
+                     and u.payload.get("semantic_type") == "meeting_proposal"]
+        self.assertEqual(len(proposals), 2)
+        self.assertEqual(stats.grouped_proposal_units, 2)
+        self.assertTrue(proposals[0].title.startswith("一、审议通过了"))
+        self.assertIn("同意票12票", proposals[0].payload["parts"][0]["text"])
+        self.assertTrue(proposals[1].title.startswith("二、审议通过了"))
+
+    def test_table_caption_proposal_anchor_starts_new_unit(self) -> None:
+        # Codex round7 招商股东会决议: MinerU attaches "8. 议案名称：…" as the
+        # vote table's caption — it must start proposal 8, not join proposal 7.
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {"kind": "heading", "raw_kind": "text", "order_index": 1,
+                     "heading_level": 1, "text": "二、议案审议情况"},
+                    {"kind": "text", "raw_kind": "text", "order_index": 2,
+                     "text": "7. 议案名称：关于选举董事的议案\n审议结果：通过"},
+                    {"kind": "table", "raw_kind": "table", "order_index": 3,
+                     "table": {"headers": ["同意"], "rows": [["99%"]]}},
+                    {"kind": "table", "raw_kind": "table", "order_index": 4,
+                     "table_caption": ["8. 议案名称：关于选举监事的议案"],
+                     "table": {"headers": ["同意"], "rows": [["98%"]]}},
+                ]
+            },
+            filing_type="other",
+        )
+
+        titles = [u.title for u in units if u.payload_kind == "mixed"]
+        self.assertIn("7. 议案名称：关于选举董事的议案", titles)
+        self.assertIn("8. 议案名称：关于选举监事的议案", titles)
+
+    def test_flat_document_units_anchor_under_document_title(self) -> None:
+        # Codex round7 美的 IR: form-table filings have no headings at all —
+        # units anchored under the registry title, never heading_path=[].
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {"kind": "table", "raw_kind": "table", "order_index": 1,
+                     "table": {"headers": ["活动类别"], "rows": [["特定对象调研"]]}},
+                ]
+            },
+            filing_type="investor_relations",
+            document_title="美的集团股份有限公司投资者关系活动记录表",
+        )
+
+        self.assertEqual(
+            units[0].heading_path,
+            ["美的集团股份有限公司投资者关系活动记录表"],
+        )
+        self.assertIsNotNone(units[0].title)
+
+    def test_shredded_qa_table_is_flagged_needs_review(self) -> None:
+        shredded = "机系列销量超56万套。户数量持续增长。" * 30 + "3. 公司业务当前的进展？"
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {"kind": "table", "raw_kind": "table", "order_index": 1,
+                     "table": {"headers": [shredded], "rows": [["答：进展顺利。"]]}},
+                ]
+            },
+            filing_type="investor_relations",
+            document_title="投资者关系活动记录表",
+        )
+
+        self.assertEqual(units[0].payload_kind, "table")
+        self.assertEqual(units[0].quality_status, "needs_review")
 
     def test_full_s1_s7_oversized_leaf_still_merges_whole(self) -> None:
         # Splitting one topic by payload kind is the defect — an oversized

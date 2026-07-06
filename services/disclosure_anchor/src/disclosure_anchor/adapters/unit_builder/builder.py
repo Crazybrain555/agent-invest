@@ -521,6 +521,25 @@ def replace_text_units_with_qa_where_stable(units: Iterable[UnitDraft]) -> list[
     return output
 
 
+def _flag_shredded_qa_table(unit: UnitDraft) -> UnitDraft:
+    """Flag Q&A transcripts that MinerU mis-detected as a table.
+
+    Form-style 投资者关系记录表 sometimes arrive with the transcript shredded
+    across cells (sentences split mid-way, question titles inside headers) —
+    unrecoverable at build time. Mark needs_review so L2 skips the soup; the
+    raw artifact stays reprocessable (§3.5).
+    """
+
+    if unit.payload_kind != "table" or unit.quality_status != "ok":
+        return unit
+    text = _main_text(unit)
+    if len(text) < rules.QA_TABLE_CONTENT_MIN_CHARS:
+        return unit
+    if not rules.QA_TABLE_MARKER_RE.search(text):
+        return unit
+    return UnitDraft(**{**unit.__dict__, "quality_status": "needs_review"})
+
+
 def _drop_blank_rows_adjusting(
     rows: list[list[str]],
     merged_cells: list[dict[str, int]],
@@ -643,11 +662,13 @@ def build_unit_drafts_s1_s7(
         s3_build_text_units(placed, stats=s1.stats)
     )
     table_units = s5_build_table_units(placed, s1.stats)
+    if filing_type in {"investor_relations", "performance_briefing"}:
+        table_units = [_flag_shredded_qa_table(unit) for unit in table_units]
     table_qa_units = _qa_units_from_tables(table_units)
     units = sorted([*text_units, *table_units, *table_qa_units], key=_unit_sort_key)
     units = _sink_leading_applicable(units)
     kept = s6_filter_units(units, s1.stats)
-    kept = _anchor_headerless_units(kept, stats=s1.stats)
+    kept = _anchor_headerless_units(kept, document_title=document_title, stats=s1.stats)
     kept = s8_group_semantic_units(
         kept, filing_type=filing_type, document_title=document_title, stats=s1.stats
     )
@@ -655,7 +676,7 @@ def build_unit_drafts_s1_s7(
 
 
 def _anchor_headerless_units(
-    units: list[UnitDraft], *, stats: BuildStats
+    units: list[UnitDraft], *, document_title: str | None = None, stats: BuildStats
 ) -> list[UnitDraft]:
     """Anchor pre-first-heading units under a stable synthetic heading.
 
@@ -666,8 +687,13 @@ def _anchor_headerless_units(
     there would be worse than none.
     """
 
-    if not any(unit.heading_path for unit in units):
+    fully_flat = not any(unit.heading_path for unit in units)
+    if fully_flat and not document_title:
         return units
+    # Pre-first-heading remnants anchor under 公告头信息; a fully flat document
+    # (MinerU form-table filings) anchors under its registry title instead of
+    # inventing structure (Codex round7: IR units with heading_path=[]).
+    anchor = document_title if fully_flat else rules.DOCUMENT_HEADER_ANCHOR
     out: list[UnitDraft] = []
     for unit in units:
         if unit.heading_path:
@@ -676,7 +702,11 @@ def _anchor_headerless_units(
         stats.anchored_header_units += 1
         out.append(
             UnitDraft(
-                **{**unit.__dict__, "heading_path": [rules.DOCUMENT_HEADER_ANCHOR]}
+                **{
+                    **unit.__dict__,
+                    "heading_path": [anchor],
+                    "title": unit.title or (anchor if fully_flat else None),
+                }
             )
         )
     return out
@@ -731,7 +761,7 @@ def _split_units_at_proposal_anchors(units: list[UnitDraft]) -> list[UnitDraft]:
         inner_anchors = [
             index
             for index, line in enumerate(lines)
-            if index > 0 and rules.PROPOSAL_ANCHOR_RE.match(line.strip())
+            if index > 0 and rules.match_proposal_anchor(line.strip())
         ]
         if not inner_anchors:
             out.append(unit)
@@ -811,7 +841,7 @@ def _proposal_anchor(
 
     if unit.payload_kind == "text" and "text" in unit.payload:
         lines = str(unit.payload["text"]).splitlines()
-        if lines and rules.PROPOSAL_ANCHOR_RE.match(lines[0].strip()):
+        if lines and rules.match_proposal_anchor(lines[0].strip()):
             title = lines[0].strip()
             remainder = "\n".join(lines[1:]).strip()
             members: list[UnitDraft] = []
@@ -820,15 +850,25 @@ def _proposal_anchor(
                     UnitDraft(**{**unit.__dict__, "payload": {"text": remainder}})
                 )
             return ("text", title, _strip_anchor_suffix(unit.heading_path), members)
+    if unit.payload_kind == "table":
+        caption = unit.payload.get("caption") or []
+        first = str(caption[0]).strip() if caption else ""
+        if first and rules.match_proposal_anchor(first):
+            return (
+                "table_caption",
+                first,
+                _strip_anchor_suffix(unit.heading_path),
+                [unit],
+            )
     path = unit.heading_path
-    if path and rules.PROPOSAL_ANCHOR_RE.match(path[-1].strip()):
+    if path and rules.match_proposal_anchor(path[-1].strip()):
         return ("heading", path[-1].strip(), _strip_anchor_suffix(path), [unit])
     return None
 
 
 def _strip_anchor_suffix(path: list[str]) -> list[str]:
     parent = list(path)
-    while parent and rules.PROPOSAL_ANCHOR_RE.match(parent[-1].strip()):
+    while parent and rules.match_proposal_anchor(parent[-1].strip()):
         parent.pop()
     return parent
 
