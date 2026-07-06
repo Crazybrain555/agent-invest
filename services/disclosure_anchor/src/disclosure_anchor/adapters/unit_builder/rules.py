@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-7"
+RULES_VERSION = "ub-2026.07-8"
 HEADING_RULESET_ID = "cn_a_v4"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -133,8 +133,11 @@ FOOTNOTE_LINE_RE = re.compile(r"^\s*(?:[\[［]\s*注\s*\d*\s*[\]］]|注\s*[：:
 # The fixed board-guarantee legalese (§3.5 稳定噪声, user-authorized drop
 # 2026-07-06). Anchored and keyword-complete so any sentence carrying real
 # content fails the match and is kept (red line).
+# The subject clause is a bounded character-class soup: real filings permute
+# it freely (本公司及董事会全体成员…, 公司董事会、监事会及董事、监事、高级管理
+# 人员…) and an ordered alternation missed the 及-before-董事会 variant.
 BOILERPLATE_GUARANTEE_RE = re.compile(
-    r"^\s*本?公司?(?:董事会|监事会)?[、及和]*(?:全体)?(?:董事|监事|高级管理人员|及|、)*"
+    r"^\s*本?[公司行董事监会高级管理人员全体成及和、\s]{0,30}"
     r"保证(?:本公告|本报告|年度报告|半年度报告|季度报告|报告)?(?:内容)?[^。]{0,40}?"
     r"(?:真实|虚假记载)[^。]{0,80}?(?:重大遗漏|连带责任|法律责任)[。.]?\s*$"
 )

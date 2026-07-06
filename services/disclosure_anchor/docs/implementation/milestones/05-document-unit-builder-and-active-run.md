@@ -28,7 +28,7 @@ delivers_to: milestone 06
 ## 2. 本 milestone 锁定的契约决策
 
 - **U1 同 run 构建（04R-D8）**：builder 作用于一个 `status='succeeded'` 的 parse run，
-  unit 挂在同一 `processing_run_id` 下；`run_kind='rebuild_units'` 保留不实现。
+  unit 挂在同一 `processing_run_id` 下；`run_kind='rebuild_units'` 已于 2026-07-06 实现（用户裁决：规则迭代不重跑 MinerU）——`use_cases/rebuild_units.py` 复制最近 succeeded parse run 的解析出处与 artifact 引用生成 succeeded 重切 run，CLI `rebuild-units` 串 build+publish，实测全语料重切 5 秒（对比全解析 ~40 分钟）。
 - **U2 三哈希分层（unit 级；实现为 domain service `domain/services/unit_hashing.py`；
   canonical_json = `json.dumps(sort_keys=True, ensure_ascii=False,
   separators=(",", ":"))`）**。跨进程稳定性测试形态定死：新建
@@ -514,6 +514,21 @@ p.102）后定案，全部为标题树进栈规则问题，cn_a_v4：
 6. 已知接受项（用户裁决"一类数据大也没关系"）：大 mixed section（主营业务分析
    25 parts）保持；十二、金融工具风险内部 1、/(一) 层级倒置文档的次级归属不完美
    （修复后不再窜根、保持在 十二 子树内），完美化需字体/样式信息，记 P2。
+
+### ub-2026.07-8（2026-07-06 round6 GO 后的工作流轮）
+
+1. **rebuild_units 快速路径落地**（见 §2 U1）：轻/重测试分层——轻 = agent-check +
+   `make rebuild-units`（秒级，规则改动的默认验证路径）；重 = `make process` 全解析
+   （仅 parser/MinerU 变更时需要）。
+2. **prune-history 测试期工具**：`make prune-history PRUNE=YES` 删除全部非 active
+   run + 其 units + 相关 outbox 事件，库中只留当前代（用户裁决：测试期看不清新旧不可接受；
+   被删代的 U5 历史回放测试期放弃，投产 retention 另议）。
+3. **责任声明主语收网**：round6 发现"本公司及董事会全体成员保证…"变体漏网（及 在 董事会
+   之前打败有序 alternation）——主语改为有界字符类，正负五例验证（鉴证报告"管理层的责任
+   是提供真实…"等实质责任段不匹配、正确保留）。
+4. Codex round6 P2 挂账：42、其他重要会计政策 单成员组保留叶子 title（可改进为组键
+   title + local_heading，不阻塞）；structure_status / 分组标签行 / 金融工具风险次级
+   层级完美化 维持开放。
 
 ## 9. 明确不做
 

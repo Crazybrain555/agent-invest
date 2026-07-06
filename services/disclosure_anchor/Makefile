@@ -19,7 +19,7 @@ PGPORT ?= 55432
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	test-mineru-smoke lint typecheck agent-check api archive pg-init pg-start pg-stop \
-	pg-status db-create migrate register parse build-units publish process sync worker-once worker-loop doctor-full wipe-test-data
+	pg-status db-create migrate register parse build-units publish process rebuild-units prune-history sync worker-once worker-loop doctor-full wipe-test-data
 
 doctor:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -111,6 +111,17 @@ publish:
 
 process:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline process --document-id "$(DOC)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
+
+# Rules-only iteration: reuse the latest succeeded parse artifacts, no MinerU.
+rebuild-units:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline rebuild-units --document-id "$(DOC)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
+
+# TEST-PHASE ONLY: delete superseded (non-active) runs + their units + events,
+# so the DB shows exactly the current generation. Production retention is a
+# separate post-launch decision.
+prune-history:
+	@test "$(PRUNE)" = "YES" || (echo 'refusing: set PRUNE=YES to confirm' && exit 2)
+	./scripts/prune_history.sh
 
 sync:
 	@test -n "$(COMPANY)" || (echo 'usage: make sync COMPANY=<scode> [WINDOW=N]' && exit 2); \

@@ -60,7 +60,11 @@ def document_observed(
 
 
 def processing_run_created(
-    *, document_id: str, processing_run_id: str, occurred_at: datetime
+    *,
+    document_id: str,
+    processing_run_id: str,
+    occurred_at: datetime,
+    status: str = "running",
 ) -> OutboxEvent:
     return OutboxEvent(
         event_id=ids.new_outbox_event_id(),
@@ -70,7 +74,7 @@ def processing_run_created(
         subject_ref=processing_run_id,
         document_id=document_id,
         processing_run_id=processing_run_id,
-        payload={"document_id": document_id, "status": "running"},
+        payload={"document_id": document_id, "status": status},
         occurred_at=occurred_at,
     )
 

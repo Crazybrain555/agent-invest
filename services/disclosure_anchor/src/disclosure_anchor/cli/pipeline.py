@@ -45,6 +45,10 @@ from disclosure_anchor.application.use_cases.publish_run import (
     PublishRun,
     PublishRunCommand,
 )
+from disclosure_anchor.application.use_cases.rebuild_units import (
+    RebuildUnits,
+    RebuildUnitsCommand,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.use_cases.register_local_pdf import (
     RegisterLocalPdf,
@@ -87,6 +91,14 @@ def _parser() -> argparse.ArgumentParser:
     publish.add_argument("--processing-run-id", required=True)
     publish.add_argument("--allow-empty", action="store_true")
     publish.add_argument("--reason")
+
+    rebuild = subparsers.add_parser(
+        "rebuild-units",
+        help="rebuild units from the latest succeeded parse run (no MinerU re-parse)",
+    )
+    rebuild.add_argument("--document-id", required=True)
+    rebuild.add_argument("--allow-empty", action="store_true")
+    rebuild.add_argument("--reason")
 
     process = subparsers.add_parser("process")
     process.add_argument("--document-id", required=True)
@@ -136,6 +148,31 @@ def main(argv: list[str] | None = None) -> int:
             if not _stage_succeeded("publish", result):
                 _print_failed_stage("publish", result)
                 return 1
+        elif args.command == "rebuild-units":
+            rebuild_result = deps.rebuild_units().execute(
+                RebuildUnitsCommand(document_id=args.document_id)
+            )
+            build_result = deps.build_units().execute(
+                BuildUnitsCommand(processing_run_id=rebuild_result.processing_run_id)
+            )
+            if not _stage_succeeded("build-units", build_result):
+                _print_failed_stage("build-units", build_result)
+                return 1
+            publish_result = deps.publish().execute(
+                PublishRunCommand(
+                    processing_run_id=rebuild_result.processing_run_id,
+                    allow_empty=args.allow_empty,
+                    reason=args.reason,
+                )
+            )
+            if not _stage_succeeded("publish", publish_result):
+                _print_failed_stage("publish", publish_result)
+                return 1
+            result = {
+                "rebuild": _jsonable(rebuild_result),
+                "build_units": _jsonable(build_result),
+                "publish": _jsonable(publish_result),
+            }
         elif args.command == "process":
             parse_result = deps.parse().execute(
                 ParseDocumentCommand(document_id=args.document_id)
@@ -214,6 +251,9 @@ class _Deps:
 
     def publish(self) -> PublishRun:
         return PublishRun(uow_factory=self.uow_factory)
+
+    def rebuild_units(self) -> RebuildUnits:
+        return RebuildUnits(uow_factory=self.uow_factory)
 
     def sync(self, args: argparse.Namespace) -> dict[str, object]:
         company = args.company
