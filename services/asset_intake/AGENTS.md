@@ -1,7 +1,7 @@
 # asset_intake - Agent Operating Contract
 
 L1 轻资产登记服务：dataset_snapshot（结构化数据查询结果）+ tool_result（工具返回登记），统一出口
-`data_asset` 信封。语义权威：根 `../../docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md`
+`data_asset` 信封。语义权威：根 `../../docs/reference/投研预测引擎顶层框架协议_v0.8.md`
 （§3.2 信封、§3.7 payload 契约、§3.9 查空、§2.8 change feed、§3.11 对外契约）。跨服务规矩见根
 `AGENTS.md`；蓝图（只读参考）是 `../disclosure_anchor/`。
 

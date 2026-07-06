@@ -5,12 +5,12 @@ contract_version: v1.2
 status: canonical
 layer: L1
 layer_name: 披露文件接入与结构化准备层
-reference: ../../docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md
+reference: ../../docs/reference/投研预测引擎顶层框架协议_v0.8.md
 delivers_to: L2
 scope: self_maintained_exchange_disclosures
 output_kind: l2_ready_document_units
 output_form: queryable_database_plus_filing_api
-payload_kinds: [text, table, qa]
+payload_kinds: [text, table, qa, mixed]
 query_keys: [company_ref, security_ref, report_period, announcement_date, filing_type, document_id, asset_id, payload_kind, heading_path, semantic_key, quality_status, content_hash, source_ref, producer_action_ref]
 core_objects: [company, security, source_access, document, processing_run, document_unit]
 optional_objects: [source_checkpoint]
@@ -1068,7 +1068,7 @@ L2 收到一个 unit 后负责：
 
 # 18. 对上位协议的兼容说明
 
-本文件已对齐 `投研预测引擎顶层框架协议_v0.7修订最终版本.md`，尤其是 §3.10
+本文件已对齐 `投研预测引擎顶层框架协议_v0.8.md`，尤其是 §3.10
 对 `disclosure_anchor` 的三点补强：
 
 1. `document_units_v1` 保留 unit 级 scope keys，方便 L2 / MCP / API 检索；

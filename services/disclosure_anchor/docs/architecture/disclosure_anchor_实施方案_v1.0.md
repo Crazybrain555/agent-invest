@@ -11,7 +11,7 @@ layer: L1
 requirements:
   - docs/architecture/service-purpose.md
   - docs/architecture/财报与披露数据接入及切分方案.md
-  - ../../docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md
+  - ../../docs/reference/投研预测引擎顶层框架协议_v0.8.md
 references:
   - docs/architecture/database-selection.md
   - docs/architecture/pdf-parsing-investigation.md
@@ -41,7 +41,7 @@ implementation_style: modular_monolith_with_ports_and_adapters
 1. `service-purpose.md`：决定本服务做什么、不做什么，是业务边界的 canonical contract；
 2. `财报与披露数据接入及切分方案.md`：决定标准数据 provider 与 PDF 的分工、保留范围和切分方向；
 3. 本实施方案：在前两份需求契约之下，决定这些需求如何落成代码；
-4. `投研预测引擎顶层框架协议_v0.7修订最终版本.md`：决定上位系统目标和 L1/L2/L3 关系；
+4. `投研预测引擎顶层框架协议_v0.8.md`：决定上位系统目标和 L1/L2/L3 关系；
 5. `database-selection.md`、`pdf-parsing-investigation.md`、`open-source-references.md`：作为论证与参考，不直接约束代码细节。
 
 出现冲突时：
@@ -169,7 +169,7 @@ PostgreSQL + filesystem 的结论正确。需要加强：
 
 参考方向正确，但应补入 `Unstructured` 的“partition elements 与 chunking 分离”思想，并把 `DoclingDocument` 视为 normalized IR 的重要参考。OpenBB、EdgarTools、secfsdstools、dlt 和 CocoIndex 仍是本项目最值得借鉴的五类架构模式。
 
-### `投研预测引擎顶层框架协议_v0.7修订最终版本.md`
+### `投研预测引擎顶层框架协议_v0.8.md`
 
 旧版协议（v0.5 前）存在一处真实冲突（把 G0 写成“PDF + 页码 + 段落/表格位置”，并把信息单元切分全部放在 L2），**已在协议修订中收敛（现行 v0.7）**，按以下 canonical 设计落地（协议 §2.9、§3.4–§3.5、§3.10、§17.2）：
 

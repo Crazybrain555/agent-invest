@@ -14,7 +14,7 @@ created_at: 2026-06-26
 
 ```text
 docs/architecture/service-purpose.md
-../../docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md
+../../docs/reference/投研预测引擎顶层框架协议_v0.8.md
 docs/implementation/001-disclosure-anchor-framework.md
 docs/implementation/002-implementation-roadmap.md
 docs/implementation/milestones/<current>.md

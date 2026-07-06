@@ -32,16 +32,20 @@ node --version && npx --version
 
 ## 1. Install approach: shared npm cache ("download once, both share")
 
-We use **Plan A**: harness configs invoke `npx -y <pkg>@<pinned-version>` directly. The
-"public place" is the per-user **shared npm cache** (`~/.npm/_cacache` + `~/.npm/_npx`),
-which Codex and Claude both hit — so a package is downloaded once and reused by both.
+We use **Plan A** for general MCP servers: harness configs invoke `npx -y <pkg>@<pinned-version>`
+directly. The "public place" is the per-user **shared npm cache** (`~/.npm/_cacache` +
+`~/.npm/_npx`), which Codex and Claude both hit — so a package is downloaded once and reused
+by both. DBHub is the exception because it also needs a private DB password: Codex and Claude run
+`/Users/zhang/.config/agent-invest/disclosure_anchor/dbhub-mcp`, a wrapper that loads the private
+env file and executes a fixed local copy of DBHub.
 
 - The npm cache is content-addressed with **no time-based expiry** — it does not re-download
   "a day later". Re-download happens only if: the spec is unpinned/`@latest` (version drift),
   the cache is cleared, or the cache dir is missing.
 - **Pin every version** in the spec (done below) → no drift, offline-capable after first pull.
-- Future hardening (optional, "Plan B"): `npm install pkg@x.y.z --prefix ~/.mcp-servers/node/<srv>`
-  and point `command` at the absolute `node_modules/.bin/<bin>` for 100% offline determinism.
+- Future hardening (optional, "Plan B"): for more servers, `npm install pkg@x.y.z --prefix
+  ~/.mcp-servers/node/<srv>` and point `command` at the absolute `node_modules/.bin/<bin>` for
+  100% offline determinism. DBHub already follows this fixed-directory pattern locally.
 
 Warm the cache after a `npm cache clean` or on a new machine:
 
@@ -58,7 +62,7 @@ npx -y playwright@1 install chromium   # browser for Playwright MCP (shared ms-p
 |---|---|---|---|
 | context7 | `@upstash/context7-mcp@3.2.1` | Version-accurate docs for MinerU/Docling/PyMuPDF/SQLModel/FastAPI/etc. | `CONTEXT7_API_KEY` (optional; runs keyless) |
 | playwright | `@playwright/mcp@0.0.76` | Recon cninfo/HKEXnews pages: real XHR, `hisAnnouncement/query` params, PDF URL patterns | none |
-| dbhub | `@bytebase/dbhub@0.22.3` | Read-only introspection of the `invest_engine` Postgres DB the service writes | password (local dev DB; DSN in gitignored `dbhub.toml`) |
+| dbhub | `@bytebase/dbhub@0.22.3` | Build-phase SQL access to the `invest_engine` Postgres DB | password in private user-level env |
 
 GitHub is **not** added as an MCP: Codex already has the `github` plugin and Claude Code has
 the `gh` CLI. Optional snippet in §6 if you want the dedicated server later.
@@ -76,9 +80,8 @@ falls back to keyless. Each project opts in by listing only the servers it wants
                    "env": { "CONTEXT7_API_KEY": "${CONTEXT7_API_KEY:-}" } },
     "playwright":{ "command": "/Users/zhang/.local/bin/npx",
                    "args": ["-y", "@playwright/mcp@0.0.76"] },
-    "dbhub":     { "command": "/Users/zhang/.local/bin/npx",
-                   "args": ["-y", "@bytebase/dbhub@0.22.3", "--transport", "stdio",
-                            "--config", "/Users/zhang/dev/agent-invest/services/disclosure_anchor/dbhub.toml"] }
+    "dbhub":     { "command": "/Users/zhang/.config/agent-invest/disclosure_anchor/dbhub-mcp",
+                   "args": [] }
   }
 }
 ```
@@ -140,8 +143,10 @@ sslmode = "disable"
 - Secret: do not put the password in repo-local config. The wrapper at
   `/Users/zhang/.config/agent-invest/disclosure_anchor/dbhub-mcp` loads
   `/Users/zhang/.config/agent-invest/disclosure_anchor/dbhub.env` and then starts DBHub; keep that
-  env file private (`0600`). The wrapper executes the locally cached DBHub package directly, avoiding
-  `npx` registry access during MCP startup. Claude and Codex both read the same `dbhub.toml` path.
+  env file private (`0600`). The wrapper executes the fixed local DBHub package copy under
+  `/Users/zhang/.config/agent-invest/disclosure_anchor/dbhub-node/`, avoiding `npx` registry access
+  and volatile `_npx` cache paths during MCP startup. Claude and Codex both read the same
+  `dbhub.toml` path.
 
 ## 6. Secrets & optional servers
 
@@ -158,9 +163,9 @@ sslmode = "disable"
 export PATH="$HOME/.local/bin:$PATH"
 npx -y @upstash/context7-mcp@3.2.1 --help            # prints usage
 node "$(npm root -g 2>/dev/null)"; :                 # (no-op placeholder)
-# DBHub connects read-only and exits on EOF:
-npx -y @bytebase/dbhub@0.22.3 --transport stdio \
-  --config "$PWD/dbhub.toml" < /dev/null             # expect EXIT 0, "🔒 execute_sql"
+# DBHub connects and exits on EOF; current build-phase config exposes read-write execute_sql:
+/Users/zhang/.config/agent-invest/disclosure_anchor/dbhub-mcp < /dev/null
+# expect EXIT 0, "execute_sql" plus locked "search_objects"
 claude mcp list                                       # context7/playwright/dbhub healthy
 codex mcp list                                        # from repo: +dbhub; from ~: dbhub absent
 ```

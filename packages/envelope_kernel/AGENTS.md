@@ -1,7 +1,7 @@
 # envelope_kernel - Agent Operating Contract
 
 Shared L1 `data_asset` envelope kernel for the 投研预测引擎 monorepo. Semantic authority is the engine
-protocol at `../../docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md` — this package implements
+protocol at `../../docs/reference/投研预测引擎顶层框架协议_v0.8.md` — this package implements
 §3.2 (envelope), §2.2 (kind matrix), §2.3 (`asset://` URI), §2.9 (source_tier / trace_level); it decides
 nothing on its own. Cross-service norms live in the root `AGENTS.md`.
 

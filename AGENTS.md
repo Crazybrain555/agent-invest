@@ -27,7 +27,7 @@ Rules:
 
 ## 2. Authority documents
 
-- Engine architecture: `docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md`
+- Engine architecture: `docs/reference/投研预测引擎顶层框架协议_v0.8.md`
   (engine-wide protocol, homed at root `docs/reference/` alongside prior versions).
 - L1 disclosure service contract: `services/disclosure_anchor/AGENTS.md` and its `docs/` tree.
 

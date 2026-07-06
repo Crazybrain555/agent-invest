@@ -1,7 +1,7 @@
 # agent-invest
 
 投研预测引擎（L1–L6）monorepo。架构由《投研预测引擎顶层框架协议 v0.7》锁定：
-`docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md`。
+`docs/reference/投研预测引擎顶层框架协议_v0.8.md`。
 
 ## 布局
 

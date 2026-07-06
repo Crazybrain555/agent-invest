@@ -17,7 +17,7 @@ turn normal answers into long operation manuals.
    durable-docs rules (Status≤120 / Plan≤300 / Documentation≤200, rotate into `archive/`).
 4. `docs/archive/pre-restart/` is frozen Quant_agent-era history — read on demand only, never as policy.
 5. The engine protocol (v0.7) lives at
-   `docs/reference/投研预测引擎顶层框架协议_v0.7修订最终版本.md`.
+   `docs/reference/投研预测引擎顶层框架协议_v0.8.md`.
 
 ## Preferences (inherited from disclosure_anchor practice)
 
