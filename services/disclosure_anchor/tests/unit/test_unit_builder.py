@@ -24,8 +24,8 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-9")
-        self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v4")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-10")
+        self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v5")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
 
@@ -513,6 +513,63 @@ class UnitBuilderTests(unittest.TestCase):
 
         self.assertEqual(units[0].payload_kind, "table")
         self.assertEqual(units[0].quality_status, "needs_review")
+
+    def test_year_line_never_becomes_numbered_heading(self) -> None:
+        # "2025 年度" matched the ^\d+\s numbered-heading pattern (user-found
+        # bug: it became a heading node under 财务报表附注 and stranded a
+        # 金额单位 line as its own unit).
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(kind="heading", order_index=1, heading_level=1,
+                                text="财务报表附注"),
+                PreparedElement(kind="heading", order_index=2, heading_level=2,
+                                text="2025 年度"),
+                PreparedElement(kind="text", order_index=3, text="接上表。"),
+            ]
+        )
+
+        # The year line nests as an unnumbered sub-label, never a numbered
+        # top-level node; and it must not evict 财务报表附注.
+        self.assertEqual(placed[-1].heading_path[0], "财务报表附注")
+
+    def test_amount_unit_declaration_variant_is_stripped(self) -> None:
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {"kind": "heading", "raw_kind": "text", "order_index": 1,
+                     "heading_level": 1, "text": "财务报表附注"},
+                    {"kind": "text", "raw_kind": "text", "order_index": 2,
+                     "text": "金额单位：人民币元\n应收账款期末余额如下。"},
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].payload["text"], "应收账款期末余额如下。")
+        self.assertEqual(stats.dropped_unit_declarations, 1)
+
+    def test_expanded_semantic_vocabulary_samples(self) -> None:
+        cases = [
+            ("4、研发投入", "研发费用及人员构成如下", "rd_investment"),
+            ("前五名客户销售情况", "", "customer_concentration"),
+            ("现金流量表主要项目", "", "cash_flow"),
+            ("利润分配方案", "", "dividend"),
+            ("回购股份实施结果", "", "share_buyback"),
+        ]
+        for title, text, expected in cases:
+            with self.subTest(key=expected):
+                unit = UnitDraft(
+                    payload_kind="text",
+                    payload={"text": text or title},
+                    source_order=1,
+                    heading_path=[title],
+                    title=title,
+                )
+                self.assertEqual(
+                    semantic_key_for_unit(unit, filing_type="annual_report"),
+                    expected,
+                )
 
     def test_full_s1_s7_oversized_leaf_still_merges_whole(self) -> None:
         # Splitting one topic by payload kind is the defect — an oversized

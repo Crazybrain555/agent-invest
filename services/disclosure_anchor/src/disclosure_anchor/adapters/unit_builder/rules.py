@@ -6,8 +6,8 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-9"
-HEADING_RULESET_ID = "cn_a_v4"
+RULES_VERSION = "ub-2026.07-10"
+HEADING_RULESET_ID = "cn_a_v5"
 GIBBERISH_RATIO_MAX = 0.30
 
 # A-share applicability declaration lines ("√适用 □不适用" / "□适用 √不适用").
@@ -58,7 +58,9 @@ def strip_header_kv_line(line: str) -> str | None:
 # extracts the value into table payload `unit` from the element stream, so a
 # text unit carrying only this line is pure duplication (audited: 194 of 908
 # units in a real annual report).
-UNIT_DECLARATION_RE = re.compile(r"^\s*单\s*位\s*[：:]\s*\S{1,8}\s*$")
+UNIT_DECLARATION_RE = re.compile(
+    r"^\s*(?:金\s*额|币\s*种)?\s*单\s*位\s*[：:]\s*\S{1,12}\s*$"
+)
 
 
 def classify_marker_line(line: str) -> str | None:
@@ -173,8 +175,8 @@ HEADING_PATTERNS: tuple[tuple[int, re.Pattern[str]], ...] = (
     (1, re.compile(r"^第[一二三四五六七八九十百]+[节章]")),
     (2, re.compile(r"^[一二三四五六七八九十]+、")),
     (3, re.compile(r"^（[一二三四五六七八九十]+）|^\([一二三四五六七八九十]+\)")),
-    (4, re.compile(r"^\d+([.、．]|\s)")),
-    (5, re.compile(r"^（\d+）|^\(\d+\)|^\d+[)）]")),
+    (4, re.compile(r"^\d{1,3}([.、．]|\s)")),
+    (5, re.compile(r"^（\d{1,3}）|^\(\d{1,3}\)|^\d{1,3}[)）]")),
     (6, re.compile(r"^[①②③④⑤⑥⑦⑧⑨⑩]")),
 )
 FIXED_L1_TITLES = {"重要提示", "释义", "目录", "备查文件"}
@@ -233,5 +235,78 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         required=("关税",),
         any_required=(),
         filing_type_limited=False,
+    ),
+    SemanticKeyRule("rd_investment", required=("研发",), any_required=("投入", "费用", "人员")),
+    SemanticKeyRule(
+        "customer_concentration",
+        required=(),
+        any_required=("前五名客户", "前5名客户", "主要客户", "前五名供应商", "前5名供应商", "主要供应商"),
+    ),
+    SemanticKeyRule("cash_flow", required=("现金流量",), any_required=()),
+    SemanticKeyRule(
+        "debt_financing",
+        required=(),
+        any_required=("短期借款", "长期借款", "应付债券", "有息负债", "银行授信"),
+    ),
+    SemanticKeyRule(
+        "capex_projects",
+        required=(),
+        any_required=("在建工程", "募集资金", "投资进展", "产能建设"),
+    ),
+    SemanticKeyRule(
+        "dividend",
+        required=(),
+        any_required=("利润分配", "权益分派", "现金分红", "分红"),
+        filing_type_limited=False,
+    ),
+    SemanticKeyRule(
+        "share_buyback",
+        required=("回购",),
+        any_required=("股份", "股票"),
+        filing_type_limited=False,
+    ),
+    SemanticKeyRule(
+        "equity_incentive",
+        required=(),
+        any_required=("股权激励", "限制性股票", "员工持股"),
+        filing_type_limited=False,
+    ),
+    SemanticKeyRule(
+        "meeting_resolution",
+        required=("议案",),
+        any_required=("审议", "表决"),
+        filing_type_limited=False,
+    ),
+    SemanticKeyRule(
+        "shareholding_change",
+        required=(),
+        any_required=("增持", "减持"),
+        filing_type_limited=False,
+    ),
+    SemanticKeyRule(
+        "litigation",
+        required=(),
+        any_required=("诉讼", "仲裁"),
+        filing_type_limited=False,
+    ),
+    SemanticKeyRule(
+        "accounting_policy",
+        required=("会计政策",),
+        any_required=("变更", "估计", "重要"),
+    ),
+    SemanticKeyRule(
+        "risk_factors",
+        required=("风险",),
+        any_required=("提示", "因素", "应对"),
+    ),
+    SemanticKeyRule(
+        "segment_performance",
+        required=(),
+        any_required=("分部报告", "分部信息", "经营分部"),
+    ),
+    SemanticKeyRule(
+        "impairment",
+        required=("减值",),
+        any_required=("准备", "测试", "损失"),
     ),
 )
