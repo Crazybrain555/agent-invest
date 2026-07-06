@@ -1,5 +1,6 @@
 # Root-level safety net; each service carries its own .gitignore with the full set.
 /docs/agent/
+/docs/reference/api resource/
 .DS_Store
 ._*
 .env

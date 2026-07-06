@@ -90,6 +90,7 @@ SOURCE_REF_COLUMNS = (
     "provider_document_id",
     "raw_file_hash",
     "processing_run_id",
+    "is_active_run",
     "payload_kind",
     "heading_path",
     "title",

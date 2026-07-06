@@ -13,10 +13,13 @@ from tests.integration._support import engine_or_skip
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_MODELS_ROOT = REPO_ROOT / "contracts" / "public_models"
-DERIVED = {"document_unit": {"asset_uri", "is_active_run"}}
+# is_active_run left DERIVED for source_ref only from 0011 on: document_units_v1
+# exposes it directly (round3 P1#7).
+DERIVED = {"document_unit": {"asset_uri"}}
 VIEW_BY_MODEL = {
     "document": "documents_v1",
     "document_unit": "document_units_v1",
+    "document_category": "document_categories_v1",
     "processing_run": "processing_runs_v1",
     "source_ref": "source_refs_v1",
     "change_event": "change_events_v1",

@@ -49,7 +49,7 @@ UNIT_REQUIRED_KEYS = {
     "payload_kind",
 }
 
-ALLOWED_PAYLOAD_KINDS = {"text", "table", "qa"}
+ALLOWED_PAYLOAD_KINDS = {"text", "table", "qa", "mixed"}
 
 
 def _is_relative_locator(value: str) -> bool:

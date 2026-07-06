@@ -6,8 +6,8 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-4"
-HEADING_RULESET_ID = "cn_a_v1"
+RULES_VERSION = "ub-2026.07-5"
+HEADING_RULESET_ID = "cn_a_v2"
 GIBBERISH_RATIO_MAX = 0.30
 
 # A-share applicability declaration lines ("√适用 □不适用" / "□适用 √不适用").
@@ -80,15 +80,64 @@ def is_pure_marker_line(line: str) -> bool:
     match = APPLICABLE_MARK_RE.search(stripped) or NOT_APPLICABLE_MARK_RE.search(stripped)
     return match is not None and match.start() == 0
 
+
+# Yes/no checkbox answers ("是 □否", "□是 √否"). They are disclosure answers,
+# not applicability declarations: the line stays in unit text, but it must
+# never become a heading or a table caption/title (observed as a table title
+# in the real 江海 annual corpus, 2026-07-06).
+YES_NO_ANSWER_RE = re.compile(
+    rf"^\s*[{_CHECKED}{_UNCHECKED}]?\s*是\s*[{_CHECKED}{_UNCHECKED}]?\s*否\s*[。.]?\s*$"
+)
+
+
+def is_checkbox_answer_line(line: str) -> bool:
+    stripped = line.strip()
+    if not any(glyph in stripped for glyph in _CHECKED + _UNCHECKED):
+        return False
+    return bool(YES_NO_ANSWER_RE.match(stripped))
+
+
+def is_declaration_line(line: str) -> bool:
+    """Any checkbox declaration: applicability marker or yes/no answer."""
+
+    return is_pure_marker_line(line) or is_checkbox_answer_line(line)
+
+
+# Semantic grouping (ub-2026.07-5). L2-facing units must be business-semantic
+# blocks, not MinerU element slices: a meeting proposal (审议结果 + 表决表格 +
+# 会议决定) is ONE unit with ordered parts, and a short filing without proposal
+# structure is ONE document-level unit. Thresholds follow the phase008 round3
+# over-fragmentation audit.
+PROPOSAL_ANCHOR_RE = re.compile(r"^\s*\d{1,3}\s*[.、．]?\s*议案名称\s*[：:]")
+SHORT_DOC_CONTENT_CHARS = 8000
+COLLAPSIBLE_FILING_TYPES = frozenset(
+    {"other", "performance_forecast", "performance_flash"}
+)
+DOCUMENT_HEADER_ANCHOR = "公告头信息"
+
+# Long structured documents (annual reports, long 制度/办法) group at the
+# shallowest heading node whose subtree stays within this budget — deep enough
+# to be one business topic (研发投入、附注某科目), shallow enough that reading
+# the unit answers one business question. An oversized LEAF still merges whole:
+# splitting one topic by payload kind is the exact defect round3 P0#1 forbids.
+SECTION_GROUP_MAX_CHARS = 8000
+
 NOISE_SEPARATOR_RE = re.compile(r"^[\s\-—―=_·•\*~～]{3,}$")
 NOISE_LINE_PATTERNS: tuple[re.Pattern[str], ...] = ()
 
+# Canonical CN filing hierarchy: 节/章 > 一、 > （一） > 1、 > （1） > ①.
+# Digit-paren (（1）/1）) forms were previously unmapped, so MinerU's own
+# heading_level placed them right under the 节 and they swallowed sibling
+# 1、-level topics as children (round3 P1#11 drift; observed merging 研发投入
+# into （8）客户/供应商 on the real 江海 annual). Levels beyond the depth-4
+# heading_path cap simply stay in the unit text — that is the desired shape.
 HEADING_PATTERNS: tuple[tuple[int, re.Pattern[str]], ...] = (
     (1, re.compile(r"^第[一二三四五六七八九十百]+[节章]")),
     (2, re.compile(r"^[一二三四五六七八九十]+、")),
     (3, re.compile(r"^（[一二三四五六七八九十]+）")),
     (4, re.compile(r"^\d+([.、．]|\s)")),
-    (5, re.compile(r"^[①②③④⑤⑥⑦⑧⑨⑩]")),
+    (5, re.compile(r"^（\d+）|^\d+[)）]")),
+    (6, re.compile(r"^[①②③④⑤⑥⑦⑧⑨⑩]")),
 )
 FIXED_L1_TITLES = {"重要提示", "释义", "目录", "备查文件"}
 SKIP_SECTION_TITLES = {"释义", "目录", "备查文件"}

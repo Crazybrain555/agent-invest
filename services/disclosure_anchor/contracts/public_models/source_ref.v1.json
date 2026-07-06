@@ -43,6 +43,10 @@
       "title": "Heading Path",
       "type": "array"
     },
+    "is_active_run": {
+      "title": "Is Active Run",
+      "type": "boolean"
+    },
     "page_no": {
       "anyOf": [
         {
@@ -140,6 +144,7 @@
     "provider_document_id",
     "raw_file_hash",
     "processing_run_id",
+    "is_active_run",
     "payload_kind",
     "heading_path",
     "title",

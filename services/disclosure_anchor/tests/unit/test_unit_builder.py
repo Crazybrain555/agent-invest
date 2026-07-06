@@ -24,8 +24,8 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-4")
-        self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v1")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-5")
+        self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v2")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
 
@@ -118,7 +118,9 @@ class UnitBuilderTests(unittest.TestCase):
         self.assertEqual(parsed[0].payload_kind, "qa")
         self.assertEqual(parsed[0].payload["question"], "请公司讲一下，2025年重点工作")
 
-    def test_s3_splits_many_long_numbered_items(self) -> None:
+    def test_s3_keeps_numbered_enumeration_as_one_block(self) -> None:
+        # ub-2026.07-5: enumerated lines are one business block — splitting
+        # them into per-line units was the round3 over-fragmentation defect.
         long_items = "\n".join(
             f"{idx}、" + "经营情况说明" * 12
             for idx in range(1, 4)
@@ -135,16 +137,17 @@ class UnitBuilderTests(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(len(units), 3)
-        self.assertTrue(all(unit.payload_kind == "text" for unit in units))
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].payload_kind, "text")
+        self.assertEqual(units[0].payload["text"], long_items)
 
-    def test_full_s1_s7_split_numbered_text_stays_before_following_table(self) -> None:
+    def test_full_s1_s7_short_other_doc_collapses_to_document_unit(self) -> None:
         long_items = "\n".join(
             f"{idx}、" + "经营情况说明" * 12
             for idx in range(1, 4)
         )
 
-        units, _ = build_unit_drafts_s1_s7(
+        units, stats = build_unit_drafts_s1_s7(
             {
                 "elements": [
                     {
@@ -165,13 +168,271 @@ class UnitBuilderTests(unittest.TestCase):
             filing_type="other",
         )
 
+        self.assertEqual([unit.payload_kind for unit in units], ["mixed"])
+        self.assertEqual(units[0].payload["semantic_type"], "document")
         self.assertEqual(
-            [unit.payload_kind for unit in units],
-            ["text", "text", "text", "table"],
+            [part["kind"] for part in units[0].payload["parts"]],
+            ["text", "table"],
         )
-        self.assertEqual(units[0].payload["text"].split("、", 1)[0], "1")
-        self.assertEqual(units[1].payload["text"].split("、", 1)[0], "2")
-        self.assertEqual(units[2].payload["text"].split("、", 1)[0], "3")
+        self.assertEqual(units[0].payload["parts"][0]["text"], long_items)
+        self.assertEqual(units[0].payload["parts"][1]["caption"], ["收入表"])
+        self.assertEqual(stats.collapsed_documents, 1)
+
+    def test_full_s1_s7_annual_section_groups_text_and_tables(self) -> None:
+        # 研发投入 shape (round3 P0#1 长年报 clause): intro text + two tables
+        # under one business heading must be ONE unit, not three slices. The
+        # oversized sibling forces grouping below the 节 level.
+        filler = "业务概况说明。" * 1300  # > SECTION_GROUP_MAX_CHARS
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "第三节 管理层讨论与分析",
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "heading_level": 2,
+                        "text": "一、业务概况",
+                    },
+                    {"kind": "text", "raw_kind": "text", "order_index": 3, "text": filler},
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 4,
+                        "heading_level": 2,
+                        "text": "二、研发投入",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 5,
+                        "text": "报告期内公司持续加大研发投入。",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 6,
+                        "table_caption": ["费用化研发投入"],
+                        "table": {"headers": ["项目", "金额"], "rows": [["费用化", "100"]]},
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 7,
+                        "table_caption": ["研发人员情况"],
+                        "table": {"headers": ["类别", "人数"], "rows": [["硕士", "30"]]},
+                    },
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        by_path = {tuple(unit.heading_path): unit for unit in units}
+        overview = by_path[("第三节 管理层讨论与分析", "一、业务概况")]
+        self.assertEqual(overview.payload_kind, "text")  # single member: untouched
+        rnd = by_path[("第三节 管理层讨论与分析", "二、研发投入")]
+        self.assertEqual(rnd.payload_kind, "mixed")
+        self.assertEqual(rnd.payload["semantic_type"], "section")
+        self.assertEqual(
+            [part["kind"] for part in rnd.payload["parts"]],
+            ["text", "table", "table"],
+        )
+        self.assertEqual(rnd.title, "二、研发投入")
+        self.assertEqual(stats.grouped_section_units, 1)
+
+    def test_full_s1_s7_oversized_leaf_still_merges_whole(self) -> None:
+        # Splitting one topic by payload kind is the defect — an oversized
+        # leaf section still becomes one mixed unit.
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "第一节 经营情况",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "经营情况说明。" * 700,
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 3,
+                        "table": {
+                            "headers": ["项目", "金额"],
+                            "rows": [["收入" * 400, "100" * 400]],
+                        },
+                    },
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        self.assertEqual([unit.payload_kind for unit in units], ["mixed"])
+        self.assertEqual(units[0].heading_path, ["第一节 经营情况"])
+
+    def test_full_s1_s7_meeting_proposals_group_with_votes(self) -> None:
+        # 股东会决议 shape (round3 P0#1): 审议结果 + 表决表格 + 会议决定 are
+        # ONE proposal unit, and the next proposal starting mid-text must not
+        # stay attributed to the previous proposal's heading.
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "二、议案审议情况",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "3.议案名称：《关于聘请审计机构的议案》\n审议结果：通过\n表决情况：",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 3,
+                        "table": {"headers": ["股东类型", "同意"], "rows": [["A股", "99%"]]},
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 4,
+                        "text": "会议决定，聘请天健会计师事务所。\n4.议案名称：《关于利润分配方案的议案》\n审议结果：通过\n表决情况：",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 5,
+                        "table": {"headers": ["股东类型", "同意"], "rows": [["A股", "98%"]]},
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 6,
+                        "text": "会议决定，通过利润分配方案。",
+                    },
+                ]
+            },
+            filing_type="other",
+        )
+
+        proposals = [unit for unit in units if unit.payload_kind == "mixed"]
+        self.assertEqual(len(proposals), 2)
+        self.assertEqual(stats.grouped_proposal_units, 2)
+        first, second = proposals
+        self.assertEqual(first.title, "3.议案名称：《关于聘请审计机构的议案》")
+        self.assertEqual(first.payload["semantic_type"], "meeting_proposal")
+        self.assertEqual(
+            [part["kind"] for part in first.payload["parts"]],
+            ["text", "table", "text"],
+        )
+        self.assertIn("会议决定，聘请天健会计师事务所。", first.payload["parts"][2]["text"])
+        self.assertEqual(second.title, "4.议案名称：《关于利润分配方案的议案》")
+        self.assertEqual(
+            [part["kind"] for part in second.payload["parts"]],
+            ["text", "table", "text"],
+        )
+        # Acceptance A: no text carries the NEXT proposal's title mid-body.
+        for unit in units:
+            for part in unit.payload.get("parts", []):
+                text = str(part.get("text", ""))
+                self.assertNotRegex(text, r"\n\d+\.议案名称：")
+
+    def test_full_s1_s7_headerless_prefix_anchors_under_stable_heading(self) -> None:
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": "公告编号：临 2026-026",
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "heading_level": 1,
+                        "text": "关于聘任董事会秘书的公告",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 3,
+                        "text": "董事会决定聘任张三为董事会秘书。",
+                    },
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        self.assertEqual(stats.anchored_header_units, 1)
+        by_path = {tuple(unit.heading_path): unit for unit in units}
+        header = by_path[(rules.DOCUMENT_HEADER_ANCHOR,)]
+        self.assertEqual(header.payload["text"], "公告编号：临 2026-026")
+
+    def test_full_s1_s7_qa_units_never_join_section_groups(self) -> None:
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "问询回复",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "问题1：公司毛利率为何下滑？\n回复：主要系原材料涨价。",
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 3,
+                        "heading_level": 2,
+                        "text": "一、数据说明",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 4,
+                        "text": "具体数据说明如下。",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 5,
+                        "table": {"headers": ["年度", "毛利率"], "rows": [["2025", "30%"]]},
+                    },
+                ]
+            },
+            filing_type="inquiry_reply",
+        )
+
+        kinds = [unit.payload_kind for unit in units]
+        self.assertEqual(kinds, ["qa", "mixed"])
+        self.assertEqual(
+            [part["kind"] for part in units[1].payload["parts"]],
+            ["text", "table"],
+        )
 
     def test_full_s1_s7_table_qa_stays_before_following_text(self) -> None:
         units, _ = build_unit_drafts_s1_s7(
@@ -756,17 +1017,21 @@ class UnitBuilderTests(unittest.TestCase):
             filing_type="annual_report",
         )
 
-        by_path = {tuple(unit.heading_path): unit for unit in units}
-        bankruptcy = by_path[("第五节 重要事项", "一、破产重整相关事项")]
-        litigation = by_path[("第五节 重要事项", "二、重大诉讼事项")]
-        # Column-destined field, never a payload key (user decision 2026-07-06).
-        self.assertEqual(bankruptcy.applicability, "not_applicable")
-        self.assertNotIn("applicability", bankruptcy.payload)
-        self.assertIn("不适用", bankruptcy.payload["text"])
-        self.assertEqual(litigation.applicability, "applicable")
-        self.assertNotIn("applicability", litigation.payload)
+        # Tiny sibling sections group into one 第五节 unit (ub-2026.07-5);
+        # per-section flags live on the parts, and the unit-level column stays
+        # None because the merged sections disagree.
+        self.assertEqual([unit.payload_kind for unit in units], ["mixed"])
+        section = units[0]
+        self.assertEqual(section.heading_path, ["第五节 重要事项"])
+        self.assertIsNone(section.applicability)
+        bankruptcy, litigation = section.payload["parts"]
+        self.assertEqual(bankruptcy["local_heading"], ["一、破产重整相关事项"])
+        self.assertEqual(bankruptcy["applicability"], "not_applicable")
+        self.assertIn("不适用", bankruptcy["text"])
+        self.assertEqual(litigation["local_heading"], ["二、重大诉讼事项"])
+        self.assertEqual(litigation["applicability"], "applicable")
         # The leading marker line is stripped; the prose remains.
-        self.assertEqual(litigation.payload["text"], "公司报告期内存在如下诉讼。")
+        self.assertEqual(litigation["text"], "公司报告期内存在如下诉讼。")
 
     def test_dangling_applicable_marker_sinks_onto_following_table(self) -> None:
         units, stats = build_unit_drafts_s1_s7(
@@ -988,9 +1253,16 @@ class UnitBuilderTests(unittest.TestCase):
             filing_type="other",
         )
 
-        self.assertEqual([unit.title for unit in units], ["重要提示", "风险提示"])
-        self.assertIn("退市风险", units[0].payload["text"])
-        self.assertIn("原材料价格波动", units[1].payload["text"])
+        # Short 'other' doc collapses to one document unit; the red line is
+        # that both tips stay visible to L2 inside it.
+        self.assertEqual([unit.payload_kind for unit in units], ["mixed"])
+        parts = units[0].payload["parts"]
+        self.assertEqual(
+            [part["heading_path"] for part in parts],
+            [["重要提示"], ["风险提示"]],
+        )
+        self.assertIn("退市风险", parts[0]["text"])
+        self.assertIn("原材料价格波动", parts[1]["text"])
 
     def test_full_s1_s7_redline_important_tip_repeated_header_negative(self) -> None:
         units, stats = build_unit_drafts_s1_s7(

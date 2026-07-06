@@ -438,6 +438,39 @@ phase00 fixtures 的 payload 内层是 v1 历史形态（{format,page_no,text} �
    **公告编号行保留**——provider 公告编号是元数据里没有的独有信息。正文中
    "被担保人证券代码"等前缀不同的行不受影响。实测年报 908 → 687（-2 起累计）。
 
+### ub-2026.07-5（2026-07-06 phase008 综合审查后：unit 边界升级为业务语义块）
+
+审查依据 `docs/implementation/reviews/phase008-db-comprehensive-audit-round3.md`（P0#1-#4）；
+用户裁决：**payload kind 不决定 unit 边界，一个业务块内 text/table 混合是常态**。新增
+`payload_kind='mixed'`（0011 迁移扩 CHECK；payload = semantic_type + 有序 parts，
+part 形状复用各 kind payload schema；见 service-purpose §6.5）。S8 语义分组阶段：
+
+1. **议案分组**（P0#1 股东会决议实证）：`\d+.议案名称：` 锚点起一个 proposal unit
+   （semantic_type=meeting_proposal），审议结果+表决表格+会议决定同体；正文中段出现的下一项
+   议案标题就地切开并重新归属（修复"第 4 项议案挂在第 3 项 heading 下"的结构归属错误）。
+2. **短公告坍缩**：可坍缩 filing_type（other/performance_forecast/performance_flash）且
+   正文 ≤ SHORT_DOC_CONTENT_CHARS(8000) → 一个 document 级 mixed unit（parts 保留完整
+   heading_path）——短公告首先是"一份公告"（P0#1 董事会决议实证）。
+3. **长文档业务块分组**：其余文档在"子树内容 ≤ SECTION_GROUP_MAX_CHARS(8000) 的最浅标题
+   节点"整体成 unit（semantic_type=section，parts 带 local_heading 局部路径）；超限叶子
+   仍整体合并（按 kind 硬拆一个主题=被禁碎片化）；单成员节点保持原 kind 不包壳；qa 单元
+   永不并组。单元级 applicability 仅在成员声明一致时置值，冲突为 NULL（parts 承载细节）。
+4. **编号行拆分废除**：原"≥3 条全编号行拆成逐条 unit"逻辑删除——编号列表是一个业务块
+   （round3 过碎主诉之一）。
+5. **封面误删修复**（P0#2）：MinerU 把"第一章 总则"标成 text 时也算首个结构标题
+   （复用 heading 门的 text 候选判定），薪酬管理办法第一/二章不再被当封面丢弃。
+6. **公告头锚定**（P0#4）：首标题前的眉头残留（公告编号行）挂到合成锚 `公告头信息`，
+   不再产生 heading_path=[] 孤儿；全平文档不造假结构。
+7. **是/否 checkbox 防线**（P0#3 扩展）：`是 □否` 类 disclosure answer 不是标题也不是
+   表名——heading 门与 table caption 双向拦截（is_declaration_line）。
+8. **发布投影字段补全**（P1#8）：PROJECTION_FIELDS 补 applicability，
+   outbox `document_unit_projection_changed` 的 changed_fields 不再出现空列表审计洞。
+9. 配套：0011 迁移同时给 document_units_v1/source_refs_v1 加 is_active_run（P1#7，
+   DB 直读方免 join 过滤 active）；0012 provider 分类维表 + document_categories_v1 +
+   filing_type_map r3（012001 调研活动→investor_relations，P1#6）。
+10. 计数：grouped_proposal_units / grouped_section_units / collapsed_documents /
+   anchored_header_units 进 build_stats。
+
 ## 9. 明确不做
 
 - 不抽取 claim；不做 table_cell / page-bbox 核心索引；不做 LLM 语义价值判断；

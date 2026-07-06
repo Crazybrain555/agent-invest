@@ -25,6 +25,7 @@ def _unit(
     semantic_key: str | None = None,
     quality_status: str = "ok",
     query_projection_hash: str = "sha256:projection",
+    applicability: str | None = None,
 ) -> e.DocumentUnit:
     return e.DocumentUnit(
         asset_id=asset_id,
@@ -39,6 +40,7 @@ def _unit(
         semantic_key=semantic_key,
         quality_status=quality_status,
         query_projection_hash=query_projection_hash,
+        applicability=applicability,
     )
 
 
@@ -144,6 +146,26 @@ class PublishRunTests(unittest.TestCase):
         self.assertEqual(diff.created, [])
         self.assertEqual(diff.removed, [])
         self.assertEqual(diff.projection_changed[0][2], ["title", "semantic_key"])
+
+    def test_applicability_only_change_reports_changed_fields(self) -> None:
+        # query_projection_hash includes applicability; a hash change with
+        # changed_fields=[] is an audit hole (round3 P1#8).
+        old = _unit(
+            "du_old",
+            "run_old",
+            applicability=None,
+            query_projection_hash="sha256:old_projection",
+        )
+        new = _unit(
+            "du_new",
+            "run_new",
+            applicability="not_applicable",
+            query_projection_hash="sha256:new_projection",
+        )
+
+        diff = diff_units(old_units=[old], new_units=[new])
+
+        self.assertEqual(diff.projection_changed[0][2], ["applicability"])
 
     def test_second_publish_event_order_and_observed_when_content_same(self) -> None:
         uow = _uow_with_document()

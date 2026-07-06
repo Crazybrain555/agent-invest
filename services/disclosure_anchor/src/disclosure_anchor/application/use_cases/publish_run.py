@@ -15,7 +15,16 @@ from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain.errors import PublishRunError
 
 
-PROJECTION_FIELDS = ("title", "heading_path", "semantic_key", "quality_status")
+# Every query_projection_hash input except payload_kind, which is part of the
+# stable-pairing key and can never differ between a matched old/new pair. A
+# hash change with changed_fields=[] is an audit hole (round3 P1#8).
+PROJECTION_FIELDS = (
+    "title",
+    "heading_path",
+    "semantic_key",
+    "quality_status",
+    "applicability",
+)
 
 
 @dataclass(frozen=True)

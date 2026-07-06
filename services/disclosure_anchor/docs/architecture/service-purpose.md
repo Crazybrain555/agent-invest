@@ -132,6 +132,18 @@ L2
 
 正文按标题层级、显式编号、完整问答和完整事项切分。
 
+**单元边界是业务语义块，不是 parser 元素**（2026-07-06 phase008 审查定案）：
+一个 unit 必须表达一个完整的业务事实/事项/章节/证据块——大到足以让一个人读完后回答一个
+业务问题。payload kind（text/table）不决定 unit 边界；一个业务块内 text 与 table 交替时，
+产出 `mixed` 单元（payload = 有序 parts，每个 part 保留 kind、局部小标题、适用性标记）。
+粒度规则（rule bundle 内版本化）：
+
+- 短公告/决议/制度（可坍缩 filing_type 且正文 ≤ 阈值）→ 一个 document 级 unit；
+- 事项型公告（股东会/董事会决议）→ 每项议案一个 unit（审议结果+表决表+会议决定同体）；
+- 长结构化文档（年报等）→ 在"子树内容 ≤ 阈值"的最浅标题节点整体成 unit
+  （研发投入、附注某科目）；超限叶子仍整体合并——按 kind 硬拆一个主题是被禁止的碎片化；
+- qa 单元天然完整，永不并组。
+
 第一版不把以下对象作为长期数据模型：
 
 ```text
@@ -474,6 +486,34 @@ artifact_locator（可选）
 > 示例取自美的集团（000333）2025 年 4 月 11 日投资者关系活动记录表（2024 年度业绩说明会，编号 2025-2）的第 1 问。
 
 一个回答即使很长，也不按 token 拆碎。L2 可以从中抽取多条 `evidence_record`。
+
+## 6.5 mixed 单元
+
+适用于一个业务块内 text 与 table（或 image）交替的场景：短公告整体、股东会/董事会
+一项议案、年报里的一个业务小节（研发投入、附注某科目）。payload 是有序 parts；每个
+part 的形状复用对应 kind 的 payload schema，另带 `kind`、`order`，以及可选的
+`local_heading`（相对 unit heading_path 的局部小标题）、`heading_path`（document 级
+坍缩时的完整路径）、`applicability`、`quality_status`。
+
+```json
+{
+  "payload_kind": "mixed",
+  "heading_path": ["二、议案审议情况"],
+  "title": "3.议案名称：《关于聘请2026年度财务审计机构和内控审计机构的议案》",
+  "payload": {
+    "semantic_type": "meeting_proposal",
+    "parts": [
+      {"kind": "text", "order": 12, "text": "审议结果：通过\n表决情况："},
+      {"kind": "table", "order": 13, "headers": ["股东类型", "同意"], "rows": [["A股", "99.98%"]], "caption": [], "unit": null, "notes": []},
+      {"kind": "text", "order": 14, "text": "会议决定，聘请天健会计师事务所……"}
+    ]
+  }
+}
+```
+
+`semantic_type` 当前取值：`document`（短公告坍缩）、`meeting_proposal`（议案）、
+`section`（长文档业务小节）。单元级 `applicability` 只在各 parts 声明一致时置值，
+冲突时为 NULL、由 parts 承载细节。
 
 ---
 

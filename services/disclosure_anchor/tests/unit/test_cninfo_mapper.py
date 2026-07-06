@@ -26,7 +26,7 @@ class CninfoMapperTests(unittest.TestCase):
     def test_filing_type_rule_bundle_has_required_seed_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
 
-        self.assertEqual(bundle.version, "2026-07-r2")
+        self.assertEqual(bundle.version, "2026-07-r3")
         self.assertEqual(
             {rule.filing_type for rule in bundle.rules},
             {
@@ -72,6 +72,16 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertEqual(
             map_filing_type("第一季度报告", category_names_by_code={}),
             "quarterly_report",
+        )
+
+    def test_research_activity_category_maps_to_investor_relations(self) -> None:
+        # cninfo 012001 = 调研活动: an investor-relations record that fell into
+        # `other` before rule bundle 2026-07-r3 (round3 P1#6).
+        self.assertEqual(
+            map_filing_type(
+                "012001", category_names_by_code={"012001": "调研活动"}
+            ),
+            "investor_relations",
         )
 
     def test_report_period_derivation_from_real_title_shapes(self) -> None:

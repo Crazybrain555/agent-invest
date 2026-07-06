@@ -110,6 +110,7 @@ class SourceRefV1(PublicModel):
     provider_document_id: str | None
     raw_file_hash: str | None
     processing_run_id: str
+    is_active_run: bool
     payload_kind: str
     heading_path: list[str]
     title: str | None
@@ -118,6 +119,17 @@ class SourceRefV1(PublicModel):
     applicability: str | None
     page_no: int | None
     artifact_locator: dict[str, Any] | None
+
+
+class DocumentCategoryV1(PublicModel):
+    document_id: str
+    provider: str | None
+    provider_document_id: str | None
+    category_code: str
+    ordinal: int
+    category_name: str | None
+    parent_category_code: str | None
+    contract_version: str
 
 
 class ChangeEventV1(PublicModel):

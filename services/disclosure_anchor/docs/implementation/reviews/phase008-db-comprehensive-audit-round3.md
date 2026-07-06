@@ -492,6 +492,40 @@ WHERE payload ? 'applicability';
 
 All five should be zero for the rebuilt acceptance corpus, or every non-zero row must have a documented product reason and a stronger schema model.
 
+## Progress (2026-07-06, in-flight)
+
+- P0#1 semantic grouping: builder S8 landed — meeting_proposal / document / section mixed
+  units (payload_kind='mixed', ordered parts), proposal in-text anchor splitting fixes the
+  股东会 misattribution; rules ub-2026.07-5. Corpus rebuild + acceptance rerun pending.
+- P0#2 cover prelude: text-kind structural L1 (第一章 as text) now counts as the structural
+  start — opening chapters no longer dropped.
+- P0#3 markers: yes/no checkbox answers (是 □否) blocked from heading tree and table captions.
+- P0#4 empty heading_path: pre-first-heading units anchored under 公告头信息.
+- P1#6 categories: migration 0012 — provider_category dim (2135 p_info3005 codes seeded) +
+  document_categories_v1 view (facet ordinal, no invented is_primary); filing_type bundle
+  2026-07-r3 maps 调研活动→investor_relations (fallback += 012001). Verified on live DB:
+  164 segments, 0 unnamed.
+- P1#7 active flag: migration 0011 — document_units_v1 / source_refs_v1 expose is_active_run;
+  SourceRefV1 contract updated; api/AGENTS.md derived-field note revised.
+- P1#8 outbox: PROJECTION_FIELDS += applicability, regression test added.
+- **Rebuild + acceptance rerun DONE (2026-07-06, sessions merged)**: full wipe → fresh sync
+  (600519 W30 + 002484 W90) → acceptance corpus processed under the final rules
+  (ub-2026.07-5 + heading ruleset cn_a_v2). Acceptance pack A–E **all zero**. Eyeballs:
+  聘任董秘/薪酬办法/董事会决议 = one document unit each (薪酬办法 parts start at 第一章 —
+  P0#2 verified); 股东会决议 = 8 units (会议概况 section + 6 meeting_proposal + 律师/表决
+  section); 江海年报 687 (-4) → 205 units (99 mixed / 65 text / 41 table), 研发投入 lives
+  under its true parent 四、主营业务分析.
+- Heading ruleset cn_a_v2 (follow-up to P2#11 drift, same day): digit-paren levels added to
+  HEADING_PATTERNS (（1）/1） = level 5, ① = level 6) — （8） no longer swallows sibling
+  1、-level topics, and >depth-4 note numbering stays in unit text instead of drifting into
+  heading_path[1].
+- s8 refinement: proposal-path documents also section-group their non-proposal remainder
+  (mixed never regroups); section-unit applicability only set when merged parts agree;
+  numbered-enumeration per-line splitting removed (S3).
+- Open: P1#5 declaration model, P2#9 structure QA field, P2#10 table blank/group rows,
+  P2#11 residual flat-numbering drift inside 审计报告-style notes, P2#12 leak gate
+  assertion, P2#13 locator JSON null.
+
 ## Bottom Line
 
 当前最大问题不是 worker loop，而是 DB 成品的语义形状。`document_unit` 不能只是 MinerU 元素加一点 heading 的技术切片；它必须是 L2 能直接使用的披露语义证据。股东会议案这个例子说明：text/table 混合才是一个业务 unit，硬按 payload kind 切会让后续 L2 做大量脆弱拼接。先把 unit 边界从“技术块”升级成“业务语义块”，再谈 schema polish。

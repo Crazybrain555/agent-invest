@@ -10,6 +10,7 @@ import yaml
 
 from disclosure_anchor.api.schemas.public import (
     ChangeEventV1,
+    DocumentCategoryV1,
     DocumentUnitV1,
     DocumentV1,
     ProcessingRunV1,
@@ -25,6 +26,7 @@ DEFAULT_CONTRACTS_ROOT = REPO_ROOT / "contracts"
 PUBLIC_MODELS: dict[str, type[Any]] = {
     "document": DocumentV1,
     "document_unit": DocumentUnitV1,
+    "document_category": DocumentCategoryV1,
     "processing_run": ProcessingRunV1,
     "source_ref": SourceRefV1,
     "change_event": ChangeEventV1,

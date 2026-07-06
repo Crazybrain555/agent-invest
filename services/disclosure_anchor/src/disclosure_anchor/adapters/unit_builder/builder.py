@@ -61,6 +61,10 @@ class BuildStats:
     stripped_marker_lines: int = 0
     stripped_header_lines: int = 0
     merged_tables: int = 0
+    grouped_proposal_units: int = 0
+    grouped_section_units: int = 0
+    collapsed_documents: int = 0
+    anchored_header_units: int = 0
     needs_review_count: int = 0
     unusable_count: int = 0
 
@@ -75,6 +79,10 @@ class BuildStats:
             "stripped_marker_lines": self.stripped_marker_lines,
             "stripped_header_lines": self.stripped_header_lines,
             "merged_tables": self.merged_tables,
+            "grouped_proposal_units": self.grouped_proposal_units,
+            "grouped_section_units": self.grouped_section_units,
+            "collapsed_documents": self.collapsed_documents,
+            "anchored_header_units": self.anchored_header_units,
             "needs_review_count": self.needs_review_count,
             "unusable_count": self.unusable_count,
         }
@@ -174,6 +182,14 @@ def s1_preprocess_elements(
                 stats.dropped_by_kind[kind] += 1
             continue
         if kind == "table":
+            # MinerU misattaches checkbox declarations ("是 □否") as table
+            # captions; they would leak into unit titles.
+            captions: list[str] = []
+            for caption in element.get("table_caption") or []:
+                if rules.is_declaration_line(str(caption)):
+                    stats.stripped_marker_lines += 1
+                    continue
+                captions.append(str(caption))
             item = PreparedElement(
                 kind="table",
                 order_index=order_index,
@@ -181,7 +197,7 @@ def s1_preprocess_elements(
                 page_no=page_no,
                 heading_level=_int_or_none(element.get("heading_level")),
                 table=dict(element.get("table") or {"headers": [], "rows": []}),
-                table_caption=[str(item) for item in element.get("table_caption") or []],
+                table_caption=captions,
                 table_footnote=[str(item) for item in element.get("table_footnote") or []],
                 table_html=element.get("table_html"),
                 table_parse_failed=bool(element.get("table_parse_failed")),
@@ -253,9 +269,16 @@ def s3_build_text_units(
         text, applicability = _strip_declaration_lines(text, stats=stats)
         if text:
             quality = "needs_review" if any(item.quality_status == "needs_review" for item in buffer) else "ok"
-            units.extend(
-                _split_numbered_text_block(
-                    buffer[0], text, quality_status=quality, applicability=applicability
+            units.append(
+                UnitDraft(
+                    payload_kind="text",
+                    payload={"text": text},
+                    source_order=buffer[0].order_index,
+                    heading_path=list(buffer[0].heading_path),
+                    title=buffer[0].title,
+                    quality_status=quality,
+                    applicability=applicability,
+                    artifact_locator=buffer[0].artifact_locator,
                 )
             )
         elif applicability == "applicable":
@@ -497,7 +520,413 @@ def build_unit_drafts_s1_s7(
     units = sorted([*text_units, *table_units, *table_qa_units], key=_unit_sort_key)
     units = _sink_leading_applicable(units)
     kept = s6_filter_units(units, s1.stats)
+    kept = _anchor_headerless_units(kept, stats=s1.stats)
+    kept = s8_group_semantic_units(kept, filing_type=filing_type, stats=s1.stats)
     return s7_finalize_units(kept, filing_type=filing_type, stats=s1.stats), s1.stats
+
+
+def _anchor_headerless_units(
+    units: list[UnitDraft], *, stats: BuildStats
+) -> list[UnitDraft]:
+    """Anchor pre-first-heading units under a stable synthetic heading.
+
+    Announcement-header remnants (公告编号 lines, letterhead) sit before the
+    first in-document heading and used to surface with heading_path=[], which
+    breaks L2 retrieval and replay anchoring (round3 P0#4). Fully flat
+    documents (no headings anywhere) are left untouched — inventing structure
+    there would be worse than none.
+    """
+
+    if not any(unit.heading_path for unit in units):
+        return units
+    out: list[UnitDraft] = []
+    for unit in units:
+        if unit.heading_path:
+            out.append(unit)
+            continue
+        stats.anchored_header_units += 1
+        out.append(
+            UnitDraft(
+                **{**unit.__dict__, "heading_path": [rules.DOCUMENT_HEADER_ANCHOR]}
+            )
+        )
+    return out
+
+
+def s8_group_semantic_units(
+    units: list[UnitDraft], *, filing_type: str | None, stats: BuildStats
+) -> list[UnitDraft]:
+    """Regroup technical slices into business-semantic units (round3 P0#1).
+
+    L2-facing units must express a complete business fact: a meeting proposal
+    (审议结果 + 表决表格 + 会议决定) becomes ONE mixed unit with ordered parts,
+    and a short filing without proposal structure becomes ONE document-level
+    mixed unit. QA-mode filings are already semantic and are never regrouped.
+    """
+
+    if filing_type in {"investor_relations", "performance_briefing"}:
+        return units
+    grouped, made_proposals = _group_proposal_units(
+        _split_units_at_proposal_anchors(units), stats=stats
+    )
+    if made_proposals:
+        # Proposals are done; the surrounding units (会议召开情况, 律师意见)
+        # still deserve section grouping — mixed units never regroup.
+        return _group_section_units(grouped, stats=stats)
+    collapsed = _collapse_short_document(grouped, filing_type=filing_type, stats=stats)
+    if collapsed is not None:
+        return collapsed
+    return _group_section_units(grouped, stats=stats)
+
+
+def _split_units_at_proposal_anchors(units: list[UnitDraft]) -> list[UnitDraft]:
+    """Split text units at in-body proposal starts (\\d+.议案名称：…).
+
+    The next proposal's title often begins inside the previous proposal's last
+    text block (observed on the real 贵州茅台 股东会决议公告); without the split
+    the following proposal inherits the wrong heading attribution.
+    """
+
+    out: list[UnitDraft] = []
+    for unit in units:
+        if unit.payload_kind != "text" or "text" not in unit.payload:
+            out.append(unit)
+            continue
+        lines = str(unit.payload["text"]).splitlines()
+        inner_anchors = [
+            index
+            for index, line in enumerate(lines)
+            if index > 0 and rules.PROPOSAL_ANCHOR_RE.match(line.strip())
+        ]
+        if not inner_anchors:
+            out.append(unit)
+            continue
+        boundaries = [0, *inner_anchors, len(lines)]
+        for offset, start in enumerate(boundaries[:-1]):
+            text = "\n".join(lines[start : boundaries[offset + 1]]).strip()
+            if not text:
+                continue
+            out.append(
+                UnitDraft(
+                    **{
+                        **unit.__dict__,
+                        "payload": {"text": text},
+                        "intra_order": unit.intra_order + offset,
+                        "applicability": unit.applicability if offset == 0 else None,
+                    }
+                )
+            )
+    return out
+
+
+def _group_proposal_units(
+    units: list[UnitDraft], *, stats: BuildStats
+) -> tuple[list[UnitDraft], bool]:
+    out: list[UnitDraft] = []
+    current: dict[str, Any] | None = None
+    seen_titles: set[str] = set()
+    made = False
+
+    def close() -> None:
+        nonlocal current
+        if current is not None:
+            out.append(_proposal_to_unit(current, stats=stats))
+            current = None
+
+    for unit in units:
+        anchor = _proposal_anchor(unit)
+        if anchor is not None:
+            anchor_kind, title, parent_path, members = anchor
+            if current is not None and title == current["title"]:
+                current["members"].append(unit)
+                continue
+            if (
+                anchor_kind == "heading"
+                and title in seen_titles
+                and current is not None
+            ):
+                # Stale heading attribution: units after an in-text proposal
+                # start still carry the previous proposal's heading. They
+                # belong to the currently open proposal.
+                current["members"].append(unit)
+                continue
+            close()
+            made = True
+            seen_titles.add(title)
+            current = {
+                "title": title,
+                "parent_path": parent_path,
+                "members": members,
+                "first": unit,
+            }
+            continue
+        if current is not None and _joins_proposal(unit, current["parent_path"]):
+            current["members"].append(unit)
+            continue
+        close()
+        out.append(unit)
+    close()
+    return out, made
+
+
+def _proposal_anchor(
+    unit: UnitDraft,
+) -> tuple[str, str, list[str], list[UnitDraft]] | None:
+    """Detect a proposal start: (kind, title, parent_path, initial members)."""
+
+    if unit.payload_kind == "text" and "text" in unit.payload:
+        lines = str(unit.payload["text"]).splitlines()
+        if lines and rules.PROPOSAL_ANCHOR_RE.match(lines[0].strip()):
+            title = lines[0].strip()
+            remainder = "\n".join(lines[1:]).strip()
+            members: list[UnitDraft] = []
+            if remainder:
+                members.append(
+                    UnitDraft(**{**unit.__dict__, "payload": {"text": remainder}})
+                )
+            return ("text", title, _strip_anchor_suffix(unit.heading_path), members)
+    path = unit.heading_path
+    if path and rules.PROPOSAL_ANCHOR_RE.match(path[-1].strip()):
+        return ("heading", path[-1].strip(), _strip_anchor_suffix(path), [unit])
+    return None
+
+
+def _strip_anchor_suffix(path: list[str]) -> list[str]:
+    parent = list(path)
+    while parent and rules.PROPOSAL_ANCHOR_RE.match(parent[-1].strip()):
+        parent.pop()
+    return parent
+
+
+def _joins_proposal(unit: UnitDraft, parent_path: list[str]) -> bool:
+    normalized = _strip_anchor_suffix(unit.heading_path)
+    return normalized[: len(parent_path)] == parent_path
+
+
+def _proposal_to_unit(current: dict[str, Any], *, stats: BuildStats) -> UnitDraft:
+    members = [
+        member for member in current["members"] if not _is_blank_text_unit(member)
+    ]
+    first: UnitDraft = current["first"]
+    title: str = current["title"]
+    heading_path = list(current["parent_path"]) or [title]
+    if not members:
+        return UnitDraft(
+            payload_kind="text",
+            payload={"text": title},
+            source_order=first.source_order,
+            intra_order=first.intra_order,
+            heading_path=heading_path,
+            title=title,
+            quality_status=first.quality_status,
+            artifact_locator=first.artifact_locator,
+        )
+    stats.grouped_proposal_units += 1
+    return UnitDraft(
+        payload_kind="mixed",
+        payload={
+            "semantic_type": "meeting_proposal",
+            "parts": [_unit_part(member, include_heading=False) for member in members],
+        },
+        source_order=first.source_order,
+        intra_order=first.intra_order,
+        heading_path=heading_path,
+        title=title,
+        quality_status=_worst_quality(members),
+        artifact_locator=_merged_locator(members),
+    )
+
+
+def _collapse_short_document(
+    units: list[UnitDraft], *, filing_type: str | None, stats: BuildStats
+) -> list[UnitDraft] | None:
+    """Collapse a short filing into one document-level unit, or None to decline."""
+
+    if filing_type not in rules.COLLAPSIBLE_FILING_TYPES:
+        return None
+    real = [unit for unit in units if not _is_blank_text_unit(unit)]
+    if len(real) < 2:
+        return None
+    if sum(len(_main_text(unit)) for unit in real) > rules.SHORT_DOC_CONTENT_CHARS:
+        return None
+    title = next(
+        (
+            unit.heading_path[0]
+            for unit in real
+            if unit.heading_path
+            and unit.heading_path[0] != rules.DOCUMENT_HEADER_ANCHOR
+        ),
+        None,
+    )
+    stats.collapsed_documents += 1
+    first = real[0]
+    return [
+        UnitDraft(
+            payload_kind="mixed",
+            payload={
+                "semantic_type": "document",
+                "parts": [_unit_part(unit, include_heading=True) for unit in real],
+            },
+            source_order=first.source_order,
+            intra_order=first.intra_order,
+            heading_path=[title] if title else [rules.DOCUMENT_HEADER_ANCHOR],
+            title=title,
+            quality_status=_worst_quality(real),
+            artifact_locator=_merged_locator(real),
+        )
+    ]
+
+
+def _group_section_units(
+    units: list[UnitDraft], *, stats: BuildStats
+) -> list[UnitDraft]:
+    """Merge each business section's text/table/image slices into one unit.
+
+    The grouping node is the shallowest heading whose subtree stays within
+    rules.SECTION_GROUP_MAX_CHARS: 研发投入 (intro text + expense table +
+    personnel table) becomes ONE mixed unit instead of a text/table/table
+    scatter (round3 P0#1, 长年报 clause). qa units are already complete
+    business units and never join a group; a single-member group keeps its
+    original payload_kind untouched.
+    """
+
+    sizes: dict[tuple[str, ...], int] = {}
+    for unit in units:
+        chars = len(_main_text(unit))
+        path = tuple(unit.heading_path)
+        for depth in range(1, len(path) + 1):
+            prefix = path[:depth]
+            sizes[prefix] = sizes.get(prefix, 0) + chars
+
+    def key_for(unit: UnitDraft) -> tuple[str, ...] | None:
+        # qa units are complete; mixed units are already grouped (no nesting).
+        if unit.payload_kind in {"qa", "mixed"}:
+            return None
+        path = tuple(unit.heading_path)
+        if not path:
+            return None
+        for depth in range(1, len(path) + 1):
+            prefix = path[:depth]
+            if sizes[prefix] <= rules.SECTION_GROUP_MAX_CHARS:
+                return prefix
+        # Oversized leaf: still one business topic — merge at the leaf.
+        return path
+
+    out: list[UnitDraft] = []
+    group: list[UnitDraft] = []
+    group_key: tuple[str, ...] = ()
+
+    def close() -> None:
+        nonlocal group
+        if group:
+            out.extend(_section_group_to_units(group, list(group_key), stats=stats))
+            group = []
+
+    for unit in units:
+        key = key_for(unit)
+        if key is None:
+            close()
+            out.append(unit)
+            continue
+        if key != group_key:
+            close()
+            group_key = key
+        group.append(unit)
+    close()
+    return out
+
+
+def _section_group_to_units(
+    members_all: list[UnitDraft], key: list[str], *, stats: BuildStats
+) -> list[UnitDraft]:
+    members = [unit for unit in members_all if not _is_blank_text_unit(unit)]
+    if not members:
+        return list(members_all)
+    if len(members) == 1:
+        return [members[0]]
+    stats.grouped_section_units += 1
+    first = members[0]
+    return [
+        UnitDraft(
+            payload_kind="mixed",
+            payload={
+                "semantic_type": "section",
+                "parts": [
+                    _unit_part(member, include_heading=False, relative_to=key)
+                    for member in members
+                ],
+            },
+            source_order=first.source_order,
+            intra_order=first.intra_order,
+            heading_path=list(key),
+            title=key[-1] if key else first.title,
+            quality_status=_worst_quality(members),
+            applicability=_uniform_applicability(members),
+            artifact_locator=_merged_locator(members),
+        )
+    ]
+
+
+def _uniform_applicability(members: list[UnitDraft]) -> str | None:
+    """Unit-level flag only when the merged sections agree; parts keep detail."""
+
+    flags = {unit.applicability for unit in members if unit.applicability}
+    if len(flags) == 1:
+        return next(iter(flags))
+    return None
+
+
+def _unit_part(
+    unit: UnitDraft,
+    *,
+    include_heading: bool,
+    relative_to: list[str] | None = None,
+) -> dict[str, Any]:
+    part: dict[str, Any] = {"kind": unit.payload_kind, "order": unit.source_order}
+    if unit.payload_kind == "text" and "image_ref" in unit.payload:
+        part["kind"] = "image"
+    part.update(unit.payload)
+    if include_heading and unit.heading_path:
+        part["heading_path"] = list(unit.heading_path)
+    if relative_to is not None and unit.heading_path[: len(relative_to)] == relative_to:
+        local = unit.heading_path[len(relative_to) :]
+        if local:
+            part["local_heading"] = local
+    if unit.applicability:
+        part["applicability"] = unit.applicability
+    if unit.quality_status != "ok":
+        part["quality_status"] = unit.quality_status
+    return part
+
+
+def _is_blank_text_unit(unit: UnitDraft) -> bool:
+    return (
+        unit.payload_kind == "text"
+        and "image_ref" not in unit.payload
+        and not str(unit.payload.get("text", "")).strip()
+    )
+
+
+def _worst_quality(units: list[UnitDraft]) -> str:
+    return (
+        "needs_review"
+        if any(unit.quality_status == "needs_review" for unit in units)
+        else "ok"
+    )
+
+
+def _merged_locator(units: list[UnitDraft]) -> dict[str, Any] | None:
+    locator = dict(units[0].artifact_locator or {})
+    pages = [
+        value
+        for value in (
+            (unit.artifact_locator or {}).get("page_no") for unit in units
+        )
+        if isinstance(value, int)
+    ]
+    if pages and min(pages) != max(pages):
+        locator["page_span"] = [min(pages), max(pages)]
+    return locator or None
 
 
 def _drop_cover_prelude(
@@ -512,11 +941,20 @@ def _drop_cover_prelude(
     structure are never touched. Drops are counted, never silent (D9).
     """
 
+    # MinerU sometimes tags real structural headings (第一章 总则) as plain
+    # text; requiring kind=='heading' here dropped whole opening chapters as
+    # cover prelude (observed on 贵州茅台薪酬管理办法, 2026-07-06). A text
+    # element counts when it would enter the heading tree via the same gate
+    # _heading_level_for applies.
     first_structural = next(
         (
             index
             for index, element in enumerate(elements)
-            if element.kind == "heading" and _is_structural_l1(element)
+            if _is_structural_l1(element)
+            and (
+                element.kind == "heading"
+                or _text_heading_candidate(element.text or "")
+            )
         ),
         None,
     )
@@ -645,10 +1083,11 @@ def _heading_level_for(element: PreparedElement) -> int | None:
         return None
     if text.endswith(("?", "？")) or rules.QUESTION_START_RE.match(text):
         return None
-    # MinerU occasionally tags applicability markers with text_level>=1; a
-    # declaration line must never enter the heading tree (observed polluting
-    # heading_path/title in the real annual corpus, 2026-07-06).
-    if rules.is_pure_marker_line(text):
+    # MinerU occasionally tags applicability markers or yes/no checkbox
+    # answers with text_level>=1; a declaration line must never enter the
+    # heading tree (observed polluting heading_path/title in the real annual
+    # corpus, 2026-07-06).
+    if rules.is_declaration_line(text):
         return None
     normalized_title = _normalized_title(text)
     if normalized_title in rules.FIXED_L1_TITLES:
@@ -672,44 +1111,6 @@ def _text_heading_candidate(text: str) -> bool:
 
 def _normalized_title(text: str) -> str:
     return re.sub(r"\s+", "", text).rstrip("：:")
-
-
-def _split_numbered_text_block(
-    source: PreparedElement,
-    text: str,
-    *,
-    quality_status: str,
-    applicability: str | None = None,
-) -> list[UnitDraft]:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    numbered = [line for line in lines if re.match(r"^\d+[、.．]\s*", line)]
-    if len(numbered) >= 3 and len(text) >= 200 and len(numbered) == len(lines):
-        return [
-            UnitDraft(
-                payload_kind="text",
-                payload={"text": line},
-                source_order=source.order_index,
-                intra_order=offset,
-                heading_path=list(source.heading_path),
-                title=source.title,
-                quality_status=quality_status,
-                applicability=applicability if offset == 0 else None,
-                artifact_locator=source.artifact_locator,
-            )
-            for offset, line in enumerate(lines)
-        ]
-    return [
-        UnitDraft(
-            payload_kind="text",
-            payload={"text": text},
-            source_order=source.order_index,
-            heading_path=list(source.heading_path),
-            title=source.title,
-            quality_status=quality_status,
-            applicability=applicability,
-            artifact_locator=source.artifact_locator,
-        )
-    ]
 
 
 def _strip_declaration_lines(
@@ -1009,6 +1410,10 @@ def _main_text_is_unusable(unit: UnitDraft) -> bool:
 
 
 def _main_text(unit: UnitDraft) -> str:
+    if unit.payload_kind == "mixed":
+        return " ".join(
+            filter(None, (_part_text(part) for part in unit.payload.get("parts", [])))
+        )
     if unit.payload_kind == "text":
         if "text" in unit.payload:
             return str(unit.payload.get("text") or "")
@@ -1025,6 +1430,24 @@ def _main_text(unit: UnitDraft) -> str:
             + [str(cell) for row in rows for cell in row]
         )
     return ""
+
+
+def _part_text(part: dict[str, Any]) -> str:
+    kind = str(part.get("kind", "text"))
+    if kind == "table":
+        rows = part.get("rows") or []
+        headers = part.get("headers") or []
+        cells = [str(cell) for cell in headers] + [
+            str(cell) for row in rows for cell in row
+        ]
+        return " ".join(cells) or str(part.get("raw_html") or "")
+    if kind == "qa":
+        return str(part.get("question") or "") + str(part.get("answer") or "")
+    if kind == "image":
+        return " ".join(
+            filter(None, (str(part.get("caption") or ""), str(part.get("context") or "")))
+        )
+    return str(part.get("text") or "")
 
 
 def _table_caption_first(unit: UnitDraft) -> str:

@@ -105,6 +105,7 @@ def _source_ref_row() -> dict:
         "provider_document_id": "pid-doc_1",
         "raw_file_hash": "sha256:" + "a" * 64,
         "processing_run_id": "run_active",
+        "is_active_run": True,
         "payload_kind": "text",
         "heading_path": ["第一节", "风险"],
         "title": "风险提示",

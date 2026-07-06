@@ -18,8 +18,9 @@ API 只暴露 public 契约。读端点只从 `disclosure_public.*_v1` 或等价
 MinerU raw JSON、parser block、bbox、page internals 暴露到响应体。
 
 读 DTO 规则：字段同 public view 列名同义；`document_unit` API 派生字段全集仅为
-`asset_uri` 与 `is_active_run`。这两个字段不入库、不进 public view；contract 导出与测试用
-DERIVED 白名单处理。新增或改名 public 字段必须同步 schema/export、contract 测试与
+`asset_uri`（不入库、不进 public view，contract 导出与测试用 DERIVED 白名单处理）。
+`is_active_run` 自迁移 0011 起由 public view 直出（round3 P1#7：DB 直读方也要能
+过滤 active run），API 侧继续按视图列返回。新增或改名 public 字段必须同步 schema/export、contract 测试与
 `docs/implementation/checks/contract-checklist.md`。
 
 错误模型固定为统一 envelope，业务错误码全集：

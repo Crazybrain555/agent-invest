@@ -190,6 +190,29 @@ class SourceCheckpoint(Base):
     )
 
 
+class ProviderCategory(Base):
+    """Provider-native announcement classification dictionary (round3 P1#6).
+
+    Seeded from the p_info3005 snapshot by migration 0012; F006V segments on
+    document.provider_metadata join against this dimension via the
+    document_categories_v1 public view.
+    """
+
+    __tablename__ = "provider_category"
+    __table_args__ = {"schema": CORE_SCHEMA}
+
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    category_code: Mapped[str] = mapped_column(String(32), primary_key=True)
+    parent_category_code: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    category_name: Mapped[str] = mapped_column(Text, nullable=False)
+    valid_from: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_to: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class Document(Base):
     __tablename__ = "document"
     __table_args__ = (
@@ -315,7 +338,8 @@ class DocumentUnit(Base):
     __tablename__ = "document_unit"
     __table_args__ = (
         CheckConstraint(
-            "payload_kind in ('text','table','qa')", name="ck_document_unit_payload_kind"
+            "payload_kind in ('text','table','qa','mixed')",
+            name="ck_document_unit_payload_kind",
         ),
         CheckConstraint(
             "quality_status IN ('ok','needs_review','unusable')",

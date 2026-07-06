@@ -15,6 +15,7 @@ created_at: 2026-06-26
 ```text
 document
 document_unit
+document_category
 processing_run
 source_ref
 change_event
@@ -57,18 +58,26 @@ GET /v1/changes
 响应不含绝对路径
 错误码枚举：L1_PROCESSING_REQUIRED / NOT_FOUND / CONTRACT_VERSION_MISMATCH /
            GONE_SUPERSEDED / VALIDATION_ERROR（触发条件见 06 §3.3）
-unit 级 DTO 派生字段全集 = {asset_uri, is_active_run}（仅 API 序列化层派生，
-  不入库、不进 *_v1 视图；schema 收录二者，三方一致断言按 DERIVED 白名单排除）
+unit 级 DTO 派生字段全集 = {asset_uri}（仅 API 序列化层派生，不入库、不进 *_v1 视图，
+  DERIVED 白名单排除）；is_active_run 自 0011 起是 document_units_v1 / source_refs_v1
+  的真实视图列（round3 P1#7：DB 直读方可直接过滤 active run）
 scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（数组前缀语义，
   见 06 §3.8）/ semantic_key / quality_status 等）
-0010 起 document_units_v1 追加 applicability 列（'applicable'|'not_applicable'|NULL，
-节适用性声明的一等筛选列；payload 保持纯原文，部分索引 ix_document_unit_applicability）。
+0010 起 document_units_v1 追加 applicability / page_no 列（applicability：
+  'applicable'|'not_applicable'|NULL，节适用性声明的一等筛选列，payload 保持纯原文，
+  部分索引 ix_document_unit_applicability；page_no：artifact_locator 首页码提升列）。
 0007 起 document_units_v1 追加 6 列：asset_kind / observed_at / source_tier /
-  trace_level / raw_file_hash / query_projection_hash（33 列全集（0010 起含 applicability）见 04R-R7）
+  trace_level / raw_file_hash / query_projection_hash
+  （列全集：04R-R7 的 32 列 + 0010 applicability/page_no + 0011 is_active_run = 35 列）
 0007 起 change_events_v1 追加 change_kind（真实列）/ subject_kind / subject_ref /
   source / contract_version
 0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref /
   supersedes 链 / superseded_by_document_id / provider_metadata
+0011 起 document_unit.payload_kind 增加 'mixed'（round3 P0#1 业务语义块：
+  semantic_type = meeting_proposal / document / section，payload.parts 承载有序部件）
+0012 起新增 document_categories_v1（provider 原生分类：F006V 段 × provider_category
+  字典（p_info3005 快照 seed）；facet 语义只给 ordinal 不造 is_primary；filing_type
+  仍为内部粗桶，规则包 2026-07-r3 起 调研活动→investor_relations）
 ```
 
 ## 3. Public view 检查
@@ -78,6 +87,7 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
 ```text
 disclosure_public.documents_v1
 disclosure_public.document_units_v1
+disclosure_public.document_categories_v1
 disclosure_public.processing_runs_v1
 disclosure_public.source_refs_v1
 disclosure_public.change_events_v1
@@ -107,6 +117,7 @@ provider
 provider_document_id
 raw_file_hash
 processing_run_id
+is_active_run
 asset_id
 payload_kind
 heading_path

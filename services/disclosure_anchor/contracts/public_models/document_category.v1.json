@@ -1,0 +1,77 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "category_code": {
+      "title": "Category Code",
+      "type": "string"
+    },
+    "category_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Category Name"
+    },
+    "contract_version": {
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "document_id": {
+      "title": "Document Id",
+      "type": "string"
+    },
+    "ordinal": {
+      "title": "Ordinal",
+      "type": "integer"
+    },
+    "parent_category_code": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Parent Category Code"
+    },
+    "provider": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Provider"
+    },
+    "provider_document_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Provider Document Id"
+    }
+  },
+  "required": [
+    "document_id",
+    "provider",
+    "provider_document_id",
+    "category_code",
+    "ordinal",
+    "category_name",
+    "parent_category_code",
+    "contract_version"
+  ],
+  "title": "DocumentCategoryV1",
+  "type": "object"
+}

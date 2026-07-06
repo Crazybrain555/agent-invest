@@ -354,6 +354,7 @@ class PublicViewContentTests(unittest.TestCase):
             "asset_id",
             "document_id",
             "processing_run_id",
+            "is_active_run",
             "provider_document_id",
             "payload_kind",
             "heading_path",
@@ -399,7 +400,7 @@ class PublicViewContentTests(unittest.TestCase):
             }
 
         self.assertEqual(columns, expected)
-        self.assertEqual(len(columns), 34)
+        self.assertEqual(len(columns), 35)
 
     def test_source_tier_mapping_contract(self) -> None:
         self._seed()

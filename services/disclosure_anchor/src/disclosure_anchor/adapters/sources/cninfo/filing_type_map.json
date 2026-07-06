@@ -1,5 +1,5 @@
 {
-  "version": "2026-07-r2",
+  "version": "2026-07-r3",
   "rules": [
     {
       "filing_type": "semiannual_report",
@@ -39,7 +39,8 @@
     {
       "filing_type": "investor_relations",
       "keywords": [
-        "投资者关系"
+        "投资者关系",
+        "调研活动"
       ],
       "match": "any"
     },
