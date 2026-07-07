@@ -2,7 +2,7 @@
 id: disclosure_anchor_design_watchlist_operations
 project: disclosure_anchor
 title: 股票池运维设计评审（round8 问题清单 + 业界调研 + 决议建议）
-status: proposed
+status: adopted-and-implemented (2026-07-07, user authorization)
 created_at: 2026-07-07
 inputs: 用户 round8 提问 + Codex round8 实测 + 2026-07-07 四路调研（qlib/LEAN/zipline/vnpy/py-sec-edgar/Prometheus/GitOps）
 decides_for: milestone 09（生产就绪）
@@ -81,7 +81,15 @@ Codex round8 实测了"增量加 5 只"（000002/000651/600900 成功，601398/3
 | B6 | 合理，S 修 | parser 补一列即可，实体/用例早已支持 |
 | B7 | 合理，P2 | cursor 加 window_start（审计字段，不参与判定逻辑） |
 
-## 5. 设计决议建议（待用户拍板后进 09 排期，本轮不实施）
+## 5. 设计决议（用户已授权，2026-07-07 实施完毕）
+
+实施对照：§5.1 watchlist 列扩展 ✓（status/joined_date/filing_categories 列 + parser）；
+§5.2 对账 apply ✓（reconcile+drift 报告，PRUNE_DRIFT=YES 置 paused；track-status 只读
+进度视图；--codes 打漂移提示）；§5.3 回补背压 ✓（DISCLOSURE_BACKFILL_MAX_PENDING_
+DOWNLOADS=2000，changedetection.io MAX_QUEUE_SIZE 模式）+ 429 配额语义 ✓（参照
+edgartools：请求内 fail-fast 不烧配额、retryable=true 留下轮、worker 轮级熔断
+sync_quota_break）+ 同步失败留痕 ✓（profile 失败也写 source_access）；
+§5.4 cursor 审计字段 ✓（window_start/synced_at）。
 
 ### 5.1 watchlist.csv 仍是唯一真源，列扩展
 

@@ -160,6 +160,9 @@ class TrackedCompanyRepo(_Repo[e.TrackedCompany]):
             None,
         )
 
+    def list_all(self) -> list[e.TrackedCompany]:
+        return sorted(self.items.values(), key=lambda item: item.tracked_company_id)
+
 
 class DocumentRepo(_Repo[e.Document]):
     def _key(self, item: e.Document) -> str:
@@ -247,6 +250,10 @@ class DocumentUnitRepo(_Repo[e.DocumentUnit]):
             ),
             key=lambda item: (item.order_index, item.asset_id),
         )
+
+
+class TrackedCompanyRepoMixinPatch:  # placeholder anchor
+    pass
 
 
 class OutboxRepo(_Repo[e.OutboxEvent]):

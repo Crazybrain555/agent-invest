@@ -72,6 +72,61 @@ class TrackCompaniesTests(unittest.TestCase):
         self.assertEqual(tracked[0].lookback, {"days": 90})
         self.assertEqual(len(uow.companies.items), 1)
 
+    def test_reconcile_reports_and_prunes_drift(self) -> None:
+        uow = FakeUnitOfWork()
+        use_case = TrackCompanies(uow_factory=lambda: uow)
+        use_case.execute(
+            TrackCompaniesCommand(
+                entries=(
+                    TrackEntry(security_code="600519", exchange="SSE"),
+                    TrackEntry(security_code="000001", exchange="SZSE"),
+                )
+            )
+        )
+
+        # Reconcile against a watchlist that no longer contains 000001.
+        result = use_case.execute(
+            TrackCompaniesCommand(
+                entries=(TrackEntry(security_code="600519", exchange="SSE"),),
+                reconcile=True,
+            )
+        )
+        self.assertEqual(len(result.drift), 1)
+        self.assertEqual(result.drift[0].security_code, "000001")
+        self.assertEqual(result.drift[0].action, "reported")
+
+        pruned = use_case.execute(
+            TrackCompaniesCommand(
+                entries=(TrackEntry(security_code="600519", exchange="SSE"),),
+                reconcile=True,
+                prune_drift=True,
+            )
+        )
+        self.assertEqual(pruned.drift[0].action, "paused")
+        drifted = next(
+            t for t in uow.tracked_companies.items.values()
+            if t.tracked_company_id == pruned.drift[0].tracked_company_id
+        )
+        self.assertEqual(drifted.status, "paused")
+
+    def test_paused_status_and_categories_from_entry(self) -> None:
+        uow = FakeUnitOfWork()
+        TrackCompanies(uow_factory=lambda: uow).execute(
+            TrackCompaniesCommand(
+                entries=(
+                    TrackEntry(
+                        security_code="600519",
+                        exchange="SSE",
+                        status="paused",
+                        filing_categories=("011301", "0119"),
+                    ),
+                )
+            )
+        )
+        tracked = next(iter(uow.tracked_companies.items.values()))
+        self.assertEqual(tracked.status, "paused")
+        self.assertEqual(tracked.filing_categories, ["011301", "0119"])
+
     def test_unknown_sync_frequency_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             TrackCompanies(uow_factory=lambda: FakeUnitOfWork()).execute(

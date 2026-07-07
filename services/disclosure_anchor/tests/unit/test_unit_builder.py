@@ -24,7 +24,7 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-10")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-11")
         self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v5")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
@@ -280,8 +280,10 @@ class UnitBuilderTests(unittest.TestCase):
         self.assertTrue(
             all("semantic_key" not in part for part in section.payload["parts"])
         )
+        # Rule keys and note-vocabulary keys coexist on the unit.
         self.assertEqual(
-            section.semantic_keys, ["inventory_breakdown", "revenue_breakdown"]
+            section.semantic_keys,
+            ["inventory", "inventory_breakdown", "revenue_and_cost", "revenue_breakdown"],
         )
 
     def test_collapsed_document_title_uses_registry_title(self) -> None:
@@ -570,6 +572,51 @@ class UnitBuilderTests(unittest.TestCase):
                     semantic_key_for_unit(unit, filing_type="annual_report"),
                     expected,
                 )
+
+    def test_note_vocabulary_keys_notes_sections(self) -> None:
+        # design/retrieval-and-semantic-keys.md §4: 附注标题是法定受控词表
+        # （编报规则第15号），标题剥编号后三级匹配派生 note key。
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {"kind": "heading", "raw_kind": "text", "order_index": 1,
+                     "heading_level": 1, "text": "第八节 财务报告"},
+                    {"kind": "heading", "raw_kind": "text", "order_index": 2,
+                     "heading_level": 2, "text": "七、合并财务报表项目注释"},
+                    {"kind": "heading", "raw_kind": "text", "order_index": 3,
+                     "heading_level": 2, "text": "75、其他综合收益"},
+                    {"kind": "text", "raw_kind": "text", "order_index": 4,
+                     "text": "本期其他综合收益变动如下。"},
+                    {"kind": "heading", "raw_kind": "text", "order_index": 5,
+                     "heading_level": 2, "text": "八、研发支出"},
+                    {"kind": "text", "raw_kind": "text", "order_index": 6,
+                     "text": "研发支出按性质列示。"},
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        # The tiny doc groups into one section unit; member note keys must
+        # surface on the aggregated semantic_keys column.
+        all_keys = {key for unit in units for key in (unit.semantic_keys or [])}
+        self.assertIn("other_comprehensive_income", all_keys)
+        self.assertIn("rd_expenses", all_keys)
+
+    def test_note_vocabulary_gated_to_periodic_reports(self) -> None:
+        unit_title = "其他综合收益"
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {"kind": "heading", "raw_kind": "text", "order_index": 1,
+                     "heading_level": 1, "text": unit_title},
+                    {"kind": "text", "raw_kind": "text", "order_index": 2,
+                     "text": "临时公告正文。" * 1200},
+                ]
+            },
+            filing_type="other",
+        )
+        for unit in units:
+            self.assertNotIn("other_comprehensive_income", unit.semantic_keys or [])
 
     def test_full_s1_s7_oversized_leaf_still_merges_whole(self) -> None:
         # Splitting one topic by payload kind is the defect — an oversized

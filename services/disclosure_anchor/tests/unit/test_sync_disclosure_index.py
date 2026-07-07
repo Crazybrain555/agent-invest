@@ -52,7 +52,11 @@ class SyncDisclosureIndexTests(unittest.TestCase):
             512,
         )
         checkpoint = uow.source_checkpoints.get(result.checkpoint_id)
-        self.assertEqual(checkpoint.cursor, {"window_end": "2026-07-02"})
+        # Cursor gained audit fields (design/watchlist-operations.md §5.4);
+        # readers only use window_end.
+        self.assertEqual(checkpoint.cursor["window_end"], "2026-07-02")
+        self.assertEqual(checkpoint.cursor["window_start"], "2026-07-01")
+        self.assertIn("synced_at", checkpoint.cursor)
         self.assertTrue(checkpoint.scope_key.endswith(":p_info3015"))
         self.assertEqual(uow.commit_count, 1)
 

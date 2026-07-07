@@ -36,6 +36,8 @@ class WorkerReport:
     published: int = 0
     failed: int = 0
     skipped_oversized: int = 0
+    sync_quota_break: bool = False
+    deferred_backfill: int = 0
     failures: list[WorkerFailure] = field(default_factory=list)
     build_stats: list[dict[str, Any]] = field(default_factory=list)
 
@@ -47,6 +49,8 @@ class WorkerReport:
             "synced_companies": self.synced_companies,
             "candidates_discovered": self.candidates_discovered,
             "downloaded": self.downloaded,
+            "sync_quota_break": self.sync_quota_break,
+            "deferred_backfill": self.deferred_backfill,
             "parsed": self.parsed,
             "built": self.built,
             "published": self.published,

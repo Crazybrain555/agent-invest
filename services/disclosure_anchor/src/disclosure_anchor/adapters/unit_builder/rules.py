@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+from importlib import resources
+import json
 import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-10"
+RULES_VERSION = "ub-2026.07-11"
 HEADING_RULESET_ID = "cn_a_v5"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -310,3 +313,46 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         any_required=("准备", "测试", "损失"),
     ),
 )
+
+
+# 附注科目受控词表（design/retrieval-and-semantic-keys.md §4）：标题剥编号后按
+# 精确名 → 别名 → 包含式（最长名优先）三级匹配。词表是法定封闭集（编报规则
+# 第15号 2023 修订），note_key_map.json 独立版本化。
+_NOTE_TITLE_NUMBERING_RE = re.compile(
+    r"^\s*(?:[（(]?(?:\d{1,3}|[一二三四五六七八九十百]+)[）)]?\s*[、.．)）]?)+\s*"
+)
+
+
+@lru_cache(maxsize=1)
+def _note_key_tables() -> tuple[dict[str, str], tuple[tuple[str, str], ...]]:
+    payload = json.loads(
+        resources.files("disclosure_anchor.adapters.unit_builder")
+        .joinpath("note_key_map.json")
+        .read_text(encoding="utf-8")
+    )
+    exact: dict[str, str] = {}
+    for key, entry in payload["keys"].items():
+        for name in [*entry["names"], *entry.get("aliases", [])]:
+            exact.setdefault(name, key)
+    by_length = tuple(
+        sorted(exact.items(), key=lambda item: len(item[0]), reverse=True)
+    )
+    return exact, by_length
+
+
+def note_key_for_title(title: str | None) -> str | None:
+    """Map a note-section title to its canonical key, or None."""
+
+    if not title:
+        return None
+    core = _NOTE_TITLE_NUMBERING_RE.sub("", title).strip().rstrip("：: ")
+    if not core:
+        return None
+    exact, by_length = _note_key_tables()
+    hit = exact.get(core)
+    if hit is not None:
+        return hit
+    for name, key in by_length:
+        if name in core:
+            return key
+    return None

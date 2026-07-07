@@ -170,6 +170,7 @@ def _deps(settings: Settings, engine: Engine) -> WorkerDeps:
             cninfo_max_retries=settings.cninfo_max_retries,
             cninfo_oversized_kb=settings.cninfo_oversized_kb,
             initial_lookback_days=settings.disclosure_initial_lookback_days,
+            backfill_max_pending_downloads=settings.disclosure_backfill_max_pending_downloads,
             parse_scope_category_prefixes=_parse_scope_prefixes(settings),
         ),
         clock=lambda: datetime.now(timezone.utc),

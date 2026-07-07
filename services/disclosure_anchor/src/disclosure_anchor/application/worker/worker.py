@@ -74,6 +74,8 @@ class WorkerConfig:
     cninfo_oversized_kb: int
     # First-sync historical backfill (user decision: 三年是底线).
     initial_lookback_days: int = 1095
+    # Backpressure cap for the pending-download queue; 0 disables deferral.
+    backfill_max_pending_downloads: int = 2000
     # None → parse everything; a prefix tuple → 'other' docs need a matching
     # F006V category segment (parse scope 'core').
     parse_scope_category_prefixes: tuple[str, ...] | None = None
@@ -156,6 +158,7 @@ def _sync_stage(
         uow_factory=deps.uow_factory,
     )
     today = deps.clock().astimezone(SHANGHAI_TZ).date()
+    pending_downloads_now: int | None = None
     for row in due:
         if should_stop():
             return
@@ -171,6 +174,19 @@ def _sync_stage(
                 )
             )
             continue
+        never_synced = row.get("last_synced_at") is None and not row.get("window_end")
+        if never_synced and deps.config.backfill_max_pending_downloads > 0:
+            # Backpressure (changedetection.io MAX_QUEUE_SIZE pattern): a full
+            # historical backfill enqueues the whole window at once — defer
+            # new companies while the download queue is saturated.
+            if pending_downloads_now is None:
+                with deps.engine.connect() as conn:
+                    pending_downloads_now = queries.pending_download_count(
+                        conn, max_retries=deps.config.cninfo_max_retries
+                    )
+            if pending_downloads_now >= deps.config.backfill_max_pending_downloads:
+                report.deferred_backfill += 1
+                continue
         window_start = _sync_window_start(
             row.get("window_end"),
             today=today,
@@ -198,9 +214,25 @@ def _sync_stage(
                     error_code=type(exc).__name__,
                 )
             )
+            if _is_quota_error(exc):
+                # Round-level breaker (edgartools guidance: stop, do not keep
+                # burning quota); remaining companies stay due for next round.
+                report.sync_quota_break = True
+                return
             continue
         report.synced_companies += 1
         report.candidates_discovered += result.candidate_count
+
+
+def _is_quota_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "error_code", None) == "quota_exhausted":
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _sync_window_start(
@@ -471,6 +503,8 @@ def render_report_section(report: WorkerReport) -> str:
         f"- published: {report.published}",
         f"- failed: {report.failed}",
         f"- skipped_oversized: {report.skipped_oversized}",
+        f"- deferred_backfill: {report.deferred_backfill}",
+        f"- sync_quota_break: {report.sync_quota_break}",
     ]
     if report.failures:
         lines.append("- failures:")

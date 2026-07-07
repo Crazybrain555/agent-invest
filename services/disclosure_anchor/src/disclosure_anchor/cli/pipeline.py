@@ -104,6 +104,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     track.add_argument("--file", help="watchlist CSV (default: config/watchlist.csv)")
     track.add_argument("--codes", help="comma-separated security codes (ad-hoc adds)")
+    track.add_argument(
+        "--prune-drift",
+        action="store_true",
+        help="pause tracked companies missing from the watchlist (default: report only)",
+    )
+
+    track_status = subparsers.add_parser(
+        "track-status", help="read-only watchlist status (config + sync progress)"
+    )
+    del track_status  # no arguments
 
     rebuild = subparsers.add_parser(
         "rebuild-units",
@@ -163,7 +173,24 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         elif args.command == "track":
             entries = _track_entries(args)
-            result = deps.track().execute(TrackCompaniesCommand(entries=entries))
+            # File-driven runs reconcile (CSV is the source of truth); --codes
+            # ad-hoc adds do not, and are flagged as future drift.
+            file_driven = not args.codes
+            result = deps.track().execute(
+                TrackCompaniesCommand(
+                    entries=entries,
+                    reconcile=file_driven,
+                    prune_drift=file_driven and args.prune_drift,
+                )
+            )
+            if args.codes:
+                print(
+                    "[note] --codes upserts are NOT written to config/watchlist.csv; "
+                    "the next file-driven `make track` will report them as drift",
+                    file=sys.stderr,
+                )
+        elif args.command == "track-status":
+            result = deps.track_status()
         elif args.command == "rebuild-units":
             rebuild_result = deps.rebuild_units().execute(
                 RebuildUnitsCommand(document_id=args.document_id)
@@ -273,6 +300,36 @@ class _Deps:
 
     def track(self) -> TrackCompanies:
         return TrackCompanies(uow_factory=self.uow_factory)
+
+    def track_status(self) -> list[dict[str, Any]]:
+        """Read-only pool status: tracked config + checkpoint + pending counts."""
+
+        from sqlalchemy import text as sql_text
+
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                sql_text(
+                    """
+                    SELECT s.security_code, s.exchange, tc.status,
+                           tc.lookback, tc.filing_categories, tc.sync_frequency,
+                           sc.cursor->>'window_end' AS synced_through,
+                           sc.updated_at AS last_synced_at,
+                           (SELECT count(*) FROM disclosure_core.document d
+                             WHERE d.company_id = tc.company_id) AS documents,
+                           (SELECT count(*) FROM disclosure_core.document d
+                             WHERE d.company_id = tc.company_id
+                               AND d.status = 'published') AS published
+                      FROM disclosure_core.tracked_company tc
+                      LEFT JOIN disclosure_core.security s
+                        ON s.security_id = tc.security_id
+                      LEFT JOIN disclosure_core.source_checkpoint sc
+                        ON sc.provider = 'cninfo'
+                       AND sc.scope_key = tc.company_id || '\:p_info3015'
+                     ORDER BY s.security_code
+                    """
+                )
+            ).mappings()
+            return [dict(row) for row in rows]
 
     def sync(self, args: argparse.Namespace) -> dict[str, object]:
         company = args.company
@@ -416,6 +473,16 @@ def _track_entries(args: argparse.Namespace) -> tuple[TrackEntry, ...]:
                     continue
                 lookback_raw = (row.get("lookback_days") or "").strip()
                 frequency = (row.get("sync_frequency") or "").strip() or None
+                status = (row.get("status") or "").strip() or "active"
+                categories_raw = (row.get("filing_categories") or "").strip()
+                categories = (
+                    tuple(
+                        seg.strip()
+                        for seg in categories_raw.split(";")
+                        if seg.strip()
+                    )
+                    or None
+                )
                 entries.append(
                     TrackEntry(
                         security_code=code,
@@ -423,6 +490,8 @@ def _track_entries(args: argparse.Namespace) -> tuple[TrackEntry, ...]:
                         or _exchange_for_scode(code),
                         lookback_days=int(lookback_raw) if lookback_raw else None,
                         sync_frequency=frequency,
+                        filing_categories=categories,
+                        status=status,
                     )
                 )
     if not entries:
@@ -485,6 +554,8 @@ def _jsonable(value: Any) -> Any:
         return [_jsonable(item) for item in value]
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
     return value
 
 

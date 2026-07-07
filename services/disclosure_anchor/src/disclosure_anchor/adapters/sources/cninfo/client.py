@@ -22,6 +22,11 @@ TOKEN_ENDPOINT = "https://webapi.cninfo.com.cn/api-cloud-platform/oauth2/token"
 BASE_URL = "https://webapi.cninfo.com.cn"
 SENSITIVE_PARAM_KEYS = frozenset({"access_token", "client_id", "client_secret"})
 RETRYABLE_RESULT_CODES = frozenset({-1, 403, 404, 405})
+# 配额/限流（信封 resultcode=429）：参照 edgartools 对 SEC 429 的处理——请求内
+# 立即失败（重试只会烧配额/延长封禁），但 retryable=true 留给下一轮；worker 侧
+# 另有轮级熔断（design/watchlist-operations.md §5.3）。
+QUOTA_RESULT_CODE = 429
+QUOTA_ERROR_CODE = "quota_exhausted"
 TOKEN_REFRESH_RESULT_CODES = frozenset({404, 405})
 BACKOFF_BASE_SECONDS = 1.0
 BACKOFF_FACTOR = 2.0
@@ -249,6 +254,13 @@ class CninfoClient:
             resultcode = response.audit.resultcode
             if response.audit.http_status < 400 and resultcode == 200:
                 return response
+            if resultcode == QUOTA_RESULT_CODE:
+                raise CninfoClientError(
+                    "CNINFO quota/rate limit exhausted (resultcode 429)",
+                    error_code=QUOTA_ERROR_CODE,
+                    retryable=True,
+                    audit=response.audit,
+                )
             retryable = _is_retryable(
                 http_status=response.audit.http_status, resultcode=resultcode
             )

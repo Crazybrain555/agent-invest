@@ -62,6 +62,21 @@ def sync_due(
     return [dict(row) for row in rows]
 
 
+def pending_download_count(conn: Connection, *, max_retries: int) -> int:
+    """Backfill backpressure input (changedetection.io MAX_QUEUE_SIZE pattern)."""
+
+    row = conn.execute(
+        text(
+            f"""
+            SELECT count(*) FROM {OPS_SCHEMA}.pending_download_v1
+             WHERE failed_download_count < :max_retries
+            """
+        ),
+        {"max_retries": max_retries},
+    ).scalar()
+    return int(row or 0)
+
+
 def pending_downloads(
     conn: Connection, *, max_retries: int, limit: int
 ) -> list[dict[str, Any]]:

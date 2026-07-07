@@ -37,6 +37,10 @@ class TrackEntry:
 @dataclass(frozen=True)
 class TrackCompaniesCommand:
     entries: tuple[TrackEntry, ...]
+    # Full reconciliation (design/watchlist-operations.md §5.2): tracked rows
+    # absent from the entries are reported as drift; prune_drift pauses them.
+    reconcile: bool = False
+    prune_drift: bool = False
 
 
 @dataclass(frozen=True)
@@ -49,8 +53,18 @@ class TrackEntryResult:
 
 
 @dataclass(frozen=True)
+class DriftEntry:
+    tracked_company_id: str
+    company_id: str
+    security_code: str | None
+    status: str
+    action: str  # "reported" | "paused"
+
+
+@dataclass(frozen=True)
 class TrackCompaniesResult:
     results: tuple[TrackEntryResult, ...]
+    drift: tuple[DriftEntry, ...] = ()
 
     @property
     def created_count(self) -> int:
@@ -74,11 +88,46 @@ class TrackCompanies:
                     f"lookback_days must be non-negative for {entry.security_code}"
                 )
         results: list[TrackEntryResult] = []
+        drift: list[DriftEntry] = []
         with self._uow_factory() as uow:
             for entry in command.entries:
                 results.append(self._track_one(uow, entry))
+            if command.reconcile:
+                drift = self._reconcile_drift(
+                    uow,
+                    known_company_ids={item.company_id for item in results},
+                    prune=command.prune_drift,
+                )
             uow.commit()
-        return TrackCompaniesResult(results=tuple(results))
+        return TrackCompaniesResult(results=tuple(results), drift=tuple(drift))
+
+    def _reconcile_drift(
+        self, uow: UnitOfWork, *, known_company_ids: set[str], prune: bool
+    ) -> list[DriftEntry]:
+        drift: list[DriftEntry] = []
+        for tracked in uow.tracked_companies.list_all():
+            if tracked.company_id in known_company_ids:
+                continue
+            security = (
+                uow.securities.get(tracked.security_id)
+                if tracked.security_id
+                else None
+            )
+            action = "reported"
+            if prune and tracked.status == "active":
+                tracked.status = "paused"
+                uow.tracked_companies.update(tracked)
+                action = "paused"
+            drift.append(
+                DriftEntry(
+                    tracked_company_id=tracked.tracked_company_id,
+                    company_id=tracked.company_id,
+                    security_code=security.security_code if security else None,
+                    status=tracked.status,
+                    action=action,
+                )
+            )
+        return drift
 
     def _track_one(self, uow: UnitOfWork, entry: TrackEntry) -> TrackEntryResult:
         subject = self._resolver.resolve(

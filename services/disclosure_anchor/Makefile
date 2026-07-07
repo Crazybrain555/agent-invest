@@ -19,7 +19,7 @@ PGPORT ?= 55432
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	test-mineru-smoke lint typecheck agent-check api archive pg-init pg-start pg-stop \
-	pg-status db-create migrate register parse build-units publish process rebuild-units prune-history track sync worker-once worker-loop doctor-full wipe-test-data
+	pg-status db-create migrate register parse build-units publish process rebuild-units prune-history track track-status sync worker-once worker-loop doctor-full wipe-test-data
 
 doctor:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -126,7 +126,10 @@ prune-history:
 # Upsert the company watchlist (config/watchlist.csv) into tracked_company.
 # Offline + idempotent; the worker backfills new companies on its next round.
 track:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline track $(if $(FILE),--file "$(FILE)") $(if $(CODES),--codes "$(CODES)")
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline track $(if $(FILE),--file "$(FILE)") $(if $(CODES),--codes "$(CODES)") $(if $(PRUNE_DRIFT),--prune-drift)
+
+track-status:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline track-status
 
 sync:
 	@test -n "$(COMPANY)" || (echo 'usage: make sync COMPANY=<scode> [WINDOW=N]' && exit 2); \

@@ -2,7 +2,7 @@
 id: disclosure_anchor_design_retrieval_semantic_keys
 project: disclosure_anchor
 title: 非 embedding 检索数据面：多级标题、关键词与 semantic_key 附注词表（设计评审）
-status: proposed
+status: partially-adopted (词表已实施 2026-07-07；06R 投影待立项)
 created_at: 2026-07-07
 inputs: 用户 round8 提问 + 2026-07-07 调研（EDGAR EFTS/AlphaSense/PG 中文 FTS/编报规则第15号/XBRL）+ 本仓只读取证
 decides_for: 06R（检索投影里程碑，规格待编写）+ semantic_key 词表升版
@@ -109,7 +109,15 @@ scope 过滤沿既有列（filing_type/report_period/heading_path @>/applicabili
 **明确不做**（重申 U7 红线 + 本轮调研加强）：不加自由抽取关键词字段（无召回增益）、
 不做 embedding/向量库、投影重建不产生 materialized 事件。
 
-## 6. 排期建议
+## 6. 排期（更新 2026-07-07）
+
+§4 附注词表已实施（用户授权）：note_key_map.json 95 键 + 三级匹配（剥编号→精确→
+别名→最长名包含），builder 在定期报告类文档对 title/末级标题派生 note key 并入
+semantic_keys（scalar 在规则未命中时回落 note key）。实测：附注双 NULL 95→37
+（余 37 为"其他说明/明细情况"类无科目语义标题，按设计兜底不强配），全库 keyed
+36%→56.5%。规则包 ub-2026.07-11。06R 投影按 §5 表待立项。
+
+## 6.1 原排期建议（存档）
 
 1. **S**：semantic_key 附注词表（note_key_map.json + 三级匹配 + 别名表）——
    独立于 06R，先把 A4 的 85% NULL 补掉；规则包升版 + 5 秒重建即可验证。

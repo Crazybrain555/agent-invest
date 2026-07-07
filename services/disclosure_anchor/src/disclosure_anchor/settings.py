@@ -122,6 +122,16 @@ class Settings(BaseSettings):
             "DISCLOSURE_ENABLE_ADMIN_API", "disclosure_enable_admin_api"
         ),
     )
+    # Backfill backpressure: when the pending-download queue exceeds this cap,
+    # never-synced companies are deferred to a later round (batched intake).
+    disclosure_backfill_max_pending_downloads: int = Field(
+        default=2000,
+        ge=0,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_BACKFILL_MAX_PENDING_DOWNLOADS",
+            "disclosure_backfill_max_pending_downloads",
+        ),
+    )
     disclosure_parse_scope: str = Field(
         default="core",
         pattern="^(core|all)$",

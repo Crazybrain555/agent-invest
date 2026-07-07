@@ -225,3 +225,62 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SyncStageProtectionTests(unittest.TestCase):
+    def _run_sync(self, due, *, pending_downloads=0, sync_side_effect=None,
+                  backfill_cap=2000):
+        deps = _deps()
+        object.__setattr__(deps, "config", WorkerConfig(
+            max_parse_retries=3, max_build_retries=3,
+            stale_run_threshold_seconds=3600, sync_interval_seconds=86400,
+            cninfo_overlap_days=7, cninfo_max_retries=3, cninfo_oversized_kb=10240,
+            backfill_max_pending_downloads=backfill_cap,
+        ))
+        with (
+            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
+            mock.patch.object(worker_module.queries, "sync_due", return_value=due),
+            mock.patch.object(worker_module.queries, "pending_download_count",
+                              return_value=pending_downloads),
+            mock.patch.object(worker_module, "SyncDisclosureIndex") as sync_cls,
+        ):
+            if sync_side_effect is not None:
+                sync_cls.return_value.execute.side_effect = sync_side_effect
+            else:
+                sync_cls.return_value.execute.return_value = mock.MagicMock(
+                    candidates_persisted=1
+                )
+            report = run_once(
+                WorkerLimits(sync=10, download=0, parse=0, build=0, publish=0), deps
+            )
+        return report, sync_cls
+
+    def test_quota_error_trips_round_breaker(self) -> None:
+        # edgartools guidance: on quota exhaustion stop the round instead of
+        # burning quota on the remaining companies.
+        class _Quota(Exception):
+            error_code = "quota_exhausted"
+
+        due = [
+            {"security_code": "000001", "exchange": "SZSE", "window_end": "2026-07-01"},
+            {"security_code": "000002", "exchange": "SZSE", "window_end": "2026-07-01"},
+        ]
+        report, sync_cls = self._run_sync(due, sync_side_effect=_Quota("429"))
+
+        self.assertTrue(report.sync_quota_break)
+        self.assertEqual(report.failed, 1)
+        sync_cls.return_value.execute.assert_called_once()
+
+    def test_never_synced_company_deferred_when_download_queue_saturated(self) -> None:
+        due = [
+            {"security_code": "000001", "exchange": "SZSE",
+             "window_end": None, "last_synced_at": None},
+            {"security_code": "600519", "exchange": "SSE",
+             "window_end": "2026-07-01", "last_synced_at": "2026-07-01"},
+        ]
+        report, sync_cls = self._run_sync(due, pending_downloads=5000)
+
+        # The backfill candidate defers; the incremental company still syncs.
+        self.assertEqual(report.deferred_backfill, 1)
+        self.assertEqual(report.synced_companies, 1)
+        sync_cls.return_value.execute.assert_called_once()

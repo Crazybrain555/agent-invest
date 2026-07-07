@@ -1,9 +1,16 @@
-# disclosure_anchor company watchlist (the ONLY human-maintained input).
-# Apply with: make track   (idempotent upsert into tracked_company)
-# Columns: security_code,exchange(optional: SSE|SZSE, default by code),lookback_days(optional),sync_frequency(optional: hourly|daily|weekly),note
-security_code,exchange,lookback_days,sync_frequency,note
-600519,SSE,,,贵州茅台
-002484,SZSE,,,江海股份
-000001,SZSE,,,平安银行
-000333,SZSE,,,美的集团
-600036,SSE,,,招商银行
+# disclosure_anchor company watchlist — the ONLY human-maintained input (single source of truth).
+# Apply with: make track            (idempotent reconcile: upserts rows, reports DB drift)
+#             make track PRUNE_DRIFT=YES   (additionally pauses tracked companies missing here)
+# Pause a company = set status=paused (do NOT delete the row: git history + point-in-time).
+# filing_categories: semicolon-separated F006V prefixes (empty = all, per 07 contract).
+security_code,exchange,status,joined_date,lookback_days,sync_frequency,filing_categories,note
+600519,SSE,active,2026-07-06,,,,贵州茅台
+002484,SZSE,active,2026-07-06,,,,江海股份
+000001,SZSE,active,2026-07-06,,,,平安银行
+000333,SZSE,active,2026-07-06,,,,美的集团
+600036,SSE,active,2026-07-06,,,,招商银行
+000002,SZSE,active,2026-07-07,,,,万科A-round8测试入池
+000651,SZSE,active,2026-07-07,,,,格力电器-round8测试入池
+600900,SSE,active,2026-07-07,,,,长江电力-round8测试入池
+601398,SSE,active,2026-07-07,,,,工商银行-round8测试入池
+300750,SZSE,active,2026-07-07,,,,宁德时代-round8测试入池

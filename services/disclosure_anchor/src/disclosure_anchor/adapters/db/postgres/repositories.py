@@ -191,6 +191,14 @@ class TrackedCompanyRepository:
         )
         return mappers.tracked_company_to_entity(row) if row is not None else None
 
+    def list_all(self) -> list[e.TrackedCompany]:
+        rows = (
+            self._session.query(models.TrackedCompany)
+            .order_by(models.TrackedCompany.tracked_company_id)
+            .all()
+        )
+        return [mappers.tracked_company_to_entity(row) for row in rows]
+
     def update(self, tracked_company: e.TrackedCompany) -> e.TrackedCompany:
         row = self._session.get(models.TrackedCompany, tracked_company.tracked_company_id)
         if row is None:

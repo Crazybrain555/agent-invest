@@ -201,7 +201,9 @@ class CninfoSyncIntegrationTests(unittest.TestCase):
         self.assertNotIn("access_token", index_row.query_params)
         self.assertEqual(checkpoint_row.provider, "cninfo")
         self.assertTrue(checkpoint_row.scope_key.endswith(":p_info3015"))
-        self.assertEqual(checkpoint_row.cursor, {"window_end": "2026-07-02"})
+        self.assertEqual(checkpoint_row.cursor["window_end"], "2026-07-02")
+        self.assertIn("window_start", checkpoint_row.cursor)
+        self.assertIn("synced_at", checkpoint_row.cursor)
         self.assertEqual(tracked_count, 1)
 
 

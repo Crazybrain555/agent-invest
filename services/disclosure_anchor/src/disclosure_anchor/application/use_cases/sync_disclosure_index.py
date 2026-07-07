@@ -78,8 +78,20 @@ class SyncDisclosureIndex:
 
     def execute(self, command: SyncDisclosureIndexCommand) -> SyncDisclosureIndexResult:
         window = DisclosureWindow(command.window_start, command.window_end)
-        profile = self._profile_loader(command.security_code)
         now = datetime.now(timezone.utc)
+        try:
+            profile = self._profile_loader(command.security_code)
+        except DisclosureAnchorError as exc:
+            # The profile fetch fails BEFORE any UoW opens; without this trace
+            # a first-sync failure left no source_access at all (round8:
+            # 300750 was untraceable). Persist the failure, then re-raise.
+            failed_access = self._record_failed_profile_access(
+                command=command, error=exc, now=now
+            )
+            raise SyncDisclosureIndexError(
+                "CNINFO profile fetch failed; "
+                f"source_access_id={failed_access.source_access_id}"
+            ) from exc
 
         with self._uow_factory() as uow:
             profile_access = self._record_profile_access(
@@ -143,6 +155,7 @@ class SyncDisclosureIndex:
                 uow=uow,
                 company_id=subject.company.company_id,
                 window_end=command.window_end,
+                window_start=command.window_start,
             )
             # Keep the variable live so mypy sees the tracked-company write as intentional.
             _ = tracked
@@ -173,6 +186,38 @@ class SyncDisclosureIndex:
                     item for item in raw_candidates if isinstance(item, dict)
                 )
         return candidates
+
+    def _record_failed_profile_access(
+        self,
+        *,
+        command: SyncDisclosureIndexCommand,
+        error: DisclosureAnchorError,
+        now: datetime,
+    ) -> e.SourceAccess:
+        with self._uow_factory() as uow:
+            access = uow.source_accesses.add(
+                e.SourceAccess(
+                    source_access_id=ids.new_source_access_id(),
+                    provider=CNINFO_PROVIDER,
+                    provider_interface="cninfo:p_stock2100",
+                    dataset_key="p_stock2100",
+                    query_params={"scode": command.security_code},
+                    accessed_at=now,
+                    status="failed",
+                    error=_json(
+                        error.to_error(stage="profile")
+                        if isinstance(error, SourceRequestError)
+                        else {
+                            "stage": "profile",
+                            "error_code": type(error).__name__,
+                            "retryable": False,
+                        }
+                    ),
+                    result_snapshot={"reason": str(error)},
+                )
+            )
+            uow.commit()
+        return access
 
     def _record_profile_access(
         self,
@@ -361,11 +406,22 @@ class SyncDisclosureIndex:
         )
 
     def _upsert_checkpoint(
-        self, *, uow: UnitOfWork, company_id: str, window_end: date
+        self,
+        *,
+        uow: UnitOfWork,
+        company_id: str,
+        window_end: date,
+        window_start: date | None = None,
     ) -> e.SourceCheckpoint:
         scope_key = f"{company_id}:p_info3015"
         existing = uow.source_checkpoints.get_by_scope(CNINFO_PROVIDER, scope_key)
-        cursor = {"window_end": window_end.isoformat()}
+        cursor = {
+            "window_end": window_end.isoformat(),
+            # Audit fields (design/watchlist-operations.md §5.4): what window
+            # this sync actually covered and when. Readers only use window_end.
+            "window_start": window_start.isoformat() if window_start else None,
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+        }
         if existing is None:
             return uow.source_checkpoints.add(
                 e.SourceCheckpoint(

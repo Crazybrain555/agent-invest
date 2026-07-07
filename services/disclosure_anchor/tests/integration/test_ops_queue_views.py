@@ -195,7 +195,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 "provider_document_id": pid,
                 "title": f"测试公告 {pid}",
                 "download_url": f"http://static.cninfo.com.cn/{pid}.PDF",
-                "announcement_date": "2026-07-01",
+                "announcement_date": "1990-01-01",
                 "security_code": "T08QV",
                 "exchange": "LOCAL",
                 "filing_type": "other",

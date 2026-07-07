@@ -623,6 +623,11 @@ def s7_finalize_units(
         keys = set(unit.semantic_keys or ())
         if semantic_key:
             keys.add(semantic_key)
+        note_key = _note_key_for_unit(unit, filing_type=filing_type)
+        if note_key:
+            keys.add(note_key)
+            if semantic_key is None:
+                semantic_key = note_key
         quality_status = _final_quality_status(unit)
         if quality_status == "needs_review":
             stats.needs_review_count += 1
@@ -1080,6 +1085,11 @@ def _member_semantic_keys(
             or semantic_key_for_unit(member, filing_type=filing_type)
         )
     }
+    keys.update(
+        key
+        for member in members
+        if (key := _note_key_for_unit(member, filing_type=filing_type))
+    )
     return sorted(keys) or None
 
 
@@ -1197,6 +1207,16 @@ def _is_structural_l1(element: PreparedElement) -> bool:
 
 def _unit_sort_key(unit: UnitDraft) -> tuple[int, int]:
     return (unit.source_order, unit.intra_order)
+
+
+def _note_key_for_unit(unit: UnitDraft, *, filing_type: str | None) -> str | None:
+    """附注科目键：只在定期报告类文档里按标题词表派生（法定封闭集）。"""
+
+    if filing_type not in rules.SEMANTIC_LIMITED_FILING_TYPES:
+        return None
+    return rules.note_key_for_title(unit.title) or rules.note_key_for_title(
+        unit.heading_path[-1] if unit.heading_path else None
+    )
 
 
 def semantic_key_for_unit(unit: UnitDraft, *, filing_type: str | None) -> str | None:
