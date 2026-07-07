@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-14"
+RULES_VERSION = "ub-2026.07-15"
 HEADING_RULESET_ID = "cn_a_v5"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -437,3 +437,28 @@ def note_key_for_title(title: str | None) -> str | None:
         if name in core:
             return key
     return None
+
+
+# 事件键（round12 调研：DuEE-fin/CCKS/FewFC/CFinDEE 并集，8-K item 式监管锚定）。
+# 从公告标题派生，文档级语义 → 并入该文档全部单元的 semantic_keys。
+@lru_cache(maxsize=1)
+def _event_key_table() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    payload = json.loads(
+        resources.files("disclosure_anchor.adapters.unit_builder")
+        .joinpath("event_key_map.json")
+        .read_text(encoding="utf-8")
+    )
+    return tuple(
+        (key, tuple(str(p) for p in patterns))
+        for key, patterns in payload["events"].items()
+    )
+
+
+def event_keys_for_document_title(title: str | None) -> tuple[str, ...]:
+    if not title:
+        return ()
+    return tuple(
+        key
+        for key, patterns in _event_key_table()
+        if any(pattern in title for pattern in patterns)
+    )

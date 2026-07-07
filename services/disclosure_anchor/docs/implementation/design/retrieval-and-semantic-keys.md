@@ -103,6 +103,25 @@ decides_for: 06R（检索投影里程碑，规格待编写）+ semantic_key 词�
 3. 若 06R 后仍有"按层级过滤"需求（只查第 2 级为 X 的单元），heading_path 的 jsonb
    下标访问（`heading_path->>1`）已经支持，无需 schema 变更。
 
+## 4.6 三 facet 标签架构（round12 调研定案）
+
+业界共识（RavenPack/AlphaSense/SmarTag/8-K/DuEE-fin 全部如此）：**facet 分立，不混词表**。
+本服务三 facet：
+
+| facet | 字段 | 词表 | 规模 | 回答的问题 |
+|---|---|---|---|---|
+| 主题（文档级） | document.disclosure_topics | topic_map.json | 12 | 这份公告属于哪类事务 |
+| 章节（单元级） | semantic_keys 中的 section 键 | note_key_map.json | 142 | 这个单元是报告的哪个标准部位 |
+| **事件（文档级→单元）** | semantic_keys 中的 event 键 | event_key_map.json | 30 | **发生了什么公司行为** |
+
+事件词表 = DuEE-fin(13) ∪ CCKS篇章级(9) ∪ FewFC(10) ∪ CFinDEE(22) 并集去重（≈30 键），
+对标 SEC 8-K item 的监管锚定思路；方向成对键分立（增持/减持——投资检索里方向即查询词）；
+从公告标题派生（标题是交易所格式指引规范文本），并入该文档全部单元 semantic_keys。
+
+调研留给后续的三项（记 09 背账，暂不做）：①142 个 section 键之上加 2 级父分类
+（CFinDEE 6 类/FiQA 4×27 模式，>20 键后层级利于查询放宽）；②每键 salience 分
+（SmarTag 模式，排序用）；③查询侧同义词映射表（06R 配套）。
+
 ## 5. 06R 最小检索投影规格草案（A1-A3 的答案）
 
 U7 边界（05 §2，原文摘录）已锁定：投影是**派生层**，字段族

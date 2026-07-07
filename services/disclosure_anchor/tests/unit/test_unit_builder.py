@@ -24,7 +24,7 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-14")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-15")
         self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v5")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
@@ -592,6 +592,29 @@ class UnitBuilderTests(unittest.TestCase):
                     semantic_key_for_unit(unit, filing_type="annual_report"),
                     expected,
                 )
+
+    def test_event_keys_from_document_title_union_into_all_units(self) -> None:
+        # Round12 (研究落地): 事件键是独立 facet，从公告标题派生并入全部单元。
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {"kind": "text", "raw_kind": "text", "order_index": 1,
+                     "text": "回购方案实施完毕，累计回购股份 1,200 万股。" * 40},
+                ]
+            },
+            filing_type="other",
+            document_title="贵州茅台：关于回购股份实施结果暨股份变动的公告",
+        )
+
+        for unit in units:
+            self.assertIn("share_buyback_event", unit.semantic_keys or [])
+
+    def test_event_keys_precise_on_composite_titles(self) -> None:
+        keys = rules.event_keys_for_document_title(
+            "江海股份：关于部分董事、高级管理人员减持股份预披露的公告"
+        )
+        self.assertEqual(set(keys), {"holding_decrease"})
+        self.assertEqual(rules.event_keys_for_document_title("2025年年度报告"), ())
 
     def test_note_vocabulary_keys_notes_sections(self) -> None:
         # design/retrieval-and-semantic-keys.md §4: 附注标题是法定受控词表

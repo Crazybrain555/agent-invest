@@ -638,12 +638,17 @@ def s7_finalize_units(
     units: Iterable[UnitDraft],
     *,
     filing_type: str | None,
+    document_title: str | None = None,
     stats: BuildStats,
 ) -> list[UnitDraft]:
+    # Document-level event keys (round12): "what happened" is its own facet;
+    # derived from the announcement title, unioned into every unit's keys.
+    event_keys = rules.event_keys_for_document_title(document_title)
     finalized: list[UnitDraft] = []
     for unit in units:
         semantic_key = unit.semantic_key or semantic_key_for_unit(unit, filing_type=filing_type)
         keys = set(unit.semantic_keys or ())
+        keys.update(event_keys)
         if semantic_key:
             keys.add(semantic_key)
         note_key = _note_key_for_unit(unit, filing_type=filing_type)
@@ -701,7 +706,15 @@ def build_unit_drafts_s1_s7(
         kept, filing_type=filing_type, document_title=document_title, stats=s1.stats
     )
     kept = _drop_standalone_noise_units(kept, stats=s1.stats)
-    return s7_finalize_units(kept, filing_type=filing_type, stats=s1.stats), s1.stats
+    return (
+        s7_finalize_units(
+            kept,
+            filing_type=filing_type,
+            document_title=document_title,
+            stats=s1.stats,
+        ),
+        s1.stats,
+    )
 
 
 def _anchor_headerless_units(

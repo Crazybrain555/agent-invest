@@ -1,5 +1,5 @@
 {
-  "version": "2026-07-r2",
+  "version": "2026-07-r3",
   "_about": "年报章节受控词表（design/retrieval-and-semantic-keys.md §4）。两部法定来源：①《编报规则第15号——财务报告的一般规定》(2023) 的附注科目；②《年报准则第2号》(2021修订) 规定的正文目录结构（管理层讨论与分析各节、公司治理、环境社会、股份变动等）。names=标准名；aliases=旧准则/实务变体。匹配前剥离标题编号。",
   "keys": {
     "monetary_funds": {
@@ -931,6 +931,137 @@
       "aliases": [
         "募集资金总体使用情况"
       ]
+    },
+    "balance_sheet": {
+      "names": [
+        "合并资产负债表"
+      ],
+      "aliases": []
+    },
+    "balance_sheet_parent": {
+      "names": [
+        "母公司资产负债表"
+      ],
+      "aliases": []
+    },
+    "income_statement": {
+      "names": [
+        "合并利润表"
+      ],
+      "aliases": []
+    },
+    "income_statement_parent": {
+      "names": [
+        "母公司利润表"
+      ],
+      "aliases": []
+    },
+    "cash_flow_statement": {
+      "names": [
+        "合并现金流量表"
+      ],
+      "aliases": []
+    },
+    "cash_flow_statement_parent": {
+      "names": [
+        "母公司现金流量表"
+      ],
+      "aliases": []
+    },
+    "equity_statement": {
+      "names": [
+        "合并所有者权益变动表"
+      ],
+      "aliases": []
+    },
+    "equity_statement_parent": {
+      "names": [
+        "母公司所有者权益变动表"
+      ],
+      "aliases": []
+    },
+    "corporate_independence": {
+      "names": [
+        "保证公司资产、人员、财务、机构、业务等方面的独立情况"
+      ],
+      "aliases": [
+        "独立情况",
+        "五分开"
+      ]
+    },
+    "horizontal_competition": {
+      "names": [
+        "同业竞争情况"
+      ],
+      "aliases": [
+        "同业竞争"
+      ]
+    },
+    "board_duty_performance": {
+      "names": [
+        "报告期内董事履行职责的情况",
+        "董事履行职责"
+      ],
+      "aliases": [
+        "独立董事情况"
+      ]
+    },
+    "board_committees": {
+      "names": [
+        "董事会下设专门委员会",
+        "审计委员会工作情况"
+      ],
+      "aliases": [
+        "专门委员会",
+        "薪酬与考核委员会",
+        "提名委员会",
+        "战略委员会"
+      ]
+    },
+    "shareholder_meetings_held": {
+      "names": [
+        "年度内召开的股东大会情况",
+        "股东大会情况"
+      ],
+      "aliases": []
+    },
+    "investor_reception": {
+      "names": [
+        "报告期内接待调研、沟通、采访等活动",
+        "接待调研"
+      ],
+      "aliases": [
+        "调研、沟通、采访"
+      ]
+    },
+    "market_value_management": {
+      "names": [
+        "市值管理制度和估值提升计划",
+        "市值管理"
+      ],
+      "aliases": [
+        "估值提升计划"
+      ]
+    },
+    "quality_return_plan": {
+      "names": [
+        "质量回报双提升"
+      ],
+      "aliases": []
+    },
+    "performance_evaluation_incentive": {
+      "names": [
+        "董事、监事、高级管理人员考核评价和激励情况",
+        "考核评价和激励"
+      ],
+      "aliases": []
+    },
+    "info_disclosure_management": {
+      "names": [
+        "信息披露与投资者关系管理",
+        "信息披露事务管理"
+      ],
+      "aliases": []
     }
   }
 }
