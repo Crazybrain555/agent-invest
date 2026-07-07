@@ -1,5 +1,5 @@
 {
-  "version": "2026-07-r2",
+  "version": "2026-07-r3",
   "_about": "Worker parse-layer scope (design/watchlist-operations.md + round9 disclosure_topics). Scope 'core' parses every non-other filing_type plus 'other' documents whose disclosure_topics hit core_topics. Adjustable file config; topics derive from topic_map.json at registration.",
   "core_topics": [
     "dividend",
@@ -12,9 +12,11 @@
     "risk_alert",
     "investor_communication",
     "meeting_resolution",
-    "financing"
+    "financing",
+    "related_party"
   ],
   "_deprioritized": [
-    "governance_rules"
+    "governance_rules",
+    "intermediary_report"
   ]
 }

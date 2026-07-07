@@ -60,7 +60,7 @@ security_id PK；company_id FK；security_code+exchange 定位（exchange 全大
 |---|---|
 | status | 公开可消费态：registered → parsed \| parse_failed →（发布后）published；published 永不降级 |
 | filing_type | **一级粗桶**闭集 9 值：annual/semiannual/quarterly_report, performance_forecast/flash, investor_relations, performance_briefing, inquiry_reply, other（新值=契约升版） |
-| disclosure_topics | **二级分类** jsonb 数组（0014）；F006V→topic_map.json 派生，12 topic；web 通道无 F006V→NULL；GIN 部分索引 |
+| disclosure_topics | **二级分类** jsonb 数组（0014）；F006V→topic_map.json 派生，**14 topic**（r2）；定期报告本体与无 F006V 通道→NULL（一级分类已承载）；GIN 部分索引 |
 | report_period | `YYYY(A|Q1-4)`；定期报告必填，临时公告可 NULL，不伪造 |
 | raw_file_relpath/raw_file_hash | 相对路径+sha256；原始 PDF 不可变只追加 |
 | provider_metadata | jsonb：raw_category（F006V 原串）、category_names（中文分类名数组）、file_signature、oversized 标记等 |
@@ -112,14 +112,18 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 ## 4. 词表/配置文件索引（versioned，改=升版）
 
+**存量刷新纪律**：注册只分类一次，重复观察不重推导。filing_type_map / topic_map
+升版后**必须**跑 `PYTHONPATH=src .venv/bin/python scripts/reclassify_documents.py`
+——按当前词表对全部带 F006V 的存量文档重推导两级分类并逐条报告变化（幂等）。
+
 | 文件 | 内容 | 当前版本 |
 |---|---|---|
 | adapters/unit_builder/rules.py | 切分/噪声/声明组合文法/语义规则 | RULES_VERSION ub-2026.07-18 |
 | adapters/unit_builder/note_key_map.json | 章节词表 **144 键**（section facet；祖先继承+全类型开放） | 2026-07-r4 |
 | adapters/unit_builder/event_key_map.json | 事件键 **30 键**（DuEE-fin/CCKS/FewFC/CFinDEE 并集，标题派生） | 2026-07-r1 |
 | adapters/sources/cninfo/filing_type_map.json | F006V→filing_type 9 桶 | 2026-07-r3 |
-| adapters/sources/cninfo/topic_map.json | F006V→disclosure_topics 12 题 | 2026-07-r1 |
-| application/worker/parse_scope.json | 分层解析 core_topics | 2026-07-r2 |
+| adapters/sources/cninfo/topic_map.json | F006V→disclosure_topics **14** 题 | 2026-07-r2 |
+| application/worker/parse_scope.json | 分层解析 core_topics（12 进核心，governance_rules/intermediary_report 降级） | 2026-07-r3 |
 | config/watchlist.csv | 股票池唯一真源 | git 即版本 |
 
 ## 5. 设计讨论记录
