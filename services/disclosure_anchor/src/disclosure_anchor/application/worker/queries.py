@@ -101,29 +101,26 @@ def pending_parse(
     *,
     max_retries: int,
     limit: int,
-    scope_category_prefixes: tuple[str, ...] | None = None,
+    scope_topics: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Documents awaiting parse, excluding non-retryable and exhausted ones.
 
     Oversized documents (07 §3.9) are excluded in SQL: they used to be
     LIMIT-selected first and then skipped, permanently occupying every batch
-    slot (round8 audit blocker). With scope_category_prefixes set (parse
-    scope 'core'), 'other' documents are parsed only when an F006V category
-    segment matches a configured prefix; every non-other filing_type always
-    parses. None → parse everything ('all').
+    slot (round8 audit blocker). With scope_topics set (parse scope 'core'),
+    'other' documents are parsed only when disclosure_topics (round9 second-
+    level classification) hits a core topic; every non-other filing_type
+    always parses. None → parse everything ('all').
     """
 
     scope_sql = ""
     params: dict[str, Any] = {"max_retries": max_retries, "limit": limit}
-    if scope_category_prefixes is not None:
+    if scope_topics is not None:
         scope_sql = """
-               AND (d.filing_type <> 'other' OR EXISTS (
-                   SELECT 1
-                     FROM unnest(string_to_array(
-                              coalesce(d.provider_metadata->>'raw_category', ''), '||'
-                          )) AS seg(category_code)
-                    WHERE seg.category_code LIKE ANY(:scope_prefixes)))"""
-        params["scope_prefixes"] = [f"{p}%" for p in scope_category_prefixes]
+               AND (d.filing_type <> 'other'
+                    OR (d.disclosure_topics IS NOT NULL
+                        AND d.disclosure_topics ?| CAST(:scope_topics AS text[])))"""
+        params["scope_topics"] = list(scope_topics)
     rows = conn.execute(
         text(
             f"""

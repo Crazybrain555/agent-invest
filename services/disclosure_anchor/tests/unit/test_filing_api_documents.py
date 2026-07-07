@@ -28,6 +28,7 @@ def _document_row(document_id: str, announcement_date: date | None) -> dict:
         "security_code": "002484",
         "exchange": "szse",
         "filing_type": "annual_report",
+        "disclosure_topics": None,
         "title": "annual report",
         "announcement_date": announcement_date,
         "report_period": "2025A",

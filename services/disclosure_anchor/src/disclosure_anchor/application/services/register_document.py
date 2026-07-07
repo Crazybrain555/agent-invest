@@ -25,6 +25,7 @@ class DocumentRegistration:
     report_period: ReportPeriod | None
     filename: str
     provider_metadata: dict[str, object] = field(default_factory=dict)
+    disclosure_topics: list[str] | None = None
     provider_interface: str = "local:register_pdf"
     dataset_key: str = "local_pdf"
 
@@ -93,6 +94,7 @@ def register_document(
             provider_document_id=doc_meta.provider_document_id,
             title=doc_meta.title,
             filing_type=doc_meta.filing_type,
+            disclosure_topics=doc_meta.disclosure_topics,
             announcement_date=doc_meta.announcement_date,
             report_period=str(doc_meta.report_period) if doc_meta.report_period else None,
             raw_file_relpath=str(raw.relpath),

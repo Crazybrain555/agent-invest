@@ -163,6 +163,13 @@ components:
           format: date-time
           title: Created At
           type: string
+        disclosure_topics:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Disclosure Topics
         document_id:
           title: Document Id
           type: string
@@ -303,6 +310,7 @@ components:
       - security_code
       - exchange
       - filing_type
+      - disclosure_topics
       - report_period
       - announcement_date
       - producer_action_ref
@@ -349,6 +357,13 @@ components:
           - type: string
           - type: 'null'
           title: Current Processing Run Id
+        disclosure_topics:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Disclosure Topics
         document_id:
           title: Document Id
           type: string
@@ -430,6 +445,7 @@ components:
       - security_code
       - exchange
       - filing_type
+      - disclosure_topics
       - title
       - announcement_date
       - report_period

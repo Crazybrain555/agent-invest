@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-11"
+RULES_VERSION = "ub-2026.07-12"
 HEADING_RULESET_ID = "cn_a_v5"
 GIBBERISH_RATIO_MAX = 0.30
 

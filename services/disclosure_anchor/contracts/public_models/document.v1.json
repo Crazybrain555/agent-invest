@@ -55,6 +55,20 @@
       ],
       "title": "Current Processing Run Id"
     },
+    "disclosure_topics": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Disclosure Topics"
+    },
     "document_id": {
       "title": "Document Id",
       "type": "string"
@@ -213,6 +227,7 @@
     "security_code",
     "exchange",
     "filing_type",
+    "disclosure_topics",
     "title",
     "announcement_date",
     "report_period",

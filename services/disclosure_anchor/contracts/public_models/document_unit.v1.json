@@ -72,6 +72,20 @@
       "title": "Created At",
       "type": "string"
     },
+    "disclosure_topics": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Disclosure Topics"
+    },
     "document_id": {
       "title": "Document Id",
       "type": "string"
@@ -312,6 +326,7 @@
     "security_code",
     "exchange",
     "filing_type",
+    "disclosure_topics",
     "report_period",
     "announcement_date",
     "producer_action_ref",

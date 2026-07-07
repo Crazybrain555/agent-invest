@@ -256,6 +256,9 @@ class Document(Base):
     provider_document_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     filing_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    disclosure_topics: Mapped[Optional[list[str]]] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
     announcement_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     report_period: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     raw_file_relpath: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

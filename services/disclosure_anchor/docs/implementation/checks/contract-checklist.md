@@ -68,7 +68,7 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
   部分索引 ix_document_unit_applicability；page_no：artifact_locator 首页码提升列）。
 0007 起 document_units_v1 追加 6 列：asset_kind / observed_at / source_tier /
   trace_level / raw_file_hash / query_projection_hash
-  （列全集：04R-R7 的 32 列 + 0010 applicability/page_no + 0011 is_active_run + 0013 semantic_keys = 36 列）
+  （列全集：04R-R7 的 32 列 + 0010 applicability/page_no + 0011 is_active_run + 0013 semantic_keys + 0014 disclosure_topics = 37 列）
 0007 起 change_events_v1 追加 change_kind（真实列）/ subject_kind / subject_ref /
   source / contract_version
 0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref /
@@ -78,6 +78,9 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
 0013 起 document_unit 增加 semantic_keys（jsonb 数组 = 单元自身 semantic_key ∪ mixed
   parts 的 semantic_key；GIN 部分索引支持 `semantic_keys ? 'revenue_breakdown'`；
   纳入 query_projection_hash 与 outbox PROJECTION_FIELDS）
+0014 起 document/documents_v1/document_units_v1 增加 disclosure_topics（F006V→
+  topic_map.json 派生的二级分类数组，GIN 部分索引；filing_type 保持粗桶，
+  round9 用户裁决"两三级分类合理"；web 兜底通道无 F006V → null）
 0012 起新增 document_categories_v1（provider 原生分类：F006V 段 × provider_category
   字典（p_info3005 快照 seed）；facet 语义只给 ordinal 不造 is_primary；filing_type
   仍为内部粗桶，规则包 2026-07-r3 起 调研活动→investor_relations）

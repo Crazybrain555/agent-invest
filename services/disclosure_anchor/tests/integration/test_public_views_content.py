@@ -376,6 +376,7 @@ class PublicViewContentTests(unittest.TestCase):
             "security_code",
             "exchange",
             "filing_type",
+            "disclosure_topics",
             "report_period",
             "announcement_date",
             "producer_action_ref",
@@ -401,7 +402,7 @@ class PublicViewContentTests(unittest.TestCase):
             }
 
         self.assertEqual(columns, expected)
-        self.assertEqual(len(columns), 36)
+        self.assertEqual(len(columns), 37)
 
     def test_source_tier_mapping_contract(self) -> None:
         self._seed()

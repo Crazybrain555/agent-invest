@@ -19,6 +19,7 @@ class DocumentV1(PublicModel):
     security_code: str | None
     exchange: str | None
     filing_type: str | None
+    disclosure_topics: list[str] | None
     title: str | None
     announcement_date: date | None
     report_period: str | None
@@ -86,6 +87,7 @@ class DocumentUnitV1(PublicModel):
     security_code: str | None
     exchange: str | None
     filing_type: str | None
+    disclosure_topics: list[str] | None
     report_period: str | None
     announcement_date: date | None
     producer_action_ref: str

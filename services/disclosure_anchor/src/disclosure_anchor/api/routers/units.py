@@ -68,6 +68,7 @@ UNIT_COLUMNS = (
     "security_code",
     "exchange",
     "filing_type",
+    "disclosure_topics",
     "report_period",
     "announcement_date",
     "producer_action_ref",

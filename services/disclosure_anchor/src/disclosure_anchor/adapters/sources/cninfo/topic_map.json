@@ -1,0 +1,32 @@
+{
+  "version": "2026-07-r1",
+  "_about": "F006V 分类码前缀 → disclosure_topic（filing_type 之上的第二级分类，round9 用户裁决：两三级分类合理，默认监控参数按 topic 可调）。来源：p_info3005 全量字典（2135 类）+ Codex round9 调研的关键类清单。一个公告可命中多个 topic。web 兜底通道无 F006V，topics 为空。",
+  "topics": {
+    "dividend": ["011301", "0113"],
+    "equity_share_change": ["011501", "011513", "351501", "250744", "35150"],
+    "equity_incentive": ["012325", "352325", "250752"],
+    "restructuring_assets": ["01012405", "01012505", "01012603", "01012703", "011503", "011505", "011701", "011703"],
+    "major_contract": ["012327", "352327", "N004007"],
+    "guarantee": ["011711"],
+    "inquiry_regulatory": ["015107", "2407", "2420", "24", "35239947"],
+    "risk_alert": ["0121"],
+    "investor_communication": ["0120", "012001", "012003"],
+    "meeting_resolution": ["0119", "01010507", "N003001", "N003002", "01239901"],
+    "governance_rules": ["012303", "012309", "0123", "35232"],
+    "financing": ["0107", "0109", "0111", "011507"]
+  },
+  "_topic_names": {
+    "dividend": "权益分派/分红",
+    "equity_share_change": "持股变动/增减持/回购",
+    "equity_incentive": "股权激励/员工持股",
+    "restructuring_assets": "重组/收购/出售资产/债务重组",
+    "major_contract": "重大合同/中标",
+    "guarantee": "担保",
+    "inquiry_regulatory": "问询/监管函件",
+    "risk_alert": "澄清/风险提示/业绩预告事项",
+    "investor_communication": "投资者关系/调研/说明会",
+    "meeting_resolution": "股东大会/董事会/监事会决议",
+    "governance_rules": "治理制度/董监高变动",
+    "financing": "增发/配股/可转债等融资"
+  }
+}

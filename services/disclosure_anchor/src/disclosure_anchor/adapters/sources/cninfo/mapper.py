@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from datetime import date, datetime
 import json
 from importlib import resources
@@ -143,6 +144,38 @@ def derive_report_period(title: str, *, filing_type: str) -> str | None:
 
 def split_category_segments(raw_category: str) -> list[str]:
     return [segment.strip() for segment in raw_category.split("||") if segment.strip()]
+
+
+@lru_cache(maxsize=1)
+def _topic_prefixes() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    payload = json.loads(
+        resources.files("disclosure_anchor.adapters.sources.cninfo")
+        .joinpath("topic_map.json")
+        .read_text(encoding="utf-8")
+    )
+    return tuple(
+        (topic, tuple(str(p) for p in prefixes))
+        for topic, prefixes in payload["topics"].items()
+    )
+
+
+def topics_for_category(raw_category: str | None) -> list[str] | None:
+    """Map F006V segments to disclosure_topics (round9 second-level buckets).
+
+    Multiple topics per announcement are normal; None when no segment matches
+    or the channel carries no categories (web fallback).
+    """
+
+    if not raw_category:
+        return None
+    segments = split_category_segments(raw_category)
+    topics = {
+        topic
+        for topic, prefixes in _topic_prefixes()
+        for segment in segments
+        if any(segment.startswith(prefix) for prefix in prefixes)
+    }
+    return sorted(topics) or None
 
 
 def category_prefix_matches(raw_category: str, categories: Sequence[str] | None) -> bool:

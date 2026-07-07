@@ -40,6 +40,7 @@ DOCUMENT_COLUMNS = (
     "security_code",
     "exchange",
     "filing_type",
+    "disclosure_topics",
     "title",
     "announcement_date",
     "report_period",

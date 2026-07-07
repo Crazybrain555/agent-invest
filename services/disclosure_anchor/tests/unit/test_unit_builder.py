@@ -24,7 +24,7 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-11")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-12")
         self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v5")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
@@ -283,7 +283,8 @@ class UnitBuilderTests(unittest.TestCase):
         # Rule keys and note-vocabulary keys coexist on the unit.
         self.assertEqual(
             section.semantic_keys,
-            ["inventory", "inventory_breakdown", "revenue_and_cost", "revenue_breakdown"],
+            ["inventory", "inventory_breakdown", "main_business_analysis",
+             "revenue_and_cost", "revenue_breakdown"],
         )
 
     def test_collapsed_document_title_uses_registry_title(self) -> None:

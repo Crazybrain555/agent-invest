@@ -76,9 +76,9 @@ class WorkerConfig:
     initial_lookback_days: int = 1095
     # Backpressure cap for the pending-download queue; 0 disables deferral.
     backfill_max_pending_downloads: int = 2000
-    # None → parse everything; a prefix tuple → 'other' docs need a matching
-    # F006V category segment (parse scope 'core').
-    parse_scope_category_prefixes: tuple[str, ...] | None = None
+    # None → parse everything; a topic tuple → 'other' docs need a matching
+    # disclosure_topic (parse scope 'core', round9).
+    parse_scope_topics: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -328,7 +328,7 @@ def _parse_stage(
             conn,
             max_retries=deps.config.max_parse_retries,
             limit=limit,
-            scope_category_prefixes=deps.config.parse_scope_category_prefixes,
+            scope_topics=deps.config.parse_scope_topics,
         )
     parse_use_case = ParseDocument(
         parser=deps.parser_factory(),

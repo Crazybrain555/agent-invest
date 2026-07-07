@@ -98,6 +98,9 @@ class Document:
     provider: Optional[str] = None
     provider_document_id: Optional[str] = None
     filing_type: Optional[str] = None
+    # Second-level classification derived from F006V category codes
+    # (topic_map.json); filing_type stays the coarse contract bucket.
+    disclosure_topics: Optional[list[str]] = None
     announcement_date: Optional[date] = None
     report_period: Optional[str] = None
     raw_file_relpath: Optional[str] = None
