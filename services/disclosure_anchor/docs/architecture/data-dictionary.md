@@ -72,7 +72,7 @@ security_id PK；company_id FK；security_code+exchange 定位（exchange 全大
 | run_kind | parse / rebuild_units（复用解析产物只重切，5 秒级） |
 | status | running / succeeded / failed；stale running 由 worker 按阈值回收 |
 | is_active | 每文档唯一 true（发布原子切换） |
-| builder_rules_version | 恒等于 rules.RULES_VERSION（当前 ub-2026.07-15）；单一代=同版本 |
+| builder_rules_version | 恒等于 rules.RULES_VERSION（当前 ub-2026.07-17）；单一代=同版本 |
 | content_hash_aggregate / structure_hash | run 级聚合（U3）；"内容没变"只看前者 |
 | parser_* / *_relpath / artifact_hash | 解析出处与产物引用（相对路径） |
 | unit_build_status/attempt_count/error | 构建生命周期；error 为结构化 {stage,error_code,retryable} |
