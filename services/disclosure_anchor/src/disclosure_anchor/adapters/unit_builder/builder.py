@@ -883,8 +883,11 @@ def _proposal_anchor(
     if unit.payload_kind == "text" and "text" in unit.payload:
         lines = str(unit.payload["text"]).splitlines()
         if lines and rules.match_proposal_anchor(lines[0].strip()):
-            title = lines[0].strip()
-            remainder = "\n".join(lines[1:]).strip()
+            title, same_line_remainder = _split_proposal_anchor_title(lines[0])
+            remainder_lines = lines[1:]
+            if same_line_remainder:
+                remainder_lines = [same_line_remainder, *remainder_lines]
+            remainder = "\n".join(remainder_lines).strip()
             members: list[UnitDraft] = []
             if remainder:
                 members.append(
@@ -895,16 +898,31 @@ def _proposal_anchor(
         caption = unit.payload.get("caption") or []
         first = str(caption[0]).strip() if caption else ""
         if first and rules.match_proposal_anchor(first):
+            title, _ = _split_proposal_anchor_title(first)
             return (
                 "table_caption",
-                first,
+                title,
                 _strip_anchor_suffix(unit.heading_path),
                 [unit],
             )
     path = unit.heading_path
     if path and rules.match_proposal_anchor(path[-1].strip()):
-        return ("heading", path[-1].strip(), _strip_anchor_suffix(path), [unit])
+        title, _ = _split_proposal_anchor_title(path[-1])
+        return ("heading", title, _strip_anchor_suffix(path), [unit])
     return None
+
+
+_PROPOSAL_TITLE_TRAILING_RE = re.compile(
+    r"\s*(?P<tail>(?:审议结果|表决情况)\s*[：:].*)$"
+)
+
+
+def _split_proposal_anchor_title(line: str) -> tuple[str, str]:
+    stripped = line.strip()
+    match = _PROPOSAL_TITLE_TRAILING_RE.search(stripped)
+    if match is None:
+        return stripped, ""
+    return stripped[: match.start()].rstrip(), match.group("tail").strip()
 
 
 def _strip_anchor_suffix(path: list[str]) -> list[str]:
@@ -1554,6 +1572,14 @@ def _column_count(element: PreparedElement) -> int | None:
 def _can_merge_continued_table(previous: PreparedElement, current: PreparedElement) -> bool:
     if current.table_caption:
         return False
+    # A page-spillover continuation never crosses a section boundary. Note
+    # tables share one shape (项目/本期/上期), so column count alone merged
+    # adjacent DIFFERENT notes once cn_a_v6 let their headings enter the
+    # stack (no text element left between the tables) — 3. 销售费用's table
+    # was absorbed into 1. 营业收入 and the heading vanished from every path
+    # (ub-2026.07-18, swallowed-heading audit).
+    if list(previous.heading_path) != list(current.heading_path):
+        return False
     previous_count = _column_count(previous)
     current_count = _column_count(current)
     return previous_count is not None and previous_count == current_count
@@ -1678,6 +1704,12 @@ def _matching_skip_title(unit: UnitDraft) -> str | None:
 
 def _table_payload_is_empty(payload: dict[str, Any]) -> bool:
     if str(payload.get("raw_html") or "").strip():
+        return False
+    # A header-skeleton table (headers, zero data rows) is original content:
+    # 分部信息-class sections disclose an empty template, and dropping the
+    # unit swallowed the whole heading branch from every path
+    # (ub-2026.07-18 swallowed-heading audit).
+    if any(str(cell).strip() for cell in payload.get("headers") or []):
         return False
     rows = payload.get("rows") or []
     if not rows:

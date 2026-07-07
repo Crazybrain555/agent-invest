@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-17"
+RULES_VERSION = "ub-2026.07-18"
 HEADING_RULESET_ID = "cn_a_v6"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -271,8 +271,8 @@ HEADING_PATTERNS: tuple[tuple[int, re.Pattern[str]], ...] = (
     (6, re.compile(r"^（\d{1,3}）|^\(\d{1,3}\)|^\d{1,3}[)）]")),
     (7, re.compile(r"^[①②③④⑤⑥⑦⑧⑨⑩]")),
 )
-FIXED_L1_TITLES = {"重要提示", "释义", "目录", "备查文件"}
-SKIP_SECTION_TITLES = {"释义", "目录", "备查文件"}
+FIXED_L1_TITLES = {"重要提示", "释义", "目录", "备查文件", "备查文件目录"}
+SKIP_SECTION_TITLES = {"释义", "目录", "备查文件", "备查文件目录"}
 
 QUESTION_START_RE = re.compile(
     r"^\s*(问题|问|Q\d*|投资者提问|提问)\s*\d*\s*[：:]"

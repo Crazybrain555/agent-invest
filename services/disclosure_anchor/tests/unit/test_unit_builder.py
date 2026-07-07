@@ -9,6 +9,7 @@ from disclosure_anchor.adapters.unit_builder.builder import (
     BuildStats,
     PreparedElement,
     UnitDraft,
+    _proposal_anchor,
     build_unit_drafts_s1_s7,
     replace_text_units_with_qa_where_stable,
     s1_preprocess_elements,
@@ -24,9 +25,11 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-17")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-18")
         self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v6")
-        self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
+        self.assertEqual(
+            rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件", "备查文件目录"}
+        )
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
 
     def test_s1_drops_furniture_and_separator_but_records_stats(self) -> None:
@@ -557,16 +560,60 @@ class UnitBuilderTests(unittest.TestCase):
                     {"kind": "table", "raw_kind": "table", "order_index": 3,
                      "table": {"headers": ["同意"], "rows": [["99%"]]}},
                     {"kind": "table", "raw_kind": "table", "order_index": 4,
-                     "table_caption": ["8. 议案名称：关于选举监事的议案"],
+                     "table_caption": ["8. 议案名称：关于选举监事的议案审议结果：通过"],
                      "table": {"headers": ["同意"], "rows": [["98%"]]}},
                 ]
             },
             filing_type="other",
         )
 
-        titles = [u.title for u in units if u.payload_kind == "mixed"]
+        proposals = [u for u in units if u.payload_kind == "mixed"]
+        titles = [u.title for u in proposals]
         self.assertIn("7. 议案名称：关于选举董事的议案", titles)
         self.assertIn("8. 议案名称：关于选举监事的议案", titles)
+        self.assertNotIn("8. 议案名称：关于选举监事的议案审议结果：通过", titles)
+        self.assertEqual(
+            [proposal.heading_path for proposal in proposals],
+            [["二、议案审议情况"], ["二、议案审议情况"]],
+        )
+
+    def test_text_proposal_anchor_splits_same_line_result_from_title(self) -> None:
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {"kind": "heading", "raw_kind": "text", "order_index": 1,
+                     "heading_level": 1, "text": "二、议案审议情况"},
+                    {"kind": "text", "raw_kind": "text", "order_index": 2,
+                     "text": "8. 议案名称：关于选举监事的议案审议结果：通过\n表决情况："},
+                    {"kind": "table", "raw_kind": "table", "order_index": 3,
+                     "table": {"headers": ["同意"], "rows": [["98%"]]}},
+                ]
+            },
+            filing_type="other",
+        )
+
+        proposal = next(u for u in units if u.payload_kind == "mixed")
+        self.assertEqual(proposal.title, "8. 议案名称：关于选举监事的议案")
+        self.assertEqual(proposal.heading_path, ["二、议案审议情况"])
+        self.assertEqual(proposal.payload["parts"][0]["text"], "审议结果：通过\n表决情况：")
+
+    def test_proposal_anchor_preserves_existing_body_blank_lines(self) -> None:
+        anchor = _proposal_anchor(
+            UnitDraft(
+                payload_kind="text",
+                payload={
+                    "text": "8. 议案名称：关于选举监事的议案审议结果：通过\n\n表决情况："
+                },
+                source_order=1,
+                heading_path=["二、议案审议情况"],
+            )
+        )
+
+        self.assertIsNotNone(anchor)
+        _, title, parent_path, members = anchor
+        self.assertEqual(title, "8. 议案名称：关于选举监事的议案")
+        self.assertEqual(parent_path, ["二、议案审议情况"])
+        self.assertEqual(members[0].payload["text"], "审议结果：通过\n\n表决情况：")
 
     def test_flat_document_units_anchor_under_document_title(self) -> None:
         # Codex round7 美的 IR: form-table filings have no headings at all —
@@ -1067,6 +1114,39 @@ class UnitBuilderTests(unittest.TestCase):
         self.assertEqual(units[0].artifact_locator["page_span"], [10, 11])
         self.assertEqual(stats.dropped_by_kind["table_empty"], 1)
         self.assertEqual(stats.merged_tables, 1)
+
+    def test_s5_never_merges_tables_across_section_boundary(self) -> None:
+        # Audit-report expense notes share one 3-column shape; once cn_a_v6
+        # let their headings enter the stack, the tables became adjacent and
+        # column count alone merged 3. 销售费用 into 1. 营业收入 — the heading
+        # vanished from every path (ub-2026.07-18 swallowed-heading audit).
+        stats = BuildStats()
+        base = ["财务报表附注", "五、合并财务报表项目注释", "(二) 合并利润表项目注释"]
+        elements = [
+            PreparedElement(
+                kind="table",
+                order_index=1,
+                page_no=20,
+                table={"headers": ["项目", "本期", "上期"], "rows": [["工资", "1", "2"]]},
+                heading_path=[*base, "3. 销售费用"],
+                title="3. 销售费用",
+            ),
+            PreparedElement(
+                kind="table",
+                order_index=2,
+                page_no=20,
+                table={"headers": ["项目", "本期", "上期"], "rows": [["折旧", "3", "4"]]},
+                heading_path=[*base, "4. 管理费用"],
+                title="4. 管理费用",
+            ),
+        ]
+
+        units = s5_build_table_units(elements, stats)
+
+        self.assertEqual(len(units), 2)
+        self.assertEqual(units[0].title, "3. 销售费用")
+        self.assertEqual(units[1].title, "4. 管理费用")
+        self.assertEqual(stats.merged_tables, 0)
 
     def test_s5_table_parse_failed_uses_raw_html_payload(self) -> None:
         stats = BuildStats()

@@ -80,6 +80,16 @@ WHERE is_active_run AND title ~ '^\d{1,3}[.．](?!\d)'
 -- 过碎审计：filing_type='other' 且 units>=10 且总字数<8000 的文档需逐一给理由
 -- 过粗审计：单 unit chars>15000 的抽查其 parts 是否同主题
 ```
+标题吞没对账环（round15 制度化——**DB 内类扫描看不见"从未入库"的丢失**，
+本环是唯一能系统抓住该类的手段）：
+`PYTHONPATH=src .venv/bin/python scripts/audit_heading_coverage.py`
+——逐文档核对 IR 里每个 heading 元素必须出现在单元的 title/heading_path/
+parts.local_heading/parts.heading_path/正文行之一；自动分类扉页标题行与空节
+（信息性）。预期残余=1（江海年报"（1）在子公司所有者权益份额…"模板反转，
+见 §4）；新增 SWALLOWED 即为切分 bug。round15 用它抓出两个真 bug：
+S5 续表合并只看列数（cn_a_v6 后同构附注表跨科目误并，3. 销售费用类标题
+全域蒸发）与 S6 把 headers-only 表判空丢弃（分部信息类整支路径蒸发）。
+
 变体发现环（业界定式：C4/eDiscovery 频率法，round11 调研落地）：
 `PYTHONPATH=src .venv/bin/python scripts/audit_boilerplate_candidates.py`
 ——跨文档高频短行且未被现有模式族覆盖的 = 候选新套话变体，人工确认后
@@ -108,6 +118,16 @@ WHERE is_active_run AND title ~ '^\d{1,3}[.．](?!\d)'
   （LIMIT/日期排序）必须对积压免疫。
 
 ## 4. 已知接受项（不要重复开 finding）
+
+- 标题对账环接受类（round15）：①文内扉页标题行（首个编号标题之前的封面标题，
+  document.title 已承载，脚本自动归类）；②空节（标题至下一标题间无有效内容，
+  42 处，脚本自动归类为 empty sections——含 12、应收票据等零余额附注槽位）；
+  ③江海年报"（1）在子公司所有者权益份额发生变化的情况说明"：模板反转
+  （（1）包裹层在 1. 子项之上，与 cn_a_v6 主流约定相反），内容完整锚定在
+  近同名兄弟"1. 在子公司的所有者权益份额发生变化的情况说明"下，检索零损失；
+  确定性管线不同时支持两种嵌套方向，接受。
+- headers-only 表（表头非空、数据行全空）自 ub-2026.07-18 起**保留**为 table
+  单元——表头是原文内容且承载标题路径（分部信息类）；不要报"空表未剔"。
 
 - 同主题大 mixed 单元（主营业务分析 25 parts）——用户裁决可接受。
 - 一句话完整附注（2、会计期间 /「详见附注 X」式转指引）——原子事实，独立保留
