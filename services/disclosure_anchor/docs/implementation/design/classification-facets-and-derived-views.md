@@ -80,7 +80,11 @@ created_at: 2026-07-07
 | publisher_categories | jsonb 数组 | `[{"code":"01010503","name":"上市公司董事会"}]`；律所公告为 `[{"code":"01010901","name":"律师事务所"}]` |
 | market | text（0..1） | `"深市公司公告"` / `"沪市主板公告"` / NULL（IR 记录无市场码） |
 | content_categories | jsonb 数组（≥1） | 年报：`[{"code":"010301","name":"年度报告"}]`；激励解禁：`[{"code":"011307","name":"限制出售股份上市"},{"code":"012325","name":"股权激励"}]` |
-| content_branches | jsonb 数组 | 内容码的巨潮二层支**原名**（树上爬祖先即得，零词表维护）：`["定期报告"]`、`["权益分派与限制出售股份上市","其它重大事项"]`——想按巨潮原分类查就用这列 |
+
+**裁定：不加 content_branches 列**（2026-07-08 评估）。巨潮原样分类已由
+document_categories_v1 完整承载（每文档每码一行，含 category_name 与
+parent_category_code，可按树任意钻取）——再加一列 = 同一信息第三个载体，
+恰恰复刻"分不清哪列是谁的分类"的混乱。替代保障是质量环（见 §4）。
 | filing_type | text（现算优先） | `COALESCE(规则表按 priority 首命中, d.filing_type)`——API 通道永远跟随当前词表，web 通道回落注册值 |
 | disclosure_topics | jsonb 数组（现算） | `["equity_incentive","equity_share_change"]` |
 
@@ -122,6 +126,10 @@ pending_parse 的 scope 判定从 `d.disclosure_topics ?| :core_topics` 改为�
   14 → ~25：+清盘退市、供股/公开发售、关连交易细分、盈利警告、
   股份合并拆细、主要交易/须予披露交易分级等），每键带 std_refs；
   扩容后 parse_scope 白名单同步复核。
+- **规则质量环（替代暴露原样 30 类）**：未映射内容码审计——语料中出现、
+  既不命中 filing_type 规则也不命中 topic 规则的内容维码 = 候选缺口，
+  列出码+巨潮名+文档数供人工晋级（同套话/标题吞没发现环模式）；进
+  评审指南 §2 每轮必跑。词表升版即全库生效（视图现算），无存量残留。
 - 事件语义零影响：两级分类都不进任何 hash（0014 时已如此），改现算不触发
   materialized 事件。
 
