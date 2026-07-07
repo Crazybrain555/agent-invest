@@ -36,6 +36,14 @@ created_at: 2026-07-07
 结论：粗桶（单值枚举）+ 多值内容标签的双层是行业通行形态；差别只在物化位置。
 本方案把两层全部下沉到视图现算，表里只留事实。
 
+**用户裁决（2026-07-08，港股+A股双市场）**：
+1. topic 词表**按 HKEX Tier 2（上市规则 Appendix 24）为锚扩容**——它是离
+   A 股最近的官方两级体系，且用户做港股，未来 HKEX 通道的 Tier 2 可直接映射
+   进同一套 topics；A 股特色类（问询回复等）保留自定键。
+2. 每个 topic/event 键挂 `std_refs` 交叉引用（caev / hkex_t2 / sec），
+   **只放词表 JSON 文件**，不进库表不进契约。
+3. L2 契约暴露 CAEV 列：暂缓（视图加列便宜，有跨市场需求再加）。
+
 ## 3. 目标 schema（迁移 0016）
 
 ### 3.1 新表 disclosure_core.classification_rule（词表的库内加载副本）
@@ -50,6 +58,10 @@ created_at: 2026-07-07
 
 - 真源仍是仓内 versioned JSON（filing_type_map.json / topic_map.json /
   新增 facet_map.json）；`make load-rules` = 事务内 TRUNCATE+INSERT。
+- **watchlist.csv 的 filing_categories 列改收 topic 键**（如
+  `dividend;major_contract`），经规则表解析为 F006V 前缀集下推同步过滤；
+  原始 F006V 前缀仍兼容（运维友好：人记得住 topic 键，记不住码）。
+  全量登记默认不变（round9 裁决）；按公司收窄是运营者选项。
 - doctor 增加校验：库内 version == 文件 version（漂移报警）。
 - **词表升版 = 改文件 + make load-rules，全库分类即刻生效**；
   scripts/reclassify_documents.py 删除（补偿工具不再需要）。
@@ -105,6 +117,10 @@ pending_parse 的 scope 判定从 `d.disclosure_topics ?| :core_topics` 改为�
 - **filing_type 双来源**必须写进数据字典：视图值 = 码派生优先、注册值兜底；
   document 表列 ≠ 视图列（表列仅兜底语义）。
 - 不给主体/市场维做白名单策略（纯事实透传）；解析范围策略仍只挂内容维。
+- 词表扩容（r3，与 0016 同批）：以 HKEX Tier 2 为锚补齐 topics（预计
+  14 → ~25：+清盘退市、供股/公开发售、关连交易细分、盈利警告、
+  股份合并拆细、主要交易/须予披露交易分级等），每键带 std_refs；
+  扩容后 parse_scope 白名单同步复核。
 - 事件语义零影响：两级分类都不进任何 hash（0014 时已如此），改现算不触发
   materialized 事件。
 
