@@ -86,6 +86,17 @@ document_categories_v1 完整承载（每文档每码一行，含 category_name 
 parent_category_code，可按树任意钻取）——再加一列 = 同一信息第三个载体，
 恰恰复刻"分不清哪列是谁的分类"的混乱。替代保障是质量环（见 §4）。
 | filing_type | text（现算优先） | `COALESCE(规则表按 priority 首命中, d.filing_type)`——API 通道永远跟随当前词表，web 通道回落注册值 |
+
+**filing_type 词表扩桶（2026-07-08 定案，回应"92% other 无意义"）**：
+单值主分类词表从 9 值扩到与 topics 同源（HKEX 锚定 ~25 类），取**最高优先
+内容码命中**：定期报告/业绩类 > 重组 > 激励 > 股份变动 > 分红 > 重大合同 >
+关联交易 > 问询监管 > 风险提示 > 融资 > IR > 决议 > 中介报告 > 治理制度 >
+other。全库 91 份实测模拟：other 92% → **0%**（governance_rules 32、
+equity_incentive 17、meeting_resolution 13、intermediary_report 7、
+dividend 5…）。与 disclosure_topics 的分工 = SEC form type 之于 8-K items：
+**单值主分类管 GROUP BY/看板/简单过滤，多值 topics 管检索**（激励解禁公告
+primary=equity_incentive，topics 同时含 equity_share_change）。
+L2 前向兼容规则写进契约说明：未知枚举值按 other 消费。
 | disclosure_topics | jsonb 数组（现算） | `["equity_incentive","equity_share_change"]` |
 
 实现骨架（documents_v1 内）：
