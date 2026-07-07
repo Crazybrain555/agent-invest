@@ -33,6 +33,13 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
 - [x] **[major]** PENDING_LEGAL_NAME placeholder companies poison the first credentialed sync — bl → resolver 占位名就地升级，真名冲突仍 contested（回归测试）
 - [x] **[minor]** Live CNINFO credentials sit in the working-tree .env under a header claiming it  → 同上（凭据迁出+轮换提示）
 
+## 设计评审文档（2026-07-07 round8 后，先设计后实施）
+
+- `docs/implementation/design/watchlist-operations.md` — 股票池运维（CSV 真源判定、
+  对账式 apply、回补批次、429 熔断、cursor 审计字段）
+- `docs/implementation/design/retrieval-and-semantic-keys.md` — 非 embedding 检索
+  数据面（06R 投影草案、semantic_key 附注词表 ~80-90 键方案）
+
 ## 待办背账（按严重度）
 
 
