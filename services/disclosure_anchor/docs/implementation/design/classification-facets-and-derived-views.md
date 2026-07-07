@@ -50,11 +50,18 @@ created_at: 2026-07-07
 
 | 列 | 类型 | 说明 |
 |---|---|---|
-| rule_set | vc16 | 'filing_type' / 'topic' / 'facet' |
-| prefix | vc16 | F006V 码前缀（'0103'、'011513'、'010112'…） |
+| rule_set | vc16 | **'class' / 'facet' 两种**（2026-07-08 定案：filing_type 无独立规则行） |
+| prefix | vc16 | F006V 码前缀（'010301'、'0113'、'010112'…） |
 | value | vc32 | 'annual_report' / 'dividend' / 'market'… |
-| priority | int | filing_type 单值取最高优先命中；facet 长前缀优先 |
+| priority | int | class 行=该类在主分类阶梯的档位（同类各前缀行同值，loader 从词表校验）；facet 行=长前缀优先 |
 | version | vc16 | 与源 JSON 词表版本一致（整表同版本） |
+
+**单一映射、两种输出**（回应"filing_type 和 topic 是不是一样的"——是同一张映射）：
+`disclosure_topics` = 文档全部 class 命中的**集合**；`filing_type` = 同一命中集里
+**priority 最高的那一个**（argmax）。定期报告/业绩类也进同一张 map——
+年报 topics=["annual_report"]，"定期报告 topics 为 NULL"的特例消失，
+topics 成为完备分类（NULL 仅剩无码通道）。词表 JSON 形态：
+`"dividend": {"prefixes":["0113"], "priority":60, "std_refs":{...}}`。
 
 - 真源仍是仓内 versioned JSON（filing_type_map.json / topic_map.json /
   新增 facet_map.json）；`make load-rules` = 事务内 TRUNCATE+INSERT。
@@ -88,10 +95,17 @@ parent_category_code，可按树任意钻取）——再加一列 = 同一信息
 | filing_type | text（现算优先） | `COALESCE(规则表按 priority 首命中, d.filing_type)`——API 通道永远跟随当前词表，web 通道回落注册值 |
 
 **filing_type 词表扩桶（2026-07-08 定案，回应"92% other 无意义"）**：
-单值主分类词表从 9 值扩到与 topics 同源（HKEX 锚定 ~25 类），取**最高优先
-内容码命中**：定期报告/业绩类 > 重组 > 激励 > 股份变动 > 分红 > 重大合同 >
-关联交易 > 问询监管 > 风险提示 > 融资 > IR > 决议 > 中介报告 > 治理制度 >
-other。全库 91 份实测模拟：other 92% → **0%**（governance_rules 32、
+单值主分类 = 同一 class 映射按 priority 取 argmax。优先级不是口味，是
+**三层原则**（无公认标准可抄——SEC 靠表单结构天然单值、HKEX 多选不定主次、
+东财/RavenPack 规则不公开——故显式建阶梯并写进 versioned 词表）：
+1. 日历/法定周期类（定期报告、业绩预告/快报）——身份无歧义，最高档；
+2. 实质事件类（重组>激励>股份变动>分红>合同>关联>问询>风险>融资>IR）——
+   按重大性，锚定交易所上市规则重大性章节与 8-K item 结构的共同取向；
+3. 程序载体类（决议、中介报告、治理制度）——载体永远让位于内容
+   （激励方案经董事会决议发布，内容是激励不是决议）。
+实测影响面：91 份中仅 4 份存在 ≥2 实质类命中（全为激励公告，argmax 给出
+equity_incentive 与人工判断一致）；层内微调顺序影响 <5% 文档，且落选类
+仍在 topics 集合里不丢失。全库 91 份实测模拟：other 92% → **0%**（governance_rules 32、
 equity_incentive 17、meeting_resolution 13、intermediary_report 7、
 dividend 5…）。与 disclosure_topics 的分工 = SEC form type 之于 8-K items：
 **单值主分类管 GROUP BY/看板/简单过滤，多值 topics 管检索**（激励解禁公告
