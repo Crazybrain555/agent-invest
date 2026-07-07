@@ -80,6 +80,7 @@ created_at: 2026-07-07
 | publisher_categories | jsonb 数组 | `[{"code":"01010503","name":"上市公司董事会"}]`；律所公告为 `[{"code":"01010901","name":"律师事务所"}]` |
 | market | text（0..1） | `"深市公司公告"` / `"沪市主板公告"` / NULL（IR 记录无市场码） |
 | content_categories | jsonb 数组（≥1） | 年报：`[{"code":"010301","name":"年度报告"}]`；激励解禁：`[{"code":"011307","name":"限制出售股份上市"},{"code":"012325","name":"股权激励"}]` |
+| content_branches | jsonb 数组 | 内容码的巨潮二层支**原名**（树上爬祖先即得，零词表维护）：`["定期报告"]`、`["权益分派与限制出售股份上市","其它重大事项"]`——想按巨潮原分类查就用这列 |
 | filing_type | text（现算优先） | `COALESCE(规则表按 priority 首命中, d.filing_type)`——API 通道永远跟随当前词表，web 通道回落注册值 |
 | disclosure_topics | jsonb 数组（现算） | `["equity_incentive","equity_share_change"]` |
 
