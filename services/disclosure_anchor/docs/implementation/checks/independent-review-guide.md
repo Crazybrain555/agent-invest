@@ -70,6 +70,13 @@ SELECT count(*) FROM disclosure_public.document_units_v1 WHERE is_active_run AND
 -- 声明残留（单位/保证/适用 三族）
 SELECT count(*) FROM disclosure_public.document_units_v1
 WHERE is_active_run AND payload->>'text' ~ '单位(均)?[为是]?[：:]\S{1,12}$';
+-- 附注子项失怙（cn_a_v6 驱逐 bug 回归探测）：点号子项直挂 、号章级（3 层且
+-- 尾项=title）= 科目父级被吞的签名，判读清单（当前正本语料为 0；宽式
+-- 「无 \d、祖先」不可作门——决议议案/审计报告科目层合法直用点号）
+SELECT provider_document_id, title, heading_path FROM disclosure_public.document_units_v1
+WHERE is_active_run AND title ~ '^\d{1,3}[.．](?!\d)'
+  AND jsonb_array_length(heading_path) = 3
+  AND heading_path->>1 ~ '^[一二三四五六七八九十]+、' AND heading_path->>2 = title;
 -- 过碎审计：filing_type='other' 且 units>=10 且总字数<8000 的文档需逐一给理由
 -- 过粗审计：单 unit chars>15000 的抽查其 parts 是否同主题
 ```
@@ -103,7 +110,11 @@ WHERE is_active_run AND payload->>'text' ~ '单位(均)?[为是]?[：:]\S{1,12}$
 ## 4. 已知接受项（不要重复开 finding）
 
 - 同主题大 mixed 单元（主营业务分析 25 parts）——用户裁决可接受。
-- 会计政策一句话叶子单元——原子事实，保留（round10 决定；异议再议）。
+- 一句话完整附注（2、会计期间 /「详见附注 X」式转指引）——原子事实，独立保留
+  （round10 决定，round14 系统分析确认：合并要发明阈值且破坏锚定粒度/跨公司槽位对齐，
+  没有赢的维度）。一句话**子项**（发出存货计价方法等）不属此类——cn_a_v6 修复
+  科目标题驱逐 bug 后，它们由既有 section 分组自然归进科目 mixed 单元（parts 带
+  local_heading，引用粒度不丢）；再出现失怙孤儿子项按 §2 跳级探测处理。
 - "详见附注 X"交叉引用单元——真实内容，保留。
 - 金融工具风险节内部 1、/(一) 层级倒置的次级归属（不窜根即可）。
 - web 兜底通道 disclosure_topics=null（接口无 F006V）。

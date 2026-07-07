@@ -114,7 +114,7 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 | 文件 | 内容 | 当前版本 |
 |---|---|---|
-| adapters/unit_builder/rules.py | 切分/噪声/声明组合文法/语义规则 | RULES_VERSION ub-2026.07-16 |
+| adapters/unit_builder/rules.py | 切分/噪声/声明组合文法/语义规则 | RULES_VERSION ub-2026.07-17 |
 | adapters/unit_builder/note_key_map.json | 章节词表 **144 键**（section facet；祖先继承+全类型开放） | 2026-07-r4 |
 | adapters/unit_builder/event_key_map.json | 事件键 **30 键**（DuEE-fin/CCKS/FewFC/CFinDEE 并集，标题派生） | 2026-07-r1 |
 | adapters/sources/cninfo/filing_type_map.json | F006V→filing_type 9 桶 | 2026-07-r3 |

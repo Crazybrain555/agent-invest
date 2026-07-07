@@ -9,8 +9,8 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-16"
-HEADING_RULESET_ID = "cn_a_v5"
+RULES_VERSION = "ub-2026.07-17"
+HEADING_RULESET_ID = "cn_a_v6"
 GIBBERISH_RATIO_MAX = 0.30
 
 # A-share applicability declaration lines ("√适用 □不适用" / "□适用 √不适用").
@@ -246,7 +246,7 @@ BOILERPLATE_GUARANTEE_RE = re.compile(
     r"(?:真实|虚假记载)[^。]{0,80}?(?:重大遗漏|连带责任|法律责任)[。.]?\s*$"
 )
 
-# Canonical CN filing hierarchy: 节/章 > 一、 > （一） > 1、 > （1） > ①.
+# Canonical CN filing hierarchy: 节/章 > 一、 > （一） > 1、 > 1. > （1） > ①.
 # Both full-width and half-width parens per level: MinerU flattens audit-note
 # headings to heading_level=2, so an unmatched "(1) 明细情况" used to enter at
 # level 2 and evict its 科目 parent from the stack (Codex round4 P1#2).
@@ -255,13 +255,21 @@ BOILERPLATE_GUARANTEE_RE = re.compile(
 # 1、-level topics as children (round3 P1#11 drift; observed merging 研发投入
 # into （8）客户/供应商 on the real 江海 annual). Levels beyond the depth-4
 # heading_path cap simply stay in the unit text — that is the desired shape.
+# cn_a_v6 (round14): 顿号-numbered (17、存货) and dot/space-numbered
+# (1. 存货的分类) arabic headings are DIFFERENT levels — CSRC annual-report
+# notes use 、 for 科目 headings and . for sub-items within one note. One
+# shared level made every first sub-item evict its 科目 parent from the
+# stack, so 存货/长期股权投资-class intermediates vanished from children's
+# heading_path (observed corpus-wide on the 江海 annual). The dot class
+# carries (?!\d) so decimal amounts (1.5亿元…) never read as headings.
 HEADING_PATTERNS: tuple[tuple[int, re.Pattern[str]], ...] = (
     (1, re.compile(r"^第[一二三四五六七八九十百]+[节章]")),
     (2, re.compile(r"^[一二三四五六七八九十]+、")),
     (3, re.compile(r"^（[一二三四五六七八九十]+）|^\([一二三四五六七八九十]+\)")),
-    (4, re.compile(r"^\d{1,3}([.、．]|\s)")),
-    (5, re.compile(r"^（\d{1,3}）|^\(\d{1,3}\)|^\d{1,3}[)）]")),
-    (6, re.compile(r"^[①②③④⑤⑥⑦⑧⑨⑩]")),
+    (4, re.compile(r"^\d{1,3}、")),
+    (5, re.compile(r"^\d{1,3}(?:[.．](?!\d)|\s)")),
+    (6, re.compile(r"^（\d{1,3}）|^\(\d{1,3}\)|^\d{1,3}[)）]")),
+    (7, re.compile(r"^[①②③④⑤⑥⑦⑧⑨⑩]")),
 )
 FIXED_L1_TITLES = {"重要提示", "释义", "目录", "备查文件"}
 SKIP_SECTION_TITLES = {"释义", "目录", "备查文件"}

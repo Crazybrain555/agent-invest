@@ -24,8 +24,8 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-16")
-        self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v5")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-17")
+        self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v6")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
 
@@ -374,6 +374,92 @@ class UnitBuilderTests(unittest.TestCase):
             market.heading_path,
             ["第八节 财务报告", "十二、与金融工具相关的风险", "三、（市场风险）"],
         )
+
+    def test_s2_dot_subitem_nests_under_dunhao_note_heading(self) -> None:
+        # cn_a_v6 (round14): 、-numbered 科目 headings and .-numbered sub-items
+        # are different levels. On the real 江海 annual, "1. 存货的分类" used to
+        # evict "17、存货" from the stack, so every 存货 policy sub-item lost its
+        # 科目 ancestor from heading_path (text-kind and heading-kind alike:
+        # MinerU tags "1. 共同控制、重大影响的判断" as heading_level=2).
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(kind="heading", order_index=1, heading_level=1,
+                                text="第八节 财务报告"),
+                PreparedElement(kind="heading", order_index=2, heading_level=2,
+                                text="五、重要会计政策及会计估计"),
+                PreparedElement(kind="heading", order_index=3, heading_level=2,
+                                text="17、存货"),
+                PreparedElement(kind="text", order_index=4, text="1. 存货的分类"),
+                PreparedElement(kind="text", order_index=5,
+                                text="存货包括产成品、在产品和原材料。"),
+                PreparedElement(kind="text", order_index=6, text="2. 发出存货的计价方法"),
+                PreparedElement(kind="text", order_index=7, text="发出存货采用加权平均法。"),
+                PreparedElement(kind="heading", order_index=8, heading_level=2,
+                                text="18、持有待售资产"),
+                PreparedElement(kind="heading", order_index=9, heading_level=2,
+                                text="1. 共同控制、重大影响的判断"),
+                PreparedElement(kind="text", order_index=10, text="按照相关约定判断。"),
+            ]
+        )
+
+        by_text = {item.text: item for item in placed}
+        self.assertEqual(
+            by_text["存货包括产成品、在产品和原材料。"].heading_path,
+            ["第八节 财务报告", "五、重要会计政策及会计估计", "17、存货", "1. 存货的分类"],
+        )
+        self.assertEqual(
+            by_text["发出存货采用加权平均法。"].heading_path,
+            ["第八节 财务报告", "五、重要会计政策及会计估计", "17、存货",
+             "2. 发出存货的计价方法"],
+        )
+        # The 、-chain continues past the sub-items (18、 ordinal follows 17、),
+        # and a heading-kind dot item nests instead of evicting.
+        self.assertEqual(
+            by_text["按照相关约定判断。"].heading_path,
+            ["第八节 财务报告", "五、重要会计政策及会计估计", "18、持有待售资产",
+             "1. 共同控制、重大影响的判断"],
+        )
+
+    def test_s2_colon_lead_in_nests_under_note_instead_of_evicting(self) -> None:
+        # Round14 companion defect: "2. 当公司…下列项目：" (heading candidate)
+        # used to evict "8、合营安排…" while its sibling "1. …。" stayed body
+        # text — the same note's children split across two ancestries.
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(kind="heading", order_index=1, heading_level=2,
+                                text="8、合营安排分类及共同经营会计处理方法"),
+                PreparedElement(kind="text", order_index=2,
+                                text="1. 合营安排分为共同经营和合营企业。"),
+                PreparedElement(kind="text", order_index=3,
+                                text="2. 当公司为共同经营的合营方时，确认下列项目："),
+                PreparedElement(kind="text", order_index=4,
+                                text="确认单独所持有的资产。"),
+            ]
+        )
+
+        self.assertEqual(
+            placed[0].heading_path, ["8、合营安排分类及共同经营会计处理方法"]
+        )
+        self.assertEqual(
+            placed[-1].heading_path,
+            ["8、合营安排分类及共同经营会计处理方法",
+             "2. 当公司为共同经营的合营方时，确认下列项目："],
+        )
+
+    def test_s2_decimal_amount_line_is_not_a_heading(self) -> None:
+        # cn_a_v6: the dot class carries (?!\d) — "1.5亿元…" is an amount
+        # sentence, not a numbered heading.
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(kind="heading", order_index=1, heading_level=2,
+                                text="一、募集资金使用情况"),
+                PreparedElement(kind="text", order_index=2,
+                                text="1.5亿元用于产能建设项目"),
+            ]
+        )
+
+        self.assertEqual(placed[0].text, "1.5亿元用于产能建设项目")
+        self.assertEqual(placed[0].heading_path, ["一、募集资金使用情况"])
 
     def test_s2_footnote_line_never_becomes_heading(self) -> None:
         placed = s2_apply_heading_tree(
