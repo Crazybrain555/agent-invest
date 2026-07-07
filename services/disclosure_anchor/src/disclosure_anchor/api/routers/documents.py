@@ -57,6 +57,9 @@ DOCUMENT_COLUMNS = (
     "correction_of_document_id",
     "superseded_by_document_id",
     "provider_metadata",
+    "publisher_categories",
+    "market",
+    "content_categories",
 )
 
 PROCESSING_RUN_COLUMNS = (

@@ -45,6 +45,9 @@ def _document_row(document_id: str, announcement_date: date | None) -> dict:
         "correction_of_document_id": None,
         "superseded_by_document_id": None,
         "provider_metadata": {},
+        "publisher_categories": None,
+        "market": None,
+        "content_categories": None,
     }
 
 

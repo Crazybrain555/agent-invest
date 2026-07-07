@@ -171,13 +171,13 @@ def _deps(settings: Settings, engine: Engine) -> WorkerDeps:
             cninfo_oversized_kb=settings.cninfo_oversized_kb,
             initial_lookback_days=settings.disclosure_initial_lookback_days,
             backfill_max_pending_downloads=settings.disclosure_backfill_max_pending_downloads,
-            parse_scope_topics=_parse_scope_topics(settings),
+            parse_scope_classes=_parse_scope_classes(settings),
         ),
         clock=lambda: datetime.now(timezone.utc),
     )
 
 
-def _parse_scope_topics(settings: Settings) -> tuple[str, ...] | None:
+def _parse_scope_classes(settings: Settings) -> tuple[str, ...] | None:
     """None = parse everything; tuple = 'core' scope topics for 'other' docs."""
 
     if settings.disclosure_parse_scope == "all":
@@ -187,7 +187,7 @@ def _parse_scope_topics(settings: Settings) -> tuple[str, ...] | None:
         .joinpath("parse_scope.json")
         .read_text(encoding="utf-8")
     )
-    return tuple(str(t) for t in payload["core_topics"])
+    return tuple(str(t) for t in payload["core_classes"])
 
 
 def _append_reports(settings: Settings, report: WorkerReport) -> None:

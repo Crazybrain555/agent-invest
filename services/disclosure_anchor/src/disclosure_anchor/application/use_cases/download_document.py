@@ -23,7 +23,6 @@ from disclosure_anchor.application.services.subject_resolver import (
     SubjectCandidate,
     SubjectResolver,
 )
-from disclosure_anchor.adapters.sources.cninfo.mapper import topics_for_category
 from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     CNINFO_PROVIDER,
     INDEX_INTERFACE,
@@ -178,9 +177,6 @@ class DownloadDocument:
                     provider_document_id=ref.provider_document_id,
                     title=ref.title,
                     filing_type=_candidate_str(candidate, "filing_type", default="other"),
-                    disclosure_topics=topics_for_category(
-                        _candidate_optional_str(candidate.get("raw_category"))
-                    ),
                     announcement_date=ref.announcement_date,
                     report_period=_candidate_report_period(candidate),
                     filename=f"{ref.provider_document_id}.pdf",

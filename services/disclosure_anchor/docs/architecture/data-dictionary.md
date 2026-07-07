@@ -59,8 +59,8 @@ security_id PK；company_id FK；security_code+exchange 定位（exchange 全大
 | 列 | 含义 |
 |---|---|
 | status | 公开可消费态：registered → parsed \| parse_failed →（发布后）published；published 永不降级 |
-| filing_type | **一级粗桶**闭集 9 值：annual/semiannual/quarterly_report, performance_forecast/flash, investor_relations, performance_briefing, inquiry_reply, other（新值=契约升版） |
-| disclosure_topics | **二级分类** jsonb 数组（0014）；F006V→topic_map.json 派生，**14 topic**（r2）；定期报告本体与无 F006V 通道→NULL（一级分类已承载）；GIN 部分索引 |
+| filing_type | 表列=**注册时兜底值**（无码通道标题推导，9 值）。**消费永远读视图列**：视图现算 = class 词表 argmax（30 类，class_map r4），COALESCE 回落表列；未知枚举值按 other 消费（前向兼容） |
+| ~~disclosure_topics~~ | **0016 删除**（表列）。视图现算：class 词表全部命中类集合（jsonb 数组）；无码通道 NULL |
 | report_period | `YYYY(A|Q1-4)`；定期报告必填，临时公告可 NULL，不伪造 |
 | raw_file_relpath/raw_file_hash | 相对路径+sha256；原始 PDF 不可变只追加 |
 | provider_metadata | jsonb：raw_category（F006V 原串）、category_names（中文分类名数组）、file_signature、oversized 标记等 |
@@ -93,6 +93,13 @@ security_id PK；company_id FK；security_code+exchange 定位（exchange 全大
 | page_no | 定位列（artifact_locator 首页码） |
 | artifact_locator | jsonb（order_index/page_no/bbox/merge 信息）；JSONB(none_as_null) |
 
+### classification_rule（0016，词表的库内查询副本）
+| 列 | 含义 |
+|---|---|
+| rule_set | 闭集 class / facet（filing_type 无独立规则——同一 class 映射 argmax） |
+| prefix / value / priority | F006V 前缀 → 类名/维度名；priority=主分类阶梯档位（三层原则）/facet 长前缀优先 |
+| version | 与仓内 JSON 词表一致；doctor 校验漂移；`make load-rules` 事务内重载 |
+
 ### source_access / source_checkpoint / provider_category
 - source_access：每次 provider 访问一行（**失败也留痕**，含 profile 拉取失败）；query_params 已剔除凭据；error 结构化。
 - source_checkpoint：scope_key=`company_id:p_info3015`；cursor={window_end, window_start, synced_at}（后两个为审计字段，判定只用 window_end 与 updated_at）。
@@ -103,7 +110,8 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 ## 3. disclosure_public 视图（唯一读契约）
 
-- **document_units_v1（38 列）**：core 列 + 派生（is_active_run、heading_path_text 面包屑、
+- **document_units_v1（41 列）**：core 列 + 派生（is_active_run、heading_path_text 面包屑、
+  publisher_categories/market/content_categories 三维拆解、现算 filing_type/disclosure_topics、
   contract_version、company_ref/security_ref、security_code/exchange、filing_type、
   disclosure_topics、report_period、announcement_date、source_ref、parent_ref、asset_kind、
   observed_at、source_tier、trace_level、raw_file_hash）。列集权威=contract-checklist §2。
@@ -112,18 +120,20 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 ## 4. 词表/配置文件索引（versioned，改=升版）
 
-**存量刷新纪律**：注册只分类一次，重复观察不重推导。filing_type_map / topic_map
-升版后**必须**跑 `PYTHONPATH=src .venv/bin/python scripts/reclassify_documents.py`
-——按当前词表对全部带 F006V 的存量文档重推导两级分类并逐条报告变化（幂等）。
+**词表升版纪律（0016 起）**：分类为视图现算，**无存量残留**。升版 = 改 JSON +
+`make load-rules`（事务内 TRUNCATE+INSERT，doctor 校验版本一致），全库即刻生效。
+质量环：`scripts/audit_unmapped_codes.py`（语料中未被 class/facet 覆盖的内容码
+→ 人工晋级）。watchlist filing_categories 收 class 键（经词表展开为前缀）。
 
 | 文件 | 内容 | 当前版本 |
 |---|---|---|
 | adapters/unit_builder/rules.py | 切分/噪声/声明组合文法/语义规则 | RULES_VERSION ub-2026.07-18 |
 | adapters/unit_builder/note_key_map.json | 章节词表 **144 键**（section facet；祖先继承+全类型开放） | 2026-07-r4 |
 | adapters/unit_builder/event_key_map.json | 事件键 **30 键**（DuEE-fin/CCKS/FewFC/CFinDEE 并集，标题派生） | 2026-07-r1 |
-| adapters/sources/cninfo/filing_type_map.json | F006V→filing_type 9 桶 | 2026-07-r3 |
-| adapters/sources/cninfo/topic_map.json | F006V→disclosure_topics **14** 题 | 2026-07-r2 |
-| application/worker/parse_scope.json | 分层解析 core_topics（12 进核心，governance_rules/intermediary_report 降级） | 2026-07-r3 |
+| adapters/sources/cninfo/class_map.json | **统一 class 词表 30 类**（prefixes+priority+zh+std_refs；topics=集合/filing_type=argmax） | 2026-07-r4 |
+| adapters/sources/cninfo/facet_map.json | F006V 维度判定（market 精确码/publisher 0101） | 2026-07-r1 |
+| adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（仅注册时写表列） | 2026-07-r3 |
+| application/worker/parse_scope.json | 分层解析 core_classes（25 核心/5 降级） | 2026-07-r4 |
 | config/watchlist.csv | 股票池唯一真源 | git 即版本 |
 
 ## 5. 设计讨论记录

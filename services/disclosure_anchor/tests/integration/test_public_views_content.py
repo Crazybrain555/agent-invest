@@ -389,6 +389,9 @@ class PublicViewContentTests(unittest.TestCase):
             "trace_level",
             "raw_file_hash",
             "query_projection_hash",
+            "publisher_categories",
+            "market",
+            "content_categories",
         }
         with self.engine.connect() as conn:
             columns = {
@@ -403,7 +406,105 @@ class PublicViewContentTests(unittest.TestCase):
             }
 
         self.assertEqual(columns, expected)
-        self.assertEqual(len(columns), 38)
+        self.assertEqual(len(columns), 41)
+
+    def test_view_derives_classification_and_facets_from_raw_category(self) -> None:
+        # 0016: one class map, two outputs — filing_type = argmax priority,
+        # disclosure_topics = full hit set; facet columns split the segments.
+        self._seed()
+        self._ensure_classification_rules()
+        document_id, _ = self._seed_extra_document_unit("other")
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.document "
+                    "SET provider_metadata = jsonb_build_object("
+                    "'raw_category', '01010503||010112||011301||012325') "
+                    "WHERE document_id = :document_id"
+                ),
+                {"document_id": document_id},
+            )
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT filing_type, disclosure_topics, publisher_categories, "
+                    "market, content_categories "
+                    "FROM disclosure_public.documents_v1 "
+                    "WHERE document_id = :document_id"
+                ),
+                {"document_id": document_id},
+            ).mappings().one()
+        # equity_incentive (75) outranks dividend (68); both stay in topics
+        self.assertEqual(row["filing_type"], "equity_incentive")
+        self.assertEqual(
+            set(row["disclosure_topics"]), {"dividend", "equity_incentive"}
+        )
+        self.assertEqual(row["market"], "深市公司公告")
+        self.assertEqual(
+            [item["code"] for item in row["publisher_categories"]], ["01010503"]
+        )
+        self.assertEqual(
+            {item["code"] for item in row["content_categories"]},
+            {"011301", "012325"},
+        )
+
+    def test_view_falls_back_to_registration_filing_type_without_codes(self) -> None:
+        self._seed()
+        document_id, _ = self._seed_extra_document_unit("annual_report")
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT filing_type, disclosure_topics, content_categories "
+                    "FROM disclosure_public.documents_v1 "
+                    "WHERE document_id = :document_id"
+                ),
+                {"document_id": document_id},
+            ).mappings().one()
+        self.assertEqual(row["filing_type"], "annual_report")
+        self.assertIsNone(row["disclosure_topics"])
+        self.assertIsNone(row["content_categories"])
+
+    def _ensure_classification_rules(self) -> None:
+        # Additive idempotent seed (never TRUNCATE the shared DB from a test);
+        # `make load-rules` owns full reconciliation.
+        from disclosure_anchor.adapters.sources.cninfo.mapper import (
+            load_class_map,
+            load_facet_map,
+        )
+
+        class_map = load_class_map()
+        facet_map = load_facet_map()
+        rows = [
+            {
+                "rule_set": "class",
+                "prefix": prefix,
+                "value": name,
+                "priority": spec["priority"],
+                "version": class_map["version"],
+            }
+            for name, spec in class_map["classes"].items()
+            for prefix in spec["prefixes"]
+        ] + [
+            {
+                "rule_set": "facet",
+                "prefix": prefix,
+                "value": rule["facet"],
+                "priority": rule["priority"],
+                "version": facet_map["version"],
+            }
+            for rule in facet_map["rules"]
+            for prefix in rule["prefixes"]
+        ]
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.classification_rule "
+                    "(rule_set, prefix, value, priority, version) "
+                    "VALUES (:rule_set, :prefix, :value, :priority, :version) "
+                    "ON CONFLICT (rule_set, prefix, value) DO NOTHING"
+                ),
+                rows,
+            )
 
     def test_source_tier_mapping_contract(self) -> None:
         self._seed()

@@ -80,6 +80,16 @@ class CninfoSource:
                     category_names_by_code=names,
                     rule_bundle=self._rule_bundle,
                 )
+                if filing_type == "other":
+                    # cninfo sometimes codes a real event as bare 012399
+                    # 其它事项 (业绩说明会/持股计划 observed); the title still
+                    # carries the class — same closed keyword bundle the web
+                    # channel runs (title passed as the haystack segment).
+                    filing_type = map_filing_type(
+                        mapped.title,
+                        category_names_by_code={},
+                        rule_bundle=self._rule_bundle,
+                    )
                 segments = split_category_segments(mapped.raw_category)
                 category_names = [
                     names[segment] for segment in segments if segment in names

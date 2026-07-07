@@ -17,7 +17,7 @@ SQL 都是"抓一整类"的写法。
 
 新增审查对象（round12-13）：`docs/architecture/data-dictionary.md`（逐列核对与实库
 一致）；词表文件 note_key_map r4（144 键）/ event_key_map r1（30 事件键）/
-topic_map / parse_scope；三 facet 架构（retrieval 设计文档 §4.6）。
+class_map/facet_map/parse_scope（0016 起分类视图现算，design/classification-facets-and-derived-views.md）；三 facet 架构（retrieval 设计文档 §4.6）。
 
 ## 0.1 原审查前置
 
@@ -41,8 +41,12 @@ topic_map / parse_scope；三 facet 架构（retrieval 设计文档 §4.6）。
   exchange 全大写、无 PENDING_LEGAL_NAME 残留（有=该公司从未成功同步过）。
 - tracked_company：与 config/watchlist.csv 对账零漂移（`make track` 输出 drift=0）；
   lookback/filing_categories/sync_frequency 三列有值时 worker 真在用（queries.sync_due）。
-- document：filing_type 词表 9 值闭集；disclosure_topics 与 provider_metadata
-  raw_category 一致（抽 5 行手工对 topic_map.json）；report_period 定期报告必填；
+- document：表列 filing_type 仅为注册兜底；**消费面以视图为准**——filing_type=
+  class 词表 argmax（30 类）、disclosure_topics=命中集合、三维拆解列与
+  provider_metadata.raw_category 一致（抽 5 行手工对 class_map.json）；
+  规则质量环：`scripts/audit_unmapped_codes.py` 必须输出 none；
+  doctor 的 classification rules 检查必须 pass（词表版本一致）；
+  report_period 定期报告必填；
   status 生命周期（published 不降级）。
 - document_unit：见 §2 切分审查。三哈希列非空且 content_hash 不含检索派生字段。
 - processing_run：每文档 active 唯一；无 status='running' 孤儿（stale reclaim 工作）；
@@ -104,7 +108,7 @@ S5 续表合并只看列数（cn_a_v6 后同构附注表跨科目误并，3. 销
 - **domain**：实体无 IO；枚举闭集走契约升版；错误分型 retryable 语义正确
   （尤其 quota_exhausted=请求内 fail-fast + 下轮可重试）。
 - **unit_builder**：规则全部在 rules.py 且版本化（改规则必升 RULES_VERSION）；
-  builder 纯函数无 IO；三个词表 JSON（note_key_map/topic_map/parse_scope）
+  builder 纯函数无 IO；词表 JSON（note_key_map/event_key_map/class_map/facet_map/parse_scope）
   与代码读取键一致；内容哈希纯净性——payload 不得含任何规则派生值（U2）。
 - **worker**：队列谓词只在 queries.py；批次上限/背压/熔断路径有测试；
   单项异常隔离不破轮。
@@ -118,6 +122,10 @@ S5 续表合并只看列数（cn_a_v6 后同构附注表跨科目误并，3. 销
   （LIMIT/日期排序）必须对积压免疫。
 
 ## 4. 已知接受项（不要重复开 finding）
+
+- 仅携带巨潮杂项码（012399/352399 其它事项公告）的文档 filing_type='other'
+  ——巨潮自己拒绝分类的，映射即捏造语义（audit_unmapped_codes.py 的
+  ACCEPTED_MISC_CODES）；标题关键词兜底已在注册层运行。
 
 - 标题对账环接受类（round15）：①文内扉页标题行（首个编号标题之前的封面标题，
   document.title 已承载，脚本自动归类）；②空节（标题至下一标题间无有效内容，
@@ -137,7 +145,7 @@ S5 续表合并只看列数（cn_a_v6 后同构附注表跨科目误并，3. 销
   local_heading，引用粒度不丢）；再出现失怙孤儿子项按 §2 跳级探测处理。
 - "详见附注 X"交叉引用单元——真实内容，保留。
 - 金融工具风险节内部 1、/(一) 层级倒置的次级归属（不窜根即可）。
-- web 兜底通道 disclosure_topics=null（接口无 F006V）。
+- web 兜底通道 disclosure_topics=null、三维拆解列=null（接口无 F006V），filing_type 回落注册值——设计内。
 - semantic_keys 覆盖纪律（round13 用户裁决"检索靠它，不能少"）：词表键做祖先继承
   （无科目语义的叶子从最近科目祖先取键+章级键），并对全部 filing_type 开放；
   验收口径=年报/审计报告附注 NULL 为 0、全库覆盖 ≥95%；剩余 NULL 仅限公告头存根

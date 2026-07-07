@@ -101,26 +101,35 @@ def pending_parse(
     *,
     max_retries: int,
     limit: int,
-    scope_topics: tuple[str, ...] | None = None,
+    scope_classes: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Documents awaiting parse, excluding non-retryable and exhausted ones.
 
     Oversized documents (07 §3.9) are excluded in SQL: they used to be
     LIMIT-selected first and then skipped, permanently occupying every batch
-    slot (round8 audit blocker). With scope_topics set (parse scope 'core'),
-    'other' documents are parsed only when disclosure_topics (round9 second-
-    level classification) hits a core topic; every non-other filing_type
-    always parses. None → parse everything ('all').
+    slot (round8 audit blocker). With scope_classes set (parse scope 'core'),
+    coded documents parse when any F006V segment hits a core class through
+    classification_rule (0016 — classification is view-derived, so the queue
+    joins the same rules); code-less channels fall back to the registration
+    filing_type. None → parse everything ('all').
     """
 
     scope_sql = ""
     params: dict[str, Any] = {"max_retries": max_retries, "limit": limit}
-    if scope_topics is not None:
-        scope_sql = """
-               AND (d.filing_type <> 'other'
-                    OR (d.disclosure_topics IS NOT NULL
-                        AND d.disclosure_topics ?| CAST(:scope_topics AS text[])))"""
-        params["scope_topics"] = list(scope_topics)
+    if scope_classes is not None:
+        scope_sql = f"""
+               AND (CASE WHEN d.provider_metadata->>'raw_category' IS NOT NULL
+                    THEN EXISTS (
+                        SELECT 1
+                          FROM unnest(string_to_array(
+                                   d.provider_metadata->>'raw_category', '||'))
+                               AS seg(code)
+                          JOIN {CORE_SCHEMA}.classification_rule cr
+                            ON cr.rule_set = 'class'
+                           AND seg.code LIKE cr.prefix || '%'
+                         WHERE cr.value = ANY(CAST(:scope_classes AS text[])))
+                    ELSE d.filing_type <> 'other' END)"""
+        params["scope_classes"] = list(scope_classes)
     rows = conn.execute(
         text(
             f"""

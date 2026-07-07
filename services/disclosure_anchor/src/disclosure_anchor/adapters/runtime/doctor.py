@@ -295,7 +295,43 @@ def _database_ping_and_migration_checks(engine: Engine) -> list[CheckResult]:
                 f"expected {expected_revision}, got {current_revision}",
             )
         )
+    checks.append(_classification_rules_check(engine))
     return checks
+
+
+def _classification_rules_check(engine: Engine) -> CheckResult:
+    """Loaded rules must match the repo vocabulary versions (0016 discipline)."""
+
+    from disclosure_anchor.adapters.sources.cninfo.mapper import (
+        load_class_map,
+        load_facet_map,
+    )
+
+    expected = {
+        "class": str(load_class_map()["version"]),
+        "facet": str(load_facet_map()["version"]),
+    }
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT rule_set, string_agg(DISTINCT version, ',') AS versions "
+                "FROM disclosure_core.classification_rule GROUP BY rule_set"
+            )
+        ).all()
+    loaded = {str(row.rule_set): str(row.versions) for row in rows}
+    if not loaded:
+        return _fail("classification rules", "table empty — run `make load-rules`")
+    mismatches = [
+        f"{rule_set}: loaded={loaded.get(rule_set, '∅')} file={version}"
+        for rule_set, version in expected.items()
+        if loaded.get(rule_set) != version
+    ]
+    if mismatches:
+        return _fail(
+            "classification rules",
+            "; ".join(mismatches) + " — run `make load-rules`",
+        )
+    return _pass("classification rules", f"class={expected['class']} facet={expected['facet']}")
 
 
 def _database_catalog_checks(engine: Engine) -> list[CheckResult]:

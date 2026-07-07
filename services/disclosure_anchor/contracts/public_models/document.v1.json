@@ -24,6 +24,21 @@
       ],
       "title": "Company Ref"
     },
+    "content_categories": {
+      "anyOf": [
+        {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Content Categories"
+    },
     "contract_version": {
       "title": "Contract Version",
       "type": "string"
@@ -95,6 +110,17 @@
       ],
       "title": "Filing Type"
     },
+    "market": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Market"
+    },
     "provider": {
       "anyOf": [
         {
@@ -121,6 +147,21 @@
       "additionalProperties": true,
       "title": "Provider Metadata",
       "type": "object"
+    },
+    "publisher_categories": {
+      "anyOf": [
+        {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Publisher Categories"
     },
     "raw_file_hash": {
       "anyOf": [
@@ -243,7 +284,10 @@
     "supersedes_document_id",
     "correction_of_document_id",
     "superseded_by_document_id",
-    "provider_metadata"
+    "provider_metadata",
+    "publisher_categories",
+    "market",
+    "content_categories"
   ],
   "title": "DocumentV1",
   "type": "object"

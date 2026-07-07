@@ -81,6 +81,9 @@ UNIT_COLUMNS = (
     "trace_level",
     "raw_file_hash",
     "query_projection_hash",
+    "publisher_categories",
+    "market",
+    "content_categories",
 )
 
 SOURCE_REF_COLUMNS = (

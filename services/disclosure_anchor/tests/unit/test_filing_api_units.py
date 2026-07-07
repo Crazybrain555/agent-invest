@@ -44,6 +44,9 @@ def _document_row() -> dict:
         "correction_of_document_id": None,
         "superseded_by_document_id": None,
         "provider_metadata": {},
+        "publisher_categories": None,
+        "market": None,
+        "content_categories": None,
     }
 
 
@@ -93,6 +96,9 @@ def _unit_row(
         "trace_level": "G0",
         "raw_file_hash": "sha256:" + "a" * 64,
         "query_projection_hash": "sha256:" + "d" * 64,
+        "publisher_categories": None,
+        "market": None,
+        "content_categories": None,
         "asset_uri": f"asset://disclosure_anchor/v1/document_unit/{asset_id}",
         "is_active_run": is_active_run,
     }

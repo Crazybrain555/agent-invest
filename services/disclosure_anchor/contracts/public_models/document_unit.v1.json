@@ -59,6 +59,21 @@
       ],
       "title": "Company Ref"
     },
+    "content_categories": {
+      "anyOf": [
+        {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Content Categories"
+    },
     "content_hash": {
       "title": "Content Hash",
       "type": "string"
@@ -134,6 +149,17 @@
       "title": "Is Active Run",
       "type": "boolean"
     },
+    "market": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Market"
+    },
     "observed_at": {
       "format": "date-time",
       "title": "Observed At",
@@ -185,6 +211,21 @@
         }
       ],
       "title": "Provider Document Id"
+    },
+    "publisher_categories": {
+      "anyOf": [
+        {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Publisher Categories"
     },
     "quality_status": {
       "title": "Quality Status",
@@ -350,6 +391,9 @@
     "trace_level",
     "raw_file_hash",
     "query_projection_hash",
+    "publisher_categories",
+    "market",
+    "content_categories",
     "asset_uri",
     "is_active_run"
   ],

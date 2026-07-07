@@ -78,7 +78,7 @@ class WorkerConfig:
     backfill_max_pending_downloads: int = 2000
     # None → parse everything; a topic tuple → 'other' docs need a matching
     # disclosure_topic (parse scope 'core', round9).
-    parse_scope_topics: tuple[str, ...] | None = None
+    parse_scope_classes: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -328,7 +328,7 @@ def _parse_stage(
             conn,
             max_retries=deps.config.max_parse_retries,
             limit=limit,
-            scope_topics=deps.config.parse_scope_topics,
+            scope_classes=deps.config.parse_scope_classes,
         )
     parse_use_case = ParseDocument(
         parser=deps.parser_factory(),

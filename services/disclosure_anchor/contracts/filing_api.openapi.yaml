@@ -153,6 +153,14 @@ components:
           - type: string
           - type: 'null'
           title: Company Ref
+        content_categories:
+          anyOf:
+          - items:
+              additionalProperties: true
+              type: object
+            type: array
+          - type: 'null'
+          title: Content Categories
         content_hash:
           title: Content Hash
           type: string
@@ -196,6 +204,11 @@ components:
         is_active_run:
           title: Is Active Run
           type: boolean
+        market:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Market
         observed_at:
           format: date-time
           title: Observed At
@@ -229,6 +242,14 @@ components:
           - type: string
           - type: 'null'
           title: Provider Document Id
+        publisher_categories:
+          anyOf:
+          - items:
+              additionalProperties: true
+              type: object
+            type: array
+          - type: 'null'
+          title: Publisher Categories
         quality_status:
           title: Quality Status
           type: string
@@ -328,6 +349,9 @@ components:
       - trace_level
       - raw_file_hash
       - query_projection_hash
+      - publisher_categories
+      - market
+      - content_categories
       - asset_uri
       - is_active_run
       title: DocumentUnitV1
@@ -346,6 +370,14 @@ components:
           - type: string
           - type: 'null'
           title: Company Ref
+        content_categories:
+          anyOf:
+          - items:
+              additionalProperties: true
+              type: object
+            type: array
+          - type: 'null'
+          title: Content Categories
         contract_version:
           title: Contract Version
           type: string
@@ -383,6 +415,11 @@ components:
           - type: string
           - type: 'null'
           title: Filing Type
+        market:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Market
         provider:
           anyOf:
           - type: string
@@ -397,6 +434,14 @@ components:
           additionalProperties: true
           title: Provider Metadata
           type: object
+        publisher_categories:
+          anyOf:
+          - items:
+              additionalProperties: true
+              type: object
+            type: array
+          - type: 'null'
+          title: Publisher Categories
         raw_file_hash:
           anyOf:
           - type: string
@@ -468,6 +513,9 @@ components:
       - correction_of_document_id
       - superseded_by_document_id
       - provider_metadata
+      - publisher_categories
+      - market
+      - content_categories
       title: DocumentV1
       type: object
     ErrorEnvelope:

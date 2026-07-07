@@ -36,6 +36,9 @@ class DocumentV1(PublicModel):
     correction_of_document_id: str | None
     superseded_by_document_id: str | None
     provider_metadata: dict[str, Any]
+    publisher_categories: list[dict[str, Any]] | None
+    market: str | None
+    content_categories: list[dict[str, Any]] | None
 
 
 class ProcessingRunV1(PublicModel):
@@ -100,6 +103,9 @@ class DocumentUnitV1(PublicModel):
     trace_level: str
     raw_file_hash: str | None
     query_projection_hash: str | None
+    publisher_categories: list[dict[str, Any]] | None
+    market: str | None
+    content_categories: list[dict[str, Any]] | None
     asset_uri: str
     is_active_run: bool
 

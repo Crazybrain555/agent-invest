@@ -1,22 +1,38 @@
 {
-  "version": "2026-07-r3",
-  "_about": "Worker parse-layer scope (design/watchlist-operations.md + round9 disclosure_topics). Scope 'core' parses every non-other filing_type plus 'other' documents whose disclosure_topics hit core_topics. Adjustable file config; topics derive from topic_map.json at registration.",
-  "core_topics": [
-    "dividend",
-    "equity_share_change",
-    "equity_incentive",
+  "version": "2026-07-r4",
+  "_about": "Worker parse-layer scope（design/classification-facets-and-derived-views.md）。核心谓词：文档命中类 ∩ core_classes 非空即解析；无 F006V 通道回落 document.filing_type<>'other'。日历类全进 core，故不再需要独立的 filing_type 判断。",
+  "core_classes": [
+    "annual_report",
+    "semiannual_report",
+    "quarterly_report",
+    "performance_flash",
+    "performance_forecast",
+    "operating_data",
     "restructuring_assets",
+    "delisting_risk",
+    "equity_incentive",
+    "share_buyback",
+    "share_pledge",
+    "equity_share_change",
+    "dividend",
     "major_contract",
-    "guarantee",
+    "related_party",
+    "litigation",
     "inquiry_regulatory",
     "risk_alert",
-    "investor_communication",
-    "meeting_resolution",
+    "rights_issue",
+    "additional_issuance",
+    "convertible_bond",
     "financing",
-    "related_party"
+    "performance_briefing",
+    "investor_relations",
+    "meeting_resolution"
   ],
   "_deprioritized": [
-    "governance_rules",
-    "intermediary_report"
+    "ipo_listing",
+    "bond_notice",
+    "esg",
+    "intermediary_report",
+    "governance_rules"
   ]
 }

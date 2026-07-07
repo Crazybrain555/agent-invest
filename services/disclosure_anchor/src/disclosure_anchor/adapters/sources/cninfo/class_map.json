@@ -1,0 +1,432 @@
+{
+  "version": "2026-07-r4",
+  "_about": "统一 class 词表（design/classification-facets-and-derived-views.md）。单一映射两种输出：disclosure_topics=全部命中类集合；filing_type=priority argmax。前缀=巨潮 F006V 码（provider_category 实枚举），改词表=升版+make load-rules（视图现算，全库即刻生效，无存量残留）。priority 三层原则：日历类(95-100)>实质事件类(44-80,按重大性)>程序载体类(16-30)。std_refs 仅参考元数据（caev=ISO20022 公司行为码/hkex_t2=港交所 Appendix24/sec=SEC 表单或 8-K item），不进库不进契约。",
+  "classes": {
+    "annual_report": {
+      "prefixes": [
+        "010301"
+      ],
+      "priority": 100,
+      "zh": "年度报告",
+      "std_refs": {
+        "sec": "10-K",
+        "hkex_t2": "Annual Report"
+      }
+    },
+    "semiannual_report": {
+      "prefixes": [
+        "010303"
+      ],
+      "priority": 99,
+      "zh": "半年度报告",
+      "std_refs": {
+        "sec": "10-Q",
+        "hkex_t2": "Interim Report"
+      }
+    },
+    "quarterly_report": {
+      "prefixes": [
+        "010305",
+        "010307"
+      ],
+      "priority": 98,
+      "zh": "季度报告",
+      "std_refs": {
+        "sec": "10-Q",
+        "hkex_t2": "Quarterly Report"
+      }
+    },
+    "performance_flash": {
+      "prefixes": [
+        "01211160",
+        "35211170"
+      ],
+      "priority": 97,
+      "zh": "业绩快报",
+      "std_refs": {
+        "sec": "8-K Item 2.02",
+        "hkex_t2": "Results Announcement"
+      }
+    },
+    "performance_forecast": {
+      "prefixes": [
+        "012111"
+      ],
+      "priority": 96,
+      "zh": "业绩预告",
+      "std_refs": {
+        "sec": "8-K Item 2.02",
+        "hkex_t2": "Profit Warning/Positive Profit Alert"
+      }
+    },
+    "operating_data": {
+      "prefixes": [
+        "010309"
+      ],
+      "priority": 95,
+      "zh": "经营数据/月度报告",
+      "std_refs": {
+        "hkex_t2": "Trading Update"
+      }
+    },
+    "restructuring_assets": {
+      "prefixes": [
+        "01012405",
+        "01012505",
+        "01012603",
+        "01012703",
+        "011503",
+        "011505",
+        "011511",
+        "351505",
+        "351511",
+        "011701",
+        "011702",
+        "011703",
+        "011705",
+        "011707",
+        "011715",
+        "011717",
+        "011799",
+        "012323"
+      ],
+      "priority": 80,
+      "zh": "重组/收购/出售资产",
+      "std_refs": {
+        "caev": [
+          "MRGR",
+          "TEND",
+          "EXOF"
+        ],
+        "sec": "8-K Item 2.01",
+        "hkex_t2": "Major Transaction / VSA"
+      }
+    },
+    "delisting_risk": {
+      "prefixes": [
+        "0125",
+        "012105",
+        "012107",
+        "012319",
+        "352319"
+      ],
+      "priority": 78,
+      "zh": "退市风险/特别处理/破产清算",
+      "std_refs": {
+        "caev": [
+          "LIQU"
+        ],
+        "hkex_t2": "Winding Up / Resumption / Delisting"
+      }
+    },
+    "equity_incentive": {
+      "prefixes": [
+        "012325",
+        "352325",
+        "250752"
+      ],
+      "priority": 76,
+      "zh": "股权激励/员工持股",
+      "std_refs": {
+        "sec": "8-K Item 5.02(e)",
+        "hkex_t2": "Share Option Scheme"
+      }
+    },
+    "share_buyback": {
+      "prefixes": [
+        "01151301",
+        "01151310",
+        "3515134",
+        "250751"
+      ],
+      "priority": 74,
+      "zh": "股份回购",
+      "std_refs": {
+        "caev": [
+          "BIDS"
+        ],
+        "hkex_t2": "Share Buyback"
+      }
+    },
+    "share_pledge": {
+      "prefixes": [
+        "012307",
+        "352307"
+      ],
+      "priority": 72,
+      "zh": "股份质押/冻结",
+      "std_refs": {
+        "hkex_t2": "Pledge of Shares (无官方对应, DuEE-fin: 质押)"
+      }
+    },
+    "equity_share_change": {
+      "prefixes": [
+        "011501",
+        "011507",
+        "011509",
+        "011513",
+        "351501",
+        "351513",
+        "250744",
+        "011303",
+        "011305"
+      ],
+      "priority": 70,
+      "zh": "持股/股本变动（增减持/减资/解禁/股改）",
+      "std_refs": {
+        "caev": [
+          "DECR"
+        ],
+        "sec": "SC 13D/G, Form 4",
+        "hkex_t2": "Next Day Disclosure Return"
+      }
+    },
+    "dividend": {
+      "prefixes": [
+        "011301"
+      ],
+      "priority": 68,
+      "zh": "权益分派/分红",
+      "std_refs": {
+        "caev": [
+          "DVCA",
+          "DVSE",
+          "BONU"
+        ],
+        "sec": "8-K Item 8.01",
+        "hkex_t2": "Dividend or Distribution"
+      }
+    },
+    "major_contract": {
+      "prefixes": [
+        "012327",
+        "352327",
+        "N004007"
+      ],
+      "priority": 66,
+      "zh": "重大合同/中标",
+      "std_refs": {
+        "sec": "8-K Item 1.01",
+        "hkex_t2": "Major Transaction"
+      }
+    },
+    "related_party": {
+      "prefixes": [
+        "011719",
+        "011721"
+      ],
+      "priority": 64,
+      "zh": "关联交易/资金占用",
+      "std_refs": {
+        "hkex_t2": "Connected Transaction"
+      }
+    },
+    "litigation": {
+      "prefixes": [
+        "012309",
+        "012311"
+      ],
+      "priority": 62,
+      "zh": "重大诉讼/仲裁",
+      "std_refs": {
+        "sec": "8-K Item 8.01",
+        "hkex_t2": "Litigation"
+      }
+    },
+    "inquiry_regulatory": {
+      "prefixes": [
+        "015107",
+        "24",
+        "35239947",
+        "012317"
+      ],
+      "priority": 60,
+      "zh": "问询/监管函件/处罚整改",
+      "std_refs": {
+        "sec": "SEC comment letters",
+        "hkex_t2": "Regulatory Announcement"
+      }
+    },
+    "risk_alert": {
+      "prefixes": [
+        "012101",
+        "012102",
+        "012103",
+        "012109",
+        "012305",
+        "352305",
+        "012313",
+        "352313"
+      ],
+      "priority": 58,
+      "zh": "澄清/风险提示/重大不利变化",
+      "std_refs": {
+        "sec": "8-K Item 8.01",
+        "hkex_t2": "Clarification / Inside Information"
+      }
+    },
+    "ipo_listing": {
+      "prefixes": [
+        "0102",
+        "0151"
+      ],
+      "priority": 56,
+      "zh": "发行上市（IPO/注册期）",
+      "std_refs": {
+        "sec": "S-1/424B",
+        "hkex_t2": "Listing Document"
+      }
+    },
+    "rights_issue": {
+      "prefixes": [
+        "0105"
+      ],
+      "priority": 54,
+      "zh": "配股",
+      "std_refs": {
+        "caev": [
+          "RHTS"
+        ],
+        "hkex_t2": "Rights Issue"
+      }
+    },
+    "additional_issuance": {
+      "prefixes": [
+        "0107"
+      ],
+      "priority": 52,
+      "zh": "增发",
+      "std_refs": {
+        "caev": [
+          "PRIO"
+        ],
+        "sec": "8-K Item 3.02",
+        "hkex_t2": "Placing"
+      }
+    },
+    "convertible_bond": {
+      "prefixes": [
+        "0109"
+      ],
+      "priority": 50,
+      "zh": "可转债",
+      "std_refs": {
+        "caev": [
+          "CONV",
+          "INTR"
+        ],
+        "hkex_t2": "Issue of Convertible Securities"
+      }
+    },
+    "financing": {
+      "prefixes": [
+        "0111",
+        "011709",
+        "012315",
+        "352315"
+      ],
+      "priority": 48,
+      "zh": "其它融资/借贷/募集资金使用",
+      "std_refs": {
+        "hkex_t2": "Fund Raising"
+      }
+    },
+    "bond_notice": {
+      "prefixes": [
+        "0139"
+      ],
+      "priority": 46,
+      "zh": "债券公告",
+      "std_refs": {
+        "caev": [
+          "INTR",
+          "REDM"
+        ],
+        "hkex_t2": "Debt Securities"
+      }
+    },
+    "esg": {
+      "prefixes": [
+        "012330"
+      ],
+      "priority": 44,
+      "zh": "环境与社会责任/ESG",
+      "std_refs": {
+        "hkex_t2": "ESG Report"
+      }
+    },
+    "performance_briefing": {
+      "prefixes": [
+        "012003"
+      ],
+      "priority": 30,
+      "zh": "业绩说明会/路演",
+      "std_refs": {
+        "hkex_t2": "Investor Presentation"
+      }
+    },
+    "investor_relations": {
+      "prefixes": [
+        "0120",
+        "012001",
+        "012329",
+        "352329",
+        "0122"
+      ],
+      "priority": 28,
+      "zh": "投资者关系/调研",
+      "std_refs": {
+        "sec": "8-K Item 7.01",
+        "hkex_t2": "Investor Relations"
+      }
+    },
+    "meeting_resolution": {
+      "prefixes": [
+        "0119",
+        "01010507",
+        "N003001",
+        "N003002",
+        "01239901",
+        "012321"
+      ],
+      "priority": 20,
+      "zh": "股东大会/董监事会决议",
+      "std_refs": {
+        "caev": [
+          "XMET"
+        ],
+        "sec": "8-K Item 5.07",
+        "hkex_t2": "Results of Meeting"
+      }
+    },
+    "intermediary_report": {
+      "prefixes": [
+        "0129"
+      ],
+      "priority": 18,
+      "zh": "中介机构报告（审计/评估/督导/法律）",
+      "std_refs": {
+        "hkex_t2": "Auditors' Report 类"
+      }
+    },
+    "governance_rules": {
+      "prefixes": [
+        "0131",
+        "012303",
+        "352303",
+        "012301",
+        "352301",
+        "352332",
+        "012331",
+        "012333",
+        "012004"
+      ],
+      "priority": 16,
+      "zh": "治理制度/董监高变动/基本信息变更",
+      "std_refs": {
+        "sec": "8-K Item 5.02/5.03",
+        "hkex_t2": "Constitutional Documents"
+      }
+    }
+  }
+}

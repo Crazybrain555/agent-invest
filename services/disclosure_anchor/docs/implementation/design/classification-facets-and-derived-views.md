@@ -2,7 +2,7 @@
 id: disclosure_anchor_design_classification_facets
 project: disclosure_anchor
 title: 分类三维拆解 + 衍生分类下沉视图（0016 方案）
-status: proposed
+status: adopted-and-implemented (0016, 2026-07-08)
 created_at: 2026-07-07
 ---
 
@@ -105,9 +105,12 @@ parent_category_code，可按树任意钻取）——再加一列 = 同一信息
    （激励方案经董事会决议发布，内容是激励不是决议）。
 实测影响面：91 份中仅 4 份存在 ≥2 实质类命中（全为激励公告，argmax 给出
 equity_incentive 与人工判断一致）；层内微调顺序影响 <5% 文档，且落选类
-仍在 topics 集合里不丢失。全库 91 份实测模拟：other 92% → **0%**（governance_rules 32、
-equity_incentive 17、meeting_resolution 13、intermediary_report 7、
-dividend 5…）。与 disclosure_topics 的分工 = SEC form type 之于 8-K items：
+仍在 topics 集合里不丢失。实测（2026-07-08 真库落地后）：other 92% → **16%**（15/91，全部为巨潮仅打
+012399 其它事项码的文档——董事会工作报告/财务决算/债权人通知类，诚实杂项；
+映射它会捏造语义，接受）。分布：equity_incentive 17、governance_rules 13、
+meeting_resolution 13、intermediary_report 7、dividend 5、performance_briefing 2…。
+API 通道补标题关键词兜底（码推导=other 时跑 web 通道同款规则包——巨潮漏码的
+业绩说明会类由标题救回）。与 disclosure_topics 的分工 = SEC form type 之于 8-K items：
 **单值主分类管 GROUP BY/看板/简单过滤，多值 topics 管检索**（激励解禁公告
 primary=equity_incentive，topics 同时含 equity_share_change）。
 L2 前向兼容规则写进契约说明：未知枚举值按 other 消费。

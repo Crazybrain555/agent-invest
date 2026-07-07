@@ -147,41 +147,53 @@ def split_category_segments(raw_category: str) -> list[str]:
 
 
 @lru_cache(maxsize=1)
-def _topic_prefixes() -> tuple[tuple[str, tuple[str, ...]], ...]:
-    payload = json.loads(
+def load_class_map() -> dict[str, Any]:
+    """The unified class vocabulary (one map, two outputs — design doc §3.1)."""
+
+    return json.loads(
         resources.files("disclosure_anchor.adapters.sources.cninfo")
-        .joinpath("topic_map.json")
+        .joinpath("class_map.json")
         .read_text(encoding="utf-8")
     )
-    return tuple(
-        (topic, tuple(str(p) for p in prefixes))
-        for topic, prefixes in payload["topics"].items()
+
+
+@lru_cache(maxsize=1)
+def load_facet_map() -> dict[str, Any]:
+    return json.loads(
+        resources.files("disclosure_anchor.adapters.sources.cninfo")
+        .joinpath("facet_map.json")
+        .read_text(encoding="utf-8")
     )
 
 
-def topics_for_category(raw_category: str | None) -> list[str] | None:
-    """Map F006V segments to disclosure_topics (round9 second-level buckets).
+def expand_filing_categories(values: Sequence[str] | None) -> tuple[str, ...] | None:
+    """Resolve watchlist filing_categories to F006V prefixes.
 
-    Multiple topics per announcement are normal; None when no segment matches
-    or the channel carries no categories (web fallback).
+    Operators write class keys (dividend;major_contract) — humane and stable;
+    raw F006V prefixes pass through unchanged for power use. Unknown values
+    raise so a typo in the watchlist cannot silently widen the sync filter.
     """
 
-    if not raw_category:
+    if values is None:
         return None
-    segments = split_category_segments(raw_category)
-    topics = {
-        topic
-        for topic, prefixes in _topic_prefixes()
-        for segment in segments
-        if any(segment.startswith(prefix) for prefix in prefixes)
-    }
-    return sorted(topics) or None
+    classes = load_class_map()["classes"]
+    prefixes: list[str] = []
+    for item in values:
+        if not item:
+            continue
+        if item in classes:
+            prefixes.extend(str(p) for p in classes[item]["prefixes"])
+        elif item[:1].isdigit() or item[:1] in ("N",):
+            prefixes.append(item)
+        else:
+            raise CninfoMappingError(f"unknown filing_categories value: {item!r}")
+    return tuple(prefixes) or None
 
 
 def category_prefix_matches(raw_category: str, categories: Sequence[str] | None) -> bool:
     if categories is None:
         return True
-    wanted = tuple(item for item in categories if item)
+    wanted = expand_filing_categories(tuple(categories))
     if not wanted:
         return True
     return any(

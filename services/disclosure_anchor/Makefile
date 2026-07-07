@@ -19,7 +19,7 @@ PGPORT ?= 55432
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	test-mineru-smoke lint typecheck agent-check api archive pg-init pg-start pg-stop \
-	pg-status db-create migrate register parse build-units publish process rebuild-units prune-history track track-status sync worker-once worker-loop doctor-full wipe-test-data
+	pg-status db-create migrate register parse build-units publish process rebuild-units prune-history load-rules track track-status sync worker-once worker-loop doctor-full wipe-test-data
 
 doctor:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -122,6 +122,11 @@ rebuild-units:
 prune-history:
 	@test "$(PRUNE)" = "YES" || (echo 'refusing: set PRUNE=YES to confirm' && exit 2)
 	./scripts/prune_history.sh
+
+# Load class_map.json + facet_map.json into disclosure_core.classification_rule.
+# Vocabulary upgrade = edit JSON + bump version + run this (views derive live).
+load-rules:
+	PYTHONPATH=src .venv/bin/python scripts/load_classification_rules.py
 
 # Upsert the company watchlist (config/watchlist.csv) into tracked_company.
 # Offline + idempotent; the worker backfills new companies on its next round.
