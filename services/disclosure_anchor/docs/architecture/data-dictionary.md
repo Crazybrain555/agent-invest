@@ -114,8 +114,8 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 | 文件 | 内容 | 当前版本 |
 |---|---|---|
-| adapters/unit_builder/rules.py | 切分/噪声/声明组合文法/语义规则 | RULES_VERSION ub-2026.07-15 |
-| adapters/unit_builder/note_key_map.json | 章节词表 **142 键**（section facet）（附注科目+年报正文节+三大报表+治理小节+新规节） | 2026-07-r3 |
+| adapters/unit_builder/rules.py | 切分/噪声/声明组合文法/语义规则 | RULES_VERSION ub-2026.07-16 |
+| adapters/unit_builder/note_key_map.json | 章节词表 **144 键**（section facet；祖先继承+全类型开放） | 2026-07-r4 |
 | adapters/unit_builder/event_key_map.json | 事件键 **30 键**（DuEE-fin/CCKS/FewFC/CFinDEE 并集，标题派生） | 2026-07-r1 |
 | adapters/sources/cninfo/filing_type_map.json | F006V→filing_type 9 桶 | 2026-07-r3 |
 | adapters/sources/cninfo/topic_map.json | F006V→disclosure_topics 12 题 | 2026-07-r1 |
@@ -131,6 +131,14 @@ text+CHECK（int 码是无 CHECK 时代的习惯），存储差异在本规模�
 ③它已进 public 契约与 query_projection_hash，改类型=契约升版+全量投影事件翻搅，
 收益不成比例。若未来引入第三态语义（如 partially_applicable），扩 CHECK 即可。
 不同意可推翻——改动路径：0016 迁移+契约升版。
+
+**semantic_key 用英文还是中文（round13 决策：英文规范键 + 词表即中文标签层）**：
+键是机器路由标识，ASCII 标识符在 SQL/API/代码中零引号零编码负担；XBRL 正是这个
+模式（英文 element name + 中文 standard label），tushare 同理（英文字段+中文文档）。
+中文层已经存在——note_key_map/event_key_map 的 names/aliases 就是法定中文名，
+即双语词典本体；L2 查询侧中文→键的映射用它（06R 同义词表正式化）。不做中英双写键
+（同概念两拼写会碎化过滤）。若要行内可见中文，06R 投影的 controlled_keywords 可带
+中文标签进 search_text。
 
 **semantic_keys 为什么用 jsonb 数组不用关联表**：多值标签三种形态中，
 jsonb+GIN（现状）查询 `? key` 走索引（已 EXPLAIN 验证）、随行读取零 join；

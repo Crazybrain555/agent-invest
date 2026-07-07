@@ -24,7 +24,7 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-15")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-16")
         self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v5")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
@@ -283,8 +283,9 @@ class UnitBuilderTests(unittest.TestCase):
         # Rule keys and note-vocabulary keys coexist on the unit.
         self.assertEqual(
             section.semantic_keys,
-            ["inventory", "inventory_breakdown", "main_business_analysis",
-             "revenue_and_cost", "revenue_breakdown"],
+            # Ancestor inheritance (round13): the chapter key joins the set.
+            ["business_review", "inventory", "inventory_breakdown",
+             "main_business_analysis", "revenue_and_cost", "revenue_breakdown"],
         )
 
     def test_collapsed_document_title_uses_registry_title(self) -> None:
@@ -645,21 +646,47 @@ class UnitBuilderTests(unittest.TestCase):
         self.assertIn("other_comprehensive_income", all_keys)
         self.assertIn("rd_expenses", all_keys)
 
-    def test_note_vocabulary_gated_to_periodic_reports(self) -> None:
-        unit_title = "其他综合收益"
+    def test_generic_leaf_inherits_ancestor_note_key(self) -> None:
+        # Round13 用户裁决: "(1) 明细情况" 类无科目语义标题必须从最近的科目
+        # 祖先继承键——L2 除 heading 外就靠 semantic_keys 检索。
         units, _ = build_unit_drafts_s1_s7(
             {
                 "elements": [
                     {"kind": "heading", "raw_kind": "text", "order_index": 1,
-                     "heading_level": 1, "text": unit_title},
+                     "heading_level": 1, "text": "第八节 财务报告"},
+                    {"kind": "heading", "raw_kind": "text", "order_index": 2,
+                     "heading_level": 2, "text": "19、其他非流动金融资产"},
+                    {"kind": "heading", "raw_kind": "text", "order_index": 3,
+                     "heading_level": 2, "text": "(1) 明细情况"},
+                    {"kind": "text", "raw_kind": "text", "order_index": 4,
+                     "text": "其他非流动金融资产明细如下表所示。"},
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        target = next(u for u in units if "明细" in str(u.payload))
+        self.assertIn("other_noncurrent_financial_assets", target.semantic_keys or [])
+        self.assertIn("financial_report_chapter", target.semantic_keys or [])
+        # 最具体键作为单值 semantic_key
+        self.assertEqual(target.semantic_key, "other_noncurrent_financial_assets")
+
+    def test_note_vocabulary_applies_to_other_filing_types(self) -> None:
+        # Round13: 审计报告等 'other' 文档同样承载报表/附注结构，词表键开放。
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {"kind": "heading", "raw_kind": "text", "order_index": 1,
+                     "heading_level": 1, "text": "其他综合收益"},
                     {"kind": "text", "raw_kind": "text", "order_index": 2,
                      "text": "临时公告正文。" * 1200},
                 ]
             },
             filing_type="other",
         )
-        for unit in units:
-            self.assertNotIn("other_comprehensive_income", unit.semantic_keys or [])
+        self.assertTrue(
+            any("other_comprehensive_income" in (u.semantic_keys or []) for u in units)
+        )
 
     def test_full_s1_s7_oversized_leaf_still_merges_whole(self) -> None:
         # Splitting one topic by payload kind is the defect — an oversized

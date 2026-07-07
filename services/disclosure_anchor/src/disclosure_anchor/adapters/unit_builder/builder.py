@@ -651,11 +651,10 @@ def s7_finalize_units(
         keys.update(event_keys)
         if semantic_key:
             keys.add(semantic_key)
-        note_key = _note_key_for_unit(unit, filing_type=filing_type)
-        if note_key:
-            keys.add(note_key)
-            if semantic_key is None:
-                semantic_key = note_key
+        note_keys = _note_keys_for_unit(unit, filing_type=filing_type)
+        keys.update(note_keys)
+        if semantic_key is None and note_keys:
+            semantic_key = note_keys[0]
         quality_status = _final_quality_status(unit)
         if quality_status == "needs_review":
             stats.needs_review_count += 1
@@ -1122,11 +1121,8 @@ def _member_semantic_keys(
             or semantic_key_for_unit(member, filing_type=filing_type)
         )
     }
-    keys.update(
-        key
-        for member in members
-        if (key := _note_key_for_unit(member, filing_type=filing_type))
-    )
+    for member in members:
+        keys.update(_note_keys_for_unit(member, filing_type=filing_type))
     return sorted(keys) or None
 
 
@@ -1246,14 +1242,29 @@ def _unit_sort_key(unit: UnitDraft) -> tuple[int, int]:
     return (unit.source_order, unit.intra_order)
 
 
-def _note_key_for_unit(unit: UnitDraft, *, filing_type: str | None) -> str | None:
-    """附注科目键：只在定期报告类文档里按标题词表派生（法定封闭集）。"""
+def _note_keys_for_unit(
+    unit: UnitDraft, *, filing_type: str | None
+) -> list[str]:
+    """章节键（含祖先继承，round13 用户裁决）：标题优先，然后沿 heading_path
+    自深向浅逐级取键——"(1) 明细情况" 这类无科目语义的叶子从最近的科目祖先
+    继承（19、其他非流动金融资产 → other_noncurrent_financial_assets），
+    章级键（第八节 财务报告 → financial_report_chapter）一并入组。返回按
+    深度有序去重的列表，首个即最具体键。"""
 
-    if filing_type not in rules.SEMANTIC_LIMITED_FILING_TYPES:
-        return None
-    return rules.note_key_for_title(unit.title) or rules.note_key_for_title(
-        unit.heading_path[-1] if unit.heading_path else None
-    )
+    # 词表键对全部文档类型开放（round13：审计报告等 'other' 文档同样承载
+    # 报表与附注结构；标题匹配有界，误配风险可控且被类扫描看护）。
+    keys: list[str] = []
+    candidates = [unit.title, *reversed(unit.heading_path)]
+    for candidate in candidates:
+        key = rules.note_key_for_title(candidate)
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _note_key_for_unit(unit: UnitDraft, *, filing_type: str | None) -> str | None:
+    keys = _note_keys_for_unit(unit, filing_type=filing_type)
+    return keys[0] if keys else None
 
 
 def semantic_key_for_unit(unit: UnitDraft, *, filing_type: str | None) -> str | None:

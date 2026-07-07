@@ -15,6 +15,12 @@ SQL 都是"抓一整类"的写法。
 
 ## 0. 审查前置
 
+新增审查对象（round12-13）：`docs/architecture/data-dictionary.md`（逐列核对与实库
+一致）；词表文件 note_key_map r4（144 键）/ event_key_map r1（30 事件键）/
+topic_map / parse_scope；三 facet 架构（retrieval 设计文档 §4.6）。
+
+## 0.1 原审查前置
+
 - 读：`docs/architecture/service-purpose.md`（canonical 契约）→
   `docs/implementation/design/*.md`（watchlist/检索两份决议）→
   `docs/implementation/milestones/09-production-readiness.md`（背账）→
@@ -101,7 +107,12 @@ WHERE is_active_run AND payload->>'text' ~ '单位(均)?[为是]?[：:]\S{1,12}$
 - "详见附注 X"交叉引用单元——真实内容，保留。
 - 金融工具风险节内部 1、/(一) 层级倒置的次级归属（不窜根即可）。
 - web 兜底通道 disclosure_topics=null（接口无 F006V）。
-- 附注 37 个"其他说明/明细情况"类无科目语义标题不强配 note key。
+- semantic_keys 覆盖纪律（round13 用户裁决"检索靠它，不能少"）：词表键做祖先继承
+  （无科目语义的叶子从最近科目祖先取键+章级键），并对全部 filing_type 开放；
+  验收口径=年报/审计报告附注 NULL 为 0、全库覆盖 ≥95%；剩余 NULL 仅限公告头存根
+  与词表外标题（当前 11 个），每轮类扫描复核该清单未增长。
+- semantic_key 用英文规范键 + 词表文件即中文标签层（XBRL 模式，round13 决策，
+  见 data-dictionary §5）；不做中英双写键。
 
 ## 5. 开放背账（review 时核对是否恶化）
 
