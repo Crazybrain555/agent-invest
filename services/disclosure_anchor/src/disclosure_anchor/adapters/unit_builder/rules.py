@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-12"
+RULES_VERSION = "ub-2026.07-13"
 HEADING_RULESET_ID = "cn_a_v5"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -61,9 +61,28 @@ def strip_header_kv_line(line: str) -> str | None:
 # extracts the value into table payload `unit` from the element stream, so a
 # text unit carrying only this line is pure duplication (audited: 194 of 908
 # units in a real annual report).
+# Generalized (round10): descriptive prefixes ("财务附注中报表的单位为：元")
+# and 为/是 separators all reduce to the same duplication — table units carry
+# the unit value themselves. Bounded prefix keeps substantive sentences safe.
 UNIT_DECLARATION_RE = re.compile(
-    r"^\s*(?:金\s*额|币\s*种)?\s*单\s*位\s*[：:]\s*\S{1,12}\s*$"
+    r"^\s*[^，。；,;]{0,12}?单\s*位(?:均)?\s*[为是]?\s*[：:]\s*\S{1,12}\s*[。.]?\s*$"
 )
+
+# Standalone-noise units (round10 class guard): a text unit whose ENTIRE
+# content is a bare colon-terminated label ("其他说明：") or a lone year
+# fragment ("2025 年度") carries no retrievable fact — drop counted. These
+# patterns apply only to whole-unit text, never to lines inside larger units.
+STANDALONE_NOISE_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\S{1,8}[：:]$"),
+    re.compile(r"^(?:19|20)\d{2}\s*年度?$"),
+)
+
+
+def is_standalone_noise(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return any(pattern.fullmatch(stripped) for pattern in STANDALONE_NOISE_RES)
 
 
 def classify_marker_line(line: str) -> str | None:

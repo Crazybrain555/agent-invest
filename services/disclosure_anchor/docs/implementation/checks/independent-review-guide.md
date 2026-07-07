@@ -1,0 +1,109 @@
+---
+id: disclosure_anchor_independent_review_guide
+project: disclosure_anchor
+title: 独立审查大清单（code review + 表字段 review 开工指南）
+status: living
+created_at: 2026-07-07
+---
+
+# 独立审查大清单
+
+**用法**：新 session 的独立审查按本清单开工。立场 = "L2 拿这些数据能不能直接用"，
+不是"代码能不能跑"。每一节先跑 SQL/命令取证，再下判断；每个 finding 带
+file:line 或行级 SQL 证据。历史经验：**逐案打地鼠不如类扫描**——本清单的
+SQL 都是"抓一整类"的写法。
+
+## 0. 审查前置
+
+- 读：`docs/architecture/service-purpose.md`（canonical 契约）→
+  `docs/implementation/design/*.md`（watchlist/检索两份决议）→
+  `docs/implementation/milestones/09-production-readiness.md`（背账）→
+  05 里程碑 §8.5（规则包 ub-2026.07-2..-13 全部修订史）。
+- 环境：`set -a; source ~/.config/agent-invest/disclosure_anchor/worker.env; set +a`；
+  DB 只读直连 psql 或 dbhub。
+- 语料状态：`make track-status`；确认单一规则代
+  （`SELECT DISTINCT builder_rules_version FROM ... WHERE is_active`）。
+
+## 1. 表字段 review（逐表逐列，问四个问题）
+
+对 `disclosure_core` 每张表的每一列问：①语义是否唯一清楚（与 service-purpose §5-§7
+对得上）？②空值合法吗（NULL=什么意思，是 SQL NULL 不是 JSON null）？③谁写它、
+何时变（不可变列被 update 过吗）？④L2 按它筛选时有索引吗？
+
+重点核对项：
+- company/company_identifier/security：USCC 唯一、identifier 有 source_access、
+  exchange 全大写、无 PENDING_LEGAL_NAME 残留（有=该公司从未成功同步过）。
+- tracked_company：与 config/watchlist.csv 对账零漂移（`make track` 输出 drift=0）；
+  lookback/filing_categories/sync_frequency 三列有值时 worker 真在用（queries.sync_due）。
+- document：filing_type 词表 9 值闭集；disclosure_topics 与 provider_metadata
+  raw_category 一致（抽 5 行手工对 topic_map.json）；report_period 定期报告必填；
+  status 生命周期（published 不降级）。
+- document_unit：见 §2 切分审查。三哈希列非空且 content_hash 不含检索派生字段。
+- processing_run：每文档 active 唯一；无 status='running' 孤儿（stale reclaim 工作）；
+  builder_rules_version 单一。
+- source_access/source_checkpoint：失败也有行（profile/index 双路径）；cursor 含
+  window_end/window_start/synced_at；无凭据泄漏（query_params 无 token/secret）。
+- outbox_event：projection_changed 的 changed_fields 非空；seq 单调。
+
+## 2. 切分质量审查（投资经理视角 + 类扫描 SQL）
+
+固定验收包（应全零；round3 review 文档尾部有完整 SQL）：
+A 议案标题误挂 / B 首单元从第三章起 / C 空 heading_path / D 标记行进标题 /
+E payload 带 applicability。
+
+类扫描（每轮规则变更后必跑）：
+```sql
+-- 微型孤儿单元：<25 字独立 text 单元全清单（人工逐行判：声明变体该剥、
+-- 标签碎片该丢、实质一句话事实该留）
+SELECT provider_document_id, heading_path->>-1, payload->>'text'
+FROM disclosure_public.document_units_v1
+WHERE is_active_run AND payload_kind='text'
+  AND length(coalesce(payload->>'text','')) BETWEEN 1 AND 25;
+-- title 空值
+SELECT count(*) FROM disclosure_public.document_units_v1 WHERE is_active_run AND title IS NULL;
+-- 声明残留（单位/保证/适用 三族）
+SELECT count(*) FROM disclosure_public.document_units_v1
+WHERE is_active_run AND payload->>'text' ~ '单位(均)?[为是]?[：:]\S{1,12}$';
+-- 过碎审计：filing_type='other' 且 units>=10 且总字数<8000 的文档需逐一给理由
+-- 过粗审计：单 unit chars>15000 的抽查其 parts 是否同主题
+```
+目检协议：随机抽 ≥5 份不同 filing_type 的文档，`pdftoppm` 渲染对应页
+（page_no 列可定位），逐单元对照 PDF 判断：边界是否业务完整、标题归属是否正确、
+表格是否整存、mixed parts 顺序/local_heading 是否与版面一致。
+
+## 3. code review 分层清单
+
+- **domain**：实体无 IO；枚举闭集走契约升版；错误分型 retryable 语义正确
+  （尤其 quota_exhausted=请求内 fail-fast + 下轮可重试）。
+- **unit_builder**：规则全部在 rules.py 且版本化（改规则必升 RULES_VERSION）；
+  builder 纯函数无 IO；三个词表 JSON（note_key_map/topic_map/parse_scope）
+  与代码读取键一致；内容哈希纯净性——payload 不得含任何规则派生值（U2）。
+- **worker**：队列谓词只在 queries.py；批次上限/背压/熔断路径有测试；
+  单项异常隔离不破轮。
+- **sources/cninfo**：凭据只从 env；query_params 持久化前剔除 token；
+  429/透传错误分型；两通道（API/web）候选形状一致性。
+- **api**：读端点只出 public 视图列；错误 envelope 无堆栈无绝对路径；
+  admin 默认不挂载；DERIVED 白名单={asset_uri}。
+- **migrations**：新改动从 0016 起；视图变更=契约变更（列 pin 测试 + checklist 同步 +
+  export_contracts 重导）；已应用迁移不改。
+- **tests**：新行为必有回归测试；集成测试 tearDown 自清理；对真库敏感的测试
+  （LIMIT/日期排序）必须对积压免疫。
+
+## 4. 已知接受项（不要重复开 finding）
+
+- 同主题大 mixed 单元（主营业务分析 25 parts）——用户裁决可接受。
+- 会计政策一句话叶子单元——原子事实，保留（round10 决定；异议再议）。
+- "详见附注 X"交叉引用单元——真实内容，保留。
+- 金融工具风险节内部 1、/(一) 层级倒置的次级归属（不窜根即可）。
+- web 兜底通道 disclosure_topics=null（接口无 F006V）。
+- 附注 37 个"其他说明/明细情况"类无科目语义标题不强配 note key。
+
+## 5. 开放背账（review 时核对是否恶化）
+
+见 09 里程碑待办区。数据正确性四大项：checkpoint 空洞、changes feed 并发跳事件、
+下载 403 毒化、公司改名卡死。均未修，review 应验证其仍是"未恶化的已知项"。
+
+## 6. 每轮审查的产出格式
+
+P0/P1/P2 分级 findings（行级证据 + 修法建议）+ "已核无发现"清单 + go/no-go 结论。
+假阳性教训：jsonb 数组用 `->>` 取出后是文本渲染，判断类型用 `jsonb_typeof`。

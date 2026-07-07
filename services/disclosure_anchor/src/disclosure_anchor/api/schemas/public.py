@@ -69,6 +69,7 @@ class DocumentUnitV1(PublicModel):
     provider_document_id: str | None
     payload_kind: str
     heading_path: list[str]
+    heading_path_text: str | None
     title: str | None
     order_index: int
     semantic_key: str | None

@@ -50,6 +50,7 @@ UNIT_COLUMNS = (
     "provider_document_id",
     "payload_kind",
     "heading_path",
+    "heading_path_text",
     "title",
     "order_index",
     "semantic_key",

@@ -521,6 +521,29 @@ def replace_text_units_with_qa_where_stable(units: Iterable[UnitDraft]) -> list[
     return output
 
 
+def _drop_standalone_noise_units(
+    units: list[UnitDraft], *, stats: BuildStats
+) -> list[UnitDraft]:
+    """Drop whole units that are bare labels or year fragments (round10).
+
+    Only fires on standalone text units whose entire content matches the
+    closed noise patterns; counted, never silent (D9). The raw artifact keeps
+    the line for reprocessing.
+    """
+
+    kept: list[UnitDraft] = []
+    for unit in units:
+        if (
+            unit.payload_kind == "text"
+            and "image_ref" not in unit.payload
+            and rules.is_standalone_noise(str(unit.payload.get("text", "")))
+        ):
+            stats.dropped_by_kind["standalone_noise"] += 1
+            continue
+        kept.append(unit)
+    return kept
+
+
 def _flag_shredded_qa_table(unit: UnitDraft) -> UnitDraft:
     """Flag Q&A transcripts that MinerU mis-detected as a table.
 
@@ -677,6 +700,7 @@ def build_unit_drafts_s1_s7(
     kept = s8_group_semantic_units(
         kept, filing_type=filing_type, document_title=document_title, stats=s1.stats
     )
+    kept = _drop_standalone_noise_units(kept, stats=s1.stats)
     return s7_finalize_units(kept, filing_type=filing_type, stats=s1.stats), s1.stats
 
 
@@ -710,7 +734,7 @@ def _anchor_headerless_units(
                 **{
                     **unit.__dict__,
                     "heading_path": [anchor],
-                    "title": unit.title or (anchor if fully_flat else None),
+                    "title": unit.title or anchor,
                 }
             )
         )

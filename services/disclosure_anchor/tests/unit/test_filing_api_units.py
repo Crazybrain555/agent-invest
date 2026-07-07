@@ -62,6 +62,7 @@ def _unit_row(
         "provider_document_id": "pid-doc_1",
         "payload_kind": "text",
         "heading_path": ["第一节", "风险"],
+        "heading_path_text": "第一节 > 风险",
         "title": "风险提示",
         "order_index": order_index,
         "semantic_key": "risk",
