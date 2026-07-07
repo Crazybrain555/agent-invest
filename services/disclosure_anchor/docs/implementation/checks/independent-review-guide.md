@@ -67,6 +67,11 @@ WHERE is_active_run AND payload->>'text' ~ '单位(均)?[为是]?[：:]\S{1,12}$
 -- 过碎审计：filing_type='other' 且 units>=10 且总字数<8000 的文档需逐一给理由
 -- 过粗审计：单 unit chars>15000 的抽查其 parts 是否同主题
 ```
+变体发现环（业界定式：C4/eDiscovery 频率法，round11 调研落地）：
+`PYTHONPATH=src .venv/bin/python scripts/audit_boilerplate_candidates.py`
+——跨文档高频短行且未被现有模式族覆盖的 = 候选新套话变体，人工确认后
+晋级进 rules 模式族并升 RULES_VERSION；切分时永远只跑确定性模式。
+
 目检协议：随机抽 ≥5 份不同 filing_type 的文档，`pdftoppm` 渲染对应页
 （page_no 列可定位），逐单元对照 PDF 判断：边界是否业务完整、标题归属是否正确、
 表格是否整存、mixed parts 顺序/local_heading 是否与版面一致。

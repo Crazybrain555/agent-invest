@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-13"
+RULES_VERSION = "ub-2026.07-14"
 HEADING_RULESET_ID = "cn_a_v5"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -61,12 +61,55 @@ def strip_header_kv_line(line: str) -> str | None:
 # extracts the value into table payload `unit` from the element stream, so a
 # text unit carrying only this line is pure duplication (audited: 194 of 908
 # units in a real annual report).
-# Generalized (round10): descriptive prefixes ("财务附注中报表的单位为：元")
-# and 为/是 separators all reduce to the same duplication — table units carry
-# the unit value themselves. Bounded prefix keeps substantive sentences safe.
-UNIT_DECLARATION_RE = re.compile(
-    r"^\s*[^，。；,;]{0,12}?单\s*位(?:均)?\s*[为是]?\s*[：:]\s*\S{1,12}\s*[。.]?\s*$"
+# Generalized to a pattern FAMILY (round11, user directive: 泛化能力): unit /
+# currency declarations vary freely across filing formats but reduce to the
+# same metadata duplication — table units carry the unit value themselves.
+# Family members are full-line anchored with bounded free spans (red line:
+# a sentence carrying real content must never match). Residual new variants
+# surface via the tiny-orphan sweep (independent-review-guide §2), get added
+# here, and bump RULES_VERSION.
+# Compositional axes (StudyOnCompany-style token grammar; round11 research):
+# lead-in(单位|金额单位|币种|货币单位|计量单位) x copula(：|为|均为|均以|指) x
+# hedge(除特别注明外|如无特殊说明|除另有指明外) x currency x magnitude
+# (元|千元|万元|百万元|亿元) x verb(列示|表示|为单位), optional （…） wrapping,
+# and multi-declaration lines (单位：元 币种：人民币). New variants are
+# DISCOVERED by the offline corpus-frequency audit
+# (scripts/audit_boilerplate_candidates.py), promoted here, and bump
+# RULES_VERSION — slice time stays deterministic.
+_DECL_LEAD = r"(?:货\s*币|金\s*额|计\s*量)?\s*单\s*位|币\s*种"
+_DECL_COPULA = r"(?:均)?\s*(?:[为是指]|以)?\s*[：:]?\s*"
+_DECL_CURRENCY = r"(?:人民币|美元|港[币元]|欧元|日元|英镑)?"
+_DECL_MAGNITUDE = r"(?:千?百?万?亿?元|千元|百万元|亿元)?"
+_DECL_VALUE = rf"{_DECL_CURRENCY}\s*{_DECL_MAGNITUDE}"
+_DECL_ONE = rf"(?:{_DECL_LEAD}){_DECL_COPULA}{_DECL_VALUE}"
+_DECL_HEDGE = r"(?:除特别(?:注明|说明)外|除另有(?:指明|说明)外|(?:如|若)无特(?:殊|别)(?:说明|注明))"
+UNIT_DECLARATION_RES: tuple[re.Pattern[str], ...] = (
+    # [（]?前缀? 单位/币种声明（可多段：单位：元 币种：人民币 审计类型：未经审计）[）]?
+    re.compile(
+        rf"^\s*[（(]?\s*[^，。；,;]{{0,14}}?(?:{_DECL_ONE})"
+        rf"(?:\s+{_DECL_ONE}|\s*币\s*种{_DECL_COPULA}\S{{1,8}}|\s*审计类型\s*[：:]\s*\S{{1,8}})*"
+        r"\s*[）)]?\s*[。.]?\s*$"
+    ),
+    # [（]?除特别注明外，……以人民币[百万]元列示/为单位/计价[）]?
+    re.compile(
+        rf"^\s*[（(]?\s*{_DECL_HEDGE}[，,]?[^，。；]{{0,24}}?"
+        rf"(?:人民币|美元|港[币元]|欧元)[^，。；]{{0,10}}?"
+        r"(?:列示|表示|为单位|计价)?\s*[）)]?\s*[。.]?\s*$"
+    ),
+    # 本报告中如无特殊说明，货币单位均为人民币元。
+    re.compile(
+        rf"^\s*本[^，。；]{{0,10}}{_DECL_HEDGE}[，,]?"
+        r"[^，。；]{0,14}(?:单位|币种|金额)[^，。；]{0,14}[。.]?\s*$"
+    ),
 )
+UNIT_DECLARATION_RE = UNIT_DECLARATION_RES[0]
+
+
+def is_unit_declaration_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return any(pattern.fullmatch(stripped) for pattern in UNIT_DECLARATION_RES)
 
 # Standalone-noise units (round10 class guard): a text unit whose ENTIRE
 # content is a bare colon-terminated label ("其他说明：") or a lone year
@@ -75,7 +118,26 @@ UNIT_DECLARATION_RE = re.compile(
 STANDALONE_NOISE_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\S{1,8}[：:]$"),
     re.compile(r"^(?:19|20)\d{2}\s*年度?$"),
+    # 结尾套话（round11 发现环第一例：9 docs/3 companies）
+    re.compile(r"^特此公告[。.！!]?$"),
 )
+
+
+# 发现环第二轮晋级（round11）：公司名参数化的眉头/称呼/落款行。
+_COMPANY_BOILERPLATE_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^编制单位\s*[:：]\s*\S{2,30}$"),      # 编制单位:XX股份有限公司
+    re.compile(r"^\S{2,30}全体股东\s*[:：]\s*$"),        # 审计报告称呼行
+    re.compile(r"^\S{2,28}公司(?:董事会|监事会)$"),          # 落款行
+)
+
+
+def is_closing_formula_line(line: str) -> bool:
+    """套话行：结尾敬语 + 公司名参数化眉头/称呼/落款（发现环晋级）。"""
+
+    stripped = line.strip()
+    if re.fullmatch(r"特此公告[。.！!]?", stripped):
+        return True
+    return any(pattern.fullmatch(stripped) for pattern in _COMPANY_BOILERPLATE_RES)
 
 
 def is_standalone_noise(text: str) -> bool:

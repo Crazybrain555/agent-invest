@@ -24,7 +24,7 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-13")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-14")
         self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v5")
         self.assertEqual(rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件"})
         self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
@@ -534,6 +534,25 @@ class UnitBuilderTests(unittest.TestCase):
         # The year line nests as an unnumbered sub-label, never a numbered
         # top-level node; and it must not evict 财务报表附注.
         self.assertEqual(placed[-1].heading_path[0], "财务报表附注")
+
+    def test_unit_declaration_family_generalizes(self) -> None:
+        # Round11 (user directive 泛化能力): the declaration is a pattern
+        # FAMILY across filing formats; substantive sentences never match.
+        strip = [
+            "单位：元", "金额单位：人民币元", "财务附注中报表的单位为：元",
+            "货币单位：万元", "币种：人民币",
+            "除特别注明外，本财务报表附注均以人民币元列示。",
+            "本报告中如无特殊说明，货币单位均为人民币元。",
+        ]
+        keep = [
+            "公司记账本位币为人民币。",
+            "境外子公司以美元为记账本位币，折算方法见会计政策。",
+            "本报告中如无特殊说明，均指合并口径的经营数据及相关分析。",
+        ]
+        for line in strip:
+            self.assertTrue(rules.is_unit_declaration_line(line), line)
+        for line in keep:
+            self.assertFalse(rules.is_unit_declaration_line(line), line)
 
     def test_amount_unit_declaration_variant_is_stripped(self) -> None:
         units, stats = build_unit_drafts_s1_s7(

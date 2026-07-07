@@ -1398,12 +1398,14 @@ def _strip_declaration_lines(
     kept: list[str] = []
     applicability: str | None = None
     for index, line in enumerate(lines):
-        if rules.UNIT_DECLARATION_RE.fullmatch(line):
+        if rules.is_unit_declaration_line(line):
             if stats is not None:
                 stats.dropped_unit_declarations += 1
             continue
-        if rules.BOILERPLATE_GUARANTEE_RE.match(line):
-            # Fixed board-guarantee legalese (§3.5 稳定噪声, user-authorized).
+        if rules.BOILERPLATE_GUARANTEE_RE.match(line) or rules.is_closing_formula_line(
+            line
+        ):
+            # Fixed legalese/closing formulas (§3.5 稳定噪声, user-authorized).
             if stats is not None:
                 stats.dropped_boilerplate_lines += 1
             continue
