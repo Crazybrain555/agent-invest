@@ -72,6 +72,37 @@ class TrackCompaniesTests(unittest.TestCase):
         self.assertEqual(tracked[0].lookback, {"days": 90})
         self.assertEqual(len(uow.companies.items), 1)
 
+    def test_blank_csv_cells_clear_stale_overrides(self) -> None:
+        # CSV is the single source of truth: a blank cell means "use the
+        # default" and must clear a previously-set override (acceptance P1).
+        uow = FakeUnitOfWork()
+        use_case = TrackCompanies(uow_factory=lambda: uow)
+        use_case.execute(
+            TrackCompaniesCommand(
+                entries=(
+                    TrackEntry(
+                        security_code="600519",
+                        exchange="SSE",
+                        lookback_days=30,
+                        sync_frequency="hourly",
+                        filing_categories=("F006V01",),
+                    ),
+                )
+            )
+        )
+
+        use_case.execute(
+            TrackCompaniesCommand(
+                entries=(TrackEntry(security_code="600519", exchange="SSE"),)
+            )
+        )
+
+        tracked = list(uow.tracked_companies.items.values())
+        self.assertEqual(len(tracked), 1)
+        self.assertIsNone(tracked[0].lookback)
+        self.assertIsNone(tracked[0].sync_frequency)
+        self.assertIsNone(tracked[0].filing_categories)
+
     def test_reconcile_reports_and_prunes_drift(self) -> None:
         uow = FakeUnitOfWork()
         use_case = TrackCompanies(uow_factory=lambda: uow)

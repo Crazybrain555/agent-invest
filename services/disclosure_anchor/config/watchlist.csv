@@ -14,3 +14,5 @@ security_code,exchange,status,joined_date,lookback_days,sync_frequency,filing_ca
 600900,SSE,active,2026-07-07,,,,长江电力-round8测试入池
 601398,SSE,active,2026-07-07,,,,工商银行-round8测试入池
 300750,SZSE,active,2026-07-07,,,,宁德时代-round8测试入池
+601318,SSE,active,2026-07-07,,,,中国平安-acceptance
+000858,SZSE,active,2026-07-07,30,,,五粮液-acceptance-lookback30

@@ -249,6 +249,10 @@ class FilingApiRuntimeTests(unittest.TestCase):
         self.run_ids: list[str] = []
         self.asset_ids: list[str] = []
         self.event_ids: list[str] = []
+        # Run-unique stem: a crashed previous run must never collide with the
+        # provider_document_id unique key (tests/CLAUDE.md T{ulid} convention;
+        # Codex acceptance P2).
+        self.provider_stem = f"m06-{ids.new_ulid()[-8:].lower()}"
 
     def tearDown(self) -> None:
         self._cleanup_rows()
@@ -262,7 +266,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
                 company_id=company_id,
                 security_id=security_id,
                 source_access_id=source_access_id,
-                provider_document_id="m06-page-a",
+                provider_document_id=f"{self.provider_stem}-page-a",
                 filing_type="other",
                 report_period=None,
                 announcement_date=date(2026, 7, 5),
@@ -271,7 +275,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
                 company_id=company_id,
                 security_id=security_id,
                 source_access_id=source_access_id,
-                provider_document_id="m06-page-b",
+                provider_document_id=f"{self.provider_stem}-page-b",
                 filing_type="other",
                 report_period=None,
                 announcement_date=date(2026, 7, 4),
@@ -280,7 +284,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
                 company_id=company_id,
                 security_id=security_id,
                 source_access_id=source_access_id,
-                provider_document_id="m06-page-null",
+                provider_document_id=f"{self.provider_stem}-page-null",
                 filing_type="other",
                 report_period=None,
                 announcement_date=None,
@@ -312,7 +316,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
             company_id=company_id,
             security_id=security_id,
             source_access_id=source_access_id,
-            provider_document_id="m06-latest-old",
+            provider_document_id=f"{self.provider_stem}-latest-old",
             filing_type="other",
             report_period=None,
             announcement_date=date(2026, 7, 1),
@@ -321,7 +325,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
             company_id=company_id,
             security_id=security_id,
             source_access_id=source_access_id,
-            provider_document_id="m06-latest-new",
+            provider_document_id=f"{self.provider_stem}-latest-new",
             filing_type="other",
             report_period=None,
             announcement_date=date(2026, 7, 2),
@@ -332,7 +336,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
             company_id=company_id,
             security_id=security_id,
             source_access_id=source_access_id,
-            provider_document_id="m06-tie-a",
+            provider_document_id=f"{self.provider_stem}-tie-a",
             filing_type="annual_report",
             report_period="2025A",
             announcement_date=date(2026, 7, 5),
@@ -342,7 +346,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
             company_id=company_id,
             security_id=security_id,
             source_access_id=source_access_id,
-            provider_document_id="m06-tie-z",
+            provider_document_id=f"{self.provider_stem}-tie-z",
             filing_type="annual_report",
             report_period="2025A",
             announcement_date=date(2026, 7, 5),
@@ -660,7 +664,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
         active_run_id = ids.new_processing_run_id()
         failed_run_id = ids.new_processing_run_id()
         history_run_id = ids.new_processing_run_id()
-        provider_document_id = "m06-units"
+        provider_document_id = f"{self.provider_stem}-units"
         document_id = self._insert_document(
             company_id=company_id,
             security_id=security_id,

@@ -148,12 +148,12 @@ class TrackCompanies:
         if existing is not None:
             existing.security_id = subject.security.security_id
             existing.status = entry.status
-            if lookback is not None:
-                existing.lookback = lookback
-            if categories is not None:
-                existing.filing_categories = categories
-            if entry.sync_frequency is not None:
-                existing.sync_frequency = entry.sync_frequency
+            # CSV is the single source of truth: a blank cell means "use the
+            # default", so reconcile must also CLEAR a stale DB override
+            # (Codex acceptance P1: blank lookback left {"days":30} behind).
+            existing.lookback = lookback
+            existing.filing_categories = categories
+            existing.sync_frequency = entry.sync_frequency
             uow.tracked_companies.update(existing)
             return TrackEntryResult(
                 security_code=entry.security_code,
