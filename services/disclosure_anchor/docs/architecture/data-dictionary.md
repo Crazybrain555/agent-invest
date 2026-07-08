@@ -134,6 +134,7 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 | adapters/sources/cninfo/facet_map.json | F006V 维度判定（market 精确码/publisher 0101） | 2026-07-r1 |
 | adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（仅注册时写表列） | 2026-07-r3 |
 | application/worker/parse_scope.json | 分层解析 core_classes（25 核心/5 降级） | 2026-07-r4 |
+| application/worker/download_scope.json | **分层下载** core_classes（19 类，round20：全量登记、PDF 只下核心；DISCLOSURE_DOWNLOAD_SCOPE=all 关闭；解析实际生效面 = parse ∩ download） | 2026-07-r1 |
 | config/watchlist.csv | 股票池唯一真源 | git 即版本 |
 
 ## 5. 设计讨论记录

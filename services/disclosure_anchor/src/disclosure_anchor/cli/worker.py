@@ -172,9 +172,21 @@ def _deps(settings: Settings, engine: Engine) -> WorkerDeps:
             initial_lookback_days=settings.disclosure_initial_lookback_days,
             backfill_max_pending_downloads=settings.disclosure_backfill_max_pending_downloads,
             parse_scope_classes=_parse_scope_classes(settings),
+            download_scope_classes=_download_scope_classes(settings),
         ),
         clock=lambda: datetime.now(timezone.utc),
     )
+
+
+def _download_scope_classes(settings: Settings) -> tuple[str, ...] | None:
+    if settings.disclosure_download_scope == "all":
+        return None
+    payload = json.loads(
+        resources.files("disclosure_anchor.application.worker")
+        .joinpath("download_scope.json")
+        .read_text(encoding="utf-8")
+    )
+    return tuple(str(t) for t in payload["core_classes"])
 
 
 def _parse_scope_classes(settings: Settings) -> tuple[str, ...] | None:

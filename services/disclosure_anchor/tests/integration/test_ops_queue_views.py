@@ -336,6 +336,83 @@ class OpsQueueViewTests(unittest.TestCase):
             txn.rollback()
             conn.close()
 
+    def test_pending_download_scope_filters_by_class_and_title(self) -> None:
+        # round20: download-layer scoping — coded candidates gate on class
+        # rules, code-less candidates on title rules. Rollback, no residue.
+        pid_core = f"qvdl{self.suffix}core"
+        pid_gov = f"qvdl{self.suffix}gov"
+        pid_titled = f"qvdl{self.suffix}ttl"
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.classification_rule "
+                    "(rule_set, prefix, value, priority, version) VALUES "
+                    "('class', '011301', 'dividend', 68, 'test'), "
+                    "('class', '0131', 'governance_rules', 16, 'test'), "
+                    "('title', '年度报告', 'annual_report', 998, 'test') "
+                    "ON CONFLICT (rule_set, prefix, value) DO NOTHING"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.source_access "
+                    "(source_access_id, provider, provider_interface, accessed_at, "
+                    " status, result_snapshot) "
+                    "VALUES (:id, 'cninfo', 'cninfo:p_info3015', now(), 'ok', "
+                    "        CAST(:snap AS jsonb))"
+                ),
+                {
+                    "id": f"sa_qv{self.suffix}scope",
+                    "snap": json.dumps(
+                        {
+                            "result": "ok",
+                            "candidates": [
+                                {
+                                    "provider_document_id": pid_core,
+                                    "title": "分红公告",
+                                    "raw_category": "01010503||011301",
+                                    "download_url": "http://x/a.PDF",
+                                    "announcement_date": "1990-01-01",
+                                },
+                                {
+                                    "provider_document_id": pid_gov,
+                                    "title": "章程修订",
+                                    "raw_category": "01010503||013101",
+                                    "download_url": "http://x/b.PDF",
+                                    "announcement_date": "1990-01-01",
+                                },
+                                {
+                                    "provider_document_id": pid_titled,
+                                    "title": "某公司2025年年度报告",
+                                    "download_url": "http://x/c.PDF",
+                                    "announcement_date": "1990-01-01",
+                                },
+                            ],
+                        }
+                    ),
+                },
+            )
+            scope = ("dividend", "annual_report")
+            pids = [
+                row["provider_document_id"]
+                for row in queries.pending_downloads(
+                    conn, max_retries=3, limit=1000, scope_classes=scope
+                )
+            ]
+            self.assertIn(pid_core, pids)
+            self.assertNotIn(pid_gov, pids)
+            self.assertIn(pid_titled, pids)  # code-less → title rules
+            all_pids = [
+                row["provider_document_id"]
+                for row in queries.pending_downloads(conn, max_retries=3, limit=1000)
+            ]
+            self.assertIn(pid_gov, all_pids)  # scope None = everything
+        finally:
+            txn.rollback()
+            conn.close()
+
     def test_stale_reclaim_fails_only_over_threshold_runs(self) -> None:
         with self.engine.begin() as conn:
             document_id = self._insert_document(conn, status="parsed")

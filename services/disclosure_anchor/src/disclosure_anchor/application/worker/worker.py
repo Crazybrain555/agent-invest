@@ -79,6 +79,7 @@ class WorkerConfig:
     # None → parse everything; a topic tuple → 'other' docs need a matching
     # disclosure_topic (parse scope 'core', round9).
     parse_scope_classes: tuple[str, ...] | None = None
+    download_scope_classes: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -182,7 +183,9 @@ def _sync_stage(
             if pending_downloads_now is None:
                 with deps.engine.connect() as conn:
                     pending_downloads_now = queries.pending_download_count(
-                        conn, max_retries=deps.config.cninfo_max_retries
+                        conn,
+                        max_retries=deps.config.cninfo_max_retries,
+                        scope_classes=deps.config.download_scope_classes,
                     )
             if pending_downloads_now >= deps.config.backfill_max_pending_downloads:
                 report.deferred_backfill += 1
@@ -265,7 +268,10 @@ def _download_stage(
 ) -> None:
     with deps.engine.connect() as conn:
         pending = queries.pending_downloads(
-            conn, max_retries=deps.config.cninfo_max_retries, limit=limit
+            conn,
+            max_retries=deps.config.cninfo_max_retries,
+            limit=limit,
+            scope_classes=deps.config.download_scope_classes,
         )
     downloader = DownloadDocument(
         source=source,

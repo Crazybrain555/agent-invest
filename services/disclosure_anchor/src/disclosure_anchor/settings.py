@@ -139,6 +139,15 @@ class Settings(BaseSettings):
             "DISCLOSURE_PARSE_SCOPE", "disclosure_parse_scope"
         ),
     )
+    # Download-layer scope (round20): register everything, download PDFs only
+    # for the core classes — initial-stage quota goes to what matters.
+    disclosure_download_scope: str = Field(
+        default="core",
+        pattern="^(core|all)$",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_DOWNLOAD_SCOPE", "disclosure_download_scope"
+        ),
+    )
     cninfo_oversized_kb: int = Field(
         default=10240,
         ge=0,

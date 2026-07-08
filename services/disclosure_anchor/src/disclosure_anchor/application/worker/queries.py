@@ -62,9 +62,44 @@ def sync_due(
     return [dict(row) for row in rows]
 
 
-def pending_download_count(conn: Connection, *, max_retries: int) -> int:
+def _download_scope_sql(scope_classes: tuple[str, ...] | None) -> str:
+    """Download-layer scope predicate (round20, mirrors pending_parse).
+
+    Coded candidates download when any F006V segment hits a core class;
+    code-less candidates (web channel) fall back to title keyword rules.
+    """
+
+    if scope_classes is None:
+        return ""
+    return f"""
+               AND (CASE WHEN q.candidate->>'raw_category' IS NOT NULL
+                    THEN EXISTS (
+                        SELECT 1
+                          FROM unnest(string_to_array(
+                                   q.candidate->>'raw_category', '||'))
+                               AS seg(code)
+                          JOIN {CORE_SCHEMA}.classification_rule cr
+                            ON cr.rule_set = 'class'
+                           AND seg.code LIKE cr.prefix || '%'
+                         WHERE cr.value = ANY(CAST(:scope_classes AS text[])))
+                    ELSE EXISTS (
+                        SELECT 1 FROM {CORE_SCHEMA}.classification_rule tr
+                         WHERE tr.rule_set = 'title'
+                           AND q.candidate->>'title' LIKE '%' || tr.prefix || '%'
+                           AND tr.value = ANY(CAST(:scope_classes AS text[]))) END)"""
+
+
+def pending_download_count(
+    conn: Connection,
+    *,
+    max_retries: int,
+    scope_classes: tuple[str, ...] | None = None,
+) -> int:
     """Backfill backpressure input (changedetection.io MAX_QUEUE_SIZE pattern)."""
 
+    params: dict[str, Any] = {"max_retries": max_retries}
+    if scope_classes is not None:
+        params["scope_classes"] = list(scope_classes)
     row = conn.execute(
         text(
             f"""
@@ -73,20 +108,28 @@ def pending_download_count(conn: Connection, *, max_retries: int) -> int:
                AND NOT EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
                                 WHERE tc.company_id = q.company_id
                                   AND tc.status <> 'active')
+               {_download_scope_sql(scope_classes)}
             """
         ),
-        {"max_retries": max_retries},
+        params,
     ).scalar()
     return int(row or 0)
 
 
 def pending_downloads(
-    conn: Connection, *, max_retries: int, limit: int
+    conn: Connection,
+    *,
+    max_retries: int,
+    limit: int,
+    scope_classes: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     # Pausing a company stops its queued backlog too (round19 ruling:
     # paused = 停止一切获取). NOT-EXISTS form: only an explicitly non-active
     # tracked row blocks — candidates without a company ref stay eligible.
     # The view keeps exposing every candidate; predicates live here.
+    params: dict[str, Any] = {"max_retries": max_retries, "limit": limit}
+    if scope_classes is not None:
+        params["scope_classes"] = list(scope_classes)
     rows = conn.execute(
         text(
             f"""
@@ -97,11 +140,12 @@ def pending_downloads(
                AND NOT EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
                                 WHERE tc.company_id = q.company_id
                                   AND tc.status <> 'active')
+               {_download_scope_sql(scope_classes)}
              ORDER BY announcement_date, provider_document_id
              LIMIT :limit
             """
         ),
-        {"max_retries": max_retries, "limit": limit},
+        params,
     ).mappings()
     return [dict(row) for row in rows]
 

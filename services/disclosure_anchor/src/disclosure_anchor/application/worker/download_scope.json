@@ -1,0 +1,25 @@
+{
+  "version": "2026-07-r1",
+  "_about": "Worker download-layer scope（round20 用户裁决：全量登记保持，PDF 只下核心类——初始阶段配额花在重要公告上）。谓词与 parse_scope 同构：候选 raw_category 命中 class 规则 ∪ 无码候选 title 命中 title 规则；DISCLOSURE_DOWNLOAD_SCOPE=all 关闭过滤。注意 parse 的实际生效面 = parse_scope ∩ download_scope（没下载就没得解析）。",
+  "core_classes": [
+    "annual_report",
+    "semiannual_report",
+    "quarterly_report",
+    "performance_forecast",
+    "performance_flash",
+    "investor_relations",
+    "performance_briefing",
+    "inquiry_regulatory",
+    "restructuring_assets",
+    "dividend",
+    "additional_issuance",
+    "convertible_bond",
+    "rights_issue",
+    "share_buyback",
+    "major_contract",
+    "related_party",
+    "risk_alert",
+    "delisting_risk",
+    "equity_incentive"
+  ]
+}
