@@ -22,10 +22,9 @@ turn normal answers into long operation manuals.
 ## Preferences (inherited from disclosure_anchor practice)
 
 1. Keep responses concise; smallest direct change; let unexpected failures surface.
-0. 调研先行：在方案优化的讨论与执行中（不限于设计/配置/契约，含实现细节与运维流程），
-   先主动调研 2-4 个同形态的优秀开源项目或网上成熟实现（deepwiki / github / web），
-   独立对比找差距、有可借鉴处纳入方案——自查发现要先于用户指出。
-2. Before multi-file or risky edits, give a short plan (key assumption, file list, validation target).
-3. After code changes, update or add the relevant tests; contract changes update the matching spec/docs.
-4. If the user corrects a workflow rule, propose a concrete `CLAUDE.md`/`AGENTS.md` update before treating
+2. Before shaping or optimizing any plan, survey a few comparable open-source implementations; adopt
+   what they do better and surface the gaps unprompted.
+3. Before multi-file or risky edits, give a short plan (key assumption, file list, validation target).
+4. After code changes, update or add the relevant tests; contract changes update the matching spec/docs.
+5. If the user corrects a workflow rule, propose a concrete `CLAUDE.md`/`AGENTS.md` update before treating
    it as permanent.

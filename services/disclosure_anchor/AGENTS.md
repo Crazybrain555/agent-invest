@@ -24,7 +24,11 @@ Do not rely on deleted historical docs such as `docs/skills/*`, old skill runner
 
 ## 2. Policies and mandatory triggers
 
-**调研先行（用户裁决 2026-07-08）**：在方案优化的讨论与执行中（不限于设计/配置/契约，含实现细节与运维流程），先主动调研 2-4 个同形态的优秀开源项目或网上成熟实现（deepwiki / github / web），独立对比找差距、有可借鉴处纳入方案——自查发现要先于用户指出。
+### Research-first trigger
+
+Before proposing or optimizing any plan (design, configuration, contract, implementation, or ops
+workflow), survey 2-4 comparable open-source implementations and fold what they do better into the
+proposal. Self-found gaps come before user-found ones.
 
 ### Durable-plan trigger
 

@@ -36,11 +36,8 @@ Do not rely on deleted historical files such as `docs/skills/*`, `.agents/skills
    unless a concrete blocker or user decision is required.
 7. If the user corrects a workflow rule, propose a concrete `CLAUDE.md` or `AGENTS.md` update before treating
    it as permanent.
-8. 调研先行（2026-07-08 用户裁决）：在方案优化的讨论与执行中（不限于设计/配置/契约，含实现细节与运维流程），
-   先主动调研 2-4 个同形态的优秀开源项目或网上成熟实现（deepwiki / github / web），
-   独立对比找差距、有可借鉴处纳入方案——自查发现要先于用户指出。
-   本仓常用对标：changedetection.io、miniflux、Home Assistant、edgartools、Grafana、
-   FinGLM/StudyOnCompany（切分）、tushare/akshare（数据接口形态）。
+8. Before proposing or optimizing any plan — design, config, contract, or workflow — survey a few
+   comparable open-source implementations first; adopt what they do better and surface gaps unprompted.
 
 ## 2. Current Repo Reality
 
