@@ -15,5 +15,6 @@ security_code,exchange,status,joined_date,lookback_days,sync_frequency,filing_ca
 600900,SSE,active,2026-07-07,,,,长江电力-round8测试入池
 601398,SSE,active,2026-07-07,,,,工商银行-round8测试入池
 300750,SZSE,active,2026-07-07,,,,宁德时代-round8测试入池
-601318,SSE,active,2026-07-07,,,,中国平安-acceptance
-000858,SZSE,active,2026-07-07,30,,,五粮液-acceptance-lookback30
+300012,SZSE,active,2026-07-08,,,,华测检测-创业板
+301046,SZSE,active,2026-07-08,,,,能辉科技-创业板注册制小盘
+688077,SSE,active,2026-07-08,,,,大地熊-科创板小盘

@@ -28,7 +28,7 @@ class CninfoMapperTests(unittest.TestCase):
     def test_filing_type_rule_bundle_has_required_seed_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
 
-        self.assertEqual(bundle.version, "2026-07-r3")
+        self.assertEqual(bundle.version, "2026-07-r4")
         self.assertEqual(
             {rule.filing_type for rule in bundle.rules},
             {
@@ -39,7 +39,7 @@ class CninfoMapperTests(unittest.TestCase):
                 "performance_flash",
                 "investor_relations",
                 "performance_briefing",
-                "inquiry_reply",
+                "inquiry_regulatory",
             },
         )
 
@@ -133,7 +133,7 @@ class CninfoMapperTests(unittest.TestCase):
             category_names_by_code={"019999": "问询函回复公告"},
         )
 
-        self.assertEqual(filing_type, "inquiry_reply")
+        self.assertEqual(filing_type, "inquiry_regulatory")
 
     def test_filing_type_mapping_falls_back_to_other(self) -> None:
         self.assertEqual(

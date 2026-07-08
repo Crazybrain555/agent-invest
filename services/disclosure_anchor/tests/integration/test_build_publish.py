@@ -203,7 +203,6 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                     security_id=security_id,
                     provider="cninfo",
                     provider_document_id=provider_document_id,
-                    filing_type="other",
                     title="公告",
                     raw_file_hash="sha256:raw" + provider_document_id[-8:],
                 )
@@ -253,7 +252,6 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                     security_id=security_id,
                     provider="cninfo",
                     provider_document_id=provider_document_id,
-                    filing_type="other",
                     raw_file_hash="sha256:raw" + provider_document_id[-8:],
                     current_processing_run_id=old_run_id if old_units else None,
                 )

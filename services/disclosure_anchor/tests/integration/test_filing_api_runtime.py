@@ -562,12 +562,13 @@ class FilingApiRuntimeTests(unittest.TestCase):
                 text(
                     "INSERT INTO disclosure_core.document "
                     "(document_id, status, company_id, security_id, source_access_id, "
-                    "provider, provider_document_id, filing_type, report_period, "
+                    "provider, provider_document_id, provider_metadata, report_period, "
                     "title, announcement_date, raw_file_hash, raw_file_relpath, "
                     "current_processing_run_id, supersedes_document_id) "
                     "VALUES (:document_id, 'published', :company_id, :security_id, "
                     ":source_access_id, 'cninfo', :provider_document_id, "
-                    ":filing_type, :report_period, :title, :announcement_date, "
+                    "jsonb_build_object('raw_category', CAST(:raw_category AS text)), :report_period, "
+                    ":title, :announcement_date, "
                     ":raw_file_hash, :raw_file_relpath, :current_processing_run_id, "
                     ":supersedes_document_id)"
                 ),
@@ -577,7 +578,14 @@ class FilingApiRuntimeTests(unittest.TestCase):
                     "security_id": security_id,
                     "source_access_id": source_access_id,
                     "provider_document_id": provider_document_id,
-                    "filing_type": filing_type,
+                    # 0017: classification is view-derived — seed the F006V
+                    # code that maps to the requested class.
+                    "raw_category": {
+                        "annual_report": "010301",
+                        "investor_relations": "012001",
+                        "performance_briefing": "012003",
+                        "other": "012399",
+                    }[filing_type],
                     "report_period": report_period,
                     "title": f"Milestone 06 {provider_document_id}",
                     "announcement_date": announcement_date,

@@ -75,9 +75,13 @@ topics 成为完备分类（NULL 仅剩无码通道）。词表 JSON 形态：
 
 ### 3.2 document 表
 
-- `disclosure_topics` 列 + GIN 索引：**删除**（视图现算）。
-- `filing_type` 列：**保留但语义收窄** = 注册时兜底分类（web/本地通道无
-  F006V，只能靠标题规则，属观察期事实，SQL 无法再生）。注册代码不变。
+- `disclosure_topics` 列 + GIN 索引：**删除**（0016，视图现算）。
+- `filing_type` 列：**0017 删除**（用户裁决：规则派生值不是事实，兜底列违反
+  '表=事实'——且实测服务 0 行）。标题关键词规则进 classification_rule
+  （rule_set='title'，filing_type_map.json 文件序=优先级，'问询%回复' 表达
+  all-match）；视图 filing_type = COALESCE(码 argmax, 标题 argmax, 'other')。
+  切分器（build_units）经 mapper.derive_primary_class 用同一词表 Python 求值
+  （与视图双求值器，一致性由集成测试钉住）。
 - F006V 原串留在 provider_metadata.raw_category（现状，事实已在）。
 
 ### 3.3 视图新增/改造列（documents_v1 与 document_units_v1 同步）

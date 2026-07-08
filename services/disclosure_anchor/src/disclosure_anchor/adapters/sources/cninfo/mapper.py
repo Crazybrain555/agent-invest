@@ -17,7 +17,7 @@ from disclosure_anchor.application.ports.disclosure_source import (
     SourceCompanyProfile,
 )
 from disclosure_anchor.domain.errors import DisclosureAnchorError
-from disclosure_anchor.domain.value_objects import ReportPeriod, validate_filing_type
+from disclosure_anchor.domain.value_objects import ReportPeriod
 
 
 CNINFO_PROVIDER = "cninfo"
@@ -166,6 +166,37 @@ def load_facet_map() -> dict[str, Any]:
     )
 
 
+def derive_primary_class(raw_category: str | None, title: str | None) -> str:
+    """Python evaluator of the shared vocabulary (view parity, 0017).
+
+    Code-rule argmax first (class_map priorities), then title keyword rules
+    (filing_type_map, file order = precedence), else 'other'. The views
+    compute the same thing in SQL from classification_rule; an integration
+    test pins the two evaluators together.
+    """
+
+    classes = load_class_map()["classes"]
+    if raw_category:
+        best: tuple[int, str] | None = None
+        for segment in split_category_segments(raw_category):
+            for name, spec in classes.items():
+                if any(segment.startswith(str(p)) for p in spec["prefixes"]):
+                    key = (int(spec["priority"]), name)
+                    if best is None or (key[0], key[1]) > best:
+                        best = key
+        if best is not None:
+            return best[1]
+    if title:
+        bundle = load_filing_type_rule_bundle()
+        for rule in bundle.rules:
+            if rule.match == "all":
+                if all(keyword in title for keyword in rule.keywords):
+                    return rule.filing_type
+            elif any(keyword in title for keyword in rule.keywords):
+                return rule.filing_type
+    return "other"
+
+
 def expand_filing_categories(values: Sequence[str] | None) -> tuple[str, ...] | None:
     """Resolve watchlist filing_categories to F006V prefixes.
 
@@ -205,7 +236,6 @@ def category_prefix_matches(raw_category: str, categories: Sequence[str] | None)
 
 def _rule_from_payload(payload: Mapping[str, Any]) -> FilingTypeRule:
     filing_type = str(payload["filing_type"])
-    validate_filing_type(filing_type)
     keywords = tuple(str(item) for item in payload["keywords"])
     if not keywords:
         raise CninfoMappingError(f"filing_type rule has no keywords: {filing_type}")

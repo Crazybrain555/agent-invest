@@ -97,7 +97,6 @@ class Document:
     source_access_id: Optional[str] = None
     provider: Optional[str] = None
     provider_document_id: Optional[str] = None
-    filing_type: Optional[str] = None
     announcement_date: Optional[date] = None
     report_period: Optional[str] = None
     raw_file_relpath: Optional[str] = None

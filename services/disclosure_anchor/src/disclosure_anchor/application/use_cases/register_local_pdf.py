@@ -158,7 +158,6 @@ class RegisterLocalPdf:
                     provider=command.provider,
                     provider_document_id=command.provider_document_id,
                     title=command.title,
-                    filing_type=command.filing_type,
                     announcement_date=command.announcement_date,
                     report_period=command.report_period,
                     filename=command.file_path.name,

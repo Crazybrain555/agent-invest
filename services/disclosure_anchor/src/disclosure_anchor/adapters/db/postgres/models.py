@@ -225,7 +225,7 @@ class Document(Base):
         Index("ix_document_source_access", "source_access_id"),
         Index("ix_document_provider_ref", "provider", "provider_document_id"),
         Index("ix_document_raw_hash", "raw_file_hash"),
-        Index("ix_document_company_period_type", "company_id", "report_period", "filing_type"),
+        Index("ix_document_company_period", "company_id", "report_period"),
         Index("ix_document_announcement_date", "announcement_date"),
         Index(
             "uq_document_provider_doc_hash",
@@ -255,7 +255,6 @@ class Document(Base):
     provider: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     provider_document_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    filing_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     announcement_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     report_period: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     raw_file_relpath: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

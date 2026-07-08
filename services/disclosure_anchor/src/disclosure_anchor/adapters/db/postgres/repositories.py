@@ -499,7 +499,6 @@ class DocumentRepository:
             "provider",
             "provider_document_id",
             "title",
-            "filing_type",
             "announcement_date",
             "report_period",
             "raw_file_relpath",

@@ -106,7 +106,6 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                         provider="cninfo",
                         provider_document_id=self.pid,
                         title="2025 年年度报告",
-                        filing_type="annual_report",
                         report_period="2025A",
                         raw_file_relpath=(
                             f"raw_documents/cninfo/{self.security_code}/2025/{self.pid}/"

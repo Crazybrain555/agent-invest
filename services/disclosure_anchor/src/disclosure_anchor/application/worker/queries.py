@@ -68,8 +68,11 @@ def pending_download_count(conn: Connection, *, max_retries: int) -> int:
     row = conn.execute(
         text(
             f"""
-            SELECT count(*) FROM {OPS_SCHEMA}.pending_download_v1
-             WHERE failed_download_count < :max_retries
+            SELECT count(*) FROM {OPS_SCHEMA}.pending_download_v1 q
+             WHERE q.failed_download_count < :max_retries
+               AND NOT EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
+                                WHERE tc.company_id = q.company_id
+                                  AND tc.status <> 'active')
             """
         ),
         {"max_retries": max_retries},
@@ -80,13 +83,20 @@ def pending_download_count(conn: Connection, *, max_retries: int) -> int:
 def pending_downloads(
     conn: Connection, *, max_retries: int, limit: int
 ) -> list[dict[str, Any]]:
+    # Pausing a company stops its queued backlog too (round19 ruling:
+    # paused = 停止一切获取). NOT-EXISTS form: only an explicitly non-active
+    # tracked row blocks — candidates without a company ref stay eligible.
+    # The view keeps exposing every candidate; predicates live here.
     rows = conn.execute(
         text(
             f"""
             SELECT provider_document_id, download_url, title, announcement_date,
                    source_access_id, company_id, candidate, failed_download_count
-              FROM {OPS_SCHEMA}.pending_download_v1
-             WHERE failed_download_count < :max_retries
+              FROM {OPS_SCHEMA}.pending_download_v1 q
+             WHERE q.failed_download_count < :max_retries
+               AND NOT EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
+                                WHERE tc.company_id = q.company_id
+                                  AND tc.status <> 'active')
              ORDER BY announcement_date, provider_document_id
              LIMIT :limit
             """
@@ -128,7 +138,11 @@ def pending_parse(
                             ON cr.rule_set = 'class'
                            AND seg.code LIKE cr.prefix || '%'
                          WHERE cr.value = ANY(CAST(:scope_classes AS text[])))
-                    ELSE d.filing_type <> 'other' END)"""
+                    ELSE EXISTS (
+                        SELECT 1 FROM {CORE_SCHEMA}.classification_rule tr
+                         WHERE tr.rule_set = 'title'
+                           AND d.title LIKE '%' || tr.prefix || '%'
+                           AND tr.value = ANY(CAST(:scope_classes AS text[]))) END)"""
         params["scope_classes"] = list(scope_classes)
     rows = conn.execute(
         text(

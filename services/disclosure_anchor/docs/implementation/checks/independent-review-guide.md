@@ -145,7 +145,7 @@ S5 续表合并只看列数（cn_a_v6 后同构附注表跨科目误并，3. 销
   local_heading，引用粒度不丢）；再出现失怙孤儿子项按 §2 跳级探测处理。
 - "详见附注 X"交叉引用单元——真实内容，保留。
 - 金融工具风险节内部 1、/(一) 层级倒置的次级归属（不窜根即可）。
-- web 兜底通道 disclosure_topics=null、三维拆解列=null（接口无 F006V），filing_type 回落注册值——设计内。
+- web 兜底通道 disclosure_topics=null、三维拆解列=null（接口无 F006V），filing_type 走标题规则（rule_set='title'）——设计内。
 - semantic_keys 覆盖纪律（round13 用户裁决"检索靠它，不能少"）：词表键做祖先继承
   （无科目语义的叶子从最近科目祖先取键+章级键），并对全部 filing_type 开放；
   验收口径=年报/审计报告附注 NULL 为 0、全库覆盖 ≥95%；剩余 NULL 仅限公告头存根

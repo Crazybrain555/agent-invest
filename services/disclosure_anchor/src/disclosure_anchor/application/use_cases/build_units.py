@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from disclosure_anchor.adapters.sources.cninfo.mapper import derive_primary_class
 from disclosure_anchor.adapters.unit_builder import rules
 from disclosure_anchor.adapters.unit_builder.builder import (
     ImageBytesResolver,
@@ -83,10 +84,14 @@ class BuildUnits:
         context = self._load_context(command)
         run = context["run"]
         normalized_ir = self._load_ir(Path(run.normalized_ir_relpath or ""))
+        document = context["document"]
         drafts, stats = build_unit_drafts_s1_s7(
             normalized_ir,
-            filing_type=context["document"].filing_type,
-            document_title=context["document"].title,
+            filing_type=derive_primary_class(
+                (document.provider_metadata or {}).get("raw_category"),
+                document.title,
+            ),
+            document_title=document.title,
             image_bytes_resolver=self._image_bytes_resolver(normalized_ir),
         )
         units, snapshot_rows = self._materialize_units(

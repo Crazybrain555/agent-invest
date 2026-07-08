@@ -44,7 +44,6 @@ def _doc_meta(*, report_period: ReportPeriod | None = None) -> DocumentRegistrat
         provider="cninfo",
         provider_document_id="pid_1",
         title="公告",
-        filing_type="annual_report" if report_period else "other",
         announcement_date=date(2026, 7, 5),
         report_period=report_period,
         filename="sample.pdf",

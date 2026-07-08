@@ -20,7 +20,6 @@ class DocumentRegistration:
     provider: str
     provider_document_id: str
     title: str
-    filing_type: str
     announcement_date: date
     report_period: ReportPeriod | None
     filename: str
@@ -92,7 +91,6 @@ def register_document(
             provider=doc_meta.provider,
             provider_document_id=doc_meta.provider_document_id,
             title=doc_meta.title,
-            filing_type=doc_meta.filing_type,
             announcement_date=doc_meta.announcement_date,
             report_period=str(doc_meta.report_period) if doc_meta.report_period else None,
             raw_file_relpath=str(raw.relpath),

@@ -59,7 +59,7 @@ security_id PK；company_id FK；security_code+exchange 定位（exchange 全大
 | 列 | 含义 |
 |---|---|
 | status | 公开可消费态：registered → parsed \| parse_failed →（发布后）published；published 永不降级 |
-| filing_type | 表列=**注册时兜底值**（无码通道标题推导，9 值）。**消费永远读视图列**：视图现算 = class 词表 argmax（30 类，class_map r4），COALESCE 回落表列；未知枚举值按 other 消费（前向兼容） |
+| ~~filing_type~~ | **0017 删除**（表列——规则派生值不是事实）。视图现算：class 词表码 argmax，无码时标题关键词规则（rule_set='title'），仍无命中='other'；未知枚举值按 other 消费（前向兼容） |
 | ~~disclosure_topics~~ | **0016 删除**（表列）。视图现算：class 词表全部命中类集合（jsonb 数组）；无码通道 NULL |
 | report_period | `YYYY(A|Q1-4)`；定期报告必填，临时公告可 NULL，不伪造 |
 | raw_file_relpath/raw_file_hash | 相对路径+sha256；原始 PDF 不可变只追加 |
@@ -96,7 +96,7 @@ security_id PK；company_id FK；security_code+exchange 定位（exchange 全大
 ### classification_rule（0016，词表的库内查询副本）
 | 列 | 含义 |
 |---|---|
-| rule_set | 闭集 class / facet（filing_type 无独立规则——同一 class 映射 argmax） |
+| rule_set | 闭集 class / facet / **title**（0017：标题关键词规则，无码通道的唯一分类路径；filing_type 无独立规则——class 码 argmax → title argmax） |
 | prefix / value / priority | F006V 前缀 → 类名/维度名；priority=主分类阶梯档位（三层原则）/facet 长前缀优先 |
 | version | 与仓内 JSON 词表一致；doctor 校验漂移；`make load-rules` 事务内重载 |
 

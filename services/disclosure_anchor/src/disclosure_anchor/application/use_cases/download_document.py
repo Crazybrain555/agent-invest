@@ -176,7 +176,6 @@ class DownloadDocument:
                     provider=CNINFO_PROVIDER,
                     provider_document_id=ref.provider_document_id,
                     title=ref.title,
-                    filing_type=_candidate_str(candidate, "filing_type", default="other"),
                     announcement_date=ref.announcement_date,
                     report_period=_candidate_report_period(candidate),
                     filename=f"{ref.provider_document_id}.pdf",

@@ -82,7 +82,7 @@ class SchemaShapeTests(unittest.TestCase):
                 text(f"SELECT version_num FROM {ALEMBIC_VERSION_TABLE_SCHEMA}.alembic_version")
             ).scalar()
         self.assertEqual(schema, ALEMBIC_VERSION_TABLE_SCHEMA)
-        self.assertEqual(version, "0016_classification_rules")
+        self.assertEqual(version, "0017_filing_type_derived")
 
     def test_document_provider_hash_unique_index_exists(self) -> None:
         with self.engine.connect() as conn:

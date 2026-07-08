@@ -23,7 +23,6 @@ def _document(document_id: str = "doc_1") -> e.Document:
         provider="cninfo",
         provider_document_id="pid-1",
         title="年报",
-        filing_type="annual_report",
         announcement_date=datetime(2026, 4, 10, tzinfo=timezone.utc).date(),
         report_period="2025A",
         raw_file_relpath="raw/x.pdf",

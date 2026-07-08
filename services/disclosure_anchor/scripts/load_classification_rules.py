@@ -16,6 +16,7 @@ from sqlalchemy import create_engine, text
 from disclosure_anchor.adapters.sources.cninfo.mapper import (
     load_class_map,
     load_facet_map,
+    load_filing_type_rule_bundle,
 )
 
 
@@ -45,6 +46,23 @@ def main() -> int:
                     "version": facet_map["version"],
                 }
             )
+    # Title keyword rules: the code-less channel's ONLY classification path
+    # (0017 — no materialized filing_type anywhere). File order = priority
+    # (semiannual before annual: substring shadowing), '%' joins an
+    # all-keywords rule into one LIKE pattern.
+    bundle = load_filing_type_rule_bundle()
+    for position, rule in enumerate(bundle.rules):
+        pattern = "%".join(rule.keywords) if rule.match == "all" else None
+        for keyword in ([pattern] if pattern else rule.keywords):
+            rows.append(
+                {
+                    "rule_set": "title",
+                    "prefix": keyword,
+                    "value": rule.filing_type,
+                    "priority": 1000 - position,
+                    "version": bundle.version,
+                }
+            )
 
     engine = create_engine(os.environ["DATABASE_URL"])
     with engine.begin() as conn:
@@ -57,11 +75,13 @@ def main() -> int:
             ),
             rows,
         )
-    class_rows = sum(1 for row in rows if row["rule_set"] == "class")
+    counts = {"class": 0, "facet": 0, "title": 0}
+    for row in rows:
+        counts[str(row["rule_set"])] += 1
     print(
-        f"loaded {class_rows} class rules ({class_map['version']}, "
-        f"{len(class_map['classes'])} classes) + "
-        f"{len(rows) - class_rows} facet rules ({facet_map['version']})"
+        f"loaded {counts['class']} class rules ({class_map['version']}, "
+        f"{len(class_map['classes'])} classes) + {counts['facet']} facet rules "
+        f"({facet_map['version']}) + {counts['title']} title rules ({bundle.version})"
     )
     return 0
 

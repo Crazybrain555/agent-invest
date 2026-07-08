@@ -272,6 +272,70 @@ class OpsQueueViewTests(unittest.TestCase):
         row = next(row for row in rows if row["provider_document_id"] == pid_new)
         self.assertEqual(row["candidate"]["title"], f"测试公告 {pid_new}")
 
+    def test_pending_download_skips_paused_companies(self) -> None:
+        # round19: paused = 停止一切获取 — queued backlog included. Rollback
+        # keeps the shared DB untouched.
+        pid_active = f"qvdl{self.suffix}act"
+        pid_paused = f"qvdl{self.suffix}pau"
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            for label, pid, status in (
+                ("act", pid_active, "active"),
+                ("pau", pid_paused, "paused"),
+            ):
+                company_id = f"co_qv{self.suffix}{label}"
+                conn.execute(
+                    text(
+                        "INSERT INTO disclosure_core.company (company_id, legal_name) "
+                        "VALUES (:cid, :name)"
+                    ),
+                    {"cid": company_id, "name": f"QV{label}公司"},
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO disclosure_core.tracked_company "
+                        "(tracked_company_id, company_id, status) "
+                        "VALUES (:tid, :cid, :status)"
+                    ),
+                    {"tid": f"tc_qv{self.suffix}{label}", "cid": company_id, "status": status},
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO disclosure_core.source_access "
+                        "(source_access_id, provider, provider_interface, accessed_at, "
+                        " status, company_id, result_snapshot) "
+                        "VALUES (:id, 'cninfo', 'cninfo:p_info3015', now(), 'ok', "
+                        "        :cid, CAST(:snap AS jsonb))"
+                    ),
+                    {
+                        "id": f"sa_qv{self.suffix}{label}",
+                        "cid": company_id,
+                        "snap": json.dumps(
+                            {
+                                "result": "ok",
+                                "candidates": [
+                                    {
+                                        "provider_document_id": pid,
+                                        "title": f"测试公告 {pid}",
+                                        "download_url": f"http://x/{pid}.PDF",
+                                        "announcement_date": "1990-01-01",
+                                    }
+                                ],
+                            }
+                        ),
+                    },
+                )
+            pids = [
+                row["provider_document_id"]
+                for row in queries.pending_downloads(conn, max_retries=3, limit=1000)
+            ]
+            self.assertIn(pid_active, pids)
+            self.assertNotIn(pid_paused, pids)
+        finally:
+            txn.rollback()
+            conn.close()
+
     def test_stale_reclaim_fails_only_over_threshold_runs(self) -> None:
         with self.engine.begin() as conn:
             document_id = self._insert_document(conn, status="parsed")

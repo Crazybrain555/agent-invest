@@ -127,7 +127,6 @@ def _uow(root: Path, *, contract_version: str = "normalized_ir.v2") -> tuple[Fak
             security_id=security.security_id,
             provider="cninfo",
             provider_document_id="pid_1",
-            filing_type="other",
             title="公告",
         )
     )

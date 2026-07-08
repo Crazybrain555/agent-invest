@@ -1,5 +1,5 @@
 {
-  "version": "2026-07-r3",
+  "version": "2026-07-r4",
   "rules": [
     {
       "filing_type": "semiannual_report",
@@ -52,12 +52,13 @@
       "match": "any"
     },
     {
-      "filing_type": "inquiry_reply",
+      "filing_type": "inquiry_regulatory",
       "keywords": [
         "问询",
         "回复"
       ],
       "match": "all"
     }
-  ]
+  ],
+  "_about": "标题/分类名关键词规则（唯一用途：无码通道的视图现算 title 规则 + 注册期 report_period 推导的临时输入；0017 起不再持久化任何 filing_type 列）。顺序即优先级：semiannual 必须在 annual 之前（子串遮蔽）。值域 ⊆ class_map.json 类名。"
 }

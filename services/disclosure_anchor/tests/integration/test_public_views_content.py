@@ -114,7 +114,9 @@ class PublicViewContentTests(unittest.TestCase):
             )
         self.engine.dispose()
 
-    def _seed_extra_document_unit(self, filing_type: str) -> tuple[str, str]:
+    def _seed_extra_document_unit(
+        self, filing_type: str, *, title: str | None = None
+    ) -> tuple[str, str]:
         document_id = ids.new_document_id()
         run_id = ids.new_processing_run_id()
         unit_id = ids.new_asset_id()
@@ -128,11 +130,13 @@ class PublicViewContentTests(unittest.TestCase):
                 text(
                     "INSERT INTO disclosure_core.document "
                     "(document_id, status, company_id, security_id, source_access_id, "
-                    "provider, provider_document_id, filing_type, report_period, "
-                    "raw_file_hash, raw_file_relpath) "
+                    "provider, provider_document_id, provider_metadata, title, "
+                    "report_period, raw_file_hash, raw_file_relpath) "
                     "VALUES (:document_id, 'published', :company_id, :security_id, "
-                    ":source_access_id, 'cninfo', :provider_document_id, :filing_type, "
-                    "NULL, :raw_file_hash, :raw_file_relpath)"
+                    ":source_access_id, 'cninfo', :provider_document_id, "
+                    "CASE WHEN CAST(:raw_category AS text) IS NULL THEN '{}'::jsonb "
+                    "ELSE jsonb_build_object('raw_category', CAST(:raw_category AS text)) END, "
+                    ":title, NULL, :raw_file_hash, :raw_file_relpath)"
                 ),
                 {
                     "document_id": document_id,
@@ -140,7 +144,17 @@ class PublicViewContentTests(unittest.TestCase):
                     "security_id": self.security_id,
                     "source_access_id": self.source_access_id,
                     "provider_document_id": provider_document_id,
-                    "filing_type": filing_type,
+                    "title": title,
+                    # 0017: classification is fully view-derived — seed the
+                    # F006V code mapping to the class; "codeless" exercises
+                    # the title-rule path.
+                    "raw_category": {
+                        "annual_report": "010301",
+                        "investor_relations": "012001",
+                        "performance_briefing": "012003",
+                        "other": "012399",
+                        "codeless": None,
+                    }[filing_type],
                     "raw_file_hash": f"sha256:{document_id}",
                     "raw_file_relpath": f"raw_documents/cninfo/{document_id}.pdf",
                 },
@@ -171,6 +185,7 @@ class PublicViewContentTests(unittest.TestCase):
         return document_id, unit_id
 
     def _seed(self) -> None:
+        self._ensure_classification_rules()
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
             uow.companies.add(
                 e.Company(company_id=self.company_id, legal_name="江海股份")
@@ -203,7 +218,7 @@ class PublicViewContentTests(unittest.TestCase):
                     source_access_id=self.source_access_id,
                     provider="cninfo",
                     provider_document_id=self.pid,
-                    filing_type="annual_report",
+                    provider_metadata={"raw_category": "010301"},
                     report_period="2025A",
                     raw_file_hash=self.hash_a,
                     raw_file_relpath=(
@@ -319,7 +334,7 @@ class PublicViewContentTests(unittest.TestCase):
             self.assertEqual(doc_row["company_ref"], self.company_id)
             self.assertEqual(doc_row["security_ref"], self.security_id)
             self.assertEqual(doc_row["source_ref"], self.source_access_id)
-            self.assertEqual(doc_row["provider_metadata"], {})
+            self.assertEqual(doc_row["provider_metadata"], {"raw_category": "010301"})
             # raw_file_relpath must not be a column in the view.
             self.assertNotIn("raw_file_relpath", doc_row)
 
@@ -448,9 +463,14 @@ class PublicViewContentTests(unittest.TestCase):
             {"011301", "012325"},
         )
 
-    def test_view_falls_back_to_registration_filing_type_without_codes(self) -> None:
+    def test_view_falls_back_to_title_rules_without_codes(self) -> None:
+        # 0017: code-less channels classify through the stored title and the
+        # rule_set='title' keyword rows — zero materialized judgment anywhere.
         self._seed()
-        document_id, _ = self._seed_extra_document_unit("annual_report")
+        self._ensure_classification_rules()
+        document_id, _ = self._seed_extra_document_unit(
+            "codeless", title="江海股份：2025年半年度报告"
+        )
         with self.engine.connect() as conn:
             row = conn.execute(
                 text(
@@ -460,7 +480,8 @@ class PublicViewContentTests(unittest.TestCase):
                 ),
                 {"document_id": document_id},
             ).mappings().one()
-        self.assertEqual(row["filing_type"], "annual_report")
+        # 半年度报告 must not be shadowed by the 年度报告 keyword (rule order).
+        self.assertEqual(row["filing_type"], "semiannual_report")
         self.assertIsNone(row["disclosure_topics"])
         self.assertIsNone(row["content_categories"])
 
@@ -472,9 +493,26 @@ class PublicViewContentTests(unittest.TestCase):
             load_facet_map,
         )
 
+        from disclosure_anchor.adapters.sources.cninfo.mapper import (
+            load_filing_type_rule_bundle,
+        )
+
         class_map = load_class_map()
         facet_map = load_facet_map()
+        bundle = load_filing_type_rule_bundle()
         rows = [
+            {
+                "rule_set": "title",
+                "prefix": "%".join(rule.keywords) if rule.match == "all" else keyword,
+                "value": rule.filing_type,
+                "priority": 1000 - position,
+                "version": bundle.version,
+            }
+            for position, rule in enumerate(bundle.rules)
+            for keyword in (
+                [None] if rule.match == "all" else rule.keywords
+            )
+        ] + [
             {
                 "rule_set": "class",
                 "prefix": prefix,
@@ -508,13 +546,14 @@ class PublicViewContentTests(unittest.TestCase):
 
     def test_source_tier_mapping_contract(self) -> None:
         self._seed()
+        self._ensure_classification_rules()
         _, ir_unit_id = self._seed_extra_document_unit("investor_relations")
         _, briefing_unit_id = self._seed_extra_document_unit("performance_briefing")
 
         with self.engine.connect() as conn:
             rows = conn.execute(
                 text(
-                    "SELECT asset_id, filing_type, source_tier "
+                    "SELECT asset_id, source_tier "
                     "FROM disclosure_public.document_units_v1 "
                     "WHERE asset_id = ANY(:ids)"
                 ),
@@ -533,10 +572,10 @@ class PublicViewContentTests(unittest.TestCase):
                 text(
                     "INSERT INTO disclosure_core.document "
                     "(document_id, status, company_id, security_id, source_access_id, "
-                    "provider, provider_document_id, filing_type, report_period, "
+                    "provider, provider_document_id, report_period, "
                     "raw_file_hash, raw_file_relpath, supersedes_document_id) "
                     "VALUES (:document_id, 'registered', :company_id, :security_id, "
-                    ":source_access_id, 'cninfo', :pid, 'annual_report', "
+                    ":source_access_id, 'cninfo', :pid, "
                     "'2025A', :hash_b, "
                     ":raw_relpath, "
                     ":supersedes_document_id)"
