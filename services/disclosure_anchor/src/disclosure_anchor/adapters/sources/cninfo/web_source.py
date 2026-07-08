@@ -13,14 +13,14 @@ synced through either channel is absorbed idempotently.
 Channel limitations (documented, accepted for a fallback):
 - no company profile (no legal name / USCC); SubjectResolver falls back to the
   existing security or a placeholder company name;
-- no F006V category codes: ``categories`` filtering is ignored and
+- no F006V category codes: classification falls back to title rules and
   filing_type is classified from the announcement title through the same rule
   bundle (titles carry 年度报告/季度报告/说明会/问询…).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from datetime import datetime, timezone, timedelta
 import random
 import time
@@ -96,9 +96,7 @@ class CninfoWebSource:
         self,
         security: SourceSecurity,
         window: DisclosureWindow,
-        categories: Sequence[str] | None = None,
     ) -> list[AnnouncementRef]:
-        del categories  # no F006V on this channel; filtering happens downstream
         refs: list[AnnouncementRef] = []
         seen: set[str] = set()
         page = 1

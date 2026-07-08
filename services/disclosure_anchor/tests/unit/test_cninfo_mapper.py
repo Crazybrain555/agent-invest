@@ -9,9 +9,7 @@ import unittest
 
 from disclosure_anchor.adapters.sources.cninfo.mapper import (
     CninfoMappingError,
-    category_prefix_matches,
     derive_report_period,
-    expand_filing_categories,
     load_class_map,
     load_filing_type_rule_bundle,
     map_filing_type,
@@ -141,44 +139,28 @@ class CninfoMapperTests(unittest.TestCase):
             "other",
         )
 
-    def test_category_prefix_matching_uses_segments(self) -> None:
-        self.assertTrue(category_prefix_matches("010301||010112", ["0103"]))
-        self.assertFalse(category_prefix_matches("010301||010112", ["0120"]))
-        self.assertTrue(category_prefix_matches("010301||010112", None))
-
-    def test_filing_categories_accept_class_keys_and_raw_prefixes(self) -> None:
-        # Watchlist writes class keys (humane); raw F006V prefixes pass
-        # through; a typo must raise, never silently widen the filter.
-        expanded = expand_filing_categories(("dividend", "0139"))
-        assert expanded is not None
-        self.assertIn("011301", expanded)
-        self.assertIn("0139", expanded)
-        self.assertIsNone(expand_filing_categories(None))
-        with self.assertRaises(CninfoMappingError):
-            expand_filing_categories(("divident",))
-        # class keys work end-to-end through the sync-side filter
-        self.assertTrue(category_prefix_matches("011301||010112", ["dividend"]))
-        self.assertFalse(category_prefix_matches("010301||010112", ["dividend"]))
-
     def test_class_map_vocabulary_integrity(self) -> None:
         class_map = load_class_map()
-        self.assertEqual(class_map["version"], "2026-07-r4")
+        self.assertEqual(class_map["version"], "2026-07-r5")
         for name, spec in class_map["classes"].items():
             self.assertTrue(spec["prefixes"], name)
             self.assertIsInstance(spec["priority"], int, name)
             self.assertTrue(spec["zh"], name)
         # parse_scope classes must all exist in the class map, disjoint sets
-        scope = json.loads(
+        policy = json.loads(
             (
-                Path(__file__).resolve().parents[2]
-                / "src/disclosure_anchor/application/worker/parse_scope.json"
+                Path(__file__).resolve().parents[2] / "config/processing_policy.json"
             ).read_text(encoding="utf-8")
         )
         known = set(class_map["classes"])
-        self.assertTrue(set(scope["core_classes"]) <= known)
-        self.assertTrue(set(scope["_deprioritized"]) <= known)
-        self.assertEqual(set(scope["core_classes"]) & set(scope["_deprioritized"]), set())
-        self.assertEqual(set(scope["core_classes"]) | set(scope["_deprioritized"]), known)
+        process, register_only = set(policy["process"]), set(policy["register_only"])
+        self.assertTrue(process <= known)
+        self.assertTrue(register_only <= known)
+        self.assertEqual(process & register_only, set())
+        self.assertEqual(process | register_only, known)
+        # corrections/amendments of core filings must process (edgartools
+        # amendments=True analog)
+        self.assertIn("correction_supplement", process)
 
     def test_p_info3015_mapper_uses_textid_as_provider_document_id(self) -> None:
         payload = json.loads(

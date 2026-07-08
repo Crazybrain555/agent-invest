@@ -64,7 +64,6 @@ class CninfoWebSourceTests(unittest.TestCase):
         refs = _source(handler).search_announcements(
             SourceSecurity(security_code="000001", exchange="SZSE", security_name=None),
             DisclosureWindow(date(2026, 6, 29), date(2026, 7, 6)),
-            ("0103",),  # ignored on this channel
         )
 
         self.assertEqual(len(refs), 1)
@@ -104,7 +103,6 @@ class CninfoWebSourceTests(unittest.TestCase):
         refs = _source(handler).search_announcements(
             SourceSecurity(security_code="000001", exchange="SZSE", security_name=None),
             DisclosureWindow(date(2026, 4, 1), date(2026, 7, 6)),
-            None,
         )
 
         self.assertEqual(pages, [1, 2])
@@ -124,7 +122,6 @@ class CninfoWebSourceTests(unittest.TestCase):
         refs = _source(handler).search_announcements(
             SourceSecurity(security_code="000001", exchange="SZSE", security_name=None),
             DisclosureWindow(date(2026, 6, 29), date(2026, 7, 6)),
-            None,
         )
 
         self.assertEqual(attempts["n"], 2)
@@ -142,7 +139,6 @@ class CninfoWebSourceTests(unittest.TestCase):
         refs = source.search_announcements(
             SourceSecurity(security_code="000001", exchange="SZSE", security_name=None),
             DisclosureWindow(date(2026, 6, 29), date(2026, 7, 6)),
-            None,
         )
         with self.assertRaises(CninfoWebSourceError) as ctx:
             source.download_pdf(refs[0])

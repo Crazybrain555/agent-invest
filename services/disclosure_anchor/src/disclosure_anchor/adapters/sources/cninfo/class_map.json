@@ -1,5 +1,5 @@
 {
-  "version": "2026-07-r4",
+  "version": "2026-07-r5",
   "_about": "统一 class 词表（design/classification-facets-and-derived-views.md）。单一映射两种输出：disclosure_topics=全部命中类集合；filing_type=priority argmax。前缀=巨潮 F006V 码（provider_category 实枚举），改词表=升版+make load-rules（视图现算，全库即刻生效，无存量残留）。priority 三层原则：日历类(95-100)>实质事件类(44-80,按重大性)>程序载体类(16-30)。std_refs 仅参考元数据（caev=ISO20022 公司行为码/hkex_t2=港交所 Appendix24/sec=SEC 表单或 8-K item），不进库不进契约。",
   "classes": {
     "annual_report": {
@@ -426,6 +426,17 @@
       "std_refs": {
         "sec": "8-K Item 5.02/5.03",
         "hkex_t2": "Constitutional Documents"
+      }
+    },
+    "correction_supplement": {
+      "prefixes": [
+        "0127"
+      ],
+      "priority": 82,
+      "zh": "补充及更正（定期报告/临时公告更正件）",
+      "std_refs": {
+        "sec": "Amendments (10-K/A 类)",
+        "hkex_t2": "Supplemental / Clarification"
       }
     }
   }

@@ -44,7 +44,6 @@ class SyncDisclosureIndexCommand:
     exchange: str
     window_start: date
     window_end: date
-    categories: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -116,7 +115,6 @@ class SyncDisclosureIndex:
                 uow=uow,
                 company_id=subject.company.company_id,
                 security_id=subject.security.security_id,
-                categories=command.categories,
             )
             try:
                 refs = self._source.search_announcements(
@@ -126,7 +124,6 @@ class SyncDisclosureIndex:
                         security_name=profile.security_name if profile else None,
                     ),
                     window,
-                    command.categories,
                 )
             except DisclosureAnchorError as exc:
                 failed = self._record_failed_index_access(
@@ -309,10 +306,10 @@ class SyncDisclosureIndex:
         uow: UnitOfWork,
         company_id: str,
         security_id: str,
-        categories: tuple[str, ...] | None,
     ) -> e.TrackedCompany:
+        # process_classes is watchlist-managed (make track); sync never
+        # touches the cascade override (round21).
         existing = uow.tracked_companies.get_by_company_id(company_id)
-        filing_categories = list(categories) if categories is not None else None
         if existing is None:
             return uow.tracked_companies.add(
                 e.TrackedCompany(
@@ -320,13 +317,10 @@ class SyncDisclosureIndex:
                     company_id=company_id,
                     security_id=security_id,
                     status="active",
-                    filing_categories=filing_categories,
                 )
             )
         existing.security_id = security_id
         existing.status = "active"
-        if filing_categories is not None:
-            existing.filing_categories = filing_categories
         return uow.tracked_companies.update(existing)
 
     def _record_index_access(
@@ -474,8 +468,6 @@ def _index_query_params(command: SyncDisclosureIndexCommand) -> dict[str, object
         "sdate": command.window_start.isoformat(),
         "edate": command.window_end.isoformat(),
     }
-    if command.categories is not None:
-        params["categories"] = list(command.categories)
     return params
 
 

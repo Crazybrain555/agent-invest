@@ -95,7 +95,7 @@ def tracked_company_to_model(entity: e.TrackedCompany) -> m.TrackedCompany:
         security_id=entity.security_id,
         status=entity.status,
         lookback=entity.lookback,
-        filing_categories=entity.filing_categories,
+        process_classes=entity.process_classes,
         sync_frequency=entity.sync_frequency,
     )
 
@@ -107,7 +107,7 @@ def tracked_company_to_entity(row: m.TrackedCompany) -> e.TrackedCompany:
         security_id=row.security_id,
         status=row.status,
         lookback=row.lookback,
-        filing_categories=row.filing_categories,
+        process_classes=row.process_classes,
         sync_frequency=row.sync_frequency,
         created_at=row.created_at,
         updated_at=row.updated_at,

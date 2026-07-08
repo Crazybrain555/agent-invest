@@ -24,13 +24,19 @@ from disclosure_anchor.domain import ids
 SYNC_FREQUENCIES = ("hourly", "daily", "weekly")
 
 
+def _known_classes() -> frozenset[str]:
+    from disclosure_anchor.adapters.sources.cninfo.mapper import load_class_map
+
+    return frozenset(load_class_map()["classes"])
+
+
 @dataclass(frozen=True)
 class TrackEntry:
     security_code: str
     exchange: str
     lookback_days: int | None = None
     sync_frequency: str | None = None
-    filing_categories: tuple[str, ...] | None = None
+    process_classes: tuple[str, ...] | None = None
     status: str = "active"
 
 
@@ -41,6 +47,9 @@ class TrackCompaniesCommand:
     # absent from the entries are reported as drift; prune_drift pauses them.
     reconcile: bool = False
     prune_drift: bool = False
+    # Plan mode (terraform plan / HA check_config pattern): compute the full
+    # reconcile outcome, then roll back instead of committing.
+    dry_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -65,6 +74,7 @@ class DriftEntry:
 class TrackCompaniesResult:
     results: tuple[TrackEntryResult, ...]
     drift: tuple[DriftEntry, ...] = ()
+    dry_run: bool = False
 
     @property
     def created_count(self) -> int:
@@ -87,6 +97,13 @@ class TrackCompanies:
                 raise ValueError(
                     f"lookback_days must be non-negative for {entry.security_code}"
                 )
+            if entry.process_classes:
+                unknown = [c for c in entry.process_classes if c not in _known_classes()]
+                if unknown:
+                    raise ValueError(
+                        f"unknown process_classes {unknown} for "
+                        f"{entry.security_code}: see class_map.json"
+                    )
         results: list[TrackEntryResult] = []
         drift: list[DriftEntry] = []
         with self._uow_factory() as uow:
@@ -98,8 +115,11 @@ class TrackCompanies:
                     known_company_ids={item.company_id for item in results},
                     prune=command.prune_drift,
                 )
-            uow.commit()
-        return TrackCompaniesResult(results=tuple(results), drift=tuple(drift))
+            if not command.dry_run:
+                uow.commit()
+        return TrackCompaniesResult(
+            results=tuple(results), drift=tuple(drift), dry_run=command.dry_run
+        )
 
     def _reconcile_drift(
         self, uow: UnitOfWork, *, known_company_ids: set[str], prune: bool
@@ -143,7 +163,7 @@ class TrackCompanies:
         lookback = (
             {"days": entry.lookback_days} if entry.lookback_days is not None else None
         )
-        categories = list(entry.filing_categories) if entry.filing_categories else None
+        process_classes = list(entry.process_classes) if entry.process_classes else None
         existing = uow.tracked_companies.get_by_company_id(subject.company.company_id)
         if existing is not None:
             existing.security_id = subject.security.security_id
@@ -152,7 +172,7 @@ class TrackCompanies:
             # default", so reconcile must also CLEAR a stale DB override
             # (Codex acceptance P1: blank lookback left {"days":30} behind).
             existing.lookback = lookback
-            existing.filing_categories = categories
+            existing.process_classes = process_classes
             existing.sync_frequency = entry.sync_frequency
             uow.tracked_companies.update(existing)
             return TrackEntryResult(
@@ -169,7 +189,7 @@ class TrackCompanies:
                 security_id=subject.security.security_id,
                 status=entry.status,
                 lookback=lookback,
-                filing_categories=categories,
+                process_classes=process_classes,
                 sync_frequency=entry.sync_frequency,
             )
         )

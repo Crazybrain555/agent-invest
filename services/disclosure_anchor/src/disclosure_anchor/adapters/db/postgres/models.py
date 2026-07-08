@@ -133,8 +133,12 @@ class TrackedCompany(Base):
         ForeignKey(f"{CORE_SCHEMA}.security.security_id"), nullable=True
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
-    lookback: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
-    filing_categories: Mapped[Optional[list[str]]] = mapped_column(JSONB, nullable=True)
+    lookback: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
+    process_classes: Mapped[Optional[list[str]]] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
     sync_frequency: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

@@ -51,8 +51,8 @@ security_id PK；company_id FK；security_code+exchange 定位（exchange 全大
 | 列 | 含义 |
 |---|---|
 | status | active / paused（暂停=改字段不删行；真源是 config/watchlist.csv，`make track` 对账） |
-| lookback | jsonb `{"days": N}`；覆盖默认初始回补 1095 天 |
-| filing_categories | jsonb 数组（F006V 前缀）；同步侧过滤；NULL=全量 |
+| lookback | jsonb `{"days": N}`；覆盖默认初始回补 1095 天（级联：空=继承 env） |
+| process_classes | jsonb 数组（class 键，0018 由 filing_categories 改名改义）；**按公司覆盖全局处理策略**（替换式，NULL=继承 config/processing_policy.json）；登记永远全量 |
 | sync_frequency | 闭集 hourly/daily/weekly；NULL=全局 DISCLOSURE_SYNC_INTERVAL_SECONDS |
 
 ### document（披露文件版本）
@@ -130,12 +130,13 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 | adapters/unit_builder/rules.py | 切分/噪声/声明组合文法/语义规则 | RULES_VERSION ub-2026.07-18 |
 | adapters/unit_builder/note_key_map.json | 章节词表 **144 键**（section facet；祖先继承+全类型开放） | 2026-07-r4 |
 | adapters/unit_builder/event_key_map.json | 事件键 **30 键**（DuEE-fin/CCKS/FewFC/CFinDEE 并集，标题派生） | 2026-07-r1 |
-| adapters/sources/cninfo/class_map.json | **统一 class 词表 30 类**（prefixes+priority+zh+std_refs；topics=集合/filing_type=argmax） | 2026-07-r4 |
+| adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs） | 2026-07-r5 |
 | adapters/sources/cninfo/facet_map.json | F006V 维度判定（market 精确码/publisher 0101） | 2026-07-r1 |
 | adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（仅注册时写表列） | 2026-07-r3 |
-| application/worker/parse_scope.json | 分层解析 core_classes（25 核心/5 降级） | 2026-07-r4 |
-| application/worker/download_scope.json | **分层下载** core_classes（19 类，round20：全量登记、PDF 只下核心；DISCLOSURE_DOWNLOAD_SCOPE=all 关闭；解析实际生效面 = parse ∩ download） | 2026-07-r1 |
-| config/watchlist.csv | 股票池唯一真源 | git 即版本 |
+| **config/processing_policy.json** | 处理策略（round21 合并 parse/download 两清单）：process 20 类=下载+解析，register_only 11 类=只登记；按公司覆盖=watchlist process_classes | 2026-07-r1 |
+| config/watchlist.csv | 股票池唯一真源 + 按公司级联覆盖 | git 即版本 |
+
+运营者旋钮总索引：`config/README.md`（级联模型/命令速查/两类文件边界）。
 
 ## 5. 设计讨论记录
 

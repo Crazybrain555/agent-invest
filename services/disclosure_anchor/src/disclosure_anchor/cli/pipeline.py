@@ -109,6 +109,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="pause tracked companies missing from the watchlist (default: report only)",
     )
+    track.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the reconcile plan (create/update/pause) without writing",
+    )
 
     track_status = subparsers.add_parser(
         "track-status", help="read-only watchlist status (config + sync progress)"
@@ -181,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
                     entries=entries,
                     reconcile=file_driven,
                     prune_drift=file_driven and args.prune_drift,
+                    dry_run=args.dry_run,
                 )
             )
             if args.codes:
@@ -311,7 +317,16 @@ class _Deps:
                 sql_text(
                     """
                     SELECT s.security_code, s.exchange, tc.status,
-                           tc.lookback, tc.filing_categories, tc.sync_frequency,
+                           tc.lookback, tc.process_classes, tc.sync_frequency,
+                           CASE WHEN tc.process_classes IS NOT NULL
+                                THEN 'company' ELSE 'global(policy)' END
+                               AS process_classes_source,
+                           CASE WHEN tc.lookback IS NOT NULL
+                                THEN 'company' ELSE 'global(env)' END
+                               AS lookback_source,
+                           CASE WHEN tc.sync_frequency IS NOT NULL
+                                THEN 'company' ELSE 'global(env)' END
+                               AS sync_frequency_source,
                            sc.cursor->>'window_end' AS synced_through,
                            sc.updated_at AS last_synced_at,
                            (SELECT count(*) FROM disclosure_core.document d
@@ -474,11 +489,11 @@ def _track_entries(args: argparse.Namespace) -> tuple[TrackEntry, ...]:
                 lookback_raw = (row.get("lookback_days") or "").strip()
                 frequency = (row.get("sync_frequency") or "").strip() or None
                 status = (row.get("status") or "").strip() or "active"
-                categories_raw = (row.get("filing_categories") or "").strip()
-                categories = (
+                classes_raw = (row.get("process_classes") or "").strip()
+                process_classes = (
                     tuple(
                         seg.strip()
-                        for seg in categories_raw.split(";")
+                        for seg in classes_raw.split(";")
                         if seg.strip()
                     )
                     or None
@@ -490,7 +505,7 @@ def _track_entries(args: argparse.Namespace) -> tuple[TrackEntry, ...]:
                         or _exchange_for_scode(code),
                         lookback_days=int(lookback_raw) if lookback_raw else None,
                         sync_frequency=frequency,
-                        filing_categories=categories,
+                        process_classes=process_classes,
                         status=status,
                     )
                 )

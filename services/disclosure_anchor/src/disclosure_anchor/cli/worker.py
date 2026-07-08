@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from importlib import resources
 
 import argparse
 import signal
@@ -171,35 +170,28 @@ def _deps(settings: Settings, engine: Engine) -> WorkerDeps:
             cninfo_oversized_kb=settings.cninfo_oversized_kb,
             initial_lookback_days=settings.disclosure_initial_lookback_days,
             backfill_max_pending_downloads=settings.disclosure_backfill_max_pending_downloads,
-            parse_scope_classes=_parse_scope_classes(settings),
-            download_scope_classes=_download_scope_classes(settings),
+            process_scope_classes=_process_scope_classes(settings),
         ),
         clock=lambda: datetime.now(timezone.utc),
     )
 
 
-def _download_scope_classes(settings: Settings) -> tuple[str, ...] | None:
-    if settings.disclosure_download_scope == "all":
-        return None
+def _process_scope_classes(settings: Settings) -> tuple[str, ...]:
+    """Global processing default (cascade layer 2) — fail-closed on typos."""
+
+    from disclosure_anchor.adapters.sources.cninfo.mapper import load_class_map
+
     payload = json.loads(
-        resources.files("disclosure_anchor.application.worker")
-        .joinpath("download_scope.json")
-        .read_text(encoding="utf-8")
+        settings.disclosure_processing_policy_path.read_text(encoding="utf-8")
     )
-    return tuple(str(t) for t in payload["core_classes"])
-
-
-def _parse_scope_classes(settings: Settings) -> tuple[str, ...] | None:
-    """None = parse everything; tuple = 'core' scope topics for 'other' docs."""
-
-    if settings.disclosure_parse_scope == "all":
-        return None
-    payload = json.loads(
-        resources.files("disclosure_anchor.application.worker")
-        .joinpath("parse_scope.json")
-        .read_text(encoding="utf-8")
-    )
-    return tuple(str(t) for t in payload["core_classes"])
+    process = tuple(str(t) for t in payload["process"])
+    known = set(load_class_map()["classes"])
+    unknown = [c for c in (*process, *payload.get("register_only", ())) if c not in known]
+    if unknown:
+        raise ValueError(
+            f"processing_policy.json 含未知类名 {unknown} — 先跑 make config-check"
+        )
+    return process
 
 
 def _append_reports(settings: Settings, report: WorkerReport) -> None:

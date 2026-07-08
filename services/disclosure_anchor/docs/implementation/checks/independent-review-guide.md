@@ -17,7 +17,7 @@ SQL 都是"抓一整类"的写法。
 
 新增审查对象（round12-13）：`docs/architecture/data-dictionary.md`（逐列核对与实库
 一致）；词表文件 note_key_map r4（144 键）/ event_key_map r1（30 事件键）/
-class_map/facet_map/parse_scope（0016 起分类视图现算，design/classification-facets-and-derived-views.md）；三 facet 架构（retrieval 设计文档 §4.6）。
+class_map(r5,31类)/facet_map/config/processing_policy.json（0016 起分类视图现算、round21 单一处理面+级联覆盖，design/classification-facets-and-derived-views.md）；三 facet 架构（retrieval 设计文档 §4.6）。
 
 ## 0.1 原审查前置
 

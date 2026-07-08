@@ -132,20 +132,13 @@ class Settings(BaseSettings):
             "disclosure_backfill_max_pending_downloads",
         ),
     )
-    disclosure_parse_scope: str = Field(
-        default="core",
-        pattern="^(core|all)$",
+    # Processing policy (round21): the ONE scope file — process classes are
+    # downloaded AND parsed, everything else registers metadata only.
+    # Per-company override lives in watchlist process_classes (cascade).
+    disclosure_processing_policy_path: Path = Field(
+        default=Path("config/processing_policy.json"),
         validation_alias=AliasChoices(
-            "DISCLOSURE_PARSE_SCOPE", "disclosure_parse_scope"
-        ),
-    )
-    # Download-layer scope (round20): register everything, download PDFs only
-    # for the core classes — initial-stage quota goes to what matters.
-    disclosure_download_scope: str = Field(
-        default="core",
-        pattern="^(core|all)$",
-        validation_alias=AliasChoices(
-            "DISCLOSURE_DOWNLOAD_SCOPE", "disclosure_download_scope"
+            "DISCLOSURE_PROCESSING_POLICY", "disclosure_processing_policy_path"
         ),
     )
     cninfo_oversized_kb: int = Field(

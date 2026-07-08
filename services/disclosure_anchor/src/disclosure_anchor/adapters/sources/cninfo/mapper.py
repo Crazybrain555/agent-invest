@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from datetime import date, datetime
@@ -195,43 +195,6 @@ def derive_primary_class(raw_category: str | None, title: str | None) -> str:
             elif any(keyword in title for keyword in rule.keywords):
                 return rule.filing_type
     return "other"
-
-
-def expand_filing_categories(values: Sequence[str] | None) -> tuple[str, ...] | None:
-    """Resolve watchlist filing_categories to F006V prefixes.
-
-    Operators write class keys (dividend;major_contract) — humane and stable;
-    raw F006V prefixes pass through unchanged for power use. Unknown values
-    raise so a typo in the watchlist cannot silently widen the sync filter.
-    """
-
-    if values is None:
-        return None
-    classes = load_class_map()["classes"]
-    prefixes: list[str] = []
-    for item in values:
-        if not item:
-            continue
-        if item in classes:
-            prefixes.extend(str(p) for p in classes[item]["prefixes"])
-        elif item[:1].isdigit() or item[:1] in ("N",):
-            prefixes.append(item)
-        else:
-            raise CninfoMappingError(f"unknown filing_categories value: {item!r}")
-    return tuple(prefixes) or None
-
-
-def category_prefix_matches(raw_category: str, categories: Sequence[str] | None) -> bool:
-    if categories is None:
-        return True
-    wanted = expand_filing_categories(tuple(categories))
-    if not wanted:
-        return True
-    return any(
-        segment.startswith(prefix)
-        for segment in split_category_segments(raw_category)
-        for prefix in wanted
-    )
 
 
 def _rule_from_payload(payload: Mapping[str, Any]) -> FilingTypeRule:

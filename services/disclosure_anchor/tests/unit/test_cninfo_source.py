@@ -98,7 +98,6 @@ class CninfoSourceTests(unittest.TestCase):
         refs = source.search_announcements(
             SourceSecurity(security_code="600519", exchange="SSE", security_name=None),
             DisclosureWindow(date(2026, 3, 28), date(2026, 7, 6)),
-            None,
         )
 
         self.assertEqual(len(index_windows), 4)
@@ -132,7 +131,6 @@ class CninfoSourceTests(unittest.TestCase):
         refs = source.search_announcements(
             SourceSecurity(security_code="600519", exchange="SSE", security_name=None),
             DisclosureWindow(date(2026, 6, 29), date(2026, 7, 6)),
-            None,
         )
 
         # 010301 resolves via the shipped fallback snapshot, not live p_info3005.
@@ -167,7 +165,6 @@ class CninfoSourceTests(unittest.TestCase):
         refs = source.search_announcements(
             SourceSecurity(security_code="600519", exchange="SSE", security_name=None),
             DisclosureWindow(date(2026, 6, 29), date(2026, 7, 6)),
-            None,
         )
 
         self.assertEqual(attempts["count"], 2)

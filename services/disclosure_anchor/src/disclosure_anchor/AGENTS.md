@@ -23,6 +23,6 @@ main.py        create_app：快检 preflight + 进程级单 engine
 - 每个子目录有自己的 AGENTS.md（就近优先），细节看那里
 - 验收/测试政策：`docs/implementation/checks/`
 
-硬规则速记：原始 PDF 不可变只追加；已应用迁移一律冻结（当前 0001–0013，新改动从 0014 起开新迁移，
+硬规则速记：原始 PDF 不可变只追加；已应用迁移一律冻结（随时以 alembic head 为准，新改动开新迁移，
 冻结策略与增量速记见 `adapters/db/postgres/AGENTS.md`）；
 public 视图 `disclosure_public.*_v1` 是唯一读契约；凭据只从环境变量进 settings。

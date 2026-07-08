@@ -215,7 +215,6 @@ class FakeCninfoSource:
         self,
         security: SourceSecurity,
         window: DisclosureWindow,
-        categories: tuple[str, ...] | None = None,
     ) -> list[AnnouncementRef]:
         return self.refs
 
@@ -229,7 +228,6 @@ def _command() -> SyncDisclosureIndexCommand:
         exchange="LOCAL",
         window_start=date(2026, 7, 1),
         window_end=date(2026, 7, 2),
-        categories=("0103", "0120"),
     )
 
 

@@ -199,3 +199,9 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
 2. 全链条演练：watchlist 加一家新公司 → launchd 周期内自动 三年回补→解析核心集→发布；
    期间人工不介入。
 3. Codex 独立终审 go。
+
+### 追加（2026-07-08 round21）
+
+- [ ] watchlist 真相翻转设计（开放接口增删公司时）：miniflux 形态——tracked_company
+      表变真相 + admin API POST/DELETE + watchlist.csv 降级为 import/export 交换格式
+      （≈OPML）；过渡期参照 HA deprecation（YAML→UI）双轨。单人 GitOps 阶段不做。

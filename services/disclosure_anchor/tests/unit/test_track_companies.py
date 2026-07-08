@@ -85,7 +85,7 @@ class TrackCompaniesTests(unittest.TestCase):
                         exchange="SSE",
                         lookback_days=30,
                         sync_frequency="hourly",
-                        filing_categories=("F006V01",),
+                        process_classes=("dividend",),
                     ),
                 )
             )
@@ -101,7 +101,36 @@ class TrackCompaniesTests(unittest.TestCase):
         self.assertEqual(len(tracked), 1)
         self.assertIsNone(tracked[0].lookback)
         self.assertIsNone(tracked[0].sync_frequency)
-        self.assertIsNone(tracked[0].filing_categories)
+        self.assertIsNone(tracked[0].process_classes)
+
+    def test_unknown_process_classes_raise(self) -> None:
+        uow = FakeUnitOfWork()
+        use_case = TrackCompanies(uow_factory=lambda: uow)
+        with self.assertRaises(ValueError):
+            use_case.execute(
+                TrackCompaniesCommand(
+                    entries=(
+                        TrackEntry(
+                            security_code="600519",
+                            exchange="SSE",
+                            process_classes=("divident",),
+                        ),
+                    )
+                )
+            )
+
+    def test_dry_run_computes_plan_without_writes(self) -> None:
+        uow = FakeUnitOfWork()
+        use_case = TrackCompanies(uow_factory=lambda: uow)
+        result = use_case.execute(
+            TrackCompaniesCommand(
+                entries=(TrackEntry(security_code="600519", exchange="SSE"),),
+                dry_run=True,
+            )
+        )
+        self.assertTrue(result.dry_run)
+        self.assertEqual(result.created_count, 1)
+        self.assertEqual(uow.commit_count, 0)
 
     def test_reconcile_reports_and_prunes_drift(self) -> None:
         uow = FakeUnitOfWork()
@@ -149,14 +178,14 @@ class TrackCompaniesTests(unittest.TestCase):
                         security_code="600519",
                         exchange="SSE",
                         status="paused",
-                        filing_categories=("011301", "0119"),
+                        process_classes=("dividend", "meeting_resolution"),
                     ),
                 )
             )
         )
         tracked = next(iter(uow.tracked_companies.items.values()))
         self.assertEqual(tracked.status, "paused")
-        self.assertEqual(tracked.filing_categories, ["011301", "0119"])
+        self.assertEqual(tracked.process_classes, ["dividend", "meeting_resolution"])
 
     def test_unknown_sync_frequency_is_rejected(self) -> None:
         with self.assertRaises(ValueError):

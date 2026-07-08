@@ -209,7 +209,7 @@ class TrackedCompanyRepository:
             "security_id",
             "status",
             "lookback",
-            "filing_categories",
+            "process_classes",
             "sync_frequency",
         ):
             setattr(row, column, getattr(updated, column))

@@ -147,11 +147,15 @@ pending_parse 的 scope 判定从 `d.disclosure_topics ?| :core_topics` 改为�
 同款的规则表 join。语料规模（200 只票 ≈ 数万文档、队列批量 LIMIT 小）下无
 索引也毫秒级；若未来涨到百万级再物化回列（可逆决策，记录于此）。
 
-**下载分层（2026-07-08 round20 用户裁决）**：全量登记保持（round9），新增
-download_scope（19 类：财报/预告/IR/问询监管/重组/股本总量类(分红送转/定增/
-可转债/配股/回购)/重大合同/关联/风险退市/激励）——初始阶段 PDF 配额只花在
-核心类；质押/增减持明确不进下载核心。谓词与 parse 同构（候选码→class 规则，
-无码候选→title 规则），作用于 pending_downloads 与背压计数。
+**处理策略最终形态（2026-07-08 round21，取代 round20 的双清单）**：
+"下载了就解析"——parse_scope/download_scope 合并为 config/processing_policy.json
+（process 20 类含 correction_supplement / register_only 11 类；并集=词表）。
+级联：policy=全局默认，watchlist process_classes=按公司替换式覆盖（0018 列改名，
+旧同步侧登记过滤删除——登记永远全量，加类自动回补历史）。业界对标：
+changedetection.io 三层级联/替换语义/空=继承；HA check_config→make config-check；
+terraform plan→make track DRY_RUN=1；changedetection _source→track-status 来源层列；
+edgartools amendments=True→correction_supplement 默认 process；
+miniflux OPML→真相翻转时 CSV 降级为 import/export（09 占位）。
 
 ## 4. 取舍与不做
 

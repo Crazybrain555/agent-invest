@@ -404,6 +404,40 @@ class OpsQueueViewTests(unittest.TestCase):
             self.assertIn(pid_core, pids)
             self.assertNotIn(pid_gov, pids)
             self.assertIn(pid_titled, pids)  # code-less → title rules
+
+            # Cascade: a company override REPLACES the global tuple — a
+            # governance-only override excludes the dividend candidate.
+            company_id = f"co_qv{self.suffix}ovr"
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company (company_id, legal_name) "
+                    "VALUES (:cid, 'QV覆盖公司')"
+                ),
+                {"cid": company_id},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.tracked_company "
+                    "(tracked_company_id, company_id, status, process_classes) "
+                    "VALUES (:tid, :cid, 'active', '[\"governance_rules\"]'::jsonb)"
+                ),
+                {"tid": f"tc_qv{self.suffix}ovr", "cid": company_id},
+            )
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.source_access "
+                    "SET company_id = :cid WHERE source_access_id = :sid"
+                ),
+                {"cid": company_id, "sid": f"sa_qv{self.suffix}scope"},
+            )
+            override_pids = [
+                row["provider_document_id"]
+                for row in queries.pending_downloads(
+                    conn, max_retries=3, limit=1000, scope_classes=scope
+                )
+            ]
+            self.assertNotIn(pid_core, override_pids)  # dividend not in override
+            self.assertIn(pid_gov, override_pids)      # governance now in
             all_pids = [
                 row["provider_document_id"]
                 for row in queries.pending_downloads(conn, max_retries=3, limit=1000)

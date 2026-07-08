@@ -30,7 +30,7 @@ def sync_due(
     global default) — the old window_end::date comparison truncated both
     sides to dates and stretched a daily cadence to every-other-day.
     Never-synced companies (no checkpoint) are always due. The tracked row's
-    lookback/filing_categories overrides ride along for the caller.
+    lookback/process_classes overrides ride along for the caller.
     """
 
     rows = conn.execute(
@@ -38,7 +38,7 @@ def sync_due(
             f"""
             SELECT v.tracked_company_id, v.company_id, v.security_id, v.window_end,
                    s.security_code, s.exchange,
-                   tc.lookback, tc.filing_categories, tc.sync_frequency,
+                   tc.lookback, tc.process_classes, tc.sync_frequency,
                    sc.updated_at AS last_synced_at
               FROM {OPS_SCHEMA}.sync_due_v1 v
               LEFT JOIN {CORE_SCHEMA}.security s ON s.security_id = v.security_id
@@ -62,11 +62,21 @@ def sync_due(
     return [dict(row) for row in rows]
 
 
-def _download_scope_sql(scope_classes: tuple[str, ...] | None) -> str:
-    """Download-layer scope predicate (round20, mirrors pending_parse).
+# Cascade layer resolution (round21): a tracked company's process_classes
+# REPLACES the global policy for that company; NULL inherits the global
+# tuple. Same expression drives download and parse — one processing surface.
+_EFFECTIVE_CLASSES = (
+    "CASE WHEN jsonb_typeof(tc_scope.process_classes) = 'array' "
+    "THEN ARRAY(SELECT jsonb_array_elements_text(tc_scope.process_classes)) "
+    "ELSE CAST(:scope_classes AS text[]) END"
+)
 
-    Coded candidates download when any F006V segment hits a core class;
-    code-less candidates (web channel) fall back to title keyword rules.
+
+def _download_scope_sql(scope_classes: tuple[str, ...] | None) -> str:
+    """Processing-scope predicate for the download queue.
+
+    Coded candidates download when any F006V segment hits an effective
+    class; code-less candidates (web channel) fall back to title rules.
     """
 
     if scope_classes is None:
@@ -81,12 +91,12 @@ def _download_scope_sql(scope_classes: tuple[str, ...] | None) -> str:
                           JOIN {CORE_SCHEMA}.classification_rule cr
                             ON cr.rule_set = 'class'
                            AND seg.code LIKE cr.prefix || '%'
-                         WHERE cr.value = ANY(CAST(:scope_classes AS text[])))
+                         WHERE cr.value = ANY({_EFFECTIVE_CLASSES}))
                     ELSE EXISTS (
                         SELECT 1 FROM {CORE_SCHEMA}.classification_rule tr
                          WHERE tr.rule_set = 'title'
                            AND q.candidate->>'title' LIKE '%' || tr.prefix || '%'
-                           AND tr.value = ANY(CAST(:scope_classes AS text[]))) END)"""
+                           AND tr.value = ANY({_EFFECTIVE_CLASSES})) END)"""
 
 
 def pending_download_count(
@@ -104,6 +114,8 @@ def pending_download_count(
         text(
             f"""
             SELECT count(*) FROM {OPS_SCHEMA}.pending_download_v1 q
+              LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
+                ON tc_scope.company_id = q.company_id
              WHERE q.failed_download_count < :max_retries
                AND NOT EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
                                 WHERE tc.company_id = q.company_id
@@ -133,15 +145,18 @@ def pending_downloads(
     rows = conn.execute(
         text(
             f"""
-            SELECT provider_document_id, download_url, title, announcement_date,
-                   source_access_id, company_id, candidate, failed_download_count
+            SELECT q.provider_document_id, q.download_url, q.title,
+                   q.announcement_date, q.source_access_id, q.company_id,
+                   q.candidate, q.failed_download_count
               FROM {OPS_SCHEMA}.pending_download_v1 q
+              LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
+                ON tc_scope.company_id = q.company_id
              WHERE q.failed_download_count < :max_retries
                AND NOT EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
                                 WHERE tc.company_id = q.company_id
                                   AND tc.status <> 'active')
                {_download_scope_sql(scope_classes)}
-             ORDER BY announcement_date, provider_document_id
+             ORDER BY q.announcement_date, q.provider_document_id
              LIMIT :limit
             """
         ),
@@ -181,12 +196,12 @@ def pending_parse(
                           JOIN {CORE_SCHEMA}.classification_rule cr
                             ON cr.rule_set = 'class'
                            AND seg.code LIKE cr.prefix || '%'
-                         WHERE cr.value = ANY(CAST(:scope_classes AS text[])))
+                         WHERE cr.value = ANY({_EFFECTIVE_CLASSES}))
                     ELSE EXISTS (
                         SELECT 1 FROM {CORE_SCHEMA}.classification_rule tr
                          WHERE tr.rule_set = 'title'
                            AND d.title LIKE '%' || tr.prefix || '%'
-                           AND tr.value = ANY(CAST(:scope_classes AS text[]))) END)"""
+                           AND tr.value = ANY({_EFFECTIVE_CLASSES})) END)"""
         params["scope_classes"] = list(scope_classes)
     rows = conn.execute(
         text(
@@ -197,6 +212,8 @@ def pending_parse(
                        AS oversized
               FROM {OPS_SCHEMA}.pending_parse_v1 q
               JOIN {CORE_SCHEMA}.document d ON d.document_id = q.document_id
+              LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
+                ON tc_scope.company_id = d.company_id
              WHERE COALESCE(q.last_failed_retryable, true)
                AND q.failed_parse_count < :max_retries
                AND NOT COALESCE((d.provider_metadata->>'oversized')::boolean, false)

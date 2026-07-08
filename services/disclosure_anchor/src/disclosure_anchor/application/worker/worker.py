@@ -78,8 +78,7 @@ class WorkerConfig:
     backfill_max_pending_downloads: int = 2000
     # None → parse everything; a topic tuple → 'other' docs need a matching
     # disclosure_topic (parse scope 'core', round9).
-    parse_scope_classes: tuple[str, ...] | None = None
-    download_scope_classes: tuple[str, ...] | None = None
+    process_scope_classes: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -185,7 +184,7 @@ def _sync_stage(
                     pending_downloads_now = queries.pending_download_count(
                         conn,
                         max_retries=deps.config.cninfo_max_retries,
-                        scope_classes=deps.config.download_scope_classes,
+                        scope_classes=deps.config.process_scope_classes,
                     )
             if pending_downloads_now >= deps.config.backfill_max_pending_downloads:
                 report.deferred_backfill += 1
@@ -197,7 +196,6 @@ def _sync_stage(
             initial_lookback_days=deps.config.initial_lookback_days,
             lookback=row.get("lookback"),
         )
-        categories = row.get("filing_categories")
         try:
             result = use_case.execute(
                 SyncDisclosureIndexCommand(
@@ -205,7 +203,6 @@ def _sync_stage(
                     exchange=str(exchange),
                     window_start=window_start,
                     window_end=today,
-                    categories=tuple(categories) if categories else None,
                 )
             )
         except Exception as exc:
@@ -271,7 +268,7 @@ def _download_stage(
             conn,
             max_retries=deps.config.cninfo_max_retries,
             limit=limit,
-            scope_classes=deps.config.download_scope_classes,
+            scope_classes=deps.config.process_scope_classes,
         )
     downloader = DownloadDocument(
         source=source,
@@ -334,7 +331,7 @@ def _parse_stage(
             conn,
             max_retries=deps.config.max_parse_retries,
             limit=limit,
-            scope_classes=deps.config.parse_scope_classes,
+            scope_classes=deps.config.process_scope_classes,
         )
     parse_use_case = ParseDocument(
         parser=deps.parser_factory(),

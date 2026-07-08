@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Protocol
@@ -79,7 +79,6 @@ class DisclosureSourcePort(Protocol):
         self,
         security: SourceSecurity,
         window: DisclosureWindow,
-        categories: Sequence[str] | None = None,
     ) -> list[AnnouncementRef]:
         ...
 

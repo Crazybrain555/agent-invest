@@ -82,7 +82,7 @@ class SyncDisclosureIndexTests(unittest.TestCase):
             "cninfo_org_id", "cninfo-org-test-000001"
         )
         self.assertEqual(tracked.security_id, result.security_id)
-        self.assertEqual(tracked.filing_categories, ["0103", "0120"])
+        self.assertIsNone(tracked.process_classes)
         self.assertEqual(identifier.company_id, result.company_id)
         self.assertEqual(identifier.source_access_id, result.profile_source_access_id)
 
@@ -119,9 +119,8 @@ class FakeCninfoSource:
         self,
         security: SourceSecurity,
         window: DisclosureWindow,
-        categories: tuple[str, ...] | None = None,
     ) -> list[AnnouncementRef]:
-        self.calls.append((security, window, categories))
+        self.calls.append((security, window))
         return self.refs
 
     def download_pdf(self, ref: AnnouncementRef) -> bytes:
@@ -149,7 +148,6 @@ def _command() -> SyncDisclosureIndexCommand:
         exchange="SZSE",
         window_start=date(2026, 7, 1),
         window_end=date(2026, 7, 2),
-        categories=("0103", "0120"),
     )
 
 

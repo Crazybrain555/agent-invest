@@ -55,7 +55,7 @@ class TrackedCompany:
     security_id: Optional[str] = None
     status: str = "active"
     lookback: Optional[dict[str, Any]] = None
-    filing_categories: Optional[list[str]] = None
+    process_classes: Optional[list[str]] = None
     sync_frequency: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None

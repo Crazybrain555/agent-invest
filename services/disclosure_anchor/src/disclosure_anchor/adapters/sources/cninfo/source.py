@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import date, timedelta
 import json
@@ -11,7 +11,6 @@ from importlib import resources
 from disclosure_anchor.adapters.sources.cninfo.client import CninfoClient
 from disclosure_anchor.adapters.sources.cninfo.mapper import (
     CninfoCompanyProfile,
-    category_prefix_matches,
     derive_report_period,
     split_category_segments,
     load_filing_type_rule_bundle,
@@ -48,7 +47,6 @@ class CninfoSource:
         self,
         security: SourceSecurity,
         window: DisclosureWindow,
-        categories: Sequence[str] | None = None,
     ) -> list[AnnouncementRef]:
         names = self._category_names_cached()
         refs: list[AnnouncementRef] = []
@@ -104,11 +102,7 @@ class CninfoSource:
                         category_names=category_names or None,
                     )
                 )
-        return [
-            ref
-            for ref in refs
-            if category_prefix_matches(ref.raw_category, categories)
-        ]
+        return refs
 
     def _category_names_cached(self) -> dict[str, str]:
         """Fetch live category names; fall back to the shipped snapshot.
