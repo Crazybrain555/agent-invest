@@ -50,10 +50,24 @@ class TopicRule:
 
 
 @dataclass(frozen=True)
+class NoiseRule:
+    """Absolute processing-exclusion rule matched against the title.
+
+    A hit keeps the document out of download AND parse regardless of codes
+    or per-company overrides (phase-1 user ruling: no boilerplate/routine
+    filings). Classification views are unaffected — metadata stays visible.
+    """
+
+    keywords: tuple[str, ...]
+    match: Literal["any", "all"] = "any"
+
+
+@dataclass(frozen=True)
 class FilingTypeRuleBundle:
     version: str
     rules: tuple[FilingTypeRule, ...]
     topic_rules: tuple[TopicRule, ...] = ()
+    noise_rules: tuple[NoiseRule, ...] = ()
 
 
 # CNINFO profiles use the provider-neutral port DTO directly.
@@ -75,8 +89,18 @@ def load_filing_type_rule_bundle() -> FilingTypeRuleBundle:
         )
         for item in payload.get("topic_rules", [])
     )
+    noise_rules = tuple(
+        NoiseRule(
+            keywords=tuple(str(keyword) for keyword in item["keywords"]),
+            match="all" if item.get("match") == "all" else "any",
+        )
+        for item in payload.get("noise_rules", [])
+    )
     return FilingTypeRuleBundle(
-        version=str(payload["version"]), rules=rules, topic_rules=topic_rules
+        version=str(payload["version"]),
+        rules=rules,
+        topic_rules=topic_rules,
+        noise_rules=noise_rules,
     )
 
 

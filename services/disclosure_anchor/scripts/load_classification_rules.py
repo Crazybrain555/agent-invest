@@ -79,6 +79,23 @@ def main() -> int:
                     "version": bundle.version,
                 }
             )
+    # Noise rules: absolute processing exclusions (phase-1 user ruling) —
+    # a title hit keeps the document out of download AND parse for coded
+    # and code-less rows alike. value 'noise' is a marker, never a class.
+    for noise_rule in bundle.noise_rules:
+        noise_pattern = (
+            "%".join(noise_rule.keywords) if noise_rule.match == "all" else None
+        )
+        for keyword in ([noise_pattern] if noise_pattern else noise_rule.keywords):
+            rows.append(
+                {
+                    "rule_set": "title_noise",
+                    "prefix": keyword,
+                    "value": "noise",
+                    "priority": 0,
+                    "version": bundle.version,
+                }
+            )
 
     engine = create_engine(os.environ["DATABASE_URL"])
     with engine.begin() as conn:
@@ -94,14 +111,15 @@ def main() -> int:
             ),
             rows,
         )
-    counts = {"class": 0, "facet": 0, "title": 0, "title_topic": 0}
+    counts = {"class": 0, "facet": 0, "title": 0, "title_topic": 0, "title_noise": 0}
     for row in rows:
         counts[str(row["rule_set"])] += 1
     print(
         f"loaded {counts['class']} class rules ({class_map['version']}, "
         f"{len(class_map['classes'])} classes) + {counts['facet']} facet rules "
         f"({facet_map['version']}) + {counts['title']} title rules "
-        f"+ {counts['title_topic']} title_topic rules ({bundle.version})"
+        f"+ {counts['title_topic']} title_topic rules "
+        f"+ {counts['title_noise']} title_noise rules ({bundle.version})"
     )
     return 0
 

@@ -88,6 +88,9 @@ def _processing_scope_sql(*, category_expr: str, title_expr: str) -> str:
     when a title_topic rule matches (provider-code blind spots, 0021).
     Carrier guard: no carrier-class hit may sit outside the effective set —
     coded rows detect carriers via class rules, code-less via title rules.
+    Noise guard (phase-1 user ruling): a title_noise hit excludes the row
+    absolutely — codes, topic hits, and per-company overrides cannot
+    readmit boilerplate (募集资金存放 专项/鉴证报告 family etc.).
     Callers must bind :scope_classes AND :carrier_classes.
 
     NULLIF: the web channel stores raw_category as '' (candidate snapshots
@@ -132,7 +135,11 @@ def _processing_scope_sql(*, category_expr: str, title_expr: str) -> str:
                          WHERE tx.rule_set = 'title'
                            AND {title_expr} LIKE '%' || tx.prefix || '%'
                            AND tx.value = ANY(CAST(:carrier_classes AS text[]))
-                           AND NOT tx.value = ANY({_EFFECTIVE_CLASSES})) END)"""
+                           AND NOT tx.value = ANY({_EFFECTIVE_CLASSES})) END)
+               AND NOT EXISTS (
+                        SELECT 1 FROM {CORE_SCHEMA}.classification_rule nz
+                         WHERE nz.rule_set = 'title_noise'
+                           AND {title_expr} LIKE '%' || nz.prefix || '%')"""
 
 
 def _download_scope_sql(scope_classes: tuple[str, ...] | None) -> str:

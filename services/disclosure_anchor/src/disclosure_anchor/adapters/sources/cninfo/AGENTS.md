@@ -20,7 +20,9 @@ filing_type_map.json 规则包(版本化)；**intermediary_report 必须排最�
                      判定优先——"激励计划法律意见书"是意见书不是激励公告)；
                      **semiannual 必须排在 annual 之前**(子串遮蔽，实测踩过)；
                      topic_rules 段=title_topic 追加规则(有码无码都追加命中 class，
-                     补 provider 码盲区：销售简报/经营数据/发电量走 012305 而非 010309)
+                     补 provider 码盲区：销售简报/经营数据/发电量走 012305 而非 010309)；
+                     noise_rules 段=title_noise 负向规则(标题命中=绝对不下载不解析，
+                     覆盖不能翻；加词必须先跑全库+候选层误伤核验并写 note)
 ```
 
 硬规则：凭据只从 settings 进(构造注入)，query_params/日志一律先脱敏；

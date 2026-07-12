@@ -595,6 +595,88 @@ class OpsQueueViewTests(unittest.TestCase):
             txn.rollback()
             conn.close()
 
+    def test_pending_queues_noise_gate_is_absolute(self) -> None:
+        # Phase-1 ruling: a title_noise hit excludes the row from download
+        # AND parse even when its codes are squarely in scope, and even for
+        # a per-company override.
+        pid_noise = f"qvdl{self.suffix}nz"
+        pid_clean = f"qvdl{self.suffix}cl"
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.classification_rule "
+                    "(rule_set, prefix, value, priority, version) VALUES "
+                    "('class', '0111', 'financing', 48, 'test'), "
+                    "('title_noise', '募集资金存放', 'noise', 0, 'test') "
+                    "ON CONFLICT (rule_set, prefix, value) DO NOTHING"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.source_access "
+                    "(source_access_id, provider, provider_interface, accessed_at, "
+                    " status, result_snapshot) "
+                    "VALUES (:id, 'cninfo', 'cninfo:p_info3015', now(), 'ok', "
+                    "        CAST(:snap AS jsonb))"
+                ),
+                {
+                    "id": f"sa_qv{self.suffix}noise",
+                    "snap": json.dumps(
+                        {
+                            "result": "ok",
+                            "candidates": [
+                                {
+                                    "provider_document_id": pid_noise,
+                                    "title": "2025年度募集资金存放与使用情况的专项报告",
+                                    "raw_category": "01010503||011101",
+                                    "download_url": "http://x/n1.PDF",
+                                    "announcement_date": "1990-01-01",
+                                },
+                                {
+                                    "provider_document_id": pid_clean,
+                                    "title": "关于向银行申请借款的公告",
+                                    "raw_category": "01010503||011101",
+                                    "download_url": "http://x/n2.PDF",
+                                    "announcement_date": "1990-01-01",
+                                },
+                            ],
+                        }
+                    ),
+                },
+            )
+            pids = [
+                row["provider_document_id"]
+                for row in queries.pending_downloads(
+                    conn, max_retries=3, limit=1000, scope_classes=("financing",)
+                )
+            ]
+            self.assertNotIn(pid_noise, pids)
+            self.assertIn(pid_clean, pids)
+
+            # Parse side, same guard, and status registered.
+            doc_noise = self._insert_document(conn, status="registered")
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.document SET provider_metadata = "
+                    "jsonb_build_object('raw_category', CAST('01010503||011101' AS text)), "
+                    "title = '2024年度募集资金存放与实际使用情况的专项报告' "
+                    "WHERE document_id = :id"
+                ),
+                {"id": doc_noise},
+            )
+            parse_ids = [
+                row["document_id"]
+                for row in queries.pending_parse(
+                    conn, max_retries=3, limit=1000, scope_classes=("financing",)
+                )
+            ]
+            self.assertNotIn(doc_noise, parse_ids)
+        finally:
+            txn.rollback()
+            conn.close()
+
     def test_pending_parse_carrier_gate_matches_download_gate(self) -> None:
         # One processing surface: the parse queue applies the same carrier
         # guard, title_topic eligibility, and ''→title-branch routing (the

@@ -27,7 +27,7 @@ class CninfoMapperTests(unittest.TestCase):
     def test_filing_type_rule_bundle_has_required_seed_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
 
-        self.assertEqual(bundle.version, "2026-07-r5")
+        self.assertEqual(bundle.version, "2026-07-r6")
         self.assertEqual(
             {rule.filing_type for rule in bundle.rules},
             {
@@ -59,6 +59,12 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertIn("销售简报", by_class["operating_data"].keywords)
         self.assertIn("经营数据", by_class["operating_data"].keywords)
         self.assertIn("产销快报", by_class["operating_data"].keywords)
+
+    def test_rule_bundle_parses_noise_rules(self) -> None:
+        bundle = load_filing_type_rule_bundle()
+
+        all_keywords = [kw for rule in bundle.noise_rules for kw in rule.keywords]
+        self.assertIn("募集资金存放", all_keywords)
 
     def test_carrier_title_rules_behavior_on_codeless_channel(self) -> None:
         # Carrier keywords outrank subject keywords on the title path…

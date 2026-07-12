@@ -316,6 +316,8 @@ def _classification_rules_check(engine: Engine) -> CheckResult:
     }
     if bundle.topic_rules:
         expected["title_topic"] = bundle.version
+    if bundle.noise_rules:
+        expected["title_noise"] = bundle.version
     with engine.connect() as conn:
         rows = conn.execute(
             text(
