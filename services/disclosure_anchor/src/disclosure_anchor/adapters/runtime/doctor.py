@@ -305,12 +305,17 @@ def _classification_rules_check(engine: Engine) -> CheckResult:
     from disclosure_anchor.adapters.sources.cninfo.mapper import (
         load_class_map,
         load_facet_map,
+        load_filing_type_rule_bundle,
     )
 
+    bundle = load_filing_type_rule_bundle()
     expected = {
         "class": str(load_class_map()["version"]),
         "facet": str(load_facet_map()["version"]),
+        "title": bundle.version,
     }
+    if bundle.topic_rules:
+        expected["title_topic"] = bundle.version
     with engine.connect() as conn:
         rows = conn.execute(
             text(
@@ -331,7 +336,10 @@ def _classification_rules_check(engine: Engine) -> CheckResult:
             "classification rules",
             "; ".join(mismatches) + " — run `make load-rules`",
         )
-    return _pass("classification rules", f"class={expected['class']} facet={expected['facet']}")
+    return _pass(
+        "classification rules",
+        f"class={expected['class']} facet={expected['facet']} title={expected['title']}",
+    )
 
 
 def _database_catalog_checks(engine: Engine) -> list[CheckResult]:

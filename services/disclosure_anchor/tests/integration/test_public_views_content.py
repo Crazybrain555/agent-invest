@@ -9,6 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
+from disclosure_anchor.adapters.sources.cninfo.mapper import derive_primary_class
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from tests.integration._support import engine_or_skip
@@ -518,6 +519,37 @@ class PublicViewContentTests(unittest.TestCase):
         self.assertEqual(
             set(row["disclosure_topics"]), {"operating_data", "risk_alert"}
         )
+        # Python evaluator parity (derive_primary_class consults topic_rules).
+        self.assertEqual(
+            derive_primary_class(
+                "01010503||010112||012305",
+                "万科A：2026年6月销售及近期新增项目情况简报",
+            ),
+            "operating_data",
+        )
+
+    def test_title_topic_rules_never_mask_a_higher_priority_code(self) -> None:
+        # Reverse direction of the argmax: annual_report (100) outranks the
+        # operating_data topic hit (95) — topics keep both, filing_type
+        # stays with the code class.
+        self._seed()
+        self._ensure_classification_rules()
+        document_id, _ = self._seed_extra_document_unit(
+            "annual_report", title="某公司2025年年度报告（含主要经营数据）"
+        )
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT filing_type, disclosure_topics "
+                    "FROM disclosure_public.documents_v1 "
+                    "WHERE document_id = :document_id"
+                ),
+                {"document_id": document_id},
+            ).mappings().one()
+        self.assertEqual(row["filing_type"], "annual_report")
+        self.assertEqual(
+            set(row["disclosure_topics"]), {"annual_report", "operating_data"}
+        )
 
     def test_title_topic_rules_classify_codeless_documents(self) -> None:
         # 0021: code-less docs consult topic rules too — topics no longer
@@ -538,6 +570,11 @@ class PublicViewContentTests(unittest.TestCase):
             ).mappings().one()
         self.assertEqual(row["filing_type"], "operating_data")
         self.assertEqual(list(row["disclosure_topics"]), ["operating_data"])
+        # Python evaluator parity on the code-less path.
+        self.assertEqual(
+            derive_primary_class(None, "贵州茅台2026年第二季度主要经营数据公告"),
+            "operating_data",
+        )
 
     def _ensure_classification_rules(self) -> None:
         # Additive idempotent seed (never TRUNCATE the shared DB from a test);

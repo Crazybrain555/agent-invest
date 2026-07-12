@@ -211,27 +211,36 @@ def load_processing_policy(path: Path) -> tuple[str, ...]:
 
 
 def derive_primary_class(raw_category: str | None, title: str | None) -> str:
-    """Python evaluator of the shared vocabulary (view parity, 0017).
+    """Python evaluator of the shared vocabulary (view parity, 0021).
 
-    Code-rule argmax first (class_map priorities), then title keyword rules
-    (filing_type_map, file order = precedence), else 'other'. The views
-    compute the same thing in SQL from classification_rule; an integration
-    test pins the two evaluators together.
+    Argmax over the UNION of code-rule hits (class_map priorities) and
+    title_topic hits (same priority scale), then the code-less title
+    keyword fallback (filing_type_map, file order = precedence), else
+    'other'. The views compute the same thing in SQL from
+    classification_rule; the 0021 view tests assert parity on the
+    topic-rule scenarios.
     """
 
     classes = load_class_map()["classes"]
+    bundle = load_filing_type_rule_bundle()
+    best: tuple[int, str] | None = None
     if raw_category:
-        best: tuple[int, str] | None = None
         for segment in split_category_segments(raw_category):
             for name, spec in classes.items():
                 if any(segment.startswith(str(p)) for p in spec["prefixes"]):
                     key = (int(spec["priority"]), name)
                     if best is None or (key[0], key[1]) > best:
                         best = key
-        if best is not None:
-            return best[1]
     if title:
-        bundle = load_filing_type_rule_bundle()
+        for topic_rule in bundle.topic_rules:
+            if any(keyword in title for keyword in topic_rule.keywords):
+                spec = classes[topic_rule.class_name]
+                key = (int(spec["priority"]), topic_rule.class_name)
+                if best is None or (key[0], key[1]) > best:
+                    best = key
+    if best is not None:
+        return best[1]
+    if title:
         for rule in bundle.rules:
             if rule.match == "all":
                 if all(keyword in title for keyword in rule.keywords):

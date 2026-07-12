@@ -82,6 +82,9 @@ def main() -> int:
 
     engine = create_engine(os.environ["DATABASE_URL"])
     with engine.begin() as conn:
+        # TRUNCATE takes ACCESS EXCLUSIVE; a long-running view reader would
+        # queue us and everything behind us. Fail fast instead of wedging.
+        conn.execute(text("SET LOCAL lock_timeout = '5s'"))
         conn.execute(text("TRUNCATE disclosure_core.classification_rule"))
         conn.execute(
             text(

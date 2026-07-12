@@ -554,13 +554,51 @@ class OpsQueueViewTests(unittest.TestCase):
             ]
             self.assertIn(pid_carrier, optin_pids)
             self.assertIn(pid_codeless_carrier, optin_pids)
+
+            # Per-company override (REPLACE semantics): a company whose
+            # process_classes is ["intermediary_report"] opts its carriers
+            # back in even though the global scope excludes them — and
+            # loses everything else.
+            company_id = f"co_qv{self.suffix}car"
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company (company_id, legal_name) "
+                    "VALUES (:cid, 'QV载体覆盖公司')"
+                ),
+                {"cid": company_id},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.tracked_company "
+                    "(tracked_company_id, company_id, status, process_classes) "
+                    "VALUES (:tid, :cid, 'active', "
+                    "'[\"intermediary_report\"]'::jsonb)"
+                ),
+                {"tid": f"tc_qv{self.suffix}car", "cid": company_id},
+            )
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.source_access "
+                    "SET company_id = :cid WHERE source_access_id = :sid"
+                ),
+                {"cid": company_id, "sid": f"sa_qv{self.suffix}carrier"},
+            )
+            override_pids = [
+                row["provider_document_id"]
+                for row in queries.pending_downloads(
+                    conn, max_retries=3, limit=1000, scope_classes=scope
+                )
+            ]
+            self.assertIn(pid_carrier, override_pids)
+            self.assertNotIn(pid_topic, override_pids)  # replaced, not merged
         finally:
             txn.rollback()
             conn.close()
 
     def test_pending_parse_carrier_gate_matches_download_gate(self) -> None:
         # One processing surface: the parse queue applies the same carrier
-        # guard, so an already-registered legal opinion stops at parse too.
+        # guard, title_topic eligibility, and ''→title-branch routing (the
+        # web channel persists provider_metadata raw_category as '').
         conn = self.engine.connect()
         txn = conn.begin()
         try:
@@ -569,25 +607,32 @@ class OpsQueueViewTests(unittest.TestCase):
                     "INSERT INTO disclosure_core.classification_rule "
                     "(rule_set, prefix, value, priority, version) VALUES "
                     "('class', '012325', 'equity_incentive', 76, 'test'), "
-                    "('class', '0129', 'intermediary_report', 18, 'test') "
+                    "('class', '0131', 'governance_rules', 16, 'test'), "
+                    "('class', '0129', 'intermediary_report', 18, 'test'), "
+                    "('title', '年度报告', 'annual_report', 998, 'test'), "
+                    "('title_topic', '销售简报', 'operating_data', 95, 'test') "
                     "ON CONFLICT (rule_set, prefix, value) DO NOTHING"
                 )
             )
             doc_carrier = self._insert_document(conn, status="registered")
             doc_subject = self._insert_document(conn, status="registered")
-            for raw, doc_id in (
-                ("01010503||012325||012901", doc_carrier),
-                ("01010503||012325", doc_subject),
+            doc_web = self._insert_document(conn, status="registered")
+            doc_topic = self._insert_document(conn, status="registered")
+            for raw, title, doc_id in (
+                ("01010503||012325||012901", "法律意见书", doc_carrier),
+                ("01010503||012325", "激励公告", doc_subject),
+                ("", "某公司2025年年度报告", doc_web),
+                ("01010503||013101", "2026年6月销售简报", doc_topic),
             ):
                 conn.execute(
                     text(
                         "UPDATE disclosure_core.document SET provider_metadata = "
-                        "jsonb_build_object('raw_category', CAST(:raw AS text)) "
-                        "WHERE document_id = :id"
+                        "jsonb_build_object('raw_category', CAST(:raw AS text)), "
+                        "title = :title WHERE document_id = :id"
                     ),
-                    {"raw": raw, "id": doc_id},
+                    {"raw": raw, "title": title, "id": doc_id},
                 )
-            scope = ("equity_incentive",)
+            scope = ("equity_incentive", "annual_report", "operating_data")
             doc_ids = [
                 row["document_id"]
                 for row in queries.pending_parse(
@@ -596,6 +641,8 @@ class OpsQueueViewTests(unittest.TestCase):
             ]
             self.assertNotIn(doc_carrier, doc_ids)
             self.assertIn(doc_subject, doc_ids)
+            self.assertIn(doc_web, doc_ids)  # '' raw_category → title branch
+            self.assertIn(doc_topic, doc_ids)  # topic hit despite gov codes
         finally:
             txn.rollback()
             conn.close()

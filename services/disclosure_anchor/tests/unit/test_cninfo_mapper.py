@@ -9,6 +9,7 @@ import unittest
 
 from disclosure_anchor.adapters.sources.cninfo.mapper import (
     CninfoMappingError,
+    derive_primary_class,
     derive_report_period,
     load_class_map,
     load_filing_type_rule_bundle,
@@ -57,6 +58,41 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertIn("operating_data", by_class)
         self.assertIn("销售简报", by_class["operating_data"].keywords)
         self.assertIn("经营数据", by_class["operating_data"].keywords)
+        self.assertIn("产销快报", by_class["operating_data"].keywords)
+
+    def test_carrier_title_rules_behavior_on_codeless_channel(self) -> None:
+        # Carrier keywords outrank subject keywords on the title path…
+        self.assertEqual(
+            map_filing_type(
+                "关于2024年限制性股票激励计划的法律意见书", category_names_by_code={}
+            ),
+            "intermediary_report",
+        )
+        # …but '审计报告' is deliberately NOT a carrier keyword: a merged
+        # "年度报告及审计报告" title must stay an annual report (substring
+        # shadowing would otherwise misroute the annual report itself).
+        self.assertEqual(
+            map_filing_type(
+                "某公司2024年年度报告及审计报告", category_names_by_code={}
+            ),
+            "annual_report",
+        )
+
+    def test_derive_primary_class_consults_topic_rules(self) -> None:
+        # View parity (0021): topic hit wins over a lower-priority code
+        # class, loses to a higher one, and works code-less too.
+        self.assertEqual(
+            derive_primary_class("012305", "2026年6月销售及近期新增项目情况简报"),
+            "operating_data",
+        )
+        self.assertEqual(
+            derive_primary_class("010301", "2025年年度报告（含主要经营数据）"),
+            "annual_report",
+        )
+        self.assertEqual(
+            derive_primary_class(None, "贵州茅台2026年第一季度主要经营数据公告"),
+            "operating_data",
+        )
 
     def test_f006v_segments_are_split_before_filing_type_mapping(self) -> None:
         filing_type = map_filing_type(

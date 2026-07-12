@@ -76,7 +76,7 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
   部分索引 ix_document_unit_applicability；page_no：artifact_locator 首页码提升列）。
 0007 起 document_units_v1 追加 6 列：asset_kind / observed_at / source_tier /
   trace_level / raw_file_hash / query_projection_hash
-  （列全集：04R-R7 的 32 列 + 0010 applicability/page_no + 0011 is_active_run + 0013 semantic_keys + 0014 disclosure_topics + 0015 heading_path_text + 0016 publisher_categories/market/content_categories = **41 列**；0016/0017 起 filing_type/disclosure_topics 为视图现算——class 词表码 argmax/命中集合，无码通道走 rule_set='title' 标题关键词规则，任何表列均不物化分类）
+  （列全集：04R-R7 的 32 列 + 0010 applicability/page_no + 0011 is_active_run + 0013 semantic_keys + 0014 disclosure_topics + 0015 heading_path_text + 0016 publisher_categories/market/content_categories = **41 列**；0016/0017 起 filing_type/disclosure_topics 为视图现算；0021 起分类 = class 词表码命中 ∪ rule_set='title_topic' 标题追加命中（有码无码都咨询，argmax 同一优先级刻度），无码通道 filing_type 兜底 rule_set='title' 标题关键词规则，任何表列均不物化分类）
 0007 起 change_events_v1 追加 change_kind（真实列）/ subject_kind / subject_ref /
   source / contract_version
 0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref /
@@ -91,7 +91,8 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
   不进哈希；06R 投影将对同一字段建 FTS 索引）
 0014 起 document/documents_v1/document_units_v1 增加 disclosure_topics（F006V→
   topic_map.json 派生的二级分类数组，GIN 部分索引；filing_type 保持粗桶，
-  round9 用户裁决"两三级分类合理"；web 兜底通道无 F006V → null）
+  round9 用户裁决"两三级分类合理"；web 兜底通道无 F006V → null，0021 起
+  title_topic 标题命中会填充无码文档的 topics（无命中仍为 null））
 0012 起新增 document_categories_v1（provider 原生分类：F006V 段 × provider_category
   字典（p_info3005 快照 seed）；facet 语义只给 ordinal 不造 is_primary；filing_type
   仍为内部粗桶，规则包 2026-07-r3 起 调研活动→investor_relations）

@@ -37,4 +37,5 @@ PUBLIC_VIEWS = (
     "processing_runs_v1",
     "source_refs_v1",
     "change_events_v1",
+    "tracked_companies_v1",
 )
