@@ -10,7 +10,13 @@
   </array>
   <key>StartInterval</key><integer>7200</integer>
   <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>__RUNTIME__/logs/launchd-worker.out</string>
-  <key>StandardErrorPath</key><string>__RUNTIME__/logs/launchd-worker.err</string>
+  <!-- launchd stdout/err MUST live on the internal disk (~/Library/Logs is
+       the macOS LaunchAgent convention): creating files on an external
+       volume from a launchd-spawned process is TCC-denied with no prompt,
+       and the job dies as EX_CONFIG before the script even runs (observed
+       2026-07-08). The script appends the real worker log under
+       $DISCLOSURE_RUNTIME_ROOT once it is running. -->
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/agent-invest/disclosure-worker.out</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/agent-invest/disclosure-worker.err</string>
 </dict>
 </plist>

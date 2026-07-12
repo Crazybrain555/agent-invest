@@ -19,6 +19,7 @@ document_category
 processing_run
 source_ref
 change_event
+tracked_company
 ```
 
 不得对外承诺：
@@ -46,6 +47,7 @@ GET /v1/units/{asset_id}/source-ref
 GET /v1/units/{asset_id}/context
 GET /v1/filings/latest
 GET /v1/changes
+GET /v1/tracked-companies
 ```
 
 检查项（语义细则以 milestone 06 为唯一权威，本清单只列覆盖面）：
@@ -61,6 +63,12 @@ GET /v1/changes
 unit 级 DTO 派生字段全集 = {asset_uri}（仅 API 序列化层派生，不入库、不进 *_v1 视图，
   DERIVED 白名单排除）；is_active_run 自 0011 起是 document_units_v1 / source_refs_v1
   的真实视图列（round3 P1#7：DB 直读方可直接过滤 active run）
+tracked_company DTO 派生字段全集 = {effective_lookback_days / effective_sync_seconds /
+  effective_process_classes / sync_state}（级联与 due 判定在 API 层解析——全局 policy/
+  间隔是配置文件与 env，视图只暴露 raw 覆盖列，NULL=继承；DERIVED 白名单排除）
+0020 起 tracked_companies_v1 追加生命周期列：legal_name_status（pending/resolved，
+  占位名判别）/ last_synced_at（checkpoint 时间，NULL=从未同步）/ synced_through
+  （cursor window_end 覆盖日期）
 scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（数组前缀语义，
   见 06 §3.8）/ semantic_key / quality_status 等）
 0010 起 document_units_v1 追加 applicability / page_no 列（applicability：
@@ -100,6 +108,7 @@ disclosure_public.document_categories_v1
 disclosure_public.processing_runs_v1
 disclosure_public.source_refs_v1
 disclosure_public.change_events_v1
+disclosure_public.tracked_companies_v1
 ```
 
 检查项：

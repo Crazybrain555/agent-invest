@@ -9,11 +9,15 @@ from disclosure_anchor.application.services.subject_resolver import (
     SubjectCandidate,
     SubjectResolver,
 )
+from disclosure_anchor.application.ports.disclosure_source import SourceCompanyProfile
 from disclosure_anchor.application.use_cases.track_companies import (
+    ResolveTrackedProfiles,
     TrackCompanies,
     TrackCompaniesCommand,
     TrackEntry,
+    UntrackCompanies,
 )
+from disclosure_anchor.domain.errors import DisclosureAnchorError
 
 from tests.unit._fakes import FakeUnitOfWork
 
@@ -225,6 +229,71 @@ class PlaceholderUpgradeTests(unittest.TestCase):
 
         self.assertEqual(resolved.company.legal_name, "贵州茅台酒股份有限公司")
         self.assertEqual(len(uow.companies.items), 1)
+
+    def test_untrack_removes_pool_row_but_keeps_company_and_security(self) -> None:
+        uow = FakeUnitOfWork()
+        TrackCompanies(uow_factory=lambda: uow).execute(
+            TrackCompaniesCommand(
+                entries=(
+                    TrackEntry(security_code="600519", exchange="SSE"),
+                    TrackEntry(security_code="000001", exchange="SZSE"),
+                )
+            )
+        )
+
+        result = UntrackCompanies(uow_factory=lambda: uow).execute(
+            (("600519", "SSE"), ("999999", "SSE"))
+        )
+
+        self.assertEqual(len(result.removed), 1)
+        self.assertEqual(result.removed[0].security_code, "600519")
+        self.assertEqual(result.not_tracked, ("999999.SSE",))
+        # Pool row gone; ledger rows (company + security) stay.
+        self.assertEqual(len(uow.tracked_companies.items), 1)
+        self.assertEqual(len(uow.companies.items), 2)
+        self.assertEqual(len(uow.securities.items), 2)
+
+    def test_resolve_profiles_upgrades_pending_names_and_fails_open(self) -> None:
+        uow = FakeUnitOfWork()
+        TrackCompanies(uow_factory=lambda: uow).execute(
+            TrackCompaniesCommand(
+                entries=(
+                    TrackEntry(security_code="300012", exchange="SZSE"),
+                    TrackEntry(security_code="301046", exchange="SZSE"),
+                )
+            )
+        )
+
+        def loader(code: str) -> SourceCompanyProfile | None:
+            if code == "300012":
+                return SourceCompanyProfile(
+                    security_code=code,
+                    security_name="华测检测",
+                    legal_name="华测检测认证集团股份有限公司",
+                    provider_org_id=None,
+                    uscc=None,
+                )
+            raise DisclosureAnchorError("quota exhausted")
+
+        results = ResolveTrackedProfiles(
+            uow_factory=lambda: uow, profile_loader=loader
+        ).execute((("300012", "SZSE"), ("301046", "SZSE")))
+
+        by_code = {r.security_code: r for r in results}
+        self.assertTrue(by_code["300012"].resolved)
+        self.assertFalse(by_code["301046"].resolved)
+        names = {c.legal_name for c in uow.companies.items.values()}
+        self.assertIn("华测检测认证集团股份有限公司", names)
+        # Failure keeps the placeholder (first sync heals it later).
+        self.assertTrue(
+            any(n.startswith(PENDING_LEGAL_NAME_PREFIX) for n in names)
+        )
+
+        # Second pass: resolved companies are skipped entirely.
+        second = ResolveTrackedProfiles(
+            uow_factory=lambda: uow, profile_loader=loader
+        ).execute((("300012", "SZSE"),))
+        self.assertEqual(second, ())
 
     def test_real_name_conflict_still_contested(self) -> None:
         from disclosure_anchor.domain.errors import SubjectIdentityConflictError

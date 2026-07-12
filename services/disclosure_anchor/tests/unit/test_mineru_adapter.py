@@ -35,6 +35,20 @@ class MinerUProcessTests(unittest.TestCase):
         self.assertIn("0", command)
         self.assertIn("-e", command)
         self.assertIn("2", command)
+        self.assertNotIn("-u", command)
+
+    def test_command_appends_server_url_for_http_client_backend(self) -> None:
+        process = MinerUProcess(executable=Path("/opt/mineru/bin/mineru"))
+        command = process.command_for(
+            input_pdf=Path("input.pdf"),
+            output_dir=Path("out"),
+            options=ParserOptions(
+                backend="vlm-http-client", server_url="http://192.168.1.50:30000"
+            ),
+        )
+        self.assertIn("vlm-http-client", command)
+        url_index = command.index("-u")
+        self.assertEqual(command[url_index + 1], "http://192.168.1.50:30000")
 
 
 class MinerUArtifactReaderTests(unittest.TestCase):

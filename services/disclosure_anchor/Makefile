@@ -17,9 +17,15 @@ PGSOCKET_DIR ?= /Volumes/AgentSSD/agent_system/postgres/sockets
 PGLOG ?= /Volumes/AgentSSD/agent_system/postgres/logs/disclosure-anchor-pg18.log
 PGPORT ?= 55432
 
+# Machine-local env (roots/DB/credentials) lives OUTSIDE the repo; DB-touching
+# targets auto-load it (same files run_worker_once.sh sources) so a bare
+# `make track` works in a fresh shell. Values are exported silently.
+DISCLOSURE_ENV_DIR ?= $(HOME)/.config/agent-invest/disclosure_anchor
+WITH_ENV = set -a; for f in worker.env cninfo.env; do [ -r "$(DISCLOSURE_ENV_DIR)/$$f" ] && . "$(DISCLOSURE_ENV_DIR)/$$f"; done; set +a;
+
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	test-mineru-smoke lint typecheck agent-check api archive pg-init pg-start pg-stop \
-	pg-status db-create migrate register parse build-units publish process rebuild-units prune-history load-rules config-check track track-status sync worker-once worker-loop doctor-full wipe-test-data
+	pg-status db-create migrate register parse build-units publish process rebuild-units prune-history load-rules config-check track track-status track-export untrack purge-company sync worker-once worker-loop doctor-full wipe-test-data
 
 doctor:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -90,31 +96,31 @@ pg-status:
 # --- Database bootstrap and migrations ---------------------------------------
 
 db-create:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.db create
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.db create
 
 migrate:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m alembic upgrade head
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m alembic upgrade head
 
 # --- Single-document pipeline ------------------------------------------------
 
 register:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline register --file "$(FILE)" --provider "$(PROVIDER)" --security-code "$(SECURITY_CODE)" --exchange "$(EXCHANGE)" --filing-type "$(FILING_TYPE)" --title "$(TITLE)" --announcement-date "$(ANNOUNCEMENT_DATE)" $(if $(REPORT_PERIOD),--report-period "$(REPORT_PERIOD)") $(if $(PROVIDER_DOCUMENT_ID),--provider-document-id "$(PROVIDER_DOCUMENT_ID)") $(if $(COMPANY_LEGAL_NAME),--company-legal-name "$(COMPANY_LEGAL_NAME)")
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline register --file "$(FILE)" --provider "$(PROVIDER)" --security-code "$(SECURITY_CODE)" --exchange "$(EXCHANGE)" --filing-type "$(FILING_TYPE)" --title "$(TITLE)" --announcement-date "$(ANNOUNCEMENT_DATE)" $(if $(REPORT_PERIOD),--report-period "$(REPORT_PERIOD)") $(if $(PROVIDER_DOCUMENT_ID),--provider-document-id "$(PROVIDER_DOCUMENT_ID)") $(if $(COMPANY_LEGAL_NAME),--company-legal-name "$(COMPANY_LEGAL_NAME)")
 
 parse:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline parse --document-id "$(DOC)"
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline parse --document-id "$(DOC)"
 
 build-units:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline build-units --document-id "$(DOC)"
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline build-units --document-id "$(DOC)"
 
 publish:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline publish --processing-run-id "$(RUN)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline publish --processing-run-id "$(RUN)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
 
 process:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline process --document-id "$(DOC)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline process --document-id "$(DOC)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
 
 # Rules-only iteration: reuse the latest succeeded parse artifacts, no MinerU.
 rebuild-units:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline rebuild-units --document-id "$(DOC)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline rebuild-units --document-id "$(DOC)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
 
 # TEST-PHASE ONLY: delete superseded (non-active) runs + their units + events,
 # so the DB shows exactly the current generation. Production retention is a
@@ -126,34 +132,52 @@ prune-history:
 # Load class_map.json + facet_map.json into disclosure_core.classification_rule.
 # Vocabulary upgrade = edit JSON + bump version + run this (views derive live).
 load-rules:
-	PYTHONPATH=src .venv/bin/python scripts/load_classification_rules.py
+	$(WITH_ENV) PYTHONPATH=src .venv/bin/python scripts/load_classification_rules.py
 
 # Offline validation of config/watchlist.csv + config/processing_policy.json
 # (HA check_config pattern): file/line errors, no DB access.
 config-check:
 	PYTHONPATH=src .venv/bin/python scripts/config_check.py
 
-# Upsert the company watchlist (config/watchlist.csv) into tracked_company.
-# Offline + idempotent; the worker backfills new companies on its next round.
+# Import companies into tracked_company (the DB is the pool's source of
+# truth; the CSV is the import/seed + git-snapshot format). Offline +
+# idempotent; the worker backfills new companies on its next round.
 track: config-check
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline track $(if $(FILE),--file "$(FILE)") $(if $(CODES),--codes "$(CODES)") $(if $(PRUNE_DRIFT),--prune-drift) $(if $(DRY_RUN),--dry-run)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline track $(if $(FILE),--file "$(FILE)") $(if $(CODES),--codes "$(CODES)") $(if $(PRUNE_DRIFT),--prune-drift) $(if $(DRY_RUN),--dry-run)
 
 track-status:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline track-status
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline track-status
+
+# Snapshot the DB pool back into config/watchlist.csv (git point-in-time
+# backup; round-trips with `make track`). OUT=path overrides the target.
+track-export:
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline track-export --out "$(or $(OUT),config/watchlist.csv)"
+
+# Remove companies from the pool (deletes tracked rows; company/documents
+# stay). Reversible stop is status=paused via track/PUT instead.
+untrack:
+	@test -n "$(CODES)" || (echo 'usage: make untrack CODES=600887[,601318]' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline untrack --codes "$(CODES)"
+
+# TEST-PHASE ONLY: cascade-delete ONE company (rows + files) — the
+# single-company version of wipe-test-data, for undoing mistakes/residue.
+purge-company:
+	@test "$(PURGE)" = "YES" || (echo 'usage: make purge-company CODE=600887 PURGE=YES  (test-phase only!)' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline purge-company --code "$(CODE)" $(if $(EXCHANGE),--exchange "$(EXCHANGE)") --yes
 
 sync:
 	@test -n "$(COMPANY)" || (echo 'usage: make sync COMPANY=<scode> [WINDOW=N]' && exit 2); \
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline sync --company $(COMPANY) $(if $(WINDOW),--window $(WINDOW))
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline sync --company $(COMPANY) $(if $(WINDOW),--window $(WINDOW))
 
 worker-once:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker once
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker once
 
 worker-loop:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker loop
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker loop
 
 doctor-full:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor --full
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor --full
 
 wipe-test-data:
 	@test "$(WIPE)" = "YES" || (echo 'usage: make wipe-test-data WIPE=YES  (test-phase only!)' && exit 2)
-	WIPE=YES ./scripts/wipe_test_data.sh
+	$(WITH_ENV) WIPE=YES ./scripts/wipe_test_data.sh

@@ -94,5 +94,9 @@ Claude 进入该目录读文件时按需加载，Codex 按就近优先读取。�
 - `docs/agent/Implement.md` — execution runbook
 - `docs/agent/Documentation.md` — durable notes index (decisions, follow-ups, archive index)
 - `docs/agent/archive/` — dated snapshots of rotated durable files; read on demand only
+- `docs/agent/notes/` — run artifacts (reports/research/benchmarks), indexed from Documentation.md
 - `docs/agent/code_review.md` — independent review rubric
 - `AGENTS.md` independent-review trigger — use the read-only reviewer gate when required
+
+docs/agent 顶层是**白名单制**（上列文件 + archive/ + notes/，AGENTS.md durable-docs 节 + §8 机检）：
+验收报告等运行产物一律写进 `notes/`，不得在顶层新建文件。

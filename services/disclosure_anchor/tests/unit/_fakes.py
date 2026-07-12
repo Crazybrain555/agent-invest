@@ -163,6 +163,11 @@ class TrackedCompanyRepo(_Repo[e.TrackedCompany]):
     def list_all(self) -> list[e.TrackedCompany]:
         return sorted(self.items.values(), key=lambda item: item.tracked_company_id)
 
+    def delete(self, tracked_company_id: str) -> None:
+        if tracked_company_id not in self.items:
+            raise KeyError(f"tracked company not found: {tracked_company_id}")
+        del self.items[tracked_company_id]
+
 
 class DocumentRepo(_Repo[e.Document]):
     def _key(self, item: e.Document) -> str:

@@ -15,6 +15,7 @@ from disclosure_anchor.api.schemas.public import (
     DocumentV1,
     ProcessingRunV1,
     SourceRefV1,
+    TrackedCompanyV1,
 )
 from disclosure_anchor.main import create_app
 from disclosure_anchor.settings import Settings
@@ -30,6 +31,7 @@ PUBLIC_MODELS: dict[str, type[Any]] = {
     "processing_run": ProcessingRunV1,
     "source_ref": SourceRefV1,
     "change_event": ChangeEventV1,
+    "tracked_company": TrackedCompanyV1,
 }
 
 

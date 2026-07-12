@@ -75,6 +75,23 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("DISCLOSURE_MINERU_BIN", "disclosure_mineru_bin"),
     )
+    # MinerU 3.4 backend vocabulary: pipeline | vlm-engine | hybrid-engine |
+    # vlm-http-client | hybrid-http-client. The *-http-client backends need
+    # DISCLOSURE_MINERU_SERVER_URL pointing at a mineru-openai-server
+    # (GPU box) and shift VLM inference off this machine.
+    disclosure_mineru_backend: str = Field(
+        default="pipeline",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_BACKEND", "disclosure_mineru_backend"
+        ),
+    )
+    disclosure_mineru_server_url: Optional[str] = Field(
+        default=None,
+        pattern=r"^https?://",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_SERVER_URL", "disclosure_mineru_server_url"
+        ),
+    )
     cninfo_access_key: Optional[SecretStr] = Field(
         default=None,
         validation_alias=AliasChoices("CNINFO_ACCESS_KEY", "cninfo_access_key"),
@@ -189,6 +206,17 @@ class Settings(BaseSettings):
         default=3,
         ge=0,
         validation_alias=AliasChoices("WORKER_BATCH_PARSE", "worker_batch_parse"),
+    )
+    # Parallel parse chains per round (1 = serial). Meant for the
+    # *-http-client backends where the GPU server absorbs concurrency;
+    # capped to keep local memory/subprocess fan-out bounded.
+    worker_parse_concurrency: int = Field(
+        default=1,
+        ge=1,
+        le=16,
+        validation_alias=AliasChoices(
+            "WORKER_PARSE_CONCURRENCY", "worker_parse_concurrency"
+        ),
     )
     worker_batch_build: int = Field(
         default=10,

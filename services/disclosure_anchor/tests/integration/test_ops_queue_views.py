@@ -273,16 +273,21 @@ class OpsQueueViewTests(unittest.TestCase):
         self.assertEqual(row["candidate"]["title"], f"测试公告 {pid_new}")
 
     def test_pending_download_skips_paused_companies(self) -> None:
-        # round19: paused = 停止一切获取 — queued backlog included. Rollback
-        # keeps the shared DB untouched.
+        # Pool membership drives acquisition: active row = eligible; paused
+        # row = blocked (round19: 停止一切获取, queued backlog included);
+        # NO tracked row (round22 untrack) = blocked too — deleting the pool
+        # row must not re-open the backlog. Rollback keeps the shared DB
+        # untouched.
         pid_active = f"qvdl{self.suffix}act"
         pid_paused = f"qvdl{self.suffix}pau"
+        pid_untracked = f"qvdl{self.suffix}unt"
         conn = self.engine.connect()
         txn = conn.begin()
         try:
             for label, pid, status in (
                 ("act", pid_active, "active"),
                 ("pau", pid_paused, "paused"),
+                ("unt", pid_untracked, None),
             ):
                 company_id = f"co_qv{self.suffix}{label}"
                 conn.execute(
@@ -292,14 +297,19 @@ class OpsQueueViewTests(unittest.TestCase):
                     ),
                     {"cid": company_id, "name": f"QV{label}公司"},
                 )
-                conn.execute(
-                    text(
-                        "INSERT INTO disclosure_core.tracked_company "
-                        "(tracked_company_id, company_id, status) "
-                        "VALUES (:tid, :cid, :status)"
-                    ),
-                    {"tid": f"tc_qv{self.suffix}{label}", "cid": company_id, "status": status},
-                )
+                if status is not None:
+                    conn.execute(
+                        text(
+                            "INSERT INTO disclosure_core.tracked_company "
+                            "(tracked_company_id, company_id, status) "
+                            "VALUES (:tid, :cid, :status)"
+                        ),
+                        {
+                            "tid": f"tc_qv{self.suffix}{label}",
+                            "cid": company_id,
+                            "status": status,
+                        },
+                    )
                 conn.execute(
                     text(
                         "INSERT INTO disclosure_core.source_access "
@@ -332,6 +342,7 @@ class OpsQueueViewTests(unittest.TestCase):
             ]
             self.assertIn(pid_active, pids)
             self.assertNotIn(pid_paused, pids)
+            self.assertNotIn(pid_untracked, pids)
         finally:
             txn.rollback()
             conn.close()

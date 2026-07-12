@@ -8,6 +8,7 @@ from disclosure_anchor.api.routers.changes import router as changes_router
 from disclosure_anchor.api.routers.documents import router as documents_router
 from disclosure_anchor.api.routers.filings import router as filings_router
 from disclosure_anchor.api.routers.health import router as health_router
+from disclosure_anchor.api.routers.tracked import router as tracked_router
 from disclosure_anchor.api.routers.units import router as units_router
 from disclosure_anchor.adapters.db.postgres.connection import (
     app_database_url,
@@ -75,6 +76,8 @@ def create_app(settings: Settings | None = None, *, validate_runtime: bool = Tru
         app.include_router(units_router)
     if changes_router is not None:
         app.include_router(changes_router)
+    if tracked_router is not None:
+        app.include_router(tracked_router)
     if admin_router is not None and resolved_settings.disclosure_enable_admin_api:
         # Unauthenticated local-ops surface: explicitly opt-in, never on the
         # L2-facing deployment (round8 audit blocker).

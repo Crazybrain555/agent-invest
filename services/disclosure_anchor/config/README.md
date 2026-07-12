@@ -7,8 +7,24 @@
 
 | 文件 | 管什么 | 改完跑什么 |
 |---|---|---|
-| `watchlist.csv` | 股票池唯一真源：一行一只票 + 按公司覆盖（lookback_days / sync_frequency / process_classes，空=继承全局） | `make track`（自动先 config-check；`DRY_RUN=1` 只看计划不写库；`PRUNE_DRIFT=YES` 把删掉的行置 paused） |
+| `watchlist.csv` | 股票池**导入/快照文件**（真源是 DB 的 tracked_company，round22 改判）：一行一只票 + 按公司覆盖（lookback_days / sync_frequency / process_classes，空=继承全局） | 导入：`make track`（自动先 config-check；`DRY_RUN=1` 只看计划；`PRUNE_DRIFT=YES` 全量恢复）；快照：`make track-export`（DB → 本文件，git 留痕） |
 | `processing_policy.json` | 全局处理策略：`process`=下载+解析；`register_only`=只登记元数据 | 无需命令，下次 worker 启动生效；改前 `make config-check` 验证 |
+
+池子的增删改查（写语义相同：整行 upsert，空可选字段=清除覆盖回继承）：
+
+| 操作 | API | CLI |
+|---|---|---|
+| 增/改 | `PUT /v1/admin/tracked-companies` | `make track CODES=...` 或编辑 CSV + `make track` |
+| ↳ 入池即解名 | 两条路径都会在有凭据时当场拉公司档案补真名（Miniflux 模式，失败留占位符，首次同步兜底） | |
+| 暂停（可逆停） | PUT 里 `status=paused` | CSV 该行 status=paused + `make track` |
+| 删（出池，公司与文档留档） | `DELETE /v1/admin/tracked-companies/{code}?exchange=` | `make untrack CODES=...` |
+| 按需取证（L6 拉式触发） | `POST /v1/admin/tracked-companies/{code}/sync?exchange=`（body 可选 window_days） | `make sync COMPANY=...` |
+| 清除（测试期：连公司/文档/文件一起删） | 无（刻意只留 CLI） | `make purge-company CODE=... PURGE=YES` |
+| 查 | `GET /v1/tracked-companies`（含级联生效值） | `make track-status` |
+
+暂停 vs 出池 vs 清除：paused 保留配置随时恢复；untrack 删订阅关系但公司/已获取文档留档
+（下载队列只放行有 active 行的公司，出池即停止获取）；purge 是 wipe-test-data 的单公司版，
+只用于撤销失误/测试残留。
 
 ## 级联模型（同一参数，三层，空=继承）
 
@@ -47,8 +63,10 @@
 
 ```bash
 make config-check          # 离线验证两个配置文件（文件:行号 报错）
-make track DRY_RUN=1       # 看对账计划（创建/更新/暂停），不写库
-make track                 # 应用 watchlist（幂等）
+make track DRY_RUN=1       # 看导入对账计划（创建/更新/暂停），不写库
+make track                 # 导入 watchlist（幂等）
+make track CODES=600519    # 快捷入池（DB 直写；想留 git 快照再 track-export）
+make track-export          # DB 池子 → config/watchlist.csv 快照（git 留痕）
 make track-status          # 全池状态 + 每公司生效配置与来源层
 make worker-once           # 手动跑一轮（同步→下载→解析→切分→发布）
 make doctor-full           # 环境+迁移头+分类规则版本 全体检

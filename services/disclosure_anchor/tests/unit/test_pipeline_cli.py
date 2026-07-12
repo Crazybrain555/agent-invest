@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from disclosure_anchor.cli import pipeline
+from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.use_cases.build_units import BuildUnitsResult
 from disclosure_anchor.application.use_cases.parse_document import ParseDocumentResult
 
@@ -216,6 +217,9 @@ def _deps_type(
     class _FakeDeps:
         def __init__(self, settings) -> None:  # noqa: ANN001
             self.settings = settings
+
+        def parser_options(self) -> ParserOptions:
+            return ParserOptions()
 
         def parse(self) -> _UseCase:
             return _UseCase(parse_result)

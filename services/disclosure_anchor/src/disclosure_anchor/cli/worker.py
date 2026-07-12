@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 
 import argparse
 import signal
@@ -32,6 +31,7 @@ from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
 from disclosure_anchor.application.dto.worker_report import WorkerLimits, WorkerReport
 from disclosure_anchor.application.ports.disclosure_source import DisclosureSourcePort
+from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.worker.locks import WORKER_NS
 from disclosure_anchor.application.worker.worker import (
     WorkerConfig,
@@ -171,27 +171,20 @@ def _deps(settings: Settings, engine: Engine) -> WorkerDeps:
             initial_lookback_days=settings.disclosure_initial_lookback_days,
             backfill_max_pending_downloads=settings.disclosure_backfill_max_pending_downloads,
             process_scope_classes=_process_scope_classes(settings),
+            parse_concurrency=settings.worker_parse_concurrency,
         ),
         clock=lambda: datetime.now(timezone.utc),
+        parser_options=ParserOptions(
+            backend=settings.disclosure_mineru_backend,
+            server_url=settings.disclosure_mineru_server_url,
+        ),
     )
 
 
 def _process_scope_classes(settings: Settings) -> tuple[str, ...]:
-    """Global processing default (cascade layer 2) — fail-closed on typos."""
+    from disclosure_anchor.adapters.sources.cninfo.mapper import load_processing_policy
 
-    from disclosure_anchor.adapters.sources.cninfo.mapper import load_class_map
-
-    payload = json.loads(
-        settings.disclosure_processing_policy_path.read_text(encoding="utf-8")
-    )
-    process = tuple(str(t) for t in payload["process"])
-    known = set(load_class_map()["classes"])
-    unknown = [c for c in (*process, *payload.get("register_only", ())) if c not in known]
-    if unknown:
-        raise ValueError(
-            f"processing_policy.json 含未知类名 {unknown} — 先跑 make config-check"
-        )
-    return process
+    return load_processing_policy(settings.disclosure_processing_policy_path)
 
 
 def _append_reports(settings: Settings, report: WorkerReport) -> None:

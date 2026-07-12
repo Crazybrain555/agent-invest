@@ -22,6 +22,9 @@ class ParserOptions:
     start_page: int | None = None
     end_page: int | None = None
     timeout_seconds: int | None = None
+    # OpenAI-compatible MinerU server for the *-http-client backends
+    # (mineru-openai-server on a GPU box); None for local backends.
+    server_url: str | None = None
 
 
 @dataclass(frozen=True)

@@ -216,6 +216,13 @@ class TrackedCompanyRepository:
         self._session.flush()
         return mappers.tracked_company_to_entity(row)
 
+    def delete(self, tracked_company_id: str) -> None:
+        row = self._session.get(models.TrackedCompany, tracked_company_id)
+        if row is None:
+            raise KeyError(f"tracked company not found: {tracked_company_id}")
+        self._session.delete(row)
+        self._session.flush()
+
 
 class SourceAccessRepository:
     def __init__(self, session: Session) -> None:

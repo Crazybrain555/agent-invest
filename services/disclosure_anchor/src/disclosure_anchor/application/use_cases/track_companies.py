@@ -1,11 +1,12 @@
-"""Batch company-list intake — the production initialization entry.
+"""Batch tracking-pool writes — the ONE write path for tracked_company.
 
-The operator maintains one input (config/watchlist.csv, service-purpose §4.1);
-this use case upserts it into tracked_company OFFLINE: subjects resolve via
-SubjectResolver's no-name path (PENDING_LEGAL_NAME placeholder, upgraded in
-place on the first credentialed sync), so intake needs no CNINFO reachability.
-The worker then picks new companies up on its next round and backfills the
-default initial lookback window.
+The DB is the pool's source of truth (round22); every mutation route — CSV
+import (`make track`), direct adds (`--codes`), and the admin API
+(PUT /v1/admin/tracked-companies) — funnels through this use case OFFLINE:
+subjects resolve via SubjectResolver's no-name path (PENDING_LEGAL_NAME
+placeholder, upgraded in place on the first credentialed sync), so intake
+needs no CNINFO reachability. The worker then picks new companies up on its
+next round and backfills the default initial lookback window.
 """
 
 from __future__ import annotations
@@ -13,13 +14,16 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from disclosure_anchor.application.ports.disclosure_source import SourceCompanyProfile
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.services.subject_resolver import (
+    PENDING_LEGAL_NAME_PREFIX,
     SubjectCandidate,
     SubjectResolver,
 )
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
+from disclosure_anchor.domain.errors import DisclosureAnchorError
 
 SYNC_FREQUENCIES = ("hourly", "daily", "weekly")
 
@@ -79,6 +83,141 @@ class TrackCompaniesResult:
     @property
     def created_count(self) -> int:
         return sum(1 for item in self.results if item.created)
+
+
+@dataclass(frozen=True)
+class ProfileResolution:
+    security_code: str
+    exchange: str
+    legal_name: str | None
+    resolved: bool
+
+
+class ResolveTrackedProfiles:
+    """Best-effort on-add company-name resolution (round22c).
+
+    Industry analog: Miniflux / changedetection.io fetch feed/watch metadata
+    at creation time. Intake stays offline-first; this runs AFTER the track
+    upsert commits, upgrades PENDING_LEGAL_NAME placeholders through the
+    same SubjectResolver path the credentialed sync uses, and keeps the
+    placeholder on any per-company failure — the worker's first sync remains
+    the fallback that heals whatever this pass could not.
+    """
+
+    def __init__(
+        self,
+        *,
+        uow_factory: Callable[[], UnitOfWork],
+        profile_loader: Callable[[str], SourceCompanyProfile | None],
+        resolver: SubjectResolver | None = None,
+    ) -> None:
+        self._uow_factory = uow_factory
+        self._profile_loader = profile_loader
+        self._resolver = resolver or SubjectResolver()
+
+    def execute(
+        self, codes: tuple[tuple[str, str], ...]
+    ) -> tuple[ProfileResolution, ...]:
+        results: list[ProfileResolution] = []
+        for security_code, exchange in codes:
+            with self._uow_factory() as uow:
+                security = uow.securities.get_by_code_exchange(security_code, exchange)
+                company = (
+                    uow.companies.get(security.company_id)
+                    if security is not None and security.company_id
+                    else None
+                )
+                if company is None or not company.legal_name.startswith(
+                    PENDING_LEGAL_NAME_PREFIX
+                ):
+                    continue  # already resolved (or unknown) — nothing to do
+                try:
+                    profile = self._profile_loader(security_code)
+                    if profile is None or not profile.legal_name:
+                        results.append(
+                            ProfileResolution(security_code, exchange, None, False)
+                        )
+                        continue
+                    self._resolver.resolve(
+                        uow,
+                        SubjectCandidate(
+                            security_code=security_code,
+                            exchange=exchange,
+                            legal_name=profile.legal_name,
+                            board=None,
+                            credit_code=profile.uscc,
+                        ),
+                    )
+                    uow.commit()
+                    results.append(
+                        ProfileResolution(
+                            security_code, exchange, profile.legal_name, True
+                        )
+                    )
+                except DisclosureAnchorError:
+                    # Offline/quota/conflict: keep the placeholder, next sync heals.
+                    results.append(
+                        ProfileResolution(security_code, exchange, None, False)
+                    )
+        return tuple(results)
+
+
+@dataclass(frozen=True)
+class UntrackEntryResult:
+    security_code: str
+    exchange: str
+    tracked_company_id: str
+    company_id: str
+
+
+@dataclass(frozen=True)
+class UntrackCompaniesResult:
+    removed: tuple[UntrackEntryResult, ...]
+    not_tracked: tuple[str, ...]
+
+
+class UntrackCompanies:
+    """Remove companies from the pool (delete the tracked row).
+
+    Deletion semantics (round22, Miniflux DELETE-feed analog with the GLEIF
+    registry discipline): the tracked row is operational subscription state
+    and CAN be hard-deleted; the company/security ledger rows and any
+    acquired documents are evidence and stay. Acquisition stops because the
+    download queue only serves companies with an ACTIVE tracked row. For a
+    reversible stop use status=paused instead; for full test-data removal
+    use the purge-company CLI (test-phase tool).
+    """
+
+    def __init__(self, *, uow_factory: Callable[[], UnitOfWork]) -> None:
+        self._uow_factory = uow_factory
+
+    def execute(self, codes: tuple[tuple[str, str], ...]) -> UntrackCompaniesResult:
+        removed: list[UntrackEntryResult] = []
+        missing: list[str] = []
+        with self._uow_factory() as uow:
+            for security_code, exchange in codes:
+                security = uow.securities.get_by_code_exchange(security_code, exchange)
+                tracked = (
+                    uow.tracked_companies.get_by_company_id(security.company_id)
+                    if security is not None and security.company_id
+                    else None
+                )
+                if tracked is None:
+                    missing.append(f"{security_code}.{exchange}")
+                    continue
+                uow.tracked_companies.delete(tracked.tracked_company_id)
+                removed.append(
+                    UntrackEntryResult(
+                        security_code=security_code,
+                        exchange=exchange,
+                        tracked_company_id=tracked.tracked_company_id,
+                        company_id=tracked.company_id,
+                    )
+                )
+            uow.commit()
+        return UntrackCompaniesResult(
+            removed=tuple(removed), not_tracked=tuple(missing)
+        )
 
 
 class TrackCompanies:
@@ -168,9 +307,10 @@ class TrackCompanies:
         if existing is not None:
             existing.security_id = subject.security.security_id
             existing.status = entry.status
-            # CSV is the single source of truth: a blank cell means "use the
-            # default", so reconcile must also CLEAR a stale DB override
-            # (Codex acceptance P1: blank lookback left {"days":30} behind).
+            # Full-row upsert semantics on every route: an absent optional
+            # field means "inherit the default", so an update must also CLEAR
+            # a stale override (Codex acceptance P1: blank lookback left
+            # {"days":30} behind).
             existing.lookback = lookback
             existing.process_classes = process_classes
             existing.sync_frequency = entry.sync_frequency

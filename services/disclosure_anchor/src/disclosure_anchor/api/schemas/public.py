@@ -159,6 +159,39 @@ class ChangeEventV1(PublicModel):
     created_at: datetime
 
 
+class TrackedCompanyV1(PublicModel):
+    tracked_company_id: str
+    company_ref: str
+    security_ref: str | None
+    security_code: str | None
+    exchange: str | None
+    legal_name: str
+    # Lifecycle facts (0020): 'pending' until the intake placeholder name is
+    # upgraded by an on-add profile fetch or the first sync.
+    legal_name_status: str
+    status: str
+    lookback_days: int | None
+    sync_frequency: str | None
+    process_classes: list[str] | None
+    last_synced_at: datetime | None
+    synced_through: date | None
+    created_at: datetime
+    updated_at: datetime
+    contract_version: str
+    # API-derived cascade resolution (not view columns): NULL overrides fall
+    # back to the global defaults from settings + processing_policy.json.
+    effective_lookback_days: int
+    effective_sync_seconds: int
+    effective_process_classes: list[str]
+    # API-derived acquisition state: never_synced | due | fresh (the due
+    # judgement needs the effective interval, which includes env defaults).
+    sync_state: str
+
+
+class TrackedCompanyListResponse(PublicModel):
+    items: list[TrackedCompanyV1]
+
+
 class DocumentListResponse(PublicModel):
     items: list[DocumentV1]
     next_cursor: str | None

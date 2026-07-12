@@ -119,39 +119,29 @@ active content plus one-line pointers into the archive. Rewrite, do not append. 
 `docs/agent/notes/<topic>.md` and are indexed from `Documentation.md`. Archives and notes are read on demand,
 never part of the default resume set.
 
+File-set whitelist (recurring violation — checked in section 8): the ONLY entries allowed at
+`docs/agent/` top level are `Status.md`, `Plan.md`, `Implement.md`, `Documentation.md`,
+`code_review.md`, `Prompt.md`, and the `archive/` + `notes/` directories. Run artifacts —
+acceptance/review reports, research write-ups, benchmark evidence — are notes: write them to
+`docs/agent/notes/<topic>.md` and index them from `Documentation.md`. Never mint a new
+top-level file or directory here.
+
 ## 3. Repository reality
 
 Per-directory code maps: key source directories (`src/disclosure_anchor` and its domain/application/adapters subtrees, `tests/`) each carry an `AGENTS.md` directory map (layer duties, hard rules, authority-doc pointers); the sibling `CLAUDE.md` is a symlink to it. Nearest file wins. Keep them norms+pointers only and update them when a directory's structure or hard rules change.
 
-Retained areas:
+Retained areas: `AGENTS.md` / `CLAUDE.md` / `docs/agent/` / `.codex/` /
+`.claude/settings.local.json` / `.mcp.json` / `.env.template` / `.env.example` /
+`docs/MCP_SETUP_GUIDE.md` / `README.md` / `pyproject.toml` / `Makefile` /
+`src/disclosure_anchor/` / `contracts/` / `tests/`.
 
-- `AGENTS.md`
-- `CLAUDE.md`
-- `docs/agent/`
-- `.codex/`
-- `.claude/settings.local.json`
-- `.mcp.json`
-- `.env.template`
-- `.env.example`
-- `docs/MCP_SETUP_GUIDE.md`
-- `README.md`
-- `pyproject.toml`
-- `Makefile`
-- `src/disclosure_anchor/`
-- `contracts/`
-- `tests/`
+Intentionally absent after the reset: `.agents/skills/`, `.claude/skills/`, `.claude/worktrees/`,
+`company_research_runtime/`, `docs/skills/`, `requirements.txt`, `tools/py`.
 
-Intentionally absent after the reset:
-
-- `.agents/skills/`
-- `.claude/skills/`
-- `.claude/worktrees/`
-- `company_research_runtime/`
-- `docs/skills/`
-- `requirements.txt`
-- `tools/py`
-
-Do not assume a scheduler, notebook pipeline, or company-research skill chain exists unless the user creates those files again.
+Scheduling reality: the worker runs via a user-installed launchd job
+(`scripts/install_launchd.sh`, every 2h + at load; macOS TCC requires Full Disk Access for
+`/bin/zsh` before launchd-spawned processes can write the AgentSSD runtime/data roots).
+No notebook pipeline or company-research skill chain exists unless the user recreates those files.
 
 ## 4. Request router
 
@@ -320,6 +310,7 @@ awk 'END{exit NR>300}' docs/agent/Plan.md
 awk 'END{exit NR>200}' docs/agent/Documentation.md
 awk 'END{exit NR>350}' AGENTS.md
 awk 'END{exit NR>120}' CLAUDE.md
+ls docs/agent | grep -vqE '^(Status|Plan|Implement|Documentation|code_review|Prompt)\.md$|^(archive|notes)$' && echo 'VIOLATION: unexpected docs/agent top-level entry' && false || true
 test ! -e .agents/skills
 test ! -e .claude/skills
 test ! -e .claude/worktrees

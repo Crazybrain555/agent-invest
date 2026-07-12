@@ -15,7 +15,15 @@ from disclosure_anchor.cli.export_contracts import PUBLIC_MODELS, export_contrac
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONTRACTS_ROOT = REPO_ROOT / "contracts"
 PUBLIC_MODELS_ROOT = CONTRACTS_ROOT / "public_models"
-DERIVED = {"document_unit": {"asset_uri", "is_active_run"}}
+DERIVED = {
+    "document_unit": {"asset_uri", "is_active_run"},
+    "tracked_company": {
+        "effective_lookback_days",
+        "effective_sync_seconds",
+        "effective_process_classes",
+        "sync_state",
+    },
+}
 
 
 class FilingApiContractsTests(unittest.TestCase):

@@ -6,7 +6,11 @@ routers/documents.py   documents_v1 与 processing_runs_v1 读端点
 routers/filings.py     latest filings 集合端点
 routers/units.py       document_units_v1 / source_refs_v1 / context 端点
 routers/changes.py     change_events_v1 增量 feed
-routers/admin.py       本地同步写端点，编排已有 use case
+routers/tracked.py     tracked_companies_v1 读端点（股票池真源在 DB，round22；
+                       effective_* 级联生效值在此层解析——全局 policy 是文件，SQL 看不见）
+routers/admin.py       本地同步写端点，编排已有 use case（含 PUT/DELETE tracked-companies；
+                       DELETE=出池留档，purge 走 CLI 不进 API；POST {code}/sync =
+                       L6 按需取证触发，Miniflux refresh 模式，失败返回 200+failed+留痕）
 schemas/               public/admin/health Pydantic DTO
 pagination.py          opaque keyset cursor 与 limit 校验
 errors.py              public error envelope 与 contract-version guard
@@ -17,8 +21,10 @@ API 只暴露 public 契约。读端点只从 `disclosure_public.*_v1` 或等价
 不要把 `disclosure_core`/`disclosure_ops` 表结构、SQLAlchemy model、绝对路径、堆栈、
 MinerU raw JSON、parser block、bbox、page internals 暴露到响应体。
 
-读 DTO 规则：字段同 public view 列名同义；`document_unit` API 派生字段全集仅为
-`asset_uri`（不入库、不进 public view，contract 导出与测试用 DERIVED 白名单处理）。
+读 DTO 规则：字段同 public view 列名同义；API 派生字段全集 = `document_unit` 的
+`asset_uri` + `tracked_company` 的 `effective_lookback_days` / `effective_sync_seconds` /
+`effective_process_classes`（不入库、不进 public view，contract 导出与测试用 DERIVED
+白名单处理）。
 `is_active_run` 自迁移 0011 起由 public view 直出（round3 P1#7：DB 直读方也要能
 过滤 active run），API 侧继续按视图列返回。新增或改名 public 字段必须同步 schema/export、contract 测试与
 `docs/implementation/checks/contract-checklist.md`。

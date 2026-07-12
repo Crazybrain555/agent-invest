@@ -225,6 +225,21 @@ class ParseDocumentTests(unittest.TestCase):
                     text("DELETE FROM disclosure_core.company WHERE company_id = :id"),
                     {"id": company_id},
                 )
+            # Register can create company/security WITHOUT a document row
+            # (quarantine/failure paths), so document-derived cleanup misses
+            # them — delete by this run's known identity too (the 2026-07-08
+            # live-DB leak: 7 orphaned Phase04 companies).
+            conn.execute(
+                text(
+                    "DELETE FROM disclosure_core.security WHERE security_code = :code "
+                    "AND exchange = 'LOCAL'"
+                ),
+                {"code": "P04" + provider_document_id[-4:]},
+            )
+            conn.execute(
+                text("DELETE FROM disclosure_core.company WHERE legal_name = :name"),
+                {"name": f"Phase04 Test Co {provider_document_id}"},
+            )
 
     def _register_document(self) -> str:
         provider_document_id = "phase04-" + ids.new_ulid()

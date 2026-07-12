@@ -14,8 +14,17 @@ from tests.integration._support import engine_or_skip
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_MODELS_ROOT = REPO_ROOT / "contracts" / "public_models"
 # is_active_run left DERIVED for source_ref only from 0011 on: document_units_v1
-# exposes it directly (round3 P1#7).
-DERIVED = {"document_unit": {"asset_uri"}}
+# exposes it directly (round3 P1#7). tracked_company effective_* fields resolve
+# the config cascade in the API layer (0019: the global policy is a file).
+DERIVED = {
+    "document_unit": {"asset_uri"},
+    "tracked_company": {
+        "effective_lookback_days",
+        "effective_sync_seconds",
+        "effective_process_classes",
+        "sync_state",
+    },
+}
 VIEW_BY_MODEL = {
     "document": "documents_v1",
     "document_unit": "document_units_v1",
@@ -23,6 +32,7 @@ VIEW_BY_MODEL = {
     "processing_run": "processing_runs_v1",
     "source_ref": "source_refs_v1",
     "change_event": "change_events_v1",
+    "tracked_company": "tracked_companies_v1",
 }
 
 

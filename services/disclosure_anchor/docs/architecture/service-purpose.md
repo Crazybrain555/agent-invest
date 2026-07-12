@@ -257,6 +257,15 @@ tracked_companies
 
 即需要持续跟踪的公司或证券代码清单。第一版从一开始就是 **≥500 只人工精选**（研究员精选名单录入），不是先跑几家的试点；它定义第一版的覆盖范围，但仍小于全市场全 A（~5000+），后者是非目标。
 
+清单真源是 DB 的 `tracked_company`（round22 裁决）；维护路径三条等价：
+`PUT /v1/admin/tracked-companies`（服务/AI 程序化）、`make track CODES=...`（快捷入池）、
+watchlist.csv + `make track`（批量导入/恢复，`make track-export` 回写 git 快照）。
+读侧：`GET /v1/tracked-companies` / `tracked_companies_v1` 视图。
+删除三层语义（round22）：`status=paused` 可逆停；`DELETE /v1/admin/tracked-companies/{code}`
+（= `make untrack`）删订阅行、公司与已获取文档留档（下载队列只放行有 active 行的公司）；
+`make purge-company`（测试期专用 CLI）单公司级联清除——登记账本按 GLEIF 模式从不经
+运营路径删除。
+
 其他参数均为有默认值的配置：
 
 - 市场；
@@ -890,8 +899,19 @@ semantic_key / quality_status / heading_prefix），其余键经 DB 视图直读
 
 ```text
 documents_v1 / document_units_v1 / document_categories_v1 /
-processing_runs_v1 / source_refs_v1 / change_events_v1
+processing_runs_v1 / source_refs_v1 / change_events_v1 / tracked_companies_v1
 ```
+
+`tracked_companies_v1`（0019+0020 迁移，contract_version `tracked_company.v1`，round22）
+暴露股票池配置与生命周期：真源是 `tracked_company` 表（watchlist.csv 降级为导入/快照格式，
+改判记录见 `docs/implementation/design/watchlist-operations.md` §7）。视图暴露 raw 覆盖列
+（NULL=继承全局默认）+ 生命周期事实（legal_name_status、last_synced_at、synced_through）；
+级联生效值（effective_*）与采集状态 sync_state（never_synced/due/fresh）由
+`GET /v1/tracked-companies` 在 API 层派生——全局处理策略在
+`config/processing_policy.json`、间隔默认在 env，SQL 视图看不见。写侧走
+`PUT /v1/admin/tracked-companies`（admin gate 内，复用 TrackCompanies 用例；整行 upsert，
+空可选字段=清除覆盖）；入池即解名：track 提交后有凭据时当场拉档案升级占位公司名
+（best-effort fail-open，首次同步兜底自愈）。
 
 `document_categories_v1`（0012 迁移，contract_version `document_category.v1`）暴露 provider
 原生分类维表：CNINFO F006V 段 × `provider_category` 字典（p_info3005 快照 seed）；facet

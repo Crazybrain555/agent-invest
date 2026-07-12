@@ -9,8 +9,10 @@ round continues.
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.engine import Engine
@@ -29,7 +31,7 @@ from disclosure_anchor.application.ports.file_store import (
     FileStorePathPort,
     RawDocumentStorePort,
 )
-from disclosure_anchor.application.ports.parser import DocumentParserPort
+from disclosure_anchor.application.ports.parser import DocumentParserPort, ParserOptions
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.use_cases.build_units import (
     BuildUnits,
@@ -79,6 +81,10 @@ class WorkerConfig:
     # None → parse everything; a topic tuple → 'other' docs need a matching
     # disclosure_topic (parse scope 'core', round9).
     process_scope_classes: tuple[str, ...] | None = None
+    # Bounded per-round parallelism for the parse chain (1 = serial legacy).
+    # Raise with the *-http-client backends: local work is HTTP waiting and
+    # the GPU server batches requests; keep small for local CPU backends.
+    parse_concurrency: int = 1
 
 
 @dataclass(frozen=True)
@@ -98,6 +104,9 @@ class WorkerDeps:
     parse_timeout_seconds: int
     config: WorkerConfig
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
+    # Settings-driven parse defaults (backend/server_url cascade) — the CLI
+    # builds this from env so GPU offload is a config flip, not a code change.
+    parser_options: ParserOptions = ParserOptions()
 
 
 def run_once(
@@ -317,22 +326,27 @@ def _download_stage(
             )
 
 
-def _parse_stage(
-    report: WorkerReport,
-    deps: WorkerDeps,
-    *,
-    limit: int,
-    should_stop: Callable[[], bool],
-) -> None:
-    """Parse pending documents through the 05 process chain (parse→build→publish)."""
+@dataclass
+class _DocOutcome:
+    """Per-document result of one parse→build→publish chain (thread-safe fold
+    into the shared report happens on the caller's thread only)."""
 
-    with deps.engine.connect() as conn:
-        pending = queries.pending_parse(
-            conn,
-            max_retries=deps.config.max_parse_retries,
-            limit=limit,
-            scope_classes=deps.config.process_scope_classes,
-        )
+    parsed: bool = False
+    built: bool = False
+    published: bool = False
+    build_stats: dict[str, Any] | None = None
+    failure: WorkerFailure | None = None
+
+
+def _process_one_document(
+    deps: WorkerDeps, document_id: str
+) -> _DocOutcome:
+    """Run the 05 chain for ONE document. Safe to run concurrently: each call
+    builds its own parser (no shared _version_cache), every DB write is a
+    fresh UoW, and parse-finish/publish already take the doc-level advisory
+    xact lock (worker/locks.py DOC_NS)."""
+
+    outcome = _DocOutcome()
     parse_use_case = ParseDocument(
         parser=deps.parser_factory(),
         path_builder=deps.path_builder,
@@ -341,71 +355,114 @@ def _parse_stage(
         uow_factory=deps.uow_factory,
         default_timeout_seconds=deps.parse_timeout_seconds,
     )
-    build_use_case = BuildUnits(
-        path_builder=deps.path_builder,
-        artifact_store=deps.artifact_store,
-        uow_factory=deps.uow_factory,
-    )
-    publish_use_case = PublishRun(uow_factory=deps.uow_factory)
+    try:
+        parse_result = parse_use_case.execute(
+            ParseDocumentCommand(document_id=document_id, options=deps.parser_options)
+        )
+        if parse_result.status != "succeeded":
+            outcome.failure = WorkerFailure(
+                stage="parse",
+                item_ref=document_id,
+                error_code=_error_code(parse_result.error),
+            )
+            return outcome
+        outcome.parsed = True
+        build_result = BuildUnits(
+            path_builder=deps.path_builder,
+            artifact_store=deps.artifact_store,
+            uow_factory=deps.uow_factory,
+        ).execute(
+            BuildUnitsCommand(processing_run_id=parse_result.processing_run_id)
+        )
+        if build_result.status != "succeeded":
+            outcome.failure = WorkerFailure(
+                stage="build",
+                item_ref=document_id,
+                error_code=_error_code(build_result.error),
+            )
+            return outcome
+        outcome.built = True
+        if build_result.build_stats:
+            outcome.build_stats = dict(build_result.build_stats)
+        publish_result = PublishRun(uow_factory=deps.uow_factory).execute(
+            PublishRunCommand(processing_run_id=parse_result.processing_run_id)
+        )
+        if publish_result.status != "published":
+            outcome.failure = WorkerFailure(
+                stage="publish",
+                item_ref=document_id,
+                error_code=str(publish_result.status),
+            )
+            return outcome
+        outcome.published = True
+    except Exception as exc:
+        outcome.failure = WorkerFailure(
+            stage="parse", item_ref=document_id, error_code=type(exc).__name__
+        )
+    return outcome
+
+
+def _fold_outcome(report: WorkerReport, outcome: _DocOutcome) -> None:
+    if outcome.parsed:
+        report.parsed += 1
+    if outcome.built:
+        report.built += 1
+    if outcome.build_stats:
+        report.build_stats.append(outcome.build_stats)
+    if outcome.published:
+        report.published += 1
+    if outcome.failure is not None:
+        report.failed += 1
+        report.failures.append(outcome.failure)
+
+
+def _parse_stage(
+    report: WorkerReport,
+    deps: WorkerDeps,
+    *,
+    limit: int,
+    should_stop: Callable[[], bool],
+) -> None:
+    """Parse pending documents through the 05 process chain (parse→build→publish).
+
+    Per-document chains are independent (doc-level xact locks), so the stage
+    runs them on a bounded pool when parse_concurrency > 1 — the fit for the
+    remote *-http-client backends where each chain is mostly waiting on the
+    GPU server (vllm continuous batching absorbs the parallel requests).
+    Miniflux WORKER_POOL_SIZE / changedetection.io FETCH_WORKERS analog.
+    """
+
+    with deps.engine.connect() as conn:
+        pending = queries.pending_parse(
+            conn,
+            max_retries=deps.config.max_parse_retries,
+            limit=limit,
+            scope_classes=deps.config.process_scope_classes,
+        )
+    document_ids: list[str] = []
     for row in pending:
-        if should_stop():
-            return
-        document_id = str(row["document_id"])
         if bool(row.get("oversized")):
             report.skipped_oversized += 1
             continue
-        try:
-            parse_result = parse_use_case.execute(
-                ParseDocumentCommand(document_id=document_id)
-            )
-            if parse_result.status != "succeeded":
-                report.failed += 1
-                report.failures.append(
-                    WorkerFailure(
-                        stage="parse",
-                        item_ref=document_id,
-                        error_code=_error_code(parse_result.error),
-                    )
-                )
-                continue
-            report.parsed += 1
-            build_result = build_use_case.execute(
-                BuildUnitsCommand(processing_run_id=parse_result.processing_run_id)
-            )
-            if build_result.status != "succeeded":
-                report.failed += 1
-                report.failures.append(
-                    WorkerFailure(
-                        stage="build",
-                        item_ref=document_id,
-                        error_code=_error_code(build_result.error),
-                    )
-                )
-                continue
-            report.built += 1
-            if build_result.build_stats:
-                report.build_stats.append(dict(build_result.build_stats))
-            publish_result = publish_use_case.execute(
-                PublishRunCommand(processing_run_id=parse_result.processing_run_id)
-            )
-            if publish_result.status != "published":
-                report.failed += 1
-                report.failures.append(
-                    WorkerFailure(
-                        stage="publish",
-                        item_ref=document_id,
-                        error_code=str(publish_result.status),
-                    )
-                )
-                continue
-            report.published += 1
-        except Exception as exc:
-            report.failed += 1
-            report.failures.append(
-                WorkerFailure(
-                    stage="parse", item_ref=document_id, error_code=type(exc).__name__
-                )
-            )
+        document_ids.append(str(row["document_id"]))
+
+    concurrency = max(1, deps.config.parse_concurrency)
+    if concurrency == 1:
+        for document_id in document_ids:
+            if should_stop():
+                return
+            _fold_outcome(report, _process_one_document(deps, document_id))
+        return
+    with ThreadPoolExecutor(
+        max_workers=concurrency, thread_name_prefix="parse"
+    ) as pool:
+        futures = []
+        for document_id in document_ids:
+            if should_stop():
+                break  # submitted chains still finish; no new ones start
+            futures.append(pool.submit(_process_one_document, deps, document_id))
+        for future in as_completed(futures):
+            _fold_outcome(report, future.result())
 
 
 def _build_stage(

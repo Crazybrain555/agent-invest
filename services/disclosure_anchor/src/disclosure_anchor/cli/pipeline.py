@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import argparse
 import csv
-from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
 import sys
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -30,6 +30,7 @@ from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
+from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.use_cases.build_units import (
     BuildUnits,
     BuildUnitsCommand,
@@ -51,11 +52,13 @@ from disclosure_anchor.application.use_cases.rebuild_units import (
     RebuildUnitsCommand,
 )
 from disclosure_anchor.application.use_cases.track_companies import (
+    ProfileResolution,
+    ResolveTrackedProfiles,
     TrackCompanies,
     TrackCompaniesCommand,
     TrackEntry,
+    UntrackCompanies,
 )
-from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.use_cases.register_local_pdf import (
     RegisterLocalPdf,
     RegisterLocalPdfCommand,
@@ -65,6 +68,7 @@ from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     WEB_INDEX_INTERFACE,
     SyncDisclosureIndex,
     SyncDisclosureIndexCommand,
+    compute_sync_window,
 )
 from disclosure_anchor.domain.errors import BuildUnitsError, ConfigurationError, PublishRunError
 from disclosure_anchor.domain.value_objects import ReportPeriod
@@ -100,14 +104,15 @@ def _parser() -> argparse.ArgumentParser:
 
     track = subparsers.add_parser(
         "track",
-        help="upsert the company watchlist into tracked_company (offline, idempotent)",
+        help="import companies into tracked_company (DB is the source of truth; "
+        "CSV is the import/seed format, idempotent)",
     )
     track.add_argument("--file", help="watchlist CSV (default: config/watchlist.csv)")
-    track.add_argument("--codes", help="comma-separated security codes (ad-hoc adds)")
+    track.add_argument("--codes", help="comma-separated security codes (direct adds)")
     track.add_argument(
         "--prune-drift",
         action="store_true",
-        help="pause tracked companies missing from the watchlist (default: report only)",
+        help="pause tracked companies missing from the import file (full restore)",
     )
     track.add_argument(
         "--dry-run",
@@ -116,9 +121,40 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     track_status = subparsers.add_parser(
-        "track-status", help="read-only watchlist status (config + sync progress)"
+        "track-status", help="read-only pool status (config + sync progress)"
     )
     del track_status  # no arguments
+
+    track_export = subparsers.add_parser(
+        "track-export",
+        help="export tracked_company to watchlist CSV (git snapshot / backup; "
+        "round-trips with `track --file`)",
+    )
+    track_export.add_argument(
+        "--out",
+        help="write CSV to this path (default: stdout)",
+    )
+
+    untrack = subparsers.add_parser(
+        "untrack",
+        help="remove companies from the pool (deletes the tracked row; "
+        "company/documents stay — reversible stop is `status=paused` instead)",
+    )
+    untrack.add_argument("--codes", required=True, help="comma-separated security codes")
+
+    purge = subparsers.add_parser(
+        "purge-company",
+        help="TEST-PHASE ONLY: cascade-delete ONE company (tracked row, "
+        "security, documents, runs, units, events, files) — wipe-test-data "
+        "scoped to a single company",
+    )
+    purge.add_argument("--code", required=True, help="security code")
+    purge.add_argument("--exchange", help="exchange (default: inferred from code)")
+    purge.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm the destructive cascade delete",
+    )
 
     rebuild = subparsers.add_parser(
         "rebuild-units",
@@ -154,7 +190,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "register":
             result = deps.register().execute(_register_command(args))
         elif args.command == "parse":
-            result = deps.parse().execute(ParseDocumentCommand(document_id=args.document_id))
+            result = deps.parse().execute(
+                ParseDocumentCommand(
+                    document_id=args.document_id, options=deps.parser_options()
+                )
+            )
             if not _stage_succeeded("parse", result):
                 _print_failed_stage("parse", result)
                 return 1
@@ -178,8 +218,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         elif args.command == "track":
             entries = _track_entries(args)
-            # File-driven runs reconcile (CSV is the source of truth); --codes
-            # ad-hoc adds do not, and are flagged as future drift.
+            # File-driven runs reconcile against the import file (restore
+            # semantics); --codes direct adds write the DB truth as-is.
             file_driven = not args.codes
             result = deps.track().execute(
                 TrackCompaniesCommand(
@@ -191,12 +231,57 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.codes:
                 print(
-                    "[note] --codes upserts are NOT written to config/watchlist.csv; "
-                    "the next file-driven `make track` will report them as drift",
+                    "[note] DB updated; run `make track-export` when you want "
+                    "a fresh config/watchlist.csv git snapshot",
                     file=sys.stderr,
                 )
+            if not args.dry_run:
+                # On-add metadata fetch (Miniflux pattern): resolve pending
+                # legal names now when credentials allow; sync remains the
+                # fallback healer.
+                for res in deps.resolve_profiles(
+                    tuple((r.security_code, r.exchange) for r in result.results)
+                ):
+                    note = (
+                        f"resolved {res.security_code} -> {res.legal_name}"
+                        if res.resolved
+                        else f"legal name for {res.security_code} still pending "
+                        "(profile unavailable; first sync will heal it)"
+                    )
+                    print(f"[note] {note}", file=sys.stderr)
         elif args.command == "track-status":
             result = deps.track_status()
+        elif args.command == "untrack":
+            codes = tuple(
+                (code.strip(), _exchange_for_scode(code.strip()))
+                for code in str(args.codes).split(",")
+                if code.strip()
+            )
+            if not codes:
+                raise ValueError("untrack: no security codes given")
+            result = deps.untrack().execute(codes)
+        elif args.command == "purge-company":
+            if not args.yes:
+                print(
+                    "refusing: purge-company cascades DB rows AND files; "
+                    "re-run with --yes (test-phase only)",
+                    file=sys.stderr,
+                )
+                return 2
+            result = deps.purge_company(
+                code=args.code,
+                exchange=args.exchange or _exchange_for_scode(args.code),
+            )
+        elif args.command == "track-export":
+            csv_text, exported, skipped = deps.track_export()
+            for line in skipped:
+                print(f"[warn] {line}", file=sys.stderr)
+            if args.out:
+                Path(args.out).write_text(csv_text, encoding="utf-8")
+                result = {"companies": exported, "written_to": args.out}
+            else:
+                sys.stdout.write(csv_text)
+                return 0
         elif args.command == "rebuild-units":
             rebuild_result = deps.rebuild_units().execute(
                 RebuildUnitsCommand(document_id=args.document_id)
@@ -224,7 +309,9 @@ def main(argv: list[str] | None = None) -> int:
             }
         elif args.command == "process":
             parse_result = deps.parse().execute(
-                ParseDocumentCommand(document_id=args.document_id)
+                ParseDocumentCommand(
+                    document_id=args.document_id, options=deps.parser_options()
+                )
             )
             if not _stage_succeeded("parse", parse_result):
                 _print_failed_stage("parse", parse_result)
@@ -279,6 +366,12 @@ class _Deps:
             uow_factory=self.uow_factory,
         )
 
+    def parser_options(self) -> ParserOptions:
+        return ParserOptions(
+            backend=self.settings.disclosure_mineru_backend,
+            server_url=self.settings.disclosure_mineru_server_url,
+        )
+
     def parse(self) -> ParseDocument:
         executable = self.settings.disclosure_mineru_bin or Path("mineru")
         parser = MinerUDocumentParser(process=MinerUProcess(executable=executable))
@@ -306,6 +399,156 @@ class _Deps:
 
     def track(self) -> TrackCompanies:
         return TrackCompanies(uow_factory=self.uow_factory)
+
+    def untrack(self) -> UntrackCompanies:
+        return UntrackCompanies(uow_factory=self.uow_factory)
+
+    def resolve_profiles(
+        self, codes: tuple[tuple[str, str], ...]
+    ) -> tuple[ProfileResolution, ...]:
+        settings = self.settings
+        if not (settings.cninfo_access_key and settings.cninfo_access_secret):
+            return ()
+        source = CninfoSource(CninfoClient.from_settings(settings))
+        return ResolveTrackedProfiles(
+            uow_factory=self.uow_factory,
+            profile_loader=source.profile_for_security,
+        ).execute(codes)
+
+    def purge_company(self, *, code: str, exchange: str) -> dict[str, Any]:
+        """TEST-PHASE cascade delete of one company (wipe_test_data, scoped).
+
+        Order mirrors scripts/wipe_test_data.sh; file removal is best-effort
+        (missing files are fine). The company ledger row goes too — this is
+        for undoing mistakes/test residue, not an operations path.
+        """
+
+        from sqlalchemy import text as sql_text
+
+        removed_files = 0
+        with self.engine.begin() as conn:
+            company_id = conn.execute(
+                sql_text(
+                    "SELECT company_id FROM disclosure_core.security "
+                    "WHERE security_code = :code AND exchange = :exchange"
+                ),
+                {"code": code, "exchange": exchange},
+            ).scalar()
+            if company_id is None:
+                raise ValueError(f"no security {code}.{exchange}")
+            relpaths = [
+                row[0]
+                for row in conn.execute(
+                    sql_text(
+                        "SELECT raw_file_relpath FROM disclosure_core.document "
+                        "WHERE company_id = :cid AND raw_file_relpath IS NOT NULL"
+                    ),
+                    {"cid": company_id},
+                )
+            ]
+            for row in conn.execute(
+                sql_text(
+                    "SELECT parser_artifact_relpath, normalized_ir_relpath, "
+                    "document_units_relpath FROM disclosure_core.processing_run r "
+                    "JOIN disclosure_core.document d ON d.document_id = r.document_id "
+                    "WHERE d.company_id = :cid"
+                ),
+                {"cid": company_id},
+            ):
+                relpaths.extend(p for p in row if p)
+            counts: dict[str, int] = {}
+            conn.execute(
+                sql_text(
+                    "UPDATE disclosure_core.document "
+                    "SET current_processing_run_id = NULL WHERE company_id = :cid"
+                ),
+                {"cid": company_id},
+            )
+            for label, sql in (
+                (
+                    "outbox_events",
+                    "DELETE FROM disclosure_ops.outbox_event WHERE document_id IN "
+                    "(SELECT document_id FROM disclosure_core.document "
+                    " WHERE company_id = :cid)",
+                ),
+                (
+                    "document_units",
+                    "DELETE FROM disclosure_core.document_unit WHERE document_id IN "
+                    "(SELECT document_id FROM disclosure_core.document "
+                    " WHERE company_id = :cid)",
+                ),
+                (
+                    "processing_runs",
+                    "DELETE FROM disclosure_core.processing_run WHERE document_id IN "
+                    "(SELECT document_id FROM disclosure_core.document "
+                    " WHERE company_id = :cid)",
+                ),
+                (
+                    "documents",
+                    "DELETE FROM disclosure_core.document WHERE company_id = :cid",
+                ),
+                (
+                    "source_accesses",
+                    "DELETE FROM disclosure_core.source_access "
+                    "WHERE company_id = :cid",
+                ),
+                (
+                    # Profile fetches are recorded BEFORE subject resolution,
+                    # so their rows carry no company_id (Codex acceptance P1:
+                    # cninfo:p_stock2100 residue keyed only by query scode).
+                    "source_accesses_unlinked",
+                    "DELETE FROM disclosure_core.source_access "
+                    "WHERE company_id IS NULL "
+                    "AND (query_params->>'scode' = :code "
+                    "     OR query_params->>'security_code' = :code)",
+                ),
+                (
+                    "source_checkpoints",
+                    "DELETE FROM disclosure_core.source_checkpoint "
+                    "WHERE scope_key LIKE :cid_scope",
+                ),
+                (
+                    "tracked_companies",
+                    "DELETE FROM disclosure_core.tracked_company "
+                    "WHERE company_id = :cid",
+                ),
+                (
+                    "company_identifiers",
+                    "DELETE FROM disclosure_core.company_identifier "
+                    "WHERE company_id = :cid",
+                ),
+                (
+                    "securities",
+                    "DELETE FROM disclosure_core.security WHERE company_id = :cid",
+                ),
+                (
+                    "companies",
+                    "DELETE FROM disclosure_core.company WHERE company_id = :cid",
+                ),
+            ):
+                counts[label] = conn.execute(
+                    sql_text(sql),
+                    {
+                        "cid": company_id,
+                        "cid_scope": f"{company_id}:%",
+                        "code": code,
+                    },
+                ).rowcount
+        data_dir = self.settings.disclosure_data_root / "data"
+        for relpath in relpaths:
+            target = data_dir / relpath
+            if target.is_file():
+                target.unlink()
+                removed_files += 1
+            elif target.is_dir():
+                shutil.rmtree(target)
+                removed_files += 1
+        return {
+            "company_id": company_id,
+            "security": f"{code}.{exchange}",
+            "deleted": counts,
+            "removed_files": removed_files,
+        }
 
     def track_status(self) -> list[dict[str, Any]]:
         """Read-only pool status: tracked config + checkpoint + pending counts."""
@@ -345,6 +588,70 @@ class _Deps:
                 )
             ).mappings()
             return [dict(row) for row in rows]
+
+    def track_export(self) -> tuple[str, int, list[str]]:
+        """DB -> watchlist CSV snapshot (the OPML-export analog).
+
+        The DB is the source of truth; this dump round-trips with
+        `track --file`. joined_date derives from created_at, note from
+        legal_name — both are ignored by import, kept for the human reader.
+        """
+
+        from sqlalchemy import text as sql_text
+
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                sql_text(
+                    """
+                    SELECT s.security_code, s.exchange, tc.status,
+                           tc.created_at::date AS joined_date,
+                           tc.lookback->>'days' AS lookback_days,
+                           tc.sync_frequency, tc.process_classes,
+                           c.legal_name
+                      FROM disclosure_core.tracked_company tc
+                      JOIN disclosure_core.company c ON c.company_id = tc.company_id
+                      LEFT JOIN disclosure_core.security s
+                        ON s.security_id = tc.security_id
+                     ORDER BY s.security_code
+                    """
+                )
+            ).mappings().all()
+        skipped = [
+            f"tracked company without security skipped: {row['legal_name']}"
+            for row in rows
+            if not row["security_code"]
+        ]
+        lines = [
+            "# disclosure_anchor tracking-pool snapshot — exported from the DB"
+            " (source of truth) by `make track-export`.",
+            "# Restore with: make track [PRUNE_DRIFT=YES]. Mutate the pool via"
+            " PUT /v1/admin/tracked-companies, `make track CODES=...`,",
+            "# or edit this file and re-import; blank optional cells mean"
+            " 'inherit the global default'.",
+            "security_code,exchange,status,joined_date,lookback_days,"
+            "sync_frequency,process_classes,note",
+        ]
+        exported = 0
+        for row in rows:
+            if not row["security_code"]:
+                continue
+            classes = row["process_classes"]
+            lines.append(
+                ",".join(
+                    [
+                        row["security_code"],
+                        row["exchange"] or "",
+                        row["status"],
+                        row["joined_date"].isoformat(),
+                        row["lookback_days"] or "",
+                        row["sync_frequency"] or "",
+                        ";".join(classes) if classes else "",
+                        row["legal_name"].replace(",", "，"),
+                    ]
+                )
+            )
+            exported += 1
+        return "\n".join(lines) + "\n", exported, skipped
 
     def sync(self, args: argparse.Namespace) -> dict[str, object]:
         company = args.company
@@ -431,41 +738,9 @@ def datetime_today_shanghai() -> date:
     return datetime.now(ZoneInfo("Asia/Shanghai")).date()
 
 
-def _sync_window(
-    *,
-    uow_factory: Callable[[], UnitOfWork],
-    company: str,
-    exchange: str,
-    explicit_window_days: int | None,
-    today: date,
-    overlap_days: int,
-    initial_lookback_days: int = 1095,
-) -> tuple[date, date]:
-    if explicit_window_days is not None:
-        if explicit_window_days < 0:
-            raise ValueError("--window must be non-negative")
-        return today - timedelta(days=explicit_window_days), today
-    with uow_factory() as uow:
-        security = uow.securities.get_by_code_exchange(company, exchange)
-        if security is None:
-            # First contact: default historical backfill (user decision
-            # 2026-07-06, 三年是底线); --window stays the explicit override.
-            return today - timedelta(days=initial_lookback_days), today
-        checkpoint = uow.source_checkpoints.get_by_scope(
-            "cninfo", f"{security.company_id}:p_info3015"
-        )
-        if checkpoint is None or not checkpoint.cursor:
-            tracked = uow.tracked_companies.get_by_company_id(security.company_id)
-            days = initial_lookback_days
-            if tracked and isinstance(tracked.lookback, dict):
-                override = tracked.lookback.get("days")
-                if isinstance(override, int) and override >= 0:
-                    days = override
-            return today - timedelta(days=days), today
-        window_end = checkpoint.cursor.get("window_end")
-        if not isinstance(window_end, str):
-            raise ValueError("checkpoint cursor missing window_end")
-        return date.fromisoformat(window_end) - timedelta(days=overlap_days), today
+# Shared with the on-demand admin sync endpoint; single definition lives in
+# the use-case module.
+_sync_window = compute_sync_window
 
 
 def _track_entries(args: argparse.Namespace) -> tuple[TrackEntry, ...]:

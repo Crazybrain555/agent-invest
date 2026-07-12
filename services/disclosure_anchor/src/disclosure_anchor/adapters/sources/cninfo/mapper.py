@@ -8,6 +8,7 @@ from functools import lru_cache
 from datetime import date, datetime
 import json
 from importlib import resources
+from pathlib import Path
 import re
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -164,6 +165,26 @@ def load_facet_map() -> dict[str, Any]:
         .joinpath("facet_map.json")
         .read_text(encoding="utf-8")
     )
+
+
+def load_processing_policy(path: Path) -> tuple[str, ...]:
+    """Global processing default (cascade layer 2) — fail-closed on typos.
+
+    The ONE loader for config/processing_policy.json: worker CLI and the
+    Filing API resolve the effective-class cascade through this. Validates
+    against the unified class vocabulary; not cached so a policy edit is
+    picked up by the next run/request.
+    """
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    process = tuple(str(t) for t in payload["process"])
+    known = set(load_class_map()["classes"])
+    unknown = [c for c in (*process, *payload.get("register_only", ())) if c not in known]
+    if unknown:
+        raise ValueError(
+            f"processing_policy.json 含未知类名 {unknown} — 先跑 make config-check"
+        )
+    return process
 
 
 def derive_primary_class(raw_category: str | None, title: str | None) -> str:

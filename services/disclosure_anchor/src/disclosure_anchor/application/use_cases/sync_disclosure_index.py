@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 from typing import Any
@@ -55,6 +55,47 @@ class SyncDisclosureIndexResult:
     checkpoint_id: str
     candidate_count: int
     empty: bool
+
+
+def compute_sync_window(
+    *,
+    uow_factory: Callable[[], UnitOfWork],
+    company: str,
+    exchange: str,
+    explicit_window_days: int | None,
+    today: date,
+    overlap_days: int,
+    initial_lookback_days: int = 1095,
+) -> tuple[date, date]:
+    """Effective sync window for one company (shared by CLI sync and the
+    on-demand admin sync endpoint): explicit override > checkpoint+overlap >
+    per-company lookback > global initial backfill."""
+
+    if explicit_window_days is not None:
+        if explicit_window_days < 0:
+            raise ValueError("window must be non-negative")
+        return today - timedelta(days=explicit_window_days), today
+    with uow_factory() as uow:
+        security = uow.securities.get_by_code_exchange(company, exchange)
+        if security is None:
+            # First contact: default historical backfill (user decision
+            # 2026-07-06, 三年是底线); explicit window stays the override.
+            return today - timedelta(days=initial_lookback_days), today
+        checkpoint = uow.source_checkpoints.get_by_scope(
+            "cninfo", f"{security.company_id}:p_info3015"
+        )
+        if checkpoint is None or not checkpoint.cursor:
+            tracked = uow.tracked_companies.get_by_company_id(security.company_id)
+            days = initial_lookback_days
+            if tracked and isinstance(tracked.lookback, dict):
+                override = tracked.lookback.get("days")
+                if isinstance(override, int) and override >= 0:
+                    days = override
+            return today - timedelta(days=days), today
+        window_end = checkpoint.cursor.get("window_end")
+        if not isinstance(window_end, str):
+            raise ValueError("checkpoint cursor missing window_end")
+        return date.fromisoformat(window_end) - timedelta(days=overlap_days), today
 
 
 class SyncDisclosureIndex:

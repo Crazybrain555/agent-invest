@@ -16,7 +16,7 @@ from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParse
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
-from disclosure_anchor.api.errors import not_found
+from disclosure_anchor.api.errors import not_found, validation_error
 from disclosure_anchor.api.schemas.admin import (
     BuildUnitsResponse,
     ParseDocumentResponse,
@@ -25,6 +25,13 @@ from disclosure_anchor.api.schemas.admin import (
     PublishRunResponse,
     RegisterLocalPdfRequest,
     RegisterLocalPdfResponse,
+    SyncCompanyRequest,
+    SyncCompanyResponse,
+    TrackCompaniesRequest,
+    TrackCompaniesResponse,
+    TrackDriftResponse,
+    TrackEntryResultResponse,
+    UntrackCompanyResponse,
 )
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.use_cases.build_units import (
@@ -45,6 +52,21 @@ from disclosure_anchor.application.use_cases.register_local_pdf import (
     RegisterLocalPdf,
     RegisterLocalPdfCommand,
     RegisterLocalPdfResult,
+)
+from disclosure_anchor.application.use_cases.sync_disclosure_index import (
+    SyncDisclosureIndex,
+    SyncDisclosureIndexCommand,
+    SyncDisclosureIndexError,
+    compute_sync_window,
+)
+from disclosure_anchor.application.use_cases.track_companies import (
+    ResolveTrackedProfiles,
+    TrackCompanies,
+    TrackCompaniesCommand,
+    TrackCompaniesResult,
+    TrackEntry,
+    UntrackCompanies,
+    UntrackCompaniesResult,
 )
 from disclosure_anchor.domain.value_objects import ReportPeriod
 from disclosure_anchor.settings import Settings
@@ -69,9 +91,18 @@ def parse_document(
     request: Request,
     options: ParserOptionsRequest,
 ) -> ParseDocumentResponse:
+    settings = getattr(request.app.state, "settings", None)
+    defaults = (
+        ParserOptions(
+            backend=settings.disclosure_mineru_backend,
+            server_url=settings.disclosure_mineru_server_url,
+        )
+        if settings is not None
+        else ParserOptions()
+    )
     result = _admin_deps(request).parse_document(
         document_id=document_id,
-        options=_parser_options(options),
+        options=_parser_options(options, defaults),
     )
     return ParseDocumentResponse.model_validate(asdict(result))
 
@@ -94,6 +125,99 @@ def publish_run(
         processing_run_id=processing_run_id,
         allow_empty=command.allow_empty,
         reason=command.reason,
+    )
+
+
+def track_companies(
+    request: Request,
+    command: TrackCompaniesRequest,
+) -> TrackCompaniesResponse:
+    # Full-row upsert semantics (same as the CSV import path): an absent
+    # optional field clears the stored override back to inherit-global.
+    deps = _admin_deps(request)
+    try:
+        result = deps.track_companies(
+            TrackCompaniesCommand(
+                entries=tuple(
+                    TrackEntry(
+                        security_code=entry.security_code,
+                        exchange=entry.exchange,
+                        status=entry.status,
+                        lookback_days=entry.lookback_days,
+                        sync_frequency=entry.sync_frequency,
+                        process_classes=(
+                            tuple(entry.process_classes)
+                            if entry.process_classes
+                            else None
+                        ),
+                    )
+                    for entry in command.entries
+                ),
+                reconcile=command.reconcile,
+                prune_drift=command.prune_drift,
+                dry_run=command.dry_run,
+            )
+        )
+    except ValueError as exc:
+        # TrackCompanies rejects unknown sync_frequency/process_classes and
+        # negative lookback with ValueError — surface as the envelope's 422.
+        raise validation_error("entries", str(exc)) from exc
+    if not command.dry_run:
+        # On-add metadata fetch (Miniflux pattern), best-effort: pending
+        # legal names resolve now when credentials allow; the worker's
+        # first sync heals whatever this pass could not.
+        deps.resolve_profiles(
+            tuple((item.security_code, item.exchange) for item in result.results)
+        )
+    return _track_response(result)
+
+
+def sync_company(
+    security_code: str,
+    request: Request,
+    exchange: str,
+    command: SyncCompanyRequest,
+) -> SyncCompanyResponse:
+    """On-demand acquisition trigger (Miniflux refresh-feed analog).
+
+    This is the machine-callable entry the L6 pull loop uses: an
+    evidence_request that needs a company's disclosures NOW calls this
+    instead of waiting for the scheduler's next round. Synchronous like the
+    admin parse endpoint; downloads/parses still flow through worker rounds.
+    """
+
+    deps = _admin_deps(request)
+    if not deps.can_sync():
+        raise validation_error(
+            "cninfo", "CNINFO credentials are required for on-demand sync"
+        )
+    if command.window_days is not None and command.window_days < 0:
+        raise validation_error("window_days", "must be non-negative")
+    return deps.sync_company(
+        security_code=security_code,
+        exchange=exchange,
+        window_days=command.window_days,
+    )
+
+
+def untrack_company(
+    security_code: str,
+    request: Request,
+    exchange: str,
+) -> UntrackCompanyResponse:
+    deps = _admin_deps(request)
+    result: UntrackCompaniesResult = deps.untrack_companies(
+        ((security_code, exchange),)
+    )
+    if not result.removed:
+        not_found(f"company is not tracked: {security_code}.{exchange}")
+    removed = result.removed[0]
+    return UntrackCompanyResponse(
+        security_code=removed.security_code,
+        exchange=removed.exchange,
+        tracked_company_id=removed.tracked_company_id,
+        company_id=removed.company_id,
+        documents_retained=deps.document_count(removed.company_id),
     )
 
 
@@ -154,6 +278,103 @@ class AdminDeps:
             processing_run_id=result.processing_run_id,
             is_active=True,
         )
+
+    def track_companies(self, command: TrackCompaniesCommand) -> TrackCompaniesResult:
+        return TrackCompanies(uow_factory=self._uow_factory).execute(command)
+
+    def untrack_companies(
+        self, codes: tuple[tuple[str, str], ...]
+    ) -> UntrackCompaniesResult:
+        return UntrackCompanies(uow_factory=self._uow_factory).execute(codes)
+
+    def resolve_profiles(self, codes: tuple[tuple[str, str], ...]) -> None:
+        settings = self._settings
+        if not self.can_sync():
+            return
+        from disclosure_anchor.adapters.sources.cninfo import (
+            CninfoClient,
+            CninfoSource,
+        )
+
+        source = CninfoSource(CninfoClient.from_settings(settings))
+        ResolveTrackedProfiles(
+            uow_factory=self._uow_factory,
+            profile_loader=source.profile_for_security,
+        ).execute(codes)
+
+    def can_sync(self) -> bool:
+        return bool(
+            self._settings.cninfo_access_key and self._settings.cninfo_access_secret
+        )
+
+    def sync_company(
+        self, *, security_code: str, exchange: str, window_days: int | None
+    ) -> SyncCompanyResponse:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from disclosure_anchor.adapters.sources.cninfo import (
+            CninfoClient,
+            CninfoSource,
+        )
+
+        settings = self._settings
+        source = CninfoSource(CninfoClient.from_settings(settings))
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        window_start, window_end = compute_sync_window(
+            uow_factory=self._uow_factory,
+            company=security_code,
+            exchange=exchange,
+            explicit_window_days=window_days,
+            today=today,
+            overlap_days=settings.cninfo_overlap_days,
+            initial_lookback_days=settings.disclosure_initial_lookback_days,
+        )
+        try:
+            result = SyncDisclosureIndex(
+                source=source,
+                profile_loader=source.profile_for_security,
+                uow_factory=self._uow_factory,
+            ).execute(
+                SyncDisclosureIndexCommand(
+                    security_code=security_code,
+                    exchange=exchange,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+            )
+        except SyncDisclosureIndexError as exc:
+            # Durable failure trace already persisted (source_access row).
+            return SyncCompanyResponse(
+                sync_status="failed",
+                security_code=security_code,
+                exchange=exchange,
+                window_start=window_start,
+                window_end=window_end,
+                error=str(exc),
+            )
+        return SyncCompanyResponse(
+            sync_status="ok",
+            security_code=security_code,
+            exchange=exchange,
+            window_start=window_start,
+            window_end=window_end,
+            company_id=result.company_id,
+            candidate_count=result.candidate_count,
+            empty=result.empty,
+            checkpoint_id=result.checkpoint_id,
+        )
+
+    def document_count(self, company_id: str) -> int:
+        with self._engine.connect() as conn:
+            count = conn.execute(
+                text(
+                    f"SELECT count(*) FROM {CORE_SCHEMA}.document "
+                    "WHERE company_id = :company_id"
+                ),
+                {"company_id": company_id},
+            ).scalar()
+        return int(count or 0)
 
     def _document_id_for_run(self, processing_run_id: str) -> str:
         with self._engine.connect() as conn:
@@ -218,8 +439,21 @@ def _register_response(result: RegisterLocalPdfResult) -> RegisterLocalPdfRespon
     )
 
 
-def _parser_options(command: ParserOptionsRequest) -> ParserOptions:
-    defaults = ParserOptions()
+def _track_response(result: TrackCompaniesResult) -> TrackCompaniesResponse:
+    return TrackCompaniesResponse(
+        results=[
+            TrackEntryResultResponse(**asdict(item)) for item in result.results
+        ],
+        drift=[TrackDriftResponse(**asdict(item)) for item in result.drift],
+        dry_run=result.dry_run,
+        created_count=result.created_count,
+    )
+
+
+def _parser_options(
+    command: ParserOptionsRequest, defaults: ParserOptions | None = None
+) -> ParserOptions:
+    defaults = defaults or ParserOptions()
     return ParserOptions(
         method=command.method if command.method is not None else defaults.method,
         backend=command.backend if command.backend is not None else defaults.backend,
@@ -229,6 +463,11 @@ def _parser_options(command: ParserOptionsRequest) -> ParserOptions:
         start_page=command.start_page,
         end_page=command.end_page,
         timeout_seconds=command.timeout_seconds,
+        server_url=(
+            command.server_url
+            if command.server_url is not None
+            else defaults.server_url
+        ),
     )
 
 
@@ -258,6 +497,24 @@ if APIRouter is not None:
         publish_run,
         methods=["POST"],
         response_model=PublishRunResponse,
+    )
+    router.add_api_route(
+        "/v1/admin/tracked-companies",
+        track_companies,
+        methods=["PUT"],
+        response_model=TrackCompaniesResponse,
+    )
+    router.add_api_route(
+        "/v1/admin/tracked-companies/{security_code}",
+        untrack_company,
+        methods=["DELETE"],
+        response_model=UntrackCompanyResponse,
+    )
+    router.add_api_route(
+        "/v1/admin/tracked-companies/{security_code}/sync",
+        sync_company,
+        methods=["POST"],
+        response_model=SyncCompanyResponse,
     )
 else:
     router = None

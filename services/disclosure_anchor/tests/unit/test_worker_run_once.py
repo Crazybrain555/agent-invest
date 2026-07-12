@@ -185,6 +185,60 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self.assertEqual(report.failures[0].item_ref, "doc_bad")
         self.assertEqual(report.failures[0].error_code, "RuntimeError")
 
+    def test_parse_concurrency_runs_document_chains_in_parallel(self) -> None:
+        import threading
+
+        deps = _deps()
+        object.__setattr__(
+            deps,
+            "config",
+            WorkerConfig(
+                max_parse_retries=3,
+                max_build_retries=3,
+                stale_run_threshold_seconds=3600,
+                sync_interval_seconds=86400,
+                cninfo_overlap_days=7,
+                cninfo_max_retries=3,
+                cninfo_oversized_kb=10240,
+                parse_concurrency=3,
+            ),
+        )
+        pending = [
+            {"document_id": f"doc_{i}", "oversized": False} for i in range(3)
+        ]
+        # The barrier only releases when all 3 chains are inside execute()
+        # simultaneously — proof of parallelism, not just completion.
+        barrier = threading.Barrier(3, timeout=10)
+
+        def blocking_execute(command):  # noqa: ANN001, ANN202
+            barrier.wait()
+            return mock.MagicMock(
+                status="succeeded", processing_run_id=f"run_{command.document_id}"
+            )
+
+        with (
+            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
+            mock.patch.object(worker_module.queries, "pending_parse", return_value=pending),
+            mock.patch.object(worker_module, "ParseDocument") as parse_cls,
+            mock.patch.object(worker_module, "BuildUnits") as build_cls,
+            mock.patch.object(worker_module, "PublishRun") as publish_cls,
+        ):
+            parse_cls.return_value.execute.side_effect = blocking_execute
+            build_cls.return_value.execute.return_value = mock.MagicMock(
+                status="succeeded", build_stats=None
+            )
+            publish_cls.return_value.execute.return_value = mock.MagicMock(
+                status="published"
+            )
+            report = run_once(
+                WorkerLimits(sync=0, download=0, parse=5, build=0, publish=0), deps
+            )
+
+        self.assertEqual(report.parsed, 3)
+        self.assertEqual(report.built, 3)
+        self.assertEqual(report.published, 3)
+        self.assertEqual(report.failed, 0)
+
     def test_retryable_false_parse_failure_recorded_with_error_code(self) -> None:
         deps = _deps()
         failed = mock.MagicMock(

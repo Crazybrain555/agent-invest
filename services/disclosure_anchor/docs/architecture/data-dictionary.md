@@ -116,6 +116,11 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
   disclosure_topics、report_period、announcement_date、source_ref、parent_ref、asset_kind、
   observed_at、source_tier、trace_level、raw_file_hash）。列集权威=contract-checklist §2。
 - documents_v1 / processing_runs_v1 / source_refs_v1 / change_events_v1 / document_categories_v1。
+- **tracked_companies_v1（0019+0020，round22）**：股票池读契约——真源是 tracked_company 表
+  （watchlist.csv 降级为导入/快照）。视图只暴露 raw 覆盖列（NULL=继承）+ 生命周期事实列
+  （legal_name_status pending/resolved、last_synced_at、synced_through——Miniflux
+  checked_at 模式）；生效值与 sync_state（never_synced/due/fresh）由
+  `GET /v1/tracked-companies` 在 API 层派生（全局 policy/间隔是文件与 env，SQL 看不见）。
 - **L2 直读纪律**：必须过滤 `is_active_run`（历史 run 行是 U5 审计语义）。
 
 ## 4. 词表/配置文件索引（versioned，改=升版）

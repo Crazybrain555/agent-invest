@@ -1,0 +1,175 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "company_ref": {
+      "title": "Company Ref",
+      "type": "string"
+    },
+    "contract_version": {
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "effective_lookback_days": {
+      "title": "Effective Lookback Days",
+      "type": "integer"
+    },
+    "effective_process_classes": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Effective Process Classes",
+      "type": "array"
+    },
+    "effective_sync_seconds": {
+      "title": "Effective Sync Seconds",
+      "type": "integer"
+    },
+    "exchange": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Exchange"
+    },
+    "last_synced_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Last Synced At"
+    },
+    "legal_name": {
+      "title": "Legal Name",
+      "type": "string"
+    },
+    "legal_name_status": {
+      "title": "Legal Name Status",
+      "type": "string"
+    },
+    "lookback_days": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Lookback Days"
+    },
+    "process_classes": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Process Classes"
+    },
+    "security_code": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Security Code"
+    },
+    "security_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Security Ref"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "sync_frequency": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Sync Frequency"
+    },
+    "sync_state": {
+      "title": "Sync State",
+      "type": "string"
+    },
+    "synced_through": {
+      "anyOf": [
+        {
+          "format": "date",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Synced Through"
+    },
+    "tracked_company_id": {
+      "title": "Tracked Company Id",
+      "type": "string"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "tracked_company_id",
+    "company_ref",
+    "security_ref",
+    "security_code",
+    "exchange",
+    "legal_name",
+    "legal_name_status",
+    "status",
+    "lookback_days",
+    "sync_frequency",
+    "process_classes",
+    "last_synced_at",
+    "synced_through",
+    "created_at",
+    "updated_at",
+    "contract_version",
+    "effective_lookback_days",
+    "effective_sync_seconds",
+    "effective_process_classes",
+    "sync_state"
+  ],
+  "title": "TrackedCompanyV1",
+  "type": "object"
+}

@@ -67,6 +67,10 @@ class MinerUProcess:
             command.extend(["-s", str(options.start_page)])
         if options.end_page is not None:
             command.extend(["-e", str(options.end_page)])
+        if options.server_url:
+            # *-http-client backends offload VLM inference to a remote
+            # mineru-openai-server (GPU box); mineru ignores -u otherwise.
+            command.extend(["-u", options.server_url])
         return command
 
     def version(self) -> str:

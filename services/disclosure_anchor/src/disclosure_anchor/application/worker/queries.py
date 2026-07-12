@@ -117,9 +117,10 @@ def pending_download_count(
               LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
                 ON tc_scope.company_id = q.company_id
              WHERE q.failed_download_count < :max_retries
-               AND NOT EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
+               AND (q.company_id IS NULL
+                    OR EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
                                 WHERE tc.company_id = q.company_id
-                                  AND tc.status <> 'active')
+                                  AND tc.status = 'active'))
                {_download_scope_sql(scope_classes)}
             """
         ),
@@ -135,10 +136,13 @@ def pending_downloads(
     limit: int,
     scope_classes: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    # Pausing a company stops its queued backlog too (round19 ruling:
-    # paused = 停止一切获取). NOT-EXISTS form: only an explicitly non-active
-    # tracked row blocks — candidates without a company ref stay eligible.
-    # The view keeps exposing every candidate; predicates live here.
+    # Pool membership drives acquisition: a company's candidates download
+    # only while an ACTIVE tracked row exists. Covers both round19 (paused =
+    # 停止一切获取, queued backlog included) and round22 untrack (deleting the
+    # tracked row must NOT re-open the backlog, which the old only-paused-
+    # blocks NOT-EXISTS form would have done). Candidates without a company
+    # ref stay eligible. The view keeps exposing every candidate; predicates
+    # live here.
     params: dict[str, Any] = {"max_retries": max_retries, "limit": limit}
     if scope_classes is not None:
         params["scope_classes"] = list(scope_classes)
@@ -152,9 +156,10 @@ def pending_downloads(
               LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
                 ON tc_scope.company_id = q.company_id
              WHERE q.failed_download_count < :max_retries
-               AND NOT EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
+               AND (q.company_id IS NULL
+                    OR EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
                                 WHERE tc.company_id = q.company_id
-                                  AND tc.status <> 'active')
+                                  AND tc.status = 'active'))
                {_download_scope_sql(scope_classes)}
              ORDER BY q.announcement_date, q.provider_document_id
              LIMIT :limit

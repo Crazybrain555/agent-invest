@@ -2,7 +2,7 @@
 id: disclosure_anchor_design_watchlist_operations
 project: disclosure_anchor
 title: 股票池运维设计评审（round8 问题清单 + 业界调研 + 决议建议）
-status: adopted-and-implemented (2026-07-07, user authorization)
+status: adopted-and-implemented (2026-07-07, user authorization); §5.1 真源归属已被 §7 改判 (2026-07-08)
 created_at: 2026-07-07
 inputs: 用户 round8 提问 + Codex round8 实测 + 2026-07-07 四路调研（qlib/LEAN/zipline/vnpy/py-sec-edgar/Prometheus/GitOps）
 decides_for: milestone 09（生产就绪）
@@ -131,3 +131,30 @@ cursor 增记 `window_start` 与 `synced_at`（只增不改判定逻辑，向后
 本文档吸收/细化 09 中这些条目：公司清单 operator 工具（ops-deploy #6）、
 回补批次（critic 配额项）、429（failure-paths #4/#10）、CSV filing_categories
 （company-watch #3 残留）。实施时按 §5 顺序：5.1+5.2（S/M）→ 5.3（M）→ 5.4（S）。
+
+## 7. 真源归属改判（round22，2026-07-08，用户裁决）
+
+**§5.1"watchlist.csv 仍是唯一真源"被改判为：DB（tracked_company）是唯一真源，
+CSV 降级为导入/种子 + git 快照格式。**
+
+改判依据（§3 调研的适用前提变了，不是调研错了）：
+
+1. 用户实际用法不是"编辑文件 + git commit"，而是直接看库、问 AI、走接口；
+2. 池子管理要暴露给内部其他服务（L2-L6）程序化调用——顶层协议 §10.9 新增个股
+   初始化与 §1.5 拉式回路都要求机器可调用的写入口；
+3. 业界参照系随之从 qlib/Prometheus（人编辑文件）切到 Miniflux/changedetection.io
+   （产品化服务：DB 真源 + OPML/文件导入导出）。
+
+实施形态：`disclosure_public.tracked_companies_v1` 读视图 +
+`GET /v1/tracked-companies`（含级联生效值）+ `PUT /v1/admin/tracked-companies`
+（复用 TrackCompanies，写语义仍是整行 upsert、空可选字段=清除覆盖）；
+`make track` 语义从"对账权威"变"导入/恢复"，新增 `make track-export`
+（DB → watchlist.csv git 快照）。§5.2 的对账/漂移机制保留（导入即对账），
+§5.3/§5.4 不受影响。
+
+删除语义（同轮补齐，业界对照 Miniflux DELETE-feed / GLEIF registry 双状态）：
+§3 经验三"没有项目提供 add/remove CLI"随真源翻转一并失效——DB 真源下 CRUD 就是接口。
+三层：`status=paused` 可逆停（原 qlib 模式保留）；`DELETE /v1/admin/tracked-companies/{code}`
+= `make untrack`（删订阅行，公司/文档留档；下载队列谓词同轮从"paused 才拦"翻转为
+"active 行才放行"，否则删行会重新打开积压下载）；`make purge-company CODE=.. PURGE=YES`
+（测试期专用，wipe-test-data 单公司版，撤销失误用）。

@@ -1,20 +1,17 @@
-# disclosure_anchor company watchlist — the ONLY human-maintained input (single source of truth).
-# Apply with: make track            (idempotent reconcile: upserts rows, reports DB drift)
-#             make track PRUNE_DRIFT=YES   (additionally pauses tracked companies missing here)
-# Pause a company = set status=paused (do NOT delete the row: git history + point-in-time).
-# process_classes: 按公司覆盖全局处理策略（config/processing_policy.json）——分号分隔的
-#                  class 键（如 annual_report;dividend），替换式；留空=继承全局。登记永远全量。
+# disclosure_anchor tracking-pool snapshot — exported from the DB (source of truth) by `make track-export`.
+# Restore with: make track [PRUNE_DRIFT=YES]. Mutate the pool via PUT /v1/admin/tracked-companies, `make track CODES=...`,
+# or edit this file and re-import; blank optional cells mean 'inherit the global default'.
 security_code,exchange,status,joined_date,lookback_days,sync_frequency,process_classes,note
-600519,SSE,active,2026-07-06,,,,贵州茅台
-002484,SZSE,active,2026-07-06,,,,江海股份
-000001,SZSE,active,2026-07-06,,,,平安银行
-000333,SZSE,active,2026-07-06,,,,美的集团
-600036,SSE,active,2026-07-06,,,,招商银行
-000002,SZSE,active,2026-07-07,,,,万科A-round8测试入池
-000651,SZSE,active,2026-07-07,,,,格力电器-round8测试入池
-600900,SSE,active,2026-07-07,,,,长江电力-round8测试入池
-601398,SSE,active,2026-07-07,,,,工商银行-round8测试入池
-300750,SZSE,active,2026-07-07,,,,宁德时代-round8测试入池
-300012,SZSE,active,2026-07-08,,,,华测检测-创业板
-301046,SZSE,active,2026-07-08,,,,能辉科技-创业板注册制小盘
-688077,SSE,active,2026-07-08,,,,大地熊-科创板小盘
+000001,SZSE,active,2026-07-08,,,,平安银行股份有限公司
+000002,SZSE,active,2026-07-08,,,,万科企业股份有限公司
+000333,SZSE,active,2026-07-08,,,,美的集团股份有限公司
+000651,SZSE,active,2026-07-08,,,,珠海格力电器股份有限公司
+002484,SZSE,active,2026-07-08,,,,南通江海电容器股份有限公司
+300012,SZSE,active,2026-07-08,,,,华测检测认证集团股份有限公司
+300750,SZSE,active,2026-07-08,,,,宁德时代新能源科技股份有限公司
+301046,SZSE,active,2026-07-08,,,,上海能辉科技股份有限公司
+600036,SSE,active,2026-07-08,,,,招商银行股份有限公司
+600519,SSE,active,2026-07-08,,,,贵州茅台酒股份有限公司
+600900,SSE,active,2026-07-08,,,,中国长江电力股份有限公司
+601398,SSE,active,2026-07-08,,,,中国工商银行股份有限公司
+688077,SSE,active,2026-07-08,,,,安徽大地熊新材料股份有限公司
