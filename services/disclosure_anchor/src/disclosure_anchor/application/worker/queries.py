@@ -71,22 +71,36 @@ _EFFECTIVE_CLASSES = (
     "ELSE CAST(:scope_classes AS text[]) END"
 )
 
+# Carrier precedence (process-classes audit 2026-07-12): a document whose
+# codes mark it as a procedural carrier (0129 中介机构报告 — 法律意见书/核查
+# 意见/受托管理报告/评级/督导) processes ONLY when that carrier class is
+# itself effective, no matter what subject classes ride along on the shared
+# F006V segments. ANY-hit alone let every incentive legal opinion through.
+# Per-company overrides opt back in by adding the class to process_classes.
+CARRIER_CLASSES = ("intermediary_report",)
 
-def _download_scope_sql(scope_classes: tuple[str, ...] | None) -> str:
-    """Processing-scope predicate for the download queue.
 
-    Coded candidates download when any F006V segment hits an effective
-    class; code-less candidates (web channel) fall back to title rules.
+def _processing_scope_sql(*, category_expr: str, title_expr: str) -> str:
+    """Scope predicate shared by the download and parse queues.
+
+    Eligibility: coded rows hit when any F006V segment maps to an effective
+    class, code-less rows when a title rule does; both additionally hit
+    when a title_topic rule matches (provider-code blind spots, 0021).
+    Carrier guard: no carrier-class hit may sit outside the effective set —
+    coded rows detect carriers via class rules, code-less via title rules.
+    Callers must bind :scope_classes AND :carrier_classes.
+
+    NULLIF: the web channel stores raw_category as '' (candidate snapshots
+    and provider_metadata alike), so empty string must route to the
+    code-less branch or web documents never reach the title rules.
     """
 
-    if scope_classes is None:
-        return ""
     return f"""
-               AND (CASE WHEN q.candidate->>'raw_category' IS NOT NULL
+               AND ((CASE WHEN NULLIF({category_expr}, '') IS NOT NULL
                     THEN EXISTS (
                         SELECT 1
                           FROM unnest(string_to_array(
-                                   q.candidate->>'raw_category', '||'))
+                                   {category_expr}, '||'))
                                AS seg(code)
                           JOIN {CORE_SCHEMA}.classification_rule cr
                             ON cr.rule_set = 'class'
@@ -95,8 +109,41 @@ def _download_scope_sql(scope_classes: tuple[str, ...] | None) -> str:
                     ELSE EXISTS (
                         SELECT 1 FROM {CORE_SCHEMA}.classification_rule tr
                          WHERE tr.rule_set = 'title'
-                           AND q.candidate->>'title' LIKE '%' || tr.prefix || '%'
-                           AND tr.value = ANY({_EFFECTIVE_CLASSES})) END)"""
+                           AND {title_expr} LIKE '%' || tr.prefix || '%'
+                           AND tr.value = ANY({_EFFECTIVE_CLASSES})) END)
+                    OR EXISTS (
+                        SELECT 1 FROM {CORE_SCHEMA}.classification_rule tt
+                         WHERE tt.rule_set = 'title_topic'
+                           AND {title_expr} LIKE '%' || tt.prefix || '%'
+                           AND tt.value = ANY({_EFFECTIVE_CLASSES})))
+               AND (CASE WHEN NULLIF({category_expr}, '') IS NOT NULL
+                    THEN NOT EXISTS (
+                        SELECT 1
+                          FROM unnest(string_to_array(
+                                   {category_expr}, '||'))
+                               AS seg(code)
+                          JOIN {CORE_SCHEMA}.classification_rule cx
+                            ON cx.rule_set = 'class'
+                           AND seg.code LIKE cx.prefix || '%'
+                         WHERE cx.value = ANY(CAST(:carrier_classes AS text[]))
+                           AND NOT cx.value = ANY({_EFFECTIVE_CLASSES}))
+                    ELSE NOT EXISTS (
+                        SELECT 1 FROM {CORE_SCHEMA}.classification_rule tx
+                         WHERE tx.rule_set = 'title'
+                           AND {title_expr} LIKE '%' || tx.prefix || '%'
+                           AND tx.value = ANY(CAST(:carrier_classes AS text[]))
+                           AND NOT tx.value = ANY({_EFFECTIVE_CLASSES})) END)"""
+
+
+def _download_scope_sql(scope_classes: tuple[str, ...] | None) -> str:
+    """Processing-scope predicate for the download queue."""
+
+    if scope_classes is None:
+        return ""
+    return _processing_scope_sql(
+        category_expr="q.candidate->>'raw_category'",
+        title_expr="q.candidate->>'title'",
+    )
 
 
 def pending_download_count(
@@ -110,6 +157,7 @@ def pending_download_count(
     params: dict[str, Any] = {"max_retries": max_retries}
     if scope_classes is not None:
         params["scope_classes"] = list(scope_classes)
+        params["carrier_classes"] = list(CARRIER_CLASSES)
     row = conn.execute(
         text(
             f"""
@@ -146,6 +194,7 @@ def pending_downloads(
     params: dict[str, Any] = {"max_retries": max_retries, "limit": limit}
     if scope_classes is not None:
         params["scope_classes"] = list(scope_classes)
+        params["carrier_classes"] = list(CARRIER_CLASSES)
     rows = conn.execute(
         text(
             f"""
@@ -191,23 +240,12 @@ def pending_parse(
     scope_sql = ""
     params: dict[str, Any] = {"max_retries": max_retries, "limit": limit}
     if scope_classes is not None:
-        scope_sql = f"""
-               AND (CASE WHEN d.provider_metadata->>'raw_category' IS NOT NULL
-                    THEN EXISTS (
-                        SELECT 1
-                          FROM unnest(string_to_array(
-                                   d.provider_metadata->>'raw_category', '||'))
-                               AS seg(code)
-                          JOIN {CORE_SCHEMA}.classification_rule cr
-                            ON cr.rule_set = 'class'
-                           AND seg.code LIKE cr.prefix || '%'
-                         WHERE cr.value = ANY({_EFFECTIVE_CLASSES}))
-                    ELSE EXISTS (
-                        SELECT 1 FROM {CORE_SCHEMA}.classification_rule tr
-                         WHERE tr.rule_set = 'title'
-                           AND d.title LIKE '%' || tr.prefix || '%'
-                           AND tr.value = ANY({_EFFECTIVE_CLASSES})) END)"""
+        scope_sql = _processing_scope_sql(
+            category_expr="d.provider_metadata->>'raw_category'",
+            title_expr="d.title",
+        )
         params["scope_classes"] = list(scope_classes)
+        params["carrier_classes"] = list(CARRIER_CLASSES)
     rows = conn.execute(
         text(
             f"""

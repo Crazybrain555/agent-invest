@@ -16,8 +16,11 @@ web_source.py        免凭据兜底通道 CninfoWebSource：官网 hisAnnouncem
                      去重键与文件签名跨通道通用
 mapper.py            p_info3015/p_stock2100 → DTO(TEXTID 即 provider_document_id)、
                      F006V 多段拆分映射、report_period 标题推导(07 §3.2 封闭规则)
-filing_type_map.json 规则包(版本化)；**semiannual 必须排在 annual 之前**
-                     (子串遮蔽："半年度报告"含"年度报告"，实测踩过)
+filing_type_map.json 规则包(版本化)；**intermediary_report 必须排最前**(carrier 载体
+                     判定优先——"激励计划法律意见书"是意见书不是激励公告)；
+                     **semiannual 必须排在 annual 之前**(子串遮蔽，实测踩过)；
+                     topic_rules 段=title_topic 追加规则(有码无码都追加命中 class，
+                     补 provider 码盲区：销售简报/经营数据/发电量走 012305 而非 010309)
 ```
 
 硬规则：凭据只从 settings 进(构造注入)，query_params/日志一律先脱敏；

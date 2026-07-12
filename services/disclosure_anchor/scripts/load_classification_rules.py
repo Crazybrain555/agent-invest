@@ -63,6 +63,22 @@ def main() -> int:
                     "version": bundle.version,
                 }
             )
+    # Topic rules (0021): additive title hits consulted for coded AND
+    # code-less documents — they fill provider-code blind spots. Priority is
+    # the class's own class_map priority so the filing_type argmax compares
+    # code hits and topic hits on one scale.
+    for topic_rule in bundle.topic_rules:
+        class_priority = class_map["classes"][topic_rule.class_name]["priority"]
+        for keyword in topic_rule.keywords:
+            rows.append(
+                {
+                    "rule_set": "title_topic",
+                    "prefix": keyword,
+                    "value": topic_rule.class_name,
+                    "priority": class_priority,
+                    "version": bundle.version,
+                }
+            )
 
     engine = create_engine(os.environ["DATABASE_URL"])
     with engine.begin() as conn:
@@ -75,13 +91,14 @@ def main() -> int:
             ),
             rows,
         )
-    counts = {"class": 0, "facet": 0, "title": 0}
+    counts = {"class": 0, "facet": 0, "title": 0, "title_topic": 0}
     for row in rows:
         counts[str(row["rule_set"])] += 1
     print(
         f"loaded {counts['class']} class rules ({class_map['version']}, "
         f"{len(class_map['classes'])} classes) + {counts['facet']} facet rules "
-        f"({facet_map['version']}) + {counts['title']} title rules ({bundle.version})"
+        f"({facet_map['version']}) + {counts['title']} title rules "
+        f"+ {counts['title_topic']} title_topic rules ({bundle.version})"
     )
     return 0
 

@@ -4,7 +4,8 @@
 枚举与合法组合矩阵（§2.2）、`asset://` URI 规则（§2.3）、source_tier/trace_level 枚举（§2.9）、
 `data_asset.v1` JSON schema（从代码导出）与契约校验入口。
 
-语义权威是根 `docs/reference/` 下的引擎协议 v0.7；本包只实现、不发明。运行时依赖仅 pydantic。
+语义权威是根 `docs/reference/投研预测引擎顶层框架协议_v0.8.md`；本包只实现、不发明。
+运行时依赖仅 pydantic。
 
 ```bash
 make agent-check        # ruff + mypy + unittest + git diff --check

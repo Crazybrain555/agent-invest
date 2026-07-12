@@ -8,7 +8,7 @@
 | 文件 | 管什么 | 改完跑什么 |
 |---|---|---|
 | `watchlist.csv` | 股票池**导入/快照文件**（真源是 DB 的 tracked_company，round22 改判）：一行一只票 + 按公司覆盖（lookback_days / sync_frequency / process_classes，空=继承全局） | 导入：`make track`（自动先 config-check；`DRY_RUN=1` 只看计划；`PRUNE_DRIFT=YES` 全量恢复）；快照：`make track-export`（DB → 本文件，git 留痕） |
-| `processing_policy.json` | 全局处理策略：`process`=下载+解析；`register_only`=只登记元数据 | 无需命令，下次 worker 启动生效；改前 `make config-check` 验证 |
+| `processing_policy.json` | 全局处理策略：`process`=下载+解析；`register_only`=只登记元数据。carrier 例外（2026-07-12 审计）：带 0129 中介报告码/标题的载体件（法律意见书/核查意见/受托管理…）即使共码命中 process 类也不放行，除非把 intermediary_report 本身加进 process 或按公司覆盖 | 无需命令，下次 worker 启动生效；改前 `make config-check` 验证 |
 
 池子的增删改查（写语义相同：整行 upsert，空可选字段=清除覆盖回继承）：
 

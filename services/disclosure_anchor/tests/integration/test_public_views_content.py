@@ -485,6 +485,60 @@ class PublicViewContentTests(unittest.TestCase):
         self.assertIsNone(row["disclosure_topics"])
         self.assertIsNone(row["content_categories"])
 
+    def test_title_topic_rules_add_class_for_coded_documents(self) -> None:
+        # 0021: CNINFO files monthly operating data under 012305 (risk_alert)
+        # and never emits 010309 — title_topic hits are UNIONed with code
+        # hits, so the class lands in topics AND wins the argmax (95 > 58)
+        # without masking the code-derived class.
+        self._seed()
+        self._ensure_classification_rules()
+        document_id, _ = self._seed_extra_document_unit(
+            "other", title="万科A：2026年6月销售及近期新增项目情况简报"
+        )
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.document "
+                    "SET provider_metadata = jsonb_build_object("
+                    "'raw_category', '01010503||010112||012305') "
+                    "WHERE document_id = :document_id"
+                ),
+                {"document_id": document_id},
+            )
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT filing_type, disclosure_topics "
+                    "FROM disclosure_public.documents_v1 "
+                    "WHERE document_id = :document_id"
+                ),
+                {"document_id": document_id},
+            ).mappings().one()
+        self.assertEqual(row["filing_type"], "operating_data")
+        self.assertEqual(
+            set(row["disclosure_topics"]), {"operating_data", "risk_alert"}
+        )
+
+    def test_title_topic_rules_classify_codeless_documents(self) -> None:
+        # 0021: code-less docs consult topic rules too — topics no longer
+        # NULL when a topic keyword hits.
+        self._seed()
+        self._ensure_classification_rules()
+        document_id, _ = self._seed_extra_document_unit(
+            "codeless", title="贵州茅台2026年第二季度主要经营数据公告"
+        )
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT filing_type, disclosure_topics "
+                    "FROM disclosure_public.documents_v1 "
+                    "WHERE document_id = :document_id"
+                ),
+                {"document_id": document_id},
+            ).mappings().one()
+        self.assertEqual(row["filing_type"], "operating_data")
+        self.assertEqual(list(row["disclosure_topics"]), ["operating_data"])
+
     def _ensure_classification_rules(self) -> None:
         # Additive idempotent seed (never TRUNCATE the shared DB from a test);
         # `make load-rules` owns full reconciliation.
@@ -532,6 +586,16 @@ class PublicViewContentTests(unittest.TestCase):
             }
             for rule in facet_map["rules"]
             for prefix in rule["prefixes"]
+        ] + [
+            {
+                "rule_set": "title_topic",
+                "prefix": keyword,
+                "value": topic_rule.class_name,
+                "priority": class_map["classes"][topic_rule.class_name]["priority"],
+                "version": bundle.version,
+            }
+            for topic_rule in bundle.topic_rules
+            for keyword in topic_rule.keywords
         ]
         with self.engine.begin() as conn:
             conn.execute(

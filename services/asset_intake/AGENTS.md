@@ -5,8 +5,8 @@ L1 轻资产登记服务：dataset_snapshot（结构化数据查询结果）+ to
 （§3.2 信封、§3.7 payload 契约、§3.9 查空、§2.8 change feed、§3.11 对外契约）。跨服务规矩见根
 `AGENTS.md`；蓝图（只读参考）是 `../disclosure_anchor/`。
 
-Keep this file thin: norms + pointers. Durable task state lives in `docs/agent/` (gitignored,
-machine-local; currently managed from the monorepo root session's `docs/agent/`).
+Keep this file thin: norms + pointers. Service-scoped durable state, when needed, lives in its gitignored
+`docs/agent/`; cross-repo tasks use the single owner declared by the root task state.
 
 ## Hard rules
 
@@ -21,8 +21,7 @@ machine-local; currently managed from the monorepo root session's `docs/agent/`)
 4. 凭证只走环境变量（`.env.template` 占位符）；运行时数据、原始返回留存都在
    `/Volumes/AgentSSD/agent_system/services/asset_intake/`，never in the repo。
 5. unittest only（no pytest）；真实 provider 调用只在显式 opt-in 的 smoke 测试里，缺凭证时 skip。
-6. git 提交逐个显式路径 `git add`；禁止 `git add -A` / `commit -am`（同一工作树有并行会话在
-   `services/disclosure_anchor` 持续提交）。
+6. 需要提交时只暂存明确路径，避免把工作树中的无关改动带入提交；commit/push 授权服从根规则。
 
 ## Validation
 

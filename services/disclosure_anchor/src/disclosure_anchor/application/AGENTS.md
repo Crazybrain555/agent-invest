@@ -15,7 +15,7 @@ worker/queries.py     队列读取唯一入口（视图 facts + 阈值谓词都�
 worker/worker.py      run_once 纯调度壳（stale→sync→download→parse(=05 process 每文档链)→build→publish，
                单项异常隔离；业务动作全是既有 use case）；解析链按
                WORKER_PARSE_CONCURRENCY 有界并发（默认 1=串行；每任务独立 parser/UoW，
-               report 主线程折叠；调度设计见 docs/agent/notes/worker-scheduling-design.md）；
+               report 主线程折叠）；
                worker/locks.py 定义 WORKER_NS=815001/DOC_NS=815002 与文档级 xact 锁
                （register 复用/parse finish/publish 三事务内注入，内存 fake 无 session 自动跳过）
 dto/worker_report.py  WorkerLimits/WorkerReport/WorkerFailure（08 报告契约）

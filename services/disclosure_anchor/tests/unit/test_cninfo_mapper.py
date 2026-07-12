@@ -26,10 +26,11 @@ class CninfoMapperTests(unittest.TestCase):
     def test_filing_type_rule_bundle_has_required_seed_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
 
-        self.assertEqual(bundle.version, "2026-07-r4")
+        self.assertEqual(bundle.version, "2026-07-r5")
         self.assertEqual(
             {rule.filing_type for rule in bundle.rules},
             {
+                "intermediary_report",
                 "annual_report",
                 "semiannual_report",
                 "quarterly_report",
@@ -40,6 +41,22 @@ class CninfoMapperTests(unittest.TestCase):
                 "inquiry_regulatory",
             },
         )
+        # Order constraints: carrier keywords must outrank subject keywords
+        # (激励法律意见书 is a legal opinion, not an incentive filing), and
+        # 半年度报告 must stay ahead of 年度报告 (substring shadowing).
+        order = [rule.filing_type for rule in bundle.rules]
+        self.assertEqual(order[0], "intermediary_report")
+        self.assertLess(
+            order.index("semiannual_report"), order.index("annual_report")
+        )
+
+    def test_rule_bundle_parses_topic_rules(self) -> None:
+        bundle = load_filing_type_rule_bundle()
+
+        by_class = {rule.class_name: rule for rule in bundle.topic_rules}
+        self.assertIn("operating_data", by_class)
+        self.assertIn("销售简报", by_class["operating_data"].keywords)
+        self.assertIn("经营数据", by_class["operating_data"].keywords)
 
     def test_f006v_segments_are_split_before_filing_type_mapping(self) -> None:
         filing_type = map_filing_type(

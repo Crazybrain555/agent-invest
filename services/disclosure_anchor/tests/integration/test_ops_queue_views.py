@@ -458,6 +458,148 @@ class OpsQueueViewTests(unittest.TestCase):
             txn.rollback()
             conn.close()
 
+    def test_pending_download_carrier_and_title_topic_gate(self) -> None:
+        # Carrier precedence: a 0129-coded legal opinion rides equity_incentive
+        # codes but must NOT download unless intermediary_report itself is in
+        # scope. title_topic: a coded 销售简报 whose codes miss the scope still
+        # downloads when the topic class is in scope (0021).
+        pid_carrier = f"qvdl{self.suffix}car"
+        pid_topic = f"qvdl{self.suffix}top"
+        pid_codeless_carrier = f"qvdl{self.suffix}clc"
+        pid_web_titled = f"qvdl{self.suffix}web"
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.classification_rule "
+                    "(rule_set, prefix, value, priority, version) VALUES "
+                    "('class', '012325', 'equity_incentive', 76, 'test'), "
+                    "('class', '0129', 'intermediary_report', 18, 'test'), "
+                    "('class', '0131', 'governance_rules', 16, 'test'), "
+                    "('title', '年度报告', 'annual_report', 998, 'test'), "
+                    "('title', '法律意见书', 'intermediary_report', 1000, 'test'), "
+                    "('title_topic', '销售简报', 'operating_data', 95, 'test') "
+                    "ON CONFLICT (rule_set, prefix, value) DO NOTHING"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.source_access "
+                    "(source_access_id, provider, provider_interface, accessed_at, "
+                    " status, result_snapshot) "
+                    "VALUES (:id, 'cninfo', 'cninfo:p_info3015', now(), 'ok', "
+                    "        CAST(:snap AS jsonb))"
+                ),
+                {
+                    "id": f"sa_qv{self.suffix}carrier",
+                    "snap": json.dumps(
+                        {
+                            "result": "ok",
+                            "candidates": [
+                                {
+                                    "provider_document_id": pid_carrier,
+                                    "title": "关于股权激励计划的法律意见书",
+                                    "raw_category": "01010503||012325||012901",
+                                    "download_url": "http://x/c1.PDF",
+                                    "announcement_date": "1990-01-01",
+                                },
+                                {
+                                    "provider_document_id": pid_topic,
+                                    "title": "某公司2026年6月销售简报",
+                                    "raw_category": "01010503||013101",
+                                    "download_url": "http://x/c2.PDF",
+                                    "announcement_date": "1990-01-01",
+                                },
+                                {
+                                    "provider_document_id": pid_codeless_carrier,
+                                    "title": "关于2025年年度报告的法律意见书",
+                                    "download_url": "http://x/c3.PDF",
+                                    "announcement_date": "1990-01-01",
+                                },
+                                {
+                                    # Web-channel snapshots store raw_category
+                                    # as '' — must route to the title branch
+                                    # (NULLIF), not the coded branch.
+                                    "provider_document_id": pid_web_titled,
+                                    "title": "某公司2025年年度报告",
+                                    "raw_category": "",
+                                    "download_url": "http://x/c4.PDF",
+                                    "announcement_date": "1990-01-01",
+                                },
+                            ],
+                        }
+                    ),
+                },
+            )
+            scope = ("equity_incentive", "operating_data", "annual_report")
+            pids = [
+                row["provider_document_id"]
+                for row in queries.pending_downloads(
+                    conn, max_retries=3, limit=1000, scope_classes=scope
+                )
+            ]
+            self.assertNotIn(pid_carrier, pids)  # carrier code outside scope
+            self.assertIn(pid_topic, pids)  # topic hit despite gov-only codes
+            self.assertNotIn(pid_codeless_carrier, pids)  # carrier title hit
+            self.assertIn(pid_web_titled, pids)  # '' raw_category → title branch
+
+            # Opting the carrier class into scope re-admits both carriers.
+            optin = scope + ("intermediary_report",)
+            optin_pids = [
+                row["provider_document_id"]
+                for row in queries.pending_downloads(
+                    conn, max_retries=3, limit=1000, scope_classes=optin
+                )
+            ]
+            self.assertIn(pid_carrier, optin_pids)
+            self.assertIn(pid_codeless_carrier, optin_pids)
+        finally:
+            txn.rollback()
+            conn.close()
+
+    def test_pending_parse_carrier_gate_matches_download_gate(self) -> None:
+        # One processing surface: the parse queue applies the same carrier
+        # guard, so an already-registered legal opinion stops at parse too.
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.classification_rule "
+                    "(rule_set, prefix, value, priority, version) VALUES "
+                    "('class', '012325', 'equity_incentive', 76, 'test'), "
+                    "('class', '0129', 'intermediary_report', 18, 'test') "
+                    "ON CONFLICT (rule_set, prefix, value) DO NOTHING"
+                )
+            )
+            doc_carrier = self._insert_document(conn, status="registered")
+            doc_subject = self._insert_document(conn, status="registered")
+            for raw, doc_id in (
+                ("01010503||012325||012901", doc_carrier),
+                ("01010503||012325", doc_subject),
+            ):
+                conn.execute(
+                    text(
+                        "UPDATE disclosure_core.document SET provider_metadata = "
+                        "jsonb_build_object('raw_category', CAST(:raw AS text)) "
+                        "WHERE document_id = :id"
+                    ),
+                    {"raw": raw, "id": doc_id},
+                )
+            scope = ("equity_incentive",)
+            doc_ids = [
+                row["document_id"]
+                for row in queries.pending_parse(
+                    conn, max_retries=3, limit=1000, scope_classes=scope
+                )
+            ]
+            self.assertNotIn(doc_carrier, doc_ids)
+            self.assertIn(doc_subject, doc_ids)
+        finally:
+            txn.rollback()
+            conn.close()
+
     def test_stale_reclaim_fails_only_over_threshold_runs(self) -> None:
         with self.engine.begin() as conn:
             document_id = self._insert_document(conn, status="parsed")

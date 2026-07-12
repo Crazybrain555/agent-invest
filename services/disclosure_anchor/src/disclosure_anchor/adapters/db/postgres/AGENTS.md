@@ -6,7 +6,8 @@ migrations/        alembic；文件名即 revision（0001…0013）。冻结策�
                    0001–0009 冻结；0010–0013 于 2026-07 原地发布、现同样冻结；新改动一律从 0014 起开新迁移。
                    增量速记：0008=unit builder provenance；0009=sync/download 队列视图（op.execute 内字面冒号要 \: 转义，
                    source_access.error 是 Text 需 ::jsonb cast）；0010=applicability/page_no；0011=payload_kind 'mixed'
-                   + is_active_run 视图列；0012=provider 分类维表 + document_categories_v1；0013=semantic_keys + GIN 部分索引
+                   + is_active_run 视图列；0012=provider 分类维表 + document_categories_v1；0013=semantic_keys + GIN 部分索引；
+                   0021=documents/units 视图分类改并集推导（class 码命中 ∪ title_topic 标题命中；operating_data 归位，列集不变）
 models.py          SQLAlchemy 模型 + 与迁移同名的 CheckConstraint（两边必须同名同义）
 repositories.py    仓储实现；unique 冲突翻译成领域错误（DocumentIdentityConflictError 等）
 mappers.py         entity ↔ model 全字段映射（新加列两边都要动）

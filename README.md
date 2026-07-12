@@ -1,6 +1,6 @@
 # agent-invest
 
-投研预测引擎（L1–L6）monorepo。架构由《投研预测引擎顶层框架协议 v0.7》锁定：
+投研预测引擎（L1–L6）monorepo。现行架构权威是《投研预测引擎顶层框架协议 v0.8》：
 `docs/reference/投研预测引擎顶层框架协议_v0.8.md`。
 
 ## 布局
@@ -8,10 +8,10 @@
 | 路径 | 说明 |
 |---|---|
 | `services/disclosure_anchor/` | L1 披露公告/财报 PDF 路径服务（live），也是后续服务的复用蓝图 |
-| `docs/reference/` | 引擎级协议文档（v0.7 现行 + v0.6 沿革） |
+| `docs/reference/` | 引擎级协议文档（v0.8 现行 + v0.6 沿革）与 L1 规划 |
 | `docs/archive/pre-restart/` | Quant_agent 时代冻结存档（协议 v0.4/v0.5、旧 harness 文档），仅作历史证据 |
 | `packages/envelope_kernel/` | 跨服务共享代码：data_asset 信封核（字段模型、kind 矩阵、asset:// URI、契约 schema） |
-| `services/asset_intake/` | L1 标准数据 + 工具结果轻登记服务（M-C 立项中） |
+| `services/asset_intake/` | L1 标准数据 + 工具结果轻登记服务（已实现；真实 provider adapter 为后续项） |
 | `services/upload_service/`（规划中） | L1 人工上传服务（独立服务，最后立项） |
 
 ## 约定

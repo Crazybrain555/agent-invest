@@ -37,9 +37,23 @@ class FilingTypeRule:
 
 
 @dataclass(frozen=True)
+class TopicRule:
+    """Additive class rule matched against the title regardless of codes.
+
+    Fills provider-code blind spots (e.g. CNINFO files monthly operating
+    data under 012305 and never uses 010309): a hit ADDS the class to
+    disclosure_topics / the filing_type argmax, it never replaces code hits.
+    """
+
+    class_name: str
+    keywords: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class FilingTypeRuleBundle:
     version: str
     rules: tuple[FilingTypeRule, ...]
+    topic_rules: tuple[TopicRule, ...] = ()
 
 
 # CNINFO profiles use the provider-neutral port DTO directly.
@@ -54,7 +68,16 @@ def load_filing_type_rule_bundle() -> FilingTypeRuleBundle:
     )
     payload = json.loads(raw)
     rules = tuple(_rule_from_payload(item) for item in payload["rules"])
-    return FilingTypeRuleBundle(version=str(payload["version"]), rules=rules)
+    topic_rules = tuple(
+        TopicRule(
+            class_name=str(item["class"]),
+            keywords=tuple(str(keyword) for keyword in item["keywords"]),
+        )
+        for item in payload.get("topic_rules", [])
+    )
+    return FilingTypeRuleBundle(
+        version=str(payload["version"]), rules=rules, topic_rules=topic_rules
+    )
 
 
 def map_p_info3015_record(record: Mapping[str, Any]) -> AnnouncementRef:
