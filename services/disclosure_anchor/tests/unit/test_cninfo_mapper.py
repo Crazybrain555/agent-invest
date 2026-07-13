@@ -27,7 +27,7 @@ class CninfoMapperTests(unittest.TestCase):
     def test_filing_type_rule_bundle_has_required_seed_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
 
-        self.assertEqual(bundle.version, "2026-07-r8")
+        self.assertEqual(bundle.version, "2026-07-r9")
         self.assertEqual(
             {rule.filing_type for rule in bundle.rules},
             {
@@ -84,6 +84,15 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertIn("问询函", by_class["inquiry_regulatory"].keywords)
         self.assertIn("重整", by_class["delisting_risk"].keywords)
         self.assertIn("回购报告书", by_class["share_buyback"].keywords)
+        # r9 batch-3 additions (EPS lens): distress tripwire, pharma late-stage
+        # approvals, license-out deals, plant commissioning milestones.
+        self.assertIn("宽限期", by_class["risk_alert"].keywords)
+        self.assertIn("药品注册批准", by_class["risk_alert"].keywords)
+        self.assertIn("授权许可协议", by_class["major_contract"].keywords)
+        self.assertIn("小时试运行", by_class["operating_data"].keywords)
+        # 电量完成情况 supersedes 发电量完成情况 (substring superset).
+        self.assertIn("电量完成情况", by_class["operating_data"].keywords)
+        self.assertNotIn("发电量完成情况", by_class["operating_data"].keywords)
         # topic keywords are plain substrings — a '%' would act as a LIKE
         # wildcard in SQL but stay literal in the Python evaluator.
         for rule in bundle.topic_rules:
@@ -115,6 +124,9 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertIn(("中期票据计划", "挂牌"), keyword_sets)
         self.assertIn(("中期票据计划", "进行发行", "提供担保"), keyword_sets)
         self.assertNotIn(("预计满足", "条件的提示性公告"), keyword_sets)
+        # r9: 已获授 wording variant of the second-type restricted-stock
+        # cancellation rule (Kingsoft Office shape).
+        self.assertIn(("作废", "已获授", "尚未归属", "限制性股票"), keyword_sets)
 
     def test_carrier_title_rules_behavior_on_codeless_channel(self) -> None:
         # Carrier keywords outrank subject keywords on the title path…

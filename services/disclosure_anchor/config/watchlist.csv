@@ -3,7 +3,7 @@
 # or edit this file and re-import; blank optional cells mean 'inherit the global default'.
 security_code,exchange,status,joined_date,lookback_days,sync_frequency,process_classes,note
 000001,SZSE,active,2026-07-08,,,,平安银行股份有限公司
-000002,SZSE,active,2026-07-08,,,,万科企业股份有限公司
+000002,SZSE,active,2026-07-08,,,annual_report;semiannual_report;quarterly_report;performance_forecast;performance_flash;operating_data;investor_relations;performance_briefing;inquiry_regulatory;restructuring_assets;additional_issuance;convertible_bond;rights_issue;share_buyback;major_contract;risk_alert;delisting_risk;equity_incentive;correction_supplement;financing;related_party,万科企业股份有限公司
 000333,SZSE,active,2026-07-08,,,,美的集团股份有限公司
 000651,SZSE,active,2026-07-08,,,,珠海格力电器股份有限公司
 002484,SZSE,active,2026-07-08,,,,南通江海电容器股份有限公司

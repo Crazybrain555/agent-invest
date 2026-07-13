@@ -1,6 +1,6 @@
 {
-  "version": "2026-07-r2",
-  "_about": "处理策略（级联层2，design/classification-facets-and-derived-views.md v3）。process=下载+解析（一个动作，round20 用户裁决：不存在下载不解析）；register_only=只登记元数据（可见可查，零下载/解析成本）。按公司覆盖=watchlist.csv 的 process_classes 列（替换式，空=继承本文件）。增类=从 register_only 挪到 process，历史已登记文档自动回补下载；删类=挪回，队列即刻静默，已有数据不动。类名必须 ⊆ class_map.json（make config-check 校验，worker 启动 fail-closed）。2026-07-12 审计（docs/implementation/reviews/process-classes-review-2026-07-12.md，用户采纳）：+operating_data（月度经营数据=预测核心输入）、+financing（募投进度/借款利息）。",
+  "version": "2026-07-r3",
+  "_about": "处理策略（级联层2，design/classification-facets-and-derived-views.md v3）。process=下载+解析（一个动作，round20 用户裁决：不存在下载不解析）；register_only=只登记元数据（可见可查，零下载/解析成本）。按公司覆盖=watchlist.csv 的 process_classes 列（替换式，空=继承本文件）。增类=从 register_only 挪到 process，历史已登记文档自动回补下载；删类=挪回，队列即刻静默，已有数据不动。类名必须 ⊆ class_map.json（make config-check 校验，worker 启动 fail-closed）。2026-07-13 用户裁决（r3，EPS 核心精简）：起步下载解析面越谨慎越好，唯一入围标准=对未来每股收益(EPS)有信息量，以类别为核心、词表只做加法（topic 补码盲区）、noise 排除词表降级为第二道保险——process 22→19：移出 dividend（分红是 payout 不改 EPS）、related_party（用户点名'不重要的关联交易可拿走'；重大关联并购经 011503 等共码仍走 restructuring_assets）、financing（利息费用边际；困境公司信贷通道信号按公司在 watchlist process_classes 加回 financing/related_party 找回，如万科类标的）。五层语料实测（池外 29+16 家+池内双层，见 reviews/vocab-generalization-2026-07-13.md 增补节）：process 率 ~21%→~14%，17 条 noise 模式退出把关位降级为保险丝。",
   "process": [
     "annual_report",
     "semiannual_report",
@@ -12,14 +12,11 @@
     "performance_briefing",
     "inquiry_regulatory",
     "restructuring_assets",
-    "dividend",
     "additional_issuance",
     "convertible_bond",
     "rights_issue",
     "share_buyback",
     "major_contract",
-    "related_party",
-    "financing",
     "risk_alert",
     "delisting_risk",
     "equity_incentive",
@@ -32,6 +29,9 @@
     "equity_share_change",
     "share_pledge",
     "litigation",
+    "financing",
+    "related_party",
+    "dividend",
     "ipo_listing",
     "bond_notice",
     "esg"

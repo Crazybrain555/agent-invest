@@ -140,8 +140,8 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 | adapters/unit_builder/event_key_map.json | 事件键 **30 键**（DuEE-fin/CCKS/FewFC/CFinDEE 并集，标题派生） | 2026-07-r1 |
 | adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs；r6 financing +011711 担保/011713 财务资助、meeting_resolution +01239910；r7 equity_share_change +0115 父级实码） | 2026-07-r7 |
 | adapters/sources/cninfo/facet_map.json | F006V 维度判定（market 精确码/publisher 0101） | 2026-07-r1 |
-| adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（intermediary carrier 词最前，r7 起 briefing/inquiry 双向语序规则紧随其后防子串抢注）+ topic_rules 追加规则（title_topic：有码无码都追加命中 class，r7 扩至 10 类补码盲区）+ noise_rules 负向规则（title_noise：绝对不下载不解析；r8 共 77 条 JSON 规则/79 pattern，撤除“预计满足”并把裸“中期票据计划”收窄为挂牌/上市/母担保程序形态，保住实质融资条款） | 2026-07-r8 |
-| **config/processing_policy.json** | 处理策略（round21 合并 parse/download 两清单）：process 22 类=下载+解析，register_only 9 类=只登记；carrier 类（intermediary_report）共码不放行，除非该类自身在生效集合；按公司覆盖=watchlist process_classes | 2026-07-r2 |
+| adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（intermediary carrier 词最前，r7 起 briefing/inquiry 双向语序规则紧随其后防子串抢注）+ topic_rules 追加规则（title_topic：有码无码都追加命中 class，r7 扩至 10 类补码盲区）+ noise_rules 负向规则（title_noise：绝对不下载不解析；r8 撤除“预计满足”并把裸“中期票据计划”收窄为挂牌/上市/母担保程序形态，保住实质融资条款；r9 批次3 词表加法 12 topic 词+作废已获授变体，共 78 条 JSON 规则/80 pattern） | 2026-07-r9 |
+| **config/processing_policy.json** | 处理策略（round21 合并 parse/download 两清单）：process 19 类=下载+解析（r3 EPS 核心精简：dividend/related_party/financing 移出，困境/集团绑定公司按公司覆盖加回，万科已配 21 类），register_only 12 类=只登记；carrier 类（intermediary_report）共码不放行，除非该类自身在生效集合；按公司覆盖=watchlist process_classes | 2026-07-r3 |
 | config/watchlist.csv | 股票池唯一真源 + 按公司级联覆盖 | git 即版本 |
 
 运营者旋钮总索引：`config/README.md`（级联模型/命令速查/两类文件边界）。
