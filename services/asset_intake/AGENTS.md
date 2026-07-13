@@ -5,8 +5,9 @@ L1 轻资产登记服务：dataset_snapshot（结构化数据查询结果）+ to
 （§3.2 信封、§3.7 payload 契约、§3.9 查空、§2.8 change feed、§3.11 对外契约）。跨服务规矩见根
 `AGENTS.md`；蓝图（只读参考）是 `../disclosure_anchor/`。
 
-Keep this file thin: norms + pointers. Service-scoped durable state, when needed, lives in its gitignored
-`docs/agent/`; cross-repo tasks use the single owner declared by the root task state.
+Keep this file thin: norms + pointers. When a root `AGENTS.md` durable trigger applies, a service task uses
+its gitignored `docs/agent/HANDOFF.md`; cross-repo work uses `../../docs/agent/HANDOFF.md`. Never keep both
+active in one worktree. Any legacy task files are read-only migration/history evidence.
 
 ## Hard rules
 

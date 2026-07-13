@@ -1,30 +1,52 @@
-# CLAUDE.md - Claude Code Agent Guide (monorepo root)
+# CLAUDE.md — Claude Code guide (monorepo root)
 
-**Scope:** root-level guidance only. Repo-wide policy lives in `AGENTS.md` (this directory); each service
-carries its own `AGENTS.md`/`CLAUDE.md` which win inside their subtree (nearest file wins).
+<!-- Maintainer note (stripped before injection): this ROOT file deliberately has no @AGENTS.md
+     import (user decision) — root AGENTS.md §3 and this file each carry their own tool's workflow.
+     Component/package/nested CLAUDE.md files are symlinks to their sibling AGENTS.md (tool-neutral
+     boundaries, lazily auto-loaded). Do not add an import or symlink at the root. -->
 
-Always reply to the user in Chinese unless the user asks otherwise or the content is code/API text. Do not
-turn normal answers into long operation manuals.
+## Defaults and authority
 
-## Working in this repo
+- Product semantics follow the engine protocol, component contracts, and actual repository evidence.
+- Read-only requests (questions, diagnosis, review) authorize inspection and reporting only;
+  change/fix requests authorize in-scope local edits and non-destructive validation.
+- Before modifying the repository, read the root `AGENTS.md` for the cross-service invariants and
+  layout; deeper `AGENTS.md` files load automatically through their CLAUDE.md symlinks as you work
+  in those directories. Codex-specific mechanisms in them (instruction loading, sessions, tool
+  config) do not apply to Claude.
+- Preserve unrelated user changes. Without an explicit user request: no commit/push, no publishing,
+  no credential or permission changes, no external writes, no destructive operations. Credentials
+  never go into tracked files, Auto Memory, or handoffs.
+- Back "done" claims only with checks actually run in the current session; report exact blockers
+  instead of weakening a gate.
 
-1. Cross-service or repo-structure work: follow root `AGENTS.md`.
-2. Work on a specific service: `cd` mentally into it — read that service's `AGENTS.md`/`CLAUDE.md` and its
-   `docs/agent/` durable state first. The live service today is `services/disclosure_anchor/`.
-3. Durable working memory is gitignored machine-local `docs/agent/`: per-service
-   (`services/<svc>/docs/agent/`) plus the root's own `docs/agent/` (user-approved) for cross-service
-   work at the monorepo root. Root budgets and snapshot rotation follow disclosure_anchor's
-   durable-docs rules (Status≤120 / Plan≤300 / Documentation≤200, rotate into `archive/`).
-4. `docs/archive/pre-restart/` is frozen Quant_agent-era history — read on demand only, never as policy.
-5. The engine protocol (v0.7) lives at
-   `docs/reference/投研预测引擎顶层框架协议_v0.8.md`.
+## Durable handoff
 
-## Preferences (inherited from disclosure_anchor practice)
+A gitignored `docs/agent/HANDOFF.md` is mandatory when any of these applies: work crosses sessions;
+touches architecture, a public contract, a migration/data boundary, or high-risk operations; has
+material unknowns; is explicitly requested as durable; resumes an existing task; or awaits a user
+decision. Create it before the first repository mutation when the trigger is known up front, or
+before yielding when a bounded task first meets a trigger.
 
-1. Keep responses concise; smallest direct change; let unexpected failures surface.
-2. Before shaping or optimizing any plan, survey a few comparable open-source implementations; adopt
-   what they do better and surface the gaps unprompted.
-3. Before multi-file or risky edits, give a short plan (key assumption, file list, validation target).
-4. After code changes, update or add the relevant tests; contract changes update the matching spec/docs.
-5. If the user corrects a workflow rule, propose a concrete `CLAUDE.md`/`AGENTS.md` update before treating
-   it as permanent.
+- Cross-repo tasks use the root handoff; component tasks use the nearest component handoff.
+- One worktree has one active task and one owning writer; separate write tasks use separate
+  worktrees; reviewers and helpers are read-only. Shared PG, AgentSSD, worker, and launchd runtime
+  state likewise has exactly one owner.
+- In every new session, before the first repository mutation, check the root and nearest component
+  `HANDOFF.md` and state its task/state/writer once.
+- Any unclosed handoff (`active`, `monitoring`, `waiting_user`, `paused`, `blocked`) keeps its gate
+  and writer: stay read-only until an explicit handoff, closed/completed, or a separate worktree;
+  never infer ownership from recency.
+- A handoff lives only in its checkout/worktree and is never copied via Git or `.worktreeinclude`.
+  Before archiving or deleting a task or worktree, close it or explicitly transfer every unresolved
+  user gate and external runtime obligation.
+- A handoff records only: task key/title, scope, state, authority, user intent/acceptance,
+  authorization boundary, next action, blockers, worktree/branch/base, changed paths, latest
+  current-session validation/review, runtime owner, writer, updated time — 80 lines max.
+- Legacy `Prompt/Plan/Status/Documentation/Implement/code_review`, `archive/`, and `notes/` are
+  read-only history: never update or recreate them; physically deleting these ignored files needs
+  explicit user approval.
+
+This section and root `AGENTS.md` §3 are two renderings of one protocol; edit them together.
+Auto Memory keeps only user preferences and collaboration habits that outlast tasks; specs belong in
+tracked docs, and volatile ops facts are not stored.

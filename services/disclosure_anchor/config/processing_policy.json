@@ -1,6 +1,6 @@
 {
   "version": "2026-07-r2",
-  "_about": "处理策略（级联层2，design/classification-facets-and-derived-views.md v3）。process=下载+解析（一个动作，round20 用户裁决：不存在下载不解析）；register_only=只登记元数据（可见可查，零下载/解析成本）。按公司覆盖=watchlist.csv 的 process_classes 列（替换式，空=继承本文件）。增类=从 register_only 挪到 process，历史已登记文档自动回补下载；删类=挪回，队列即刻静默，已有数据不动。类名必须 ⊆ class_map.json（make config-check 校验，worker 启动 fail-closed）。2026-07-12 审计（docs/agent/notes/process-classes-review-2026-07-12.md，用户采纳）：+operating_data（月度经营数据=预测核心输入）、+financing（募投进度/借款利息）。",
+  "_about": "处理策略（级联层2，design/classification-facets-and-derived-views.md v3）。process=下载+解析（一个动作，round20 用户裁决：不存在下载不解析）；register_only=只登记元数据（可见可查，零下载/解析成本）。按公司覆盖=watchlist.csv 的 process_classes 列（替换式，空=继承本文件）。增类=从 register_only 挪到 process，历史已登记文档自动回补下载；删类=挪回，队列即刻静默，已有数据不动。类名必须 ⊆ class_map.json（make config-check 校验，worker 启动 fail-closed）。2026-07-12 审计（docs/implementation/reviews/process-classes-review-2026-07-12.md，用户采纳）：+operating_data（月度经营数据=预测核心输入）、+financing（募投进度/借款利息）。",
   "process": [
     "annual_report",
     "semiannual_report",

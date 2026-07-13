@@ -122,9 +122,10 @@ stale 回收的执行载体定死：run_once 第一步经 queries.py 执行单�
    parse 阶段跳过 `provider_metadata.oversized=true` 的 document（07 §3.9 护栏；
    计入 skipped_oversized 并出现在报告，人工单跑提高 timeout 处理）。
    阶段↔use case 接法定死：parse 阶段对 pending_parse 的每个 document 调 **05 的 process**
-   （parse→build→publish 串行——检查点"含 05 process"即此意）；build/publish 队列只消化
-   process 中断留下的残留，分别调 build_units / publish_run。parse 串行执行，
-   MinerU 吃满单机资源。
+   （单文档内 parse→build→publish 串行——检查点"含 05 process"即此意）；build/publish 队列只消化
+   process 中断留下的残留，分别调 build_units / publish_run。不同文档可按
+   `WORKER_PARSE_CONCURRENCY` 有界并行，默认 1 是安全退化路径；GPU 流控同时受文档并发和
+   MinerU 页窗口约束，详见 `../design/worker-dynamic-scheduling.md`。
    异常隔离粒度按阶段定死：sync=每 tracked_company、download=每候选、
    parse/build/publish=每 document；单项异常记入失败清单（含 stage 与标识）后 continue——
    一个坏项不得打死整个 loop（04R-R4 的异常分型保证 run 已持久化 failed 状态）。
@@ -214,6 +215,22 @@ tests/unit 只测 run_once 的调度/报告聚合（fake 队列结果）与 stab
   （实测 3 份真实文档被记了 raw_missing 失败 run，已外科清理）。共享库只跑视图行级断言。
 - parse_quality 日报聚合 run 内存中的 build_stats（不回读 artifact）。
 
+## 6.6 动态解析链与 GPU 双层流控（2026-07-12 实施后修订）
+
+- Phase 1 已实现 `WORKER_PARSE_CONCURRENCY`：默认 1，settings 硬上限 16；每个文档仍执行
+  parse→build→publish 一条完整链，每个任务使用独立 parser/UoW，主线程折叠报告，已有
+  document lock 与 worker singleton lock 继续兜底。
+- 本地文档并发不能与 provider 下载 QPS 混为一谈；下载仍服从来源端限速与既有批量边界。
+- 事故证据表明，文档并发 8 与 MinerU 页窗口 64 叠加时曾形成约 255 sequences、KV cache
+  97.7% 并触发 CUDA OOM；connection reset 是后果。流控必须同时限制文档并发和页窗口。
+- 当时的运维缓解包括 `MINERU_PROCESSING_WINDOW_SIZE=16`，以及服务重启时评估
+  `--max-num-seqs 128`；这些不是仓库永久默认值，使用前必须按当前 MinerU/vLLM 版本、GPU
+  占用和真实 workload 重新核验。
+- 只有出现阶段空转或服务端排队的实测证据后，才进入常驻流水线或延迟自适应的 Phase 2/3；
+  继续不引入 Celery、Redis、Airflow 等外部调度平台。
+
+完整取证、备选设计与回退条件见 `../design/worker-dynamic-scheduling.md`。
+
 ## 7. 明确不做
 
 - 不引入 Celery / Redis / Airflow / Prefect / Dagster；不建全局 L6 调度脊柱；
@@ -224,4 +241,5 @@ tests/unit 只测 run_once 的调度/报告聚合（fake 队列结果）与 stab
 - worker 重复处理：先查两级锁与 document.status 事务顺序。
 - publish 中断：旧 active run 保持（05 事务保证）；下轮 pending_publish_v1 重入。
 - 长时间卡住：stale_running 回收 + 报告可见；人工 `make doctor-full` 定位。
-- MinerU 内存压力：parse 串行 + 超时（04R-R4）兜底；必要时调小 WORKER_BATCH_PARSE。
+- MinerU 内存压力：先降低 `WORKER_PARSE_CONCURRENCY` 与 `WORKER_BATCH_PARSE`，再收紧 MinerU
+  页窗口；默认并发 1 仍是安全退化路径，外部服务参数按当前环境重新核验。

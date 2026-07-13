@@ -4,7 +4,7 @@ Revision ID: 0021_title_topic_classification
 Revises: 0020_tracked_pool_lifecycle
 Create Date: 2026-07-12
 
-Process-classes audit F3 (docs/agent/notes/process-classes-review-2026-07-12.md):
+Process-classes audit F3 (docs/implementation/reviews/process-classes-review-2026-07-12.md):
 CNINFO files monthly operating data (销售简报/主要经营数据/发电量完成情况) under
 F006V 012305 "经营环境重大变化" and never emits 010309, so the operating_data
 class was dead vocabulary while its documents rode risk_alert. Fix: a new

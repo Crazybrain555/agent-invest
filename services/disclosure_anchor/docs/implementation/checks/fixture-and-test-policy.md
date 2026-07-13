@@ -35,8 +35,9 @@ short_announcement.pdf   短公告，验证少量事项型 text/table
 - synthetic 测试仍然需要保留，用于纯函数/unit 逻辑、边界条件、失败注入、权限错误、不可读文件、hash
   mismatch、无 DB 环境 skip 等难以稳定复现的分支。
 - 当某个 acceptance item 面向真实业务输入时，synthetic 测试只能证明局部机制，不能单独作为完成证明。
-- 如果本地没有合适真实样本，或真实样本验证需要外部网络/凭据/长耗时资源，必须在 `Status.md` 或
-  `Plan.md` 的 validation 记录中写明例外原因、替代验证和后续补齐条件。
+- 如果本地没有合适真实样本，或验证依赖外部网络、凭据或长耗时资源，必须在当前 Task 的最终交接中
+  写明例外原因、替代验证和补齐条件；若例外会跨 Task 持续或改变产品验收状态，同时更新相关
+  tracked milestone、checklist 或 review。
 - 真实样本 smoke/integration 测试应使用临时 data/runtime root、随机 provider_document_id 或可清理测试
   database 记录，避免污染持久样本库和生产式 raw archive。
 

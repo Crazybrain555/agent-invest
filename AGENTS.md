@@ -24,12 +24,10 @@ docs/archive/pre-restart/     frozen Quant_agent-era evidence; never current pol
 (planned) services/upload_service/   independent L1 human-upload service
 ```
 
-Codex loads applicable project instructions from the repository root toward the working directory. Nearer
-files add or narrow subtree rules and take precedence only when the same subject conflicts; they do not erase
-unrelated parent rules. `docs/archive/pre-restart/` remains frozen even if it contains old instruction files.
-
-Root and per-service `docs/agent/` directories are gitignored machine-local task state. A cross-repo task has
-one state owner at root; a service-scoped task uses that service's state. Do not maintain competing active plans.
+Codex loads applicable `AGENTS.md` files from the repository root toward the working directory. Nearer files
+add or narrow subtree rules and take precedence only when the same subject conflicts; they do not erase
+unrelated parent rules. `AGENTS.md` is Codex project guidance; Claude-specific workflow lives in `CLAUDE.md`.
+`docs/archive/pre-restart/` remains frozen even if it contains old instruction files.
 
 ## 2. Cross-service invariants
 
@@ -49,14 +47,35 @@ one state owner at root; a service-scoped task uses that service's state. Do not
 7. **Service ownership:** migrations write only the owning component's schemas/roles. Shared-package changes and
    public-contract changes update all affected consumers, exports, tests, and docs together.
 
-## 3. Planning and research
+## 3. Work selection, research, and handoff
 
 - Default to bounded, in-scope work. Read-only requests authorize inspection/reporting; change/fix requests
-  authorize requested local edits and non-destructive validation. Ask before destructive, external, costly, or
-  materially scope-expanding actions.
-- Use durable task files for cross-session work, architecture/public contracts/migrations, high-risk operations,
-  material unknowns, an explicit user request, or continuation of an active durable task. File count and routine
-  state/doc maintenance are not sufficient triggers.
+  authorize requested local edits and non-destructive validation. Ask before destructive, external, costly,
+  credential/permission, commit/push, or materially scope-expanding actions.
+- A gitignored `docs/agent/HANDOFF.md` is mandatory when work is expected to cross sessions; changes
+  architecture, a public contract, migration/data boundary, or high-risk operations; has material unknowns;
+  is explicitly requested as durable; resumes an existing durable task; or pauses awaiting a user decision.
+  Create it before the first task mutation, or before yielding when a bounded task first meets a trigger.
+- In every new session, before the first repository mutation, inspect the root and nearest component
+  `docs/agent/HANDOFF.md` when present and announce its task/state/writer once. Any unresolved handoff—
+  `active`, `monitoring`, `waiting_user`, `paused`, or `blocked`—keeps its gate and writer ownership; stay
+  read-only until it is explicitly handed off, closed/completed, or isolated in a different worktree. Never
+  infer ownership from recency, and replace/delete a handoff only after an explicit closed/completed transition.
+- Cross-repo work uses root `docs/agent/HANDOFF.md`; component work uses the nearest component handoff.
+  One worktree has at most one active task and one owning writer. Different modifying tasks use different
+  worktrees. Reviewers and helper agents are read-only. Shared PostgreSQL, AgentSSD, worker, and launchd state
+  still has one runtime owner.
+- A handoff is local to its checkout/worktree and is not copied through Git or `.worktreeinclude`. A receiving
+  session must resume in that checkout or perform an explicit handoff. Before archiving/deleting a task or
+  worktree, close it or transfer every unresolved user gate and external-state obligation.
+- Keep `HANDOFF.md` under 80 lines and record only: task key/title, scope, state, authority, user intent and
+  acceptance, authorization boundary, next action, blockers, worktree/branch/base, changed paths, latest
+  current-session validation/review, runtime owner, writer, and updated time. Long-lived facts belong in
+  tracked contracts/docs; secrets, chat transcripts, duplicated repo facts, and volatile ops snapshots do not.
+  This handoff protocol is mirrored in the "Durable handoff" section of root `CLAUDE.md`; edit both together.
+- Legacy `Prompt.md`, `Plan.md`, `Status.md`, `Documentation.md`, `Implement.md`, `code_review.md`, `archive/`,
+  and `notes/` are migration/history evidence only: read on demand; never update, rotate, recreate, or use as
+  current authority. Do not delete ignored legacy state without the user's explicit approval.
 - Before selecting a materially new architecture, cross-service contract, dependency, provider framework, or
   ops mechanism, compare 2–4 relevant implementations. Prefer official vendor docs for vendor/model behavior.
   Approved-plan execution, localized fixes, factual corrections, and state synchronization are exempt.
@@ -79,8 +98,8 @@ one state owner at root; a service-scoped task uses that service's state. Do not
 
 1. Confirm scope against protocol v0.8, the L1 v0.5 plan when relevant, and the user's current priorities.
 2. Create `services/<name>/` or `packages/<name>/` with a short local `AGENTS.md`, `Makefile` containing
-   `agent-check`, `pyproject.toml`, `.gitignore`, and gitignored `docs/agent/` only when durable local state is
-   actually needed. Tool-specific adapters are maintained separately from this shared policy.
+   `agent-check`, `pyproject.toml`, `.gitignore`, and gitignored `docs/agent/HANDOFF.md` only when a task meets
+   the §3 triggers. Tool-specific adapters are maintained separately from this shared policy.
 3. Add the component to the root Makefile delegation list and update the layout table above.
 4. Give DB-backed services their own schemas and roles in `invest_engine`; expose versioned public views and
    forbid private cross-service reads.

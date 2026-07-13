@@ -1,4 +1,4 @@
-# Root-level safety net; each service carries its own .gitignore with the full set.
+# Root-level safety net; agent handoff is worktree-local and legacy task state stays untracked.
 /docs/agent/
 /docs/reference/api resource/
 .DS_Store

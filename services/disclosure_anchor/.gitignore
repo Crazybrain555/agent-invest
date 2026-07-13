@@ -170,7 +170,7 @@ desktop.ini
 .codex/config.toml
 dbhub.toml
 
-# Codex/agent working state (local, session-specific)
+# Agent handoff state (worktree-local) and read-only legacy task evidence
 docs/agent/
 
 

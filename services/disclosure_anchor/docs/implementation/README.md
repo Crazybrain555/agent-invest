@@ -19,6 +19,11 @@ docs/implementation/
   002-implementation-roadmap.md
   003-agent-execution-rules.md
   disclosure_anchor_phase000_004_final_merged_review.md   # phase000–004 审查意见（历史记录）
+  design/
+    classification-facets-and-derived-views.md
+    retrieval-and-semantic-keys.md
+    watchlist-operations.md
+    worker-dynamic-scheduling.md
   milestones/
     00-local-environment-and-parser-validation.md
     01-code-skeleton-and-config.md
@@ -30,6 +35,7 @@ docs/implementation/
     06-filing-api-public-contracts.md
     07-cninfo-sync.md
     08-worker-loop-and-ops.md
+    09-production-readiness.md
   checks/
     acceptance-matrix.md
     doctor-checklist.md
@@ -37,13 +43,15 @@ docs/implementation/
     fixture-and-test-policy.md
   reviews/
     phase008-db-comprehensive-audit-round3.md
+    process-classes-review-2026-07-12.md
   runbooks/
     phase00-environment-and-parser-validation.md
     com.agentinvest.disclosure-anchor.worker-once.plist
 ```
 
 里程碑 00–08（含 04R）均已实施完成（frontmatter status 与 `checks/acceptance-matrix.md` 为准）；
-06R（检索投影派生层）为规划中里程碑，规格文档尚未编写。
+09 为生产就绪持续整改，状态为 in-progress；06R（检索投影派生层）为规划中里程碑，规格文档
+尚未编写。
 
 `milestones/` 讲每阶段"做什么/为什么/验收口径"；`runbooks/` 讲"具体敲什么命令、产物落哪、每步怎么自检"，照着跑即可。
 

@@ -2028,7 +2028,9 @@ disclosure_ops      outbox_event 与迁移记录
 
 # 19. 实施顺序
 
-不按工时拆分，按可运行纵向闭环推进。本节是目标蓝图，不反映当前进度；进度与 Stage↔Phase 对应关系以 `docs/agent/Status.md` / `Plan.md` 为准。
+不按工时拆分，按可运行纵向闭环推进。本节是目标蓝图，不反映当前进度；当前已实现范围以仓库事实、
+migration head、`docs/implementation/milestones/` 的 frontmatter 与
+`docs/implementation/checks/acceptance-matrix.md` 为准，会话级进度不构成架构权威。
 
 ## Stage 1：工程骨架与持久化
 

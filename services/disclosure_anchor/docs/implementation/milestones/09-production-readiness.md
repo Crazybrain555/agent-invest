@@ -32,6 +32,9 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
 - [x] **[major]** tracked_company.sync_frequency never honored, and the global due-predicate's  → sync_due 谓词按 hourly/daily/weekly 词表逐行生效 + updated_at 时间戳比较（修双倍周期 bug）
 - [x] **[major]** PENDING_LEGAL_NAME placeholder companies poison the first credentialed sync — bl → resolver 占位名就地升级，真名冲突仍 contested（回归测试）
 - [x] **[minor]** Live CNINFO credentials sit in the working-tree .env under a header claiming it  → 同上（凭据迁出+轮换提示）
+- [x] **[acceptance follow-up]** 2026-07-08 clean-DB P0/P1 → `781e7ec` 为 launchd 日志增加
+  TCC 失败时的用户日志目录回退，并让 `purge-company` 清除按 scode/security_code 关联的 unlinked
+  CNINFO profile `source_access`；旧本地 acceptance report 不再是当前 No-Go 权威。
 
 ## 设计评审文档（2026-07-07 round8 后，先设计后实施）
 
@@ -42,6 +45,18 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
 
 ## 待办背账（按严重度）
 
+### 2026-07-13 数据质量与可观测性后续（从本地任务状态提升）
+
+- [ ] **register_local_pdf 身份防污染**：对 provider-specific document ID 做 preflight；
+  `provider=cninfo` 时只接受数字 TEXTID，其他本地导入必须使用显式 manual namespace，禁止把目录描述
+  当作去重键。验收：非法 ID 在归档/写库前失败；合法本地导入在 scratch DB 回归，绝不触碰 live corpus。
+- [ ] **S 规则单元噪声升版**：治理纯勾选空壳、参会花名册、尾表夹带 Q&A 和题号跨页错位，
+  不得按长度一刀切。验收：使用真实 annual/IR 样本，保留财务数字与有效否定；先把尾表夹带正文
+  抽回再删模板；builder rules 版本化并验证 rebuild/change 语义。
+- [ ] **N009002 快照标签裁决**：明确“对重组的核查意见/问询函”在注册期 snapshot label 的
+  carrier/content 语义；证明不改变 0021 视图 topics 与 processing gate，或同步规则、契约和测试。
+- [ ] **processing-policy 回滚可观测性**：doctor/worker report 统计“已下载但按当前 policy
+  不再 eligible 且仍为 registered”的文档，显示 policy/rule 版本与数量；不得自动清理。
 
 ### MAJOR
 
@@ -150,8 +165,9 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
   - 修法：Either patch the frontmatter/payload-kind mentions to include mixed with a pointer to service-purpose §6.5, or stamp both docs with a "superseded on payload kinds by service-purpose v1.2" banner.
 - [ ] (S/DOCS/CONTRACT DRIFT) **Acceptance rows A38-A40 and the canonical doc cite milestone "06R", but no 06R milestone document ex**
   - 修法：Create a stub 06R milestone doc (scope = 05-U7 projection + A38-A40) or re-point the references to a "planned, unscheduled" note in the roadmap; update implementation README's file inventory (reviews/, plist) at the same time.
-- [ ] (S/DOCS/CONTRACT DRIFT) **Durable docs disagree on the active task: Prompt.md still specifies milestone 07 as the current dura**
-  - 修法：Rewrite Prompt.md for the actual open durable item (milestone 08 final-review handoff), and fold its freeze wording into the unified migration-freeze policy.
+- [x] (S/DOCS/CONTRACT DRIFT) **Legacy durable docs disagreed on the active task.**
+  - 处置：2026-07-13 退役本地 Prompt/Plan/Status 多文件栈；长期事实提升到 tracked
+    milestone/review，会话级交接改用条件触发的单一 HANDOFF。该历史 finding 不再要求重写 Prompt.md。
 - [ ] (S/FAILURE PATHS AND RESILIENCE) **Web/API channel state divergence: shared checkpoint scope and cross-channel candidate override**
   - 修法：Record the channel in the checkpoint cursor (or use channel-scoped scope_keys), and prefer the API-channel candidate when both channels have snapshotted the same announcement.
 - [ ] (S/FAILURE PATHS AND RESILIENCE) **Stale reclaim can fail a legitimately running manual parse; no validation that stale threshold excee**

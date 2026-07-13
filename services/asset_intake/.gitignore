@@ -41,5 +41,5 @@ logs/
 .mcp.json
 .codex/config.toml
 
-# Agent working state (machine-local, session-specific)
+# Agent handoff state (worktree-local) and read-only legacy task evidence
 docs/agent/
