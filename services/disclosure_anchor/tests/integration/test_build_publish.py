@@ -192,7 +192,7 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                     security_id=security_id,
                     company_id=company_id,
                     security_code="T05" + provider_document_id[-6:],
-                    exchange="SZSE",
+                    exchange="LOCAL",
                 )
             )
             uow.documents.add(
@@ -241,7 +241,7 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                     security_id=security_id,
                     company_id=company_id,
                     security_code="T05" + provider_document_id[-6:],
-                    exchange="SZSE",
+                    exchange="LOCAL",
                 )
             )
             uow.documents.add(

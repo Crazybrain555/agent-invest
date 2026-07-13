@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -16,6 +15,8 @@ from sqlalchemy.engine import Engine
 
 from disclosure_anchor.adapters.db.postgres.connection import create_db_engine
 from disclosure_anchor.adapters.db.postgres.connection import uses_reader_database_url_fallback
+from disclosure_anchor.adapters.db.postgres.catalog import view_names
+from disclosure_anchor.adapters.db.postgres.migration_state import single_migration_head
 from disclosure_anchor.adapters.db.postgres.schema import (
     ALEMBIC_VERSION_TABLE,
     ALEMBIC_VERSION_TABLE_SCHEMA,
@@ -38,6 +39,13 @@ from disclosure_anchor.settings import Settings
 PASS = "PASS"
 WARN = "WARN"
 FAIL = "FAIL"
+_PYTHON_STRIP_CHARS_SQL = (
+    r"U&'\0009\000A\000B\000C\000D\001C\001D\001E\001F"
+    r"\0020\0085\00A0\1680\2000\2001\2002\2003\2004\2005"
+    r"\2006\2007\2008\2009\200A\2028\2029\202F\205F\3000'"
+)
+_CANONICAL_CODE_SQL = f"btrim(security_code, {_PYTHON_STRIP_CHARS_SQL})"
+_CANONICAL_EXCHANGE_SQL = f"upper(btrim(exchange, {_PYTHON_STRIP_CHARS_SQL}))"
 
 
 @dataclass(frozen=True)
@@ -221,6 +229,7 @@ def run_doctor(
     try:
         checks.extend(_database_ping_and_migration_checks(engine))
         checks.extend(_database_catalog_checks(engine))
+        checks.extend(_classification_coverage_checks(engine))
         checks.extend(_database_consistency_checks(settings, engine))
         checks.extend(run_raw_archive_checks(settings, engine, full=full, sample_size=sample_size))
         checks.extend(_processing_run_checks(settings, engine))
@@ -231,39 +240,6 @@ def run_doctor(
     finally:
         engine.dispose()
     return DoctorReport(results=tuple(checks))
-
-
-def _migration_head_revision() -> str:
-    versions_dir = (
-        Path(__file__).resolve().parents[1]
-        / "db"
-        / "postgres"
-        / "migrations"
-        / "versions"
-    )
-    revision_re = re.compile(r"^revision(?:\s*:\s*[^=]+)?\s*=\s*[\"']([^\"']+)[\"']")
-    down_re = re.compile(r"^down_revision(?:\s*:\s*[^=]+)?\s*=\s*(.+)$")
-    revisions: set[str] = set()
-    down_revisions: set[str] = set()
-    for path in versions_dir.glob("*.py"):
-        revision: str | None = None
-        down_revision: str | None = None
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if revision is None and (match := revision_re.match(line.strip())):
-                revision = match.group(1)
-            elif down_revision is None and (match := down_re.match(line.strip())):
-                raw_value = match.group(1).strip().strip("\"'")
-                down_revision = raw_value if raw_value != "None" else None
-            if revision is not None and down_revision is not None:
-                break
-        if revision is not None:
-            revisions.add(revision)
-        if down_revision is not None:
-            down_revisions.add(down_revision)
-    heads = revisions - down_revisions
-    if len(heads) != 1:
-        raise RuntimeError(f"expected exactly one migration head, got {sorted(heads)}")
-    return next(iter(heads))
 
 
 def _database_ping_and_migration_checks(engine: Engine) -> list[CheckResult]:
@@ -285,7 +261,7 @@ def _database_ping_and_migration_checks(engine: Engine) -> list[CheckResult]:
                 f"{ALEMBIC_VERSION_TABLE}"
             )
         ).scalar_one_or_none()
-    expected_revision = _migration_head_revision()
+    expected_revision = single_migration_head()
     if current_revision == expected_revision:
         checks.append(_pass("migration head", str(current_revision)))
     else:
@@ -344,6 +320,106 @@ def _classification_rules_check(engine: Engine) -> CheckResult:
     )
 
 
+def _classification_coverage_checks(engine: Engine) -> list[CheckResult]:
+    """Audit candidate-boundary F006V gaps and persisted override integrity."""
+
+    from disclosure_anchor.adapters.sources.cninfo.classification_coverage import (
+        unmapped_code_counts,
+    )
+    from disclosure_anchor.adapters.sources.cninfo.mapper import (
+        load_class_map,
+        load_facet_map,
+    )
+    from disclosure_anchor.application.worker.queries import candidate_code_counts
+
+    class_map = load_class_map()
+    class_prefixes = [
+        str(prefix)
+        for spec in class_map["classes"].values()
+        for prefix in spec["prefixes"]
+    ]
+    facet_prefixes = [
+        str(prefix)
+        for rule in load_facet_map()["rules"]
+        for prefix in rule["prefixes"]
+    ]
+    known_classes = set(class_map["classes"])
+    with engine.connect() as conn:
+        counts = candidate_code_counts(conn)
+        gaps = unmapped_code_counts(
+            counts,
+            class_prefixes=class_prefixes,
+            facet_prefixes=facet_prefixes,
+        )
+        override_rows = conn.execute(
+            text(
+                f"SELECT tracked_company_id, process_classes "
+                f"FROM {CORE_SCHEMA}.tracked_company "
+                "WHERE process_classes IS NOT NULL"
+            )
+        ).all()
+
+    if gaps:
+        top = ", ".join(
+            f"{code}={count}"
+            for code, count in sorted(
+                gaps.items(), key=lambda item: (-item[1], item[0])
+            )[:10]
+        )
+        coverage = _warn(
+            "candidate F006V coverage",
+            f"unmapped={sum(gaps.values())} candidate-code occurrences; {top}; "
+            "run `scripts/audit_unmapped_codes.py`",
+        )
+    else:
+        coverage = _pass(
+            "candidate F006V coverage",
+            f"{sum(counts.values())} coded candidate segments covered",
+        )
+
+    invalid_overrides = _invalid_process_class_overrides(
+        override_rows, known_classes=known_classes
+    )
+    overrides = (
+        _warn("process_classes overrides", "; ".join(invalid_overrides[:10]))
+        if invalid_overrides
+        else _pass(
+            "process_classes overrides",
+            "all non-empty overrides use known class names; [] inherits",
+        )
+    )
+    return [coverage, overrides]
+
+
+def _invalid_process_class_overrides(
+    override_rows: Iterable[object], *, known_classes: set[str]
+) -> list[str]:
+    invalid_overrides: list[str] = []
+    for row in override_rows:
+        tracked_company_id = getattr(row, "tracked_company_id")
+        values = getattr(row, "process_classes")
+        if not isinstance(values, list):
+            invalid_overrides.append(f"{tracked_company_id}:non-array")
+            continue
+        invalid_shapes = sorted(
+            type(value).__name__ for value in values if not isinstance(value, str)
+        )
+        unknown = sorted(
+            value
+            for value in values
+            if isinstance(value, str) and value not in known_classes
+        )
+        if invalid_shapes:
+            invalid_overrides.append(
+                f"{tracked_company_id}:non-string={','.join(invalid_shapes)}"
+            )
+        if unknown:
+            invalid_overrides.append(
+                f"{tracked_company_id}:unknown={','.join(unknown)}"
+            )
+    return invalid_overrides
+
+
 def _database_catalog_checks(engine: Engine) -> list[CheckResult]:
     checks: list[CheckResult] = []
     with engine.connect() as conn:
@@ -369,28 +445,52 @@ def _database_catalog_checks(engine: Engine) -> list[CheckResult]:
             else _fail("role presence", f"missing: {sorted(missing_roles)}")
         )
 
+        actual_public_views = set(view_names(conn, schema=PUBLIC_SCHEMA))
+        expected_public_views = set(PUBLIC_VIEWS)
+        missing_views = expected_public_views - actual_public_views
+        unexpected_views = actual_public_views - expected_public_views
+        checks.append(
+            _pass(
+                "public view catalog",
+                ", ".join(sorted(actual_public_views)),
+            )
+            if not missing_views and not unexpected_views
+            else _fail(
+                "public view catalog",
+                f"missing={sorted(missing_views)} unexpected={sorted(unexpected_views)}",
+            )
+        )
+
         permission_failures: list[str] = []
-        for schema in (CORE_SCHEMA, OPS_SCHEMA, PUBLIC_SCHEMA):
-            if not conn.execute(
-                text("SELECT has_schema_privilege(:role, :schema, 'USAGE')"),
-                {"role": APP_ROLE, "schema": schema},
-            ).scalar_one():
-                permission_failures.append(f"{APP_ROLE}:{schema}:USAGE")
-        for role in READ_ONLY_PUBLIC_ROLES:
+        if APP_ROLE in roles:
+            for schema in (CORE_SCHEMA, OPS_SCHEMA, PUBLIC_SCHEMA):
+                if not conn.execute(
+                    text("SELECT has_schema_privilege(:role, :schema, 'USAGE')"),
+                    {"role": APP_ROLE, "schema": schema},
+                ).scalar_one():
+                    permission_failures.append(f"{APP_ROLE}:{schema}:USAGE")
+        for role in (candidate for candidate in READ_ONLY_PUBLIC_ROLES if candidate in roles):
             if not conn.execute(
                 text("SELECT has_schema_privilege(:role, :schema, 'USAGE')"),
                 {"role": role, "schema": PUBLIC_SCHEMA},
             ).scalar_one():
                 permission_failures.append(f"{role}:{PUBLIC_SCHEMA}:USAGE")
-        for view_name in PUBLIC_VIEWS:
-            if not conn.execute(
-                text("SELECT has_table_privilege(:role, :rel, 'SELECT')"),
-                {
-                    "role": APP_ROLE,
-                    "rel": f"{PUBLIC_SCHEMA}.{view_name}",
-                },
-            ).scalar_one():
-                permission_failures.append(f"{APP_ROLE}:{PUBLIC_SCHEMA}.{view_name}:SELECT")
+        for role in (
+            candidate
+            for candidate in (APP_ROLE, *READ_ONLY_PUBLIC_ROLES)
+            if candidate in roles
+        ):
+            for view_name in actual_public_views:
+                if not conn.execute(
+                    text("SELECT has_table_privilege(:role, :rel, 'SELECT')"),
+                    {
+                        "role": role,
+                        "rel": f"{PUBLIC_SCHEMA}.{view_name}",
+                    },
+                ).scalar_one():
+                    permission_failures.append(
+                        f"{role}:{PUBLIC_SCHEMA}.{view_name}:SELECT"
+                    )
         checks.append(
             _pass("role permissions", "schema usage and public view select ok")
             if not permission_failures
@@ -412,6 +512,66 @@ def _database_consistency_checks(settings: Settings, engine: Engine) -> list[Che
             _pass("active run uniqueness", "each document has at most one active run")
             if not duplicate_active
             else _fail("active run uniqueness", f"duplicates={len(duplicate_active)}")
+        )
+
+        duplicate_security_keys = conn.execute(
+            text(
+                f"SELECT {_CANONICAL_CODE_SQL}, {_CANONICAL_EXCHANGE_SQL}, count(*) "
+                f"FROM {CORE_SCHEMA}.security "
+                f"GROUP BY {_CANONICAL_CODE_SQL}, {_CANONICAL_EXCHANGE_SQL} "
+                "HAVING count(*) > 1"
+            )
+        ).all()
+        identity_shape = conn.execute(
+            text(
+                f"SELECT count(*) FILTER (WHERE security_code <> {_CANONICAL_CODE_SQL} "
+                f"OR exchange <> {_CANONICAL_EXCHANGE_SQL}) AS noncanonical, "
+                "count(*) FILTER (WHERE exchange IN ('SSE','SZSE','BSE') AND NOT ("
+                "security_code ~ '^[0-9]{6}$' AND CASE "
+                "WHEN security_code LIKE '92%' OR security_code LIKE '4%' "
+                "  OR security_code LIKE '8%' THEN exchange = 'BSE' "
+                "WHEN security_code LIKE '6%' OR security_code LIKE '9%' "
+                "  THEN exchange = 'SSE' "
+                "WHEN security_code LIKE '0%' OR security_code LIKE '2%' "
+                "  OR security_code LIKE '3%' THEN exchange = 'SZSE' "
+                "ELSE false END)) AS mainland_mismatch "
+                f"FROM {CORE_SCHEMA}.security"
+            )
+        ).mappings().one()
+        identity_problem = bool(
+            duplicate_security_keys
+            or identity_shape["noncanonical"]
+            or identity_shape["mainland_mismatch"]
+        )
+        checks.append(
+            _pass(
+                "canonical security identity",
+                "no aliases, normalized duplicates, or mainland exchange mismatches",
+            )
+            if not identity_problem
+            else _fail(
+                "canonical security identity",
+                f"normalized duplicates={len(duplicate_security_keys)}; "
+                f"noncanonical={identity_shape['noncanonical']}; "
+                f"mainland_mismatch={identity_shape['mainland_mismatch']}",
+            )
+        )
+
+        contested_identifiers = int(
+            conn.execute(
+                text(
+                    f"SELECT count(*) FROM {CORE_SCHEMA}.company_identifier "
+                    "WHERE status = 'contested'"
+                )
+            ).scalar_one()
+        )
+        checks.append(
+            _pass("contested company identifiers", "none")
+            if contested_identifiers == 0
+            else _warn(
+                "contested company identifiers",
+                f"count={contested_identifiers}; resolve before bulk intake",
+            )
         )
 
         seq_stats = conn.execute(
@@ -447,6 +607,62 @@ def _database_consistency_checks(settings: Settings, engine: Engine) -> list[Che
             _pass("stale running runs", "none")
             if not stale_rows
             else _warn("stale running runs", f"count={len(stale_rows)}")
+        )
+
+        empty_publish = int(
+            conn.execute(
+                text(
+                    f"SELECT count(DISTINCT q.document_id) "
+                    f"FROM {OPS_SCHEMA}.pending_publish_v1 q "
+                    f"WHERE NOT EXISTS (SELECT 1 FROM {CORE_SCHEMA}.document_unit u "
+                    "WHERE u.processing_run_id = q.processing_run_id)"
+                )
+            ).scalar_one()
+        )
+        checks.append(
+            _pass("empty publish dead letters", "none")
+            if empty_publish == 0
+            else _warn(
+                "empty publish dead letters",
+                f"count={empty_publish}; automatic publish excludes them; "
+                "review before using --allow-empty",
+            )
+        )
+
+        oversized = int(
+            conn.execute(
+                text(
+                    f"SELECT count(*) FROM {CORE_SCHEMA}.document "
+                    "WHERE COALESCE((provider_metadata->>'oversized')::boolean, false)"
+                )
+            ).scalar_one()
+        )
+        checks.append(
+            _pass("oversized parse exclusions", "none")
+            if oversized == 0
+            else _warn(
+                "oversized parse exclusions",
+                f"count={oversized}; excluded before parse LIMIT",
+            )
+        )
+
+        exhausted_parse = int(
+            conn.execute(
+                text(
+                    f"SELECT count(*) FROM {OPS_SCHEMA}.pending_parse_v1 "
+                    "WHERE failed_parse_count >= :max_retries "
+                    "OR last_failed_retryable = false"
+                ),
+                {"max_retries": settings.disclosure_max_parse_retries},
+            ).scalar_one()
+        )
+        checks.append(
+            _pass("parse dead letters", "none")
+            if exhausted_parse == 0
+            else _warn(
+                "parse dead letters",
+                f"count={exhausted_parse}; exhausted or non-retryable",
+            )
         )
     return checks
 

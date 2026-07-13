@@ -63,9 +63,10 @@ docs/implementation/                   roadmap, milestones, checks, and operatio
 scripts/                               deterministic maintenance/audit/launchd helpers
 ```
 
-The worker is installed as a user launchd job by `scripts/install_launchd.sh` (at load and every two hours).
-Treat live scheduler/GPU/backlog values as operational evidence that must be re-verified for an ops task, not as
-permanent prompt facts.
+The worker is installed as a resident user launchd job by `scripts/install_launchd.sh` (`KeepAlive` + adaptive
+`worker loop`). Code/config/env or loaded-rule changes require an explicit job restart and doctor check; there is
+no periodic process restart that reloads them. Treat live scheduler/GPU/backlog values as operational evidence
+that must be re-verified for an ops task, not as permanent prompt facts.
 
 ## 4. Validation and independent review
 

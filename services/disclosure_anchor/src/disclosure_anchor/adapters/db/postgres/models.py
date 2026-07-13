@@ -94,10 +94,37 @@ class CompanyIdentifier(Base):
     )
 
 
+_PYTHON_STRIP_CHARS_SQL = (
+    r"U&'\0009\000A\000B\000C\000D\001C\001D\001E\001F"
+    r"\0020\0085\00A0\1680\2000\2001\2002\2003\2004\2005"
+    r"\2006\2007\2008\2009\200A\2028\2029\202F\205F\3000'"
+)
+
+
 class Security(Base):
     __tablename__ = "security"
     __table_args__ = (
         UniqueConstraint("security_code", "exchange", name="uq_security_code_exchange"),
+        CheckConstraint(
+            f"security_code = btrim(security_code, {_PYTHON_STRIP_CHARS_SQL})",
+            name="ck_security_code_canonical",
+        ),
+        CheckConstraint(
+            f"exchange = upper(btrim(exchange, {_PYTHON_STRIP_CHARS_SQL}))",
+            name="ck_security_exchange_canonical",
+        ),
+        CheckConstraint(
+            "exchange NOT IN ('SSE', 'SZSE', 'BSE') OR ("
+            "security_code ~ '^[0-9]{6}$' AND CASE "
+            "WHEN security_code LIKE '92%' OR security_code LIKE '4%' "
+            "  OR security_code LIKE '8%' THEN exchange = 'BSE' "
+            "WHEN security_code LIKE '6%' OR security_code LIKE '9%' "
+            "  THEN exchange = 'SSE' "
+            "WHEN security_code LIKE '0%' OR security_code LIKE '2%' "
+            "  OR security_code LIKE '3%' THEN exchange = 'SZSE' "
+            "ELSE false END)",
+            name="ck_security_mainland_exchange_code",
+        ),
         {"schema": CORE_SCHEMA},
     )
 

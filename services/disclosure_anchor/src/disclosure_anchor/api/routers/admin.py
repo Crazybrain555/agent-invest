@@ -82,7 +82,11 @@ def register_local_pdf(
     request: Request,
     command: RegisterLocalPdfRequest,
 ) -> RegisterLocalPdfResponse:
-    result = _admin_deps(request).register_local_pdf(_register_command(command))
+    try:
+        register_command = _register_command(command)
+    except ValueError as exc:
+        raise validation_error("register", str(exc)) from exc
+    result = _admin_deps(request).register_local_pdf(register_command)
     return _register_response(result)
 
 

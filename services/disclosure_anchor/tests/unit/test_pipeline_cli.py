@@ -62,7 +62,7 @@ class PipelineCliTests(unittest.TestCase):
         self.assertEqual(str(command.report_period), "2025A")
         self.assertEqual(command.company_legal_name, command.title)
 
-    def test_register_command_defaults_provider_document_id_to_hash_fallback(self) -> None:
+    def test_register_command_rejects_filename_without_numeric_textid(self) -> None:
         args = pipeline._parser().parse_args(
             [
                 "register",
@@ -83,9 +83,26 @@ class PipelineCliTests(unittest.TestCase):
             ]
         )
 
-        command = pipeline._register_command(args)
+        with self.assertRaisesRegex(ValueError, "numeric TEXTID"):
+            pipeline._register_command(args)
 
-        self.assertRegex(command.provider_document_id, r"^local-[a-f0-9]{16}$")
+    def test_exchange_inference_covers_b_shares_and_bse(self) -> None:
+        cases = {
+            "600519": "SSE",
+            "900901": "SSE",
+            "000001": "SZSE",
+            "200771": "SZSE",
+            "300750": "SZSE",
+            "920047": "BSE",
+            "430047": "BSE",
+            "830799": "BSE",
+        }
+        for code, expected in cases.items():
+            with self.subTest(code=code):
+                self.assertEqual(pipeline._exchange_for_scode(code), expected)
+
+        with self.assertRaisesRegex(ValueError, "cannot infer exchange"):
+            pipeline._exchange_for_scode("700001")
 
     def test_parse_failed_result_returns_nonzero(self) -> None:
         deps = _deps_type(

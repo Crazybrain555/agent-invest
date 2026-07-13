@@ -11,6 +11,7 @@ from typing import Any
 
 from disclosure_anchor.adapters.db.postgres import models as m
 from disclosure_anchor.domain import entities as e
+from disclosure_anchor.domain.value_objects import canonical_security_identity
 
 
 def company_to_model(entity: e.Company) -> m.Company:
@@ -65,11 +66,14 @@ def company_identifier_to_entity(row: m.CompanyIdentifier) -> e.CompanyIdentifie
 
 
 def security_to_model(entity: e.Security) -> m.Security:
+    security_code, exchange = canonical_security_identity(
+        entity.security_code, entity.exchange
+    )
     return m.Security(
         security_id=entity.security_id,
         company_id=entity.company_id,
-        security_code=entity.security_code,
-        exchange=entity.exchange,
+        security_code=security_code,
+        exchange=exchange,
         board=entity.board,
         status=entity.status,
     )
@@ -155,6 +159,7 @@ def source_checkpoint_to_model(entity: e.SourceCheckpoint) -> m.SourceCheckpoint
         provider=entity.provider,
         scope_key=entity.scope_key,
         cursor=entity.cursor,
+        updated_at=entity.updated_at,
     )
 
 

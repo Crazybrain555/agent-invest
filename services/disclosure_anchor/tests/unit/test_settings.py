@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from pydantic import ValidationError
+
 from disclosure_anchor.settings import Settings, load_settings
 
 
@@ -21,6 +23,35 @@ def _env(root: Path) -> dict[str, str]:
 
 
 class SettingsTests(unittest.TestCase):
+    def test_parallel_parse_requires_remote_http_backend_and_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = _env(Path(tmp))
+            for extra in (
+                {"WORKER_PARSE_CONCURRENCY": "8"},
+                {
+                    "WORKER_PARSE_CONCURRENCY": "8",
+                    "DISCLOSURE_MINERU_BACKEND": "hybrid-http-client",
+                },
+            ):
+                with self.subTest(extra=extra), patch.dict(
+                    os.environ, {**base, **extra}, clear=True
+                ), self.assertRaises(ValidationError):
+                    load_settings()
+
+            with patch.dict(
+                os.environ,
+                {
+                    **base,
+                    "WORKER_PARSE_CONCURRENCY": "8",
+                    "DISCLOSURE_MINERU_BACKEND": "hybrid-http-client",
+                    "DISCLOSURE_MINERU_SERVER_URL": "http://127.0.0.1:30000",
+                },
+                clear=True,
+            ):
+                settings = load_settings()
+
+        self.assertEqual(settings.worker_parse_concurrency, 8)
+
     def test_loads_required_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, _env(Path(tmp)), clear=True):
             settings = load_settings()

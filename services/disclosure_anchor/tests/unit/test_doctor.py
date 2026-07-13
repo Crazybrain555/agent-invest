@@ -2,10 +2,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from disclosure_anchor.adapters.runtime.doctor import (
     _check_unit_snapshot_aggregate,
+    _invalid_process_class_overrides,
     run_doctor,
     run_startup_preflight,
 )
@@ -43,6 +45,25 @@ def _create_roots(root: Path) -> None:
 
 
 class DoctorTests(unittest.TestCase):
+    def test_override_shape_check_handles_nested_json_without_crashing(self) -> None:
+        rows = [
+            SimpleNamespace(
+                tracked_company_id="tc_bad",
+                process_classes=["annual_report", {"bad": True}, ["nested"]],
+            ),
+            SimpleNamespace(
+                tracked_company_id="tc_mixed",
+                process_classes=["annual_report", "not_a_class"],
+            ),
+        ]
+
+        invalid = _invalid_process_class_overrides(
+            rows, known_classes={"annual_report"}
+        )
+
+        self.assertIn("tc_bad:non-string=dict,list", invalid)
+        self.assertIn("tc_mixed:unknown=not_a_class", invalid)
+
     def test_passes_with_sentinel_writable_roots_and_external_caches(self) -> None:
         with without_db_env(), tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

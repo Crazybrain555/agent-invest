@@ -2,12 +2,13 @@
 
 ```text
 schema.py          三 schema（disclosure_core/public/ops）+ 四角色常量（owner/app/reader/l2_reader）
-migrations/        alembic；文件名即 revision（0001…0013）。冻结策略（唯一权威表述）：已应用迁移一律冻结——
-                   0001–0009 冻结；0010–0013 于 2026-07 原地发布、现同样冻结；新改动一律从 0014 起开新迁移。
+migrations/        alembic；冻结策略（唯一权威表述）：所有已应用迁移一律冻结，新改动只开新迁移；
+                   当前 head 必须由 Alembic revision graph 推导，不在测试/doctor 手写 revision 字符串。
                    增量速记：0008=unit builder provenance；0009=sync/download 队列视图（op.execute 内字面冒号要 \: 转义，
                    source_access.error 是 Text 需 ::jsonb cast）；0010=applicability/page_no；0011=payload_kind 'mixed'
                    + is_active_run 视图列；0012=provider 分类维表 + document_categories_v1；0013=semantic_keys + GIN 部分索引；
-                   0021=documents/units 视图分类改并集推导（class 码命中 ∪ title_topic 标题命中；operating_data 归位，列集不变）
+                   0021=documents/units 视图分类改并集推导；0022=证券规范形态 CHECK + coded/无码
+                   标题路由恢复与 title_topic 对齐（public 列集不变）
 models.py          SQLAlchemy 模型 + 与迁移同名的 CheckConstraint（两边必须同名同义）
 repositories.py    仓储实现；unique 冲突翻译成领域错误（DocumentIdentityConflictError 等）
 mappers.py         entity ↔ model 全字段映射（新加列两边都要动）

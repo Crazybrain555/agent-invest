@@ -36,6 +36,7 @@ from disclosure_anchor.adapters.sources.cninfo.client import (
 )
 from disclosure_anchor.adapters.sources.cninfo.mapper import (
     CninfoCompanyProfile,
+    derive_primary_class,
     derive_report_period,
     load_filing_type_rule_bundle,
     map_filing_type,
@@ -59,6 +60,26 @@ SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 class CninfoWebSourceError(SourceRequestError):
     """Raised when the public endpoint fails under retry policy."""
+
+
+def _website_column(exchange: str) -> str:
+    """Map only website channels whose behavior is verified.
+
+    CNINFO's public fallback has separate Shanghai/Shenzhen columns.  Routing
+    every non-SSE exchange to Shenzhen silently returned the wrong universe
+    for BSE codes, so BSE now fails closed and stays on the WebAPI channel.
+    """
+
+    normalized = exchange.strip().upper()
+    if normalized == "SSE":
+        return "sse"
+    if normalized == "SZSE":
+        return "szse"
+    raise CninfoWebSourceError(
+        f"CNINFO website fallback does not support exchange={normalized!r}",
+        error_code="unsupported_exchange",
+        retryable=False,
+    )
 
 
 class CninfoWebSource:
@@ -154,12 +175,13 @@ class CninfoWebSource:
         window: DisclosureWindow,
         page: int,
     ) -> dict[str, Any]:
+        column = _website_column(exchange)
         data = {
             "stock": self._stock_param(security_code),
             "tabName": "fulltext",
             "pageSize": str(PAGE_SIZE),
             "pageNum": str(page),
-            "column": "sse" if exchange == "SSE" else "szse",
+            "column": column,
             "category": "",
             "seDate": f"{window.start.isoformat()}~{window.end.isoformat()}",
             "isHLtitle": "false",
@@ -251,6 +273,7 @@ class CninfoWebSource:
         filing_type = map_filing_type(
             title, category_names_by_code={}, rule_bundle=self._rule_bundle
         )
+        primary_class = derive_primary_class(None, title)
         adjunct_size = record.get("adjunctSize")
         return AnnouncementRef(
             provider="cninfo",
@@ -266,7 +289,7 @@ class CninfoWebSource:
             file_size=adjunct_size if isinstance(adjunct_size, (int, float)) else None,
             index_updated_at=None,
             filing_type=filing_type,
-            report_period=derive_report_period(title, filing_type=filing_type),
+            report_period=derive_report_period(title, filing_type=primary_class),
             object_id=None,
             rec_id=None,
             provider_org_id=(

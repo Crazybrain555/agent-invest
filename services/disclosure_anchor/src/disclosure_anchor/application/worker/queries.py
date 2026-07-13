@@ -20,6 +20,64 @@ from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA, OPS_SCHEM
 SYNC_FREQUENCY_SECONDS = {"hourly": 3600, "daily": 86400, "weekly": 604800}
 
 
+def candidate_code_counts(conn: Connection) -> dict[str, int]:
+    """Count F006V segments in the candidate universe, once per announcement.
+
+    Auditing only ``document`` observes survivors after the processing gate and
+    therefore hides the exact unknown codes that prevented a download.  Source
+    snapshots are append-only and overlap. Select the latest *non-empty-code*
+    observation of each CNINFO provider_document_id (falling back to latest
+    overall) so a newer code-less web fallback cannot mask API F006V evidence.
+    """
+
+    rows = conn.execute(
+        text(
+            f"""
+            WITH candidate_versions AS (
+                SELECT candidate,
+                       row_number() OVER (
+                           PARTITION BY candidate->>'provider_document_id'
+                           ORDER BY
+                                    (NULLIF(btrim(
+                                        candidate->>'raw_category'), '')
+                                        IS NOT NULL) DESC,
+                                    sa.accessed_at DESC,
+                                    sa.source_access_id DESC) AS recency
+                  FROM {CORE_SCHEMA}.source_access sa
+                  CROSS JOIN LATERAL jsonb_array_elements(
+                      CASE
+                          WHEN jsonb_typeof(sa.result_snapshot->'candidates') = 'array'
+                              THEN sa.result_snapshot->'candidates'
+                          ELSE '[]'::jsonb
+                      END) AS candidate
+                 WHERE sa.provider = 'cninfo'
+                   AND sa.provider_interface IN (:api_interface, :web_interface)
+                   AND sa.status = 'ok'
+                   AND jsonb_typeof(sa.result_snapshot->'candidates') = 'array'
+                   AND NULLIF(candidate->>'provider_document_id', '') IS NOT NULL
+            ), segments AS (
+                SELECT candidate->>'provider_document_id' AS provider_document_id,
+                       btrim(segment.code) AS code
+                  FROM candidate_versions
+                  CROSS JOIN LATERAL unnest(string_to_array(
+                      candidate->>'raw_category', '||')) AS segment(code)
+                 WHERE recency = 1
+                   AND NULLIF(btrim(segment.code), '') IS NOT NULL
+            )
+            SELECT code, count(DISTINCT provider_document_id)::int AS candidate_count
+              FROM segments
+             GROUP BY code
+             ORDER BY candidate_count DESC, code
+            """
+        ),
+        {
+            "api_interface": "cninfo:p_info3015",
+            "web_interface": "cninfo:hisAnnouncement",
+        },
+    ).all()
+    return {str(row.code): int(row.candidate_count) for row in rows}
+
+
 def sync_due(
     conn: Connection, *, interval_seconds: int, limit: int
 ) -> list[dict[str, Any]]:
@@ -29,8 +87,12 @@ def sync_due(
     per-company effective interval (sync_frequency vocabulary, else the
     global default) — the old window_end::date comparison truncated both
     sides to dates and stretched a daily cadence to every-other-day.
-    Never-synced companies (no checkpoint) are always due. The tracked row's
-    lookback/process_classes overrides ride along for the caller.
+    Never-synced companies (no checkpoint) are due unless their most recent
+    worker-level sync failure is inside the short per-company retry cooldown.
+    Ordering untouched companies before failed ones prevents a persistent
+    first-page failure set from starving the rest of a large tracked pool.
+    The tracked row's lookback/process_classes overrides ride along for the
+    caller.
     """
 
     rows = conn.execute(
@@ -39,21 +101,34 @@ def sync_due(
             SELECT v.tracked_company_id, v.company_id, v.security_id, v.window_end,
                    s.security_code, s.exchange,
                    tc.lookback, tc.process_classes, tc.sync_frequency,
-                   sc.updated_at AS last_synced_at
+                   sc.updated_at AS last_synced_at,
+                   sync_failure.last_failed_at AS last_sync_failed_at
               FROM {OPS_SCHEMA}.sync_due_v1 v
               LEFT JOIN {CORE_SCHEMA}.security s ON s.security_id = v.security_id
               JOIN {CORE_SCHEMA}.tracked_company tc
                 ON tc.tracked_company_id = v.tracked_company_id
               LEFT JOIN {CORE_SCHEMA}.source_checkpoint sc
                 ON sc.provider = 'cninfo'
-               AND sc.scope_key = v.company_id || '\:p_info3015'
-             WHERE sc.updated_at IS NULL
+               AND sc.scope_key = v.company_id || chr(58) || 'p_info3015'
+              LEFT JOIN LATERAL (
+                   SELECT max(sa.accessed_at) AS last_failed_at
+                     FROM {CORE_SCHEMA}.source_access sa
+                    WHERE sa.provider = 'cninfo'
+                      AND sa.provider_interface = 'cninfo:worker_sync_failure'
+                      AND sa.company_id = v.company_id
+              ) sync_failure ON true
+             WHERE (sc.updated_at IS NULL
                 OR sc.updated_at < now() - make_interval(secs => CASE tc.sync_frequency
                        WHEN 'hourly' THEN 3600
                        WHEN 'daily' THEN 86400
                        WHEN 'weekly' THEN 604800
-                       ELSE :interval END)
-             ORDER BY sc.updated_at NULLS FIRST, v.company_id
+                       ELSE :interval END))
+               AND (sync_failure.last_failed_at IS NULL
+                    OR sync_failure.last_failed_at
+                       <= now() - make_interval(secs => 60))
+             ORDER BY sync_failure.last_failed_at NULLS FIRST,
+                      sc.updated_at NULLS FIRST,
+                      v.company_id
              LIMIT :limit
             """
         ),
@@ -65,11 +140,30 @@ def sync_due(
 # Cascade layer resolution (round21): a tracked company's process_classes
 # REPLACES the global policy for that company; NULL inherits the global
 # tuple. Same expression drives download and parse — one processing surface.
-_EFFECTIVE_CLASSES = (
-    "CASE WHEN jsonb_typeof(tc_scope.process_classes) = 'array' "
-    "THEN ARRAY(SELECT jsonb_array_elements_text(tc_scope.process_classes)) "
-    "ELSE CAST(:scope_classes AS text[]) END"
-)
+_EFFECTIVE_CLASSES = f"""
+    CASE
+      WHEN tc_scope.process_classes IS NULL
+        OR (jsonb_typeof(tc_scope.process_classes) = 'array'
+            AND jsonb_array_length(tc_scope.process_classes) = 0)
+      THEN CAST(:scope_classes AS text[])
+      WHEN jsonb_typeof(tc_scope.process_classes) = 'array'
+        AND NOT EXISTS (
+            SELECT 1
+              FROM jsonb_array_elements(tc_scope.process_classes)
+                   AS override_item(value)
+             WHERE jsonb_typeof(override_item.value) <> 'string'
+                OR NOT EXISTS (
+                    SELECT 1
+                      FROM {CORE_SCHEMA}.classification_rule known_rule
+                     WHERE known_rule.rule_set IN ('class', 'title', 'title_topic')
+                       AND known_rule.value = override_item.value #>> '{{}}'))
+      THEN ARRAY(
+          SELECT override_item.value #>> '{{}}'
+            FROM jsonb_array_elements(tc_scope.process_classes)
+                 AS override_item(value))
+      ELSE ARRAY[]::text[]
+    END
+"""
 
 # Carrier precedence (process-classes audit 2026-07-12): a document whose
 # codes mark it as a procedural carrier (0129 中介机构报告 — 法律意见书/核查
@@ -99,7 +193,7 @@ def _processing_scope_sql(*, category_expr: str, title_expr: str) -> str:
     """
 
     return f"""
-               AND ((CASE WHEN NULLIF({category_expr}, '') IS NOT NULL
+               AND ((CASE WHEN NULLIF(btrim({category_expr}), '') IS NOT NULL
                     THEN EXISTS (
                         SELECT 1
                           FROM unnest(string_to_array(
@@ -107,7 +201,7 @@ def _processing_scope_sql(*, category_expr: str, title_expr: str) -> str:
                                AS seg(code)
                           JOIN {CORE_SCHEMA}.classification_rule cr
                             ON cr.rule_set = 'class'
-                           AND seg.code LIKE cr.prefix || '%'
+                           AND btrim(seg.code) LIKE cr.prefix || '%'
                          WHERE cr.value = ANY({_EFFECTIVE_CLASSES}))
                     ELSE EXISTS (
                         SELECT 1 FROM {CORE_SCHEMA}.classification_rule tr
@@ -119,7 +213,7 @@ def _processing_scope_sql(*, category_expr: str, title_expr: str) -> str:
                          WHERE tt.rule_set = 'title_topic'
                            AND {title_expr} LIKE '%' || tt.prefix || '%'
                            AND tt.value = ANY({_EFFECTIVE_CLASSES})))
-               AND (CASE WHEN NULLIF({category_expr}, '') IS NOT NULL
+               AND (CASE WHEN NULLIF(btrim({category_expr}), '') IS NOT NULL
                     THEN NOT EXISTS (
                         SELECT 1
                           FROM unnest(string_to_array(
@@ -127,7 +221,7 @@ def _processing_scope_sql(*, category_expr: str, title_expr: str) -> str:
                                AS seg(code)
                           JOIN {CORE_SCHEMA}.classification_rule cx
                             ON cx.rule_set = 'class'
-                           AND seg.code LIKE cx.prefix || '%'
+                           AND btrim(seg.code) LIKE cx.prefix || '%'
                          WHERE cx.value = ANY(CAST(:carrier_classes AS text[]))
                            AND NOT cx.value = ANY({_EFFECTIVE_CLASSES}))
                     ELSE NOT EXISTS (
@@ -182,6 +276,67 @@ def pending_download_count(
         params,
     ).scalar()
     return int(row or 0)
+
+
+def pending_parse_backlog_count(
+    conn: Connection,
+    *,
+    scope_classes: tuple[str, ...] | None = None,
+) -> int:
+    """Count downloaded raw documents still awaiting a successful parse.
+
+    This is deliberately broader than :func:`pending_parse`: oversized,
+    non-retryable, and retry-exhausted documents still occupy raw storage and
+    therefore remain part of the backfill admission pressure.  The processing
+    predicate is retained so metadata-only/noise documents do not consume the
+    processing watermark.
+    """
+
+    scope_sql = ""
+    params: dict[str, Any] = {}
+    if scope_classes is not None:
+        scope_sql = _processing_scope_sql(
+            category_expr="d.provider_metadata->>'raw_category'",
+            title_expr="d.title",
+        )
+        params["scope_classes"] = list(scope_classes)
+        params["carrier_classes"] = list(CARRIER_CLASSES)
+    row = conn.execute(
+        text(
+            f"""
+            SELECT count(*)
+              FROM {OPS_SCHEMA}.pending_parse_v1 q
+              JOIN {CORE_SCHEMA}.document d ON d.document_id = q.document_id
+              LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
+                ON tc_scope.company_id = d.company_id
+             WHERE true
+               {scope_sql}
+            """
+        ),
+        params,
+    ).scalar()
+    return int(row or 0)
+
+
+def pending_processing_backlog_count(
+    conn: Connection,
+    *,
+    max_retries: int,
+    scope_classes: tuple[str, ...] | None = None,
+) -> int:
+    """Admission watermark across undiscovered raw work and parse backlog.
+
+    Counting only pending downloads lets a healthy downloader turn the whole
+    queue into raw files while the GPU is unavailable.  The sum is stable as
+    downloads move candidates into pending-parse, so first-sync admission can
+    continue only after parsing actually drains work.
+    """
+
+    return pending_download_count(
+        conn,
+        max_retries=max_retries,
+        scope_classes=scope_classes,
+    ) + pending_parse_backlog_count(conn, scope_classes=scope_classes)
 
 
 def pending_downloads(
@@ -297,7 +452,12 @@ def pending_build(
 
 
 def pending_publish(conn: Connection, *, limit: int) -> list[dict[str, Any]]:
-    """Latest publishable run per document (ORDER pinned by 08 §1)."""
+    """Latest non-empty publishable run per document.
+
+    Empty succeeded builds require the explicit ``allow_empty + reason``
+    operator path.  Excluding them here prevents a permanent EMPTY_RUN from
+    consuming one automatic worker slot forever.
+    """
 
     rows = conn.execute(
         text(
@@ -306,6 +466,9 @@ def pending_publish(conn: Connection, *, limit: int) -> list[dict[str, Any]]:
               FROM {OPS_SCHEMA}.pending_publish_v1 q
               JOIN {CORE_SCHEMA}.processing_run r
                 ON r.processing_run_id = q.processing_run_id
+             WHERE EXISTS (
+                   SELECT 1 FROM {CORE_SCHEMA}.document_unit u
+                    WHERE u.processing_run_id = q.processing_run_id)
              ORDER BY q.document_id, r.started_at DESC, q.processing_run_id DESC
              LIMIT :limit
             """

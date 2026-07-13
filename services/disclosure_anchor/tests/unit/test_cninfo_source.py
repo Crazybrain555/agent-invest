@@ -16,6 +16,7 @@ from disclosure_anchor.application.ports.disclosure_source import (
     DisclosureWindow,
     SourceSecurity,
 )
+from disclosure_anchor.domain.errors import SourceRequestError
 
 
 ACCESS_TOKEN = "unit-access-token"
@@ -85,6 +86,8 @@ class CninfoSourceTests(unittest.TestCase):
                     200,
                     json={
                         "resultcode": 200,
+                        "total": 2,
+                        "count": 2,
                         "records": [
                             _record(textid, "贵州茅台：2025年年度报告", "010301"),
                             # Duplicate id across chunks must be absorbed once.
@@ -120,6 +123,8 @@ class CninfoSourceTests(unittest.TestCase):
                     200,
                     json={
                         "resultcode": 200,
+                        "total": 1,
+                        "count": 1,
                         "records": [
                             _record("tid-a", "贵州茅台：2025年年度报告", "010301")
                         ],
@@ -136,6 +141,65 @@ class CninfoSourceTests(unittest.TestCase):
         # 010301 resolves via the shipped fallback snapshot, not live p_info3005.
         self.assertEqual(refs[0].filing_type, "annual_report")
         self.assertEqual(refs[0].report_period, "2025A")
+
+    def test_category_quota_stops_before_index_request(self) -> None:
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            if request.url.path.endswith("/p_info3005"):
+                return httpx.Response(200, json={"resultcode": 407, "records": []})
+            raise AssertionError("index endpoint must not be called after quota")
+
+        source = self._source(handler)
+        with self.assertRaises(SourceRequestError) as caught:
+            source.search_announcements(
+                SourceSecurity(
+                    security_code="600519", exchange="SSE", security_name=None
+                ),
+                DisclosureWindow(date(2026, 6, 29), date(2026, 7, 6)),
+            )
+
+        self.assertEqual(caught.exception.error_code, "quota_exhausted")
+        self.assertEqual(len(calls), 1)
+
+    def test_report_period_uses_topic_aware_priority_class(self) -> None:
+        """Generic/multi-code rows must not persist a contradictory period."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/p_info3005"):
+                return httpx.Response(200, json={"resultcode": 200, "records": []})
+            if request.url.path.endswith("/p_info3015"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "resultcode": 200,
+                        "total": 2,
+                        "count": 2,
+                        "records": [
+                            _record(
+                                "tid-solvency",
+                                "中国人寿偿付能力季度报告摘要（2026年第一季度）",
+                                "01010501||010113||012399",
+                            ),
+                            _record(
+                                "tid-multicode",
+                                "某公司2024年年度报告",
+                                "012111||010301",
+                            ),
+                        ],
+                    },
+                )
+            raise AssertionError(f"unexpected path {request.url.path}")
+
+        refs = self._source(handler).search_announcements(
+            SourceSecurity(security_code="600519", exchange="SSE", security_name=None),
+            DisclosureWindow(date(2026, 6, 29), date(2026, 7, 6)),
+        )
+        by_id = {ref.provider_document_id: ref for ref in refs}
+
+        self.assertIsNone(by_id["tid-solvency"].report_period)
+        self.assertEqual(by_id["tid-multicode"].report_period, "2024A")
 
     def test_intermittent_non_json_index_response_is_retried(self) -> None:
         attempts = {"count": 0}
@@ -154,6 +218,8 @@ class CninfoSourceTests(unittest.TestCase):
                     200,
                     json={
                         "resultcode": 200,
+                        "total": 1,
+                        "count": 1,
                         "records": [
                             _record("tid-b", "贵州茅台：临时公告", "019901")
                         ],
@@ -169,6 +235,66 @@ class CninfoSourceTests(unittest.TestCase):
 
         self.assertEqual(attempts["count"], 2)
         self.assertEqual(len(refs), 1)
+
+    def test_success_envelope_with_non_array_records_fails_closed(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/p_info3005"):
+                return httpx.Response(200, json={"resultcode": 200, "records": []})
+            if request.url.path.endswith("/p_info3015"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "resultcode": 200,
+                        "total": 1,
+                        "count": 1,
+                        "records": {"unexpected": []},
+                    },
+                )
+            raise AssertionError(f"unexpected path {request.url.path}")
+
+        with self.assertRaises(SourceRequestError) as raised:
+            self._source(handler).search_announcements(
+                SourceSecurity(
+                    security_code="600519", exchange="SSE", security_name=None
+                ),
+                DisclosureWindow(date(2026, 6, 29), date(2026, 7, 6)),
+            )
+
+        self.assertEqual(raised.exception.error_code, "invalid_response_shape")
+        self.assertTrue(raised.exception.retryable)
+
+    def test_non_object_record_and_partial_count_fail_closed(self) -> None:
+        payloads = (
+            {
+                "resultcode": 200,
+                "total": 1,
+                "count": 1,
+                "records": ["not-an-object"],
+            },
+            {
+                "resultcode": 200,
+                "total": 2,
+                "count": 1,
+                "records": [_record("tid-partial", "临时公告", "019901")],
+            },
+        )
+        for payload in payloads:
+            def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path.endswith("/p_info3005"):
+                    return httpx.Response(
+                        200, json={"resultcode": 200, "records": []}
+                    )
+                if request.url.path.endswith("/p_info3015"):
+                    return httpx.Response(200, json=payload)
+                raise AssertionError(f"unexpected path {request.url.path}")
+
+            with self.subTest(payload=payload), self.assertRaises(SourceRequestError):
+                self._source(handler).search_announcements(
+                    SourceSecurity(
+                        security_code="600519", exchange="SSE", security_name=None
+                    ),
+                    DisclosureWindow(date(2026, 6, 29), date(2026, 7, 6)),
+                )
 
 
 if __name__ == "__main__":

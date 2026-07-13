@@ -152,10 +152,10 @@ stale 回收的执行载体定死：run_once 第一步经 queries.py 执行单�
    WARN = stale running run 存在 / 孤儿 raw、artifact 文件 / outbox seq 有空洞 /
    failed run 的 error 非合法 JSON。
    退出码：有 FAIL→1，仅 WARN→0。
-7. launchd plist 示例定死：`docs/implementation/runbooks/
-   com.agentinvest.disclosure-anchor.worker-once.plist`（Label 同文件名去 .plist，
-   ProgramArguments 调 make worker-once，StartCalendarInterval 每日 07:30；默认不启用），
-   符合协议 §15"定时批处理、人工拉起"。
+7. 当时的 launchd 示例是 `docs/implementation/runbooks/
+   com.agentinvest.disclosure-anchor.worker-once.plist`（每日 07:30、默认不启用）。该样例现为
+   **历史证据，不得安装**；2026-07-13 起由 `scripts/install_launchd.sh` 安装 KeepAlive resident
+   loop，当前语义以 `design/worker-dynamic-scheduling.md` 为准，`worker-once` 仅供人工诊断。
 
 ## 4. 检查点
 

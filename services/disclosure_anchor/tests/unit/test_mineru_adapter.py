@@ -1,13 +1,16 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from disclosure_anchor.adapters.parsers.mineru.artifact_reader import MinerUArtifactReader
 from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
     MinerUParserInfo,
     MinerUToNormalizedIRMapper,
 )
+from disclosure_anchor.adapters.parsers.mineru import mineru_process
 from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
 from disclosure_anchor.application.ports.parser import ParserOptions
@@ -49,6 +52,38 @@ class MinerUProcessTests(unittest.TestCase):
         self.assertIn("vlm-http-client", command)
         url_index = command.index("-u")
         self.assertEqual(command[url_index + 1], "http://192.168.1.50:30000")
+
+    def test_shutdown_kills_every_registered_process_group(self) -> None:
+        process = mock.MagicMock(pid=43210)
+        process.poll.return_value = None
+        mineru_process._register_process(process)
+        try:
+            with mock.patch.object(mineru_process.os, "killpg") as killpg:
+                terminated = mineru_process.terminate_active_mineru_processes()
+        finally:
+            mineru_process._unregister_process(process)
+
+        self.assertEqual(terminated, 1)
+        killpg.assert_called_once_with(43210, mineru_process.signal.SIGKILL)
+
+    def test_version_probe_timeout_kills_registered_process_group(self) -> None:
+        process = mock.MagicMock(pid=54321, returncode=None)
+        process.communicate.side_effect = subprocess.TimeoutExpired(
+            cmd=["mineru", "-v"], timeout=0.01
+        )
+        with (
+            mock.patch.object(mineru_process.subprocess, "Popen", return_value=process),
+            mock.patch.object(mineru_process.os, "killpg") as killpg,
+        ):
+            probe = MinerUProcess(
+                executable=Path("mineru"), version_timeout_seconds=0.01
+            )
+            with self.assertRaises(ParserVersionProbeError):
+                probe.version()
+
+        killpg.assert_called_once_with(54321, mineru_process.signal.SIGKILL)
+        process.wait.assert_called_once_with()
+        self.assertNotIn(process, mineru_process._ACTIVE_PROCESSES)
 
 
 class MinerUArtifactReaderTests(unittest.TestCase):

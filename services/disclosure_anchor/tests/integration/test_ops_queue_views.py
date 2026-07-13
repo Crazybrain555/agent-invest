@@ -19,12 +19,21 @@ class OpsQueueViewTests(unittest.TestCase):
         self.suffix = ids.new_ulid().lower()
         self.doc_ids: list[str] = []
         self.run_ids: list[str] = []
+        self.unit_ids: list[str] = []
         self.sa_ids: list[str] = []
         self.company_id: str | None = None
         self.tracked_id: str | None = None
 
     def tearDown(self) -> None:
         with self.engine.begin() as conn:
+            if self.unit_ids:
+                conn.execute(
+                    text(
+                        "DELETE FROM disclosure_core.document_unit "
+                        "WHERE asset_id = ANY(:ids)"
+                    ),
+                    {"ids": self.unit_ids},
+                )
             if self.run_ids:
                 conn.execute(
                     text(
@@ -114,6 +123,25 @@ class OpsQueueViewTests(unittest.TestCase):
         self.run_ids.append(run_id)
         return run_id
 
+    def _insert_unit(self, conn, document_id: str, run_id: str) -> str:
+        unit_id = f"du_qv{self.suffix}{len(self.unit_ids)}"
+        conn.execute(
+            text(
+                "INSERT INTO disclosure_core.document_unit "
+                "(asset_id, document_id, processing_run_id, payload_kind, "
+                " order_index, payload, content_hash) "
+                "VALUES (:id, :doc, :run, 'text', 1, '{}'::jsonb, :hash)"
+            ),
+            {
+                "id": unit_id,
+                "doc": document_id,
+                "run": run_id,
+                "hash": f"sha256:{self.suffix}",
+            },
+        )
+        self.unit_ids.append(unit_id)
+        return unit_id
+
     def test_pending_publish_enqueues_document_without_active_run(self) -> None:
         # Pinned negative #1 inverse: no active run at all → still enqueued.
         with self.engine.begin() as conn:
@@ -121,8 +149,30 @@ class OpsQueueViewTests(unittest.TestCase):
             run_id = self._insert_run(
                 conn, document_id, status="succeeded", unit_build_status="succeeded"
             )
+            self._insert_unit(conn, document_id, run_id)
             rows = queries.pending_publish(conn, limit=1000)
         self.assertIn(run_id, [row["processing_run_id"] for row in rows])
+
+    def test_pending_publish_excludes_real_empty_run_poison(self) -> None:
+        with self.engine.begin() as conn:
+            document_id = self._insert_document(conn, status="parsed")
+            run_id = self._insert_run(
+                conn, document_id, status="succeeded", unit_build_status="succeeded"
+            )
+            raw_rows = conn.execute(
+                text(
+                    "SELECT processing_run_id FROM disclosure_ops.pending_publish_v1 "
+                    "WHERE processing_run_id = :run"
+                ),
+                {"run": run_id},
+            ).scalars()
+            automatic_rows = queries.pending_publish(conn, limit=1000)
+        self.assertIn(run_id, list(raw_rows), "view preserves the dead-letter fact")
+        self.assertNotIn(
+            run_id,
+            [row["processing_run_id"] for row in automatic_rows],
+            "automatic queue must not retry EMPTY_RUN forever",
+        )
 
     def test_pending_parse_helper_excludes_non_retryable_failure(self) -> None:
         # Pinned negative #2: retryable=false excluded by the helper threshold.
@@ -162,6 +212,68 @@ class OpsQueueViewTests(unittest.TestCase):
             helper_rows = queries.pending_parse(conn, max_retries=3, limit=1000)
         self.assertNotIn(document_id, [row["document_id"] for row in helper_rows])
 
+    def test_processing_backlog_counts_download_and_all_raw_parse_work(self) -> None:
+        """GPU outage pressure cannot disappear as downloads become raw files."""
+
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            before = queries.pending_processing_backlog_count(conn, max_retries=3)
+            candidate_id = f"backlog{self.suffix}candidate"
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.source_access "
+                    "(source_access_id, provider, provider_interface, accessed_at, "
+                    " status, result_snapshot) VALUES "
+                    "(:id, 'cninfo', 'cninfo:p_info3015', now(), 'ok', "
+                    " CAST(:snapshot AS jsonb))"
+                ),
+                {
+                    "id": f"sa_qv{self.suffix}backlog",
+                    "snapshot": json.dumps(
+                        {
+                            "candidates": [
+                                {
+                                    "provider_document_id": candidate_id,
+                                    "title": "待下载年度报告",
+                                    "raw_category": "010301",
+                                    "download_url": "http://x/backlog.PDF",
+                                    "announcement_date": "1990-01-01",
+                                }
+                            ]
+                        }
+                    ),
+                },
+            )
+            # Dead-letter and oversized raw files are not parse-eligible, but
+            # they still occupy disk and therefore hold the admission gate.
+            dead = self._insert_document(conn, status="parse_failed")
+            self._insert_run(
+                conn,
+                dead,
+                status="failed",
+                error={"stage": "parse", "error_code": "poison", "retryable": False},
+            )
+            oversized = f"doc_qv{self.suffix}oversized"
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.document "
+                    "(document_id, status, provider, provider_document_id, "
+                    " provider_metadata) VALUES "
+                    "(:id, 'registered', 'cninfo', :pid, "
+                    " '{\"oversized\": true}'::jsonb)"
+                ),
+                {"id": oversized, "pid": f"oversized{self.suffix}"},
+            )
+            self.doc_ids.append(oversized)
+
+            after = queries.pending_processing_backlog_count(conn, max_retries=3)
+        finally:
+            txn.rollback()
+            conn.close()
+
+        self.assertEqual(after - before, 3)
+
     def test_sync_due_includes_company_without_checkpoint(self) -> None:
         with self.engine.begin() as conn:
             self.company_id = f"co_qv{self.suffix}"
@@ -184,6 +296,167 @@ class OpsQueueViewTests(unittest.TestCase):
         match = [row for row in rows if row["company_id"] == self.company_id]
         self.assertEqual(len(match), 1)
         self.assertIsNone(match[0]["window_end"])
+
+    def test_fresh_checkpoint_is_not_due_and_lifecycle_view_exposes_it(self) -> None:
+        company_id = f"co_qv{self.suffix}freshcheckpoint"
+        tracked_id = f"tc_qv{self.suffix}freshcheckpoint"
+        scope_key = f"{company_id}:p_info3015"
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company (company_id, legal_name) "
+                    "VALUES (:company, '新鲜游标公司')"
+                ),
+                {"company": company_id},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.tracked_company "
+                    "(tracked_company_id, company_id, status) "
+                    "VALUES (:tracked, :company, 'active')"
+                ),
+                {"tracked": tracked_id, "company": company_id},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.source_checkpoint "
+                    "(source_checkpoint_id, provider, scope_key, cursor, updated_at) "
+                    "VALUES (:checkpoint, 'cninfo', :scope, "
+                    "'{\"window_end\": \"2026-07-13\"}', now())"
+                ),
+                {"checkpoint": f"cp_qv{self.suffix}", "scope": scope_key},
+            )
+
+            due = queries.sync_due(conn, interval_seconds=86400, limit=1000)
+            lifecycle = conn.execute(
+                text(
+                    "SELECT last_synced_at, synced_through "
+                    "FROM disclosure_public.tracked_companies_v1 "
+                    "WHERE tracked_company_id = :tracked"
+                ),
+                {"tracked": tracked_id},
+            ).mappings().one()
+        finally:
+            txn.rollback()
+            conn.close()
+
+        self.assertNotIn(company_id, [row["company_id"] for row in due])
+        self.assertIsNotNone(lifecycle["last_synced_at"])
+        self.assertEqual(str(lifecycle["synced_through"]), "2026-07-13")
+
+    def test_candidate_code_audit_prefers_older_nonempty_api_over_newer_web_empty(self) -> None:
+        provider_document_id = f"f006{self.suffix}"
+        code = f"UNMAPPED{self.suffix[:8]}"
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            for source_id, interface, accessed_at, raw_category in (
+                (
+                    f"sa_qv{self.suffix}f006api",
+                    "cninfo:p_info3015",
+                    datetime.now(timezone.utc) - timedelta(minutes=1),
+                    code,
+                ),
+                (
+                    f"sa_qv{self.suffix}f006web",
+                    "cninfo:hisAnnouncement",
+                    datetime.now(timezone.utc),
+                    "",
+                ),
+            ):
+                conn.execute(
+                    text(
+                        "INSERT INTO disclosure_core.source_access "
+                        "(source_access_id, provider, provider_interface, accessed_at, "
+                        " status, result_snapshot) VALUES "
+                        "(:id, 'cninfo', :interface, :accessed_at, 'ok', "
+                        " CAST(:snapshot AS jsonb))"
+                    ),
+                    {
+                        "id": source_id,
+                        "interface": interface,
+                        "accessed_at": accessed_at,
+                        "snapshot": json.dumps(
+                            {
+                                "candidates": [
+                                    {
+                                        "provider_document_id": provider_document_id,
+                                        "raw_category": raw_category,
+                                    }
+                                ]
+                            }
+                        ),
+                    },
+                )
+            counts = queries.candidate_code_counts(conn)
+        finally:
+            txn.rollback()
+            conn.close()
+
+        self.assertEqual(counts[code], 1)
+
+    def test_sync_due_failure_cooldown_preserves_first_sync_fairness(self) -> None:
+        failed_company = f"co_qv{self.suffix}000failed"
+        untouched_company = f"co_qv{self.suffix}999fresh"
+        failure_access = f"sa_qv{self.suffix}syncfailure"
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company (company_id, legal_name) VALUES "
+                    "(:failed, '失败公司'), (:fresh, '未尝试公司')"
+                ),
+                {"failed": failed_company, "fresh": untouched_company},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.tracked_company "
+                    "(tracked_company_id, company_id, status) VALUES "
+                    "(:failed_id, :failed, 'active'), "
+                    "(:fresh_id, :fresh, 'active')"
+                ),
+                {
+                    "failed_id": f"tc_qv{self.suffix}failed",
+                    "fresh_id": f"tc_qv{self.suffix}fresh",
+                    "failed": failed_company,
+                    "fresh": untouched_company,
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.source_access "
+                    "(source_access_id, provider, provider_interface, accessed_at, "
+                    " status, company_id) VALUES "
+                    "(:id, 'cninfo', 'cninfo:worker_sync_failure', now(), "
+                    " 'failed', :company)"
+                ),
+                {"id": failure_access, "company": failed_company},
+            )
+            cooled = queries.sync_due(conn, interval_seconds=86400, limit=1000)
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.source_access "
+                    "SET accessed_at = now() - interval '2 minutes' "
+                    "WHERE source_access_id = :id"
+                ),
+                {"id": failure_access},
+            )
+            retriable = queries.sync_due(conn, interval_seconds=86400, limit=1000)
+        finally:
+            txn.rollback()
+            conn.close()
+
+        cooled_ids = [row["company_id"] for row in cooled]
+        retriable_ids = [row["company_id"] for row in retriable]
+        self.assertNotIn(failed_company, cooled_ids)
+        self.assertIn(untouched_company, cooled_ids)
+        self.assertLess(
+            retriable_ids.index(untouched_company),
+            retriable_ids.index(failed_company),
+        )
 
     def test_pending_download_excludes_registered_and_terminal_failures(self) -> None:
         pid_new = f"qvdl{self.suffix}new"
@@ -458,6 +731,195 @@ class OpsQueueViewTests(unittest.TestCase):
             txn.rollback()
             conn.close()
 
+    def test_processing_scope_edge_inputs_and_empty_override_inheritance(self) -> None:
+        """Constructed scale-edge inputs pin the SQL gate's full truth table."""
+
+        ids_by_case = {
+            name: f"qvedge{self.suffix}{index}"
+            for index, name in enumerate(
+                (
+                    "null_title_coded",
+                    "null_title_codeless",
+                    "long_title",
+                    "whitespace_category",
+                    "spaced_multicode",
+                    "unknown_override",
+                    "mixed_override",
+                    "nonarray_override",
+                )
+            )
+        }
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.classification_rule "
+                    "(rule_set, prefix, value, priority, version) VALUES "
+                    "('class', '011301', 'dividend', 68, 'test'), "
+                    "('class', '0131', 'governance_rules', 16, 'test'), "
+                    "('title', '年度报告', 'annual_report', 998, 'test') "
+                    "ON CONFLICT (rule_set, prefix, value) DO NOTHING"
+                )
+            )
+            inherited_company = f"co_qv{self.suffix}empty"
+            unknown_company = f"co_qv{self.suffix}unknown"
+            mixed_company = f"co_qv{self.suffix}mixed"
+            nonarray_company = f"co_qv{self.suffix}shape"
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company (company_id, legal_name) "
+                    "VALUES (:inherit, '空覆盖'), (:unknown, '未知覆盖'), "
+                    "(:mixed, '混合覆盖'), (:nonarray, '异形覆盖')"
+                ),
+                {
+                    "inherit": inherited_company,
+                    "unknown": unknown_company,
+                    "mixed": mixed_company,
+                    "nonarray": nonarray_company,
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.tracked_company "
+                    "(tracked_company_id, company_id, status, process_classes) VALUES "
+                    "(:ti, :inherit, 'active', '[]'::jsonb), "
+                    "(:tu, :unknown, 'active', '[\"not_a_class\"]'::jsonb), "
+                    "(:tm, :mixed, 'active', "
+                    " '[\"dividend\",\"not_a_class\"]'::jsonb), "
+                    "(:tn, :nonarray, 'active', '{\"class\":\"dividend\"}'::jsonb)"
+                ),
+                {
+                    "ti": f"tc_qv{self.suffix}empty",
+                    "tu": f"tc_qv{self.suffix}unknown",
+                    "tm": f"tc_qv{self.suffix}mixed",
+                    "tn": f"tc_qv{self.suffix}shape",
+                    "inherit": inherited_company,
+                    "unknown": unknown_company,
+                    "mixed": mixed_company,
+                    "nonarray": nonarray_company,
+                },
+            )
+            inherited_candidates = [
+                {
+                    "provider_document_id": ids_by_case["null_title_coded"],
+                    "title": None,
+                    "raw_category": "011301",
+                    "download_url": "http://x/e1.PDF",
+                    "announcement_date": "1990-01-01",
+                },
+                {
+                    "provider_document_id": ids_by_case["null_title_codeless"],
+                    "title": None,
+                    "raw_category": "",
+                    "download_url": "http://x/e2.PDF",
+                    "announcement_date": "1990-01-01",
+                },
+                {
+                    "provider_document_id": ids_by_case["long_title"],
+                    "title": "x" * 100_000 + "年度报告",
+                    "download_url": "http://x/e3.PDF",
+                    "announcement_date": "1990-01-01",
+                },
+                {
+                    "provider_document_id": ids_by_case["whitespace_category"],
+                    "title": "2025年年度报告",
+                    "raw_category": "   ",
+                    "download_url": "http://x/e4.PDF",
+                    "announcement_date": "1990-01-01",
+                },
+                {
+                    "provider_document_id": ids_by_case["spaced_multicode"],
+                    "title": "分红公告",
+                    "raw_category": " 013101 || 011301 ",
+                    "download_url": "http://x/e5.PDF",
+                    "announcement_date": "1990-01-01",
+                },
+            ]
+            for source_id, company_id, candidates in (
+                (
+                    f"sa_qv{self.suffix}empty",
+                    inherited_company,
+                    inherited_candidates,
+                ),
+                (
+                    f"sa_qv{self.suffix}unknown",
+                    unknown_company,
+                    [
+                        {
+                            "provider_document_id": ids_by_case["unknown_override"],
+                            "title": "分红公告",
+                            "raw_category": "011301",
+                            "download_url": "http://x/e6.PDF",
+                            "announcement_date": "1990-01-01",
+                        }
+                    ],
+                ),
+                (
+                    f"sa_qv{self.suffix}mixed",
+                    mixed_company,
+                    [
+                        {
+                            "provider_document_id": ids_by_case["mixed_override"],
+                            "title": "分红公告",
+                            "raw_category": "011301",
+                            "download_url": "http://x/e7.PDF",
+                            "announcement_date": "1990-01-01",
+                        }
+                    ],
+                ),
+                (
+                    f"sa_qv{self.suffix}shape",
+                    nonarray_company,
+                    [
+                        {
+                            "provider_document_id": ids_by_case["nonarray_override"],
+                            "title": "分红公告",
+                            "raw_category": "011301",
+                            "download_url": "http://x/e8.PDF",
+                            "announcement_date": "1990-01-01",
+                        }
+                    ],
+                ),
+            ):
+                conn.execute(
+                    text(
+                        "INSERT INTO disclosure_core.source_access "
+                        "(source_access_id, provider, provider_interface, accessed_at, "
+                        " status, result_snapshot, company_id) VALUES "
+                        "(:id, 'cninfo', 'cninfo:p_info3015', now(), 'ok', "
+                        " CAST(:snapshot AS jsonb), :company)"
+                    ),
+                    {
+                        "id": source_id,
+                        "snapshot": json.dumps(
+                            {"result": "ok", "candidates": candidates}
+                        ),
+                        "company": company_id,
+                    },
+                )
+            actual = {
+                row["provider_document_id"]
+                for row in queries.pending_downloads(
+                    conn,
+                    max_retries=3,
+                    limit=1000,
+                    scope_classes=("dividend", "annual_report"),
+                )
+            }
+        finally:
+            txn.rollback()
+            conn.close()
+
+        self.assertIn(ids_by_case["null_title_coded"], actual)
+        self.assertNotIn(ids_by_case["null_title_codeless"], actual)
+        self.assertIn(ids_by_case["long_title"], actual)
+        self.assertIn(ids_by_case["whitespace_category"], actual)
+        self.assertIn(ids_by_case["spaced_multicode"], actual)
+        self.assertNotIn(ids_by_case["unknown_override"], actual)
+        self.assertNotIn(ids_by_case["mixed_override"], actual)
+        self.assertNotIn(ids_by_case["nonarray_override"], actual)
+
     def test_pending_download_carrier_and_title_topic_gate(self) -> None:
         # Carrier precedence: a 0129-coded legal opinion rides equity_incentive
         # codes but must NOT download unless intermediary_report itself is in
@@ -601,6 +1063,8 @@ class OpsQueueViewTests(unittest.TestCase):
         # a per-company override.
         pid_noise = f"qvdl{self.suffix}nz"
         pid_clean = f"qvdl{self.suffix}cl"
+        pid_mtn_terms = f"qvdl{self.suffix}mtn"
+        pid_redemption_warning = f"qvdl{self.suffix}redeem"
         conn = self.engine.connect()
         txn = conn.begin()
         try:
@@ -609,6 +1073,7 @@ class OpsQueueViewTests(unittest.TestCase):
                     "INSERT INTO disclosure_core.classification_rule "
                     "(rule_set, prefix, value, priority, version) VALUES "
                     "('class', '0111', 'financing', 48, 'test'), "
+                    "('class', '0109', 'convertible_bond', 94, 'test'), "
                     "('title_noise', '募集资金存放', 'noise', 0, 'test') "
                     "ON CONFLICT (rule_set, prefix, value) DO NOTHING"
                 )
@@ -641,6 +1106,22 @@ class OpsQueueViewTests(unittest.TestCase):
                                     "download_url": "http://x/n2.PDF",
                                     "announcement_date": "1990-01-01",
                                 },
+                                {
+                                    "provider_document_id": pid_mtn_terms,
+                                    "title": "招商银行：[H股公告]招商银行股份有限公司伦敦分行"
+                                    "在招商银行股份有限公司的50亿美元中期票据计划下发行于"
+                                    "2029年到期的人民币30亿元票息为1.73%的票据",
+                                    "raw_category": "01010503||010113||011103||012399",
+                                    "download_url": "http://x/1225149847.PDF",
+                                    "announcement_date": "2025-04-23",
+                                },
+                                {
+                                    "provider_document_id": pid_redemption_warning,
+                                    "title": "晶科能源关于“晶能转债”预计满足赎回条件的提示性公告",
+                                    "raw_category": "01010503||010123||010919",
+                                    "download_url": "http://x/1225006849.PDF",
+                                    "announcement_date": "2025-04-03",
+                                },
                             ],
                         }
                     ),
@@ -649,11 +1130,24 @@ class OpsQueueViewTests(unittest.TestCase):
             pids = [
                 row["provider_document_id"]
                 for row in queries.pending_downloads(
-                    conn, max_retries=3, limit=1000, scope_classes=("financing",)
+                    conn,
+                    max_retries=3,
+                    limit=1000,
+                    scope_classes=("financing", "convertible_bond"),
                 )
             ]
             self.assertNotIn(pid_noise, pids)
             self.assertIn(pid_clean, pids)
+            self.assertIn(
+                pid_mtn_terms,
+                pids,
+                "pid 1225149847 is substantive financing terms, not title noise",
+            )
+            self.assertIn(
+                pid_redemption_warning,
+                pids,
+                "pid 1225006849 is the first redemption trigger signal",
+            )
 
             # Parse side, same guard, and status registered.
             doc_noise = self._insert_document(conn, status="registered")

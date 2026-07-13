@@ -100,7 +100,7 @@ def _tracked_company(
         ),
         effective_sync_seconds=effective_sync_seconds,
         effective_process_classes=(
-            list(process_classes) if process_classes is not None else global_classes
+            list(process_classes) if process_classes else global_classes
         ),
         sync_state=sync_state,
     )

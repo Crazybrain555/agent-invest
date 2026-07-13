@@ -80,6 +80,29 @@ class CninfoWebSourceTests(unittest.TestCase):
         self.assertEqual(ref.report_period, "2025Q2")
         self.assertEqual(ref.provider_org_id, "gssz0000001")
 
+    def test_topic_class_prevents_fake_quarterly_report_period(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "announcements": [
+                        _record(
+                            1225406052,
+                            "中国人寿偿付能力季度报告摘要（2026年第一季度）",
+                        )
+                    ],
+                    "hasMore": False,
+                },
+            )
+
+        refs = _source(handler).search_announcements(
+            SourceSecurity(security_code="000001", exchange="SZSE", security_name=None),
+            DisclosureWindow(date(2026, 6, 29), date(2026, 7, 6)),
+        )
+
+        self.assertEqual(len(refs), 1)
+        self.assertIsNone(refs[0].report_period)
+
     def test_paginates_until_short_page(self) -> None:
         pages: list[int] = []
 
@@ -148,6 +171,25 @@ class CninfoWebSourceTests(unittest.TestCase):
     def test_profile_is_unavailable_on_this_channel(self) -> None:
         source = _source(lambda request: httpx.Response(500))
         self.assertIsNone(source.profile_for_security("000001"))
+
+    def test_bse_fails_closed_instead_of_routing_to_shenzhen(self) -> None:
+        requests = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            return httpx.Response(500)
+
+        with self.assertRaises(CninfoWebSourceError) as ctx:
+            _source(handler).search_announcements(
+                SourceSecurity(
+                    security_code="920001", exchange="BSE", security_name=None
+                ),
+                DisclosureWindow(date(2026, 6, 29), date(2026, 7, 6)),
+            )
+        self.assertEqual(ctx.exception.error_code, "unsupported_exchange")
+        self.assertFalse(ctx.exception.retryable)
+        self.assertEqual(requests, 0)
 
 
 if __name__ == "__main__":

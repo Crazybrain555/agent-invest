@@ -8,6 +8,7 @@ cleanly so the suite stays green without external resources.
 from __future__ import annotations
 
 import os
+import secrets
 import unittest
 from typing import Optional
 
@@ -29,6 +30,12 @@ def _database_url() -> Optional[str]:
     return os.environ.get("DISCLOSURE_MIGRATION_DATABASE_URL") or os.environ.get(
         "DATABASE_URL"
     )
+
+
+def numeric_provider_document_id() -> str:
+    """Run-unique ASCII-decimal TEXTID stand-in for CNINFO integration tests."""
+
+    return str(secrets.randbits(120))
 
 
 def engine_or_skip() -> "Engine":

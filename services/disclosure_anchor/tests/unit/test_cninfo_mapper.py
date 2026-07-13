@@ -27,7 +27,7 @@ class CninfoMapperTests(unittest.TestCase):
     def test_filing_type_rule_bundle_has_required_seed_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
 
-        self.assertEqual(bundle.version, "2026-07-r6")
+        self.assertEqual(bundle.version, "2026-07-r8")
         self.assertEqual(
             {rule.filing_type for rule in bundle.rules},
             {
@@ -50,6 +50,24 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertLess(
             order.index("semiannual_report"), order.index("annual_report")
         )
+        # r7: briefing and inquiry outrank the periodic-report substrings —
+        # BSE "年度报告业绩说明会预告公告" and "年度报告…问询函的回复" titles
+        # were being captured by 年度报告/季度报告 (and then faking a
+        # report_period via derive_report_period).
+        self.assertLess(
+            order.index("performance_briefing"), order.index("semiannual_report")
+        )
+        self.assertLess(
+            order.index("inquiry_regulatory"), order.index("semiannual_report")
+        )
+        # r7: inquiry has both keyword orders (SQL LIKE match=all is ordered;
+        # "延期回复…问询函" puts 回复 before 问询).
+        inquiry_keyword_sets = [
+            rule.keywords for rule in bundle.rules
+            if rule.filing_type == "inquiry_regulatory"
+        ]
+        self.assertIn(("问询", "回复"), inquiry_keyword_sets)
+        self.assertIn(("回复", "问询"), inquiry_keyword_sets)
 
     def test_rule_bundle_parses_topic_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
@@ -59,12 +77,44 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertIn("销售简报", by_class["operating_data"].keywords)
         self.assertIn("经营数据", by_class["operating_data"].keywords)
         self.assertIn("产销快报", by_class["operating_data"].keywords)
+        # r7 generalization audit: provider-code blind spots per class.
+        self.assertIn("保费收入", by_class["operating_data"].keywords)
+        self.assertIn("业绩快报", by_class["performance_flash"].keywords)
+        self.assertIn("减值准备", by_class["risk_alert"].keywords)
+        self.assertIn("问询函", by_class["inquiry_regulatory"].keywords)
+        self.assertIn("重整", by_class["delisting_risk"].keywords)
+        self.assertIn("回购报告书", by_class["share_buyback"].keywords)
+        # topic keywords are plain substrings — a '%' would act as a LIKE
+        # wildcard in SQL but stay literal in the Python evaluator.
+        for rule in bundle.topic_rules:
+            for keyword in rule.keywords:
+                self.assertNotIn("%", keyword)
 
     def test_rule_bundle_parses_noise_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
 
         all_keywords = [kw for rule in bundle.noise_rules for kw in rule.keywords]
         self.assertIn("募集资金存放", all_keywords)
+        # r7: the wide 异动 keyword was narrowed to adjacency anchors so ST
+        # compound titles (…异常波动暨风险提示…) and 异动问询回函 stay
+        # processable; only the pure template form is rejected.
+        self.assertNotIn("股票交易异常波动", all_keywords)
+        self.assertIn("股票交易异常波动的公告", all_keywords)
+        self.assertIn("股票交易异常波动公告", all_keywords)
+        # r7 ordered word-order variants (SQL LIKE '%'-joined, order matters).
+        self.assertIn("限制性股票回购注销实施", all_keywords)
+        keyword_sets = [rule.keywords for rule in bundle.noise_rules]
+        self.assertIn(("归还", "闲置募集资金"), keyword_sets)
+        self.assertIn(("子公司发行", "票据", "提供担保"), keyword_sets)
+        # r8: a bare MTN-plan keyword killed a real RMB3bn/1.73%-coupon
+        # issuance. Only explicitly procedural listing/quotation shapes stay
+        # behind the absolute gate.
+        self.assertNotIn(("中期票据计划",), keyword_sets)
+        self.assertIn(("中期票据计划", "上市"), keyword_sets)
+        self.assertIn(("上市", "中期票据计划"), keyword_sets)
+        self.assertIn(("中期票据计划", "挂牌"), keyword_sets)
+        self.assertIn(("中期票据计划", "进行发行", "提供担保"), keyword_sets)
+        self.assertNotIn(("预计满足", "条件的提示性公告"), keyword_sets)
 
     def test_carrier_title_rules_behavior_on_codeless_channel(self) -> None:
         # Carrier keywords outrank subject keywords on the title path…
@@ -98,6 +148,63 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertEqual(
             derive_primary_class(None, "贵州茅台2026年第一季度主要经营数据公告"),
             "operating_data",
+        )
+
+    def test_r7_topic_rules_fill_generalization_blind_spots(self) -> None:
+        # 保费收入/偿付能力: insurers' operating data files under generic
+        # codes only (01010501||010113||012399) — topic grants class AND
+        # download eligibility; 偿付能力 also fixes the title-fallback
+        # mislabel quarterly_report (which faked a report_period).
+        self.assertEqual(
+            derive_primary_class("01010501||010113||012399", "中国平安保费收入公告"),
+            "operating_data",
+        )
+        self.assertEqual(
+            derive_primary_class(
+                "01010501||010113||012399",
+                "中国人寿偿付能力季度报告摘要（2026年第一季度）",
+            ),
+            "operating_data",
+        )
+        # 业绩快报: the dedicated flash prefixes (01211160) never occur in
+        # real data — everything is coded 012111 (forecast). The topic hit
+        # relabels flashes via argmax (flash 97 > forecast 96).
+        self.assertEqual(
+            derive_primary_class("012111", "招商银行股份有限公司2024年度业绩快报公告"),
+            "performance_flash",
+        )
+        # 重整: bankruptcy-reorg chain files under 012399 → delisting_risk.
+        self.assertEqual(
+            derive_primary_class(
+                "01010503||010112||012399",
+                "关于公司及控股子公司重整计划执行完毕的公告",
+            ),
+            "delisting_risk",
+        )
+
+    def test_r7_title_rule_order_stops_substring_capture(self) -> None:
+        # BSE briefing notices contain 年度报告/季度报告 substrings; the
+        # briefing rule must win or report_period gets faked as an annual.
+        self.assertEqual(
+            map_filing_type("2025年年度报告业绩说明会预告公告", category_names_by_code={}),
+            "performance_briefing",
+        )
+        self.assertEqual(
+            map_filing_type(
+                "晶科能源关于2024年年度报告的信息披露监管问询函的回复的公告",
+                category_names_by_code={},
+            ),
+            "inquiry_regulatory",
+        )
+        # 业绩发布会 is the financial-sector wording of 说明会.
+        self.assertEqual(
+            map_filing_type("中国平安关于召开2025年度业绩发布会的公告", category_names_by_code={}),
+            "performance_briefing",
+        )
+        # Real periodic reports never contain 说明会/问询 — still annual.
+        self.assertEqual(
+            map_filing_type("某公司2024年年度报告", category_names_by_code={}),
+            "annual_report",
         )
 
     def test_f006v_segments_are_split_before_filing_type_mapping(self) -> None:
@@ -200,7 +307,14 @@ class CninfoMapperTests(unittest.TestCase):
 
     def test_class_map_vocabulary_integrity(self) -> None:
         class_map = load_class_map()
-        self.assertEqual(class_map["version"], "2026-07-r5")
+        self.assertEqual(class_map["version"], "2026-07-r7")
+        # r6 code blind-spot fills (2026-07-13 generalization audit).
+        self.assertIn("011711", class_map["classes"]["financing"]["prefixes"])
+        self.assertIn("011713", class_map["classes"]["financing"]["prefixes"])
+        self.assertIn(
+            "01239910", class_map["classes"]["meeting_resolution"]["prefixes"]
+        )
+        self.assertIn("0115", class_map["classes"]["equity_share_change"]["prefixes"])
         for name, spec in class_map["classes"].items():
             self.assertTrue(spec["prefixes"], name)
             self.assertIsInstance(spec["priority"], int, name)

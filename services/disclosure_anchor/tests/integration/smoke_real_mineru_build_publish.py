@@ -30,10 +30,9 @@ from disclosure_anchor.application.use_cases.register_local_pdf import (
     RegisterLocalPdf,
     RegisterLocalPdfCommand,
 )
-from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.value_objects import ReportPeriod
 from disclosure_anchor.settings import Settings
-from tests.integration._support import engine_or_skip
+from tests.integration._support import engine_or_skip, numeric_provider_document_id
 
 
 SAMPLE_ROOT = Path("tmp/sample_filings")
@@ -185,9 +184,7 @@ class Milestone05RealMinerUBuildPublishSmoke(unittest.TestCase):
         raw_store: RawDocumentStore,
         artifact_store: ArtifactStore,
     ) -> dict[str, object]:
-        provider_document_id = (
-            f"m05-{sample.label}-{sample.pdf.stem.rsplit('__', 1)[-1]}-{ids.new_ulid()}"
-        )
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         register = RegisterLocalPdf(raw_store=raw_store, uow_factory=self._uow)
         registered = register.execute(

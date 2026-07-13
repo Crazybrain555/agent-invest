@@ -12,6 +12,7 @@ from disclosure_anchor.domain.errors import (
     RegistrationMetadataError,
     SubjectIdentityConflictError,
 )
+from disclosure_anchor.domain.value_objects import canonical_security_identity
 
 
 # Offline batch intake (pipeline track) creates companies before any provider
@@ -31,6 +32,13 @@ class SubjectCandidate:
     legal_name: str | None
     board: str | None = None
     credit_code: str | None = None
+
+    def __post_init__(self) -> None:
+        security_code, exchange = canonical_security_identity(
+            self.security_code, self.exchange
+        )
+        object.__setattr__(self, "security_code", security_code)
+        object.__setattr__(self, "exchange", exchange)
 
 
 @dataclass(frozen=True)

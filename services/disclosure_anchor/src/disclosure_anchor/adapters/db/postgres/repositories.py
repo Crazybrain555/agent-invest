@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from disclosure_anchor.adapters.db.postgres import mappers, models
 from disclosure_anchor.domain import entities as e
+from disclosure_anchor.domain.value_objects import canonical_security_identity
 from disclosure_anchor.domain.errors import (
     DocumentIdentityConflictError,
     SubjectIdentityRaceError,
@@ -158,6 +159,7 @@ class SecurityRepository:
         return mappers.security_to_entity(row) if row is not None else None
 
     def get_by_code_exchange(self, security_code: str, exchange: str) -> Optional[e.Security]:
+        security_code, exchange = canonical_security_identity(security_code, exchange)
         row = (
             self._session.query(models.Security)
             .filter(
@@ -459,6 +461,7 @@ class SourceCheckpointRepository:
         row.provider = updated.provider
         row.scope_key = updated.scope_key
         row.cursor = updated.cursor
+        row.updated_at = updated.updated_at
         self._session.flush()
         return mappers.source_checkpoint_to_entity(row)
 

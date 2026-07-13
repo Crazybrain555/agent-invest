@@ -10,6 +10,10 @@ from disclosure_anchor.domain.value_objects.common import (
     validate_official_provider,
     validate_report_period_for_filing_type,
 )
+from disclosure_anchor.domain.value_objects.security import (
+    canonical_security_identity,
+    infer_mainland_exchange,
+)
 
 
 class ContentHashTests(unittest.TestCase):
@@ -71,6 +75,34 @@ class ReportPeriodTests(unittest.TestCase):
             validate_report_period_for_filing_type(
                 filing_type="annual_report", report_period=None
             )
+
+
+class SecurityIdentityTests(unittest.TestCase):
+    def test_mainland_exchange_covers_a_b_and_beijing_codes(self) -> None:
+        self.assertEqual(infer_mainland_exchange("600519"), "SSE")
+        self.assertEqual(infer_mainland_exchange("900901"), "SSE")
+        self.assertEqual(infer_mainland_exchange("000001"), "SZSE")
+        self.assertEqual(infer_mainland_exchange("200002"), "SZSE")
+        self.assertEqual(infer_mainland_exchange("920001"), "BSE")
+        self.assertEqual(infer_mainland_exchange("430001"), "BSE")
+
+    def test_explicit_mainland_exchange_must_match_code_shape_and_prefix(self) -> None:
+        for code, exchange in (
+            ("000001", "SSE"),
+            ("600519", "SZSE"),
+            ("920001", "SSE"),
+            ("1", "SZSE"),
+        ):
+            with self.subTest(code=code, exchange=exchange), self.assertRaises(
+                ValueError
+            ):
+                canonical_security_identity(code, exchange)
+
+    def test_non_mainland_namespace_remains_extensible(self) -> None:
+        self.assertEqual(
+            canonical_security_identity(" local-1 ", " local "),
+            ("local-1", "LOCAL"),
+        )
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.services.unit_hashing import canonical_json, sha256_prefixed
 from disclosure_anchor.main import create_app
 from disclosure_anchor.settings import Settings
-from tests.integration._support import engine_or_skip
+from tests.integration._support import engine_or_skip, numeric_provider_document_id
 from tests.integration.smoke_real_mineru_build_publish import _mineru_bin_or_skip
 
 
@@ -516,7 +516,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
                 text(
                     "INSERT INTO disclosure_core.security "
                     "(security_id, company_id, security_code, exchange) "
-                    "VALUES (:security_id, :company_id, :security_code, 'SZSE')"
+                    "VALUES (:security_id, :company_id, :security_code, 'LOCAL')"
                 ),
                 {
                     "security_id": security_id,
@@ -885,7 +885,7 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
                 self._run_admin_sample(sample=sample, sample_pdf=sample_pdf)
 
     def _run_admin_sample(self, *, sample: AdminSample, sample_pdf: Path) -> None:
-        provider_document_id = sample_pdf.stem
+        provider_document_id = numeric_provider_document_id()
         self._assert_provider_document_id_available(provider_document_id)
 
         registered = _api_request(

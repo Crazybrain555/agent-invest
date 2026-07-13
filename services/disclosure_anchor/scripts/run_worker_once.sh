@@ -1,7 +1,8 @@
 #!/bin/zsh
 # Production worker entry for launchd/cron: loads the machine-local env
-# (worker.env: roots/DB/MinerU; cninfo.env: credentials) then runs one round.
-# Exit codes: 0 = round completed (per-item failures land in the report),
+# (worker.env: roots/DB/MinerU; cninfo.env: credentials), then runs one round
+# by default or the adaptive resident loop when invoked with `loop`.
+# Exit codes: 0 = worker stopped cleanly (per-item failures land in reports),
 # 77 = TCC write-access failure (see below), else fatal.
 #
 # macOS TCC reality (observed 2026-07-08/09): launchd-spawned processes have
@@ -13,6 +14,11 @@
 # One-time fix: System Settings > Privacy & Security > Full Disk Access ->
 # add /bin/zsh AND the venv python; then kickstart the job.
 set -euo pipefail
+MODE="${1:-once}"
+if [[ "$MODE" != "once" && "$MODE" != "loop" ]]; then
+  echo "usage: $0 [once|loop]" >&2
+  exit 64
+fi
 ENV_DIR="${DISCLOSURE_ENV_DIR:-$HOME/.config/agent-invest/disclosure_anchor}"
 for f in worker.env cninfo.env; do
   [[ -r "$ENV_DIR/$f" ]] || { echo "missing $ENV_DIR/$f" >&2; exit 78; }
@@ -70,5 +76,5 @@ if ! mkdir -p "$LOG_DIR" 2>/dev/null \
   LOG_DIR="$FALLBACK_LOG_DIR"
 fi
 exec >>"$LOG_DIR/worker-$(date +%Y%m%d).log" 2>&1
-echo "=== worker-once $(date '+%F %T') ==="
-exec make worker-once
+echo "=== worker-$MODE $(date '+%F %T') ==="
+exec make "worker-$MODE"

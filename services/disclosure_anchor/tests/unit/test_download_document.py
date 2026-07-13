@@ -139,11 +139,29 @@ class DownloadDocumentTests(unittest.TestCase):
 
         self.assertIsNone(result.document_id)
         self.assertIsNone(result.quarantined_path)
+        self.assertEqual(result.error_code, "http_404")
+        self.assertTrue(result.retryable)
         source_access = uow.source_accesses.get(result.source_access_id)
         self.assertEqual(source_access.status, "failed")
         self.assertIn('"error_code":"http_404"', source_access.error)
         self.assertIn('"retryable":true', source_access.error)
         self.assertIn('"stage":"download"', source_access.error)
+
+    def test_missing_exchange_uses_inferred_mainland_identity(self) -> None:
+        for code, exchange in (("600519", "SSE"), ("830001", "BSE")):
+            with self.subTest(code=code, exchange=exchange):
+                uow = _uow_with_listed_subject(code, exchange)
+                candidate = _candidate()
+                candidate["security_code"] = code
+                candidate.pop("exchange")
+
+                result = _use_case(
+                    uow, [b"%PDF-1.4\nlisted\n%%EOF\n"]
+                ).execute(DownloadDocumentCommand(candidate=candidate))
+
+                self.assertIsNotNone(result.document_id)
+                document = uow.documents.get(result.document_id)
+                self.assertEqual(document.company_id, "co_listed")
 
 
 class FailingDownloadSource:
@@ -272,6 +290,23 @@ def _uow_with_subject() -> FakeUnitOfWork:
             company_id=company.company_id,
             security_code="T07SYNC",
             exchange="LOCAL",
+            status="active",
+        )
+    )
+    return uow
+
+
+def _uow_with_listed_subject(code: str, exchange: str) -> FakeUnitOfWork:
+    uow = FakeUnitOfWork()
+    company = uow.companies.add(
+        e.Company(company_id="co_listed", legal_name="Listed Test Co")
+    )
+    uow.securities.add(
+        e.Security(
+            security_id="sec_listed",
+            company_id=company.company_id,
+            security_code=code,
+            exchange=exchange,
             status="active",
         )
     )

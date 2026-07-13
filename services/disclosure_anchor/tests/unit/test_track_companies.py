@@ -17,7 +17,7 @@ from disclosure_anchor.application.use_cases.track_companies import (
     TrackEntry,
     UntrackCompanies,
 )
-from disclosure_anchor.domain.errors import DisclosureAnchorError
+from disclosure_anchor.domain.errors import DisclosureAnchorError, SourceRequestError
 
 from tests.unit._fakes import FakeUnitOfWork
 
@@ -294,6 +294,33 @@ class PlaceholderUpgradeTests(unittest.TestCase):
             uow_factory=lambda: uow, profile_loader=loader
         ).execute((("300012", "SZSE"),))
         self.assertEqual(second, ())
+
+    def test_profile_resolution_stops_batch_on_quota_exhaustion(self) -> None:
+        uow = FakeUnitOfWork()
+        codes = (("300012", "SZSE"), ("301046", "SZSE"), ("600519", "SSE"))
+        TrackCompanies(uow_factory=lambda: uow).execute(
+            TrackCompaniesCommand(
+                entries=tuple(
+                    TrackEntry(security_code=code, exchange=exchange)
+                    for code, exchange in codes
+                )
+            )
+        )
+        calls: list[str] = []
+
+        def loader(code: str) -> SourceCompanyProfile | None:
+            calls.append(code)
+            raise SourceRequestError(
+                "quota exhausted", error_code="quota_exhausted", retryable=True
+            )
+
+        results = ResolveTrackedProfiles(
+            uow_factory=lambda: uow, profile_loader=loader
+        ).execute(codes)
+
+        self.assertEqual(calls, ["300012"])
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].resolved)
 
     def test_real_name_conflict_still_contested(self) -> None:
         from disclosure_anchor.domain.errors import SubjectIdentityConflictError

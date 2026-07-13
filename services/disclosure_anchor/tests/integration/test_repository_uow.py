@@ -80,7 +80,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                         security_id=ids.new_security_id(),
                         company_id=company.company_id,
                         security_code=self.security_code,
-                        exchange="SZSE",
+                        exchange="LOCAL",
                     )
                 )
                 created["security"] = security.security_id

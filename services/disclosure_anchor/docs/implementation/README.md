@@ -46,14 +46,16 @@ docs/implementation/
     process-classes-review-2026-07-12.md
   runbooks/
     phase00-environment-and-parser-validation.md
-    com.agentinvest.disclosure-anchor.worker-once.plist
+    com.agentinvest.disclosure-anchor.worker-once.plist  # historical; do not install
 ```
 
 里程碑 00–08（含 04R）均已实施完成（frontmatter status 与 `checks/acceptance-matrix.md` 为准）；
 09 为生产就绪持续整改，状态为 in-progress；06R（检索投影派生层）为规划中里程碑，规格文档
 尚未编写。
 
-`milestones/` 讲每阶段"做什么/为什么/验收口径"；`runbooks/` 讲"具体敲什么命令、产物落哪、每步怎么自检"，照着跑即可。
+`milestones/` 讲每阶段"做什么/为什么/验收口径"；`runbooks/` 同时保留历史与当前操作证据。
+旧 `worker-once.plist` 已被 resident 调度取代，不得安装；当前 worker 安装入口只有
+`scripts/install_launchd.sh`，语义见 `design/worker-dynamic-scheduling.md`。
 
 推荐阅读顺序：
 

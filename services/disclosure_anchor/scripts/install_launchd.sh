@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Install the worker launchd job (every 2h + at load). Idempotent.
+# Install the resident adaptive worker launchd job. Idempotent.
 # launchd stdout/err live in ~/Library/Logs/agent-invest (internal disk —
 # external volumes are TCC-denied for launchd-spawned processes); the real
 # worker log still lands under $DISCLOSURE_RUNTIME_ROOT/logs.
@@ -13,6 +13,6 @@ sed -e "s|__REPO__|$REPO|g" -e "s|__HOME__|$HOME|g" \
   "$REPO/scripts/launchd/com.agentinvest.disclosure-worker.plist.template" > "$PLIST"
 launchctl unload "$PLIST" 2>/dev/null || true
 launchctl load "$PLIST"
-echo "installed: $PLIST (every 2h + at load)"
+echo "installed: $PLIST (KeepAlive adaptive loop; idle backoff 15-30m)"
 echo "launchd log: $HOME/Library/Logs/agent-invest/disclosure-worker.{out,err}"
 echo "worker log:  $DISCLOSURE_RUNTIME_ROOT/logs/worker-YYYYMMDD.log"

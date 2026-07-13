@@ -83,22 +83,39 @@ class BuildUnits:
     def execute(self, command: BuildUnitsCommand) -> BuildUnitsResult:
         context = self._load_context(command)
         run = context["run"]
-        normalized_ir = self._load_ir(Path(run.normalized_ir_relpath or ""))
-        document = context["document"]
-        drafts, stats = build_unit_drafts_s1_s7(
-            normalized_ir,
-            filing_type=derive_primary_class(
-                (document.provider_metadata or {}).get("raw_category"),
-                document.title,
-            ),
-            document_title=document.title,
-            image_bytes_resolver=self._image_bytes_resolver(normalized_ir),
-        )
-        units, snapshot_rows = self._materialize_units(
-            drafts=drafts,
-            document=context["document"],
-            run=run,
-        )
+        try:
+            normalized_ir = self._load_ir(Path(run.normalized_ir_relpath or ""))
+            document = context["document"]
+            drafts, stats = build_unit_drafts_s1_s7(
+                normalized_ir,
+                filing_type=derive_primary_class(
+                    (document.provider_metadata or {}).get("raw_category"),
+                    document.title,
+                ),
+                document_title=document.title,
+                image_bytes_resolver=self._image_bytes_resolver(normalized_ir),
+            )
+            units, snapshot_rows = self._materialize_units(
+                drafts=drafts,
+                document=context["document"],
+                run=run,
+            )
+        except BuildUnitsError as exc:
+            return self._mark_and_result(run.processing_run_id, exc.error)
+        except OSError as exc:
+            return self._mark_and_result(
+                run.processing_run_id,
+                self._structured_error(
+                    error_code="ARTIFACT_READ_FAILED", message=str(exc)
+                ),
+            )
+        except Exception as exc:
+            error = self._structured_error(
+                error_code="BUILD_PREPARATION_FAILED",
+                message="unit preparation failed",
+            )
+            self._mark_failed(run.processing_run_id, error)
+            raise BuildUnitsError(error) from exc
         try:
             snapshot_relpath = self._snapshot_relpath(context)
             snapshot_result = self._artifact_store.write_jsonl_atomic(
@@ -116,24 +133,14 @@ class BuildUnits:
                 payload=stats.as_dict(),
             )
         except BuildUnitsError as exc:
-            if exc.error.get("error_code") == "ARTIFACT_WRITE_FAILED":
-                failed = self._mark_failed(run.processing_run_id, exc.error)
-                return BuildUnitsResult(
-                    processing_run_id=failed.processing_run_id,
-                    status=failed.unit_build_status,
-                    error=failed.unit_build_error,
-                )
-            raise
+            return self._mark_and_result(run.processing_run_id, exc.error)
         except OSError as exc:
-            error = self._structured_error(
-                error_code="ARTIFACT_WRITE_FAILED",
-                message=str(exc),
-            )
-            failed = self._mark_failed(run.processing_run_id, error)
-            return BuildUnitsResult(
-                processing_run_id=failed.processing_run_id,
-                status=failed.unit_build_status,
-                error=failed.unit_build_error,
+            return self._mark_and_result(
+                run.processing_run_id,
+                self._structured_error(
+                    error_code="ARTIFACT_WRITE_FAILED",
+                    message=str(exc),
+                ),
             )
 
         try:
@@ -144,15 +151,13 @@ class BuildUnits:
                 content_hash_aggregate=_content_hash_aggregate(units),
                 structure_hash=_structure_hash_aggregate(units),
             )
-        except Exception:
-            self._mark_failed(
-                run.processing_run_id,
-                self._structured_error(
-                    error_code="DB_WRITE_FAILED",
-                    message="document_unit DB persistence failed after snapshot write",
-                ),
+        except Exception as exc:
+            error = self._structured_error(
+                error_code="DB_WRITE_FAILED",
+                message="document_unit DB persistence failed after snapshot write",
             )
-            raise
+            self._mark_failed(run.processing_run_id, error)
+            raise BuildUnitsError(error) from exc
 
         return BuildUnitsResult(
             processing_run_id=updated.processing_run_id,
@@ -162,6 +167,16 @@ class BuildUnits:
             build_stats=stats.as_dict(),
             content_hash_aggregate=updated.content_hash_aggregate,
             structure_hash=updated.structure_hash,
+        )
+
+    def _mark_and_result(
+        self, processing_run_id: str, error: dict[str, Any]
+    ) -> BuildUnitsResult:
+        failed = self._mark_failed(processing_run_id, error)
+        return BuildUnitsResult(
+            processing_run_id=failed.processing_run_id,
+            status=failed.unit_build_status,
+            error=failed.unit_build_error,
         )
 
     def _load_context(self, command: BuildUnitsCommand) -> dict[str, Any]:

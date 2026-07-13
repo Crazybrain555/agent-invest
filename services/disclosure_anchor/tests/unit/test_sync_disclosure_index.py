@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timezone
 import json
 from pathlib import Path
 import unittest
@@ -95,6 +95,25 @@ class SyncDisclosureIndexTests(unittest.TestCase):
             use_case.execute(_command())
 
         self.assertEqual(uow.source_checkpoints.all(), [])
+
+    def test_existing_checkpoint_refreshes_due_timestamp(self) -> None:
+        uow = FakeUnitOfWork()
+        use_case = _use_case(uow, _refs())
+        first = use_case.execute(_command())
+        checkpoint = uow.source_checkpoints.get(first.checkpoint_id)
+        old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        checkpoint.updated_at = old
+        uow.source_checkpoints.update(checkpoint)
+
+        second = use_case.execute(_command())
+
+        refreshed = uow.source_checkpoints.get(second.checkpoint_id)
+        self.assertEqual(second.checkpoint_id, first.checkpoint_id)
+        self.assertIsNotNone(refreshed.updated_at)
+        self.assertGreater(refreshed.updated_at, old)
+        self.assertEqual(
+            refreshed.cursor["synced_at"], refreshed.updated_at.isoformat()
+        )
 
     def test_persisted_candidates_can_be_recovered_after_crash(self) -> None:
         uow = FakeUnitOfWork()

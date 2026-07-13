@@ -32,7 +32,7 @@ from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import ParserInvocationError, ParserVersionProbeError
 from disclosure_anchor.settings import Settings
-from tests.integration._support import engine_or_skip
+from tests.integration._support import engine_or_skip, numeric_provider_document_id
 
 
 def _settings(root: Path) -> Settings:
@@ -242,7 +242,7 @@ class ParseDocumentTests(unittest.TestCase):
             )
 
     def _register_document(self) -> str:
-        provider_document_id = "phase04-" + ids.new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         pdf = self.root / "realistic.pdf"
         pdf.write_bytes(b"%PDF-1.4\nrealistic phase04 pdf\n%%EOF\n")
@@ -459,7 +459,7 @@ class ParseDocumentTests(unittest.TestCase):
         self.assertIsNotNone(result.error)
         self.assertEqual(result.error["stage"], "parser_identity")
         self.assertEqual(result.error["error_code"], "parser_version_probe_failed")
-        self.assertFalse(result.error["retryable"])
+        self.assertTrue(result.error["retryable"])
         with self.engine.connect() as conn:
             row = conn.execute(
                 text(

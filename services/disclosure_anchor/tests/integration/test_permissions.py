@@ -12,10 +12,11 @@ import unittest
 from sqlalchemy import text
 from sqlalchemy.exc import ProgrammingError
 
+from disclosure_anchor.adapters.db.postgres.catalog import view_names
 from disclosure_anchor.adapters.db.postgres.schema import (
     APP_ROLE,
     FUTURE_L2_READER_ROLE,
-    PUBLIC_VIEWS,
+    PUBLIC_SCHEMA,
     READER_ROLE,
 )
 from tests.integration._support import engine_or_skip
@@ -39,6 +40,8 @@ class PermissionTests(unittest.TestCase):
                 trans.rollback()
 
     def test_reader_can_read_public_view(self) -> None:
+        with self.engine.connect() as catalog_conn:
+            public_views = view_names(catalog_conn, schema=PUBLIC_SCHEMA)
         for role in (READER_ROLE, FUTURE_L2_READER_ROLE):
             with self.engine.connect() as conn:
                 trans = conn.begin()
@@ -46,7 +49,7 @@ class PermissionTests(unittest.TestCase):
                     conn.execute(text(f'SET ROLE "{role}"'))
                     # Must not raise; results may be empty. Covers views recreated
                     # by 0007 via DROP+CREATE plus the retained source_refs_v1.
-                    for view in PUBLIC_VIEWS:
+                    for view in public_views:
                         conn.execute(
                             text(f"SELECT * FROM disclosure_public.{view} LIMIT 1")
                         ).all()

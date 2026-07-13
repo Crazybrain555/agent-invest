@@ -8,10 +8,12 @@ round continues.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
+from collections.abc import Callable, Iterable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+import json
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -59,8 +61,53 @@ from disclosure_anchor.application.worker.locks import (  # noqa: F401  (re-expo
     WORKER_NS,
     stable_document_hash,
 )
+from disclosure_anchor.domain import entities as e
+from disclosure_anchor.domain import ids
+from disclosure_anchor.domain.errors import ParserVersionProbeError
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+PARSER_INFRASTRUCTURE_ERROR_CODES = frozenset(
+    {
+        "parse_timeout",
+        "parser_timeout",
+        "parser_invocation_failed",
+        "ParserInvocationError",
+        "ParserTimeoutError",
+        "parser_version_probe_failed",
+    }
+)
+PROVIDER_INFRASTRUCTURE_ERROR_CODES = frozenset(
+    {
+        "transport_error",
+        "non_json_response",
+        "invalid_response_shape",
+        "incomplete_response",
+        "stock_list_unavailable",
+        "resultcode_-1",
+        "resultcode_403",
+        "resultcode_404",
+        "resultcode_405",
+    }
+)
+BUILD_INFRASTRUCTURE_ERROR_CODES = frozenset(
+    {
+        "ARTIFACT_WRITE_FAILED",
+        "DB_WRITE_FAILED",
+        "DatabaseError",
+        "InterfaceError",
+        "OSError",
+        "OperationalError",
+    }
+)
+BUILD_ITEM_LOCAL_ERROR_CODES = frozenset(
+    {
+        "IR_CONTRACT_TOO_OLD",
+        "IR_MISSING",
+        "RUN_NOT_FOUND",
+        "RUN_NOT_SUCCEEDED",
+        "UNITS_ALREADY_BUILT",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -76,7 +123,8 @@ class WorkerConfig:
     cninfo_oversized_kb: int
     # First-sync historical backfill (user decision: 三年是底线).
     initial_lookback_days: int = 1095
-    # Backpressure cap for the pending-download queue; 0 disables deferral.
+    # Backpressure cap for pending-download + downloaded/pending-parse work;
+    # 0 disables first-sync deferral.  The env key retains its legacy name.
     backfill_max_pending_downloads: int = 2000
     # None → parse everything; a topic tuple → 'other' docs need a matching
     # disclosure_topic (parse scope 'core', round9).
@@ -107,6 +155,11 @@ class WorkerDeps:
     # Settings-driven parse defaults (backend/server_url cascade) — the CLI
     # builds this from env so GPU offload is a config flip, not a code change.
     parser_options: ParserOptions = ParserOptions()
+    # CLI resident mode owns one lazy CNINFO client for the process lifetime,
+    # preserving both its token cache and 1-QPS bucket across zero-wait rounds.
+    # Tests/other callers retain the legacy per-round close by default.
+    source_close_after_round: bool = True
+    close_source: Callable[[], None] = lambda: None
 
 
 def run_once(
@@ -125,24 +178,59 @@ def run_once(
 
     source: DisclosureSourcePort | None = None
     try:
-        if limits.sync > 0 and not should_stop():
-            source = source or deps.source_factory()
-            _sync_stage(report, deps, source, limit=limits.sync, should_stop=should_stop)
-        if limits.download > 0 and not should_stop():
-            source = source or deps.source_factory()
-            _download_stage(
-                report, deps, source, limit=limits.download, should_stop=should_stop
+        try:
+            if limits.sync > 0 and not should_stop():
+                source = _sync_stage(
+                    report,
+                    deps,
+                    source,
+                    limit=limits.sync,
+                    should_stop=should_stop,
+                )
+            if (
+                limits.download > 0
+                and not report.sync_quota_break
+                and not report.source_outage_break
+                and not should_stop()
+            ):
+                source = _download_stage(
+                    report,
+                    deps,
+                    source,
+                    limit=limits.download,
+                    should_stop=should_stop,
+                )
+        except Exception as exc:
+            # Provider construction/query failures are stage-isolated: raw
+            # parse/build/publish work must continue even when credentials,
+            # CNINFO, or its DB queue read are unavailable.
+            report.failed += 1
+            report.source_outage_break = True
+            report.failures.append(
+                WorkerFailure(
+                    stage="source",
+                    item_ref="cninfo",
+                    error_code=type(exc).__name__,
+                )
             )
     finally:
         close = getattr(source, "close", None)
-        if callable(close):
+        if deps.source_close_after_round and callable(close):
             close()
 
     if limits.parse > 0 and not should_stop():
         _parse_stage(report, deps, limit=limits.parse, should_stop=should_stop)
-    if limits.build > 0 and not should_stop():
+    if (
+        limits.build > 0
+        and not any(failure.stage == "build" for failure in report.failures)
+        and not should_stop()
+    ):
         _build_stage(report, deps, limit=limits.build, should_stop=should_stop)
-    if limits.publish > 0 and not should_stop():
+    if (
+        limits.publish > 0
+        and not any(failure.stage == "publish" for failure in report.failures)
+        and not should_stop()
+    ):
         _publish_stage(report, deps, limit=limits.publish, should_stop=should_stop)
 
     report.duration_seconds = (deps.clock() - started_at).total_seconds()
@@ -152,28 +240,36 @@ def run_once(
 def _sync_stage(
     report: WorkerReport,
     deps: WorkerDeps,
-    source: DisclosureSourcePort,
+    source: DisclosureSourcePort | None,
     *,
     limit: int,
     should_stop: Callable[[], bool],
-) -> None:
+) -> DisclosureSourcePort | None:
     with deps.engine.connect() as conn:
         due = queries.sync_due(
             conn, interval_seconds=deps.config.sync_interval_seconds, limit=limit
         )
+    if not due:
+        return source
+    source = source or deps.source_factory()
     use_case = SyncDisclosureIndex(
         source=source,
         profile_loader=deps.profile_loader_factory(source),
         uow_factory=deps.uow_factory,
     )
     today = deps.clock().astimezone(SHANGHAI_TZ).date()
-    pending_downloads_now: int | None = None
+    processing_backlog_now: int | None = None
     for row in due:
         if should_stop():
-            return
+            return source
         security_code = row.get("security_code")
         exchange = row.get("exchange")
         if not security_code or not exchange:
+            _record_sync_failure_access(
+                deps,
+                row,
+                error_code="tracked_company_without_security",
+            )
             report.failed += 1
             report.failures.append(
                 WorkerFailure(
@@ -185,17 +281,22 @@ def _sync_stage(
             continue
         never_synced = row.get("last_synced_at") is None and not row.get("window_end")
         if never_synced and deps.config.backfill_max_pending_downloads > 0:
-            # Backpressure (changedetection.io MAX_QUEUE_SIZE pattern): a full
-            # historical backfill enqueues the whole window at once — defer
-            # new companies while the download queue is saturated.
-            if pending_downloads_now is None:
+            # Admission watermark (changedetection.io MAX_QUEUE_SIZE pattern):
+            # scan pending-download + pending-parse once per round, then add
+            # each admitted company's full candidate_count as a conservative
+            # upper bound. Downloads merely move items between those queues,
+            # so a GPU outage cannot admit the universe as raw files. A company
+            # sync is atomic, therefore one company's set may cross the mark.
+            if processing_backlog_now is None:
                 with deps.engine.connect() as conn:
-                    pending_downloads_now = queries.pending_download_count(
-                        conn,
-                        max_retries=deps.config.cninfo_max_retries,
-                        scope_classes=deps.config.process_scope_classes,
+                    processing_backlog_now = (
+                        queries.pending_processing_backlog_count(
+                            conn,
+                            max_retries=deps.config.cninfo_max_retries,
+                            scope_classes=deps.config.process_scope_classes,
+                        )
                     )
-            if pending_downloads_now >= deps.config.backfill_max_pending_downloads:
+            if processing_backlog_now >= deps.config.backfill_max_pending_downloads:
                 report.deferred_backfill += 1
                 continue
         window_start = _sync_window_start(
@@ -215,22 +316,91 @@ def _sync_stage(
                 )
             )
         except Exception as exc:
+            error_code, retryable = _source_error_details(exc)
+            _record_sync_failure_access(
+                deps,
+                row,
+                error_code=error_code,
+                retryable=True if retryable is None else retryable,
+            )
             report.failed += 1
             report.failures.append(
                 WorkerFailure(
                     stage="sync",
                     item_ref=str(security_code),
-                    error_code=type(exc).__name__,
+                    error_code=error_code,
+                    retryable=retryable,
                 )
             )
             if _is_quota_error(exc):
                 # Round-level breaker (edgartools guidance: stop, do not keep
                 # burning quota); remaining companies stay due for next round.
                 report.sync_quota_break = True
-                return
+                return source
+            if _is_provider_infrastructure_error(error_code, retryable):
+                # A retryable provider outage is batch-wide, not 13/50
+                # independent item failures. Stop touching CNINFO now; the
+                # resident controller cools source while local parse drains.
+                report.source_outage_break = True
+                return source
             continue
         report.synced_companies += 1
         report.candidates_discovered += result.candidate_count
+        if never_synced and processing_backlog_now is not None:
+            # Conservative in-round cache: candidate_count can include rows
+            # already known from overlap, so it may overestimate but cannot
+            # admit below the real watermark. The next round re-counts truth.
+            processing_backlog_now += result.candidate_count
+    return source
+
+
+def _record_sync_failure_access(
+    deps: WorkerDeps,
+    row: dict[str, Any],
+    *,
+    error_code: str,
+    retryable: bool = True,
+) -> None:
+    """Persist a scheduler-visible failure marker for fair due rotation.
+
+    Provider use cases already retain request-level provenance. This separate
+    marker covers failures before/around those requests as well, so every
+    caught item failure moves behind untouched companies for at least 60s.
+    """
+
+    company_id = row.get("company_id")
+    if not isinstance(company_id, str) or not company_id:
+        raise RuntimeError("sync due row is missing company_id")
+    security_id = row.get("security_id")
+    safe_code = error_code[:128]
+    with deps.uow_factory() as uow:
+        uow.source_accesses.add(
+            e.SourceAccess(
+                source_access_id=ids.new_source_access_id(),
+                provider="cninfo",
+                provider_interface="cninfo:worker_sync_failure",
+                dataset_key="worker_sync_failure",
+                query_params={
+                    "security_code": row.get("security_code"),
+                    "exchange": row.get("exchange"),
+                },
+                accessed_at=deps.clock(),
+                status="failed",
+                error=json.dumps(
+                    {
+                        "stage": "sync",
+                        "error_code": safe_code,
+                        "retryable": retryable,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                result_snapshot={"tracked_company_id": row.get("tracked_company_id")},
+                company_id=company_id,
+                security_id=(security_id if isinstance(security_id, str) else None),
+            )
+        )
+        uow.commit()
 
 
 def _is_quota_error(exc: BaseException) -> bool:
@@ -242,6 +412,32 @@ def _is_quota_error(exc: BaseException) -> bool:
             return True
         current = current.__cause__ or current.__context__
     return False
+
+
+def _source_error_details(exc: BaseException) -> tuple[str, bool | None]:
+    """Recover provider semantics hidden below a use-case wrapper."""
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    fallback = type(exc).__name__
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        error_code = getattr(current, "error_code", None)
+        if isinstance(error_code, str) and error_code:
+            retryable = getattr(current, "retryable", None)
+            return error_code, retryable if isinstance(retryable, bool) else None
+        current = current.__cause__ or current.__context__
+    return fallback, None
+
+
+def _is_provider_infrastructure_error(
+    error_code: str, retryable: bool | None
+) -> bool:
+    return retryable is True and (
+        error_code in PROVIDER_INFRASTRUCTURE_ERROR_CODES
+        or error_code.startswith("http_5")
+        or error_code == "http_429"
+    )
 
 
 def _sync_window_start(
@@ -267,11 +463,11 @@ def _sync_window_start(
 def _download_stage(
     report: WorkerReport,
     deps: WorkerDeps,
-    source: DisclosureSourcePort,
+    source: DisclosureSourcePort | None,
     *,
     limit: int,
     should_stop: Callable[[], bool],
-) -> None:
+) -> DisclosureSourcePort | None:
     with deps.engine.connect() as conn:
         pending = queries.pending_downloads(
             conn,
@@ -279,6 +475,9 @@ def _download_stage(
             limit=limit,
             scope_classes=deps.config.process_scope_classes,
         )
+    if not pending:
+        return source
+    source = source or deps.source_factory()
     downloader = DownloadDocument(
         source=source,
         raw_store=deps.raw_store,
@@ -287,7 +486,7 @@ def _download_stage(
     )
     for row in pending:
         if should_stop():
-            return
+            return source
         item_ref = str(row["provider_document_id"])
         candidate = row.get("candidate")
         if not isinstance(candidate, dict):
@@ -306,12 +505,19 @@ def _download_stage(
                 )
             )
         except Exception as exc:
+            error_code, retryable = _source_error_details(exc)
             report.failed += 1
             report.failures.append(
                 WorkerFailure(
-                    stage="download", item_ref=item_ref, error_code=type(exc).__name__
+                    stage="download",
+                    item_ref=item_ref,
+                    error_code=error_code,
+                    retryable=retryable,
                 )
             )
+            if _is_provider_infrastructure_error(error_code, retryable):
+                report.source_outage_break = True
+                return source
             continue
         if result.document_id is not None:
             report.downloaded += 1
@@ -321,9 +527,20 @@ def _download_stage(
                 WorkerFailure(
                     stage="download",
                     item_ref=item_ref,
-                    error_code=result.quarantine_reason or "download_failed",
+                    error_code=(
+                        result.error_code
+                        or result.quarantine_reason
+                        or "download_failed"
+                    ),
+                    retryable=result.retryable,
                 )
             )
+            if _is_provider_infrastructure_error(
+                result.error_code or "", result.retryable
+            ):
+                report.source_outage_break = True
+                return source
+    return source
 
 
 @dataclass
@@ -347,15 +564,16 @@ def _process_one_document(
     xact lock (worker/locks.py DOC_NS)."""
 
     outcome = _DocOutcome()
-    parse_use_case = ParseDocument(
-        parser=deps.parser_factory(),
-        path_builder=deps.path_builder,
-        raw_store=deps.raw_store,
-        artifact_store=deps.artifact_store,
-        uow_factory=deps.uow_factory,
-        default_timeout_seconds=deps.parse_timeout_seconds,
-    )
+    stage = "parse"
     try:
+        parse_use_case = ParseDocument(
+            parser=deps.parser_factory(),
+            path_builder=deps.path_builder,
+            raw_store=deps.raw_store,
+            artifact_store=deps.artifact_store,
+            uow_factory=deps.uow_factory,
+            default_timeout_seconds=deps.parse_timeout_seconds,
+        )
         parse_result = parse_use_case.execute(
             ParseDocumentCommand(document_id=document_id, options=deps.parser_options)
         )
@@ -367,6 +585,7 @@ def _process_one_document(
             )
             return outcome
         outcome.parsed = True
+        stage = "build"
         build_result = BuildUnits(
             path_builder=deps.path_builder,
             artifact_store=deps.artifact_store,
@@ -384,6 +603,7 @@ def _process_one_document(
         outcome.built = True
         if build_result.build_stats:
             outcome.build_stats = dict(build_result.build_stats)
+        stage = "publish"
         publish_result = PublishRun(uow_factory=deps.uow_factory).execute(
             PublishRunCommand(processing_run_id=parse_result.processing_run_id)
         )
@@ -396,8 +616,15 @@ def _process_one_document(
             return outcome
         outcome.published = True
     except Exception as exc:
+        structured_error = getattr(exc, "error", None)
         outcome.failure = WorkerFailure(
-            stage="parse", item_ref=document_id, error_code=type(exc).__name__
+            stage=stage,
+            item_ref=document_id,
+            error_code=(
+                _error_code(structured_error)
+                if isinstance(structured_error, dict)
+                else type(exc).__name__
+            ),
         )
     return outcome
 
@@ -414,6 +641,41 @@ def _fold_outcome(report: WorkerReport, outcome: _DocOutcome) -> None:
     if outcome.failure is not None:
         report.failed += 1
         report.failures.append(outcome.failure)
+
+
+def build_failures_indicate_outage(
+    failures: Iterable[WorkerFailure],
+) -> bool:
+    """Classify shared build failure without letting one bad IR block peers.
+
+    Explicit DB/shared-write codes trip immediately. An otherwise unknown
+    code needs two same-round occurrences; known item-local contract/IR codes
+    remain isolated and rely on the existing per-run attempt cap.
+    """
+
+    build_codes = [
+        failure.error_code for failure in failures if failure.stage == "build"
+    ]
+    if any(code in BUILD_INFRASTRUCTURE_ERROR_CODES for code in build_codes):
+        return True
+    unknown_counts = Counter(
+        code for code in build_codes if code not in BUILD_ITEM_LOCAL_ERROR_CODES
+    )
+    return any(count >= 2 for count in unknown_counts.values())
+
+
+def _halts_parse_refill(
+    outcome: _DocOutcome, failures: Iterable[WorkerFailure]
+) -> bool:
+    failure = outcome.failure
+    return failure is not None and (
+        failure.stage == "publish"
+        or (failure.stage == "build" and build_failures_indicate_outage(failures))
+        or (
+            failure.stage == "parse"
+            and failure.error_code in PARSER_INFRASTRUCTURE_ERROR_CODES
+        )
+    )
 
 
 def _parse_stage(
@@ -446,23 +708,77 @@ def _parse_stage(
             continue
         document_ids.append(str(row["document_id"]))
 
+    if document_ids:
+        # Parser identity is process/configuration health. Probe once before
+        # dequeuing any item so a missing/broken MinerU binary cannot consume
+        # every document's retry budget in concurrency-sized waves.
+        try:
+            deps.parser_factory().identity()
+        except ParserVersionProbeError:
+            report.failed += 1
+            report.failures.append(
+                WorkerFailure(
+                    stage="parse",
+                    item_ref="parser",
+                    error_code="parser_version_probe_failed",
+                    retryable=True,
+                )
+            )
+            return
+
     concurrency = max(1, deps.config.parse_concurrency)
     if concurrency == 1:
         for document_id in document_ids:
             if should_stop():
                 return
-            _fold_outcome(report, _process_one_document(deps, document_id))
+            outcome = _process_one_document(deps, document_id)
+            _fold_outcome(report, outcome)
+            if _halts_parse_refill(outcome, report.failures):
+                return
         return
-    with ThreadPoolExecutor(
-        max_workers=concurrency, thread_name_prefix="parse"
-    ) as pool:
-        futures = []
-        for document_id in document_ids:
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="parse") as pool:
+        pending_ids = iter(document_ids)
+        in_flight: dict[Future[_DocOutcome], str] = {}
+
+        def submit_one() -> bool:
             if should_stop():
-                break  # submitted chains still finish; no new ones start
-            futures.append(pool.submit(_process_one_document, deps, document_id))
-        for future in as_completed(futures):
-            _fold_outcome(report, future.result())
+                return False
+            try:
+                document_id = next(pending_ids)
+            except StopIteration:
+                return False
+            in_flight[pool.submit(_process_one_document, deps, document_id)] = document_id
+            return True
+
+        for _ in range(concurrency):
+            if not submit_one():
+                break
+        halt_refill = False
+        while in_flight:
+            completed, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
+            for future in completed:
+                document_id = in_flight.pop(future)
+                try:
+                    outcome = future.result()
+                except Exception as exc:  # defensive boundary around a worker future
+                    outcome = _DocOutcome(
+                        failure=WorkerFailure(
+                            stage="parse",
+                            item_ref=document_id,
+                            error_code=type(exc).__name__,
+                        )
+                    )
+                _fold_outcome(report, outcome)
+                halt_refill = halt_refill or _halts_parse_refill(
+                    outcome, report.failures
+                )
+            if should_stop():
+                for future in in_flight:
+                    future.cancel()
+                continue
+            if not halt_refill:
+                for _ in completed:
+                    submit_one()
 
 
 def _build_stage(
@@ -490,12 +806,20 @@ def _build_stage(
         try:
             result = use_case.execute(BuildUnitsCommand(processing_run_id=run_id))
         except Exception as exc:
+            structured_error = getattr(exc, "error", None)
+            error_code = (
+                _error_code(structured_error)
+                if isinstance(structured_error, dict)
+                else type(exc).__name__
+            )
             report.failed += 1
             report.failures.append(
                 WorkerFailure(
-                    stage="build", item_ref=run_id, error_code=type(exc).__name__
+                    stage="build", item_ref=run_id, error_code=error_code
                 )
             )
+            if build_failures_indicate_outage(report.failures):
+                return
             continue
         if result.status == "succeeded":
             report.built += 1
@@ -510,6 +834,8 @@ def _build_stage(
                     error_code=_error_code(result.error),
                 )
             )
+            if build_failures_indicate_outage(report.failures):
+                return
 
 
 def _publish_stage(
@@ -535,7 +861,7 @@ def _publish_stage(
                     stage="publish", item_ref=run_id, error_code=type(exc).__name__
                 )
             )
-            continue
+            return
         if result.status == "published":
             report.published += 1
         else:
@@ -545,6 +871,7 @@ def _publish_stage(
                     stage="publish", item_ref=run_id, error_code=str(result.status)
                 )
             )
+            return
 
 
 def render_report_section(report: WorkerReport) -> str:
@@ -565,6 +892,7 @@ def render_report_section(report: WorkerReport) -> str:
         f"- skipped_oversized: {report.skipped_oversized}",
         f"- deferred_backfill: {report.deferred_backfill}",
         f"- sync_quota_break: {report.sync_quota_break}",
+        f"- source_outage_break: {report.source_outage_break}",
     ]
     if report.failures:
         lines.append("- failures:")

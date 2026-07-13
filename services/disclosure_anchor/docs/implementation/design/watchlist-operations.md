@@ -116,8 +116,10 @@ security_code,exchange,status,joined_date,lookback_days,sync_frequency,filing_ca
 
 ### 5.3 首次回补的批次与失败恢复（B3/B4）
 
-- 入队上限：新增 `DISCLOSURE_BACKFILL_MAX_PENDING_DOWNLOADS`（如 2000）——
-  超限时 sync 阶段跳过尚未回补的新公司（下轮再试），天然形成分批入池。
+- 入队水位：`DISCLOSURE_BACKFILL_MAX_PENDING_DOWNLOADS` 保留兼容名，但计数口径为
+  **待下载 + 已下载待解析**；达到 2000 时 sync 跳过尚未回补的新公司。每轮首次精确计数，
+  同轮按已放行公司 `candidate_count` 保守累计，下一轮校正；单公司原子同步可越线一次。
+  这样 GPU 故障时下载只搬移队列，不会把整池变成 raw backlog。
 - resultcode 429 → retryable=true + 轮级熔断（连续 N 次 429 停掉本轮剩余 sync，
   记 quota_exhausted），与 09 背账"配额计量"项合并实施。
 - 首同步失败必须留痕：失败也写 source_access（error 信封），消除"300750 无迹可查"。

@@ -21,7 +21,7 @@ from disclosure_anchor.domain.errors import RegistrationMetadataError
 from disclosure_anchor.domain.errors import SubjectIdentityConflictError
 from disclosure_anchor.domain.ids import new_ulid
 from disclosure_anchor.settings import Settings
-from tests.integration._support import engine_or_skip
+from tests.integration._support import engine_or_skip, numeric_provider_document_id
 
 
 def _settings(root: Path) -> Settings:
@@ -159,7 +159,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         )
 
     def test_register_local_pdf_writes_raw_and_db_metadata(self) -> None:
-        provider_document_id = "local-" + new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
 
         result = self.use_case.execute(
@@ -200,7 +200,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(event_row.subject_ref, result.document_id)
 
     def test_duplicate_same_file_reuses_document(self) -> None:
-        provider_document_id = "local-" + new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         file_path = self._pdf("duplicate.pdf")
 
@@ -220,7 +220,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(count, 1)
 
     def test_duplicate_import_records_observed_event_and_source_access(self) -> None:
-        provider_document_id = "local-" + new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         file_path = self._pdf("duplicate-observed.pdf")
 
@@ -252,7 +252,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(access_count, 2)
 
     def test_invalid_pdf_goes_to_quarantine_without_document(self) -> None:
-        provider_document_id = "local-" + new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         bad_file = self.root / "bad.pdf"
         bad_file.write_bytes(b"not pdf")
@@ -273,7 +273,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(count, 0)
 
     def test_quarantine_records_failed_source_access(self) -> None:
-        provider_document_id = "local-" + new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         bad_file = self.root / "quarantine-trace.pdf"
         bad_file.write_bytes(b"not pdf")
@@ -296,7 +296,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(row["query_params"]["provider_document_id"], provider_document_id)
 
     def test_missing_pdf_goes_to_quarantine_without_document(self) -> None:
-        provider_document_id = "local-" + new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         missing_file = self.root / "missing.pdf"
 
@@ -317,7 +317,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(count, 0)
 
     def test_existing_security_company_mismatch_fails_before_raw_write(self) -> None:
-        provider_document_id = "local-" + new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         command = self._command(provider_document_id, self._pdf("mismatch.pdf"))
         company_id = "co_" + new_ulid()
@@ -367,7 +367,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(count, 0)
 
     def test_security_legal_name_mismatch_marks_identifier_contested(self) -> None:
-        provider_document_id = "local-" + new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         credit_code = "USCC" + new_ulid()
         company_id = "co_" + new_ulid()
@@ -455,7 +455,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(document_count, 0)
 
     def test_security_legal_name_mismatch_records_new_contested_identifier(self) -> None:
-        provider_document_id = "local-" + new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         credit_code = "USCC" + new_ulid()
         company_id = "co_" + new_ulid()
@@ -533,7 +533,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(document_count, 0)
 
     def test_identifier_legal_name_mismatch_marks_identifier_contested(self) -> None:
-        provider_document_id = "local-" + new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         credit_code = "USCC" + new_ulid()
         company_id = "co_" + new_ulid()
@@ -606,7 +606,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(document_count, 0)
 
     def test_security_uscc_owner_mismatch_marks_identifier_contested(self) -> None:
-        provider_document_id = "local-" + new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         credit_code = "USCC" + new_ulid()
         security_company_id = "co_" + new_ulid()
@@ -697,7 +697,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(document_count, 0)
 
     def test_company_uscc_conflict_records_contested_identifier(self) -> None:
-        provider_document_id = "local-" + new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         old_credit_code = "OLD" + new_ulid()
         new_credit_code = "NEW" + new_ulid()
@@ -773,7 +773,7 @@ class RegisterLocalPdfTests(unittest.TestCase):
         self.assertEqual(document_count, 0)
 
     def test_doctor_detects_raw_hash_mismatch(self) -> None:
-        provider_document_id = "local-" + new_ulid()
+        provider_document_id = numeric_provider_document_id()
         self.provider_document_ids.append(provider_document_id)
         result = self.use_case.execute(
             self._command(provider_document_id, self._pdf("doctor.pdf"))

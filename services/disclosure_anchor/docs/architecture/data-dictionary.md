@@ -45,14 +45,17 @@ outbox_event（ops；subject_ref 弱引用 document/unit/run）
 | source_access_id | 证据来源（可空=人工/初始化） |
 
 ### security（证券）
-security_id PK；company_id FK；security_code+exchange 定位（exchange 全大写 SSE/SZSE）；board 可空；status active。
+security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写入口统一
+`strip + uppercase exchange`；0022 以 CHECK 保证库存键已是规范形态，并校验大陆六位码
+与 SSE/SZSE/BSE 前缀一致（上海 B 股仍属 SSE）。无法从代码前缀可靠判断时必须显式给 exchange，
+不允许悄悄落 SZSE。
 
 ### tracked_company（盯盘配置——唯一人工输入的落库形态）
 | 列 | 含义 |
 |---|---|
 | status | active / paused（暂停=改字段不删行；真源是 config/watchlist.csv，`make track` 对账） |
 | lookback | jsonb `{"days": N}`；覆盖默认初始回补 1095 天（级联：空=继承 env） |
-| process_classes | jsonb 数组（class 键，0018 由 filing_categories 改名改义）；**按公司覆盖全局处理策略**（替换式，NULL=继承 config/processing_policy.json）；登记永远全量 |
+| process_classes | jsonb 数组（class 键，0018 由 filing_categories 改名改义）；**按公司覆盖全局处理策略**（替换式，非空数组整体替换；NULL/空数组 `[]` 均继承 config/processing_policy.json）；登记永远全量 |
 | sync_frequency | 闭集 hourly/daily/weekly；NULL=全局 DISCLOSURE_SYNC_INTERVAL_SECONDS |
 
 ### document（披露文件版本）
@@ -61,7 +64,7 @@ security_id PK；company_id FK；security_code+exchange 定位（exchange 全大
 | status | 公开可消费态：registered → parsed \| parse_failed →（发布后）published；published 永不降级 |
 | ~~filing_type~~ | **0017 删除**（表列——规则派生值不是事实）。视图现算：class 词表码 argmax，无码时标题关键词规则（rule_set='title'），仍无命中='other'；未知枚举值按 other 消费（前向兼容） |
 | ~~disclosure_topics~~ | **0016 删除**（表列）。视图现算：class 词表全部命中类集合（jsonb 数组）；无码通道 NULL |
-| report_period | `YYYY(A|Q1-4)`；定期报告必填，临时公告可 NULL，不伪造 |
+| report_period | `YYYY(A|Q1-4)`；按 code + title_topic priority argmax 后的主类推导，定期报告必填，临时公告可 NULL，不因标题含“季度报告”等子串伪造 |
 | raw_file_relpath/raw_file_hash | 相对路径+sha256；原始 PDF 不可变只追加 |
 | provider_metadata | jsonb：raw_category（F006V 原串）、category_names（中文分类名数组）、file_signature、oversized 标记等 |
 | supersedes/correction_of_document_id | 版本链（修订/更正） |
@@ -96,13 +99,13 @@ security_id PK；company_id FK；security_code+exchange 定位（exchange 全大
 ### classification_rule（0016，词表的库内查询副本）
 | 列 | 含义 |
 |---|---|
-| rule_set | 闭集 class / facet / **title**（0017：标题关键词规则，无码通道的唯一分类路径；filing_type 无独立规则——class 码 argmax → title argmax） |
-| prefix / value / priority | F006V 前缀 → 类名/维度名；priority=主分类阶梯档位（三层原则）/facet 长前缀优先 |
+| rule_set | 闭集 class / facet / **title** / **title_topic** / **title_noise**。title 是无码通道 broad fallback；title_topic 对有码/无码都可追加窄主题；title_noise 是处理队列绝对排除，不改变登记事实 |
+| prefix / value / priority | F006V 前缀或标题模式 → 类名/维度名；priority=主分类阶梯档位（三层原则）/facet 长前缀优先；match=all 的标题模式以 `%` 编码并由 SQL/Python 同义匹配 |
 | version | 与仓内 JSON 词表一致；doctor 校验漂移；`make load-rules` 事务内重载 |
 
 ### source_access / source_checkpoint / provider_category
-- source_access：每次 provider 访问一行（**失败也留痕**，含 profile 拉取失败）；query_params 已剔除凭据；error 结构化。
-- source_checkpoint：scope_key=`company_id:p_info3015`；cursor={window_end, window_start, synced_at}（后两个为审计字段，判定只用 window_end 与 updated_at）。
+- source_access：每次 provider 访问一行（**失败也留痕**，含 profile 拉取失败）；query_params 已剔除凭据；error 结构化。worker 捕获的同步失败另写 `cninfo:worker_sync_failure` 调度标记，保证失败公司冷却并移到未尝试公司之后。
+- source_checkpoint：scope_key=`company_id:p_info3015`；cursor={window_end, window_start, synced_at}（后两个为审计字段，判定只用 window_end 与 updated_at）；每次 cursor update 必须同步刷新 updated_at，避免已同步公司永久 due。
 - provider_category：F006V 字典 2135 行（p_info3005 快照 seed）。
 
 ### ops.outbox_event
@@ -135,9 +138,9 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 | adapters/unit_builder/rules.py | 切分/噪声/声明组合文法/语义规则 | RULES_VERSION ub-2026.07-18 |
 | adapters/unit_builder/note_key_map.json | 章节词表 **144 键**（section facet；祖先继承+全类型开放） | 2026-07-r4 |
 | adapters/unit_builder/event_key_map.json | 事件键 **30 键**（DuEE-fin/CCKS/FewFC/CFinDEE 并集，标题派生） | 2026-07-r1 |
-| adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs） | 2026-07-r5 |
+| adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs；r6 financing +011711 担保/011713 财务资助、meeting_resolution +01239910；r7 equity_share_change +0115 父级实码） | 2026-07-r7 |
 | adapters/sources/cninfo/facet_map.json | F006V 维度判定（market 精确码/publisher 0101） | 2026-07-r1 |
-| adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（intermediary carrier 词最前）+ topic_rules 追加规则（title_topic：有码无码都追加命中 class，补 012305 类码盲区）+ noise_rules 负向规则（title_noise：标题命中即绝对不下载不解析，52 条模板/程序件模式，2026-07-13 单元内容质检定案） | 2026-07-r6 |
+| adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（intermediary carrier 词最前，r7 起 briefing/inquiry 双向语序规则紧随其后防子串抢注）+ topic_rules 追加规则（title_topic：有码无码都追加命中 class，r7 扩至 10 类补码盲区）+ noise_rules 负向规则（title_noise：绝对不下载不解析；r8 共 77 条 JSON 规则/79 pattern，撤除“预计满足”并把裸“中期票据计划”收窄为挂牌/上市/母担保程序形态，保住实质融资条款） | 2026-07-r8 |
 | **config/processing_policy.json** | 处理策略（round21 合并 parse/download 两清单）：process 22 类=下载+解析，register_only 9 类=只登记；carrier 类（intermediary_report）共码不放行，除非该类自身在生效集合；按公司覆盖=watchlist process_classes | 2026-07-r2 |
 | config/watchlist.csv | 股票池唯一真源 + 按公司级联覆盖 | git 即版本 |
 

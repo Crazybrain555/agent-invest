@@ -21,6 +21,7 @@ class WorkerFailure:
     stage: str
     item_ref: str
     error_code: str
+    retryable: bool | None = None
 
 
 @dataclass
@@ -37,6 +38,7 @@ class WorkerReport:
     failed: int = 0
     skipped_oversized: int = 0
     sync_quota_break: bool = False
+    source_outage_break: bool = False
     deferred_backfill: int = 0
     failures: list[WorkerFailure] = field(default_factory=list)
     build_stats: list[dict[str, Any]] = field(default_factory=list)
@@ -50,6 +52,7 @@ class WorkerReport:
             "candidates_discovered": self.candidates_discovered,
             "downloaded": self.downloaded,
             "sync_quota_break": self.sync_quota_break,
+            "source_outage_break": self.source_outage_break,
             "deferred_backfill": self.deferred_backfill,
             "parsed": self.parsed,
             "built": self.built,
@@ -61,6 +64,7 @@ class WorkerReport:
                     "stage": failure.stage,
                     "item_ref": failure.item_ref,
                     "error_code": failure.error_code,
+                    "retryable": failure.retryable,
                 }
                 for failure in self.failures
             ],

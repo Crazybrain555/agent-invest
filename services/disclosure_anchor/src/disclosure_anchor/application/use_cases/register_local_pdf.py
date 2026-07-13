@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
+import re
 from typing import cast
 
 from disclosure_anchor.application.ports.file_store import (
@@ -36,7 +37,11 @@ from disclosure_anchor.domain.value_objects import (
     validate_filing_type,
     validate_official_provider,
     validate_report_period_for_filing_type,
+    canonical_security_identity,
 )
+
+
+_CNINFO_TEXTID_RE = re.compile(r"^[0-9]{1,128}$", re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,20 @@ class RegisterLocalPdfCommand:
 
     def __post_init__(self) -> None:
         validate_official_provider(self.provider)
+        security_code, exchange = canonical_security_identity(
+            self.security_code, self.exchange
+        )
+        object.__setattr__(self, "security_code", security_code)
+        object.__setattr__(self, "exchange", exchange)
+        provider_document_id = self.provider_document_id.strip()
+        if self.provider == "cninfo" and not _CNINFO_TEXTID_RE.fullmatch(
+            provider_document_id
+        ):
+            raise ValueError(
+                "cninfo provider_document_id must be the numeric TEXTID "
+                "(1-128 ASCII digits)"
+            )
+        object.__setattr__(self, "provider_document_id", provider_document_id)
         validate_filing_type(self.filing_type)
         report_period = self.report_period
         if isinstance(report_period, str):

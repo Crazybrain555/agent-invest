@@ -23,6 +23,11 @@ from disclosure_anchor.domain.value_objects import ReportPeriod
 
 CNINFO_PROVIDER = "cninfo"
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+# Provider-owned generic buckets: no stable semantic class can be inferred
+# from the code alone; narrow title_topic evidence may still classify a row.
+ACCEPTED_MISC_CATEGORY_CODES = frozenset(
+    {"0123", "012399", "01239999", "352399"}
+)
 
 
 class CninfoMappingError(DisclosureAnchorError):
@@ -47,6 +52,7 @@ class TopicRule:
 
     class_name: str
     keywords: tuple[str, ...]
+    match: Literal["any", "all"] = "any"
 
 
 @dataclass(frozen=True)
@@ -86,6 +92,7 @@ def load_filing_type_rule_bundle() -> FilingTypeRuleBundle:
         TopicRule(
             class_name=str(item["class"]),
             keywords=tuple(str(keyword) for keyword in item["keywords"]),
+            match="all" if item.get("match") == "all" else "any",
         )
         for item in payload.get("topic_rules", [])
     )
@@ -257,17 +264,22 @@ def derive_primary_class(raw_category: str | None, title: str | None) -> str:
                         best = key
     if title:
         for topic_rule in bundle.topic_rules:
-            if any(keyword in title for keyword in topic_rule.keywords):
+            topic_hit = (
+                _ordered_keywords_in_text(topic_rule.keywords, title)
+                if topic_rule.match == "all"
+                else any(keyword in title for keyword in topic_rule.keywords)
+            )
+            if topic_hit:
                 spec = classes[topic_rule.class_name]
                 key = (int(spec["priority"]), topic_rule.class_name)
                 if best is None or (key[0], key[1]) > best:
                     best = key
     if best is not None:
         return best[1]
-    if title:
+    if title and (raw_category is None or not raw_category.strip()):
         for rule in bundle.rules:
             if rule.match == "all":
-                if all(keyword in title for keyword in rule.keywords):
+                if _ordered_keywords_in_text(rule.keywords, title):
                     return rule.filing_type
             elif any(keyword in title for keyword in rule.keywords):
                 return rule.filing_type
@@ -291,8 +303,23 @@ def _rule_from_payload(payload: Mapping[str, Any]) -> FilingTypeRule:
 
 def _rule_matches(*, rule: FilingTypeRule, haystacks: tuple[str, str]) -> bool:
     if rule.match == "all":
-        return any(all(keyword in haystack for keyword in rule.keywords) for haystack in haystacks)
+        return any(
+            _ordered_keywords_in_text(rule.keywords, haystack)
+            for haystack in haystacks
+        )
     return any(keyword in haystack for keyword in rule.keywords for haystack in haystacks)
+
+
+def _ordered_keywords_in_text(keywords: tuple[str, ...], text: str) -> bool:
+    """Mirror the SQL ``keyword1%keyword2`` pattern used by the rule loader."""
+
+    offset = 0
+    for keyword in keywords:
+        position = text.find(keyword, offset)
+        if position < 0:
+            return False
+        offset = position + len(keyword)
+    return True
 
 
 def _required_str(record: Mapping[str, Any], field: str) -> str:

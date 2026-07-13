@@ -69,7 +69,12 @@ def main() -> int:
     # code hits and topic hits on one scale.
     for topic_rule in bundle.topic_rules:
         class_priority = class_map["classes"][topic_rule.class_name]["priority"]
-        for keyword in topic_rule.keywords:
+        topic_pattern = (
+            "%".join(topic_rule.keywords) if topic_rule.match == "all" else None
+        )
+        for keyword in (
+            [topic_pattern] if topic_pattern is not None else topic_rule.keywords
+        ):
             rows.append(
                 {
                     "rule_set": "title_topic",

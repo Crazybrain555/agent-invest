@@ -227,7 +227,10 @@ class ParseDocument:
                 prepare_error = self._structured_error(
                     stage="parser_identity",
                     error_code="parser_version_probe_failed",
-                    retryable=False,
+                    # Parser identity is process/configuration health, not a
+                    # property of this PDF. Keep the item retryable so a
+                    # repaired binary/service can resume after worker cooldown.
+                    retryable=True,
                     message=str(exc),
                 )
             run = uow.processing_runs.add(
@@ -454,7 +457,7 @@ class ParseDocument:
             return _ParseRunFailure(
                 stage="parser_identity",
                 error_code="parser_version_probe_failed",
-                retryable=False,
+                retryable=True,
                 message=str(exc),
             )
         if isinstance(exc, ParserOutputContractError):

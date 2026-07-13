@@ -42,7 +42,7 @@ def _subject(uow: FakeUnitOfWork) -> ResolvedSubject:
 def _doc_meta(*, report_period: ReportPeriod | None = None) -> DocumentRegistration:
     return DocumentRegistration(
         provider="cninfo",
-        provider_document_id="pid_1",
+        provider_document_id="1225000001",
         title="公告",
         announcement_date=date(2026, 7, 5),
         report_period=report_period,
@@ -52,7 +52,7 @@ def _doc_meta(*, report_period: ReportPeriod | None = None) -> DocumentRegistrat
 
 def _raw(raw_hash: str = "sha256:raw") -> RawDocumentWriteResult:
     return RawDocumentWriteResult(
-        relpath=Path("raw_documents/cninfo/002484/2026/pid_1/sample.pdf"),
+        relpath=Path("raw_documents/cninfo/002484/2026/1225000001/sample.pdf"),
         raw_file_hash=raw_hash,
         byte_count=100,
         created=True,
@@ -121,7 +121,7 @@ class RegisterDocumentTests(unittest.TestCase):
                 document_id="doc_old",
                 status="registered",
                 provider="cninfo",
-                provider_document_id="pid_1",
+                provider_document_id="1225000001",
                 raw_file_hash="sha256:old",
             )
         )
@@ -146,7 +146,7 @@ class RegisterDocumentTests(unittest.TestCase):
                 document_id="doc_existing",
                 status="registered",
                 provider="cninfo",
-                provider_document_id="pid_1",
+                provider_document_id="1225000001",
                 raw_file_hash="sha256:raw",
             )
         )
@@ -202,7 +202,7 @@ class RegisterDocumentTests(unittest.TestCase):
                 filing_type="other",
                 title="公告",
                 announcement_date=date(2026, 7, 5),
-                provider_document_id="pid_1",
+                provider_document_id="1225000001",
                 provider="cninfo",
             )
         )
@@ -230,7 +230,7 @@ class RegisterDocumentTests(unittest.TestCase):
                 filing_type="other",
                 title="公告",
                 announcement_date=date(2026, 7, 5),
-                provider_document_id="pid_1",
+                provider_document_id="1225000001",
                 provider="cninfo",
             )
         )
@@ -259,7 +259,7 @@ class RegisterDocumentTests(unittest.TestCase):
                     filing_type="other",
                     title="公告",
                     announcement_date=date(2026, 7, 5),
-                    provider_document_id="pid_1",
+                    provider_document_id="1225000001",
                     provider="cninfo",
                 )
             )
@@ -279,7 +279,7 @@ class RegisterDocumentTests(unittest.TestCase):
                 filing_type="other",
                 title="公告",
                 announcement_date=date(2026, 7, 5),
-                provider_document_id="pid_1",
+                provider_document_id="1225000001",
                 provider="cninfo",
                 expected_raw_file_hash="sha256:wrong",
             )
@@ -303,7 +303,7 @@ class RegisterDocumentTests(unittest.TestCase):
                 filing_type="annual_report",
                 title="公告",
                 announcement_date=date(2026, 7, 5),
-                provider_document_id="pid_1",
+                provider_document_id="1225000001",
                 provider="cninfo",
             )
 
@@ -315,10 +315,48 @@ class RegisterDocumentTests(unittest.TestCase):
             filing_type="other",
             title="公告",
             announcement_date=date(2026, 7, 5),
-            provider_document_id="pid_1",
+            provider_document_id="1225000001",
             provider="cninfo",
         )
         self.assertIsNone(command.report_period)
+
+    def test_cninfo_provider_document_id_requires_numeric_textid(self) -> None:
+        for provider_document_id in (
+            "年度报告目录",
+            "local-deadbeef",
+            "periodic",
+            "１２２５０８７１６９",
+            "1" * 129,
+        ):
+            with self.subTest(provider_document_id=provider_document_id):
+                with self.assertRaisesRegex(ValueError, "numeric TEXTID"):
+                    RegisterLocalPdfCommand(
+                        file_path=Path("sample.pdf"),
+                        company_legal_name="江海股份",
+                        security_code="002484",
+                        exchange="SZSE",
+                        filing_type="other",
+                        title="公告",
+                        announcement_date=date(2026, 7, 5),
+                        provider_document_id=provider_document_id,
+                        provider="cninfo",
+                    )
+
+    def test_command_canonicalizes_security_identity(self) -> None:
+        command = RegisterLocalPdfCommand(
+            file_path=Path("sample.pdf"),
+            company_legal_name="江海股份",
+            security_code=" 002484 ",
+            exchange=" szse ",
+            filing_type="other",
+            title="公告",
+            announcement_date=date(2026, 7, 5),
+            provider_document_id="1225087169",
+            provider="cninfo",
+        )
+
+        self.assertEqual(command.security_code, "002484")
+        self.assertEqual(command.exchange, "SZSE")
 
 
 if __name__ == "__main__":

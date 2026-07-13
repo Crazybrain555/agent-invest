@@ -29,7 +29,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 
-from tests.integration._support import engine_or_skip
+from tests.integration._support import engine_or_skip, numeric_provider_document_id
 
 FIXTURE_REF = (
     Path(__file__).resolve().parents[1]
@@ -72,7 +72,7 @@ class RealMinerUSmokeTest(unittest.TestCase):
         self.mineru = _mineru_bin_or_skip()
         self.pdf = _sample_pdf_or_skip()
         self.text = text
-        self.pid = "smoke-mineru-1225376481"
+        self.pid = numeric_provider_document_id()
         self._cleanup()
 
     def tearDown(self) -> None:

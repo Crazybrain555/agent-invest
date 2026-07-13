@@ -196,7 +196,7 @@ class PublicViewContentTests(unittest.TestCase):
                     security_id=self.security_id,
                     company_id=self.company_id,
                     security_code=self.security_code,
-                    exchange="SZSE",
+                    exchange="LOCAL",
                 )
             )
             uow.source_accesses.add(
@@ -486,6 +486,38 @@ class PublicViewContentTests(unittest.TestCase):
         self.assertIsNone(row["disclosure_topics"])
         self.assertIsNone(row["content_categories"])
 
+    def test_coded_unknown_does_not_use_broad_title_fallback(self) -> None:
+        """0022 restores parity: broad title rules are code-less-only."""
+
+        self._seed()
+        self._ensure_classification_rules()
+        broad_id, _ = self._seed_extra_document_unit(
+            "other", title="某公司2025年年度报告相关说明"
+        )
+        topic_id, _ = self._seed_extra_document_unit(
+            "other", title="关于计提2025年度资产减值准备的公告"
+        )
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT document_id, filing_type, disclosure_topics "
+                    "FROM disclosure_public.documents_v1 "
+                    "WHERE document_id = ANY(:ids)"
+                ),
+                {"ids": [broad_id, topic_id]},
+            ).mappings()
+            by_id = {row["document_id"]: row for row in rows}
+        self.assertEqual(by_id[broad_id]["filing_type"], "other")
+        self.assertIsNone(by_id[broad_id]["disclosure_topics"])
+        self.assertEqual(by_id[topic_id]["filing_type"], "risk_alert")
+        self.assertEqual(
+            list(by_id[topic_id]["disclosure_topics"]), ["risk_alert"]
+        )
+        self.assertEqual(
+            derive_primary_class("012399", "某公司2025年年度报告相关说明"),
+            "other",
+        )
+
     def test_title_topic_rules_add_class_for_coded_documents(self) -> None:
         # 0021: CNINFO files monthly operating data under 012305 (risk_alert)
         # and never emits 010309 — title_topic hits are UNIONed with code
@@ -626,13 +658,19 @@ class PublicViewContentTests(unittest.TestCase):
         ] + [
             {
                 "rule_set": "title_topic",
-                "prefix": keyword,
+                "prefix": (
+                    "%".join(topic_rule.keywords)
+                    if topic_rule.match == "all"
+                    else keyword
+                ),
                 "value": topic_rule.class_name,
                 "priority": class_map["classes"][topic_rule.class_name]["priority"],
                 "version": bundle.version,
             }
             for topic_rule in bundle.topic_rules
-            for keyword in topic_rule.keywords
+            for keyword in (
+                [None] if topic_rule.match == "all" else topic_rule.keywords
+            )
         ]
         with self.engine.begin() as conn:
             conn.execute(

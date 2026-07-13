@@ -6,7 +6,6 @@ import argparse
 import csv
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timedelta
-import hashlib
 import json
 from pathlib import Path
 import re
@@ -72,6 +71,7 @@ from disclosure_anchor.application.use_cases.sync_disclosure_index import (
 )
 from disclosure_anchor.domain.errors import BuildUnitsError, ConfigurationError, PublishRunError
 from disclosure_anchor.domain.value_objects import ReportPeriod
+from disclosure_anchor.domain.value_objects import infer_mainland_exchange
 from disclosure_anchor.settings import Settings, load_settings
 
 
@@ -582,7 +582,7 @@ class _Deps:
                         ON s.security_id = tc.security_id
                       LEFT JOIN disclosure_core.source_checkpoint sc
                         ON sc.provider = 'cninfo'
-                       AND sc.scope_key = tc.company_id || '\:p_info3015'
+                       AND sc.scope_key = tc.company_id || chr(58) || 'p_info3015'
                      ORDER BY s.security_code
                     """
                 )
@@ -790,7 +790,7 @@ def _track_entries(args: argparse.Namespace) -> tuple[TrackEntry, ...]:
 
 
 def _exchange_for_scode(scode: str) -> str:
-    return "SSE" if scode.startswith("6") else "SZSE"
+    return infer_mainland_exchange(scode)
 
 
 def _register_command(args: argparse.Namespace) -> RegisterLocalPdfCommand:
@@ -815,10 +815,12 @@ def _register_command(args: argparse.Namespace) -> RegisterLocalPdfCommand:
 def _default_provider_document_id(file_path: Path) -> str:
     stem = file_path.stem
     suffix = stem.rsplit("__", 1)[-1]
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", suffix):
+    if re.fullmatch(r"[0-9]{1,128}", suffix, re.ASCII):
         return suffix
-    digest = hashlib.sha256(stem.encode("utf-8")).hexdigest()[:16]
-    return f"local-{digest}"
+    raise ValueError(
+        "cninfo provider_document_id is required unless the PDF name ends "
+        "with '__<numeric TEXTID>.pdf'"
+    )
 
 
 def _stage_succeeded(stage: str, result: Any) -> bool:

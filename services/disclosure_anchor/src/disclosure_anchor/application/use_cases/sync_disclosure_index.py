@@ -194,6 +194,7 @@ class SyncDisclosureIndex:
                 company_id=subject.company.company_id,
                 window_end=command.window_end,
                 window_start=command.window_start,
+                now=now,
             )
             # Keep the variable live so mypy sees the tracked-company write as intentional.
             _ = tracked
@@ -447,6 +448,7 @@ class SyncDisclosureIndex:
         company_id: str,
         window_end: date,
         window_start: date | None = None,
+        now: datetime,
     ) -> e.SourceCheckpoint:
         scope_key = f"{company_id}:p_info3015"
         existing = uow.source_checkpoints.get_by_scope(CNINFO_PROVIDER, scope_key)
@@ -455,7 +457,7 @@ class SyncDisclosureIndex:
             # Audit fields (design/watchlist-operations.md §5.4): what window
             # this sync actually covered and when. Readers only use window_end.
             "window_start": window_start.isoformat() if window_start else None,
-            "synced_at": datetime.now(timezone.utc).isoformat(),
+            "synced_at": now.isoformat(),
         }
         if existing is None:
             return uow.source_checkpoints.add(
@@ -464,9 +466,11 @@ class SyncDisclosureIndex:
                     provider=CNINFO_PROVIDER,
                     scope_key=scope_key,
                     cursor=cursor,
+                    updated_at=now,
                 )
             )
         existing.cursor = cursor
+        existing.updated_at = now
         return uow.source_checkpoints.update(existing)
 
 

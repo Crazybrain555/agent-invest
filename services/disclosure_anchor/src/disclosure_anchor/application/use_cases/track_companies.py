@@ -24,6 +24,7 @@ from disclosure_anchor.application.services.subject_resolver import (
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import DisclosureAnchorError
+from disclosure_anchor.domain.value_objects import canonical_security_identity
 
 SYNC_FREQUENCIES = ("hourly", "daily", "weekly")
 
@@ -42,6 +43,13 @@ class TrackEntry:
     sync_frequency: str | None = None
     process_classes: tuple[str, ...] | None = None
     status: str = "active"
+
+    def __post_init__(self) -> None:
+        security_code, exchange = canonical_security_identity(
+            self.security_code, self.exchange
+        )
+        object.__setattr__(self, "security_code", security_code)
+        object.__setattr__(self, "exchange", exchange)
 
 
 @dataclass(frozen=True)
@@ -154,11 +162,16 @@ class ResolveTrackedProfiles:
                             security_code, exchange, profile.legal_name, True
                         )
                     )
-                except DisclosureAnchorError:
+                except DisclosureAnchorError as exc:
                     # Offline/quota/conflict: keep the placeholder, next sync heals.
                     results.append(
                         ProfileResolution(security_code, exchange, None, False)
                     )
+                    if getattr(exc, "error_code", None) == "quota_exhausted":
+                        # Quota is batch-wide. Do not burn one request per
+                        # remaining code; placeholders are deliberately healed
+                        # by the worker's first sync on a later quota window.
+                        break
         return tuple(results)
 
 

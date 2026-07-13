@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import unittest
 
-from sqlalchemy import text
+from sqlalchemy import exc, text
 
+from disclosure_anchor.adapters.db.postgres.catalog import view_names
 from disclosure_anchor.adapters.db.postgres.schema import (
     ALEMBIC_VERSION_TABLE_SCHEMA,
     CORE_SCHEMA,
@@ -13,6 +14,7 @@ from disclosure_anchor.adapters.db.postgres.schema import (
     PUBLIC_SCHEMA,
     PUBLIC_VIEWS,
 )
+from disclosure_anchor.adapters.db.postgres.migration_state import single_migration_head
 from tests.integration._support import engine_or_skip
 
 EXPECTED_CORE_TABLES = {
@@ -60,29 +62,24 @@ class SchemaShapeTests(unittest.TestCase):
 
     def test_public_views_exist(self) -> None:
         with self.engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    "SELECT table_name FROM information_schema.views "
-                    "WHERE table_schema = :s"
-                ),
-                {"s": PUBLIC_SCHEMA},
-            ).scalars()
-            views = set(rows)
+            views = set(view_names(conn, schema=PUBLIC_SCHEMA))
         self.assertEqual(set(PUBLIC_VIEWS), views)
 
     def test_alembic_version_in_ops_schema_and_at_head(self) -> None:
         with self.engine.connect() as conn:
-            schema = conn.execute(
+            present = conn.execute(
                 text(
-                    "SELECT table_schema FROM information_schema.tables "
-                    "WHERE table_name = 'alembic_version'"
-                )
-            ).scalar()
+                    "SELECT count(*) FROM information_schema.tables "
+                    "WHERE table_schema = :schema "
+                    "AND table_name = 'alembic_version'"
+                ),
+                {"schema": ALEMBIC_VERSION_TABLE_SCHEMA},
+            ).scalar_one()
             version = conn.execute(
                 text(f"SELECT version_num FROM {ALEMBIC_VERSION_TABLE_SCHEMA}.alembic_version")
             ).scalar()
-        self.assertEqual(schema, ALEMBIC_VERSION_TABLE_SCHEMA)
-        self.assertEqual(version, "0021_title_topic_classification")
+        self.assertEqual(present, 1)
+        self.assertEqual(version, single_migration_head())
 
     def test_document_provider_hash_unique_index_exists(self) -> None:
         with self.engine.connect() as conn:
@@ -96,6 +93,66 @@ class SchemaShapeTests(unittest.TestCase):
                 {"schema": CORE_SCHEMA},
             ).scalar()
         self.assertEqual(present, 1)
+
+    def test_security_identity_has_unique_and_canonical_constraints(self) -> None:
+        with self.engine.connect() as conn:
+            names = set(
+                conn.execute(
+                    text(
+                        "SELECT constraint_name FROM information_schema.table_constraints "
+                        "WHERE table_schema = :schema AND table_name = 'security'"
+                    ),
+                    {"schema": CORE_SCHEMA},
+                ).scalars()
+            )
+        self.assertTrue(
+            {
+                "uq_security_code_exchange",
+                "ck_security_code_canonical",
+                "ck_security_exchange_canonical",
+                "ck_security_mainland_exchange_code",
+            }
+            <= names,
+            names,
+        )
+
+    def test_security_constraints_reject_unicode_aliases_and_wrong_exchange(self) -> None:
+        company_id = "co_schema_security_constraints"
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company (company_id, legal_name) "
+                    "VALUES (:id, '约束构造公司') ON CONFLICT (company_id) DO NOTHING"
+                ),
+                {"id": company_id},
+            )
+            invalid = (
+                ("000001\t", "SZSE"),
+                ("000001\u00a0", "SZSE"),
+                ("000001", "SZSE\t"),
+                ("000001", "SSE"),
+                ("1", "SZSE"),
+            )
+            for index, (code, exchange) in enumerate(invalid):
+                with self.assertRaises(exc.IntegrityError), conn.begin_nested():
+                    conn.execute(
+                        text(
+                            "INSERT INTO disclosure_core.security "
+                            "(security_id, company_id, security_code, exchange) "
+                            "VALUES (:id, :company, :code, :exchange)"
+                        ),
+                        {
+                            "id": f"sec_schema_invalid_{index}",
+                            "company": company_id,
+                            "code": code,
+                            "exchange": exchange,
+                        },
+                    )
+        finally:
+            txn.rollback()
+            conn.close()
 
     def test_public_views_do_not_expose_relpath_columns(self) -> None:
         with self.engine.connect() as conn:

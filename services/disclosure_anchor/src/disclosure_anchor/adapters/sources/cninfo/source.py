@@ -11,6 +11,7 @@ from importlib import resources
 from disclosure_anchor.adapters.sources.cninfo.client import CninfoClient
 from disclosure_anchor.adapters.sources.cninfo.mapper import (
     CninfoCompanyProfile,
+    derive_primary_class,
     derive_report_period,
     split_category_segments,
     load_filing_type_rule_bundle,
@@ -65,10 +66,40 @@ class CninfoSource:
             )
             records = response.payload.get("records", [])
             if not isinstance(records, list):
-                continue
+                # A resultcode=200 envelope with a malformed chunk is not an
+                # empty result. Treating it as success advances the checkpoint
+                # across a permanent announcement hole.
+                raise SourceRequestError(
+                    "CNINFO p_info3015 records is not an array",
+                    error_code="invalid_response_shape",
+                    retryable=True,
+                )
+            if any(not isinstance(record, dict) for record in records):
+                raise SourceRequestError(
+                    "CNINFO p_info3015 records contains a non-object row",
+                    error_code="invalid_response_shape",
+                    retryable=True,
+                )
+            count = response.payload.get("count")
+            total = response.payload.get("total")
+            if (
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or not isinstance(total, int)
+                or isinstance(total, bool)
+                or count != len(records)
+                or total != len(records)
+            ):
+                # This adapter never requests page/pagesize and each request is
+                # one stock over <=30 days. Therefore count/total must describe
+                # the complete returned window; a mismatch is partial data,
+                # not a successful empty/tiny chunk.
+                raise SourceRequestError(
+                    "CNINFO p_info3015 count/total does not match records",
+                    error_code="incomplete_response",
+                    retryable=True,
+                )
             for record in records:
-                if not isinstance(record, dict):
-                    continue
                 mapped = map_p_info3015_record(record)
                 if mapped.provider_document_id in seen_provider_document_ids:
                     continue
@@ -97,7 +128,10 @@ class CninfoSource:
                         mapped,
                         filing_type=filing_type,
                         report_period=derive_report_period(
-                            mapped.title, filing_type=filing_type
+                            mapped.title,
+                            filing_type=derive_primary_class(
+                                mapped.raw_category, mapped.title
+                            ),
                         ),
                         category_names=category_names or None,
                     )
@@ -115,7 +149,12 @@ class CninfoSource:
         if self._category_names is None:
             try:
                 self._category_names = self.category_names_by_code()
-            except SourceRequestError:
+            except SourceRequestError as exc:
+                if exc.error_code == "quota_exhausted":
+                    # Quota is provider-wide, not a category-only outage. Do
+                    # not hide it behind the snapshot and spend another call
+                    # on p_info3015 before the worker can trip its breaker.
+                    raise
                 self._category_names = {}
             if not self._category_names:
                 self._category_names = _fallback_category_names()

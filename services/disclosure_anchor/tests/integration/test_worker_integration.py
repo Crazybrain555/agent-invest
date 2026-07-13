@@ -545,7 +545,7 @@ class WorkerRunOnceIntegrationTests(unittest.TestCase):
                 {"pid": f"bad{self.suffix}"},
             )
 
-    def test_0009_migration_roundtrip_on_scratch_database(self) -> None:
+    def test_all_post_0008_migrations_roundtrip_on_scratch_database(self) -> None:
         env = {
             **os.environ,
             "PYTHONPATH": "src",
@@ -573,18 +573,45 @@ class WorkerRunOnceIntegrationTests(unittest.TestCase):
                 }
 
         self.assertLessEqual({"sync_due_v1", "pending_download_v1"}, view_names())
+        with self.engine.connect() as conn:
+            self.assertTrue(
+                conn.execute(
+                    text(
+                        "SELECT 1 FROM pg_constraint "
+                        "WHERE conname = 'ck_security_exchange_canonical'"
+                    )
+                ).scalar()
+            )
         down = subprocess.run(
             [sys.executable, "-m", "alembic", "downgrade", "0008_unit_builder_provenance"],
             cwd=cwd, env=env, capture_output=True, text=True,
         )
         self.assertEqual(down.returncode, 0, down.stderr[-500:])
         self.assertFalse({"sync_due_v1", "pending_download_v1"} & view_names())
+        with self.engine.connect() as conn:
+            self.assertFalse(
+                conn.execute(
+                    text(
+                        "SELECT 1 FROM pg_constraint "
+                        "WHERE conname = 'ck_security_exchange_canonical'"
+                    )
+                ).scalar()
+            )
         up = subprocess.run(
             [sys.executable, "-m", "alembic", "upgrade", "head"],
             cwd=cwd, env=env, capture_output=True, text=True,
         )
         self.assertEqual(up.returncode, 0, up.stderr[-500:])
         self.assertLessEqual({"sync_due_v1", "pending_download_v1"}, view_names())
+        with self.engine.connect() as conn:
+            self.assertTrue(
+                conn.execute(
+                    text(
+                        "SELECT 1 FROM pg_constraint "
+                        "WHERE conname = 'ck_security_exchange_canonical'"
+                    )
+                ).scalar()
+            )
 
     def test_kill_dash_nine_releases_advisory_locks(self) -> None:
         url = self.temp_url
@@ -633,6 +660,9 @@ class WorkerRunOnceIntegrationTests(unittest.TestCase):
         finally:
             if child.poll() is None:
                 child.kill()
+            child.wait(timeout=10)
+            if child.stdout is not None:
+                child.stdout.close()
 
 
 if __name__ == "__main__":

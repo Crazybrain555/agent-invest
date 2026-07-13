@@ -16,14 +16,30 @@ web_source.py        免凭据兜底通道 CninfoWebSource：官网 hisAnnouncem
                      去重键与文件签名跨通道通用
 mapper.py            p_info3015/p_stock2100 → DTO(TEXTID 即 provider_document_id)、
                      F006V 多段拆分映射、report_period 标题推导(07 §3.2 封闭规则)
-filing_type_map.json 规则包(版本化)；**intermediary_report 必须排最前**(carrier 载体
+filing_type_map.json 规则包(版本化，当前 r8)；**intermediary_report 必须排最前**(carrier 载体
                      判定优先——"激励计划法律意见书"是意见书不是激励公告)；
+                     **performance_briefing 与 inquiry(双向语序两条)必须排在
+                     semiannual/annual/quarterly 之前**(北交所"年度报告业绩说明会预告"
+                     与"年度报告问询函回复"被定期报告子串抢注且伪造 report_period，实测)；
                      **semiannual 必须排在 annual 之前**(子串遮蔽，实测踩过)；
-                     topic_rules 段=title_topic 追加规则(有码无码都追加命中 class，
-                     补 provider 码盲区：销售简报/经营数据/发电量走 012305 而非 010309)；
+                     topic_rules 段=title_topic 追加规则(有码无码都追加命中 class 并给
+                     下载资格，补 provider 码盲区；关键词是纯子串禁含 %)；
                      noise_rules 段=title_noise 负向规则(标题命中=绝对不下载不解析，
-                     覆盖不能翻；加词必须先跑全库+候选层误伤核验并写 note)
+                     覆盖不能翻；match=all 按序 % 连接=语序敏感)
 ```
+
+词表工程原则(2026-07-13 泛化审计定案，加删词必须遵守；决策与证据见
+docs/implementation/reviews/vocab-generalization-2026-07-13.md)：
+
+1. **语料证据强制**：每条前缀/关键词携带分层命中记录写入 note(池内+池外，标注留出集)；
+   零命中规则要么删除、要么显式标注"占位待语料"并列入复审。禁止凭官方码表或单公司孤例入表
+   (死词表 010309/01211160 的教训)。
+2. **池外+留出集双段核验**：先在池外多行业语料跑全命中清单逐条判读，再用未参与推导的
+   留出集复验；match=all 关键词语序必须与证据标题语序逐条一致(SQL LIKE 有序——语序变体
+   是实测最大漏杀源：长城/北交所/中远海控三家各击穿过一条连排锚)。
+3. **双轨互检指标化**：码与标题的分歧即告警——"码零命中而标题高值"=码盲区、"title 兜底
+   撑起 process 分类但无下载资格"=资格裂缝(基线 432 行)、"前缀在语料零出现"=死词表；
+   按 doctor/审计对账指标持续监控，不等下次人工审计。
 
 硬规则：凭据只从 settings 进(构造注入)，query_params/日志一律先脱敏；
 provider 词表 cninfo:p_info3015 / p_stock2100 / hisAnnouncement / download_pdf

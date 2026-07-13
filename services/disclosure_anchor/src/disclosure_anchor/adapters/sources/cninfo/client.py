@@ -25,7 +25,7 @@ RETRYABLE_RESULT_CODES = frozenset({-1, 403, 404, 405})
 # 配额/限流（信封 resultcode=429）：参照 edgartools 对 SEC 429 的处理——请求内
 # 立即失败（重试只会烧配额/延长封禁），但 retryable=true 留给下一轮；worker 侧
 # 另有轮级熔断（design/watchlist-operations.md §5.3）。
-QUOTA_RESULT_CODE = 429
+QUOTA_RESULT_CODES = frozenset({407, 408, 412, 429})
 QUOTA_ERROR_CODE = "quota_exhausted"
 TOKEN_REFRESH_RESULT_CODES = frozenset({404, 405})
 BACKOFF_BASE_SECONDS = 1.0
@@ -192,7 +192,14 @@ class CninfoClient:
         }
         started = time.perf_counter()
         self._bucket.take()
-        response = self._client.post(TOKEN_ENDPOINT, data=body)
+        try:
+            response = self._client.post(TOKEN_ENDPOINT, data=body)
+        except httpx.TransportError as exc:
+            raise CninfoClientError(
+                "CNINFO token transport failed",
+                error_code="transport_error",
+                retryable=True,
+            ) from exc
         elapsed_ms = _elapsed_ms(started)
         audit = RequestAudit(
             provider_interface="cninfo:token",
@@ -254,9 +261,9 @@ class CninfoClient:
             resultcode = response.audit.resultcode
             if response.audit.http_status < 400 and resultcode == 200:
                 return response
-            if resultcode == QUOTA_RESULT_CODE:
+            if resultcode in QUOTA_RESULT_CODES:
                 raise CninfoClientError(
-                    "CNINFO quota/rate limit exhausted (resultcode 429)",
+                    f"CNINFO quota/billing limit reached (resultcode {resultcode})",
                     error_code=QUOTA_ERROR_CODE,
                     retryable=True,
                     audit=response.audit,
@@ -296,7 +303,14 @@ class CninfoClient:
         url = f"{BASE_URL}{path}"
         started = time.perf_counter()
         self._bucket.take()
-        http_response = self._client.get(url, params=_http_params(params))
+        try:
+            http_response = self._client.get(url, params=_http_params(params))
+        except httpx.TransportError as exc:
+            raise CninfoClientError(
+                f"CNINFO transport failed for {provider_interface}",
+                error_code="transport_error",
+                retryable=True,
+            ) from exc
         elapsed_ms = _elapsed_ms(started)
         payload = _json_payload(http_response, provider_interface=provider_interface)
         resultcode = _resultcode(payload)
@@ -322,7 +336,18 @@ class CninfoClient:
         while True:
             started = time.perf_counter()
             self._bucket.take()
-            response = self._client.get(url, params=_http_params(params))
+            try:
+                response = self._client.get(url, params=_http_params(params))
+            except httpx.TransportError as exc:
+                if attempt >= self._max_retries:
+                    raise CninfoClientError(
+                        f"CNINFO transport failed for {provider_interface}",
+                        error_code="transport_error",
+                        retryable=True,
+                    ) from exc
+                self._sleep(self._next_delay(attempt))
+                attempt += 1
+                continue
             audit = RequestAudit(
                 provider_interface=provider_interface,
                 query_params=redact_params(params),

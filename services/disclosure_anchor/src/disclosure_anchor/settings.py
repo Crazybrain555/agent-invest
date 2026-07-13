@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -139,8 +139,9 @@ class Settings(BaseSettings):
             "DISCLOSURE_ENABLE_ADMIN_API", "disclosure_enable_admin_api"
         ),
     )
-    # Backfill backpressure: when the pending-download queue exceeds this cap,
-    # never-synced companies are deferred to a later round (batched intake).
+    # Backfill backpressure: when pending-download + downloaded/pending-parse
+    # work reaches this watermark, never-synced companies are deferred.  The
+    # env key keeps its original name for compatibility.
     disclosure_backfill_max_pending_downloads: int = Field(
         default=2000,
         ge=0,
@@ -193,17 +194,17 @@ class Settings(BaseSettings):
         ),
     )
     worker_batch_sync: int = Field(
-        default=5,
+        default=13,
         ge=0,
         validation_alias=AliasChoices("WORKER_BATCH_SYNC", "worker_batch_sync"),
     )
     worker_batch_download: int = Field(
-        default=10,
+        default=50,
         ge=0,
         validation_alias=AliasChoices("WORKER_BATCH_DOWNLOAD", "worker_batch_download"),
     )
     worker_batch_parse: int = Field(
-        default=3,
+        default=50,
         ge=0,
         validation_alias=AliasChoices("WORKER_BATCH_PARSE", "worker_batch_parse"),
     )
@@ -213,7 +214,7 @@ class Settings(BaseSettings):
     worker_parse_concurrency: int = Field(
         default=1,
         ge=1,
-        le=16,
+        le=8,
         validation_alias=AliasChoices(
             "WORKER_PARSE_CONCURRENCY", "worker_parse_concurrency"
         ),
@@ -235,6 +236,29 @@ class Settings(BaseSettings):
             "WORKER_LOOP_INTERVAL_SECONDS", "worker_loop_interval_seconds"
         ),
     )
+    worker_loop_max_interval_seconds: int = Field(
+        default=1800,
+        ge=1,
+        validation_alias=AliasChoices(
+            "WORKER_LOOP_MAX_INTERVAL_SECONDS",
+            "worker_loop_max_interval_seconds",
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_parallel_parser_backend(self) -> "Settings":
+        if self.worker_parse_concurrency > 1:
+            if not self.disclosure_mineru_backend.endswith("-http-client"):
+                raise ValueError(
+                    "WORKER_PARSE_CONCURRENCY > 1 requires a MinerU "
+                    "*-http-client backend; local parallel MinerU is unsafe"
+                )
+            if self.disclosure_mineru_server_url is None:
+                raise ValueError(
+                    "WORKER_PARSE_CONCURRENCY > 1 requires "
+                    "DISCLOSURE_MINERU_SERVER_URL"
+                )
+        return self
 
     @property
     def agent_system_root(self) -> Path:

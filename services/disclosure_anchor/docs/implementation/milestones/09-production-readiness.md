@@ -11,8 +11,8 @@ depends_on: milestones 00-08 + phase008 数据质量整改（rounds 1-7）
 
 目标（用户指令 2026-07-06）："尽全力把 disclosure_anchor 做到能够实现生产的状态"。
 生产形态 = 运营者只维护公司清单（config/watchlist.csv），服务按默认参数持续盯盘：
-初始回补三年（用户裁决"三年是底线"），全量登记+分层解析（核心集见
-src/…/application/worker/parse_scope.json），launchd 每 2 小时一轮 worker。
+初始回补三年（用户裁决"三年是底线"），全量登记 + processing_policy 分层处理，
+launchd KeepAlive 常驻 worker；有积压零等待排水，空队列 15→30 分钟退避。
 
 背账来源：2026-07-07 六维度并行审计 + 完备性 critic（≈39 万 token 通读代码，
 findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除）。
@@ -47,9 +47,10 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
 
 ### 2026-07-13 数据质量与可观测性后续（从本地任务状态提升）
 
-- [ ] **register_local_pdf 身份防污染**：对 provider-specific document ID 做 preflight；
-  `provider=cninfo` 时只接受数字 TEXTID，其他本地导入必须使用显式 manual namespace，禁止把目录描述
-  当作去重键。验收：非法 ID 在归档/写库前失败；合法本地导入在 scratch DB 回归，绝不触碰 live corpus。
+- [x] **register_local_pdf 身份防污染（2026-07-13）**：`provider=cninfo` 只接受 1–128 位
+  ASCII 数字 TEXTID；非法 ID 在归档/写库前失败，API=422、CLI=exit 2；文件名自动推导只认
+  `__<数字TEXTID>.pdf` 尾段，删除 `local-<hash>`/目录名兜底。当前 official provider 闭集只有
+  cninfo；若未来引入 manual provider，必须先设计独立 namespace，不能复用 cninfo identity。
 - [ ] **S 规则单元噪声升版**：治理纯勾选空壳、参会花名册、尾表夹带 Q&A 和题号跨页错位，
   不得按长度一刀切。验收：使用真实 annual/IR 样本，保留财务数字与有效否定；先把尾表夹带正文
   抽回再删模板；builder rules 版本化并验证 rebuild/change 语义。
@@ -70,6 +71,8 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
   - 修法：Write docs/architecture/l2-consumer-guide.md: bootstrap recipe, change-feed tailing contract (cursor rules, delivery semantics), an event-kind → required-action table, error-code handling (GONE_SUPERSEDED, L1_PROCESSING_REQUIRED), and the DB-view-vs-API decisi
 - [ ] (M/COMPLETENESS CRITIC) **No CNINFO quota budgeting or request metering: per-request audits vanish into an unconfigured DEBUG **
   - 修法：Persist per-interface request counts per worker round (thread the client audit counts into WorkerReport and the daily report), map resultcode 407 to a distinct quota_exhausted error that short-circuits the remaining sync/download items in the round, and add ba
+  - 2026-07-13：407/408/412/429 已统一映射 quota_exhausted，worker 与 track profile resolution
+    均首错断批，sync 30→60→120m cooldown；尚欠持久的按interface计量/预算和报警，故本项不关闭。
 - [ ] (S/DOCS/CONTRACT DRIFT) **Canonical service-purpose §5.2 still says document_unit has only three kinds (text/table/qa), contra**
   - 修法：Update §5.2 to list four payload kinds (or say "three content kinds plus mixed composition, see §6.5") and change the v0.7 wording to v0.8 so the canonical contract is internally consistent.
 - [ ] (S/DOCS/CONTRACT DRIFT) **Canonical query-key list omits semantic_keys / applicability / page_no, which 0010/0013 made first-c**
@@ -90,32 +93,44 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
   - 修法：Append a "### ub-2026.07-9" section to milestone 05 §8.5 describing the round7 rules (approval-style proposal anchor, QA-table-as-table needs_review, caption/flat-doc anchoring) so builder_rules_version provenance resolves to documented semantics.
 - [ ] (M/FAILURE PATHS AND RESILIENCE) **Publish stage has no attempt counter or persisted failure state — poison runs retry forever (confirm**
   - 修法：Add publish_attempt_count/publish_error to processing_run, persist non-retryable publish failures, filter them in pending_publish, and surface exhausted runs in an ops view plus a CLI resolution path (allow-empty publish already exists for operators).
-- [ ] (S/FAILURE PATHS AND RESILIENCE) **Build attempt cap is bypassed for most poison-IR failures — infinite build retry loop**
-  - 修法：Wrap the whole execute path in a handler that calls _mark_failed with a structured, retryability-classified error for every failure (re-raising unknowns after persisting), so the existing attempt cap actually engages.
-- [ ] (S/FAILURE PATHS AND RESILIENCE) **httpx transport exceptions bypass the retry policy and all failure accounting in both CNINFO channel**
-  - 修法：Wrap httpx transport exceptions into CninfoClientError(retryable=True)/CninfoWebSourceError at the client boundary so backoff, retry caps, and failed source_access accounting all engage.
-- [ ] (M/FAILURE PATHS AND RESILIENCE) **Silent partial index sync still advances the checkpoint — permanent announcement gaps**
-  - 修法：Treat a non-list 'records' as a chunk failure (raise, do not advance checkpoint); validate count vs len(records) and page until exhausted; only advance the checkpoint after all chunks validate.
+  - 2026-07-13 临时保护：空 run 已从自动队列排除；非空 publish 失败每轮最多一次并触发
+    parse+publish 120s 指数 cooldown。持久 attempt cap/人工 requeue 仍未完成，故本项不关闭。
+- [x] (S/FAILURE PATHS AND RESILIENCE) **Build attempt cap 曾被 poison-IR 绕过（2026-07-13）**
+  - 已将 post-context IR/rule 构建纳入 failure-marking 边界；已知 BuildUnitsError/OSError 持久化，
+    未知错误先持久化 structured failure 再抛，现有 attempt cap 对整条 execute 路径生效。
+- [ ] (S/FAILURE PATHS AND RESILIENCE) **Web fallback transport exceptions still需统一进 retry/failure accounting**
+  - 2026-07-13：生产 WebAPI client 已将 JSON/PDF `httpx.TransportError` 包为
+    `transport_error,retryable=true` 并按 cap 重试；worker 继续 stage-local cooldown。web fallback
+    channel 的统一包装仍是剩余项，故不把原“两通道” finding 整体关闭。
+- [x] (M/FAILURE PATHS AND RESILIENCE) **Silent partial index sync advanced checkpoint — fixed 2026-07-13**
+  - `records` 非 array/含非 object、`count/total` 缺失或不等于 records 长度均 retryable
+    fail-closed；任一 ≤30d chunk 失败则整家公司不推进 checkpoint，下一轮重做窗口。
 - [ ] (M/FAILURE PATHS AND RESILIENCE) **Worker download queue never re-downloads revised announcements — the supersede/B7 logic is unreachab**
   - 修法：Port the B7 predicate (correction signal, signature mismatch, overlap window) into pending_download_v1 or queries.pending_downloads so the worker and CLI share one queue definition.
-- [ ] (M/FAILURE PATHS AND RESILIENCE) **One systemic error (DB loss, missing credentials) kills the worker loop; no restart story; singleton**
-  - 修法：Catch systemic errors in the loop with bounded backoff instead of dying; ship/document a supervisor unit with restart policy; re-verify the singleton lock at the start of each round.
+- [x] (M/FAILURE PATHS AND RESILIENCE) **One systemic error killed the worker loop（2026-07-13）**
+  - 常驻 loop 现在逐轮 catch + synthetic failure report + 60s 指数退避；每轮复核 dedicated
+    singleton lock，锁/连接丢失 fail-closed；launchd KeepAlive 负责进程级重启。source 构造、
+    CNINFO retryable outage、parser、publish、report I/O 各自 cooldown，本地阶段不被上游故障拖死。
 - [ ] (M/FAILURE PATHS AND RESILIENCE) **Transient 403 / non-PDF download responses are recorded retryable=false and permanently poison annou**
   - 修法：Make download 403s and non-PDF bodies retryable up to the cap; add an ops dead-letter view for exhausted/quarantined candidates and a requeue command.
 - [ ] (S/FAILURE PATHS AND RESILIENCE) **Unknown parse exceptions persist retryable=False — transient infra faults (disk full) permanently dr**
   - 修法：Classify OSError and DB disconnects as retryable in the fallback handler, or default unknown errors to retryable=True so they consume the existing max_parse_retries cap instead of being terminal on first occurrence.
 - [ ] (M/FAILURE PATHS AND RESILIENCE) **CNINFO quota/auth outage: no circuit breaker, no automatic web-channel failover, signal buried in ma**
-  - 修法：Add a per-provider circuit breaker (skip sync/download stages after N consecutive auth/quota failures in a round), optional automatic web-channel fallback for index sync, and an explicit alarm condition when a round is 100% source failures.
+  - 2026-07-13：quota breaker 已完成；category lookup 不再吞 quota，retryable 5xx/transport 也首错停止
+    剩余source batch并stage cooldown。剩余范围收窄为auth专用判定、自动web-channel fallback和100%
+    source failure报警，故本项不关闭。
 - [ ] (M/FAILURE PATHS AND RESILIENCE) **No dead-letter observability anywhere: exhausted parse/download/publish items are invisible and the **
   - 修法：Add per-stage exhausted/dead-letter ops views, a doctor check that FAILs on nonzero dead-letter counts, and nonzero exit or an alarm marker when rounds are fully failing.
-- [ ] (M/OPERATIONS AND DEPLOYMENT) **worker-loop has no supervision and dies permanently on the first error that escapes per-item isolati**
-  - 修法：Wrap run_once in the loop with catch-log-backoff for transient errors (bounded exponential backoff, re-verify the singleton lock connection each round via a ping on lock_conn, exit if the lock was lost). Provide a KeepAlive launchd plist (or document `launchct
+- [x] (M/OPERATIONS AND DEPLOYMENT) **worker-loop supervision（2026-07-13）**：`run_once`
+  轮级异常有 report/backoff，singleton 每轮复核；plist 已改 KeepAlive，wrapper 以 `loop` 启动；
+  SIGTERM 停止补 future、终止活跃 MinerU 子进程组，launchd 可安全重启。
 - [ ] (M/OPERATIONS AND DEPLOYMENT) **Operator cannot tell why a document failed without psql: no logging is configured, worker reports re**
   - 修法：Configure stdlib logging (timestamped, to stderr and optionally runtime/logs/) at CLI entry; include str(exc) and a traceback log line for unexpected failures; add exception message to WorkerFailure; persist MinerU stderr tail into processing_run.error or the 
 - [ ] (M/OPERATIONS AND DEPLOYMENT) **No database backup story at all, and both the DB cluster and the immutable raw archive live on the s**
   - 修法：Add a `make pg-backup` target (pg_dump -Fc to a different physical volume, or wal-g/pgBackRest), schedule it alongside doctor, and document restore. Decide raw-archive redundancy (second disk or cloud sync of raw_documents, which is only 45MB today). Define re
-- [ ] (M/OPERATIONS AND DEPLOYMENT) **Default worker knobs cannot service the stated ≥500-company scope, and the fully serial round couple**
-  - 修法：Retune defaults for the 500-company target (larger sync batch — sync is cheap index fetching; sleep-less rounds when queues are non-empty), and/or decouple the sync/download cadence from the parse stage (e.g. separate loop intervals or skip sleep while pending
+- [ ] (M/OPERATIONS AND DEPLOYMENT) **Default worker knobs 对 ≥500-company 仍需单独压测**
+  - 2026-07-13 已完成 200 股目标的最小修复：有进展零等待、sync/download/parse=13/50/50、
+    concurrency 硬顶 8、回补背压 2000；500 家候选量、磁盘与 quota 尚未实测，故本项不关闭。
 - [ ] (M/OPERATIONS AND DEPLOYMENT) **The one human-maintained input — the company list — has no operator tooling: no bulk seed, no list/p**
   - 修法：Add a `tracked-companies` CLI (import CSV of scodes with default backfill window, list, pause/resume) reusing the existing upsert; make the worker skip-and-report companies without securities once (mark tracked_company status or write a checkpoint) instead of 
 - [ ] (M/OPERATIONS AND DEPLOYMENT) **Disk growth is unmanaged: ~17x artifact amplification per parse, retries and superseded runs never g**
@@ -172,10 +187,12 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
   - 修法：Record the channel in the checkpoint cursor (or use channel-scoped scope_keys), and prefer the API-channel candidate when both channels have snapshotted the same announcement.
 - [ ] (S/FAILURE PATHS AND RESILIENCE) **Stale reclaim can fail a legitimately running manual parse; no validation that stale threshold excee**
   - 修法：Validate stale_run_threshold_seconds > disclosure_parse_timeout_seconds at settings load; longer term, add a heartbeat column to running runs instead of a fixed age threshold.
-- [ ] (M/FAILURE PATHS AND RESILIENCE) **Shutdown during a parse orphans the MinerU process group**
-  - 修法：On SIGTERM, forward the signal to the active MinerU process group and mark the run failed-retryable immediately; document a supervisor stop timeout larger than the parse timeout.
-- [ ] (S/FAILURE PATHS AND RESILIENCE) **sync_due mixes Shanghai dates with UTC date truncation — effective sync cadence stretches to ~2x the**
-  - 修法：Store a last_synced_at timestamp in the checkpoint cursor and compare timestamps without date truncation (or normalize both sides to Shanghai dates).
+- [x] (M/FAILURE PATHS AND RESILIENCE) **Shutdown during parse orphaned MinerU — fixed 2026-07-13**
+  - SIGINT/SIGTERM 停止 pool refill、取消未开始 future，并终止登记的 MinerU process group；
+    当前文档失败可重试，singleton session lock 随进程退出释放。
+- [x] (S/FAILURE PATHS AND RESILIENCE) **sync_due date truncation / stale timestamp — fixed 2026-07-13**
+  - due 直接比较 checkpoint `updated_at + interval`；repository cursor update 同步刷新
+    `updated_at`，不再把上海日期截断成约两日 cadence。
 - [ ] (M/FAILURE PATHS AND RESILIENCE) **Unbounded growth: index snapshots accumulate forever and pending_download_v1 rescans all history; do**
   - 修法：Prune or supersede old index snapshots (or restrict the view to the newest access per company), index the extraction, and stream downloads to the tmp file with a max-size guard.
 - [ ] (M/OPERATIONS AND DEPLOYMENT) **Doctor's per-run integrity checks are unbounded and will make `make doctor` unusably slow and noisy **

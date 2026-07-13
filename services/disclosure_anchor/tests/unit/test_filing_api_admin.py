@@ -187,6 +187,28 @@ class FilingApiAdminTests(unittest.TestCase):
         self.assertNotIn("/", response.quarantined_path)
         self.assertEqual(deps.register_command.provider, "cninfo")
         self.assertEqual(deps.register_command.security_code, "002484")
+        self.assertEqual(deps.register_command.exchange, "SZSE")
+
+    def test_register_local_pdf_rejects_non_textid_as_422(self) -> None:
+        deps = _Deps()
+        with self.assertRaises(FilingApiError) as raised:
+            register_local_pdf(
+                _request(deps),
+                RegisterLocalPdfRequest(
+                    file_path=Path("/service/input.pdf"),
+                    company_legal_name="江海股份",
+                    security_code="002484",
+                    exchange="SZSE",
+                    filing_type="other",
+                    title="短公告",
+                    announcement_date=date(2026, 7, 5),
+                    provider_document_id="年度报告目录",
+                    provider="cninfo",
+                ),
+            )
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertIsNone(deps.register_command)
 
     def test_parse_uses_parser_options_defaults_and_overrides(self) -> None:
         deps = _Deps()

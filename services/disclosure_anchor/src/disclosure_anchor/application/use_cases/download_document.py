@@ -35,7 +35,7 @@ from disclosure_anchor.domain.errors import (
     RegistrationMetadataError,
     SourceRequestError,
 )
-from disclosure_anchor.domain.value_objects import ReportPeriod
+from disclosure_anchor.domain.value_objects import ReportPeriod, infer_mainland_exchange
 
 
 DOWNLOAD_INTERFACE = "cninfo:download_pdf"
@@ -56,6 +56,8 @@ class DownloadDocumentResult:
     reused_existing_document: bool = False
     quarantined_path: Path | None = None
     quarantine_reason: str | None = None
+    error_code: str | None = None
+    retryable: bool | None = None
 
 
 class DownloadDocument:
@@ -110,6 +112,8 @@ class DownloadDocument:
                     document_id=None,
                     source_access_id=source_access.source_access_id,
                     raw_file_hash=None,
+                    error_code=exc.error_code,
+                    retryable=exc.retryable,
                 )
             tmp_path.write_bytes(payload)
             try:
@@ -148,6 +152,8 @@ class DownloadDocument:
                     raw_file_hash=None,
                     quarantined_path=quarantine.path,
                     quarantine_reason=quarantine.reason,
+                    error_code="invalid_raw_document",
+                    retryable=False,
                 )
             return self._register(candidate=candidate, ref=ref, raw=raw, command=command)
         finally:
@@ -253,8 +259,16 @@ def _ref_from_candidate(candidate: Mapping[str, object]) -> AnnouncementRef:
 def _subject_candidate_from_existing_security(
     *, uow: UnitOfWork, ref: AnnouncementRef, exchange: str | None
 ) -> SubjectCandidate:
-    exchanges = [exchange] if exchange else []
-    exchanges.extend(item for item in ("SZSE", "SSE", "LOCAL") if item not in exchanges)
+    if exchange:
+        exchanges = [exchange]
+    else:
+        try:
+            exchanges = [infer_mainland_exchange(ref.security_code), "LOCAL"]
+        except ValueError:
+            # Provider-neutral/manual snapshots may carry an extensible local
+            # identity. Mainland shapes, however, must never be probed through
+            # known-wrong exchanges now that lookups validate canonical pairs.
+            exchanges = ["LOCAL"]
     security = None
     for candidate_exchange in exchanges:
         if candidate_exchange is None:

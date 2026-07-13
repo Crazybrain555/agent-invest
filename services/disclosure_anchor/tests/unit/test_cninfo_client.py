@@ -104,6 +104,53 @@ class CninfoClientTests(unittest.TestCase):
         self.assertEqual(sleeps, [0.25])
         client.close()
 
+    def test_json_transport_error_is_retried(self) -> None:
+        api_attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal api_attempts
+            if request.url.path.endswith("/oauth2/token"):
+                return httpx.Response(200, json={"access_token": ACCESS_TOKEN})
+            api_attempts += 1
+            if api_attempts == 1:
+                raise httpx.ConnectError("temporary reset", request=request)
+            return httpx.Response(
+                200,
+                json={"resultcode": 200, "count": 0, "records": []},
+            )
+
+        client = _client(handler, sleep=lambda _: None, jitter=lambda _: 0.0)
+
+        client.get_json(
+            provider_interface="cninfo:p_info3015",
+            path="/api/info/p_info3015",
+            params={"scode": "000001"},
+        )
+
+        self.assertEqual(api_attempts, 2)
+        client.close()
+
+    def test_download_transport_error_is_retried(self) -> None:
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ReadError("temporary reset", request=request)
+            return httpx.Response(200, content=b"%PDF-1.4\n%%EOF\n")
+
+        client = _client(handler, sleep=lambda _: None, jitter=lambda _: 0.0)
+
+        payload, _ = client.download_bytes(
+            provider_interface="cninfo:download_pdf",
+            url="https://static.cninfo.example/test.PDF",
+        )
+
+        self.assertTrue(payload.startswith(b"%PDF-"))
+        self.assertEqual(attempts, 2)
+        client.close()
+
     def test_400_is_not_retryable(self) -> None:
         calls = 0
 
@@ -127,6 +174,33 @@ class CninfoClientTests(unittest.TestCase):
         self.assertFalse(raised.exception.retryable)
         self.assertEqual(raised.exception.error_code, "http_400")
         client.close()
+
+    def test_quota_and_billing_resultcodes_trip_same_breaker(self) -> None:
+        for resultcode in (407, 408, 412, 429):
+            with self.subTest(resultcode=resultcode):
+                calls = 0
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    nonlocal calls
+                    if request.url.path.endswith("/oauth2/token"):
+                        return httpx.Response(200, json={"access_token": ACCESS_TOKEN})
+                    calls += 1
+                    return httpx.Response(
+                        200,
+                        json={"resultcode": resultcode, "resultmsg": "quota"},
+                    )
+
+                client = _client(handler)
+                with self.assertRaises(CninfoClientError) as raised:
+                    client.get_json(
+                        provider_interface="cninfo:p_info3015",
+                        path="/api/info/p_info3015",
+                        params={"scode": "000001"},
+                    )
+                self.assertEqual(raised.exception.error_code, "quota_exhausted")
+                self.assertTrue(raised.exception.retryable)
+                self.assertEqual(calls, 1)
+                client.close()
 
     def test_token_expiry_resultcode_refreshes_once(self) -> None:
         token_count = 0

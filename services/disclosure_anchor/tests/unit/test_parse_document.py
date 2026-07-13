@@ -289,6 +289,7 @@ class ParseDocumentUnitTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertFalse(parser.called)
         self.assertEqual(result.error["error_code"], "parser_version_probe_failed")
+        self.assertTrue(result.error["retryable"])
         self.assertEqual(uow.documents.get("doc_1").status, "parse_failed")
 
     def test_unknown_exception_persists_failed_run_then_reraises(self) -> None:

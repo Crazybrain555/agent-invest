@@ -33,6 +33,29 @@ class SubjectResolverTests(unittest.TestCase):
         self.assertEqual(identifiers[0].scheme, "uscc")
         self.assertEqual(identifiers[0].normalized_value, "USCC-1")
 
+    def test_security_identity_normalization_prevents_semantic_duplicate(self) -> None:
+        first = self.resolver.resolve(
+            self.uow,
+            SubjectCandidate(
+                security_code="002484",
+                exchange="SZSE",
+                legal_name="江海股份",
+            ),
+        )
+        again = self.resolver.resolve(
+            self.uow,
+            SubjectCandidate(
+                security_code=" 002484 ",
+                exchange=" szse ",
+                legal_name="江海股份",
+            ),
+        )
+
+        self.assertEqual(again.company.company_id, first.company.company_id)
+        self.assertEqual(again.security.security_id, first.security.security_id)
+        self.assertEqual(len(self.uow.companies.all()), 1)
+        self.assertEqual(len(self.uow.securities.all()), 1)
+
     def test_no_legal_name_claim_resolves_existing_company_without_conflict(self) -> None:
         first = self.resolver.resolve(
             self.uow,

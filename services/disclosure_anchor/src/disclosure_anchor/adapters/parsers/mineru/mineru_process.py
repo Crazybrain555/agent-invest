@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,42 @@ from disclosure_anchor.domain.errors import (
     ParserTimeoutError,
     ParserVersionProbeError,
 )
+
+
+_ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
+_ACTIVE_PROCESSES_LOCK = threading.Lock()
+
+
+def _register_process(process: subprocess.Popen[str]) -> None:
+    with _ACTIVE_PROCESSES_LOCK:
+        _ACTIVE_PROCESSES.add(process)
+
+
+def _unregister_process(process: subprocess.Popen[str]) -> None:
+    with _ACTIVE_PROCESSES_LOCK:
+        _ACTIVE_PROCESSES.discard(process)
+
+
+def terminate_active_mineru_processes() -> int:
+    """Kill active MinerU process groups during worker SIGTERM/SIGINT.
+
+    The parse thread observes the non-zero return, persists a retryable
+    invocation failure, and exits.  Taking a snapshot avoids holding the
+    registry lock while delivering signals.
+    """
+
+    with _ACTIVE_PROCESSES_LOCK:
+        processes = tuple(_ACTIVE_PROCESSES)
+    terminated = 0
+    for process in processes:
+        if process.poll() is not None:
+            continue
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+        terminated += 1
+    return terminated
 
 
 def _kill_process_group(process: subprocess.Popen[str]) -> None:
@@ -39,9 +76,11 @@ class MinerUProcess:
         *,
         executable: Path,
         extra_env: dict[str, str] | None = None,
+        version_timeout_seconds: float = 10.0,
     ) -> None:
         self._executable = executable
         self._extra_env = extra_env or {}
+        self._version_timeout_seconds = version_timeout_seconds
 
     def command_for(
         self, *, input_pdf: Path, output_dir: Path, options: ParserOptions
@@ -75,18 +114,39 @@ class MinerUProcess:
 
     def version(self) -> str:
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 [str(self._executable), "-v"],
-                check=True,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 env=self._env(),
+                start_new_session=True,
             )
-        except (OSError, subprocess.CalledProcessError) as exc:
+        except OSError as exc:
             raise ParserVersionProbeError(
                 f"MinerU version probe failed: {self._executable}"
             ) from exc
-        output = (completed.stdout or completed.stderr).strip()
+        _register_process(process)
+        try:
+            stdout, stderr = process.communicate(
+                timeout=self._version_timeout_seconds
+            )
+        except subprocess.TimeoutExpired as exc:
+            _kill_process_group(process)
+            raise ParserVersionProbeError(
+                "MinerU version probe timed out after "
+                f"{self._version_timeout_seconds}s: {self._executable}"
+            ) from exc
+        except BaseException:
+            _kill_process_group(process)
+            raise
+        finally:
+            _unregister_process(process)
+        if process.returncode != 0:
+            raise ParserVersionProbeError(
+                f"MinerU version probe failed: {self._executable}"
+            )
+        output = (stdout or stderr).strip()
         if not output:
             raise ParserVersionProbeError(
                 f"MinerU version probe returned no output: {self._executable}"
@@ -113,6 +173,7 @@ class MinerUProcess:
             )
         except OSError as exc:
             raise ParserInvocationError(f"MinerU parse failed: {exc}") from exc
+        _register_process(process)
         try:
             stdout, stderr = process.communicate(timeout=options.timeout_seconds)
         except subprocess.TimeoutExpired as exc:
@@ -123,6 +184,8 @@ class MinerUProcess:
         except BaseException:
             _kill_process_group(process)
             raise
+        finally:
+            _unregister_process(process)
         if process.returncode != 0:
             detail = f": {stderr.strip()}" if stderr else ""
             raise ParserInvocationError(f"MinerU parse failed{detail}")

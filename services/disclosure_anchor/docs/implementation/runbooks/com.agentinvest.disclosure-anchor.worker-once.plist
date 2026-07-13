@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Daily worker round (08 §3.7). Not loaded by default; install manually:
-     cp to ~/Library/LaunchAgents/ and `launchctl load` after filling env. -->
+<!-- HISTORICAL / SUPERSEDED: DO NOT INSTALL. Use scripts/install_launchd.sh. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>

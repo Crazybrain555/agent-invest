@@ -22,10 +22,11 @@ from pathlib import Path
 
 from disclosure_anchor.adapters.sources.cninfo.mapper import load_class_map
 from disclosure_anchor.application.use_cases.track_companies import SYNC_FREQUENCIES
+from disclosure_anchor.domain.value_objects import canonical_security_identity
 
 WATCHLIST = Path("config/watchlist.csv")
 POLICY = Path("config/processing_policy.json")
-EXCHANGES = {"SSE", "SZSE"}
+EXCHANGES = {"BSE", "SSE", "SZSE"}
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CODE_RE = re.compile(r"^\d{6}$")
 
@@ -65,6 +66,11 @@ def check_watchlist(errors: list[str], known_classes: frozenset[str]) -> None:
         exchange = (row.get("exchange") or "").strip()
         if exchange and exchange not in EXCHANGES:
             errors.append(f"{where}: exchange {exchange!r} not in {sorted(EXCHANGES)}")
+        elif exchange and CODE_RE.match(code):
+            try:
+                canonical_security_identity(code, exchange)
+            except ValueError as exc:
+                errors.append(f"{where}: {exc}")
         status = (row.get("status") or "").strip() or "active"
         if status not in ("active", "paused"):
             errors.append(f"{where}: status {status!r} must be active|paused")

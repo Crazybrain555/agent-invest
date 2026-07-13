@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.application.ports.file_store import ArtifactWriteResult
@@ -148,6 +149,33 @@ def _uow(root: Path, *, contract_version: str = "normalized_ir.v2") -> tuple[Fak
 
 
 class BuildUnitsTests(unittest.TestCase):
+    def test_unknown_preparation_failure_preserves_structured_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, _ = _uow(root)
+            paths = _PathBuilder(root)
+            use_case = BuildUnits(
+                path_builder=paths,
+                artifact_store=ArtifactStore(paths),
+                uow_factory=lambda: uow,
+            )
+            with (
+                mock.patch(
+                    "disclosure_anchor.application.use_cases.build_units.build_unit_drafts_s1_s7",
+                    side_effect=RuntimeError("builder regression"),
+                ),
+                self.assertRaises(BuildUnitsError) as caught,
+            ):
+                use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+        self.assertEqual(
+            caught.exception.error["error_code"], "BUILD_PREPARATION_FAILED"
+        )
+        self.assertEqual(
+            uow.processing_runs.get("run_1").unit_build_error["error_code"],
+            "BUILD_PREPARATION_FAILED",
+        )
+
     def test_build_writes_snapshot_stats_and_document_units(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -210,7 +238,7 @@ class BuildUnitsTests(unittest.TestCase):
             self.assertEqual(units[0].payload["image_ref"], f"images/{digest}.png")
             self.assertEqual(units[0].quality_status, "needs_review")
 
-    def test_rejects_old_ir_contract(self) -> None:
+    def test_old_ir_contract_is_dead_lettered_and_counts_an_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             uow, _ = _uow(root, contract_version="normalized_ir.v1")
@@ -221,10 +249,12 @@ class BuildUnitsTests(unittest.TestCase):
                 uow_factory=lambda: uow,
             )
 
-            with self.assertRaises(BuildUnitsError) as ctx:
-                use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
 
-            self.assertEqual(ctx.exception.error["error_code"], "IR_CONTRACT_TOO_OLD")
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.error["error_code"], "IR_CONTRACT_TOO_OLD")
+            run = uow.processing_runs.get("run_1")
+            self.assertEqual(run.unit_build_attempt_count, 1)
 
     def test_rejects_already_built_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
