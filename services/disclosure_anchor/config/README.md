@@ -8,7 +8,7 @@
 | 文件 | 管什么 | 改完跑什么 |
 |---|---|---|
 | `watchlist.csv` | 股票池**导入/快照文件**（真源是 DB 的 tracked_company，round22 改判）：一行一只票 + 按公司覆盖（lookback_days / sync_frequency / process_classes，空=继承全局） | 导入：`make track`（自动先 config-check；`DRY_RUN=1` 只看计划；`PRUNE_DRIFT=YES` 全量恢复）；快照：`make track-export`（DB → 本文件，git 留痕） |
-| `processing_policy.json` | 全局处理策略：`process`=下载+解析；`register_only`=只登记元数据。r3(2026-07-13 用户裁决)：EPS 核心精简——process 19 类,dividend/related_party/financing 移出(困境/集团绑定公司按公司 process_classes 加回,万科已配)。carrier 例外（2026-07-12 审计）：带 0129 中介报告码/标题的载体件（法律意见书/核查意见/受托管理…）即使共码命中 process 类也不放行，除非把 intermediary_report 本身加进 process 或按公司覆盖。noise 总闸（2026-07-13 用户裁决）：标题命中包内词表 filing_type_map.json `noise_rules`（r9：78 条 JSON 规则/80 个 SQL pattern）的文档**绝对**不下载不解析，公司覆盖也不能翻——第一阶段拒绝模板件；登记与分类不受影响 | 升版后 `make load-rules`；改前 `make config-check` 验证 |
+| `processing_policy.json` | 全局处理策略：`process`=下载+解析；`register_only`=只登记元数据。r3(2026-07-13 用户裁决)：EPS 核心精简——process 19 类,dividend/related_party/financing 移出(需要时按公司 process_classes 加回并 make track,历史已登记候选自动回补)。carrier 例外（2026-07-12 审计）：带 0129 中介报告码/标题的载体件（法律意见书/核查意见/受托管理…）即使共码命中 process 类也不放行，除非把 intermediary_report 本身加进 process 或按公司覆盖。noise 总闸（2026-07-13 用户裁决）：标题命中包内词表 filing_type_map.json `noise_rules`（r10：78 条 JSON 规则/80 个 SQL pattern）的文档**绝对**不下载不解析，公司覆盖也不能翻——第一阶段拒绝模板件；登记与分类不受影响 | 升版后 `make load-rules`；改前 `make config-check` 验证 |
 
 池子的增删改查（写语义相同：整行 upsert，空可选字段=清除覆盖回继承）：
 

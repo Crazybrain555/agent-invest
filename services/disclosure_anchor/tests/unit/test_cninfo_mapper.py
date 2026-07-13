@@ -27,7 +27,7 @@ class CninfoMapperTests(unittest.TestCase):
     def test_filing_type_rule_bundle_has_required_seed_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
 
-        self.assertEqual(bundle.version, "2026-07-r9")
+        self.assertEqual(bundle.version, "2026-07-r10")
         self.assertEqual(
             {rule.filing_type for rule in bundle.rules},
             {
@@ -87,8 +87,8 @@ class CninfoMapperTests(unittest.TestCase):
         # r9 batch-3 additions (EPS lens): distress tripwire, pharma late-stage
         # approvals, license-out deals, plant commissioning milestones.
         self.assertIn("宽限期", by_class["risk_alert"].keywords)
-        self.assertIn("药品注册批准", by_class["risk_alert"].keywords)
-        self.assertIn("授权许可协议", by_class["major_contract"].keywords)
+        self.assertIn("注册批准", by_class["risk_alert"].keywords)
+        self.assertIn("许可协议", by_class["major_contract"].keywords)
         self.assertIn("小时试运行", by_class["operating_data"].keywords)
         # 电量完成情况 supersedes 发电量完成情况 (substring superset).
         self.assertIn("电量完成情况", by_class["operating_data"].keywords)

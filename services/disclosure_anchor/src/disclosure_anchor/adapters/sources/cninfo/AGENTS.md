@@ -16,7 +16,7 @@ web_source.py        免凭据兜底通道 CninfoWebSource：官网 hisAnnouncem
                      去重键与文件签名跨通道通用
 mapper.py            p_info3015/p_stock2100 → DTO(TEXTID 即 provider_document_id)、
                      F006V 多段拆分映射、report_period 标题推导(07 §3.2 封闭规则)
-filing_type_map.json 规则包(版本化，当前 r8)；**intermediary_report 必须排最前**(carrier 载体
+filing_type_map.json 规则包(版本化，当前 r10)；**intermediary_report 必须排最前**(carrier 载体
                      判定优先——"激励计划法律意见书"是意见书不是激励公告)；
                      **performance_briefing 与 inquiry(双向语序两条)必须排在
                      semiannual/annual/quarterly 之前**(北交所"年度报告业绩说明会预告"
@@ -40,6 +40,11 @@ docs/implementation/reviews/vocab-generalization-2026-07-13.md)：
 3. **双轨互检指标化**：码与标题的分歧即告警——"码零命中而标题高值"=码盲区、"title 兜底
    撑起 process 分类但无下载资格"=资格裂缝(基线 432 行)、"前缀在语料零出现"=死词表；
    按 doctor/审计对账指标持续监控，不等下次人工审计。
+4. **普遍性门槛与不对称原则**（2026-07-13 用户裁决）：只收行业普遍性及以上的规则，
+   单发行人/单事件特例不入表（出现后按需"拉"回：register 永远全量，覆盖/增类后历史已登记
+   候选自动回补——漏=可回补的延迟）；脏数据难清洗、错误会向下游传播——拿不准一律不加，
+   宁漏勿脏（实证：r10 用行业超集"注册批准/许可协议"替换单发行人措辞，而早期 IND/受理/
+   突破性治疗、股东借款、集团绑定关联预计均评估后不加）。
 
 硬规则：凭据只从 settings 进(构造注入)，query_params/日志一律先脱敏；
 provider 词表 cninfo:p_info3015 / p_stock2100 / hisAnnouncement / download_pdf
