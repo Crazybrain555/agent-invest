@@ -25,3 +25,6 @@ venv/
 # OS
 .DS_Store
 ._*
+
+# agent handoff state is worktree-local, never tracked
+docs/agent/

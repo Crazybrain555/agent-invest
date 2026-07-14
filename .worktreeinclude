@@ -1,0 +1,9 @@
+# Gitignored files copied into new agent worktrees by scripts/agent_worktree.sh spawn.
+# docs/agent/ state (HANDOFF.md, parked/, RUNTIME.md) is never copied — worktree-local by protocol.
+.env
+.env.*
+.mcp.json
+.codex/config.toml
+.claude/settings.local.json
+services/*/.env
+services/*/.env.*

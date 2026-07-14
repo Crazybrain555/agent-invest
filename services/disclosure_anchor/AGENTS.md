@@ -14,14 +14,16 @@ Use separate authorities for separate questions:
 2. **What exists now:** current files, runnable commands, schemas, and observed behavior. A mismatch with a
    normative authority is drift to fix or explicitly revise, not an implicit contract override.
 3. **Durable task state:** when a root `AGENTS.md` trigger applies, service-scoped work uses
-   `docs/agent/HANDOFF.md`; cross-repo work uses `../../docs/agent/HANDOFF.md`. Never keep both active in one
-   worktree, and do not recreate the legacy six-file stack when no handoff exists.
+   `docs/agent/HANDOFF.md`; cross-repo work uses `../../docs/agent/HANDOFF.md`. Never keep both holding the
+   worktree gate; parked records (`docs/agent/parked/`, root §3) may exist at both levels. Do not recreate
+   the legacy six-file stack when no handoff exists.
 4. **Setup/config:** `docs/MCP_SETUP_GUIDE.md`, `.codex/config.toml`, `.mcp.json`, and environment templates,
    each only for its own surface.
 
-`docs/agent/HANDOFF.md` is worktree-local, gitignored, and never copied implicitly to another worktree. Durable
-policy and product facts belong in tracked files — this `AGENTS.md` or product documentation — never only in a
-handoff. Legacy task files, archives, and notes are read-only migration/history evidence.
+`docs/agent/HANDOFF.md` and `docs/agent/parked/` are worktree-local, gitignored, and never copied implicitly
+to another worktree. Durable policy and product facts belong in tracked files — this `AGENTS.md` or product
+documentation — never only in a handoff. Legacy task files, archives, and notes are read-only
+migration/history evidence.
 
 ## 2. Service hard boundaries
 
@@ -76,9 +78,10 @@ that must be re-verified for an ops task, not as permanent prompt facts.
 - Changes involving disclosure inputs, parser outputs, archive storage, DB publication, APIs, or worker state
   use representative local samples when available. Synthetic-only validation needs a recorded exception; see
   `docs/implementation/checks/fixture-and-test-policy.md`.
-- For policy/config changes, parse every changed TOML/JSON file with project-venv Python, validate any active
-  `HANDOFF.md` fields/line budget/unique writer and documented commands, measure the applicable instruction-file
-  chain against each tool's documented size limits, and run `git diff --check`.
+- For policy/config changes, parse every changed TOML/JSON file with project-venv Python, validate any
+  gate-holding `HANDOFF.md` and `docs/agent/parked/` records (fields, line budgets, single gate-holder per
+  worktree) and documented commands, measure the applicable instruction-file chain against each tool's
+  documented size limits, and run `git diff --check`.
 
 Before completing a material change to runtime behavior, public contracts, setup/validation commands, agent
 policy, or durable-workflow semantics, obtain an independent read-only review from an agent/user path that did
@@ -87,5 +90,5 @@ files, and validation evidence; it must not edit or update state. Findings are c
 evidence-backed items. Ordinary state progress and trivial factual/typographic edits do not trigger review.
 
 Completion means acceptance is met, relevant checks passed or exact blockers are recorded, and required
-material review findings are resolved or explicitly deferred by the user. Update only the active HANDOFF when
-one exists; otherwise report the result directly.
+material review findings are resolved or explicitly deferred by the user. Update only the gate-holding
+HANDOFF or the task's own parked record when one exists; otherwise report the result directly.

@@ -7,7 +7,8 @@ L1 轻资产登记服务：dataset_snapshot（结构化数据查询结果）+ to
 
 Keep this file thin: norms + pointers. When a root `AGENTS.md` durable trigger applies, a service task uses
 its gitignored `docs/agent/HANDOFF.md`; cross-repo work uses `../../docs/agent/HANDOFF.md`. Never keep both
-active in one worktree. Any legacy task files are read-only migration/history evidence.
+holding the worktree gate; parked records (`docs/agent/parked/`, root §3) may coexist. Any legacy task files
+are read-only migration/history evidence.
 
 ## Hard rules
 

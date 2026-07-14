@@ -43,7 +43,8 @@ unrelated parent rules. `AGENTS.md` is Codex project guidance; Claude-specific w
 5. **Secrets:** real credentials live in environment variables or private user-level config. Tracked files and
    examples contain placeholders only; replace exposed credentials and tell the user to rotate them.
 6. **Git/external actions:** do not commit, push, rewrite history, publish, or make other external writes unless
-   the user explicitly asks. Never run destructive cleanup without explicit approval.
+   the user explicitly asks. Local commits on a spawned `task/<task-key>` branch are the one standing
+   exception (§3). Never run destructive cleanup without explicit approval.
 7. **Service ownership:** migrations write only the owning component's schemas/roles. Shared-package changes and
    public-contract changes update all affected consumers, exports, tests, and docs together.
 
@@ -52,26 +53,70 @@ unrelated parent rules. `AGENTS.md` is Codex project guidance; Claude-specific w
 - Default to bounded, in-scope work. Read-only requests authorize inspection/reporting; change/fix requests
   authorize requested local edits and non-destructive validation. Ask before destructive, external, costly,
   credential/permission, commit/push, or materially scope-expanding actions.
-- A gitignored `docs/agent/HANDOFF.md` is mandatory when work is expected to cross sessions; changes
-  architecture, a public contract, migration/data boundary, or high-risk operations; has material unknowns;
-  is explicitly requested as durable; resumes an existing durable task; or pauses awaiting a user decision.
-  Create it before the first task mutation, or before yielding when a bounded task first meets a trigger.
-- In every new session, before the first repository mutation, inspect the root and nearest component
-  `docs/agent/HANDOFF.md` when present and announce its task/state/writer once. Any unresolved handoff—
-  `active`, `monitoring`, `waiting_user`, `paused`, or `blocked`—keeps its gate and writer ownership; stay
-  read-only until it is explicitly handed off, closed/completed, or isolated in a different worktree. Never
-  infer ownership from recency, and replace/delete a handoff only after an explicit closed/completed transition.
+- A gitignored durable record — `docs/agent/HANDOFF.md`, or a parked record once parked — is mandatory when
+  work is expected to cross sessions; changes architecture, a public contract, migration/data boundary, or
+  high-risk operations; has material unknowns; is explicitly requested as durable; resumes an existing
+  durable task; or pauses awaiting a user decision. Create it before the first task mutation, or before
+  yielding when a bounded task first meets a trigger.
+- Task records and locks are separate things. Per worktree, `docs/agent/HANDOFF.md` holds the single
+  gate-holding task and `docs/agent/parked/<task-key>.md` holds any number of parked tasks. The worktree
+  write gate is held exactly while an unclosed `HANDOFF.md` exists anywhere in the worktree; a session that
+  does not own that gate makes no working-tree mutation there, however small — it works in a separate
+  worktree instead. Closed means `State:` is exactly `closed` or `completed`; a missing, malformed, or novel
+  state counts as unclosed and holds the gate.
+- A gate-holding handoff keeps a named writer; the writer changes only by parking, closing, or an explicit
+  user handoff. Closing requires the worktree to carry none of the task's uncommitted edits — closing over
+  live dirt is invalid; the gate follows protected state. The user's resolution of a gate-holding task's
+  pending decision authorizes the resuming session to claim its writer slot; unrelated requests never do,
+  and a crashed or absent session's unclosed task is reclaimed only on explicit user instruction, never
+  inferred from recency.
+- Parking is one step: write `docs/agent/parked/<task-key>.md` and delete `HANDOFF.md`; the gate releases
+  with that deletion. Parking (`waiting_user`, `blocked`, `paused`, `monitoring`) requires: no uncommitted
+  working-tree edits of the task's own (committed to its `task/` branch, or none) and runtime claims
+  released in `RUNTIME.md` — only a `monitoring` record may retain listed claims. A task that cannot meet
+  these — e.g. `waiting_user` over an uncommitted diff — stays in `HANDOFF.md` and keeps the gate.
+- A parked record never gates the worktree; it names its pending decision and premises (the paths and
+  subjects the decision rests on). No session in any worktree edits those premises or acts on the pending
+  decision until the user resolves it. Resuming moves the record back into a free `HANDOFF.md` slot (absent
+  or closed) and deletes the parked file in the same step; a task the user resolves without further work is
+  closed by deleting its parked record after reporting the outcome.
+- In every new session, before the first repository mutation, read this worktree's root and nearest
+  component `docs/agent/HANDOFF.md` and `docs/agent/parked/` — and, when working in a spawned worktree, the
+  primary checkout's root and affected-component `parked/` — and announce the gate task/state/writer and
+  each parked key/state once. Claim the writer slot only when no unclosed `HANDOFF.md` exists anywhere in
+  the worktree (`scripts/agent_worktree.sh list` shows them all) and the tree is clean or every dirty path
+  belongs to the record being resumed. Claims are check-then-verify: after writing `HANDOFF.md` or a
+  `RUNTIME.md` row, re-read it before the first mutation; if the writer/owner differs, back off and
+  re-announce.
 - Cross-repo work uses root `docs/agent/HANDOFF.md`; component work uses the nearest component handoff.
-  One worktree has at most one active task and one owning writer. Different modifying tasks use different
-  worktrees. Reviewers and helper agents are read-only. Shared PostgreSQL, AgentSSD, worker, and launchd state
-  still has one runtime owner.
-- A handoff is local to its checkout/worktree and is not copied through Git or `.worktreeinclude`. A receiving
-  session must resume in that checkout or perform an explicit handoff. Before archiving/deleting a task or
-  worktree, close it or transfer every unresolved user gate and external-state obligation.
+  One worktree has at most one gate-holding task and one owning writer (root or component level, not both).
+  Parallel mutating tasks use separate worktrees — `scripts/agent_worktree.sh spawn <task-key>` creates
+  `../agent-invest-worktrees/<task-key>` on branch `task/<task-key>`, copies `.worktreeinclude` files, and
+  surfaces the primary checkout's parked guards; `reap` removes only a clean worktree whose handoffs are
+  closed or absent, parked records resolved or transferred, and runtime claims released. Reviewers and
+  helper agents are read-only.
+- Work in a spawned worktree is delivered as local commits on its `task/<task-key>` branch — spawning
+  authorizes commits on that branch only (the §2.6 exception); push, merging into `main`, and branch
+  deletion still need an explicit user request, and the merge is performed by the primary checkout's
+  writer or the user.
+- Worktrees do not isolate shared runtime state. Shared PostgreSQL writes, AgentSSD mutation, and
+  worker/launchd control each have exactly one owner, recorded in the gitignored `docs/agent/RUNTIME.md`
+  of the primary checkout (the first entry of `git worktree list`). Read it before any task that may touch
+  these resources; claim before mutating; release on close or park. Claim/release edits to `RUNTIME.md` are
+  coordination state, exempt from the primary worktree's write gate. Never claim over a non-default owner:
+  surface the current owner — including any parked task retaining the claim — and get the user's
+  confirmation first. The resident launchd KeepAlive job is the worker's steady-state owner when no task
+  claims it.
+- A handoff, parked record, or runtime claim is local to its checkout/worktree and is not copied through Git
+  or `.worktreeinclude`. A receiving session must resume in that checkout or perform an explicit handoff.
+  Before archiving/deleting a task or worktree, close it or transfer every unresolved user gate, premise
+  guard, and external-state obligation.
 - Keep `HANDOFF.md` under 80 lines and record only: task key/title, scope, state, authority, user intent and
   acceptance, authorization boundary, next action, blockers, worktree/branch/base, changed paths, latest
-  current-session validation/review, runtime owner, writer, and updated time. Long-lived facts belong in
-  tracked contracts/docs; secrets, chat transcripts, duplicated repo facts, and volatile ops snapshots do not.
+  current-session validation/review, runtime claims, writer, and updated time. Keep each parked record under
+  40 lines: key/title, state, pending decision and re-entry condition, guarded premises, retained runtime
+  claims, next action, branch/base, brief origin note, and updated time. Long-lived facts belong in tracked
+  contracts/docs; secrets, chat transcripts, duplicated repo facts, and volatile ops snapshots do not.
   This handoff protocol is mirrored in the "Durable handoff" section of root `CLAUDE.md`; edit both together.
 - Legacy `Prompt.md`, `Plan.md`, `Status.md`, `Documentation.md`, `Implement.md`, `code_review.md`, `archive/`,
   and `notes/` are migration/history evidence only: read on demand; never update, rotate, recreate, or use as
