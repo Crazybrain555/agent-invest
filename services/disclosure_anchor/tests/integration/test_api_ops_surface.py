@@ -101,6 +101,85 @@ class ApiOpsSurfaceTests(unittest.TestCase):
         self.assertEqual(bad.status_code, 422)
         self.assertEqual(bad.json()["error_code"], "VALIDATION_ERROR")
 
+    def test_multi_value_filters_and_title_contains(self) -> None:
+        # round24: comma-separated multi-value (industry standard — EDGAR
+        # forms / cninfo category are multi-select) + title substring.
+        multi = self.client.get(
+            "/v1/documents",
+            params={"filing_type": "annual_report,semiannual_report", "limit": 20},
+        )
+        self.assertEqual(multi.status_code, 200)
+        types = {item["filing_type"] for item in multi.json()["items"]}
+        self.assertLessEqual(types, {"annual_report", "semiannual_report"})
+
+        topics = self.client.get(
+            "/v1/documents",
+            params={"disclosure_topic": "dividend,annual_report", "limit": 20},
+        )
+        self.assertEqual(topics.status_code, 200)
+        for item in topics.json()["items"]:
+            self.assertTrue(
+                set(item["disclosure_topics"]) & {"dividend", "annual_report"}
+            )
+
+        titled = self.client.get(
+            "/v1/documents", params={"title_contains": "年度报告", "limit": 10}
+        )
+        self.assertEqual(titled.status_code, 200)
+        for item in titled.json()["items"]:
+            self.assertIn("年度报告", item["title"])
+        # LIKE metacharacters are escaped: a literal-% needle must not
+        # degenerate into match-everything.
+        total = len(self.client.get("/v1/documents", params={"limit": 5}).json()["items"])
+        pct = self.client.get(
+            "/v1/documents", params={"title_contains": "%%%", "limit": 5}
+        )
+        self.assertEqual(pct.status_code, 200)
+        self.assertLess(len(pct.json()["items"]), max(total, 1))
+        blank = self.client.get("/v1/documents", params={"title_contains": "  "})
+        self.assertEqual(blank.status_code, 422)
+
+    def test_content_category_filter_by_code_and_name(self) -> None:
+        # Find a real category from live data, then filter by its code and name.
+        seed = None
+        for item in self.client.get(
+            "/v1/documents", params={"limit": 50}
+        ).json()["items"]:
+            cats = item.get("content_categories") or []
+            if cats:
+                seed = cats[0]
+                break
+        if seed is None:
+            self.skipTest("no documents with content_categories in live data")
+        by_code = self.client.get(
+            "/v1/documents", params={"content_category": seed["code"], "limit": 5}
+        )
+        self.assertEqual(by_code.status_code, 200)
+        hits = by_code.json()["items"]
+        self.assertTrue(hits)
+        for item in hits:
+            codes = {c["code"] for c in item["content_categories"] or []}
+            self.assertIn(seed["code"], codes)
+        if seed.get("name"):
+            by_name = self.client.get(
+                "/v1/documents",
+                params={"content_category": seed["name"], "limit": 5},
+            )
+            self.assertEqual(by_name.status_code, 200)
+            self.assertTrue(by_name.json()["items"])
+
+    def test_unknown_query_param_rejected_not_silently_ignored(self) -> None:
+        # round24: FastAPI's default is to ignore undeclared params — an AI
+        # caller with a misspelled filter got 200 + unfiltered results.
+        bad = self.client.get(
+            "/v1/documents", params={"content_categorey": "010301"}
+        )
+        self.assertEqual(bad.status_code, 422)
+        body = bad.json()
+        self.assertEqual(body["error_code"], "VALIDATION_ERROR")
+        self.assertIn("content_categorey", body["message"])
+        self.assertIn("supported:", body["message"])
+
     def test_tracked_companies_paginate_without_overlap(self) -> None:
         first = self.client.get("/v1/tracked-companies", params={"limit": 2}).json()
         self.assertLessEqual(len(first["items"]), 2)

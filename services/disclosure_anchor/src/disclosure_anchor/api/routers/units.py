@@ -9,7 +9,11 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from disclosure_anchor.api.db import reader_engine_from_request
-from disclosure_anchor.api.errors import gone_superseded, l1_processing_required
+from disclosure_anchor.api.errors import (
+    gone_superseded,
+    l1_processing_required,
+    strict_query_params,
+)
 from disclosure_anchor.api.pagination import (
     DEFAULT_LIMIT,
     UnitCursor,
@@ -35,9 +39,10 @@ from disclosure_anchor.adapters.db.postgres.schema import PUBLIC_SCHEMA
 from disclosure_anchor.domain.services.unit_hashing import canonical_json, sha256_prefixed
 
 try:
-    from fastapi import APIRouter, HTTPException, Query, Request
+    from fastapi import APIRouter, Depends, HTTPException, Query, Request
 except ModuleNotFoundError:  # pragma: no cover - exercised by app-start validation
     APIRouter = None  # type: ignore[assignment, misc]
+    Depends = None  # type: ignore[assignment]
     HTTPException = None  # type: ignore[assignment, misc]
     Query = None  # type: ignore[assignment]
     Request = None  # type: ignore[assignment, misc]
@@ -419,7 +424,7 @@ def raise_l1_required(status: str) -> NoReturn:
 
 router: Any
 if APIRouter is not None and Query is not None:
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(strict_query_params)])
     router.add_api_route(
         "/v1/documents/{document_id}/units",
         list_document_units,

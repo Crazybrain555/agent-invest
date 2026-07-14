@@ -16,13 +16,15 @@ from disclosure_anchor.api.pagination import (
     encode_change_cursor,
     validate_limit,
 )
+from disclosure_anchor.api.errors import strict_query_params
 from disclosure_anchor.api.schemas.public import ChangeEventV1, ChangeListResponse
 from disclosure_anchor.adapters.db.postgres.schema import PUBLIC_SCHEMA
 
 try:
-    from fastapi import APIRouter, Request
+    from fastapi import APIRouter, Depends, Request
 except ModuleNotFoundError:  # pragma: no cover - exercised by app-start validation
     APIRouter = None  # type: ignore[assignment, misc]
+    Depends = None  # type: ignore[assignment]
     Request = None  # type: ignore[assignment, misc]
 
 
@@ -103,7 +105,7 @@ def _change_list_response(
 
 router: Any
 if APIRouter is not None:
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(strict_query_params)])
     router.add_api_route(
         "/v1/changes",
         list_changes,

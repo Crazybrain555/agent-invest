@@ -16,7 +16,11 @@ from sqlalchemy import text
 from disclosure_anchor.adapters.db.postgres.schema import PUBLIC_SCHEMA
 from disclosure_anchor.adapters.sources.cninfo.mapper import load_processing_policy
 from disclosure_anchor.api.db import reader_engine_from_request
-from disclosure_anchor.api.errors import not_found, validation_error
+from disclosure_anchor.api.errors import (
+    not_found,
+    strict_query_params,
+    validation_error,
+)
 from disclosure_anchor.api.pagination import (
     DEFAULT_LIMIT,
     TrackedCompanyCursor,
@@ -32,9 +36,10 @@ from disclosure_anchor.api.schemas.public import (
 from disclosure_anchor.application.worker.queries import SYNC_FREQUENCY_SECONDS
 
 try:
-    from fastapi import APIRouter, Request
+    from fastapi import APIRouter, Depends, Request
 except ModuleNotFoundError:  # pragma: no cover - exercised by app-start validation
     APIRouter = None  # type: ignore[assignment, misc]
+    Depends = None  # type: ignore[assignment]
     Request = None  # type: ignore[assignment, misc]
 
 TRACKED_STATUSES = ("active", "paused")
@@ -222,7 +227,7 @@ def _tracked_company(
 
 router: Any
 if APIRouter is not None:
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(strict_query_params)])
     router.add_api_route(
         "/v1/tracked-companies",
         list_tracked_companies,

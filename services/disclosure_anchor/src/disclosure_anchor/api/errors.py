@@ -337,3 +337,36 @@ def _replace_error_response(
         "description": description,
         "content": {"application/json": {"schema": ERROR_RESPONSE_REF}},
     }
+
+
+def strict_query_params(request: "Request") -> None:
+    """Reject unknown query parameters with the standard 422 envelope.
+
+    FastAPI silently ignores undeclared query params — an AI caller passing
+    a misspelled filter (e.g. ``content_category`` before it existed) got
+    HTTP 200 with UNFILTERED results and no signal that the filter never
+    applied (round24). Applied as a router-level dependency on the read
+    routers; write/admin and health stay lenient.
+    """
+
+    route = request.scope.get("route")
+    dependant = getattr(route, "dependant", None)
+    if dependant is None:
+        return
+    allowed: set[str] = set()
+    stack = [dependant]
+    while stack:
+        node = stack.pop()
+        for param in node.query_params:
+            allowed.add(param.alias or param.name)
+        stack.extend(node.dependencies)
+    unknown = [key for key in request.query_params.keys() if key not in allowed]
+    if unknown:
+        raise FilingApiError(
+            status_code=422,
+            error_code=VALIDATION_ERROR,
+            message=(
+                f"unknown query parameter(s): {', '.join(sorted(unknown))}; "
+                f"supported: {', '.join(sorted(allowed))}"
+            ),
+        )

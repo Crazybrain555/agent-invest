@@ -187,3 +187,13 @@ GET /v1/health 响应新增 queues 对象（队列/死信/重试中文档/backfi
 admin 面（不进导出契约）：PUT tracked-companies 响应新增 action/cleared_overrides/status_change；entries min_length=1；
   POST {code}/sync 新增 window_start/window_end（与 window_days 互斥）；Bearer token + 回环双闸（401/403/409 运行期码）
 ```
+
+2026-07-14（round24 查询面补齐，用户裁决"最小改动"）：
+
+```text
+GET /v1/documents、/v1/filings/latest：filing_type / disclosure_topic 支持逗号分隔多值（单值行为不变）；
+  新增 content_category（按 jsonb 元素 code 或 name 命中，多值同上）；新增 title_contains（ILIKE 子串，
+  LIKE 元字符转义，≤100 字符）
+读路由（documents/filings/units/tracked/changes）未知查询参数 → 422 VALIDATION_ERROR（此前静默忽略）；
+  health/admin 保持宽松
+```

@@ -9,7 +9,12 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from disclosure_anchor.api.db import reader_engine_from_request
-from disclosure_anchor.api.errors import gone_superseded, not_found, validation_error
+from disclosure_anchor.api.errors import (
+    gone_superseded,
+    not_found,
+    strict_query_params,
+    validation_error,
+)
 from disclosure_anchor.api.pagination import (
     DEFAULT_LIMIT,
     DocumentCursor,
@@ -26,9 +31,10 @@ from disclosure_anchor.api.schemas.public import (
 from disclosure_anchor.adapters.db.postgres.schema import PUBLIC_SCHEMA
 
 try:
-    from fastapi import APIRouter, HTTPException, Request
+    from fastapi import APIRouter, Depends, HTTPException, Request
 except ModuleNotFoundError:  # pragma: no cover - exercised by app-start validation
     APIRouter = None  # type: ignore[assignment, misc]
+    Depends = None  # type: ignore[assignment]
     HTTPException = None  # type: ignore[assignment, misc]
     Request = None  # type: ignore[assignment, misc]
 
@@ -93,6 +99,8 @@ def list_documents(
     security_code: str | None = None,
     filing_type: str | None = None,
     disclosure_topic: str | None = None,
+    content_category: str | None = None,
+    title_contains: str | None = None,
     report_period: str | None = None,
     announcement_date_from: date | None = None,
     announcement_date_to: date | None = None,
@@ -106,8 +114,14 @@ def list_documents(
         filters=DocumentFilters(
             company_ref=company_ref,
             security_code=security_code,
-            filing_type=filing_type,
-            disclosure_topic=validate_disclosure_topic(disclosure_topic),
+            filing_type=validate_multi_value("filing_type", filing_type),
+            disclosure_topic=validate_multi_value(
+                "disclosure_topic", disclosure_topic
+            ),
+            content_category=validate_multi_value(
+                "content_category", content_category
+            ),
+            title_contains=validate_title_contains(title_contains),
             report_period=report_period,
             announcement_date_from=announcement_date_from,
             announcement_date_to=announcement_date_to,
@@ -144,8 +158,10 @@ class DocumentFilters:
         *,
         company_ref: str | None = None,
         security_code: str | None = None,
-        filing_type: str | None = None,
-        disclosure_topic: str | None = None,
+        filing_type: list[str] | None = None,
+        disclosure_topic: list[str] | None = None,
+        content_category: list[str] | None = None,
+        title_contains: str | None = None,
         report_period: str | None = None,
         announcement_date_from: date | None = None,
         announcement_date_to: date | None = None,
@@ -155,6 +171,8 @@ class DocumentFilters:
         self.security_code = security_code
         self.filing_type = filing_type
         self.disclosure_topic = disclosure_topic
+        self.content_category = content_category
+        self.title_contains = title_contains
         self.report_period = report_period
         self.announcement_date_from = announcement_date_from
         self.announcement_date_to = announcement_date_to
@@ -206,14 +224,35 @@ def _document_where(filters: DocumentFilters) -> tuple[list[str], dict[str, Any]
     params: dict[str, Any] = {}
     _add_filter(where, params, "company_ref", filters.company_ref)
     _add_filter(where, params, "security_code", filters.security_code)
-    _add_filter(where, params, "filing_type", filters.filing_type)
+    if filters.filing_type is not None:
+        # Comma-separated multi-value (round24, industry standard: EDGAR
+        # forms / cninfo category are multi-select); single value unchanged.
+        where.append("filing_type = ANY(CAST(:filing_types AS text[]))")
+        params["filing_types"] = filters.filing_type
     _add_filter(where, params, "report_period", filters.report_period)
     _add_filter(where, params, "status", filters.status)
     if filters.disclosure_topic is not None:
-        # disclosure_topics is a jsonb array (documents_v1); the ? existence
-        # operator asks whether the topic string is one of its elements.
-        where.append("disclosure_topics ? :disclosure_topic")
-        params["disclosure_topic"] = filters.disclosure_topic
+        # disclosure_topics is a jsonb array (documents_v1); ANY-of match.
+        # Function form of ?| — avoids operator-escaping pitfalls in text().
+        where.append(
+            "jsonb_exists_any(disclosure_topics, CAST(:disclosure_topics AS text[]))"
+        )
+        params["disclosure_topics"] = filters.disclosure_topic
+    if filters.content_category is not None:
+        # content_categories is a jsonb array of {code, name}; a value hits
+        # when it equals any element's code OR name (round24 — the source
+        # cninfo category dimension, previously response-only).
+        where.append(
+            "EXISTS (SELECT 1 FROM jsonb_array_elements(content_categories) cc "
+            "WHERE cc->>'code' = ANY(CAST(:content_categories AS text[])) "
+            "OR cc->>'name' = ANY(CAST(:content_categories AS text[])))"
+        )
+        params["content_categories"] = filters.content_category
+    if filters.title_contains is not None:
+        where.append("title ILIKE :title_pattern ESCAPE '\\'")
+        params["title_pattern"] = (
+            "%" + _escape_like(filters.title_contains) + "%"
+        )
     if filters.announcement_date_from is not None:
         where.append("announcement_date >= :announcement_date_from")
         params["announcement_date_from"] = filters.announcement_date_from
@@ -232,15 +271,35 @@ def _add_filter(
     params[column] = value
 
 
-def validate_disclosure_topic(value: str | None) -> str | None:
-    # No enum check (disclosure_topics is an open, versioned vocabulary); the
-    # only rule is a non-empty/non-whitespace string. Empty string routes to
-    # the standard VALIDATION_ERROR envelope instead of matching nothing.
+def validate_multi_value(field: str, value: str | None) -> list[str] | None:
+    """Comma-separated multi-value filter (round24). No enum check — these
+    are open, versioned vocabularies; the rule is at least one non-blank
+    item. A blank/empty value routes to the standard VALIDATION_ERROR
+    envelope instead of silently matching nothing."""
+
     if value is None:
         return None
-    if not value.strip():
-        raise validation_error("disclosure_topic", "must be a non-empty string")
-    return value
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    if not items:
+        raise validation_error(field, "must contain at least one non-empty value")
+    return items
+
+
+def validate_title_contains(value: str | None) -> str | None:
+    if value is None:
+        return None
+    trimmed = value.strip()
+    if not trimmed:
+        raise validation_error("title_contains", "must be a non-empty string")
+    if len(trimmed) > 100:
+        raise validation_error("title_contains", "must be at most 100 characters")
+    return trimmed
+
+
+def _escape_like(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
 
 
 def _append_document_cursor(
@@ -302,7 +361,7 @@ def raise_not_found() -> NoReturn:
 
 router: Any
 if APIRouter is not None:
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(strict_query_params)])
     router.add_api_route(
         "/v1/documents",
         list_documents,

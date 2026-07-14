@@ -1239,6 +1239,22 @@ paths:
           - type: 'null'
           title: Disclosure Topic
       - in: query
+        name: content_category
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Content Category
+      - in: query
+        name: title_contains
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Title Contains
+      - in: query
         name: report_period
         required: false
         schema:
@@ -1534,6 +1550,22 @@ paths:
           - type: string
           - type: 'null'
           title: Disclosure Topic
+      - in: query
+        name: content_category
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Content Category
+      - in: query
+        name: title_contains
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Title Contains
       - in: query
         name: report_period
         required: false

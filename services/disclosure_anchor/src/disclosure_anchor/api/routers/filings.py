@@ -22,15 +22,18 @@ from disclosure_anchor.api.routers.documents import (
     _document_where,
     _fetch_all,
     _where_sql,
-    validate_disclosure_topic,
+    validate_multi_value,
+    validate_title_contains,
 )
+from disclosure_anchor.api.errors import strict_query_params
 from disclosure_anchor.api.schemas.public import DocumentListResponse
 from disclosure_anchor.adapters.db.postgres.schema import PUBLIC_SCHEMA
 
 try:
-    from fastapi import APIRouter, Request
+    from fastapi import APIRouter, Depends, Request
 except ModuleNotFoundError:  # pragma: no cover - exercised by app-start validation
     APIRouter = None  # type: ignore[assignment, misc]
+    Depends = None  # type: ignore[assignment]
     Request = None  # type: ignore[assignment, misc]
 
 
@@ -40,6 +43,8 @@ def latest_filings(
     security_code: str | None = None,
     filing_type: str | None = None,
     disclosure_topic: str | None = None,
+    content_category: str | None = None,
+    title_contains: str | None = None,
     report_period: str | None = None,
     announcement_date_from: date | None = None,
     announcement_date_to: date | None = None,
@@ -53,8 +58,14 @@ def latest_filings(
         filters=DocumentFilters(
             company_ref=company_ref,
             security_code=security_code,
-            filing_type=filing_type,
-            disclosure_topic=validate_disclosure_topic(disclosure_topic),
+            filing_type=validate_multi_value("filing_type", filing_type),
+            disclosure_topic=validate_multi_value(
+                "disclosure_topic", disclosure_topic
+            ),
+            content_category=validate_multi_value(
+                "content_category", content_category
+            ),
+            title_contains=validate_title_contains(title_contains),
             report_period=report_period,
             announcement_date_from=announcement_date_from,
             announcement_date_to=announcement_date_to,
@@ -97,7 +108,7 @@ def _select_latest_filings(
 
 router: Any
 if APIRouter is not None:
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(strict_query_params)])
     router.add_api_route(
         "/v1/filings/latest",
         latest_filings,
