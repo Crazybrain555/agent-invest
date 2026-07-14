@@ -1,4 +1,4 @@
-"""Load class_map.json + facet_map.json into disclosure_core.classification_rule.
+"""Load class, facet, and filing maps into disclosure_core.classification_rule.
 
 The versioned JSON files in the repo are the source of truth; the table is a
 query-side copy the views and worker predicates join against. Vocabulary

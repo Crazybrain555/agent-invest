@@ -1065,6 +1065,7 @@ class OpsQueueViewTests(unittest.TestCase):
         pid_clean = f"qvdl{self.suffix}cl"
         pid_mtn_terms = f"qvdl{self.suffix}mtn"
         pid_redemption_warning = f"qvdl{self.suffix}redeem"
+        pid_downward_revision_warning = f"qvdl{self.suffix}revise"
         conn = self.engine.connect()
         txn = conn.begin()
         try:
@@ -1122,6 +1123,14 @@ class OpsQueueViewTests(unittest.TestCase):
                                     "download_url": "http://x/1225006849.PDF",
                                     "announcement_date": "2025-04-03",
                                 },
+                                {
+                                    "provider_document_id": pid_downward_revision_warning,
+                                    "title": "温氏股份关于预计触发可转债转股价格"
+                                    "向下修正条件的提示性公告",
+                                    "raw_category": "01010503||010112||010115||010915",
+                                    "download_url": "http://x/1225343892.PDF",
+                                    "announcement_date": "2026-06-01",
+                                },
                             ],
                         }
                     ),
@@ -1147,6 +1156,11 @@ class OpsQueueViewTests(unittest.TestCase):
                 pid_redemption_warning,
                 pids,
                 "pid 1225006849 is the first redemption trigger signal",
+            )
+            self.assertIn(
+                pid_downward_revision_warning,
+                pids,
+                "pid 1225343892 is a forward-looking dilution signal",
             )
 
             # Parse side, same guard, and status registered.

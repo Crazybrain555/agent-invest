@@ -27,7 +27,7 @@ class CninfoMapperTests(unittest.TestCase):
     def test_filing_type_rule_bundle_has_required_seed_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
 
-        self.assertEqual(bundle.version, "2026-07-r10")
+        self.assertEqual(bundle.version, "2026-07-r11")
         self.assertEqual(
             {rule.filing_type for rule in bundle.rules},
             {
@@ -90,6 +90,8 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertIn("注册批准", by_class["risk_alert"].keywords)
         self.assertIn("许可协议", by_class["major_contract"].keywords)
         self.assertIn("小时试运行", by_class["operating_data"].keywords)
+        self.assertIn("出售部分股票资产", by_class["restructuring_assets"].keywords)
+        self.assertIn("出售股票资产", by_class["restructuring_assets"].keywords)
         # 电量完成情况 supersedes 发电量完成情况 (substring superset).
         self.assertIn("电量完成情况", by_class["operating_data"].keywords)
         self.assertNotIn("发电量完成情况", by_class["operating_data"].keywords)
@@ -124,6 +126,7 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertIn(("中期票据计划", "挂牌"), keyword_sets)
         self.assertIn(("中期票据计划", "进行发行", "提供担保"), keyword_sets)
         self.assertNotIn(("预计满足", "条件的提示性公告"), keyword_sets)
+        self.assertNotIn(("预计触发", "条件的提示性公告"), keyword_sets)
         # r9: 已获授 wording variant of the second-type restricted-stock
         # cancellation rule (Kingsoft Office shape).
         self.assertIn(("作废", "已获授", "尚未归属", "限制性股票"), keyword_sets)
@@ -192,6 +195,15 @@ class CninfoMapperTests(unittest.TestCase):
                 "关于公司及控股子公司重整计划执行完毕的公告",
             ),
             "delisting_risk",
+        )
+
+    def test_r11_asset_sale_topic_fills_generic_code_blind_spot(self) -> None:
+        self.assertEqual(
+            derive_primary_class(
+                "01010501||010112||012399",
+                "关于子公司拟出售股票资产的公告",
+            ),
+            "restructuring_assets",
         )
 
     def test_r7_title_rule_order_stops_substring_capture(self) -> None:

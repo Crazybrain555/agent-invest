@@ -129,7 +129,8 @@ prune-history:
 	@test "$(PRUNE)" = "YES" || (echo 'refusing: set PRUNE=YES to confirm' && exit 2)
 	./scripts/prune_history.sh
 
-# Load class_map.json + facet_map.json into disclosure_core.classification_rule.
+# Load class_map.json + facet_map.json + filing_type_map.json into
+# disclosure_core.classification_rule.
 # Vocabulary upgrade = edit JSON + bump version + run this (views derive live).
 load-rules:
 	$(WITH_ENV) PYTHONPATH=src .venv/bin/python scripts/load_classification_rules.py

@@ -16,9 +16,10 @@ scope: services/disclosure_anchor
 均重新取证。并入本轮的 `vocab-generalization-2026-07-13.md` 也没有被默认采信：独立复审
 又实锤两条 absolute noise 误杀，最终升为 filing r8 / class r7，并重算候选层容量。
 
-结论是 **Conditional GO**：代码侧 P0 已封闭，真实 16-PDF 常驻 backlog 验收通过；正式
-清库前仍必须完成 0022 migration、class_map r7 / filing map r8 load-rules、worker.env 调参和
-KeepAlive plist 安装。生产激活/清库未在本轮执行，生产 DB 取证始终只读。
+本轮在 2026-07-13 当时的结论是 **Conditional GO**：代码侧 P0 已封闭，真实 16-PDF 常驻
+backlog 验收通过；当时尚待完成 0022 migration、class_map r7 / filing map r8 load-rules、
+worker.env 调参与 KeepAlive 安装。上述激活项后来均已完成；当前版本与清库动作以本页 checklist
+的 2026-07-14 修订及 live doctor 为准，不能再把本段历史状态当作执行指令。
 
 本轮没有推翻四项用户裁决：register 永远全量；process=下载+解析一个动作；title_noise
 绝对排除；文档并发≤8（MinerU window=16）。
@@ -329,9 +330,10 @@ varchar(32) 时，新的 scratch migration gate 立即真实失败，也证明�
 1. **停旧 worker**：unload 当前 launchd；确认无 worker/MinerU 子进程且 singleton lock 已释放。
 2. 保存需要的 watchlist 快照；确认 200 行无同发行人 A/B 双代码，至少含科创板688xxx、
    BSE、沪B、深B各一只 canary。
-3. 在新代码上跑 `make agent-check`；再 `make migrate`、`make load-rules`、`make doctor-full`。
-   doctor 必须显示 migration head=0022；classification rules PASS（class=2026-07-r7、
-   facet=2026-07-r1、title=2026-07-r8，topic/noise由同bundle校验）；public catalog/role permissions PASS。
+3. 在新代码上跑 `make agent-check` 与 `make doctor-full`。doctor 必须显示 migration head=0022；
+   classification rules PASS（class=2026-07-r7、facet=2026-07-r1、title/topic/noise=2026-07-r11，
+   预期 107/16/18/65/79）。只有 doctor 显示 migration 或规则落后时才分别执行 `make migrate` /
+   `make load-rules` 后复跑 doctor；wipe 不清 migration/rules，已在目标版本时不要无条件重跑。
 4. worker 仍停止时执行用户已决定的 `make wipe-test-data WIPE=YES`；核对 company/document/unit/
    access 均为 0。该命令会删业务表与 raw/derived/parser artifacts，不删 classification rules。
 5. `make config-check` → `make track DRY_RUN=1` → `make track` → `make track-status`；确认200 active
