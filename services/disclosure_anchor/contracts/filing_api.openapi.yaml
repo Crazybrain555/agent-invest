@@ -101,6 +101,61 @@ components:
       - next_cursor
       title: ChangeListResponse
       type: object
+    ClassificationResponse:
+      additionalProperties: false
+      properties:
+        class_map_version:
+          title: Class Map Version
+          type: string
+        classes:
+          items:
+            $ref: '#/components/schemas/ProcessingClassV1'
+          title: Classes
+          type: array
+        note:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Note
+        processing_policy_available:
+          title: Processing Policy Available
+          type: boolean
+        processing_policy_version:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Processing Policy Version
+        rule_sets:
+          items:
+            $ref: '#/components/schemas/ClassificationRuleSetV1'
+          title: Rule Sets
+          type: array
+      required:
+      - class_map_version
+      - processing_policy_version
+      - processing_policy_available
+      - classes
+      - rule_sets
+      title: ClassificationResponse
+      type: object
+    ClassificationRuleSetV1:
+      additionalProperties: false
+      properties:
+        rule_count:
+          title: Rule Count
+          type: integer
+        rule_set:
+          title: Rule Set
+          type: string
+        version:
+          title: Version
+          type: string
+      required:
+      - rule_set
+      - version
+      - rule_count
+      title: ClassificationRuleSetV1
+      type: object
     DocumentListResponse:
       additionalProperties: false
       properties:
@@ -550,6 +605,10 @@ components:
           - type: string
           - type: 'null'
           title: Migration Head
+        queues:
+          anyOf:
+          - $ref: '#/components/schemas/QueueStatus'
+          - type: 'null'
         service:
           title: Service
           type: string
@@ -569,6 +628,30 @@ components:
       - migration_head
       - data_root_mounted
       title: HealthResponse
+      type: object
+    ProcessingClassV1:
+      additionalProperties: false
+      properties:
+        disposition:
+          title: Disposition
+          type: string
+        name:
+          title: Name
+          type: string
+        priority:
+          title: Priority
+          type: integer
+        zh:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Zh
+      required:
+      - name
+      - zh
+      - priority
+      - disposition
+      title: ProcessingClassV1
       type: object
     ProcessingRunV1:
       additionalProperties: false
@@ -690,6 +773,54 @@ components:
       - builder_rules_version
       title: ProcessingRunV1
       type: object
+    QueueStatus:
+      properties:
+        backfill_pending:
+          title: Backfill Pending
+          type: integer
+        download_dead_letters:
+          title: Download Dead Letters
+          type: integer
+        last_outbox_event_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Last Outbox Event At
+        parse_dead_letters:
+          title: Parse Dead Letters
+          type: integer
+        pending_build:
+          title: Pending Build
+          type: integer
+        pending_download:
+          title: Pending Download
+          type: integer
+        pending_parse:
+          title: Pending Parse
+          type: integer
+        pending_publish:
+          title: Pending Publish
+          type: integer
+        retrying_documents:
+          title: Retrying Documents
+          type: integer
+        sync_due:
+          title: Sync Due
+          type: integer
+      required:
+      - pending_download
+      - pending_parse
+      - pending_build
+      - pending_publish
+      - download_dead_letters
+      - parse_dead_letters
+      - retrying_documents
+      - sync_due
+      - backfill_pending
+      - last_outbox_event_at
+      title: QueueStatus
+      type: object
     SourceRefV1:
       additionalProperties: false
       properties:
@@ -795,6 +926,11 @@ components:
             $ref: '#/components/schemas/TrackedCompanyV1'
           title: Items
           type: array
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
       required:
       - items
       title: TrackedCompanyListResponse
@@ -1043,6 +1179,29 @@ paths:
               schema: *id001
           description: Validation error
       summary: List Changes
+  /v1/classification:
+    get:
+      operationId: get_classification_v1_classification_get
+      parameters:
+      - *id002
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClassificationResponse'
+          description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '422':
+          content:
+            application/json:
+              schema: *id001
+          description: Validation error
+      summary: Get Classification
   /v1/documents:
     get:
       operationId: list_documents_v1_documents_get
@@ -1071,6 +1230,14 @@ paths:
           - type: string
           - type: 'null'
           title: Filing Type
+      - in: query
+        name: disclosure_topic
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Disclosure Topic
       - in: query
         name: report_period
         required: false
@@ -1360,6 +1527,14 @@ paths:
           - type: 'null'
           title: Filing Type
       - in: query
+        name: disclosure_topic
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Disclosure Topic
+      - in: query
         name: report_period
         required: false
         schema:
@@ -1462,6 +1637,21 @@ paths:
           - type: string
           - type: 'null'
           title: Status
+      - in: query
+        name: cursor
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cursor
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          title: Limit
+          type: integer
       - *id002
       responses:
         '200':
@@ -1481,6 +1671,46 @@ paths:
               schema: *id001
           description: Validation error
       summary: List Tracked Companies
+  /v1/tracked-companies/{security_code}:
+    get:
+      operationId: get_tracked_company_v1_tracked_companies__security_code__get
+      parameters:
+      - in: path
+        name: security_code
+        required: true
+        schema:
+          title: Security Code
+          type: string
+      - in: query
+        name: exchange
+        required: true
+        schema:
+          title: Exchange
+          type: string
+      - *id002
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackedCompanyV1'
+          description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '404':
+          content:
+            application/json:
+              schema: *id001
+          description: Not found
+        '422':
+          content:
+            application/json:
+              schema: *id001
+          description: Validation error
+      summary: Get Tracked Company
   /v1/units/{asset_id}:
     get:
       operationId: get_unit_v1_units__asset_id__get

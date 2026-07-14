@@ -63,7 +63,10 @@ from disclosure_anchor.application.worker.locks import (  # noqa: F401  (re-expo
 )
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
-from disclosure_anchor.domain.errors import ParserVersionProbeError
+from disclosure_anchor.domain.errors import (
+    DisclosureAnchorError,
+    ParserVersionProbeError,
+)
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 PARSER_INFRASTRUCTURE_ERROR_CODES = frozenset(
@@ -200,10 +203,9 @@ def run_once(
                     limit=limits.download,
                     should_stop=should_stop,
                 )
-        except Exception as exc:
-            # Provider construction/query failures are stage-isolated: raw
-            # parse/build/publish work must continue even when credentials,
-            # CNINFO, or its DB queue read are unavailable.
+        except DisclosureAnchorError as exc:
+            # Provider family (credentials, CNINFO HTTP, token): pause
+            # acquisition this round; parse/build/publish continue.
             report.failed += 1
             report.source_outage_break = True
             report.failures.append(
@@ -211,6 +213,21 @@ def run_once(
                     stage="source",
                     item_ref="cninfo",
                     error_code=type(exc).__name__,
+                    message=str(exc)[:500],
+                )
+            )
+        except Exception as exc:
+            # Local failure (queue-read SQL, programming error): still
+            # stage-isolated, but it is NOT a provider outage — tagging it
+            # as one disguised local DB faults as CNINFO downtime and
+            # triggered the wrong backoff (round23).
+            report.failed += 1
+            report.failures.append(
+                WorkerFailure(
+                    stage="source_local",
+                    item_ref="worker",
+                    error_code=type(exc).__name__,
+                    message=str(exc)[:500],
                 )
             )
     finally:
@@ -855,13 +872,19 @@ def _publish_stage(
         try:
             result = use_case.execute(PublishRunCommand(processing_run_id=run_id))
         except Exception as exc:
+            # Continue with the rest of the batch: a single deterministically
+            # failing run must not head-of-line block every other document's
+            # publish round after round (round23).
             report.failed += 1
             report.failures.append(
                 WorkerFailure(
-                    stage="publish", item_ref=run_id, error_code=type(exc).__name__
+                    stage="publish",
+                    item_ref=run_id,
+                    error_code=type(exc).__name__,
+                    message=str(exc)[:500],
                 )
             )
-            return
+            continue
         if result.status == "published":
             report.published += 1
         else:
@@ -871,7 +894,7 @@ def _publish_stage(
                     stage="publish", item_ref=run_id, error_code=str(result.status)
                 )
             )
-            return
+            continue
 
 
 def render_report_section(report: WorkerReport) -> str:
@@ -898,6 +921,7 @@ def render_report_section(report: WorkerReport) -> str:
         lines.append("- failures:")
         lines.extend(
             f"  - {failure.stage} {failure.item_ref} {failure.error_code}"
+            + (f" — {failure.message}" if failure.message else "")
             for failure in report.failures
         )
     lines.append("")

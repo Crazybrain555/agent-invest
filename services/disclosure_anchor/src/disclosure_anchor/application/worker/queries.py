@@ -7,6 +7,7 @@ module writes business state except the pinned stale-run reclaim UPDATE.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from sqlalchemy import text
@@ -345,6 +346,8 @@ def pending_downloads(
     max_retries: int,
     limit: int,
     scope_classes: tuple[str, ...] | None = None,
+    security_code: str | None = None,
+    min_announcement_date: date | None = None,
 ) -> list[dict[str, Any]]:
     # Pool membership drives acquisition: a company's candidates download
     # only while an ACTIVE tracked row exists. Covers both round19 (paused =
@@ -352,17 +355,36 @@ def pending_downloads(
     # tracked row must NOT re-open the backlog, which the old only-paused-
     # blocks NOT-EXISTS form would have done). Candidates without a company
     # ref stay eligible. The view keeps exposing every candidate; predicates
-    # live here.
+    # live here. security_code narrows to one company for the CLI sync's
+    # immediate-download pass — same gates as the worker, never a bypass
+    # (round23).
     params: dict[str, Any] = {"max_retries": max_retries, "limit": limit}
     if scope_classes is not None:
         params["scope_classes"] = list(scope_classes)
         params["carrier_classes"] = list(CARRIER_CLASSES)
+    company_sql = ""
+    if security_code is not None:
+        params["security_code"] = security_code
+        company_sql = (
+            "AND (q.candidate ->> 'security_code') = :security_code"
+        )
+    date_sql = ""
+    if min_announcement_date is not None:
+        # CLI sync's immediate pass only downloads the recent overlap window;
+        # historical backfill candidates drain through worker rounds at the
+        # provider's paced QPS (round23).
+        params["min_announcement_date"] = min_announcement_date
+        # announcement_date is text in the view (jsonb ->> extraction);
+        # cast before comparing with the date bind param (round23 review B1:
+        # text >= date has no operator and crashed every CLI sync).
+        date_sql = "AND (q.announcement_date)::date >= :min_announcement_date"
     rows = conn.execute(
         text(
             f"""
             SELECT q.provider_document_id, q.download_url, q.title,
                    q.announcement_date, q.source_access_id, q.company_id,
-                   q.candidate, q.failed_download_count
+                   q.candidate, q.failed_download_count,
+                   q.already_registered, q.signature_differs
               FROM {OPS_SCHEMA}.pending_download_v1 q
               LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
                 ON tc_scope.company_id = q.company_id
@@ -371,6 +393,8 @@ def pending_downloads(
                     OR EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
                                 WHERE tc.company_id = q.company_id
                                   AND tc.status = 'active'))
+               {company_sql}
+               {date_sql}
                {_download_scope_sql(scope_classes)}
              ORDER BY q.announcement_date, q.provider_document_id
              LIMIT :limit
@@ -476,6 +500,104 @@ def pending_publish(conn: Connection, *, limit: int) -> list[dict[str, Any]]:
         {"limit": limit},
     ).mappings()
     return [dict(row) for row in rows]
+
+
+def pending_build_count(conn: Connection, *, max_retries: int) -> int:
+    return int(
+        conn.execute(
+            text(
+                f"SELECT count(*) FROM {OPS_SCHEMA}.pending_build_v1 "
+                "WHERE unit_build_attempt_count < :max_retries"
+            ),
+            {"max_retries": max_retries},
+        ).scalar_one()
+    )
+
+
+def pending_publish_count(conn: Connection) -> int:
+    # Same non-empty predicate as pending_publish (empty runs are the
+    # explicit allow_empty operator path, not automatic backlog).
+    return int(
+        conn.execute(
+            text(
+                f"""
+                SELECT count(DISTINCT q.document_id)
+                  FROM {OPS_SCHEMA}.pending_publish_v1 q
+                 WHERE EXISTS (
+                       SELECT 1 FROM {CORE_SCHEMA}.document_unit u
+                        WHERE u.processing_run_id = q.processing_run_id)
+                """
+            )
+        ).scalar_one()
+    )
+
+
+def download_dead_letter_count(conn: Connection, *, max_retries: int) -> int:
+    """Distinct candidates permanently out of the download queue: a terminal
+    (retryable=false) failure or an exhausted retry budget. Same expressions
+    the 0023 view/queries use — single definition lives here (08 §1)."""
+
+    return int(
+        conn.execute(
+            text(
+                f"""
+                SELECT count(*) FROM (
+                    SELECT f.query_params->>'provider_document_id' AS pid
+                      FROM {CORE_SCHEMA}.source_access f
+                     WHERE f.provider = 'cninfo'
+                       AND f.provider_interface = 'cninfo:download_pdf'
+                       AND f.status = 'failed'
+                     GROUP BY 1
+                    HAVING count(*) >= :max_retries
+                        OR bool_or(
+                            f.error IS NOT NULL
+                            AND (f.error)::jsonb->>'retryable' = 'false')
+                ) dead
+                """
+            ),
+            {"max_retries": max_retries},
+        ).scalar_one()
+    )
+
+
+def parse_dead_letter_count(conn: Connection, *, max_retries: int) -> int:
+    """Documents whose parse retries are exhausted or terminally failed —
+    doctor's exhausted-parse口径."""
+
+    return int(
+        conn.execute(
+            text(
+                f"SELECT count(*) FROM {OPS_SCHEMA}.pending_parse_v1 "
+                "WHERE failed_parse_count >= :max_retries "
+                "OR last_failed_retryable = false"
+            ),
+            {"max_retries": max_retries},
+        ).scalar_one()
+    )
+
+
+def retrying_document_count(conn: Connection) -> int:
+    """Documents still pending whose latest failure is retryable — the
+    actionable "currently failing, will be retried" gauge. The raw
+    retryable_failed_run_v1 view counts historical failed RUNS and keeps
+    counting them after the document succeeds (batch-0 finding: 55 stale
+    rows read as a live backlog)."""
+
+    return int(
+        conn.execute(
+            text(
+                f"SELECT count(*) FROM {OPS_SCHEMA}.pending_parse_v1 "
+                "WHERE failed_parse_count > 0 "
+                "AND last_failed_retryable IS NOT false"
+            )
+        ).scalar_one()
+    )
+
+
+def last_outbox_event_at(conn: Connection) -> Any:
+    return conn.execute(
+        text(f"SELECT max(created_at) FROM {OPS_SCHEMA}.outbox_event")
+    ).scalar_one_or_none()
 
 
 def reclaim_stale_runs(conn: Connection, *, threshold_seconds: int) -> int:

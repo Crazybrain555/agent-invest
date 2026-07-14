@@ -29,7 +29,12 @@ PERIOD_RECOMMENDED_FILING_TYPES = frozenset(
 )
 OFFICIAL_DISCLOSURE_PROVIDERS = frozenset({"cninfo"})
 QuarantineReason = Literal[
-    "invalid_raw_document", "expected_hash_mismatch", "io_error"
+    "invalid_raw_document",
+    "expected_hash_mismatch",
+    "io_error",
+    # Archive already holds different bytes for this identity (round23):
+    # the fresh download is preserved as evidence, operator resolves.
+    "raw_archive_conflict",
 ]
 
 _REPORT_PERIOD_RE = re.compile(r"^\d{4}(A|Q[1-4])$")

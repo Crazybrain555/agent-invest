@@ -176,6 +176,53 @@ def _mineru_orphan_check() -> CheckResult:
     return _pass("mineru orphans", "none")
 
 
+def _disk_headroom_checks(settings: Settings) -> list[CheckResult]:
+    """Free-space watermarks (batch 4, 2026-07-14): PG PANICs on a full
+    volume and the archive grows monotonically; <10% free warns."""
+
+    import shutil as _shutil
+
+    checks: list[CheckResult] = []
+    targets = {
+        "disk headroom (data root)": settings.disclosure_data_root,
+    }
+    pgdata = os.environ.get(
+        "DISCLOSURE_PGDATA", "/Volumes/AgentSSD/agent_system/postgres/pg18-main"
+    )
+    targets["disk headroom (PGDATA volume)"] = Path(pgdata)
+    for name, path in targets.items():
+        probe = path
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        try:
+            usage = _shutil.disk_usage(probe)
+        except OSError as exc:
+            checks.append(_warn(name, f"cannot stat {probe}: {exc}"))
+            continue
+        free_pct = usage.free / usage.total * 100
+        detail = f"{free_pct:.0f}% free ({usage.free / 2**30:.0f} GiB) at {probe}"
+        checks.append(
+            _pass(name, detail) if free_pct >= 10 else _warn(name, detail)
+        )
+    return checks
+
+
+def _ops_launchd_check() -> CheckResult:
+    """PostgreSQL has no boot autostart by itself; after a power cycle the
+    worker KeepAlive loops against a dead DB with no alert (batch 4)."""
+
+    plist = (
+        Path.home() / "Library" / "LaunchAgents" / "com.agentinvest.postgres.plist"
+    )
+    if plist.exists():
+        return _pass("postgres autostart", f"installed: {plist.name}")
+    return _warn(
+        "postgres autostart",
+        "not installed; run make install-ops-launchd (machine reboot leaves "
+        "the worker looping against a dead DB)",
+    )
+
+
 def _reader_database_url_checks(settings: Settings) -> list[CheckResult]:
     if uses_reader_database_url_fallback(settings):
         return [
@@ -221,6 +268,8 @@ def run_doctor(
     checks = _environment_checks(settings)
     checks.extend(_reader_database_url_checks(settings))
     checks.append(_mineru_orphan_check())
+    checks.extend(_disk_headroom_checks(settings))
+    checks.append(_ops_launchd_check())
     if settings.database_url is None:
         checks.append(_warn("DATABASE_URL", "missing; DB-backed doctor checks skipped"))
         return DoctorReport(results=tuple(checks))
@@ -582,15 +631,19 @@ def _database_consistency_checks(settings: Settings, engine: Engine) -> list[Che
         ).mappings().one()
         if seq_stats["event_count"] == 0:
             checks.append(_pass("outbox seq", "no outbox events"))
-        elif seq_stats["max_seq"] - seq_stats["min_seq"] + 1 == seq_stats["event_count"]:
-            checks.append(_pass("outbox seq", "monotonic without gaps"))
         else:
+            # Holes are structural, not a defect: every rolled-back
+            # transaction and prune_history run leaves one. Ordering safety
+            # is enforced at the writer (OutboxRepository commit-order lock,
+            # locks.OUTBOX_NS); a no-gap assertion here only cried wolf
+            # (round23: 29k false-positive WARNs).
             checks.append(
-                _warn(
+                _pass(
                     "outbox seq",
                     (
-                        f"gap detected: min={seq_stats['min_seq']} "
-                        f"max={seq_stats['max_seq']} count={seq_stats['event_count']}"
+                        f"count={seq_stats['event_count']} "
+                        f"span=[{seq_stats['min_seq']},{seq_stats['max_seq']}]; "
+                        "holes expected (rollbacks/prune)"
                     ),
                 )
             )

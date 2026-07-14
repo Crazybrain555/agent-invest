@@ -27,6 +27,9 @@ from disclosure_anchor.domain.errors import DisclosureAnchorError
 from disclosure_anchor.domain.value_objects import canonical_security_identity
 
 SYNC_FREQUENCIES = ("hourly", "daily", "weekly")
+# The pool has exactly two lifecycle states; the empty/None default of "active"
+# is applied by the CSV/API intake layers before an entry reaches here.
+TRACK_STATUSES = ("active", "paused")
 
 
 def _known_classes() -> frozenset[str]:
@@ -52,6 +55,9 @@ class TrackEntry:
         object.__setattr__(self, "exchange", exchange)
 
 
+TRACK_MODES = ("full_row", "ensure")
+
+
 @dataclass(frozen=True)
 class TrackCompaniesCommand:
     entries: tuple[TrackEntry, ...]
@@ -62,6 +68,11 @@ class TrackCompaniesCommand:
     # Plan mode (terraform plan / HA check_config pattern): compute the full
     # reconcile outcome, then roll back instead of committing.
     dry_run: bool = False
+    # "full_row" = every route's historical upsert semantics (absent optional
+    # field clears the stale override). "ensure" = membership only: existing
+    # rows keep status and all overrides untouched (`track --codes` shortcut,
+    # round23 — a quick add must not wipe a curated row).
+    mode: str = "full_row"
 
 
 @dataclass(frozen=True)
@@ -71,6 +82,11 @@ class TrackEntryResult:
     tracked_company_id: str
     company_id: str
     created: bool
+    # Visibility for the full-row footgun (round23): which existing non-null
+    # overrides this upsert cleared back to inherit, and any status flip.
+    action: str = "updated"  # "created" | "updated" | "unchanged"
+    cleared_overrides: tuple[str, ...] = ()
+    status_change: str | None = None
 
 
 @dataclass(frozen=True)
@@ -239,7 +255,19 @@ class TrackCompanies:
         self._resolver = SubjectResolver()
 
     def execute(self, command: TrackCompaniesCommand) -> TrackCompaniesResult:
+        if command.mode not in TRACK_MODES:
+            raise ValueError(
+                f"unknown mode {command.mode!r}: expected one of {TRACK_MODES}"
+            )
         for entry in command.entries:
+            if entry.status not in TRACK_STATUSES:
+                # A misspelled status (e.g. "pasued") would silently drop the
+                # company out of every queue; reject it up front like the other
+                # override validations rather than persist it.
+                raise ValueError(
+                    f"unknown status {entry.status!r} for "
+                    f"{entry.security_code}: expected one of {TRACK_STATUSES}"
+                )
             if entry.sync_frequency and entry.sync_frequency not in SYNC_FREQUENCIES:
                 raise ValueError(
                     f"unknown sync_frequency {entry.sync_frequency!r} for "
@@ -260,7 +288,7 @@ class TrackCompanies:
         drift: list[DriftEntry] = []
         with self._uow_factory() as uow:
             for entry in command.entries:
-                results.append(self._track_one(uow, entry))
+                results.append(self._track_one(uow, entry, mode=command.mode))
             if command.reconcile:
                 drift = self._reconcile_drift(
                     uow,
@@ -301,7 +329,9 @@ class TrackCompanies:
             )
         return drift
 
-    def _track_one(self, uow: UnitOfWork, entry: TrackEntry) -> TrackEntryResult:
+    def _track_one(
+        self, uow: UnitOfWork, entry: TrackEntry, *, mode: str = "full_row"
+    ) -> TrackEntryResult:
         subject = self._resolver.resolve(
             uow,
             SubjectCandidate(
@@ -318,12 +348,38 @@ class TrackCompanies:
         process_classes = list(entry.process_classes) if entry.process_classes else None
         existing = uow.tracked_companies.get_by_company_id(subject.company.company_id)
         if existing is not None:
+            if mode == "ensure":
+                # Membership shortcut: the row exists, keep status and every
+                # override exactly as curated (round23).
+                return TrackEntryResult(
+                    security_code=entry.security_code,
+                    exchange=entry.exchange,
+                    tracked_company_id=existing.tracked_company_id,
+                    company_id=subject.company.company_id,
+                    created=False,
+                    action="unchanged",
+                )
+            cleared = tuple(
+                name
+                for name, old, new in (
+                    ("lookback", existing.lookback, lookback),
+                    ("process_classes", existing.process_classes, process_classes),
+                    ("sync_frequency", existing.sync_frequency, entry.sync_frequency),
+                )
+                if old is not None and new is None
+            )
+            status_change = (
+                f"{existing.status}->{entry.status}"
+                if existing.status != entry.status
+                else None
+            )
             existing.security_id = subject.security.security_id
             existing.status = entry.status
             # Full-row upsert semantics on every route: an absent optional
             # field means "inherit the default", so an update must also CLEAR
             # a stale override (Codex acceptance P1: blank lookback left
-            # {"days":30} behind).
+            # {"days":30} behind). cleared_overrides/status_change give the
+            # caller visibility into exactly that (round23).
             existing.lookback = lookback
             existing.process_classes = process_classes
             existing.sync_frequency = entry.sync_frequency
@@ -334,6 +390,9 @@ class TrackCompanies:
                 tracked_company_id=existing.tracked_company_id,
                 company_id=subject.company.company_id,
                 created=False,
+                action="updated",
+                cleared_overrides=cleared,
+                status_change=status_change,
             )
         tracked = uow.tracked_companies.add(
             e.TrackedCompany(
@@ -352,4 +411,5 @@ class TrackCompanies:
             tracked_company_id=tracked.tracked_company_id,
             company_id=subject.company.company_id,
             created=True,
+            action="created",
         )

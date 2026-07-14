@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from disclosure_anchor.api.errors import install_error_handlers
 from disclosure_anchor.api.routers.admin import router as admin_router
 from disclosure_anchor.api.routers.changes import router as changes_router
@@ -79,7 +81,15 @@ def create_app(settings: Settings | None = None, *, validate_runtime: bool = Tru
     if tracked_router is not None:
         app.include_router(tracked_router)
     if admin_router is not None and resolved_settings.disclosure_enable_admin_api:
-        # Unauthenticated local-ops surface: explicitly opt-in, never on the
-        # L2-facing deployment (round8 audit blocker).
-        app.include_router(admin_router)
+        # Token-guarded local-ops surface (user decision 2026-07-14,
+        # supersedes round8's unauthenticated stance): mounting requires a
+        # configured DISCLOSURE_ADMIN_TOKEN — fail closed, never expose the
+        # write surface bare. Still never on the L2-facing deployment.
+        if resolved_settings.disclosure_admin_token is None:
+            logging.getLogger(__name__).warning(
+                "DISCLOSURE_ENABLE_ADMIN_API is set but DISCLOSURE_ADMIN_TOKEN "
+                "is missing; refusing to mount /v1/admin (fail-closed)"
+            )
+        else:
+            app.include_router(admin_router)
     return app

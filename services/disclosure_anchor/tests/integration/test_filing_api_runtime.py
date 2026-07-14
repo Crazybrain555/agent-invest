@@ -109,11 +109,16 @@ def _sample_pdf_or_skip(label: str) -> Path:
     return sample_pdf
 
 
+_ADMIN_TOKEN = "integration-admin-token"
+_ADMIN_HEADERS = {"Authorization": f"Bearer {_ADMIN_TOKEN}"}
+
+
 def _settings(root: Path, *, mineru: Path | None = None) -> Settings:
     data_root = root / "services" / "disclosure_anchor"
     shared_root = root / "shared"
     return Settings(
         disclosure_enable_admin_api=True,
+        disclosure_admin_token=_ADMIN_TOKEN,
         disclosure_data_root=data_root,
         disclosure_shared_root=shared_root,
         disclosure_runtime_root=data_root / "runtime",
@@ -892,6 +897,7 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
             self.app,
             "POST",
             "/v1/admin/documents/register-local-pdf",
+            headers=_ADMIN_HEADERS,
             json_body={
                 "file_path": str(sample_pdf),
                 "company_legal_name": sample.company_legal_name,
@@ -917,6 +923,7 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
             self.app,
             "POST",
             f"/v1/admin/documents/{document_id}/parse",
+            headers=_ADMIN_HEADERS,
             json_body={},
         )
         self.assertEqual(parsed.status_code, 200, parsed.body)
@@ -928,6 +935,7 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
             self.app,
             "POST",
             f"/v1/admin/documents/{document_id}/build-units",
+            headers=_ADMIN_HEADERS,
         )
         self.assertEqual(built.status_code, 200, built.body)
         build_payload = built.json()
@@ -938,6 +946,7 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
             self.app,
             "POST",
             f"/v1/admin/runs/{processing_run_id}/publish",
+            headers=_ADMIN_HEADERS,
             json_body={"allow_empty": False},
         )
         self.assertEqual(published.status_code, 200, published.body)

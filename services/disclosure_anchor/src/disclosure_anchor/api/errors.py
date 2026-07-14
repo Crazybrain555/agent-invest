@@ -5,6 +5,18 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any, NoReturn
 
+from disclosure_anchor.application.use_cases.sync_disclosure_index import (
+    CompanyNotTrackedError,
+)
+from disclosure_anchor.domain.errors import (
+    BuildUnitsError,
+    ParseDocumentError,
+    PublishRunError,
+    RawDocumentError,
+    RegistrationMetadataError,
+    SubjectIdentityConflictError,
+)
+
 try:
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.exceptions import RequestValidationError
@@ -29,6 +41,14 @@ GONE_SUPERSEDED = "GONE_SUPERSEDED"
 L1_PROCESSING_REQUIRED = "L1_PROCESSING_REQUIRED"
 CONTRACT_VERSION_MISMATCH = "CONTRACT_VERSION_MISMATCH"
 VALIDATION_ERROR = "VALIDATION_ERROR"
+# Local-ops admin-only conflict code. NOT part of the public error-code
+# 全集 (api/CLAUDE.md) and deliberately kept out of the exported OpenAPI
+# ErrorEnvelope enum: the admin write surface is not in the public contract,
+# so its operational 409s carry this code in the same envelope shape without
+# widening the public read-side vocabulary.
+CONFLICT = "CONFLICT"
+UNAUTHORIZED = "UNAUTHORIZED"
+FORBIDDEN = "FORBIDDEN"
 
 
 class FilingApiError(HTTPException):
@@ -93,6 +113,84 @@ def contract_version_mismatch(requested: str) -> FilingApiError:
     )
 
 
+# Domain error codes (BuildUnitsError/PublishRunError structured .error dict)
+# that mean "the referenced entity does not exist" and therefore map to 404.
+_NOT_FOUND_DOMAIN_CODES = frozenset({"RUN_NOT_FOUND"})
+
+
+def _looks_like_not_found(text: str) -> bool:
+    return "not found" in text.lower()
+
+
+def _domain_validation_error(field: str, message: str) -> FilingApiError:
+    return FilingApiError(
+        status_code=422,
+        error_code=VALIDATION_ERROR,
+        message="request validation failed",
+        detail={"errors": [{"field": field, "message": message}]},
+    )
+
+
+def filing_error_from_domain_error(exc: Exception) -> FilingApiError | None:
+    """Translate a use-case domain error into the structured error envelope.
+
+    Admin write endpoints (register-local-pdf/parse/build-units/publish/sync)
+    do not catch use-case errors inline; without this an unknown id surfaced as
+    a bare FastAPI 500. Only the specific, expected domain errors are mapped —
+    anything else returns None so it keeps failing loudly (service boundary 7).
+    """
+
+    if isinstance(exc, CompanyNotTrackedError):
+        # Message carries the operator guidance ("track it first via …"); pass
+        # it through verbatim.
+        return FilingApiError(status_code=404, error_code=NOT_FOUND, message=str(exc))
+    # SubjectIdentityConflictError is a RegistrationMetadataError subclass;
+    # check it first so an identity conflict maps to 409, not 422.
+    if isinstance(exc, SubjectIdentityConflictError):
+        return FilingApiError(status_code=409, error_code=CONFLICT, message=str(exc))
+    if isinstance(exc, RegistrationMetadataError):
+        return _domain_validation_error("registration", str(exc))
+    if isinstance(exc, RawDocumentError):
+        return _domain_validation_error("raw_document", str(exc))
+    if isinstance(exc, (BuildUnitsError, PublishRunError)):
+        error = exc.error if isinstance(exc.error, dict) else {}
+        code = str(error.get("error_code", ""))
+        message = str(error.get("message") or exc)
+        detail = {"error": error}
+        if code in _NOT_FOUND_DOMAIN_CODES or _looks_like_not_found(code) or (
+            _looks_like_not_found(message)
+        ):
+            return FilingApiError(
+                status_code=404, error_code=NOT_FOUND, message=message, detail=detail
+            )
+        # EMPTY_RUN / RUN_NOT_SUCCEEDED / UNITS_NOT_BUILT / … — publishable-state
+        # conflicts.
+        return FilingApiError(
+            status_code=409, error_code=CONFLICT, message=message, detail=detail
+        )
+    if isinstance(exc, ParseDocumentError):
+        message = str(exc)
+        if _looks_like_not_found(message):
+            return FilingApiError(
+                status_code=404, error_code=NOT_FOUND, message=message
+            )
+        return FilingApiError(status_code=409, error_code=CONFLICT, message=message)
+    return None
+
+
+# Base types registered with the app so any subclass raised by an admin write
+# endpoint is translated by filing_error_from_domain_error. SubjectIdentity*
+# and InvalidRawDocumentError reach these via their base classes.
+_DOMAIN_ERROR_TYPES: tuple[type[Exception], ...] = (
+    CompanyNotTrackedError,
+    RegistrationMetadataError,
+    RawDocumentError,
+    BuildUnitsError,
+    PublishRunError,
+    ParseDocumentError,
+)
+
+
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(FilingApiError)
     async def _filing_api_error_handler(
@@ -115,6 +213,15 @@ def install_error_handlers(app: FastAPI) -> None:
             detail={"errors": errors},
         )
         return JSONResponse(status_code=api_error.status_code, content=api_error.body())
+
+    async def _domain_error_handler(request: Request, exc: Exception) -> JSONResponse:
+        api_error = filing_error_from_domain_error(exc)
+        if api_error is None:  # pragma: no cover - only registered types reach here
+            raise exc
+        return JSONResponse(status_code=api_error.status_code, content=api_error.body())
+
+    for exc_type in _DOMAIN_ERROR_TYPES:
+        app.add_exception_handler(exc_type, _domain_error_handler)
 
     @app.middleware("http")
     async def _contract_version_middleware(

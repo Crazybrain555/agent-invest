@@ -149,6 +149,54 @@ def _uow(root: Path, *, contract_version: str = "normalized_ir.v2") -> tuple[Fak
 
 
 class BuildUnitsTests(unittest.TestCase):
+    def test_matching_ir_artifact_hash_builds_normally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _uow(root)
+            run = uow.processing_runs.get("run_1")
+            run.artifact_hash = (
+                "sha256:"
+                + hashlib.sha256((root / ir_relpath).read_bytes()).hexdigest()
+            )
+            uow.processing_runs.update(run)
+            paths = _PathBuilder(root)
+            use_case = BuildUnits(
+                path_builder=paths,
+                artifact_store=ArtifactStore(paths),
+                uow_factory=lambda: uow,
+            )
+
+            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+            self.assertEqual(result.status, "succeeded")
+
+    def test_ir_hash_mismatch_fails_structured_before_building(self) -> None:
+        # The IR sits in the overwritable derived area; a corrupted or
+        # overwritten IR must fail loudly instead of publishing
+        # self-consistent bad units (round23).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _uow(root)
+            run = uow.processing_runs.get("run_1")
+            run.artifact_hash = "sha256:" + "0" * 64
+            uow.processing_runs.update(run)
+            paths = _PathBuilder(root)
+            use_case = BuildUnits(
+                path_builder=paths,
+                artifact_store=ArtifactStore(paths),
+                uow_factory=lambda: uow,
+            )
+
+            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.error["error_code"], "IR_HASH_MISMATCH")
+            self.assertEqual(
+                uow.processing_runs.get("run_1").unit_build_error["error_code"],
+                "IR_HASH_MISMATCH",
+            )
+            self.assertEqual(uow.document_units.list_by_processing_run("run_1"), [])
+
     def test_unknown_preparation_failure_preserves_structured_code(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

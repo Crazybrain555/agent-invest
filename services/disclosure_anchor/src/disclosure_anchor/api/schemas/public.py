@@ -190,6 +190,40 @@ class TrackedCompanyV1(PublicModel):
 
 class TrackedCompanyListResponse(PublicModel):
     items: list[TrackedCompanyV1]
+    next_cursor: str | None = None
+
+
+class ProcessingClassV1(PublicModel):
+    # One entry of the unified class vocabulary (class_map.json). disposition
+    # is the processing_policy.json layer-2 default: process (download+parse) |
+    # register_only (metadata only) | unknown_disposition (policy unreachable
+    # or a class the policy does not list).
+    name: str
+    zh: str | None
+    priority: int
+    disposition: str
+
+
+class ClassificationRuleSetV1(PublicModel):
+    # DB-loaded classification_rule versions per rule_set (doctor口径:
+    # string_agg(DISTINCT version)). rule_count is the row count in that set.
+    rule_set: str
+    version: str
+    rule_count: int
+
+
+class ClassificationResponse(PublicModel):
+    # Vocabulary catalog behind documents_v1.disclosure_topics / filing_type:
+    # the full class set (class_map.json) with each class's processing
+    # disposition, plus the classification_rule versions actually loaded in
+    # the DB. processing_policy fields degrade (available=false + note) when
+    # the policy file is unreachable — the class set and rule versions stay.
+    class_map_version: str
+    processing_policy_version: str | None
+    processing_policy_available: bool
+    classes: list[ProcessingClassV1]
+    rule_sets: list[ClassificationRuleSetV1]
+    note: str | None = None
 
 
 class DocumentListResponse(PublicModel):

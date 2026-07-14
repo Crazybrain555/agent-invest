@@ -38,6 +38,24 @@ class SyncDisclosureIndexError(DisclosureAnchorError):
     """Raised when index sync fails after durable failure state is recorded."""
 
 
+class CompanyNotTrackedError(DisclosureAnchorError):
+    """Sync requires prior pool membership; tracking is an explicit operator act.
+
+    Sync never adds a company to the tracked pool and never changes its
+    status: `make track` / PUT /v1/admin/tracked-companies own membership,
+    `paused` stays paused across explicit syncs (round23).
+    """
+
+    def __init__(self, security_code: str, exchange: str) -> None:
+        self.security_code = security_code
+        self.exchange = exchange
+        super().__init__(
+            f"company {security_code} ({exchange}) is not in the tracked pool; "
+            "track it first via `make track CODES=...` or "
+            "PUT /v1/admin/tracked-companies"
+        )
+
+
 @dataclass(frozen=True)
 class SyncDisclosureIndexCommand:
     security_code: str
@@ -66,11 +84,30 @@ def compute_sync_window(
     today: date,
     overlap_days: int,
     initial_lookback_days: int = 1095,
+    explicit_window_start: date | None = None,
+    explicit_window_end: date | None = None,
 ) -> tuple[date, date]:
     """Effective sync window for one company (shared by CLI sync and the
-    on-demand admin sync endpoint): explicit override > checkpoint+overlap >
-    per-company lookback > global initial backfill."""
+    on-demand admin sync endpoint): explicit date range > explicit window
+    days > checkpoint+overlap > per-company lookback > global initial
+    backfill.
 
+    The explicit [start, end] range is the backfill channel (round23,
+    industry-standard shape: Airflow/edgartools/OpenBB all take absolute
+    date ranges for历史补数); the pool's lookback_days stays the relative
+    first-sync depth and is never a query parameter.
+    """
+
+    if explicit_window_start is not None or explicit_window_end is not None:
+        if explicit_window_days is not None:
+            raise ValueError("window and from/to are mutually exclusive")
+        if explicit_window_start is None or explicit_window_end is None:
+            raise ValueError("from/to must be provided together")
+        if explicit_window_start > explicit_window_end:
+            raise ValueError("window start must not be after window end")
+        if explicit_window_end > today:
+            raise ValueError("window end must not be in the future")
+        return explicit_window_start, explicit_window_end
     if explicit_window_days is not None:
         if explicit_window_days < 0:
             raise ValueError("window must be non-negative")
@@ -119,6 +156,10 @@ class SyncDisclosureIndex:
     def execute(self, command: SyncDisclosureIndexCommand) -> SyncDisclosureIndexResult:
         window = DisclosureWindow(command.window_start, command.window_end)
         now = datetime.now(timezone.utc)
+        # Membership precheck happens BEFORE the provider profile call: an
+        # untracked company must not burn CNINFO quota, and the resolver must
+        # not create ledger rows for it (round23).
+        self._require_tracked(command)
         try:
             profile = self._profile_loader(command.security_code)
         except DisclosureAnchorError as exc:
@@ -152,8 +193,9 @@ class SyncDisclosureIndex:
                 source_access_id=profile_access.source_access_id,
                 observed_at=now,
             )
-            tracked = self._upsert_tracked_company(
+            tracked = self._refresh_tracked_company(
                 uow=uow,
+                command=command,
                 company_id=subject.company.company_id,
                 security_id=subject.security.security_id,
             )
@@ -342,27 +384,34 @@ class SyncDisclosureIndex:
             )
         )
 
-    def _upsert_tracked_company(
+    def _require_tracked(self, command: SyncDisclosureIndexCommand) -> None:
+        with self._uow_factory() as uow:
+            security = uow.securities.get_by_code_exchange(
+                command.security_code, command.exchange
+            )
+            if security is None:
+                raise CompanyNotTrackedError(command.security_code, command.exchange)
+            tracked = uow.tracked_companies.get_by_company_id(security.company_id)
+            if tracked is None:
+                raise CompanyNotTrackedError(command.security_code, command.exchange)
+
+    def _refresh_tracked_company(
         self,
         *,
         uow: UnitOfWork,
+        command: SyncDisclosureIndexCommand,
         company_id: str,
         security_id: str,
     ) -> e.TrackedCompany:
-        # process_classes is watchlist-managed (make track); sync never
-        # touches the cascade override (round21).
+        # Bookkeeping only: keep security_id current. Membership and status
+        # are watchlist-managed (make track / admin PUT); sync never creates
+        # pool rows, never resurrects paused, never touches the cascade
+        # overrides (round21/round23). Re-verified inside this transaction:
+        # the precheck ran in an earlier one and untrack may have raced.
         existing = uow.tracked_companies.get_by_company_id(company_id)
         if existing is None:
-            return uow.tracked_companies.add(
-                e.TrackedCompany(
-                    tracked_company_id=ids.new_tracked_company_id(),
-                    company_id=company_id,
-                    security_id=security_id,
-                    status="active",
-                )
-            )
+            raise CompanyNotTrackedError(command.security_code, command.exchange)
         existing.security_id = security_id
-        existing.status = "active"
         return uow.tracked_companies.update(existing)
 
     def _record_index_access(
@@ -452,8 +501,19 @@ class SyncDisclosureIndex:
     ) -> e.SourceCheckpoint:
         scope_key = f"{company_id}:p_info3015"
         existing = uow.source_checkpoints.get_by_scope(CNINFO_PROVIDER, scope_key)
+        cursor_end = window_end
+        if existing is not None and existing.cursor:
+            prior = existing.cursor.get("window_end")
+            if isinstance(prior, str) and prior:
+                prior_end = date.fromisoformat(prior)
+                # Monotonic cursor: a historical backfill (explicit
+                # from/to with end < today, round23) must not drag
+                # window_end backwards — the next worker round would
+                # re-sync everything since that date. The daily
+                # increment anchor only ever moves forward.
+                cursor_end = max(prior_end, window_end)
         cursor = {
-            "window_end": window_end.isoformat(),
+            "window_end": cursor_end.isoformat(),
             # Audit fields (design/watchlist-operations.md §5.4): what window
             # this sync actually covered and when. Readers only use window_end.
             "window_start": window_start.isoformat() if window_start else None,

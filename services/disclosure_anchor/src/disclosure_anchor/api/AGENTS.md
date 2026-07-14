@@ -48,4 +48,8 @@ DB 拓扑：read routers 使用 `reader_db_engine`（来自 `DISCLOSURE_READER_D
 不要让读端点依赖 admin/app engine 的写权限。
 
 admin 端点仅供本地运维同步执行；请求/响应体跟 use case 契约对齐。`quarantined_path` 只返回
-basename。不要在 API 层新增鉴权、多租户、MCP 包装、全文/向量检索或 retrieval projection。
+basename。admin 面自带静态 Bearer token + 回环双闸（用户裁决 2026-07-14，取代 round8 的
+"无鉴权+默认关"立场）：挂载需要 `DISCLOSURE_ADMIN_TOKEN`（缺失 fail-closed 拒挂），
+401/403/409 用 admin 专用运行期码（UNAUTHORIZED/FORBIDDEN/CONFLICT，不进公开契约枚举——
+admin 不在导出契约面内）。读侧公开错误码全集仍为上方 5 个。
+不要在 API 层新增多租户、MCP 包装、全文/向量检索或 retrieval projection。

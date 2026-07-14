@@ -20,8 +20,10 @@ from disclosure_anchor.application.ports.disclosure_source import (
 )
 from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     INDEX_INTERFACE,
+    CompanyNotTrackedError,
     SyncDisclosureIndex,
     SyncDisclosureIndexCommand,
+    compute_sync_window,
 )
 from disclosure_anchor.domain import entities as e
 from tests.unit._fakes import FakeUnitOfWork, SourceAccessRepo
@@ -30,9 +32,34 @@ from tests.unit._fakes import FakeUnitOfWork, SourceAccessRepo
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "cninfo"
 
 
+def _seed_tracked(uow: FakeUnitOfWork, *, status: str = "active") -> e.TrackedCompany:
+    """Sync requires prior pool membership (round23); seed it like `make track`."""
+
+    company = uow.companies.add(
+        e.Company(company_id="comp_test000001", legal_name="平安银行股份有限公司")
+    )
+    security = uow.securities.add(
+        e.Security(
+            security_id="sec_test000001",
+            company_id=company.company_id,
+            security_code="000001",
+            exchange="SZSE",
+        )
+    )
+    return uow.tracked_companies.add(
+        e.TrackedCompany(
+            tracked_company_id="trk_test000001",
+            company_id=company.company_id,
+            security_id=security.security_id,
+            status=status,
+        )
+    )
+
+
 class SyncDisclosureIndexTests(unittest.TestCase):
     def test_persists_candidates_before_advancing_checkpoint(self) -> None:
         uow = FakeUnitOfWork()
+        _seed_tracked(uow)
         use_case = _use_case(uow, _refs())
 
         result = use_case.execute(_command())
@@ -62,6 +89,7 @@ class SyncDisclosureIndexTests(unittest.TestCase):
 
     def test_empty_index_writes_empty_snapshot_and_hash(self) -> None:
         uow = FakeUnitOfWork()
+        _seed_tracked(uow)
         use_case = _use_case(uow, [])
 
         result = use_case.execute(_command())
@@ -73,6 +101,7 @@ class SyncDisclosureIndexTests(unittest.TestCase):
 
     def test_cninfo_org_id_and_tracked_company_are_recorded(self) -> None:
         uow = FakeUnitOfWork()
+        _seed_tracked(uow)
         use_case = _use_case(uow, _refs())
 
         result = use_case.execute(_command())
@@ -86,8 +115,46 @@ class SyncDisclosureIndexTests(unittest.TestCase):
         self.assertEqual(identifier.company_id, result.company_id)
         self.assertEqual(identifier.source_access_id, result.profile_source_access_id)
 
+    def test_untracked_company_is_rejected_before_any_provider_call(self) -> None:
+        uow = FakeUnitOfWork()
+        profile_calls: list[str] = []
+        source = FakeCninfoSource(_refs())
+
+        def _recording_loader(code: str) -> object:
+            profile_calls.append(code)
+            return _profile()
+
+        use_case = SyncDisclosureIndex(
+            source=source,
+            profile_loader=_recording_loader,
+            uow_factory=lambda: uow,
+        )
+
+        with self.assertRaises(CompanyNotTrackedError):
+            use_case.execute(_command())
+
+        # No quota burned, no ledger rows created, nothing persisted.
+        self.assertEqual(profile_calls, [])
+        self.assertEqual(source.calls, [])
+        self.assertEqual(uow.companies.all(), [])
+        self.assertEqual(uow.securities.all(), [])
+        self.assertEqual(uow.source_accesses.all(), [])
+        self.assertEqual(uow.commit_count, 0)
+
+    def test_sync_preserves_paused_status_and_never_resurrects(self) -> None:
+        uow = FakeUnitOfWork()
+        _seed_tracked(uow, status="paused")
+        use_case = _use_case(uow, _refs())
+
+        result = use_case.execute(_command())
+
+        tracked = uow.tracked_companies.get_by_company_id(result.company_id)
+        self.assertEqual(tracked.status, "paused")
+        self.assertEqual(tracked.security_id, result.security_id)
+
     def test_checkpoint_does_not_advance_when_candidate_persistence_fails(self) -> None:
         uow = FakeUnitOfWork()
+        _seed_tracked(uow)
         uow.source_accesses = FailingIndexSourceAccessRepo()
         use_case = _use_case(uow, _refs())
 
@@ -98,6 +165,7 @@ class SyncDisclosureIndexTests(unittest.TestCase):
 
     def test_existing_checkpoint_refreshes_due_timestamp(self) -> None:
         uow = FakeUnitOfWork()
+        _seed_tracked(uow)
         use_case = _use_case(uow, _refs())
         first = use_case.execute(_command())
         checkpoint = uow.source_checkpoints.get(first.checkpoint_id)
@@ -117,6 +185,7 @@ class SyncDisclosureIndexTests(unittest.TestCase):
 
     def test_persisted_candidates_can_be_recovered_after_crash(self) -> None:
         uow = FakeUnitOfWork()
+        _seed_tracked(uow)
         use_case = _use_case(uow, _refs())
         result = use_case.execute(_command())
 
@@ -127,6 +196,77 @@ class SyncDisclosureIndexTests(unittest.TestCase):
             recovered[0]["provider_document_id"],
             "cninfo-test-000001-20260701-annual",
         )
+
+
+class ComputeSyncWindowTests(unittest.TestCase):
+    TODAY = date(2026, 7, 14)
+
+    def _window(self, **kwargs):
+        uow = FakeUnitOfWork()
+        return compute_sync_window(
+            uow_factory=lambda: uow,
+            company="000001",
+            exchange="SZSE",
+            today=self.TODAY,
+            overlap_days=7,
+            explicit_window_days=kwargs.pop("explicit_window_days", None),
+            **kwargs,
+        )
+
+    def test_explicit_date_range_wins(self) -> None:
+        self.assertEqual(
+            self._window(
+                explicit_window_start=date(2019, 1, 1),
+                explicit_window_end=date(2019, 12, 31),
+            ),
+            (date(2019, 1, 1), date(2019, 12, 31)),
+        )
+
+    def test_range_and_window_days_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(ValueError):
+            self._window(
+                explicit_window_days=30,
+                explicit_window_start=date(2019, 1, 1),
+                explicit_window_end=date(2019, 12, 31),
+            )
+
+    def test_range_requires_both_ends_ordered_and_not_future(self) -> None:
+        with self.assertRaises(ValueError):
+            self._window(explicit_window_start=date(2019, 1, 1))
+        with self.assertRaises(ValueError):
+            self._window(
+                explicit_window_start=date(2020, 1, 1),
+                explicit_window_end=date(2019, 1, 1),
+            )
+        with self.assertRaises(ValueError):
+            self._window(
+                explicit_window_start=date(2026, 7, 1),
+                explicit_window_end=date(2027, 1, 1),
+            )
+
+
+class CheckpointMonotonicTests(unittest.TestCase):
+    def test_historical_backfill_does_not_regress_cursor(self) -> None:
+        # A [2019, 2019] repair sync must not drag window_end back to 2019 —
+        # the next worker round would re-sync years of index (round23).
+        uow = FakeUnitOfWork()
+        _seed_tracked(uow)
+        use_case = _use_case(uow, _refs())
+        first = use_case.execute(_command())  # window_end = 2026-07-02
+        backfill = use_case.execute(
+            SyncDisclosureIndexCommand(
+                security_code="000001",
+                exchange="SZSE",
+                window_start=date(2019, 1, 1),
+                window_end=date(2019, 12, 31),
+            )
+        )
+
+        checkpoint = uow.source_checkpoints.get(backfill.checkpoint_id)
+        self.assertEqual(backfill.checkpoint_id, first.checkpoint_id)
+        self.assertEqual(checkpoint.cursor["window_end"], "2026-07-02")
+        # Audit fields still record what the backfill actually covered.
+        self.assertEqual(checkpoint.cursor["window_start"], "2019-01-01")
 
 
 class FakeCninfoSource:

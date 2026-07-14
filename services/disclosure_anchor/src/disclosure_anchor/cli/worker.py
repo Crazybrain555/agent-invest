@@ -4,6 +4,7 @@ from __future__ import annotations
 
 
 import argparse
+import subprocess
 from dataclasses import dataclass, replace
 import signal
 import threading
@@ -81,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = load_settings()
+    _print_version_banner(settings)
     # Singleton lock on a dedicated NullPool connection: a pooled connection
     # would leak the session lock back into the pool on release (08 §2 E6).
     lock_engine = sqlalchemy.create_engine(
@@ -167,6 +169,7 @@ def _run_loop(settings: Settings, *, lock_conn: Connection) -> int:
             try:
                 _append_reports(settings, report)
                 print(render_report_section(report))
+                _maybe_alert(settings, report)
             except Exception:
                 # A full/unmounted report volume must not turn KeepAlive into
                 # a 30-second restart storm. stderr still carries the trace.
@@ -529,6 +532,73 @@ def _process_scope_classes(settings: Settings) -> tuple[str, ...]:
     from disclosure_anchor.adapters.sources.cninfo.mapper import load_processing_policy
 
     return load_processing_policy(settings.disclosure_processing_policy_path)
+
+
+def _print_version_banner(settings: Settings) -> None:
+    """Log the loaded config generation at startup (batch 4, 2026-07-14).
+
+    The resident process reads policy/env exactly once; without this banner
+    "the file says X but the process runs Y" drift was undetectable from the
+    logs. DB rule versions are best-effort — a down DB must not block boot.
+    """
+
+    from disclosure_anchor.adapters.unit_builder import rules as builder_rules
+
+    scope = _process_scope_classes(settings)
+    line = (
+        f"[versions] policy={settings.disclosure_processing_policy_path.name} "
+        f"scope_classes={len(scope)} builder_rules={builder_rules.RULES_VERSION}"
+    )
+    try:
+        engine = create_db_engine(_database_url(settings))
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT rule_set, max(version) FROM "
+                    "disclosure_core.classification_rule GROUP BY rule_set "
+                    "ORDER BY rule_set"
+                )
+            ).all()
+        engine.dispose()
+        line += " " + " ".join(f"{kind}={version}" for kind, version in rows)
+    except Exception as exc:  # pragma: no cover - depends on live DB
+        line += f" (rule versions unavailable: {type(exc).__name__})"
+    # flush: launchd redirects stdout to a file (block-buffered); the boot
+    # banner must not sit invisible in the buffer (its whole purpose).
+    print(line, flush=True)
+
+
+def _maybe_alert(settings: Settings, report: WorkerReport) -> None:
+    """Fire the single-operator notification channel on round-level trouble.
+
+    Best-effort by design: a broken osascript/notify path must never take the
+    worker down — the report file remains the durable record.
+    """
+
+    message = _alert_message(report)
+    if message is None:
+        return
+    script = Path(__file__).resolve().parents[3] / "scripts" / "notify.sh"
+    if not script.exists():
+        return
+    try:
+        subprocess.run(
+            [str(script), "worker round trouble", message],
+            timeout=15,
+            check=False,
+            capture_output=True,
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+def _alert_message(report: WorkerReport) -> str | None:
+    if report.source_outage_break:
+        return "source outage break (CNINFO/credentials); acquisition paused this round"
+    if report.failed >= 5:
+        stages = sorted({failure.stage for failure in report.failures})
+        return f"{report.failed} failures in one round (stages: {', '.join(stages)})"
+    return None
 
 
 def _append_reports(settings: Settings, report: WorkerReport) -> None:

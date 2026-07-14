@@ -25,10 +25,11 @@ WITH_ENV = set -a; for f in worker.env cninfo.env; do [ -r "$(DISCLOSURE_ENV_DIR
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	test-mineru-smoke lint typecheck agent-check api archive pg-init pg-start pg-stop \
-	pg-status db-create migrate register parse build-units publish process rebuild-units prune-history load-rules config-check track track-status track-export untrack purge-company sync worker-once worker-loop doctor-full wipe-test-data
+	pg-status db-create migrate register parse build-units publish process rebuild-units prune-history load-rules config-check track track-status track-export untrack purge-company sync worker-once worker-loop doctor-full wipe-test-data \
+	worker-status worker-restart gc-orphans audit-unmapped-codes audit-boilerplate audit-headings audit-weekly install-ops-launchd
 
 doctor:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
 
 lint:
 	$(PYTHON) -m ruff check src tests scripts
@@ -175,6 +176,44 @@ worker-once:
 
 worker-loop:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker loop
+
+# Resident worker control (batch 4, 2026-07-14). Config/code/env changes only
+# take effect after an explicit restart — see config/README.md 生效矩阵.
+worker-status:
+	@launchctl print gui/$$(id -u)/com.agentinvest.disclosure-worker 2>/dev/null \
+		| grep -E "state|pid|last exit" || echo "[warn] worker job not loaded"
+	@echo "--- latest report ---"
+	@$(WITH_ENV) tail -n 30 "$$DISCLOSURE_RUNTIME_ROOT/reports/worker/$$(date +%F).md" 2>/dev/null \
+		|| echo "[note] no report for today yet"
+
+worker-restart:
+	launchctl kickstart -k gui/$$(id -u)/com.agentinvest.disclosure-worker
+	@sleep 5
+	@launchctl print gui/$$(id -u)/com.agentinvest.disclosure-worker | grep -E "state|pid" || true
+	@echo "[note] restarted; run 'make doctor-full' and watch one round before walking away"
+
+# Orphan parser-artifact inventory (dry-run; APPLY=YES deletes with an audit
+# manifest). Raw documents are never touched.
+gc-orphans:
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/gc_orphan_artifacts.py $(if $(filter YES,$(APPLY)),--apply)
+
+# --- Data-quality audits (batch 4: previously script-only, no make entry) ----
+
+audit-unmapped-codes:
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/audit_unmapped_codes.py
+
+audit-boilerplate:
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/audit_boilerplate_candidates.py
+
+audit-headings:
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/audit_heading_coverage.py
+
+# Weekly sweep: run all three audits; each exits nonzero on a real finding.
+audit-weekly: audit-unmapped-codes audit-boilerplate audit-headings
+
+# Install the ops launchd jobs (postgres boot autostart + daily doctor).
+install-ops-launchd:
+	./scripts/install_ops_launchd.sh
 
 doctor-full:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor --full

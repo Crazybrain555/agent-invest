@@ -47,6 +47,19 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _write_bytes_durable(path: Path, payload: bytes) -> None:
+    """tmp + fsync + atomic rename: quarantine evidence must survive a crash
+    mid-write just like the immutable archive does (round23)."""
+
+    tmp = path.with_suffix(path.suffix + f".tmp-{new_ulid()}")
+    with tmp.open("xb") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
 class RawDocumentStore:
     """Store original PDF bytes under controlled relative paths."""
 
@@ -186,9 +199,14 @@ class RawDocumentStore:
         input_file: Path,
         reason: QuarantineReason,
     ) -> QuarantineResult:
+        # The quarantine copy can be the ONLY surviving evidence of a bad
+        # download (the caller deletes its tmp file), so an empty copy must
+        # be explicit, hashed, and durably written — never a silent b""
+        # (round23).
         copy_error = None
         if not input_file.exists():
             payload = b""
+            copy_error = "input file missing at quarantine time"
         else:
             try:
                 payload = input_file.read_bytes()
@@ -204,7 +222,8 @@ class RawDocumentStore:
             name=name,
         )
         quarantine_path.parent.mkdir(parents=True, exist_ok=True)
-        quarantine_path.write_bytes(payload)
+        payload_sha256 = "sha256:" + hashlib.sha256(payload).hexdigest()
+        _write_bytes_durable(quarantine_path, payload)
 
         manifest_path = quarantine_path.with_suffix(quarantine_path.suffix + ".json")
         manifest = {
@@ -213,9 +232,14 @@ class RawDocumentStore:
             "reason": reason,
             "original_path": str(input_file),
             "byte_count": len(payload),
+            "payload_sha256": payload_sha256,
+            "payload_empty": not payload,
             "copy_error": copy_error,
         }
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+        _write_bytes_durable(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
         return QuarantineResult(
             path=quarantine_path,
             reason=reason,

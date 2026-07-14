@@ -92,7 +92,10 @@ class TrackEntryRequest(AdminModel):
 
 
 class TrackCompaniesRequest(AdminModel):
-    entries: list[TrackEntryRequest]
+    # min_length=1: an empty batch combined with reconcile+prune_drift would
+    # pause the entire pool in one request (every tracked row becomes drift).
+    # Reject it at request validation so it never reaches the use case.
+    entries: list[TrackEntryRequest] = Field(min_length=1)
     reconcile: bool = False
     prune_drift: bool = False
     dry_run: bool = False
@@ -104,6 +107,14 @@ class TrackEntryResultResponse(AdminModel):
     tracked_company_id: str
     company_id: str
     created: bool
+    # Full-row upsert visibility (round23): action is created | updated |
+    # unchanged; cleared_overrides echoes exactly which previously-set
+    # overrides this request cleared back to inherit-global (the full-row
+    # footgun — an omitted optional field clears, it does not keep the old
+    # value); status_change reports any active<->paused flip.
+    action: str = "updated"
+    cleared_overrides: list[str] = Field(default_factory=list)
+    status_change: str | None = None
 
 
 class TrackDriftResponse(AdminModel):
@@ -125,6 +136,12 @@ class SyncCompanyRequest(AdminModel):
     # None = checkpoint-based incremental window (first sync falls back to
     # the lookback cascade); an explicit value overrides the window in days.
     window_days: int | None = None
+    # Absolute backfill range (round23): mutually exclusive with window_days.
+    # Both ends required together; end must not be in the future. The
+    # validation lives in compute_sync_window — the router surfaces its
+    # ValueError as VALIDATION_ERROR.
+    window_start: date | None = None
+    window_end: date | None = None
 
 
 class SyncCompanyResponse(AdminModel):

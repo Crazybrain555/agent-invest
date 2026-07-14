@@ -1,7 +1,10 @@
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
+import tempfile
 import unittest
+
+from fastapi.testclient import TestClient
 
 from disclosure_anchor.api.errors import FilingApiError
 from disclosure_anchor.api.routers.admin import (
@@ -13,6 +16,12 @@ from disclosure_anchor.api.routers.admin import (
     track_companies,
     untrack_company,
 )
+from disclosure_anchor.application.use_cases.sync_disclosure_index import (
+    CompanyNotTrackedError,
+)
+from disclosure_anchor.domain.errors import PublishRunError
+from disclosure_anchor.main import create_app
+from disclosure_anchor.settings import Settings
 from disclosure_anchor.api.schemas.admin import (
     ParserOptionsRequest,
     PublishRunRequest,
@@ -45,10 +54,14 @@ class _Deps:
         self.publish_args: tuple[str, bool, str | None] | None = None
         self.track_command = None
         self.track_error: Exception | None = None
+        self.track_result: TrackCompaniesResult | None = None
         self.untrack_codes = None
         self.untracked = True
         self.sync_allowed = True
         self.sync_args = None
+        self.sync_error: Exception | None = None
+        self.publish_error: Exception | None = None
+        self.track_called = False
 
     def register_local_pdf(self, command):
         self.register_command = command
@@ -83,6 +96,8 @@ class _Deps:
 
     def publish_run(self, *, processing_run_id: str, allow_empty: bool, reason: str | None):
         self.publish_args = (processing_run_id, allow_empty, reason)
+        if self.publish_error is not None:
+            raise self.publish_error
         return PublishRunResponse(
             document_id="doc_1",
             processing_run_id=processing_run_id,
@@ -117,8 +132,14 @@ class _Deps:
     def can_sync(self):
         return self.sync_allowed
 
-    def sync_company(self, *, security_code, exchange, window_days):
+    def sync_company(
+        self, *, security_code, exchange, window_days,
+        window_start=None, window_end=None,
+    ):
         self.sync_args = (security_code, exchange, window_days)
+        self.sync_window_range = (window_start, window_end)
+        if self.sync_error is not None:
+            raise self.sync_error
         return SyncCompanyResponse(
             sync_status="ok",
             security_code=security_code,
@@ -133,8 +154,11 @@ class _Deps:
 
     def track_companies(self, command):
         self.track_command = command
+        self.track_called = True
         if self.track_error is not None:
             raise self.track_error
+        if self.track_result is not None:
+            return self.track_result
         return TrackCompaniesResult(
             results=tuple(
                 TrackEntryResult(
@@ -289,6 +313,38 @@ class FilingApiAdminTests(unittest.TestCase):
         self.assertEqual(response.drift[0].action, "paused")
         self.assertTrue(response.dry_run)
 
+    def test_track_companies_echoes_cleared_overrides(self) -> None:
+        deps = _Deps()
+        deps.track_result = TrackCompaniesResult(
+            results=(
+                TrackEntryResult(
+                    security_code="600519",
+                    exchange="SSE",
+                    tracked_company_id="tc_1",
+                    company_id="co_1",
+                    created=False,
+                    action="updated",
+                    cleared_overrides=("lookback", "process_classes"),
+                    status_change="active->paused",
+                ),
+            ),
+            drift=(),
+            dry_run=False,
+        )
+
+        response = track_companies(
+            _request(deps),
+            TrackCompaniesRequest(
+                entries=[TrackEntryRequest(security_code="600519", exchange="SSE")]
+            ),
+        )
+
+        entry = response.results[0]
+        self.assertEqual(entry.action, "updated")
+        self.assertEqual(entry.cleared_overrides, ["lookback", "process_classes"])
+        self.assertEqual(entry.status_change, "active->paused")
+        self.assertEqual(response.created_count, 0)
+
     def test_untrack_company_returns_removal_with_retained_documents(self) -> None:
         deps = _Deps()
 
@@ -353,6 +409,153 @@ class FilingApiAdminTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.status_code, 422)
         self.assertEqual(ctx.exception.error_code, "VALIDATION_ERROR")
+
+
+_ADMIN_TOKEN = "test-admin-token"
+_AUTH_HEADERS = {"Authorization": f"Bearer {_ADMIN_TOKEN}"}
+
+
+def _admin_app(deps: _Deps):
+    root = Path(tempfile.gettempdir()) / "disclosure_admin_api_test"
+    settings = Settings(
+        disclosure_data_root=root / "data",
+        disclosure_shared_root=root / "shared",
+        disclosure_runtime_root=root / "runtime",
+        mineru_model_cache=root / "mineru",
+        hf_home=root / "hf",
+        modelscope_cache=root / "modelscope",
+        disclosure_enable_admin_api=True,
+        disclosure_admin_token=_ADMIN_TOKEN,
+    )
+    app = create_app(settings, validate_runtime=False)
+    app.state.admin_deps = deps
+    return app
+
+
+class FilingApiAdminAppTests(unittest.TestCase):
+    """End-to-end (ASGI) admin behaviour: request validation and the
+    domain-error -> structured envelope mapping installed on the app."""
+
+    def test_empty_entries_rejected_before_use_case(self) -> None:
+        deps = _Deps()
+        with TestClient(_admin_app(deps)) as client:
+            response = client.put(
+                "/v1/admin/tracked-companies",
+                json={"entries": []},
+                headers=_AUTH_HEADERS,
+            )
+
+        self.assertEqual(response.status_code, 422)
+        body = response.json()
+        self.assertEqual(body["error_code"], "VALIDATION_ERROR")
+        # The empty batch must never reach the reconcile/prune use case.
+        self.assertFalse(deps.track_called)
+
+    def test_publish_unknown_run_is_404(self) -> None:
+        deps = _Deps()
+        deps.publish_error = PublishRunError(
+            {
+                "stage": "publish",
+                "error_code": "RUN_NOT_FOUND",
+                "retryable": False,
+                "message": "processing run not found: run_x",
+            }
+        )
+        with TestClient(_admin_app(deps)) as client:
+            response = client.post(
+                "/v1/admin/runs/run_x/publish",
+                json={"allow_empty": False},
+                headers=_AUTH_HEADERS,
+            )
+
+        self.assertEqual(response.status_code, 404)
+        body = response.json()
+        self.assertEqual(body["error_code"], "NOT_FOUND")
+        self.assertEqual(body["detail"]["error"]["error_code"], "RUN_NOT_FOUND")
+
+    def test_publish_empty_run_is_409(self) -> None:
+        deps = _Deps()
+        deps.publish_error = PublishRunError(
+            {
+                "stage": "publish",
+                "error_code": "EMPTY_RUN",
+                "retryable": False,
+                "message": "cannot publish empty unit run without allow_empty",
+            }
+        )
+        with TestClient(_admin_app(deps)) as client:
+            response = client.post(
+                "/v1/admin/runs/run_1/publish",
+                json={"allow_empty": False},
+                headers=_AUTH_HEADERS,
+            )
+
+        self.assertEqual(response.status_code, 409)
+        body = response.json()
+        self.assertEqual(body["error_code"], "CONFLICT")
+        self.assertEqual(body["detail"]["error"]["error_code"], "EMPTY_RUN")
+
+    def test_missing_or_wrong_token_is_401(self) -> None:
+        deps = _Deps()
+        with TestClient(_admin_app(deps)) as client:
+            missing = client.put(
+                "/v1/admin/tracked-companies",
+                json={"entries": [{"security_code": "000001", "exchange": "SZSE"}]},
+            )
+            wrong = client.put(
+                "/v1/admin/tracked-companies",
+                json={"entries": [{"security_code": "000001", "exchange": "SZSE"}]},
+                headers={"Authorization": "Bearer nope"},
+            )
+
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(missing.json()["error_code"], "UNAUTHORIZED")
+        self.assertEqual(wrong.status_code, 401)
+        self.assertFalse(deps.track_called)
+
+    def test_admin_router_refuses_to_mount_without_token(self) -> None:
+        # Fail-closed (user decision 2026-07-14): enabling the admin surface
+        # without DISCLOSURE_ADMIN_TOKEN must not expose bare endpoints.
+        deps = _Deps()
+        root = Path(tempfile.gettempdir()) / "disclosure_admin_api_test"
+        settings = Settings(
+            disclosure_data_root=root / "data",
+            disclosure_shared_root=root / "shared",
+            disclosure_runtime_root=root / "runtime",
+            mineru_model_cache=root / "mineru",
+            hf_home=root / "hf",
+            modelscope_cache=root / "modelscope",
+            disclosure_enable_admin_api=True,
+            # Explicit None beats any DISCLOSURE_ADMIN_TOKEN in the ambient
+            # env (worker.env is sourced in DB-mode test shells).
+            disclosure_admin_token=None,
+        )
+        app = create_app(settings, validate_runtime=False)
+        app.state.admin_deps = deps
+        with TestClient(app) as client:
+            response = client.put(
+                "/v1/admin/tracked-companies",
+                json={"entries": [{"security_code": "000001", "exchange": "SZSE"}]},
+                headers=_AUTH_HEADERS,
+            )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_sync_untracked_company_is_404(self) -> None:
+        deps = _Deps()
+        deps.sync_error = CompanyNotTrackedError("300012", "SZSE")
+        with TestClient(_admin_app(deps)) as client:
+            response = client.post(
+                "/v1/admin/tracked-companies/300012/sync",
+                params={"exchange": "SZSE"},
+                json={},
+                headers=_AUTH_HEADERS,
+            )
+
+        self.assertEqual(response.status_code, 404)
+        body = response.json()
+        self.assertEqual(body["error_code"], "NOT_FOUND")
+        self.assertIn("not in the tracked pool", body["message"])
 
 
 if __name__ == "__main__":

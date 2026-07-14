@@ -17,6 +17,7 @@ from disclosure_anchor.application.worker.worker import (
     run_once,
 )
 from disclosure_anchor.domain.errors import (
+    ConfigurationError,
     ParserVersionProbeError,
     PublishRunError,
     SourceRequestError,
@@ -128,7 +129,9 @@ class RunOnceSchedulingTests(unittest.TestCase):
         object.__setattr__(
             deps,
             "source_factory",
-            mock.Mock(side_effect=RuntimeError("credentials unavailable")),
+            # Provider-family error (credentials/config) → "source" outage;
+            # a local RuntimeError is covered by the test below (round23).
+            mock.Mock(side_effect=ConfigurationError("credentials unavailable")),
         )
         parsed = mock.MagicMock(status="succeeded", processing_run_id="run_local")
         built = mock.MagicMock(status="succeeded", build_stats=None)
@@ -168,6 +171,60 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self.assertEqual(report.parsed, 1)
         self.assertEqual(report.published, 1)
         self.assertIn("source", [failure.stage for failure in report.failures])
+        self.assertTrue(report.source_outage_break)
+
+    def test_local_stage_crash_is_not_disguised_as_provider_outage(self) -> None:
+        # A queue-read SQL/programming error is a LOCAL fault: it must be
+        # stage-isolated and reported, but never flagged as a CNINFO outage
+        # (round23 — wrong classification triggered provider backoff).
+        deps = _deps()
+        object.__setattr__(
+            deps,
+            "source_factory",
+            mock.Mock(side_effect=RuntimeError("queue view exploded")),
+        )
+        parsed = mock.MagicMock(status="succeeded", processing_run_id="run_local")
+        built = mock.MagicMock(status="succeeded", build_stats=None)
+        published = mock.MagicMock(status="published")
+        with (
+            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
+            mock.patch.object(
+                worker_module.queries,
+                "sync_due",
+                return_value=[
+                    {
+                        "tracked_company_id": "tc_local",
+                        "company_id": "co_local",
+                        "security_id": "sec_local",
+                        "security_code": "000001",
+                        "exchange": "SZSE",
+                    }
+                ],
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "pending_parse",
+                return_value=[{"document_id": "doc_local", "oversized": False}],
+            ),
+            mock.patch.object(worker_module, "ParseDocument") as parse_cls,
+            mock.patch.object(worker_module, "BuildUnits") as build_cls,
+            mock.patch.object(worker_module, "PublishRun") as publish_cls,
+        ):
+            parse_cls.return_value.execute.return_value = parsed
+            build_cls.return_value.execute.return_value = built
+            publish_cls.return_value.execute.return_value = published
+            report = run_once(
+                WorkerLimits(sync=1, download=1, parse=1, build=0, publish=0),
+                deps,
+            )
+
+        self.assertEqual(report.parsed, 1)
+        stages = [failure.stage for failure in report.failures]
+        self.assertIn("source_local", stages)
+        self.assertNotIn("source", stages)
+        self.assertFalse(report.source_outage_break)
+        local = next(f for f in report.failures if f.stage == "source_local")
+        self.assertIn("queue view exploded", local.message or "")
 
     def test_oversized_documents_are_skipped_and_counted(self) -> None:
         deps = _deps()

@@ -11,6 +11,7 @@ from pathlib import Path
 from disclosure_anchor.application.ports.disclosure_source import AnnouncementRef, DisclosureSourcePort
 from disclosure_anchor.application.ports.file_store import (
     FileStorePathPort,
+    QuarantineResult,
     RawDocumentStorePort,
     RawDocumentWriteResult,
 )
@@ -31,9 +32,13 @@ from disclosure_anchor.application.use_cases.sync_disclosure_index import (
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import (
+    DocumentIdentityConflictError,
     InvalidRawDocumentError,
+    RawDocumentError,
     RegistrationMetadataError,
     SourceRequestError,
+    SubjectIdentityConflictError,
+    SubjectIdentityRaceError,
 )
 from disclosure_anchor.domain.value_objects import ReportPeriod, infer_mainland_exchange
 
@@ -92,7 +97,20 @@ class DownloadDocument:
 
     def execute(self, command: DownloadDocumentCommand) -> DownloadDocumentResult:
         candidate = command.candidate
-        ref = _ref_from_candidate(candidate)
+        # Every failure below must land as a status='failed' download
+        # source_access: the retry budget and the dead-letter cutoff in
+        # ops.pending_download_v1 count exactly those rows — an escaping
+        # exception means an uncounted, endlessly re-downloaded candidate
+        # (round23). Only environment-level failures (DB down) may escape.
+        try:
+            ref = _ref_from_candidate(candidate)
+        except (RegistrationMetadataError, ValueError) as exc:
+            return self._failed_result(
+                candidate=candidate,
+                error_code="invalid_candidate_snapshot",
+                retryable=False,
+                reason=str(exc),
+            )
         tmp_path = self._paths.runtime_tmp_path(f"cninfo_{ids.new_ulid()}.pdf")
         tmp_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -115,8 +133,8 @@ class DownloadDocument:
                     error_code=exc.error_code,
                     retryable=exc.retryable,
                 )
-            tmp_path.write_bytes(payload)
             try:
+                tmp_path.write_bytes(payload)
                 raw = self._raw_store.put_raw_document(
                     provider=CNINFO_PROVIDER,
                     security_code=ref.security_code,
@@ -155,10 +173,116 @@ class DownloadDocument:
                     error_code="invalid_raw_document",
                     retryable=False,
                 )
-            return self._register(candidate=candidate, ref=ref, raw=raw, command=command)
+            except RawDocumentError as exc:
+                # Archive-level inconsistency (e.g. existing file at the hash
+                # path with different content): keep the fresh bytes as
+                # evidence, needs operator action — terminal.
+                quarantine = self._raw_store.quarantine_raw_document(
+                    provider=CNINFO_PROVIDER,
+                    provider_document_id=ref.provider_document_id,
+                    input_file=tmp_path,
+                    reason="raw_archive_conflict",
+                )
+                return self._failed_result(
+                    candidate=candidate,
+                    error_code="raw_archive_error",
+                    retryable=False,
+                    reason=str(exc),
+                    extra_snapshot={
+                        "quarantine_filename": quarantine.path.name,
+                        "byte_count": quarantine.byte_count,
+                    },
+                    quarantine=quarantine,
+                )
+            except OSError as exc:
+                return self._failed_result(
+                    candidate=candidate,
+                    error_code="io_error",
+                    retryable=True,
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
+            return self._register_with_retry(
+                candidate=candidate, ref=ref, raw=raw, command=command
+            )
         finally:
             if tmp_path.exists():
                 tmp_path.unlink()
+
+    def _register_with_retry(
+        self,
+        *,
+        candidate: Mapping[str, object],
+        ref: AnnouncementRef,
+        raw: RawDocumentWriteResult,
+        command: DownloadDocumentCommand,
+    ) -> DownloadDocumentResult:
+        try:
+            try:
+                return self._register(
+                    candidate=candidate, ref=ref, raw=raw, command=command
+                )
+            except (DocumentIdentityConflictError, SubjectIdentityRaceError):
+                # Same single-retry policy as RegisterLocalPdf: unique-index
+                # races with a concurrent CLI/admin register resolve on reread.
+                return self._register(
+                    candidate=candidate, ref=ref, raw=raw, command=command
+                )
+        except (DocumentIdentityConflictError, SubjectIdentityRaceError) as exc:
+            return self._failed_result(
+                candidate=candidate,
+                error_code=type(exc).__name__,
+                retryable=True,
+                reason=str(exc),
+            )
+        except SubjectIdentityConflictError as exc:
+            return self._failed_result(
+                candidate=candidate,
+                error_code="subject_identity_conflict",
+                retryable=False,
+                reason=str(exc),
+            )
+        except RegistrationMetadataError as exc:
+            return self._failed_result(
+                candidate=candidate,
+                error_code="registration_metadata_error",
+                retryable=False,
+                reason=str(exc),
+            )
+
+    def _failed_result(
+        self,
+        *,
+        candidate: Mapping[str, object],
+        error_code: str,
+        retryable: bool,
+        reason: str,
+        extra_snapshot: Mapping[str, object] | None = None,
+        quarantine: QuarantineResult | None = None,
+    ) -> DownloadDocumentResult:
+        provider_document_id = _candidate_lenient_str(candidate, "provider_document_id")
+        snapshot: dict[str, object] = {"reason": reason}
+        if extra_snapshot:
+            snapshot.update(extra_snapshot)
+        source_access = self._record_failed_download(
+            candidate=candidate,
+            error={
+                "stage": "download",
+                "error_code": error_code,
+                "retryable": retryable,
+                "provider_document_id": provider_document_id,
+            },
+            snapshot=snapshot,
+        )
+        return DownloadDocumentResult(
+            provider_document_id=provider_document_id,
+            document_id=None,
+            source_access_id=source_access.source_access_id,
+            raw_file_hash=None,
+            quarantined_path=quarantine.path if quarantine else None,
+            quarantine_reason=quarantine.reason if quarantine else None,
+            error_code=error_code,
+            retryable=retryable,
+        )
 
     def _register(
         self,
@@ -217,10 +341,14 @@ class DownloadDocument:
                     provider_interface=DOWNLOAD_INTERFACE,
                     dataset_key="p_info3015",
                     query_params={
-                        "provider_document_id": _candidate_str(
+                        # Lenient lookups: the failure record itself must never
+                        # raise on a malformed candidate snapshot.
+                        "provider_document_id": _candidate_lenient_str(
                             candidate, "provider_document_id"
                         ),
-                        "download_url": _candidate_str(candidate, "download_url"),
+                        "download_url": _candidate_lenient_str(
+                            candidate, "download_url"
+                        ),
                     },
                     accessed_at=datetime.now(timezone.utc),
                     status="failed",
@@ -343,6 +471,13 @@ def _candidate_str(
 def _candidate_optional_str(value: object) -> str | None:
     if value is None or value == "":
         return None
+    return str(value)
+
+
+def _candidate_lenient_str(candidate: Mapping[str, object], key: str) -> str:
+    value = candidate.get(key)
+    if value is None or value == "":
+        return "unknown"
     return str(value)
 
 

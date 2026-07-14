@@ -23,6 +23,7 @@ from disclosure_anchor.application.ports.file_store import (
     FileStorePathPort,
 )
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.worker.locks import maybe_lock_document
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import BuildUnitsError
@@ -84,7 +85,10 @@ class BuildUnits:
         context = self._load_context(command)
         run = context["run"]
         try:
-            normalized_ir = self._load_ir(Path(run.normalized_ir_relpath or ""))
+            normalized_ir = self._load_ir(
+                Path(run.normalized_ir_relpath or ""),
+                expected_artifact_hash=run.artifact_hash,
+            )
             document = context["document"]
             drafts, stats = build_unit_drafts_s1_s7(
                 normalized_ir,
@@ -110,9 +114,14 @@ class BuildUnits:
                 ),
             )
         except Exception as exc:
+            # Persist the actual cause: a fixed message made every unknown
+            # builder failure untraceable without re-running locally (round23).
             error = self._structured_error(
                 error_code="BUILD_PREPARATION_FAILED",
-                message="unit preparation failed",
+                message=(
+                    "unit preparation failed: "
+                    f"{type(exc).__name__}: {str(exc)[:400]}"
+                ),
             )
             self._mark_failed(run.processing_run_id, error)
             raise BuildUnitsError(error) from exc
@@ -151,6 +160,28 @@ class BuildUnits:
                 content_hash_aggregate=_content_hash_aggregate(units),
                 structure_hash=_structure_hash_aggregate(units),
             )
+        except BuildUnitsError as exc:
+            if exc.error.get("error_code") == "UNITS_ALREADY_BUILT":
+                # Lost a concurrent build race under the document lock: the
+                # winner's persisted state stands untouched (round23).
+                with self._uow_factory() as uow:
+                    existing = uow.processing_runs.get(run.processing_run_id)
+                return BuildUnitsResult(
+                    processing_run_id=run.processing_run_id,
+                    status=(
+                        existing.unit_build_status if existing else "failed"
+                    ),
+                    document_units_relpath=(
+                        existing.document_units_relpath if existing else None
+                    ),
+                    error=exc.error,
+                )
+            error = self._structured_error(
+                error_code="DB_WRITE_FAILED",
+                message="document_unit DB persistence failed after snapshot write",
+            )
+            self._mark_failed(run.processing_run_id, error)
+            raise BuildUnitsError(error) from exc
         except Exception as exc:
             error = self._structured_error(
                 error_code="DB_WRITE_FAILED",
@@ -238,7 +269,9 @@ class BuildUnits:
                 )
             return {"run": run, "document": document, "security": security}
 
-    def _load_ir(self, relpath: Path) -> dict[str, Any]:
+    def _load_ir(
+        self, relpath: Path, *, expected_artifact_hash: str | None = None
+    ) -> dict[str, Any]:
         if not str(relpath):
             raise BuildUnitsError(
                 self._structured_error(
@@ -247,11 +280,30 @@ class BuildUnits:
                 )
             )
         try:
-            payload = json.loads(self._paths.data_path(relpath).read_text(encoding="utf-8"))
+            raw_bytes = self._paths.data_path(relpath).read_bytes()
         except OSError as exc:
             raise BuildUnitsError(
                 self._structured_error(error_code="IR_MISSING", message=str(exc))
             ) from exc
+        # Ingress hash check, symmetric with parse's raw-PDF verification
+        # (parse_document.py): the IR lives in the overwritable derived area
+        # and rebuild-units consumes it months later — a corrupted/overwritten
+        # IR must fail loudly here, not publish self-consistent bad units
+        # (round23). Runs predating artifact_hash skip the check.
+        if expected_artifact_hash:
+            actual = "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
+            if actual != expected_artifact_hash:
+                raise BuildUnitsError(
+                    self._structured_error(
+                        error_code="IR_HASH_MISMATCH",
+                        message=(
+                            f"normalized IR at {relpath} hashes to {actual}, "
+                            f"run.artifact_hash is {expected_artifact_hash}; "
+                            "re-parse or investigate the derived area"
+                        ),
+                    )
+                )
+        payload = json.loads(raw_bytes.decode("utf-8"))
         if payload.get("contract_version") != "normalized_ir.v2":
             raise BuildUnitsError(
                 self._structured_error(
@@ -399,6 +451,18 @@ class BuildUnits:
                         message=f"processing run not found: {run_id}",
                     )
                 )
+            # Serialize with any concurrent CLI/worker build of the same
+            # document, then re-check under the lock: without this, the
+            # loser of a concurrent build overwrote the winner's succeeded
+            # state with failed (round23).
+            maybe_lock_document(uow, run.document_id)
+            if uow.document_units.list_by_processing_run(run_id):
+                raise BuildUnitsError(
+                    self._structured_error(
+                        error_code="UNITS_ALREADY_BUILT",
+                        message=f"run already has units: {run_id}",
+                    )
+                )
             uow.document_units.add_many(units)
             run.document_units_relpath = str(snapshot_relpath)
             run.content_hash_aggregate = content_hash_aggregate
@@ -422,6 +486,11 @@ class BuildUnits:
                         message=f"processing run not found: {run_id}",
                     )
                 )
+            if run.unit_build_status == "succeeded":
+                # Never downgrade a persisted success: rebuilds get a NEW
+                # run, so a late failure here is always a losing racer
+                # (round23, defense in depth behind the document lock).
+                return run
             run.unit_build_status = "failed"
             run.unit_build_error = error
             run.unit_build_attempt_count += 1

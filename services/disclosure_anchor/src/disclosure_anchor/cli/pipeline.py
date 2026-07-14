@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import csv
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timedelta
+import io
 import json
 from pathlib import Path
 import re
@@ -30,6 +32,10 @@ from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.services.subject_resolver import (
+    PENDING_LEGAL_NAME_PREFIX,
+)
 from disclosure_anchor.application.use_cases.build_units import (
     BuildUnits,
     BuildUnitsCommand,
@@ -65,13 +71,17 @@ from disclosure_anchor.application.use_cases.register_local_pdf import (
 from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     INDEX_INTERFACE,
     WEB_INDEX_INTERFACE,
+    CompanyNotTrackedError,
     SyncDisclosureIndex,
     SyncDisclosureIndexCommand,
     compute_sync_window,
 )
 from disclosure_anchor.domain.errors import BuildUnitsError, ConfigurationError, PublishRunError
 from disclosure_anchor.domain.value_objects import ReportPeriod
-from disclosure_anchor.domain.value_objects import infer_mainland_exchange
+from disclosure_anchor.domain.value_objects import (
+    canonical_security_identity,
+    infer_mainland_exchange,
+)
 from disclosure_anchor.settings import Settings, load_settings
 
 
@@ -171,7 +181,22 @@ def _parser() -> argparse.ArgumentParser:
 
     sync = subparsers.add_parser("sync")
     sync.add_argument("--company", required=True)
-    sync.add_argument("--window", type=int)
+    sync.add_argument(
+        "--window",
+        type=int,
+        help="relative window: sync [today-N, today] (mutually exclusive with --from/--to)",
+    )
+    sync.add_argument(
+        "--from",
+        dest="window_from",
+        help="backfill window start YYYY-MM-DD (explicit historical range; "
+        "requires --to or defaults it to today)",
+    )
+    sync.add_argument(
+        "--to",
+        dest="window_to",
+        help="backfill window end YYYY-MM-DD (default: today when --from is given)",
+    )
     sync.add_argument(
         "--channel",
         choices=("api", "web"),
@@ -188,7 +213,15 @@ def main(argv: list[str] | None = None) -> int:
         deps = _Deps(settings)
         result: Any
         if args.command == "register":
-            result = deps.register().execute(_register_command(args))
+            legal_name = _resolve_register_legal_name(args, deps.uow_factory)
+            if legal_name is None:
+                print(
+                    "[FAIL] register: --company-legal-name is required"
+                    "（公司法定名尚未解析，请显式提供）",
+                    file=sys.stderr,
+                )
+                return 2
+            result = deps.register().execute(_register_command(args, legal_name))
         elif args.command == "parse":
             result = deps.parse().execute(
                 ParseDocumentCommand(
@@ -219,16 +252,34 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "track":
             entries = _track_entries(args)
             # File-driven runs reconcile against the import file (restore
-            # semantics); --codes direct adds write the DB truth as-is.
+            # semantics) with full-row upserts; a pure --codes shortcut only
+            # ensures membership and must not wipe curated overrides or flip
+            # status on rows that already exist (round23).
             file_driven = not args.codes
+            codes_only = bool(args.codes) and not args.file
             result = deps.track().execute(
                 TrackCompaniesCommand(
                     entries=entries,
                     reconcile=file_driven,
                     prune_drift=file_driven and args.prune_drift,
                     dry_run=args.dry_run,
+                    mode="ensure" if codes_only else "full_row",
                 )
             )
+            for res in result.results:
+                if res.cleared_overrides:
+                    print(
+                        f"[warn] track {res.security_code}: cleared overrides "
+                        f"{list(res.cleared_overrides)} (full-row upsert; blank "
+                        "cell = inherit global default)",
+                        file=sys.stderr,
+                    )
+                if res.status_change:
+                    print(
+                        f"[warn] track {res.security_code}: status "
+                        f"{res.status_change}",
+                        file=sys.stderr,
+                    )
             if args.codes:
                 print(
                     "[note] DB updated; run `make track-export` when you want "
@@ -344,6 +395,9 @@ def main(argv: list[str] | None = None) -> int:
     except (BuildUnitsError, PublishRunError) as exc:
         print(json.dumps(exc.error, ensure_ascii=False, sort_keys=True), file=sys.stderr)
         return 1
+    except CompanyNotTrackedError as exc:
+        print(f"[FAIL] sync: {exc}", file=sys.stderr)
+        return 2
     except (ConfigurationError, ValidationError, ValueError) as exc:
         print(f"[FAIL] pipeline: {exc}", file=sys.stderr)
         return 2
@@ -616,47 +670,20 @@ class _Deps:
                     """
                 )
             ).mappings().all()
-        skipped = [
-            f"tracked company without security skipped: {row['legal_name']}"
-            for row in rows
-            if not row["security_code"]
-        ]
-        lines = [
-            "# disclosure_anchor tracking-pool snapshot — exported from the DB"
-            " (source of truth) by `make track-export`.",
-            "# Restore with: make track [PRUNE_DRIFT=YES]. Mutate the pool via"
-            " PUT /v1/admin/tracked-companies, `make track CODES=...`,",
-            "# or edit this file and re-import; blank optional cells mean"
-            " 'inherit the global default'.",
-            "security_code,exchange,status,joined_date,lookback_days,"
-            "sync_frequency,process_classes,note",
-        ]
-        exported = 0
-        for row in rows:
-            if not row["security_code"]:
-                continue
-            classes = row["process_classes"]
-            lines.append(
-                ",".join(
-                    [
-                        row["security_code"],
-                        row["exchange"] or "",
-                        row["status"],
-                        row["joined_date"].isoformat(),
-                        row["lookback_days"] or "",
-                        row["sync_frequency"] or "",
-                        ";".join(classes) if classes else "",
-                        row["legal_name"].replace(",", "，"),
-                    ]
-                )
-            )
-            exported += 1
-        return "\n".join(lines) + "\n", exported, skipped
+        return _render_watchlist_csv([dict(row) for row in rows])
 
     def sync(self, args: argparse.Namespace) -> dict[str, object]:
         company = args.company
         exchange = _exchange_for_scode(company)
         today = datetime_today_shanghai()
+        window_from = getattr(args, "window_from", None)
+        window_to = getattr(args, "window_to", None)
+        explicit_start = date.fromisoformat(window_from) if window_from else None
+        explicit_end = (
+            date.fromisoformat(window_to)
+            if window_to
+            else (today if explicit_start else None)
+        )
         window_start, window_end = _sync_window(
             uow_factory=self.uow_factory,
             company=company,
@@ -665,7 +692,16 @@ class _Deps:
             today=today,
             overlap_days=self.settings.cninfo_overlap_days,
             initial_lookback_days=self.settings.disclosure_initial_lookback_days,
+            explicit_window_start=explicit_start,
+            explicit_window_end=explicit_end,
         )
+        if explicit_start is not None:
+            print(
+                f"[note] backfill window [{window_start} .. {window_end}]: the "
+                "index is synced now; candidates outside the recent overlap "
+                "drain through worker rounds at provider pace",
+                file=sys.stderr,
+            )
         channel = getattr(args, "channel", "api")
         if channel == "web":
             source: CninfoSource | CninfoWebSource = CninfoWebSource(
@@ -697,22 +733,36 @@ class _Deps:
                 path_builder=self.paths,
                 uow_factory=self.uow_factory,
             )
-            pending = [
-                candidate
-                for candidate in downloader.list_pending_candidates(
+            # Same queue predicates as the worker (scope classes, carrier
+            # guard, title_noise exclusion, active tracked row) narrowed to
+            # this company in SQL — the CLI must not be a gate bypass that
+            # downloads register_only/noise announcements (round23).
+            from disclosure_anchor.adapters.sources.cninfo.mapper import (
+                load_processing_policy,
+            )
+            from disclosure_anchor.application.worker import queries as worker_queries
+
+            with self.engine.connect() as conn:
+                pending_rows = worker_queries.pending_downloads(
+                    conn,
                     max_retries=self.settings.cninfo_max_retries,
-                    overlap_start=today - timedelta(days=self.settings.cninfo_overlap_days),
+                    limit=1_000_000,
+                    scope_classes=load_processing_policy(
+                        self.settings.disclosure_processing_policy_path
+                    ),
+                    security_code=company,
+                    min_announcement_date=today
+                    - timedelta(days=self.settings.cninfo_overlap_days),
                 )
-                if candidate.get("security_code") == company
-            ]
             downloads = [
                 downloader.execute(
                     DownloadDocumentCommand(
-                        candidate=candidate,
+                        candidate=row["candidate"],
                         oversized_kb=self.settings.cninfo_oversized_kb,
                     )
                 )
-                for candidate in pending
+                for row in pending_rows
+                if isinstance(row.get("candidate"), dict)
             ]
         finally:
             source.close()
@@ -741,6 +791,56 @@ def datetime_today_shanghai() -> date:
 # Shared with the on-demand admin sync endpoint; single definition lives in
 # the use-case module.
 _sync_window = compute_sync_window
+
+
+def _render_watchlist_csv(
+    rows: list[dict[str, Any]],
+) -> tuple[str, int, list[str]]:
+    """DB rows -> watchlist CSV text (round-trips with `track --file`).
+
+    Uses ``csv.writer`` (QUOTE_MINIMAL) so a ``legal_name``/note containing a
+    comma or quote is quoted rather than splitting the row and corrupting the
+    tracked columns. The comment banner and column header are emitted verbatim
+    (byte-identical to prior exports); ``\\n`` line endings match the header.
+    Blank cells still mean 'inherit the global default'.
+    """
+
+    skipped = [
+        f"tracked company without security skipped: {row['legal_name']}"
+        for row in rows
+        if not row["security_code"]
+    ]
+    header = [
+        "# disclosure_anchor tracking-pool snapshot — exported from the DB"
+        " (source of truth) by `make track-export`.",
+        "# Restore with: make track [PRUNE_DRIFT=YES]. Mutate the pool via"
+        " PUT /v1/admin/tracked-companies, `make track CODES=...`,",
+        "# or edit this file and re-import; blank optional cells mean"
+        " 'inherit the global default'.",
+        "security_code,exchange,status,joined_date,lookback_days,"
+        "sync_frequency,process_classes,note",
+    ]
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    exported = 0
+    for row in rows:
+        if not row["security_code"]:
+            continue
+        classes = row["process_classes"]
+        writer.writerow(
+            [
+                row["security_code"],
+                row["exchange"] or "",
+                row["status"],
+                row["joined_date"].isoformat(),
+                row["lookback_days"] or "",
+                row["sync_frequency"] or "",
+                ";".join(classes) if classes else "",
+                row["legal_name"],
+            ]
+        )
+        exported += 1
+    return "\n".join(header) + "\n" + buffer.getvalue(), exported, skipped
 
 
 def _track_entries(args: argparse.Namespace) -> tuple[TrackEntry, ...]:
@@ -793,13 +893,46 @@ def _exchange_for_scode(scode: str) -> str:
     return infer_mainland_exchange(scode)
 
 
-def _register_command(args: argparse.Namespace) -> RegisterLocalPdfCommand:
+def _resolve_register_legal_name(
+    args: argparse.Namespace, uow_factory: Callable[[], UnitOfWork]
+) -> str | None:
+    """Company legal name for `register`, never poisoned by the title.
+
+    An explicit ``--company-legal-name`` wins. Otherwise reuse the ledger's
+    already-resolved name for the security; refuse (return ``None``) when the
+    security is unknown or only a PENDING_LEGAL_NAME placeholder exists, so the
+    caller must supply the real name. The announcement title is NEVER used as a
+    company legal name (that poisons the company ledger).
+    """
+
+    if args.company_legal_name:
+        return str(args.company_legal_name)
+    security_code, exchange = canonical_security_identity(
+        args.security_code, args.exchange
+    )
+    with uow_factory() as uow:
+        security = uow.securities.get_by_code_exchange(security_code, exchange)
+        company = (
+            uow.companies.get(security.company_id)
+            if security is not None and security.company_id
+            else None
+        )
+        if company is not None and not company.legal_name.startswith(
+            PENDING_LEGAL_NAME_PREFIX
+        ):
+            return company.legal_name
+    return None
+
+
+def _register_command(
+    args: argparse.Namespace, company_legal_name: str
+) -> RegisterLocalPdfCommand:
     report_period = (
         ReportPeriod.parse(args.report_period) if args.report_period else None
     )
     return RegisterLocalPdfCommand(
         file_path=args.file,
-        company_legal_name=args.company_legal_name or args.title,
+        company_legal_name=company_legal_name,
         security_code=args.security_code,
         exchange=args.exchange,
         filing_type=args.filing_type,

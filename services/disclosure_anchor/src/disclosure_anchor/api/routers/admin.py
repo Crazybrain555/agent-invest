@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import date
+import hmac
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +18,13 @@ from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParse
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
-from disclosure_anchor.api.errors import not_found, validation_error
+from disclosure_anchor.api.errors import (
+    FORBIDDEN,
+    UNAUTHORIZED,
+    FilingApiError,
+    not_found,
+    validation_error,
+)
 from disclosure_anchor.api.schemas.admin import (
     BuildUnitsResponse,
     ParseDocumentResponse,
@@ -72,9 +80,10 @@ from disclosure_anchor.domain.value_objects import ReportPeriod
 from disclosure_anchor.settings import Settings
 
 try:
-    from fastapi import APIRouter, Request
+    from fastapi import APIRouter, Depends, Request
 except ModuleNotFoundError:  # pragma: no cover - exercised by app-start validation
     APIRouter = None  # type: ignore[assignment, misc]
+    Depends = None  # type: ignore[assignment]
     Request = None  # type: ignore[assignment, misc]
 
 
@@ -136,6 +145,16 @@ def track_companies(
     request: Request,
     command: TrackCompaniesRequest,
 ) -> TrackCompaniesResponse:
+    """Upsert the tracked-company pool — FULL-ROW UPSERT.
+
+    FULL-ROW UPSERT semantics (identical to the CSV import path): every
+    optional field is authoritative. Omitting an optional override field
+    (lookback_days, sync_frequency, process_classes) CLEARS the stored
+    override back to inherit-global — a blank field does NOT preserve the
+    previous value, it drops it. Each result echoes `cleared_overrides` so the
+    caller sees exactly which overrides this request cleared, plus `action`
+    (created | updated | unchanged) and any `status_change`.
+    """
     # Full-row upsert semantics (same as the CSV import path): an absent
     # optional field clears the stored override back to inherit-global.
     deps = _admin_deps(request)
@@ -201,6 +220,8 @@ def sync_company(
         security_code=security_code,
         exchange=exchange,
         window_days=command.window_days,
+        window_start=command.window_start,
+        window_end=command.window_end,
     )
 
 
@@ -312,7 +333,13 @@ class AdminDeps:
         )
 
     def sync_company(
-        self, *, security_code: str, exchange: str, window_days: int | None
+        self,
+        *,
+        security_code: str,
+        exchange: str,
+        window_days: int | None,
+        window_start: date | None = None,
+        window_end: date | None = None,
     ) -> SyncCompanyResponse:
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -325,15 +352,22 @@ class AdminDeps:
         settings = self._settings
         source = CninfoSource(CninfoClient.from_settings(settings))
         today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
-        window_start, window_end = compute_sync_window(
-            uow_factory=self._uow_factory,
-            company=security_code,
-            exchange=exchange,
-            explicit_window_days=window_days,
-            today=today,
-            overlap_days=settings.cninfo_overlap_days,
-            initial_lookback_days=settings.disclosure_initial_lookback_days,
-        )
+        try:
+            window_start, window_end = compute_sync_window(
+                uow_factory=self._uow_factory,
+                company=security_code,
+                exchange=exchange,
+                explicit_window_days=window_days,
+                today=today,
+                overlap_days=settings.cninfo_overlap_days,
+                initial_lookback_days=settings.disclosure_initial_lookback_days,
+                # Absolute backfill range (round23): the shared window helper
+                # owns the mutual-exclusion/order/future validation.
+                explicit_window_start=window_start,
+                explicit_window_end=window_end,
+            )
+        except ValueError as exc:
+            raise validation_error("window", str(exc)) from exc
         try:
             result = SyncDisclosureIndex(
                 source=source,
@@ -475,9 +509,48 @@ def _parser_options(
     )
 
 
+def require_admin_auth(request: Request) -> None:
+    """Static bearer token + loopback double barrier (user decision
+    2026-07-14, supersedes round8's unauthenticated local-ops stance).
+
+    The token comes from DISCLOSURE_ADMIN_TOKEN via app.state.settings;
+    main.py refuses to mount this router when it is missing, so a None
+    here means a misconfigured embedding — fail closed. The client-host
+    allowlist keeps the write surface loopback-only even if API_HOST is
+    overridden; "testclient"/None cover the in-process ASGI test client,
+    which never represents a remote peer.
+    """
+
+    settings = getattr(request.app.state, "settings", None)
+    token = getattr(settings, "disclosure_admin_token", None) if settings else None
+    if token is None:
+        raise FilingApiError(
+            status_code=401,
+            error_code=UNAUTHORIZED,
+            message="admin API token is not configured",
+        )
+    client_host = request.client.host if request.client else None
+    if client_host not in (None, "127.0.0.1", "::1", "testclient"):
+        raise FilingApiError(
+            status_code=403,
+            error_code=FORBIDDEN,
+            message="admin API is loopback-only",
+        )
+    header = request.headers.get("Authorization", "")
+    scheme, _, presented = header.partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(
+        presented.strip(), token.get_secret_value()
+    ):
+        raise FilingApiError(
+            status_code=401,
+            error_code=UNAUTHORIZED,
+            message="missing or invalid admin bearer token",
+        )
+
+
 router: Any
 if APIRouter is not None:
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(require_admin_auth)])
     router.add_api_route(
         "/v1/admin/documents/register-local-pdf",
         register_local_pdf,

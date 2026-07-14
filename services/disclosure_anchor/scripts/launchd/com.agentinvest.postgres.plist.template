@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.agentinvest.postgres</string>
+  <!-- One-shot boot starter (batch 4, 2026-07-14): RunAtLoad + no KeepAlive.
+       pg_ctl keeps owning the cluster lifecycle (make pg-start/pg-stop stay
+       authoritative); this job only removes the "machine rebooted, worker
+       KeepAlive loops against a dead DB with no alert" failure mode. The
+       wrapper exits 0 when the cluster is already running. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>__REPO__/scripts/pg_autostart.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/agent-invest/postgres-autostart.out</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/agent-invest/postgres-autostart.err</string>
+</dict>
+</plist>

@@ -192,6 +192,13 @@ class ParseDocument:
             if document is None:
                 raise ParseDocumentError(f"document not found: {document_id}")
             self._validate_document(document)
+            # Lock ordering discipline (round23 review S2): every transaction
+            # that touches both the document row and the outbox takes the
+            # document lock FIRST (finish/publish/register all do). The
+            # prepare failure branch updates document.status after its first
+            # outbox insert, which inverted the order and could deadlock
+            # against a concurrent finisher on the same document.
+            maybe_lock_document(uow, document_id)
             security = (
                 uow.securities.get(document.security_id)
                 if document.security_id is not None
@@ -369,6 +376,19 @@ class ParseDocument:
             if run is None:
                 raise ParseDocumentError(f"processing run not found: {processing_run_id}")
             maybe_lock_document(uow, run.document_id)
+            if run.status != "running":
+                # First terminal state wins: the stale reclaimer (or a
+                # duplicate finisher) already closed this run, and a retry
+                # run may exist for the document. A late failure is
+                # idempotent; a late success must not resurrect the run and
+                # race the retry (round23).
+                if status == "failed":
+                    return run
+                raise ParseDocumentError(
+                    f"processing run {processing_run_id} is already "
+                    f"{run.status}; discarding late success (stale reclaim "
+                    "or duplicate finisher won)"
+                )
             run.status = status
             run.parser_name = parser_name or run.parser_name
             run.parser_version = parser_version or run.parser_version

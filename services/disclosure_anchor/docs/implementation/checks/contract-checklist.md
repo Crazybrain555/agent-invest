@@ -174,3 +174,16 @@ at-least-once 投递 + 消费端幂等（重复投递不产生重复消费效果
 同一 subject（document / asset）内事件保序
 下游失效只由 change_kind=materialized 触发
 ```
+
+## 6. 契约变更记录（append-only）
+
+2026-07-14（round23 上线加固）——公开读契约新增，随 `export_contracts` 重导：
+
+```text
+GET /v1/documents、/v1/filings/latest 新增查询参数 disclosure_topic（jsonb ? 存在判定；空白值 VALIDATION_ERROR）
+GET /v1/classification 新端点：class_map 版本 + 31 处理类（含 processing_policy 处置）+ classification_rule 版本集
+GET /v1/tracked-companies 新增 keyset 分页（cursor/limit，与 documents 同风格）；GET /v1/tracked-companies/{code}?exchange= 单条（404=NOT_FOUND）
+GET /v1/health 响应新增 queues 对象（队列/死信/重试中文档/backfill 水位/最近事件时间；引擎不可用时为 null，不影响 status 语义）
+admin 面（不进导出契约）：PUT tracked-companies 响应新增 action/cleared_overrides/status_change；entries min_length=1；
+  POST {code}/sync 新增 window_start/window_end（与 window_days 互斥）；Bearer token + 回环双闸（401/403/409 运行期码）
+```

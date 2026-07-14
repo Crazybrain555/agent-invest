@@ -9,7 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from disclosure_anchor.api.db import reader_engine_from_request
-from disclosure_anchor.api.errors import gone_superseded, not_found
+from disclosure_anchor.api.errors import gone_superseded, not_found, validation_error
 from disclosure_anchor.api.pagination import (
     DEFAULT_LIMIT,
     DocumentCursor,
@@ -92,6 +92,7 @@ def list_documents(
     company_ref: str | None = None,
     security_code: str | None = None,
     filing_type: str | None = None,
+    disclosure_topic: str | None = None,
     report_period: str | None = None,
     announcement_date_from: date | None = None,
     announcement_date_to: date | None = None,
@@ -106,6 +107,7 @@ def list_documents(
             company_ref=company_ref,
             security_code=security_code,
             filing_type=filing_type,
+            disclosure_topic=validate_disclosure_topic(disclosure_topic),
             report_period=report_period,
             announcement_date_from=announcement_date_from,
             announcement_date_to=announcement_date_to,
@@ -143,6 +145,7 @@ class DocumentFilters:
         company_ref: str | None = None,
         security_code: str | None = None,
         filing_type: str | None = None,
+        disclosure_topic: str | None = None,
         report_period: str | None = None,
         announcement_date_from: date | None = None,
         announcement_date_to: date | None = None,
@@ -151,6 +154,7 @@ class DocumentFilters:
         self.company_ref = company_ref
         self.security_code = security_code
         self.filing_type = filing_type
+        self.disclosure_topic = disclosure_topic
         self.report_period = report_period
         self.announcement_date_from = announcement_date_from
         self.announcement_date_to = announcement_date_to
@@ -205,6 +209,11 @@ def _document_where(filters: DocumentFilters) -> tuple[list[str], dict[str, Any]
     _add_filter(where, params, "filing_type", filters.filing_type)
     _add_filter(where, params, "report_period", filters.report_period)
     _add_filter(where, params, "status", filters.status)
+    if filters.disclosure_topic is not None:
+        # disclosure_topics is a jsonb array (documents_v1); the ? existence
+        # operator asks whether the topic string is one of its elements.
+        where.append("disclosure_topics ? :disclosure_topic")
+        params["disclosure_topic"] = filters.disclosure_topic
     if filters.announcement_date_from is not None:
         where.append("announcement_date >= :announcement_date_from")
         params["announcement_date_from"] = filters.announcement_date_from
@@ -221,6 +230,17 @@ def _add_filter(
         return
     where.append(f"{column} = :{column}")
     params[column] = value
+
+
+def validate_disclosure_topic(value: str | None) -> str | None:
+    # No enum check (disclosure_topics is an open, versioned vocabulary); the
+    # only rule is a non-empty/non-whitespace string. Empty string routes to
+    # the standard VALIDATION_ERROR envelope instead of matching nothing.
+    if value is None:
+        return None
+    if not value.strip():
+        raise validation_error("disclosure_topic", "must be a non-empty string")
+    return value
 
 
 def _append_document_cursor(
@@ -300,6 +320,18 @@ if APIRouter is not None:
         list_document_runs,
         methods=["GET"],
         response_model=list[ProcessingRunV1],
+    )
+    # Registered here (not a new top-level router) so the vocabulary catalog
+    # behind documents_v1.disclosure_topics/filing_type mounts without a
+    # main.py change. Imported at point of use to avoid an import cycle.
+    from disclosure_anchor.api.routers.classification import get_classification
+    from disclosure_anchor.api.schemas.public import ClassificationResponse
+
+    router.add_api_route(
+        "/v1/classification",
+        get_classification,
+        methods=["GET"],
+        response_model=ClassificationResponse,
     )
 else:
     router = None

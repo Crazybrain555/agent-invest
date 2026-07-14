@@ -22,6 +22,9 @@ class WorkerFailure:
     item_ref: str
     error_code: str
     retryable: bool | None = None
+    # Human-readable context for the daily report; without it a stage-level
+    # crash left only an exception class name to debug from (round23).
+    message: str | None = None
 
 
 @dataclass
@@ -65,6 +68,7 @@ class WorkerReport:
                     "item_ref": failure.item_ref,
                     "error_code": failure.error_code,
                     "retryable": failure.retryable,
+                    "message": failure.message,
                 }
                 for failure in self.failures
             ],

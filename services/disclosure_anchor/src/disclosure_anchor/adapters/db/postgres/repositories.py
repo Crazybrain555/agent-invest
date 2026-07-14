@@ -12,10 +12,12 @@ from datetime import date
 import json
 from typing import Optional
 
+import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from disclosure_anchor.adapters.db.postgres import mappers, models
+from disclosure_anchor.application.worker.locks import OUTBOX_NS
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.value_objects import canonical_security_identity
 from disclosure_anchor.domain.errors import (
@@ -677,6 +679,17 @@ class OutboxRepository:
         self._session = session
 
     def add(self, event: e.OutboxEvent) -> e.OutboxEvent:
+        # BIGSERIAL assigns seq at INSERT, not at commit: two concurrent
+        # publishers can commit out of seq order, and a `seq > cursor`
+        # consumer that saw the later seq first would skip the earlier one
+        # forever. This xact-scoped advisory lock serializes [first outbox
+        # insert .. commit], making committed seq order == commit order
+        # (holes come only from rolled-back transactions). Outbox-writing
+        # transactions are short DB-only writes, so the serialization cost
+        # is negligible at this deployment's write rate (round23).
+        self._session.execute(
+            sa.text("SELECT pg_advisory_xact_lock(:ns, 0)"), {"ns": OUTBOX_NS}
+        )
         row = mappers.outbox_event_to_model(event)
         self._session.add(row)
         self._session.flush()

@@ -60,6 +60,21 @@ def register_document(
     )
     if existing is not None:
         maybe_lock_document(uow, existing.document_id)
+        # Same bytes, fresher provider signature hint: refresh the stored
+        # file_signature so the pending_download_v1 signature_differs
+        # re-fetch trigger self-limits — a spurious size-hint drift must
+        # not re-download the same PDF every round (round23).
+        fresh_signature = (doc_meta.provider_metadata or {}).get("file_signature")
+        if isinstance(fresh_signature, dict) and isinstance(
+            existing.provider_metadata, dict
+        ):
+            stored = existing.provider_metadata.get("file_signature")
+            if stored != fresh_signature:
+                existing.provider_metadata = {
+                    **existing.provider_metadata,
+                    "file_signature": fresh_signature,
+                }
+                uow.documents.update(existing)
         event = uow.outbox.add(
             outbox_events.document_observed(
                 document_id=existing.document_id,

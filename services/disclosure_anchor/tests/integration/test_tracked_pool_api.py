@@ -18,7 +18,11 @@ from disclosure_anchor.domain import ids
 from disclosure_anchor.main import create_app
 from disclosure_anchor.settings import Settings
 from tests.integration._support import engine_or_skip
-from tests.integration.test_filing_api_runtime import _api_request
+from tests.integration.test_filing_api_runtime import (
+    _ADMIN_HEADERS,
+    _ADMIN_TOKEN,
+    _api_request,
+)
 
 
 def _settings(root: Path) -> Settings:
@@ -32,6 +36,7 @@ def _settings(root: Path) -> Settings:
         hf_home=shared_root / "model_cache" / "huggingface",
         modelscope_cache=shared_root / "model_cache" / "modelscope",
         disclosure_enable_admin_api=True,
+        disclosure_admin_token=_ADMIN_TOKEN,
         # No credentials: the on-add profile fetch must stay offline in tests
         # (env may carry real CNINFO keys).
         cninfo_access_key=None,
@@ -97,6 +102,7 @@ class TrackedPoolApiTests(unittest.TestCase):
             self.app,
             "PUT",
             "/v1/admin/tracked-companies",
+            headers=_ADMIN_HEADERS,
             json_body={
                 "entries": [
                     {
@@ -162,6 +168,7 @@ class TrackedPoolApiTests(unittest.TestCase):
             self.app,
             "PUT",
             "/v1/admin/tracked-companies",
+            headers=_ADMIN_HEADERS,
             json_body={
                 "entries": [
                     {
@@ -179,6 +186,7 @@ class TrackedPoolApiTests(unittest.TestCase):
             self.app,
             "PUT",
             "/v1/admin/tracked-companies",
+            headers=_ADMIN_HEADERS,
             json_body={
                 "entries": [
                     {"security_code": self.code_override, "exchange": "LOCAL"}
@@ -200,6 +208,7 @@ class TrackedPoolApiTests(unittest.TestCase):
             self.app,
             "PUT",
             "/v1/admin/tracked-companies",
+            headers=_ADMIN_HEADERS,
             json_body={
                 "entries": [
                     {"security_code": self.code_override, "exchange": "LOCAL"}
@@ -212,6 +221,7 @@ class TrackedPoolApiTests(unittest.TestCase):
             self.app,
             "DELETE",
             f"/v1/admin/tracked-companies/{self.code_override}",
+            headers=_ADMIN_HEADERS,
             query={"exchange": "LOCAL"},
         )
         self.assertEqual(deleted.status_code, 200, deleted.body)
@@ -237,6 +247,7 @@ class TrackedPoolApiTests(unittest.TestCase):
             self.app,
             "DELETE",
             f"/v1/admin/tracked-companies/{self.code_override}",
+            headers=_ADMIN_HEADERS,
             query={"exchange": "LOCAL"},
         )
         self.assertEqual(again.status_code, 404, again.body)
@@ -247,6 +258,7 @@ class TrackedPoolApiTests(unittest.TestCase):
             self.app,
             "PUT",
             "/v1/admin/tracked-companies",
+            headers=_ADMIN_HEADERS,
             json_body={
                 "entries": [
                     {

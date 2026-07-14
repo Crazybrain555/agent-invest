@@ -10,7 +10,9 @@
 | `watchlist.csv` | 股票池**导入/快照文件**（真源是 DB 的 tracked_company，round22 改判）：一行一只票 + 按公司覆盖（lookback_days / sync_frequency / process_classes，空=继承全局） | 导入：`make track`（自动先 config-check；`DRY_RUN=1` 只看计划；`PRUNE_DRIFT=YES` 全量恢复）；快照：`make track-export`（DB → 本文件，git 留痕） |
 | `processing_policy.json` | 全局处理策略：`process`=下载+解析；`register_only`=只登记元数据。r3(2026-07-13 用户裁决)：EPS 核心精简——process 19 类,dividend/related_party/financing 移出(需要时由运营者显式按公司 process_classes 拉回,历史已登记候选自动回补)。carrier 例外（2026-07-12 审计）：带 0129 中介报告码/标题的载体件（法律意见书/核查意见/受托管理…）即使共码命中 process 类也不放行，除非把 intermediary_report 本身加进 process 或按公司覆盖。noise 总闸（2026-07-13 用户裁决）：标题命中包内词表 filing_type_map.json `noise_rules`（r11：77 条 JSON 规则/79 个 SQL pattern）的文档**绝对**不下载不解析，公司覆盖也不能翻；登记与分类不受影响 | `make config-check`，再重启/kickstart resident worker 并跑 doctor；`make load-rules` 不能刷新本文件 |
 
-池子的增删改查（写语义相同：整行 upsert，空可选字段=清除覆盖回继承）：
+池子的增删改查（CSV 导入与 API PUT 是整行 upsert：空可选字段=清除覆盖回继承，响应/输出会回显
+`cleared_overrides`；**例外**：`make track CODES=...` 快捷入池是 ensure 语义——已在池的公司
+保持 status 与全部覆盖不动，2026-07-14 改判）：
 
 | 操作 | API | CLI |
 |---|---|---|
@@ -82,4 +84,22 @@ make track-status          # 全池状态 + 每公司生效配置与来源层
 make worker-once           # 手动跑一轮（同步→下载→解析→切分→发布）
 make worker-loop           # 常驻自适应排水；积压时零等待，空闲时 15→30 分钟退避
 make doctor-full           # 环境+迁移头+分类规则版本 全体检
+make worker-status         # 常驻 worker 状态 + 今日报告尾部
+make worker-restart        # kickstart 常驻 worker（改完需重启的配置后必跑）
 ```
+
+## 生效矩阵：改什么 → 跑什么 → 是否需重启（2026-07-14）
+
+常驻 worker 的 env/policy 只在进程启动时读一次；改了不重启 = 文件里的值 ≠ 进程里的值。
+worker 启动时会打印 `[versions]` 行（policy/builder/分类规则版本），核对生效用它。
+
+| 改动对象 | 生效命令 | 需要 worker-restart? |
+|---|---|---|
+| 股票池（增删/参数覆盖） | `make track` / `PUT /v1/admin/tracked-companies` | 否（DB 即时） |
+| 分类词表 JSON（class/facet/filing_type_map） | `make load-rules` | 否（视图现算） |
+| `processing_policy.json` | `make config-check` 后 | **是** |
+| `~/.config/.../worker.env`（含 DB/凭据/批量/并发） | — | **是** |
+| 代码（src/） | `make agent-check` 后 | **是** |
+| `watchlist.csv`（仅文件） | `make track`（导入才生效） | 否 |
+
+重启后固定动作：`make doctor-full` 退出 0 + 观察一轮报告（`make worker-status`）。

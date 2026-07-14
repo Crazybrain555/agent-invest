@@ -23,6 +23,8 @@ from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     SyncDisclosureIndex,
     SyncDisclosureIndexCommand,
 )
+from disclosure_anchor.domain import entities as e
+from disclosure_anchor.domain import ids
 from tests.integration._support import engine_or_skip
 
 
@@ -156,7 +158,38 @@ class CninfoSyncIntegrationTests(unittest.TestCase):
                 {"id": company_id},
             )
 
+    def _seed_tracked(self) -> None:
+        """Sync requires prior pool membership (round23); seed like `make track`."""
+
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            company = uow.companies.add(
+                e.Company(
+                    company_id=ids.new_company_id(),
+                    legal_name="P4 CNINFO Sync Integration Co",
+                )
+            )
+            security = uow.securities.add(
+                e.Security(
+                    security_id=ids.new_security_id(),
+                    company_id=company.company_id,
+                    security_code="T07SYNC",
+                    exchange="LOCAL",
+                )
+            )
+            uow.tracked_companies.add(
+                e.TrackedCompany(
+                    tracked_company_id=ids.new_tracked_company_id(),
+                    company_id=company.company_id,
+                    security_id=security.security_id,
+                    status="active",
+                )
+            )
+            uow.commit()
+        self.created_company_ids.append(company.company_id)
+        self.created_security_ids.append(security.security_id)
+
     def test_sync_persists_candidates_and_checkpoint(self) -> None:
+        self._seed_tracked()
         use_case = SyncDisclosureIndex(
             source=FakeCninfoSource(_refs()),
             profile_loader=lambda _: _profile(),
@@ -164,8 +197,6 @@ class CninfoSyncIntegrationTests(unittest.TestCase):
         )
 
         result = use_case.execute(_command())
-        self.created_company_ids.append(result.company_id)
-        self.created_security_ids.append(result.security_id)
         self.created_source_access_ids.extend(
             [result.profile_source_access_id, result.index_source_access_id]
         )

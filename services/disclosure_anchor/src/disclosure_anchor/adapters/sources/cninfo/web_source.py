@@ -132,10 +132,20 @@ class CninfoWebSource:
             if not isinstance(announcements, list) or not announcements:
                 break
             for record in announcements:
+                # Shape drift must fail loudly: a silently dropped record
+                # lands behind the advanced checkpoint and becomes a
+                # permanent, trace-free index hole. The API channel already
+                # fail-louds on shape (source.py); this channel must match
+                # (round23).
                 if not isinstance(record, dict):
-                    continue
+                    raise CninfoWebSourceError(
+                        "CNINFO web index record is not an object; "
+                        "response shape drifted",
+                        error_code="index_record_shape",
+                        retryable=False,
+                    )
                 ref = self._ref_from_record(record)
-                if ref is None or ref.provider_document_id in seen:
+                if ref.provider_document_id in seen:
                     continue
                 seen.add(ref.provider_document_id)
                 refs.append(ref)
@@ -154,7 +164,22 @@ class CninfoWebSource:
         attempt = 0
         while True:
             self._bucket.take()
-            response = self._client.get(ref.download_url)
+            # Transport failures (connect/read timeouts — routine on the
+            # public site) must surface as SourceRequestError like the API
+            # channel does (client.py), or they escape the download retry
+            # budget entirely (round23 review S1).
+            try:
+                response = self._client.get(ref.download_url)
+            except httpx.TransportError as exc:
+                if attempt >= self._max_retries:
+                    raise CninfoWebSourceError(
+                        f"CNINFO web download transport failure: {exc}",
+                        error_code="transport_error",
+                        retryable=True,
+                    ) from exc
+                self._sleep(self._next_delay(attempt))
+                attempt += 1
+                continue
             if response.status_code < 400:
                 return response.content
             retryable = response.status_code == 429 or response.status_code >= 500
@@ -189,7 +214,18 @@ class CninfoWebSource:
         attempt = 0
         while True:
             self._bucket.take()
-            response = self._client.post(QUERY_URL, data=data)
+            try:
+                response = self._client.post(QUERY_URL, data=data)
+            except httpx.TransportError as exc:
+                if attempt >= self._max_retries:
+                    raise CninfoWebSourceError(
+                        f"CNINFO web index transport failure: {exc}",
+                        error_code="transport_error",
+                        retryable=True,
+                    ) from exc
+                self._sleep(self._next_delay(attempt))
+                attempt += 1
+                continue
             payload: dict[str, Any] | None = None
             if response.status_code < 400:
                 try:
@@ -225,7 +261,18 @@ class CninfoWebSource:
             attempt = 0
             while True:
                 self._bucket.take()
-                response = self._client.get(STOCK_LIST_URL)
+                try:
+                    response = self._client.get(STOCK_LIST_URL)
+                except httpx.TransportError as exc:
+                    if attempt >= self._max_retries:
+                        raise CninfoWebSourceError(
+                            f"CNINFO stock list transport failure: {exc}",
+                            error_code="transport_error",
+                            retryable=True,
+                        ) from exc
+                    self._sleep(self._next_delay(attempt))
+                    attempt += 1
+                    continue
                 if response.status_code < 400:
                     try:
                         payload = response.json()
@@ -255,18 +302,38 @@ class CninfoWebSource:
                 attempt += 1
         return self._org_ids
 
-    def _ref_from_record(self, record: dict[str, Any]) -> AnnouncementRef | None:
+    def _ref_from_record(self, record: dict[str, Any]) -> AnnouncementRef:
         announcement_id = record.get("announcementId")
         title = record.get("announcementTitle")
         adjunct_url = record.get("adjunctUrl")
         sec_code = record.get("secCode")
         time_ms = record.get("announcementTime")
-        if not announcement_id or not isinstance(title, str) or not title:
-            return None
-        if not isinstance(adjunct_url, str) or not adjunct_url:
-            return None
-        if not isinstance(sec_code, str) or not isinstance(time_ms, (int, float)):
-            return None
+        missing = [
+            name
+            for name, ok in (
+                ("announcementId", bool(announcement_id)),
+                ("announcementTitle", isinstance(title, str) and bool(title)),
+                ("adjunctUrl", isinstance(adjunct_url, str) and bool(adjunct_url)),
+                ("secCode", isinstance(sec_code, str)),
+                ("announcementTime", isinstance(time_ms, (int, float))),
+            )
+            if not ok
+        ]
+        if missing:
+            # Fail loudly instead of silently dropping the record: the sync
+            # would otherwise mark the access 'ok', advance the checkpoint,
+            # and this announcement would never be seen again (round23).
+            raise CninfoWebSourceError(
+                "CNINFO web index record missing/invalid fields "
+                f"{missing} (announcementId={record.get('announcementId')!r}, "
+                f"secCode={record.get('secCode')!r})",
+                error_code="index_record_shape",
+                retryable=False,
+            )
+        assert isinstance(title, str)
+        assert isinstance(adjunct_url, str)
+        assert isinstance(sec_code, str)
+        assert isinstance(time_ms, (int, float))
         announcement_date = datetime.fromtimestamp(
             time_ms / 1000.0, tz=SHANGHAI_TZ
         ).date()

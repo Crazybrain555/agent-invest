@@ -333,6 +333,26 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "singleton advisory lock was lost"):
             worker_cli._assert_singleton_lock(lock_conn)
 
+    def test_alert_message_triggers_on_outage_and_failure_burst(self) -> None:
+        # Single-operator alert channel (batch 4): fire on source outage or
+        # >=5 failures in a round; stay quiet on ordinary rounds.
+        quiet = WorkerReport(started_at=datetime.now(timezone.utc))
+        quiet.failed = 4
+        self.assertIsNone(worker_cli._alert_message(quiet))
+
+        outage = WorkerReport(started_at=datetime.now(timezone.utc))
+        outage.source_outage_break = True
+        self.assertIn("outage", worker_cli._alert_message(outage))
+
+        burst = WorkerReport(started_at=datetime.now(timezone.utc))
+        burst.failed = 5
+        burst.failures = [
+            WorkerFailure(stage="parse", item_ref="doc_x", error_code="boom")
+        ]
+        message = worker_cli._alert_message(burst)
+        self.assertIn("5 failures", message)
+        self.assertIn("parse", message)
+
     def test_signal_stops_refill_and_terminates_active_mineru_groups(self) -> None:
         stop = worker_cli._StopFlag()
         with mock.patch.object(

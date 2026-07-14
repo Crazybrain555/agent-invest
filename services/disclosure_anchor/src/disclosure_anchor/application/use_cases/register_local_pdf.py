@@ -19,6 +19,7 @@ from disclosure_anchor.application.services.register_document import (
     register_document,
 )
 from disclosure_anchor.application.services.subject_resolver import (
+    PENDING_LEGAL_NAME_PREFIX,
     SubjectCandidate,
     SubjectResolver,
 )
@@ -227,7 +228,7 @@ class RegisterLocalPdf:
                                 "uscc strong identifier belongs to a different company"
                             ),
                         )
-                    if company.legal_name != command.company_legal_name:
+                    if _names_conflict(company.legal_name, command.company_legal_name):
                         self._contest_identifier_and_raise(
                             uow,
                             identifier=identifier,
@@ -254,9 +255,8 @@ class RegisterLocalPdf:
                             "candidate uscc"
                         ),
                     )
-                if (
-                    security_company is not None
-                    and security_company.legal_name != command.company_legal_name
+                if security_company is not None and _names_conflict(
+                    security_company.legal_name, command.company_legal_name
                 ):
                     self._add_contested_identifier_and_raise(
                         uow,
@@ -269,9 +269,8 @@ class RegisterLocalPdf:
                             f"got {command.company_legal_name!r}"
                         ),
                     )
-            if (
-                security_company is not None
-                and security_company.legal_name != command.company_legal_name
+            if security_company is not None and _names_conflict(
+                security_company.legal_name, command.company_legal_name
             ):
                 raise SubjectIdentityConflictError(
                     "security/company mismatch: "
@@ -358,3 +357,14 @@ class RegisterLocalPdf:
 
 def _normalize_credit_code(value: str | None) -> str | None:
     return value.strip().upper() if value else None
+
+
+def _names_conflict(existing_legal_name: str, candidate_legal_name: str) -> bool:
+    """Placeholder ledger names never count as a conflict (resolver rule:
+    subject_resolver.py — the placeholder upgrades in place on first real
+    name); preflight must mirror that or registration deadlocks between
+    `make track` and the first credentialed sync (round23)."""
+
+    if existing_legal_name.startswith(PENDING_LEGAL_NAME_PREFIX):
+        return False
+    return existing_legal_name != candidate_legal_name

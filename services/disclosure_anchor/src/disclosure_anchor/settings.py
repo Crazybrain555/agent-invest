@@ -128,15 +128,26 @@ class Settings(BaseSettings):
             "DISCLOSURE_INITIAL_LOOKBACK_DAYS", "disclosure_initial_lookback_days"
         ),
     )
-    # Parse-layer scope: 'core' = every non-other filing_type + 'other' docs
-    # matching config/parse_scope.json prefixes; 'all' = parse everything
-    # (user decision 2026-07-06: 全量登记+分层解析).
-    # /v1/admin/* are unauthenticated local-ops write endpoints; production
-    # deployments must keep them off the L2-facing app (round8 audit blocker).
+    # Parse-layer scope now comes from config/processing_policy.json
+    # (loaded via load_processing_policy; the old parse_scope.json was
+    # retired — comment fixed 2026-07-14, user decision 2026-07-06 stands:
+    # 全量登记+分层解析).
+    # /v1/admin/* are token-guarded local-ops write endpoints (user decision
+    # 2026-07-14, supersedes the round8 "unauthenticated + default-off"
+    # stance): enabling the admin surface additionally requires
+    # DISCLOSURE_ADMIN_TOKEN — without a token the router refuses to mount
+    # (fail-closed). Production deployments still keep admin off the
+    # L2-facing app.
     disclosure_enable_admin_api: bool = Field(
         default=False,
         validation_alias=AliasChoices(
             "DISCLOSURE_ENABLE_ADMIN_API", "disclosure_enable_admin_api"
+        ),
+    )
+    disclosure_admin_token: Optional[SecretStr] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_ADMIN_TOKEN", "disclosure_admin_token"
         ),
     )
     # Backfill backpressure: when pending-download + downloaded/pending-parse

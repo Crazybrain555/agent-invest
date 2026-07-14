@@ -30,6 +30,8 @@ from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     SyncDisclosureIndex,
     SyncDisclosureIndexCommand,
 )
+from disclosure_anchor.domain import entities as e
+from disclosure_anchor.domain import ids
 from disclosure_anchor.settings import Settings
 from tests.integration._support import engine_or_skip
 
@@ -49,7 +51,36 @@ class CninfoDownloadIntegrationTests(unittest.TestCase):
         self.engine.dispose()
         self.tmpdir.cleanup()
 
+    def _seed_tracked(self) -> None:
+        """Sync requires prior pool membership (round23); seed like `make track`."""
+
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            company = uow.companies.add(
+                e.Company(
+                    company_id=ids.new_company_id(),
+                    legal_name="P5 CNINFO Download Integration Co",
+                )
+            )
+            security = uow.securities.add(
+                e.Security(
+                    security_id=ids.new_security_id(),
+                    company_id=company.company_id,
+                    security_code="T07DOWN",
+                    exchange="LOCAL",
+                )
+            )
+            uow.tracked_companies.add(
+                e.TrackedCompany(
+                    tracked_company_id=ids.new_tracked_company_id(),
+                    company_id=company.company_id,
+                    security_id=security.security_id,
+                    status="active",
+                )
+            )
+            uow.commit()
+
     def test_sync_download_register_full_chain_with_fake_source(self) -> None:
+        self._seed_tracked()
         source = FakeCninfoSource(_refs(), _pdf_bytes())
         sync = SyncDisclosureIndex(
             source=source,

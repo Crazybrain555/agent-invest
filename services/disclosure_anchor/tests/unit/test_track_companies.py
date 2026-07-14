@@ -205,6 +205,44 @@ class TrackCompaniesTests(unittest.TestCase):
                 )
             )
 
+    def test_unknown_status_is_rejected(self) -> None:
+        # A misspelled status must fail loudly (not silently drop the company
+        # out of every queue) — same validation discipline as sync_frequency.
+        uow = FakeUnitOfWork()
+        with self.assertRaisesRegex(ValueError, "unknown status 'pasued'"):
+            TrackCompanies(uow_factory=lambda: uow).execute(
+                TrackCompaniesCommand(
+                    entries=(
+                        TrackEntry(
+                            security_code="600519",
+                            exchange="SSE",
+                            status="pasued",
+                        ),
+                    )
+                )
+            )
+        # Nothing was written for the rejected batch.
+        self.assertEqual(len(uow.tracked_companies.items), 0)
+        self.assertEqual(uow.commit_count, 0)
+
+    def test_valid_statuses_are_accepted(self) -> None:
+        for status in ("active", "paused"):
+            with self.subTest(status=status):
+                uow = FakeUnitOfWork()
+                TrackCompanies(uow_factory=lambda: uow).execute(
+                    TrackCompaniesCommand(
+                        entries=(
+                            TrackEntry(
+                                security_code="600519",
+                                exchange="SSE",
+                                status=status,
+                            ),
+                        )
+                    )
+                )
+                tracked = next(iter(uow.tracked_companies.items.values()))
+                self.assertEqual(tracked.status, status)
+
 
 class PlaceholderUpgradeTests(unittest.TestCase):
     def test_first_credentialed_sync_upgrades_placeholder_name(self) -> None:

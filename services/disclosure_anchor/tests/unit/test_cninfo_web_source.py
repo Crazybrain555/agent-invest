@@ -80,6 +80,29 @@ class CninfoWebSourceTests(unittest.TestCase):
         self.assertEqual(ref.report_period, "2025Q2")
         self.assertEqual(ref.provider_org_id, "gssz0000001")
 
+    def test_malformed_record_fails_loud_instead_of_silent_drop(self) -> None:
+        # A silently dropped record would land behind the advanced checkpoint
+        # and become a permanent index hole (round23): shape drift must raise.
+        def handler(request: httpx.Request) -> httpx.Response:
+            bad = _record(1225406052, "关于回购股份的公告")
+            bad["announcementTime"] = "2026-07-03"  # drifted: string, not ms
+            return httpx.Response(
+                200,
+                json={"announcements": [bad], "hasMore": False},
+            )
+
+        with self.assertRaises(CninfoWebSourceError) as caught:
+            _source(handler).search_announcements(
+                SourceSecurity(
+                    security_code="000001", exchange="SZSE", security_name=None
+                ),
+                DisclosureWindow(date(2026, 6, 29), date(2026, 7, 6)),
+            )
+
+        self.assertEqual(caught.exception.error_code, "index_record_shape")
+        self.assertFalse(caught.exception.retryable)
+        self.assertIn("announcementTime", str(caught.exception))
+
     def test_topic_class_prevents_fake_quarterly_report_period(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(

@@ -16,6 +16,11 @@ from sqlalchemy.orm import Session
 
 WORKER_NS = 815001
 DOC_NS = 815002
+# Outbox commit-order lock (round23): serializes [first outbox insert ..
+# commit] so committed seq order == commit order and `/v1/changes` cursor
+# consumption never skips a late-committing lower seq. 815003 is taken by
+# the integration-test suite namespace (tests/integration/_support.py).
+OUTBOX_NS = 815004
 
 
 def stable_document_hash(document_id: str) -> int:

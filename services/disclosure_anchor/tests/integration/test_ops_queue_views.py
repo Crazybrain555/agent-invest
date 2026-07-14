@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import text
 
@@ -544,6 +544,130 @@ class OpsQueueViewTests(unittest.TestCase):
         self.assertNotIn(pid_dead, pids)
         row = next(row for row in rows if row["provider_document_id"] == pid_new)
         self.assertEqual(row["candidate"]["title"], f"测试公告 {pid_new}")
+
+    def test_pending_download_signature_differ_refetch_and_coded_preference(self) -> None:
+        # 0023 (round23): a registered TEXTID re-enters the queue ONLY when
+        # the provider's file signature drifted (same-ID file replacement);
+        # and the latest CODED snapshot outranks a newer code-less web
+        # snapshot so registration keeps F006V provenance.
+        pid_swap = f"qv23{self.suffix}swap"
+        pid_same = f"qv23{self.suffix}same"
+        pid_code = f"qv23{self.suffix}code"
+
+        def candidate(pid: str, *, size: int, raw_category: str = "010301") -> dict:
+            return {
+                "provider_document_id": pid,
+                "title": f"测试公告 {pid}",
+                "download_url": f"http://static.cninfo.com.cn/{pid}.PDF",
+                "announcement_date": "1990-01-01",
+                "security_code": "T08QV",
+                "exchange": "LOCAL",
+                "filing_type": "other",
+                "report_period": None,
+                "raw_category": raw_category,
+                "file_signature_hint": {"file_size": size},
+            }
+
+        with self.engine.begin() as conn:
+            sa_old = f"sa_qv23{self.suffix}a"
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.source_access "
+                    "(source_access_id, provider, provider_interface, accessed_at, "
+                    " status, result_snapshot) "
+                    "VALUES (:id, 'cninfo', 'cninfo:p_info3015', now() - interval '1 hour', "
+                    "        'ok', CAST(:snap AS jsonb))"
+                ),
+                {
+                    "id": sa_old,
+                    "snap": json.dumps(
+                        {
+                            "result": "ok",
+                            "candidates": [
+                                candidate(pid_swap, size=20),
+                                candidate(pid_same, size=10),
+                                candidate(pid_code, size=10),
+                            ],
+                        }
+                    ),
+                },
+            )
+            self.sa_ids.append(sa_old)
+            # Newer code-less web snapshot for pid_code only.
+            sa_web = f"sa_qv23{self.suffix}b"
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.source_access "
+                    "(source_access_id, provider, provider_interface, accessed_at, "
+                    " status, result_snapshot) "
+                    "VALUES (:id, 'cninfo', 'cninfo:hisAnnouncement', now(), 'ok', "
+                    "        CAST(:snap AS jsonb))"
+                ),
+                {
+                    "id": sa_web,
+                    "snap": json.dumps(
+                        {
+                            "result": "ok",
+                            "candidates": [
+                                candidate(pid_code, size=10, raw_category="")
+                            ],
+                        }
+                    ),
+                },
+            )
+            self.sa_ids.append(sa_web)
+            # pid_swap and pid_same are registered with stored size 10:
+            # swap's hint (20) differs → re-fetch; same's hint (10) → absent.
+            for pid, doc_suffix in ((pid_swap, "swap"), (pid_same, "same")):
+                doc_id = f"doc_qv23{self.suffix}{doc_suffix}"
+                conn.execute(
+                    text(
+                        "INSERT INTO disclosure_core.document "
+                        "(document_id, status, provider, provider_document_id, "
+                        " provider_metadata) "
+                        "VALUES (:id, 'registered', 'cninfo', :pid, "
+                        "        CAST(:meta AS jsonb))"
+                    ),
+                    {
+                        "id": doc_id,
+                        "pid": pid,
+                        "meta": json.dumps({"file_signature": {"file_size": 10}}),
+                    },
+                )
+                self.doc_ids.append(doc_id)
+            rows = queries.pending_downloads(conn, max_retries=3, limit=1000)
+
+        by_pid = {row["provider_document_id"]: row for row in rows}
+        self.assertIn(pid_swap, by_pid)
+        self.assertTrue(by_pid[pid_swap]["signature_differs"])
+        self.assertTrue(by_pid[pid_swap]["already_registered"])
+        self.assertNotIn(pid_same, by_pid)
+        self.assertIn(pid_code, by_pid)
+        # Coded API snapshot wins over the newer code-less web snapshot.
+        self.assertEqual(by_pid[pid_code]["candidate"]["raw_category"], "010301")
+
+        # CLI sync's immediate pass binds security_code + min_announcement_date
+        # against the real PG (round23 review B1: announcement_date is text in
+        # the view; an uncast date bind param crashed every `make sync`).
+        with self.engine.connect() as conn2:
+            filtered = queries.pending_downloads(
+                conn2,
+                max_retries=3,
+                limit=1000,
+                security_code="T08QV",
+                min_announcement_date=date(1989, 1, 1),
+            )
+            excluded = queries.pending_downloads(
+                conn2,
+                max_retries=3,
+                limit=1000,
+                security_code="T08QV",
+                min_announcement_date=date(1991, 1, 1),
+            )
+        filtered_pids = {row["provider_document_id"] for row in filtered}
+        self.assertIn(pid_code, filtered_pids)  # 1990-01-01 >= 1989-01-01
+        excluded_pids = {row["provider_document_id"] for row in excluded}
+        self.assertNotIn(pid_code, excluded_pids)  # 1990-01-01 < 1991-01-01
 
     def test_pending_download_skips_paused_companies(self) -> None:
         # Pool membership drives acquisition: active row = eligible; paused

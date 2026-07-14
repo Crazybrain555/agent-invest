@@ -147,6 +147,64 @@ class DownloadDocumentTests(unittest.TestCase):
         self.assertIn('"retryable":true', source_access.error)
         self.assertIn('"stage":"download"', source_access.error)
 
+    def test_malformed_candidate_records_terminal_failure_not_raise(self) -> None:
+        # Escaping exceptions leave no failed source_access, so the candidate
+        # never accrues retry budget and re-downloads every round (round23).
+        uow = _uow_with_subject()
+        candidate = _candidate()
+        candidate["announcement_date"] = "not-a-date"
+        use_case = _use_case(uow, [b"%PDF-1.4\nx\n%%EOF\n"])
+
+        result = use_case.execute(DownloadDocumentCommand(candidate=candidate))
+
+        self.assertIsNone(result.document_id)
+        self.assertEqual(result.error_code, "invalid_candidate_snapshot")
+        self.assertFalse(result.retryable)
+        source_access = uow.source_accesses.get(result.source_access_id)
+        self.assertEqual(source_access.status, "failed")
+        self.assertEqual(source_access.query_params["provider_document_id"], "pid-1")
+        self.assertIn('"retryable":false', source_access.error)
+
+    def test_unsynced_security_records_terminal_failure_not_raise(self) -> None:
+        uow = FakeUnitOfWork()  # no security/company seeded
+        use_case = _use_case(uow, [b"%PDF-1.4\nx\n%%EOF\n"])
+
+        result = use_case.execute(DownloadDocumentCommand(candidate=_candidate()))
+
+        self.assertIsNone(result.document_id)
+        self.assertEqual(result.error_code, "registration_metadata_error")
+        self.assertFalse(result.retryable)
+        source_access = uow.source_accesses.get(result.source_access_id)
+        self.assertEqual(source_access.status, "failed")
+        self.assertIn("security must be synced", source_access.result_snapshot["reason"])
+
+    def test_raw_archive_conflict_quarantines_and_records_terminal_failure(self) -> None:
+        from disclosure_anchor.domain.errors import RawDocumentError
+
+        class ArchiveConflictRawStore(FakeRawStore):
+            def put_raw_document(self, **kwargs):  # type: ignore[override]
+                raise RawDocumentError("existing archived file hash mismatch")
+
+        uow = _uow_with_subject()
+        use_case = DownloadDocument(
+            source=FakeDownloadSource([b"%PDF-1.4\nx\n%%EOF\n"]),
+            raw_store=ArchiveConflictRawStore(),
+            path_builder=FakePathBuilder(),
+            uow_factory=lambda: uow,
+        )
+
+        result = use_case.execute(DownloadDocumentCommand(candidate=_candidate()))
+
+        self.assertIsNone(result.document_id)
+        self.assertEqual(result.error_code, "raw_archive_error")
+        self.assertFalse(result.retryable)
+        self.assertEqual(result.quarantine_reason, "raw_archive_conflict")
+        source_access = uow.source_accesses.get(result.source_access_id)
+        self.assertEqual(source_access.status, "failed")
+        self.assertIn(
+            "quarantine_filename", source_access.result_snapshot
+        )
+
     def test_missing_exchange_uses_inferred_mainland_identity(self) -> None:
         for code, exchange in (("600519", "SSE"), ("830001", "BSE")):
             with self.subTest(code=code, exchange=exchange):
@@ -233,7 +291,7 @@ class FakeRawStore:
     ) -> QuarantineResult:
         return QuarantineResult(
             path=Path("quarantine") / f"{provider_document_id}.bin",
-            reason="invalid_raw_document",
+            reason=reason,
             byte_count=len(input_file.read_bytes()),
         )
 

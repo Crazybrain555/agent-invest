@@ -266,6 +266,80 @@ class RegisterDocumentTests(unittest.TestCase):
 
         self.assertEqual(resolver.calls, 1)
 
+    def test_preflight_exempts_pending_legal_name_placeholder(self) -> None:
+        # `make track` seeds a placeholder ledger name; registering with the
+        # real legal name before the first credentialed sync must succeed and
+        # upgrade the placeholder, never contest it (round23).
+        uow = FakeUnitOfWork()
+        company = uow.companies.add(
+            e.Company(
+                company_id="co_pending",
+                legal_name="PENDING_LEGAL_NAME 002484.SZSE",
+            )
+        )
+        uow.securities.add(
+            e.Security(
+                security_id="sec_pending",
+                company_id=company.company_id,
+                security_code="002484",
+                exchange="SZSE",
+            )
+        )
+        use_case = RegisterLocalPdf(raw_store=_RawStore(), uow_factory=lambda: uow)
+
+        result = use_case.execute(
+            RegisterLocalPdfCommand(
+                file_path=Path("sample.pdf"),
+                company_legal_name="江海股份",
+                security_code="002484",
+                exchange="SZSE",
+                filing_type="other",
+                title="公告",
+                announcement_date=date(2026, 7, 5),
+                provider_document_id="1225000001",
+                provider="cninfo",
+                company_credit_code="91320600725062086F",
+            )
+        )
+
+        self.assertIsNotNone(result.document_id)
+        refreshed = uow.companies.get(company.company_id)
+        self.assertEqual(refreshed.legal_name, "江海股份")
+        contested = [
+            row for row in uow.company_identifiers.all() if row.status == "contested"
+        ]
+        self.assertEqual(contested, [])
+
+    def test_preflight_still_rejects_real_legal_name_mismatch(self) -> None:
+        uow = FakeUnitOfWork()
+        company = uow.companies.add(
+            e.Company(company_id="co_real", legal_name="江海股份")
+        )
+        uow.securities.add(
+            e.Security(
+                security_id="sec_real",
+                company_id=company.company_id,
+                security_code="002484",
+                exchange="SZSE",
+            )
+        )
+        use_case = RegisterLocalPdf(raw_store=_RawStore(), uow_factory=lambda: uow)
+
+        with self.assertRaises(SubjectIdentityConflictError):
+            use_case.execute(
+                RegisterLocalPdfCommand(
+                    file_path=Path("sample.pdf"),
+                    company_legal_name="完全不同的公司名",
+                    security_code="002484",
+                    exchange="SZSE",
+                    filing_type="other",
+                    title="公告",
+                    announcement_date=date(2026, 7, 5),
+                    provider_document_id="1225000001",
+                    provider="cninfo",
+                )
+            )
+
     def test_hash_mismatch_is_quarantined_and_records_failed_source_access(self) -> None:
         uow = FakeUnitOfWork()
         use_case = RegisterLocalPdf(raw_store=_RawStore(), uow_factory=lambda: uow)

@@ -149,6 +149,10 @@ class TrackedCompany(Base):
     __table_args__ = (
         UniqueConstraint("company_id", name="uq_tracked_company_company"),
         Index("ix_tracked_company_security", "security_id"),
+        CheckConstraint(
+            "status IN ('active','paused')",
+            name="ck_tracked_company_status",
+        ),
         {"schema": CORE_SCHEMA},
     )
 

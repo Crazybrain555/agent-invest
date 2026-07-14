@@ -22,6 +22,7 @@ from disclosure_anchor.api.routers.documents import (
     _document_where,
     _fetch_all,
     _where_sql,
+    validate_disclosure_topic,
 )
 from disclosure_anchor.api.schemas.public import DocumentListResponse
 from disclosure_anchor.adapters.db.postgres.schema import PUBLIC_SCHEMA
@@ -38,6 +39,7 @@ def latest_filings(
     company_ref: str | None = None,
     security_code: str | None = None,
     filing_type: str | None = None,
+    disclosure_topic: str | None = None,
     report_period: str | None = None,
     announcement_date_from: date | None = None,
     announcement_date_to: date | None = None,
@@ -52,6 +54,7 @@ def latest_filings(
             company_ref=company_ref,
             security_code=security_code,
             filing_type=filing_type,
+            disclosure_topic=validate_disclosure_topic(disclosure_topic),
             report_period=report_period,
             announcement_date_from=announcement_date_from,
             announcement_date_to=announcement_date_to,
