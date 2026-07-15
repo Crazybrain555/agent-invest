@@ -109,7 +109,9 @@ def _image_ir() -> dict:
     }
 
 
-def _uow(root: Path, *, contract_version: str = "normalized_ir.v2") -> tuple[FakeUnitOfWork, Path]:
+def _uow(
+    root: Path, *, contract_version: str = "normalized_ir.v2"
+) -> tuple[FakeUnitOfWork, Path]:
     uow = FakeUnitOfWork()
     company = uow.companies.add(e.Company(company_id="co_1", legal_name="江海股份"))
     security = uow.securities.add(
@@ -131,7 +133,9 @@ def _uow(root: Path, *, contract_version: str = "normalized_ir.v2") -> tuple[Fak
             title="公告",
         )
     )
-    ir_relpath = Path("derived/normalized_ir/cninfo/002484/pid_1/run_1/normalized_ir.v2.json")
+    ir_relpath = Path(
+        "derived/normalized_ir/cninfo/002484/pid_1/run_1/normalized_ir.v2.json"
+    )
     payload = {**_normalized_ir(), "contract_version": contract_version}
     path = root / ir_relpath
     path.parent.mkdir(parents=True)
@@ -155,8 +159,7 @@ class BuildUnitsTests(unittest.TestCase):
             uow, ir_relpath = _uow(root)
             run = uow.processing_runs.get("run_1")
             run.artifact_hash = (
-                "sha256:"
-                + hashlib.sha256((root / ir_relpath).read_bytes()).hexdigest()
+                "sha256:" + hashlib.sha256((root / ir_relpath).read_bytes()).hexdigest()
             )
             uow.processing_runs.update(run)
             paths = _PathBuilder(root)
@@ -196,6 +199,54 @@ class BuildUnitsTests(unittest.TestCase):
                 "IR_HASH_MISMATCH",
             )
             self.assertEqual(uow.document_units.list_by_processing_run("run_1"), [])
+
+    def test_table_builder_semantics_version_guards_reconciled_ir(self) -> None:
+        cases = (
+            ("table-builder-semantics.v2", "succeeded"),
+            ("table-builder-semantics.v1", "failed"),
+            ("table-builder-semantics.v0", "failed"),
+            (None, "failed"),
+        )
+        for semantics_version, expected_status in cases:
+            with self.subTest(semantics_version=semantics_version):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    uow, ir_relpath = _uow(root)
+                    ir_path = root / ir_relpath
+                    payload = json.loads(ir_path.read_text(encoding="utf-8"))
+                    reconciliation = {
+                        "algorithm_version": "mineru-aggregate-table-restore.v3"
+                    }
+                    if semantics_version is not None:
+                        reconciliation["table_builder_semantics_version"] = (
+                            semantics_version
+                        )
+                    payload["parser_diagnostics"] = {
+                        "table_reconciliation": reconciliation
+                    }
+                    ir_path.write_text(
+                        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+                    )
+                    paths = _PathBuilder(root)
+                    use_case = BuildUnits(
+                        path_builder=paths,
+                        artifact_store=ArtifactStore(paths),
+                        uow_factory=lambda: uow,
+                    )
+
+                    result = use_case.execute(
+                        BuildUnitsCommand(processing_run_id="run_1")
+                    )
+
+                    self.assertEqual(result.status, expected_status)
+                    if expected_status == "failed":
+                        self.assertEqual(
+                            result.error["error_code"],
+                            "IR_TABLE_BUILDER_SEMANTICS_MISMATCH",
+                        )
+                        self.assertEqual(
+                            uow.document_units.list_by_processing_run("run_1"), []
+                        )
 
     def test_unknown_preparation_failure_preserves_structured_code(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -240,9 +291,11 @@ class BuildUnitsTests(unittest.TestCase):
             self.assertEqual(result.status, "succeeded")
             self.assertEqual(result.unit_count, 1)
             run = uow.processing_runs.get("run_1")
-            self.assertEqual(run.builder_rules_version, "ub-2026.07-24")
+            self.assertEqual(run.builder_rules_version, "ub-2026.07-52")
             self.assertEqual(run.unit_build_attempt_count, 1)
-            self.assertTrue(run.document_units_relpath.endswith("document_units.v1.jsonl"))
+            self.assertTrue(
+                run.document_units_relpath.endswith("document_units.v1.jsonl")
+            )
             units = uow.document_units.list_by_processing_run("run_1")
             self.assertEqual(len(units), 1)
             snapshot_path = paths.data_path(Path(run.document_units_relpath))
@@ -345,7 +398,9 @@ class BuildUnitsTests(unittest.TestCase):
 
             self.assertEqual(result.status, "failed")
             self.assertEqual(result.error["error_code"], "ARTIFACT_WRITE_FAILED")
-            self.assertEqual(uow.processing_runs.get("run_1").unit_build_attempt_count, 1)
+            self.assertEqual(
+                uow.processing_runs.get("run_1").unit_build_attempt_count, 1
+            )
             self.assertEqual(uow.document_units.list_by_processing_run("run_1"), [])
 
 

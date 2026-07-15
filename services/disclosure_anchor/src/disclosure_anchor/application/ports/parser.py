@@ -47,6 +47,7 @@ class ParserResult:
     content_list_path: Path
     markdown_path: Path | None
     normalized_ir: dict[str, Any]
+    model_path: Path | None = None
 
 
 class DocumentParserPort(Protocol):

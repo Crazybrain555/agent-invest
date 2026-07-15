@@ -36,14 +36,17 @@ NORMALIZED_IR_REQUIRED_KEYS = {
 }
 
 UNIT_REQUIRED_KEYS = {
+    "applicability",
     "artifact_locator",
     "content_hash",
     "document_id",
     "heading_path",
     "order_index",
+    "page_no",
     "payload",
     "quality_status",
     "semantic_key",
+    "semantic_keys",
     "title",
     "asset_id",
     "payload_kind",
@@ -71,7 +74,9 @@ def _read_jsonl(path: Path) -> list[dict]:
             try:
                 units.append(json.loads(line))
             except json.JSONDecodeError as exc:  # pragma: no cover - failure detail
-                raise AssertionError(f"{path}:{line_no} is not valid JSON: {exc}") from exc
+                raise AssertionError(
+                    f"{path}:{line_no} is not valid JSON: {exc}"
+                ) from exc
     return units
 
 
@@ -87,7 +92,9 @@ class Phase00FixtureContractTests(unittest.TestCase):
 
     def test_normalized_ir_has_required_keys_and_matching_sample_key(self) -> None:
         for key in CLEAN_CHECKOUT_SAMPLE_KEYS:
-            data = json.loads((FIXTURE_ROOT / key / "normalized_ir.v2.json").read_text("utf-8"))
+            data = json.loads(
+                (FIXTURE_ROOT / key / "normalized_ir.v2.json").read_text("utf-8")
+            )
             missing = NORMALIZED_IR_REQUIRED_KEYS - data.keys()
             self.assertFalse(missing, f"{key} missing keys: {sorted(missing)}")
             self.assertEqual(data["sample_key"], key)
@@ -96,15 +103,20 @@ class Phase00FixtureContractTests(unittest.TestCase):
 
     def test_document_units_are_well_formed(self) -> None:
         for key in CLEAN_CHECKOUT_SAMPLE_KEYS:
-            ir = json.loads((FIXTURE_ROOT / key / "normalized_ir.v2.json").read_text("utf-8"))
+            ir = json.loads(
+                (FIXTURE_ROOT / key / "normalized_ir.v2.json").read_text("utf-8")
+            )
             units = _read_jsonl(FIXTURE_ROOT / key / "document_units.v1.jsonl")
             self.assertGreater(len(units), 0, key)
 
             seen_asset_ids: set[str] = set()
             last_order = 0
             for unit in units:
-                missing = UNIT_REQUIRED_KEYS - unit.keys()
-                self.assertFalse(missing, f"{key} unit missing keys: {sorted(missing)}")
+                self.assertEqual(
+                    set(unit),
+                    UNIT_REQUIRED_KEYS,
+                    f"{key} unit snapshot key drift",
+                )
 
                 # document_id is consistent with the normalized IR header.
                 self.assertEqual(unit["document_id"], ir["document_id"], key)
@@ -112,7 +124,9 @@ class Phase00FixtureContractTests(unittest.TestCase):
                 # asset_id is non-empty and unique within the document.
                 asset_id = unit["asset_id"]
                 self.assertTrue(asset_id)
-                self.assertNotIn(asset_id, seen_asset_ids, f"duplicate asset_id {asset_id}")
+                self.assertNotIn(
+                    asset_id, seen_asset_ids, f"duplicate asset_id {asset_id}"
+                )
                 seen_asset_ids.add(asset_id)
 
                 self.assertIn(unit["payload_kind"], ALLOWED_PAYLOAD_KINDS, key)
@@ -135,6 +149,55 @@ class Phase00FixtureContractTests(unittest.TestCase):
                 self.assertIsInstance(order_index, int)
                 self.assertGreater(order_index, last_order, key)
                 last_order = order_index
+
+    def test_rendered_units_use_production_document_metadata(self) -> None:
+        fixtures = {
+            key: _read_jsonl(FIXTURE_ROOT / key / "document_units.v1.jsonl")
+            for key in CLEAN_CHECKOUT_SAMPLE_KEYS
+        }
+
+        short_units = fixtures["short_announcement"]
+        self.assertFalse(
+            any(
+                "公告头信息" in [unit.get("title"), *unit.get("heading_path", [])]
+                for unit in short_units
+            )
+        )
+
+        ir_units = fixtures["ir_activity"]
+        self.assertTrue(ir_units)
+        self.assertTrue(
+            all("investor_communication" in unit["semantic_keys"] for unit in ir_units)
+        )
+        ir_qa_units = [
+            unit for unit in ir_units if unit["payload_kind"] == "qa"
+        ]
+        ir_questions = [unit["payload"]["question"] for unit in ir_qa_units]
+        self.assertEqual(len(ir_questions), 43)
+        self.assertTrue(
+            all(
+                unit["heading_path"]
+                == ["投资者关系活动主要内容介绍"]
+                for unit in ir_qa_units
+            )
+        )
+        self.assertIn("美国加征关税对公司有什么影响？", ir_questions)
+        self.assertIn("请介绍集团现有业务矩阵？", ir_questions)
+        self.assertIn("2024年家电行业发展情况？", ir_questions)
+        tariff_qa = next(
+            unit
+            for unit in ir_units
+            if unit["payload_kind"] == "qa"
+            and unit["payload"]["question"] == "美国加征关税对公司有什么影响？"
+        )
+        self.assertEqual(tariff_qa["quality_status"], "needs_review")
+
+        for sample_units in fixtures.values():
+            for unit in sample_units:
+                self.assertIsInstance(unit["semantic_keys"], list)
+                self.assertTrue(unit["semantic_keys"])
+                self.assertIsNotNone(unit["semantic_key"])
+                self.assertIn(unit["semantic_key"], unit["semantic_keys"])
 
     def test_optional_full_annual_fixture_is_valid_when_present(self) -> None:
         for key in OPTIONAL_LOCAL_SAMPLE_KEYS:

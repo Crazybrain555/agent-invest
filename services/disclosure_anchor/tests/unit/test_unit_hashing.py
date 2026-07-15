@@ -91,6 +91,198 @@ class UnitHashingTests(unittest.TestCase):
         self.assertEqual(first.query_projection_hash, second.query_projection_hash)
         self.assertEqual(first.structure_hash, second.structure_hash)
 
+    def test_mixed_annotations_are_projection_not_content(self) -> None:
+        base = {
+            "payload_kind": "mixed",
+            "payload": {
+                "semantic_type": "section",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "order": 12,
+                        "text": "正文",
+                        "local_heading": ["（一）收入"],
+                        "applicability": "applicable",
+                    }
+                ],
+            },
+            "title": "经营情况",
+            "heading_path": ["第三节 管理层讨论与分析", "一、经营情况"],
+            "semantic_key": "document_content",
+            "semantic_keys": ["document_content"],
+            "quality_status": "ok",
+            "order_index": 1,
+        }
+        first = compute_unit_hashes(**base)
+        changed_payload = {
+            **base["payload"],
+            "semantic_type": "document",
+            "parts": [
+                {
+                    **base["payload"]["parts"][0],
+                    "order": 99,
+                    "local_heading": ["（一）主营业务收入"],
+                    "quality_status": "needs_review",
+                }
+            ],
+        }
+        second = compute_unit_hashes(
+            **{**base, "payload": changed_payload}
+        )
+
+        self.assertEqual(first.content_hash, second.content_hash)
+        self.assertNotEqual(first.query_projection_hash, second.query_projection_hash)
+        self.assertEqual(first.structure_hash, second.structure_hash)
+
+    def test_mixed_part_content_and_list_order_remain_content_identity(self) -> None:
+        base = {
+            "payload_kind": "mixed",
+            "payload": {
+                "semantic_type": "section",
+                "parts": [
+                    {"kind": "text", "order": 4, "text": "甲"},
+                    {"kind": "text", "order": 9, "text": "乙"},
+                ],
+            },
+            "title": "业务",
+            "heading_path": ["一、业务"],
+            "semantic_key": "document_content",
+            "quality_status": "ok",
+            "order_index": 1,
+        }
+        first = compute_unit_hashes(**base)
+        changed_text = compute_unit_hashes(
+            **{
+                **base,
+                "payload": {
+                    **base["payload"],
+                    "parts": [
+                        {"kind": "text", "order": 4, "text": "甲变更"},
+                        {"kind": "text", "order": 9, "text": "乙"},
+                    ],
+                },
+            }
+        )
+        reversed_parts = compute_unit_hashes(
+            **{
+                **base,
+                "payload": {
+                    **base["payload"],
+                    "parts": list(reversed(base["payload"]["parts"])),
+                },
+            }
+        )
+
+        self.assertNotEqual(first.content_hash, changed_text.content_hash)
+        self.assertNotEqual(first.content_hash, reversed_parts.content_hash)
+
+    def test_mixed_part_order_locator_is_not_identity(self) -> None:
+        base = {
+            "payload_kind": "mixed",
+            "payload": {
+                "semantic_type": "section",
+                "parts": [
+                    {"kind": "text", "order": 4, "text": "甲"},
+                    {"kind": "text", "order": 9, "text": "乙"},
+                ],
+            },
+            "title": "业务",
+            "heading_path": ["一、业务"],
+            "semantic_key": "document_content",
+            "quality_status": "ok",
+            "order_index": 1,
+        }
+        first = compute_unit_hashes(**base)
+        second = compute_unit_hashes(
+            **{
+                **base,
+                "payload": {
+                    **base["payload"],
+                    "parts": [
+                        {"kind": "text", "order": 400, "text": "甲"},
+                        {"kind": "text", "order": 900, "text": "乙"},
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(first, second)
+
+    def test_mixed_part_artifact_locator_is_projection_not_content(self) -> None:
+        common = {
+            "payload_kind": "mixed",
+            "title": "业务",
+            "heading_path": ["一、业务"],
+            "semantic_key": "document_content",
+            "semantic_keys": ["document_content"],
+            "quality_status": "ok",
+            "order_index": 1,
+        }
+        first = compute_unit_hashes(
+            payload={
+                "semantic_type": "section",
+                "parts": [
+                    {
+                        "kind": "table",
+                        "order": 4,
+                        "headers": ["项目", "金额"],
+                        "rows": [["甲", "1"]],
+                        "artifact_locator": {
+                            "page_no": 1,
+                            "merged_cells": [
+                                {
+                                    "row": 0,
+                                    "col": 0,
+                                    "rowspan": 1,
+                                    "colspan": 2,
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            **common,
+        )
+        second = compute_unit_hashes(
+            payload={
+                "semantic_type": "section",
+                "parts": [
+                    {
+                        "kind": "table",
+                        "order": 4,
+                        "headers": ["项目", "金额"],
+                        "rows": [["甲", "1"]],
+                        "artifact_locator": {
+                            "page_no": 2,
+                            "merged_cells": [],
+                        },
+                    }
+                ],
+            },
+            **common,
+        )
+
+        self.assertEqual(first.content_hash, second.content_hash)
+        self.assertNotEqual(first.query_projection_hash, second.query_projection_hash)
+        self.assertEqual(first.structure_hash, second.structure_hash)
+
+    def test_mixed_parts_must_be_nonempty_objects(self) -> None:
+        common = {
+            "payload_kind": "mixed",
+            "title": "业务",
+            "heading_path": ["一、业务"],
+            "semantic_key": "document_content",
+            "quality_status": "ok",
+            "order_index": 1,
+        }
+        for parts in (None, [], ["正文"]):
+            with self.subTest(parts=parts):
+                with self.assertRaises(ValueError):
+                    compute_unit_hashes(
+                        payload={"semantic_type": "section", "parts": parts},
+                        **common,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

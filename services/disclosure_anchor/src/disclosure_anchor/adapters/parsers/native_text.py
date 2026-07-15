@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 import multiprocessing
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -12,9 +12,20 @@ import re
 from time import monotonic
 from typing import Any, Protocol
 
+from pdfminer.psexceptions import PSException
 import pdfplumber
 
-from disclosure_anchor.domain.errors import ParserTimeoutError
+
+class NativeTextExtractionError(Exception):
+    """Expected failure of the optional native-text shadow channel."""
+
+    def __init__(self, message: str, *, error_code: str) -> None:
+        self.error_code = error_code
+        super().__init__(message)
+
+
+class NativeTextTimeoutError(NativeTextExtractionError):
+    """The native-text shadow exceeded only its remaining parse budget."""
 
 
 class NativeTextExtractor(Protocol):
@@ -53,11 +64,49 @@ def _extract_pdf_payload(input_pdf: Path) -> dict[str, Any]:
     }
 
 
+_EXPECTED_EXTRACTION_ERRORS = (
+    OSError,
+    EOFError,
+    PackageNotFoundError,
+    PSException,
+)
+
+
+def _expected_error_code(exc: BaseException) -> str:
+    if isinstance(exc, PackageNotFoundError):
+        return "dependency_metadata_unavailable"
+    if isinstance(exc, OSError):
+        return "pdf_io_error"
+    return "pdf_parse_error"
+
+
+def _extract_pdf_payload_typed(input_pdf: Path) -> dict[str, Any]:
+    try:
+        return _extract_pdf_payload(input_pdf)
+    except _EXPECTED_EXTRACTION_ERRORS as exc:
+        raise NativeTextExtractionError(
+            f"native PDF text extraction failed: {type(exc).__name__}",
+            error_code=_expected_error_code(exc),
+        ) from exc
+
+
 def _native_text_child(connection: Connection, input_pdf: str) -> None:
     try:
         connection.send(("ok", _extract_pdf_payload(Path(input_pdf))))
+    except _EXPECTED_EXTRACTION_ERRORS as exc:
+        connection.send(
+            (
+                "error",
+                _expected_error_code(exc),
+                type(exc).__name__,
+                str(exc),
+            )
+        )
     except BaseException as exc:  # child must return a structured failure
-        connection.send(("error", type(exc).__name__, str(exc)))
+        # Unknown programming/runtime failures are transported to the parent
+        # but deliberately remain outside NativeTextExtractionError, so the
+        # parser does not silently degrade them.
+        connection.send(("unexpected", type(exc).__name__, str(exc)))
     finally:
         connection.close()
 
@@ -78,18 +127,35 @@ class PdfplumberNativeTextExtractor:
         self, input_pdf: Path, *, timeout_seconds: float | None = None
     ) -> dict[str, Any]:
         if timeout_seconds is None:
-            return _extract_pdf_payload(input_pdf)
+            return _extract_pdf_payload_typed(input_pdf)
         if timeout_seconds <= 0:
-            raise ParserTimeoutError("native PDF text extraction budget exhausted")
+            raise NativeTextTimeoutError(
+                "native PDF text extraction budget exhausted",
+                error_code="budget_exhausted",
+            )
 
         context = multiprocessing.get_context("spawn")
-        receiver, sender = context.Pipe(duplex=False)
+        try:
+            receiver, sender = context.Pipe(duplex=False)
+        except OSError as exc:
+            raise NativeTextExtractionError(
+                "native PDF text extraction pipe could not be created",
+                error_code="process_start_error",
+            ) from exc
         process = context.Process(
             target=_native_text_child,
             args=(sender, str(input_pdf)),
             name="disclosure-native-text",
         )
-        process.start()
+        try:
+            process.start()
+        except OSError as exc:
+            receiver.close()
+            sender.close()
+            raise NativeTextExtractionError(
+                "native PDF text extraction process could not be started",
+                error_code="process_start_error",
+            ) from exc
         sender.close()
         deadline = monotonic() + timeout_seconds
         message: tuple[Any, ...] | None = None
@@ -97,18 +163,33 @@ class PdfplumberNativeTextExtractor:
             while message is None:
                 remaining = deadline - monotonic()
                 if remaining <= 0:
-                    raise ParserTimeoutError(
-                        f"native PDF text extraction timed out after {timeout_seconds}s"
+                    raise NativeTextTimeoutError(
+                        "native PDF text extraction timed out after "
+                        f"{timeout_seconds}s",
+                        error_code="timeout",
                     )
                 if receiver.poll(min(self.poll_interval_seconds, remaining)):
-                    message = receiver.recv()
+                    try:
+                        message = receiver.recv()
+                    except EOFError as exc:
+                        raise NativeTextExtractionError(
+                            "native PDF text extraction returned no result",
+                            error_code="process_no_result",
+                        ) from exc
                     break
                 if not process.is_alive():
                     if receiver.poll():
-                        message = receiver.recv()
+                        try:
+                            message = receiver.recv()
+                        except EOFError as exc:
+                            raise NativeTextExtractionError(
+                                "native PDF text extraction returned no result",
+                                error_code="process_no_result",
+                            ) from exc
                         break
-                    raise RuntimeError(
-                        "native PDF text extraction process exited without a result"
+                    raise NativeTextExtractionError(
+                        "native PDF text extraction process exited without a result",
+                        error_code="process_no_result",
                     )
         finally:
             receiver.close()
@@ -119,8 +200,16 @@ class PdfplumberNativeTextExtractor:
                 process.kill()
             process.join(timeout=1)
 
-        if message[0] != "ok":
+        if not message or message[0] not in {"ok", "error", "unexpected"}:
+            raise RuntimeError("native PDF text extraction returned an invalid result")
+        if message[0] == "error":
+            raise NativeTextExtractionError(
+                f"native PDF text extraction failed: {message[2]}",
+                error_code=str(message[1]),
+            )
+        if message[0] == "unexpected":
             raise RuntimeError(
-                f"native PDF text extraction failed: {message[1]}: {message[2]}"
+                "native PDF text extraction failed unexpectedly: "
+                f"{message[1]}: {message[2]}"
             )
         return dict(message[1])

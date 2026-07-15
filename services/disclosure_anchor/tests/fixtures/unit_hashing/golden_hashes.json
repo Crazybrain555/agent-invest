@@ -84,5 +84,60 @@
       "query_projection_hash": "sha256:6d3dd67000e5e0ed7bf328df443c28dce7cd7d235d63aca6d2c7459703428e1c",
       "structure_hash": "sha256:5e2f1e49a3347c836fd41ba97f69540746fc40d55abf750b08d28d5e50eca1eb"
     }
+  },
+  {
+    "name": "mixed",
+    "input": {
+      "payload_kind": "mixed",
+      "payload": {
+        "semantic_type": "section",
+        "parts": [
+          {
+            "kind": "text",
+            "order": 12,
+            "text": "正文",
+            "local_heading": [
+              "（一）收入"
+            ],
+            "applicability": "applicable"
+          },
+          {
+            "kind": "table",
+            "order": 13,
+            "caption": [],
+            "unit": "元",
+            "headers": [
+              "项目",
+              "金额"
+            ],
+            "rows": [
+              [
+                "收入",
+                "100"
+              ]
+            ],
+            "notes": []
+          }
+        ]
+      },
+      "title": "经营情况",
+      "heading_path": [
+        "第三节 管理层讨论与分析",
+        "一、经营情况"
+      ],
+      "semantic_key": "revenue",
+      "semantic_keys": [
+        "document_content",
+        "revenue"
+      ],
+      "quality_status": "ok",
+      "applicability": null,
+      "order_index": 4
+    },
+    "expected": {
+      "content_hash": "sha256:c3edb065f408962add20361342d04194aa428ab1b8e19c87ce73f5ce9fe92c5d",
+      "query_projection_hash": "sha256:fe9e7ff7d3c18ddd17dd3fab2be45b18f7e21de681983cbefdeb05be1f272b42",
+      "structure_hash": "sha256:42b9f44c722e5de44f9c8079a38d7d15126e217a7919edaf12385d4602c12993"
+    }
   }
 ]

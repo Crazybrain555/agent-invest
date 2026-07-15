@@ -40,7 +40,7 @@ class FixtureDeterminismTests(unittest.TestCase):
                     committed,
                     f"{sample_dir.name}: committed fixture drifted from the "
                     "current rule bundle — run scripts/regen_phase00_fixtures.py "
-                    "and review the diff",
+                    f"--units-only {sample_dir.name} and review the diff",
                 )
 
 

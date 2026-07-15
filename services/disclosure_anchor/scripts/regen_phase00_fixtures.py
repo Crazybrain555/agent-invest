@@ -1,4 +1,4 @@
-"""Regenerate Phase 00 NormalizedIR v2 fixtures from saved MinerU artifacts."""
+"""Regenerate Phase 00 fixtures from artifacts or rebuild units from committed IR."""
 
 from __future__ import annotations
 
@@ -9,12 +9,17 @@ from typing import Any
 
 from collections import Counter
 
-from disclosure_anchor.adapters.parsers.mineru.artifact_reader import MinerUArtifactReader
+from disclosure_anchor.adapters.parsers.mineru.artifact_reader import (
+    MinerUArtifactReader,
+)
 from disclosure_anchor.adapters.unit_builder.builder import build_unit_drafts_s1_s7
 from disclosure_anchor.domain.services import unit_hashing
 from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
     MinerUParserInfo,
     MinerUToNormalizedIRMapper,
+)
+from disclosure_anchor.adapters.parsers.mineru.parser import (
+    map_reconciled_mineru_content_list,
 )
 
 
@@ -108,31 +113,46 @@ def _relpath(value: str | Path | None) -> str | None:
     return text
 
 
-def _parser_artifacts(sample_key: str, content_list_path: Path) -> dict[str, str]:
+def _parser_artifacts(
+    sample_key: str,
+    content_list_path: Path,
+    model_path: Path | None,
+) -> dict[str, str]:
     ref_key = "annual_report" if sample_key == "annual_report_excerpt" else sample_key
     values = _read_ref(ref_key)
-    artifact_root = _relpath(values.get("Parser artifacts root") or content_list_path.parent)
+    artifact_root = _relpath(
+        values.get("Parser artifacts root") or content_list_path.parent
+    )
     content_list = _relpath(content_list_path)
     markdown = _relpath(values.get("Markdown"))
+    if artifact_root is None or content_list is None:
+        raise AssertionError("required parser artifact paths cannot be empty")
     artifacts = {
         "artifact_root_relpath": artifact_root,
         "content_list_relpath": content_list,
     }
     if markdown is not None:
         artifacts["markdown_relpath"] = markdown
+    if model_path is not None:
+        model = _relpath(model_path)
+        if model is None:
+            raise AssertionError("model parser artifact path cannot be empty")
+        artifacts["model_relpath"] = model
     return artifacts
 
 
-def _content_list_for_sample(sample_key: str) -> tuple[list[dict[str, Any]], Path]:
+def _content_list_for_sample(
+    sample_key: str,
+) -> tuple[list[dict[str, Any]], Path, Path | None]:
     path = _content_list_path(sample_key)
-    content_list = MinerUArtifactReader().read_content_list(path)
-    if sample_key == "annual_report_excerpt":
-        content_list = [
-            item
-            for item in content_list
-            if isinstance(item.get("page_idx"), int) and item["page_idx"] <= 6
-        ]
-    return content_list, path
+    reader = MinerUArtifactReader()
+    located = reader.locate(path.parent)
+    if located.content_list_path.resolve() != path.resolve():
+        raise SystemExit(
+            f"{sample_key}: artifact locator selected a different content_list: "
+            f"{located.content_list_path}"
+        )
+    return reader.read_content_list(path), path, located.model_path
 
 
 def _inject_fixture_fields(sample_key: str, normalized: dict[str, Any]) -> None:
@@ -175,18 +195,33 @@ def _coverage_line(sample_key: str, normalized: dict[str, Any]) -> str:
 
 def regenerate_sample(sample_key: str) -> str:
     metadata = SAMPLE_METADATA[sample_key]
-    content_list, content_list_path = _content_list_for_sample(sample_key)
-    normalized = MinerUToNormalizedIRMapper().map_content_list(
+    content_list, content_list_path, model_path = _content_list_for_sample(sample_key)
+    normalized, _reconciliation = map_reconciled_mineru_content_list(
         content_list=content_list,
+        model_path=model_path,
+        mapper=MinerUToNormalizedIRMapper(),
         parser_info=PARSER_INFO,
         document_metadata={
             "document_id": f"phase00_{sample_key}",
             "source_pdf": metadata["source_pdf"],
             "title": metadata["title"],
         },
-        parser_artifacts=_parser_artifacts(sample_key, content_list_path),
+        parser_artifacts=_parser_artifacts(
+            sample_key,
+            content_list_path,
+            model_path,
+        ),
     )
     if sample_key == "annual_report_excerpt":
+        # Reconcile the complete source first. Filtering raw content before
+        # reconciliation can cut a proven cross-page group at the excerpt
+        # boundary and recreate the aggregate/ghost defect in the golden.
+        normalized["elements"] = [
+            element
+            for element in normalized["elements"]
+            if isinstance(element.get("page_idx"), int)
+            and element["page_idx"] <= 6
+        ]
         normalized["parsed_pages"] = {
             "start_page_no": 1,
             "end_page_no": 7,
@@ -207,6 +242,23 @@ def regenerate_sample(sample_key: str) -> str:
     return _coverage_line(sample_key, normalized)
 
 
+def regenerate_units_from_committed_ir(sample_key: str) -> str:
+    """Rebuild only the derived unit golden when source artifacts are absent.
+
+    Clean checkouts intentionally carry NormalizedIR fixtures but not the
+    external MinerU artifact tree.  Rule-only changes must still have a
+    deterministic, documented way to refresh ``document_units.v1.jsonl``.
+    """
+
+    sample_dir = PHASE00_ROOT / sample_key
+    normalized_path = sample_dir / "normalized_ir.v2.json"
+    if not normalized_path.is_file():
+        raise SystemExit(f"{sample_key}: normalized IR missing: {normalized_path}")
+    normalized = json.loads(normalized_path.read_text(encoding="utf-8"))
+    _write_document_units(sample_key, normalized, sample_dir)
+    return _coverage_line(sample_key, normalized)
+
+
 def render_document_units_jsonl(
     *, normalized_ir: dict[str, Any], sample_key: str
 ) -> str:
@@ -221,6 +273,7 @@ def render_document_units_jsonl(
     drafts, _stats = build_unit_drafts_s1_s7(
         normalized,
         filing_type=SAMPLE_METADATA[sample_key].get("filing_type"),
+        document_title=SAMPLE_METADATA[sample_key]["title"],
         image_bytes_resolver=None,
     )
     counters: Counter[str] = Counter()
@@ -278,8 +331,14 @@ def _selected_sample_keys(argv: list[str]) -> tuple[str, ...]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    for sample_key in _selected_sample_keys(sys.argv[1:] if argv is None else argv):
-        print(regenerate_sample(sample_key))
+    args = list(sys.argv[1:] if argv is None else argv)
+    units_only = "--units-only" in args
+    args = [arg for arg in args if arg != "--units-only"]
+    for sample_key in _selected_sample_keys(args):
+        if units_only:
+            print(regenerate_units_from_committed_ir(sample_key))
+        else:
+            print(regenerate_sample(sample_key))
     return 0
 
 

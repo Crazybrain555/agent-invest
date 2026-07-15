@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from disclosure_anchor.adapters.parsers import native_text
-from disclosure_anchor.domain.errors import ParserTimeoutError
+from pdfminer.pdfparser import PDFSyntaxError
 
 
 class PdfplumberNativeTextExtractorTests(unittest.TestCase):
@@ -76,10 +76,33 @@ class PdfplumberNativeTextExtractorTests(unittest.TestCase):
         self.assertEqual(result["status"], "empty")
         self.assertEqual(result["non_whitespace_chars"], 0)
 
-        with self.assertRaises(ParserTimeoutError):
+        with self.assertRaises(native_text.NativeTextTimeoutError) as raised:
             native_text.PdfplumberNativeTextExtractor().extract(
                 Path("never-opened.pdf"), timeout_seconds=0
             )
+        self.assertEqual(raised.exception.error_code, "budget_exhausted")
+
+    def test_expected_pdf_error_is_typed_but_unknown_error_propagates(self) -> None:
+        with mock.patch.object(
+            native_text.pdfplumber,
+            "open",
+            side_effect=PDFSyntaxError("broken xref"),
+        ):
+            with self.assertRaises(native_text.NativeTextExtractionError) as raised:
+                native_text.PdfplumberNativeTextExtractor().extract(
+                    Path("broken.pdf")
+                )
+        self.assertEqual(raised.exception.error_code, "pdf_parse_error")
+
+        with mock.patch.object(
+            native_text.pdfplumber,
+            "open",
+            side_effect=ValueError("programming error"),
+        ):
+            with self.assertRaisesRegex(ValueError, "programming error"):
+                native_text.PdfplumberNativeTextExtractor().extract(
+                    Path("unexpected.pdf")
+                )
 
 
 if __name__ == "__main__":

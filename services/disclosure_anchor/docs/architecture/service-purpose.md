@@ -140,8 +140,9 @@ L2
 
 - 短公告/决议/制度（可坍缩 filing_type 且正文 ≤ 阈值）→ 一个 document 级 unit；
 - 事项型公告（股东会/董事会决议）→ 每项议案一个 unit（审议结果+表决表+会议决定同体）；
-- 长结构化文档（年报等）→ 在"子树内容 ≤ 阈值"的最浅标题节点整体成 unit
-  （研发投入、附注某科目）；超限叶子仍整体合并——按 kind 硬拆一个主题是被禁止的碎片化；
+- 长结构化文档（年报等）→ 先按显式业务结构/受控附注边界定组，再在同一边界内把技术切片
+  合成 `mixed`；8,000 字符与 24 parts 仅是合组安全上限，不用于向上寻找更浅祖先；已经原子化的
+  超限 text/table 保持原子，交由 L2 窗口化，禁止为了凑阈值按 kind 或页码硬拆；
 - qa 单元天然完整，永不并组。
 
 第一版不把以下对象作为长期数据模型：
@@ -162,6 +163,16 @@ agent 运行时为了控制上下文长度，可以临时合并、截取或拆�
 可选 summary），帮助 AI/L2 按语义找到 unit。投影不进 content_hash、不替代 payload、不作为
 证据；不引入 persistent chunk / RAG node / 独立向量库（边界与实现见 milestone 05-U7 / 06R；
 06R 为规划中的检索投影里程碑，规格文档尚未编写）。
+
+L2 的上下文包与 L1 的持久化边界不得混为一谈：L1 按显式业务/受控科目边界保留可寻址
+证据，8k 仅是 mixed unit 的安全硬上限；L2 按最终模型 tokenizer 对渲染后的 prompt +
+sources 计数，并预留输出/工具开销。当前 1,371 份 active 语料呈双峰：1,292 份正文
+不超过 40,000 字符，79 份年报/半年报从 103,354 到 388,948 字符，两组之间无样本。
+这只是 corpus 分层信号，不是 token 阈值：短文档在实际预算内可整篇，长文档用 12–20k
+token 的 section packs；超长表格另建 1.5–3k token 的连续行窗口，重复 caption/表头/路径且
+不拆逻辑行。多文档联合抽取共享总 token budget，并保留每个 asset_id/source_ref。
+不得把“少于 50k tokens”实现成一个 L1 巨型 unit。完整四档决策见
+`docs/implementation/design/retrieval-and-semantic-keys.md` §6.2。
 
 ## 2.4 表格先保留完整结构，不急于全市场标准化
 
@@ -391,7 +402,8 @@ payload_kind
 heading_path
 title
 order_index
-semantic_key（可选）
+semantic_key（ub-2026.07-26 新产物必有；历史 run 可空）
+semantic_keys（ub-2026.07-26 新产物为非空数组；无窄键时为 document_content）
 payload
 content_hash
 quality_status
@@ -799,7 +811,7 @@ exact table snapshot= {"账龄":"1 年以内（含1 年）","期末账面余额"
 
 ## 10.5 document_unit
 
-保存当前 run 生成的 `text/table/qa` 单元。
+保存当前 run 生成的 `text/table/qa/mixed` 单元。
 
 `asset_id` 在对应 run 内不可变，但不承诺跨 parser 版本保持同一 ID。
 
@@ -873,7 +885,8 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - `heading_path`；
 - `semantic_key`；
 - `semantic_keys`（0013 起的 jsonb 数组列；**mixed 单元的召回必须用它**——单值
-  `semantic_key` 查不到并入 parts 的 key）；
+  `semantic_key` 查不到并入 parts 的 key；ub-2026.07-26 新产物至少含
+  `document_content` 通用内容键）；
 - `applicability`（0010 起，节适用性一等筛选列）；
 - `page_no`（0010 起，定位与审查的一等筛选参数）；
 - `quality_status`；
@@ -886,7 +899,8 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 查询面说明：上述键在 `disclosure_public.*_v1` 视图上全部可作谓词（DB 直读满足全集）；
 Filing API 首版只暴露其中一部分为查询参数（documents：company_ref / security_code /
 filing_type / report_period / announcement_date_from,to / status；units：payload_kind /
-semantic_key / quality_status / heading_prefix），其余键经 DB 视图直读或后续 API 升版满足。
+semantic_key（单值参数，匹配 scalar 列或 semantic_keys 数组成员）/ semantic_keys_any / semantic_keys_all / quality_status /
+heading_prefix），其余键经 DB 视图直读或后续 API 升版满足。
 
 全文关键词检索可以后加，但不是证据对象，也不要求向量化。
 

@@ -15,8 +15,8 @@ SQL 都是"抓一整类"的写法。
 
 ## 0. 审查前置
 
-新增审查对象（round12-13）：`docs/architecture/data-dictionary.md`（逐列核对与实库
-一致）；词表文件 note_key_map r4（144 键）/ event_key_map r1（30 事件键）/
+新增审查对象（round12-16）：`docs/architecture/data-dictionary.md`（逐列核对与实库
+一致）；词表文件 note_key_map r16（173 键、389 标签）/ event_key_map r2（35 事件键）/
 class_map(r5,31类)/facet_map/config/processing_policy.json（0016 起分类视图现算、round21 单一处理面+级联覆盖，design/classification-facets-and-derived-views.md）；三 facet 架构（retrieval 设计文档 §4.6）。
 
 ## 0.1 原审查前置
@@ -24,7 +24,7 @@ class_map(r5,31类)/facet_map/config/processing_policy.json（0016 起分类视�
 - 读：`docs/architecture/service-purpose.md`（canonical 契约）→
   `docs/implementation/design/*.md`（watchlist/检索两份决议）→
   `docs/implementation/milestones/09-production-readiness.md`（背账）→
-  05 里程碑 §8.5（规则包 ub-2026.07-2..-13 全部修订史）。
+  05 里程碑 §8.5（规则包 ub-2026.07-2..-52 修订史）。
 - 环境：`set -a; source ~/.config/agent-invest/disclosure_anchor/worker.env; set +a`；
   DB 只读直连 psql 或 dbhub。
 - 语料状态：`make track-status`；确认单一规则代

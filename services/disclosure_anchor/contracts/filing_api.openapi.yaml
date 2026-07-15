@@ -1439,14 +1439,43 @@ paths:
           - type: string
           - type: 'null'
           title: Payload Kind
-      - in: query
+      - description: Lowercase ASCII controlled semantic key.
+        in: query
         name: semantic_key
         required: false
         schema:
           anyOf:
-          - type: string
+          - pattern: ^[a-z][a-z0-9_]{0,127}$
+            type: string
           - type: 'null'
+          description: Lowercase ASCII controlled semantic key.
           title: Semantic Key
+      - description: Comma-separated lowercase ASCII controlled semantic keys (max
+          50).
+        in: query
+        name: semantic_keys_any
+        required: false
+        schema:
+          anyOf:
+          - pattern: ^ *[a-z][a-z0-9_]{0,127} *(?:, *[a-z][a-z0-9_]{0,127} *)*$
+            type: string
+          - type: 'null'
+          description: Comma-separated lowercase ASCII controlled semantic keys (max
+            50).
+          title: Semantic Keys Any
+      - description: Comma-separated lowercase ASCII controlled semantic keys (max
+          50).
+        in: query
+        name: semantic_keys_all
+        required: false
+        schema:
+          anyOf:
+          - pattern: ^ *[a-z][a-z0-9_]{0,127} *(?:, *[a-z][a-z0-9_]{0,127} *)*$
+            type: string
+          - type: 'null'
+          description: Comma-separated lowercase ASCII controlled semantic keys (max
+            50).
+          title: Semantic Keys All
       - in: query
         name: quality_status
         required: false

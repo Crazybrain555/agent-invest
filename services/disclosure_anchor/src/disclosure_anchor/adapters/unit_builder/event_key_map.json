@@ -1,5 +1,5 @@
 {
-  "version": "2026-07-r1",
+  "version": "2026-07-r2",
   "_about": "事件键词表（round12 调研落地：DuEE-fin 13 ∪ CCKS篇章级 9 ∪ FewFC 10 ∪ CFinDEE 22 取并集，对标 SEC 8-K item 的监管锚定思路）。从公告标题（document.title）派生，并入该文档全部单元的 semantic_keys。patterns=标题包含匹配（任一命中即打键，可多键）。方向成对键（增持/减持）分立——投资检索里方向就是查询词。",
   "events": {
     "pledge": ["质押"],
@@ -31,6 +31,33 @@
     "correction_restatement": ["更正", "重述", "差错更正"],
     "abnormal_fluctuation": ["异常波动", "严重异常波动"],
     "equity_incentive_event": ["股权激励", "限制性股票", "员工持股计划"],
-    "meeting_event": ["股东大会", "股东会", "董事会决议", "监事会决议"]
+    "meeting_event": ["股东大会", "股东会", "董事会决议", "监事会决议"],
+    "investor_communication": [
+      "投资者关系活动记录表",
+      "投资者关系活动记录",
+      "调研活动记录",
+      "业绩说明会",
+      "业绩交流会",
+      "投资者交流"
+    ],
+    "operating_data_event": [
+      "销售及近期新增项目情况简报",
+      "主要经营数据",
+      "生产经营情况公告",
+      "发电量完成情况"
+    ],
+    "performance_forecast_event": [
+      "业绩预告",
+      "业绩预增",
+      "业绩预减",
+      "业绩预亏",
+      "业绩预盈"
+    ],
+    "performance_flash_event": [
+      "业绩快报"
+    ],
+    "related_party_transaction_event": [
+      "关联交易"
+    ]
   }
 }

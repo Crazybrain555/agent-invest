@@ -13,19 +13,7 @@ from disclosure_anchor.application.worker.locks import maybe_lock_document
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain.errors import PublishRunError
-
-
-# Every query_projection_hash input except payload_kind, which is part of the
-# stable-pairing key and can never differ between a matched old/new pair. A
-# hash change with changed_fields=[] is an audit hole (round3 P1#8).
-PROJECTION_FIELDS = (
-    "title",
-    "heading_path",
-    "semantic_key",
-    "semantic_keys",
-    "quality_status",
-    "applicability",
-)
+from disclosure_anchor.domain.services.unit_hashing import query_projection
 
 
 @dataclass(frozen=True)
@@ -211,17 +199,56 @@ def diff_units(*, old_units: list[e.DocumentUnit], new_units: list[e.DocumentUni
     for key in sorted(set(old_by_key) | set(new_by_key)):
         old_group = sorted(old_by_key[key], key=lambda item: (item.order_index, item.asset_id))
         new_group = sorted(new_by_key[key], key=lambda item: (item.order_index, item.asset_id))
-        pair_count = min(len(old_group), len(new_group))
-        for index in range(pair_count):
-            old_unit = old_group[index]
-            new_unit = new_group[index]
+        exact_pairs, old_remaining, new_remaining = _pair_equal_projections(
+            old_group, new_group
+        )
+        pair_count = min(len(old_remaining), len(new_remaining))
+        for old_unit, new_unit in [
+            *exact_pairs,
+            *zip(
+                old_remaining[:pair_count],
+                new_remaining[:pair_count],
+                strict=True,
+            ),
+        ]:
             if old_unit.query_projection_hash != new_unit.query_projection_hash:
                 projection_changed.append(
                     (old_unit, new_unit, _changed_projection_fields(old_unit, new_unit))
                 )
-        removed.extend(old_group[pair_count:])
-        created.extend(new_group[pair_count:])
+        removed.extend(old_remaining[pair_count:])
+        created.extend(new_remaining[pair_count:])
     return UnitDiff(created=created, removed=removed, projection_changed=projection_changed)
+
+
+def _pair_equal_projections(
+    old_group: list[e.DocumentUnit],
+    new_group: list[e.DocumentUnit],
+) -> tuple[
+    list[tuple[e.DocumentUnit, e.DocumentUnit]],
+    list[e.DocumentUnit],
+    list[e.DocumentUnit],
+]:
+    """Pair identical projections before applying stable positional pairing.
+
+    A document may legitimately contain duplicate content. Reordering two such
+    units must not manufacture two projection-change events when the old and
+    new projection multisets are identical.
+    """
+
+    new_by_projection: dict[str | None, list[e.DocumentUnit]] = defaultdict(list)
+    for unit in new_group:
+        new_by_projection[unit.query_projection_hash].append(unit)
+    exact: list[tuple[e.DocumentUnit, e.DocumentUnit]] = []
+    old_remaining: list[e.DocumentUnit] = []
+    for old_unit in old_group:
+        candidates = new_by_projection.get(old_unit.query_projection_hash)
+        if candidates:
+            exact.append((old_unit, candidates.pop(0)))
+        else:
+            old_remaining.append(old_unit)
+    paired_new_ids = {id(unit) for _old, unit in exact}
+    new_remaining = [unit for unit in new_group if id(unit) not in paired_new_ids]
+    return exact, old_remaining, new_remaining
 
 
 def _units_by_key(
@@ -234,11 +261,38 @@ def _units_by_key(
 
 
 def _changed_projection_fields(old: e.DocumentUnit, new: e.DocumentUnit) -> list[str]:
-    return [
+    old_projection = _unit_query_projection(old)
+    new_projection = _unit_query_projection(new)
+    changed = [
         field
-        for field in PROJECTION_FIELDS
-        if getattr(old, field) != getattr(new, field)
+        for field in old_projection
+        if field != "payload_kind"
+        and old_projection[field] != new_projection[field]
     ]
+    if not changed:
+        raise PublishRunError(
+            _structured_error(
+                error_code="QUERY_PROJECTION_HASH_MISMATCH",
+                message=(
+                    "query_projection_hash differs although the canonical "
+                    "query projection is unchanged"
+                ),
+            )
+        )
+    return changed
+
+
+def _unit_query_projection(unit: e.DocumentUnit) -> dict[str, Any]:
+    return query_projection(
+        payload_kind=unit.payload_kind,
+        title=unit.title,
+        heading_path=unit.heading_path,
+        semantic_key=unit.semantic_key,
+        semantic_keys=unit.semantic_keys,
+        quality_status=unit.quality_status,
+        applicability=unit.applicability,
+        payload=unit.payload,
+    )
 
 
 def _validate_publishable(run: e.ProcessingRun) -> None:

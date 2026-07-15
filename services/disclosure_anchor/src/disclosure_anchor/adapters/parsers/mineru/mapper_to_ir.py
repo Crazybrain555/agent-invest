@@ -5,8 +5,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+import math
 import re
 from typing import Any
+
+from disclosure_anchor.domain.errors import ParserOutputContractError
+
+
+TABLE_RECONCILIATION_ALGORITHM_VERSION = "mineru-aggregate-table-restore.v3"
+_PRIVATE_AGGREGATE_TABLE_LOCATOR_KEY = "_mineru_aggregate_table_locator"
+_AGGREGATE_TABLE_LOCATOR_FIELDS = frozenset(
+    {
+        "algorithm_version",
+        "page_span",
+        "page_bboxes",
+        "model_table_indices",
+        "continuation_source_item_indices",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +84,134 @@ def _string_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value]
     return [str(value)]
+
+
+def _validated_aggregate_table_locator(
+    locator: dict[str, Any], *, root_source_item_index: int
+) -> dict[str, Any]:
+    """Validate the ordered, complete private locator before publishing it.
+
+    JSON Schema can require the public bundle and unique array members, but it
+    cannot compare two array positions or require page numbers to be ordered.
+    The mapper is therefore the fail-loud semantic contract boundary for those
+    cross-field invariants.
+    """
+
+    fields = set(locator)
+    if fields != _AGGREGATE_TABLE_LOCATOR_FIELDS:
+        missing = sorted(_AGGREGATE_TABLE_LOCATOR_FIELDS - fields)
+        unexpected = sorted(fields - _AGGREGATE_TABLE_LOCATOR_FIELDS)
+        raise ParserOutputContractError(
+            "invalid aggregate table locator fields: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    if locator["algorithm_version"] != TABLE_RECONCILIATION_ALGORITHM_VERSION:
+        raise ParserOutputContractError(
+            "invalid aggregate table locator algorithm version"
+        )
+
+    page_span = locator["page_span"]
+    if (
+        not isinstance(page_span, list)
+        or len(page_span) != 2
+        or any(
+            not isinstance(page, int) or isinstance(page, bool) or page < 1
+            for page in page_span
+        )
+        or page_span[0] >= page_span[1]
+    ):
+        raise ParserOutputContractError(
+            "aggregate table locator page_span must be strictly ascending"
+        )
+
+    page_bboxes = locator["page_bboxes"]
+    if not isinstance(page_bboxes, list) or len(page_bboxes) < 2:
+        raise ParserOutputContractError(
+            "aggregate table locator page_bboxes must contain at least two pages"
+        )
+    expected_pages = list(range(page_span[0], page_span[1] + 1))
+    actual_pages: list[int] = []
+    normalized_page_bboxes: list[dict[str, Any]] = []
+    for page_bbox in page_bboxes:
+        if not isinstance(page_bbox, dict) or set(page_bbox) != {"page_no", "bbox"}:
+            raise ParserOutputContractError(
+                "aggregate table locator page bbox must contain page_no and bbox"
+            )
+        page_no = page_bbox["page_no"]
+        bbox = page_bbox["bbox"]
+        if (
+            not isinstance(page_no, int)
+            or isinstance(page_no, bool)
+            or page_no < 1
+            or not isinstance(bbox, list)
+            or len(bbox) != 4
+            or any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                for value in bbox
+            )
+        ):
+            raise ParserOutputContractError(
+                "aggregate table locator contains an invalid page bbox"
+            )
+        x_min, y_min, x_max, y_max = (float(value) for value in bbox)
+        if x_min >= x_max or y_min >= y_max:
+            raise ParserOutputContractError(
+                "aggregate table locator bbox must have positive width and height"
+            )
+        actual_pages.append(page_no)
+        normalized_page_bboxes.append(
+            {"page_no": page_no, "bbox": list(bbox)}
+        )
+    if actual_pages != expected_pages:
+        raise ParserOutputContractError(
+            "aggregate table locator page_bboxes must cover page_span in order"
+        )
+
+    model_indices = _validated_unique_nonnegative_indices(
+        locator["model_table_indices"],
+        label="model_table_indices",
+        expected_length=len(page_bboxes),
+    )
+    continuation_indices = _validated_unique_nonnegative_indices(
+        locator["continuation_source_item_indices"],
+        label="continuation_source_item_indices",
+        expected_length=len(page_bboxes) - 1,
+    )
+    if continuation_indices != sorted(continuation_indices):
+        raise ParserOutputContractError(
+            "aggregate table locator continuation indices must be ascending"
+        )
+    if any(index <= root_source_item_index for index in continuation_indices):
+        raise ParserOutputContractError(
+            "aggregate table locator continuation indices must follow the root"
+        )
+    return {
+        "algorithm_version": TABLE_RECONCILIATION_ALGORITHM_VERSION,
+        "page_span": list(page_span),
+        "page_bboxes": normalized_page_bboxes,
+        "model_table_indices": model_indices,
+        "continuation_source_item_indices": continuation_indices,
+    }
+
+
+def _validated_unique_nonnegative_indices(
+    value: Any, *, label: str, expected_length: int
+) -> list[int]:
+    if (
+        not isinstance(value, list)
+        or len(value) != expected_length
+        or any(
+            not isinstance(index, int) or isinstance(index, bool) or index < 0
+            for index in value
+        )
+        or len(set(value)) != len(value)
+    ):
+        raise ParserOutputContractError(
+            f"aggregate table locator {label} has invalid indices"
+        )
+    return list(value)
 
 
 def _list_text(item: dict[str, Any]) -> str | None:
@@ -159,7 +303,9 @@ def _span_value(value: str | None) -> int:
     return parsed if parsed >= 1 else 1
 
 
-def _parse_table(html: str) -> tuple[dict[str, Any], bool]:
+def parse_table_html(html: str) -> tuple[dict[str, Any], bool]:
+    """Parse MinerU table HTML into the neutral expanded grid contract."""
+
     if not html.strip():
         return {"headers": [], "rows": []}, False
     try:
@@ -175,6 +321,38 @@ def _parse_table(html: str) -> tuple[dict[str, Any], bool]:
     if not table.get("headers") and not table.get("rows"):
         return table, True
     return table, False
+
+
+def table_html_logical_rows(
+    html: str,
+) -> tuple[list[list[tuple[str, bool, int, int]]], bool]:
+    """Return source ``tr`` cells without expanding row/column spans.
+
+    Reconciliation compares text, ``th``/``td`` identity, rowspan and colspan.
+    All four affect the expanded NormalizedIR grid, so omitting any of them can
+    make a seemingly equal source-cell sequence add, remove or reclassify rows
+    after page-local restoration. NormalizedIR itself continues to use the
+    expanded grid from :func:`parse_table_html`.
+    """
+
+    if not html.strip():
+        return [], False
+    try:
+        parser = _TableParser()
+        parser.feed(html)
+        parser.finish()
+        rows = [
+            [
+                (cell.text, cell.is_header, cell.rowspan, cell.colspan)
+                for cell in row
+            ]
+            for row in parser.rows
+        ]
+    except Exception:
+        return [], True
+    if not any(row for row in rows):
+        return [], True
+    return rows, False
 
 
 def _table_grid(source_rows: list[list[_TableCell]]) -> dict[str, Any]:
@@ -293,6 +471,14 @@ class MinerUToNormalizedIRMapper:
         document_id: str,
     ) -> dict[str, Any]:
         raw_kind = str(item.get("type") or "unknown")
+        locator_present = _PRIVATE_AGGREGATE_TABLE_LOCATOR_KEY in item
+        locator = item.get(_PRIVATE_AGGREGATE_TABLE_LOCATOR_KEY)
+        if locator_present and (
+            raw_kind != "table" or not isinstance(locator, dict)
+        ):
+            raise ParserOutputContractError(
+                "aggregate table locator requires a table item and object bundle"
+            )
         kind, heading_level = _kind_and_heading(raw_kind, item)
         element: dict[str, Any] = {
             "ir_id": f"ir_{index:04d}",
@@ -316,10 +502,29 @@ class MinerUToNormalizedIRMapper:
             element["table_footnote"] = _string_list(item.get("table_footnote"))
             table_html = _table_html(item) or ""
             element["table_html"] = table_html
-            table, parse_failed = _parse_table(table_html)
+            table, parse_failed = parse_table_html(table_html)
             element["table"] = table
             if parse_failed:
                 element["table_parse_failed"] = True
+            if locator is not None:
+                assert isinstance(locator, dict)  # narrowed by the fail-loud guard
+                # A proven group rejected for page-local restoration keeps its
+                # aggregate HTML. These fields are source locators only and
+                # therefore never enter the table payload. Restored groups use
+                # the ordinary per-page fields above and carry no private tag.
+                validated_locator = _validated_aggregate_table_locator(
+                    locator, root_source_item_index=index
+                )
+                for key in (
+                    "page_span",
+                    "page_bboxes",
+                    "model_table_indices",
+                    "continuation_source_item_indices",
+                ):
+                    element[key] = validated_locator[key]
+                element["table_locator_algorithm"] = validated_locator[
+                    "algorithm_version"
+                ]
         if image_path := _image_path(item):
             element["image_path"] = image_path
         if "image" in item and "image_path" not in element:

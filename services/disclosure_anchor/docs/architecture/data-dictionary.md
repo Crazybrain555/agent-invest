@@ -75,7 +75,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | run_kind | parse / rebuild_units（复用解析产物只重切，5 秒级） |
 | status | running / succeeded / failed；stale running 由 worker 按阈值回收 |
 | is_active | 每文档唯一 true（发布原子切换） |
-| builder_rules_version | 恒等于 rules.RULES_VERSION（当前 ub-2026.07-18）；单一代=同版本 |
+| builder_rules_version | 恒等于 rules.RULES_VERSION（当前 ub-2026.07-52）；单一代=同版本 |
 | content_hash_aggregate / structure_hash | run 级聚合（U3）；"内容没变"只看前者 |
 | parser_* / *_relpath / artifact_hash | 解析出处与产物引用（相对路径） |
 | unit_build_status/attempt_count/error | 构建生命周期；error 为结构化 {stage,error_code,retryable} |
@@ -87,8 +87,8 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | payload_kind | 闭集 text / table / qa / **mixed**（业务块，payload=semantic_type+有序 parts） |
 | heading_path | jsonb 1-4 级**多级标题**（必填非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text |
 | title | 叶子显示名（单值；多级在 heading_path，决策记录见 retrieval 设计文档 §4.5） |
-| semantic_key | 单值路由键（规则命中优先，否则回落词表键）；btree 索引 |
-| semantic_keys | jsonb 数组=规则键∪词表键（note_key_map 142 键）；GIN(jsonb_ops) 支持 `? / ?|`——**多值标签的正确 PG 检索形态**（`semantic_keys ? 'dividend'` 走位图索引） |
+| semantic_key | 单值路由键（规则命中→词表键→事件键→`document_content` 通用内容键）；ub-2026.07-26 新产物非空，库列仅为历史兼容仍可空；`document_content` 表示“确定是文档证据、暂无更窄受控概念”，不是 `unknown`；btree 索引 |
+| semantic_keys | jsonb 非空数组=规则键∪词表键∪事件键；无更窄概念时为 `["document_content"]`（ub-2026.07-26；库列仅为历史兼容仍可空）；GIN(jsonb_ops) 支持 `? / ?|`；Filing API 的 `semantic_key` 单值参数匹配 scalar 列或数组成员，另有 comma-list any/all 过滤 |
 | payload | 纯内容（**禁**任何规则派生字段——进 content_hash，U2） |
 | content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；projection 含 title/heading/semantic_key(s)/quality/applicability |
 | quality_status | ok / needs_review / unusable（乱码率>30%） |
@@ -135,9 +135,9 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 | 文件 | 内容 | 当前版本 |
 |---|---|---|
-| adapters/unit_builder/rules.py | 切分/噪声/声明组合文法/语义规则 | RULES_VERSION ub-2026.07-18 |
-| adapters/unit_builder/note_key_map.json | 章节词表 **144 键**（section facet；祖先继承+全类型开放） | 2026-07-r4 |
-| adapters/unit_builder/event_key_map.json | 事件键 **30 键**（DuEE-fin/CCKS/FewFC/CFinDEE 并集，标题派生） | 2026-07-r1 |
+| adapters/unit_builder/rules.py | 切分/噪声/声明组合文法/语义规则 | RULES_VERSION ub-2026.07-52 |
+| adapters/unit_builder/note_key_map.json | 章节词表 **173 键、389 标签**（section facet；祖先继承+全类型开放） | 2026-07-r16 |
+| adapters/unit_builder/event_key_map.json | 事件键 **35 键**（DuEE-fin/CCKS/FewFC/CFinDEE 并集 + 经营数据/业绩/关联交易监管标题，标题派生） | 2026-07-r2 |
 | adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs；r6 financing +011711 担保/011713 财务资助、meeting_resolution +01239910；r7 equity_share_change +0115 父级实码） | 2026-07-r7 |
 | adapters/sources/cninfo/facet_map.json | F006V 维度判定（market 精确码/publisher 0101） | 2026-07-r1 |
 | adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（intermediary carrier 词最前，briefing/inquiry 在定期报告前）+ 65 个 title_topic 词补码盲区 + 18 个 title_noise hard pattern。r12 金融复核将 41 个事实 pattern 与 26 个待可靠去重 pattern 移出绝对门（例行但含股本、稀释、债务、现金、募投或风险新事实的公告不再按标题硬杀）；r13 恢复 6 条自我标识副本/序次重复项（英文版/（英文）/H股季报年报/ST 退市链第 N 次提示），此类标题自带副本标识，无需主件 linkage 键 | 2026-07-r13 |

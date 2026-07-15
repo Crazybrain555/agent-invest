@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Annotated, Any, NoReturn
 
 from sqlalchemy import text
@@ -36,7 +37,10 @@ from disclosure_anchor.api.schemas.public import (
     UnitListResponse,
 )
 from disclosure_anchor.adapters.db.postgres.schema import PUBLIC_SCHEMA
-from disclosure_anchor.domain.services.unit_hashing import canonical_json, sha256_prefixed
+from disclosure_anchor.domain.services.unit_hashing import (
+    canonical_json,
+    sha256_prefixed,
+)
 
 try:
     from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -119,13 +123,40 @@ def _query_default() -> Any:
     return Query()
 
 
+def _semantic_key_query_default() -> Any:
+    if Query is None:  # pragma: no cover
+        return None
+    return Query(
+        pattern=r"^[a-z][a-z0-9_]{0,127}$",
+        description="Lowercase ASCII controlled semantic key.",
+    )
+
+
+def _semantic_key_list_query_default() -> Any:
+    if Query is None:  # pragma: no cover
+        return None
+    return Query(
+        pattern=(
+            r"^ *[a-z][a-z0-9_]{0,127} *"
+            r"(?:, *[a-z][a-z0-9_]{0,127} *)*$"
+        ),
+        description="Comma-separated lowercase ASCII controlled semantic keys (max 50).",
+    )
+
+
 def list_document_units(
     document_id: str,
     request: Request,
     processing_run_id: str | None = None,
     reject_superseded: bool = False,
     payload_kind: str | None = None,
-    semantic_key: str | None = None,
+    semantic_key: Annotated[str | None, _semantic_key_query_default()] = None,
+    semantic_keys_any: Annotated[
+        str | None, _semantic_key_list_query_default()
+    ] = None,
+    semantic_keys_all: Annotated[
+        str | None, _semantic_key_list_query_default()
+    ] = None,
     quality_status: str | None = None,
     heading_prefix: Annotated[list[str] | None, _query_default()] = None,
     cursor: str | None = None,
@@ -154,7 +185,13 @@ def list_document_units(
         processing_run_id=selected_run_id,
         filters=UnitFilters(
             payload_kind=payload_kind,
-            semantic_key=semantic_key,
+            semantic_key=_validate_semantic_key("semantic_key", semantic_key),
+            semantic_keys_any=_validate_semantic_key_list(
+                "semantic_keys_any", semantic_keys_any
+            ),
+            semantic_keys_all=_validate_semantic_key_list(
+                "semantic_keys_all", semantic_keys_all
+            ),
             quality_status=quality_status,
             heading_prefix=heading_prefix or [],
         ),
@@ -225,11 +262,15 @@ class UnitFilters:
         *,
         payload_kind: str | None = None,
         semantic_key: str | None = None,
+        semantic_keys_any: list[str] | None = None,
+        semantic_keys_all: list[str] | None = None,
         quality_status: str | None = None,
         heading_prefix: list[str] | None = None,
     ) -> None:
         self.payload_kind = payload_kind
         self.semantic_key = semantic_key
+        self.semantic_keys_any = semantic_keys_any
+        self.semantic_keys_all = semantic_keys_all
         self.quality_status = quality_status
         self.heading_prefix = heading_prefix or []
 
@@ -338,7 +379,11 @@ def _latest_processing_warning(
         "LIMIT 1"
     )
     with engine.connect() as conn:
-        row = conn.execute(text(sql), {"document_id": document_id}).mappings().one_or_none()
+        row = (
+            conn.execute(text(sql), {"document_id": document_id})
+            .mappings()
+            .one_or_none()
+        )
     if row is None or row["processing_run_id"] == active_run_id:
         return None
     if row["status"] == "failed" or row["unit_build_status"] == "failed":
@@ -350,7 +395,24 @@ def _unit_where(filters: UnitFilters) -> tuple[list[str], dict[str, Any]]:
     where: list[str] = []
     params: dict[str, Any] = {}
     _add_filter(where, params, "payload_kind", filters.payload_kind)
-    _add_filter(where, params, "semantic_key", filters.semantic_key)
+    if filters.semantic_key is not None:
+        where.append(
+            "(u.semantic_key = :semantic_key OR "
+            "jsonb_exists(u.semantic_keys, :semantic_key))"
+        )
+        params["semantic_key"] = filters.semantic_key
+    if filters.semantic_keys_any is not None:
+        where.append(
+            "jsonb_exists_any(u.semantic_keys, "
+            "CAST(:semantic_keys_any AS text[]))"
+        )
+        params["semantic_keys_any"] = filters.semantic_keys_any
+    if filters.semantic_keys_all is not None:
+        where.append(
+            "jsonb_exists_all(u.semantic_keys, "
+            "CAST(:semantic_keys_all AS text[]))"
+        )
+        params["semantic_keys_all"] = filters.semantic_keys_all
     _add_filter(where, params, "quality_status", filters.quality_status)
     if filters.heading_prefix:
         params["heading_prefix_json"] = json.dumps(
@@ -360,14 +422,47 @@ def _unit_where(filters: UnitFilters) -> tuple[list[str], dict[str, Any]]:
         )
         params["heading_prefix_len"] = len(filters.heading_prefix)
         where.append("u.heading_path @> CAST(:heading_prefix_json AS jsonb)")
-        where.append(
-            "jsonb_array_length(u.heading_path) >= :heading_prefix_len"
-        )
+        where.append("jsonb_array_length(u.heading_path) >= :heading_prefix_len")
         for index, value in enumerate(filters.heading_prefix):
             key = f"heading_prefix_{index}"
             params[key] = value
             where.append(f"u.heading_path ->> {index} = :{key}")
     return where, params
+
+
+def _validate_semantic_key_list(field: str, value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    raw_items = value.split(",")
+    # The public contract permits optional ASCII spaces around comma-separated
+    # keys.  Do not let str.strip() silently normalize tabs/newlines or other
+    # controls that the OpenAPI pattern intentionally rejects.
+    items = [item.strip(" ") for item in raw_items]
+    if not items or any(not item for item in items):
+        raise validation_error(
+            field, "must contain only non-empty comma-separated keys"
+        )
+    deduplicated = list(dict.fromkeys(items))
+    if len(deduplicated) > 50:
+        raise validation_error(field, "must contain at most 50 keys")
+    for item in deduplicated:
+        _validate_semantic_key(field, item)
+    return deduplicated
+
+
+_SEMANTIC_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$", re.ASCII)
+
+
+def _validate_semantic_key(field: str, value: str | None) -> str | None:
+    if value is None:
+        return None
+    if _SEMANTIC_KEY_RE.fullmatch(value) is None:
+        raise validation_error(
+            field,
+            "each key must be 1-128 lowercase ASCII letters, digits, or underscores "
+            "and start with a letter",
+        )
+    return value
 
 
 def _add_filter(
@@ -387,7 +482,9 @@ def _append_unit_cursor(
 ) -> None:
     if cursor is None:
         return
-    where.append("(u.order_index, u.asset_id) > (:cursor_order_index, :cursor_asset_id)")
+    where.append(
+        "(u.order_index, u.asset_id) > (:cursor_order_index, :cursor_asset_id)"
+    )
     params["cursor_order_index"] = cursor.order_index
     params["cursor_asset_id"] = cursor.asset_id
 

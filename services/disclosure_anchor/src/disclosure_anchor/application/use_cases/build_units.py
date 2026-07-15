@@ -311,7 +311,41 @@ class BuildUnits:
                     message="normalized IR must be regenerated as normalized_ir.v2",
                 )
             )
+        self._validate_table_builder_semantics(payload)
         return payload
+
+    def _validate_table_builder_semantics(self, payload: dict[str, Any]) -> None:
+        """Reject reconciled IR whose table proof targets different S5 rules.
+
+        Legacy IR without table-reconciliation diagnostics remains readable.
+        Once a reconciliation algorithm is recorded, however, its page-local
+        equivalence proof is safe only for the table-builder semantics version
+        it names. Ordinary RULES_VERSION changes intentionally do not enter
+        this compatibility check.
+        """
+
+        diagnostics = payload.get("parser_diagnostics")
+        if not isinstance(diagnostics, dict):
+            return
+        reconciliation = diagnostics.get("table_reconciliation")
+        if not isinstance(reconciliation, dict):
+            return
+        algorithm = str(reconciliation.get("algorithm_version") or "")
+        if not algorithm.startswith("mineru-aggregate-table-restore.v"):
+            return
+        actual = reconciliation.get("table_builder_semantics_version")
+        expected = rules.TABLE_BUILDER_SEMANTICS_VERSION
+        if actual != expected:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="IR_TABLE_BUILDER_SEMANTICS_MISMATCH",
+                    message=(
+                        "normalized IR table reconciliation targets "
+                        f"{actual!r}; current builder requires {expected!r}. "
+                        "Re-parse the document before building units"
+                    ),
+                )
+            )
 
     def _image_bytes_resolver(
         self, normalized_ir: dict[str, Any]

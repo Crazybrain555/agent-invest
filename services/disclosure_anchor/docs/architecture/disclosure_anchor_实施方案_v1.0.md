@@ -30,7 +30,9 @@ implementation_style: modular_monolith_with_ports_and_adapters
 >
 > 它定义代码边界、模块职责、数据对象、解析适配层、运行管道、发布语义、API 和实施顺序；不定义详细测试方案。测试策略、测试样本矩阵和验收用例将在独立文档中编写。
 >
-> 漂移说明（2026-07-07）：payload kinds 自迁移 0011 起为 text/table/qa/mixed；本文其余 text/table/qa 表述与 `service-purpose.md` 冲突处，以后者（canonical）为准。
+> 漂移说明（2026-07-15）：payload kinds 自迁移 0011 起为 text/table/qa/mixed；ub-2026.07-26
+> 起新 builder 产物的 semantic_key/semantic_keys 均非空，无更窄概念时为
+> `document_content`；本文其余早期表述与 `service-purpose.md` 冲突处，以后者（canonical）为准。
 
 ---
 
@@ -737,7 +739,7 @@ payload_kind                 text / table / qa / mixed（0011 起，见 service-
 order_index
 heading_path
 title
-semantic_key（可空）
+semantic_key（新 builder 产物非空；历史 run 的库列可空）
 semantic_key_version（可空）
 payload_schema_version
 payload
@@ -1232,7 +1234,8 @@ filing type
 
 - 明确模板废话、页眉页脚、目录点线和重复免责声明：suppress；
 - 明确由标准数据 provider 稳定覆盖的标准表：默认 suppress from published units；
-- 预测可能相关且规则不确定的内容：publish，`semantic_key = null`；
+- 预测可能相关且规则不确定的内容：publish，使用真实通用键
+  `semantic_key = document_content`（不得伪造具体主题）；
 - 结构严重损坏：review 或 unusable；
 - 不允许 LLM 作为唯一删除依据。
 

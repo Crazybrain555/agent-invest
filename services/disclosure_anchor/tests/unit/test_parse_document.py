@@ -109,9 +109,16 @@ class _ArtifactStore:
 
 
 class _Parser:
-    def __init__(self, *, error: Exception | None = None, identity_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        error: Exception | None = None,
+        identity_error: Exception | None = None,
+        native_shadow_diagnostic: dict[str, object] | None = None,
+    ) -> None:
         self.error = error
         self.identity_error = identity_error
+        self.native_shadow_diagnostic = native_shadow_diagnostic
         self.called = False
         self.document_metadata: dict[str, Any] | None = None
 
@@ -139,6 +146,20 @@ class _Parser:
         if self.error is not None:
             raise self.error
         artifact_root = output_dir / "sample" / "auto"
+        normalized_ir: dict[str, Any] = {
+            "contract_version": "normalized_ir.v2",
+            "document_id": document_metadata["document_id"],
+            "source_pdf": document_metadata["source_pdf"],
+            "title": document_metadata["title"],
+            "parser": {},
+            "parser_artifacts": {},
+            "parsed_pages": {"start_page_no": 1, "end_page_no": 1},
+            "elements": [],
+        }
+        if self.native_shadow_diagnostic is not None:
+            normalized_ir["parser_diagnostics"] = {
+                "native_text_shadow": self.native_shadow_diagnostic
+            }
         return ParserResult(
             parser_name="MinerU",
             parser_version="3.4.0",
@@ -148,16 +169,8 @@ class _Parser:
             artifact_root=artifact_root,
             content_list_path=artifact_root / "content_list.json",
             markdown_path=artifact_root / "sample.md",
-            normalized_ir={
-                "contract_version": "normalized_ir.v2",
-                "document_id": document_metadata["document_id"],
-                "source_pdf": document_metadata["source_pdf"],
-                "title": document_metadata["title"],
-                "parser": {},
-                "parser_artifacts": {},
-                "parsed_pages": {"start_page_no": 1, "end_page_no": 1},
-                "elements": [],
-            },
+            normalized_ir=normalized_ir,
+            model_path=artifact_root / "sample_model.json",
         )
 
 
@@ -277,6 +290,31 @@ class ParseDocumentUnitTests(unittest.TestCase):
         self.assertEqual(uow.documents.get("doc_1").status, "parsed")
         latest_payload = artifact_store.payloads[second.normalized_ir_relpath]
         self.assertFalse(latest_payload["parsed_pages"]["full_pdf"])
+        self.assertTrue(
+            latest_payload["parser_artifacts"]["model_relpath"].endswith(
+                "sample_model.json"
+            )
+        )
+
+    def test_native_shadow_unavailable_diagnostic_still_persists_success(
+        self,
+    ) -> None:
+        uow = _uow_with_document()
+        diagnostic = {"status": "unavailable", "error_code": "timeout"}
+        use_case, artifact_store = _use_case(
+            uow,
+            parser=_Parser(native_shadow_diagnostic=diagnostic),
+        )
+
+        result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+
+        self.assertEqual(result.status, "succeeded")
+        payload = artifact_store.payloads[result.normalized_ir_relpath]
+        self.assertEqual(
+            payload["parser_diagnostics"]["native_text_shadow"],
+            diagnostic,
+        )
+        self.assertNotIn("native_text", payload)
 
     def test_typed_parser_exceptions_map_to_structured_errors(self) -> None:
         cases = (

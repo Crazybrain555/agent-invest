@@ -149,16 +149,16 @@ VALIDATION_ERROR           → 422，参数/游标校验失败（坏 base64/JSON
    `src/disclosure_anchor/cli/export_contracts.py`，命令
    `PYTHONPATH=src .venv/bin/python -m disclosure_anchor.cli.export_contracts`——
    (a) create_app().openapi() 经 yaml.safe_dump(sort_keys=True, allow_unicode=True) 写
-   `contracts/filing_api.openapi.yaml`；(b) 五个 Pydantic 响应模型 .model_json_schema()
+   `contracts/filing_api.openapi.yaml`；(b) 七个 Pydantic 响应模型 .model_json_schema()
    经 json.dumps(indent=2, ensure_ascii=False, sort_keys=True) 写
-   `contracts/public_models/{document,document_unit,processing_run,source_ref,change_event}.v1.json`。
+   `contracts/public_models/{document,document_unit,processing_run,source_ref,change_event,document_category,tracked_company}.v1.json`。
    三方一致断言拆两层（contract 测试是 no-DB 的，读不到视图列）：
    (a) no-DB：tests/contract/test_filing_api_contracts.py 重新导出并断言与已提交文件
-       逐字节一致，且对五个模型断言 set(schema["properties"]) == set(Model.model_fields)−DERIVED；
+       逐字节一致，且对七个模型断言 set(schema["properties"]) == set(Model.model_fields)−DERIVED；
    (b) DB-gated：tests/integration/test_filing_api_views_contract.py 对每个视图断言
        information_schema.columns（table_schema='disclosure_public'）的列名集合 ==
        set(schema["properties"]) − DERIVED；
-   DERIVED = {"asset_uri","is_active_run"}（仅 document_unit.v1）。
+   DERIVED = {"asset_uri"}（仅 document_unit.v1；`is_active_run` 已是公开响应模型字段）。
 6. **实现形态**：FastAPI router 按资源拆分（documents / units / filings / changes / admin)；
    engine 拓扑定死：读侧 router（documents/units/filings/changes/health）用
    `DISCLOSURE_READER_DATABASE_URL` engine（缺省回落 DATABASE_URL 并 doctor WARN），
@@ -168,7 +168,11 @@ VALIDATION_ERROR           → 422，参数/游标校验失败（坏 base64/JSON
 7. **MCP 映射预留**（协议 §3.11 第 6 条，不在本期实现）：查询→tool、取回→resource（按
    asset_uri）、变更→notifications；本期只保证 URI 与游标契约稳定，包装时零改造。
 8. **unit 过滤与 heading 语义**：`/documents/{id}/units` 支持 `payload_kind` / `semantic_key` /
-   `quality_status` / `heading_prefix` 过滤；`heading_prefix` 语义 = heading_path **数组前缀
+   `semantic_keys_any` / `semantic_keys_all` / `quality_status` / `heading_prefix` 过滤；旧的
+   `semantic_key` 同时命中 scalar 或 semantic_keys 数组，避免 array-only mixed unit 漏召回；
+   any/all 使用逗号分隔、去重后的受控键列表（最多 50 个）；scalar/list 中每个 key 都必须是
+   1–128 字符的小写 ASCII snake_case（字母开头），控制字符等非法值在 SQL 前返回 422。
+   `heading_prefix` 语义 = heading_path **数组前缀
    匹配**（实现：GIN jsonb_path_ops containment 作候选过滤，命中后精确校验前缀，不把
    containment 当长期方案）。全文/向量检索不在本期：`GET /v1/search/units`
    （PostgreSQL FTS/pg_trgm + retrieval projection 派生层，边界见 05-U7）保留给 06R
@@ -211,7 +215,7 @@ provider_document_id=文件名去后缀）。
 - 每包提交门禁 = `make agent-check`（lint+严格 mypy+no-DB test+diff check，零违例基线）
   + live-DB `make test`（04R §6.1 2026-07-05 修订）；
 - 三个本地样本经 admin API 全链处理后，units/changes/source-ref 均可经 HTTP 读取；
-- OpenAPI 与五个 JSON schema 提交并有 contract test 守护；
+- OpenAPI 与七个 JSON schema 提交并有 contract test 守护；
 - acceptance-matrix A16/A17/A18/A22/A23/A24/A41 置 pass
   （A41 = 错误码 contract test 行，已预登记；不得新增重复行）。
 

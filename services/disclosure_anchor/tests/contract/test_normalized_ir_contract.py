@@ -1,5 +1,6 @@
 """NormalizedIR v2 contract checks."""
 
+import copy
 import json
 import unittest
 from pathlib import Path
@@ -10,6 +11,9 @@ from disclosure_anchor.adapters.parsers.mineru.artifact_reader import MinerUArti
 from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
     MinerUParserInfo,
     MinerUToNormalizedIRMapper,
+)
+from disclosure_anchor.adapters.parsers.mineru.table_reconciler import (
+    TableReconciliationStats,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -139,6 +143,161 @@ class NormalizedIRContractTests(unittest.TestCase):
             label="native_text_shadow_extra_field",
             path=("native_text",),
         )
+
+    def test_table_reconciliation_diagnostics_and_model_provenance_validate(
+        self,
+    ) -> None:
+        data = _load_fixture("annual_report_excerpt")
+        data["parser_artifacts"]["model_relpath"] = (
+            "parser_artifacts/sample/sample_model.json"
+        )
+        data["parser_diagnostics"] = {
+            "table_reconciliation": TableReconciliationStats(
+                model_status="supported",
+                content_tables=2,
+                model_hash="sha256:" + "a" * 64,
+                model_tables=2,
+                uniquely_matched_tables=2,
+                candidate_groups=1,
+                proven_groups=1,
+                restoration_rejected_groups=1,
+                located_groups=1,
+                located_tables=2,
+            ).as_dict()
+        }
+        table = _table_elements(data)[0]
+        table.update(
+            {
+                "page_span": [1, 2],
+                "page_bboxes": [
+                    {"page_no": 1, "bbox": [100, 700, 900, 900]},
+                    {"page_no": 2, "bbox": [100, 100, 900, 300]},
+                ],
+                "model_table_indices": [0, 1],
+                "continuation_source_item_indices": [table["source_item_index"] + 1],
+                "table_locator_algorithm": "mineru-aggregate-table-restore.v3",
+            }
+        )
+        self._assert_valid(data, label="table_reconciliation")
+
+        element_index = data["elements"].index(table)
+        for field in (
+            "page_span",
+            "page_bboxes",
+            "model_table_indices",
+            "continuation_source_item_indices",
+            "table_locator_algorithm",
+        ):
+            with self.subTest(missing_locator_field=field):
+                partial = copy.deepcopy(data)
+                del partial["elements"][element_index][field]
+                self._assert_invalid(
+                    partial,
+                    label=f"table_locator_missing_{field}",
+                    path=("elements", element_index),
+                )
+
+        wrong_kind = copy.deepcopy(data)
+        wrong_kind["elements"][element_index]["kind"] = "text"
+        self._assert_invalid(
+            wrong_kind,
+            label="table_locator_wrong_kind",
+            path=("elements", element_index, "kind"),
+        )
+
+        for field, duplicate in (
+            ("page_span", [1, 1]),
+            (
+                "page_bboxes",
+                [
+                    {"page_no": 1, "bbox": [100, 700, 900, 900]},
+                    {"page_no": 1, "bbox": [100, 700, 900, 900]},
+                ],
+            ),
+            ("model_table_indices", [0, 0]),
+            ("continuation_source_item_indices", [2, 2]),
+        ):
+            with self.subTest(duplicate_locator_field=field):
+                duplicated = copy.deepcopy(data)
+                duplicated["elements"][element_index][field] = duplicate
+                self._assert_invalid(
+                    duplicated,
+                    label=f"table_locator_duplicate_{field}",
+                    path=("elements", element_index, field),
+                )
+
+        del data["parser_diagnostics"]["table_reconciliation"][
+            "located_tables"
+        ]
+        self._assert_invalid(
+            data,
+            label="table_reconciliation_missing_counter",
+            path=("parser_diagnostics", "table_reconciliation"),
+        )
+
+    def test_non_supported_reconciliation_diagnostics_require_zero_counters(
+        self,
+    ) -> None:
+        data = _load_fixture("annual_report_excerpt")
+        stats = TableReconciliationStats(
+            model_status="absent", content_tables=2
+        ).as_dict()
+        stats["restored_groups"] = 99
+        data["parser_diagnostics"] = {"table_reconciliation": stats}
+        self._assert_invalid(
+            data,
+            label="absent_model_nonzero_counter",
+            path=(
+                "parser_diagnostics",
+                "table_reconciliation",
+                "restored_groups",
+            ),
+        )
+
+    def test_native_text_shadow_diagnostic_validates(self) -> None:
+        data = _load_fixture("short_announcement")
+        data["parser_diagnostics"] = {
+            "native_text_shadow": {
+                "status": "unavailable",
+                "error_code": "pdf_parse_error",
+            }
+        }
+        self._assert_valid(data, label="native_text_shadow_unavailable")
+
+        invalid_type = copy.deepcopy(data)
+        invalid_type["parser_diagnostics"]["native_text_shadow"]["error_code"] = 42
+        self._assert_invalid(
+            invalid_type,
+            label="native_text_shadow_bad_error_code",
+            path=("parser_diagnostics", "native_text_shadow", "error_code"),
+        )
+
+        unavailable_without_error = copy.deepcopy(data)
+        unavailable_without_error["parser_diagnostics"]["native_text_shadow"][
+            "error_code"
+        ] = None
+        self._assert_invalid(
+            unavailable_without_error,
+            label="native_text_shadow_unavailable_requires_error",
+            path=("parser_diagnostics", "native_text_shadow"),
+        )
+
+        for status in ("ok", "empty"):
+            available = copy.deepcopy(data)
+            available["parser_diagnostics"]["native_text_shadow"] = {
+                "status": status,
+                "error_code": None,
+            }
+            self._assert_valid(available, label=f"native_text_shadow_{status}")
+
+            available["parser_diagnostics"]["native_text_shadow"][
+                "error_code"
+            ] = "unexpected_error"
+            self._assert_invalid(
+                available,
+                label=f"native_text_shadow_{status}_rejects_error",
+                path=("parser_diagnostics", "native_text_shadow"),
+            )
 
     def test_optional_full_annual_fixture_validates_when_present(self) -> None:
         path = PHASE00_ROOT / "annual_report" / "normalized_ir.v2.json"

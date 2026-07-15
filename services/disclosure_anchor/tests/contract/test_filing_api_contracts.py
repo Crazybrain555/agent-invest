@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONTRACTS_ROOT = REPO_ROOT / "contracts"
 PUBLIC_MODELS_ROOT = CONTRACTS_ROOT / "public_models"
 DERIVED = {
-    "document_unit": {"asset_uri", "is_active_run"},
+    "document_unit": {"asset_uri"},
     "tracked_company": {
         "effective_lookback_days",
         "effective_sync_seconds",

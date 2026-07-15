@@ -20,7 +20,7 @@ created_at: 2026-06-26
 | 03 | 文件存储与 raw archive | raw store、atomic write、hash、register local PDF | 否 |
 | 04 | MinerU adapter 与 NormalizedIR | parser_artifacts、MinerU mapper、normalized_ir | 否 |
 | 04R | Phase000–004 返工 | 0007/0008 迁移、主体解析服务化、注册核心、IR v2、事件惯例、parse 加固、doctor | 否 |
-| 05 | document_unit builder 与 active run | text/table/qa units、载体规范化、publish 原子事务、diff 事件 | 否 |
+| 05 | document_unit builder 与 active run | text/table/qa/mixed units、载体规范化、publish 原子事务、diff 事件 | 否 |
 | 06 | Filing API 与 public contracts | API、OpenAPI、source_ref、changes、contract tests | 否 |
 | 07 | CNINFO 增量同步 | source adapter、index sync、download、checkpoint、重试 | 是 |
 | 08 | worker loop 与本地运行 | worker-once/loop、locks、reports、运行闭环 | 可选 |

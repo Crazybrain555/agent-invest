@@ -1,6 +1,6 @@
 {
-  "version": "2026-07-r4",
-  "_about": "年报章节受控词表（design/retrieval-and-semantic-keys.md §4）。两部法定来源：①《编报规则第15号——财务报告的一般规定》(2023) 的附注科目；②《年报准则第2号》(2021修订) 规定的正文目录结构（管理层讨论与分析各节、公司治理、环境社会、股份变动等）。names=标准名；aliases=旧准则/实务变体。匹配前剥离标题编号。",
+  "version": "2026-07-r16",
+  "_about": "年报章节受控词表（design/retrieval-and-semantic-keys.md §4）。来源包括：①《编报规则第15号——财务报告的一般规定》(2023) 的附注科目；②《年报准则第2号》(2021修订) 规定的正文目录结构（管理层讨论与分析各节、公司治理、环境社会、股份变动等）；③商业银行定期报告中受监管约束的贷款、存款、净利息、资本充足率与金融风险章节。names=标准名；aliases=旧准则/实务变体。匹配前剥离标题编号。",
   "keys": {
     "monetary_funds": {
       "names": [
@@ -13,7 +13,8 @@
         "交易性金融资产"
       ],
       "aliases": [
-        "以公允价值计量且其变动计入当期损益的金融资产"
+        "以公允价值计量且其变动计入当期损益的金融资产",
+        "以公允价值计量且其变动计入当期损益的金融投资"
       ]
     },
     "derivative_financial_assets": {
@@ -96,7 +97,8 @@
         "债权投资"
       ],
       "aliases": [
-        "持有至到期投资"
+        "持有至到期投资",
+        "以摊余成本计量的债务工具投资"
       ]
     },
     "other_debt_investments": {
@@ -115,7 +117,9 @@
       "names": [
         "长期股权投资"
       ],
-      "aliases": []
+      "aliases": [
+        "长期股权投资及共同经营"
+      ]
     },
     "other_equity_investments": {
       "names": [
@@ -154,6 +158,12 @@
     "biological_assets": {
       "names": [
         "生产性生物资产"
+      ],
+      "aliases": []
+    },
+    "borrowing_costs": {
+      "names": [
+        "借款费用"
       ],
       "aliases": []
     },
@@ -197,7 +207,8 @@
       "names": [
         "递延所得税资产",
         "递延所得税负债",
-        "递延所得税"
+        "递延所得税",
+        "递延所得税资产和负债"
       ],
       "aliases": []
     },
@@ -394,6 +405,7 @@
     "revenue_and_cost": {
       "names": [
         "营业收入和营业成本",
+        "营业收入及成本",
         "营业收入",
         "营业成本"
       ],
@@ -494,6 +506,14 @@
       "names": [
         "每股收益"
       ],
+      "aliases": [
+        "基本每股收益和稀释每股收益的计算过程"
+      ]
+    },
+    "income_statement_supplement": {
+      "names": [
+        "利润表补充资料"
+      ],
       "aliases": []
     },
     "cash_flow_note": {
@@ -503,7 +523,8 @@
         "现金和现金等价物"
       ],
       "aliases": [
-        "现金流量表附注"
+        "现金流量表附注",
+        "现金及现金等价物"
       ]
     },
     "owners_equity_change_note": {
@@ -552,8 +573,10 @@
         "其他重要的会计政策和会计估计"
       ],
       "aliases": [
+        "主要会计政策和会计估计",
         "重要会计政策和会计估计",
-        "重要会计政策、会计估计"
+        "重要会计政策、会计估计",
+        "同一控制下和非同一控制下企业合并的会计处理方法"
       ]
     },
     "accounting_changes": {
@@ -609,6 +632,7 @@
       ],
       "aliases": [
         "金融工具风险",
+        "金融风险管理",
         "套期",
         "金融资产转移"
       ]
@@ -618,14 +642,19 @@
         "公允价值的披露",
         "公允价值披露"
       ],
-      "aliases": []
+      "aliases": [
+        "金融工具的公允价值"
+      ]
     },
     "related_party_note": {
       "names": [
         "关联方及关联交易"
       ],
       "aliases": [
-        "关联方关系及交易"
+        "关联方关系及交易",
+        "关联方及关联方交易",
+        "关联方担保情况",
+        "关联方应收应付款项"
       ]
     },
     "share_based_payment_note": {
@@ -675,6 +704,7 @@
         "租赁"
       ],
       "aliases": [
+        "关联租赁情况",
         "经营租赁",
         "融资租赁"
       ]
@@ -699,7 +729,8 @@
         "净资产收益率"
       ],
       "aliases": [
-        "加权平均净资产收益率"
+        "加权平均净资产收益率",
+        "净资产收益率及每股收益"
       ]
     },
     "audit_opinion": {
@@ -723,7 +754,11 @@
       ],
       "aliases": [
         "主要会计数据和财务指标",
-        "主要财务指标"
+        "主要财务指标",
+        "补充财务指标",
+        "财务概要",
+        "财务业绩摘要",
+        "会计数据和财务指标摘要"
       ]
     },
     "business_review": {
@@ -838,7 +873,8 @@
       ],
       "aliases": [
         "公司治理的基本状况",
-        "治理专项行动"
+        "治理专项行动",
+        "治理信息"
       ]
     },
     "directors_management": {
@@ -869,7 +905,9 @@
       "aliases": [
         "社会责任",
         "环境保护",
-        "乡村振兴"
+        "乡村振兴",
+        "环境信息",
+        "环境、社会与治理情况综述"
       ]
     },
     "important_matters": {
@@ -890,20 +928,20 @@
     "bonds_section": {
       "names": [
         "债券相关情况",
-        "公司债券相关情况"
+        "公司债券相关情况",
+        "公司债券情况"
       ],
       "aliases": [
         "可转换公司债券",
-        "债券"
+        "债券",
+        "债券偿还"
       ]
     },
     "financial_report_chapter": {
       "names": [
         "财务报告"
       ],
-      "aliases": [
-        "财务报表"
-      ]
+      "aliases": []
     },
     "profit_distribution_plan": {
       "names": [
@@ -936,49 +974,79 @@
       "names": [
         "合并资产负债表"
       ],
-      "aliases": []
+      "aliases": [
+        "合并及公司资产负债表",
+        "合并及银行资产负债表"
+      ]
     },
     "balance_sheet_parent": {
       "names": [
         "母公司资产负债表"
       ],
-      "aliases": []
+      "aliases": [
+        "公司资产负债表",
+        "银行资产负债表"
+      ]
     },
     "income_statement": {
       "names": [
         "合并利润表"
       ],
-      "aliases": []
+      "aliases": [
+        "合并及公司利润表",
+        "合并及银行利润表"
+      ]
     },
     "income_statement_parent": {
       "names": [
         "母公司利润表"
       ],
-      "aliases": []
+      "aliases": [
+        "公司利润表",
+        "银行利润表"
+      ]
     },
     "cash_flow_statement": {
       "names": [
         "合并现金流量表"
       ],
-      "aliases": []
+      "aliases": [
+        "合并及公司现金流量表",
+        "合并及银行现金流量表"
+      ]
     },
     "cash_flow_statement_parent": {
       "names": [
         "母公司现金流量表"
       ],
-      "aliases": []
+      "aliases": [
+        "公司现金流量表",
+        "银行现金流量表"
+      ]
     },
     "equity_statement": {
       "names": [
         "合并所有者权益变动表"
       ],
-      "aliases": []
+      "aliases": [
+        "合并股东权益变动表",
+        "合并及公司股东权益变动表",
+        "合并及银行股东权益变动表",
+        "合并及公司所有者权益变动表",
+        "合并及银行所有者权益变动表"
+      ]
     },
     "equity_statement_parent": {
       "names": [
         "母公司所有者权益变动表"
       ],
-      "aliases": []
+      "aliases": [
+        "母公司股东权益变动表",
+        "公司股东权益变动表",
+        "银行股东权益变动表",
+        "公司所有者权益变动表",
+        "银行所有者权益变动表"
+      ]
     },
     "corporate_independence": {
       "names": [
@@ -1067,10 +1135,214 @@
       "names": [
         "合并财务报表项目注释",
         "财务报表项目注释",
-        "合并财务报表主要项目注释"
+        "合并财务报表主要项目注释",
+        "财务报表主要项目注释"
       ],
       "aliases": [
         "财务报表附注"
+      ]
+    },
+    "bank_interest_income": {
+      "names": [
+        "利息收入"
+      ],
+      "aliases": [
+        "贷款和垫款利息收入",
+        "投资利息收入"
+      ]
+    },
+    "bank_interest_expense": {
+      "names": [
+        "利息支出"
+      ],
+      "aliases": [
+        "客户存款利息支出"
+      ]
+    },
+    "bank_net_interest_income": {
+      "names": [
+        "净利息收入"
+      ],
+      "aliases": []
+    },
+    "bank_noninterest_income": {
+      "names": [
+        "非利息净收入"
+      ],
+      "aliases": []
+    },
+    "bank_fee_commission_income": {
+      "names": [
+        "手续费及佣金净收入"
+      ],
+      "aliases": [
+        "手续费及佣金收入"
+      ]
+    },
+    "bank_operating_expenses": {
+      "names": [
+        "业务及管理费"
+      ],
+      "aliases": []
+    },
+    "bank_loans_advances": {
+      "names": [
+        "贷款和垫款"
+      ],
+      "aliases": [
+        "客户贷款及垫款",
+        "发放贷款和垫款"
+      ]
+    },
+    "bank_customer_deposits": {
+      "names": [
+        "客户存款"
+      ],
+      "aliases": [
+        "吸收存款"
+      ]
+    },
+    "bank_investment_securities": {
+      "names": [
+        "投资证券及其他金融资产"
+      ],
+      "aliases": [
+        "投资证券"
+      ]
+    },
+    "bank_derivatives": {
+      "names": [
+        "衍生金融工具"
+      ],
+      "aliases": []
+    },
+    "bank_loan_quality": {
+      "names": [
+        "贷款质量"
+      ],
+      "aliases": [
+        "不良贷款分布情况",
+        "重组贷款情况",
+        "按五级分类划分的贷款分布情况"
+      ]
+    },
+    "bank_loan_loss_allowance": {
+      "names": [
+        "贷款损失准备"
+      ],
+      "aliases": [
+        "贷款减值准备"
+      ]
+    },
+    "bank_capital_adequacy": {
+      "names": [
+        "资本充足率情况",
+        "资本监管要求"
+      ],
+      "aliases": [
+        "资本充足率计算范围",
+        "资本构成信息披露"
+      ]
+    },
+    "credit_risk": {
+      "names": [
+        "信用风险"
+      ],
+      "aliases": [
+        "信用风险暴露余额"
+      ]
+    },
+    "liquidity_risk": {
+      "names": [
+        "流动性风险"
+      ],
+      "aliases": []
+    },
+    "market_risk": {
+      "names": [
+        "市场风险"
+      ],
+      "aliases": [
+        "交易账簿风险"
+      ]
+    },
+    "banking_book_interest_rate_risk": {
+      "names": [
+        "银行账簿利率风险"
+      ],
+      "aliases": []
+    },
+    "operational_risk": {
+      "names": [
+        "操作风险"
+      ],
+      "aliases": []
+    },
+    "bank_capital_management": {
+      "names": [
+        "资本管理"
+      ],
+      "aliases": []
+    },
+    "off_balance_sheet_exposure": {
+      "names": [
+        "表外项目"
+      ],
+      "aliases": [
+        "信贷承诺按合同到期日分析"
+      ]
+    },
+    "segment_information": {
+      "names": [
+        "分部经营业绩",
+        "分部信息"
+      ],
+      "aliases": [
+        "经营分部"
+      ]
+    },
+    "accounting_standard_differences": {
+      "names": [
+        "境内外会计准则差异"
+      ],
+      "aliases": [
+        "会计准则差异"
+      ]
+    },
+    "bank_asset_securitization_exposure": {
+      "names": [
+        "资产证券化风险暴露"
+      ],
+      "aliases": []
+    },
+    "overdue_debt": {
+      "names": [
+        "逾期未偿债务情况"
+      ],
+      "aliases": [
+        "逾期未偿债务"
+      ]
+    },
+    "comparative_information": {
+      "names": [
+        "比较数据"
+      ],
+      "aliases": []
+    },
+    "financial_statement_approval": {
+      "names": [
+        "财务报表的批准"
+      ],
+      "aliases": [
+        "财务报表批准"
+      ]
+    },
+    "supplementary_financial_information": {
+      "names": [
+        "未经审计财务报表补充资料"
+      ],
+      "aliases": [
+        "财务报表补充资料"
       ]
     },
     "financial_statements_section": {

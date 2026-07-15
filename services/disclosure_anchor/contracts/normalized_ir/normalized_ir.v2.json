@@ -159,6 +159,153 @@
         },
         "markdown_relpath": {
           "$ref": "#/$defs/relative_path"
+        },
+        "model_relpath": {
+          "$ref": "#/$defs/relative_path"
+        }
+      }
+    },
+    "parser_diagnostics": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "table_reconciliation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "algorithm_version",
+            "table_builder_semantics_version",
+            "model_status",
+            "model_hash",
+            "content_tables",
+            "model_tables",
+            "uniquely_matched_tables",
+            "ambiguous_matches",
+            "candidate_groups",
+            "proven_groups",
+            "unproven_groups",
+            "restoration_rejected_groups",
+            "unresolved_groups",
+            "located_groups",
+            "located_tables",
+            "restored_groups",
+            "restored_tables"
+          ],
+          "properties": {
+            "algorithm_version": {
+              "const": "mineru-aggregate-table-restore.v3"
+            },
+            "table_builder_semantics_version": {
+              "const": "table-builder-semantics.v2"
+            },
+            "model_status": {
+              "type": "string",
+              "enum": [
+                "absent",
+                "supported",
+                "unreadable",
+                "invalid_json",
+                "unsupported_schema"
+              ]
+            },
+            "model_hash": {
+              "type": ["string", "null"],
+              "pattern": "^sha256:[a-f0-9]{64}$"
+            },
+            "content_tables": {"type": "integer", "minimum": 0},
+            "model_tables": {"type": "integer", "minimum": 0},
+            "uniquely_matched_tables": {"type": "integer", "minimum": 0},
+            "ambiguous_matches": {"type": "integer", "minimum": 0},
+            "candidate_groups": {"type": "integer", "minimum": 0},
+            "proven_groups": {"type": "integer", "minimum": 0},
+            "unproven_groups": {"type": "integer", "minimum": 0},
+            "restoration_rejected_groups": {"type": "integer", "minimum": 0},
+            "unresolved_groups": {"type": "integer", "minimum": 0},
+            "located_groups": {"type": "integer", "minimum": 0},
+            "located_tables": {"type": "integer", "minimum": 0},
+            "restored_groups": {"type": "integer", "minimum": 0},
+            "restored_tables": {"type": "integer", "minimum": 0}
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": ["model_status"],
+                "properties": {"model_status": {"not": {"const": "supported"}}}
+              },
+              "then": {
+                "properties": {
+                  "model_tables": {"const": 0},
+                  "uniquely_matched_tables": {"const": 0},
+                  "ambiguous_matches": {"const": 0},
+                  "candidate_groups": {"const": 0},
+                  "proven_groups": {"const": 0},
+                  "unproven_groups": {"const": 0},
+                  "restoration_rejected_groups": {"const": 0},
+                  "unresolved_groups": {"const": 0},
+                  "located_groups": {"const": 0},
+                  "located_tables": {"const": 0},
+                  "restored_groups": {"const": 0},
+                  "restored_tables": {"const": 0}
+                }
+              }
+            },
+            {
+              "if": {
+                "required": ["model_status"],
+                "properties": {
+                  "model_status": {"enum": ["absent", "unreadable"]}
+                }
+              },
+              "then": {"properties": {"model_hash": {"type": "null"}}}
+            },
+            {
+              "if": {
+                "required": ["model_status"],
+                "properties": {
+                  "model_status": {
+                    "enum": ["supported", "invalid_json", "unsupported_schema"]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "model_hash": {
+                    "type": "string",
+                    "pattern": "^sha256:[a-f0-9]{64}$"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "native_text_shadow": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "error_code"],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": ["ok", "empty", "unavailable"]
+            },
+            "error_code": {
+              "type": ["string", "null"],
+              "minLength": 1
+            }
+          },
+          "oneOf": [
+            {
+              "properties": {
+                "status": {"enum": ["ok", "empty"]},
+                "error_code": {"type": "null"}
+              }
+            },
+            {
+              "properties": {
+                "status": {"const": "unavailable"},
+                "error_code": {"type": "string", "minLength": 1}
+              }
+            }
+          ]
         }
       }
     },
@@ -302,10 +449,84 @@
           "table_footnote": {
             "type": "array"
           },
+          "page_span": {
+            "type": "array",
+            "prefixItems": [
+              {"type": "integer", "minimum": 1},
+              {"type": "integer", "minimum": 1}
+            ],
+            "items": false,
+            "minItems": 2,
+            "maxItems": 2,
+            "uniqueItems": true
+          },
+          "page_bboxes": {
+            "type": "array",
+            "minItems": 2,
+            "uniqueItems": true,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["page_no", "bbox"],
+              "properties": {
+                "page_no": {"type": "integer", "minimum": 1},
+                "bbox": {
+                  "type": "array",
+                  "prefixItems": [
+                    {"type": "number"},
+                    {"type": "number"},
+                    {"type": "number"},
+                    {"type": "number"}
+                  ],
+                  "items": false,
+                  "minItems": 4,
+                  "maxItems": 4
+                }
+              }
+            }
+          },
+          "model_table_indices": {
+            "type": "array",
+            "minItems": 2,
+            "uniqueItems": true,
+            "items": {"type": "integer", "minimum": 0}
+          },
+          "continuation_source_item_indices": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "integer", "minimum": 0}
+          },
+          "table_locator_algorithm": {
+            "const": "mineru-aggregate-table-restore.v3"
+          },
           "image_path": {
             "type": "string"
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "anyOf": [
+                {"required": ["page_span"]},
+                {"required": ["page_bboxes"]},
+                {"required": ["model_table_indices"]},
+                {"required": ["continuation_source_item_indices"]},
+                {"required": ["table_locator_algorithm"]}
+              ]
+            },
+            "then": {
+              "required": [
+                "page_span",
+                "page_bboxes",
+                "model_table_indices",
+                "continuation_source_item_indices",
+                "table_locator_algorithm"
+              ],
+              "properties": {"kind": {"const": "table"}}
+            }
+          }
+        ]
       }
     }
   }

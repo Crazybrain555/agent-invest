@@ -10,12 +10,17 @@ from disclosure_anchor.api.pagination import (
     encode_unit_cursor,
 )
 from disclosure_anchor.api.routers.units import (
+    _validate_semantic_key,
+    _validate_semantic_key_list,
     get_unit,
     get_unit_context,
     get_unit_source_ref,
     list_document_units,
 )
-from disclosure_anchor.domain.services.unit_hashing import canonical_json, sha256_prefixed
+from disclosure_anchor.domain.services.unit_hashing import (
+    canonical_json,
+    sha256_prefixed,
+)
 
 
 def _document_row() -> dict:
@@ -192,7 +197,13 @@ class FilingApiUnitTests(unittest.TestCase):
             [
                 [_document_row()],
                 [_unit_row("asset_1")],
-                [{"processing_run_id": "run_failed", "status": "failed", "unit_build_status": "failed"}],
+                [
+                    {
+                        "processing_run_id": "run_failed",
+                        "status": "failed",
+                        "unit_build_status": "failed",
+                    }
+                ],
             ]
         )
 
@@ -206,15 +217,27 @@ class FilingApiUnitTests(unittest.TestCase):
             "asset://disclosure_anchor/v1/document_unit/asset_1",
         )
         self.assertEqual(engine.params[1]["processing_run_id"], "run_active")
-        self.assertIn("ORDER BY u.order_index ASC, u.asset_id ASC", engine.statements[1])
+        self.assertIn(
+            "ORDER BY u.order_index ASC, u.asset_id ASC", engine.statements[1]
+        )
 
     def test_document_units_explicit_history_run_is_resolved(self) -> None:
         engine = _Engine(
             [
                 [_document_row()],
                 [{"exists": 1}],
-                [_unit_row("asset_old", processing_run_id="run_old", is_active_run=False)],
-                [{"processing_run_id": "run_active", "status": "succeeded", "unit_build_status": "succeeded"}],
+                [
+                    _unit_row(
+                        "asset_old", processing_run_id="run_old", is_active_run=False
+                    )
+                ],
+                [
+                    {
+                        "processing_run_id": "run_active",
+                        "status": "succeeded",
+                        "unit_build_status": "succeeded",
+                    }
+                ],
             ]
         )
 
@@ -237,7 +260,9 @@ class FilingApiUnitTests(unittest.TestCase):
             list_document_units("doc_1", _request(_Engine([[document]])))
 
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertEqual(caught.exception.detail["error_code"], "L1_PROCESSING_REQUIRED")
+        self.assertEqual(
+            caught.exception.detail["error_code"], "L1_PROCESSING_REQUIRED"
+        )
         self.assertEqual(caught.exception.detail["detail"], {"status": "parsed"})
 
     def test_heading_prefix_uses_candidate_and_exact_prefix_predicates(self) -> None:
@@ -245,7 +270,13 @@ class FilingApiUnitTests(unittest.TestCase):
             [
                 [_document_row()],
                 [_unit_row("asset_1")],
-                [{"processing_run_id": "run_active", "status": "succeeded", "unit_build_status": "succeeded"}],
+                [
+                    {
+                        "processing_run_id": "run_active",
+                        "status": "succeeded",
+                        "unit_build_status": "succeeded",
+                    }
+                ],
             ]
         )
 
@@ -264,12 +295,90 @@ class FilingApiUnitTests(unittest.TestCase):
         self.assertEqual(engine.params[1]["heading_prefix_json"], '["第一节","风险"]')
         self.assertEqual(engine.params[1]["payload_kind"], "text")
 
+    def test_semantic_filters_cover_scalar_and_array_keys(self) -> None:
+        engine = _Engine(
+            [
+                [_document_row()],
+                [_unit_row("asset_1")],
+                [
+                    {
+                        "processing_run_id": "run_active",
+                        "status": "succeeded",
+                        "unit_build_status": "succeeded",
+                    }
+                ],
+            ]
+        )
+
+        list_document_units(
+            "doc_1",
+            _request(engine),
+            semantic_key="risk",
+            semantic_keys_any="risk, revenue ,risk",
+            semantic_keys_all="risk,governance",
+        )
+
+        sql = engine.statements[1]
+        self.assertIn("u.semantic_key = :semantic_key OR jsonb_exists", sql)
+        self.assertIn("jsonb_exists_any", sql)
+        self.assertIn("jsonb_exists_all", sql)
+        self.assertEqual(engine.params[1]["semantic_keys_any"], ["risk", "revenue"])
+        self.assertEqual(engine.params[1]["semantic_keys_all"], ["risk", "governance"])
+
+    def test_semantic_key_list_validation_is_bounded_and_rejects_empty_items(
+        self,
+    ) -> None:
+        with self.assertRaises(HTTPException) as caught:
+            _validate_semantic_key_list("semantic_keys_any", "risk,,revenue")
+        self.assertEqual(caught.exception.status_code, 422)
+
+        with self.assertRaises(HTTPException):
+            _validate_semantic_key_list(
+                "semantic_keys_all", ",".join(f"key{index}" for index in range(51))
+            )
+        with self.assertRaises(HTTPException):
+            _validate_semantic_key_list("semantic_keys_any", "x" * 129)
+
+    def test_semantic_key_filters_reject_non_contract_and_control_characters(
+        self,
+    ) -> None:
+        for value in (
+            "risk\x00key",
+            "risk\n,revenue",
+            "risk\t,revenue",
+            "risk\r,revenue",
+            "risk\x85,revenue",
+            "risk\u00a0,revenue",
+            "Risk",
+            "risk-key",
+            "风险",
+            "_risk",
+        ):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(HTTPException) as caught:
+                    _validate_semantic_key("semantic_key", value)
+                self.assertEqual(caught.exception.status_code, 422)
+                with self.assertRaises(HTTPException) as list_caught:
+                    _validate_semantic_key_list("semantic_keys_any", value)
+                self.assertEqual(list_caught.exception.status_code, 422)
+
+        self.assertEqual(
+            _validate_semantic_key("semantic_key", "cash_flow_note_2"),
+            "cash_flow_note_2",
+        )
+
     def test_unit_cursor_uses_row_comparison(self) -> None:
         engine = _Engine(
             [
                 [_document_row()],
                 [_unit_row("asset_2", order_index=2)],
-                [{"processing_run_id": "run_active", "status": "succeeded", "unit_build_status": "succeeded"}],
+                [
+                    {
+                        "processing_run_id": "run_active",
+                        "status": "succeeded",
+                        "unit_build_status": "succeeded",
+                    }
+                ],
             ]
         )
 
@@ -288,9 +397,13 @@ class FilingApiUnitTests(unittest.TestCase):
 
     def test_unit_get_and_source_ref_get(self) -> None:
         unit = get_unit("asset_1", _request(_Engine([[_unit_row("asset_1")]])))
-        self.assertEqual(unit.asset_uri, "asset://disclosure_anchor/v1/document_unit/asset_1")
+        self.assertEqual(
+            unit.asset_uri, "asset://disclosure_anchor/v1/document_unit/asset_1"
+        )
 
-        source_ref = get_unit_source_ref("asset_1", _request(_Engine([[_source_ref_row()]])))
+        source_ref = get_unit_source_ref(
+            "asset_1", _request(_Engine([[_source_ref_row()]]))
+        )
         self.assertEqual(source_ref.contract_version, "source_ref.v1")
         self.assertEqual(source_ref.unit_content_hash, "sha256:" + "b" * 64)
 

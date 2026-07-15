@@ -50,6 +50,7 @@ class _ArtifactRelpaths:
     artifact_root: Path
     content_list: Path
     markdown: Path | None
+    model: Path | None
 
 
 @dataclass(frozen=True)
@@ -107,12 +108,14 @@ class ParseDocument:
                 artifact_root=parser_result.artifact_root,
                 content_list_path=parser_result.content_list_path,
                 markdown_path=parser_result.markdown_path,
+                model_path=parser_result.model_path,
             )
             normalized_ir = dict(parser_result.normalized_ir)
             normalized_ir["parser_artifacts"] = artifact_relpath_map(
                 artifact_root_relpath=artifact_relpaths.artifact_root,
                 content_list_relpath=artifact_relpaths.content_list,
                 markdown_relpath=artifact_relpaths.markdown,
+                model_relpath=artifact_relpaths.model,
             )
             parsed_pages = dict(normalized_ir.get("parsed_pages") or {})
             parsed_pages["full_pdf"] = (
@@ -348,6 +351,7 @@ class ParseDocument:
         artifact_root: Path,
         content_list_path: Path,
         markdown_path: Path | None,
+        model_path: Path | None,
     ) -> _ArtifactRelpaths:
         def relpath(path: Path) -> Path:
             return artifact_root_relpath / path.relative_to(artifact_root_path)
@@ -356,6 +360,7 @@ class ParseDocument:
             artifact_root=relpath(artifact_root),
             content_list=relpath(content_list_path),
             markdown=relpath(markdown_path) if markdown_path is not None else None,
+            model=relpath(model_path) if model_path is not None else None,
         )
 
     def _finish_run(
@@ -505,6 +510,7 @@ def artifact_relpath_map(
     artifact_root_relpath: Path,
     content_list_relpath: Path,
     markdown_relpath: Path | None,
+    model_relpath: Path | None = None,
 ) -> dict[str, str]:
     artifacts = {
         "artifact_root_relpath": str(artifact_root_relpath),
@@ -512,4 +518,6 @@ def artifact_relpath_map(
     }
     if markdown_relpath is not None:
         artifacts["markdown_relpath"] = str(markdown_relpath)
+    if model_relpath is not None:
+        artifacts["model_relpath"] = str(model_relpath)
     return artifacts

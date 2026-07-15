@@ -48,7 +48,8 @@ short_announcement.pdf   短公告，验证少量事项型 text/table
 ```text
 mineru_raw 或简化 parser output
 normalized_ir.v2.json（04R-R5 起；R5 前为 .v1。再生成协议 = 04R §6.4，
-  脚本 scripts/regen_phase00_fixtures.py，document_id 保持 phase00_<key> 不变）
+  脚本 scripts/regen_phase00_fixtures.py，document_id 保持 phase00_<key> 不变；不带参数会从
+  本地 source content_list/model artifact 重跑 reader→reconciler→mapper→builder）
 document_units.v1.jsonl（unit builder 到 05 才存在，04R 阶段禁止再生成）
 manual_review.md
 ```
@@ -105,6 +106,12 @@ quality_status 是否变化
 ```
 
 只有 unit content_hash 变化，才视为 L2 需要重处理。
+
+仅修改 builder 规则、且要保持已提交 IR 作为固定输入时，使用
+`PYTHONPATH=src .venv/bin/python scripts/regen_phase00_fixtures.py --units-only`；该模式只重建
+`document_units.v1.jsonl`。parser/reader/reconciler/mapper 变化必须去掉 `--units-only`，从本地
+source artifact 重跑全链；若 source artifact 不在 clean checkout，则以真实样本测试覆盖全链，
+并明确记录 committed IR 只是兼容 fixture，不能把 builder-only 再生成冒充 parser 回归。
 
 ## 5. 人工复核报告格式
 

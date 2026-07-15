@@ -15,6 +15,7 @@ class MinerUArtifacts:
     root: Path
     content_list_path: Path
     markdown_path: Path | None
+    model_path: Path | None
 
 
 class MinerUArtifactReader:
@@ -41,10 +42,15 @@ class MinerUArtifactReader:
         content_list_path = content_lists[0]
         markdowns = sorted(content_list_path.parent.glob("*.md"))
         markdown_path = markdowns[0] if markdowns else None
+        model_name = content_list_path.name.removesuffix(
+            "_content_list.json"
+        ) + "_model.json"
+        model_candidate = content_list_path.with_name(model_name)
         return MinerUArtifacts(
             root=content_list_path.parent,
             content_list_path=content_list_path,
             markdown_path=markdown_path,
+            model_path=model_candidate if model_candidate.is_file() else None,
         )
 
     def read_content_list(self, content_list_path: Path) -> list[dict[str, Any]]:

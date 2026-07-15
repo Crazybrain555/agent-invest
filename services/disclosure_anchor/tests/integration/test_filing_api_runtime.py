@@ -429,6 +429,26 @@ class FilingApiRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(unit_payload["warning"], "LATEST_PROCESSING_FAILED")
 
+        semantic_responses = []
+        for query in (
+            {"semantic_key": "governance", "limit": 10},
+            {"semantic_keys_any": "missing,governance", "limit": 10},
+            {"semantic_keys_all": "risk_factor,governance", "limit": 10},
+        ):
+            response = _api_request(
+                self.app,
+                "GET",
+                f"/v1/documents/{seeded['document_id']}/units",
+                query=query,
+            )
+            self.assertEqual(response.status_code, 200, response.body)
+            payload = response.json()
+            self.assertEqual(
+                [item["asset_id"] for item in payload["items"]],
+                [seeded["prefix_asset_id"]],
+            )
+            semantic_responses.append(payload)
+
         active_unit = _api_request(
             self.app,
             "GET",
@@ -498,6 +518,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
             source_ref,
             context_payload,
             bad_cursor.json(),
+            *semantic_responses,
         ):
             _assert_no_leaks(self, self.settings, payload)
 
@@ -644,6 +665,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
         heading_path: list[str],
         payload: dict[str, Any],
         title: str,
+        semantic_keys: list[str] | None = None,
     ) -> None:
         self.asset_ids.append(asset_id)
         with self.engine.begin() as conn:
@@ -652,10 +674,11 @@ class FilingApiRuntimeTests(unittest.TestCase):
                     "INSERT INTO disclosure_core.document_unit "
                     "(asset_id, document_id, processing_run_id, provider_document_id, "
                     "payload_kind, heading_path, title, order_index, semantic_key, "
-                    "payload, content_hash, query_projection_hash) "
+                    "semantic_keys, payload, content_hash, query_projection_hash) "
                     "VALUES (:asset_id, :document_id, :run_id, :provider_document_id, "
                     "'text', CAST(:heading_path AS jsonb), :title, :order_index, "
-                    "'risk_factor', CAST(:payload AS jsonb), :content_hash, "
+                    "'risk_factor', CAST(:semantic_keys AS jsonb), "
+                    "CAST(:payload AS jsonb), :content_hash, "
                     ":query_projection_hash)"
                 ),
                 {
@@ -665,6 +688,9 @@ class FilingApiRuntimeTests(unittest.TestCase):
                     "provider_document_id": provider_document_id,
                     "heading_path": json.dumps(heading_path, ensure_ascii=False),
                     "title": title,
+                    "semantic_keys": json.dumps(
+                        semantic_keys or ["risk_factor"], ensure_ascii=True
+                    ),
                     "order_index": order_index,
                     "payload": json.dumps(payload, ensure_ascii=False),
                     "content_hash": f"sha256:{asset_id}",
@@ -726,6 +752,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
             heading_path=["第一节", "风险", "详情"],
             payload=prefix_payload,
             title="风险提示",
+            semantic_keys=["risk_factor", "governance"],
         )
         self._insert_unit(
             asset_id=counter_asset_id,
@@ -736,6 +763,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
             heading_path=["风险", "第一节"],
             payload={"text": "containment counterexample"},
             title="误匹配样本",
+            semantic_keys=["risk_factor"],
         )
         self._insert_unit(
             asset_id=history_asset_id,

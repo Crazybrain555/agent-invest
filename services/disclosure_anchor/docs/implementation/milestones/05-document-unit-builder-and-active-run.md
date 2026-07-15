@@ -32,16 +32,18 @@ delivers_to: milestone 06
 - **U2 三哈希分层（unit 级；实现为 domain service `domain/services/unit_hashing.py`；
   canonical_json = `json.dumps(sort_keys=True, ensure_ascii=False,
   separators=(",", ":"))`）**。跨进程稳定性测试形态定死：新建
-  `tests/fixtures/unit_hashing/golden_hashes.json`——固定 3 组输入（text/table/qa 各一，
-  含中文与 null semantic_key）及期望三哈希 hex，`tests/unit/test_unit_hashing.py`
+  `tests/fixtures/unit_hashing/golden_hashes.json`——固定 4 组输入（text/table/qa/mixed 各一，
+  含中文、历史 nullable semantic_key 兼容例及 mixed part 注解）与期望三哈希 hex，`tests/unit/test_unit_hashing.py`
   重算断言相等（期望值固化在文件里即保证跨进程/跨版本稳定）：
 
 ```text
-content_hash          = "sha256:" + sha256(canonical_json({payload_kind, payload}))
-                        纯内容身份。不含 title/heading_path/order_index/semantic_key/
-                        artifact_locator——标题识别与切分规则升级不得伪装成内容变化
+content_hash          = "sha256:" + sha256(canonical_json({payload_kind, content_payload}))
+                        纯内容身份。不含 title/heading_path/order_index/semantic_key(s)/
+                        applicability/quality/artifact_locator；mixed 另排除 semantic_type、part order、
+                        local_heading/heading_path/applicability/quality_status 等规则注解
 query_projection_hash = "sha256:" + sha256(canonical_json({payload_kind, title,
-                        heading_path, semantic_key, quality_status}))
+                        heading_path, semantic_key, semantic_keys, quality_status,
+                        applicability[, mixed_part_annotations]}))
                         public 查询投影身份：这些字段不是内容，但 L2 按它们检索/路由，
                         规则升级改变投影时必须可产生事件（落 document_unit 列，0007）
 structure_hash        = "sha256:" + sha256(canonical_json({payload_kind, heading_path,
@@ -62,7 +64,8 @@ structure_hash        = "sha256:" + sha256(canonical_json({payload_kind, heading
 
 ```text
 第一层 multiset：old/new 各按 key=(payload_kind, content_hash) 计数（Counter）
-第二层稳定配对：同 key 的 old/new units 各按 (order_index, asset_id) 排序后逐个配对
+第二层稳定配对：同 key 内先按相同 query_projection_hash 做 multiset 精确配对；剩余 old/new
+  再各按 (order_index, asset_id) 排序后逐个配对，避免重复内容仅因位置漂移产生假投影事件
   未配对 new   → document_unit_created（materialized）
                  payload {new_asset_id, new_processing_run_id, content_hash, payload_kind,
                           new_order_index, new_heading_path}
@@ -74,8 +77,8 @@ structure_hash        = "sha256:" + sha256(canonical_json({payload_kind, heading
                → document_unit_projection_changed（materialized）
                  payload {old_asset_id, new_asset_id, content_hash,
                           old/new_query_projection_hash, changed_fields[]}
-                 changed_fields 词表固定 = {title, heading_path, semantic_key,
-                 quality_status} 的子集，逐字段比较旧/新值得出（payload_kind 在配对
+                 changed_fields 词表固定 = {title, heading_path, semantic_key, semantic_keys,
+                 quality_status, applicability, mixed_part_annotations} 的子集，逐字段比较旧/新值得出（payload_kind 在配对
                  key 中不可能变）
   配对且投影相同 → 不发事件（内容与投影都没变；旧 asset_id 永远可解析，L2 引用不失效）
 processing_run_published  每次发布 1 条：
@@ -126,6 +129,7 @@ processing_run_published payload = {previous_processing_run_id|null, content_has
 前置校验错误码闭集（沿用 04R 结构化错误 JSON 形状，stage='build_units'，retryable=false）：
 `RUN_NOT_FOUND`（run 不存在）/ `RUN_NOT_SUCCEEDED` / `IR_MISSING`（normalized_ir_relpath
 缺失或不可读）/ `IR_CONTRACT_TOO_OLD`（contract_version 非 normalized_ir.v2，指引重新 parse）/
+`IR_TABLE_BUILDER_SEMANTICS_MISMATCH`（表恢复证明与当前 S5 语义版本不兼容，必须重新 parse）/
 `UNITS_ALREADY_BUILT`（该 run 已有 unit——unit 不可变，重建走新 run）。
 
 按序七个阶段（每阶段独立纯函数，输入输出可单测）：
@@ -178,10 +182,11 @@ heading_path = 祖先标题原文列表（保留编号前缀，与 golden fixtur
 `text` unit；显式编号条目多且长时按条目拆分；长而无内部结构的小节保持单 unit（§8.2，
 不做字符数/token 切分）。`title` = 最近标题文本。
 
-**S4 qa builder**（2026-07-05 评审修订：qa 识别对**全部 filing_type** 生效，稳定性三判据 +
-needs_review 兜底防误报——问询函回复等问答密集文档同样受益；实证 16+ 真实文件年报/审计/
-季报零误报。原"投关/说明会触发"限定只保留在 S2 的 qa_heading_mode——该模式下编号标题
-不入 heading 树，防问句累积成 heading_path）：
+**S4 qa builder**（qa 识别对全部 filing_type 运行，但边界强度分层）：投关记录/业绩说明会
+允许“编号问句 + 无显式答标签的连续正文”；其他 filing_type 必须同时出现明确 `答/回复/A:`
+才生成 QA，避免把年报里的审计职责、声明或判断条件误拆成问答。原“投关/说明会触发”还限定
+S2 的 qa_heading_mode——该模式下编号标题不入 heading 树，防问句累积成 heading_path；所有
+模式仍使用下述稳定性判据与 needs_review 兜底：
 
 ```text
 问题起始：^\s*(问题|问|Q\d*|投资者提问|提问)\s*\d*\s*[：:] 或
@@ -192,9 +197,12 @@ needs_review 兜底防误报——问询函回复等问答密集文档同样受�
       "投资者关系活动主要内容介绍" cell 里——按行拆后套同一规则）
 产出：每个 Q&A 对一个 qa unit，payload = {question, answer, raw_text}
       （与 golden fixtures 契约一致）
-"边界不稳"闭合判据（命中任一 → 整块存 text + needs_review，不硬拆）：
+前缀/尾段保全：首个问题前的表单元数据、会议说明或上一问尾段单独保留为 text，不阻断其后
+完整 QA；若至少已有一个完整 QA，块尾因分页/跨表只剩“有问无答”的截断问题，则保留已闭合
+QA，并把尾段单独存为 text + needs_review。结构化表格本体始终保留，QA 只是其检索投影。
+"边界不稳"闭合判据（命中任一 → 除上述可证明的块尾截断外，整块存 text + needs_review）：
   (a) 出现回答起始行但其前无未配对的问题起始；
-  (b) 问题起始后直到下一问题起始/块尾无任何非空文本（有问无答）；
+  (b) 问题起始后到下一问题起始无任何非空文本，或首个/唯一问题到块尾仍有问无答；
   (c) 同一问题区间内出现 ≥2 个回答起始行
 全部模式用 re.match，不启用 IGNORECASE（Q/A 仅匹配大写）
 ```
@@ -234,8 +242,10 @@ service-purpose §9.2 其余类目首版**一律保留**（拿不准 → 保留�
 RULES_VERSION。**「重要提示」「风险提示」标题的板块必须生成 unit**，不得按标签跳过
 （协议 §3.5，有专门测试）。跳过项记入 build 统计（S8 报告），不写 DB。
 
-**S7 semantic_key + quality_status**：semantic_key 由规则表给出（未命中 = null，禁止自由
-发明）。首版规则表定死（rules.py `SEMANTIC_KEY_RULES`，按序首个命中；匹配对象 = title +
+**S7 semantic_key + quality_status（首版历史规则；由 §8.5 ub-2026.07-26 取代）**：
+semantic_key 由规则表给出（首版未命中 = null，禁止自由发明；当前未命中使用真实通用键
+`document_content`，新产物 scalar/array 均非空）。首版规则表定死
+（rules.py `SEMANTIC_KEY_RULES`，按序首个命中；匹配对象 = title +
 heading_path 末两级 + table caption 首项，qa 另加 question）：
 
 ```text
@@ -262,12 +272,13 @@ cell 拼接）去空白后为空 → unusable；(Unicode 类别 C*（\n\t\r 除�
 2. 快照写临时路径 → fsync → 原子 rename 到 document_units_snapshot_relpath →
    校验（基准定死）：重新打开快照文件，行数 == len(units) 且重算 sha256 ==
    ArtifactWriteResult.artifact_hash；任一不符按 ARTIFACT_WRITE_FAILED 处理。
-   快照行顶层键集 = {artifact_locator, asset_id, content_hash, document_id, heading_path,
-   order_index, payload, payload_kind, quality_status, semantic_key, title}
+   快照行顶层键集 = {applicability, artifact_locator, asset_id, content_hash, document_id,
+   heading_path, order_index, page_no, payload, payload_kind, quality_status, semantic_key,
+   semantic_keys, title}
    （structure_hash/query_projection_hash 只在 DB 列，不进快照）。
-   build 统计落点定死：ArtifactStore.write_json_atomic 写快照同目录 `build_stats.v1.json`
-   （键：generated_by_kind / dropped_by_kind / dropped_unknown_by_raw_kind /
-   skipped_sections / merged_tables / needs_review_count / unusable_count），
+   build 统计落点定死：ArtifactStore.write_json_atomic 写快照同目录 `build_stats.v1.json`；
+   顶层键集由 `BuildStats.as_dict()` 与 fixture contract 守护（当前 33 键，覆盖生成/丢弃、标题与
+   表格恢复、native-text/QA 恢复、公告号合并去重、needs_review/unusable），
    CLI 同时打印该 JSON 到 stdout；不加 DB 列
 3. 开 DB 事务：DocumentUnitRepository.add_many（新增仓储方法，含 list_by_processing_run、
    list_by_document_active）；order_index 从 1 开始步长 1 全文档递增（与 golden fixtures
@@ -373,10 +384,11 @@ announcement_date 取文件名/文首日期）：
 U5 multiset 配对 diff（重复 hash、仅投影变化、仅结构变化三分支）；事件 subject_kind/change_kind。
 集成（DB-gated）：build→publish 全链、幂等重发布、发布失败回滚、事件可从 change_events_v1
 读回且 subject_ref/change_kind 正确（期望值 = U5 定死的取值表）。
-契约（键集断言定死，防两个真相源打架）：快照每行**顶层键集** == S8 步骤 2 的 11 键集合
+契约（键集断言定死，防两个真相源打架）：快照每行**顶层键集** == S8 步骤 2 的 14 键集合
 （与 phase00 fixture 顶层一致）；**payload 内层键集按 kind 断言**：text={text}（image 壳=
 {image_ref, caption, context}）、qa={question, answer, raw_text}、table={caption, unit,
-headers, rows, notes}（table_parse_failed 时={caption, raw_html, notes}）。
+headers, rows, notes}（table_parse_failed 时={caption, raw_html, notes}）；mixed 至少为
+{semantic_type, parts}，parts 保留有序 kind/content 与局部标题/适用性/质量注解。
 phase00 fixtures 的 payload 内层是 v1 历史形态（{format,page_no,text} 等），
 **不作为 05 payload 契约来源**，payload 内层不与 fixture 比较。
 
@@ -627,6 +639,132 @@ ub-2026.07-9 代并 prune；门禁全绿。
   普通标题树、普通 QA 和非 native 元素不受影响。
 - 真实 content_list→mapper→builder 重放为 `3 table + 2 text + 10 qa`，6 条经营亮点、Q1–Q10、
   Q10 跨页尾段、footer 与附件全部保留，`needs_review=0`，无 mixed 合并和“公告头信息”。
+
+### ub-2026.07-25（2026-07-15：标题树、报表锚定与两层边界收敛）
+
+- **不是 MinerU 单点故障**：9 份真实 normalized IR 重放证明，主要错因是 builder 把跨页
+  缩进当层级、内部标题栈曾受公开 4 级 breadcrumb 上限截断，以及 S8 用 8k 反向寻找最浅
+  祖先。MinerU 的原始标题/页码/bbox 足以确定性恢复；不需要为这些缺陷重新执行 OCR。
+- **标题树**：内部栈保持完整深度，公开 heading_path 仍投影前 4 级；同编号族连续性优先于
+  换页缩进；支持 `3.2/3.9.1` 大纲与无编号银行报告大章；问号、声明、脚注、年份噪声永不
+  进栈。财务报表首表与审计责任为兄弟，后续报表互为兄弟，`一、公司简介`式附注重启会
+  关闭报表 run。
+- **报表页眉恢复**：只有同页、视觉位于表格上方、水平相交且 exact 命中受控报表词表的
+  单一 page_furniture 才补为 table caption；0/多候选不猜，显式 caption 优先。银行/公司/
+  合并及公司等报表别名进入 note_key_map（当时 r6；当前 r16）；`财务报表`改为 exact-only，避免把“注册会计师
+  对财务报表审计的责任”误标为父节。结构树只接受完整受控报表标题（可带审计状态、年度/
+  日期前缀和括号/横线“续”），包含“利润表内确认的金额”或多个页码的目录句不得开报表根；
+  计数 `recovered_statement_captions` 进入 build_stats。
+- **caption 持续边界**：编号且命中受控科目的 table caption 会更新 S2 当前结构栈，使其后的
+  caption-less 正文/表格继续归入新科目；不再只在 S8 修正 caption 表本身后回落到旧 sibling。
+- **S8 当前规则覆盖 §8.5 的历史第 3 条**：结构决定边界，8k 只作 mixed 主文本硬上限，
+  另设 24 parts 硬上限；有多级标题时至少停在二级业务标题，并下钻到最深受控科目，不跨
+  科目把母公司附注或管理层整章并成一个 unit。原子 slice 自身超限时保持原 kind，由 L2
+  context packaging 处理。商誉模板以“（n）为商誉减值测试的目的”为资产组实例边界。
+- **语义空值（当时规则；由下一节 ub-2026.07-26 取代）**：S7 当时输出真实键数组或
+  `semantic_keys=[]`，单值仍允许 NULL；当前新产物改为 `document_content` 非空兜底且 scalar
+  必须属于 array。多值召回由 Filing API 的 `semantic_keys_any/all` 承担。
+- 真实重放：`1217576500` 维持 `3 table + 2 text + 10 qa` 且全单元有
+  `investor_communication`；`1222948914` 的 6 个报表页眉恢复，`38. 会计政策变更` 从错误
+  44 parts 审计链缩回 3 parts；`1223121668` 的商誉测试从 52-part 单块恢复为 25 个资产组
+  实例（每组最多 4 parts）。
+
+### ub-2026.07-26（2026-07-15：跨载体 QA 与非空语义路由）
+
+- `_qa_lines` 不再把 `Q4/P4/V12` 或 `2.0` 型号拆成编号；支持同一表格单元格内的
+  `Q:…A:…Q:` / `Q11、…回复:` 显式边界。表格派生 QA 始终要求明确答复标记，并在解析视图
+  内去重 MinerU 合并单元格的重复展开，原 table payload 不变。
+- QA 状态机以外层题号和显式答复共同定界：长题干、换行题干、Q10 下的 1/2/3/4 子问题均
+  保持一个 question；损坏的领先回答可在下一条强问题处重同步，不再因第二个“答”清空整段。
+  table→text / text→table 的高置信跨载体问答可恢复为 `needs_review` QA；无法证明完整性的
+  截断答案保留原 evidence 并降级，绝不标 `ok`。
+- S7 在没有更窄规则/词表/事件键时写入真实通用键 `document_content`；因此新产物的
+  `semantic_key` 与 `semantic_keys` 都非空，且 scalar 始终属于 array。数据库列仍可空只为
+  历史 run 兼容，不用伪造的 `unknown`。
+
+### ub-2026.07-27 〜 -31（2026-07-15：多公司、多文类真实语料审计收敛）
+
+- **-27〜-30 中间轮次**：连续重放投关、年报、审计报告、债券与普通公告，收敛原生文本
+  direct-QA、正式表单门控、声明/报表/附注 sibling 标题树、公告头及页眉噪声、受控 caption
+  锚定；note_key_map 在该轮升至 r11（169 键；当前 r16/173 键、389 标签），event_key_map 保持 r2
+  （35 键）。这些
+  同日版本是语料发现环的可复现中间代，不再作为上线目标代。
+- **-31 最终 builder 代**：以最多 3 个物理 carrier、显式 QA 信号、同章节与顺序距离为界，
+  在独立 logical view 中恢复 table→heading→text / text→table→text 连续问答；普通正文、业务表、
+  footer 和附件均 fail-closed。恢复结果标 `needs_review`，原 table/text evidence 不被删除。
+- 无标题投关 QA 固定锚到正式表单段 `投资者关系活动主要内容介绍`，不再把 question 自身当
+  breadcrumb；`43.2024年……？` 仅在严格年份题号形态下识别且 raw_text 保留原点号；text-kind
+  的“一 持续加强研发投入 / 1 亿元投资额”不凭空格升级为标题，只有受控附注/报表名例外。
+- MinerU 3.4 的另一类根因在 parser 输入层处理：当 `content_list` 把后续页 table HTML 聚合到
+  前页并留下空 ghost 时，只在同页 bbox 唯一匹配且 logical cell 串接完全等价时，才用同 stem
+  `*_model.json` 恢复 page-local HTML；缺失、坏 schema、歧义或不等价全部保留原值，计数写入
+  `parser_diagnostics.table_reconciliation`。几何与 cell 等价的正向证明不依赖标题/业务词表；
+  受控结构标题只作拒绝不安全恢复的负向护栏，并由专用 table-builder semantics 版本约束。
+
+### ub-2026.07-32 〜 -37（2026-07-15：全语料重放后的跨页与标题树收口）
+
+- **跨页表格根因确认**：MinerU `content_list` 的首表 HTML 会聚合多页，而同 stem
+  `model.json` 仍保留逐页表。reconciler 现支持相邻多页链，以 bbox 唯一匹配和未展开的
+  logical source cells 精确串接为证明；rowspan/colspan 展开差异不再制造假不等价。MinerU 将
+  running header/page number 序列化在跨页 table carrier 之间时，仅允许跨页精确重复且不可能
+  恢复为 statement caption/结构标题的 furniture 穿过；普通变列、正文间隔、唯一页眉或标题冲突
+  仍 fail-closed，S5 最终表数保持不变。
+- **报表与附注边界**：受控科目词表当轮升至 note_key_map r13（172 键；当前 r16/173 键、389 标签）；补充每股收益、长期
+  股权投资、共同经营、债券偿还等真实标题别名。模型把母公司利润表末行
+  `（二）稀释每股收益(元/股)` 误标标题时，builder 只在“上一页 4 列利润表末两行 + 次页
+  三位签字人 + 紧随现金流量表”全证据成立时恢复成表格行。重复页眉、跨碎片附注标题和
+  page-furniture statement caption 同样采用页码/bbox/受控词表的窄门，均有负例回归。
+- **历史编号树安全化**：银行报告局部热点可暂时关闭 `1.`…`8.` 主章序列；历史重开仅允许
+  受控边界标题、active 同号/前号优先、保存父路径必须是当前路径前缀，多个身份候选时拒绝。
+  这消除了把现金流补充资料、金融风险附注错误拉回旧会计政策父树的跨父误挂。
+- **无标记/跨页 QA**：官方投关表中 `N、问题？ 无标记回答` 只有在完整 form/footer、连续
+  `1..N`、完整问号及 mode isolation 成立时才从 native PDF text 恢复；dot 序列可继续到
+  顿号/冒号，explicit-Q 模式的答案编号仍不参与外题边界。MinerU evidence fallback 另支持
+  “物理页底问句 → 次页单格内至少 3 个连续问答”，以及“断词答案 → 次页顶部纯续文 →
+  同页紧邻下一题”的三明治；原 carrier 保留，派生/修正 QA 一律 `needs_review`。
+- **真实回放结果**：`1218099701` 从 10/15 恢复为 15/15；`1223071887` Q1/Q11 的
+  `美的|系`、`水冷|型` 跨页断词完整拼回；三份复杂发布会中 tokenizer 产生的 20 个裸
+  `问题` 只在其后紧接已证明 outer Q 时丢弃，不改变原 question set。当前规则代为
+  `ub-2026.07-37`（当前上线目标代见下一节 `ub-2026.07-52`）。
+
+### ub-2026.07-38 〜 -52（2026-07-15：全库根因审计与可检索证据闭环）
+
+- **MinerU 聚合表恢复 v3**：根因是 MinerU `content_list` 把跨页表聚合到首个 carrier、后页留下
+  空 ghost，而 model artifact 仍保留逐页表。reconciler 只有在同页 bbox 唯一、逻辑 cell 串接
+  精确相等、列宽一致、续页无 `<th>`/caption/footnote 且 carrier 间仅有可证明 furniture 时才恢复；
+  受控报表标题只作否决护栏，不能补足正向证据。v3 进一步把统计公式、专用 S5 语义代、
+  locator 五字段 bundle、唯一索引、连续页序和有效 bbox 固定为 fail-loud 契约；歧义一律 fail closed。
+- **原生文本 shadow 可观测降级**：仅预期 PDF/IO/子进程/剩余预算错误降级为
+  `native_text_shadow=unavailable + error_code`；空结果为 `empty`，未知异常继续使 parse 失败。
+  投关/业绩表单遇到 empty/unavailable 时保留 MinerU 主证据并标 `needs_review`。
+- **标题树与重复根**：补齐受控 sibling/root 的精确重开、带日期财务附注根与跨页补充 furniture；
+  内部分组身份始终使用完整 `structural_path`，公开 breadcrumb 仍最多 4 级。mixed part 通过
+  `local_heading` 保留被公开深度上限挤出的标题；空格漂移按逐段规范化匹配，不再吞掉
+  `37 主要会计政策…`、`16.3.1/16.3.2/16.4` 等可寻址标题。
+- **公告号链**：公告号不再形成伪 `公告头信息` 单元；只允许在首屏局部链中穿过严格元数据载体
+  合并到首个实质正文，找不到目标时全部原样保留。兼容 `A 股证券代码`、带内部空格的简称/债券
+  代码及中文发布日期；正文历史公告号引用不参与合并。统计记录 merged/deduplicated 数量。
+- **声明与终端附件边界**：MinerU 把 `标题 √适用 □不适用` 粘成一个 heading 时，先把声明拆为
+  独立 marker 再进入既有适用性状态机，标题不再携带勾选噪声；签章之后、以 `附件:` caption
+  开始并连续跨页的终端表只在窄证据成立时重锚到文档根，普通正文内附件仍保持所在业务作用域。
+- **语义与检索不变量**：所有新 unit 均满足 `semantic_key IS NOT NULL`、`semantic_keys` 为非空
+  数组且 scalar 属于 array；无窄键统一为 `document_content`。Filing API 的 scalar 参数匹配
+  scalar 或数组成员，另提供 comma-list 的 any/all 过滤。
+- **全量离线重放**：截至 -48 对 1,371 份现有 raw artifact（13 公司、21 个 active 文类）完成
+  content_list→reconciler→IR→builder 重放：39,005 units、0 build errors、0 semantic 空值、0 超过
+  50k 字符的 unit；264/264 个首屏唯一公告号均可精确搜索且只出现一次。-49 只修复上述 4 个
+  local-heading 证据缺口；-50 再收口声明粘连与终端附件边界，并以针对性回归、完整 builder
+  回归与 schema contract 验证。
+- **-51 长标题局部序列闭环**：全库只有 3 条 41–80 字的 `n）` 真标题被通用 40 字门限
+  压成前一叶子；新规则只在外层 `(1)/(2)` 序列已由来源层级和几何证明、当前栈顶为
+  `n-1）`、左边距差不超过 8、单行高度不超过 32、与外层顺序距离不超过 12 且无句末/
+  KV 标点时恢复叶子。真实 `1225087169` 的财务担保合同因此从错误继承
+  `financial_instrument_risk` 收敛为 `guarantee`；两份格力英文年报的同构叶子一并恢复。
+  MinerU list 内的 `①/②/2）` 另保持 mapper 字符守恒后的粗粒度文本；不为一句条款新造碎 unit。
+- **-52 parser→builder 语义握手**：表恢复证明记录独立的
+  `table-builder-semantics.v2`；BuildUnits 对任何带 aggregate-table reconciliation 诊断的 IR
+  fail-loud 校验该版本，不匹配即要求重 parse。它不绑定整个 `RULES_VERSION`，普通标题、QA、
+  semantic 规则升级仍可走 5 秒级 `rebuild-units`，只有 S5 重并或结构页眉否决语义变化才重解析。
 
 ## 9. 明确不做
 
