@@ -319,9 +319,15 @@ class FilingApiUnitTests(unittest.TestCase):
         )
 
         sql = engine.statements[1]
-        self.assertIn("u.semantic_key = :semantic_key OR jsonb_exists", sql)
-        self.assertIn("jsonb_exists_any", sql)
-        self.assertIn("jsonb_exists_all", sql)
+        self.assertIn(
+            "u.semantic_key = :semantic_key OR u.semantic_keys ? :semantic_key", sql
+        )
+        self.assertIn(
+            "u.semantic_keys ?| CAST(:semantic_keys_any AS text[])", sql
+        )
+        self.assertIn(
+            "u.semantic_keys ?& CAST(:semantic_keys_all AS text[])", sql
+        )
         self.assertEqual(engine.params[1]["semantic_keys_any"], ["risk", "revenue"])
         self.assertEqual(engine.params[1]["semantic_keys_all"], ["risk", "governance"])
 

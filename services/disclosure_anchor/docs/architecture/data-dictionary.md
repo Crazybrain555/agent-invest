@@ -88,7 +88,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | heading_path | jsonb 1-4 级**多级标题**（必填非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text |
 | title | 叶子显示名（单值；多级在 heading_path，决策记录见 retrieval 设计文档 §4.5） |
 | semantic_key | 单值路由键（规则命中→词表键→事件键→`document_content` 通用内容键）；ub-2026.07-26 新产物非空，库列仅为历史兼容仍可空；`document_content` 表示“确定是文档证据、暂无更窄受控概念”，不是 `unknown`；btree 索引 |
-| semantic_keys | jsonb 非空数组=规则键∪词表键∪事件键；无更窄概念时为 `["document_content"]`（ub-2026.07-26；库列仅为历史兼容仍可空）；GIN(jsonb_ops) 支持 `? / ?|`；Filing API 的 `semantic_key` 单值参数匹配 scalar 列或数组成员，另有 comma-list any/all 过滤 |
+| semantic_keys | jsonb 非空数组=规则键∪词表键∪事件键；无更窄概念时为 `["document_content"]`（ub-2026.07-26；库列仅为历史兼容仍可空）；GIN(jsonb_ops) 支持 `? / ?| / ?&`；Filing API 的 `semantic_key` 单值参数匹配 scalar 列或数组成员，另有 comma-list any/all 过滤 |
 | payload | 纯内容（**禁**任何规则派生字段——进 content_hash，U2） |
 | content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；projection 含 title/heading/semantic_key(s)/quality/applicability |
 | quality_status | ok / needs_review / unusable（乱码率>30%） |

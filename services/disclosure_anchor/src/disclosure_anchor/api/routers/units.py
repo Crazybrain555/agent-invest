@@ -398,19 +398,17 @@ def _unit_where(filters: UnitFilters) -> tuple[list[str], dict[str, Any]]:
     if filters.semantic_key is not None:
         where.append(
             "(u.semantic_key = :semantic_key OR "
-            "jsonb_exists(u.semantic_keys, :semantic_key))"
+            "u.semantic_keys ? :semantic_key)"
         )
         params["semantic_key"] = filters.semantic_key
     if filters.semantic_keys_any is not None:
         where.append(
-            "jsonb_exists_any(u.semantic_keys, "
-            "CAST(:semantic_keys_any AS text[]))"
+            "u.semantic_keys ?| CAST(:semantic_keys_any AS text[])"
         )
         params["semantic_keys_any"] = filters.semantic_keys_any
     if filters.semantic_keys_all is not None:
         where.append(
-            "jsonb_exists_all(u.semantic_keys, "
-            "CAST(:semantic_keys_all AS text[]))"
+            "u.semantic_keys ?& CAST(:semantic_keys_all AS text[])"
         )
         params["semantic_keys_all"] = filters.semantic_keys_all
     _add_filter(where, params, "quality_status", filters.quality_status)

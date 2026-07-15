@@ -136,7 +136,7 @@ extractive_keywords /（后置）summary；不进 content_hash、不替代 paylo
 | title | 已有 | ↓ 并入 search_tsv | A |
 | heading_path_text | heading_path join " > "（含 mixed parts local_heading） | ↓ 并入 | B |
 | body_text | payload 线性化（text + 表头/单元格 + qa 问答） | ↓ 并入 | C |
-| semantic_keys | 已有列（§4 扩容后） | GIN(array) 精确过滤 + 并入 tsv | D |
+| semantic_keys | 已有列（§4 扩容后） | GIN(jsonb_ops) 的 `? / ?| / ?&` 精确过滤 + 并入 tsv | D |
 | search_tsv | 上四者 setweight 拼接，zhparser/pg_jieba + 财务领域词典 | GIN | — |
 | （可选兜底） | pg_bigm 双通道应对短查询/新词 | GIN(bigram) | — |
 
