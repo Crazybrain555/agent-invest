@@ -27,7 +27,7 @@ class CninfoMapperTests(unittest.TestCase):
     def test_filing_type_rule_bundle_has_required_seed_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
 
-        self.assertEqual(bundle.version, "2026-07-r12")
+        self.assertEqual(bundle.version, "2026-07-r13")
         self.assertEqual(
             {rule.filing_type for rule in bundle.rules},
             {
@@ -106,7 +106,7 @@ class CninfoMapperTests(unittest.TestCase):
 
         all_keywords = [kw for rule in bundle.noise_rules for kw in rule.keywords]
         keyword_sets = [rule.keywords for rule in bundle.noise_rules]
-        self.assertEqual(len(bundle.noise_rules), 12)
+        self.assertEqual(len(bundle.noise_rules), 18)
         # r12 financial review: only templates with no incremental fact stay
         # behind the absolute gate.
         self.assertIn(("股票期权", "限制行权期间"), keyword_sets)
@@ -116,6 +116,15 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertIn(("赎回选择权", "提示性公告"), keyword_sets)
         self.assertIn("独立董事候选人声明", all_keywords)
         self.assertIn("发售通函", all_keywords)
+
+        # r13: 标题自带副本标识(英文版/H股)或序次标识(第 N 次)的重复件不需要
+        # 主件 linkage 键即可判定,与保留的『提前赎回%的第%次』同一标准。
+        self.assertIn("英文版", all_keywords)
+        self.assertIn("（英文）", all_keywords)
+        self.assertIn(("H股", "季度报告"), keyword_sets)
+        self.assertIn(("H股", "年度报告"), keyword_sets)
+        self.assertIn(("的第", "次风险提示公告"), keyword_sets)
+        self.assertIn(("退市风险警示的第", "次提示性公告"), keyword_sets)
 
         # Routine does not mean fact-free: executed share-count/dilution,
         # convertible, debt, cash and proceeds facts must not be hard noise.
@@ -133,14 +142,16 @@ class CninfoMapperTests(unittest.TestCase):
         ):
             self.assertNotIn(restored, all_keywords)
 
-        # Conditional duplicates need primary/attachment lineage. Until that
-        # exists they are not allowed to remain an absolute title kill.
+        # Conditional duplicates need primary/attachment lineage: an
+        # attachment or second-hand carrier can only be deduped against a
+        # located primary. Until that key exists they are not an absolute
+        # title kill. (r13 keeps this bar for the lineage-dependent family
+        # and does NOT apply it to self-identifying copies — those name
+        # themselves in the title and need no primary to be recognised.)
         for conditional in (
-            "英文版",
             "激励对象名单",
             "受托管理事务报告",
             "股票交易异常波动的公告",
-            "H股",
         ):
             self.assertNotIn(conditional, all_keywords)
 
@@ -150,6 +161,43 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertIn(("中期票据计划", "上市"), keyword_sets)
         self.assertIn(("上市", "中期票据计划"), keyword_sets)
         self.assertIn(("中期票据计划", "挂牌"), keyword_sets)
+
+    def test_r13_self_identifying_copies_die_originals_survive(self) -> None:
+        # r13 判据:副本被拦、正本/首发一律存活。实盘复核 17/17 命中件均有
+        # 已发布中文正本;首发风险提示件(无序号)不得被序次规则误杀。
+        bundle = load_filing_type_rule_bundle()
+
+        def is_noise(title: str) -> bool:
+            for rule in bundle.noise_rules:
+                if rule.match == "all":
+                    if all(k in title for k in rule.keywords):
+                        return True
+                elif any(k in title for k in rule.keywords):
+                    return True
+            return False
+
+        for copy_title in (
+            "格力电器：2024年年度报告（英文版）",
+            "美的集团：2023年第三季度报告（英文）",
+            "工商银行：工商银行H股公告-2025年第一季度报告",
+            "中国银行：中国银行H股公告-2024年度报告",
+            "锦州港：关于公司股票可能被终止上市的风险提示公告的第五次风险提示公告",
+            "金科股份：关于公司股票被叠加实施退市风险警示的第三次提示性公告",
+        ):
+            self.assertTrue(is_noise(copy_title), f"copy not gated: {copy_title}")
+
+        for original_title in (
+            # 中文正本 —— 副本规则的唯一保留对象
+            "格力电器：2024年年度报告",
+            "美的集团：2024年第三季度报告",
+            "招商银行：招商银行股份有限公司2025年度报告",
+            # 首发风险提示(无序号)必须存活:序次规则只杀第 N 次重发
+            "锦州港：关于公司股票可能被终止上市的风险提示公告",
+            "*ST 某某：关于公司股票交易首日的风险提示公告",
+            # H 股通道的真信号件不含'年度报告'/'季度报告'串
+            "工商银行：H股公告-不派发中期股息",
+        ):
+            self.assertFalse(is_noise(original_title), f"false kill: {original_title}")
 
     def test_carrier_title_rules_behavior_on_codeless_channel(self) -> None:
         # Carrier keywords outrank subject keywords on the title path…
