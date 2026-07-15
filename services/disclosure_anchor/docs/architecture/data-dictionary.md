@@ -99,7 +99,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 ### classification_rule（0016，词表的库内查询副本）
 | 列 | 含义 |
 |---|---|
-| rule_set | 闭集 class / facet / **title** / **title_topic** / **title_noise**。title 是无码通道 broad fallback；title_topic 对有码/无码都可追加窄主题；title_noise 是处理队列绝对排除，不改变登记事实 |
+| rule_set | 闭集 class / facet / **title** / **title_topic** / **title_noise**。title 是无码通道 broad fallback；title_topic 对有码/无码都可追加窄主题；title_noise 是处理队列绝对硬排除，不改变登记事实，仅允许无新增金融事实的窄模板/明确重复/行政载体 |
 | prefix / value / priority | F006V 前缀或标题模式 → 类名/维度名；priority=主分类阶梯档位（三层原则）/facet 长前缀优先；match=all 的标题模式以 `%` 编码并由 SQL/Python 同义匹配 |
 | version | 与仓内 JSON 词表一致；doctor 校验漂移；`make load-rules` 事务内重载 |
 
@@ -140,8 +140,8 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 | adapters/unit_builder/event_key_map.json | 事件键 **30 键**（DuEE-fin/CCKS/FewFC/CFinDEE 并集，标题派生） | 2026-07-r1 |
 | adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs；r6 financing +011711 担保/011713 财务资助、meeting_resolution +01239910；r7 equity_share_change +0115 父级实码） | 2026-07-r7 |
 | adapters/sources/cninfo/facet_map.json | F006V 维度判定（market 精确码/publisher 0101） | 2026-07-r1 |
-| adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（intermediary carrier 词最前，r7 起 briefing/inquiry 双向语序规则紧随其后防子串抢注）+ topic_rules 追加规则（title_topic：有码无码都追加命中 class，r7 扩至 10 类补码盲区）+ noise_rules 负向规则（title_noise：绝对不下载不解析；r8 撤除“预计满足”并收窄裸“中期票据计划”；r9 批次3 加法；r10 注册批准/许可协议行业超集；r11 新增跨发行人“出售股票资产”，并删除误杀15个下修/赎回前瞻预警的“预计触发”绝对 noise），共 77 条 JSON noise 规则/79 pattern、65 个 topic 词 | 2026-07-r11 |
-| **config/processing_policy.json** | 处理策略（round21 合并 parse/download 两清单）：process 19 类=下载+解析（r3 EPS 核心精简：dividend/related_party/financing 移出；需要时按公司覆盖加回，历史已登记候选自动回补），register_only 12 类=只登记；carrier 类（intermediary_report）共码不放行，除非该类自身在生效集合；按公司覆盖=watchlist process_classes | 2026-07-r3 |
+| adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（intermediary carrier 词最前，briefing/inquiry 在定期报告前）+ 65 个 title_topic 词补码盲区 + 12 个 title_noise hard pattern。r12 金融复核将 41 个事实 pattern 与 26 个待可靠去重 pattern 移出绝对门；例行但含股本、稀释、债务、现金、募投或风险新事实的公告不再按标题硬杀 | 2026-07-r12 |
+| **config/processing_policy.json** | process 20 类=下载+解析；r4 将 equity_share_change 纳入以覆盖当前股数、流通/限售与未来解禁，register_only 11 类=只登记；carrier 类共码不放行，除非其自身在生效集合；按公司覆盖=watchlist process_classes | 2026-07-r4 |
 | config/watchlist.csv | 股票池唯一真源 + 按公司级联覆盖 | git 即版本 |
 
 运营者旋钮总索引：`config/README.md`（级联模型/命令速查/两类文件边界）。

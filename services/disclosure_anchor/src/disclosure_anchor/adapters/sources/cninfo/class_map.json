@@ -1,6 +1,6 @@
 {
   "version": "2026-07-r7",
-  "_about": "统一 class 词表（design/classification-facets-and-derived-views.md）。单一映射两种输出：disclosure_topics=全部命中类集合；filing_type=priority argmax。前缀=巨潮 F006V 码（provider_category 实枚举），改词表=升版+make load-rules（视图现算，全库即刻生效，无存量残留）。priority 三层原则：日历类(95-100)>实质事件类(44-80,按重大性)>程序载体类(16-30)。std_refs 仅参考元数据（caev=ISO20022 公司行为码/hkex_t2=港交所 Appendix24/sec=SEC 表单或 8-K item），不进库不进契约。r6(2026-07-13 池外泛化审计):financing +011711(担保)+011713(提供财务资助);meeting_resolution +01239910(其它监事会公告);010109*/01010701 中介主体码明确不映射。见 docs/implementation/reviews/vocab-generalization-2026-07-13.md。r7(2026-07-13 上量前候选层复核):equity_share_change +0115 父级实码,修复美的解除限售候选落 other;该类仍为 register_only。",
+  "_about": "统一 class 词表（design/classification-facets-and-derived-views.md）。单一映射两种输出：disclosure_topics=全部命中类集合；filing_type=priority argmax。前缀=巨潮 F006V 码（provider_category 实枚举），改词表=升版+make load-rules（视图现算，全库即刻生效，无存量残留）。priority 三层原则：日历类(95-100)>实质事件类(44-80,按重大性)>程序载体类(16-30)。std_refs 仅参考元数据（caev=ISO20022 公司行为码/hkex_t2=港交所 Appendix24/sec=SEC 表单或 8-K item），不进库不进契约。r6(2026-07-13 池外泛化审计):financing +011711(担保)+011713(提供财务资助);meeting_resolution +01239910(其它监事会公告);010109*/01010701 中介主体码明确不映射。见 docs/implementation/reviews/vocab-generalization-2026-07-13.md。r7(2026-07-13 上量前候选层复核):equity_share_change +0115 父级实码,修复美的解除限售候选落 other；是否处理由 processing_policy 独立决定。",
   "classes": {
     "annual_report": {
       "prefixes": [

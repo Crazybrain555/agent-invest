@@ -1181,8 +1181,8 @@ class OpsQueueViewTests(unittest.TestCase):
             txn.rollback()
             conn.close()
 
-    def test_pending_queues_noise_gate_is_absolute(self) -> None:
-        # Phase-1 ruling: a title_noise hit excludes the row from download
+    def test_pending_queues_hard_noise_gate_is_absolute(self) -> None:
+        # A true hard-noise hit excludes the row from download
         # AND parse even when its codes are squarely in scope, and even for
         # a per-company override.
         pid_noise = f"qvdl{self.suffix}nz"
@@ -1199,7 +1199,8 @@ class OpsQueueViewTests(unittest.TestCase):
                     "(rule_set, prefix, value, priority, version) VALUES "
                     "('class', '0111', 'financing', 48, 'test'), "
                     "('class', '0109', 'convertible_bond', 94, 'test'), "
-                    "('title_noise', '募集资金存放', 'noise', 0, 'test') "
+                    "('class', '012325', 'equity_incentive', 76, 'test'), "
+                    "('title_noise', '股票期权%限制行权期间', 'noise', 0, 'test') "
                     "ON CONFLICT (rule_set, prefix, value) DO NOTHING"
                 )
             )
@@ -1219,8 +1220,8 @@ class OpsQueueViewTests(unittest.TestCase):
                             "candidates": [
                                 {
                                     "provider_document_id": pid_noise,
-                                    "title": "2025年度募集资金存放与使用情况的专项报告",
-                                    "raw_category": "01010503||011101",
+                                    "title": "关于股票期权激励计划限制行权期间的提示性公告",
+                                    "raw_category": "01010503||012325",
                                     "download_url": "http://x/n1.PDF",
                                     "announcement_date": "1990-01-01",
                                 },
@@ -1266,7 +1267,11 @@ class OpsQueueViewTests(unittest.TestCase):
                     conn,
                     max_retries=3,
                     limit=1000,
-                    scope_classes=("financing", "convertible_bond"),
+                    scope_classes=(
+                        "financing",
+                        "convertible_bond",
+                        "equity_incentive",
+                    ),
                 )
             ]
             self.assertNotIn(pid_noise, pids)
@@ -1292,8 +1297,8 @@ class OpsQueueViewTests(unittest.TestCase):
             conn.execute(
                 text(
                     "UPDATE disclosure_core.document SET provider_metadata = "
-                    "jsonb_build_object('raw_category', CAST('01010503||011101' AS text)), "
-                    "title = '2024年度募集资金存放与实际使用情况的专项报告' "
+                    "jsonb_build_object('raw_category', CAST('01010503||012325' AS text)), "
+                    "title = '关于股票期权激励计划限制行权期间的提示性公告' "
                     "WHERE document_id = :id"
                 ),
                 {"id": doc_noise},
@@ -1301,10 +1306,137 @@ class OpsQueueViewTests(unittest.TestCase):
             parse_ids = [
                 row["document_id"]
                 for row in queries.pending_parse(
-                    conn, max_retries=3, limit=1000, scope_classes=("financing",)
+                    conn,
+                    max_retries=3,
+                    limit=1000,
+                    scope_classes=("equity_incentive",),
                 )
             ]
             self.assertNotIn(doc_noise, parse_ids)
+        finally:
+            txn.rollback()
+            conn.close()
+
+    def test_restored_share_facts_enter_download_and_parse_queues(self) -> None:
+        # r12: routine execution notices still carry the share ledger facts
+        # needed for current shares, float/unlock and forward dilution.
+        cases = (
+            (
+                "unlock_condition",
+                "关于2024年限制性股票激励计划解除限售条件成就的公告",
+                "01010503||0115",
+            ),
+            (
+                "unlock_listing",
+                "关于2024年限制性股票激励计划解除限售并上市流通的公告",
+                "01010503||0115",
+            ),
+            (
+                "vesting_listing",
+                "关于2024年第二类限制性股票归属结果暨股份上市的公告",
+                "01010503||0115",
+            ),
+            (
+                "cancellation",
+                "限制性股票回购注销完成公告",
+                "01010503||0115",
+            ),
+            (
+                "conversion",
+                "2026年第二季度可转换公司债券转股结果暨股份变动公告",
+                "01010503||0109",
+            ),
+        )
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            # Make the test independent of whether the shared test DB has
+            # already loaded r12; every delete is transactionally rolled back.
+            conn.execute(
+                text(
+                    "DELETE FROM disclosure_core.classification_rule "
+                    "WHERE rule_set = 'title_noise' AND prefix = ANY(:patterns)"
+                ),
+                {
+                    "patterns": [
+                        "解除限售条件成就",
+                        "激励计划%解除限售%上市流通",
+                        "归属结果暨股份上市",
+                        "限制性股票回购注销完成",
+                        "转股结果暨股份变动",
+                        "季度可转换公司债券转股情况",
+                    ]
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.classification_rule "
+                    "(rule_set, prefix, value, priority, version) VALUES "
+                    "('class', '0115', 'equity_share_change', 70, 'test'), "
+                    "('class', '0109', 'convertible_bond', 94, 'test') "
+                    "ON CONFLICT (rule_set, prefix, value) DO NOTHING"
+                )
+            )
+            candidates = [
+                {
+                    "provider_document_id": f"qvdl{self.suffix}{key}",
+                    "title": title,
+                    "raw_category": raw_category,
+                    "download_url": f"http://x/{key}.PDF",
+                    "announcement_date": "1990-01-01",
+                }
+                for key, title, raw_category in cases
+            ]
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.source_access "
+                    "(source_access_id, provider, provider_interface, accessed_at, "
+                    " status, result_snapshot) "
+                    "VALUES (:id, 'cninfo', 'cninfo:p_info3015', now(), 'ok', "
+                    "        CAST(:snap AS jsonb))"
+                ),
+                {
+                    "id": f"sa_qv{self.suffix}restoredfacts",
+                    "snap": json.dumps({"result": "ok", "candidates": candidates}),
+                },
+            )
+            download_ids = {
+                row["provider_document_id"]
+                for row in queries.pending_downloads(
+                    conn,
+                    max_retries=3,
+                    limit=1000,
+                    scope_classes=("equity_share_change", "convertible_bond"),
+                )
+            }
+            self.assertTrue(
+                {candidate["provider_document_id"] for candidate in candidates}
+                <= download_ids
+            )
+
+            parse_docs: list[str] = []
+            for _, title, raw_category in (cases[0], cases[-1]):
+                document_id = self._insert_document(conn, status="registered")
+                conn.execute(
+                    text(
+                        "UPDATE disclosure_core.document "
+                        "SET provider_metadata = jsonb_build_object("
+                        "'raw_category', CAST(:raw AS text)), title = :title "
+                        "WHERE document_id = :id"
+                    ),
+                    {"raw": raw_category, "title": title, "id": document_id},
+                )
+                parse_docs.append(document_id)
+            parse_ids = {
+                row["document_id"]
+                for row in queries.pending_parse(
+                    conn,
+                    max_retries=3,
+                    limit=1000,
+                    scope_classes=("equity_share_change", "convertible_bond"),
+                )
+            }
+            self.assertTrue(set(parse_docs) <= parse_ids)
         finally:
             txn.rollback()
             conn.close()

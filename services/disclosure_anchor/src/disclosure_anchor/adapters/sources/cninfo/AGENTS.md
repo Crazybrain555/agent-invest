@@ -16,7 +16,7 @@ web_source.py        免凭据兜底通道 CninfoWebSource：官网 hisAnnouncem
                      去重键与文件签名跨通道通用
 mapper.py            p_info3015/p_stock2100 → DTO(TEXTID 即 provider_document_id)、
                      F006V 多段拆分映射、report_period 标题推导(07 §3.2 封闭规则)
-filing_type_map.json 规则包(版本化，当前 r11)；**intermediary_report 必须排最前**(carrier 载体
+filing_type_map.json 规则包(版本化，当前 r12)；**intermediary_report 必须排最前**(carrier 载体
                      判定优先——"激励计划法律意见书"是意见书不是激励公告)；
                      **performance_briefing 与 inquiry(双向语序两条)必须排在
                      semiannual/annual/quarterly 之前**(北交所"年度报告业绩说明会预告"
@@ -24,8 +24,10 @@ filing_type_map.json 规则包(版本化，当前 r11)；**intermediary_report �
                      **semiannual 必须排在 annual 之前**(子串遮蔽，实测踩过)；
                      topic_rules 段=title_topic 追加规则(有码无码都追加命中 class 并给
                      下载资格，补 provider 码盲区；关键词是纯子串禁含 %)；
-                     noise_rules 段=title_noise 负向规则(标题命中=绝对不下载不解析，
-                     覆盖不能翻；match=all 按序 % 连接=语序敏感)
+                     noise_rules 段=title_noise 硬负向规则(标题命中=绝对不下载不解析，
+                     覆盖不能翻；match=all 按序 % 连接=语序敏感；只允许无新增金融事实的
+                     窄模板/明确重复/行政载体，例行但含股本、稀释、债务、现金、募投或风险
+                     新事实的公告不得放入)
 ```
 
 词表工程原则(2026-07-13 泛化审计定案，加删词必须遵守；决策与证据见
@@ -45,6 +47,9 @@ docs/implementation/reviews/vocab-generalization-2026-07-13.md)：
    候选自动回补——漏=可回补的延迟）；脏数据难清洗、错误会向下游传播——拿不准一律不加，
    宁漏勿脏（实证：r10 用行业超集"注册批准/许可协议"替换单发行人措辞，而早期 IND/受理/
    突破性治疗、股东借款、集团绑定关联预计均评估后不加）。
+5. **硬排除证据门槛**（2026-07-15 金融复核）：`title_noise` 的判断对象是“是否有新增
+   金融事实”，不是“是否例行”。主附件/语言副本关系不确定时先恢复处理，等 provenance-aware
+   去重具备可靠关联键后再降成本；不得仅凭同公司、同日或相似标题猜主件。
 
 硬规则：凭据只从 settings 进(构造注入)，query_params/日志一律先脱敏；
 provider 词表 cninfo:p_info3015 / p_stock2100 / hisAnnouncement / download_pdf

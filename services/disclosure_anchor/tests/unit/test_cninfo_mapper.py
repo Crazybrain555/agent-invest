@@ -27,7 +27,7 @@ class CninfoMapperTests(unittest.TestCase):
     def test_filing_type_rule_bundle_has_required_seed_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
 
-        self.assertEqual(bundle.version, "2026-07-r11")
+        self.assertEqual(bundle.version, "2026-07-r12")
         self.assertEqual(
             {rule.filing_type for rule in bundle.rules},
             {
@@ -105,31 +105,51 @@ class CninfoMapperTests(unittest.TestCase):
         bundle = load_filing_type_rule_bundle()
 
         all_keywords = [kw for rule in bundle.noise_rules for kw in rule.keywords]
-        self.assertIn("募集资金存放", all_keywords)
-        # r7: the wide 异动 keyword was narrowed to adjacency anchors so ST
-        # compound titles (…异常波动暨风险提示…) and 异动问询回函 stay
-        # processable; only the pure template form is rejected.
-        self.assertNotIn("股票交易异常波动", all_keywords)
-        self.assertIn("股票交易异常波动的公告", all_keywords)
-        self.assertIn("股票交易异常波动公告", all_keywords)
-        # r7 ordered word-order variants (SQL LIKE '%'-joined, order matters).
-        self.assertIn("限制性股票回购注销实施", all_keywords)
         keyword_sets = [rule.keywords for rule in bundle.noise_rules]
-        self.assertIn(("归还", "闲置募集资金"), keyword_sets)
-        self.assertIn(("子公司发行", "票据", "提供担保"), keyword_sets)
-        # r8: a bare MTN-plan keyword killed a real RMB3bn/1.73%-coupon
-        # issuance. Only explicitly procedural listing/quotation shapes stay
+        self.assertEqual(len(bundle.noise_rules), 12)
+        # r12 financial review: only templates with no incremental fact stay
         # behind the absolute gate.
+        self.assertIn(("股票期权", "限制行权期间"), keyword_sets)
+        self.assertIn(("提前赎回", "的第", "次提示性公告"), keyword_sets)
+        self.assertIn(("中期票据计划", "上市"), keyword_sets)
+        self.assertIn(("上市", "中期票据计划"), keyword_sets)
+        self.assertIn(("赎回选择权", "提示性公告"), keyword_sets)
+        self.assertIn("独立董事候选人声明", all_keywords)
+        self.assertIn("发售通函", all_keywords)
+
+        # Routine does not mean fact-free: executed share-count/dilution,
+        # convertible, debt, cash and proceeds facts must not be hard noise.
+        for restored in (
+            "募集资金存放",
+            "限制性股票回购注销完成",
+            "解除限售条件成就",
+            "归属结果暨股份上市",
+            "股票期权行权结果",
+            "授予登记完成",
+            "转股结果暨股份变动",
+            "季度可转换公司债券转股情况",
+            "债券发行完毕",
+            "摊薄即期回报",
+        ):
+            self.assertNotIn(restored, all_keywords)
+
+        # Conditional duplicates need primary/attachment lineage. Until that
+        # exists they are not allowed to remain an absolute title kill.
+        for conditional in (
+            "英文版",
+            "激励对象名单",
+            "受托管理事务报告",
+            "股票交易异常波动的公告",
+            "H股",
+        ):
+            self.assertNotIn(conditional, all_keywords)
+
+        # A bare MTN-plan keyword once killed substantive issuance terms.
+        # Only the explicitly administrative listing/quotation shapes remain.
         self.assertNotIn(("中期票据计划",), keyword_sets)
         self.assertIn(("中期票据计划", "上市"), keyword_sets)
         self.assertIn(("上市", "中期票据计划"), keyword_sets)
         self.assertIn(("中期票据计划", "挂牌"), keyword_sets)
-        self.assertIn(("中期票据计划", "进行发行", "提供担保"), keyword_sets)
-        self.assertNotIn(("预计满足", "条件的提示性公告"), keyword_sets)
-        self.assertNotIn(("预计触发", "条件的提示性公告"), keyword_sets)
-        # r9: 已获授 wording variant of the second-type restricted-stock
-        # cancellation rule (Kingsoft Office shape).
-        self.assertIn(("作废", "已获授", "尚未归属", "限制性股票"), keyword_sets)
 
     def test_carrier_title_rules_behavior_on_codeless_channel(self) -> None:
         # Carrier keywords outrank subject keywords on the title path…
@@ -358,6 +378,10 @@ class CninfoMapperTests(unittest.TestCase):
         # corrections/amendments of core filings must process (edgartools
         # amendments=True analog)
         self.assertIn("correction_supplement", process)
+        # r4: current shares, float/unlock and future dilution require the
+        # full share-change class, not only incentive co-coded documents.
+        self.assertIn("equity_share_change", process)
+        self.assertNotIn("equity_share_change", register_only)
 
     def test_p_info3015_mapper_uses_textid_as_provider_document_id(self) -> None:
         payload = json.loads(
