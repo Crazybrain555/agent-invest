@@ -8,7 +8,7 @@
 | 文件 | 管什么 | 改完跑什么 |
 |---|---|---|
 | `watchlist.csv` | 股票池**导入/快照文件**（真源是 DB 的 tracked_company，round22 改判）：一行一只票 + 按公司覆盖（lookback_days / sync_frequency / process_classes，空=继承全局） | 导入：`make track`（自动先 config-check；`DRY_RUN=1` 只看计划；`PRUNE_DRIFT=YES` 全量恢复）；快照：`make track-export`（DB → 本文件，git 留痕） |
-| `processing_policy.json` | 全局处理策略：`process`=下载+解析；`register_only`=只登记元数据。r3(2026-07-13 用户裁决)：EPS 核心精简——process 19 类,dividend/related_party/financing 移出(需要时由运营者显式按公司 process_classes 拉回,历史已登记候选自动回补)。carrier 例外（2026-07-12 审计）：带 0129 中介报告码/标题的载体件（法律意见书/核查意见/受托管理…）即使共码命中 process 类也不放行，除非把 intermediary_report 本身加进 process 或按公司覆盖。noise 总闸（2026-07-13 用户裁决）：标题命中包内词表 filing_type_map.json `noise_rules`（r11：77 条 JSON 规则/79 个 SQL pattern）的文档**绝对**不下载不解析，公司覆盖也不能翻；登记与分类不受影响 | `make config-check`，再重启/kickstart resident worker 并跑 doctor；`make load-rules` 不能刷新本文件 |
+| `processing_policy.json` | 全局处理策略：`process`=下载+解析；`register_only`=只登记元数据。r4(2026-07-15)：process 20 类，`equity_share_change` 为完整股本/流通/解禁台账进入 process；dividend/related_party/financing 仍 register_only，必要时按公司覆盖拉回。carrier 例外：中介载体即使共码命中 process 也不放行，除非把 intermediary_report 加进生效集合。title_noise 总闸仍是绝对门，但 r12 只保留 12 个没有新增金融事实的 hard pattern；其余 67 个事实/条件项恢复到 class/process/carrier 正常路径，主件感知去重待可靠关联键后实施 | `make config-check` + `make load-rules`，再重启/kickstart resident worker 并跑 doctor |
 
 池子的增删改查（CSV 导入与 API PUT 是整行 upsert：空可选字段=清除覆盖回继承，响应/输出会回显
 `cleared_overrides`；**例外**：`make track CODES=...` 快捷入池是 ensure 语义——已在池的公司

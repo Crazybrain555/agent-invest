@@ -84,9 +84,10 @@ def main() -> int:
                     "version": bundle.version,
                 }
             )
-    # Noise rules: absolute processing exclusions (phase-1 user ruling) —
-    # a title hit keeps the document out of download AND parse for coded
-    # and code-less rows alike. value 'noise' is a marker, never a class.
+    # Hard-noise rules: absolute processing exclusions. A title hit keeps
+    # the document out of download AND parse for coded and code-less rows.
+    # Only patterns with no incremental financial fact belong here.
+    # value 'noise' is a marker, never a class.
     for noise_rule in bundle.noise_rules:
         noise_pattern = (
             "%".join(noise_rule.keywords) if noise_rule.match == "all" else None

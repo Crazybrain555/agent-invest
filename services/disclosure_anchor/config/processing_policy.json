@@ -1,6 +1,6 @@
 {
-  "version": "2026-07-r3",
-  "_about": "处理策略（级联层2，design/classification-facets-and-derived-views.md v3）。process=下载+解析（一个动作，round20 用户裁决：不存在下载不解析）；register_only=只登记元数据（可见可查，零下载/解析成本）。按公司覆盖=watchlist.csv 的 process_classes 列（替换式，空=继承本文件）。增类=从 register_only 挪到 process，历史已登记文档自动回补下载；删类=挪回，队列即刻静默，已有数据不动。类名必须 ⊆ class_map.json（make config-check 校验，worker 启动 fail-closed）。2026-07-13 用户裁决（r3，EPS 核心精简）：起步下载解析面越谨慎越好，唯一入围标准=对未来每股收益(EPS)有信息量，以类别为核心、词表只做加法（topic 补码盲区）、noise 排除词表降级为第二道保险——process 22→19：移出 dividend（分红是 payout 不改 EPS）、related_party（不重要的关联交易移出；重大关联并购经 011503 等共码仍走 restructuring_assets）、financing（利息费用边际）。单发行人特殊情况不预置硬编码覆盖，仅在出现后由运营者显式按需拉回；register 全量保证历史候选可回补。五层语料 19,631 行实测（r8+r2→r9+r3，见 review §11.2）：process 24.6%→17.5%，80 个 noise pattern 中 20 个退出把关位降级为保险丝。改动本文件后必须 make config-check，并重启 resident worker 后跑 doctor；make load-rules 只用于分类词表，不能刷新 WorkerConfig。",
+  "version": "2026-07-r4",
+  "_about": "处理策略（级联层2，design/classification-facets-and-derived-views.md v3）。process=下载+解析；register_only=只登记候选元数据。按公司覆盖=watchlist.csv 的 process_classes（替换式，空=继承本文件）。类名必须完整且互斥地覆盖 class_map.json（make config-check；worker 启动 fail-closed）。r3 的 EPS 核心精简保留 dividend/related_party/financing 为 register_only。r4(2026-07-15)：为当前股数、流通/限售、未来解禁及潜在稀释台账，将 equity_share_change 纳入 process；同时 title_noise 仅保留 12 个无新增金融事实的 hard pattern，详见 title-noise-finance-review-2026-07-15.md。规则变化不改变既有显式物理清理语义；若运营者决定排除，runs/units 仍可删除而不是强制保留 inactive 历史。改动本文件后必须 make config-check，并重启 resident worker 后跑 doctor；make load-rules 只刷新分类词表，不能刷新 WorkerConfig。",
   "process": [
     "annual_report",
     "semiannual_report",
@@ -20,13 +20,13 @@
     "risk_alert",
     "delisting_risk",
     "equity_incentive",
+    "equity_share_change",
     "correction_supplement"
   ],
   "register_only": [
     "meeting_resolution",
     "governance_rules",
     "intermediary_report",
-    "equity_share_change",
     "share_pledge",
     "litigation",
     "financing",

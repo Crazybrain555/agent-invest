@@ -183,9 +183,10 @@ def _processing_scope_sql(*, category_expr: str, title_expr: str) -> str:
     when a title_topic rule matches (provider-code blind spots, 0021).
     Carrier guard: no carrier-class hit may sit outside the effective set —
     coded rows detect carriers via class rules, code-less via title rules.
-    Noise guard (phase-1 user ruling): a title_noise hit excludes the row
-    absolutely — codes, topic hits, and per-company overrides cannot
-    readmit boilerplate (募集资金存放 专项/鉴证报告 family etc.).
+    Hard-noise guard: a title_noise hit excludes the row absolutely —
+    codes, topic hits, and per-company overrides cannot readmit it. The
+    rule set is deliberately narrow: routine filings that carry a new
+    share-count, dilution, debt, cash, project, or risk fact do not belong.
     Callers must bind :scope_classes AND :carrier_classes.
 
     NULLIF: the web channel stores raw_category as '' (candidate snapshots

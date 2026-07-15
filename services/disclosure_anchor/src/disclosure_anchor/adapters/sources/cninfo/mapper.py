@@ -57,11 +57,11 @@ class TopicRule:
 
 @dataclass(frozen=True)
 class NoiseRule:
-    """Absolute processing-exclusion rule matched against the title.
+    """Absolute hard-noise exclusion matched against the title.
 
     A hit keeps the document out of download AND parse regardless of codes
-    or per-company overrides (phase-1 user ruling: no boilerplate/routine
-    filings). Classification views are unaffected — metadata stays visible.
+    or per-company overrides. Only narrow patterns with no incremental
+    financial fact belong here; classification views and metadata remain.
     """
 
     keywords: tuple[str, ...]
