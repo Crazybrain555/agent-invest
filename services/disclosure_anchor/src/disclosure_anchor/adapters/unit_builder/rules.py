@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-18"
+RULES_VERSION = "ub-2026.07-21"
 HEADING_RULESET_ID = "cn_a_v6"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -33,7 +33,9 @@ NOT_APPLICABLE_MARK_RE = re.compile(
 # values are already document metadata (security join), so the lines are pure
 # duplication — but 公告编号 lines are NOT stripped: the provider announcement
 # number exists nowhere else in our metadata.
-_HEADER_KV_SEG = r"(?:[ABH]\s*股|证\s*券|股\s*票|债\s*券)\s*(?:代\s*码|简\s*称)\s*[：:]\s*\S{1,24}"
+# 值允许一个内部空格段（PDF 抽取会把「平银优 01」拆出空格，round16 语料）；
+# 有界防吞：第二段 ≤8 个非空白字符，不含冒号，组合行的回溯仍能正确切分。
+_HEADER_KV_SEG = r"(?:[ABH]\s*股|证\s*券|股\s*票|债\s*券|优\s*先\s*股)\s*(?:代\s*码|简\s*称)\s*[：:]\s*\S{1,24}(?:[ \t][^\s：:]{1,8})?"
 HEADER_KV_LINE_RE = re.compile(rf"^\s*{_HEADER_KV_SEG}\s*$")
 # One line may carry several KV segments plus the announcement number
 # ("证券代码：600519 证券简称：贵州茅台 公告编号：临 2026-027"): strip the KV
@@ -120,6 +122,10 @@ STANDALONE_NOISE_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"^(?:19|20)\d{2}\s*年度?$"),
     # 结尾套话（round11 发现环第一例：9 docs/3 companies）
     re.compile(r"^特此公告[。.！!]?$"),
+    # 信头公告编号残片（round16 语料：68 个存量『公告头信息』unit 整段只有此行）。
+    # 只对整 unit 生效：嵌在长文里的公告编号行仍按 rules.py 头部注释保留——
+    # 行级不剥离（编号是元数据里唯一来源），成为独立 unit 才算纯噪声。
+    re.compile(r"^公告编号\s*[：:]\s*[^\s，。；]{1,20}(?:[ \t][^\s，。；]{1,12})?$"),
 )
 
 
@@ -218,6 +224,19 @@ COLLAPSIBLE_FILING_TYPES = frozenset(
     {"other", "performance_forecast", "performance_flash"}
 )
 DOCUMENT_HEADER_ANCHOR = "公告头信息"
+# 附件 caption 是正文结构的兄弟节点(round17 语料: 11 个错挂实例, 全部
+# 投关记录表): 命中即在标题树里开新顶层分支, 后续延续表随之归属。仅在
+# qa_heading_mode 生效——非表单文档的附件可能出现在文中, 栈重置会把其后
+# 的正文标题错挂进附件分支(复审 Major#1)。必须带冒号——「附件清单（如
+# 有）」是表单字段名, 不是附件标签。
+ATTACHMENT_CAPTION_RE = re.compile(r"^附件\s*[0-9一二三四五六七八九十]*\s*[：:]")
+# 投关记录表单尾字段(深/沪官方模板固定词表; round17 语料 74 张表, 首列
+# 取值仅「日期/附件清单(如有)」两族含 PDF 抽取空格变体): 整格精确匹配,
+# 整表非空首列全部命中才判定为表单残段, 归属文档本身而非最后一个叙事
+# 小节。前缀匹配会误伤「日期安排」类业务标签(复审 Major#2)。
+QA_FORM_FOOTER_FIELD_RE = re.compile(
+    r"^(附件清单\s*[（(]\s*如\s*有\s*[）)]|附件清单|日期)$"
+)
 
 # Long structured documents (annual reports, long 制度/办法) group at the
 # shallowest heading node whose subtree stays within this budget — deep enough

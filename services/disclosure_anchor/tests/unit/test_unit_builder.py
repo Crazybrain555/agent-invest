@@ -25,7 +25,7 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-18")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-21")
         self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v6")
         self.assertEqual(
             rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件", "备查文件目录"}
@@ -928,7 +928,9 @@ class UnitBuilderTests(unittest.TestCase):
                 text = str(part.get("text", ""))
                 self.assertNotRegex(text, r"\n\d+\.议案名称：")
 
-    def test_full_s1_s7_headerless_prefix_anchors_under_stable_heading(self) -> None:
+    def test_full_s1_s7_sse_spaced_announce_no_dropped_as_noise(self) -> None:
+        # round17 语料：沪市信头「公告编号：临 2026-026」编号带内部空格，
+        # 旧模式漏放行，整段残片曾挂在合成锚下入库。
         units, stats = build_unit_drafts_s1_s7(
             {
                 "elements": [
@@ -956,10 +958,52 @@ class UnitBuilderTests(unittest.TestCase):
             filing_type="annual_report",
         )
 
+        self.assertEqual(stats.dropped_by_kind.get("standalone_noise", 0), 1)
+        self.assertEqual(stats.anchored_header_units, 0)
+        paths = {part for unit in units for part in unit.heading_path}
+        self.assertNotIn(rules.DOCUMENT_HEADER_ANCHOR, paths)
+
+    def test_full_s1_s7_headerless_prefix_prefers_document_title(self) -> None:
+        # round17：首标题前的真内容属于文档本身——有注册标题用它做锚，
+        # 「公告头信息」只在 document_title 缺失时兜底。表单类文档的被困
+        # 标题与正文粘连无分隔，按宁漏勿脏不抽取，锚到文档标题即根本解法。
+        elements = [
+            {
+                "kind": "text",
+                "raw_kind": "text",
+                "order_index": 1,
+                "text": "截至本公告披露日，公司回购专用账户持有股份 1,200,000 股。",
+            },
+            {
+                "kind": "heading",
+                "raw_kind": "text",
+                "order_index": 2,
+                "heading_level": 1,
+                "text": "一、回购进展",
+            },
+            {
+                "kind": "text",
+                "raw_kind": "text",
+                "order_index": 3,
+                "text": "回购按计划推进。",
+            },
+        ]
+
+        units, stats = build_unit_drafts_s1_s7(
+            {"elements": elements},
+            filing_type="annual_report",
+            document_title="某公司关于回购股份进展的公告",
+        )
         self.assertEqual(stats.anchored_header_units, 1)
         by_path = {tuple(unit.heading_path): unit for unit in units}
-        header = by_path[(rules.DOCUMENT_HEADER_ANCHOR,)]
-        self.assertEqual(header.payload["text"], "公告编号：临 2026-026")
+        header = by_path[("某公司关于回购股份进展的公告",)]
+        self.assertIn("回购专用账户", str(header.payload))
+
+        units2, _ = build_unit_drafts_s1_s7(
+            {"elements": elements}, filing_type="annual_report"
+        )
+        by_path2 = {tuple(unit.heading_path): unit for unit in units2}
+        self.assertIn((rules.DOCUMENT_HEADER_ANCHOR,), by_path2)
 
     def test_full_s1_s7_qa_units_never_join_section_groups(self) -> None:
         units, _ = build_unit_drafts_s1_s7(
@@ -1582,6 +1626,338 @@ class UnitBuilderTests(unittest.TestCase):
         )
         self.assertIn("被担保人证券代码", units2[0].payload["text"])
         self.assertEqual(stats2.stripped_header_lines, 0)
+
+    def test_preferred_stock_kv_lines_stripped(self) -> None:
+        # round16 语料：平安银行信头「优先股代码/简称」不在旧 KV 模式里，
+        # 残片曾以『公告头信息』unit 形态入库（4 个存量实例）。
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": "优先股代码：140002\n优先股简称：平银优 01",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "本行第十二届董事会审议通过了关联交易议案。",
+                    },
+                ]
+            },
+            filing_type="other",
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertNotIn("优先股", units[0].payload["text"])
+        self.assertEqual(stats.stripped_header_lines, 2)
+
+    def test_standalone_announce_no_unit_dropped_embedded_kept(self) -> None:
+        # round16 语料：68 个存量『公告头信息』unit 整段只有公告编号一行——
+        # 整 unit 即纯噪声要丢；嵌在长文里的编号行保持原设计（保留）。
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": "公告编号：2023-026",
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "heading_level": 1,
+                        "text": "一、交易概述",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 3,
+                        "text": "公告编号：2023-026\n公司拟与关联方发生交易，金额为人民币一亿元。",
+                    },
+                ]
+            },
+            filing_type="other",
+        )
+
+        titles = [unit.title for unit in units]
+        self.assertNotIn("公告头信息", titles)
+        self.assertEqual(stats.dropped_by_kind.get("standalone_noise", 0), 1)
+        body = next(u for u in units if "交易概述" in (u.title or ""))
+        self.assertIn("公告编号：2023-026", body.payload["text"])
+
+    def test_long_preheading_content_still_anchored(self) -> None:
+        # 31 个存量『公告头信息』unit 是真内容（首标题出现晚），必须继续锚定
+        # 而不是被噪声规则误杀。
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": "实现营业收入 4.80 亿元，同比增长 53.58%，毛利率 44.18%，"
+                        "该板块毛利率下降主要受并表影响；医药板块实现营业收入 2.06 亿元。",
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "heading_level": 1,
+                        "text": "一、经营情况讨论",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 3,
+                        "text": "报告期内公司经营稳健。",
+                    },
+                ]
+            },
+            filing_type="other",
+        )
+
+        # 短文档可能被 s8 折叠成单个 doc unit——断言内容不丢失且未被
+        # 噪声规则误杀（可能以独立 unit 或 mixed parts 形态存在）。
+        blob = " ".join(str(u.payload) for u in units)
+        self.assertIn("营业收入", blob)
+        self.assertIn("公告头信息", blob + " ".join(str(u.heading_path) for u in units))
+
+    def test_attachment_caption_opens_top_level_scope(self) -> None:
+        # round17 语料：11 张「附件N：《…》」表错挂在最后一个叙事小节下
+        # （1217576500 的《参与机构名单》混进「三、主要交流问题」）。附件
+        # 是正文的兄弟节点：caption 命中即在标题树开新顶层分支。
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "三、主要交流问题",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "问：公司下半年增长压力如何？答：经营保持稳健。",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 3,
+                        "table_caption": ["附件 1：《参与机构名单》"],
+                        "table": {
+                            "headers": ["机构名称"],
+                            "rows": [["某某基金"], ["某某证券"]],
+                        },
+                    },
+                ]
+            },
+            filing_type="investor_relations",
+        )
+
+        paths = [tuple(unit.heading_path) for unit in units]
+        self.assertIn(("附件 1：《参与机构名单》",), paths)
+        for unit in units:
+            if unit.heading_path and unit.heading_path[0] == "三、主要交流问题":
+                self.assertNotIn("机构名称", str(unit.payload))
+
+    def test_captioned_table_before_first_heading_anchors_to_caption(self) -> None:
+        # round17：首标题前自带 caption 的表（投关记录表单头）锚到自身
+        # 标题，而不是文档标题或「公告头信息」。
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 1,
+                        "table_caption": [
+                            "华测检测认证集团股份有限公司投资者关系活动记录表"
+                        ],
+                        "table": {
+                            "headers": [],
+                            "rows": [
+                                ["投资者关系活动类别", "特定对象调研"],
+                                ["时间", "2023年8月11日"],
+                            ],
+                        },
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "heading_level": 1,
+                        "text": "一、公司基本情况",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 3,
+                        "text": "公司主营检验检测服务。",
+                    },
+                ]
+            },
+            filing_type="investor_relations",
+            document_title="华测检测：投资者关系活动记录表",
+        )
+
+        form = next(u for u in units if "投资者关系活动类别" in str(u.payload))
+        self.assertEqual(
+            form.heading_path,
+            ["华测检测认证集团股份有限公司投资者关系活动记录表"],
+        )
+
+    def test_qa_form_footer_table_reanchors_to_document(self) -> None:
+        # round17 语料：72 张表单尾字段表（附件清单/日期）错挂在最后一个
+        # 叙事小节下——官方模板的固定尾字段归属文档本身。
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "三、主要交流问题",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "问：竞争格局如何？答：每个细分领域有不同的竞争者。",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 3,
+                        "table": {
+                            "headers": [],
+                            "rows": [
+                                ["附件清单（如有）", "《参会机构名单》"],
+                                ["日期", "2023-08-11~2023-08-17"],
+                            ],
+                        },
+                    },
+                ]
+            },
+            filing_type="investor_relations",
+            document_title="华测检测：投资者关系活动记录表",
+        )
+
+        footer = next(u for u in units if "附件清单" in str(u.payload))
+        self.assertEqual(footer.heading_path, ["华测检测：投资者关系活动记录表"])
+        self.assertEqual(footer.title, "华测检测：投资者关系活动记录表")
+        # 叙事小节里的业务表格不受影响——首列不是模板尾字段。
+        units2, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "二、经营数据",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 2,
+                        "table": {
+                            "headers": ["日期", "营业收入"],
+                            "rows": [["2023-06-30", "4.8亿元"]],
+                        },
+                    },
+                ]
+            },
+            filing_type="investor_relations",
+            document_title="华测检测：投资者关系活动记录表",
+        )
+        data_table = next(u for u in units2 if "营业收入" in str(u.payload))
+        self.assertEqual(data_table.heading_path[0], "二、经营数据")
+        # 「日期安排」类业务标签是前缀命中而非整格命中，不得触发重锚
+        # （复审 Major#2：尾字段词表整格精确匹配）。
+        units3, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "二、回购安排",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 2,
+                        "table": {
+                            "headers": [],
+                            "rows": [
+                                ["日期安排", "2026年7月至12月"],
+                                ["日期变更", "无"],
+                            ],
+                        },
+                    },
+                ]
+            },
+            filing_type="investor_relations",
+            document_title="某公司：投资者关系活动记录表",
+        )
+        biz_table = next(u for u in units3 if "日期变更" in str(u.payload))
+        self.assertEqual(biz_table.heading_path[0], "二、回购安排")
+
+    def test_attachment_caption_ignored_outside_qa_mode(self) -> None:
+        # 复审 Major#1：附件栈重置仅限表单模式（语料 11 例全部投关）。
+        # 叙事文档的文中附件若重置栈，其后的正文标题会错挂进附件分支。
+        units, _ = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 1,
+                        "text": "一、审议事项",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 2,
+                        "table_caption": ["附件1：《股东名单》"],
+                        "table": {
+                            "headers": ["股东名称"],
+                            "rows": [["某某投资"]],
+                        },
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 3,
+                        "heading_level": 1,
+                        "text": "二、表决结果",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 4,
+                        "text": "议案获得通过。",
+                    },
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        vote = next(u for u in units if "议案获得通过" in str(u.payload))
+        self.assertEqual(vote.heading_path[0], "二、表决结果")
+        roster = next(u for u in units if "股东名称" in str(u.payload))
+        self.assertEqual(roster.heading_path[0], "一、审议事项")
 
     def test_applicability_marker_becomes_payload_flag(self) -> None:
         units, _ = build_unit_drafts_s1_s7(

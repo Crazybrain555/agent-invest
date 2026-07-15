@@ -225,6 +225,13 @@ def s2_apply_heading_tree(
     stack: list[tuple[int, str, int | None]] = []
     placed: list[PreparedElement] = []
     for element in elements:
+        if qa_heading_mode and element.kind == "table" and element.table_caption:
+            first_caption = str(element.table_caption[0]).strip()
+            if rules.ATTACHMENT_CAPTION_RE.match(first_caption):
+                # 附件是正文的兄弟节点(round17, 语料 11 例全部投关表单):
+                # caption 命中即开新顶层分支, 本表与其后的延续元素都归属
+                # 附件。仅表单模式——叙事文档的文中附件重置栈会错挂后续标题。
+                stack = [(1, first_caption, None)]
         if qa_heading_mode and element.kind == "heading" and _numbered_line(element.text or ""):
             heading_path = [title for _, title, _ in stack]
             placed.append(
@@ -563,6 +570,34 @@ def _flag_shredded_qa_table(unit: UnitDraft) -> UnitDraft:
     return UnitDraft(**{**unit.__dict__, "quality_status": "needs_review"})
 
 
+def _reanchor_qa_form_footer(
+    unit: UnitDraft, *, document_title: str | None
+) -> UnitDraft:
+    """投关记录表单尾字段表(附件清单/日期)归属文档本身, 不是最后一个叙事
+    小节(round17 语料: 72 张表错挂在「三、主要交流问题」类标题下)。首列
+    全部命中官方模板字段词表才判定, 叙事小节里的业务表格不受影响。"""
+
+    if document_title is None or unit.payload_kind != "table":
+        # 无注册标题时不发明合成锚——否则全平文档会因此失去
+        # 「fully flat 不造结构」的守卫。
+        return unit
+    rows = unit.payload.get("rows") or []
+    firsts = [str(row[0]).strip() for row in rows if row and str(row[0]).strip()]
+    # 空首格行是跨页溢出残行(1217576500 表#18), 不参与判定; 判定本身
+    # 要求每个非空首格整格命中官方模板字段。
+    if not firsts or not all(
+        rules.QA_FORM_FOOTER_FIELD_RE.match(first) for first in firsts
+    ):
+        return unit
+    return UnitDraft(
+        **{
+            **unit.__dict__,
+            "heading_path": [document_title],
+            "title": document_title,
+        }
+    )
+
+
 def _drop_blank_rows_adjusting(
     rows: list[list[str]],
     merged_cells: list[dict[str, int]],
@@ -696,6 +731,10 @@ def build_unit_drafts_s1_s7(
     table_units = s5_build_table_units(placed, s1.stats)
     if filing_type in {"investor_relations", "performance_briefing"}:
         table_units = [_flag_shredded_qa_table(unit) for unit in table_units]
+        table_units = [
+            _reanchor_qa_form_footer(unit, document_title=document_title)
+            for unit in table_units
+        ]
     table_qa_units = _qa_units_from_tables(table_units)
     units = sorted([*text_units, *table_units, *table_qa_units], key=_unit_sort_key)
     units = _sink_leading_applicable(units)
@@ -731,16 +770,35 @@ def _anchor_headerless_units(
     fully_flat = not any(unit.heading_path for unit in units)
     if fully_flat and not document_title:
         return units
-    # Pre-first-heading remnants anchor under 公告头信息; a fully flat document
-    # (MinerU form-table filings) anchors under its registry title instead of
-    # inventing structure (Codex round7: IR units with heading_path=[]).
-    anchor = document_title if fully_flat else rules.DOCUMENT_HEADER_ANCHOR
+    # 首标题前的内容属于文档本身(round17, 取代 round3 的合成锚常态):
+    # 自带 caption 的单元锚到自身标题, 其余锚到文档注册标题——
+    # 「公告头信息」只作 document_title 缺失时的最后兜底。被困在表单
+    # 单元格里的小节标题(一、…)与正文粘连无分隔, 任何切分都会产出脏
+    # 锚点, 按宁漏勿脏不做抽取。
     out: list[UnitDraft] = []
     for unit in units:
         if unit.heading_path:
             out.append(unit)
             continue
+        # Pre-heading letterhead remnants (whole-unit 公告编号 line etc.,
+        # round16 corpus: 68 live 公告头信息 units) drop HERE, before the
+        # short-document collapse can absorb them as mixed-unit parts where
+        # the late standalone-noise stage cannot see them. Long real content
+        # that merely sits before the first heading never matches the closed
+        # family and keeps anchoring.
+        if (
+            unit.payload_kind == "text"
+            and "image_ref" not in unit.payload
+            and rules.is_standalone_noise(str(unit.payload.get("text", "")))
+        ):
+            stats.dropped_by_kind["standalone_noise"] += 1
+            continue
         stats.anchored_header_units += 1
+        anchor = (
+            unit.title
+            or document_title
+            or rules.DOCUMENT_HEADER_ANCHOR
+        )
         out.append(
             UnitDraft(
                 **{
