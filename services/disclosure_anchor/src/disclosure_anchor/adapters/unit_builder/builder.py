@@ -68,6 +68,8 @@ class BuildStats:
     grouped_section_units: int = 0
     collapsed_documents: int = 0
     anchored_header_units: int = 0
+    native_text_sections_recovered: int = 0
+    qa_form_carriers_replaced: int = 0
     needs_review_count: int = 0
     unusable_count: int = 0
 
@@ -88,6 +90,8 @@ class BuildStats:
             "grouped_section_units": self.grouped_section_units,
             "collapsed_documents": self.collapsed_documents,
             "anchored_header_units": self.anchored_header_units,
+            "native_text_sections_recovered": self.native_text_sections_recovered,
+            "qa_form_carriers_replaced": self.qa_form_carriers_replaced,
             "needs_review_count": self.needs_review_count,
             "unusable_count": self.unusable_count,
         }
@@ -103,6 +107,23 @@ class Stage1Result:
 class QaParseResult:
     units: list[UnitDraft]
     unstable: bool = False
+    ordinals: list[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _NativeSection:
+    title: str
+    body: str
+    ordinal: int
+    start_page_no: int
+    end_page_no: int
+
+
+@dataclass(frozen=True)
+class _QaFormRecovery:
+    elements: list[dict[str, Any]]
+    section_count: int = 0
+    replaced_carriers: int = 0
 
 
 def s1_preprocess_elements(
@@ -225,6 +246,19 @@ def s2_apply_heading_tree(
     stack: list[tuple[int, str, int | None]] = []
     placed: list[PreparedElement] = []
     for element in elements:
+        text = (element.text or "").strip()
+        if (
+            qa_heading_mode
+            and element.kind == "heading"
+            and (element.artifact_locator or {}).get("source") == "native_text"
+            and rules.QA_FORM_MAIN_SECTION_RE.match(text)
+            and _heading_ordinal(text) == 1
+        ):
+            # A recovered official-form section run is a sibling of the form
+            # metadata, not a child of MinerU's optional level-1 document
+            # title.  Reset only at the proven native first section so normal
+            # filing heading trees and ordinary QA documents are untouched.
+            stack = []
         if qa_heading_mode and element.kind == "table" and element.table_caption:
             first_caption = str(element.table_caption[0]).strip()
             if rules.ATTACHMENT_CAPTION_RE.match(first_caption):
@@ -425,41 +459,55 @@ def s3_build_text_units(
 
 def s4_build_qa_units(text: str, *, source: UnitDraft) -> QaParseResult:
     lines = _qa_lines(text)
+    native_source = (source.artifact_locator or {}).get("source") == "native_text"
     allow_numbered_question = any(
         rules.ANSWER_START_RE.match(line.strip()) for line in lines
     )
-    current_question: str | None = None
+    current_question_lines: list[str] = []
+    current_ordinal: int | None = None
     answer_lines: list[str] = []
     raw_lines: list[str] = []
     seen_answer = False
     units: list[UnitDraft] = []
+    ordinals: list[int] = []
     unstable = False
 
     def emit() -> None:
-        nonlocal current_question, answer_lines, raw_lines, seen_answer, unstable
-        if current_question is None:
+        nonlocal current_question_lines, current_ordinal
+        nonlocal answer_lines, raw_lines, seen_answer, unstable
+        if not current_question_lines:
             return
-        answer = "\n".join(line for line in answer_lines if line.strip()).strip()
-        if not answer:
+        question = _join_wrapped_lines(current_question_lines)
+        answer = (
+            _join_wrapped_lines(answer_lines)
+            if native_source
+            else "\n".join(line for line in answer_lines if line.strip()).strip()
+        )
+        if not question or not answer or (native_source and not seen_answer):
             unstable = True
             return
         units.append(
             UnitDraft(
                 payload_kind="qa",
                 payload={
-                    "question": current_question.strip(),
+                    "question": question,
                     "answer": answer,
                     "raw_text": "\n".join(raw_lines).strip(),
                 },
                 source_order=source.source_order,
                 intra_order=source.intra_order + len(units),
                 heading_path=list(source.heading_path),
-                title=source.title,
+                # A QA leaf is addressed by its question; the surrounding
+                # section remains in heading_path ("三、主要交流问题").
+                title=question,
                 quality_status=source.quality_status,
                 artifact_locator=source.artifact_locator,
             )
         )
-        current_question = None
+        if current_ordinal is not None:
+            ordinals.append(current_ordinal)
+        current_question_lines = []
+        current_ordinal = None
         answer_lines = []
         raw_lines = []
         seen_answer = False
@@ -471,17 +519,18 @@ def s4_build_qa_units(text: str, *, source: UnitDraft) -> QaParseResult:
         if rules.QUESTION_START_RE.match(stripped) or (
             allow_numbered_question and _numbered_line(stripped)
         ):
-            if current_question is not None:
+            if current_question_lines:
                 emit()
                 if unstable:
                     break
-            current_question = _strip_question_prefix(stripped)
+            current_question_lines = [_strip_question_prefix(stripped)]
+            current_ordinal = _heading_ordinal(stripped)
             raw_lines = [stripped]
             answer_lines = []
             seen_answer = False
             continue
         if rules.ANSWER_START_RE.match(stripped):
-            if current_question is None:
+            if not current_question_lines:
                 unstable = True
                 break
             if seen_answer:
@@ -491,18 +540,25 @@ def s4_build_qa_units(text: str, *, source: UnitDraft) -> QaParseResult:
             raw_lines.append(stripped)
             answer_lines.append(_strip_answer_prefix(stripped))
             continue
-        if current_question is not None:
+        if current_question_lines:
             raw_lines.append(stripped)
             if seen_answer:
                 answer_lines.append(stripped)
+            elif native_source:
+                # Native PDF text preserves hard line wraps.  Until the first
+                # 答/回复 marker, a wrapped line is still part of the question,
+                # not an answer fragment.
+                current_question_lines.append(stripped)
             else:
+                # Existing MinerU contract: a line after an explicit question
+                # may be an unlabelled answer.
                 answer_lines.append(stripped)
 
     if not unstable:
         emit()
     if unstable:
-        return QaParseResult(units=[], unstable=True)
-    return QaParseResult(units=units, unstable=False)
+        return QaParseResult(units=[], unstable=True, ordinals=[])
+    return QaParseResult(units=units, unstable=False, ordinals=ordinals)
 
 
 def replace_text_units_with_qa_where_stable(units: Iterable[UnitDraft]) -> list[UnitDraft]:
@@ -512,7 +568,19 @@ def replace_text_units_with_qa_where_stable(units: Iterable[UnitDraft]) -> list[
             output.append(unit)
             continue
         result = s4_build_qa_units(str(unit.payload["text"]), source=unit)
-        if result.unstable:
+        native_qa_section = (
+            (unit.artifact_locator or {}).get("source") == "native_text"
+            and any(
+                rules.QA_FORM_QA_SECTION_RE.search(title)
+                for title in [unit.title or "", *unit.heading_path]
+            )
+        )
+        native_sequence_unstable = native_qa_section and (
+            not result.units
+            or len(result.ordinals) != len(result.units)
+            or result.ordinals != list(range(1, len(result.ordinals) + 1))
+        )
+        if result.unstable or native_sequence_unstable:
             output.append(
                 UnitDraft(
                     **{
@@ -570,6 +638,28 @@ def _flag_shredded_qa_table(unit: UnitDraft) -> UnitDraft:
     return UnitDraft(**{**unit.__dict__, "quality_status": "needs_review"})
 
 
+def _downgrade_qa_before_shredded_table(units: list[UnitDraft]) -> list[UnitDraft]:
+    """A Q&A cut at a text→table page boundary is not a complete `ok` QA."""
+
+    out = list(units)
+    for index, unit in enumerate(out):
+        if (
+            unit.payload_kind != "table"
+            or unit.quality_status != "needs_review"
+            or not rules.QA_TABLE_MARKER_RE.search(_main_text(unit))
+        ):
+            continue
+        previous = index - 1
+        if previous < 0:
+            continue
+        candidate = out[previous]
+        if candidate.payload_kind == "qa" and candidate.heading_path == unit.heading_path:
+            out[previous] = UnitDraft(
+                **{**candidate.__dict__, "quality_status": "needs_review"}
+            )
+    return out
+
+
 def _reanchor_qa_form_footer(
     unit: UnitDraft, *, document_title: str | None
 ) -> UnitDraft:
@@ -589,11 +679,26 @@ def _reanchor_qa_form_footer(
         rules.QA_FORM_FOOTER_FIELD_RE.match(first) for first in firsts
     ):
         return unit
+    headers = [str(cell).strip() for cell in unit.payload.get("headers") or []]
+    header_first = headers[0] if headers else ""
+    carries_narrative_overflow = bool(
+        any(headers)
+        and not (
+            header_first
+            and rules.QA_FORM_FOOTER_FIELD_RE.match(header_first)
+        )
+    )
     return UnitDraft(
         **{
             **unit.__dict__,
             "heading_path": [document_title],
             "title": document_title,
+            # Without a native-text recovery channel, a blank first header can
+            # hide the tail of the final answer (1217576500 page 7).  Keep the
+            # content but fail closed instead of calling the footer clean.
+            "quality_status": (
+                "needs_review" if carries_narrative_overflow else unit.quality_status
+            ),
         }
     )
 
@@ -709,6 +814,549 @@ def s7_finalize_units(
     return finalized
 
 
+def _native_qa_form_sections(native_text: Any) -> list[_NativeSection]:
+    """Recover consecutive top-level form sections from the PDF text layer.
+
+    The native channel stays parser-neutral; this is the business-aware gate.
+    We require a consecutive run beginning at 一、 and containing a Q&A section,
+    then stop before the official form footer/attachment.  Anything less
+    certain falls back to the MinerU elements unchanged.
+    """
+
+    if not isinstance(native_text, dict) or native_text.get("status") != "ok":
+        return []
+    pages = native_text.get("pages")
+    if not isinstance(pages, list):
+        return []
+
+    lines: list[tuple[int, str]] = []
+    for page in pages:
+        if not isinstance(page, dict):
+            return []
+        page_no = _int_or_none(page.get("page_no"))
+        if page_no is None:
+            return []
+        for raw_line in str(page.get("text") or "").splitlines():
+            line = raw_line.strip()
+            if line:
+                lines.append((page_no, line))
+    if not lines:
+        return []
+
+    end_index = next(
+        (
+            index
+            for index, (_, line) in enumerate(lines)
+            if rules.QA_FORM_NARRATIVE_END_RE.match(line)
+        ),
+        len(lines),
+    )
+    candidates: list[tuple[int, str, int]] = []
+    for index, (_, line) in enumerate(lines[:end_index]):
+        match = rules.QA_FORM_MAIN_SECTION_RE.match(line)
+        if match is None:
+            continue
+        title = match.group(1).strip()
+        ordinal = _heading_ordinal(title)
+        if ordinal is not None:
+            candidates.append((index, title, ordinal))
+
+    runs: list[list[tuple[int, str, int]]] = []
+    for start, candidate in enumerate(candidates):
+        if candidate[2] != 1:
+            continue
+        run = [candidate]
+        expected = 2
+        for following in candidates[start + 1 :]:
+            if following[2] != expected:
+                break
+            run.append(following)
+            expected += 1
+        if len(run) >= 2 and any(
+            rules.QA_FORM_QA_SECTION_RE.search(title) for _, title, _ in run
+        ):
+            runs.append(run)
+    if not runs:
+        return []
+    run = max(runs, key=len)
+
+    sections: list[_NativeSection] = []
+    for offset, (line_index, title, ordinal) in enumerate(run):
+        next_index = run[offset + 1][0] if offset + 1 < len(run) else end_index
+        body_lines = [
+            line
+            for _, line in lines[line_index + 1 : next_index]
+            if not rules.QA_FORM_NARRATIVE_LABEL_RE.match(line)
+        ]
+        if not body_lines:
+            return []
+        page_numbers = [page_no for page_no, _ in lines[line_index:next_index]]
+        sections.append(
+            _NativeSection(
+                title=title,
+                body="\n".join(body_lines),
+                ordinal=ordinal,
+                start_page_no=min(page_numbers),
+                end_page_no=max(page_numbers),
+            )
+        )
+    for section in sections:
+        if not rules.QA_FORM_QA_SECTION_RE.search(section.title):
+            continue
+        qa_check = s4_build_qa_units(
+            section.body,
+            source=UnitDraft(
+                payload_kind="text",
+                payload={"text": section.body},
+                source_order=0,
+                heading_path=[section.title],
+                artifact_locator={"source": "native_text"},
+            ),
+        )
+        if qa_check.unstable or not qa_check.units:
+            return []
+    return sections
+
+
+def _raw_table_text(element: dict[str, Any]) -> str:
+    table = element.get("table") or {}
+    headers = table.get("headers") or []
+    rows = table.get("rows") or []
+    return " ".join(
+        [str(item) for item in element.get("table_caption") or []]
+        + [str(cell) for cell in headers]
+        + [str(cell) for row in rows for cell in row]
+    )
+
+
+def _raw_element_text(element: dict[str, Any]) -> str:
+    if str(element.get("kind")) == "table":
+        return _raw_table_text(element)
+    return str(element.get("text") or "")
+
+
+def _marker_start(text: str, marker: str) -> int | None:
+    compact = re.sub(r"\s+", "", marker)
+    if not compact:
+        return None
+    match = re.search(r"\s*".join(re.escape(char) for char in compact), text)
+    return match.start() if match is not None else None
+
+
+def _element_contains_marker(element: dict[str, Any], marker: str) -> bool:
+    return _marker_start(_raw_element_text(element), marker) is not None
+
+
+def _raw_start_table_is_safe_narrative(
+    element: dict[str, Any], marker: str
+) -> bool:
+    if str(element.get("kind")) != "table":
+        return True
+    table = element.get("table") or {}
+    marker_seen = False
+    for row in [table.get("headers") or [], *(table.get("rows") or [])]:
+        narrative_cells: list[str] = []
+        marker_in_row = False
+        for cell in row:
+            text = str(cell)
+            marker_start = _marker_start(text, marker)
+            if marker_start is not None:
+                marker_seen = True
+                marker_in_row = True
+                narrative_cells.append(_comparison_text(text[marker_start:]))
+            elif marker_seen:
+                narrative_cells.append(_comparison_text(text))
+        if marker_seen and not marker_in_row and any(narrative_cells):
+            # Even a sparse one-nonempty-cell row can be one column of a real
+            # table.  The only proven first-carrier shape has the narrative in
+            # the final non-empty row, so any later content makes recovery
+            # structurally ambiguous and must fall back.
+            return False
+        distinct = {cell for cell in narrative_cells if cell}
+        if len(distinct) > 1:
+            # The first form carrier contains a real multi-column table after
+            # the narrative marker.  Text coverage cannot authorize dropping
+            # its row/column structure.
+            return False
+    return marker_seen
+
+
+def _trim_raw_table_before_marker(
+    element: dict[str, Any], marker: str
+) -> dict[str, Any] | None:
+    if str(element.get("kind")) != "table" or element.get("table_parse_failed"):
+        return None
+    table = dict(element.get("table") or {})
+    seen = False
+
+    def trim(cell: Any) -> str:
+        nonlocal seen
+        text = str(cell)
+        start = _marker_start(text, marker)
+        if start is not None:
+            seen = True
+            return text[:start].rstrip()
+        return "" if seen else text
+
+    table["headers"] = [trim(cell) for cell in table.get("headers") or []]
+    table["rows"] = [
+        [trim(cell) for cell in row] for row in table.get("rows") or []
+    ]
+    if not seen:
+        return None
+    return {**element, "table": table}
+
+
+def _raw_table_is_empty(element: dict[str, Any]) -> bool:
+    table = element.get("table") or {}
+    return not any(str(cell).strip() for cell in table.get("headers") or []) and not any(
+        str(cell).strip() for row in table.get("rows") or [] for cell in row
+    )
+
+
+def _raw_table_is_qa_prose_carrier(element: dict[str, Any]) -> bool:
+    if str(element.get("kind")) != "table":
+        return False
+    table = element.get("table") or {}
+    rows = table.get("rows") or []
+    grids = [table.get("headers") or [], *rows]
+    nonempty_columns = max(
+        (sum(bool(str(cell).strip()) for cell in row) for row in grids),
+        default=0,
+    )
+    occupied_columns = {
+        column
+        for row in grids
+        for column, cell in enumerate(row)
+        if str(cell).strip()
+    }
+    text = _raw_table_text(element)
+    return (
+        not element.get("table_caption")
+        and nonempty_columns <= 1
+        and len(occupied_columns) <= 1
+        and len(text) >= rules.QA_TABLE_CONTENT_MIN_CHARS
+        and bool(rules.QA_TABLE_MARKER_RE.search(text))
+    )
+
+
+def _raw_attachment_table(element: dict[str, Any]) -> bool:
+    if str(element.get("kind")) != "table":
+        return False
+    captions = [str(item).strip() for item in element.get("table_caption") or []]
+    return bool(captions and rules.ATTACHMENT_CAPTION_RE.match(captions[0]))
+
+
+def _raw_attachment_boundary(element: dict[str, Any]) -> bool:
+    if _raw_attachment_table(element):
+        return True
+    if str(element.get("kind")) not in {"text", "heading"}:
+        return False
+    first_line = next(
+        (line.strip() for line in str(element.get("text") or "").splitlines() if line.strip()),
+        "",
+    )
+    return bool(rules.ATTACHMENT_CAPTION_RE.match(first_line))
+
+
+def _normalized_attachment_boundary(
+    element: dict[str, Any],
+) -> dict[str, Any] | None:
+    if _raw_attachment_table(element):
+        return element
+    lines = [
+        line.strip()
+        for line in str(element.get("text") or "").splitlines()
+        if line.strip()
+    ]
+    if len(lines) != 1 or not rules.ATTACHMENT_CAPTION_RE.match(lines[0]):
+        return None
+    return {
+        **element,
+        "kind": "heading",
+        "heading_level": 1,
+        "text": lines[0],
+    }
+
+
+def _raw_footer_only(element: dict[str, Any]) -> tuple[dict[str, Any], int] | None:
+    if str(element.get("kind")) != "table" or element.get("table_parse_failed"):
+        return None
+    table = dict(element.get("table") or {})
+    rows = [[str(cell) for cell in row] for row in table.get("rows") or []]
+    first_footer = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if row and rules.QA_FORM_FOOTER_FIELD_RE.match(row[0].strip())
+        ),
+        None,
+    )
+    if first_footer is None:
+        return None
+    pre_footer_grids = [table.get("headers") or [], *rows[:first_footer]]
+    if any(
+        sum(bool(str(cell).strip()) for cell in row) > 1
+        for row in pre_footer_grids
+    ):
+        # A structured multi-column table immediately before the template
+        # footer is business content, not narrative overflow.  Recovery must
+        # keep the original MinerU structure instead of flattening it.
+        return None
+    occupied_columns = {
+        column
+        for row in pre_footer_grids
+        for column, cell in enumerate(row)
+        if str(cell).strip()
+    }
+    if len(occupied_columns) > 1:
+        # A sparse table may have only one non-empty cell per row while values
+        # alternate across real columns.  Narrative overflow stays in one
+        # fixed outer-form cell; cross-column content is structural.
+        return None
+    footer_rows = rows[first_footer:]
+    first_cells = [row[0].strip() for row in footer_rows if row and row[0].strip()]
+    if not first_cells or not all(
+        rules.QA_FORM_FOOTER_FIELD_RE.match(cell) for cell in first_cells
+    ):
+        return None
+    merged_cells = []
+    for cell in table.get("merged_cells") or []:
+        row = int(cell["row"])
+        if row < first_footer:
+            continue
+        merged_cells.append({**cell, "row": row - first_footer})
+    table["headers"] = []
+    table["rows"] = footer_rows
+    if merged_cells:
+        table["merged_cells"] = merged_cells
+    else:
+        table.pop("merged_cells", None)
+    return {**element, "table": table}, first_footer
+
+
+def _comparison_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    # MinerU's Markdown text escapes a literal tilde as ``\~`` while the
+    # native PDF text layer contains ``~``.  The backslash is serialization
+    # syntax, not source punctuation; keep the tilde itself so ranges such as
+    # ``1~2 年`` still participate in strict fact-preserving comparison.
+    normalized = normalized.replace(r"\~", "~")
+    # Only PDF hard-wrap whitespace is layout noise.  Preserve punctuation,
+    # decimals, percent signs and +/- because they carry financial meaning.
+    return re.sub(r"\s+", "", normalized)
+
+
+def _native_covers_replaced_narrative(
+    *,
+    raw_elements: list[dict[str, Any]],
+    start_index: int,
+    attachment_index: int,
+    sections: list[_NativeSection],
+) -> bool:
+    first_title = sections[0].title
+    fragments: list[str] = []
+
+    def add_fragment(value: Any) -> None:
+        compact = _comparison_text(str(value))
+        if compact and (not fragments or compact != fragments[-1]):
+            fragments.append(compact)
+
+    first_element = raw_elements[start_index]
+    if str(first_element.get("kind")) == "table":
+        table = first_element.get("table") or {}
+        marker_seen = False
+        for row in [table.get("headers") or [], *(table.get("rows") or [])]:
+            for cell in row:
+                text = str(cell)
+                marker = _marker_start(text, first_title)
+                if marker is not None:
+                    marker_seen = True
+                    add_fragment(text[marker:])
+                elif marker_seen:
+                    add_fragment(text)
+        if not marker_seen:
+            return False
+    else:
+        first_text = _raw_element_text(first_element)
+        first_marker = _marker_start(first_text, first_title)
+        if first_marker is None:
+            return False
+        add_fragment(first_text[first_marker:])
+
+    for element in raw_elements[start_index + 1 : attachment_index]:
+        kind = str(element.get("kind"))
+        if kind in {"text", "heading"}:
+            add_fragment(_raw_element_text(element))
+            continue
+        if kind != "table":
+            continue
+        table = element.get("table") or {}
+        footer_result = _raw_footer_only(element)
+        if footer_result is not None:
+            headers = table.get("headers") or []
+            rows = table.get("rows") or []
+            first_footer = footer_result[1]
+            for cell in headers:
+                add_fragment(cell)
+            for row in rows[:first_footer]:
+                for cell in row:
+                    add_fragment(cell)
+        elif _raw_table_is_qa_prose_carrier(element):
+            for cell in table.get("headers") or []:
+                add_fragment(cell)
+            for row in table.get("rows") or []:
+                for cell in row:
+                    add_fragment(cell)
+
+    native_text = _comparison_text(
+        "\n".join(f"{section.title}\n{section.body}" for section in sections)
+    )
+    if not fragments or not native_text:
+        return False
+    cursor = 0
+    for fragment in fragments:
+        position = native_text.find(fragment, cursor)
+        if position < 0:
+            return False
+        cursor = position + len(fragment)
+    return True
+
+
+def _replace_qa_form_narrative(
+    normalized_ir: dict[str, Any], *, filing_type: str | None
+) -> _QaFormRecovery:
+    raw_elements = [dict(item) for item in normalized_ir.get("elements", [])]
+    if filing_type not in {"investor_relations", "performance_briefing"}:
+        return _QaFormRecovery(elements=raw_elements)
+    sections = _native_qa_form_sections(normalized_ir.get("native_text"))
+    if not sections:
+        return _QaFormRecovery(elements=raw_elements)
+
+    first_title = sections[0].title
+    start_index = next(
+        (
+            index
+            for index, element in enumerate(raw_elements)
+            if _element_contains_marker(element, first_title)
+        ),
+        None,
+    )
+    if start_index is None:
+        return _QaFormRecovery(elements=raw_elements)
+    if not _raw_start_table_is_safe_narrative(
+        raw_elements[start_index], first_title
+    ):
+        return _QaFormRecovery(elements=raw_elements)
+    attachment_index = next(
+        (
+            index
+            for index, element in enumerate(raw_elements[start_index:], start_index)
+            if _raw_attachment_boundary(element)
+        ),
+        len(raw_elements),
+    )
+    attachment_suffix = list(raw_elements[attachment_index:])
+    if attachment_suffix:
+        normalized_boundary = _normalized_attachment_boundary(attachment_suffix[0])
+        if normalized_boundary is None:
+            return _QaFormRecovery(elements=raw_elements)
+        attachment_suffix[0] = normalized_boundary
+    if not _native_covers_replaced_narrative(
+        raw_elements=raw_elements,
+        start_index=start_index,
+        attachment_index=attachment_index,
+        sections=sections,
+    ):
+        return _QaFormRecovery(elements=raw_elements)
+
+    prefix = list(raw_elements[:start_index])
+    trimmed = _trim_raw_table_before_marker(raw_elements[start_index], first_title)
+    if trimmed is not None and not _raw_table_is_empty(trimmed):
+        prefix.append(trimmed)
+    elif str(raw_elements[start_index].get("kind")) != "table":
+        # A plain text/heading carrier is fully replaced by native text.
+        trimmed = {}
+    else:
+        return _QaFormRecovery(elements=raw_elements)
+
+    footer: list[dict[str, Any]] = []
+    replaced_carriers = 1
+    for element in raw_elements[start_index + 1 : attachment_index]:
+        kind = str(element.get("kind"))
+        if kind in {"text", "heading", "page_furniture"}:
+            continue
+        if kind == "unknown" and not _clean_text(_element_text(element)):
+            # Mirror S1 for legacy persisted IR whose mapper emitted an empty
+            # unknown.  New MinerU string-list items are preserved as text by
+            # mapper_to_ir and therefore pass through the strict coverage
+            # comparison instead of relying on this compatibility branch.
+            continue
+        if kind == "table":
+            footer_result = _raw_footer_only(element)
+            if footer_result is not None:
+                footer_element, overflow_rows = footer_result
+                footer.append(footer_element)
+                replaced_carriers += int(overflow_rows > 0)
+                continue
+            if _raw_table_is_empty(element):
+                continue
+            if _raw_table_is_qa_prose_carrier(element):
+                replaced_carriers += 1
+                continue
+        # Do not silently flatten a real business table/image/equation.  This
+        # form is outside the high-confidence recovery family; keep MinerU and
+        # its needs_review behavior unchanged.
+        return _QaFormRecovery(elements=raw_elements)
+
+    native_hash = str((normalized_ir.get("native_text") or {}).get("content_hash") or "")
+    recovered: list[dict[str, Any]] = []
+    for section in sections:
+        locator = {
+            "source": "native_text",
+            "page_span": [section.start_page_no, section.end_page_no],
+        }
+        if native_hash:
+            locator["native_text_hash"] = native_hash
+        recovered.extend(
+            [
+                {
+                    "kind": "heading",
+                    "raw_kind": "native_text",
+                    "heading_level": 2,
+                    "text": section.title,
+                    "page_no": section.start_page_no,
+                    **locator,
+                },
+                {
+                    "kind": "text",
+                    "raw_kind": "native_text",
+                    "text": (
+                        section.body
+                        if rules.QA_FORM_QA_SECTION_RE.search(section.title)
+                        else _join_native_prose(section.body)
+                    ),
+                    "page_no": section.start_page_no,
+                    **locator,
+                },
+            ]
+        )
+
+    combined = [*prefix, *recovered, *footer, *attachment_suffix]
+    reindexed: list[dict[str, Any]] = []
+    for order_index, element in enumerate(combined):
+        values = dict(element)
+        if "order_index" in values:
+            values["source_order_index"] = values["order_index"]
+        values["order_index"] = order_index
+        reindexed.append(values)
+    return _QaFormRecovery(
+        elements=reindexed,
+        section_count=len(sections),
+        replaced_carriers=replaced_carriers,
+    )
+
+
 def build_unit_drafts_s1_s7(
     normalized_ir: dict[str, Any],
     *,
@@ -716,10 +1364,15 @@ def build_unit_drafts_s1_s7(
     document_title: str | None = None,
     image_bytes_resolver: ImageBytesResolver | None = None,
 ) -> tuple[list[UnitDraft], BuildStats]:
+    recovery = _replace_qa_form_narrative(
+        normalized_ir, filing_type=filing_type
+    )
     s1 = s1_preprocess_elements(
-        normalized_ir.get("elements", []),
+        recovery.elements,
         image_bytes_resolver=image_bytes_resolver,
     )
+    s1.stats.native_text_sections_recovered = recovery.section_count
+    s1.stats.qa_form_carriers_replaced = recovery.replaced_carriers
     elements = _drop_cover_prelude(s1.elements, stats=s1.stats)
     placed = s2_apply_heading_tree(
         elements,
@@ -737,6 +1390,8 @@ def build_unit_drafts_s1_s7(
         ]
     table_qa_units = _qa_units_from_tables(table_units)
     units = sorted([*text_units, *table_units, *table_qa_units], key=_unit_sort_key)
+    if filing_type in {"investor_relations", "performance_briefing"}:
+        units = _downgrade_qa_before_shredded_table(units)
     units = _sink_leading_applicable(units)
     kept = s6_filter_units(units, s1.stats)
     kept = _anchor_headerless_units(kept, document_title=document_title, stats=s1.stats)
@@ -823,11 +1478,13 @@ def s8_group_semantic_units(
     L2-facing units must express a complete business fact: a meeting proposal
     (审议结果 + 表决表格 + 会议决定) becomes ONE mixed unit with ordered parts,
     and a short filing without proposal structure becomes ONE document-level
-    mixed unit. QA-mode filings are already semantic and are never regrouped.
+    mixed unit. QA leaves are already semantic and are never regrouped; the
+    non-QA prelude/sections inside an IR filing still use normal section
+    grouping.
     """
 
     if filing_type in {"investor_relations", "performance_briefing"}:
-        return units
+        return _group_section_units(units, filing_type=filing_type, stats=stats)
     grouped, made_proposals = _group_proposal_units(
         _split_units_at_proposal_anchors(units), filing_type=filing_type, stats=stats
     )
@@ -1434,6 +2091,9 @@ def _artifact_locator(element: dict[str, Any]) -> dict[str, Any]:
         locator["page_no"] = element.get("page_no")
     if element.get("bbox") is not None:
         locator["bbox"] = element.get("bbox")
+    for key in ("source", "source_order_index", "page_span", "native_text_hash"):
+        if element.get(key) is not None:
+            locator[key] = element.get(key)
     return locator
 
 
@@ -1583,16 +2243,50 @@ def _sink_leading_applicable(units: list[UnitDraft]) -> list[UnitDraft]:
 
 def _qa_lines(text: str) -> list[str]:
     prepared = re.sub(
-        r"(?<!^)(?=\d+(?:[、．]|\.(?!\d))\s*)",
+        r"(?<!^)(?<!\d)(?=\d+(?:[、．]|\.(?!\d))\s*)",
         "\n",
         text,
     )
     prepared = re.sub(
-        r"([？?])(?=(答|回复|公司回复|A\d*)\s*[：:])",
+        r"([？?])(?=\s*(答|回复|公司回复|A\d*)\s*[：:])",
         "\\1\n",
         prepared,
     )
     return prepared.splitlines()
+
+
+def _join_wrapped_lines(lines: list[str]) -> str:
+    """Join PDF hard wraps without inventing spaces inside Chinese words."""
+
+    joined = ""
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if joined and re.search(r"[A-Za-z0-9]$", joined) and re.match(
+            r"^[A-Za-z0-9]", line
+        ):
+            joined += " "
+        joined += line
+    return joined.strip()
+
+
+def _join_native_prose(text: str) -> str:
+    """Remove PDF hard wraps while preserving numbered-list boundaries."""
+
+    paragraphs: list[str] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _numbered_line(stripped) and current:
+            paragraphs.append(_join_wrapped_lines(current))
+            current = []
+        current.append(stripped)
+    if current:
+        paragraphs.append(_join_wrapped_lines(current))
+    return "\n".join(paragraph for paragraph in paragraphs if paragraph)
 
 
 def _numbered_line(text: str) -> bool:
@@ -1848,7 +2542,7 @@ def _table_caption_first(unit: UnitDraft) -> str:
 def _qa_units_from_tables(table_units: Iterable[UnitDraft]) -> list[UnitDraft]:
     units: list[UnitDraft] = []
     for table in table_units:
-        if table.payload_kind != "table":
+        if table.payload_kind != "table" or table.quality_status != "ok":
             continue
         text_blocks = ["\n".join(str(cell) for cell in row) for row in table.payload.get("rows", [])]
         for offset, text in enumerate(text_blocks, start=100):

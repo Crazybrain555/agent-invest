@@ -589,6 +589,45 @@ ub-2026.07-9 代并 prune；门禁全绿。
   （分部信息类）是原文内容且承载路径，保留。
 - SKIP/FIXED 词表加"备查文件目录"（备查文件的年报变体，显式化既有丢弃语义）。
 
+### ub-2026.07-22（2026-07-15：投关表单跨页正文无损恢复）
+
+- 根因样本 `provider_document_id=1217576500`：官方 PDF 把正文放在跨页外层表格单元格中，
+  MinerU 的物理 table 判定正确，但跨页拼接漏掉第 10 问并把其余问答拆成 text/table/footer
+  残片。NormalizedIR v2 增加可选 `native_text` shadow（pdfplumber 逐页文本、版本、hash、
+  字符统计）；只对标题有“活动记录表/调研记录/业绩说明会问答或实录”证据的**完整页解析**
+  生成，且在 MinerU 剩余 timeout 预算内的可终止子进程执行。MinerU 继续是表格、版面和
+  locator 真源。
+- builder 恢复门为 fail-closed：native 必须有从“一、”起连续章节、章节内真实闭合 QA、
+  首章节在 MinerU 载荷中可定位；所有将被替换的 MinerU 正文片段须在保留小数点、百分号、
+  正负号等符号后，按顺序逐片段严格存在于 native 文本。任何独有事实、真实多列表、
+  image/equation 或不安全附件边界均取消替换并保留原产物；问答序号有缺口时禁止拆成 QA，
+  但可在 coverage 已证明不丢 MinerU 片段的前提下保留完整 native section 为 `needs_review`。
+- 恢复后按章节生成 2 个正文单元，问答以 question 为 title、章节为 heading_path；PDF
+  硬换行只在可检索正文/answer 中消除，`raw_text` 仍保留。真实样本重建结果为 3 table +
+  2 text + 10 qa，Q1–Q10 连续且 footer/附件各归正确顶层路径，无“公告头信息”。
+
+### ub-2026.07-23（2026-07-15：真实重解析形态兼容）
+
+- `1217576500` 真实重解析时 MinerU 已把大部分问答输出为 text，但仍把第 10 问答案尾段塞进
+  footer table；严格 recovery coverage 又被官方表单纵向标签尾片 `要内容介绍`、Markdown
+  的 `\~` 转义和一个在旧 IR 中表现为空的 list 节点拒绝。
+- recovery 精确删除纵向标签尾片、比较时把 `\~` 还原为 `~`（波浪号本身仍参与比较），并
+  为已落盘的空 unknown 保留与 S1 相同的兼容分支；任何非空 unknown、MinerU 独有事实或
+  结构化表仍取消恢复并保留原产物。随后复核证实该空 unknown 的 raw `list_items` 实际有正文，
+  因此不能把兼容分支当成根因修复，见 -24。
+
+### ub-2026.07-24（2026-07-15：MinerU list 保真与稳定章节根）
+
+- MinerU 会直接输出 `type=list + list_items:string[]`；旧 mapper 仅复制 `item.text`，把这类
+  正文落成空 unknown，违反“未映射类型不得静默消失”边界。mapper 现将至少含一个非空值的
+  纯字符串列表按原顺序以换行连接为 `kind=text, raw_kind=list`；空/混合/嵌套形状仍保持
+  unknown，交给既有 fail-visible 路径。
+- 新 MinerU 形态还带一级文档标题。仅当投关模式遇到 `source=native_text` 且序号为“一、”的
+  已证明恢复章节时清空标题栈，使表单元数据、第一/二节正文和第三节问答成为同级业务分支；
+  普通标题树、普通 QA 和非 native 元素不受影响。
+- 真实 content_list→mapper→builder 重放为 `3 table + 2 text + 10 qa`，6 条经营亮点、Q1–Q10、
+  Q10 跨页尾段、footer 与附件全部保留，`needs_review=0`，无 mixed 合并和“公告头信息”。
+
 ## 9. 明确不做
 
 - 不抽取 claim；不做 table_cell / page-bbox 核心索引；不做 LLM 语义价值判断；

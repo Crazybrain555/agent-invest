@@ -180,6 +180,66 @@
         }
       }
     },
+    "native_text": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "extractor",
+        "content_hash",
+        "non_whitespace_chars",
+        "pages"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["ok", "empty"]
+        },
+        "extractor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version"],
+          "properties": {
+            "name": {
+              "const": "pdfplumber"
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "content_hash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "non_whitespace_chars": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["page_no", "text", "non_whitespace_chars"],
+            "properties": {
+              "page_no": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "text": {
+                "type": "string"
+              },
+              "non_whitespace_chars": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
     "elements": {
       "type": "array",
       "items": {

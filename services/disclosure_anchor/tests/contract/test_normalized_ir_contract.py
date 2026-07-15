@@ -116,6 +116,30 @@ class NormalizedIRContractTests(unittest.TestCase):
             self._assert_valid(data, label=sample_key)
             self.assertGreater(len(data["elements"]), 0, sample_key)
 
+    def test_optional_native_text_shadow_validates_strict_shape(self) -> None:
+        data = _load_fixture("ir_activity")
+        data["native_text"] = {
+            "status": "ok",
+            "extractor": {"name": "pdfplumber", "version": "0.11.10"},
+            "content_hash": "sha256:" + "0" * 64,
+            "non_whitespace_chars": 8,
+            "pages": [
+                {
+                    "page_no": 1,
+                    "text": "一、经营情况",
+                    "non_whitespace_chars": 8,
+                }
+            ],
+        }
+        self._assert_valid(data, label="native_text_shadow")
+
+        data["native_text"]["unexpected"] = True
+        self._assert_invalid(
+            data,
+            label="native_text_shadow_extra_field",
+            path=("native_text",),
+        )
+
     def test_optional_full_annual_fixture_validates_when_present(self) -> None:
         path = PHASE00_ROOT / "annual_report" / "normalized_ir.v2.json"
         if not path.is_file():
@@ -184,6 +208,11 @@ class NormalizedIRContractTests(unittest.TestCase):
                         "<tr><td>收入</td><td>10</td></tr></table>"
                     ),
                 },
+                {
+                    "type": "list",
+                    "list_items": ["1、第一项", "2、第二项"],
+                    "page_idx": 0,
+                },
             ],
             parser_info=MinerUParserInfo(
                 name="MinerU",
@@ -214,6 +243,9 @@ class NormalizedIRContractTests(unittest.TestCase):
             normalized["elements"][1]["table"],
             {"headers": ["项目", "金额"], "rows": [["收入", "10"]]},
         )
+        self.assertEqual(normalized["elements"][2]["kind"], "text")
+        self.assertEqual(normalized["elements"][2]["raw_kind"], "list")
+        self.assertEqual(normalized["elements"][2]["text"], "1、第一项\n2、第二项")
 
     def test_ir_activity_first_table_preserves_embedded_qa_text(self) -> None:
         data = _load_fixture("ir_activity")

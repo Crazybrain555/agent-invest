@@ -296,6 +296,9 @@ class ParseDocument:
                 "source_pdf": document.raw_file_relpath,
                 "provider": document.provider,
                 "provider_document_id": document.provider_document_id,
+                "provider_category_names": list(
+                    (document.provider_metadata or {}).get("category_names") or []
+                ),
                 "raw_file_hash": document.raw_file_hash,
             },
         }

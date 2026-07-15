@@ -76,9 +76,10 @@ canonical 契约（`service-purpose.md` v1.2 + 顶层协议 v0.7）的深度评�
   （`page_furniture` = 页眉/页脚/页码等版面件；`equation` 为 MinerU 实际会产出的类型），
   原始类型保留在 `raw_kind`。**任何 kind 都不得静默消失**：builder 不生成 unit 的元素必须
   进入 build 统计（丢弃计数按 kind 分桶），image 类见 05-S1 的保留规则。评审建议的
-  list/chart/code/footnote 枚举值不采纳（当前 MinerU 实测：list 以 text 形态出现、chart 即
-  image、footnote 已在 table_footnote 通道），但该理由不写死为"parser 永不产出"：mapper 对
-  任何未显式映射的 raw type 一律落 `kind='unknown'` + 原样 `raw_kind`，禁止丢弃；`unknown`
+  list/chart/code/footnote 枚举值不采纳（MinerU 的稳定字符串 `list_items` 映为中立 text、
+  chart 即 image、footnote 已在 table_footnote 通道），但该理由不写死为"parser 永不产出"：
+  mapper 对任何未显式映射或形状不稳定的 raw type 一律落 `kind='unknown'` + 原样 `raw_kind`，
+  禁止丢弃；`unknown`
   的 builder 处置见 05-S1（有可读文本 → 并入 text 流 + needs_review，否则计数丢弃）。
   kind 集合以本条为唯一权威，D9 / R5 / 05 前置依赖 / IR schema 四处必须逐字一致。
   没有消费者，直接升 `normalized_ir.v2`，golden fixtures 全量再生成。
@@ -356,7 +357,9 @@ tests/contract 两个测试文件的 SCHEMA/FIXTURE 路径与断言键同步改�
    page_furniture, unknown}`（与 D9 逐字一致），原始 MinerU type 保留在 `raw_kind`；
    MinerU 映射：`text→text`、`header/page_number/footer→page_furniture`（页眉页脚页码在
    IR 层就分类出来，05 的噪声抑制只看中立 kind）、`table→table`、`image→image`、
-   `equation→equation`、**其余未映射类型→`unknown`（raw_kind 原样保留，禁止丢弃）**。
+   `equation→equation`；`list` 仅当 `list_items` 是至少含一个非空值的纯字符串列表时，按原
+   顺序以换行连接为 `text` 并保留 `raw_kind='list'`，空/混合/嵌套形状保持 `unknown`；
+   **其余未映射类型→`unknown`（raw_kind 原样保留，禁止丢弃）**。
    heading 判定谓词定死：`kind='heading'` 当且仅当 raw type=='text' 且 item 含
    'text_level' 且 int(text_level)>=1，此时 `heading_level=int(text_level)`；
    其余 text 元素 kind='text'、heading_level=null（R7 单测按此断言：

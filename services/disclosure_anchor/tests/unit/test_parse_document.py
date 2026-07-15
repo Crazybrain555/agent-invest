@@ -113,6 +113,7 @@ class _Parser:
         self.error = error
         self.identity_error = identity_error
         self.called = False
+        self.document_metadata: dict[str, Any] | None = None
 
     def identity(self) -> ParserIdentity:
         if self.identity_error is not None:
@@ -134,6 +135,7 @@ class _Parser:
         document_metadata: dict[str, Any],
     ) -> ParserResult:
         self.called = True
+        self.document_metadata = document_metadata
         if self.error is not None:
             raise self.error
         artifact_root = output_dir / "sample" / "auto"
@@ -208,6 +210,25 @@ def _use_case(
 
 
 class ParseDocumentUnitTests(unittest.TestCase):
+    def test_provider_category_names_reach_parser_metadata(self) -> None:
+        uow = _uow_with_document()
+        document = uow.documents.get("doc_1")
+        document.provider_metadata = {
+            "category_names": ["调研活动", "深市主板"],
+        }
+        uow.documents.update(document)
+        parser = _Parser()
+        use_case, _ = _use_case(uow, parser=parser)
+
+        result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+
+        self.assertEqual(result.status, "succeeded")
+        assert parser.document_metadata is not None
+        self.assertEqual(
+            parser.document_metadata["provider_category_names"],
+            ["调研活动", "深市主板"],
+        )
+
     def test_raw_missing_and_hash_mismatch_fail_before_parser(self) -> None:
         for actual_hash, expected_code in (
             (None, "raw_missing"),

@@ -25,7 +25,7 @@ from disclosure_anchor.adapters.unit_builder.builder import (
 
 class UnitBuilderTests(unittest.TestCase):
     def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-21")
+        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-24")
         self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v6")
         self.assertEqual(
             rules.SKIP_SECTION_TITLES, {"释义", "目录", "备查文件", "备查文件目录"}
@@ -1106,6 +1106,77 @@ class UnitBuilderTests(unittest.TestCase):
         )
         self.assertTrue(s4_build_qa_units("问:问题？", source=source).unstable)
 
+        unlabelled = s4_build_qa_units(
+            "问：收入如何？\n公司收入稳定。", source=source
+        )
+        self.assertFalse(unlabelled.unstable)
+        self.assertEqual(unlabelled.units[0].payload["answer"], "公司收入稳定。")
+
+        native_source = UnitDraft(
+            **{
+                **source.__dict__,
+                "artifact_locator": {"source": "native_text"},
+            }
+        )
+        self.assertTrue(
+            s4_build_qa_units(
+                "问：收入如何？\n公司收入稳定。", source=native_source
+            ).unstable
+        )
+
+    def test_s4_preserves_wrapped_questions_and_multi_digit_ordinals(self) -> None:
+        source = UnitDraft(
+            payload_kind="text",
+            payload={"text": ""},
+            source_order=1,
+            heading_path=["三、主要交流问题"],
+            artifact_locator={"source": "native_text"},
+        )
+        text = "\n".join(
+            [
+                "1、第一问跨行",
+                "继续吗？ 答：第一答。",
+                "2、第二问？",
+                "答：第二答跨",
+                "页完整。",
+                "10、第十问不会拆成第零问吗？",
+                "答：第十答。",
+            ]
+        )
+
+        parsed = s4_build_qa_units(text, source=source)
+
+        self.assertFalse(parsed.unstable)
+        self.assertEqual(parsed.ordinals, [1, 2, 10])
+        self.assertEqual(len(parsed.units), 3)
+        self.assertEqual(parsed.units[0].payload["question"], "第一问跨行继续吗？")
+        self.assertEqual(parsed.units[2].payload["question"], "第十问不会拆成第零问吗？")
+        self.assertEqual(parsed.units[2].title, "第十问不会拆成第零问吗？")
+        self.assertEqual(parsed.units[1].payload["answer"], "第二答跨页完整。")
+
+        native_source = UnitDraft(
+            payload_kind="text",
+            payload={"text": ""},
+            source_order=1,
+            heading_path=["三、主要交流问题"],
+            artifact_locator={"source": "native_text"},
+        )
+        recovered = replace_text_units_with_qa_where_stable(
+            [
+                UnitDraft(
+                    **{
+                        **native_source.__dict__,
+                        "payload": {
+                            "text": "1、第一问？答：第一答。\n问：无序号问？答：无序号答。"
+                        },
+                    }
+                )
+            ]
+        )
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].payload_kind, "text")
+        self.assertEqual(recovered[0].quality_status, "needs_review")
+
     def test_s4_unstable_text_block_becomes_needs_review_text(self) -> None:
         units = replace_text_units_with_qa_where_stable(
             [
@@ -1912,6 +1983,641 @@ class UnitBuilderTests(unittest.TestCase):
         )
         biz_table = next(u for u in units3 if "日期变更" in str(u.payload))
         self.assertEqual(biz_table.heading_path[0], "二、回购安排")
+
+    def test_native_text_recovers_qa_form_without_duplicate_prose_table(self) -> None:
+        # 1217576500 的真实故障形态：MinerU 把表单内的跨页正文截成
+        # text + 单列表格 + 页脚溢出，原生 PDF 文本层却有完整的三个章节。
+        long_answer = "第一答完整且保留全部跨页内容。" * 45
+        native_text = "\n".join(
+            [
+                "华测检测认证集团股份有限公司投资者关系活动记录表",
+                "投资者关系活动主要内容介绍",
+                "一、公司上半年业绩情况",
+                "收入和利润均保持增长。",
+                # 真实 PDF 的外层表单标签被纵向拆开，尾片落进正文行。
+                "要内容介绍",
+                "二、公司上半年经营亮点介绍",
+                "公司持续推进国际化和精益管理。",
+                "三、主要交流问题",
+                "1、第一问跨行",
+                f"继续吗？ 答：{long_answer}",
+                "2、未来 1~2 年规划？",
+                "答：第二答完整。",
+                "附件清单（如有） 《参与机构名单》",
+                "日期 2023-08-11",
+            ]
+        )
+        shredded = (
+            f"1、第一问跨行继续吗？答：{long_answer}"
+            # MinerU Markdown 对同一个原文波浪号增加转义反斜杠。
+            + r"2、未来 1\~2 年规划？"
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "native_text": {
+                    "status": "ok",
+                    "content_hash": "sha256:" + "0" * 64,
+                    "pages": [
+                        {
+                            "page_no": 1,
+                            "text": native_text,
+                            "non_whitespace_chars": len(native_text),
+                        }
+                    ],
+                },
+                "elements": [
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 1,
+                        "table_caption": [
+                            "华测检测认证集团股份有限公司投资者关系活动记录表"
+                        ],
+                        "table": {
+                            "headers": [],
+                            "rows": [
+                                ["投资者关系活动类别", "特定对象调研"],
+                                [
+                                    "投资者关系活动主要内容介绍",
+                                    "一、公司上半年业绩情况\n收入和利润",
+                                    "另一位接待人 一、公司上半年业绩情况\n收入和利润",
+                                ],
+                            ],
+                        },
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "均保持增长。",
+                    },
+                    {
+                        "kind": "unknown",
+                        "raw_kind": "list",
+                        "order_index": 3,
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 4,
+                        "table": {"headers": [shredded], "rows": []},
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 5,
+                        "table": {
+                            "headers": [],
+                            "rows": [
+                                ["答：第二答完整。", ""],
+                                ["附件清单（如有）", "《参与机构名单》"],
+                                ["日期", "2023-08-11"],
+                            ],
+                        },
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 6,
+                        "table": {"headers": [], "rows": [["", ""]]},
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 7,
+                        "heading_level": 2,
+                        "text": "附件 1：《参与机构名单》",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 8,
+                        "table": {
+                            "headers": ["机构", "姓名"],
+                            "rows": [["某某基金", "张三"]],
+                        },
+                    },
+                ],
+            },
+            filing_type="investor_relations",
+            document_title="华测检测：投资者关系活动记录表",
+        )
+
+        self.assertEqual(stats.native_text_sections_recovered, 3)
+        self.assertEqual(stats.qa_form_carriers_replaced, 3)
+        self.assertEqual(stats.needs_review_count, 0)
+        self.assertEqual(
+            [unit.payload_kind for unit in units],
+            ["table", "text", "text", "qa", "qa", "table", "table"],
+        )
+        blob = " ".join(str(unit.payload) for unit in units)
+        self.assertNotIn("第二答残片", blob)
+        self.assertIn("另一位接待人", blob)
+        self.assertNotIn(rules.DOCUMENT_HEADER_ANCHOR, blob)
+        qa_units = [unit for unit in units if unit.payload_kind == "qa"]
+        self.assertEqual(
+            [unit.payload["question"] for unit in qa_units],
+            ["第一问跨行继续吗？", "未来 1~2 年规划？"],
+        )
+        self.assertEqual(
+            [unit.title for unit in qa_units],
+            ["第一问跨行继续吗？", "未来 1~2 年规划？"],
+        )
+        self.assertTrue(
+            all(unit.heading_path == ["三、主要交流问题"] for unit in qa_units)
+        )
+        footer = next(unit for unit in units if "附件清单" in str(unit.payload))
+        self.assertNotIn("第二答完整", str(footer.payload))
+        attachment = next(unit for unit in units if "某某基金" in str(unit.payload))
+        self.assertEqual(attachment.heading_path, ["附件 1：《参与机构名单》"])
+
+    def test_native_recovery_normalizes_text_heavy_form_with_mapped_list(self) -> None:
+        document_heading = "华测检测认证集团股份有限公司投资者关系活动记录表"
+        list_text = "\n".join(
+            [
+                "1、食农检测业务保持较快增长。",
+                "2、汽车检测覆盖国内外知名车企。",
+            ]
+        )
+        native_text = "\n".join(
+            [
+                document_heading,
+                "一、公司上半年业绩情况",
+                "收入和利润均",
+                "投资者关系活动主",
+                "保持增长。",
+                "要内容介绍",
+                "二、公司上半年经营亮点介绍",
+                "公司持续推进国际化和精益管理。",
+                list_text,
+                "三、主要交流问题",
+                "1. 第一问？",
+                "答：第一答完整。",
+                "2. 未来 1~2 年规划？",
+                "答：第二答开头。",
+                "第二答尾段。",
+                "附件清单（如有） 《参与机构名单》",
+                "日期 2023-08-11",
+            ]
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "native_text": {
+                    "status": "ok",
+                    "content_hash": "sha256:" + "8" * 64,
+                    "pages": [{"page_no": 1, "text": native_text}],
+                },
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 0,
+                        "heading_level": 1,
+                        "text": document_heading,
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 1,
+                        "table_caption": [document_heading],
+                        "table": {
+                            "headers": [],
+                            "rows": [
+                                ["投资者关系活动类别", "业绩说明会"],
+                                [
+                                    "投资者关系活动主要内容介绍",
+                                    "一、公司上半年业绩情况\n收入和利润均",
+                                ],
+                            ],
+                        },
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "保持增长。",
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 3,
+                        "heading_level": 2,
+                        "text": "二、公司上半年经营亮点介绍",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 4,
+                        "text": "公司持续推进国际化和精益管理。",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "list",
+                        "order_index": 5,
+                        "text": list_text,
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 6,
+                        "heading_level": 2,
+                        "text": "三、主要交流问题",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 7,
+                        "text": "1. 第一问？",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 8,
+                        "text": "答：第一答完整。",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 9,
+                        "text": r"2. 未来 1\~2 年规划？",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 10,
+                        "text": "答：第二答开头。",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 11,
+                        "table": {
+                            "headers": [],
+                            "rows": [
+                                ["", "第二答尾段。"],
+                                ["附件清单（如有）", "《参与机构名单》"],
+                                ["日期", "2023-08-11"],
+                            ],
+                        },
+                    },
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 12,
+                        "heading_level": 2,
+                        "text": "附件 1：《参与机构名单》",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 13,
+                        "table": {
+                            "headers": ["机构", "姓名"],
+                            "rows": [["某某基金", "张三"]],
+                        },
+                    },
+                ],
+            },
+            filing_type="investor_relations",
+            document_title="华测检测：投资者关系活动记录表",
+        )
+
+        self.assertEqual(stats.native_text_sections_recovered, 3)
+        self.assertEqual(stats.qa_form_carriers_replaced, 2)
+        self.assertEqual(stats.needs_review_count, 0)
+        self.assertEqual(
+            [unit.payload_kind for unit in units],
+            ["table", "text", "text", "qa", "qa", "table", "table"],
+        )
+        self.assertEqual(units[0].heading_path, [document_heading])
+        self.assertEqual(units[1].heading_path, ["一、公司上半年业绩情况"])
+        self.assertEqual(units[2].heading_path, ["二、公司上半年经营亮点介绍"])
+        self.assertIn("汽车检测覆盖国内外知名车企", str(units[2].payload))
+        qa_units = [unit for unit in units if unit.payload_kind == "qa"]
+        self.assertEqual(
+            [unit.heading_path for unit in qa_units],
+            [["三、主要交流问题"], ["三、主要交流问题"]],
+        )
+        self.assertEqual(qa_units[1].payload["answer"], "第二答开头。第二答尾段。")
+        footer = next(unit for unit in units if "附件清单" in str(unit.payload))
+        self.assertEqual(footer.heading_path, ["华测检测：投资者关系活动记录表"])
+        attachment = next(unit for unit in units if "某某基金" in str(unit.payload))
+        self.assertEqual(attachment.heading_path, ["附件 1：《参与机构名单》"])
+
+    def test_native_recovery_keeps_nonempty_unknown_element(self) -> None:
+        native_text = "\n".join(
+            [
+                "一、经营情况",
+                "公司经营稳定。",
+                "二、主要交流问题",
+                "1、收入如何？答：收入保持增长。",
+                "日期 2026-07-15",
+            ]
+        )
+        mineru_only = "MinerU 未分类但非空的业务内容。"
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "native_text": {
+                    "status": "ok",
+                    "content_hash": "sha256:" + "9" * 64,
+                    "pages": [{"page_no": 1, "text": native_text}],
+                },
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": native_text.replace("\n日期 2026-07-15", ""),
+                    },
+                    {
+                        "kind": "unknown",
+                        "raw_kind": "list",
+                        "order_index": 2,
+                        "content": mineru_only,
+                    },
+                ],
+            },
+            filing_type="investor_relations",
+            document_title="某公司：投资者关系活动记录表",
+        )
+
+        self.assertEqual(stats.native_text_sections_recovered, 0)
+        self.assertIn(mineru_only, " ".join(str(unit.payload) for unit in units))
+
+    def test_native_recovery_preserves_mineru_only_fact_by_falling_back(self) -> None:
+        native_text = "\n".join(
+            [
+                "一、经营情况",
+                "公司经营稳定。",
+                "二、主要交流问题",
+                "1、收入如何？答：收入保持增长。",
+                "日期 2026-07-15",
+            ]
+        )
+        mineru_only = "MinerU独有关键事实：毛利率下降1.25%。"
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "native_text": {
+                    "status": "ok",
+                    "content_hash": "sha256:" + "2" * 64,
+                    "pages": [{"page_no": 1, "text": native_text}],
+                },
+                "elements": [
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 1,
+                        "table": {
+                            "headers": [],
+                            "rows": [[native_text.replace("\n日期 2026-07-15", "") + mineru_only]],
+                        },
+                    }
+                ],
+            },
+            filing_type="investor_relations",
+            document_title="某公司：投资者关系活动记录表",
+        )
+
+        self.assertEqual(stats.native_text_sections_recovered, 0)
+        self.assertIn(mineru_only, " ".join(str(unit.payload) for unit in units))
+
+    def test_native_recovery_rejects_briefing_notice_without_real_qa(self) -> None:
+        notice = "\n".join(
+            [
+                "一、说明会安排",
+                "本次说明会于十五点召开。",
+                "二、投资者提问方式",
+                "投资者可在网络平台提前提交问题。",
+                "日期 2026-07-15",
+            ]
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "native_text": {
+                    "status": "ok",
+                    "content_hash": "sha256:" + "3" * 64,
+                    "pages": [{"page_no": 1, "text": notice}],
+                },
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": notice,
+                    }
+                ],
+            },
+            filing_type="performance_briefing",
+            document_title="某公司关于召开年度业绩说明会的公告",
+        )
+
+        self.assertEqual(stats.native_text_sections_recovered, 0)
+        self.assertNotIn(
+            "native_text",
+            " ".join(str(unit.artifact_locator) for unit in units),
+        )
+
+    def test_native_recovery_keeps_multi_column_table_before_footer(self) -> None:
+        native_text = "\n".join(
+            [
+                "一、经营情况",
+                "公司经营稳定。",
+                "二、主要交流问题",
+                "1、收入如何？答：收入保持增长。",
+                "日期 2026-07-15",
+            ]
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "native_text": {
+                    "status": "ok",
+                    "content_hash": "sha256:" + "4" * 64,
+                    "pages": [{"page_no": 1, "text": native_text}],
+                },
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": native_text.replace("\n日期 2026-07-15", ""),
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 2,
+                        "table": {
+                            "headers": [],
+                            "rows": [
+                                ["指标", ""],
+                                ["", "金额"],
+                                ["营业收入", ""],
+                                ["", "10亿元"],
+                                ["日期", "2026-07-15"],
+                            ],
+                        },
+                    },
+                ],
+            },
+            filing_type="investor_relations",
+            document_title="某公司：投资者关系活动记录表",
+        )
+
+        self.assertEqual(stats.native_text_sections_recovered, 0)
+        table = next(unit for unit in units if unit.payload_kind == "table")
+        self.assertIn("营业收入", str(table.payload))
+
+    def test_native_recovery_keeps_multi_column_table_inside_first_form(self) -> None:
+        native_text = "\n".join(
+            [
+                "一、经营情况",
+                "指标 金额",
+                "营业收入 10亿元",
+                "二、主要交流问题",
+                "1、收入如何？答：收入保持增长。",
+                "日期 2026-07-15",
+            ]
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "native_text": {
+                    "status": "ok",
+                    "content_hash": "sha256:" + "5" * 64,
+                    "pages": [{"page_no": 1, "text": native_text}],
+                },
+                "elements": [
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 1,
+                        "table": {
+                            "headers": [],
+                            "rows": [
+                                ["表单标签", "一、经营情况"],
+                                ["指标", "金额"],
+                                ["营业收入", "10亿元"],
+                                [
+                                    "二、主要交流问题",
+                                    "1、收入如何？答：收入保持增长。",
+                                ],
+                            ],
+                        },
+                    }
+                ],
+            },
+            filing_type="investor_relations",
+            document_title="某公司：投资者关系活动记录表",
+        )
+
+        self.assertEqual(stats.native_text_sections_recovered, 0)
+        table = next(unit for unit in units if unit.payload_kind == "table")
+        self.assertIn("营业收入", str(table.payload))
+        self.assertIn("10亿元", str(table.payload))
+
+    def test_native_recovery_keeps_sparse_multi_column_middle_table(self) -> None:
+        first_half = "第一列保留真实结构。" * 35
+        second_half = "第二列同样是结构化内容。" * 35
+        native_text = "\n".join(
+            [
+                "一、经营情况",
+                "公司经营稳定。",
+                "二、主要交流问题",
+                f"1、收入如何？答：{first_half}{second_half}",
+                "日期 2026-07-15",
+            ]
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "native_text": {
+                    "status": "ok",
+                    "content_hash": "sha256:" + "6" * 64,
+                    "pages": [{"page_no": 1, "text": native_text}],
+                },
+                "elements": [
+                    {
+                        "kind": "heading",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "heading_level": 2,
+                        "text": "一、经营情况",
+                    },
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 2,
+                        "text": "公司经营稳定。",
+                    },
+                    {
+                        "kind": "table",
+                        "raw_kind": "table",
+                        "order_index": 3,
+                        "table": {
+                            "headers": [],
+                            "rows": [
+                                [f"二、主要交流问题 1、收入如何？答：{first_half}", ""],
+                                ["", second_half],
+                            ],
+                        },
+                    },
+                ],
+            },
+            filing_type="investor_relations",
+            document_title="某公司：投资者关系活动记录表",
+        )
+
+        self.assertEqual(stats.native_text_sections_recovered, 0)
+        table_payloads = [
+            unit.payload
+            for unit in units
+            if unit.payload_kind == "table"
+        ]
+        table_payloads.extend(
+            part
+            for unit in units
+            if unit.payload_kind == "mixed"
+            for part in unit.payload.get("parts", [])
+            if part.get("kind") == "table"
+        )
+        self.assertTrue(table_payloads)
+        self.assertIn("第一列保留真实结构", str(table_payloads))
+        self.assertIn("第二列同样是结构化内容", str(table_payloads))
+
+    def test_native_qa_recovery_fails_closed_on_missing_question_ordinal(self) -> None:
+        native_text = "\n".join(
+            [
+                "一、经营情况",
+                "经营稳定。",
+                "二、主要交流问题",
+                "1、第一问？答：第一答。",
+                "3、第三问？答：第三答。",
+                "日期 2026-07-15",
+            ]
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "native_text": {
+                    "status": "ok",
+                    "content_hash": "sha256:" + "1" * 64,
+                    "pages": [{"page_no": 1, "text": native_text}],
+                },
+                "elements": [
+                    {
+                        "kind": "text",
+                        "raw_kind": "text",
+                        "order_index": 1,
+                        "text": native_text.replace("\n日期 2026-07-15", ""),
+                    }
+                ],
+            },
+            filing_type="investor_relations",
+            document_title="某公司：投资者关系活动记录表",
+        )
+
+        self.assertEqual(stats.native_text_sections_recovered, 2)
+        qa_section = next(unit for unit in units if "第三问" in str(unit.payload))
+        self.assertEqual(qa_section.payload_kind, "text")
+        self.assertEqual(qa_section.quality_status, "needs_review")
+        self.assertNotIn("日期", str(qa_section.payload))
+        self.assertFalse(any(unit.payload_kind == "qa" for unit in units))
 
     def test_attachment_caption_ignored_outside_qa_mode(self) -> None:
         # 复审 Major#1：附件栈重置仅限表单模式（语料 11 例全部投关）。

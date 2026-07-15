@@ -70,6 +70,19 @@ def _string_list(value: Any) -> list[str]:
     return [str(value)]
 
 
+def _list_text(item: dict[str, Any]) -> str | None:
+    """Preserve MinerU list prose without inventing a nested-list contract."""
+
+    value = item.get("list_items")
+    if not isinstance(value, list) or not value:
+        return None
+    if not all(isinstance(list_item, str) for list_item in value):
+        return None
+    if not any(list_item.strip() for list_item in value):
+        return None
+    return "\n".join(value)
+
+
 @dataclass(frozen=True)
 class _TableCell:
     text: str
@@ -224,6 +237,11 @@ def _kind_and_heading(raw_kind: str, item: dict[str, Any]) -> tuple[str, int | N
         return "page_furniture", heading_level
     if raw_kind in {"table", "image", "equation"}:
         return raw_kind, heading_level
+    if raw_kind == "list" and _list_text(item) is not None:
+        # MinerU 3.x emits prose lists as ordered string items.  NormalizedIR
+        # has no parser-specific list kind, so preserve their exact order and
+        # text as a neutral text element while retaining raw_kind="list".
+        return "text", None
     return "unknown", heading_level
 
 
@@ -291,6 +309,8 @@ class MinerUToNormalizedIRMapper:
             element["page_no"] = page_no
         if "text" in item:
             element["text"] = str(item["text"])
+        elif raw_kind == "list" and (list_text := _list_text(item)) is not None:
+            element["text"] = list_text
         if raw_kind == "table":
             element["table_caption"] = _string_list(item.get("table_caption"))
             element["table_footnote"] = _string_list(item.get("table_footnote"))

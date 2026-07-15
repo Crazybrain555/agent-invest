@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 
 
-RULES_VERSION = "ub-2026.07-21"
+RULES_VERSION = "ub-2026.07-24"
 HEADING_RULESET_ID = "cn_a_v6"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -237,6 +237,22 @@ ATTACHMENT_CAPTION_RE = re.compile(r"^附件\s*[0-9一二三四五六七八九�
 QA_FORM_FOOTER_FIELD_RE = re.compile(
     r"^(附件清单\s*[（(]\s*如\s*有\s*[）)]|附件清单|日期)$"
 )
+# Native-text recovery for official IR/briefing forms.  The PDF often uses one
+# outer table cell for the whole narrative, so layout parsers preserve the
+# physical table while losing cross-page business structure.  Recovery is
+# gated by a consecutive Chinese-numbered section run and stops before the
+# official footer/attachment boundary.
+QA_FORM_MAIN_SECTION_RE = re.compile(
+    r"^\s*([一二三四五六七八九十百]{1,3}、\s*[^\n]{2,60})\s*$"
+)
+QA_FORM_NARRATIVE_END_RE = re.compile(
+    r"^\s*(?:附件清单\s*[（(]\s*如\s*有\s*[）)]|日期(?:\s|$)|"
+    r"附件\s*[0-9一二三四五六七八九十]*\s*[：:])"
+)
+QA_FORM_NARRATIVE_LABEL_RE = re.compile(
+    r"^\s*(?:投资者关系活动(?:主|要内容介绍|主要内容介绍)|要内容介绍)\s*$"
+)
+QA_FORM_QA_SECTION_RE = re.compile(r"(?:交流问题|问答|提问)")
 
 # Long structured documents (annual reports, long 制度/办法) group at the
 # shallowest heading node whose subtree stays within this budget — deep enough

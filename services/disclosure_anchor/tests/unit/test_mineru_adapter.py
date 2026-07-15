@@ -171,8 +171,133 @@ class MinerUMapperTests(unittest.TestCase):
         self.assertEqual(normalized["elements"][5]["raw_kind"], "mystery")
         json.dumps(normalized, ensure_ascii=False)
 
+    def test_preserves_string_list_items_and_rejects_malformed_lists(self) -> None:
+        mapper = MinerUToNormalizedIRMapper()
+        normalized = mapper.map_content_list(
+            content_list=[
+                {
+                    "type": "list",
+                    "sub_type": "text",
+                    "list_items": ["1、第一项", "", "2、第二项"],
+                    "page_idx": 0,
+                },
+                {"type": "list", "list_items": [], "page_idx": 0},
+                {
+                    "type": "list",
+                    "list_items": ["可读项", {"text": "非稳定嵌套形状"}],
+                    "page_idx": 0,
+                },
+                {"type": "list", "list_items": ["  ", "\t"], "page_idx": 0},
+            ],
+            parser_info=MinerUParserInfo(
+                name="MinerU",
+                package_version="3.4.0",
+                backend="pipeline",
+                method="auto",
+                language="ch",
+                formula=False,
+                table=True,
+            ),
+            document_metadata={
+                "document_id": "doc_01K0000000000000000000000",
+                "source_pdf": "raw_documents/local/sample.pdf",
+                "title": "sample",
+            },
+        )
+
+        self.assertEqual(
+            [element["kind"] for element in normalized["elements"]],
+            ["text", "unknown", "unknown", "unknown"],
+        )
+        self.assertEqual(normalized["elements"][0]["raw_kind"], "list")
+        self.assertEqual(
+            normalized["elements"][0]["text"],
+            "1、第一项\n\n2、第二项",
+        )
+        self.assertTrue(
+            all("text" not in element for element in normalized["elements"][1:])
+        )
+
 
 class MinerUDocumentParserTests(unittest.TestCase):
+    def test_ir_form_adds_native_text_shadow_but_normal_pdf_does_not(self) -> None:
+        class SuccessfulProcess:
+            def run(
+                self, *, input_pdf: Path, output_dir: Path, options: ParserOptions
+            ) -> None:
+                nested = output_dir / "sample" / "auto"
+                nested.mkdir(parents=True)
+                (nested / "sample_content_list.json").write_text(
+                    '[{"type": "text", "text": "hello", "page_idx": 0}]',
+                    encoding="utf-8",
+                )
+
+            def version(self) -> str:
+                return "3.4.0"
+
+        native_payload = {
+            "status": "ok",
+            "extractor": {"name": "pdfplumber", "version": "0.11.10"},
+            "content_hash": "sha256:" + "0" * 64,
+            "non_whitespace_chars": 5,
+            "pages": [
+                {"page_no": 1, "text": "hello", "non_whitespace_chars": 5}
+            ],
+        }
+        extractor = mock.Mock()
+        extractor.extract.return_value = native_payload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_pdf = root / "input.pdf"
+            input_pdf.write_bytes(b"%PDF-1.4\nsample\n%%EOF\n")
+            parser = MinerUDocumentParser(
+                process=SuccessfulProcess(),
+                native_text_extractor=extractor,
+                parser_version="3.4.0",
+            )
+
+            ir_result = parser.parse(
+                input_pdf=input_pdf,
+                output_dir=root / "ir-out",
+                options=ParserOptions(),
+                document_metadata={
+                    "document_id": "doc_ir",
+                    "source_pdf": "raw_documents/local/ir.pdf",
+                    "title": "某公司投资者关系活动记录表",
+                },
+            )
+            self.assertEqual(ir_result.normalized_ir["native_text"], native_payload)
+            extractor.extract.assert_called_once_with(input_pdf, timeout_seconds=None)
+
+            extractor.reset_mock()
+            ordinary_result = parser.parse(
+                input_pdf=input_pdf,
+                output_dir=root / "ordinary-out",
+                options=ParserOptions(),
+                document_metadata={
+                    "document_id": "doc_ordinary",
+                    "source_pdf": "raw_documents/local/ordinary.pdf",
+                    "title": "某公司关于回购股份的公告",
+                    "provider_category_names": ["业绩说明会"],
+                },
+            )
+            self.assertNotIn("native_text", ordinary_result.normalized_ir)
+            extractor.extract.assert_not_called()
+
+            partial_result = parser.parse(
+                input_pdf=input_pdf,
+                output_dir=root / "partial-out",
+                options=ParserOptions(start_page=0, end_page=0),
+                document_metadata={
+                    "document_id": "doc_partial_ir",
+                    "source_pdf": "raw_documents/local/partial-ir.pdf",
+                    "title": "某公司投资者关系活动记录表",
+                },
+            )
+            self.assertNotIn("native_text", partial_result.normalized_ir)
+            extractor.extract.assert_not_called()
+
     def test_version_probe_failure_fails_closed(self) -> None:
         class VersionFailingProcess:
             def run(self, *, input_pdf: Path, output_dir: Path, options: ParserOptions):
