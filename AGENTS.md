@@ -5,14 +5,23 @@ each service/package owns its local commands, maps, and hard boundaries in a nea
 
 ## 1. Authority and layout
 
-Semantic authorities:
+Use the authority that governs the question:
 
-- Engine protocol: `docs/reference/投研预测引擎顶层框架协议_v0.8.md`.
-- L1 planning: `docs/reference/l1_planning/L1来源资产层整体规划_v0.5.md`, subordinate to v0.8.
-- Component contracts: the nearest tracked `AGENTS.md` plus that component's architecture/contract docs.
-- Descriptive truth: actual files, schemas, commands, and observed results determine what currently exists.
-  A mismatch is implementation/doc drift to reconcile; it does not silently override v0.8 or a component's
-  normative contract.
+- **Task intent and authorization:** the current user request and acceptance criteria set task scope and
+  permitted actions; they revise product semantics only when the user explicitly authorizes that revision.
+- **Product semantics:** the engine protocol `docs/reference/投研预测引擎顶层框架协议_v0.8.md`; L1 planning
+  `docs/reference/l1_planning/L1来源资产层整体规划_v0.5.md`, subordinate to v0.8; then the nearest component's
+  architecture/contract docs.
+- **Agent operating policy:** the applicable `AGENTS.md` chain plus the shared workflow docs it references
+  (`docs/agent-workflow.md`, `docs/agent-research-workflow.md`).
+- **External mechanisms:** version-matched official specifications, documentation, release notes, and source
+  for the library, provider, protocol, or source format actually deployed.
+- **Descriptive truth:** actual files, schemas, commands, and observed results describe what currently exists.
+  A mismatch with a normative authority is implementation/doc drift to reconcile; it never silently overrides
+  v0.8 or a component's normative contract.
+- **Comparative design evidence:** maintainer design records, issues/PRs, and mature implementations inform
+  design choices; they are never semantic authorities. Discovery tools (Context7, DeepWiki, GitHub/web search,
+  DBHub) locate and summarize evidence; a tool's summary is not an authority either.
 
 ```text
 services/disclosure_anchor/   L1 disclosure/PDF path (live; blueprint for service mechanics)
@@ -24,10 +33,12 @@ docs/archive/pre-restart/     frozen Quant_agent-era evidence; never current pol
 (planned) services/upload_service/   independent L1 human-upload service
 ```
 
-Codex loads applicable `AGENTS.md` files from the repository root toward the working directory. Nearer files
-add or narrow subtree rules and take precedence only when the same subject conflicts; they do not erase
-unrelated parent rules. `AGENTS.md` is Codex project guidance; Claude-specific workflow lives in `CLAUDE.md`.
-`docs/archive/pre-restart/` remains frozen even if it contains old instruction files.
+Instruction files load from the repository root toward the working directory. Nearer files add or narrow
+subtree rules and take precedence only when the same subject conflicts; they do not erase unrelated parent
+rules. `AGENTS.md` is the shared tool-neutral operating contract; tool-specific adapters (root `CLAUDE.md`,
+Codex configuration) may add loading, memory, or tool mechanics but never duplicate or redefine shared
+semantics or hard boundaries. `docs/archive/pre-restart/` remains frozen even if it contains old instruction
+files.
 
 ## 2. Cross-service invariants
 
@@ -48,82 +59,42 @@ unrelated parent rules. `AGENTS.md` is Codex project guidance; Claude-specific w
 7. **Service ownership:** migrations write only the owning component's schemas/roles. Shared-package changes and
    public-contract changes update all affected consumers, exports, tests, and docs together.
 
-## 3. Work selection, research, and handoff
+## 3. Work selection, research, and task state
 
 - Default to bounded, in-scope work. Read-only requests authorize inspection/reporting; change/fix requests
   authorize requested local edits and non-destructive validation. Ask before destructive, external, costly,
-  credential/permission, commit/push, or materially scope-expanding actions.
-- A gitignored durable record — `docs/agent/HANDOFF.md`, or a parked record once parked — is mandatory when
-  work is expected to cross sessions; changes architecture, a public contract, migration/data boundary, or
-  high-risk operations; has material unknowns; is explicitly requested as durable; resumes an existing
-  durable task; or pauses awaiting a user decision. Create it before the first task mutation, or before
-  yielding when a bounded task first meets a trigger.
-- Task records and locks are separate things. Per worktree, `docs/agent/HANDOFF.md` holds the single
-  gate-holding task and `docs/agent/parked/<task-key>.md` holds any number of parked tasks. The worktree
-  write gate is held exactly while an unclosed `HANDOFF.md` exists anywhere in the worktree; a session that
-  does not own that gate makes no working-tree mutation there, however small — it works in a separate
-  worktree instead. Closed means `State:` is exactly `closed` or `completed`; a missing, malformed, or novel
-  state counts as unclosed and holds the gate.
-- A gate-holding handoff keeps a named writer; the writer changes only by parking, closing, or an explicit
-  user handoff. Closing requires the worktree to carry none of the task's uncommitted edits — closing over
-  live dirt is invalid; the gate follows protected state. The user's resolution of a gate-holding task's
-  pending decision authorizes the resuming session to claim its writer slot; unrelated requests never do,
-  and a crashed or absent session's unclosed task is reclaimed only on explicit user instruction, never
-  inferred from recency.
-- Parking is one step: write `docs/agent/parked/<task-key>.md` and delete `HANDOFF.md`; the gate releases
-  with that deletion. Parking (`waiting_user`, `blocked`, `paused`, `monitoring`) requires: no uncommitted
-  working-tree edits of the task's own (committed to its `task/` branch, or none) and runtime claims
-  released in `RUNTIME.md` — only a `monitoring` record may retain listed claims. A task that cannot meet
-  these — e.g. `waiting_user` over an uncommitted diff — stays in `HANDOFF.md` and keeps the gate.
-- A parked record never gates the worktree; it names its pending decision and premises (the paths and
-  subjects the decision rests on). No session in any worktree edits those premises or acts on the pending
-  decision until the user resolves it. Resuming moves the record back into a free `HANDOFF.md` slot (absent
-  or closed) and deletes the parked file in the same step; a task the user resolves without further work is
-  closed by deleting its parked record after reporting the outcome.
-- In every new session, before the first repository mutation, read this worktree's root and nearest
-  component `docs/agent/HANDOFF.md` and `docs/agent/parked/` — and, when working in a spawned worktree, the
-  primary checkout's root and affected-component `parked/` — and announce the gate task/state/writer and
-  each parked key/state once. Claim the writer slot only when no unclosed `HANDOFF.md` exists anywhere in
-  the worktree (`scripts/agent_worktree.sh list` shows them all) and the tree is clean or every dirty path
-  belongs to the record being resumed. Claims are check-then-verify: after writing `HANDOFF.md` or a
-  `RUNTIME.md` row, re-read it before the first mutation; if the writer/owner differs, back off and
-  re-announce.
-- Cross-repo work uses root `docs/agent/HANDOFF.md`; component work uses the nearest component handoff.
-  One worktree has at most one gate-holding task and one owning writer (root or component level, not both).
-  Parallel mutating tasks use separate worktrees — `scripts/agent_worktree.sh spawn <task-key>` creates
-  `../agent-invest-worktrees/<task-key>` on branch `task/<task-key>`, copies `.worktreeinclude` files, and
-  surfaces the primary checkout's parked guards; `reap` removes only a clean worktree whose handoffs are
-  closed or absent, parked records resolved or transferred, and runtime claims released. Reviewers and
-  helper agents are read-only.
-- Work in a spawned worktree is delivered as local commits on its `task/<task-key>` branch — spawning
-  authorizes commits on that branch only (the §2.6 exception); push, merging into `main`, and branch
-  deletion still need an explicit user request, and the merge is performed by the primary checkout's
-  writer or the user.
-- Worktrees do not isolate shared runtime state. Shared PostgreSQL writes, AgentSSD mutation, and
-  worker/launchd control each have exactly one owner, recorded in the gitignored `docs/agent/RUNTIME.md`
-  of the primary checkout (the first entry of `git worktree list`). Read it before any task that may touch
-  these resources; claim before mutating; release on close or park. Claim/release edits to `RUNTIME.md` are
-  coordination state, exempt from the primary worktree's write gate. Never claim over a non-default owner:
-  surface the current owner — including any parked task retaining the claim — and get the user's
-  confirmation first. The resident launchd KeepAlive job is the worker's steady-state owner when no task
-  claims it.
-- A handoff, parked record, or runtime claim is local to its checkout/worktree and is not copied through Git
-  or `.worktreeinclude`. A receiving session must resume in that checkout or perform an explicit handoff.
-  Before archiving/deleting a task or worktree, close it or transfer every unresolved user gate, premise
-  guard, and external-state obligation.
-- Keep `HANDOFF.md` under 80 lines and record only: task key/title, scope, state, authority, user intent and
-  acceptance, authorization boundary, next action, blockers, worktree/branch/base, changed paths, latest
-  current-session validation/review, runtime claims, writer, and updated time. Keep each parked record under
-  40 lines: key/title, state, pending decision and re-entry condition, guarded premises, retained runtime
-  claims, next action, branch/base, brief origin note, and updated time. Long-lived facts belong in tracked
-  contracts/docs; secrets, chat transcripts, duplicated repo facts, and volatile ops snapshots do not.
-  This handoff protocol is mirrored in the "Durable handoff" section of root `CLAUDE.md`; edit both together.
-- Legacy `Prompt.md`, `Plan.md`, `Status.md`, `Documentation.md`, `Implement.md`, `code_review.md`, `archive/`,
-  and `notes/` are migration/history evidence only: read on demand; never update, rotate, recreate, or use as
-  current authority. Do not delete ignored legacy state without the user's explicit approval.
-- Before selecting a materially new architecture, cross-service contract, dependency, provider framework, or
-  ops mechanism, compare 2–4 relevant implementations. Prefer official vendor docs for vendor/model behavior.
-  Approved-plan execution, localized fixes, factual corrections, and state synchronization are exempt.
+  credential/permission, commit/push, or materially scope-expanding actions. Preserve unrelated user changes:
+  never revert or overwrite working-tree edits that are not the current task's.
+- Durable task state is required when work crosses sessions; touches architecture, a public contract,
+  migration/data boundaries, or high-risk operations; has material unknowns; is explicitly requested as durable;
+  resumes an existing durable task; or pauses for a user decision. Before the first mutation, fully read and follow
+  `docs/agent-workflow.md` when a trigger applies, HANDOFF/parked state is in scope, or shared runtime may change.
+- At session start, inspect root and affected-service HANDOFF/parked records before mutation and announce each
+  active gate once. An unclosed HANDOFF holds the worktree write gate; only its named writer may mutate. Read and
+  claim the primary checkout's `docs/agent/RUNTIME.md` before shared PG, AgentSSD, or worker mutations.
+- Legacy `Prompt/Plan/Status/Documentation/Implement/code_review`, `archive/`, and `notes/` are read-only history,
+  never current authority. Do not recreate, update, or delete ignored legacy state without explicit approval.
+- **Pre-design research gate:** every change that may alter normative semantics or observable application
+  behavior passes this gate before the first design commitment or behavior-affecting edit. Familiarity, low
+  difficulty, and existing local tests are not exemptions—difficulty changes research depth, not whether the
+  gate applies. First inspect the governing repository contract, the current implementation, and a
+  representative real case. For non-novel work, presume an official contract or mature prior art exists and
+  run a bounded external check; skip external research only when the change is provably design-neutral (e.g.
+  formatting or a pure mechanical rename; canonical classes in the workflow doc §2) and record the skip
+  reason with equivalence evidence—agent confidence alone is never one. Before editing, record the research
+  question, governing authority, adopted invariant with the main rejected alternative, validation plan, and
+  any skip reason. Material architecture, cross-service contract, dependency, provider, security, migration,
+  or ops changes additionally record the material fields of the workflow doc §5 and compare 2–4 independent
+  relevant sources or implementations. Cross-check candidates against normative contracts, current code, and real
+  data; adopt invariants and tests, not project-specific patches or copied code. External evidence never
+  silently revises a normative repository contract—surface a required contract revision explicitly. Follow
+  `docs/agent-research-workflow.md` for evidence classes, depth, stop conditions, and conflict resolution.
+- For DB-backed parsing, projection, publication, or retrieval work, calibrate against the real versioned public
+  view/read model with read-only SQL when available (DBHub is suitable): inspect the live schema before naming
+  columns, then sample active rows and distributions across representative types/owners. Historical tests and
+  fixtures are evidence, not product authority. Keep currently published output distinct from an offline replay
+  of dirty-tree code, explain any delta from source identity, and only then encode the confirmed invariant as a
+  positive/negative regression test. Never mutate shared runtime data merely to make an inspection convenient.
 - Keep scope surgical, expose unexpected failures, validate real boundaries, and close behavior changes with
   tests or an exact blocker plus matching contract/docs updates.
 
@@ -133,7 +104,8 @@ unrelated parent rules. `AGENTS.md` is Codex project guidance; Claude-specific w
   targets. Run component-specific live-DB, migration, fixture, or smoke gates when the changed behavior needs
   them and the environment is in scope.
 - Policy/doc changes require `git diff --check`, current path/command verification, and TOML/JSON parsing when
-  those formats change. Record exact blockers rather than weakening a gate.
+  those formats change. Back "done" claims only with checks actually run in the current session; record exact
+  blockers rather than weakening a gate.
 - Before completing material runtime, public-contract, setup/validation-command, agent-policy, or durable-
   workflow changes, use an independent read-only reviewer that did not implement the diff. Treat findings as
   candidates and fix only evidence-backed material items. Routine progress updates and trivial factual edits do
