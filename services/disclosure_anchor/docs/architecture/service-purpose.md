@@ -494,6 +494,8 @@ artifact_locator（可选）
 
 ## 6.4 qa 单元
 
+> 历史值：旧产物存在、2026-07-16 起不再产出（QA 判别已移除，转写以 raw text 落地）。以下 schema 仅供历史行解读，新 run 不再生成 qa 单元。
+
 适用于投关记录、业绩说明会和公开交流中的完整问答。
 
 ```json
@@ -517,10 +519,12 @@ artifact_locator（可选）
 
 适用于一个业务块内 text 与 table（或 image）交替的场景：短公告整体、股东会/董事会
 一项议案、年报里的一个业务小节（研发投入、附注某科目）。payload 是有序 parts；每个
-part 的形状复用对应 kind 的 payload schema，另带 `kind`、`order`，以及可选的
-`local_heading`（相对 unit heading_path 的局部小标题）、`heading_path`（document 级
-坍缩时的完整路径）、`applicability`、`quality_status`、`artifact_locator`。定位信息属于
-各 part，消费者不能只读取 mixed unit 顶层 locator。
+part 的形状复用对应 kind 的 payload schema（part 级 `kind` ∈ {text, table, image}；image
+part 另带 `visual_kind` ∈ {image, chart, equation} 与可选 `visual_subtype`——MinerU sub_type
+透传，如 seal/bar），另带 `kind`、`order`，以及可选的 `local_heading`（**历史字段，新产物不再
+产出**——被公开深度挤出的深层子标题现各自成 unit，仅存于冻结的历史 fixture 与哈希输入枚举）、
+`heading_path`（document 级坍缩时的完整路径）、`applicability`、`quality_status`、
+`artifact_locator`。定位信息属于各 part，消费者不能只读取 mixed unit 顶层 locator。
 
 ```json
 {
@@ -621,8 +625,10 @@ merged_cells
 
 它指回 parser 产物中该表所在位置，便于人工复核或重解析。跨页 aggregate 表保持一个逻辑
 table，locator 用连续 `page_span`、逐页 `page_bboxes` 和 model/ghost 索引覆盖所有页面；
-`merged_cells` 坐标始终相对最终 `[headers, *rows]` full grid。mixed 中每个 part 可有自己的
-locator，unit 顶层 locator 不替代它；locator 不是 agent 的主查询键。
+`merged_cells` 坐标始终相对最终 `[headers, *rows]` full grid。headers 仅在源 HTML 携带
+`<th>` 证据时非空（用户 2026-07-16 裁决：无证据不做首行提升，完整网格忠实保留在 rows，
+表头解释归 L2/视图层——本节示例中的 headers 值仅适用于有 th 证据的表）。mixed 中每个
+part 可有自己的 locator，unit 顶层 locator 不替代它；locator 不是 agent 的主查询键。
 
 ## 7.3 第一版追溯锚
 

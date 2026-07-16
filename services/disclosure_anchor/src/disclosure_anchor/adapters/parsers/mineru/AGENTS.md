@@ -16,8 +16,9 @@ fixture 兼容读取，禁止新写）：
   原样 raw_kind，**禁止丢弃**
 - heading 判定：raw type=='text' 且 int(text_level)>=1；heading_level 同步
 - 表结构化：rowspan/colspan 感知的 HTML→grid；**headers 只在 `<th>` 证据时非空**
-  （MinerU 输出纯 td，headers 通常为空、全网格在 rows；表头提升是 05-S5 的
-  业务规则，合并后执行——不要在 mapper 里猜表头，实测会错标续表/KV 表）
+  （MinerU 输出纯 td，headers 通常为空、全网格在 rows；用户 2026-07-16 裁决
+  **不做表头提升**——无 th 证据时 headers 保持空、忠实落盘，表头解释归 L2/视图层；
+  不要在任何层猜表头，实测会错标续表/KV 表）
 - 非空 HTML 解析出零 cell → table_parse_failed=true（防静默空网格）
 - model 对账的正向同组证明不得依赖标题/科目词：仅支持已验证的 pipeline/VLM schema、同页唯一 bbox
   （归一化坐标最大差 3/1000），且 content 聚合表的 logical cell 文本、`th/td`、rowspan、colspan 必须精确等于
@@ -31,7 +32,7 @@ fixture 兼容读取，禁止新写）：
   parser 自身不可变的定位证明，不绑定 S5 或全部 RULES_VERSION。BuildUnits 先把合法旧算法
   分类为必须重 parse，再对当前 v4 的完整 shape/cross-object 关系做 fail-loud 校验；
   locator 五字段还须与 diagnostics 的 group/table/model counts 对账；model relpath 进入 parser_artifacts。
-- mapper 不做业务判断（单位识别/表头提升/保留跳过都在 05 builder）
+- mapper 不做业务判断（单位识别/保留跳过在 05 builder；表头提升已整体废除）
 
 golden fixtures 再生成：`scripts/regen_phase00_fixtures.py` 不带参数时从本地 source artifact
 重跑 reader→reconciler→mapper→builder；仅 builder 变化才用 `--units-only` 从 committed IR

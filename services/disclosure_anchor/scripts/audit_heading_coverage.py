@@ -35,14 +35,14 @@ def _norm(line: str) -> str:
 
 
 def _deliberately_stripped(line: str) -> bool:
+    # Only vocabularies that still exist in rules.py: the historical
+    # is_standalone_noise / is_closing_formula_line / BOILERPLATE_GUARANTEE_RE /
+    # SKIP_SECTION_TITLES clauses referenced deleted machinery and made this
+    # helper raise AttributeError since their removal.
     return (
         rules.is_unit_declaration_line(line)
         or rules.is_declaration_line(line)
-        or rules.is_standalone_noise(line)
-        or rules.is_closing_formula_line(line)
-        or bool(rules.BOILERPLATE_GUARANTEE_RE.match(line))
         or rules.strip_header_kv_line(line) is not None
-        or _norm(line) in {_norm(t) for t in rules.SKIP_SECTION_TITLES}
     )
 
 

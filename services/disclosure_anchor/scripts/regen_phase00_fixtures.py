@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -230,16 +231,39 @@ def regenerate_sample(sample_key: str) -> str:
         _write_excerpt_ref(content_list_path)
     _inject_fixture_fields(sample_key, normalized)
     sample_dir = PHASE00_ROOT / sample_key
-    output_path = sample_dir / "normalized_ir.v2.json"
+    # The fixture filename must match the payload the mapper actually stamped
+    # (normalized_ir.v3 today); writing v3 content into a v2-named file fails
+    # the path-version validation and the schema contract test.
+    contract_version = str(normalized.get("contract_version") or "")
+    if not re.fullmatch(r"normalized_ir\.v\d+", contract_version):
+        raise SystemExit(
+            f"{sample_key}: unexpected contract_version {contract_version!r}"
+        )
+    output_path = sample_dir / f"{contract_version}.json"
     output_path.write_text(
         json.dumps(normalized, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    old_path = sample_dir / "normalized_ir.v1.json"
-    if old_path.exists():
-        old_path.unlink()
+    for stale_path in sample_dir.glob("normalized_ir.v*.json"):
+        if stale_path != output_path:
+            stale_path.unlink()
     _write_document_units(sample_key, normalized, sample_dir)
     return _coverage_line(sample_key, normalized)
+
+
+def _committed_normalized_ir_path(sample_dir: Path, sample_key: str) -> Path:
+    """Locate the committed IR fixture, preferring the newest contract version."""
+
+    candidates = sorted(
+        sample_dir.glob("normalized_ir.v*.json"),
+        key=lambda path: int(path.stem.rsplit("v", 1)[-1]),
+        reverse=True,
+    )
+    if not candidates:
+        raise SystemExit(
+            f"{sample_key}: normalized IR missing under {sample_dir}"
+        )
+    return candidates[0]
 
 
 def regenerate_units_from_committed_ir(sample_key: str) -> str:
@@ -251,9 +275,7 @@ def regenerate_units_from_committed_ir(sample_key: str) -> str:
     """
 
     sample_dir = PHASE00_ROOT / sample_key
-    normalized_path = sample_dir / "normalized_ir.v2.json"
-    if not normalized_path.is_file():
-        raise SystemExit(f"{sample_key}: normalized IR missing: {normalized_path}")
+    normalized_path = _committed_normalized_ir_path(sample_dir, sample_key)
     normalized = json.loads(normalized_path.read_text(encoding="utf-8"))
     _write_document_units(sample_key, normalized, sample_dir)
     return _coverage_line(sample_key, normalized)

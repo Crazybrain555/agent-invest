@@ -346,39 +346,6 @@ class DocumentUnitAuditTests(unittest.TestCase):
 
         self.assertIn("public_heading_path_mismatch", _codes(report))
 
-    def test_qa_partition_retains_parent_heading_projection(self) -> None:
-        normalized = _ir(
-            [
-                _element(
-                    0,
-                    kind="heading",
-                    text="三、主要交流问题",
-                    heading_level=1,
-                ),
-                _element(1, kind="text", text="问：收入如何？\n答：收入保持增长。"),
-            ]
-        )
-        units, _ = build_unit_drafts_s1_s7(
-            normalized,
-            filing_type="investor_relations",
-            document_title="审计样本",
-        )
-        qa = next(unit for unit in units if unit.payload_kind == "qa")
-        graph = (qa.artifact_locator or {})["source_projection"]
-
-        report = audit_document(
-            normalized_ir=normalized,
-            units=_views(units),
-            metadata=replace(self.metadata, filing_type="investor_relations"),
-        )
-
-        self.assertTrue(report.ok, report.findings)
-        self.assertEqual(len(graph["heading_path"]), 1)
-        self.assertEqual(
-            graph["heading_path"][0]["selector"]["source"]["ir_id"],
-            "ir_0000",
-        )
-
     def test_table_spans_are_checked_as_source_structure(self) -> None:
         normalized = _ir(
             [
@@ -492,35 +459,6 @@ class DocumentUnitAuditTests(unittest.TestCase):
 
         self.assertIn("public_heading_path_mismatch", _codes(report))
         self.assertIn("heading_source_path_mismatch", _codes(report))
-
-    def test_qa_projection_is_validated_separately_from_raw_text(self) -> None:
-        normalized = _ir(
-            [
-                _element(
-                    0,
-                    kind="text",
-                    text="问题：今年收入如何？\n答：收入保持增长。",
-                )
-            ]
-        )
-        units, _ = build_unit_drafts_s1_s7(
-            normalized,
-            filing_type="investor_relations",
-            document_title="审计样本",
-        )
-        self.assertEqual(units[0].payload_kind, "qa")
-        broken = replace(
-            units[0],
-            payload={**units[0].payload, "answer": "并不存在的回答"},
-        )
-
-        report = audit_document(
-            normalized_ir=normalized,
-            units=_views([broken]),
-            metadata=self.metadata,
-        )
-
-        self.assertIn("qa_projection_mismatch", _codes(report))
 
     def test_unit_source_order_cannot_move_backwards(self) -> None:
         normalized = _ir(
@@ -702,6 +640,141 @@ class DocumentUnitAuditTests(unittest.TestCase):
         )
 
         self.assertIn("image_payload_count_invalid", _codes(report))
+
+    def test_semantic_key_invalid_states_are_flagged(self) -> None:
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="heading",
+                    raw_kind="text",
+                    text="一、经营情况",
+                    heading_level=1,
+                ),
+                _element(1, kind="text", text="营业收入同比增长20%。"),
+            ]
+        )
+        units, _ = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="other",
+            document_title="审计样本",
+        )
+        forged_states = [
+            ("scalar_none_with_nonempty_array", None, ["dividend"]),
+            ("empty_array_with_valid_scalar", "dividend", []),
+            ("array_contains_invalid_token", "dividend", ["dividend", "Bad-Key!"]),
+            ("array_duplicate", "dividend", ["dividend", "dividend"]),
+            ("scalar_not_member", "dividend", ["cash_flow"]),
+        ]
+        for label, semantic_key, semantic_keys in forged_states:
+            with self.subTest(state=label):
+                broken = replace(
+                    units[0],
+                    semantic_key=semantic_key,
+                    semantic_keys=semantic_keys,
+                )
+                report = audit_document(
+                    normalized_ir=normalized,
+                    units=_views([broken]),
+                    metadata=self.metadata,
+                )
+                self.assertIn("semantic_key_invalid", _codes(report))
+
+    def test_image_payload_field_and_hash_negatives_are_flagged(self) -> None:
+        digest = "a" * 64
+        mismatch = "b" * 64
+        base_payload = {
+            "image_ref": f"images/{digest}.png",
+            "caption": "",
+            "context": "",
+            "visual_kind": "image",
+        }
+        cases = [
+            (
+                "image_caption_dropped",
+                _element(
+                    0,
+                    kind="image",
+                    raw_kind="image",
+                    image_path=f"source/{digest}.png",
+                    image_caption=["关键图注"],
+                ),
+                base_payload,
+                {"ir_0000": f"sha256:{digest}"},
+            ),
+            (
+                "visual_kind_mismatch",
+                _element(
+                    0,
+                    kind="image",
+                    raw_kind="chart",
+                    image_path=f"source/{digest}.png",
+                ),
+                base_payload,
+                {"ir_0000": f"sha256:{digest}"},
+            ),
+            (
+                "visual_subtype_mismatch",
+                _element(
+                    0,
+                    kind="image",
+                    raw_kind="image",
+                    image_path=f"source/{digest}.png",
+                    visual_subtype="bar",
+                ),
+                base_payload,
+                {"ir_0000": f"sha256:{digest}"},
+            ),
+            (
+                "image_hash_mismatch",
+                _element(
+                    0,
+                    kind="image",
+                    raw_kind="image",
+                    image_path=f"source/{digest}.png",
+                ),
+                {**base_payload, "image_ref": f"images/{mismatch}.png"},
+                {"ir_0000": f"sha256:{digest}"},
+            ),
+            (
+                "image_hash_unavailable",
+                _element(
+                    0,
+                    kind="image",
+                    raw_kind="image",
+                    image_path="source/plain_diagram.png",
+                ),
+                base_payload,
+                {},
+            ),
+        ]
+        for code, element, payload, image_hashes in cases:
+            with self.subTest(code=code):
+                unit = AuditUnitView(
+                    order_index=1,
+                    payload_kind="text",
+                    payload=payload,
+                    title="图注",
+                    heading_path=["图注"],
+                    structural_path=["图注"],
+                    semantic_key="document_content",
+                    semantic_keys=["document_content"],
+                    quality_status="needs_review",
+                    applicability=None,
+                    artifact_locator={
+                        "ir_id": "ir_0000",
+                        "source_item_index": 0,
+                        "order_index": 0,
+                        "page_no": 1,
+                    },
+                )
+                report = audit_document(
+                    normalized_ir=_ir([element]),
+                    units=[unit],
+                    metadata=self.metadata,
+                    image_hashes=image_hashes,
+                )
+                self.assertIn(code, _codes(report))
 
 
 if __name__ == "__main__":

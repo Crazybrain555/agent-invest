@@ -2,7 +2,7 @@
 id: disclosure_anchor_design_retrieval_semantic_keys
 project: disclosure_anchor
 title: 非 embedding 检索数据面：多级标题、关键词与 semantic_key 附注词表（设计评审）
-status: partially-adopted (词表与数组过滤已实施；06R 投影待立项)
+status: partially-adopted (词表与数组过滤已实施；06R 投影待立项；现状勘误见 §6.3)
 created_at: 2026-07-07
 inputs: 用户 round8 提问 + 2026-07-07 调研（EDGAR EFTS/AlphaSense/PG 中文 FTS/编报规则第15号/XBRL）+ 本仓只读取证
 decides_for: 06R（检索投影里程碑，规格待编写）+ semantic_key 词表升版
@@ -26,6 +26,8 @@ decides_for: 06R（检索投影里程碑，规格待编写）+ semantic_key 词�
 | A4 | semantic_key 明显少了 | **对，是词表覆盖缺口**：附注小节 95/112 双 NULL；且附注标题是法定受控词表，可系统性补齐 |
 
 ## 2. 现状取证（file:line + live DB，2026-07-07）
+
+（勘误见 §6.3）
 
 - **多级标题分两个形态**：公开 `heading_path` 是每个 unit 的必填 1-4 级 breadcrumb，
   `title` 保留最深叶子；S2 内部 `structural_path` 保留完整树，供分组和语义键派生，但不入当前
@@ -86,6 +88,8 @@ decides_for: 06R（检索投影里程碑，规格待编写）+ semantic_key 词�
 
 ## 4.5 多级标题/多 title 的决策记录（round10 补记——此前只在 §1/§5 隐含，未显式讨论，用户指正）
 
+（勘误见 §6.3）
+
 **问题**：unit 只有一个 `title` 列，是否需要"多级标题/多个 title"？
 
 **决策：不加多个 title 列，理由如下；但补一个立即可用的检索形态。**
@@ -103,6 +107,8 @@ decides_for: 06R（检索投影里程碑，规格待编写）+ semantic_key 词�
    下标访问（`heading_path->>1`）已经支持，无需 schema 变更。
 
 ## 4.6 三 facet 标签架构（round12 调研定案）
+
+（勘误见 §6.3）
 
 业界共识（RavenPack/AlphaSense/SmarTag/8-K/DuEE-fin 全部如此）：**facet 分立，不混词表**。
 本服务三 facet：
@@ -197,3 +203,54 @@ semantic_keys（scalar 在规则未命中时回落 note key）。实测：附注
   标题若要单独全文搜索，应在 06R 显式增加完整路径投影，不应反向扭曲 L1 切分。
 - 06R 仍未立项，L1 API 不新增 `/v1/search/units`、embedding 或 search projection；自然语言
   发现/排序应由 L2 自有检索面或未来正式 06R 承担，证据引用始终回到 L1 asset_id。
+
+## 6.3 2026-07-16 现状勘误与决策补记（corpus-reparse-audit-r1）
+
+本节按 corpus-reparse-audit-r1 全语料重放统一勘误 §2/§4/§4.5/§4.6/§6.2 的过期表述；历史小节
+保留原文不改写，凡冲突以本节为准。
+
+- **(a) heading_path 勘误（取代 §2、§4.5、§6.2 一切"最多 4 级/有损 breadcrumb"表述）**：公开
+  `heading_path` 现投影**完整源面包屑**（`adapters/unit_builder/builder.py` 的
+  `_project_heading_path` 直接返回整条 `structural_path`，无 4 级封顶），不再有"公开 4 级 + 内部
+  structural_path"的双形态落差。`local_heading` 也不再产出——被公开深度挤出的深层子标题现各自
+  成 unit，该字段仅存于冻结的历史 fixture 与冻结的哈希输入枚举。因此 06R 的立项理由相应收窄：
+  仍需要 06R 做 FTS/线性化 + 字段加权（把 title + 面包屑 + payload 拼进被打分文本），但**不再**
+  为"补路径无损"而存在——公开 heading_path 本身已是无损完整路径。
+- **(b) 词表规模勘误**：§4 的"~80-90 键"与 §6 的"95 键"是早期轮次的陈旧数字。当前
+  note_key_map.json = 版本 `2026-07-r17`，**173 键 / 389 标签**（§4.6 表中的 173 已经是对的）。
+- **(c) 事件 facet 撤销决策（取代 §4.6 表第 3 行 event_key_map.json / 35 键）**：event_key_map.json
+  已在 checkpoint 提交 `31f8439` **移除**——标题派生的事件键在持续累积样本特异的短语规则，与根
+  研究门"不得从孤立样本长出短语表"相抵。当前状态：事件语义只保留为通用的 per-unit
+  `SEMANTIC_KEY_RULES`，加上文档级 `investor_communication` 键（investor_relations /
+  performance_briefing 文类）。未来若要重建事件 facet，必须走**有界、以监管条目为锚**的词表设计
+  门（对标 SEC 8-K item），不得再靠标题短语累积。
+- **(d) 主题 facet 命名勘误**：文档级主题 facet 落地为
+  `adapters/sources/cninfo/class_map.json`（**31 类**，version 2026-07-r7，单张 class 映射同时派生
+  disclosure_topics 与 filing_type），取代 §4.6 表中的 `topic_map.json`（12）——后者是陈旧名、
+  已不在树上。（注：`facet_map.json` **不是**主题 facet 的旧名，而是仍在用的另一个文件——F006V 的
+  market/publisher 维度判定，见 classification-facets 设计 §5；勿混为一谈。）
+- **(e) semantic_key 状态不变量记录**：不变量定义在
+  `src/disclosure_anchor/domain/value_objects/semantic_key.py`，五条：① 正则
+  `^[a-z][a-z0-9_]{0,127}$`；② `semantic_keys` 数组非空；③ 数组内无重复；④ scalar `semantic_key`
+  必须是数组成员；⑤ 新产物 scalar/数组均非空，无更窄受控概念时兜底 `document_content`（build 层
+  保证）。四处强制：build（`build_units.py`）、publish（`publish_run.py`）、audit（finding code
+  `semantic_key_invalid`）、API 查询校验。"再加一份词表做成员校验"的提案已**否决**：单生产者按
+  构造保证一致，第二份清单本身就是漂移源。另记两条此前未成文的不变量：① semantic_key /
+  semantic_keys 参与 `query_projection_hash`——纯规则升级发 `projection_changed`，不是内容事件；
+  ② mixed 单元把成员 part 的键并入父单元 `semantic_keys`（在 content_hash 之外）。
+- **(f) qa 判别撤销决策（2026-07-16 用户裁决）**：`payload_kind="qa"` 判别已从 builder 全面移除，
+  投关/业绩说明会转写以 raw `text` 单元携完整溯源落地，不再产出问答拆分。理由：脆弱的问答文法
+  在全语料重放暴露 4 个失败家族（有问无答的跨页/跨表截断、单元格内碎句、编号问句与声明/判断句
+  混淆、单区间多答标签），持续修补即是从孤立样本长短语表，与根研究门相抵；而 L1 只需保证证据
+  原子完整 + 溯源可回放，问答语义属 L2 关注面，L2 亦不做 qa 拆分。附带收益：vlm 与 pipeline
+  两后端的单元形状因此收敛一致，不再因 QA 恢复启发式而分叉。冻结历史：DB `payload_kind` CHECK
+  仍接受 `'qa'`（历史行），golden 哈希输入枚举保留 qa 例，service-purpose §6.4 schema 存档不删。
+- **(g) 表头与"可能错的解释"的统一原则（用户 2026-07-16 方向，记 06R 背账）**：同日废除
+  td-only 表格的首行提升启发式（headers 仅 `<th>` 证据时非空，完整网格忠实在 rows）。用户
+  方向：这类"有用但可能判错"的解释信号（首行疑似表头、以及未来同类）不进 L1 payload/
+  content_hash，而是作为 **06R 派生投影层的可再生标注**（规则从 rows[0] 形态确定性推导，
+  标注在视图/投影列供检索加权；判错不污染证据、可随规则升级整体重算）。L1 第一性原则：
+  能切分、方便 L2 处理即可；切不准的解释一律以派生标注兜底，不固化进证据原子。
+  外部对标（补记）：Unstructured 对投关/会议转写不做任何 QA 拆分（一律 NarrativeText，
+  官方定位为库外自定义逻辑），td-only 表格 `header_row_count=0` 只认 `<th>/<thead>`
+  证据——两项拆除均为业界保守标准做法（DeepWiki Unstructured-IO/unstructured，2026-07-16）。

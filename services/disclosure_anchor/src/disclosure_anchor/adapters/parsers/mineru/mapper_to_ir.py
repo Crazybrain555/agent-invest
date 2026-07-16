@@ -10,6 +10,12 @@ import math
 import re
 from typing import Any
 
+from disclosure_anchor.adapters.parsers.mineru.geometry import (
+    PAGE_BOTTOM_BAND_MIN,
+    PAGE_TOP_BAND_MAX,
+    bbox_delta,
+    is_page_index,
+)
 from disclosure_anchor.application.contracts.normalized_ir import (
     CURRENT_NORMALIZED_IR_VERSION,
 )
@@ -31,8 +37,6 @@ _AGGREGATE_TABLE_LOCATOR_FIELDS = frozenset(
         "continuation_source_item_indices",
     }
 )
-_PAGE_TOP_BAND_MAX = 180.0
-_PAGE_BOTTOM_BAND_MIN = 820.0
 _FURNITURE_POSITION_BUCKET = 25.0
 _FURNITURE_MIN_PAGES = 3
 _FURNITURE_MIN_CONTIGUOUS_DENSITY = 0.60
@@ -51,13 +55,7 @@ class MinerUParserInfo:
 
 def _page_no(item: dict[str, Any]) -> int | None:
     page_idx = item.get("page_idx")
-    return (
-        page_idx + 1
-        if isinstance(page_idx, int)
-        and not isinstance(page_idx, bool)
-        and page_idx >= 0
-        else None
-    )
+    return page_idx + 1 if is_page_index(page_idx) else None
 
 
 def _parsed_pages(
@@ -74,9 +72,7 @@ def _parsed_pages(
     """
 
     for label, page in (("start_page", start_page), ("end_page", end_page)):
-        if page is not None and (
-            not isinstance(page, int) or isinstance(page, bool) or page < 0
-        ):
+        if page is not None and not is_page_index(page):
             raise ParserOutputContractError(
                 f"MinerU {label} must be a non-negative integer or null"
             )
@@ -299,7 +295,7 @@ def _validated_aggregate_table_locator(
             "aggregate table locator root must carry non-empty aggregate table HTML"
         )
     root_bbox = _required_source_item_bbox(root_item, label="root")
-    if _bbox_delta(root_bbox, normalized_page_bboxes[0]["bbox"]) > (
+    if bbox_delta(root_bbox, normalized_page_bboxes[0]["bbox"]) > (
         _AGGREGATE_TABLE_LOCATOR_BBOX_MAX_DELTA
     ):
         raise ParserOutputContractError(
@@ -336,7 +332,7 @@ def _validated_aggregate_table_locator(
         continuation_bbox = _required_source_item_bbox(
             continuation, label="continuation"
         )
-        if _bbox_delta(continuation_bbox, expected_page_bbox["bbox"]) > (
+        if bbox_delta(continuation_bbox, expected_page_bbox["bbox"]) > (
             _AGGREGATE_TABLE_LOCATOR_BBOX_MAX_DELTA
         ):
             raise ParserOutputContractError(
@@ -353,11 +349,7 @@ def _validated_aggregate_table_locator(
 
 def _required_source_item_page_no(item: dict[str, Any], *, label: str) -> int:
     page_idx = item.get("page_idx")
-    if (
-        not isinstance(page_idx, int)
-        or isinstance(page_idx, bool)
-        or page_idx < 0
-    ):
+    if not is_page_index(page_idx):
         raise ParserOutputContractError(
             f"aggregate table locator {label} item requires a valid page_idx"
         )
@@ -392,12 +384,6 @@ def _required_source_item_bbox(
         normalized_bbox[2],
         normalized_bbox[3],
     )
-
-
-def _bbox_delta(
-    left: tuple[float, float, float, float], right: list[Any]
-) -> float:
-    return max(abs(left[index] - float(right[index])) for index in range(4))
 
 
 def _validated_unique_nonnegative_indices(
@@ -671,12 +657,7 @@ def _inferred_page_furniture_indices(
             continue
         page_idx = item.get("page_idx")
         text = _layout_text(item.get("text"))
-        if (
-            text
-            and isinstance(page_idx, int)
-            and not isinstance(page_idx, bool)
-            and page_idx >= 0
-        ):
+        if text and is_page_index(page_idx):
             signature_page_counts[(text, page_idx)] += 1
 
     groups: dict[tuple[str, str, int, int], list[tuple[int, int]]] = defaultdict(
@@ -690,16 +671,16 @@ def _inferred_page_furniture_indices(
             continue
         page_idx = item.get("page_idx")
         bbox = _finite_bbox(item.get("bbox"))
-        if not isinstance(page_idx, int) or isinstance(page_idx, bool) or bbox is None:
+        if not is_page_index(page_idx) or bbox is None:
             continue
         if signature_page_counts[(text, page_idx)] != 1:
             continue
         x1, y1, x2, y2 = bbox
         if min(x1, y1, x2, y2) < 0 or max(x1, y1, x2, y2) > 1000:
             continue
-        if y2 <= _PAGE_TOP_BAND_MAX:
+        if y2 <= PAGE_TOP_BAND_MAX:
             band = "top"
-        elif y1 >= _PAGE_BOTTOM_BAND_MIN:
+        elif y1 >= PAGE_BOTTOM_BAND_MIN:
             band = "bottom"
         else:
             continue
@@ -826,11 +807,7 @@ class MinerUToNormalizedIRMapper:
         }
         if "page_idx" in item:
             page_idx = item["page_idx"]
-            if (
-                not isinstance(page_idx, int)
-                or isinstance(page_idx, bool)
-                or page_idx < 0
-            ):
+            if not is_page_index(page_idx):
                 raise ParserOutputContractError(
                     "MinerU page_idx must be a non-negative integer"
                 )

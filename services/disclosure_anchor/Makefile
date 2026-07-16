@@ -44,6 +44,7 @@ agent-check:
 	$(MAKE) lint
 	$(MAKE) typecheck
 	env -u DATABASE_URL -u DISCLOSURE_MIGRATION_DATABASE_URL $(MAKE) test
+	$(PYTHON) scripts/audit_test_composition.py
 	git diff --check
 
 test:

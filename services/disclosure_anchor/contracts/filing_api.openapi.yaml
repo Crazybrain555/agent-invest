@@ -1457,7 +1457,8 @@ paths:
         required: false
         schema:
           anyOf:
-          - pattern: ^ *[a-z][a-z0-9_]{0,127} *(?:, *[a-z][a-z0-9_]{0,127} *)*$
+          - maxLength: 8192
+            pattern: ^ *[a-z][a-z0-9_]{0,127} *(?:, *[a-z][a-z0-9_]{0,127} *)*$
             type: string
           - type: 'null'
           description: Comma-separated lowercase ASCII controlled semantic keys (max
@@ -1470,7 +1471,8 @@ paths:
         required: false
         schema:
           anyOf:
-          - pattern: ^ *[a-z][a-z0-9_]{0,127} *(?:, *[a-z][a-z0-9_]{0,127} *)*$
+          - maxLength: 8192
+            pattern: ^ *[a-z][a-z0-9_]{0,127} *(?:, *[a-z][a-z0-9_]{0,127} *)*$
             type: string
           - type: 'null'
           description: Comma-separated lowercase ASCII controlled semantic keys (max

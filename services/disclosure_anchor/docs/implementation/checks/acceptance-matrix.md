@@ -13,7 +13,7 @@ created_at: 2026-06-26
 | A01 | 外置盘挂载且 sentinel 存在 | 00/01 | `make doctor` | pass |
 | A02 | PostgreSQL native cluster 可启动，PGDATA 位于 AgentSSD | 00/02 | Homebrew `pg_ctl` + `pg_isready` + `psql` | pass |
 | A03 | 模型缓存不落内置盘默认 cache | 00/04 | env + doctor | pass |
-| A04 | 样本 PDF 可生成 normalized_ir.v2.json | 00/04 | fixture check | pass |
+| A04 | 样本 PDF 可生成 normalized_ir.v3.json（新解析产物；已提交 phase00 fixture 仍为冻结的历史 v2） | 00/04 | fixture check | pass |
 | A05 | 样本 PDF 可生成 document_units.v1.jsonl | 00/05 | fixture check | pass |
 | A06 | 代码中无业务硬编码 `/Volumes/AgentSSD` | 01 | grep + code review | pass |
 | A07 | `FileStorePathBuilder` 是唯一路径生成入口 | 01/03 | unit test + review | pass |
@@ -46,7 +46,7 @@ created_at: 2026-06-26
 | A34 | 主体解析走 identifier ledger 强键顺序（security→强键→新建），legal_name 只校验不合并；冲突置 contested 并拒绝 | 04R | unit test | pass |
 | A35 | change_kind 落列且写侧必填；事件工厂统一 event_kind/change_kind/occurred_at | 04R | integration test | pass |
 | A36 | parse 超时/探测失败 fail-closed/未知异常 re-raise；document.status 生命周期随 run 变迁 | 04R | unit+integration test | pass |
-| A37 | NormalizedIR v2：parser 中立 kind 分类、结构化表、heading_level；golden fixtures 再生成 | 04R | contract test | pass |
+| A37 | NormalizedIR v3（新解析写契约，v2 仅读兼容；已提交 phase00 fixture 保持冻结历史 v2）：parser 中立 kind 分类、结构化表、heading_level；golden fixtures 再生成 | 04R | contract test | pass |
 | A38 | retrieval projection 派生层：published unit 的 search projection（heading_path_text/display_subtitle/search_text/controlled_keywords/extractive_keywords/retrieval_rules_version，字段族=05-U7）全部可由已持久化数据确定性再生 | 06R | integration test | pending |
 | A39 | 检索 smoke：自然语言关键词（应收账款账龄 / 关税影响 / 退市风险）可召回已知样本 unit | 06R | API test | pending |
 | A40 | search projection 不污染证据：summary/keywords 不进 content_hash；payload 不变时投影重建不产生 materialized 事件、不触发 L3 失效 | 06R | integration test | pending |

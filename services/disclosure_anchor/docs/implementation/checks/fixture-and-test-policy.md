@@ -47,9 +47,12 @@ short_announcement.pdf   短公告，验证少量事项型 text/table
 
 ```text
 mineru_raw 或简化 parser output
-normalized_ir.v2.json（04R-R5 起；R5 前为 .v1。再生成协议 = 04R §6.4，
-  脚本 scripts/regen_phase00_fixtures.py，document_id 保持 phase00_<key> 不变；不带参数会从
-  本地 source content_list/model artifact 重跑 reader→reconciler→mapper→builder）
+normalized_ir.v2.json（04R-R5 起；R5 前为 .v1。committed fixture 仍是冻结的历史 v2。
+  勘误 2026-07-16：不带参数的全量再生成现按 payload 的 contract_version 写文件名——当前落
+  normalized_ir.v3.json——并从本地 source content_list/model artifact 重跑
+  reader→reconciler→mapper→builder，属需显式确认的测试迁移；--units-only 只对已提交的历史
+  v2 IR 重建 units、不改动任何 IR 文件。再生成协议 = 04R §6.4，
+  脚本 scripts/regen_phase00_fixtures.py，document_id 保持 phase00_<key> 不变）
 document_units.v1.jsonl（unit builder 到 05 才存在，04R 阶段禁止再生成）
 manual_review.md
 ```

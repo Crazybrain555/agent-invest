@@ -24,6 +24,9 @@ from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
 from disclosure_anchor.application.dto.worker_report import WorkerLimits
 from disclosure_anchor.application.ports.disclosure_source import AnnouncementRef
+from disclosure_anchor.application.contracts.normalized_ir import (
+    CURRENT_NORMALIZED_IR_VERSION,
+)
 from disclosure_anchor.application.ports.parser import (
     ParserIdentity,
     ParserOptions,
@@ -103,6 +106,12 @@ class FakeParser:
     ) -> ParserResult:
         normalized = json.loads(FIXTURE_IR.read_text(encoding="utf-8"))
         normalized["document_id"] = document_metadata.get("document_id", "unknown")
+        # The committed fixture is frozen legacy v2, but the parse write path
+        # accepts only the current contract and checks run identity: a fresh
+        # parse must stamp v3 and carry this run's registered raw source.
+        normalized["contract_version"] = CURRENT_NORMALIZED_IR_VERSION
+        if document_metadata.get("source_pdf") is not None:
+            normalized["source_pdf"] = str(document_metadata["source_pdf"])
         output_dir.mkdir(parents=True, exist_ok=True)
         content_list = output_dir / "fake_content_list.json"
         content_list.write_text("[]", encoding="utf-8")

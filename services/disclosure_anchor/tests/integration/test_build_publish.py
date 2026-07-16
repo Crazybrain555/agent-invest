@@ -51,7 +51,16 @@ def _normalized_ir(text_value: str = "公司存在退市风险，请投资者注
         "document_id": "doc_placeholder",
         "source_pdf": "raw.pdf",
         "title": "公告",
-        "parser": {},
+        # The read contract requires a fully-identified parser block.
+        "parser": {
+            "name": "MinerU",
+            "package_version": "3.4.0",
+            "backend": "pipeline",
+            "method": "auto",
+            "language": "ch",
+            "formula": True,
+            "table": True,
+        },
         "parser_artifacts": {
             "artifact_root_relpath": "parser/a",
             "content_list_relpath": "parser/a/content.json",

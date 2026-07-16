@@ -753,6 +753,39 @@ class NormalizedIRContractTests(unittest.TestCase):
             widths.add(len(headers))
         self.assertLessEqual(len(widths), 1, label)
 
+    def test_v3_element_visual_fields_validate_and_reject_mistyped_values(self) -> None:
+        data = _load_fixture("short_announcement")
+        data["contract_version"] = "normalized_ir.v3"
+        index = len(data["elements"])
+        data["elements"].append(
+            {
+                "ir_id": "ir_visual_probe",
+                "kind": "image",
+                "raw_kind": "image",
+                "order_index": index,
+                "source_item_index": index,
+                "image_path": "images/a.jpg",
+                "image_caption": ["x"],
+                "image_footnote": ["y"],
+                "visual_subtype": "seal",
+            }
+        )
+        self._assert_valid(data, label="v3_visual_fields")
+
+        for field, invalid_value in (
+            ("image_caption", "x"),
+            ("visual_subtype", 7),
+            ("image_path", 7),
+        ):
+            with self.subTest(field=field):
+                mutated = copy.deepcopy(data)
+                mutated["elements"][index][field] = invalid_value
+                self._assert_invalid(
+                    mutated,
+                    label=f"v3_visual_{field}_mistyped",
+                    path=("elements", index, field),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

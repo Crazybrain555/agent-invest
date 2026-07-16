@@ -221,11 +221,12 @@ class Settings(BaseSettings):
     )
     # Parallel parse chains per round (1 = serial). Meant for the
     # *-http-client backends where the GPU server absorbs concurrency;
-    # capped to keep local memory/subprocess fan-out bounded.
+    # capped to keep local memory/subprocess fan-out bounded (raised 8→16
+    # per user decision 2026-07-17 for the vllm continuous-batching server).
     worker_parse_concurrency: int = Field(
         default=1,
         ge=1,
-        le=8,
+        le=16,
         validation_alias=AliasChoices(
             "WORKER_PARSE_CONCURRENCY", "worker_parse_concurrency"
         ),

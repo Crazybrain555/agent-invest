@@ -31,6 +31,7 @@ from disclosure_anchor.application.contracts.unit_source_projection import (
     UNIT_SOURCE_PROJECTION_VERSION,
     source_value_sha256,
 )
+from disclosure_anchor.domain.value_objects.comparison_text import comparison_text
 from disclosure_anchor.domain.value_objects.semantic_key import (
     SemanticKeyInvariantError,
     validate_semantic_key_state,
@@ -708,38 +709,63 @@ def _validate_source_dispositions(
     return state
 
 
-def _resolve_disposition(
-    proof: Mapping[str, Any],
+def _resolve_source_identity(
+    identity: Mapping[str, Any],
     *,
     source: _SourceIndex,
-    findings: list[AuditFinding],
-) -> str | None:
+    on_unresolved: Callable[[], None],
+) -> tuple[set[str], bool] | None:
+    """Resolve ir_id/source_item_index/order_index to candidate source atoms.
+
+    Returns (candidate refs, whether any identity field was supplied), or None
+    when a supplied field does not resolve — in that case ``on_unresolved`` has
+    already emitted the caller's finding and the caller must return None.  Each
+    caller keeps its own conflict/unresolved codes and any extra validation.
+    """
+
     candidates: set[str] = set()
     supplied = False
-    ir_id = proof.get("ir_id")
+    ir_id = identity.get("ir_id")
     if ir_id is not None:
         supplied = True
         if not isinstance(ir_id, str) or ir_id not in source.by_ir_id:
-            _unresolved_disposition(findings)
+            on_unresolved()
             return None
         candidates.add(source.by_ir_id[ir_id])
-    source_index = proof.get("source_item_index")
+    source_index = identity.get("source_item_index")
     if source_index is not None:
         supplied = True
         if (
             not isinstance(source_index, int)
             or source_index not in source.by_source_item_index
         ):
-            _unresolved_disposition(findings)
+            on_unresolved()
             return None
         candidates.add(source.by_source_item_index[source_index])
-    order_index = proof.get("order_index")
+    order_index = identity.get("order_index")
     if order_index is not None:
         supplied = True
         if not isinstance(order_index, int) or order_index not in source.by_order_index:
-            _unresolved_disposition(findings)
+            on_unresolved()
             return None
         candidates.add(source.by_order_index[order_index])
+    return candidates, supplied
+
+
+def _resolve_disposition(
+    proof: Mapping[str, Any],
+    *,
+    source: _SourceIndex,
+    findings: list[AuditFinding],
+) -> str | None:
+    resolved = _resolve_source_identity(
+        proof,
+        source=source,
+        on_unresolved=lambda: _unresolved_disposition(findings),
+    )
+    if resolved is None:
+        return None
+    candidates, supplied = resolved
     if not supplied or len(candidates) != 1:
         findings.append(
             AuditFinding(
@@ -1507,6 +1533,7 @@ def _resolve_source_selector(
         "image": common,
         "image_caption": common | {"index", "char_span"},
         "image_footnote": common | {"index", "char_span"},
+        "visual_subtype": common,
     }
     if not set(field_selector).issubset(allowed_by_kind[str(kind)]):
         _projection_finding(
@@ -1676,6 +1703,8 @@ def _select_source_value(
     elif kind == "image_footnote":
         notes = _string_list(element.get("image_footnote"))
         value = notes[_selector_index(field)]
+    elif kind == "visual_subtype":
+        value = str(element.get("visual_subtype") or "")
     else:
         raise ValueError(f"unsupported selector kind {kind}")
     span = field.get("char_span")
@@ -1801,8 +1830,7 @@ def _validate_payload_projection_value(
 
 
 def _projection_norm(value: Any) -> str:
-    normalized = unicodedata.normalize("NFKC", str(value)).casefold().replace(r"\~", "~")
-    return re.sub(r"\s+", "", normalized)
+    return comparison_text(str(value))
 
 
 def _table_projection_matches(projection: _ResolvedPayloadProjection) -> bool:
@@ -2000,32 +2028,14 @@ def _resolve_locator(
     findings: list[AuditFinding],
     unit: AuditUnitView,
 ) -> str | None:
-    candidates: set[str] = set()
-    supplied = False
-    ir_id = locator.get("ir_id")
-    if ir_id is not None:
-        supplied = True
-        if not isinstance(ir_id, str) or ir_id not in source.by_ir_id:
-            _unresolved_locator(findings, unit=unit)
-            return None
-        candidates.add(source.by_ir_id[ir_id])
-    source_index = locator.get("source_item_index")
-    if source_index is not None:
-        supplied = True
-        if (
-            not isinstance(source_index, int)
-            or source_index not in source.by_source_item_index
-        ):
-            _unresolved_locator(findings, unit=unit)
-            return None
-        candidates.add(source.by_source_item_index[source_index])
-    order_index = locator.get("order_index")
-    if order_index is not None:
-        supplied = True
-        if not isinstance(order_index, int) or order_index not in source.by_order_index:
-            _unresolved_locator(findings, unit=unit)
-            return None
-        candidates.add(source.by_order_index[order_index])
+    resolved = _resolve_source_identity(
+        locator,
+        source=source,
+        on_unresolved=lambda: _unresolved_locator(findings, unit=unit),
+    )
+    if resolved is None:
+        return None
+    candidates, supplied = resolved
     if len(candidates) > 1:
         findings.append(
             AuditFinding(
@@ -2622,6 +2632,90 @@ def _validate_tables(
             )
 
 
+def _expected_visual_kind(element: Mapping[str, Any]) -> str:
+    """Derive the typed visual classification from the source element."""
+
+    if element.get("raw_kind") == "chart":
+        return "chart"
+    if element.get("kind") == "equation":
+        return "equation"
+    return "image"
+
+
+def _validate_visual_payload_fields(
+    element: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    ref: str,
+    findings: list[AuditFinding],
+) -> None:
+    """Fail closed when a rebuilt image payload drops or mistypes source facts."""
+
+    source_caption = _projection_norm("".join(_string_list(element.get("image_caption"))))
+    if source_caption and source_caption not in _projection_norm(payload.get("caption")):
+        findings.append(
+            AuditFinding(
+                code="image_caption_dropped",
+                severity="error",
+                message="source image_caption is absent from the payload caption",
+                source_ref=ref,
+            )
+        )
+    source_notes = _projection_norm("".join(_string_list(element.get("image_footnote"))))
+    if source_notes and source_notes not in _projection_norm(
+        "".join(_string_list(payload.get("notes")))
+    ):
+        findings.append(
+            AuditFinding(
+                code="image_notes_dropped",
+                severity="error",
+                message="source image_footnote is absent from the payload notes",
+                source_ref=ref,
+            )
+        )
+    source_content = _projection_norm(_element_text(dict(element)))
+    if source_content and source_content not in _projection_norm(
+        "".join(
+            [
+                *_string_list(payload.get("content")),
+                *_string_list(payload.get("caption")),
+            ]
+        )
+    ):
+        findings.append(
+            AuditFinding(
+                code="image_content_dropped",
+                severity="error",
+                message="source image text is absent from payload content or caption",
+                source_ref=ref,
+            )
+        )
+    if payload.get("visual_kind") != _expected_visual_kind(element):
+        findings.append(
+            AuditFinding(
+                code="visual_kind_mismatch",
+                severity="error",
+                message="payload visual_kind differs from the source element type",
+                source_ref=ref,
+            )
+        )
+    if _optional_visual_subtype(element.get("visual_subtype")) != _optional_visual_subtype(
+        payload.get("visual_subtype")
+    ):
+        findings.append(
+            AuditFinding(
+                code="visual_subtype_mismatch",
+                severity="error",
+                message="payload visual_subtype differs from the source element",
+                source_ref=ref,
+            )
+        )
+
+
+def _optional_visual_subtype(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
 def _validate_images(
     source: _SourceIndex,
     *,
@@ -2650,20 +2744,14 @@ def _validate_images(
             )
             continue
         _, payload = occurrences[0]
+        _validate_visual_payload_fields(element, payload, ref=ref, findings=findings)
+        # Registration into image_payloads requires a truthy image_ref, so a
+        # payload that dropped it never reaches here — it fails above as
+        # image_payload_count_invalid (zero occurrences).
         image_ref = _payload_image_ref(payload)
-        refs = {image_ref} if image_ref is not None else set()
-        if len(refs) != 1:
-            findings.append(
-                AuditFinding(
-                    code="image_ref_missing",
-                    severity="error",
-                    message="source image does not resolve to one content-addressed ref",
-                    source_ref=ref,
-                )
-            )
-            continue
+        assert image_ref is not None
         expected = image_hashes.get(ref) or _digest_from_path(image_path)
-        actual = _digest_from_path(next(iter(refs)))
+        actual = _digest_from_path(image_ref)
         if expected is None:
             findings.append(
                 AuditFinding(
@@ -2860,7 +2948,6 @@ def _validate_units(
                     unit_order=unit.order_index,
                 )
             )
-        _validate_qa_projection(unit, findings=findings)
         _validate_title_projection(unit, metadata=metadata, findings=findings)
 
 
@@ -2899,52 +2986,6 @@ def _has_typed_headerless_anchor(
         and all(isinstance(value, dict) for value in entry["sources"])
     )
 
-
-def _validate_qa_projection(
-    unit: AuditUnitView, *, findings: list[AuditFinding]
-) -> None:
-    if unit.payload_kind != "qa":
-        return
-    question = unit.payload.get("question")
-    answer = unit.payload.get("answer")
-    raw_text = unit.payload.get("raw_text")
-    if not all(
-        isinstance(value, str) and bool(value.strip())
-        for value in (question, answer, raw_text)
-    ):
-        findings.append(
-            AuditFinding(
-                code="qa_projection_invalid",
-                severity="error",
-                message="QA payload requires non-empty question, answer, and raw_text",
-                unit_order=unit.order_index,
-            )
-        )
-        return
-    assert isinstance(question, str)
-    assert isinstance(answer, str)
-    assert isinstance(raw_text, str)
-    normalized_raw = _norm(raw_text)
-    question_offset = normalized_raw.find(_norm(question))
-    answer_offset = normalized_raw.find(_norm(answer), max(0, question_offset))
-    if question_offset < 0 or answer_offset < question_offset:
-        findings.append(
-            AuditFinding(
-                code="qa_projection_mismatch",
-                severity="error",
-                message="question and answer are not ordered substrings of raw_text",
-                unit_order=unit.order_index,
-            )
-        )
-    if _norm(unit.title or "") != _norm(question):
-        findings.append(
-            AuditFinding(
-                code="qa_title_mismatch",
-                severity="error",
-                message="QA title must equal its question",
-                unit_order=unit.order_index,
-            )
-        )
 
 
 def _validate_title_projection(
@@ -2989,7 +3030,6 @@ def _payload_title_candidates(kind: str, payload: Mapping[str, Any]) -> list[str
                 continue
             values.extend(_payload_title_candidates(str(part.get("kind") or "text"), part))
             values.extend(_string_list(part.get("heading_path")))
-            values.extend(_string_list(part.get("local_heading")))
     return values
 
 
@@ -3090,13 +3130,6 @@ def _payload_primary_text(kind: str, payload: dict[str, Any]) -> str:
             for part in parts
             if isinstance(part, dict)
         )
-    if kind == "qa":
-        raw = payload.get("raw_text")
-        if isinstance(raw, str) and raw:
-            return raw
-        return "\n".join(
-            str(payload.get(key) or "") for key in ("question", "answer")
-        )
     if kind == "text":
         if _payload_image_ref(payload):
             values = [
@@ -3148,6 +3181,11 @@ def _string_list(value: Any) -> list[str]:
 
 
 def _norm(value: Any) -> str:
+    # Intentionally NFKC + whitespace only, and case-sensitive: unlike
+    # comparison_text/_projection_norm this must NOT casefold, because its
+    # inputs include case-significant values (uppercase security codes, English
+    # headings/titles).  It also needs no LaTeX ``\~`` unescaping.  Do not fold
+    # it into comparison_text.
     return "".join(unicodedata.normalize("NFKC", str(value)).split())
 
 

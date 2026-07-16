@@ -164,7 +164,13 @@ class _Parser:
                 "table": options.table,
             },
             "parser_artifacts": {},
-            "parsed_pages": {"start_page_no": 1, "end_page_no": 1},
+            # v3 write contract: parsed_pages carries exactly these three keys,
+            # with full_pdf derived from whether a page window was requested.
+            "parsed_pages": {
+                "start_page_no": 1,
+                "end_page_no": 1,
+                "full_pdf": options.start_page is None and options.end_page is None,
+            },
             "elements": [],
         }
         return ParserResult(

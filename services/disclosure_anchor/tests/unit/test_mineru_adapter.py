@@ -254,6 +254,67 @@ class MinerUMapperTests(unittest.TestCase):
 
         self.assertTrue(all(item["kind"] == "heading" for item in normalized["elements"]))
 
+    def test_structures_rowspan_colspan_table_and_preserves_qa_cell_text(self) -> None:
+        normalized = MinerUToNormalizedIRMapper().map_content_list(
+            content_list=[
+                {
+                    "type": "table",
+                    "page_idx": 0,
+                    "table_body": (
+                        "<table>"
+                        "<tr><td>问题</td><td colspan=\"2\">回答</td></tr>"
+                        "<tr><td rowspan=\"2\">收入是否增长？</td><td>是</td><td>10%</td></tr>"
+                        "<tr><td>原因</td><td>订单增加</td></tr>"
+                        "</table>"
+                    ),
+                }
+            ],
+            parser_info=_parser_info(),
+            document_metadata={
+                "document_id": "doc_1",
+                "source_pdf": "raw/doc.pdf",
+                "title": "sample",
+            },
+        )
+
+        element = normalized["elements"][0]
+        table = element["table"]
+        self.assertEqual(element["kind"], "table")
+        self.assertEqual(element["raw_kind"], "table")
+        # td-only tables carry no header evidence: the full grid stays in
+        # rows and header promotion is the unit builder's business rule.
+        self.assertEqual(table["headers"], [])
+        self.assertEqual(table["rows"][0], ["问题", "回答", "回答"])
+        self.assertEqual(table["rows"][1], ["收入是否增长？", "是", "10%"])
+        self.assertIn("收入是否增长？", "".join("".join(row) for row in table["rows"]))
+        self.assertEqual(
+            table["merged_cells"],
+            [
+                {"row": 0, "col": 1, "rowspan": 1, "colspan": 2},
+                {"row": 1, "col": 0, "rowspan": 2, "colspan": 1},
+            ],
+        )
+
+    def test_nonempty_html_without_cells_flags_table_parse_failed(self) -> None:
+        normalized = MinerUToNormalizedIRMapper().map_content_list(
+            content_list=[
+                {
+                    "type": "table",
+                    "page_idx": 0,
+                    "table_body": "<div>不是表格的载体</div>",
+                }
+            ],
+            parser_info=_parser_info(),
+            document_metadata={
+                "document_id": "doc_bad_table",
+                "source_pdf": "raw/doc.pdf",
+                "title": "sample",
+            },
+        )
+        element = normalized["elements"][0]
+        self.assertTrue(element.get("table_parse_failed"))
+        self.assertEqual(element["table"], {"headers": [], "rows": []})
+
     def test_maps_neutral_kinds_and_structured_tables(self) -> None:
         mapper = MinerUToNormalizedIRMapper()
         normalized = mapper.map_content_list(

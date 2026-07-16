@@ -84,7 +84,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | 列 | 含义 |
 |---|---|
 | asset_id | `du_`+ULID；跨 run 不承诺同 ID，身份=content_hash |
-| payload_kind | 闭集 text / table / qa / **mixed**（业务块，payload=semantic_type+有序 parts） |
+| payload_kind | 闭集 text / table / qa「历史值：旧产物存在、2026-07-16 起不再产出（QA 判别已移除，转写以 raw text 落地）」/ **mixed**（业务块，payload=semantic_type+有序 parts）。mixed 的 part 级 kind ∈ {text, table, **image**}；image part/壳 payload = `{image_ref, caption, context, content?, notes?, visual_kind, visual_subtype?}`，其中 image_ref = 归档视觉产物的内容寻址 sha256，visual_kind ∈ {image, chart, equation}，visual_subtype? = MinerU sub_type 透传（如 seal/bar） |
 | heading_path | jsonb 1-4 级**多级标题**（必填非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text |
 | title | 叶子显示名（单值；多级在 heading_path，决策记录见 retrieval 设计文档 §4.5） |
 | semantic_key | 单值路由键（规则命中→词表键→事件键→`document_content` 通用内容键）；ub-2026.07-26 新产物非空，库列仅为历史兼容仍可空；`document_content` 表示“确定是文档证据、暂无更窄受控概念”，不是 `unknown`；btree 索引 |

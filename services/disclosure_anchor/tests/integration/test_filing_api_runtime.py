@@ -1053,19 +1053,28 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
                 for unit in receivable_units
                 for part in _unit_table_parts(unit)
             ]
-            self.assertTrue(any(part.get("headers") for part in tables))
+            # User decision 2026-07-16: no first-row header guessing — without
+            # <th> evidence the full faithful grid lives in rows and headers
+            # stay empty; interpretation belongs to L2/the view layer.
             self.assertTrue(any(part.get("rows") for part in tables))
             self.assertTrue(any(part.get("unit") for part in tables))
         elif sample.label == "ir_activity":
-            qa_units = [unit for unit in units if unit["payload_kind"] == "qa"]
-            self.assertGreaterEqual(len(qa_units), 30)
-            self.assertTrue(
-                any(
-                    "美国加征关税" in unit["payload"].get("question", "")
-                    and "美国收入占比很低" in unit["payload"].get("answer", "")
-                    for unit in qa_units
-                )
+            # QA discrimination removed 2026-07-16: the transcript stays raw
+            # text under the official narrative label, question and answer
+            # both retrievable from the same evidence carrier.
+            self.assertFalse(
+                any(unit["payload_kind"] == "qa" for unit in units)
             )
+            narrative_texts = [
+                str(unit["payload"].get("text") or "")
+                for unit in units
+                if unit["payload_kind"] == "text"
+                and unit["heading_path"] == ["投资者关系活动主要内容介绍"]
+            ]
+            self.assertTrue(narrative_texts)
+            joined = "\n".join(narrative_texts)
+            self.assertIn("美国加征关税", joined)
+            self.assertIn("美国收入占比很低", joined)
 
     def _assert_provider_document_id_available(self, provider_document_id: str) -> None:
         with self.engine.connect() as conn:

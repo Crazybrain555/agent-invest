@@ -197,7 +197,11 @@ class SourceProjectionTests(unittest.TestCase):
         self.assertNotIn("projection_region_role", unproven.elements[0])
         self.assertNotIn("projection_region_role", unproven.elements[1])
 
-    def test_qa_partition_spans_carriers_and_keeps_heading_provenance(self) -> None:
+    def test_qa_transcript_stays_text_and_keeps_heading_provenance(self) -> None:
+        # QA discrimination was removed 2026-07-16: an investor-relations
+        # transcript stays raw text carriers under its parser section — no
+        # payload_kind="qa" — while the section heading keeps its typed
+        # provenance on the projection graph.
         elements = [
             _text(0, "三、主要交流问题", kind="heading"),
             _text(1, "1. 请问收入？"),
@@ -212,16 +216,18 @@ class SourceProjectionTests(unittest.TestCase):
             document_title="甲公司调研记录",
         )
 
-        self.assertEqual([unit.payload_kind for unit in units], ["qa", "qa"])
-        for index, unit in enumerate(units):
-            graph = (unit.artifact_locator or {})["source_projection"]
-            self.assertEqual(graph["payload"]["kind"], "text_partition")
-            self.assertEqual(graph["payload"]["index"], index)
-            self.assertEqual(graph["payload"]["count"], 2)
-            self.assertEqual(
-                graph["heading_path"][0]["selector"]["source"]["ir_id"],
-                "ir_0000",
-            )
+        self.assertTrue(units)
+        self.assertNotIn("qa", [unit.payload_kind for unit in units])
+        transcript = next(unit for unit in units if "请问收入" in str(unit.payload))
+        self.assertEqual(transcript.payload_kind, "text")
+        self.assertIn("收入增长", transcript.payload["text"])
+        self.assertIn("保持稳定", transcript.payload["text"])
+        self.assertEqual(transcript.heading_path, ["三、主要交流问题"])
+        graph = (transcript.artifact_locator or {})["source_projection"]
+        self.assertEqual(
+            graph["heading_path"][0]["selector"]["source"]["ir_id"],
+            "ir_0000",
+        )
 
     def test_numbered_business_prose_without_answers_is_not_qa(self) -> None:
         elements = [

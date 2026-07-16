@@ -11,7 +11,7 @@ delivers_to: milestone 06
 
 # Milestone 05: document_unit builder 与 active run
 
-从 NormalizedIR v2 生成 L2-ready `document_unit`，完成载体规范化（carrier normalization，
+从 NormalizedIR v3 生成（v2 仅读兼容）L2-ready `document_unit`，完成载体规范化（carrier normalization，
 顶层协议 §3.5）、质量标记、unit snapshot、active run 原子发布和 change_event。
 本文件是实施级规格：算法、事务边界、哈希定义、事件语义全部定死，实施 agent 不另做设计决策。
 
@@ -129,7 +129,7 @@ processing_run_published payload = {previous_processing_run_id|null, content_has
 前置校验错误码闭集（沿用 04R 结构化错误 JSON 形状，stage='build_units'，retryable=false）：
 `RUN_NOT_FOUND`（run 不存在）/ `RUN_NOT_SUCCEEDED` / `IR_MISSING`（normalized_ir_relpath
 缺失或不可读）/ `IR_HASH_MISMATCH`（derived IR 与 run 记录的 artifact hash 不一致）/
-`IR_CONTRACT_TOO_OLD`（contract_version 非 normalized_ir.v2，指引重新 parse）/
+`IR_CONTRACT_TOO_OLD`（contract_version 世代低于 v2（即 v1）才触发；当前写入契约为 v3，v2 仍可读，指引重新 parse）/
 `IR_TABLE_RECONCILIATION_INVALID`（聚合表 locator 诊断、元素或跨对象计数不可能）/
 `IR_TABLE_RECONCILIATION_ALGORITHM_MISMATCH`（聚合表 locator 算法版本不兼容，必须重新 parse）/
 `UNITS_ALREADY_BUILT`（该 run 已有 unit——unit 不可变，重建走新 run）。
@@ -142,7 +142,9 @@ processing_run_published payload = {previous_processing_run_id|null, content_has
 空扩展位。**任何丢弃都进 build 统计（按 kind 分桶计数），不允许静默消失**。
 `image`：不无条件丢弃——判定"有语境"= caption 非空，或紧邻标题（该元素之前最近的非
 page_furniture 元素是 kind='heading' 且同页）；有语境（股权结构图、组织架构图等实质图）
-→ 生成 `text` unit，payload `{"image_ref": ..., "caption": ..., "context": 邻近标题}`、
+→ 生成 `text` unit，payload `{"image_ref": ..., "caption": ..., "context": 邻近标题,
+"visual_kind": image|chart|equation, "visual_subtype"?: MinerU sub_type 透传}`（ub-2026.07-56
+起补齐 chart/equation 源身份与子类型，含 typed source projection 与审计比对）、
 quality_status='needs_review'。**image_ref 存跨 run 稳定的内容寻址图片名**（MinerU 输出的
 images/<sha256>.jpg 文件名；若非哈希命名则以图片 bytes 的 sha256 自算），**绝不存
 artifact_locator**——run 级路径进 payload 会使 content_hash 每次重解析必变，击穿"内容未变
@@ -184,6 +186,10 @@ heading_path = 祖先标题原文列表（保留编号前缀，与 golden fixtur
 `text` unit；显式编号条目多且长时按条目拆分；长而无内部结构的小节保持单 unit（§8.2，
 不做字符数/token 切分）。`title` = 最近标题文本。
 
+> **历史（已废止，2026-07-16 用户裁决取代）**：以下 S4 qa builder 阶段整体被移除——QA 判别
+> 不再运行，投关/业绩说明会转写以 raw text 单元携完整溯源落地，L2 亦不做 qa 拆分，builder
+> 不再产出 `payload_kind="qa"`。下文保留为历史设计记录，勿据此实现新行为。
+
 **S4 qa builder**（qa 识别对全部 filing_type 运行，但边界强度分层）：投关记录/业绩说明会
 允许“编号问句 + 无显式答标签的连续正文”；其他 filing_type 必须同时出现明确 `答/回复/A:`
 才生成 QA，避免把年报里的审计职责、声明或判断条件误拆成问答。原“投关/说明会触发”还限定
@@ -219,10 +225,10 @@ QA，并把尾段单独存为 text + needs_review。结构化表格本体始终�
   "rows":     IR 结构化 rows,
   "notes":    table_footnote 列表原样
 }
-title = caption 首项或最近标题。**payload.headers 的来源（表头提升规则，04R-R5.2 定死
-IR headers 只含 `<th>` 证据、MinerU 下通常为空）**：跨页合并**完成后**，IR headers 非空
-（th 证据）→ 直接采用；为空 → 将合并后网格的首行提升为 payload.headers（先合并后提升，
-防续页首行被错标；KV 形态首行被提升属可接受粗糙，数据完整保留在 payload）。
+title = caption 首项或最近标题。**payload.headers 的来源（04R-R5.2 定死 IR headers 只含
+`<th>` 证据、MinerU 下通常为空；用户 2026-07-16 裁决废除首行提升启发式）**：IR headers
+非空（th 证据）→ 直接采用；为空 → **headers 保持空、全网格忠实保留在 rows**，表头解释
+归 L2/视图层（历史的"合并后首行提升"规则已随 corpus-reparse-audit-r1 移除，防错标续表/KV 表）。
 merged_cells 保留 row_span/col_span；空单元格、"-"、"—"、"不适用" 原样区分不归一。
 单位说明与脚注**绝不作为噪声丢弃**（脚注常含追溯调整/会计政策，红线）。
 IR 带 table_parse_failed → payload 落 {caption, raw_html, notes} 并
@@ -388,7 +394,8 @@ U5 multiset 配对 diff（重复 hash、仅投影变化、仅结构变化三分�
 读回且 subject_ref/change_kind 正确（期望值 = U5 定死的取值表）。
 契约（键集断言定死，防两个真相源打架）：快照每行**顶层键集** == S8 步骤 2 的 14 键集合
 （与 phase00 fixture 顶层一致）；**payload 内层键集按 kind 断言**：text={text}（image 壳=
-{image_ref, caption, context}）、qa={question, answer, raw_text}、table={caption, unit,
+{image_ref, caption, context, visual_kind} + 可选 {content, notes, visual_subtype}，
+ub-2026.07-56 起）、qa={question, answer, raw_text}、table={caption, unit,
 headers, rows, notes}（table_parse_failed 时={caption, raw_html, notes}）；mixed 至少为
 {semantic_type, parts}，parts 保留有序 kind/content 与局部标题/适用性/质量注解。
 phase00 fixtures 的 payload 内层是 v1 历史形态（{format,page_no,text} 等），
@@ -458,6 +465,12 @@ phase00 fixtures 的 payload 内层是 v1 历史形态（{format,page_no,text} �
 用户裁决：**payload kind 不决定 unit 边界，一个业务块内 text/table 混合是常态**。新增
 `payload_kind='mixed'`（0011 迁移扩 CHECK；payload = semantic_type + 有序 parts，
 part 形状复用各 kind payload schema；见 service-purpose §6.5）。S8 语义分组阶段：
+
+> **历史设计（corpus-reparse-audit-r1 勘误 2026-07-16）**：以下 S8 语义分组各条为 ub-2026.07-5
+> 当时的边界，多条已被本 §8.5 后续轮次改写——完整 `structural_path` 现全量投影进公开
+> `heading_path`，第 3 条的 `local_heading` 不再产出（深层子标题各自成 unit，见 ub-2026.07-25/-53
+> 与 retrieval-and-semantic-keys 设计 §6.3）；第 6 条的合成锚 `公告头信息` 已废止，现为审计
+> **ERROR**（finding `synthetic_header_anchor`），公告号只在严格元数据链内并入首个实质正文或原样保留。
 
 1. **议案分组**（P0#1 股东会决议实证）：`\d+.议案名称：` 锚点起一个 proposal unit
    （semantic_type=meeting_proposal），审议结果+表决表格+会议决定同体；正文中段出现的下一项
@@ -610,7 +623,8 @@ ub-2026.07-9 代并 prune；门禁全绿。
   残片。NormalizedIR v2 增加可选 `native_text` shadow（pdfplumber 逐页文本、版本、hash、
   字符统计）；只对标题有“活动记录表/调研记录/业绩说明会问答或实录”证据的**完整页解析**
   生成，且在 MinerU 剩余 timeout 预算内的可终止子进程执行。MinerU 继续是表格、版面和
-  locator 真源。
+  locator 真源。**（勘误 2026-07-16：normalized_ir.v3 写契约已彻底禁止 native_text 与
+  native_text_shadow，写入即被拒绝；该 shadow 仅是 v2 历史机制，v3 产物不再包含。）**
 - builder 恢复门为 fail-closed：native 必须有从“一、”起连续章节、章节内真实闭合 QA、
   首章节在 MinerU 载荷中可定位；所有将被替换的 MinerU 正文片段须在保留小数点、百分号、
   正负号等符号后，按顺序逐片段严格存在于 native 文本。任何独有事实、真实多列表、

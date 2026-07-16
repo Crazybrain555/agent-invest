@@ -28,6 +28,10 @@ Parser/builder 回归不能只固定一个 provider_document_id。行为变化�
 slice 守恒、边界和输出语义，不以某一 golden 的 unit 数恰好相等代替泛化验证。
 补回归前先审计相邻测试组合，优先删除、合并或重写过期/重复断言，再增加最小正负例；历史 AI
 fixture、旧实现预期或测试数量本身都不是保留理由，确认无冗余时才原样保留。
+本原则由**棘轮账本机械执行**（quality-ratchet CI 模式，用户 2026-07-16 确认）：`agent-check`
+跑 `scripts/audit_test_composition.py`，每文件测试数或 src 私有符号导入超过
+`tests/composition_ledger.json` 即门禁红；完成组合审计后用 `--update` 有意识刷新账本，
+缩减自动通过。
 **会消费全局队列的测试（worker run_once 类）必须建独立 scratch database**
 （模式见 test_worker_integration.setUpClass：CREATE DATABASE + ensure_schemas + alembic 子进程），
 共享真库上跑 run_once 会把真实 pending 文档灌进 fake——已实测踩过。

@@ -9,42 +9,23 @@ from disclosure_anchor.adapters.unit_builder.builder import (
     BuildStats,
     PreparedElement,
     UnitDraft,
-    _worst_quality,
     build_unit_drafts_s1_s7,
-    replace_text_units_with_qa_where_stable,
     s1_preprocess_elements,
     s2_apply_heading_tree,
     s3_build_text_units,
-    s4_build_qa_units,
     s5_build_table_units,
     s6_filter_units,
     s7_finalize_units,
-    semantic_key_for_unit,
     semantic_keys_for_unit,
 )
 
 
 class UnitBuilderTests(unittest.TestCase):
-    def test_rules_version_and_fixed_tables(self) -> None:
-        self.assertEqual(rules.RULES_VERSION, "ub-2026.07-55")
-        self.assertEqual(rules.HEADING_RULESET_ID, "cn_a_v6")
-        self.assertEqual(rules.SKIP_SECTION_TITLES, set())
-        self.assertEqual(rules.GIBBERISH_RATIO_MAX, 0.30)
-
     def test_short_note_labels_do_not_match_unrelated_substrings(self) -> None:
         self.assertIsNone(rules.note_key_for_title("库存货物管理情况"))
         self.assertIsNone(rules.note_key_for_title("公司商誉体系建设"))
         self.assertIsNone(rules.note_key_for_title("融资租赁业务发展"))
         self.assertEqual(rules.note_key_for_title("存货分类构成"), "inventory")
-
-    def test_every_registered_note_label_reaches_its_declared_keys(self) -> None:
-        exact, _ = rules._note_key_tables()
-        for label, expected_keys in exact.items():
-            with self.subTest(label=label):
-                self.assertTrue(
-                    set(expected_keys).issubset(rules.note_keys_for_title(label)),
-                    (label, expected_keys, rules.note_keys_for_title(label)),
-                )
 
     def test_note_number_stripping_requires_structural_punctuation(self) -> None:
         self.assertEqual(
@@ -226,6 +207,41 @@ class UnitBuilderTests(unittest.TestCase):
             6,
         )
 
+    def test_same_page_repeated_business_text_survives_s1(self) -> None:
+        # A running header/footer repeats across pages; identical business text
+        # on the SAME page (mid-page, well inside the 180/820 furniture bands)
+        # is genuine content and must never be deduplicated or reclassified as
+        # page furniture.
+        result = s1_preprocess_elements(
+            [
+                {
+                    "kind": "text",
+                    "raw_kind": "text",
+                    "order_index": 1,
+                    "page_no": 3,
+                    "bbox": [100, 400, 500, 430],
+                    "text": "公司超级电容器业务收入同比增长20%。",
+                },
+                {
+                    "kind": "text",
+                    "raw_kind": "text",
+                    "order_index": 2,
+                    "page_no": 3,
+                    "bbox": [100, 470, 500, 500],
+                    "text": "公司超级电容器业务收入同比增长20%。",
+                },
+            ]
+        )
+
+        self.assertEqual([item.kind for item in result.elements], ["text", "text"])
+        self.assertEqual(
+            [item.text for item in result.elements],
+            ["公司超级电容器业务收入同比增长20%。"] * 2,
+        )
+        self.assertEqual(
+            result.stats.dropped_by_kind["page_furniture_exact_duplicate"], 0
+        )
+
     def test_retained_page_furniture_does_not_inherit_business_heading(self) -> None:
         units, _ = build_unit_drafts_s1_s7(
             {
@@ -403,6 +419,65 @@ class UnitBuilderTests(unittest.TestCase):
             "image_caption_without_image",
         )
 
+    def test_s1_chart_payload_carries_visual_subtype_and_projection(self) -> None:
+        # ub-2026.07-56: a MinerU chart (kind=image, raw_kind=chart) with a
+        # typed sub_type must publish visual_kind/visual_subtype and expose the
+        # subtype as a structured source projection onto payload.visual_subtype.
+        digest = "d" * 64
+        result = s1_preprocess_elements(
+            [
+                {
+                    "kind": "image",
+                    "raw_kind": "chart",
+                    "order_index": 1,
+                    "source_item_index": 1,
+                    "ir_id": "ir_0001",
+                    "page_no": 4,
+                    "image_path": f"images/{digest}.jpg",
+                    "visual_subtype": "bar",
+                    "image_caption": ["图1 营收结构"],
+                    "image_footnote": ["注：单位亿元"],
+                }
+            ]
+        )
+
+        chart = next(item for item in result.elements if item.payload)
+        self.assertEqual(chart.payload["visual_kind"], "chart")
+        self.assertEqual(chart.payload["visual_subtype"], "bar")
+        self.assertEqual(chart.payload["caption"], "图1 营收结构")
+        self.assertEqual(chart.payload["notes"], ["注：单位亿元"])
+        structured = (chart.artifact_locator or {})["source_projection"]["structured"]
+        subtype_projection = next(
+            item
+            for item in structured
+            if item["target_field"] == "payload.visual_subtype"
+        )
+        self.assertEqual(subtype_projection["source"]["field"]["kind"], "visual_subtype")
+
+    def test_s1_equation_payload_uses_content_fallback_without_notes(self) -> None:
+        # Equations never carry image_caption/image_footnote; the caption falls
+        # back to the formula content and no notes key is emitted.
+        digest = "e" * 64
+        result = s1_preprocess_elements(
+            [
+                {
+                    "kind": "equation",
+                    "raw_kind": "equation",
+                    "order_index": 1,
+                    "source_item_index": 1,
+                    "ir_id": "ir_0001",
+                    "page_no": 2,
+                    "image_path": f"images/{digest}.jpg",
+                    "text": "$$x=1$$",
+                }
+            ]
+        )
+
+        equation = next(item for item in result.elements if item.payload)
+        self.assertEqual(equation.payload["visual_kind"], "equation")
+        self.assertEqual(equation.payload["caption"], "$$x=1$$")
+        self.assertNotIn("notes", equation.payload)
+
     def test_s2_heading_tree_excludes_questions(self) -> None:
         placed = s2_apply_heading_tree(
             [
@@ -442,9 +517,13 @@ class UnitBuilderTests(unittest.TestCase):
         )
 
         self.assertEqual(placed[0].kind, "text")
-        parsed = replace_text_units_with_qa_where_stable(s3_build_text_units(placed))
-        self.assertEqual([unit.payload_kind for unit in parsed], ["text"])
-        self.assertEqual(parsed[0].title, "6.请公司讲一下，2025年重点工作")
+        # QA discrimination was removed 2026-07-16: the numbered request line is
+        # never split into a question/answer pair. Under qa_heading_mode it is
+        # demoted out of the heading tree yet stays one raw text unit that keeps
+        # the whole line as its title (declarative numbering is not fragmented).
+        units = s3_build_text_units(placed)
+        self.assertEqual([unit.payload_kind for unit in units], ["text"])
+        self.assertEqual(units[0].title, "6.请公司讲一下，2025年重点工作")
 
     def test_numbered_business_sentences_remain_searchable_without_fragmenting(
         self,
@@ -517,26 +596,6 @@ class UnitBuilderTests(unittest.TestCase):
             ],
         )
 
-    def test_s3_keeps_numbered_enumeration_as_one_block(self) -> None:
-        # ub-2026.07-5: enumerated lines are one business block — splitting
-        # them into per-line units was the round3 over-fragmentation defect.
-        long_items = "\n".join(f"{idx}、" + "经营情况说明" * 12 for idx in range(1, 4))
-        units = s3_build_text_units(
-            [
-                PreparedElement(
-                    kind="text",
-                    order_index=1,
-                    text=long_items,
-                    heading_path=["重要提示"],
-                    title="重要提示",
-                )
-            ]
-        )
-
-        self.assertEqual(len(units), 1)
-        self.assertEqual(units[0].payload_kind, "text")
-        self.assertEqual(units[0].payload["text"], long_items)
-
     def test_s3_coalescing_preserves_each_source_locator(self) -> None:
         units = s3_build_text_units(
             [
@@ -564,35 +623,6 @@ class UnitBuilderTests(unittest.TestCase):
         self.assertEqual(locator["source_order_span"], [1, 2])
         self.assertEqual(locator["page_span"], [1, 2])
         self.assertEqual(len(locator["source_locators"]), 2)
-
-    def test_s4_preserves_prose_before_first_question(self) -> None:
-        source = UnitDraft(
-            payload_kind="text",
-            payload={"text": "placeholder"},
-            source_order=1,
-            heading_path=["交流情况"],
-            structural_path=["交流情况"],
-        )
-
-        units = replace_text_units_with_qa_where_stable(
-            [
-                UnitDraft(
-                    **{
-                        **source.__dict__,
-                        "payload": {
-                            "text": "活动背景：本次交流围绕年度经营。\n问：收入为何增长？\n答：主要系销量提升。"
-                        },
-                    }
-                )
-            ]
-        )
-
-        self.assertEqual([unit.payload_kind for unit in units], ["text", "qa"])
-        self.assertEqual(
-            units[0].payload["text"], "活动背景：本次交流围绕年度经营。"
-        )
-        self.assertEqual(units[0].quality_status, "needs_review")
-        self.assertEqual(units[1].payload["answer"], "主要系销量提升。")
 
     def test_s2_persists_full_source_hierarchy_on_public_path(self) -> None:
         elements = [
@@ -1601,8 +1631,8 @@ class UnitBuilderTests(unittest.TestCase):
                     title=title,
                 )
                 self.assertEqual(
-                    semantic_key_for_unit(unit, filing_type="annual_report"),
-                    expected,
+                    semantic_keys_for_unit(unit, filing_type="annual_report")[:1],
+                    [expected],
                 )
 
     def test_semantic_labels_use_complete_source_hierarchy(self) -> None:
@@ -1903,105 +1933,6 @@ class UnitBuilderTests(unittest.TestCase):
         self.assertIn("问:产能如何？", str(units[0].payload))
         self.assertEqual(units[1].payload["text"], "后续正文。")
 
-    def test_s4_parses_chinese_qa_and_rejects_unstable_boundaries(self) -> None:
-        source = UnitDraft(
-            payload_kind="text",
-            payload={"text": ""},
-            source_order=1,
-            title="投资者关系活动主要内容介绍",
-        )
-        parsed = s4_build_qa_units(
-            "1.美国加征关税对公司有什么影响？答:美国收入占比很低。",
-            source=source,
-        )
-        self.assertFalse(parsed.unstable)
-        self.assertEqual(
-            parsed.units[0].payload["question"], "美国加征关税对公司有什么影响？"
-        )
-        self.assertEqual(parsed.units[0].payload["answer"], "美国收入占比很低。")
-
-        self.assertTrue(s4_build_qa_units("答:没有问题。", source=source).unstable)
-        self.assertTrue(
-            s4_build_qa_units("问:问题？\n答:一\n回复:二", source=source).unstable
-        )
-        self.assertTrue(s4_build_qa_units("问:问题？", source=source).unstable)
-
-    def test_explicit_answer_mode_keeps_wrapped_lines_in_question(self) -> None:
-        source = UnitDraft(
-            payload_kind="text",
-            payload={"text": ""},
-            source_order=1,
-            heading_path=["交流问题"],
-        )
-
-        parsed = s4_build_qa_units(
-            "问：第一行问题\n问题续行？\n答：真实回答",
-            source=source,
-            require_explicit_answer=True,
-        )
-
-        self.assertFalse(parsed.unstable)
-        self.assertEqual(parsed.units[0].payload["question"], "第一行问题问题续行？")
-        self.assertEqual(parsed.units[0].payload["answer"], "真实回答")
-
-    def test_s4_numbered_prose_is_not_promoted_by_a_later_answer_marker(
-        self,
-    ) -> None:
-        source = UnitDraft(
-            payload_kind="text",
-            payload={"text": ""},
-            source_order=1,
-        )
-
-        parsed = s4_build_qa_units(
-            "1、公司基本情况\n公司成立于2000年。\n问：收入如何？\n答：收入增长。",
-            source=source,
-        )
-
-        self.assertFalse(parsed.unstable)
-        self.assertEqual(len(parsed.units), 1)
-        self.assertEqual(parsed.units[0].payload["question"], "收入如何？")
-        self.assertEqual(parsed.leading_text, "1、公司基本情况\n公司成立于2000年。")
-
-        unlabelled = s4_build_qa_units("问：收入如何？\n公司收入稳定。", source=source)
-        self.assertTrue(unlabelled.unstable)
-        self.assertEqual(unlabelled.units, [])
-
-    def test_stable_qa_conversion_preserves_leading_business_fact(self) -> None:
-        source = UnitDraft(
-            payload_kind="text",
-            payload={
-                "text": (
-                    "交流前，公司说明本季度收入同比增长20%。\n"
-                    "问：毛利率为何提升？\n答：产品结构改善。"
-                )
-            },
-            source_order=1,
-            heading_path=["交流问题"],
-            structural_path=["交流问题"],
-        )
-
-        converted = replace_text_units_with_qa_where_stable([source])
-
-        self.assertEqual([unit.payload_kind for unit in converted], ["text", "qa"])
-        self.assertIn("收入同比增长20%", converted[0].payload["text"])
-        self.assertEqual(converted[0].quality_status, "needs_review")
-        self.assertEqual(converted[1].payload["answer"], "产品结构改善。")
-
-    def test_s4_unstable_text_block_becomes_needs_review_text(self) -> None:
-        units = replace_text_units_with_qa_where_stable(
-            [
-                UnitDraft(
-                    payload_kind="text",
-                    payload={"text": "答:没有问题。"},
-                    source_order=1,
-                )
-            ]
-        )
-
-        self.assertEqual(units[0].payload_kind, "text")
-        self.assertEqual(units[0].quality_status, "needs_review")
-
     def test_s5_does_not_infer_continuation_from_shape_and_page(self) -> None:
         stats = BuildStats()
         elements = [
@@ -2191,29 +2122,6 @@ class UnitBuilderTests(unittest.TestCase):
 
         self.assertEqual(len(units), 2)
 
-    def test_s5_table_parse_failed_uses_raw_html_payload(self) -> None:
-        stats = BuildStats()
-        units = s5_build_table_units(
-            [
-                PreparedElement(
-                    kind="table",
-                    order_index=1,
-                    table={"headers": [], "rows": []},
-                    table_caption=["失败表"],
-                    table_footnote=["注"],
-                    table_html="<table>",
-                    table_parse_failed=True,
-                )
-            ],
-            stats,
-        )
-
-        self.assertEqual(
-            units[0].payload,
-            {"caption": ["失败表"], "raw_html": "<table>", "notes": ["注"]},
-        )
-        self.assertEqual(units[0].quality_status, "needs_review")
-
     def test_s5_empty_grid_with_html_fails_closed_even_without_upstream_flag(
         self,
     ) -> None:
@@ -2267,10 +2175,6 @@ class UnitBuilderTests(unittest.TestCase):
         text_unit = s3_build_text_units(
             [PreparedElement(kind="text", order_index=1, text="正文")]
         )[0]
-        qa_unit = s4_build_qa_units(
-            "问:问题？\n答:答案",
-            source=UnitDraft(payload_kind="text", payload={"text": ""}, source_order=2),
-        ).units[0]
         image_unit = s1_preprocess_elements(
             [
                 {
@@ -2310,8 +2214,10 @@ class UnitBuilderTests(unittest.TestCase):
         )[0]
 
         self.assertEqual(set(text_unit.payload), {"text"})
-        self.assertEqual(set(qa_unit.payload), {"question", "answer", "raw_text"})
-        self.assertEqual(set(image_unit.payload), {"image_ref", "caption", "context"})
+        self.assertEqual(
+            set(image_unit.payload),
+            {"image_ref", "caption", "context", "visual_kind"},
+        )
         self.assertEqual(image_unit.quality_status, "needs_review")
         self.assertEqual(
             set(table_unit.payload),
@@ -2350,7 +2256,6 @@ class UnitBuilderTests(unittest.TestCase):
         )
 
         self.assertEqual([unit.title for unit in kept], ["释义", "重要提示", "风险提示"])
-        self.assertEqual(stats.skipped_sections, [])
 
     def test_s7_semantic_key_and_quality(self) -> None:
         stats = BuildStats()
@@ -2374,6 +2279,13 @@ class UnitBuilderTests(unittest.TestCase):
                     source_order=2,
                     title="乱码",
                 ),
+                UnitDraft(
+                    payload_kind="text",
+                    payload={"text": "无进一步信息。"},
+                    source_order=3,
+                    heading_path=["其他说明"],
+                    title="其他说明",
+                ),
             ],
             filing_type="annual_report",
             stats=stats,
@@ -2381,6 +2293,10 @@ class UnitBuilderTests(unittest.TestCase):
 
         self.assertEqual(units[0].semantic_key, "receivable_aging")
         self.assertEqual(units[1].quality_status, "unusable")
+        # No vocabulary matches the title/path/text, so scalar and array both
+        # fall back to the single controlled document_content retrieval key.
+        self.assertEqual(units[2].semantic_key, "document_content")
+        self.assertEqual(units[2].semantic_keys, ["document_content"])
         self.assertEqual(stats.generated_by_kind["table"], 1)
         self.assertEqual(stats.unusable_count, 1)
 
@@ -2393,8 +2309,8 @@ class UnitBuilderTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            semantic_key_for_unit(unit, filing_type="other"),
-            "tariff_exposure",
+            semantic_keys_for_unit(unit, filing_type="other")[:1],
+            ["tariff_exposure"],
         )
 
     def test_cover_prelude_is_not_bulk_deleted_before_first_section(self) -> None:
@@ -2572,23 +2488,6 @@ class UnitBuilderTests(unittest.TestCase):
         table = s5_build_table_units(placed, BuildStats())[0]
 
         self.assertIsNone(table.payload["unit"])
-
-    def test_quality_aggregation_never_upgrades_unusable_members(self) -> None:
-        members = [
-            UnitDraft(
-                payload_kind="text",
-                payload={"text": "损坏"},
-                source_order=1,
-                quality_status="unusable",
-            ),
-            UnitDraft(
-                payload_kind="text",
-                payload={"text": "正常正文"},
-                source_order=2,
-                quality_status="ok",
-            ),
-        ]
-        self.assertEqual(_worst_quality(members), "unusable")
 
     def test_unit_declaration_merged_with_content_is_kept(self) -> None:
         units, stats = build_unit_drafts_s1_s7(

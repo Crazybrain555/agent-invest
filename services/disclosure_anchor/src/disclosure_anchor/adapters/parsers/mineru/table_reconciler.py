@@ -22,6 +22,12 @@ import math
 from pathlib import Path
 from typing import Any
 
+from disclosure_anchor.adapters.parsers.mineru.geometry import (
+    PAGE_BOTTOM_BAND_MIN,
+    PAGE_TOP_BAND_MAX,
+    bbox_delta,
+    is_page_index,
+)
 from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
     resolved_table_html,
     table_html_logical_rows,
@@ -338,7 +344,7 @@ def _unique_geometry_matches(
             table
             for table in model_tables
             if table.page_idx == page_idx
-            and _bbox_delta(bbox, table.bbox) <= MODEL_BBOX_MAX_DELTA
+            and bbox_delta(bbox, table.bbox) <= MODEL_BBOX_MAX_DELTA
         ]
         if len(candidates) == 1:
             provisional[index] = candidates[0]
@@ -417,8 +423,8 @@ def _allowed_intervening_furniture_indices(
         in_margin = bool(
             bbox is not None
             and (
-                (kind == "header" and bbox[3] <= 180)
-                or (kind == "footer" and bbox[1] >= 820)
+                (kind == "header" and bbox[3] <= PAGE_TOP_BAND_MAX)
+                or (kind == "footer" and bbox[1] >= PAGE_BOTTOM_BAND_MIN)
             )
         )
         if (
@@ -502,13 +508,6 @@ def _bbox(value: Any) -> tuple[float, float, float, float] | None:
     return parsed  # type: ignore[return-value]
 
 
-def _bbox_delta(
-    left: tuple[float, float, float, float],
-    right: tuple[float, float, float, float],
-) -> float:
-    return max(abs(a - b) for a, b in zip(left, right, strict=True))
-
-
 def _positive_float(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -522,6 +521,6 @@ def _positive_float(value: Any) -> float | None:
 def _page_index(value: Any) -> int | None:
     return (
         value
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        if is_page_index(value)
         else None
     )

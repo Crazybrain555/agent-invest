@@ -10,6 +10,9 @@ from disclosure_anchor.domain.services.unit_hashing import (
     canonical_json,
     compute_unit_hashes,
 )
+from disclosure_anchor.domain.value_objects.semantic_key import (
+    validate_semantic_key_state,
+)
 
 
 FIXTURE = (
@@ -31,6 +34,14 @@ class UnitHashingTests(unittest.TestCase):
                     case["expected"]["query_projection_hash"],
                 )
                 self.assertEqual(got.structure_hash, case["expected"]["structure_hash"])
+
+    def test_golden_cases_carry_a_valid_controlled_semantic_state(self) -> None:
+        for case in json.loads(FIXTURE.read_text(encoding="utf-8")):
+            with self.subTest(case=case["name"]):
+                validate_semantic_key_state(
+                    case["input"]["semantic_key"],
+                    case["input"]["semantic_keys"],
+                )
 
     def test_canonical_json_shape_is_pinned(self) -> None:
         self.assertEqual(

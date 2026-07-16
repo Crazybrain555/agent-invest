@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 import hashlib
 import re
@@ -21,6 +22,7 @@ from disclosure_anchor.application.contracts.unit_source_projection import (
     source_selector,
     source_value_sha256,
 )
+from disclosure_anchor.domain.value_objects.comparison_text import comparison_text
 
 
 ImageBytesResolver = Callable[[str], bytes]
@@ -95,7 +97,6 @@ class BuildStats:
     generated_by_kind: Counter[str] = field(default_factory=Counter)
     dropped_by_kind: Counter[str] = field(default_factory=Counter)
     dropped_unknown_by_raw_kind: Counter[str] = field(default_factory=Counter)
-    skipped_sections: list[str] = field(default_factory=list)
     stripped_marker_lines: int = 0
     dropped_blank_table_rows: int = 0
     heading_only_carriers_preserved: int = 0
@@ -118,7 +119,6 @@ class BuildStats:
             "generated_by_kind": dict(self.generated_by_kind),
             "dropped_by_kind": dict(self.dropped_by_kind),
             "dropped_unknown_by_raw_kind": dict(self.dropped_unknown_by_raw_kind),
-            "skipped_sections": list(self.skipped_sections),
             "stripped_marker_lines": self.stripped_marker_lines,
             "dropped_blank_table_rows": self.dropped_blank_table_rows,
             "heading_only_carriers_preserved": (
@@ -148,21 +148,6 @@ class BuildStats:
 class Stage1Result:
     elements: list[PreparedElement]
     stats: BuildStats
-
-
-@dataclass(frozen=True)
-class QaParseResult:
-    units: list[UnitDraft]
-    unstable: bool = False
-    ordinals: list[int] = field(default_factory=list)
-    leading_text: str | None = None
-    leading_needs_review: bool = False
-    # Corrupt source spans quarantined before the QA at the given zero-based
-    # index.  This keeps a bad middle pair in evidence order without either
-    # fabricating QA from it or hiding independently proven later pairs.
-    review_spans: list[tuple[int, str]] = field(default_factory=list)
-    trailing_text: str | None = None
-    leading_locator: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -293,12 +278,41 @@ def s1_preprocess_elements(
             continue
         image_path = str(element.get("image_path") or "").strip()
         if kind in {"image", "equation"} and image_path:
-            caption_values = _source_text_values(element.get("image_caption"))
+            is_equation = kind == "equation"
+            # MinerU equations never carry image_caption/image_footnote; only
+            # image/chart elements do.  The equation caption is recovered from
+            # its formula content below, so those reads are skipped here.
+            caption_values = (
+                []
+                if is_equation
+                else _source_text_values(element.get("image_caption"))
+            )
             caption = "\n".join(caption_values)
             content = _source_text(_element_text(element))
-            footnote_values = _source_text_values(element.get("image_footnote"))
-            if kind == "equation" and not caption and content:
+            footnote_values = (
+                []
+                if is_equation
+                else _source_text_values(element.get("image_footnote"))
+            )
+            if is_equation and not caption and content:
                 caption = content
+            # chart is a distinct MinerU visual type (mapper: kind="image",
+            # raw_kind="chart"); equation keeps its own kind; everything else
+            # is a plain image.  visual_subtype is a typed sub_type carried by
+            # image/chart only.
+            visual_kind = (
+                "chart"
+                if raw_kind == "chart"
+                else "equation"
+                if is_equation
+                else "image"
+            )
+            raw_visual_subtype = None if is_equation else element.get("visual_subtype")
+            visual_subtype = (
+                raw_visual_subtype
+                if isinstance(raw_visual_subtype, str) and raw_visual_subtype
+                else None
+            )
             context, context_locator = _image_context(
                 previous_non_furniture, page_no
             )
@@ -317,7 +331,7 @@ def s1_preprocess_elements(
                         "transform": "sha256_bytes.v1",
                     },
                 ) or locator
-            if caption:
+            if caption_values:
                 caption_source = source_selector(locator, field="image_caption")
                 if caption_source is not None:
                     locator = _with_structured_projection(
@@ -327,6 +341,18 @@ def s1_preprocess_elements(
                             "source": caption_source,
                             "target_field": "payload.caption",
                             "transform": "ordered_nonempty_lines.v1",
+                        },
+                    ) or locator
+            if visual_subtype:
+                subtype_source = source_selector(locator, field="visual_subtype")
+                if subtype_source is not None:
+                    locator = _with_structured_projection(
+                        locator,
+                        {
+                            "kind": "derived_field",
+                            "source": subtype_source,
+                            "target_field": "payload.visual_subtype",
+                            "transform": "identity.v1",
                         },
                     ) or locator
             if content:
@@ -348,7 +374,7 @@ def s1_preprocess_elements(
                     ) or locator
             emitted_note_index = 0
             for note_index, raw_note in enumerate(
-                element.get("image_footnote") or []
+                [] if is_equation else (element.get("image_footnote") or [])
             ):
                 cleaned_note = _source_text(str(raw_note))
                 if not cleaned_note:
@@ -393,7 +419,10 @@ def s1_preprocess_elements(
                 "image_ref": image_ref,
                 "caption": caption,
                 "context": context,
+                "visual_kind": visual_kind,
             }
+            if visual_subtype:
+                payload["visual_subtype"] = visual_subtype
             if content and content != caption:
                 payload["content"] = content
             if footnote_values:
@@ -727,8 +756,7 @@ def _canonical_duplicate_locator(
 def _comparison_text(text: str) -> str:
     """Normalize only representation-level differences for exact comparison."""
 
-    normalized = unicodedata.normalize("NFKC", text).casefold().replace(r"\~", "~")
-    return re.sub(r"\s+", "", normalized)
+    return comparison_text(text)
 
 
 def _projection_graph(locator: dict[str, Any]) -> dict[str, Any]:
@@ -1467,12 +1495,6 @@ def _before_outline_family(
     return stack
 
 
-def _pattern_heading_level(text: str) -> int | None:
-    """Stateless compatibility helper for non-ambiguous pattern families."""
-
-    return _heading_pattern_evidence(text, stack=[]).level
-
-
 def _roman_ordinal(token: str) -> int | None:
     values = {"i": 1, "v": 5, "x": 10}
     if not token or any(char not in values for char in token):
@@ -1712,248 +1734,6 @@ def _prepared_group_locator(
     return first
 
 
-def s4_build_qa_units(
-    text: str,
-    *,
-    source: UnitDraft,
-    require_explicit_answer: bool = True,
-    official_mode: bool = False,
-) -> QaParseResult:
-    # A QA leaf is a semantic partition of one already-structured text unit.
-    # Its payload owns only the physical question/answer slices, while its
-    # retrieval path remains the parent's independently sourced structure.
-    # Rebuilding a locator from the payload slices alone would discard that
-    # distinction and leave the public heading path without provenance.
-    parent_heading_projection = list(
-        _projection_graph(dict(source.artifact_locator or {}))["heading_path"]
-    )
-
-    def with_parent_heading_projection(
-        locator: dict[str, Any] | None,
-    ) -> dict[str, Any] | None:
-        return _with_heading_projection(locator, parent_heading_projection)
-
-    lines = _qa_lines_with_locators(text, source=source)
-    current_question_lines: list[str] = []
-    current_ordinal: int | None = None
-    answer_lines: list[str] = []
-    raw_items: list[tuple[str, dict[str, Any] | None]] = []
-    seen_answer = False
-    units: list[UnitDraft] = []
-    ordinals: list[int] = []
-    unstable = False
-    leading_items: list[tuple[str, dict[str, Any] | None]] = []
-
-    def emit() -> None:
-        nonlocal current_question_lines, current_ordinal
-        nonlocal answer_lines, raw_items, seen_answer, unstable
-        if not current_question_lines:
-            return
-        question = _join_wrapped_lines(current_question_lines)
-        answer = "\n".join(
-            line for line in answer_lines if line.strip()
-        ).strip()
-        if not question or not answer or (
-            require_explicit_answer and not seen_answer
-        ):
-            unstable = True
-            return
-        units.append(
-            UnitDraft(
-                payload_kind="qa",
-                payload={
-                    "question": question,
-                    "answer": answer,
-                    "raw_text": "\n".join(
-                        line for line, _ in raw_items
-                    ).strip(),
-                },
-                source_order=source.source_order,
-                intra_order=source.intra_order + len(units),
-                heading_path=list(source.heading_path),
-                structural_path=list(source.structural_path),
-                section_path=list(source.section_path),
-                # A QA leaf is addressed by its question; the surrounding
-                # section remains in heading_path ("三、主要交流问题").
-                title=question,
-                quality_status=source.quality_status,
-                artifact_locator=with_parent_heading_projection(
-                    _qa_items_locator(
-                        raw_items,
-                        target_field="payload.raw_text",
-                    )
-                ),
-                region_role=source.region_role,
-                region_id=source.region_id,
-                source_segments=list(raw_items),
-            )
-        )
-        if current_ordinal is not None:
-            ordinals.append(current_ordinal)
-        current_question_lines = []
-        current_ordinal = None
-        answer_lines = []
-        raw_items = []
-        seen_answer = False
-
-    for line, line_locator in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        official_question = (
-            _official_numbered_question_match(stripped)
-            if official_mode
-            else None
-        )
-        if rules.QUESTION_START_RE.match(stripped) or official_question is not None:
-            if current_question_lines:
-                emit()
-                if unstable:
-                    break
-            current_question_lines = [_strip_question_prefix(stripped)]
-            current_ordinal = (
-                int(official_question.group("ordinal"))
-                if official_question is not None
-                else _heading_ordinal(stripped)
-            )
-            raw_items = [(stripped, line_locator)]
-            answer_lines = []
-            seen_answer = False
-            continue
-        if rules.ANSWER_START_RE.match(stripped):
-            if not current_question_lines:
-                unstable = True
-                break
-            if seen_answer:
-                unstable = True
-                break
-            seen_answer = True
-            raw_items.append((stripped, line_locator))
-            answer_lines.append(_strip_answer_prefix(stripped))
-            continue
-        if current_question_lines:
-            raw_items.append((stripped, line_locator))
-            if seen_answer:
-                answer_lines.append(stripped)
-            elif require_explicit_answer:
-                # Until the first 答/回复 marker, a wrapped line is still part
-                # of the question whenever the caller requires that marker.
-                current_question_lines.append(stripped)
-            else:
-                # Existing MinerU contract: a line after an explicit question
-                # may be an unlabelled answer.
-                answer_lines.append(stripped)
-        else:
-            leading_items.append((stripped, line_locator))
-
-    if not unstable:
-        emit()
-    if unstable:
-        return QaParseResult(units=[], unstable=True, ordinals=[])
-    if official_mode and units and (
-        len(ordinals) != len(units)
-        or any(current != previous + 1 for previous, current in zip(ordinals, ordinals[1:]))
-    ):
-        return QaParseResult(units=[], unstable=True, ordinals=[])
-    leading_text = "\n".join(line for line, _ in leading_items).strip() or None
-    return QaParseResult(
-        units=units,
-        unstable=False,
-        ordinals=ordinals,
-        leading_text=leading_text,
-        leading_needs_review=leading_text is not None,
-        leading_locator=with_parent_heading_projection(
-            _qa_items_locator(
-                leading_items,
-                target_field="payload.text",
-            )
-        ),
-    )
-
-
-def replace_text_units_with_qa_where_stable(
-    units: Iterable[UnitDraft],
-) -> list[UnitDraft]:
-    output: list[UnitDraft] = []
-    for unit in units:
-        if unit.payload_kind != "text" or "text" not in unit.payload:
-            output.append(unit)
-            continue
-        result = s4_build_qa_units(
-            str(unit.payload["text"]),
-            source=unit,
-            official_mode=unit.region_role == "narrative",
-        )
-        if result.unstable:
-            output.append(
-                UnitDraft(
-                    **{
-                        **unit.__dict__,
-                        "quality_status": "needs_review",
-                    }
-                )
-            )
-        elif result.units:
-            pieces: list[UnitDraft] = []
-            if result.leading_text:
-                pieces.append(
-                    UnitDraft(
-                        **{
-                            **unit.__dict__,
-                            "payload": {"text": result.leading_text},
-                            "artifact_locator": result.leading_locator,
-                            "source_segments": [
-                                (result.leading_text, result.leading_locator)
-                            ],
-                            "quality_status": (
-                                "needs_review"
-                                if result.leading_needs_review
-                                else unit.quality_status
-                            ),
-                        }
-                    )
-                )
-            pieces.extend(result.units)
-            source_hash = "sha256:" + hashlib.sha256(
-                _comparison_text(str(unit.payload["text"])).encode("utf-8")
-            ).hexdigest()
-            count = len(pieces)
-            for index, piece in enumerate(pieces):
-                target_field = (
-                    "payload.raw_text"
-                    if piece.payload_kind == "qa"
-                    else "payload.text"
-                )
-                locator = _with_payload_projection(
-                    piece.artifact_locator,
-                    {
-                        "kind": "text_partition",
-                        # Each child owns only the physical slices that actually
-                        # contribute to it.  The group hash/count proves that
-                        # the ordered children still reconstruct the original
-                        # carrier without giving every QA an over-broad locator.
-                        "sources": _text_source_selectors(
-                            piece.artifact_locator
-                        ),
-                        "target_field": target_field,
-                        "transform": "explicit_qa.v1",
-                        "index": index,
-                        "count": count,
-                        "source_sha256": source_hash,
-                    },
-                )
-                output.append(
-                    UnitDraft(
-                        **{
-                            **piece.__dict__,
-                            "intra_order": unit.intra_order + index,
-                            "artifact_locator": locator,
-                        }
-                    )
-                )
-        else:
-            output.append(unit)
-    return output
 
 
 def s5_build_table_units(
@@ -1995,10 +1775,6 @@ def s5_build_table_units(
 def s6_filter_units(units: Iterable[UnitDraft], stats: BuildStats) -> list[UnitDraft]:
     kept: list[UnitDraft] = []
     for unit in units:
-        skip_title = _matching_skip_title(unit)
-        if skip_title is not None:
-            stats.skipped_sections.append(skip_title)
-            continue
         if unit.payload_kind == "table" and _table_payload_is_empty(unit.payload):
             stats.dropped_by_kind["table_empty"] += 1
             continue
@@ -2163,7 +1939,7 @@ def s7_finalize_units(
     )
     finalized: list[UnitDraft] = []
     for unit in units:
-        note_keys = _note_keys_for_unit(unit, filing_type=filing_type)
+        note_keys = _note_keys_for_unit(unit)
         matched_keys = semantic_keys_for_unit(unit, filing_type=filing_type)
         candidates = _stable_semantic_keys(
             [unit.semantic_key] if unit.semantic_key else [],
@@ -2243,9 +2019,10 @@ def build_unit_drafts_s1_s7(
         qa_heading_mode=qa_mode,
         stats=s1.stats,
     )
-    text_units = replace_text_units_with_qa_where_stable(
-        s3_build_text_units(placed, stats=s1.stats)
-    )
+    # QA discrimination was removed by user decision 2026-07-16: transcripts
+    # stay raw text units with full provenance; question/answer semantics are
+    # not an L1 concern and no payload_kind="qa" is emitted anymore.
+    text_units = s3_build_text_units(placed, stats=s1.stats)
     table_units = s5_build_table_units(placed, s1.stats)
     units = sorted([*text_units, *table_units], key=_unit_sort_key)
     units = _sink_leading_applicable(units)
@@ -2480,7 +2257,7 @@ def _headerless_anchor_projection(
     document_title: str | None,
 ) -> tuple[str | None, dict[str, Any] | None]:
     locator = unit.artifact_locator or {}
-    if unit.payload_kind != "qa" and unit.title:
+    if unit.title:
         if unit.payload_kind == "table":
             captions = [str(value) for value in unit.payload.get("caption") or []]
             for index, caption in enumerate(captions):
@@ -2545,7 +2322,7 @@ def _member_semantic_keys(
             keys,
             [member.semantic_key] if member.semantic_key else [],
             semantic_keys_for_unit(member, filing_type=filing_type),
-            _note_keys_for_unit(member, filing_type=filing_type),
+            _note_keys_for_unit(member),
             member.semantic_keys or [],
         )
     return keys or None
@@ -2555,7 +2332,6 @@ def _unit_part(
     unit: UnitDraft,
     *,
     include_heading: bool,
-    relative_to: list[str] | None = None,
 ) -> dict[str, Any]:
     part: dict[str, Any] = {"kind": unit.payload_kind, "order": unit.source_order}
     if unit.payload_kind == "text" and "image_ref" in unit.payload:
@@ -2563,12 +2339,6 @@ def _unit_part(
     part.update(unit.payload)
     if include_heading and unit.heading_path:
         part["heading_path"] = list(unit.heading_path)
-    if relative_to is not None:
-        source_path = _unit_section_path(unit)
-        if source_path[: len(relative_to)] == relative_to:
-            local = source_path[len(relative_to) :]
-            if local:
-                part["local_heading"] = list(local)
     if unit.applicability:
         part["applicability"] = unit.applicability
     if unit.quality_status != "ok":
@@ -2630,7 +2400,7 @@ def _unit_sort_key(unit: UnitDraft) -> tuple[int, int]:
     return (unit.source_order, unit.intra_order)
 
 
-def _note_keys_for_unit(unit: UnitDraft, *, filing_type: str | None) -> list[str]:
+def _note_keys_for_unit(unit: UnitDraft) -> list[str]:
     """章节键（含祖先继承，round13 用户裁决）：标题优先，然后沿 heading_path
     自深向浅逐级取键——"(1) 明细情况" 这类无科目语义的叶子从最近的科目祖先
     继承（19、其他非流动金融资产 → other_noncurrent_financial_assets），
@@ -2660,7 +2430,6 @@ def semantic_keys_for_unit(unit: UnitDraft, *, filing_type: str | None) -> list[
             unit.title or "",
             " ".join(source_path),
             _table_caption_first(unit),
-            str(unit.payload.get("question", "")) if unit.payload_kind == "qa" else "",
         ]
         if part
     )
@@ -2679,11 +2448,6 @@ def semantic_keys_for_unit(unit: UnitDraft, *, filing_type: str | None) -> list[
     return keys
 
 
-def semantic_key_for_unit(unit: UnitDraft, *, filing_type: str | None) -> str | None:
-    keys = semantic_keys_for_unit(unit, filing_type=filing_type)
-    return keys[0] if keys else None
-
-
 def _clean_text(value: str) -> str:
     cleaned = "".join(
         char
@@ -2695,14 +2459,12 @@ def _clean_text(value: str) -> str:
         stripped = line.strip()
         if rules.NOISE_SEPARATOR_RE.match(stripped):
             continue
-        if any(pattern.match(stripped) for pattern in rules.NOISE_LINE_PATTERNS):
-            continue
         lines.append(line.strip())
     return "\n".join(line for line in lines if line).strip()
 
 
 def _element_text(element: dict[str, Any]) -> str:
-    for key in ("text", "latex", "content"):
+    for key in ("text", "content"):
         value = element.get(key)
         if value is not None:
             return str(value)
@@ -2717,16 +2479,6 @@ def _caption_text(element: dict[str, Any]) -> str:
                 return " ".join(str(item) for item in value)
             return str(value)
     return ""
-
-
-def _clean_text_values(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [
-        cleaned
-        for item in value
-        if (cleaned := _clean_text(str(item)))
-    ]
 
 
 def _source_text(value: str) -> str:
@@ -2809,9 +2561,8 @@ def _heading_level_for(element: PreparedElement) -> int | None:
         and _official_numbered_question_match(text) is not None
     ):
         # Within a structurally proven official form, an Arabic-numbered
-        # question is a QA boundary, not a business-section heading.  S4 still
-        # requires an explicit answer and a stable ordinal run before emitting
-        # QA, so this demotion cannot fabricate a pair.
+        # question line is transcript body, not a business-section heading;
+        # demoting it keeps the narrative in one raw-text evidence carrier.
         return None
     if text.endswith(("?", "？")) or rules.QUESTION_START_RE.match(text):
         return None
@@ -2840,24 +2591,6 @@ def _heading_level_for(element: PreparedElement) -> int | None:
 
 def _normalized_title(text: str) -> str:
     return re.sub(r"\s+", "", text).rstrip("：:")
-
-
-_SKIP_SECTION_PREFIX_RE = re.compile(
-    r"^(?:第[一二三四五六七八九十百]+[节章]|"
-    r"[一二三四五六七八九十百]+、|"
-    r"\d{1,3}[、.．]|"
-    r"[（(](?:\d{1,3}|[一二三四五六七八九十百]+)[）)])"
-)
-
-
-def _skip_section_title(text: str) -> str | None:
-    normalized = _normalized_title(text)
-    core = _SKIP_SECTION_PREFIX_RE.sub("", normalized).lstrip("、.．)）")
-    if core in rules.SKIP_SECTION_TITLES:
-        return core
-    if normalized in rules.SKIP_SECTION_TITLES:
-        return normalized
-    return None
 
 
 def _strip_declaration_lines(
@@ -3020,77 +2753,20 @@ def _sink_leading_applicable(units: list[UnitDraft]) -> list[UnitDraft]:
     return [unit for index, unit in enumerate(out) if index not in dropped]
 
 
+# Dot-numbering disambiguation for the ``N.`` question separator: a western dot
+# followed by a digit is normally a decimal number ("1.5亿元"), so ``\.(?!\d)``
+# rejects that form.  The single ``\.(?=\d{4}\s*年)`` carve-out re-admits a dot
+# glued to a 4-digit year + 年 ("3.2024年经营情况"; the vlm backend spaces
+# ASCII tokens, so "16.2024 年…" must qualify too), which is numbered-question
+# grammar, not a decimal.  This is structural grammar, not a sample-specific
+# phrase rule.
 _OFFICIAL_NUMBERED_QUESTION_RE = re.compile(
     r"^\s*(?P<ordinal>\d{1,3})"
-    r"(?:[、．]|\.(?!\d)|\.(?=\d{4}年))\s*(?P<body>\S.*)$"
+    r"(?:[、．]|\.(?!\d)|\.(?=\d{4}\s*年))\s*(?P<body>\S.*)$"
 )
-_INLINE_NUMBERED_BOUNDARY_RE = re.compile(
-    r"(?<!\d)\d{1,3}(?:[、．]|\.(?!\d)|\.(?=\d{4}年))\s*"
-)
-_INLINE_ANSWER_BOUNDARY_RE = re.compile(
-    r"([？?])(?=\s*(?:答|回复|公司回复|A\d*)\s*[：:])"
-)
-
 
 def _official_numbered_question_match(text: str) -> re.Match[str] | None:
     return _OFFICIAL_NUMBERED_QUESTION_RE.match(text)
-
-
-def _qa_fragments(text: str) -> list[tuple[str, int, int]]:
-    """Return QA parsing lines with offsets into the physical source text."""
-
-    fragments: list[tuple[str, int, int]] = []
-    offset = 0
-    for raw_line in text.splitlines(keepends=True) or [text]:
-        line = raw_line.rstrip("\r\n")
-        boundaries = {0, len(line)}
-        boundaries.update(
-            match.start()
-            for match in _INLINE_NUMBERED_BOUNDARY_RE.finditer(line)
-            if match.start() > 0
-        )
-        boundaries.update(
-            match.end(1) for match in _INLINE_ANSWER_BOUNDARY_RE.finditer(line)
-        )
-        ordered = sorted(boundaries)
-        for start, end in zip(ordered, ordered[1:]):
-            value = line[start:end]
-            left = len(value) - len(value.lstrip())
-            right = len(value.rstrip())
-            if right <= left:
-                continue
-            fragment_start = offset + start + left
-            fragment_end = offset + start + right
-            fragments.append(
-                (text[fragment_start:fragment_end], fragment_start, fragment_end)
-            )
-        offset += len(raw_line)
-    return fragments
-
-
-def _qa_lines(text: str) -> list[str]:
-    return [value for value, _, _ in _qa_fragments(text)]
-
-
-def _qa_lines_with_locators(
-    text: str, *, source: UnitDraft
-) -> list[tuple[str, dict[str, Any] | None]]:
-    segments = source.source_segments or [(text, source.artifact_locator)]
-    output: list[tuple[str, dict[str, Any] | None]] = []
-    for segment_text, locator in segments:
-        for value, start, end in _qa_fragments(segment_text):
-            output.append(
-                (
-                    value,
-                    _sliced_locator(
-                        locator,
-                        start=start,
-                        end=end,
-                        selected_value=value,
-                    ),
-                )
-            )
-    return output
 
 
 def _prepared_text_slice_locator(
@@ -3160,73 +2836,6 @@ def _sliced_locator(
         output["source_slice"] = selector
     return output
 
-
-def _qa_items_locator(
-    items: list[tuple[str, dict[str, Any] | None]],
-    *,
-    target_field: str,
-) -> dict[str, Any] | None:
-    locators: list[dict[str, Any]] = []
-    for _, locator in items:
-        if locator is not None and locator not in locators:
-            locators.append(dict(locator))
-    if not locators:
-        return None
-    if len(locators) == 1:
-        return _with_text_payload_projection(
-            locators[0],
-            target_field=target_field,
-        )
-    orders = [
-        value
-        for locator in locators
-        if (value := _int_or_none(locator.get("order_index"))) is not None
-    ]
-    pages = [
-        value
-        for locator in locators
-        if (value := _int_or_none(locator.get("page_no"))) is not None
-    ]
-    output: dict[str, Any] = {
-        "derivation": {
-            "kind": "qa_source_partition",
-            "reason": "explicit_question_answer_boundaries",
-        },
-        "source_locators": locators,
-    }
-    if orders:
-        output["source_order_span"] = [min(orders), max(orders)]
-    if pages and min(pages) != max(pages):
-        output["page_span"] = [min(pages), max(pages)]
-    return _with_text_payload_projection(output, target_field=target_field)
-
-
-def _join_wrapped_lines(lines: list[str]) -> str:
-    """Join PDF hard wraps without inventing spaces inside Chinese words."""
-
-    joined = ""
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-        if (
-            joined
-            and re.search(r"[A-Za-z0-9]$", joined)
-            and re.match(r"^[A-Za-z0-9]", line)
-        ):
-            joined += " "
-        joined += line
-    return joined.strip()
-
-
-def _strip_question_prefix(text: str) -> str:
-    text = re.sub(r"^\s*(问题|问|Q\d*|投资者提问|提问)\s*\d*\s*[：:]\s*", "", text)
-    text = re.sub(r"^\s*\d+[、.．]\s*", "", text)
-    return text.strip()
-
-
-def _strip_answer_prefix(text: str) -> str:
-    return re.sub(r"^\s*(答|回复|公司回复|A\d*)\s*[：:]\s*", "", text).strip()
 
 
 def _is_empty_table_element(element: PreparedElement) -> bool:
@@ -3428,12 +3037,7 @@ def _detect_unit_with_projection(
     for candidate, source_field, source_index, source_locator in candidates:
         if not rules.is_unit_declaration_line(candidate):
             continue
-        match = re.search(
-            r"(?:货币|金额|计量)?\s*单位\s*(?:均)?(?:为|是|指|以)?\s*[：:]?\s*"
-            r"((?:人民币|美元|港[币元]|欧元|日元|英镑)?\s*"
-            r"(?:元|千元|万元|百万元|亿元))",
-            candidate,
-        )
+        match = rules.UNIT_DECLARATION_VALUE_RE.search(candidate)
         if match:
             selector_locator = source_locator or element.artifact_locator
             selector = source_selector(
@@ -3450,13 +3054,6 @@ def _detect_unit_with_projection(
             }
             return re.sub(r"\s+", "", match.group(1)), projection
     return None, None
-
-
-def _matching_skip_title(unit: UnitDraft) -> str | None:
-    for title in [unit.title, *_unit_section_path(unit)]:
-        if title is not None and (skip_title := _skip_section_title(title)) is not None:
-            return skip_title
-    return None
 
 
 def _table_payload_is_empty(payload: dict[str, Any]) -> bool:
@@ -3511,40 +3108,30 @@ def _main_text(unit: UnitDraft) -> str:
         if "text" in unit.payload:
             return str(unit.payload.get("text") or "")
         return " ".join(str(value) for value in unit.payload.values() if value)
-    if unit.payload_kind == "qa":
-        return str(unit.payload.get("question") or "") + str(
-            unit.payload.get("answer") or ""
-        )
     if unit.payload_kind == "table":
-        rows = unit.payload.get("rows") or []
-        headers = unit.payload.get("headers") or []
-        return " ".join(
-            [str(value) for value in unit.payload.get("caption") or []]
-            + [str(unit.payload.get("unit") or "")]
-            + [str(cell) for cell in headers]
-            + [str(cell) for row in rows for cell in row]
-            + [str(value) for value in unit.payload.get("notes") or []]
-            + [str(unit.payload.get("raw_html") or "")]
-        )
+        return _table_cells_text(unit.payload)
     return ""
+
+
+def _table_cells_text(payload: Mapping[str, Any]) -> str:
+    """Linearize one table payload/part into its searchable cell text."""
+
+    rows = payload.get("rows") or []
+    headers = payload.get("headers") or []
+    return " ".join(
+        [str(value) for value in payload.get("caption") or []]
+        + [str(payload.get("unit") or "")]
+        + [str(cell) for cell in headers]
+        + [str(cell) for row in rows for cell in row]
+        + [str(value) for value in payload.get("notes") or []]
+        + [str(payload.get("raw_html") or "")]
+    )
 
 
 def _part_text(part: dict[str, Any]) -> str:
     kind = str(part.get("kind", "text"))
     if kind == "table":
-        rows = part.get("rows") or []
-        headers = part.get("headers") or []
-        cells = (
-            [str(value) for value in part.get("caption") or []]
-            + [str(part.get("unit") or "")]
-            + [str(cell) for cell in headers]
-            + [str(cell) for row in rows for cell in row]
-            + [str(value) for value in part.get("notes") or []]
-            + [str(part.get("raw_html") or "")]
-        )
-        return " ".join(cells)
-    if kind == "qa":
-        return str(part.get("question") or "") + str(part.get("answer") or "")
+        return _table_cells_text(part)
     if kind == "image":
         return " ".join(
             filter(

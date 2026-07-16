@@ -37,6 +37,7 @@ SOURCE_FIELD_KINDS = frozenset(
         "image",
         "image_caption",
         "image_footnote",
+        "visual_subtype",
     }
 )
 

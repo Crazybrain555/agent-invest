@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import unicodedata
 
 
-RULES_VERSION = "ub-2026.07-55"
+RULES_VERSION = "ub-2026.07-56"
 HEADING_RULESET_ID = "cn_a_v6"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -48,7 +48,6 @@ _HEADER_NAME_SEG = (
     r"[^\s：:，。；,;]{1,24}"
 )
 _HEADER_KV_SEG = rf"(?:{_HEADER_CODE_SEG}|{_HEADER_NAME_SEG})"
-HEADER_KV_LINE_RE = re.compile(rf"^\s*{_HEADER_KV_SEG}\s*$")
 # One line may carry several KV segments plus the announcement number
 # ("证券代码：600519 证券简称：贵州茅台 公告编号：临 2026-027"): strip the KV
 # segments, keep the announcement number (unique information).
@@ -62,10 +61,6 @@ HEADER_CODE_VALUE_RE = re.compile(
 HEADER_NAME_VALUE_RE = re.compile(
     rf"{_HEADER_SECURITY_PREFIX}\s*简\s*称\s*[：:]\s*"
     r"(?P<value>[^\s：:，。；,;]{1,24})"
-)
-ANNOUNCEMENT_NUMBER_LINE_RE = re.compile(
-    r"^\s*公告编号\s*[：:]\s*[^\s，。；]{1,20}"
-    r"(?:[ \t][^\s，。；]{1,12})?\s*$"
 )
 
 
@@ -221,6 +216,12 @@ UNIT_DECLARATION_RES: tuple[re.Pattern[str], ...] = (
     ),
 )
 UNIT_DECLARATION_RE = UNIT_DECLARATION_RES[0]
+# Value extraction for a line already proven to be a unit declaration: capture
+# the currency/magnitude token so the builder never re-encodes this vocabulary.
+UNIT_DECLARATION_VALUE_RE = re.compile(
+    r"(?:货币|金额|计量)?\s*单位\s*(?:均)?(?:为|是|指|以)?\s*[：:]?\s*"
+    rf"({_DECL_CURRENCY}?\s*{_DECL_MAGNITUDE})"
+)
 
 
 def is_unit_declaration_line(line: str) -> bool:
@@ -300,19 +301,14 @@ ATTACHMENT_CAPTION_RE = re.compile(r"^附件\s*[0-9一二三四五六七八九�
 # physical table while losing cross-page business structure.  Recovery is
 # gated by a consecutive Chinese-numbered section run and stops before the
 # official footer/attachment boundary.
-QA_FORM_MAIN_SECTION_RE = re.compile(
-    r"^\s*([一二三四五六七八九十百]{1,3}、\s*[^\n]{2,60})\s*$"
-)
 QA_FORM_NARRATIVE_LABEL_RE = re.compile(
     r"^\s*投资者关系活动(?:主要内容介绍|内容介绍)\s*$"
 )
-QA_FORM_QA_SECTION_RE = re.compile(r"(?:交流问题|问答|提问)")
 # Official IR-form narrative labels that prove a table cell is carrying a
 # transcript rather than an ordinary business grid.  This narrower cue lets
 # the builder fail closed on a short, truncated first-page carrier without
 # lowering the general 500-character shredded-table threshold.
 NOISE_SEPARATOR_RE = re.compile(r"^[\s\-—―=_·•\*~～]{3,}$")
-NOISE_LINE_PATTERNS: tuple[re.Pattern[str], ...] = ()
 
 # Table/figure footnote lines ("[注1] 该金额系…", "注：…"). They are footnotes
 # of the preceding table, never section headings (observed promoted to a
@@ -361,17 +357,14 @@ DOT_NUMBER_HEADING_RE = re.compile(
 PAREN_ALPHA_HEADING_RE = re.compile(
     r"^[（(](?P<token>[a-z]{1,7})[）)](?=\s|\S)", re.IGNORECASE
 )
-FIXED_L1_TITLES = {"重要提示", "释义", "目录", "备查文件", "备查文件目录"}
 # Structural vocabularies may label or rank units, but they never authorize
 # destructive section deletion. Even a 释义/备查文件 branch can carry unique
 # evidence needed by downstream retrieval.
-SKIP_SECTION_TITLES: set[str] = set()
+FIXED_L1_TITLES = {"重要提示", "释义", "目录", "备查文件", "备查文件目录"}
 QUESTION_START_RE = re.compile(
     r"^\s*(问题|问|Q\d*|投资者提问|提问)\s*\d*\s*[：:]"
     r"|^\s*\d+[、.．]\s*.{2,}[？?]\s*$"
 )
-ANSWER_START_RE = re.compile(r"^\s*(答|回复|公司回复|A\d*)\s*[：:]")
-
 # A real, controlled fallback concept for evidence that has no narrower
 # section/event match.  This is intentionally not ``unknown``: the unit is
 # known to be retrievable document content, while its narrower topic remains
@@ -379,42 +372,6 @@ ANSWER_START_RE = re.compile(r"^\s*(答|回复|公司回复|A\d*)\s*[：:]")
 # of a scalar NULL plus an empty array state.
 SEMANTIC_FALLBACK_KEY = "document_content"
 
-# Periodic cover metadata is removable only under the builder's additional
-# page/position/preceding-cover proof. This expression by itself is never a
-# global noise rule: exact dates elsewhere are filing evidence.
-PERIODIC_REPORT_FILING_TYPES = frozenset(
-    {"annual_report", "semiannual_report", "quarterly_report"}
-)
-PERIODIC_COVER_DATE_ONLY_RE = re.compile(
-    r"^\s*[【\[]?\s*20\d{2}\s*年\s*(?:0?[1-9]|1[0-2])\s*月\s*"
-    r"(?:0?[1-9]|[12]\d|3[01])\s*日\s*[】\]]?\s*$"
-)
-PERIODIC_REPORT_TITLE_RE = re.compile(
-    r"(?:年度报告|半年度报告|第?[一二三四1-4]季度报告)"
-)
-PERIODIC_COVER_REPORT_TITLE_LINE_RE = re.compile(
-    r"^\s*20\d{2}\s*年?\s*"
-    r"(?:年度报告|半年度报告|第?[一二三四1-4]季度报告)"
-    r"\s*(?:摘要|全文)?\s*$"
-)
-PERIODIC_COVER_AUXILIARY_LINE_RES: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^\s*[（(]?\s*股票代码\s*[：:]\s*[0-9A-Z.]{4,12}\s*[）)]?\s*$"),
-    re.compile(
-        r"^\s*[二〇○零一二三四五六七八九十]{4}年"
-        r"[一二三四五六七八九十]{1,3}月"
-        r"(?:[一二三四五六七八九十]{1,3}日)?\s*$"
-    ),
-    re.compile(
-        r"^\s*20\d{2}\s*年\s*(?:0?[1-9]|1[0-2])\s*月"
-        r"(?:\s*(?:0?[1-9]|[12]\d|3[01])\s*日)?\s*$"
-    ),
-)
-PERIODIC_REPORT_BANNER_RE = re.compile(
-    r"^\s*.{2,80}(?:股份有限公司|有限责任公司)\s*"
-    r"20\d{2}\s*年?\s*"
-    r"(?:年度报告|半年度报告|第?[一二三四1-4]季度报告)"
-    r"\s*(?:摘要|全文)?\s*$"
-)
 
 SEMANTIC_LIMITED_FILING_TYPES = {
     "annual_report",

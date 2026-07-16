@@ -63,8 +63,12 @@ created_at: 2026-07-07
 topics 成为完备分类（NULL 仅剩无码通道）。词表 JSON 形态：
 `"dividend": {"prefixes":["0113"], "priority":60, "std_refs":{...}}`。
 
-- 真源仍是仓内 versioned JSON（filing_type_map.json / topic_map.json /
-  新增 facet_map.json）；`make load-rules` = 事务内 TRUNCATE+INSERT。
+- 真源仍是仓内 versioned JSON（filing_type_map.json / topic_map.json / 新增 facet_map.json——
+  **落地勘误 2026-07-16：`topic_map.json` 已并入统一的
+  `adapters/sources/cninfo/class_map.json`（31 类，单张 class 映射同时派生 disclosure_topics 与
+  filing_type）；`filing_type_map.json`（标题 title/title_topic 规则）与 `facet_map.json`
+  （F006V market/publisher 维度判定）仍各自独立在库，未被 class_map 取代**）；
+  `make load-rules` = 事务内 TRUNCATE+INSERT。
 - **watchlist.csv 的 filing_categories 列改收 topic 键**（如
   `dividend;major_contract`），经规则表解析为 F006V 前缀集下推同步过滤；
   原始 F006V 前缀仍兼容（运维友好：人记得住 topic 键，记不住码）。

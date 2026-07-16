@@ -169,31 +169,25 @@ class Phase00FixtureContractTests(unittest.TestCase):
         self.assertTrue(
             all("investor_communication" in unit["semantic_keys"] for unit in ir_units)
         )
-        ir_qa_units = [
-            unit for unit in ir_units if unit["payload_kind"] == "qa"
-        ]
-        ir_questions = [unit["payload"]["question"] for unit in ir_qa_units]
-        self.assertEqual(len(ir_questions), 43)
-        self.assertTrue(
-            all(
-                unit["heading_path"]
-                == ["投资者关系活动主要内容介绍"]
-                for unit in ir_qa_units
-            )
-        )
-        self.assertIn("美国加征关税对公司有什么影响？", ir_questions)
-        self.assertIn("请介绍集团现有业务矩阵？", ir_questions)
-        self.assertIn("2024年家电行业发展情况？", ir_questions)
-        tariff_qa = next(
+        # QA discrimination was removed 2026-07-16 (user decision): the investor
+        # relations transcript stays as raw text units under the form's narrative
+        # label with full question/answer text preserved — no payload_kind="qa".
+        # The narrative cell spans more than one source element, so its questions
+        # land across the narrative-label text carriers rather than a single unit.
+        narrative_units = [
             unit
             for unit in ir_units
-            if unit["payload_kind"] == "qa"
-            and unit["payload"]["question"] == "美国加征关税对公司有什么影响？"
-        )
-        self.assertEqual(tariff_qa["quality_status"], "needs_review")
+            if unit["payload_kind"] == "text"
+            and unit["heading_path"] == ["投资者关系活动主要内容介绍"]
+        ]
+        self.assertTrue(narrative_units)
+        narrative_text = "\n".join(unit["payload"]["text"] for unit in narrative_units)
+        self.assertIn("美国加征关税对公司有什么影响", narrative_text)
+        self.assertIn("请介绍集团现有业务矩阵", narrative_text)
 
         for sample_units in fixtures.values():
             for unit in sample_units:
+                self.assertNotEqual(unit["payload_kind"], "qa")
                 self.assertIsInstance(unit["semantic_keys"], list)
                 self.assertTrue(unit["semantic_keys"])
                 self.assertIsNotNone(unit["semantic_key"])

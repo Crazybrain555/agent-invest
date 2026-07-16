@@ -1,0 +1,285 @@
+{
+ "files": {
+  "tests/contract/test_filing_api_contracts.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/contract/test_fixture_determinism.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/contract/test_normalized_ir_contract.py": {
+   "private_imports": [],
+   "tests": 19
+  },
+  "tests/contract/test_phase00_fixtures.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/integration/test_api_ops_surface.py": {
+   "private_imports": [],
+   "tests": 8
+  },
+  "tests/integration/test_build_publish.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/integration/test_cninfo_download.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/integration/test_cninfo_sync.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/integration/test_filing_api_runtime.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/integration/test_filing_api_views_contract.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/integration/test_ops_queue_views.py": {
+   "private_imports": [],
+   "tests": 19
+  },
+  "tests/integration/test_outbox_commit_order.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/integration/test_parse_document.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/integration/test_permissions.py": {
+   "private_imports": [],
+   "tests": 7
+  },
+  "tests/integration/test_public_views_content.py": {
+   "private_imports": [],
+   "tests": 11
+  },
+  "tests/integration/test_register_local_pdf.py": {
+   "private_imports": [],
+   "tests": 13
+  },
+  "tests/integration/test_repository_uow.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/integration/test_schema_and_views.py": {
+   "private_imports": [],
+   "tests": 8
+  },
+  "tests/integration/test_tracked_pool_api.py": {
+   "private_imports": [
+    "_ADMIN_HEADERS",
+    "_ADMIN_TOKEN",
+    "_api_request"
+   ],
+   "tests": 4
+  },
+  "tests/integration/test_worker_integration.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/sample_corpus/test_mineru_table_reconciliation_real.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/sample_corpus/test_sample_filings.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_app_startup.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_artifact_store.py": {
+   "private_imports": [],
+   "tests": 2
+  },
+  "tests/unit/test_build_units.py": {
+   "private_imports": [],
+   "tests": 17
+  },
+  "tests/unit/test_cninfo_client.py": {
+   "private_imports": [],
+   "tests": 11
+  },
+  "tests/unit/test_cninfo_mapper.py": {
+   "private_imports": [],
+   "tests": 21
+  },
+  "tests/unit/test_cninfo_source.py": {
+   "private_imports": [
+    "_window_chunks"
+   ],
+   "tests": 9
+  },
+  "tests/unit/test_cninfo_web_source.py": {
+   "private_imports": [],
+   "tests": 8
+  },
+  "tests/unit/test_config_check.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/unit/test_disclosure_source_port.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_doctor.py": {
+   "private_imports": [
+    "_check_unit_snapshot_aggregate",
+    "_invalid_process_class_overrides"
+   ],
+   "tests": 11
+  },
+  "tests/unit/test_doctor_render.py": {
+   "private_imports": [],
+   "tests": 2
+  },
+  "tests/unit/test_document_unit_audit.py": {
+   "private_imports": [],
+   "tests": 19
+  },
+  "tests/unit/test_download_document.py": {
+   "private_imports": [],
+   "tests": 10
+  },
+  "tests/unit/test_filing_api_admin.py": {
+   "private_imports": [],
+   "tests": 19
+  },
+  "tests/unit/test_filing_api_changes_errors.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_filing_api_documents.py": {
+   "private_imports": [],
+   "tests": 10
+  },
+  "tests/unit/test_filing_api_tracked.py": {
+   "private_imports": [
+    "_tracked_company"
+   ],
+   "tests": 5
+  },
+  "tests/unit/test_filing_api_units.py": {
+   "private_imports": [
+    "_validate_semantic_key",
+    "_validate_semantic_key_list"
+   ],
+   "tests": 12
+  },
+  "tests/unit/test_health.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_ids.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/unit/test_ids_extra.py": {
+   "private_imports": [],
+   "tests": 7
+  },
+  "tests/unit/test_migration_state.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/unit/test_mineru_adapter.py": {
+   "private_imports": [],
+   "tests": 19
+  },
+  "tests/unit/test_mineru_table_reconciler.py": {
+   "private_imports": [],
+   "tests": 18
+  },
+  "tests/unit/test_parse_document.py": {
+   "private_imports": [],
+   "tests": 10
+  },
+  "tests/unit/test_path_builder.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_pending_download_predicate.py": {
+   "private_imports": [
+    "_should_download_candidate"
+   ],
+   "tests": 7
+  },
+  "tests/unit/test_pipeline_cli.py": {
+   "private_imports": [],
+   "tests": 16
+  },
+  "tests/unit/test_publish_run.py": {
+   "private_imports": [
+    "_validate_candidate_unit_set"
+   ],
+   "tests": 19
+  },
+  "tests/unit/test_raw_document_store.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/unit/test_rebuild_units.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/unit/test_register_document.py": {
+   "private_imports": [],
+   "tests": 11
+  },
+  "tests/unit/test_settings.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/unit/test_source_projection.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_subject_resolver.py": {
+   "private_imports": [],
+   "tests": 9
+  },
+  "tests/unit/test_sync_disclosure_index.py": {
+   "private_imports": [],
+   "tests": 12
+  },
+  "tests/unit/test_track_companies.py": {
+   "private_imports": [],
+   "tests": 15
+  },
+  "tests/unit/test_unit_builder.py": {
+   "private_imports": [],
+   "tests": 100
+  },
+  "tests/unit/test_unit_hashing.py": {
+   "private_imports": [],
+   "tests": 12
+  },
+  "tests/unit/test_unmapped_code_audit.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/unit/test_value_objects.py": {
+   "private_imports": [],
+   "tests": 14
+  },
+  "tests/unit/test_worker_cli.py": {
+   "private_imports": [],
+   "tests": 22
+  },
+  "tests/unit/test_worker_run_once.py": {
+   "private_imports": [
+    "_sync_window_start"
+   ],
+   "tests": 24
+  }
+ },
+ "schema": "test-composition-ledger.v1"
+}

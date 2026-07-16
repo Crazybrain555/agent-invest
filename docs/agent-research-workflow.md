@@ -18,6 +18,15 @@ contract confirms is defining behavior and passes the gate too.
 Evidence-only inspection, reproduction, and a failing regression test that encodes an already-authoritative
 contract may precede external research when they establish no new semantics.
 
+The gate is keyed to **decisions, not just code edits** (user refinement 2026-07-16): every significant
+decision — including removals, simplifications, adjudications between designs, new mechanisms/tooling, and
+ops procedure designs — checks 1–2 external analogues before execution, unless it is trivially simple or the
+question was already researched in this task. **User direction or authorization does not exempt the external
+check**: a user-approved removal still gets its analogue lookup (it usually confirms the decision cheaply,
+e.g. Unstructured neither splits Q&A transcripts nor infers td-only table headers — recorded evidence for the
+2026-07-16 simplifications). When the external evidence contradicts the intended decision, surface it to the
+user before executing.
+
 ## 2. Permitted skip of external research
 
 Every gated change still produces a before-edit record (§5); skipping affects only the external-research

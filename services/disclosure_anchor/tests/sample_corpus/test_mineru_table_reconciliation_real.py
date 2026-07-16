@@ -375,12 +375,12 @@ class RealMinerUTableReconciliationTests(unittest.TestCase):
             self, before=content, after=result.content_list
         )
         self.assertEqual(len(locators), 41)
-        units, stats = build_unit_drafts_s1_s7(
+        units, _stats = build_unit_drafts_s1_s7(
             normalized,
             filing_type="semiannual_report",
             document_title=str(metadata["title"]),
         )
-        before_units, before_stats = build_unit_drafts_s1_s7(
+        before_units, _before_stats = build_unit_drafts_s1_s7(
             before_ir,
             filing_type="semiannual_report",
             document_title=str(metadata["title"]),
@@ -389,13 +389,9 @@ class RealMinerUTableReconciliationTests(unittest.TestCase):
             [_unit_semantics(unit) for unit in units],
             [_unit_semantics(unit) for unit in before_units],
         )
-        # The aggregate carrier already contains this logical row; v4 keeps
-        # it in place instead of manufacturing a page-local orphan to recover.
-        self.assertEqual(stats.recovered_statement_orphan_rows, 0)
-        self.assertEqual(
-            stats.recovered_statement_orphan_rows,
-            before_stats.recovered_statement_orphan_rows,
-        )
+        # The aggregate carrier already contains this logical row; v4 keeps it
+        # in place, and the orphan-recovery mechanism (with its BuildStats
+        # counter) no longer exists — semantic equality above is the invariant.
         table_payloads: list[dict[str, Any]] = []
         for unit in units:
             if unit.payload_kind == "table":

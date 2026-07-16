@@ -10,13 +10,16 @@
       "heading_path": [
         "重要提示"
       ],
-      "semantic_key": null,
+      "semantic_key": "document_content",
+      "semantic_keys": [
+        "document_content"
+      ],
       "quality_status": "ok",
       "order_index": 1
     },
     "expected": {
       "content_hash": "sha256:0035f7615fda3c2fff4fe93799edd2999987ffc7afc8067d78f19ef8c4797ea7",
-      "query_projection_hash": "sha256:5a5b7c9804ed527f92309f371d8b1111b784fb4594ae551a2d5857fa83f817b5",
+      "query_projection_hash": "sha256:13b2d66a1af330a77995b90fdbad58fbc3c472b5520a4ff086e52a4fb83c2bcf",
       "structure_hash": "sha256:c4948f9f2d03c7edbb3a51e3699092ec3f5102f09b4f788268989e1a3994ac74"
     }
   },
@@ -53,12 +56,15 @@
         "应收账款"
       ],
       "semantic_key": "receivable_aging",
+      "semantic_keys": [
+        "receivable_aging"
+      ],
       "quality_status": "ok",
       "order_index": 2
     },
     "expected": {
       "content_hash": "sha256:15af01ea5e919319fdff7c394486f50ec0e0955a5cbbc200ed13936265f8c17b",
-      "query_projection_hash": "sha256:9d66fc0d81448ce591301b407fc8b91a870e236085e5109a826f405cef8375f9",
+      "query_projection_hash": "sha256:e648fa63df380435d88a150e0023176466cacce0cdadcd977ee8d657b4da470e",
       "structure_hash": "sha256:a7d7c814b0ad54d6d775238b6e978f246e6c5b3eb3841e007e75aa25ca8f0598"
     }
   },
@@ -75,13 +81,16 @@
       "heading_path": [
         "投资者关系活动记录表"
       ],
-      "semantic_key": null,
+      "semantic_key": "document_content",
+      "semantic_keys": [
+        "document_content"
+      ],
       "quality_status": "needs_review",
       "order_index": 3
     },
     "expected": {
       "content_hash": "sha256:a137877582f5c9df33aca0e546d7969943878adcf2482bd949370406dcf870cd",
-      "query_projection_hash": "sha256:6d3dd67000e5e0ed7bf328df443c28dce7cd7d235d63aca6d2c7459703428e1c",
+      "query_projection_hash": "sha256:3b56f06814a50b90eee84d39dc38f803bb051f36166a75505d267855d1e12f42",
       "structure_hash": "sha256:5e2f1e49a3347c836fd41ba97f69540746fc40d55abf750b08d28d5e50eca1eb"
     }
   },
