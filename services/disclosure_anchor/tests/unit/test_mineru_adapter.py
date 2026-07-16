@@ -3,29 +3,41 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from disclosure_anchor.adapters.parsers.mineru.artifact_reader import MinerUArtifactReader
 from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
     MinerUParserInfo,
     MinerUToNormalizedIRMapper,
+    TABLE_RECONCILIATION_ALGORITHM_VERSION,
 )
 from disclosure_anchor.adapters.parsers.mineru import mineru_process
 from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru.parser import (
     MinerUDocumentParser,
-    _needs_native_text,
     map_reconciled_mineru_content_list,
 )
-from disclosure_anchor.adapters.parsers.native_text import (
-    NativeTextExtractionError,
-    NativeTextTimeoutError,
-)
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation import (
+    TableReconciliationContractError,
+)
 from disclosure_anchor.domain.errors import (
     ParserOutputContractError,
     ParserVersionProbeError,
 )
+
+
+def _parser_info() -> MinerUParserInfo:
+    return MinerUParserInfo(
+        name="MinerU",
+        package_version="3.4.0",
+        backend="pipeline",
+        method="auto",
+        language="ch",
+        formula=False,
+        table=True,
+    )
 
 
 class MinerUProcessTests(unittest.TestCase):
@@ -120,6 +132,128 @@ class MinerUArtifactReaderTests(unittest.TestCase):
 
 
 class MinerUMapperTests(unittest.TestCase):
+    def test_table_html_alias_uses_nonempty_value_and_rejects_conflicts(self) -> None:
+        mapper = MinerUToNormalizedIRMapper()
+        metadata = {"document_id": "doc_table_alias", "title": "样本"}
+        normalized = mapper.map_content_list(
+            content_list=[
+                {
+                    "type": "table",
+                    "page_idx": 0,
+                    "table_body": "",
+                    "table_html": "<table><tr><td>A</td></tr></table>",
+                }
+            ],
+            parser_info=_parser_info(),
+            document_metadata=metadata,
+        )
+        self.assertEqual(normalized["elements"][0]["table"]["rows"], [["A"]])
+
+        with self.assertRaises(ParserOutputContractError):
+            mapper.map_content_list(
+                content_list=[
+                    {
+                        "type": "table",
+                        "page_idx": 0,
+                        "table_body": "<table><tr><td>A</td></tr></table>",
+                        "table_html": "<table><tr><td>B</td></tr></table>",
+                    }
+                ],
+                parser_info=_parser_info(),
+                document_metadata=metadata,
+            )
+
+    def test_repeated_page_edge_headings_become_furniture_by_layout_evidence(
+        self,
+    ) -> None:
+        mapper = MinerUToNormalizedIRMapper()
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": "2025年度财务报表附注",
+                "page_idx": 0,
+                "bbox": [100, 400, 360, 430],
+                "text_level": 1,
+            }
+        ]
+        content.extend(
+            {
+                "type": "text",
+                "text": "2025年度财务报表附注",
+                "page_idx": page,
+                "bbox": [120 + page % 2, 80, 360 + page % 2, 100],
+                "text_level": 1,
+            }
+            for page in (1, 2, 3)
+        )
+
+        normalized = mapper.map_content_list(
+            content_list=content,
+            parser_info=_parser_info(),
+            document_metadata={"document_id": "doc_layout", "title": "样本"},
+        )
+
+        self.assertEqual(normalized["elements"][0]["kind"], "heading")
+        self.assertEqual(
+            [item["kind"] for item in normalized["elements"][1:]],
+            ["page_furniture", "page_furniture", "page_furniture"],
+        )
+        self.assertTrue(
+            all(item["raw_kind"] == "text" for item in normalized["elements"][1:])
+        )
+
+    def test_repeated_layout_inference_fails_closed_on_weak_or_ambiguous_evidence(
+        self,
+    ) -> None:
+        mapper = MinerUToNormalizedIRMapper()
+        content = [
+            {
+                "type": "text",
+                "text": "可能是真实标题",
+                "page_idx": page,
+                "bbox": [100, 80, 300, 100],
+                "text_level": 1,
+            }
+            for page in (0, 5, 10)
+        ]
+        content.extend(
+            {
+                "type": "text",
+                "text": "仅重复两页",
+                "page_idx": page,
+                "bbox": [100, 80, 300, 100],
+                "text_level": 1,
+            }
+            for page in (11, 12)
+        )
+        for page in (20, 21, 22):
+            content.extend(
+                [
+                    {
+                        "type": "text",
+                        "text": "同页重复的业务状态",
+                        "page_idx": page,
+                        "bbox": [100, 145, 300, 165],
+                        "text_level": 1,
+                    },
+                    {
+                        "type": "text",
+                        "text": "同页重复的业务状态",
+                        "page_idx": page,
+                        "bbox": [100, 400, 300, 420],
+                        "text_level": 1,
+                    },
+                ]
+            )
+
+        normalized = mapper.map_content_list(
+            content_list=content,
+            parser_info=_parser_info(),
+            document_metadata={"document_id": "doc_layout", "title": "样本"},
+        )
+
+        self.assertTrue(all(item["kind"] == "heading" for item in normalized["elements"]))
+
     def test_maps_neutral_kinds_and_structured_tables(self) -> None:
         mapper = MinerUToNormalizedIRMapper()
         normalized = mapper.map_content_list(
@@ -145,6 +279,17 @@ class MinerUMapperTests(unittest.TestCase):
                     "img_path": "images/a.jpg",
                 },
                 {"type": "equation", "text": "E=mc^2", "page_idx": 1},
+                {"type": "aside_text", "text": "补充说明", "page_idx": 1},
+                {"type": "page_footnote", "text": "定义：口径说明", "page_idx": 1},
+                {
+                    "type": "chart",
+                    "page_idx": 1,
+                    "img_path": "images/chart.jpg",
+                    "content": "| 指标 | 数值 |\n| --- | --- |\n| 收入 | 10 |",
+                    "chart_caption": ["收入结构", "按期末数"],
+                    "chart_footnote": ["注：未经审计"],
+                    "sub_type": "bar",
+                },
                 {"type": "mystery", "text": "保留未知类型", "page_idx": 1},
             ],
             parser_info=MinerUParserInfo(
@@ -166,12 +311,22 @@ class MinerUMapperTests(unittest.TestCase):
                 "content_list_relpath": "parser_artifacts/sample/sample.json",
             },
         )
-        self.assertEqual(normalized["contract_version"], "normalized_ir.v2")
+        self.assertEqual(normalized["contract_version"], "normalized_ir.v3")
         self.assertEqual(normalized["parsed_pages"]["start_page_no"], 1)
         self.assertEqual(normalized["parsed_pages"]["end_page_no"], 2)
         self.assertEqual(
             [item["kind"] for item in normalized["elements"]],
-            ["heading", "text", "page_furniture", "table", "equation", "unknown"],
+            [
+                "heading",
+                "text",
+                "page_furniture",
+                "table",
+                "equation",
+                "text",
+                "text",
+                "image",
+                "unknown",
+            ],
         )
         self.assertEqual(normalized["elements"][0]["raw_kind"], "text")
         self.assertEqual(normalized["elements"][0]["heading_level"], 1)
@@ -182,7 +337,13 @@ class MinerUMapperTests(unittest.TestCase):
             normalized["elements"][3]["table"]["merged_cells"],
             [{"row": 0, "col": 0, "rowspan": 2, "colspan": 1}],
         )
-        self.assertEqual(normalized["elements"][5]["raw_kind"], "mystery")
+        visual = normalized["elements"][7]
+        self.assertEqual(visual["raw_kind"], "chart")
+        self.assertEqual(visual["text"], "| 指标 | 数值 |\n| --- | --- |\n| 收入 | 10 |")
+        self.assertEqual(visual["image_caption"], ["收入结构", "按期末数"])
+        self.assertEqual(visual["image_footnote"], ["注：未经审计"])
+        self.assertEqual(visual["visual_subtype"], "bar")
+        self.assertEqual(normalized["elements"][8]["raw_kind"], "mystery")
         json.dumps(normalized, ensure_ascii=False)
 
     def test_preserves_string_list_items_and_rejects_malformed_lists(self) -> None:
@@ -232,9 +393,28 @@ class MinerUMapperTests(unittest.TestCase):
             all("text" not in element for element in normalized["elements"][1:])
         )
 
+        for field, value in (
+            ("chart_caption", ["合法", {"text": "非字符串"}]),
+            ("chart_footnote", {"text": "非数组"}),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(ParserOutputContractError):
+                    mapper.map_content_list(
+                        content_list=[
+                            {
+                                "type": "chart",
+                                "page_idx": 0,
+                                "img_path": "images/chart.jpg",
+                                field: value,
+                            }
+                        ],
+                        parser_info=_parser_info(),
+                        document_metadata={"document_id": "doc_bad_visual"},
+                    )
+
     def test_aggregate_table_locator_semantics_fail_loud(self) -> None:
         base_locator = {
-            "algorithm_version": "mineru-aggregate-table-restore.v3",
+            "algorithm_version": TABLE_RECONCILIATION_ALGORITHM_VERSION,
             "page_span": [1, 2],
             "page_bboxes": [
                 {"page_no": 1, "bbox": [100, 700, 900, 900]},
@@ -243,7 +423,11 @@ class MinerUMapperTests(unittest.TestCase):
             "model_table_indices": [0, 1],
             "continuation_source_item_indices": [1],
         }
-        variants = {
+        variants: dict[str, dict[str, Any]] = {
+            "old_algorithm_version": {
+                **base_locator,
+                "algorithm_version": "mineru-aggregate-table-restore.v3",
+            },
             "reversed_span": {**base_locator, "page_span": [2, 1]},
             "nonconsecutive_pages": {
                 **base_locator,
@@ -304,9 +488,16 @@ class MinerUMapperTests(unittest.TestCase):
                             {
                                 "type": "table",
                                 "page_idx": 0,
+                                "bbox": [100, 700, 900, 900],
                                 "table_body": "<table><tr><td>A</td></tr></table>",
                                 "_mineru_aggregate_table_locator": locator,
-                            }
+                            },
+                            {
+                                "type": "table",
+                                "page_idx": 1,
+                                "bbox": [100, 100, 900, 300],
+                                "table_body": "",
+                            },
                         ],
                         parser_info=parser_info,
                         document_metadata=metadata,
@@ -333,132 +524,259 @@ class MinerUMapperTests(unittest.TestCase):
                         document_metadata=metadata,
                     )
 
+    def test_aggregate_table_locator_matches_source_content_list(self) -> None:
+        locator = {
+            "algorithm_version": TABLE_RECONCILIATION_ALGORITHM_VERSION,
+            "page_span": [1, 2],
+            "page_bboxes": [
+                {"page_no": 1, "bbox": [100, 700, 900, 900]},
+                {"page_no": 2, "bbox": [100, 100, 900, 300]},
+            ],
+            "model_table_indices": [4, 7],
+            "continuation_source_item_indices": [1],
+        }
+        mapper = MinerUToNormalizedIRMapper()
+        normalized = mapper.map_content_list(
+            content_list=[
+                {
+                    "type": "table",
+                    "page_idx": 0,
+                    "bbox": [101, 699, 899, 901],
+                    "table_body": "<table><tr><td>A</td></tr></table>",
+                    "_mineru_aggregate_table_locator": locator,
+                },
+                {
+                    "type": "table",
+                    "page_idx": 1,
+                    "bbox": [98, 102, 902, 298],
+                    "table_body": "  ",
+                },
+            ],
+            parser_info=_parser_info(),
+            document_metadata={
+                "document_id": "doc_locator_valid",
+                "source_pdf": "raw/sample.pdf",
+                "title": "sample",
+            },
+        )
+
+        carrier, ghost = normalized["elements"]
+        self.assertEqual(carrier["page_no"], 1)
+        self.assertEqual(carrier["page_span"], [1, 2])
+        self.assertEqual(carrier["model_table_indices"], [4, 7])
+        self.assertEqual(carrier["continuation_source_item_indices"], [1])
+        self.assertEqual(ghost["page_no"], 2)
+        self.assertEqual(ghost["table_html"], "  ")
+
+    def test_aggregate_table_locator_source_mismatches_fail_loud(self) -> None:
+        base_locator = {
+            "algorithm_version": TABLE_RECONCILIATION_ALGORITHM_VERSION,
+            "page_span": [1, 2],
+            "page_bboxes": [
+                {"page_no": 1, "bbox": [100, 700, 900, 900]},
+                {"page_no": 2, "bbox": [100, 100, 900, 300]},
+            ],
+            "model_table_indices": [0, 1],
+            "continuation_source_item_indices": [1],
+        }
+
+        def content_list(
+            *,
+            root_page_idx: Any = 0,
+            continuation: dict[str, Any] | None = None,
+            locator: dict[str, Any] | None = None,
+        ) -> list[dict[str, Any]]:
+            return [
+                {
+                    "type": "table",
+                    "page_idx": root_page_idx,
+                    "bbox": [100, 700, 900, 900],
+                    "table_body": "<table><tr><td>A</td></tr></table>",
+                    "_mineru_aggregate_table_locator": locator or base_locator,
+                },
+                continuation
+                or {
+                    "type": "table",
+                    "page_idx": 1,
+                    "bbox": [100, 100, 900, 300],
+                    "table_body": "",
+                },
+            ]
+
+        out_of_range_locator = {
+            **base_locator,
+            "continuation_source_item_indices": [2],
+        }
+        variants: dict[str, list[dict[str, Any]]] = {
+            "root_page_mismatch": content_list(root_page_idx=1),
+            "root_page_idx_missing": [
+                {
+                    "type": "table",
+                    "bbox": [100, 700, 900, 900],
+                    "table_body": "<table><tr><td>A</td></tr></table>",
+                    "_mineru_aggregate_table_locator": base_locator,
+                },
+                {
+                    "type": "table",
+                    "page_idx": 1,
+                    "bbox": [100, 100, 900, 300],
+                    "table_body": "",
+                },
+            ],
+            "root_boolean_page_idx": content_list(root_page_idx=True),
+            "root_empty_table_html": [
+                {
+                    "type": "table",
+                    "page_idx": 0,
+                    "bbox": [100, 700, 900, 900],
+                    "table_body": "",
+                    "_mineru_aggregate_table_locator": base_locator,
+                },
+                {
+                    "type": "table",
+                    "page_idx": 1,
+                    "bbox": [100, 100, 900, 300],
+                    "table_body": "",
+                },
+            ],
+            "root_bbox_missing": [
+                {
+                    "type": "table",
+                    "page_idx": 0,
+                    "table_body": "<table><tr><td>A</td></tr></table>",
+                    "_mineru_aggregate_table_locator": base_locator,
+                },
+                {
+                    "type": "table",
+                    "page_idx": 1,
+                    "bbox": [100, 100, 900, 300],
+                    "table_body": "",
+                },
+            ],
+            "root_bbox_nonfinite": [
+                {
+                    "type": "table",
+                    "page_idx": 0,
+                    "bbox": [100, 700, float("nan"), 900],
+                    "table_body": "<table><tr><td>A</td></tr></table>",
+                    "_mineru_aggregate_table_locator": base_locator,
+                },
+                {
+                    "type": "table",
+                    "page_idx": 1,
+                    "bbox": [100, 100, 900, 300],
+                    "table_body": "",
+                },
+            ],
+            "root_bbox_wrong_geometry": [
+                {
+                    "type": "table",
+                    "page_idx": 0,
+                    "bbox": [100, 700, 100, 900],
+                    "table_body": "<table><tr><td>A</td></tr></table>",
+                    "_mineru_aggregate_table_locator": base_locator,
+                },
+                {
+                    "type": "table",
+                    "page_idx": 1,
+                    "bbox": [100, 100, 900, 300],
+                    "table_body": "",
+                },
+            ],
+            "root_bbox_mismatch": [
+                {
+                    "type": "table",
+                    "page_idx": 0,
+                    "bbox": [90, 700, 900, 900],
+                    "table_body": "<table><tr><td>A</td></tr></table>",
+                    "_mineru_aggregate_table_locator": base_locator,
+                },
+                {
+                    "type": "table",
+                    "page_idx": 1,
+                    "bbox": [100, 100, 900, 300],
+                    "table_body": "",
+                },
+            ],
+            "continuation_out_of_range": content_list(locator=out_of_range_locator),
+            "continuation_not_table": content_list(
+                continuation={
+                    "type": "text",
+                    "page_idx": 1,
+                    "bbox": [100, 100, 900, 300],
+                    "text": "正文",
+                }
+            ),
+            "continuation_nonempty_table_body": content_list(
+                continuation={
+                    "type": "table",
+                    "page_idx": 1,
+                    "bbox": [100, 100, 900, 300],
+                    "table_body": "<table><tr><td>B</td></tr></table>",
+                }
+            ),
+            "continuation_nonempty_table_html": content_list(
+                continuation={
+                    "type": "table",
+                    "page_idx": 1,
+                    "bbox": [100, 100, 900, 300],
+                    "table_body": "",
+                    "table_html": "<table><tr><td>B</td></tr></table>",
+                }
+            ),
+            "continuation_page_idx_missing": content_list(
+                continuation={
+                    "type": "table",
+                    "bbox": [100, 100, 900, 300],
+                    "table_body": "",
+                }
+            ),
+            "continuation_page_mismatch": content_list(
+                continuation={
+                    "type": "table",
+                    "page_idx": 2,
+                    "bbox": [100, 100, 900, 300],
+                    "table_body": "",
+                }
+            ),
+            "continuation_bbox_missing": content_list(
+                continuation={"type": "table", "page_idx": 1, "table_body": ""}
+            ),
+            "continuation_bbox_wrong_geometry": content_list(
+                continuation={
+                    "type": "table",
+                    "page_idx": 1,
+                    "bbox": [100, 100, 900, 100],
+                    "table_body": "",
+                }
+            ),
+            "continuation_bbox_mismatch": content_list(
+                continuation={
+                    "type": "table",
+                    "page_idx": 1,
+                    "bbox": [100, 104, 900, 300],
+                    "table_body": "",
+                }
+            ),
+        }
+        mapper = MinerUToNormalizedIRMapper()
+        metadata = {
+            "document_id": "doc_locator_invalid_source",
+            "source_pdf": "raw/sample.pdf",
+            "title": "sample",
+        }
+        for label, content in variants.items():
+            with self.subTest(label=label):
+                with self.assertRaises(ParserOutputContractError):
+                    mapper.map_content_list(
+                        content_list=content,
+                        parser_info=_parser_info(),
+                        document_metadata=metadata,
+                    )
+
 
 class MinerUDocumentParserTests(unittest.TestCase):
-    def test_native_text_title_gate_covers_observed_ir_information_families(
-        self,
-    ) -> None:
-        for title in (
-            "平安银行调研活动信息(4)",
-            "平安银行投资者关系管理信息",
-            "某公司投资者沟通情况通报",
-            "某公司业绩交流会问答实录",
-        ):
-            with self.subTest(title=title):
-                self.assertTrue(_needs_native_text({"title": title}))
-        self.assertFalse(
-            _needs_native_text(
-                {
-                    "title": "某公司关于回购股份的公告",
-                    "provider_category_names": ["业绩说明会"],
-                }
-            )
-        )
-        self.assertTrue(
-            _needs_native_text(
-                {
-                    "title": "平安银行：业绩说明会、路演活动信息",
-                    "provider_category_names": ["业绩说明会"],
-                }
-            )
-        )
-        self.assertFalse(
-            _needs_native_text(
-                {"title": "某公司：业绩说明会、路演活动信息"}
-            )
-        )
-
-    def test_ir_form_adds_native_text_shadow_but_normal_pdf_does_not(self) -> None:
-        class SuccessfulProcess:
-            def run(
-                self, *, input_pdf: Path, output_dir: Path, options: ParserOptions
-            ) -> None:
-                nested = output_dir / "sample" / "auto"
-                nested.mkdir(parents=True)
-                (nested / "sample_content_list.json").write_text(
-                    '[{"type": "text", "text": "hello", "page_idx": 0}]',
-                    encoding="utf-8",
-                )
-
-            def version(self) -> str:
-                return "3.4.0"
-
-        native_payload = {
-            "status": "ok",
-            "extractor": {"name": "pdfplumber", "version": "0.11.10"},
-            "content_hash": "sha256:" + "0" * 64,
-            "non_whitespace_chars": 5,
-            "pages": [
-                {"page_no": 1, "text": "hello", "non_whitespace_chars": 5}
-            ],
-        }
-        extractor = mock.Mock()
-        extractor.extract.return_value = native_payload
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            input_pdf = root / "input.pdf"
-            input_pdf.write_bytes(b"%PDF-1.4\nsample\n%%EOF\n")
-            parser = MinerUDocumentParser(
-                process=SuccessfulProcess(),
-                native_text_extractor=extractor,
-                parser_version="3.4.0",
-            )
-
-            ir_result = parser.parse(
-                input_pdf=input_pdf,
-                output_dir=root / "ir-out",
-                options=ParserOptions(),
-                document_metadata={
-                    "document_id": "doc_ir",
-                    "source_pdf": "raw_documents/local/ir.pdf",
-                    "title": "某公司投资者关系活动记录表",
-                },
-            )
-            self.assertEqual(ir_result.normalized_ir["native_text"], native_payload)
-            self.assertEqual(
-                ir_result.normalized_ir["parser_diagnostics"][
-                    "native_text_shadow"
-                ],
-                {"status": "ok", "error_code": None},
-            )
-            self.assertEqual(
-                ir_result.normalized_ir["parser_diagnostics"][
-                    "table_reconciliation"
-                ]["model_status"],
-                "absent",
-            )
-            extractor.extract.assert_called_once_with(input_pdf, timeout_seconds=None)
-
-            extractor.reset_mock()
-            ordinary_result = parser.parse(
-                input_pdf=input_pdf,
-                output_dir=root / "ordinary-out",
-                options=ParserOptions(),
-                document_metadata={
-                    "document_id": "doc_ordinary",
-                    "source_pdf": "raw_documents/local/ordinary.pdf",
-                    "title": "某公司关于回购股份的公告",
-                    "provider_category_names": ["业绩说明会"],
-                },
-            )
-            self.assertNotIn("native_text", ordinary_result.normalized_ir)
-            extractor.extract.assert_not_called()
-
-            partial_result = parser.parse(
-                input_pdf=input_pdf,
-                output_dir=root / "partial-out",
-                options=ParserOptions(start_page=0, end_page=0),
-                document_metadata={
-                    "document_id": "doc_partial_ir",
-                    "source_pdf": "raw_documents/local/partial-ir.pdf",
-                    "title": "某公司投资者关系活动记录表",
-                },
-            )
-            self.assertNotIn("native_text", partial_result.normalized_ir)
-            extractor.extract.assert_not_called()
-
-    def test_parser_reconciles_proven_model_table_pair_before_mapping(self) -> None:
+    def test_parser_attaches_locator_without_splitting_physical_tables(self) -> None:
         first = "<table><tr><td>A</td></tr></table>"
         second = "<table><tr><td>B</td></tr></table>"
 
@@ -544,164 +862,67 @@ class MinerUDocumentParserTests(unittest.TestCase):
 
         self.assertEqual(
             [element["table"]["rows"] for element in result.normalized_ir["elements"]],
-            [[["A"]], [["B"]]],
+            [[["A"], ["B"]], []],
         )
-        self.assertNotIn("page_span", result.normalized_ir["elements"][0])
+        root, ghost = result.normalized_ir["elements"]
+        self.assertEqual(
+            [root["table_html"], ghost["table_html"]],
+            [
+                "<table><tr><td>A</td></tr><tr><td>B</td></tr></table>",
+                "",
+            ],
+        )
+        self.assertEqual(root["page_span"], [1, 2])
+        self.assertEqual(
+            root["page_bboxes"],
+            [
+                {"page_no": 1, "bbox": [100.0, 700.0, 900.0, 900.0]},
+                {"page_no": 2, "bbox": [100.0, 100.0, 900.0, 300.0]},
+            ],
+        )
+        self.assertEqual(root["model_table_indices"], [0, 1])
+        self.assertEqual(root["continuation_source_item_indices"], [1])
+        self.assertEqual(
+            root["table_locator_algorithm"],
+            "mineru-aggregate-table-locator.v4",
+        )
         diagnostics = result.normalized_ir["parser_diagnostics"][
             "table_reconciliation"
         ]
+        self.assertEqual(
+            diagnostics["algorithm_version"],
+            "mineru-aggregate-table-locator.v4",
+        )
         self.assertEqual(diagnostics["located_groups"], 1)
         self.assertEqual(diagnostics["located_tables"], 2)
-        self.assertEqual(diagnostics["restored_groups"], 1)
-        self.assertEqual(diagnostics["restored_tables"], 2)
+        self.assertEqual(diagnostics["locator_only_groups"], 1)
+        self.assertEqual(diagnostics["locator_only_tables"], 2)
+        self.assertEqual(diagnostics["restored_groups"], 0)
+        self.assertEqual(diagnostics["restored_tables"], 0)
+        self.assertEqual(diagnostics["restoration_rejected_groups"], 0)
+        self.assertEqual(diagnostics["unresolved_groups"], 0)
         self.assertRegex(diagnostics["model_hash"], r"^sha256:[a-f0-9]{64}$")
         self.assertIsNotNone(result.model_path)
         self.assertEqual(result.model_path.name, "sample_model.json")
-
-    def test_expected_native_shadow_failures_preserve_mineru_result(self) -> None:
-        class SuccessfulProcess:
-            def run(
-                self, *, input_pdf: Path, output_dir: Path, options: ParserOptions
-            ) -> None:
-                nested = output_dir / "sample" / "auto"
-                nested.mkdir(parents=True)
-                (nested / "sample_content_list.json").write_text(
-                    '[{"type": "text", "text": "MinerU正文", "page_idx": 0}]',
-                    encoding="utf-8",
-                )
-
-            def version(self) -> str:
-                return "3.4.0"
-
-        failures = (
-            (
-                NativeTextTimeoutError("shadow timeout", error_code="timeout"),
-                "timeout",
-            ),
-            (
-                NativeTextExtractionError(
-                    "bad PDF shadow", error_code="pdf_parse_error"
-                ),
-                "pdf_parse_error",
-            ),
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            input_pdf = root / "input.pdf"
-            input_pdf.write_bytes(b"%PDF-1.4\nsample\n%%EOF\n")
-            for index, (failure, error_code) in enumerate(failures):
-                with self.subTest(error_code=error_code):
-                    extractor = mock.Mock()
-                    extractor.extract.side_effect = failure
-                    result = MinerUDocumentParser(
-                        process=SuccessfulProcess(),
-                        native_text_extractor=extractor,
-                        parser_version="3.4.0",
-                    ).parse(
-                        input_pdf=input_pdf,
-                        output_dir=root / f"out-{index}",
-                        options=ParserOptions(),
-                        document_metadata={
-                            "document_id": f"doc_shadow_{index}",
-                            "source_pdf": "raw/sample.pdf",
-                            "title": "某公司投资者关系活动记录表",
-                        },
-                    )
-                    self.assertNotIn("native_text", result.normalized_ir)
-                    self.assertEqual(
-                        result.normalized_ir["parser_diagnostics"][
-                            "native_text_shadow"
-                        ],
-                        {"status": "unavailable", "error_code": error_code},
-                    )
-                    self.assertEqual(
-                        result.normalized_ir["elements"][0]["text"],
-                        "MinerU正文",
-                    )
-
-    def test_exhausted_native_budget_degrades_without_calling_extractor(
-        self,
-    ) -> None:
-        class SuccessfulProcess:
-            def run(
-                self, *, input_pdf: Path, output_dir: Path, options: ParserOptions
-            ) -> None:
-                nested = output_dir / "sample" / "auto"
-                nested.mkdir(parents=True)
-                (nested / "sample_content_list.json").write_text(
-                    '[]', encoding="utf-8"
-                )
-
-            def version(self) -> str:
-                return "3.4.0"
-
-        extractor = mock.Mock()
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            input_pdf = root / "input.pdf"
-            input_pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
-            result = MinerUDocumentParser(
-                process=SuccessfulProcess(),
-                native_text_extractor=extractor,
-                parser_version="3.4.0",
-            ).parse(
-                input_pdf=input_pdf,
-                output_dir=root / "out",
-                options=ParserOptions(timeout_seconds=0),
-                document_metadata={
-                    "document_id": "doc_budget",
-                    "source_pdf": "raw/sample.pdf",
-                    "title": "某公司投资者关系活动记录表",
-                },
-            )
-        extractor.extract.assert_not_called()
-        self.assertEqual(
-            result.normalized_ir["parser_diagnostics"]["native_text_shadow"],
-            {"status": "unavailable", "error_code": "budget_exhausted"},
-        )
-
-    def test_unknown_native_shadow_error_remains_fatal(self) -> None:
-        class SuccessfulProcess:
-            def run(
-                self, *, input_pdf: Path, output_dir: Path, options: ParserOptions
-            ) -> None:
-                nested = output_dir / "sample" / "auto"
-                nested.mkdir(parents=True)
-                (nested / "sample_content_list.json").write_text(
-                    '[]', encoding="utf-8"
-                )
-
-            def version(self) -> str:
-                return "3.4.0"
-
-        extractor = mock.Mock()
-        extractor.extract.side_effect = ValueError("unexpected shadow bug")
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            input_pdf = root / "input.pdf"
-            input_pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
-            parser = MinerUDocumentParser(
-                process=SuccessfulProcess(),
-                native_text_extractor=extractor,
-                parser_version="3.4.0",
-            )
-            with self.assertRaisesRegex(ValueError, "unexpected shadow bug"):
-                parser.parse(
-                    input_pdf=input_pdf,
-                    output_dir=root / "out",
-                    options=ParserOptions(),
-                    document_metadata={
-                        "document_id": "doc_unknown_shadow",
-                        "source_pdf": "raw/sample.pdf",
-                        "title": "某公司投资者关系活动记录表",
-                    },
-                )
 
     def test_reconciliation_diagnostics_preserve_other_parser_diagnostics(
         self,
     ) -> None:
         mapper = mock.Mock(spec=MinerUToNormalizedIRMapper)
         mapper.map_content_list.return_value = {
+            "contract_version": "normalized_ir.v3",
+            "created_at": "2026-07-16T00:00:00Z",
+            "document_id": "doc_diagnostics",
+            "source_pdf": "raw/sample.pdf",
+            "title": "sample",
+            "parser": {},
+            "parser_artifacts": {},
+            "parsed_pages": {
+                "start_page_no": None,
+                "end_page_no": None,
+                "full_pdf": True,
+            },
+            "elements": [],
             "parser_diagnostics": {"future_probe": {"status": "ok"}}
         }
         normalized, reconciliation = map_reconciled_mineru_content_list(
@@ -735,6 +956,48 @@ class MinerUDocumentParserTests(unittest.TestCase):
             "absent",
         )
         self.assertEqual(reconciliation.stats.model_status, "absent")
+
+    def test_reconciliation_contract_reason_is_preserved_in_error(
+        self,
+    ) -> None:
+        mapper = mock.Mock(spec=MinerUToNormalizedIRMapper)
+        mapper.map_content_list.return_value = {
+            "contract_version": "normalized_ir.v3",
+            "created_at": "2026-07-16T00:00:00Z",
+            "document_id": "doc_bad_locator",
+            "source_pdf": "raw/sample.pdf",
+            "title": "sample",
+            "parser": {},
+            "parser_artifacts": {},
+            "parsed_pages": {
+                "start_page_no": None,
+                "end_page_no": None,
+                "full_pdf": True,
+            },
+            "elements": [],
+        }
+        with mock.patch(
+            "disclosure_anchor.adapters.parsers.mineru.parser."
+            "validate_table_reconciliation_payload",
+            side_effect=TableReconciliationContractError(
+                "locator_table_grid", "root grid missing"
+            ),
+        ):
+            with self.assertRaises(ParserOutputContractError) as caught:
+                map_reconciled_mineru_content_list(
+                    content_list=[],
+                    model_path=None,
+                    mapper=mapper,
+                    parser_info=_parser_info(),
+                    document_metadata={
+                        "document_id": "doc_bad_locator",
+                        "source_pdf": "raw/sample.pdf",
+                        "title": "sample",
+                    },
+                )
+
+        self.assertIn("locator_table_grid", str(caught.exception))
+        self.assertIn("root grid missing", str(caught.exception))
 
     def test_version_probe_failure_fails_closed(self) -> None:
         class VersionFailingProcess:

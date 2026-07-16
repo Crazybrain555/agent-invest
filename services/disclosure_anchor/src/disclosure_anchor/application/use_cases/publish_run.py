@@ -13,7 +13,17 @@ from disclosure_anchor.application.worker.locks import maybe_lock_document
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain.errors import PublishRunError
-from disclosure_anchor.domain.services.unit_hashing import query_projection
+from disclosure_anchor.domain.services.unit_hashing import (
+    UnitHashes,
+    compute_unit_hashes,
+    content_hash_aggregate,
+    query_projection,
+    structure_hash_aggregate,
+)
+from disclosure_anchor.domain.value_objects.semantic_key import (
+    SemanticKeyInvariantError,
+    validate_semantic_key_state,
+)
 
 
 @dataclass(frozen=True)
@@ -73,13 +83,19 @@ class PublishRun:
                         message=f"document not found: {run.document_id}",
                     )
                 )
-            if run.is_active and document.current_processing_run_id == run.processing_run_id:
+            if (
+                run.is_active
+                and document.current_processing_run_id == run.processing_run_id
+            ):
                 return PublishRunResult(
                     processing_run_id=run.processing_run_id,
                     status="published",
                     idempotent=True,
                 )
-            if document.current_processing_run_id == run.processing_run_id and not run.is_active:
+            if (
+                document.current_processing_run_id == run.processing_run_id
+                and not run.is_active
+            ):
                 raise PublishRunError(
                     _structured_error(
                         error_code="RUN_NOT_FOUND",
@@ -105,6 +121,13 @@ class PublishRun:
                 if old_run is not None
                 else []
             )
+            canonical_new = _validate_candidate_run(run=run, units=new_units)
+            diff = diff_units(old_units=old_units, new_units=new_units)
+
+            # All candidate identity and semantic checks happen before the
+            # active pointer or either run is mutated. Historical active runs
+            # are compared from their canonical rows but are not rejected for
+            # legacy stored hashes.
             if old_run is not None:
                 old_run.is_active = False
                 uow.processing_runs.update(old_run)
@@ -115,27 +138,32 @@ class PublishRun:
             document.status = "published"
             uow.documents.update(document)
 
-            diff = diff_units(old_units=old_units, new_units=new_units)
-            for unit in sorted(diff.removed, key=lambda item: (item.order_index, item.asset_id)):
+            for unit in sorted(
+                diff.removed, key=lambda item: (item.order_index, item.asset_id)
+            ):
+                canonical = _canonical_unit_hashes(unit)
                 uow.outbox.add(
                     outbox_events.document_unit_removed(
                         document_id=document.document_id,
                         old_processing_run_id=unit.processing_run_id,
                         old_asset_id=unit.asset_id,
-                        content_hash=unit.content_hash,
+                        content_hash=canonical.content_hash,
                         payload_kind=unit.payload_kind,
                         old_order_index=unit.order_index,
                         old_heading_path=unit.heading_path,
                         occurred_at=now,
                     )
                 )
-            for unit in sorted(diff.created, key=lambda item: (item.order_index, item.asset_id)):
+            for unit in sorted(
+                diff.created, key=lambda item: (item.order_index, item.asset_id)
+            ):
+                canonical = canonical_new[id(unit)]
                 uow.outbox.add(
                     outbox_events.document_unit_created(
                         document_id=document.document_id,
                         processing_run_id=unit.processing_run_id,
                         new_asset_id=unit.asset_id,
-                        content_hash=unit.content_hash,
+                        content_hash=canonical.content_hash,
                         payload_kind=unit.payload_kind,
                         new_order_index=unit.order_index,
                         new_heading_path=unit.heading_path,
@@ -146,21 +174,26 @@ class PublishRun:
                 diff.projection_changed,
                 key=lambda item: (item[1].order_index, item[1].asset_id),
             ):
+                old_hashes = _canonical_unit_hashes(old_unit)
+                new_hashes = canonical_new[id(new_unit)]
                 uow.outbox.add(
                     outbox_events.document_unit_projection_changed(
                         document_id=document.document_id,
                         new_processing_run_id=new_unit.processing_run_id,
                         old_asset_id=old_unit.asset_id,
                         new_asset_id=new_unit.asset_id,
-                        content_hash=new_unit.content_hash,
-                        old_query_projection_hash=old_unit.query_projection_hash,
-                        new_query_projection_hash=new_unit.query_projection_hash,
+                        content_hash=new_hashes.content_hash,
+                        old_query_projection_hash=(old_hashes.query_projection_hash),
+                        new_query_projection_hash=(new_hashes.query_projection_hash),
                         changed_fields=changed_fields,
                         occurred_at=now,
                     )
                 )
 
-            published_change_kind = _published_change_kind(old_run=old_run, new_run=run)
+            published_change_kind = _published_change_kind(
+                old_run=old_run,
+                diff=diff,
+            )
             uow.outbox.add(
                 outbox_events.processing_run_published(
                     document_id=document.document_id,
@@ -190,17 +223,28 @@ class PublishRun:
             )
 
 
-def diff_units(*, old_units: list[e.DocumentUnit], new_units: list[e.DocumentUnit]) -> UnitDiff:
-    old_by_key = _units_by_key(old_units)
-    new_by_key = _units_by_key(new_units)
+def diff_units(
+    *, old_units: list[e.DocumentUnit], new_units: list[e.DocumentUnit]
+) -> UnitDiff:
+    canonical = {
+        id(unit): _canonical_unit_hashes(unit) for unit in [*old_units, *new_units]
+    }
+    old_by_key = _units_by_key(old_units, canonical=canonical)
+    new_by_key = _units_by_key(new_units, canonical=canonical)
     created: list[e.DocumentUnit] = []
     removed: list[e.DocumentUnit] = []
     projection_changed: list[tuple[e.DocumentUnit, e.DocumentUnit, list[str]]] = []
     for key in sorted(set(old_by_key) | set(new_by_key)):
-        old_group = sorted(old_by_key[key], key=lambda item: (item.order_index, item.asset_id))
-        new_group = sorted(new_by_key[key], key=lambda item: (item.order_index, item.asset_id))
+        old_group = sorted(
+            old_by_key[key], key=lambda item: (item.order_index, item.asset_id)
+        )
+        new_group = sorted(
+            new_by_key[key], key=lambda item: (item.order_index, item.asset_id)
+        )
         exact_pairs, old_remaining, new_remaining = _pair_equal_projections(
-            old_group, new_group
+            old_group,
+            new_group,
+            canonical=canonical,
         )
         pair_count = min(len(old_remaining), len(new_remaining))
         for old_unit, new_unit in [
@@ -211,18 +255,25 @@ def diff_units(*, old_units: list[e.DocumentUnit], new_units: list[e.DocumentUni
                 strict=True,
             ),
         ]:
-            if old_unit.query_projection_hash != new_unit.query_projection_hash:
+            if (
+                canonical[id(old_unit)].query_projection_hash
+                != canonical[id(new_unit)].query_projection_hash
+            ):
                 projection_changed.append(
                     (old_unit, new_unit, _changed_projection_fields(old_unit, new_unit))
                 )
         removed.extend(old_remaining[pair_count:])
         created.extend(new_remaining[pair_count:])
-    return UnitDiff(created=created, removed=removed, projection_changed=projection_changed)
+    return UnitDiff(
+        created=created, removed=removed, projection_changed=projection_changed
+    )
 
 
 def _pair_equal_projections(
     old_group: list[e.DocumentUnit],
     new_group: list[e.DocumentUnit],
+    *,
+    canonical: dict[int, UnitHashes],
 ) -> tuple[
     list[tuple[e.DocumentUnit, e.DocumentUnit]],
     list[e.DocumentUnit],
@@ -235,13 +286,15 @@ def _pair_equal_projections(
     new projection multisets are identical.
     """
 
-    new_by_projection: dict[str | None, list[e.DocumentUnit]] = defaultdict(list)
+    new_by_projection: dict[str, list[e.DocumentUnit]] = defaultdict(list)
     for unit in new_group:
-        new_by_projection[unit.query_projection_hash].append(unit)
+        new_by_projection[canonical[id(unit)].query_projection_hash].append(unit)
     exact: list[tuple[e.DocumentUnit, e.DocumentUnit]] = []
     old_remaining: list[e.DocumentUnit] = []
     for old_unit in old_group:
-        candidates = new_by_projection.get(old_unit.query_projection_hash)
+        candidates = new_by_projection.get(
+            canonical[id(old_unit)].query_projection_hash
+        )
         if candidates:
             exact.append((old_unit, candidates.pop(0)))
         else:
@@ -253,10 +306,12 @@ def _pair_equal_projections(
 
 def _units_by_key(
     units: list[e.DocumentUnit],
+    *,
+    canonical: dict[int, UnitHashes],
 ) -> dict[tuple[str, str], list[e.DocumentUnit]]:
     by_key: dict[tuple[str, str], list[e.DocumentUnit]] = defaultdict(list)
     for unit in units:
-        by_key[(unit.payload_kind, unit.content_hash)].append(unit)
+        by_key[(unit.payload_kind, canonical[id(unit)].content_hash)].append(unit)
     return by_key
 
 
@@ -266,8 +321,7 @@ def _changed_projection_fields(old: e.DocumentUnit, new: e.DocumentUnit) -> list
     changed = [
         field
         for field in old_projection
-        if field != "payload_kind"
-        and old_projection[field] != new_projection[field]
+        if field != "payload_kind" and old_projection[field] != new_projection[field]
     ]
     if not changed:
         raise PublishRunError(
@@ -312,20 +366,156 @@ def _validate_publishable(run: e.ProcessingRun) -> None:
         )
 
 
-def _published_change_kind(
-    *, old_run: e.ProcessingRun | None, new_run: e.ProcessingRun
-) -> str:
+def _published_change_kind(*, old_run: e.ProcessingRun | None, diff: UnitDiff) -> str:
     if old_run is None:
         return "materialized"
-    if old_run.content_hash_aggregate != new_run.content_hash_aggregate:
+    if diff.created or diff.removed:
         return "materialized"
     return "observed"
 
 
-def _structured_error(*, error_code: str, message: str) -> dict[str, Any]:
-    return {
+def _canonical_unit_hashes(unit: e.DocumentUnit) -> UnitHashes:
+    return compute_unit_hashes(
+        payload_kind=unit.payload_kind,
+        payload=unit.payload,
+        title=unit.title,
+        heading_path=unit.heading_path,
+        semantic_key=unit.semantic_key,
+        semantic_keys=unit.semantic_keys,
+        quality_status=unit.quality_status,
+        order_index=unit.order_index,
+        applicability=unit.applicability,
+    )
+
+
+def _validate_candidate_run(
+    *,
+    run: e.ProcessingRun,
+    units: list[e.DocumentUnit],
+) -> dict[int, UnitHashes]:
+    _validate_candidate_unit_set(run=run, units=units)
+    canonical: dict[int, UnitHashes] = {}
+    for unit in units:
+        try:
+            validate_semantic_key_state(unit.semantic_key, unit.semantic_keys)
+        except SemanticKeyInvariantError as exc:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="RUN_UNIT_SEMANTIC_INVALID",
+                    reason_code=exc.reason_code,
+                    message=(
+                        "candidate run contains an invalid semantic-key state: "
+                        f"{unit.asset_id}"
+                    ),
+                )
+            ) from exc
+        try:
+            expected_hashes = _canonical_unit_hashes(unit)
+        except (TypeError, ValueError) as exc:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="RUN_UNIT_HASH_INPUT_INVALID",
+                    reason_code="canonical_json_invalid",
+                    message=(
+                        "candidate run contains a payload that cannot be "
+                        f"canonically hashed: {unit.asset_id}"
+                    ),
+                )
+            ) from exc
+        canonical[id(unit)] = expected_hashes
+        for field in (
+            "content_hash",
+            "query_projection_hash",
+            "structure_hash",
+        ):
+            if getattr(unit, field) != getattr(expected_hashes, field):
+                raise PublishRunError(
+                    _structured_error(
+                        error_code="RUN_UNIT_HASH_INVALID",
+                        reason_code=f"{field}_mismatch",
+                        message=(
+                            "candidate run contains a non-canonical unit hash: "
+                            f"{unit.asset_id}"
+                        ),
+                    )
+                )
+
+    expected_content_aggregate = content_hash_aggregate(
+        canonical[id(unit)].content_hash for unit in units
+    )
+    ordered = sorted(units, key=lambda item: item.order_index)
+    expected_structure_aggregate = structure_hash_aggregate(
+        canonical[id(unit)].structure_hash for unit in ordered
+    )
+    for field, expected_value in (
+        ("content_hash_aggregate", expected_content_aggregate),
+        ("structure_hash", expected_structure_aggregate),
+    ):
+        if getattr(run, field) != expected_value:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="RUN_HASH_AGGREGATE_INVALID",
+                    reason_code=f"{field}_mismatch",
+                    message=f"candidate run {field} is not canonical",
+                )
+            )
+    return canonical
+
+
+def _validate_candidate_unit_set(
+    *, run: e.ProcessingRun, units: list[e.DocumentUnit]
+) -> None:
+    """Validate ownership and ordered-set identity before hash verification."""
+
+    asset_ids = [unit.asset_id for unit in units]
+    if len(asset_ids) != len(set(asset_ids)):
+        raise PublishRunError(
+            _structured_error(
+                error_code="RUN_UNIT_SET_INVALID",
+                reason_code="duplicate_asset_id",
+                message="candidate run contains duplicate document-unit asset ids",
+            )
+        )
+    if any(unit.processing_run_id != run.processing_run_id for unit in units):
+        raise PublishRunError(
+            _structured_error(
+                error_code="RUN_UNIT_SET_INVALID",
+                reason_code="processing_run_mismatch",
+                message="candidate unit processing_run_id does not match its run",
+            )
+        )
+    if any(unit.document_id != run.document_id for unit in units):
+        raise PublishRunError(
+            _structured_error(
+                error_code="RUN_UNIT_SET_INVALID",
+                reason_code="document_mismatch",
+                message="candidate unit document_id does not match its run",
+            )
+        )
+    order_indices = sorted(unit.order_index for unit in units)
+    expected = list(range(1, len(units) + 1))
+    if order_indices != expected:
+        raise PublishRunError(
+            _structured_error(
+                error_code="RUN_UNIT_SET_INVALID",
+                reason_code="order_index_not_contiguous",
+                message="candidate run order_index must be unique and contiguous from 1",
+            )
+        )
+
+
+def _structured_error(
+    *,
+    error_code: str,
+    message: str,
+    reason_code: str | None = None,
+) -> dict[str, Any]:
+    error: dict[str, Any] = {
         "stage": "publish",
         "error_code": error_code,
         "retryable": False,
         "message": message,
     }
+    if reason_code is not None:
+        error["reason_code"] = reason_code
+    return error

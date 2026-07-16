@@ -320,7 +320,8 @@ class FilingApiUnitTests(unittest.TestCase):
 
         sql = engine.statements[1]
         self.assertIn(
-            "u.semantic_key = :semantic_key OR u.semantic_keys ? :semantic_key", sql
+            "u.semantic_key = :semantic_key OR u.semantic_keys ? :semantic_key",
+            sql,
         )
         self.assertIn(
             "u.semantic_keys ?| CAST(:semantic_keys_any AS text[])", sql
@@ -341,6 +342,10 @@ class FilingApiUnitTests(unittest.TestCase):
         with self.assertRaises(HTTPException):
             _validate_semantic_key_list(
                 "semantic_keys_all", ",".join(f"key{index}" for index in range(51))
+            )
+        with self.assertRaises(HTTPException):
+            _validate_semantic_key_list(
+                "semantic_keys_any", ",".join("risk" for _ in range(51))
             )
         with self.assertRaises(HTTPException):
             _validate_semantic_key_list("semantic_keys_any", "x" * 129)

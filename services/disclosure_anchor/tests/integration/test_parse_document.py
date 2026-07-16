@@ -85,7 +85,7 @@ class FakeParser:
             content_list_path=content_list,
             markdown_path=markdown,
             normalized_ir={
-                "contract_version": "normalized_ir.v2",
+                "contract_version": "normalized_ir.v3",
                 "created_at": "2026-06-29T00:00:00+00:00",
                 "document_id": document_metadata["document_id"],
                 "source_pdf": document_metadata["source_pdf"],

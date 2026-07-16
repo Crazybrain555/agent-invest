@@ -1,12 +1,12 @@
-"""Restore page-local carriers for proven MinerU aggregate tables.
+"""Locate every page of proven MinerU aggregate tables without splitting them.
 
 MinerU 3.4 can concatenate later pages' table HTML into the first page's
 ``content_list`` item and leave empty table carriers on the following pages.
 The sibling ``*_model.json`` retains page-local table detections. This module
-restores those page-local HTML fragments only when both the logical source
-cells and the builder-visible expanded grid prove that re-merging them is
-semantically identical. Proven groups that cannot be restored safely keep the
-aggregate carrier and gain model-backed page provenance only.
+proves which empty carriers belong to one aggregate and attaches complete
+page/model provenance to that logical table. It deliberately never replaces
+physical carriers: native-text/form recovery and unit boundaries can depend on
+carrier shape even when expanded grids compare equal.
 
 Logical-cell comparison deliberately avoids rowspan/colspan expansion, which
 can make equivalent source HTML appear to have different rectangular grids.
@@ -20,18 +20,15 @@ import hashlib
 import json
 import math
 from pathlib import Path
-import re
 from typing import Any
 
 from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
-    TABLE_RECONCILIATION_ALGORITHM_VERSION,
-    parse_table_html,
+    resolved_table_html,
     table_html_logical_rows,
 )
-from disclosure_anchor.adapters.unit_builder import rules
-from disclosure_anchor.adapters.unit_builder.table_grid import (
-    drop_blank_table_rows,
-    merge_table_grids,
+from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation import (
+    TABLE_RECONCILIATION_ALGORITHM_VERSION,
+    validate_table_reconciliation_diagnostics,
 )
 
 
@@ -51,104 +48,22 @@ class TableReconciliationStats:
     candidate_groups: int = 0
     proven_groups: int = 0
     unproven_groups: int = 0
+    locator_only_groups: int = 0
+    locator_only_tables: int = 0
     restoration_rejected_groups: int = 0
     located_groups: int = 0
     located_tables: int = 0
     restored_groups: int = 0
     restored_tables: int = 0
-    table_builder_semantics_version: str = rules.TABLE_BUILDER_SEMANTICS_VERSION
 
     def __post_init__(self) -> None:
         if self.algorithm_version != TABLE_RECONCILIATION_ALGORITHM_VERSION:
             raise ValueError("unexpected table reconciliation algorithm version")
-        if (
-            self.table_builder_semantics_version
-            != rules.TABLE_BUILDER_SEMANTICS_VERSION
-        ):
-            raise ValueError("unexpected table-builder semantics version")
-        statuses = {
-            "absent",
-            "supported",
-            "unreadable",
-            "invalid_json",
-            "unsupported_schema",
-        }
-        if self.model_status not in statuses:
-            raise ValueError("invalid table reconciliation model status")
-        counters = {
-            name: getattr(self, name)
-            for name in (
-                "content_tables",
-                "model_tables",
-                "uniquely_matched_tables",
-                "ambiguous_matches",
-                "candidate_groups",
-                "proven_groups",
-                "unproven_groups",
-                "restoration_rejected_groups",
-                "located_groups",
-                "located_tables",
-                "restored_groups",
-                "restored_tables",
-            )
-        }
-        if any(type(value) is not int or value < 0 for value in counters.values()):
-            raise ValueError("table reconciliation counters must be non-negative integers")
-        hash_required = self.model_status in {
-            "supported",
-            "invalid_json",
-            "unsupported_schema",
-        }
-        if hash_required != (self.model_hash is not None):
-            raise ValueError(
-                "table reconciliation model status and model hash disagree"
-            )
-        if self.model_hash is not None and not re.fullmatch(
-            r"sha256:[a-f0-9]{64}", self.model_hash
-        ):
-            raise ValueError("invalid table reconciliation model hash")
-        if self.model_status != "supported":
-            non_supported = {
-                name: value
-                for name, value in counters.items()
-                if name != "content_tables"
-            }
-            if any(non_supported.values()):
-                raise ValueError(
-                    "non-supported table reconciliation statuses require zero counters"
-                )
-            return
-        if self.model_hash is None:
-            raise ValueError("supported table reconciliation requires model_hash")
-        if self.candidate_groups != self.proven_groups + self.unproven_groups:
-            raise ValueError("candidate groups must equal proven plus unproven groups")
-        if self.proven_groups != self.restored_groups + self.restoration_rejected_groups:
-            raise ValueError(
-                "proven groups must equal restored plus restoration-rejected groups"
-            )
-        if self.located_groups != self.proven_groups:
-            raise ValueError("located groups must equal proven groups")
-        if self.uniquely_matched_tables > min(self.content_tables, self.model_tables):
-            raise ValueError("unique matches exceed content or model table count")
-        if self.located_tables > self.uniquely_matched_tables:
-            raise ValueError("located tables exceed uniquely matched tables")
-        if self.restored_tables > self.located_tables:
-            raise ValueError("restored tables exceed located tables")
-        if (self.located_groups == 0) != (self.located_tables == 0):
-            raise ValueError("located group and table counters disagree")
-        if self.located_tables < self.located_groups * 2:
-            raise ValueError("each located group must contain at least two tables")
-        if (self.restored_groups == 0) != (self.restored_tables == 0):
-            raise ValueError("restored group and table counters disagree")
-        if self.restored_tables < self.restored_groups * 2:
-            raise ValueError("each restored group must contain at least two tables")
+        validate_table_reconciliation_diagnostics(self.as_dict())
 
     def as_dict(self) -> dict[str, str | int | None]:
         return {
             "algorithm_version": self.algorithm_version,
-            "table_builder_semantics_version": (
-                self.table_builder_semantics_version
-            ),
             "model_status": self.model_status,
             "model_hash": self.model_hash,
             "content_tables": self.content_tables,
@@ -158,10 +73,10 @@ class TableReconciliationStats:
             "candidate_groups": self.candidate_groups,
             "proven_groups": self.proven_groups,
             "unproven_groups": self.unproven_groups,
+            "locator_only_groups": self.locator_only_groups,
+            "locator_only_tables": self.locator_only_tables,
             "restoration_rejected_groups": self.restoration_rejected_groups,
-            "unresolved_groups": (
-                self.unproven_groups + self.restoration_rejected_groups
-            ),
+            "unresolved_groups": self.unproven_groups,
             "located_groups": self.located_groups,
             "located_tables": self.located_tables,
             "restored_groups": self.restored_groups,
@@ -219,10 +134,9 @@ def reconcile_content_list_tables(
     candidate_groups = 0
     proven_groups = 0
     unproven_groups = 0
-    restoration_rejected_groups = 0
+    locator_only_groups = 0
+    locator_only_tables = 0
     located_groups = 0
-    restored_groups = 0
-    restored_tables = 0
 
     for current_index, current_item in enumerate(content_list):
         if (
@@ -251,27 +165,18 @@ def reconcile_content_list_tables(
         proven_groups += 1
         located_groups += 1
         located_indices.update(group)
-        if _can_restore_page_local_tables(
-            content_list=content_list,
+        locator_only_groups += 1
+        locator_only_tables += len(group)
+        # Never replace MinerU's physical carriers. Builder behavior includes
+        # carrier-sensitive native-text/form recovery, so equal expanded grids
+        # are not sufficient proof that page-local restoration preserves unit
+        # boundaries or hashes. Keep one logical aggregate table and attach
+        # complete page/model provenance instead.
+        reconciled[current_index] = _with_aggregate_table_locator(
+            current_item,
             group=group,
             matches=matches,
-            allowed_intervening_indices=allowed_intervening_indices,
-        ):
-            _restore_page_local_tables(
-                reconciled=reconciled,
-                content_list=content_list,
-                group=group,
-                matches=matches,
-            )
-            restored_groups += 1
-            restored_tables += len(group)
-        else:
-            restoration_rejected_groups += 1
-            reconciled[current_index] = _with_aggregate_table_locator(
-                current_item,
-                group=group,
-                matches=matches,
-            )
+        )
 
     return TableReconciliationResult(
         content_list=reconciled,
@@ -285,225 +190,14 @@ def reconcile_content_list_tables(
             candidate_groups=candidate_groups,
             proven_groups=proven_groups,
             unproven_groups=unproven_groups,
-            restoration_rejected_groups=restoration_rejected_groups,
+            locator_only_groups=locator_only_groups,
+            locator_only_tables=locator_only_tables,
             located_groups=located_groups,
             located_tables=len(located_indices),
-            restored_groups=restored_groups,
-            restored_tables=restored_tables,
         ),
     )
 
 
-def _restore_page_local_tables(
-    *,
-    reconciled: list[dict[str, Any]],
-    content_list: list[dict[str, Any]],
-    group: list[int],
-    matches: dict[int, _ModelTable],
-) -> None:
-    """Replace one proven aggregate/ghost group with page-local model HTML."""
-
-    for position, index in enumerate(group):
-        item = dict(content_list[index])
-        if "table_body" in item or "table_html" not in item:
-            item["table_body"] = matches[index].html
-        else:
-            item["table_html"] = matches[index].html
-        item.pop(_TABLE_LOCATOR_KEY, None)
-        if position:
-            # Empty-string placeholder arrays become payload/hash drift after
-            # the ghost is restored into a real table carrier. They were
-            # already semantically empty and are normalized to the mapper's
-            # canonical empty form.
-            item["table_caption"] = []
-            item["table_footnote"] = []
-        reconciled[index] = item
-
-
-def _can_restore_page_local_tables(
-    *,
-    content_list: list[dict[str, Any]],
-    group: list[int],
-    matches: dict[int, _ModelTable],
-    allowed_intervening_indices: set[int],
-) -> bool:
-    """Prove page-local mapping will re-merge to the aggregate table payload."""
-
-    continuation_items = [content_list[index] for index in group[1:]]
-    if any(
-        not _blank_string_list(item.get("table_caption"))
-        or not _blank_string_list(item.get("table_footnote"))
-        for item in continuation_items
-    ):
-        return False
-    if any(
-        _contains_header_cells(matches[index].html) for index in group[1:]
-    ):
-        return False
-    if _has_visual_furniture_conflict(
-        content_list,
-        group=group,
-        allowed_intervening_indices=allowed_intervening_indices,
-    ):
-        return False
-    aggregate_grid = _builder_visible_grid([_table_html(content_list[group[0]])])
-    page_grid = _builder_visible_grid([matches[index].html for index in group])
-    return aggregate_grid is not None and page_grid == aggregate_grid
-
-
-def _has_visual_furniture_conflict(
-    content_list: list[dict[str, Any]],
-    *,
-    group: list[int],
-    allowed_intervening_indices: set[int],
-) -> bool:
-    """Reject a restore when page furniture can alter a continuation caption.
-
-    MinerU source order is not visual order. The builder therefore recovers a
-    statutory statement caption from any same-page furniture visibly above a
-    table, including furniture serialized after the table carrier. A restore
-    would turn that caption into a new S5 boundary, so reconciliation must run
-    the same geometry check before replacing an empty ghost.
-    """
-
-    for table_index in group[1:]:
-        table_item = content_list[table_index]
-        page_idx = _page_index(table_item.get("page_idx"))
-        table_bbox = _bbox(table_item.get("bbox"))
-        if page_idx is None or table_bbox is None:
-            return True
-        for furniture_index, item in enumerate(content_list):
-            furniture_kind = str(item.get("type") or "")
-            if furniture_kind not in {
-                "header",
-                "footer",
-                "page_number",
-                "aside_text",
-            }:
-                continue
-            title = " ".join(str(item.get("text") or "").split())
-            structural = rules.is_structural_page_furniture_title(title)
-            if (
-                furniture_kind == "page_number"
-                and structural
-                and group[0] < furniture_index < group[-1]
-            ):
-                # S1 promotes the first closed-set structural furniture title
-                # without a geometry requirement. A caption misclassified as
-                # page_number between the aggregate carrier and its ghost can
-                # therefore split restored page-local tables even at the page
-                # bottom or outside the table's horizontal span.
-                return True
-            if _page_index(item.get("page_idx")) != page_idx:
-                continue
-            if furniture_kind == "page_number" and structural:
-                return True
-            furniture_bbox = _bbox(item.get("bbox"))
-            if furniture_bbox is None:
-                continue
-            if furniture_kind in {"page_number", "aside_text"}:
-                compact_page_number = re.sub(r"\s+", "", title)
-                if (
-                    compact_page_number.isdigit()
-                    and 1 <= int(compact_page_number) <= 200
-                    and furniture_bbox[0] < 200
-                ):
-                    # This is exactly the numeric candidate family used by
-                    # S1's split-note recovery. It can pair with a same-line
-                    # exact note title regardless of its position relative to
-                    # the table, so page-local restore must fail closed.
-                    return True
-            visibly_above = furniture_bbox[3] <= table_bbox[1]
-            horizontally_overlaps = max(furniture_bbox[0], table_bbox[0]) <= min(
-                furniture_bbox[2], table_bbox[2]
-            )
-            if furniture_kind == "page_number" and visibly_above:
-                # The builder can pair a left-margin numeric page_number with
-                # a same-line exact note label, so horizontal overlap with the
-                # table is not required for it to create a structural split.
-                return True
-            if not visibly_above or not horizontally_overlaps:
-                continue
-            # MinerU sometimes labels a left-margin statement caption as a
-            # page_number. The builder can recover that same-page, visibly
-            # above label as structure, so restoring the ghost table would
-            # create a new S5 boundary even though the HTML grids are equal.
-            # A real bottom page number never reaches this above-table gate.
-            if (
-                furniture_kind == "page_number"
-                or structural
-                or furniture_index not in allowed_intervening_indices
-            ):
-                return True
-    return False
-
-
-def _blank_string_list(value: Any) -> bool:
-    if value is None:
-        return True
-    return isinstance(value, list) and all(
-        isinstance(item, str) and not item.strip() for item in value
-    )
-
-
-def _contains_header_cells(html: str) -> bool:
-    rows, failed = table_html_logical_rows(html)
-    return failed or any(cell[1] for row in rows for cell in row)
-
-
-def _builder_visible_grid(
-    htmls: list[str],
-) -> (
-    tuple[
-        tuple[str, ...],
-        tuple[tuple[str, ...], ...],
-        tuple[tuple[int, int, int, int], ...],
-    ]
-    | None
-):
-    """Project HTML through the mapper/S5 grid semantics without business rules."""
-
-    tables: list[dict[str, Any]] = []
-    widths: list[int] = []
-    for html in htmls:
-        table, failed = parse_table_html(html)
-        if failed:
-            return None
-        headers = [str(value) for value in table.get("headers") or []]
-        rows = [
-            [str(value) for value in row] for row in table.get("rows") or []
-        ]
-        width = len(headers) if headers else (len(rows[0]) if rows else 0)
-        if width == 0 or any(len(row) != width for row in rows):
-            return None
-        merged_cells = [dict(cell) for cell in table.get("merged_cells") or []]
-        tables.append(
-            {"headers": headers, "rows": rows, "merged_cells": merged_cells}
-        )
-        widths.append(width)
-    if not tables or len(set(widths)) != 1:
-        return None
-
-    headers, rows, merged_cells = merge_table_grids(tables)
-    kept_rows, merged_cells, _dropped = drop_blank_table_rows(
-        headers=headers,
-        rows=rows,
-        merged_cells=merged_cells,
-    )
-    merged_projection = tuple(
-        (
-            int(cell["row"]),
-            int(cell["col"]),
-            int(cell["rowspan"]),
-            int(cell["colspan"]),
-        )
-        for cell in merged_cells
-    )
-    return (
-        tuple(headers),
-        tuple(tuple(row) for row in kept_rows),
-        merged_projection,
-    )
 def _with_aggregate_table_locator(
     item: dict[str, Any],
     *,
@@ -687,7 +381,7 @@ def _following_empty_table_group(
             index in located_indices
             or index not in matches
             or page_idx != expected_page
-            or _table_html(item).strip()
+            or _has_any_table_html(item)
         ):
             break
         group.append(index)
@@ -718,7 +412,6 @@ def _allowed_intervening_furniture_indices(
         if kind not in {"header", "footer"}:
             continue
         text = " ".join(str(item.get("text") or "").split())
-        structural_text = re.sub(r"[（(]\s*续\s*[）)]$", "", text)
         page_idx = _page_index(item.get("page_idx"))
         bbox = _bbox(item.get("bbox"))
         in_margin = bool(
@@ -730,7 +423,6 @@ def _allowed_intervening_furniture_indices(
         )
         if (
             not text
-            or rules.is_structural_page_furniture_title(structural_text)
             or page_idx is None
             or not in_margin
         ):
@@ -783,10 +475,17 @@ def _is_proven_page_concatenation(
 
 
 def _table_html(item: dict[str, Any]) -> str:
-    value = item.get("table_body")
-    if value is None:
-        value = item.get("table_html")
-    return str(value) if value is not None else ""
+    return resolved_table_html(item) or ""
+
+
+def _has_any_table_html(item: dict[str, Any]) -> bool:
+    """Treat a carrier as empty only when every supported HTML field is empty."""
+
+    return any(
+        str(item[key]).strip()
+        for key in ("table_body", "table_html")
+        if key in item and item[key] is not None
+    )
 
 
 def _bbox(value: Any) -> tuple[float, float, float, float] | None:

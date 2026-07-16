@@ -26,7 +26,7 @@ WITH_ENV = set -a; for f in worker.env cninfo.env; do [ -r "$(DISCLOSURE_ENV_DIR
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	test-mineru-smoke lint typecheck agent-check api archive pg-init pg-start pg-stop \
 	pg-status db-create migrate register parse build-units publish process rebuild-units prune-history load-rules config-check track track-status track-export untrack purge-company sync worker-once worker-loop doctor-full wipe-test-data \
-	worker-status worker-restart gc-orphans audit-unmapped-codes audit-boilerplate audit-headings audit-weekly install-ops-launchd
+	worker-status worker-restart gc-orphans audit-unmapped-codes audit-boilerplate audit-headings audit-unit-corpus export-unit-corpus-manifest audit-weekly install-ops-launchd
 
 doctor:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -207,6 +207,16 @@ audit-boilerplate:
 
 audit-headings:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/audit_heading_coverage.py
+
+# Deterministic file-only replay gate. Export is a separate read-only DB step
+# so every audit is bound to one manifest and exact IR file hashes.
+export-unit-corpus-manifest:
+	@test -n "$(OUT)" || (echo 'usage: make export-unit-corpus-manifest OUT=/private/tmp/corpus-manifest.jsonl' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/export_unit_corpus_manifest.py --output "$(OUT)"
+
+audit-unit-corpus:
+	@test -n "$(MANIFEST)" -a -n "$(OUT)" || (echo 'usage: make audit-unit-corpus MANIFEST=/path/manifest.jsonl OUT=/private/tmp/audit-dir [WORKERS=4]' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/audit_unit_corpus.py --manifest "$(MANIFEST)" --out "$(OUT)" $(if $(WORKERS),--workers "$(WORKERS)")
 
 # Weekly sweep: run all three audits; each exits nonzero on a real finding.
 audit-weekly: audit-unmapped-codes audit-boilerplate audit-headings

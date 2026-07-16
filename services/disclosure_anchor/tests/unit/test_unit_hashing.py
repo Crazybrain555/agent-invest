@@ -38,6 +38,11 @@ class UnitHashingTests(unittest.TestCase):
             '{"a":null,"b":"中文"}',
         )
 
+    def test_canonical_json_rejects_non_finite_numbers(self) -> None:
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                canonical_json({"value": value})
+
     def test_title_changes_only_query_projection_hash(self) -> None:
         base = {
             "payload_kind": "text",
@@ -208,7 +213,7 @@ class UnitHashingTests(unittest.TestCase):
 
         self.assertEqual(first, second)
 
-    def test_mixed_part_artifact_locator_is_projection_not_content(self) -> None:
+    def test_mixed_part_locator_is_provenance_but_grid_spans_are_content(self) -> None:
         common = {
             "payload_kind": "mixed",
             "title": "业务",
@@ -227,17 +232,15 @@ class UnitHashingTests(unittest.TestCase):
                         "order": 4,
                         "headers": ["项目", "金额"],
                         "rows": [["甲", "1"]],
-                        "artifact_locator": {
-                            "page_no": 1,
-                            "merged_cells": [
-                                {
-                                    "row": 0,
-                                    "col": 0,
-                                    "rowspan": 1,
-                                    "colspan": 2,
-                                }
-                            ],
-                        },
+                        "merged_cells": [
+                            {
+                                "row": 0,
+                                "col": 0,
+                                "rowspan": 1,
+                                "colspan": 2,
+                            }
+                        ],
+                        "artifact_locator": {"page_no": 1},
                     }
                 ],
             },
@@ -252,19 +255,42 @@ class UnitHashingTests(unittest.TestCase):
                         "order": 4,
                         "headers": ["项目", "金额"],
                         "rows": [["甲", "1"]],
-                        "artifact_locator": {
-                            "page_no": 2,
-                            "merged_cells": [],
-                        },
+                        "merged_cells": [],
+                        "artifact_locator": {"page_no": 2},
                     }
                 ],
             },
             **common,
         )
 
-        self.assertEqual(first.content_hash, second.content_hash)
-        self.assertNotEqual(first.query_projection_hash, second.query_projection_hash)
+        self.assertNotEqual(first.content_hash, second.content_hash)
+        self.assertEqual(first.query_projection_hash, second.query_projection_hash)
         self.assertEqual(first.structure_hash, second.structure_hash)
+
+        locator_only = compute_unit_hashes(
+            payload={
+                "semantic_type": "section",
+                "parts": [
+                    {
+                        "kind": "table",
+                        "order": 4,
+                        "headers": ["项目", "金额"],
+                        "rows": [["甲", "1"]],
+                        "merged_cells": [
+                            {
+                                "row": 0,
+                                "col": 0,
+                                "rowspan": 1,
+                                "colspan": 2,
+                            }
+                        ],
+                        "artifact_locator": {"page_no": 99},
+                    }
+                ],
+            },
+            **common,
+        )
+        self.assertEqual(first, locator_only)
 
     def test_mixed_parts_must_be_nonempty_objects(self) -> None:
         common = {

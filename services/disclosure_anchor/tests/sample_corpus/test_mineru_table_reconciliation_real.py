@@ -76,14 +76,7 @@ def _unit_semantics(unit: UnitDraft) -> tuple[object, ...]:
 
 
 def _without_continuation_provenance(value: object) -> object:
-    """Ignore only S5 merge spans while retaining cell geometry semantics.
-
-    Page-local restoration intentionally lets S5 prove and record a
-    ``continued_table`` page span that an aggregate carrier could not expose.
-    Those two locator keys are provenance, not payload semantics.  Keep every
-    other locator field -- especially ``merged_cells`` -- in the equality
-    check so a lossy grid restoration still fails this real-artifact gate.
-    """
+    """Ignore only locator provenance while retaining table content geometry."""
 
     if isinstance(value, list):
         return [_without_continuation_provenance(item) for item in value]
@@ -94,9 +87,36 @@ def _without_continuation_provenance(value: object) -> object:
     }
     locator = normalized.get("artifact_locator")
     if isinstance(locator, dict):
-        locator.pop("merge_reason", None)
-        locator.pop("page_span", None)
+        for key in (
+            "merge_reason",
+            "page_span",
+            "page_bboxes",
+            "model_table_indices",
+            "continuation_source_item_indices",
+            "table_locator_algorithm",
+        ):
+            locator.pop(key, None)
     return normalized
+
+
+def _assert_only_locators_added(
+    test: unittest.TestCase,
+    *,
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Assert every physical carrier is byte-for-byte unchanged."""
+
+    test.assertEqual(len(after), len(before))
+    locators: list[dict[str, Any]] = []
+    for original, reconciled in zip(before, after, strict=True):
+        physical = dict(reconciled)
+        locator = physical.pop("_mineru_aggregate_table_locator", None)
+        test.assertEqual(physical, original)
+        if locator is not None:
+            test.assertIsInstance(locator, dict)
+            locators.append(locator)
+    return locators
 
 
 @unittest.skipUnless(
@@ -106,7 +126,7 @@ def _without_continuation_provenance(value: object) -> object:
     "real MinerU reconciliation artifacts are absent",
 )
 class RealMinerUTableReconciliationTests(unittest.TestCase):
-    def test_1217576500_restores_attachment_pages_and_remerges_semantics(self) -> None:
+    def test_1217576500_locates_attachment_pages_without_splitting(self) -> None:
         root = DATA_ROOT / POSITIVE_ROOT
         content_path = root / f"{POSITIVE_STEM}_content_list.json"
         model_path = root / f"{POSITIVE_STEM}_model.json"
@@ -149,7 +169,7 @@ class RealMinerUTableReconciliationTests(unittest.TestCase):
         diagnostics = after_ir["parser_diagnostics"]["table_reconciliation"]
         self.assertEqual(
             diagnostics["algorithm_version"],
-            "mineru-aggregate-table-restore.v3",
+            "mineru-aggregate-table-locator.v4",
         )
         self.assertEqual(
             diagnostics["model_hash"],
@@ -157,10 +177,34 @@ class RealMinerUTableReconciliationTests(unittest.TestCase):
         )
         self.assertEqual(diagnostics["located_groups"], 1)
         self.assertEqual(diagnostics["located_tables"], 11)
-        self.assertEqual(diagnostics["restored_groups"], 1)
-        self.assertEqual(diagnostics["restored_tables"], 11)
-        self.assertTrue(
-            all(result.content_list[index].get("table_body") for index in range(39, 50))
+        self.assertEqual(diagnostics["locator_only_groups"], 1)
+        self.assertEqual(diagnostics["locator_only_tables"], 11)
+        self.assertEqual(diagnostics["restored_groups"], 0)
+        self.assertEqual(diagnostics["restored_tables"], 0)
+        self.assertEqual(diagnostics["restoration_rejected_groups"], 0)
+        self.assertEqual(diagnostics["unresolved_groups"], 0)
+        locators = _assert_only_locators_added(
+            self, before=content, after=result.content_list
+        )
+        self.assertEqual(len(locators), 1)
+        self.assertEqual(
+            set(locators[0]),
+            {
+                "algorithm_version",
+                "page_span",
+                "page_bboxes",
+                "model_table_indices",
+                "continuation_source_item_indices",
+            },
+        )
+        self.assertEqual(
+            locators[0]["algorithm_version"], diagnostics["algorithm_version"]
+        )
+        self.assertEqual(locators[0]["page_span"], [8, 18])
+        self.assertEqual(len(locators[0]["page_bboxes"]), 11)
+        self.assertEqual(len(locators[0]["model_table_indices"]), 11)
+        self.assertEqual(
+            locators[0]["continuation_source_item_indices"], list(range(40, 50))
         )
         before, _ = build_unit_drafts_s1_s7(
             before_ir,
@@ -184,7 +228,7 @@ class RealMinerUTableReconciliationTests(unittest.TestCase):
             [8, 18],
         )
 
-    def test_1218206761_restores_only_equal_width_groups(self) -> None:
+    def test_1218206761_locates_only_logically_proven_groups(self) -> None:
         root = DATA_ROOT / NEGATIVE_ROOT
         content_path = root / f"{NEGATIVE_STEM}_content_list.json"
         model_path = root / f"{NEGATIVE_STEM}_model.json"
@@ -240,8 +284,29 @@ class RealMinerUTableReconciliationTests(unittest.TestCase):
             "sha256:b58ff2334e4321d7325df189ccd80a022330d8ebf2cabe6ee4c6ef0038a46eba",
         )
         self.assertEqual(diagnostics["unproven_groups"], 1)
-        self.assertEqual(diagnostics["restored_groups"], 3)
-        self.assertEqual(diagnostics["restored_tables"], 7)
+        self.assertEqual(diagnostics["locator_only_groups"], 3)
+        self.assertEqual(diagnostics["locator_only_tables"], 7)
+        self.assertEqual(diagnostics["restored_groups"], 0)
+        self.assertEqual(diagnostics["restored_tables"], 0)
+        self.assertEqual(diagnostics["restoration_rejected_groups"], 0)
+        self.assertEqual(diagnostics["unresolved_groups"], 1)
+        locators = _assert_only_locators_added(
+            self, before=content, after=result.content_list
+        )
+        self.assertEqual(len(locators), 3)
+        self.assertTrue(
+            all(
+                set(locator)
+                == {
+                    "algorithm_version",
+                    "page_span",
+                    "page_bboxes",
+                    "model_table_indices",
+                    "continuation_source_item_indices",
+                }
+                for locator in locators
+            )
+        )
         before_units, _ = build_unit_drafts_s1_s7(
             before_ir, filing_type="quarterly_report"
         )
@@ -253,7 +318,7 @@ class RealMinerUTableReconciliationTests(unittest.TestCase):
             [_unit_semantics(unit) for unit in before_units],
         )
 
-    def test_1224557820_restoration_recovers_diluted_eps_orphan(self) -> None:
+    def test_1224557820_locator_only_preserves_diluted_eps_semantics(self) -> None:
         root = DATA_ROOT / RUNNING_FURNITURE_ROOT
         content_path = root / f"{RUNNING_FURNITURE_STEM}_content_list.json"
         model_path = root / f"{RUNNING_FURNITURE_STEM}_model.json"
@@ -266,41 +331,71 @@ class RealMinerUTableReconciliationTests(unittest.TestCase):
             "ff6693ca2701142f010dd1a54ba6a6c63504fedc151f267b4b47c6be432c4ddd",
         )
         content = MinerUArtifactReader().read_content_list(content_path)
+        mapper = MinerUToNormalizedIRMapper()
+        parser_info = MinerUParserInfo(
+            name="MinerU",
+            package_version="3.4.0",
+            backend="vlm-http-client",
+            method="auto",
+            language="ch",
+            formula=False,
+            table=True,
+        )
+        metadata = {
+            "document_id": "real_1224557820",
+            "source_pdf": "raw/1224557820.pdf",
+            "title": "大地熊：大地熊2025年半年度报告",
+        }
+        before_ir = mapper.map_content_list(
+            content_list=content,
+            parser_info=parser_info,
+            document_metadata=metadata,
+        )
         normalized, result = map_reconciled_mineru_content_list(
             content_list=content,
             model_path=model_path,
-            mapper=MinerUToNormalizedIRMapper(),
-            parser_info=MinerUParserInfo(
-                name="MinerU",
-                package_version="3.4.0",
-                backend="vlm-http-client",
-                method="auto",
-                language="ch",
-                formula=False,
-                table=True,
-            ),
-            document_metadata={
-                "document_id": "real_1224557820",
-                "source_pdf": "raw/1224557820.pdf",
-                "title": "大地熊：大地熊2025年半年度报告",
-            },
+            mapper=mapper,
+            parser_info=parser_info,
+            document_metadata=metadata,
         )
-        self.assertEqual(result.stats.restored_groups, 41)
-        self.assertEqual(result.stats.restored_tables, 88)
+        self.assertEqual(result.stats.locator_only_groups, 41)
+        self.assertEqual(result.stats.locator_only_tables, 88)
+        self.assertEqual(result.stats.restored_groups, 0)
+        self.assertEqual(result.stats.restored_tables, 0)
+        self.assertEqual(result.stats.restoration_rejected_groups, 0)
         diagnostics = normalized["parser_diagnostics"]["table_reconciliation"]
         self.assertEqual(
             diagnostics["algorithm_version"],
-            "mineru-aggregate-table-restore.v3",
+            "mineru-aggregate-table-locator.v4",
         )
         self.assertEqual(
             diagnostics["unresolved_groups"], diagnostics["unproven_groups"]
         )
+        locators = _assert_only_locators_added(
+            self, before=content, after=result.content_list
+        )
+        self.assertEqual(len(locators), 41)
         units, stats = build_unit_drafts_s1_s7(
             normalized,
             filing_type="semiannual_report",
-            document_title="大地熊：大地熊2025年半年度报告",
+            document_title=str(metadata["title"]),
         )
-        self.assertEqual(stats.recovered_statement_orphan_rows, 1)
+        before_units, before_stats = build_unit_drafts_s1_s7(
+            before_ir,
+            filing_type="semiannual_report",
+            document_title=str(metadata["title"]),
+        )
+        self.assertEqual(
+            [_unit_semantics(unit) for unit in units],
+            [_unit_semantics(unit) for unit in before_units],
+        )
+        # The aggregate carrier already contains this logical row; v4 keeps
+        # it in place instead of manufacturing a page-local orphan to recover.
+        self.assertEqual(stats.recovered_statement_orphan_rows, 0)
+        self.assertEqual(
+            stats.recovered_statement_orphan_rows,
+            before_stats.recovered_statement_orphan_rows,
+        )
         table_payloads: list[dict[str, Any]] = []
         for unit in units:
             if unit.payload_kind == "table":
@@ -320,12 +415,6 @@ class RealMinerUTableReconciliationTests(unittest.TestCase):
             for cell in row
         ]
         self.assertIn("(二)稀释每股收益(元/股)", table_cells)
-        self.assertFalse(
-            any(
-                "稀释每股收益" in " > ".join([*unit.heading_path, unit.title or ""])
-                for unit in units
-            )
-        )
 
 
 if __name__ == "__main__":

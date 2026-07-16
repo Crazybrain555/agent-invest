@@ -13,17 +13,13 @@ Use separate authorities for separate questions:
    `docs/architecture/service-purpose.md` and the matching architecture/contract checklist.
 2. **What exists now:** current files, runnable commands, schemas, and observed behavior. A mismatch with a
    normative authority is drift to fix or explicitly revise, not an implicit contract override.
-3. **Durable task state:** when a root `AGENTS.md` trigger applies, service-scoped work uses
-   `docs/agent/HANDOFF.md`; cross-repo work uses `../../docs/agent/HANDOFF.md`. Never keep both holding the
-   worktree gate; parked records (`docs/agent/parked/`, root §3) may exist at both levels. Do not recreate
-   the legacy six-file stack when no handoff exists.
+3. **Durable task state:** follow `../../docs/agent-workflow.md`; service work uses `docs/agent/HANDOFF.md`,
+   cross-repo work uses `../../docs/agent/HANDOFF.md`, and never both as gate holders.
 4. **Setup/config:** `docs/MCP_SETUP_GUIDE.md`, `.codex/config.toml`, `.mcp.json`, and environment templates,
    each only for its own surface.
 
-`docs/agent/HANDOFF.md` and `docs/agent/parked/` are worktree-local, gitignored, and never copied implicitly
-to another worktree. Durable policy and product facts belong in tracked files — this `AGENTS.md` or product
-documentation — never only in a handoff. Legacy task files, archives, and notes are read-only
-migration/history evidence.
+HANDOFF/parked state is worktree-local and gitignored. Durable policy and product facts belong in tracked files,
+never only in task state; legacy task files remain read-only history.
 
 ## 2. Service hard boundaries
 
@@ -75,6 +71,23 @@ that must be re-verified for an ops task, not as permanent prompt facts.
 - Default deterministic gate: `make agent-check` (ruff, strict mypy, no-DB unittest, `git diff --check`).
 - Run `make test` and required migration round trips for DB/migration behavior when local credentials and the
   shared test cluster are in scope; otherwise record the exact blocker.
+- Before changing parser, unit-builder, publication, or retrieval behavior, use read-only DBHub/SQL against
+  `disclosure_public.*_v1` when available: inspect the actual view schema, then compare active published units and
+  cross-filing/issuer distributions with a source-identity replay of the current worktree. Published rows may have
+  been built by older code, while old tests/fixtures may encode an earlier AI agent's assumption; neither is the
+  semantic oracle by itself. Resolve the delta against the normative contract, raw artifact, and NormalizedIR,
+  then add only the confirmed general invariant and its adjacent negative case to tests.
+- The root pre-design research gate applies to every parser, unit-builder, publication, and retrieval behavior
+  change, even when the problem looks simple, familiar, or covered by local tests. After inspecting the failing
+  artifact and representative corpus, check the official MinerU contract and 1–2 relevant document systems such
+  as Docling or Unstructured before designing the behavior change; difficulty changes only the depth. Announce
+  the research question/tools and the
+  adopted or rejected invariant. Only a design-neutral mechanical edit may skip the check, with the reason stated.
+  Validate the result with source-identity replay.
+  Every fix must name the failure family, invariant, and fail-closed boundary, then pass positive and negative
+  examples across representative filing types and issuers. Never branch on document IDs, grow a phrase list from
+  isolated samples, or copy another project's internals; a bounded provider/form schema is valid only when the
+  source format supplies that contract.
 - Changes involving disclosure inputs, parser outputs, archive storage, DB publication, APIs, or worker state
   use representative local samples when available. Synthetic-only validation needs a recorded exception; see
   `docs/implementation/checks/fixture-and-test-policy.md`.
@@ -83,11 +96,9 @@ that must be re-verified for an ops task, not as permanent prompt facts.
   worktree) and documented commands, measure the applicable instruction-file chain against each tool's
   documented size limits, and run `git diff --check`.
 
-Before completing a material change to runtime behavior, public contracts, setup/validation commands, agent
-policy, or durable-workflow semantics, obtain an independent read-only review from an agent/user path that did
-not implement the change. Give it the request, acceptance criteria, applicable policy, current diff, affected
-files, and validation evidence; it must not edit or update state. Findings are candidates—fix only material,
-evidence-backed items. Ordinary state progress and trivial factual/typographic edits do not trigger review.
+Material runtime, public-contract, setup-command, agent-policy, or durable-workflow changes require the root §4
+independent read-only review. Give the reviewer the request, acceptance criteria, policy, diff, affected files,
+and validation evidence; findings remain candidates and only evidence-backed material items are fixed.
 
 Completion means acceptance is met, relevant checks passed or exact blockers are recorded, and required
 material review findings are resolved or explicitly deferred by the user. Update only the gate-holding

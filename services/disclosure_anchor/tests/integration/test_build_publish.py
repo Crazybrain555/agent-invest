@@ -12,10 +12,21 @@ from sqlalchemy import text
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
-from disclosure_anchor.application.use_cases.build_units import BuildUnits, BuildUnitsCommand
-from disclosure_anchor.application.use_cases.publish_run import PublishRun, PublishRunCommand
+from disclosure_anchor.application.use_cases.build_units import (
+    BuildUnits,
+    BuildUnitsCommand,
+)
+from disclosure_anchor.application.use_cases.publish_run import (
+    PublishRun,
+    PublishRunCommand,
+)
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
+from disclosure_anchor.domain.services.unit_hashing import (
+    compute_unit_hashes,
+    content_hash_aggregate,
+    structure_hash_aggregate,
+)
 from disclosure_anchor.settings import Settings
 from tests.integration._support import engine_or_skip
 
@@ -73,25 +84,45 @@ def _unit(
     document_id: str,
     run_id: str,
     *,
-    content_hash: str = "sha256:content",
+    content_hash: str | None = None,
     order_index: int = 1,
     title: str = "标题",
-    query_projection_hash: str = "sha256:projection",
-    semantic_key: str | None = None,
+    query_projection_hash: str | None = None,
+    semantic_key: str | None = "document_content",
+    semantic_keys: list[str] | None = None,
+    payload: dict[str, object] | None = None,
 ) -> e.DocumentUnit:
+    resolved_payload = payload or {"text": asset_id}
+    resolved_semantic_keys = (
+        [semantic_key]
+        if semantic_keys is None and semantic_key is not None
+        else semantic_keys
+    )
+    hashes = compute_unit_hashes(
+        payload_kind="text",
+        payload=resolved_payload,
+        title=title,
+        heading_path=["第一节"],
+        semantic_key=semantic_key,
+        semantic_keys=resolved_semantic_keys,
+        quality_status="ok",
+        order_index=order_index,
+    )
     return e.DocumentUnit(
         asset_id=asset_id,
         document_id=document_id,
         processing_run_id=run_id,
         payload_kind="text",
         order_index=order_index,
-        payload={"text": asset_id},
-        content_hash=content_hash,
+        payload=resolved_payload,
+        content_hash=content_hash or hashes.content_hash,
         title=title,
         heading_path=["第一节"],
         semantic_key=semantic_key,
+        semantic_keys=resolved_semantic_keys,
         quality_status="ok",
-        query_projection_hash=query_projection_hash,
+        query_projection_hash=(query_projection_hash or hashes.query_projection_hash),
+        structure_hash=hashes.structure_hash,
     )
 
 
@@ -129,15 +160,21 @@ class BuildPublishIntegrationTests(unittest.TestCase):
             security_ids = [row[3] for row in rows if row[3]]
             for document_id in document_ids:
                 conn.execute(
-                    text("DELETE FROM disclosure_ops.outbox_event WHERE document_id=:id"),
+                    text(
+                        "DELETE FROM disclosure_ops.outbox_event WHERE document_id=:id"
+                    ),
                     {"id": document_id},
                 )
                 conn.execute(
-                    text("DELETE FROM disclosure_core.document_unit WHERE document_id=:id"),
+                    text(
+                        "DELETE FROM disclosure_core.document_unit WHERE document_id=:id"
+                    ),
                     {"id": document_id},
                 )
                 conn.execute(
-                    text("DELETE FROM disclosure_core.processing_run WHERE document_id=:id"),
+                    text(
+                        "DELETE FROM disclosure_core.processing_run WHERE document_id=:id"
+                    ),
                     {"id": document_id},
                 )
                 conn.execute(
@@ -146,7 +183,9 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                 )
             for source_access_id in source_access_ids:
                 conn.execute(
-                    text("DELETE FROM disclosure_core.source_access WHERE source_access_id=:id"),
+                    text(
+                        "DELETE FROM disclosure_core.source_access WHERE source_access_id=:id"
+                    ),
                     {"id": source_access_id},
                 )
             for security_id in security_ids:
@@ -186,7 +225,9 @@ class BuildPublishIntegrationTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         with self._uow() as uow:
-            uow.companies.add(e.Company(company_id=company_id, legal_name=provider_document_id))
+            uow.companies.add(
+                e.Company(company_id=company_id, legal_name=provider_document_id)
+            )
             uow.securities.add(
                 e.Security(
                     security_id=security_id,
@@ -225,17 +266,37 @@ class BuildPublishIntegrationTests(unittest.TestCase):
         *,
         old_units: list[e.DocumentUnit],
         new_units: list[e.DocumentUnit],
-        old_aggregate: str = "sha256:old",
-        new_aggregate: str = "sha256:new",
+        old_aggregate: str | None = None,
+        new_aggregate: str | None = None,
     ) -> tuple[str, str]:
         self.provider_document_ids.append(provider_document_id)
         company_id = ids.new_company_id()
         security_id = ids.new_security_id()
-        document_id = old_units[0].document_id if old_units else new_units[0].document_id
-        old_run_id = old_units[0].processing_run_id if old_units else ids.new_processing_run_id()
+        document_id = (
+            old_units[0].document_id if old_units else new_units[0].document_id
+        )
+        old_run_id = (
+            old_units[0].processing_run_id if old_units else ids.new_processing_run_id()
+        )
         new_run_id = new_units[0].processing_run_id
+        resolved_old_aggregate = old_aggregate or content_hash_aggregate(
+            unit.content_hash for unit in old_units
+        )
+        resolved_new_aggregate = new_aggregate or content_hash_aggregate(
+            unit.content_hash for unit in new_units
+        )
+        old_structure_aggregate = structure_hash_aggregate(
+            unit.structure_hash or ""
+            for unit in sorted(old_units, key=lambda item: item.order_index)
+        )
+        new_structure_aggregate = structure_hash_aggregate(
+            unit.structure_hash or ""
+            for unit in sorted(new_units, key=lambda item: item.order_index)
+        )
         with self._uow() as uow:
-            uow.companies.add(e.Company(company_id=company_id, legal_name=provider_document_id))
+            uow.companies.add(
+                e.Company(company_id=company_id, legal_name=provider_document_id)
+            )
             uow.securities.add(
                 e.Security(
                     security_id=security_id,
@@ -265,8 +326,8 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                         status="succeeded",
                         unit_build_status="succeeded",
                         is_active=True,
-                        content_hash_aggregate=old_aggregate,
-                        structure_hash="sha256:old_structure",
+                        content_hash_aggregate=resolved_old_aggregate,
+                        structure_hash=old_structure_aggregate,
                     )
                 )
             uow.processing_runs.add(
@@ -276,8 +337,8 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                     run_kind="parse",
                     status="succeeded",
                     unit_build_status="succeeded",
-                    content_hash_aggregate=new_aggregate,
-                    structure_hash="sha256:new_structure",
+                    content_hash_aggregate=resolved_new_aggregate,
+                    structure_hash=new_structure_aggregate,
                 )
             )
             uow.document_units.add_many(old_units + new_units)
@@ -301,20 +362,28 @@ class BuildPublishIntegrationTests(unittest.TestCase):
         self.assertEqual(publish_result.status, "published")
         self.assertTrue(second_publish.idempotent)
         with self.engine.connect() as conn:
-            unit_row = conn.execute(
-                text(
-                    "SELECT asset_id, payload FROM disclosure_core.document_unit "
-                    "WHERE processing_run_id=:run_id"
-                ),
-                {"run_id": run_id},
-            ).mappings().one()
-            run_row = conn.execute(
-                text(
-                    "SELECT document_units_relpath FROM disclosure_core.processing_run "
-                    "WHERE processing_run_id=:run_id"
-                ),
-                {"run_id": run_id},
-            ).mappings().one()
+            unit_row = (
+                conn.execute(
+                    text(
+                        "SELECT asset_id, payload FROM disclosure_core.document_unit "
+                        "WHERE processing_run_id=:run_id"
+                    ),
+                    {"run_id": run_id},
+                )
+                .mappings()
+                .one()
+            )
+            run_row = (
+                conn.execute(
+                    text(
+                        "SELECT document_units_relpath FROM disclosure_core.processing_run "
+                        "WHERE processing_run_id=:run_id"
+                    ),
+                    {"run_id": run_id},
+                )
+                .mappings()
+                .one()
+            )
             view_count = conn.execute(
                 text(
                     "SELECT count(*) FROM disclosure_public.document_units_v1 "
@@ -322,14 +391,18 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                 ),
                 {"document_id": document_id},
             ).scalar_one()
-            event_rows = conn.execute(
-                text(
-                    "SELECT event_kind, change_kind, subject_kind, subject_ref "
-                    "FROM disclosure_public.change_events_v1 "
-                    "WHERE document_id=:document_id ORDER BY seq"
-                ),
-                {"document_id": document_id},
-            ).mappings().all()
+            event_rows = (
+                conn.execute(
+                    text(
+                        "SELECT event_kind, change_kind, subject_kind, subject_ref "
+                        "FROM disclosure_public.change_events_v1 "
+                        "WHERE document_id=:document_id ORDER BY seq"
+                    ),
+                    {"document_id": document_id},
+                )
+                .mappings()
+                .all()
+            )
 
         snapshot_path = self.paths.data_path(Path(run_row["document_units_relpath"]))
         snapshot_rows = [
@@ -353,9 +426,25 @@ class BuildPublishIntegrationTests(unittest.TestCase):
         old_run_id = ids.new_processing_run_id()
         new_run_id = ids.new_processing_run_id()
         pid = "p05-rollback-" + ids.new_ulid()
-        old_units = [_unit(ids.new_asset_id(), document_id, old_run_id, content_hash="sha256:old")]
-        new_units = [_unit(ids.new_asset_id(), document_id, new_run_id, content_hash="sha256:new")]
-        self._seed_direct_publish_document(pid, old_units=old_units, new_units=new_units)
+        old_units = [
+            _unit(
+                ids.new_asset_id(),
+                document_id,
+                old_run_id,
+                payload={"text": "old"},
+            )
+        ]
+        new_units = [
+            _unit(
+                ids.new_asset_id(),
+                document_id,
+                new_run_id,
+                payload={"text": "new"},
+            )
+        ]
+        self._seed_direct_publish_document(
+            pid, old_units=old_units, new_units=new_units
+        )
 
         class FailingUoW(SqlAlchemyUnitOfWork):
             def _bind_repositories(self, session):  # noqa: ANN001
@@ -375,21 +464,29 @@ class BuildPublishIntegrationTests(unittest.TestCase):
             )
 
         with self.engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    "SELECT processing_run_id, is_active "
-                    "FROM disclosure_core.processing_run "
-                    "WHERE processing_run_id IN (:old, :new)"
-                ),
-                {"old": old_run_id, "new": new_run_id},
-            ).mappings().all()
-            document = conn.execute(
-                text(
-                    "SELECT current_processing_run_id, status "
-                    "FROM disclosure_core.document WHERE document_id=:document_id"
-                ),
-                {"document_id": document_id},
-            ).mappings().one()
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT processing_run_id, is_active "
+                        "FROM disclosure_core.processing_run "
+                        "WHERE processing_run_id IN (:old, :new)"
+                    ),
+                    {"old": old_run_id, "new": new_run_id},
+                )
+                .mappings()
+                .all()
+            )
+            document = (
+                conn.execute(
+                    text(
+                        "SELECT current_processing_run_id, status "
+                        "FROM disclosure_core.document WHERE document_id=:document_id"
+                    ),
+                    {"document_id": document_id},
+                )
+                .mappings()
+                .one()
+            )
             event_count = conn.execute(
                 text(
                     "SELECT count(*) FROM disclosure_ops.outbox_event "
@@ -412,26 +509,64 @@ class BuildPublishIntegrationTests(unittest.TestCase):
             old_run_id = ids.new_processing_run_id()
             new_run_id = ids.new_processing_run_id()
             if label == "same":
-                old_units = [_unit(ids.new_asset_id(), document_id, old_run_id)]
-                new_units = [_unit(ids.new_asset_id(), document_id, new_run_id)]
-                old_aggregate = new_aggregate = "sha256:same"
-            elif label == "changed":
                 old_units = [
-                    _unit(ids.new_asset_id(), document_id, old_run_id, content_hash="sha256:old")
+                    _unit(
+                        ids.new_asset_id(),
+                        document_id,
+                        old_run_id,
+                        payload={"text": "same"},
+                    )
                 ]
                 new_units = [
-                    _unit(ids.new_asset_id(), document_id, new_run_id, content_hash="sha256:new")
+                    _unit(
+                        ids.new_asset_id(),
+                        document_id,
+                        new_run_id,
+                        payload={"text": "same"},
+                    )
                 ]
-                old_aggregate = "sha256:old"
-                new_aggregate = "sha256:new"
+            elif label == "changed":
+                old_units = [
+                    _unit(
+                        ids.new_asset_id(),
+                        document_id,
+                        old_run_id,
+                        payload={"text": "old"},
+                    )
+                ]
+                new_units = [
+                    _unit(
+                        ids.new_asset_id(),
+                        document_id,
+                        new_run_id,
+                        payload={"text": "new"},
+                    )
+                ]
             elif label == "duplicate":
                 old_units = [
-                    _unit(ids.new_asset_id(), document_id, old_run_id, order_index=1),
-                    _unit(ids.new_asset_id(), document_id, old_run_id, order_index=2),
+                    _unit(
+                        ids.new_asset_id(),
+                        document_id,
+                        old_run_id,
+                        order_index=1,
+                        payload={"text": "same"},
+                    ),
+                    _unit(
+                        ids.new_asset_id(),
+                        document_id,
+                        old_run_id,
+                        order_index=2,
+                        payload={"text": "same"},
+                    ),
                 ]
-                new_units = [_unit(ids.new_asset_id(), document_id, new_run_id)]
-                old_aggregate = "sha256:old_dupe"
-                new_aggregate = "sha256:new_dupe"
+                new_units = [
+                    _unit(
+                        ids.new_asset_id(),
+                        document_id,
+                        new_run_id,
+                        payload={"text": "same"},
+                    )
+                ]
             else:
                 old_units = [
                     _unit(
@@ -440,6 +575,7 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                         old_run_id,
                         title="原标题",
                         query_projection_hash="sha256:old_projection",
+                        payload={"text": "same"},
                     )
                 ]
                 new_units = [
@@ -448,17 +584,14 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                         document_id,
                         new_run_id,
                         title="新标题",
-                        query_projection_hash="sha256:new_projection",
+                        payload={"text": "same"},
                     )
                 ]
-                old_aggregate = new_aggregate = "sha256:same_projection_content"
             pid = "p05-diff-" + label + "-" + ids.new_ulid()
             document_id, new_run_id = self._seed_direct_publish_document(
                 pid,
                 old_units=old_units,
                 new_units=new_units,
-                old_aggregate=old_aggregate,
-                new_aggregate=new_aggregate,
             )
             PublishRun(uow_factory=self._uow).execute(
                 PublishRunCommand(processing_run_id=new_run_id)
@@ -468,14 +601,18 @@ class BuildPublishIntegrationTests(unittest.TestCase):
         by_label = {}
         with self.engine.connect() as conn:
             for label, document_id in scenarios:
-                rows = conn.execute(
-                    text(
-                        "SELECT event_kind, change_kind, payload "
-                        "FROM disclosure_public.change_events_v1 "
-                        "WHERE document_id=:document_id ORDER BY seq"
-                    ),
-                    {"document_id": document_id},
-                ).mappings().all()
+                rows = (
+                    conn.execute(
+                        text(
+                            "SELECT event_kind, change_kind, payload "
+                            "FROM disclosure_public.change_events_v1 "
+                            "WHERE document_id=:document_id ORDER BY seq"
+                        ),
+                        {"document_id": document_id},
+                    )
+                    .mappings()
+                    .all()
+                )
                 by_label[label] = rows
 
         self.assertEqual(
@@ -492,7 +629,9 @@ class BuildPublishIntegrationTests(unittest.TestCase):
             ],
         )
         duplicate_removed = [
-            row for row in by_label["duplicate"] if row["event_kind"] == "document_unit_removed"
+            row
+            for row in by_label["duplicate"]
+            if row["event_kind"] == "document_unit_removed"
         ]
         self.assertEqual(len(duplicate_removed), 1)
         self.assertEqual(

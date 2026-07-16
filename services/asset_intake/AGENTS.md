@@ -5,10 +5,9 @@ L1 轻资产登记服务：dataset_snapshot（结构化数据查询结果）+ to
 （§3.2 信封、§3.7 payload 契约、§3.9 查空、§2.8 change feed、§3.11 对外契约）。跨服务规矩见根
 `AGENTS.md`；蓝图（只读参考）是 `../disclosure_anchor/`。
 
-Keep this file thin: norms + pointers. When a root `AGENTS.md` durable trigger applies, a service task uses
-its gitignored `docs/agent/HANDOFF.md`; cross-repo work uses `../../docs/agent/HANDOFF.md`. Never keep both
-holding the worktree gate; parked records (`docs/agent/parked/`, root §3) may coexist. Any legacy task files
-are read-only migration/history evidence.
+Keep this file thin: norms + pointers. Follow `../../docs/agent-workflow.md` when a root durable trigger applies;
+service work uses gitignored `docs/agent/HANDOFF.md`, cross-repo work uses `../../docs/agent/HANDOFF.md`, and never
+both as gate holders. Legacy task files are read-only history.
 
 ## Hard rules
 
@@ -31,6 +30,17 @@ are read-only migration/history evidence.
 `make test`（需 `ASSET_INTAKE_DATABASE_URL` / `ASSET_INTAKE_MIGRATION_DATABASE_URL`，socket DSN 形如
 `postgresql+psycopg://<role>@/invest_engine?host=/Volumes/AgentSSD/agent_system/postgres/sockets&port=55432`）。
 Live-DB 验证必须附带 `disclosure_*` 对象零变化断言。
+
+修改 provider、registry、登记/public-view、envelope 或 provenance 行为前，先检查真实 payload/schema；
+库可用时再用只读 DBHub/SQL 校准 `intake_public.*_v1` 的 schema、active 数据及跨 provider/kind 分布。
+已发布旧产物和历史测试都不是单独的语义权威，差异须回到顶层协议、source payload 和信封身份。
+根级“前置设计研究门”适用于每一次 provider、registry、登记、public-view、envelope 或 provenance
+行为修改，即使问题看似简单、熟悉或已有本地测试；先检查真实样本并做有界外部校验，再设计修改，
+难度只改变调研深度：
+供应商/库契约查官方文档或 Context7，成熟实现查 DeepWiki/GitHub/web（1–2 个），并公开研究问题及
+采纳/否决的不变量。只有格式、拼写、纯机械重命名等设计中性的机械修改可说明理由后跳过。结论须与
+`envelope-kernel` 和代表性 dataset_snapshot/tool_result 交叉验证并固化为正反测试，
+不得把单一 provider 样本或外部内部结构写进核心契约，也不得为只读诊断改写共享运行时。
 
 ## Layout
 

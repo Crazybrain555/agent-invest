@@ -1,4 +1,4 @@
-"""Build document_unit snapshots from NormalizedIR v2."""
+"""Build document_unit snapshots from supported NormalizedIR generations."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from disclosure_anchor.adapters.sources.cninfo.mapper import derive_primary_class
 from disclosure_anchor.adapters.unit_builder import rules
@@ -22,6 +22,19 @@ from disclosure_anchor.application.ports.file_store import (
     ArtifactWriteResult,
     FileStorePathPort,
 )
+from disclosure_anchor.application.contracts.normalized_ir import (
+    NormalizedIRVersionError,
+    validate_normalized_ir_contract,
+    validate_normalized_ir_identity,
+    validate_normalized_ir_path_version,
+    validate_reconciliation_generation,
+)
+from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation import (
+    ReconciliationCompatibility,
+    TableReconciliationContractError,
+    UnsupportedTableReconciliationAlgorithm,
+    assess_normalized_ir_table_reconciliation,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.worker.locks import maybe_lock_document
 from disclosure_anchor.domain import entities as e
@@ -30,6 +43,11 @@ from disclosure_anchor.domain.errors import BuildUnitsError
 from disclosure_anchor.domain.services.unit_hashing import (
     compute_unit_hashes,
     content_hash_aggregate,
+    structure_hash_aggregate,
+)
+from disclosure_anchor.domain.value_objects.semantic_key import (
+    SemanticKeyInvariantError,
+    validate_semantic_key_state,
 )
 
 
@@ -88,6 +106,7 @@ class BuildUnits:
             normalized_ir = self._load_ir(
                 Path(run.normalized_ir_relpath or ""),
                 expected_artifact_hash=run.artifact_hash,
+                expected_document_id=run.document_id,
             )
             document = context["document"]
             drafts, stats = build_unit_drafts_s1_s7(
@@ -97,6 +116,10 @@ class BuildUnits:
                     document.title,
                 ),
                 document_title=document.title,
+                security_code=context["security"].security_code,
+                security_name=_optional_text(
+                    (document.provider_metadata or {}).get("security_name")
+                ),
                 image_bytes_resolver=self._image_bytes_resolver(normalized_ir),
             )
             units, snapshot_rows = self._materialize_units(
@@ -110,7 +133,8 @@ class BuildUnits:
             return self._mark_and_result(
                 run.processing_run_id,
                 self._structured_error(
-                    error_code="ARTIFACT_READ_FAILED", message=str(exc)
+                    error_code="ARTIFACT_READ_FAILED",
+                    message=str(exc),
                 ),
             )
         except Exception as exc:
@@ -119,8 +143,7 @@ class BuildUnits:
             error = self._structured_error(
                 error_code="BUILD_PREPARATION_FAILED",
                 message=(
-                    "unit preparation failed: "
-                    f"{type(exc).__name__}: {str(exc)[:400]}"
+                    f"unit preparation failed: {type(exc).__name__}: {str(exc)[:400]}"
                 ),
             )
             self._mark_failed(run.processing_run_id, error)
@@ -168,9 +191,7 @@ class BuildUnits:
                     existing = uow.processing_runs.get(run.processing_run_id)
                 return BuildUnitsResult(
                     processing_run_id=run.processing_run_id,
-                    status=(
-                        existing.unit_build_status if existing else "failed"
-                    ),
+                    status=(existing.unit_build_status if existing else "failed"),
                     document_units_relpath=(
                         existing.document_units_relpath if existing else None
                     ),
@@ -270,7 +291,11 @@ class BuildUnits:
             return {"run": run, "document": document, "security": security}
 
     def _load_ir(
-        self, relpath: Path, *, expected_artifact_hash: str | None = None
+        self,
+        relpath: Path,
+        *,
+        expected_artifact_hash: str | None = None,
+        expected_document_id: str,
     ) -> dict[str, Any]:
         if not str(relpath):
             raise BuildUnitsError(
@@ -283,7 +308,10 @@ class BuildUnits:
             raw_bytes = self._paths.data_path(relpath).read_bytes()
         except OSError as exc:
             raise BuildUnitsError(
-                self._structured_error(error_code="IR_MISSING", message=str(exc))
+                self._structured_error(
+                    error_code="IR_MISSING",
+                    message=str(exc),
+                )
             ) from exc
         # Ingress hash check, symmetric with parse's raw-PDF verification
         # (parse_document.py): the IR lives in the overwritable derived area
@@ -303,46 +331,82 @@ class BuildUnits:
                         ),
                     )
                 )
-        payload = json.loads(raw_bytes.decode("utf-8"))
-        if payload.get("contract_version") != "normalized_ir.v2":
+        decoded: object = json.loads(raw_bytes.decode("utf-8"))
+        if not isinstance(decoded, dict):
             raise BuildUnitsError(
                 self._structured_error(
-                    error_code="IR_CONTRACT_TOO_OLD",
-                    message="normalized IR must be regenerated as normalized_ir.v2",
+                    error_code="IR_CONTRACT_UNSUPPORTED",
+                    reason_code="payload_not_object",
+                    message="normalized IR must be an object",
                 )
             )
-        self._validate_table_builder_semantics(payload)
-        return payload
-
-    def _validate_table_builder_semantics(self, payload: dict[str, Any]) -> None:
-        """Reject reconciled IR whose table proof targets different S5 rules.
-
-        Legacy IR without table-reconciliation diagnostics remains readable.
-        Once a reconciliation algorithm is recorded, however, its page-local
-        equivalence proof is safe only for the table-builder semantics version
-        it names. Ordinary RULES_VERSION changes intentionally do not enter
-        this compatibility check.
-        """
-
-        diagnostics = payload.get("parser_diagnostics")
-        if not isinstance(diagnostics, dict):
-            return
-        reconciliation = diagnostics.get("table_reconciliation")
-        if not isinstance(reconciliation, dict):
-            return
-        algorithm = str(reconciliation.get("algorithm_version") or "")
-        if not algorithm.startswith("mineru-aggregate-table-restore.v"):
-            return
-        actual = reconciliation.get("table_builder_semantics_version")
-        expected = rules.TABLE_BUILDER_SEMANTICS_VERSION
-        if actual != expected:
+        payload = cast(dict[str, Any], decoded)
+        try:
+            version = validate_normalized_ir_contract(payload)
+            validate_normalized_ir_identity(
+                payload, document_id=expected_document_id
+            )
+            validate_normalized_ir_path_version(relpath, version=version)
+        except NormalizedIRVersionError as exc:
+            error_code = (
+                "IR_CONTRACT_TOO_OLD"
+                if exc.reason_code == "contract_version_too_old"
+                else "IR_CONTRACT_UNSUPPORTED"
+            )
             raise BuildUnitsError(
                 self._structured_error(
-                    error_code="IR_TABLE_BUILDER_SEMANTICS_MISMATCH",
+                    error_code=error_code,
+                    reason_code=exc.reason_code,
+                    message=str(exc),
+                )
+            ) from exc
+        self._validate_table_reconciliation(payload, version=version)
+        return payload
+
+    def _validate_table_reconciliation(
+        self, payload: dict[str, Any], *, version: str
+    ) -> None:
+        """Validate the shared IR extension and act on evidence compatibility."""
+        try:
+            assessment = assess_normalized_ir_table_reconciliation(payload)
+        except UnsupportedTableReconciliationAlgorithm as exc:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="IR_TABLE_RECONCILIATION_UNSUPPORTED",
+                    reason_code=exc.reason_code,
+                    message=str(exc),
+                )
+            ) from exc
+        except TableReconciliationContractError as exc:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="IR_TABLE_RECONCILIATION_INVALID",
+                    reason_code=exc.reason_code,
+                    message=f"invalid normalized IR table reconciliation: {exc}",
+                )
+            ) from exc
+        try:
+            validate_reconciliation_generation(
+                version=version,
+                algorithm_version=assessment.algorithm_version,
+            )
+        except NormalizedIRVersionError as exc:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="IR_TABLE_RECONCILIATION_CONTRACT_MISMATCH",
+                    reason_code=exc.reason_code,
+                    message=str(exc),
+                )
+            ) from exc
+        if assessment.compatibility is ReconciliationCompatibility.REPARSE_REQUIRED:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="IR_TABLE_RECONCILIATION_REPARSE_REQUIRED",
+                    reason_code="legacy_physical_carriers_restored",
                     message=(
-                        "normalized IR table reconciliation targets "
-                        f"{actual!r}; current builder requires {expected!r}. "
-                        "Re-parse the document before building units"
+                        "normalized IR was produced by a legacy reconciliation "
+                        "that rewrote physical table carriers; re-parse before "
+                        "building units"
                     ),
                 )
             )
@@ -372,6 +436,19 @@ class BuildUnits:
         units: list[e.DocumentUnit] = []
         rows: list[dict[str, Any]] = []
         for order_index, draft in enumerate(drafts, start=1):
+            try:
+                validate_semantic_key_state(
+                    draft.semantic_key,
+                    draft.semantic_keys,
+                )
+            except SemanticKeyInvariantError as exc:
+                raise BuildUnitsError(
+                    self._structured_error(
+                        error_code="UNIT_SEMANTIC_KEYS_INVALID",
+                        reason_code=exc.reason_code,
+                        message=str(exc),
+                    )
+                ) from exc
             hashes = compute_unit_hashes(
                 payload_kind=draft.payload_kind,
                 payload=draft.payload,
@@ -532,13 +609,22 @@ class BuildUnits:
             uow.commit()
             return updated
 
-    def _structured_error(self, *, error_code: str, message: str) -> dict[str, Any]:
-        return {
+    def _structured_error(
+        self,
+        *,
+        error_code: str,
+        message: str,
+        reason_code: str | None = None,
+    ) -> dict[str, Any]:
+        error: dict[str, Any] = {
             "stage": "build_units",
             "error_code": error_code,
             "retryable": False,
             "message": message,
         }
+        if reason_code is not None:
+            error["reason_code"] = reason_code
+        return error
 
 
 def _locator_page_no(locator: dict[str, Any] | None) -> int | None:
@@ -548,15 +634,16 @@ def _locator_page_no(locator: dict[str, Any] | None) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def _optional_text(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def _content_hash_aggregate(units: list[e.DocumentUnit]) -> str:
     return content_hash_aggregate(unit.content_hash for unit in units)
 
 
 def _structure_hash_aggregate(units: list[e.DocumentUnit]) -> str:
-    return _sha256_prefixed(
-        "\n".join(unit.structure_hash or "" for unit in sorted(units, key=lambda item: item.order_index))
+    return structure_hash_aggregate(
+        unit.structure_hash or ""
+        for unit in sorted(units, key=lambda item: item.order_index)
     )
-
-
-def _sha256_prefixed(payload: str) -> str:
-    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()

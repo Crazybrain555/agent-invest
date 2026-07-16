@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Annotated, Any, NoReturn
 
 from sqlalchemy import text
@@ -41,6 +40,7 @@ from disclosure_anchor.domain.services.unit_hashing import (
     canonical_json,
     sha256_prefixed,
 )
+from disclosure_anchor.domain.value_objects.semantic_key import is_valid_semantic_key
 
 try:
     from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -136,6 +136,7 @@ def _semantic_key_list_query_default() -> Any:
     if Query is None:  # pragma: no cover
         return None
     return Query(
+        max_length=8192,
         pattern=(
             r"^ *[a-z][a-z0-9_]{0,127} *"
             r"(?:, *[a-z][a-z0-9_]{0,127} *)*$"
@@ -396,6 +397,9 @@ def _unit_where(filters: UnitFilters) -> tuple[list[str], dict[str, Any]]:
     params: dict[str, Any] = {}
     _add_filter(where, params, "payload_kind", filters.payload_kind)
     if filters.semantic_key is not None:
+        # Preserve the v1 recall contract: the compatibility scalar parameter
+        # also finds a key that is secondary inside semantic_keys. Explicit
+        # any/all parameters add set semantics without narrowing v1.
         where.append(
             "(u.semantic_key = :semantic_key OR "
             "u.semantic_keys ? :semantic_key)"
@@ -432,6 +436,8 @@ def _validate_semantic_key_list(field: str, value: str | None) -> list[str] | No
     if value is None:
         return None
     raw_items = value.split(",")
+    if len(raw_items) > 50:
+        raise validation_error(field, "must contain at most 50 keys")
     # The public contract permits optional ASCII spaces around comma-separated
     # keys.  Do not let str.strip() silently normalize tabs/newlines or other
     # controls that the OpenAPI pattern intentionally rejects.
@@ -441,20 +447,15 @@ def _validate_semantic_key_list(field: str, value: str | None) -> list[str] | No
             field, "must contain only non-empty comma-separated keys"
         )
     deduplicated = list(dict.fromkeys(items))
-    if len(deduplicated) > 50:
-        raise validation_error(field, "must contain at most 50 keys")
     for item in deduplicated:
         _validate_semantic_key(field, item)
     return deduplicated
 
 
-_SEMANTIC_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$", re.ASCII)
-
-
 def _validate_semantic_key(field: str, value: str | None) -> str | None:
     if value is None:
         return None
-    if _SEMANTIC_KEY_RE.fullmatch(value) is None:
+    if not is_valid_semantic_key(value):
         raise validation_error(
             field,
             "each key must be 1-128 lowercase ASCII letters, digits, or underscores "

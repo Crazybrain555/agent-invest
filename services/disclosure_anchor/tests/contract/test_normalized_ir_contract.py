@@ -1,4 +1,4 @@
-"""NormalizedIR v2 contract checks."""
+"""Versioned NormalizedIR contract checks."""
 
 import copy
 import json
@@ -15,9 +15,20 @@ from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
 from disclosure_anchor.adapters.parsers.mineru.table_reconciler import (
     TableReconciliationStats,
 )
+from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation import (
+    validate_table_reconciliation_diagnostics,
+    validate_table_reconciliation_payload,
+)
+from disclosure_anchor.application.contracts.normalized_ir import (
+    NormalizedIRVersionError,
+    validate_normalized_ir_contract,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCHEMA_PATH = REPO_ROOT / "contracts" / "normalized_ir" / "normalized_ir.v2.json"
+SCHEMA_PATHS = {
+    version: REPO_ROOT / "contracts" / "normalized_ir" / f"{version}.json"
+    for version in ("normalized_ir.v2", "normalized_ir.v3")
+}
 PHASE00_ROOT = REPO_ROOT / "tests" / "fixtures" / "phase00"
 CLEAN_CHECKOUT_SAMPLE_KEYS = (
     "annual_report_excerpt",
@@ -49,17 +60,18 @@ def _table_elements(payload: dict) -> list[dict]:
 
 
 class NormalizedIRContractTests(unittest.TestCase):
-    def _schema(self) -> dict:
-        return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    def _schema(self, version: str = "normalized_ir.v3") -> dict:
+        return json.loads(SCHEMA_PATHS[version].read_text(encoding="utf-8"))
 
-    def _validator(self) -> Draft202012Validator:
-        schema = self._schema()
+    def _validator(self, version: str) -> Draft202012Validator:
+        schema = self._schema(version)
         Draft202012Validator.check_schema(schema)
         return Draft202012Validator(schema, format_checker=FormatChecker())
 
     def _assert_valid(self, payload: dict, *, label: str) -> None:
+        version = str(payload.get("contract_version") or "normalized_ir.v3")
         errors = sorted(
-            self._validator().iter_errors(payload),
+            self._validator(version).iter_errors(payload),
             key=lambda error: list(error.path),
         )
         if errors:
@@ -70,8 +82,9 @@ class NormalizedIRContractTests(unittest.TestCase):
             self.fail(details)
 
     def _assert_invalid(self, payload: dict, *, label: str, path: tuple[str, ...]) -> None:
+        version = str(payload.get("contract_version") or "normalized_ir.v3")
         errors = sorted(
-            self._validator().iter_errors(payload),
+            self._validator(version).iter_errors(payload),
             key=lambda error: list(error.path),
         )
         if not any(tuple(error.path) == path for error in errors):
@@ -120,6 +133,87 @@ class NormalizedIRContractTests(unittest.TestCase):
             self._assert_valid(data, label=sample_key)
             self.assertGreater(len(data["elements"]), 0, sample_key)
 
+    def test_current_mapper_output_is_v3_only(self) -> None:
+        current = MinerUToNormalizedIRMapper().map_content_list(
+            content_list=[{"type": "text", "text": "正文", "page_idx": 0}],
+            parser_info=MinerUParserInfo(
+                name="MinerU",
+                package_version="3.4.0",
+                backend="pipeline",
+                method="auto",
+                language="ch",
+                formula=False,
+                table=True,
+            ),
+            document_metadata={
+                "document_id": "v3_contract_probe",
+                "source_pdf": "raw/probe.pdf",
+                "title": "probe",
+            },
+            parser_artifacts={
+                "artifact_root_relpath": "parser_artifacts/probe",
+                "content_list_relpath": "parser_artifacts/probe/content.json",
+            },
+        )
+
+        self._assert_valid(current, label="current_v3")
+        v2_errors = list(self._validator("normalized_ir.v2").iter_errors(current))
+        self.assertTrue(
+            any(tuple(error.path) == ("contract_version",) for error in v2_errors)
+        )
+
+    def test_v3_rejects_legacy_native_shadow_fields(self) -> None:
+        current = _load_fixture("short_announcement")
+        current["contract_version"] = "normalized_ir.v3"
+        current["native_text"] = {
+            "status": "empty",
+            "extractor": {"name": "legacy", "version": "1"},
+            "content_hash": "sha256:" + "0" * 64,
+            "non_whitespace_chars": 0,
+            "pages": [],
+        }
+        current["parser_diagnostics"] = {
+            "native_text_shadow": {"status": "empty", "error_code": None}
+        }
+
+        self._assert_invalid(
+            current,
+            label="v3_rejects_native_text",
+            path=(),
+        )
+        without_root_shadow = copy.deepcopy(current)
+        del without_root_shadow["native_text"]
+        self._assert_invalid(
+            without_root_shadow,
+            label="v3_rejects_native_text_diagnostic",
+            path=("parser_diagnostics",),
+        )
+
+    def test_runtime_contract_rejects_invalid_element_identities(self) -> None:
+        for label, mutate in (
+            (
+                "negative_order",
+                lambda value: value["elements"][0].update({"order_index": -1}),
+            ),
+            (
+                "boolean_source_index",
+                lambda value: value["elements"][0].update(
+                    {"source_item_index": True}
+                ),
+            ),
+            (
+                "duplicate_ir_id",
+                lambda value: value["elements"][1].update(
+                    {"ir_id": value["elements"][0]["ir_id"]}
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                payload = _load_fixture("annual_report_excerpt")
+                mutate(payload)
+                with self.assertRaises(NormalizedIRVersionError):
+                    validate_normalized_ir_contract(payload)
+
     def test_optional_native_text_shadow_validates_strict_shape(self) -> None:
         data = _load_fixture("ir_activity")
         data["native_text"] = {
@@ -148,6 +242,7 @@ class NormalizedIRContractTests(unittest.TestCase):
         self,
     ) -> None:
         data = _load_fixture("annual_report_excerpt")
+        data["contract_version"] = "normalized_ir.v3"
         data["parser_artifacts"]["model_relpath"] = (
             "parser_artifacts/sample/sample_model.json"
         )
@@ -160,7 +255,8 @@ class NormalizedIRContractTests(unittest.TestCase):
                 uniquely_matched_tables=2,
                 candidate_groups=1,
                 proven_groups=1,
-                restoration_rejected_groups=1,
+                locator_only_groups=1,
+                locator_only_tables=2,
                 located_groups=1,
                 located_tables=2,
             ).as_dict()
@@ -175,10 +271,40 @@ class NormalizedIRContractTests(unittest.TestCase):
                 ],
                 "model_table_indices": [0, 1],
                 "continuation_source_item_indices": [table["source_item_index"] + 1],
-                "table_locator_algorithm": "mineru-aggregate-table-restore.v3",
+                "table_locator_algorithm": "mineru-aggregate-table-locator.v4",
             }
         )
         self._assert_valid(data, label="table_reconciliation")
+
+        # normalized_ir.v2 already published restore.v3 diagnostics before
+        # locator-only v4. Keep that structural shape schema-readable even
+        # though BuildUnits classifies it as requiring a fresh parse.
+        legacy = copy.deepcopy(data)
+        legacy["contract_version"] = "normalized_ir.v2"
+        legacy["parser_diagnostics"]["table_reconciliation"] = {
+            "algorithm_version": "mineru-aggregate-table-restore.v3",
+            "table_builder_semantics_version": "table-builder-semantics.v2",
+            "model_status": "supported",
+            "model_hash": "sha256:" + "a" * 64,
+            "content_tables": 2,
+            "model_tables": 2,
+            "uniquely_matched_tables": 2,
+            "ambiguous_matches": 0,
+            "candidate_groups": 1,
+            "proven_groups": 1,
+            "unproven_groups": 0,
+            "restoration_rejected_groups": 1,
+            "unresolved_groups": 1,
+            "located_groups": 1,
+            "located_tables": 2,
+            "restored_groups": 0,
+            "restored_tables": 0,
+        }
+        legacy_table = _table_elements(legacy)[0]
+        legacy_table["table_locator_algorithm"] = (
+            "mineru-aggregate-table-restore.v3"
+        )
+        self._assert_valid(legacy, label="legacy_restore_v3")
 
         element_index = data["elements"].index(table)
         for field in (
@@ -239,6 +365,7 @@ class NormalizedIRContractTests(unittest.TestCase):
         self,
     ) -> None:
         data = _load_fixture("annual_report_excerpt")
+        data["contract_version"] = "normalized_ir.v3"
         stats = TableReconciliationStats(
             model_status="absent", content_tables=2
         ).as_dict()
@@ -253,6 +380,172 @@ class NormalizedIRContractTests(unittest.TestCase):
                 "restored_groups",
             ),
         )
+
+    def test_runtime_reconciliation_validator_enforces_cross_field_formulas(
+        self,
+    ) -> None:
+        valid = TableReconciliationStats(
+            model_status="supported",
+            content_tables=2,
+            model_hash="sha256:" + "a" * 64,
+            model_tables=2,
+            uniquely_matched_tables=2,
+            candidate_groups=1,
+            proven_groups=1,
+            locator_only_groups=1,
+            locator_only_tables=2,
+            located_groups=1,
+            located_tables=2,
+        ).as_dict()
+        validate_table_reconciliation_diagnostics(valid)
+
+        for field, invalid_value in (
+            ("algorithm_version", 3),
+            ("unresolved_groups", 1),
+            ("restored_groups", 1),
+            ("uniquely_matched_tables", 1),
+        ):
+            with self.subTest(field=field):
+                invalid = copy.deepcopy(valid)
+                invalid[field] = invalid_value
+                with self.assertRaises(ValueError):
+                    validate_table_reconciliation_diagnostics(invalid)
+
+        shared_model = {
+            **TableReconciliationStats(
+                model_status="supported",
+                content_tables=2,
+                model_hash="sha256:" + "b" * 64,
+                model_tables=1,
+            ).as_dict(),
+            "ambiguous_matches": 2,
+        }
+        validate_table_reconciliation_diagnostics(shared_model)
+        for model_tables, ambiguous_matches in ((0, 1), (1, 1)):
+            invalid = {
+                **shared_model,
+                "model_tables": model_tables,
+                "ambiguous_matches": ambiguous_matches,
+            }
+            with self.assertRaises(ValueError):
+                validate_table_reconciliation_diagnostics(invalid)
+
+    def test_runtime_reconciliation_validator_binds_locators_to_elements(
+        self,
+    ) -> None:
+        algorithm = "mineru-aggregate-table-locator.v4"
+        stats = TableReconciliationStats(
+            model_status="supported",
+            content_tables=2,
+            model_hash="sha256:" + "c" * 64,
+            model_tables=2,
+            uniquely_matched_tables=2,
+            candidate_groups=1,
+            proven_groups=1,
+            locator_only_groups=1,
+            locator_only_tables=2,
+            located_groups=1,
+            located_tables=2,
+        ).as_dict()
+        payload = {
+            "elements": [
+                {
+                    "kind": "table",
+                    "raw_kind": "table",
+                    "source_item_index": 0,
+                    "page_no": 1,
+                    "bbox": [0, 0, 10, 10],
+                    "table_html": "<table><tr><td>A</td></tr></table>",
+                    "table": {"headers": [], "rows": [["A"]]},
+                    "page_span": [1, 2],
+                    "page_bboxes": [
+                        {"page_no": 1, "bbox": [0, 0, 10, 10]},
+                        {"page_no": 2, "bbox": [0, 0, 10, 10]},
+                    ],
+                    "model_table_indices": [0, 1],
+                    "continuation_source_item_indices": [1],
+                    "table_locator_algorithm": algorithm,
+                },
+                {
+                    "kind": "table",
+                    "raw_kind": "table",
+                    "source_item_index": 1,
+                    "page_no": 2,
+                    "bbox": [0, 0, 10, 10],
+                    "table_html": "",
+                    "table": {"headers": [], "rows": []},
+                },
+            ],
+            "parser_diagnostics": {"table_reconciliation": stats},
+        }
+        validate_table_reconciliation_payload(payload)
+
+        variants = {
+            "missing_diagnostics": {key: value for key, value in payload.items() if key != "parser_diagnostics"},
+            "null_diagnostics": {**payload, "parser_diagnostics": None},
+            "null_reconciliation": {
+                **payload,
+                "parser_diagnostics": {"table_reconciliation": None},
+            },
+            "content_count": {
+                **payload,
+                "parser_diagnostics": {
+                    "table_reconciliation": {**stats, "content_tables": 3}
+                },
+            },
+            "model_index_out_of_range": {
+                **payload,
+                "elements": [
+                    {**payload["elements"][0], "model_table_indices": [0, 2]},
+                    payload["elements"][1],
+                ],
+            },
+            "continuation_not_empty_table": {
+                **payload,
+                "elements": [
+                    payload["elements"][0],
+                    {**payload["elements"][1], "kind": "text"},
+                ],
+            },
+            "boolean_root_page": {
+                **payload,
+                "elements": [
+                    {**payload["elements"][0], "page_no": True},
+                    payload["elements"][1],
+                ],
+            },
+            "non_string_root_html": {
+                **payload,
+                "elements": [
+                    {**payload["elements"][0], "table_html": 7},
+                    payload["elements"][1],
+                ],
+            },
+            "missing_root_grid": {
+                **payload,
+                "elements": [
+                    {
+                        key: value
+                        for key, value in payload["elements"][0].items()
+                        if key != "table"
+                    },
+                    payload["elements"][1],
+                ],
+            },
+            "nonempty_ghost_grid": {
+                **payload,
+                "elements": [
+                    payload["elements"][0],
+                    {
+                        **payload["elements"][1],
+                        "table": {"headers": [], "rows": [["ghost"]]},
+                    },
+                ],
+            },
+        }
+        for label, invalid in variants.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_table_reconciliation_payload(invalid)
 
     def test_native_text_shadow_diagnostic_validates(self) -> None:
         data = _load_fixture("short_announcement")
@@ -395,7 +688,7 @@ class NormalizedIRContractTests(unittest.TestCase):
             },
         )
         self._assert_valid(normalized, label="synthetic_mapper")
-        self.assertEqual(normalized["contract_version"], "normalized_ir.v2")
+        self.assertEqual(normalized["contract_version"], "normalized_ir.v3")
         self.assertEqual(normalized["elements"][0]["raw_kind"], "text")
         self.assertEqual(normalized["elements"][1]["kind"], "table")
         self.assertEqual(

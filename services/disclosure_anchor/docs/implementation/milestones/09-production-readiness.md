@@ -77,8 +77,9 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
   - 修法：Update §5.2 to list four payload kinds (or say "three content kinds plus mixed composition, see §6.5") and change the v0.7 wording to v0.8 so the canonical contract is internally consistent.
 - [ ] (S/DOCS/CONTRACT DRIFT) **Canonical query-key list omits semantic_keys / applicability / page_no, which 0010/0013 made first-c**
   - 修法：Add semantic_keys, applicability, page_no to the frontmatter query_keys and §12 entrance list (with a note that mixed-unit recall requires semantic_keys), and state explicitly which keys are Filing-API filters vs DB-view-only predicates.
-- [ ] (S/DOCS/CONTRACT DRIFT) **service-purpose §12.1 pins the document_units_v1 full column set at "32 列 (04R-R7)" — actual view ha**
-  - 修法：Update §12.1 to the 36-column reality (or to "04R-R7 32 列 + 0010/0011/0013 增量，全集以 contract-checklist 为准") and mention the 0010-0013 additions the way 0007/0008 are documented today.
+- [x] (S/DOCS/CONTRACT DRIFT) **service-purpose 的 document_units_v1 列数已对齐当前契约。**
+  - 2026-07-16：service-purpose/data-dictionary/milestone 06/postgres AGENTS 统一为当前 41 列；
+    32/36 只保留为历史迁移口径，全集以 contract-checklist §2 为准。
 - [ ] (S/DOCS/CONTRACT DRIFT) **0012's document_category public contract (document_categories_v1 view + document_category.v1.json) i**
   - 修法：Add document_category to service-purpose (frontmatter core/optional objects, §5 or §12.1: provider-native category dimension, facet semantics, relationship to the 9-value filing_type vocabulary) matching contract-checklist lines 81-84.
 - [ ] (S/DOCS/CONTRACT DRIFT) **Migration freeze policy is inconsistent across docs (frozen frontier stated as 0001-0006, 0001-0007,**

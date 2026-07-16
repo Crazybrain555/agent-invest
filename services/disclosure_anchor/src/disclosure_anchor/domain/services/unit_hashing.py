@@ -9,12 +9,19 @@ import json
 from typing import Any
 
 
-_MIXED_PART_ANNOTATION_FIELDS = (
+_MIXED_PART_CONTENT_EXCLUDED_FIELDS = (
+    "order",
     "heading_path",
     "local_heading",
     "applicability",
     "quality_status",
     "artifact_locator",
+)
+_MIXED_PART_QUERY_FIELDS = (
+    "heading_path",
+    "local_heading",
+    "applicability",
+    "quality_status",
 )
 
 
@@ -26,11 +33,19 @@ class UnitHashes:
 
 
 def canonical_json(value: dict[str, Any]) -> str:
+    """Serialize the service's deterministic JSON hash profile.
+
+    This is intentionally the existing Python JSON profile, not a claim of
+    RFC 8785/JCS compatibility.  Non-finite floats are rejected because they
+    are not valid JSON and PostgreSQL jsonb cannot persist the same value.
+    """
+
     return json.dumps(
         value,
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),
+        allow_nan=False,
     )
 
 
@@ -46,6 +61,12 @@ def content_hash_aggregate(content_hashes: Iterable[str]) -> str:
     """
 
     return sha256_prefixed("\n".join(sorted(content_hashes)))
+
+
+def structure_hash_aggregate(structure_hashes: Iterable[str]) -> str:
+    """Run-level ordered aggregate over canonical unit structure hashes."""
+
+    return sha256_prefixed("\n".join(structure_hashes))
 
 
 def content_hash(*, payload_kind: str, payload: dict[str, Any]) -> str:
@@ -137,32 +158,22 @@ def mixed_part_annotations(
     return {
         "semantic_type": payload.get("semantic_type"),
         "parts": [
-            {
-                field: part[field]
-                for field in _MIXED_PART_ANNOTATION_FIELDS
-                if field in part
-            }
+            {field: part[field] for field in _MIXED_PART_QUERY_FIELDS if field in part}
             for part in parts
         ],
     }
 
 
-def _content_payload(
-    *, payload_kind: str, payload: dict[str, Any]
-) -> dict[str, Any]:
+def _content_payload(*, payload_kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     if payload_kind != "mixed":
         return payload
     parts = _mixed_parts(payload)
-    content = {
-        key: value
-        for key, value in payload.items()
-        if key != "semantic_type"
-    }
+    content = {key: value for key, value in payload.items() if key != "semantic_type"}
     content["parts"] = [
         {
             key: value
             for key, value in part.items()
-            if key not in {"order", *_MIXED_PART_ANNOTATION_FIELDS}
+            if key not in _MIXED_PART_CONTENT_EXCLUDED_FIELDS
         }
         for part in parts
     ]
@@ -171,8 +182,10 @@ def _content_payload(
 
 def _mixed_parts(payload: dict[str, Any]) -> list[dict[str, Any]]:
     parts = payload.get("parts")
-    if not isinstance(parts, list) or not parts or any(
-        not isinstance(part, dict) for part in parts
+    if (
+        not isinstance(parts, list)
+        or not parts
+        or any(not isinstance(part, dict) for part in parts)
     ):
         raise ValueError("mixed payload parts must be a non-empty list of objects")
     return parts

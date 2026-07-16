@@ -40,7 +40,7 @@ delivers_to: milestone 06
 content_hash          = "sha256:" + sha256(canonical_json({payload_kind, content_payload}))
                         纯内容身份。不含 title/heading_path/order_index/semantic_key(s)/
                         applicability/quality/artifact_locator；mixed 另排除 semantic_type、part order、
-                        local_heading/heading_path/applicability/quality_status 等规则注解
+                        local_heading/heading_path/applicability/quality_status/artifact_locator 等规则与位置注解
 query_projection_hash = "sha256:" + sha256(canonical_json({payload_kind, title,
                         heading_path, semantic_key, semantic_keys, quality_status,
                         applicability[, mixed_part_annotations]}))
@@ -128,8 +128,10 @@ processing_run_published payload = {previous_processing_run_id|null, content_has
 输入：`document_id`（找其最新 succeeded parse run）或显式 `processing_run_id`。
 前置校验错误码闭集（沿用 04R 结构化错误 JSON 形状，stage='build_units'，retryable=false）：
 `RUN_NOT_FOUND`（run 不存在）/ `RUN_NOT_SUCCEEDED` / `IR_MISSING`（normalized_ir_relpath
-缺失或不可读）/ `IR_CONTRACT_TOO_OLD`（contract_version 非 normalized_ir.v2，指引重新 parse）/
-`IR_TABLE_BUILDER_SEMANTICS_MISMATCH`（表恢复证明与当前 S5 语义版本不兼容，必须重新 parse）/
+缺失或不可读）/ `IR_HASH_MISMATCH`（derived IR 与 run 记录的 artifact hash 不一致）/
+`IR_CONTRACT_TOO_OLD`（contract_version 非 normalized_ir.v2，指引重新 parse）/
+`IR_TABLE_RECONCILIATION_INVALID`（聚合表 locator 诊断、元素或跨对象计数不可能）/
+`IR_TABLE_RECONCILIATION_ALGORITHM_MISMATCH`（聚合表 locator 算法版本不兼容，必须重新 parse）/
 `UNITS_ALREADY_BUILT`（该 run 已有 unit——unit 不可变，重建走新 run）。
 
 按序七个阶段（每阶段独立纯函数，输入输出可单测）：
@@ -725,11 +727,11 @@ ub-2026.07-9 代并 prune；门禁全绿。
 - **真实回放结果**：`1218099701` 从 10/15 恢复为 15/15；`1223071887` Q1/Q11 的
   `美的|系`、`水冷|型` 跨页断词完整拼回；三份复杂发布会中 tokenizer 产生的 20 个裸
   `问题` 只在其后紧接已证明 outer Q 时丢弃，不改变原 question set。当前规则代为
-  `ub-2026.07-37`（当前上线目标代见下一节 `ub-2026.07-52`）。
+  `ub-2026.07-37`（当前上线目标代见下文 `ub-2026.07-53`）。
 
 ### ub-2026.07-38 〜 -52（2026-07-15：全库根因审计与可检索证据闭环）
 
-- **MinerU 聚合表恢复 v3**：根因是 MinerU `content_list` 把跨页表聚合到首个 carrier、后页留下
+- **MinerU 聚合表恢复 v3（历史，已由 -53 的 locator-only v4 取代）**：根因是 MinerU `content_list` 把跨页表聚合到首个 carrier、后页留下
   空 ghost，而 model artifact 仍保留逐页表。reconciler 只有在同页 bbox 唯一、逻辑 cell 串接
   精确相等、列宽一致、续页无 `<th>`/caption/footnote 且 carrier 间仅有可证明 furniture 时才恢复；
   受控报表标题只作否决护栏，不能补足正向证据。v3 进一步把统计公式、专用 S5 语义代、
@@ -748,8 +750,8 @@ ub-2026.07-9 代并 prune；门禁全绿。
   独立 marker 再进入既有适用性状态机，标题不再携带勾选噪声；签章之后、以 `附件:` caption
   开始并连续跨页的终端表只在窄证据成立时重锚到文档根，普通正文内附件仍保持所在业务作用域。
 - **语义与检索不变量**：所有新 unit 均满足 `semantic_key IS NOT NULL`、`semantic_keys` 为非空
-  数组且 scalar 属于 array；无窄键统一为 `document_content`。Filing API 的 scalar 参数匹配
-  scalar 或数组成员，另提供 comma-list 的 any/all 过滤。
+  数组且 scalar 属于 array；无窄键统一为 `document_content`。Filing API 的 scalar 参数保持
+  scalar 精确语义，跨 primary/secondary key 召回使用 comma-list 的 any/all 过滤。
 - **全量离线重放**：截至 -48 对 1,371 份现有 raw artifact（13 公司、21 个 active 文类）完成
   content_list→reconciler→IR→builder 重放：39,005 units、0 build errors、0 semantic 空值、0 超过
   50k 字符的 unit；264/264 个首屏唯一公告号均可精确搜索且只出现一次。-49 只修复上述 4 个
@@ -761,10 +763,36 @@ ub-2026.07-9 代并 prune；门禁全绿。
   KV 标点时恢复叶子。真实 `1225087169` 的财务担保合同因此从错误继承
   `financial_instrument_risk` 收敛为 `guarantee`；两份格力英文年报的同构叶子一并恢复。
   MinerU list 内的 `①/②/2）` 另保持 mapper 字符守恒后的粗粒度文本；不为一句条款新造碎 unit。
-- **-52 parser→builder 语义握手**：表恢复证明记录独立的
+- **-52 parser→builder 语义握手（历史版本）**：表恢复证明记录独立的
   `table-builder-semantics.v2`；BuildUnits 对任何带 aggregate-table reconciliation 诊断的 IR
   fail-loud 校验该版本，不匹配即要求重 parse。它不绑定整个 `RULES_VERSION`，普通标题、QA、
   semantic 规则升级仍可走 5 秒级 `rebuild-units`，只有 S5 重并或结构页眉否决语义变化才重解析。
+
+### ub-2026.07-53（2026-07-16：跨页逻辑表 locator-only 与契约闭环）
+
+- **v4 不再物理恢复**：expanded grid 相等并不能证明最终 unit 相等，因为 native form recovery、
+  footer 重挂和 S5 边界会观察物理 carrier。`mineru-aggregate-table-locator.v4` 对 proven
+  aggregate+ghost group 永远保留原 `table_body` 和 empty ghosts，只在 root 写连续 page span、
+  每页 bbox、model indices 与 continuation indices。`1217576500` 的 11 页附件表因此保持一个
+  339 行逻辑表；逐页 model 合计 349 行，多出的正好是 10 次重复表头。完整 locator 同时保留
+  11 个页面 bbox，不再把证据切成 page-local 碎片。
+- **算法边界与跨对象校验**：diagnostics 新增 `locator_only_groups/tables`。BuildUnits 先把
+  语法合法的旧 restore/locator algorithm 分类为 `ALGORITHM_MISMATCH`，再校验当前 v4 的统计恒等式、locator root/table
+  数、model index 范围/全局唯一、continuation ghost、页序/bbox 与 content table count；
+  locator 没有 diagnostics 也 fail loud。v4 只记录 parser provenance，不改变 carrier、unit 或 hash，
+  因此不再绑定 S5/RULES_VERSION；旧 v3/v2 IR 仍必须重新 parse，不能仅 rebuild units。
+- **full-grid 坐标与 footer**：headerless 表先删除空行并 remap merged spans，再提升首个非空行；
+  repeated header 若有 rowspan 跨越删除边界则不抑制。`merged_cells` 始终相对最终
+  `[headers, *rows]`；mixed 每个 part 保存自己的 `artifact_locator`。全语料 29,022 张表中
+  32 张命中 leading-blank 修复，32/32 坐标有效；投关 footer 判定改读 full grid，单行日期与
+  sparse 附件字段不再错挂到“主要交流问题”；日期值必须含数字或中文数字日期结构，
+  `月度收入/报告日余额/日均营业收入/当日收盘价` 等业务列不会再触发 footer 重锚。
+- **一次性 mixed hash-domain 迁移**：mixed payload 会保存规则/位置注解，但 content hash 只对
+  去注解的 canonical content projection 计算；query projection 继续包含这些注解。首次从旧
+  whole-payload hash 重建到本版本时，既有 mixed unit 会产生一次 materialized
+  `document_unit_removed/created`，这是身份域修正而非 PDF 内容变化。L2 消费者必须按 change
+  feed 撤销旧 asset_id、刷新/重放对应 mixed 证据；完成一次迁移后，同内容只改路径/locator
+  走 projection change，不再伪造内容变化。
 
 ## 9. 明确不做
 

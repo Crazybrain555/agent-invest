@@ -7,11 +7,16 @@ import unittest
 from disclosure_anchor.application.use_cases.publish_run import (
     PublishRun,
     PublishRunCommand,
+    _validate_candidate_unit_set,
     diff_units,
 )
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.errors import PublishRunError
-from disclosure_anchor.domain.services.unit_hashing import compute_unit_hashes
+from disclosure_anchor.domain.services.unit_hashing import (
+    compute_unit_hashes,
+    content_hash_aggregate,
+    structure_hash_aggregate,
+)
 from tests.unit._fakes import FakeUnitOfWork
 
 
@@ -19,32 +24,52 @@ def _unit(
     asset_id: str,
     run_id: str,
     *,
-    content_hash: str = "sha256:content",
+    content_hash: str | None = None,
     order_index: int = 1,
     title: str | None = "标题",
     heading_path: list[str] | None = None,
-    semantic_key: str | None = None,
+    semantic_key: str | None = "document_content",
     semantic_keys: list[str] | None = None,
     quality_status: str = "ok",
-    query_projection_hash: str = "sha256:projection",
+    query_projection_hash: str | None = None,
+    structure_hash: str | None = None,
     applicability: str | None = None,
     payload_kind: str = "text",
     payload: dict[str, object] | None = None,
 ) -> e.DocumentUnit:
+    resolved_payload = payload or {"text": asset_id}
+    resolved_heading_path = heading_path or ["第一节"]
+    resolved_semantic_keys = (
+        [semantic_key]
+        if semantic_keys is None and semantic_key is not None
+        else semantic_keys
+    )
+    hashes = compute_unit_hashes(
+        payload_kind=payload_kind,
+        payload=resolved_payload,
+        title=title,
+        heading_path=resolved_heading_path,
+        semantic_key=semantic_key,
+        semantic_keys=resolved_semantic_keys,
+        quality_status=quality_status,
+        order_index=order_index,
+        applicability=applicability,
+    )
     return e.DocumentUnit(
         asset_id=asset_id,
         document_id="doc_1",
         processing_run_id=run_id,
         payload_kind=payload_kind,
         order_index=order_index,
-        payload=payload or {"text": asset_id},
-        content_hash=content_hash,
+        payload=resolved_payload,
+        content_hash=content_hash or hashes.content_hash,
         title=title,
-        heading_path=heading_path or ["第一节"],
+        heading_path=resolved_heading_path,
         semantic_key=semantic_key,
-        semantic_keys=semantic_keys,
+        semantic_keys=resolved_semantic_keys,
         quality_status=quality_status,
-        query_projection_hash=query_projection_hash,
+        query_projection_hash=(query_projection_hash or hashes.query_projection_hash),
+        structure_hash=structure_hash or hashes.structure_hash,
         applicability=applicability,
     )
 
@@ -53,8 +78,8 @@ def _run(
     run_id: str,
     *,
     active: bool = False,
-    content_hash_aggregate: str = "sha256:agg",
-    structure_hash: str = "sha256:structure",
+    content_hash_aggregate: str | None = None,
+    structure_hash: str | None = None,
 ) -> e.ProcessingRun:
     return e.ProcessingRun(
         processing_run_id=run_id,
@@ -63,8 +88,10 @@ def _run(
         status="succeeded",
         unit_build_status="succeeded",
         is_active=active,
-        content_hash_aggregate=content_hash_aggregate,
-        structure_hash=structure_hash,
+        content_hash_aggregate=(
+            content_hash_aggregate or content_hash_aggregate_for([])
+        ),
+        structure_hash=structure_hash or structure_hash_aggregate([]),
     )
 
 
@@ -74,14 +101,28 @@ def _uow_with_document() -> FakeUnitOfWork:
     return uow
 
 
+def content_hash_aggregate_for(units: list[e.DocumentUnit]) -> str:
+    return content_hash_aggregate(unit.content_hash for unit in units)
+
+
+def _sync_run_hashes(uow: FakeUnitOfWork, run_id: str) -> None:
+    units = uow.document_units.list_by_processing_run(run_id)
+    run = uow.processing_runs.get(run_id)
+    assert run is not None
+    run.content_hash_aggregate = content_hash_aggregate_for(units)
+    run.structure_hash = structure_hash_aggregate(
+        unit.structure_hash or ""
+        for unit in sorted(units, key=lambda item: item.order_index)
+    )
+
+
 class PublishRunTests(unittest.TestCase):
     def test_first_publish_creates_unit_events_then_published(self) -> None:
         uow = _uow_with_document()
         uow.processing_runs.add(_run("run_new"))
         uow.document_units.add(_unit("du_new_1", "run_new", order_index=1))
-        uow.document_units.add(
-            _unit("du_new_2", "run_new", content_hash="sha256:other", order_index=2)
-        )
+        uow.document_units.add(_unit("du_new_2", "run_new", order_index=2))
+        _sync_run_hashes(uow, "run_new")
 
         result = PublishRun(uow_factory=lambda: uow).execute(
             PublishRunCommand(processing_run_id="run_new")
@@ -90,7 +131,9 @@ class PublishRunTests(unittest.TestCase):
         self.assertEqual(result.created_count, 2)
         self.assertEqual(result.published_change_kind, "materialized")
         self.assertEqual(uow.documents.get("doc_1").status, "published")
-        self.assertEqual(uow.documents.get("doc_1").current_processing_run_id, "run_new")
+        self.assertEqual(
+            uow.documents.get("doc_1").current_processing_run_id, "run_new"
+        )
         events = sorted(uow.outbox.all(), key=lambda item: item.seq)
         self.assertEqual(
             [event.event_kind for event in events],
@@ -120,10 +163,12 @@ class PublishRunTests(unittest.TestCase):
 
     def test_multiset_duplicate_delete_removes_one_old_unit(self) -> None:
         old_units = [
-            _unit("du_old_1", "run_old", order_index=1),
-            _unit("du_old_2", "run_old", order_index=2),
+            _unit("du_old_1", "run_old", order_index=1, payload={"text": "same"}),
+            _unit("du_old_2", "run_old", order_index=2, payload={"text": "same"}),
         ]
-        new_units = [_unit("du_new_1", "run_new", order_index=1)]
+        new_units = [
+            _unit("du_new_1", "run_new", order_index=1, payload={"text": "same"})
+        ]
 
         diff = diff_units(old_units=old_units, new_units=new_units)
 
@@ -138,6 +183,7 @@ class PublishRunTests(unittest.TestCase):
                 order_index=1,
                 title="甲",
                 query_projection_hash="sha256:projection_a",
+                payload={"text": "same"},
             ),
             _unit(
                 "du_old_b",
@@ -145,6 +191,7 @@ class PublishRunTests(unittest.TestCase):
                 order_index=2,
                 title="乙",
                 query_projection_hash="sha256:projection_b",
+                payload={"text": "same"},
             ),
         ]
         new_units = [
@@ -154,6 +201,7 @@ class PublishRunTests(unittest.TestCase):
                 order_index=1,
                 title="乙",
                 query_projection_hash="sha256:projection_b",
+                payload={"text": "same"},
             ),
             _unit(
                 "du_new_a",
@@ -161,6 +209,7 @@ class PublishRunTests(unittest.TestCase):
                 order_index=2,
                 title="甲",
                 query_projection_hash="sha256:projection_a",
+                payload={"text": "same"},
             ),
         ]
 
@@ -177,6 +226,7 @@ class PublishRunTests(unittest.TestCase):
             title="原标题",
             semantic_key=None,
             query_projection_hash="sha256:old_projection",
+            payload={"text": "same"},
         )
         new = _unit(
             "du_new",
@@ -184,13 +234,17 @@ class PublishRunTests(unittest.TestCase):
             title="新标题",
             semantic_key="receivable_aging",
             query_projection_hash="sha256:new_projection",
+            payload={"text": "same"},
         )
 
         diff = diff_units(old_units=[old], new_units=[new])
 
         self.assertEqual(diff.created, [])
         self.assertEqual(diff.removed, [])
-        self.assertEqual(diff.projection_changed[0][2], ["title", "semantic_key"])
+        self.assertEqual(
+            diff.projection_changed[0][2],
+            ["title", "semantic_key", "semantic_keys"],
+        )
 
     def test_applicability_only_change_reports_changed_fields(self) -> None:
         # query_projection_hash includes applicability; a hash change with
@@ -200,12 +254,14 @@ class PublishRunTests(unittest.TestCase):
             "run_old",
             applicability=None,
             query_projection_hash="sha256:old_projection",
+            payload={"text": "same"},
         )
         new = _unit(
             "du_new",
             "run_new",
             applicability="not_applicable",
             query_projection_hash="sha256:new_projection",
+            payload={"text": "same"},
         )
 
         diff = diff_units(old_units=[old], new_units=[new])
@@ -219,9 +275,7 @@ class PublishRunTests(unittest.TestCase):
             payload_kind="mixed",
             payload={
                 "semantic_type": "section",
-                "parts": [
-                    {"kind": "text", "order": 1, "text": "正文"}
-                ],
+                "parts": [{"kind": "text", "order": 1, "text": "正文"}],
             },
             query_projection_hash="sha256:old_projection",
         )
@@ -307,39 +361,225 @@ class PublishRunTests(unittest.TestCase):
         diff = diff_units(old_units=[old], new_units=[new])
 
         self.assertEqual(old.content_hash, new.content_hash)
-        self.assertEqual(
-            diff.projection_changed[0][2], ["mixed_part_annotations"]
-        )
+        self.assertEqual(diff.projection_changed[0][2], ["mixed_part_annotations"])
 
-    def test_projection_hash_mismatch_without_field_change_fails_loudly(self) -> None:
+    def test_stale_stored_projection_hashes_do_not_create_a_change(self) -> None:
         old = _unit(
             "du_old",
             "run_old",
             query_projection_hash="sha256:stale_old",
+            payload={"text": "same"},
         )
         new = _unit(
             "du_new",
             "run_new",
             query_projection_hash="sha256:stale_new",
+            payload={"text": "same"},
         )
+
+        diff = diff_units(old_units=[old], new_units=[new])
+
+        self.assertEqual(diff.created, [])
+        self.assertEqual(diff.removed, [])
+        self.assertEqual(diff.projection_changed, [])
+
+    def test_diff_uses_canonical_payload_instead_of_stored_content_hash(self) -> None:
+        same_stored = "sha256:" + "a" * 64
+        old = _unit(
+            "du_old",
+            "run_old",
+            content_hash=same_stored,
+            payload={"text": "old"},
+        )
+        new = _unit(
+            "du_new",
+            "run_new",
+            content_hash=same_stored,
+            payload={"text": "new"},
+        )
+
+        diff = diff_units(old_units=[old], new_units=[new])
+
+        self.assertEqual([unit.asset_id for unit in diff.removed], ["du_old"])
+        self.assertEqual([unit.asset_id for unit in diff.created], ["du_new"])
+
+    def test_diff_ignores_stale_stored_content_hash_when_payload_matches(self) -> None:
+        old = _unit(
+            "du_old",
+            "run_old",
+            content_hash="sha256:" + "a" * 64,
+            payload={"text": "same"},
+        )
+        new = _unit(
+            "du_new",
+            "run_new",
+            content_hash="sha256:" + "b" * 64,
+            payload={"text": "same"},
+        )
+
+        diff = diff_units(old_units=[old], new_units=[new])
+
+        self.assertEqual(diff.created, [])
+        self.assertEqual(diff.removed, [])
+        self.assertEqual(diff.projection_changed, [])
+
+    def test_candidate_unit_hash_mismatch_fails_before_publish_mutation(self) -> None:
+        for field in ("content_hash", "query_projection_hash", "structure_hash"):
+            with self.subTest(field=field):
+                uow = _uow_with_document()
+                document = uow.documents.get("doc_1")
+                document.current_processing_run_id = "run_old"
+                document.status = "published"
+                uow.processing_runs.add(_run("run_old", active=True))
+                uow.processing_runs.add(_run("run_new"))
+                new_unit = _unit("du_new", "run_new")
+                uow.document_units.add(new_unit)
+                _sync_run_hashes(uow, "run_new")
+                setattr(new_unit, field, "sha256:" + "f" * 64)
+
+                with self.assertRaises(PublishRunError) as ctx:
+                    PublishRun(uow_factory=lambda: uow).execute(
+                        PublishRunCommand(processing_run_id="run_new")
+                    )
+
+                self.assertEqual(
+                    ctx.exception.error["error_code"], "RUN_UNIT_HASH_INVALID"
+                )
+                self.assertEqual(
+                    document.current_processing_run_id,
+                    "run_old",
+                )
+                self.assertTrue(uow.processing_runs.get("run_old").is_active)
+                self.assertFalse(uow.processing_runs.get("run_new").is_active)
+                self.assertEqual(uow.outbox.all(), [])
+
+    def test_candidate_aggregate_mismatch_fails_before_publish_mutation(self) -> None:
+        for field in ("content_hash_aggregate", "structure_hash"):
+            with self.subTest(field=field):
+                uow = _uow_with_document()
+                document = uow.documents.get("doc_1")
+                document.current_processing_run_id = "run_old"
+                document.status = "published"
+                uow.processing_runs.add(_run("run_old", active=True))
+                uow.processing_runs.add(_run("run_new"))
+                uow.document_units.add(_unit("du_new", "run_new"))
+                _sync_run_hashes(uow, "run_new")
+                setattr(
+                    uow.processing_runs.get("run_new"),
+                    field,
+                    "sha256:" + "e" * 64,
+                )
+
+                with self.assertRaises(PublishRunError) as ctx:
+                    PublishRun(uow_factory=lambda: uow).execute(
+                        PublishRunCommand(processing_run_id="run_new")
+                    )
+
+                self.assertEqual(
+                    ctx.exception.error["error_code"],
+                    "RUN_HASH_AGGREGATE_INVALID",
+                )
+                self.assertEqual(document.current_processing_run_id, "run_old")
+                self.assertTrue(uow.processing_runs.get("run_old").is_active)
+                self.assertFalse(uow.processing_runs.get("run_new").is_active)
+                self.assertEqual(uow.outbox.all(), [])
+
+    def test_candidate_semantic_invariant_is_rechecked_at_publish(self) -> None:
+        uow = _uow_with_document()
+        uow.processing_runs.add(_run("run_new"))
+        unit = _unit("du_new", "run_new")
+        unit.semantic_keys = []
+        hashes = compute_unit_hashes(
+            payload_kind=unit.payload_kind,
+            payload=unit.payload,
+            title=unit.title,
+            heading_path=unit.heading_path,
+            semantic_key=unit.semantic_key,
+            semantic_keys=unit.semantic_keys,
+            quality_status=unit.quality_status,
+            order_index=unit.order_index,
+            applicability=unit.applicability,
+        )
+        unit.content_hash = hashes.content_hash
+        unit.query_projection_hash = hashes.query_projection_hash
+        unit.structure_hash = hashes.structure_hash
+        uow.document_units.add(unit)
+        _sync_run_hashes(uow, "run_new")
 
         with self.assertRaises(PublishRunError) as ctx:
-            diff_units(old_units=[old], new_units=[new])
+            PublishRun(uow_factory=lambda: uow).execute(
+                PublishRunCommand(processing_run_id="run_new")
+            )
 
+        self.assertEqual(ctx.exception.error["error_code"], "RUN_UNIT_SEMANTIC_INVALID")
+        self.assertIsNone(uow.documents.get("doc_1").current_processing_run_id)
+        self.assertEqual(uow.outbox.all(), [])
+
+    def test_candidate_unit_set_invariants_are_closed(self) -> None:
+        cases = {
+            "duplicate_asset_id": [
+                _unit("du_same", "run_new", order_index=1),
+                _unit("du_same", "run_new", order_index=2),
+            ],
+            "processing_run_mismatch": [
+                _unit("du_new", "run_other", order_index=1)
+            ],
+            "document_mismatch": [_unit("du_new", "run_new", order_index=1)],
+            "order_index_not_contiguous": [
+                _unit("du_new", "run_new", order_index=2)
+            ],
+        }
+        cases["document_mismatch"][0].document_id = "doc_other"
+        for reason_code, units in cases.items():
+            with self.subTest(reason_code=reason_code):
+                with self.assertRaises(PublishRunError) as ctx:
+                    _validate_candidate_unit_set(run=_run("run_new"), units=units)
+
+                self.assertEqual(
+                    ctx.exception.error["error_code"], "RUN_UNIT_SET_INVALID"
+                )
+                self.assertEqual(ctx.exception.error["reason_code"], reason_code)
+
+    def test_candidate_order_invariant_fails_before_publish_mutation(self) -> None:
+        uow = _uow_with_document()
+        document = uow.documents.get("doc_1")
+        document.current_processing_run_id = "run_old"
+        document.status = "published"
+        uow.processing_runs.add(_run("run_old", active=True))
+        uow.processing_runs.add(_run("run_new"))
+        uow.document_units.add(_unit("du_new", "run_new", order_index=2))
+        _sync_run_hashes(uow, "run_new")
+
+        with self.assertRaises(PublishRunError) as ctx:
+            PublishRun(uow_factory=lambda: uow).execute(
+                PublishRunCommand(processing_run_id="run_new")
+            )
+
+        self.assertEqual(ctx.exception.error["error_code"], "RUN_UNIT_SET_INVALID")
         self.assertEqual(
-            ctx.exception.error["error_code"],
-            "QUERY_PROJECTION_HASH_MISMATCH",
+            ctx.exception.error["reason_code"], "order_index_not_contiguous"
         )
+        self.assertEqual(document.current_processing_run_id, "run_old")
+        self.assertTrue(uow.processing_runs.get("run_old").is_active)
+        self.assertFalse(uow.processing_runs.get("run_new").is_active)
+        self.assertEqual(uow.outbox.all(), [])
 
     def test_second_publish_event_order_and_observed_when_content_same(self) -> None:
         uow = _uow_with_document()
         document = uow.documents.get("doc_1")
         document.current_processing_run_id = "run_old"
         document.status = "published"
-        uow.processing_runs.add(_run("run_old", active=True, content_hash_aggregate="sha256:same"))
+        uow.processing_runs.add(
+            _run("run_old", active=True, content_hash_aggregate="sha256:same")
+        )
         uow.processing_runs.add(_run("run_new", content_hash_aggregate="sha256:same"))
-        uow.document_units.add(_unit("du_old", "run_old", order_index=1))
-        uow.document_units.add(_unit("du_new", "run_new", order_index=2))
+        uow.document_units.add(
+            _unit("du_old", "run_old", order_index=1, payload={"text": "same"})
+        )
+        uow.document_units.add(
+            _unit("du_new", "run_new", order_index=1, payload={"text": "same"})
+        )
+        _sync_run_hashes(uow, "run_new")
 
         result = PublishRun(uow_factory=lambda: uow).execute(
             PublishRunCommand(processing_run_id="run_new")
@@ -347,7 +587,9 @@ class PublishRunTests(unittest.TestCase):
 
         self.assertEqual(result.published_change_kind, "observed")
         events = sorted(uow.outbox.all(), key=lambda item: item.seq)
-        self.assertEqual([event.event_kind for event in events], ["processing_run_published"])
+        self.assertEqual(
+            [event.event_kind for event in events], ["processing_run_published"]
+        )
         self.assertEqual(events[0].change_kind, "observed")
         self.assertFalse(uow.processing_runs.get("run_old").is_active)
         self.assertTrue(uow.processing_runs.get("run_new").is_active)
@@ -357,10 +599,13 @@ class PublishRunTests(unittest.TestCase):
         document = uow.documents.get("doc_1")
         document.current_processing_run_id = "run_old"
         document.status = "published"
-        uow.processing_runs.add(_run("run_old", active=True, content_hash_aggregate="sha256:old"))
+        uow.processing_runs.add(
+            _run("run_old", active=True, content_hash_aggregate="sha256:old")
+        )
         uow.processing_runs.add(_run("run_new", content_hash_aggregate="sha256:new"))
-        uow.document_units.add(_unit("du_old", "run_old", content_hash="sha256:old"))
-        uow.document_units.add(_unit("du_new", "run_new", content_hash="sha256:new"))
+        uow.document_units.add(_unit("du_old", "run_old", payload={"text": "old"}))
+        uow.document_units.add(_unit("du_new", "run_new", payload={"text": "new"}))
+        _sync_run_hashes(uow, "run_new")
 
         result = PublishRun(uow_factory=lambda: uow).execute(
             PublishRunCommand(processing_run_id="run_new")
@@ -401,7 +646,9 @@ class PublishRunTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "published")
         event = uow.outbox.all()[0]
-        self.assertEqual(event.payload["allow_empty_reason"], "fixture intentionally empty")
+        self.assertEqual(
+            event.payload["allow_empty_reason"], "fixture intentionally empty"
+        )
 
 
 if __name__ == "__main__":

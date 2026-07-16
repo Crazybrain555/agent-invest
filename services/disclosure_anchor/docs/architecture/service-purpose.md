@@ -166,7 +166,8 @@ agent 运行时为了控制上下文长度，可以临时合并、截取或拆�
 
 L2 的上下文包与 L1 的持久化边界不得混为一谈：L1 按显式业务/受控科目边界保留可寻址
 证据，8k 仅是 mixed unit 的安全硬上限；L2 按最终模型 tokenizer 对渲染后的 prompt +
-sources 计数，并预留输出/工具开销。当前 1,371 份 active 语料呈双峰：1,292 份正文
+sources 计数，并预留输出/工具开销。ub-2026.07-48 的 1,371 份历史离线重放按展开表格字符
+估算时呈双峰：1,292 份正文
 不超过 40,000 字符，79 份年报/半年报从 103,354 到 388,948 字符，两组之间无样本。
 这只是 corpus 分层信号，不是 token 阈值：短文档在实际预算内可整篇，长文档用 12–20k
 token 的 section packs；超长表格另建 1.5–3k token 的连续行窗口，重复 caption/表头/路径且
@@ -518,7 +519,8 @@ artifact_locator（可选）
 一项议案、年报里的一个业务小节（研发投入、附注某科目）。payload 是有序 parts；每个
 part 的形状复用对应 kind 的 payload schema，另带 `kind`、`order`，以及可选的
 `local_heading`（相对 unit heading_path 的局部小标题）、`heading_path`（document 级
-坍缩时的完整路径）、`applicability`、`quality_status`。
+坍缩时的完整路径）、`applicability`、`quality_status`、`artifact_locator`。定位信息属于
+各 part，消费者不能只读取 mixed unit 顶层 locator。
 
 ```json
 {
@@ -592,27 +594,35 @@ part 的形状复用对应 kind 的 payload schema，另带 `kind`、`order`，�
 
 ## 7.2 artifact_locator
 
-`artifact_locator` 是可选的**技术位置**，用于回到 Markdown、JSON、HTML 或 parser artifact。
+`artifact_locator` 是可选的**技术位置**，用于回到 parser artifact 的真实页、bbox 与元素。
 
 它可以包含：
 
 ```text
-artifact_path
-artifact_unit_ref
 order_index
+page_no
+bbox
+page_span / page_bboxes
+model_table_indices / continuation_source_item_indices
+table_locator_algorithm
+merged_cells
 ```
 
 以江海股份 receivable_aging 单元为例（document 来自 CNINFO textid `1225087169`）：
 
 ```json
 {
-  "artifact_path": "artifacts/002484/1225087169/parsed.md",
-  "artifact_unit_ref": "table-receivable_aging",
-  "order_index": 312
+  "order_index": 312,
+  "page_no": 88,
+  "bbox": [91.0, 166.0, 906.0, 691.0],
+  "merged_cells": [{"row": 0, "col": 0, "rowspan": 2, "colspan": 1}]
 }
 ```
 
-它指回 parser 产物中该表所在位置，便于人工复核或重解析；但它不是 agent 的主查询键，也不要求使用 page 或 bbox。
+它指回 parser 产物中该表所在位置，便于人工复核或重解析。跨页 aggregate 表保持一个逻辑
+table，locator 用连续 `page_span`、逐页 `page_bboxes` 和 model/ghost 索引覆盖所有页面；
+`merged_cells` 坐标始终相对最终 `[headers, *rows]` full grid。mixed 中每个 part 可有自己的
+locator，unit 顶层 locator 不替代它；locator 不是 agent 的主查询键。
 
 ## 7.3 第一版追溯锚
 
@@ -899,7 +909,7 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 查询面说明：上述键在 `disclosure_public.*_v1` 视图上全部可作谓词（DB 直读满足全集）；
 Filing API 首版只暴露其中一部分为查询参数（documents：company_ref / security_code /
 filing_type / report_period / announcement_date_from,to / status；units：payload_kind /
-semantic_key（单值参数，匹配 scalar 列或 semantic_keys 数组成员）/ semantic_keys_any / semantic_keys_all / quality_status /
+semantic_key（单值参数，精确匹配 scalar 列）/ semantic_keys_any / semantic_keys_all / quality_status /
 heading_prefix），其余键经 DB 视图直读或后续 API 升版满足。
 
 全文关键词检索可以后加，但不是证据对象，也不要求向量化。
@@ -966,14 +976,15 @@ order_index
 `asset_kind`（常量 document_unit）、`observed_at`（= created_at 别名）、`source_tier`
 （按 §5.1 映射 CASE 派生）、`trace_level`（常量 G0）、`raw_file_hash`（join document）；
 另投影 `query_projection_hash`（document_unit 存储列，05-U2 查询投影哈希）——0007 新增共
-6 列，至 04R-R7 为 32 列。
+6 列，至 04R-R7 为 32 列（仅历史基线）。
 
 0008 迁移起，`processing_runs_v1` 投影 `builder_rules_version`，用于 05-U6 builder 规则
 归因；历史 run 可为 NULL，05 builder 成功落库的 run 必须等于当前 `rules.RULES_VERSION`。
 
-0010–0013 迁移起的 `document_units_v1` 增量列（列全集 = 04R-R7 的 32 列 +
-0010 `applicability`/`page_no` + 0011 `is_active_run` + 0013 `semantic_keys` = **36 列**，
-以 `docs/implementation/checks/contract-checklist.md` §2 为准）：
+0010–0016 迁移起的 `document_units_v1` 增量列使当前列全集达到 **41 列**：04R-R7 的
+32 列 + 0010 `applicability`/`page_no` + 0011 `is_active_run` + 0013 `semantic_keys` +
+0014 `disclosure_topics` + 0015 `heading_path_text` + 0016 三维分类投影；0016/0017 后分类
+由视图现算。完整列集以 `docs/implementation/checks/contract-checklist.md` §2 为准：
 
 - 0010：`applicability`（'applicable'|'not_applicable'|NULL，节适用性一等筛选列，部分索引）
   与 `page_no`（artifact_locator 首页码提升列）；

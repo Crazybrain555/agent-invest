@@ -10,7 +10,14 @@ import unittest
 from unittest import mock
 
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
+from disclosure_anchor.adapters.parsers.mineru.table_reconciler import (
+    TableReconciliationStats,
+)
 from disclosure_anchor.application.ports.file_store import ArtifactWriteResult
+from disclosure_anchor.application.contracts.normalized_ir import (
+    CURRENT_NORMALIZED_IR_VERSION,
+    normalized_ir_filename,
+)
 from disclosure_anchor.application.use_cases.build_units import (
     BuildUnits,
     BuildUnitsCommand,
@@ -59,12 +66,20 @@ class _BadHashArtifactStore(ArtifactStore):
 
 def _normalized_ir() -> dict:
     return {
-        "contract_version": "normalized_ir.v2",
+        "contract_version": CURRENT_NORMALIZED_IR_VERSION,
         "document_id": "doc_1",
         "created_at": "2026-07-05T00:00:00Z",
         "source_pdf": "raw.pdf",
         "title": "公告",
-        "parser": {},
+        "parser": {
+            "name": "MinerU",
+            "package_version": "3.4.0",
+            "backend": "pipeline",
+            "method": "auto",
+            "language": "ch",
+            "formula": False,
+            "table": True,
+        },
         "parser_artifacts": {
             "artifact_root_relpath": "parser/a",
             "content_list_relpath": "parser/a/content.json",
@@ -110,7 +125,7 @@ def _image_ir() -> dict:
 
 
 def _uow(
-    root: Path, *, contract_version: str = "normalized_ir.v2"
+    root: Path, *, contract_version: str = CURRENT_NORMALIZED_IR_VERSION
 ) -> tuple[FakeUnitOfWork, Path]:
     uow = FakeUnitOfWork()
     company = uow.companies.add(e.Company(company_id="co_1", legal_name="江海股份"))
@@ -134,7 +149,11 @@ def _uow(
         )
     )
     ir_relpath = Path(
-        "derived/normalized_ir/cninfo/002484/pid_1/run_1/normalized_ir.v2.json"
+        "derived/normalized_ir/cninfo/002484/pid_1/run_1"
+    ) / (
+        normalized_ir_filename(contract_version)
+        if contract_version in {"normalized_ir.v2", "normalized_ir.v3"}
+        else f"{contract_version}.json"
     )
     payload = {**_normalized_ir(), "contract_version": contract_version}
     path = root / ir_relpath
@@ -200,53 +219,257 @@ class BuildUnitsTests(unittest.TestCase):
             )
             self.assertEqual(uow.document_units.list_by_processing_run("run_1"), [])
 
-    def test_table_builder_semantics_version_guards_reconciled_ir(self) -> None:
-        cases = (
-            ("table-builder-semantics.v2", "succeeded"),
-            ("table-builder-semantics.v1", "failed"),
-            ("table-builder-semantics.v0", "failed"),
-            (None, "failed"),
-        )
-        for semantics_version, expected_status in cases:
-            with self.subTest(semantics_version=semantics_version):
-                with tempfile.TemporaryDirectory() as tmp:
-                    root = Path(tmp)
-                    uow, ir_relpath = _uow(root)
-                    ir_path = root / ir_relpath
-                    payload = json.loads(ir_path.read_text(encoding="utf-8"))
-                    reconciliation = {
-                        "algorithm_version": "mineru-aggregate-table-restore.v3"
-                    }
-                    if semantics_version is not None:
-                        reconciliation["table_builder_semantics_version"] = (
-                            semantics_version
-                        )
-                    payload["parser_diagnostics"] = {
-                        "table_reconciliation": reconciliation
-                    }
-                    ir_path.write_text(
-                        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-                    )
-                    paths = _PathBuilder(root)
-                    use_case = BuildUnits(
-                        path_builder=paths,
-                        artifact_store=ArtifactStore(paths),
-                        uow_factory=lambda: uow,
-                    )
+    def test_locator_diagnostics_have_no_builder_rules_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _uow(root)
+            ir_path = root / ir_relpath
+            payload = json.loads(ir_path.read_text(encoding="utf-8"))
+            reconciliation = TableReconciliationStats(
+                model_status="absent", content_tables=0
+            ).as_dict()
+            self.assertNotIn("table_builder_semantics_version", reconciliation)
+            payload["parser_diagnostics"] = {
+                "table_reconciliation": reconciliation
+            }
+            ir_path.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            paths = _PathBuilder(root)
+            result = BuildUnits(
+                path_builder=paths,
+                artifact_store=ArtifactStore(paths),
+                uow_factory=lambda: uow,
+            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
 
-                    result = use_case.execute(
-                        BuildUnitsCommand(processing_run_id="run_1")
-                    )
+            self.assertEqual(result.status, "succeeded")
 
-                    self.assertEqual(result.status, expected_status)
-                    if expected_status == "failed":
-                        self.assertEqual(
-                            result.error["error_code"],
-                            "IR_TABLE_BUILDER_SEMANTICS_MISMATCH",
-                        )
-                        self.assertEqual(
-                            uow.document_units.list_by_processing_run("run_1"), []
-                        )
+    def test_reconciled_ir_requires_complete_consistent_diagnostics(self) -> None:
+        cases = {
+            "not_an_object": [],
+            "missing_counter": {
+                key: value
+                for key, value in TableReconciliationStats(
+                    model_status="absent", content_tables=0
+                ).as_dict().items()
+                if key != "located_tables"
+            },
+            "unexpected_hash_without_model": {
+                **TableReconciliationStats(
+                    model_status="absent", content_tables=0
+                ).as_dict(),
+                "model_hash": 7,
+            },
+            "impossible_supported_formula": {
+                **TableReconciliationStats(
+                    model_status="supported",
+                    content_tables=2,
+                    model_hash="sha256:" + "a" * 64,
+                    model_tables=2,
+                    uniquely_matched_tables=2,
+                    candidate_groups=1,
+                    proven_groups=1,
+                    locator_only_groups=1,
+                    locator_only_tables=2,
+                    located_groups=1,
+                    located_tables=2,
+                ).as_dict(),
+                "restored_groups": 1,
+            },
+        }
+        for label, reconciliation in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                uow, ir_relpath = _uow(root)
+                ir_path = root / ir_relpath
+                payload = json.loads(ir_path.read_text(encoding="utf-8"))
+                payload["parser_diagnostics"] = {
+                    "table_reconciliation": reconciliation
+                }
+                ir_path.write_text(
+                    json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+                )
+                use_case = BuildUnits(
+                    path_builder=_PathBuilder(root),
+                    artifact_store=ArtifactStore(_PathBuilder(root)),
+                    uow_factory=lambda: uow,
+                )
+
+                result = use_case.execute(
+                    BuildUnitsCommand(processing_run_id="run_1")
+                )
+
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(
+                    result.error["error_code"],
+                    "IR_TABLE_RECONCILIATION_INVALID",
+                )
+                self.assertEqual(
+                    uow.document_units.list_by_processing_run("run_1"), []
+                )
+
+    def test_legacy_reconciliation_without_restoration_remains_buildable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _uow(root, contract_version="normalized_ir.v2")
+            ir_path = root / ir_relpath
+            payload = json.loads(ir_path.read_text(encoding="utf-8"))
+            # Exact shape emitted by the previous restore.v3 generation.  It
+            # intentionally lacks v4 locator-only counters; algorithm
+            # classification must happen before current-shape validation.
+            reconciliation = {
+                "algorithm_version": "mineru-aggregate-table-restore.v3",
+                "table_builder_semantics_version": "table-builder-semantics.v2",
+                "model_status": "absent",
+                "model_hash": None,
+                "content_tables": 0,
+                "model_tables": 0,
+                "uniquely_matched_tables": 0,
+                "ambiguous_matches": 0,
+                "candidate_groups": 0,
+                "proven_groups": 0,
+                "unproven_groups": 0,
+                "restoration_rejected_groups": 0,
+                "unresolved_groups": 0,
+                "located_groups": 0,
+                "located_tables": 0,
+                "restored_groups": 0,
+                "restored_tables": 0,
+            }
+            payload["parser_diagnostics"] = {
+                "table_reconciliation": reconciliation
+            }
+            ir_path.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            use_case = BuildUnits(
+                path_builder=_PathBuilder(root),
+                artifact_store=ArtifactStore(_PathBuilder(root)),
+                uow_factory=lambda: uow,
+            )
+
+            result = use_case.execute(
+                BuildUnitsCommand(processing_run_id="run_1")
+            )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.error, None)
+            self.assertEqual(len(uow.document_units.list_by_processing_run("run_1")), 1)
+
+    def test_aggregate_locator_cannot_bypass_missing_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _uow(root)
+            ir_path = root / ir_relpath
+            payload = json.loads(ir_path.read_text(encoding="utf-8"))
+            payload["elements"][0].update(
+                {
+                    "kind": "table",
+                    "raw_kind": "table",
+                    "page_no": 1,
+                    "table_html": "<table><tr><td>A</td></tr></table>",
+                    "page_span": [1, 2],
+                    "page_bboxes": [
+                        {"page_no": 1, "bbox": [0, 0, 10, 10]},
+                        {"page_no": 2, "bbox": [0, 0, 10, 10]},
+                    ],
+                    "model_table_indices": [0, 1],
+                    "continuation_source_item_indices": [2],
+                    "table_locator_algorithm": (
+                        "mineru-aggregate-table-locator.v4"
+                    ),
+                }
+            )
+            ir_path.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            paths = _PathBuilder(root)
+            result = BuildUnits(
+                path_builder=paths,
+                artifact_store=ArtifactStore(paths),
+                uow_factory=lambda: uow,
+            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(
+                result.error["error_code"], "IR_TABLE_RECONCILIATION_INVALID"
+            )
+            self.assertEqual(uow.document_units.list_by_processing_run("run_1"), [])
+
+    def test_valid_locator_only_ir_builds_one_logical_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _uow(root)
+            ir_path = root / ir_relpath
+            payload = json.loads(ir_path.read_text(encoding="utf-8"))
+            algorithm = "mineru-aggregate-table-locator.v4"
+            payload["elements"] = [
+                {
+                    "ir_id": "ir_0000",
+                    "kind": "table",
+                    "raw_kind": "table",
+                    "order_index": 0,
+                    "source_item_index": 0,
+                    "page_no": 1,
+                    "bbox": [0, 0, 10, 10],
+                    "table_html": "<table><tr><td>A</td></tr><tr><td>B</td></tr></table>",
+                    "table": {"headers": ["A"], "rows": [["B"]]},
+                    "table_caption": [],
+                    "table_footnote": [],
+                    "page_span": [1, 2],
+                    "page_bboxes": [
+                        {"page_no": 1, "bbox": [0, 0, 10, 10]},
+                        {"page_no": 2, "bbox": [0, 0, 10, 10]},
+                    ],
+                    "model_table_indices": [0, 1],
+                    "continuation_source_item_indices": [1],
+                    "table_locator_algorithm": algorithm,
+                },
+                {
+                    "ir_id": "ir_0001",
+                    "kind": "table",
+                    "raw_kind": "table",
+                    "order_index": 1,
+                    "source_item_index": 1,
+                    "page_no": 2,
+                    "bbox": [0, 0, 10, 10],
+                    "table_html": "",
+                    "table": {"headers": [], "rows": []},
+                    "table_caption": [],
+                    "table_footnote": [],
+                },
+            ]
+            payload["parser_diagnostics"] = {
+                "table_reconciliation": TableReconciliationStats(
+                    model_status="supported",
+                    content_tables=2,
+                    model_hash="sha256:" + "d" * 64,
+                    model_tables=2,
+                    uniquely_matched_tables=2,
+                    candidate_groups=1,
+                    proven_groups=1,
+                    locator_only_groups=1,
+                    locator_only_tables=2,
+                    located_groups=1,
+                    located_tables=2,
+                ).as_dict()
+            }
+            ir_path.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            paths = _PathBuilder(root)
+            result = BuildUnits(
+                path_builder=paths,
+                artifact_store=ArtifactStore(paths),
+                uow_factory=lambda: uow,
+            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.unit_count, 1)
+            unit = uow.document_units.list_by_processing_run("run_1")[0]
+            self.assertEqual(unit.payload_kind, "table")
+            self.assertEqual(unit.artifact_locator["page_span"], [1, 2])
+            self.assertEqual(len(unit.artifact_locator["page_bboxes"]), 2)
 
     def test_unknown_preparation_failure_preserves_structured_code(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -291,7 +514,7 @@ class BuildUnitsTests(unittest.TestCase):
             self.assertEqual(result.status, "succeeded")
             self.assertEqual(result.unit_count, 1)
             run = uow.processing_runs.get("run_1")
-            self.assertEqual(run.builder_rules_version, "ub-2026.07-52")
+            self.assertEqual(run.builder_rules_version, "ub-2026.07-55")
             self.assertEqual(run.unit_build_attempt_count, 1)
             self.assertTrue(
                 run.document_units_relpath.endswith("document_units.v1.jsonl")
@@ -339,6 +562,37 @@ class BuildUnitsTests(unittest.TestCase):
             self.assertEqual(units[0].payload["image_ref"], f"images/{digest}.png")
             self.assertEqual(units[0].quality_status, "needs_review")
 
+    def test_build_hashes_image_bytes_even_when_source_name_looks_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_bytes = b"mineru identifier is not a content hash"
+            misleading = "a" * 64
+            uow, ir_relpath = _uow(root)
+            image_path = root / f"parser/a/images/{misleading}.png"
+            image_path.parent.mkdir(parents=True)
+            image_path.write_bytes(image_bytes)
+            normalized_ir = _image_ir()
+            normalized_ir["elements"][0]["image_path"] = (
+                f"images/{misleading}.png"
+            )
+            (root / ir_relpath).write_text(
+                json.dumps(normalized_ir, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            paths = _PathBuilder(root)
+            use_case = BuildUnits(
+                path_builder=paths,
+                artifact_store=ArtifactStore(paths),
+                uow_factory=lambda: uow,
+            )
+
+            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+            self.assertEqual(result.status, "succeeded")
+            units = uow.document_units.list_by_processing_run("run_1")
+            actual = hashlib.sha256(image_bytes).hexdigest()
+            self.assertEqual(units[0].payload["image_ref"], f"images/{actual}.png")
+
     def test_old_ir_contract_is_dead_lettered_and_counts_an_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -356,6 +610,73 @@ class BuildUnitsTests(unittest.TestCase):
             self.assertEqual(result.error["error_code"], "IR_CONTRACT_TOO_OLD")
             run = uow.processing_runs.get("run_1")
             self.assertEqual(run.unit_build_attempt_count, 1)
+
+    def test_contract_version_must_match_artifact_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _uow(root)
+            wrong_relpath = ir_relpath.with_name("normalized_ir.v2.json")
+            (root / ir_relpath).rename(root / wrong_relpath)
+            run = uow.processing_runs.get("run_1")
+            run.normalized_ir_relpath = str(wrong_relpath)
+            uow.processing_runs.update(run)
+
+            result = BuildUnits(
+                path_builder=_PathBuilder(root),
+                artifact_store=ArtifactStore(_PathBuilder(root)),
+                uow_factory=lambda: uow,
+            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.error["error_code"], "IR_CONTRACT_UNSUPPORTED")
+            self.assertEqual(
+                result.error["reason_code"], "contract_filename_mismatch"
+            )
+
+    def test_current_contract_rejects_retired_native_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _uow(root)
+            path = root / ir_relpath
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["native_text"] = {"status": "empty"}
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            result = BuildUnits(
+                path_builder=_PathBuilder(root),
+                artifact_store=ArtifactStore(_PathBuilder(root)),
+                uow_factory=lambda: uow,
+            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.error["error_code"], "IR_CONTRACT_UNSUPPORTED")
+            self.assertEqual(result.error["reason_code"], "v3_native_text_forbidden")
+
+    def test_v2_cannot_claim_locator_v4_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _uow(root, contract_version="normalized_ir.v2")
+            path = root / ir_relpath
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["parser_diagnostics"] = {
+                "table_reconciliation": TableReconciliationStats(
+                    model_status="absent", content_tables=0
+                ).as_dict()
+            }
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            result = BuildUnits(
+                path_builder=_PathBuilder(root),
+                artifact_store=ArtifactStore(_PathBuilder(root)),
+                uow_factory=lambda: uow,
+            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(
+                result.error["error_code"],
+                "IR_TABLE_RECONCILIATION_CONTRACT_MISMATCH",
+            )
+            self.assertEqual(result.error["reason_code"], "v2_locator_v4_forbidden")
 
     def test_rejects_already_built_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

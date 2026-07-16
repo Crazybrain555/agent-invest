@@ -24,7 +24,7 @@ class_map(r5,31类)/facet_map/config/processing_policy.json（0016 起分类视�
 - 读：`docs/architecture/service-purpose.md`（canonical 契约）→
   `docs/implementation/design/*.md`（watchlist/检索两份决议）→
   `docs/implementation/milestones/09-production-readiness.md`（背账）→
-  05 里程碑 §8.5（规则包 ub-2026.07-2..-52 修订史）。
+  05 里程碑 §8.5（规则包 ub-2026.07-2..-53 修订史）。
 - 环境：`set -a; source ~/.config/agent-invest/disclosure_anchor/worker.env; set +a`；
   DB 只读直连 psql 或 dbhub。
 - 语料状态：`make track-status`；确认单一规则代

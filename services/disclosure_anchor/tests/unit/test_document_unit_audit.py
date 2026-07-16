@@ -1,0 +1,708 @@
+from __future__ import annotations
+
+import copy
+from dataclasses import replace
+import unittest
+from typing import Any
+
+from disclosure_anchor.adapters.unit_builder.builder import (
+    UnitDraft,
+    build_unit_drafts_s1_s7,
+)
+from disclosure_anchor.application.services.document_unit_audit import (
+    AuditDocumentMetadata,
+    AuditUnitView,
+    audit_document,
+)
+
+
+def _element(
+    order: int,
+    *,
+    kind: str,
+    text: str | None = None,
+    raw_kind: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "document_id": "doc_audit",
+        "ir_id": f"ir_{order:04d}",
+        "source_item_index": order,
+        "order_index": order,
+        "page_idx": 0,
+        "page_no": 1,
+        "kind": kind,
+        "raw_kind": raw_kind or kind,
+        **extra,
+    }
+    if text is not None:
+        value["text"] = text
+    return value
+
+
+def _ir(elements: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "contract_version": "normalized_ir.v2",
+        "created_at": "2026-07-16T00:00:00Z",
+        "document_id": "doc_audit",
+        "source_pdf": "raw/audit.pdf",
+        "title": "审计样本",
+        "parser": {
+            "name": "MinerU",
+            "package_version": "3.4.0",
+            "backend": "pipeline",
+            "method": "auto",
+            "language": "ch",
+            "formula": False,
+            "table": True,
+        },
+        "parser_artifacts": {
+            "artifact_root_relpath": "parser/audit",
+            "content_list_relpath": "parser/audit/content.json",
+        },
+        "parsed_pages": {
+            "start_page_no": 1,
+            "end_page_no": 1,
+            "full_pdf": True,
+        },
+        "elements": elements,
+    }
+
+
+def _views(units: list[UnitDraft]) -> list[AuditUnitView]:
+    return [
+        AuditUnitView(
+            order_index=index,
+            payload_kind=unit.payload_kind,
+            payload=unit.payload,
+            title=unit.title,
+            heading_path=unit.heading_path,
+            structural_path=unit.structural_path,
+            semantic_key=unit.semantic_key,
+            semantic_keys=unit.semantic_keys,
+            quality_status=unit.quality_status,
+            applicability=unit.applicability,
+            artifact_locator=unit.artifact_locator,
+        )
+        for index, unit in enumerate(units, start=1)
+    ]
+
+
+def _codes(report: Any) -> set[str]:
+    return {item.code for item in report.findings}
+
+
+class DocumentUnitAuditTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.metadata = AuditDocumentMetadata(
+            document_id="doc_audit",
+            title="审计样本",
+            filing_type="other",
+        )
+
+    def test_blank_table_annotations_are_proven_empty_source(self) -> None:
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="table",
+                    raw_kind="table",
+                    table={"headers": [], "rows": []},
+                    table_html="",
+                    table_caption=[],
+                    table_footnote=["", "  "],
+                )
+            ]
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=[],
+            metadata=self.metadata,
+        )
+
+        self.assertEqual(report.metrics["coverage"]["proven_empty"], 1)
+        self.assertNotIn(
+            "source_atom_uncovered", {item.code for item in report.findings}
+        )
+
+    def test_builder_output_conserves_heading_and_text_by_source_identity(self) -> None:
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="heading",
+                    raw_kind="text",
+                    text="一、经营情况",
+                    heading_level=1,
+                ),
+                _element(1, kind="text", text="营业收入同比增长20%。"),
+            ]
+        )
+        units, _ = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="other",
+            document_title="审计样本",
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views(units),
+            metadata=self.metadata,
+        )
+
+        self.assertTrue(report.ok, report.findings)
+        self.assertEqual(report.metrics["coverage"]["payload"], 1)
+        self.assertEqual(report.metrics["coverage"]["structure"], 1)
+        self.assertEqual(report.metrics["typed_payload_projections"], 1)
+        self.assertEqual(report.metrics["source_text_chars"], 0)
+        self.assertEqual(
+            report.metrics["source_text_chars"],
+            report.metrics["output_text_chars"],
+        )
+
+    def test_repeated_heading_text_cannot_cover_an_unreferenced_occurrence(self) -> None:
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="heading",
+                    raw_kind="text",
+                    text="风险提示",
+                    heading_level=1,
+                ),
+                _element(
+                    1,
+                    kind="heading",
+                    raw_kind="text",
+                    text="风险提示",
+                    heading_level=1,
+                ),
+            ]
+        )
+        unit = AuditUnitView(
+            order_index=1,
+            payload_kind="text",
+            payload={"text": "风险提示"},
+            title="风险提示",
+            heading_path=["风险提示"],
+            structural_path=["风险提示"],
+            semantic_key="document_content",
+            semantic_keys=["document_content"],
+            quality_status="ok",
+            applicability=None,
+            artifact_locator={
+                "ir_id": "ir_0000",
+                "source_item_index": 0,
+                "order_index": 0,
+                "page_no": 1,
+            },
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=[unit],
+            metadata=self.metadata,
+        )
+
+        self.assertFalse(report.ok)
+        self.assertIn("source_atom_uncovered", {item.code for item in report.findings})
+
+    def test_exact_registered_metadata_can_be_covered_outside_payload(self) -> None:
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="text",
+                    raw_kind="header",
+                    text="证券代码：300012",
+                ),
+                _element(1, kind="text", text="公司经营保持稳定。"),
+            ]
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="other",
+            document_title="华测检测：审计样本",
+            security_code="300012",
+            security_name="华测检测",
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views(units),
+            metadata=AuditDocumentMetadata(
+                document_id="doc_audit",
+                title="华测检测：审计样本",
+                filing_type="other",
+                security_code="300012",
+                security_name="华测检测",
+            ),
+            source_dispositions=stats.source_dispositions,
+        )
+
+        self.assertTrue(report.ok, report.findings)
+        self.assertEqual(report.metrics["coverage"]["external_metadata"], 1)
+
+    def test_typed_projection_detects_payload_loss(self) -> None:
+        normalized = _ir([_element(0, kind="text", text="完整来源事实。")])
+        units, _ = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="other",
+            document_title="审计样本",
+        )
+        broken = replace(units[0], payload={"text": "来源事实。"})
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views([broken]),
+            metadata=self.metadata,
+        )
+
+        self.assertIn("payload_projection_mismatch", _codes(report))
+
+    def test_legacy_text_component_still_detects_payload_loss(self) -> None:
+        normalized = _ir([_element(0, kind="text", text="完整来源事实。")])
+        unit = AuditUnitView(
+            order_index=1,
+            payload_kind="text",
+            payload={"text": "来源事实。"},
+            title="审计样本",
+            heading_path=["审计样本"],
+            structural_path=[],
+            semantic_key="document_content",
+            semantic_keys=["document_content"],
+            quality_status="ok",
+            applicability=None,
+            artifact_locator={
+                "ir_id": "ir_0000",
+                "source_item_index": 0,
+                "order_index": 0,
+                "page_no": 1,
+            },
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=[unit],
+            metadata=self.metadata,
+        )
+
+        self.assertIn("text_component_mismatch", _codes(report))
+
+    def test_headerless_table_caption_is_a_typed_source_anchor(self) -> None:
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="table",
+                    table={"headers": ["项目"], "rows": [["研发"]]},
+                    table_caption=["募集资金使用表"],
+                    table_footnote=[],
+                )
+            ]
+        )
+        units, _ = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="other",
+            document_title=None,
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views(units),
+            metadata=replace(self.metadata, title=None),
+        )
+
+        self.assertTrue(report.ok, report.findings)
+        self.assertEqual(units[0].heading_path, ["募集资金使用表"])
+
+    def test_untyped_headerless_anchor_is_rejected(self) -> None:
+        normalized = _ir([_element(0, kind="text", text="来源事实。")])
+        unit = AuditUnitView(
+            order_index=1,
+            payload_kind="text",
+            payload={"text": "来源事实。"},
+            title="任意锚点",
+            heading_path=["任意锚点"],
+            structural_path=[],
+            semantic_key="document_content",
+            semantic_keys=["document_content"],
+            quality_status="ok",
+            applicability=None,
+            artifact_locator={
+                "ir_id": "ir_0000",
+                "source_item_index": 0,
+                "order_index": 0,
+                "page_no": 1,
+            },
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=[unit],
+            metadata=self.metadata,
+        )
+
+        self.assertIn("public_heading_path_mismatch", _codes(report))
+
+    def test_qa_partition_retains_parent_heading_projection(self) -> None:
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="heading",
+                    text="三、主要交流问题",
+                    heading_level=1,
+                ),
+                _element(1, kind="text", text="问：收入如何？\n答：收入保持增长。"),
+            ]
+        )
+        units, _ = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="investor_relations",
+            document_title="审计样本",
+        )
+        qa = next(unit for unit in units if unit.payload_kind == "qa")
+        graph = (qa.artifact_locator or {})["source_projection"]
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views(units),
+            metadata=replace(self.metadata, filing_type="investor_relations"),
+        )
+
+        self.assertTrue(report.ok, report.findings)
+        self.assertEqual(len(graph["heading_path"]), 1)
+        self.assertEqual(
+            graph["heading_path"][0]["selector"]["source"]["ir_id"],
+            "ir_0000",
+        )
+
+    def test_table_spans_are_checked_as_source_structure(self) -> None:
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="table",
+                    table={
+                        "headers": ["项目", "金额"],
+                        "rows": [["收入", "100"]],
+                        "merged_cells": [
+                            {"row": 0, "col": 0, "rowspan": 1, "colspan": 2}
+                        ],
+                    },
+                    table_caption=[],
+                    table_footnote=[],
+                )
+            ]
+        )
+        units, _ = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="other",
+            document_title="审计样本",
+        )
+        valid = audit_document(
+            normalized_ir=normalized,
+            units=_views(units),
+            metadata=self.metadata,
+        )
+        self.assertTrue(valid.ok, valid.findings)
+
+        broken = replace(
+            units[0],
+            payload={**units[0].payload, "merged_cells": []},
+        )
+        invalid = audit_document(
+            normalized_ir=normalized,
+            units=_views([broken]),
+            metadata=self.metadata,
+        )
+        self.assertIn(
+            "table_structure_mismatch",
+            {item.code for item in invalid.findings},
+        )
+
+    def test_bad_navigation_locator_does_not_override_typed_ownership(self) -> None:
+        normalized = _ir([_element(0, kind="text", text="唯一事实。")])
+        units, _ = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="other",
+            document_title="审计样本",
+        )
+        locator = dict(units[0].artifact_locator or {})
+        locator["ir_id"] = "does_not_exist"
+        broken = replace(units[0], artifact_locator=locator)
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views([broken]),
+            metadata=self.metadata,
+        )
+
+        self.assertIn("locator_identity_unresolved", _codes(report))
+        self.assertNotIn("source_atom_uncovered", _codes(report))
+
+    def test_bad_typed_source_cannot_be_rescued_by_navigation_locator(self) -> None:
+        normalized = _ir([_element(0, kind="text", text="唯一事实。")])
+        units, _ = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="other",
+            document_title="审计样本",
+        )
+        locator = copy.deepcopy(units[0].artifact_locator or {})
+        locator["source_projection"]["payload"]["sources"][0]["source"][
+            "ir_id"
+        ] = "does_not_exist"
+        broken = replace(units[0], artifact_locator=locator)
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views([broken]),
+            metadata=self.metadata,
+        )
+
+        self.assertIn("source_ref_identity_invalid", _codes(report))
+        self.assertIn("source_atom_uncovered", _codes(report))
+
+    def test_public_heading_path_cannot_hide_behind_private_structure(self) -> None:
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="heading",
+                    text="一、经营情况",
+                    heading_level=1,
+                ),
+                _element(1, kind="text", text="经营保持稳定。"),
+            ]
+        )
+        units, _ = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="other",
+            document_title="审计样本",
+        )
+        broken = replace(units[0], heading_path=[])
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views([broken]),
+            metadata=self.metadata,
+        )
+
+        self.assertIn("public_heading_path_mismatch", _codes(report))
+        self.assertIn("heading_source_path_mismatch", _codes(report))
+
+    def test_qa_projection_is_validated_separately_from_raw_text(self) -> None:
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="text",
+                    text="问题：今年收入如何？\n答：收入保持增长。",
+                )
+            ]
+        )
+        units, _ = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="investor_relations",
+            document_title="审计样本",
+        )
+        self.assertEqual(units[0].payload_kind, "qa")
+        broken = replace(
+            units[0],
+            payload={**units[0].payload, "answer": "并不存在的回答"},
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views([broken]),
+            metadata=self.metadata,
+        )
+
+        self.assertIn("qa_projection_mismatch", _codes(report))
+
+    def test_unit_source_order_cannot_move_backwards(self) -> None:
+        normalized = _ir(
+            [
+                _element(0, kind="text", text="第一段。"),
+                _element(1, kind="text", text="第二段。"),
+            ]
+        )
+        units, _ = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="other",
+            document_title=None,
+        )
+        self.assertEqual(len(units), 1)
+        first = replace(
+            units[0],
+            payload={"text": "第一段。"},
+            artifact_locator={
+                "ir_id": "ir_0000",
+                "source_item_index": 0,
+                "order_index": 0,
+                "page_no": 1,
+            },
+        )
+        second = replace(
+            units[0],
+            payload={"text": "第二段。"},
+            artifact_locator={
+                "ir_id": "ir_0001",
+                "source_item_index": 1,
+                "order_index": 1,
+                "page_no": 1,
+            },
+        )
+        views = _views([second, first])
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=views,
+            metadata=self.metadata,
+        )
+
+        self.assertIn("unit_source_order_invalid", _codes(report))
+
+    def test_duplicate_equal_table_occurrences_are_not_value_deduplicated(self) -> None:
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="table",
+                    table={"headers": ["项目"], "rows": [["收入"]]},
+                    table_caption=[],
+                    table_footnote=[],
+                )
+            ]
+        )
+        units, _ = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="other",
+            document_title="审计样本",
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views([units[0], units[0]]),
+            metadata=self.metadata,
+        )
+
+        self.assertIn("table_payload_count_invalid", _codes(report))
+
+    def test_applicability_requires_one_target_with_the_proven_value(self) -> None:
+        normalized = _ir(
+            [_element(0, kind="text", text="√适用 □不适用\n经营保持稳定。")]
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="other",
+            document_title="审计样本",
+        )
+        self.assertEqual(units[0].applicability, "applicable")
+        broken = replace(units[0], applicability="not_applicable")
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views([broken]),
+            metadata=self.metadata,
+            source_dispositions=stats.source_dispositions,
+        )
+
+        self.assertIn("applicability_value_mismatch", _codes(report))
+
+    def test_fully_externalized_source_cannot_still_be_published(self) -> None:
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="page_furniture",
+                    raw_kind="page_number",
+                    text="1",
+                )
+            ]
+        )
+        unit = AuditUnitView(
+            order_index=1,
+            payload_kind="text",
+            payload={"text": "1"},
+            title="1",
+            heading_path=["1"],
+            structural_path=["1"],
+            semantic_key="document_content",
+            semantic_keys=["document_content"],
+            quality_status="needs_review",
+            applicability=None,
+            artifact_locator={
+                "ir_id": "ir_0000",
+                "source_item_index": 0,
+                "order_index": 0,
+                "page_no": 1,
+            },
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=[unit],
+            metadata=self.metadata,
+            source_dispositions=[
+                {
+                    "ir_id": "ir_0000",
+                    "source_item_index": 0,
+                    "order_index": 0,
+                    "role": "external_metadata",
+                    "reason": "exact_page_number",
+                }
+            ],
+        )
+
+        self.assertIn("external_source_emitted", _codes(report))
+
+    def test_duplicate_equal_image_occurrences_are_counted_separately(self) -> None:
+        digest = "a" * 64
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="image",
+                    image_path=f"source/{digest}.png",
+                    text="图一",
+                )
+            ]
+        )
+        unit = AuditUnitView(
+            order_index=1,
+            payload_kind="text",
+            payload={
+                "image_ref": f"images/{digest}.png",
+                "caption": "图一",
+                "context": "",
+            },
+            title="图一",
+            heading_path=["图一"],
+            structural_path=["图一"],
+            semantic_key="document_content",
+            semantic_keys=["document_content"],
+            quality_status="needs_review",
+            applicability=None,
+            artifact_locator={
+                "ir_id": "ir_0000",
+                "source_item_index": 0,
+                "order_index": 0,
+                "page_no": 1,
+            },
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=[unit, replace(unit, order_index=2)],
+            metadata=self.metadata,
+            image_hashes={"ir_0000": f"sha256:{digest}"},
+        )
+
+        self.assertIn("image_payload_count_invalid", _codes(report))
+
+
+if __name__ == "__main__":
+    unittest.main()

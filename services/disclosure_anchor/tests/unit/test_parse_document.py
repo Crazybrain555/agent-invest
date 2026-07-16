@@ -1,5 +1,7 @@
-import unittest
+import hashlib
 from pathlib import Path
+import tempfile
+import unittest
 from typing import Any
 
 from disclosure_anchor.application.ports.file_store import (
@@ -64,7 +66,7 @@ class _PathBuilder:
             / security_code
             / provider_document_id
             / processing_run_id
-            / "normalized_ir.v2.json"
+            / "normalized_ir.v3.json"
         )
 
 
@@ -114,11 +116,11 @@ class _Parser:
         *,
         error: Exception | None = None,
         identity_error: Exception | None = None,
-        native_shadow_diagnostic: dict[str, object] | None = None,
+        contract_version: str = "normalized_ir.v3",
     ) -> None:
         self.error = error
         self.identity_error = identity_error
-        self.native_shadow_diagnostic = native_shadow_diagnostic
+        self.contract_version = contract_version
         self.called = False
         self.document_metadata: dict[str, Any] | None = None
 
@@ -147,19 +149,24 @@ class _Parser:
             raise self.error
         artifact_root = output_dir / "sample" / "auto"
         normalized_ir: dict[str, Any] = {
-            "contract_version": "normalized_ir.v2",
+            "contract_version": self.contract_version,
+            "created_at": "2026-07-16T00:00:00Z",
             "document_id": document_metadata["document_id"],
             "source_pdf": document_metadata["source_pdf"],
             "title": document_metadata["title"],
-            "parser": {},
+            "parser": {
+                "name": "MinerU",
+                "package_version": "3.4.0",
+                "backend": options.backend,
+                "method": options.method,
+                "language": options.language,
+                "formula": options.formula,
+                "table": options.table,
+            },
             "parser_artifacts": {},
             "parsed_pages": {"start_page_no": 1, "end_page_no": 1},
             "elements": [],
         }
-        if self.native_shadow_diagnostic is not None:
-            normalized_ir["parser_diagnostics"] = {
-                "native_text_shadow": self.native_shadow_diagnostic
-            }
         return ParserResult(
             parser_name="MinerU",
             parser_version="3.4.0",
@@ -223,24 +230,56 @@ def _use_case(
 
 
 class ParseDocumentUnitTests(unittest.TestCase):
-    def test_provider_category_names_reach_parser_metadata(self) -> None:
-        uow = _uow_with_document()
-        document = uow.documents.get("doc_1")
-        document.provider_metadata = {
-            "category_names": ["调研活动", "深市主板"],
-        }
-        uow.documents.update(document)
-        parser = _Parser()
-        use_case, _ = _use_case(uow, parser=parser)
+    def test_model_diagnostics_are_bound_to_the_exact_artifact_bytes(self) -> None:
+        def normalized_ir(status: str, model_hash: str | None) -> dict[str, Any]:
+            return {
+                "parser_diagnostics": {
+                    "table_reconciliation": {
+                        "model_status": status,
+                        "model_hash": model_hash,
+                    }
+                }
+            }
 
-        result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "sample_model.json"
+            model_bytes = b"[]"
+            model_path.write_bytes(model_bytes)
+            actual_hash = "sha256:" + hashlib.sha256(model_bytes).hexdigest()
 
-        self.assertEqual(result.status, "succeeded")
-        assert parser.document_metadata is not None
-        self.assertEqual(
-            parser.document_metadata["provider_category_names"],
-            ["调研活动", "深市主板"],
-        )
+            for status in ("supported", "invalid_json", "unsupported_schema"):
+                with self.subTest(status=status):
+                    ParseDocument._verify_model_diagnostic_binding(
+                        normalized_ir(status, actual_hash),
+                        model_path=model_path,
+                    )
+
+            with self.assertRaises(Exception) as mismatch:
+                ParseDocument._verify_model_diagnostic_binding(
+                    normalized_ir("supported", "sha256:" + "0" * 64),
+                    model_path=model_path,
+                )
+            self.assertEqual(
+                getattr(mismatch.exception, "error_code", None),
+                "parser_model_hash_mismatch",
+            )
+
+            invalid_bindings = (
+                ("absent", None, model_path),
+                ("unreadable", actual_hash, model_path),
+                ("supported", actual_hash, None),
+            )
+            for status, model_hash, path in invalid_bindings:
+                with self.subTest(invalid_status=status, model_path=path):
+                    with self.assertRaises(Exception) as invalid:
+                        ParseDocument._verify_model_diagnostic_binding(
+                            normalized_ir(status, model_hash),
+                            model_path=path,
+                        )
+                    self.assertEqual(
+                        getattr(invalid.exception, "error_code", None),
+                        "parser_model_binding_invalid",
+                    )
 
     def test_raw_missing_and_hash_mismatch_fail_before_parser(self) -> None:
         for actual_hash, expected_code in (
@@ -296,26 +335,6 @@ class ParseDocumentUnitTests(unittest.TestCase):
             )
         )
 
-    def test_native_shadow_unavailable_diagnostic_still_persists_success(
-        self,
-    ) -> None:
-        uow = _uow_with_document()
-        diagnostic = {"status": "unavailable", "error_code": "timeout"}
-        use_case, artifact_store = _use_case(
-            uow,
-            parser=_Parser(native_shadow_diagnostic=diagnostic),
-        )
-
-        result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
-
-        self.assertEqual(result.status, "succeeded")
-        payload = artifact_store.payloads[result.normalized_ir_relpath]
-        self.assertEqual(
-            payload["parser_diagnostics"]["native_text_shadow"],
-            diagnostic,
-        )
-        self.assertNotIn("native_text", payload)
-
     def test_typed_parser_exceptions_map_to_structured_errors(self) -> None:
         cases = (
             (ParserTimeoutError("timeout"), "parse_timeout", True),
@@ -337,6 +356,20 @@ class ParseDocumentUnitTests(unittest.TestCase):
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(result.error["error_code"], error_code)
                 self.assertEqual(result.error["retryable"], retryable)
+
+    def test_new_parse_rejects_legacy_ir_generation(self) -> None:
+        uow = _uow_with_document()
+        use_case, artifact_store = _use_case(
+            uow, parser=_Parser(contract_version="normalized_ir.v2")
+        )
+
+        result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(
+            result.error["error_code"], "parser_output_contract_failed"
+        )
+        self.assertEqual(artifact_store.payloads, {})
 
     def test_version_probe_failure_fails_closed_without_parse(self) -> None:
         uow = _uow_with_document()

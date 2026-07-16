@@ -75,7 +75,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | run_kind | parse / rebuild_units（复用解析产物只重切，5 秒级） |
 | status | running / succeeded / failed；stale running 由 worker 按阈值回收 |
 | is_active | 每文档唯一 true（发布原子切换） |
-| builder_rules_version | 恒等于 rules.RULES_VERSION（当前 ub-2026.07-52）；单一代=同版本 |
+| builder_rules_version | 恒等于 rules.RULES_VERSION（当前 ub-2026.07-53）；单一代=同版本 |
 | content_hash_aggregate / structure_hash | run 级聚合（U3）；"内容没变"只看前者 |
 | parser_* / *_relpath / artifact_hash | 解析出处与产物引用（相对路径） |
 | unit_build_status/attempt_count/error | 构建生命周期；error 为结构化 {stage,error_code,retryable} |
@@ -88,13 +88,13 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | heading_path | jsonb 1-4 级**多级标题**（必填非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text |
 | title | 叶子显示名（单值；多级在 heading_path，决策记录见 retrieval 设计文档 §4.5） |
 | semantic_key | 单值路由键（规则命中→词表键→事件键→`document_content` 通用内容键）；ub-2026.07-26 新产物非空，库列仅为历史兼容仍可空；`document_content` 表示“确定是文档证据、暂无更窄受控概念”，不是 `unknown`；btree 索引 |
-| semantic_keys | jsonb 非空数组=规则键∪词表键∪事件键；无更窄概念时为 `["document_content"]`（ub-2026.07-26；库列仅为历史兼容仍可空）；GIN(jsonb_ops) 支持 `? / ?| / ?&`；Filing API 的 `semantic_key` 单值参数匹配 scalar 列或数组成员，另有 comma-list any/all 过滤 |
-| payload | 纯内容（**禁**任何规则派生字段——进 content_hash，U2） |
-| content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；projection 含 title/heading/semantic_key(s)/quality/applicability |
+| semantic_keys | jsonb 非空数组=规则键∪词表键∪事件键；无更窄概念时为 `["document_content"]`（ub-2026.07-26；库列仅为历史兼容仍可空）；GIN(jsonb_ops) 支持 `? / ?| / ?&`；Filing API 的 `semantic_key` 精确匹配 scalar，跨 primary/secondary key 召回显式使用 comma-list any/all 过滤 |
+| payload | 原始证据内容；mixed payload 还保存 `semantic_type` 与每个 part 的路径/适用性/质量/定位注解。`content_hash` 使用去除这些规则与位置注解后的 canonical content projection，不直接 hash 整个 mixed payload |
+| content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；projection 含 title/heading/semantic_key(s)/quality/applicability，以及 mixed part 的规则型路径、质量和适用性注解；来源 `artifact_locator` 不进入 content/query identity |
 | quality_status | ok / needs_review / unusable（乱码率>30%） |
 | applicability | vc16 CHECK：applicable / not_applicable / NULL（√适用声明列化；见 §5 讨论） |
 | page_no | 定位列（artifact_locator 首页码） |
-| artifact_locator | jsonb（order_index/page_no/bbox/merge 信息）；JSONB(none_as_null) |
+| artifact_locator | jsonb（order_index/page_no/bbox/merge 信息）；跨页 aggregate 表还含连续 `page_span`、逐页 `page_bboxes`、model/continuation 索引与 v4 locator algorithm。mixed 的每个 part 保留自己的 locator，不能只读 unit 顶层；`merged_cells` 坐标统一相对最终 `[headers, *rows]` full grid；JSONB(none_as_null) |
 
 ### classification_rule（0016，词表的库内查询副本）
 | 列 | 含义 |
@@ -135,7 +135,7 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 | 文件 | 内容 | 当前版本 |
 |---|---|---|
-| adapters/unit_builder/rules.py | 切分/噪声/声明组合文法/语义规则 | RULES_VERSION ub-2026.07-52 |
+| adapters/unit_builder/rules.py | 切分/噪声/声明组合文法/语义规则 | RULES_VERSION ub-2026.07-53 |
 | adapters/unit_builder/note_key_map.json | 章节词表 **173 键、389 标签**（section facet；祖先继承+全类型开放） | 2026-07-r16 |
 | adapters/unit_builder/event_key_map.json | 事件键 **35 键**（DuEE-fin/CCKS/FewFC/CFinDEE 并集 + 经营数据/业绩/关联交易监管标题，标题派生） | 2026-07-r2 |
 | adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs；r6 financing +011711 担保/011713 财务资助、meeting_resolution +01239910；r7 equity_share_change +0115 父级实码） | 2026-07-r7 |

@@ -70,7 +70,7 @@ tracked_company DTO 派生字段全集 = {effective_lookback_days / effective_sy
   占位名判别）/ last_synced_at（checkpoint 时间，NULL=从未同步）/ synced_through
   （cursor window_end 覆盖日期）
 scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（数组前缀语义，
-  见 06 §3.8）/ semantic_key（单值参数，匹配 scalar 列或数组成员）/ semantic_keys_any / semantic_keys_all /
+  见 06 §3.8）/ semantic_key（单值参数，精确匹配 scalar 列）/ semantic_keys_any / semantic_keys_all /
   quality_status 等）
 0010 起 document_units_v1 追加 applicability / page_no 列（applicability：
   'applicable'|'not_applicable'|NULL，节适用性声明的一等筛选列，payload 保持纯原文，

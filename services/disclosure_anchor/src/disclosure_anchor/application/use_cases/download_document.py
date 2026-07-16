@@ -433,6 +433,7 @@ def _provider_metadata(
         "provider_org_id": candidate.get("provider_org_id"),
         "object_id": candidate.get("object_id"),
         "rec_id": candidate.get("rec_id"),
+        "security_name": candidate.get("security_name"),
         "file_signature": signature,
     }
     file_size = signature.get("file_size")

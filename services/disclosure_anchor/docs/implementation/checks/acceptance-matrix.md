@@ -13,7 +13,7 @@ created_at: 2026-06-26
 | A01 | 外置盘挂载且 sentinel 存在 | 00/01 | `make doctor` | pass |
 | A02 | PostgreSQL native cluster 可启动，PGDATA 位于 AgentSSD | 00/02 | Homebrew `pg_ctl` + `pg_isready` + `psql` | pass |
 | A03 | 模型缓存不落内置盘默认 cache | 00/04 | env + doctor | pass |
-| A04 | 样本 PDF 可生成 normalized_ir.v1.json | 00/04 | fixture check | pass |
+| A04 | 样本 PDF 可生成 normalized_ir.v2.json | 00/04 | fixture check | pass |
 | A05 | 样本 PDF 可生成 document_units.v1.jsonl | 00/05 | fixture check | pass |
 | A06 | 代码中无业务硬编码 `/Volumes/AgentSSD` | 01 | grep + code review | pass |
 | A07 | `FileStorePathBuilder` 是唯一路径生成入口 | 01/03 | unit test + review | pass |

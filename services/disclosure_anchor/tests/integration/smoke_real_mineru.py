@@ -207,7 +207,7 @@ class RealMinerUSmokeTest(unittest.TestCase):
                 settings.disclosure_data_root / "data" / result.normalized_ir_relpath
             )
             ir = json.loads(ir_path.read_text(encoding="utf-8"))
-            self.assertEqual(ir["contract_version"], "normalized_ir.v2")
+            self.assertEqual(ir["contract_version"], "normalized_ir.v3")
             self.assertGreater(len(ir["elements"]), 0)
             allowed = {
                 "text",

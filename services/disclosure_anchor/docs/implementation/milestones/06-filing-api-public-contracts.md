@@ -17,9 +17,9 @@ delivers_to: milestone 07 / L2 / MCP 包装
 
 ## 1. 前置依赖
 
-- 05 完成（active run、unit 数据、事件流）；0007/0008 视图列全集——
-  document_units_v1：15 scope keys + asset_id + asset_kind/observed_at/source_tier/
-  trace_level/raw_file_hash/query_projection_hash（32 列全集见 04R-R7）；
+- 05 完成（active run、unit 数据、事件流）；当前 `document_units_v1` 为 41 列（完整列集以
+  contract-checklist §2 为准；32 列仅是 0007/0008 的历史基线），包含 active run、
+  applicability/page_no、semantic_keys、heading_path_text 与三维分类投影；
   processing_runs_v1：builder_rules_version（0008，是 run 列不是 unit 列）；
 - `document.status` 枚举（04R-D4）——`L1_PROCESSING_REQUIRED` 的判定数据面。
 
@@ -169,8 +169,10 @@ VALIDATION_ERROR           → 422，参数/游标校验失败（坏 base64/JSON
    asset_uri）、变更→notifications；本期只保证 URI 与游标契约稳定，包装时零改造。
 8. **unit 过滤与 heading 语义**：`/documents/{id}/units` 支持 `payload_kind` / `semantic_key` /
    `semantic_keys_any` / `semantic_keys_all` / `quality_status` / `heading_prefix` 过滤；旧的
-   `semantic_key` 同时命中 scalar 或 semantic_keys 数组，避免 array-only mixed unit 漏召回；
-   any/all 使用逗号分隔、去重后的受控键列表（最多 50 个）；scalar/list 中每个 key 都必须是
+   `semantic_key` 保持 v1 的兼容召回语义，同时命中 scalar 或 `semantic_keys` 数组，避免只有
+   secondary key 的 mixed unit 漏召回；`semantic_keys_any/all` 提供显式集合语义。any/all 使用
+   逗号分隔的受控键列表（原始项最多 50 个，随后稳定去重）；
+   scalar/list 中每个 key 都必须是
    1–128 字符的小写 ASCII snake_case（字母开头），控制字符等非法值在 SQL 前返回 422。
    `heading_prefix` 语义 = heading_path **数组前缀
    匹配**（实现：GIN jsonb_path_ops containment 作候选过滤，命中后精确校验前缀，不把
@@ -241,6 +243,5 @@ provider_document_id=文件名去后缀）。
   `{asset_uri}`；`document_unit.v1.json` 的 properties 同时收录 asset_uri（派生）与
   is_active_run（视图列）；三方一致断言按 `DERIVED = {"asset_uri"}` 执行
   （tests/integration/test_filing_api_views_contract.py 与 contract-checklist §2 已同步）。
-- §1 的 "32 列全集见 04R-R7" 是本文编写时口径：0010–0013 迁移后 `document_units_v1`
-  为 36 列（+applicability/page_no/is_active_run/semantic_keys），列全集以
-  contract-checklist §2 为准。
+- §1 的 32/36 列均为历史迁移口径；0014–0016 后当前 `document_units_v1` 为 **41 列**，
+  `is_active_run` 是真实视图列，列全集以 contract-checklist §2 为准。

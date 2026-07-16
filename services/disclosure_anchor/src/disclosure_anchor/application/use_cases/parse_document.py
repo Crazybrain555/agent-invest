@@ -5,9 +5,16 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 from typing import Any, cast
 
+from disclosure_anchor.application.contracts.normalized_ir import (
+    NormalizedIRVersionError,
+    validate_current_normalized_ir_for_write,
+    validate_normalized_ir_identity,
+    validate_normalized_ir_path_version,
+)
 from disclosure_anchor.application.ports.file_store import (
     ArtifactStorePort,
     FileStorePathPort,
@@ -111,17 +118,30 @@ class ParseDocument:
                 model_path=parser_result.model_path,
             )
             normalized_ir = dict(parser_result.normalized_ir)
+            self._verify_model_diagnostic_binding(
+                normalized_ir,
+                model_path=parser_result.model_path,
+            )
             normalized_ir["parser_artifacts"] = artifact_relpath_map(
                 artifact_root_relpath=artifact_relpaths.artifact_root,
                 content_list_relpath=artifact_relpaths.content_list,
                 markdown_relpath=artifact_relpaths.markdown,
                 model_relpath=artifact_relpaths.model,
             )
-            parsed_pages = dict(normalized_ir.get("parsed_pages") or {})
-            parsed_pages["full_pdf"] = (
-                options.start_page is None and options.end_page is None
-            )
-            normalized_ir["parsed_pages"] = parsed_pages
+            try:
+                version = validate_current_normalized_ir_for_write(normalized_ir)
+                validate_normalized_ir_identity(
+                    normalized_ir,
+                    document_id=context["document"].document_id,
+                    source_pdf=str(context["document_metadata"]["source_pdf"]),
+                )
+                validate_normalized_ir_path_version(
+                    context["normalized_ir_relpath"], version=version
+                )
+            except NormalizedIRVersionError as exc:
+                raise ParserOutputContractError(
+                    f"invalid NormalizedIR contract [{exc.reason_code}]: {exc}"
+                ) from exc
             normalized_ir_result = self._artifact_store.write_json_atomic(
                 relpath=context["normalized_ir_relpath"],
                 payload=normalized_ir,
@@ -181,6 +201,68 @@ class ParseDocument:
             normalized_ir_relpath=run.normalized_ir_relpath,
             artifact_hash=run.artifact_hash,
         )
+
+    @staticmethod
+    def _verify_model_diagnostic_binding(
+        normalized_ir: dict[str, Any], *, model_path: Path | None
+    ) -> None:
+        diagnostics = normalized_ir.get("parser_diagnostics")
+        if not isinstance(diagnostics, dict):
+            return
+        reconciliation = diagnostics.get("table_reconciliation")
+        if not isinstance(reconciliation, dict):
+            return
+        status = reconciliation.get("model_status")
+        expected_hash = reconciliation.get("model_hash")
+        if status == "absent":
+            if model_path is not None or expected_hash is not None:
+                raise _ParseRunFailure(
+                    stage="parse_artifact",
+                    error_code="parser_model_binding_invalid",
+                    retryable=False,
+                    message="absent model diagnostics must not reference a model artifact",
+                )
+            return
+        if status == "unreadable":
+            if expected_hash is not None:
+                raise _ParseRunFailure(
+                    stage="parse_artifact",
+                    error_code="parser_model_binding_invalid",
+                    retryable=False,
+                    message="unreadable model diagnostics must not publish a model hash",
+                )
+            return
+        if status not in {"supported", "invalid_json", "unsupported_schema"}:
+            return
+        if model_path is None or not isinstance(expected_hash, str):
+            raise _ParseRunFailure(
+                stage="parse_artifact",
+                error_code="parser_model_binding_invalid",
+                retryable=False,
+                message=f"{status} model diagnostics require a path and sha256 hash",
+            )
+        try:
+            with model_path.open("rb") as model_file:
+                actual_hash = "sha256:" + hashlib.file_digest(
+                    model_file, "sha256"
+                ).hexdigest()
+        except OSError as exc:
+            raise _ParseRunFailure(
+                stage="parse_artifact",
+                error_code="parser_model_artifact_unreadable",
+                retryable=False,
+                message=str(exc),
+            ) from exc
+        if actual_hash != expected_hash:
+            raise _ParseRunFailure(
+                stage="parse_artifact",
+                error_code="parser_model_hash_mismatch",
+                retryable=False,
+                message=(
+                    f"model artifact hashes to {actual_hash}, diagnostics publish "
+                    f"{expected_hash}"
+                ),
+            )
 
     def _effective_options(self, options: ParserOptions) -> ParserOptions:
         if options.timeout_seconds is not None:
@@ -299,9 +381,6 @@ class ParseDocument:
                 "source_pdf": document.raw_file_relpath,
                 "provider": document.provider,
                 "provider_document_id": document.provider_document_id,
-                "provider_category_names": list(
-                    (document.provider_metadata or {}).get("category_names") or []
-                ),
                 "raw_file_hash": document.raw_file_hash,
             },
         }

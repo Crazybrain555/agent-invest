@@ -166,11 +166,14 @@ semantic_keys（scalar 在规则未命中时回落 note key）。实测：附注
 - ub-2026.07-26 起，新 builder 产物的 `semantic_key` 与 `semantic_keys` 都非空：优先保留
   规则/词表/事件键，无更窄受控概念时使用真实通用键 `document_content`（scalar 与数组均
   写入）。它只表达“这是可检索的文档证据”，不假装知道具体主题，也不等同 `unknown`；
-  数据库列继续可空仅为历史 run 兼容。Filing API 的 `semantic_key` 是单值参数，但会同时匹配
-  scalar 列或 `semantic_keys` 数组成员；另有 comma-list 的 `semantic_keys_any/all`。因此消费者
+  数据库列继续可空仅为历史 run 兼容。Filing API 的 `semantic_key` 是单值兼容参数，会同时匹配
+  scalar 列或 `semantic_keys` 数组；集合查询使用 comma-list 的 `semantic_keys_any/all`。因此消费者
   不会因空路由状态漏掉普通证据；这仍是结构化 facet
   过滤，不是 06R 全文检索投影。
-- 分层到全量的真实报告重放表明，原“最浅且子树不超过 8k”会跨显式业务兄弟合并，且
+- 以下 1,371 份统计来自 ub-2026.07-48 的历史离线重放，长度是展开表格后的**字符启发式**，
+  不是当前 ub-2026.07-53 的 token 计数或 prompt 上限；v53 将跨页表保持 aggregate，具体数字
+  可随重解析变化，但双峰与两层决策不依赖这些精确计数。分层到全量的重放表明，原“最浅且
+  子树不超过 8k”会跨显式业务兄弟合并，且
   边界随年度字数跳变。1,371 份 active NormalizedIR 中，1,292 份（94.24%）的可检索正文
   不超过 40,000 **字符**；短文档最大 39,821，长文档最小 103,354，中间没有样本。79 份
   长文档全是年报/半年报，最大 388,948 字符。这是当前 corpus 的双峰形态，不是通用
