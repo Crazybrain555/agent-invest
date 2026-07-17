@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import unicodedata
 
 
-RULES_VERSION = "ub-2026.07-56"
+RULES_VERSION = "ub-2026.07-57"
 HEADING_RULESET_ID = "cn_a_v6"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -387,6 +387,11 @@ class SemanticKeyRule:
     required: tuple[str, ...] = ()
     any_required: tuple[str, ...] = ()
     filing_type_limited: bool = True
+    # Structural section keys describe the unit's OWN slot, so they match only
+    # the title/leaf heading — full-path matching would leak a combined
+    # section title ("重要提示、目录和释义") onto every descendant and demote
+    # narrower business scalars (observed on the phase00 excerpt fixture).
+    leaf_only: bool = False
 
 
 SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
@@ -530,6 +535,19 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         required=("减值",),
         any_required=("准备", "测试", "损失"),
     ),
+    # 法定章节键（2026-07-17 用户批准第一批扩容；锚点=证监会年报格式准则第 2 号
+    # 固定章节 + 交易所公告格式指引的通用"提示"节；数据支撑见 retrieval 设计 §6.3）。
+    # 三条均 leaf_only：章节键只描述单元自身所在部位，不沿路径污染子孙；置于元组
+    # 末尾使更窄的业务概念优先成为 scalar。important_notice 不限文类。
+    SemanticKeyRule(
+        "important_notice",
+        required=(),
+        any_required=("重要提示", "重要内容提示", "特别提示"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule("reference_documents", required=("备查文件",), leaf_only=True),
+    SemanticKeyRule("definitions", required=("释义",), leaf_only=True),
 )
 
 
@@ -558,9 +576,9 @@ _SHORT_NOTE_SUFFIX_RE = re.compile(
 # is not the statutory statement parent and must not become a semantic key or
 # a heading-tree anchor.
 EXACT_ONLY_NOTE_KEYS = frozenset({"financial_statements_section"})
-NOTE_KEY_MAP_VERSION = "2026-07-r17"
+NOTE_KEY_MAP_VERSION = "2026-07-r18"
 NOTE_KEY_MAP_KEY_COUNT = 173
-NOTE_KEY_MAP_LABEL_COUNT = 389
+NOTE_KEY_MAP_LABEL_COUNT = 391
 @lru_cache(maxsize=1)
 def _note_key_tables() -> tuple[
     dict[str, tuple[str, ...]], tuple[tuple[str, tuple[str, ...]], ...]

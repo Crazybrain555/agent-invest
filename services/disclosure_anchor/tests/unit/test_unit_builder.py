@@ -1635,6 +1635,49 @@ class UnitBuilderTests(unittest.TestCase):
                     [expected],
                 )
 
+    def test_statutory_section_keys_and_filing_gates(self) -> None:
+        # 2026-07-17 approved expansion: statutory report sections
+        # (格式准则第2号) plus the universal exchange-format notice preamble.
+        cases = [
+            ("重要内容提示:", "other", ["important_notice"]),
+            ("特别提示", "related_party", ["important_notice"]),
+            ("备查文件", "annual_report", ["reference_documents"]),
+            ("释义", "annual_report", ["definitions"]),
+            # Periodic-report gate: section keys stay off standalone filings.
+            ("备查文件", "other", []),
+            ("释义", "financing", []),
+        ]
+        for title, filing_type, expected in cases:
+            with self.subTest(title=title, filing_type=filing_type):
+                unit = UnitDraft(
+                    payload_kind="text",
+                    payload={"text": "内容"},
+                    source_order=1,
+                    title=title,
+                    heading_path=[title],
+                )
+                self.assertEqual(
+                    semantic_keys_for_unit(unit, filing_type=filing_type),
+                    expected,
+                )
+        self.assertEqual(
+            rules.note_key_for_title("非经常性损益项目和金额"),
+            "non_recurring_items",
+        )
+        # leaf_only: a combined ancestor title ("重要提示、目录和释义") must not
+        # leak section keys onto descendants; their own concepts win the scalar.
+        descendant = UnitDraft(
+            payload_kind="text",
+            payload={"text": "内容"},
+            source_order=1,
+            title="1、市场竞争风险",
+            heading_path=["第一节 重要提示、目录和释义", "1、市场竞争风险"],
+        )
+        self.assertEqual(
+            semantic_keys_for_unit(descendant, filing_type="annual_report"),
+            ["risk_factors"],
+        )
+
     def test_semantic_labels_use_complete_source_hierarchy(self) -> None:
         unit = UnitDraft(
             payload_kind="text",

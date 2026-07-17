@@ -2433,6 +2433,17 @@ def semantic_keys_for_unit(unit: UnitDraft, *, filing_type: str | None) -> list[
         ]
         if part
     )
+    # leaf_only rules see the unit's own slot only (title/deepest heading/
+    # caption) so a combined ancestor title never leaks onto descendants.
+    leaf_text = " ".join(
+        part
+        for part in [
+            unit.title or "",
+            source_path[-1] if source_path else "",
+            _table_caption_first(unit),
+        ]
+        if part
+    )
     keys: list[str] = []
     for rule in rules.SEMANTIC_KEY_RULES:
         if (
@@ -2440,8 +2451,10 @@ def semantic_keys_for_unit(unit: UnitDraft, *, filing_type: str | None) -> list[
             and filing_type not in rules.SEMANTIC_LIMITED_FILING_TYPES
         ):
             continue
-        if all(token in text for token in rule.required) and (
-            not rule.any_required or any(token in text for token in rule.any_required)
+        haystack = leaf_text if rule.leaf_only else text
+        if all(token in haystack for token in rule.required) and (
+            not rule.any_required
+            or any(token in haystack for token in rule.any_required)
         ):
             if rule.semantic_key not in keys:
                 keys.append(rule.semantic_key)
