@@ -25,7 +25,7 @@ WITH_ENV = set -a; for f in worker.env cninfo.env; do [ -r "$(DISCLOSURE_ENV_DIR
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	test-mineru-smoke lint typecheck agent-check api archive pg-init pg-start pg-stop \
-	pg-status db-create migrate register parse build-units publish process rebuild-units prune-history load-rules config-check track track-status track-export untrack purge-company sync worker-once worker-loop doctor-full wipe-test-data \
+	pg-status db-create migrate register parse build-units publish process rebuild-units rebuild-search-projection prune-history load-rules config-check track track-status track-export untrack purge-company sync worker-once worker-loop doctor-full wipe-test-data \
 	worker-status worker-restart gc-orphans audit-unmapped-codes audit-boilerplate audit-headings audit-unit-corpus export-unit-corpus-manifest audit-weekly install-ops-launchd
 
 doctor:
@@ -123,6 +123,11 @@ process:
 # Rules-only iteration: reuse the latest succeeded parse artifacts, no MinerU.
 rebuild-units:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline rebuild-units --document-id "$(DOC)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
+
+# Rebuild the 06R derived search projection (U7): delta by default, ALL=YES for a
+# full recompute + orphan prune after a retrieval rules/dictionary version bump.
+rebuild-search-projection:
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline rebuild-search-projection $(if $(filter YES,$(ALL)),--all)
 
 # TEST-PHASE ONLY: delete superseded (non-active) runs + their units + events,
 # so the DB shows exactly the current generation. Production retention is a

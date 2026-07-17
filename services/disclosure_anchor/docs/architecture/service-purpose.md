@@ -929,8 +929,14 @@ heading_prefix），其余键经 DB 视图直读或后续 API 升版满足。
 
 ```text
 documents_v1 / document_units_v1 / document_categories_v1 /
-processing_runs_v1 / source_refs_v1 / change_events_v1 / tracked_companies_v1
+processing_runs_v1 / source_refs_v1 / change_events_v1 / tracked_companies_v1 /
+unit_search_projection_v1
 ```
+
+`unit_search_projection_v1`（0025 迁移，06R 检索投影层）是**派生、可再生、无事件语义**的读面：
+每列可由已持久化 unit 经钉死 jieba 分词确定性再生，不进 content/query_projection 哈希、重建
+不发 outbox 事件，L2 直接消费加权 tsvector + pg_trgm 子串通道；证据引用始终回到 document_unit
+的 asset_id。
 
 `tracked_companies_v1`（0019+0020 迁移，contract_version `tracked_company.v1`，round22）
 暴露股票池配置与生命周期：真源是 `tracked_company` 表（watchlist.csv 降级为导入/快照格式，

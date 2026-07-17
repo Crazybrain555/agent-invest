@@ -18,6 +18,7 @@ from sqlalchemy import text
 from disclosure_anchor.adapters.db.postgres.bootstrap import (
     ensure_schemas_and_base_grants,
 )
+from disclosure_anchor.adapters.db.postgres.schema import OWNER_ROLE
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
@@ -180,7 +181,14 @@ class WorkerRunOnceIntegrationTests(unittest.TestCase):
         try:
             with admin.connect() as conn:
                 conn.execute(text(f'DROP DATABASE IF EXISTS "{cls.temp_db}" WITH (FORCE)'))
-                conn.execute(text(f'CREATE DATABASE "{cls.temp_db}"'))
+                # Own the scratch DB with disclosure_owner (mirrors
+                # bootstrap.ensure_database): migrations SET ROLE disclosure_owner,
+                # and 0025's CREATE EXTENSION pg_trgm needs the owner role to hold
+                # CREATE on the database. Without this the whole class silently
+                # skipped once 0025 landed.
+                conn.execute(
+                    text(f'CREATE DATABASE "{cls.temp_db}" OWNER "{OWNER_ROLE}"')
+                )
         except Exception as exc:  # pragma: no cover - environment dependent
             raise unittest.SkipTest(f"cannot create scratch database: {exc}")
         finally:

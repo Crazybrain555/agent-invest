@@ -112,7 +112,12 @@ disclosure_public.processing_runs_v1
 disclosure_public.source_refs_v1
 disclosure_public.change_events_v1
 disclosure_public.tracked_companies_v1
+disclosure_public.unit_search_projection_v1
 ```
+
+`unit_search_projection_v1`（0025 迁移，06R 派生检索投影层）：全部列可由已持久化 unit
+确定性再生，不进 content/query_projection 哈希、重建不产生 outbox 事件；non-evidence 派生面，
+与 documents/units 事实视图区别对待。
 
 检查项：
 

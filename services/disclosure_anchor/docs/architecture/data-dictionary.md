@@ -124,6 +124,13 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
   （legal_name_status pending/resolved、last_synced_at、synced_through——Miniflux
   checked_at 模式）；生效值与 sync_state（never_synced/due/fresh）由
   `GET /v1/tracked-companies` 在 API 层派生（全局 policy/间隔是文件与 env，SQL 看不见）。
+- **unit_search_projection_v1（0025 迁移，06R 派生检索投影层，U7）**：与 document_unit 1:1，
+  全部列（title_text/heading_path_text/{title,path,body,key}_tokens/header_row_candidate/
+  built_at/加权 search_tsv）可由已持久化 unit 确定性再生——应用侧 jieba 预分词 + `simple`
+  配置 + `setweight` 拼接 + 单 GIN，title/面包屑另建 pg_trgm GIN 子串兜底。**派生、非证据**：
+  不进 content/query_projection 哈希，重建不产生 outbox 事件；`retrieval_rules_version` 是重建
+  幂等键（词典/jieba 升版即全量重建）。CLI `make rebuild-search-projection`（`ALL=YES` 全量），
+  worker 每轮 publish 后跑增量。
 - **L2 直读纪律**：必须过滤 `is_active_run`（历史 run 行是 U5 审计语义）。
 
 ## 4. 词表/配置文件索引（versioned，改=升版）

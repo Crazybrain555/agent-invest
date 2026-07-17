@@ -38,6 +38,7 @@ class WorkerReport:
     parsed: int = 0
     built: int = 0
     published: int = 0
+    projected: int = 0
     failed: int = 0
     skipped_oversized: int = 0
     sync_quota_break: bool = False
@@ -60,6 +61,7 @@ class WorkerReport:
             "parsed": self.parsed,
             "built": self.built,
             "published": self.published,
+            "projected": self.projected,
             "failed": self.failed,
             "skipped_oversized": self.skipped_oversized,
             "failures": [

@@ -72,6 +72,10 @@
    "private_imports": [],
    "tests": 8
   },
+  "tests/integration/test_search_projection.py": {
+   "private_imports": [],
+   "tests": 3
+  },
   "tests/integration/test_tracked_pool_api.py": {
    "private_imports": [
     "_ADMIN_HEADERS",
@@ -233,6 +237,10 @@
   "tests/unit/test_register_document.py": {
    "private_imports": [],
    "tests": 11
+  },
+  "tests/unit/test_search_projection.py": {
+   "private_imports": [],
+   "tests": 15
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],

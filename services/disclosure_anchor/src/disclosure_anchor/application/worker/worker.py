@@ -35,6 +35,10 @@ from disclosure_anchor.application.ports.file_store import (
 )
 from disclosure_anchor.application.ports.parser import DocumentParserPort, ParserOptions
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.use_cases.build_search_projection import (
+    BuildSearchProjection,
+    BuildSearchProjectionCommand,
+)
 from disclosure_anchor.application.use_cases.build_units import (
     BuildUnits,
     BuildUnitsCommand,
@@ -249,6 +253,11 @@ def run_once(
         and not should_stop()
     ):
         _publish_stage(report, deps, limit=limits.publish, should_stop=should_stop)
+    if limits.publish > 0 and not should_stop():
+        # Derived retrieval projection (U7): delta rebuild bounded by the publish
+        # batch limit. It reads active-run units and writes only the projection
+        # table, so it is isolated from and never blocks the publish chain.
+        _project_stage(report, deps, limit=limits.publish)
 
     report.duration_seconds = (deps.clock() - started_at).total_seconds()
     return report
@@ -897,6 +906,38 @@ def _publish_stage(
             continue
 
 
+def _project_stage(
+    report: WorkerReport,
+    deps: WorkerDeps,
+    *,
+    limit: int,
+) -> None:
+    """Delta-rebuild the derived search projection (08 + 06R §5).
+
+    Failure-isolated like every other stage: a projection fault lands in the
+    failure list under stage='project' and the round still completes. The
+    projection is derived and regenerable, so a skipped round self-heals on the
+    next delta pass or a CLI full rebuild.
+    """
+
+    try:
+        result = BuildSearchProjection(engine=deps.engine).execute(
+            BuildSearchProjectionCommand(full=False, limit=limit)
+        )
+    except Exception as exc:
+        report.failed += 1
+        report.failures.append(
+            WorkerFailure(
+                stage="project",
+                item_ref="search_projection",
+                error_code=type(exc).__name__,
+                message=str(exc)[:500],
+            )
+        )
+        return
+    report.projected += result.projected
+
+
 def render_report_section(report: WorkerReport) -> str:
     """One `## run <ISO>` section; the CLI appends it to the daily file."""
 
@@ -911,6 +952,7 @@ def render_report_section(report: WorkerReport) -> str:
         f"- parsed: {report.parsed}",
         f"- built: {report.built}",
         f"- published: {report.published}",
+        f"- projected: {report.projected}",
         f"- failed: {report.failed}",
         f"- skipped_oversized: {report.skipped_oversized}",
         f"- deferred_backfill: {report.deferred_backfill}",

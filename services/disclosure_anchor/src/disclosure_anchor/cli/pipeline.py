@@ -36,6 +36,10 @@ from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.services.subject_resolver import (
     PENDING_LEGAL_NAME_PREFIX,
 )
+from disclosure_anchor.application.use_cases.build_search_projection import (
+    BuildSearchProjection,
+    BuildSearchProjectionCommand,
+)
 from disclosure_anchor.application.use_cases.build_units import (
     BuildUnits,
     BuildUnitsCommand,
@@ -173,6 +177,18 @@ def _parser() -> argparse.ArgumentParser:
     rebuild.add_argument("--document-id", required=True)
     rebuild.add_argument("--allow-empty", action="store_true")
     rebuild.add_argument("--reason")
+
+    rebuild_projection = subparsers.add_parser(
+        "rebuild-search-projection",
+        help="rebuild the 06R derived search projection (delta by default; "
+        "--all recomputes every active-run unit and prunes orphans)",
+    )
+    rebuild_projection.add_argument(
+        "--all",
+        dest="full",
+        action="store_true",
+        help="full rebuild (default: incremental — only missing/stale rows)",
+    )
 
     process = subparsers.add_parser("process")
     process.add_argument("--document-id", required=True)
@@ -358,6 +374,12 @@ def main(argv: list[str] | None = None) -> int:
                 "build_units": _jsonable(build_result),
                 "publish": _jsonable(publish_result),
             }
+        elif args.command == "rebuild-search-projection":
+            result = _jsonable(
+                deps.build_search_projection().execute(
+                    BuildSearchProjectionCommand(full=args.full)
+                )
+            )
         elif args.command == "process":
             parse_result = deps.parse().execute(
                 ParseDocumentCommand(
@@ -450,6 +472,9 @@ class _Deps:
 
     def rebuild_units(self) -> RebuildUnits:
         return RebuildUnits(uow_factory=self.uow_factory)
+
+    def build_search_projection(self) -> BuildSearchProjection:
+        return BuildSearchProjection(engine=self.engine)
 
     def track(self) -> TrackCompanies:
         return TrackCompanies(uow_factory=self.uow_factory)

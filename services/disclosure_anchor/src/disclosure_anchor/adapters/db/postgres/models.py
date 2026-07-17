@@ -14,6 +14,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Computed,
     Date,
     DateTime,
     ForeignKey,
@@ -25,7 +26,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA, OPS_SCHEMA
@@ -471,4 +472,74 @@ class OutboxEvent(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# Weighted tsvector persisted mirror of migration 0025's ``_TSV_EXPRESSION``.
+# A=title, B=breadcrumb, C=body, D=semantic keys over the pre-tokenized columns
+# through the built-in ``simple`` config (milestone 06R §3). Keep byte-identical
+# to the migration; the DB computes/stores this column, callers never write it.
+_SEARCH_TSV_EXPRESSION = (
+    "setweight(to_tsvector('simple', title_tokens), 'A') || "
+    "setweight(to_tsvector('simple', path_tokens), 'B') || "
+    "setweight(to_tsvector('simple', body_tokens), 'C') || "
+    "setweight(to_tsvector('simple', key_tokens), 'D')"
+)
+
+
+class UnitSearchProjection(Base):
+    """06R derived retrieval projection (U7): 1:1 with ``document_unit``.
+
+    Every column regenerates deterministically from the persisted unit via the
+    pinned application-side jieba tokenizer; nothing here enters content /
+    query-projection hashes and rebuilds emit no outbox events. Created by
+    migration 0025 with a matching ``pg_trgm`` GIN pair on the raw
+    title/breadcrumb strings; this ORM mirror exists so the build use case can
+    read units and upsert the projection through the same metadata.
+    """
+
+    __tablename__ = "unit_search_projection"
+    __table_args__ = (
+        Index(
+            "ix_unit_search_projection_tsv",
+            "search_tsv",
+            postgresql_using="gin",
+        ),
+        Index(
+            "ix_unit_search_projection_title_trgm",
+            "title_text",
+            postgresql_using="gin",
+            postgresql_ops={"title_text": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_unit_search_projection_path_trgm",
+            "heading_path_text",
+            postgresql_using="gin",
+            postgresql_ops={"heading_path_text": "gin_trgm_ops"},
+        ),
+        {"schema": CORE_SCHEMA},
+    )
+
+    asset_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey(f"{CORE_SCHEMA}.document_unit.asset_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    retrieval_rules_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    title_text: Mapped[str] = mapped_column(Text, nullable=False)
+    heading_path_text: Mapped[str] = mapped_column(Text, nullable=False)
+    title_tokens: Mapped[str] = mapped_column(Text, nullable=False)
+    path_tokens: Mapped[str] = mapped_column(Text, nullable=False)
+    body_tokens: Mapped[str] = mapped_column(Text, nullable=False)
+    key_tokens: Mapped[str] = mapped_column(Text, nullable=False)
+    header_row_candidate: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    built_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    search_tsv: Mapped[Any] = mapped_column(
+        TSVECTOR(),
+        Computed(_SEARCH_TSV_EXPRESSION, persisted=True),
+        nullable=False,
     )

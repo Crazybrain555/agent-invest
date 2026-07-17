@@ -2,7 +2,7 @@
 id: disclosure_anchor_design_retrieval_semantic_keys
 project: disclosure_anchor
 title: 非 embedding 检索数据面：多级标题、关键词与 semantic_key 附注词表（设计评审）
-status: partially-adopted (词表与数组过滤已实施；06R 投影待立项；现状勘误见 §6.3)
+status: partially-adopted (词表与数组过滤已实施；06R 检索投影 2026-07-17 已实施，见 milestone 06R；现状勘误见 §6.3)
 created_at: 2026-07-07
 inputs: 用户 round8 提问 + 2026-07-07 调研（EDGAR EFTS/AlphaSense/PG 中文 FTS/编报规则第15号/XBRL）+ 本仓只读取证
 decides_for: 06R（检索投影里程碑，规格待编写）+ semantic_key 词表升版
@@ -129,6 +129,12 @@ decides_for: 06R（检索投影里程碑，规格待编写）+ semantic_key 词�
 （SmarTag 模式，排序用）；③查询侧同义词映射表（06R 配套）。
 
 ## 5. 06R 最小检索投影规格草案（A1-A3 的答案）
+
+> **实施状态（2026-07-17）**：本节草案已由 milestone 06R 落地——migration 0025 建
+> `disclosure_core.unit_search_projection` 投影表 + `disclosure_public.unit_search_projection_v1`
+> 视图（应用侧 jieba 预分词 + `setweight` 加权 tsvector A=title/B=面包屑/C=正文/D=semantic keys +
+> 单 GIN；title/面包屑另建 pg_trgm GIN 子串兜底）。下表为原始设计草案，实际列集/权重以
+> migration 0025 与 milestone 06R 为准；投影仍是派生层，重建不发事件、不进哈希。
 
 U7 边界（05 §2，原文摘录）已锁定：投影是**派生层**，字段族
 heading_path_text / display_subtitle / search_text / controlled_keywords /

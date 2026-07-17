@@ -38,4 +38,6 @@ PUBLIC_VIEWS = (
     "source_refs_v1",
     "change_events_v1",
     "tracked_companies_v1",
+    # 06R derived retrieval projection (regenerable, no event semantics).
+    "unit_search_projection_v1",
 )

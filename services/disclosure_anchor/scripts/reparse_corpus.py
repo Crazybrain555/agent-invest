@@ -45,11 +45,15 @@ from disclosure_anchor.application.worker import queries
 from disclosure_anchor.application.worker.locks import WORKER_NS
 from disclosure_anchor.application.worker.worker import _process_one_document
 from disclosure_anchor.cli.worker import (
+    PARSER_INFRASTRUCTURE_ERRORS,
     _database_url,
     _deps,
     _process_scope_classes,
 )
 from disclosure_anchor.settings import Settings, load_settings
+
+# Consecutive infrastructure failures before the driver stops feeding work.
+INFRA_BREAKER_THRESHOLD = 5
 
 
 def _worklist(
@@ -106,6 +110,32 @@ def _worklist(
     return items
 
 
+def _raw_sizes(
+    engine: sqlalchemy.Engine, settings: Settings, document_ids: list[str]
+) -> dict[str, float]:
+    """Raw PDF byte sizes for scheduling; missing files sort last."""
+
+    if not document_ids:
+        return {}
+    data_root = Path(settings.disclosure_data_root) / "data"
+    sizes: dict[str, float] = {}
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT document_id, raw_file_relpath"
+                " FROM disclosure_core.document"
+                " WHERE document_id = ANY(:ids) AND raw_file_relpath IS NOT NULL"
+            ),
+            {"ids": document_ids},
+        )
+        for document_id, relpath in rows:
+            try:
+                sizes[document_id] = (data_root / relpath).stat().st_size
+            except OSError:
+                sizes[document_id] = float("inf")
+    return sizes
+
+
 def _load_done(ledger_path: Path) -> set[str]:
     done: set[str] = set()
     if not ledger_path.exists():
@@ -141,6 +171,11 @@ def main(argv: list[str] | None = None) -> int:
         items = _worklist(engine, settings, args.only)
         done = _load_done(args.ledger)
         todo = [(d, bucket) for d, bucket in items if d not in done]
+        # Small-first scheduling: giant filings otherwise monopolise every
+        # slot for 30-60 minutes each (observed 2026-07-17 annual-report
+        # cluster). Unknown sizes sort last, with the giants, fail-closed.
+        sizes = _raw_sizes(engine, settings, [d for d, _ in todo])
+        todo.sort(key=lambda item: sizes.get(item[0], float("inf")))
         if args.limit is not None:
             todo = todo[: args.limit]
         by_bucket: dict[str, int] = {}
@@ -169,9 +204,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         ledger_lock = threading.Lock()
         args.ledger.parent.mkdir(parents=True, exist_ok=True)
-        counters = {"published": 0, "failed": 0}
+        counters = {"published": 0, "failed": 0, "consecutive_infra": 0}
+        stop_event = threading.Event()
 
         def run_one(document_id: str, bucket: str) -> None:
+            if stop_event.is_set():
+                return
             outcome = _process_one_document(deps, document_id)
             record = {
                 "document_id": document_id,
@@ -190,6 +228,28 @@ def main(argv: list[str] | None = None) -> int:
                 with args.ledger.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                 counters["published" if outcome.published else "failed"] += 1
+                # Circuit breaker (worker _halts_parse_refill analogue): a run
+                # of consecutive parser-infrastructure failures means the GPU
+                # server is down — stop feeding documents instead of burning a
+                # failed run per document (observed 2026-07-17 outage).
+                if (
+                    outcome.failure is not None
+                    and outcome.failure.error_code
+                    in PARSER_INFRASTRUCTURE_ERRORS
+                ):
+                    counters["consecutive_infra"] += 1
+                    if counters["consecutive_infra"] >= INFRA_BREAKER_THRESHOLD:
+                        if not stop_event.is_set():
+                            print(
+                                "[breaker] "
+                                f"{counters['consecutive_infra']} consecutive "
+                                "parser-infrastructure failures — halting; fix "
+                                "the parser backend and rerun with the same "
+                                "ledger"
+                            )
+                        stop_event.set()
+                else:
+                    counters["consecutive_infra"] = 0
                 total_done = counters["published"] + counters["failed"]
                 if total_done % 25 == 0 or not outcome.published:
                     print(
@@ -209,6 +269,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"[done] published={counters['published']} failed={counters['failed']}"
         )
+        if stop_event.is_set():
+            return 2
         return 0 if counters["failed"] == 0 else 1
     finally:
         lock_conn.close()
