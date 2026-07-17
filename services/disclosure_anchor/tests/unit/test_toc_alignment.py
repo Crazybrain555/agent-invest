@@ -98,6 +98,20 @@ class TocParsingTests(unittest.TestCase):
         # Short lists never define the outline.
         self.assertEqual(toc_declared_root_keys(["10 第一章 公司简介"]), frozenset())
 
+    def test_feature_box_without_enumerators_contributes_nothing(self) -> None:
+        # A page-numbered feature box mimics the TOC line grammar but carries
+        # no statutory 第X章/节 entries, so it must not declare sections.
+        box = "\n".join(
+            [
+                "21 热点问题一 高质量发展业绩亮点",
+                "22 热点问题二 持续提升服务实体经济质效",
+                "23 热点问题三 全面风险管理与资产质量",
+                "24 热点问题四 基础工程夯实生态化基础",
+                "25 热点问题五 数字工行建设持续深化",
+            ]
+        )
+        self.assertEqual(toc_declared_root_keys([box]), frozenset())
+
     def test_dash_wrapped_page_numbers_parse(self) -> None:
         text = "\n".join(
             [

@@ -1233,6 +1233,26 @@ def s2_apply_heading_tree(
     return sorted(placed, key=lambda item: (item.order_index, item.intra_order))
 
 
+def _front_matter_page_texts(
+    elements: Iterable[PreparedElement],
+) -> list[str]:
+    """Front-matter text joined per page for TOC detection.
+
+    Some backends emit one element per TOC line, so a per-element scan never
+    reaches the TOC-shape threshold; the page is the natural block.
+    """
+
+    pages: dict[int, list[str]] = {}
+    for element in elements:
+        if (
+            element.kind == "text"
+            and element.text
+            and (element.page_no or 0) <= 30
+        ):
+            pages.setdefault(element.page_no or 0, []).append(element.text)
+    return ["\n".join(texts) for _, texts in sorted(pages.items())]
+
+
 def _section_continuation_key(title: str) -> str:
     """Continuation-tolerant identity key ("第十节财务报告（续）" == "…报告")."""
 
@@ -2163,11 +2183,7 @@ def build_unit_drafts_s1_s7(
         elements,
         qa_heading_mode=qa_mode,
         toc_root_keys=toc_outline.toc_declared_root_keys(
-            element.text
-            for element in elements
-            if element.kind == "text"
-            and element.text
-            and (element.page_no or 0) <= 30
+            _front_matter_page_texts(elements)
         ),
         stats=s1.stats,
     )

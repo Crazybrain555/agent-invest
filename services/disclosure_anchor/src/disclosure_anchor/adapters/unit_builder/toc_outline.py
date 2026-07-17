@@ -107,14 +107,19 @@ def parse_toc_titles(toc_text: str) -> tuple[list[str], int]:
 
 _SUB_ENTRY_PREFIX_RE = re.compile(r"^[\d(（]")
 
+# A block harvests unprefixed entries only when it proves itself a statutory
+# TOC by carrying this many 第X章/第X节 entries; page-numbered feature boxes
+# ("热点问题一…") mimic the line grammar but never carry the enumerators.
+_MIN_ENUMERATED_ENTRIES = 2
+
 
 def toc_declared_root_keys(text_blocks: Iterable[str]) -> frozenset[str]:
     """Normalized top-level section names declared by TOC-shaped blocks.
 
     Enumerator-prefixed entries (第X章/第X节 …) are top-level by statute and
     are returned enumerator-stripped so prefix-less body openers can match.
-    Unprefixed entries without sub-entry numbering (释义, 行长致辞,
-    附表：…) are the TOC's own top level and count as declared too;
+    Unprefixed entries without sub-entry numbering (释义, 附表：…) count as
+    declared only inside a block that also carries the statutory enumerators;
     numbered sub-entries (3.1 …, (1) …) never do.
     """
 
@@ -122,6 +127,13 @@ def toc_declared_root_keys(text_blocks: Iterable[str]) -> frozenset[str]:
     for block in text_blocks:
         titles, _unparsed = parse_toc_titles(block)
         if len(titles) < _MIN_TOC_TITLES:
+            continue
+        prefixed = [
+            title
+            for title in titles
+            if strip_section_enumerator(title) != title.strip()
+        ]
+        if len(prefixed) < _MIN_ENUMERATED_ENTRIES:
             continue
         for title in titles:
             stripped = strip_section_enumerator(title)
