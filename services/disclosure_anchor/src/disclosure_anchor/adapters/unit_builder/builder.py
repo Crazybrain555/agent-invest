@@ -1039,6 +1039,36 @@ def s2_apply_heading_tree(
             source_level = max(1, min(7, parser_level or level))
             evidence = _heading_pattern_evidence(heading_text, stack=stack)
             pattern_level = evidence.level
+            if not parser_levels_informative and pattern_level is not None:
+                # Degenerate regime: the grammar evidence level is the only
+                # honest depth. HEADING_PATTERNS matches already agree with
+                # ``level``; dotted chains ("1.2") match no pattern entry and
+                # would otherwise keep the meaningless parser constant, which
+                # made anchored children outrank mid-stack ancestors.
+                source_level = max(1, min(7, pattern_level))
+            if (
+                not parser_levels_informative
+                and pattern_level is None
+                and evidence.dotted_components is None
+                and _normalized_title(heading_text) not in rules.FIXED_L1_TITLES
+                and stack
+            ):
+                # Degenerate-regime unnumbered headings carry no depth evidence
+                # at all (constant parser level, no grammar), so they anchor to
+                # the stack top instead of resetting to root: below a top that
+                # proved its depth (grammar/dotted), beside a top that could
+                # not (FIXED anchors and other anchored headings). Ancestors
+                # are never severed on no-evidence input; an empty stack keeps
+                # the honest root for document-front matter.
+                top_entry = stack[-1]
+                top_has_depth_evidence = (
+                    top_entry.pattern_level is not None
+                    or top_entry.dotted_components is not None
+                )
+                source_level = min(
+                    7,
+                    top_entry.source_level + (1 if top_has_depth_evidence else 0),
+                )
             dotted_parent_proven = False
             if evidence.dotted_components is not None:
                 components = evidence.dotted_components

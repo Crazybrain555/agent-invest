@@ -912,6 +912,128 @@ class UnitBuilderTests(unittest.TestCase):
         self.assertEqual(body.heading_path[0], "第三节 财务报告")
         self.assertEqual(body.heading_path[-1], "1）税前折现率的确定方法")
 
+    def test_s2_degenerate_unnumbered_heading_anchors_below_numbered_parent(
+        self,
+    ) -> None:
+        # Phase 2 (approved 2026-07-17): in a degenerate-parser document an
+        # unnumbered heading has no depth evidence, so it anchors below the
+        # stack top instead of resetting to root — ancestors survive for both
+        # its own body and the numbered sibling that follows.
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(
+                    kind="heading", order_index=1, heading_level=1, text="第一节 财务报告"
+                ),
+                PreparedElement(
+                    kind="heading", order_index=2, heading_level=1, text="一、公司概况"
+                ),
+                PreparedElement(
+                    kind="heading",
+                    order_index=3,
+                    heading_level=1,
+                    text="审计报告基本情况",
+                ),
+                PreparedElement(kind="text", order_index=4, text="审计意见为标准无保留。"),
+                PreparedElement(
+                    kind="heading", order_index=5, heading_level=1, text="（一）资产构成"
+                ),
+                PreparedElement(kind="text", order_index=6, text="资产以流动资产为主。"),
+            ]
+        )
+
+        audit_body = next(
+            item for item in placed if item.text == "审计意见为标准无保留。"
+        )
+        asset_body = next(
+            item for item in placed if item.text == "资产以流动资产为主。"
+        )
+        self.assertEqual(
+            audit_body.heading_path,
+            ["第一节 财务报告", "一、公司概况", "审计报告基本情况"],
+        )
+        self.assertEqual(
+            asset_body.heading_path,
+            ["第一节 财务报告", "一、公司概况", "（一）资产构成"],
+        )
+
+    def test_s2_degenerate_consecutive_unnumbered_headings_stay_siblings(
+        self,
+    ) -> None:
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(
+                    kind="heading", order_index=1, heading_level=1, text="第一节 财务报告"
+                ),
+                PreparedElement(
+                    kind="heading", order_index=2, heading_level=1, text="一、公司概况"
+                ),
+                PreparedElement(
+                    kind="heading", order_index=3, heading_level=1, text="主要会计数据"
+                ),
+                PreparedElement(kind="text", order_index=4, text="营业收入十亿元。"),
+                PreparedElement(
+                    kind="heading", order_index=5, heading_level=1, text="补充财务指标"
+                ),
+                PreparedElement(kind="text", order_index=6, text="加权净资产收益率。"),
+            ]
+        )
+
+        second = next(item for item in placed if item.text == "加权净资产收益率。")
+        self.assertEqual(
+            second.heading_path,
+            ["第一节 财务报告", "一、公司概况", "补充财务指标"],
+        )
+        self.assertNotIn("主要会计数据", second.heading_path)
+
+    def test_s2_degenerate_unnumbered_after_fixed_anchor_stays_root_sibling(
+        self,
+    ) -> None:
+        # FIXED_L1 anchors declare a statutory root but prove no depth below
+        # themselves, so a following unnumbered heading stays a root sibling
+        # rather than being swallowed into the anchor's section.
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(
+                    kind="heading", order_index=1, heading_level=1, text="重要提示"
+                ),
+                PreparedElement(kind="text", order_index=2, text="本报告未经审计。"),
+                PreparedElement(
+                    kind="heading", order_index=3, heading_level=1, text="其他事项说明"
+                ),
+                PreparedElement(kind="text", order_index=4, text="无其他事项。"),
+            ]
+        )
+
+        other = next(item for item in placed if item.text == "无其他事项。")
+        self.assertEqual(other.heading_path, ["其他事项说明"])
+
+    def test_s2_varied_parser_levels_skip_unnumbered_anchoring(self) -> None:
+        # Adjacent negative: with an informative parser level set the anchoring
+        # branch must not fire — the unnumbered heading keeps parser semantics
+        # (level 2 cuts back to the level-1 section, dropping 一、).
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(
+                    kind="heading", order_index=1, heading_level=1, text="第一节 财务报告"
+                ),
+                PreparedElement(
+                    kind="heading", order_index=2, heading_level=2, text="一、公司概况"
+                ),
+                PreparedElement(
+                    kind="heading",
+                    order_index=3,
+                    heading_level=2,
+                    text="审计报告基本情况",
+                ),
+                PreparedElement(kind="text", order_index=4, text="审计意见为标准无保留。"),
+            ]
+        )
+
+        body = next(item for item in placed if item.text == "审计意见为标准无保留。")
+        self.assertEqual(
+            body.heading_path, ["第一节 财务报告", "审计报告基本情况"]
+        )
+
     def test_s2_missing_parser_levels_fall_back_to_numbering_grammar(self) -> None:
         # Boundary: no heading carries a parser level at all — the level set is
         # empty, the document is degenerate, and grammar depths must hold.
