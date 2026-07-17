@@ -1007,6 +1007,25 @@ class UnitBuilderTests(unittest.TestCase):
         other = next(item for item in placed if item.text == "无其他事项。")
         self.assertEqual(other.heading_path, ["其他事项说明"])
 
+    def test_numbered_request_line_without_question_mark_is_not_a_heading(
+        self,
+    ) -> None:
+        # Transcript questions phrased as requests ("N. 请介绍…。") carry no
+        # question mark yet are dialogue, not section headings.
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(
+                    kind="heading",
+                    order_index=1,
+                    heading_level=1,
+                    text="4. 请介绍一下信用卡业务的整体经营情况。",
+                ),
+                PreparedElement(kind="text", order_index=2, text="信用卡业务保持稳健。"),
+            ]
+        )
+        body = next(item for item in placed if item.text == "信用卡业务保持稳健。")
+        self.assertEqual(body.heading_path, [])
+
     def test_s2_toc_declared_opener_roots_instead_of_anchoring(self) -> None:
         # A degenerate document whose TOC declares "第X章 <title>" proves that
         # a prefix-less body opener with the same title is a top-level section

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import unicodedata
 
 
-RULES_VERSION = "ub-2026.07-64"
+RULES_VERSION = "ub-2026.07-65"
 HEADING_RULESET_ID = "cn_a_v6"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -364,6 +364,10 @@ FIXED_L1_TITLES = {"重要提示", "释义", "目录", "备查文件", "备查�
 QUESTION_START_RE = re.compile(
     r"^\s*(问题|问|Q\d*|投资者提问|提问)\s*\d*\s*[：:]"
     r"|^\s*\d+[、.．]\s*.{2,}[？?]\s*$"
+    # Numbered interrogative-request openers without a question mark
+    # ("4. 请介绍一下信用卡业务的整体经营情况。") are transcript questions,
+    # not section headings.
+    r"|^\s*\d+[、.．]\s*请(?:问|介绍|谈|简[要单]介绍|分享|说明|展望)"
 )
 # A real, controlled fallback concept for evidence that has no narrower
 # section/event match.  This is intentionally not ``unknown``: the unit is

@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 from collections import Counter
+from difflib import SequenceMatcher
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -57,6 +58,14 @@ def match_titles_to_tree(
             or (len(segment) >= 4 and key.startswith(segment))
             for segment in segments
         )
+        if not hit and len(key) >= 6:
+            # Near-match fallback: body headings drift from the TOC by a
+            # character or two ("前六个月内买卖" vs "前六个月买卖").
+            hit = any(
+                len(segment) >= 6
+                and SequenceMatcher(None, key, segment).ratio() >= 0.85
+                for segment in segments
+            )
         (matched if hit else missing).append(title)
     return matched, missing
 

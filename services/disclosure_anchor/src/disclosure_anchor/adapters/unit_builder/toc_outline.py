@@ -41,6 +41,35 @@ def _candidate_lines(toc_text: str) -> list[str]:
     return lines
 
 
+def _join_wrapped_lines(lines: list[str]) -> list[str]:
+    """Repair a long TOC entry wrapped onto two physical lines.
+
+    A wrapped head carries no page number of its own; joining it with the
+    following line yields one parseable entry ("四、本次权益变动…不超过公 /
+    司已发行股份 5% 的情况....8"). Only an unparseable head followed by a
+    line whose concatenation parses is joined, so normal entries never merge.
+    """
+
+    joined: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        head_parses = bool(
+            _TRAILING_PAGE_RE.match(line) or _LEADING_PAGE_RE.match(line)
+        )
+        if not head_parses and index + 1 < len(lines):
+            candidate = line + lines[index + 1]
+            if _TRAILING_PAGE_RE.match(candidate) or _LEADING_PAGE_RE.match(
+                candidate
+            ):
+                joined.append(candidate)
+                index += 2
+                continue
+        joined.append(line)
+        index += 1
+    return joined
+
+
 def parse_toc_titles(toc_text: str) -> tuple[list[str], int]:
     """Extract section titles from a TOC page's text.
 
@@ -50,6 +79,7 @@ def parse_toc_titles(toc_text: str) -> tuple[list[str], int]:
     """
 
     lines = _candidate_lines(toc_text)
+    lines = _join_wrapped_lines(lines)
     trailing = [_TRAILING_PAGE_RE.match(line) for line in lines]
     leading = [_LEADING_PAGE_RE.match(line) for line in lines]
 

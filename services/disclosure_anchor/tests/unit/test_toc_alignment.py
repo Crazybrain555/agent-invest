@@ -50,6 +50,27 @@ class TocParsingTests(unittest.TestCase):
         titles, _ = parse_toc_titles("目\n录\n....\n123\n")
         self.assertEqual(titles, [])
 
+    def test_wrapped_toc_entry_joins_with_next_line(self) -> None:
+        text = "\n".join(
+            [
+                "一、信息披露义务人及其一致行动人....3",
+                "四、本次权益变动不超过公",
+                "司已发行股份 5% 的情况....8",
+                "五、前六个月买卖上市公司股票的情况....12",
+            ]
+        )
+        titles, unparsed = parse_toc_titles(text)
+        self.assertIn("四、本次权益变动不超过公司已发行股份 5% 的情况", titles)
+        self.assertEqual(unparsed, 0)
+
+    def test_near_match_tolerates_single_character_drift(self) -> None:
+        segments = {normalize_heading("第五节 前六个月内买卖上市公司股票的情况")}
+        matched, missing = match_titles_to_tree(
+            ["第五节 前六个月买卖上市公司股票的情况"], segments
+        )
+        self.assertEqual(missing, [])
+        self.assertEqual(len(matched), 1)
+
     def test_strip_section_enumerator(self) -> None:
         self.assertEqual(strip_section_enumerator("第三章 管理层讨论与分析"), "管理层讨论与分析")
         self.assertEqual(strip_section_enumerator("第十节 财务报告"), "财务报告")
