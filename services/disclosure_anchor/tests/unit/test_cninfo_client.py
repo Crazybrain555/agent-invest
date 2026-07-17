@@ -175,7 +175,7 @@ class CninfoClientTests(unittest.TestCase):
         self.assertEqual(raised.exception.error_code, "http_400")
         client.close()
 
-    def test_quota_and_billing_resultcodes_trip_same_breaker(self) -> None:
+    def test_rate_and_billing_resultcodes_classify_separately(self) -> None:
         for resultcode in (407, 408, 412, 429):
             with self.subTest(resultcode=resultcode):
                 calls = 0
@@ -197,7 +197,10 @@ class CninfoClientTests(unittest.TestCase):
                         path="/api/info/p_info3015",
                         params={"scode": "000001"},
                     )
-                self.assertEqual(raised.exception.error_code, "quota_exhausted")
+                expected = (
+                    "rate_limited" if resultcode == 429 else "quota_exhausted"
+                )
+                self.assertEqual(raised.exception.error_code, expected)
                 self.assertTrue(raised.exception.retryable)
                 self.assertEqual(calls, 1)
                 client.close()
@@ -371,3 +374,53 @@ class ClientErrorAuditTests(unittest.TestCase):
         self.assertEqual(payload["resultcode"], 429)
         self.assertEqual(payload["http_status"], 200)
         self.assertEqual(payload["error_code"], "quota_exhausted")
+
+
+class AdaptiveTokenBucketTests(unittest.TestCase):
+    def test_throttle_halves_and_floors_success_increases_and_caps(self) -> None:
+        from disclosure_anchor.adapters.sources.cninfo.client import (
+            AdaptiveTokenBucket,
+        )
+
+        bucket = AdaptiveTokenBucket(
+            max_qps=1.5,
+            min_qps=0.1,
+            initial_qps=0.8,
+            increase_step_qps=0.1,
+            successes_per_increase=2,
+            clock=lambda: 0.0,
+            sleep=lambda _s: None,
+        )
+        self.assertAlmostEqual(bucket.current_qps, 0.8)
+        bucket.on_throttle()
+        self.assertAlmostEqual(bucket.current_qps, 0.4)
+        for _ in range(6):
+            bucket.on_throttle()
+        self.assertAlmostEqual(bucket.current_qps, 0.1)
+        for _ in range(2):
+            bucket.on_success()
+        self.assertAlmostEqual(bucket.current_qps, 0.2)
+        for _ in range(100):
+            bucket.on_success()
+        self.assertAlmostEqual(bucket.current_qps, 1.5)
+
+    def test_throttle_resets_success_streak(self) -> None:
+        from disclosure_anchor.adapters.sources.cninfo.client import (
+            AdaptiveTokenBucket,
+        )
+
+        bucket = AdaptiveTokenBucket(
+            max_qps=1.0,
+            initial_qps=0.5,
+            increase_step_qps=0.1,
+            successes_per_increase=3,
+            clock=lambda: 0.0,
+            sleep=lambda _s: None,
+        )
+        bucket.on_success()
+        bucket.on_success()
+        bucket.on_throttle()
+        bucket.on_success()
+        bucket.on_success()
+        # The pre-throttle streak must not carry over.
+        self.assertAlmostEqual(bucket.current_qps, 0.25)

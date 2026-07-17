@@ -8,6 +8,8 @@ round continues.
 
 from __future__ import annotations
 
+import time
+
 from collections import Counter
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -192,6 +194,7 @@ def run_once(
                     deps,
                     source,
                     limit=limits.sync,
+                    stage_seconds=limits.sync_stage_seconds,
                     should_stop=should_stop,
                 )
             if (
@@ -269,6 +272,7 @@ def _sync_stage(
     source: DisclosureSourcePort | None,
     *,
     limit: int,
+    stage_seconds: int,
     should_stop: Callable[[], bool],
 ) -> DisclosureSourcePort | None:
     with deps.engine.connect() as conn:
@@ -285,8 +289,13 @@ def _sync_stage(
     )
     today = deps.clock().astimezone(SHANGHAI_TZ).date()
     processing_backlog_now: int | None = None
+    stage_deadline = time.monotonic() + stage_seconds if stage_seconds > 0 else None
     for row in due:
         if should_stop():
+            return source
+        if stage_deadline is not None and time.monotonic() >= stage_deadline:
+            # Time-boxed: yield to download/parse so no stage starves; the
+            # remaining companies stay due for the next round.
             return source
         security_code = row.get("security_code")
         exchange = row.get("exchange")
@@ -358,6 +367,12 @@ def _sync_stage(
                     retryable=retryable,
                 )
             )
+            if _is_rate_limit_error(exc):
+                # Short-window provider verdict: yield the stage now and let
+                # the controller apply a brief cooldown while local download/
+                # parse work continues.
+                report.sync_rate_limited = True
+                return source
             if _is_quota_error(exc):
                 # Round-level breaker (edgartools guidance: stop, do not keep
                 # burning quota); remaining companies stay due for next round.
@@ -427,6 +442,17 @@ def _record_sync_failure_access(
             )
         )
         uow.commit()
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "error_code", None) == "rate_limited":
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _is_quota_error(exc: BaseException) -> bool:
@@ -957,6 +983,7 @@ def render_report_section(report: WorkerReport) -> str:
         f"- skipped_oversized: {report.skipped_oversized}",
         f"- deferred_backfill: {report.deferred_backfill}",
         f"- sync_quota_break: {report.sync_quota_break}",
+        f"- sync_rate_limited: {report.sync_rate_limited}",
         f"- source_outage_break: {report.source_outage_break}",
     ]
     if report.failures:

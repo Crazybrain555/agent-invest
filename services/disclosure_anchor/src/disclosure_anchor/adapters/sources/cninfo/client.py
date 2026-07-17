@@ -25,8 +25,13 @@ RETRYABLE_RESULT_CODES = frozenset({-1, 403, 404, 405})
 # 配额/限流（信封 resultcode=429）：参照 edgartools 对 SEC 429 的处理——请求内
 # 立即失败（重试只会烧配额/延长封禁），但 retryable=true 留给下一轮；worker 侧
 # 另有轮级熔断（design/watchlist-operations.md §5.3）。
-QUOTA_RESULT_CODES = frozenset({407, 408, 412, 429})
+QUOTA_RESULT_CODES = frozenset({407, 408, 412})
 QUOTA_ERROR_CODE = "quota_exhausted"
+# 429 is a short-window rate verdict (probe 2026-07-18: ~70 calls at 1 rps
+# trip it and it clears within minutes) — waiting briefly helps, unlike a
+# billing wall.
+RATE_LIMIT_RESULT_CODES = frozenset({429})
+RATE_LIMIT_ERROR_CODE = "rate_limited"
 TOKEN_REFRESH_RESULT_CODES = frozenset({404, 405})
 BACKOFF_BASE_SECONDS = 1.0
 BACKOFF_FACTOR = 2.0
@@ -103,6 +108,64 @@ class TokenBucket:
         self._next_available_at = max(now, self._next_available_at) + self._interval_seconds
 
 
+class AdaptiveTokenBucket:
+    """AIMD client-side rate limiter (AWS SDK adaptive-retry-mode style).
+
+    Successes grow the send rate additively; a provider rate verdict halves
+    it. Configuration sets only the bounds — the operating point is
+    discovered at runtime against the provider's actual tolerance.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_qps: float,
+        min_qps: float = 0.1,
+        initial_qps: float | None = None,
+        increase_step_qps: float = 0.05,
+        successes_per_increase: int = 10,
+        clock: Callable[[], float] | None = None,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        if max_qps <= 0:
+            raise ValueError("CNINFO max_qps must be greater than zero")
+        self._max_qps = max_qps
+        self._min_qps = min(min_qps, max_qps)
+        self._rate = initial_qps if initial_qps is not None else max(
+            self._min_qps, max_qps / 2
+        )
+        self._rate = min(max(self._rate, self._min_qps), self._max_qps)
+        self._increase_step = increase_step_qps
+        self._successes_per_increase = successes_per_increase
+        self._successes = 0
+        self._clock = clock or time.monotonic
+        self._sleep = sleep or time.sleep
+        self._next_available_at = 0.0
+
+    @property
+    def current_qps(self) -> float:
+        return self._rate
+
+    def take(self) -> None:
+        now = self._clock()
+        if now < self._next_available_at:
+            self._sleep(self._next_available_at - now)
+            now = self._clock()
+        self._next_available_at = max(now, self._next_available_at) + (
+            1.0 / self._rate
+        )
+
+    def on_success(self) -> None:
+        self._successes += 1
+        if self._successes >= self._successes_per_increase:
+            self._successes = 0
+            self._rate = min(self._max_qps, self._rate + self._increase_step)
+
+    def on_throttle(self) -> None:
+        self._successes = 0
+        self._rate = max(self._min_qps, self._rate / 2)
+
+
 class CninfoClient:
     """Small CNINFO client used by source adapter and sync use cases."""
 
@@ -129,7 +192,9 @@ class CninfoClient:
         self._access_secret = access_secret
         self._access_token = access_token
         self._max_retries = max_retries
-        self._bucket = bucket or TokenBucket(max_qps=max_qps, sleep=sleep)
+        self._bucket = bucket or AdaptiveTokenBucket(
+            max_qps=max_qps, sleep=sleep
+        )
         self._sleep = sleep or time.sleep
         self._jitter = jitter or (lambda upper: random.uniform(0.0, upper))
         self._client = httpx.Client(transport=transport, timeout=30.0, trust_env=False)
@@ -273,7 +338,20 @@ class CninfoClient:
                 continue
             resultcode = response.audit.resultcode
             if response.audit.http_status < 400 and resultcode == 200:
+                on_success = getattr(self._bucket, "on_success", None)
+                if on_success is not None:
+                    on_success()
                 return response
+            if resultcode in RATE_LIMIT_RESULT_CODES:
+                on_throttle = getattr(self._bucket, "on_throttle", None)
+                if on_throttle is not None:
+                    on_throttle()
+                raise CninfoClientError(
+                    f"CNINFO rate limit hit (resultcode {resultcode})",
+                    error_code=RATE_LIMIT_ERROR_CODE,
+                    retryable=True,
+                    audit=response.audit,
+                )
             if resultcode in QUOTA_RESULT_CODES:
                 raise CninfoClientError(
                     f"CNINFO quota/billing limit reached (resultcode {resultcode})",

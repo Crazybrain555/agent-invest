@@ -14,6 +14,7 @@ class WorkerLimits:
     parse: int
     build: int
     publish: int
+    sync_stage_seconds: int = 300
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class WorkerReport:
     failed: int = 0
     skipped_oversized: int = 0
     sync_quota_break: bool = False
+    sync_rate_limited: bool = False
     source_outage_break: bool = False
     deferred_backfill: int = 0
     failures: list[WorkerFailure] = field(default_factory=list)
@@ -56,6 +58,7 @@ class WorkerReport:
             "candidates_discovered": self.candidates_discovered,
             "downloaded": self.downloaded,
             "sync_quota_break": self.sync_quota_break,
+            "sync_rate_limited": self.sync_rate_limited,
             "source_outage_break": self.source_outage_break,
             "deferred_backfill": self.deferred_backfill,
             "parsed": self.parsed,

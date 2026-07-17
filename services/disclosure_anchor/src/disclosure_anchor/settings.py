@@ -214,6 +214,16 @@ class Settings(BaseSettings):
             "DISCLOSURE_SYNC_INTERVAL_SECONDS", "disclosure_sync_interval_seconds"
         ),
     )
+    # Sync-stage time box: the stage yields to download/parse after this many
+    # seconds even mid-batch, so a long first-sync sweep can never starve the
+    # GPU; remaining companies stay due for the next round.
+    worker_sync_stage_seconds: int = Field(
+        default=300,
+        ge=0,
+        validation_alias=AliasChoices(
+            "WORKER_SYNC_STAGE_SECONDS", "worker_sync_stage_seconds"
+        ),
+    )
     worker_batch_sync: int = Field(
         default=13,
         ge=0,

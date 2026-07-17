@@ -60,6 +60,8 @@ SKIP_MESSAGE = "[skip] another worker holds the singleton lock"
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 SYSTEM_ERROR_BASE_SECONDS = 60
 SYNC_COOLDOWN_BASE_SECONDS = 1800
+RATE_LIMIT_COOLDOWN_BASE_SECONDS = 90
+RATE_LIMIT_COOLDOWN_MAX_SECONDS = 600
 SYNC_COOLDOWN_MAX_SECONDS = 7200
 PARSE_COOLDOWN_BASE_SECONDS = 120
 PROVIDER_ERROR_COOLDOWN_BASE_SECONDS = 60
@@ -202,6 +204,8 @@ class _AdaptiveLoopController:
     item_failure_delay_seconds: int = SYSTEM_ERROR_BASE_SECONDS
     system_failure_delay_seconds: int = SYSTEM_ERROR_BASE_SECONDS
     sync_quota_cooldown_until: float = 0.0
+    rate_limit_cooldown_until: float = 0.0
+    rate_limit_cooldown_seconds: int = RATE_LIMIT_COOLDOWN_BASE_SECONDS
     provider_error_cooldown_until: float = 0.0
     quota_cooldown_seconds: int = SYNC_COOLDOWN_BASE_SECONDS
     provider_error_cooldown_seconds: int = PROVIDER_ERROR_COOLDOWN_BASE_SECONDS
@@ -226,6 +230,7 @@ class _AdaptiveLoopController:
                 0
                 if now < max(
                     self.sync_quota_cooldown_until,
+                    self.rate_limit_cooldown_until,
                     self.provider_error_cooldown_until,
                 )
                 else base.sync
@@ -253,7 +258,14 @@ class _AdaptiveLoopController:
         # healthy again, even when the queues are empty.
         self.system_failure_delay_seconds = SYSTEM_ERROR_BASE_SECONDS
         quota_started = False
-        if report.sync_quota_break:
+        if report.sync_rate_limited:
+            self.rate_limit_cooldown_until = now + self.rate_limit_cooldown_seconds
+            self.rate_limit_cooldown_seconds = min(
+                RATE_LIMIT_COOLDOWN_MAX_SECONDS,
+                self.rate_limit_cooldown_seconds * 2,
+            )
+            quota_started = True
+        elif report.sync_quota_break:
             self.sync_quota_cooldown_until = now + self.quota_cooldown_seconds
             self.quota_cooldown_seconds = min(
                 SYNC_COOLDOWN_MAX_SECONDS, self.quota_cooldown_seconds * 2
@@ -269,6 +281,7 @@ class _AdaptiveLoopController:
             )
         elif report.synced_companies:
             self.quota_cooldown_seconds = SYNC_COOLDOWN_BASE_SECONDS
+            self.rate_limit_cooldown_seconds = RATE_LIMIT_COOLDOWN_BASE_SECONDS
             self.provider_error_cooldown_seconds = PROVIDER_ERROR_COOLDOWN_BASE_SECONDS
         elif report.downloaded:
             # Local/static download success proves the provider path recovered,
@@ -343,6 +356,7 @@ class _AdaptiveLoopController:
             deadline - now
             for deadline in (
                 self.sync_quota_cooldown_until,
+                self.rate_limit_cooldown_until,
                 self.provider_error_cooldown_until,
                 self.parse_cooldown_until,
                 self.build_cooldown_until,
@@ -453,6 +467,7 @@ def _sleep_interruptible(seconds: float, *, stop: _StopFlag) -> None:
 def _limits(settings: Settings) -> WorkerLimits:
     return WorkerLimits(
         sync=settings.worker_batch_sync,
+        sync_stage_seconds=settings.worker_sync_stage_seconds,
         download=settings.worker_batch_download,
         parse=settings.worker_batch_parse,
         build=settings.worker_batch_build,
