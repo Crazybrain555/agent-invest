@@ -517,7 +517,7 @@ class UnitBuilderTests(unittest.TestCase):
         )
 
         self.assertEqual(placed[0].kind, "text")
-        # QA discrimination was removed 2026-07-16: the numbered request line is
+        # QA discrimination was removed: the numbered request line is
         # never split into a question/answer pair. Under qa_heading_mode it is
         # demoted out of the heading tree yet stays one raw text unit that keeps
         # the whole line as its title (declarative numbering is not fragmented).
@@ -915,7 +915,7 @@ class UnitBuilderTests(unittest.TestCase):
     def test_s2_degenerate_unnumbered_heading_anchors_below_numbered_parent(
         self,
     ) -> None:
-        # Phase 2 (approved 2026-07-17): in a degenerate-parser document an
+        # In a degenerate-parser document an
         # unnumbered heading has no depth evidence, so it anchors below the
         # stack top instead of resetting to root — ancestors survive for both
         # its own body and the numbered sibling that follows.
@@ -1899,15 +1899,14 @@ class UnitBuilderTests(unittest.TestCase):
                 )
 
     def test_statutory_section_keys_and_filing_gates(self) -> None:
-        # 2026-07-17 approved expansion: statutory report sections
+        # Statutory report sections
         # (格式准则第2号) plus the universal exchange-format notice preamble.
         cases = [
             ("重要内容提示:", "other", ["important_notice"]),
             ("特别提示", "related_party", ["important_notice"]),
             ("备查文件", "annual_report", ["reference_documents"]),
             ("释义", "annual_report", ["definitions"]),
-            # 2026-07-17 batch 3 ungated the structural section keys:
-            # announcements carry 备查文件/释义 sections too.
+            # Announcements carry 备查文件/释义 sections too.
             ("备查文件", "other", ["reference_documents"]),
             ("释义", "financing", ["definitions"]),
         ]
@@ -1943,9 +1942,9 @@ class UnitBuilderTests(unittest.TestCase):
         )
 
     def test_announcement_section_keys_guarantee_and_incentive(self) -> None:
-        # 2026-07-17 approved batch 2: guarantee + equity-incentive section
-        # keys (交易所公告格式指引交易类第5号 / 股权激励管理办法第九条),
-        # leaf_only and unrestricted by filing type.
+        # Guarantee + equity-incentive section keys (交易所公告格式指引
+        # 交易类第5号 / 股权激励管理办法第九条), leaf_only and unrestricted
+        # by filing type.
         cases = [
             ("一、担保情况概述", "financing", ["guarantee_overview"]),
             ("三、担保协议的主要内容", "financing", ["guarantee_agreement_terms"]),
@@ -1956,13 +1955,13 @@ class UnitBuilderTests(unittest.TestCase):
             ("6、归属安排", "equity_incentive", ["incentive_vesting_exercise"]),
             ("7、有效期、限售期和解除限售安排", "equity_incentive", ["incentive_vesting_exercise"]),
             ("（一）2021年激励计划简介及授予情况", "equity_incentive", ["incentive_plan_overview"]),
-            # Adjacent negatives (independent review 2026-07-17): assessment
+            # Adjacent negatives: assessment
             # and lockup-release phrases outside the incentive-plan idiom must
             # not earn incentive scalars — a remuneration KPI section or an
             # IPO lockup-expiry announcement shares the surface words.
             ("四、高级管理人员的业绩考核要求", "annual_report", []),
             ("三、解除限售安排", "equity_share_change", []),
-            # Batch 3: related-party family and cross-announcement sections
+            # Related-party family and cross-announcement sections
             # (交易类第9号 template phrasing).
             ("一、关联交易概述", "related_party", ["related_party_overview"]),
             ("二、关联方基本情况", "related_party", ["related_party_profile"]),

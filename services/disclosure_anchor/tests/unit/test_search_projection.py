@@ -75,7 +75,7 @@ class QuerySynonymTests(unittest.TestCase):
         self.assertEqual(tokenizer.build_search_tsquery("  "), "")
 
     def test_synonym_loading_is_lock_order_independent(self) -> None:
-        # Regression (independent review 2026-07-17): loading synonyms before
+        # Regression: loading synonyms before
         # any tokenize call must not deadlock on the tokenizer lock.
         import threading
 

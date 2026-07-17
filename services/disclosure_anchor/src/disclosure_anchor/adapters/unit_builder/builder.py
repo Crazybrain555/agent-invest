@@ -2062,7 +2062,7 @@ def build_unit_drafts_s1_s7(
         qa_heading_mode=qa_mode,
         stats=s1.stats,
     )
-    # QA discrimination was removed by user decision 2026-07-16: transcripts
+    # QA discrimination was removed: transcripts
     # stay raw text units with full provenance; question/answer semantics are
     # not an L1 concern and no payload_kind="qa" is emitted anymore.
     text_units = s3_build_text_units(placed, stats=s1.stats)
@@ -2713,8 +2713,8 @@ def _sink_leading_applicable(units: list[UnitDraft]) -> list[UnitDraft]:
     """Attach dangling √适用 declarations to the section content they open.
 
     An applicable marker with no prose means "content follows" (usually a
-    table); the marker line itself must not survive as a unit (user decision
-    2026-07-06) — the flag moves onto the immediately following unit of the
+    table); the marker line itself must not survive as a unit — the flag
+    moves onto the immediately following unit of the
     same section. With no such sibling the declaration stays as its own unit.
     """
 

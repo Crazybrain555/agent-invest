@@ -78,7 +78,7 @@ _MAX_SYNONYM_GROUPS = 40
 
 # Parsing validates every term through tokenize(), which may itself have to
 # build the jieba tokenizer under ``_lock`` — so synonym caching needs its
-# own lock or a cold-start load deadlocks (independent review 2026-07-17).
+# own lock or a cold-start load deadlocks.
 _synonyms_lock = threading.Lock()
 _synonyms: dict[str, tuple[str, ...]] | None = None
 

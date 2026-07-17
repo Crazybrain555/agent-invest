@@ -535,10 +535,9 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         required=("减值",),
         any_required=("准备", "测试", "损失"),
     ),
-    # 公告节键（2026-07-17 用户批准第二批：担保+股权激励两家族；锚点=深交所公告
-    # 格式指引交易类第 5 号逐字节名 + 证监会股权激励管理办法第九条；担保/激励
-    # 逐单元复核与全叶 token 碰撞检查零误伤，数据见 retrieval 设计 §6.3）。
-    # 全部 leaf_only、不限文类；置于粗粒度业务键之后，定期报告 scalar 不回退。
+    # 公告节键：短语逐字取自交易所公告格式指引与股权激励管理办法（数据与
+    # 决策记录见 retrieval 设计 §6.3/§6.4）。全部 leaf_only、不限文类；
+    # 置于粗粒度业务键之后，定期报告 scalar 不回退。
     SemanticKeyRule(
         "guarantee_overview",
         any_required=("担保情况概述", "担保事项概述"),
@@ -569,9 +568,8 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         filing_type_limited=False,
         leaf_only=True,
     ),
-    # 独立复审 2026-07-17：考核/解禁短语并非股权激励独占（年报薪酬节、限售股
-    # 解禁公告同词），语料未撞不等于格式契约——收窄到管理办法第九条真正独占的
-    # 「公司/个人层面…考核」与「限售期和解除限售」形态。
+    # 考核/解禁短语并非股权激励独占（年报薪酬节、限售股解禁公告同词），
+    # 只收管理办法第九条独占的「层面…考核」与「限售期和解除限售」形态。
     SemanticKeyRule(
         "incentive_performance_assessment",
         any_required=(
@@ -607,9 +605,8 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         filing_type_limited=False,
         leaf_only=True,
     ),
-    # 公告节键第三批（2026-07-17 用户批准：关联交易家族 + 跨公告通用节；
-    # 锚点=深交所公告格式指引交易类第 9 号逐字节名；定价/协议条款在重组类公告
-    # 同为诚实交易节，故取通用键名）。
+    # 关联交易家族与跨公告通用节（交易类第 9 号）；定价/协议条款在重组类
+    # 公告同为诚实交易节，故取通用键名。
     SemanticKeyRule(
         "related_party_overview",
         required=("关联交易概述",),
@@ -652,8 +649,8 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         filing_type_limited=False,
         leaf_only=True,
     ),
-    # 法定章节键（2026-07-17 用户批准第一批扩容；锚点=证监会年报格式准则第 2 号
-    # 固定章节 + 交易所公告格式指引的通用"提示"节；数据支撑见 retrieval 设计 §6.3）。
+    # 法定章节键（证监会年报格式准则第 2 号固定章节 + 交易所公告格式指引的
+    # 通用"提示"节；数据见 retrieval 设计 §6.3）。
     # 三条均 leaf_only：章节键只描述单元自身所在部位，不沿路径污染子孙；置于元组
     # 末尾使更窄的业务概念优先成为 scalar。important_notice 不限文类。
     SemanticKeyRule(
@@ -663,7 +660,7 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         filing_type_limited=False,
         leaf_only=True,
     ),
-    # 2026-07-17 第三批去门控：公告类同样有备查文件/释义节（语料 388/37 例回退）。
+    # 公告类同样有备查文件/释义节，故不限文类。
     SemanticKeyRule(
         "reference_documents",
         required=("备查文件",),
@@ -676,8 +673,8 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         filing_type_limited=False,
         leaf_only=True,
     ),
-    # 目录页是 L2 脉络的基线原料（用户 2026-07-17 方向）。置于 reference_documents
-    # 之后：「备查文件目录」的 scalar 仍归 reference_documents，本键只入数组。
+    # 目录页是脉络基线。置于 reference_documents 之后：「备查文件目录」的
+    # scalar 仍归 reference_documents，本键只入数组。
     SemanticKeyRule(
         "table_of_contents",
         required=("目录",),

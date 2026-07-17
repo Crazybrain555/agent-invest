@@ -24,7 +24,7 @@ Guards:
   * artifact deletion refuses relpaths shared with any run outside the
     manifest;
   * U5 historical replay for retired runs is intentionally given up
-    (HANDOFF corpus-reparse-audit-r1 authorization, user 2026-07-16).
+    (authorized in HANDOFF corpus-reparse-audit-r1).
 
 Usage:
   .venv/bin/python scripts/retire_derived_generation.py --before <ISO8601>
@@ -70,6 +70,37 @@ _SELECT_RETIREMENT = text(
     """
 )
 
+# Auto mode: per document keep the newest superseded
+# run as rollback insurance and retire everything older. New/active/current
+# runs are excluded by the same predicates as the manual path; the newest
+# superseded run per document is excluded explicitly.
+_SELECT_AUTO_RETIREMENT = text(
+    """
+    SELECT pr.processing_run_id, pr.document_id, pr.status, pr.is_active,
+           pr.created_at, pr.parser_artifact_relpath, pr.normalized_ir_relpath,
+           pr.document_units_relpath,
+           (SELECT count(*) FROM disclosure_core.document_unit du
+             WHERE du.processing_run_id = pr.processing_run_id) AS unit_count
+      FROM disclosure_core.processing_run pr
+     WHERE NOT pr.is_active
+       AND pr.status <> 'running'
+       AND pr.processing_run_id NOT IN (
+           SELECT current_processing_run_id FROM disclosure_core.document
+            WHERE current_processing_run_id IS NOT NULL)
+       AND pr.processing_run_id NOT IN (
+           SELECT DISTINCT ON (pr2.document_id) pr2.processing_run_id
+             FROM disclosure_core.processing_run pr2
+            WHERE NOT pr2.is_active
+              AND pr2.status <> 'running'
+              AND pr2.processing_run_id NOT IN (
+                  SELECT current_processing_run_id FROM disclosure_core.document
+                   WHERE current_processing_run_id IS NOT NULL)
+            ORDER BY pr2.document_id, pr2.created_at DESC,
+                     pr2.processing_run_id DESC)
+     ORDER BY pr.processing_run_id
+    """
+)
+
 _VERIFY_ONE = text(
     """
     SELECT NOT pr.is_active
@@ -83,15 +114,29 @@ _VERIFY_ONE = text(
 )
 
 
-def _build_manifest(engine: sqlalchemy.Engine, before: str) -> dict:
+def _build_manifest(
+    engine: sqlalchemy.Engine, before: str, *, auto: bool = False
+) -> dict:
     with engine.connect() as conn:
-        rows = [dict(row) for row in conn.execute(_SELECT_RETIREMENT, {"before": before}).mappings()]
+        if auto:
+            rows = [
+                dict(row)
+                for row in conn.execute(_SELECT_AUTO_RETIREMENT).mappings()
+            ]
+        else:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    _SELECT_RETIREMENT, {"before": before}
+                ).mappings()
+            ]
     for row in rows:
         row["created_at"] = row["created_at"].isoformat()
     return {
         "manifest_schema": _MANIFEST_SCHEMA,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "before": before,
+        "mode": "auto-keep-latest-superseded" if auto else "manual",
         "run_count": len(rows),
         "unit_count": sum(int(row["unit_count"]) for row in rows),
         "runs": rows,
@@ -228,16 +273,46 @@ def _apply_metadata(engine: sqlalchemy.Engine, manifest: dict) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="retire_derived_generation")
-    parser.add_argument("--before", required=True, help="ISO8601 cutoff: only runs created before this retire")
+    parser.add_argument("--before", help="ISO8601 cutoff: only runs created before this retire")
     parser.add_argument("--manifest", type=Path, help="existing manifest to apply / output path override")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--apply-artifacts", action="store_true")
     group.add_argument("--apply-metadata", action="store_true")
+    group.add_argument(
+        "--auto",
+        action="store_true",
+        help="unattended mode: per document keep the newest superseded run, "
+        "build the manifest for everything older and apply both phases",
+    )
     args = parser.parse_args(argv)
+    if not args.auto and not args.before:
+        parser.error("--before is required unless --auto is given")
 
     settings = load_settings()
     engine = create_db_engine(_database_url(settings))
     try:
+        if args.auto:
+            now = datetime.now(timezone.utc)
+            manifest = _build_manifest(engine, now.isoformat(), auto=True)
+            out_dir = Path(settings.disclosure_data_root) / "audit" / "gc"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / (
+                f"retire_auto_{now.strftime('%Y%m%dT%H%M%SZ')}.json"
+            )
+            out_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            print(
+                f"[auto] superseded-beyond-rollback runs={manifest['run_count']}"
+                f" units={manifest['unit_count']} manifest={out_path}"
+            )
+            if manifest["run_count"] == 0:
+                return 0
+            artifacts_rc = _apply_artifacts(engine, settings, manifest, out_path)
+            metadata_rc = _apply_metadata(engine, manifest)
+            return artifacts_rc or metadata_rc
+
         if args.apply_artifacts or args.apply_metadata:
             if not args.manifest or not args.manifest.is_file():
                 raise SystemExit("[abort] apply phases require --manifest pointing at a reviewed manifest file")
