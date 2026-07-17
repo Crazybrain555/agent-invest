@@ -1031,44 +1031,15 @@ def s2_apply_heading_tree(
         level = _heading_level_for(heading_candidate)
         if level is not None:
             heading_text = heading_candidate.text or ""
-            parser_level = (
-                heading_candidate.heading_level
-                if parser_levels_informative
-                else None
-            )
-            source_level = max(1, min(7, parser_level or level))
             evidence = _heading_pattern_evidence(heading_text, stack=stack)
             pattern_level = evidence.level
-            if not parser_levels_informative and pattern_level is not None:
-                # Degenerate regime: the grammar evidence level is the only
-                # honest depth. HEADING_PATTERNS matches already agree with
-                # ``level``; dotted chains ("1.2") match no pattern entry and
-                # would otherwise keep the meaningless parser constant, which
-                # made anchored children outrank mid-stack ancestors.
-                source_level = max(1, min(7, pattern_level))
-            if (
-                not parser_levels_informative
-                and pattern_level is None
-                and evidence.dotted_components is None
-                and _normalized_title(heading_text) not in rules.FIXED_L1_TITLES
-                and stack
-            ):
-                # Degenerate-regime unnumbered headings carry no depth evidence
-                # at all (constant parser level, no grammar), so they anchor to
-                # the stack top instead of resetting to root: below a top that
-                # proved its depth (grammar/dotted), beside a top that could
-                # not (FIXED anchors and other anchored headings). Ancestors
-                # are never severed on no-evidence input; an empty stack keeps
-                # the honest root for document-front matter.
-                top_entry = stack[-1]
-                top_has_depth_evidence = (
-                    top_entry.pattern_level is not None
-                    or top_entry.dotted_components is not None
-                )
-                source_level = min(
-                    7,
-                    top_entry.source_level + (1 if top_has_depth_evidence else 0),
-                )
+            source_level = _arbitrated_source_level(
+                heading_candidate,
+                fallback_level=level,
+                evidence=evidence,
+                stack=stack,
+                parser_levels_informative=parser_levels_informative,
+            )
             dotted_parent_proven = False
             if evidence.dotted_components is not None:
                 components = evidence.dotted_components
@@ -1221,6 +1192,50 @@ def s2_apply_heading_tree(
         stats.heading_only_carriers_preserved += len(orphan_ids)
     placed.extend(heading_carriers[item] for item in orphan_ids)
     return sorted(placed, key=lambda item: (item.order_index, item.intra_order))
+
+
+def _arbitrated_source_level(
+    heading_candidate: PreparedElement,
+    *,
+    fallback_level: int,
+    evidence: _HeadingPatternEvidence,
+    stack: list[_HeadingStackEntry],
+    parser_levels_informative: bool,
+) -> int:
+    """Pick the source level from the most reliable available depth signal.
+
+    Informative parser levels stay authoritative. In the degenerate regime
+    (one constant level document-wide) the grammar evidence level is the
+    only honest depth — including dotted chains ("1.2"), which match no
+    HEADING_PATTERNS entry and would otherwise keep the meaningless parser
+    constant. A heading with no depth evidence at all anchors to the stack
+    top instead of resetting to root: below a top that proved its depth
+    (grammar/dotted), beside a top that could not (FIXED anchors and other
+    anchored headings); an empty stack keeps the honest root for
+    document-front matter.
+    """
+
+    if parser_levels_informative:
+        return max(
+            1, min(7, heading_candidate.heading_level or fallback_level)
+        )
+    if evidence.level is not None:
+        return max(1, min(7, evidence.level))
+    title = _normalized_title(heading_candidate.text or "")
+    if (
+        evidence.dotted_components is None
+        and title not in rules.FIXED_L1_TITLES
+        and stack
+    ):
+        top_entry = stack[-1]
+        top_has_depth_evidence = (
+            top_entry.pattern_level is not None
+            or top_entry.dotted_components is not None
+        )
+        return min(
+            7, top_entry.source_level + (1 if top_has_depth_evidence else 0)
+        )
+    return max(1, min(7, fallback_level))
 
 
 def _place_unnumbered_heading(

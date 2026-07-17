@@ -145,6 +145,19 @@ def _build_manifest(
     }
 
 
+def _write_manifest(
+    manifest: dict, settings: Settings, *, prefix: str, override: Path | None = None
+) -> Path:
+    out_dir = Path(settings.disclosure_data_root) / "audit" / "gc"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = override or (out_dir / f"{prefix}_{stamp}.json")
+    out_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return out_path
+
+
 def _shared_relpath_owners(
     conn: Connection, column: str, relpath: str, manifest_ids: set[str]
 ) -> list[str]:
@@ -286,6 +299,11 @@ def main(argv: list[str] | None = None) -> int:
         help="unattended mode: per document keep the newest superseded run, "
         "build the manifest for everything older and apply both phases",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --auto: build and print the manifest, apply nothing",
+    )
     args = parser.parse_args(argv)
     if not args.auto and not args.before:
         parser.error("--before is required unless --auto is given")
@@ -296,20 +314,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.auto:
             now = datetime.now(timezone.utc)
             manifest = _build_manifest(engine, now.isoformat(), auto=True)
-            out_dir = Path(settings.disclosure_data_root) / "audit" / "gc"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / (
-                f"retire_auto_{now.strftime('%Y%m%dT%H%M%SZ')}.json"
-            )
-            out_path.write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
+            out_path = _write_manifest(manifest, settings, prefix="retire_auto")
             print(
                 f"[auto] superseded-beyond-rollback runs={manifest['run_count']}"
                 f" units={manifest['unit_count']} manifest={out_path}"
             )
-            if manifest["run_count"] == 0:
+            if manifest["run_count"] == 0 or args.dry_run:
                 return 0
             artifacts_rc = _apply_artifacts(engine, settings, manifest, out_path)
             if artifacts_rc:
@@ -331,14 +341,8 @@ def main(argv: list[str] | None = None) -> int:
             return _apply_metadata(engine, manifest)
 
         manifest = _build_manifest(engine, args.before)
-        out_dir = Path(settings.disclosure_data_root) / "audit" / "gc"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = args.manifest or (
-            out_dir
-            / f"retire_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
-        )
-        out_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        out_path = _write_manifest(
+            manifest, settings, prefix="retire", override=args.manifest
         )
         print(
             f"[manifest] runs={manifest['run_count']} units={manifest['unit_count']}"

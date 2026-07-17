@@ -394,6 +394,29 @@ class SemanticKeyRule:
     leaf_only: bool = False
 
 
+
+def _section_rule(
+    semantic_key: str,
+    *,
+    required: tuple[str, ...] = (),
+    any_required: tuple[str, ...] = (),
+) -> SemanticKeyRule:
+    """A leaf-scoped section key available to every filing type.
+
+    Section keys describe the unit's own slot only, so they never leak onto
+    descendants and never displace the coarse periodic-report scalars that
+    precede them in the tuple.
+    """
+
+    return SemanticKeyRule(
+        semantic_key,
+        required=required,
+        any_required=any_required,
+        filing_type_limited=False,
+        leaf_only=True,
+    )
+
+
 SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
     SemanticKeyRule(
         "receivable_aging", required=("应收账款",), any_required=("账龄", "坏账")
@@ -536,41 +559,18 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         any_required=("准备", "测试", "损失"),
     ),
     # 公告节键：短语逐字取自交易所公告格式指引与股权激励管理办法（数据与
-    # 决策记录见 retrieval 设计 §6.3/§6.4）。全部 leaf_only、不限文类；
-    # 置于粗粒度业务键之后，定期报告 scalar 不回退。
-    SemanticKeyRule(
-        "guarantee_overview",
-        any_required=("担保情况概述", "担保事项概述"),
-        filing_type_limited=False,
-        leaf_only=True,
+    # 决策记录见 retrieval 设计 §6.3–§6.5）。置于粗粒度业务键之后，
+    # 定期报告 scalar 不回退。
+    _section_rule(
+        "guarantee_overview", any_required=("担保情况概述", "担保事项概述")
     ),
-    SemanticKeyRule(
-        "guarantee_progress",
-        required=("担保进展",),
-        filing_type_limited=False,
-        leaf_only=True,
-    ),
-    SemanticKeyRule(
-        "guaranteed_party_profile",
-        required=("被担保人基本情况",),
-        filing_type_limited=False,
-        leaf_only=True,
-    ),
-    SemanticKeyRule(
-        "guarantee_agreement_terms",
-        required=("担保协议", "主要内容"),
-        filing_type_limited=False,
-        leaf_only=True,
-    ),
-    SemanticKeyRule(
-        "cumulative_external_guarantees",
-        required=("累计对外担保",),
-        filing_type_limited=False,
-        leaf_only=True,
-    ),
+    _section_rule("guarantee_progress", required=("担保进展",)),
+    _section_rule("guaranteed_party_profile", required=("被担保人基本情况",)),
+    _section_rule("guarantee_agreement_terms", required=("担保协议", "主要内容")),
+    _section_rule("cumulative_external_guarantees", required=("累计对外担保",)),
     # 考核/解禁短语并非股权激励独占（年报薪酬节、限售股解禁公告同词），
     # 只收管理办法第九条独占的「层面…考核」与「限售期和解除限售」形态。
-    SemanticKeyRule(
+    _section_rule(
         "incentive_performance_assessment",
         any_required=(
             "层面业绩考核",
@@ -578,87 +578,53 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
             "层面绩效考核",
             "层面的绩效考核",
         ),
-        filing_type_limited=False,
-        leaf_only=True,
     ),
-    SemanticKeyRule(
+    _section_rule(
         "incentive_vesting_exercise",
         any_required=("行权安排", "归属安排", "限售期和解除限售"),
-        filing_type_limited=False,
-        leaf_only=True,
     ),
-    SemanticKeyRule(
+    _section_rule(
         "incentive_plan_overview",
         any_required=("激励计划简介", "激励计划的目的", "激励计划概述"),
-        filing_type_limited=False,
-        leaf_only=True,
     ),
-    SemanticKeyRule(
-        "incentive_recipients",
-        required=("激励对象名单",),
-        filing_type_limited=False,
-        leaf_only=True,
-    ),
-    SemanticKeyRule(
+    _section_rule("incentive_recipients", required=("激励对象名单",)),
+    _section_rule(
         "incentive_condition_satisfaction",
-        any_required=("满足行权条件", "满足归属条件", "符合行权条件", "满足解除限售条件"),
-        filing_type_limited=False,
-        leaf_only=True,
+        any_required=(
+            "满足行权条件",
+            "满足归属条件",
+            "符合行权条件",
+            "满足解除限售条件",
+        ),
     ),
     # 关联交易家族与跨公告通用节（交易类第 9 号）；定价/协议条款在重组类
     # 公告同为诚实交易节，故取通用键名。
-    SemanticKeyRule(
-        "related_party_overview",
-        required=("关联交易概述",),
-        filing_type_limited=False,
-        leaf_only=True,
-    ),
-    SemanticKeyRule(
+    _section_rule("related_party_overview", required=("关联交易概述",)),
+    _section_rule(
         "related_party_profile",
         any_required=("关联方基本情况", "关联人基本情况"),
-        filing_type_limited=False,
-        leaf_only=True,
     ),
     # 「定价政策」单独出现也见于 MD&A 产品定价叙述，只认交易语境形态。
-    SemanticKeyRule(
+    _section_rule(
         "transaction_pricing_basis",
         any_required=("定价政策及定价依据", "定价依据"),
-        filing_type_limited=False,
-        leaf_only=True,
     ),
-    SemanticKeyRule(
+    _section_rule(
         "transaction_agreement_terms",
         any_required=("关联交易协议", "交易协议的主要内容"),
-        filing_type_limited=False,
-        leaf_only=True,
     ),
-    SemanticKeyRule(
-        "cumulative_related_party_transactions",
-        required=("累计已发生", "关联"),
-        filing_type_limited=False,
-        leaf_only=True,
+    _section_rule(
+        "cumulative_related_party_transactions", required=("累计已发生", "关联")
     ),
-    SemanticKeyRule(
-        "decision_procedures",
-        any_required=("决策程序", "审批程序"),
-        filing_type_limited=False,
-        leaf_only=True,
-    ),
-    SemanticKeyRule(
+    _section_rule("decision_procedures", any_required=("决策程序", "审批程序")),
+    _section_rule(
         "intermediary_opinion",
         any_required=("独立财务顾问", "法律意见", "核查意见"),
-        filing_type_limited=False,
-        leaf_only=True,
     ),
     # 募集资金家族（再融资类第 1/2/3 号模板节名；细键与 note_key_map 的
     # fundraising_usage 零短语重叠，定期报告 scalar 不受影响）。
-    SemanticKeyRule(
-        "fundraising_overview",
-        required=("募集资金基本情况",),
-        filing_type_limited=False,
-        leaf_only=True,
-    ),
-    SemanticKeyRule(
+    _section_rule("fundraising_overview", required=("募集资金基本情况",)),
+    _section_rule(
         "fundraising_custody",
         any_required=(
             "募集资金存放",
@@ -667,28 +633,16 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
             "三方监管协议",
             "四方监管协议",
         ),
-        filing_type_limited=False,
-        leaf_only=True,
     ),
-    SemanticKeyRule(
-        "fundraising_repurposing",
-        any_required=("改变募集资金", "变更募集资金"),
-        filing_type_limited=False,
-        leaf_only=True,
+    _section_rule(
+        "fundraising_repurposing", any_required=("改变募集资金", "变更募集资金")
     ),
-    SemanticKeyRule(
+    _section_rule(
         "fundraising_replacement",
         any_required=("募集资金置换", "置换先期投入", "置换预先投入"),
-        filing_type_limited=False,
-        leaf_only=True,
     ),
-    SemanticKeyRule(
-        "fundraising_use_plan",
-        required=("募集资金的使用计划",),
-        filing_type_limited=False,
-        leaf_only=True,
-    ),
-    SemanticKeyRule(
+    _section_rule("fundraising_use_plan", required=("募集资金的使用计划",)),
+    _section_rule(
         "fundraising_project_status",
         any_required=(
             "募投项目基本情况",
@@ -696,41 +650,20 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
             "结项",
             "节余募集资金",
         ),
-        filing_type_limited=False,
-        leaf_only=True,
     ),
     # 法定章节键（证监会年报格式准则第 2 号固定章节 + 交易所公告格式指引的
-    # 通用"提示"节；数据见 retrieval 设计 §6.3）。
-    # 三条均 leaf_only：章节键只描述单元自身所在部位，不沿路径污染子孙；置于元组
-    # 末尾使更窄的业务概念优先成为 scalar。important_notice 不限文类。
-    SemanticKeyRule(
+    # 通用"提示"节；数据见 retrieval 设计 §6.3）。章节键只描述单元自身所在
+    # 部位，不沿路径污染子孙；置于元组末尾使更窄的业务概念优先成为 scalar。
+    _section_rule(
         "important_notice",
-        required=(),
         any_required=("重要提示", "重要内容提示", "特别提示"),
-        filing_type_limited=False,
-        leaf_only=True,
     ),
     # 公告类同样有备查文件/释义节，故不限文类。
-    SemanticKeyRule(
-        "reference_documents",
-        required=("备查文件",),
-        filing_type_limited=False,
-        leaf_only=True,
-    ),
-    SemanticKeyRule(
-        "definitions",
-        required=("释义",),
-        filing_type_limited=False,
-        leaf_only=True,
-    ),
+    _section_rule("reference_documents", required=("备查文件",)),
+    _section_rule("definitions", required=("释义",)),
     # 目录页是脉络基线。置于 reference_documents 之后：「备查文件目录」的
     # scalar 仍归 reference_documents，本键只入数组。
-    SemanticKeyRule(
-        "table_of_contents",
-        required=("目录",),
-        filing_type_limited=False,
-        leaf_only=True,
-    ),
+    _section_rule("table_of_contents", required=("目录",)),
 )
 
 
