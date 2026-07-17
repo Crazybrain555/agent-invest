@@ -284,3 +284,22 @@ semantic_keys（scalar 在规则未命中时回落 note key）。实测：附注
   仅作候选挖掘）。实测召回：分红 1,190→3,300；派息 352→3,414；定增 0→210（"定增"在正式
   公告中零出现，纯靠别名映射）。L1 不加 search API（06R 红线不变）；L2 接入时再定
   查询构造契约的导出形态。
+
+## 6.5 2026-07-17 词表第三/四批与治理机制（决策补记）
+
+- **(a) 第三批（ub-2026.07-62）**：关联交易家族 5 键（交易类第 9 号逐字；定价/协议
+  取通用键名 transaction_*，重组类同节诚实复用）+ 决策程序/中介意见跨公告通用键
+  （中介机构意见 token 叶零命中被剔除）+ reference_documents/definitions 去文类门控
+  + table_of_contents（脉络基线，置于 reference_documents 后保 scalar）。
+  回退 17.2%→15.9%。
+- **(b) 第四批（ub-2026.07-63，募集资金专项）**：否决粗键（规则键 scalar 优先于
+  note 键，会把定期报告 139 段 fundraising_usage 挤粗）；采用再融资类第 1/2/3 号
+  模板锚定的 6 细键（basic/custody/repurposing/replacement/use_plan/project_status），
+  与 note_key_map 短语零重叠。独立复审加固同批：定价 token 收窄
+  （定价政策及定价依据|定价依据，防 MD&A 产品定价误标）。
+- **(c) 查询侧同义表（qs-2026.07-1）复审加固**：同义缓存独立锁（冷启动死锁根治，
+  带秩序无关回归测试）、token 自别名去重。
+- **(d) 旧代治理机制**：retire --auto（每文档保留最新**成功**被取代 run 作回滚保险，
+  其余自动清；工件阶段失败则跳过元数据阶段防孤儿文件）+ 每日 19:30 launchd
+  作业（com.agentinvest.disclosure-gc），失败经 notify.sh 告警。
+- **(e) 脉络方向**：见 document-outline-and-toc.md（两步方案：脉络视图 + 目录审计）。

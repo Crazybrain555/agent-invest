@@ -70,10 +70,10 @@ _SELECT_RETIREMENT = text(
     """
 )
 
-# Auto mode: per document keep the newest superseded
-# run as rollback insurance and retire everything older. New/active/current
-# runs are excluded by the same predicates as the manual path; the newest
-# superseded run per document is excluded explicitly.
+# Auto mode: per document keep the newest SUCCEEDED superseded run as
+# rollback insurance (a newer failed run is not a rollback target) and retire
+# everything else superseded. New/active/current runs are excluded by the
+# same predicates as the manual path.
 _SELECT_AUTO_RETIREMENT = text(
     """
     SELECT pr.processing_run_id, pr.document_id, pr.status, pr.is_active,
@@ -95,7 +95,9 @@ _SELECT_AUTO_RETIREMENT = text(
               AND pr2.processing_run_id NOT IN (
                   SELECT current_processing_run_id FROM disclosure_core.document
                    WHERE current_processing_run_id IS NOT NULL)
-            ORDER BY pr2.document_id, pr2.created_at DESC,
+            ORDER BY pr2.document_id,
+                     (pr2.status = 'succeeded') DESC,
+                     pr2.created_at DESC,
                      pr2.processing_run_id DESC)
      ORDER BY pr.processing_run_id
     """
@@ -310,8 +312,11 @@ def main(argv: list[str] | None = None) -> int:
             if manifest["run_count"] == 0:
                 return 0
             artifacts_rc = _apply_artifacts(engine, settings, manifest, out_path)
-            metadata_rc = _apply_metadata(engine, manifest)
-            return artifacts_rc or metadata_rc
+            if artifacts_rc:
+                # A guard tripped on the artifact side; leave metadata rows in
+                # place so nothing ever becomes a file-without-row orphan.
+                return artifacts_rc
+            return _apply_metadata(engine, manifest)
 
         if args.apply_artifacts or args.apply_metadata:
             if not args.manifest or not args.manifest.is_file():

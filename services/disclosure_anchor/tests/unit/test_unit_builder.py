@@ -1982,6 +1982,21 @@ class UnitBuilderTests(unittest.TestCase):
                 "annual_report",
                 ["reference_documents", "table_of_contents"],
             ),
+            # Fundraising family (再融资类第1/2/3号 template phrasing); the
+            # note-map fundraising_usage phrases stay disjoint so periodic
+            # scalars are untouched.
+            ("一、募集资金基本情况", "financing", ["fundraising_overview"]),
+            ("2、募集资金专户信息", "financing", ["fundraising_custody"]),
+            ("一、改变募集资金投资项目的概述", "financing", ["fundraising_repurposing"]),
+            ("六、本次归属募集资金的使用计划", "equity_incentive", ["fundraising_use_plan"]),
+            (
+                "三、本次结项的募投项目募集资金使用及节余情况",
+                "financing",
+                ["fundraising_project_status"],
+            ),
+            # MD&A product-pricing prose must not read as a transaction
+            # pricing section.
+            ("三、产品定价政策", "annual_report", []),
         ]
         for title, filing_type, expected in cases:
             with self.subTest(title=title):

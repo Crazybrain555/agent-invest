@@ -49,7 +49,8 @@ def _load_tokenizer():  # type: ignore[no-untyped-def]
         import jieba
 
         tokenizer = jieba.Tokenizer()
-        tokenizer.load_userdict(str(_DICT_PATH))
+        with _DICT_PATH.open("rb") as handle:
+            tokenizer.load_userdict(handle)
         _tokenizer = tokenizer
     return _tokenizer
 

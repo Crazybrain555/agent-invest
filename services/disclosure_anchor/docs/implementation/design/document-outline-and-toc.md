@@ -1,0 +1,75 @@
+---
+id: disclosure_anchor_design_document_outline_toc
+project: disclosure_anchor
+title: 文件脉络视图与目录审计（L2 消费面）
+status: approved-design (两步方案获批准；本文档为实施前设计)
+created_at: 2026-07-17
+depends_on: 06R 检索投影、标题层级仲裁（heading-level-arbitration.md）
+---
+
+# 文件脉络视图与目录审计
+
+## 1. 需求与消费过程
+
+L2 的真实消费过程（用户 2026-07-17 阐明）：**先看整个文件的脉络**（有哪些节、
+表和附注不能漏）→ 自行分块 → 块内精查，偶尔跨块补查；几乎不跨公司查询。
+因此 L1 对 L2 最重要的交付不是模糊搜索，而是：
+1. 开篇一眼看清文件骨架（脉络视图）；
+2. 骨架必须完整可信（目录审计兜底解析缺漏）。
+
+## 2. 语料证据（2026-07-17 取证）
+
+- 标题路径深度分布（86,252 单元）：1 级 7,831 / 2 级 13,439 / 3 级 27,767 /
+  4 级 28,148 / 5 级 7,820 / 6+ 级 1,247——结构修复后细脉络真实存在，
+  典型年报根标题恰为十节法定章节 + 封面件（大地熊样本 14 根全部合规）。
+- 目录页单元文本干净可机读：两种主形态「节名….页码」（万科）与
+  「页码 节名」（招商银行，含 3.1–3.12 子节）。
+- 目录粒度是基线而非上限（用户判断成立）：招行目录列到二级，实际标题树到 4+ 级。
+
+## 3. 第一步：文件脉络视图（derived，先实施）
+
+**形态**：`disclosure_public.document_outline_v1` 派生视图（U7 红线同 06R 投影：
+可从单元表确定性重算、不入 content_hash、不发 outbox、非证据）。
+
+每行 = 一份文档的一个标题树节点：
+
+| 列 | 含义 |
+|---|---|
+| document_id | 文档 |
+| path / depth | 标题路径（jsonb）与深度 |
+| unit_count / table_count / image_count | 该节点直属单元数按类型 |
+| semantic_keys | 该节点直属单元的去重标签集 |
+| page_span | 该节点单元的页码范围 |
+| first_order_index | 排序锚 |
+
+实现为普通 SQL 视图（GROUP BY document_id, heading_path 即可，无新表、无迁移
+数据）；若性能不足再物化。L2 开篇 `SELECT * FROM document_outline_v1 WHERE
+document_id = X ORDER BY first_order_index` 即得全骨架。
+
+**验收**：视图行数=各文档 distinct heading_path 之和；抽样 5 份文档人工比对
+骨架与 PDF 目录；契约导出与 reader 授权同 06R。
+
+## 4. 第二步：目录审计（先审计后修复）
+
+**原则**：目录反哺解析，从审计信号做起，有证据再升级为修复信号
+（对标 docling-hierarchical 的 TOC-anchor：它直接用 PDF 书签重排；我们语料书签
+覆盖仅 15%，改用文内目录页，且先只报不改）。
+
+**实现**：`scripts/audit_toc_alignment.py`（离线审计，进语料审计工具族）：
+1. 取每份文档 table_of_contents 标签单元的文本，解析成节名列表
+   （两种形态的行文法：行首/行尾页码、点线分隔；解析失败按文档记录，不猜）；
+2. 与该文档实际标题树（脉络视图）做规范化匹配（去空白/标点，前缀含关系）；
+3. 输出三类 finding：`toc_section_missing_in_tree`（目录列了、树里没有——
+   最重要，指向解析丢标题）、`tree_root_missing_in_toc`（树里有根、目录没列——
+   多为封面件/附件，通常合法）、`toc_unparsable`；
+4. 汇总按文档/发行人/文类分布，供人工定损与后续修复设计。
+
+**升级路径（有证据才走）**：若 `toc_section_missing_in_tree` 揭示系统性丢标题
+家族，把目录节名注册为仲裁框架的 S0' 信号槽（heading-level-arbitration.md §3
+的阶梯顶端补一档「文内目录锚点」），进入正常的设计-验证循环。
+
+## 5. 明确不做
+
+- 不用目录直接改写标题树（未经审计验证的修复信号违反"低可靠证据不砍祖先"）；
+- 不为脉络视图建新表/迁移（视图纯派生；物化仅在实测性能不足后）；
+- 不做跨公司聚合面（L2 不跨公司查询）。

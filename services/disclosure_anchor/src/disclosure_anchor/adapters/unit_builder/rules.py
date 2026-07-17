@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import unicodedata
 
 
-RULES_VERSION = "ub-2026.07-62"
+RULES_VERSION = "ub-2026.07-63"
 HEADING_RULESET_ID = "cn_a_v6"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -619,9 +619,10 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         filing_type_limited=False,
         leaf_only=True,
     ),
+    # 「定价政策」单独出现也见于 MD&A 产品定价叙述，只认交易语境形态。
     SemanticKeyRule(
         "transaction_pricing_basis",
-        any_required=("定价政策", "定价依据"),
+        any_required=("定价政策及定价依据", "定价依据"),
         filing_type_limited=False,
         leaf_only=True,
     ),
@@ -646,6 +647,55 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
     SemanticKeyRule(
         "intermediary_opinion",
         any_required=("独立财务顾问", "法律意见", "核查意见"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    # 募集资金家族（再融资类第 1/2/3 号模板节名；细键与 note_key_map 的
+    # fundraising_usage 零短语重叠，定期报告 scalar 不受影响）。
+    SemanticKeyRule(
+        "fundraising_overview",
+        required=("募集资金基本情况",),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "fundraising_custody",
+        any_required=(
+            "募集资金存放",
+            "募集资金专户",
+            "募集资金存储",
+            "三方监管协议",
+            "四方监管协议",
+        ),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "fundraising_repurposing",
+        any_required=("改变募集资金", "变更募集资金"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "fundraising_replacement",
+        any_required=("募集资金置换", "置换先期投入", "置换预先投入"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "fundraising_use_plan",
+        required=("募集资金的使用计划",),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "fundraising_project_status",
+        any_required=(
+            "募投项目基本情况",
+            "募集资金投资项目基本情况",
+            "结项",
+            "节余募集资金",
+        ),
         filing_type_limited=False,
         leaf_only=True,
     ),
