@@ -961,6 +961,17 @@ def s2_apply_heading_tree(
     qa_heading_mode: bool = False,
     stats: BuildStats | None = None,
 ) -> list[PreparedElement]:
+    # Per-document reliability gate (docs/implementation/design/
+    # heading-level-arbitration.md): a layout backend that emits one constant
+    # heading_level for the whole document proves nothing about depth, so only
+    # a varied level set lets parser levels outrank the enumeration grammar in
+    # the source_level arbitration below.
+    parser_heading_levels = {
+        element.heading_level
+        for element in elements
+        if element.kind == "heading" and element.heading_level
+    }
+    parser_levels_informative = len(parser_heading_levels) >= 2
     stack: list[_HeadingStackEntry] = []
     placed: list[PreparedElement] = []
     heading_occurrence_ids: set[int] = set()
@@ -1020,10 +1031,12 @@ def s2_apply_heading_tree(
         level = _heading_level_for(heading_candidate)
         if level is not None:
             heading_text = heading_candidate.text or ""
-            source_level = max(
-                1,
-                min(7, heading_candidate.heading_level or level),
+            parser_level = (
+                heading_candidate.heading_level
+                if parser_levels_informative
+                else None
             )
+            source_level = max(1, min(7, parser_level or level))
             evidence = _heading_pattern_evidence(heading_text, stack=stack)
             pattern_level = evidence.level
             dotted_parent_proven = False

@@ -793,6 +793,147 @@ class UnitBuilderTests(unittest.TestCase):
         )
         self.assertEqual(orphan.heading_path[-1], orphan.text)
 
+    def test_s2_degenerate_parser_levels_never_root_numbered_deep_heading(
+        self,
+    ) -> None:
+        # vlm corpus shape: every heading_level is the same constant, so the
+        # enumeration grammar is the only depth evidence. An unnumbered
+        # heading between digit_paren blocks used to inherit the deep sibling
+        # logical level as a root, after which consecutive ``1）`` blocks
+        # evicted each other into false roots (the 5,390-unit corpus family).
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(
+                    kind="heading",
+                    order_index=1,
+                    heading_level=1,
+                    text="第三节 财务报告",
+                ),
+                PreparedElement(
+                    kind="heading",
+                    order_index=2,
+                    heading_level=1,
+                    text="一、合并财务报表项目注释",
+                ),
+                PreparedElement(
+                    kind="heading", order_index=3, heading_level=1, text="（一）商誉"
+                ),
+                PreparedElement(
+                    kind="heading",
+                    order_index=4,
+                    heading_level=1,
+                    text="1）预计未来现金流量的现值",
+                ),
+                PreparedElement(
+                    kind="text", order_index=5, text="现值按五年期预测计算。"
+                ),
+                PreparedElement(
+                    kind="heading",
+                    order_index=6,
+                    heading_level=1,
+                    text="商誉减值测试的关键参数",
+                ),
+                PreparedElement(
+                    kind="heading",
+                    order_index=7,
+                    heading_level=1,
+                    text="1）税前折现率的确定方法",
+                ),
+                PreparedElement(kind="text", order_index=8, text="折现率取加权平均值。"),
+            ]
+        )
+
+        deep_body = next(
+            item for item in placed if item.text == "现值按五年期预测计算。"
+        )
+        self.assertEqual(
+            deep_body.heading_path,
+            [
+                "第三节 财务报告",
+                "一、合并财务报表项目注释",
+                "（一）商誉",
+                "1）预计未来现金流量的现值",
+            ],
+        )
+        # The numbered deep form must never be a root anywhere in the document.
+        for item in placed:
+            self.assertIn(
+                item.heading_path[0],
+                {"第三节 财务报告", "商誉减值测试的关键参数"},
+                msg=f"false root for {item.text!r}: {item.heading_path}",
+            )
+
+    def test_s2_varied_parser_levels_keep_parser_priority_for_same_sequence(
+        self,
+    ) -> None:
+        # Adjacent negative: the same text sequence with a varied (informative)
+        # parser level set keeps the existing parser-priority semantics — the
+        # parser-proven top section stays the retained parent throughout.
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(
+                    kind="heading",
+                    order_index=1,
+                    heading_level=1,
+                    text="第三节 财务报告",
+                ),
+                PreparedElement(
+                    kind="heading",
+                    order_index=2,
+                    heading_level=2,
+                    text="一、合并财务报表项目注释",
+                ),
+                PreparedElement(
+                    kind="heading", order_index=3, heading_level=2, text="（一）商誉"
+                ),
+                PreparedElement(
+                    kind="heading",
+                    order_index=4,
+                    heading_level=2,
+                    text="1）预计未来现金流量的现值",
+                ),
+                PreparedElement(
+                    kind="heading",
+                    order_index=5,
+                    heading_level=2,
+                    text="商誉减值测试的关键参数",
+                ),
+                PreparedElement(
+                    kind="heading",
+                    order_index=6,
+                    heading_level=2,
+                    text="1）税前折现率的确定方法",
+                ),
+                PreparedElement(kind="text", order_index=7, text="折现率取加权平均值。"),
+            ]
+        )
+
+        body = next(item for item in placed if item.text == "折现率取加权平均值。")
+        self.assertEqual(body.heading_path[0], "第三节 财务报告")
+        self.assertEqual(body.heading_path[-1], "1）税前折现率的确定方法")
+
+    def test_s2_missing_parser_levels_fall_back_to_numbering_grammar(self) -> None:
+        # Boundary: no heading carries a parser level at all — the level set is
+        # empty, the document is degenerate, and grammar depths must hold.
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(kind="heading", order_index=1, text="第三节 财务报告"),
+                PreparedElement(
+                    kind="heading", order_index=2, text="一、合并财务报表项目注释"
+                ),
+                PreparedElement(
+                    kind="heading", order_index=3, text="1）预计未来现金流量的现值"
+                ),
+                PreparedElement(kind="text", order_index=4, text="现值按五年期预测计算。"),
+            ]
+        )
+
+        body = next(item for item in placed if item.text == "现值按五年期预测计算。")
+        self.assertEqual(
+            body.heading_path,
+            ["第三节 财务报告", "一、合并财务报表项目注释", "1）预计未来现金流量的现值"],
+        )
+
     def test_s2_does_not_reparent_from_one_ordinal_coincidence(self) -> None:
         placed = s2_apply_heading_tree(
             [
