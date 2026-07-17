@@ -347,3 +347,27 @@ def _no_wait_bucket() -> TokenBucket:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClientErrorAuditTests(unittest.TestCase):
+    def test_to_error_carries_raw_provider_verdict(self) -> None:
+        from disclosure_anchor.adapters.sources.cninfo.client import (
+            CninfoClientError,
+            RequestAudit,
+        )
+
+        audit = RequestAudit(
+            provider_interface="cninfo:p_info3015",
+            query_params={},
+            http_status=200,
+            resultcode=429,
+            row_count=None,
+            elapsed_ms=5,
+        )
+        exc = CninfoClientError(
+            "limited", error_code="quota_exhausted", retryable=True, audit=audit
+        )
+        payload = exc.to_error(stage="index")
+        self.assertEqual(payload["resultcode"], 429)
+        self.assertEqual(payload["http_status"], 200)
+        self.assertEqual(payload["error_code"], "quota_exhausted")

@@ -63,6 +63,19 @@ class CninfoClientError(SourceRequestError):
         self.audit = audit
         super().__init__(message, error_code=error_code, retryable=retryable)
 
+    def to_error(
+        self, *, stage: str, provider_document_id: str | None = None
+    ) -> dict[str, object]:
+        payload = super().to_error(
+            stage=stage, provider_document_id=provider_document_id
+        )
+        if self.audit is not None:
+            # The raw provider verdict is what separates a rate limit (wait a
+            # moment) from a billing wall (waiting is useless).
+            payload["resultcode"] = self.audit.resultcode
+            payload["http_status"] = self.audit.http_status
+        return payload
+
 
 class TokenBucket:
     """Simple process-local QPS limiter."""

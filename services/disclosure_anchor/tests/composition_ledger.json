@@ -110,7 +110,7 @@
   },
   "tests/unit/test_cninfo_client.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 12
   },
   "tests/unit/test_cninfo_mapper.py": {
    "private_imports": [],
