@@ -118,6 +118,7 @@ def _apply_artifacts(
     manifest_ids = {run["processing_run_id"] for run in manifest["runs"]}
     deleted_log = manifest_path.with_suffix(".artifacts-deleted.jsonl")
     failures = 0
+    skipped_shared = 0
     with engine.connect() as conn, deleted_log.open("a", encoding="utf-8") as log:
         for run in manifest["runs"]:
             run_id = run["processing_run_id"]
@@ -136,8 +137,11 @@ def _apply_artifacts(
                     continue
                 owners = _shared_relpath_owners(conn, column, relpath, manifest_ids)
                 if owners:
+                    # Expected whenever a rules-only rebuild shares parse
+                    # artifacts with the active generation — a guard skip,
+                    # not a failure.
                     print(f"[skip-shared] {run_id} {column}={relpath} also owned by {owners}")
-                    failures += 1
+                    skipped_shared += 1
                     continue
                 if Path(relpath).is_absolute() or ".." in Path(relpath).parts:
                     print(f"[skip-unsafe] {run_id} {column}={relpath}")
@@ -152,7 +156,10 @@ def _apply_artifacts(
                 else:
                     target.unlink()
                 log.write(json.dumps({"run_id": run_id, "relpath": relpath, "result": "deleted"}) + "\n")
-    print(f"[artifacts] processed {len(manifest['runs'])} runs, failures={failures}, log={deleted_log}")
+    print(
+        f"[artifacts] processed {len(manifest['runs'])} runs, "
+        f"skipped_shared={skipped_shared}, failures={failures}, log={deleted_log}"
+    )
     return 1 if failures else 0
 
 

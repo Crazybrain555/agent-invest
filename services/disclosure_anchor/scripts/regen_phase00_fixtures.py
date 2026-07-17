@@ -101,7 +101,15 @@ def _content_list_path(sample_key: str) -> Path:
         raise SystemExit(f"{ref_key}: parser_artifacts_ref.txt lacks Content list")
     path = Path(value)
     if not path.is_file():
-        raise SystemExit(f"{ref_key}: content_list missing: {path}")
+        raise SystemExit(
+            f"{ref_key}: content_list missing: {path}\n"
+            "The frozen _phase00 parser-artifact snapshot is not on this "
+            "machine (lost before 2026-07-17). Rule-only changes should use "
+            "--units-only (rebuilds document_units.v1.jsonl from the "
+            "committed NormalizedIR fixtures); a mapper-level change needs a "
+            "fresh pipeline-backend parse of the retained source PDFs under "
+            "tmp/sample_filings/ plus a full fixture semantic re-review."
+        )
     return path
 
 
