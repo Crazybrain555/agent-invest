@@ -74,6 +74,23 @@ class QuerySynonymTests(unittest.TestCase):
         )
         self.assertEqual(tokenizer.build_search_tsquery("  "), "")
 
+    def test_synonym_loading_is_lock_order_independent(self) -> None:
+        # Regression (independent review 2026-07-17): loading synonyms before
+        # any tokenize call must not deadlock on the tokenizer lock.
+        import threading
+
+        tokenizer._synonyms = None
+        tokenizer._tokenizer = None
+        loaded: list[dict] = []
+        worker = threading.Thread(
+            target=lambda: loaded.append(tokenizer._load_synonyms()),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=30)
+        self.assertFalse(worker.is_alive(), "synonym loading deadlocked")
+        self.assertTrue(loaded and loaded[0])
+
     def test_parse_rejects_multi_lexeme_and_degenerate_rules(self) -> None:
         with self.assertRaises(tokenizer.RetrievalSynonymError):
             tokenizer.parse_synonyms("回购, 股份回购\n")

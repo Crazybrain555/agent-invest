@@ -76,6 +76,10 @@ SEARCH_SYNONYMS_VERSION = "qs-2026.07-1"
 _SYNONYMS_PATH = Path(__file__).with_name("synonyms.txt")
 _MAX_SYNONYM_GROUPS = 40
 
+# Parsing validates every term through tokenize(), which may itself have to
+# build the jieba tokenizer under ``_lock`` — so synonym caching needs its
+# own lock or a cold-start load deadlocks (independent review 2026-07-17).
+_synonyms_lock = threading.Lock()
 _synonyms: dict[str, tuple[str, ...]] | None = None
 
 
@@ -142,7 +146,7 @@ def _load_synonyms() -> dict[str, tuple[str, ...]]:
     global _synonyms
     if _synonyms is not None:
         return _synonyms
-    with _lock:
+    with _synonyms_lock:
         if _synonyms is None:
             _synonyms = parse_synonyms(
                 _SYNONYMS_PATH.read_text(encoding="utf-8")
@@ -168,7 +172,7 @@ def build_search_tsquery(query: str) -> str:
     synonyms = _load_synonyms()
     groups: list[str] = []
     for token in dict.fromkeys(tokens):
-        alternatives = [token, *synonyms.get(token, ())]
+        alternatives = dict.fromkeys([token, *synonyms.get(token, ())])
         quoted = [_quote_lexeme(alternative) for alternative in alternatives]
         groups.append(
             "(" + " | ".join(quoted) + ")" if len(quoted) > 1 else quoted[0]

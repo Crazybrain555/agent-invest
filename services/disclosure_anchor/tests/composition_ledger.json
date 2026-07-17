@@ -240,7 +240,7 @@
   },
   "tests/unit/test_search_projection.py": {
    "private_imports": [],
-   "tests": 20
+   "tests": 21
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],

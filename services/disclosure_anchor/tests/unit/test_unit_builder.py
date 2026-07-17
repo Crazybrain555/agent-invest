@@ -1953,7 +1953,14 @@ class UnitBuilderTests(unittest.TestCase):
             ("（1）公司层面的业绩考核要求", "equity_incentive", ["incentive_performance_assessment"]),
             ("7、行权安排", "equity_incentive", ["incentive_vesting_exercise"]),
             ("6、归属安排", "equity_incentive", ["incentive_vesting_exercise"]),
+            ("7、有效期、限售期和解除限售安排", "equity_incentive", ["incentive_vesting_exercise"]),
             ("（一）2021年激励计划简介及授予情况", "equity_incentive", ["incentive_plan_overview"]),
+            # Adjacent negatives (independent review 2026-07-17): assessment
+            # and lockup-release phrases outside the incentive-plan idiom must
+            # not earn incentive scalars — a remuneration KPI section or an
+            # IPO lockup-expiry announcement shares the surface words.
+            ("四、高级管理人员的业绩考核要求", "annual_report", []),
+            ("三、解除限售安排", "equity_share_change", []),
         ]
         for title, filing_type, expected in cases:
             with self.subTest(title=title):

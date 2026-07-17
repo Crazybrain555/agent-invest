@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import unicodedata
 
 
-RULES_VERSION = "ub-2026.07-60"
+RULES_VERSION = "ub-2026.07-61"
 HEADING_RULESET_ID = "cn_a_v6"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -569,15 +569,23 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         filing_type_limited=False,
         leaf_only=True,
     ),
+    # 独立复审 2026-07-17：考核/解禁短语并非股权激励独占（年报薪酬节、限售股
+    # 解禁公告同词），语料未撞不等于格式契约——收窄到管理办法第九条真正独占的
+    # 「公司/个人层面…考核」与「限售期和解除限售」形态。
     SemanticKeyRule(
         "incentive_performance_assessment",
-        any_required=("业绩考核要求", "绩效考核要求", "业绩考核指标"),
+        any_required=(
+            "层面业绩考核",
+            "层面的业绩考核",
+            "层面绩效考核",
+            "层面的绩效考核",
+        ),
         filing_type_limited=False,
         leaf_only=True,
     ),
     SemanticKeyRule(
         "incentive_vesting_exercise",
-        any_required=("行权安排", "归属安排", "解除限售安排"),
+        any_required=("行权安排", "归属安排", "限售期和解除限售"),
         filing_type_limited=False,
         leaf_only=True,
     ),
