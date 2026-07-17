@@ -264,7 +264,7 @@
   },
   "tests/unit/test_unit_builder.py": {
    "private_imports": [],
-   "tests": 108
+   "tests": 109
   },
   "tests/unit/test_unit_hashing.py": {
    "private_imports": [],

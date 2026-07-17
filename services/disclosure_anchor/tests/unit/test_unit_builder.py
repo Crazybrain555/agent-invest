@@ -1941,6 +1941,60 @@ class UnitBuilderTests(unittest.TestCase):
             ["risk_factors"],
         )
 
+    def test_announcement_section_keys_guarantee_and_incentive(self) -> None:
+        # 2026-07-17 approved batch 2: guarantee + equity-incentive section
+        # keys (交易所公告格式指引交易类第5号 / 股权激励管理办法第九条),
+        # leaf_only and unrestricted by filing type.
+        cases = [
+            ("一、担保情况概述", "financing", ["guarantee_overview"]),
+            ("三、担保协议的主要内容", "financing", ["guarantee_agreement_terms"]),
+            ("五、累计对外担保数量及逾期担保的数量", "financing", ["cumulative_external_guarantees"]),
+            ("二、被担保人基本情况", "financing", ["guaranteed_party_profile"]),
+            ("（1）公司层面的业绩考核要求", "equity_incentive", ["incentive_performance_assessment"]),
+            ("7、行权安排", "equity_incentive", ["incentive_vesting_exercise"]),
+            ("6、归属安排", "equity_incentive", ["incentive_vesting_exercise"]),
+            ("（一）2021年激励计划简介及授予情况", "equity_incentive", ["incentive_plan_overview"]),
+        ]
+        for title, filing_type, expected in cases:
+            with self.subTest(title=title):
+                unit = UnitDraft(
+                    payload_kind="text",
+                    payload={"text": "内容"},
+                    source_order=1,
+                    title=title,
+                    heading_path=[title],
+                )
+                self.assertEqual(
+                    semantic_keys_for_unit(unit, filing_type=filing_type),
+                    expected,
+                )
+        # Periodic reports keep the coarse guarantee scalar; the section key
+        # joins the array without displacing it.
+        periodic = UnitDraft(
+            payload_kind="text",
+            payload={"text": "内容"},
+            source_order=1,
+            title="担保协议的主要内容",
+            heading_path=["第十节 财务报告", "十、担保情况", "担保协议的主要内容"],
+        )
+        self.assertEqual(
+            semantic_keys_for_unit(periodic, filing_type="annual_report"),
+            ["guarantee", "guarantee_agreement_terms"],
+        )
+        # leaf_only: an ancestor section title must not leak onto a descendant
+        # whose own slot carries no matching phrase.
+        descendant = UnitDraft(
+            payload_kind="text",
+            payload={"text": "内容"},
+            source_order=1,
+            title="反担保情况",
+            heading_path=["四、担保协议的主要内容", "反担保情况"],
+        )
+        self.assertEqual(
+            semantic_keys_for_unit(descendant, filing_type="financing"),
+            [],
+        )
+
     def test_semantic_labels_use_complete_source_hierarchy(self) -> None:
         unit = UnitDraft(
             payload_kind="text",

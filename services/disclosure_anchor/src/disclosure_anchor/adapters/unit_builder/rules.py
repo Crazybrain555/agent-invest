@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import unicodedata
 
 
-RULES_VERSION = "ub-2026.07-59"
+RULES_VERSION = "ub-2026.07-60"
 HEADING_RULESET_ID = "cn_a_v6"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -534,6 +534,70 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         "impairment",
         required=("减值",),
         any_required=("准备", "测试", "损失"),
+    ),
+    # 公告节键（2026-07-17 用户批准第二批：担保+股权激励两家族；锚点=深交所公告
+    # 格式指引交易类第 5 号逐字节名 + 证监会股权激励管理办法第九条；担保/激励
+    # 逐单元复核与全叶 token 碰撞检查零误伤，数据见 retrieval 设计 §6.3）。
+    # 全部 leaf_only、不限文类；置于粗粒度业务键之后，定期报告 scalar 不回退。
+    SemanticKeyRule(
+        "guarantee_overview",
+        any_required=("担保情况概述", "担保事项概述"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "guarantee_progress",
+        required=("担保进展",),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "guaranteed_party_profile",
+        required=("被担保人基本情况",),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "guarantee_agreement_terms",
+        required=("担保协议", "主要内容"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "cumulative_external_guarantees",
+        required=("累计对外担保",),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "incentive_performance_assessment",
+        any_required=("业绩考核要求", "绩效考核要求", "业绩考核指标"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "incentive_vesting_exercise",
+        any_required=("行权安排", "归属安排", "解除限售安排"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "incentive_plan_overview",
+        any_required=("激励计划简介", "激励计划的目的", "激励计划概述"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "incentive_recipients",
+        required=("激励对象名单",),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "incentive_condition_satisfaction",
+        any_required=("满足行权条件", "满足归属条件", "符合行权条件", "满足解除限售条件"),
+        filing_type_limited=False,
+        leaf_only=True,
     ),
     # 法定章节键（2026-07-17 用户批准第一批扩容；锚点=证监会年报格式准则第 2 号
     # 固定章节 + 交易所公告格式指引的通用"提示"节；数据支撑见 retrieval 设计 §6.3）。
