@@ -1906,9 +1906,10 @@ class UnitBuilderTests(unittest.TestCase):
             ("特别提示", "related_party", ["important_notice"]),
             ("备查文件", "annual_report", ["reference_documents"]),
             ("释义", "annual_report", ["definitions"]),
-            # Periodic-report gate: section keys stay off standalone filings.
-            ("备查文件", "other", []),
-            ("释义", "financing", []),
+            # 2026-07-17 batch 3 ungated the structural section keys:
+            # announcements carry 备查文件/释义 sections too.
+            ("备查文件", "other", ["reference_documents"]),
+            ("释义", "financing", ["definitions"]),
         ]
         for title, filing_type, expected in cases:
             with self.subTest(title=title, filing_type=filing_type):
@@ -1961,6 +1962,27 @@ class UnitBuilderTests(unittest.TestCase):
             # IPO lockup-expiry announcement shares the surface words.
             ("四、高级管理人员的业绩考核要求", "annual_report", []),
             ("三、解除限售安排", "equity_share_change", []),
+            # Batch 3: related-party family and cross-announcement sections
+            # (交易类第9号 template phrasing).
+            ("一、关联交易概述", "related_party", ["related_party_overview"]),
+            ("二、关联方基本情况", "related_party", ["related_party_profile"]),
+            ("四、定价政策及定价依据", "related_party", ["transaction_pricing_basis"]),
+            ("五、关联交易协议的主要内容", "related_party", ["transaction_agreement_terms"]),
+            (
+                "八、与该关联人累计已发生的各类关联交易情况",
+                "related_party",
+                ["cumulative_related_party_transactions"],
+            ),
+            ("三、本次交易已履行的决策程序", "financing", ["decision_procedures"]),
+            ("五、独立财务顾问的专业意见", "restructuring_assets", ["intermediary_opinion"]),
+            ("目录", "annual_report", ["table_of_contents"]),
+            # 备查文件目录 keeps its statutory scalar; the TOC key joins the
+            # array only.
+            (
+                "备查文件目录",
+                "annual_report",
+                ["reference_documents", "table_of_contents"],
+            ),
         ]
         for title, filing_type, expected in cases:
             with self.subTest(title=title):

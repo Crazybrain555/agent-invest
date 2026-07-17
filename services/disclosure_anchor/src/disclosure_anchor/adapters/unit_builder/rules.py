@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import unicodedata
 
 
-RULES_VERSION = "ub-2026.07-61"
+RULES_VERSION = "ub-2026.07-62"
 HEADING_RULESET_ID = "cn_a_v6"
 GIBBERISH_RATIO_MAX = 0.30
 
@@ -607,6 +607,51 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         filing_type_limited=False,
         leaf_only=True,
     ),
+    # 公告节键第三批（2026-07-17 用户批准：关联交易家族 + 跨公告通用节；
+    # 锚点=深交所公告格式指引交易类第 9 号逐字节名；定价/协议条款在重组类公告
+    # 同为诚实交易节，故取通用键名）。
+    SemanticKeyRule(
+        "related_party_overview",
+        required=("关联交易概述",),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "related_party_profile",
+        any_required=("关联方基本情况", "关联人基本情况"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "transaction_pricing_basis",
+        any_required=("定价政策", "定价依据"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "transaction_agreement_terms",
+        any_required=("关联交易协议", "交易协议的主要内容"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "cumulative_related_party_transactions",
+        required=("累计已发生", "关联"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "decision_procedures",
+        any_required=("决策程序", "审批程序"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "intermediary_opinion",
+        any_required=("独立财务顾问", "法律意见", "核查意见"),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
     # 法定章节键（2026-07-17 用户批准第一批扩容；锚点=证监会年报格式准则第 2 号
     # 固定章节 + 交易所公告格式指引的通用"提示"节；数据支撑见 retrieval 设计 §6.3）。
     # 三条均 leaf_only：章节键只描述单元自身所在部位，不沿路径污染子孙；置于元组
@@ -618,8 +663,27 @@ SEMANTIC_KEY_RULES: tuple[SemanticKeyRule, ...] = (
         filing_type_limited=False,
         leaf_only=True,
     ),
-    SemanticKeyRule("reference_documents", required=("备查文件",), leaf_only=True),
-    SemanticKeyRule("definitions", required=("释义",), leaf_only=True),
+    # 2026-07-17 第三批去门控：公告类同样有备查文件/释义节（语料 388/37 例回退）。
+    SemanticKeyRule(
+        "reference_documents",
+        required=("备查文件",),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    SemanticKeyRule(
+        "definitions",
+        required=("释义",),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
+    # 目录页是 L2 脉络的基线原料（用户 2026-07-17 方向）。置于 reference_documents
+    # 之后：「备查文件目录」的 scalar 仍归 reference_documents，本键只入数组。
+    SemanticKeyRule(
+        "table_of_contents",
+        required=("目录",),
+        filing_type_limited=False,
+        leaf_only=True,
+    ),
 )
 
 
