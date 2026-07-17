@@ -67,3 +67,110 @@ def tokenize(text: str) -> str:
         if token.strip()
     ]
     return " ".join(tokens)
+
+
+# --- Query-side synonym expansion (queries only; never touches stored data) --
+
+SEARCH_SYNONYMS_VERSION = "qs-2026.07-1"
+
+_SYNONYMS_PATH = Path(__file__).with_name("synonyms.txt")
+_MAX_SYNONYM_GROUPS = 40
+
+_synonyms: dict[str, tuple[str, ...]] | None = None
+
+
+class RetrievalSynonymError(RuntimeError):
+    """The query-side synonym table is malformed or out of contract."""
+
+
+def _synonym_terms(segment: str, *, line_no: int) -> list[str]:
+    terms = [term.strip() for term in segment.split(",")]
+    terms = [term for term in terms if term]
+    for term in terms:
+        if tokenize(term) != term:
+            raise RetrievalSynonymError(
+                f"synonyms.txt:{line_no}: {term!r} is not a single lexeme "
+                "under the pinned tokenizer; shared-lexeme pairs match "
+                "without an alias and multi-lexeme aliases never fire"
+            )
+    return terms
+
+
+def parse_synonyms(text: str) -> dict[str, tuple[str, ...]]:
+    """Parse the alias table into token -> extra-lexemes, failing closed."""
+
+    expansion: dict[str, list[str]] = {}
+    groups = 0
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        groups += 1
+        if "=>" in line:
+            left, _, right = line.partition("=>")
+            sources = _synonym_terms(left, line_no=line_no)
+            targets = _synonym_terms(right, line_no=line_no)
+            if len(sources) != 1 or not targets:
+                raise RetrievalSynonymError(
+                    f"synonyms.txt:{line_no}: a directional rule needs "
+                    "exactly one source and at least one target"
+                )
+            expansion.setdefault(sources[0], []).extend(targets)
+        else:
+            terms = _synonym_terms(line, line_no=line_no)
+            if len(terms) < 2:
+                raise RetrievalSynonymError(
+                    f"synonyms.txt:{line_no}: an equivalence group needs "
+                    "at least two terms"
+                )
+            for term in terms:
+                expansion.setdefault(term, []).extend(
+                    other for other in terms if other != term
+                )
+    if groups > _MAX_SYNONYM_GROUPS:
+        raise RetrievalSynonymError(
+            f"synonyms.txt exceeds the {_MAX_SYNONYM_GROUPS}-group cap; the "
+            "alias table is deliberately bounded (see file header)"
+        )
+    return {
+        token: tuple(dict.fromkeys(extras))
+        for token, extras in expansion.items()
+    }
+
+
+def _load_synonyms() -> dict[str, tuple[str, ...]]:
+    global _synonyms
+    if _synonyms is not None:
+        return _synonyms
+    with _lock:
+        if _synonyms is None:
+            _synonyms = parse_synonyms(
+                _SYNONYMS_PATH.read_text(encoding="utf-8")
+            )
+    return _synonyms
+
+
+def _quote_lexeme(lexeme: str) -> str:
+    return "'" + lexeme.replace("'", "''") + "'"
+
+
+def build_search_tsquery(query: str) -> str:
+    """Expand a user query into a ``to_tsquery('simple', …)`` string.
+
+    Each query lexeme becomes an OR-group of itself plus its curated
+    aliases; groups are AND-combined. Returns an empty string when no
+    lexeme survives normalization, so callers can skip the tsquery channel.
+    """
+
+    tokens = tokenize(query).split()
+    if not tokens:
+        return ""
+    synonyms = _load_synonyms()
+    groups: list[str] = []
+    for token in dict.fromkeys(tokens):
+        alternatives = [token, *synonyms.get(token, ())]
+        quoted = [_quote_lexeme(alternative) for alternative in alternatives]
+        groups.append(
+            "(" + " | ".join(quoted) + ")" if len(quoted) > 1 else quoted[0]
+        )
+    return " & ".join(groups)

@@ -48,6 +48,45 @@ class TokenizerTests(unittest.TestCase):
             tokenizer._tokenizer = None
 
 
+class QuerySynonymTests(unittest.TestCase):
+    def test_shipped_synonym_file_loads_against_pinned_tokenizer(self) -> None:
+        expansion = tokenizer._load_synonyms()
+        self.assertIn("年报", expansion)
+        self.assertIn("年度报告", expansion["年报"])
+
+    def test_equivalence_group_expands_both_directions(self) -> None:
+        self.assertEqual(
+            tokenizer.build_search_tsquery("分红"),
+            "('分红' | '利润分配' | '分派')",
+        )
+        self.assertIn("'分红'", tokenizer.build_search_tsquery("利润分配"))
+
+    def test_directional_rule_is_one_way(self) -> None:
+        expanded = tokenizer.build_search_tsquery("派息")
+        self.assertIn("'分红'", expanded)
+        self.assertNotIn("'派息'", tokenizer.build_search_tsquery("分红"))
+
+    def test_multi_lexeme_query_terms_and_conjunction(self) -> None:
+        # 商誉减值 segments to two lexemes with no aliases: plain AND, which
+        # already matches 商誉减值准备 through the shared lexemes.
+        self.assertEqual(
+            tokenizer.build_search_tsquery("商誉减值"), "'商誉' & '减值'"
+        )
+        self.assertEqual(tokenizer.build_search_tsquery("  "), "")
+
+    def test_parse_rejects_multi_lexeme_and_degenerate_rules(self) -> None:
+        with self.assertRaises(tokenizer.RetrievalSynonymError):
+            tokenizer.parse_synonyms("回购, 股份回购\n")
+        with self.assertRaises(tokenizer.RetrievalSynonymError):
+            tokenizer.parse_synonyms("年报\n")
+        with self.assertRaises(tokenizer.RetrievalSynonymError):
+            tokenizer.parse_synonyms("年报, 季报 => 季度\n")
+        with self.assertRaises(tokenizer.RetrievalSynonymError):
+            tokenizer.parse_synonyms(
+                "\n".join(f"年报, 年度报告  # {index}" for index in range(41))
+            )
+
+
 class LinearizeBodyTests(unittest.TestCase):
     def test_text_body_is_payload_text(self) -> None:
         self.assertEqual(linearize_body("text", {"text": "货币资金明细"}), "货币资金明细")
