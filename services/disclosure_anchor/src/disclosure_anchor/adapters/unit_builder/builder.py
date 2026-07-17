@@ -10,7 +10,7 @@ import re
 import unicodedata
 from typing import Any, Callable, Iterable
 
-from disclosure_anchor.adapters.unit_builder import rules
+from disclosure_anchor.adapters.unit_builder import rules, toc_outline
 from disclosure_anchor.adapters.unit_builder.source_projection import (
     project_official_ir_form,
 )
@@ -165,6 +165,9 @@ class _HeadingStackEntry:
     outline_family: str | None = None
     outline_ordinal: int | None = None
     dotted_components: tuple[int, ...] | None = None
+    # The document's TOC declared this title as a top-level section, so the
+    # entry carries proven depth even without a grammar pattern.
+    toc_proven: bool = False
 
 
 @dataclass(frozen=True)
@@ -959,8 +962,10 @@ def s2_apply_heading_tree(
     elements: Iterable[PreparedElement],
     *,
     qa_heading_mode: bool = False,
+    toc_root_keys: frozenset[str] = frozenset(),
     stats: BuildStats | None = None,
 ) -> list[PreparedElement]:
+    elements = list(elements)
     # Per-document reliability gate (docs/implementation/design/
     # heading-level-arbitration.md): a layout backend that emits one constant
     # heading_level for the whole document proves nothing about depth, so only
@@ -1033,12 +1038,13 @@ def s2_apply_heading_tree(
             heading_text = heading_candidate.text or ""
             evidence = _heading_pattern_evidence(heading_text, stack=stack)
             pattern_level = evidence.level
-            source_level = _arbitrated_source_level(
+            source_level, toc_proven = _arbitrated_source_level(
                 heading_candidate,
                 fallback_level=level,
                 evidence=evidence,
                 stack=stack,
                 parser_levels_informative=parser_levels_informative,
+                toc_root_keys=toc_root_keys,
             )
             dotted_parent_proven = False
             if evidence.dotted_components is not None:
@@ -1096,6 +1102,7 @@ def s2_apply_heading_tree(
                     outline_family=evidence.family,
                     outline_ordinal=evidence.ordinal,
                     dotted_components=evidence.dotted_components,
+                    toc_proven=toc_proven,
                 )
             )
             next_occurrence_id += 1
@@ -1201,7 +1208,8 @@ def _arbitrated_source_level(
     evidence: _HeadingPatternEvidence,
     stack: list[_HeadingStackEntry],
     parser_levels_informative: bool,
-) -> int:
+    toc_root_keys: frozenset[str] = frozenset(),
+) -> tuple[int, bool]:
     """Pick the source level from the most reliable available depth signal.
 
     Informative parser levels stay authoritative. In the degenerate regime
@@ -1216,11 +1224,21 @@ def _arbitrated_source_level(
     """
 
     if parser_levels_informative:
-        return max(
-            1, min(7, heading_candidate.heading_level or fallback_level)
+        return (
+            max(1, min(7, heading_candidate.heading_level or fallback_level)),
+            False,
         )
     if evidence.level is not None:
-        return max(1, min(7, evidence.level))
+        return max(1, min(7, evidence.level)), False
+    if evidence.dotted_components is None and toc_root_keys:
+        # The document's own TOC is the strongest available signal here: an
+        # unnumbered body opener whose title the TOC declares with a 第X章/
+        # 第X节 prefix is a proven top-level section, not a note interior.
+        toc_key = toc_outline.normalize_section_title(
+            toc_outline.strip_section_enumerator(heading_candidate.text or "")
+        )
+        if toc_key in toc_root_keys:
+            return 1, True
     title = _normalized_title(heading_candidate.text or "")
     if (
         evidence.dotted_components is None
@@ -1231,11 +1249,13 @@ def _arbitrated_source_level(
         top_has_depth_evidence = (
             top_entry.pattern_level is not None
             or top_entry.dotted_components is not None
+            or top_entry.toc_proven
         )
-        return min(
-            7, top_entry.source_level + (1 if top_has_depth_evidence else 0)
+        return (
+            min(7, top_entry.source_level + (1 if top_has_depth_evidence else 0)),
+            False,
         )
-    return max(1, min(7, fallback_level))
+    return max(1, min(7, fallback_level)), False
 
 
 def _place_unnumbered_heading(
@@ -2075,6 +2095,13 @@ def build_unit_drafts_s1_s7(
     placed = s2_apply_heading_tree(
         elements,
         qa_heading_mode=qa_mode,
+        toc_root_keys=toc_outline.toc_declared_root_keys(
+            element.text
+            for element in elements
+            if element.kind == "text"
+            and element.text
+            and (element.page_no or 0) <= 30
+        ),
         stats=s1.stats,
     )
     # QA discrimination was removed: transcripts

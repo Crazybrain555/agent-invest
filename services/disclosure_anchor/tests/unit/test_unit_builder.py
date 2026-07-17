@@ -1007,6 +1007,60 @@ class UnitBuilderTests(unittest.TestCase):
         other = next(item for item in placed if item.text == "无其他事项。")
         self.assertEqual(other.heading_path, ["其他事项说明"])
 
+    def test_s2_toc_declared_opener_roots_instead_of_anchoring(self) -> None:
+        # A degenerate document whose TOC declares "第X章 <title>" proves that
+        # a prefix-less body opener with the same title is a top-level section
+        # (the 招商银行 family); without that declaration the same heading
+        # anchors below the stack top.
+        toc_block = "\n".join(
+            [
+                "10 第一章 公司简介",
+                "14 第二章 会计数据和财务指标摘要",
+                "19 第三章 管理层讨论与分析",
+                "72 第四章 环境、社会与治理(ESG)",
+                "80 第五章 公司治理",
+            ]
+        )
+        elements = [
+            PreparedElement(
+                kind="heading", order_index=1, heading_level=1, text="公司简介"
+            ),
+            PreparedElement(
+                kind="heading", order_index=2, heading_level=1, text="一、基本情况"
+            ),
+            PreparedElement(kind="text", order_index=3, text="简介正文。"),
+            PreparedElement(
+                kind="heading", order_index=4, heading_level=1, text="管理层讨论与分析"
+            ),
+            PreparedElement(kind="text", order_index=5, text="经营回顾正文。"),
+            PreparedElement(
+                kind="heading", order_index=6, heading_level=1, text="资产负债情况"
+            ),
+            PreparedElement(kind="text", order_index=7, text="资产结构正文。"),
+        ]
+        from disclosure_anchor.adapters.unit_builder import toc_outline
+
+        toc_root_keys = toc_outline.toc_declared_root_keys([toc_block])
+        placed = s2_apply_heading_tree(elements, toc_root_keys=toc_root_keys)
+
+        mda = next(item for item in placed if item.text == "经营回顾正文。")
+        self.assertEqual(mda.heading_path, ["管理层讨论与分析"])
+        # A heading the TOC does not declare keeps the anchoring behavior.
+        other = next(item for item in placed if item.text == "资产结构正文。")
+        self.assertEqual(
+            other.heading_path, ["管理层讨论与分析", "资产负债情况"]
+        )
+        # Without the TOC evidence the same opener anchors below the numbered
+        # section instead of rooting.
+        placed_without = s2_apply_heading_tree(elements)
+        mda_without = next(
+            item for item in placed_without if item.text == "经营回顾正文。"
+        )
+        self.assertEqual(
+            mda_without.heading_path,
+            ["公司简介", "一、基本情况", "管理层讨论与分析"],
+        )
+
     def test_s2_varied_parser_levels_skip_unnumbered_anchoring(self) -> None:
         # Adjacent negative: with an informative parser level set the anchoring
         # branch must not fire — the unnumbered heading keeps parser semantics

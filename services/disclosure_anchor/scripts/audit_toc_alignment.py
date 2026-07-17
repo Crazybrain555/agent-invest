@@ -13,61 +13,24 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-_TRAILING_PAGE_RE = re.compile(r"^(?P<title>.+?)[\s.·…‥、_-]*(?P<page>\d{1,4})$")
-_LEADING_PAGE_RE = re.compile(r"^(?P<page>\d{1,4})\s+(?P<title>\S.*?)\s*$")
-_NUMERIC_ONLY_RE = re.compile(r"^[\d\s./·…-]*$")
+from disclosure_anchor.adapters.unit_builder.toc_outline import (  # noqa: E402
+    normalize_section_title,
+    parse_toc_titles,
+    strip_section_enumerator,
+)
 
 
 def normalize_heading(text: str) -> str:
-    return re.sub(r"[\s.·…‥、_（）()：:]+", "", text)
+    """Match key: enumerator-stripped so 目录's 第X章 form meets the
+    prefix-less body opener."""
 
-
-def _candidate_lines(toc_text: str) -> list[str]:
-    lines = []
-    for raw in toc_text.splitlines():
-        line = raw.strip()
-        if len(line) >= 2 and not _NUMERIC_ONLY_RE.match(line):
-            lines.append(line)
-    return lines
-
-
-def parse_toc_titles(toc_text: str) -> tuple[list[str], int]:
-    """Extract section titles from a TOC page's text.
-
-    Real TOCs come in two line grammars — "title …… page" and
-    "page title" — and one document sticks to one of them, so the majority
-    grammar wins per document. Returns (titles, unparsed_line_count).
-    """
-
-    lines = _candidate_lines(toc_text)
-    trailing = [_TRAILING_PAGE_RE.match(line) for line in lines]
-    leading = [_LEADING_PAGE_RE.match(line) for line in lines]
-
-    def _titles(matches: list[re.Match[str] | None]) -> list[str]:
-        found = []
-        for match in matches:
-            if match is None:
-                continue
-            title = match.group("title").strip()
-            if len(title) >= 2 and not _NUMERIC_ONLY_RE.match(title):
-                found.append(title)
-        return found
-
-    trailing_titles = _titles(trailing)
-    leading_titles = _titles(leading)
-    titles = (
-        leading_titles
-        if len(leading_titles) > len(trailing_titles)
-        else trailing_titles
-    )
-    return titles, len(lines) - len(titles)
+    return normalize_section_title(strip_section_enumerator(text))
 
 
 def match_titles_to_tree(

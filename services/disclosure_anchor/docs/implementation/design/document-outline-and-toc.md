@@ -67,6 +67,10 @@ document_id = X ORDER BY first_order_index` 即得全骨架。
 **升级路径（有证据才走）**：若 `toc_section_missing_in_tree` 揭示系统性丢标题
 家族，把目录节名注册为仲裁框架的 S0' 信号槽（heading-level-arbitration.md §3
 的阶梯顶端补一档「文内目录锚点」），进入正常的设计-验证循环。
+→ **已走通（同日）**：首次审计的招行家族（71% 缺失）即此类——章首 heading 存在
+但无前缀，被锚定吞章。S0' 已实装（见仲裁文档 §5），解析与 title path 现在
+以目录为 base（用户方向）；共享解析器在 `unit_builder/toc_outline.py`，
+审计与构建同源。
 
 ## 5. 首次审计结果（2026-07-17）
 
