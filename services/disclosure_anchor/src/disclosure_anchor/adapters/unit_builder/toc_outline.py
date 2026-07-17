@@ -12,7 +12,9 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
-_TRAILING_PAGE_RE = re.compile(r"^(?P<title>.+?)[\s.·…‥、_-]*(?P<page>\d{1,4})$")
+_TRAILING_PAGE_RE = re.compile(
+    r"^(?P<title>.+?)[\s.·…‥、_-]*(?P<page>\d{1,4})[\s\-–－]*$"
+)
 _LEADING_PAGE_RE = re.compile(r"^(?P<page>\d{1,4})\s+(?P<title>\S.*?)\s*$")
 _NUMERIC_ONLY_RE = re.compile(r"^[\d\s./·…-]*$")
 _SECTION_ENUMERATOR_RE = re.compile(r"^第\s*[一二三四五六七八九十百]+\s*[节章]\s*")
@@ -103,13 +105,17 @@ def parse_toc_titles(toc_text: str) -> tuple[list[str], int]:
     return titles, len(lines) - len(titles)
 
 
+_SUB_ENTRY_PREFIX_RE = re.compile(r"^[\d(（]")
+
+
 def toc_declared_root_keys(text_blocks: Iterable[str]) -> frozenset[str]:
     """Normalized top-level section names declared by TOC-shaped blocks.
 
-    Only enumerator-prefixed entries (第X章/第X节 …) define roots: the
-    statutory prefix is what proves the entry is a top-level section rather
-    than a listed sub-heading, and the returned keys are enumerator-stripped
-    so prefix-less body openers can match.
+    Enumerator-prefixed entries (第X章/第X节 …) are top-level by statute and
+    are returned enumerator-stripped so prefix-less body openers can match.
+    Unprefixed entries without sub-entry numbering (释义, 行长致辞,
+    附表：…) are the TOC's own top level and count as declared too;
+    numbered sub-entries (3.1 …, (1) …) never do.
     """
 
     keys: set[str] = set()
@@ -119,7 +125,9 @@ def toc_declared_root_keys(text_blocks: Iterable[str]) -> frozenset[str]:
             continue
         for title in titles:
             stripped = strip_section_enumerator(title)
-            if stripped == title.strip():
+            if stripped == title.strip() and _SUB_ENTRY_PREFIX_RE.match(
+                stripped
+            ):
                 continue
             key = normalize_section_title(stripped)
             if len(key) >= 2:

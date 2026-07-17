@@ -1007,6 +1007,73 @@ class UnitBuilderTests(unittest.TestCase):
         other = next(item for item in placed if item.text == "无其他事项。")
         self.assertEqual(other.heading_path, ["其他事项说明"])
 
+    def test_s2_swallowed_section_title_in_table_caption_opens_section(
+        self,
+    ) -> None:
+        # A layout backend folds a section title set flush against its first
+        # table into that table's caption (释义 / 第十节财务报告 / 附表：…).
+        # The caption opens the section; a continuation caption of the open
+        # section never reopens it, and ordinary captions never qualify.
+        placed = s2_apply_heading_tree(
+            [
+                PreparedElement(
+                    kind="heading", order_index=1, heading_level=1, text="重要提示"
+                ),
+                PreparedElement(kind="text", order_index=2, text="本报告未经审计。"),
+                PreparedElement(
+                    kind="table",
+                    order_index=3,
+                    heading_level=None,
+                    table_caption=["释义"],
+                    payload={"rows": [["释义项", "指", "内容"]]},
+                ),
+                PreparedElement(
+                    kind="table",
+                    order_index=4,
+                    heading_level=None,
+                    table_caption=["第十节财务报告"],
+                    payload={"rows": [["审计意见类型", "标准无保留"]]},
+                ),
+                PreparedElement(
+                    kind="heading", order_index=5, heading_level=1, text="一、审计报告"
+                ),
+                PreparedElement(kind="text", order_index=6, text="审计意见正文。"),
+                PreparedElement(
+                    kind="table",
+                    order_index=7,
+                    heading_level=None,
+                    table_caption=["第十节财务报告（续）"],
+                    payload={"rows": [["合并资产负债表", ""]]},
+                ),
+                PreparedElement(
+                    kind="table",
+                    order_index=8,
+                    heading_level=None,
+                    table_caption=["单位：元"],
+                    payload={"rows": [["资产", "100"]]},
+                ),
+            ]
+        )
+
+        definitions_table = next(
+            item for item in placed if item.table_caption == ["释义"]
+        )
+        self.assertEqual(definitions_table.heading_path, ["释义"])
+        audit_body = next(item for item in placed if item.text == "审计意见正文。")
+        self.assertEqual(
+            audit_body.heading_path, ["第十节财务报告", "一、审计报告"]
+        )
+        # The continuation caption stays inside the open section instead of
+        # reopening it, and the ordinary caption changes nothing.
+        continuation = next(
+            item
+            for item in placed
+            if item.table_caption == ["第十节财务报告（续）"]
+        )
+        self.assertEqual(continuation.heading_path[0], "第十节财务报告")
+        plain = next(item for item in placed if item.table_caption == ["单位：元"])
+        self.assertEqual(plain.heading_path[0], "第十节财务报告")
+
     def test_numbered_request_line_without_question_mark_is_not_a_heading(
         self,
     ) -> None:

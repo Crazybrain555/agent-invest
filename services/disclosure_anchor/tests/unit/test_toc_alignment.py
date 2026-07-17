@@ -76,24 +76,39 @@ class TocParsingTests(unittest.TestCase):
         self.assertEqual(strip_section_enumerator("第十节 财务报告"), "财务报告")
         self.assertEqual(strip_section_enumerator("重要提示"), "重要提示")
 
-    def test_toc_declared_root_keys_prefixed_entries_only(self) -> None:
+    def test_toc_declared_root_keys_top_level_entries(self) -> None:
         toc = "\n".join(
             [
                 "2 释义",
                 "10 第一章 公司简介",
                 "14 第二章 会计数据和财务指标摘要",
-                "19 第三章 管理层讨论与分析",
+                "18 3.1 总体经营情况分析",
                 "72 第四章 环境、社会与治理(ESG)",
                 "80 第五章 公司治理",
+                "112 附表：简式权益变动报告书",
             ]
         )
         keys = toc_declared_root_keys([toc])
-        self.assertIn("管理层讨论与分析", keys)
         self.assertIn("公司简介", keys)
-        # Unprefixed TOC lines do not define roots.
-        self.assertNotIn("释义", keys)
+        # Unprefixed top-level entries count; numbered sub-entries never do.
+        self.assertIn("释义", keys)
+        self.assertIn("附表简式权益变动报告书", keys)
+        self.assertNotIn("总体经营情况分析", keys)
+        self.assertFalse(any("3.1" in key for key in keys))
         # Short lists never define the outline.
         self.assertEqual(toc_declared_root_keys(["10 第一章 公司简介"]), frozenset())
+
+    def test_dash_wrapped_page_numbers_parse(self) -> None:
+        text = "\n".join(
+            [
+                "第一节 重要提示、目录和释义 ..... -3 -",
+                "第四节 公司治理....-68-",
+                "第十节 财务报告....-148-",
+            ]
+        )
+        titles, unparsed = parse_toc_titles(text)
+        self.assertEqual(unparsed, 0)
+        self.assertEqual(titles[-1], "第十节 财务报告")
 
     def test_matching_strips_enumerator_on_both_sides(self) -> None:
         segments = {

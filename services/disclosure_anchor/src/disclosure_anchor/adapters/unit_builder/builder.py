@@ -1013,6 +1013,38 @@ def s2_apply_heading_tree(
                     )
                 ]
                 next_occurrence_id += 1
+        if (
+            not parser_levels_informative
+            and element.kind == "table"
+            and element.table_caption
+        ):
+            section_key = _caption_section_key(
+                str(element.table_caption[0]), toc_root_keys
+            )
+            if section_key is not None and not (
+                stack and _section_continuation_key(stack[0].title) == section_key
+            ):
+                # A section title set flush against its first table gets
+                # folded into that table's caption by the layout backend
+                # (释义 / 第十节财务报告 / 附表：…); the caption is
+                # parser-attributed structure carrying the lost section
+                # boundary, so it opens the section the table and the
+                # following elements belong to. A continuation caption
+                # ("…（续）") of the already-open section never reopens it.
+                stack = [
+                    _HeadingStackEntry(
+                        logical_level=1,
+                        title=str(element.table_caption[0]).strip(),
+                        occurrence_id=next_occurrence_id,
+                        source_level=1,
+                        pattern_level=None,
+                        artifact_locator=element.artifact_locator,
+                        projection_field="table_caption",
+                        projection_index=0,
+                        toc_proven=True,
+                    )
+                ]
+                next_occurrence_id += 1
         clean_text, trailing_marker = rules.split_trailing_applicability_marker(text)
         heading_candidate = element
         marker_locator: dict[str, Any] | None = None
@@ -1199,6 +1231,41 @@ def s2_apply_heading_tree(
         stats.heading_only_carriers_preserved += len(orphan_ids)
     placed.extend(heading_carriers[item] for item in orphan_ids)
     return sorted(placed, key=lambda item: (item.order_index, item.intra_order))
+
+
+def _section_continuation_key(title: str) -> str:
+    """Continuation-tolerant identity key ("第十节财务报告（续）" == "…报告")."""
+
+    key = toc_outline.normalize_section_title(
+        toc_outline.strip_section_enumerator(title)
+    )
+    return key[:-1] if key.endswith("续") else key
+
+
+def _caption_section_key(
+    caption: str, toc_root_keys: frozenset[str]
+) -> str | None:
+    """Identity key when a table caption is a swallowed section title.
+
+    Strong evidence only: a statutory 第X章/第X节 enumerator on the caption
+    itself, a FIXED_L1 title, or a TOC-declared top-level section name.
+    Ordinary captions (单位：元, "(1) 商誉账面原值") never qualify.
+    """
+
+    text = caption.strip()
+    if not text:
+        return None
+    key = _section_continuation_key(text)
+    if not key:
+        return None
+    if toc_outline.strip_section_enumerator(text) != text:
+        return key
+    if _normalized_title(text) in rules.FIXED_L1_TITLES:
+        return key
+    normalized = toc_outline.normalize_section_title(text)
+    if normalized in toc_root_keys:
+        return key
+    return None
 
 
 def _arbitrated_source_level(
