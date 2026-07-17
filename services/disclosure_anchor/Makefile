@@ -237,3 +237,7 @@ doctor-full:
 wipe-test-data:
 	@test "$(WIPE)" = "YES" || (echo 'usage: make wipe-test-data WIPE=YES  (test-phase only!)' && exit 2)
 	$(WITH_ENV) WIPE=YES ./scripts/wipe_test_data.sh
+
+wipe-derived:
+	@test "$(WIPE)" = "YES" || (echo 'usage: make wipe-derived WIPE=YES  (keeps raw PDFs, wipes parse/units/DB derived state)' && exit 2)
+	$(WITH_ENV) WIPE=YES ./scripts/wipe_derived_data.sh
