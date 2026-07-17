@@ -40,4 +40,6 @@ PUBLIC_VIEWS = (
     "tracked_companies_v1",
     # 06R derived retrieval projection (regenerable, no event semantics).
     "unit_search_projection_v1",
+    # Derived per-document heading-tree skeleton (regenerable, no events).
+    "document_outline_v1",
 )
