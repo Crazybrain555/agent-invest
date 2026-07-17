@@ -258,6 +258,10 @@
    "private_imports": [],
    "tests": 12
   },
+  "tests/unit/test_toc_alignment.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/unit/test_track_companies.py": {
    "private_imports": [],
    "tests": 15
