@@ -24,6 +24,7 @@ from disclosure_anchor.application.ports.disclosure_source import (
     DisclosureWindow,
     SourceSecurity,
 )
+from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
 from disclosure_anchor.domain.errors import SourceRequestError
 
 
@@ -227,3 +228,45 @@ def _fallback_category_names() -> dict[str, str]:
         for code, name in names.items()
         if isinstance(code, str) and isinstance(name, str)
     }
+
+
+class CninfoWebIndexSource:
+    """Web-channel index/download with API-channel company profiles.
+
+    The listing API carries a per-account allowance that walls off large
+    backfills while the profile API keeps answering, so the index and PDF
+    downloads ride the public website channel and profiles stay on the API —
+    degrading to the web channel's None whenever the API refuses.
+    """
+
+    def __init__(
+        self,
+        *,
+        web: CninfoWebSource,
+        api_profile_source: CninfoSource | None,
+    ) -> None:
+        self._web = web
+        self._api = api_profile_source
+
+    def search_announcements(
+        self, security: SourceSecurity, window: DisclosureWindow
+    ) -> list[AnnouncementRef]:
+        return self._web.search_announcements(security, window)
+
+    def download_pdf(self, ref: AnnouncementRef) -> bytes:
+        return self._web.download_pdf(ref)
+
+    def profile_for_security(
+        self, security_code: str
+    ) -> CninfoCompanyProfile | None:
+        if self._api is None:
+            return None
+        try:
+            return self._api.profile_for_security(security_code)
+        except SourceRequestError:
+            return None
+
+    def close(self) -> None:
+        self._web.close()
+        if self._api is not None:
+            self._api.close()

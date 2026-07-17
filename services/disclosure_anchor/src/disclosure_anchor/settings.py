@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -113,6 +113,16 @@ class Settings(BaseSettings):
         default=3,
         ge=0,
         validation_alias=AliasChoices("CNINFO_MAX_RETRIES", "cninfo_max_retries"),
+    )
+    # Worker index-sync channel. "api" is the credentialed WebAPI; "web" uses
+    # the public website index (no per-API allowance) while company profiles
+    # stay on the API channel — the escape hatch when the listing API's
+    # account allowance walls off a large backfill.
+    disclosure_sync_channel: Literal["api", "web"] = Field(
+        default="api",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_SYNC_CHANNEL", "disclosure_sync_channel"
+        ),
     )
     cninfo_overlap_days: int = Field(
         default=7,

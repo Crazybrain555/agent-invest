@@ -33,6 +33,8 @@ from disclosure_anchor.adapters.parsers.mineru.mineru_process import (
 )
 from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
 from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
+from disclosure_anchor.adapters.sources.cninfo.source import CninfoWebIndexSource
+from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
@@ -460,14 +462,27 @@ def _limits(settings: Settings) -> WorkerLimits:
 
 def _deps(settings: Settings, engine: Engine) -> WorkerDeps:
     paths = FileStorePathBuilder(settings)
-    source: CninfoSource | None = None
+    source: CninfoSource | CninfoWebIndexSource | None = None
     parser_version: str | None = None
     parser_version_lock = threading.Lock()
 
     def source_factory() -> DisclosureSourcePort:
         nonlocal source
         if source is None:
-            source = CninfoSource(CninfoClient.from_settings(settings))
+            if settings.disclosure_sync_channel == "web":
+                source = CninfoWebIndexSource(
+                    web=CninfoWebSource(
+                        max_qps=settings.cninfo_max_qps,
+                        max_retries=settings.cninfo_max_retries,
+                    ),
+                    api_profile_source=(
+                        CninfoSource(CninfoClient.from_settings(settings))
+                        if settings.cninfo_access_key
+                        else None
+                    ),
+                )
+            else:
+                source = CninfoSource(CninfoClient.from_settings(settings))
         return source
 
     def close_source() -> None:

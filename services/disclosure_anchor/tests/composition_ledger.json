@@ -120,7 +120,7 @@
    "private_imports": [
     "_window_chunks"
    ],
-   "tests": 9
+   "tests": 11
   },
   "tests/unit/test_cninfo_web_source.py": {
    "private_imports": [],

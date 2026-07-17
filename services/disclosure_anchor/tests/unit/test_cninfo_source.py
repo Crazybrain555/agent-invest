@@ -299,3 +299,76 @@ class CninfoSourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CninfoWebIndexSourceTests(unittest.TestCase):
+    def test_index_and_download_route_to_web_profile_to_api(self) -> None:
+        from disclosure_anchor.adapters.sources.cninfo.source import (
+            CninfoWebIndexSource,
+        )
+        from disclosure_anchor.domain.errors import SourceRequestError
+
+        calls: list[str] = []
+
+        class _Web:
+            def search_announcements(self, security, window):
+                calls.append("web.search")
+                return []
+
+            def download_pdf(self, ref):
+                calls.append("web.download")
+                return b"pdf"
+
+            def close(self):
+                calls.append("web.close")
+
+        class _Api:
+            def __init__(self, fail: bool) -> None:
+                self.fail = fail
+
+            def profile_for_security(self, security_code):
+                calls.append("api.profile")
+                if self.fail:
+                    raise SourceRequestError(
+                        "quota", error_code="quota_exhausted", retryable=True
+                    )
+                return "profile"
+
+            def close(self):
+                calls.append("api.close")
+
+        hybrid = CninfoWebIndexSource(web=_Web(), api_profile_source=_Api(False))
+        hybrid.search_announcements(None, None)
+        self.assertEqual(hybrid.download_pdf(None), b"pdf")
+        self.assertEqual(hybrid.profile_for_security("600941"), "profile")
+        hybrid.close()
+        self.assertEqual(
+            calls,
+            ["web.search", "web.download", "api.profile", "web.close", "api.close"],
+        )
+
+    def test_profile_degrades_to_none_on_api_refusal_or_absence(self) -> None:
+        from disclosure_anchor.adapters.sources.cninfo.source import (
+            CninfoWebIndexSource,
+        )
+        from disclosure_anchor.domain.errors import SourceRequestError
+
+        class _Web:
+            def close(self):
+                pass
+
+        class _RefusingApi:
+            def profile_for_security(self, security_code):
+                raise SourceRequestError(
+                    "quota", error_code="quota_exhausted", retryable=True
+                )
+
+            def close(self):
+                pass
+
+        with_api = CninfoWebIndexSource(
+            web=_Web(), api_profile_source=_RefusingApi()
+        )
+        self.assertIsNone(with_api.profile_for_security("600941"))
+        without_api = CninfoWebIndexSource(web=_Web(), api_profile_source=None)
+        self.assertIsNone(without_api.profile_for_security("600941"))
