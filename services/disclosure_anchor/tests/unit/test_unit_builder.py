@@ -4108,6 +4108,92 @@ class TocRegionArbitrationTests(unittest.TestCase):
             any("第一章 公司简介 5" in text for text in toc_texts)
         )
 
+    def test_toc_declared_page_boundaries_open_sections_without_headings(
+        self,
+    ) -> None:
+        # Side-tab layouts: section names exist only as page furniture, so
+        # the TOC's declared page (aligned via page-number furniture) is the
+        # only real boundary evidence.
+        toc = "\n".join(
+            [
+                "第一节 释义....3",
+                "第二节 重要提示....4",
+                "第三节 管理层讨论与分析....5",
+                "第四节 公司治理....7",
+                "第五节 财务报告....8",
+            ]
+        )
+        def page_number(oi: int, p: int) -> dict[str, object]:
+            return {
+                "kind": "page_furniture",
+                "raw_kind": "page_number",
+                "order_index": oi,
+                "page_no": p,
+                "text": str(p),
+            }
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    self._element("heading", 1, 1, "目录"),
+                    self._element("text", 2, 1, toc),
+                    self._element("text", 3, 3, "本报告中的释义内容如下。"),
+                    page_number(4, 3),
+                    self._element("text", 5, 4, "请投资者注意投资风险。"),
+                    page_number(6, 4),
+                    self._element("text", 7, 5, "报告期内经营情况良好。"),
+                    page_number(8, 5),
+                ]
+            },
+            filing_type="semiannual_report",
+        )
+
+        self.assertEqual(stats.toc_page_boundaries_synthesized, 3)
+        paths = {
+            str(unit.payload.get("text", ""))[:6]: unit.heading_path
+            for unit in units
+            if unit.payload_kind == "text"
+        }
+        self.assertEqual(paths.get("本报告中的释"), ["第一节 释义"])
+        self.assertEqual(paths.get("请投资者注意"), ["第二节 重要提示"])
+        self.assertEqual(paths.get("报告期内经营"), ["第三节 管理层讨论与分析"])
+
+    def test_no_boundary_synthesis_when_headings_or_structure_exist(
+        self,
+    ) -> None:
+        toc = "\n".join(
+            [
+                "第一节 释义....3",
+                "第二节 重要提示....4",
+                "第三节 管理层讨论与分析....5",
+                "第四节 公司治理....7",
+                "第五节 财务报告....8",
+            ]
+        )
+        # A real body heading claims its declared key: the normal TOC pin
+        # places the section and no boundary is synthesized for it.
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    self._element("heading", 1, 1, "目录"),
+                    self._element("text", 2, 1, toc),
+                    self._element("heading", 3, 3, "第一节 释义"),
+                    self._element("text", 4, 3, "本报告中的释义内容如下。"),
+                    {
+                        "kind": "page_furniture",
+                        "raw_kind": "page_number",
+                        "order_index": 5,
+                        "page_no": 3,
+                        "text": "3",
+                    },
+                ]
+            },
+            filing_type="semiannual_report",
+        )
+        self.assertEqual(stats.toc_page_boundaries_synthesized, 0)
+        for unit in units:
+            if "释义内容" in str(unit.payload.get("text", "")):
+                self.assertEqual(unit.heading_path, ["第一节 释义"])
+
     def test_arabic_toc_declaration_pins_numbered_body_openers(self) -> None:
         toc_lines = "\n".join(
             [
