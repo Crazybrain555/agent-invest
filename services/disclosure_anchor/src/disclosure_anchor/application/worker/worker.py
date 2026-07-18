@@ -8,6 +8,7 @@ round continues.
 
 from __future__ import annotations
 
+import threading
 import time
 
 from collections import Counter
@@ -177,6 +178,29 @@ class WorkerDeps:
     close_source: Callable[[], None] = lambda: None
 
 
+def _merge_acquisition_report(
+    report: WorkerReport, acquisition: WorkerReport
+) -> None:
+    """Fold the acquisition thread's sub-report into the round report."""
+
+    report.synced_companies += acquisition.synced_companies
+    report.candidates_discovered += acquisition.candidates_discovered
+    report.downloaded += acquisition.downloaded
+    report.deferred_backfill += acquisition.deferred_backfill
+    report.skipped_oversized += acquisition.skipped_oversized
+    report.failed += acquisition.failed
+    report.sync_quota_break = (
+        report.sync_quota_break or acquisition.sync_quota_break
+    )
+    report.sync_rate_limited = (
+        report.sync_rate_limited or acquisition.sync_rate_limited
+    )
+    report.source_outage_break = (
+        report.source_outage_break or acquisition.source_outage_break
+    )
+    report.failures.extend(acquisition.failures)
+
+
 def run_once(
     limits: WorkerLimits,
     deps: WorkerDeps,
@@ -191,65 +215,83 @@ def run_once(
             conn, threshold_seconds=deps.config.stale_run_threshold_seconds
         )
 
-    source: DisclosureSourcePort | None = None
-    try:
+    # Acquisition (sync -> download) runs beside the parse stage: they share
+    # no mutable state except the DB (disjoint documents) — acquisition
+    # writes its own sub-report, merged deterministically after join, so the
+    # GPU no longer idles while the provider stages run.  Build/publish stay
+    # sequential after both: they consume this round's parse outputs.
+    acquisition = WorkerReport(started_at=started_at)
+
+    def _acquisition_stages() -> None:
+        source: DisclosureSourcePort | None = None
         try:
-            if limits.sync > 0 and not should_stop():
-                source = _sync_stage(
-                    report,
-                    deps,
-                    source,
-                    limit=limits.sync,
-                    stage_seconds=limits.sync_stage_seconds,
-                    should_stop=should_stop,
+            try:
+                if limits.sync > 0 and not should_stop():
+                    source = _sync_stage(
+                        acquisition,
+                        deps,
+                        source,
+                        limit=limits.sync,
+                        stage_seconds=limits.sync_stage_seconds,
+                        should_stop=should_stop,
+                    )
+                if (
+                    limits.download > 0
+                    and not acquisition.sync_quota_break
+                    and not acquisition.source_outage_break
+                    and not should_stop()
+                ):
+                    source = _download_stage(
+                        acquisition,
+                        deps,
+                        source,
+                        limit=limits.download,
+                        should_stop=should_stop,
+                    )
+            except DisclosureAnchorError as exc:
+                # Provider family (credentials, CNINFO HTTP, token): pause
+                # acquisition this round; parse/build/publish continue.
+                acquisition.failed += 1
+                acquisition.source_outage_break = True
+                acquisition.failures.append(
+                    WorkerFailure(
+                        stage="source",
+                        item_ref="cninfo",
+                        error_code=type(exc).__name__,
+                        message=str(exc)[:500],
+                    )
                 )
-            if (
-                limits.download > 0
-                and not report.sync_quota_break
-                and not report.source_outage_break
-                and not should_stop()
-            ):
-                source = _download_stage(
-                    report,
-                    deps,
-                    source,
-                    limit=limits.download,
-                    should_stop=should_stop,
+            except Exception as exc:
+                # Local failure (queue-read SQL, programming error): still
+                # stage-isolated, but it is NOT a provider outage — tagging it
+                # as one disguised local DB faults as CNINFO downtime and
+                # triggered the wrong backoff (round23).
+                acquisition.failed += 1
+                acquisition.failures.append(
+                    WorkerFailure(
+                        stage="source_local",
+                        item_ref="worker",
+                        error_code=type(exc).__name__,
+                        message=str(exc)[:500],
+                    )
                 )
-        except DisclosureAnchorError as exc:
-            # Provider family (credentials, CNINFO HTTP, token): pause
-            # acquisition this round; parse/build/publish continue.
-            report.failed += 1
-            report.source_outage_break = True
-            report.failures.append(
-                WorkerFailure(
-                    stage="source",
-                    item_ref="cninfo",
-                    error_code=type(exc).__name__,
-                    message=str(exc)[:500],
-                )
-            )
-        except Exception as exc:
-            # Local failure (queue-read SQL, programming error): still
-            # stage-isolated, but it is NOT a provider outage — tagging it
-            # as one disguised local DB faults as CNINFO downtime and
-            # triggered the wrong backoff (round23).
-            report.failed += 1
-            report.failures.append(
-                WorkerFailure(
-                    stage="source_local",
-                    item_ref="worker",
-                    error_code=type(exc).__name__,
-                    message=str(exc)[:500],
-                )
+        finally:
+            close = getattr(source, "close", None)
+            if deps.source_close_after_round and callable(close):
+                close()
+
+    acquisition_thread = threading.Thread(
+        target=_acquisition_stages, name="acquire", daemon=True
+    )
+    acquisition_thread.start()
+    try:
+        if limits.parse > 0 and not should_stop():
+            _parse_stage(
+                report, deps, limit=limits.parse, should_stop=should_stop
             )
     finally:
-        close = getattr(source, "close", None)
-        if deps.source_close_after_round and callable(close):
-            close()
-
-    if limits.parse > 0 and not should_stop():
-        _parse_stage(report, deps, limit=limits.parse, should_stop=should_stop)
+        acquisition_thread.join()
+    _merge_acquisition_report(report, acquisition)
     if (
         limits.build > 0
         and not any(failure.stage == "build" for failure in report.failures)

@@ -124,6 +124,55 @@ class SyncWindowStartTests(unittest.TestCase):
 
 
 class RunOnceSchedulingTests(unittest.TestCase):
+    def test_parse_stage_overlaps_acquisition(self) -> None:
+        # The acquisition thread (sync/download) must run beside the parse
+        # stage: here sync blocks until parse has started, which deadlocks
+        # under sequential stage order and completes only when pipelined.
+        import threading
+
+        deps = _deps()
+        parse_started = threading.Event()
+        acquisition_saw_parse: list[bool] = []
+
+        def _sync_due(*args: object, **kwargs: object) -> list[dict[str, str]]:
+            acquisition_saw_parse.append(parse_started.wait(timeout=5.0))
+            return []
+
+        parsed = mock.MagicMock(status="succeeded", processing_run_id="run_x")
+        built = mock.MagicMock(status="succeeded", build_stats=None)
+        published = mock.MagicMock(status="published")
+
+        def _parse_execute(command: object) -> object:
+            parse_started.set()
+            return parsed
+
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "sync_due", side_effect=_sync_due
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "pending_parse",
+                return_value=[{"document_id": "doc_x", "oversized": False}],
+            ),
+            mock.patch.object(worker_module, "ParseDocument") as parse_cls,
+            mock.patch.object(worker_module, "BuildUnits") as build_cls,
+            mock.patch.object(worker_module, "PublishRun") as publish_cls,
+        ):
+            parse_cls.return_value.execute.side_effect = _parse_execute
+            build_cls.return_value.execute.return_value = built
+            publish_cls.return_value.execute.return_value = published
+            report = run_once(
+                WorkerLimits(sync=1, download=0, parse=1, build=0, publish=0),
+                deps,
+            )
+
+        self.assertEqual(acquisition_saw_parse, [True])
+        self.assertEqual(report.parsed, 1)
+
     def test_source_factory_failure_does_not_block_local_parse_chain(self) -> None:
         deps = _deps()
         object.__setattr__(

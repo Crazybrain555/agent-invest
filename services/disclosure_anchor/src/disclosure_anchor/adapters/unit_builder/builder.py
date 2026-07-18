@@ -1306,7 +1306,8 @@ def _printed_page_map(
         ):
             text = str(element.get("text") or "").strip()
             page_no = _int_or_none(element.get("page_no"))
-            if text.isdigit() and page_no is not None:
+            # isascii guard: "③".isdigit() is True but int("③") raises.
+            if text.isascii() and text.isdigit() and page_no is not None:
                 mapping.setdefault(int(text), page_no)
     return mapping
 

@@ -276,7 +276,7 @@
   },
   "tests/unit/test_unit_builder.py": {
    "private_imports": [],
-   "tests": 116
+   "tests": 117
   },
   "tests/unit/test_unit_hashing.py": {
    "private_imports": [],
@@ -298,7 +298,7 @@
    "private_imports": [
     "_sync_window_start"
    ],
-   "tests": 24
+   "tests": 25
   }
  },
  "schema": "test-composition-ledger.v1"

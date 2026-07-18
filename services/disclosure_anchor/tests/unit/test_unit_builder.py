@@ -4157,6 +4157,29 @@ class TocRegionArbitrationTests(unittest.TestCase):
         self.assertEqual(paths.get("请投资者注意"), ["第二节 重要提示"])
         self.assertEqual(paths.get("报告期内经营"), ["第三节 管理层讨论与分析"])
 
+    def test_circled_digit_page_furniture_is_ignored(self) -> None:
+        from disclosure_anchor.adapters.unit_builder.builder import (
+            _printed_page_map,
+        )
+
+        mapping = _printed_page_map(
+            [
+                {
+                    "kind": "page_furniture",
+                    "raw_kind": "page_number",
+                    "page_no": 3,
+                    "text": "③",
+                },
+                {
+                    "kind": "page_furniture",
+                    "raw_kind": "page_number",
+                    "page_no": 4,
+                    "text": "4",
+                },
+            ]
+        )
+        self.assertEqual(mapping, {4: 4})
+
     def test_no_boundary_synthesis_when_headings_or_structure_exist(
         self,
     ) -> None:
