@@ -198,6 +198,10 @@
    "private_imports": [],
    "tests": 19
   },
+  "tests/unit/test_mineru_backend_probe.py": {
+   "private_imports": [],
+   "tests": 3
+  },
   "tests/unit/test_mineru_table_reconciler.py": {
    "private_imports": [],
    "tests": 18
@@ -284,7 +288,7 @@
   },
   "tests/unit/test_worker_cli.py": {
    "private_imports": [],
-   "tests": 22
+   "tests": 23
   },
   "tests/unit/test_worker_run_once.py": {
    "private_imports": [

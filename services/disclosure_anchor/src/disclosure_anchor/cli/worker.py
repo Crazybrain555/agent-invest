@@ -281,7 +281,15 @@ class _AdaptiveLoopController:
             )
         elif report.synced_companies:
             self.quota_cooldown_seconds = SYNC_COOLDOWN_BASE_SECONDS
-            self.rate_limit_cooldown_seconds = RATE_LIMIT_COOLDOWN_BASE_SECONDS
+            # Decay instead of reset: inside a long provider throttle window
+            # a trickle of synced companies between 429 trips would otherwise
+            # collapse the ladder to base and hammer the wall every ~90s
+            # (observed ~50 throttled calls/hour); halving keeps recovery
+            # fast after real relief while sustained windows stay near max.
+            self.rate_limit_cooldown_seconds = max(
+                RATE_LIMIT_COOLDOWN_BASE_SECONDS,
+                self.rate_limit_cooldown_seconds // 2,
+            )
             self.provider_error_cooldown_seconds = PROVIDER_ERROR_COOLDOWN_BASE_SECONDS
         elif report.downloaded:
             # Local/static download success proves the provider path recovered,
@@ -523,6 +531,7 @@ def _deps(settings: Settings, engine: Engine) -> WorkerDeps:
         return MinerUDocumentParser(
             process=process,
             parser_version=parser_version,
+            server_url=settings.disclosure_mineru_server_url,
         )
 
     return WorkerDeps(

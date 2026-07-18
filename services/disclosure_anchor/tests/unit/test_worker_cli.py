@@ -353,6 +353,29 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         self.assertIn("5 failures", message)
         self.assertIn("parse", message)
 
+    def test_rate_limit_cooldown_decays_on_progress_instead_of_resetting(
+        self,
+    ) -> None:
+        controller = worker_cli._AdaptiveLoopController(900, 1800)
+        # Consecutive 429 trips escalate 90 -> 180 -> 360 -> 600 (cap).
+        for now in (0.0, 200.0, 600.0):
+            controller.observe(_report(sync_rate_limited=True), now=now)
+        self.assertEqual(controller.rate_limit_cooldown_seconds, 600)
+
+        # A trickle of synced companies inside a long throttle window must
+        # not collapse the ladder back to base (it would hammer the wall
+        # every ~90s); it decays by half instead.
+        controller.observe(_report(synced_companies=2), now=1300.0)
+        self.assertEqual(controller.rate_limit_cooldown_seconds, 300)
+        controller.observe(_report(synced_companies=2), now=1400.0)
+        self.assertEqual(controller.rate_limit_cooldown_seconds, 150)
+        controller.observe(_report(synced_companies=2), now=1500.0)
+        controller.observe(_report(synced_companies=2), now=1600.0)
+        self.assertEqual(
+            controller.rate_limit_cooldown_seconds,
+            worker_cli.RATE_LIMIT_COOLDOWN_BASE_SECONDS,
+        )
+
     def test_signal_stops_refill_and_terminates_active_mineru_groups(self) -> None:
         stop = worker_cli._StopFlag()
         with mock.patch.object(

@@ -96,15 +96,22 @@ class MinerUDocumentParser:
         reader: MinerUArtifactReader | None = None,
         mapper: MinerUToNormalizedIRMapper | None = None,
         parser_version: str | None = None,
+        server_url: str | None = None,
     ) -> None:
         self._process = process
         self._reader = reader or MinerUArtifactReader()
         self._mapper = mapper or MinerUToNormalizedIRMapper()
         self._version_cache: str | None = parser_version
+        self._server_url = server_url
 
     def identity(self) -> ParserIdentity:
         if self._version_cache is None:
             self._version_cache = self._process.version()
+        if self._server_url:
+            # The remote VLM server is part of the parser identity contract:
+            # probing it here lets the worker's pre-dequeue probe catch a
+            # backend outage before any document consumes a retry.
+            self._process.probe_server(self._server_url)
         return ParserIdentity(
             name="MinerU",
             version=self._version_cache,

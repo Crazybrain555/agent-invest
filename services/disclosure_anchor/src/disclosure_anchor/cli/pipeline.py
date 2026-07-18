@@ -450,7 +450,10 @@ class _Deps:
 
     def parse(self) -> ParseDocument:
         executable = self.settings.disclosure_mineru_bin or Path("mineru")
-        parser = MinerUDocumentParser(process=MinerUProcess(executable=executable))
+        parser = MinerUDocumentParser(
+            process=MinerUProcess(executable=executable),
+            server_url=self.settings.disclosure_mineru_server_url,
+        )
         return ParseDocument(
             parser=parser,
             path_builder=self.paths,

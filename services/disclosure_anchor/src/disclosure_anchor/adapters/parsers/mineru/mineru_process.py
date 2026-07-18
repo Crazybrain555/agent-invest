@@ -6,6 +6,8 @@ import os
 import signal
 import subprocess
 import threading
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -111,6 +113,35 @@ class MinerUProcess:
             # mineru-openai-server (GPU box); mineru ignores -u otherwise.
             command.extend(["-u", options.server_url])
         return command
+
+    def probe_server(
+        self, server_url: str, *, timeout_seconds: float = 5.0
+    ) -> None:
+        """Fail loudly when the remote VLM backend is unreachable.
+
+        The remote server is part of the parser stack for *-http-client
+        backends: dispatching a batch against a dead server would burn one
+        parse-retry per document for an infrastructure condition.  Any HTTP
+        answer below 500 proves a listening server (a 404 on /health is
+        still a live server); connection errors, timeouts, and 5xx are an
+        outage.
+        """
+
+        url = server_url.rstrip("/") + "/health"
+        request = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds):
+                return
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                return
+            raise ParserVersionProbeError(
+                f"MinerU backend server unhealthy ({exc.code}): {server_url}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ParserVersionProbeError(
+                f"MinerU backend server unreachable: {server_url}"
+            ) from exc
 
     def version(self) -> str:
         try:
