@@ -62,6 +62,9 @@ from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     SyncDisclosureIndexCommand,
 )
 from disclosure_anchor.application.worker import queries
+from disclosure_anchor.application.worker.concurrency import (
+    AdaptiveConcurrencyLimit,
+)
 from disclosure_anchor.application.worker.locks import (  # noqa: F401  (re-export, 08 §2)
     DOC_NS,
     WORKER_NS,
@@ -164,6 +167,9 @@ class WorkerDeps:
     # Settings-driven parse defaults (backend/server_url cascade) — the CLI
     # builds this from env so GPU offload is a config flip, not a code change.
     parser_options: ParserOptions = ParserOptions()
+    # Loop-lifetime adaptive parse concurrency; None gives each stage call a
+    # fresh limiter opened at the configured bound (fixed-limit behavior).
+    parse_limiter: AdaptiveConcurrencyLimit | None = None
     # CLI resident mode owns one lazy CNINFO client for the process lifetime,
     # preserving both its token cache and 1-QPS bucket across zero-wait rounds.
     # Tests/other callers retain the legacy per-round close by default.
@@ -788,6 +794,9 @@ def _parse_stage(
             if _halts_parse_refill(outcome, report.failures):
                 return
         return
+    limiter = deps.parse_limiter or AdaptiveConcurrencyLimit(
+        max_limit=concurrency
+    )
     with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="parse") as pool:
         pending_ids = iter(document_ids)
         in_flight: dict[Future[_DocOutcome], str] = {}
@@ -802,9 +811,11 @@ def _parse_stage(
             in_flight[pool.submit(_process_one_document, deps, document_id)] = document_id
             return True
 
-        for _ in range(concurrency):
-            if not submit_one():
-                break
+        def refill() -> None:
+            while len(in_flight) < limiter.current and submit_one():
+                pass
+
+        refill()
         halt_refill = False
         while in_flight:
             completed, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
@@ -821,16 +832,32 @@ def _parse_stage(
                         )
                     )
                 _fold_outcome(report, outcome)
-                halt_refill = halt_refill or _halts_parse_refill(
-                    outcome, report.failures
-                )
+                failure = outcome.failure
+                if (
+                    failure is not None
+                    and failure.stage == "parse"
+                    and failure.error_code in PARSER_INFRASTRUCTURE_ERROR_CODES
+                ):
+                    # An infrastructure drop is backpressure first: shrink
+                    # and keep dispatching at the reduced rate.  Only a
+                    # drop while already at the floor reads as a dead
+                    # backend and stops the refill.
+                    if limiter.current <= limiter.min_limit:
+                        halt_refill = True
+                    limiter.on_drop()
+                else:
+                    if failure is None:
+                        limiter.on_success(inflight=len(in_flight) + 1)
+                    halt_refill = halt_refill or _halts_parse_refill(
+                        outcome, report.failures
+                    )
+            report.parse_concurrency_limit = limiter.current
             if should_stop():
                 for future in in_flight:
                     future.cancel()
                 continue
             if not halt_refill:
-                for _ in completed:
-                    submit_one()
+                refill()
 
 
 def _build_stage(
@@ -984,6 +1011,7 @@ def render_report_section(report: WorkerReport) -> str:
         f"- deferred_backfill: {report.deferred_backfill}",
         f"- sync_quota_break: {report.sync_quota_break}",
         f"- sync_rate_limited: {report.sync_rate_limited}",
+        f"- parse_concurrency_limit: {report.parse_concurrency_limit}",
         f"- source_outage_break: {report.source_outage_break}",
     ]
     if report.failures:

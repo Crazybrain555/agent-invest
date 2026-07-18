@@ -96,6 +96,10 @@
    "private_imports": [],
    "tests": 5
   },
+  "tests/unit/test_adaptive_concurrency.py": {
+   "private_imports": [],
+   "tests": 3
+  },
   "tests/unit/test_app_startup.py": {
    "private_imports": [],
    "tests": 5

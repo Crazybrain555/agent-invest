@@ -44,6 +44,7 @@ class WorkerReport:
     skipped_oversized: int = 0
     sync_quota_break: bool = False
     sync_rate_limited: bool = False
+    parse_concurrency_limit: int | None = None
     source_outage_break: bool = False
     deferred_backfill: int = 0
     failures: list[WorkerFailure] = field(default_factory=list)
@@ -59,6 +60,7 @@ class WorkerReport:
             "downloaded": self.downloaded,
             "sync_quota_break": self.sync_quota_break,
             "sync_rate_limited": self.sync_rate_limited,
+            "parse_concurrency_limit": self.parse_concurrency_limit,
             "source_outage_break": self.source_outage_break,
             "deferred_backfill": self.deferred_backfill,
             "parsed": self.parsed,

@@ -45,6 +45,9 @@ from disclosure_anchor.application.dto.worker_report import (
 )
 from disclosure_anchor.application.ports.disclosure_source import DisclosureSourcePort
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.worker.concurrency import (
+    AdaptiveConcurrencyLimit,
+)
 from disclosure_anchor.application.worker.locks import WORKER_NS
 from disclosure_anchor.application.worker.worker import (
     WorkerConfig,
@@ -542,6 +545,9 @@ def _deps(settings: Settings, engine: Engine) -> WorkerDeps:
     return WorkerDeps(
         engine=engine,
         uow_factory=unit_of_work_factory(engine),
+        parse_limiter=AdaptiveConcurrencyLimit(
+            max_limit=max(1, settings.worker_parse_concurrency)
+        ),
         path_builder=paths,
         raw_store=RawDocumentStore(paths),
         artifact_store=ArtifactStore(paths),
