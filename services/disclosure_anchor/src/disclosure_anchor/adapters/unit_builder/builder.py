@@ -1264,10 +1264,7 @@ def _front_matter_toc_scan(
         page = element.page_no or 0
         if element.kind in ("text", "heading") and element.text and page <= 30:
             pages.setdefault(page, []).append(element)
-            if (
-                toc_outline.normalize_section_title(element.text.strip())
-                == "目录"
-            ):
+            if toc_outline.is_toc_marker(element.text.strip()):
                 marker_pages.add(page)
 
     keys: set[str] = set()
@@ -1277,9 +1274,7 @@ def _front_matter_toc_scan(
         block = "\n".join(
             element.text
             for element in page_elements
-            if element.text
-            and toc_outline.normalize_section_title(element.text.strip())
-            != "目录"
+            if element.text and not toc_outline.is_toc_marker(element.text.strip())
         )
         analysis = toc_outline.analyze_toc_block(
             block, marker_anchored=anchored

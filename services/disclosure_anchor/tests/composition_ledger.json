@@ -264,7 +264,7 @@
   },
   "tests/unit/test_toc_alignment.py": {
    "private_imports": [],
-   "tests": 21
+   "tests": 23
   },
   "tests/unit/test_track_companies.py": {
    "private_imports": [],

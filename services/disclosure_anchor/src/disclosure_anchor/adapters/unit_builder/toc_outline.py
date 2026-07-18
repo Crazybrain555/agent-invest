@@ -19,9 +19,11 @@ from dataclasses import dataclass
 from typing import Iterable
 
 _TRAILING_PAGE_RE = re.compile(
-    r"^(?P<title>.+?)[\s.·…‥、_-]*(?P<page>\d{1,4})[\s\-–－]*$"
+    r"^(?P<title>.+?)[\s.·…‥、_|｜-]*(?P<page>\d{1,4})[\s\-–－]*$"
 )
-_LEADING_PAGE_RE = re.compile(r"^(?P<page>\d{1,4})\s+(?P<title>\S.*?)\s*$")
+_LEADING_PAGE_RE = re.compile(
+    r"^(?P<page>\d{1,4})[\s|｜]+(?P<title>\S.*?)\s*$"
+)
 _NUMERIC_ONLY_RE = re.compile(r"^[\d\s./·…-]*$")
 _SECTION_ENUMERATOR_RE = re.compile(
     r"^第\s*(?P<ord>[一二三四五六七八九十百]+)\s*[节章]\s*"
@@ -123,6 +125,20 @@ def normalize_section_title(text: str) -> str:
     return re.sub(r"[\s.·…‥、_（）()：:]+", "", text)
 
 
+_LATIN_FILLER_RE = re.compile(r"[A-Za-z\s]+")
+
+
+def is_toc_marker(text: str) -> bool:
+    """True for a line that announces the TOC page.
+
+    Designed (often bilingual) reports write "目录 Contents" or space the
+    characters out; the marker is the CJK content, not the exact string.
+    Longer titles that merely end in 目录 (备查文件目录) never count.
+    """
+
+    return normalize_section_title(_LATIN_FILLER_RE.sub("", text)) == "目录"
+
+
 def _classify_title(title: str) -> tuple[str, int | None]:
     statutory = _SECTION_ENUMERATOR_RE.match(title)
     if statutory:
@@ -190,7 +206,7 @@ def _bare_entry(line: str) -> TocEntry | None:
         len(line) <= 40
         and not _SENTENCE_PUNCT_RE.search(line)
         and not line.endswith(("：", ":"))
-        and normalize_section_title(line) != "目录"
+        and not is_toc_marker(line)
     ):
         return TocEntry(title=line, page=None, family="plain", ordinal=None)
     return None

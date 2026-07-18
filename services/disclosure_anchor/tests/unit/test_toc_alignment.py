@@ -221,6 +221,36 @@ class TocEnumerationFamilyTests(unittest.TestCase):
         self.assertEqual(strip_outline_enumerator("（一）保证"), "（一）保证")
         self.assertEqual(strip_outline_enumerator("2023 年度报告"), "2023 年度报告")
 
+    def test_pipe_separated_page_grammar(self) -> None:
+        # Bilingual designed reports render the TOC's visual column divider
+        # as a pipe: "004 | 重要提示".
+        block = "\n".join(
+            [
+                "004 | 重要提示",
+                "005 | 释义",
+                "014 | 公司简介",
+                "038 | 经营层讨论与分析",
+                "082 | 公司治理",
+                "142 | 重要事项",
+            ]
+        )
+        anchored = analyze_toc_block(block, marker_anchored=True)
+        self.assertTrue(anchored.qualified)
+        self.assertIn("重要提示", anchored.keys)
+        self.assertIn("经营层讨论与分析", anchored.keys)
+        self.assertNotIn("|重要提示", anchored.keys)
+
+    def test_is_toc_marker_accepts_bilingual_and_rejects_suffix(self) -> None:
+        from disclosure_anchor.adapters.unit_builder.toc_outline import (
+            is_toc_marker,
+        )
+
+        self.assertTrue(is_toc_marker("目录"))
+        self.assertTrue(is_toc_marker("目 录"))
+        self.assertTrue(is_toc_marker("目录 Contents"))
+        self.assertFalse(is_toc_marker("备查文件目录"))
+        self.assertFalse(is_toc_marker("信息披露公告索引"))
+
     def test_is_page_annotated_entry(self) -> None:
         self.assertTrue(is_page_annotated_entry("第一章 公司简介 5"))
         self.assertTrue(is_page_annotated_entry("释义 5"))
