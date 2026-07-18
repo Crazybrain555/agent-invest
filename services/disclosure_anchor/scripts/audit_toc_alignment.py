@@ -23,15 +23,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from disclosure_anchor.adapters.unit_builder.toc_outline import (  # noqa: E402
     normalize_section_title,
     parse_toc_titles,
-    strip_section_enumerator,
+    strip_outline_enumerator,
 )
 
 
 def normalize_heading(text: str) -> str:
-    """Match key: enumerator-stripped so 目录's 第X章 form meets the
-    prefix-less body opener."""
+    """Match key: enumerator-stripped (any top-level family) so 目录's
+    第X章/一、/1. form meets the prefix-less body opener and vice versa."""
 
-    return normalize_section_title(strip_section_enumerator(text))
+    return normalize_section_title(strip_outline_enumerator(text))
 
 
 def match_titles_to_tree(
