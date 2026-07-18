@@ -127,7 +127,11 @@ def main() -> int:
     with findings_path.open("w", encoding="utf-8") as handle:
         for document_id, filing_type, title, toc_text in toc_rows:
             stats["documents_with_toc"] += 1
-            titles, unparsed = parse_toc_titles(toc_text or "")
+            # The audited text is by construction the TOC region (units under the
+            # 目录 root), so bare page-number-less entries count too.
+            titles, unparsed = parse_toc_titles(
+                toc_text or "", include_bare=True
+            )
             if not titles:
                 stats["toc_unparsable"] += 1
                 handle.write(

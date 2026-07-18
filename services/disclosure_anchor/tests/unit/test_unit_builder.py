@@ -4054,5 +4054,100 @@ class UnitBuilderTests(unittest.TestCase):
         self.assertEqual(stats.dropped_by_kind["page_furniture"], 0)
 
 
+class TocRegionArbitrationTests(unittest.TestCase):
+    """TOC-page entries never enter the heading tree; the TOC's declared
+    top level outranks generic enumeration conventions in the degenerate
+    parser regime."""
+
+    @staticmethod
+    def _element(
+        kind: str, order_index: int, page_no: int, text: str
+    ) -> dict[str, object]:
+        element: dict[str, object] = {
+            "kind": kind,
+            "raw_kind": "text",
+            "order_index": order_index,
+            "page_no": page_no,
+            "text": text,
+        }
+        if kind == "heading":
+            element["heading_level"] = 1
+        return element
+
+    def test_page_annotated_toc_entry_headings_are_demoted(self) -> None:
+        units, stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    self._element("heading", 1, 1, "目录"),
+                    self._element("heading", 2, 1, "重要提示....1"),
+                    self._element("heading", 3, 1, "释义....4"),
+                    self._element("heading", 4, 1, "第一章 公司简介 5"),
+                    self._element("heading", 5, 1, "第二章 会计数据和财务指标....10"),
+                    self._element("heading", 6, 1, "第三章 管理层讨论与分析 …… 17"),
+                    self._element("heading", 7, 5, "第一章 公司简介"),
+                    self._element("text", 8, 5, "公司注册地为深圳市。"),
+                    self._element("heading", 9, 10, "第二章 会计数据和财务指标"),
+                    self._element("text", 10, 10, "报告期营业收入稳定。"),
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        self.assertEqual(stats.toc_entry_headings_demoted, 5)
+        roots = {unit.heading_path[0] for unit in units if unit.heading_path}
+        self.assertNotIn("第一章 公司简介 5", roots)
+        self.assertNotIn("第三章 管理层讨论与分析 …… 17", roots)
+        self.assertIn("第一章 公司简介", roots)
+        # The demoted entry lines survive as TOC text under 目录 (不漏).
+        toc_texts = [
+            str(unit.payload.get("text", ""))
+            for unit in units
+            if unit.heading_path and unit.heading_path[0] == "目录"
+        ]
+        self.assertTrue(
+            any("第一章 公司简介 5" in text for text in toc_texts)
+        )
+
+    def test_arabic_toc_declaration_pins_numbered_body_openers(self) -> None:
+        toc_lines = "\n".join(
+            [
+                "1. 释义....5",
+                "2. 重要提示....8",
+                "3. 公司基本情况简介....9",
+                "4. 董事会报告....15",
+                "5. 监事会报告....20",
+            ]
+        )
+        units, _stats = build_unit_drafts_s1_s7(
+            {
+                "elements": [
+                    self._element("heading", 1, 1, "目录"),
+                    self._element("text", 2, 1, toc_lines),
+                    self._element("heading", 3, 5, "1. 释义"),
+                    self._element("text", 4, 5, "本报告中的释义如下。"),
+                    self._element("heading", 5, 8, "2. 重要提示"),
+                    self._element("text", 6, 8, "请投资者注意投资风险。"),
+                    self._element("heading", 7, 9, "3. 公司基本情况简介"),
+                    self._element("heading", 8, 9, "3.1 注册信息"),
+                    self._element("text", 9, 9, "注册资本保持不变。"),
+                ]
+            },
+            filing_type="annual_report",
+        )
+
+        roots = {unit.heading_path[0] for unit in units if unit.heading_path}
+        # Declared arabic top-level entries pin as roots even though the
+        # "1." grammar alone would map them deeper than the TOC heading.
+        self.assertIn("1. 释义", roots)
+        self.assertIn("2. 重要提示", roots)
+        self.assertIn("3. 公司基本情况简介", roots)
+        # Dotted sub-numbering stays nested inside its declared section.
+        self.assertNotIn("3.1 注册信息", roots)
+        for unit in units:
+            if unit.heading_path and unit.heading_path[0] == "目录":
+                self.assertEqual(unit.payload_kind, "text")
+                self.assertNotIn("释义如下", str(unit.payload.get("text", "")))
+
+
 if __name__ == "__main__":
     unittest.main()

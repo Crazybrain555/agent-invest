@@ -105,6 +105,7 @@ class BuildStats:
     merged_cover_title_fragments: int = 0
     deduplicated_registered_header_lines: int = 0
     deduplicated_page_number_lines: int = 0
+    toc_entry_headings_demoted: int = 0
     needs_review_count: int = 0
     unusable_count: int = 0
     official_ir_form_status: str = "not_applicable"
@@ -133,6 +134,7 @@ class BuildStats:
                 self.deduplicated_registered_header_lines
             ),
             "deduplicated_page_number_lines": self.deduplicated_page_number_lines,
+            "toc_entry_headings_demoted": self.toc_entry_headings_demoted,
             "needs_review_count": self.needs_review_count,
             "unusable_count": self.unusable_count,
             "official_ir_form_status": self.official_ir_form_status,
@@ -1079,7 +1081,7 @@ def s2_apply_heading_tree(
                 toc_root_keys=toc_root_keys,
             )
             dotted_parent_proven = False
-            if evidence.dotted_components is not None:
+            if not toc_proven and evidence.dotted_components is not None:
                 components = evidence.dotted_components
                 proven_parent = (
                     next(
@@ -1104,7 +1106,12 @@ def s2_apply_heading_tree(
                     # never be used merely because its abstract depth is
                     # smaller (``1.`` is not the parent of orphan ``2.1``).
                     stack = _before_outline_family(stack, "dotted")
-            if pattern_level is None:
+            if toc_proven:
+                # A TOC-declared top-level section opens a fresh root no
+                # matter what its own enumerator family would suggest.
+                stack = []
+                logical_level = 1
+            elif pattern_level is None:
                 stack, logical_level = _place_unnumbered_heading(
                     stack,
                     source_level=source_level,
@@ -1233,24 +1240,72 @@ def s2_apply_heading_tree(
     return sorted(placed, key=lambda item: (item.order_index, item.intra_order))
 
 
-def _front_matter_page_texts(
-    elements: Iterable[PreparedElement],
-) -> list[str]:
-    """Front-matter text joined per page for TOC detection.
+def _front_matter_toc_scan(
+    elements: list[PreparedElement],
+    *,
+    stats: BuildStats,
+) -> tuple[list[PreparedElement], frozenset[str]]:
+    """Scan front matter for TOC pages; demote TOC-entry headings.
 
-    Some backends emit one element per TOC line, so a per-element scan never
-    reaches the TOC-shape threshold; the page is the natural block.
+    Per the parser output contract a TOC page's titles may arrive as text
+    or heading elements, with page numbers inline or in a detached column,
+    so both kinds join the per-page block (one element per TOC line never
+    reaches the TOC-shape threshold alone; the page is the natural block).
+    Bare-entry and weak-enumeration grammars apply only to pages anchored
+    by their own 目录 marker (this page or the one before, for wrapped
+    TOCs).  On a page that qualified as a TOC, heading elements whose own
+    line reads "title + page number" are the TOC's entries, not section
+    openers, and are demoted to text so they never enter the heading tree.
     """
 
-    pages: dict[int, list[str]] = {}
+    pages: dict[int, list[PreparedElement]] = {}
+    marker_pages: set[int] = set()
     for element in elements:
-        if (
-            element.kind == "text"
-            and element.text
-            and (element.page_no or 0) <= 30
-        ):
-            pages.setdefault(element.page_no or 0, []).append(element.text)
-    return ["\n".join(texts) for _, texts in sorted(pages.items())]
+        page = element.page_no or 0
+        if element.kind in ("text", "heading") and element.text and page <= 30:
+            pages.setdefault(page, []).append(element)
+            if (
+                toc_outline.normalize_section_title(element.text.strip())
+                == "目录"
+            ):
+                marker_pages.add(page)
+
+    keys: set[str] = set()
+    demoted_ids: set[int] = set()
+    for page, page_elements in sorted(pages.items()):
+        anchored = page in marker_pages or (page - 1) in marker_pages
+        block = "\n".join(
+            element.text
+            for element in page_elements
+            if element.text
+            and toc_outline.normalize_section_title(element.text.strip())
+            != "目录"
+        )
+        analysis = toc_outline.analyze_toc_block(
+            block, marker_anchored=anchored
+        )
+        keys.update(analysis.keys)
+        if analysis.qualified:
+            for element in page_elements:
+                if (
+                    element.kind == "heading"
+                    and element.text
+                    and toc_outline.is_page_annotated_entry(element.text)
+                ):
+                    demoted_ids.add(id(element))
+
+    if not demoted_ids:
+        return elements, frozenset(keys)
+    demoted_elements = [
+        (
+            replace(element, kind="text", heading_level=None)
+            if id(element) in demoted_ids
+            else element
+        )
+        for element in elements
+    ]
+    stats.toc_entry_headings_demoted += len(demoted_ids)
+    return demoted_elements, frozenset(keys)
 
 
 def _section_continuation_key(title: str) -> str:
@@ -1282,7 +1337,9 @@ def _caption_section_key(
         return key
     if _normalized_title(text) in rules.FIXED_L1_TITLES:
         return key
-    normalized = toc_outline.normalize_section_title(text)
+    normalized = toc_outline.normalize_section_title(
+        toc_outline.strip_outline_enumerator(text)
+    )
     if normalized in toc_root_keys:
         return key
     return None
@@ -1315,17 +1372,19 @@ def _arbitrated_source_level(
             max(1, min(7, heading_candidate.heading_level or fallback_level)),
             False,
         )
-    if evidence.level is not None:
-        return max(1, min(7, evidence.level)), False
-    if evidence.dotted_components is None and toc_root_keys:
-        # The document's own TOC is the strongest available signal here: an
-        # unnumbered body opener whose title the TOC declares with a 第X章/
-        # 第X节 prefix is a proven top-level section, not a note interior.
+    if toc_root_keys:
+        # The document's own TOC is the strongest signal in the degenerate
+        # regime and outranks generic enumeration conventions: a body
+        # heading whose top-level-stripped title the TOC declares as a
+        # top-level section is proven top-level even when its own
+        # enumerator ("1. 释义", "一、基本情况") would grammar-map deeper.
         toc_key = toc_outline.normalize_section_title(
-            toc_outline.strip_section_enumerator(heading_candidate.text or "")
+            toc_outline.strip_outline_enumerator(heading_candidate.text or "")
         )
         if toc_key in toc_root_keys:
             return 1, True
+    if evidence.level is not None:
+        return max(1, min(7, evidence.level)), False
     title = _normalized_title(heading_candidate.text or "")
     if (
         evidence.dotted_components is None
@@ -2179,12 +2238,11 @@ def build_unit_drafts_s1_s7(
         document_title=document_title,
         stats=s1.stats,
     )
+    elements, toc_root_keys = _front_matter_toc_scan(elements, stats=s1.stats)
     placed = s2_apply_heading_tree(
         elements,
         qa_heading_mode=qa_mode,
-        toc_root_keys=toc_outline.toc_declared_root_keys(
-            _front_matter_page_texts(elements)
-        ),
+        toc_root_keys=toc_root_keys,
         stats=s1.stats,
     )
     # QA discrimination was removed: transcripts
