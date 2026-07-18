@@ -597,6 +597,52 @@ class DocumentUnitAuditTests(unittest.TestCase):
 
         self.assertIn("external_source_emitted", _codes(report))
 
+    def test_case_flapped_furniture_dedup_is_valid_exact_duplication(
+        self,
+    ) -> None:
+        # OCR case-flaps the same repeated footer ("[QR Code]"/"[QR CODE]").
+        # The builder dedups them under comparison_text equivalence; the
+        # audit must validate that claim under the same equivalence.
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="heading",
+                    raw_kind="text",
+                    text="重要提示",
+                    heading_level=1,
+                ),
+                _element(1, kind="text", raw_kind="text", text="正文内容。"),
+                _element(
+                    2,
+                    kind="page_furniture",
+                    raw_kind="footer",
+                    text="[QR Code]",
+                    page_no=1,
+                ),
+                _element(
+                    3,
+                    kind="page_furniture",
+                    raw_kind="footer",
+                    text="[QR CODE]",
+                    page_no=2,
+                ),
+            ]
+        )
+        units, _ = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="other",
+            document_title="审计样本",
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views(units),
+            metadata=self.metadata,
+        )
+
+        self.assertNotIn("exact_dedup_content_mismatch", _codes(report))
+
     def test_duplicate_equal_image_occurrences_are_counted_separately(self) -> None:
         digest = "a" * 64
         normalized = _ir(

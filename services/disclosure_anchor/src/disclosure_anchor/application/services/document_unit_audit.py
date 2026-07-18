@@ -2237,7 +2237,14 @@ def _validated_duplicate_map(
     duplicate_of: dict[str, str] = {}
     for group in groups:
         ordered = sorted(group, key=source_order(source))
-        values = {_norm(_source_text(source.elements[ref])) for ref in ordered}
+        # The builder forms these groups under comparison_text equivalence
+        # (NFKC + casefold: OCR case-flaps the same repeated carrier, e.g.
+        # "[QR Code]"/"[QR CODE]").  Validate the claim under the claimant's
+        # own equivalence; _norm stays case-sensitive for identity fields.
+        values = {
+            comparison_text(_source_text(source.elements[ref]))
+            for ref in ordered
+        }
         values.discard("")
         if len(values) > 1:
             findings.append(
