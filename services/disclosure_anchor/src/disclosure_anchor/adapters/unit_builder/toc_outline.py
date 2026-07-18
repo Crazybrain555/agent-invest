@@ -280,6 +280,12 @@ def _qualifies(entries: list[TocEntry], *, marker_anchored: bool) -> bool:
         return True
     if not marker_anchored:
         return False
+    # A page anchored by its own 目录 marker whose lines read "title +
+    # page number" is a TOC by the document's own declaration, even with
+    # no enumeration anywhere (designed reports may number nothing).
+    paged = sum(1 for entry in entries if entry.page is not None)
+    if paged >= _MIN_TOC_TITLES:
+        return True
     top = _top_family(entries)
     if top not in ("chinese", "arabic"):
         return False

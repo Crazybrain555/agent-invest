@@ -109,10 +109,19 @@ class TocEnumerationFamilyTests(unittest.TestCase):
         anchored = analyze_toc_block("\n".join(entries), marker_anchored=True)
         self.assertTrue(anchored.qualified)
         self.assertIn("董事会和管理层声明", anchored.keys)
-        # Shuffled ordinals are a reference list, not a TOC in order.
-        shuffled = [entries[2], entries[0], entries[4], entries[1], entries[3]]
+        # Without page numbers the ascending run is the only TOC evidence:
+        # shuffled bare ordinals are a reference list, not a TOC in order.
+        shuffled = "\n".join(
+            [
+                "三、主要指标表",
+                "一、董事会和管理层声明",
+                "五、风险综合评级",
+                "二、基本情况",
+                "四、风险管理能力",
+            ]
+        )
         self.assertFalse(
-            analyze_toc_block("\n".join(shuffled), marker_anchored=True).qualified
+            analyze_toc_block(shuffled, marker_anchored=True).qualified
         )
 
     def test_statutory_top_family_excludes_chinese_sub_entries(self) -> None:
@@ -131,7 +140,10 @@ class TocEnumerationFamilyTests(unittest.TestCase):
         self.assertIn("受托管理的可转换公司债券概况", analysis.keys)
         self.assertNotIn("发行人主体名称", analysis.keys)
 
-    def test_plain_only_page_never_qualifies_even_anchored(self) -> None:
+    def test_plain_paged_entries_need_the_marker_page(self) -> None:
+        # A page-numbered feature box in the body (no 目录 marker) never
+        # declares the outline; the same shape on the marker page is the
+        # document's own TOC even with no enumeration anywhere.
         box = "\n".join(
             [
                 "21 热点问题一 高质量发展业绩亮点",
@@ -141,7 +153,50 @@ class TocEnumerationFamilyTests(unittest.TestCase):
                 "25 热点问题五 数字工行建设持续深化",
             ]
         )
-        self.assertFalse(analyze_toc_block(box, marker_anchored=True).qualified)
+        self.assertFalse(analyze_toc_block(box, marker_anchored=False).qualified)
+        self.assertTrue(analyze_toc_block(box, marker_anchored=True).qualified)
+
+    def test_unenumerated_plain_toc_qualifies_on_marker_page(self) -> None:
+        # 人保 shape: bare "title page" pairs, zero enumerators anywhere.
+        block = "\n".join(
+            [
+                "重要提示 2",
+                "释义 3",
+                "核心竞争力与经营亮点 4",
+                "财务指标 8",
+                "管理层讨论与分析 11",
+                "内含价值 45",
+                "备查文件目录 58",
+                "财务报告 59",
+            ]
+        )
+        anchored = analyze_toc_block(block, marker_anchored=True)
+        self.assertTrue(anchored.qualified)
+        self.assertIn("内含价值", anchored.keys)
+        self.assertIn("管理层讨论与分析", anchored.keys)
+        self.assertFalse(analyze_toc_block(block, marker_anchored=False).qualified)
+
+    def test_part_headers_with_leading_page_lists_qualify(self) -> None:
+        # 国泰君安 shape: bare part headers ("1 关于我们") between list
+        # blocks whose lines carry leading page numbers.
+        block = "\n".join(
+            [
+                "1 关于我们",
+                "4 重要提示",
+                "6 释义",
+                "8 公司简介",
+                "16 业绩概览",
+                "2 战略与经营分析",
+                "21 管理层讨论与分析",
+                "3 公司治理",
+                "45 公司治理",
+                "54 重要事项",
+            ]
+        )
+        anchored = analyze_toc_block(block, marker_anchored=True)
+        self.assertTrue(anchored.qualified)
+        self.assertIn("关于我们", anchored.keys)
+        self.assertIn("管理层讨论与分析", anchored.keys)
 
     def test_bare_body_prose_is_not_an_entry(self) -> None:
         block = "\n".join(
