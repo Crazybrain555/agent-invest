@@ -123,6 +123,30 @@ migrate/load/install，天然满足这一点。
 → KV cache 97.7%（叠加 NBA 2K 抢显存）→ CUDA OOM → vLLM EngineCore 死亡 →
 connection reset 只是尸体现象 → restart:always 73 秒自愈，44 篇 retryable 自动重排。
 
+## GPU 侧客户端弹性栈（2026-07-18 定案）
+
+同日三连「假停机」（真实短断连→熔断压制、代理污染误诊、探针风暴自击）收敛出的
+完整方案，三层各司其职，全部推送（6cbd45d/d6c8d34）：
+
+1. **后端预探针**（adapters/parsers/mineru）：identity() 直连探 server `/health`
+   （无条件绕代理 ProxyHandler({})，与 mineru 子进程的 `_env()` 代理剥离同理）；
+   成功按 server 缓存 60s、失败永不缓存、超时 15s——探测频率与派单解耦，
+   死后端仍在批前被拦，不烧文档重试预算。
+2. **AIMD 自适应文档并发**（application/worker/concurrency.py）：采纳 Netflix
+   concurrency-limits AIMDLimit（损失驱动：成功且在途 ≥ 限额半时 +1，基础设施
+   失败乘性回退 ×0.5，界 [1, WORKER_PARSE_CONCURRENCY]，起点=上界）。**有据拒绝**
+   Envoy 自适应并发的延迟梯度控制器：其文档自认的局限正是本工况——单请求
+   30-300s 高方差使 minRTT 基线不稳，且需周期压缩并发重标定。批内一次基础
+   设施失败=背压（降档续跑），地板上再失败才判死停补位。环境变量语义从
+   「固定并发」变为「上界」；上界 16 **不上调**（下方 OOM 事故 93-100% 利用率
+   背书；页面窗口 16 为内层护栏，双侧乘积 ≤256 序列）。
+3. **占比式熔断**（cli/worker）：基础设施失败须占批主导（≥max(2, parsed)）才算
+   停机（k8s/Envoy 失败率惯例）；成功存在即证明后端活着。熔断由高频保护
+   退为死后端最后保险；轮报告新增 `parse_concurrency_limit` 可观测。
+
+CNINFO 同构：AdaptiveTokenBucket（qps AIMD）+ 控制器冷却梯子（进展衰减不清零）。
+两侧共同原则：**配置只定边界，实际速率/并发始终由观测信号动态贴合**。
+
 结论：**流控必须双侧**——文档级并发（当时为 8）只是外层，真正的请求单位是页面窗口。
 当时的事故缓解是客户端 `MINERU_PROCESSING_WINDOW_SIZE=16`；服务端重启候选为
 `--max-num-seqs 128`，若仍 OOM 再评估 memory utilization。它们不是仓库永久默认值，启用前
