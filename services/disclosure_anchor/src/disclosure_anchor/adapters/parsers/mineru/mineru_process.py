@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -21,6 +22,10 @@ from disclosure_anchor.domain.errors import (
 
 _ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
 _ACTIVE_PROCESSES_LOCK = threading.Lock()
+
+_PROBE_SUCCESS_AT: dict[str, float] = {}
+_PROBE_CACHE_LOCK = threading.Lock()
+_PROBE_SUCCESS_TTL_SECONDS = 60.0
 
 
 def _register_process(process: subprocess.Popen[str]) -> None:
@@ -115,7 +120,7 @@ class MinerUProcess:
         return command
 
     def probe_server(
-        self, server_url: str, *, timeout_seconds: float = 5.0
+        self, server_url: str, *, timeout_seconds: float = 15.0
     ) -> None:
         """Fail loudly when the remote VLM backend is unreachable.
 
@@ -125,8 +130,21 @@ class MinerUProcess:
         answer below 500 proves a listening server (a 404 on /health is
         still a live server); connection errors, timeouts, and 5xx are an
         outage.
+
+        A success is cached briefly and probes are generous with time:
+        identity() runs per parsed document under full concurrency, and a
+        server busy with continuous batching answers /health slowly — a
+        tight per-document probe manufactures outage evidence from our own
+        load (k8s/Envoy convention: lenient probes, rate-based breakers).
         """
 
+        with _PROBE_CACHE_LOCK:
+            cached_at = _PROBE_SUCCESS_AT.get(server_url)
+            if (
+                cached_at is not None
+                and time.monotonic() - cached_at < _PROBE_SUCCESS_TTL_SECONDS
+            ):
+                return
         url = server_url.rstrip("/") + "/health"
         request = urllib.request.Request(url, method="GET")
         # The backend lives on the LAN/tailnet: never route the probe
@@ -138,17 +156,18 @@ class MinerUProcess:
         )
         try:
             with opener.open(request, timeout=timeout_seconds):
-                return
+                pass
         except urllib.error.HTTPError as exc:
-            if exc.code < 500:
-                return
-            raise ParserVersionProbeError(
-                f"MinerU backend server unhealthy ({exc.code}): {server_url}"
-            ) from exc
+            if exc.code >= 500:
+                raise ParserVersionProbeError(
+                    f"MinerU backend server unhealthy ({exc.code}): {server_url}"
+                ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ParserVersionProbeError(
                 f"MinerU backend server unreachable: {server_url}"
             ) from exc
+        with _PROBE_CACHE_LOCK:
+            _PROBE_SUCCESS_AT[server_url] = time.monotonic()
 
     def version(self) -> str:
         try:

@@ -394,10 +394,15 @@ def _parse_infrastructure_outage(report: WorkerReport) -> bool:
         if failure.stage == "parse"
         and failure.error_code in PARSER_INFRASTRUCTURE_ERRORS
     )
-    # One failed item beside successful work can be a document-local poison.
-    # Two or more infrastructure-shaped failures are batch evidence even when
-    # an early document completed before the GPU/service went down.
-    return infrastructure_failures >= 2 or (
+    # One failed item beside successful work can be a document-local poison,
+    # and a couple of infrastructure-shaped failures inside a mostly
+    # successful batch are load blips, not an outage — the successes prove
+    # the backend lives (rate-based breaker, not absolute counts).  Failures
+    # that dominate the batch are real evidence even when early documents
+    # completed before the GPU/service went down.
+    if infrastructure_failures == 0:
+        return False
+    return infrastructure_failures >= max(2, report.parsed) or (
         report.parsed == 0 and infrastructure_failures == 1
     )
 

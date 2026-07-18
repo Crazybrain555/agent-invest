@@ -5,6 +5,8 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+from disclosure_anchor.adapters.parsers.mineru import mineru_process
+from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
 from disclosure_anchor.domain.errors import ParserVersionProbeError
 
@@ -48,6 +50,57 @@ class BackendProbeTests(unittest.TestCase):
         parser.identity()
 
         process.probe_server.assert_not_called()
+
+
+class ProbeSuccessCacheTests(unittest.TestCase):
+    """identity() runs per parsed document under full concurrency; a fresh
+    HTTP probe per document manufactures outage evidence from our own load,
+    so successes are cached briefly and failures never are."""
+
+    def setUp(self) -> None:
+        mineru_process._PROBE_SUCCESS_AT.clear()
+        self.process = MinerUProcess(executable="mineru")
+
+    def tearDown(self) -> None:
+        mineru_process._PROBE_SUCCESS_AT.clear()
+
+    def test_probe_success_is_cached_within_ttl(self) -> None:
+        opener = mock.Mock()
+        opener.open.return_value.__enter__ = mock.Mock(return_value=None)
+        opener.open.return_value.__exit__ = mock.Mock(return_value=False)
+        clock = iter([100.0, 100.5, 130.0, 100.0 + 61.0, 200.0])
+        with (
+            mock.patch.object(
+                mineru_process.urllib.request,
+                "build_opener",
+                return_value=opener,
+            ),
+            mock.patch.object(
+                mineru_process.time, "monotonic", side_effect=clock
+            ),
+        ):
+            self.process.probe_server("http://gpu:30000")
+            self.process.probe_server("http://gpu:30000")
+            self.process.probe_server("http://gpu:30000")
+        self.assertEqual(opener.open.call_count, 1)
+
+    def test_probe_failure_is_never_cached(self) -> None:
+        opener = mock.Mock()
+        opener.open.side_effect = OSError("connection refused")
+        with (
+            mock.patch.object(
+                mineru_process.urllib.request,
+                "build_opener",
+                return_value=opener,
+            ),
+            mock.patch.object(
+                mineru_process.time, "monotonic", return_value=100.0
+            ),
+        ):
+            for _ in range(2):
+                with self.assertRaises(ParserVersionProbeError):
+                    self.process.probe_server("http://gpu:30000")
+        self.assertEqual(opener.open.call_count, 2)
 
 
 if __name__ == "__main__":
