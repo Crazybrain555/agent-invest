@@ -303,3 +303,11 @@ semantic_keys（scalar 在规则未命中时回落 note key）。实测：附注
   其余自动清；工件阶段失败则跳过元数据阶段防孤儿文件）+ 每日 19:30 launchd
   作业（com.agentinvest.disclosure-gc），失败经 notify.sh 告警。
 - **(e) 脉络方向**：见 document-outline-and-toc.md（两步方案：脉络视图 + 目录审计）。
+
+## 问答/实录类切分外部验证（2026-07-18）
+
+用户建议问答内容整体保留不按语义切；对标 Unstructured 与 LlamaIndex：两者均无
+按发言轮/问答对切分的内建机制，通行做法是**文档处理层保持源文档原子、检索层
+按句窗/语义窗再分粒度**（Unstructured 变更日志自证：细粒度元数据会被合块丢弃，
+建议直接消费未合块原子）。与本服务 QA 拆除裁决（实录原子+完整溯源，无 qa
+payload）一致，维持现状；若 L2 实测需要更细粒度，在检索投影层加窗，不回改 L1。
