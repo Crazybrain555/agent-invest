@@ -129,8 +129,15 @@ class MinerUProcess:
 
         url = server_url.rstrip("/") + "/health"
         request = urllib.request.Request(url, method="GET")
+        # The backend lives on the LAN/tailnet: never route the probe
+        # through proxy env vars (a proxy that cannot reach the private
+        # address would report a healthy server as an outage — the same
+        # reason _env() strips proxies for the mineru subprocess).
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({})
+        )
         try:
-            with urllib.request.urlopen(request, timeout=timeout_seconds):
+            with opener.open(request, timeout=timeout_seconds):
                 return
         except urllib.error.HTTPError as exc:
             if exc.code < 500:
