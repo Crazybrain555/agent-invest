@@ -20,6 +20,7 @@ jobs:
           p=Path('tcf_blind/case_alpha/run_forecast.py')
           s=p.read_text()
           s=s.replace('for i in range(2):', 'for i in range(3):')
+          s=s.replace("'max_tokens': 16000", "'max_tokens': 8000")
           old="weights=forecast['mechanism_map'].get('weights', forecast['mechanism_map'])\nif not isinstance(weights,dict) or not weights: weights={'recurring-contract-software':1.0}\ns=sum(float(v) for v in weights.values()); weights={k:float(v)/s for k,v in weights.items()}"
           new="weights=forecast['mechanism_map'].get('weights', {}) if isinstance(forecast['mechanism_map'],dict) else {}\nweights={str(k):float(v) for k,v in weights.items() if isinstance(v,(int,float)) or str(v).replace('.','',1).isdigit()}\nif not weights: weights={'recurring-contract-software':1.0}\ns=sum(weights.values()); weights={k:v/s for k,v in weights.items()}"
           s=s.replace(old,new)
