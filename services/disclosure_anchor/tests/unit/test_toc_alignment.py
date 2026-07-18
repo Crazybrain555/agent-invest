@@ -221,6 +221,24 @@ class TocEnumerationFamilyTests(unittest.TestCase):
         self.assertEqual(strip_outline_enumerator("（一）保证"), "（一）保证")
         self.assertEqual(strip_outline_enumerator("2023 年度报告"), "2023 年度报告")
 
+    def test_clean_mini_toc_on_marker_page_qualifies(self) -> None:
+        # Inquiry replies genuinely index 3-5 questions; a marker page whose
+        # lines ALL parse as "title + page" is that document's own TOC.
+        block = "\n".join(
+            ["问题1....3", "问题 2....30", "问题 3....91", "其他问题....118"]
+        )
+        anchored = analyze_toc_block(block, marker_anchored=True)
+        self.assertTrue(anchored.qualified)
+        self.assertIn("问题1", anchored.keys)
+        self.assertIn("其他问题", anchored.keys)
+        # No marker, or any residue line, keeps the strict threshold.
+        self.assertFalse(analyze_toc_block(block, marker_anchored=False).qualified)
+        dirty = block + "\n本回复不构成任何投资建议"
+        self.assertFalse(analyze_toc_block(dirty, marker_anchored=True).qualified)
+        self.assertFalse(
+            analyze_toc_block("问题1....3\n问题 2....30", marker_anchored=True).qualified
+        )
+
     def test_pipe_separated_page_grammar(self) -> None:
         # Bilingual designed reports render the TOC's visual column divider
         # as a pipe: "004 | 重要提示".

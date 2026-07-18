@@ -54,6 +54,11 @@ _MIN_ENUMERATED_ENTRIES = 2
 # only as an ascending run at least this long; a TOC enumerates in order.
 _MIN_ASCENDING_RUN = 3
 
+# A marker page whose lines ALL parse as "title + page" (no residue, no
+# bare lines) is a clean miniature TOC even below the general threshold:
+# inquiry replies genuinely index 3-5 questions.
+_MIN_CLEAN_MINI_TOC = 3
+
 # Highest-ranked family present in a block defines its top level; lower
 # families are that TOC's sub-structure (第X章 > 一、 > 1. by convention).
 _FAMILY_RANK = {"statutory": 0, "chinese": 1, "arabic": 2}
@@ -288,9 +293,17 @@ def _has_ascending_run(values: list[int], minimum: int) -> bool:
     return minimum <= 1
 
 
-def _qualifies(entries: list[TocEntry], *, marker_anchored: bool) -> bool:
+def _qualifies(
+    entries: list[TocEntry], *, marker_anchored: bool, unparsed: int = 1
+) -> bool:
     if len(entries) < _MIN_TOC_TITLES:
-        return False
+        paged = sum(1 for entry in entries if entry.page is not None)
+        return (
+            marker_anchored
+            and unparsed == 0
+            and paged == len(entries)
+            and paged >= _MIN_CLEAN_MINI_TOC
+        )
     statutory = sum(1 for entry in entries if entry.family == "statutory")
     if statutory >= _MIN_ENUMERATED_ENTRIES:
         return True
@@ -349,10 +362,12 @@ def analyze_toc_block(
     un-anchored blocks keep the strict statutory inline-page contract.
     """
 
-    entries, _unparsed = parse_toc_entries(
+    entries, unparsed = parse_toc_entries(
         toc_text, include_bare=marker_anchored
     )
-    if not _qualifies(entries, marker_anchored=marker_anchored):
+    if not _qualifies(
+        entries, marker_anchored=marker_anchored, unparsed=unparsed
+    ):
         return TocBlockAnalysis(qualified=False, keys=frozenset())
     return TocBlockAnalysis(qualified=True, keys=_declared_keys(entries))
 
