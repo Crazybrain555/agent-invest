@@ -287,7 +287,11 @@ def run_once(
     try:
         if limits.parse > 0 and not should_stop():
             _parse_stage(
-                report, deps, limit=limits.parse, should_stop=should_stop
+                report,
+                deps,
+                limit=limits.parse,
+                should_stop=should_stop,
+                keep_feeding=acquisition_thread.is_alive,
             )
     finally:
         acquisition_thread.join()
@@ -784,6 +788,7 @@ def _parse_stage(
     *,
     limit: int,
     should_stop: Callable[[], bool],
+    keep_feeding: Callable[[], bool] = lambda: False,
 ) -> None:
     """Parse pending documents through the 05 process chain (parse→build→publish).
 
@@ -792,7 +797,36 @@ def _parse_stage(
     remote *-http-client backends where each chain is mostly waiting on the
     GPU server (vllm continuous batching absorbs the parallel requests).
     Miniflux WORKER_POOL_SIZE / changedetection.io FETCH_WORKERS analog.
+
+    While ``keep_feeding`` holds (the acquisition thread is still syncing/
+    downloading), an exhausted batch re-dequeues and keeps the GPU fed —
+    without this the round blocks on the acquisition join with an idle GPU
+    (the observed 15-minute sawtooth valleys).  Fresh downloads landed by
+    the live acquisition thread become parseable within the same round.
     """
+
+    while True:
+        batch_done = _parse_one_batch(
+            report, deps, limit=limit, should_stop=should_stop
+        )
+        if batch_done == "halt" or should_stop():
+            return
+        if not keep_feeding():
+            return
+        if batch_done == "empty":
+            # Nothing to parse yet; give the acquisition thread a moment to
+            # land more downloads instead of hammering the queue query.
+            time.sleep(5)
+
+
+def _parse_one_batch(
+    report: WorkerReport,
+    deps: WorkerDeps,
+    *,
+    limit: int,
+    should_stop: Callable[[], bool],
+) -> str:
+    """Run one dequeue-and-parse wave; returns "done" | "empty" | "halt"."""
 
     with deps.engine.connect() as conn:
         pending = queries.pending_parse(
@@ -808,34 +842,36 @@ def _parse_stage(
             continue
         document_ids.append(str(row["document_id"]))
 
-    if document_ids:
-        # Parser identity is process/configuration health. Probe once before
-        # dequeuing any item so a missing/broken MinerU binary cannot consume
-        # every document's retry budget in concurrency-sized waves.
-        try:
-            deps.parser_factory().identity()
-        except ParserVersionProbeError:
-            report.failed += 1
-            report.failures.append(
-                WorkerFailure(
-                    stage="parse",
-                    item_ref="parser",
-                    error_code="parser_version_probe_failed",
-                    retryable=True,
-                )
+    if not document_ids:
+        return "empty"
+
+    # Parser identity is process/configuration health. Probe once before
+    # dequeuing any item so a missing/broken MinerU binary cannot consume
+    # every document's retry budget in concurrency-sized waves.
+    try:
+        deps.parser_factory().identity()
+    except ParserVersionProbeError:
+        report.failed += 1
+        report.failures.append(
+            WorkerFailure(
+                stage="parse",
+                item_ref="parser",
+                error_code="parser_version_probe_failed",
+                retryable=True,
             )
-            return
+        )
+        return "halt"
 
     concurrency = max(1, deps.config.parse_concurrency)
     if concurrency == 1:
         for document_id in document_ids:
             if should_stop():
-                return
+                return "halt"
             outcome = _process_one_document(deps, document_id)
             _fold_outcome(report, outcome)
             if _halts_parse_refill(outcome, report.failures):
-                return
-        return
+                return "halt"
+        return "done"
     limiter = deps.parse_limiter or AdaptiveConcurrencyLimit(
         max_limit=concurrency
     )
@@ -900,6 +936,7 @@ def _parse_stage(
                 continue
             if not halt_refill:
                 refill()
+    return "halt" if halt_refill else "done"
 
 
 def _build_stage(
