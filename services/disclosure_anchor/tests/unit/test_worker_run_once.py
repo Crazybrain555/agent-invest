@@ -146,6 +146,11 @@ class RunOnceSchedulingTests(unittest.TestCase):
             parse_started.set()
             return parsed
 
+        # One-shot batch: the continuous-feed loop re-dequeues while the
+        # acquisition thread lives, and the real queue excludes documents
+        # with runs — a constant mock would replay the same document.
+        batches = iter([[{"document_id": "doc_x", "oversized": False}]])
+
         with (
             mock.patch.object(
                 worker_module.queries, "reclaim_stale_runs", return_value=0
@@ -156,7 +161,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             mock.patch.object(
                 worker_module.queries,
                 "pending_parse",
-                return_value=[{"document_id": "doc_x", "oversized": False}],
+                side_effect=lambda *a, **k: next(batches, []),
             ),
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
             mock.patch.object(worker_module, "BuildUnits") as build_cls,

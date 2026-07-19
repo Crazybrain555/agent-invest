@@ -816,7 +816,10 @@ def _parse_stage(
         if batch_done == "empty":
             # Nothing to parse yet; give the acquisition thread a moment to
             # land more downloads instead of hammering the queue query.
-            time.sleep(5)
+            for _ in range(10):
+                if should_stop() or not keep_feeding():
+                    return
+                time.sleep(0.5)
 
 
 def _parse_one_batch(
