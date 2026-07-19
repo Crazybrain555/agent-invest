@@ -25,7 +25,9 @@ RETRYABLE_RESULT_CODES = frozenset({-1, 403, 404, 405})
 # 配额/限流（信封 resultcode=429）：参照 edgartools 对 SEC 429 的处理——请求内
 # 立即失败（重试只会烧配额/延长封禁），但 retryable=true 留给下一轮；worker 侧
 # 另有轮级熔断（design/watchlist-operations.md §5.3）。
-QUOTA_RESULT_CODES = frozenset({407, 408, 412})
+# 430 = daily call-volume wall (probe 2026-07-19: 30/30 flat 430 on the
+# listing API at any pacing — a per-day quota, not a rate verdict).
+QUOTA_RESULT_CODES = frozenset({407, 408, 412, 430})
 QUOTA_ERROR_CODE = "quota_exhausted"
 # 429 is a short-window rate verdict (probe 2026-07-18: ~70 calls at 1 rps
 # trip it and it clears within minutes) — waiting briefly helps, unlike a
