@@ -172,11 +172,17 @@ def _run_loop(settings: Settings, *, lock_conn: Connection) -> int:
                     exc=exc,
                 )
                 round_failed = True
+            # Alert first, and on its own: a full/unmounted report volume is
+            # exactly the condition an operator must hear about, and running
+            # the notification downstream of that write silenced it.
+            try:
+                _maybe_alert(settings, report)
+            except Exception:
+                traceback.print_exc()
             report_failed = False
             try:
                 _append_reports(settings, report)
                 print(render_report_section(report))
-                _maybe_alert(settings, report)
             except Exception:
                 # A full/unmounted report volume must not turn KeepAlive into
                 # a 30-second restart storm. stderr still carries the trace.
@@ -643,6 +649,13 @@ def _maybe_alert(settings: Settings, report: WorkerReport) -> None:
 
 
 def _alert_message(report: WorkerReport) -> str | None:
+    system = [failure for failure in report.failures if failure.stage == "system"]
+    if system:
+        # A whole-round crash (DB down, unmounted volume, programming error)
+        # only backs the loop off — it published no signal, so an operator
+        # learned about it a day later from the sampled doctor at best.
+        codes = sorted({failure.error_code for failure in system if failure.error_code})
+        return f"round crashed ({', '.join(codes) or 'system'}) — worker is looping without progress"
     if report.source_outage_break:
         return "source outage break (CNINFO/credentials); acquisition paused this round"
     if report.failed >= 5:

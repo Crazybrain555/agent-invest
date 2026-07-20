@@ -597,6 +597,68 @@ class DocumentUnitAuditTests(unittest.TestCase):
 
         self.assertIn("external_source_emitted", _codes(report))
 
+    def test_absorbed_duplicate_furniture_keeps_a_disposition_each(
+        self,
+    ) -> None:
+        # Repeated 证券代码/证券简称 headers collapse onto one carrier in S1,
+        # and the registered-header dedup then drops that carrier. Without a
+        # disposition per absorbed occurrence the later pages' source atoms
+        # end up represented by nothing at all.
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="heading",
+                    raw_kind="text",
+                    text="投资者关系活动记录表",
+                    heading_level=1,
+                    page_no=1,
+                ),
+                _element(
+                    1, kind="text", raw_kind="text", text="正文内容。", page_no=1
+                ),
+                _element(
+                    2,
+                    kind="page_furniture",
+                    raw_kind="header",
+                    text="证券代码：688525",
+                    page_no=1,
+                ),
+                _element(
+                    3, kind="text", raw_kind="text", text="第二页正文。", page_no=2
+                ),
+                _element(
+                    4,
+                    kind="page_furniture",
+                    raw_kind="header",
+                    text="证券代码：688525",
+                    page_no=2,
+                ),
+            ]
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="investor_relations",
+            document_title="审计样本",
+            security_code="688525",
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views(units),
+            metadata=replace(self.metadata, security_code="688525"),
+            source_dispositions=stats.source_dispositions,
+        )
+
+        self.assertNotIn("source_atom_uncovered", _codes(report))
+        # Both occurrences are accounted for, not just the surviving identity.
+        dropped = [
+            d
+            for d in stats.source_dispositions
+            if d.get("reason") == "registered_security_header"
+        ]
+        self.assertEqual({d["ir_id"] for d in dropped}, {"ir_0002", "ir_0004"})
+
     def test_case_flapped_furniture_dedup_is_valid_exact_duplication(
         self,
     ) -> None:

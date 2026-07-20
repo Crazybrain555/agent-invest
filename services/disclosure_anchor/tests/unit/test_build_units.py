@@ -514,7 +514,7 @@ class BuildUnitsTests(unittest.TestCase):
             self.assertEqual(result.status, "succeeded")
             self.assertEqual(result.unit_count, 1)
             run = uow.processing_runs.get("run_1")
-            self.assertEqual(run.builder_rules_version, "ub-2026.07-72")
+            self.assertEqual(run.builder_rules_version, "ub-2026.07-73")
             self.assertEqual(run.unit_build_attempt_count, 1)
             self.assertTrue(
                 run.document_units_relpath.endswith("document_units.v1.jsonl")

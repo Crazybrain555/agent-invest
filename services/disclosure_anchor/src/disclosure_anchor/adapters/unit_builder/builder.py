@@ -106,7 +106,6 @@ class BuildStats:
     deduplicated_registered_header_lines: int = 0
     deduplicated_page_number_lines: int = 0
     toc_entry_headings_demoted: int = 0
-    toc_page_boundaries_synthesized: int = 0
     needs_review_count: int = 0
     unusable_count: int = 0
     official_ir_form_status: str = "not_applicable"
@@ -136,9 +135,6 @@ class BuildStats:
             ),
             "deduplicated_page_number_lines": self.deduplicated_page_number_lines,
             "toc_entry_headings_demoted": self.toc_entry_headings_demoted,
-            "toc_page_boundaries_synthesized": (
-                self.toc_page_boundaries_synthesized
-            ),
             "needs_review_count": self.needs_review_count,
             "unusable_count": self.unusable_count,
             "official_ir_form_status": self.official_ir_form_status,
@@ -969,7 +965,6 @@ def s2_apply_heading_tree(
     *,
     qa_heading_mode: bool = False,
     toc_root_keys: frozenset[str] = frozenset(),
-    toc_page_boundaries: tuple[TocPageBoundary, ...] = (),
     stats: BuildStats | None = None,
 ) -> list[PreparedElement]:
     elements = list(elements)
@@ -990,33 +985,7 @@ def s2_apply_heading_tree(
     represented_heading_ids: set[int] = set()
     heading_carriers: dict[int, PreparedElement] = {}
     next_occurrence_id = 1
-    pending_boundaries = list(toc_page_boundaries)
     for element in elements:
-        # TOC-declared sections whose openers exist only as page-margin
-        # furniture (side-tab layouts): the declared page boundary opens the
-        # section, with provenance on the TOC entry line itself.  Informative
-        # parser levels mean real structure exists — never synthesize there.
-        while (
-            pending_boundaries
-            and not parser_levels_informative
-            and element.page_no is not None
-            and element.page_no >= pending_boundaries[0].pdf_page
-        ):
-            boundary = pending_boundaries.pop(0)
-            stack = [
-                _HeadingStackEntry(
-                    logical_level=1,
-                    title=boundary.title,
-                    occurrence_id=next_occurrence_id,
-                    source_level=1,
-                    pattern_level=None,
-                    artifact_locator=boundary.artifact_locator,
-                    toc_proven=True,
-                )
-            ]
-            next_occurrence_id += 1
-            if stats is not None:
-                stats.toc_page_boundaries_synthesized += 1
         text = (element.text or "").strip()
         if (
             qa_heading_mode
@@ -1271,123 +1240,11 @@ def s2_apply_heading_tree(
     return sorted(placed, key=lambda item: (item.order_index, item.intra_order))
 
 
-@dataclass(frozen=True)
-class TocPageBoundary:
-    """A TOC-declared section boundary for a body without in-flow headings.
-
-    Some designed reports carry section names only as page-margin furniture
-    (side tabs): the TOC declares "第一节 释义 …… 3" but no heading element
-    ever opens the section in the reading flow.  The declared entry plus the
-    printed→PDF page alignment (page-number furniture) is then the only real
-    evidence of the boundary; the opened section's provenance points at the
-    TOC entry line itself — no synthetic content, only a tree boundary.
-    """
-
-    title: str
-    pdf_page: int
-    artifact_locator: dict[str, Any] | None
-
-
-def _printed_page_map(
-    raw_elements: Iterable[Mapping[str, Any]],
-) -> dict[int, int]:
-    """Map printed page numbers to PDF pages from page-number furniture.
-
-    Runs over the raw parser elements: S1 legitimately drops page-number
-    furniture from the unit stream, but the numbers are the only alignment
-    evidence between TOC-declared printed pages and PDF pages.
-    """
-
-    mapping: dict[int, int] = {}
-    for element in raw_elements:
-        if (
-            element.get("kind") == "page_furniture"
-            and element.get("raw_kind") == "page_number"
-        ):
-            text = str(element.get("text") or "").strip()
-            page_no = _int_or_none(element.get("page_no"))
-            # isascii guard: "③".isdigit() is True but int("③") raises.
-            if text.isascii() and text.isdigit() and page_no is not None:
-                mapping.setdefault(int(text), page_no)
-    return mapping
-
-
-def _toc_page_boundaries(
-    pages: dict[int, list[PreparedElement]],
-    qualified_pages: set[int],
-    elements: list[PreparedElement],
-    *,
-    demoted_ids: set[int],
-    printed_map: Mapping[int, int],
-) -> tuple[TocPageBoundary, ...]:
-    """Bind TOC-declared paged entries to PDF-page boundaries (fail closed).
-
-    Only entries whose stripped title matches NO heading anywhere in the
-    document qualify (a matching heading means the normal TOC pin places the
-    section; demoted TOC-entry headings never claim); every boundary needs
-    direct page-number-furniture evidence for its printed page, and the
-    resulting sequence must be strictly increasing — a second section
-    starting on an already-claimed PDF page is dropped rather than guessed.
-    """
-
-    claimed: set[str] = set()
-    for element in elements:
-        if (
-            element.kind == "heading"
-            and element.text
-            and id(element) not in demoted_ids
-        ):
-            claimed.add(
-                toc_outline.normalize_section_title(
-                    toc_outline.strip_outline_enumerator(element.text)
-                )
-            )
-    candidates: list[TocPageBoundary] = []
-    for page in sorted(qualified_pages):
-        for element in pages.get(page, []):
-            if not element.text:
-                continue
-            entries, _unparsed = toc_outline.parse_toc_entries(
-                element.text, include_bare=True
-            )
-            for entry in entries:
-                if entry.page is None:
-                    continue
-                key = toc_outline.normalize_section_title(
-                    toc_outline.strip_outline_enumerator(entry.title)
-                )
-                if len(key) < 2 or key in claimed:
-                    continue
-                pdf_page = printed_map.get(entry.page)
-                if pdf_page is None:
-                    continue
-                locator = _prepared_text_slice_locator(element, entry.title)
-                if locator is None:
-                    continue
-                candidates.append(
-                    TocPageBoundary(
-                        title=entry.title,
-                        pdf_page=pdf_page,
-                        artifact_locator=locator,
-                    )
-                )
-    ordered = sorted(candidates, key=lambda b: b.pdf_page)
-    deduped: list[TocPageBoundary] = []
-    for boundary in ordered:
-        if deduped and boundary.pdf_page <= deduped[-1].pdf_page:
-            continue
-        deduped.append(boundary)
-    return tuple(deduped)
-
-
 def _front_matter_toc_scan(
     elements: list[PreparedElement],
     *,
     stats: BuildStats,
-    printed_map: Mapping[int, int] | None = None,
-) -> tuple[
-    list[PreparedElement], frozenset[str], tuple[TocPageBoundary, ...]
-]:
+) -> tuple[list[PreparedElement], frozenset[str]]:
     """Scan front matter for TOC pages; demote TOC-entry headings.
 
     Per the parser output contract a TOC page's titles may arrive as text
@@ -1412,7 +1269,6 @@ def _front_matter_toc_scan(
 
     keys: set[str] = set()
     demoted_ids: set[int] = set()
-    qualified_pages: set[int] = set()
     for page, page_elements in sorted(pages.items()):
         anchored = page in marker_pages or (page - 1) in marker_pages
         block = "\n".join(
@@ -1425,7 +1281,6 @@ def _front_matter_toc_scan(
         )
         keys.update(analysis.keys)
         if analysis.qualified:
-            qualified_pages.add(page)
             for element in page_elements:
                 if (
                     element.kind == "heading"
@@ -1434,15 +1289,8 @@ def _front_matter_toc_scan(
                 ):
                     demoted_ids.add(id(element))
 
-    boundaries = _toc_page_boundaries(
-        pages,
-        qualified_pages,
-        elements,
-        demoted_ids=demoted_ids,
-        printed_map=printed_map or {},
-    )
     if not demoted_ids:
-        return elements, frozenset(keys), boundaries
+        return elements, frozenset(keys)
     demoted_elements = [
         (
             replace(element, kind="text", heading_level=None)
@@ -1452,7 +1300,7 @@ def _front_matter_toc_scan(
         for element in elements
     ]
     stats.toc_entry_headings_demoted += len(demoted_ids)
-    return demoted_elements, frozenset(keys), boundaries
+    return demoted_elements, frozenset(keys)
 
 
 def _section_continuation_key(title: str) -> str:
@@ -2385,16 +2233,11 @@ def build_unit_drafts_s1_s7(
         document_title=document_title,
         stats=s1.stats,
     )
-    elements, toc_root_keys, toc_page_boundaries = _front_matter_toc_scan(
-        elements,
-        stats=s1.stats,
-        printed_map=_printed_page_map(normalized_ir.get("elements", [])),
-    )
+    elements, toc_root_keys = _front_matter_toc_scan(elements, stats=s1.stats)
     placed = s2_apply_heading_tree(
         elements,
         qa_heading_mode=qa_mode,
         toc_root_keys=toc_root_keys,
-        toc_page_boundaries=toc_page_boundaries,
         stats=s1.stats,
     )
     # QA discrimination was removed: transcripts
@@ -2465,17 +2308,24 @@ def _deduplicate_registered_security_headers(
                 output.append(replace(element, quality_status="needs_review"))
                 continue
         stats.deduplicated_registered_header_lines += match.metadata_value_count
-        _record_source_disposition(
-            stats,
-            element.artifact_locator,
-            role=(
-                "partial_external_metadata"
-                if match.replacement
-                else "external_metadata"
-            ),
-            reason="registered_security_header",
-            replacement_text=match.replacement,
+        role = (
+            "partial_external_metadata"
+            if match.replacement
+            else "external_metadata"
         )
+        # The carrier may already stand for identical furniture absorbed from
+        # later pages (S1 keeps one occurrence and records the rest under
+        # ``source_locators``).  Dropping it here without a disposition per
+        # absorbed occurrence would leave those source atoms represented by
+        # nothing at all.
+        for absorbed in _carrier_source_locators(element.artifact_locator):
+            _record_source_disposition(
+                stats,
+                absorbed,
+                role=role,
+                reason="registered_security_header",
+                replacement_text=match.replacement,
+            )
         if match.replacement:
             locator = dict(residual_locator or {})
             locator["derivation"] = {
@@ -2491,6 +2341,26 @@ def _deduplicate_registered_security_headers(
                 )
             )
     return output
+
+
+def _carrier_source_locators(
+    locator: dict[str, Any] | None,
+) -> list[dict[str, Any] | None]:
+    """Every source occurrence a carrier stands for, itself included.
+
+    Exact-duplicate furniture collapses onto one carrier whose locator lists
+    the absorbed occurrences; a later stage that removes the carrier owes a
+    disposition to each of them, not just to the surviving identity.
+    """
+
+    if not locator:
+        return [locator]
+    children = [
+        child
+        for child in locator.get("source_locators") or []
+        if isinstance(child, dict) and child.get("ir_id")
+    ]
+    return list(children) if children else [locator]
 
 
 def _record_source_disposition(

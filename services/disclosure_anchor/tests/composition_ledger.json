@@ -151,7 +151,7 @@
   },
   "tests/unit/test_document_unit_audit.py": {
    "private_imports": [],
-   "tests": 20
+   "tests": 21
   },
   "tests/unit/test_download_document.py": {
    "private_imports": [],
@@ -276,7 +276,7 @@
   },
   "tests/unit/test_unit_builder.py": {
    "private_imports": [],
-   "tests": 117
+   "tests": 114
   },
   "tests/unit/test_unit_hashing.py": {
    "private_imports": [],
