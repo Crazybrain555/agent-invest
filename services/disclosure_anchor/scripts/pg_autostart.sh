@@ -8,8 +8,16 @@ PG_BIN="${PG_BIN:-/opt/homebrew/opt/postgresql@18/bin}"
 PGDATA="${DISCLOSURE_PGDATA:-/Volumes/AgentSSD/agent_system/postgres/pg18-main}"
 PGLOG="${DISCLOSURE_PGLOG:-/Volumes/AgentSSD/agent_system/postgres/logs/disclosure-anchor-pg18.log}"
 
-# External volume may mount a beat after login; wait briefly.
-for _ in {1..30}; do
+# launchd hands over an environment with no locale. macOS then initializes
+# its locale machinery lazily on threads, and PostgreSQL 18 aborts startup
+# with "postmaster became multithreaded during startup" — every boot-time
+# start failed this way while manual starts from a shell succeeded.
+export LC_ALL="${LC_ALL:-C}"
+
+# External volume may mount well after login (observed: minutes on a cold
+# boot), and a missed start leaves the whole pipeline down until someone
+# notices, so wait generously rather than fail fast.
+for _ in {1..150}; do
   [ -d "$PGDATA" ] && break
   sleep 2
 done
