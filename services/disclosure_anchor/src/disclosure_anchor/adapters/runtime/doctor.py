@@ -214,13 +214,39 @@ def _ops_launchd_check() -> CheckResult:
     plist = (
         Path.home() / "Library" / "LaunchAgents" / "com.agentinvest.postgres.plist"
     )
-    if plist.exists():
-        return _pass("postgres autostart", f"installed: {plist.name}")
-    return _warn(
-        "postgres autostart",
-        "not installed; run make install-ops-launchd (machine reboot leaves "
-        "the worker looping against a dead DB)",
+    if not plist.exists():
+        return _warn(
+            "postgres autostart",
+            "not installed; run make install-ops-launchd (machine reboot leaves "
+            "the worker looping against a dead DB)",
+        )
+    # Installed is not the same as working: a locale-less launchd environment
+    # made every boot-time start abort, and this check reported PASS while the
+    # cluster stayed down. Ask the cluster itself.
+    data_dir = os.environ.get(
+        "DISCLOSURE_PGDATA", "/Volumes/AgentSSD/agent_system/postgres/pg18-main"
     )
+    pg_ctl = Path(
+        os.environ.get("PG_BIN", "/opt/homebrew/opt/postgresql@18/bin")
+    ) / "pg_ctl"
+    if not pg_ctl.exists():
+        return _pass("postgres autostart", f"installed: {plist.name}")
+    try:
+        probe = subprocess.run(
+            [str(pg_ctl), "-D", data_dir, "status"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _warn("postgres autostart", f"cannot probe cluster: {exc}")
+    if probe.returncode != 0:
+        return _fail(
+            "postgres autostart",
+            f"installed but the cluster at {data_dir} is not running — "
+            "check the autostart log; the worker cannot reach the DB",
+        )
+    return _pass("postgres autostart", f"installed and running: {plist.name}")
 
 
 def _reader_database_url_checks(settings: Settings) -> list[CheckResult]:

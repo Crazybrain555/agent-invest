@@ -24,15 +24,25 @@ FAIL_COUNT=$(echo "$DOCTOR_OUT" | grep -c '^\[FAIL\]' || true)
 WARN_COUNT=$(echo "$DOCTOR_OUT" | grep -c '^\[WARN\]' || true)
 if [ "$DOCTOR_EXIT" -ne 0 ] || [ "$FAIL_COUNT" -gt 0 ]; then
   "$NOTIFY" "doctor FAIL" "exit=$DOCTOR_EXIT fail=$FAIL_COUNT warn=$WARN_COUNT — run make doctor-full"
+else
+  # A few WARN families are the early edge of an outage rather than advice:
+  # a volume that fills stops PostgreSQL outright, and artifacts/dead
+  # letters/stale runs that keep growing mean a stage quietly stopped
+  # draining. They keep doctor's exit code (pinned) but must still reach
+  # an operator during an unattended multi-week backfill.
+  CRITICAL_WARNS=$(echo "$DOCTOR_OUT" | grep -E '^\[WARN\].*(disk|free space|orphan parser artifacts|parse dead letters|stale runs)' || true)
+  if [ -n "$CRITICAL_WARNS" ]; then
+    "$NOTIFY" "doctor WARN (actionable)" "$(echo "$CRITICAL_WARNS" | head -3 | tr '\n' ' ')"
+  fi
 fi
 
-# 2. Freshness (采集服务第一告警): on a trading day (Mon-Fri) after 18:00,
-#    zero document_registered events in the last 24h means the whole intake
-#    path silently stalled (upstream ban, worker hang, DB fault all present
-#    the same way).
-DOW=$(date +%u)   # 1..7, Mon=1
+# 2. Freshness (采集服务第一告警): after 18:00, zero document_registered
+#    events in the last 24h means the whole intake path silently stalled
+#    (upstream ban, worker hang, DB fault all present the same way). The
+#    weekday gate is gone: a backfill runs through weekends, and a Friday
+#    evening stall used to stay invisible until Monday.
 HOUR=$(date +%H)
-if [ "$DOW" -le 5 ] && [ "$HOUR" -ge 18 ]; then
+if [ "$HOUR" -ge 18 ]; then
   PSQL_URL=$(echo "${DATABASE_URL:-}" | sed 's|+psycopg||')
   if [ -n "$PSQL_URL" ]; then
     REGISTERED=$(psql "$PSQL_URL" -X -A -t -c \
