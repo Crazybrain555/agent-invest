@@ -597,6 +597,98 @@ class DocumentUnitAuditTests(unittest.TestCase):
 
         self.assertIn("external_source_emitted", _codes(report))
 
+    def test_conflicting_sub_item_markers_claim_no_block_applicability(
+        self,
+    ) -> None:
+        # One block, four sub-items, and their answers disagree — no single
+        # applicability describes the block, so none may be claimed.
+        block = "\n".join(
+            [
+                "(2) 暂时闲置的固定资产情况",
+                "□适用√不适用",
+                "(3) 通过融资租赁租入的固定资产情况",
+                "□适用√不适用",
+                "(4) 未办妥产权证书的固定资产情况",
+                "√适用 □不适用",
+            ]
+        )
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="heading",
+                    raw_kind="text",
+                    text="固定资产",
+                    heading_level=1,
+                ),
+                _element(1, kind="text", raw_kind="text", text=block),
+            ]
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            normalized, filing_type="semiannual_report", document_title="审计样本"
+        )
+
+        self.assertEqual(
+            [unit.applicability for unit in units if unit.payload_kind == "text"],
+            [None],
+        )
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views(units),
+            metadata=self.metadata,
+            source_dispositions=stats.source_dispositions,
+        )
+        self.assertNotIn("source_disposition_proof_invalid", _codes(report))
+
+    def test_marker_labelled_as_heading_is_not_image_context(self) -> None:
+        # A backend may label a bare 适用/不适用 line as a heading. It answers
+        # the section above it; letting a following image adopt it as context
+        # made two units claim one marker.
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="heading",
+                    raw_kind="text",
+                    text="(4). 研发人员构成发生重大变化的原因",
+                    heading_level=1,
+                    page_no=1,
+                ),
+                _element(
+                    1,
+                    kind="heading",
+                    raw_kind="text",
+                    text="□适用√不适用",
+                    heading_level=1,
+                    page_no=1,
+                ),
+                _element(
+                    2,
+                    kind="image",
+                    raw_kind="image",
+                    image_path=f"source/{'b' * 64}.png",
+                    page_no=1,
+                ),
+            ]
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="annual_report",
+            document_title="审计样本",
+            image_bytes_resolver=lambda _path: b"image-bytes",
+        )
+
+        image_units = [u for u in units if "image_ref" in u.payload]
+        self.assertEqual([u.payload.get("context") for u in image_units], [""])
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views(units),
+            metadata=self.metadata,
+            source_dispositions=stats.source_dispositions,
+            image_hashes={"ir_0002": "sha256:" + "0" * 64},
+        )
+        self.assertNotIn("applicability_target_count_invalid", _codes(report))
+
     def test_absorbed_duplicate_furniture_keeps_a_disposition_each(
         self,
     ) -> None:

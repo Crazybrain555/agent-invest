@@ -2761,7 +2761,13 @@ def _image_context(
         return "", None
     if previous.page_no != page_no:
         return "", None
-    return previous.text or "", dict(previous.artifact_locator or {}) or None
+    text = previous.text or ""
+    if rules.is_declaration_line(text.strip()):
+        # A layout backend can label a bare "□适用√不适用" as a heading. It
+        # answers the section above it and is never an image's context; taking
+        # it here made the image a second claimant of that one marker.
+        return "", None
+    return text, dict(previous.artifact_locator or {}) or None
 
 
 def _content_addressed_image_ref(
@@ -2854,6 +2860,24 @@ def _normalized_title(text: str) -> str:
     return re.sub(r"\s+", "", text).rstrip("：:")
 
 
+def _single_marker_verdict(lines: list[str]) -> str | None:
+    """The block's applicability when all its markers agree, else None.
+
+    A backend can hand back several sub-items in one block ("(2) …/□适用√不
+    适用/(3) …/√适用 □不适用"). Their verdicts belong to their own sub-items,
+    so no single applicability describes the block; claiming the first one
+    would attribute one sub-item's answer to all of them.
+    """
+
+    verdicts = {
+        verdict
+        for line in lines
+        if rules.is_pure_marker_line(line)
+        and (verdict := rules.classify_marker_line(line)) is not None
+    }
+    return next(iter(verdicts)) if len(verdicts) == 1 else None
+
+
 def _strip_declaration_lines(
     text: str, *, stats: BuildStats | None
 ) -> tuple[str, str | None]:
@@ -2888,6 +2912,7 @@ def _strip_declaration_lines(
             and rules.is_pure_marker_line(line)
             and len(lines[0].strip()) <= 24
             and not lines[0].strip().endswith(("。", "；"))
+            and _single_marker_verdict(lines) is not None
         ):
             # Label-then-marker composite: flag it, keep the text intact.
             applicability = rules.classify_marker_line(line)
