@@ -38,10 +38,8 @@ from disclosure_anchor.adapters.db.postgres.models import (
 )
 from disclosure_anchor.adapters.retrieval import tokenizer
 
-# Milestone 06R §5: single-transaction rebuild, flush every 1000 rows. The read
-# batch matches the flush batch so at most this many payloads are in memory and
-# the streaming-read-while-writing hazard (server-side cursor + concurrent DML
-# on one connection) never arises.
+# Upsert flush size inside one keyset batch (memory bound on payload rows);
+# the outer keyset batch (_BATCH_SIZE) commits per batch — see execute().
 _BATCH = 1000
 
 # Milestone 06R §4: a numeric-shaped cell after strip. Currency-magnitude words
@@ -71,8 +69,9 @@ _UPDATE_COLUMNS = (
 class BuildSearchProjectionCommand:
     # full=False is the incremental default (CLI default; worker always delta).
     full: bool = False
-    # Delta batch bound; the worker passes the publish batch limit, the CLI
-    # leaves it unbounded. Ignored in full mode.
+    # Upper bound on rows projected this call (worker passes the publish
+    # batch limit; CLI leaves it unbounded). Honored in both modes; the
+    # remainder is reported as ``skipped``.
     limit: int | None = None
 
 
@@ -98,7 +97,10 @@ class BuildSearchProjection:
     # batch, so a corpus-scale rebuild never rides one giant transaction
     # (pinning vacuum, ballooning WAL, restarting from zero on failure) and
     # never materializes millions of asset ids into Python
-    # (design: retrieval-scale-hardening.md §5).
+    # (design: retrieval-scale-hardening.md §5). A full run is therefore not
+    # one MVCC snapshot: units activated below the moving cursor by a
+    # concurrent publish are picked up by the next delta round, and the
+    # doctor coverage check alerts if that ever stops converging.
     _BATCH_SIZE = 2000
 
     def execute(

@@ -493,7 +493,6 @@ class DocumentRepository:
         refresh_document_classification(
             self._session.connection(), document_id=row.document_id
         )
-        self._session.expire(row)
         return mappers.document_to_entity(row)
 
     def get(self, document_id: str) -> Optional[e.Document]:
@@ -514,6 +513,11 @@ class DocumentRepository:
         if row is None:
             raise KeyError(f"document not found: {document.document_id}")
         updated = mappers.document_to_model(document)
+        classification_inputs_changed = (
+            row.title != updated.title
+            or row.provider != updated.provider
+            or row.provider_metadata != updated.provider_metadata
+        )
         for column in (
             "company_id",
             "security_id",
@@ -533,6 +537,14 @@ class DocumentRepository:
         ):
             setattr(row, column, getattr(updated, column))
         self._session.flush()
+        if classification_inputs_changed:
+            # Materialized classification derives from title/provider/
+            # metadata; a mutation without a re-stamp would survive under a
+            # still-matching stamp forever (the loader only refreshes on
+            # stamp mismatch).
+            refresh_document_classification(
+                self._session.connection(), document_id=row.document_id
+            )
         return mappers.document_to_entity(row)
 
     def get_by_provider_document_and_hash(

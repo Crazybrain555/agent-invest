@@ -16,16 +16,22 @@ everything is current — while list/filter reads stay index-backed
 from __future__ import annotations
 
 from sqlalchemy import text
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, Engine
 
 from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA
 
+# Content digest, not just declared versions: an operator edit that forgets
+# the version bump still changes the digest, so load-rules always refreshes
+# exactly the rows classified under different rule content (review finding,
+# 2026-07-22 — version-only stamps split-brained silently on such edits).
 CURRENT_STAMP_SQL = f"""
 SELECT COALESCE(
-    (SELECT string_agg(rule_set || ':' || version, '|' ORDER BY rule_set)
-       FROM (SELECT DISTINCT rule_set, version
-               FROM {CORE_SCHEMA}.classification_rule) v),
+    md5(string_agg(
+        rule_set || ':' || prefix || ':' || value || ':' || priority::text
+            || ':' || version,
+        '|' ORDER BY rule_set, prefix, value, priority, version)),
     'empty')
+  FROM {CORE_SCHEMA}.classification_rule
 """
 
 _CLS_EXPRESSION = f"""
@@ -131,22 +137,24 @@ def refresh_document_classification(
 
 
 def refresh_stale_documents(
-    conn: Connection, *, batch_size: int = 5000
+    engine: Engine, *, batch_size: int = 5000
 ) -> int:
     """Refresh every document whose stamp predates the loaded rules.
 
-    Batched by keyset with per-batch statements so a large corpus never
-    rides one giant transaction; the caller owns commit cadence.
+    One transaction per keyset batch — a corpus-scale refresh must never
+    ride one giant transaction (WAL bloat, long locks, all-or-nothing).
     """
 
-    stamp = current_rules_stamp(conn)
+    with engine.begin() as conn:
+        stamp = current_rules_stamp(conn)
     total = 0
     while True:
-        result = conn.execute(
-            text(REFRESH_STALE_BATCH_SQL),
-            {"stamp": stamp, "batch": batch_size},
-        )
-        updated = result.rowcount or 0
+        with engine.begin() as conn:
+            result = conn.execute(
+                text(REFRESH_STALE_BATCH_SQL),
+                {"stamp": stamp, "batch": batch_size},
+            )
+            updated = result.rowcount or 0
         total += updated
         if updated < batch_size:
             return total

@@ -124,8 +124,7 @@ def main() -> int:
         refresh_stale_documents,
     )
 
-    with engine.begin() as conn:
-        refreshed = refresh_stale_documents(conn)
+    refreshed = refresh_stale_documents(engine)
     print(f"refreshed materialized classification on {refreshed} documents")
 
     counts = {"class": 0, "facet": 0, "title": 0, "title_topic": 0, "title_noise": 0}
