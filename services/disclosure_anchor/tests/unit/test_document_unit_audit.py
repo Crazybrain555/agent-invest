@@ -597,6 +597,44 @@ class DocumentUnitAuditTests(unittest.TestCase):
 
         self.assertIn("external_source_emitted", _codes(report))
 
+    def test_captioned_cover_image_as_structure_tolerates_description_text(
+        self,
+    ) -> None:
+        # A cover image can carry both a caption (real document text, usable
+        # as structure) and a parser-generated scene description in ``text``.
+        # The description travels as payload; only the caption must be
+        # represented by the structure that claims the image.
+        digest = "c" * 64
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="image",
+                    raw_kind="image",
+                    image_path=f"source/{digest}.png",
+                    text="Abstract digital circuit board pattern with nodes",
+                    image_caption=["2025年度报告"],
+                ),
+                _element(1, kind="text", raw_kind="text", text="正文内容。"),
+            ]
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            normalized,
+            filing_type="annual_report",
+            document_title="风华高科：2025年年度报告",
+            image_bytes_resolver=lambda _path: b"cover-bytes",
+        )
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views(units),
+            metadata=self.metadata,
+            source_dispositions=stats.source_dispositions,
+            image_hashes={"ir_0000": "sha256:" + "1" * 64},
+        )
+
+        self.assertNotIn("structure_text_mismatch", _codes(report))
+
     def test_leading_marker_with_conflicting_followers_claims_nothing(
         self,
     ) -> None:

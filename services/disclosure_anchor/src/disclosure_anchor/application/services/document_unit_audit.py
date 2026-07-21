@@ -2100,7 +2100,15 @@ def _validate_structure_texts(
 ) -> None:
     for ref in sorted(state.structure_refs, key=source_order(source)):
         element = source.elements[ref]
-        text = source_text_overrides.get(ref, _element_text(element))
+        if element.get("kind") == "image":
+            # The only image field that can legitimately serve as structure
+            # is its caption; ``text`` on an image is the parser's generated
+            # scene description (cover art transcriptions, mermaid renders),
+            # which travels as payload and is guarded by text conservation.
+            default_text = _image_caption(element)
+        else:
+            default_text = _element_text(element)
+        text = source_text_overrides.get(ref, default_text)
         if not text:
             continue
         normalized = _norm(text)
