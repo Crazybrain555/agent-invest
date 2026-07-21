@@ -597,6 +597,48 @@ class DocumentUnitAuditTests(unittest.TestCase):
 
         self.assertIn("external_source_emitted", _codes(report))
 
+    def test_leading_marker_with_conflicting_followers_claims_nothing(
+        self,
+    ) -> None:
+        # Symmetry with the label-then-marker gate: a block OPENING with a
+        # marker whose later sub-items answer differently describes no single
+        # applicability either; the first answer must not speak for the block.
+        block = "\n".join(
+            [
+                "□适用√不适用",
+                "(3) 通过融资租赁租入的固定资产情况",
+                "√适用 □不适用",
+            ]
+        )
+        normalized = _ir(
+            [
+                _element(
+                    0,
+                    kind="heading",
+                    raw_kind="text",
+                    text="固定资产",
+                    heading_level=1,
+                ),
+                _element(1, kind="text", raw_kind="text", text=block),
+            ]
+        )
+        units, stats = build_unit_drafts_s1_s7(
+            normalized, filing_type="semiannual_report", document_title="审计样本"
+        )
+
+        text_units = [u for u in units if u.payload_kind == "text"]
+        self.assertEqual([u.applicability for u in text_units], [None])
+        # The refused marker stays visible in the text, not silently dropped.
+        self.assertIn("□适用√不适用", str(text_units[0].payload.get("text", "")))
+        report = audit_document(
+            normalized_ir=normalized,
+            units=_views(units),
+            metadata=self.metadata,
+            source_dispositions=stats.source_dispositions,
+        )
+        self.assertNotIn("source_disposition_proof_invalid", _codes(report))
+        self.assertNotIn("applicability_target_count_invalid", _codes(report))
+
     def test_conflicting_sub_item_markers_claim_no_block_applicability(
         self,
     ) -> None:

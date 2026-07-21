@@ -2899,7 +2899,15 @@ def _strip_declaration_lines(
     kept: list[str] = []
     applicability: str | None = None
     for index, line in enumerate(lines):
-        if applicability is None and index == 0 and rules.is_pure_marker_line(line):
+        if (
+            applicability is None
+            and index == 0
+            and rules.is_pure_marker_line(line)
+            and _single_marker_verdict(lines) is not None
+        ):
+            # Same conflict gate as the label-then-marker path below: a
+            # leading marker followed by sub-items whose own markers disagree
+            # describes no single block applicability either.
             applicability = rules.classify_marker_line(line)
             if stats is not None:
                 stats.stripped_marker_lines += 1
