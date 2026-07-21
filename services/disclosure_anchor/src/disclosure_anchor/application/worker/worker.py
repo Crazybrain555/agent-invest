@@ -806,20 +806,35 @@ def _parse_stage(
     """
 
     while True:
+        feeding_before = keep_feeding()
         batch_done = _parse_one_batch(
             report, deps, limit=limit, should_stop=should_stop
         )
         if batch_done == "halt" or should_stop():
             return
-        if not keep_feeding():
-            return
         if batch_done == "empty":
+            if not feeding_before:
+                # Acquisition had already finished before this dequeue came
+                # back empty, so nothing else can land this round. Exiting on
+                # a live thread's empty instead would race a download that
+                # commits between the dequeue and the join.
+                return
             # Nothing to parse yet; give the acquisition thread a moment to
             # land more downloads instead of hammering the queue query.
             for _ in range(10):
-                if should_stop() or not keep_feeding():
+                if should_stop():
                     return
+                if not keep_feeding():
+                    break
                 time.sleep(0.5)
+            continue
+        # Batch done. If acquisition was already over before this batch even
+        # started, nothing new can have landed since — stop here so rounds
+        # stay bounded (the backlog belongs to the next round). A batch that
+        # STARTED while acquisition was live loops once more, which is what
+        # closes the race with a download committing near the join.
+        if not feeding_before and not keep_feeding():
+            return
 
 
 def _parse_one_batch(
