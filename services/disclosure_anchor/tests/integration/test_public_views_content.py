@@ -8,6 +8,9 @@ import unittest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from disclosure_anchor.adapters.db.postgres.classification_refresh import (
+    refresh_document_classification,
+)
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
 from disclosure_anchor.adapters.sources.cninfo.mapper import derive_primary_class
 from disclosure_anchor.domain import entities as e
@@ -160,6 +163,8 @@ class PublicViewContentTests(unittest.TestCase):
                     "raw_file_relpath": f"raw_documents/cninfo/{document_id}.pdf",
                 },
             )
+            # 0027: raw seeding must stamp classification like the repository does.
+            refresh_document_classification(conn, document_id=document_id)
             conn.execute(
                 text(
                     "INSERT INTO disclosure_core.processing_run "
@@ -440,6 +445,9 @@ class PublicViewContentTests(unittest.TestCase):
                 ),
                 {"document_id": document_id},
             )
+            # 0027: metadata mutation must re-stamp the materialized
+            # classification, exactly like the rules loader does.
+            refresh_document_classification(conn, document_id=document_id)
         with self.engine.connect() as conn:
             row = conn.execute(
                 text(
@@ -538,6 +546,9 @@ class PublicViewContentTests(unittest.TestCase):
                 ),
                 {"document_id": document_id},
             )
+            # 0027: metadata mutation must re-stamp the materialized
+            # classification, exactly like the rules loader does.
+            refresh_document_classification(conn, document_id=document_id)
         with self.engine.connect() as conn:
             row = conn.execute(
                 text(
@@ -729,6 +740,10 @@ class PublicViewContentTests(unittest.TestCase):
                     "hash_b": self.hash_b,
                     "raw_relpath": f"raw_documents/cninfo/002484/2025/{self.pid}/sha256_def.pdf",
                 },
+            )
+            # 0027: raw seeding must stamp classification like the repository does.
+            refresh_document_classification(
+                conn, document_id=self.superseding_document_id
             )
 
         with self.engine.connect() as conn:

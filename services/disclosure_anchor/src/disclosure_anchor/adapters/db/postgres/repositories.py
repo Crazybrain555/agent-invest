@@ -17,6 +17,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from disclosure_anchor.adapters.db.postgres import mappers, models
+from disclosure_anchor.adapters.db.postgres.classification_refresh import (
+    refresh_document_classification,
+)
 from disclosure_anchor.application.worker.locks import OUTBOX_NS
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.value_objects import canonical_security_identity
@@ -484,6 +487,13 @@ class DocumentRepository:
                     "document provider/document/hash already exists"
                 ) from exc
             raise
+        # Materialized classification stamps at insert, in the same
+        # transaction; rules reloads refresh the rest by stamp mismatch
+        # (design: retrieval-scale-hardening.md §3).
+        refresh_document_classification(
+            self._session.connection(), document_id=row.document_id
+        )
+        self._session.expire(row)
         return mappers.document_to_entity(row)
 
     def get(self, document_id: str) -> Optional[e.Document]:

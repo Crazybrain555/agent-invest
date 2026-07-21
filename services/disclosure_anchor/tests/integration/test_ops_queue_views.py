@@ -8,6 +8,9 @@ from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import text
 
+from disclosure_anchor.adapters.db.postgres.classification_refresh import (
+    refresh_document_classification,
+)
 from disclosure_anchor.application.worker import queries
 from disclosure_anchor.domain import ids
 from tests.integration._support import engine_or_skip
@@ -85,6 +88,8 @@ class OpsQueueViewTests(unittest.TestCase):
             ),
             {"id": document_id, "status": status, "pid": f"qv{self.suffix}{len(self.doc_ids)}"},
         )
+        # 0027: raw seeding must stamp classification like the repository does.
+        refresh_document_classification(conn, document_id=document_id)
         self.doc_ids.append(document_id)
         return document_id
 
@@ -150,7 +155,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 conn, document_id, status="succeeded", unit_build_status="succeeded"
             )
             self._insert_unit(conn, document_id, run_id)
-            rows = queries.pending_publish(conn, limit=1000)
+            rows = queries.pending_publish(conn, limit=500000)
         self.assertIn(run_id, [row["processing_run_id"] for row in rows])
 
     def test_pending_publish_excludes_real_empty_run_poison(self) -> None:
@@ -166,7 +171,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 ),
                 {"run": run_id},
             ).scalars()
-            automatic_rows = queries.pending_publish(conn, limit=1000)
+            automatic_rows = queries.pending_publish(conn, limit=500000)
         self.assertIn(run_id, list(raw_rows), "view preserves the dead-letter fact")
         self.assertNotIn(
             run_id,
@@ -191,7 +196,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 ),
                 {"id": document_id},
             ).all()
-            helper_rows = queries.pending_parse(conn, max_retries=3, limit=1000)
+            helper_rows = queries.pending_parse(conn, max_retries=3, limit=500000)
         self.assertEqual(len(view_rows), 1, "view exposes the fact row")
         self.assertNotIn(
             document_id, [row["document_id"] for row in helper_rows],
@@ -209,7 +214,7 @@ class OpsQueueViewTests(unittest.TestCase):
                     status="failed",
                     error={"stage": "parse", "error_code": "T", "retryable": True},
                 )
-            helper_rows = queries.pending_parse(conn, max_retries=3, limit=1000)
+            helper_rows = queries.pending_parse(conn, max_retries=3, limit=500000)
         self.assertNotIn(document_id, [row["document_id"] for row in helper_rows])
 
     def test_processing_backlog_counts_download_and_all_raw_parse_work(self) -> None:
@@ -265,6 +270,8 @@ class OpsQueueViewTests(unittest.TestCase):
                 ),
                 {"id": oversized, "pid": f"oversized{self.suffix}"},
             )
+            # 0027: raw seeding must stamp classification like the repository does.
+            refresh_document_classification(conn, document_id=oversized)
             self.doc_ids.append(oversized)
 
             after = queries.pending_processing_backlog_count(conn, max_retries=3)
@@ -292,7 +299,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 ),
                 {"id": self.tracked_id, "co": self.company_id},
             )
-            rows = queries.sync_due(conn, interval_seconds=86400, limit=1000)
+            rows = queries.sync_due(conn, interval_seconds=86400, limit=500000)
         match = [row for row in rows if row["company_id"] == self.company_id]
         self.assertEqual(len(match), 1)
         self.assertIsNone(match[0]["window_end"])
@@ -329,7 +336,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 {"checkpoint": f"cp_qv{self.suffix}", "scope": scope_key},
             )
 
-            due = queries.sync_due(conn, interval_seconds=86400, limit=1000)
+            due = queries.sync_due(conn, interval_seconds=86400, limit=500000)
             lifecycle = conn.execute(
                 text(
                     "SELECT last_synced_at, synced_through "
@@ -435,7 +442,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 ),
                 {"id": failure_access, "company": failed_company},
             )
-            cooled = queries.sync_due(conn, interval_seconds=86400, limit=1000)
+            cooled = queries.sync_due(conn, interval_seconds=86400, limit=500000)
             conn.execute(
                 text(
                     "UPDATE disclosure_core.source_access "
@@ -444,7 +451,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 ),
                 {"id": failure_access},
             )
-            retriable = queries.sync_due(conn, interval_seconds=86400, limit=1000)
+            retriable = queries.sync_due(conn, interval_seconds=86400, limit=500000)
         finally:
             txn.rollback()
             conn.close()
@@ -511,6 +518,8 @@ class OpsQueueViewTests(unittest.TestCase):
                 ),
                 {"id": done_doc, "pid": pid_done},
             )
+            # 0027: raw seeding must stamp classification like the repository does.
+            refresh_document_classification(conn, document_id=done_doc)
             self.doc_ids.append(done_doc)
             # pid_dead has a non-retryable download failure → excluded.
             sa_fail = f"sa_qv{self.suffix}fail"
@@ -536,7 +545,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 },
             )
             self.sa_ids.append(sa_fail)
-            rows = queries.pending_downloads(conn, max_retries=3, limit=1000)
+            rows = queries.pending_downloads(conn, max_retries=3, limit=500000)
 
         pids = [row["provider_document_id"] for row in rows]
         self.assertIn(pid_new, pids)
@@ -634,8 +643,10 @@ class OpsQueueViewTests(unittest.TestCase):
                         "meta": json.dumps({"file_signature": {"file_size": 10}}),
                     },
                 )
+                # 0027: raw seeding must stamp classification like the repository does.
+                refresh_document_classification(conn, document_id=doc_id)
                 self.doc_ids.append(doc_id)
-            rows = queries.pending_downloads(conn, max_retries=3, limit=1000)
+            rows = queries.pending_downloads(conn, max_retries=3, limit=500000)
 
         by_pid = {row["provider_document_id"]: row for row in rows}
         self.assertIn(pid_swap, by_pid)
@@ -653,14 +664,14 @@ class OpsQueueViewTests(unittest.TestCase):
             filtered = queries.pending_downloads(
                 conn2,
                 max_retries=3,
-                limit=1000,
+                limit=500000,
                 security_code="T08QV",
                 min_announcement_date=date(1989, 1, 1),
             )
             excluded = queries.pending_downloads(
                 conn2,
                 max_retries=3,
-                limit=1000,
+                limit=500000,
                 security_code="T08QV",
                 min_announcement_date=date(1991, 1, 1),
             )
@@ -735,7 +746,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 )
             pids = [
                 row["provider_document_id"]
-                for row in queries.pending_downloads(conn, max_retries=3, limit=1000)
+                for row in queries.pending_downloads(conn, max_retries=3, limit=500000)
             ]
             self.assertIn(pid_active, pids)
             self.assertNotIn(pid_paused, pids)
@@ -806,7 +817,7 @@ class OpsQueueViewTests(unittest.TestCase):
             pids = [
                 row["provider_document_id"]
                 for row in queries.pending_downloads(
-                    conn, max_retries=3, limit=1000, scope_classes=scope
+                    conn, max_retries=3, limit=500000, scope_classes=scope
                 )
             ]
             self.assertIn(pid_core, pids)
@@ -841,14 +852,14 @@ class OpsQueueViewTests(unittest.TestCase):
             override_pids = [
                 row["provider_document_id"]
                 for row in queries.pending_downloads(
-                    conn, max_retries=3, limit=1000, scope_classes=scope
+                    conn, max_retries=3, limit=500000, scope_classes=scope
                 )
             ]
             self.assertNotIn(pid_core, override_pids)  # dividend not in override
             self.assertIn(pid_gov, override_pids)      # governance now in
             all_pids = [
                 row["provider_document_id"]
-                for row in queries.pending_downloads(conn, max_retries=3, limit=1000)
+                for row in queries.pending_downloads(conn, max_retries=3, limit=500000)
             ]
             self.assertIn(pid_gov, all_pids)  # scope None = everything
         finally:
@@ -1027,7 +1038,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 for row in queries.pending_downloads(
                     conn,
                     max_retries=3,
-                    limit=1000,
+                    limit=500000,
                     scope_classes=("dividend", "annual_report"),
                 )
             }
@@ -1122,7 +1133,7 @@ class OpsQueueViewTests(unittest.TestCase):
             pids = [
                 row["provider_document_id"]
                 for row in queries.pending_downloads(
-                    conn, max_retries=3, limit=1000, scope_classes=scope
+                    conn, max_retries=3, limit=500000, scope_classes=scope
                 )
             ]
             self.assertNotIn(pid_carrier, pids)  # carrier code outside scope
@@ -1135,7 +1146,7 @@ class OpsQueueViewTests(unittest.TestCase):
             optin_pids = [
                 row["provider_document_id"]
                 for row in queries.pending_downloads(
-                    conn, max_retries=3, limit=1000, scope_classes=optin
+                    conn, max_retries=3, limit=500000, scope_classes=optin
                 )
             ]
             self.assertIn(pid_carrier, optin_pids)
@@ -1172,7 +1183,7 @@ class OpsQueueViewTests(unittest.TestCase):
             override_pids = [
                 row["provider_document_id"]
                 for row in queries.pending_downloads(
-                    conn, max_retries=3, limit=1000, scope_classes=scope
+                    conn, max_retries=3, limit=500000, scope_classes=scope
                 )
             ]
             self.assertIn(pid_carrier, override_pids)
@@ -1266,7 +1277,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 for row in queries.pending_downloads(
                     conn,
                     max_retries=3,
-                    limit=1000,
+                    limit=500000,
                     scope_classes=(
                         "financing",
                         "convertible_bond",
@@ -1308,7 +1319,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 for row in queries.pending_parse(
                     conn,
                     max_retries=3,
-                    limit=1000,
+                    limit=500000,
                     scope_classes=("equity_incentive",),
                 )
             ]
@@ -1405,7 +1416,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 for row in queries.pending_downloads(
                     conn,
                     max_retries=3,
-                    limit=1000,
+                    limit=500000,
                     scope_classes=("equity_share_change", "convertible_bond"),
                 )
             }
@@ -1432,7 +1443,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 for row in queries.pending_parse(
                     conn,
                     max_retries=3,
-                    limit=1000,
+                    limit=500000,
                     scope_classes=("equity_share_change", "convertible_bond"),
                 )
             }
@@ -1482,7 +1493,7 @@ class OpsQueueViewTests(unittest.TestCase):
             doc_ids = [
                 row["document_id"]
                 for row in queries.pending_parse(
-                    conn, max_retries=3, limit=1000, scope_classes=scope
+                    conn, max_retries=3, limit=500000, scope_classes=scope
                 )
             ]
             self.assertNotIn(doc_carrier, doc_ids)

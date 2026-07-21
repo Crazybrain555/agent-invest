@@ -30,7 +30,7 @@ else
   # letters/stale runs that keep growing mean a stage quietly stopped
   # draining. They keep doctor's exit code (pinned) but must still reach
   # an operator during an unattended multi-week backfill.
-  CRITICAL_WARNS=$(echo "$DOCTOR_OUT" | grep -E '^\[WARN\].*(disk|free space|orphan parser artifacts|parse dead letters|stale runs)' || true)
+  CRITICAL_WARNS=$(echo "$DOCTOR_OUT" | grep -E '^\[WARN\].*(disk|free space|orphan parser artifacts|parse dead letters|stale runs|search projection coverage)' || true)
   if [ -n "$CRITICAL_WARNS" ]; then
     "$NOTIFY" "doctor WARN (actionable)" "$(echo "$CRITICAL_WARNS" | head -3 | tr '\n' ' ')"
   fi

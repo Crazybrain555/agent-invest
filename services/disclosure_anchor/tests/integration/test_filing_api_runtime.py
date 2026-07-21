@@ -16,6 +16,9 @@ import unittest
 from sqlalchemy import text
 from sqlalchemy.exc import ProgrammingError
 
+from disclosure_anchor.adapters.db.postgres.classification_refresh import (
+    refresh_document_classification,
+)
 from disclosure_anchor.adapters.db.postgres.schema import READER_ROLE
 from disclosure_anchor.api.errors import GONE_SUPERSEDED, VALIDATION_ERROR
 from disclosure_anchor.domain import ids
@@ -621,6 +624,8 @@ class FilingApiRuntimeTests(unittest.TestCase):
                     "supersedes_document_id": supersedes_document_id,
                 },
             )
+            # 0027: raw seeding must stamp classification like the repository does.
+            refresh_document_classification(conn, document_id=document_id)
         return document_id
 
     def _insert_run(

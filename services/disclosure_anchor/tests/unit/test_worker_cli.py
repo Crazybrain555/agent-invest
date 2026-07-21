@@ -290,6 +290,10 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 hf_home=root / "shared" / "hf",
                 modelscope_cache=root / "shared" / "modelscope",
                 cninfo_access_token="test-token",
+                # The test pins the API-client lifecycle; the ambient
+                # DISCLOSURE_SYNC_CHANNEL=web of a backfill deployment would
+                # otherwise route source_factory away from CninfoClient.
+                disclosure_sync_channel="api",
             )
             client = mock.MagicMock()
             with mock.patch.object(

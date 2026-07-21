@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from datetime import date
 from typing import Any, NoReturn
 
@@ -242,12 +244,15 @@ def _document_where(filters: DocumentFilters) -> tuple[list[str], dict[str, Any]
         # content_categories is a jsonb array of {code, name}; a value hits
         # when it equals any element's code OR name (round24 — the source
         # cninfo category dimension, previously response-only).
-        where.append(
-            "EXISTS (SELECT 1 FROM jsonb_array_elements(content_categories) cc "
-            "WHERE cc->>'code' = ANY(CAST(:content_categories AS text[])) "
-            "OR cc->>'name' = ANY(CAST(:content_categories AS text[])))"
-        )
-        params["content_categories"] = filters.content_category
+        # Containment form so the 0027 GIN index on the materialized
+        # column serves the filter; per-element EXISTS forced a full scan.
+        clauses = []
+        for index, value in enumerate(filters.content_category):
+            for field in ("code", "name"):
+                key = f"content_category_{field}_{index}"
+                clauses.append(f"content_categories @> CAST(:{key} AS jsonb)")
+                params[key] = json.dumps([{field: value}])
+        where.append("(" + " OR ".join(clauses) + ")")
     if filters.title_contains is not None:
         where.append("title ILIKE :title_pattern ESCAPE '\\'")
         params["title_pattern"] = (

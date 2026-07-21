@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 import re
 from typing import Any
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
@@ -94,19 +94,44 @@ class BuildSearchProjection:
     def __init__(self, *, engine: Engine) -> None:
         self._engine = engine
 
+    # Discourse-style bounded reindex: keyset batches with a commit per
+    # batch, so a corpus-scale rebuild never rides one giant transaction
+    # (pinning vacuum, ballooning WAL, restarting from zero on failure) and
+    # never materializes millions of asset ids into Python
+    # (design: retrieval-scale-hardening.md §5).
+    _BATCH_SIZE = 2000
+
     def execute(
         self, command: BuildSearchProjectionCommand
     ) -> BuildSearchProjectionResult:
         built_at = datetime.now(timezone.utc)
+        projected = 0
+        skipped = 0
+        remaining = command.limit
+        cursor: str | None = None
         with Session(self._engine) as session:
-            if command.full:
-                asset_ids: list[str] = self._active_asset_ids(session)
-                skipped = 0
-            else:
-                asset_ids, skipped = self._delta_asset_ids(
-                    session, limit=command.limit
+            while True:
+                batch_cap = self._BATCH_SIZE
+                if remaining is not None:
+                    batch_cap = min(batch_cap, remaining)
+                    if batch_cap <= 0:
+                        skipped = self._pending_count(
+                            session, full=command.full, after=cursor
+                        )
+                        break
+                asset_ids = self._select_batch(
+                    session,
+                    full=command.full,
+                    after=cursor,
+                    limit=batch_cap,
                 )
-            projected = self._upsert(session, asset_ids, built_at=built_at)
+                if not asset_ids:
+                    break
+                projected += self._upsert(session, asset_ids, built_at=built_at)
+                session.commit()
+                cursor = asset_ids[-1]
+                if remaining is not None:
+                    remaining -= len(asset_ids)
             deleted = self._delete_orphans(session) if command.full else 0
             session.commit()
         return BuildSearchProjectionResult(
@@ -114,7 +139,7 @@ class BuildSearchProjection:
         )
 
     # -- selection ----------------------------------------------------------
-    def _active_asset_ids(self, session: Session) -> list[str]:
+    def _selection_stmt(self, *, full: bool, after: str | None) -> Any:
         stmt = (
             select(DocumentUnit.asset_id)
             .join(
@@ -122,39 +147,34 @@ class BuildSearchProjection:
                 ProcessingRun.processing_run_id == DocumentUnit.processing_run_id,
             )
             .where(ProcessingRun.is_active.is_(True))
-            .order_by(DocumentUnit.asset_id)
         )
-        return list(session.execute(stmt).scalars())
-
-    def _delta_asset_ids(
-        self, session: Session, *, limit: int | None
-    ) -> tuple[list[str], int]:
-        stmt = (
-            select(DocumentUnit.asset_id)
-            .join(
-                ProcessingRun,
-                ProcessingRun.processing_run_id == DocumentUnit.processing_run_id,
-            )
-            .outerjoin(
+        if not full:
+            stmt = stmt.outerjoin(
                 UnitSearchProjection,
                 UnitSearchProjection.asset_id == DocumentUnit.asset_id,
-            )
-            .where(
-                ProcessingRun.is_active.is_(True),
+            ).where(
                 or_(
                     UnitSearchProjection.asset_id.is_(None),
                     UnitSearchProjection.retrieval_rules_version
                     != tokenizer.RETRIEVAL_RULES_VERSION,
-                ),
+                )
             )
-            .order_by(DocumentUnit.asset_id)
-        )
-        ids = list(session.execute(stmt).scalars())
-        if limit is not None and len(ids) > limit:
-            # Deferred candidates are reported as ``skipped``; the next round
-            # (or an unbounded CLI run) picks them up.
-            return ids[:limit], len(ids) - limit
-        return ids, 0
+        if after is not None:
+            stmt = stmt.where(DocumentUnit.asset_id > after)
+        return stmt.order_by(DocumentUnit.asset_id)
+
+    def _select_batch(
+        self, session: Session, *, full: bool, after: str | None, limit: int
+    ) -> list[str]:
+        stmt = self._selection_stmt(full=full, after=after).limit(limit)
+        return list(session.execute(stmt).scalars())
+
+    def _pending_count(
+        self, session: Session, *, full: bool, after: str | None
+    ) -> int:
+        stmt = self._selection_stmt(full=full, after=after)
+        counted = select(func.count()).select_from(stmt.subquery())
+        return int(session.execute(counted).scalar() or 0)
 
     # -- mutation -----------------------------------------------------------
     def _upsert(

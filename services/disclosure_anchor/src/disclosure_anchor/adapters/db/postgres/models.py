@@ -304,6 +304,15 @@ class Document(Base):
     current_processing_run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     supersedes_document_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     correction_of_document_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Materialized classification (0027): stamped at insert and refreshed by
+    # the rules loader on stamp mismatch; the public views read these instead
+    # of recomputing the classification per row per read.
+    class_filing_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    class_market: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    class_rules_version: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    class_disclosure_topics: Mapped[Optional[list[Any]]] = mapped_column(JSONB, nullable=True)
+    class_publisher_categories: Mapped[Optional[list[Any]]] = mapped_column(JSONB, nullable=True)
+    class_content_categories: Mapped[Optional[list[Any]]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

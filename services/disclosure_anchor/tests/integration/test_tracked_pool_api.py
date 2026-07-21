@@ -45,6 +45,27 @@ def _settings(root: Path) -> Settings:
     )
 
 
+def _list_all_tracked(app, query: dict | None = None) -> list[dict]:
+    """Walk cursor pages: the shared pool holds 1,000+ real companies and the
+    T-prefixed test codes sort after every numeric code, i.e. onto the last
+    page — a single default-limit GET can never see them."""
+
+    items: list[dict] = []
+    cursor: str | None = None
+    while True:
+        q = dict(query or {})
+        q["limit"] = "1000"
+        if cursor:
+            q["cursor"] = cursor
+        got = _api_request(app, "GET", "/v1/tracked-companies", query=q)
+        assert got.status_code == 200, got.body
+        payload = got.json()
+        items.extend(payload["items"])
+        cursor = payload.get("next_cursor")
+        if not cursor:
+            return items
+
+
 class TrackedPoolApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = engine_or_skip()
@@ -125,9 +146,9 @@ class TrackedPoolApiTests(unittest.TestCase):
         self.assertEqual(payload["created_count"], 2)
         self.assertFalse(payload["dry_run"])
 
-        got = _api_request(self.app, "GET", "/v1/tracked-companies")
-        self.assertEqual(got.status_code, 200, got.body)
-        by_code = {item["security_code"]: item for item in got.json()["items"]}
+        by_code = {
+            item["security_code"]: item for item in _list_all_tracked(self.app)
+        }
 
         override = by_code[self.code_override]
         self.assertEqual(override["effective_lookback_days"], 30)
@@ -154,11 +175,9 @@ class TrackedPoolApiTests(unittest.TestCase):
         # Inherit rows resolve to the global policy's process list.
         self.assertGreater(len(inherit["effective_process_classes"]), 0)
 
-        active_only = _api_request(
-            self.app, "GET", "/v1/tracked-companies", query={"status": "active"}
-        )
         active_codes = {
-            item["security_code"] for item in active_only.json()["items"]
+            item["security_code"]
+            for item in _list_all_tracked(self.app, {"status": "active"})
         }
         self.assertIn(self.code_override, active_codes)
         self.assertNotIn(self.code_inherit, active_codes)
@@ -196,9 +215,9 @@ class TrackedPoolApiTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200, second.body)
         self.assertEqual(second.json()["created_count"], 0)
 
-        got = _api_request(self.app, "GET", "/v1/tracked-companies")
+        got_items = _list_all_tracked(self.app)
         row = {
-            item["security_code"]: item for item in got.json()["items"]
+            item["security_code"]: item for item in got_items
         }[self.code_override]
         self.assertIsNone(row["lookback_days"])
         self.assertIsNone(row["process_classes"])
@@ -229,8 +248,9 @@ class TrackedPoolApiTests(unittest.TestCase):
         self.assertEqual(payload["security_code"], self.code_override)
         self.assertEqual(payload["documents_retained"], 0)
 
-        got = _api_request(self.app, "GET", "/v1/tracked-companies")
-        codes = {item["security_code"] for item in got.json()["items"]}
+        codes = {
+            item["security_code"] for item in _list_all_tracked(self.app)
+        }
         self.assertNotIn(self.code_override, codes)
         # Ledger rows (company + security) survive the pool removal.
         with self.engine.connect() as conn:

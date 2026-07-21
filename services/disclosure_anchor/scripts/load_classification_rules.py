@@ -117,6 +117,17 @@ def main() -> int:
             ),
             rows,
         )
+    # Materialized classification (0027): reloading rules must leave no
+    # stale rows behind, or the 0017 "load-rules -> current everywhere"
+    # contract dies. Batched keyset refresh, seconds at 100k documents.
+    from disclosure_anchor.adapters.db.postgres.classification_refresh import (
+        refresh_stale_documents,
+    )
+
+    with engine.begin() as conn:
+        refreshed = refresh_stale_documents(conn)
+    print(f"refreshed materialized classification on {refreshed} documents")
+
     counts = {"class": 0, "facet": 0, "title": 0, "title_topic": 0, "title_noise": 0}
     for row in rows:
         counts[str(row["rule_set"])] += 1

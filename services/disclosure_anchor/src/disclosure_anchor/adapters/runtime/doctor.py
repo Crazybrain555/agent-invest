@@ -577,6 +577,35 @@ def _database_catalog_checks(engine: Engine) -> list[CheckResult]:
 def _database_consistency_checks(settings: Settings, engine: Engine) -> list[CheckResult]:
     checks: list[CheckResult] = []
     with engine.connect() as conn:
+        # Repeated full-corpus rebuilds replace every asset_id, and a
+        # per-round-bounded delta can then never refill the projection — it
+        # sat at 0.04% coverage for days with every check green (2026-07-21).
+        # Search is only as alive as this ratio.
+        active_units = conn.execute(
+            text(
+                f"SELECT count(*) FROM {CORE_SCHEMA}.document_unit u "
+                f"JOIN {CORE_SCHEMA}.processing_run r "
+                "ON r.processing_run_id = u.processing_run_id WHERE r.is_active"
+            )
+        ).scalar() or 0
+        projected = conn.execute(
+            text(f"SELECT count(*) FROM {CORE_SCHEMA}.unit_search_projection")
+        ).scalar() or 0
+        if active_units:
+            coverage = projected / active_units
+            detail = (
+                f"projection rows={projected} active units={active_units} "
+                f"({coverage:.1%})"
+            )
+            checks.append(
+                _pass("search projection coverage", detail)
+                if coverage >= 0.95
+                else _warn(
+                    "search projection coverage",
+                    detail + " — run make rebuild-search-projection ALL=YES",
+                )
+            )
+
         duplicate_active = conn.execute(
             text(
                 f"SELECT document_id, count(*) FROM {CORE_SCHEMA}.processing_run "
