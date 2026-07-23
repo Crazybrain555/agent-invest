@@ -74,7 +74,7 @@
   },
   "tests/integration/test_search_projection.py": {
    "private_imports": [],
-   "tests": 3
+   "tests": 4
   },
   "tests/integration/test_tracked_pool_api.py": {
    "private_imports": [
@@ -298,7 +298,7 @@
    "private_imports": [
     "_sync_window_start"
    ],
-   "tests": 35
+   "tests": 36
   }
  },
  "schema": "test-composition-ledger.v1"

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import sqlalchemy
@@ -193,6 +194,44 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
             result = BuildSearchProjection(engine=self.engine).execute(
                 BuildSearchProjectionCommand(full=True)
             )
+            self.assertEqual(result.deleted, 2)
+            self.assertEqual(self._projection_count(), 0)
+        finally:
+            self._cleanup(ids)
+
+    def test_delta_drains_unbounded_and_prunes_orphans(self) -> None:
+        # Delta is the worker's per-round path: it must drain every missing
+        # unit without a cap (a borrowed document-scale constant once starved
+        # it to 48% live coverage) and prune deactivated runs' rows without
+        # waiting for a full rebuild, because the public search view reads
+        # the projection bare (no is_active join).
+        suffix = os.urandom(4).hex()
+        ids = self._seed_two_units(suffix)
+        try:
+            # _BATCH_SIZE=1 forces the keyset loop through multiple batches
+            # (select -> upsert -> commit -> cursor advance -> terminal empty
+            # select), so the unbounded drain path is exercised end to end
+            # rather than fitting a single batch.
+            with mock.patch.object(BuildSearchProjection, "_BATCH_SIZE", 1):
+                result = BuildSearchProjection(engine=self.engine).execute(
+                    BuildSearchProjectionCommand(full=False)
+                )
+            self.assertEqual(result.projected, 2)
+            self.assertEqual(result.skipped, 0)
+            self.assertEqual(self._projection_count(), 2)
+
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE disclosure_core.processing_run "
+                        "SET is_active = false WHERE processing_run_id = :rid"
+                    ),
+                    {"rid": ids["run"]},
+                )
+            result = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False)
+            )
+            self.assertEqual(result.projected, 0)
             self.assertEqual(result.deleted, 2)
             self.assertEqual(self._projection_count(), 0)
         finally:

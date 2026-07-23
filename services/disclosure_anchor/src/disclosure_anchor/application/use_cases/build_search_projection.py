@@ -20,7 +20,7 @@ linearization and ``header_row_candidate`` rules are testable without a DB.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import re
@@ -69,9 +69,13 @@ _UPDATE_COLUMNS = (
 class BuildSearchProjectionCommand:
     # full=False is the incremental default (CLI default; worker always delta).
     full: bool = False
-    # Upper bound on rows projected this call (worker passes the publish
-    # batch limit; CLI leaves it unbounded). Honored in both modes; the
-    # remainder is reported as ``skipped``.
+    # Upper bound on rows projected this call. None (the worker and CLI
+    # default) drains everything the delta finds: maintenance work must be
+    # proportional to new/changed units, never capped by a fixed constant —
+    # a borrowed document-scale limit once starved this unit-scale rebuild
+    # to 48% search coverage (2026-07-23). A bound remains available for
+    # explicitly time-boxed invocations; the remainder is reported as
+    # ``skipped``.
     limit: int | None = None
 
 
@@ -102,17 +106,28 @@ class BuildSearchProjection:
     # concurrent publish are picked up by the next delta round, and the
     # doctor coverage check alerts if that ever stops converging.
     _BATCH_SIZE = 2000
+    # Orphan ids fetched per anti-join scan: bounds Python memory to a few MB
+    # even when a rules-bump corpus rebuild deactivates runs corpus-wide
+    # (orphan waves at unit scale), while the steady state pays one probe.
+    _ORPHAN_SCAN_LIMIT = 50_000
 
     def execute(
-        self, command: BuildSearchProjectionCommand
+        self,
+        command: BuildSearchProjectionCommand,
+        *,
+        should_stop: Callable[[], bool] | None = None,
     ) -> BuildSearchProjectionResult:
         built_at = datetime.now(timezone.utc)
         projected = 0
         skipped = 0
         remaining = command.limit
         cursor: str | None = None
+
+        def stop_requested() -> bool:
+            return should_stop is not None and should_stop()
+
         with Session(self._engine) as session:
-            while True:
+            while not stop_requested():
                 batch_cap = self._BATCH_SIZE
                 if remaining is not None:
                     batch_cap = min(batch_cap, remaining)
@@ -134,8 +149,13 @@ class BuildSearchProjection:
                 cursor = asset_ids[-1]
                 if remaining is not None:
                     remaining -= len(asset_ids)
-            deleted = self._delete_orphans(session) if command.full else 0
-            session.commit()
+            # Orphan pruning runs in BOTH modes: units leave the active set
+            # whenever a re-parse or supersede deactivates their run, which
+            # happens continuously, not only around full rebuilds. The public
+            # search view is a bare projection read (no is_active join), so
+            # rows left behind would keep serving superseded units until the
+            # next full rebuild.
+            deleted = self._delete_orphans(session, should_stop=should_stop)
         return BuildSearchProjectionResult(
             projected=projected, deleted=deleted, skipped=skipped
         )
@@ -196,7 +216,21 @@ class BuildSearchProjection:
             projected += len(batch)
         return projected
 
-    def _delete_orphans(self, session: Session) -> int:
+    def _delete_orphans(
+        self, session: Session, *, should_stop: Callable[[], bool] | None = None
+    ) -> int:
+        """Prune projection rows whose unit left the active set — batched.
+
+        Design §5 applies to the delete too: a rules-bump corpus rebuild
+        deactivates old runs corpus-wide, so the orphan set can reach unit
+        scale in one wave. One unbatched DELETE would ride a single giant
+        transaction (WAL spike, long row locks); instead fetch ids in bounded
+        scans and delete in ``_BATCH_SIZE`` chunks with a commit per chunk.
+        Deleting a live unit's row is impossible to make permanent: each
+        chunk deletes only ids the committed snapshot saw as inactive, and
+        any row racing back to active is re-added by the next delta pass.
+        """
+
         active_asset_ids = (
             select(DocumentUnit.asset_id)
             .join(
@@ -205,16 +239,36 @@ class BuildSearchProjection:
             )
             .where(ProcessingRun.is_active.is_(True))
         )
-        # Route DML through the session's transactional connection: its
-        # ``CursorResult.rowcount`` is the orphan-prune count (the ORM
-        # ``Session.execute`` return type does not expose rowcount). The delete
-        # commits with the session like every upsert above.
-        result = session.connection().execute(
-            delete(UnitSearchProjection).where(
-                UnitSearchProjection.asset_id.not_in(active_asset_ids)
+        deleted = 0
+        while True:
+            orphan_ids = list(
+                session.execute(
+                    select(UnitSearchProjection.asset_id)
+                    .where(UnitSearchProjection.asset_id.not_in(active_asset_ids))
+                    .order_by(UnitSearchProjection.asset_id)
+                    .limit(self._ORPHAN_SCAN_LIMIT)
+                ).scalars()
             )
-        )
-        return int(result.rowcount or 0)
+            if not orphan_ids:
+                return deleted
+            for start in range(0, len(orphan_ids), self._BATCH_SIZE):
+                if should_stop is not None and should_stop():
+                    return deleted
+                chunk = orphan_ids[start : start + self._BATCH_SIZE]
+                # Route DML through the session's transactional connection:
+                # its ``CursorResult.rowcount`` is the prune count (the ORM
+                # ``Session.execute`` return type does not expose rowcount).
+                result = session.connection().execute(
+                    delete(UnitSearchProjection).where(
+                        UnitSearchProjection.asset_id.in_(chunk)
+                    )
+                )
+                deleted += int(result.rowcount or 0)
+                session.commit()
+            if len(orphan_ids) < self._ORPHAN_SCAN_LIMIT:
+                return deleted
+            if should_stop is not None and should_stop():
+                return deleted
 
 
 def _load_units(session: Session, asset_ids: Sequence[str]) -> list[dict[str, Any]]:

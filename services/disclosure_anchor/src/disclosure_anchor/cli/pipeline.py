@@ -181,13 +181,13 @@ def _parser() -> argparse.ArgumentParser:
     rebuild_projection = subparsers.add_parser(
         "rebuild-search-projection",
         help="rebuild the 06R derived search projection (delta by default; "
-        "--all recomputes every active-run unit and prunes orphans)",
+        "both modes prune orphans; --all recomputes every active-run unit)",
     )
     rebuild_projection.add_argument(
         "--all",
         dest="full",
         action="store_true",
-        help="full rebuild (default: incremental — only missing/stale rows)",
+        help="full rebuild (default: incremental — missing/stale rows only)",
     )
 
     process = subparsers.add_parser("process")

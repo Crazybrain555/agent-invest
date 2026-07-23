@@ -76,3 +76,23 @@ delta 同构，delta 由版本列索引直达。孤儿删除同样分批。用�
 迁移往返（upgrade/downgrade）绿；存量回填后**新列与旧 LATERAL 全库逐行
 等价断言**；四条热路径复测延迟（目标：latest_filings < 100ms）；全量源身份
 重放审计零发现；`make agent-check` + §4 独立复审。
+
+## 8.1 §5 修订（2026-07-23，投影饱和事故）
+
+§5 的「delta 由版本列索引直达」隐含假设 worker 每轮的 delta 上限足够覆盖新增；
+实际 `_project_stage` 借用了 `WORKER_BATCH_PUBLISH`（=10，文档尺度）作单元尺度上限，
+每轮只重建 10 个单元，与解析产出差约 170×。覆盖率自上次全量重建后单调衰减至 48%
+（活跃 1,755,455 vs 投影 846,495；缺口 908,960 全为完全缺失），doctor 告警按设计触发，
+但 delta 自身无自愈能力。
+
+修订采纳的不变量（对标 Discourse write-through+版本 rebake / GitLab ES 事件队列 /
+Zulip tsvector 触发器的共同形态）：**索引维护量与新增/变更内容成比例，禁止与任何
+固定常数或语料规模挂钩**。落地：
+
+- worker 每轮 delta **全排空**（`limit=None`；keyset 分批+逐批提交机制不变），追平后
+  每轮工作量自动等于该轮新发布单元数；
+- 孤儿清理从仅 full 扩展到**每轮**：`unit_search_projection_v1` 是裸投影读
+  （无 is_active join），滞留行会持续服务被替代 run 的单元；
+- 否决方案：调大常数（结构性复发）；
+- 缓做方案（带触发指标）：发布时 write-through（事件供给、零扫描）。当前 delta 空探测
+  ~2.9s@85 万行，随语料线性增长；**超过 ~30s/轮时启动该设计**（约 10M+ 单元）。

@@ -378,10 +378,15 @@ def run_once(
     ):
         _publish_stage(report, deps, limit=limits.publish, should_stop=should_stop)
     if limits.publish > 0 and not should_stop():
-        # Derived retrieval projection (U7): delta rebuild bounded by the publish
-        # batch limit. It reads active-run units and writes only the projection
-        # table, so it is isolated from and never blocks the publish chain.
-        _project_stage(report, deps, limit=limits.publish)
+        # Derived retrieval projection (U7): drain the whole delta every
+        # round. Index maintenance must be proportional to NEW units, never
+        # capped by an unrelated constant — the publish batch limit (10,
+        # document-scale) once bounded this unit-scale rebuild, so the
+        # projection fell ~170x behind parse and search coverage decayed to
+        # 48% while every round reported success (2026-07-23). The use case
+        # keyset-batches with a commit per batch, so an unbounded drain
+        # never rides one giant transaction.
+        _project_stage(report, deps, should_stop=should_stop)
 
     report.duration_seconds = (deps.clock() - started_at).total_seconds()
     return report
@@ -1138,19 +1143,25 @@ def _project_stage(
     report: WorkerReport,
     deps: WorkerDeps,
     *,
-    limit: int,
+    should_stop: Callable[[], bool],
 ) -> None:
-    """Delta-rebuild the derived search projection (08 + 06R §5).
+    """Drain the search-projection delta for this round (08 + 06R §5).
 
-    Failure-isolated like every other stage: a projection fault lands in the
-    failure list under stage='project' and the round still completes. The
-    projection is derived and regenerable, so a skipped round self-heals on the
-    next delta pass or a CLI full rebuild.
+    Unbounded on purpose: the delta anti-join selects exactly the units the
+    projection is missing (or stamped with an older retrieval-rules version),
+    so once caught up the per-round work equals that round's newly published
+    units. The stop signal is honored between batches, so a shutdown during
+    a large catch-up drain yields within seconds and the committed batches
+    resume next round. Failure-isolated like every other stage: a projection
+    fault lands in the failure list under stage='project' and the round still
+    completes. The projection is derived and regenerable, so a skipped round
+    self-heals on the next round's drain or a CLI rebuild.
     """
 
     try:
         result = BuildSearchProjection(engine=deps.engine).execute(
-            BuildSearchProjectionCommand(full=False, limit=limit)
+            BuildSearchProjectionCommand(full=False, limit=None),
+            should_stop=should_stop,
         )
     except Exception as exc:
         report.failed += 1

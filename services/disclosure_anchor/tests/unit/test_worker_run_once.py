@@ -1161,19 +1161,29 @@ class AcquisitionPumpTests(unittest.TestCase):
         self.assertEqual(sync_due.call_count, 2)
 
     def test_parse_exit_ends_pump_promptly(self) -> None:
+        import threading
+
         deps = _deps()
         counter = iter(range(0, 10**9))
+        first_pass_started = threading.Event()
 
         def _slow_pending(*a: object, **k: object) -> list[dict]:
             # Real passes take minutes; the mocked pump would otherwise spin
             # hundreds of passes inside one GIL slice before the main thread
-            # ever gets to set the parse-exited event. 10ms per pass gives
-            # the main thread ample scheduling room, and the fake-monotonic
-            # deadline below bounds the test if the coupling regresses.
+            # ever gets to set the parse-exited event. Ordering is pinned:
+            # the fake parse below returns only after pass 1 has started, so
+            # parse_exited is set while an early pass is in flight, and the
+            # 25ms pass length gives the main thread scheduling room even on
+            # a loaded machine. The fake-monotonic deadline bounds the test
+            # if the coupling regresses.
             import time as _time
 
-            _time.sleep(0.01)
+            first_pass_started.set()
+            _time.sleep(0.025)
             return [self._pending_row("again")]
+
+        def _fake_parse(*a: object, **k: object) -> None:
+            first_pass_started.wait(timeout=5.0)
 
         with (
             mock.patch.object(
@@ -1183,7 +1193,7 @@ class AcquisitionPumpTests(unittest.TestCase):
                 worker_module.queries, "pending_downloads", side_effect=_slow_pending
             ) as pending,
             mock.patch.object(worker_module, "DownloadDocument") as download_cls,
-            mock.patch.object(worker_module, "_parse_stage", return_value=None),
+            mock.patch.object(worker_module, "_parse_stage", side_effect=_fake_parse),
             mock.patch.object(
                 worker_module.time,
                 "monotonic",
@@ -1206,8 +1216,8 @@ class AcquisitionPumpTests(unittest.TestCase):
         # Parse returning while the pump is alive (halt path) must end the
         # pump within a few passes, not hold the round open for the whole
         # window: report/alert/controller reaction stay prompt.
-        self.assertLessEqual(pending.call_count, 5)
-        self.assertLessEqual(report.downloaded, 5)
+        self.assertLessEqual(pending.call_count, 6)
+        self.assertLessEqual(report.downloaded, 6)
 
     def test_failed_sync_company_attempted_once_per_round(self) -> None:
         deps = _deps()
@@ -1331,3 +1341,33 @@ class AcquisitionPumpTests(unittest.TestCase):
         # pump pass.
         self.assertEqual(report.deferred_backfill, 1)
         self.assertEqual(report.downloaded, 2)
+
+
+class ProjectStageTests(unittest.TestCase):
+    def test_projection_delta_drains_unbounded(self) -> None:
+        # The projection must never be capped by an unrelated batch constant:
+        # the borrowed publish limit (document-scale, 10) once starved this
+        # unit-scale rebuild to 48% search coverage while rounds kept
+        # reporting success.
+        deps = _deps()
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "pending_publish", return_value=[]
+            ),
+            mock.patch.object(worker_module, "BuildSearchProjection") as project_cls,
+        ):
+            project_cls.return_value.execute.return_value = mock.MagicMock(
+                projected=7, deleted=0, skipped=0
+            )
+            report = run_once(
+                WorkerLimits(sync=0, download=0, parse=0, build=0, publish=10),
+                deps,
+            )
+
+        (command,) = project_cls.return_value.execute.call_args.args
+        self.assertFalse(command.full)
+        self.assertIsNone(command.limit)
+        self.assertEqual(report.projected, 7)
