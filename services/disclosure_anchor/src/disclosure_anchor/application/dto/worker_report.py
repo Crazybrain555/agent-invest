@@ -15,6 +15,12 @@ class WorkerLimits:
     build: int
     publish: int
     sync_stage_seconds: int = 300
+    # Acquisition pump window: sync+download passes repeat inside the round
+    # for up to this many seconds (progress-gated), so long parse batches no
+    # longer cap acquisition at one pass per round. <= 0 = single pass; the
+    # conservative DTO default keeps direct constructions (tests) on the
+    # legacy single-pass shape — production wires WORKER_ACQUISITION_SECONDS.
+    acquisition_seconds: int = 0
 
 
 @dataclass(frozen=True)

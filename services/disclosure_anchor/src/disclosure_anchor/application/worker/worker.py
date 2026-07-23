@@ -222,59 +222,125 @@ def run_once(
     # sequential after both: they consume this round's parse outputs.
     acquisition = WorkerReport(started_at=started_at)
 
+    # "Parse stage returned" gates whether the pump starts ANOTHER pass, not
+    # the work inside a pass already in flight. While the pump is alive,
+    # _parse_stage returns only on halt or hard stop (its normal drain exits
+    # require the pump to be dead first), so a parse return means the parser
+    # is down: finish the current acquisition pass, then close the round.
+    # Without this a dead parser (GPU outage) left run_once blocked in join
+    # for the whole acquisition window, deferring the round report, the
+    # operator alert, and the controller's parse cooldown by up to an hour.
+    # It must NOT short-circuit the first pass's sync/download — a fast/empty
+    # parse queue finishing before the acquisition thread's first pass would
+    # otherwise skip acquisition entirely (legacy single-pass regression).
+    parse_exited = threading.Event()
+
     def _acquisition_stages() -> None:
+        # Pump loop, symmetric to the parse stage's continuous re-dequeue:
+        # sync and download passes repeat inside the round until the
+        # acquisition window closes or a full pass makes no successful
+        # progress. Before this, acquisition ran exactly once per round, so
+        # a single heavy parse batch (annual-report cohorts run for hours)
+        # capped downloads at one batch per multi-hour round — measurably
+        # below the parse rate, draining the raw-file buffer toward a GPU
+        # stall. acquisition_seconds <= 0 keeps the legacy single pass.
         source: DisclosureSourcePort | None = None
+        deadline = time.monotonic() + limits.acquisition_seconds
+
+        def stop_acquiring() -> bool:
+            # Loop-continuation gate only (see parse_exited note above);
+            # in-pass work uses should_stop (the hard SIGTERM/SIGINT signal).
+            return should_stop() or parse_exited.is_set()
+
+        # One sync attempt per company per round: sync failures cool down
+        # for only 60s (fair due rotation), so without this a company whose
+        # sync keeps failing would be re-attempted every ~60s for as long
+        # as download progress keeps the pump alive. Deferred-backfill
+        # companies are likewise counted once, not once per pass.
+        attempted_sync: set[str] = set()
         try:
-            try:
-                if limits.sync > 0 and not should_stop():
-                    source = _sync_stage(
-                        acquisition,
-                        deps,
-                        source,
-                        limit=limits.sync,
-                        stage_seconds=limits.sync_stage_seconds,
-                        should_stop=should_stop,
+            while True:
+                synced_before = acquisition.synced_companies
+                downloaded_before = acquisition.downloaded
+                try:
+                    if (
+                        limits.sync > 0
+                        and not acquisition.sync_rate_limited
+                        and not should_stop()
+                    ):
+                        source = _sync_stage(
+                            acquisition,
+                            deps,
+                            source,
+                            limit=limits.sync,
+                            stage_seconds=limits.sync_stage_seconds,
+                            should_stop=should_stop,
+                            attempted=attempted_sync,
+                        )
+                    if (
+                        limits.download > 0
+                        and not acquisition.sync_quota_break
+                        and not acquisition.source_outage_break
+                        and not should_stop()
+                    ):
+                        source = _download_stage(
+                            acquisition,
+                            deps,
+                            source,
+                            limit=limits.download,
+                            should_stop=should_stop,
+                        )
+                except DisclosureAnchorError as exc:
+                    # Provider family (credentials, CNINFO HTTP, token): pause
+                    # acquisition this round; parse/build/publish continue.
+                    acquisition.failed += 1
+                    acquisition.source_outage_break = True
+                    acquisition.failures.append(
+                        WorkerFailure(
+                            stage="source",
+                            item_ref="cninfo",
+                            error_code=type(exc).__name__,
+                            message=str(exc)[:500],
+                        )
+                    )
+                except Exception as exc:
+                    # Local failure (queue-read SQL, programming error): still
+                    # stage-isolated, but it is NOT a provider outage — tagging
+                    # it as one disguised local DB faults as CNINFO downtime
+                    # and triggered the wrong backoff (round23).
+                    acquisition.failed += 1
+                    acquisition.failures.append(
+                        WorkerFailure(
+                            stage="source_local",
+                            item_ref="worker",
+                            error_code=type(exc).__name__,
+                            message=str(exc)[:500],
+                        )
                     )
                 if (
-                    limits.download > 0
-                    and not acquisition.sync_quota_break
-                    and not acquisition.source_outage_break
-                    and not should_stop()
+                    stop_acquiring()
+                    or acquisition.sync_quota_break
+                    or acquisition.source_outage_break
                 ):
-                    source = _download_stage(
-                        acquisition,
-                        deps,
-                        source,
-                        limit=limits.download,
-                        should_stop=should_stop,
-                    )
-            except DisclosureAnchorError as exc:
-                # Provider family (credentials, CNINFO HTTP, token): pause
-                # acquisition this round; parse/build/publish continue.
-                acquisition.failed += 1
-                acquisition.source_outage_break = True
-                acquisition.failures.append(
-                    WorkerFailure(
-                        stage="source",
-                        item_ref="cninfo",
-                        error_code=type(exc).__name__,
-                        message=str(exc)[:500],
-                    )
-                )
-            except Exception as exc:
-                # Local failure (queue-read SQL, programming error): still
-                # stage-isolated, but it is NOT a provider outage — tagging it
-                # as one disguised local DB faults as CNINFO downtime and
-                # triggered the wrong backoff (round23).
-                acquisition.failed += 1
-                acquisition.failures.append(
-                    WorkerFailure(
-                        stage="source_local",
-                        item_ref="worker",
-                        error_code=type(exc).__name__,
-                        message=str(exc)[:500],
-                    )
-                )
+                    return
+                if limits.acquisition_seconds <= 0:
+                    return
+                if time.monotonic() >= deadline:
+                    # Window closed: stop starting new passes (a pass in
+                    # flight already finished — the window bounds pass starts,
+                    # not a hard abort), so the parse stage can drain its tail
+                    # and the round can report/observe on a bounded cadence.
+                    return
+                if (
+                    acquisition.synced_companies == synced_before
+                    and acquisition.downloaded == downloaded_before
+                ):
+                    # No successful progress this pass: both queues are idle
+                    # or every remaining item failed. Ending the round's
+                    # acquisition here (instead of hot-retrying the same
+                    # items) leaves them due/pending for the next round with
+                    # their retry accounting intact.
+                    return
         finally:
             close = getattr(source, "close", None)
             if deps.source_close_after_round and callable(close):
@@ -286,13 +352,16 @@ def run_once(
     acquisition_thread.start()
     try:
         if limits.parse > 0 and not should_stop():
-            _parse_stage(
-                report,
-                deps,
-                limit=limits.parse,
-                should_stop=should_stop,
-                keep_feeding=acquisition_thread.is_alive,
-            )
+            try:
+                _parse_stage(
+                    report,
+                    deps,
+                    limit=limits.parse,
+                    should_stop=should_stop,
+                    keep_feeding=acquisition_thread.is_alive,
+                )
+            finally:
+                parse_exited.set()
     finally:
         acquisition_thread.join()
     _merge_acquisition_report(report, acquisition)
@@ -326,11 +395,16 @@ def _sync_stage(
     limit: int,
     stage_seconds: int,
     should_stop: Callable[[], bool],
+    attempted: set[str] | None = None,
 ) -> DisclosureSourcePort | None:
     with deps.engine.connect() as conn:
         due = queries.sync_due(
             conn, interval_seconds=deps.config.sync_interval_seconds, limit=limit
         )
+    if attempted is not None:
+        due = [
+            row for row in due if str(row.get("company_id")) not in attempted
+        ]
     if not due:
         return source
     source = source or deps.source_factory()
@@ -349,6 +423,10 @@ def _sync_stage(
             # Time-boxed: yield to download/parse so no stage starves; the
             # remaining companies stay due for the next round.
             return source
+        if attempted is not None:
+            # Companies the stage never reached stay out of the set, so a
+            # later pass in the same round still picks them up.
+            attempted.add(str(row.get("company_id")))
         security_code = row.get("security_code")
         exchange = row.get("exchange")
         if not security_code or not exchange:

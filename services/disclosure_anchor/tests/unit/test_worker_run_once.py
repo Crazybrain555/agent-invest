@@ -868,3 +868,466 @@ class SyncStageProtectionTests(unittest.TestCase):
         self.assertEqual(report.synced_companies, 1)
         self.assertEqual(report.deferred_backfill, 2)
         self.assertEqual(pending_count.call_count, 1)
+
+
+class AcquisitionPumpTests(unittest.TestCase):
+    """Round-internal sync+download pump (progress-gated, window-bounded)."""
+
+    @staticmethod
+    def _ok_download() -> mock.MagicMock:
+        return mock.MagicMock(
+            document_id="doc_pump",
+            error_code=None,
+            retryable=None,
+            quarantine_reason=None,
+        )
+
+    @staticmethod
+    def _pending_row(pdid: str) -> dict:
+        return {
+            "provider_document_id": pdid,
+            "candidate": {"provider_document_id": pdid},
+        }
+
+    def test_pump_repeats_download_batches_until_queue_drains(self) -> None:
+        deps = _deps()
+        batches = [
+            [self._pending_row("1")],
+            [self._pending_row("2")],
+            [],
+        ]
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "pending_downloads", side_effect=batches
+            ) as pending,
+            mock.patch.object(worker_module, "DownloadDocument") as download_cls,
+        ):
+            download_cls.return_value.execute.return_value = self._ok_download()
+            report = run_once(
+                WorkerLimits(
+                    sync=0,
+                    download=1,
+                    parse=0,
+                    build=0,
+                    publish=0,
+                    acquisition_seconds=3600,
+                ),
+                deps,
+            )
+
+        # Two productive passes, then the empty pass ends the pump early —
+        # the window deadline is a bound, not a hold-open.
+        self.assertEqual(report.downloaded, 2)
+        self.assertEqual(pending.call_count, 3)
+
+    def test_zero_window_keeps_legacy_single_pass(self) -> None:
+        deps = _deps()
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "pending_downloads",
+                return_value=[self._pending_row("1")],
+            ) as pending,
+            mock.patch.object(worker_module, "DownloadDocument") as download_cls,
+        ):
+            download_cls.return_value.execute.return_value = self._ok_download()
+            report = run_once(
+                WorkerLimits(sync=0, download=1, parse=0, build=0, publish=0),
+                deps,
+            )
+
+        self.assertEqual(report.downloaded, 1)
+        self.assertEqual(pending.call_count, 1)
+
+    def test_rate_limited_sync_skipped_while_download_pump_continues(self) -> None:
+        class _Rate(Exception):
+            error_code = "rate_limited"
+
+        deps = _deps()
+        due = [
+            {
+                "tracked_company_id": "tc_pump",
+                "company_id": "co_pump",
+                "security_id": "sec_pump",
+                "security_code": "000001",
+                "exchange": "SZSE",
+                "window_end": "2026-07-01",
+            }
+        ]
+        batches = [[self._pending_row("1")], []]
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "sync_due", return_value=due
+            ) as sync_due,
+            mock.patch.object(
+                worker_module.queries, "pending_downloads", side_effect=batches
+            ) as pending,
+            mock.patch.object(worker_module, "SyncDisclosureIndex") as sync_cls,
+            mock.patch.object(worker_module, "DownloadDocument") as download_cls,
+        ):
+            sync_cls.return_value.execute.side_effect = _Rate("slow down")
+            download_cls.return_value.execute.return_value = self._ok_download()
+            report = run_once(
+                WorkerLimits(
+                    sync=1,
+                    download=1,
+                    parse=0,
+                    build=0,
+                    publish=0,
+                    acquisition_seconds=3600,
+                ),
+                deps,
+            )
+
+        # Pass 1 trips the rate limit; pass 2 must not touch CNINFO sync
+        # again this round, while the download pump keeps going.
+        self.assertTrue(report.sync_rate_limited)
+        self.assertEqual(sync_due.call_count, 1)
+        sync_cls.return_value.execute.assert_called_once()
+        self.assertEqual(report.downloaded, 1)
+        self.assertEqual(pending.call_count, 2)
+
+    def test_window_deadline_bounds_pump_despite_endless_supply(self) -> None:
+        deps = _deps()
+        counter = iter(range(0, 10**9, 100))
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "pending_downloads",
+                side_effect=lambda *a, **k: [self._pending_row("again")],
+            ) as pending,
+            mock.patch.object(worker_module, "DownloadDocument") as download_cls,
+            mock.patch.object(
+                worker_module.time,
+                "monotonic",
+                side_effect=lambda: float(next(counter)),
+            ),
+        ):
+            download_cls.return_value.execute.return_value = self._ok_download()
+            report = run_once(
+                WorkerLimits(
+                    sync=0,
+                    download=1,
+                    parse=0,
+                    build=0,
+                    publish=0,
+                    acquisition_seconds=150,
+                ),
+                deps,
+            )
+
+        # monotonic advances 100s per call and the window is 150s: the pump
+        # must stop after very few passes even though the queue never dries.
+        self.assertLess(pending.call_count, 4)
+        self.assertGreaterEqual(report.downloaded, 1)
+
+    def test_failures_only_download_pass_ends_pump(self) -> None:
+        deps = _deps()
+        failed = mock.MagicMock(
+            document_id=None,
+            error_code="download_failed",
+            retryable=False,
+            quarantine_reason=None,
+        )
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "pending_downloads",
+                side_effect=lambda *a, **k: [self._pending_row("stuck")],
+            ) as pending,
+            mock.patch.object(worker_module, "DownloadDocument") as download_cls,
+        ):
+            download_cls.return_value.execute.return_value = failed
+            report = run_once(
+                WorkerLimits(
+                    sync=0,
+                    download=1,
+                    parse=0,
+                    build=0,
+                    publish=0,
+                    acquisition_seconds=3600,
+                ),
+                deps,
+            )
+
+        # Failures are not progress: one pass, then the item stays pending
+        # for the next round with its retry accounting intact.
+        self.assertEqual(report.downloaded, 0)
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(pending.call_count, 1)
+
+    def test_outage_after_same_pass_progress_ends_pump(self) -> None:
+        deps = _deps()
+        outage = mock.MagicMock(
+            document_id=None,
+            error_code="transport_error",
+            retryable=True,
+            quarantine_reason=None,
+        )
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "pending_downloads",
+                side_effect=lambda *a, **k: [
+                    self._pending_row("ok"),
+                    self._pending_row("boom"),
+                ],
+            ) as pending,
+            mock.patch.object(worker_module, "DownloadDocument") as download_cls,
+        ):
+            download_cls.return_value.execute.side_effect = [
+                self._ok_download(),
+                outage,
+            ]
+            report = run_once(
+                WorkerLimits(
+                    sync=0,
+                    download=2,
+                    parse=0,
+                    build=0,
+                    publish=0,
+                    acquisition_seconds=3600,
+                ),
+                deps,
+            )
+
+        # Progress in the same pass must not outvote the outage breaker.
+        self.assertTrue(report.source_outage_break)
+        self.assertEqual(report.downloaded, 1)
+        self.assertEqual(pending.call_count, 1)
+
+    def test_sync_progress_alone_keeps_pumping(self) -> None:
+        deps = _deps()
+        due_batches = [
+            [
+                {
+                    "tracked_company_id": "tc_only",
+                    "company_id": "co_only",
+                    "security_id": "sec_only",
+                    "security_code": "000001",
+                    "exchange": "SZSE",
+                    "window_end": "2026-07-01",
+                }
+            ],
+            [],
+        ]
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "sync_due", side_effect=due_batches
+            ) as sync_due,
+            mock.patch.object(
+                worker_module.queries, "pending_downloads", return_value=[]
+            ),
+            mock.patch.object(worker_module, "SyncDisclosureIndex") as sync_cls,
+        ):
+            sync_cls.return_value.execute.return_value = mock.MagicMock(
+                candidate_count=1
+            )
+            report = run_once(
+                WorkerLimits(
+                    sync=1,
+                    download=1,
+                    parse=0,
+                    build=0,
+                    publish=0,
+                    acquisition_seconds=3600,
+                ),
+                deps,
+            )
+
+        # Sync-only progress keeps the pump alive for another pass.
+        self.assertEqual(report.synced_companies, 1)
+        self.assertEqual(sync_due.call_count, 2)
+
+    def test_parse_exit_ends_pump_promptly(self) -> None:
+        deps = _deps()
+        counter = iter(range(0, 10**9))
+
+        def _slow_pending(*a: object, **k: object) -> list[dict]:
+            # Real passes take minutes; the mocked pump would otherwise spin
+            # hundreds of passes inside one GIL slice before the main thread
+            # ever gets to set the parse-exited event. 10ms per pass gives
+            # the main thread ample scheduling room, and the fake-monotonic
+            # deadline below bounds the test if the coupling regresses.
+            import time as _time
+
+            _time.sleep(0.01)
+            return [self._pending_row("again")]
+
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "pending_downloads", side_effect=_slow_pending
+            ) as pending,
+            mock.patch.object(worker_module, "DownloadDocument") as download_cls,
+            mock.patch.object(worker_module, "_parse_stage", return_value=None),
+            mock.patch.object(
+                worker_module.time,
+                "monotonic",
+                side_effect=lambda: float(next(counter)),
+            ),
+        ):
+            download_cls.return_value.execute.return_value = self._ok_download()
+            report = run_once(
+                WorkerLimits(
+                    sync=0,
+                    download=1,
+                    parse=1,
+                    build=0,
+                    publish=0,
+                    acquisition_seconds=60,
+                ),
+                deps,
+            )
+
+        # Parse returning while the pump is alive (halt path) must end the
+        # pump within a few passes, not hold the round open for the whole
+        # window: report/alert/controller reaction stay prompt.
+        self.assertLessEqual(pending.call_count, 5)
+        self.assertLessEqual(report.downloaded, 5)
+
+    def test_failed_sync_company_attempted_once_per_round(self) -> None:
+        deps = _deps()
+        row = {
+            "tracked_company_id": "tc_flaky",
+            "company_id": "co_flaky",
+            "security_id": "sec_flaky",
+            "security_code": "000001",
+            "exchange": "SZSE",
+            "window_end": "2026-07-01",
+        }
+        download_batches = [
+            [self._pending_row("1")],
+            [self._pending_row("2")],
+            [],
+        ]
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "sync_due",
+                side_effect=lambda *a, **k: [dict(row)],
+            ) as sync_due,
+            mock.patch.object(
+                worker_module.queries,
+                "pending_downloads",
+                side_effect=download_batches,
+            ),
+            mock.patch.object(worker_module, "SyncDisclosureIndex") as sync_cls,
+            mock.patch.object(worker_module, "DownloadDocument") as download_cls,
+        ):
+            sync_cls.return_value.execute.side_effect = RuntimeError("boom")
+            download_cls.return_value.execute.return_value = self._ok_download()
+            report = run_once(
+                WorkerLimits(
+                    sync=1,
+                    download=1,
+                    parse=0,
+                    build=0,
+                    publish=0,
+                    acquisition_seconds=3600,
+                ),
+                deps,
+            )
+
+        # The 60s failure cooldown re-lists the company while downloads keep
+        # the pump alive; the per-round attempted set caps provider-facing
+        # retries at one per round.
+        sync_cls.return_value.execute.assert_called_once()
+        self.assertGreaterEqual(sync_due.call_count, 2)
+        self.assertEqual(report.downloaded, 2)
+
+    def test_deferred_backfill_counted_once_per_round(self) -> None:
+        deps = _deps()
+        object.__setattr__(
+            deps,
+            "config",
+            WorkerConfig(
+                max_parse_retries=3,
+                max_build_retries=3,
+                stale_run_threshold_seconds=3600,
+                sync_interval_seconds=86400,
+                cninfo_overlap_days=7,
+                cninfo_max_retries=3,
+                cninfo_oversized_kb=10240,
+                backfill_max_pending_downloads=2000,
+            ),
+        )
+        row = {
+            "tracked_company_id": "tc_defer",
+            "company_id": "co_defer",
+            "security_id": "sec_defer",
+            "security_code": "000002",
+            "exchange": "SZSE",
+            "window_end": None,
+            "last_synced_at": None,
+        }
+        download_batches = [
+            [self._pending_row("1")],
+            [self._pending_row("2")],
+            [],
+        ]
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "sync_due",
+                side_effect=lambda *a, **k: [dict(row)],
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "pending_processing_backlog_count",
+                return_value=5000,
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "pending_downloads",
+                side_effect=download_batches,
+            ),
+            mock.patch.object(worker_module, "SyncDisclosureIndex"),
+            mock.patch.object(worker_module, "DownloadDocument") as download_cls,
+        ):
+            download_cls.return_value.execute.return_value = self._ok_download()
+            report = run_once(
+                WorkerLimits(
+                    sync=1,
+                    download=1,
+                    parse=0,
+                    build=0,
+                    publish=0,
+                    acquisition_seconds=3600,
+                ),
+                deps,
+            )
+
+        # Saturated-watermark deferral is one fact per round, not one per
+        # pump pass.
+        self.assertEqual(report.deferred_backfill, 1)
+        self.assertEqual(report.downloaded, 2)

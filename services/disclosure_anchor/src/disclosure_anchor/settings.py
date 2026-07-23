@@ -224,6 +224,17 @@ class Settings(BaseSettings):
             "WORKER_SYNC_STAGE_SECONDS", "worker_sync_stage_seconds"
         ),
     )
+    # Acquisition pump window: sync+download passes repeat inside one round
+    # for up to this many seconds (each pass still bounded by the batch
+    # limits and the sync time box; the pump exits early when a full pass
+    # makes no successful progress). 0 restores one pass per round.
+    worker_acquisition_seconds: int = Field(
+        default=3600,
+        ge=0,
+        validation_alias=AliasChoices(
+            "WORKER_ACQUISITION_SECONDS", "worker_acquisition_seconds"
+        ),
+    )
     worker_batch_sync: int = Field(
         default=13,
         ge=0,

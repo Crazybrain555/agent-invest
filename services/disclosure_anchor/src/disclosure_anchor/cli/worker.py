@@ -490,6 +490,7 @@ def _limits(settings: Settings) -> WorkerLimits:
     return WorkerLimits(
         sync=settings.worker_batch_sync,
         sync_stage_seconds=settings.worker_sync_stage_seconds,
+        acquisition_seconds=settings.worker_acquisition_seconds,
         download=settings.worker_batch_download,
         parse=settings.worker_batch_parse,
         build=settings.worker_batch_build,
