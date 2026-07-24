@@ -340,6 +340,31 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
         finally:
             self._cleanup(ids_map)
 
+    def test_clean_delta_round_returns_without_error(self) -> None:
+        # Regression (2026-07-24): the refactor left ``deleted`` unbound on
+        # the quiet delta path — prune gate closed (prune=False, no count
+        # divergence), nothing missing, nothing stale — so the final return
+        # raised UnboundLocalError. Every no-op worker round (published a
+        # fresh doc, no supersede, projection already caught up) hit it.
+        suffix = os.urandom(4).hex()
+        ids_map = self._seed_two_units(suffix)
+        try:
+            first = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False)
+            )
+            self.assertEqual(first.projected, 2)
+            # Second delta with prune disabled: caught up, no orphans, no
+            # stale rows — must return cleanly, doing nothing.
+            second = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False, prune=False)
+            )
+            self.assertEqual(second.projected, 0)
+            self.assertEqual(second.deleted, 0)
+            self.assertEqual(second.skipped, 0)
+            self.assertEqual(self._projection_count(), 2)
+        finally:
+            self._cleanup(ids_map)
+
     # -- seeding / queries / cleanup ---------------------------------------
     def _seed_two_units(self, suffix: str) -> dict[str, str]:
         ids = {

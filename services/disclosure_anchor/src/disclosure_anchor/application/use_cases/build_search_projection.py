@@ -132,6 +132,7 @@ class BuildSearchProjection:
     ) -> BuildSearchProjectionResult:
         built_at = datetime.now(timezone.utc)
         projected = 0
+        deleted = 0
         skipped = 0
         remaining = command.limit
         cursor: str | None = None

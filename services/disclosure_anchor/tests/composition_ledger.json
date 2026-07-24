@@ -74,7 +74,7 @@
   },
   "tests/integration/test_search_projection.py": {
    "private_imports": [],
-   "tests": 7
+   "tests": 8
   },
   "tests/integration/test_tracked_pool_api.py": {
    "private_imports": [
