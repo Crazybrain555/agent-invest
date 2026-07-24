@@ -1371,3 +1371,56 @@ class ProjectStageTests(unittest.TestCase):
         self.assertFalse(command.full)
         self.assertIsNone(command.limit)
         self.assertEqual(report.projected, 7)
+
+    def test_prune_gate_follows_round_deactivations(self) -> None:
+        # The orphan prune is corpus-sized when it has nothing to delete, so
+        # the worker passes it the round's deactivation signal: no publish
+        # deactivated a run -> prune=False.
+        deps = _deps()
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "pending_publish", return_value=[]
+            ),
+            mock.patch.object(worker_module, "BuildSearchProjection") as project_cls,
+        ):
+            project_cls.return_value.execute.return_value = mock.MagicMock(
+                projected=0, deleted=0, skipped=0
+            )
+            run_once(
+                WorkerLimits(sync=0, download=0, parse=0, build=0, publish=10),
+                deps,
+            )
+        (command,) = project_cls.return_value.execute.call_args.args
+        self.assertFalse(command.prune)
+
+    def test_prune_gate_set_when_publish_supersedes(self) -> None:
+        deps = _deps()
+        superseding = mock.MagicMock(
+            status="published", superseded_run_id="run_old"
+        )
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "pending_publish",
+                return_value=[{"processing_run_id": "run_new"}],
+            ),
+            mock.patch.object(worker_module, "PublishRun") as publish_cls,
+            mock.patch.object(worker_module, "BuildSearchProjection") as project_cls,
+        ):
+            publish_cls.return_value.execute.return_value = superseding
+            project_cls.return_value.execute.return_value = mock.MagicMock(
+                projected=0, deleted=0, skipped=0
+            )
+            report = run_once(
+                WorkerLimits(sync=0, download=0, parse=0, build=0, publish=10),
+                deps,
+            )
+        self.assertEqual(report.runs_deactivated, 1)
+        (command,) = project_cls.return_value.execute.call_args.args
+        self.assertTrue(command.prune)

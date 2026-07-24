@@ -386,7 +386,12 @@ def run_once(
         # 48% while every round reported success (2026-07-23). The use case
         # keyset-batches with a commit per batch, so an unbounded drain
         # never rides one giant transaction.
-        _project_stage(report, deps, should_stop=should_stop)
+        _project_stage(
+            report,
+            deps,
+            should_stop=should_stop,
+            prune=report.runs_deactivated > 0,
+        )
 
     report.duration_seconds = (deps.clock() - started_at).total_seconds()
     return report
@@ -738,6 +743,7 @@ class _DocOutcome:
     parsed: bool = False
     built: bool = False
     published: bool = False
+    superseded_run: bool = False
     build_stats: dict[str, Any] | None = None
     failure: WorkerFailure | None = None
 
@@ -802,6 +808,7 @@ def _process_one_document(
             )
             return outcome
         outcome.published = True
+        outcome.superseded_run = publish_result.superseded_run_id is not None
     except Exception as exc:
         structured_error = getattr(exc, "error", None)
         outcome.failure = WorkerFailure(
@@ -825,6 +832,8 @@ def _fold_outcome(report: WorkerReport, outcome: _DocOutcome) -> None:
         report.build_stats.append(outcome.build_stats)
     if outcome.published:
         report.published += 1
+        if outcome.superseded_run:
+            report.runs_deactivated += 1
     if outcome.failure is not None:
         report.failed += 1
         report.failures.append(outcome.failure)
@@ -1129,6 +1138,8 @@ def _publish_stage(
             continue
         if result.status == "published":
             report.published += 1
+            if result.superseded_run_id is not None:
+                report.runs_deactivated += 1
         else:
             report.failed += 1
             report.failures.append(
@@ -1144,6 +1155,7 @@ def _project_stage(
     deps: WorkerDeps,
     *,
     should_stop: Callable[[], bool],
+    prune: bool,
 ) -> None:
     """Drain the search-projection delta for this round (08 + 06R §5).
 
@@ -1160,7 +1172,7 @@ def _project_stage(
 
     try:
         result = BuildSearchProjection(engine=deps.engine).execute(
-            BuildSearchProjectionCommand(full=False, limit=None),
+            BuildSearchProjectionCommand(full=False, limit=None, prune=prune),
             should_stop=should_stop,
         )
     except Exception as exc:

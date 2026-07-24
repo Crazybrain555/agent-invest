@@ -60,6 +60,34 @@ def is_internal_id(value: str) -> bool:
     return bool(_ID_RE.fullmatch(value))
 
 
+def _decode_crockford(value: str) -> int:
+    result = 0
+    for char in value:
+        result = (result << 5) | _CROCKFORD.index(char)
+    return result
+
+
+def id_time_floor(id_value: str, *, backoff_ms: int) -> str:
+    """An id that sorts <= every same-prefix id minted after (t - backoff_ms).
+
+    ULIDs are millisecond time-prefixed, so ids of one prefix sort by mint
+    time. Decoding ``id_value``'s timestamp, backing it off, and re-encoding
+    with the minimum randomness suffix yields a keyset lower bound for "ids
+    minted since shortly before this one" — scan-range pruning for
+    time-ordered id spaces. Pure string arithmetic; raises on non-internal
+    ids.
+    """
+
+    if backoff_ms < 0:
+        raise ValueError(f"backoff_ms must be >= 0: {backoff_ms}")
+    if not is_internal_id(id_value):
+        raise ValueError(f"not an internal id: {id_value!r}")
+    prefix, ulid = id_value.rsplit("_", 1)
+    timestamp_ms = _decode_crockford(ulid[:10])
+    floored = max(timestamp_ms - backoff_ms, 0)
+    return f"{prefix}_{_encode_crockford(floored, 10)}{'0' * 16}"
+
+
 def new_company_id() -> CompanyId:
     return CompanyId(new_id("co"))
 

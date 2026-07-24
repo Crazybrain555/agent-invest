@@ -237,6 +237,109 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
         finally:
             self._cleanup(ids)
 
+    def test_delta_restamps_stale_rules_version(self) -> None:
+        # Pass 2 of the delta: rows stamped under an older retrieval rules
+        # version are re-tokenized and re-stamped current, without a full
+        # rebuild. This is the "edit rules -> delta refreshes" contract.
+        suffix = os.urandom(4).hex()
+        ids = self._seed_two_units(suffix)
+        try:
+            BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False)
+            )
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE disclosure_core.unit_search_projection "
+                        "SET retrieval_rules_version = 'rp-0000.00-0' "
+                        "WHERE asset_id IN (:a, :b)"
+                    ),
+                    {"a": ids["title_hit"], "b": ids["body_hit"]},
+                )
+            result = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False)
+            )
+            self.assertEqual(result.projected, 2)
+            self.assertEqual(result.deleted, 0)
+            with self.engine.connect() as conn:
+                versions = list(
+                    conn.execute(
+                        text(
+                            "SELECT DISTINCT retrieval_rules_version "
+                            "FROM disclosure_core.unit_search_projection "
+                            "WHERE asset_id IN (:a, :b)"
+                        ),
+                        {"a": ids["title_hit"], "b": ids["body_hit"]},
+                    ).scalars()
+                )
+            self.assertEqual(versions, [tokenizer.RETRIEVAL_RULES_VERSION])
+        finally:
+            self._cleanup(ids)
+
+    def test_inactive_stale_rows_are_pruned_not_restamped(self) -> None:
+        # Review finding 2026-07-24: a rules bump plus a supersede in the
+        # same round leaves rows that are BOTH stale and inactive. They must
+        # leave via the orphan prune (which runs first), never be
+        # re-tokenized and re-stamped current by the stale pass.
+        suffix = os.urandom(4).hex()
+        ids_map = self._seed_two_units(suffix)
+        try:
+            BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False)
+            )
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE disclosure_core.processing_run "
+                        "SET is_active = false WHERE processing_run_id = :rid"
+                    ),
+                    {"rid": ids_map["run"]},
+                )
+                conn.execute(
+                    text(
+                        "UPDATE disclosure_core.unit_search_projection "
+                        "SET retrieval_rules_version = 'rp-0000.00-0' "
+                        "WHERE asset_id IN (:a, :b)"
+                    ),
+                    {"a": ids_map["title_hit"], "b": ids_map["body_hit"]},
+                )
+            result = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False)
+            )
+            self.assertEqual(result.projected, 0)
+            self.assertEqual(result.deleted, 2)
+            self.assertEqual(self._projection_count(), 0)
+        finally:
+            self._cleanup(ids_map)
+
+    def test_delta_prune_gate_skips_scan_when_no_deactivations(self) -> None:
+        # prune=False (the worker's quiet-round signal) must skip the
+        # corpus-sized orphan scan; the count gate still forces it when the
+        # projection provably exceeds the active set.
+        suffix = os.urandom(4).hex()
+        ids_map = self._seed_two_units(suffix)
+        try:
+            BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False)
+            )
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE disclosure_core.processing_run "
+                        "SET is_active = false WHERE processing_run_id = :rid"
+                    ),
+                    {"rid": ids_map["run"]},
+                )
+            # prune=False, projection(2) > active(0): count gate overrides
+            # and the orphans still go.
+            result = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False, prune=False)
+            )
+            self.assertEqual(result.deleted, 2)
+            self.assertEqual(self._projection_count(), 0)
+        finally:
+            self._cleanup(ids_map)
+
     # -- seeding / queries / cleanup ---------------------------------------
     def _seed_two_units(self, suffix: str) -> dict[str, str]:
         ids = {

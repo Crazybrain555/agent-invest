@@ -42,6 +42,10 @@ class PublishRunResult:
     removed_count: int = 0
     projection_changed_count: int = 0
     published_change_kind: str | None = None
+    # The run this publish deactivated, if any. Run deactivation is the only
+    # in-service source of search-projection orphans, so the worker uses
+    # this as the per-round "orphans may exist" signal for prune gating.
+    superseded_run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +224,9 @@ class PublishRun:
                 removed_count=len(diff.removed),
                 projection_changed_count=len(diff.projection_changed),
                 published_change_kind=published_change_kind,
+                superseded_run_id=(
+                    old_run.processing_run_id if old_run is not None else None
+                ),
             )
 
 

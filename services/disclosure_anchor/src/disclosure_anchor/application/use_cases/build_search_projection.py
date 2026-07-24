@@ -10,9 +10,10 @@ Two modes:
 
 * ``full``  — recompute every active-run unit (upsert), then delete projection
   rows whose ``asset_id`` no longer belongs to an active-run unit.
-* delta     — recompute only units missing a projection row or carrying a stale
-  ``retrieval_rules_version``; the worker runs this bounded by the publish
-  batch limit.
+* delta     — recompute units missing a projection row (index-ordered merge
+  anti-join pass), then rows carrying a stale ``retrieval_rules_version``
+  (keyset pass); the worker drains it fully every round. Both modes end with
+  a batched orphan prune.
 
 Row computation is factored into pure module-level functions so the
 linearization and ``header_row_candidate`` rules are testable without a DB.
@@ -26,7 +27,7 @@ from datetime import datetime, timezone
 import re
 from typing import Any
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
@@ -37,6 +38,7 @@ from disclosure_anchor.adapters.db.postgres.models import (
     UnitSearchProjection,
 )
 from disclosure_anchor.adapters.retrieval import tokenizer
+from disclosure_anchor.domain import ids
 
 # Upsert flush size inside one keyset batch (memory bound on payload rows);
 # the outer keyset batch (_BATCH_SIZE) commits per batch — see execute().
@@ -69,6 +71,16 @@ _UPDATE_COLUMNS = (
 class BuildSearchProjectionCommand:
     # full=False is the incremental default (CLI default; worker always delta).
     full: bool = False
+    # Orphan-prune gate for delta mode (full mode always prunes). Proving
+    # "no orphans" is a corpus-sized anti-join (~16s live), while orphans can
+    # only appear when a publish deactivates a run — so the worker passes the
+    # round's deactivation signal here and skips the scan on quiet rounds.
+    # A projection count exceeding the active-unit count forces the prune
+    # regardless (orphans then provably exist). Residual: orphans from a
+    # crash between publish and projection can outlive their round until the
+    # next deactivation round; bounded, and erased by the write-through
+    # design (§8.1 trigger).
+    prune: bool = True
     # Upper bound on rows projected this call. None (the worker and CLI
     # default) drains everything the delta finds: maintenance work must be
     # proportional to new/changed units, never capped by a fixed constant —
@@ -126,42 +138,135 @@ class BuildSearchProjection:
         def stop_requested() -> bool:
             return should_stop is not None and should_stop()
 
+        stale_cursor: str | None = None
         with Session(self._engine) as session:
-            while not stop_requested():
-                batch_cap = self._BATCH_SIZE
-                if remaining is not None:
-                    batch_cap = min(batch_cap, remaining)
-                    if batch_cap <= 0:
-                        skipped = self._pending_count(
-                            session, full=command.full, after=cursor
+            if command.full:
+                projected, remaining, cursor = self._drain_keyset(
+                    session,
+                    self._active_units_stmt,
+                    built_at=built_at,
+                    remaining=remaining,
+                    stop_requested=stop_requested,
+                )
+                deleted = self._delete_orphans(session, should_stop=should_stop)
+            else:
+                # Order and gating carry the steady-state cost (§8.2 review,
+                # 2026-07-24: every "prove the delta is empty" scan is
+                # corpus-sized, so each one must be gated or range-pruned):
+                #
+                # 1. Prune orphans only when they can exist — the caller's
+                #    deactivation signal (command.prune) or a projection
+                #    count exceeding the active count. Pruning before the
+                #    other passes restores projection ⊆ active units (count
+                #    gate exact) and keeps the stale pass from re-stamping
+                #    rows whose run was just deactivated (they are gone).
+                # 2. Count gate: |projection| == |active units| under ⊆
+                #    means nothing is missing — skip the missing pass
+                #    without the corpus-wide anti-join probe (measured 19s
+                #    when caught up). The one blind spot — orphans and
+                #    missing rows in equal numbers — self-heals on the next
+                #    unequal round and is backstopped by the doctor
+                #    coverage alarm.
+                # 3. Missing pass scans from a ULID time floor: new units
+                #    carry fresh time-ordered ids, so the scan range is the
+                #    recent tail, not the corpus. Exactness does NOT rest on
+                #    that assumption — a recount after the drain falls back
+                #    to an unbounded scan if rows below the floor are still
+                #    missing (clock skew, out-of-band writes).
+                # 4. Stale pass runs only when the rules-version btree shows
+                #    any row outside the current version (two range probes,
+                #    ~ms) — after a bump nearly every row matches and the
+                #    scan is productive by construction.
+                projection_count, active_count = self._counts(session)
+                if (
+                    (command.prune or projection_count > active_count)
+                    and not stop_requested()
+                ):
+                    deleted = self._delete_orphans(
+                        session, should_stop=should_stop
+                    )
+                    if deleted:
+                        projection_count -= deleted
+                if not stop_requested() and projection_count != active_count:
+                    floor = self._missing_scan_floor(session)
+                    projected, remaining, cursor = self._drain_keyset(
+                        session,
+                        self._missing_stmt,
+                        built_at=built_at,
+                        remaining=remaining,
+                        stop_requested=stop_requested,
+                        start_after=floor,
+                    )
+                    if (
+                        floor is not None
+                        and not stop_requested()
+                        and (remaining is None or remaining > 0)
+                        and self._counts_diverge(session)
+                    ):
+                        repaired, remaining, cursor = self._drain_keyset(
+                            session,
+                            self._missing_stmt,
+                            built_at=built_at,
+                            remaining=remaining,
+                            stop_requested=stop_requested,
                         )
-                        break
-                asset_ids = self._select_batch(
+                        projected += repaired
+                if not stop_requested() and self._stale_rows_exist(session):
+                    restamped, remaining, stale_cursor = self._drain_keyset(
+                        session,
+                        self._stale_stmt,
+                        built_at=built_at,
+                        remaining=remaining,
+                        stop_requested=stop_requested,
+                    )
+                    projected += restamped
+            if remaining is not None and remaining <= 0:
+                skipped = self._pending_count(
                     session,
                     full=command.full,
                     after=cursor,
-                    limit=batch_cap,
+                    stale_after=stale_cursor,
                 )
-                if not asset_ids:
-                    break
-                projected += self._upsert(session, asset_ids, built_at=built_at)
-                session.commit()
-                cursor = asset_ids[-1]
-                if remaining is not None:
-                    remaining -= len(asset_ids)
-            # Orphan pruning runs in BOTH modes: units leave the active set
-            # whenever a re-parse or supersede deactivates their run, which
-            # happens continuously, not only around full rebuilds. The public
-            # search view is a bare projection read (no is_active join), so
-            # rows left behind would keep serving superseded units until the
-            # next full rebuild.
-            deleted = self._delete_orphans(session, should_stop=should_stop)
         return BuildSearchProjectionResult(
             projected=projected, deleted=deleted, skipped=skipped
         )
 
+    def _drain_keyset(
+        self,
+        session: Session,
+        stmt_builder: Callable[..., Any],
+        *,
+        built_at: datetime,
+        remaining: int | None,
+        stop_requested: Callable[[], bool],
+        start_after: str | None = None,
+    ) -> tuple[int, int | None, str | None]:
+        """Batched keyset drain: select -> upsert -> commit -> advance."""
+
+        projected = 0
+        cursor = start_after
+        while not stop_requested():
+            batch_cap = self._BATCH_SIZE
+            if remaining is not None:
+                batch_cap = min(batch_cap, remaining)
+                if batch_cap <= 0:
+                    break
+            asset_ids = list(
+                session.execute(
+                    stmt_builder(after=cursor).limit(batch_cap)
+                ).scalars()
+            )
+            if not asset_ids:
+                break
+            projected += self._upsert(session, asset_ids, built_at=built_at)
+            session.commit()
+            cursor = asset_ids[-1]
+            if remaining is not None:
+                remaining -= len(asset_ids)
+        return projected, remaining, cursor
+
     # -- selection ----------------------------------------------------------
-    def _selection_stmt(self, *, full: bool, after: str | None) -> Any:
+    def _active_units_stmt(self, *, after: str | None) -> Any:
         stmt = (
             select(DocumentUnit.asset_id)
             .join(
@@ -170,33 +275,108 @@ class BuildSearchProjection:
             )
             .where(ProcessingRun.is_active.is_(True))
         )
-        if not full:
-            stmt = stmt.outerjoin(
-                UnitSearchProjection,
-                UnitSearchProjection.asset_id == DocumentUnit.asset_id,
-            ).where(
-                or_(
-                    UnitSearchProjection.asset_id.is_(None),
-                    UnitSearchProjection.retrieval_rules_version
-                    != tokenizer.RETRIEVAL_RULES_VERSION,
-                )
-            )
         if after is not None:
             stmt = stmt.where(DocumentUnit.asset_id > after)
         return stmt.order_by(DocumentUnit.asset_id)
 
-    def _select_batch(
-        self, session: Session, *, full: bool, after: str | None, limit: int
-    ) -> list[str]:
-        stmt = self._selection_stmt(full=full, after=after).limit(limit)
-        return list(session.execute(stmt).scalars())
+    def _missing_stmt(self, *, after: str | None) -> Any:
+        # NOT EXISTS (not an OUTER JOIN + OR) so the planner may pick a
+        # merge anti-join over the two asset_id PKs; see execute() pass 1.
+        return self._active_units_stmt(after=after).where(
+            ~select(UnitSearchProjection.asset_id)
+            .where(UnitSearchProjection.asset_id == DocumentUnit.asset_id)
+            .exists()
+        )
+
+    def _stale_stmt(self, *, after: str | None) -> Any:
+        stmt = select(UnitSearchProjection.asset_id).where(
+            UnitSearchProjection.retrieval_rules_version
+            != tokenizer.RETRIEVAL_RULES_VERSION
+        )
+        if after is not None:
+            stmt = stmt.where(UnitSearchProjection.asset_id > after)
+        return stmt.order_by(UnitSearchProjection.asset_id)
+
+    def _counts(self, session: Session) -> tuple[int, int]:
+        # |projection| via index-only count; |active units| via the run
+        # join. Under projection ⊆ active units (holds after a prune),
+        # equal counts prove set equality without an anti-join probe.
+        projection_count = int(
+            session.execute(
+                select(func.count()).select_from(UnitSearchProjection)
+            ).scalar()
+            or 0
+        )
+        active_count = int(
+            session.execute(
+                select(func.count()).select_from(
+                    self._active_units_stmt(after=None)
+                    .order_by(None)
+                    .subquery()
+                )
+            ).scalar()
+            or 0
+        )
+        return projection_count, active_count
+
+    def _counts_diverge(self, session: Session) -> bool:
+        projection_count, active_count = self._counts(session)
+        return projection_count != active_count
+
+    # In-flight margin for the missing-scan floor: a unit's ULID is minted
+    # inside BuildUnits moments before its transaction commits, so ids can
+    # land in the table at most minutes below the projected maximum. Two
+    # hours is deliberately extravagant — the recount fallback, not this
+    # margin, carries exactness.
+    _MISSING_FLOOR_BACKOFF_MS = 2 * 60 * 60 * 1000
+
+    def _missing_scan_floor(self, session: Session) -> str | None:
+        max_projected = session.execute(
+            select(func.max(UnitSearchProjection.asset_id))
+        ).scalar()
+        if not max_projected:
+            return None
+        return ids.id_time_floor(
+            str(max_projected), backoff_ms=self._MISSING_FLOOR_BACKOFF_MS
+        )
+
+    def _stale_rows_exist(self, session: Session) -> bool:
+        # ``!=`` is not btree-servable, but its two open ranges are: one
+        # probe below the current version, one above, each an instant index
+        # range scan on retrieval_rules_version.
+        current = tokenizer.RETRIEVAL_RULES_VERSION
+        below = (
+            select(UnitSearchProjection.asset_id)
+            .where(UnitSearchProjection.retrieval_rules_version < current)
+            .exists()
+        )
+        above = (
+            select(UnitSearchProjection.asset_id)
+            .where(UnitSearchProjection.retrieval_rules_version > current)
+            .exists()
+        )
+        return bool(session.execute(select(below | above)).scalar())
 
     def _pending_count(
-        self, session: Session, *, full: bool, after: str | None
+        self,
+        session: Session,
+        *,
+        full: bool,
+        after: str | None,
+        stale_after: str | None = None,
     ) -> int:
-        stmt = self._selection_stmt(full=full, after=after)
-        counted = select(func.count()).select_from(stmt.subquery())
-        return int(session.execute(counted).scalar() or 0)
+        if full:
+            stmt = self._active_units_stmt(after=after)
+            counted = select(func.count()).select_from(stmt.subquery())
+            return int(session.execute(counted).scalar() or 0)
+        total = 0
+        for pending_stmt in (
+            self._missing_stmt(after=after),
+            self._stale_stmt(after=stale_after),
+        ):
+            counted = select(func.count()).select_from(pending_stmt.subquery())
+            total += int(session.execute(counted).scalar() or 0)
+        return total
 
     # -- mutation -----------------------------------------------------------
     def _upsert(
@@ -231,20 +411,29 @@ class BuildSearchProjection:
         any row racing back to active is re-added by the next delta pass.
         """
 
-        active_asset_ids = (
+        # NOT EXISTS, never NOT IN (subquery): review measurement 2026-07-24
+        # — the NOT IN form planned as a correlated subplan rescanning a
+        # 1.64M-row materialized hash join per projection row (EXPLAIN cost
+        # 10.5e9; EXPLAIN ANALYZE did not finish in 400s at zero orphans).
+        # The anti-join form walks the projection PK probing the unit PK.
+        is_active_unit = (
             select(DocumentUnit.asset_id)
             .join(
                 ProcessingRun,
                 ProcessingRun.processing_run_id == DocumentUnit.processing_run_id,
             )
-            .where(ProcessingRun.is_active.is_(True))
+            .where(
+                DocumentUnit.asset_id == UnitSearchProjection.asset_id,
+                ProcessingRun.is_active.is_(True),
+            )
+            .exists()
         )
         deleted = 0
         while True:
             orphan_ids = list(
                 session.execute(
                     select(UnitSearchProjection.asset_id)
-                    .where(UnitSearchProjection.asset_id.not_in(active_asset_ids))
+                    .where(~is_active_unit)
                     .order_by(UnitSearchProjection.asset_id)
                     .limit(self._ORPHAN_SCAN_LIMIT)
                 ).scalars()

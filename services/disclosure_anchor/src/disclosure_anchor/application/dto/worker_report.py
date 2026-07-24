@@ -45,6 +45,9 @@ class WorkerReport:
     parsed: int = 0
     built: int = 0
     published: int = 0
+    # Publishes that deactivated a prior run — the only in-service source of
+    # search-projection orphans; gates the per-round orphan prune.
+    runs_deactivated: int = 0
     projected: int = 0
     failed: int = 0
     skipped_oversized: int = 0
@@ -72,6 +75,7 @@ class WorkerReport:
             "parsed": self.parsed,
             "built": self.built,
             "published": self.published,
+            "runs_deactivated": self.runs_deactivated,
             "projected": self.projected,
             "failed": self.failed,
             "skipped_oversized": self.skipped_oversized,

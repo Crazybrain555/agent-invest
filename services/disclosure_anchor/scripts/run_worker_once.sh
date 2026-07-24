@@ -77,4 +77,10 @@ if ! mkdir -p "$LOG_DIR" 2>/dev/null \
 fi
 exec >>"$LOG_DIR/worker-$(date +%Y%m%d).log" 2>&1
 echo "=== worker-$MODE $(date '+%F %T') ==="
-exec make "worker-$MODE"
+# exec the interpreter directly (no make/sh layer): launchd signals the pid
+# it tracks, and the make->sh->python chain left python orphaned on three
+# kickstarts — an orphan then wedges the singleton lock while every
+# KeepAlive relaunch [skip]s against it. Env is already sourced above; make
+# worker-loop added only PYTHONPATH on top of that.
+export PYTHONPATH=src
+exec .venv/bin/python -m disclosure_anchor.cli.worker "$MODE"
