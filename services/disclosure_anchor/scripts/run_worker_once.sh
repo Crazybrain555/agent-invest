@@ -77,10 +77,20 @@ if ! mkdir -p "$LOG_DIR" 2>/dev/null \
 fi
 exec >>"$LOG_DIR/worker-$(date +%Y%m%d).log" 2>&1
 echo "=== worker-$MODE $(date '+%F %T') ==="
-# exec the interpreter directly (no make/sh layer): launchd signals the pid
-# it tracks, and the make->sh->python chain left python orphaned on three
-# kickstarts — an orphan then wedges the singleton lock while every
-# KeepAlive relaunch [skip]s against it. Env is already sourced above; make
-# worker-loop added only PYTHONPATH on top of that.
+# zsh stays the launchd job process ON PURPOSE: macOS TCC attributes consent
+# to it, and /bin/zsh holds the Full Disk Access grant that lets children
+# execute the MinerU interpreter on the external volume. This morning's
+# `exec python` variant moved TCC responsibility onto python and every
+# parser probe was denied (parse halted round after round) while plain file
+# reads/writes kept working. Signals are forwarded by hand instead: the
+# earlier make->sh->python chain swallowed launchd's SIGTERM, which left
+# python orphaned holding the singleton lock on three kickstarts.
 export PYTHONPATH=src
-exec .venv/bin/python -m disclosure_anchor.cli.worker "$MODE"
+.venv/bin/python -m disclosure_anchor.cli.worker "$MODE" &
+WORKER_PID=$!
+trap 'kill -TERM "$WORKER_PID" 2>/dev/null' TERM INT
+while kill -0 "$WORKER_PID" 2>/dev/null; do
+  wait "$WORKER_PID"
+done
+wait "$WORKER_PID" 2>/dev/null
+exit $?

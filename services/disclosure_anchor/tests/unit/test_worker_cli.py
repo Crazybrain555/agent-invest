@@ -230,6 +230,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 mock.MagicMock(
                     worker_loop_interval_seconds=900,
                     worker_loop_max_interval_seconds=1800,
+                    worker_wedge_timeout_seconds=0,
                 ),
                 lock_conn=mock.MagicMock(),
             )
@@ -272,6 +273,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 mock.MagicMock(
                     worker_loop_interval_seconds=900,
                     worker_loop_max_interval_seconds=1800,
+                    worker_wedge_timeout_seconds=0,
                 ),
                 lock_conn=mock.MagicMock(),
             )
@@ -393,3 +395,58 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AcquisitionWindowTrackingTests(unittest.TestCase):
+    """The pump window must follow the parse gate (2026-07-24: a 120s parse
+    cooldown otherwise idled the GPU for the full acquisition hour, because
+    parse only retries at round start)."""
+
+    def setUp(self) -> None:
+        self.controller = worker_cli._AdaptiveLoopController(
+            idle_base_seconds=1, idle_max_seconds=600
+        )
+        self.limits = WorkerLimits(
+            sync=13,
+            download=300,
+            parse=50,
+            build=10,
+            publish=10,
+            acquisition_seconds=3600,
+        )
+
+    def test_open_parse_gate_keeps_full_window(self) -> None:
+        effective = self.controller.effective_limits(self.limits, now=10.0)
+        self.assertEqual(effective.parse, 50)
+        self.assertEqual(effective.acquisition_seconds, 3600)
+
+    def test_parse_cooldown_shrinks_window_to_gate_expiry(self) -> None:
+        report = _report(failed=1)
+        report.failures.append(
+            WorkerFailure("parse", "parser", "parser_version_probe_failed")
+        )
+        self.controller.observe(report, now=10.0)
+        effective = self.controller.effective_limits(self.limits, now=11.0)
+        self.assertEqual(effective.parse, 0)
+        # Gate lifts at 10 + 120s cooldown; window tracks the remainder, so
+        # the next round can retry parse right after the cooldown instead of
+        # pumping the full hour with an idle GPU.
+        self.assertLessEqual(effective.acquisition_seconds, 121)
+        self.assertGreaterEqual(effective.acquisition_seconds, 60)
+
+    def test_gate_never_stretches_a_smaller_base_window(self) -> None:
+        small = WorkerLimits(
+            sync=1,
+            download=1,
+            parse=1,
+            build=0,
+            publish=0,
+            acquisition_seconds=30,
+        )
+        report = _report(failed=1)
+        report.failures.append(
+            WorkerFailure("parse", "parser", "parser_version_probe_failed")
+        )
+        self.controller.observe(report, now=10.0)
+        effective = self.controller.effective_limits(small, now=11.0)
+        self.assertEqual(effective.acquisition_seconds, 30)

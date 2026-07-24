@@ -42,7 +42,7 @@
   },
   "tests/integration/test_ops_queue_views.py": {
    "private_imports": [],
-   "tests": 19
+   "tests": 21
   },
   "tests/integration/test_outbox_commit_order.py": {
    "private_imports": [],
@@ -292,7 +292,7 @@
   },
   "tests/unit/test_worker_cli.py": {
    "private_imports": [],
-   "tests": 23
+   "tests": 26
   },
   "tests/unit/test_worker_run_once.py": {
    "private_imports": [

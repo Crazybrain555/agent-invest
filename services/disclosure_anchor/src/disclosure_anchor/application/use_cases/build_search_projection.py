@@ -128,6 +128,7 @@ class BuildSearchProjection:
         command: BuildSearchProjectionCommand,
         *,
         should_stop: Callable[[], bool] | None = None,
+        on_progress: Callable[[], None] | None = None,
     ) -> BuildSearchProjectionResult:
         built_at = datetime.now(timezone.utc)
         projected = 0
@@ -147,6 +148,7 @@ class BuildSearchProjection:
                     built_at=built_at,
                     remaining=remaining,
                     stop_requested=stop_requested,
+                    on_progress=on_progress,
                 )
                 deleted = self._delete_orphans(session, should_stop=should_stop)
             else:
@@ -196,6 +198,7 @@ class BuildSearchProjection:
                         remaining=remaining,
                         stop_requested=stop_requested,
                         start_after=floor,
+                        on_progress=on_progress,
                     )
                     if (
                         floor is not None
@@ -209,6 +212,7 @@ class BuildSearchProjection:
                             built_at=built_at,
                             remaining=remaining,
                             stop_requested=stop_requested,
+                            on_progress=on_progress,
                         )
                         projected += repaired
                 if not stop_requested() and self._stale_rows_exist(session):
@@ -218,6 +222,7 @@ class BuildSearchProjection:
                         built_at=built_at,
                         remaining=remaining,
                         stop_requested=stop_requested,
+                        on_progress=on_progress,
                     )
                     projected += restamped
             if remaining is not None and remaining <= 0:
@@ -240,6 +245,7 @@ class BuildSearchProjection:
         remaining: int | None,
         stop_requested: Callable[[], bool],
         start_after: str | None = None,
+        on_progress: Callable[[], None] | None = None,
     ) -> tuple[int, int | None, str | None]:
         """Batched keyset drain: select -> upsert -> commit -> advance."""
 
@@ -260,6 +266,8 @@ class BuildSearchProjection:
                 break
             projected += self._upsert(session, asset_ids, built_at=built_at)
             session.commit()
+            if on_progress is not None:
+                on_progress()
             cursor = asset_ids[-1]
             if remaining is not None:
                 remaining -= len(asset_ids)

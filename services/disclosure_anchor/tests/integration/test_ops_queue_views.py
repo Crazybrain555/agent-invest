@@ -217,6 +217,52 @@ class OpsQueueViewTests(unittest.TestCase):
             helper_rows = queries.pending_parse(conn, max_retries=3, limit=500000)
         self.assertNotIn(document_id, [row["document_id"] for row in helper_rows])
 
+    def test_infra_only_failures_do_not_burn_parse_retry_budget(self) -> None:
+        # Two IO-storm days (2026-07-23/24) stranded documents whose ONLY
+        # failures were parser infrastructure codes. Infrastructure failures
+        # describe the environment, not the document: the budget predicate
+        # counts non-infra failures only.
+        with self.engine.begin() as conn:
+            document_id = self._insert_document(conn, status="parse_failed")
+            for _ in range(4):
+                self._insert_run(
+                    conn,
+                    document_id,
+                    status="failed",
+                    error={
+                        "stage": "parse",
+                        "error_code": "parser_invocation_failed",
+                        "retryable": True,
+                    },
+                )
+            helper_rows = queries.pending_parse(conn, max_retries=3, limit=500000)
+        self.assertIn(
+            document_id,
+            [row["document_id"] for row in helper_rows],
+            "infra-only failure history must stay retryable",
+        )
+
+    def test_parse_retry_ceiling_bounds_even_infra_failures(self) -> None:
+        # Safety valve: a document that always dies infra-coded still stops
+        # at max_retries x RETRY_CEILING_MULTIPLIER total attempts.
+        with self.engine.begin() as conn:
+            document_id = self._insert_document(conn, status="parse_failed")
+            for _ in range(3 * queries.RETRY_CEILING_MULTIPLIER):
+                self._insert_run(
+                    conn,
+                    document_id,
+                    status="failed",
+                    error={
+                        "stage": "parse",
+                        "error_code": "parser_invocation_failed",
+                        "retryable": True,
+                    },
+                )
+            helper_rows = queries.pending_parse(conn, max_retries=3, limit=500000)
+        self.assertNotIn(
+            document_id, [row["document_id"] for row in helper_rows]
+        )
+
     def test_processing_backlog_counts_download_and_all_raw_parse_work(self) -> None:
         """GPU outage pressure cannot disappear as downloads become raw files."""
 

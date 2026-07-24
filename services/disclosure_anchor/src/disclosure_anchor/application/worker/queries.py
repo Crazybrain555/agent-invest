@@ -15,6 +15,24 @@ from sqlalchemy.engine import Connection
 
 from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA, OPS_SCHEMA
 
+# Parse failures that indicate infrastructure (parser/GPU/volume), not the
+# document. They do not consume the document's retry budget: two IO-storm
+# days (2026-07-23/24) stranded documents whose only failures were
+# parser_invocation_failed, and each storm would strand more. The absolute
+# ceiling below still bounds total attempts per document.
+PARSE_INFRASTRUCTURE_ERROR_CODES: tuple[str, ...] = (
+    "parse_timeout",
+    "parser_timeout",
+    "parser_invocation_failed",
+    "ParserInvocationError",
+    "ParserTimeoutError",
+    "parser_version_probe_failed",
+)
+# Safety valve: even infra-coded failures stop retrying past this multiple
+# of max_retries, so a document that somehow always dies infra-coded cannot
+# churn forever.
+RETRY_CEILING_MULTIPLIER = 5
+
 
 # Closed vocabulary for tracked_company.sync_frequency; unknown/null values
 # fall back to the global interval.
@@ -425,7 +443,12 @@ def pending_parse(
     """
 
     scope_sql = ""
-    params: dict[str, Any] = {"max_retries": max_retries, "limit": limit}
+    params: dict[str, Any] = {
+        "max_retries": max_retries,
+        "max_retries_ceiling": max_retries * RETRY_CEILING_MULTIPLIER,
+        "infra_error_codes": list(PARSE_INFRASTRUCTURE_ERROR_CODES),
+        "limit": limit,
+    }
     if scope_classes is not None:
         scope_sql = _processing_scope_sql(
             category_expr="d.provider_metadata->>'raw_category'",
@@ -445,7 +468,14 @@ def pending_parse(
               LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
                 ON tc_scope.company_id = d.company_id
              WHERE COALESCE(q.last_failed_retryable, true)
-               AND q.failed_parse_count < :max_retries
+               AND (SELECT count(*)
+                      FROM {CORE_SCHEMA}.processing_run pr
+                     WHERE pr.document_id = q.document_id
+                       AND pr.run_kind = 'parse'
+                       AND pr.status = 'failed'
+                       AND COALESCE(pr.error->>'error_code', '')
+                           <> ALL(:infra_error_codes)) < :max_retries
+               AND q.failed_parse_count < :max_retries_ceiling
                AND NOT COALESCE((d.provider_metadata->>'oversized')::boolean, false)
                {scope_sql}
              ORDER BY q.document_id

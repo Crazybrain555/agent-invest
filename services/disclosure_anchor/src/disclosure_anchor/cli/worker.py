@@ -7,6 +7,7 @@ import argparse
 import subprocess
 from dataclasses import dataclass, replace
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -48,6 +49,7 @@ from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.worker.concurrency import (
     AdaptiveConcurrencyLimit,
 )
+from disclosure_anchor.application.worker import queries
 from disclosure_anchor.application.worker.locks import WORKER_NS
 from disclosure_anchor.application.worker.worker import (
     WorkerConfig,
@@ -70,14 +72,7 @@ PARSE_COOLDOWN_BASE_SECONDS = 120
 PROVIDER_ERROR_COOLDOWN_BASE_SECONDS = 60
 PUBLISH_COOLDOWN_BASE_SECONDS = 120
 PARSER_INFRASTRUCTURE_ERRORS = frozenset(
-    {
-        "parse_timeout",
-        "parser_invocation_failed",
-        "parser_timeout",
-        "ParserInvocationError",
-        "ParserTimeoutError",
-        "parser_version_probe_failed",
-    }
+    queries.PARSE_INFRASTRUCTURE_ERROR_CODES
 )
 
 
@@ -141,6 +136,50 @@ def _run_rounds(settings: Settings, *, rounds: int | None) -> int:
         engine.dispose()
 
 
+def _wedge_watchdog(
+    *,
+    last_progress: list[float],
+    threshold_seconds: int,
+    stop: _StopFlag,
+) -> threading.Thread:
+    """Fail loudly when NOTHING progresses for longer than any legal gap.
+
+    Rounds may honestly run for hours (heavy parse batches), so duration
+    bounds nothing — liveness does. Every stage bumps the heartbeat at item
+    granularity; the longest legal silent gap is one document parse timeout
+    (a cold batch of heavy documents completes nothing until its first doc
+    finishes). Beyond that, the process is wedged in something no inner
+    timeout covers — a hung getaddrinfo, a TCC-blocked spawn, a pathological
+    query (all three observed 2026-07-23/24, each holding a round open for
+    hours while the GPU idled). Dump every thread's stack and exit nonzero:
+    launchd KeepAlive restarts clean, and every write path is batch-committed
+    idempotent by design, so a hard exit loses no work.
+    """
+
+    def _watch() -> None:
+        import faulthandler
+        import os
+
+        while not stop.is_set():
+            time.sleep(30)
+            silent = time.monotonic() - last_progress[0]
+            if silent > threshold_seconds and not stop.is_set():
+                print(
+                    f"[watchdog] no progress for {int(silent)}s "
+                    f"(threshold {threshold_seconds}s) — dumping stacks and "
+                    "exiting for a clean relaunch",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                faulthandler.dump_traceback(file=sys.stderr)
+                sys.stderr.flush()
+                os._exit(70)
+
+    thread = threading.Thread(target=_watch, name="wedge-watchdog", daemon=True)
+    thread.start()
+    return thread
+
+
 def _run_loop(settings: Settings, *, lock_conn: Connection) -> int:
     """Run continuously, draining work immediately and backing off when idle."""
 
@@ -153,11 +192,24 @@ def _run_loop(settings: Settings, *, lock_conn: Connection) -> int:
     )
     base_limits = _limits(settings)
     deps = _deps(settings, engine)
+    last_progress = [time.monotonic()]
+    if settings.worker_wedge_timeout_seconds > 0:
+        object.__setattr__(
+            deps, "heartbeat", lambda: last_progress.__setitem__(0, time.monotonic())
+        )
+        _wedge_watchdog(
+            last_progress=last_progress,
+            threshold_seconds=settings.worker_wedge_timeout_seconds,
+            stop=stop,
+        )
     try:
         while not stop.is_set():
             _assert_singleton_lock(lock_conn)
             started_at = datetime.now(timezone.utc)
             started_monotonic = time.monotonic()
+            # Round boundaries are progress too: idle rounds plus backoff
+            # sleeps must not accumulate into a false wedge verdict.
+            last_progress[0] = started_monotonic
             limits = controller.effective_limits(
                 base_limits, now=started_monotonic
             )
@@ -232,6 +284,18 @@ class _AdaptiveLoopController:
         )
         self.idle_delay_seconds = self.idle_base_seconds
 
+    def parse_gate_until(self, *, now: float) -> float | None:
+        """Monotonic instant the parse gate lifts, or None when parse is open."""
+
+        gate_until = max(
+            self.parse_cooldown_until,
+            self.build_cooldown_until,
+            self.publish_cooldown_until,
+        )
+        if self.build_probe_required:
+            return max(gate_until, now)
+        return gate_until if now < gate_until else None
+
     def effective_limits(self, base: WorkerLimits, *, now: float) -> WorkerLimits:
         return replace(
             base,
@@ -260,7 +324,26 @@ class _AdaptiveLoopController:
             ),
             build=0 if now < self.build_cooldown_until else base.build,
             publish=0 if now < self.publish_cooldown_until else base.publish,
+            acquisition_seconds=self._acquisition_window(base, now=now),
         )
+
+    def _acquisition_window(self, base: WorkerLimits, *, now: float) -> int:
+        """Shrink the pump window to the parse gate when parse is closed.
+
+        A parse=0 round otherwise pumps the FULL window: a 120s parse
+        cooldown then keeps the GPU idle for the whole acquisition hour,
+        because parse only retries at round start (observed 2026-07-24 —
+        one transient probe failure amplified into an hour of idle GPU).
+        Tracking the gate keeps outage rounds short at first and lets them
+        grow with the cooldown's own exponential backoff, so a real outage
+        still fills the download buffer on ever-longer rounds.
+        """
+
+        gate_until = self.parse_gate_until(now=now)
+        if gate_until is None:
+            return base.acquisition_seconds
+        remaining = max(60, int(gate_until - now) + 1)
+        return min(base.acquisition_seconds, remaining)
 
     def observe(self, report: WorkerReport, *, now: float) -> float:
         # Reaching a report proves the round-level dependency boundary is

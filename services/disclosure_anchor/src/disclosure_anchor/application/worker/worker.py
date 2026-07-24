@@ -79,15 +79,10 @@ from disclosure_anchor.domain.errors import (
 )
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+# Single source in worker/queries.py: the queue's retry-budget predicate and
+# the scheduler's outage detection must agree on what "infrastructure" means.
 PARSER_INFRASTRUCTURE_ERROR_CODES = frozenset(
-    {
-        "parse_timeout",
-        "parser_timeout",
-        "parser_invocation_failed",
-        "ParserInvocationError",
-        "ParserTimeoutError",
-        "parser_version_probe_failed",
-    }
+    queries.PARSE_INFRASTRUCTURE_ERROR_CODES
 )
 PROVIDER_INFRASTRUCTURE_ERROR_CODES = frozenset(
     {
@@ -176,6 +171,13 @@ class WorkerDeps:
     # Tests/other callers retain the legacy per-round close by default.
     source_close_after_round: bool = True
     close_source: Callable[[], None] = lambda: None
+    # Liveness heartbeat, bumped at item granularity (download landed, sync
+    # company done, document chain folded, projection batch committed). The
+    # CLI's wedge watchdog reads it: rounds may legitimately run for hours,
+    # but zero progress beyond the single-document parse timeout means a
+    # wedge (hung DNS, TCC-blocked spawn, pathological query) — fail loudly
+    # and let launchd relaunch instead of holding the round open forever.
+    heartbeat: Callable[[], None] = lambda: None
 
 
 def _merge_acquisition_report(
@@ -527,6 +529,7 @@ def _sync_stage(
             continue
         report.synced_companies += 1
         report.candidates_discovered += result.candidate_count
+        deps.heartbeat()
         if never_synced and processing_backlog_now is not None:
             # Conservative in-round cache: candidate_count can include rows
             # already known from overlap, so it may overestimate but cannot
@@ -713,6 +716,7 @@ def _download_stage(
             continue
         if result.document_id is not None:
             report.downloaded += 1
+            deps.heartbeat()
         else:
             report.failed += 1
             report.failures.append(
@@ -979,6 +983,7 @@ def _parse_one_batch(
                 return "halt"
             outcome = _process_one_document(deps, document_id)
             _fold_outcome(report, outcome)
+            deps.heartbeat()
             if _halts_parse_refill(outcome, report.failures):
                 return "halt"
         return "done"
@@ -1020,6 +1025,7 @@ def _parse_one_batch(
                         )
                     )
                 _fold_outcome(report, outcome)
+                deps.heartbeat()
                 failure = outcome.failure
                 if (
                     failure is not None
@@ -1174,6 +1180,7 @@ def _project_stage(
         result = BuildSearchProjection(engine=deps.engine).execute(
             BuildSearchProjectionCommand(full=False, limit=None, prune=prune),
             should_stop=should_stop,
+            on_progress=deps.heartbeat,
         )
     except Exception as exc:
         report.failed += 1

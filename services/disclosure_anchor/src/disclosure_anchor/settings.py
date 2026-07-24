@@ -287,6 +287,17 @@ class Settings(BaseSettings):
             "worker_loop_max_interval_seconds",
         ),
     )
+    # Wedge watchdog: exit loudly (launchd relaunches) when NOTHING has
+    # progressed for this long. Must exceed the longest legal silent gap —
+    # one document parse timeout (a cold batch of heavy documents completes
+    # nothing until its first document finishes) plus margin. 0 disables.
+    worker_wedge_timeout_seconds: int = Field(
+        default=2700,
+        ge=0,
+        validation_alias=AliasChoices(
+            "WORKER_WEDGE_TIMEOUT_SECONDS", "worker_wedge_timeout_seconds"
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_parallel_parser_backend(self) -> "Settings":
