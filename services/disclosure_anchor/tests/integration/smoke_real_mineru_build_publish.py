@@ -25,7 +25,11 @@ from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
 from disclosure_anchor.application.use_cases.build_units import BuildUnits, BuildUnitsCommand
 from disclosure_anchor.application.use_cases.parse_document import ParseDocument, ParseDocumentCommand
-from disclosure_anchor.application.use_cases.publish_run import PublishRun, PublishRunCommand
+from disclosure_anchor.application.use_cases.publish_run import (
+    NormalizedIRPublicationGuard,
+    PublishRun,
+    PublishRunCommand,
+)
 from disclosure_anchor.application.use_cases.register_local_pdf import (
     RegisterLocalPdf,
     RegisterLocalPdfCommand,
@@ -222,7 +226,10 @@ class Milestone05RealMinerUBuildPublishSmoke(unittest.TestCase):
         self.assertEqual(built.status, "succeeded", built.error)
         self.assertGreater(built.unit_count, 0)
 
-        published = PublishRun(uow_factory=self._uow).execute(
+        published = PublishRun(
+            uow_factory=self._uow,
+            publication_guard=NormalizedIRPublicationGuard(self.paths),
+        ).execute(
             PublishRunCommand(processing_run_id=parsed.processing_run_id)
         )
         self.assertEqual(published.status, "published")

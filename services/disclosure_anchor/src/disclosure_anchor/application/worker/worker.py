@@ -58,8 +58,10 @@ from disclosure_anchor.application.use_cases.parse_document import (
     ParseDocumentCommand,
 )
 from disclosure_anchor.application.use_cases.publish_run import (
+    NormalizedIRPublicationGuard,
     PublishRun,
     PublishRunCommand,
+    TERMINAL_PUBLICATION_ERROR_CODES,
 )
 from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     SyncDisclosureIndex,
@@ -81,12 +83,11 @@ from disclosure_anchor.domain.errors import (
 LOGGER = logging.getLogger(__name__)
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 # The dispatcher, rather than a document future, owns the resident-worker
-# heartbeat.  Long documents may legally remain silent for hours, so wake the
-# dispatcher periodically while at least one admitted parse is still inside
-# its page-aware deadline.  Once every deadline expires, stop extending
-# liveness and let the outer wedge watchdog fail the process loudly.
-PARSE_LEGAL_WINDOW_HEARTBEAT_SECONDS = 30.0
-PARSE_LEGAL_WINDOW_GRACE_SECONDS = 60.0
+# heartbeat. Long documents may legally remain silent for hours, so wake the
+# dispatcher periodically while at least one registered parse is still owned.
+# The adapter's remote runaway guard, not the page estimate, bounds a child
+# that remains alive but never returns.
+PARSE_HEARTBEAT_INTERVAL_SECONDS = 30.0
 # A readiness probe is an admission gate, not a liveness verdict. One remote
 # connect timeout is common even while the backend is serving requests; only
 # consecutive failures should end the parse round and enter cooldown.
@@ -130,6 +131,7 @@ BUILD_INFRASTRUCTURE_ERROR_CODES = frozenset(
         "DB_WRITE_FAILED",
         "DatabaseError",
         "InterfaceError",
+        "IR_READ_FAILED",
         "OSError",
         "OperationalError",
     }
@@ -137,11 +139,26 @@ BUILD_INFRASTRUCTURE_ERROR_CODES = frozenset(
 BUILD_ITEM_LOCAL_ERROR_CODES = frozenset(
     {
         "IR_CONTRACT_TOO_OLD",
+        "IR_CONTRACT_UNSUPPORTED",
+        "IR_HASH_MISMATCH",
         "IR_MISSING",
+        "PARTIAL_PDF_NOT_PUBLISHABLE",
         "RUN_NOT_FOUND",
         "RUN_NOT_SUCCEEDED",
         "UNITS_ALREADY_BUILT",
     }
+)
+PUBLISH_INFRASTRUCTURE_ERROR_CODES = BUILD_INFRASTRUCTURE_ERROR_CODES
+PUBLISH_ITEM_LOCAL_ERROR_CODES = frozenset(
+    {
+        "ALLOW_EMPTY_REASON_REQUIRED",
+        "EMPTY_RUN",
+        "RUN_HASH_AGGREGATE_INVALID",
+        "RUN_NOT_FOUND",
+        "RUN_NOT_SUCCEEDED",
+        "UNITS_NOT_BUILT",
+    }
+    | TERMINAL_PUBLICATION_ERROR_CODES
 )
 
 
@@ -155,6 +172,8 @@ class WorkerConfig:
     sync_interval_seconds: int
     cninfo_overlap_days: int
     cninfo_max_retries: int
+    # Legacy name: archived byte-size threshold for the HUGE lane only.
+    # Large documents remain eligible and may borrow the full idle pool.
     cninfo_oversized_kb: int
     # First-sync historical backfill (user decision: 三年是底线).
     initial_lookback_days: int = 1095
@@ -176,10 +195,13 @@ class WorkerConfig:
     parse_huge_saturated_share: int = 1
     parse_candidate_window: int = 200
     finalize_concurrency: int = 2
-    # A page-aware deadline handles one-page notices and ~1,000-page filings
-    # without making every document inherit the largest possible timeout.
+    # Page-aware expected-duration envelope. It drives one soft warning only;
+    # it must never terminate a healthy whole-document parse.
     parse_timeout_per_page_seconds: int = 12
     parse_timeout_max_seconds: int = 14400
+    # Remote last-resort guard for a child process that remains alive but
+    # never returns. Normal long documents continue through the soft envelope.
+    parse_runaway_timeout_seconds: int = 86400
 
 
 @dataclass(frozen=True)
@@ -196,7 +218,7 @@ class WorkerDeps:
         [DisclosureSourcePort], Callable[[str], SourceCompanyProfile | None]
     ]
     parser_factory: Callable[[], DocumentParserPort]
-    parse_timeout_seconds: int
+    parse_expected_seconds: int
     config: WorkerConfig
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
     # Settings-driven parse defaults (backend/server_url cascade) — the CLI
@@ -204,20 +226,22 @@ class WorkerDeps:
     parser_options: ParserOptions = ParserOptions()
     # Read-only cost probe injected by the composition root. A failed/unknown
     # probe never blocks parsing, but enters the resource-conservative heavy
-    # lane with the base timeout rather than masquerading as a cheap notice.
+    # lane and uses the base expected-duration envelope rather than
+    # masquerading as a cheap notice.
     page_counter: Callable[[Path], int] | None = None
     # CLI resident mode owns one lazy CNINFO client for the process lifetime,
     # preserving both its token cache and 1-QPS bucket across zero-wait rounds.
     # Tests/other callers retain the legacy per-round close by default.
     source_close_after_round: bool = True
     close_source: Callable[[], None] = lambda: None
-    # Liveness heartbeat, bumped at item granularity and periodically by the
-    # dispatcher while a parse is inside its page-aware legal deadline. The
-    # CLI watchdog may therefore stay shorter than the largest huge-document
-    # timeout; after all admitted deadlines expire, the dispatcher stops
-    # extending liveness so a hung child still fails loudly and launchd can
-    # relaunch it.
+    # Liveness heartbeat, bumped at item granularity and periodically while a
+    # whole parse future remains inside its extreme runaway lease.
     heartbeat: Callable[[], None] = lambda: None
+    # Python threads cannot be killed safely. Production injects a
+    # process-supervisor handoff that terminates registered MinerU groups and
+    # exits for launchd replacement when the entire parse future (including
+    # artifact read/map/store/DB finish) exceeds the extreme lease.
+    on_parse_runaway: Callable[[str], None] = lambda _document_id: None
     # Resident production wiring re-validates the dedicated PostgreSQL
     # singleton session before every admission boundary and during long
     # waits. Losing that session must stop active MinerU groups before this
@@ -234,7 +258,6 @@ def _merge_acquisition_report(
     report.candidates_discovered += acquisition.candidates_discovered
     report.downloaded += acquisition.downloaded
     report.deferred_backfill += acquisition.deferred_backfill
-    report.skipped_oversized += acquisition.skipped_oversized
     report.failed += acquisition.failed
     report.sync_quota_break = (
         report.sync_quota_break or acquisition.sync_quota_break
@@ -753,10 +776,7 @@ def _download_stage(
             continue
         try:
             result = downloader.execute(
-                DownloadDocumentCommand(
-                    candidate=candidate,
-                    oversized_kb=deps.config.cninfo_oversized_kb,
-                )
+                DownloadDocumentCommand(candidate=candidate)
             )
         except Exception as exc:
             error_code, retryable = _source_error_details(exc)
@@ -816,6 +836,7 @@ class _DocOutcome:
 class _ParseWorkItem:
     document_id: str
     page_count: int | None
+    raw_byte_count: int | None
 
 
 class _ParseLane(str, Enum):
@@ -828,21 +849,27 @@ class _ParseLane(str, Enum):
 class _InFlightParse:
     item: _ParseWorkItem
     lane: _ParseLane
-    legal_until_monotonic: float
+    expected_seconds: int
+    expected_until_monotonic: float
+    runaway_until_monotonic: float
 
 
 def _parse_work_items(
     pending: Iterable[dict[str, Any]],
     *,
     deps: WorkerDeps,
-    report: WorkerReport,
 ) -> list[_ParseWorkItem]:
     items: list[_ParseWorkItem] = []
     for row in pending:
-        if bool(row.get("oversized")):
-            report.skipped_oversized += 1
-            continue
         page_count: int | None = None
+        raw_byte_count_value = row.get("raw_byte_count")
+        raw_byte_count = (
+            raw_byte_count_value
+            if isinstance(raw_byte_count_value, int)
+            and not isinstance(raw_byte_count_value, bool)
+            and raw_byte_count_value >= 0
+            else None
+        )
         raw_file_relpath = row.get("raw_file_relpath")
         if deps.page_counter is not None and isinstance(raw_file_relpath, str):
             try:
@@ -857,12 +884,22 @@ def _parse_work_items(
             _ParseWorkItem(
                 document_id=str(row["document_id"]),
                 page_count=page_count,
+                raw_byte_count=raw_byte_count,
             )
         )
     return items
 
 
 def _parse_lane(item: _ParseWorkItem, config: WorkerConfig) -> _ParseLane:
+    # CNINFO's provider size hint is not unit-stable. The queue supplies the
+    # archived raw byte count instead, and the legacy-named threshold now
+    # means isolation only: even a very large PDF remains parse-eligible.
+    if (
+        config.cninfo_oversized_kb > 0
+        and item.raw_byte_count is not None
+        and item.raw_byte_count > config.cninfo_oversized_kb * 1024
+    ):
+        return _ParseLane.HUGE
     if item.page_count is None:
         return _ParseLane.HEAVY
     if item.page_count >= config.parse_huge_page_threshold:
@@ -917,7 +954,7 @@ def _parse_lane_caps(
     return caps
 
 
-def _parse_timeout_seconds(deps: WorkerDeps, item: _ParseWorkItem) -> int:
+def _parse_expected_seconds(deps: WorkerDeps, item: _ParseWorkItem) -> int:
     page_budget = (
         0
         if item.page_count is None
@@ -925,7 +962,7 @@ def _parse_timeout_seconds(deps: WorkerDeps, item: _ParseWorkItem) -> int:
     )
     return min(
         deps.config.parse_timeout_max_seconds,
-        max(deps.parse_timeout_seconds, page_budget),
+        max(deps.parse_expected_seconds, page_budget),
     )
 
 
@@ -936,7 +973,7 @@ def _parse_one_document(
 
     outcome = _DocOutcome()
     document_id = item.document_id
-    timeout_seconds = _parse_timeout_seconds(deps, item)
+    timeout_seconds = deps.config.parse_runaway_timeout_seconds
     try:
         parse_use_case = ParseDocument(
             parser=deps.parser_factory(),
@@ -1020,7 +1057,10 @@ def _finalize_one_document(
         if build_result.build_stats:
             outcome.build_stats = dict(build_result.build_stats)
         stage = "publish"
-        publish_result = PublishRun(uow_factory=deps.uow_factory).execute(
+        publish_result = PublishRun(
+            uow_factory=deps.uow_factory,
+            publication_guard=NormalizedIRPublicationGuard(deps.path_builder),
+        ).execute(
             PublishRunCommand(processing_run_id=processing_run_id)
         )
         if publish_result.status != "published":
@@ -1083,12 +1123,38 @@ def build_failures_indicate_outage(
     return any(count >= 2 for count in unknown_counts.values())
 
 
+def publish_failures_indicate_outage(
+    failures: Iterable[WorkerFailure],
+) -> bool:
+    """Keep deterministic publication poison local to its processing run."""
+
+    publish_codes = [
+        failure.error_code
+        for failure in failures
+        if failure.stage == "publish"
+    ]
+    if any(
+        code in PUBLISH_INFRASTRUCTURE_ERROR_CODES
+        for code in publish_codes
+    ):
+        return True
+    unknown_counts = Counter(
+        code
+        for code in publish_codes
+        if code not in PUBLISH_ITEM_LOCAL_ERROR_CODES
+    )
+    return any(count >= 2 for count in unknown_counts.values())
+
+
 def _halts_parse_refill(
     outcome: _DocOutcome, failures: Iterable[WorkerFailure]
 ) -> bool:
     failure = outcome.failure
     return failure is not None and (
-        failure.stage == "publish"
+        (
+            failure.stage == "publish"
+            and publish_failures_indicate_outage(failures)
+        )
         or (failure.stage == "build" and build_failures_indicate_outage(failures))
         or (
             failure.stage == "parse"
@@ -1194,7 +1260,7 @@ def _parse_one_batch(
             for row in pending
             if str(row["document_id"]) not in known_ids
         )
-        return _parse_work_items(unseen, deps=deps, report=report)
+        return _parse_work_items(unseen, deps=deps)
 
     readiness_failures = 0
     readiness_retry_at = 0.0
@@ -1281,6 +1347,8 @@ def _parse_one_batch(
     ):
         parse_futures: dict[Future[_DocOutcome], _InFlightParse] = {}
         finalize_futures: dict[Future[_DocOutcome], str] = {}
+        expected_duration_warned: set[Future[_DocOutcome]] = set()
+        runaway_duration_warned: set[Future[_DocOutcome]] = set()
         lane_inflight = {lane: 0 for lane in _ParseLane}
 
         def halt_admission() -> None:
@@ -1358,18 +1426,21 @@ def _parse_one_batch(
                 ],
             )
             item = queued[lane].popleft()
-            legal_until = (
-                time.monotonic()
-                + _parse_timeout_seconds(deps, item)
-                + PARSE_LEGAL_WINDOW_GRACE_SECONDS
-            )
-            parse_futures[
-                parse_pool.submit(_parse_one_document, deps, item)
-            ] = (
+            expected_seconds = _parse_expected_seconds(deps, item)
+            admitted_at = time.monotonic()
+            future = parse_pool.submit(_parse_one_document, deps, item)
+            parse_futures[future] = (
                 _InFlightParse(
                     item=item,
                     lane=lane,
-                    legal_until_monotonic=legal_until,
+                    expected_seconds=expected_seconds,
+                    expected_until_monotonic=(
+                        admitted_at + expected_seconds
+                    ),
+                    runaway_until_monotonic=(
+                        admitted_at
+                        + deps.config.parse_runaway_timeout_seconds
+                    ),
                 )
             )
             lane_inflight[lane] += 1
@@ -1453,7 +1524,7 @@ def _parse_one_batch(
                 continue
 
             futures = tuple((*parse_futures, *finalize_futures))
-            wait_timeout = PARSE_LEGAL_WINDOW_HEARTBEAT_SECONDS
+            wait_timeout = PARSE_HEARTBEAT_INTERVAL_SECONDS
             if readiness_deferred:
                 wait_timeout = min(
                     wait_timeout,
@@ -1464,13 +1535,56 @@ def _parse_one_batch(
                 timeout=wait_timeout,
                 return_when=FIRST_COMPLETED,
             )
+            now = time.monotonic()
+            # Inspect every still-pending parse even when another parse or
+            # finalize future completed. Otherwise a stream of short peers can
+            # indefinitely hide one stuck future from the extreme lease.
+            for future, admitted in parse_futures.items():
+                # A future can complete after wait() captured its result set
+                # but before this scan. Never hand an already-finished
+                # 24-hour result to the process supervisor as a runaway.
+                if future in completed or future.done():
+                    continue
+                if now >= admitted.runaway_until_monotonic:
+                    if future not in runaway_duration_warned:
+                        LOGGER.error(
+                            "MinerU whole parse future exceeded the "
+                            "extreme runaway lease: document_id=%s "
+                            "lane=%s page_count=%s "
+                            "runaway_guard_seconds=%s; closing admission "
+                            "and handing off to the process supervisor",
+                            admitted.item.document_id,
+                            admitted.lane.value,
+                            admitted.item.page_count,
+                            deps.config.parse_runaway_timeout_seconds,
+                        )
+                        runaway_duration_warned.add(future)
+                        halt_admission()
+                        deps.on_parse_runaway(admitted.item.document_id)
+                    continue
+                if (
+                    future in expected_duration_warned
+                    or now < admitted.expected_until_monotonic
+                ):
+                    continue
+                LOGGER.warning(
+                    "MinerU parse exceeded its soft expected-duration "
+                    "envelope and will continue: document_id=%s lane=%s "
+                    "page_count=%s expected_seconds=%s "
+                    "runaway_guard_seconds=%s",
+                    admitted.item.document_id,
+                    admitted.lane.value,
+                    admitted.item.page_count,
+                    admitted.expected_seconds,
+                    deps.config.parse_runaway_timeout_seconds,
+                )
+                expected_duration_warned.add(future)
             if not completed:
                 deps.admission_guard()
-                now = time.monotonic()
                 if readiness_deferred and now >= readiness_retry_at:
                     refill()
                 if any(
-                    admitted.legal_until_monotonic > now
+                    now < admitted.runaway_until_monotonic
                     for admitted in parse_futures.values()
                 ):
                     deps.heartbeat()
@@ -1478,6 +1592,8 @@ def _parse_one_batch(
 
             for future in completed & parse_futures.keys():
                 admitted = parse_futures.pop(future)
+                expected_duration_warned.discard(future)
+                runaway_duration_warned.discard(future)
                 lane_inflight[admitted.lane] -= 1
                 try:
                     outcome = future.result()
@@ -1598,7 +1714,10 @@ def _publish_stage(
 ) -> None:
     with deps.engine.connect() as conn:
         pending = queries.pending_publish(conn, limit=limit)
-    use_case = PublishRun(uow_factory=deps.uow_factory)
+    use_case = PublishRun(
+        uow_factory=deps.uow_factory,
+        publication_guard=NormalizedIRPublicationGuard(deps.path_builder),
+    )
     for row in pending:
         if should_stop():
             return
@@ -1609,12 +1728,23 @@ def _publish_stage(
             # Continue with the rest of the batch: a single deterministically
             # failing run must not head-of-line block every other document's
             # publish round after round (round23).
+            structured_error = getattr(exc, "error", None)
+            error_code = (
+                _error_code(structured_error)
+                if isinstance(structured_error, dict)
+                else type(exc).__name__
+            )
             report.failed += 1
             report.failures.append(
                 WorkerFailure(
                     stage="publish",
                     item_ref=run_id,
-                    error_code=type(exc).__name__,
+                    error_code=error_code,
+                    retryable=(
+                        bool(structured_error.get("retryable"))
+                        if isinstance(structured_error, dict)
+                        else None
+                    ),
                     message=str(exc)[:500],
                 )
             )
@@ -1689,7 +1819,6 @@ def render_report_section(report: WorkerReport) -> str:
         f"- published: {report.published}",
         f"- projected: {report.projected}",
         f"- failed: {report.failed}",
-        f"- skipped_oversized: {report.skipped_oversized}",
         f"- deferred_backfill: {report.deferred_backfill}",
         f"- sync_quota_break: {report.sync_quota_break}",
         f"- sync_rate_limited: {report.sync_rate_limited}",

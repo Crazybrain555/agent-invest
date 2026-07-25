@@ -23,7 +23,8 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
 
 - [x] **[blocker]** No batch company-list intake → pipeline track + config/watchlist.csv（离线幂等，PENDING_LEGAL_NAME 占位+首同步升级）
 - [x] **[blocker]** No default initial backfill window → DISCLOSURE_INITIAL_LOOKBACK_DAYS=1095（用户裁决三年底线）+ tracked.lookback 覆盖，CLI/worker 双路径
-- [x] **[blocker]** Oversized documents permanently occupy parse-queue slots and can wedge the whole → pending_parse SQL 级排除 oversized（原为 LIMIT 后跳过占满槽位）
+- [x] **[blocker]** 大文档永久占 parse batch 槽 → 2026-07-25 复核后废止大小硬排除；
+  pending_parse 返回归档 actual byte_count，worker 送入可借用 HUGE lane
 - [x] **[blocker]** No mechanism delivers required environment to automated runs; the shipped launch → ~/.config/agent-invest/disclosure_anchor/{worker,cninfo}.env + scripts/run_worker_once.sh + launchd 模板/安装脚本
 - [x] **[blocker]** Real CNINFO credentials stored inside the repo checkout .env despite placeholder → 凭据迁至 ~/.config（chmod 600），.env 只留指引；密钥需用户轮换
 - [x] **[blocker]** Unauthenticated /v1/admin write endpoints are always mounted on the same app as  → DISCLOSURE_ENABLE_ADMIN_API 默认关闭 + ParserOptions 闭集词表（防 argv 注入）

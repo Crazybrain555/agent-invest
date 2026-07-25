@@ -136,14 +136,13 @@ core.tracked_company（0001 已有表，单数名；≥500 精选池，本期验
    `PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline sync --company $(COMPANY) $(if $(WINDOW),--window $(WINDOW))`
    （加入 .PHONY）。首次对某公司 sync 时经 SubjectResolver 建 company/security 并
    upsert core.tracked_company(status='active')——这也是验收样本池的种子方式。
-9. **巨型文档护栏（2026-07-05 实战新增）**：F005N > `CNINFO_OVERSIZED_KB`（settings，
-   默认 10240 即 10MB）的候选**照常下载归档与登记**（原文不可变原则不受影响），但
-   register 时在 `document.provider_metadata` 记 `"oversized": true`；08 的 parse 批次
-   跳过 oversized 文档（见 08 §3.1），人工用 `make parse DOC=<id>` 配更高
-   DISCLOSURE_PARSE_TIMEOUT_SECONDS 单独跑。依据：比亚迪 H 股年度业绩公布实测
-   21MB/368 页 A3 双语 ≈4.1s/页，必超 1800s 默认超时，MAX_PARSE_RETRIES=3 会烧 90 分钟
-   worker 时间。双上市公司（池内 002594）的 H 股公告类也可在
-   tracked_company.filing_categories 客户端过滤中直接排除（更源头的选项，运营配置决定）。
+9. **巨型文档调度（2026-07-25 根因修订）**：F005N/adjunctSize 必须原样保存为不透明
+   provider signature hint，不能假定为 KB。真实语料同时存在 KB-like、bytes-like 与无法
+   安全归类的数值；下载完成后绑定 raw hash 的
+   `source_access.result_snapshot.byte_count` 才是调度用字节事实。兼容名
+   `CNINFO_OVERSIZED_KB` 仅决定 actual bytes 超阈值时进入 HUGE lane，不再阻止自动解析；
+   大文档在混合队列保留隔离槽，队列只有大文档时可借满空闲容量。页数与字节只影响成本/份额，
+   不切 PDF、不把正常长耗时当失败，极端 whole-future runaway 由 08 的监督边界处理。
 
 ## 4. 检查点
 
@@ -177,7 +176,7 @@ supersedes。真实 API 冒烟（人工触发、不进 CI）：1 家公司 1 窗
 
 - 每包提交门禁 = `make agent-check` + live-DB `make test`（04R §6.1 2026-07-05 修订）；
 - 10 家样本池 sync→download→register→parse→build→publish 全链跑通（05 已完成，直接验证；
-  oversized 文档按 §3.9 跳过 parse 属预期）；
+  大文档按 §3.9 进入隔离 lane 但仍自动解析）；
 - 失败状态可定位（source_access + 结构化错误）；
 - acceptance-matrix A25/A26/A27 置 pass（A28 此前已 pass，不重复认领）。
 
@@ -189,13 +188,14 @@ supersedes。真实 API 冒烟（人工触发、不进 CI）：1 家公司 1 窗
   退化为 other。
 - **免凭据兜底通道**（用户决策：配额不可查，建保险通道）：`adapters/sources/cninfo/web_source.py`
   走官网 hisAnnouncement/query + szse_stock.json(code→orgId)。同 provider 命名空间——实测
-  announcementId==TEXTID、adjunctSize==F005N(KB)，去重键/文件签名跨通道通用；无档案
+  announcementId==TEXTID；大小字段只作为不透明 provider 签名，去重最终以 raw hash 为准；无档案
   (SubjectCandidate.legal_name=None="无名称主张"，resolver 不视为冲突)、无 F006V
   (filing_type 从标题走同一规则包)。CLI：`sync --channel api|web`（默认 api）；
   provenance 词表新增 `cninfo:hisAnnouncement`，待下载队列同时消费两通道候选。
 - **验收证据**（A25/A26/A27 pass）：10/10 家真实同步共 464 份，核心字段零空值；年报 15 份
-  全带 2025A、一季报 10 份全带 2026Q1；oversized 护栏真实拦截 14 份 >10MB 巨型文件
-  （最大 91MB 万科可持续发展报告）；查空/断点续跑/跨通道幂等均在真实数据上验证；
+  全带 2025A、一季报 10 份全带 2026Q1；2026-07-25 全库复核证明旧大小护栏误将
+  88 份 0.1–0.7 MiB 普通 PDF 排除，现改为 actual byte_count + lane 隔离；查空/断点续跑/
+  跨通道幂等均在真实数据上验证；
   真实全链 sync→…→publish 打通（平安董事会决议 1225406051 → 1 unit published，
   doctor 深检 aggregate ok）。中芯国际(688981)无 USCC 属正确现实（开曼红筹主体，D5 边界）。
 

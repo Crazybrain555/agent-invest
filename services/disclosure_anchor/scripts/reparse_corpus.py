@@ -92,7 +92,7 @@ def _worklist(
             )
             for row in pending:
                 document_id = str(row["document_id"])
-                if bool(row.get("oversized")) or document_id in seen:
+                if document_id in seen:
                     continue
                 seen.add(document_id)
                 items.append((document_id, "pending"))

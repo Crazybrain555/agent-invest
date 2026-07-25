@@ -49,6 +49,10 @@ class SettingsTests(unittest.TestCase):
                     "WORKER_PARSE_HEAVY_PAGE_THRESHOLD": "80",
                     "WORKER_PARSE_HUGE_PAGE_THRESHOLD": "80",
                 },
+                {
+                    "DISCLOSURE_PARSE_TIMEOUT_MAX_SECONDS": "14400",
+                    "DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS": "14399",
+                },
             ):
                 with self.subTest(extra=extra), patch.dict(
                     os.environ, {**base, **extra}, clear=True
@@ -85,6 +89,9 @@ class SettingsTests(unittest.TestCase):
                 settings.disclosure_parse_timeout_per_page_seconds, 12
             )
             self.assertEqual(settings.disclosure_parse_timeout_max_seconds, 14400)
+            self.assertEqual(
+                settings.disclosure_parse_runaway_timeout_seconds, 86400
+            )
             self.assertIsNone(settings.disclosure_mineru_bin)
             self.assertEqual(settings.cninfo_max_qps, 1.0)
             self.assertEqual(settings.cninfo_max_retries, 3)
@@ -109,6 +116,7 @@ class SettingsTests(unittest.TestCase):
                     "DISCLOSURE_PARSE_TIMEOUT_SECONDS": "42",
                     "DISCLOSURE_PARSE_TIMEOUT_PER_PAGE_SECONDS": "3",
                     "DISCLOSURE_PARSE_TIMEOUT_MAX_SECONDS": "99",
+                    "DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS": "360",
                     "DISCLOSURE_MINERU_BIN": "/opt/mineru/bin/mineru",
                 }
             )
@@ -130,6 +138,9 @@ class SettingsTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     settings.disclosure_parse_timeout_max_seconds, 99
+                )
+                self.assertEqual(
+                    settings.disclosure_parse_runaway_timeout_seconds, 360
                 )
                 self.assertEqual(
                     settings.disclosure_mineru_bin, Path("/opt/mineru/bin/mineru")

@@ -70,8 +70,11 @@
 | WORKER_PARSE_CONCURRENCY | 16（生产模板） | 文档槽，不是 GPU 请求数；本地 CPU backend 必须设 1 |
 | WORKER_GPU_REQUEST_BUDGET / MAX_SEQUENCES | 112 / 128 | resident worker 稳态请求包络；16 文档时每份 MinerU `--max-concurrency=7` |
 | WORKER_PARSE_*_PAGE_THRESHOLD / SATURATED_SHARE | 80/4、500/1 | regular/heavy/huge 名义份额；lane 空闲时允许借用 |
+| CNINFO_OVERSIZED_KB | 10240 | 兼容旧名；以归档 actual byte_count 判定 HUGE lane，不是下载/解析上限 |
 | WORKER_PARSE_CANDIDATE_WINDOW | 1000 | 每次公平选择的候选前缀；不是第二份耐久队列 |
 | WORKER_FINALIZE_CONCURRENCY | 2 | parse 后 build/publish 的有界下游池 |
+| DISCLOSURE_PARSE_TIMEOUT_* | 3600 / 12-per-page / 14400 | 页数感知的软预期耗时，只告警、不终止正常长文档 |
+| DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS | 86400 | 极端 live-but-stuck 进程保护；整本文档默认可运行 24 小时 |
 | WORKER_LOOP_INTERVAL_SECONDS / MAX | 900 / 1800 | 仅空队列使用的 15→30 分钟退避；有进展时不睡眠 |
 | MINERU_PROCESSING_WINDOW_SIZE | 16 | GPU 页窗口红线（round22h OOM 后定案） |
 | CNINFO_* | — | 凭据（只进环境，绝不进仓） |

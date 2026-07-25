@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
+from disclosure_anchor.application.contracts.normalized_ir import (
+    CURRENT_NORMALIZED_IR_VERSION,
+)
 from disclosure_anchor.application.use_cases.publish_run import (
+    NormalizedIRPublicationGuard,
     PublishRun,
     PublishRunCommand,
     _validate_candidate_unit_set,
@@ -116,6 +124,72 @@ def _sync_run_hashes(uow: FakeUnitOfWork, run_id: str) -> None:
     )
 
 
+def _allow_whole_pdf(_run: e.ProcessingRun) -> None:
+    """Unit tests below isolate publish semantics from artifact I/O."""
+
+
+class _PathBuilder:
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def data_path(self, relpath: Path) -> Path:
+        return self._root / relpath
+
+
+class _UnreadablePathBuilder(_PathBuilder):
+    def data_path(self, relpath: Path) -> Path:
+        raise PermissionError("simulated shared data-store outage")
+
+
+def _normalized_ir(*, full_pdf: bool) -> dict[str, object]:
+    return {
+        "contract_version": CURRENT_NORMALIZED_IR_VERSION,
+        "created_at": "2026-07-25T00:00:00Z",
+        "document_id": "doc_1",
+        "source_pdf": "raw.pdf",
+        "title": "公告",
+        "parser": {
+            "name": "MinerU",
+            "package_version": "3.4.0",
+            "backend": "pipeline",
+            "method": "auto",
+            "language": "ch",
+            "formula": False,
+            "table": True,
+        },
+        "parser_artifacts": {
+            "artifact_root_relpath": "parser/a",
+            "content_list_relpath": "parser/a/content.json",
+        },
+        "parsed_pages": {
+            "start_page_no": 1,
+            "end_page_no": 1,
+            "full_pdf": full_pdf,
+        },
+        "elements": [
+            {
+                "ir_id": "ir_1",
+                "kind": "text",
+                "raw_kind": "text",
+                "order_index": 1,
+                "source_item_index": 1,
+                "text": "正文",
+            }
+        ],
+    }
+
+
+def _publisher(
+    uow: FakeUnitOfWork,
+    *,
+    publication_guard=_allow_whole_pdf,  # noqa: ANN001
+) -> PublishRun:
+    return PublishRun(
+        uow_factory=lambda: uow,
+        publication_guard=publication_guard,
+    )
+
+
 class PublishRunTests(unittest.TestCase):
     def test_first_publish_creates_unit_events_then_published(self) -> None:
         uow = _uow_with_document()
@@ -124,7 +198,7 @@ class PublishRunTests(unittest.TestCase):
         uow.document_units.add(_unit("du_new_2", "run_new", order_index=2))
         _sync_run_hashes(uow, "run_new")
 
-        result = PublishRun(uow_factory=lambda: uow).execute(
+        result = _publisher(uow).execute(
             PublishRunCommand(processing_run_id="run_new")
         )
 
@@ -154,12 +228,78 @@ class PublishRunTests(unittest.TestCase):
         uow.processing_runs.add(_run("run_new", active=True))
         uow.document_units.add(_unit("du_new_1", "run_new"))
 
-        result = PublishRun(uow_factory=lambda: uow).execute(
+        result = _publisher(uow).execute(
             PublishRunCommand(processing_run_id="run_new")
         )
 
         self.assertTrue(result.idempotent)
         self.assertEqual(uow.outbox.all(), [])
+
+    def test_built_partial_pdf_is_rejected_before_publish_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            relpath = Path("normalized_ir.v3.json")
+            raw = json.dumps(
+                _normalized_ir(full_pdf=False),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8")
+            (root / relpath).write_bytes(raw)
+            uow = _uow_with_document()
+            run = _run("run_partial")
+            run.normalized_ir_relpath = str(relpath)
+            run.artifact_hash = "sha256:" + hashlib.sha256(raw).hexdigest()
+            uow.processing_runs.add(run)
+            uow.document_units.add(_unit("du_partial", "run_partial"))
+            _sync_run_hashes(uow, "run_partial")
+
+            with self.assertRaises(PublishRunError) as ctx:
+                _publisher(
+                    uow,
+                    publication_guard=NormalizedIRPublicationGuard(
+                        _PathBuilder(root)
+                    ),
+                ).execute(PublishRunCommand(processing_run_id="run_partial"))
+
+        self.assertEqual(
+            ctx.exception.error["error_code"],
+            "PARTIAL_PDF_NOT_PUBLISHABLE",
+        )
+        self.assertIsNone(uow.documents.get("doc_1").current_processing_run_id)
+        self.assertFalse(run.is_active)
+        self.assertEqual(run.unit_build_status, "failed")
+        self.assertEqual(
+            run.unit_build_error["error_code"],
+            "PARTIAL_PDF_NOT_PUBLISHABLE",
+        )
+        self.assertEqual(run.unit_build_attempt_count, 1)
+        self.assertEqual(uow.outbox.all(), [])
+
+        unavailable_uow = _uow_with_document()
+        unavailable_run = _run("run_storage_outage")
+        unavailable_run.normalized_ir_relpath = "normalized_ir.v3.json"
+        unavailable_uow.processing_runs.add(unavailable_run)
+        unavailable_uow.document_units.add(
+            _unit("du_storage_outage", "run_storage_outage")
+        )
+        _sync_run_hashes(unavailable_uow, "run_storage_outage")
+        with self.assertRaises(PublishRunError) as unavailable_ctx:
+            _publisher(
+                unavailable_uow,
+                publication_guard=NormalizedIRPublicationGuard(
+                    _UnreadablePathBuilder(Path("/unused"))
+                ),
+            ).execute(
+                PublishRunCommand(processing_run_id="run_storage_outage")
+            )
+        self.assertEqual(
+            unavailable_ctx.exception.error["error_code"],
+            "IR_READ_FAILED",
+        )
+        self.assertTrue(unavailable_ctx.exception.error["retryable"])
+        self.assertEqual(unavailable_run.unit_build_status, "succeeded")
+        self.assertIsNone(unavailable_run.unit_build_error)
 
     def test_multiset_duplicate_delete_removes_one_old_unit(self) -> None:
         old_units = [
@@ -438,7 +578,7 @@ class PublishRunTests(unittest.TestCase):
                 setattr(new_unit, field, "sha256:" + "f" * 64)
 
                 with self.assertRaises(PublishRunError) as ctx:
-                    PublishRun(uow_factory=lambda: uow).execute(
+                    _publisher(uow).execute(
                         PublishRunCommand(processing_run_id="run_new")
                     )
 
@@ -450,7 +590,13 @@ class PublishRunTests(unittest.TestCase):
                     "run_old",
                 )
                 self.assertTrue(uow.processing_runs.get("run_old").is_active)
-                self.assertFalse(uow.processing_runs.get("run_new").is_active)
+                failed_run = uow.processing_runs.get("run_new")
+                self.assertFalse(failed_run.is_active)
+                self.assertEqual(failed_run.unit_build_status, "failed")
+                self.assertEqual(
+                    failed_run.unit_build_error["error_code"],
+                    "RUN_UNIT_HASH_INVALID",
+                )
                 self.assertEqual(uow.outbox.all(), [])
 
     def test_candidate_aggregate_mismatch_fails_before_publish_mutation(self) -> None:
@@ -471,7 +617,7 @@ class PublishRunTests(unittest.TestCase):
                 )
 
                 with self.assertRaises(PublishRunError) as ctx:
-                    PublishRun(uow_factory=lambda: uow).execute(
+                    _publisher(uow).execute(
                         PublishRunCommand(processing_run_id="run_new")
                     )
 
@@ -507,7 +653,7 @@ class PublishRunTests(unittest.TestCase):
         _sync_run_hashes(uow, "run_new")
 
         with self.assertRaises(PublishRunError) as ctx:
-            PublishRun(uow_factory=lambda: uow).execute(
+            _publisher(uow).execute(
                 PublishRunCommand(processing_run_id="run_new")
             )
 
@@ -551,7 +697,7 @@ class PublishRunTests(unittest.TestCase):
         _sync_run_hashes(uow, "run_new")
 
         with self.assertRaises(PublishRunError) as ctx:
-            PublishRun(uow_factory=lambda: uow).execute(
+            _publisher(uow).execute(
                 PublishRunCommand(processing_run_id="run_new")
             )
 
@@ -581,7 +727,7 @@ class PublishRunTests(unittest.TestCase):
         )
         _sync_run_hashes(uow, "run_new")
 
-        result = PublishRun(uow_factory=lambda: uow).execute(
+        result = _publisher(uow).execute(
             PublishRunCommand(processing_run_id="run_new")
         )
 
@@ -607,7 +753,7 @@ class PublishRunTests(unittest.TestCase):
         uow.document_units.add(_unit("du_new", "run_new", payload={"text": "new"}))
         _sync_run_hashes(uow, "run_new")
 
-        result = PublishRun(uow_factory=lambda: uow).execute(
+        result = _publisher(uow).execute(
             PublishRunCommand(processing_run_id="run_new")
         )
 
@@ -631,13 +777,13 @@ class PublishRunTests(unittest.TestCase):
         uow.processing_runs.add(_run("run_empty"))
 
         with self.assertRaises(PublishRunError) as ctx:
-            PublishRun(uow_factory=lambda: uow).execute(
+            _publisher(uow).execute(
                 PublishRunCommand(processing_run_id="run_empty")
             )
 
         self.assertEqual(ctx.exception.error["error_code"], "EMPTY_RUN")
 
-        result = PublishRun(uow_factory=lambda: uow).execute(
+        result = _publisher(uow).execute(
             PublishRunCommand(
                 processing_run_id="run_empty",
                 allow_empty=True,

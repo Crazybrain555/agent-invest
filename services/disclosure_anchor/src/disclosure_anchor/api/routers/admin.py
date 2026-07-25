@@ -54,6 +54,7 @@ from disclosure_anchor.application.use_cases.parse_document import (
     ParseDocumentResult,
 )
 from disclosure_anchor.application.use_cases.publish_run import (
+    NormalizedIRPublicationGuard,
     PublishRun,
     PublishRunCommand,
 )
@@ -293,7 +294,7 @@ class AdminDeps:
                 artifact_store=self._artifacts,
                 uow_factory=self._uow_factory,
                 default_timeout_seconds=(
-                    self._settings.disclosure_parse_timeout_seconds
+                    self._settings.disclosure_parse_runaway_timeout_seconds
                 ),
             ).execute(
                 ParseDocumentCommand(
@@ -316,7 +317,10 @@ class AdminDeps:
         allow_empty: bool,
         reason: str | None,
     ) -> PublishRunResponse:
-        result = PublishRun(uow_factory=self._uow_factory).execute(
+        result = PublishRun(
+            uow_factory=self._uow_factory,
+            publication_guard=NormalizedIRPublicationGuard(self._paths),
+        ).execute(
             PublishRunCommand(
                 processing_run_id=processing_run_id,
                 allow_empty=allow_empty,

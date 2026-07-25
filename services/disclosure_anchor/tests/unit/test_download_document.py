@@ -57,18 +57,20 @@ class DownloadDocumentTests(unittest.TestCase):
         uow = _uow_with_subject()
         use_case = _use_case(uow, [b"%PDF-1.4\none\n%%EOF\n"])
 
-        result = use_case.execute(
-            DownloadDocumentCommand(candidate=_candidate(), oversized_kb=1024)
-        )
+        result = use_case.execute(DownloadDocumentCommand(candidate=_candidate()))
 
         self.assertIsNotNone(result.document_id)
         document = uow.documents.get(result.document_id)
         self.assertEqual(document.provider_document_id, "pid-1")
         self.assertEqual(document.provider_metadata["raw_category"], "010301")
         self.assertEqual(document.provider_metadata["file_signature"]["file_size"], 2048)
-        self.assertEqual(document.provider_metadata["oversized"], True)
+        self.assertNotIn("oversized", document.provider_metadata)
         source_access = uow.source_accesses.get(result.source_access_id)
         self.assertEqual(source_access.provider_interface, DOWNLOAD_INTERFACE)
+        self.assertEqual(
+            source_access.result_snapshot["byte_count"],
+            len(b"%PDF-1.4\none\n%%EOF\n"),
+        )
         self.assertEqual(uow.commit_count, 1)
 
     def test_same_provider_document_changed_file_supersedes_via_register_core(self) -> None:

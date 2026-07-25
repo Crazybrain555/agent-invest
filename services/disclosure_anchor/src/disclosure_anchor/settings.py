@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     modelscope_cache: Path = Field(
         validation_alias=AliasChoices("MODELSCOPE_CACHE", "modelscope_cache")
     )
+    # These legacy-named values now describe an expected-duration envelope,
+    # not a correctness deadline. Page count is a useful scheduling/alerting
+    # proxy, but OCR/table/image complexity makes it unsafe to kill a healthy
+    # whole-document parse merely because that estimate elapsed.
     disclosure_parse_timeout_seconds: int = Field(
         default=3600,
         ge=1,
@@ -72,8 +76,6 @@ class Settings(BaseSettings):
             "disclosure_parse_timeout_seconds",
         ),
     )
-    # A fixed deadline is wrong for a corpus spanning one to ~1,000 pages.
-    # The worker uses max(base, pages * per_page), bounded by max_seconds.
     disclosure_parse_timeout_per_page_seconds: int = Field(
         default=12,
         ge=0,
@@ -88,6 +90,18 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices(
             "DISCLOSURE_PARSE_TIMEOUT_MAX_SECONDS",
             "disclosure_parse_timeout_max_seconds",
+        ),
+    )
+    # Last-resort process-liveness guard. MinerU 3.4 has no durable page-level
+    # checkpoint or progress API, so normal long documents must be allowed to
+    # finish. This bound is deliberately remote from the expected envelope:
+    # it protects against a child that remains alive but never returns.
+    disclosure_parse_runaway_timeout_seconds: int = Field(
+        default=86400,
+        ge=1,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS",
+            "disclosure_parse_runaway_timeout_seconds",
         ),
     )
     disclosure_mineru_bin: Optional[Path] = Field(
@@ -199,6 +213,9 @@ class Settings(BaseSettings):
             "DISCLOSURE_PROCESSING_POLICY", "disclosure_processing_policy_path"
         ),
     )
+    # Legacy env name retained for compatibility. This is now a scheduling
+    # isolation threshold over the archived raw byte_count, never a parse
+    # eligibility limit and never a unit assumption about CNINFO F005N.
     cninfo_oversized_kb: int = Field(
         default=10240,
         ge=0,
@@ -375,10 +392,11 @@ class Settings(BaseSettings):
             "worker_loop_max_interval_seconds",
         ),
     )
-    # Wedge watchdog: exit loudly (launchd relaunches) when NOTHING has
-    # progressed for this long. Must exceed the longest legal silent gap —
-    # one document parse timeout (a cold batch of heavy documents completes
-    # nothing until its first document finishes) plus margin. 0 disables.
+    # Wedge watchdog: exit loudly (launchd relaunches) when the coordinator
+    # stops reporting ownership progress for this long. Healthy parse futures
+    # heartbeat every 30 seconds, independently of their wall-clock duration;
+    # the separate extreme parse lease handles live-but-never-return futures.
+    # 0 disables.
     worker_wedge_timeout_seconds: int = Field(
         default=2700,
         ge=0,
@@ -396,6 +414,14 @@ class Settings(BaseSettings):
             raise ValueError(
                 "DISCLOSURE_PARSE_TIMEOUT_MAX_SECONDS must be greater than "
                 "or equal to DISCLOSURE_PARSE_TIMEOUT_SECONDS"
+            )
+        if (
+            self.disclosure_parse_runaway_timeout_seconds
+            < self.disclosure_parse_timeout_max_seconds
+        ):
+            raise ValueError(
+                "DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS must be greater "
+                "than or equal to DISCLOSURE_PARSE_TIMEOUT_MAX_SECONDS"
             )
         if self.worker_gpu_request_budget > self.worker_gpu_max_sequences:
             raise ValueError(

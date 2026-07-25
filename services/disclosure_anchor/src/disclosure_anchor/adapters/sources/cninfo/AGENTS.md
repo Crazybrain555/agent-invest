@@ -12,8 +12,9 @@ source.py            主通道 CninfoSource：p_info3015 索引按 ≤30 天分�
 web_source.py        免凭据兜底通道 CninfoWebSource：官网 hisAnnouncement/query +
                      szse_stock.json(code→orgId，query 必须成对传)；无档案(profile=None，
                      resolver 按"无名称主张"处理)、无 F006V(filing_type 从标题走同一规则包)；
-                     已实测 announcementId==TEXTID、adjunctSize==F005N(KB)——
-                     去重键与文件签名跨通道通用
+                     已实测 announcementId==TEXTID；adjunctSize/F005N 仅作不透明
+                     provider signature hint（真实语料单位不稳定），解析成本只用归档后
+                     source_access.result_snapshot.byte_count
 mapper.py            p_info3015/p_stock2100 → DTO(TEXTID 即 provider_document_id)、
                      F006V 多段拆分映射、report_period 标题推导(07 §3.2 封闭规则)
 filing_type_map.json 规则包(版本化，当前 r12)；**intermediary_report 必须排最前**(carrier 载体

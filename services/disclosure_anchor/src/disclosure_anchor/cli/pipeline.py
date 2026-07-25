@@ -53,6 +53,7 @@ from disclosure_anchor.application.use_cases.parse_document import (
     ParseDocumentCommand,
 )
 from disclosure_anchor.application.use_cases.publish_run import (
+    NormalizedIRPublicationGuard,
     PublishRun,
     PublishRunCommand,
 )
@@ -476,7 +477,9 @@ class _Deps:
             raw_store=RawDocumentStore(self.paths),
             artifact_store=self.artifacts,
             uow_factory=self.uow_factory,
-            default_timeout_seconds=self.settings.disclosure_parse_timeout_seconds,
+            default_timeout_seconds=(
+                self.settings.disclosure_parse_runaway_timeout_seconds
+            ),
         )
 
     def build_units(self) -> BuildUnits:
@@ -487,7 +490,10 @@ class _Deps:
         )
 
     def publish(self) -> PublishRun:
-        return PublishRun(uow_factory=self.uow_factory)
+        return PublishRun(
+            uow_factory=self.uow_factory,
+            publication_guard=NormalizedIRPublicationGuard(self.paths),
+        )
 
     def rebuild_units(self) -> RebuildUnits:
         return RebuildUnits(uow_factory=self.uow_factory)
@@ -800,10 +806,7 @@ class _Deps:
                 )
             downloads = [
                 downloader.execute(
-                    DownloadDocumentCommand(
-                        candidate=row["candidate"],
-                        oversized_kb=self.settings.cninfo_oversized_kb,
-                    )
+                    DownloadDocumentCommand(candidate=row["candidate"])
                 )
                 for row in pending_rows
                 if isinstance(row.get("candidate"), dict)

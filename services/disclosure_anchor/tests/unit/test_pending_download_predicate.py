@@ -70,8 +70,8 @@ class ShouldDownloadCandidateTests(unittest.TestCase):
         )
 
     def test_registered_same_signature_inside_window_redownloads(self) -> None:
-        # F005N is KB-granular; a matching size inside the overlap window must
-        # still be re-verified by raw_file_hash (silent replacement guard).
+        # The provider size hint is not unit-stable; a matching value inside
+        # the overlap window still needs raw-hash verification.
         self.assertTrue(
             _should_download_candidate(
                 candidate=_candidate(announcement_date="2026-07-03"),

@@ -113,7 +113,7 @@ SELECT count(*) FROM disclosure_ops.pending_parse_v1 WHERE failed_parse_count > 
 |---|---|---|
 | parse 重试耗尽 / 不可重试 | doctor `parse dead letters` WARN；`pending_parse_v1.last_failed_retryable=false` | 查 `processing_run.error` 根因；修复后 `make process DOC=<id>` 手动重跑 |
 | 空发布（0 unit） | doctor `empty publish dead letters`（实存案例：美的 3 篇「日常关联交易预计」，疑似表格型盲区） | 人工看原 PDF：确属无正文可切 → `make publish RUN=<id> ALLOW_EMPTY=1 REASON=...`；是切分盲区 → 修规则后 `make rebuild-units DOC=<id>` |
-| 超大文件排除 | doctor `oversized parse exclusions`（实存案例：万科A 2023 年报、招商银行 2025 年报） | 年报是核心文件，不应长期滞留：确认 `CNINFO_OVERSIZED_KB` 上限（worker.env）→ 提高后 `make worker-restart`，或单独 `make process DOC=<id>` 试解析并观察 MinerU 内存 |
+| HUGE lane 长任务 | worker report 的 `parse_huge_dispatched` 与 processing_run 时长；不再有大小排除死信 | 以归档 actual byte_count/页数核对成本；正常长任务继续运行，只在极端 whole-future runaway 时由 launchd 监督重启 |
 
 下载类死信（新增 2026-07-14）：`invalid_candidate_snapshot` / `raw_archive_error` /
 `subject_identity_conflict` 等 retryable=false 的下载失败永久出队，证据在

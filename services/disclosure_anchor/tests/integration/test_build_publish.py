@@ -17,6 +17,7 @@ from disclosure_anchor.application.use_cases.build_units import (
     BuildUnitsCommand,
 )
 from disclosure_anchor.application.use_cases.publish_run import (
+    NormalizedIRPublicationGuard,
     PublishRun,
     PublishRunCommand,
 )
@@ -86,6 +87,10 @@ def _normalized_ir(text_value: str = "公司存在退市风险，请投资者注
             },
         ],
     }
+
+
+def _allow_whole_pdf(_run: e.ProcessingRun) -> None:
+    """Manual DB fixtures below isolate publish transaction semantics."""
 
 
 def _unit(
@@ -361,7 +366,10 @@ class BuildPublishIntegrationTests(unittest.TestCase):
             artifact_store=ArtifactStore(self.paths),
             uow_factory=self._uow,
         )
-        publish = PublishRun(uow_factory=self._uow)
+        publish = PublishRun(
+            uow_factory=self._uow,
+            publication_guard=NormalizedIRPublicationGuard(self.paths),
+        )
 
         build_result = build.execute(BuildUnitsCommand(processing_run_id=run_id))
         publish_result = publish.execute(PublishRunCommand(processing_run_id=run_id))
@@ -468,7 +476,10 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                 self.outbox.add = add
 
         with self.assertRaises(RuntimeError):
-            PublishRun(uow_factory=lambda: FailingUoW(engine=self.engine)).execute(
+            PublishRun(
+                uow_factory=lambda: FailingUoW(engine=self.engine),
+                publication_guard=_allow_whole_pdf,
+            ).execute(
                 PublishRunCommand(processing_run_id=new_run_id)
             )
 
@@ -602,7 +613,10 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                 old_units=old_units,
                 new_units=new_units,
             )
-            PublishRun(uow_factory=self._uow).execute(
+            PublishRun(
+                uow_factory=self._uow,
+                publication_guard=_allow_whole_pdf,
+            ).execute(
                 PublishRunCommand(processing_run_id=new_run_id)
             )
             scenarios.append((label, document_id))

@@ -54,6 +54,11 @@ class _PathBuilder:
         )
 
 
+class _UnreadablePathBuilder(_PathBuilder):
+    def data_path(self, relpath: Path) -> Path:
+        raise PermissionError("simulated shared data-store outage")
+
+
 class _BadHashArtifactStore(ArtifactStore):
     def write_jsonl_atomic(self, *, relpath: Path, rows: list[object]):
         super().write_jsonl_atomic(relpath=relpath, rows=rows)
@@ -192,7 +197,7 @@ class BuildUnitsTests(unittest.TestCase):
 
             self.assertEqual(result.status, "succeeded")
 
-    def test_ir_hash_mismatch_fails_structured_before_building(self) -> None:
+    def test_ir_ingress_failures_are_structured_before_building(self) -> None:
         # The IR sits in the overwritable derived area; a corrupted or
         # overwritten IR must fail loudly instead of publishing
         # self-consistent bad units (round23).
@@ -218,6 +223,52 @@ class BuildUnitsTests(unittest.TestCase):
                 "IR_HASH_MISMATCH",
             )
             self.assertEqual(uow.document_units.list_by_processing_run("run_1"), [])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, _ = _uow(root)
+            paths = _UnreadablePathBuilder(root)
+
+            result = BuildUnits(
+                path_builder=paths,
+                artifact_store=ArtifactStore(paths),
+                uow_factory=lambda: uow,
+            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.error["error_code"], "IR_READ_FAILED")
+            self.assertTrue(result.error["retryable"])
+            self.assertEqual(uow.document_units.list_by_processing_run("run_1"), [])
+
+    def test_page_range_diagnostic_ir_cannot_enter_publication_pipeline(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _uow(root)
+            ir_path = root / ir_relpath
+            payload = json.loads(ir_path.read_text(encoding="utf-8"))
+            payload["parsed_pages"]["full_pdf"] = False
+            ir_path.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            paths = _PathBuilder(root)
+
+            result = BuildUnits(
+                path_builder=paths,
+                artifact_store=ArtifactStore(paths),
+                uow_factory=lambda: uow,
+            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(
+                result.error["error_code"],
+                "PARTIAL_PDF_NOT_PUBLISHABLE",
+            )
+            self.assertEqual(
+                uow.document_units.list_by_processing_run("run_1"),
+                [],
+            )
 
     def test_locator_diagnostics_have_no_builder_rules_dependency(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

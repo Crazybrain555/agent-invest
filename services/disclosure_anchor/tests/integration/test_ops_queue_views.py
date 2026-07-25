@@ -176,11 +176,117 @@ class OpsQueueViewTests(unittest.TestCase):
                 {"run": run_id},
             ).scalars()
             automatic_rows = queries.pending_publish(conn, limit=500000)
+            terminal_document_id = self._insert_document(
+                conn, status="parsed"
+            )
+            terminal_run_id = self._insert_run(
+                conn,
+                terminal_document_id,
+                status="succeeded",
+                unit_build_status="failed",
+                attempts=1,
+            )
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.processing_run "
+                    "SET unit_build_error = CAST(:error AS jsonb) "
+                    "WHERE processing_run_id = :run"
+                ),
+                {
+                    "run": terminal_run_id,
+                    "error": (
+                        '{"stage":"publish",'
+                        '"error_code":"RUN_UNIT_HASH_INVALID",'
+                        '"retryable":false}'
+                    ),
+                },
+            )
+            raw_build_rows = conn.execute(
+                text(
+                    "SELECT processing_run_id "
+                    "FROM disclosure_ops.pending_build_v1 "
+                    "WHERE processing_run_id = :run"
+                ),
+                {"run": terminal_run_id},
+            ).scalars()
+            retryable_document_id = self._insert_document(
+                conn, status="parsed"
+            )
+            retryable_run_id = self._insert_run(
+                conn,
+                retryable_document_id,
+                status="succeeded",
+                unit_build_status="failed",
+                attempts=3,
+            )
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.processing_run "
+                    "SET unit_build_error = CAST(:error AS jsonb) "
+                    "WHERE processing_run_id = :run"
+                ),
+                {
+                    "run": retryable_run_id,
+                    "error": (
+                        '{"stage":"build_units",'
+                        '"error_code":"IR_READ_FAILED",'
+                        '"retryable":true}'
+                    ),
+                },
+            )
+            ceiling_document_id = self._insert_document(
+                conn, status="parsed"
+            )
+            ceiling_run_id = self._insert_run(
+                conn,
+                ceiling_document_id,
+                status="succeeded",
+                unit_build_status="failed",
+                attempts=3 * queries.RETRY_CEILING_MULTIPLIER,
+            )
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.processing_run "
+                    "SET unit_build_error = CAST(:error AS jsonb) "
+                    "WHERE processing_run_id = :run"
+                ),
+                {
+                    "run": ceiling_run_id,
+                    "error": (
+                        '{"stage":"build_units",'
+                        '"error_code":"IR_READ_FAILED",'
+                        '"retryable":true}'
+                    ),
+                },
+            )
+            automatic_build_rows = queries.pending_build(
+                conn, max_retries=3, limit=500000
+            )
         self.assertIn(run_id, list(raw_rows), "view preserves the dead-letter fact")
         self.assertNotIn(
             run_id,
             [row["processing_run_id"] for row in automatic_rows],
             "automatic queue must not retry EMPTY_RUN forever",
+        )
+        self.assertIn(
+            terminal_run_id,
+            list(raw_build_rows),
+            "view preserves the quarantined build fact",
+        )
+        self.assertNotIn(
+            terminal_run_id,
+            [row["processing_run_id"] for row in automatic_build_rows],
+            "automatic build must not retry terminal publish poison",
+        )
+        self.assertIn(
+            retryable_run_id,
+            [row["processing_run_id"] for row in automatic_build_rows],
+            "retryable infrastructure failures remain eligible after recovery",
+        )
+        self.assertNotIn(
+            ceiling_run_id,
+            [row["processing_run_id"] for row in automatic_build_rows],
+            "extreme retry ceiling prevents permanent global build poison",
         )
 
     def test_pending_parse_helper_excludes_non_retryable_failure(self) -> None:
@@ -277,12 +383,69 @@ class OpsQueueViewTests(unittest.TestCase):
             document_id, [row["document_id"] for row in helper_rows]
         )
 
+    def test_pending_parse_returns_archived_bytes_and_ignores_legacy_flag(
+        self,
+    ) -> None:
+        """Measured archive bytes are cost; old provider hints cannot reject."""
+
+        source_access_id = f"sa_qv{self.suffix}rawbytes"
+        document_id = f"doc_qv{self.suffix}rawbytes"
+        raw_hash = "sha256:" + ("a" * 64)
+        measured_bytes = 106_954_752
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.source_access "
+                    "(source_access_id, provider, provider_interface, accessed_at, "
+                    " status, result_hash, result_snapshot) VALUES "
+                    "(:id, 'cninfo', 'cninfo:download_pdf', now(), 'ok', :hash, "
+                    " CAST(:snapshot AS jsonb))"
+                ),
+                {
+                    "id": source_access_id,
+                    "hash": raw_hash,
+                    "snapshot": json.dumps({"byte_count": measured_bytes}),
+                },
+            )
+            self.sa_ids.append(source_access_id)
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.document "
+                    "(document_id, source_access_id, status, provider, "
+                    " provider_document_id, raw_file_hash, provider_metadata) "
+                    "VALUES (:id, :source_access_id, 'registered', 'cninfo', :pid, "
+                    " :hash, '{\"oversized\": true}'::jsonb)"
+                ),
+                {
+                    "id": document_id,
+                    "source_access_id": source_access_id,
+                    "pid": f"rawbytes{self.suffix}",
+                    "hash": raw_hash,
+                },
+            )
+            refresh_document_classification(conn, document_id=document_id)
+            self.doc_ids.append(document_id)
+            rows = queries.pending_parse(conn, max_retries=3, limit=500000)
+
+        by_document_id = {row["document_id"]: row for row in rows}
+        self.assertIn(document_id, by_document_id)
+        self.assertEqual(
+            by_document_id[document_id]["raw_byte_count"],
+            measured_bytes,
+        )
+
     def test_processing_backlog_counts_download_and_all_raw_parse_work(self) -> None:
         """GPU outage pressure cannot disappear as downloads become raw files."""
 
         conn = self.engine.connect()
         txn = conn.begin()
         try:
+            # The resident worker legitimately advances the shared backlog.
+            # Pin both counts to one MVCC snapshot so only this transaction's
+            # three inserted facts contribute to the measured delta.
+            conn.execute(
+                text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            )
             before = queries.pending_processing_backlog_count(conn, max_retries=3)
             candidate_id = f"backlog{self.suffix}candidate"
             conn.execute(
@@ -310,8 +473,9 @@ class OpsQueueViewTests(unittest.TestCase):
                     ),
                 },
             )
-            # Dead-letter and oversized raw files are not parse-eligible, but
-            # they still occupy disk and therefore hold the admission gate.
+            # Dead letters remain in storage pressure. A legacy oversized
+            # marker is no longer an eligibility gate: actual archive bytes
+            # and page count determine only the scheduling lane.
             dead = self._insert_document(conn, status="parse_failed")
             self._insert_run(
                 conn,
@@ -335,11 +499,18 @@ class OpsQueueViewTests(unittest.TestCase):
             self.doc_ids.append(oversized)
 
             after = queries.pending_processing_backlog_count(conn, max_retries=3)
+            parse_ids = {
+                row["document_id"]
+                for row in queries.pending_parse(
+                    conn, max_retries=3, limit=500000
+                )
+            }
         finally:
             txn.rollback()
             conn.close()
 
         self.assertEqual(after - before, 3)
+        self.assertIn(oversized, parse_ids)
 
     def test_sync_due_includes_company_without_checkpoint(self) -> None:
         with self.engine.begin() as conn:

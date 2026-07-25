@@ -9,6 +9,7 @@ from disclosure_anchor.adapters.runtime.doctor import (
     CheckResult,
     _check_unit_snapshot_aggregate,
     _invalid_process_class_overrides,
+    running_run_liveness_checks,
     run_doctor,
     run_startup_preflight,
 )
@@ -46,6 +47,37 @@ def _create_roots(root: Path) -> None:
 
 
 class DoctorTests(unittest.TestCase):
+    def test_running_run_liveness_separates_parse_runaway_from_stale_work(
+        self,
+    ) -> None:
+        conn = MagicMock()
+        parse_result = MagicMock()
+        parse_result.all.return_value = [("run_parse",)]
+        other_result = MagicMock()
+        other_result.all.return_value = []
+        conn.execute.side_effect = [parse_result, other_result]
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(Path(tmp))
+
+        results = running_run_liveness_checks(settings, conn)
+
+        self.assertEqual(
+            [(item.name, item.status) for item in results],
+            [("runaway parse runs", "WARN"), ("stale runs", "PASS")],
+        )
+        parse_sql = str(conn.execute.call_args_list[0].args[0])
+        other_sql = str(conn.execute.call_args_list[1].args[0])
+        self.assertIn("run_kind = 'parse'", parse_sql)
+        self.assertIn("run_kind <> 'parse'", other_sql)
+        self.assertEqual(
+            conn.execute.call_args_list[0].args[1]["seconds"],
+            settings.disclosure_parse_runaway_timeout_seconds,
+        )
+        self.assertEqual(
+            conn.execute.call_args_list[1].args[1]["seconds"],
+            settings.disclosure_stale_run_threshold_seconds,
+        )
+
     @patch(
         "disclosure_anchor.adapters.runtime.doctor._ops_launchd_check",
         return_value=CheckResult("postgres autostart", "PASS", "test"),

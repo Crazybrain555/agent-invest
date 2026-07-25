@@ -63,7 +63,7 @@ def _deps() -> WorkerDeps:
         source_factory=lambda: mock.MagicMock(),
         profile_loader_factory=lambda source: (lambda code: None),
         parser_factory=lambda: mock.MagicMock(),
-        parse_timeout_seconds=1800,
+        parse_expected_seconds=1800,
         config=_config(),
         clock=lambda: datetime(2026, 7, 6, 0, 0, tzinfo=timezone.utc),
     )
@@ -322,37 +322,49 @@ class RunOnceSchedulingTests(unittest.TestCase):
         local = next(f for f in report.failures if f.stage == "source_local")
         self.assertIn("queue view exploded", local.message or "")
 
-    def test_oversized_documents_are_skipped_and_counted(self) -> None:
+    def test_actual_archive_bytes_drive_lane_without_excluding_documents(
+        self,
+    ) -> None:
         deps = _deps()
         pending = [
-            {"document_id": "doc_big", "oversized": True},
-            {"document_id": "doc_ok", "oversized": False},
+            {
+                "document_id": "doc_small",
+                "oversized": True,  # stale legacy metadata must be ignored
+                "raw_byte_count": 512 * 1024,
+            },
+            {
+                "document_id": "doc_big",
+                "oversized": False,
+                "raw_byte_count": 11 * 1024 * 1024,
+            },
         ]
-        parse_result = mock.MagicMock(status="succeeded", processing_run_id="run_1")
-        build_result = mock.MagicMock(
-            status="succeeded", build_stats={"generated_by_kind": {"text": 1}}
-        )
-        publish_result = mock.MagicMock(status="published")
-        with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
-            mock.patch.object(worker_module.queries, "pending_parse", return_value=pending),
-            mock.patch.object(worker_module, "ParseDocument") as parse_cls,
-            mock.patch.object(worker_module, "BuildUnits") as build_cls,
-            mock.patch.object(worker_module, "PublishRun") as publish_cls,
-        ):
-            parse_cls.return_value.execute.return_value = parse_result
-            build_cls.return_value.execute.return_value = build_result
-            publish_cls.return_value.execute.return_value = publish_result
-            report = run_once(
-                WorkerLimits(sync=0, download=0, parse=5, build=0, publish=0), deps
-            )
 
-        self.assertEqual(report.skipped_oversized, 1)
-        self.assertEqual(report.parsed, 1)
-        self.assertEqual(report.built, 1)
-        self.assertEqual(report.published, 1)
-        self.assertEqual(report.failed, 0)
-        parse_cls.return_value.execute.assert_called_once()
+        items = worker_module._parse_work_items(pending, deps=deps)
+
+        self.assertEqual(
+            [item.document_id for item in items],
+            ["doc_small", "doc_big"],
+        )
+        self.assertEqual(
+            worker_module._parse_lane(items[0], deps.config),
+            worker_module._ParseLane.HEAVY,
+        )
+        self.assertEqual(
+            worker_module._parse_lane(items[1], deps.config),
+            worker_module._ParseLane.HUGE,
+        )
+
+        # The threshold is a live scheduling policy, not persisted metadata:
+        # increasing it changes the lane without re-downloading the PDF.
+        object.__setattr__(
+            deps,
+            "config",
+            replace(deps.config, cninfo_oversized_kb=20 * 1024),
+        )
+        self.assertEqual(
+            worker_module._parse_lane(items[1], deps.config),
+            worker_module._ParseLane.HEAVY,
+        )
 
     def test_one_bad_document_does_not_kill_the_round(self) -> None:
         deps = _deps()
@@ -389,16 +401,26 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self.assertEqual(report.failures[0].item_ref, "doc_bad")
         self.assertEqual(report.failures[0].error_code, "RuntimeError")
 
-    def test_publish_error_is_attributed_to_publish_stage(self) -> None:
+    def test_item_local_publish_error_does_not_stop_parse_refill(self) -> None:
         deps = _deps()
-        parsed = mock.MagicMock(status="succeeded", processing_run_id="run_empty")
+        parsed = mock.MagicMock(
+            status="succeeded", processing_run_id="run_partial"
+        )
         built = mock.MagicMock(status="succeeded", build_stats=None)
         with (
             mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
             mock.patch.object(
                 worker_module.queries,
                 "pending_parse",
-                return_value=[{"document_id": "doc_empty", "oversized": False}],
+                return_value=[
+                    {"document_id": f"doc_{index}", "oversized": False}
+                    for index in range(3)
+                ],
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "pending_publish",
+                return_value=[{"processing_run_id": "run_partial_leftover"}],
             ),
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
             mock.patch.object(worker_module, "BuildUnits") as build_cls,
@@ -407,17 +429,38 @@ class RunOnceSchedulingTests(unittest.TestCase):
             parse_cls.return_value.execute.return_value = parsed
             build_cls.return_value.execute.return_value = built
             publish_cls.return_value.execute.side_effect = PublishRunError(
-                {"error_code": "EMPTY_RUN", "retryable": False}
+                {
+                    "error_code": "PARTIAL_PDF_NOT_PUBLISHABLE",
+                    "retryable": False,
+                }
             )
             report = run_once(
-                WorkerLimits(sync=0, download=0, parse=1, build=0, publish=0), deps
+                WorkerLimits(sync=0, download=0, parse=3, build=0, publish=0),
+                deps,
+            )
+            leftover_report = worker_module.WorkerReport(
+                started_at=datetime.now(timezone.utc)
+            )
+            worker_module._publish_stage(
+                leftover_report,
+                deps,
+                limit=1,
+                should_stop=lambda: False,
             )
 
-        self.assertEqual(report.parsed, 1)
-        self.assertEqual(report.built, 1)
-        self.assertEqual(report.failed, 1)
+        self.assertEqual(parse_cls.return_value.execute.call_count, 3)
+        self.assertEqual(report.parsed, 3)
+        self.assertEqual(report.built, 3)
+        self.assertEqual(report.failed, 3)
         self.assertEqual(report.failures[0].stage, "publish")
-        self.assertEqual(report.failures[0].error_code, "EMPTY_RUN")
+        self.assertEqual(
+            report.failures[0].error_code,
+            "PARTIAL_PDF_NOT_PUBLISHABLE",
+        )
+        self.assertEqual(
+            leftover_report.failures[0].error_code,
+            "PARTIAL_PDF_NOT_PUBLISHABLE",
+        )
 
     def test_stop_submits_at_most_parse_concurrency(self) -> None:
         import threading
@@ -553,7 +596,10 @@ class RunOnceSchedulingTests(unittest.TestCase):
             )
             build_cls.return_value.execute.return_value = mock.MagicMock(
                 status="failed",
-                error={"error_code": "IR_MISSING", "retryable": False},
+                error={
+                    "error_code": "PARTIAL_PDF_NOT_PUBLISHABLE",
+                    "retryable": False,
+                },
             )
             report = run_once(
                 WorkerLimits(sync=0, download=0, parse=3, build=0, publish=0),
@@ -618,6 +664,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 parse_huge_saturated_share=1,
                 parse_timeout_per_page_seconds=12,
                 parse_timeout_max_seconds=7200,
+                parse_runaway_timeout_seconds=20000,
             ),
         )
         object.__setattr__(
@@ -687,10 +734,17 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self.assertIn("doc_regular_1", first)
         self.assertEqual(len(first & {"doc_heavy_1", "doc_heavy_2"}), 1)
         self.assertIn("doc_heavy_3", first)
-        self.assertEqual(observed_timeouts["doc_heavy_1"], 3600)
-        self.assertEqual(observed_timeouts["doc_heavy_2"], 3000)
-        self.assertEqual(observed_timeouts["doc_heavy_3"], 4800)
-        self.assertEqual(observed_timeouts["doc_regular_1"], 1800)
+        self.assertEqual(observed_timeouts["doc_heavy_1"], 20000)
+        self.assertEqual(observed_timeouts["doc_heavy_2"], 20000)
+        self.assertEqual(observed_timeouts["doc_heavy_3"], 20000)
+        self.assertEqual(observed_timeouts["doc_regular_1"], 20000)
+        expected_by_id = {
+            item.document_id: worker_module._parse_expected_seconds(deps, item)
+            for item in worker_module._parse_work_items(pending, deps=deps)
+        }
+        self.assertEqual(expected_by_id["doc_regular_1"], 1800)
+        self.assertEqual(expected_by_id["doc_heavy_1"], 3600)
+        self.assertEqual(expected_by_id["doc_heavy_3"], 4800)
         self.assertEqual(report.parse_peak_inflight, 3)
         self.assertEqual(report.parse_heavy_dispatched, 2)
         self.assertEqual(report.parse_huge_dispatched, 1)
@@ -1407,7 +1461,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
         guard.assert_called_once_with()
         parse_cls.return_value.execute.assert_not_called()
 
-    def test_long_parse_heartbeats_only_inside_its_legal_deadline(self) -> None:
+    def test_long_parse_warns_at_soft_envelope_and_keeps_heartbeating(self) -> None:
         import threading
 
         deps = _deps()
@@ -1423,6 +1477,9 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 cninfo_max_retries=3,
                 cninfo_oversized_kb=10240,
                 parse_concurrency=1,
+                parse_timeout_per_page_seconds=0,
+                parse_timeout_max_seconds=1,
+                parse_runaway_timeout_seconds=60,
             ),
         )
         heartbeat = mock.Mock()
@@ -1452,8 +1509,11 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 mock.patch.object(worker_module, "PublishRun") as publish_cls,
                 mock.patch.object(
                     worker_module,
-                    "PARSE_LEGAL_WINDOW_HEARTBEAT_SECONDS",
+                    "PARSE_HEARTBEAT_INTERVAL_SECONDS",
                     0.01,
+                ),
+                mock.patch.object(
+                    worker_module, "_parse_expected_seconds", return_value=0
                 ),
             ):
                 parse_cls.return_value.execute.side_effect = delayed_execute
@@ -1463,20 +1523,122 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 publish_cls.return_value.execute.return_value = mock.MagicMock(
                     status="published"
                 )
-                report = run_once(
-                    WorkerLimits(
-                        sync=0, download=0, parse=1, build=0, publish=0
-                    ),
-                    deps,
-                )
+                with self.assertLogs(
+                    worker_module.LOGGER.name, level="WARNING"
+                ) as captured:
+                    report = run_once(
+                        WorkerLimits(
+                            sync=0, download=0, parse=1, build=0, publish=0
+                        ),
+                        deps,
+                    )
         finally:
             timer.cancel()
 
-        # At least one timeout-driven heartbeat happened before the normal
-        # completion heartbeat. A dead future beyond its legal deadline would
-        # not keep extending worker liveness.
+        # The estimate is advisory: the same future remains owned and live
+        # until the adapter's remote runaway guard, rather than being killed.
+        self.assertEqual(
+            parse_cls.return_value.execute.call_args.args[0].options.timeout_seconds,
+            60,
+        )
+        self.assertTrue(
+            any(
+                "soft expected-duration envelope" in message
+                for message in captured.output
+            )
+        )
         self.assertGreater(heartbeat.call_count, 1)
         self.assertEqual(report.parsed, 1)
+        self.assertEqual(report.failed, 0)
+
+    def test_extreme_lease_ignores_raced_done_and_catches_stuck(self) -> None:
+        import threading
+
+        deps = _deps()
+        object.__setattr__(
+            deps,
+            "config",
+            replace(
+                deps.config,
+                parse_concurrency=3,
+                parse_runaway_timeout_seconds=0,
+            ),
+        )
+        release_stuck = threading.Event()
+        release_raced = threading.Event()
+        runaway = mock.Mock(
+            side_effect=lambda _document_id: release_stuck.set()
+        )
+        object.__setattr__(deps, "on_parse_runaway", runaway)
+
+        def execute(command):  # noqa: ANN001, ANN202
+            if command.document_id == "doc_stuck":
+                self.assertTrue(release_stuck.wait(timeout=1))
+            elif command.document_id == "doc_raced":
+                self.assertTrue(release_raced.wait(timeout=1))
+            return mock.MagicMock(
+                status="succeeded",
+                processing_run_id=f"run_{command.document_id}",
+            )
+
+        real_wait = worker_module.wait
+        wait_calls = 0
+
+        def observed_wait(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls > 1 and not release_stuck.is_set():
+                raise AssertionError(
+                    "an expired parse was hidden by a completed peer"
+                )
+            completed, not_done = real_wait(*args, **kwargs)
+            if wait_calls == 1:
+                # Simulate a future that finishes after wait() captured its
+                # completed set but before the dispatcher scans deadlines.
+                release_raced.set()
+                raced, _ = real_wait(
+                    tuple(set(args[0]) - set(completed)),
+                    timeout=1,
+                    return_when=worker_module.FIRST_COMPLETED,
+                )
+                self.assertTrue(raced)
+            return completed, not_done
+
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "pending_parse",
+                return_value=[
+                    {"document_id": "doc_stuck"},
+                    {"document_id": "doc_peer"},
+                    {"document_id": "doc_raced"},
+                ],
+            ),
+            mock.patch.object(worker_module, "ParseDocument") as parse_cls,
+            mock.patch.object(worker_module, "BuildUnits") as build_cls,
+            mock.patch.object(worker_module, "PublishRun") as publish_cls,
+            mock.patch.object(worker_module, "wait", side_effect=observed_wait),
+            self.assertLogs(worker_module.LOGGER.name, level="ERROR"),
+        ):
+            parse_cls.return_value.execute.side_effect = execute
+            build_cls.return_value.execute.return_value = mock.MagicMock(
+                status="succeeded", build_stats=None
+            )
+            publish_cls.return_value.execute.return_value = mock.MagicMock(
+                status="published"
+            )
+            report = run_once(
+                WorkerLimits(
+                    sync=0, download=0, parse=3, build=0, publish=0
+                ),
+                deps,
+            )
+
+        runaway.assert_called_once_with("doc_stuck")
+        self.assertEqual(report.parsed, 3)
         self.assertEqual(report.failed, 0)
 
     def test_retryable_false_parse_failure_recorded_with_error_code(self) -> None:
@@ -1514,7 +1676,6 @@ class RunOnceSchedulingTests(unittest.TestCase):
         section = render_report_section(report)
         self.assertIn("## run 2026-07-06T00:00:00+00:00", section)
         self.assertIn("- stale_reclaimed: 1", section)
-        self.assertIn("- skipped_oversized: 0", section)
 
 
 if __name__ == "__main__":

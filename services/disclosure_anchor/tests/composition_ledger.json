@@ -42,7 +42,7 @@
   },
   "tests/integration/test_ops_queue_views.py": {
    "private_imports": [],
-   "tests": 21
+   "tests": 22
   },
   "tests/integration/test_outbox_commit_order.py": {
    "private_imports": [],
@@ -106,7 +106,7 @@
   },
   "tests/unit/test_build_units.py": {
    "private_imports": [],
-   "tests": 17
+   "tests": 18
   },
   "tests/unit/test_cninfo_client.py": {
    "private_imports": [],
@@ -139,7 +139,7 @@
     "_check_unit_snapshot_aggregate",
     "_invalid_process_class_overrides"
    ],
-   "tests": 14
+   "tests": 15
   },
   "tests/unit/test_doctor_render.py": {
    "private_imports": [],
@@ -228,7 +228,7 @@
    "private_imports": [
     "_validate_candidate_unit_set"
    ],
-   "tests": 19
+   "tests": 20
   },
   "tests/unit/test_raw_document_store.py": {
    "private_imports": [],
@@ -288,13 +288,13 @@
   },
   "tests/unit/test_worker_cli.py": {
    "private_imports": [],
-   "tests": 29
+   "tests": 30
   },
   "tests/unit/test_worker_run_once.py": {
    "private_imports": [
     "_sync_window_start"
    ],
-   "tests": 51
+   "tests": 52
   }
  },
  "schema": "test-composition-ledger.v1"

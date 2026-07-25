@@ -34,6 +34,7 @@ from disclosure_anchor.application.use_cases.build_units import (
     BuildUnitsCommand,
 )
 from disclosure_anchor.application.use_cases.publish_run import (
+    NormalizedIRPublicationGuard,
     PublishRun,
     PublishRunCommand,
 )
@@ -115,7 +116,10 @@ def main(argv: list[str] | None = None) -> int:
                 if build.status != "succeeded":
                     record["failure"] = build.error
                 else:
-                    publish = PublishRun(uow_factory=uow_factory).execute(
+                    publish = PublishRun(
+                        uow_factory=uow_factory,
+                        publication_guard=NormalizedIRPublicationGuard(paths),
+                    ).execute(
                         PublishRunCommand(processing_run_id=run_id)
                     )
                     record["published"] = publish.status == "published"

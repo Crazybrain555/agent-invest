@@ -49,7 +49,6 @@ DOWNLOAD_INTERFACE = "cninfo:download_pdf"
 @dataclass(frozen=True)
 class DownloadDocumentCommand:
     candidate: Mapping[str, object]
-    oversized_kb: int = 10240
 
 
 @dataclass(frozen=True)
@@ -309,9 +308,7 @@ class DownloadDocument:
                     announcement_date=ref.announcement_date,
                     report_period=_candidate_report_period(candidate),
                     filename=f"{ref.provider_document_id}.pdf",
-                    provider_metadata=_provider_metadata(
-                        candidate, oversized_kb=command.oversized_kb
-                    ),
+                    provider_metadata=_provider_metadata(candidate),
                     provider_interface=DOWNLOAD_INTERFACE,
                     dataset_key="p_info3015",
                 ),
@@ -423,11 +420,9 @@ def _subject_candidate_from_existing_security(
     )
 
 
-def _provider_metadata(
-    candidate: Mapping[str, object], *, oversized_kb: int
-) -> dict[str, object]:
+def _provider_metadata(candidate: Mapping[str, object]) -> dict[str, object]:
     signature = dict(_candidate_mapping(candidate, "file_signature_hint"))
-    metadata: dict[str, object] = {
+    return {
         "raw_category": _candidate_optional_str(candidate.get("raw_category")) or "",
         "category_names": candidate.get("category_names"),
         "provider_org_id": candidate.get("provider_org_id"),
@@ -436,10 +431,6 @@ def _provider_metadata(
         "security_name": candidate.get("security_name"),
         "file_signature": signature,
     }
-    file_size = signature.get("file_size")
-    if isinstance(file_size, (int, float)) and file_size > oversized_kb:
-        metadata["oversized"] = True
-    return metadata
 
 
 def _candidate_report_period(candidate: Mapping[str, object]) -> ReportPeriod | None:

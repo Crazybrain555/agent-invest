@@ -67,7 +67,8 @@ stale_running_run_v1    status='running' 的 run 全集，暴露 started_at
 
 **阈值策略（与 04R-R1.10 一致）**：视图只暴露事实列，不内嵌阈值；阈值全部来自 settings——
 `DISCLOSURE_MAX_PARSE_RETRIES=3`、`DISCLOSURE_MAX_BUILD_RETRIES=3`、
-`DISCLOSURE_STALE_RUN_THRESHOLD_SECONDS=3600`（=2×parse timeout 默认值的固定折算）、
+`DISCLOSURE_STALE_RUN_THRESHOLD_SECONDS=3600`（仅用于 singleton owner 已退出后回收
+遗留 run；正常长任务由同一 owner 持锁运行，不以该年龄中止）、
 `DISCLOSURE_SYNC_INTERVAL_SECONDS=86400`（首版忽略 tracked_company.sync_frequency 列，
 全局间隔统一生效）。防漂移：阈值过滤统一实现在 `application/worker/queries.py` 的查询
 helper（每视图一个函数，SELECT … FROM ops.<view> WHERE <阈值谓词>），worker 与 doctor
@@ -114,13 +115,13 @@ stale 回收的执行载体定死：run_once 第一步经 queries.py 执行单�
    现有"小写字段 + AliasChoices 大写别名"模式，同步 .env.template）；
    WorkerReport{started_at, duration_seconds, stale_reclaimed, synced_companies,
    candidates_discovered, downloaded, parsed, built, published, failed,
-   skipped_oversized, failures: list[WorkerFailure]}，
+   failures: list[WorkerFailure]}，
    WorkerFailure={stage, document_id|item_ref, error_code}。
    依赖注入定死：deps = WorkerDeps{engine, source_port_factory, parser_factory, clock}，
    生产 wiring 在 cli/worker.py 经 bootstrap 组装；集成测试注入 FakeCninfoSource 与
    fake parser，全程不出网。
-   parse 阶段跳过 `provider_metadata.oversized=true` 的 document（07 §3.9 护栏；
-   计入 skipped_oversized 并出现在报告，人工单跑提高 timeout 处理）。
+   parse 阶段不按大小硬排除 document；以归档 actual byte_count + PDF 页数进入
+   regular/heavy/huge lane（07 §3.9），大文档仍自动处理且空闲时可借满容量。
    阶段↔use case 接法定死：parse 阶段对 pending_parse 的每个 document 调 **05 的 process**
    （单文档内 parse→build→publish 串行——检查点"含 05 process"即此意）；build/publish 队列只消化
    process 中断留下的残留，分别调 build_units / publish_run。不同文档可按
@@ -197,7 +198,7 @@ tests/unit 只测 run_once 的调度/报告聚合（fake 队列结果）与 stab
 
 - **WorkerDeps 实际字段**超出 §3.1 四字段草案：run_once 组装 use case 需要
   uow_factory / path_builder / raw_store / artifact_store / profile_loader_factory /
-  parse_timeout_seconds / config(WorkerConfig 阈值集合)；生产 wiring 仍全部在 cli/worker.py。
+  parse_expected_seconds / config(WorkerConfig 阈值集合)；生产 wiring 仍全部在 cli/worker.py。
 - **pending_download_v1**：候选来源含 web 兜底通道（provider_interface IN
   ('cninfo:p_info3015','cninfo:hisAnnouncement')），并额外暴露 company_id 与完整 candidate
   jsonb 列（下载复用 07 候选协议所需）；仍为 facts-only。

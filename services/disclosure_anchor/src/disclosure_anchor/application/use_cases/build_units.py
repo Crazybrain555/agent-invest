@@ -36,6 +36,11 @@ from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation 
     assess_normalized_ir_table_reconciliation,
 )
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.services.data_file_reader import (
+    DataFileMissingError,
+    DataStoreReadError,
+    read_data_file_bytes,
+)
 from disclosure_anchor.application.worker.locks import maybe_lock_document
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
@@ -108,6 +113,20 @@ class BuildUnits:
                 expected_artifact_hash=run.artifact_hash,
                 expected_document_id=run.document_id,
             )
+            parsed_pages = normalized_ir.get("parsed_pages")
+            if (
+                not isinstance(parsed_pages, dict)
+                or parsed_pages.get("full_pdf") is not True
+            ):
+                raise BuildUnitsError(
+                    self._structured_error(
+                        error_code="PARTIAL_PDF_NOT_PUBLISHABLE",
+                        message=(
+                            "page-range diagnostic parses cannot enter the "
+                            "document-unit publication pipeline"
+                        ),
+                    )
+                )
             document = context["document"]
             drafts, stats = build_unit_drafts_s1_s7(
                 normalized_ir,
@@ -171,6 +190,7 @@ class BuildUnits:
                 run.processing_run_id,
                 self._structured_error(
                     error_code="ARTIFACT_WRITE_FAILED",
+                    retryable=True,
                     message=str(exc),
                 ),
             )
@@ -199,6 +219,7 @@ class BuildUnits:
                 )
             error = self._structured_error(
                 error_code="DB_WRITE_FAILED",
+                retryable=True,
                 message="document_unit DB persistence failed after snapshot write",
             )
             self._mark_failed(run.processing_run_id, error)
@@ -206,6 +227,7 @@ class BuildUnits:
         except Exception as exc:
             error = self._structured_error(
                 error_code="DB_WRITE_FAILED",
+                retryable=True,
                 message="document_unit DB persistence failed after snapshot write",
             )
             self._mark_failed(run.processing_run_id, error)
@@ -305,11 +327,19 @@ class BuildUnits:
                 )
             )
         try:
-            raw_bytes = self._paths.data_path(relpath).read_bytes()
-        except OSError as exc:
+            raw_bytes = read_data_file_bytes(self._paths, relpath)
+        except DataFileMissingError as exc:
             raise BuildUnitsError(
                 self._structured_error(
                     error_code="IR_MISSING",
+                    message=str(exc),
+                )
+            ) from exc
+        except DataStoreReadError as exc:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="IR_READ_FAILED",
+                    retryable=True,
                     message=str(exc),
                 )
             ) from exc
@@ -527,6 +557,7 @@ class BuildUnits:
             raise BuildUnitsError(
                 self._structured_error(
                     error_code="ARTIFACT_WRITE_FAILED",
+                    retryable=True,
                     message=str(exc),
                 )
             ) from exc
@@ -536,6 +567,7 @@ class BuildUnits:
             raise BuildUnitsError(
                 self._structured_error(
                     error_code="ARTIFACT_WRITE_FAILED",
+                    retryable=True,
                     message=(
                         "snapshot verification failed: "
                         f"rows={actual_rows}/{expected_rows} "
@@ -615,11 +647,12 @@ class BuildUnits:
         error_code: str,
         message: str,
         reason_code: str | None = None,
+        retryable: bool = False,
     ) -> dict[str, Any]:
         error: dict[str, Any] = {
             "stage": "build_units",
             "error_code": error_code,
-            "retryable": False,
+            "retryable": retryable,
             "message": message,
         }
         if reason_code is not None:

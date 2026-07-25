@@ -160,7 +160,9 @@ class AdaptiveLoopControllerTests(unittest.TestCase):
 
     def test_publish_failure_cools_publish_and_parse_even_with_other_progress(self) -> None:
         report = _report(failed=1, downloaded=1, parsed=1, built=1)
-        report.failures.append(WorkerFailure("publish", "run_1", "database_down"))
+        report.failures.append(
+            WorkerFailure("publish", "run_1", "IR_READ_FAILED", True)
+        )
 
         self.assertEqual(self.controller.observe(report, now=10.0), 0)
         cooled = self.controller.effective_limits(self.limits, now=11.0)
@@ -188,9 +190,18 @@ class AdaptiveLoopControllerTests(unittest.TestCase):
             50,
         )
 
-    def test_item_local_build_poison_does_not_cool_global_stages(self) -> None:
-        report = _report(failed=1, parsed=1)
-        report.failures.append(WorkerFailure("build", "run_1", "IR_MISSING"))
+    def test_item_local_build_and_publish_poison_do_not_cool_stages(self) -> None:
+        report = _report(failed=2, parsed=1)
+        report.failures.extend(
+            (
+                WorkerFailure("build", "run_1", "IR_MISSING"),
+                WorkerFailure(
+                    "publish",
+                    "run_2",
+                    "RUN_UNIT_HASH_INVALID",
+                ),
+            )
+        )
 
         self.assertEqual(self.controller.observe(report, now=10.0), 0)
         self.assertEqual(
@@ -360,6 +371,10 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         self.assertEqual(first.identity().version, "3.4.0")
         self.assertEqual(second.identity().version, "3.4.0")
         self.assertEqual(deps.parser_options.http_request_concurrency, 7)
+        self.assertEqual(deps.config.parse_runaway_timeout_seconds, 86400)
+        with mock.patch.object(worker_cli, "_exit_wedged_worker") as exit_worker:
+            deps.on_parse_runaway("doc_wedged")
+        exit_worker.assert_called_once_with()
         version.assert_called_once_with()
 
     def test_lost_singleton_lock_fails_closed(self) -> None:
@@ -384,6 +399,37 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             worker_cli._assert_singleton_or_cancel(lock_conn)
 
         terminate.assert_called_once_with()
+
+    def test_resident_exits_after_process_lifetime_shutdown_latch(self) -> None:
+        stop = mock.MagicMock()
+        stop.is_set.return_value = False
+        engine = mock.MagicMock()
+        deps = mock.MagicMock()
+        settings = mock.MagicMock(
+            worker_loop_interval_seconds=900,
+            worker_loop_max_interval_seconds=1800,
+            worker_wedge_timeout_seconds=0,
+        )
+        with (
+            mock.patch.object(worker_cli, "_StopFlag", return_value=stop),
+            mock.patch.object(
+                worker_cli, "create_db_engine", return_value=engine
+            ),
+            mock.patch.object(worker_cli, "_deps", return_value=deps),
+            mock.patch.object(worker_cli, "_assert_singleton_or_cancel"),
+            mock.patch.object(
+                worker_cli,
+                "run_once",
+                side_effect=worker_cli.WorkerSingletonGuardError(
+                    "singleton advisory lock was lost"
+                ),
+            ),
+            self.assertRaises(worker_cli.WorkerSingletonGuardError),
+        ):
+            worker_cli._run_loop(settings, lock_conn=mock.MagicMock())
+
+        deps.close_source.assert_called_once_with()
+        engine.dispose.assert_called_once_with()
 
     def test_alert_message_triggers_on_outage_and_failure_burst(self) -> None:
         # Single-operator alert channel (batch 4): fire on source outage or

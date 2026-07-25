@@ -36,6 +36,23 @@ PARSE_INFRASTRUCTURE_ERROR_CODES: tuple[str, ...] = (
     "parser_cancelled",
 )
 PARSE_RETRY_NEUTRAL_ERROR_CODES: tuple[str, ...] = ("parser_cancelled",)
+_TERMINAL_PUBLISH_QUARANTINE_SQL = """
+    COALESCE(r.unit_build_error->>'stage', '') = 'publish'
+    AND COALESCE(
+        (r.unit_build_error->>'retryable')::boolean,
+        false
+    ) = false
+"""
+_BUILD_RETRY_ELIGIBLE_SQL = """
+    q.unit_build_attempt_count < :max_retries
+    OR (
+        COALESCE(
+            (r.unit_build_error->>'retryable')::boolean,
+            false
+        ) = true
+        AND q.unit_build_attempt_count < :max_retries_ceiling
+    )
+"""
 # Safety valve: even infra-coded failures stop retrying past this multiple
 # of max_retries, so a document that somehow always dies infra-coded cannot
 # churn forever.
@@ -313,10 +330,10 @@ def pending_parse_backlog_count(
 ) -> int:
     """Count downloaded raw documents still awaiting a successful parse.
 
-    This is deliberately broader than :func:`pending_parse`: oversized,
-    non-retryable, and retry-exhausted documents still occupy raw storage and
-    therefore remain part of the backfill admission pressure.  The processing
-    predicate is retained so metadata-only/noise documents do not consume the
+    This is deliberately broader than :func:`pending_parse`: non-retryable
+    and retry-exhausted documents still occupy raw storage and therefore
+    remain part of the backfill admission pressure. The processing predicate
+    is retained so metadata-only/noise documents do not consume the
     processing watermark.
     """
 
@@ -441,13 +458,14 @@ def pending_parse(
 ) -> list[dict[str, Any]]:
     """Documents awaiting parse, excluding non-retryable and exhausted ones.
 
-    Oversized documents (07 §3.9) are excluded in SQL: they used to be
-    LIMIT-selected first and then skipped, permanently occupying every batch
-    slot (round8 audit blocker). With scope_classes set (parse scope 'core'),
-    coded documents parse when any F006V segment hits a core class through
-    classification_rule (0016 — classification is view-derived, so the queue
-    joins the same rules); code-less channels fall back to the registration
-    filing_type. None → parse everything ('all').
+    Raw archive byte_count is returned as a scheduling cost signal, never an
+    eligibility gate. CNINFO's F005N hint is not unit-stable in the real
+    corpus, while source_access.result_snapshot.byte_count is measured after
+    download and bound to the archived raw hash. With scope_classes set
+    (parse scope 'core'), coded documents parse when any F006V segment hits a
+    core class through classification_rule (0016 — classification is
+    view-derived, so the queue joins the same rules); code-less channels fall
+    back to the registration filing_type. None → parse everything ('all').
     """
 
     scope_sql = ""
@@ -471,10 +489,15 @@ def pending_parse(
             SELECT q.document_id, q.status, q.failed_parse_count,
                    q.last_failed_retryable,
                    d.raw_file_relpath,
-                   COALESCE((d.provider_metadata->>'oversized')::boolean, false)
-                       AS oversized
+                   CASE
+                     WHEN jsonb_typeof(sa.result_snapshot->'byte_count') = 'number'
+                     THEN (sa.result_snapshot->>'byte_count')::numeric::bigint
+                     ELSE NULL
+                   END AS raw_byte_count
               FROM {OPS_SCHEMA}.pending_parse_v1 q
               JOIN {CORE_SCHEMA}.document d ON d.document_id = q.document_id
+              LEFT JOIN {CORE_SCHEMA}.source_access sa
+                ON sa.source_access_id = d.source_access_id
               LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
                 ON tc_scope.company_id = d.company_id
              WHERE COALESCE(q.last_failed_retryable, true)
@@ -493,7 +516,6 @@ def pending_parse(
                        AND COALESCE(pr.error->>'error_code', '')
                            <> ALL(:retry_neutral_error_codes))
                    < :max_retries_ceiling
-               AND NOT COALESCE((d.provider_metadata->>'oversized')::boolean, false)
                {scope_sql}
              ORDER BY q.document_id
              LIMIT :limit
@@ -510,15 +532,22 @@ def pending_build(
     rows = conn.execute(
         text(
             f"""
-            SELECT processing_run_id, document_id, unit_build_status,
-                   unit_build_attempt_count
-              FROM {OPS_SCHEMA}.pending_build_v1
-             WHERE unit_build_attempt_count < :max_retries
-             ORDER BY processing_run_id
+            SELECT q.processing_run_id, q.document_id, q.unit_build_status,
+                   q.unit_build_attempt_count
+              FROM {OPS_SCHEMA}.pending_build_v1 q
+             JOIN {CORE_SCHEMA}.processing_run r
+                ON r.processing_run_id = q.processing_run_id
+             WHERE ({_BUILD_RETRY_ELIGIBLE_SQL})
+               AND NOT ({_TERMINAL_PUBLISH_QUARANTINE_SQL})
+             ORDER BY q.processing_run_id
              LIMIT :limit
             """
         ),
-        {"max_retries": max_retries, "limit": limit},
+        {
+            "max_retries": max_retries,
+            "max_retries_ceiling": max_retries * RETRY_CEILING_MULTIPLIER,
+            "limit": limit,
+        },
     ).mappings()
     return [dict(row) for row in rows]
 
@@ -554,10 +583,18 @@ def pending_build_count(conn: Connection, *, max_retries: int) -> int:
     return int(
         conn.execute(
             text(
-                f"SELECT count(*) FROM {OPS_SCHEMA}.pending_build_v1 "
-                "WHERE unit_build_attempt_count < :max_retries"
+                f"SELECT count(*) FROM {OPS_SCHEMA}.pending_build_v1 q "
+                f"JOIN {CORE_SCHEMA}.processing_run r "
+                "ON r.processing_run_id = q.processing_run_id "
+                f"WHERE ({_BUILD_RETRY_ELIGIBLE_SQL}) "
+                f"AND NOT ({_TERMINAL_PUBLISH_QUARANTINE_SQL})"
             ),
-            {"max_retries": max_retries},
+            {
+                "max_retries": max_retries,
+                "max_retries_ceiling": (
+                    max_retries * RETRY_CEILING_MULTIPLIER
+                ),
+            },
         ).scalar_one()
     )
 

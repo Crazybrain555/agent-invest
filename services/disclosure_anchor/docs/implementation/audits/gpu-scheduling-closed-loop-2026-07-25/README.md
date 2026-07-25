@@ -15,12 +15,70 @@
 | vLLM 补充横截面 | 2026-07-25 16:34:20 | health 200/0.316s、running 121、waiting 40、preemptions 0 |
 | `dcf7014` 正式安装波次 | 19:43:53–20:21:21 | parsed/built/published 55/55/55；一次 readiness 假阴性停止滚动准入 |
 | readiness 放大空谷 | 19:52:29–20:24:37 | 32.14 分钟无新 parse start；eligible backlog 仍为 19,887 |
+| `15994df` 重启后 A/B | 21:08:30–21:53:49 | 422 succeeded、1 item failure、16 running；每个 5 分钟桶均有 start/finish |
+| 新包络 vLLM 短窗 | 21:53:19–21:53:49 | running 40–81、waiting 0–9、preemptions 0；6/6 metrics 成功 |
+| 延长连续性复核 | 21:10–23:06 | 1,132 runs：1,113 succeeded、3 failed、16 running；每个 5 分钟桶均有 start/finish |
+| 延长 vLLM/阶段复核 | 截至 23:06 | running 2–76、waiting 通常 0/峰 10、preemptions 0；16 个 MinerU 父进程时曾只有 11 个 fast_api，证明部分文档处于本地阶段 |
+| MinerU 3.4 成功耗时包络 | 截至 21:34 | 13,896 runs；p99.9 55.19m，observed max 62.74m |
 
 05:45 基线运行的是 primary commit
 `3c7ef821922f39975a4b889738ea823052c1a648`。基础动态调度后来 squash 为
 `dcf7014`；19:43:53 的正式安装波次由 startup banner 和真实子进程命令确认运行该代码。
 该波次又发现 readiness 连续失败控制尚未闭合，后续修正的发布身份仍必须以最终 commit、
 startup banner 和真实进程为准。
+
+### 1.1 `15994df` 重启后的连续补槽与长任务包络
+
+21:08:30 受控重启后的新 worker 已出现一次
+`MinerU readiness probe failed (1/3); admission paused`，随后没有结束 round，而是恢复 refill。
+截至 21:53:49：
+
+- 5 分钟 start/finish 桶依次为
+  `16/15, 21/22, 16/15, 40/40, 59/59, 55/55, 69/69, 74/74, 50/50, 39/39`；
+- 422 份成功、1 份 item-local `parser_task_failed`、16 份运行中；
+- 最新 running start 为 21:53:49，说明没有再次形成旧 32 分钟 admission 空谷；
+- 同时 30 秒 vLLM 采样为 running `40,49,81,75,55,64`，waiting `0,0,7,2,0,9`，
+  preemptions 始终 0。它证明请求队列已从“running≈128 + waiting 数百”降到有界状态，
+  但不等于硬件 GPU 百分比恒定。
+
+延长到 23:06 后，eligible backlog 仍约 19,525、parse running 仍为 16；22:48 后一次
+completion 到下一次 start 的中位约 0.004 秒、最大 40.7 秒。vLLM waiting 通常为 0、
+峰值 10，preemptions 始终 0；同一时刻出现 16 个 MinerU 父进程但仅 11 个临时 API，
+说明残余 GPU 波形主要来自远端请求阶段与本地启动/取回/后处理阶段交替，不是队列断粮或
+持续 overload。解析失败 3/1,132（约 0.27%）是 ConnectTimeout、ReadError 和单项 server
+task failed，没有 429/`RESOURCE_EXHAUSTED`。因此这段证据不支持新增透明 request proxy
+或对正常 rolling refill 加固定等待。
+
+成功耗时不能直接定义 correctness deadline。对全部 MinerU 3.4 成功 run 使用
+`finished_at-started_at` 的只读分位数为：p50 1.35m、p90 19.34m、p95 27.98m、
+p99 41.60m、p99.9 55.19m、最大 62.74m。后续采用的 24 小时 runaway guard 是约
+23 倍当前 observed max 的 live-but-stuck 灾难保险；旧的 base/per-page/max 只保留为
+软预期和告警。
+
+复核 SQL：
+
+```sql
+BEGIN TRANSACTION READ ONLY;
+SET LOCAL TIME ZONE 'Asia/Shanghai';
+SELECT count(*) FILTER (WHERE status='succeeded') AS succeeded,
+       count(*) FILTER (WHERE status='failed') AS failed,
+       count(*) FILTER (WHERE status='running') AS running,
+       min(started_at) FILTER (WHERE status='running') AS oldest,
+       max(started_at) FILTER (WHERE status='running') AS newest
+  FROM disclosure_core.processing_run
+ WHERE run_kind='parse'
+   AND started_at >= timestamptz '2026-07-25 21:08:30+08';
+
+SELECT count(*) AS n,
+       percentile_cont(0.999) WITHIN GROUP (
+         ORDER BY extract(epoch FROM finished_at-started_at) / 60
+       ) AS p999_min,
+       max(extract(epoch FROM finished_at-started_at) / 60) AS max_min
+  FROM disclosure_core.processing_run
+ WHERE run_kind='parse' AND status='succeeded'
+   AND parser_version LIKE '%3.4.0%' AND finished_at IS NOT NULL;
+ROLLBACK;
+```
 
 本机解析端为 MinerU 3.4.0、`mineru-vl-utils` 1.0.5。已安装源文件校验：
 
@@ -46,7 +104,7 @@ curl -fsS --noproxy '*' --connect-timeout 3 --max-time 8 \
   "$DISCLOSURE_MINERU_SERVER_URL/version"
 ```
 
-### 1.1 上线 A/B 新发现：单次 readiness 仍会放大成锯齿
+### 1.2 历史上线 A/B 发现：单次 readiness 会放大成锯齿
 
 `dcf7014` 已解决 1,600 级请求突发，但真实上线证明“一次 readiness 失败立即结束
 refill”仍是独立的锯齿发生器：
@@ -171,8 +229,16 @@ ROLLBACK;
 ```
 
 `eligible pending` 必须复用被审计 source commit 的完整
-`queries.pending_parse` 谓词；raw view 会包含 oversized、不可重试或预算耗尽项。服务根目录
-可用：
+`queries.pending_parse` 谓词；raw view 会包含不可重试或预算耗尽项。旧实现还会按
+`provider_metadata.oversized` 排除，但 2026-07-25 实库审计证明 CNInfo 大小提示混合单位：
+40,544 条接近 KiB 口径、89 条接近 bytes、260 条不属于两种明确模式、3 条缺失。旧逻辑因此
+把 88 份实际仅 107–685 KiB 的文件和 1 份 190.8 MB 文件一起永久挡在 parse 之前。
+
+当前修正不再把 provider hint 或旧 `oversized` 键当准入事实；`pending_parse` 从与 document
+绑定的下载 `source_access.result_snapshot.byte_count` 返回归档实测字节。实库 40,896/40,896
+份下载文档都有该字段，且对应 `result_hash` 全部与 document raw hash 一致。89 份旧标记文档
+重放后全部重新入队：88 份按正常页数 lane 调度，真正的 190.8 MB 文件进入 HUGE lane；两者
+都保持整本解析资格。服务根目录可用：
 
 ```bash
 source ~/.config/agent-invest/disclosure_anchor/worker.env
@@ -332,6 +398,17 @@ PY
 这只排除 active IR 合同中记录在案的 range parse。resident worker 不会自动分页或拼接；
 admin 契约仍允许显式 `start_page` / `end_page`。因此 `false=0` 不能证明 MinerU 的跨页表和
 reading order 绝对正确，但足以说明目前没有“已发布页段产物被外部拼坏”的证据。
+
+23:15 又以同一数据库快照边界扩展到所有
+`status='succeeded' AND unit_build_status='succeeded'` 的历史 run：29,777 份中
+`full_pdf=true` 29,777、false/missing/unreadable 均为 0；其中 active 21,500 份也全部为
+true。发布路径同时增加独立 hash-bound IR provenance 检查，因此旧的 inactive built run
+也不能绕过 `full_pdf=true` 边界。
+
+该发布守卫同时钉住失败域：确定性的 IR/hash/contract/full-PDF/unit 不变量失败会在 run 上
+持久记录为 `stage=publish,retryable=false`，不会逐轮重占自动队列；读取前会独立确认 data
+root 在线，挂载、权限或 I/O 故障统一为可重试 `IR_READ_FAILED` 并触发共享基础设施降载，
+不会把原本健康的 built run 错误隔离。
 
 ## 5. MinerU 临时目录生命周期
 

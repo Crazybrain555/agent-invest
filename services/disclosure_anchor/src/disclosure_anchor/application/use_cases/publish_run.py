@@ -6,9 +6,24 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
 from typing import Any
 
+from disclosure_anchor.application.contracts.normalized_ir import (
+    NormalizedIRVersionError,
+    validate_normalized_ir_contract,
+    validate_normalized_ir_identity,
+    validate_normalized_ir_path_version,
+)
+from disclosure_anchor.application.ports.file_store import FileStorePathPort
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.services.data_file_reader import (
+    DataFileMissingError,
+    DataStoreReadError,
+    read_data_file_bytes,
+)
 from disclosure_anchor.application.worker.locks import maybe_lock_document
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.entities import outbox_events
@@ -55,9 +70,134 @@ class UnitDiff:
     projection_changed: list[tuple[e.DocumentUnit, e.DocumentUnit, list[str]]]
 
 
+TERMINAL_PUBLICATION_ERROR_CODES = frozenset(
+    {
+        "IR_CONTRACT_TOO_OLD",
+        "IR_CONTRACT_UNSUPPORTED",
+        "IR_HASH_MISMATCH",
+        "IR_MISSING",
+        "PARTIAL_PDF_NOT_PUBLISHABLE",
+        "QUERY_PROJECTION_HASH_MISMATCH",
+        "RUN_HASH_AGGREGATE_INVALID",
+        "RUN_UNIT_HASH_INPUT_INVALID",
+        "RUN_UNIT_HASH_INVALID",
+        "RUN_UNIT_SEMANTIC_INVALID",
+        "RUN_UNIT_SET_INVALID",
+    }
+)
+
+
+class NormalizedIRPublicationGuard:
+    """Independently verify whole-document provenance before activation.
+
+    BuildUnits rejects new diagnostic page-range artifacts, but publication is
+    also callable on historical built runs. Re-reading the hash-bound IR here
+    closes that bypass without trusting a prior in-memory build decision.
+    """
+
+    def __init__(self, path_builder: FileStorePathPort) -> None:
+        self._paths = path_builder
+
+    def __call__(self, run: e.ProcessingRun) -> None:
+        relpath_text = run.normalized_ir_relpath
+        if not relpath_text:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="IR_MISSING",
+                    message="normalized_ir_relpath is missing",
+                )
+            )
+        relpath = Path(relpath_text)
+        try:
+            raw_bytes = read_data_file_bytes(self._paths, relpath)
+        except DataFileMissingError as exc:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="IR_MISSING",
+                    message=str(exc),
+                )
+            ) from exc
+        except DataStoreReadError as exc:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="IR_READ_FAILED",
+                    retryable=True,
+                    message=str(exc),
+                )
+            ) from exc
+        if run.artifact_hash:
+            actual_hash = "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
+            if actual_hash != run.artifact_hash:
+                raise PublishRunError(
+                    _structured_error(
+                        error_code="IR_HASH_MISMATCH",
+                        message=(
+                            f"normalized IR at {relpath} hashes to "
+                            f"{actual_hash}, run.artifact_hash is "
+                            f"{run.artifact_hash}"
+                        ),
+                    )
+                )
+        try:
+            decoded = json.loads(raw_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="IR_CONTRACT_UNSUPPORTED",
+                    reason_code="invalid_json",
+                    message=f"normalized IR is not valid UTF-8 JSON: {exc}",
+                )
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise PublishRunError(
+                _structured_error(
+                    error_code="IR_CONTRACT_UNSUPPORTED",
+                    reason_code="payload_not_object",
+                    message="normalized IR must be an object",
+                )
+            )
+        try:
+            version = validate_normalized_ir_contract(decoded)
+            validate_normalized_ir_identity(
+                decoded,
+                document_id=run.document_id,
+            )
+            validate_normalized_ir_path_version(relpath, version=version)
+        except NormalizedIRVersionError as exc:
+            error_code = (
+                "IR_CONTRACT_TOO_OLD"
+                if exc.reason_code == "contract_version_too_old"
+                else "IR_CONTRACT_UNSUPPORTED"
+            )
+            raise PublishRunError(
+                _structured_error(
+                    error_code=error_code,
+                    reason_code=exc.reason_code,
+                    message=str(exc),
+                )
+            ) from exc
+        parsed_pages = decoded["parsed_pages"]
+        if parsed_pages.get("full_pdf") is not True:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="PARTIAL_PDF_NOT_PUBLISHABLE",
+                    message=(
+                        "page-range diagnostic parses cannot become the "
+                        "active document run"
+                    ),
+                )
+            )
+
+
 class PublishRun:
-    def __init__(self, *, uow_factory: Callable[[], UnitOfWork]) -> None:
+    def __init__(
+        self,
+        *,
+        uow_factory: Callable[[], UnitOfWork],
+        publication_guard: Callable[[e.ProcessingRun], None],
+    ) -> None:
         self._uow_factory = uow_factory
+        self._publication_guard = publication_guard
 
     def execute(self, command: PublishRunCommand) -> PublishRunResult:
         if command.allow_empty and not command.reason:
@@ -75,8 +215,8 @@ class PublishRun:
                     _structured_error(
                         error_code="RUN_NOT_FOUND",
                         message=f"processing run not found: {command.processing_run_id}",
-                    )
                 )
+            )
             _validate_publishable(run)
             maybe_lock_document(uow, run.document_id)
             document = uow.documents.get_for_update(run.document_id)
@@ -106,15 +246,6 @@ class PublishRun:
                         message="document points at a non-active current run",
                     )
                 )
-
-            new_units = uow.document_units.list_by_processing_run(run.processing_run_id)
-            if not new_units and not command.allow_empty:
-                raise PublishRunError(
-                    _structured_error(
-                        error_code="EMPTY_RUN",
-                        message="cannot publish empty unit run without allow_empty",
-                    )
-                )
             old_run = (
                 uow.processing_runs.get(document.current_processing_run_id)
                 if document.current_processing_run_id
@@ -125,8 +256,41 @@ class PublishRun:
                 if old_run is not None
                 else []
             )
-            canonical_new = _validate_candidate_run(run=run, units=new_units)
-            diff = diff_units(old_units=old_units, new_units=new_units)
+            try:
+                self._publication_guard(run)
+                new_units = uow.document_units.list_by_processing_run(
+                    run.processing_run_id
+                )
+                if not new_units and not command.allow_empty:
+                    raise PublishRunError(
+                        _structured_error(
+                            error_code="EMPTY_RUN",
+                            message=(
+                                "cannot publish empty unit run without "
+                                "allow_empty"
+                            ),
+                        )
+                    )
+                canonical_new = _validate_candidate_run(
+                    run=run,
+                    units=new_units,
+                )
+                diff = diff_units(old_units=old_units, new_units=new_units)
+            except PublishRunError as exc:
+                if (
+                    exc.error.get("error_code")
+                    in TERMINAL_PUBLICATION_ERROR_CODES
+                ):
+                    # Historical built runs may predate current IR/unit
+                    # invariants. Quarantine deterministic poison once while
+                    # retaining its units for audit. Shared storage failures
+                    # remain built and retryable.
+                    run.unit_build_status = "failed"
+                    run.unit_build_error = dict(exc.error)
+                    run.unit_build_attempt_count += 1
+                    uow.processing_runs.update(run)
+                    uow.commit()
+                raise
 
             # All candidate identity and semantic checks happen before the
             # active pointer or either run is mutated. Historical active runs
@@ -516,11 +680,12 @@ def _structured_error(
     error_code: str,
     message: str,
     reason_code: str | None = None,
+    retryable: bool = False,
 ) -> dict[str, Any]:
     error: dict[str, Any] = {
         "stage": "publish",
         "error_code": error_code,
-        "retryable": False,
+        "retryable": retryable,
         "message": message,
     }
     if reason_code is not None:

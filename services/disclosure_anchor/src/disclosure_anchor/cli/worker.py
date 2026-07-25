@@ -55,6 +55,7 @@ from disclosure_anchor.application.worker.worker import (
     WorkerDeps,
     _is_provider_infrastructure_error,
     build_failures_indicate_outage,
+    publish_failures_indicate_outage,
     render_report_section,
     run_once,
 )
@@ -70,6 +71,12 @@ SYNC_COOLDOWN_MAX_SECONDS = 7200
 PARSE_COOLDOWN_BASE_SECONDS = 120
 PROVIDER_ERROR_COOLDOWN_BASE_SECONDS = 60
 PUBLISH_COOLDOWN_BASE_SECONDS = 120
+
+
+class WorkerSingletonGuardError(RuntimeError):
+    """The process-lifetime singleton session can no longer be trusted."""
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="disclosure-anchor worker")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -149,12 +156,11 @@ def _wedge_watchdog(
 
     Rounds may honestly run for hours (heavy parse batches), so duration
     bounds nothing — liveness does. Every stage bumps the heartbeat at item
-    granularity; the longest legal silent gap is one document parse timeout
-    (a cold batch of heavy documents completes nothing until its first doc
-    finishes). Beyond that, the process is wedged in something no inner
-    timeout covers — a hung getaddrinfo, a TCC-blocked spawn, a pathological
-    query (all three observed 2026-07-23/24, each holding a round open for
-    hours while the GPU idled). Dump every thread's stack and exit nonzero:
+    granularity, and the parse coordinator also renews it every 30 seconds
+    while it still owns a future inside the extreme lease. Beyond the watchdog
+    threshold the process is wedged in something no inner timeout covers — a
+    hung getaddrinfo, a TCC-blocked spawn, or a pathological query (all three
+    observed 2026-07-23/24). Dump every thread's stack and exit nonzero:
     launchd KeepAlive restarts clean, and every write path is batch-committed
     idempotent by design, so a hard exit loses no work.
     """
@@ -236,6 +242,11 @@ def _run_loop(settings: Settings, *, lock_conn: Connection) -> int:
             round_failed = False
             try:
                 report = run_once(limits, deps, should_stop=stop.is_set)
+            except WorkerSingletonGuardError:
+                # _assert_singleton_or_cancel has already latched parser
+                # shutdown. Continuing this process would make every future
+                # MinerU child self-cancel, so launchd must replace it.
+                raise
             except Exception as exc:
                 traceback.print_exc()
                 report = _system_failure_report(
@@ -531,7 +542,7 @@ def _build_infrastructure_failure(report: WorkerReport) -> bool:
 
 
 def _publish_failure(report: WorkerReport) -> bool:
-    return any(failure.stage == "publish" for failure in report.failures)
+    return publish_failures_indicate_outage(report.failures)
 
 
 def _system_failure_report(
@@ -565,9 +576,9 @@ def _assert_singleton_or_cancel(lock_conn: Connection) -> None:
 
     try:
         _assert_singleton_lock(lock_conn)
-    except Exception:
+    except Exception as exc:
         terminate_active_mineru_processes()
-        raise
+        raise WorkerSingletonGuardError(str(exc)) from exc
 
 
 class _StopFlag:
@@ -670,7 +681,7 @@ def _deps(
         source_factory=source_factory,
         profile_loader_factory=profile_loader_factory,
         parser_factory=parser_factory,
-        parse_timeout_seconds=settings.disclosure_parse_timeout_seconds,
+        parse_expected_seconds=settings.disclosure_parse_timeout_seconds,
         page_counter=count_pdf_pages,
         config=WorkerConfig(
             max_parse_retries=settings.disclosure_max_parse_retries,
@@ -704,6 +715,9 @@ def _deps(
             parse_timeout_max_seconds=(
                 settings.disclosure_parse_timeout_max_seconds
             ),
+            parse_runaway_timeout_seconds=(
+                settings.disclosure_parse_runaway_timeout_seconds
+            ),
         ),
         clock=lambda: datetime.now(timezone.utc),
         parser_options=ParserOptions(
@@ -713,6 +727,7 @@ def _deps(
                 settings.mineru_http_request_concurrency
             ),
         ),
+        on_parse_runaway=lambda _document_id: _exit_wedged_worker(),
         source_close_after_round=False,
         close_source=close_source,
         admission_guard=admission_guard,
@@ -743,7 +758,8 @@ def _print_version_banner(settings: Settings) -> None:
         f"gpu_request_cap="
         f"{settings.worker_parse_concurrency}x"
         f"{per_document_cap}"
-        f"<={settings.worker_gpu_max_sequences}"
+        f"<={settings.worker_gpu_max_sequences} "
+        f"parse_runaway={settings.disclosure_parse_runaway_timeout_seconds}s"
     )
     try:
         engine = create_db_engine(_database_url(settings))

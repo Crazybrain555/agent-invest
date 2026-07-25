@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from disclosure_anchor.adapters.db.postgres.connection import create_db_engine
 from disclosure_anchor.adapters.db.postgres.connection import uses_reader_database_url_fallback
@@ -770,19 +770,7 @@ def _database_consistency_checks(settings: Settings, engine: Engine) -> list[Che
                 )
             )
 
-        stale_rows = conn.execute(
-            text(
-                f"SELECT processing_run_id FROM {CORE_SCHEMA}.processing_run "
-                "WHERE status = 'running' AND started_at IS NOT NULL "
-                "AND started_at < now() - make_interval(secs => :seconds)"
-            ),
-            {"seconds": settings.disclosure_parse_timeout_seconds},
-        ).all()
-        checks.append(
-            _pass("stale running runs", "none")
-            if not stale_rows
-            else _warn("stale running runs", f"count={len(stale_rows)}")
-        )
+        checks.extend(running_run_liveness_checks(settings, conn))
 
         empty_publish = int(
             conn.execute(
@@ -801,23 +789,6 @@ def _database_consistency_checks(settings: Settings, engine: Engine) -> list[Che
                 "empty publish dead letters",
                 f"count={empty_publish}; automatic publish excludes them; "
                 "review before using --allow-empty",
-            )
-        )
-
-        oversized = int(
-            conn.execute(
-                text(
-                    f"SELECT count(*) FROM {CORE_SCHEMA}.document "
-                    "WHERE COALESCE((provider_metadata->>'oversized')::boolean, false)"
-                )
-            ).scalar_one()
-        )
-        checks.append(
-            _pass("oversized parse exclusions", "none")
-            if oversized == 0
-            else _warn(
-                "oversized parse exclusions",
-                f"count={oversized}; excluded before parse LIMIT",
             )
         )
 
@@ -840,6 +811,58 @@ def _database_consistency_checks(settings: Settings, engine: Engine) -> list[Che
             )
         )
     return checks
+
+
+def running_run_liveness_checks(
+    settings: Settings, conn: Connection
+) -> list[CheckResult]:
+    """Separate normal long parses from actionable abandoned work.
+
+    Page-aware expected duration is a worker scheduling diagnostic and cannot
+    be reconstructed faithfully from SQL alone. Doctor therefore warns on a
+    parse only after the configured extreme whole-future lease, while keeping
+    the established stale-run signal for non-parse work.
+    """
+
+    runaway_parse_rows = conn.execute(
+        text(
+            f"SELECT processing_run_id FROM {CORE_SCHEMA}.processing_run "
+            "WHERE run_kind = 'parse' AND status = 'running' "
+            "AND started_at IS NOT NULL "
+            "AND started_at < now() - make_interval(secs => :seconds)"
+        ),
+        {"seconds": settings.disclosure_parse_runaway_timeout_seconds},
+    ).all()
+    stale_non_parse_rows = conn.execute(
+        text(
+            f"SELECT processing_run_id FROM {CORE_SCHEMA}.processing_run "
+            "WHERE run_kind <> 'parse' AND status = 'running' "
+            "AND started_at IS NOT NULL "
+            "AND started_at < now() - make_interval(secs => :seconds)"
+        ),
+        {"seconds": settings.disclosure_stale_run_threshold_seconds},
+    ).all()
+    return [
+        (
+            _pass("runaway parse runs", "none")
+            if not runaway_parse_rows
+            else _warn(
+                "runaway parse runs",
+                (
+                    f"count={len(runaway_parse_rows)}; exceeded extreme "
+                    "whole-future lease"
+                ),
+            )
+        ),
+        (
+            _pass("stale runs", "none")
+            if not stale_non_parse_rows
+            else _warn(
+                "stale runs",
+                f"count={len(stale_non_parse_rows)}; non-parse work made no finish",
+            )
+        ),
+    ]
 
 
 def _registered_raw_documents(

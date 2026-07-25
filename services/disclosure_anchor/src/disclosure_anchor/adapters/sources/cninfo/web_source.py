@@ -4,11 +4,13 @@ Insurance channel for WebAPI quota/credential outages. Verified live
 2026-07-06 against the same announcement (TEXTID 1225406051):
 
 - ``announcementId`` equals the WebAPI ``TEXTID``;
-- ``adjunctSize`` is KB, same as ``F005N``;
+- ``adjunctSize`` and ``F005N`` are provider signature hints, but their
+  numeric scale is not unit-stable in the production corpus.
 
 so the dedup key (provider, provider_document_id, raw_file_hash) and the B7
-file-signature comparison are shared across channels — the same announcement
-synced through either channel is absorbed idempotently.
+file-signature comparison preserve the provider values verbatim. Scheduling
+cost uses the measured archive byte_count instead; the same announcement
+synced through either channel is still absorbed idempotently by raw hash.
 
 Channel limitations (documented, accepted for a fallback):
 - no company profile (no legal name / USCC); SubjectResolver falls back to the

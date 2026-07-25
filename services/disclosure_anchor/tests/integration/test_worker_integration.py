@@ -340,7 +340,7 @@ class WorkerRunOnceIntegrationTests(unittest.TestCase):
             source_factory=lambda: self.source,
             profile_loader_factory=lambda source: source.profile_for_security,
             parser_factory=lambda: FakeParser(),
-            parse_timeout_seconds=60,
+            parse_expected_seconds=60,
             config=_config(),
             clock=lambda: datetime.now(timezone.utc),
         )

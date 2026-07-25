@@ -66,7 +66,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | ~~disclosure_topics~~ | **0016 删除**（表列）。视图现算：class 词表全部命中类集合（jsonb 数组）；无码通道 NULL |
 | report_period | `YYYY(A|Q1-4)`；按 code + title_topic priority argmax 后的主类推导，定期报告必填，临时公告可 NULL，不因标题含“季度报告”等子串伪造 |
 | raw_file_relpath/raw_file_hash | 相对路径+sha256；原始 PDF 不可变只追加 |
-| provider_metadata | jsonb：raw_category（F006V 原串）、category_names（中文分类名数组）、file_signature、oversized 标记等 |
+| provider_metadata | jsonb：raw_category（F006V 原串）、category_names（中文分类名数组）、file_signature 等；CNInfo F005N/adjunctSize 原值只作不透明 provider 签名提示，不推断单位，也不作为解析上限 |
 | supersedes/correction_of_document_id | 版本链（修订/更正） |
 
 ### processing_run（处理运行=action_log 特化）
@@ -104,7 +104,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | version | 与仓内 JSON 词表一致；doctor 校验漂移；`make load-rules` 事务内重载 |
 
 ### source_access / source_checkpoint / provider_category
-- source_access：每次 provider 访问一行（**失败也留痕**，含 profile 拉取失败）；query_params 已剔除凭据；error 结构化。worker 捕获的同步失败另写 `cninfo:worker_sync_failure` 调度标记，保证失败公司冷却并移到未尝试公司之后。
+- source_access：每次 provider 访问一行（**失败也留痕**，含 profile 拉取失败）；query_params 已剔除凭据；error 结构化。下载成功快照中的 `result_snapshot.byte_count` 是归档实测字节数，与 `result_hash`/document raw hash 绑定，可作调度成本；provider 大小提示仍保留原值，不冒充实测字节。worker 捕获的同步失败另写 `cninfo:worker_sync_failure` 调度标记，保证失败公司冷却并移到未尝试公司之后。
 - source_checkpoint：scope_key=`company_id:p_info3015`；cursor={window_end, window_start, synced_at}（后两个为审计字段，判定只用 window_end 与 updated_at）；每次 cursor update 必须同步刷新 updated_at，避免已同步公司永久 due。
 - provider_category：F006V 字典 2135 行（p_info3005 快照 seed）。
 
