@@ -91,9 +91,9 @@ ADMIN_SAMPLES = (
 
 
 def require_mineru_and_sample(sample: AdminSample) -> MinerUGate:
-    engine = engine_or_skip()
     mineru = _mineru_bin_or_skip()
     sample_pdf = _sample_pdf_or_skip(sample.label)
+    engine = engine_or_skip()
     return MinerUGate(engine=engine, mineru=mineru, sample_pdf=sample_pdf)
 
 

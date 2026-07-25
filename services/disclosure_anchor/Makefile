@@ -60,13 +60,14 @@ test-data:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m unittest discover -s tests/sample_corpus -t . -p 'test_*.py'
 
 test-integration:
-	@PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m unittest discover -s tests/integration -t . -p 'test_*.py' || [ $$? -eq 5 ]
+	@$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tests.integration._runner
 
 # Explicit opt-in real-MinerU end-to-end smoke (not collected by `make test`).
-# Requires DISCLOSURE_MIGRATION_DATABASE_URL, DISCLOSURE_MINERU_BIN and the
-# local short_announcement sample PDF; skips cleanly when any is absent.
+# Requires a local PostgreSQL cluster, DISCLOSURE_MINERU_BIN and the local
+# short_announcement sample PDF. The runner always uses a disposable database.
 test-mineru-smoke:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m unittest tests.integration.smoke_real_mineru -v
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tests.integration._runner \
+		--real-mineru -v tests.integration.smoke_real_mineru
 
 api:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m uvicorn disclosure_anchor.main:create_app --factory --host $(API_HOST) --port $(API_PORT)

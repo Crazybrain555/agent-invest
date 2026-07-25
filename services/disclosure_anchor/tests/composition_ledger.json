@@ -190,6 +190,10 @@
    "private_imports": [],
    "tests": 7
   },
+  "tests/unit/test_integration_db_safety.py": {
+   "private_imports": [],
+   "tests": 7
+  },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
    "tests": 1

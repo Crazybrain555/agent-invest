@@ -1,16 +1,10 @@
-"""06R search projection integration: migration round trip + full rebuild.
-
-Runs against a dedicated scratch database. A full rebuild recomputes every
-active-run unit and prunes orphan projection rows, so it must never touch the
-shared DB's real units (test_worker_integration scratch-DB pattern).
-"""
+"""06R search projection integration on the suite scratch database."""
 
 from __future__ import annotations
 
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -19,10 +13,6 @@ import sqlalchemy
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from disclosure_anchor.adapters.db.postgres.bootstrap import (
-    ensure_schemas_and_base_grants,
-)
-from disclosure_anchor.adapters.db.postgres.schema import OWNER_ROLE
 from disclosure_anchor.adapters.db.postgres.models import (
     Company,
     Document,
@@ -35,85 +25,29 @@ from disclosure_anchor.application.use_cases.build_search_projection import (
     BuildSearchProjection,
     BuildSearchProjectionCommand,
 )
-from tests.integration._support import _database_url
+from tests.integration._support import engine_or_skip
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
 
 
 class SearchProjectionIntegrationTests(unittest.TestCase):
-    temp_db: str = ""
     temp_url: str = ""
-    base_url: str = ""
     subprocess_env: dict[str, str] = {}
     class_engine: sqlalchemy.engine.Engine | None = None
 
     @classmethod
     def setUpClass(cls) -> None:
-        base = _database_url()
-        if base is None:
-            raise unittest.SkipTest("no database configured")
-        cls.base_url = base
-        cls.temp_db = f"invest_engine_sptest_{os.getpid()}"
-        admin = sqlalchemy.create_engine(base, isolation_level="AUTOCOMMIT")
-        try:
-            with admin.connect() as conn:
-                conn.execute(
-                    text(f'DROP DATABASE IF EXISTS "{cls.temp_db}" WITH (FORCE)')
-                )
-                # Own the scratch DB with disclosure_owner, mirroring
-                # bootstrap.ensure_database. Migrations SET ROLE disclosure_owner
-                # (env.py), and 0025's CREATE EXTENSION pg_trgm needs the owner
-                # role to hold CREATE on the database.
-                conn.execute(
-                    text(f'CREATE DATABASE "{cls.temp_db}" OWNER "{OWNER_ROLE}"')
-                )
-        except Exception as exc:  # pragma: no cover - environment dependent
-            raise unittest.SkipTest(f"cannot create scratch database: {exc}")
-        finally:
-            admin.dispose()
-        cls.temp_url = (
-            sqlalchemy.engine.make_url(base)
-            .set(database=cls.temp_db)
-            .render_as_string(hide_password=False)
+        cls.class_engine = engine_or_skip()
+        cls.addClassCleanup(cls.class_engine.dispose)
+        cls.temp_url = cls.class_engine.url.render_as_string(
+            hide_password=False
         )
-        schema_engine = sqlalchemy.create_engine(
-            cls.temp_url, isolation_level="AUTOCOMMIT"
-        )
-        try:
-            ensure_schemas_and_base_grants(schema_engine)
-        finally:
-            schema_engine.dispose()
-        roots = tempfile.mkdtemp(prefix="sp_mig_roots_")
         cls.subprocess_env = {
             **os.environ,
             "DISCLOSURE_MIGRATION_DATABASE_URL": cls.temp_url,
             "DATABASE_URL": cls.temp_url,
-            "DISCLOSURE_DATA_ROOT": f"{roots}/services/disclosure_anchor",
-            "DISCLOSURE_SHARED_ROOT": f"{roots}/shared",
-            "DISCLOSURE_RUNTIME_ROOT": f"{roots}/services/disclosure_anchor/runtime",
-            "MINERU_MODEL_CACHE": f"{roots}/shared/model_cache/mineru",
-            "HF_HOME": f"{roots}/shared/model_cache/huggingface",
-            "MODELSCOPE_CACHE": f"{roots}/shared/model_cache/modelscope",
             "PYTHONPATH": "src",
         }
-        upgrade = cls._alembic("upgrade", "head")
-        if upgrade.returncode != 0:  # pragma: no cover - environment dependent
-            raise unittest.SkipTest(
-                f"scratch migration to head failed: {upgrade.stderr[-500:]}"
-            )
-        cls.class_engine = sqlalchemy.create_engine(cls.temp_url)
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        if cls.class_engine is not None:
-            cls.class_engine.dispose()
-        if cls.temp_db and cls.base_url:
-            admin = sqlalchemy.create_engine(cls.base_url, isolation_level="AUTOCOMMIT")
-            with admin.connect() as conn:
-                conn.execute(
-                    text(f'DROP DATABASE IF EXISTS "{cls.temp_db}" WITH (FORCE)')
-                )
-            admin.dispose()
 
     @classmethod
     def _alembic(cls, *args: str) -> "subprocess.CompletedProcess[str]":
@@ -131,6 +65,7 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
 
     # -- migration round trip ----------------------------------------------
     def test_migration_0025_upgrade_downgrade_upgrade(self) -> None:
+        self.addCleanup(self._restore_migration_head)
         self.assertTrue(self._table_exists("unit_search_projection"))
         self.assertTrue(self._view_exists("unit_search_projection_v1"))
 
@@ -143,6 +78,10 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
         self.assertEqual(up.returncode, 0, up.stderr[-500:])
         self.assertTrue(self._table_exists("unit_search_projection"))
         self.assertTrue(self._view_exists("unit_search_projection_v1"))
+
+    def _restore_migration_head(self) -> None:
+        restored = self._alembic("upgrade", "head")
+        self.assertEqual(restored.returncode, 0, restored.stderr[-500:])
 
     # -- full rebuild: count + ts_rank ordering + trgm substring -----------
     def test_full_rebuild_counts_ranks_title_over_body_and_trgm(self) -> None:

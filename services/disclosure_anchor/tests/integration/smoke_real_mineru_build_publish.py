@@ -2,7 +2,7 @@
 
 This is explicit opt-in and intentionally not named ``test_*.py``. It runs the
 three acceptance PDFs through the real MinerU binary, writes artifacts under a
-temporary root, and cleans the rows it creates from the shared local database.
+temporary root, and uses the suite's disposable integration database.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""Worker run_once integration on a live DB with fake source/parser (08 §5)."""
+"""Worker run_once integration on the suite scratch DB (08 §5)."""
 
 from __future__ import annotations
 
@@ -15,10 +15,6 @@ from pathlib import Path
 
 from sqlalchemy import text
 
-from disclosure_anchor.adapters.db.postgres.bootstrap import (
-    ensure_schemas_and_base_grants,
-)
-from disclosure_anchor.adapters.db.postgres.schema import OWNER_ROLE
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
@@ -40,7 +36,7 @@ from disclosure_anchor.application.worker.worker import (
     run_once,
 )
 from disclosure_anchor.settings import SENTINEL_NAME, Settings
-from tests.integration._support import _database_url
+from tests.integration._support import engine_or_skip
 
 import sqlalchemy
 
@@ -165,76 +161,16 @@ class WorkerRunOnceIntegrationTests(unittest.TestCase):
     (observed: real docs got raw_missing failed runs from tmp-root deps).
     """
 
-    temp_db: str = ""
     temp_url: str = ""
-    base_url: str = ""
     class_engine: sqlalchemy.engine.Engine | None = None
 
     @classmethod
     def setUpClass(cls) -> None:
-        base = _database_url()
-        if base is None:
-            raise unittest.SkipTest("no database configured")
-        cls.base_url = base
-        cls.temp_db = f"invest_engine_wktest_{os.getpid()}"
-        admin = sqlalchemy.create_engine(base, isolation_level="AUTOCOMMIT")
-        try:
-            with admin.connect() as conn:
-                conn.execute(text(f'DROP DATABASE IF EXISTS "{cls.temp_db}" WITH (FORCE)'))
-                # Own the scratch DB with disclosure_owner (mirrors
-                # bootstrap.ensure_database): migrations SET ROLE disclosure_owner,
-                # and 0025's CREATE EXTENSION pg_trgm needs the owner role to hold
-                # CREATE on the database. Without this the whole class silently
-                # skipped once 0025 landed.
-                conn.execute(
-                    text(f'CREATE DATABASE "{cls.temp_db}" OWNER "{OWNER_ROLE}"')
-                )
-        except Exception as exc:  # pragma: no cover - environment dependent
-            raise unittest.SkipTest(f"cannot create scratch database: {exc}")
-        finally:
-            admin.dispose()
-        cls.temp_url = sqlalchemy.engine.make_url(base).set(database=cls.temp_db).render_as_string(
+        cls.class_engine = engine_or_skip()
+        cls.addClassCleanup(cls.class_engine.dispose)
+        cls.temp_url = cls.class_engine.url.render_as_string(
             hide_password=False
         )
-        schema_engine = sqlalchemy.create_engine(
-            cls.temp_url, isolation_level="AUTOCOMMIT"
-        )
-        try:
-            ensure_schemas_and_base_grants(schema_engine)
-        finally:
-            schema_engine.dispose()
-        roots = tempfile.mkdtemp(prefix="wk_mig_roots_")
-        env = {
-            **os.environ,
-            "DISCLOSURE_MIGRATION_DATABASE_URL": cls.temp_url,
-            "DATABASE_URL": cls.temp_url,
-            "DISCLOSURE_DATA_ROOT": f"{roots}/services/disclosure_anchor",
-            "DISCLOSURE_SHARED_ROOT": f"{roots}/shared",
-            "DISCLOSURE_RUNTIME_ROOT": f"{roots}/services/disclosure_anchor/runtime",
-            "MINERU_MODEL_CACHE": f"{roots}/shared/model_cache/mineru",
-            "HF_HOME": f"{roots}/shared/model_cache/huggingface",
-            "MODELSCOPE_CACHE": f"{roots}/shared/model_cache/modelscope",
-        }
-        upgrade = subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
-            cwd=str(Path(__file__).resolve().parents[2]),
-            env={**env, "PYTHONPATH": "src"},
-            capture_output=True,
-            text=True,
-        )
-        if upgrade.returncode != 0:  # pragma: no cover - environment dependent
-            raise unittest.SkipTest(f"scratch migration failed: {upgrade.stderr[-500:]}")
-        cls.class_engine = sqlalchemy.create_engine(cls.temp_url)
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        if cls.class_engine is not None:
-            cls.class_engine.dispose()
-        if cls.temp_db and cls.base_url:
-            admin = sqlalchemy.create_engine(cls.base_url, isolation_level="AUTOCOMMIT")
-            with admin.connect() as conn:
-                conn.execute(text(f'DROP DATABASE IF EXISTS "{cls.temp_db}" WITH (FORCE)'))
-            admin.dispose()
 
     def setUp(self) -> None:
         assert self.class_engine is not None
@@ -576,6 +512,7 @@ class WorkerRunOnceIntegrationTests(unittest.TestCase):
             "MODELSCOPE_CACHE": str(self.settings.modelscope_cache),
         }
         cwd = str(Path(__file__).resolve().parents[2])
+        self.addCleanup(self._restore_migration_head, env, cwd)
 
         def view_names() -> set[str]:
             with self.engine.connect() as conn:
@@ -629,6 +566,24 @@ class WorkerRunOnceIntegrationTests(unittest.TestCase):
                     )
                 ).scalar()
             )
+
+    def _restore_migration_head(self, env: dict[str, str], cwd: str) -> None:
+        restored = subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr[-500:])
+        loaded = subprocess.run(
+            [sys.executable, "scripts/load_classification_rules.py"],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(loaded.returncode, 0, loaded.stderr[-500:])
 
     def test_kill_dash_nine_releases_advisory_locks(self) -> None:
         url = self.temp_url

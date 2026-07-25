@@ -79,6 +79,8 @@ smoke（显式运行，不进 make test 默认发现）
   tests/integration/smoke_real_mineru.py：真 MinerU CLI + 真样本 PDF 的
   register→parse 全链（`make test-mineru-smoke`；三重门控：DB 可达 +
   DISCLOSURE_MINERU_BIN 指向可执行 CLI + 本地样本 PDF 存在，缺一 skip。
+  runner 的 DB 与产物根仍为一次性 scratch；只有该显式入口会继承本机
+  MinerU backend/server 与模型 cache，默认集成套件会隔离 cache 并禁用 MinerU。
   文件名不带 test_ 前缀是刻意的——保持 §6.1 双模式绿判据（live-DB 不带
   skipped 的 OK）不被未开启的冒烟 skip 污染）
 
@@ -146,18 +148,24 @@ tests/integration/   已实现  Phase 02 PG schema/权限/views + Phase 03 regis
 入口命令（Makefile）：
 
 ```bash
-make test              # 跑全部分层（当前 82 个；无 DB 环境时 26 个 integration skip）
+make test              # 无 DB 门禁；integration 合法 skip，不读取生产 DATABASE_URL
 make test-unit         # 仅 tests/unit
 make test-contract     # 仅 tests/contract
 make test-data         # 仅 tests/sample_corpus
-make test-integration  # 仅 tests/integration（需要本地 PG + migration 到 head）
+make test-integration  # 自动创建、迁移、销毁 suite-level scratch PostgreSQL DB
 ```
 
 约定：
 
 - `make test` 是**唯一权威入口**；VSCode Testing 已配置发现根为 `./tests`（`.vscode/settings.json`），三层都会出现在 Test Explorer。
-- 依赖外部资源的测试（`tests/sample_corpus` 需要 `tmp/sample_filings`，`tests/integration` 需要本地 PG/runtime）在资源缺失时必须 **skip**，保证无外部依赖的环境仍全绿。
+- 依赖外部资源的测试（`tests/sample_corpus` 需要 `tmp/sample_filings`，`tests/integration` 需要本地 PG）在资源缺失时必须 **skip**，保证无外部依赖的环境仍全绿。
 - `tmp/sample_filings` 与大型 parser artifact 是 git-ignored 的本地 fixture，不入库；只有 `tests/fixtures/phase00/` 的小型 golden 输出入库。
+- 写入型 integration 不得连接 `invest_engine`。统一 runner 以 `template0` 创建
+  `invest_engine_itest_*`，迁移至 head、加载 tracked 分类规则，将 app/migration/admin/reader
+  URL 与 data/runtime root 全部指向隔离环境，再启动 unittest 子进程；默认不继承 MinerU
+  opt-in，结束后精确 DROP。`engine_or_skip()` 只接受带
+  runner marker 的 `DISCLOSURE_TEST_DATABASE_URL`，marker/tearDown/advisory lock 都不能替代
+  database isolation。
 
 ## 7. Phase 02 独立 testing 验证记录
 

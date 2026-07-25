@@ -5,7 +5,7 @@ this test runs the actual MinerU CLI once over a small real filing so parser
 upgrades and mapper regressions surface locally. It skips cleanly unless ALL
 of the following hold:
 
-- the migrated database is reachable (``engine_or_skip``),
+- the scratch runner can provision and migrate a disposable database,
 - ``DISCLOSURE_MINERU_BIN`` points at an executable MinerU CLI,
 - the phase00 short-announcement sample PDF referenced by
   ``tests/fixtures/phase00/short_announcement/parser_artifacts_ref.txt`` exists.
@@ -14,9 +14,7 @@ Run it explicitly, e.g.::
 
     DISCLOSURE_MINERU_BIN=/Volumes/AgentSSD/agent_system/services/\
 disclosure_anchor/runtime/venvs/mineru-phase00/bin/mineru \
-    DISCLOSURE_MIGRATION_DATABASE_URL=... \
-    PYTHONPATH=src .venv/bin/python -m unittest \
-    tests.integration.test_real_mineru_smoke -v
+    make test-mineru-smoke
 """
 
 from __future__ import annotations
