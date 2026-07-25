@@ -80,6 +80,10 @@ from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     SyncDisclosureIndexCommand,
     compute_sync_window,
 )
+from disclosure_anchor.application.worker.locks import (
+    WorkerBusyError,
+    exclusive_worker_admission,
+)
 from disclosure_anchor.domain.errors import BuildUnitsError, ConfigurationError, PublishRunError
 from disclosure_anchor.domain.value_objects import ReportPeriod
 from disclosure_anchor.domain.value_objects import (
@@ -239,11 +243,13 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             result = deps.register().execute(_register_command(args, legal_name))
         elif args.command == "parse":
-            result = deps.parse().execute(
-                ParseDocumentCommand(
-                    document_id=args.document_id, options=deps.parser_options()
+            with exclusive_worker_admission(deps.engine):
+                result = deps.parse().execute(
+                    ParseDocumentCommand(
+                        document_id=args.document_id,
+                        options=deps.parser_options(),
+                    )
                 )
-            )
             if not _stage_succeeded("parse", result):
                 _print_failed_stage("parse", result)
                 return 1
@@ -381,11 +387,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         elif args.command == "process":
-            parse_result = deps.parse().execute(
-                ParseDocumentCommand(
-                    document_id=args.document_id, options=deps.parser_options()
+            with exclusive_worker_admission(deps.engine):
+                parse_result = deps.parse().execute(
+                    ParseDocumentCommand(
+                        document_id=args.document_id,
+                        options=deps.parser_options(),
+                    )
                 )
-            )
             if not _stage_succeeded("parse", parse_result):
                 _print_failed_stage("parse", parse_result)
                 return 1
@@ -420,7 +428,12 @@ def main(argv: list[str] | None = None) -> int:
     except CompanyNotTrackedError as exc:
         print(f"[FAIL] sync: {exc}", file=sys.stderr)
         return 2
-    except (ConfigurationError, ValidationError, ValueError) as exc:
+    except (
+        ConfigurationError,
+        ValidationError,
+        ValueError,
+        WorkerBusyError,
+    ) as exc:
         print(f"[FAIL] pipeline: {exc}", file=sys.stderr)
         return 2
 
@@ -446,6 +459,9 @@ class _Deps:
         return ParserOptions(
             backend=self.settings.disclosure_mineru_backend,
             server_url=self.settings.disclosure_mineru_server_url,
+            http_request_concurrency=(
+                self.settings.mineru_http_request_concurrency
+            ),
         )
 
     def parse(self) -> ParseDocument:

@@ -65,10 +65,29 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("MODELSCOPE_CACHE", "modelscope_cache")
     )
     disclosure_parse_timeout_seconds: int = Field(
-        default=1800,
+        default=3600,
+        ge=1,
         validation_alias=AliasChoices(
             "DISCLOSURE_PARSE_TIMEOUT_SECONDS",
             "disclosure_parse_timeout_seconds",
+        ),
+    )
+    # A fixed deadline is wrong for a corpus spanning one to ~1,000 pages.
+    # The worker uses max(base, pages * per_page), bounded by max_seconds.
+    disclosure_parse_timeout_per_page_seconds: int = Field(
+        default=12,
+        ge=0,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_PARSE_TIMEOUT_PER_PAGE_SECONDS",
+            "disclosure_parse_timeout_per_page_seconds",
+        ),
+    )
+    disclosure_parse_timeout_max_seconds: int = Field(
+        default=14400,
+        ge=1,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_PARSE_TIMEOUT_MAX_SECONDS",
+            "disclosure_parse_timeout_max_seconds",
         ),
     )
     disclosure_mineru_bin: Optional[Path] = Field(
@@ -262,6 +281,75 @@ class Settings(BaseSettings):
             "WORKER_PARSE_CONCURRENCY", "worker_parse_concurrency"
         ),
     )
+    # One document-level slot fans out into many page/block HTTP requests
+    # inside MinerU. Bound the aggregate request fan-out independently from
+    # document concurrency; production divides this budget across slots.
+    worker_gpu_request_budget: int = Field(
+        default=112,
+        ge=1,
+        validation_alias=AliasChoices(
+            "WORKER_GPU_REQUEST_BUDGET", "worker_gpu_request_budget"
+        ),
+    )
+    worker_gpu_max_sequences: int = Field(
+        default=128,
+        ge=1,
+        validation_alias=AliasChoices(
+            "WORKER_GPU_MAX_SEQUENCES", "worker_gpu_max_sequences"
+        ),
+    )
+    # When regular and heavyweight PDFs are both queued, only this many
+    # heavyweight documents receive the saturated share. Idle capacity is
+    # still borrowable when no regular work exists.
+    worker_parse_heavy_page_threshold: int = Field(
+        default=80,
+        ge=1,
+        validation_alias=AliasChoices(
+            "WORKER_PARSE_HEAVY_PAGE_THRESHOLD",
+            "worker_parse_heavy_page_threshold",
+        ),
+    )
+    worker_parse_heavy_saturated_share: int = Field(
+        default=4,
+        ge=1,
+        validation_alias=AliasChoices(
+            "WORKER_PARSE_HEAVY_SATURATED_SHARE",
+            "worker_parse_heavy_saturated_share",
+        ),
+    )
+    worker_parse_huge_page_threshold: int = Field(
+        default=500,
+        ge=2,
+        validation_alias=AliasChoices(
+            "WORKER_PARSE_HUGE_PAGE_THRESHOLD",
+            "worker_parse_huge_page_threshold",
+        ),
+    )
+    worker_parse_huge_saturated_share: int = Field(
+        default=1,
+        ge=1,
+        validation_alias=AliasChoices(
+            "WORKER_PARSE_HUGE_SATURATED_SHARE",
+            "worker_parse_huge_saturated_share",
+        ),
+    )
+    worker_parse_candidate_window: int = Field(
+        default=1000,
+        ge=1,
+        le=2000,
+        validation_alias=AliasChoices(
+            "WORKER_PARSE_CANDIDATE_WINDOW",
+            "worker_parse_candidate_window",
+        ),
+    )
+    worker_finalize_concurrency: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        validation_alias=AliasChoices(
+            "WORKER_FINALIZE_CONCURRENCY", "worker_finalize_concurrency"
+        ),
+    )
     worker_batch_build: int = Field(
         default=10,
         ge=0,
@@ -301,6 +389,19 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_parallel_parser_backend(self) -> "Settings":
+        if (
+            self.disclosure_parse_timeout_max_seconds
+            < self.disclosure_parse_timeout_seconds
+        ):
+            raise ValueError(
+                "DISCLOSURE_PARSE_TIMEOUT_MAX_SECONDS must be greater than "
+                "or equal to DISCLOSURE_PARSE_TIMEOUT_SECONDS"
+            )
+        if self.worker_gpu_request_budget > self.worker_gpu_max_sequences:
+            raise ValueError(
+                "WORKER_GPU_REQUEST_BUDGET must not exceed "
+                "WORKER_GPU_MAX_SEQUENCES"
+            )
         if self.worker_parse_concurrency > 1:
             if not self.disclosure_mineru_backend.endswith("-http-client"):
                 raise ValueError(
@@ -312,6 +413,27 @@ class Settings(BaseSettings):
                     "WORKER_PARSE_CONCURRENCY > 1 requires "
                     "DISCLOSURE_MINERU_SERVER_URL"
                 )
+            if self.worker_gpu_request_budget < self.worker_parse_concurrency:
+                raise ValueError(
+                    "WORKER_GPU_REQUEST_BUDGET must provide at least one "
+                    "request per parse slot"
+                )
+        if (
+            self.worker_parse_huge_page_threshold
+            <= self.worker_parse_heavy_page_threshold
+        ):
+            raise ValueError(
+                "WORKER_PARSE_HUGE_PAGE_THRESHOLD must exceed "
+                "WORKER_PARSE_HEAVY_PAGE_THRESHOLD"
+            )
+        if (
+            self.worker_parse_candidate_window
+            < self.worker_parse_concurrency
+        ):
+            raise ValueError(
+                "WORKER_PARSE_CANDIDATE_WINDOW must be at least "
+                "WORKER_PARSE_CONCURRENCY"
+            )
         return self
 
     @property
@@ -321,6 +443,24 @@ class Settings(BaseSettings):
         if self.disclosure_data_root.parent.name == "services":
             return self.disclosure_data_root.parent.parent
         return self.disclosure_data_root.parent
+
+    @property
+    def mineru_http_request_concurrency(self) -> int:
+        """Numeric per-document cap shared by every repository parse entry.
+
+        The effective backend can be overridden by an admin request, so this
+        value cannot depend on the configured default backend. MinerU's
+        command builder decides whether an HTTP backend should receive it.
+        """
+
+        return min(
+            100,
+            max(
+                1,
+                self.worker_gpu_request_budget
+                // self.worker_parse_concurrency,
+            ),
+        )
 
     @property
     def sentinel_path(self) -> Path:

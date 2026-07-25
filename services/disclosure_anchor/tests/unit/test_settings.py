@@ -32,6 +32,23 @@ class SettingsTests(unittest.TestCase):
                     "WORKER_PARSE_CONCURRENCY": "8",
                     "DISCLOSURE_MINERU_BACKEND": "hybrid-http-client",
                 },
+                {
+                    "WORKER_PARSE_CONCURRENCY": "8",
+                    "WORKER_GPU_REQUEST_BUDGET": "4",
+                    "DISCLOSURE_MINERU_BACKEND": "hybrid-http-client",
+                    "DISCLOSURE_MINERU_SERVER_URL": "http://127.0.0.1:30000",
+                },
+                {
+                    "WORKER_PARSE_CONCURRENCY": "8",
+                    "WORKER_GPU_REQUEST_BUDGET": "129",
+                    "WORKER_GPU_MAX_SEQUENCES": "128",
+                    "DISCLOSURE_MINERU_BACKEND": "hybrid-http-client",
+                    "DISCLOSURE_MINERU_SERVER_URL": "http://127.0.0.1:30000",
+                },
+                {
+                    "WORKER_PARSE_HEAVY_PAGE_THRESHOLD": "80",
+                    "WORKER_PARSE_HUGE_PAGE_THRESHOLD": "80",
+                },
             ):
                 with self.subTest(extra=extra), patch.dict(
                     os.environ, {**base, **extra}, clear=True
@@ -51,6 +68,10 @@ class SettingsTests(unittest.TestCase):
                 settings = load_settings()
 
         self.assertEqual(settings.worker_parse_concurrency, 8)
+        self.assertEqual(settings.worker_gpu_request_budget, 112)
+        self.assertEqual(settings.worker_gpu_max_sequences, 128)
+        self.assertEqual(settings.worker_parse_heavy_page_threshold, 80)
+        self.assertEqual(settings.worker_parse_huge_page_threshold, 500)
 
     def test_loads_required_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, _env(Path(tmp)), clear=True):
@@ -59,7 +80,11 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(settings.agent_system_root, Path(tmp))
             self.assertIsNone(settings.database_url)
             self.assertIsNone(settings.cninfo_access_key)
-            self.assertEqual(settings.disclosure_parse_timeout_seconds, 1800)
+            self.assertEqual(settings.disclosure_parse_timeout_seconds, 3600)
+            self.assertEqual(
+                settings.disclosure_parse_timeout_per_page_seconds, 12
+            )
+            self.assertEqual(settings.disclosure_parse_timeout_max_seconds, 14400)
             self.assertIsNone(settings.disclosure_mineru_bin)
             self.assertEqual(settings.cninfo_max_qps, 1.0)
             self.assertEqual(settings.cninfo_max_retries, 3)
@@ -82,6 +107,8 @@ class SettingsTests(unittest.TestCase):
                     "CNINFO_OVERLAP_DAYS": "14",
                     "CNINFO_OVERSIZED_KB": "20480",
                     "DISCLOSURE_PARSE_TIMEOUT_SECONDS": "42",
+                    "DISCLOSURE_PARSE_TIMEOUT_PER_PAGE_SECONDS": "3",
+                    "DISCLOSURE_PARSE_TIMEOUT_MAX_SECONDS": "99",
                     "DISCLOSURE_MINERU_BIN": "/opt/mineru/bin/mineru",
                 }
             )
@@ -98,6 +125,12 @@ class SettingsTests(unittest.TestCase):
                     "postgresql://reader:<set-in-private-env>@127.0.0.1:55432/db",
                 )
                 self.assertEqual(settings.disclosure_parse_timeout_seconds, 42)
+                self.assertEqual(
+                    settings.disclosure_parse_timeout_per_page_seconds, 3
+                )
+                self.assertEqual(
+                    settings.disclosure_parse_timeout_max_seconds, 99
+                )
                 self.assertEqual(
                     settings.disclosure_mineru_bin, Path("/opt/mineru/bin/mineru")
                 )

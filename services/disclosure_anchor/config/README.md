@@ -66,8 +66,12 @@
 | DISCLOSURE_BACKFILL_MAX_PENDING_DOWNLOADS | 2000 | 首回补处理总在途水位（兼容旧变量名）：待下载 + 已下载待解析；单公司原子同步可越线一次 |
 | WORKER_BATCH_SYNC | 13 | 每轮到期公司上限；常驻模式零等待轮转，但首回补还受总在途水位约束，不要直接升到 200 |
 | WORKER_BATCH_DOWNLOAD | 50 | 每轮下载上限；下载只把工作从 pending-download 搬到 pending-parse，总在途水位避免 GPU 故障时 raw 无界增长 |
-| WORKER_BATCH_PARSE | 50 | 每轮解析链上限；有进展时下一轮立即继续 |
-| WORKER_PARSE_CONCURRENCY | 1 | 安全默认；远端 `*-http-client` + server URL 时上量设 8，settings 硬顶 8 |
+| WORKER_BATCH_PARSE | 50 | 直接 `worker once` 的单轮上限；resident 只在有界 refill window 内滚动补槽 |
+| WORKER_PARSE_CONCURRENCY | 16（生产模板） | 文档槽，不是 GPU 请求数；本地 CPU backend 必须设 1 |
+| WORKER_GPU_REQUEST_BUDGET / MAX_SEQUENCES | 112 / 128 | resident worker 稳态请求包络；16 文档时每份 MinerU `--max-concurrency=7` |
+| WORKER_PARSE_*_PAGE_THRESHOLD / SATURATED_SHARE | 80/4、500/1 | regular/heavy/huge 名义份额；lane 空闲时允许借用 |
+| WORKER_PARSE_CANDIDATE_WINDOW | 1000 | 每次公平选择的候选前缀；不是第二份耐久队列 |
+| WORKER_FINALIZE_CONCURRENCY | 2 | parse 后 build/publish 的有界下游池 |
 | WORKER_LOOP_INTERVAL_SECONDS / MAX | 900 / 1800 | 仅空队列使用的 15→30 分钟退避；有进展时不睡眠 |
 | MINERU_PROCESSING_WINDOW_SIZE | 16 | GPU 页窗口红线（round22h OOM 后定案） |
 | CNINFO_* | — | 凭据（只进环境，绝不进仓） |
@@ -85,7 +89,8 @@ make worker-once           # 手动跑一轮（同步→下载→解析→切分
 make worker-loop           # 常驻自适应排水；积压时零等待，空闲时 15→30 分钟退避
 make doctor-full           # 环境+迁移头+分类规则版本 全体检
 make worker-status         # 常驻 worker 状态 + 今日报告尾部
-make worker-restart        # kickstart 常驻 worker（改完需重启的配置后必跑）
+make worker-restart        # 仅重载代码/env；不会重载 launchd plist
+./scripts/install_launchd.sh  # 仅在 job 已安全 bootout 后安装/更新 plist
 ```
 
 ## 生效矩阵：改什么 → 跑什么 → 是否需重启（2026-07-14）
@@ -102,4 +107,7 @@ worker 启动时会打印 `[versions]` 行（policy/builder/分类规则版本�
 | 代码（src/） | `make agent-check` 后 | **是** |
 | `watchlist.csv`（仅文件） | `make track`（导入才生效） | 否 |
 
-重启后固定动作：`make doctor-full` 退出 0 + 观察一轮报告（`make worker-status`）。
+`worker-restart` 只适用于已安装 plist 就是当前版本的常规代码/env 重载。plist 变化或首次从
+旧 worker 切换，必须按生产 runbook 的 staged drain 执行；安装脚本发现 job 仍 loaded 会
+以 75 fail closed。重启后固定动作：`make doctor-full` 退出 0 + 观察一轮报告
+（`make worker-status`）。

@@ -1,154 +1,413 @@
 ---
 id: disclosure_anchor_worker_dynamic_scheduling
-title: Worker 动态调度与 GPU 双层流控
+title: Worker 动态调度、GPU 锯齿根因与发布验收
 date: 2026-07-09
-updated_at: 2026-07-13
-status: implemented-with-follow-ups
+updated_at: 2026-07-25
+status: implemented-awaiting-deployment-ab
 authority: tracked implementation design; live runtime values must be re-verified
 ---
 
-> 本文由原 gitignored 本地任务 note 提升而来。稳定设计约束可作为实现依据；GPU 占用、
-> backlog、window 和并发数字是带日期的事故/运维证据，使用前必须按当前 MinerU、vLLM、
-> GPU 和运行环境重新核验。
+> 本文记录可复核的事故证据、版本匹配的外部机制和当前实现边界。代码已在任务分支实现，
+> 但截至本文更新时尚未合并、重启和完成生产 A/B；因此“已覆盖”只表示任务分支已有对应
+> 代码路径和回归测试设计，不表示发布门已全部通过或线上锯齿已经改善。GPU、backlog、版本
+> 和并发数字都是带日期的运维证据，发布前必须重新核验。
 
-# Worker 动态调度设计（round22g；2026-07-13 落地修订）
+# Worker 动态调度与 GPU 锯齿根因报告
 
-用户问题：worker 是不是"有点笨"——固定批量、阶段串行、下载与解析互相等；要动态、
-不冲突、不爆内存的执行模型。
+## 1. 结论先行
 
-## 业界调研
+本次归因与“GPU 任务不够”不同，也与“每次 MinerU 失败都应该砍文档并发”不同。
 
-| 项目 | 模型 | 借什么 |
+| 层级 | 结论 | 证据与影响 |
 |---|---|---|
-| Miniflux | 调度器把到期 feed 入队，WORKER_POOL_SIZE 个 worker 各自跑"抓取+解析"完整链 | **每实体端到端一条链 + 有界池**——不是按阶段分层排队 |
-| changedetection.io | async 队列 + N 个 fetch worker（默认 10）持续拉取；全局限速独立于并发 | **限速（对上游礼貌）与并发（本地吞吐）是两个旋钮** |
-| Scrapy | 单进程异步下载器（CONCURRENT_REQUESTS + AUTOTHROTTLE 按延迟动态调并发）喂 item pipeline | 动态并发的参照系；autothrottle 是 phase 3 候选 |
-| pgboss / solid_queue / oban / procrastinate | Postgres 即队列：`SELECT … FOR UPDATE SKIP LOCKED` 认领任务 | **DB-as-queue 是我们已有形态**（ops.pending_*_v1），认领原语现成 |
-| vllm（GPU 侧） | continuous batching：并发请求在服务端动态合批 | 客户端只需并发发请求，**动态合批发生在 GPU 服务端**——这就是"动态"的正解 |
-| Celery/Redis、Airflow/Dagster | 外部 broker / DAG 编排 | **否决**：单机单服务引入外部基础设施纯负担 |
+| **第一根因** | 控制单位错位：外层限制 16 份文档，内层每份临时 MinerU API 原可并发 100 个 page/block 请求 | 旧线上命令没有 `--max-concurrency`；理论上一个 worker 可放大到约 1,600 个请求，现场 vLLM running 达 127 时仍有 waiting |
+| **直接波形机制** | 请求洪峰把 vLLM running 推到调度平台并积出 waiting；文档随后成组进入本地 finalize，GPU 供给骤降 | 83 秒短窗内从 `1/0 → 127/151 → 回落`；16:34 的独立横截面仍为 `121/40` |
+| **放大器** | 文档完成级 AIMD 的反馈延迟为分钟到小时，失败砍半、成功慢升，把少量 item/健康抖动放大成低并发长谷 | 历史报告曾降到 `parse_concurrency_limit=1`；而普通大文档本身需 20–60 分钟，反馈控制不到秒级请求洪峰 |
+| **第二根因** | 固定 200 份候选的批尾排空，以及 parse 与 build/publish 共占同一文档槽 | 连续四波都恰好 200 starts，批尾分别有 6/3/7/10 分钟低于 8 个在途且没有新 start |
+| **不是根因** | 不是 backlog 不足，也不能仅凭 GPU 图的空谷判定服务宕机 | 11:53 仍有 19,878 个 eligible pending；同一观测窗 `/health` 20/20 为 200 |
 
-结论：本服务的 DB 队列视图 + 文档级 advisory 锁（worker/locks.py DOC_NS，
-register/parse-finish/publish 三事务内已注入）= 业界 DB-as-queue 模式的现成实现，
-"笨"的只是执行壳（固定批量 + 阶段串行 + 2h 节拍），不是架构。
-
-## 已落地方案
-
-**Phase 1：解析链有界并发。** `parse→build→publish` 仍是每文档一个不可拆的动作，
-由有界线程池并行；每任务独立 parser/UoW，report 在主线程折叠。用户裁决与 round22h
-OOM 证据把 `WORKER_PARSE_CONCURRENCY` 的 settings 硬顶从 16 收紧为 **8**；目标机器在
-`*-http-client` + server URL 成对配置时取 8，仓内 template/类默认均为 1，settings 对本地
-backend 的并发 >1 直接拒绝启动。
-
-**Phase 2：常驻自适应轮询（2026-07-13 用户裁决，已推翻“等 idle-wait 证据”）。**
-没有引入三套阶段线程或外部队列，而是复用经过验证的 `run_once`：
+一句话因果链：
 
 ```text
-有 sync/download/parse/build/publish 进展  -> 下一轮立即开始（sleep=0）
-完全空闲                                  -> sleep 900s，再空闲 sleep 1800s 封顶
-单项失败且无进展                          -> 60s 指数退避，封顶 1800s
-轮级系统异常                              -> 写失败 report，60s 指数退避后继续
-CNINFO quota_break                        -> 仅 sync 冷却 30m→60m→120m；
-                                             先让 download/parse 立即排水一轮
-CNINFO retryable 网络/5xx/坏响应           -> sync+download 冷却 60s 指数退避；
-                                             本地 parse/build/publish 继续
-parser identity/GPU infra 失败             -> identity在dequeue前fail-fast；仅parse
-                                             冷却120s，不消耗item retry
-共享 DB/存储 build 失败                    -> 显式infra首错或unknown同码2次后停止refill；
-                                             parse+build冷却，build-only探针后恢复
-publish 失败                              -> parse+publish 冷却 120s 指数退避；
-                                             download 可继续搬入受水位约束的队列
+16 个文档槽
+  × 每份 MinerU 默认 100 个远端请求
+  → vLLM running 达 127 时仍积出 waiting
+  → 一批文档同步转入本地 finalize / 超大任务长占槽
+  → GPU 请求供给下降
+  → 文档级 AIMD 在很久以后才误判并砍槽
+  → 固定 200 批尾继续排空
+  → “过排队—空谷—再突发”的锯齿
 ```
 
-launchd 由 `StartInterval=7200 + worker once` 改为 `KeepAlive + worker loop`；每轮仍写
-worker/parse-quality report。每轮开始用同一 dedicated connection 复核 singleton
-advisory lock，连接或锁丢失就 fail-closed 退出，交给 launchd 重启抢锁。`once` 保留给人工
-单轮诊断，拿不到锁仍 exit 0。
+目标不是把瞬时 GPU 利用率强行画成 100% 直线，而是在结果语义不变的前提下同时降低：
 
-常驻进程会缓存 Python 代码、processing policy、filing rule bundle 和 CNINFO client。以后
-改 checkout/config/env、执行 `make load-rules` 后，必须 `launchctl kickstart -k` 对应 job
-（或 unload 后重装）并再跑 doctor；不能等待旧 2h tick 自动加载。首装流程因先停 worker 再
-migrate/load/install，天然满足这一点。
+- vLLM waiting、queue time、KV/preemption 和 overload；
+- 有 eligible backlog 时的 parse 空槽和批尾时间；
+- 500+ 页任务对普通公告的队头阻塞；
+- 重启遗留子进程、临时目录和无意义重试。
 
-选择这一实现而不是 300 秒 `StartInterval`：200 家点估计约 16,031 份可解析文档，
-`BATCH_PARSE=50` 需要约 321 轮；300 秒固定节拍仍平白增加约 26.7 小时，不能满足
-“只受 GPU 限制”。常驻轮询只在有实际进展时零等待，不会因未知/不合规 raw queue facts
-热循环。
+## 2. 可复核现场证据
 
-**Phase 3（仍为候选）：** 按 GPU 服务端延迟动态调 K；仅当并发 8、window 16 下仍有
-稳定过载/排队证据才评估。外部 broker、DAG 编排和阶段独立进程池继续否决。
+时间窗、source identity、`finished_at` SQL、vLLM 采集和 active IR 扫描命令见
+[最小证据包](../audits/gpu-scheduling-closed-loop-2026-07-25/README.md)。
 
-## 防爆炸与退出边界
+### 2.1 最近数小时的生产波形
 
-- 文档并发硬顶 8；`MINERU_PROCESSING_WINDOW_SIZE=16` 是当前 GPU 红线，二者不可由
-  本调度器自动上调。
-- 下载仍单线程经过**进程生命周期共享**的 CNINFO client、token cache 与 1QPS token bucket；
-  零等待轮不会重置限速器。
-- `DISCLOSURE_BACKFILL_MAX_PENDING_DOWNLOADS=2000` 保留旧名字，实际统计 pending-download
-  + 所有 pending-parse/raw（含 oversized/dead-letter）总在途。每轮首次精确扫描一次，同轮
-  按 `candidate_count` 保守累计，下一轮校正；单公司原子同步最多越线一次。达到水位后必须等
-  GPU 排水才放下一个 never-synced 公司，因此首回补 checkpoint 不承诺 16 轮全齐。
-- parse 一次最多保持 K 个 in-flight future，完成一个才补一个；SIGINT/SIGTERM 停止补充、
-  取消尚未开始的 future，并终止已登记的 MinerU 子进程组。逐文档失败继续落 retryable
-  run，不把常驻进程当作失败状态仓库。
-- parser version 在 item dequeue 前 preflight，并由 resident 进程锁保护缓存后注入每个 fresh
-  parser；version probe 自身用独立进程组、10s timeout，失败不创建 processing_run。systemic
-  build 失败（显式共享故障首个，其他unknown同码需同轮2次）停止 refill，cooldown 后先以
-  build-only round 验证恢复；item-local IR poison 继续隔离。
-- quota 断路仍是公司窗口级：未完整同步不推进 checkpoint，下轮从该公司窗口重做；本地
-  download 进展不重置 30→60→120m quota 退避，不在冷却期空转打接口。
-- `source_checkpoint.updated_at` 每次 cursor 更新显式刷新，否则所有公司会永久 `due`，
-  使“动态”退化为每轮重复同步。
-- 同步失败也写 `cninfo:worker_sync_failure`，失败公司冷却 60s 并排到未尝试公司之后，前 13
-  个毒丸不能饿死后 187 家。singleton connection 使用 AUTOCOMMIT，避免常驻 idle transaction。
-- report 文件系统异常在 loop 内转为 system backoff，不触发 KeepAlive 30s 重启风暴。
+2026-07-25 05:45–11:45 的只读采样：
 
-## 真实 backlog 验收（2026-07-13）
+- 959 次 parse start、946 次完成；
+- 末三小时文档在途均值 7.74；10:05–11:36 连续 92 分钟低于 8；
+- 四个连续波均恰好 200 个 start；每波尾部低于 8 个在途且零新 start，持续
+  6、3、7、10 分钟；
+- 11:53 仍有 19,878 个 eligible pending，排除“没有任务”；
+- 500+ 页完成尝试 16 次、失败 9 次；10 次 invocation failure 合计浪费
+  359.3 个文档槽分钟。
 
-从现库只读复制 16 份已发布真实 PDF 到 scratch DB/root（16/16 进入 proposed gate，合计
-1,326,079 bytes），以 production MinerU HTTP 配置、并发 8、batch 50 启动真正的
-`worker loop`：
+2026-07-25 的 vLLM 采样：
 
-- 第 1 轮 36.340s：parsed/built/published = 16/16/16，failed=0，实测 1,585.0 docs/h；
-- 第 2 轮在前轮结束后立即开始，0.017s 确认队列为空，然后打印 `sleeping 900.0s`；
-- 睡眠 10s 前后 `ps` CPU time 都是 `0:00.57`，证明 idle 近零 CPU；
-- SIGTERM 正常退出，16 个 active succeeded run 全部一致，scratch DB/root 自动清理。
+- 11:49:27–11:50:50 的约 83 秒短窗从 `running=1, waiting=0` 升至
+  `running=127, waiting=151` 后回落；
+- 同窗 20 次 health 全部 HTTP 200。health 健康只说明服务能应答，不说明队列没有过载。
+- 16:34:20 的独立横截面为 `running=121, waiting=40`、preemptions 0；
+  `/version` 返回 vLLM 0.21.0。
 
-该样本刻意选小 PDF，只证明调度不再受轮间节拍限制，不用于乐观容量外推；200 股总时长
-仍采用现库 785 份大轮的 255 docs/h 与 73s/份基线。
+因此 GPU 图中的低谷和高峰是**到达流量不平滑**；高峰期并非“不饱和”，而是 worker 自己
+过度排队。`max_num_seqs` 是 vLLM 每个 scheduler iteration 可处理的最大 sequence 数，不是
+HTTP admission 或 waiting queue 上限。该端点没有直接暴露 `max_num_seqs`；128 是本系统
+待发布复核的运营配置，不能写成这段短窗直接证明的事实。
 
-## 实战教训：2026-07-12 GPU OOM 事件（首个排空轮）
+### 2.2 统计口径修正
 
-现象：44 篇在 2 分钟内齐刷 connection reset。初判"新连接风暴"是错的——Windows 侧
-日志给出完整因果：文档级并发 8 × MinerU 默认页面窗口 64 = 服务端瞬时 ~255 并发序列
-→ KV cache 97.7%（叠加 NBA 2K 抢显存）→ CUDA OOM → vLLM EngineCore 死亡 →
-connection reset 只是尸体现象 → restart:always 73 秒自愈，44 篇 retryable 自动重排。
+历史第一次诊断曾用 `processing_run.created_at` 近似完成时间，从而夸大 22:27–22:39 的
+“零完成”谷。完成时间必须用 `finished_at`。修正后，当时仍有约 12–16 个文档 run；
+但 2026-07-25 新采样又确认固定 200 波的批尾确实可持续 3–10 分钟。
 
-## GPU 侧客户端弹性栈（2026-07-18 定案）
+这两个结论并不冲突：
 
-同日三连「假停机」（真实短断连→熔断压制、代理污染误诊、探针风暴自击）收敛出的
-完整方案，三层各司其职，全部推送（6cbd45d/d6c8d34）：
+- “旧 12 分钟全空”是错误时间字段造成的夸大；
+- “固定候选批尾与 finalize 占槽”是后来用 start、真实在途和 backlog 共同确认的次级根因。
 
-1. **后端预探针**（adapters/parsers/mineru）：identity() 直连探 server `/health`
-   （无条件绕代理 ProxyHandler({})，与 mineru 子进程的 `_env()` 代理剥离同理）；
-   成功按 server 缓存 60s、失败永不缓存、超时 15s——探测频率与派单解耦，
-   死后端仍在批前被拦，不烧文档重试预算。
-2. **AIMD 自适应文档并发**（application/worker/concurrency.py）：采纳 Netflix
-   concurrency-limits AIMDLimit（损失驱动：成功且在途 ≥ 限额半时 +1，基础设施
-   失败乘性回退 ×0.5，界 [1, WORKER_PARSE_CONCURRENCY]，起点=上界）。**有据拒绝**
-   Envoy 自适应并发的延迟梯度控制器：其文档自认的局限正是本工况——单请求
-   30-300s 高方差使 minRTT 基线不稳，且需周期压缩并发重标定。批内一次基础
-   设施失败=背压（降档续跑），地板上再失败才判死停补位。环境变量语义从
-   「固定并发」变为「上界」；上界 16 **不上调**（下方 OOM 事故 93-100% 利用率
-   背书；页面窗口 16 为内层护栏，双侧乘积 ≤256 序列）。
-3. **占比式熔断**（cli/worker）：基础设施失败须占批主导（≥max(2, parsed)）才算
-   停机（k8s/Envoy 失败率惯例）；成功存在即证明后端活着。熔断由高频保护
-   退为死后端最后保险；轮报告新增 `parse_concurrency_limit` 可观测。
+### 2.3 版本匹配的 MinerU 请求模型
 
-CNINFO 同构：AdaptiveTokenBucket（qps AIMD）+ 控制器冷却梯子（进展衰减不清零）。
-两侧共同原则：**配置只定边界，实际速率/并发始终由观测信号动态贴合**。
+本机实际 MinerU 3.4.0、`mineru-vl-utils` 1.0.5；远端 OpenAI-compatible 端点在
+2026-07-25 报告 vLLM 0.21.0。对已安装源码和官方 release 源码逐项核对后：
 
-结论：**流控必须双侧**——文档级并发（当时为 8）只是外层，真正的请求单位是页面窗口。
-当时的事故缓解是客户端 `MINERU_PROCESSING_WINDOW_SIZE=16`；服务端重启候选为
-`--max-num-seqs 128`，若仍 OOM 再评估 memory utilization。它们不是仓库永久默认值，启用前
-必须按当前版本、GPU 占用和 workload 复核。事故时 GPU 利用率 93–100%，说明不能靠盲目提高
-文档并发解决吞吐；网络直连优化应排在显存安全之后。运行批任务时也必须避免其他显存竞争负载。
+- 没有 `--api-url` 时，每份 PDF 的 CLI 会启动一个临时 local `mineru-api`；
+- MinerU 3.4 的 `--max-concurrency=N` 会传入 `vlm-http-client`；
+- 对正常单 PDF，layout、block/content 和跨页表格 merge 阶段的远端 VLM chat 都受该
+  临时 API 的同尺寸 semaphore 约束；阶段并不重叠；
+- 每个临时 API 的 semaphore 互相不可见，所以 16 份文档的默认 100 不能形成全局 100，
+  而会形成约 `16 × 100` 的外层放大；
+- processing window 是 MinerU 内部执行窗口，不是 durable checkpoint，也不能证明任意
+  页段可独立解析后无损拼回。
+
+官方入口说明见 [MinerU quick usage](https://github.com/opendatalab/MinerU/blob/mineru-3.4.0-released/docs/en/usage/quick_usage.md)；
+历史上 `max_concurrency` 没有正确透传也确实是社区遇到过并由维护者修复的问题，见
+[MinerU #3654](https://github.com/opendatalab/MinerU/issues/3654)。本系统使用 3.4
+官方参数透传，不维护 MinerU 私有 fork。
+
+## 3. 成熟项目采用的共同原则
+
+本次不是复制某个框架，而是把版本匹配、可证实的调度不变量落到现有 PostgreSQL 队列和
+单机 resident worker。
+
+| 成熟实现 | 官方机制 | 本系统采用的原则 | 没有照搬的部分 |
+|---|---|---|---|
+| [MinerU](https://github.com/opendatalab/MinerU/blob/mineru-3.4.0-released/docs/en/usage/quick_usage.md) | 临时 API、显式 `max_concurrency`、整本文档输出 | 在官方请求入口设硬上限；保留 whole-PDF 语义 | 不 patch MinerU 内部，不把 processing window 当可恢复外部分片 |
+| [vLLM](https://docs.vllm.ai/en/stable/) / [SchedulerConfig](https://docs.vllm.ai/en/stable/api/vllm/config/scheduler/) | continuous batching；`max_num_seqs` 限每轮处理 sequence 数 | 客户端平滑、有界地供给，动态合批交给 vLLM | 不把 waiting queue 当 admission control，不靠提交海量请求“喂满”GPU |
+| [Celery optimization](https://docs.celeryq.dev/en/latest/userguide/optimizing.html) | 长短任务使用分别配置的 worker/queue；长任务 prefetch multiplier 取 1 | 大小 lane；执行槽空一个才取一个，避免长任务预取占住短任务 | 不引入 Redis/RabbitMQ 或第二份任务真相 |
+| [Kueue quota borrowing](https://kueue.sigs.k8s.io/docs/concepts/cluster_queue/) | nominal quota 保证份额，空闲 quota 可由 cohort 借用 | regular/heavy/huge 各有名义份额，lane 空时 work-conserving 借满 | 不引入 Kubernetes 控制面 |
+| [Ray Serve](https://docs.ray.io/en/latest/serve/advanced-guides/asyncio-best-practices.html) | `max_ongoing_requests` 以 replica 为静态 in-flight cap，超出后排队/背压 | GPU 请求预算与文档槽分开；finalize 不继续占 GPU 槽 | 不为单机 worker 引入 Ray replica/router/autoscaler |
+| [Envoy circuit breaker](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/circuit_breaking) | 分别限制 active、pending、retry，过载快速背压 | 只把明确 429/`RESOURCE_EXHAUSTED` 当全局 overload；未来多生产者时在统一入口设静态 breaker | 当前单生产者已有数据库排他锁，不新增网络 gateway |
+
+共同结论是：
+
+1. **安全容量用静态 admission/circuit breaker 表达**，不由高方差任务的完成时延猜测；
+2. **异构公平用 lane/queue 表达**，长任务有份额但不能霸占全部执行槽；
+3. **借用必须 work-conserving**，某 lane 空闲时不能为“预留”而让 GPU 空着；
+4. **下游必须有界**，否则只把 GPU 队列搬到内存或本地 finalize 队列；
+5. **服务端 continuous batching 负责动态组批**，客户端负责有界、平滑供给。
+
+## 4. 针对本系统的动态调度闭环
+
+### 4.1 GPU 请求层：112/128 静态安全包络
+
+生产配置的文档槽仍为 16，但请求安全边界独立配置：
+
+```text
+WORKER_GPU_MAX_SEQUENCES=128
+WORKER_GPU_REQUEST_BUDGET=112
+WORKER_PARSE_CONCURRENCY=16
+每份临时 MinerU API: --max-concurrency = floor(112 / 16) = 7
+worker 正常稳态包络: 16 × 7 = 112 < 128
+```
+
+保留的 16 个 sequence 不是吞吐浪费，而是给取消传播、重试的短暂交叠和服务端内部调度留下
+12.5% 余量。该式只证明**单 resident worker 的正常稳态上界**：
+
+- `max_num_seqs=128` 仍须在发布时从远端启动配置或等价运营证据复核；当前 metrics
+  端点不直接暴露它；
+- 外部绕过本服务直连 GPU 的客户端不受此预算控制；
+- shutdown/retry 传播期间允许短暂重叠，因此它不是分布式全局令牌的数学证明。
+
+所有仓内入口使用同一个 `mineru_http_request_concurrency`：
+
+- resident worker；
+- admin parse；
+- pipeline `parse` / `process`。
+
+admin/pipeline 在执行前还必须取得与 resident worker 相同的 PostgreSQL session advisory
+lock；拿不到就 fail closed（admin 409 / CLI busy），从而当前单机部署不会同时出现两个仓内
+生产者。resident 在每次补槽和最长 30 秒的等待边界复核同一 lock session；失锁先终止本进程
+MinerU，再禁止新准入。它仍不是分布式 fencing。若未来需要多 worker 或允许其他服务直连
+GPU，届时应把 112 预算上移到统一 gateway/Envoy/Ray 类 admission 层，而不是继续加本地
+semaphore。
+
+### 4.2 文档层：三 lane、名义份额与借用
+
+物理页数只作成本代理，不改 PDF 内容：
+
+| lane | 默认范围 | 三类都饱和、16 槽时的名义份额 |
+|---|---:|---:|
+| regular | `<80` 页 | 11 |
+| heavy | `80–499` 页，或页数探测失败 | 4 |
+| huge | `>=500` 页 | 1 |
+
+候选按 `document_id` 取前 1,000。实盘快照中该前缀同时含 regular/heavy，但这是观测，
+不是全 backlog 的保证；名义份额与借用只在当前候选窗口内成立。每次选取遵守：
+
+- lane 均有任务时，regular/heavy/huge 保留名义份额；
+- 任一 lane 为空，其他 lane 立即借用其空槽；
+- 同一 lane 内保留 DB 候选顺序；
+- unknown 进入 heavy，避免未知成本冒充短公告；
+- 不按 document id、发行人、标题或失败样本特判。
+
+若 A/B 观测到候选窗口长期 `regular=0`，再把页数/成本持久化并改为 per-lane keyset
+取数；当前真实前缀没有该问题，不为假设场景增加第二套查询控制面。
+
+这就是本系统的“动态”：动态选择下一份 whole PDF，并在 lane 之间借用空闲文档槽；
+GPU 请求总预算本身保持静态。
+
+### 4.3 滚动补槽与 parse/finalize 解耦
+
+旧执行链把 `parse→build→publish` 全部算作一个 GPU 文档槽，并在固定 200 份候选耗尽后
+等整批排空。当前实现改为：
+
+```text
+DB pending_parse（最多看 1000 个候选）
+          │
+          ▼
+三 lane 选择 ──> parse pool（16；完成一个立即补一个）
+                         │ parse 成功即释放 GPU 文档槽
+                         ▼
+                 finalize pool（build + publish，默认 2）
+```
+
+- 在明确的 acquisition/refill window 内，队列暂空或候选耗尽会重新读 DB，而不是等整批
+  16 个 future 全部结束再换波；
+- window 到期后停止新 admission，让 round 有界地收尾和写报告，不做无限热循环；
+- parse 成功即释放 lane/GPU 槽，build/publish 在独立 pool 执行；
+- `parse_futures + finalize_futures` 默认最多 `2 × parse_concurrency`，避免把瓶颈搬成
+  无界 finalize 内存队列；
+- build/publish 的共享基础设施故障仍停止 refill；item-local 失败只隔离该文档。
+
+固定 `WORKER_BATCH_PARSE` 仍是直接 `run_once` 的单轮上界和报告边界；生产 resident 模式
+只有在显式 refill window 打开时才可滚动超过它。
+
+### 4.4 超大文档 deadline 与失败域
+
+真实待处理样本曾出现 500–994 页 PDF；统一一小时 timeout 会把正常超大任务反复杀死，
+统一四小时又会让短公告挂死太久。当前 deadline 为：
+
+```text
+document_deadline =
+    min(max_seconds, max(base_seconds, physical_pages × per_page_seconds))
+
+默认：base=3600s，per_page=12s，max=14400s
+```
+
+同时把同一 outer deadline 传到临时 API 启动、任务提交/等待、结果下载和进程清理：
+
+- startup timeout 最多 120 秒；
+- 内层 task-result wait 从 outer deadline 扣除有界 phase reserve；
+- ZIP read-inactivity timeout 为 120 秒；
+- dispatcher 每 30 秒只为仍在合法 page-aware deadline 内的 parse 续 heartbeat；
+- deadline 全部过期后不再“保活”，真正 wedge 仍由 watchdog fail loudly；
+- task deadline、generic task failure、输出契约错误都是 item-local，不改变全局容量；
+- 只有明确 HTTP 429 或 `RESOURCE_EXHAUSTED` 记为 backend overload，停止新 refill 并进入
+  parse cooldown；不再用文档完成级 AIMD 砍 `16→8→4→2→1`。
+
+readiness 只在新 admission 前执行。已成功产生的 artifact 不会再因事后 `/health` 抖动被
+改判失败并整份重跑。
+
+### 4.5 重启、取消与官方 cleanup
+
+MinerU CLI 的临时 API 可能处于独立 session。直接 `SIGKILL` 外层进程会跳过其正常 shutdown
+和临时目录清理。当前边界是：
+
+1. worker 收到 SIGTERM/SIGINT 后停止补槽，并把所有已登记 MinerU process group 标成
+   `parser_cancelled`；
+2. 先向 process group 发送 **SIGINT**，走 MinerU 客户端的官方清理路径；
+3. 最多等待 35 秒，只对仍存活的 straggler 使用 SIGKILL；
+4. launchd `ExitTimeOut=90`，给 wrapper 转发信号、MinerU cleanup 和 Python reap 留出空间；
+5. `parser_cancelled` 是 retry-neutral，部署重启不消耗 PDF 的业务重试预算；
+6. 进程生命周期 shutdown latch 关闭“已截快照后又注册新子进程”的竞态。
+
+wrapper 只 reap 一次真实 child exit，修复旧双 `wait` 在 launchd 中出现 exit 127 的问题。
+watchdog 走 `os._exit()` 前也先执行同一 MinerU shutdown 路径，避免旧临时 API 越过 singleton
+worker 生命周期继续向 GPU 发请求。
+
+## 5. 超大 PDF 是否应该外部分片
+
+### 5.1 当前没有“外部分片拼坏”的证据
+
+上线前审计从 8,723 份扩到 12:02 的 19,369 份；16:38 又按同一口径重跑到
+19,782 份 active succeeded IR：
+
+- 最新 19,782/19,782 都是 `parsed_pages.full_pdf=true`，`false=0`，不可读 0；
+- resident 调度路径没有自动 range parse 或把多个页段结果拼成 active IR；admin 契约仍允许
+  操作者显式指定 `start_page` / `end_page`；
+- 较早的 PDF/IR 尾页核对中，8,711 份页数一致；另 12 份少一个尾页，均为纯白页或单字符
+  噪点，没有跨页表或正文被外部分片丢失的证据。
+
+因此目前**不需要因为“外部分片”重解析**。这只排除“本服务切片拼坏”这一类风险，不等于
+MinerU 对每张表、每个阅读顺序都绝对正确；后者属于 parser quality/source-identity 审计，
+不能混成切片结论。
+
+### 5.2 131 个临时目录 / 约 1.3 GB 是磁盘泄漏
+
+历史现场发现 131 个 MinerU 临时 API 残留目录，合计约 1.3 GB。它们是异常中断/强杀后没有
+执行 cleanup 留下的**磁盘生命周期泄漏**：
+
+- 不代表 PDF 被外部分片；
+- 不代表这些目录对应的已发布 IR 被拼接；
+- 单凭目录残留不能推导结果语义损坏，也不触发重解析。
+
+当前 SIGINT→grace→SIGKILL 的目标是**阻断新增同类泄漏**；是否达成仍须重启 A/B。它不会
+自动删除历史 131 个目录。历史残留应在重启后先核对无 live PID/打开文件，再单独做可恢复
+清理，不能用宽泛 `rm`。磁盘清理和语义重解析是两件独立工作。
+
+### 5.3 为什么仍不采用外部 PDF slicing
+
+MinerU 3.4 的 start/end page 和内部 processing window 都不是 durable checkpoint；最终
+reading order、连续 page bbox 和跨页表 carrier 仍在整本结果上收口。任意切成 N 个 PDF、
+各自转换后拼 JSON，会丢掉边界上下文。
+
+成熟文档系统也区分“整本转换”和“转换后语义 chunk”：
+
+- [Docling chunking](https://docling-project.github.io/docling/concepts/chunking/)
+  从完成转换的 `DoclingDocument` 开始，利用 hierarchy、caption 和 table structure
+  做后置 chunk；
+- [Unstructured PDF splitting](https://docs.unstructured.io/platform-api/partition-api/sdk-python)
+  支持有界页批次，但官方提醒服务端看不到整本文档时可能产生 unexpected results，并建议
+  先 partition、合并 elements，再单独 chunk。
+
+未来若要做安全的可恢复分片，必须先建立 chunk identity、lease/heartbeat、逐窗口 durable
+artifact、overlap/context、deterministic merge、exactly-once commit，以及跨页表/标题/TOC
+的 source-identity 正负例。在这些合同存在前，whole PDF 是语义上更安全的边界。
+
+## 6. 当前修复覆盖核对
+
+| 风险/入口 | 当前任务分支 | 边界或待验证项 |
+|---|---|---|
+| resident worker 内层请求扇出 | 已用官方 `--max-concurrency=7`，稳态 `16×7=112` | 重启后从真实命令行/health 核对，不只信配置文件 |
+| admin 与 pipeline 并发绕行 | 已统一 cap，并用同一 PostgreSQL advisory lock 排他 | 仓外直连 GPU 的客户端不受控 |
+| 大小不一导致短任务饥饿 | 已有 regular/heavy/huge 名义份额和借用 | 页数只是初始代理；历史 GPU 秒 EWMA 尚未引入 |
+| 固定 200 批尾 | 已有 1,000 候选窗口和有界滚动补槽 | 仅在 refill window 内；需 A/B 验证 3–10 分钟尾部是否消失 |
+| build/publish 占 GPU 槽 | 已拆分 parse/finalize pool，并限制下游 backlog | finalize=2 是否足够要看 A/B，不能预先调大 |
+| 超大任务 timeout | 已按页数给 1–4 小时 deadline，统一内外层 SLA | 500+ 页成功率和 p95 需线上复核 |
+| health 抖动毁掉成功产物 | readiness 前置，成功后不再探活判废 | 仍需监控真实 backend unavailable |
+| 文档级 AIMD 锯齿 | 已删除容量 AIMD；只有明确 overload 才停 refill/cooldown | 静态 112 是否最优需用吞吐、queue/KV 数据判断 |
+| 重启孤儿与新临时目录 | 已 SIGINT cleanup、35s grace、90s launchd exit window | 历史 131 目录不会自动清除 |
+| 外部分片语义损坏 | resident 不自动分页/拼接；active IR 审计 `full_pdf=false=0` | admin 仍支持显式页段；不外推成 MinerU 全部语义绝对正确 |
+
+这说明根因链的仓内入口已经闭合，但还不能宣称“生产根治完成”。最后一段证据只能由真实
+重启和 A/B 给出。
+
+## 7. 明确拒绝的替代方案
+
+### 7.1 文档完成级 AIMD / minRTT
+
+拒绝。PDF 从 1 页到近 1,000 页，OCR、图表和表格密度还会继续放大方差。用 20–60 分钟后
+才完成的文档时延控制秒级 GPU 请求，会把 document complexity 当 congestion。
+
+### 7.2 持久 MinerU API 或自研 GPU gateway
+
+本轮拒绝。当前仓内只有一个合法生产者，统一 cap + PostgreSQL 排他锁已能形成静态包络；
+引入常驻 API/gateway 会增加新的生命周期、队列和故障面。只有出现多 worker、跨服务直连或
+需要全局 active/pending/retry breaker 时，才有充分理由把 admission 上移。
+
+### 7.3 Celery、Ray、Kueue 等新框架
+
+拒绝引入，保留其不变量。PostgreSQL public ops view 已是唯一 durable queue；新增 broker/
+control plane 会制造第二任务真相，而不能自动解决错误的请求层级。
+
+### 7.4 任意 PDF 外部分片
+
+拒绝。当前没有安全 merge 协议，性能优化不能以跨页表和阅读顺序的不可验证损坏为代价。
+
+### 7.5 盲目继续提高文档并发
+
+拒绝。现场高峰已是 `running≈128 + waiting 数百`；提高 16 只会扩大临时进程、内存和请求
+洪峰。先验证 112 静态包络下的稳定吞吐，再根据 A/B 决定是否调整。
+
+## 8. 重启与生产 A/B 验收
+
+### 8.1 重启前硬门
+
+- 相关 focused tests、ruff、strict mypy、composition ledger、`git diff --check` 通过；
+- 独立 reviewer 没有未解决的 P1/P2；
+- PostgreSQL、AgentSSD 写权限、GPU `/health` 可达；
+- 取得 primary worktree 写门和 `worker-launchd` runtime claim；
+- 确认没有第二个 worker/manual producer；
+- 记录旧 worker、vLLM、MinerU 版本和当前 command line；
+- 首次从旧代码切换时，旧在途必须自然排空，不能用新代码的 retry-neutral 语义倒推旧 worker；
+- 按 production runbook 冻结 Python 子进程，并复核 PG running、MinerU/API、vLLM waiting
+  三个零条件后 bootout；安装脚本对 loaded job 或残留 MinerU/API 必须 fail closed；
+- 新 plist loaded 后实测 `ExitTimeOut=90`、state running。只有此后的新代码重启才允许
+  retry-neutral cancellation 接管。
+
+### 8.2 启动即验
+
+- startup banner 必须打印 `gpu_request_cap=16x7<=128`；
+- 实际 MinerU 子进程命令必须出现 `--max-concurrency 7`；
+- singleton advisory lock 只有一个持有者；
+- doctor、worker report 和 PG processing_run 能正常推进；
+- 重启前后的临时 API/目录数量有基线，确认没有孤儿继续请求 GPU。
+
+### 8.3 至少两小时 A/B
+
+同口径并行采集：
+
+- vLLM：running、waiting、queue time、KV cache usage、preemption、429/
+  `RESOURCE_EXHAUSTED`；
+- GPU：利用率、显存和 OOM；不把单个瞬时点当结论；
+- worker：parse in-flight、regular/heavy/huge dispatched、候选 refill、finalize backlog、
+  starts/finished、页数分桶耗时和失败码；
+- 业务：docs/hour、500+ 页成功率、重试浪费、build/publish 延迟；
+- 生命周期：新临时目录数量/大小、孤儿进程和 launchd exit status。
+
+发布成立需要同时满足：
+
+1. 实际命令和单生产者边界证明 worker 稳态请求 cap 不超过 112；
+2. 有大量 eligible backlog 时，不再重复出现旧基线的 3–10 分钟固定 200 批尾低谷；
+3. vLLM waiting、queue time、KV/preemption 相比旧基线实质下降，且没有新 OOM；
+4. 普通公告不再被 500+ 页车队长期饿死，huge 仍能借空槽持续前进；
+5. parser/build/publish 正确性和成功率不退化；
+6. SIGTERM 重启无孤儿 MinerU、无新增同类临时目录泄漏；
+7. 若任一项缺证据，报告为“部署完成、A/B 未通过/未完成”，不能写“根治完成”。
+
+参数调整顺序固定为：先查真实命令与第二生产者，再查 waiting/KV/preemption，再查 lane/
+finalize backlog；只有证据指向容量边界时才改 112、lane 份额或 finalize=2。不得回到
+“看到锯齿就加并发/加 timeout/恢复 AIMD”的补丁循环。
+
+## 9. 保留的历史事故证据
+
+2026-07-12 首个排空轮曾有 44 篇在两分钟内同时 connection reset。Windows 端日志给出的
+因果链是：当时文档并发 8 × MinerU 页面窗口 64，服务端约 255 个并发 sequence，
+KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；connection reset
+只是结果。该事故已经证明“文档槽”与“GPU 请求”必须分层控制。
+
+2026-07-13 用 16 份真实小 PDF 的 scratch 验收曾得到 16/16 parse/build/publish、
+零失败和 1,585 docs/h，下一轮 0.017 秒确认空队列并进入 idle sleep。它只证明 resident
+ loop 不再受固定 2 小时节拍限制和 idle CPU 接近零，不能外推到当前异构大 PDF 吞吐。

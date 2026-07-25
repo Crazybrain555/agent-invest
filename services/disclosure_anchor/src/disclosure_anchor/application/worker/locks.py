@@ -9,9 +9,12 @@ document — cross-worker exclusion is already the singleton lock's job.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import zlib
 
 from sqlalchemy import text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 WORKER_NS = 815001
@@ -21,6 +24,34 @@ DOC_NS = 815002
 # consumption never skips a late-committing lower seq. 815003 is taken by
 # the integration-test suite namespace (tests/integration/_support.py).
 OUTBOX_NS = 815004
+
+
+class WorkerBusyError(RuntimeError):
+    """A resident/manual producer already owns the shared GPU work path."""
+
+
+@contextmanager
+def exclusive_worker_admission(engine: Engine) -> Iterator[None]:
+    """Fail closed when another worker or manual parse producer is active."""
+
+    with engine.connect() as conn:
+        acquired = bool(
+            conn.execute(
+                text("SELECT pg_try_advisory_lock(:ns, 0)"),
+                {"ns": WORKER_NS},
+            ).scalar_one()
+        )
+        if not acquired:
+            raise WorkerBusyError(
+                "another worker or manual parse already owns GPU admission"
+            )
+        try:
+            yield
+        finally:
+            conn.execute(
+                text("SELECT pg_advisory_unlock(:ns, 0)"),
+                {"ns": WORKER_NS},
+            )
 
 
 def stable_document_hash(document_id: str) -> int:

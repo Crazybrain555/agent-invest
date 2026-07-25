@@ -107,11 +107,6 @@ class MinerUDocumentParser:
     def identity(self) -> ParserIdentity:
         if self._version_cache is None:
             self._version_cache = self._process.version()
-        if self._server_url:
-            # The remote VLM server is part of the parser identity contract:
-            # probing it here lets the worker's pre-dequeue probe catch a
-            # backend outage before any document consumes a retry.
-            self._process.probe_server(self._server_url)
         return ParserIdentity(
             name="MinerU",
             version=self._version_cache,
@@ -119,6 +114,20 @@ class MinerUDocumentParser:
             method="auto",
             language="ch",
         )
+
+    def readiness(self, options: ParserOptions | None = None) -> None:
+        """Check parser runtime dependencies without changing its identity."""
+
+        self.identity()
+        if options is not None and not options.backend.endswith("-http-client"):
+            return
+        server_url = (
+            options.server_url
+            if options is not None and options.server_url
+            else self._server_url
+        )
+        if server_url:
+            self._process.probe_server(server_url)
 
     def parse(
         self,
@@ -128,10 +137,10 @@ class MinerUDocumentParser:
         options: ParserOptions,
         document_metadata: dict[str, Any],
     ) -> ParserResult:
+        identity = self.identity()
         self._process.run(input_pdf=input_pdf, output_dir=output_dir, options=options)
         artifacts = self._reader.locate(output_dir)
         content_list = self._reader.read_content_list(artifacts.content_list_path)
-        identity = self.identity()
         parser_info = MinerUParserInfo(
             name=identity.name,
             package_version=identity.version,

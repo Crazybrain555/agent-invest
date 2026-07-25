@@ -89,8 +89,17 @@ export PYTHONPATH=src
 .venv/bin/python -m disclosure_anchor.cli.worker "$MODE" &
 WORKER_PID=$!
 trap 'kill -TERM "$WORKER_PID" 2>/dev/null' TERM INT
-while kill -0 "$WORKER_PID" 2>/dev/null; do
-  wait "$WORKER_PID"
+WORKER_STATUS=0
+while true; do
+  if wait "$WORKER_PID"; then
+    WORKER_STATUS=0
+    break
+  else
+    WORKER_STATUS=$?
+  fi
+  # wait can be interrupted after the trap forwards a signal. Keep reaping
+  # until the child really exits; never wait twice on an already-reaped PID
+  # (the old double wait surfaced as launchd exit 127).
+  kill -0 "$WORKER_PID" 2>/dev/null || break
 done
-wait "$WORKER_PID" 2>/dev/null
-exit $?
+exit "$WORKER_STATUS"

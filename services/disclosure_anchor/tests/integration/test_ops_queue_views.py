@@ -86,7 +86,11 @@ class OpsQueueViewTests(unittest.TestCase):
                 "(document_id, status, provider, provider_document_id, provider_metadata) "
                 "VALUES (:id, :status, 'cninfo', :pid, '{}'::jsonb)"
             ),
-            {"id": document_id, "status": status, "pid": f"qv{self.suffix}{len(self.doc_ids)}"},
+            {
+                "id": document_id,
+                "status": status,
+                "pid": f"qv{self.suffix}{len(self.doc_ids)}",
+            },
         )
         # 0027: raw seeding must stamp classification like the repository does.
         refresh_document_classification(conn, document_id=document_id)
@@ -223,24 +227,34 @@ class OpsQueueViewTests(unittest.TestCase):
         # describe the environment, not the document: the budget predicate
         # counts non-infra failures only.
         with self.engine.begin() as conn:
-            document_id = self._insert_document(conn, status="parse_failed")
-            for _ in range(4):
-                self._insert_run(
-                    conn,
-                    document_id,
-                    status="failed",
-                    error={
-                        "stage": "parse",
-                        "error_code": "parser_invocation_failed",
-                        "retryable": True,
-                    },
+            document_ids: dict[str, str] = {}
+            for error_code in ("parser_invocation_failed", "OSError"):
+                document_id = self._insert_document(
+                    conn, status="parse_failed"
                 )
-            helper_rows = queries.pending_parse(conn, max_retries=3, limit=500000)
-        self.assertIn(
-            document_id,
-            [row["document_id"] for row in helper_rows],
-            "infra-only failure history must stay retryable",
-        )
+                document_ids[error_code] = document_id
+                for _ in range(4):
+                    self._insert_run(
+                        conn,
+                        document_id,
+                        status="failed",
+                        error={
+                            "stage": "parse",
+                            "error_code": error_code,
+                            "retryable": True,
+                        },
+                    )
+            helper_rows = queries.pending_parse(
+                conn, max_retries=3, limit=500000
+            )
+        pending_ids = {row["document_id"] for row in helper_rows}
+        for error_code, document_id in document_ids.items():
+            with self.subTest(error_code=error_code):
+                self.assertIn(
+                    document_id,
+                    pending_ids,
+                    "shared infrastructure history must stay retryable",
+                )
 
     def test_parse_retry_ceiling_bounds_even_infra_failures(self) -> None:
         # Safety valve: a document that always dies infra-coded still stops

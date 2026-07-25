@@ -15,11 +15,11 @@ from sqlalchemy.engine import Connection
 
 from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA, OPS_SCHEMA
 
-# Parse failures that indicate infrastructure (parser/GPU/volume), not the
-# document. They do not consume the document's retry budget: two IO-storm
-# days (2026-07-23/24) stranded documents whose only failures were
-# parser_invocation_failed, and each storm would strand more. The absolute
-# ceiling below still bounds total attempts per document.
+# Parse failures that are properties of shared parser infrastructure rather
+# than of one document. Preserve legacy rows, and keep the new scoped local
+# spawn/backend-unavailable codes outside the ordinary item retry budget.
+# Task/deadline/output failures are intentionally absent and therefore consume
+# the bounded per-document budget.
 PARSE_INFRASTRUCTURE_ERROR_CODES: tuple[str, ...] = (
     "parse_timeout",
     "parser_timeout",
@@ -27,7 +27,15 @@ PARSE_INFRASTRUCTURE_ERROR_CODES: tuple[str, ...] = (
     "ParserInvocationError",
     "ParserTimeoutError",
     "parser_version_probe_failed",
+    "parser_readiness_failed",
+    "parser_local_invocation_failed",
+    "parser_backend_unavailable",
+    "parser_backend_overloaded",
+    "OSError",
+    "stale_reclaimed",
+    "parser_cancelled",
 )
+PARSE_RETRY_NEUTRAL_ERROR_CODES: tuple[str, ...] = ("parser_cancelled",)
 # Safety valve: even infra-coded failures stop retrying past this multiple
 # of max_retries, so a document that somehow always dies infra-coded cannot
 # churn forever.
@@ -447,6 +455,7 @@ def pending_parse(
         "max_retries": max_retries,
         "max_retries_ceiling": max_retries * RETRY_CEILING_MULTIPLIER,
         "infra_error_codes": list(PARSE_INFRASTRUCTURE_ERROR_CODES),
+        "retry_neutral_error_codes": list(PARSE_RETRY_NEUTRAL_ERROR_CODES),
         "limit": limit,
     }
     if scope_classes is not None:
@@ -461,6 +470,7 @@ def pending_parse(
             f"""
             SELECT q.document_id, q.status, q.failed_parse_count,
                    q.last_failed_retryable,
+                   d.raw_file_relpath,
                    COALESCE((d.provider_metadata->>'oversized')::boolean, false)
                        AS oversized
               FROM {OPS_SCHEMA}.pending_parse_v1 q
@@ -475,7 +485,14 @@ def pending_parse(
                        AND pr.status = 'failed'
                        AND COALESCE(pr.error->>'error_code', '')
                            <> ALL(:infra_error_codes)) < :max_retries
-               AND q.failed_parse_count < :max_retries_ceiling
+               AND (SELECT count(*)
+                      FROM {CORE_SCHEMA}.processing_run pr
+                     WHERE pr.document_id = q.document_id
+                       AND pr.run_kind = 'parse'
+                       AND pr.status = 'failed'
+                       AND COALESCE(pr.error->>'error_code', '')
+                           <> ALL(:retry_neutral_error_codes))
+                   < :max_retries_ceiling
                AND NOT COALESCE((d.provider_metadata->>'oversized')::boolean, false)
                {scope_sql}
              ORDER BY q.document_id

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from datetime import date
 import io
 import json
@@ -426,6 +426,7 @@ def _register_deps(
     class _FakeDeps:
         def __init__(self, settings) -> None:  # noqa: ANN001
             self.settings = settings
+            self.engine = object()
             self.uow_factory = lambda: uow
 
         def register(self) -> _FakeRegisterUseCase:
@@ -456,6 +457,7 @@ def _deps_type(
     class _FakeDeps:
         def __init__(self, settings) -> None:  # noqa: ANN001
             self.settings = settings
+            self.engine = object()
 
         def parser_options(self) -> ParserOptions:
             return ParserOptions()
@@ -483,6 +485,11 @@ def _run_main(argv: list[str], deps) -> tuple[int, str, str]:  # noqa: ANN001
     with (
         patch.object(pipeline, "load_settings", return_value=object()),
         patch.object(pipeline, "_Deps", deps),
+        patch.object(
+            pipeline,
+            "exclusive_worker_admission",
+            return_value=nullcontext(),
+        ),
         redirect_stdout(stdout),
         redirect_stderr(stderr),
     ):

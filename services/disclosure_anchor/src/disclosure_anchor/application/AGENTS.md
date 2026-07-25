@@ -12,12 +12,12 @@ services/register_document.py  注册核心：去重键(provider,pid,raw_hash)�
 use_cases/register_local_pdf.py  preflight 冲突检查 → 归档 → 核心；竞态只重试一次
 worker/queries.py     队列读取唯一入口（视图 facts + 阈值谓词都在这；worker/doctor 共用，
                禁止旁路手写判定）；reclaim_stale_runs 是钉死的回收 UPDATE
-worker/worker.py      run_once 纯调度壳（stale→[获取泵 ∥ parse(=05 process 每文档链)]→build→publish，
+worker/worker.py      run_once 纯调度壳（stale→[获取泵 ∥ whole-PDF parse→有界 finalize(build+publish)]→补漏，
                单项异常隔离；业务动作全是既有 use case）；获取(sync+download)与解析并行，
                且在轮内按 WORKER_ACQUISITION_SECONDS 时窗泵循环（按成功进展续拍、
-               失败不算进展，0=单趟旧语义）；解析链按
-               WORKER_PARSE_CONCURRENCY 有界并发（默认 1=串行；每任务独立 parser/UoW，
-               report 主线程折叠）；
+               失败不算进展，0=单趟旧语义）；解析按文档大小三 lane 配额/借用并滚动补槽，
+               WORKER_PARSE_CONCURRENCY 只计 GPU-producing parse；build/publish 释放该槽后
+               进入有界 finalize 池（每任务独立 parser/UoW，report 主线程折叠）；
                worker/locks.py 定义 WORKER_NS=815001/DOC_NS=815002 与文档级 xact 锁
                （register 复用/parse finish/publish 三事务内注入，内存 fake 无 session 自动跳过）
 dto/worker_report.py  WorkerLimits/WorkerReport/WorkerFailure（08 报告契约）

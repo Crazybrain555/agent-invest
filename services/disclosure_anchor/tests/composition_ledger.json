@@ -96,10 +96,6 @@
    "private_imports": [],
    "tests": 5
   },
-  "tests/unit/test_adaptive_concurrency.py": {
-   "private_imports": [],
-   "tests": 3
-  },
   "tests/unit/test_app_startup.py": {
    "private_imports": [],
    "tests": 5
@@ -159,7 +155,7 @@
   },
   "tests/unit/test_filing_api_admin.py": {
    "private_imports": [],
-   "tests": 19
+   "tests": 21
   },
   "tests/unit/test_filing_api_changes_errors.py": {
    "private_imports": [],
@@ -200,7 +196,7 @@
   },
   "tests/unit/test_mineru_adapter.py": {
    "private_imports": [],
-   "tests": 19
+   "tests": 22
   },
   "tests/unit/test_mineru_backend_probe.py": {
    "private_imports": [],
@@ -212,7 +208,7 @@
   },
   "tests/unit/test_parse_document.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 11
   },
   "tests/unit/test_path_builder.py": {
    "private_imports": [],
@@ -292,13 +288,13 @@
   },
   "tests/unit/test_worker_cli.py": {
    "private_imports": [],
-   "tests": 26
+   "tests": 29
   },
   "tests/unit/test_worker_run_once.py": {
    "private_imports": [
     "_sync_window_start"
    ],
-   "tests": 38
+   "tests": 48
   }
  },
  "schema": "test-composition-ledger.v1"

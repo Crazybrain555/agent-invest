@@ -11,6 +11,9 @@
   </array>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
+  <!-- Allow the wrapper to forward SIGTERM and reap MinerU process groups
+       before launchd escalates to SIGKILL. -->
+  <key>ExitTimeOut</key><integer>90</integer>
   <!-- launchd stdout/err MUST live on the internal disk (~/Library/Logs is
        the macOS LaunchAgent convention): creating files on an external
        volume from a launchd-spawned process is TCC-denied with no prompt,

@@ -74,7 +74,7 @@ class AdaptiveLoopControllerTests(unittest.TestCase):
     def test_gpu_outage_cools_only_parse_stage(self) -> None:
         report = _report(failed=8)
         report.failures.extend(
-            WorkerFailure("parse", f"doc_{index}", "parser_invocation_failed")
+            WorkerFailure("parse", f"doc_{index}", "parser_backend_unavailable")
             for index in range(8)
         )
 
@@ -87,22 +87,46 @@ class AdaptiveLoopControllerTests(unittest.TestCase):
             50,
         )
 
-    def test_actual_parse_timeout_code_activates_gpu_cooldown(self) -> None:
+    def test_document_task_timeout_does_not_activate_gpu_cooldown(self) -> None:
         report = _report(failed=1)
-        report.failures.append(WorkerFailure("parse", "doc_timeout", "parse_timeout"))
+        report.failures.append(
+            WorkerFailure(
+                "parse",
+                "doc_timeout",
+                "parser_task_deadline_exceeded",
+            )
+        )
 
         self.controller.observe(report, now=10.0)
 
         self.assertEqual(
             self.controller.effective_limits(self.limits, now=11.0).parse,
-            0,
+            50,
         )
 
     def test_partial_batch_gpu_outage_still_activates_cooldown(self) -> None:
         report = _report(failed=7, parsed=1)
         report.failures.extend(
-            WorkerFailure("parse", f"doc_{index}", "parser_invocation_failed")
+            WorkerFailure("parse", f"doc_{index}", "parser_backend_overloaded")
             for index in range(7)
+        )
+
+        self.assertEqual(self.controller.observe(report, now=10.0), 0)
+        self.assertEqual(
+            self.controller.effective_limits(self.limits, now=11.0).parse,
+            0,
+        )
+
+    def test_one_explicit_overload_after_many_successes_activates_cooldown(
+        self,
+    ) -> None:
+        report = _report(failed=1, parsed=10)
+        report.failures.append(
+            WorkerFailure(
+                "parse",
+                "doc_overloaded",
+                "parser_backend_overloaded",
+            )
         )
 
         self.assertEqual(self.controller.observe(report, now=10.0), 0)
@@ -320,6 +344,11 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 mineru_model_cache=root / "shared" / "mineru",
                 hf_home=root / "shared" / "hf",
                 modelscope_cache=root / "shared" / "modelscope",
+                disclosure_mineru_backend="vlm-http-client",
+                disclosure_mineru_server_url="http://127.0.0.1:30000",
+                worker_parse_concurrency=16,
+                worker_gpu_request_budget=112,
+                worker_gpu_max_sequences=128,
             )
             with mock.patch.object(
                 worker_cli.MinerUProcess, "version", return_value="3.4.0"
@@ -330,6 +359,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
 
         self.assertEqual(first.identity().version, "3.4.0")
         self.assertEqual(second.identity().version, "3.4.0")
+        self.assertEqual(deps.parser_options.http_request_concurrency, 7)
         version.assert_called_once_with()
 
     def test_lost_singleton_lock_fails_closed(self) -> None:
@@ -338,6 +368,22 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "singleton advisory lock was lost"):
             worker_cli._assert_singleton_lock(lock_conn)
+
+    def test_lost_singleton_lock_cancels_active_mineru_before_raising(self) -> None:
+        lock_conn = mock.MagicMock()
+        lock_conn.execute.return_value.scalar_one.return_value = False
+
+        with (
+            mock.patch.object(
+                worker_cli, "terminate_active_mineru_processes"
+            ) as terminate,
+            self.assertRaisesRegex(
+                RuntimeError, "singleton advisory lock was lost"
+            ),
+        ):
+            worker_cli._assert_singleton_or_cancel(lock_conn)
+
+        terminate.assert_called_once_with()
 
     def test_alert_message_triggers_on_outage_and_failure_burst(self) -> None:
         # Single-operator alert channel (batch 4): fire on source outage or
@@ -391,6 +437,23 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
 
         self.assertTrue(stop.is_set())
         terminate.assert_called_once_with()
+
+    def test_wedge_exit_terminates_parser_groups_before_hard_exit(self) -> None:
+        events: list[object] = []
+        with (
+            mock.patch.object(
+                worker_cli,
+                "terminate_active_mineru_processes",
+                side_effect=lambda: events.append("terminated") or 2,
+            ),
+            mock.patch(
+                "os._exit",
+                side_effect=lambda code: events.append(("exit", code)),
+            ),
+        ):
+            worker_cli._exit_wedged_worker()
+
+        self.assertEqual(events, ["terminated", ("exit", 70)])
 
 
 if __name__ == "__main__":

@@ -78,6 +78,26 @@ class ParserInvocationError(ParserError):
     """Raised when parser process invocation fails."""
 
 
+class ParserLocalInvocationError(ParserInvocationError):
+    """Raised when the local parser process cannot be started."""
+
+
+class ParserTaskError(ParserInvocationError):
+    """Raised when a parser task fails after the local process starts."""
+
+
+class ParserTaskDeadlineError(ParserTaskError):
+    """Raised when the parser backend exceeds its item-local task deadline."""
+
+
+class ParserCancelledError(ParserInvocationError):
+    """Raised when the worker intentionally cancels MinerU during shutdown."""
+
+
+class ParserBackendOverloadedError(ParserInvocationError):
+    """Raised only for an explicit remote capacity rejection."""
+
+
 class ParserVersionProbeError(ParserError):
     """Raised when parser version probing fails."""
 

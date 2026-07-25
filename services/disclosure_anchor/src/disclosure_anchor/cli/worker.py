@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 import signal
 import sys
@@ -33,6 +34,7 @@ from disclosure_anchor.adapters.parsers.mineru.mineru_process import (
     terminate_active_mineru_processes,
 )
 from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
+from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
 from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
 from disclosure_anchor.adapters.sources.cninfo.source import CninfoWebIndexSource
 from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
@@ -46,12 +48,9 @@ from disclosure_anchor.application.dto.worker_report import (
 )
 from disclosure_anchor.application.ports.disclosure_source import DisclosureSourcePort
 from disclosure_anchor.application.ports.parser import ParserOptions
-from disclosure_anchor.application.worker.concurrency import (
-    AdaptiveConcurrencyLimit,
-)
-from disclosure_anchor.application.worker import queries
 from disclosure_anchor.application.worker.locks import WORKER_NS
 from disclosure_anchor.application.worker.worker import (
+    PARSER_CONTROL_ERROR_CODES,
     WorkerConfig,
     WorkerDeps,
     _is_provider_infrastructure_error,
@@ -71,11 +70,6 @@ SYNC_COOLDOWN_MAX_SECONDS = 7200
 PARSE_COOLDOWN_BASE_SECONDS = 120
 PROVIDER_ERROR_COOLDOWN_BASE_SECONDS = 60
 PUBLISH_COOLDOWN_BASE_SECONDS = 120
-PARSER_INFRASTRUCTURE_ERRORS = frozenset(
-    queries.PARSE_INFRASTRUCTURE_ERROR_CODES
-)
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="disclosure-anchor worker")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -101,16 +95,25 @@ def main(argv: list[str] | None = None) -> int:
             print(SKIP_MESSAGE)
             return 0
         if args.command == "once":
-            return _run_rounds(settings, rounds=1)
+            return _run_rounds(settings, rounds=1, lock_conn=lock_conn)
         return _run_loop(settings, lock_conn=lock_conn)
     finally:
         lock_conn.close()
         lock_engine.dispose()
 
 
-def _run_rounds(settings: Settings, *, rounds: int | None) -> int:
+def _run_rounds(
+    settings: Settings,
+    *,
+    rounds: int | None,
+    lock_conn: Connection,
+) -> int:
     engine = create_db_engine(_database_url(settings))
-    deps = _deps(settings, engine)
+    deps = _deps(
+        settings,
+        engine,
+        admission_guard=lambda: _assert_singleton_or_cancel(lock_conn),
+    )
     stop = _StopFlag()
     stop.install()
     try:
@@ -158,7 +161,6 @@ def _wedge_watchdog(
 
     def _watch() -> None:
         import faulthandler
-        import os
 
         while not stop.is_set():
             time.sleep(30)
@@ -173,11 +175,25 @@ def _wedge_watchdog(
                 )
                 faulthandler.dump_traceback(file=sys.stderr)
                 sys.stderr.flush()
-                os._exit(70)
+                _exit_wedged_worker()
 
     thread = threading.Thread(target=_watch, name="wedge-watchdog", daemon=True)
     thread.start()
     return thread
+
+
+def _exit_wedged_worker() -> None:
+    """Kill detached parser groups before launchd replaces this worker."""
+
+    import os
+
+    # MinerU children intentionally run in their own process groups so an
+    # individual timeout can kill the whole temporary API tree. os._exit()
+    # skips signal handlers/finally blocks, so the watchdog must explicitly
+    # remove those groups; otherwise the replacement singleton worker starts
+    # with orphan requests still consuming the same GPU budget.
+    terminate_active_mineru_processes()
+    os._exit(70)
 
 
 def _run_loop(settings: Settings, *, lock_conn: Connection) -> int:
@@ -191,7 +207,11 @@ def _run_loop(settings: Settings, *, lock_conn: Connection) -> int:
         idle_max_seconds=settings.worker_loop_max_interval_seconds,
     )
     base_limits = _limits(settings)
-    deps = _deps(settings, engine)
+    deps = _deps(
+        settings,
+        engine,
+        admission_guard=lambda: _assert_singleton_or_cancel(lock_conn),
+    )
     last_progress = [time.monotonic()]
     if settings.worker_wedge_timeout_seconds > 0:
         object.__setattr__(
@@ -204,7 +224,7 @@ def _run_loop(settings: Settings, *, lock_conn: Connection) -> int:
         )
     try:
         while not stop.is_set():
-            _assert_singleton_lock(lock_conn)
+            _assert_singleton_or_cancel(lock_conn)
             started_at = datetime.now(timezone.utc)
             started_monotonic = time.monotonic()
             # Round boundaries are progress too: idle rounds plus backoff
@@ -480,22 +500,16 @@ def _made_progress(report: WorkerReport) -> bool:
 
 
 def _parse_infrastructure_outage(report: WorkerReport) -> bool:
-    infrastructure_failures = sum(
-        1
+    # These are deliberately narrow control-plane/shared-infrastructure
+    # signals, not generic document failures. The dispatcher already closes
+    # the current refill on the first one; the resident controller must apply
+    # the same boundary to the next round even when earlier documents
+    # succeeded, otherwise an explicit 429/readiness/storage outage is
+    # immediately hammered again.
+    return any(
+        failure.stage == "parse"
+        and failure.error_code in PARSER_CONTROL_ERROR_CODES
         for failure in report.failures
-        if failure.stage == "parse"
-        and failure.error_code in PARSER_INFRASTRUCTURE_ERRORS
-    )
-    # One failed item beside successful work can be a document-local poison,
-    # and a couple of infrastructure-shaped failures inside a mostly
-    # successful batch are load blips, not an outage — the successes prove
-    # the backend lives (rate-based breaker, not absolute counts).  Failures
-    # that dominate the batch are real evidence even when early documents
-    # completed before the GPU/service went down.
-    if infrastructure_failures == 0:
-        return False
-    return infrastructure_failures >= max(2, report.parsed) or (
-        report.parsed == 0 and infrastructure_failures == 1
     )
 
 
@@ -546,6 +560,16 @@ def _assert_singleton_lock(lock_conn: Connection) -> None:
         raise RuntimeError("worker singleton advisory lock was lost")
 
 
+def _assert_singleton_or_cancel(lock_conn: Connection) -> None:
+    """Fail closed and cancel live MinerU work if the lock session is lost."""
+
+    try:
+        _assert_singleton_lock(lock_conn)
+    except Exception:
+        terminate_active_mineru_processes()
+        raise
+
+
 class _StopFlag:
     def __init__(self) -> None:
         self._stopped = False
@@ -581,7 +605,12 @@ def _limits(settings: Settings) -> WorkerLimits:
     )
 
 
-def _deps(settings: Settings, engine: Engine) -> WorkerDeps:
+def _deps(
+    settings: Settings,
+    engine: Engine,
+    *,
+    admission_guard: Callable[[], None] = lambda: None,
+) -> WorkerDeps:
     paths = FileStorePathBuilder(settings)
     source: CninfoSource | CninfoWebIndexSource | None = None
     parser_version: str | None = None
@@ -635,9 +664,6 @@ def _deps(settings: Settings, engine: Engine) -> WorkerDeps:
     return WorkerDeps(
         engine=engine,
         uow_factory=unit_of_work_factory(engine),
-        parse_limiter=AdaptiveConcurrencyLimit(
-            max_limit=max(1, settings.worker_parse_concurrency)
-        ),
         path_builder=paths,
         raw_store=RawDocumentStore(paths),
         artifact_store=ArtifactStore(paths),
@@ -645,6 +671,7 @@ def _deps(settings: Settings, engine: Engine) -> WorkerDeps:
         profile_loader_factory=profile_loader_factory,
         parser_factory=parser_factory,
         parse_timeout_seconds=settings.disclosure_parse_timeout_seconds,
+        page_counter=count_pdf_pages,
         config=WorkerConfig(
             max_parse_retries=settings.disclosure_max_parse_retries,
             max_build_retries=settings.disclosure_max_build_retries,
@@ -657,14 +684,38 @@ def _deps(settings: Settings, engine: Engine) -> WorkerDeps:
             backfill_max_pending_downloads=settings.disclosure_backfill_max_pending_downloads,
             process_scope_classes=_process_scope_classes(settings),
             parse_concurrency=settings.worker_parse_concurrency,
+            parse_heavy_page_threshold=(
+                settings.worker_parse_heavy_page_threshold
+            ),
+            parse_heavy_saturated_share=(
+                settings.worker_parse_heavy_saturated_share
+            ),
+            parse_huge_page_threshold=(
+                settings.worker_parse_huge_page_threshold
+            ),
+            parse_huge_saturated_share=(
+                settings.worker_parse_huge_saturated_share
+            ),
+            parse_candidate_window=settings.worker_parse_candidate_window,
+            finalize_concurrency=settings.worker_finalize_concurrency,
+            parse_timeout_per_page_seconds=(
+                settings.disclosure_parse_timeout_per_page_seconds
+            ),
+            parse_timeout_max_seconds=(
+                settings.disclosure_parse_timeout_max_seconds
+            ),
         ),
         clock=lambda: datetime.now(timezone.utc),
         parser_options=ParserOptions(
             backend=settings.disclosure_mineru_backend,
             server_url=settings.disclosure_mineru_server_url,
+            http_request_concurrency=(
+                settings.mineru_http_request_concurrency
+            ),
         ),
         source_close_after_round=False,
         close_source=close_source,
+        admission_guard=admission_guard,
     )
 
 
@@ -685,9 +736,14 @@ def _print_version_banner(settings: Settings) -> None:
     from disclosure_anchor.adapters.unit_builder import rules as builder_rules
 
     scope = _process_scope_classes(settings)
+    per_document_cap = settings.mineru_http_request_concurrency or 0
     line = (
         f"[versions] policy={settings.disclosure_processing_policy_path.name} "
-        f"scope_classes={len(scope)} builder_rules={builder_rules.RULES_VERSION}"
+        f"scope_classes={len(scope)} builder_rules={builder_rules.RULES_VERSION} "
+        f"gpu_request_cap="
+        f"{settings.worker_parse_concurrency}x"
+        f"{per_document_cap}"
+        f"<={settings.worker_gpu_max_sequences}"
     )
     try:
         engine = create_db_engine(_database_url(settings))

@@ -183,8 +183,9 @@ worker-once:
 worker-loop:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker loop
 
-# Resident worker control (batch 4, 2026-07-14). Config/code/env changes only
-# take effect after an explicit restart — see config/README.md 生效矩阵.
+# Resident worker control. kickstart reloads code/env only for a job whose
+# installed plist is already current; plist changes require the staged
+# drain/bootout/install procedure in the production runbook.
 worker-status:
 	@launchctl print gui/$$(id -u)/com.agentinvest.disclosure-worker 2>/dev/null \
 		| grep -E "state|pid|last exit" || echo "[warn] worker job not loaded"
@@ -196,7 +197,8 @@ worker-restart:
 	launchctl kickstart -k gui/$$(id -u)/com.agentinvest.disclosure-worker
 	@sleep 5
 	@launchctl print gui/$$(id -u)/com.agentinvest.disclosure-worker | grep -E "state|pid" || true
-	@echo "[note] restarted; run 'make doctor-full' and watch one round before walking away"
+	@echo "[note] code/env restarted; plist was not reloaded"
+	@echo "[note] run 'make doctor-full' and watch one round before walking away"
 
 # Orphan parser-artifact inventory (dry-run; APPLY=YES deletes with an audit
 # manifest). Raw documents are never touched.

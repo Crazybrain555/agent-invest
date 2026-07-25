@@ -28,8 +28,13 @@ from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import (
     ParseDocumentError,
+    ParserBackendOverloadedError,
+    ParserCancelledError,
     ParserInvocationError,
+    ParserLocalInvocationError,
     ParserOutputContractError,
+    ParserTaskDeadlineError,
+    ParserTaskError,
     ParserTimeoutError,
     ParserUnknownError,
     ParserVersionProbeError,
@@ -80,6 +85,7 @@ class ParseDocument:
         artifact_store: ArtifactStorePort,
         uow_factory: Callable[[], UnitOfWork],
         default_timeout_seconds: int = 1800,
+        check_readiness: bool = True,
     ) -> None:
         self._parser = parser
         self._paths = path_builder
@@ -87,6 +93,7 @@ class ParseDocument:
         self._artifact_store = artifact_store
         self._uow_factory = uow_factory
         self._default_timeout_seconds = default_timeout_seconds
+        self._check_readiness = check_readiness
 
     def execute(self, command: ParseDocumentCommand) -> ParseDocumentResult:
         options = self._effective_options(command.options)
@@ -161,6 +168,28 @@ class ParseDocument:
                 else self._parser_failure_from_exception(exc)
             )
             run = self._finish_failed_run(context=context, failure=failure)
+            return ParseDocumentResult(
+                processing_run_id=run.processing_run_id,
+                status=run.status,
+                parser_artifact_relpath=run.parser_artifact_relpath,
+                normalized_ir_relpath=run.normalized_ir_relpath,
+                artifact_hash=run.artifact_hash,
+                error=run.error,
+            )
+        except OSError as exc:
+            # Local storage/path failures are shared infrastructure, not a
+            # malformed PDF. Preserve the failed run for observability, keep
+            # it retryable, and let the worker close rolling admission before
+            # the same outage is multiplied across the candidate window.
+            run = self._finish_failed_run(
+                context=context,
+                failure=_ParseRunFailure(
+                    stage="parse_io",
+                    error_code="OSError",
+                    retryable=True,
+                    message=str(exc),
+                ),
+            )
             return ParseDocumentResult(
                 processing_run_id=run.processing_run_id,
                 status=run.status,
@@ -325,6 +354,22 @@ class ParseDocument:
                     retryable=True,
                     message=str(exc),
                 )
+            else:
+                # Identity is stable package/configuration metadata. Runtime
+                # readiness is an admission check and must happen before the
+                # parser consumes this document, never after successful
+                # artifacts have already been produced.
+                readiness = getattr(self._parser, "readiness", None)
+                if self._check_readiness and callable(readiness):
+                    try:
+                        readiness(options)
+                    except ParserVersionProbeError as exc:
+                        prepare_error = self._structured_error(
+                            stage="parser_readiness",
+                            error_code="parser_readiness_failed",
+                            retryable=True,
+                            message=str(exc),
+                        )
             run = uow.processing_runs.add(
                 e.ProcessingRun(
                     processing_run_id=processing_run_id,
@@ -550,6 +595,41 @@ class ParseDocument:
             return _ParseRunFailure(
                 stage="parse",
                 error_code="parse_timeout",
+                retryable=True,
+                message=str(exc),
+            )
+        if isinstance(exc, ParserTaskDeadlineError):
+            return _ParseRunFailure(
+                stage="parse",
+                error_code="parser_task_deadline_exceeded",
+                retryable=True,
+                message=str(exc),
+            )
+        if isinstance(exc, ParserBackendOverloadedError):
+            return _ParseRunFailure(
+                stage="parse",
+                error_code="parser_backend_overloaded",
+                retryable=True,
+                message=str(exc),
+            )
+        if isinstance(exc, ParserCancelledError):
+            return _ParseRunFailure(
+                stage="parse",
+                error_code="parser_cancelled",
+                retryable=True,
+                message=str(exc),
+            )
+        if isinstance(exc, ParserTaskError):
+            return _ParseRunFailure(
+                stage="parse",
+                error_code="parser_task_failed",
+                retryable=True,
+                message=str(exc),
+            )
+        if isinstance(exc, ParserLocalInvocationError):
+            return _ParseRunFailure(
+                stage="parse",
+                error_code="parser_local_invocation_failed",
                 retryable=True,
                 message=str(exc),
             )

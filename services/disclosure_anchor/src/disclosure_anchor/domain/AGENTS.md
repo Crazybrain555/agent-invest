@@ -7,8 +7,8 @@ entities/outbox_events.py  事件工厂（唯一合法的事件构造点：统�
                            subject_kind/subject_ref/occurred_at；禁止在 use case 里手拼 OutboxEvent）
 ids.py                     new_id(prefix) + 类型化 helper；ULID 毫秒级时间有序、同毫秒非严格单调，
                            排序一律用显式键（created_at+id / order_index+asset_id / seq）
-errors.py                  typed 异常层级；Parser* 五分型（timeout/invocation/version_probe/
-                           output_contract/unknown）决定 retryable 映射
+errors.py                  typed 异常层级；Parser* 按 deadline/local/task/overload/cancel/
+                           version_probe/output_contract/unknown 分型并决定 retry/control 映射
 value_objects/             ReportPeriod（regex ^\d{4}(A|Q[1-4])$；半年报=YYYYQ2）、
                            filing_type 词表、provider 白名单、QuarantineReason 闭集
 ```

@@ -1,6 +1,7 @@
 # adapters/parsers/mineru — MinerU 适配与 NormalizedIR v3
 
-管道：`mineru_process.py`（subprocess 调 CLI，剥离代理 env，timeout→ParserTimeoutError）
+管道：`mineru_process.py`（subprocess 调 CLI，剥离代理 env，HTTP 内并发显式限额；
+timeout/worker stop 先 SIGINT 走 MinerU 官方临时 API cleanup，超时才强杀）
 → `artifact_reader.py`（定位/读 content_list 及同 stem 可选 model，形状不符
 →ParserOutputContractError）→ `table_reconciler.py`（同页唯一 bbox + logical-cell 串接证据，
 证明 MinerU 跨页 aggregate/empty ghost 同组，保持物理 carrier 并只给 root 附逐页 locator）→ `mapper_to_ir.py`

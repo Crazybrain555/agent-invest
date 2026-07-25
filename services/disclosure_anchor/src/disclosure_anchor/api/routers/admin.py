@@ -19,6 +19,7 @@ from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
 from disclosure_anchor.api.errors import (
+    CONFLICT,
     FORBIDDEN,
     UNAUTHORIZED,
     FilingApiError,
@@ -76,6 +77,10 @@ from disclosure_anchor.application.use_cases.track_companies import (
     UntrackCompanies,
     UntrackCompaniesResult,
 )
+from disclosure_anchor.application.worker.locks import (
+    WorkerBusyError,
+    exclusive_worker_admission,
+)
 from disclosure_anchor.domain.value_objects import ReportPeriod
 from disclosure_anchor.settings import Settings
 
@@ -109,14 +114,24 @@ def parse_document(
         ParserOptions(
             backend=settings.disclosure_mineru_backend,
             server_url=settings.disclosure_mineru_server_url,
+            http_request_concurrency=(
+                settings.mineru_http_request_concurrency
+            ),
         )
         if settings is not None
         else ParserOptions()
     )
-    result = _admin_deps(request).parse_document(
-        document_id=document_id,
-        options=_parser_options(options, defaults),
-    )
+    try:
+        result = _admin_deps(request).parse_document(
+            document_id=document_id,
+            options=_parser_options(options, defaults),
+        )
+    except WorkerBusyError as exc:
+        raise FilingApiError(
+            status_code=409,
+            error_code=CONFLICT,
+            message=str(exc),
+        ) from exc
     return ParseDocumentResponse.model_validate(asdict(result))
 
 
@@ -266,15 +281,26 @@ class AdminDeps:
         self, *, document_id: str, options: ParserOptions
     ) -> ParseDocumentResult:
         executable = self._settings.disclosure_mineru_bin or Path("mineru")
-        parser = MinerUDocumentParser(process=MinerUProcess(executable=executable))
-        return ParseDocument(
-            parser=parser,
-            path_builder=self._paths,
-            raw_store=RawDocumentStore(self._paths),
-            artifact_store=self._artifacts,
-            uow_factory=self._uow_factory,
-            default_timeout_seconds=self._settings.disclosure_parse_timeout_seconds,
-        ).execute(ParseDocumentCommand(document_id=document_id, options=options))
+        parser = MinerUDocumentParser(
+            process=MinerUProcess(executable=executable),
+            server_url=self._settings.disclosure_mineru_server_url,
+        )
+        with exclusive_worker_admission(self._engine):
+            return ParseDocument(
+                parser=parser,
+                path_builder=self._paths,
+                raw_store=RawDocumentStore(self._paths),
+                artifact_store=self._artifacts,
+                uow_factory=self._uow_factory,
+                default_timeout_seconds=(
+                    self._settings.disclosure_parse_timeout_seconds
+                ),
+            ).execute(
+                ParseDocumentCommand(
+                    document_id=document_id,
+                    options=options,
+                )
+            )
 
     def build_units(self, *, document_id: str) -> BuildUnitsResult:
         return BuildUnits(
@@ -506,6 +532,7 @@ def _parser_options(
             if command.server_url is not None
             else defaults.server_url
         ),
+        http_request_concurrency=defaults.http_request_concurrency,
     )
 
 

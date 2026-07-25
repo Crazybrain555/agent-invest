@@ -25,6 +25,10 @@ class ParserOptions:
     # OpenAI-compatible MinerU server for the *-http-client backends
     # (mineru-openai-server on a GPU box); None for local backends.
     server_url: str | None = None
+    # Per-document HTTP fan-out inside MinerU. This is distinct from the
+    # worker's document concurrency: each *-http-client process can otherwise
+    # issue up to MinerU's much larger default number of requests.
+    http_request_concurrency: int | None = None
 
 
 @dataclass(frozen=True)

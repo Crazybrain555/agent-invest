@@ -18,6 +18,57 @@ make worker-status
 launchd job 丢失时重装：`make install-ops-launchd`（postgres+doctor）、
 `./scripts/install_launchd.sh`（worker）。
 
+### 1.1 首次从旧 worker 切换到当前 plist
+
+这条路径只用于旧 job 的 `ExitTimeOut` 仍小于 90 秒、且旧代码还不认识
+`parser_cancelled` 的首次切换。此时禁止 `kickstart -k` 或让安装脚本自动 bootout；
+否则 launchd 会在 5 秒后强杀长文档，既可能留下 MinerU 临时 API，也会消耗业务重试。
+
+1. 先通过本分支全部发布门，再禁止 KeepAlive 重拉起，但不终止当前进程：
+
+   ```bash
+   WORKER_DOMAIN="gui/$(id -u)"
+   WORKER_LABEL="com.agentinvest.disclosure-worker"
+   launchctl disable "$WORKER_DOMAIN/$WORKER_LABEL"
+   ```
+
+2. 等旧波次自然排空。三个条件必须同时为零：
+
+   - `disclosure_core.processing_run` 中 `run_kind='parse' AND status='running'`；
+   - `pgrep -afil '/bin/mineru -p |mineru.cli.fast_api'` 的旧 MinerU/临时 API；
+   - vLLM `/metrics` 的 `vllm:num_requests_running` 和
+     `vllm:num_requests_waiting`（先排除其他合法客户端）。
+
+3. 零点可能很短。`launchctl` 显示的是 zsh wrapper PID，不能停它（Python 子进程会继续
+   补槽）；必须解析且只接受它唯一的直接 `disclosure_anchor.cli.worker loop` 子进程。
+   对 **Python PID** 先 `SIGSTOP` 冻结，再重复核对上述三个条件；若任一非零，
+   `SIGCONT` 后继续等。三者仍为零时，把 SIGTERM 置为 pending 后恢复 Python，让它正常
+   退出：
+
+   ```bash
+   WRAPPER_PID="$(launchctl print "$WORKER_DOMAIN/$WORKER_LABEL" |
+     awk '/pid =/{print $3; exit}')"
+   PYTHON_PID="$(pgrep -P "$WRAPPER_PID" -f \
+     'disclosure_anchor.cli.worker loop')"
+   case "$PYTHON_PID" in
+     ""|*$'\n'*) echo "expected exactly one worker Python child" >&2; exit 1 ;;
+   esac
+   kill -STOP "$PYTHON_PID"
+   # 在进程保持 STOP 时重新核对 PG、MinerU/API、vLLM 三个零条件。
+   kill -TERM "$PYTHON_PID"
+   kill -CONT "$PYTHON_PID"
+   while kill -0 "$PYTHON_PID" 2>/dev/null; do sleep 1; done
+   launchctl bootout "$WORKER_DOMAIN/$WORKER_LABEL"
+   ./scripts/install_launchd.sh
+   ```
+
+4. 确认新 loaded plist 的 `exittimeout = 90`，再按动态调度设计 §8.2 做启动即验。
+   安装脚本发现 label 仍 loaded，或仍有 MinerU CLI/临时 API 进程，都会退出 75；这是安全
+   保护，不得绕过。
+
+完成首次切换后，常规代码/env 重载才使用 `make worker-restart`；新 worker 的取消是
+retry-neutral，且 90 秒退出窗口会给官方 cleanup 路径留出时间。
+
 ## 2. 告警通道
 
 - 每日 18:30 `com.agentinvest.disclosure-doctor` 跑 `scripts/doctor_daily.sh`：
@@ -60,7 +111,8 @@ SELECT count(*) FROM disclosure_ops.pending_parse_v1 WHERE failed_parse_count > 
 
 worker 以 exit 77 自杀 = TCC 拒绝访问外置盘（详见 `scripts/run_worker_once.sh` 头部注释）。
 处置：系统设置 → 隐私与安全性 → 完全磁盘访问 给 `/bin/zsh`（或按注释操作），然后
-`make worker-restart`。KeepAlive 30 秒节流重启属预期，不要手工 bootout。
+`make worker-restart`。KeepAlive 30 秒节流重启属预期；除 §1.1 首次 staged cutover 外，
+不要手工 bootout。
 
 ## 7. 磁盘与产物治理
 

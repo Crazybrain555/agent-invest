@@ -54,6 +54,11 @@ class WorkerReport:
     sync_quota_break: bool = False
     sync_rate_limited: bool = False
     parse_concurrency_limit: int | None = None
+    parse_peak_inflight: int = 0
+    parse_regular_dispatched: int = 0
+    parse_heavy_dispatched: int = 0
+    parse_huge_dispatched: int = 0
+    parse_unknown_page_count: int = 0
     source_outage_break: bool = False
     deferred_backfill: int = 0
     failures: list[WorkerFailure] = field(default_factory=list)
@@ -70,6 +75,11 @@ class WorkerReport:
             "sync_quota_break": self.sync_quota_break,
             "sync_rate_limited": self.sync_rate_limited,
             "parse_concurrency_limit": self.parse_concurrency_limit,
+            "parse_peak_inflight": self.parse_peak_inflight,
+            "parse_regular_dispatched": self.parse_regular_dispatched,
+            "parse_heavy_dispatched": self.parse_heavy_dispatched,
+            "parse_huge_dispatched": self.parse_huge_dispatched,
+            "parse_unknown_page_count": self.parse_unknown_page_count,
             "source_outage_break": self.source_outage_break,
             "deferred_backfill": self.deferred_backfill,
             "parsed": self.parsed,

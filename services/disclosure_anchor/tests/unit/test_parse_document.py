@@ -20,8 +20,13 @@ from disclosure_anchor.application.use_cases.parse_document import (
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.errors import (
     ParseDocumentError,
+    ParserBackendOverloadedError,
+    ParserCancelledError,
     ParserInvocationError,
+    ParserLocalInvocationError,
     ParserOutputContractError,
+    ParserTaskDeadlineError,
+    ParserTaskError,
     ParserTimeoutError,
     ParserUnknownError,
     ParserVersionProbeError,
@@ -110,16 +115,24 @@ class _ArtifactStore:
         raise AssertionError("not used by parse tests")
 
 
+class _UnavailableArtifactStore(_ArtifactStore):
+    def write_json_atomic(self, *, relpath: Path, payload: object):
+        del relpath, payload
+        raise OSError("artifact volume unavailable")
+
+
 class _Parser:
     def __init__(
         self,
         *,
         error: Exception | None = None,
         identity_error: Exception | None = None,
+        readiness_error: Exception | None = None,
         contract_version: str = "normalized_ir.v3",
     ) -> None:
         self.error = error
         self.identity_error = identity_error
+        self.readiness_error = readiness_error
         self.contract_version = contract_version
         self.called = False
         self.document_metadata: dict[str, Any] | None = None
@@ -134,6 +147,10 @@ class _Parser:
             method="auto",
             language="ch",
         )
+
+    def readiness(self, _options: ParserOptions | None = None) -> None:
+        if self.readiness_error is not None:
+            raise self.readiness_error
 
     def parse(
         self,
@@ -344,6 +361,27 @@ class ParseDocumentUnitTests(unittest.TestCase):
     def test_typed_parser_exceptions_map_to_structured_errors(self) -> None:
         cases = (
             (ParserTimeoutError("timeout"), "parse_timeout", True),
+            (
+                ParserTaskDeadlineError("task deadline"),
+                "parser_task_deadline_exceeded",
+                True,
+            ),
+            (ParserTaskError("task failed"), "parser_task_failed", True),
+            (
+                ParserCancelledError("worker stopped"),
+                "parser_cancelled",
+                True,
+            ),
+            (
+                ParserLocalInvocationError("spawn failed"),
+                "parser_local_invocation_failed",
+                True,
+            ),
+            (
+                ParserBackendOverloadedError("capacity rejected"),
+                "parser_backend_overloaded",
+                True,
+            ),
             (ParserInvocationError("invoke"), "parser_invocation_failed", True),
             (
                 ParserOutputContractError("bad output"),
@@ -362,6 +400,19 @@ class ParseDocumentUnitTests(unittest.TestCase):
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(result.error["error_code"], error_code)
                 self.assertEqual(result.error["retryable"], retryable)
+
+        uow = _uow_with_document()
+        parser = _Parser(
+            readiness_error=ParserVersionProbeError("remote unavailable")
+        )
+        use_case, _ = _use_case(uow, parser=parser)
+
+        result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+
+        self.assertEqual(result.status, "failed")
+        self.assertFalse(parser.called)
+        self.assertEqual(result.error["error_code"], "parser_readiness_failed")
+        self.assertTrue(result.error["retryable"])
 
     def test_new_parse_rejects_legacy_ir_generation(self) -> None:
         uow = _uow_with_document()
@@ -401,6 +452,20 @@ class ParseDocumentUnitTests(unittest.TestCase):
         self.assertEqual(run.status, "failed")
         self.assertEqual(run.error["error_code"], "RuntimeError")
         self.assertFalse(run.error["retryable"])
+
+    def test_artifact_io_failure_is_retryable_shared_infrastructure(self) -> None:
+        uow = _uow_with_document()
+        use_case, _ = _use_case(
+            uow,
+            artifact_store=_UnavailableArtifactStore(),
+        )
+
+        result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.error["stage"], "parse_io")
+        self.assertEqual(result.error["error_code"], "OSError")
+        self.assertTrue(result.error["retryable"])
 
     def test_published_document_parse_failure_does_not_downgrade(self) -> None:
         uow = _uow_with_document()

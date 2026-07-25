@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
@@ -14,57 +15,169 @@ from pathlib import Path
 
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.domain.errors import (
+    ParserBackendOverloadedError,
+    ParserCancelledError,
     ParserInvocationError,
+    ParserLocalInvocationError,
+    ParserTaskDeadlineError,
+    ParserTaskError,
     ParserTimeoutError,
     ParserVersionProbeError,
 )
 
+LOGGER = logging.getLogger(__name__)
 
 _ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
-_ACTIVE_PROCESSES_LOCK = threading.Lock()
+_CANCELLED_PROCESSES: set[subprocess.Popen[str]] = set()
+_ACTIVE_PROCESSES_LOCK = threading.RLock()
+_MINERU_SHUTDOWN_REQUESTED = threading.Event()
+_GRACEFUL_STOP_SECONDS = 35.0
 
 _PROBE_SUCCESS_AT: dict[str, float] = {}
 _PROBE_CACHE_LOCK = threading.Lock()
 _PROBE_SUCCESS_TTL_SECONDS = 60.0
+_TASK_RESULT_TIMEOUT_MARKER = "Timed out waiting for result of task"
+_LOCAL_API_FAILURE_MARKERS = (
+    "Local mineru-api exited before becoming healthy.",
+    "Timed out waiting for local mineru-api to become healthy.",
+)
+_BACKEND_OVERLOAD_MARKERS = (
+    "429 Too Many Requests",
+    "HTTP 429",
+    "status_code=429",
+    '"status_code": 429',
+    "Unexpected status code: [429]",
+    "RESOURCE_EXHAUSTED",
+    "resource_exhausted",
+)
+_LOCAL_API_STARTUP_TIMEOUT_SECONDS = 120
+_TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS = 120
+# MinerU's task-result wait starts only after temporary API startup and upload.
+# Keep an explicit phase budget inside the outer process SLA for startup
+# (120s), its fixed submit HTTP timeouts (up to ~400s), local result download,
+# shutdown/extraction and cleanup. The outer communicate() deadline remains
+# the final absolute bound if a streaming phase keeps making partial progress.
+_MIN_TASK_RESULT_RESERVE_SECONDS = 900
+_MAX_TASK_RESULT_RESERVE_SECONDS = 1800
 
 
-def _register_process(process: subprocess.Popen[str]) -> None:
+def _task_result_timeout_seconds(outer_timeout_seconds: int) -> int:
+    """Reserve the bounded pre-task and cleanup phases from the overall SLA."""
+
+    if outer_timeout_seconds <= 1:
+        return 1
+    nominal_reserve = min(
+        _MAX_TASK_RESULT_RESERVE_SECONDS,
+        max(
+            _MIN_TASK_RESULT_RESERVE_SECONDS,
+            outer_timeout_seconds // 10,
+        ),
+    )
+    # ParserOptions remains a public/direct-call surface and historically
+    # permits deliberately short SLAs. Cap phase reserve at 25% so task wait
+    # retains at least 75%, continuously across the 900s nominal boundary.
+    reserve = min(nominal_reserve, max(1, outer_timeout_seconds // 4))
+    return max(1, outer_timeout_seconds - reserve)
+
+
+def _contains_any(value: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in value for marker in markers)
+
+
+def _register_process(process: subprocess.Popen[str]) -> bool:
     with _ACTIVE_PROCESSES_LOCK:
         _ACTIVE_PROCESSES.add(process)
+        cancel_now = _MINERU_SHUTDOWN_REQUESTED.is_set()
+        if cancel_now:
+            _CANCELLED_PROCESSES.add(process)
+    if cancel_now:
+        try:
+            os.killpg(process.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+    return cancel_now
 
 
-def _unregister_process(process: subprocess.Popen[str]) -> None:
+def _unregister_process(process: subprocess.Popen[str]) -> bool:
     with _ACTIVE_PROCESSES_LOCK:
         _ACTIVE_PROCESSES.discard(process)
+        cancelled = process in _CANCELLED_PROCESSES
+        _CANCELLED_PROCESSES.discard(process)
+    return cancelled
 
 
-def terminate_active_mineru_processes() -> int:
-    """Kill active MinerU process groups during worker SIGTERM/SIGINT.
+def terminate_active_mineru_processes(
+    *, grace_seconds: float = _GRACEFUL_STOP_SECONDS
+) -> int:
+    """Gracefully stop active MinerU groups, then force only true stragglers.
 
-    The parse thread observes the non-zero return, persists a retryable
-    invocation failure, and exits.  Taking a snapshot avoids holding the
-    registry lock while delivering signals.
+    Registry marking lets the parse thread distinguish an operator restart
+    from an item failure, so a deploy never consumes the PDF's retry budget.
+    SIGINT is intentional: MinerU's official client catches it and stops its
+    separate-session temporary API before removing the temporary directory.
+    The process-lifetime latch closes the snapshot/register race.
     """
 
+    _MINERU_SHUTDOWN_REQUESTED.set()
     with _ACTIVE_PROCESSES_LOCK:
-        processes = tuple(_ACTIVE_PROCESSES)
+        processes = tuple(
+            process
+            for process in _ACTIVE_PROCESSES
+            if process.poll() is None
+        )
+        _CANCELLED_PROCESSES.update(processes)
     terminated = 0
+    for process in processes:
+        try:
+            os.killpg(process.pid, signal.SIGINT)
+        except ProcessLookupError:
+            with _ACTIVE_PROCESSES_LOCK:
+                _CANCELLED_PROCESSES.discard(process)
+            continue
+        terminated += 1
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while (
+        any(process.poll() is None for process in processes)
+        and time.monotonic() < deadline
+    ):
+        time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
     for process in processes:
         if process.poll() is not None:
             continue
+        LOGGER.warning(
+            "MinerU PID %s exceeded graceful shutdown; forcing exit",
+            process.pid,
+        )
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
-            continue
-        terminated += 1
+            pass
     return terminated
 
 
-def _kill_process_group(process: subprocess.Popen[str]) -> None:
+def _stop_process_group(
+    process: subprocess.Popen[str],
+    *,
+    grace_seconds: float = _GRACEFUL_STOP_SECONDS,
+) -> None:
+    """Give MinerU's official cleanup path time before a forced kill."""
+
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        os.killpg(process.pid, signal.SIGINT)
     except ProcessLookupError:
-        pass
+        return
+    try:
+        process.wait(timeout=max(0.0, grace_seconds))
+        return
+    except subprocess.TimeoutExpired:
+        LOGGER.warning(
+            "MinerU PID %s exceeded graceful cleanup; forcing exit",
+            process.pid,
+        )
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
     process.wait()
 
 
@@ -117,6 +230,23 @@ class MinerUProcess:
             # *-http-client backends offload VLM inference to a remote
             # mineru-openai-server (GPU box); mineru ignores -u otherwise.
             command.extend(["-u", options.server_url])
+        if (
+            options.backend.endswith("-http-client")
+            and options.http_request_concurrency is not None
+        ):
+            if options.http_request_concurrency < 1:
+                raise ValueError(
+                    "http_request_concurrency must be positive when configured"
+                )
+            # MinerU 3.4 deliberately accepts unknown CLI options and forwards
+            # them to its temporary local mineru-api. The API normalizes this
+            # option to max_concurrency for the remote HTTP client backend.
+            command.extend(
+                [
+                    "--max-concurrency",
+                    str(options.http_request_concurrency),
+                ]
+            )
         return command
 
     def probe_server(
@@ -132,10 +262,10 @@ class MinerUProcess:
         outage.
 
         A success is cached briefly and probes are generous with time:
-        identity() runs per parsed document under full concurrency, and a
-        server busy with continuous batching answers /health slowly — a
-        tight per-document probe manufactures outage evidence from our own
-        load (k8s/Envoy convention: lenient probes, rate-based breakers).
+        readiness can run before each admission wave, and a server busy with
+        continuous batching answers /health slowly — repeated tight probes
+        manufacture outage evidence from our own load (k8s/Envoy convention:
+        lenient probes, rate-based breakers).
         """
 
         with _PROBE_CACHE_LOCK:
@@ -183,22 +313,35 @@ class MinerUProcess:
             raise ParserVersionProbeError(
                 f"MinerU version probe failed: {self._executable}"
             ) from exc
-        _register_process(process)
+        cancel_at_start = _register_process(process)
+        cancelled = False
         try:
             stdout, stderr = process.communicate(
-                timeout=self._version_timeout_seconds
+                timeout=(
+                    min(self._version_timeout_seconds, _GRACEFUL_STOP_SECONDS)
+                    if cancel_at_start
+                    else self._version_timeout_seconds
+                )
             )
         except subprocess.TimeoutExpired as exc:
-            _kill_process_group(process)
+            _stop_process_group(process)
+            if cancel_at_start:
+                raise ParserVersionProbeError(
+                    "MinerU version probe cancelled by worker shutdown"
+                ) from exc
             raise ParserVersionProbeError(
                 "MinerU version probe timed out after "
                 f"{self._version_timeout_seconds}s: {self._executable}"
             ) from exc
         except BaseException:
-            _kill_process_group(process)
+            _stop_process_group(process)
             raise
         finally:
-            _unregister_process(process)
+            cancelled = _unregister_process(process)
+        if cancelled:
+            raise ParserVersionProbeError(
+                "MinerU version probe cancelled by worker shutdown"
+            )
         if process.returncode != 0:
             raise ParserVersionProbeError(
                 f"MinerU version probe failed: {self._executable}"
@@ -216,43 +359,78 @@ class MinerUProcess:
         if not input_pdf.is_file():
             raise ParserInvocationError(f"parser input PDF is missing: {input_pdf}")
         output_dir.mkdir(parents=True, exist_ok=True)
-        # MinerU 3.4 spawns a local fast_api backend; killing only the direct
-        # child on timeout leaves that orphan resident (observed 1.8GB). Run
-        # the CLI as its own process group and clean up the whole group (08 §2).
+        # MinerU 3.4 may put its temporary fast_api in a separate session.
+        # SIGINT reaches the official CLI cleanup path, which stops that API;
+        # the outer process group is only the bounded fallback for the CLI
+        # and its same-session descendants.
         try:
             process = subprocess.Popen(
                 self.command_for(input_pdf=input_pdf, output_dir=output_dir, options=options),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                env=self._env(),
+                env=self._env(options=options),
                 start_new_session=True,
             )
         except OSError as exc:
-            raise ParserInvocationError(f"MinerU parse failed: {exc}") from exc
-        _register_process(process)
+            raise ParserLocalInvocationError(
+                f"MinerU local process failed to start: {exc}"
+            ) from exc
+        cancel_at_start = _register_process(process)
+        cancelled = False
+        communicate_timeout: float | None = options.timeout_seconds
+        if cancel_at_start:
+            communicate_timeout = min(
+                communicate_timeout or _GRACEFUL_STOP_SECONDS,
+                _GRACEFUL_STOP_SECONDS,
+            )
         try:
-            stdout, stderr = process.communicate(timeout=options.timeout_seconds)
+            stdout, stderr = process.communicate(timeout=communicate_timeout)
         except subprocess.TimeoutExpired as exc:
-            _kill_process_group(process)
+            _stop_process_group(process)
+            if cancel_at_start:
+                raise ParserCancelledError(
+                    "MinerU cancelled by worker shutdown"
+                ) from exc
             raise ParserTimeoutError(
                 f"MinerU timed out after {options.timeout_seconds}s"
             ) from exc
         except BaseException:
-            _kill_process_group(process)
+            _stop_process_group(process)
             raise
         finally:
-            _unregister_process(process)
+            cancelled = _unregister_process(process)
+        if cancelled:
+            raise ParserCancelledError("MinerU cancelled by worker shutdown")
         if process.returncode != 0:
-            detail = f": {stderr.strip()}" if stderr else ""
-            raise ParserInvocationError(f"MinerU parse failed{detail}")
+            raw_detail = "\n".join(
+                part.strip() for part in (stdout, stderr) if part.strip()
+            )
+            detail = f": {raw_detail}" if raw_detail else ""
+            if _TASK_RESULT_TIMEOUT_MARKER in raw_detail:
+                raise ParserTaskDeadlineError(
+                    f"MinerU task deadline exceeded{detail}"
+                )
+            if _contains_any(raw_detail, _BACKEND_OVERLOAD_MARKERS):
+                raise ParserBackendOverloadedError(
+                    f"MinerU backend explicitly rejected capacity{detail}"
+                )
+            if _contains_any(raw_detail, _LOCAL_API_FAILURE_MARKERS):
+                raise ParserLocalInvocationError(
+                    f"MinerU local API failed before task admission{detail}"
+                )
+            # Unknown CLI failures default to the item failure domain. Several
+            # legitimate post-admission failures (status polling, result ZIP
+            # download/extraction) do not include a JSON "task_id" key; using
+            # its presence as an admission oracle would halt unrelated work.
+            raise ParserTaskError(f"MinerU task failed{detail}")
         return MinerUProcessResult(
             output_dir=output_dir,
             stdout=stdout,
             stderr=stderr,
         )
 
-    def _env(self) -> dict[str, str]:
+    def _env(self, *, options: ParserOptions | None = None) -> dict[str, str]:
         env = dict(os.environ)
         # Local Phase 00 validation showed httpx can fail through proxy env
         # unless socks extras are installed. MinerU uses local model cache here.
@@ -261,4 +439,14 @@ class MinerUProcess:
             env.pop(key.lower(), None)
         env["NO_PROXY"] = "*"
         env.update(self._extra_env)
+        if options is not None and options.timeout_seconds is not None:
+            env["MINERU_LOCAL_API_STARTUP_TIMEOUT_SECONDS"] = str(
+                _LOCAL_API_STARTUP_TIMEOUT_SECONDS
+            )
+            env["MINERU_TASK_RESULT_TIMEOUT_SECONDS"] = str(
+                _task_result_timeout_seconds(options.timeout_seconds)
+            )
+            env["MINERU_TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS"] = str(
+                _TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS
+            )
         return env

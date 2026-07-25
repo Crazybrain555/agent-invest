@@ -1,4 +1,4 @@
-"""Remote VLM backend probe in the parser identity contract."""
+"""Remote VLM backend readiness checks."""
 
 from __future__ import annotations
 
@@ -12,50 +12,49 @@ from disclosure_anchor.domain.errors import ParserVersionProbeError
 
 
 class BackendProbeTests(unittest.TestCase):
-    def test_identity_probes_remote_backend_when_configured(self) -> None:
+    def test_identity_is_stable_without_remote_probe(self) -> None:
         process = mock.Mock()
         process.version.return_value = "2.9.9"
         parser = MinerUDocumentParser(
             process=process, server_url="http://gpu:30000"
         )
 
-        identity = parser.identity()
+        first = parser.identity()
+        second = parser.identity()
 
-        self.assertEqual(identity.version, "2.9.9")
-        process.probe_server.assert_called_once_with("http://gpu:30000")
+        self.assertEqual(first, second)
+        self.assertEqual(first.version, "2.9.9")
+        process.version.assert_called_once_with()
+        process.probe_server.assert_not_called()
 
-    def test_unreachable_backend_fails_before_any_document_dequeues(
-        self,
-    ) -> None:
-        # The worker's pre-dequeue identity probe must surface a dead GPU
-        # server as an infrastructure failure instead of letting a batch
-        # burn one parse retry per document.
+    def test_readiness_probes_remote_and_surfaces_failure(self) -> None:
         process = mock.Mock()
         process.version.return_value = "2.9.9"
+        parser = MinerUDocumentParser(
+            process=process, server_url="http://gpu:30000"
+        )
+
+        parser.readiness()
+
+        process.probe_server.assert_called_once_with("http://gpu:30000")
         process.probe_server.side_effect = ParserVersionProbeError(
             "MinerU backend server unreachable: http://gpu:30000"
         )
-        parser = MinerUDocumentParser(
-            process=process, server_url="http://gpu:30000"
-        )
-
         with self.assertRaises(ParserVersionProbeError):
-            parser.identity()
+            parser.readiness()
 
-    def test_identity_skips_probe_without_server_url(self) -> None:
+    def test_readiness_skips_probe_without_server_url(self) -> None:
         process = mock.Mock()
         process.version.return_value = "2.9.9"
         parser = MinerUDocumentParser(process=process)
 
-        parser.identity()
+        parser.readiness()
 
         process.probe_server.assert_not_called()
 
 
 class ProbeSuccessCacheTests(unittest.TestCase):
-    """identity() runs per parsed document under full concurrency; a fresh
-    HTTP probe per document manufactures outage evidence from our own load,
-    so successes are cached briefly and failures never are."""
+    """Repeated readiness checks cache success briefly, never failure."""
 
     def setUp(self) -> None:
         mineru_process._PROBE_SUCCESS_AT.clear()

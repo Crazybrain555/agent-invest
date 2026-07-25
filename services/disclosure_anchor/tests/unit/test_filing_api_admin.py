@@ -33,6 +33,7 @@ from disclosure_anchor.api.schemas.admin import (
     TrackEntryRequest,
 )
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.worker.locks import WorkerBusyError
 from disclosure_anchor.application.use_cases.build_units import BuildUnitsResult
 from disclosure_anchor.application.use_cases.parse_document import ParseDocumentResult
 from disclosure_anchor.application.use_cases.register_local_pdf import RegisterLocalPdfResult
@@ -50,6 +51,7 @@ class _Deps:
         self.register_command = None
         self.parse_document_id: str | None = None
         self.parse_options: ParserOptions | None = None
+        self.parse_error: Exception | None = None
         self.build_document_id: str | None = None
         self.publish_args: tuple[str, bool, str | None] | None = None
         self.track_command = None
@@ -78,6 +80,8 @@ class _Deps:
     def parse_document(self, *, document_id: str, options: ParserOptions):
         self.parse_document_id = document_id
         self.parse_options = options
+        if self.parse_error is not None:
+            raise self.parse_error
         return ParseDocumentResult(
             processing_run_id="run_1",
             status="succeeded",
@@ -185,8 +189,14 @@ class _Deps:
         )
 
 
-def _request(deps: _Deps) -> SimpleNamespace:
-    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(admin_deps=deps)))
+def _request(
+    deps: _Deps, *, settings: Settings | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(admin_deps=deps, settings=settings)
+        )
+    )
 
 
 class FilingApiAdminTests(unittest.TestCase):
@@ -250,6 +260,49 @@ class FilingApiAdminTests(unittest.TestCase):
         self.assertEqual(deps.parse_options.language, "ch")
         self.assertFalse(deps.parse_options.table)
         self.assertEqual(deps.parse_options.timeout_seconds, 30)
+
+    def test_http_backend_override_keeps_shared_request_cap(self) -> None:
+        deps = _Deps()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(
+                disclosure_data_root=root / "service",
+                disclosure_shared_root=root / "shared",
+                disclosure_runtime_root=root / "runtime",
+                mineru_model_cache=root / "mineru",
+                hf_home=root / "hf",
+                modelscope_cache=root / "modelscope",
+                disclosure_mineru_backend="pipeline",
+            )
+
+            parse_document(
+                "doc_1",
+                _request(deps, settings=settings),
+                ParserOptionsRequest(
+                    backend="vlm-http-client",
+                    server_url="http://127.0.0.1:30000",
+                ),
+            )
+
+        self.assertEqual(deps.parse_options.backend, "vlm-http-client")
+        self.assertEqual(
+            deps.parse_options.http_request_concurrency,
+            settings.mineru_http_request_concurrency,
+        )
+        self.assertEqual(deps.parse_options.http_request_concurrency, 100)
+
+    def test_parse_reports_busy_worker_as_conflict(self) -> None:
+        deps = _Deps()
+        deps.parse_error = WorkerBusyError("GPU admission is busy")
+
+        with self.assertRaises(FilingApiError) as raised:
+            parse_document(
+                "doc_1",
+                _request(deps),
+                ParserOptionsRequest(),
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
 
     def test_build_units_response_shape(self) -> None:
         deps = _Deps()

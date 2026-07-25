@@ -11,12 +11,14 @@ from __future__ import annotations
 import threading
 import time
 
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
+from enum import Enum
 import json
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -63,9 +65,6 @@ from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     SyncDisclosureIndexCommand,
 )
 from disclosure_anchor.application.worker import queries
-from disclosure_anchor.application.worker.concurrency import (
-    AdaptiveConcurrencyLimit,
-)
 from disclosure_anchor.application.worker.locks import (  # noqa: F401  (re-export, 08 §2)
     DOC_NS,
     WORKER_NS,
@@ -79,10 +78,31 @@ from disclosure_anchor.domain.errors import (
 )
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+# The dispatcher, rather than a document future, owns the resident-worker
+# heartbeat.  Long documents may legally remain silent for hours, so wake the
+# dispatcher periodically while at least one admitted parse is still inside
+# its page-aware deadline.  Once every deadline expires, stop extending
+# liveness and let the outer wedge watchdog fail the process loudly.
+PARSE_LEGAL_WINDOW_HEARTBEAT_SECONDS = 30.0
+PARSE_LEGAL_WINDOW_GRACE_SECONDS = 60.0
 # Single source in worker/queries.py: the queue's retry-budget predicate and
 # the scheduler's outage detection must agree on what "infrastructure" means.
-PARSER_INFRASTRUCTURE_ERROR_CODES = frozenset(
-    queries.PARSE_INFRASTRUCTURE_ERROR_CODES
+# Only explicit, current global-capacity signals may halt rolling admission.
+# Legacy parser_invocation_failed/parse_timeout rows remain retry-budget
+# compatible in queries.py, but a task-local deadline or generic CLI failure
+# is not evidence that the shared GPU path is unavailable.
+PARSER_CONTROL_ERROR_CODES = frozenset(
+    {
+        "parser_backend_overloaded",
+        "parser_backend_unavailable",
+        "parser_readiness_failed",
+        "parser_local_invocation_failed",
+        "parser_version_probe_failed",
+        "DatabaseError",
+        "InterfaceError",
+        "OSError",
+        "OperationalError",
+    }
 )
 PROVIDER_INFRASTRUCTURE_ERROR_CODES = frozenset(
     {
@@ -141,6 +161,18 @@ class WorkerConfig:
     # Raise with the *-http-client backends: local work is HTTP waiting and
     # the GPU server batches requests; keep small for local CPU backends.
     parse_concurrency: int = 1
+    # Cost-aware bulkheads. Mixed queues reserve most slots for regular PDFs,
+    # while heavy/huge lanes keep nominal shares and borrow idle capacity.
+    parse_heavy_page_threshold: int = 80
+    parse_heavy_saturated_share: int = 4
+    parse_huge_page_threshold: int = 500
+    parse_huge_saturated_share: int = 1
+    parse_candidate_window: int = 200
+    finalize_concurrency: int = 2
+    # A page-aware deadline handles one-page notices and ~1,000-page filings
+    # without making every document inherit the largest possible timeout.
+    parse_timeout_per_page_seconds: int = 12
+    parse_timeout_max_seconds: int = 14400
 
 
 @dataclass(frozen=True)
@@ -163,21 +195,27 @@ class WorkerDeps:
     # Settings-driven parse defaults (backend/server_url cascade) — the CLI
     # builds this from env so GPU offload is a config flip, not a code change.
     parser_options: ParserOptions = ParserOptions()
-    # Loop-lifetime adaptive parse concurrency; None gives each stage call a
-    # fresh limiter opened at the configured bound (fixed-limit behavior).
-    parse_limiter: AdaptiveConcurrencyLimit | None = None
+    # Read-only cost probe injected by the composition root. A failed/unknown
+    # probe never blocks parsing, but enters the resource-conservative heavy
+    # lane with the base timeout rather than masquerading as a cheap notice.
+    page_counter: Callable[[Path], int] | None = None
     # CLI resident mode owns one lazy CNINFO client for the process lifetime,
     # preserving both its token cache and 1-QPS bucket across zero-wait rounds.
     # Tests/other callers retain the legacy per-round close by default.
     source_close_after_round: bool = True
     close_source: Callable[[], None] = lambda: None
-    # Liveness heartbeat, bumped at item granularity (download landed, sync
-    # company done, document chain folded, projection batch committed). The
-    # CLI's wedge watchdog reads it: rounds may legitimately run for hours,
-    # but zero progress beyond the single-document parse timeout means a
-    # wedge (hung DNS, TCC-blocked spawn, pathological query) — fail loudly
-    # and let launchd relaunch instead of holding the round open forever.
+    # Liveness heartbeat, bumped at item granularity and periodically by the
+    # dispatcher while a parse is inside its page-aware legal deadline. The
+    # CLI watchdog may therefore stay shorter than the largest huge-document
+    # timeout; after all admitted deadlines expire, the dispatcher stops
+    # extending liveness so a hung child still fails loudly and launchd can
+    # relaunch it.
     heartbeat: Callable[[], None] = lambda: None
+    # Resident production wiring re-validates the dedicated PostgreSQL
+    # singleton session before every admission boundary and during long
+    # waits. Losing that session must stop active MinerU groups before this
+    # worker can overlap a replacement process.
+    admission_guard: Callable[[], None] = lambda: None
 
 
 def _merge_acquisition_report(
@@ -220,8 +258,9 @@ def run_once(
     # Acquisition (sync -> download) runs beside the parse stage: they share
     # no mutable state except the DB (disjoint documents) — acquisition
     # writes its own sub-report, merged deterministically after join, so the
-    # GPU no longer idles while the provider stages run.  Build/publish stay
-    # sequential after both: they consume this round's parse outputs.
+    # GPU no longer idles while the provider stages run. Newly parsed runs
+    # finalize on a separate bounded pool; the later build/publish stages
+    # drain leftovers from interrupted or older rounds.
     acquisition = WorkerReport(started_at=started_at)
 
     # "Parse stage returned" gates whether the pump starts ANOTHER pass, not
@@ -352,6 +391,11 @@ def run_once(
         target=_acquisition_stages, name="acquire", daemon=True
     )
     acquisition_thread.start()
+    parse_refill_deadline = (
+        time.monotonic() + limits.acquisition_seconds
+        if limits.acquisition_seconds > 0
+        else 0.0
+    )
     try:
         if limits.parse > 0 and not should_stop():
             try:
@@ -361,6 +405,14 @@ def run_once(
                     limit=limits.parse,
                     should_stop=should_stop,
                     keep_feeding=acquisition_thread.is_alive,
+                    keep_refilling=(
+                        (
+                            lambda: time.monotonic()
+                            < parse_refill_deadline
+                        )
+                        if parse_refill_deadline > 0
+                        else None
+                    ),
                 )
             finally:
                 parse_exited.set()
@@ -745,6 +797,7 @@ class _DocOutcome:
     into the shared report happens on the caller's thread only)."""
 
     parsed: bool = False
+    processing_run_id: str | None = None
     built: bool = False
     published: bool = False
     superseded_run: bool = False
@@ -752,16 +805,131 @@ class _DocOutcome:
     failure: WorkerFailure | None = None
 
 
-def _process_one_document(
-    deps: WorkerDeps, document_id: str
+@dataclass(frozen=True)
+class _ParseWorkItem:
+    document_id: str
+    page_count: int | None
+
+
+class _ParseLane(str, Enum):
+    REGULAR = "regular"
+    HEAVY = "heavy"
+    HUGE = "huge"
+
+
+@dataclass(frozen=True)
+class _InFlightParse:
+    item: _ParseWorkItem
+    lane: _ParseLane
+    legal_until_monotonic: float
+
+
+def _parse_work_items(
+    pending: Iterable[dict[str, Any]],
+    *,
+    deps: WorkerDeps,
+    report: WorkerReport,
+) -> list[_ParseWorkItem]:
+    items: list[_ParseWorkItem] = []
+    for row in pending:
+        if bool(row.get("oversized")):
+            report.skipped_oversized += 1
+            continue
+        page_count: int | None = None
+        raw_file_relpath = row.get("raw_file_relpath")
+        if deps.page_counter is not None and isinstance(raw_file_relpath, str):
+            try:
+                probed = deps.page_counter(
+                    deps.path_builder.data_path(Path(raw_file_relpath))
+                )
+            except (OSError, ValueError, RuntimeError):
+                probed = 0
+            if probed > 0:
+                page_count = probed
+        items.append(
+            _ParseWorkItem(
+                document_id=str(row["document_id"]),
+                page_count=page_count,
+            )
+        )
+    return items
+
+
+def _parse_lane(item: _ParseWorkItem, config: WorkerConfig) -> _ParseLane:
+    if item.page_count is None:
+        return _ParseLane.HEAVY
+    if item.page_count >= config.parse_huge_page_threshold:
+        return _ParseLane.HUGE
+    if item.page_count >= config.parse_heavy_page_threshold:
+        return _ParseLane.HEAVY
+    return _ParseLane.REGULAR
+
+
+def _parse_lane_caps(
+    *,
+    ready: tuple[_ParseLane, ...],
+    capacity: int,
+    config: WorkerConfig,
+) -> dict[_ParseLane, int]:
+    """Return work-conserving nominal quotas for the currently ready lanes."""
+
+    if not ready:
+        return {}
+    if len(ready) == 1:
+        return {ready[0]: capacity}
+    caps = {lane: 0 for lane in ready}
+    ordered = tuple(
+        lane
+        for lane in (
+            _ParseLane.REGULAR,
+            _ParseLane.HEAVY,
+            _ParseLane.HUGE,
+        )
+        if lane in caps
+    )
+    # When fewer slots exist than ready lanes, every empty lane stays
+    # eligible and the caller chooses the oldest head item. The global pool
+    # still enforces ``capacity``; this avoids permanent huge-lane starvation
+    # for safe single-document/local configurations.
+    for lane in ordered:
+        caps[lane] = 1
+    remaining = max(0, capacity - len(ordered))
+    for lane, share in (
+        (_ParseLane.HUGE, config.parse_huge_saturated_share),
+        (_ParseLane.HEAVY, config.parse_heavy_saturated_share),
+    ):
+        if lane in caps:
+            extra = min(remaining, max(0, share - caps[lane]))
+            caps[lane] += extra
+            remaining -= extra
+    preferred = next(
+        (lane for lane in ordered if lane == _ParseLane.REGULAR),
+        ordered[0],
+    )
+    caps[preferred] += remaining
+    return caps
+
+
+def _parse_timeout_seconds(deps: WorkerDeps, item: _ParseWorkItem) -> int:
+    page_budget = (
+        0
+        if item.page_count is None
+        else item.page_count * deps.config.parse_timeout_per_page_seconds
+    )
+    return min(
+        deps.config.parse_timeout_max_seconds,
+        max(deps.parse_timeout_seconds, page_budget),
+    )
+
+
+def _parse_one_document(
+    deps: WorkerDeps, item: _ParseWorkItem
 ) -> _DocOutcome:
-    """Run the 05 chain for ONE document. Safe to run concurrently: each call
-    builds its own parser (no shared _version_cache), every DB write is a
-    fresh UoW, and parse-finish/publish already take the doc-level advisory
-    xact lock (worker/locks.py DOC_NS)."""
+    """Parse one whole PDF; downstream build/publish uses a separate pool."""
 
     outcome = _DocOutcome()
-    stage = "parse"
+    document_id = item.document_id
+    timeout_seconds = _parse_timeout_seconds(deps, item)
     try:
         parse_use_case = ParseDocument(
             parser=deps.parser_factory(),
@@ -769,26 +937,70 @@ def _process_one_document(
             raw_store=deps.raw_store,
             artifact_store=deps.artifact_store,
             uow_factory=deps.uow_factory,
-            default_timeout_seconds=deps.parse_timeout_seconds,
+            default_timeout_seconds=timeout_seconds,
+            check_readiness=False,
         )
         parse_result = parse_use_case.execute(
-            ParseDocumentCommand(document_id=document_id, options=deps.parser_options)
+            ParseDocumentCommand(
+                document_id=document_id,
+                options=replace(
+                    deps.parser_options,
+                    timeout_seconds=timeout_seconds,
+                ),
+            )
         )
         if parse_result.status != "succeeded":
             outcome.failure = WorkerFailure(
                 stage="parse",
                 item_ref=document_id,
                 error_code=_error_code(parse_result.error),
+                retryable=(
+                    bool(parse_result.error.get("retryable"))
+                    if isinstance(parse_result.error, dict)
+                    and parse_result.error.get("retryable") is not None
+                    else None
+                ),
+                message=(
+                    str(parse_result.error.get("message"))
+                    if isinstance(parse_result.error, dict)
+                    and parse_result.error.get("message")
+                    else None
+                ),
             )
             return outcome
         outcome.parsed = True
-        stage = "build"
+        outcome.processing_run_id = parse_result.processing_run_id
+    except Exception as exc:
+        structured_error = getattr(exc, "error", None)
+        outcome.failure = WorkerFailure(
+            stage="parse",
+            item_ref=document_id,
+            error_code=(
+                _error_code(structured_error)
+                if isinstance(structured_error, dict)
+                else type(exc).__name__
+            ),
+        )
+    return outcome
+
+
+def _finalize_one_document(
+    deps: WorkerDeps,
+    *,
+    document_id: str,
+    processing_run_id: str,
+) -> _DocOutcome:
+    """Build and publish one parsed run without occupying a GPU slot."""
+
+    outcome = _DocOutcome()
+    stage = "build"
+    try:
         build_result = BuildUnits(
             path_builder=deps.path_builder,
             artifact_store=deps.artifact_store,
             uow_factory=deps.uow_factory,
         ).execute(
-            BuildUnitsCommand(processing_run_id=parse_result.processing_run_id)
+            BuildUnitsCommand(processing_run_id=processing_run_id)
         )
         if build_result.status != "succeeded":
             outcome.failure = WorkerFailure(
@@ -802,7 +1014,7 @@ def _process_one_document(
             outcome.build_stats = dict(build_result.build_stats)
         stage = "publish"
         publish_result = PublishRun(uow_factory=deps.uow_factory).execute(
-            PublishRunCommand(processing_run_id=parse_result.processing_run_id)
+            PublishRunCommand(processing_run_id=processing_run_id)
         )
         if publish_result.status != "published":
             outcome.failure = WorkerFailure(
@@ -873,7 +1085,7 @@ def _halts_parse_refill(
         or (failure.stage == "build" and build_failures_indicate_outage(failures))
         or (
             failure.stage == "parse"
-            and failure.error_code in PARSER_INFRASTRUCTURE_ERROR_CODES
+            and failure.error_code in PARSER_CONTROL_ERROR_CODES
         )
     )
 
@@ -885,28 +1097,32 @@ def _parse_stage(
     limit: int,
     should_stop: Callable[[], bool],
     keep_feeding: Callable[[], bool] = lambda: False,
+    keep_refilling: Callable[[], bool] | None = None,
 ) -> None:
-    """Parse pending documents through the 05 process chain (parse→build→publish).
+    """Parse whole PDFs, then finalize them on a separate bounded pool.
 
-    Per-document chains are independent (doc-level xact locks), so the stage
-    runs them on a bounded pool when parse_concurrency > 1 — the fit for the
-    remote *-http-client backends where each chain is mostly waiting on the
-    GPU server (vllm continuous batching absorbs the parallel requests).
-    Miniflux WORKER_POOL_SIZE / changedetection.io FETCH_WORKERS analog.
+    Parse slots represent GPU-producing documents only. Build/publish releases
+    that slot immediately and runs behind bounded downstream backpressure.
 
     While ``keep_feeding`` holds (the acquisition thread is still syncing/
     downloading), an exhausted batch re-dequeues and keeps the GPU fed —
-    without this the round blocks on the acquisition join with an idle GPU
-    (the observed 15-minute sawtooth valleys).  Fresh downloads landed by
-    the live acquisition thread become parseable within the same round.
+    without this the round can block on the acquisition join while newly
+    downloaded work is already parseable. Fresh downloads landed by the live
+    acquisition thread become parseable within the same round. The 2026-07-24
+    audit found fixed parse-batch turnover itself contributes only ~2 seconds,
+    so it is not treated as the current GPU sawtooth root cause.
     """
 
     while True:
         feeding_before = keep_feeding()
         batch_done = _parse_one_batch(
-            report, deps, limit=limit, should_stop=should_stop
+            report,
+            deps,
+            limit=limit,
+            should_stop=should_stop,
+            keep_refilling=keep_refilling,
         )
-        if batch_done == "halt" or should_stop():
+        if batch_done in {"halt", "closed"} or should_stop():
             return
         if batch_done == "empty":
             if not feeding_before:
@@ -924,6 +1140,11 @@ def _parse_stage(
                     break
                 time.sleep(0.5)
             continue
+        if keep_refilling is None:
+            # Direct/once mode is count-bounded: one dequeue batch may overlap
+            # acquisition, but a still-running acquisition thread must not
+            # silently grant a second full ``limit`` batch.
+            return
         # Batch done. If acquisition was already over before this batch even
         # started, nothing new can have landed since — stop here so rounds
         # stay bounded (the backlog belongs to the next round). A batch that
@@ -939,117 +1160,300 @@ def _parse_one_batch(
     *,
     limit: int,
     should_stop: Callable[[], bool],
+    keep_refilling: Callable[[], bool] | None = None,
 ) -> str:
-    """Run one dequeue-and-parse wave; returns "done" | "empty" | "halt"."""
+    """Run one dequeue-and-parse wave.
 
-    with deps.engine.connect() as conn:
-        pending = queries.pending_parse(
-            conn,
-            max_retries=deps.config.max_parse_retries,
-            limit=limit,
-            scope_classes=deps.config.process_scope_classes,
+    Returns ``done`` | ``empty`` | ``closed`` | ``halt``. ``closed`` is a
+    resident admission boundary, checked before queue I/O/thread-pool setup.
+    """
+
+    if keep_refilling is not None and not keep_refilling():
+        return "closed"
+
+    candidate_limit = max(limit, deps.config.parse_candidate_window)
+    known_ids: set[str] = set()
+
+    def dequeue() -> list[_ParseWorkItem]:
+        with deps.engine.connect() as conn:
+            pending = queries.pending_parse(
+                conn,
+                max_retries=deps.config.max_parse_retries,
+                limit=candidate_limit,
+                scope_classes=deps.config.process_scope_classes,
+            )
+        unseen = (
+            row
+            for row in pending
+            if str(row["document_id"]) not in known_ids
         )
-    document_ids: list[str] = []
-    for row in pending:
-        if bool(row.get("oversized")):
-            report.skipped_oversized += 1
-            continue
-        document_ids.append(str(row["document_id"]))
+        return _parse_work_items(unseen, deps=deps, report=report)
 
-    if not document_ids:
+    def parser_ready() -> bool:
+        try:
+            parser = deps.parser_factory()
+            parser.identity()
+            readiness = getattr(parser, "readiness", None)
+            if callable(readiness):
+                readiness(deps.parser_options)
+            return True
+        except ParserVersionProbeError as exc:
+            report.failed += 1
+            report.failures.append(
+                WorkerFailure(
+                    stage="parse",
+                    item_ref="parser",
+                    error_code="parser_readiness_failed",
+                    retryable=True,
+                    message=str(exc)[:500],
+                )
+            )
+            return False
+
+    rolling_admission = keep_refilling is not None
+
+    def admission_open() -> bool:
+        return bool(keep_refilling is not None and keep_refilling())
+
+    work_items = dequeue()
+    if not work_items:
         return "empty"
 
-    # Parser identity is process/configuration health. Probe once before
-    # dequeuing any item so a missing/broken MinerU binary cannot consume
-    # every document's retry budget in concurrency-sized waves.
-    try:
-        deps.parser_factory().identity()
-    except ParserVersionProbeError:
-        report.failed += 1
-        report.failures.append(
-            WorkerFailure(
-                stage="parse",
-                item_ref="parser",
-                error_code="parser_version_probe_failed",
-                retryable=True,
-            )
-        )
-        return "halt"
-
     concurrency = max(1, deps.config.parse_concurrency)
-    if concurrency == 1:
-        for document_id in document_ids:
-            if should_stop():
-                return "halt"
-            outcome = _process_one_document(deps, document_id)
-            _fold_outcome(report, outcome)
-            deps.heartbeat()
-            if _halts_parse_refill(outcome, report.failures):
-                return "halt"
-        return "done"
-    limiter = deps.parse_limiter or AdaptiveConcurrencyLimit(
-        max_limit=concurrency
-    )
-    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="parse") as pool:
-        pending_ids = iter(document_ids)
-        in_flight: dict[Future[_DocOutcome], str] = {}
+    queued = {lane: deque[_ParseWorkItem]() for lane in _ParseLane}
+    input_order: dict[str, int] = {}
+    sequence = 0
+
+    def enqueue(items: Iterable[_ParseWorkItem]) -> None:
+        nonlocal sequence
+        for item in items:
+            if item.document_id in known_ids:
+                continue
+            known_ids.add(item.document_id)
+            input_order[item.document_id] = sequence
+            sequence += 1
+            queued[_parse_lane(item, deps.config)].append(item)
+
+    enqueue(work_items)
+    finalize_backlog_limit = max(2, concurrency * 2)
+    halt_refill = False
+    dispatched = 0
+    report.parse_concurrency_limit = concurrency
+    with (
+        ThreadPoolExecutor(
+            max_workers=concurrency,
+            thread_name_prefix="parse",
+        ) as parse_pool,
+        ThreadPoolExecutor(
+            max_workers=deps.config.finalize_concurrency,
+            thread_name_prefix="finalize",
+        ) as finalize_pool,
+    ):
+        parse_futures: dict[Future[_DocOutcome], _InFlightParse] = {}
+        finalize_futures: dict[Future[_DocOutcome], str] = {}
+        lane_inflight = {lane: 0 for lane in _ParseLane}
+
+        def long_lane_inflight() -> bool:
+            return any(
+                lane_inflight[lane] > 0
+                for lane in (_ParseLane.HEAVY, _ParseLane.HUGE)
+            )
+
+        def rolling_admission_allowed() -> bool:
+            return admission_open() or long_lane_inflight()
 
         def submit_one() -> bool:
+            nonlocal dispatched, halt_refill
             if should_stop():
                 return False
-            try:
-                document_id = next(pending_ids)
-            except StopIteration:
+            # Direct/once mode has a count bound. Resident rolling mode has a
+            # time bound instead: the instant that admission window closes,
+            # queued candidates remain for the next round even when fewer
+            # than ``limit`` documents were admitted.
+            window_open = admission_open() if rolling_admission else False
+            if rolling_admission:
+                if not window_open and not long_lane_inflight():
+                    return False
+            elif dispatched >= limit:
                 return False
-            in_flight[pool.submit(_process_one_document, deps, document_id)] = document_id
+            # After the reporting/acquisition window closes, do not admit a
+            # new long tail. While an already-admitted heavy/huge document is
+            # still running, regular PDFs may fill its otherwise idle sibling
+            # slots. Once the last long lane drains, regular fillers already
+            # in flight finish and the round closes.
+            allowed_lanes = (
+                tuple(_ParseLane)
+                if not rolling_admission or window_open
+                else (_ParseLane.REGULAR,)
+            )
+            ready = tuple(
+                lane for lane in allowed_lanes if queued[lane]
+            )
+            if (
+                not ready
+                and rolling_admission
+                and (window_open or long_lane_inflight())
+            ):
+                new_items = dequeue()
+                enqueue(new_items)
+                ready = tuple(
+                    lane for lane in allowed_lanes if queued[lane]
+                )
+            occupied_elsewhere = sum(
+                lane_inflight[lane]
+                for lane in _ParseLane
+                if lane not in ready
+            )
+            caps = _parse_lane_caps(
+                ready=ready,
+                capacity=max(0, concurrency - occupied_elsewhere),
+                config=deps.config,
+            )
+            eligible = tuple(
+                lane
+                for lane in ready
+                if lane_inflight[lane] < caps.get(lane, 0)
+            )
+            if not eligible:
+                return False
+            lane = min(
+                eligible,
+                key=lambda candidate: input_order[
+                    queued[candidate][0].document_id
+                ],
+            )
+            item = queued[lane].popleft()
+            legal_until = (
+                time.monotonic()
+                + _parse_timeout_seconds(deps, item)
+                + PARSE_LEGAL_WINDOW_GRACE_SECONDS
+            )
+            parse_futures[
+                parse_pool.submit(_parse_one_document, deps, item)
+            ] = (
+                _InFlightParse(
+                    item=item,
+                    lane=lane,
+                    legal_until_monotonic=legal_until,
+                )
+            )
+            lane_inflight[lane] += 1
+            dispatched += 1
+            if item.page_count is None:
+                report.parse_unknown_page_count += 1
+            if lane == _ParseLane.HUGE:
+                report.parse_huge_dispatched += 1
+            elif lane == _ParseLane.HEAVY:
+                report.parse_heavy_dispatched += 1
+            else:
+                report.parse_regular_dispatched += 1
+            report.parse_peak_inflight = max(
+                report.parse_peak_inflight, len(parse_futures)
+            )
             return True
 
         def refill() -> None:
-            while len(in_flight) < limiter.current and submit_one():
+            nonlocal halt_refill
+            if (
+                halt_refill
+                or should_stop()
+                or (
+                    rolling_admission
+                    and not rolling_admission_allowed()
+                )
+                or (
+                    not rolling_admission
+                    and dispatched >= limit
+                )
+            ):
+                return
+            # One coordinator owns admission health. MinerU caches successful
+            # remote probes for 60 seconds, so this is cheap, but every refill
+            # boundary still fails closed before another document starts.
+            deps.admission_guard()
+            if not parser_ready():
+                halt_refill = True
+                return
+            while (
+                not halt_refill
+                and len(parse_futures) < concurrency
+                and len(parse_futures) + len(finalize_futures)
+                < finalize_backlog_limit
+                and submit_one()
+            ):
                 pass
 
         refill()
-        halt_refill = False
-        while in_flight:
-            completed, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
-            for future in completed:
-                document_id = in_flight.pop(future)
+        while parse_futures or finalize_futures:
+            futures = tuple((*parse_futures, *finalize_futures))
+            completed, _ = wait(
+                futures,
+                timeout=PARSE_LEGAL_WINDOW_HEARTBEAT_SECONDS,
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                deps.admission_guard()
+                now = time.monotonic()
+                if any(
+                    admitted.legal_until_monotonic > now
+                    for admitted in parse_futures.values()
+                ):
+                    deps.heartbeat()
+                continue
+
+            for future in completed & parse_futures.keys():
+                admitted = parse_futures.pop(future)
+                lane_inflight[admitted.lane] -= 1
                 try:
                     outcome = future.result()
                 except Exception as exc:  # defensive boundary around a worker future
                     outcome = _DocOutcome(
                         failure=WorkerFailure(
                             stage="parse",
+                            item_ref=admitted.item.document_id,
+                            error_code=type(exc).__name__,
+                        )
+                    )
+                _fold_outcome(report, outcome)
+                deps.heartbeat()
+                if (
+                    outcome.parsed
+                    and outcome.processing_run_id is not None
+                ):
+                    finalize_futures[
+                        finalize_pool.submit(
+                            _finalize_one_document,
+                            deps,
+                            document_id=admitted.item.document_id,
+                            processing_run_id=outcome.processing_run_id,
+                        )
+                    ] = admitted.item.document_id
+                halt_refill = halt_refill or _halts_parse_refill(
+                    outcome, report.failures
+                )
+
+            for future in completed & finalize_futures.keys():
+                document_id = finalize_futures.pop(future)
+                try:
+                    outcome = future.result()
+                except Exception as exc:
+                    outcome = _DocOutcome(
+                        failure=WorkerFailure(
+                            stage="build",
                             item_ref=document_id,
                             error_code=type(exc).__name__,
                         )
                     )
                 _fold_outcome(report, outcome)
                 deps.heartbeat()
-                failure = outcome.failure
-                if (
-                    failure is not None
-                    and failure.stage == "parse"
-                    and failure.error_code in PARSER_INFRASTRUCTURE_ERROR_CODES
-                ):
-                    # An infrastructure drop is backpressure first: shrink
-                    # and keep dispatching at the reduced rate.  Only a
-                    # drop while already at the floor reads as a dead
-                    # backend and stops the refill.
-                    if limiter.current <= limiter.min_limit:
-                        halt_refill = True
-                    limiter.on_drop()
-                else:
-                    if failure is None:
-                        limiter.on_success(inflight=len(in_flight) + 1)
-                    halt_refill = halt_refill or _halts_parse_refill(
-                        outcome, report.failures
-                    )
-            report.parse_concurrency_limit = limiter.current
+                halt_refill = halt_refill or _halts_parse_refill(
+                    outcome, report.failures
+                )
+
             if should_stop():
-                for future in in_flight:
+                halt_refill = True
+                for future in (*parse_futures, *finalize_futures):
                     future.cancel()
-                continue
             if not halt_refill:
                 refill()
     return "halt" if halt_refill else "done"
@@ -1217,6 +1621,11 @@ def render_report_section(report: WorkerReport) -> str:
         f"- sync_quota_break: {report.sync_quota_break}",
         f"- sync_rate_limited: {report.sync_rate_limited}",
         f"- parse_concurrency_limit: {report.parse_concurrency_limit}",
+        f"- parse_peak_inflight: {report.parse_peak_inflight}",
+        f"- parse_regular_dispatched: {report.parse_regular_dispatched}",
+        f"- parse_heavy_dispatched: {report.parse_heavy_dispatched}",
+        f"- parse_huge_dispatched: {report.parse_huge_dispatched}",
+        f"- parse_unknown_page_count: {report.parse_unknown_page_count}",
         f"- source_outage_break: {report.source_outage_break}",
     ]
     if report.failures:

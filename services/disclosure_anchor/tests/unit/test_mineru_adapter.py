@@ -23,7 +23,12 @@ from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation 
     TableReconciliationContractError,
 )
 from disclosure_anchor.domain.errors import (
+    ParserBackendOverloadedError,
+    ParserCancelledError,
+    ParserLocalInvocationError,
     ParserOutputContractError,
+    ParserTaskDeadlineError,
+    ParserTaskError,
     ParserVersionProbeError,
 )
 
@@ -41,12 +46,19 @@ def _parser_info() -> MinerUParserInfo:
 
 
 class MinerUProcessTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        mineru_process._MINERU_SHUTDOWN_REQUESTED.clear()
+
     def test_command_includes_stable_phase04_options(self) -> None:
         process = MinerUProcess(executable=Path("/opt/mineru/bin/mineru"))
         command = process.command_for(
             input_pdf=Path("input.pdf"),
             output_dir=Path("out"),
-            options=ParserOptions(start_page=0, end_page=2),
+            options=ParserOptions(
+                start_page=0,
+                end_page=2,
+                http_request_concurrency=3,
+            ),
         )
         self.assertEqual(command[:5], ["/opt/mineru/bin/mineru", "-p", "input.pdf", "-o", "out"])
         self.assertIn("-m", command)
@@ -62,6 +74,7 @@ class MinerUProcessTests(unittest.TestCase):
         self.assertIn("-e", command)
         self.assertIn("2", command)
         self.assertNotIn("-u", command)
+        self.assertNotIn("--max-concurrency", command)
 
     def test_command_appends_server_url_for_http_client_backend(self) -> None:
         process = MinerUProcess(executable=Path("/opt/mineru/bin/mineru"))
@@ -69,12 +82,128 @@ class MinerUProcessTests(unittest.TestCase):
             input_pdf=Path("input.pdf"),
             output_dir=Path("out"),
             options=ParserOptions(
-                backend="vlm-http-client", server_url="http://192.168.1.50:30000"
+                backend="vlm-http-client",
+                server_url="http://192.168.1.50:30000",
+                http_request_concurrency=3,
             ),
         )
         self.assertIn("vlm-http-client", command)
         url_index = command.index("-u")
         self.assertEqual(command[url_index + 1], "http://192.168.1.50:30000")
+        concurrency_index = command.index("--max-concurrency")
+        self.assertEqual(command[concurrency_index + 1], "3")
+
+    def test_run_aligns_inner_deadline_and_classifies_process_failures(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_pdf = root / "input.pdf"
+            input_pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+            options = ParserOptions(timeout_seconds=3600)
+            runner = MinerUProcess(
+                executable=Path("mineru"),
+                extra_env={"MINERU_TASK_RESULT_TIMEOUT_SECONDS": "999"},
+            )
+            self.assertEqual(
+                mineru_process._task_result_timeout_seconds(600),
+                450,
+            )
+            self.assertEqual(
+                mineru_process._task_result_timeout_seconds(900),
+                675,
+            )
+            self.assertEqual(
+                mineru_process._task_result_timeout_seconds(901),
+                676,
+            )
+
+            succeeded = mock.Mock(pid=101, returncode=0)
+            succeeded.communicate.return_value = ("ok", "")
+            with mock.patch.object(
+                mineru_process.subprocess,
+                "Popen",
+                return_value=succeeded,
+            ) as popen:
+                runner.run(
+                    input_pdf=input_pdf,
+                    output_dir=root / "success",
+                    options=options,
+                )
+            self.assertEqual(
+                popen.call_args.kwargs["env"][
+                    "MINERU_TASK_RESULT_TIMEOUT_SECONDS"
+                ],
+                "2700",
+            )
+            self.assertEqual(
+                popen.call_args.kwargs["env"][
+                    "MINERU_LOCAL_API_STARTUP_TIMEOUT_SECONDS"
+                ],
+                "120",
+            )
+            self.assertEqual(
+                popen.call_args.kwargs["env"][
+                    "MINERU_TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS"
+                ],
+                "120",
+            )
+
+            with mock.patch.object(
+                mineru_process.subprocess,
+                "Popen",
+                side_effect=OSError("not executable"),
+            ):
+                with self.assertRaises(ParserLocalInvocationError):
+                    runner.run(
+                        input_pdf=input_pdf,
+                        output_dir=root / "spawn-error",
+                        options=options,
+                    )
+
+            failures = (
+                (
+                    "Error: Timed out waiting for result of task task-1 for input.pdf",
+                    ParserTaskDeadlineError,
+                ),
+                (
+                    '{"task_id":"task-2","status":"failed","error":""}',
+                    ParserTaskError,
+                ),
+                (
+                    '{"task_id":"task-3","status":"failed",'
+                    '"error":"HTTP 429 Too Many Requests"}',
+                    ParserBackendOverloadedError,
+                ),
+                (
+                    "Unexpected status code: [429], response body: busy",
+                    ParserBackendOverloadedError,
+                ),
+                (
+                    "Local mineru-api exited before becoming healthy.",
+                    ParserLocalInvocationError,
+                ),
+                (
+                    "Timed out downloading result ZIP for task task-4",
+                    ParserTaskError,
+                ),
+            )
+            for stderr, expected_error in failures:
+                with self.subTest(expected_error=expected_error.__name__):
+                    failed = mock.Mock(pid=102, returncode=1)
+                    failed.communicate.return_value = ("", stderr)
+                    with mock.patch.object(
+                        mineru_process.subprocess,
+                        "Popen",
+                        return_value=failed,
+                    ):
+                        with self.assertRaises(expected_error) as caught:
+                            runner.run(
+                                input_pdf=input_pdf,
+                                output_dir=root / expected_error.__name__,
+                                options=options,
+                            )
+                    self.assertIs(type(caught.exception), expected_error)
 
     def test_shutdown_kills_every_registered_process_group(self) -> None:
         process = mock.MagicMock(pid=43210)
@@ -82,14 +211,53 @@ class MinerUProcessTests(unittest.TestCase):
         mineru_process._register_process(process)
         try:
             with mock.patch.object(mineru_process.os, "killpg") as killpg:
-                terminated = mineru_process.terminate_active_mineru_processes()
+                terminated = mineru_process.terminate_active_mineru_processes(
+                    grace_seconds=0
+                )
         finally:
             mineru_process._unregister_process(process)
 
         self.assertEqual(terminated, 1)
-        killpg.assert_called_once_with(43210, mineru_process.signal.SIGKILL)
+        self.assertEqual(
+            killpg.call_args_list,
+            [
+                mock.call(43210, mineru_process.signal.SIGINT),
+                mock.call(43210, mineru_process.signal.SIGKILL),
+            ],
+        )
 
-    def test_version_probe_timeout_kills_registered_process_group(self) -> None:
+    def test_worker_shutdown_is_not_classified_as_task_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_pdf = root / "input.pdf"
+            input_pdf.write_bytes(b"%PDF")
+            process = mock.MagicMock(pid=43211, returncode=-9)
+            process.poll.return_value = None
+
+            def cancel_during_wait(*, timeout):  # noqa: ANN001
+                del timeout
+                mineru_process.terminate_active_mineru_processes(
+                    grace_seconds=0
+                )
+                return "", ""
+
+            process.communicate.side_effect = cancel_during_wait
+            with (
+                mock.patch.object(
+                    mineru_process.subprocess,
+                    "Popen",
+                    return_value=process,
+                ),
+                mock.patch.object(mineru_process.os, "killpg"),
+            ):
+                with self.assertRaises(ParserCancelledError):
+                    MinerUProcess(executable=Path("mineru")).run(
+                        input_pdf=input_pdf,
+                        output_dir=root / "out",
+                        options=ParserOptions(timeout_seconds=60),
+                    )
+
+    def test_version_probe_timeout_uses_graceful_cleanup(self) -> None:
         process = mock.MagicMock(pid=54321, returncode=None)
         process.communicate.side_effect = subprocess.TimeoutExpired(
             cmd=["mineru", "-v"], timeout=0.01
@@ -104,9 +272,24 @@ class MinerUProcessTests(unittest.TestCase):
             with self.assertRaises(ParserVersionProbeError):
                 probe.version()
 
-        killpg.assert_called_once_with(54321, mineru_process.signal.SIGKILL)
-        process.wait.assert_called_once_with()
+        killpg.assert_called_once_with(54321, mineru_process.signal.SIGINT)
+        process.wait.assert_called_once_with(
+            timeout=mineru_process._GRACEFUL_STOP_SECONDS
+        )
         self.assertNotIn(process, mineru_process._ACTIVE_PROCESSES)
+
+    def test_late_process_registration_is_cancelled_immediately(self) -> None:
+        mineru_process._MINERU_SHUTDOWN_REQUESTED.set()
+        process = mock.MagicMock(pid=54322)
+
+        with mock.patch.object(mineru_process.os, "killpg") as killpg:
+            cancelled = mineru_process._register_process(process)
+        try:
+            self.assertTrue(cancelled)
+            killpg.assert_called_once_with(54322, mineru_process.signal.SIGINT)
+            self.assertIn(process, mineru_process._CANCELLED_PROCESSES)
+        finally:
+            mineru_process._unregister_process(process)
 
 
 class MinerUArtifactReaderTests(unittest.TestCase):
@@ -1060,8 +1243,11 @@ class MinerUDocumentParserTests(unittest.TestCase):
         self.assertIn("locator_table_grid", str(caught.exception))
         self.assertIn("root grid missing", str(caught.exception))
 
-    def test_version_probe_failure_fails_closed(self) -> None:
-        class VersionFailingProcess:
+    def test_successful_parse_does_not_probe_remote_readiness(self) -> None:
+        class SuccessfulProcess:
+            def __init__(self) -> None:
+                self.probe_calls = 0
+
             def run(self, *, input_pdf: Path, output_dir: Path, options: ParserOptions):
                 nested = output_dir / "sample" / "auto"
                 nested.mkdir(parents=True)
@@ -1071,25 +1257,39 @@ class MinerUDocumentParserTests(unittest.TestCase):
                 )
 
             def version(self) -> str:
-                raise ParserVersionProbeError("version failed")
+                return "3.4.0"
+
+            def probe_server(self, server_url: str) -> None:
+                self.probe_calls += 1
+                raise ParserVersionProbeError(
+                    f"backend unavailable: {server_url}"
+                )
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_pdf = root / "input.pdf"
             input_pdf.write_bytes(b"%PDF-1.4\nsample\n%%EOF\n")
-            parser = MinerUDocumentParser(process=VersionFailingProcess())
+            process = SuccessfulProcess()
+            parser = MinerUDocumentParser(
+                process=process,
+                server_url="http://gpu:30000",
+            )
+            result = parser.parse(
+                input_pdf=input_pdf,
+                output_dir=root / "out",
+                options=ParserOptions(),
+                document_metadata={
+                    "document_id": "doc_01K0000000000000000000000",
+                    "source_pdf": "raw_documents/local/sample.pdf",
+                    "title": "sample",
+                },
+            )
 
+            self.assertEqual(result.parser_version, "3.4.0")
+            self.assertEqual(process.probe_calls, 0)
             with self.assertRaises(ParserVersionProbeError):
-                parser.parse(
-                    input_pdf=input_pdf,
-                    output_dir=root / "out",
-                    options=ParserOptions(),
-                    document_metadata={
-                        "document_id": "doc_01K0000000000000000000000",
-                        "source_pdf": "raw_documents/local/sample.pdf",
-                        "title": "sample",
-                    },
-                )
+                parser.readiness()
+            self.assertEqual(process.probe_calls, 1)
 
 
 if __name__ == "__main__":
