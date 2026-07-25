@@ -425,6 +425,13 @@ find "${TMPDIR%/}" -maxdepth 1 -type d \
 
 ## 6. 证明边界
 
+- 23:59 的首次 live-DB 全套暴露了一个验证隔离缺口：
+  `test_stale_reclaim_fails_only_over_threshold_runs` 在共享库提交了全局 stale-reclaim
+  UPDATE，将 22:48 启动的合法超长 run
+  `run_01KYCW01A2A5AM5RTWC3R3T9BZ` 于 71 分钟时标为
+  `stale_reclaimed`，而其旧 MinerU 子进程仍继续运行。该 run 没有发布产物，错误可重试，
+  对应 document 已回到 pending parse；这不是切片或语义损坏。测试现改为显式
+  rollback-only 事务，断言后强制 rollback/close，复跑未新增 stale row。
 - baseline 是旧 live commit，不是候选 A/B；
 - backlog 是单点，不能重建此前每分钟队列长度；
 - 500+ 页失败率按 attempt，不能冒充 unique-document 失败率；

@@ -1736,7 +1736,12 @@ class OpsQueueViewTests(unittest.TestCase):
             conn.close()
 
     def test_stale_reclaim_fails_only_over_threshold_runs(self) -> None:
-        with self.engine.begin() as conn:
+        # reclaim_stale_runs is intentionally a global recovery UPDATE.
+        # Exercise it in a rollback-only transaction so a shared live-DB test
+        # can never persistently reclaim a legitimate production long run.
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
             document_id = self._insert_document(conn, status="parsed")
             old_run = self._insert_run(
                 conn,
@@ -1755,10 +1760,6 @@ class OpsQueueViewTests(unittest.TestCase):
                     {"ids": [old_run, fresh_run]},
                 ).all()
             )
-        self.assertGreaterEqual(reclaimed, 1)
-        self.assertEqual(rows[old_run], "failed")
-        self.assertEqual(rows[fresh_run], "running")
-        with self.engine.connect() as conn:
             error = conn.execute(
                 text(
                     "SELECT error FROM disclosure_core.processing_run "
@@ -1766,6 +1767,12 @@ class OpsQueueViewTests(unittest.TestCase):
                 ),
                 {"id": old_run},
             ).scalar_one()
+        finally:
+            txn.rollback()
+            conn.close()
+        self.assertGreaterEqual(reclaimed, 1)
+        self.assertEqual(rows[old_run], "failed")
+        self.assertEqual(rows[fresh_run], "running")
         self.assertEqual(error["error_code"], "stale_reclaimed")
         self.assertTrue(error["retryable"])
 
