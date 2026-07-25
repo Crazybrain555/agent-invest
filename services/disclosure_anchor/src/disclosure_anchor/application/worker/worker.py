@@ -8,6 +8,7 @@ round continues.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -77,6 +78,7 @@ from disclosure_anchor.domain.errors import (
     ParserVersionProbeError,
 )
 
+LOGGER = logging.getLogger(__name__)
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 # The dispatcher, rather than a document future, owns the resident-worker
 # heartbeat.  Long documents may legally remain silent for hours, so wake the
@@ -85,6 +87,11 @@ SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 # liveness and let the outer wedge watchdog fail the process loudly.
 PARSE_LEGAL_WINDOW_HEARTBEAT_SECONDS = 30.0
 PARSE_LEGAL_WINDOW_GRACE_SECONDS = 60.0
+# A readiness probe is an admission gate, not a liveness verdict. One remote
+# connect timeout is common even while the backend is serving requests; only
+# consecutive failures should end the parse round and enter cooldown.
+PARSER_READINESS_FAILURE_THRESHOLD = 3
+PARSER_READINESS_RETRY_SECONDS = 5.0
 # Single source in worker/queries.py: the queue's retry-budget predicate and
 # the scheduler's outage detection must agree on what "infrastructure" means.
 # Only explicit, current global-capacity signals may halt rolling admission.
@@ -1189,26 +1196,49 @@ def _parse_one_batch(
         )
         return _parse_work_items(unseen, deps=deps, report=report)
 
+    readiness_failures = 0
+    readiness_retry_at = 0.0
+    readiness_deferred = False
+
     def parser_ready() -> bool:
+        nonlocal readiness_failures, readiness_retry_at
         try:
             parser = deps.parser_factory()
             parser.identity()
             readiness = getattr(parser, "readiness", None)
             if callable(readiness):
                 readiness(deps.parser_options)
-            return True
         except ParserVersionProbeError as exc:
-            report.failed += 1
-            report.failures.append(
-                WorkerFailure(
-                    stage="parse",
-                    item_ref="parser",
-                    error_code="parser_readiness_failed",
-                    retryable=True,
-                    message=str(exc)[:500],
-                )
+            readiness_failures += 1
+            readiness_retry_at = (
+                time.monotonic() + PARSER_READINESS_RETRY_SECONDS
             )
+            LOGGER.warning(
+                "MinerU readiness probe failed (%s/%s); admission paused: %s",
+                readiness_failures,
+                PARSER_READINESS_FAILURE_THRESHOLD,
+                exc,
+            )
+            if readiness_failures >= PARSER_READINESS_FAILURE_THRESHOLD:
+                report.failed += 1
+                report.failures.append(
+                    WorkerFailure(
+                        stage="parse",
+                        item_ref="parser",
+                        error_code="parser_readiness_failed",
+                        retryable=True,
+                        message=str(exc)[:500],
+                    )
+                )
             return False
+        if readiness_failures:
+            LOGGER.info(
+                "MinerU readiness recovered after %s consecutive failure(s)",
+                readiness_failures,
+            )
+        readiness_failures = 0
+        readiness_retry_at = 0.0
+        return True
 
     rolling_admission = keep_refilling is not None
 
@@ -1252,6 +1282,11 @@ def _parse_one_batch(
         parse_futures: dict[Future[_DocOutcome], _InFlightParse] = {}
         finalize_futures: dict[Future[_DocOutcome], str] = {}
         lane_inflight = {lane: 0 for lane in _ParseLane}
+
+        def halt_admission() -> None:
+            nonlocal halt_refill, readiness_deferred
+            halt_refill = True
+            readiness_deferred = False
 
         def long_lane_inflight() -> bool:
             return any(
@@ -1353,7 +1388,7 @@ def _parse_one_batch(
             return True
 
         def refill() -> None:
-            nonlocal halt_refill
+            nonlocal readiness_deferred
             if (
                 halt_refill
                 or should_stop()
@@ -1366,14 +1401,29 @@ def _parse_one_batch(
                     and dispatched >= limit
                 )
             ):
+                # A deferred probe is meaningful only while admission can
+                # still resume. Closing the window or halting must not leave
+                # a zero-time wait state behind.
+                readiness_deferred = False
+                return
+            if (
+                readiness_deferred
+                and time.monotonic() < readiness_retry_at
+            ):
                 return
             # One coordinator owns admission health. MinerU caches successful
             # remote probes for 60 seconds, so this is cheap, but every refill
             # boundary still fails closed before another document starts.
+            # A transient failure pauses admission in this dispatcher; it does
+            # not end the round unless the consecutive-failure threshold trips.
             deps.admission_guard()
             if not parser_ready():
-                halt_refill = True
+                if readiness_failures >= PARSER_READINESS_FAILURE_THRESHOLD:
+                    halt_admission()
+                else:
+                    readiness_deferred = True
                 return
+            readiness_deferred = False
             while (
                 not halt_refill
                 and len(parse_futures) < concurrency
@@ -1384,16 +1434,41 @@ def _parse_one_batch(
                 pass
 
         refill()
-        while parse_futures or finalize_futures:
+        while parse_futures or finalize_futures or readiness_deferred:
+            if readiness_deferred and not parse_futures and not finalize_futures:
+                if should_stop():
+                    halt_admission()
+                    break
+                if (
+                    rolling_admission
+                    and not rolling_admission_allowed()
+                ):
+                    readiness_deferred = False
+                    break
+                remaining = max(0.0, readiness_retry_at - time.monotonic())
+                if remaining > 0:
+                    time.sleep(min(0.5, remaining))
+                    continue
+                refill()
+                continue
+
             futures = tuple((*parse_futures, *finalize_futures))
+            wait_timeout = PARSE_LEGAL_WINDOW_HEARTBEAT_SECONDS
+            if readiness_deferred:
+                wait_timeout = min(
+                    wait_timeout,
+                    max(0.0, readiness_retry_at - time.monotonic()),
+                )
             completed, _ = wait(
                 futures,
-                timeout=PARSE_LEGAL_WINDOW_HEARTBEAT_SECONDS,
+                timeout=wait_timeout,
                 return_when=FIRST_COMPLETED,
             )
             if not completed:
                 deps.admission_guard()
                 now = time.monotonic()
+                if readiness_deferred and now >= readiness_retry_at:
+                    refill()
                 if any(
                     admitted.legal_until_monotonic > now
                     for admitted in parse_futures.values()
@@ -1428,9 +1503,8 @@ def _parse_one_batch(
                             processing_run_id=outcome.processing_run_id,
                         )
                     ] = admitted.item.document_id
-                halt_refill = halt_refill or _halts_parse_refill(
-                    outcome, report.failures
-                )
+                if _halts_parse_refill(outcome, report.failures):
+                    halt_admission()
 
             for future in completed & finalize_futures.keys():
                 document_id = finalize_futures.pop(future)
@@ -1446,12 +1520,11 @@ def _parse_one_batch(
                     )
                 _fold_outcome(report, outcome)
                 deps.heartbeat()
-                halt_refill = halt_refill or _halts_parse_refill(
-                    outcome, report.failures
-                )
+                if _halts_parse_refill(outcome, report.failures):
+                    halt_admission()
 
             if should_stop():
-                halt_refill = True
+                halt_admission()
                 for future in (*parse_futures, *finalize_futures):
                     future.cancel()
             if not halt_refill:

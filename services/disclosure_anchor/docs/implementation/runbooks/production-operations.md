@@ -20,17 +20,22 @@ launchd job 丢失时重装：`make install-ops-launchd`（postgres+doctor）、
 
 ### 1.1 首次从旧 worker 切换到当前 plist
 
-这条路径只用于旧 job 的 `ExitTimeOut` 仍小于 90 秒、且旧代码还不认识
+这条路径只用于旧 job 的有效 `ExitTimeOut` 仍小于 60 秒、且旧代码还不认识
 `parser_cancelled` 的首次切换。此时禁止 `kickstart -k` 或让安装脚本自动 bootout；
 否则 launchd 会在 5 秒后强杀长文档，既可能留下 MinerU 临时 API，也会消耗业务重试。
 
-1. 先通过本分支全部发布门，再禁止 KeepAlive 重拉起，但不终止当前进程：
+1. 先通过本分支全部发布门，再写入 disabled 标记，但不终止当前进程：
 
    ```bash
    WORKER_DOMAIN="gui/$(id -u)"
    WORKER_LABEL="com.agentinvest.disclosure-worker"
    launchctl disable "$WORKER_DOMAIN/$WORKER_LABEL"
    ```
+
+   这只是安装前置状态，不是互斥保证。2026-07-25 首次切换实测：一个已经 loaded
+   的 KeepAlive job 仍可在 Python 子进程退出后、`bootout` 前立即重拉 wrapper。
+   因此不得在下文安全零点先单独终止 Python；真正阻止重拉的是对 loaded job 的
+   `bootout`。
 
 2. 等旧波次自然排空。三个条件必须同时为零：
 
@@ -42,8 +47,7 @@ launchd job 丢失时重装：`make install-ops-launchd`（postgres+doctor）、
 3. 零点可能很短。`launchctl` 显示的是 zsh wrapper PID，不能停它（Python 子进程会继续
    补槽）；必须解析且只接受它唯一的直接 `disclosure_anchor.cli.worker loop` 子进程。
    对 **Python PID** 先 `SIGSTOP` 冻结，再重复核对上述三个条件；若任一非零，
-   `SIGCONT` 后继续等。三者仍为零时，把 SIGTERM 置为 pending 后恢复 Python，让它正常
-   退出：
+   `SIGCONT` 后继续等。三者仍为零时，保持 Python 为 STOP 并直接移除整个 loaded job：
 
    ```bash
    WRAPPER_PID="$(launchctl print "$WORKER_DOMAIN/$WORKER_LABEL" |
@@ -55,19 +59,27 @@ launchd job 丢失时重装：`make install-ops-launchd`（postgres+doctor）、
    esac
    kill -STOP "$PYTHON_PID"
    # 在进程保持 STOP 时重新核对 PG、MinerU/API、vLLM 三个零条件。
-   kill -TERM "$PYTHON_PID"
-   kill -CONT "$PYTHON_PID"
-   while kill -0 "$PYTHON_PID" 2>/dev/null; do sleep 1; done
+   # 任一非零：kill -CONT "$PYTHON_PID"，继续等待；不得 bootout。
+   #
+   # 三项仍为零：保持 Python 为 STOP，直接移除整个 loaded job。不要先
+   # TERM/CONT Python；否则旧 KeepAlive 可在 bootout 前重拉一轮新任务。
    launchctl bootout "$WORKER_DOMAIN/$WORKER_LABEL"
+   while launchctl print "$WORKER_DOMAIN/$WORKER_LABEL" >/dev/null 2>&1; do
+     sleep 1
+   done
+   # 再确认 wrapper/Python/MinerU/API 均不存在，且 PG/vLLM 仍为零。
    ./scripts/install_launchd.sh
    ```
 
-4. 确认新 loaded plist 的 `exittimeout = 90`，再按动态调度设计 §8.2 做启动即验。
+4. 模板请求 `ExitTimeOut=90`；确认新 loaded job 的**有效值至少 60 秒**，再按动态调度
+   设计 §8.2 做启动即验。2026-07-25 当前 macOS 对 user LaunchAgent 实测把 plist 的
+   90 秒请求报告为 60 秒；安装器校验有效下界而不是假设请求值会原样呈现。
    安装脚本发现 label 仍 loaded，或仍有 MinerU CLI/临时 API 进程，都会退出 75；这是安全
    保护，不得绕过。
 
 完成首次切换后，常规代码/env 重载才使用 `make worker-restart`；新 worker 的取消是
-retry-neutral，且 90 秒退出窗口会给官方 cleanup 路径留出时间。
+retry-neutral，且有效值至少 60 秒（worker 自身 graceful window 为 35 秒）会给官方
+cleanup 路径和 wrapper 回收留出余量。
 
 ## 2. 告警通道
 

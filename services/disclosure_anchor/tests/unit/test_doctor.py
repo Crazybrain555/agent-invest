@@ -3,9 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from disclosure_anchor.adapters.runtime.doctor import (
+    CheckResult,
     _check_unit_snapshot_aggregate,
     _invalid_process_class_overrides,
     run_doctor,
@@ -45,6 +46,94 @@ def _create_roots(root: Path) -> None:
 
 
 class DoctorTests(unittest.TestCase):
+    @patch(
+        "disclosure_anchor.adapters.runtime.doctor._ops_launchd_check",
+        return_value=CheckResult("postgres autostart", "PASS", "test"),
+    )
+    @patch("disclosure_anchor.adapters.runtime.doctor.subprocess.run")
+    def test_active_worker_mineru_descendants_are_not_orphans(
+        self, run: MagicMock, _ops_check: MagicMock
+    ) -> None:
+        del _ops_check
+        run.return_value = SimpleNamespace(
+            returncode=0,
+            stderr="",
+            stdout=(
+                "100 1 /bin/zsh scripts/run_worker_once.sh loop\n"
+                "101 100 .venv/bin/python -m disclosure_anchor.cli.worker loop\n"
+                "102 1 .venv/bin/python -m disclosure_anchor.cli.pipeline run\n"
+                "103 1 .venv/bin/python -m uvicorn disclosure_anchor.main:app\n"
+                "200 101 /runtime/bin/mineru -p report.pdf\n"
+                "201 200 /runtime/bin/python -m mineru.cli.fast_api\n"
+                "202 101 mineru -p bare-path.pdf\n"
+                "203 102 /runtime/bin/mineru -p pipeline.pdf\n"
+                "204 103 /runtime/bin/mineru -p admin-api.pdf\n"
+                "300 1 python -c from doctor import _mineru_orphan_check\n"
+            )
+        )
+
+        with without_db_env(), tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            report = run_doctor(_settings(root))
+        result = next(item for item in report.results if item.name == "mineru orphans")
+
+        self.assertEqual(result.status, "PASS")
+        self.assertIn("5 active process(es)", result.message)
+
+    @patch(
+        "disclosure_anchor.adapters.runtime.doctor._ops_launchd_check",
+        return_value=CheckResult("postgres autostart", "PASS", "test"),
+    )
+    @patch("disclosure_anchor.adapters.runtime.doctor.subprocess.run")
+    def test_reparented_mineru_process_is_reported_as_orphan(
+        self, run: MagicMock, _ops_check: MagicMock
+    ) -> None:
+        del _ops_check
+        run.return_value = SimpleNamespace(
+            returncode=0,
+            stderr="",
+            stdout=(
+                "1 0 /sbin/launchd\n"
+                "200 1 /runtime/bin/mineru -p report.pdf\n"
+                "201 200 /runtime/bin/python -m mineru.cli.fast_api\n"
+            )
+        )
+
+        with without_db_env(), tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            report = run_doctor(_settings(root))
+        result = next(item for item in report.results if item.name == "mineru orphans")
+
+        self.assertEqual(result.status, "WARN")
+        self.assertIn("count=2", result.message)
+        self.assertIn("sample_pids=200,201", result.message)
+
+    @patch(
+        "disclosure_anchor.adapters.runtime.doctor._ops_launchd_check",
+        return_value=CheckResult("postgres autostart", "PASS", "test"),
+    )
+    @patch("disclosure_anchor.adapters.runtime.doctor.subprocess.run")
+    def test_ps_failure_does_not_false_pass_orphan_check(
+        self, run: MagicMock, _ops_check: MagicMock
+    ) -> None:
+        del _ops_check
+        run.return_value = SimpleNamespace(
+            returncode=1,
+            stderr="process table unavailable",
+            stdout="",
+        )
+
+        with without_db_env(), tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            report = run_doctor(_settings(root))
+        result = next(item for item in report.results if item.name == "mineru orphans")
+
+        self.assertEqual(result.status, "WARN")
+        self.assertIn("ps failed with exit 1", result.message)
+
     def test_override_shape_check_handles_nested_json_without_crashing(self) -> None:
         rows = [
             SimpleNamespace(
@@ -64,7 +153,14 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("tc_bad:non-string=dict,list", invalid)
         self.assertIn("tc_mixed:unknown=not_a_class", invalid)
 
-    def test_passes_with_sentinel_writable_roots_and_external_caches(self) -> None:
+    @patch(
+        "disclosure_anchor.adapters.runtime.doctor._ops_launchd_check",
+        return_value=CheckResult("postgres autostart", "PASS", "test"),
+    )
+    def test_passes_with_sentinel_writable_roots_and_external_caches(
+        self, _ops_check: MagicMock
+    ) -> None:
+        del _ops_check
         with without_db_env(), tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _create_roots(root)

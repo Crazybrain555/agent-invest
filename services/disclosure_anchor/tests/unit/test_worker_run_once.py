@@ -489,6 +489,11 @@ class RunOnceSchedulingTests(unittest.TestCase):
             mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
             mock.patch.object(worker_module.queries, "pending_parse", return_value=pending),
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
+            mock.patch.object(
+                worker_module,
+                "PARSER_READINESS_RETRY_SECONDS",
+                0.0,
+            ),
         ):
             report = run_once(
                 WorkerLimits(sync=0, download=0, parse=20, build=0, publish=0),
@@ -496,7 +501,10 @@ class RunOnceSchedulingTests(unittest.TestCase):
             )
 
         parse_cls.assert_not_called()
-        parser.identity.assert_called_once_with()
+        self.assertEqual(
+            parser.identity.call_count,
+            worker_module.PARSER_READINESS_FAILURE_THRESHOLD,
+        )
         self.assertEqual(report.failed, 1)
         self.assertEqual(report.failures[0].item_ref, "parser")
 
@@ -1054,7 +1062,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self.assertEqual(report.parse_huge_dispatched, 1)
         self.assertEqual(report.parse_regular_dispatched, 2)
 
-    def test_rolling_refill_rechecks_readiness_before_next_admission(self) -> None:
+    def test_transient_readiness_failure_pauses_then_resumes_admission(self) -> None:
         deps = _deps()
         object.__setattr__(
             deps,
@@ -1075,8 +1083,20 @@ class RunOnceSchedulingTests(unittest.TestCase):
         parser.readiness.side_effect = (
             None,
             ParserVersionProbeError("backend unavailable"),
+            None,
         )
         object.__setattr__(deps, "parser_factory", lambda: parser)
+        window_open = True
+
+        def parse(command: object) -> mock.MagicMock:
+            nonlocal window_open
+            document_id = str(getattr(command, "document_id"))
+            if document_id == "doc_1":
+                window_open = False
+            return mock.MagicMock(
+                status="succeeded",
+                processing_run_id=f"run_{document_id}",
+            )
 
         with (
             mock.patch.object(
@@ -1090,10 +1110,13 @@ class RunOnceSchedulingTests(unittest.TestCase):
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
             mock.patch.object(worker_module, "BuildUnits") as build_cls,
             mock.patch.object(worker_module, "PublishRun") as publish_cls,
+            mock.patch.object(
+                worker_module,
+                "PARSER_READINESS_RETRY_SECONDS",
+                0.0,
+            ),
         ):
-            parse_cls.return_value.execute.return_value = mock.MagicMock(
-                status="succeeded", processing_run_id="run_0"
-            )
+            parse_cls.return_value.execute.side_effect = parse
             build_cls.return_value.execute.return_value = mock.MagicMock(
                 status="succeeded", build_stats=None
             )
@@ -1108,14 +1131,253 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 deps,
                 limit=200,
                 should_stop=lambda: False,
+                keep_refilling=lambda: window_open,
+            )
+
+        self.assertEqual(result, "done")
+        self.assertEqual(report.parsed, 2)
+        self.assertEqual(parse_cls.return_value.execute.call_count, 2)
+        self.assertEqual(parser.readiness.call_count, 3)
+        self.assertEqual(report.failures, [])
+
+    def test_sustained_readiness_failure_halts_at_threshold(self) -> None:
+        deps = _deps()
+        object.__setattr__(
+            deps,
+            "config",
+            WorkerConfig(
+                max_parse_retries=3,
+                max_build_retries=3,
+                stale_run_threshold_seconds=3600,
+                sync_interval_seconds=86400,
+                cninfo_overlap_days=7,
+                cninfo_max_retries=3,
+                cninfo_oversized_kb=10240,
+                parse_concurrency=1,
+                parse_candidate_window=10,
+            ),
+        )
+        parser = mock.MagicMock()
+        parser.readiness.side_effect = ParserVersionProbeError(
+            "backend unavailable"
+        )
+        object.__setattr__(deps, "parser_factory", lambda: parser)
+
+        with (
+            mock.patch.object(
+                worker_module.queries,
+                "pending_parse",
+                return_value=[{"document_id": "doc_0", "oversized": False}],
+            ),
+            mock.patch.object(worker_module, "ParseDocument") as parse_cls,
+            mock.patch.object(
+                worker_module,
+                "PARSER_READINESS_RETRY_SECONDS",
+                0.0,
+            ),
+        ):
+            report = worker_module.WorkerReport(
+                started_at=datetime.now(timezone.utc)
+            )
+            result = worker_module._parse_one_batch(
+                report,
+                deps,
+                limit=200,
+                should_stop=lambda: False,
                 keep_refilling=lambda: True,
             )
 
         self.assertEqual(result, "halt")
-        self.assertEqual(report.parsed, 1)
-        self.assertEqual(parse_cls.return_value.execute.call_count, 1)
-        self.assertEqual(parser.readiness.call_count, 2)
+        self.assertEqual(report.parsed, 0)
+        parse_cls.return_value.execute.assert_not_called()
+        self.assertEqual(
+            parser.readiness.call_count,
+            worker_module.PARSER_READINESS_FAILURE_THRESHOLD,
+        )
+        self.assertEqual(report.failed, 1)
         self.assertEqual(report.failures[-1].error_code, "parser_readiness_failed")
+
+    def test_control_halt_clears_deferred_readiness(self) -> None:
+        import threading
+
+        deps = _deps()
+        object.__setattr__(
+            deps,
+            "config",
+            replace(
+                deps.config,
+                parse_concurrency=2,
+                parse_candidate_window=10,
+            ),
+        )
+        release_control_failure = threading.Event()
+        probe_calls = 0
+        parser = mock.MagicMock()
+
+        def readiness(*_args: object) -> None:
+            nonlocal probe_calls
+            probe_calls += 1
+            if probe_calls == 2:
+                release_control_failure.set()
+                raise ParserVersionProbeError("transient probe failure")
+
+        def process(
+            _deps: WorkerDeps, item: worker_module._ParseWorkItem
+        ) -> worker_module._DocOutcome:
+            if item.document_id == "doc_0":
+                return worker_module._DocOutcome()
+            self.assertTrue(release_control_failure.wait(timeout=1))
+            return worker_module._DocOutcome(
+                failure=worker_module.WorkerFailure(
+                    stage="parse",
+                    item_ref=item.document_id,
+                    error_code="parser_backend_overloaded",
+                )
+            )
+
+        parser.readiness.side_effect = readiness
+        object.__setattr__(deps, "parser_factory", lambda: parser)
+        with (
+            mock.patch.object(
+                worker_module.queries,
+                "pending_parse",
+                return_value=[
+                    {"document_id": "doc_0", "oversized": False},
+                    {"document_id": "doc_1", "oversized": False},
+                ],
+            ),
+            mock.patch.object(
+                worker_module,
+                "_parse_one_document",
+                side_effect=process,
+            ),
+            mock.patch.object(
+                worker_module,
+                "PARSER_READINESS_RETRY_SECONDS",
+                60.0,
+            ),
+        ):
+            report = worker_module.WorkerReport(
+                started_at=datetime.now(timezone.utc)
+            )
+            result = worker_module._parse_one_batch(
+                report,
+                deps,
+                limit=200,
+                should_stop=lambda: False,
+                keep_refilling=lambda: True,
+            )
+
+        self.assertEqual(result, "halt")
+        self.assertEqual(parser.readiness.call_count, 2)
+        self.assertEqual(
+            report.failures[-1].error_code,
+            "parser_backend_overloaded",
+        )
+
+    def test_window_close_clears_deferred_readiness_without_busy_wait(self) -> None:
+        import threading
+
+        deps = _deps()
+        object.__setattr__(
+            deps,
+            "config",
+            replace(
+                deps.config,
+                parse_concurrency=2,
+                parse_candidate_window=10,
+            ),
+        )
+        object.__setattr__(deps, "page_counter", lambda _path: 10)
+        release_tail = threading.Event()
+        window_open = True
+        probe_calls = 0
+        parser = mock.MagicMock()
+        release_timer: threading.Timer | None = None
+
+        def readiness(*_args: object) -> None:
+            nonlocal probe_calls, release_timer, window_open
+            probe_calls += 1
+            if probe_calls == 2:
+                window_open = False
+                release_timer = threading.Timer(0.02, release_tail.set)
+                release_timer.start()
+                raise ParserVersionProbeError("transient probe failure")
+
+        def process(
+            _deps: WorkerDeps, item: worker_module._ParseWorkItem
+        ) -> worker_module._DocOutcome:
+            if item.document_id == "doc_0":
+                return worker_module._DocOutcome()
+            self.assertTrue(release_tail.wait(timeout=1))
+            return worker_module._DocOutcome()
+
+        real_wait = worker_module.wait
+        wait_timeouts: list[float | None] = []
+
+        def recording_wait(*args: object, **kwargs: object) -> object:
+            timeout = kwargs.get("timeout")
+            wait_timeouts.append(
+                float(timeout) if timeout is not None else None
+            )
+            return real_wait(*args, **kwargs)
+
+        parser.readiness.side_effect = readiness
+        object.__setattr__(deps, "parser_factory", lambda: parser)
+        try:
+            with (
+                mock.patch.object(
+                    worker_module.queries,
+                    "pending_parse",
+                    return_value=[
+                        {
+                            "document_id": "doc_0",
+                            "oversized": False,
+                            "raw_file_relpath": "doc_0.pdf",
+                        },
+                        {
+                            "document_id": "doc_1",
+                            "oversized": False,
+                            "raw_file_relpath": "doc_1.pdf",
+                        },
+                    ],
+                ),
+                mock.patch.object(
+                    worker_module,
+                    "_parse_one_document",
+                    side_effect=process,
+                ),
+                mock.patch.object(
+                    worker_module,
+                    "PARSER_READINESS_RETRY_SECONDS",
+                    0.0,
+                ),
+                mock.patch.object(
+                    worker_module,
+                    "wait",
+                    side_effect=recording_wait,
+                ),
+            ):
+                report = worker_module.WorkerReport(
+                    started_at=datetime.now(timezone.utc)
+                )
+                result = worker_module._parse_one_batch(
+                    report,
+                    deps,
+                    limit=200,
+                    should_stop=lambda: False,
+                    keep_refilling=lambda: window_open,
+                )
+        finally:
+            if release_timer is not None:
+                release_timer.join(timeout=1)
+
+        self.assertEqual(result, "done")
+        self.assertEqual(parser.readiness.call_count, 2)
+        self.assertLessEqual(
+            sum(timeout is not None and timeout <= 0 for timeout in wait_timeouts),
+            1,
+        )
 
     def test_lost_admission_guard_starts_no_new_document(self) -> None:
         deps = _deps()

@@ -43,7 +43,20 @@ launchctl bootstrap "$DOMAIN" "$PLIST"
 launchctl kickstart "$DOMAIN/$LABEL"
 JOB_STATE="$(launchctl print "$DOMAIN/$LABEL")"
 print -r -- "$JOB_STATE" | grep -q "state = running"
-print -r -- "$JOB_STATE" | grep -q "exit timeout = 90"
-echo "installed: $PLIST (KeepAlive adaptive loop; idle backoff 15-30m)"
+EFFECTIVE_EXIT_TIMEOUT="$(
+  print -r -- "$JOB_STATE" | awk '/exit timeout =/{print $4; exit}'
+)"
+case "$EFFECTIVE_EXIT_TIMEOUT" in
+  ''|*[!0-9]*)
+    echo "cannot verify loaded launchd exit timeout" >&2
+    exit 1
+    ;;
+esac
+if (( EFFECTIVE_EXIT_TIMEOUT < 60 )); then
+  echo "loaded launchd exit timeout is only ${EFFECTIVE_EXIT_TIMEOUT}s" >&2
+  exit 1
+fi
+echo "installed: $PLIST (KeepAlive adaptive loop; idle backoff 15-30m;" \
+  "exit timeout ${EFFECTIVE_EXIT_TIMEOUT}s effective, 90s requested)"
 echo "launchd log: $HOME/Library/Logs/agent-invest/disclosure-worker.{out,err}"
 echo "worker log:  $DISCLOSURE_RUNTIME_ROOT/logs/worker-YYYYMMDD.log"

@@ -3,14 +3,14 @@ id: disclosure_anchor_worker_dynamic_scheduling
 title: Worker 动态调度、GPU 锯齿根因与发布验收
 date: 2026-07-09
 updated_at: 2026-07-25
-status: implemented-awaiting-deployment-ab
+status: deployed-ab-in-progress
 authority: tracked implementation design; live runtime values must be re-verified
 ---
 
-> 本文记录可复核的事故证据、版本匹配的外部机制和当前实现边界。代码已在任务分支实现，
-> 但截至本文更新时尚未合并、重启和完成生产 A/B；因此“已覆盖”只表示任务分支已有对应
-> 代码路径和回归测试设计，不表示发布门已全部通过或线上锯齿已经改善。GPU、backlog、版本
-> 和并发数字都是带日期的运维证据，发布前必须重新核验。
+> 本文记录可复核的事故证据、版本匹配的外部机制和当前实现边界。基础修复 commit
+> `dcf7014` 已于 2026-07-25 重启上线，生产 A/B 仍在进行；A/B 又发现单次 readiness
+> 抖动仍可结束 parse round，后续修正尚未发布。因此“已覆盖”不等于发布验收完成。
+> GPU、backlog、版本和并发数字都是带日期的运维证据，每次发布都必须重新核验。
 
 # Worker 动态调度与 GPU 锯齿根因报告
 
@@ -94,8 +94,14 @@ HTTP admission 或 waiting queue 上限。该端点没有直接暴露 `max_num_s
 
 - 没有 `--api-url` 时，每份 PDF 的 CLI 会启动一个临时 local `mineru-api`；
 - MinerU 3.4 的 `--max-concurrency=N` 会传入 `vlm-http-client`；
+- 顶层 `mineru --help` 不列这个动态 backend 参数，但 3.4.0 的
+  `parse_unknown_args()` 会把它规范化为 `{"max_concurrency": N}`，随后
+  `split_service_and_model_config()` 将它保留在 model config；
 - 对正常单 PDF，layout、block/content 和跨页表格 merge 阶段的远端 VLM chat 都受该
   临时 API 的同尺寸 semaphore 约束；阶段并不重叠；
+- macOS 日志中的 `Request concurrency limited to 1` 是临时 API 的**文档任务入口**
+  semaphore；本系统每个临时 API 只提交一份 PDF。它不覆盖 VLM HTTP client 的页/block
+  semaphore。线上异常栈直接显示后者 `value:7`，两者不能混为同一个并发层；
 - 每个临时 API 的 semaphore 互相不可见，所以 16 份文档的默认 100 不能形成全局 100，
   而会形成约 `16 × 100` 的外层放大；
 - processing window 是 MinerU 内部执行窗口，不是 durable checkpoint，也不能证明任意
@@ -119,6 +125,7 @@ HTTP admission 或 waiting queue 上限。该端点没有直接暴露 `max_num_s
 | [Kueue quota borrowing](https://kueue.sigs.k8s.io/docs/concepts/cluster_queue/) | nominal quota 保证份额，空闲 quota 可由 cohort 借用 | regular/heavy/huge 各有名义份额，lane 空时 work-conserving 借满 | 不引入 Kubernetes 控制面 |
 | [Ray Serve](https://docs.ray.io/en/latest/serve/advanced-guides/asyncio-best-practices.html) | `max_ongoing_requests` 以 replica 为静态 in-flight cap，超出后排队/背压 | GPU 请求预算与文档槽分开；finalize 不继续占 GPU 槽 | 不为单机 worker 引入 Ray replica/router/autoscaler |
 | [Envoy circuit breaker](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/circuit_breaking) | 分别限制 active、pending、retry，过载快速背压 | 只把明确 429/`RESOURCE_EXHAUSTED` 当全局 overload；未来多生产者时在统一入口设静态 breaker | 当前单生产者已有数据库排他锁，不新增网络 gateway |
+| [Kubernetes probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) | readiness 默认连续失败 3 次才转 not-ready；失败后继续探测，恢复后重新准入 | 探测不确定时暂停新 admission；单次失败不结束整轮，连续失败达到阈值才进入现有 cooldown | 不把 readiness 当 liveness，不因一次网络抖动重启进程 |
 
 共同结论是：
 
@@ -240,6 +247,35 @@ document_deadline =
 readiness 只在新 admission 前执行。已成功产生的 artifact 不会再因事后 `/health` 抖动被
 改判失败并整份重跑。
 
+#### 4.4.1 上线 A/B 发现的 readiness 控制缺口
+
+`dcf7014` 虽已把 readiness 移到 admission 前，却仍把**一次**
+`ParserVersionProbeError` 直接设为 `halt_refill`。2026-07-25 19:43:53 开始的首个正式
+安装波次提供了反例：
+
+- 55 份 parse/build/publish 全部完成，另 1 份 item-local `parser_task_failed`；
+- 20:20:35 最后一份 parse 完成后，vLLM 从 20:21 至至少 20:24 持续
+  `running=0, waiting=0`；
+- 同一空谷的 50 秒采样中 `/health` 既有 200，也有 3 秒 connect timeout；
+- round 最终报告 `parser_readiness_failed`，证明不是 backlog、finalize 或 lane 耗尽，
+  而是单次 readiness 抖动结束了 parse stage。
+
+预设计问题是：如何在不把真实 GPU outage 转成 16 份文档失败的前提下，又不让一次探测
+抖动结束整轮。采用的不变量是：
+
+1. readiness 未确认期间**不准入新文档**；
+2. 参考 Kubernetes `failureThreshold=3`，连续三次失败才判共享后端不可用；任一成功立即
+   清零连续失败计数；
+3. 阈值前在原 dispatcher 内每 5 秒重试，已有 parse/finalize 继续运行，不退出 round；
+4. 达到阈值后才记录结构化 `parser_readiness_failed`，停止 refill 并交给既有 stage-local
+   cooldown；
+5. 拒绝“完全取消探活并继续提交”，因为真实 outage 会同时烧掉多份文档重试预算；也拒绝
+   “单次失败立即 halt”，因为线上已证明它会放大成数分钟空谷。
+
+验证计划：单测分别覆盖“失败一次后恢复并继续准入”和“连续三次失败才 halt”；完整静态/
+回归门通过后受控重启；线上同时采集 parse start、readiness 日志与 vLLM
+running/waiting，确认瞬时失败不再形成 round 边界空谷。
+
 ### 4.5 重启、取消与官方 cleanup
 
 MinerU CLI 的临时 API 可能处于独立 session。直接 `SIGKILL` 外层进程会跳过其正常 shutdown
@@ -316,7 +352,8 @@ artifact、overlap/context、deterministic merge、exactly-once commit，以及�
 | 固定 200 批尾 | 已有 1,000 候选窗口和有界滚动补槽 | 仅在 refill window 内；需 A/B 验证 3–10 分钟尾部是否消失 |
 | build/publish 占 GPU 槽 | 已拆分 parse/finalize pool，并限制下游 backlog | finalize=2 是否足够要看 A/B，不能预先调大 |
 | 超大任务 timeout | 已按页数给 1–4 小时 deadline，统一内外层 SLA | 500+ 页成功率和 p95 需线上复核 |
-| health 抖动毁掉成功产物 | readiness 前置，成功后不再探活判废 | 仍需监控真实 backend unavailable |
+| health 抖动毁掉成功产物 | readiness 前置，成功后不再探活判废 | 已上线验证产物不被判废 |
+| 单次 readiness 假阴性停止整轮 | 连续失败阈值 3；阈值前暂停 5 秒并在原 dispatcher 恢复 | A/B 发现后修正，仍待下一次重启验证 |
 | 文档级 AIMD 锯齿 | 已删除容量 AIMD；只有明确 overload 才停 refill/cooldown | 静态 112 是否最优需用吞吐、queue/KV 数据判断 |
 | 重启孤儿与新临时目录 | 已 SIGINT cleanup、35s grace、90s launchd exit window | 历史 131 目录不会自动清除 |
 | 外部分片语义损坏 | resident 不自动分页/拼接；active IR 审计 `full_pdf=false=0` | admin 仍支持显式页段；不外推成 MinerU 全部语义绝对正确 |
@@ -364,8 +401,9 @@ control plane 会制造第二任务真相，而不能自动解决错误的请求
 - 首次从旧代码切换时，旧在途必须自然排空，不能用新代码的 retry-neutral 语义倒推旧 worker；
 - 按 production runbook 冻结 Python 子进程，并复核 PG running、MinerU/API、vLLM waiting
   三个零条件后 bootout；安装脚本对 loaded job 或残留 MinerU/API 必须 fail closed；
-- 新 plist loaded 后实测 `ExitTimeOut=90`、state running。只有此后的新代码重启才允许
-  retry-neutral cancellation 接管。
+- 新 plist 请求 `ExitTimeOut=90`；loaded job 实测有效值至少 60 秒、state running。
+  当前 macOS user LaunchAgent 会把 90 秒请求报告为 60 秒，而 worker 自身 graceful
+  window 为 35 秒。只有此后的新代码重启才允许 retry-neutral cancellation 接管。
 
 ### 8.2 启动即验
 

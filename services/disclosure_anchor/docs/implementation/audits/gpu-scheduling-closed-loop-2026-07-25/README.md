@@ -13,11 +13,14 @@
 | 当前补充快照 | 2026-07-25 16:38:41 | raw pending 20,335、候选谓词 eligible 19,669、running 10 |
 | active IR 扫描 | DB 16:38:59；扫描结束 16:39:26 | 19,782 true、0 false、0 missing/unreadable |
 | vLLM 补充横截面 | 2026-07-25 16:34:20 | health 200/0.316s、running 121、waiting 40、preemptions 0 |
+| `dcf7014` 正式安装波次 | 19:43:53–20:21:21 | parsed/built/published 55/55/55；一次 readiness 假阴性停止滚动准入 |
+| readiness 放大空谷 | 19:52:29–20:24:37 | 32.14 分钟无新 parse start；eligible backlog 仍为 19,887 |
 
 05:45 基线运行的是 primary commit
-`3c7ef821922f39975a4b889738ea823052c1a648`，不是本任务候选。证据整理时任务分支已提交
-HEAD 为 `7a62b27e11e71f2502c3cc334c5d80ff21286c73`，其后仍有未提交候选 diff；最终发布身份
-必须以合并 commit、startup banner 和真实子进程命令为准。
+`3c7ef821922f39975a4b889738ea823052c1a648`。基础动态调度后来 squash 为
+`dcf7014`；19:43:53 的正式安装波次由 startup banner 和真实子进程命令确认运行该代码。
+该波次又发现 readiness 连续失败控制尚未闭合，后续修正的发布身份仍必须以最终 commit、
+startup banner 和真实进程为准。
 
 本机解析端为 MinerU 3.4.0、`mineru-vl-utils` 1.0.5。已安装源文件校验：
 
@@ -41,6 +44,54 @@ source ~/.config/agent-invest/disclosure_anchor/worker.env
 "$DISCLOSURE_MINERU_BIN" -v
 curl -fsS --noproxy '*' --connect-timeout 3 --max-time 8 \
   "$DISCLOSURE_MINERU_SERVER_URL/version"
+```
+
+### 1.1 上线 A/B 新发现：单次 readiness 仍会放大成锯齿
+
+`dcf7014` 已解决 1,600 级请求突发，但真实上线证明“一次 readiness 失败立即结束
+refill”仍是独立的锯齿发生器：
+
+- 19:43:58 很快填满 16 个 parse 槽，随后持续滚动启动；
+- 19:52:29 后停止新启动，直到 20:24:37 才恢复，一共 32.14 分钟；
+- 这段时间不是完全卡死：仍有 16 份成功，最后一份到 20:20:35；55 份成功 run 最终
+  `normalized_ir_relpath`、`document_units_relpath`、`is_active=true` 全部齐全；
+- round 20:21:21 报告 55/55/55，唯一共享控制错误是
+  `parser_readiness_failed`；另一个 `parser_task_failed` 在 19:56:08 才发生，晚于停止
+  准入 3 分 39 秒，不能解释停止准入；
+- 20:33 复核 broad backlog 19,978、完整 scheduler predicate eligible 19,887，排除任务不足；
+- 空谷尾部 vLLM 为 `running=0–17, waiting=0`，说明旧洪峰已被压住；但单次探测失败让
+  16 份大文档自然排空，形成逐步下坡，再叠加 120 秒 parse cooldown。
+
+同一窗口 `/health` 既有 200，也有 connect timeout；后端进程没有重启，成功请求计数仍
+增长。因此它是 readiness 假阴性/瞬时网络抖动，不是持续 GPU 宕机。修正采用成熟 probe
+语义：探测失败时先暂停新 admission，5 秒后原地重试；连续三次才报告 outage，任一成功
+清零计数。Kubernetes readiness 的默认 `failureThreshold` 也是 3，且失败后继续探测，
+而不是把一次失败升级成进程 liveness 结论。
+
+时间线可用下列只读 SQL 和 worker report 复核：
+
+```sql
+BEGIN TRANSACTION READ ONLY;
+SET LOCAL TIME ZONE 'Asia/Shanghai';
+SELECT min(started_at), max(started_at), count(*)
+  FROM disclosure_core.processing_run
+ WHERE run_kind = 'parse'
+   AND started_at >= timestamptz '2026-07-25 19:43:53+08'
+   AND started_at <  timestamptz '2026-07-25 20:24:37+08';
+SELECT max(started_at) AS admission_stopped,
+       max(finished_at) FILTER (WHERE status = 'succeeded') AS tail_finished,
+       count(*) FILTER (WHERE status = 'succeeded') AS succeeded,
+       count(*) FILTER (WHERE status = 'failed') AS failed
+  FROM disclosure_core.processing_run
+ WHERE run_kind = 'parse'
+   AND started_at >= timestamptz '2026-07-25 19:43:53+08'
+   AND started_at <  timestamptz '2026-07-25 20:24:37+08';
+ROLLBACK;
+```
+
+```bash
+rg -n '^## run|duration_seconds|parsed:|built:|published:|failed:|parser_readiness_failed' \
+  /Volumes/AgentSSD/agent_system/services/disclosure_anchor/runtime/logs/worker-20260725.log
 ```
 
 ## 2. DB 波形、在途与失败

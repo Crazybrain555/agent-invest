@@ -157,23 +157,90 @@ def _environment_checks(settings: Settings) -> list[CheckResult]:
     return checks
 
 
-def _mineru_orphan_check() -> CheckResult:
-    """WARN when MinerU processes linger (08 §2: killed runs must not leak).
+_MINERU_PRODUCER_MARKERS = (
+    " -m disclosure_anchor.cli.worker ",
+    " -m disclosure_anchor.cli.pipeline ",
+    " -m uvicorn disclosure_anchor.main:",
+)
 
-    The observed leak is the fast_api backend MinerU 3.4 spawns; a resident
-    one holds ~1.8GB and steals compute from the next parse.
+
+def _is_mineru_process(command: str) -> bool:
+    argv = command.split()
+    if not argv:
+        return False
+    if Path(argv[0]).name.lower() == "mineru":
+        return True
+    return any(
+        argument == "-m" and argv[index + 1].lower().startswith("mineru.")
+        for index, argument in enumerate(argv[:-1])
+    )
+
+
+def _mineru_orphan_check() -> CheckResult:
+    """WARN only for MinerU processes detached from a repository producer.
+
+    MinerU 3.4 creates several CLI/API descendants per active parse. A plain
+    ``pgrep mineru`` therefore reports healthy in-flight work as orphans. A
+    real leak has lost its worker, pipeline, or admin-API ancestor (and is
+    normally reparented to launchd); classify by the live parent chain instead
+    of process name alone.
     """
 
     try:
         result = subprocess.run(
-            ["pgrep", "-fl", "mineru"], capture_output=True, text=True, timeout=10
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return _warn("mineru orphans", "pgrep unavailable; cannot check")
-    lines = [line for line in result.stdout.splitlines() if line.strip()]
-    if lines:
-        return _warn("mineru orphans", f"count={len(lines)} (residual mineru processes)")
-    return _pass("mineru orphans", "none")
+        return _warn("mineru orphans", "ps unavailable; cannot check")
+    if result.returncode != 0:
+        detail = result.stderr.strip()[:160] or "no stderr"
+        return _warn(
+            "mineru orphans",
+            f"ps failed with exit {result.returncode}; cannot check: {detail}",
+        )
+
+    processes: dict[int, tuple[int, str]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        processes[pid] = (ppid, parts[2])
+
+    mineru_pids = [
+        pid
+        for pid, (_, command) in processes.items()
+        if _is_mineru_process(command)
+    ]
+    orphan_pids: list[int] = []
+    for pid in mineru_pids:
+        current = processes[pid][0]
+        seen = {pid}
+        while current in processes and current not in seen:
+            seen.add(current)
+            parent, command = processes[current]
+            if any(marker in f" {command} " for marker in _MINERU_PRODUCER_MARKERS):
+                break
+            current = parent
+        else:
+            orphan_pids.append(pid)
+
+    if orphan_pids:
+        sample = ",".join(str(pid) for pid in orphan_pids[:5])
+        return _warn(
+            "mineru orphans",
+            f"count={len(orphan_pids)} detached process(es); sample_pids={sample}",
+        )
+    return _pass(
+        "mineru orphans",
+        f"none ({len(mineru_pids)} active process(es) have a live producer ancestor)",
+    )
 
 
 def _disk_headroom_checks(settings: Settings) -> list[CheckResult]:

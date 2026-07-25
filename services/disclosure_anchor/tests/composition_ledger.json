@@ -139,7 +139,7 @@
     "_check_unit_snapshot_aggregate",
     "_invalid_process_class_overrides"
    ],
-   "tests": 11
+   "tests": 14
   },
   "tests/unit/test_doctor_render.py": {
    "private_imports": [],
@@ -294,7 +294,7 @@
    "private_imports": [
     "_sync_window_start"
    ],
-   "tests": 48
+   "tests": 51
   }
  },
  "schema": "test-composition-ledger.v1"
