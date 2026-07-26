@@ -426,12 +426,33 @@ class OpsQueueViewTests(unittest.TestCase):
             refresh_document_classification(conn, document_id=document_id)
             self.doc_ids.append(document_id)
             rows = queries.pending_parse(conn, max_retries=3, limit=500000)
+            after_rows = queries.pending_parse(
+                conn,
+                max_retries=3,
+                limit=500000,
+                after_document_id=document_id,
+            )
+            exact_rows = queries.pending_parse(
+                conn,
+                max_retries=3,
+                limit=1,
+                document_ids=(document_id,),
+            )
 
         by_document_id = {row["document_id"]: row for row in rows}
         self.assertIn(document_id, by_document_id)
         self.assertEqual(
             by_document_id[document_id]["raw_byte_count"],
             measured_bytes,
+        )
+        self.assertNotIn(
+            document_id, {row["document_id"] for row in after_rows}
+        )
+        self.assertTrue(
+            all(row["document_id"] > document_id for row in after_rows)
+        )
+        self.assertEqual(
+            [row["document_id"] for row in exact_rows], [document_id]
         )
 
     def test_processing_backlog_counts_download_and_all_raw_parse_work(self) -> None:
@@ -1735,7 +1756,7 @@ class OpsQueueViewTests(unittest.TestCase):
             txn.rollback()
             conn.close()
 
-    def test_stale_reclaim_fails_only_over_threshold_runs(self) -> None:
+    def test_stale_reclaim_supports_age_guard_and_startup_cutoff(self) -> None:
         # reclaim_stale_runs is intentionally a global recovery UPDATE.
         # Exercise it in a rollback-only transaction so a shared live-DB test
         # can never persistently reclaim a legitimate production long run.
@@ -1749,9 +1770,29 @@ class OpsQueueViewTests(unittest.TestCase):
                 status="running",
                 started_at=datetime.now(timezone.utc) - timedelta(hours=3),
             )
-            fresh_run = self._insert_run(conn, document_id, status="running")
+            # PostgreSQL ``now()`` is fixed at transaction start. Make the
+            # prior-owner row unambiguously older than the startup cutoff so
+            # this proves threshold=0 reclaims a fresh crash.
+            fresh_run = self._insert_run(
+                conn,
+                document_id,
+                status="running",
+                started_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+            )
             reclaimed = queries.reclaim_stale_runs(conn, threshold_seconds=3600)
-            rows = dict(
+            threshold_rows = dict(
+                conn.execute(
+                    text(
+                        "SELECT processing_run_id, status FROM disclosure_core.processing_run "
+                        "WHERE processing_run_id = ANY(:ids)"
+                    ),
+                    {"ids": [old_run, fresh_run]},
+                ).all()
+            )
+            startup_reclaimed = queries.reclaim_stale_runs(
+                conn, threshold_seconds=0
+            )
+            startup_rows = dict(
                 conn.execute(
                     text(
                         "SELECT processing_run_id, status FROM disclosure_core.processing_run "
@@ -1771,8 +1812,10 @@ class OpsQueueViewTests(unittest.TestCase):
             txn.rollback()
             conn.close()
         self.assertGreaterEqual(reclaimed, 1)
-        self.assertEqual(rows[old_run], "failed")
-        self.assertEqual(rows[fresh_run], "running")
+        self.assertEqual(threshold_rows[old_run], "failed")
+        self.assertEqual(threshold_rows[fresh_run], "running")
+        self.assertGreaterEqual(startup_reclaimed, 1)
+        self.assertEqual(startup_rows[fresh_run], "failed")
         self.assertEqual(error["error_code"], "stale_reclaimed")
         self.assertTrue(error["retryable"])
 

@@ -292,13 +292,13 @@
   },
   "tests/unit/test_worker_cli.py": {
    "private_imports": [],
-   "tests": 30
+   "tests": 21
   },
   "tests/unit/test_worker_run_once.py": {
    "private_imports": [
     "_sync_window_start"
    ],
-   "tests": 52
+   "tests": 56
   }
  },
  "schema": "test-composition-ledger.v1"

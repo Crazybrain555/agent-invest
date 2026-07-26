@@ -4,6 +4,7 @@ from __future__ import annotations
 
 
 import argparse
+import queue
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -50,7 +51,6 @@ from disclosure_anchor.application.ports.disclosure_source import DisclosureSour
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.worker.locks import WORKER_NS
 from disclosure_anchor.application.worker.worker import (
-    PARSER_CONTROL_ERROR_CODES,
     WorkerConfig,
     WorkerDeps,
     _is_provider_infrastructure_error,
@@ -58,6 +58,7 @@ from disclosure_anchor.application.worker.worker import (
     publish_failures_indicate_outage,
     render_report_section,
     run_once,
+    run_resident_parse,
 )
 from disclosure_anchor.settings import Settings, load_settings
 
@@ -70,7 +71,6 @@ RATE_LIMIT_COOLDOWN_MAX_SECONDS = 600
 SYNC_COOLDOWN_MAX_SECONDS = 7200
 PARSE_COOLDOWN_BASE_SECONDS = 120
 PROVIDER_ERROR_COOLDOWN_BASE_SECONDS = 60
-PUBLISH_COOLDOWN_BASE_SECONDS = 120
 
 
 class WorkerSingletonGuardError(RuntimeError):
@@ -148,21 +148,19 @@ def _run_rounds(
 
 def _wedge_watchdog(
     *,
+    plane: str,
     last_progress: list[float],
     threshold_seconds: int,
     stop: _StopFlag,
 ) -> threading.Thread:
-    """Fail loudly when NOTHING progresses for longer than any legal gap.
+    """Fail loudly when one execution plane stops proving liveness.
 
     Rounds may honestly run for hours (heavy parse batches), so duration
-    bounds nothing — liveness does. Every stage bumps the heartbeat at item
-    granularity, and the parse coordinator also renews it every 30 seconds
-    while it still owns a future inside the extreme lease. Beyond the watchdog
-    threshold the process is wedged in something no inner timeout covers — a
-    hung getaddrinfo, a TCC-blocked spawn, or a pathological query (all three
-    observed 2026-07-23/24). Dump every thread's stack and exit nonzero:
-    launchd KeepAlive restarts clean, and every write path is batch-committed
-    idempotent by design, so a hard exit loses no work.
+    bounds nothing — liveness does. Parse/startup and maintenance use distinct
+    timestamps: progress in one plane must never conceal a deadlock in the
+    other. Beyond the watchdog threshold the named plane is wedged in something
+    no inner timeout covers. Dump every thread's stack and exit nonzero:
+    launchd KeepAlive restarts clean, and write paths are batch-committed.
     """
 
     def _watch() -> None:
@@ -173,7 +171,8 @@ def _wedge_watchdog(
             silent = time.monotonic() - last_progress[0]
             if silent > threshold_seconds and not stop.is_set():
                 print(
-                    f"[watchdog] no progress for {int(silent)}s "
+                    f"[watchdog] {plane} plane made no progress for "
+                    f"{int(silent)}s "
                     f"(threshold {threshold_seconds}s) — dumping stacks and "
                     "exiting for a clean relaunch",
                     file=sys.stderr,
@@ -183,7 +182,11 @@ def _wedge_watchdog(
                 sys.stderr.flush()
                 _exit_wedged_worker()
 
-    thread = threading.Thread(target=_watch, name="wedge-watchdog", daemon=True)
+    thread = threading.Thread(
+        target=_watch,
+        name=f"wedge-watchdog-{plane}",
+        daemon=True,
+    )
     thread.start()
     return thread
 
@@ -203,92 +206,391 @@ def _exit_wedged_worker() -> None:
 
 
 def _run_loop(settings: Settings, *, lock_conn: Connection) -> int:
-    """Run continuously, draining work immediately and backing off when idle."""
+    """Run a resident data plane with independent maintenance/reporting."""
 
     engine = create_db_engine(_database_url(settings))
     stop = _StopFlag()
     stop.install()
-    controller = _AdaptiveLoopController(
-        idle_base_seconds=settings.worker_loop_interval_seconds,
-        idle_max_seconds=settings.worker_loop_max_interval_seconds,
-    )
     base_limits = _limits(settings)
-    deps = _deps(
+    base_deps = _deps(
         settings,
         engine,
         admission_guard=lambda: _assert_singleton_or_cancel(lock_conn),
     )
-    last_progress = [time.monotonic()]
+    deps = base_deps
+    maintenance_deps = base_deps
+    maintenance_progress: list[float] | None = None
     if settings.worker_wedge_timeout_seconds > 0:
-        object.__setattr__(
-            deps, "heartbeat", lambda: last_progress.__setitem__(0, time.monotonic())
+        parse_progress = [time.monotonic()]
+        maintenance_progress = [parse_progress[0]]
+        deps = replace(
+            base_deps,
+            heartbeat=lambda: parse_progress.__setitem__(
+                0, time.monotonic()
+            ),
+        )
+        maintenance_deps = replace(
+            base_deps,
+            heartbeat=lambda: maintenance_progress.__setitem__(
+                0, time.monotonic()
+            ),
         )
         _wedge_watchdog(
-            last_progress=last_progress,
+            plane="parse",
+            last_progress=parse_progress,
             threshold_seconds=settings.worker_wedge_timeout_seconds,
             stop=stop,
         )
-    try:
-        while not stop.is_set():
-            _assert_singleton_or_cancel(lock_conn)
-            started_at = datetime.now(timezone.utc)
-            started_monotonic = time.monotonic()
-            # Round boundaries are progress too: idle rounds plus backoff
-            # sleeps must not accumulate into a false wedge verdict.
-            last_progress[0] = started_monotonic
-            limits = controller.effective_limits(
-                base_limits, now=started_monotonic
+    reports: queue.SimpleQueue[WorkerReport | None] = queue.SimpleQueue()
+    prune_tracker = _ProjectionPruneTracker()
+    report_thread = threading.Thread(
+        target=_report_writer,
+        kwargs={
+            "settings": settings,
+            "reports": reports,
+            "prune_tracker": prune_tracker,
+        },
+        name="worker-reports",
+    )
+    report_thread.start()
+    work_available = threading.Event()
+    fatal = threading.Event()
+    fatal_errors: queue.SimpleQueue[BaseException] = queue.SimpleQueue()
+    maintenance_thread: threading.Thread | None = None
+
+    def should_stop() -> bool:
+        return stop.is_set() or fatal.is_set()
+
+    def maintenance_target() -> None:
+        try:
+            _run_maintenance_loop(
+                settings,
+                deps=maintenance_deps,
+                base_limits=base_limits,
+                should_stop=should_stop,
+                reports=reports,
+                prune_tracker=prune_tracker,
+                work_available=work_available,
             )
-            round_failed = False
-            try:
-                report = run_once(limits, deps, should_stop=stop.is_set)
-            except WorkerSingletonGuardError:
-                # _assert_singleton_or_cancel has already latched parser
-                # shutdown. Continuing this process would make every future
-                # MinerU child self-cancel, so launchd must replace it.
-                raise
-            except Exception as exc:
-                traceback.print_exc()
-                report = _system_failure_report(
+        except BaseException as exc:
+            fatal_errors.put(exc)
+            fatal.set()
+            work_available.set()
+            terminate_active_mineru_processes()
+
+    try:
+        # Stale runs belong to a prior singleton owner. Recover them and any
+        # crash leftovers exactly once before the first resident admission;
+        # periodic age-based reclaim would kill legitimate >1h whole PDFs.
+        _run_startup_recovery(
+            settings,
+            lock_conn=lock_conn,
+            deps=deps,
+            base_limits=base_limits,
+            should_stop=should_stop,
+            reports=reports,
+        )
+        if should_stop():
+            return 0
+        if maintenance_progress is not None:
+            maintenance_progress[0] = time.monotonic()
+            _wedge_watchdog(
+                plane="maintenance",
+                last_progress=maintenance_progress,
+                threshold_seconds=settings.worker_wedge_timeout_seconds,
+                stop=stop,
+            )
+        maintenance_thread = threading.Thread(
+            target=maintenance_target,
+            name="worker-maintenance",
+        )
+        maintenance_thread.start()
+        run_resident_parse(
+            deps,
+            limit=base_limits.parse,
+            should_stop=should_stop,
+            report_interval_seconds=settings.worker_report_interval_seconds,
+            emit_report=reports.put,
+            work_available=work_available,
+            build_recovery_limit=base_limits.build,
+            publish_recovery_limit=base_limits.publish,
+            outage_backoff_initial_seconds=PARSE_COOLDOWN_BASE_SECONDS,
+            outage_backoff_max_seconds=settings.worker_loop_max_interval_seconds,
+        )
+        maintenance_thread.join()
+        maintenance_thread = None
+        if not fatal_errors.empty():
+            raise fatal_errors.get()
+        return 0
+    except BaseException:
+        fatal.set()
+        work_available.set()
+        terminate_active_mineru_processes()
+        raise
+    finally:
+        fatal.set()
+        work_available.set()
+        if maintenance_thread is not None:
+            maintenance_thread.join()
+        reports.put(None)
+        report_thread.join()
+        base_deps.close_source()
+        engine.dispose()
+
+
+class _ProjectionPruneTracker:
+    """Generation-based handoff from published reports to projection."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._acknowledged = 0
+
+    def mark(self, count: int) -> None:
+        if count <= 0:
+            return
+        with self._lock:
+            self._generation += count
+
+    def pending_generation(self) -> int:
+        with self._lock:
+            return (
+                self._generation
+                if self._generation > self._acknowledged
+                else 0
+            )
+
+    def acknowledge(self, generation: int) -> None:
+        with self._lock:
+            self._acknowledged = max(
+                self._acknowledged, min(generation, self._generation)
+            )
+
+
+def _emit_worker_report(settings: Settings, report: WorkerReport) -> None:
+    """Serialize report side effects without making them data-plane fatal."""
+
+    # Alert first, and on its own: a full/unmounted report volume is exactly
+    # the condition an operator must hear about.
+    try:
+        _maybe_alert(settings, report)
+    except Exception:
+        traceback.print_exc()
+    try:
+        _append_reports(settings, report)
+        print(render_report_section(report))
+    except Exception:
+        # Reporting failure must not stop a healthy resident dispatcher.
+        traceback.print_exc()
+
+
+def _report_writer(
+    *,
+    settings: Settings,
+    reports: queue.SimpleQueue[WorkerReport | None],
+    prune_tracker: _ProjectionPruneTracker,
+) -> None:
+    while True:
+        report = reports.get()
+        if report is None:
+            return
+        prune_tracker.mark(report.runs_deactivated)
+        _emit_worker_report(settings, report)
+
+
+def _wait_while(
+    seconds: float,
+    *,
+    should_stop: Callable[[], bool],
+    heartbeat: Callable[[], None] = lambda: None,
+) -> None:
+    deadline = time.monotonic() + seconds
+    while not should_stop():
+        heartbeat()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.5, remaining))
+
+
+def _run_startup_recovery(
+    settings: Settings,
+    *,
+    lock_conn: Connection,
+    deps: WorkerDeps,
+    base_limits: WorkerLimits,
+    should_stop: Callable[[], bool],
+    reports: queue.SimpleQueue[WorkerReport | None],
+) -> None:
+    """Recover prior-owner state and drain leftovers before parse admission."""
+
+    recovery_limits = replace(
+        base_limits,
+        sync=0,
+        download=0,
+        parse=0,
+        acquisition_seconds=0,
+    )
+    reclaim_stale = True
+    # A deactivation can commit after the maintenance thread has stopped, or
+    # immediately before a process crash. The in-memory steady-state signal
+    # cannot survive either boundary, so every new singleton owner performs
+    # one exact prune-capable projection before admitting parse work.
+    projection_recovery_pending = True
+    delay = float(PARSE_COOLDOWN_BASE_SECONDS)
+    while not should_stop():
+        _assert_singleton_or_cancel(lock_conn)
+        started_at = datetime.now(timezone.utc)
+        started_monotonic = time.monotonic()
+        try:
+            report = run_once(
+                recovery_limits,
+                deps,
+                should_stop=should_stop,
+                reclaim_stale=reclaim_stale,
+                # No current-process parse has been admitted yet, and this
+                # process owns the singleton. Every running row therefore
+                # belongs to the exited prior owner, even if it is seconds
+                # old; an age threshold here would strand fresh crash runs
+                # forever because steady maintenance never reclaims.
+                stale_threshold_seconds=0 if reclaim_stale else None,
+                run_projection=True,
+                projection_prune=projection_recovery_pending,
+            )
+        except WorkerSingletonGuardError:
+            raise
+        except Exception as exc:
+            traceback.print_exc()
+            reports.put(
+                _system_failure_report(
                     started_at=started_at,
                     duration_seconds=time.monotonic() - started_monotonic,
                     exc=exc,
                 )
-                round_failed = True
-            # Alert first, and on its own: a full/unmounted report volume is
-            # exactly the condition an operator must hear about, and running
-            # the notification downstream of that write silenced it.
-            try:
-                _maybe_alert(settings, report)
-            except Exception:
-                traceback.print_exc()
-            report_failed = False
-            try:
-                _append_reports(settings, report)
-                print(render_report_section(report))
-            except Exception:
-                # A full/unmounted report volume must not turn KeepAlive into
-                # a 30-second restart storm. stderr still carries the trace.
-                traceback.print_exc()
-                report_failed = True
-            if round_failed or report_failed:
-                delay = controller.system_error_delay()
-            else:
-                delay = controller.observe(report, now=time.monotonic())
-            if stop.is_set():
-                break
-            if delay > 0:
-                print(f"[scheduler] sleeping {round(delay, 3)}s")
-                _sleep_interruptible(delay, stop=stop)
-        return 0
-    finally:
-        deps.close_source()
-        engine.dispose()
+            )
+            _wait_while(
+                delay,
+                should_stop=should_stop,
+                heartbeat=deps.heartbeat,
+            )
+            delay = min(
+                float(settings.worker_loop_max_interval_seconds), delay * 2
+            )
+            continue
+        reclaim_stale = False
+        reports.put(report)
+        projection_failed = any(
+            failure.stage == "project" for failure in report.failures
+        )
+        if projection_recovery_pending:
+            if projection_failed:
+                _wait_while(
+                    delay,
+                    should_stop=should_stop,
+                    heartbeat=deps.heartbeat,
+                )
+                delay = min(
+                    float(settings.worker_loop_max_interval_seconds),
+                    delay * 2,
+                )
+                continue
+            projection_recovery_pending = False
+        shared_failure = (
+            build_failures_indicate_outage(report.failures)
+            or publish_failures_indicate_outage(report.failures)
+        )
+        if shared_failure:
+            _wait_while(
+                delay,
+                should_stop=should_stop,
+                heartbeat=deps.heartbeat,
+            )
+            delay = min(
+                float(settings.worker_loop_max_interval_seconds), delay * 2
+            )
+            continue
+        if report.built or report.published:
+            delay = float(PARSE_COOLDOWN_BASE_SECONDS)
+            continue
+        return
+
+
+def _run_maintenance_loop(
+    settings: Settings,
+    *,
+    deps: WorkerDeps,
+    base_limits: WorkerLimits,
+    should_stop: Callable[[], bool],
+    reports: queue.SimpleQueue[WorkerReport | None],
+    prune_tracker: _ProjectionPruneTracker,
+    work_available: threading.Event,
+) -> None:
+    """Run acquisition and derived projection without owning parse/finalize."""
+
+    controller = _AdaptiveLoopController(
+        idle_base_seconds=settings.worker_loop_interval_seconds,
+        idle_max_seconds=settings.worker_loop_max_interval_seconds,
+    )
+    maintenance_limits = replace(
+        base_limits,
+        parse=0,
+        build=0,
+        publish=0,
+    )
+    while not should_stop():
+        started_at = datetime.now(timezone.utc)
+        started_monotonic = time.monotonic()
+        deps.heartbeat()
+        limits = controller.effective_limits(
+            maintenance_limits, now=started_monotonic
+        )
+        prune_generation = prune_tracker.pending_generation()
+        round_failed = False
+        try:
+            report = run_once(
+                limits,
+                deps,
+                should_stop=should_stop,
+                reclaim_stale=False,
+                run_projection=True,
+                projection_prune=prune_generation > 0,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            report = _system_failure_report(
+                started_at=started_at,
+                duration_seconds=time.monotonic() - started_monotonic,
+                exc=exc,
+            )
+            round_failed = True
+        if (
+            prune_generation > 0
+            and not should_stop()
+            and not any(
+                failure.stage == "project" for failure in report.failures
+            )
+        ):
+            prune_tracker.acknowledge(prune_generation)
+        if report.downloaded:
+            work_available.set()
+        reports.put(report)
+        delay = (
+            controller.system_error_delay()
+            if round_failed
+            else controller.observe(report, now=time.monotonic())
+        )
+        if delay > 0 and not should_stop():
+            print(f"[maintenance] sleeping {round(delay, 3)}s")
+            _wait_while(
+                delay,
+                should_stop=should_stop,
+                heartbeat=deps.heartbeat,
+            )
 
 
 @dataclass
 class _AdaptiveLoopController:
-    """Small scheduler state machine; provider/GPU cooldowns are stage-local."""
+    """Acquisition-only cooldown and idle-backoff state."""
 
     idle_base_seconds: int
     idle_max_seconds: int
@@ -301,31 +603,12 @@ class _AdaptiveLoopController:
     provider_error_cooldown_until: float = 0.0
     quota_cooldown_seconds: int = SYNC_COOLDOWN_BASE_SECONDS
     provider_error_cooldown_seconds: int = PROVIDER_ERROR_COOLDOWN_BASE_SECONDS
-    parse_cooldown_until: float = 0.0
-    parse_cooldown_seconds: int = PARSE_COOLDOWN_BASE_SECONDS
-    build_cooldown_until: float = 0.0
-    build_cooldown_seconds: int = PARSE_COOLDOWN_BASE_SECONDS
-    build_probe_required: bool = False
-    publish_cooldown_until: float = 0.0
-    publish_cooldown_seconds: int = PUBLISH_COOLDOWN_BASE_SECONDS
 
     def __post_init__(self) -> None:
         self.idle_max_seconds = max(
             self.idle_base_seconds, self.idle_max_seconds
         )
         self.idle_delay_seconds = self.idle_base_seconds
-
-    def parse_gate_until(self, *, now: float) -> float | None:
-        """Monotonic instant the parse gate lifts, or None when parse is open."""
-
-        gate_until = max(
-            self.parse_cooldown_until,
-            self.build_cooldown_until,
-            self.publish_cooldown_until,
-        )
-        if self.build_probe_required:
-            return max(gate_until, now)
-        return gate_until if now < gate_until else None
 
     def effective_limits(self, base: WorkerLimits, *, now: float) -> WorkerLimits:
         return replace(
@@ -342,39 +625,7 @@ class _AdaptiveLoopController:
             download=(
                 0 if now < self.provider_error_cooldown_until else base.download
             ),
-            parse=(
-                0
-                if self.build_probe_required
-                or now
-                < max(
-                    self.parse_cooldown_until,
-                    self.build_cooldown_until,
-                    self.publish_cooldown_until,
-                )
-                else base.parse
-            ),
-            build=0 if now < self.build_cooldown_until else base.build,
-            publish=0 if now < self.publish_cooldown_until else base.publish,
-            acquisition_seconds=self._acquisition_window(base, now=now),
         )
-
-    def _acquisition_window(self, base: WorkerLimits, *, now: float) -> int:
-        """Shrink the pump window to the parse gate when parse is closed.
-
-        A parse=0 round otherwise pumps the FULL window: a 120s parse
-        cooldown then keeps the GPU idle for the whole acquisition hour,
-        because parse only retries at round start (observed 2026-07-24 —
-        one transient probe failure amplified into an hour of idle GPU).
-        Tracking the gate keeps outage rounds short at first and lets them
-        grow with the cooldown's own exponential backoff, so a real outage
-        still fills the download buffer on ever-longer rounds.
-        """
-
-        gate_until = self.parse_gate_until(now=now)
-        if gate_until is None:
-            return base.acquisition_seconds
-        remaining = max(60, int(gate_until - now) + 1)
-        return min(base.acquisition_seconds, remaining)
 
     def observe(self, report: WorkerReport, *, now: float) -> float:
         # Reaching a report proves the round-level dependency boundary is
@@ -420,37 +671,7 @@ class _AdaptiveLoopController:
             # collapse its 30→60→120 minute breaker while draining local work.
             self.provider_error_cooldown_seconds = PROVIDER_ERROR_COOLDOWN_BASE_SECONDS
 
-        if _parse_infrastructure_outage(report):
-            self.parse_cooldown_until = now + self.parse_cooldown_seconds
-            self.parse_cooldown_seconds = min(
-                self.idle_max_seconds, self.parse_cooldown_seconds * 2
-            )
-        elif report.parsed:
-            self.parse_cooldown_seconds = PARSE_COOLDOWN_BASE_SECONDS
-
-        build_probe_cleared = False
-        if _build_infrastructure_failure(report):
-            self.build_cooldown_until = now + self.build_cooldown_seconds
-            self.build_cooldown_seconds = min(
-                self.idle_max_seconds, self.build_cooldown_seconds * 2
-            )
-            self.build_probe_required = True
-        elif self.build_probe_required and now >= self.build_cooldown_until:
-            # This was a build-only recovery probe: either leftovers built or
-            # no build work remained. Only now may parse create more runs.
-            self.build_probe_required = False
-            build_probe_cleared = True
-            self.build_cooldown_seconds = PARSE_COOLDOWN_BASE_SECONDS
-
-        if _publish_failure(report):
-            self.publish_cooldown_until = now + self.publish_cooldown_seconds
-            self.publish_cooldown_seconds = min(
-                self.idle_max_seconds, self.publish_cooldown_seconds * 2
-            )
-        elif report.published:
-            self.publish_cooldown_seconds = PUBLISH_COOLDOWN_BASE_SECONDS
-
-        if _made_progress(report) or build_probe_cleared:
+        if _made_progress(report):
             self._reset_success_backoff()
             return 0.0
         if quota_started:
@@ -489,9 +710,6 @@ class _AdaptiveLoopController:
                 self.sync_quota_cooldown_until,
                 self.rate_limit_cooldown_until,
                 self.provider_error_cooldown_until,
-                self.parse_cooldown_until,
-                self.build_cooldown_until,
-                self.publish_cooldown_until,
             )
             if deadline > now
         ]
@@ -499,29 +717,7 @@ class _AdaptiveLoopController:
 
 
 def _made_progress(report: WorkerReport) -> bool:
-    return any(
-        (
-            report.synced_companies,
-            report.downloaded,
-            report.parsed,
-            report.built,
-            report.published,
-        )
-    )
-
-
-def _parse_infrastructure_outage(report: WorkerReport) -> bool:
-    # These are deliberately narrow control-plane/shared-infrastructure
-    # signals, not generic document failures. The dispatcher already closes
-    # the current refill on the first one; the resident controller must apply
-    # the same boundary to the next round even when earlier documents
-    # succeeded, otherwise an explicit 429/readiness/storage outage is
-    # immediately hammered again.
-    return any(
-        failure.stage == "parse"
-        and failure.error_code in PARSER_CONTROL_ERROR_CODES
-        for failure in report.failures
-    )
+    return bool(report.synced_companies or report.downloaded)
 
 
 def _source_infrastructure_outage(report: WorkerReport) -> bool:
@@ -535,14 +731,6 @@ def _source_infrastructure_outage(report: WorkerReport) -> bool:
         )
         for failure in report.failures
     )
-
-
-def _build_infrastructure_failure(report: WorkerReport) -> bool:
-    return build_failures_indicate_outage(report.failures)
-
-
-def _publish_failure(report: WorkerReport) -> bool:
-    return publish_failures_indicate_outage(report.failures)
 
 
 def _system_failure_report(
@@ -759,7 +947,9 @@ def _print_version_banner(settings: Settings) -> None:
         f"{settings.worker_parse_concurrency}x"
         f"{per_document_cap}"
         f"<={settings.worker_gpu_max_sequences} "
-        f"parse_runaway={settings.disclosure_parse_runaway_timeout_seconds}s"
+        f"parse_runaway={settings.disclosure_parse_runaway_timeout_seconds}s "
+        f"resident_dispatch=continuous "
+        f"report_interval={settings.worker_report_interval_seconds}s"
     )
     try:
         engine = create_db_engine(_database_url(settings))

@@ -53,6 +53,7 @@ class SettingsTests(unittest.TestCase):
                     "DISCLOSURE_PARSE_TIMEOUT_MAX_SECONDS": "14400",
                     "DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS": "14399",
                 },
+                {"WORKER_REPORT_INTERVAL_SECONDS": "0"},
             ):
                 with self.subTest(extra=extra), patch.dict(
                     os.environ, {**base, **extra}, clear=True
@@ -92,6 +93,7 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(
                 settings.disclosure_parse_runaway_timeout_seconds, 86400
             )
+            self.assertEqual(settings.worker_report_interval_seconds, 300)
             self.assertIsNone(settings.disclosure_mineru_bin)
             self.assertEqual(settings.cninfo_max_qps, 1.0)
             self.assertEqual(settings.cninfo_max_retries, 3)
@@ -117,6 +119,7 @@ class SettingsTests(unittest.TestCase):
                     "DISCLOSURE_PARSE_TIMEOUT_PER_PAGE_SECONDS": "3",
                     "DISCLOSURE_PARSE_TIMEOUT_MAX_SECONDS": "99",
                     "DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS": "360",
+                    "WORKER_REPORT_INTERVAL_SECONDS": "77",
                     "DISCLOSURE_MINERU_BIN": "/opt/mineru/bin/mineru",
                 }
             )
@@ -142,6 +145,7 @@ class SettingsTests(unittest.TestCase):
                 self.assertEqual(
                     settings.disclosure_parse_runaway_timeout_seconds, 360
                 )
+                self.assertEqual(settings.worker_report_interval_seconds, 77)
                 self.assertEqual(
                     settings.disclosure_mineru_bin, Path("/opt/mineru/bin/mineru")
                 )

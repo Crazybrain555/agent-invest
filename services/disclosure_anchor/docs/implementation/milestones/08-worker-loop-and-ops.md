@@ -76,7 +76,10 @@ helper（每视图一个函数，SELECT … FROM ops.<view> WHERE <阈值谓词>
 
 注意（B1）：published 文档的重解析失败**不出现**在 pending_parse 的降级路径里——document.status
 保持 published，重试判定基于 run 层状态；`non_retryable` 与超次失败只进报告与人工待办。
-stale 回收的执行载体定死：run_once 第一步经 queries.py 执行单条 UPDATE——
+stale 回收的 SQL 载体定死：显式 `worker once` 默认按配置年龄阈值在第一步执行；
+production resident 取得 singleton 后、首次 parse admission 前以 `threshold_seconds=0`
+只执行一次——此时本进程尚未创建 running row，现存行只能属于已经退出的 prior owner；
+maintenance/report 周期禁止重复执行，正常长任务绝不按年龄回收。经 queries.py 执行单条 UPDATE——
 `UPDATE core.processing_run SET status='failed', finished_at=now(),
  error='{"stage":"parse","error_code":"stale_reclaimed","retryable":true}'::jsonb
  WHERE processing_run_id IN (SELECT processing_run_id FROM ops.stale_running_run_v1
@@ -105,8 +108,13 @@ stale 回收的执行载体定死：run_once 第一步经 queries.py 执行单�
 
 ## 3. 实施细则
 
-1. `application/worker/worker.py`：`run_once(limits, deps) -> WorkerReport`——按 §1 队列顺序
-   （stale 回收 → sync → download → parse → build → publish）各处理至多 N 个。
+1. `application/worker/worker.py`：`run_once(limits, deps) -> WorkerReport` 是显式
+   count-bounded 运维入口——按 §1 队列顺序（可选 stale 回收 → sync → download → parse →
+   build → publish）各处理至多 N 个。production `worker loop` 使用同模块的常驻 parse
+   coordinator：stale 启动回收一次；parse 持续补槽；acquisition/project 独立维护；
+   build/publish 由唯一有界 finalize owner 处理新 run 和 crash leftovers；周期报告不排空。
+   startup recovery 还必须在首次 parse admission 前成功完成一次 prune-capable search
+   projection，恢复上个进程可能丢失的易失 deactivation 信号；失败时只退避重试恢复路径。
    既有空包 src/disclosure_anchor/worker/（Phase01 骨架遗留）删除，实现统一放
    application/worker/。类型定死：WorkerLimits 与 WorkerReport 定义在
    `application/dto/worker_report.py`——WorkerLimits{sync, download, parse, build,
@@ -130,15 +138,23 @@ stale 回收的执行载体定死：run_once 第一步经 queries.py 执行单�
    异常隔离粒度按阶段定死：sync=每 tracked_company、download=每候选、
    parse/build/publish=每 document；单项异常记入失败清单（含 stage 与标识）后 continue——
    一个坏项不得打死整个 loop（04R-R4 的异常分型保证 run 已持久化 failed 状态）。
-2. `worker-loop`：`run_once` + sleep（`WORKER_LOOP_INTERVAL_SECONDS` 默认 900）循环；
-   SIGINT/SIGTERM 优雅退出（完成当前 document 后停）。
-3. 重试策略只读结构化错误：`error.retryable`（04R-R4 已收紧分类）+ 次数上限；
-   worker 不自行解释错误文本。
+2. `worker-loop`：主线程常驻 parse coordinator；maintenance thread 以
+   `WORKER_LOOP_INTERVAL_SECONDS`（默认 900）作为 acquisition/project 空闲退避；
+   report writer 以 `WORKER_REPORT_INTERVAL_SECONDS`（默认 300）接收已封存快照。报告、
+   acquisition round 与正常长文档都不能关闭 parse admission。SIGINT/SIGTERM 关闭新准入，
+   终止并清理当前 MinerU 进程组后退出。parse/startup 与 maintenance 使用两个独立
+   heartbeat/watchdog；任一平面的活动都不能掩盖另一平面失活。
+3. 重试策略只读结构化错误：`error.retryable`（04R-R4 已收紧分类）+ PostgreSQL 次数上限；
+   worker 不自行解释错误文本。resident 对可重试失败先让一个固定候选窗口的其他任务通过，
+   到期后经同一 PostgreSQL 资格/次数谓词按 exact ID 重新准入；普通候选扫描使用固定页
+   大小 keyset，游标只推进到实际检查行，禁止随进程内已见集合扩大 SQL `LIMIT`。因此即使
+   新 ULID 持续到达也不热重试、不饿死，内存和查询成本都有界。
 4. 报告路径与写入语义定死：`<DISCLOSURE_RUNTIME_ROOT>/reports/worker/YYYY-MM-DD.md` 与
    `<DISCLOSURE_RUNTIME_ROOT>/reports/parse_quality/YYYY-MM-DD.md`（date = 本地时区的轮次
-   开始日期；**同日多轮追加写入**，每轮一个 `## run <ISO8601 开始时间>` 小节——覆盖式写法会让
-   挂机一晚只剩最后一轮）。内容：WorkerReport 全字段 + 失败清单（document_id + error_code）；
-   parse_quality 汇入 05 的 build_stats.v1.json 统计。不进 git。
+   开始日期；**同日多快照追加写入**，每个所有权已转移的 WorkerReport 一个
+   `## run <ISO8601 开始时间>` 小节——覆盖式写法会让挂机一晚只剩最后一轮）。内容：
+   WorkerReport 全字段 + 失败清单（document_id + error_code）；parse_quality 汇入 05 的
+   build_stats.v1.json 统计。不进 git。报告 I/O/告警失败与数据面隔离，不得停止健康 parse。
 5. CLI 与 Makefile 定死：cli/worker.py 用 argparse 子命令 `once|loop`；Makefile 追加
    （并入 .PHONY）：
    `worker-once:` → `PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker once`
@@ -189,9 +205,10 @@ tests/unit 只测 run_once 的调度/报告聚合（fake 队列结果）与 stab
 ## 6. Definition of Done
 
 - 每包提交门禁 = `make agent-check` + live-DB `make test`（04R §6.1 2026-07-05 修订）；
-- 本地运行闭环成立：`worker-loop` 挂机一晚，或模拟等价（定义定死：
-  WORKER_LOOP_INTERVAL_SECONDS=60 连续运行 ≥30 分钟，期间分两批注入 ≥3 个新候选
-  （fake source 或本地 register），全部自动到 active run 且报告文件含 ≥3 个轮次小节）；
+- 本地运行闭环成立：`worker-loop` 挂机一晚，或在隔离 scratch DB 模拟等价（定义定死：
+  `WORKER_REPORT_INTERVAL_SECONDS=60` 连续运行 ≥30 分钟，期间分两批注入 ≥3 个新候选
+  （fake source 或 scratch register），全部自动到 active run，报告文件含 ≥3 个快照小节，
+  且快照时刻不关闭 admission/排空 future）；
 - 失败可恢复、可定位；acceptance-matrix A29/A30 置 pass。
 
 ## 6.5 实施后修订（2026-07-06，Claude 实现 / Codex 终审，实施中定案）

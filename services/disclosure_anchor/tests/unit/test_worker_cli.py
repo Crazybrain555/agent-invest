@@ -30,7 +30,9 @@ class AdaptiveLoopControllerTests(unittest.TestCase):
         self.limits = WorkerLimits(sync=13, download=300, parse=50, build=10, publish=10)
 
     def test_progress_runs_next_round_without_wait(self) -> None:
-        self.assertEqual(self.controller.observe(_report(parsed=1), now=10.0), 0)
+        self.assertEqual(
+            self.controller.observe(_report(downloaded=1), now=10.0), 0
+        )
         self.assertEqual(self.controller.effective_limits(self.limits, now=10.0), self.limits)
 
     def test_idle_backoff_is_fifteen_then_thirty_minutes(self) -> None:
@@ -71,157 +73,28 @@ class AdaptiveLoopControllerTests(unittest.TestCase):
             13,
         )
 
-    def test_gpu_outage_cools_only_parse_stage(self) -> None:
-        report = _report(failed=8)
-        report.failures.extend(
-            WorkerFailure("parse", f"doc_{index}", "parser_backend_unavailable")
-            for index in range(8)
-        )
-
-        self.controller.observe(report, now=10.0)
-        cooled = self.controller.effective_limits(self.limits, now=11.0)
-        self.assertEqual(cooled.parse, 0)
-        self.assertEqual(cooled.sync, 13)
-        self.assertEqual(
-            self.controller.effective_limits(self.limits, now=130.0).parse,
-            50,
-        )
-
-    def test_document_task_timeout_does_not_activate_gpu_cooldown(self) -> None:
-        report = _report(failed=1)
-        report.failures.append(
-            WorkerFailure(
-                "parse",
-                "doc_timeout",
-                "parser_task_deadline_exceeded",
-            )
-        )
-
-        self.controller.observe(report, now=10.0)
-
-        self.assertEqual(
-            self.controller.effective_limits(self.limits, now=11.0).parse,
-            50,
-        )
-
-    def test_partial_batch_gpu_outage_still_activates_cooldown(self) -> None:
-        report = _report(failed=7, parsed=1)
-        report.failures.extend(
-            WorkerFailure("parse", f"doc_{index}", "parser_backend_overloaded")
-            for index in range(7)
-        )
-
-        self.assertEqual(self.controller.observe(report, now=10.0), 0)
-        self.assertEqual(
-            self.controller.effective_limits(self.limits, now=11.0).parse,
-            0,
-        )
-
-    def test_one_explicit_overload_after_many_successes_activates_cooldown(
-        self,
-    ) -> None:
-        report = _report(failed=1, parsed=10)
-        report.failures.append(
-            WorkerFailure(
-                "parse",
-                "doc_overloaded",
-                "parser_backend_overloaded",
-            )
-        )
-
-        self.assertEqual(self.controller.observe(report, now=10.0), 0)
-        self.assertEqual(
-            self.controller.effective_limits(self.limits, now=11.0).parse,
-            0,
-        )
-
     def test_source_outage_cools_source_but_not_local_parse(self) -> None:
-        report = _report(failed=1, parsed=1)
+        report = _report(failed=1)
         report.failures.append(WorkerFailure("source", "cninfo", "ConfigurationError"))
 
-        self.assertEqual(self.controller.observe(report, now=10.0), 0)
+        self.assertEqual(self.controller.observe(report, now=10.0), 60)
         cooled = self.controller.effective_limits(self.limits, now=11.0)
         self.assertEqual(cooled.sync, 0)
         self.assertEqual(cooled.download, 0)
         self.assertEqual(cooled.parse, 50)
 
-    def test_wrapped_provider_outage_cools_source_even_with_parse_progress(self) -> None:
-        report = _report(failed=13, parsed=1)
+    def test_wrapped_provider_outage_cools_acquisition_only(self) -> None:
+        report = _report(failed=13)
         report.failures.extend(
             WorkerFailure("sync", f"company_{index}", "http_503", True)
             for index in range(13)
         )
 
-        self.assertEqual(self.controller.observe(report, now=10.0), 0)
+        self.assertEqual(self.controller.observe(report, now=10.0), 60)
         cooled = self.controller.effective_limits(self.limits, now=11.0)
         self.assertEqual(cooled.sync, 0)
         self.assertEqual(cooled.download, 0)
         self.assertEqual(cooled.parse, 50)
-
-    def test_publish_failure_cools_publish_and_parse_even_with_other_progress(self) -> None:
-        report = _report(failed=1, downloaded=1, parsed=1, built=1)
-        report.failures.append(
-            WorkerFailure("publish", "run_1", "IR_READ_FAILED", True)
-        )
-
-        self.assertEqual(self.controller.observe(report, now=10.0), 0)
-        cooled = self.controller.effective_limits(self.limits, now=11.0)
-        self.assertEqual(cooled.parse, 0)
-        self.assertEqual(cooled.publish, 0)
-        self.assertEqual(cooled.download, 300)
-
-    def test_build_failure_cools_build_and_parse_even_with_parse_progress(self) -> None:
-        report = _report(failed=1, parsed=1)
-        report.failures.append(WorkerFailure("build", "run_1", "DB_WRITE_FAILED"))
-
-        self.assertEqual(self.controller.observe(report, now=10.0), 0)
-        cooled = self.controller.effective_limits(self.limits, now=11.0)
-        self.assertEqual(cooled.parse, 0)
-        self.assertEqual(cooled.build, 0)
-        self.assertEqual(cooled.download, 300)
-        # When cooldown expires, one build-only round proves recovery before
-        # new PDFs may consume GPU and leave the admission watermark.
-        probe = self.controller.effective_limits(self.limits, now=130.0)
-        self.assertEqual(probe.parse, 0)
-        self.assertEqual(probe.build, 10)
-        self.assertEqual(self.controller.observe(_report(), now=130.0), 0)
-        self.assertEqual(
-            self.controller.effective_limits(self.limits, now=131.0).parse,
-            50,
-        )
-
-    def test_item_local_build_and_publish_poison_do_not_cool_stages(self) -> None:
-        report = _report(failed=2, parsed=1)
-        report.failures.extend(
-            (
-                WorkerFailure("build", "run_1", "IR_MISSING"),
-                WorkerFailure(
-                    "publish",
-                    "run_2",
-                    "RUN_UNIT_HASH_INVALID",
-                ),
-            )
-        )
-
-        self.assertEqual(self.controller.observe(report, now=10.0), 0)
-        self.assertEqual(
-            self.controller.effective_limits(self.limits, now=11.0),
-            self.limits,
-        )
-
-    def test_repeated_unknown_build_failure_activates_global_cooldown(self) -> None:
-        report = _report(failed=2, parsed=2)
-        report.failures.extend(
-            (
-                WorkerFailure("build", "run_1", "RuntimeError"),
-                WorkerFailure("build", "run_2", "RuntimeError"),
-            )
-        )
-
-        self.assertEqual(self.controller.observe(report, now=10.0), 0)
-        cooled = self.controller.effective_limits(self.limits, now=11.0)
-        self.assertEqual(cooled.parse, 0)
-        self.assertEqual(cooled.build, 0)
 
     def test_system_errors_exponentially_back_off(self) -> None:
         self.assertEqual(self.controller.system_error_delay(), 60)
@@ -237,84 +110,165 @@ class AdaptiveLoopControllerTests(unittest.TestCase):
 
 
 class ResidentLoopBoundaryTests(unittest.TestCase):
-    def test_system_error_is_reported_and_next_round_runs(self) -> None:
-        stop = mock.MagicMock()
-        engine = mock.MagicMock()
-        success = _report(downloaded=1)
-        emitted: list[WorkerReport] = []
-        sleeps: list[float] = []
-        deps = mock.MagicMock()
-
-        with (
-            mock.patch.object(worker_cli, "_StopFlag", return_value=stop),
-            mock.patch.object(worker_cli, "create_db_engine", return_value=engine),
-            mock.patch.object(worker_cli, "_deps", return_value=deps),
-            mock.patch.object(worker_cli, "_assert_singleton_lock"),
-            mock.patch.object(
-                worker_cli, "run_once", side_effect=[RuntimeError("db down"), success]
-            ) as run_once,
-            mock.patch.object(
-                worker_cli, "_append_reports", side_effect=lambda _settings, report: emitted.append(report)
-            ),
-            mock.patch.object(worker_cli, "_sleep_interruptible", side_effect=lambda seconds, **_: sleeps.append(seconds)),
-            mock.patch.object(worker_cli.traceback, "print_exc"),
-            mock.patch("builtins.print"),
-        ):
-            stop.is_set.side_effect = lambda: run_once.call_count >= 2
-            result = worker_cli._run_loop(
-                mock.MagicMock(
-                    worker_loop_interval_seconds=900,
-                    worker_loop_max_interval_seconds=1800,
-                    worker_wedge_timeout_seconds=0,
-                ),
-                lock_conn=mock.MagicMock(),
+    def test_startup_recovery_retries_before_first_admission(self) -> None:
+        settings = mock.MagicMock(worker_loop_max_interval_seconds=1800)
+        projection_failed = _report(failed=1)
+        projection_failed.failures.append(
+            WorkerFailure(
+                "project",
+                "search_projection",
+                "RuntimeError",
+                True,
             )
-
-        self.assertEqual(result, 0)
-        self.assertEqual(len(emitted), 2)
-        self.assertEqual(emitted[0].failures[0].stage, "system")
-        self.assertEqual(emitted[0].failures[0].error_code, "RuntimeError")
-        self.assertEqual(emitted[1].downloaded, 1)
-        self.assertEqual(sleeps, [60.0])
-        deps.close_source.assert_called_once_with()
-        engine.dispose.assert_called_once()
-
-    def test_report_io_failure_backs_off_without_exiting(self) -> None:
-        stop = mock.MagicMock()
-        engine = mock.MagicMock()
+        )
+        recovered = _report(built=1)
+        drained = _report()
         deps = mock.MagicMock()
-        success = _report(downloaded=1)
-        sleeps: list[float] = []
+        reports: worker_cli.queue.SimpleQueue[WorkerReport | None] = (
+            worker_cli.queue.SimpleQueue()
+        )
 
         with (
-            mock.patch.object(worker_cli, "_StopFlag", return_value=stop),
-            mock.patch.object(worker_cli, "create_db_engine", return_value=engine),
-            mock.patch.object(worker_cli, "_deps", return_value=deps),
-            mock.patch.object(worker_cli, "_assert_singleton_lock"),
-            mock.patch.object(worker_cli, "run_once", return_value=success) as run_once,
-            mock.patch.object(
-                worker_cli, "_append_reports", side_effect=OSError("disk full")
-            ),
+            mock.patch.object(worker_cli, "_assert_singleton_or_cancel"),
             mock.patch.object(
                 worker_cli,
-                "_sleep_interruptible",
-                side_effect=lambda seconds, **_: sleeps.append(seconds),
-            ),
+                "run_once",
+                side_effect=[
+                    RuntimeError("db down"),
+                    projection_failed,
+                    recovered,
+                    drained,
+                ],
+            ) as run_once,
+            mock.patch.object(worker_cli, "_wait_while") as wait,
+            mock.patch.object(worker_cli.traceback, "print_exc"),
+        ):
+            worker_cli._run_startup_recovery(
+                settings,
+                lock_conn=mock.MagicMock(),
+                deps=deps,
+                base_limits=WorkerLimits(
+                    sync=1, download=1, parse=2, build=3, publish=4
+                ),
+                should_stop=lambda: False,
+                reports=reports,
+            )
+
+        first = reports.get()
+        second = reports.get()
+        third = reports.get()
+        fourth = reports.get()
+        assert (
+            first is not None
+            and second is not None
+            and third is not None
+            and fourth is not None
+        )
+        self.assertEqual(first.failures[0].stage, "system")
+        self.assertIs(second, projection_failed)
+        self.assertIs(third, recovered)
+        self.assertIs(fourth, drained)
+        self.assertEqual(run_once.call_count, 4)
+        self.assertEqual(
+            [
+                call.kwargs["reclaim_stale"]
+                for call in run_once.call_args_list
+            ],
+            [True, True, False, False],
+        )
+        self.assertEqual(
+            [
+                call.kwargs["stale_threshold_seconds"]
+                for call in run_once.call_args_list
+            ],
+            [0, 0, None, None],
+        )
+        self.assertEqual(
+            [
+                call.kwargs["run_projection"]
+                for call in run_once.call_args_list
+            ],
+            [True, True, True, True],
+        )
+        self.assertEqual(
+            [
+                call.kwargs["projection_prune"]
+                for call in run_once.call_args_list
+            ],
+            [True, True, True, False],
+        )
+        self.assertEqual(wait.call_count, 2)
+
+    def test_report_io_failure_does_not_stop_later_reports(self) -> None:
+        reports: worker_cli.queue.SimpleQueue[WorkerReport | None] = (
+            worker_cli.queue.SimpleQueue()
+        )
+        first = _report()
+        first.runs_deactivated = 2
+        second = _report(downloaded=1)
+        reports.put(first)
+        reports.put(second)
+        reports.put(None)
+        tracker = worker_cli._ProjectionPruneTracker()
+
+        with (
+            mock.patch.object(
+                worker_cli,
+                "_append_reports",
+                side_effect=[OSError("disk full"), None],
+            ) as append,
+            mock.patch.object(worker_cli, "_maybe_alert"),
             mock.patch.object(worker_cli.traceback, "print_exc"),
             mock.patch("builtins.print"),
         ):
-            stop.is_set.side_effect = lambda: run_once.call_count >= 2
-            result = worker_cli._run_loop(
-                mock.MagicMock(
-                    worker_loop_interval_seconds=900,
-                    worker_loop_max_interval_seconds=1800,
-                    worker_wedge_timeout_seconds=0,
-                ),
-                lock_conn=mock.MagicMock(),
+            worker_cli._report_writer(
+                settings=mock.MagicMock(),
+                reports=reports,
+                prune_tracker=tracker,
             )
 
-        self.assertEqual(result, 0)
-        self.assertEqual(sleeps, [60.0])
+        self.assertEqual(append.call_count, 2)
+        self.assertEqual(tracker.pending_generation(), 2)
+
+    def test_maintenance_projects_without_reclaim_or_finalize_ownership(
+        self,
+    ) -> None:
+        reports: worker_cli.queue.SimpleQueue[WorkerReport | None] = (
+            worker_cli.queue.SimpleQueue()
+        )
+        tracker = worker_cli._ProjectionPruneTracker()
+        tracker.mark(3)
+        work_available = worker_cli.threading.Event()
+        deps = mock.MagicMock()
+        report = _report(downloaded=1)
+        should_stop = mock.Mock(side_effect=[False, False, True])
+
+        with mock.patch.object(
+            worker_cli, "run_once", return_value=report
+        ) as run_once:
+            worker_cli._run_maintenance_loop(
+                mock.MagicMock(
+                    worker_loop_interval_seconds=1,
+                    worker_loop_max_interval_seconds=2,
+                ),
+                deps=deps,
+                base_limits=WorkerLimits(
+                    sync=1, download=2, parse=3, build=4, publish=5
+                ),
+                should_stop=should_stop,
+                reports=reports,
+                prune_tracker=tracker,
+                work_available=work_available,
+            )
+
+        limits = run_once.call_args.args[0]
+        self.assertEqual((limits.parse, limits.build, limits.publish), (0, 0, 0))
+        self.assertFalse(run_once.call_args.kwargs["reclaim_stale"])
+        self.assertTrue(run_once.call_args.kwargs["run_projection"])
+        self.assertTrue(run_once.call_args.kwargs["projection_prune"])
+        self.assertIs(reports.get(), report)
+        self.assertTrue(work_available.is_set())
+        self.assertEqual(tracker.pending_generation(), 0)
 
     def test_production_deps_reuses_one_cninfo_client_across_rounds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -416,10 +370,9 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 worker_cli, "create_db_engine", return_value=engine
             ),
             mock.patch.object(worker_cli, "_deps", return_value=deps),
-            mock.patch.object(worker_cli, "_assert_singleton_or_cancel"),
             mock.patch.object(
                 worker_cli,
-                "run_once",
+                "_run_startup_recovery",
                 side_effect=worker_cli.WorkerSingletonGuardError(
                     "singleton advisory lock was lost"
                 ),
@@ -429,6 +382,113 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             worker_cli._run_loop(settings, lock_conn=mock.MagicMock())
 
         deps.close_source.assert_called_once_with()
+        engine.dispose.assert_called_once_with()
+
+    def test_maintenance_heartbeat_cannot_mask_parse_plane(self) -> None:
+        import itertools
+        import threading
+
+        engine = mock.MagicMock()
+        close_source = mock.Mock()
+        deps = worker_cli.WorkerDeps(
+            engine=engine,
+            uow_factory=lambda: mock.MagicMock(),
+            path_builder=mock.MagicMock(),
+            raw_store=mock.MagicMock(),
+            artifact_store=mock.MagicMock(),
+            source_factory=lambda: mock.MagicMock(),
+            profile_loader_factory=lambda _source: lambda _code: None,
+            parser_factory=lambda: mock.MagicMock(),
+            parse_expected_seconds=1,
+            config=mock.MagicMock(),
+            close_source=close_source,
+        )
+        stop = mock.MagicMock()
+        stop.is_set.return_value = False
+        settings = mock.MagicMock(
+            worker_loop_interval_seconds=900,
+            worker_loop_max_interval_seconds=1800,
+            worker_report_interval_seconds=300,
+            worker_wedge_timeout_seconds=2700,
+        )
+        limits = WorkerLimits(
+            sync=1, download=1, parse=1, build=1, publish=1
+        )
+        progress: dict[str, list[float]] = {}
+        initial_parse_progress: list[float] = []
+        maintenance_pulsed = threading.Event()
+        clocks = itertools.count(100)
+
+        def watchdog(
+            *,
+            plane: str,
+            last_progress: list[float],
+            **_kwargs: object,
+        ) -> mock.MagicMock:
+            progress[plane] = last_progress
+            if plane == "parse":
+                initial_parse_progress.append(last_progress[0])
+            return mock.MagicMock()
+
+        def maintenance(
+            *_args: object,
+            deps: worker_cli.WorkerDeps,
+            **_kwargs: object,
+        ) -> None:
+            deps.heartbeat()
+            maintenance_pulsed.set()
+
+        def resident(
+            parse_deps: worker_cli.WorkerDeps,
+            **_kwargs: object,
+        ) -> None:
+            self.assertTrue(maintenance_pulsed.wait(timeout=1))
+            self.assertEqual(
+                progress["parse"][0],
+                initial_parse_progress[0],
+                "maintenance progress must not renew parse ownership",
+            )
+            self.assertGreater(
+                progress["maintenance"][0],
+                initial_parse_progress[0],
+            )
+            parse_deps.heartbeat()
+            self.assertGreater(
+                progress["parse"][0], initial_parse_progress[0]
+            )
+
+        with (
+            mock.patch.object(worker_cli, "_StopFlag", return_value=stop),
+            mock.patch.object(
+                worker_cli, "create_db_engine", return_value=engine
+            ),
+            mock.patch.object(worker_cli, "_deps", return_value=deps),
+            mock.patch.object(worker_cli, "_limits", return_value=limits),
+            mock.patch.object(worker_cli, "_run_startup_recovery"),
+            mock.patch.object(
+                worker_cli,
+                "_run_maintenance_loop",
+                side_effect=maintenance,
+            ),
+            mock.patch.object(
+                worker_cli, "run_resident_parse", side_effect=resident
+            ),
+            mock.patch.object(
+                worker_cli, "_wedge_watchdog", side_effect=watchdog
+            ),
+            mock.patch.object(
+                worker_cli.time,
+                "monotonic",
+                side_effect=lambda: float(next(clocks)),
+            ),
+        ):
+            result = worker_cli._run_loop(
+                settings, lock_conn=mock.MagicMock()
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(set(progress), {"parse", "maintenance"})
+        close_source.assert_called_once_with()
         engine.dispose.assert_called_once_with()
 
     def test_alert_message_triggers_on_outage_and_failure_burst(self) -> None:
@@ -504,58 +564,3 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class AcquisitionWindowTrackingTests(unittest.TestCase):
-    """The pump window must follow the parse gate (2026-07-24: a 120s parse
-    cooldown otherwise idled the GPU for the full acquisition hour, because
-    parse only retries at round start)."""
-
-    def setUp(self) -> None:
-        self.controller = worker_cli._AdaptiveLoopController(
-            idle_base_seconds=1, idle_max_seconds=600
-        )
-        self.limits = WorkerLimits(
-            sync=13,
-            download=300,
-            parse=50,
-            build=10,
-            publish=10,
-            acquisition_seconds=3600,
-        )
-
-    def test_open_parse_gate_keeps_full_window(self) -> None:
-        effective = self.controller.effective_limits(self.limits, now=10.0)
-        self.assertEqual(effective.parse, 50)
-        self.assertEqual(effective.acquisition_seconds, 3600)
-
-    def test_parse_cooldown_shrinks_window_to_gate_expiry(self) -> None:
-        report = _report(failed=1)
-        report.failures.append(
-            WorkerFailure("parse", "parser", "parser_version_probe_failed")
-        )
-        self.controller.observe(report, now=10.0)
-        effective = self.controller.effective_limits(self.limits, now=11.0)
-        self.assertEqual(effective.parse, 0)
-        # Gate lifts at 10 + 120s cooldown; window tracks the remainder, so
-        # the next round can retry parse right after the cooldown instead of
-        # pumping the full hour with an idle GPU.
-        self.assertLessEqual(effective.acquisition_seconds, 121)
-        self.assertGreaterEqual(effective.acquisition_seconds, 60)
-
-    def test_gate_never_stretches_a_smaller_base_window(self) -> None:
-        small = WorkerLimits(
-            sync=1,
-            download=1,
-            parse=1,
-            build=0,
-            publish=0,
-            acquisition_seconds=30,
-        )
-        report = _report(failed=1)
-        report.failures.append(
-            WorkerFailure("parse", "parser", "parser_version_probe_failed")
-        )
-        self.controller.observe(report, now=10.0)
-        effective = self.controller.effective_limits(small, now=11.0)
-        self.assertEqual(effective.acquisition_seconds, 30)

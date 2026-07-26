@@ -377,6 +377,17 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias=AliasChoices("WORKER_BATCH_PUBLISH", "worker_batch_publish"),
     )
+    # Observability cadence for the resident parse dispatcher. This rotates
+    # an immutable report snapshot while parse/finalize pools keep running;
+    # it is never an admission deadline or a document timeout.
+    worker_report_interval_seconds: int = Field(
+        default=300,
+        ge=1,
+        validation_alias=AliasChoices(
+            "WORKER_REPORT_INTERVAL_SECONDS",
+            "worker_report_interval_seconds",
+        ),
+    )
     worker_loop_interval_seconds: int = Field(
         default=900,
         ge=1,

@@ -2,16 +2,17 @@
 id: disclosure_anchor_worker_dynamic_scheduling
 title: Worker 动态调度、GPU 锯齿根因与发布验收
 date: 2026-07-09
-updated_at: 2026-07-25
-status: deployed-ab-in-progress-with-local-follow-up
+updated_at: 2026-07-26
+status: continuous-resident-candidate-pending-cutover
 authority: tracked implementation design; live runtime values must be re-verified
 ---
 
 > 本文记录可复核的事故证据、版本匹配的外部机制和当前实现边界。基础修复 commit
 > `dcf7014` 与 readiness/cutover 修正 `15994df` 已于 2026-07-25 重启上线，生产 A/B
-> 仍在进行。A/B 证实单次 readiness 失败可在原 dispatcher 内恢复；后续复核又发现
-> 1–4 小时 wall-clock deadline 仍与“正常长任务不因耗时终止”的产品不变量冲突，
-> 对应软预算/极远 runaway 修正尚未提交或发布。因此“已覆盖”不等于发布验收完成。
+> 证实单次 readiness 失败可在原 dispatcher 内恢复；2026-07-26 的后续 A/B 又确认，
+> parse admission 仍被一小时 acquisition/report round 截断。当前候选把生产 parse
+> 改为生命周期常驻、把报告改为只读快照；尚未完成本次受控重启和新 A/B。因此“代码
+> 覆盖”不等于发布验收完成。
 > GPU、backlog、版本和并发数字都是带日期的运维证据，每次发布都必须重新核验。
 
 # Worker 动态调度与 GPU 锯齿根因报告
@@ -26,6 +27,7 @@ authority: tracked implementation design; live runtime values must be re-verifie
 | **直接波形机制** | 请求洪峰把 vLLM running 推到调度平台并积出 waiting；文档随后成组进入本地 finalize，GPU 供给骤降 | 83 秒短窗内从 `1/0 → 127/151 → 回落`；16:34 的独立横截面仍为 `121/40` |
 | **放大器** | 文档完成级 AIMD 的反馈延迟为分钟到小时，失败砍半、成功慢升，把少量 item/健康抖动放大成低并发长谷 | 历史报告曾降到 `parse_concurrency_limit=1`；而普通大文档本身需 20–60 分钟，反馈控制不到秒级请求洪峰 |
 | **第二根因** | 固定 200 份候选的批尾排空，以及 parse 与 build/publish 共占同一文档槽 | 连续四波都恰好 200 starts，批尾分别有 6/3/7/10 分钟低于 8 个在途且没有新 start |
+| **2026-07-26 残余根因** | resident parse 仍把 `WORKER_ACQUISITION_SECONDS=3600` 同时当成 admission deadline 和 report/round 边界；到期后只允许 regular filler | 最近 245 个分钟边界有 69 个低于 16；同时 backlog 约 20,538，候选前 1,000 为 `regular=0/heavy=460/huge=540`，所以时窗一关只能排空长尾 |
 | **不是根因** | 不是 backlog 不足，也不能仅凭 GPU 图的空谷判定服务宕机 | 11:53 仍有 19,878 个 eligible pending；同一观测窗 `/health` 20/20 为 200 |
 
 一句话因果链：
@@ -39,6 +41,18 @@ authority: tracked implementation design; live runtime values must be re-verifie
   → 文档级 AIMD 在很久以后才误判并砍槽
   → 固定 200 批尾继续排空
   → “过排队—空谷—再突发”的锯齿
+```
+
+前两轮修复已收住请求洪峰、拆开 finalize 并删除文档级 AIMD，但旧 round 生命周期仍留下
+一条独立锯齿链：
+
+```text
+一小时 acquisition/report deadline 到期
+  → resident 停止 heavy/huge admission
+  → 当前候选恰好没有 regular
+  → 16 个不可抢占的 whole-PDF future 逐个完成而不补槽
+  → 报告写完、下一 round 才重新准入
+  → GPU 到达流量形成长尾空谷
 ```
 
 目标不是把瞬时 GPU 利用率强行画成 100% 直线，而是在结果语义不变的前提下同时降低：
@@ -121,6 +135,30 @@ HTTP admission 或 waiting queue 上限。该端点没有直接暴露 `max_num_s
 最新 4.0.0 alpha 虽增加页范围缓存和任务队列，仍在整 job 完成后写结果，没有跨文档 GPU
 request broker 或内部 window 失败续跑 checkpoint；alpha 不进入本轮生产 cutover。
 
+### 2.4 2026-07-26：为什么前一轮修复后仍有锯齿
+
+17:30–21:35 对 `processing_run.started_at/finished_at` 做分钟边界重放：
+
+- 245 个分钟边界中，176 个达到 16 份文档在途，69 个低于 16（28.16%）；
+- 46 个边界不高于 8、40 个不高于 4、30 个不高于 1；
+- 平均文档在途 12.861；按当前 `16×7` 请求包络粗算，理论供给利用率只有 80.38%；
+- 同窗 169 成功、1 失败，不能用失败潮解释 17:38–17:50、19:30–20:04、
+  21:15 之后的长尾；
+- admission 打开时，文档完成到下一份 start 的 p50 仅 0.77 秒，排除 PostgreSQL dequeue
+  或普通补槽本身过慢。
+
+代码与实时队列的交叉证据给出唯一能同时解释这些事实的机制：
+
+1. `run_once()` 把生产默认 3,600 秒的 `limits.acquisition_seconds` 复用成 parse
+   `keep_refilling` deadline；
+2. deadline 之后只允许 regular filler，等待已有 heavy/huge future 排空后才能返回、写报告；
+3. 同时刻 eligible backlog 约 20,538，`pending_parse` 前 1,000 份成本重放为
+   `regular=0 / heavy=460 / huge=540`。
+
+因此这是**有任务但调度器主动关闭准入**，不是 GPU 必须 100% 才算健康，也不是提高并发能
+解决的问题。固定时窗对不可抢占、耗时高方差的 whole-PDF future 必然制造 drain barrier；
+只要报告仍要求先排空，窗口改成两小时或“到期后多放几个 heavy”都只会改变锯齿周期。
+
 ## 3. 成熟项目采用的共同原则
 
 本次不是复制某个框架，而是把版本匹配、可证实的调度不变量落到现有 PostgreSQL 队列和
@@ -131,11 +169,11 @@ request broker 或内部 window 失败续跑 checkpoint；alpha 不进入本轮�
 | [MinerU](https://github.com/opendatalab/MinerU/blob/mineru-3.4.0-released/docs/en/usage/quick_usage.md) | 临时 API、显式 `max_concurrency`、整本文档输出 | 在官方请求入口设硬上限；保留 whole-PDF 语义 | 不 patch MinerU 内部，不把 processing window 当可恢复外部分片 |
 | [vLLM](https://docs.vllm.ai/en/stable/) / [SchedulerConfig](https://docs.vllm.ai/en/stable/api/vllm/config/scheduler/) | continuous batching；`max_num_seqs` 限每轮处理 sequence 数 | 客户端平滑、有界地供给，动态合批交给 vLLM | 不把 waiting queue 当 admission control，不靠提交海量请求“喂满”GPU |
 | [Docling pipeline](https://docling-project.github.io/docling/reference/pipeline_options/) | OCR/layout/table 分阶段 batch；bounded queue 满时上游阻塞；`document_timeout=None` 默认不强杀 | 页/阶段窗口限制工作集，总时长只是可选业务策略 | 不把 Docling 的 partial-success timeout 套到 MinerU 原子整本产物 |
-| [Celery optimization](https://docs.celeryq.dev/en/latest/userguide/optimizing.html) | 长短任务使用分别配置的 worker/queue；长任务 prefetch multiplier 取 1 | 大小 lane；执行槽空一个才取一个，避免长任务预取占住短任务 | 不引入 Redis/RabbitMQ 或第二份任务真相 |
+| [Celery optimization](https://docs.celeryq.dev/en/latest/userguide/optimizing.html) | 长短任务使用分别配置的 worker/queue；长任务 prefetch multiplier 取 1；resident consumer 持续取任务 | 大小 lane；执行槽空一个才取一个；监控/事件周期不结束 consumer 生命周期 | 不引入 Redis/RabbitMQ 或第二份任务真相 |
 | [Kueue quota borrowing](https://kueue.sigs.k8s.io/docs/concepts/cluster_queue/) | nominal quota 保证份额，空闲 quota 可由 cohort 借用 | regular/heavy/huge 各有名义份额，lane 空时 work-conserving 借满 | 不引入 Kubernetes 控制面 |
 | [Temporal heartbeat/fairness](https://docs.temporal.io/encyclopedia/detecting-activity-failures) | 长 Activity 用短 heartbeat timeout 证明存活；Start-To-Close 必须长于最大可能耗时；weighted band 空时可借满 | 正常长任务持续续 heartbeat；耗时预算与 liveness 分开 | MinerU 无页级 checkpoint，不能伪造可恢复进度 payload |
 | [NVIDIA Triton](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/batcher.html) | 单一服务端队列、dynamic batching、queue policy 与 priority | 真正动态容量应位于共享 GPU 请求入口 | 当前 vLLM/MinerU 模型协议不是 Triton drop-in，不替换生产推理栈 |
-| [Ray Serve](https://docs.ray.io/en/latest/serve/advanced-guides/asyncio-best-practices.html) | `max_ongoing_requests` 以 replica 为静态 in-flight cap，超出后排队/背压 | GPU 请求预算与文档槽分开；finalize 不继续占 GPU 槽 | 不为单机 worker 引入 Ray replica/router/autoscaler |
+| [Ray Serve](https://docs.ray.io/en/latest/serve/advanced-guides/asyncio-best-practices.html) | `max_ongoing_requests` 以 replica 为静态 in-flight cap，超出后排队/背压；周期指标不要求 replica 排空 | GPU 请求预算与文档槽分开；报告是所有权转移的周期快照，不是 drain barrier | 不为单机 worker 引入 Ray replica/router/autoscaler |
 | [Envoy circuit breaker](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/circuit_breaking) | 分别限制 active、pending、retry，过载快速背压 | 只把明确 429/`RESOURCE_EXHAUSTED` 当全局 overload；未来多生产者时在统一入口设静态 breaker | 当前单生产者已有数据库排他锁，不新增网络 gateway |
 | [Kubernetes probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) | readiness 默认连续失败 3 次才转 not-ready；失败后继续探测，恢复后重新准入 | 探测不确定时暂停新 admission；单次失败不结束整轮，连续失败达到阈值才进入现有 cooldown | 不把 readiness 当 liveness，不因一次网络抖动重启进程 |
 
@@ -148,6 +186,8 @@ request broker 或内部 window 失败续跑 checkpoint；alpha 不进入本轮�
 5. **服务端 continuous batching 负责动态组批**，客户端负责有界、平滑供给。
 6. **总耗时与失活必须分开**：成本模型只告警/排队，heartbeat/lease 证明所有权，
    只有远高于已知正常包络的 runaway guard 才能终止。
+7. **观测周期与执行生命周期必须分开**：resident consumer/replica 持续工作，报告通过
+   快照或事件流产生；为了写一份报告而排空不可抢占任务，会把观测机制变成流量整形器。
 
 ## 4. 针对本系统的动态调度闭环
 
@@ -223,37 +263,68 @@ GPU 请求总预算本身保持静态。必须诚实记录一个当前 MinerU 3.
 上游把 app-scoped semaphore 传到所有 VLM client 调用，或在统一 GPU 请求入口使用成熟的
 有界、公平 admission gateway；不能靠再提高每文档并发或手写裸 semaphore 代理替代。
 
-### 4.3 滚动补槽与 parse/finalize 解耦
+### 4.3 常驻、工作守恒的 parse coordinator
 
-旧执行链把 `parse→build→publish` 全部算作一个 GPU 文档槽，并在固定 200 份候选耗尽后
-等整批排空。当前实现改为：
+旧执行链把 `parse→build→publish` 全部算作一个 GPU 文档槽；第一轮修复虽拆开了 finalize，
+resident 仍在 acquisition/report deadline 到期时停止 admission 并排空。当前候选把执行
+生命周期与维护、报告生命周期彻底分开：
 
 ```text
-DB pending_parse（最多看 1000 个候选）
-          │
-          ▼
-三 lane 选择 ──> parse pool（16；完成一个立即补一个）
-                         │ parse 成功即释放 GPU 文档槽
-                         ▼
-                 finalize pool（build + publish，默认 2）
+主线程（唯一 singleton / admission owner）
+  PostgreSQL pending_parse
+        │  1000 候选、三 lane 名义份额 + 空槽借用
+        ▼
+  parse pool（16，完成一个立即补一个）
+        │ parse 成功即释放 GPU 文档槽
+        ▼
+  同一 finalize coordinator / bounded pool
+        ├─ 新 run: build → publish
+        └─ 周期 seed: pending_build / pending_publish crash leftovers
+
+maintenance thread                 report writer thread
+  sync + download + projection       mailbox 接收已封存 WorkerReport
+  下载成功只发 work-available Event  写日志/告警失败不停止数据面
 ```
 
-- 在明确的 acquisition/refill window 内，队列暂空或候选耗尽会重新读 DB，而不是等整批
-  16 个 future 全部结束再换波；
-- window 到期后停止新 admission，让 round 有界地收尾和写报告，不做无限热循环；
-- parse 成功即释放 lane/GPU 槽，build/publish 在独立 pool 执行；
-- `parse_futures + finalize_futures` 默认最多 `2 × parse_concurrency`，避免把瓶颈搬成
-  无界 finalize 内存队列；
-- build/publish 的共享基础设施故障仍停止 refill；item-local 失败只隔离该文档；
-- IR 读取先确认 data root 是否在线：单文件缺失/哈希或合同/单位不变量错误记录为
-  `stage=publish,retryable=false` 的终止隔离，自动 build/publish 队列不再重入；挂载、
-  权限或 I/O 故障记录为可重试 `IR_READ_FAILED`，不把健康 run 错误隔离，并触发共享
-  基础设施降载；可重试的 build 基础设施错误不受普通文档构建次数上限永久排除，恢复后
-  自动续建；同时保留 `5 × max_build_retries` 极端安全阀，防止 catch-all/约束类错误被
-  误分类后永久封住 parse recovery probe。
+核心不变量：
 
-固定 `WORKER_BATCH_PARSE` 仍是直接 `run_once` 的单轮上界和报告边界；生产 resident 模式
-只有在显式 refill window 打开时才可滚动超过它。
+- production resident 的 admission 只因 shutdown、singleton 丢失、连续 readiness 失败达到
+  阈值，或有证据的共享基础设施故障而关闭；acquisition 结束、报告到点和正常长文档都不是
+  关闭理由；
+- `WORKER_REPORT_INTERVAL_SECONDS` 默认 300 秒，只轮换 coordinator 私有 report 对象；
+  旧对象经 mailbox 转移所有权后永不再修改，parse/finalize future 不排空；
+- `WORKER_BATCH_PARSE` 只约束显式 `worker once`；resident 持续从 PostgreSQL 重新取数，
+  队列暂空时由下载 Event 立即唤醒，并保留 5 秒 fail-safe poll；
+- production stale reclaim 只在取得 singleton 后、第一次 parse admission 前以 cutoff=0
+  执行一次：此时本进程尚未创建 running row，现存行只能属于已退出的 prior owner。
+  steady maintenance 不按年龄 reclaim，避免误杀合法超过一小时的 whole-PDF run；
+- 同一 startup recovery 在首次 parse admission 前强制完成一次 prune-capable search
+  projection；失败则保持 finalize/projection-only backoff。这样即使上一个进程在维护线程停止
+  后才完成 deactivation，或提交后立刻崩溃，易失的进程内 prune 信号也不会跨重启丢失；
+- parse 成功即释放 lane/GPU 槽；`parse_futures + finalize_futures` 最多
+  `2 × parse_concurrency`，避免把瓶颈搬成无界 finalize 内存队列；
+- build/publish 只有**同一个 coordinator**准入：正常 run 直接进入 finalize pool；
+  周期报告安全点从 DB 有界 seed crash/瞬时失败 leftovers，并按 run id 排除 active future；
+  队列尾部则在没有 parse pool 活跃时做一轮有界补漏。不会并行启动第二个 BuildUnits consumer；
+- 成功/终止失败 ID 只保留一个候选窗口大小的进程内防重复历史；可重试失败先让一个固定
+  候选窗口的其他 admission 通过，到期后经同一 PostgreSQL 资格/次数谓词按 exact ID
+  优先重新准入，因此即使 ULID 尾部以不低于消费速度持续增长也不会饿死。普通候选查询使用
+  固定页大小的 `document_id` keyset 游标，且只推进到实际检查过的最后一行；绝不按已见
+  集合大小扩大 SQL `LIMIT`；
+  PostgreSQL 状态和尝试次数仍是唯一 durable truth，进程内延后只负责防热重试与公平性；
+- build/publish 的共享基础设施故障停止 admission 并进入可中断 backoff；item-local 失败
+  只隔离该 run。两次未知下游失败须在独立于报告周期的 300 秒控制窗口内共同出现才视为
+  共享故障，报告轮换不会清掉或伪造控制证据。shared outage 后只运行 finalize-only
+  恢复探针；build/publish 成功前不得重新放入 parse 流量，避免每个故障 epoch 再累积一池
+  leftovers。resident parse 启用时 build/publish recovery limit 必须同时为正，否则启动
+  fail fast；零 limit 不能被解释成“无需探针、已经恢复”；
+- IR 读取先确认 data root 是否在线：单文件缺失/哈希或合同/单位不变量错误记录为
+  `stage=publish,retryable=false` 的终止隔离；挂载、权限或 I/O 故障记录为可重试
+  `IR_READ_FAILED` 并触发共享基础设施降载。仍保留 `5 × max_build_retries` 极端安全阀。
+
+`worker once` 保持可预测的“最多 N 份”运维语义；production resident 则采用成熟 consumer
+的生命周期语义：持续消费、独立快照、显式背压。这样既不会为了“100% GPU”盲目过载，也
+不会因为写报告而主动制造空谷。
 
 ### 4.4 正常长任务续租、软耗时包络与失败域
 
@@ -298,6 +369,8 @@ MinerU 3.4 的异步状态只有 pending/processing/completed/failed、时间戳
 - 同一极远 lease 覆盖整个 parse future：MinerU 子进程、产物定位/读取、IR 映射、归档写入
   和 DB finish；Python 线程无法安全强杀，越界后先终止已登记 MinerU process group，再由
   launchd 替换整个 worker，不能继续用一个已污染的进程；
+- startup/resident parse 与 maintenance 各自维护独立 heartbeat/watchdog；一个平面的正常
+  进展不能替另一个死锁平面续租，任一 active owner 超过 wedge threshold 都触发整进程替换；
 - 只有 runaway guard 到期、明确 task failure、子进程退出或操作员取消才结束任务；
 - task deadline、generic task failure、输出契约错误都是 item-local，不改变全局容量；
 - 只有明确 HTTP 429 或 `RESOURCE_EXHAUSTED` 记为 backend overload，停止新 refill 并进入
@@ -413,8 +486,11 @@ artifact、overlap/context、deterministic merge、exactly-once commit，以及�
 | resident worker 内层请求扇出 | 已用官方 `--max-concurrency=7`，稳态 `16×7=112` | 重启后从真实命令行/health 核对，不只信配置文件 |
 | admin 与 pipeline 并发绕行 | 已统一 cap，并用同一 PostgreSQL advisory lock 排他 | 仓外直连 GPU 的客户端不受控 |
 | 大小不一导致短任务饥饿 | 已有 regular/heavy/huge 名义份额和借用 | 页数只是初始代理；历史 GPU 秒 EWMA 尚未引入 |
-| 固定 200 批尾 | 已有 1,000 候选窗口和有界滚动补槽 | 仅在 refill window 内；需 A/B 验证 3–10 分钟尾部是否消失 |
+| 固定 200 / 一小时 round 批尾 | resident 常驻补槽；`WORKER_BATCH_PARSE` 仅约束 once；报告快照不排空 | 需 A/B 验证 3–10 分钟尾部及 2026-07-26 的 deadline 长谷是否消失 |
 | build/publish 占 GPU 槽 | 已拆分 parse/finalize pool，并限制下游 backlog | finalize=2 是否足够要看 A/B，不能预先调大 |
+| resident 期间 finalize 瞬时失败只能等重启 | 同一 finalize owner 周期 seed DB leftovers；active run id 排重；尾部有界补漏 | 不允许 maintenance 再启动第二个 BuildUnits consumer |
+| 报告/采集周期关闭 admission | 300 秒 report 只做对象所有权转移；acquisition/project 独立维护线程 | 报告 I/O 故障只告警，不能终止健康 parse 数据面 |
+| 周期 stale reclaim 误杀合法长文档 | singleton 取得后、首个 admission 前只 reclaim 一次 | 仍由 24h runaway + 进程所有权处理真正 stuck |
 | 确定性坏产物反复占 publish 队首 | 所有 hash/contract/full-PDF/unit 不变量错误统一持久隔离；队列按 `stage=publish,retryable=false` 排除 | 共享存储不可读必须保持可重试，不能误隔离 |
 | 正常长任务被 wall-clock 误杀 | 本地修正为页数感知软告警 + 整个 parse future 的 24h runaway lease；worker/admin/pipeline 同一默认 | 尚未提交/重启；24h 只可在真实更长样本出现后按证据上调，不得缩成普通 SLA |
 | provider 大小提示混合单位 | 不再写/读取 `oversized` 准入键；使用归档实测 `byte_count` 只决定 HUGE lane | 旧 89 份全部恢复准入；无需重新下载 |
@@ -490,7 +566,9 @@ control plane 会制造第二任务真相，而不能自动解决错误的请求
 
 ### 8.2 启动即验
 
-- startup banner 必须打印 `gpu_request_cap=16x7<=128 parse_runaway=86400s`；
+- startup banner 必须同时打印
+  `resident_dispatch=continuous report_interval=300s` 与
+  `gpu_request_cap=16x7<=128 parse_runaway=86400s`；
 - 实际 MinerU 子进程命令必须出现 `--max-concurrency 7`；
 - singleton advisory lock 只有一个持有者；
 - doctor、worker report 和 PG processing_run 能正常推进；

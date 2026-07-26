@@ -146,7 +146,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
         parse_batch.assert_called_once()
 
-    def test_closed_resident_window_exits_before_queue_io(self) -> None:
+    def test_closed_resident_admission_exits_before_queue_io(self) -> None:
         deps = _deps()
         report = worker_module.WorkerReport(
             started_at=datetime.now(timezone.utc)
@@ -610,14 +610,52 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self.assertEqual(report.parsed, 3)
         self.assertEqual(report.failed, 3)
 
-    def test_repeated_unknown_build_failure_stops_after_batch_evidence(self) -> None:
+    def test_repeated_unknown_build_failure_survives_report_rotation(
+        self,
+    ) -> None:
+        import threading
+        import time
+
         deps = _deps()
+        object.__setattr__(
+            deps,
+            "config",
+            replace(
+                deps.config,
+                parse_concurrency=2,
+                parse_candidate_window=20,
+                finalize_concurrency=2,
+            ),
+        )
         pending = [
             {"document_id": f"doc_{index}", "oversized": False}
             for index in range(20)
         ]
+        first_failure_reported = threading.Event()
+        build_call_lock = threading.Lock()
+        build_calls = 0
+        emitted: list[worker_module.WorkerReport] = []
+
+        def build(_command: object) -> object:
+            nonlocal build_calls
+            with build_call_lock:
+                build_calls += 1
+                call_number = build_calls
+            if call_number == 1:
+                time.sleep(0.02)
+            elif call_number == 2:
+                self.assertTrue(first_failure_reported.wait(timeout=2))
+            raise RuntimeError("regression")
+
+        def emit(report: worker_module.WorkerReport) -> None:
+            emitted.append(report)
+            if any(
+                failure.error_code == "RuntimeError"
+                for failure in report.failures
+            ):
+                first_failure_reported.set()
+
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
             mock.patch.object(worker_module.queries, "pending_parse", return_value=pending),
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
             mock.patch.object(worker_module, "BuildUnits") as build_cls,
@@ -625,22 +663,34 @@ class RunOnceSchedulingTests(unittest.TestCase):
             parse_cls.return_value.execute.return_value = mock.MagicMock(
                 status="succeeded", processing_run_id="run_unknown"
             )
-            build_cls.return_value.execute.side_effect = RuntimeError("regression")
-            report = run_once(
-                WorkerLimits(sync=0, download=0, parse=20, build=0, publish=0),
+            build_cls.return_value.execute.side_effect = build
+            report = worker_module.WorkerReport(
+                started_at=datetime.now(timezone.utc)
+            )
+            result = worker_module._parse_one_batch(
+                report,
                 deps,
+                limit=20,
+                should_stop=lambda: False,
+                keep_refilling=lambda: True,
+                resident_hooks=worker_module._ResidentParseHooks(
+                    report_interval_seconds=0.001,
+                    emit_report=emit,
+                ),
             )
 
-        # Two initial parses may finish and one replacement may be admitted
-        # before the second identical build failure establishes shared-outage
-        # evidence. The remaining backlog must not be dispatched.
-        self.assertEqual(parse_cls.return_value.execute.call_count, 3)
-        self.assertEqual(build_cls.return_value.execute.call_count, 3)
-        self.assertEqual([failure.error_code for failure in report.failures], [
-            "RuntimeError",
-            "RuntimeError",
-            "RuntimeError",
-        ])
+        self.assertEqual(result, "halt")
+        self.assertTrue(first_failure_reported.is_set())
+        self.assertLess(parse_cls.return_value.execute.call_count, 20)
+        self.assertGreaterEqual(build_cls.return_value.execute.call_count, 2)
+        self.assertGreaterEqual(
+            sum(
+                failure.error_code == "RuntimeError"
+                for item in emitted
+                for failure in item.failures
+            ),
+            2,
+        )
 
     def test_parse_concurrency_bulkheads_size_lanes_and_scales_deadline(self) -> None:
         import threading
@@ -848,9 +898,6 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                worker_module.queries, "reclaim_stale_runs", return_value=0
-            ),
-            mock.patch.object(
                 worker_module.queries,
                 "pending_parse",
                 side_effect=pending_parse,
@@ -864,18 +911,18 @@ class RunOnceSchedulingTests(unittest.TestCase):
             publish_cls.return_value.execute.return_value = mock.MagicMock(
                 status="published", superseded_run_id=None
             )
-            report = run_once(
-                WorkerLimits(
-                    sync=0,
-                    download=0,
-                    parse=2,
-                    build=0,
-                    publish=0,
-                    acquisition_seconds=1,
-                ),
+            report = worker_module.WorkerReport(
+                started_at=datetime.now(timezone.utc)
+            )
+            result = worker_module._parse_one_batch(
+                report,
                 deps,
+                limit=2,
+                should_stop=lambda: False,
+                keep_refilling=lambda: True,
             )
 
+        self.assertEqual(result, "done")
         self.assertTrue(third_parse_started.is_set())
         self.assertGreaterEqual(pending_query.call_count, 2)
         self.assertEqual(report.parsed, 4)
@@ -955,7 +1002,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             ["doc_0.pdf", "doc_1.pdf", "doc_2.pdf"],
         )
 
-    def test_rolling_refill_stops_admission_when_window_closes(self) -> None:
+    def test_resident_refill_stops_when_admission_gate_closes(self) -> None:
         deps = _deps()
         object.__setattr__(
             deps,
@@ -972,11 +1019,11 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 parse_candidate_window=10,
             ),
         )
-        window_open = True
+        admission_open = True
 
         def parse(command):  # noqa: ANN001, ANN202
-            nonlocal window_open
-            window_open = False
+            nonlocal admission_open
+            admission_open = False
             return mock.MagicMock(
                 status="succeeded",
                 processing_run_id=f"run_{command.document_id}",
@@ -1010,17 +1057,16 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 deps,
                 limit=200,
                 should_stop=lambda: False,
-                keep_refilling=lambda: window_open,
+                keep_refilling=lambda: admission_open,
             )
 
         self.assertEqual(result, "done")
         self.assertEqual(report.parsed, 1)
         self.assertEqual(parse_cls.return_value.execute.call_count, 1)
 
-    def test_closed_window_uses_regular_fillers_until_huge_tail_drains(
-        self,
-    ) -> None:
+    def test_report_rotation_does_not_drain_all_heavy_refill(self) -> None:
         import threading
+        import time
 
         deps = _deps()
         object.__setattr__(
@@ -1040,31 +1086,29 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 parse_candidate_window=10,
             ),
         )
-        object.__setattr__(
-            deps,
-            "page_counter",
-            lambda path: {
-                "huge.pdf": 600,
-                "regular_0.pdf": 10,
-                "regular_1.pdf": 10,
-            }[path.name],
-        )
+        object.__setattr__(deps, "page_counter", lambda _path: 100)
         deps.path_builder.data_path.side_effect = lambda relpath: relpath
-        window_open = True
-        filler_started = threading.Event()
+        third_started = threading.Event()
+        emitted: list[worker_module.WorkerReport] = []
+        frozen: list[dict[str, object]] = []
 
-        def parse(command):  # noqa: ANN001, ANN202
-            nonlocal window_open
-            if command.document_id == "doc_huge":
-                self.assertTrue(filler_started.wait(timeout=2))
-            elif command.document_id == "doc_regular_0":
-                window_open = False
-            elif command.document_id == "doc_regular_1":
-                filler_started.set()
-            return mock.MagicMock(
-                status="succeeded",
-                processing_run_id=f"run_{command.document_id}",
+        def parse_one(
+            _deps: WorkerDeps, item: worker_module._ParseWorkItem
+        ) -> worker_module._DocOutcome:
+            if item.document_id == "doc_0":
+                time.sleep(0.02)
+            elif item.document_id == "doc_1":
+                self.assertTrue(third_started.wait(timeout=2))
+            else:
+                third_started.set()
+            return worker_module._DocOutcome(
+                parsed=True,
+                processing_run_id=f"run_{item.document_id}",
             )
+
+        def emit(report: worker_module.WorkerReport) -> None:
+            emitted.append(report)
+            frozen.append(report.as_dict())
 
         with (
             mock.patch.object(
@@ -1072,33 +1116,24 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 "pending_parse",
                 return_value=[
                     {
-                        "document_id": "doc_huge",
-                        "raw_file_relpath": "huge.pdf",
+                        "document_id": f"doc_{index}",
+                        "raw_file_relpath": f"doc_{index}.pdf",
                         "oversized": False,
-                    },
-                    {
-                        "document_id": "doc_regular_0",
-                        "raw_file_relpath": "regular_0.pdf",
-                        "oversized": False,
-                    },
-                    {
-                        "document_id": "doc_regular_1",
-                        "raw_file_relpath": "regular_1.pdf",
-                        "oversized": False,
-                    },
+                    }
+                    for index in range(3)
                 ],
             ),
-            mock.patch.object(worker_module, "ParseDocument") as parse_cls,
-            mock.patch.object(worker_module, "BuildUnits") as build_cls,
-            mock.patch.object(worker_module, "PublishRun") as publish_cls,
+            mock.patch.object(
+                worker_module, "_parse_one_document", side_effect=parse_one
+            ),
+            mock.patch.object(
+                worker_module,
+                "_finalize_one_document",
+                return_value=worker_module._DocOutcome(
+                    built=True, published=True
+                ),
+            ),
         ):
-            parse_cls.return_value.execute.side_effect = parse
-            build_cls.return_value.execute.return_value = mock.MagicMock(
-                status="succeeded", build_stats=None
-            )
-            publish_cls.return_value.execute.return_value = mock.MagicMock(
-                status="published", superseded_run_id=None
-            )
             report = worker_module.WorkerReport(
                 started_at=datetime.now(timezone.utc)
             )
@@ -1107,14 +1142,486 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 deps,
                 limit=200,
                 should_stop=lambda: False,
-                keep_refilling=lambda: window_open,
+                keep_refilling=lambda: True,
+                resident_hooks=worker_module._ResidentParseHooks(
+                    report_interval_seconds=0.001,
+                    emit_report=emit,
+                ),
             )
 
         self.assertEqual(result, "done")
-        self.assertTrue(filler_started.is_set())
-        self.assertEqual(report.parsed, 3)
-        self.assertEqual(report.parse_huge_dispatched, 1)
-        self.assertEqual(report.parse_regular_dispatched, 2)
+        self.assertTrue(third_started.is_set())
+        self.assertGreaterEqual(len(emitted), 1)
+        self.assertEqual(sum(item.parsed for item in emitted), 3)
+        self.assertEqual(sum(item.built for item in emitted), 3)
+        self.assertEqual(sum(item.published for item in emitted), 3)
+        self.assertEqual(
+            sum(item.parse_heavy_dispatched for item in emitted), 3
+        )
+        self.assertEqual(
+            [item.as_dict() for item in emitted],
+            frozen,
+            "ownership-transferred reports must never be mutated again",
+        )
+
+    def test_resident_finalize_owner_recovers_leftover_without_duplicate(
+        self,
+    ) -> None:
+        import threading
+
+        deps = _deps()
+        object.__setattr__(
+            deps,
+            "config",
+            replace(
+                deps.config,
+                parse_concurrency=2,
+                finalize_concurrency=1,
+                parse_candidate_window=4,
+            ),
+        )
+        object.__setattr__(deps, "page_counter", lambda _path: 10)
+        deps.path_builder.data_path.side_effect = lambda relpath: relpath
+        parse_reads = 0
+        finalized: list[str] = []
+        finalized_lock = threading.Lock()
+        emitted: list[worker_module.WorkerReport] = []
+        release_raced_parse = threading.Event()
+        raced_parse_returned = threading.Event()
+        wait_calls = 0
+
+        def pending_parse(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            nonlocal parse_reads
+            parse_reads += 1
+            if parse_reads == 1:
+                return [
+                    {
+                        "document_id": document_id,
+                        "raw_file_relpath": f"{document_id}.pdf",
+                    }
+                    for document_id in ("doc_tick", "doc_race")
+                ]
+            return []
+
+        def pending_build(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            with finalized_lock:
+                done = set(finalized)
+            return [
+                {
+                    "document_id": document_id,
+                    "processing_run_id": run_id,
+                }
+                for document_id, run_id in (
+                    ("doc_tick", "run_tick"),
+                    ("doc_race", "run_race"),
+                    ("doc_old", "run_old"),
+                )
+                if run_id not in done
+            ]
+
+        def parse_one(
+            _deps: WorkerDeps, item: worker_module._ParseWorkItem
+        ) -> worker_module._DocOutcome:
+            if item.document_id == "doc_race":
+                self.assertTrue(release_raced_parse.wait(timeout=1))
+                raced_parse_returned.set()
+            return worker_module._DocOutcome(
+                parsed=True,
+                processing_run_id=f"run_{item.document_id.removeprefix('doc_')}",
+            )
+
+        def finalize_one(
+            _deps: WorkerDeps,
+            *,
+            document_id: str,
+            processing_run_id: str,
+        ) -> worker_module._DocOutcome:
+            del document_id
+            with finalized_lock:
+                finalized.append(processing_run_id)
+            return worker_module._DocOutcome(built=True, published=True)
+
+        real_wait = worker_module.wait
+
+        def controlled_wait(*args: object, **kwargs: object) -> object:
+            nonlocal wait_calls
+            wait_calls += 1
+            completed = real_wait(*args, **kwargs)
+            if wait_calls == 1:
+                # Model a parse that commits after wait() snapshots completed
+                # but before report rotation/recovery. It remains registered
+                # in parse_futures even though pending_build can now see it.
+                release_raced_parse.set()
+                self.assertTrue(raced_parse_returned.wait(timeout=1))
+            return completed
+
+        with (
+            mock.patch.object(
+                worker_module.queries,
+                "pending_parse",
+                side_effect=pending_parse,
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "pending_build",
+                side_effect=pending_build,
+            ) as build_query,
+            mock.patch.object(
+                worker_module.queries,
+                "pending_publish",
+                return_value=[],
+            ),
+            mock.patch.object(
+                worker_module, "_parse_one_document", side_effect=parse_one
+            ),
+            mock.patch.object(
+                worker_module,
+                "_finalize_one_document",
+                side_effect=finalize_one,
+            ),
+            mock.patch.object(
+                worker_module,
+                "wait",
+                side_effect=controlled_wait,
+            ),
+        ):
+            report = worker_module.WorkerReport(
+                started_at=datetime.now(timezone.utc)
+            )
+            result = worker_module._parse_one_batch(
+                report,
+                deps,
+                limit=200,
+                should_stop=lambda: False,
+                keep_refilling=lambda: True,
+                resident_hooks=worker_module._ResidentParseHooks(
+                    report_interval_seconds=0.000001,
+                    emit_report=emitted.append,
+                    build_recovery_limit=3,
+                    publish_recovery_limit=3,
+                ),
+            )
+
+        self.assertEqual(result, "done")
+        self.assertGreaterEqual(build_query.call_count, 1)
+        self.assertCountEqual(
+            finalized, ["run_tick", "run_race", "run_old"]
+        )
+        self.assertEqual(len(finalized), 3)
+        self.assertEqual(sum(item.built for item in emitted), 3)
+        self.assertEqual(sum(item.published for item in emitted), 3)
+
+    def test_resident_empty_queue_wakes_on_download_event(self) -> None:
+        import threading
+
+        deps = _deps()
+        stop = threading.Event()
+        work_available = threading.Event()
+        first_empty = threading.Event()
+        calls = 0
+
+        def parse_batch(*_args: object, **_kwargs: object) -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_empty.set()
+                return "empty"
+            stop.set()
+            return "done"
+
+        with (
+            mock.patch.object(
+                worker_module, "_parse_one_batch", side_effect=parse_batch
+            ),
+            mock.patch.object(worker_module, "_build_stage"),
+            mock.patch.object(worker_module, "_publish_stage"),
+        ):
+            thread = threading.Thread(
+                target=worker_module.run_resident_parse,
+                kwargs={
+                    "deps": deps,
+                    "limit": 1,
+                    "should_stop": stop.is_set,
+                    "report_interval_seconds": 60.0,
+                    "emit_report": mock.Mock(),
+                    "work_available": work_available,
+                    "build_recovery_limit": 1,
+                    "publish_recovery_limit": 1,
+                    "idle_poll_seconds": 60.0,
+                },
+            )
+            thread.start()
+            self.assertTrue(first_empty.wait(timeout=1))
+            work_available.set()
+            thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(calls, 2)
+
+    def test_resident_tail_recovery_uses_no_parallel_parse_pool(self) -> None:
+        import threading
+
+        deps = _deps()
+        stop = threading.Event()
+        emitted: list[worker_module.WorkerReport] = []
+
+        for build_limit, publish_limit in ((0, 1), (1, 0), (0, 0)):
+            with (
+                self.subTest(
+                    build_limit=build_limit,
+                    publish_limit=publish_limit,
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "positive build and publish recovery limits",
+                ),
+            ):
+                worker_module.run_resident_parse(
+                    deps,
+                    limit=1,
+                    should_stop=lambda: True,
+                    report_interval_seconds=60.0,
+                    emit_report=mock.Mock(),
+                    build_recovery_limit=build_limit,
+                    publish_recovery_limit=publish_limit,
+                )
+
+        def build_stage(
+            report: worker_module.WorkerReport,
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            report.built = 1
+
+        def publish_stage(
+            report: worker_module.WorkerReport,
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            report.published = 1
+
+        def emit(report: worker_module.WorkerReport) -> None:
+            emitted.append(report)
+            stop.set()
+
+        with (
+            mock.patch.object(
+                worker_module, "_parse_one_batch", return_value="done"
+            ),
+            mock.patch.object(
+                worker_module, "_build_stage", side_effect=build_stage
+            ) as build_mock,
+            mock.patch.object(
+                worker_module, "_publish_stage", side_effect=publish_stage
+            ) as publish_mock,
+        ):
+            worker_module.run_resident_parse(
+                deps,
+                limit=1,
+                should_stop=stop.is_set,
+                report_interval_seconds=60.0,
+                emit_report=emit,
+                build_recovery_limit=2,
+                publish_recovery_limit=2,
+                idle_poll_seconds=60.0,
+            )
+
+        build_mock.assert_called_once()
+        publish_mock.assert_called_once()
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0].built, 1)
+        self.assertEqual(emitted[0].published, 1)
+
+        # A confirmed downstream outage must stay in finalize-only recovery.
+        # Reopening parse before a successful probe would add another bounded
+        # pool of durable leftovers on every outage epoch.
+        stop = threading.Event()
+        events: list[str] = []
+        recovery_calls = 0
+
+        def parse_batch(*_args: object, **_kwargs: object) -> str:
+            parse_index = sum(
+                event.startswith("parse") for event in events
+            ) + 1
+            events.append(f"parse{parse_index}")
+            if parse_index == 1:
+                return "halt"
+            stop.set()
+            return "done"
+
+        def recovery_build(
+            report: worker_module.WorkerReport,
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            nonlocal recovery_calls
+            recovery_calls += 1
+            events.append(f"probe{recovery_calls}")
+            if recovery_calls == 1:
+                report.failed += 1
+                report.failures.append(
+                    worker_module.WorkerFailure(
+                        stage="build",
+                        item_ref="run_leftover",
+                        error_code="DB_WRITE_FAILED",
+                        retryable=True,
+                    )
+                )
+
+        with (
+            mock.patch.object(
+                worker_module, "_parse_one_batch", side_effect=parse_batch
+            ),
+            mock.patch.object(
+                worker_module, "_build_stage", side_effect=recovery_build
+            ),
+            mock.patch.object(worker_module, "_publish_stage"),
+        ):
+            worker_module.run_resident_parse(
+                deps,
+                limit=1,
+                should_stop=stop.is_set,
+                report_interval_seconds=60.0,
+                emit_report=mock.Mock(),
+                build_recovery_limit=2,
+                publish_recovery_limit=2,
+                idle_poll_seconds=60.0,
+                outage_backoff_initial_seconds=0.001,
+                outage_backoff_max_seconds=0.002,
+            )
+
+        self.assertEqual(events, ["parse1", "probe1", "probe2", "parse2"])
+
+    def test_retryable_parse_reenters_after_bounded_other_work(self) -> None:
+        deps = _deps()
+        object.__setattr__(
+            deps,
+            "config",
+            replace(
+                deps.config,
+                parse_concurrency=1,
+                finalize_concurrency=1,
+                parse_candidate_window=3,
+            ),
+        )
+        object.__setattr__(deps, "page_counter", lambda _path: 10)
+        deps.path_builder.data_path.side_effect = lambda relpath: relpath
+        retry_document_id = "doc_000"
+        pending_ids = {retry_document_id}
+        attempts: list[str] = []
+        query_limits: list[int] = []
+        exact_retry_queries: list[tuple[str, ...]] = []
+        admission_open = True
+
+        def pending_parse(
+            *_args: object, **kwargs: object
+        ) -> list[dict[str, object]]:
+            limit = int(kwargs["limit"])
+            query_limits.append(limit)
+            exact_ids = kwargs.get("document_ids")
+            if exact_ids is not None:
+                exact = tuple(str(item) for item in exact_ids)
+                exact_retry_queries.append(exact)
+                return [
+                    {
+                        "document_id": document_id,
+                        "raw_file_relpath": f"{document_id}.pdf",
+                    }
+                    for document_id in exact
+                    if document_id in pending_ids
+                ][:limit]
+            after = kwargs.get("after_document_id")
+            start = (
+                int(str(after).removeprefix("doc_")) + 1
+                if after is not None
+                else 0
+            )
+            # Model a queue whose ULID-ordered tail keeps growing at least as
+            # fast as consumption: the forward scan is always a full page and
+            # therefore can never rely on reaching an empty tail to wrap.
+            eligible = [
+                f"doc_{index:03d}" for index in range(start, start + limit)
+            ]
+            return [
+                {
+                    "document_id": document_id,
+                    "raw_file_relpath": f"{document_id}.pdf",
+                }
+                for document_id in eligible
+            ]
+
+        def parse_one(
+            _deps: WorkerDeps, item: worker_module._ParseWorkItem
+        ) -> worker_module._DocOutcome:
+            nonlocal admission_open
+            attempts.append(item.document_id)
+            if (
+                item.document_id == retry_document_id
+                and attempts.count(retry_document_id) == 1
+            ):
+                return worker_module._DocOutcome(
+                    failure=worker_module.WorkerFailure(
+                        stage="parse",
+                        item_ref=retry_document_id,
+                        error_code="parser_invocation_failed",
+                        retryable=True,
+                    )
+                )
+            pending_ids.discard(item.document_id)
+            if item.document_id == retry_document_id:
+                admission_open = False
+            return worker_module._DocOutcome(
+                parsed=True,
+                processing_run_id=f"run_{item.document_id}",
+            )
+
+        with (
+            mock.patch.object(
+                worker_module.queries,
+                "pending_parse",
+                side_effect=pending_parse,
+            ),
+            mock.patch.object(
+                worker_module, "_parse_one_document", side_effect=parse_one
+            ),
+            mock.patch.object(
+                worker_module,
+                "_finalize_one_document",
+                return_value=worker_module._DocOutcome(
+                    built=True, published=True
+                ),
+            ),
+        ):
+            report = worker_module.WorkerReport(
+                started_at=datetime.now(timezone.utc)
+            )
+            result = worker_module._parse_one_batch(
+                report,
+                deps,
+                limit=1,
+                should_stop=lambda: False,
+                keep_refilling=lambda: admission_open,
+            )
+
+        self.assertEqual(result, "done")
+        self.assertEqual(
+            attempts,
+            [
+                "doc_000",
+                "doc_001",
+                "doc_002",
+                "doc_003",
+                "doc_004",
+                "doc_005",
+                "doc_000",
+            ],
+            "due retry bypasses a continuously growing forward tail",
+        )
+        self.assertEqual(exact_retry_queries, [(retry_document_id,)])
+        self.assertTrue(query_limits)
+        self.assertEqual(set(query_limits), {3})
+        self.assertEqual(report.parsed, 6)
+        self.assertEqual(report.failed, 1)
 
     def test_transient_readiness_failure_pauses_then_resumes_admission(self) -> None:
         deps = _deps()
@@ -1140,13 +1647,13 @@ class RunOnceSchedulingTests(unittest.TestCase):
             None,
         )
         object.__setattr__(deps, "parser_factory", lambda: parser)
-        window_open = True
+        admission_open = True
 
         def parse(command: object) -> mock.MagicMock:
-            nonlocal window_open
+            nonlocal admission_open
             document_id = str(getattr(command, "document_id"))
             if document_id == "doc_1":
-                window_open = False
+                admission_open = False
             return mock.MagicMock(
                 status="succeeded",
                 processing_run_id=f"run_{document_id}",
@@ -1185,7 +1692,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 deps,
                 limit=200,
                 should_stop=lambda: False,
-                keep_refilling=lambda: window_open,
+                keep_refilling=lambda: admission_open,
             )
 
         self.assertEqual(result, "done")
@@ -1329,7 +1836,9 @@ class RunOnceSchedulingTests(unittest.TestCase):
             "parser_backend_overloaded",
         )
 
-    def test_window_close_clears_deferred_readiness_without_busy_wait(self) -> None:
+    def test_admission_close_clears_deferred_readiness_without_busy_wait(
+        self,
+    ) -> None:
         import threading
 
         deps = _deps()
@@ -1344,16 +1853,16 @@ class RunOnceSchedulingTests(unittest.TestCase):
         )
         object.__setattr__(deps, "page_counter", lambda _path: 10)
         release_tail = threading.Event()
-        window_open = True
+        admission_open = True
         probe_calls = 0
         parser = mock.MagicMock()
         release_timer: threading.Timer | None = None
 
         def readiness(*_args: object) -> None:
-            nonlocal probe_calls, release_timer, window_open
+            nonlocal probe_calls, release_timer, admission_open
             probe_calls += 1
             if probe_calls == 2:
-                window_open = False
+                admission_open = False
                 release_timer = threading.Timer(0.02, release_tail.set)
                 release_timer.start()
                 raise ParserVersionProbeError("transient probe failure")
@@ -1420,7 +1929,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                     deps,
                     limit=200,
                     should_stop=lambda: False,
-                    keep_refilling=lambda: window_open,
+                    keep_refilling=lambda: admission_open,
                 )
         finally:
             if release_timer is not None:

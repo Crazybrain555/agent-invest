@@ -455,6 +455,8 @@ def pending_parse(
     max_retries: int,
     limit: int,
     scope_classes: tuple[str, ...] | None = None,
+    after_document_id: str | None = None,
+    document_ids: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Documents awaiting parse, excluding non-retryable and exhausted ones.
 
@@ -483,6 +485,19 @@ def pending_parse(
         )
         params["scope_classes"] = list(scope_classes)
         params["carrier_classes"] = list(CARRIER_CLASSES)
+    cursor_sql = ""
+    if after_document_id is not None and document_ids is not None:
+        raise ValueError(
+            "after_document_id and document_ids are mutually exclusive"
+        )
+    if document_ids is not None:
+        if not document_ids:
+            return []
+        cursor_sql = "AND q.document_id = ANY(:document_ids)"
+        params["document_ids"] = list(document_ids)
+    if after_document_id is not None:
+        cursor_sql = "AND q.document_id > :after_document_id"
+        params["after_document_id"] = after_document_id
     rows = conn.execute(
         text(
             f"""
@@ -517,6 +532,7 @@ def pending_parse(
                            <> ALL(:retry_neutral_error_codes))
                    < :max_retries_ceiling
                {scope_sql}
+               {cursor_sql}
              ORDER BY q.document_id
              LIMIT :limit
             """

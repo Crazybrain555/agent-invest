@@ -93,6 +93,11 @@ PARSE_HEARTBEAT_INTERVAL_SECONDS = 30.0
 # consecutive failures should end the parse round and enter cooldown.
 PARSER_READINESS_FAILURE_THRESHOLD = 3
 PARSER_READINESS_RETRY_SECONDS = 5.0
+# Unknown build/publish exceptions need two observations close enough to be
+# credible shared-infrastructure evidence. This window is independent of the
+# report cadence: rotating observability must neither erase nor create a
+# circuit signal.
+DOWNSTREAM_CONTROL_EVIDENCE_SECONDS = 300.0
 # Single source in worker/queries.py: the queue's retry-budget predicate and
 # the scheduler's outage detection must agree on what "infrastructure" means.
 # Only explicit, current global-capacity signals may halt rolling admission.
@@ -276,21 +281,29 @@ def run_once(
     deps: WorkerDeps,
     *,
     should_stop: Callable[[], bool] = lambda: False,
+    reclaim_stale: bool = True,
+    stale_threshold_seconds: int | None = None,
+    run_projection: bool | None = None,
+    projection_prune: bool = False,
 ) -> WorkerReport:
     started_at = deps.clock()
     report = WorkerReport(started_at=started_at)
 
-    with deps.engine.begin() as conn:
-        report.stale_reclaimed = queries.reclaim_stale_runs(
-            conn, threshold_seconds=deps.config.stale_run_threshold_seconds
+    if reclaim_stale:
+        threshold_seconds = (
+            deps.config.stale_run_threshold_seconds
+            if stale_threshold_seconds is None
+            else max(0, stale_threshold_seconds)
         )
+        with deps.engine.begin() as conn:
+            report.stale_reclaimed = queries.reclaim_stale_runs(
+                conn, threshold_seconds=threshold_seconds
+            )
 
-    # Acquisition (sync -> download) runs beside the parse stage: they share
-    # no mutable state except the DB (disjoint documents) — acquisition
-    # writes its own sub-report, merged deterministically after join, so the
-    # GPU no longer idles while the provider stages run. Newly parsed runs
-    # finalize on a separate bounded pool; the later build/publish stages
-    # drain leftovers from interrupted or older rounds.
+    # Direct/once mode may overlap acquisition with its one count-bounded
+    # parse wave. Production resident mode calls this path for maintenance
+    # with parse/build/publish disabled; its long-lived parse coordinator is
+    # independent of this acquisition/report lifecycle.
     acquisition = WorkerReport(started_at=started_at)
 
     # "Parse stage returned" gates whether the pump starts ANOTHER pass, not
@@ -399,8 +412,8 @@ def run_once(
                 if time.monotonic() >= deadline:
                     # Window closed: stop starting new passes (a pass in
                     # flight already finished — the window bounds pass starts,
-                    # not a hard abort), so the parse stage can drain its tail
-                    # and the round can report/observe on a bounded cadence.
+                    # not a hard abort). In resident mode this only closes a
+                    # maintenance snapshot; parse admission is independent.
                     return
                 if (
                     acquisition.synced_companies == synced_before
@@ -421,11 +434,6 @@ def run_once(
         target=_acquisition_stages, name="acquire", daemon=True
     )
     acquisition_thread.start()
-    parse_refill_deadline = (
-        time.monotonic() + limits.acquisition_seconds
-        if limits.acquisition_seconds > 0
-        else 0.0
-    )
     try:
         if limits.parse > 0 and not should_stop():
             try:
@@ -435,14 +443,7 @@ def run_once(
                     limit=limits.parse,
                     should_stop=should_stop,
                     keep_feeding=acquisition_thread.is_alive,
-                    keep_refilling=(
-                        (
-                            lambda: time.monotonic()
-                            < parse_refill_deadline
-                        )
-                        if parse_refill_deadline > 0
-                        else None
-                    ),
+                    keep_refilling=None,
                 )
             finally:
                 parse_exited.set()
@@ -461,7 +462,10 @@ def run_once(
         and not should_stop()
     ):
         _publish_stage(report, deps, limit=limits.publish, should_stop=should_stop)
-    if limits.publish > 0 and not should_stop():
+    projection_enabled = (
+        limits.publish > 0 if run_projection is None else run_projection
+    )
+    if projection_enabled and not should_stop():
         # Derived retrieval projection (U7): drain the whole delta every
         # round. Index maintenance must be proportional to NEW units, never
         # capped by an unrelated constant — the publish batch limit (10,
@@ -474,7 +478,7 @@ def run_once(
             report,
             deps,
             should_stop=should_stop,
-            prune=report.runs_deactivated > 0,
+            prune=projection_prune or report.runs_deactivated > 0,
         )
 
     report.duration_seconds = (deps.clock() - started_at).total_seconds()
@@ -854,6 +858,28 @@ class _InFlightParse:
     runaway_until_monotonic: float
 
 
+@dataclass(frozen=True)
+class _InFlightFinalize:
+    document_id: str
+    processing_run_id: str
+
+
+@dataclass(frozen=True)
+class _ResidentParseHooks:
+    """Observation hooks for the resident dispatcher.
+
+    The coordinator transfers each completed report object to ``emit_report``
+    and immediately continues with a fresh object.  No reporter ever reads a
+    report that the dispatcher can still mutate, so periodic reporting needs
+    neither a shared lock nor an admission/drain boundary.
+    """
+
+    report_interval_seconds: float
+    emit_report: Callable[[WorkerReport], None]
+    build_recovery_limit: int = 0
+    publish_recovery_limit: int = 0
+
+
 def _parse_work_items(
     pending: Iterable[dict[str, Any]],
     *,
@@ -1056,7 +1082,40 @@ def _finalize_one_document(
         outcome.built = True
         if build_result.build_stats:
             outcome.build_stats = dict(build_result.build_stats)
-        stage = "publish"
+    except Exception as exc:
+        structured_error = getattr(exc, "error", None)
+        outcome.failure = WorkerFailure(
+            stage=stage,
+            item_ref=document_id,
+            error_code=(
+                _error_code(structured_error)
+                if isinstance(structured_error, dict)
+                else type(exc).__name__
+            ),
+        )
+        return outcome
+
+    publish_outcome = _publish_one_document(
+        deps,
+        document_id=document_id,
+        processing_run_id=processing_run_id,
+    )
+    outcome.published = publish_outcome.published
+    outcome.superseded_run = publish_outcome.superseded_run
+    outcome.failure = publish_outcome.failure
+    return outcome
+
+
+def _publish_one_document(
+    deps: WorkerDeps,
+    *,
+    document_id: str,
+    processing_run_id: str,
+) -> _DocOutcome:
+    """Publish an already-built run for resident crash/failure recovery."""
+
+    outcome = _DocOutcome()
+    try:
         publish_result = PublishRun(
             uow_factory=deps.uow_factory,
             publication_guard=NormalizedIRPublicationGuard(deps.path_builder),
@@ -1075,13 +1134,20 @@ def _finalize_one_document(
     except Exception as exc:
         structured_error = getattr(exc, "error", None)
         outcome.failure = WorkerFailure(
-            stage=stage,
+            stage="publish",
             item_ref=document_id,
             error_code=(
                 _error_code(structured_error)
                 if isinstance(structured_error, dict)
                 else type(exc).__name__
             ),
+            retryable=(
+                bool(structured_error.get("retryable"))
+                if isinstance(structured_error, dict)
+                and structured_error.get("retryable") is not None
+                else None
+            ),
+            message=str(exc)[:500],
         )
     return outcome
 
@@ -1100,6 +1166,32 @@ def _fold_outcome(report: WorkerReport, outcome: _DocOutcome) -> None:
     if outcome.failure is not None:
         report.failed += 1
         report.failures.append(outcome.failure)
+
+
+def _report_has_observations(report: WorkerReport) -> bool:
+    """Whether a resident period contains activity worth transferring."""
+
+    return any(
+        (
+            report.stale_reclaimed,
+            report.synced_companies,
+            report.candidates_discovered,
+            report.downloaded,
+            report.parsed,
+            report.built,
+            report.published,
+            report.runs_deactivated,
+            report.projected,
+            report.failed,
+            report.parse_peak_inflight,
+            report.parse_regular_dispatched,
+            report.parse_heavy_dispatched,
+            report.parse_huge_dispatched,
+            report.parse_unknown_page_count,
+            report.failures,
+            report.build_stats,
+        )
+    )
 
 
 def build_failures_indicate_outage(
@@ -1227,6 +1319,175 @@ def _parse_stage(
             return
 
 
+def run_resident_parse(
+    deps: WorkerDeps,
+    *,
+    limit: int,
+    should_stop: Callable[[], bool],
+    report_interval_seconds: float,
+    emit_report: Callable[[WorkerReport], None],
+    work_available: threading.Event | None = None,
+    build_recovery_limit: int = 0,
+    publish_recovery_limit: int = 0,
+    idle_poll_seconds: float = 5.0,
+    outage_backoff_initial_seconds: float = 120.0,
+    outage_backoff_max_seconds: float = 1800.0,
+) -> None:
+    """Continuously admit parse work independently of reporting epochs.
+
+    PostgreSQL remains the durable queue.  The resident coordinator owns the
+    existing bounded parse/finalize pools and transfers immutable period
+    reports to ``emit_report`` without draining either pool.  Queue-empty and
+    confirmed shared-infrastructure halts pause admission with interruptible
+    polling/backoff; normal long documents and report time never do.
+    """
+
+    if report_interval_seconds <= 0:
+        raise ValueError("report_interval_seconds must be positive")
+    if idle_poll_seconds <= 0:
+        raise ValueError("idle_poll_seconds must be positive")
+    if outage_backoff_initial_seconds <= 0:
+        raise ValueError("outage_backoff_initial_seconds must be positive")
+    if limit > 0 and (
+        build_recovery_limit <= 0 or publish_recovery_limit <= 0
+    ):
+        raise ValueError(
+            "resident parse requires positive build and publish recovery "
+            "limits so shared downstream recovery can be proven before "
+            "admission reopens"
+        )
+    outage_backoff_max_seconds = max(
+        outage_backoff_initial_seconds, outage_backoff_max_seconds
+    )
+    wake = work_available or threading.Event()
+    outage_delay = outage_backoff_initial_seconds
+
+    def wait_interruptibly(seconds: float, *, wake_for_work: bool) -> None:
+        deadline = time.monotonic() + seconds
+        while not should_stop():
+            # Queue-empty and outage backoff are intentional responsive
+            # states, not lost ownership. Renew only from this coordinator;
+            # a deadlocked future path cannot reach this loop.
+            deps.heartbeat()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if wake_for_work and wake.wait(timeout=min(0.5, remaining)):
+                return
+            if not wake_for_work:
+                time.sleep(min(0.5, remaining))
+
+    def recover_finalize_tail() -> bool:
+        """Drain a bounded leftover epoch while no parse pool is active."""
+
+        started_monotonic = time.monotonic()
+        recovery_report = WorkerReport(started_at=deps.clock())
+        unhandled_outage = False
+        try:
+            if build_recovery_limit > 0:
+                _build_stage(
+                    recovery_report,
+                    deps,
+                    limit=build_recovery_limit,
+                    should_stop=should_stop,
+                )
+            if publish_recovery_limit > 0 and not should_stop():
+                _publish_stage(
+                    recovery_report,
+                    deps,
+                    limit=publish_recovery_limit,
+                    should_stop=should_stop,
+                )
+        except Exception as exc:
+            # Queue-read/connection failures sit outside the item-isolating
+            # stage loops and therefore prove the recovery probe itself did
+            # not establish downstream health.
+            unhandled_outage = True
+            recovery_report.failed += 1
+            recovery_report.failures.append(
+                WorkerFailure(
+                    stage="build",
+                    item_ref="resident_finalize_recovery",
+                    error_code=type(exc).__name__,
+                    message=str(exc)[:500],
+                )
+            )
+        recovery_report.duration_seconds = (
+            time.monotonic() - started_monotonic
+        )
+        if _report_has_observations(recovery_report):
+            emit_report(recovery_report)
+        return unhandled_outage or (
+            build_failures_indicate_outage(recovery_report.failures)
+            or publish_failures_indicate_outage(recovery_report.failures)
+        )
+
+    while not should_stop():
+        # Clear before the queue read. A download committed after this point
+        # sets the event and either appears in the read or wakes the empty
+        # fallback wait; no notification can be lost into a long idle sleep.
+        wake.clear()
+        deps.admission_guard()
+        deps.heartbeat()
+        if limit <= 0:
+            wait_interruptibly(idle_poll_seconds, wake_for_work=True)
+            continue
+        batch_started = time.monotonic()
+        report = WorkerReport(started_at=deps.clock())
+        status = _parse_one_batch(
+            report,
+            deps,
+            limit=limit,
+            should_stop=should_stop,
+            keep_refilling=lambda: not should_stop(),
+            resident_hooks=_ResidentParseHooks(
+                report_interval_seconds=report_interval_seconds,
+                emit_report=emit_report,
+                build_recovery_limit=max(0, build_recovery_limit),
+                publish_recovery_limit=max(0, publish_recovery_limit),
+            ),
+        )
+        if should_stop():
+            return
+        if status == "halt":
+            # The explicit control signal survives report rotation in
+            # ``status``. Do not admit another PDF until the sole finalize
+            # owner proves downstream recovery; otherwise every outage epoch
+            # can create another bounded pool of durable leftovers.
+            ran_for = time.monotonic() - batch_started
+            probe_failed = False
+            while not should_stop():
+                wait_interruptibly(outage_delay, wake_for_work=False)
+                if should_stop():
+                    return
+                probe_failed = recover_finalize_tail()
+                if not probe_failed:
+                    break
+                outage_delay = min(
+                    outage_backoff_max_seconds, outage_delay * 2
+                )
+            if ran_for >= report_interval_seconds:
+                outage_delay = outage_backoff_initial_seconds
+            elif not probe_failed:
+                outage_delay = min(
+                    outage_backoff_max_seconds, outage_delay * 2
+                )
+            continue
+        recovery_failed = recover_finalize_tail()
+        while recovery_failed and not should_stop():
+            wait_interruptibly(outage_delay, wake_for_work=False)
+            if should_stop():
+                return
+            outage_delay = min(
+                outage_backoff_max_seconds, outage_delay * 2
+            )
+            recovery_failed = recover_finalize_tail()
+        if should_stop():
+            return
+        outage_delay = outage_backoff_initial_seconds
+        wait_interruptibly(idle_poll_seconds, wake_for_work=True)
+
+
 def _parse_one_batch(
     report: WorkerReport,
     deps: WorkerDeps,
@@ -1234,11 +1495,15 @@ def _parse_one_batch(
     limit: int,
     should_stop: Callable[[], bool],
     keep_refilling: Callable[[], bool] | None = None,
+    resident_hooks: _ResidentParseHooks | None = None,
 ) -> str:
     """Run one dequeue-and-parse wave.
 
     Returns ``done`` | ``empty`` | ``closed`` | ``halt``. ``closed`` is a
     resident admission boundary, checked before queue I/O/thread-pool setup.
+    Direct/once mode is count-bounded. Resident mode keeps refilling until its
+    explicit admission predicate closes, the queue empties, or a shared
+    infrastructure signal halts it; report rotation never closes admission.
     """
 
     if keep_refilling is not None and not keep_refilling():
@@ -1246,21 +1511,88 @@ def _parse_one_batch(
 
     candidate_limit = max(limit, deps.config.parse_candidate_window)
     known_ids: set[str] = set()
+    successful_history: deque[str] = deque()
+    deferred_retries: deque[tuple[int, str]] = deque()
+    candidate_cursor: str | None = None
+    dispatched = 0
 
     def dequeue() -> list[_ParseWorkItem]:
-        with deps.engine.connect() as conn:
-            pending = queries.pending_parse(
-                conn,
-                max_retries=deps.config.max_parse_retries,
-                limit=candidate_limit,
-                scope_classes=deps.config.process_scope_classes,
+        nonlocal candidate_cursor
+        due_retry_ids: list[str] = []
+        while (
+            deferred_retries
+            and deferred_retries[0][0] <= dispatched
+            and len(due_retry_ids) < candidate_limit
+        ):
+            _, document_id = deferred_retries.popleft()
+            known_ids.discard(document_id)
+            due_retry_ids.append(document_id)
+
+        selected: list[dict[str, Any]] = []
+        selected_ids: set[str] = set()
+        if due_retry_ids:
+            # A forward ULID cursor need not reach the queue tail while new
+            # documents arrive continuously. Revalidate due retries by exact
+            # ID through the same durable eligibility/budget predicate, then
+            # fill remaining capacity from the normal keyset stream.
+            with deps.engine.connect() as conn:
+                due_rows = queries.pending_parse(
+                    conn,
+                    max_retries=deps.config.max_parse_retries,
+                    limit=candidate_limit,
+                    scope_classes=deps.config.process_scope_classes,
+                    document_ids=tuple(due_retry_ids),
+                )
+            selected.extend(due_rows)
+            selected_ids.update(
+                str(row["document_id"]) for row in due_rows
             )
-        unseen = (
-            row
-            for row in pending
-            if str(row["document_id"]) not in known_ids
-        )
-        return _parse_work_items(unseen, deps=deps)
+        scan_start = candidate_cursor
+        wrapped = scan_start is None
+        while len(selected) < candidate_limit:
+            with deps.engine.connect() as conn:
+                page = queries.pending_parse(
+                    conn,
+                    max_retries=deps.config.max_parse_retries,
+                    limit=candidate_limit,
+                    scope_classes=deps.config.process_scope_classes,
+                    after_document_id=candidate_cursor,
+                )
+            if not page:
+                if not wrapped:
+                    candidate_cursor = None
+                    wrapped = True
+                    continue
+                break
+            last_examined_id: str | None = None
+            for row in page:
+                document_id = str(row["document_id"])
+                last_examined_id = document_id
+                if (
+                    document_id in known_ids
+                    or document_id in selected_ids
+                ):
+                    continue
+                selected.append(row)
+                selected_ids.add(document_id)
+                if len(selected) >= candidate_limit:
+                    break
+            if last_examined_id is not None:
+                candidate_cursor = last_examined_id
+            if (
+                wrapped
+                and scan_start is not None
+                and last_examined_id is not None
+                and last_examined_id >= scan_start
+            ):
+                break
+            if len(page) < candidate_limit:
+                if not wrapped:
+                    candidate_cursor = None
+                    wrapped = True
+                    continue
+                break
+        return _parse_work_items(selected, deps=deps)
 
     readiness_failures = 0
     readiness_retry_at = 0.0
@@ -1333,8 +1665,13 @@ def _parse_one_batch(
     enqueue(work_items)
     finalize_backlog_limit = max(2, concurrency * 2)
     halt_refill = False
-    dispatched = 0
     report.parse_concurrency_limit = concurrency
+    report_started_monotonic = time.monotonic()
+    report_due_monotonic = (
+        report_started_monotonic + resident_hooks.report_interval_seconds
+        if resident_hooks is not None
+        else 0.0
+    )
     with (
         ThreadPoolExecutor(
             max_workers=concurrency,
@@ -1346,56 +1683,199 @@ def _parse_one_batch(
         ) as finalize_pool,
     ):
         parse_futures: dict[Future[_DocOutcome], _InFlightParse] = {}
-        finalize_futures: dict[Future[_DocOutcome], str] = {}
+        finalize_futures: dict[Future[_DocOutcome], _InFlightFinalize] = {}
         expected_duration_warned: set[Future[_DocOutcome]] = set()
         runaway_duration_warned: set[Future[_DocOutcome]] = set()
         lane_inflight = {lane: 0 for lane in _ParseLane}
+        # This control state is intentionally independent of periodic reports.
+        # Two nearby unknown downstream failures may straddle a report
+        # rotation and still establish shared-infrastructure evidence.
+        control_failures: deque[tuple[float, WorkerFailure]] = deque()
 
         def halt_admission() -> None:
             nonlocal halt_refill, readiness_deferred
             halt_refill = True
             readiness_deferred = False
 
-        def long_lane_inflight() -> bool:
-            return any(
-                lane_inflight[lane] > 0
-                for lane in (_ParseLane.HEAVY, _ParseLane.HUGE)
+        def rotate_report(*, force: bool = False) -> None:
+            nonlocal report, report_started_monotonic, report_due_monotonic
+            if resident_hooks is None:
+                return
+            now = time.monotonic()
+            if not force and now < report_due_monotonic:
+                return
+            if not force:
+                seed_finalize_recovery()
+            report.parse_concurrency_limit = concurrency
+            report.parse_peak_inflight = max(
+                report.parse_peak_inflight, len(parse_futures)
+            )
+            report.duration_seconds = now - report_started_monotonic
+            if _report_has_observations(report):
+                completed_report = report
+                report = WorkerReport(started_at=deps.clock())
+                report.parse_concurrency_limit = concurrency
+                report.parse_peak_inflight = len(parse_futures)
+                resident_hooks.emit_report(completed_report)
+            report_started_monotonic = now
+            report_due_monotonic = (
+                now + resident_hooks.report_interval_seconds
             )
 
-        def rolling_admission_allowed() -> bool:
-            return admission_open() or long_lane_inflight()
+        def outcome_halts_admission(outcome: _DocOutcome) -> bool:
+            failure = outcome.failure
+            if failure is None:
+                return False
+            now = time.monotonic()
+            while (
+                control_failures
+                and now - control_failures[0][0]
+                > DOWNSTREAM_CONTROL_EVIDENCE_SECONDS
+            ):
+                control_failures.popleft()
+            if failure.stage in {"build", "publish"}:
+                control_failures.append((now, failure))
+            return _halts_parse_refill(
+                outcome,
+                (item for _, item in control_failures),
+            )
+
+        def seed_finalize_recovery() -> None:
+            """Submit bounded DB leftovers through the sole finalize owner."""
+
+            if resident_hooks is None or halt_refill or should_stop():
+                return
+            available = max(
+                0,
+                finalize_backlog_limit
+                - len(parse_futures)
+                - len(finalize_futures),
+            )
+            if available <= 0:
+                return
+            active_run_ids = {
+                item.processing_run_id for item in finalize_futures.values()
+            }
+            # A parse thread commits its succeeded run before the coordinator
+            # folds the completed Future and submits normal finalization.
+            # During that short interval pending_build can already see the
+            # run, so run-id de-dup alone is insufficient: the coordinator
+            # does not know that run id yet. Exclude every document still
+            # registered in either pool.
+            active_document_ids = {
+                admitted.item.document_id
+                for admitted in parse_futures.values()
+            } | {
+                item.document_id for item in finalize_futures.values()
+            }
+            try:
+                build_limit = min(
+                    available, resident_hooks.build_recovery_limit
+                )
+                with deps.engine.connect() as conn:
+                    pending_build = (
+                        queries.pending_build(
+                            conn,
+                            max_retries=deps.config.max_build_retries,
+                            limit=build_limit + len(active_document_ids),
+                        )
+                        if build_limit > 0
+                        else []
+                    )
+                for row in pending_build:
+                    if available <= 0 or build_limit <= 0:
+                        break
+                    run_id = str(row["processing_run_id"])
+                    document_id = str(row["document_id"])
+                    if (
+                        run_id in active_run_ids
+                        or document_id in active_document_ids
+                    ):
+                        continue
+                    finalize_futures[
+                        finalize_pool.submit(
+                            _finalize_one_document,
+                            deps,
+                            document_id=document_id,
+                            processing_run_id=run_id,
+                        )
+                    ] = _InFlightFinalize(
+                        document_id=document_id,
+                        processing_run_id=run_id,
+                    )
+                    active_run_ids.add(run_id)
+                    active_document_ids.add(document_id)
+                    available -= 1
+                    build_limit -= 1
+
+                publish_limit = min(
+                    available, resident_hooks.publish_recovery_limit
+                )
+                with deps.engine.connect() as conn:
+                    pending_publish = (
+                        queries.pending_publish(
+                            conn,
+                            limit=publish_limit + len(active_document_ids),
+                        )
+                        if publish_limit > 0
+                        else []
+                    )
+                for row in pending_publish:
+                    if available <= 0 or publish_limit <= 0:
+                        break
+                    run_id = str(row["processing_run_id"])
+                    document_id = str(row["document_id"])
+                    if (
+                        run_id in active_run_ids
+                        or document_id in active_document_ids
+                    ):
+                        continue
+                    finalize_futures[
+                        finalize_pool.submit(
+                            _publish_one_document,
+                            deps,
+                            document_id=document_id,
+                            processing_run_id=run_id,
+                        )
+                    ] = _InFlightFinalize(
+                        document_id=document_id,
+                        processing_run_id=run_id,
+                    )
+                    active_run_ids.add(run_id)
+                    active_document_ids.add(document_id)
+                    available -= 1
+                    publish_limit -= 1
+            except Exception as exc:
+                failure = _DocOutcome(
+                    failure=WorkerFailure(
+                        stage="build",
+                        item_ref="resident_finalize_recovery",
+                        error_code=type(exc).__name__,
+                        message=str(exc)[:500],
+                    )
+                )
+                _fold_outcome(report, failure)
+                halt_admission()
 
         def submit_one() -> bool:
             nonlocal dispatched, halt_refill
             if should_stop():
                 return False
-            # Direct/once mode has a count bound. Resident rolling mode has a
-            # time bound instead: the instant that admission window closes,
-            # queued candidates remain for the next round even when fewer
-            # than ``limit`` documents were admitted.
-            window_open = admission_open() if rolling_admission else False
-            if rolling_admission:
-                if not window_open and not long_lane_inflight():
-                    return False
-            elif dispatched >= limit:
+            # Direct/once mode has a count bound. Resident mode is
+            # work-conserving and has no reporting/acquisition time bound;
+            # only its explicit admission predicate may stop new work.
+            if rolling_admission and not admission_open():
                 return False
-            # After the reporting/acquisition window closes, do not admit a
-            # new long tail. While an already-admitted heavy/huge document is
-            # still running, regular PDFs may fill its otherwise idle sibling
-            # slots. Once the last long lane drains, regular fillers already
-            # in flight finish and the round closes.
-            allowed_lanes = (
-                tuple(_ParseLane)
-                if not rolling_admission or window_open
-                else (_ParseLane.REGULAR,)
-            )
+            if not rolling_admission and dispatched >= limit:
+                return False
+            allowed_lanes = tuple(_ParseLane)
             ready = tuple(
                 lane for lane in allowed_lanes if queued[lane]
             )
             if (
                 not ready
                 and rolling_admission
-                and (window_open or long_lane_inflight())
+                and admission_open()
             ):
                 new_items = dequeue()
                 enqueue(new_items)
@@ -1426,6 +1906,7 @@ def _parse_one_batch(
                 ],
             )
             item = queued[lane].popleft()
+            input_order.pop(item.document_id, None)
             expected_seconds = _parse_expected_seconds(deps, item)
             admitted_at = time.monotonic()
             future = parse_pool.submit(_parse_one_document, deps, item)
@@ -1465,7 +1946,7 @@ def _parse_one_batch(
                 or should_stop()
                 or (
                     rolling_admission
-                    and not rolling_admission_allowed()
+                    and not admission_open()
                 )
                 or (
                     not rolling_admission
@@ -1512,7 +1993,7 @@ def _parse_one_batch(
                     break
                 if (
                     rolling_admission
-                    and not rolling_admission_allowed()
+                    and not admission_open()
                 ):
                     readiness_deferred = False
                     break
@@ -1521,6 +2002,7 @@ def _parse_one_batch(
                     time.sleep(min(0.5, remaining))
                     continue
                 refill()
+                rotate_report()
                 continue
 
             futures = tuple((*parse_futures, *finalize_futures))
@@ -1588,6 +2070,7 @@ def _parse_one_batch(
                     for admitted in parse_futures.values()
                 ):
                     deps.heartbeat()
+                rotate_report()
                 continue
 
             for future in completed & parse_futures.keys():
@@ -1611,32 +2094,66 @@ def _parse_one_batch(
                     outcome.parsed
                     and outcome.processing_run_id is not None
                 ):
+                    processing_run_id = outcome.processing_run_id
                     finalize_futures[
                         finalize_pool.submit(
                             _finalize_one_document,
                             deps,
                             document_id=admitted.item.document_id,
-                            processing_run_id=outcome.processing_run_id,
+                            processing_run_id=processing_run_id,
                         )
-                    ] = admitted.item.document_id
-                if _halts_parse_refill(outcome, report.failures):
+                    ] = _InFlightFinalize(
+                        document_id=admitted.item.document_id,
+                        processing_run_id=processing_run_id,
+                    )
+                    # Keep only a bounded recent-success window. PostgreSQL
+                    # has already committed the status transition, so this
+                    # protects against one lagging/fake read without turning
+                    # a resident process into an unbounded completion ledger.
+                    successful_history.append(admitted.item.document_id)
+                    while len(successful_history) > candidate_limit:
+                        known_ids.discard(successful_history.popleft())
+                elif (
+                    outcome.failure is not None
+                    and outcome.failure.stage == "parse"
+                ):
+                    if outcome.failure.retryable is False:
+                        successful_history.append(
+                            admitted.item.document_id
+                        )
+                        while len(successful_history) > candidate_limit:
+                            known_ids.discard(
+                                successful_history.popleft()
+                            )
+                    else:
+                        # Retry after one fixed candidate window worth of
+                        # other admissions. This is bounded, work-based
+                        # fairness—not a wall-clock document deadline—and
+                        # PostgreSQL attempt counts remain the durable cap.
+                        deferred_retries.append(
+                            (
+                                dispatched + candidate_limit,
+                                admitted.item.document_id,
+                            )
+                        )
+                if outcome_halts_admission(outcome):
                     halt_admission()
 
             for future in completed & finalize_futures.keys():
-                document_id = finalize_futures.pop(future)
+                finalized = finalize_futures.pop(future)
                 try:
                     outcome = future.result()
                 except Exception as exc:
                     outcome = _DocOutcome(
                         failure=WorkerFailure(
                             stage="build",
-                            item_ref=document_id,
+                            item_ref=finalized.document_id,
                             error_code=type(exc).__name__,
                         )
                     )
                 _fold_outcome(report, outcome)
                 deps.heartbeat()
-                if _halts_parse_refill(outcome, report.failures):
+                if outcome_halts_admission(outcome):
                     halt_admission()
 
             if should_stop():
@@ -1645,6 +2162,8 @@ def _parse_one_batch(
                     future.cancel()
             if not halt_refill:
                 refill()
+            rotate_report()
+        rotate_report(force=True)
     return "halt" if halt_refill else "done"
 
 

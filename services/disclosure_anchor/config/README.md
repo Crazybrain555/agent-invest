@@ -66,16 +66,17 @@
 | DISCLOSURE_BACKFILL_MAX_PENDING_DOWNLOADS | 2000 | 首回补处理总在途水位（兼容旧变量名）：待下载 + 已下载待解析；单公司原子同步可越线一次 |
 | WORKER_BATCH_SYNC | 13 | 每轮到期公司上限；常驻模式零等待轮转，但首回补还受总在途水位约束，不要直接升到 200 |
 | WORKER_BATCH_DOWNLOAD | 50 | 每轮下载上限；下载只把工作从 pending-download 搬到 pending-parse，总在途水位避免 GPU 故障时 raw 无界增长 |
-| WORKER_BATCH_PARSE | 50 | 直接 `worker once` 的单轮上限；resident 只在有界 refill window 内滚动补槽 |
+| WORKER_BATCH_PARSE | 50 | 仅为直接 `worker once` 的单轮文档上限；production resident 常驻补槽，不把该数当报告/排空边界 |
 | WORKER_PARSE_CONCURRENCY | 16（生产模板） | 文档槽，不是 GPU 请求数；本地 CPU backend 必须设 1 |
 | WORKER_GPU_REQUEST_BUDGET / MAX_SEQUENCES | 112 / 128 | resident worker 稳态请求包络；16 文档时每份 MinerU `--max-concurrency=7` |
 | WORKER_PARSE_*_PAGE_THRESHOLD / SATURATED_SHARE | 80/4、500/1 | regular/heavy/huge 名义份额；lane 空闲时允许借用 |
 | CNINFO_OVERSIZED_KB | 10240 | 兼容旧名；以归档 actual byte_count 判定 HUGE lane，不是下载/解析上限 |
 | WORKER_PARSE_CANDIDATE_WINDOW | 1000 | 每次公平选择的候选前缀；不是第二份耐久队列 |
 | WORKER_FINALIZE_CONCURRENCY | 2 | parse 后 build/publish 的有界下游池 |
+| WORKER_REPORT_INTERVAL_SECONDS | 300 | resident 观测快照周期；只轮换 report 对象，绝不关闭 admission 或排空 future |
 | DISCLOSURE_PARSE_TIMEOUT_* | 3600 / 12-per-page / 14400 | 页数感知的软预期耗时，只告警、不终止正常长文档 |
 | DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS | 86400 | 极端 live-but-stuck 进程保护；整本文档默认可运行 24 小时 |
-| WORKER_LOOP_INTERVAL_SECONDS / MAX | 900 / 1800 | 仅空队列使用的 15→30 分钟退避；有进展时不睡眠 |
+| WORKER_LOOP_INTERVAL_SECONDS / MAX | 900 / 1800 | acquisition/project maintenance 的空闲/故障退避；parse 空队列由下载事件或 5 秒 fail-safe poll 唤醒 |
 | MINERU_PROCESSING_WINDOW_SIZE | 16 | GPU 页窗口红线（round22h OOM 后定案） |
 | CNINFO_* | — | 凭据（只进环境，绝不进仓） |
 
