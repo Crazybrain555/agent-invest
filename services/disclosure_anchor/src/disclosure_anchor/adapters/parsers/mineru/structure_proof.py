@@ -7,6 +7,7 @@ from numbering or nearest-level proximity.
 
 from __future__ import annotations
 
+import statistics
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -960,11 +961,70 @@ def _apply_native_line_grammar(
         if len(refs) == 1
     }
 
-    # Merge the lines of one printed title (adjacent title carriers
-    # sharing a native block). Corpus measurement rejected any looser
-    # geometric criterion: financial-note reports pack real adjacent
-    # same-level headings at line pitch, so only block co-membership is
-    # safe evidence that two lines are one printed title.
+    all_heights = [
+        atom.bbox[3] - atom.bbox[1]
+        for page in source_pages
+        for atom in page.atoms
+    ]
+    doc_line_height = statistics.median(all_heights) if all_heights else 0.0
+    line_height_cache: dict[int, float] = {}
+
+    def line_height(sii: int) -> float:
+        if sii not in line_height_cache:
+            heights: list[float] = []
+            for carrier in by_sii.get(sii, []):
+                page = pages_by_idx.get(carrier.page_idx)
+                if page is None:
+                    continue
+                x0, y0, x1, y1 = carrier.bbox
+                for atom in page.atoms:
+                    cx = (atom.bbox[0] + atom.bbox[2]) / 2 / page.width * 1000.0
+                    cy = (atom.bbox[1] + atom.bbox[3]) / 2 / page.height * 1000.0
+                    if x0 <= cx <= x1 and y0 <= cy <= y1:
+                        heights.append(atom.bbox[3] - atom.bbox[1])
+            line_height_cache[sii] = (
+                statistics.median(heights) if heights else 0.0
+            )
+        return line_height_cache[sii]
+
+    def lines_of_one_printed_title(sii: int, nxt: int) -> bool:
+        # Two lines of one printed title: both carry display-size type
+        # (corpus calibration: real adjacent headings stay <= 1.14x the
+        # document line height, split document titles sit >= 1.33x), the
+        # same size as each other, at line pitch, centre-aligned, in one
+        # native flow. Block co-membership merges directly.
+        if blocks(sii) and blocks(sii) & blocks(nxt):
+            return True
+        left = by_sii.get(sii, [None])[0]
+        right = by_sii.get(nxt, [None])[0]
+        if left is None or right is None or left.page_idx != right.page_idx:
+            return False
+        left_flows = {flow for flow, _ in blocks(sii)}
+        right_flows = {flow for flow, _ in blocks(nxt)}
+        if not (left_flows and left_flows & right_flows):
+            return False
+        if doc_line_height <= 0:
+            return False
+        height_left = line_height(sii)
+        height_right = line_height(nxt)
+        if min(height_left, height_right) < 1.25 * doc_line_height:
+            return False
+        if abs(height_left - height_right) > 0.1 * max(
+            height_left, height_right
+        ):
+            return False
+        gap = right.bbox[1] - left.bbox[3]
+        pitch = min(
+            left.bbox[3] - left.bbox[1],
+            right.bbox[3] - right.bbox[1],
+        )
+        if pitch <= 0 or gap > pitch:
+            return False
+        left_center = (left.bbox[0] + left.bbox[2]) / 2
+        right_center = (right.bbox[0] + right.bbox[2]) / 2
+        return abs(left_center - right_center) <= 100.0
+
+    # Merge the lines of one printed title, longest chains first.
     merged_any = True
     while merged_any:
         merged_any = False
@@ -972,7 +1032,7 @@ def _apply_native_line_grammar(
             nxt = sii + 1
             if nxt not in title_groups:
                 continue
-            if not (blocks(sii) and blocks(sii) & blocks(nxt)):
+            if not lines_of_one_printed_title(sii, nxt):
                 continue
             left_refs = title_groups[sii]
             right_refs = title_groups[nxt]

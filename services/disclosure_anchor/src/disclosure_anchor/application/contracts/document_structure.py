@@ -10,7 +10,7 @@ from typing import Any, Never, cast
 
 
 DOCUMENT_STRUCTURE_VERSION = "document_structure.v1"
-DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v9"
+DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v10"
 
 _SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 _ROOT_FIELDS = frozenset(

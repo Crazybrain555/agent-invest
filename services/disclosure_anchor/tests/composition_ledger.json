@@ -237,7 +237,7 @@
   },
   "tests/unit/test_mineru_adapter.py": {
    "private_imports": [],
-   "tests": 45
+   "tests": 46
   },
   "tests/unit/test_mineru_backend_probe.py": {
    "private_imports": [],

@@ -1945,6 +1945,85 @@ class MinerUMapperTests(unittest.TestCase):
         )
         self.assertEqual(heading["section_span"], [0, 2])
 
+    def test_display_size_title_lines_merge_across_blocks(self) -> None:
+        # The two lines of a printed document title live in adjacent
+        # blocks but both carry display-size type at line pitch with
+        # aligned centres; body-size adjacent headings never merge.
+        content = [
+            {
+                "type": "text",
+                "text": "财通证券股份有限公司",
+                "page_idx": 0,
+                "bbox": [300, 80, 700, 106],
+                "text_level": 1,
+            },
+            {
+                "type": "text",
+                "text": "投资者关系活动记录表",
+                "page_idx": 0,
+                "bbox": [300, 110, 700, 136],
+                "text_level": 1,
+            },
+            {
+                "type": "text",
+                "text": "正文内容甲乙丙丁戊己庚辛",
+                "page_idx": 0,
+                "bbox": [100, 200, 500, 218],
+                "text_level": None,
+            },
+        ]
+        atoms = [
+            self._layout_atom(
+                0, "财通证券股份有限公司", block=1, line=0, cx=300, cy=74
+            ),
+            self._layout_atom(
+                1, "投资者关系活动记录表", block=2, line=0, cx=300, cy=98
+            ),
+        ]
+        # Display-size title atoms: taller boxes than the body words.
+        atoms = [
+            a.__class__(
+                page_idx=a.page_idx,
+                order=a.order,
+                bbox=(a.bbox[0], a.bbox[1] - 3.0, a.bbox[2], a.bbox[3] + 3.0),
+                char_span=a.char_span,
+                text=a.text,
+                layout=a.layout,
+            )
+            for a in atoms
+        ] + [
+            self._layout_atom(
+                2 + i, text, block=3, line=i, cx=90, cy=170 + i * 10
+            )
+            for i, text in enumerate(
+                ("正文内容", "甲乙丙丁", "戊己庚辛", "更多正文")
+            )
+        ]
+        page = self._layout_page(atoms)
+        proof, _content = _v2_structure_proof(
+            native=native_index(page_count=1),
+            legacy_content_list=content,
+            content_list_v2=[
+                [
+                    _title_block("财通证券股份有限公司", [300, 80, 700, 106]),
+                    _title_block("投资者关系活动记录表", [300, 110, 700, 136]),
+                    _paragraph_block(
+                        "正文内容甲乙丙丁戊己庚辛", [100, 200, 500, 218]
+                    ),
+                ]
+            ],
+            source_pages=(page,),
+        )
+
+        self.assertEqual(len(proof["headings"]), 1)
+        self.assertEqual(
+            [
+                ref["source_item_index"]
+                for ref in proof["headings"][0]["source_refs"]
+            ],
+            [0, 1],
+        )
+
     def test_adjacent_titles_in_distinct_blocks_stay_separate(self) -> None:
         content = [
             {
