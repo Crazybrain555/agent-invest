@@ -1036,6 +1036,14 @@ def _apply_native_line_grammar(
                 continue
             left_refs = title_groups[sii]
             right_refs = title_groups[nxt]
+            if any(
+                "struct_tree" in item.evidence
+                for item in (*grouped[left_refs], *grouped[right_refs])
+            ):
+                # Native-lane headings carry their own provenance and
+                # multi-ref mechanism; a merge would fabricate native
+                # claims the proof cannot back.
+                continue
             left = grouped.pop(left_refs)
             right = grouped.pop(right_refs)
             refs = (*left_refs, *right_refs)

@@ -2674,6 +2674,12 @@ def _collect_projection_graph(
                 expected_heading = "\n".join(selected_text)
             elif kind == "source_field" and transform == "clean_text.v1":
                 expected_heading = selected_text[0] if len(selected_text) == 1 else ""
+            elif kind == "source_concat" and transform == "clean_text.v1":
+                # A merged printed title joins its line carriers verbatim
+                # and strips only the outer whitespace, exactly like the
+                # single-field clean_text lane.
+                raw_values = [str(value.value) for value in selected_values]
+                expected_heading = "".join(raw_values).strip()
             else:
                 expected_heading = ""
             if selected_values:
