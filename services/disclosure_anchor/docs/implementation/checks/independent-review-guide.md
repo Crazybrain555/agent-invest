@@ -16,8 +16,10 @@ SQL 都是"抓一整类"的写法。
 ## 0. 审查前置
 
 新增审查对象（round12-16）：`docs/architecture/data-dictionary.md`（逐列核对与实库
-一致）；词表文件 note_key_map r16（173 键、389 标签）/ event_key_map r2（35 事件键）/
-class_map(r5,31类)/facet_map/config/processing_policy.json（0016 起分类视图现算、round21 单一处理面+级联覆盖，design/classification-facets-and-derived-views.md）；三 facet 架构（retrieval 设计文档 §4.6）。
+一致）；词表文件 note_key_map r18（173 键、391 标签）/
+class_map(r7,31类)/facet_map r1/config/processing_policy r4（0016 起分类视图现算、round21
+单一处理面+级联覆盖，design/classification-facets-and-derived-views.md）；已撤销的
+event_key_map 不得作为当前审查对象，现状勘误见 retrieval 设计文档 §6.3。
 
 ## 0.1 原审查前置
 
@@ -108,14 +110,15 @@ S5 续表合并只看列数（cn_a_v6 后同构附注表跨科目误并，3. 销
 - **domain**：实体无 IO；枚举闭集走契约升版；错误分型 retryable 语义正确
   （尤其 quota_exhausted=请求内 fail-fast + 下轮可重试）。
 - **unit_builder**：规则全部在 rules.py 且版本化（改规则必升 RULES_VERSION）；
-  builder 纯函数无 IO；词表 JSON（note_key_map/event_key_map/class_map/facet_map/parse_scope）
+  builder 纯函数无 IO；词表 JSON（note_key_map/class_map/facet_map/parse_scope）
   与代码读取键一致；内容哈希纯净性——payload 不得含任何规则派生值（U2）。
 - **worker**：队列谓词只在 queries.py；批次上限/背压/熔断路径有测试；
   单项异常隔离不破轮。
 - **sources/cninfo**：凭据只从 env；query_params 持久化前剔除 token；
   429/透传错误分型；两通道（API/web）候选形状一致性。
 - **api**：读端点只出 public 视图列；错误 envelope 无堆栈无绝对路径；
-  admin 默认不挂载；DERIVED 白名单={asset_uri}。
+  admin 默认不挂载；DERIVED 白名单=document_unit.{asset_uri,evidence_refs} +
+  source_ref.{evidence_refs}。
 - **migrations**：新改动从 0016 起；视图变更=契约变更（列 pin 测试 + checklist 同步 +
   export_contracts 重导）；已应用迁移不改。
 - **tests**：新行为必有回归测试；集成测试 tearDown 自清理；对真库敏感的测试

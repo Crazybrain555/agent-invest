@@ -2,27 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
-from disclosure_anchor.adapters.sources.cninfo.mapper import derive_primary_class
-from disclosure_anchor.adapters.unit_builder import rules
-from disclosure_anchor.adapters.unit_builder.builder import (
-    ImageBytesResolver,
-    UnitDraft,
-    build_unit_drafts_s1_s7,
-)
-from disclosure_anchor.application.ports.file_store import (
-    ArtifactStorePort,
-    ArtifactWriteResult,
-    FileStorePathPort,
-)
 from disclosure_anchor.application.contracts.normalized_ir import (
+    CURRENT_NORMALIZED_IR_VERSION,
     NormalizedIRVersionError,
     validate_normalized_ir_contract,
     validate_normalized_ir_identity,
@@ -30,10 +19,26 @@ from disclosure_anchor.application.contracts.normalized_ir import (
     validate_reconciliation_generation,
 )
 from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation import (
-    ReconciliationCompatibility,
     TableReconciliationContractError,
     UnsupportedTableReconciliationAlgorithm,
     assess_normalized_ir_table_reconciliation,
+)
+from disclosure_anchor.application.contracts.parser_target import (
+    ParserTargetIdentity,
+    ParserTargetIdentityError,
+)
+from disclosure_anchor.application.contracts.unit_source_projection import (
+    payload_page_no,
+)
+from disclosure_anchor.application.ports.file_store import (
+    ArtifactStorePort,
+    ArtifactWriteResult,
+    FileStorePathPort,
+)
+from disclosure_anchor.application.ports.source_evidence import (
+    SourceEvidenceValidationError,
+    SourceEvidenceValidatorPort,
+    VerifiedParserArtifact,
 )
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.services.data_file_reader import (
@@ -41,7 +46,23 @@ from disclosure_anchor.application.services.data_file_reader import (
     DataStoreReadError,
     read_data_file_bytes,
 )
-from disclosure_anchor.application.worker.locks import maybe_lock_document
+from disclosure_anchor.application.services.document_unit_audit import (
+    AuditDocumentMetadata,
+)
+from disclosure_anchor.application.services.unit_builder import rules
+from disclosure_anchor.application.services.unit_builder.builder import (
+    ImageArtifactResolver,
+    ResolvedImageArtifact,
+    SourceEvidenceClosureError,
+    UnitDraft,
+)
+from disclosure_anchor.application.services.unit_preparation import (
+    prepare_and_audit_units,
+)
+from disclosure_anchor.application.worker.locks import (
+    exclusive_document_producer,
+    maybe_lock_document,
+)
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import BuildUnitsError
@@ -54,7 +75,6 @@ from disclosure_anchor.domain.value_objects.semantic_key import (
     SemanticKeyInvariantError,
     validate_semantic_key_state,
 )
-
 
 SNAPSHOT_KEYS = {
     "applicability",
@@ -99,12 +119,30 @@ class BuildUnits:
         path_builder: FileStorePathPort,
         artifact_store: ArtifactStorePort,
         uow_factory: Callable[[], UnitOfWork],
+        source_evidence_validator: SourceEvidenceValidatorPort,
     ) -> None:
         self._paths = path_builder
         self._artifact_store = artifact_store
         self._uow_factory = uow_factory
+        self._source_evidence_validator = source_evidence_validator
 
     def execute(self, command: BuildUnitsCommand) -> BuildUnitsResult:
+        initial = self._load_context(command)
+        run = initial["run"]
+        # The producer UoW owns both corpus admission and the document lease
+        # across IR/image reads, snapshot writes, and every DB transaction.
+        with exclusive_document_producer(
+            self._uow_factory,
+            run.document_id,
+        ):
+            return self._execute_owned(command)
+
+    def _execute_owned(
+        self,
+        command: BuildUnitsCommand,
+    ) -> BuildUnitsResult:
+        # Re-read after document admission. A concurrent winner may have
+        # completed between initial resolution and the document lease.
         context = self._load_context(command)
         run = context["run"]
         try:
@@ -112,6 +150,7 @@ class BuildUnits:
                 Path(run.normalized_ir_relpath or ""),
                 expected_artifact_hash=run.artifact_hash,
                 expected_document_id=run.document_id,
+                expected_parser_target=run.parser_target_identity,
             )
             parsed_pages = normalized_ir.get("parsed_pages")
             if (
@@ -127,24 +166,74 @@ class BuildUnits:
                         ),
                     )
                 )
-            document = context["document"]
-            drafts, stats = build_unit_drafts_s1_s7(
+            evidence = self._source_evidence_validator.validate(
                 normalized_ir,
-                filing_type=derive_primary_class(
-                    (document.provider_metadata or {}).get("raw_category"),
-                    document.title,
+                load_artifact=lambda role: self._load_hashed_parser_artifact(
+                    normalized_ir,
+                    role=role,
                 ),
-                document_title=document.title,
-                security_code=context["security"].security_code,
-                security_name=_optional_text(
-                    (document.provider_metadata or {}).get("security_name")
-                ),
-                image_bytes_resolver=self._image_bytes_resolver(normalized_ir),
             )
+            document = context["document"]
+            security = context["security"]
+            # Retrieval taxonomy consumes the classification materialized on
+            # the document.  Parser/build structure must never be reclassified
+            # from provider metadata or title text at this downstream stage.
+            filing_type = document.class_filing_type
+            image_hashes_by_role: dict[str, str] = {}
+            drafts, stats, report = prepare_and_audit_units(
+                normalized_ir=normalized_ir,
+                filing_type=filing_type,
+                metadata=AuditDocumentMetadata(
+                    document_id=document.document_id,
+                    title=document.title,
+                    filing_type=filing_type,
+                    security_code=security.security_code,
+                ),
+                image_artifact_resolver=self._image_artifact_resolver(
+                    normalized_ir,
+                    image_hashes_by_role=image_hashes_by_role,
+                ),
+                image_hash_provider=lambda: _image_hashes_by_source(
+                    normalized_ir,
+                    image_hashes_by_role=image_hashes_by_role,
+                ),
+                source_proof=evidence.proof,
+            )
+            if not report.ok:
+                sample = "; ".join(
+                    f"{finding.code}:{finding.source_ref or '-'}"
+                    for finding in report.findings[:8]
+                )
+                raise BuildUnitsError(
+                    self._structured_error(
+                        error_code="UNIT_SOURCE_AUDIT_FAILED",
+                        message=(
+                            f"source replay rejected {report.metrics['error_count']} "
+                            f"unit finding(s): {sample}"
+                        ),
+                    )
+                )
             units, snapshot_rows = self._materialize_units(
                 drafts=drafts,
                 document=context["document"],
                 run=run,
+            )
+        except SourceEvidenceClosureError as exc:
+            return self._mark_and_result(
+                run.processing_run_id,
+                self._structured_error(
+                    error_code="SOURCE_EVIDENCE_UNADDRESSABLE",
+                    message=str(exc),
+                ),
+            )
+        except SourceEvidenceValidationError as exc:
+            return self._mark_and_result(
+                run.processing_run_id,
+                self._structured_error(
+                    error_code="SOURCE_EVIDENCE_INVALID",
+                    reason_code=exc.reason_code,
+                    message=str(exc),
+                ),
             )
         except BuildUnitsError as exc:
             return self._mark_and_result(run.processing_run_id, exc.error)
@@ -318,6 +407,7 @@ class BuildUnits:
         *,
         expected_artifact_hash: str | None = None,
         expected_document_id: str,
+        expected_parser_target: object,
     ) -> dict[str, Any]:
         if not str(relpath):
             raise BuildUnitsError(
@@ -373,9 +463,7 @@ class BuildUnits:
         payload = cast(dict[str, Any], decoded)
         try:
             version = validate_normalized_ir_contract(payload)
-            validate_normalized_ir_identity(
-                payload, document_id=expected_document_id
-            )
+            validate_normalized_ir_identity(payload, document_id=expected_document_id)
             validate_normalized_ir_path_version(relpath, version=version)
         except NormalizedIRVersionError as exc:
             error_code = (
@@ -390,8 +478,85 @@ class BuildUnits:
                     message=str(exc),
                 )
             ) from exc
+        if version != CURRENT_NORMALIZED_IR_VERSION:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="IR_CONTRACT_TOO_OLD",
+                    reason_code="structure_proof_reparse_required",
+                    message=(
+                        f"{version} has no source-bound document structure "
+                        "and must be re-parsed before building units"
+                    ),
+                )
+            )
+        try:
+            run_target = ParserTargetIdentity.from_payload(expected_parser_target)
+            ir_target = ParserTargetIdentity.from_payload(payload.get("parser"))
+        except ParserTargetIdentityError as exc:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="PARSER_TARGET_IDENTITY_INVALID",
+                    message=str(exc),
+                )
+            ) from exc
+        if run_target != ir_target:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="PARSER_TARGET_IDENTITY_MISMATCH",
+                    message=(
+                        "processing run parser target differs from "
+                        "NormalizedIR"
+                    ),
+                )
+            )
         self._validate_table_reconciliation(payload, version=version)
         return payload
+
+    def _load_hashed_parser_artifact(
+        self,
+        normalized_ir: Mapping[str, Any],
+        *,
+        role: str,
+    ) -> VerifiedParserArtifact:
+        parser_artifacts = cast(
+            Mapping[str, Any],
+            normalized_ir["parser_artifacts"],
+        )
+        files = cast(Mapping[str, Any], parser_artifacts["files"])
+        descriptor = cast(Mapping[str, Any], files[role])
+        relpath = Path(cast(str, descriptor["relpath"]))
+        expected_sha256 = cast(str, descriptor["sha256"])
+        expected_size = cast(int, descriptor["size_bytes"])
+        try:
+            payload = read_data_file_bytes(self._paths, relpath)
+        except DataFileMissingError as exc:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="PARSER_ARTIFACT_MISSING",
+                    message=f"{role}: {exc}",
+                )
+            ) from exc
+        except DataStoreReadError as exc:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="PARSER_ARTIFACT_READ_FAILED",
+                    retryable=True,
+                    message=f"{role}: {exc}",
+                )
+            ) from exc
+        actual_sha256 = "sha256:" + hashlib.sha256(payload).hexdigest()
+        if len(payload) != expected_size or actual_sha256 != expected_sha256:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="PARSER_ARTIFACT_IDENTITY_MISMATCH",
+                    message=(
+                        f"{role} at {relpath} has size/hash "
+                        f"{len(payload)}/{actual_sha256}; expected "
+                        f"{expected_size}/{expected_sha256}"
+                    ),
+                )
+            )
+        return VerifiedParserArtifact(payload=payload, sha256=actual_sha256)
 
     def _validate_table_reconciliation(
         self, payload: dict[str, Any], *, version: str
@@ -428,31 +593,51 @@ class BuildUnits:
                     message=str(exc),
                 )
             ) from exc
-        if assessment.compatibility is ReconciliationCompatibility.REPARSE_REQUIRED:
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="IR_TABLE_RECONCILIATION_REPARSE_REQUIRED",
-                    reason_code="legacy_physical_carriers_restored",
-                    message=(
-                        "normalized IR was produced by a legacy reconciliation "
-                        "that rewrote physical table carriers; re-parse before "
-                        "building units"
-                    ),
-                )
-            )
-
-    def _image_bytes_resolver(
-        self, normalized_ir: dict[str, Any]
-    ) -> ImageBytesResolver | None:
-        parser_artifacts = normalized_ir.get("parser_artifacts") or {}
-        artifact_root = parser_artifacts.get("artifact_root_relpath")
-        if not artifact_root:
+    def _image_artifact_resolver(
+        self,
+        normalized_ir: dict[str, Any],
+        *,
+        image_hashes_by_role: dict[str, str] | None = None,
+    ) -> ImageArtifactResolver | None:
+        parser_artifacts = normalized_ir.get("parser_artifacts")
+        if not isinstance(parser_artifacts, Mapping):
             return None
-        artifact_root_relpath = Path(str(artifact_root))
+        artifact_root = parser_artifacts.get("artifact_root_relpath")
+        files = parser_artifacts.get("files")
+        if not isinstance(artifact_root, str) or not isinstance(files, Mapping):
+            return None
+        artifact_root_relpath = Path(artifact_root)
 
-        def resolve(image_path: str) -> bytes:
-            relpath = artifact_root_relpath / Path(image_path)
-            return self._paths.data_path(relpath).read_bytes()
+        def resolve(artifact_role: str, image_path: str) -> ResolvedImageArtifact:
+            role = artifact_role
+            descriptor = files.get(role)
+            if not isinstance(descriptor, Mapping):
+                raise SourceEvidenceClosureError(
+                    f"image artifact role is missing: {role}"
+                )
+            expected_relpath = artifact_root_relpath / Path(image_path)
+            if (
+                descriptor.get("availability") != "present"
+                or descriptor.get("relpath") != str(expected_relpath)
+            ):
+                raise SourceEvidenceClosureError(
+                    f"image artifact role does not bind image_path: {role}"
+                )
+            artifact = self._load_hashed_parser_artifact(
+                normalized_ir,
+                role=role,
+            )
+            if image_hashes_by_role is not None:
+                image_hashes_by_role[role] = artifact.sha256.removeprefix(
+                    "sha256:"
+                )
+            return ResolvedImageArtifact(
+                content=artifact.payload,
+                artifact_role=role,
+                sha256=artifact.sha256,
+                size_bytes=len(artifact.payload),
+                media_type=_image_media_type(artifact.payload),
+            )
 
         return resolve
 
@@ -506,7 +691,11 @@ class BuildUnits:
                 structure_hash=hashes.structure_hash,
                 quality_status=draft.quality_status,
                 applicability=draft.applicability,
-                page_no=_locator_page_no(draft.artifact_locator),
+                page_no=payload_page_no(
+                    payload_kind=draft.payload_kind,
+                    payload=draft.payload,
+                    artifact_locator=draft.artifact_locator,
+                ),
                 query_projection_hash=hashes.query_projection_hash,
                 artifact_locator=draft.artifact_locator,
             )
@@ -660,15 +849,42 @@ class BuildUnits:
         return error
 
 
-def _locator_page_no(locator: dict[str, Any] | None) -> int | None:
-    if not locator:
-        return None
-    value = locator.get("page_no")
-    return value if isinstance(value, int) else None
+def _image_hashes_by_source(
+    normalized_ir: Mapping[str, Any],
+    *,
+    image_hashes_by_role: Mapping[str, str],
+) -> dict[str, str]:
+    output = dict(image_hashes_by_role)
+    elements = normalized_ir.get("elements")
+    if not isinstance(elements, list):
+        return output
+    for element in elements:
+        if not isinstance(element, Mapping):
+            continue
+        ir_id = element.get("ir_id")
+        source_item_index = element.get("source_item_index")
+        if (
+            isinstance(ir_id, str)
+            and isinstance(source_item_index, int)
+            and not isinstance(source_item_index, bool)
+            and (
+                role := f"evidence_image_{source_item_index:06d}"
+            ) in image_hashes_by_role
+        ):
+            output[ir_id] = image_hashes_by_role[role]
+    return output
 
 
-def _optional_text(value: object) -> str | None:
-    return value.strip() if isinstance(value, str) and value.strip() else None
+def _image_media_type(content: bytes) -> str:
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    raise SourceEvidenceClosureError("image artifact has an unsupported media type")
 
 
 def _content_hash_aggregate(units: list[e.DocumentUnit]) -> str:

@@ -1,31 +1,57 @@
-"""BuildUnits use case tests."""
+"""BuildUnits boundary tests for source-bound NormalizedIR v4."""
 
 from __future__ import annotations
 
+import ast
+import contextlib
+import copy
 import hashlib
 import json
-from pathlib import Path
 import tempfile
 import unittest
+from contextlib import ExitStack
+from dataclasses import asdict, replace
+from pathlib import Path
+from typing import Any
 from unittest import mock
 
+from scripts import audit_unit_corpus
+
+from disclosure_anchor.adapters.parsers.mineru.source_evidence_validator import (
+    MinerUSourceEvidenceValidator,
+)
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
-from disclosure_anchor.adapters.parsers.mineru.table_reconciler import (
-    TableReconciliationStats,
+from disclosure_anchor.application.contracts import (
+    canonical_occurrence,
+    source_evidence_projection,
+)
+from disclosure_anchor.application.contracts.unit_source_projection import (
+    search_text_values,
 )
 from disclosure_anchor.application.ports.file_store import ArtifactWriteResult
-from disclosure_anchor.application.contracts.normalized_ir import (
-    CURRENT_NORMALIZED_IR_VERSION,
-    normalized_ir_filename,
+from disclosure_anchor.application.services import (
+    document_unit_audit as document_unit_audit_module,
+    unit_preparation,
 )
+from disclosure_anchor.application.services.document_unit_audit import (
+    AuditFinding,
+    DocumentAuditReport,
+)
+from disclosure_anchor.application.services.unit_builder import (
+    source_native_fallback,
+)
+from disclosure_anchor.application.services.unit_builder.builder import (
+    SourceEvidenceClosureError,
+)
+from disclosure_anchor.application.use_cases import build_units as build_units_module
 from disclosure_anchor.application.use_cases.build_units import (
+    SNAPSHOT_KEYS,
     BuildUnits,
     BuildUnitsCommand,
-    SNAPSHOT_KEYS,
 )
 from disclosure_anchor.domain import entities as e
-from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import BuildUnitsError
+from tests.unit._current_ir import write_text_ir_bundle
 from tests.unit._fakes import FakeUnitOfWork
 
 
@@ -54,13 +80,13 @@ class _PathBuilder:
         )
 
 
-class _UnreadablePathBuilder(_PathBuilder):
-    def data_path(self, relpath: Path) -> Path:
-        raise PermissionError("simulated shared data-store outage")
-
-
 class _BadHashArtifactStore(ArtifactStore):
-    def write_jsonl_atomic(self, *, relpath: Path, rows: list[object]):
+    def write_jsonl_atomic(
+        self,
+        *,
+        relpath: Path,
+        rows: list[object],
+    ) -> ArtifactWriteResult:
         super().write_jsonl_atomic(relpath=relpath, rows=rows)
         return ArtifactWriteResult(
             relpath=relpath,
@@ -69,68 +95,15 @@ class _BadHashArtifactStore(ArtifactStore):
         )
 
 
-def _normalized_ir() -> dict:
-    return {
-        "contract_version": CURRENT_NORMALIZED_IR_VERSION,
-        "document_id": "doc_1",
-        "created_at": "2026-07-05T00:00:00Z",
-        "source_pdf": "raw.pdf",
-        "title": "公告",
-        "parser": {
-            "name": "MinerU",
-            "package_version": "3.4.0",
-            "backend": "pipeline",
-            "method": "auto",
-            "language": "ch",
-            "formula": False,
-            "table": True,
-        },
-        "parser_artifacts": {
-            "artifact_root_relpath": "parser/a",
-            "content_list_relpath": "parser/a/content.json",
-        },
-        "parsed_pages": {"start_page_no": 1, "end_page_no": 1, "full_pdf": True},
-        "elements": [
-            {
-                "ir_id": "ir_1",
-                "kind": "heading",
-                "raw_kind": "text",
-                "order_index": 1,
-                "source_item_index": 1,
-                "heading_level": 1,
-                "text": "重要提示",
-            },
-            {
-                "ir_id": "ir_2",
-                "kind": "text",
-                "raw_kind": "text",
-                "order_index": 2,
-                "source_item_index": 2,
-                "text": "公司存在退市风险，请投资者注意。",
-            },
-        ],
-    }
-
-
-def _image_ir() -> dict:
-    return {
-        **_normalized_ir(),
-        "elements": [
-            {
-                "ir_id": "ir_image",
-                "kind": "image",
-                "raw_kind": "image",
-                "order_index": 1,
-                "source_item_index": 1,
-                "caption": "股权结构图",
-                "image_path": "images/plot.png",
-            }
-        ],
-    }
-
-
-def _uow(
-    root: Path, *, contract_version: str = CURRENT_NORMALIZED_IR_VERSION
+def _setup(
+    root: Path,
+    *,
+    native_only_texts: tuple[str, ...] = (),
+    native_page_texts: tuple[str, ...] | None = None,
+    full_pdf: bool = True,
+    page_visual: bool = False,
+    image: bool = False,
+    class_filing_type: str | None = "other",
 ) -> tuple[FakeUnitOfWork, Path]:
     uow = FakeUnitOfWork()
     company = uow.companies.add(e.Company(company_id="co_1", legal_name="江海股份"))
@@ -151,629 +124,1003 @@ def _uow(
             provider="cninfo",
             provider_document_id="pid_1",
             title="公告",
+            class_filing_type=class_filing_type,
+            class_rules_version=(
+                "test-materialized-v1" if class_filing_type is not None else None
+            ),
         )
     )
     ir_relpath = Path(
-        "derived/normalized_ir/cninfo/002484/pid_1/run_1"
-    ) / (
-        normalized_ir_filename(contract_version)
-        if contract_version in {"normalized_ir.v2", "normalized_ir.v3"}
-        else f"{contract_version}.json"
+        "derived/normalized_ir/cninfo/002484/pid_1/run_1/normalized_ir.v4.json"
     )
-    payload = {**_normalized_ir(), "contract_version": contract_version}
-    path = root / ir_relpath
-    path.parent.mkdir(parents=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    uow.processing_runs.add(
-        e.ProcessingRun(
-            processing_run_id="run_1",
-            document_id=document.document_id,
-            run_kind="parse",
-            status="succeeded",
-            normalized_ir_relpath=str(ir_relpath),
-        )
+    normalized_ir = write_text_ir_bundle(
+        root,
+        ir_relpath,
+        native_only_texts=native_only_texts,
+        native_page_texts=native_page_texts,
+        full_pdf=full_pdf,
+        page_visual=page_visual,
+        image=image,
     )
+    run = e.ProcessingRun(
+        processing_run_id="run_1",
+        document_id=document.document_id,
+        artifact_owner_processing_run_id="run_1",
+        run_kind="parse",
+        status="succeeded",
+        parser_target_identity=normalized_ir["parser"],
+        normalized_ir_relpath=str(ir_relpath),
+        artifact_hash=_sha256((root / ir_relpath).read_bytes()),
+    )
+    uow.processing_runs.add(run)
     return uow, ir_relpath
 
 
+def _use_case(
+    root: Path,
+    uow: FakeUnitOfWork,
+    *,
+    artifact_store: ArtifactStore | None = None,
+) -> BuildUnits:
+    paths = _PathBuilder(root)
+    return BuildUnits(
+        path_builder=paths,
+        artifact_store=artifact_store or ArtifactStore(paths),
+        uow_factory=lambda: uow,
+        source_evidence_validator=MinerUSourceEvidenceValidator(),
+    )
+
+
+def _rewrite_ir(
+    root: Path,
+    uow: FakeUnitOfWork,
+    ir_relpath: Path,
+    payload: dict[str, object],
+) -> None:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    (root / ir_relpath).write_bytes(encoded)
+    run = uow.processing_runs.get("run_1")
+    run.artifact_hash = _sha256(encoded)
+    uow.processing_runs.update(run)
+
+
+def _run_shared_preparation_paths(
+    service_root: Path,
+    *,
+    source_gap: bool,
+) -> tuple[object, dict[str, object], object, object, FakeUnitOfWork]:
+    data_root = service_root / "data"
+    uow, ir_relpath = _setup(
+        data_root,
+        native_only_texts=(("MinerU遗漏但PDF可见",) if source_gap else ()),
+        page_visual=source_gap,
+        image=True,
+    )
+    run = uow.processing_runs.get("run_1")
+    replay_ir = json.loads((data_root / ir_relpath).read_bytes())
+    replay_bundle = audit_unit_corpus._load_persisted_source_bundle(
+        replay_ir,
+        data_root=service_root,
+    )
+    document = uow.documents.get("doc_1")
+    assert document is not None
+    filing_type = document.class_filing_type
+    assert filing_type is not None
+    entry = audit_unit_corpus.ManifestEntry(
+        document_id="doc_1",
+        provider="cninfo",
+        provider_document_id="pid_1",
+        processing_run_id="run_1",
+        security_code="002484",
+        security_name=None,
+        company_name=None,
+        title="公告",
+        filing_type=filing_type,
+        normalized_ir_relpath=str(ir_relpath),
+        normalized_ir_sha256=run.artifact_hash,
+    )
+    production: list[object] = []
+    corpus: list[object] = []
+    prepare = unit_preparation.prepare_and_audit_units
+
+    def capture(target: list[object]):
+        def wrapped(**kwargs: object) -> object:
+            result = prepare(**kwargs)
+            target.append(result)
+            return result
+
+        return wrapped
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            mock.patch.object(
+                build_units_module,
+                "prepare_and_audit_units",
+                side_effect=capture(production),
+            )
+        )
+        publication = _use_case(data_root, uow).execute(
+            BuildUnitsCommand(processing_run_id="run_1")
+        )
+        stack.enter_context(
+            mock.patch.object(
+                audit_unit_corpus,
+                "prepare_and_audit_units",
+                side_effect=capture(corpus),
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                audit_unit_corpus,
+                "_replay_source_ir",
+                return_value=(
+                    replay_ir,
+                    {"transient_source_evidence_rebuilt": True},
+                    replay_bundle.ledger,
+                    replay_bundle.proof,
+                    replay_bundle.native_structure_index,
+                ),
+            )
+        )
+        replay = audit_unit_corpus._audit_one((entry, str(service_root), True))
+    return publication, replay, production[0], corpus[0], uow
+
+
+def _prepared_bytes(value: object) -> bytes:
+    drafts, stats, report = value
+    return json.dumps(
+        {
+            "drafts": [asdict(draft) for draft in drafts],
+            "stats": stats.as_dict(),
+            "report": report.as_dict(),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+
 class BuildUnitsTests(unittest.TestCase):
-    def test_matching_ir_artifact_hash_builds_normally(self) -> None:
+    def test_valid_v4_build_writes_audited_snapshot_and_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            uow, ir_relpath = _uow(root)
-            run = uow.processing_runs.get("run_1")
-            run.artifact_hash = (
-                "sha256:" + hashlib.sha256((root / ir_relpath).read_bytes()).hexdigest()
-            )
-            uow.processing_runs.update(run)
-            paths = _PathBuilder(root)
-            use_case = BuildUnits(
-                path_builder=paths,
-                artifact_store=ArtifactStore(paths),
-                uow_factory=lambda: uow,
-            )
+            uow, _ = _setup(root)
 
-            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+            result = _use_case(root, uow).execute(
+                BuildUnitsCommand(processing_run_id="run_1")
+            )
 
             self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.unit_count, 1)
+            rows = uow.document_units.list_by_processing_run("run_1")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].title, "重要提示")
+            self.assertEqual(rows[0].heading_path, ["重要提示"])
+            self.assertIn(
+                "公司存在退市风险",
+                json.dumps(rows[0].payload, ensure_ascii=False),
+            )
+            snapshot = root / str(result.document_units_relpath)
+            records = [
+                json.loads(line)
+                for line in snapshot.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(set(records[0]), SNAPSHOT_KEYS)
+            self.assertEqual(
+                result.content_hash_aggregate,
+                uow.processing_runs.get("run_1").content_hash_aggregate,
+            )
 
-    def test_ir_ingress_failures_are_structured_before_building(self) -> None:
-        # The IR sits in the overwritable derived area; a corrupted or
-        # overwritten IR must fail loudly instead of publishing
-        # self-consistent bad units (round23).
+    def test_build_consumes_only_materialized_filing_classification(self) -> None:
+        structures: list[list[tuple[object, ...]]] = []
+        for materialized in ("investor_relations", None):
+            with (
+                self.subTest(materialized=materialized),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                uow, _ = _setup(
+                    root,
+                    class_filing_type=materialized,
+                )
+                document = uow.documents.get("doc_1")
+                assert document is not None
+                document.title = "2025年年度报告"
+                document.provider_metadata = {"raw_category": "010301"}
+                uow.documents.update(document)
+                with mock.patch.object(
+                    build_units_module,
+                    "prepare_and_audit_units",
+                    wraps=unit_preparation.prepare_and_audit_units,
+                ) as prepare:
+                    result = _use_case(root, uow).execute(
+                        BuildUnitsCommand(processing_run_id="run_1")
+                    )
+
+                self.assertEqual(result.status, "succeeded")
+                self.assertEqual(
+                    prepare.call_args.kwargs["filing_type"],
+                    materialized,
+                )
+                self.assertEqual(
+                    prepare.call_args.kwargs["metadata"].filing_type,
+                    materialized,
+                )
+                structures.append(
+                    [
+                        (
+                            unit.order_index,
+                            unit.payload_kind,
+                            unit.title,
+                            tuple(unit.heading_path),
+                            unit.payload,
+                            unit.applicability,
+                            unit.page_no,
+                            unit.artifact_locator,
+                        )
+                        for unit in uow.document_units.list_by_processing_run("run_1")
+                    ]
+                )
+        self.assertEqual(structures[0], structures[1])
+
+    def test_ir_hash_mismatch_fails_before_any_publication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            uow, ir_relpath = _uow(root)
+            uow, _ = _setup(root)
             run = uow.processing_runs.get("run_1")
             run.artifact_hash = "sha256:" + "0" * 64
             uow.processing_runs.update(run)
-            paths = _PathBuilder(root)
-            use_case = BuildUnits(
-                path_builder=paths,
-                artifact_store=ArtifactStore(paths),
-                uow_factory=lambda: uow,
-            )
 
-            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+            result = _use_case(root, uow).execute(
+                BuildUnitsCommand(processing_run_id="run_1")
+            )
 
             self.assertEqual(result.status, "failed")
             self.assertEqual(result.error["error_code"], "IR_HASH_MISMATCH")
             self.assertEqual(
-                uow.processing_runs.get("run_1").unit_build_error["error_code"],
-                "IR_HASH_MISMATCH",
+                uow.document_units.list_by_processing_run("run_1"),
+                [],
             )
-            self.assertEqual(uow.document_units.list_by_processing_run("run_1"), [])
 
+    def test_partial_pdf_is_never_publishable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            uow, _ = _uow(root)
-            paths = _UnreadablePathBuilder(root)
+            uow, _ = _setup(root, full_pdf=False)
 
-            result = BuildUnits(
-                path_builder=paths,
-                artifact_store=ArtifactStore(paths),
-                uow_factory=lambda: uow,
-            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
-
-            self.assertEqual(result.status, "failed")
-            self.assertEqual(result.error["error_code"], "IR_READ_FAILED")
-            self.assertTrue(result.error["retryable"])
-            self.assertEqual(uow.document_units.list_by_processing_run("run_1"), [])
-
-    def test_page_range_diagnostic_ir_cannot_enter_publication_pipeline(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            uow, ir_relpath = _uow(root)
-            ir_path = root / ir_relpath
-            payload = json.loads(ir_path.read_text(encoding="utf-8"))
-            payload["parsed_pages"]["full_pdf"] = False
-            ir_path.write_text(
-                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            result = _use_case(root, uow).execute(
+                BuildUnitsCommand(processing_run_id="run_1")
             )
-            paths = _PathBuilder(root)
-
-            result = BuildUnits(
-                path_builder=paths,
-                artifact_store=ArtifactStore(paths),
-                uow_factory=lambda: uow,
-            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
 
             self.assertEqual(result.status, "failed")
             self.assertEqual(
                 result.error["error_code"],
                 "PARTIAL_PDF_NOT_PUBLISHABLE",
             )
+
+    def test_source_artifact_pair_is_rechecked_before_publication(self) -> None:
+        for case in (
+            "source_evidence_hash_mismatch",
+            "typed_artifact_missing",
+            "typed_ledger_hash_mismatch",
+            "typed_projection_mismatch",
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                uow, ir_relpath = _setup(root)
+                if case == "source_evidence_hash_mismatch":
+                    (root / "parser/a/source_evidence.json").write_text(
+                        "{}",
+                        encoding="utf-8",
+                    )
+                    expected_code = "PARSER_ARTIFACT_IDENTITY_MISMATCH"
+                    expected_reason = None
+                elif case == "typed_artifact_missing":
+                    (root / "parser/a/content_list_v2.json").unlink()
+                    expected_code = "PARSER_ARTIFACT_MISSING"
+                    expected_reason = None
+                else:
+                    ir_path = root / ir_relpath
+                    payload = json.loads(ir_path.read_text(encoding="utf-8"))
+                    typed_path = root / "parser/a/content_list_v2.json"
+                    typed = json.loads(typed_path.read_text(encoding="utf-8"))
+                    if case == "typed_projection_mismatch":
+                        typed[0][0]["content"]["title_content"][0]["content"] += "篡改"
+                        expected_reason = "mineru_text_projection_invalid"
+                    else:
+                        expected_reason = "mineru_typed_artifact_identity_mismatch"
+                    typed_bytes = json.dumps(
+                        typed,
+                        ensure_ascii=False,
+                        indent=(2 if case == "typed_ledger_hash_mismatch" else None),
+                        separators=(
+                            None if case == "typed_ledger_hash_mismatch" else (",", ":")
+                        ),
+                        sort_keys=True,
+                    ).encode()
+                    typed_path.write_bytes(typed_bytes)
+                    descriptor = payload["parser_artifacts"]["files"]["content_list_v2"]
+                    descriptor["sha256"] = _sha256(typed_bytes)
+                    descriptor["size_bytes"] = len(typed_bytes)
+                    _rewrite_ir(root, uow, ir_relpath, payload)
+                    expected_code = "SOURCE_EVIDENCE_INVALID"
+
+                result = _use_case(root, uow).execute(
+                    BuildUnitsCommand(processing_run_id="run_1")
+                )
+
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.error["error_code"], expected_code)
+                if expected_reason is not None:
+                    self.assertEqual(result.error["reason_code"], expected_reason)
+                self.assertEqual(
+                    uow.document_units.list_by_processing_run("run_1"),
+                    [],
+                )
+
+    def test_publication_and_corpus_replay_share_byte_exact_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            publication, replay, production, corpus, uow = (
+                _run_shared_preparation_paths(
+                    Path(tmp),
+                    source_gap=False,
+                )
+            )
+
+            self.assertEqual(publication.status, "succeeded")
+            self.assertTrue(replay["ok"])
+            self.assertEqual(_prepared_bytes(production), _prepared_bytes(corpus))
+            rows = uow.document_units.list_by_processing_run("run_1")
+            self.assertEqual(len(rows), 1)
+            image = next(
+                part
+                for row in rows
+                for part in row.payload.get("parts", [])
+                if part["kind"] == "image"
+            )
+            self.assertRegex(
+                image["image_ref"],
+                r"^images/[0-9a-f]{64}\.png$",
+            )
+
+    def test_source_gap_is_atomically_projected_in_both_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            publication, replay, production, corpus, uow = (
+                _run_shared_preparation_paths(
+                    Path(tmp),
+                    source_gap=True,
+                )
+            )
+
+            self.assertEqual(publication.status, "succeeded")
+            self.assertTrue(replay["ok"])
+            self.assertEqual(_prepared_bytes(production), _prepared_bytes(corpus))
+            drafts, _stats, report = production
+            self.assertTrue(report.ok, [item.as_dict() for item in report.findings])
+            supplemental = drafts[-1]
+            self.assertEqual(supplemental.payload_kind, "mixed")
+            self.assertEqual(supplemental.heading_path, [])
+            self.assertIsNone(supplemental.title)
+            self.assertEqual(
+                supplemental.payload["semantic_type"],
+                "document",
+            )
+            parts = supplemental.payload["parts"]
+            self.assertEqual(
+                [part["text"] for part in parts],
+                ["MinerU遗漏但PDF可见", "不可定位字符"],
+            )
+            self.assertEqual(
+                [
+                    part["artifact_locator"]["source_projection"]["payload"]["sources"][
+                        0
+                    ]["source"]["kind"]
+                    for part in parts
+                ],
+                [
+                    "source_evidence_atom",
+                    "source_evidence_geometry_issue",
+                ],
+            )
+            self.assertTrue(
+                all(
+                    part["artifact_locator"]["source_projection"]["search_targets"]
+                    == ["payload.text"]
+                    for part in parts
+                )
+            )
+            self.assertEqual(
+                search_text_values(
+                    payload_kind=supplemental.payload_kind,
+                    payload=supplemental.payload,
+                    artifact_locator=supplemental.artifact_locator,
+                ),
+                ("MinerU遗漏但PDF可见", "不可定位字符"),
+            )
+            rows = uow.document_units.list_by_processing_run("run_1")
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[-1].page_no, 1)
+
+    def test_missing_one_native_occurrence_fails_the_shared_final_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, _ = _setup(
+                root,
+                native_only_texts=("MinerU遗漏但PDF可见",),
+                page_visual=True,
+            )
+            native_drafts = unit_preparation.native_stream_unit_drafts
+
+            def drop_first_native_part(
+                *args: Any,
+                **kwargs: Any,
+            ) -> object:
+                output = native_drafts(*args, **kwargs)
+                supplemental = output[-1]
+                parts = list(supplemental.payload["parts"])
+                return [
+                    *output[:-1],
+                    replace(
+                        supplemental,
+                        payload={
+                            **supplemental.payload,
+                            "parts": parts[1:],
+                        },
+                    ),
+                ]
+
+            with mock.patch.object(
+                unit_preparation,
+                "native_stream_unit_drafts",
+                side_effect=drop_first_native_part,
+            ):
+                result = _use_case(root, uow).execute(
+                    BuildUnitsCommand(processing_run_id="run_1")
+                )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(
+                result.error["error_code"],
+                "UNIT_SOURCE_AUDIT_FAILED",
+            )
             self.assertEqual(
                 uow.document_units.list_by_processing_run("run_1"),
                 [],
             )
 
-    def test_locator_diagnostics_have_no_builder_rules_dependency(self) -> None:
+    def test_native_geometry_quality_cannot_be_downgraded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            uow, ir_relpath = _uow(root)
-            ir_path = root / ir_relpath
-            payload = json.loads(ir_path.read_text(encoding="utf-8"))
-            reconciliation = TableReconciliationStats(
-                model_status="absent", content_tables=0
-            ).as_dict()
-            self.assertNotIn("table_builder_semantics_version", reconciliation)
-            payload["parser_diagnostics"] = {
-                "table_reconciliation": reconciliation
-            }
-            ir_path.write_text(
-                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            uow, _ = _setup(
+                root,
+                native_only_texts=("MinerU遗漏但PDF可见",),
+                page_visual=True,
             )
-            paths = _PathBuilder(root)
-            result = BuildUnits(
-                path_builder=paths,
-                artifact_store=ArtifactStore(paths),
-                uow_factory=lambda: uow,
-            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
+            native_drafts = unit_preparation.native_stream_unit_drafts
 
-            self.assertEqual(result.status, "succeeded")
+            def downgrade_native_geometry(
+                *args: Any,
+                **kwargs: Any,
+            ) -> object:
+                output = native_drafts(*args, **kwargs)
+                supplemental = output[-1]
+                payload = copy.deepcopy(supplemental.payload)
+                for part in payload["parts"]:
+                    source = part["artifact_locator"]["source_projection"]["payload"][
+                        "sources"
+                    ][0]["source"]
+                    if source["kind"] == "source_evidence_geometry_issue":
+                        part["quality_status"] = "ok"
+                return [
+                    *output[:-1],
+                    replace(
+                        supplemental,
+                        payload=payload,
+                        quality_status="ok",
+                    ),
+                ]
 
-    def test_reconciled_ir_requires_complete_consistent_diagnostics(self) -> None:
-        cases = {
-            "not_an_object": [],
-            "missing_counter": {
-                key: value
-                for key, value in TableReconciliationStats(
-                    model_status="absent", content_tables=0
-                ).as_dict().items()
-                if key != "located_tables"
-            },
-            "unexpected_hash_without_model": {
-                **TableReconciliationStats(
-                    model_status="absent", content_tables=0
-                ).as_dict(),
-                "model_hash": 7,
-            },
-            "impossible_supported_formula": {
-                **TableReconciliationStats(
-                    model_status="supported",
-                    content_tables=2,
-                    model_hash="sha256:" + "a" * 64,
-                    model_tables=2,
-                    uniquely_matched_tables=2,
-                    candidate_groups=1,
-                    proven_groups=1,
-                    locator_only_groups=1,
-                    locator_only_tables=2,
-                    located_groups=1,
-                    located_tables=2,
-                ).as_dict(),
-                "restored_groups": 1,
-            },
-        }
-        for label, reconciliation in cases.items():
-            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                uow, ir_relpath = _uow(root)
-                ir_path = root / ir_relpath
-                payload = json.loads(ir_path.read_text(encoding="utf-8"))
-                payload["parser_diagnostics"] = {
-                    "table_reconciliation": reconciliation
-                }
-                ir_path.write_text(
-                    json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-                )
-                use_case = BuildUnits(
-                    path_builder=_PathBuilder(root),
-                    artifact_store=ArtifactStore(_PathBuilder(root)),
-                    uow_factory=lambda: uow,
-                )
-
-                result = use_case.execute(
+            with mock.patch.object(
+                unit_preparation,
+                "native_stream_unit_drafts",
+                side_effect=downgrade_native_geometry,
+            ):
+                result = _use_case(root, uow).execute(
                     BuildUnitsCommand(processing_run_id="run_1")
                 )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(
+                result.error["error_code"],
+                "UNIT_SOURCE_AUDIT_FAILED",
+            )
+            self.assertEqual(
+                uow.document_units.list_by_processing_run("run_1"),
+                [],
+            )
+
+    def test_native_gap_projection_mutations_fail_the_shared_final_audit(
+        self,
+    ) -> None:
+        cases = (
+            "title",
+            "heading",
+            "taxonomy",
+            "applicability",
+            "run_boundary",
+            "physical_context",
+            "anchor_heading_path",
+            "part_order",
+            "part_source_ref",
+            "unit_order",
+            "split_gap",
+            "merge_gaps",
+        )
+        two_gap_cases = {"merge_gaps", "unit_order"}
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                if case in two_gap_cases:
+                    uow, _ = _setup(
+                        root,
+                        native_page_texts=(
+                            "重要提示",
+                            "物理缺口甲",
+                            "公司存在退市风险，请投资者注意。",
+                            "物理缺口乙",
+                        ),
+                    )
+                else:
+                    uow, _ = _setup(
+                        root,
+                        native_only_texts=("MinerU遗漏但PDF可见",),
+                        page_visual=True,
+                    )
+                native_drafts = unit_preparation.native_stream_unit_drafts
+
+                def forge_native_gap(
+                    *args: Any,
+                    **kwargs: Any,
+                ) -> object:
+                    output = native_drafts(*args, **kwargs)
+                    if case in two_gap_cases:
+                        gaps = list(output)
+                        self.assertEqual(len(gaps), 2)
+                    if case == "merge_gaps":
+                        merged_payload = copy.deepcopy(gaps[0].payload)
+                        merged_payload["parts"].extend(
+                            copy.deepcopy(gaps[1].payload["parts"])
+                        )
+                        return [replace(gaps[0], payload=merged_payload)]
+                    if case == "unit_order":
+                        # Placement is the stream position: swapping the two
+                        # proven positions publishes the later gap first.
+                        return [
+                            replace(
+                                gaps[0],
+                                source_order=gaps[1].source_order,
+                                native_order_anchor=gaps[1].native_order_anchor,
+                            ),
+                            replace(
+                                gaps[1],
+                                source_order=gaps[0].source_order,
+                                native_order_anchor=gaps[0].native_order_anchor,
+                            ),
+                        ]
+                    supplemental = output[-1]
+                    payload = copy.deepcopy(supplemental.payload)
+                    locator = copy.deepcopy(supplemental.artifact_locator)
+                    replacement: dict[str, Any] = {
+                        "payload": payload,
+                        "artifact_locator": locator,
+                    }
+                    if case == "title":
+                        replacement["title"] = "公告"
+                    elif case == "heading":
+                        replacement["title"] = "伪章节"
+                        replacement["heading_path"] = ["伪章节"]
+                    elif case == "applicability":
+                        replacement["applicability"] = "applicable"
+                    elif case == "run_boundary":
+                        search_atoms = locator["source_projection"]["search_atoms"]
+                        search_atoms[0]["boundary"]["run_index"] += 1
+                    elif case == "physical_context":
+                        context = locator["source_projection"]["physical_context"]
+                        context["word_order_span"][1] += 1
+                    elif case == "part_order":
+                        payload["parts"][0]["order"] += 1
+                    elif case == "part_source_ref":
+                        source = payload["parts"][0]["artifact_locator"][
+                            "source_projection"
+                        ]["payload"]["sources"][0]["source"]
+                        source["atom_index"] += 1
+                    forged = replace(supplemental, **replacement)
+                    if case == "split_gap":
+                        left_payload = copy.deepcopy(payload)
+                        right_payload = copy.deepcopy(payload)
+                        left_payload["parts"] = left_payload["parts"][:1]
+                        right_payload["parts"] = right_payload["parts"][1:]
+                        return [
+                            *output[:-1],
+                            replace(forged, payload=left_payload),
+                            replace(forged, payload=right_payload),
+                        ]
+                    return [
+                        *output[:-1],
+                        forged,
+                    ]
+
+                bind_visuals = unit_preparation.bind_visual_page_evidence
+
+                def forge_taxonomy_after_finalize(
+                    drafts: Any,
+                    proof: Any,
+                ) -> Any:
+                    # s7 structurally normalizes native taxonomy, so the
+                    # forgery must land after finalize for the audit gate
+                    # itself to be exercised.
+                    return [
+                        (
+                            replace(
+                                unit,
+                                semantic_key="shareholder_structure",
+                                semantic_keys=["shareholder_structure"],
+                            )
+                            if isinstance(unit.artifact_locator, dict)
+                            and (
+                                unit.artifact_locator.get("source_projection")
+                                or {}
+                            ).get("physical_context")
+                            is not None
+                            else unit
+                        )
+                        for unit in bind_visuals(drafts, proof)
+                    ]
+
+                def forge_anchor_after_attribution(
+                    drafts: Any,
+                    proof: Any,
+                ) -> Any:
+                    # Section attribution is a builder pass, so an invented
+                    # anchor path only reaches the audit gate when the
+                    # forgery lands after finalize.
+                    forged_units = []
+                    for unit in bind_visuals(drafts, proof):
+                        locator = copy.deepcopy(unit.artifact_locator)
+                        context = (
+                            (locator or {}).get("source_projection") or {}
+                        ).get("physical_context")
+                        if context is None:
+                            forged_units.append(unit)
+                            continue
+                        context["anchor_heading_path"] = ["伪章节"]
+                        forged_units.append(
+                            replace(unit, artifact_locator=locator)
+                        )
+                    return forged_units
+
+                post_finalize = {
+                    "taxonomy": forge_taxonomy_after_finalize,
+                    "anchor_heading_path": forge_anchor_after_attribution,
+                }.get(case)
+                finalize_patch = (
+                    mock.patch.object(
+                        unit_preparation,
+                        "bind_visual_page_evidence",
+                        side_effect=post_finalize,
+                    )
+                    if post_finalize is not None
+                    else contextlib.nullcontext()
+                )
+                with mock.patch.object(
+                    unit_preparation,
+                    "native_stream_unit_drafts",
+                    side_effect=forge_native_gap,
+                ), finalize_patch:
+                    result = _use_case(root, uow).execute(
+                        BuildUnitsCommand(processing_run_id="run_1")
+                    )
 
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(
                     result.error["error_code"],
-                    "IR_TABLE_RECONCILIATION_INVALID",
+                    "UNIT_SOURCE_AUDIT_FAILED",
                 )
-                self.assertEqual(
-                    uow.document_units.list_by_processing_run("run_1"), []
-                )
-
-    def test_legacy_reconciliation_without_restoration_remains_buildable(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            uow, ir_relpath = _uow(root, contract_version="normalized_ir.v2")
-            ir_path = root / ir_relpath
-            payload = json.loads(ir_path.read_text(encoding="utf-8"))
-            # Exact shape emitted by the previous restore.v3 generation.  It
-            # intentionally lacks v4 locator-only counters; algorithm
-            # classification must happen before current-shape validation.
-            reconciliation = {
-                "algorithm_version": "mineru-aggregate-table-restore.v3",
-                "table_builder_semantics_version": "table-builder-semantics.v2",
-                "model_status": "absent",
-                "model_hash": None,
-                "content_tables": 0,
-                "model_tables": 0,
-                "uniquely_matched_tables": 0,
-                "ambiguous_matches": 0,
-                "candidate_groups": 0,
-                "proven_groups": 0,
-                "unproven_groups": 0,
-                "restoration_rejected_groups": 0,
-                "unresolved_groups": 0,
-                "located_groups": 0,
-                "located_tables": 0,
-                "restored_groups": 0,
-                "restored_tables": 0,
-            }
-            payload["parser_diagnostics"] = {
-                "table_reconciliation": reconciliation
-            }
-            ir_path.write_text(
-                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-            )
-            use_case = BuildUnits(
-                path_builder=_PathBuilder(root),
-                artifact_store=ArtifactStore(_PathBuilder(root)),
-                uow_factory=lambda: uow,
-            )
-
-            result = use_case.execute(
-                BuildUnitsCommand(processing_run_id="run_1")
-            )
-
-            self.assertEqual(result.status, "succeeded")
-            self.assertEqual(result.error, None)
-            self.assertEqual(len(uow.document_units.list_by_processing_run("run_1")), 1)
-
-    def test_aggregate_locator_cannot_bypass_missing_diagnostics(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            uow, ir_relpath = _uow(root)
-            ir_path = root / ir_relpath
-            payload = json.loads(ir_path.read_text(encoding="utf-8"))
-            payload["elements"][0].update(
-                {
-                    "kind": "table",
-                    "raw_kind": "table",
-                    "page_no": 1,
-                    "table_html": "<table><tr><td>A</td></tr></table>",
-                    "page_span": [1, 2],
-                    "page_bboxes": [
-                        {"page_no": 1, "bbox": [0, 0, 10, 10]},
-                        {"page_no": 2, "bbox": [0, 0, 10, 10]},
-                    ],
-                    "model_table_indices": [0, 1],
-                    "continuation_source_item_indices": [2],
-                    "table_locator_algorithm": (
-                        "mineru-aggregate-table-locator.v4"
+                expected_code = {
+                    "anchor_heading_path": (
+                        "source_native_physical_context_invalid"
                     ),
-                }
-            )
-            ir_path.write_text(
-                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-            )
-            paths = _PathBuilder(root)
-            result = BuildUnits(
-                path_builder=paths,
-                artifact_store=ArtifactStore(paths),
-                uow_factory=lambda: uow,
-            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
+                    "merge_gaps": "source_native_gap_membership_invalid",
+                    "unit_order": "source_native_linearization_invalid",
+                }.get(case)
+                if expected_code is not None:
+                    self.assertIn(expected_code, result.error["message"])
+                self.assertEqual(
+                    uow.document_units.list_by_processing_run("run_1"),
+                    [],
+                )
+
+    def test_image_projection_contract_cannot_be_forged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, _ = _setup(root, image=True)
+            # The forged image part belongs to a MinerU carrier, so the last
+            # pass that still sees every draft is the visual binder.
+            bind_visuals = unit_preparation.bind_visual_page_evidence
+
+            def forge_image_projection(
+                *args: Any,
+                **kwargs: Any,
+            ) -> object:
+                output = bind_visuals(*args, **kwargs)
+                mutated: list[object] = []
+                forged = False
+                for draft in output:
+                    payload = copy.deepcopy(draft.payload)
+                    for part in payload.get("parts", []):
+                        if part.get("kind") != "image" or forged:
+                            continue
+                        projection = part["artifact_locator"]["source_projection"][
+                            "payload"
+                        ]
+                        projection["target_field"] = "payload.caption"
+                        projection["transform"] = "forged.v999"
+                        forged = True
+                    mutated.append(
+                        replace(draft, payload=payload)
+                        if payload != draft.payload
+                        else draft
+                    )
+                self.assertTrue(forged)
+                return mutated
+
+            with mock.patch.object(
+                unit_preparation,
+                "bind_visual_page_evidence",
+                side_effect=forge_image_projection,
+            ):
+                result = _use_case(root, uow).execute(
+                    BuildUnitsCommand(processing_run_id="run_1")
+                )
 
             self.assertEqual(result.status, "failed")
             self.assertEqual(
-                result.error["error_code"], "IR_TABLE_RECONCILIATION_INVALID"
+                result.error["error_code"],
+                "UNIT_SOURCE_AUDIT_FAILED",
             )
-            self.assertEqual(uow.document_units.list_by_processing_run("run_1"), [])
+            self.assertEqual(
+                uow.document_units.list_by_processing_run("run_1"),
+                [],
+            )
 
-    def test_valid_locator_only_ir_builds_one_logical_table(self) -> None:
+    def test_source_replay_audit_blocks_snapshot_and_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            uow, ir_relpath = _uow(root)
-            ir_path = root / ir_relpath
-            payload = json.loads(ir_path.read_text(encoding="utf-8"))
-            algorithm = "mineru-aggregate-table-locator.v4"
-            payload["elements"] = [
-                {
-                    "ir_id": "ir_0000",
-                    "kind": "table",
-                    "raw_kind": "table",
-                    "order_index": 0,
-                    "source_item_index": 0,
-                    "page_no": 1,
-                    "bbox": [0, 0, 10, 10],
-                    "table_html": "<table><tr><td>A</td></tr><tr><td>B</td></tr></table>",
-                    "table": {"headers": ["A"], "rows": [["B"]]},
-                    "table_caption": [],
-                    "table_footnote": [],
-                    "page_span": [1, 2],
-                    "page_bboxes": [
-                        {"page_no": 1, "bbox": [0, 0, 10, 10]},
-                        {"page_no": 2, "bbox": [0, 0, 10, 10]},
-                    ],
-                    "model_table_indices": [0, 1],
-                    "continuation_source_item_indices": [1],
-                    "table_locator_algorithm": algorithm,
-                },
-                {
-                    "ir_id": "ir_0001",
-                    "kind": "table",
-                    "raw_kind": "table",
-                    "order_index": 1,
-                    "source_item_index": 1,
-                    "page_no": 2,
-                    "bbox": [0, 0, 10, 10],
-                    "table_html": "",
-                    "table": {"headers": [], "rows": []},
-                    "table_caption": [],
-                    "table_footnote": [],
-                },
-            ]
-            payload["parser_diagnostics"] = {
-                "table_reconciliation": TableReconciliationStats(
-                    model_status="supported",
-                    content_tables=2,
-                    model_hash="sha256:" + "d" * 64,
-                    model_tables=2,
-                    uniquely_matched_tables=2,
-                    candidate_groups=1,
-                    proven_groups=1,
-                    locator_only_groups=1,
-                    locator_only_tables=2,
-                    located_groups=1,
-                    located_tables=2,
-                ).as_dict()
-            }
-            ir_path.write_text(
-                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            uow, _ = _setup(root)
+            report = DocumentAuditReport(
+                document_id="doc_1",
+                metrics={"error_count": 1},
+                findings=(
+                    AuditFinding(
+                        code="source_atom_uncovered",
+                        severity="error",
+                        message="missing",
+                        source_ref="ir_1",
+                    ),
+                ),
             )
-            paths = _PathBuilder(root)
-            result = BuildUnits(
-                path_builder=paths,
-                artifact_store=ArtifactStore(paths),
-                uow_factory=lambda: uow,
-            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
 
-            self.assertEqual(result.status, "succeeded")
-            self.assertEqual(result.unit_count, 1)
-            unit = uow.document_units.list_by_processing_run("run_1")[0]
-            self.assertEqual(unit.payload_kind, "table")
-            self.assertEqual(unit.artifact_locator["page_span"], [1, 2])
-            self.assertEqual(len(unit.artifact_locator["page_bboxes"]), 2)
+            with mock.patch(
+                "disclosure_anchor.application.services.unit_preparation.audit_document",
+                return_value=report,
+            ):
+                result = _use_case(root, uow).execute(
+                    BuildUnitsCommand(processing_run_id="run_1")
+                )
 
-    def test_unknown_preparation_failure_preserves_structured_code(self) -> None:
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(
+                result.error["error_code"],
+                "UNIT_SOURCE_AUDIT_FAILED",
+            )
+            self.assertEqual(
+                uow.document_units.list_by_processing_run("run_1"),
+                [],
+            )
+
+    def test_unaddressable_carrier_is_structured_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            uow, _ = _uow(root)
-            paths = _PathBuilder(root)
-            use_case = BuildUnits(
-                path_builder=paths,
-                artifact_store=ArtifactStore(paths),
-                uow_factory=lambda: uow,
+            uow, _ = _setup(root)
+            with mock.patch(
+                "disclosure_anchor.application.use_cases.build_units."
+                "prepare_and_audit_units",
+                side_effect=SourceEvidenceClosureError("unaddressable"),
+            ):
+                result = _use_case(root, uow).execute(
+                    BuildUnitsCommand(processing_run_id="run_1")
+                )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(
+                result.error["error_code"],
+                "SOURCE_EVIDENCE_UNADDRESSABLE",
             )
+
+    def test_unexpected_builder_error_remains_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, _ = _setup(root)
             with (
                 mock.patch(
-                    "disclosure_anchor.application.use_cases.build_units.build_unit_drafts_s1_s7",
-                    side_effect=RuntimeError("builder regression"),
+                    "disclosure_anchor.application.use_cases.build_units."
+                    "prepare_and_audit_units",
+                    side_effect=RuntimeError("boom"),
                 ),
-                self.assertRaises(BuildUnitsError) as caught,
+                self.assertRaises(BuildUnitsError) as raised,
             ):
-                use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+                _use_case(root, uow).execute(
+                    BuildUnitsCommand(processing_run_id="run_1")
+                )
 
-        self.assertEqual(
-            caught.exception.error["error_code"], "BUILD_PREPARATION_FAILED"
-        )
-        self.assertEqual(
-            uow.processing_runs.get("run_1").unit_build_error["error_code"],
-            "BUILD_PREPARATION_FAILED",
-        )
-
-    def test_build_writes_snapshot_stats_and_document_units(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            uow, _ = _uow(root)
-            paths = _PathBuilder(root)
-            use_case = BuildUnits(
-                path_builder=paths,
-                artifact_store=ArtifactStore(paths),
-                uow_factory=lambda: uow,
-            )
-
-            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
-
-            self.assertEqual(result.status, "succeeded")
-            self.assertEqual(result.unit_count, 1)
-            run = uow.processing_runs.get("run_1")
-            self.assertEqual(run.builder_rules_version, "ub-2026.07-75")
-            self.assertEqual(run.unit_build_attempt_count, 1)
-            self.assertTrue(
-                run.document_units_relpath.endswith("document_units.v1.jsonl")
-            )
-            units = uow.document_units.list_by_processing_run("run_1")
-            self.assertEqual(len(units), 1)
-            snapshot_path = paths.data_path(Path(run.document_units_relpath))
-            rows = [
-                json.loads(line)
-                for line in snapshot_path.read_text(encoding="utf-8").splitlines()
-            ]
-            self.assertEqual(set(rows[0]), SNAPSHOT_KEYS)
-            self.assertNotIn("structure_hash", rows[0])
-            self.assertNotIn("query_projection_hash", rows[0])
-            self.assertEqual(rows[0]["payload"], units[0].payload)
-            stats_path = snapshot_path.parent / "build_stats.v1.json"
-            stats = json.loads(stats_path.read_text(encoding="utf-8"))
-            self.assertEqual(stats["generated_by_kind"]["text"], 1)
-
-    def test_build_resolves_non_hash_image_from_parser_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            image_bytes = b"not already content addressed"
-            uow, ir_relpath = _uow(root)
-            image_path = root / "parser/a/images/plot.png"
-            image_path.parent.mkdir(parents=True)
-            image_path.write_bytes(image_bytes)
-            (root / ir_relpath).write_text(
-                json.dumps(_image_ir(), ensure_ascii=False),
-                encoding="utf-8",
-            )
-            paths = _PathBuilder(root)
-            use_case = BuildUnits(
-                path_builder=paths,
-                artifact_store=ArtifactStore(paths),
-                uow_factory=lambda: uow,
-            )
-
-            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
-
-            self.assertEqual(result.status, "succeeded")
-            units = uow.document_units.list_by_processing_run("run_1")
-            self.assertEqual(len(units), 1)
-            digest = hashlib.sha256(image_bytes).hexdigest()
-            self.assertEqual(units[0].payload["image_ref"], f"images/{digest}.png")
-            self.assertEqual(units[0].quality_status, "needs_review")
-
-    def test_build_hashes_image_bytes_even_when_source_name_looks_hashed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            image_bytes = b"mineru identifier is not a content hash"
-            misleading = "a" * 64
-            uow, ir_relpath = _uow(root)
-            image_path = root / f"parser/a/images/{misleading}.png"
-            image_path.parent.mkdir(parents=True)
-            image_path.write_bytes(image_bytes)
-            normalized_ir = _image_ir()
-            normalized_ir["elements"][0]["image_path"] = (
-                f"images/{misleading}.png"
-            )
-            (root / ir_relpath).write_text(
-                json.dumps(normalized_ir, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            paths = _PathBuilder(root)
-            use_case = BuildUnits(
-                path_builder=paths,
-                artifact_store=ArtifactStore(paths),
-                uow_factory=lambda: uow,
-            )
-
-            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
-
-            self.assertEqual(result.status, "succeeded")
-            units = uow.document_units.list_by_processing_run("run_1")
-            actual = hashlib.sha256(image_bytes).hexdigest()
-            self.assertEqual(units[0].payload["image_ref"], f"images/{actual}.png")
-
-    def test_old_ir_contract_is_dead_lettered_and_counts_an_attempt(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            uow, _ = _uow(root, contract_version="normalized_ir.v1")
-            paths = _PathBuilder(root)
-            use_case = BuildUnits(
-                path_builder=paths,
-                artifact_store=ArtifactStore(paths),
-                uow_factory=lambda: uow,
-            )
-
-            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
-
-            self.assertEqual(result.status, "failed")
-            self.assertEqual(result.error["error_code"], "IR_CONTRACT_TOO_OLD")
-            run = uow.processing_runs.get("run_1")
-            self.assertEqual(run.unit_build_attempt_count, 1)
-
-    def test_contract_version_must_match_artifact_filename(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            uow, ir_relpath = _uow(root)
-            wrong_relpath = ir_relpath.with_name("normalized_ir.v2.json")
-            (root / ir_relpath).rename(root / wrong_relpath)
-            run = uow.processing_runs.get("run_1")
-            run.normalized_ir_relpath = str(wrong_relpath)
-            uow.processing_runs.update(run)
-
-            result = BuildUnits(
-                path_builder=_PathBuilder(root),
-                artifact_store=ArtifactStore(_PathBuilder(root)),
-                uow_factory=lambda: uow,
-            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
-
-            self.assertEqual(result.status, "failed")
-            self.assertEqual(result.error["error_code"], "IR_CONTRACT_UNSUPPORTED")
             self.assertEqual(
-                result.error["reason_code"], "contract_filename_mismatch"
+                raised.exception.error["error_code"],
+                "BUILD_PREPARATION_FAILED",
+            )
+            self.assertIn("RuntimeError: boom", raised.exception.error["message"])
+
+    def test_existing_units_reject_duplicate_build(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, _ = _setup(root)
+            first = _use_case(root, uow).execute(
+                BuildUnitsCommand(processing_run_id="run_1")
+            )
+            self.assertEqual(first.status, "succeeded")
+
+            with self.assertRaises(BuildUnitsError) as raised:
+                _use_case(root, uow).execute(
+                    BuildUnitsCommand(processing_run_id="run_1")
+                )
+
+            self.assertEqual(
+                raised.exception.error["error_code"],
+                "UNITS_ALREADY_BUILT",
             )
 
-    def test_current_contract_rejects_retired_native_shadow(self) -> None:
+    def test_snapshot_verification_failure_marks_run_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            uow, ir_relpath = _uow(root)
-            path = root / ir_relpath
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            payload["native_text"] = {"status": "empty"}
-            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            uow, _ = _setup(root)
+            paths = _PathBuilder(root)
 
-            result = BuildUnits(
-                path_builder=_PathBuilder(root),
-                artifact_store=ArtifactStore(_PathBuilder(root)),
-                uow_factory=lambda: uow,
-            ).execute(BuildUnitsCommand(processing_run_id="run_1"))
-
-            self.assertEqual(result.status, "failed")
-            self.assertEqual(result.error["error_code"], "IR_CONTRACT_UNSUPPORTED")
-            self.assertEqual(result.error["reason_code"], "v3_native_text_forbidden")
-
-    def test_v2_cannot_claim_locator_v4_reconciliation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            uow, ir_relpath = _uow(root, contract_version="normalized_ir.v2")
-            path = root / ir_relpath
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            payload["parser_diagnostics"] = {
-                "table_reconciliation": TableReconciliationStats(
-                    model_status="absent", content_tables=0
-                ).as_dict()
-            }
-            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-
-            result = BuildUnits(
-                path_builder=_PathBuilder(root),
-                artifact_store=ArtifactStore(_PathBuilder(root)),
-                uow_factory=lambda: uow,
+            result = _use_case(
+                root,
+                uow,
+                artifact_store=_BadHashArtifactStore(paths),
             ).execute(BuildUnitsCommand(processing_run_id="run_1"))
 
             self.assertEqual(result.status, "failed")
             self.assertEqual(
                 result.error["error_code"],
-                "IR_TABLE_RECONCILIATION_CONTRACT_MISMATCH",
+                "ARTIFACT_WRITE_FAILED",
             )
-            self.assertEqual(result.error["reason_code"], "v2_locator_v4_forbidden")
+            self.assertEqual(
+                uow.document_units.list_by_processing_run("run_1"),
+                [],
+            )
 
-    def test_rejects_already_built_run(self) -> None:
+    def test_legacy_ir_requires_reparse_instead_of_guessing_structure(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            uow, _ = _uow(root)
-            uow.document_units.add(
-                e.DocumentUnit(
-                    asset_id=ids.new_asset_id(),
-                    document_id="doc_1",
-                    processing_run_id="run_1",
-                    payload_kind="text",
-                    order_index=1,
-                    payload={"text": "old"},
-                    content_hash="sha256:old",
-                )
+            uow, ir_relpath = _setup(root)
+            payload = json.loads((root / ir_relpath).read_text(encoding="utf-8"))
+            payload["contract_version"] = "normalized_ir.v3"
+            payload["parser_artifacts"] = {
+                "artifact_root_relpath": "parser/a",
+                "content_list_relpath": "parser/a/content.json",
+            }
+            payload.pop("source_pdf_sha256")
+            payload.pop("source_pdf_page_count")
+            payload.pop("structure_proof")
+            legacy_relpath = ir_relpath.with_name("normalized_ir.v3.json")
+            run = uow.processing_runs.get("run_1")
+            run.normalized_ir_relpath = str(legacy_relpath)
+            uow.processing_runs.update(run)
+            _rewrite_ir(root, uow, legacy_relpath, payload)
+
+            result = _use_case(root, uow).execute(
+                BuildUnitsCommand(processing_run_id="run_1")
             )
-            use_case = BuildUnits(
-                path_builder=_PathBuilder(root),
-                artifact_store=ArtifactStore(_PathBuilder(root)),
-                uow_factory=lambda: uow,
-            )
-
-            with self.assertRaises(BuildUnitsError) as ctx:
-                use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
-
-            self.assertEqual(ctx.exception.error["error_code"], "UNITS_ALREADY_BUILT")
-
-    def test_snapshot_verification_failure_marks_run_failed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            uow, _ = _uow(root)
-            paths = _PathBuilder(root)
-            use_case = BuildUnits(
-                path_builder=paths,
-                artifact_store=_BadHashArtifactStore(paths),
-                uow_factory=lambda: uow,
-            )
-
-            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
 
             self.assertEqual(result.status, "failed")
-            self.assertEqual(result.error["error_code"], "ARTIFACT_WRITE_FAILED")
+            self.assertEqual(result.error["error_code"], "IR_CONTRACT_TOO_OLD")
             self.assertEqual(
-                uow.processing_runs.get("run_1").unit_build_attempt_count, 1
+                result.error["reason_code"],
+                "structure_proof_reparse_required",
             )
-            self.assertEqual(uow.document_units.list_by_processing_run("run_1"), [])
+
+
+class BuildUnitsDependencyTests(unittest.TestCase):
+    def test_application_unit_path_does_not_import_adapters(self) -> None:
+        trees: dict[str, ast.AST] = {}
+        for name, module in {
+            "build_units": build_units_module,
+            "document_unit_audit": document_unit_audit_module,
+        }.items():
+            module_path = module.__file__
+            assert module_path is not None
+            trees[name] = ast.parse(Path(module_path).read_text(encoding="utf-8"))
+        for name, tree in trees.items():
+            imported = [
+                module
+                for node in ast.walk(tree)
+                for module in (
+                    [node.module]
+                    if isinstance(node, ast.ImportFrom) and node.module
+                    else [alias.name for alias in node.names]
+                    if isinstance(node, ast.Import)
+                    else []
+                )
+            ]
+            with self.subTest(module=name):
+                self.assertFalse(
+                    [
+                        module
+                        for module in imported
+                        if module.startswith("disclosure_anchor.adapters")
+                    ]
+                )
+        audit_tree = trees["document_unit_audit"]
+        audit_imported = {
+            node.module
+            for node in ast.walk(audit_tree)
+            if isinstance(node, ast.ImportFrom) and node.module
+        }
+        for module in (
+            "disclosure_anchor.application.contracts.source_evidence_projection",
+            "disclosure_anchor.application.contracts.canonical_occurrence",
+        ):
+            self.assertNotIn(module, audit_imported)
+        prohibited_calls = {
+            source_evidence_projection: (
+                "native_evidence_gaps",
+                "native_evidence_occurrences",
+                "native_gap_physical_context",
+                "native_gap_search_atoms",
+            ),
+            canonical_occurrence: ("canonical_occurrence_stream",),
+            source_native_fallback: ("native_stream_unit_drafts",),
+        }
+        # A prohibited name that no longer exists silently stops protecting
+        # anything, so the isolation list is pinned to live exports.
+        for module, names in prohibited_calls.items():
+            for name in names:
+                with self.subTest(export=name):
+                    self.assertTrue(hasattr(module, name))
+        prohibited = {name for names in prohibited_calls.values() for name in names}
+        called = {
+            (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else ""
+            )
+            for node in ast.walk(audit_tree)
+            if isinstance(node, ast.Call)
+        }
+        self.assertTrue(prohibited.isdisjoint(called))
+
+
+def _sha256(payload: bytes) -> str:
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 if __name__ == "__main__":

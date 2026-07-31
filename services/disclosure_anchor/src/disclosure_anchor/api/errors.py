@@ -41,6 +41,7 @@ GONE_SUPERSEDED = "GONE_SUPERSEDED"
 L1_PROCESSING_REQUIRED = "L1_PROCESSING_REQUIRED"
 CONTRACT_VERSION_MISMATCH = "CONTRACT_VERSION_MISMATCH"
 VALIDATION_ERROR = "VALIDATION_ERROR"
+EVIDENCE_INTEGRITY_ERROR = "EVIDENCE_INTEGRITY_ERROR"
 # Local-ops admin-only conflict code. NOT part of the public error-code
 # 全集 (api/CLAUDE.md) and deliberately kept out of the exported OpenAPI
 # ErrorEnvelope enum: the admin write surface is not in the public contract,
@@ -92,6 +93,15 @@ def l1_processing_required(status: str) -> NoReturn:
         error_code=L1_PROCESSING_REQUIRED,
         message="L1 processing is required before units can be read",
         detail={"status": status},
+    )
+
+
+def evidence_integrity_error(reason: str) -> NoReturn:
+    raise FilingApiError(
+        status_code=500,
+        error_code=EVIDENCE_INTEGRITY_ERROR,
+        message="published evidence failed integrity verification",
+        detail={"reason": reason},
     )
 
 
@@ -157,8 +167,10 @@ def filing_error_from_domain_error(exc: Exception) -> FilingApiError | None:
         code = str(error.get("error_code", ""))
         message = str(error.get("message") or exc)
         detail = {"error": error}
-        if code in _NOT_FOUND_DOMAIN_CODES or _looks_like_not_found(code) or (
-            _looks_like_not_found(message)
+        if (
+            code in _NOT_FOUND_DOMAIN_CODES
+            or _looks_like_not_found(code)
+            or (_looks_like_not_found(message))
         ):
             return FilingApiError(
                 status_code=404, error_code=NOT_FOUND, message=message, detail=detail
@@ -203,7 +215,10 @@ def install_error_handlers(app: FastAPI) -> None:
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
         errors = [
-            {"field": ".".join(str(part) for part in error["loc"]), "message": error["msg"]}
+            {
+                "field": ".".join(str(part) for part in error["loc"]),
+                "message": error["msg"],
+            }
             for error in exc.errors()
         ]
         api_error = FilingApiError(
@@ -231,7 +246,9 @@ def install_error_handlers(app: FastAPI) -> None:
         requested = request.headers.get("X-Contract-Version")
         if requested is not None and requested not in SUPPORTED_CONTRACT_VERSIONS:
             api_error = contract_version_mismatch(requested)
-            return JSONResponse(status_code=api_error.status_code, content=api_error.body())
+            return JSONResponse(
+                status_code=api_error.status_code, content=api_error.body()
+            )
         return await call_next(request)
 
     _install_openapi_contract(app)
@@ -274,6 +291,7 @@ def _add_error_components(schema: dict[str, Any]) -> None:
                     L1_PROCESSING_REQUIRED,
                     CONTRACT_VERSION_MISMATCH,
                     VALIDATION_ERROR,
+                    EVIDENCE_INTEGRITY_ERROR,
                 ],
             },
             "message": {"type": "string"},
@@ -313,6 +331,12 @@ def _apply_operation_contract(schema: dict[str, Any]) -> None:
                 _replace_error_response(operation, "410", "Gone superseded")
             if path == "/v1/documents/{document_id}/units":
                 _replace_error_response(operation, "409", "L1 processing required")
+            if path == "/v1/units/{asset_id}/evidence/{sha256}":
+                _replace_error_response(
+                    operation,
+                    "500",
+                    "Published evidence failed integrity verification",
+                )
 
 
 def _add_contract_version_header(operation: dict[str, Any]) -> None:

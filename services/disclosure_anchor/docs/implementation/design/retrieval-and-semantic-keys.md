@@ -94,8 +94,8 @@ decides_for: 06R（检索投影里程碑，规格待编写）+ semantic_key 词�
 
 **决策：不加多个 title 列，理由如下；但补一个立即可用的检索形态。**
 
-1. 不加 `title_1..title_N` 固定多列：深度可变，`title` 作为最深叶子显示名（或表名/议案名）
-   保持单值是对的。但原“数据早已完整”的表述经全语料复核已修正：公开 `heading_path` 只投影
+1. 不加 `title_1..title_N` 固定多列：深度可变，`title` 作为源标题树最深叶子显示名
+   保持单值是对的；table/image caption 是 payload 关联证据，不是第二套 title。但原“数据早已完整”的表述经全语料复核已修正：公开 `heading_path` 只投影
    前 4 级，`title` 只补最深一级，两者之间的深层中间节可能仅存在 build-time
    `structural_path`。mixed parts 的 `local_heading` 可保留组内相对路径，但不能等价为全文档完整路径列。
 2. 用户真正缺的是**可检索形态**：heading_path 是 jsonb，只能整串精确匹配、没法关键词
@@ -216,14 +216,14 @@ semantic_keys（scalar 在规则未命中时回落 note key）。实测：附注
 保留原文不改写，凡冲突以本节为准。
 
 - **(a) heading_path 勘误（取代 §2、§4.5、§6.2 一切"最多 4 级/有损 breadcrumb"表述）**：公开
-  `heading_path` 现投影**完整源面包屑**（`adapters/unit_builder/builder.py` 的
+  `heading_path` 现投影**完整源面包屑**（`application/services/unit_builder/builder.py` 的
   `_project_heading_path` 直接返回整条 `structural_path`，无 4 级封顶），不再有"公开 4 级 + 内部
   structural_path"的双形态落差。`local_heading` 也不再产出——被公开深度挤出的深层子标题现各自
   成 unit，该字段仅存于冻结的历史 fixture 与冻结的哈希输入枚举。因此 06R 的立项理由相应收窄：
   仍需要 06R 做 FTS/线性化 + 字段加权（把 title + 面包屑 + payload 拼进被打分文本），但**不再**
   为"补路径无损"而存在——公开 heading_path 本身已是无损完整路径。
 - **(b) 词表规模勘误**：§4 的"~80-90 键"与 §6 的"95 键"是早期轮次的陈旧数字。当前
-  note_key_map.json = 版本 `2026-07-r17`，**173 键 / 389 标签**（§4.6 表中的 173 已经是对的）。
+  note_key_map.json = 版本 `2026-07-r18`，**173 键 / 391 标签**（§4.6 表中的 173 已经是对的）。
 - **(c) 事件 facet 撤销决策（取代 §4.6 表第 3 行 event_key_map.json / 35 键）**：event_key_map.json
   已在 checkpoint 提交 `31f8439` **移除**——标题派生的事件键在持续累积样本特异的短语规则，与根
   研究门"不得从孤立样本长出短语表"相抵。当前状态：事件语义只保留为通用的 per-unit
@@ -251,15 +251,20 @@ semantic_keys（scalar 在规则未命中时回落 note key）。实测：附注
   原子完整 + 溯源可回放，问答语义属 L2 关注面，L2 亦不做 qa 拆分。附带收益：vlm 与 pipeline
   两后端的单元形状因此收敛一致，不再因 QA 恢复启发式而分叉。冻结历史：DB `payload_kind` CHECK
   仍接受 `'qa'`（历史行），golden 哈希输入枚举保留 qa 例，service-purpose §6.4 schema 存档不删。
-- **(g) 表头与"可能错的解释"的统一原则（用户 2026-07-16 方向，记 06R 背账）**：同日废除
+- **(g) 表头与解释字段的证据原则（2026-07-26 根因复核取代早期“投影兜底”表述）**：同日废除
   td-only 表格的首行提升启发式（headers 仅 `<th>` 证据时非空，完整网格忠实在 rows）。用户
-  方向：这类"有用但可能判错"的解释信号（首行疑似表头、以及未来同类）不进 L1 payload/
-  content_hash，而是作为 **06R 派生投影层的可再生标注**（规则从 rows[0] 形态确定性推导，
-  标注在视图/投影列供检索加权；判错不污染证据、可随规则升级整体重算）。L1 第一性原则：
-  能切分、方便 L2 处理即可；切不准的解释一律以派生标注兜底，不固化进证据原子。
+  后续裁决进一步收紧：证据不足时必须沿 locator 回到 NormalizedIR、MinerU page/model artifact
+  和原始 PDF 找证据，不能把“可能是表头/标题/边界”写成词面猜测，也不能用派生标注掩盖
+  parser 缺失。只有源 HTML `<th>/<thead>` 或另一条可核验结构证据成立，才能派生 header role；
+  否则完整 grid 保持原样，并把证据缺口作为 parser 质量问题追查。
   外部对标（补记）：Unstructured 对投关/会议转写不做任何 QA 拆分（一律 NarrativeText，
   官方定位为库外自定义逻辑），td-only 表格 `header_row_count=0` 只认 `<th>/<thead>`
   证据——两项拆除均为业界保守标准做法（DeepWiki Unstructured-IO/unstructured，2026-07-16）。
+- **(h) taxonomy 与证据结构隔离（ub-2026.07-76）**：监管 taxonomy、semantic_key(s) 和查询
+  同义词只在 unit 已完成组装后运行，允许改变路由列/query projection，不得改变 title、
+  heading_path、payload、source ownership、unit 数量或 mixed 边界。代码以
+  `source_structure` 与 `retrieval_routing` 两个依赖面隔离，并用“替换全部 taxonomy 规则后
+  evidence shape 不变”的回归测试守门。结构层不导出任何 taxonomy 符号。
 
 ## 6.4 2026-07-17 词表第二批与查询侧同义映射（决策补记）
 
@@ -276,8 +281,10 @@ semantic_keys（scalar 在规则未命中时回落 note key）。实测：附注
   **小而有规范**：只收法定术语的等价称谓/俗称，且仅当查询词与目标词**零共享词元**时才建组
   （共享词元对如 回购/股份回购 分词后天然互命中，禁止入表）；禁止概念联想与传递链；每项
   必须是钉扳分词器下的单一词元（加载校验 fail-closed）；上限 40 组。实现：
-  `adapters/retrieval/synonyms.txt`（6 组种子）+ `tokenizer.build_search_tsquery()`
-  （查询时 per-token OR 组、AND 拼接；纯查询时，投影零改动、不触发重建）。
+  `adapters/retrieval/synonyms.txt`（6 组种子）+
+  `tokenizer.build_search_tsquery_groups()` / `build_search_tsquery()`
+  （查询时保留 per-token OR group、groups 间 AND；跨 0028 body windows 时按
+  asset_id+group_id 聚合；纯查询时，投影零改动、不触发重建）。
   外部对标：ES/OpenSearch synonym_graph 查询时为生产默认（索引时需全量重建仅限稳定规则）；
   PG 原生 synonym 词典不支持词组、thesaurus 改动强制重索引，均不适配 app 侧 jieba+simple
   管线；中文金融别名无现成开源资源，业界一致为小型人审版本化文件（哈工大词林/腾讯词向量

@@ -1,416 +1,133 @@
-"""Opt-in regression checks against real MinerU 3.4 artifact pairs."""
+"""Real MinerU no-merge table-closure canary."""
 
 from __future__ import annotations
 
 import hashlib
 import os
 from pathlib import Path
-from typing import Any
 import unittest
 
 from disclosure_anchor.adapters.parsers.mineru.artifact_reader import (
     MinerUArtifactReader,
 )
-from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
-    MinerUParserInfo,
-    MinerUToNormalizedIRMapper,
+from disclosure_anchor.adapters.parsers.mineru.content_list_contract import (
+    resolved_image_path,
+    resolved_table_html,
 )
-from disclosure_anchor.adapters.parsers.mineru.parser import (
-    map_reconciled_mineru_content_list,
+from disclosure_anchor.adapters.parsers.mineru.table_html_structure import (
+    parse_table_html_structure,
 )
-from disclosure_anchor.adapters.unit_builder.builder import (
-    UnitDraft,
-    build_unit_drafts_s1_s7,
+from disclosure_anchor.adapters.parsers.mineru.table_reconciler import (
+    reconcile_content_list_tables,
 )
 
 
-DATA_ROOT = Path(os.environ.get("DISCLOSURE_DATA_ROOT", "/__absent__")) / "data"
-POSITIVE_ROOT = Path(
-    "parser_artifacts/cninfo/300012/1217576500/"
-    "run_01KXJGVWYXY40E0W4DHAKRMNXF/"
-    "sha256_c12d0d323ccb648fd7a3959de79f18c51ac57dbaced3f19dec659cb9784ae3ff/"
+DEFAULT_CANARY_ROOT = Path(
+    "/private/tmp/disclosure-table-no-merge-canary-1218382773-p167-168-r3/"
+    "sha256_2ffa5bdc0c2bd00c16b360ebdf23e1229f44be56b950a862ca653c445953a3d1/"
     "vlm"
 )
-POSITIVE_STEM = (
-    "sha256_c12d0d323ccb648fd7a3959de79f18c51ac57dbaced3f19dec659cb9784ae3ff"
+CANARY_ROOT = Path(
+    os.environ.get("DISCLOSURE_TABLE_NO_MERGE_CANARY", str(DEFAULT_CANARY_ROOT))
 )
-NEGATIVE_ROOT = Path(
-    "parser_artifacts/cninfo/000651/1218206761/"
-    "run_01KX8ABMBWDDR2BD4HXEJ7GD8V/"
-    "sha256_d55f8d14d8864d88c82d6f36dca35ea974fc9f5a60451f5c6119f772ffc49d43/"
-    "auto"
+STEM = (
+    "sha256_2ffa5bdc0c2bd00c16b360ebdf23e1229f44be56b950a862ca653c445953a3d1"
 )
-NEGATIVE_STEM = (
-    "sha256_d55f8d14d8864d88c82d6f36dca35ea974fc9f5a60451f5c6119f772ffc49d43"
-)
-RUNNING_FURNITURE_ROOT = Path(
-    "parser_artifacts/cninfo/688077/1224557820/"
-    "run_01KXB5VVEM852TKXY10Q62ZYE1/"
-    "sha256_62efbae9aa57765825bb75e8a20a0707c8238af94cb38c0ff605076771f4f945/"
-    "vlm"
-)
-RUNNING_FURNITURE_STEM = (
-    "sha256_62efbae9aa57765825bb75e8a20a0707c8238af94cb38c0ff605076771f4f945"
-)
+EXPECTED_HASHES = {
+    "origin": "1a6955f94adcaa412bff573546845fb8dc1c492eae5ef23950b51d7c99ad7d49",
+    "content_list": (
+        "bc55a8109435fda7cb3ef1decb70b7a71d03fb4afe8335e8359ead8ee8c2bad1"
+    ),
+    "model": "82b42fd531bccab0bdb5ce6fe00c7ee990971fc1c10c965640a70320b19e1c7f",
+}
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _unit_semantics(unit: UnitDraft) -> tuple[object, ...]:
-    return (
-        unit.payload_kind,
-        _without_continuation_provenance(unit.payload),
-        unit.heading_path,
-        unit.title,
-        unit.semantic_key,
-        unit.semantic_keys,
-        unit.quality_status,
-        unit.applicability,
-    )
-
-
-def _without_continuation_provenance(value: object) -> object:
-    """Ignore only locator provenance while retaining table content geometry."""
-
-    if isinstance(value, list):
-        return [_without_continuation_provenance(item) for item in value]
-    if not isinstance(value, dict):
-        return value
-    normalized = {
-        key: _without_continuation_provenance(item) for key, item in value.items()
-    }
-    locator = normalized.get("artifact_locator")
-    if isinstance(locator, dict):
-        for key in (
-            "merge_reason",
-            "page_span",
-            "page_bboxes",
-            "model_table_indices",
-            "continuation_source_item_indices",
-            "table_locator_algorithm",
-        ):
-            locator.pop(key, None)
-    return normalized
-
-
-def _assert_only_locators_added(
-    test: unittest.TestCase,
-    *,
-    before: list[dict[str, Any]],
-    after: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Assert every physical carrier is byte-for-byte unchanged."""
-
-    test.assertEqual(len(after), len(before))
-    locators: list[dict[str, Any]] = []
-    for original, reconciled in zip(before, after, strict=True):
-        physical = dict(reconciled)
-        locator = physical.pop("_mineru_aggregate_table_locator", None)
-        test.assertEqual(physical, original)
-        if locator is not None:
-            test.assertIsInstance(locator, dict)
-            locators.append(locator)
-    return locators
-
-
-@unittest.skipUnless(
-    (DATA_ROOT / POSITIVE_ROOT).is_dir()
-    and (DATA_ROOT / NEGATIVE_ROOT).is_dir()
-    and (DATA_ROOT / RUNNING_FURNITURE_ROOT).is_dir(),
-    "real MinerU reconciliation artifacts are absent",
-)
 class RealMinerUTableReconciliationTests(unittest.TestCase):
-    def test_1217576500_locates_attachment_pages_without_splitting(self) -> None:
-        root = DATA_ROOT / POSITIVE_ROOT
-        content_path = root / f"{POSITIVE_STEM}_content_list.json"
-        model_path = root / f"{POSITIVE_STEM}_model.json"
-        self.assertEqual(
-            _sha256(content_path),
-            "c5fc441621031d18d232ba8e448ae7310bc0eb52b1e7ba59e72e6364e34a65f6",
-        )
-        self.assertEqual(
-            _sha256(model_path),
-            "e26ff561ee529014c12de2f1e5636f324907f71391c3a0a2695e0a83a92c62e5",
-        )
-        content = MinerUArtifactReader().read_content_list(content_path)
-        parser_info = MinerUParserInfo(
-            name="MinerU",
-            package_version="3.4.0",
-            backend="vlm-http-client",
-            method="auto",
-            language="ch",
-            formula=False,
-            table=True,
-        )
-        metadata = {
-            "document_id": "real_1217576500",
-            "source_pdf": "raw/1217576500.pdf",
-            "title": "投资者关系活动记录表",
+    @unittest.skipUnless(
+        (CANARY_ROOT / f"{STEM}_content_list.json").is_file(),
+        "fresh 1218382773 MinerU no-merge canary is absent",
+    )
+    def test_1218382773_pages_167_168_close_as_four_page_local_tables(
+        self,
+    ) -> None:
+        paths = {
+            "origin": CANARY_ROOT / f"{STEM}_origin.pdf",
+            "content_list": CANARY_ROOT / f"{STEM}_content_list.json",
+            "model": CANARY_ROOT / f"{STEM}_model.json",
         }
-        mapper = MinerUToNormalizedIRMapper()
-        before_ir = mapper.map_content_list(
-            content_list=content,
-            parser_info=parser_info,
-            document_metadata=metadata,
-        )
-        after_ir, result = map_reconciled_mineru_content_list(
-            content_list=content,
-            model_path=model_path,
-            mapper=mapper,
-            parser_info=parser_info,
-            document_metadata=metadata,
-        )
-        diagnostics = after_ir["parser_diagnostics"]["table_reconciliation"]
         self.assertEqual(
-            diagnostics["algorithm_version"],
-            "mineru-aggregate-table-locator.v4",
+            {role: _sha256(path) for role, path in paths.items()},
+            EXPECTED_HASHES,
         )
+        artifact = MinerUArtifactReader().read_content_artifact(
+            paths["content_list"]
+        )
+        content = artifact.items
+        registered = artifact.evidence_image_paths
+        registered_outer = {
+            f"evidence_image_{index:06d}"
+            for index, item in enumerate(content)
+            if resolved_image_path(item) is not None
+        }
+        self.assertTrue(registered_outer <= set(registered))
+
+        result = reconcile_content_list_tables(
+            content,
+            model_path=paths["model"],
+            registered_evidence_image_paths=registered,
+            content_table_structures=artifact.table_structures,
+        )
+
+        self.assertEqual(result.content_list, content)
         self.assertEqual(
-            diagnostics["model_hash"],
-            "sha256:e26ff561ee529014c12de2f1e5636f324907f71391c3a0a2695e0a83a92c62e5",
-        )
-        self.assertEqual(diagnostics["located_groups"], 1)
-        self.assertEqual(diagnostics["located_tables"], 11)
-        self.assertEqual(diagnostics["locator_only_groups"], 1)
-        self.assertEqual(diagnostics["locator_only_tables"], 11)
-        self.assertEqual(diagnostics["restored_groups"], 0)
-        self.assertEqual(diagnostics["restored_tables"], 0)
-        self.assertEqual(diagnostics["restoration_rejected_groups"], 0)
-        self.assertEqual(diagnostics["unresolved_groups"], 0)
-        locators = _assert_only_locators_added(
-            self, before=content, after=result.content_list
-        )
-        self.assertEqual(len(locators), 1)
-        self.assertEqual(
-            set(locators[0]),
+            result.stats.as_dict(),
             {
-                "algorithm_version",
-                "page_span",
-                "page_bboxes",
-                "model_table_indices",
-                "continuation_source_item_indices",
+                "algorithm_version": "mineru-page-local-table-closure.v6",
+                "model_hash": "sha256:" + EXPECTED_HASHES["model"],
+                "content_tables": 4,
+                "model_tables": 4,
+                "matched_tables": 4,
+                "page_local_closed": True,
             },
         )
-        self.assertEqual(
-            locators[0]["algorithm_version"], diagnostics["algorithm_version"]
-        )
-        self.assertEqual(locators[0]["page_span"], [8, 18])
-        self.assertEqual(len(locators[0]["page_bboxes"]), 11)
-        self.assertEqual(len(locators[0]["model_table_indices"]), 11)
-        self.assertEqual(
-            locators[0]["continuation_source_item_indices"], list(range(40, 50))
-        )
-        before, _ = build_unit_drafts_s1_s7(
-            before_ir,
-            filing_type="investor_relations",
-            document_title=str(metadata["title"]),
-        )
-        after, _ = build_unit_drafts_s1_s7(
-            after_ir,
-            filing_type="investor_relations",
-            document_title=str(metadata["title"]),
-        )
-        before_tables = [unit.payload for unit in before if unit.payload_kind == "table"]
-        after_tables = [unit.payload for unit in after if unit.payload_kind == "table"]
-        self.assertTrue(after_tables)
-        self.assertEqual(after_tables, before_tables)
-        attachment = next(
-            unit for unit in after if unit.title and "参与机构名单" in unit.title
-        )
-        self.assertEqual(
-            (attachment.artifact_locator or {}).get("page_span"),
-            [8, 18],
-        )
+        page_rows: dict[int, list[list[str]]] = {}
+        for item in content:
+            if item.get("type") != "table":
+                continue
+            html = resolved_table_html(item)
+            self.assertIsInstance(html, str)
+            structure = parse_table_html_structure(str(html))
+            page_rows.setdefault(int(item["page_idx"]), []).extend(
+                [list(row) for row in structure.rows]
+            )
 
-    def test_1218206761_locates_only_logically_proven_groups(self) -> None:
-        root = DATA_ROOT / NEGATIVE_ROOT
-        content_path = root / f"{NEGATIVE_STEM}_content_list.json"
-        model_path = root / f"{NEGATIVE_STEM}_model.json"
-        self.assertEqual(
-            _sha256(content_path),
-            "6dc324d613e8074dac2b5d4d414284da4228c2ba73758589bac441efe05f566e",
-        )
-        self.assertEqual(
-            _sha256(model_path),
-            "b58ff2334e4321d7325df189ccd80a022330d8ebf2cabe6ee4c6ef0038a46eba",
-        )
-        content = MinerUArtifactReader().read_content_list(content_path)
-        mapper = MinerUToNormalizedIRMapper()
-        parser_info = MinerUParserInfo(
-            name="MinerU",
-            package_version="3.4.0",
-            backend="pipeline",
-            method="auto",
-            language="ch",
-            formula=False,
-            table=True,
-        )
-        metadata = {
-            "document_id": "real_1218206761",
-            "source_pdf": "raw/1218206761.pdf",
-            "title": "复杂跨页表负例",
-        }
-        before_ir = mapper.map_content_list(
-            content_list=content,
-            parser_info=parser_info,
-            document_metadata=metadata,
-        )
-        normalized, result = map_reconciled_mineru_content_list(
-            content_list=content,
-            model_path=model_path,
-            mapper=mapper,
-            parser_info=parser_info,
-            document_metadata=metadata,
-        )
-        # The first candidate changes from seven to five columns and is not an
-        # exact aggregate concatenation. It remains aggregate + empty ghost.
-        self.assertEqual(
-            result.content_list[35].get("table_body"),
-            content[35].get("table_body"),
-        )
-        self.assertEqual(
-            result.content_list[38].get("table_body"),
-            content[38].get("table_body"),
-        )
-        diagnostics = normalized["parser_diagnostics"]["table_reconciliation"]
-        self.assertEqual(
-            diagnostics["model_hash"],
-            "sha256:b58ff2334e4321d7325df189ccd80a022330d8ebf2cabe6ee4c6ef0038a46eba",
-        )
-        self.assertEqual(diagnostics["unproven_groups"], 1)
-        self.assertEqual(diagnostics["locator_only_groups"], 3)
-        self.assertEqual(diagnostics["locator_only_tables"], 7)
-        self.assertEqual(diagnostics["restored_groups"], 0)
-        self.assertEqual(diagnostics["restored_tables"], 0)
-        self.assertEqual(diagnostics["restoration_rejected_groups"], 0)
-        self.assertEqual(diagnostics["unresolved_groups"], 1)
-        locators = _assert_only_locators_added(
-            self, before=content, after=result.content_list
-        )
-        self.assertEqual(len(locators), 3)
+        first_page_rows = page_rows[0]
+        second_page_rows = page_rows[1]
         self.assertTrue(
-            all(
-                set(locator)
-                == {
-                    "algorithm_version",
-                    "page_span",
-                    "page_bboxes",
-                    "model_table_indices",
-                    "continuation_source_item_indices",
-                }
-                for locator in locators
+            any(
+                "航空工业" in set(row)
+                and "272,517.84" in set(row)
+                for row in first_page_rows
             )
         )
-        before_units, _ = build_unit_drafts_s1_s7(
-            before_ir, filing_type="quarterly_report"
+        self.assertTrue(
+            any(
+                "黎明公司" in set(row)
+                and "974,082.55" in set(row)
+                for row in second_page_rows
+            )
         )
-        after_units, _ = build_unit_drafts_s1_s7(
-            normalized, filing_type="quarterly_report"
+        self.assertFalse(
+            any(
+                {"航空工业", "黎明公司"}.issubset(set(row))
+                for rows in page_rows.values()
+                for row in rows
+            )
         )
-        self.assertEqual(
-            [_unit_semantics(unit) for unit in after_units],
-            [_unit_semantics(unit) for unit in before_units],
-        )
-
-    def test_1224557820_locator_only_preserves_diluted_eps_semantics(self) -> None:
-        root = DATA_ROOT / RUNNING_FURNITURE_ROOT
-        content_path = root / f"{RUNNING_FURNITURE_STEM}_content_list.json"
-        model_path = root / f"{RUNNING_FURNITURE_STEM}_model.json"
-        self.assertEqual(
-            _sha256(content_path),
-            "b866e765e2412bd05b55243355bc165a906db7cc4b80a282cafad5f75a3b2dc4",
-        )
-        self.assertEqual(
-            _sha256(model_path),
-            "ff6693ca2701142f010dd1a54ba6a6c63504fedc151f267b4b47c6be432c4ddd",
-        )
-        content = MinerUArtifactReader().read_content_list(content_path)
-        mapper = MinerUToNormalizedIRMapper()
-        parser_info = MinerUParserInfo(
-            name="MinerU",
-            package_version="3.4.0",
-            backend="vlm-http-client",
-            method="auto",
-            language="ch",
-            formula=False,
-            table=True,
-        )
-        metadata = {
-            "document_id": "real_1224557820",
-            "source_pdf": "raw/1224557820.pdf",
-            "title": "大地熊：大地熊2025年半年度报告",
-        }
-        before_ir = mapper.map_content_list(
-            content_list=content,
-            parser_info=parser_info,
-            document_metadata=metadata,
-        )
-        normalized, result = map_reconciled_mineru_content_list(
-            content_list=content,
-            model_path=model_path,
-            mapper=mapper,
-            parser_info=parser_info,
-            document_metadata=metadata,
-        )
-        self.assertEqual(result.stats.locator_only_groups, 41)
-        self.assertEqual(result.stats.locator_only_tables, 88)
-        self.assertEqual(result.stats.restored_groups, 0)
-        self.assertEqual(result.stats.restored_tables, 0)
-        self.assertEqual(result.stats.restoration_rejected_groups, 0)
-        diagnostics = normalized["parser_diagnostics"]["table_reconciliation"]
-        self.assertEqual(
-            diagnostics["algorithm_version"],
-            "mineru-aggregate-table-locator.v4",
-        )
-        self.assertEqual(
-            diagnostics["unresolved_groups"], diagnostics["unproven_groups"]
-        )
-        locators = _assert_only_locators_added(
-            self, before=content, after=result.content_list
-        )
-        self.assertEqual(len(locators), 41)
-        units, _stats = build_unit_drafts_s1_s7(
-            normalized,
-            filing_type="semiannual_report",
-            document_title=str(metadata["title"]),
-        )
-        before_units, _before_stats = build_unit_drafts_s1_s7(
-            before_ir,
-            filing_type="semiannual_report",
-            document_title=str(metadata["title"]),
-        )
-        self.assertEqual(
-            [_unit_semantics(unit) for unit in units],
-            [_unit_semantics(unit) for unit in before_units],
-        )
-        # The aggregate carrier already contains this logical row; v4 keeps it
-        # in place, and the orphan-recovery mechanism (with its BuildStats
-        # counter) no longer exists — semantic equality above is the invariant.
-        table_payloads: list[dict[str, Any]] = []
-        for unit in units:
-            if unit.payload_kind == "table":
-                table_payloads.append(unit.payload)
-            elif unit.payload_kind == "mixed":
-                parts = unit.payload.get("parts")
-                if isinstance(parts, list):
-                    table_payloads.extend(
-                        part
-                        for part in parts
-                        if isinstance(part, dict) and part.get("kind") == "table"
-                    )
-        table_cells = [
-            str(cell).replace("（", "(").replace("）", ")").replace("：", ":")
-            for payload in table_payloads
-            for row in [payload.get("headers") or [], *payload.get("rows", [])]
-            for cell in row
-        ]
-        self.assertIn("(二)稀释每股收益(元/股)", table_cells)
 
 
 if __name__ == "__main__":

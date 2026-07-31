@@ -35,6 +35,9 @@ from disclosure_anchor.adapters.parsers.mineru.mineru_process import (
     terminate_active_mineru_processes,
 )
 from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
+from disclosure_anchor.adapters.parsers.mineru.source_evidence_validator import (
+    MinerUSourceEvidenceValidator,
+)
 from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
 from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
 from disclosure_anchor.adapters.sources.cninfo.source import CninfoWebIndexSource
@@ -77,6 +80,18 @@ class WorkerSingletonGuardError(RuntimeError):
     """The process-lifetime singleton session can no longer be trusted."""
 
 
+@dataclass(frozen=True)
+class ExactReplayGuard:
+    """One fail-closed boundary around the regular resident worker."""
+
+    manifest_sha256: str
+    reset_boundary_at: datetime
+    document_count: int
+    runtime_check: Callable[[WorkerDeps], None]
+    database_check: Callable[[Engine], None]
+    raw_identity_check: Callable[[str, str | None], None]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="disclosure-anchor worker")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -85,6 +100,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = load_settings()
+    if args.command == "loop":
+        return run_resident_worker(settings)
     _print_version_banner(settings)
     # Singleton lock on a dedicated NullPool connection: a pooled connection
     # would leak the session lock back into the pool on release (08 §2 E6).
@@ -101,9 +118,7 @@ def main(argv: list[str] | None = None) -> int:
         if not acquired:
             print(SKIP_MESSAGE)
             return 0
-        if args.command == "once":
-            return _run_rounds(settings, rounds=1, lock_conn=lock_conn)
-        return _run_loop(settings, lock_conn=lock_conn)
+        return _run_rounds(settings, rounds=1, lock_conn=lock_conn)
     finally:
         lock_conn.close()
         lock_engine.dispose()
@@ -205,18 +220,102 @@ def _exit_wedged_worker() -> None:
     os._exit(70)
 
 
-def _run_loop(settings: Settings, *, lock_conn: Connection) -> int:
+def run_resident_worker(
+    settings: Settings,
+    *,
+    exact_replay_guard: ExactReplayGuard | None = None,
+) -> int:
+    """Run the one resident worker, optionally bound to an exact replay.
+
+    Replay is an admission guard, not a second scheduler: it keeps the production
+    singleton, dispatcher, retry budgets, crash recovery, projection loop and
+    watchdog. Acquisition and taxonomy routing are disabled because the
+    immutable manifest owns corpus membership. The guard validates identity
+    on the resident composition, rechecks the source closure, and checks each
+    raw hash immediately before parse.
+    """
+
+    _print_version_banner(settings)
+    if exact_replay_guard is not None:
+        print(
+            "[replay] exact manifest="
+            f"{exact_replay_guard.manifest_sha256} "
+            f"documents={exact_replay_guard.document_count} "
+            f"reset_boundary_at="
+            f"{exact_replay_guard.reset_boundary_at.isoformat()}"
+        )
+    lock_engine = sqlalchemy.create_engine(
+        _database_url(settings),
+        poolclass=NullPool,
+        isolation_level="AUTOCOMMIT",
+    )
+    lock_conn = lock_engine.connect()
+    try:
+        acquired = lock_conn.execute(
+            text("SELECT pg_try_advisory_lock(:ns, 0)"), {"ns": WORKER_NS}
+        ).scalar_one()
+        if not acquired:
+            if exact_replay_guard is not None:
+                raise WorkerSingletonGuardError(
+                    "worker singleton lock is held; stop and drain the "
+                    "resident worker before exact replay"
+                )
+            print(SKIP_MESSAGE)
+            return 0
+        return _run_loop(
+            settings,
+            lock_conn=lock_conn,
+            exact_replay_guard=exact_replay_guard,
+        )
+    finally:
+        lock_conn.close()
+        lock_engine.dispose()
+
+
+def _run_loop(
+    settings: Settings,
+    *,
+    lock_conn: Connection,
+    exact_replay_guard: ExactReplayGuard | None = None,
+) -> int:
     """Run a resident data plane with independent maintenance/reporting."""
 
     engine = create_db_engine(_database_url(settings))
     stop = _StopFlag()
     stop.install()
     base_limits = _limits(settings)
+    if exact_replay_guard is not None:
+        base_limits = replace(
+            base_limits,
+            sync=0,
+            sync_stage_seconds=0,
+            acquisition_seconds=0,
+            download=0,
+        )
+
+    def admission_guard() -> None:
+        _assert_singleton_or_cancel(lock_conn)
+        if exact_replay_guard is not None:
+            exact_replay_guard.database_check(engine)
+
     base_deps = _deps(
         settings,
         engine,
-        admission_guard=lambda: _assert_singleton_or_cancel(lock_conn),
+        admission_guard=admission_guard,
     )
+    if exact_replay_guard is not None:
+        base_deps = replace(
+            base_deps,
+            config=replace(
+                base_deps.config,
+                process_scope_classes=None,
+            ),
+            replay_raw_identity_guard=(
+                exact_replay_guard.raw_identity_check
+            ),
+        )
+        exact_replay_guard.runtime_check(base_deps)
+        exact_replay_guard.database_check(engine)
     deps = base_deps
     maintenance_deps = base_deps
     maintenance_progress: list[float] | None = None
@@ -769,6 +868,12 @@ def _assert_singleton_or_cancel(lock_conn: Connection) -> None:
         raise WorkerSingletonGuardError(str(exc)) from exc
 
 
+def assert_worker_singleton_or_cancel(lock_conn: Connection) -> None:
+    """Public fail-closed guard for controlled maintenance workers."""
+
+    _assert_singleton_or_cancel(lock_conn)
+
+
 class _StopFlag:
     def __init__(self) -> None:
         self._stopped = False
@@ -866,6 +971,7 @@ def _deps(
         path_builder=paths,
         raw_store=RawDocumentStore(paths),
         artifact_store=ArtifactStore(paths),
+        source_evidence_validator=MinerUSourceEvidenceValidator(),
         source_factory=source_factory,
         profile_loader_factory=profile_loader_factory,
         parser_factory=parser_factory,
@@ -914,12 +1020,26 @@ def _deps(
             http_request_concurrency=(
                 settings.mineru_http_request_concurrency
             ),
+            runtime_bundle_identity_sha256=(
+                settings.disclosure_mineru_runtime_bundle_identity_sha256
+            ),
         ),
         on_parse_runaway=lambda _document_id: _exit_wedged_worker(),
         source_close_after_round=False,
         close_source=close_source,
         admission_guard=admission_guard,
     )
+
+
+def build_worker_dependencies(
+    settings: Settings,
+    engine: Engine,
+    *,
+    admission_guard: Callable[[], None] = lambda: None,
+) -> WorkerDeps:
+    """Public composition boundary for controlled maintenance workers."""
+
+    return _deps(settings, engine, admission_guard=admission_guard)
 
 
 def _process_scope_classes(settings: Settings) -> tuple[str, ...]:
@@ -936,7 +1056,7 @@ def _print_version_banner(settings: Settings) -> None:
     logs. DB rule versions are best-effort — a down DB must not block boot.
     """
 
-    from disclosure_anchor.adapters.unit_builder import rules as builder_rules
+    from disclosure_anchor.application.services.unit_builder import rules as builder_rules
 
     scope = _process_scope_classes(settings)
     per_document_cap = settings.mineru_http_request_concurrency or 0
@@ -1036,6 +1156,12 @@ def _database_url(settings: Settings) -> str:
     if settings.database_url is not None:
         return app_database_url(settings)
     return migration_database_url(settings)
+
+
+def worker_database_url(settings: Settings) -> str:
+    """Resolve the same write database used by the resident worker."""
+
+    return _database_url(settings)
 
 
 

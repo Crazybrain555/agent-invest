@@ -212,6 +212,8 @@ def document_to_entity(row: m.Document) -> e.Document:
         current_processing_run_id=row.current_processing_run_id,
         supersedes_document_id=row.supersedes_document_id,
         correction_of_document_id=row.correction_of_document_id,
+        class_filing_type=row.class_filing_type,
+        class_rules_version=row.class_rules_version,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -221,6 +223,7 @@ def processing_run_to_model(entity: e.ProcessingRun) -> m.ProcessingRun:
     return m.ProcessingRun(
         processing_run_id=entity.processing_run_id,
         document_id=entity.document_id,
+        artifact_owner_processing_run_id=(entity.artifact_owner_processing_run_id),
         run_kind=entity.run_kind,
         status=entity.status,
         parser_name=entity.parser_name,
@@ -228,6 +231,8 @@ def processing_run_to_model(entity: e.ProcessingRun) -> m.ProcessingRun:
         parser_backend=entity.parser_backend,
         parser_method=entity.parser_method,
         parser_language=entity.parser_language,
+        parser_target_identity=entity.parser_target_identity,
+        search_projection_error=entity.search_projection_error,
         input_raw_file_hash=entity.input_raw_file_hash,
         parser_artifact_relpath=entity.parser_artifact_relpath,
         artifact_hash=entity.artifact_hash,
@@ -251,6 +256,7 @@ def processing_run_to_entity(row: m.ProcessingRun) -> e.ProcessingRun:
     return e.ProcessingRun(
         processing_run_id=row.processing_run_id,
         document_id=row.document_id,
+        artifact_owner_processing_run_id=(row.artifact_owner_processing_run_id),
         run_kind=row.run_kind,
         status=row.status,
         parser_name=row.parser_name,
@@ -258,6 +264,8 @@ def processing_run_to_entity(row: m.ProcessingRun) -> e.ProcessingRun:
         parser_backend=row.parser_backend,
         parser_method=row.parser_method,
         parser_language=row.parser_language,
+        parser_target_identity=row.parser_target_identity,
+        search_projection_error=row.search_projection_error,
         input_raw_file_hash=row.input_raw_file_hash,
         parser_artifact_relpath=row.parser_artifact_relpath,
         artifact_hash=row.artifact_hash,

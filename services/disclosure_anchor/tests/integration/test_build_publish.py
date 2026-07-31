@@ -10,6 +10,9 @@ import unittest
 from sqlalchemy import text
 
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
+from disclosure_anchor.adapters.parsers.mineru.source_evidence_validator import (
+    MinerUSourceEvidenceValidator,
+)
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.application.use_cases.build_units import (
@@ -61,6 +64,8 @@ def _normalized_ir(text_value: str = "公司存在退市风险，请投资者注
             "language": "ch",
             "formula": True,
             "table": True,
+            "effort": None,
+            "image_analysis": False,
         },
         "parser_artifacts": {
             "artifact_root_relpath": "parser/a",
@@ -266,6 +271,7 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                 e.ProcessingRun(
                     processing_run_id=run_id,
                     document_id=document_id,
+                    artifact_owner_processing_run_id=run_id,
                     run_kind="parse",
                     status="succeeded",
                     normalized_ir_relpath=str(ir_relpath),
@@ -336,6 +342,7 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                     e.ProcessingRun(
                         processing_run_id=old_run_id,
                         document_id=document_id,
+                        artifact_owner_processing_run_id=old_run_id,
                         run_kind="parse",
                         status="succeeded",
                         unit_build_status="succeeded",
@@ -348,6 +355,7 @@ class BuildPublishIntegrationTests(unittest.TestCase):
                 e.ProcessingRun(
                     processing_run_id=new_run_id,
                     document_id=document_id,
+                    artifact_owner_processing_run_id=new_run_id,
                     run_kind="parse",
                     status="succeeded",
                     unit_build_status="succeeded",
@@ -365,6 +373,7 @@ class BuildPublishIntegrationTests(unittest.TestCase):
             path_builder=self.paths,
             artifact_store=ArtifactStore(self.paths),
             uow_factory=self._uow,
+            source_evidence_validator=MinerUSourceEvidenceValidator(),
         )
         publish = PublishRun(
             uow_factory=self._uow,
@@ -479,9 +488,7 @@ class BuildPublishIntegrationTests(unittest.TestCase):
             PublishRun(
                 uow_factory=lambda: FailingUoW(engine=self.engine),
                 publication_guard=_allow_whole_pdf,
-            ).execute(
-                PublishRunCommand(processing_run_id=new_run_id)
-            )
+            ).execute(PublishRunCommand(processing_run_id=new_run_id))
 
         with self.engine.connect() as conn:
             rows = (
@@ -616,9 +623,7 @@ class BuildPublishIntegrationTests(unittest.TestCase):
             PublishRun(
                 uow_factory=self._uow,
                 publication_guard=_allow_whole_pdf,
-            ).execute(
-                PublishRunCommand(processing_run_id=new_run_id)
-            )
+            ).execute(PublishRunCommand(processing_run_id=new_run_id))
             scenarios.append((label, document_id))
 
         by_label = {}

@@ -45,6 +45,7 @@ GET /v1/documents/{document_id}/units
 GET /v1/units/{asset_id}
 GET /v1/units/{asset_id}/source-ref
 GET /v1/units/{asset_id}/context
+GET /v1/units/{asset_id}/evidence/{sha256}
 GET /v1/filings/latest
 GET /v1/changes
 GET /v1/tracked-companies
@@ -59,9 +60,12 @@ GET /v1/tracked-companies
 错误响应不泄露内部堆栈
 响应不含绝对路径
 错误码枚举：L1_PROCESSING_REQUIRED / NOT_FOUND / CONTRACT_VERSION_MISMATCH /
-           GONE_SUPERSEDED / VALIDATION_ERROR（触发条件见 06 §3.3）
-unit 级 DTO 派生字段全集 = {asset_uri}（仅 API 序列化层派生，不入库、不进 *_v1 视图，
-  DERIVED 白名单排除）；is_active_run 自 0011 起是 document_units_v1 / source_refs_v1
+           GONE_SUPERSEDED / VALIDATION_ERROR / EVIDENCE_INTEGRITY_ERROR
+           （触发条件见 06 §3.3 与 evidence endpoint 契约）
+unit 级 DTO 派生字段全集 = {asset_uri, evidence_refs}，source_ref 级派生字段全集 =
+  {evidence_refs}（仅 API 序列化层派生，不入库、不进 *_v1 视图，DERIVED 白名单排除）；
+  evidence_refs 只含可请求 URI、sha256、media_type、size_bytes，不含 role/path；
+  is_active_run 自 0011 起是 document_units_v1 / source_refs_v1
   的真实视图列（round3 P1#7：DB 直读方可直接过滤 active run）
 tracked_company DTO 派生字段全集 = {effective_lookback_days / effective_sync_seconds /
   effective_process_classes / sync_state}（级联与 due 判定在 API 层解析——全局 policy/
@@ -83,7 +87,8 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
 0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref /
   supersedes 链 / superseded_by_document_id / provider_metadata
 0011 起 document_unit.payload_kind 增加 'mixed'（round3 P0#1 业务语义块：
-  semantic_type = meeting_proposal / document / section，payload.parts 承载有序部件）
+  当前 semantic_type = document / section，payload.parts 承载同一 source-proved
+  结构区间内的有序部件；监管 taxonomy 不参与切分）
 0013 起 document_unit 增加 semantic_keys（jsonb 数组 = 单元自身 semantic_key ∪ mixed
   parts 的 semantic_key；GIN 部分索引支持 `semantic_keys ? 'revenue_breakdown'`；
   纳入 query_projection_hash 与 outbox PROJECTION_FIELDS；ub-2026.07-26 新产物在无更窄
@@ -113,11 +118,25 @@ disclosure_public.source_refs_v1
 disclosure_public.change_events_v1
 disclosure_public.tracked_companies_v1
 disclosure_public.unit_search_projection_v1
+disclosure_public.unit_body_search_windows_v1
+disclosure_public.unit_search_atoms_v1
 ```
 
-`unit_search_projection_v1`（0025 迁移，06R 派生检索投影层）：全部列可由已持久化 unit
+`unit_search_projection_v1`（0025+0028，06R 派生检索投影层）：原 11 列及顺序保持不变；
+`unit_body_search_windows_v1` 只承载 PostgreSQL 无法无损表示的 body token 连续窗。两者全部
+可由已持久化 unit
 确定性再生，不进 content/query_projection 哈希、重建不产生 outbox 事件；non-evidence 派生面，
 与 documents/units 事实视图区别对待。
+
+`unit_search_atoms_v1`（0030）列顺序固定为 `asset_id / atom_index / atom_text /
+retrieval_rules_version / built_at`；每行来自 explicit search target 的一个非空叶子，禁止跨
+target/part 连接。`atom_text` 是 NFKC+casefold 候选投影，不是证据。
+
+`processing_runs_v1`（0031）暴露
+`artifact_owner_processing_run_id` opaque provenance id，但继续禁止暴露
+`normalized_ir_relpath` / `parser_artifact_relpath`。parse owner=self；
+rebuild owner 必须解析到同 document 的根 parse run，且 producer/owner artifact hash
+一致。
 
 检查项：
 
@@ -153,6 +172,7 @@ quality_status
 applicability
 page_no
 artifact_locator
+evidence_refs（API 派生；URI/sha256/media_type/size_bytes）
 ```
 
 L2 引用 source_ref 后，应能回到：
@@ -162,6 +182,7 @@ L2 引用 source_ref 后，应能回到：
 处理 run
 unit payload snapshot
 artifact locator
+locator 绑定的 hash-addressed evidence bytes（仅能经 unit evidence URI 读取）
 ```
 
 ## 5. Change feed 检查

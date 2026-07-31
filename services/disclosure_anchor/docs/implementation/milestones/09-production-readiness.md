@@ -137,8 +137,9 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
   - 修法：Add a `tracked-companies` CLI (import CSV of scodes with default backfill window, list, pause/resume) reusing the existing upsert; make the worker skip-and-report companies without securities once (mark tracked_company status or write a checkpoint) instead of 
 - [ ] (M/OPERATIONS AND DEPLOYMENT) **Disk growth is unmanaged: ~17x artifact amplification per parse, retries and superseded runs never g**
   - 修法：Add a GC command that removes artifact/derived dirs for runs that are (a) failed and retry-exhausted or (b) pruned/superseded beyond a retention window, keeping the DB as source of truth; add a doctor WARN/FAIL on free-space thresholds for data root and PGDATA
-- [ ] (S/OPERATIONS AND DEPLOYMENT) **wipe_test_data.sh is a production-corpus-destroying command guarded only by an env var, sitting in t**
-  - 修法：Make the wipe refuse to run unless the target database name/host matches an explicit allowlist (e.g. require `WIPE_DB=invest_engine_test` matching current_database()), or remove the target from the production Makefile and keep it in a tests-only script; at min
+- [x] (S/OPERATIONS AND DEPLOYMENT) **旧 `wipe_test_data.sh` 可绕过证据与恢复门禁**
+  - 2026-07-28 已删除脚本及 Makefile 入口。全量派生清理只走 manifest-bound reset；
+    单公司测试残留只走持 CORPUS exclusive 的 `purge-company`。
 - [ ] (S/SECURITY AND CREDENTIALS POS) **Parse-failure error text (MinerU stderr, absolute paths) leaks into the public change feed and /v1/c**
   - 修法：Drop the free-text message from outbox event payloads (keep stage/error_code/retryable, which is what the queue views consume), or sanitize messages to relpaths/basenames before they enter outbox_event.
 - [ ] (M/SECURITY AND CREDENTIALS POS) **DB role separation exists only on paper: runtime service, migrations login, and DBHub MCP all connec**
@@ -149,8 +150,10 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
   - 修法：Generalize the scratch-DB round-trip test to walk head → 0009 → head (exercising every post-0009 downgrade/upgrade pair) and assert view/column shape at each stop; make 'add a migration' imply extending this test per the milestone protocol.
 - [ ] (M/TEST COVERAGE GAPS for produ) **Web fallback channel (CninfoWebSource) has zero end-to-end/integration coverage; queue view's hisAnn**
   - 修法：Add an integration test on the scratch-DB pattern: run SyncDisclosureIndex with a fake web-shaped source writing provider_interface='cninfo:hisAnnouncement', assert the candidates appear in pending_download_v1 and download→register completes; add a CLI parse t
-- [ ] (M/TEST COVERAGE GAPS for produ) **prune_history.sh and wipe_test_data.sh are untested shell run against the live DB and data root**
-  - 修法：Add a scratch-DB integration test (reuse test_worker_integration setUpClass pattern): publish two generations of one document, run prune_history.sh via subprocess, assert the active run/units/events are intact, superseded rows are gone, and the change feed's p
+- [x] (M/TEST COVERAGE GAPS for produ) **旧 wipe shell 无法在共享生产库安全验证**
+  - `prune_history.sh` 与 `wipe_test_data.sh` 均已删除；历史退役统一为带 CORPUS exclusive、复核 manifest 和事务内
+    membership recheck 的 `retire_derived_generation.py`，文件只由带 24h guard 的统一 orphan
+    collector 后置清理；manifest-bound reset 在 managed scratch DB 做 rollback/restore 集成门禁。
 - [ ] (L/TEST COVERAGE GAPS for produ) **No load/volume testing; pending_download_v1 and pending_parse_v1 predicates lack supporting indexes **
   - 修法：Add a volume smoke on the scratch DB: seed 500 tracked companies and a few thousand synthetic source_access snapshots, assert queries.py helpers stay under a latency bound (or EXPLAIN shows no full-corpus jsonb re-explosion); pair with a new migration adding (
 - [ ] (M/TEST COVERAGE GAPS for produ) **rebuild_units path tested only against in-memory fakes: real repository query, CLI chain, and supers**

@@ -20,6 +20,7 @@ from disclosure_anchor.adapters.db.postgres.schema import (
     ALEMBIC_VERSION_TABLE_SCHEMA,
     OWNER_ROLE,
 )
+from disclosure_anchor.application.worker.locks import exclusive_corpus_mutation
 from disclosure_anchor.settings import load_settings
 
 config = context.config
@@ -64,17 +65,20 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     engine = create_db_engine(_resolve_url(), set_role=OWNER_ROLE)
-    with engine.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            version_table=ALEMBIC_VERSION_TABLE,
-            version_table_schema=ALEMBIC_VERSION_TABLE_SCHEMA,
-            include_schemas=True,
-        )
-        with context.begin_transaction():
-            context.run_migrations()
-    engine.dispose()
+    try:
+        with exclusive_corpus_mutation(engine):
+            with engine.connect() as connection:
+                context.configure(
+                    connection=connection,
+                    target_metadata=target_metadata,
+                    version_table=ALEMBIC_VERSION_TABLE,
+                    version_table_schema=ALEMBIC_VERSION_TABLE_SCHEMA,
+                    include_schemas=True,
+                )
+                with context.begin_transaction():
+                    context.run_migrations()
+    finally:
+        engine.dispose()
 
 
 if context.is_offline_mode():

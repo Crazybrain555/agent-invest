@@ -13,6 +13,8 @@ dependencies = [
   "fastapi>=0.115",
   "httpx>=0.27",
   "jieba==0.42.1",
+  "pdfminer.six==20260107",
+  "Pillow>=10.0",
   "psycopg[binary]>=3.2",
   "pydantic>=2.8",
   "pydantic-settings>=2.4",
@@ -37,6 +39,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "disclosure_anchor.adapters.sources.cninfo" = ["filing_type_map.json"]
+"disclosure_anchor.application.services.unit_builder" = ["note_key_map.json"]
 
 [tool.ruff]
 target-version = "py311"
@@ -44,7 +47,7 @@ src = ["src", "tests"]
 
 [tool.mypy]
 python_version = "3.11"
-files = ["src/disclosure_anchor"]
+files = ["src/disclosure_anchor", "scripts"]
 mypy_path = "src"
 ignore_missing_imports = true
 disallow_untyped_defs = true

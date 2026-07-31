@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,6 +9,22 @@ from disclosure_anchor.application.ports.file_store import (
     ArtifactWriteResult,
     RawDocumentVerification,
 )
+from disclosure_anchor.application.contracts.normalized_ir import (
+    CURRENT_NORMALIZED_IR_VERSION,
+    normalized_ir_filename,
+)
+from disclosure_anchor.application.contracts.document_structure import (
+    DOCUMENT_STRUCTURE_ALGORITHM,
+    DOCUMENT_STRUCTURE_VERSION,
+    carrier_set_sha256,
+)
+from disclosure_anchor.application.contracts.visual_semantics import (
+    MINERU_VL_UTILS_PACKAGE_VERSION,
+    VisualSemanticClosure,
+    parser_target_sha256,
+    visual_semantic_bytes,
+    visual_semantic_diagnostics,
+)
 from disclosure_anchor.application.ports.parser import (
     ParserIdentity,
     ParserOptions,
@@ -16,6 +33,7 @@ from disclosure_anchor.application.ports.parser import (
 from disclosure_anchor.application.use_cases.parse_document import (
     ParseDocument,
     ParseDocumentCommand,
+    build_parser_artifact_manifest,
 )
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.errors import (
@@ -32,6 +50,21 @@ from disclosure_anchor.domain.errors import (
     ParserVersionProbeError,
 )
 from tests.unit._fakes import FakeUnitOfWork
+
+
+_RAW_HASH = "sha256:" + "a" * 64
+_RUNTIME_BUNDLE_HASH = "sha256:" + "b" * 64
+
+
+def _command(
+    *,
+    options: ParserOptions | None = None,
+) -> ParseDocumentCommand:
+    return ParseDocumentCommand(
+        document_id="doc_1",
+        options=options
+        or ParserOptions(runtime_bundle_identity_sha256=_RUNTIME_BUNDLE_HASH),
+    )
 
 
 class _PathBuilder:
@@ -71,12 +104,12 @@ class _PathBuilder:
             / security_code
             / provider_document_id
             / processing_run_id
-            / "normalized_ir.v3.json"
+            / normalized_ir_filename()
         )
 
 
 class _RawStore:
-    def __init__(self, *, ok: bool = True, actual_hash: str | None = "sha256:raw") -> None:
+    def __init__(self, *, ok: bool = True, actual_hash: str | None = _RAW_HASH) -> None:
         self.ok = ok
         self.actual_hash = actual_hash
 
@@ -128,7 +161,7 @@ class _Parser:
         error: Exception | None = None,
         identity_error: Exception | None = None,
         readiness_error: Exception | None = None,
-        contract_version: str = "normalized_ir.v3",
+        contract_version: str = CURRENT_NORMALIZED_IR_VERSION,
     ) -> None:
         self.error = error
         self.identity_error = identity_error
@@ -143,9 +176,6 @@ class _Parser:
         return ParserIdentity(
             name="MinerU",
             version="3.4.0",
-            backend="pipeline",
-            method="auto",
-            language="ch",
         )
 
     def readiness(self, _options: ParserOptions | None = None) -> None:
@@ -165,43 +195,118 @@ class _Parser:
         if self.error is not None:
             raise self.error
         artifact_root = output_dir / "sample" / "auto"
+        artifact_root.mkdir(parents=True)
+        content_list = artifact_root / "sample_content_list.json"
+        content_list.write_text("[]", encoding="utf-8")
+        content_list_v2 = artifact_root / "sample_content_list_v2.json"
+        content_list_v2.write_text("[[]]", encoding="utf-8")
+        markdown = artifact_root / "sample.md"
+        markdown.write_text("sample", encoding="utf-8")
+        model = artifact_root / "sample_model.json"
+        model.write_text("[]", encoding="utf-8")
+        middle = artifact_root / "sample_middle.json"
+        middle.write_text("{}", encoding="utf-8")
+        pdf_structure = artifact_root / "sample_pdf_structure.json"
+        pdf_structure.write_text(
+            json.dumps(
+                {
+                    "source_pdf_sha256": document_metadata["raw_file_hash"],
+                    "source_pdf_page_count": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        source_evidence = artifact_root / "sample_source_evidence.json"
+        source_evidence.write_text("{}", encoding="utf-8")
+        elements: list[dict[str, Any]] = []
+        target = options.target_identity(self.identity())
+        visual_closure = VisualSemanticClosure(
+            source_pdf_sha256=document_metadata["raw_file_hash"],
+            source_pdf_page_count=1,
+            source_evidence_sha256=_hash_bytes(b"{}"),
+            content_list_sha256=_hash_bytes(b"[]"),
+            content_list_v2_sha256=_hash_bytes(b"[[]]"),
+            middle_sha256=_hash_bytes(b"{}"),
+            model_sha256=_hash_bytes(b"[]"),
+            parser_target_sha256=parser_target_sha256(target.to_payload()),
+            runtime_bundle_identity_sha256=_RUNTIME_BUNDLE_HASH,
+            mineru_package_version="3.4.0",
+            mineru_vl_utils_version=MINERU_VL_UTILS_PACKAGE_VERSION,
+            enrichment_backend="http-client",
+            enrichment_image_analysis=True,
+            server_url_sha256=_hash_bytes(b"fixture-server"),
+            formula_enabled=True,
+            dispositions=(),
+        )
+        visual_semantics = artifact_root / "sample_visual_semantics.json"
+        visual_semantics.write_bytes(visual_semantic_bytes(visual_closure))
         normalized_ir: dict[str, Any] = {
             "contract_version": self.contract_version,
             "created_at": "2026-07-16T00:00:00Z",
             "document_id": document_metadata["document_id"],
             "source_pdf": document_metadata["source_pdf"],
+            "source_pdf_sha256": document_metadata["raw_file_hash"],
+            "source_pdf_page_count": 1,
             "title": document_metadata["title"],
-            "parser": {
-                "name": "MinerU",
-                "package_version": "3.4.0",
-                "backend": options.backend,
-                "method": options.method,
-                "language": options.language,
-                "formula": options.formula,
-                "table": options.table,
-            },
+            "parser": target.to_payload(),
             "parser_artifacts": {},
-            # v3 write contract: parsed_pages carries exactly these three keys,
+            # Current write contract: parsed_pages carries exactly these three keys,
             # with full_pdf derived from whether a page window was requested.
             "parsed_pages": {
                 "start_page_no": 1,
                 "end_page_no": 1,
                 "full_pdf": options.start_page is None and options.end_page is None,
             },
-            "elements": [],
+            "elements": elements,
+            "parser_diagnostics": {
+                "table_reconciliation": {
+                    "algorithm_version": "mineru-page-local-table-closure.v6",
+                    "model_hash": ("sha256:" + hashlib.sha256(b"[]").hexdigest()),
+                    "content_tables": 0,
+                    "model_tables": 0,
+                    "matched_tables": 0,
+                    "page_local_closed": True,
+                },
+                "visual_semantics": visual_semantic_diagnostics(visual_closure),
+            },
+            "structure_proof": {
+                "contract_version": DOCUMENT_STRUCTURE_VERSION,
+                "algorithm_version": DOCUMENT_STRUCTURE_ALGORITHM,
+                "source_pdf_sha256": document_metadata["raw_file_hash"],
+                "source_pdf_page_count": 1,
+                "carrier_set_sha256": carrier_set_sha256(elements),
+                "native": {
+                    "status": "untagged",
+                    "artifact_role": "pdf_structure",
+                },
+                "headings": [],
+                "page_frames": [],
+                "conflicts": [],
+                "coverage": {
+                    "heading_nodes": 0,
+                    "page_frame_groups": 0,
+                },
+            },
         }
         return ParserResult(
-            parser_name="MinerU",
-            parser_version="3.4.0",
-            parser_backend=options.backend,
-            parser_method=options.method,
-            parser_language=options.language,
+            target_identity=target,
             artifact_root=artifact_root,
-            content_list_path=artifact_root / "content_list.json",
-            markdown_path=artifact_root / "sample.md",
+            artifact_paths={
+                "content_list": content_list,
+                "content_list_v2": content_list_v2,
+                "markdown": markdown,
+                "middle": middle,
+                "model": model,
+                "pdf_structure": pdf_structure,
+                "source_evidence": source_evidence,
+                "visual_semantics": visual_semantics,
+            },
             normalized_ir=normalized_ir,
-            model_path=artifact_root / "sample_model.json",
         )
+
+
+def _hash_bytes(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
 def _uow_with_document() -> FakeUnitOfWork:
@@ -225,7 +330,7 @@ def _uow_with_document() -> FakeUnitOfWork:
             provider_document_id="pid_1",
             title="公告",
             raw_file_relpath="raw_documents/doc.pdf",
-            raw_file_hash="sha256:raw",
+            raw_file_hash=_RAW_HASH,
         )
     )
     return uow
@@ -253,56 +358,45 @@ def _use_case(
 
 
 class ParseDocumentUnitTests(unittest.TestCase):
-    def test_model_diagnostics_are_bound_to_the_exact_artifact_bytes(self) -> None:
-        def normalized_ir(status: str, model_hash: str | None) -> dict[str, Any]:
-            return {
-                "parser_diagnostics": {
-                    "table_reconciliation": {
-                        "model_status": status,
-                        "model_hash": model_hash,
-                    }
-                }
-            }
-
+    def test_artifact_manifest_hashes_roles_and_rejects_root_escape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            model_path = Path(tmp) / "sample_model.json"
-            model_bytes = b"[]"
-            model_path.write_bytes(model_bytes)
-            actual_hash = "sha256:" + hashlib.sha256(model_bytes).hexdigest()
-
-            for status in ("supported", "invalid_json", "unsupported_schema"):
-                with self.subTest(status=status):
-                    ParseDocument._verify_model_diagnostic_binding(
-                        normalized_ir(status, actual_hash),
-                        model_path=model_path,
-                    )
-
-            with self.assertRaises(Exception) as mismatch:
-                ParseDocument._verify_model_diagnostic_binding(
-                    normalized_ir("supported", "sha256:" + "0" * 64),
-                    model_path=model_path,
-                )
+            root = Path(tmp) / "artifact_root"
+            root.mkdir()
+            content = root / "sample_content_list.json"
+            content_bytes = b"[]"
+            content.write_bytes(content_bytes)
+            manifest = build_parser_artifact_manifest(
+                artifact_root=root,
+                artifact_root_relpath=Path("parser/run/auto"),
+                artifact_paths={
+                    "content_list": content,
+                    "middle": None,
+                },
+            )
             self.assertEqual(
-                getattr(mismatch.exception, "error_code", None),
-                "parser_model_hash_mismatch",
+                manifest["files"]["content_list"],
+                {
+                    "availability": "present",
+                    "relpath": "parser/run/auto/sample_content_list.json",
+                    "sha256": "sha256:" + hashlib.sha256(content_bytes).hexdigest(),
+                    "size_bytes": len(content_bytes),
+                },
             )
-
-            invalid_bindings = (
-                ("absent", None, model_path),
-                ("unreadable", actual_hash, model_path),
-                ("supported", actual_hash, None),
+            self.assertEqual(
+                manifest["files"]["middle"],
+                {"availability": "not_emitted"},
             )
-            for status, model_hash, path in invalid_bindings:
-                with self.subTest(invalid_status=status, model_path=path):
-                    with self.assertRaises(Exception) as invalid:
-                        ParseDocument._verify_model_diagnostic_binding(
-                            normalized_ir(status, model_hash),
-                            model_path=path,
-                        )
-                    self.assertEqual(
-                        getattr(invalid.exception, "error_code", None),
-                        "parser_model_binding_invalid",
-                    )
+            outside = Path(tmp) / "outside.json"
+            outside.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(
+                ParserOutputContractError,
+                "escapes artifact root",
+            ):
+                build_parser_artifact_manifest(
+                    artifact_root=root,
+                    artifact_root_relpath=Path("parser/run/auto"),
+                    artifact_paths={"content_list": outside},
+                )
 
     def test_raw_missing_and_hash_mismatch_fail_before_parser(self) -> None:
         for actual_hash, expected_code in (
@@ -318,7 +412,7 @@ class ParseDocumentUnitTests(unittest.TestCase):
                     raw_store=_RawStore(ok=False, actual_hash=actual_hash),
                 )
 
-                result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+                result = use_case.execute(_command())
 
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(result.error["error_code"], expected_code)
@@ -331,7 +425,7 @@ class ParseDocumentUnitTests(unittest.TestCase):
         use_case, _ = _use_case(uow)
 
         with self.assertRaises(ParseDocumentError):
-            use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+            use_case.execute(_command())
 
         self.assertEqual(len(uow.processing_runs.all()), 0)
 
@@ -339,11 +433,14 @@ class ParseDocumentUnitTests(unittest.TestCase):
         uow = _uow_with_document()
         use_case, artifact_store = _use_case(uow)
 
-        first = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+        first = use_case.execute(_command())
         second = use_case.execute(
-            ParseDocumentCommand(
-                document_id="doc_1",
-                options=ParserOptions(start_page=0, end_page=0),
+            _command(
+                options=ParserOptions(
+                    start_page=0,
+                    end_page=0,
+                    runtime_bundle_identity_sha256=_RUNTIME_BUNDLE_HASH,
+                )
             )
         )
 
@@ -352,10 +449,13 @@ class ParseDocumentUnitTests(unittest.TestCase):
         self.assertEqual(uow.documents.get("doc_1").status, "parsed")
         latest_payload = artifact_store.payloads[second.normalized_ir_relpath]
         self.assertFalse(latest_payload["parsed_pages"]["full_pdf"])
-        self.assertTrue(
-            latest_payload["parser_artifacts"]["model_relpath"].endswith(
-                "sample_model.json"
-            )
+        self.assertEqual(
+            latest_payload["parser_artifacts"]["files"]["model"]["availability"],
+            "present",
+        )
+        self.assertRegex(
+            latest_payload["parser_artifacts"]["files"]["model"]["sha256"],
+            r"^sha256:[a-f0-9]{64}$",
         )
 
     def test_typed_parser_exceptions_map_to_structured_errors(self) -> None:
@@ -395,19 +495,17 @@ class ParseDocumentUnitTests(unittest.TestCase):
                 uow = _uow_with_document()
                 use_case, _ = _use_case(uow, parser=_Parser(error=exc))
 
-                result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+                result = use_case.execute(_command())
 
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(result.error["error_code"], error_code)
                 self.assertEqual(result.error["retryable"], retryable)
 
         uow = _uow_with_document()
-        parser = _Parser(
-            readiness_error=ParserVersionProbeError("remote unavailable")
-        )
+        parser = _Parser(readiness_error=ParserVersionProbeError("remote unavailable"))
         use_case, _ = _use_case(uow, parser=parser)
 
-        result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+        result = use_case.execute(_command())
 
         self.assertEqual(result.status, "failed")
         self.assertFalse(parser.called)
@@ -417,15 +515,13 @@ class ParseDocumentUnitTests(unittest.TestCase):
     def test_new_parse_rejects_legacy_ir_generation(self) -> None:
         uow = _uow_with_document()
         use_case, artifact_store = _use_case(
-            uow, parser=_Parser(contract_version="normalized_ir.v2")
+            uow, parser=_Parser(contract_version="normalized_ir.v3")
         )
 
-        result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+        result = use_case.execute(_command())
 
         self.assertEqual(result.status, "failed")
-        self.assertEqual(
-            result.error["error_code"], "parser_output_contract_failed"
-        )
+        self.assertEqual(result.error["error_code"], "parser_output_contract_failed")
         self.assertEqual(artifact_store.payloads, {})
 
     def test_version_probe_failure_fails_closed_without_parse(self) -> None:
@@ -433,7 +529,7 @@ class ParseDocumentUnitTests(unittest.TestCase):
         parser = _Parser(identity_error=ParserVersionProbeError("version failed"))
         use_case, _ = _use_case(uow, parser=parser)
 
-        result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+        result = use_case.execute(_command())
 
         self.assertEqual(result.status, "failed")
         self.assertFalse(parser.called)
@@ -446,7 +542,7 @@ class ParseDocumentUnitTests(unittest.TestCase):
         use_case, _ = _use_case(uow, parser=_Parser(error=RuntimeError("boom")))
 
         with self.assertRaises(RuntimeError):
-            use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+            use_case.execute(_command())
 
         run = uow.processing_runs.all()[0]
         self.assertEqual(run.status, "failed")
@@ -460,7 +556,7 @@ class ParseDocumentUnitTests(unittest.TestCase):
             artifact_store=_UnavailableArtifactStore(),
         )
 
-        result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+        result = use_case.execute(_command())
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.error["stage"], "parse_io")
@@ -473,6 +569,7 @@ class ParseDocumentUnitTests(unittest.TestCase):
             e.ProcessingRun(
                 processing_run_id="run_active",
                 document_id="doc_1",
+                artifact_owner_processing_run_id="run_active",
                 run_kind="publish",
                 status="succeeded",
                 is_active=True,
@@ -486,7 +583,7 @@ class ParseDocumentUnitTests(unittest.TestCase):
             parser=_Parser(error=ParserInvocationError("failed reparse")),
         )
 
-        result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+        result = use_case.execute(_command())
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(document.status, "published")
@@ -496,8 +593,13 @@ class ParseDocumentUnitTests(unittest.TestCase):
         uow = _uow_with_document()
         use_case, _ = _use_case(uow)
 
-        result = use_case.execute(ParseDocumentCommand(document_id="doc_1"))
+        result = use_case.execute(_command())
 
+        run = uow.processing_runs.get(result.processing_run_id)
+        self.assertEqual(
+            run.artifact_owner_processing_run_id,
+            result.processing_run_id,
+        )
         events = uow.outbox.all()
         self.assertEqual(len(events), 1)
         event = events[0]

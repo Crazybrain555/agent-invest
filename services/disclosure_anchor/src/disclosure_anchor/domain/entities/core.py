@@ -105,6 +105,8 @@ class Document:
     current_processing_run_id: Optional[str] = None
     supersedes_document_id: Optional[str] = None
     correction_of_document_id: Optional[str] = None
+    class_filing_type: Optional[str] = None
+    class_rules_version: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -113,6 +115,7 @@ class Document:
 class ProcessingRun:
     processing_run_id: str
     document_id: str
+    artifact_owner_processing_run_id: str
     run_kind: str
     status: str
     parser_name: Optional[str] = None
@@ -120,6 +123,8 @@ class ProcessingRun:
     parser_backend: Optional[str] = None
     parser_method: Optional[str] = None
     parser_language: Optional[str] = None
+    parser_target_identity: Optional[dict[str, Any]] = None
+    search_projection_error: Optional[dict[str, Any]] = None
     input_raw_file_hash: Optional[str] = None
     parser_artifact_relpath: Optional[str] = None
     artifact_hash: Optional[str] = None

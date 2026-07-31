@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from disclosure_anchor.application.dto.worker_report import WorkerLimits
+from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.worker import worker as worker_module
 from disclosure_anchor.application.worker.locks import stable_document_hash
 from disclosure_anchor.application.worker.worker import (
@@ -37,9 +38,19 @@ def _config() -> WorkerConfig:
     )
 
 
+class _FakeResult:
+    def scalar_one(self) -> bool:
+        return True
+
+
+class _FakeConnection:
+    def execute(self, *_args: object, **_kwargs: object) -> _FakeResult:
+        return _FakeResult()
+
+
 class _FakeEngineContext:
-    def __enter__(self) -> object:
-        return object()
+    def __enter__(self) -> _FakeConnection:
+        return _FakeConnection()
 
     def __exit__(self, *args: object) -> None:
         return None
@@ -60,11 +71,15 @@ def _deps() -> WorkerDeps:
         path_builder=mock.MagicMock(),
         raw_store=mock.MagicMock(),
         artifact_store=mock.MagicMock(),
+        source_evidence_validator=mock.MagicMock(),
         source_factory=lambda: mock.MagicMock(),
         profile_loader_factory=lambda source: (lambda code: None),
         parser_factory=lambda: mock.MagicMock(),
         parse_expected_seconds=1800,
         config=_config(),
+        parser_options=ParserOptions(
+            runtime_bundle_identity_sha256="sha256:" + "b" * 64
+        ),
         clock=lambda: datetime(2026, 7, 6, 0, 0, tzinfo=timezone.utc),
     )
 
@@ -165,6 +180,33 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
         self.assertEqual(result, "closed")
         pending_parse.assert_not_called()
+
+        scope_flags: list[bool] = []
+
+        def empty_queue(*args: object, **kwargs: object) -> list[object]:
+            scope_flags.append(bool(kwargs["require_active_company_scope"]))
+            return []
+
+        replay_deps = replace(
+            deps,
+            replay_raw_identity_guard=mock.MagicMock(),
+        )
+        with mock.patch.object(
+            worker_module.queries,
+            "pending_parse",
+            side_effect=empty_queue,
+        ):
+            for active_deps in (deps, replay_deps):
+                result = worker_module._parse_one_batch(
+                    report,
+                    active_deps,
+                    limit=200,
+                    should_stop=lambda: False,
+                    keep_refilling=lambda: True,
+                )
+                self.assertEqual(result, "empty")
+
+        self.assertEqual(scope_flags, [True, False])
 
     def test_parse_stage_overlaps_acquisition(self) -> None:
         # The acquisition thread (sync/download) must run beside the parse
@@ -2898,10 +2940,9 @@ class AcquisitionPumpTests(unittest.TestCase):
 
 class ProjectStageTests(unittest.TestCase):
     def test_projection_delta_drains_unbounded(self) -> None:
-        # The projection must never be capped by an unrelated batch constant:
-        # the borrowed publish limit (document-scale, 10) once starved this
-        # unit-scale rebuild to 48% search coverage while rounds kept
-        # reporting success.
+        # Projection has no row-limit control: a borrowed publish limit once
+        # starved this unit-scale rebuild to 48% coverage while rounds kept
+        # reporting success.  The only stop boundary is a complete run.
         deps = _deps()
         with (
             mock.patch.object(
@@ -2912,8 +2953,16 @@ class ProjectStageTests(unittest.TestCase):
             ),
             mock.patch.object(worker_module, "BuildSearchProjection") as project_cls,
         ):
+            terminal_failure = mock.MagicMock(
+                processing_run_id="run_projection_failed",
+                error_code="search_target_contract_invalid",
+                message="source projection is not closed",
+            )
             project_cls.return_value.execute.return_value = mock.MagicMock(
-                projected=7, deleted=0, skipped=0
+                projected=7,
+                deleted=0,
+                skipped=0,
+                failures=(terminal_failure,),
             )
             report = run_once(
                 WorkerLimits(sync=0, download=0, parse=0, build=0, publish=10),
@@ -2922,8 +2971,15 @@ class ProjectStageTests(unittest.TestCase):
 
         (command,) = project_cls.return_value.execute.call_args.args
         self.assertFalse(command.full)
-        self.assertIsNone(command.limit)
+        self.assertFalse(hasattr(command, "limit"))
         self.assertEqual(report.projected, 7)
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(report.failures[0].stage, "project")
+        self.assertEqual(
+            report.failures[0].item_ref,
+            "run_projection_failed",
+        )
+        self.assertFalse(report.failures[0].retryable)
 
     def test_prune_gate_follows_round_deactivations(self) -> None:
         # The orphan prune is corpus-sized when it has nothing to delete, so

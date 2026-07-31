@@ -36,6 +36,7 @@ def _parse_run(document_id: str = "doc_1") -> e.ProcessingRun:
     return e.ProcessingRun(
         processing_run_id="run_parse_1",
         document_id=document_id,
+        artifact_owner_processing_run_id="run_parse_1",
         run_kind="parse",
         status="succeeded",
         parser_name="mineru",
@@ -57,12 +58,15 @@ class RebuildUnitsTests(unittest.TestCase):
         result = RebuildUnits(uow_factory=lambda: uow).execute(
             RebuildUnitsCommand(document_id="doc_1")
         )
-
         self.assertEqual(result.source_processing_run_id, "run_parse_1")
         self.assertEqual(result.status, "succeeded")
         run = uow.processing_runs.get(result.processing_run_id)
         self.assertEqual(run.run_kind, "rebuild_units")
         self.assertEqual(run.status, "succeeded")
+        self.assertEqual(
+            run.artifact_owner_processing_run_id,
+            "run_parse_1",
+        )
         self.assertEqual(run.normalized_ir_relpath, "derived/normalized_ir/x.json")
         self.assertEqual(run.parser_name, "mineru")
         self.assertEqual(run.input_raw_file_hash, "sha256:" + "a" * 64)
@@ -73,6 +77,34 @@ class RebuildUnitsTests(unittest.TestCase):
         ]
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].payload["status"], "succeeded")
+
+        chained = RebuildUnits(uow_factory=lambda: uow).execute(
+            RebuildUnitsCommand(document_id="doc_1")
+        )
+        self.assertEqual(
+            chained.source_processing_run_id,
+            result.processing_run_id,
+        )
+        self.assertEqual(
+            uow.processing_runs.get(
+                chained.processing_run_id
+            ).artifact_owner_processing_run_id,
+            "run_parse_1",
+        )
+
+        invalid_uow = FakeUnitOfWork()
+        invalid_uow.documents.add(_document())
+        invalid = _parse_run()
+        invalid.artifact_owner_processing_run_id = "run_missing"
+        invalid_uow.processing_runs.add(invalid)
+        with self.assertRaises(BuildUnitsError) as invalid_ctx:
+            RebuildUnits(uow_factory=lambda: invalid_uow).execute(
+                RebuildUnitsCommand(document_id="doc_1")
+            )
+        self.assertEqual(
+            invalid_ctx.exception.error["error_code"],
+            "ARTIFACT_OWNER_INVALID",
+        )
 
     def test_rebuild_without_succeeded_parse_run_is_typed_error(self) -> None:
         uow = FakeUnitOfWork()

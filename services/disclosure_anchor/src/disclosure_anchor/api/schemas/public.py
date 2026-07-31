@@ -44,6 +44,7 @@ class DocumentV1(PublicModel):
 class ProcessingRunV1(PublicModel):
     processing_run_id: str
     document_id: str
+    artifact_owner_processing_run_id: str
     run_kind: str
     status: str
     parser_name: str | None
@@ -63,6 +64,13 @@ class ProcessingRunV1(PublicModel):
     unit_build_attempt_count: int
     unit_built_at: datetime | None
     builder_rules_version: str | None
+
+
+class EvidenceRefV1(PublicModel):
+    uri: str
+    sha256: str
+    size_bytes: int
+    media_type: str
 
 
 class DocumentUnitV1(PublicModel):
@@ -108,6 +116,7 @@ class DocumentUnitV1(PublicModel):
     content_categories: list[dict[str, Any]] | None
     asset_uri: str
     is_active_run: bool
+    evidence_refs: list[EvidenceRefV1]
 
 
 class SourceRefV1(PublicModel):
@@ -129,6 +138,7 @@ class SourceRefV1(PublicModel):
     applicability: str | None
     page_no: int | None
     artifact_locator: dict[str, Any] | None
+    evidence_refs: list[EvidenceRefV1]
 
 
 class DocumentCategoryV1(PublicModel):
@@ -250,6 +260,7 @@ class UnitContextResponse(PublicModel):
     heading_path: list[str]
     title: str | None
     payload: dict[str, Any]
+    evidence_refs: list[EvidenceRefV1]
     excerpt: str | None = None
     start: int | None = None
     end: int | None = None

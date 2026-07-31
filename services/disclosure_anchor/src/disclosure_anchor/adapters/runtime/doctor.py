@@ -8,7 +8,7 @@ import os
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
@@ -792,15 +792,13 @@ def _database_consistency_checks(settings: Settings, engine: Engine) -> list[Che
             )
         )
 
-        exhausted_parse = int(
-            conn.execute(
-                text(
-                    f"SELECT count(*) FROM {OPS_SCHEMA}.pending_parse_v1 "
-                    "WHERE failed_parse_count >= :max_retries "
-                    "OR last_failed_retryable = false"
-                ),
-                {"max_retries": settings.disclosure_max_parse_retries},
-            ).scalar_one()
+        from disclosure_anchor.application.worker.queries import (
+            parse_dead_letter_count,
+        )
+
+        exhausted_parse = parse_dead_letter_count(
+            conn,
+            max_retries=settings.disclosure_max_parse_retries,
         )
         checks.append(
             _pass("parse dead letters", "none")
@@ -1113,8 +1111,12 @@ def _orphan_file_checks(settings: Settings, engine: Engine) -> list[CheckResult]
             )
         }
 
-    raw_orphans = _orphan_files(raw_root, data_root=data_root, expected_relpaths=raw_relpaths)
-    artifact_orphans = _orphan_files(
+    raw_orphans = inventory_orphan_files(
+        raw_root,
+        data_root=data_root,
+        expected_relpaths=raw_relpaths,
+    )
+    artifact_orphans = inventory_orphan_files(
         artifact_root,
         data_root=data_root,
         expected_relpaths=artifact_relpaths,
@@ -1130,25 +1132,30 @@ def _orphan_file_checks(settings: Settings, engine: Engine) -> list[CheckResult]
     ]
 
 
-def _orphan_files(
+def inventory_orphan_files(
     root: Path,
     *,
     data_root: Path,
     expected_relpaths: set[str],
     prefix_match: bool = False,
 ) -> list[str]:
+    """Return unowned files in linear path-depth time, not files×owners."""
+
     if not root.exists():
         return []
     orphans: list[str] = []
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        relpath = str(path.relative_to(data_root))
+        relpath = path.relative_to(data_root).as_posix()
         if prefix_match:
-            if not any(
-                relpath == expected or relpath.startswith(expected + "/")
-                for expected in expected_relpaths
-            ):
+            relative = PurePosixPath(relpath)
+            owned = relpath in expected_relpaths or any(
+                parent.as_posix() in expected_relpaths
+                for parent in relative.parents
+                if parent != PurePosixPath(".")
+            )
+            if not owned:
                 orphans.append(relpath)
         elif relpath not in expected_relpaths:
             orphans.append(relpath)

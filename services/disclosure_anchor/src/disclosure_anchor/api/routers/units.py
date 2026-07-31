@@ -10,6 +10,7 @@ from sqlalchemy.engine import Engine
 
 from disclosure_anchor.api.db import reader_engine_from_request
 from disclosure_anchor.api.errors import (
+    evidence_integrity_error,
     gone_superseded,
     l1_processing_required,
     strict_query_params,
@@ -35,21 +36,29 @@ from disclosure_anchor.api.schemas.public import (
     UnitContextResponse,
     UnitListResponse,
 )
+from disclosure_anchor.api.unit_evidence import (
+    normalize_evidence_digest,
+    read_unit_evidence,
+    unit_evidence_refs,
+)
 from disclosure_anchor.adapters.db.postgres.schema import PUBLIC_SCHEMA
+from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.domain.services.unit_hashing import (
     canonical_json,
     sha256_prefixed,
 )
 from disclosure_anchor.domain.value_objects.semantic_key import is_valid_semantic_key
+from disclosure_anchor.settings import Settings
 
 try:
-    from fastapi import APIRouter, Depends, HTTPException, Query, Request
+    from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 except ModuleNotFoundError:  # pragma: no cover - exercised by app-start validation
     APIRouter = None  # type: ignore[assignment, misc]
     Depends = None  # type: ignore[assignment]
     HTTPException = None  # type: ignore[assignment, misc]
     Query = None  # type: ignore[assignment]
     Request = None  # type: ignore[assignment, misc]
+    Response = None  # type: ignore[assignment, misc]
 
 
 UNIT_COLUMNS = (
@@ -152,12 +161,8 @@ def list_document_units(
     reject_superseded: bool = False,
     payload_kind: str | None = None,
     semantic_key: Annotated[str | None, _semantic_key_query_default()] = None,
-    semantic_keys_any: Annotated[
-        str | None, _semantic_key_list_query_default()
-    ] = None,
-    semantic_keys_all: Annotated[
-        str | None, _semantic_key_list_query_default()
-    ] = None,
+    semantic_keys_any: Annotated[str | None, _semantic_key_list_query_default()] = None,
+    semantic_keys_all: Annotated[str | None, _semantic_key_list_query_default()] = None,
     quality_status: str | None = None,
     heading_prefix: Annotated[list[str] | None, _query_default()] = None,
     cursor: str | None = None,
@@ -212,7 +217,7 @@ def get_unit(asset_id: str, request: Request) -> DocumentUnitV1:
     row = _select_unit(engine=engine, asset_id=asset_id)
     if row is None:
         raise_not_found()
-    return DocumentUnitV1.model_validate(row)
+    return _document_unit_model(row)
 
 
 def get_unit_source_ref(asset_id: str, request: Request) -> SourceRefV1:
@@ -220,7 +225,37 @@ def get_unit_source_ref(asset_id: str, request: Request) -> SourceRefV1:
     row = _select_source_ref(engine=engine, asset_id=asset_id)
     if row is None:
         raise_not_found()
-    return SourceRefV1.model_validate(row)
+    return _source_ref_model(row)
+
+
+def get_unit_evidence(asset_id: str, sha256: str, request: Request) -> Response:
+    digest = normalize_evidence_digest(sha256)
+    if digest is None:
+        raise validation_error("sha256", "must be a lowercase 64-character hex digest")
+    engine = reader_engine_from_request(request)
+    row = _select_unit_evidence(engine=engine, asset_id=asset_id)
+    if row is None:
+        raise_not_found()
+    settings = getattr(request.app.state, "settings", None)
+    if not isinstance(settings, Settings):
+        evidence_integrity_error("storage_configuration_unavailable")
+    evidence = read_unit_evidence(
+        row=row,
+        digest=digest,
+        paths=FileStorePathBuilder(settings),
+    )
+    if evidence is None:
+        raise_not_found()
+    assert Response is not None
+    return Response(
+        content=evidence.content,
+        media_type=evidence.media_type,
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "ETag": f'"{evidence.sha256}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def get_unit_context(
@@ -246,6 +281,12 @@ def get_unit_context(
         heading_path=list(unit["heading_path"]),
         title=unit["title"],
         payload=payload,
+        evidence_refs=unit_evidence_refs(
+            asset_id=str(unit["asset_id"]),
+            payload_kind=str(unit["payload_kind"]),
+            payload=payload,
+            artifact_locator=unit["artifact_locator"],
+        ),
     )
     if max_chars is not None:
         source = canonical_json(payload)
@@ -336,9 +377,44 @@ def _select_unit(*, engine: Engine, asset_id: str) -> dict[str, Any] | None:
 
 def _select_source_ref(*, engine: Engine, asset_id: str) -> dict[str, Any] | None:
     sql = (
-        f"SELECT {', '.join(SOURCE_REF_COLUMNS)} "
-        f"FROM {PUBLIC_SCHEMA}.source_refs_v1 "
-        "WHERE asset_id = :asset_id"
+        f"SELECT {', '.join(f'sr.{column}' for column in SOURCE_REF_COLUMNS)}, "
+        "u.payload AS _unit_payload "
+        f"FROM {PUBLIC_SCHEMA}.source_refs_v1 sr "
+        f"JOIN {PUBLIC_SCHEMA}.document_units_v1 u "
+        "ON u.asset_id = sr.asset_id "
+        "WHERE sr.asset_id = :asset_id"
+    )
+    with engine.connect() as conn:
+        row = conn.execute(text(sql), {"asset_id": asset_id}).mappings().one_or_none()
+    return dict(row) if row is not None else None
+
+
+def _select_unit_evidence(
+    *,
+    engine: Engine,
+    asset_id: str,
+) -> dict[str, Any] | None:
+    sql = (
+        "SELECT "
+        "u.asset_id, u.document_id, u.processing_run_id, u.payload_kind, "
+        "u.payload, u.artifact_locator, "
+        "d.provider, d.provider_document_id, d.security_code, "
+        "r.artifact_owner_processing_run_id, "
+        "r.artifact_hash AS producer_artifact_hash, "
+        "owner.processing_run_id AS resolved_artifact_owner_processing_run_id, "
+        "owner.document_id AS artifact_owner_document_id, "
+        "owner.run_kind AS artifact_owner_run_kind, "
+        "owner.artifact_hash "
+        f"FROM {PUBLIC_SCHEMA}.document_units_v1 u "
+        f"LEFT JOIN {PUBLIC_SCHEMA}.documents_v1 d "
+        "ON d.document_id = u.document_id "
+        f"LEFT JOIN {PUBLIC_SCHEMA}.processing_runs_v1 r "
+        "ON r.processing_run_id = u.processing_run_id "
+        "AND r.document_id = u.document_id "
+        f"LEFT JOIN {PUBLIC_SCHEMA}.processing_runs_v1 owner "
+        "ON owner.processing_run_id = "
+        "r.artifact_owner_processing_run_id "
+        "WHERE u.asset_id = :asset_id"
     )
     with engine.connect() as conn:
         row = conn.execute(text(sql), {"asset_id": asset_id}).mappings().one_or_none()
@@ -401,19 +477,14 @@ def _unit_where(filters: UnitFilters) -> tuple[list[str], dict[str, Any]]:
         # also finds a key that is secondary inside semantic_keys. Explicit
         # any/all parameters add set semantics without narrowing v1.
         where.append(
-            "(u.semantic_key = :semantic_key OR "
-            "u.semantic_keys ? :semantic_key)"
+            "(u.semantic_key = :semantic_key OR u.semantic_keys ? :semantic_key)"
         )
         params["semantic_key"] = filters.semantic_key
     if filters.semantic_keys_any is not None:
-        where.append(
-            "u.semantic_keys ?| CAST(:semantic_keys_any AS text[])"
-        )
+        where.append("u.semantic_keys ?| CAST(:semantic_keys_any AS text[])")
         params["semantic_keys_any"] = filters.semantic_keys_any
     if filters.semantic_keys_all is not None:
-        where.append(
-            "u.semantic_keys ?& CAST(:semantic_keys_all AS text[])"
-        )
+        where.append("u.semantic_keys ?& CAST(:semantic_keys_all AS text[])")
         params["semantic_keys_all"] = filters.semantic_keys_all
     _add_filter(where, params, "quality_status", filters.quality_status)
     if filters.heading_prefix:
@@ -508,10 +579,33 @@ def _unit_list_response(
     if len(rows) > limit:
         next_cursor = encode_unit_cursor(unit_cursor_from_row(page_rows[-1]))
     return UnitListResponse(
-        items=[DocumentUnitV1.model_validate(row) for row in page_rows],
+        items=[_document_unit_model(row) for row in page_rows],
         next_cursor=next_cursor,
         warning=warning,
     )
+
+
+def _document_unit_model(row: dict[str, Any]) -> DocumentUnitV1:
+    enriched = dict(row)
+    enriched["evidence_refs"] = unit_evidence_refs(
+        asset_id=str(row["asset_id"]),
+        payload_kind=str(row["payload_kind"]),
+        payload=row["payload"],
+        artifact_locator=row["artifact_locator"],
+    )
+    return DocumentUnitV1.model_validate(enriched)
+
+
+def _source_ref_model(row: dict[str, Any]) -> SourceRefV1:
+    enriched = dict(row)
+    payload = enriched.pop("_unit_payload", None)
+    enriched["evidence_refs"] = unit_evidence_refs(
+        asset_id=str(row["asset_id"]),
+        payload_kind=str(row["payload_kind"]),
+        payload=payload,
+        artifact_locator=row["artifact_locator"],
+    )
+    return SourceRefV1.model_validate(enriched)
 
 
 def raise_l1_required(status: str) -> NoReturn:
@@ -538,6 +632,27 @@ if APIRouter is not None and Query is not None:
         get_unit_source_ref,
         methods=["GET"],
         response_model=SourceRefV1,
+    )
+    router.add_api_route(
+        "/v1/units/{asset_id}/evidence/{sha256}",
+        get_unit_evidence,
+        methods=["GET"],
+        response_class=Response,
+        responses={
+            200: {
+                "description": "Hash-verified unit evidence bytes",
+                "content": {
+                    media_type: {"schema": {"type": "string", "format": "binary"}}
+                    for media_type in (
+                        "image/gif",
+                        "image/jpeg",
+                        "image/png",
+                        "image/webp",
+                    )
+                },
+            },
+            500: {"description": "Published evidence integrity failure"},
+        },
     )
     router.add_api_route(
         "/v1/units/{asset_id}/context",

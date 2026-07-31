@@ -81,6 +81,92 @@ launchd job 丢失时重装：`make install-ops-launchd`（postgres+doctor）、
 retry-neutral，且有效值至少 60 秒（worker 自身 graceful window 为 35 秒）会给官方
 cleanup 路径和 wrapper 回收留出余量。
 
+**GC label 的同等静默（派生全量重置前必做）**：静默 `com.agentinvest.disclosure-gc` 与
+worker 切换无关，但派生全量重置的静默门（`scripts/corpus_reset_quiescence.py:109`）逐个检查
+worker 和 GC **两个 label**，要求它们都既未 loaded、又已持久 disable，缺一即 fail loud。GC 是
+19:30 日历作业、没有 KeepAlive，不需要上面的排空舞蹈：
+
+```bash
+GC_DOMAIN="gui/$(id -u)"
+GC_LABEL="com.agentinvest.disclosure-gc"
+launchctl disable "$GC_DOMAIN/$GC_LABEL"
+launchctl bootout "$GC_DOMAIN/$GC_LABEL" 2>/dev/null || true
+# 两项都必须成立才过门：disable 记为 true，且 print 找不到该 label。
+launchctl print-disabled "$GC_DOMAIN" | grep "$GC_LABEL"   # 期望 => true
+launchctl print "$GC_DOMAIN/$GC_LABEL" >/dev/null 2>&1; echo "loaded? exit=$?"  # 期望非 0
+```
+
+恢复必须显式做，disable 是持久状态，重启机器不会自愈，否则 GC 静默停摆、派生垃圾无限堆积：
+worker 走 `./scripts/install_launchd.sh`，GC（连同 postgres/doctor）走
+`make install-ops-launchd`。两个安装脚本都是 `enable` + `bootout` + `bootstrap`，`enable` 那步
+正是用来清掉这里写下的 persistent disable 标记；恢复后用上面两条命令反查（期望 disable 不再为
+true、`print` 退出 0）。
+
+### 1.1a MinerU runtime bundle attestation（任何 fresh parse 的前置）
+
+parser target 契约要求 `DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256`
+（否则 parse 在 parser_identity 阶段 fail loud）。digest 用
+`scripts/attest_mineru_runtime.py --mineru-bin "$DISCLOSURE_MINERU_BIN"`
+生成（venv 包清单+解释器版本的规范哈希，幂等），stderr 会给出可直接粘进
+worker.env 的 export 行。**MinerU venv 任何变更（升级/重装）后必须重新生成**，
+否则新产物会带旧运行时身份；worker 重启后生效。
+
+### 1.2 全量派生重置后的 exact replay
+
+全量重解析没有第二个 scheduler、ledger 或 launchd label。reset 前冻结并验真
+`export-reparse-manifest`、备份及 reset receipt；reset 后在 machine-local
+`worker.env` 设置以下两个绝对路径，再重启原有
+`com.agentinvest.disclosure-worker`：
+
+0031 是显式 reset barrier：历史 rebuild 没有可安全回填的 artifact owner 时，迁移会在
+任何 DDL 前 fail loud。操作顺序固定为：在旧 schema 上完成 manifest-bound reset →
+升级到 repository head → 启动 exact replay；禁止先升级并通过拆解 artifact 路径猜 owner。
+
+```bash
+DISCLOSURE_REPLAY_MANIFEST=/.../reset.jsonl
+DISCLOSURE_REPLAY_RESET_RECEIPT=/.../pre-reset.dump.reset-receipt.json
+```
+
+同一个 resident worker 会关闭获取，以 manifest 的全量 document/raw 闭包守卫队列，
+并继续复用生产 parse/finalize pools、重试预算、stale recovery、projection 和
+watchdog。`make reparse-status MANIFEST=... RESET_RECEIPT=...` 在
+`complete=true` 前退出 75；任何代码、文档输入、raw hash、数据库身份或 parser
+deployment 漂移均 fail loud。完成后人工移除这两个环境值并重启同一 job；脚本不会
+自动恢复普通获取，也不会替运维者修改 launchd 状态。
+
+### 1.3 reset bundle 目录布局
+
+`validate_reset_bundle_paths`（`scripts/corpus_reparse_manifest.py:370`）强制：一次重置的**全部**
+控制文件必须直属于 `$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/` 这**一层**目录——不能再套
+子目录，不能散在别处，路径上也不允许有 symlink。理由是 manifest / backup 属于
+控制面证据，一旦落在派生族下面，reset 会把自己的回滚材料一起搬走。
+
+- 目录要**手工**建：`mkdir -p "$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>"`；没有脚本替你建。
+- `<name>` 自取，一次重置一个目录，建议带日期与目的（如 `20260728-heading-arbitration`）。
+- 一个 bundle 最终约 10 个文件，全部平铺在这一层：`reset.jsonl`、
+  `pre-reset.dump` 及其 `.metadata.json` / `.restore-proof.json` / `.reset-receipt.json`，
+  外加每个文件各自的 `.sha256` 旁挂。
+- 因此 `export-reparse-manifest` / `verify-reparse-manifest` / `create-reset-backup` /
+  `prove-reset-backup` / `reset-derived-rehearse` / `wipe-derived` / `reparse-status` /
+  `reparse-corpus` 的 `OUT`、`MANIFEST`、`BACKUP`、`RESET_RECEIPT` 必须全部指向同一个
+  bundle 目录，否则脚本 fail loud。
+- `reset-derived-rehearse` 只做 `reset_transaction(commit=False)` 演练并打印摘要，不产出
+  文件工件；它不是 `wipe-derived` 的前置门，但仍是唯一能在不破坏数据的前提下验证整条
+  reset 事务的手段。
+
+`wipe-derived` 不删旧代派生产物，而是移入 `$DISCLOSURE_DATA_ROOT/audit/reset-trash/<manifest-sha256>/`。
+那是唯一的回滚材料，所以 GC 不按时间自动清它，每日 `gc_daily.sh` 只在日志里打一行
+`[warn] reset-trash holds <size>; run 'make purge-reset-trash' after the new generation is verified`。
+删除用专用命令，不要裸 `rm -rf`：
+
+- `make purge-reset-trash MANIFEST=… RESET_RECEIPT=…`（默认路径）：内部先跑与 `reparse-status`
+  完全相同的校验链，只有回放完整且不变量为零（status exit 0）才允许删除；不带 `PURGE=YES`
+  时只做干跑报体积。
+- `make purge-reset-trash-force MANIFEST=… PURGE=YES`（逃生口）：跳过验证门直接删，用于
+  明确放弃该冻结代或磁盘告急时；等于放弃回滚路径，命令会响亮警告。
+
+两条路径都带 bundle 路径护栏与 symlink 拒绝，只会删 `audit/reset-trash/<manifest-sha>/` 这一棵树。
+
 ## 2. 告警通道
 
 - 每日 18:30 `com.agentinvest.disclosure-doctor` 跑 `scripts/doctor_daily.sh`：
@@ -129,9 +215,15 @@ worker 以 exit 77 自杀 = TCC 拒绝访问外置盘（详见 `scripts/run_work
 ## 7. 磁盘与产物治理
 
 - doctor 有双卷剩余空间检查（<10% WARN）。
-- 孤儿解析产物：`make gc-orphans`（dry-run 盘点，2026-07-14 实测 8,174 文件 / 1.48 GiB，
-  全为被 supersede 的旧 parse run 产物）；确认后 `make gc-orphans APPLY=YES`
-  （删除前自动写 manifest 到 audit/gc/）。原始 PDF 永不在 GC 范围内。
+- 派生代退役只走 DB-first 流程：先
+  `make retire-derived BEFORE=<ISO8601> MANIFEST=/path/retire.json` 生成清单并人工复核，
+  再以相同 `BEFORE`、`MANIFEST` 和 `APPLY=YES` 原子撤销仍满足条件的 DB ownership。
+  已删除绕开锁和清单的 `prune-history` 入口。
+- 派生孤儿统一由 `make gc-orphans`（dry-run）盘点，覆盖 `parser_artifacts`、
+  `derived/normalized_ir` 和 `derived/document_unit_snapshots`；确认后
+  `make gc-orphans APPLY=YES`。apply 全程持 CORPUS exclusive，文件必须至少 24 小时，
+  且删除前把 family、relpath、大小和文件身份写入 `audit/gc/` 清单。parser ownership
+  是 run 目录前缀；另外两类是精确文件 ownership。原始 PDF 永不在 GC 范围内。
 
 ## 8. 数据质量巡检（周节律）
 
@@ -145,7 +237,9 @@ worker 以 exit 77 自杀 = TCC 拒绝访问外置盘（详见 `scripts/run_work
 
 ## 10. 危险边界（不要做的事）
 
-- `make purge-company` / `make wipe-test-data`：测试期工具，级联删行+删文件，生产禁用。
+- `make purge-company`：仅限明确单一公司的测试残留清理，全程持 CORPUS exclusive；
+  生产禁用。旧的全库 `wipe-test-data` 已删除；派生全量重置只能走 manifest/backup/
+  restore-proof/receipt 约束的 `wipe-derived`。
 - `untrack` 是退订（保留全部文档档案），`paused` 是可逆暂停——想停采集永远先用 paused。
 - 已应用迁移一律冻结；改视图/约束开新迁移。
 - admin API 需要 `DISCLOSURE_ADMIN_TOKEN`（Bearer）且仅回环可用；token 在 worker.env，

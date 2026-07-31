@@ -71,23 +71,29 @@ class OpsQueueViewTests(unittest.TestCase):
                 )
             if self.company_id:
                 conn.execute(
-                    text(
-                        "DELETE FROM disclosure_core.company WHERE company_id = :id"
-                    ),
+                    text("DELETE FROM disclosure_core.company WHERE company_id = :id"),
                     {"id": self.company_id},
                 )
         self.engine.dispose()
 
-    def _insert_document(self, conn, status: str = "registered") -> str:
+    def _insert_document(
+        self,
+        conn,
+        status: str = "registered",
+        *,
+        company_id: str | None = None,
+    ) -> str:
         document_id = f"doc_qv{self.suffix}{len(self.doc_ids)}"
         conn.execute(
             text(
                 "INSERT INTO disclosure_core.document "
-                "(document_id, status, provider, provider_document_id, provider_metadata) "
-                "VALUES (:id, :status, 'cninfo', :pid, '{}'::jsonb)"
+                "(document_id, company_id, status, provider, "
+                " provider_document_id, provider_metadata) "
+                "VALUES (:id, :company_id, :status, 'cninfo', :pid, '{}'::jsonb)"
             ),
             {
                 "id": document_id,
+                "company_id": company_id,
                 "status": status,
                 "pid": f"qv{self.suffix}{len(self.doc_ids)}",
             },
@@ -96,6 +102,102 @@ class OpsQueueViewTests(unittest.TestCase):
         refresh_document_classification(conn, document_id=document_id)
         self.doc_ids.append(document_id)
         return document_id
+
+    def test_pending_parse_requires_current_active_research_scope(self) -> None:
+        """Company-bound PDFs follow structural tracking state; local PDFs do not."""
+
+        self.company_id = f"co_qv{self.suffix}"
+        self.tracked_id = f"trk_qv{self.suffix}"
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company (company_id, legal_name) "
+                    "VALUES (:company_id, :legal_name)"
+                ),
+                {
+                    "company_id": self.company_id,
+                    "legal_name": f"queue scope {self.suffix}",
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.tracked_company "
+                    "(tracked_company_id, company_id, status) "
+                    "VALUES (:tracked_id, :company_id, 'active')"
+                ),
+                {
+                    "tracked_id": self.tracked_id,
+                    "company_id": self.company_id,
+                },
+            )
+            company_document = self._insert_document(conn, company_id=self.company_id)
+            local_document = self._insert_document(conn)
+
+            active_ids = {
+                row["document_id"]
+                for row in queries.pending_parse(conn, max_retries=3, limit=500000)
+            }
+            active_backlog = queries.pending_parse_backlog_count(conn)
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.tracked_company "
+                    "SET status = 'paused' WHERE tracked_company_id = :tracked_id"
+                ),
+                {"tracked_id": self.tracked_id},
+            )
+            paused_ids = {
+                row["document_id"]
+                for row in queries.pending_parse(conn, max_retries=3, limit=500000)
+            }
+            paused_exact_ids = {
+                row["document_id"]
+                for row in queries.pending_parse(
+                    conn,
+                    max_retries=3,
+                    limit=1,
+                    document_ids=(company_document,),
+                )
+            }
+            replay_exact_ids = {
+                row["document_id"]
+                for row in queries.pending_parse(
+                    conn,
+                    max_retries=3,
+                    limit=1,
+                    document_ids=(company_document,),
+                    require_active_company_scope=False,
+                )
+            }
+            paused_backlog = queries.pending_parse_backlog_count(conn)
+            replay_backlog = queries.pending_parse_backlog_count(
+                conn,
+                require_active_company_scope=False,
+            )
+            conn.execute(
+                text(
+                    "DELETE FROM disclosure_core.tracked_company "
+                    "WHERE tracked_company_id = :tracked_id"
+                ),
+                {"tracked_id": self.tracked_id},
+            )
+            self.tracked_id = None
+            untracked_ids = {
+                row["document_id"]
+                for row in queries.pending_parse(conn, max_retries=3, limit=500000)
+            }
+            untracked_backlog = queries.pending_parse_backlog_count(conn)
+
+        self.assertIn(company_document, active_ids)
+        self.assertNotIn(company_document, paused_ids)
+        self.assertNotIn(company_document, paused_exact_ids)
+        self.assertIn(company_document, replay_exact_ids)
+        self.assertNotIn(company_document, untracked_ids)
+        self.assertIn(local_document, active_ids)
+        self.assertIn(local_document, paused_ids)
+        self.assertIn(local_document, untracked_ids)
+        self.assertEqual(active_backlog, paused_backlog + 1)
+        self.assertEqual(active_backlog, replay_backlog)
+        self.assertEqual(paused_backlog, untracked_backlog)
 
     def _insert_run(
         self,
@@ -113,9 +215,11 @@ class OpsQueueViewTests(unittest.TestCase):
         conn.execute(
             text(
                 "INSERT INTO disclosure_core.processing_run "
-                "(processing_run_id, document_id, run_kind, status, unit_build_status, "
-                " is_active, started_at, error, unit_build_attempt_count) "
-                "VALUES (:id, :doc, 'parse', :status, :ubs, :active, :started, "
+                "(processing_run_id, document_id, "
+                " artifact_owner_processing_run_id, run_kind, status, "
+                " unit_build_status, is_active, started_at, error, "
+                " unit_build_attempt_count) "
+                "VALUES (:id, :doc, :id, 'parse', :status, :ubs, :active, :started, "
                 "        CAST(:error AS jsonb), :attempts)"
             ),
             {
@@ -176,9 +280,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 {"run": run_id},
             ).scalars()
             automatic_rows = queries.pending_publish(conn, limit=500000)
-            terminal_document_id = self._insert_document(
-                conn, status="parsed"
-            )
+            terminal_document_id = self._insert_document(conn, status="parsed")
             terminal_run_id = self._insert_run(
                 conn,
                 terminal_document_id,
@@ -209,9 +311,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 ),
                 {"run": terminal_run_id},
             ).scalars()
-            retryable_document_id = self._insert_document(
-                conn, status="parsed"
-            )
+            retryable_document_id = self._insert_document(conn, status="parsed")
             retryable_run_id = self._insert_run(
                 conn,
                 retryable_document_id,
@@ -234,9 +334,7 @@ class OpsQueueViewTests(unittest.TestCase):
                     ),
                 },
             )
-            ceiling_document_id = self._insert_document(
-                conn, status="parsed"
-            )
+            ceiling_document_id = self._insert_document(conn, status="parsed")
             ceiling_run_id = self._insert_run(
                 conn,
                 ceiling_document_id,
@@ -297,7 +395,12 @@ class OpsQueueViewTests(unittest.TestCase):
                 conn,
                 document_id,
                 status="failed",
-                error={"stage": "parse", "error_code": "X", "retryable": False},
+                error={
+                    "stage": "parse",
+                    "error_code": "X",
+                    "retryable": False,
+                    "retry_budget_class": "item",
+                },
             )
             view_rows = conn.execute(
                 text(
@@ -309,7 +412,8 @@ class OpsQueueViewTests(unittest.TestCase):
             helper_rows = queries.pending_parse(conn, max_retries=3, limit=500000)
         self.assertEqual(len(view_rows), 1, "view exposes the fact row")
         self.assertNotIn(
-            document_id, [row["document_id"] for row in helper_rows],
+            document_id,
+            [row["document_id"] for row in helper_rows],
             "helper must exclude non-retryable failures",
         )
 
@@ -322,7 +426,12 @@ class OpsQueueViewTests(unittest.TestCase):
                     conn,
                     document_id,
                     status="failed",
-                    error={"stage": "parse", "error_code": "T", "retryable": True},
+                    error={
+                        "stage": "parse",
+                        "error_code": "T",
+                        "retryable": True,
+                        "retry_budget_class": "item",
+                    },
                 )
             helper_rows = queries.pending_parse(conn, max_retries=3, limit=500000)
         self.assertNotIn(document_id, [row["document_id"] for row in helper_rows])
@@ -335,9 +444,7 @@ class OpsQueueViewTests(unittest.TestCase):
         with self.engine.begin() as conn:
             document_ids: dict[str, str] = {}
             for error_code in ("parser_invocation_failed", "OSError"):
-                document_id = self._insert_document(
-                    conn, status="parse_failed"
-                )
+                document_id = self._insert_document(conn, status="parse_failed")
                 document_ids[error_code] = document_id
                 for _ in range(4):
                     self._insert_run(
@@ -348,11 +455,10 @@ class OpsQueueViewTests(unittest.TestCase):
                             "stage": "parse",
                             "error_code": error_code,
                             "retryable": True,
+                            "retry_budget_class": "infrastructure",
                         },
                     )
-            helper_rows = queries.pending_parse(
-                conn, max_retries=3, limit=500000
-            )
+            helper_rows = queries.pending_parse(conn, max_retries=3, limit=500000)
         pending_ids = {row["document_id"] for row in helper_rows}
         for error_code, document_id in document_ids.items():
             with self.subTest(error_code=error_code):
@@ -376,12 +482,61 @@ class OpsQueueViewTests(unittest.TestCase):
                         "stage": "parse",
                         "error_code": "parser_invocation_failed",
                         "retryable": True,
+                        "retry_budget_class": "infrastructure",
                     },
                 )
             helper_rows = queries.pending_parse(conn, max_retries=3, limit=500000)
-        self.assertNotIn(
-            document_id, [row["document_id"] for row in helper_rows]
-        )
+        self.assertNotIn(document_id, [row["document_id"] for row in helper_rows])
+
+    def test_neutral_failures_charge_neither_parse_budget(self) -> None:
+        with self.engine.begin() as conn:
+            document_id = self._insert_document(conn, status="parse_failed")
+            for _ in range(3 * queries.RETRY_CEILING_MULTIPLIER + 1):
+                self._insert_run(
+                    conn,
+                    document_id,
+                    status="failed",
+                    error={
+                        "stage": "parse",
+                        "error_code": "any_diagnostic_code",
+                        "retryable": True,
+                        "retry_budget_class": "neutral",
+                    },
+                )
+            pending_ids = {
+                row["document_id"]
+                for row in queries.pending_parse(
+                    conn,
+                    max_retries=3,
+                    limit=500000,
+                )
+            }
+        self.assertIn(document_id, pending_ids)
+
+    def test_missing_retry_budget_class_fails_closed_without_word_guessing(
+        self,
+    ) -> None:
+        with self.engine.begin() as conn:
+            document_id = self._insert_document(conn, status="parse_failed")
+            self._insert_run(
+                conn,
+                document_id,
+                status="failed",
+                error={
+                    "stage": "parse",
+                    "error_code": "parser_invocation_failed",
+                    "retryable": True,
+                },
+            )
+            pending_ids = {
+                row["document_id"]
+                for row in queries.pending_parse(
+                    conn,
+                    max_retries=3,
+                    limit=500000,
+                )
+            }
+        self.assertNotIn(document_id, pending_ids)
 
     def test_pending_parse_returns_archived_bytes_and_ignores_legacy_flag(
         self,
@@ -445,15 +600,9 @@ class OpsQueueViewTests(unittest.TestCase):
             by_document_id[document_id]["raw_byte_count"],
             measured_bytes,
         )
-        self.assertNotIn(
-            document_id, {row["document_id"] for row in after_rows}
-        )
-        self.assertTrue(
-            all(row["document_id"] > document_id for row in after_rows)
-        )
-        self.assertEqual(
-            [row["document_id"] for row in exact_rows], [document_id]
-        )
+        self.assertNotIn(document_id, {row["document_id"] for row in after_rows})
+        self.assertTrue(all(row["document_id"] > document_id for row in after_rows))
+        self.assertEqual([row["document_id"] for row in exact_rows], [document_id])
 
     def test_processing_backlog_counts_download_and_all_raw_parse_work(self) -> None:
         """GPU outage pressure cannot disappear as downloads become raw files."""
@@ -464,9 +613,7 @@ class OpsQueueViewTests(unittest.TestCase):
             # The resident worker legitimately advances the shared backlog.
             # Pin both counts to one MVCC snapshot so only this transaction's
             # three inserted facts contribute to the measured delta.
-            conn.execute(
-                text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-            )
+            conn.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
             before = queries.pending_processing_backlog_count(conn, max_retries=3)
             candidate_id = f"backlog{self.suffix}candidate"
             conn.execute(
@@ -502,7 +649,12 @@ class OpsQueueViewTests(unittest.TestCase):
                 conn,
                 dead,
                 status="failed",
-                error={"stage": "parse", "error_code": "poison", "retryable": False},
+                error={
+                    "stage": "parse",
+                    "error_code": "poison",
+                    "retryable": False,
+                    "retry_budget_class": "item",
+                },
             )
             oversized = f"doc_qv{self.suffix}oversized"
             conn.execute(
@@ -522,9 +674,7 @@ class OpsQueueViewTests(unittest.TestCase):
             after = queries.pending_processing_backlog_count(conn, max_retries=3)
             parse_ids = {
                 row["document_id"]
-                for row in queries.pending_parse(
-                    conn, max_retries=3, limit=500000
-                )
+                for row in queries.pending_parse(conn, max_retries=3, limit=500000)
             }
         finally:
             txn.rollback()
@@ -583,20 +733,24 @@ class OpsQueueViewTests(unittest.TestCase):
                     "INSERT INTO disclosure_core.source_checkpoint "
                     "(source_checkpoint_id, provider, scope_key, cursor, updated_at) "
                     "VALUES (:checkpoint, 'cninfo', :scope, "
-                    "'{\"window_end\": \"2026-07-13\"}', now())"
+                    '\'{"window_end": "2026-07-13"}\', now())'
                 ),
                 {"checkpoint": f"cp_qv{self.suffix}", "scope": scope_key},
             )
 
             due = queries.sync_due(conn, interval_seconds=86400, limit=500000)
-            lifecycle = conn.execute(
-                text(
-                    "SELECT last_synced_at, synced_through "
-                    "FROM disclosure_public.tracked_companies_v1 "
-                    "WHERE tracked_company_id = :tracked"
-                ),
-                {"tracked": tracked_id},
-            ).mappings().one()
+            lifecycle = (
+                conn.execute(
+                    text(
+                        "SELECT last_synced_at, synced_through "
+                        "FROM disclosure_public.tracked_companies_v1 "
+                        "WHERE tracked_company_id = :tracked"
+                    ),
+                    {"tracked": tracked_id},
+                )
+                .mappings()
+                .one()
+            )
         finally:
             txn.rollback()
             conn.close()
@@ -605,7 +759,9 @@ class OpsQueueViewTests(unittest.TestCase):
         self.assertIsNotNone(lifecycle["last_synced_at"])
         self.assertEqual(str(lifecycle["synced_through"]), "2026-07-13")
 
-    def test_candidate_code_audit_prefers_older_nonempty_api_over_newer_web_empty(self) -> None:
+    def test_candidate_code_audit_prefers_older_nonempty_api_over_newer_web_empty(
+        self,
+    ) -> None:
         provider_document_id = f"f006{self.suffix}"
         code = f"UNMAPPED{self.suffix[:8]}"
         conn = self.engine.connect()
@@ -806,7 +962,9 @@ class OpsQueueViewTests(unittest.TestCase):
         row = next(row for row in rows if row["provider_document_id"] == pid_new)
         self.assertEqual(row["candidate"]["title"], f"测试公告 {pid_new}")
 
-    def test_pending_download_signature_differ_refetch_and_coded_preference(self) -> None:
+    def test_pending_download_signature_differ_refetch_and_coded_preference(
+        self,
+    ) -> None:
         # 0023 (round23): a registered TEXTID re-enters the queue ONLY when
         # the provider's file signature drifted (same-ID file replacement);
         # and the latest CODED snapshot outranks a newer code-less web
@@ -1108,7 +1266,7 @@ class OpsQueueViewTests(unittest.TestCase):
                 )
             ]
             self.assertNotIn(pid_core, override_pids)  # dividend not in override
-            self.assertIn(pid_gov, override_pids)      # governance now in
+            self.assertIn(pid_gov, override_pids)  # governance now in
             all_pids = [
                 row["provider_document_id"]
                 for row in queries.pending_downloads(conn, max_retries=3, limit=500000)
@@ -1173,7 +1331,7 @@ class OpsQueueViewTests(unittest.TestCase):
                     "(:ti, :inherit, 'active', '[]'::jsonb), "
                     "(:tu, :unknown, 'active', '[\"not_a_class\"]'::jsonb), "
                     "(:tm, :mixed, 'active', "
-                    " '[\"dividend\",\"not_a_class\"]'::jsonb), "
+                    ' \'["dividend","not_a_class"]\'::jsonb), '
                     "(:tn, :nonarray, 'active', '{\"class\":\"dividend\"}'::jsonb)"
                 ),
                 {
@@ -1789,9 +1947,7 @@ class OpsQueueViewTests(unittest.TestCase):
                     {"ids": [old_run, fresh_run]},
                 ).all()
             )
-            startup_reclaimed = queries.reclaim_stale_runs(
-                conn, threshold_seconds=0
-            )
+            startup_reclaimed = queries.reclaim_stale_runs(conn, threshold_seconds=0)
             startup_rows = dict(
                 conn.execute(
                     text(

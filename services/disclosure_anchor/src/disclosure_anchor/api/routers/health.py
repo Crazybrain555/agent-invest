@@ -79,7 +79,10 @@ def _queue_status(
                 parse_dead_letters=queries.parse_dead_letter_count(
                     conn, max_retries=settings.disclosure_max_parse_retries
                 ),
-                retrying_documents=queries.retrying_document_count(conn),
+                retrying_documents=queries.retrying_document_count(
+                    conn,
+                    max_retries=settings.disclosure_max_parse_retries,
+                ),
                 sync_due=len(
                     queries.sync_due(
                         conn,

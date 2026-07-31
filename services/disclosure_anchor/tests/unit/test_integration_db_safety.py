@@ -69,18 +69,18 @@ class IntegrationDatabaseSafetyTests(unittest.TestCase):
         engine.dispose.assert_called_once_with()
 
     def test_scratch_name_without_runner_marker_is_rejected(self) -> None:
-        database_name = "invest_engine_itest_1785000035_456_deadbeef"
+        database_name = "invest_engine_scratch_1785000035_456_deadbeef"
         cases = (
             (database_name, None),
             (
                 database_name,
                 f"{_support.TEST_DATABASE_COMMENT_PREFIX}1785000035:"
-                "invest_engine_itest_1785000035_999_feedface",
+                "invest_engine_scratch_1785000035_999_feedface",
             ),
             (
-                "invest_engine_itest_1785000035_backup",
+                "invest_engine_scratch_1785000035_backup",
                 f"{_support.TEST_DATABASE_COMMENT_PREFIX}1785000035:"
-                "invest_engine_itest_1785000035_backup",
+                "invest_engine_scratch_1785000035_backup",
             ),
         )
         for candidate_name, marker in cases:
@@ -107,7 +107,7 @@ class IntegrationDatabaseSafetyTests(unittest.TestCase):
                 engine.dispose.assert_called_once_with()
 
     def test_managed_migrated_scratch_database_is_accepted(self) -> None:
-        database_name = "invest_engine_itest_1785000035_456_deadbeef"
+        database_name = "invest_engine_scratch_1785000035_456_deadbeef"
         engine = self._engine_with_identity(
             database_name,
             f"{_support.TEST_DATABASE_COMMENT_PREFIX}1785000035:{database_name}",
@@ -170,8 +170,34 @@ class IntegrationDatabaseSafetyTests(unittest.TestCase):
         for key, value in inherited.items():
             self.assertEqual(opted_in_env[key], value)
 
+    def test_runner_bootstrap_commits_schema_grants_before_migration(self) -> None:
+        scratch = ScratchIntegrationDatabase(
+            "postgresql+psycopg://localhost/postgres"
+        )
+        schema_engine = mock.MagicMock()
+        try:
+            with (
+                mock.patch.object(scratch, "provision"),
+                mock.patch(
+                    "tests.integration._runner.sqlalchemy.create_engine",
+                    return_value=schema_engine,
+                ) as create_engine,
+                mock.patch(
+                    "tests.integration._runner.ensure_schemas_and_base_grants"
+                ) as bootstrap,
+            ):
+                scratch._provision()
+            create_engine.assert_called_once_with(
+                scratch.database_url,
+                isolation_level="AUTOCOMMIT",
+            )
+            bootstrap.assert_called_once_with(schema_engine)
+            schema_engine.dispose.assert_called_once_with()
+        finally:
+            scratch.close()
+
     def test_reaper_uses_parent_lease_as_liveness_signal(self) -> None:
-        database_name = "invest_engine_itest_1785000035_456_deadbeef"
+        database_name = "invest_engine_scratch_1785000035_456_deadbeef"
         marker = (
             f"{_support.TEST_DATABASE_COMMENT_PREFIX}1785000035:{database_name}"
         )

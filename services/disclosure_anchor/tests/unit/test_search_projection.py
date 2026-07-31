@@ -1,226 +1,483 @@
 """06R search projection: tokenizer + deterministic row computation (no DB).
 
 Covers the pure, DB-free surface of milestone 06R: the pinned jieba tokenizer
-(determinism + dictionary-drift rejection) and the projection row computation
-(body linearization per payload_kind incl. raw_html exclusion, and the
-header_row_candidate diagnostic).
+and source-bound SearchAtom replay. Body fields are declared by the unit source
+projection; they are never discovered by recursively walking payload JSON.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 import unittest
-from unittest import mock
 
 from disclosure_anchor.adapters.retrieval import tokenizer
+from disclosure_anchor.application.contracts.unit_source_projection import (
+    SearchTargetContractError,
+    search_text_values,
+)
 from disclosure_anchor.application.use_cases.build_search_projection import (
     compute_search_projection_row,
-    header_row_candidate,
-    linearize_body,
+)
+from tests.unit.test_unit_builder import (
+    _build,
+    _element,
+    _sample_share_change,
 )
 
 _BUILT_AT = datetime(2026, 7, 17, tzinfo=timezone.utc)
 
 
+def _search_locator(
+    *,
+    projection_kind: str,
+    projection_target: str,
+    targets: list[tuple[str, str]],
+) -> dict[str, object]:
+    return {
+        "source_projection": {
+            "version": "unit-source-projection.v4",
+            "payload": {
+                "kind": projection_kind,
+                "sources": [{"source": {}, "field": {}}],
+                "target_field": projection_target,
+                "transform": "test",
+            },
+            "heading_path": [],
+            "structured": [
+                {
+                    "kind": "derived_field",
+                    "source": {},
+                    "target_field": target_field,
+                    "transform": "identity.v1",
+                }
+                for target_field, role in targets
+                if role == "structured"
+            ],
+            "provenance": [],
+            "search_targets": [target_field for target_field, _role in targets],
+            "search_atoms": [],
+            "physical_context": None,
+        }
+    }
+
+
 class TokenizerTests(unittest.TestCase):
-    def test_tokenize_is_deterministic(self) -> None:
-        first = tokenizer.tokenize("应收账款账龄分析")
-        second = tokenizer.tokenize("应收账款账龄分析")
+    def test_index_and_query_analyzers_are_deterministic(self) -> None:
+        first = tokenizer.index_word_tokens("应收账款账龄分析")
+        second = tokenizer.index_word_tokens("应收账款账龄分析")
         self.assertEqual(first, second)
         self.assertTrue(first)
-
-    def test_tokenize_normalizes_width_and_case_and_empty(self) -> None:
-        # NFKC folds full-width forms; casefold lowercases; blank -> "".
-        self.assertEqual(tokenizer.tokenize("１２３"), tokenizer.tokenize("123"))
-        self.assertIn("abc", tokenizer.tokenize("ABC def").split())
-        self.assertEqual(tokenizer.tokenize("   "), "")
-
-    def test_tokenize_rejects_dictionary_drift(self) -> None:
-        # Reset the module cache so the pinned-fingerprint check re-runs, then
-        # force a sha mismatch: the tokenizer must fail loudly, not segment.
-        tokenizer._tokenizer = None
-        try:
-            with mock.patch.object(tokenizer, "_DICT_SHA256", "0" * 64):
-                with self.assertRaises(tokenizer.RetrievalDictionaryError):
-                    tokenizer.tokenize("应收账款")
-        finally:
-            # Drop the (unbuilt) cache so later tests reload against the real sha.
-            tokenizer._tokenizer = None
-
-
-class QuerySynonymTests(unittest.TestCase):
-    def test_shipped_synonym_file_loads_against_pinned_tokenizer(self) -> None:
-        expansion = tokenizer._load_synonyms()
-        self.assertIn("年报", expansion)
-        self.assertIn("年度报告", expansion["年报"])
-
-    def test_equivalence_group_expands_both_directions(self) -> None:
         self.assertEqual(
-            tokenizer.build_search_tsquery("分红"),
-            "('分红' | '利润分配' | '分派')",
+            tokenizer.query_word_tokens("应收账款账龄分析"),
+            tokenizer.query_word_tokens("应收账款账龄分析"),
         )
-        self.assertIn("'分红'", tokenizer.build_search_tsquery("利润分配"))
 
-    def test_directional_rule_is_one_way(self) -> None:
-        expanded = tokenizer.build_search_tsquery("派息")
-        self.assertIn("'分红'", expanded)
-        self.assertNotIn("'派息'", tokenizer.build_search_tsquery("分红"))
+    def test_analyzers_normalize_width_and_case_and_empty(self) -> None:
+        # NFKC folds full-width forms; casefold lowercases; blank -> "".
+        self.assertEqual(
+            tokenizer.normalize_search_text("ＡＢＣ％ＤＥＦ＿ＧＨ＼Ｉ"),
+            "abc%def_gh\\i",
+        )
+        self.assertEqual(
+            tokenizer.index_word_tokens("１２３"),
+            tokenizer.index_word_tokens("123"),
+        )
+        self.assertIn("abc", tokenizer.index_word_tokens("ABC def").split())
+        self.assertEqual(tokenizer.index_word_tokens("   "), "")
+        self.assertEqual(tokenizer.query_word_tokens("   "), ())
 
-    def test_multi_lexeme_query_terms_and_conjunction(self) -> None:
-        # 商誉减值 segments to two lexemes with no aliases: plain AND, which
-        # already matches 商誉减值准备 through the shared lexemes.
+    def test_search_mode_index_contains_exact_query_subterms(self) -> None:
+        indexed = set(
+            tokenizer.index_word_tokens("股份变动及股东情况").split()
+        )
+        for query in ("股份变动", "股东情况"):
+            self.assertLessEqual(
+                set(tokenizer.query_word_tokens(query)),
+                indexed,
+            )
+
+    def test_query_groups_have_no_content_alias_expansion(self) -> None:
+        self.assertEqual(
+            tokenizer.build_search_tsquery_groups("商誉减值"),
+            ("'商誉'", "'减值'"),
+        )
         self.assertEqual(
             tokenizer.build_search_tsquery("商誉减值"), "'商誉' & '减值'"
         )
+        self.assertEqual(tokenizer.build_search_tsquery_groups("  "), ())
         self.assertEqual(tokenizer.build_search_tsquery("  "), "")
-
-    def test_synonym_loading_is_lock_order_independent(self) -> None:
-        # Regression: loading synonyms before
-        # any tokenize call must not deadlock on the tokenizer lock.
-        import threading
-
-        tokenizer._synonyms = None
-        tokenizer._tokenizer = None
-        loaded: list[dict] = []
-        worker = threading.Thread(
-            target=lambda: loaded.append(tokenizer._load_synonyms()),
-            daemon=True,
+        self.assertEqual(tokenizer.build_search_tsquery("半年报"), "'半年报'")
+        self.assertNotIn("半年度", tokenizer.build_search_tsquery("半年报"))
+        self.assertIn(
+            "'\\\\'",
+            tokenizer.build_search_tsquery_groups("ＡＢＣ％ＤＥＦ＿ＧＨ＼Ｉ"),
         )
-        worker.start()
-        worker.join(timeout=30)
-        self.assertFalse(worker.is_alive(), "synonym loading deadlocked")
-        self.assertTrue(loaded and loaded[0])
-
-    def test_parse_rejects_multi_lexeme_and_degenerate_rules(self) -> None:
-        with self.assertRaises(tokenizer.RetrievalSynonymError):
-            tokenizer.parse_synonyms("回购, 股份回购\n")
-        with self.assertRaises(tokenizer.RetrievalSynonymError):
-            tokenizer.parse_synonyms("年报\n")
-        with self.assertRaises(tokenizer.RetrievalSynonymError):
-            tokenizer.parse_synonyms("年报, 季报 => 季度\n")
-        with self.assertRaises(tokenizer.RetrievalSynonymError):
-            tokenizer.parse_synonyms(
-                "\n".join(f"年报, 年度报告  # {index}" for index in range(41))
-            )
 
 
-class LinearizeBodyTests(unittest.TestCase):
-    def test_text_body_is_payload_text(self) -> None:
-        self.assertEqual(linearize_body("text", {"text": "货币资金明细"}), "货币资金明细")
+class SearchTargetTests(unittest.TestCase):
+    def test_text_has_one_explicit_payload_target(self) -> None:
+        (unit,), _ = _build([_element(0, text="货币资金明细")])
 
-    def test_table_body_excludes_raw_html(self) -> None:
-        body = linearize_body(
-            "table",
-            {
-                "caption": ["应收账款账龄"],
-                "unit": "元",
-                "headers": ["账龄", "金额"],
-                "rows": [["1年以内", "100"], ["1-2年", "50"]],
-                "notes": ["注1"],
-                "raw_html": "<table><td>RAWHTMLSENTINEL</td></table>",
-            },
+        self.assertEqual(
+            search_text_values(
+                payload_kind=unit.payload_kind,
+                payload=unit.payload,
+                artifact_locator=unit.artifact_locator,
+            ),
+            ("货币资金明细",),
         )
-        for token in ["应收账款账龄", "元", "账龄", "金额", "1年以内", "100", "注1"]:
-            self.assertIn(token, body)
-        self.assertNotIn("RAWHTMLSENTINEL", body)
-        self.assertNotIn("<table>", body)
-
-    def test_mixed_parts_linearize_in_order_recursively(self) -> None:
-        body = linearize_body(
-            "mixed",
-            {
-                "semantic_type": "section",
-                "parts": [
-                    {"kind": "text", "text": "文本部分ALPHA"},
-                    {
-                        "kind": "table",
-                        "headers": ["列"],
-                        "rows": [["值BETA"]],
-                        "raw_html": "<b>RAWSENTINEL</b>",
-                    },
-                    {"kind": "image", "caption": "图注GAMMA", "context": "上下文DELTA"},
-                ],
-            },
+        graph = unit.artifact_locator["source_projection"]
+        self.assertEqual(
+            graph["search_targets"],
+            ["payload.text"],
         )
-        for token in ["文本部分ALPHA", "列", "值BETA", "图注GAMMA", "上下文DELTA"]:
-            self.assertIn(token, body)
-        self.assertNotIn("RAWSENTINEL", body)
-
-    def test_unknown_payload_kind_is_empty(self) -> None:
-        self.assertEqual(linearize_body("qa", {"parts": [{"text": "x"}]}), "")
-
-
-class HeaderRowCandidateTests(unittest.TestCase):
-    def test_positive_td_only_numeric_table(self) -> None:
-        self.assertTrue(
-            header_row_candidate(
-                "table",
-                {
-                    "headers": [],
-                    "rows": [
-                        ["应收账款", "期末余额", "期初余额"],
-                        ["1年以内", "100", "90"],
-                        ["1-2年", "50.5", "40"],
+        for typed_element in (
+            _element(
+                0,
+                text="第一项",
+                raw_kind="list",
+                list_items=["第一项"],
+                list_subtype="ordered",
+            ),
+            _element(
+                0,
+                text="print('x')",
+                raw_kind="code",
+                code_body="print('x')",
+                code_caption=[],
+                code_footnote=[],
+            ),
+        ):
+            with self.subTest(raw_kind=typed_element["raw_kind"]):
+                (typed_unit,), _ = _build([typed_element])
+                self.assertEqual(
+                    typed_unit.artifact_locator["source_projection"][
+                        "search_targets"
                     ],
-                },
+                    ["payload.text"],
+                )
+
+    def test_table_indexes_only_source_owned_evidence_fields(self) -> None:
+        (unit,), _ = _build(
+            [
+                _element(
+                    0,
+                    kind="table",
+                    raw_kind="table",
+                    table_caption=["应收账款账龄"],
+                    table_footnote=["注1"],
+                    table={
+                        "headers": ["账龄", "金额"],
+                        "rows": [["1年以内", "100"]],
+                        "merged_cells": [],
+                    },
+                )
+            ]
+        )
+        unit.payload.update(
+            {
+                "context": "CONTEXT_SENTINEL",
+                "metadata": "METADATA_SENTINEL",
+                "raw_html": "<b>RAW_SENTINEL</b>",
+            }
+        )
+        body = " ".join(
+            search_text_values(
+                payload_kind=unit.payload_kind,
+                payload=unit.payload,
+                artifact_locator=unit.artifact_locator,
             )
         )
 
-    def test_negative_kv_form_first_row_has_numeric_value(self) -> None:
-        self.assertFalse(
-            header_row_candidate(
-                "table",
+        for expected in ("应收账款账龄", "账龄", "金额", "1年以内", "100", "注1"):
+            self.assertIn(expected, body)
+        for excluded in (
+            "CONTEXT_SENTINEL",
+            "METADATA_SENTINEL",
+            "RAW_SENTINEL",
+            str(unit.payload.get("unit") or ""),
+        ):
+            if excluded:
+                self.assertNotIn(excluded, body)
+
+    def test_mixed_container_has_no_targets_and_replays_parts_in_order(self) -> None:
+        elements, headings = _sample_share_change()
+        units, _ = _build(elements, headings=headings)
+        (unit,) = units
+
+        self.assertEqual(
+            unit.artifact_locator["source_projection"]["search_targets"],
+            [],
+        )
+        values = search_text_values(
+            payload_kind="mixed",
+            payload=unit.payload,
+            artifact_locator=unit.artifact_locator,
+        )
+        self.assertIn("单位：股", " ".join(values))
+        self.assertIn("股份总数", " ".join(values))
+        row = compute_search_projection_row(
+            asset_id="ua_mixed_atoms",
+            title=unit.title,
+            heading_path=unit.heading_path,
+            payload_kind=unit.payload_kind,
+            payload=unit.payload,
+            semantic_keys=unit.semantic_keys,
+            artifact_locator=unit.artifact_locator,
+            built_at=_BUILT_AT,
+        )
+        self.assertEqual(
+            row["body_atoms"],
+            tuple(
+                tokenizer.normalize_search_text(value)
+                for value in values
+                if tokenizer.normalize_search_text(value).strip()
+            ),
+        )
+        self.assertNotIn(" ".join(values), row["body_atoms"])
+
+    def test_native_retrieval_run_rejoins_only_proved_split_words(self) -> None:
+        parts = [
+            {
+                "kind": "text",
+                "text": text,
+                "artifact_locator": _search_locator(
+                    projection_kind="text_identity_exact",
+                    projection_target="payload.text",
+                    targets=[("payload.text", "payload")],
+                ),
+            }
+            for text in ("股", "份变动")
+        ]
+        locator = _search_locator(
+            projection_kind="container",
+            projection_target="payload.parts",
+            targets=[],
+        )
+        locator["source_projection"]["search_atoms"] = [
+            {
+                "boundary": {
+                    "kind": "source_evidence_run",
+                    "source_evidence_sha256": "sha256:" + "a" * 64,
+                    "page_idx": 0,
+                    "run_index": 0,
+                },
+                "target_fields": [
+                    "payload.parts.0.text",
+                    "payload.parts.1.text",
+                ],
+                "transform": "exact_concat.v1",
+            }
+        ]
+        payload = {"semantic_type": "document", "parts": parts}
+
+        self.assertEqual(
+            search_text_values(
+                payload_kind="mixed",
+                payload=payload,
+                artifact_locator=locator,
+            ),
+            ("股份变动",),
+        )
+        row = compute_search_projection_row(
+            asset_id="ua_native_split_run",
+            title=None,
+            heading_path=[],
+            payload_kind="mixed",
+            payload=payload,
+            semantic_keys=["document_content"],
+            artifact_locator=locator,
+            built_at=_BUILT_AT,
+        )
+        self.assertEqual(row["body_atoms"], ("股份变动",))
+
+    def test_grouped_search_atoms_reject_unproved_or_reordered_joins(self) -> None:
+        parts = [
+            {
+                "kind": "text",
+                "text": text,
+                "artifact_locator": _search_locator(
+                    projection_kind="text_identity_exact",
+                    projection_target="payload.text",
+                    targets=[("payload.text", "payload")],
+                ),
+            }
+            for text in ("甲", "乙", "丙")
+        ]
+        payload = {"semantic_type": "document", "parts": parts}
+        boundary = {
+            "kind": "source_evidence_run",
+            "source_evidence_sha256": "sha256:" + "a" * 64,
+            "page_idx": 0,
+            "run_index": 0,
+        }
+        invalid_atoms = (
+            [
                 {
-                    "headers": [],
-                    "rows": [["证券代码", "600000"], ["注册资本", "1000"]],
+                    "boundary": {"kind": "source_occurrence_singleton"},
+                    "target_fields": [
+                        "payload.parts.0.text",
+                        "payload.parts.1.text",
+                    ],
+                    "transform": "exact_concat.v1",
                 },
-            )
-        )
-
-    def test_negative_table_with_real_headers(self) -> None:
-        self.assertFalse(
-            header_row_candidate(
-                "table",
                 {
-                    "headers": ["科目", "金额"],
-                    "rows": [["货币资金", "100"], ["应收账款", "50"]],
+                    "boundary": {"kind": "source_occurrence_singleton"},
+                    "target_fields": ["payload.parts.2.text"],
+                    "transform": "exact_concat.v1",
                 },
+            ],
+            [
+                {
+                    "boundary": boundary,
+                    "target_fields": [
+                        "payload.parts.0.text",
+                        "payload.parts.2.text",
+                    ],
+                    "transform": "exact_concat.v1",
+                },
+                {
+                    "boundary": {"kind": "source_occurrence_singleton"},
+                    "target_fields": ["payload.parts.1.text"],
+                    "transform": "exact_concat.v1",
+                },
+            ],
+            [
+                {
+                    "boundary": boundary,
+                    "target_fields": ["payload.parts.0.text"],
+                    "transform": "exact_concat.v1",
+                },
+                {
+                    "boundary": boundary,
+                    "target_fields": [
+                        "payload.parts.1.text",
+                        "payload.parts.2.text",
+                    ],
+                    "transform": "exact_concat.v1",
+                },
+            ],
+        )
+        for search_atoms in invalid_atoms:
+            with self.subTest(search_atoms=search_atoms):
+                locator = _search_locator(
+                    projection_kind="container",
+                    projection_target="payload.parts",
+                    targets=[],
+                )
+                locator["source_projection"]["search_atoms"] = search_atoms
+                with self.assertRaises(SearchTargetContractError):
+                    search_text_values(
+                        payload_kind="mixed",
+                        payload=payload,
+                        artifact_locator=locator,
+                    )
+
+    def test_unproved_or_unknown_target_fails_closed(self) -> None:
+        (unit,), _ = _build([_element(0, text="原文")])
+        graph = unit.artifact_locator["source_projection"]
+        graph["search_targets"][0] = "payload.context"
+        unit.payload["context"] = "伪上下文"
+
+        with self.assertRaises(SearchTargetContractError):
+            search_text_values(
+                payload_kind="text",
+                payload=unit.payload,
+                artifact_locator=unit.artifact_locator,
             )
-        )
-
-    def test_negative_single_row_table(self) -> None:
-        self.assertFalse(
-            header_row_candidate("table", {"headers": [], "rows": [["应收账款", "账龄"]]})
-        )
-
-    def test_negative_all_text_table_has_no_numeric_data(self) -> None:
-        self.assertFalse(
-            header_row_candidate(
-                "table",
-                {"headers": [], "rows": [["项目", "说明"], ["政策", "描述"]]},
-            )
-        )
-
-    def test_negative_non_table_kind(self) -> None:
-        self.assertFalse(header_row_candidate("text", {"rows": [["a"], ["1"]]}))
+        for unsupported_kind in ("qa", "unknown"):
+            with self.subTest(payload_kind=unsupported_kind):
+                with self.assertRaises(SearchTargetContractError):
+                    search_text_values(
+                        payload_kind=unsupported_kind,
+                        payload=unit.payload,
+                        artifact_locator=unit.artifact_locator,
+                    )
 
 
 class ComputeRowTests(unittest.TestCase):
+    def test_empty_visual_routes_by_structure_without_invented_body_text(self) -> None:
+        row = compute_search_projection_row(
+            asset_id="ua_empty_visual",
+            title="第一节 经营情况",
+            heading_path=["第一节 经营情况", "一、收入分析"],
+            payload_kind="text",
+            payload={
+                "image_ref": "images/" + "d" * 64 + ".png",
+                "caption": "",
+                "visual_kind": "image",
+                "context": "UNBOUND_CONTEXT",
+            },
+            semantic_keys=["business_overview"],
+            artifact_locator=_search_locator(
+                projection_kind="image_identity",
+                projection_target="payload.image_ref",
+                targets=[],
+            ),
+            built_at=_BUILT_AT,
+        )
+
+        self.assertTrue(row["title_tokens"])
+        self.assertTrue(row["path_tokens"])
+        self.assertEqual(row["body_tokens"], "")
+        self.assertEqual(row["key_tokens"], "business_overview")
+        self.assertNotIn("images", row["body_tokens"])
+        self.assertNotIn("unbound_context", row["body_tokens"])
+
+        (visual_unit,), _ = _build(
+            [
+                _element(
+                    0,
+                    kind="image",
+                    raw_kind="image",
+                    text="唯一图内事实VIS123",
+                    image_path="images/source.png",
+                    image_caption=["图标题CAPTION"],
+                    image_footnote=["唯一脚注NOTE456"],
+                )
+            ]
+        )
+        visual_unit.payload["context"] = "UNBOUND_CONTEXT"
+        visual_row = compute_search_projection_row(
+            asset_id="ua_bound_visual",
+            title=None,
+            heading_path=[],
+            payload_kind="text",
+            payload=visual_unit.payload,
+            semantic_keys=[],
+            artifact_locator=visual_unit.artifact_locator,
+            built_at=_BUILT_AT,
+        )
+        for expected in ("caption", "vis123", "note456"):
+            self.assertIn(expected, visual_row["body_tokens"])
+        self.assertNotIn("unbound_context", visual_row["body_tokens"])
+
     def test_row_fields_exclude_generated_tsv_and_exclude_raw_html(self) -> None:
+        (unit,), _ = _build(
+            [
+                _element(
+                    0,
+                    kind="table",
+                    raw_kind="table",
+                    table_caption=["现金流量表补充资料"],
+                    table_footnote=[],
+                    table={
+                        "headers": ["项目"],
+                        "rows": [["经营活动", "100"]],
+                        "merged_cells": [],
+                    },
+                )
+            ]
+        )
+        unit.payload["raw_html"] = "<x>NOPE</x>"
         row = compute_search_projection_row(
             asset_id="ua_x",
             title="现金流量表",
             heading_path=["第八节 财务报告", "现金流量表补充资料"],
-            payload_kind="table",
-            payload={
-                "caption": ["现金流量表补充资料"],
-                "unit": "元",
-                "headers": ["项目"],
-                "rows": [["经营活动", "100"]],
-                "notes": [],
-                "raw_html": "<x>NOPE</x>",
-            },
+            payload_kind=unit.payload_kind,
+            payload=unit.payload,
             semantic_keys=["cash_flow_statement", "financial_report_chapter"],
+            artifact_locator=unit.artifact_locator,
             built_at=_BUILT_AT,
         )
         self.assertEqual(row["asset_id"], "ua_x")
@@ -234,6 +491,15 @@ class ComputeRowTests(unittest.TestCase):
         self.assertFalse(row["header_row_candidate"])
         self.assertEqual(row["built_at"], _BUILT_AT)
         self.assertNotIn("search_tsv", row)
+        self.assertEqual(
+            row["body_atoms"],
+            (
+                "现金流量表补充资料",
+                "项目",
+                "经营活动",
+                "100",
+            ),
+        )
         self.assertTrue(row["title_tokens"])
         self.assertNotIn("nope", row["body_tokens"])
 
@@ -245,6 +511,11 @@ class ComputeRowTests(unittest.TestCase):
             payload_kind="text",
             payload={"text": ""},
             semantic_keys=None,
+            artifact_locator=_search_locator(
+                projection_kind="text_identity",
+                projection_target="payload.text",
+                targets=[("payload.text", "payload")],
+            ),
             built_at=_BUILT_AT,
         )
         self.assertEqual(row["title_text"], "")
@@ -252,8 +523,81 @@ class ComputeRowTests(unittest.TestCase):
         self.assertEqual(row["title_tokens"], "")
         self.assertEqual(row["path_tokens"], "")
         self.assertEqual(row["body_tokens"], "")
+        self.assertEqual(row["body_atoms"], ())
         self.assertEqual(row["key_tokens"], "")
         self.assertEqual(row["retrieval_rules_version"], tokenizer.RETRIEVAL_RULES_VERSION)
+
+    def test_structural_section_keeps_table_and_explanation_retrievable(self) -> None:
+        elements, headings = _sample_share_change()
+        elements.extend(
+            [
+                _element(5, text="股权激励行权导致股本增加。"),
+                _element(6, text="股份变动的批准情况\n董事会审议通过。"),
+            ]
+        )
+        for heading in headings:
+            heading["section_span"][1] = 6
+        units, _ = _build(
+            elements,
+            headings=headings,
+            filing_type="semiannual_report",
+        )
+        self.assertTrue(units)
+        rows = [
+            compute_search_projection_row(
+                asset_id=f"ua_share_changes_{index}",
+                title=unit.title,
+                heading_path=unit.heading_path,
+                payload_kind=unit.payload_kind,
+                payload=unit.payload,
+                semantic_keys=unit.semantic_keys,
+                artifact_locator=unit.artifact_locator,
+                built_at=_BUILT_AT,
+            )
+            for index, unit in enumerate(units)
+        ]
+        for row in rows:
+            self.assertEqual(row["title_text"], "1、股份变动情况")
+            self.assertEqual(
+                row["heading_path_text"],
+                "第七节 股份变动及股东情况 > 一、股份变动情况 > 1、股份变动情况",
+            )
+        body = "\n".join(
+            " ".join(
+                search_text_values(
+                    payload_kind=unit.payload_kind,
+                    payload=unit.payload,
+                    artifact_locator=unit.artifact_locator,
+                )
+            )
+            for unit in units
+        )
+        for evidence in (
+            "单位：股",
+            "股份总数",
+            "843,978,741",
+            "股权激励行权导致股本增加",
+            "董事会审议通过",
+        ):
+            self.assertIn(evidence, body)
+
+        for query, channel in (
+            ("股份变动情况", "title_tokens"),
+            ("第七节 股份变动及股东情况", "path_tokens"),
+            ("股份总数", "body_tokens"),
+            ("股份变动的原因", "body_tokens"),
+            ("股权激励行权股本增加", "body_tokens"),
+            ("股份变动的批准情况", "body_tokens"),
+            ("董事会审议通过", "body_tokens"),
+        ):
+            query_tokens = set(tokenizer.query_word_tokens(query))
+            self.assertTrue(
+                any(
+                    query_tokens <= set(str(row[channel]).split())
+                    for row in rows
+                ),
+                (query, channel, rows),
+            )
 
 
 if __name__ == "__main__":

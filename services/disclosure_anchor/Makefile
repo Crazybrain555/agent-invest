@@ -25,8 +25,9 @@ WITH_ENV = set -a; for f in worker.env cninfo.env; do [ -r "$(DISCLOSURE_ENV_DIR
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	test-mineru-smoke lint typecheck agent-check api archive pg-init pg-start pg-stop \
-	pg-status db-create migrate register parse build-units publish process rebuild-units rebuild-search-projection prune-history load-rules config-check track track-status track-export untrack purge-company sync worker-once worker-loop doctor-full wipe-test-data \
-	worker-status worker-restart gc-orphans audit-unmapped-codes audit-boilerplate audit-headings audit-unit-corpus export-unit-corpus-manifest audit-weekly install-ops-launchd
+	pg-status db-create migrate register parse build-units publish process rebuild-units rebuild-search-projection retire-derived load-rules config-check track track-status track-export untrack purge-company sync worker-once worker-loop doctor-full \
+	worker-status worker-restart gc-orphans audit-unmapped-codes audit-unit-corpus export-unit-corpus-manifest audit-weekly install-ops-launchd export-reparse-manifest verify-reparse-manifest reparse-status reparse-corpus reset-derived-rehearse wipe-derived \
+	create-reset-backup prove-reset-backup purge-reset-trash purge-reset-trash-force
 
 doctor:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -130,12 +131,15 @@ rebuild-units:
 rebuild-search-projection:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline rebuild-search-projection $(if $(filter YES,$(ALL)),--all)
 
-# TEST-PHASE ONLY: delete superseded (non-active) runs + their units + events,
-# so the DB shows exactly the current generation. Production retention is a
-# separate post-launch decision.
-prune-history:
-	@test "$(PRUNE)" = "YES" || (echo 'refusing: set PRUNE=YES to confirm' && exit 2)
-	./scripts/prune_history.sh
+# Review-first, DB-first retirement. The first invocation writes a manifest;
+# APPLY=YES requires that exact reviewed manifest and atomically removes only
+# its still-retirable DB ownership. Files are collected later by gc-orphans.
+retire-derived:
+	@test -n "$(BEFORE)" || (echo 'usage: make retire-derived BEFORE=<ISO8601> [MANIFEST=/path/retire.json] [APPLY=YES]' && exit 2)
+	@test "$(APPLY)" != "YES" -o -n "$(MANIFEST)" || (echo 'APPLY=YES requires MANIFEST=/path/to/reviewed-manifest.json' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/retire_derived_generation.py \
+		--before "$(BEFORE)" $(if $(MANIFEST),--manifest "$(MANIFEST)") \
+		$(if $(filter YES,$(APPLY)),--apply)
 
 # Load class_map.json + facet_map.json + filing_type_map.json into
 # disclosure_core.classification_rule.
@@ -168,8 +172,8 @@ untrack:
 	@test -n "$(CODES)" || (echo 'usage: make untrack CODES=600887[,601318]' && exit 2)
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline untrack --codes "$(CODES)"
 
-# TEST-PHASE ONLY: cascade-delete ONE company (rows + files) — the
-# single-company version of wipe-test-data, for undoing mistakes/residue.
+# TEST-PHASE ONLY: corpus-gated cascade delete of one company (rows + files)
+# for undoing a specifically identified mistake or test residue.
 purge-company:
 	@test "$(PURGE)" = "YES" || (echo 'usage: make purge-company CODE=600887 PURGE=YES  (test-phase only!)' && exit 2)
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline purge-company --code "$(CODE)" $(if $(EXCHANGE),--exchange "$(EXCHANGE)") --yes
@@ -201,8 +205,9 @@ worker-restart:
 	@echo "[note] code/env restarted; plist was not reloaded"
 	@echo "[note] run 'make doctor-full' and watch one round before walking away"
 
-# Orphan parser-artifact inventory (dry-run; APPLY=YES deletes with an audit
-# manifest). Raw documents are never touched.
+# Orphan derived-artifact inventory for parser output, normalized IR, and unit
+# snapshots (dry-run; APPLY=YES deletes with an audit manifest). Raw documents
+# are never touched.
 gc-orphans:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/gc_orphan_artifacts.py $(if $(filter YES,$(APPLY)),--apply)
 
@@ -211,12 +216,6 @@ gc-orphans:
 audit-unmapped-codes:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/audit_unmapped_codes.py
 
-audit-boilerplate:
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/audit_boilerplate_candidates.py
-
-audit-headings:
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/audit_heading_coverage.py
-
 # Deterministic file-only replay gate. Export is a separate read-only DB step
 # so every audit is bound to one manifest and exact IR file hashes.
 export-unit-corpus-manifest:
@@ -224,11 +223,11 @@ export-unit-corpus-manifest:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/export_unit_corpus_manifest.py --output "$(OUT)"
 
 audit-unit-corpus:
-	@test -n "$(MANIFEST)" -a -n "$(OUT)" || (echo 'usage: make audit-unit-corpus MANIFEST=/path/manifest.jsonl OUT=/private/tmp/audit-dir [WORKERS=4]' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/audit_unit_corpus.py --manifest "$(MANIFEST)" --out "$(OUT)" $(if $(WORKERS),--workers "$(WORKERS)")
+	@test -n "$(MANIFEST)" -a -n "$(OUT)" || (echo 'usage: make audit-unit-corpus MANIFEST=/path/manifest.jsonl OUT=/private/tmp/audit-dir [WORKERS=4] [LIMIT=N] [SOURCE_REPLAY=YES]' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/audit_unit_corpus.py --manifest "$(MANIFEST)" --out "$(OUT)" $(if $(WORKERS),--workers "$(WORKERS)") $(if $(LIMIT),--limit "$(LIMIT)") $(if $(filter YES,$(SOURCE_REPLAY)),--source-replay)
 
-# Weekly sweep: run all three audits; each exits nonzero on a real finding.
-audit-weekly: audit-unmapped-codes audit-boilerplate audit-headings
+# Weekly sweep keeps only audits that do not propose lexical parsing rules.
+audit-weekly: audit-unmapped-codes
 
 # Install the ops launchd jobs (postgres boot autostart + daily doctor).
 install-ops-launchd:
@@ -237,10 +236,57 @@ install-ops-launchd:
 doctor-full:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor --full
 
-wipe-test-data:
-	@test "$(WIPE)" = "YES" || (echo 'usage: make wipe-test-data WIPE=YES  (test-phase only!)' && exit 2)
-	$(WITH_ENV) WIPE=YES ./scripts/wipe_test_data.sh
+export-reparse-manifest:
+	@test -n "$(OUT)" || (echo 'usage: make export-reparse-manifest OUT=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reparse_corpus.py \
+		--export-manifest "$(OUT)"
+
+verify-reparse-manifest:
+	@test -n "$(MANIFEST)" || (echo 'usage: make verify-reparse-manifest MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reparse_corpus.py \
+		--verify --manifest "$(MANIFEST)"
+
+create-reset-backup:
+	@test -n "$(MANIFEST)" -a -n "$(BACKUP)" || (echo 'usage: make create-reset-backup MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl BACKUP=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump (one bundle dir holds manifest+plan+backup)' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/create_corpus_reset_backup.py \
+		--manifest "$(MANIFEST)" --backup "$(BACKUP)" \
+		--pg-dump "$(PG_BIN)/pg_dump"
+
+prove-reset-backup:
+	@test -n "$(MANIFEST)" -a -n "$(BACKUP)" || (echo 'usage: make prove-reset-backup MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl BACKUP=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump (one bundle dir holds manifest+plan+backup)' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/prove_corpus_reset_backup.py \
+		--manifest "$(MANIFEST)" --backup "$(BACKUP)" \
+		--pg-restore "$(PG_BIN)/pg_restore"
+
+reparse-status:
+	@test -n "$(MANIFEST)" -a -n "$(RESET_RECEIPT)" || (echo 'usage: make reparse-status MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl RESET_RECEIPT=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump.reset-receipt.json' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reparse_corpus.py \
+		--status --manifest "$(MANIFEST)" \
+		--reset-receipt "$(RESET_RECEIPT)"
+
+purge-reset-trash:
+	@test -n "$(MANIFEST)" -a -n "$(RESET_RECEIPT)" || (echo 'usage: make purge-reset-trash MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl RESET_RECEIPT=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump.reset-receipt.json [PURGE=YES]  (gated: refuses unless reparse --status exits 0; without PURGE=YES only reports size)' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reparse_corpus.py \
+		--purge-trash --manifest "$(MANIFEST)" \
+		--reset-receipt "$(RESET_RECEIPT)" $(if $(filter YES,$(PURGE)),--yes,)
+
+purge-reset-trash-force:
+	@test -n "$(MANIFEST)" || (echo 'usage: make purge-reset-trash-force MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl [PURGE=YES]  (skips the verified-generation gate and destroys the only rollback material; without PURGE=YES only reports size)' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reparse_corpus.py \
+		--purge-trash --force --manifest "$(MANIFEST)" $(if $(filter YES,$(PURGE)),--yes,)
+
+reparse-corpus:
+	@test -n "$(MANIFEST)" -a -n "$(RESET_RECEIPT)" || (echo 'usage: make reparse-corpus MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl RESET_RECEIPT=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump.reset-receipt.json' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reparse_corpus.py \
+		--run --manifest "$(MANIFEST)" \
+		--reset-receipt "$(RESET_RECEIPT)"
+
+reset-derived-rehearse:
+	@test -n "$(MANIFEST)" -a -n "$(BACKUP)" || (echo 'usage: make reset-derived-rehearse MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl BACKUP=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump (both in the same bundle dir)' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reset_derived_corpus.py \
+		--manifest "$(MANIFEST)" --backup "$(BACKUP)" --rehearse
 
 wipe-derived:
-	@test "$(WIPE)" = "YES" || (echo 'usage: make wipe-derived WIPE=YES  (keeps raw PDFs, wipes parse/units/DB derived state)' && exit 2)
-	$(WITH_ENV) WIPE=YES ./scripts/wipe_derived_data.sh
+	@test "$(WIPE)" = "YES" -a -n "$(MANIFEST)" -a -n "$(BACKUP)" || (echo 'usage: make wipe-derived WIPE=YES MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl BACKUP=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump (both in the same bundle dir)' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reset_derived_corpus.py \
+		--manifest "$(MANIFEST)" --backup "$(BACKUP)" --apply

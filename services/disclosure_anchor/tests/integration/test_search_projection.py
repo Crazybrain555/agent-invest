@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import os
 import subprocess
 import sys
@@ -13,6 +14,10 @@ import sqlalchemy
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from disclosure_anchor.application.use_cases import (
+    build_search_projection as projection_module,
+)
+from disclosure_anchor.application.worker import queries as worker_queries
 from disclosure_anchor.adapters.db.postgres.models import (
     Company,
     Document,
@@ -24,10 +29,72 @@ from disclosure_anchor.adapters.retrieval import tokenizer
 from disclosure_anchor.application.use_cases.build_search_projection import (
     BuildSearchProjection,
     BuildSearchProjectionCommand,
+    SearchProjectionSafetyError,
 )
 from tests.integration._support import engine_or_skip
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _text_search_locator(order_index: int) -> dict[str, object]:
+    return {
+        "source_projection": {
+            "version": "unit-source-projection.v4",
+            "payload": {
+                "kind": "text_identity",
+                "sources": [
+                    {
+                        "source": {
+                            "kind": "normalized_ir_element",
+                            "ir_id": f"ir_sp_{order_index}",
+                            "source_item_index": order_index,
+                            "order_index": order_index,
+                        },
+                        "field": {"kind": "text"},
+                    }
+                ],
+                "target_field": "payload.text",
+                "transform": "clean_text.v1",
+            },
+            "heading_path": [],
+            "structured": [],
+            "provenance": [],
+            "search_targets": ["payload.text"],
+            "search_atoms": [],
+            "physical_context": None,
+        }
+    }
+
+
+def _table_search_locator(order_index: int) -> dict[str, object]:
+    source = {
+        "kind": "normalized_ir_element",
+        "ir_id": f"ir_sp_{order_index}",
+        "source_item_index": order_index,
+        "order_index": order_index,
+    }
+    return {
+        "source_projection": {
+            "version": "unit-source-projection.v4",
+            "payload": {
+                "kind": "table_identity",
+                "sources": [{"source": source, "field": {"kind": "table"}}],
+                "target_field": "payload",
+                "transform": "table_identity.v1",
+            },
+            "heading_path": [],
+            "structured": [],
+            "provenance": [],
+            "search_targets": [
+                "payload.caption",
+                "payload.headers",
+                "payload.rows",
+                "payload.notes",
+            ],
+            "search_atoms": [],
+            "physical_context": None,
+        }
+    }
 
 
 class SearchProjectionIntegrationTests(unittest.TestCase):
@@ -39,9 +106,7 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.class_engine = engine_or_skip()
         cls.addClassCleanup(cls.class_engine.dispose)
-        cls.temp_url = cls.class_engine.url.render_as_string(
-            hide_password=False
-        )
+        cls.temp_url = cls.class_engine.url.render_as_string(hide_password=False)
         cls.subprocess_env = {
             **os.environ,
             "DISCLOSURE_MIGRATION_DATABASE_URL": cls.temp_url,
@@ -67,17 +132,56 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
     def test_migration_0025_upgrade_downgrade_upgrade(self) -> None:
         self.addCleanup(self._restore_migration_head)
         self.assertTrue(self._table_exists("unit_search_projection"))
+        self.assertTrue(self._table_exists("unit_body_search_window"))
         self.assertTrue(self._view_exists("unit_search_projection_v1"))
+        self.assertTrue(self._view_exists("unit_body_search_windows_v1"))
+        self.assertTrue(self._view_exists("unit_search_atoms_v1"))
+        self.assertTrue(self._function_exists("search_tsvector_is_safe"))
+        parent_columns = self._view_columns("unit_search_projection_v1")
+        self.assertEqual(
+            parent_columns,
+            [
+                "asset_id",
+                "retrieval_rules_version",
+                "title_text",
+                "heading_path_text",
+                "title_tokens",
+                "path_tokens",
+                "body_tokens",
+                "key_tokens",
+                "header_row_candidate",
+                "built_at",
+                "search_tsv",
+            ],
+        )
 
         down = self._alembic("downgrade", "0024_reader_vocabulary_grants")
         self.assertEqual(down.returncode, 0, down.stderr[-500:])
         self.assertFalse(self._table_exists("unit_search_projection"))
+        self.assertFalse(self._table_exists("unit_body_search_window"))
         self.assertFalse(self._view_exists("unit_search_projection_v1"))
+        self.assertFalse(self._view_exists("unit_body_search_windows_v1"))
+        self.assertFalse(self._view_exists("unit_search_atoms_v1"))
+        self.assertFalse(self._function_exists("search_tsvector_is_safe"))
 
         up = self._alembic("upgrade", "head")
         self.assertEqual(up.returncode, 0, up.stderr[-500:])
         self.assertTrue(self._table_exists("unit_search_projection"))
+        self.assertTrue(self._table_exists("unit_body_search_window"))
         self.assertTrue(self._view_exists("unit_search_projection_v1"))
+        self.assertTrue(self._view_exists("unit_body_search_windows_v1"))
+        self.assertTrue(self._view_exists("unit_search_atoms_v1"))
+        self.assertTrue(self._function_exists("search_tsvector_is_safe"))
+        self.assertEqual(
+            self._view_columns("unit_search_atoms_v1"),
+            [
+                "asset_id",
+                "atom_index",
+                "atom_text",
+                "retrieval_rules_version",
+                "built_at",
+            ],
+        )
 
     def _restore_migration_head(self) -> None:
         restored = self._alembic("upgrade", "head")
@@ -88,6 +192,21 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
         suffix = os.urandom(4).hex()
         ids = self._seed_two_units(suffix)
         try:
+            with Session(self.engine) as session:
+                body_unit = session.get(DocumentUnit, ids["body_hit"])
+                assert body_unit is not None
+                body_unit.payload_kind = "table"
+                body_unit.payload = {
+                    "caption": "甲乙丙丁戊己庚辛",
+                    "headers": ["应收账款账龄分析"],
+                    "rows": [
+                        ["股份变动及股东情况"],
+                        ["ＡＢＣ％ＤＥＦ＿ＧＨ＼Ｉ"],
+                    ],
+                    "notes": [],
+                }
+                body_unit.artifact_locator = _table_search_locator(2)
+                session.commit()
             result = BuildSearchProjection(engine=self.engine).execute(
                 BuildSearchProjectionCommand(full=True)
             )
@@ -106,9 +225,42 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
             )
 
             # pg_trgm substring channel over the raw heading_path_text.
-            self.assertEqual(
-                self._trgm_hits(f"账龄{suffix}"), [ids["title_hit"]]
-            )
+            self.assertEqual(self._trgm_hits(f"账龄{suffix}"), [ids["title_hit"]])
+
+            # The body substring lane stores each explicit target leaf as one
+            # NFKC/casefolded atom. LIKE is only the GIN candidate; strpos is
+            # the exact same-atom heap recheck.
+            for query in (
+                "甲乙丙",
+                "应收账",
+                "股份变",
+                "ＡＢＣ％ＤＥＦ＿ＧＨ＼Ｉ",
+            ):
+                self.assertEqual(self._atom_hits(query), [ids["body_hit"]])
+                self.assertEqual(self._candidate_hits(query), [ids["body_hit"]])
+            self.assertEqual(self._atom_hits("庚辛 应收"), [])
+            self.assertEqual(self._atom_hits("股份"), [])
+            self.assertEqual(self._candidate_hits("股份"), [ids["body_hit"]])
+            self.assertEqual(self._candidate_hits("股份 不存在"), [])
+
+            with self.engine.begin() as conn:
+                conn.exec_driver_sql("SET LOCAL enable_seqscan = off")
+                plan_query = self._CANDIDATE_QUERY_SQL.rsplit("ORDER BY asset_id", 1)[0]
+                plan = "\n".join(
+                    str(row[0])
+                    for row in conn.execute(
+                        text("EXPLAIN " + plan_query),
+                        {
+                            "normalized_query": (
+                                tokenizer.normalize_search_text("应收账")
+                            ),
+                            "query_groups": list(
+                                tokenizer.build_search_tsquery_groups("应收账")
+                            ),
+                        },
+                    )
+                )
+            self.assertIn("ix_unit_search_atom_text_trgm", plan)
         finally:
             self._cleanup(ids)
 
@@ -147,11 +299,9 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
         suffix = os.urandom(4).hex()
         ids = self._seed_two_units(suffix)
         try:
-            # _BATCH_SIZE=1 forces the keyset loop through multiple batches
-            # (select -> upsert -> commit -> cursor advance -> terminal empty
-            # select), so the unbounded drain path is exercised end to end
-            # rather than fitting a single batch.
-            with mock.patch.object(BuildSearchProjection, "_BATCH_SIZE", 1):
+            # One-run keyset batches exercise select -> run-atomic replace ->
+            # cursor advance -> terminal exact-empty proof.
+            with mock.patch.object(BuildSearchProjection, "_RUN_BATCH_SIZE", 1):
                 result = BuildSearchProjection(engine=self.engine).execute(
                     BuildSearchProjectionCommand(full=False)
                 )
@@ -301,6 +451,526 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
             self.assertEqual(second.deleted, 0)
             self.assertEqual(second.skipped, 0)
             self.assertEqual(self._projection_count(), 2)
+
+            # A non-windowed parent with a leftover child is not a closed
+            # projection. Delta must select the owning run and replace it,
+            # otherwise replay status remains permanently pending.
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO disclosure_core.unit_body_search_window "
+                        "(asset_id, window_index, body_token_start, "
+                        "body_token_end, body_tokens) "
+                        "VALUES (:asset_id, 0, 0, 1, 'stalechild')"
+                    ),
+                    {"asset_id": ids_map["title_hit"]},
+                )
+            repaired = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False, prune=False)
+            )
+            self.assertEqual(repaired.projected, 2)
+            with self.engine.connect() as conn:
+                stale_children = int(
+                    conn.execute(
+                        text(
+                            "SELECT count(*) FROM "
+                            "disclosure_core.unit_body_search_window "
+                            "WHERE asset_id = :asset_id"
+                        ),
+                        {"asset_id": ids_map["title_hit"]},
+                    ).scalar_one()
+                )
+            self.assertEqual(stale_children, 0)
+        finally:
+            self._cleanup(ids_map)
+
+    def test_postgres_safety_probe_detects_every_physical_loss_mode(self) -> None:
+        def unique_tokens(count: int) -> str:
+            return " ".join(f"lexeme{index}" for index in range(count))
+
+        candidates = {
+            "repeat_255": "repeat " * 255,
+            "repeat_256": "repeat " * 256,
+            "positions_16383": unique_tokens(16_383),
+            "positions_16384": unique_tokens(16_384),
+            "long_lexeme": "x" * 2_100,
+            "over_one_megabyte": unique_tokens(120_000),
+        }
+        with self.engine.connect() as conn:
+            results = {
+                name: bool(
+                    conn.execute(
+                        text(
+                            "SELECT disclosure_core."
+                            "search_tsvector_is_safe('', '', :body, '')"
+                        ),
+                        {"body": body},
+                    ).scalar_one()
+                )
+                for name, body in candidates.items()
+            }
+        self.assertTrue(results["repeat_255"])
+        self.assertFalse(results["repeat_256"])
+        self.assertTrue(results["positions_16383"])
+        self.assertFalse(results["positions_16384"])
+        self.assertFalse(results["long_lexeme"])
+        self.assertFalse(results["over_one_megabyte"])
+
+    def test_windowed_body_is_lossless_and_and_groups_do_not_cross_assets(
+        self,
+    ) -> None:
+        suffix = os.urandom(4).hex()
+        ids_map = self._seed_two_units(suffix)
+        ids_map["left_only"] = f"ua_sp_left_{suffix}"
+        ids_map["right_only"] = f"ua_sp_right_{suffix}"
+        unsafe_body = (
+            "leftsentinel " + " ".join("repeat" for _ in range(256)) + " rightsentinel"
+        )
+        try:
+            with Session(self.engine) as session:
+                unsafe = session.get(DocumentUnit, ids_map["body_hit"])
+                assert unsafe is not None
+                unsafe.payload = {"text": unsafe_body}
+                for asset_id, body, order_index in (
+                    (ids_map["left_only"], "leftsentinel", 3),
+                    (ids_map["right_only"], "rightsentinel", 4),
+                ):
+                    session.add(
+                        DocumentUnit(
+                            asset_id=asset_id,
+                            document_id=ids_map["document"],
+                            processing_run_id=ids_map["run"],
+                            payload_kind="text",
+                            heading_path=["窗口负例"],
+                            title="窗口负例",
+                            order_index=order_index,
+                            payload={"text": body},
+                            content_hash=f"h_{asset_id}",
+                            semantic_keys=[],
+                            artifact_locator=_text_search_locator(order_index),
+                        )
+                    )
+                session.commit()
+
+            result = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=True)
+            )
+            self.assertEqual(result.projected, 4)
+            expected_body_tokens = tokenizer.index_word_tokens(unsafe_body)
+            with self.engine.connect() as conn:
+                parent = conn.execute(
+                    text(
+                        "SELECT body_tokens, body_search_windowed "
+                        "FROM disclosure_core.unit_search_projection "
+                        "WHERE asset_id = :asset_id"
+                    ),
+                    {"asset_id": ids_map["body_hit"]},
+                ).one()
+                windows = conn.execute(
+                    text(
+                        "SELECT window_index, body_token_start, body_token_end, "
+                        "body_tokens, "
+                        "disclosure_core.search_tsvector_is_safe("
+                        "'', '', body_tokens, '') AS safe "
+                        "FROM disclosure_core.unit_body_search_window "
+                        "WHERE asset_id = :asset_id ORDER BY window_index"
+                    ),
+                    {"asset_id": ids_map["body_hit"]},
+                ).all()
+            self.assertEqual(parent.body_tokens, expected_body_tokens)
+            self.assertTrue(parent.body_search_windowed)
+            self.assertGreaterEqual(len(windows), 2)
+            cursor = 0
+            reconstructed: list[str] = []
+            for window in windows:
+                self.assertEqual(window.body_token_start, cursor)
+                self.assertGreater(window.body_token_end, window.body_token_start)
+                self.assertTrue(window.safe)
+                reconstructed.extend(str(window.body_tokens).split())
+                cursor = int(window.body_token_end)
+            self.assertEqual(
+                reconstructed,
+                expected_body_tokens.split(),
+            )
+            self.assertEqual(cursor, len(expected_body_tokens.split()))
+
+            groups = tokenizer.build_search_tsquery_groups("leftsentinel rightsentinel")
+            self.assertEqual(len(groups), 2)
+            with self.engine.connect() as conn:
+                hits = list(
+                    conn.execute(
+                        text(
+                            """
+                            WITH query_groups(group_id, query_text) AS (
+                                VALUES (0, :group_0), (1, :group_1)
+                            ),
+                            hits AS (
+                                SELECT p.asset_id, q.group_id
+                                  FROM disclosure_public.unit_search_projection_v1 p
+                                  CROSS JOIN query_groups q
+                                 WHERE p.search_tsv
+                                       @@ to_tsquery('simple', q.query_text)
+                                UNION
+                                SELECT w.asset_id, q.group_id
+                                  FROM disclosure_public.unit_body_search_windows_v1 w
+                                  CROSS JOIN query_groups q
+                                 WHERE w.search_tsv
+                                       @@ to_tsquery('simple', q.query_text)
+                            )
+                            SELECT asset_id
+                              FROM hits
+                             GROUP BY asset_id
+                            HAVING count(DISTINCT group_id) = 2
+                             ORDER BY asset_id
+                            """
+                        ),
+                        {"group_0": groups[0], "group_1": groups[1]},
+                    ).scalars()
+                )
+            self.assertEqual(hits, [ids_map["body_hit"]])
+
+            with self.engine.begin() as conn:
+                conn.exec_driver_sql("SET LOCAL enable_seqscan = off")
+                plan = "\n".join(
+                    str(row[0])
+                    for row in conn.execute(
+                        text(
+                            "EXPLAIN SELECT asset_id FROM "
+                            "disclosure_core.unit_body_search_window "
+                            "WHERE search_tsv @@ to_tsquery('simple', :query)"
+                        ),
+                        {"query": groups[0]},
+                    )
+                )
+            self.assertIn("ix_unit_body_search_window_tsv", plan)
+            refused = self._alembic("downgrade", "0027_materialized_classification")
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn(
+                "cannot downgrade while windowed search projections exist",
+                refused.stderr,
+            )
+            self.assertTrue(self._view_exists("unit_body_search_windows_v1"))
+        finally:
+            self._cleanup(ids_map)
+
+    def test_child_insert_failure_rolls_back_the_complete_run(self) -> None:
+        suffix = os.urandom(4).hex()
+        ids_map = self._seed_two_units(suffix)
+        try:
+            BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=True)
+            )
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE disclosure_core.unit_search_projection "
+                        "SET retrieval_rules_version = 'rp-before-failure' "
+                        "WHERE asset_id IN (:a, :b)"
+                    ),
+                    {
+                        "a": ids_map["title_hit"],
+                        "b": ids_map["body_hit"],
+                    },
+                )
+                before = conn.execute(
+                    text(
+                        "SELECT asset_id, retrieval_rules_version, built_at "
+                        "FROM disclosure_core.unit_search_projection "
+                        "WHERE asset_id IN (:a, :b) ORDER BY asset_id"
+                    ),
+                    {
+                        "a": ids_map["title_hit"],
+                        "b": ids_map["body_hit"],
+                    },
+                ).all()
+                before_atoms = conn.execute(
+                    text(
+                        "SELECT asset_id, atom_index, atom_text "
+                        "FROM disclosure_core.unit_search_atom "
+                        "WHERE asset_id IN (:a, :b) "
+                        "ORDER BY asset_id, atom_index"
+                    ),
+                    {
+                        "a": ids_map["title_hit"],
+                        "b": ids_map["body_hit"],
+                    },
+                ).all()
+
+            with mock.patch.object(
+                projection_module,
+                "_prepare_search_rows",
+                side_effect=SearchProjectionSafetyError(
+                    "search_projection_unsplittable_body_token: "
+                    f"asset_id={ids_map['body_hit']}"
+                ),
+            ):
+                deterministic = BuildSearchProjection(engine=self.engine).execute(
+                    BuildSearchProjectionCommand(full=False)
+                )
+            self.assertEqual(deterministic.projected, 0)
+            self.assertEqual(len(deterministic.failures), 1)
+            self.assertEqual(
+                deterministic.failures[0].processing_run_id,
+                ids_map["run"],
+            )
+            self.assertEqual(
+                deterministic.failures[0].error_code,
+                "search_projection_unsplittable_body_token",
+            )
+            with self.engine.connect() as conn:
+                stored_error = conn.execute(
+                    text(
+                        "SELECT search_projection_error "
+                        "FROM disclosure_core.processing_run "
+                        "WHERE processing_run_id = :run"
+                    ),
+                    {"run": ids_map["run"]},
+                ).scalar_one()
+            self.assertEqual(stored_error["retryable"], False)
+            self.assertEqual(
+                stored_error["retrieval_rules_version"],
+                tokenizer.RETRIEVAL_RULES_VERSION,
+            )
+            parser_target = {"name": "scratch-parser", "version": "1"}
+            generation_started_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+            with Session(self.engine) as session:
+                document = session.get(Document, ids_map["document"])
+                run = session.get(ProcessingRun, ids_map["run"])
+                assert document is not None
+                assert run is not None
+                document.current_processing_run_id = ids_map["run"]
+                document.raw_file_hash = "sha256:" + "a" * 64
+                run.run_kind = "parse"
+                run.parser_target_identity = parser_target
+                run.input_raw_file_hash = document.raw_file_hash
+                run.builder_rules_version = "builder.scratch"
+                run.started_at = datetime.now(timezone.utc)
+                session.commit()
+            with self.engine.connect() as conn:
+                (processing_state,) = worker_queries.document_processing_states(
+                    conn,
+                    document_ids=(ids_map["document"],),
+                    generation_started_at=generation_started_at,
+                    target_identity={
+                        "parser_target": parser_target,
+                        "builder_rules_version": "builder.scratch",
+                        "retrieval_rules_version": (tokenizer.RETRIEVAL_RULES_VERSION),
+                        "max_parse_retries": 3,
+                        "max_build_retries": 3,
+                    },
+                )
+            self.assertEqual(processing_state.state, "terminal_failed")
+            self.assertEqual(
+                processing_state.reason_code,
+                "search_projection_terminal",
+            )
+            with self.engine.connect() as conn:
+                transaction = conn.begin()
+                try:
+                    with (
+                        self.assertRaises(sqlalchemy.exc.IntegrityError),
+                        conn.begin_nested(),
+                    ):
+                        conn.execute(
+                            text(
+                                "UPDATE disclosure_core.processing_run "
+                                "SET search_projection_error = "
+                                '\'{"stage":"search_projection"}\'::jsonb '
+                                "WHERE processing_run_id = :run"
+                            ),
+                            {"run": ids_map["run"]},
+                        )
+                    with (
+                        self.assertRaises(sqlalchemy.exc.IntegrityError),
+                        conn.begin_nested(),
+                    ):
+                        conn.execute(
+                            text(
+                                "UPDATE disclosure_core.processing_run "
+                                "SET parser_target_identity = '[]'::jsonb "
+                                "WHERE processing_run_id = :run"
+                            ),
+                            {"run": ids_map["run"]},
+                        )
+                finally:
+                    transaction.rollback()
+            with self.engine.connect() as conn:
+                after_deterministic_failure = conn.execute(
+                    text(
+                        "SELECT asset_id, retrieval_rules_version, built_at "
+                        "FROM disclosure_core.unit_search_projection "
+                        "WHERE asset_id IN (:a, :b) ORDER BY asset_id"
+                    ),
+                    {
+                        "a": ids_map["title_hit"],
+                        "b": ids_map["body_hit"],
+                    },
+                ).all()
+            self.assertEqual(after_deterministic_failure, before)
+            with self.engine.connect() as conn:
+                after_failure_atoms = conn.execute(
+                    text(
+                        "SELECT asset_id, atom_index, atom_text "
+                        "FROM disclosure_core.unit_search_atom "
+                        "WHERE asset_id IN (:a, :b) "
+                        "ORDER BY asset_id, atom_index"
+                    ),
+                    {
+                        "a": ids_map["title_hit"],
+                        "b": ids_map["body_hit"],
+                    },
+                ).all()
+            self.assertEqual(after_failure_atoms, before_atoms)
+
+            # Delta does not spin on a current terminal fact. Full is the
+            # explicit retry path, and success clears the fact atomically.
+            skipped = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False)
+            )
+            self.assertEqual(skipped.projected, 0)
+            self.assertEqual(skipped.failures, ())
+            with Session(self.engine) as session:
+                run = session.get(ProcessingRun, ids_map["run"])
+                assert run is not None
+                run.search_projection_error = {
+                    **stored_error,
+                    "retrieval_rules_version": "retrieval.old",
+                }
+                session.commit()
+            rules_changed = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False)
+            )
+            self.assertEqual(rules_changed.projected, 2)
+            with Session(self.engine) as session:
+                run = session.get(ProcessingRun, ids_map["run"])
+                assert run is not None
+                self.assertIsNone(run.search_projection_error)
+
+            # Full mode retries even a current terminal fact without a gap.
+            with Session(self.engine) as session:
+                run = session.get(ProcessingRun, ids_map["run"])
+                assert run is not None
+                run.search_projection_error = stored_error
+                session.commit()
+            recovered = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=True)
+            )
+            self.assertEqual(recovered.projected, 2)
+            with self.engine.connect() as conn:
+                cleared_error = conn.execute(
+                    text(
+                        "SELECT search_projection_error "
+                        "FROM disclosure_core.processing_run "
+                        "WHERE processing_run_id = :run"
+                    ),
+                    {"run": ids_map["run"]},
+                ).scalar_one()
+            self.assertIsNone(cleared_error)
+
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE disclosure_core.unit_search_projection "
+                        "SET retrieval_rules_version = 'rp-before-failure' "
+                        "WHERE asset_id IN (:a, :b)"
+                    ),
+                    {
+                        "a": ids_map["title_hit"],
+                        "b": ids_map["body_hit"],
+                    },
+                )
+                before = conn.execute(
+                    text(
+                        "SELECT asset_id, retrieval_rules_version, built_at "
+                        "FROM disclosure_core.unit_search_projection "
+                        "WHERE asset_id IN (:a, :b) ORDER BY asset_id"
+                    ),
+                    {
+                        "a": ids_map["title_hit"],
+                        "b": ids_map["body_hit"],
+                    },
+                ).all()
+                before_atoms = conn.execute(
+                    text(
+                        "SELECT asset_id, atom_index, atom_text "
+                        "FROM disclosure_core.unit_search_atom "
+                        "WHERE asset_id IN (:a, :b) "
+                        "ORDER BY asset_id, atom_index"
+                    ),
+                    {
+                        "a": ids_map["title_hit"],
+                        "b": ids_map["body_hit"],
+                    },
+                ).all()
+
+            def invalid_child(
+                session: Session,
+                rows: list[dict[str, object]],
+            ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+                del session
+                prepared = [{**row, "body_search_windowed": True} for row in rows]
+                return prepared, [
+                    {
+                        "asset_id": prepared[0]["asset_id"],
+                        "window_index": 0,
+                        "body_token_start": 0,
+                        "body_token_end": 1,
+                        "body_tokens": "",
+                    }
+                ]
+
+            with (
+                mock.patch.object(
+                    projection_module,
+                    "_prepare_search_rows",
+                    side_effect=invalid_child,
+                ),
+                self.assertRaises(sqlalchemy.exc.IntegrityError),
+            ):
+                BuildSearchProjection(engine=self.engine).execute(
+                    BuildSearchProjectionCommand(full=False)
+                )
+
+            with self.engine.connect() as conn:
+                after = conn.execute(
+                    text(
+                        "SELECT asset_id, retrieval_rules_version, built_at "
+                        "FROM disclosure_core.unit_search_projection "
+                        "WHERE asset_id IN (:a, :b) ORDER BY asset_id"
+                    ),
+                    {
+                        "a": ids_map["title_hit"],
+                        "b": ids_map["body_hit"],
+                    },
+                ).all()
+                child_count = int(
+                    conn.execute(
+                        text(
+                            "SELECT count(*) FROM "
+                            "disclosure_core.unit_body_search_window "
+                            "WHERE asset_id IN (:a, :b)"
+                        ),
+                        {
+                            "a": ids_map["title_hit"],
+                            "b": ids_map["body_hit"],
+                        },
+                    ).scalar_one()
+                )
+                after_atoms = conn.execute(
+                    text(
+                        "SELECT asset_id, atom_index, atom_text "
+                        "FROM disclosure_core.unit_search_atom "
+                        "WHERE asset_id IN (:a, :b) "
+                        "ORDER BY asset_id, atom_index"
+                    ),
+                    {
+                        "a": ids_map["title_hit"],
+                        "b": ids_map["body_hit"],
+                    },
+                ).all()
+            self.assertEqual(after, before)
+            self.assertEqual(child_count, 0)
+            self.assertEqual(after_atoms, before_atoms)
         finally:
             self._cleanup(ids_map)
 
@@ -346,7 +1016,8 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                 ProcessingRun(
                     processing_run_id=ids["run"],
                     document_id=ids["document"],
-                    run_kind="rebuild_units",
+                    artifact_owner_processing_run_id=ids["run"],
+                    run_kind="parse",
                     status="succeeded",
                     is_active=True,
                     unit_build_status="succeeded",
@@ -365,6 +1036,7 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     payload={"text": "期末余额说明"},
                     content_hash=f"h1_{suffix}",
                     semantic_keys=["receivable_aging"],
+                    artifact_locator=_text_search_locator(1),
                 )
             )
             session.add(
@@ -379,6 +1051,7 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     payload={"text": "应收账款"},
                     content_hash=f"h2_{suffix}",
                     semantic_keys=["credit_impairment_loss"],
+                    artifact_locator=_text_search_locator(2),
                 )
             )
             session.commit()
@@ -397,8 +1070,7 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
             )
             conn.execute(
                 text(
-                    "DELETE FROM disclosure_core.document_unit "
-                    "WHERE document_id = :did"
+                    "DELETE FROM disclosure_core.document_unit WHERE document_id = :did"
                 ),
                 {"did": ids["document"]},
             )
@@ -423,7 +1095,7 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
             )
 
     def _ranked_asset_ids(self, term: str) -> list[str]:
-        query = tokenizer.tokenize(term)
+        query = " ".join(tokenizer.query_word_tokens(term))
         with self.engine.connect() as conn:
             rows = conn.execute(
                 text(
@@ -435,6 +1107,114 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                 {"q": query},
             ).scalars()
             return list(rows)
+
+    _ATOM_QUERY_SQL = r"""
+        WITH q AS (
+            SELECT CAST(:normalized_query AS text) AS normalized_query
+        )
+        SELECT DISTINCT a.asset_id
+          FROM disclosure_public.unit_search_atoms_v1 a
+          CROSS JOIN q
+         WHERE char_length(q.normalized_query) >= 3
+           AND a.atom_text LIKE (
+                   '%' ||
+                   replace(
+                       replace(
+                           replace(q.normalized_query, '\', '\\'),
+                           '%',
+                           '\%'
+                       ),
+                       '_',
+                       '\_'
+                   )
+                   || '%'
+               ) ESCAPE '\'
+           AND strpos(a.atom_text, q.normalized_query) > 0
+         ORDER BY a.asset_id
+    """
+
+    _CANDIDATE_QUERY_SQL = r"""
+        WITH input AS (
+            SELECT CAST(:normalized_query AS text) AS atom_query,
+                   CAST(:query_groups AS text[]) AS word_groups
+        ),
+        groups AS (
+            SELECT ordinality AS group_id, query_text
+              FROM input,
+                   unnest(word_groups) WITH ORDINALITY
+                       AS g(query_text, ordinality)
+        ),
+        word_group_hits AS (
+            SELECT p.asset_id, g.group_id
+              FROM disclosure_public.unit_search_projection_v1 p
+              CROSS JOIN groups g
+             WHERE p.search_tsv
+                   @@ to_tsquery('simple', g.query_text)
+            UNION
+            SELECT w.asset_id, g.group_id
+              FROM disclosure_public.unit_body_search_windows_v1 w
+              CROSS JOIN groups g
+             WHERE w.search_tsv
+                   @@ to_tsquery('simple', g.query_text)
+        ),
+        word_hits AS (
+            SELECT asset_id
+              FROM word_group_hits
+             GROUP BY asset_id
+            HAVING count(DISTINCT group_id) = (
+                       SELECT count(*) FROM groups
+                   )
+               AND (SELECT count(*) FROM groups) > 0
+        ),
+        atom_hits AS (
+            SELECT DISTINCT a.asset_id
+              FROM disclosure_public.unit_search_atoms_v1 a
+              CROSS JOIN input i
+             WHERE char_length(i.atom_query) >= 3
+               AND a.atom_text LIKE (
+                       '%' ||
+                       replace(
+                           replace(
+                               replace(i.atom_query, '\', '\\'),
+                               '%',
+                               '\%'
+                           ),
+                           '_',
+                           '\_'
+                       )
+                       || '%'
+                   ) ESCAPE '\'
+               AND strpos(a.atom_text, i.atom_query) > 0
+        )
+        SELECT asset_id FROM word_hits
+        UNION
+        SELECT asset_id FROM atom_hits
+        ORDER BY asset_id
+    """
+
+    def _atom_hits(self, query: str) -> list[str]:
+        normalized_query = tokenizer.normalize_search_text(query)
+        with self.engine.connect() as conn:
+            return list(
+                conn.execute(
+                    text(self._ATOM_QUERY_SQL),
+                    {"normalized_query": normalized_query},
+                ).scalars()
+            )
+
+    def _candidate_hits(self, query: str) -> list[str]:
+        with self.engine.connect() as conn:
+            return list(
+                conn.execute(
+                    text(self._CANDIDATE_QUERY_SQL),
+                    {
+                        "normalized_query": (tokenizer.normalize_search_text(query)),
+                        "query_groups": list(
+                            tokenizer.build_search_tsquery_groups(query)
+                        ),
+                    },
+                ).scalars()
+            )
 
     def _trgm_hits(self, substring: str) -> list[str]:
         with self.engine.connect() as conn:
@@ -490,6 +1270,34 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     ),
                     {"n": name},
                 ).scalar()
+            )
+
+    def _function_exists(self, name: str) -> bool:
+        with self.engine.connect() as conn:
+            return bool(
+                conn.execute(
+                    text(
+                        "SELECT 1 FROM pg_proc AS routine "
+                        "JOIN pg_namespace AS namespace "
+                        "ON namespace.oid = routine.pronamespace "
+                        "WHERE namespace.nspname = 'disclosure_core' "
+                        "AND routine.proname = :name"
+                    ),
+                    {"name": name},
+                ).scalar()
+            )
+
+    def _view_columns(self, name: str) -> list[str]:
+        with self.engine.connect() as conn:
+            return list(
+                conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = 'disclosure_public' "
+                        "AND table_name = :name ORDER BY ordinal_position"
+                    ),
+                    {"name": name},
+                ).scalars()
             )
 
 

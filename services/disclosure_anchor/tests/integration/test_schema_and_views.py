@@ -76,10 +76,49 @@ class SchemaShapeTests(unittest.TestCase):
                 {"schema": ALEMBIC_VERSION_TABLE_SCHEMA},
             ).scalar_one()
             version = conn.execute(
-                text(f"SELECT version_num FROM {ALEMBIC_VERSION_TABLE_SCHEMA}.alembic_version")
+                text(
+                    f"SELECT version_num FROM {ALEMBIC_VERSION_TABLE_SCHEMA}.alembic_version"
+                )
             ).scalar()
+            processing_run_columns = set(
+                conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = :schema "
+                        "AND table_name = 'processing_run'"
+                    ),
+                    {"schema": CORE_SCHEMA},
+                ).scalars()
+            )
+            processing_run_constraints = set(
+                conn.execute(
+                    text(
+                        "SELECT conname FROM pg_constraint "
+                        "WHERE conrelid = "
+                        "'disclosure_core.processing_run'::regclass"
+                    )
+                ).scalars()
+            )
         self.assertEqual(present, 1)
         self.assertEqual(version, single_migration_head())
+        self.assertLessEqual(
+            {
+                "artifact_owner_processing_run_id",
+                "parser_target_identity",
+                "search_projection_error",
+            },
+            processing_run_columns,
+        )
+        self.assertLessEqual(
+            {
+                "ck_processing_run_parse_artifact_owner",
+                "ck_processing_run_rebuild_artifact_owner",
+                "fk_processing_run_artifact_owner",
+                "ck_processing_run_parser_target_identity",
+                "ck_processing_run_search_projection_error",
+            },
+            processing_run_constraints,
+        )
 
     def test_document_provider_hash_unique_index_exists(self) -> None:
         with self.engine.connect() as conn:
@@ -116,7 +155,9 @@ class SchemaShapeTests(unittest.TestCase):
             names,
         )
 
-    def test_security_constraints_reject_unicode_aliases_and_wrong_exchange(self) -> None:
+    def test_security_constraints_reject_unicode_aliases_and_wrong_exchange(
+        self,
+    ) -> None:
         company_id = "co_schema_security_constraints"
         conn = self.engine.connect()
         txn = conn.begin()

@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import os
-import re
 import secrets
 import unittest
 from typing import Optional
+
+from scripts.managed_scratch_database import (
+    SCRATCH_DATABASE_COMMENT_PREFIX,
+    SCRATCH_DATABASE_NAME_PATTERN,
+    SCRATCH_DATABASE_PREFIX,
+    is_managed_scratch_database,
+    scratch_database_created_epoch,
+)
 
 try:
     from sqlalchemy import text
@@ -43,22 +50,15 @@ def _configured_test_database_url() -> Optional[str]:
     return None
 
 
-TEST_DATABASE_PREFIX = "invest_engine_itest_"
-TEST_DATABASE_COMMENT_PREFIX = "disclosure_anchor:integration-test:v1:"
-TEST_DATABASE_NAME_PATTERN = re.compile(
-    rf"^{re.escape(TEST_DATABASE_PREFIX)}"
-    r"(?P<created_at>[1-9][0-9]{8,11})_"
-    r"(?P<pid>[1-9][0-9]*)_(?P<nonce>[0-9a-f]{8})$"
-)
+TEST_DATABASE_PREFIX = SCRATCH_DATABASE_PREFIX
+TEST_DATABASE_COMMENT_PREFIX = SCRATCH_DATABASE_COMMENT_PREFIX
+TEST_DATABASE_NAME_PATTERN = SCRATCH_DATABASE_NAME_PATTERN
 
 
 def test_database_created_epoch(database_name: str) -> int | None:
     """Return the embedded creation epoch for an exact runner database name."""
 
-    match = TEST_DATABASE_NAME_PATTERN.fullmatch(database_name)
-    if match is None:
-        return None
-    return int(match.group("created_at"))
+    return scratch_database_created_epoch(database_name)
 
 
 def is_managed_test_database_identity(
@@ -67,12 +67,7 @@ def is_managed_test_database_identity(
 ) -> bool:
     """Require an exact runner name and its matching versioned DB marker."""
 
-    created_at = test_database_created_epoch(database_name)
-    if created_at is None:
-        return False
-    return database_comment == (
-        f"{TEST_DATABASE_COMMENT_PREFIX}{created_at}:{database_name}"
-    )
+    return is_managed_scratch_database(database_name, database_comment)
 
 
 def numeric_provider_document_id() -> str:

@@ -2,27 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+import json
 from pathlib import Path
 from typing import Any
 
-from disclosure_anchor.adapters.parsers.mineru.artifact_reader import MinerUArtifactReader
+from disclosure_anchor.adapters.parsers.mineru.artifact_reader import (
+    MinerUArtifactReader,
+)
+from disclosure_anchor.adapters.parsers.mineru.existing_artifact_pipeline import (
+    build_current_ir_from_mineru_artifacts,
+)
 from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
-    MinerUParserInfo,
     MinerUToNormalizedIRMapper,
 )
 from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
-from disclosure_anchor.adapters.parsers.mineru.table_reconciler import (
-    TableReconciliationResult,
-    reconcile_content_list_tables,
-)
-from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation import (
-    TableReconciliationContractError,
-    validate_table_reconciliation_payload,
-)
-from disclosure_anchor.application.contracts.normalized_ir import (
-    NormalizedIRVersionError,
-    require_current_normalized_ir,
-    validate_reconciliation_generation,
+from disclosure_anchor.adapters.parsers.mineru.visual_semantic_enricher import (
+    MinerUVisualSemanticEnricher,
 )
 from disclosure_anchor.application.ports.parser import (
     ParserIdentity,
@@ -32,58 +28,7 @@ from disclosure_anchor.application.ports.parser import (
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
 
-def map_reconciled_mineru_content_list(
-    *,
-    content_list: list[dict[str, Any]],
-    model_path: Path | None,
-    mapper: MinerUToNormalizedIRMapper,
-    parser_info: MinerUParserInfo,
-    document_metadata: dict[str, Any],
-    parser_artifacts: dict[str, str] | None = None,
-    start_page: int | None = None,
-    end_page: int | None = None,
-) -> tuple[dict[str, Any], TableReconciliationResult]:
-    """Run the production table-reconciliation + mapping composition.
-
-    Fixture regeneration reuses this function so a golden parser output cannot
-    silently bypass a production-only normalization stage.
-    """
-
-    reconciled = reconcile_content_list_tables(
-        content_list,
-        model_path=model_path,
-    )
-    normalized_ir = mapper.map_content_list(
-        content_list=reconciled.content_list,
-        parser_info=parser_info,
-        document_metadata=document_metadata,
-        parser_artifacts=parser_artifacts,
-        start_page=start_page,
-        end_page=end_page,
-    )
-    existing = normalized_ir.get("parser_diagnostics")
-    if existing is not None and not isinstance(existing, dict):
-        raise ParserOutputContractError(
-            "normalized IR parser_diagnostics must be an object"
-        )
-    normalized_ir["parser_diagnostics"] = {
-        **(existing or {}),
-        "table_reconciliation": reconciled.stats.as_dict(),
-    }
-    try:
-        require_current_normalized_ir(normalized_ir)
-        assessment = validate_table_reconciliation_payload(normalized_ir)
-        validate_reconciliation_generation(
-            version=str(normalized_ir["contract_version"]),
-            algorithm_version=assessment.algorithm_version,
-        )
-    except (TableReconciliationContractError, NormalizedIRVersionError) as exc:
-        reason_code = getattr(exc, "reason_code", "invalid_contract")
-        raise ParserOutputContractError(
-            "invalid table reconciliation payload "
-            f"[{reason_code}]: {exc}"
-        ) from exc
-    return normalized_ir, reconciled
+__all__ = ["MinerUDocumentParser"]
 
 
 class MinerUDocumentParser:
@@ -110,9 +55,6 @@ class MinerUDocumentParser:
         return ParserIdentity(
             name="MinerU",
             version=self._version_cache,
-            backend="pipeline",
-            method="auto",
-            language="ch",
         )
 
     def readiness(self, options: ParserOptions | None = None) -> None:
@@ -140,34 +82,126 @@ class MinerUDocumentParser:
         identity = self.identity()
         self._process.run(input_pdf=input_pdf, output_dir=output_dir, options=options)
         artifacts = self._reader.locate(output_dir)
-        content_list = self._reader.read_content_list(artifacts.content_list_path)
-        parser_info = MinerUParserInfo(
-            name=identity.name,
-            package_version=identity.version,
-            backend=options.backend,
-            method=options.method,
-            language=options.language,
-            formula=options.formula,
-            table=options.table,
+        content_list_path = artifacts.paths["content_list"]
+        assert content_list_path is not None
+        model_path = artifacts.paths["model"]
+        content_artifact = self._reader.read_content_artifact(
+            content_list_path
         )
-        normalized_ir, _reconciled_tables = map_reconciled_mineru_content_list(
-            content_list=content_list,
-            model_path=artifacts.model_path,
-            mapper=self._mapper,
+        artifact_stem = content_list_path.name.removesuffix("_content_list.json")
+        content_list_v2_path = artifacts.paths["content_list_v2"]
+        if content_list_v2_path is None:
+            raise ParserOutputContractError(
+                "MinerU content_list_v2 is required for canonical text closure"
+            )
+        content_list_v2 = self._reader.read_content_list_v2(
+            content_list_v2_path
+        )
+        middle_path = artifacts.paths["middle"]
+        if middle_path is None:
+            raise ParserOutputContractError(
+                "MinerU middle artifact is required for source role closure"
+            )
+        source_pdf_sha256 = document_metadata.get("raw_file_hash")
+        if not isinstance(source_pdf_sha256, str) or not source_pdf_sha256:
+            raise ParserOutputContractError(
+                "registered raw PDF hash is required for structure extraction"
+            )
+        parser_info = options.target_identity(identity)
+        server_url = options.server_url or self._server_url
+        build = build_current_ir_from_mineru_artifacts(
+            raw_pdf_path=input_pdf,
+            source_pdf_sha256=source_pdf_sha256,
+            content_artifact=content_artifact,
+            content_list_v2=content_list_v2,
+            middle_path=middle_path,
+            model_path=model_path,
             parser_info=parser_info,
             document_metadata=document_metadata,
+            visual_output_dir=content_list_path.with_name(
+                artifact_stem + "_source_page_visuals"
+            ),
             start_page=options.start_page,
             end_page=options.end_page,
+            mapper=self._mapper,
+            server_url=server_url,
+            visual_semantic_extractor=MinerUVisualSemanticEnricher(
+                process=self._process,
+                options=options,
+                server_url=server_url or "",
+            ),
+        )
+        native_path = content_list_path.with_name(artifact_stem + "_pdf_structure.json")
+        source_evidence_path = content_list_path.with_name(
+            artifact_stem + "_source_evidence.json"
+        )
+        visual_semantics_path = content_list_path.with_name(
+            artifact_stem + "_visual_semantics.json"
+        )
+        _write_json_artifact(
+            native_path,
+            build.native_structure,
+            label="native PDF structure",
+        )
+        _write_json_artifact(
+            source_evidence_path,
+            build.source_evidence,
+            label="source evidence",
+        )
+        _write_bytes_artifact(
+            visual_semantics_path,
+            build.visual_semantics_bytes,
+            label="visual semantics",
         )
         return ParserResult(
-            parser_name=parser_info.name,
-            parser_version=parser_info.package_version,
-            parser_backend=parser_info.backend,
-            parser_method=parser_info.method,
-            parser_language=parser_info.language,
+            target_identity=parser_info,
             artifact_root=artifacts.root,
-            content_list_path=artifacts.content_list_path,
-            markdown_path=artifacts.markdown_path,
-            normalized_ir=normalized_ir,
-            model_path=artifacts.model_path,
+            artifact_paths={
+                **artifacts.paths,
+                **build.evidence_image_paths,
+                **{
+                    visual.artifact_role: visual.artifact_path
+                    for visual in build.visual_evidence
+                },
+                "pdf_structure": native_path,
+                "source_evidence": source_evidence_path,
+                "visual_semantics": visual_semantics_path,
+            },
+            normalized_ir=build.normalized_ir,
         )
+
+
+def _write_json_artifact(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    label: str,
+) -> None:
+    try:
+        path.write_text(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise ParserOutputContractError(
+            f"cannot write {label} artifact: {path}"
+        ) from exc
+
+
+def _write_bytes_artifact(
+    path: Path,
+    payload: bytes,
+    *,
+    label: str,
+) -> None:
+    try:
+        path.write_bytes(payload)
+    except OSError as exc:
+        raise ParserOutputContractError(
+            f"cannot write {label} artifact: {path}"
+        ) from exc

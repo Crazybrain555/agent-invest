@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -59,6 +60,10 @@ _TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS = 120
 # the final absolute bound if a streaming phase keeps making partial progress.
 _MIN_TASK_RESULT_RESERVE_SECONDS = 900
 _MAX_TASK_RESULT_RESERVE_SECONDS = 1800
+_CLICK_VERSION_OUTPUT = re.compile(
+    r"^[^,\r\n]+, version "
+    r"(?P<version>[0-9]+(?:\.[0-9]+)*(?:[A-Za-z0-9.+_-]*)?)$"
+)
 
 
 def _task_result_timeout_seconds(outer_timeout_seconds: int) -> int:
@@ -82,6 +87,17 @@ def _task_result_timeout_seconds(outer_timeout_seconds: int) -> int:
 
 def _contains_any(value: str, markers: tuple[str, ...]) -> bool:
     return any(marker in value for marker in markers)
+
+
+def _parse_cli_version_output(output: str) -> str:
+    """Extract Click's version token without weakening identity equality."""
+
+    match = _CLICK_VERSION_OUTPUT.fullmatch(output.strip())
+    if match is None:
+        raise ParserVersionProbeError(
+            "MinerU version probe returned an unsupported output contract"
+        )
+    return match.group("version")
 
 
 def _register_process(process: subprocess.Popen[str]) -> bool:
@@ -188,6 +204,13 @@ class MinerUProcessResult:
     stderr: str
 
 
+@dataclass(frozen=True)
+class MinerURuntimeHelperResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
 class MinerUProcess:
     """Run the local MinerU CLI in a controlled subprocess."""
 
@@ -222,6 +245,12 @@ class MinerUProcess:
             "-t",
             str(options.table).lower(),
         ]
+        if options.backend != "pipeline":
+            command.extend(
+                ["--image-analysis", str(options.image_analysis).lower()]
+            )
+        if options.backend.startswith("hybrid-"):
+            command.extend(["--effort", options.effort])
         if options.start_page is not None:
             command.extend(["-s", str(options.start_page)])
         if options.end_page is not None:
@@ -248,6 +277,82 @@ class MinerUProcess:
                 ]
             )
         return command
+
+    @property
+    def runtime_python(self) -> Path:
+        """Return the venv sibling Python without resolving its symlink.
+
+        Resolving this path escapes the MinerU virtualenv to its base
+        interpreter, where ``mineru_vl_utils`` is not installed.
+        """
+
+        return self._executable.parent / "python"
+
+    def run_runtime_helper(
+        self,
+        *,
+        script: Path,
+        input_payload: str,
+        options: ParserOptions,
+    ) -> MinerURuntimeHelperResult:
+        """Run one bounded helper inside the attested MinerU environment."""
+
+        runtime_python = self.runtime_python
+        if not runtime_python.is_file():
+            raise ParserLocalInvocationError(
+                f"MinerU runtime Python is missing: {runtime_python}"
+            )
+        if not script.is_file():
+            raise ParserLocalInvocationError(
+                f"MinerU runtime helper is missing: {script}"
+            )
+        try:
+            process = subprocess.Popen(
+                [str(runtime_python), str(script)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=self._env(options=options),
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise ParserLocalInvocationError(
+                f"MinerU runtime helper failed to start: {exc}"
+            ) from exc
+        cancel_at_start = _register_process(process)
+        cancelled = False
+        timeout = options.timeout_seconds or 600
+        if cancel_at_start:
+            timeout = min(timeout, int(_GRACEFUL_STOP_SECONDS))
+        try:
+            stdout, stderr = process.communicate(
+                input=input_payload,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            _stop_process_group(process)
+            if cancel_at_start:
+                raise ParserCancelledError(
+                    "MinerU runtime helper cancelled by worker shutdown"
+                ) from exc
+            raise ParserTimeoutError(
+                f"MinerU runtime helper timed out after {timeout}s"
+            ) from exc
+        except BaseException:
+            _stop_process_group(process)
+            raise
+        finally:
+            cancelled = _unregister_process(process)
+        if cancelled:
+            raise ParserCancelledError(
+                "MinerU runtime helper cancelled by worker shutdown"
+            )
+        return MinerURuntimeHelperResult(
+            returncode=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
     def probe_server(
         self, server_url: str, *, timeout_seconds: float = 15.0
@@ -351,7 +456,7 @@ class MinerUProcess:
             raise ParserVersionProbeError(
                 f"MinerU version probe returned no output: {self._executable}"
             )
-        return output
+        return _parse_cli_version_output(output)
 
     def run(
         self, *, input_pdf: Path, output_dir: Path, options: ParserOptions
@@ -449,4 +554,10 @@ class MinerUProcess:
             env["MINERU_TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS"] = str(
                 _TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS
             )
+        # MinerU's default cross-page table merge rewrites the leading
+        # table HTML and empties continuation-page carriers.  Physical-page
+        # tables are the canonical evidence boundary here. Cross-page
+        # semantic relations, if needed, belong to retrieval and cannot
+        # rewrite the source table payload.
+        env["MINERU_TABLE_MERGE_ENABLE"] = "0"
         return env

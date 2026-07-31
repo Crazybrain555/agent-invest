@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import signal
 import subprocess
@@ -19,11 +18,11 @@ from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOf
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
+from disclosure_anchor.adapters.parsers.mineru.source_evidence_validator import (
+    MinerUSourceEvidenceValidator,
+)
 from disclosure_anchor.application.dto.worker_report import WorkerLimits
 from disclosure_anchor.application.ports.disclosure_source import AnnouncementRef
-from disclosure_anchor.application.contracts.normalized_ir import (
-    CURRENT_NORMALIZED_IR_VERSION,
-)
 from disclosure_anchor.application.ports.parser import (
     ParserIdentity,
     ParserOptions,
@@ -37,16 +36,13 @@ from disclosure_anchor.application.worker.worker import (
 )
 from disclosure_anchor.settings import SENTINEL_NAME, Settings
 from tests.integration._support import engine_or_skip
+from tests.unit._current_ir import (
+    artifact_paths_from_ir,
+    write_text_ir_bundle,
+)
 
 import sqlalchemy
 
-FIXTURE_IR = (
-    Path(__file__).resolve().parents[1]
-    / "fixtures"
-    / "phase00"
-    / "short_announcement"
-    / "normalized_ir.v2.json"
-)
 PDF_BYTES = b"%PDF-1.4 fake worker integration pdf\n%%EOF\n"
 
 
@@ -86,11 +82,12 @@ class FakeWorkerSource:
 
 
 class FakeParser:
-    """Returns the short_announcement fixture IR rebadged for the document."""
+    """Returns one current, source-bound IR fixture for the document."""
 
     def identity(self) -> ParserIdentity:
         return ParserIdentity(
-            name="FakeParser", version="1.0", backend="fake", method="auto", language="ch"
+            name="MinerU",
+            version="3.4.0",
         )
 
     def parse(
@@ -101,26 +98,22 @@ class FakeParser:
         options: ParserOptions,
         document_metadata: dict,
     ) -> ParserResult:
-        normalized = json.loads(FIXTURE_IR.read_text(encoding="utf-8"))
-        normalized["document_id"] = document_metadata.get("document_id", "unknown")
-        # The committed fixture is frozen legacy v2, but the parse write path
-        # accepts only the current contract and checks run identity: a fresh
-        # parse must stamp v3 and carry this run's registered raw source.
-        normalized["contract_version"] = CURRENT_NORMALIZED_IR_VERSION
-        if document_metadata.get("source_pdf") is not None:
-            normalized["source_pdf"] = str(document_metadata["source_pdf"])
-        output_dir.mkdir(parents=True, exist_ok=True)
-        content_list = output_dir / "fake_content_list.json"
-        content_list.write_text("[]", encoding="utf-8")
+        fixture_ir_path = Path("_fixture_normalized_ir.v4.json")
+        normalized = write_text_ir_bundle(
+            output_dir,
+            fixture_ir_path,
+            texts=("测试公告", "测试正文"),
+            document_id=str(document_metadata["document_id"]),
+            source_pdf=str(document_metadata["source_pdf"]),
+            document_title=str(document_metadata["title"]),
+            parser_target=options.target_identity(self.identity()),
+        )
+        (output_dir / fixture_ir_path).unlink()
+        artifact_root = output_dir / "parser" / "a"
         return ParserResult(
-            parser_name="FakeParser",
-            parser_version="1.0",
-            parser_backend="fake",
-            parser_method="auto",
-            parser_language="ch",
-            artifact_root=output_dir,
-            content_list_path=content_list,
-            markdown_path=None,
+            target_identity=options.target_identity(self.identity()),
+            artifact_root=artifact_root,
+            artifact_paths=artifact_paths_from_ir(output_dir, normalized),
             normalized_ir=normalized,
         )
 
@@ -273,9 +266,13 @@ class WorkerRunOnceIntegrationTests(unittest.TestCase):
             path_builder=paths,
             raw_store=RawDocumentStore(paths),
             artifact_store=ArtifactStore(paths),
+            source_evidence_validator=MinerUSourceEvidenceValidator(),
             source_factory=lambda: self.source,
             profile_loader_factory=lambda source: source.profile_for_security,
             parser_factory=lambda: FakeParser(),
+            parser_options=ParserOptions(
+                runtime_bundle_identity_sha256="sha256:" + "b" * 64
+            ),
             parse_expected_seconds=60,
             config=_config(),
             clock=lambda: datetime.now(timezone.utc),
@@ -526,7 +523,23 @@ class WorkerRunOnceIntegrationTests(unittest.TestCase):
                     ).all()
                 }
 
+        def processing_run_columns() -> set[str]:
+            with self.engine.connect() as conn:
+                return set(
+                    conn.execute(
+                        text(
+                            "SELECT column_name FROM information_schema.columns "
+                            "WHERE table_schema='disclosure_core' "
+                            "AND table_name='processing_run'"
+                        )
+                    ).scalars()
+                )
+
         self.assertLessEqual({"sync_due_v1", "pending_download_v1"}, view_names())
+        self.assertLessEqual(
+            {"parser_target_identity", "search_projection_error"},
+            processing_run_columns(),
+        )
         with self.engine.connect() as conn:
             self.assertTrue(
                 conn.execute(
@@ -542,6 +555,10 @@ class WorkerRunOnceIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(down.returncode, 0, down.stderr[-500:])
         self.assertFalse({"sync_due_v1", "pending_download_v1"} & view_names())
+        self.assertFalse(
+            {"parser_target_identity", "search_projection_error"}
+            & processing_run_columns()
+        )
         with self.engine.connect() as conn:
             self.assertFalse(
                 conn.execute(
@@ -557,6 +574,10 @@ class WorkerRunOnceIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(up.returncode, 0, up.stderr[-500:])
         self.assertLessEqual({"sync_due_v1", "pending_download_v1"}, view_names())
+        self.assertLessEqual(
+            {"parser_target_identity", "search_projection_error"},
+            processing_run_columns(),
+        )
         with self.engine.connect() as conn:
             self.assertTrue(
                 conn.execute(

@@ -13,6 +13,7 @@ from disclosure_anchor.application.dto.worker_report import (
     WorkerLimits,
     WorkerReport,
 )
+from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.cli import worker as worker_cli
 from disclosure_anchor.settings import Settings
 
@@ -396,11 +397,15 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             path_builder=mock.MagicMock(),
             raw_store=mock.MagicMock(),
             artifact_store=mock.MagicMock(),
+            source_evidence_validator=mock.MagicMock(),
             source_factory=lambda: mock.MagicMock(),
             profile_loader_factory=lambda _source: lambda _code: None,
             parser_factory=lambda: mock.MagicMock(),
             parse_expected_seconds=1,
             config=mock.MagicMock(),
+            parser_options=ParserOptions(
+                runtime_bundle_identity_sha256="sha256:" + "b" * 64
+            ),
             close_source=close_source,
         )
         stop = mock.MagicMock()

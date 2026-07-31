@@ -18,6 +18,7 @@ from disclosure_anchor.adapters.sources.cninfo.mapper import (
     load_facet_map,
     load_filing_type_rule_bundle,
 )
+from disclosure_anchor.application.worker.locks import exclusive_corpus_mutation
 
 
 def main() -> int:
@@ -104,27 +105,33 @@ def main() -> int:
             )
 
     engine = create_engine(os.environ["DATABASE_URL"])
-    with engine.begin() as conn:
-        # TRUNCATE takes ACCESS EXCLUSIVE; a long-running view reader would
-        # queue us and everything behind us. Fail fast instead of wedging.
-        conn.execute(text("SET LOCAL lock_timeout = '5s'"))
-        conn.execute(text("TRUNCATE disclosure_core.classification_rule"))
-        conn.execute(
-            text(
-                "INSERT INTO disclosure_core.classification_rule"
-                " (rule_set, prefix, value, priority, version)"
-                " VALUES (:rule_set, :prefix, :value, :priority, :version)"
-            ),
-            rows,
-        )
-    # Materialized classification (0027): reloading rules must leave no
-    # stale rows behind, or the 0017 "load-rules -> current everywhere"
-    # contract dies. Batched keyset refresh, seconds at 100k documents.
-    from disclosure_anchor.adapters.db.postgres.classification_refresh import (
-        refresh_stale_documents,
-    )
+    try:
+        # Rules and materialized document classifications are one generation.
+        # Exclude ordinary UoWs so no old-stamp registration can commit after
+        # the final refresh batch has already passed it.
+        with exclusive_corpus_mutation(engine):
+            with engine.begin() as conn:
+                # TRUNCATE takes ACCESS EXCLUSIVE; a long-running view reader
+                # would queue us and everything behind us. Fail fast instead.
+                conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+                conn.execute(text("TRUNCATE disclosure_core.classification_rule"))
+                conn.execute(
+                    text(
+                        "INSERT INTO disclosure_core.classification_rule"
+                        " (rule_set, prefix, value, priority, version)"
+                        " VALUES (:rule_set, :prefix, :value, :priority, :version)"
+                    ),
+                    rows,
+                )
+            # Materialized classification (0027): reloading rules must leave
+            # no stale rows behind. Refresh is keyset-batched.
+            from disclosure_anchor.adapters.db.postgres.classification_refresh import (
+                refresh_stale_documents,
+            )
 
-    refreshed = refresh_stale_documents(engine)
+            refreshed = refresh_stale_documents(engine)
+    finally:
+        engine.dispose()
     print(f"refreshed materialized classification on {refreshed} documents")
 
     counts = {"class": 0, "facet": 0, "title": 0, "title_topic": 0, "title_noise": 0}

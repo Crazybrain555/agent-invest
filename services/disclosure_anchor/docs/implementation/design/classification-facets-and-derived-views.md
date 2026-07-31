@@ -161,17 +161,23 @@ terraform plan→make track DRY_RUN=1；changedetection _source→track-status �
 edgartools amendments=True→correction_supplement 默认 process；
 miniflux OPML→真相翻转时 CSV 降级为 import/export（09 占位）。
 
+> 2026-07-26 边界澄清：processing policy 只决定尚未接入文档的调度/获取范围，不是 PDF
+> 内容白名单。文档一旦进入 parse scope，其非空 source carriers 必须全量形成可检索证据；
+> classification/title/topic 不能决定标题、切分、删除或 table title。不能用扩大分类词表修复
+> parser 结构缺陷。
+
 ## 4. 取舍与不做
 
 - **GIN 索引丢失**：全库按 topic 聚合会变慢——L2 场景以过滤为主，可接受；
   阈值见 §3.4。
 - **filing_type 双来源**必须写进数据字典：视图值 = 码派生优先、注册值兜底；
   document 表列 ≠ 视图列（表列仅兜底语义）。
-- 不给主体/市场维做白名单策略（纯事实透传）；解析范围策略仍只挂内容维。
+- 不给主体/市场维做筛选策略（纯事实透传）；调度范围策略仍只挂内容维，且不得下沉为
+  文档内部的结构/证据可见性规则。
 - 词表扩容（r3，与 0016 同批）：以 HKEX Tier 2 为锚补齐 topics（预计
   14 → ~25：+清盘退市、供股/公开发售、关连交易细分、盈利警告、
   股份合并拆细、主要交易/须予披露交易分级等），每键带 std_refs；
-  扩容后 parse_scope 白名单同步复核。
+  扩容后 processing-policy 覆盖范围同步复核。
 - **规则质量环（替代暴露原样 30 类）**：未映射内容码审计——语料中出现、
   既不命中 filing_type 规则也不命中 topic 规则的内容维码 = 候选缺口，
   列出码+巨潮名+文档数供人工晋级（同套话/标题吞没发现环模式）；进

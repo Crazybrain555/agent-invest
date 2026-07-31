@@ -2,13 +2,16 @@
 
 ```text
 ports/         抽象接口：UnitOfWork(默认回滚、显式 commit)、各 Repository、
-               DocumentParserPort(parse + identity)、file_store（路径/原始档/artifact）
+               DocumentParserPort(parse + identity)、SourceEvidenceValidatorPort
+               （provider artifact 校验）、file_store（路径/原始档/artifact）
 services/subject_resolver.py   D5 主体解析顺序：security 命中 → USCC 强键查 ledger → 新建；
                legal_name 只校验不合并；冲突置 contested（resolver 内 commit 后抛——
                让 contested 标记在注册回滚后仍持久，这是刻意的）
 services/register_document.py  注册核心：去重键(provider,pid,raw_hash)幂等吸收、
                supersedes 链、source_access、document_registered/observed 事件；
                07 的 provider 下载路径必须复用它，不得重实现
+services/unit_builder/  纯 S1-S7 证据投影与只读 retrieval taxonomy；不做 IO，不反向依赖 adapter，
+               taxonomy 只能标注已完成单元，不能改变 title/边界/归属/顺序
 use_cases/register_local_pdf.py  preflight 冲突检查 → 归档 → 核心；竞态只重试一次
 worker/queries.py     队列读取唯一入口（视图 facts + 阈值谓词都在这；worker/doctor 共用，
                禁止旁路手写判定）；reclaim_stale_runs 是钉死的回收 UPDATE

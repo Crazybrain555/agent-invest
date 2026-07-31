@@ -22,7 +22,10 @@ from disclosure_anchor.adapters.db.postgres.classification_refresh import (
 from disclosure_anchor.adapters.db.postgres.schema import READER_ROLE
 from disclosure_anchor.api.errors import GONE_SUPERSEDED, VALIDATION_ERROR
 from disclosure_anchor.domain import ids
-from disclosure_anchor.domain.services.unit_hashing import canonical_json, sha256_prefixed
+from disclosure_anchor.domain.services.unit_hashing import (
+    canonical_json,
+    sha256_prefixed,
+)
 from disclosure_anchor.main import create_app
 from disclosure_anchor.settings import Settings
 from tests.integration._support import engine_or_skip, numeric_provider_document_id
@@ -102,7 +105,9 @@ def _sample_pdf_or_skip(label: str) -> Path:
     try:
         lines = ref.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
-        raise unittest.SkipTest(f"sample PDF reference unreadable: {ref}: {exc}") from exc
+        raise unittest.SkipTest(
+            f"sample PDF reference unreadable: {ref}: {exc}"
+        ) from exc
     source_lines = [line for line in lines if line.startswith("Source PDF:")]
     if not source_lines:
         raise unittest.SkipTest(f"sample PDF reference missing Source PDF line: {ref}")
@@ -132,9 +137,7 @@ def _settings(root: Path, *, mineru: Path | None = None) -> Settings:
             )
         ),
         hf_home=Path(
-            os.environ.get(
-                "HF_HOME", str(shared_root / "model_cache" / "huggingface")
-            )
+            os.environ.get("HF_HOME", str(shared_root / "model_cache" / "huggingface"))
         ),
         modelscope_cache=Path(
             os.environ.get(
@@ -198,7 +201,9 @@ def _api_request(
     }
     asyncio.run(app(scope, receive, send))
 
-    start = next(message for message in messages if message["type"] == "http.response.start")
+    start = next(
+        message for message in messages if message["type"] == "http.response.start"
+    )
     chunks = [
         message.get("body", b"")
         for message in messages
@@ -489,7 +494,9 @@ class FilingApiRuntimeTests(unittest.TestCase):
         self.assertEqual(context_payload["excerpt"], expected_excerpt)
         self.assertEqual(context_payload["start"], 0)
         self.assertEqual(context_payload["end"], len(expected_excerpt))
-        self.assertEqual(context_payload["excerpt_hash"], sha256_prefixed(expected_excerpt))
+        self.assertEqual(
+            context_payload["excerpt_hash"], sha256_prefixed(expected_excerpt)
+        )
 
         bad_cursor = _api_request(
             self.app,
@@ -643,10 +650,11 @@ class FilingApiRuntimeTests(unittest.TestCase):
             conn.execute(
                 text(
                     "INSERT INTO disclosure_core.processing_run "
-                    "(processing_run_id, document_id, run_kind, status, is_active, "
+                    "(processing_run_id, document_id, "
+                    "artifact_owner_processing_run_id, run_kind, status, is_active, "
                     "unit_build_status, unit_build_attempt_count, started_at, "
                     "finished_at, builder_rules_version) "
-                    "VALUES (:run_id, :document_id, 'parse', :status, :is_active, "
+                    "VALUES (:run_id, :document_id, :run_id, 'parse', :status, :is_active, "
                     ":unit_build_status, 1, :started_at, :started_at, 'm06')"
                 ),
                 {
@@ -941,7 +949,11 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
                 "announcement_date": sample.announcement_date.isoformat(),
                 "provider_document_id": provider_document_id,
                 "provider": "cninfo",
-                **({"report_period": sample.report_period} if sample.report_period else {}),
+                **(
+                    {"report_period": sample.report_period}
+                    if sample.report_period
+                    else {}
+                ),
             },
         )
         self.assertEqual(registered.status_code, 200, registered.body)
@@ -1054,9 +1066,7 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
             ]
             self.assertTrue(receivable_units)
             tables = [
-                part
-                for unit in receivable_units
-                for part in _unit_table_parts(unit)
+                part for unit in receivable_units for part in _unit_table_parts(unit)
             ]
             # User decision 2026-07-16: no first-row header guessing — without
             # <th> evidence the full faithful grid lives in rows and headers
@@ -1067,9 +1077,7 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
             # QA discrimination removed 2026-07-16: the transcript stays raw
             # text under the official narrative label, question and answer
             # both retrievable from the same evidence carrier.
-            self.assertFalse(
-                any(unit["payload_kind"] == "qa" for unit in units)
-            )
+            self.assertFalse(any(unit["payload_kind"] == "qa" for unit in units))
             narrative_texts = [
                 str(unit["payload"].get("text") or "")
                 for unit in units
@@ -1112,20 +1120,28 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
             # Harvest SubjectResolver-created company/security rows before the
             # documents disappear — the register path creates them and this
             # class leaked one company per zero-skip suite run (2026-07-06).
-            subject_rows = conn.execute(
-                text(
-                    "SELECT DISTINCT company_id, security_id "
-                    "FROM disclosure_core.document WHERE document_id = ANY(:ids)"
-                ),
-                {"ids": list(self.document_ids)},
-            ).all() if self.document_ids else []
+            subject_rows = (
+                conn.execute(
+                    text(
+                        "SELECT DISTINCT company_id, security_id "
+                        "FROM disclosure_core.document WHERE document_id = ANY(:ids)"
+                    ),
+                    {"ids": list(self.document_ids)},
+                ).all()
+                if self.document_ids
+                else []
+            )
             for document_id in self.document_ids:
                 conn.execute(
-                    text("DELETE FROM disclosure_ops.outbox_event WHERE document_id=:id"),
+                    text(
+                        "DELETE FROM disclosure_ops.outbox_event WHERE document_id=:id"
+                    ),
                     {"id": document_id},
                 )
                 conn.execute(
-                    text("DELETE FROM disclosure_core.document_unit WHERE document_id=:id"),
+                    text(
+                        "DELETE FROM disclosure_core.document_unit WHERE document_id=:id"
+                    ),
                     {"id": document_id},
                 )
                 conn.execute(

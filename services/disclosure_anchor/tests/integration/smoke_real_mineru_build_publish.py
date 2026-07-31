@@ -20,9 +20,13 @@ from sqlalchemy import text
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
 from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
+from disclosure_anchor.adapters.parsers.mineru.source_evidence_validator import (
+    MinerUSourceEvidenceValidator,
+)
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
+from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.use_cases.build_units import BuildUnits, BuildUnitsCommand
 from disclosure_anchor.application.use_cases.parse_document import ParseDocument, ParseDocumentCommand
 from disclosure_anchor.application.use_cases.publish_run import (
@@ -215,13 +219,23 @@ class Milestone05RealMinerUBuildPublishSmoke(unittest.TestCase):
             uow_factory=self._uow,
             default_timeout_seconds=1800,
         )
-        parsed = parser.execute(ParseDocumentCommand(document_id=registered.document_id))
+        parsed = parser.execute(
+            ParseDocumentCommand(
+                document_id=registered.document_id,
+                options=ParserOptions(
+                    runtime_bundle_identity_sha256=(
+                        settings.disclosure_mineru_runtime_bundle_identity_sha256
+                    )
+                ),
+            )
+        )
         self.assertEqual(parsed.status, "succeeded", parsed.error)
 
         built = BuildUnits(
             path_builder=paths,
             artifact_store=artifact_store,
             uow_factory=self._uow,
+            source_evidence_validator=MinerUSourceEvidenceValidator(),
         ).execute(BuildUnitsCommand(processing_run_id=parsed.processing_run_id))
         self.assertEqual(built.status, "succeeded", built.error)
         self.assertGreater(built.unit_count, 0)

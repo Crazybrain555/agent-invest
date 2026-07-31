@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
@@ -11,16 +12,29 @@ from typing import Any
 from collections import Counter
 
 from disclosure_anchor.adapters.parsers.mineru.artifact_reader import (
+    MinerUContentArtifact,
     MinerUArtifactReader,
 )
-from disclosure_anchor.adapters.unit_builder.builder import build_unit_drafts_s1_s7
+from disclosure_anchor.adapters.parsers.mineru.existing_artifact_pipeline import (
+    build_current_ir_from_mineru_artifacts,
+)
+from disclosure_anchor.application.services.unit_builder.builder import build_unit_drafts_s1_s7
 from disclosure_anchor.domain.services import unit_hashing
 from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
     MinerUParserInfo,
-    MinerUToNormalizedIRMapper,
 )
-from disclosure_anchor.adapters.parsers.mineru.parser import (
-    map_reconciled_mineru_content_list,
+from disclosure_anchor.adapters.parsers.mineru.source_evidence import (
+    validate_mapped_element_bindings,
+    validate_source_evidence_ledger,
+)
+from disclosure_anchor.application.contracts.normalized_ir import (
+    validate_current_normalized_ir_for_write,
+)
+from disclosure_anchor.application.contracts.unit_source_projection import (
+    payload_page_no,
+)
+from disclosure_anchor.application.use_cases.parse_document import (
+    build_parser_artifact_manifest,
 )
 
 
@@ -80,6 +94,7 @@ PARSER_INFO = MinerUParserInfo(
     language="ch",
     formula=False,
     table=True,
+    runtime_bundle_identity_sha256="sha256:" + "0" * 64,
 )
 
 
@@ -102,7 +117,7 @@ def _content_list_path(sample_key: str) -> Path:
     path = Path(value)
     if not path.is_file():
         raise SystemExit(
-            f"{ref_key}: content_list missing: {path}\n"
+            f"{ref_key}: reparse_required: content_list missing: {path}\n"
             "The frozen _phase00 parser-artifact snapshot is not on this "
             "machine (lost before 2026-07-17). Rule-only changes should use "
             "--units-only (rebuilds document_units.v1.jsonl from the "
@@ -125,43 +140,59 @@ def _relpath(value: str | Path | None) -> str | None:
 def _parser_artifacts(
     sample_key: str,
     content_list_path: Path,
-    model_path: Path | None,
-) -> dict[str, str]:
+    artifact_paths: dict[str, Path | None],
+) -> dict[str, Any]:
     ref_key = "annual_report" if sample_key == "annual_report_excerpt" else sample_key
     values = _read_ref(ref_key)
     artifact_root = _relpath(
         values.get("Parser artifacts root") or content_list_path.parent
     )
-    content_list = _relpath(content_list_path)
-    markdown = _relpath(values.get("Markdown"))
-    if artifact_root is None or content_list is None:
+    if artifact_root is None:
         raise AssertionError("required parser artifact paths cannot be empty")
-    artifacts = {
-        "artifact_root_relpath": artifact_root,
-        "content_list_relpath": content_list,
-    }
-    if markdown is not None:
-        artifacts["markdown_relpath"] = markdown
-    if model_path is not None:
-        model = _relpath(model_path)
-        if model is None:
-            raise AssertionError("model parser artifact path cannot be empty")
-        artifacts["model_relpath"] = model
-    return artifacts
+    located = MinerUArtifactReader().locate(content_list_path.parent)
+    if located.paths["content_list"] != content_list_path:
+        raise AssertionError("artifact reader selected a different content_list")
+    return build_parser_artifact_manifest(
+        artifact_root=located.root,
+        artifact_root_relpath=Path(artifact_root),
+        artifact_paths=artifact_paths,
+    )
 
 
 def _content_list_for_sample(
     sample_key: str,
-) -> tuple[list[dict[str, Any]], Path, Path | None]:
+) -> tuple[MinerUContentArtifact, Path, Path | None]:
     path = _content_list_path(sample_key)
     reader = MinerUArtifactReader()
     located = reader.locate(path.parent)
-    if located.content_list_path.resolve() != path.resolve():
+    located_content = located.paths["content_list"]
+    if located_content is None or located_content.resolve() != path.resolve():
         raise SystemExit(
             f"{sample_key}: artifact locator selected a different content_list: "
-            f"{located.content_list_path}"
+            f"{located_content}"
         )
-    return reader.read_content_list(path), path, located.model_path
+    return reader.read_content_artifact(path), path, located.paths["model"]
+
+
+def _source_pdf_path(sample_key: str, content_list_path: Path) -> Path:
+    source = Path(str(SAMPLE_METADATA[sample_key]["source_pdf"]))
+    if source.is_absolute():
+        candidate = source
+    else:
+        content_text = str(content_list_path.resolve())
+        if DATA_MARKER not in content_text:
+            raise SystemExit(
+                f"{sample_key}: reparse_required: cannot resolve data root "
+                "from the MinerU artifact path"
+            )
+        data_root = Path(content_text.split(DATA_MARKER, 1)[0]) / "data"
+        candidate = data_root / source
+    if not candidate.is_file():
+        raise SystemExit(
+            f"{sample_key}: reparse_required: registered raw PDF is absent: "
+            f"{candidate}"
+        )
+    return candidate
 
 
 def _inject_fixture_fields(sample_key: str, normalized: dict[str, Any]) -> None:
@@ -204,44 +235,125 @@ def _coverage_line(sample_key: str, normalized: dict[str, Any]) -> str:
 
 def regenerate_sample(sample_key: str) -> str:
     metadata = SAMPLE_METADATA[sample_key]
-    content_list, content_list_path, model_path = _content_list_for_sample(sample_key)
-    normalized, _reconciliation = map_reconciled_mineru_content_list(
-        content_list=content_list,
+    content_artifact, content_list_path, model_path = _content_list_for_sample(
+        sample_key
+    )
+    if model_path is None:
+        raise SystemExit(
+            f"{sample_key}: reparse_required: MinerU model artifact is absent"
+        )
+    reader = MinerUArtifactReader()
+    located = reader.locate(content_list_path.parent)
+    content_list_v2_path = located.paths["content_list_v2"]
+    if content_list_v2_path is None:
+        raise SystemExit(
+            f"{sample_key}: reparse_required: MinerU content_list_v2 is absent"
+        )
+    content_list_v2 = reader.read_content_list_v2(content_list_v2_path)
+    middle_path = located.paths["middle"]
+    if middle_path is None:
+        raise SystemExit(
+            f"{sample_key}: reparse_required: MinerU middle artifact is absent"
+        )
+    raw_pdf_path = _source_pdf_path(sample_key, content_list_path)
+    raw_pdf_sha256 = (
+        "sha256:" + hashlib.sha256(raw_pdf_path.read_bytes()).hexdigest()
+    )
+    artifact_stem = content_list_path.name.removesuffix("_content_list.json")
+    visual_dir = content_list_path.with_name(
+        artifact_stem + "_source_page_visuals"
+    )
+    if PARSER_INFO.formula is not True:
+        raise SystemExit(
+            f"{sample_key}: reparse_required: frozen parser target disabled formula"
+        )
+    visual_semantics_path = content_list_path.with_name(
+        artifact_stem + "_visual_semantics.json"
+    )
+    if not visual_semantics_path.is_file():
+        raise SystemExit(
+            f"{sample_key}: reparse_required: visual semantics artifact is absent"
+        )
+    build = build_current_ir_from_mineru_artifacts(
+        raw_pdf_path=raw_pdf_path,
+        source_pdf_sha256=raw_pdf_sha256,
+        content_artifact=content_artifact,
+        content_list_v2=content_list_v2,
+        middle_path=middle_path,
         model_path=model_path,
-        mapper=MinerUToNormalizedIRMapper(),
         parser_info=PARSER_INFO,
         document_metadata={
             "document_id": f"phase00_{sample_key}",
             "source_pdf": metadata["source_pdf"],
             "title": metadata["title"],
         },
-        parser_artifacts=_parser_artifacts(
-            sample_key,
-            content_list_path,
-            model_path,
-        ),
+        visual_output_dir=visual_dir,
+        visual_semantic_artifact=visual_semantics_path.read_bytes(),
     )
-    if sample_key == "annual_report_excerpt":
-        # Reconcile the complete source first. Filtering raw content before
-        # reconciliation can cut a proven cross-page group at the excerpt
-        # boundary and recreate the aggregate/ghost defect in the golden.
-        normalized["elements"] = [
-            element
-            for element in normalized["elements"]
-            if isinstance(element.get("page_idx"), int)
-            and element["page_idx"] <= 6
-        ]
-        normalized["parsed_pages"] = {
-            "start_page_no": 1,
-            "end_page_no": 7,
-            "full_pdf": False,
-        }
-        _write_excerpt_ref(content_list_path)
+    native_path = content_list_path.with_name(
+        artifact_stem + "_pdf_structure.json"
+    )
+    source_evidence_path = content_list_path.with_name(
+        artifact_stem + "_source_evidence.json"
+    )
+    native_path.write_text(
+        json.dumps(
+            build.native_structure,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    source_evidence_path.write_text(
+        json.dumps(
+            build.source_evidence,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    normalized = build.normalized_ir
+    normalized["parser_artifacts"] = _parser_artifacts(
+        sample_key,
+        content_list_path,
+        {
+            **located.paths,
+            **build.evidence_image_paths,
+            **{
+                visual.artifact_role: visual.artifact_path
+                for visual in build.visual_evidence
+            },
+            "pdf_structure": native_path,
+            "source_evidence": source_evidence_path,
+            "visual_semantics": visual_semantics_path,
+        },
+    )
+    validate_source_evidence_ledger(
+        build.source_evidence,
+        expected_source_pdf_sha256=raw_pdf_sha256,
+        expected_source_pdf_page_count=int(
+            build.native_structure["source_pdf_page_count"]
+        ),
+        expected_mineru_artifact_sha256=build.content_list_sha256,
+        mineru_content_list_bytes=content_artifact.raw,
+        canonical_content_list=build.canonical_content_list,
+        expected_mineru_typed_artifact_sha256=content_list_v2.sha256,
+        native_structure=build.native_structure,
+        mineru_middle_artifact=build.middle_artifact,
+        parser_artifacts=normalized["parser_artifacts"],
+    )
+    validate_mapped_element_bindings(
+        build.source_evidence,
+        elements=normalized["elements"],
+    )
+    validate_current_normalized_ir_for_write(normalized)
     _inject_fixture_fields(sample_key, normalized)
     sample_dir = PHASE00_ROOT / sample_key
     # The fixture filename must match the payload the mapper actually stamped
-    # (normalized_ir.v3 today); writing v3 content into a v2-named file fails
-    # the path-version validation and the schema contract test.
+    # Writing a current payload into a legacy-named file fails path-version
+    # validation and the schema contract test.
     contract_version = str(normalized.get("contract_version") or "")
     if not re.fullmatch(r"normalized_ir\.v\d+", contract_version):
         raise SystemExit(
@@ -303,8 +415,7 @@ def render_document_units_jsonl(
     drafts, _stats = build_unit_drafts_s1_s7(
         normalized,
         filing_type=SAMPLE_METADATA[sample_key].get("filing_type"),
-        document_title=SAMPLE_METADATA[sample_key]["title"],
-        image_bytes_resolver=None,
+        image_artifact_resolver=None,
     )
     counters: Counter[str] = Counter()
     rows: list[dict[str, Any]] = []
@@ -313,10 +424,10 @@ def render_document_units_jsonl(
         rows.append(
             {
                 "applicability": draft.applicability,
-                "page_no": (
-                    draft.artifact_locator.get("page_no")
-                    if isinstance(draft.artifact_locator, dict)
-                    else None
+                "page_no": payload_page_no(
+                    payload_kind=draft.payload_kind,
+                    payload=draft.payload,
+                    artifact_locator=draft.artifact_locator,
                 ),
                 "artifact_locator": draft.artifact_locator,
                 "asset_id": (

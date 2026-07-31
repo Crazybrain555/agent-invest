@@ -89,7 +89,9 @@ class CompanyIdentifier(Base):
     )
     valid_from: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     valid_to: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -164,7 +166,9 @@ class TrackedCompany(Base):
     security_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey(f"{CORE_SCHEMA}.security.security_id"), nullable=True
     )
-    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default=text("'active'")
+    )
     lookback: Mapped[Optional[dict[str, Any]]] = mapped_column(
         JSONB(none_as_null=True), nullable=True
     )
@@ -191,14 +195,20 @@ class SourceAccess(Base):
 
     source_access_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
-    provider_interface: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    provider_interface: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
     dataset_key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     query_params: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
-    accessed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    accessed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     result_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    result_snapshot: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+    result_snapshot: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=True
+    )
     company_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey(f"{CORE_SCHEMA}.company.company_id"), nullable=True
     )
@@ -239,10 +249,16 @@ class ProviderCategory(Base):
 
     provider: Mapped[str] = mapped_column(String(32), primary_key=True)
     category_code: Mapped[str] = mapped_column(String(32), primary_key=True)
-    parent_category_code: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    parent_category_code: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True
+    )
     category_name: Mapped[str] = mapped_column(Text, nullable=False)
-    valid_from: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    valid_to: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_from: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    valid_to: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -289,7 +305,9 @@ class Document(Base):
         ForeignKey(f"{CORE_SCHEMA}.source_access.source_access_id"), nullable=True
     )
     provider: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    provider_document_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    provider_document_id: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
     title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     announcement_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     report_period: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
@@ -301,18 +319,32 @@ class Document(Base):
     )
     # Pointer to the current default run; intentionally not a hard FK to avoid a
     # cycle with processing_run.document_id.
-    current_processing_run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    supersedes_document_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    correction_of_document_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    current_processing_run_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    supersedes_document_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    correction_of_document_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
     # Materialized classification (0027): stamped at insert and refreshed by
     # the rules loader on stamp mismatch; the public views read these instead
     # of recomputing the classification per row per read.
     class_filing_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     class_market: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    class_rules_version: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
-    class_disclosure_topics: Mapped[Optional[list[Any]]] = mapped_column(JSONB, nullable=True)
-    class_publisher_categories: Mapped[Optional[list[Any]]] = mapped_column(JSONB, nullable=True)
-    class_content_categories: Mapped[Optional[list[Any]]] = mapped_column(JSONB, nullable=True)
+    class_rules_version: Mapped[Optional[str]] = mapped_column(
+        String(256), nullable=True
+    )
+    class_disclosure_topics: Mapped[Optional[list[Any]]] = mapped_column(
+        JSONB, nullable=True
+    )
+    class_publisher_categories: Mapped[Optional[list[Any]]] = mapped_column(
+        JSONB, nullable=True
+    )
+    class_content_categories: Mapped[Optional[list[Any]]] = mapped_column(
+        JSONB, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -328,7 +360,40 @@ class ProcessingRun(Base):
             "unit_build_status IN ('not_started','running','succeeded','failed')",
             name="ck_processing_run_unit_build_status",
         ),
+        CheckConstraint(
+            "parser_target_identity IS NULL "
+            "OR jsonb_typeof(parser_target_identity) = 'object'",
+            name="ck_processing_run_parser_target_identity",
+        ),
+        CheckConstraint(
+            "search_projection_error IS NULL OR ("
+            "jsonb_typeof(search_projection_error) = 'object' "
+            "AND COALESCE(search_projection_error->>'stage' = "
+            "'search_projection', false) "
+            "AND COALESCE(search_projection_error->'retryable' = "
+            "'false'::jsonb, false) "
+            "AND NULLIF(btrim(search_projection_error->>'error_code'), '') "
+            "IS NOT NULL "
+            "AND NULLIF(btrim("
+            "search_projection_error->>'retrieval_rules_version'), '') "
+            "IS NOT NULL)",
+            name="ck_processing_run_search_projection_error",
+        ),
+        CheckConstraint(
+            "run_kind <> 'parse' OR "
+            "artifact_owner_processing_run_id = processing_run_id",
+            name="ck_processing_run_parse_artifact_owner",
+        ),
+        CheckConstraint(
+            "run_kind <> 'rebuild_units' OR "
+            "artifact_owner_processing_run_id <> processing_run_id",
+            name="ck_processing_run_rebuild_artifact_owner",
+        ),
         Index("ix_processing_run_document", "document_id"),
+        Index(
+            "ix_processing_run_artifact_owner",
+            "artifact_owner_processing_run_id",
+        ),
         Index(
             "uq_processing_run_one_active_per_document",
             "document_id",
@@ -342,6 +407,15 @@ class ProcessingRun(Base):
     document_id: Mapped[str] = mapped_column(
         ForeignKey(f"{CORE_SCHEMA}.document.document_id"), nullable=False
     )
+    artifact_owner_processing_run_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            f"{CORE_SCHEMA}.processing_run.processing_run_id",
+            name="fk_processing_run_artifact_owner",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        nullable=False,
+    )
     run_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     parser_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
@@ -349,29 +423,47 @@ class ProcessingRun(Base):
     parser_backend: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     parser_method: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     parser_language: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
-    input_raw_file_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    parser_target_identity: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
+    search_projection_error: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
+    input_raw_file_hash: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
     parser_artifact_relpath: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     artifact_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     normalized_ir_relpath: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     document_units_relpath: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    content_hash_aggregate: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    content_hash_aggregate: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
     structure_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
-    builder_rules_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    builder_rules_version: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True
+    )
     is_active: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
     unit_build_status: Mapped[str] = mapped_column(
         String(16), nullable=False, server_default=text("'not_started'")
     )
-    unit_build_error: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+    unit_build_error: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=True
+    )
     unit_build_attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
     )
     unit_built_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     error: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -423,7 +515,9 @@ class DocumentUnit(Base):
     processing_run_id: Mapped[str] = mapped_column(
         ForeignKey(f"{CORE_SCHEMA}.processing_run.processing_run_id"), nullable=False
     )
-    provider_document_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    provider_document_id: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
     payload_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     heading_path: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
@@ -442,7 +536,9 @@ class DocumentUnit(Base):
     semantic_keys: Mapped[Optional[list[str]]] = mapped_column(
         JSONB(none_as_null=True), nullable=True
     )
-    query_projection_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    query_projection_hash: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
     artifact_locator: Mapped[Optional[dict[str, Any]]] = mapped_column(
         JSONB(none_as_null=True), nullable=True
     )
@@ -484,16 +580,22 @@ class OutboxEvent(Base):
     )
 
 
-# Weighted tsvector persisted mirror of migration 0025's ``_TSV_EXPRESSION``.
-# A=title, B=breadcrumb, C=body, D=semantic keys over the pre-tokenized columns
-# through the built-in ``simple`` config (milestone 06R §3). Keep byte-identical
-# to the migration; the DB computes/stores this column, callers never write it.
+# Weighted tsvector persisted mirror of migration 0028.  Safe rows retain the
+# original A/B/C/D vector.  Bodies that PostgreSQL cannot represent losslessly
+# move to ``unit_body_search_window`` and the parent stores A/B/D only.
 _SEARCH_TSV_EXPRESSION = (
+    "CASE WHEN body_search_windowed THEN "
+    "setweight(to_tsvector('simple', title_tokens), 'A') || "
+    "setweight(to_tsvector('simple', path_tokens), 'B') || "
+    "setweight(to_tsvector('simple', key_tokens), 'D') "
+    "ELSE "
     "setweight(to_tsvector('simple', title_tokens), 'A') || "
     "setweight(to_tsvector('simple', path_tokens), 'B') || "
     "setweight(to_tsvector('simple', body_tokens), 'C') || "
-    "setweight(to_tsvector('simple', key_tokens), 'D')"
+    "setweight(to_tsvector('simple', key_tokens), 'D') "
+    "END"
 )
+_BODY_SEARCH_TSV_EXPRESSION = "setweight(to_tsvector('simple', body_tokens), 'C')"
 
 
 class UnitSearchProjection(Base):
@@ -509,6 +611,13 @@ class UnitSearchProjection(Base):
 
     __tablename__ = "unit_search_projection"
     __table_args__ = (
+        CheckConstraint(
+            f"{CORE_SCHEMA}.search_tsvector_is_safe("
+            "title_tokens, path_tokens, "
+            "CASE WHEN body_search_windowed THEN '' ELSE body_tokens END, "
+            "key_tokens)",
+            name="ck_unit_search_projection_tsv_safe",
+        ),
         Index(
             "ix_unit_search_projection_tsv",
             "search_tsv",
@@ -544,11 +653,94 @@ class UnitSearchProjection(Base):
     header_row_candidate: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
-    built_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
+    body_search_windowed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
     )
+    built_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     search_tsv: Mapped[Any] = mapped_column(
         TSVECTOR(),
         Computed(_SEARCH_TSV_EXPRESSION, persisted=True),
         nullable=False,
     )
+
+
+class UnitBodySearchWindow(Base):
+    """Lossless C-weight body fragment for a windowed unit projection."""
+
+    __tablename__ = "unit_body_search_window"
+    __table_args__ = (
+        CheckConstraint(
+            "window_index >= 0",
+            name="ck_unit_body_search_window_index",
+        ),
+        CheckConstraint(
+            "body_token_start >= 0 AND body_token_end > body_token_start",
+            name="ck_unit_body_search_window_range",
+        ),
+        CheckConstraint(
+            "btrim(body_tokens) <> ''",
+            name="ck_unit_body_search_window_body",
+        ),
+        CheckConstraint(
+            f"{CORE_SCHEMA}.search_tsvector_is_safe('', '', body_tokens, '')",
+            name="ck_unit_body_search_window_tsv_safe",
+        ),
+        Index(
+            "ix_unit_body_search_window_tsv",
+            "search_tsv",
+            postgresql_using="gin",
+        ),
+        {"schema": CORE_SCHEMA},
+    )
+
+    asset_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey(
+            f"{CORE_SCHEMA}.unit_search_projection.asset_id",
+            ondelete="CASCADE",
+        ),
+        primary_key=True,
+    )
+    window_index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    body_token_start: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    body_token_end: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    body_tokens: Mapped[str] = mapped_column(Text, nullable=False)
+    search_tsv: Mapped[Any] = mapped_column(
+        TSVECTOR(),
+        Computed(_BODY_SEARCH_TSV_EXPRESSION, persisted=True),
+        nullable=False,
+    )
+
+
+class UnitSearchAtom(Base):
+    """One normalized leaf from an explicit source-bound search target."""
+
+    __tablename__ = "unit_search_atom"
+    __table_args__ = (
+        CheckConstraint(
+            "atom_index >= 0",
+            name="ck_unit_search_atom_index",
+        ),
+        CheckConstraint(
+            "btrim(atom_text) <> ''",
+            name="ck_unit_search_atom_text",
+        ),
+        Index(
+            "ix_unit_search_atom_text_trgm",
+            "atom_text",
+            postgresql_using="gin",
+            postgresql_ops={"atom_text": "gin_trgm_ops"},
+        ),
+        {"schema": CORE_SCHEMA},
+    )
+
+    asset_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey(
+            f"{CORE_SCHEMA}.unit_search_projection.asset_id",
+            ondelete="CASCADE",
+        ),
+        primary_key=True,
+    )
+    atom_index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    atom_text: Mapped[str] = mapped_column(Text, nullable=False)

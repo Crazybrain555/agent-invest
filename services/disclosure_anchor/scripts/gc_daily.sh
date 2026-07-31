@@ -44,6 +44,15 @@ if [ -n "${DISCLOSURE_DATA_ROOT:-}" ] && [ -d "$DISCLOSURE_DATA_ROOT/audit/gc" ]
   echo "[retention] pruning $MANIFESTS gc manifests older than 30d"
   find "$DISCLOSURE_DATA_ROOT/audit/gc" -type f -mtime +30 -delete 2>/dev/null || true
 fi
+# audit/reset-trash is the only rollback material for a full derived reset, so
+# it gets a size alarm instead of a time-based retention rule. Age says nothing
+# about whether the new generation has been verified; only the operator knows.
+if [ -n "${DISCLOSURE_DATA_ROOT:-}" ] && [ -d "$DISCLOSURE_DATA_ROOT/audit/reset-trash" ]; then
+  TRASH_SIZE=$(du -sh "$DISCLOSURE_DATA_ROOT/audit/reset-trash" 2>/dev/null | cut -f1)
+  if [ -n "$(ls -A "$DISCLOSURE_DATA_ROOT/audit/reset-trash" 2>/dev/null)" ]; then
+    echo "[warn] reset-trash holds ${TRASH_SIZE:-unknown}; run 'make purge-reset-trash' after the new generation is verified"
+  fi
+fi
 for sub in reports/worker reports/parse_quality; do
   dir="${DISCLOSURE_DATA_ROOT:-}/$sub"
   [ -d "$dir" ] && find "$dir" -type f -name '*.md' -mtime +30 -delete 2>/dev/null || true

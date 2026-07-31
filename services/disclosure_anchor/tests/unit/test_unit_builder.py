@@ -1,4152 +1,1299 @@
-"""Unit builder rule and S1-S7 stage tests."""
+"""Proof-bound document-unit builder invariants.
+
+These tests deliberately avoid a second heading language.  Source carriers
+remain parser-neutral; only a closed, PDF-bound ``structure_proof`` may define
+section ownership.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import unittest
+from typing import Any
+from unittest.mock import patch
 
-from disclosure_anchor.adapters.unit_builder import rules
-from disclosure_anchor.adapters.unit_builder.builder import (
-    BuildStats,
-    PreparedElement,
+from disclosure_anchor.application.services.unit_builder import retrieval_routing
+from disclosure_anchor.application.services.unit_builder.builder import (
+    ResolvedImageArtifact,
+    SourceEvidenceClosureError,
     UnitDraft,
     build_unit_drafts_s1_s7,
-    s1_preprocess_elements,
-    s2_apply_heading_tree,
-    s3_build_text_units,
-    s5_build_table_units,
-    s6_filter_units,
-    s7_finalize_units,
-    semantic_keys_for_unit,
 )
+from disclosure_anchor.application.contracts.document_structure import (
+    DOCUMENT_STRUCTURE_ALGORITHM,
+    DOCUMENT_STRUCTURE_VERSION,
+    DocumentStructureContractError,
+    carrier_set_sha256,
+)
+from disclosure_anchor.application.contracts.source_evidence import (
+    SourceEvidenceProof,
+    SourcePageProof,
+    SourceProofIdentity,
+)
+from disclosure_anchor.application.services.document_unit_audit import (
+    AuditDocumentMetadata,
+    DocumentAuditReport,
+)
+from disclosure_anchor.application.services.unit_preparation import (
+    prepare_and_audit_units,
+)
+from tests.unit.test_document_unit_audit import _ir as write_valid_ir
 
 
-class UnitBuilderTests(unittest.TestCase):
-    def test_short_note_labels_do_not_match_unrelated_substrings(self) -> None:
-        self.assertIsNone(rules.note_key_for_title("库存货物管理情况"))
-        self.assertIsNone(rules.note_key_for_title("公司商誉体系建设"))
-        self.assertIsNone(rules.note_key_for_title("融资租赁业务发展"))
-        self.assertEqual(rules.note_key_for_title("存货分类构成"), "inventory")
+_SOURCE_PDF_SHA256 = "sha256:" + "a" * 64
 
-    def test_note_number_stripping_requires_structural_punctuation(self) -> None:
-        self.assertEqual(
-            rules.note_key_for_title("一年内到期的非流动资产"),
-            "noncurrent_due_within_one_year",
-        )
-        self.assertEqual(rules.note_key_for_title("一般风险准备"), "surplus_reserve")
-        self.assertIsNone(rules.note_key_for_title("12存货"))
-        self.assertEqual(rules.note_key_for_title("12、存货"), "inventory")
 
-    def test_s1_keeps_one_repeated_furniture_carrier_with_all_provenance(
-        self,
-    ) -> None:
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "page_furniture",
-                    "raw_kind": "header",
-                    "order_index": 1,
-                    "page_no": 1,
-                    "text": "重复页眉",
-                },
-                {
-                    "kind": "page_furniture",
-                    "raw_kind": "header",
-                    "order_index": 2,
-                    "page_no": 2,
-                    "text": "重复页眉",
-                },
-                {
-                    "kind": "page_furniture",
-                    "raw_kind": "header",
-                    "order_index": 3,
-                    "page_no": 2,
-                    "text": "合并资产负债表",
-                },
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 4,
-                    "text": "---\n正文\u0001",
-                },
-                {"kind": "unknown", "raw_kind": "mystery", "order_index": 5},
-            ]
-        )
+def _element(
+    index: int,
+    *,
+    kind: str = "text",
+    raw_kind: str | None = None,
+    text: str | None = None,
+    page_no: int = 1,
+    **extra: Any,
+) -> dict[str, Any]:
+    element: dict[str, Any] = {
+        "document_id": "doc_builder",
+        "ir_id": f"ir_{index:04d}",
+        "source_item_index": index,
+        "source_item_sha256": "sha256:"
+        + hashlib.sha256(f"carrier:{index}".encode()).hexdigest(),
+        "order_index": index,
+        "page_idx": page_no - 1,
+        "page_no": page_no,
+        "bbox": [0.0, float(index * 10), 100.0, float(index * 10 + 8)],
+        "kind": kind,
+        "raw_kind": raw_kind or kind,
+        **extra,
+    }
+    if text is not None:
+        element["text"] = text
+    return element
 
-        self.assertEqual(
-            [item.text for item in result.elements],
-            ["重复页眉", "合并资产负债表", "正文"],
-        )
-        self.assertEqual(
-            result.stats.dropped_by_kind["page_furniture_exact_duplicate"], 1
-        )
-        self.assertEqual(result.stats.source_dispositions, [])
-        self.assertEqual(
-            result.elements[0].artifact_locator["derivation"]["kind"],
-            "exact_duplicate_carriers",
-        )
-        self.assertEqual(
-            len(result.elements[0].artifact_locator["source_locators"]), 2
-        )
-        self.assertEqual(result.stats.dropped_by_kind["unknown"], 1)
-        self.assertEqual(result.stats.dropped_unknown_by_raw_kind["mystery"], 1)
 
-    def test_s1_deduplicates_only_authoritative_page_number_metadata(self) -> None:
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "page_furniture",
-                    "raw_kind": "page_number",
-                    "order_index": 1,
-                    "page_no": 7,
-                    "text": "第 7 页",
-                },
-                {
-                    "kind": "page_furniture",
-                    "raw_kind": "header",
-                    "order_index": 2,
-                    "page_no": 7,
-                    "text": "7",
-                },
-                {
-                    "kind": "page_furniture",
-                    "raw_kind": "page_number",
-                    "order_index": 3,
-                    "page_no": 7,
-                    "text": "8",
-                },
-                {
-                    "kind": "page_furniture",
-                    "raw_kind": "page_number",
-                    "order_index": 4,
-                    "page_no": 7,
-                    "text": "7 / 24",
-                },
-                {
-                    "kind": "page_furniture",
-                    "raw_kind": "page_number",
-                    "order_index": 5,
-                    "page_no": 7,
-                    "text": "8 / 24",
-                },
-            ]
-        )
-
-        self.assertEqual([item.text for item in result.elements], ["7"])
-        self.assertEqual(result.stats.deduplicated_page_number_lines, 4)
-        self.assertEqual(
-            [item["reason"] for item in result.stats.source_dispositions],
-            ["exact_page_number"] * 4,
-        )
-
-    def test_s1_overlapping_furniture_groups_have_one_unsuppressed_canonical(
-        self,
-    ) -> None:
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 1,
-                    "page_no": 1,
-                    "text": "重复页眉",
-                },
-                {
-                    "kind": "page_furniture",
-                    "raw_kind": "header",
-                    "order_index": 2,
-                    "page_no": 2,
-                    "text": "重复页眉",
-                },
-                {
-                    "kind": "page_furniture",
-                    "raw_kind": "header",
-                    "order_index": 3,
-                    "page_no": 3,
-                    "text": "重复页眉",
-                },
-                {
-                    "kind": "page_furniture",
-                    "raw_kind": "footer",
-                    "order_index": 4,
-                    "page_no": 4,
-                    "text": "重复页眉",
-                },
-                {
-                    "kind": "page_furniture",
-                    "raw_kind": "footer",
-                    "order_index": 5,
-                    "page_no": 5,
-                    "text": "重复页眉",
-                },
-                {
-                    "kind": "page_furniture",
-                    "raw_kind": "header",
-                    "order_index": 6,
-                    "page_no": 6,
-                    "text": "重复页眉",
-                },
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 7,
-                    "page_no": 6,
-                    "text": "重复页眉",
-                },
-            ]
-        )
-
-        self.assertEqual([item.kind for item in result.elements], ["heading"])
-        locator = result.elements[0].artifact_locator or {}
-        self.assertEqual(locator["order_index"], 1)
-        self.assertEqual(
-            {item["order_index"] for item in locator["source_locators"]},
-            set(range(1, 8)),
-        )
-        self.assertEqual(
-            result.stats.dropped_by_kind["page_furniture_exact_duplicate"],
-            6,
-        )
-
-    def test_same_page_repeated_business_text_survives_s1(self) -> None:
-        # A running header/footer repeats across pages; identical business text
-        # on the SAME page (mid-page, well inside the 180/820 furniture bands)
-        # is genuine content and must never be deduplicated or reclassified as
-        # page furniture.
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 1,
-                    "page_no": 3,
-                    "bbox": [100, 400, 500, 430],
-                    "text": "公司超级电容器业务收入同比增长20%。",
-                },
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 2,
-                    "page_no": 3,
-                    "bbox": [100, 470, 500, 500],
-                    "text": "公司超级电容器业务收入同比增长20%。",
-                },
-            ]
-        )
-
-        self.assertEqual([item.kind for item in result.elements], ["text", "text"])
-        self.assertEqual(
-            [item.text for item in result.elements],
-            ["公司超级电容器业务收入同比增长20%。"] * 2,
-        )
-        self.assertEqual(
-            result.stats.dropped_by_kind["page_furniture_exact_duplicate"], 0
-        )
-
-    def test_retained_page_furniture_does_not_inherit_business_heading(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
+def _heading(
+    node_id: int,
+    source_index: int,
+    *,
+    text: str,
+    section_end: int,
+    parent_node_id: int | None = None,
+    level: int = 1,
+    propagates: bool = True,
+    text_span: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    span = text_span or (0, len(text))
+    return {
+        "node_id": node_id,
+        "parent_node_id": parent_node_id,
+        "heading_level": level,
+        "propagates": propagates,
+        "evidence_kinds": ["mineru_v2_title"],
+        "section_span": [source_index, section_end],
+        "source_refs": [
             {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "一、经营情况",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "经营情况稳定。",
-                    },
-                    {
-                        "kind": "page_furniture",
-                        "raw_kind": "footer",
-                        "order_index": 3,
-                        "page_no": 1,
-                        "text": "公告编号：2026-001",
-                    },
-                ]
-            },
-            filing_type="other",
-            document_title="测试公告",
-        )
+                "source_item_index": source_index,
+                "field": "text",
+                "text_span": list(span),
+            }
+        ],
+    }
 
-        furniture = next(
-            unit for unit in units if "公告编号" in unit.payload.get("text", "")
-        )
-        self.assertEqual(furniture.heading_path, ["测试公告"])
-        self.assertNotIn(
-            "heading_source_locators", furniture.artifact_locator or {}
-        )
 
-    def test_repeated_page_furniture_is_published_once_with_duplicate_lineage(
-        self,
-    ) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "一、经营情况",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "经营情况稳定。",
-                    },
-                    {
-                        "kind": "page_furniture",
-                        "raw_kind": "header",
-                        "order_index": 3,
-                        "page_no": 2,
-                        "text": "测试公司 2026 年年度报告",
-                    },
-                    {
-                        "kind": "page_furniture",
-                        "raw_kind": "header",
-                        "order_index": 4,
-                        "page_no": 3,
-                        "text": "测试公司 2026 年年度报告",
-                    },
-                ]
-            },
+def _proof(
+    elements: list[dict[str, Any]],
+    *,
+    headings: list[dict[str, Any]] | None = None,
+    page_frames: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    heading_values = list(headings or [])
+    frame_values = list(page_frames or [])
+    return {
+        "contract_version": DOCUMENT_STRUCTURE_VERSION,
+        "algorithm_version": DOCUMENT_STRUCTURE_ALGORITHM,
+        "source_pdf_sha256": _SOURCE_PDF_SHA256,
+        "source_pdf_page_count": max(
+            (int(element["page_no"]) for element in elements),
+            default=1,
+        ),
+        "carrier_set_sha256": carrier_set_sha256(elements),
+        "native": {
+            "status": "untagged",
+            "artifact_role": "pdf_structure",
+        },
+        "headings": heading_values,
+        "page_frames": frame_values,
+        "conflicts": [],
+        "coverage": {
+            "heading_nodes": len(heading_values),
+            "page_frame_groups": len(frame_values),
+        },
+    }
+
+
+def _build(
+    elements: list[dict[str, Any]],
+    *,
+    headings: list[dict[str, Any]] | None = None,
+    page_frames: list[dict[str, Any]] | None = None,
+    filing_type: str = "annual_report",
+    document_title: str | None = None,
+) -> tuple[list[UnitDraft], Any]:
+    normalized_ir: dict[str, Any] = {
+        "contract_version": "normalized_ir.v4",
+        "source_pdf_sha256": _SOURCE_PDF_SHA256,
+        "elements": elements,
+        "structure_proof": _proof(
+            elements,
+            headings=headings,
+            page_frames=page_frames,
+        ),
+    }
+    if document_title is not None:
+        normalized_ir["title"] = document_title
+    return build_unit_drafts_s1_s7(
+        normalized_ir,
+        filing_type=filing_type,
+        image_artifact_resolver=lambda role, path: ResolvedImageArtifact(
+            content=(content := f"fixture:{path}".encode()),
+            artifact_role=role,
+            sha256="sha256:" + hashlib.sha256(content).hexdigest(),
+            size_bytes=len(content),
+            media_type="image/png",
+        ),
+    )
+
+
+def _replay_and_audit(
+    elements: list[dict[str, Any]],
+    *,
+    headings: list[dict[str, Any]],
+    page_count: int,
+) -> tuple[list[UnitDraft], DocumentAuditReport]:
+    """Replay one case through publication assembly and the independent audit.
+
+    ``_build`` states only the proof facts a boundary case is about, while the
+    audit additionally requires the closed v4 envelope publication validates.
+    Cases that must stay publishable reuse the envelope the audit cases already
+    maintain instead of restating it.
+    """
+
+    normalized_ir = write_valid_ir(elements, headings=headings)
+    normalized_ir["document_id"] = str(elements[0]["document_id"])
+    normalized_ir["source_pdf_page_count"] = page_count
+    normalized_ir["structure_proof"]["source_pdf_page_count"] = page_count
+    normalized_ir["parsed_pages"]["end_page_no"] = page_count
+    artifacts = normalized_ir["parser_artifacts"]["files"]
+    drafts, _stats, report = prepare_and_audit_units(
+        normalized_ir=normalized_ir,
+        filing_type="annual_report",
+        metadata=AuditDocumentMetadata(
+            document_id=str(normalized_ir["document_id"]),
+            title=str(normalized_ir["title"]),
             filing_type="annual_report",
-            document_title="测试公司 2026 年年度报告",
-        )
+        ),
+        image_artifact_resolver=None,
+        image_hash_provider=dict,
+        source_proof=SourceEvidenceProof(
+            identity=SourceProofIdentity(
+                source_evidence_sha256=str(artifacts["source_evidence"]["sha256"]),
+                source_pdf_sha256=str(normalized_ir["source_pdf_sha256"]),
+                page_count=page_count,
+            ),
+            pages=tuple(
+                SourcePageProof(page_idx=page_idx, events=())
+                for page_idx in range(page_count)
+            ),
+            retrieval_runs=(),
+            visual_bindings=(),
+            verified_visuals=(),
+        ),
+    )
+    return drafts, report
 
-        furniture = [
-            unit
-            for unit in units
-            if "测试公司" in unit.payload.get("text", "")
-        ]
-        self.assertEqual(len(furniture), 1)
-        self.assertEqual(
-            furniture[0].artifact_locator["derivation"]["kind"],
-            "exact_duplicate_carriers",
-        )
 
-    def test_s1_visual_payload_preserves_structured_source_fields(self) -> None:
-        digest = "a" * 64
-        content = "| 指标 | 数值 |\n| --- | --- |\n| 收入 | 10 |"
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 1,
-                    "source_item_index": 1,
-                    "ir_id": "ir_0001",
-                    "page_no": 5,
-                    "text": "股权结构图",
-                    "heading_level": 2,
-                },
-                {
-                    "kind": "image",
-                    "raw_kind": "chart",
-                    "order_index": 2,
-                    "source_item_index": 2,
-                    "ir_id": "ir_0002",
-                    "page_no": 5,
-                    "image_path": f"images/{digest}.jpg",
-                    "text": content,
-                    "image_caption": ["收入结构", "按期末数"],
-                    "image_footnote": ["注：未经审计"],
-                },
-                {
-                    "kind": "image",
-                    "raw_kind": "image",
-                    "order_index": 3,
-                    "source_item_index": 3,
-                    "ir_id": "ir_0003",
-                    "page_no": 6,
-                    "image_path": f"images/{'b' * 64}.jpg",
-                },
-            ]
-        )
-
-        image_units = [item for item in result.elements if item.payload]
-        self.assertEqual(len(image_units), 2)
-        self.assertEqual(image_units[0].payload["image_ref"], f"images/{digest}.jpg")
-        self.assertEqual(image_units[0].payload["caption"], "收入结构\n按期末数")
-        self.assertEqual(image_units[0].payload["context"], "股权结构图")
-        self.assertEqual(image_units[0].payload["content"], content)
-        self.assertEqual(image_units[0].payload["notes"], ["注：未经审计"])
-        self.assertEqual(image_units[0].quality_status, "needs_review")
-        locator = image_units[0].artifact_locator or {}
-        projection = locator["source_projection"]
-        self.assertEqual(
-            [item["target_field"] for item in projection["structured"]],
-            [
-                "payload.caption",
-                "payload.content",
-                "payload.notes.0",
-                "payload.context",
-            ],
-        )
-        self.assertEqual(
-            image_units[1].payload["image_ref"], f"images/{'b' * 64}.jpg"
-        )
-        self.assertEqual(image_units[1].payload["caption"], "")
-        self.assertEqual(image_units[1].payload["context"], "")
-        self.assertEqual(result.stats.dropped_by_kind["image"], 0)
-
-    def test_s1_preserves_fact_caption_when_image_path_is_missing(self) -> None:
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "image",
-                    "raw_kind": "image",
-                    "order_index": 1,
-                    "caption": "控股股东持股比例为51%",
-                }
-            ]
-        )
-
-        self.assertEqual(len(result.elements), 1)
-        self.assertIsNone(result.elements[0].text)
-        self.assertEqual(
-            result.elements[0].payload["text"],
-            "控股股东持股比例为51%",
-        )
-        self.assertEqual(result.elements[0].quality_status, "needs_review")
-        self.assertEqual(
-            result.elements[0].artifact_locator["derivation"]["kind"],
-            "image_caption_without_image",
-        )
-
-    def test_s1_chart_payload_carries_visual_subtype_and_projection(self) -> None:
-        # ub-2026.07-56: a MinerU chart (kind=image, raw_kind=chart) with a
-        # typed sub_type must publish visual_kind/visual_subtype and expose the
-        # subtype as a structured source projection onto payload.visual_subtype.
-        digest = "d" * 64
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "image",
-                    "raw_kind": "chart",
-                    "order_index": 1,
-                    "source_item_index": 1,
-                    "ir_id": "ir_0001",
-                    "page_no": 4,
-                    "image_path": f"images/{digest}.jpg",
-                    "visual_subtype": "bar",
-                    "image_caption": ["图1 营收结构"],
-                    "image_footnote": ["注：单位亿元"],
-                }
-            ]
-        )
-
-        chart = next(item for item in result.elements if item.payload)
-        self.assertEqual(chart.payload["visual_kind"], "chart")
-        self.assertEqual(chart.payload["visual_subtype"], "bar")
-        self.assertEqual(chart.payload["caption"], "图1 营收结构")
-        self.assertEqual(chart.payload["notes"], ["注：单位亿元"])
-        structured = (chart.artifact_locator or {})["source_projection"]["structured"]
-        subtype_projection = next(
-            item
-            for item in structured
-            if item["target_field"] == "payload.visual_subtype"
-        )
-        self.assertEqual(subtype_projection["source"]["field"]["kind"], "visual_subtype")
-
-    def test_s1_equation_payload_uses_content_fallback_without_notes(self) -> None:
-        # Equations never carry image_caption/image_footnote; the caption falls
-        # back to the formula content and no notes key is emitted.
-        digest = "e" * 64
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "equation",
-                    "raw_kind": "equation",
-                    "order_index": 1,
-                    "source_item_index": 1,
-                    "ir_id": "ir_0001",
-                    "page_no": 2,
-                    "image_path": f"images/{digest}.jpg",
-                    "text": "$$x=1$$",
-                }
-            ]
-        )
-
-        equation = next(item for item in result.elements if item.payload)
-        self.assertEqual(equation.payload["visual_kind"], "equation")
-        self.assertEqual(equation.payload["caption"], "$$x=1$$")
-        self.assertNotIn("notes", equation.payload)
-
-    def test_s2_heading_tree_excludes_questions(self) -> None:
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading",
-                    order_index=1,
-                    text="第一节 重要提示、目录和释义",
-                    heading_level=1,
-                ),
-                PreparedElement(
-                    kind="text", order_index=2, text="2.请介绍集团业务矩阵？"
-                ),
-                PreparedElement(
-                    kind="text", order_index=3, text="答:业务覆盖多个领域。"
-                ),
-            ]
-        )
-
-        self.assertEqual(len(placed), 2)
-        self.assertEqual(placed[0].text, "2.请介绍集团业务矩阵？")
-        self.assertEqual(placed[0].kind, "text")
-        self.assertEqual(placed[0].heading_path, ["第一节 重要提示、目录和释义"])
-        self.assertNotIn("2.请介绍集团业务矩阵？", placed[1].heading_path)
-
-    def test_s2_qa_heading_mode_does_not_demote_declarative_numbering(self) -> None:
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading",
-                    order_index=1,
-                    text="6.请公司讲一下，2025年重点工作",
-                    heading_level=2,
-                ),
-                PreparedElement(kind="text", order_index=2, text="答:重点是海外业务。"),
-            ],
-            qa_heading_mode=True,
-        )
-
-        self.assertEqual(placed[0].kind, "text")
-        # QA discrimination was removed: the numbered request line is
-        # never split into a question/answer pair. Under qa_heading_mode it is
-        # demoted out of the heading tree yet stays one raw text unit that keeps
-        # the whole line as its title (declarative numbering is not fragmented).
-        units = s3_build_text_units(placed)
-        self.assertEqual([unit.payload_kind for unit in units], ["text"])
-        self.assertEqual(units[0].title, "6.请公司讲一下，2025年重点工作")
-
-    def test_numbered_business_sentences_remain_searchable_without_fragmenting(
-        self,
-    ) -> None:
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="text", order_index=1, text="1、公司不存在重大诉讼"
-                ),
-                PreparedElement(
-                    kind="text", order_index=2, text="2、公司不存在违规担保"
-                ),
-            ]
-        )
-
-        units = s3_build_text_units(placed)
-
-        self.assertEqual(len(units), 1)
-        self.assertIn("重大诉讼", units[0].payload["text"])
-        self.assertIn("违规担保", units[0].payload["text"])
-
-    def test_terminal_heading_remains_publicly_searchable(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "一、核心事实：收入增长20%",
-                    }
-                ]
+def _sample_share_change() -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    elements = [
+        _element(0, text="第七节 股份变动及股东情况", text_level=1),
+        _element(1, text="一、股份变动情况", text_level=2),
+        _element(2, text="1、股份变动情况", text_level=3),
+        _element(
+            3,
+            kind="table",
+            raw_kind="table",
+            table_caption=["单位：股"],
+            table_footnote=[],
+            table_html=(
+                "<table><tr><td>股份总数</td><td>843,978,741</td></tr></table>"
+            ),
+            table={
+                "headers": ["项目", "本次变动后"],
+                "rows": [["股份总数", "843,978,741"]],
+                "merged_cells": [],
             },
-            filing_type="other",
-        )
+        ),
+        _element(4, text="股份变动的原因"),
+    ]
+    headings = [
+        _heading(
+            1,
+            0,
+            text=str(elements[0]["text"]),
+            section_end=4,
+            level=1,
+        ),
+        _heading(
+            2,
+            1,
+            text=str(elements[1]["text"]),
+            section_end=4,
+            parent_node_id=1,
+            level=2,
+        ),
+        _heading(
+            3,
+            2,
+            text=str(elements[2]["text"]),
+            section_end=4,
+            parent_node_id=2,
+            level=3,
+        ),
+    ]
+    return elements, headings
 
-        self.assertEqual(len(units), 1)
-        self.assertEqual(units[0].payload["text"], "一、核心事实：收入增长20%")
-        self.assertEqual(stats.heading_only_carriers_preserved, 1)
-        self.assertEqual(stats.needs_review_count, 0)
 
-    def test_unnumbered_parser_headings_with_same_level_are_siblings(self) -> None:
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading", order_index=1, text="经营情况", heading_level=1
-                ),
-                PreparedElement(
-                    kind="heading", order_index=2, text="主营业务", heading_level=2
-                ),
-                PreparedElement(kind="text", order_index=3, text="业务事实。"),
-                PreparedElement(
-                    kind="heading", order_index=4, text="核心竞争力", heading_level=2
-                ),
-                PreparedElement(kind="text", order_index=5, text="竞争力事实。"),
-                PreparedElement(
-                    kind="heading", order_index=6, text="经营计划", heading_level=2
-                ),
-                PreparedElement(kind="text", order_index=7, text="计划事实。"),
-            ]
-        )
+def _all_visible_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return "\n".join(_all_visible_text(item) for item in value.values())
+    if isinstance(value, list):
+        return "\n".join(_all_visible_text(item) for item in value)
+    return ""
+
+
+def _source_indices(value: object) -> set[int]:
+    found: set[int] = set()
+    if isinstance(value, dict):
+        source_index = value.get("source_item_index")
+        if isinstance(source_index, int) and not isinstance(source_index, bool):
+            found.add(source_index)
+        for child in value.values():
+            found.update(_source_indices(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.update(_source_indices(child))
+    return found
+
+
+def _evidence_shape(unit: UnitDraft) -> tuple[object, ...]:
+    return (
+        unit.payload_kind,
+        unit.payload,
+        unit.source_order,
+        unit.heading_path,
+        unit.section_path,
+        unit.title,
+        unit.quality_status,
+        unit.applicability,
+        unit.artifact_locator,
+        unit.detached_from_section,
+    )
+
+
+class BuilderBoundaryTests(unittest.TestCase):
+    def test_structure_proof_is_required_and_bound_to_carriers(self) -> None:
+        elements = [_element(0, text="来源事实")]
+        with self.assertRaises(DocumentStructureContractError):
+            build_unit_drafts_s1_s7(
+                {
+                    "contract_version": "normalized_ir.v4",
+                    "source_pdf_sha256": _SOURCE_PDF_SHA256,
+                    "elements": elements,
+                },
+                filing_type="other",
+            )
+
+        proof = _proof(elements)
+        proof["carrier_set_sha256"] = "sha256:" + "f" * 64
+        with self.assertRaisesRegex(
+            DocumentStructureContractError,
+            "carrier set hash differs",
+        ):
+            build_unit_drafts_s1_s7(
+                {
+                    "contract_version": "normalized_ir.v4",
+                    "source_pdf_sha256": _SOURCE_PDF_SHA256,
+                    "elements": elements,
+                    "structure_proof": proof,
+                },
+                filing_type="other",
+            )
+
+    def test_routing_taxonomy_cannot_change_evidence_or_boundaries(self) -> None:
+        elements, headings = _sample_share_change()
+        baseline, _ = _build(elements, headings=headings)
+        with (
+            patch.object(
+                retrieval_routing,
+                "semantic_keys",
+                return_value=["taxonomy_probe"],
+            ),
+            patch.object(
+                retrieval_routing,
+                "note_keys",
+                return_value=["note_probe"],
+            ),
+        ):
+            rerouted, _ = _build(elements, headings=headings)
 
         self.assertEqual(
-            [item.structural_path for item in placed],
-            [
-                ["经营情况", "主营业务"],
-                ["经营情况", "核心竞争力"],
-                ["经营情况", "经营计划"],
-            ],
+            [_evidence_shape(unit) for unit in rerouted],
+            [_evidence_shape(unit) for unit in baseline],
+        )
+        self.assertNotEqual(
+            [unit.semantic_keys for unit in rerouted],
+            [unit.semantic_keys for unit in baseline],
         )
 
-    def test_s3_coalescing_preserves_each_source_locator(self) -> None:
-        units = s3_build_text_units(
-            [
-                PreparedElement(
-                    kind="text",
-                    order_index=1,
-                    page_no=1,
-                    text="第一段。",
-                    structural_path=["经营情况"],
-                    artifact_locator={"order_index": 1, "page_no": 1, "bbox": [0, 0, 1, 1]},
-                ),
-                PreparedElement(
-                    kind="text",
-                    order_index=2,
-                    page_no=2,
-                    text="第二段。",
-                    structural_path=["经营情况"],
-                    artifact_locator={"order_index": 2, "page_no": 2, "bbox": [0, 0, 1, 1]},
-                ),
-            ]
-        )
-
-        self.assertEqual(len(units), 1)
-        locator = units[0].artifact_locator
-        self.assertEqual(locator["source_order_span"], [1, 2])
-        self.assertEqual(locator["page_span"], [1, 2])
-        self.assertEqual(len(locator["source_locators"]), 2)
-
-    def test_s2_persists_full_source_hierarchy_on_public_path(self) -> None:
+    def test_future_carrier_fails_closed_instead_of_being_dropped(self) -> None:
         elements = [
-            PreparedElement(
-                kind="heading",
-                order_index=index,
-                text=title,
-                heading_level=index,
-            )
-            for index, title in enumerate(
-                ["一级", "二级", "三级", "四级", "五级"], start=1
+            _element(
+                0,
+                kind="audio",
+                raw_kind="future_audio",
+                text="不得静默丢弃的未来载荷",
             )
         ]
-        elements.append(
-            PreparedElement(kind="text", order_index=6, text="完整层级下的事实。")
-        )
+        with self.assertRaisesRegex(
+            SourceEvidenceClosureError,
+            "unsupported NormalizedIR carrier kind",
+        ):
+            _build(elements)
 
-        placed = s2_apply_heading_tree(elements)
 
-        self.assertEqual(
-            placed[0].heading_path,
-            ["一级", "二级", "三级", "四级", "五级"],
-        )
-        self.assertEqual(
-            placed[0].structural_path,
-            ["一级", "二级", "三级", "四级", "五级"],
-        )
-
-    def test_numbering_never_discards_parser_proven_parent(self) -> None:
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading", order_index=1, text="管理层讨论", heading_level=1
-                ),
-                PreparedElement(
-                    kind="heading", order_index=2, text="经营分析", heading_level=2
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=3,
-                    text="一、分产品分析",
-                    heading_level=3,
-                ),
-                PreparedElement(kind="text", order_index=4, text="产品事实。"),
-            ]
-        )
-
-        self.assertEqual(
-            placed[0].heading_path,
-            ["管理层讨论", "经营分析", "一、分产品分析"],
-        )
-
-    def test_repeated_same_title_sections_keep_distinct_occurrence_identity(
-        self,
-    ) -> None:
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading", order_index=1, text="项目情况", heading_level=1
-                ),
-                PreparedElement(kind="text", order_index=2, text="甲项目事实。"),
-                PreparedElement(
-                    kind="heading", order_index=3, text="项目情况", heading_level=1
-                ),
-                PreparedElement(kind="text", order_index=4, text="乙项目事实。"),
-            ]
-        )
-
-        self.assertEqual([item.heading_path for item in placed], [["项目情况"]] * 2)
-        self.assertNotEqual(placed[0].section_path, placed[1].section_path)
-        units = s3_build_text_units(placed)
-        self.assertEqual(
-            [unit.payload["text"] for unit in units],
-            ["甲项目事实。", "乙项目事实。"],
-        )
-
-    def test_short_structured_document_keeps_explicit_chapter_boundaries(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "第一章 总则",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "第一条 为完善治理结构，制定本办法。",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "heading_level": 1,
-                        "text": "第二章 附则",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 4,
-                        "text": "第二条 本办法自发布之日起施行。",
-                    },
-                ]
-            },
-            filing_type="other",
-            document_title="贵州茅台：董事、高级管理人员考核和薪酬管理办法",
-        )
-
-        self.assertEqual(
-            [unit.heading_path for unit in units],
-            [["第一章 总则"], ["第二章 附则"]],
-        )
-        self.assertIn("完善治理结构", units[0].payload["text"])
-        self.assertIn("发布之日起施行", units[1].payload["text"])
-
-    def test_s2_preserves_parser_level_for_ambiguous_unnumbered_heading(
-        self,
-    ) -> None:
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading",
-                    order_index=1,
-                    heading_level=1,
-                    text="第八节 财务报告",
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=2,
-                    heading_level=2,
-                    text="42、其他重要的会计政策和会计估计",
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=3,
-                    heading_level=2,
-                    text="与回购公司股份相关的会计处理方法",
-                ),
-                PreparedElement(
-                    kind="text", order_index=4, text="按实际支付的金额作为库存股处理。"
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=5,
-                    heading_level=2,
-                    text="43、重要会计政策和会计估计变更",
-                ),
-                PreparedElement(kind="text", order_index=6, text="无变更。"),
-            ]
-        )
-
-        body = next(item for item in placed if item.text == "按实际支付的金额作为库存股处理。")
-        change = next(item for item in placed if item.text == "无变更。")
-        orphan = next(
-            item for item in placed if item.text == "42、其他重要的会计政策和会计估计"
-        )
-        self.assertEqual(
-            body.heading_path,
-            ["第八节 财务报告", "与回购公司股份相关的会计处理方法"],
-        )
-        self.assertEqual(
-            change.heading_path,
-            ["第八节 财务报告", "43、重要会计政策和会计估计变更"],
-        )
-        self.assertEqual(orphan.heading_path[-1], orphan.text)
-
-    def test_s2_degenerate_parser_levels_never_root_numbered_deep_heading(
-        self,
-    ) -> None:
-        # vlm corpus shape: every heading_level is the same constant, so the
-        # enumeration grammar is the only depth evidence. An unnumbered
-        # heading between digit_paren blocks used to inherit the deep sibling
-        # logical level as a root, after which consecutive ``1）`` blocks
-        # evicted each other into false roots (the 5,390-unit corpus family).
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading",
-                    order_index=1,
-                    heading_level=1,
-                    text="第三节 财务报告",
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=2,
-                    heading_level=1,
-                    text="一、合并财务报表项目注释",
-                ),
-                PreparedElement(
-                    kind="heading", order_index=3, heading_level=1, text="（一）商誉"
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=4,
-                    heading_level=1,
-                    text="1）预计未来现金流量的现值",
-                ),
-                PreparedElement(
-                    kind="text", order_index=5, text="现值按五年期预测计算。"
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=6,
-                    heading_level=1,
-                    text="商誉减值测试的关键参数",
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=7,
-                    heading_level=1,
-                    text="1）税前折现率的确定方法",
-                ),
-                PreparedElement(kind="text", order_index=8, text="折现率取加权平均值。"),
-            ]
-        )
-
-        deep_body = next(
-            item for item in placed if item.text == "现值按五年期预测计算。"
-        )
-        self.assertEqual(
-            deep_body.heading_path,
-            [
-                "第三节 财务报告",
-                "一、合并财务报表项目注释",
-                "（一）商誉",
-                "1）预计未来现金流量的现值",
-            ],
-        )
-        # The numbered deep form must never be a root anywhere in the document.
-        for item in placed:
-            self.assertIn(
-                item.heading_path[0],
-                {"第三节 财务报告", "商誉减值测试的关键参数"},
-                msg=f"false root for {item.text!r}: {item.heading_path}",
-            )
-
-    def test_s2_varied_parser_levels_keep_parser_priority_for_same_sequence(
-        self,
-    ) -> None:
-        # Adjacent negative: the same text sequence with a varied (informative)
-        # parser level set keeps the existing parser-priority semantics — the
-        # parser-proven top section stays the retained parent throughout.
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading",
-                    order_index=1,
-                    heading_level=1,
-                    text="第三节 财务报告",
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=2,
-                    heading_level=2,
-                    text="一、合并财务报表项目注释",
-                ),
-                PreparedElement(
-                    kind="heading", order_index=3, heading_level=2, text="（一）商誉"
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=4,
-                    heading_level=2,
-                    text="1）预计未来现金流量的现值",
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=5,
-                    heading_level=2,
-                    text="商誉减值测试的关键参数",
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=6,
-                    heading_level=2,
-                    text="1）税前折现率的确定方法",
-                ),
-                PreparedElement(kind="text", order_index=7, text="折现率取加权平均值。"),
-            ]
-        )
-
-        body = next(item for item in placed if item.text == "折现率取加权平均值。")
-        self.assertEqual(body.heading_path[0], "第三节 财务报告")
-        self.assertEqual(body.heading_path[-1], "1）税前折现率的确定方法")
-
-    def test_s2_degenerate_unnumbered_heading_anchors_below_numbered_parent(
-        self,
-    ) -> None:
-        # In a degenerate-parser document an
-        # unnumbered heading has no depth evidence, so it anchors below the
-        # stack top instead of resetting to root — ancestors survive for both
-        # its own body and the numbered sibling that follows.
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading", order_index=1, heading_level=1, text="第一节 财务报告"
-                ),
-                PreparedElement(
-                    kind="heading", order_index=2, heading_level=1, text="一、公司概况"
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=3,
-                    heading_level=1,
-                    text="审计报告基本情况",
-                ),
-                PreparedElement(kind="text", order_index=4, text="审计意见为标准无保留。"),
-                PreparedElement(
-                    kind="heading", order_index=5, heading_level=1, text="（一）资产构成"
-                ),
-                PreparedElement(kind="text", order_index=6, text="资产以流动资产为主。"),
-            ]
-        )
-
-        audit_body = next(
-            item for item in placed if item.text == "审计意见为标准无保留。"
-        )
-        asset_body = next(
-            item for item in placed if item.text == "资产以流动资产为主。"
-        )
-        self.assertEqual(
-            audit_body.heading_path,
-            ["第一节 财务报告", "一、公司概况", "审计报告基本情况"],
-        )
-        self.assertEqual(
-            asset_body.heading_path,
-            ["第一节 财务报告", "一、公司概况", "（一）资产构成"],
-        )
-
-    def test_s2_degenerate_consecutive_unnumbered_headings_stay_siblings(
-        self,
-    ) -> None:
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading", order_index=1, heading_level=1, text="第一节 财务报告"
-                ),
-                PreparedElement(
-                    kind="heading", order_index=2, heading_level=1, text="一、公司概况"
-                ),
-                PreparedElement(
-                    kind="heading", order_index=3, heading_level=1, text="主要会计数据"
-                ),
-                PreparedElement(kind="text", order_index=4, text="营业收入十亿元。"),
-                PreparedElement(
-                    kind="heading", order_index=5, heading_level=1, text="补充财务指标"
-                ),
-                PreparedElement(kind="text", order_index=6, text="加权净资产收益率。"),
-            ]
-        )
-
-        second = next(item for item in placed if item.text == "加权净资产收益率。")
-        self.assertEqual(
-            second.heading_path,
-            ["第一节 财务报告", "一、公司概况", "补充财务指标"],
-        )
-        self.assertNotIn("主要会计数据", second.heading_path)
-
-    def test_s2_degenerate_unnumbered_after_fixed_anchor_stays_root_sibling(
-        self,
-    ) -> None:
-        # FIXED_L1 anchors declare a statutory root but prove no depth below
-        # themselves, so a following unnumbered heading stays a root sibling
-        # rather than being swallowed into the anchor's section.
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading", order_index=1, heading_level=1, text="重要提示"
-                ),
-                PreparedElement(kind="text", order_index=2, text="本报告未经审计。"),
-                PreparedElement(
-                    kind="heading", order_index=3, heading_level=1, text="其他事项说明"
-                ),
-                PreparedElement(kind="text", order_index=4, text="无其他事项。"),
-            ]
-        )
-
-        other = next(item for item in placed if item.text == "无其他事项。")
-        self.assertEqual(other.heading_path, ["其他事项说明"])
-
-    def test_s2_swallowed_section_title_in_table_caption_opens_section(
-        self,
-    ) -> None:
-        # A layout backend folds a section title set flush against its first
-        # table into that table's caption (释义 / 第十节财务报告 / 附表：…).
-        # The caption opens the section; a continuation caption of the open
-        # section never reopens it, and ordinary captions never qualify.
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading", order_index=1, heading_level=1, text="重要提示"
-                ),
-                PreparedElement(kind="text", order_index=2, text="本报告未经审计。"),
-                PreparedElement(
-                    kind="table",
-                    order_index=3,
-                    heading_level=None,
-                    table_caption=["释义"],
-                    payload={"rows": [["释义项", "指", "内容"]]},
-                ),
-                PreparedElement(
-                    kind="table",
-                    order_index=4,
-                    heading_level=None,
-                    table_caption=["第十节财务报告"],
-                    payload={"rows": [["审计意见类型", "标准无保留"]]},
-                ),
-                PreparedElement(
-                    kind="heading", order_index=5, heading_level=1, text="一、审计报告"
-                ),
-                PreparedElement(kind="text", order_index=6, text="审计意见正文。"),
-                PreparedElement(
-                    kind="table",
-                    order_index=7,
-                    heading_level=None,
-                    table_caption=["第十节财务报告（续）"],
-                    payload={"rows": [["合并资产负债表", ""]]},
-                ),
-                PreparedElement(
-                    kind="table",
-                    order_index=8,
-                    heading_level=None,
-                    table_caption=["单位：元"],
-                    payload={"rows": [["资产", "100"]]},
-                ),
-            ]
-        )
-
-        definitions_table = next(
-            item for item in placed if item.table_caption == ["释义"]
-        )
-        self.assertEqual(definitions_table.heading_path, ["释义"])
-        audit_body = next(item for item in placed if item.text == "审计意见正文。")
-        self.assertEqual(
-            audit_body.heading_path, ["第十节财务报告", "一、审计报告"]
-        )
-        # The continuation caption stays inside the open section instead of
-        # reopening it, and the ordinary caption changes nothing.
-        continuation = next(
-            item
-            for item in placed
-            if item.table_caption == ["第十节财务报告（续）"]
-        )
-        self.assertEqual(continuation.heading_path[0], "第十节财务报告")
-        plain = next(item for item in placed if item.table_caption == ["单位：元"])
-        self.assertEqual(plain.heading_path[0], "第十节财务报告")
-
-    def test_numbered_request_line_without_question_mark_is_not_a_heading(
-        self,
-    ) -> None:
-        # Transcript questions phrased as requests ("N. 请介绍…。") carry no
-        # question mark yet are dialogue, not section headings.
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading",
-                    order_index=1,
-                    heading_level=1,
-                    text="4. 请介绍一下信用卡业务的整体经营情况。",
-                ),
-                PreparedElement(kind="text", order_index=2, text="信用卡业务保持稳健。"),
-            ]
-        )
-        body = next(item for item in placed if item.text == "信用卡业务保持稳健。")
-        self.assertEqual(body.heading_path, [])
-
-    def test_s2_toc_declared_opener_roots_instead_of_anchoring(self) -> None:
-        # A degenerate document whose TOC declares "第X章 <title>" proves that
-        # a prefix-less body opener with the same title is a top-level section
-        # (the 招商银行 family); without that declaration the same heading
-        # anchors below the stack top.
-        toc_block = "\n".join(
-            [
-                "10 第一章 公司简介",
-                "14 第二章 会计数据和财务指标摘要",
-                "19 第三章 管理层讨论与分析",
-                "72 第四章 环境、社会与治理(ESG)",
-                "80 第五章 公司治理",
-            ]
-        )
+class StructureProofProjectionTests(unittest.TestCase):
+    def test_empty_visual_stays_in_mixed_section_with_sibling_evidence(self) -> None:
         elements = [
-            PreparedElement(
-                kind="heading", order_index=1, heading_level=1, text="公司简介"
+            _element(0, text="第一节 经营情况", text_level=1),
+            _element(1, text="主营业务收入增长。"),
+            _element(
+                2,
+                kind="image",
+                raw_kind="image",
+                image_path="images/" + "d" * 64 + ".png",
+                image_caption=[],
+                image_footnote=[],
             ),
-            PreparedElement(
-                kind="heading", order_index=2, heading_level=1, text="一、基本情况"
+            _element(
+                3,
+                kind="table",
+                raw_kind="table",
+                table_caption=["单位：万元"],
+                table_footnote=[],
+                table_html="<table><tr><td>收入</td><td>100</td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["收入", "100"]],
+                    "merged_cells": [],
+                },
             ),
-            PreparedElement(kind="text", order_index=3, text="简介正文。"),
-            PreparedElement(
-                kind="heading", order_index=4, heading_level=1, text="管理层讨论与分析"
-            ),
-            PreparedElement(kind="text", order_index=5, text="经营回顾正文。"),
-            PreparedElement(
-                kind="heading", order_index=6, heading_level=1, text="资产负债情况"
-            ),
-            PreparedElement(kind="text", order_index=7, text="资产结构正文。"),
         ]
-        from disclosure_anchor.adapters.unit_builder import toc_outline
+        headings = [
+            _heading(
+                1,
+                0,
+                text="第一节 经营情况",
+                section_end=3,
+                level=1,
+            )
+        ]
 
-        toc_root_keys = toc_outline.toc_declared_root_keys([toc_block])
-        placed = s2_apply_heading_tree(elements, toc_root_keys=toc_root_keys)
-
-        mda = next(item for item in placed if item.text == "经营回顾正文。")
-        self.assertEqual(mda.heading_path, ["管理层讨论与分析"])
-        # A heading the TOC does not declare keeps the anchoring behavior.
-        other = next(item for item in placed if item.text == "资产结构正文。")
-        self.assertEqual(
-            other.heading_path, ["管理层讨论与分析", "资产负债情况"]
-        )
-        # Without the TOC evidence the same opener anchors below the numbered
-        # section instead of rooting.
-        placed_without = s2_apply_heading_tree(elements)
-        mda_without = next(
-            item for item in placed_without if item.text == "经营回顾正文。"
-        )
-        self.assertEqual(
-            mda_without.heading_path,
-            ["公司简介", "一、基本情况", "管理层讨论与分析"],
-        )
-
-    def test_s2_varied_parser_levels_skip_unnumbered_anchoring(self) -> None:
-        # Adjacent negative: with an informative parser level set the anchoring
-        # branch must not fire — the unnumbered heading keeps parser semantics
-        # (level 2 cuts back to the level-1 section, dropping 一、).
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading", order_index=1, heading_level=1, text="第一节 财务报告"
-                ),
-                PreparedElement(
-                    kind="heading", order_index=2, heading_level=2, text="一、公司概况"
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=3,
-                    heading_level=2,
-                    text="审计报告基本情况",
-                ),
-                PreparedElement(kind="text", order_index=4, text="审计意见为标准无保留。"),
-            ]
-        )
-
-        body = next(item for item in placed if item.text == "审计意见为标准无保留。")
-        self.assertEqual(
-            body.heading_path, ["第一节 财务报告", "审计报告基本情况"]
-        )
-
-    def test_s2_missing_parser_levels_fall_back_to_numbering_grammar(self) -> None:
-        # Boundary: no heading carries a parser level at all — the level set is
-        # empty, the document is degenerate, and grammar depths must hold.
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(kind="heading", order_index=1, text="第三节 财务报告"),
-                PreparedElement(
-                    kind="heading", order_index=2, text="一、合并财务报表项目注释"
-                ),
-                PreparedElement(
-                    kind="heading", order_index=3, text="1）预计未来现金流量的现值"
-                ),
-                PreparedElement(kind="text", order_index=4, text="现值按五年期预测计算。"),
-            ]
-        )
-
-        body = next(item for item in placed if item.text == "现值按五年期预测计算。")
-        self.assertEqual(
-            body.heading_path,
-            ["第三节 财务报告", "一、合并财务报表项目注释", "1）预计未来现金流量的现值"],
-        )
-
-    def test_s2_does_not_reparent_from_one_ordinal_coincidence(self) -> None:
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading",
-                    order_index=1,
-                    heading_level=1,
-                    text="第八节 财务报告",
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=2,
-                    heading_level=2,
-                    text="十二、与金融工具相关的风险",
-                ),
-                PreparedElement(
-                    kind="heading", order_index=3, heading_level=2, text="(一) 信用风险"
-                ),
-                PreparedElement(kind="text", order_index=4, text="信用风险管理。"),
-                PreparedElement(
-                    kind="heading",
-                    order_index=5,
-                    heading_level=2,
-                    text="(二) 流动性风险",
-                ),
-                PreparedElement(kind="text", order_index=6, text="流动性管理。"),
-                PreparedElement(
-                    kind="heading",
-                    order_index=7,
-                    heading_level=2,
-                    text="三、（市场风险）",
-                ),
-                PreparedElement(kind="text", order_index=8, text="市场风险说明。"),
-            ]
-        )
-
-        market = placed[-1]
-        self.assertEqual(
-            market.heading_path,
-            ["第八节 财务报告", "三、（市场风险）"],
-        )
-
-        counterexample = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading", order_index=1, heading_level=1, text="第八节"
-                ),
-                PreparedElement(
-                    kind="heading", order_index=2, heading_level=2, text="二、业务概况"
-                ),
-                PreparedElement(
-                    kind="heading", order_index=3, heading_level=3, text="3、子项"
-                ),
-                PreparedElement(
-                    kind="heading", order_index=4, heading_level=2, text="四、独立事项"
-                ),
-                PreparedElement(kind="text", order_index=5, text="独立事实。"),
-            ]
-        )
-        self.assertEqual(
-            counterexample[-1].heading_path,
-            ["第八节", "四、独立事项"],
-        )
-
-    def test_s2_dot_subitem_nests_under_dunhao_note_heading(self) -> None:
-        # cn_a_v6 (round14): 、-numbered 科目 headings and .-numbered sub-items
-        # are different levels. On the real 江海 annual, "1. 存货的分类" used to
-        # evict "17、存货" from the stack, so every 存货 policy sub-item lost its
-        # 科目 ancestor from heading_path (text-kind and heading-kind alike:
-        # MinerU tags "1. 共同控制、重大影响的判断" as heading_level=2).
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading",
-                    order_index=1,
-                    heading_level=1,
-                    text="第八节 财务报告",
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=2,
-                    heading_level=2,
-                    text="五、重要会计政策及会计估计",
-                ),
-                PreparedElement(
-                    kind="heading", order_index=3, heading_level=2, text="17、存货"
-                ),
-                PreparedElement(kind="text", order_index=4, text="1. 存货的分类"),
-                PreparedElement(
-                    kind="text", order_index=5, text="存货包括产成品、在产品和原材料。"
-                ),
-                PreparedElement(
-                    kind="text", order_index=6, text="2. 发出存货的计价方法"
-                ),
-                PreparedElement(
-                    kind="text", order_index=7, text="发出存货采用加权平均法。"
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=8,
-                    heading_level=2,
-                    text="18、持有待售资产",
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=9,
-                    heading_level=2,
-                    text="1. 共同控制、重大影响的判断",
-                ),
-                PreparedElement(kind="text", order_index=10, text="按照相关约定判断。"),
-            ]
-        )
-
-        by_text = {item.text: item for item in placed}
-        self.assertEqual(
-            by_text["存货包括产成品、在产品和原材料。"].heading_path,
-            ["第八节 财务报告", "五、重要会计政策及会计估计", "17、存货"],
-        )
-        self.assertEqual(
-            by_text["发出存货采用加权平均法。"].heading_path,
-            ["第八节 财务报告", "五、重要会计政策及会计估计", "17、存货"],
-        )
-        # The 、-chain continues past the sub-items (18、 ordinal follows 17、),
-        # and a heading-kind dot item nests instead of evicting.
-        self.assertEqual(
-            by_text["按照相关约定判断。"].heading_path,
-            [
-                "第八节 财务报告",
-                "五、重要会计政策及会计估计",
-                "18、持有待售资产",
-                "1. 共同控制、重大影响的判断",
-            ],
-        )
-
-    def test_s2_dotted_outline_recovers_flattened_parser_hierarchy(self) -> None:
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 1,
-                    "heading_level": 1,
-                    "text": "财务报表附注",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 2,
-                    "heading_level": 1,
-                    "text": "3. 重要会计政策和会计估计",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 3,
-                    "heading_level": 1,
-                    "text": "3.1 总体经营情况",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 4,
-                    "heading_level": 1,
-                    "text": "3.1.1 外部环境",
-                },
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 5,
-                    "text": "外部环境保持复杂。",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 6,
-                    "heading_level": 1,
-                    "text": "3.2 利润表分析",
-                },
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 7,
-                    "text": "利润表分析正文。",
-                },
-            ]
-        )
-
-        placed = s2_apply_heading_tree(result.elements)
-        body = {item.text: item for item in placed if item.text}
-        self.assertEqual(
-            body["外部环境保持复杂。"].heading_path,
-            [
-                "财务报表附注",
-                "3. 重要会计政策和会计估计",
-                "3.1 总体经营情况",
-                "3.1.1 外部环境",
-            ],
-        )
-        self.assertEqual(
-            body["利润表分析正文。"].heading_path,
-            [
-                "财务报表附注",
-                "3. 重要会计政策和会计估计",
-                "3.2 利润表分析",
-            ],
-        )
-
-    def test_s2_latin_and_roman_outline_recovers_flattened_hierarchy(self) -> None:
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 1,
-                    "heading_level": 1,
-                    "text": "3. 重要会计政策和会计估计",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 2,
-                    "heading_level": 1,
-                    "text": "(a) 遵循企业会计准则的声明",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 3,
-                    "heading_level": 1,
-                    "text": "(i) 计量基础",
-                },
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 4,
-                    "text": "采用权责发生制。",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 5,
-                    "heading_level": 1,
-                    "text": "(b) 重要会计政策",
-                },
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 6,
-                    "text": "政策保持一致。",
-                },
-            ]
-        )
-
-        placed = s2_apply_heading_tree(result.elements)
-        body = {item.text: item for item in placed if item.text}
-        self.assertEqual(
-            body["采用权责发生制。"].heading_path,
-            [
-                "3. 重要会计政策和会计估计",
-                "(a) 遵循企业会计准则的声明",
-                "(i) 计量基础",
-            ],
-        )
-        self.assertEqual(
-            body["政策保持一致。"].heading_path,
-            ["3. 重要会计政策和会计估计", "(b) 重要会计政策"],
-        )
-
-    def test_parenthesized_i_continues_a_proven_latin_sibling_run(self) -> None:
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 1,
-                    "heading_level": 1,
-                    "text": "3. 现金流量表附注",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 2,
-                    "heading_level": 1,
-                    "text": "(h) 现金流量表补充资料",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 3,
-                    "heading_level": 1,
-                    "text": "(i) 现金及现金等价物的构成",
-                },
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 4,
-                    "text": "构成明细如下。",
-                },
-            ]
-        )
-
-        placed = s2_apply_heading_tree(result.elements)
-        body = next(item for item in placed if item.text == "构成明细如下。")
-        self.assertEqual(
-            body.heading_path,
-            ["3. 现金流量表附注", "(i) 现金及现金等价物的构成"],
-        )
-
-    def test_direct_roman_run_is_sibling_children_of_non_latin_parent(self) -> None:
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 1,
-                    "heading_level": 1,
-                    "text": "1.1 信用风险管理",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 2,
-                    "heading_level": 1,
-                    "text": "(i) 发放贷款",
-                },
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 3,
-                    "text": "贷款风险说明。",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 4,
-                    "heading_level": 1,
-                    "text": "(ii) 债券",
-                },
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 5,
-                    "text": "债券风险说明。",
-                },
-            ]
-        )
-
-        placed = s2_apply_heading_tree(result.elements)
-        body = {item.text: item for item in placed if item.text}
-        self.assertEqual(
-            body["贷款风险说明。"].heading_path,
-            ["1.1 信用风险管理", "(i) 发放贷款"],
-        )
-        self.assertEqual(
-            body["债券风险说明。"].heading_path,
-            ["1.1 信用风险管理", "(ii) 债券"],
-        )
-
-    def test_roman_outline_supports_ordinals_beyond_ten(self) -> None:
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 1,
-                    "heading_level": 1,
-                    "text": "58. 风险管理",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 2,
-                    "heading_level": 1,
-                    "text": "(a) 信用风险",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 3,
-                    "heading_level": 1,
-                    "text": "(xi) 本金变动",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 4,
-                    "heading_level": 1,
-                    "text": "(xii) 信用质量分析",
-                },
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 5,
-                    "text": "信用质量正文。",
-                },
-            ]
-        )
-
-        placed = s2_apply_heading_tree(result.elements)
-        body = next(item for item in placed if item.text == "信用质量正文。")
-        self.assertEqual(
-            body.heading_path,
-            ["58. 风险管理", "(a) 信用风险", "(xii) 信用质量分析"],
-        )
-
-    def test_latin_clause_depth_is_relative_to_digit_paren_parent(self) -> None:
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 1,
-                    "heading_level": 1,
-                    "text": "(17) 无形资产",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 2,
-                    "heading_level": 1,
-                    "text": "(d) 使用寿命",
-                },
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 3,
-                    "text": "使用寿命按年限确定。",
-                },
-            ]
-        )
-
-        placed = s2_apply_heading_tree(result.elements)
-        body = next(item for item in placed if item.text == "使用寿命按年限确定。")
-        self.assertEqual(body.heading_path, ["(17) 无形资产", "(d) 使用寿命"])
-
-    def test_dotted_outline_never_uses_a_different_numeric_prefix_as_parent(
-        self,
-    ) -> None:
-        result = s1_preprocess_elements(
-            [
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 1,
-                    "heading_level": 1,
-                    "text": "第一章 总览",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 2,
-                    "heading_level": 1,
-                    "text": "1. 已知分支",
-                },
-                {
-                    "kind": "heading",
-                    "raw_kind": "text",
-                    "order_index": 3,
-                    "heading_level": 1,
-                    "text": "2.1 缺失父标题的分支",
-                },
-                {
-                    "kind": "text",
-                    "raw_kind": "text",
-                    "order_index": 4,
-                    "text": "证据正文。",
-                },
-            ]
-        )
-
-        placed = s2_apply_heading_tree(result.elements)
-        body = next(item for item in placed if item.text == "证据正文。")
-        self.assertEqual(
-            body.heading_path,
-            ["第一章 总览", "2.1 缺失父标题的分支"],
-        )
-
-    def test_root_heading_only_siblings_without_document_title_are_not_grouped(
-        self,
-    ) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "风险一",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "heading_level": 1,
-                        "text": "风险二",
-                    },
-                ]
-            },
-            filing_type="other",
-            document_title=None,
-        )
-
-        self.assertEqual([unit.payload_kind for unit in units], ["text", "text"])
-        self.assertEqual([unit.title for unit in units], ["风险一", "风险二"])
-        self.assertEqual(stats.heading_outline_units_generated, 0)
-
-    def test_headerless_captioned_table_uses_its_local_caption_anchor(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 1,
-                        "table_caption": ["募集资金使用表"],
-                        "table": {"headers": ["项目"], "rows": [["研发"]]},
-                    }
-                ]
-            },
-            filing_type="other",
-            document_title=None,
-        )
-
-        self.assertEqual(units[0].heading_path, ["募集资金使用表"])
-
-    def test_s2_colon_lead_in_nests_under_note_instead_of_evicting(self) -> None:
-        # Round14 companion defect: "2. 当公司…下列项目：" (heading candidate)
-        # used to evict "8、合营安排…" while its sibling "1. …。" stayed body
-        # text — the same note's children split across two ancestries.
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading",
-                    order_index=1,
-                    heading_level=2,
-                    text="8、合营安排分类及共同经营会计处理方法",
-                ),
-                PreparedElement(
-                    kind="text",
-                    order_index=2,
-                    text="1. 合营安排分为共同经营和合营企业。",
-                ),
-                PreparedElement(
-                    kind="text",
-                    order_index=3,
-                    text="2. 当公司为共同经营的合营方时，确认下列项目：",
-                ),
-                PreparedElement(
-                    kind="text", order_index=4, text="确认单独所持有的资产。"
-                ),
-            ]
-        )
-
-        self.assertEqual(
-            placed[0].heading_path, ["8、合营安排分类及共同经营会计处理方法"]
-        )
-        self.assertEqual(
-            placed[-1].heading_path,
-            ["8、合营安排分类及共同经营会计处理方法"],
-        )
-
-    def test_s2_decimal_amount_line_is_not_a_heading(self) -> None:
-        # cn_a_v6: the dot class carries (?!\d) — "1.5亿元…" is an amount
-        # sentence, not a numbered heading.
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading",
-                    order_index=1,
-                    heading_level=2,
-                    text="一、募集资金使用情况",
-                ),
-                PreparedElement(
-                    kind="text", order_index=2, text="1.5亿元用于产能建设项目"
-                ),
-            ]
-        )
-
-        self.assertEqual(placed[0].text, "1.5亿元用于产能建设项目")
-        self.assertEqual(placed[0].heading_path, ["一、募集资金使用情况"])
-
-    def test_s2_footnote_line_never_becomes_heading(self) -> None:
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading",
-                    order_index=1,
-                    heading_level=1,
-                    text="十一、关联方及关联交易",
-                ),
-                PreparedElement(
-                    kind="heading",
-                    order_index=2,
-                    heading_level=2,
-                    text="[注] 该金额系双方 2025 年 1-2 月交易金额",
-                ),
-                PreparedElement(kind="text", order_index=3, text="承租情况如下。"),
-            ]
-        )
-
-        self.assertEqual(placed[0].text, "[注] 该金额系双方 2025 年 1-2 月交易金额")
-        self.assertEqual(placed[0].kind, "text")
-        self.assertEqual(placed[0].heading_path, ["十一、关联方及关联交易"])
-        self.assertEqual(placed[1].heading_path, ["十一、关联方及关联交易"])
-
-    def test_boilerplate_guarantee_line_is_preserved_as_source_evidence(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "重要提示",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": (
-                            "本公司董事会及全体董事保证本公告内容不存在任何虚假记载、"
-                            "误导性陈述或者重大遗漏，并对其内容的真实性、准确性和完整性"
-                            "承担法律责任。\n公司存在退市风险，请投资者注意。"
-                        ),
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
+        units, _ = _build(elements, headings=headings)
 
         self.assertEqual(len(units), 1)
-        self.assertIn("董事会及全体董事保证", units[0].payload["text"])
-        self.assertIn("公司存在退市风险", units[0].payload["text"])
-
-    def test_guarantee_like_line_with_business_fact_is_never_dropped(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "text": (
-                            "公司保证本公告内容真实，2025年收入增长20%，"
-                            "不存在重大遗漏。"
-                        ),
-                    }
-                ]
-            },
-            filing_type="other",
+        self.assertEqual(units[0].payload_kind, "mixed")
+        self.assertEqual(units[0].title, "第一节 经营情况")
+        self.assertEqual(units[0].heading_path, ["第一节 经营情况"])
+        self.assertEqual(units[0].quality_status, "needs_review")
+        self.assertEqual(
+            [part["kind"] for part in units[0].payload["parts"]],
+            ["text", "image", "table"],
         )
+        image_part = units[0].payload["parts"][1]
+        self.assertEqual(image_part["caption"], "")
+        self.assertEqual(image_part["visual_kind"], "image")
+        self.assertEqual(image_part["quality_status"], "needs_review")
 
-        self.assertIn("收入增长20%", str(units[0].payload))
+    def test_deepest_proven_heading_owns_table_and_caption_is_not_title(self) -> None:
+        elements, headings = _sample_share_change()
+        units, _ = _build(elements, headings=headings)
 
-    def test_blank_rows_and_merged_cells_preserve_source_grid(self) -> None:
-        stats = BuildStats()
-        units = s5_build_table_units(
+        self.assertEqual(len(units), 1)
+        section = units[0]
+        self.assertEqual(section.payload_kind, "mixed")
+        self.assertEqual(section.title, "1、股份变动情况")
+        self.assertEqual(
+            section.heading_path,
             [
-                PreparedElement(
-                    kind="table",
-                    order_index=1,
-                    table={
-                        "headers": ["项目", "金额"],
-                        "rows": [["收入", "100"], ["", " "], ["成本", "60"]],
-                        "merged_cells": [
-                            {"row": 3, "col": 0, "rowspan": 1, "colspan": 2}
-                        ],
-                    },
-                )
+                "第七节 股份变动及股东情况",
+                "一、股份变动情况",
+                "1、股份变动情况",
             ],
-            stats,
         )
-
+        table_part = next(
+            part for part in section.payload["parts"] if part["kind"] == "table"
+        )
+        self.assertEqual(table_part["caption"], ["单位：股"])
+        self.assertNotEqual(section.title, "单位：股")
         self.assertEqual(
-            units[0].payload["rows"],
-            [["收入", "100"], ["", " "], ["成本", "60"]],
+            _source_indices(
+                {
+                    "payload": section.payload,
+                    "locator": section.artifact_locator,
+                }
+            ),
+            set(range(5)),
         )
-        self.assertEqual(stats.dropped_blank_table_rows, 0)
+
+    def test_cross_page_tables_share_proved_context_without_rewriting_cells(
+        self,
+    ) -> None:
+        elements = [
+            _element(0, text="第七节 股份变动及股东情况", text_level=1),
+            _element(1, text="一、股份变动情况", text_level=2),
+            _element(2, text="1、股份变动情况", text_level=3),
+            _element(
+                3,
+                kind="table",
+                raw_kind="table",
+                page_no=1,
+                image_path="images/page_24_table.png",
+                table_caption=["单位：股"],
+                table_footnote=[],
+                table_html="<table><tr><td>4、其</td><td></td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["4、其", ""]],
+                    "merged_cells": [],
+                },
+            ),
+            _element(
+                4,
+                kind="table",
+                raw_kind="table",
+                page_no=2,
+                image_path="images/page_25_table.png",
+                table_caption=[],
+                table_footnote=[],
+                table_html="<table><tr><td>他</td><td></td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["他", ""]],
+                    "merged_cells": [],
+                },
+            ),
+            _element(5, page_no=2, text="股份变动的原因"),
+        ]
+        headings = [
+            _heading(1, 0, text=str(elements[0]["text"]), section_end=5, level=1),
+            _heading(
+                2,
+                1,
+                text=str(elements[1]["text"]),
+                section_end=5,
+                parent_node_id=1,
+                level=2,
+            ),
+            _heading(
+                3,
+                2,
+                text=str(elements[2]["text"]),
+                section_end=5,
+                parent_node_id=2,
+                level=3,
+            ),
+        ]
+
+        units, _ = _build(elements, headings=headings)
+
+        self.assertEqual(len(units), 1)
+        section = units[0]
+        self.assertEqual(section.title, "1、股份变动情况")
         self.assertEqual(
-            units[0].payload["merged_cells"],
-            [{"row": 3, "col": 0, "rowspan": 1, "colspan": 2}],
+            section.heading_path,
+            [
+                "第七节 股份变动及股东情况",
+                "一、股份变动情况",
+                "1、股份变动情况",
+            ],
         )
-        locator = units[0].artifact_locator or {}
-        self.assertNotIn("merged_cells", locator)
-
-    def test_flat_document_units_anchor_under_document_title(self) -> None:
-        # Codex round7 美的 IR: form-table filings have no headings at all —
-        # units anchored under the registry title, never heading_path=[].
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 1,
-                        "table": {"headers": ["活动类别"], "rows": [["特定对象调研"]]},
-                    },
-                ]
-            },
-            filing_type="investor_relations",
-            document_title="美的集团股份有限公司投资者关系活动记录表",
-        )
-
+        parts = section.payload["parts"]
+        self.assertEqual([part["kind"] for part in parts], ["table", "table", "text"])
+        self.assertEqual(parts[0]["rows"], [["4、其", ""]])
+        self.assertEqual(parts[1]["rows"], [["他", ""]])
+        self.assertEqual(parts[0]["caption"], ["单位：股"])
+        self.assertNotEqual(section.title, "单位：股")
+        self.assertNotIn("4、其他", _all_visible_text(section.payload))
         self.assertEqual(
-            units[0].heading_path,
-            ["美的集团股份有限公司投资者关系活动记录表"],
+            [
+                part["artifact_locator"]["evidence_artifacts"][0]["artifact_role"]
+                for part in parts[:2]
+            ],
+            ["evidence_image_000003", "evidence_image_000004"],
         )
-        self.assertIsNotNone(units[0].title)
 
-    def test_qa_vocabulary_alone_does_not_downgrade_table_quality(self) -> None:
-        shredded = (
-            "机系列销量超56万套。户数量持续增长。" * 30 + "3. 公司业务当前的进展？"
-        )
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 1,
-                        "table": {"headers": [shredded], "rows": [["答：进展顺利。"]]},
-                    },
-                ]
-            },
-            filing_type="investor_relations",
-            document_title="投资者关系活动记录表",
-        )
+    def test_heading_like_text_never_opens_sections_without_proof(self) -> None:
+        elements, _ = _sample_share_change()
+        units, _ = _build(elements)
 
         table = next(unit for unit in units if unit.payload_kind == "table")
-        self.assertEqual(table.quality_status, "ok")
-        self.assertIn("进展顺利", str(table.payload))
+        self.assertIsNone(table.title)
+        self.assertEqual(table.heading_path, [])
+        visible = _all_visible_text([unit.payload for unit in units])
+        for expected in (
+            "第七节 股份变动及股东情况",
+            "一、股份变动情况",
+            "1、股份变动情况",
+            "单位：股",
+            "股份变动的原因",
+        ):
+            self.assertIn(expected, visible)
 
-    def test_year_line_never_becomes_numbered_heading(self) -> None:
-        # "2025 年度" matched the ^\d+\s numbered-heading pattern (user-found
-        # bug: it became a heading node under 财务报表附注 and stranded a
-        # 金额单位 line as its own unit).
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="heading", order_index=1, heading_level=1, text="财务报表附注"
-                ),
-                PreparedElement(
-                    kind="heading", order_index=2, heading_level=2, text="2025 年度"
-                ),
-                PreparedElement(kind="text", order_index=3, text="接上表。"),
-            ]
+    def test_equal_heading_text_occurrences_keep_distinct_identity(self) -> None:
+        elements = [
+            _element(0, text="风险提示"),
+            _element(1, text="甲事实"),
+            _element(2, text="风险提示"),
+            _element(3, text="乙事实"),
+        ]
+        headings = [
+            _heading(1, 0, text="风险提示", section_end=1),
+            _heading(2, 2, text="风险提示", section_end=3),
+        ]
+        units, _ = _build(elements, headings=headings)
+
+        self.assertEqual([unit.title for unit in units], ["风险提示", "风险提示"])
+        self.assertEqual([unit.section_path for unit in units], [[1], [2]])
+        self.assertEqual(
+            [unit.payload["text"] for unit in units],
+            ["甲事实", "乙事实"],
         )
 
-        # The year line nests as an unnumbered sub-label, never a numbered
-        # top-level node; and it must not evict 财务报表附注.
-        self.assertEqual(placed[-1].heading_path[0], "财务报表附注")
+    def test_heading_only_and_partial_span_evidence_remain_searchable(self) -> None:
+        heading_only = [_element(0, text="仅有标题")]
+        units, stats = _build(
+            heading_only,
+            headings=[_heading(1, 0, text="仅有标题", section_end=0)],
+        )
+        self.assertEqual(units[0].payload["text"], "仅有标题")
+        self.assertEqual(stats.heading_only_carriers_preserved, 1)
 
-    def test_plain_text_numeric_quantities_never_become_headings(self) -> None:
-        for text in ("1 年内到期债务为100万元", "2 个项目已完成验收"):
-            with self.subTest(text=text):
-                placed = s2_apply_heading_tree(
-                    [
-                        PreparedElement(kind="text", order_index=1, text=text),
-                        PreparedElement(kind="text", order_index=2, text="后续事实。"),
-                    ]
+        partial = [_element(0, text="第一节\n同一载荷中的正文")]
+        units, _ = _build(
+            partial,
+            headings=[
+                _heading(
+                    1,
+                    0,
+                    text=str(partial[0]["text"]),
+                    section_end=0,
+                    text_span=(0, 3),
                 )
-                self.assertEqual(placed[0].heading_path, [])
-                self.assertEqual(placed[1].heading_path, [])
+            ],
+        )
+        self.assertEqual(units[0].title, "第一节")
+        self.assertIn("同一载荷中的正文", units[0].payload["text"])
 
-    def test_unit_declaration_family_generalizes(self) -> None:
-        # Round11 (user directive 泛化能力): the declaration is a pattern
-        # FAMILY across filing formats; substantive sentences never match.
-        strip = [
-            "单位：元",
-            "金额单位：人民币元",
-            "货币单位：万元",
-            "币种：人民币",
-            "除特别注明外，本财务报表附注均以人民币元列示。",
-            "本报告中如无特殊说明，货币单位均为人民币元。",
+    def test_anchor_only_provider_title_inherits_coarser_section(self) -> None:
+        elements = [
+            _element(0, text="原生章节"),
+            _element(1, text="模型标题候选"),
+            _element(2, text="关键事实"),
         ]
-        keep = [
-            "财务附注中报表的单位为：元",
-            "营业收入单位：万元",
-            "单位：",
-            "金额单位为",
-            "币种：",
-            "公司记账本位币为人民币。",
-            "境外子公司以美元为记账本位币，折算方法见会计政策。",
-            "本报告中如无特殊说明，均指合并口径的经营数据及相关分析。",
-        ]
-        for line in strip:
-            self.assertTrue(rules.is_unit_declaration_line(line), line)
-        for line in keep:
-            self.assertFalse(rules.is_unit_declaration_line(line), line)
-
-    def test_amount_unit_declaration_stays_with_narrative_values(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "财务报表附注",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "金额单位：人民币元\n应收账款期末余额如下。",
-                    },
-                ]
-            },
-            filing_type="annual_report",
+        units, _ = _build(
+            elements,
+            headings=[
+                _heading(1, 0, text="原生章节", section_end=2),
+                _heading(
+                    2,
+                    1,
+                    text="模型标题候选",
+                    section_end=1,
+                    propagates=False,
+                ),
+            ],
         )
 
         self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].heading_path, ["原生章节"])
+        self.assertEqual(units[0].title, "原生章节")
         self.assertEqual(
             units[0].payload["text"],
-            "金额单位：人民币元\n应收账款期末余额如下。",
+            "模型标题候选\n关键事实",
         )
 
-    def test_expanded_semantic_vocabulary_samples(self) -> None:
-        cases = [
-            ("4、研发投入", "研发费用及人员构成如下", "rd_investment"),
-            ("前五名客户销售情况", "", "customer_concentration"),
-            ("现金流量表主要项目", "", "cash_flow"),
-            ("利润分配方案", "", "dividend"),
-            ("回购股份实施结果", "", "share_buyback"),
-        ]
-        for title, text, expected in cases:
-            with self.subTest(key=expected):
-                unit = UnitDraft(
-                    payload_kind="text",
-                    payload={"text": text or title},
-                    source_order=1,
-                    heading_path=[title],
-                    title=title,
-                )
-                self.assertEqual(
-                    semantic_keys_for_unit(unit, filing_type="annual_report")[:1],
-                    [expected],
-                )
-
-    def test_statutory_section_keys_and_filing_gates(self) -> None:
-        # Statutory report sections
-        # (格式准则第2号) plus the universal exchange-format notice preamble.
-        cases = [
-            ("重要内容提示:", "other", ["important_notice"]),
-            ("特别提示", "related_party", ["important_notice"]),
-            ("备查文件", "annual_report", ["reference_documents"]),
-            ("释义", "annual_report", ["definitions"]),
-            # Announcements carry 备查文件/释义 sections too.
-            ("备查文件", "other", ["reference_documents"]),
-            ("释义", "financing", ["definitions"]),
-        ]
-        for title, filing_type, expected in cases:
-            with self.subTest(title=title, filing_type=filing_type):
-                unit = UnitDraft(
-                    payload_kind="text",
-                    payload={"text": "内容"},
-                    source_order=1,
-                    title=title,
-                    heading_path=[title],
-                )
-                self.assertEqual(
-                    semantic_keys_for_unit(unit, filing_type=filing_type),
-                    expected,
-                )
-        self.assertEqual(
-            rules.note_key_for_title("非经常性损益项目和金额"),
-            "non_recurring_items",
-        )
-        # leaf_only: a combined ancestor title ("重要提示、目录和释义") must not
-        # leak section keys onto descendants; their own concepts win the scalar.
-        descendant = UnitDraft(
-            payload_kind="text",
-            payload={"text": "内容"},
-            source_order=1,
-            title="1、市场竞争风险",
-            heading_path=["第一节 重要提示、目录和释义", "1、市场竞争风险"],
-        )
-        self.assertEqual(
-            semantic_keys_for_unit(descendant, filing_type="annual_report"),
-            ["risk_factors"],
-        )
-
-    def test_announcement_section_keys_guarantee_and_incentive(self) -> None:
-        # Guarantee + equity-incentive section keys (交易所公告格式指引
-        # 交易类第5号 / 股权激励管理办法第九条), leaf_only and unrestricted
-        # by filing type.
-        cases = [
-            ("一、担保情况概述", "financing", ["guarantee_overview"]),
-            ("三、担保协议的主要内容", "financing", ["guarantee_agreement_terms"]),
-            ("五、累计对外担保数量及逾期担保的数量", "financing", ["cumulative_external_guarantees"]),
-            ("二、被担保人基本情况", "financing", ["guaranteed_party_profile"]),
-            ("（1）公司层面的业绩考核要求", "equity_incentive", ["incentive_performance_assessment"]),
-            ("7、行权安排", "equity_incentive", ["incentive_vesting_exercise"]),
-            ("6、归属安排", "equity_incentive", ["incentive_vesting_exercise"]),
-            ("7、有效期、限售期和解除限售安排", "equity_incentive", ["incentive_vesting_exercise"]),
-            ("（一）2021年激励计划简介及授予情况", "equity_incentive", ["incentive_plan_overview"]),
-            # Adjacent negatives: assessment
-            # and lockup-release phrases outside the incentive-plan idiom must
-            # not earn incentive scalars — a remuneration KPI section or an
-            # IPO lockup-expiry announcement shares the surface words.
-            ("四、高级管理人员的业绩考核要求", "annual_report", []),
-            ("三、解除限售安排", "equity_share_change", []),
-            # Related-party family and cross-announcement sections
-            # (交易类第9号 template phrasing).
-            ("一、关联交易概述", "related_party", ["related_party_overview"]),
-            ("二、关联方基本情况", "related_party", ["related_party_profile"]),
-            ("四、定价政策及定价依据", "related_party", ["transaction_pricing_basis"]),
-            ("五、关联交易协议的主要内容", "related_party", ["transaction_agreement_terms"]),
-            (
-                "八、与该关联人累计已发生的各类关联交易情况",
-                "related_party",
-                ["cumulative_related_party_transactions"],
-            ),
-            ("三、本次交易已履行的决策程序", "financing", ["decision_procedures"]),
-            ("五、独立财务顾问的专业意见", "restructuring_assets", ["intermediary_opinion"]),
-            ("目录", "annual_report", ["table_of_contents"]),
-            # 备查文件目录 keeps its statutory scalar; the TOC key joins the
-            # array only.
-            (
-                "备查文件目录",
-                "annual_report",
-                ["reference_documents", "table_of_contents"],
-            ),
-            # Fundraising family (再融资类第1/2/3号 template phrasing); the
-            # note-map fundraising_usage phrases stay disjoint so periodic
-            # scalars are untouched.
-            ("一、募集资金基本情况", "financing", ["fundraising_overview"]),
-            ("2、募集资金专户信息", "financing", ["fundraising_custody"]),
-            ("一、改变募集资金投资项目的概述", "financing", ["fundraising_repurposing"]),
-            ("六、本次归属募集资金的使用计划", "equity_incentive", ["fundraising_use_plan"]),
-            (
-                "三、本次结项的募投项目募集资金使用及节余情况",
-                "financing",
-                ["fundraising_project_status"],
-            ),
-            # MD&A product-pricing prose must not read as a transaction
-            # pricing section.
-            ("三、产品定价政策", "annual_report", []),
-        ]
-        for title, filing_type, expected in cases:
-            with self.subTest(title=title):
-                unit = UnitDraft(
-                    payload_kind="text",
-                    payload={"text": "内容"},
-                    source_order=1,
-                    title=title,
-                    heading_path=[title],
-                )
-                self.assertEqual(
-                    semantic_keys_for_unit(unit, filing_type=filing_type),
-                    expected,
-                )
-        # Periodic reports keep the coarse guarantee scalar; the section key
-        # joins the array without displacing it.
-        periodic = UnitDraft(
-            payload_kind="text",
-            payload={"text": "内容"},
-            source_order=1,
-            title="担保协议的主要内容",
-            heading_path=["第十节 财务报告", "十、担保情况", "担保协议的主要内容"],
-        )
-        self.assertEqual(
-            semantic_keys_for_unit(periodic, filing_type="annual_report"),
-            ["guarantee", "guarantee_agreement_terms"],
-        )
-        # leaf_only: an ancestor section title must not leak onto a descendant
-        # whose own slot carries no matching phrase.
-        descendant = UnitDraft(
-            payload_kind="text",
-            payload={"text": "内容"},
-            source_order=1,
-            title="反担保情况",
-            heading_path=["四、担保协议的主要内容", "反担保情况"],
-        )
-        self.assertEqual(
-            semantic_keys_for_unit(descendant, filing_type="financing"),
-            [],
-        )
-
-    def test_semantic_labels_use_complete_source_hierarchy(self) -> None:
-        unit = UnitDraft(
-            payload_kind="text",
-            payload={"text": "本期测试结果如下。"},
-            source_order=1,
-            heading_path=["第八节 财务报告", "其他"],
-            structural_path=[
-                "第八节 财务报告",
-                "七、资产减值",
-                "商誉减值测试",
-                "其他",
-            ],
-            title="其他",
-        )
-
-        self.assertIn(
-            "goodwill_impairment",
-            semantic_keys_for_unit(unit, filing_type="annual_report"),
-        )
-
-    def test_document_title_does_not_inject_event_keys_into_units(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "text": "公司日常经营正常。" * 40,
-                    },
-                ]
-            },
-            filing_type="other",
-            document_title="贵州茅台：关于回购股份实施结果暨股份变动的公告",
-        )
-
-        for unit in units:
-            self.assertNotIn("share_buyback_event", unit.semantic_keys or [])
-
-    def test_negated_document_title_is_not_published_as_confirmed_event(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "text": "该项目对本期经营无重大影响。",
-                    }
-                ]
-            },
-            filing_type="other",
-            document_title="关于项目未中标的公告",
-        )
-
-        self.assertTrue(units)
-        self.assertTrue(
-            all("contract_award" not in (unit.semantic_keys or []) for unit in units)
-        )
-
-    def test_note_vocabulary_keys_notes_sections(self) -> None:
-        # design/retrieval-and-semantic-keys.md §4: 附注标题是法定受控词表
-        # （编报规则第15号），标题剥编号后三级匹配派生 note key。
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "第八节 财务报告",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "heading_level": 2,
-                        "text": "七、合并财务报表项目注释",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "heading_level": 2,
-                        "text": "75、其他综合收益",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 4,
-                        "text": "本期其他综合收益变动如下。",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 5,
-                        "heading_level": 2,
-                        "text": "八、研发支出",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 6,
-                        "text": "研发支出按性质列示。",
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        # The tiny doc groups into one section unit; member note keys must
-        # surface on the aggregated semantic_keys column.
-        all_keys = {key for unit in units for key in (unit.semantic_keys or [])}
-        self.assertIn("other_comprehensive_income", all_keys)
-        self.assertIn("rd_expenses", all_keys)
-
-    def test_generic_leaf_inherits_ancestor_note_key(self) -> None:
-        # Round13 用户裁决: "(1) 明细情况" 类无科目语义标题必须从最近的科目
-        # 祖先继承键——L2 除 heading 外就靠 semantic_keys 检索。
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "第八节 财务报告",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "heading_level": 2,
-                        "text": "19、其他非流动金融资产",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "heading_level": 2,
-                        "text": "(1) 明细情况",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 4,
-                        "text": "其他非流动金融资产明细如下表所示。",
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        target = next(u for u in units if "明细" in str(u.payload))
-        self.assertIn("other_noncurrent_financial_assets", target.semantic_keys or [])
-        self.assertIn("financial_report_chapter", target.semantic_keys or [])
-        # 最具体键作为单值 semantic_key
-        self.assertEqual(target.semantic_key, "other_noncurrent_financial_assets")
-
-    def test_note_vocabulary_applies_to_other_filing_types(self) -> None:
-        # Round13: 审计报告等 'other' 文档同样承载报表/附注结构，词表键开放。
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "其他综合收益",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "临时公告正文。" * 1200,
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-        self.assertTrue(
-            any("other_comprehensive_income" in (u.semantic_keys or []) for u in units)
-        )
-
-    def test_full_s1_s7_sse_spaced_announce_no_dropped_as_noise(self) -> None:
-        # round17 语料：沪市信头「公告编号：临 2026-026」编号带内部空格，
-        # 旧模式漏放行，整段残片曾挂在合成锚下入库。
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "text": "公告编号：临 2026-026",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "heading_level": 1,
-                        "text": "关于聘任董事会秘书的公告",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "text": "董事会决定聘任张三为董事会秘书。",
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        self.assertEqual(stats.dropped_by_kind.get("standalone_noise", 0), 0)
-        self.assertEqual(stats.anchored_header_units, 0)
-        paths = {part for unit in units for part in unit.heading_path}
-        self.assertNotIn("公告头信息", paths)
-        self.assertIn("公告编号：临 2026-026", units[0].payload["text"])
-
-    def test_full_s1_s7_headerless_prefix_prefers_document_title(self) -> None:
-        # round17：首标题前的真内容属于文档本身——有注册标题用它做锚，
-        # 「公告头信息」只在 document_title 缺失时兜底。表单类文档的被困
-        # 标题与正文粘连无分隔，按宁漏勿脏不抽取，锚到文档标题即根本解法。
+    def test_unheaded_prelude_remains_searchable_without_invented_title(self) -> None:
         elements = [
-            {
-                "kind": "text",
-                "raw_kind": "text",
-                "order_index": 1,
-                "text": "截至本公告披露日，公司回购专用账户持有股份 1,200,000 股。",
-            },
-            {
-                "kind": "heading",
-                "raw_kind": "text",
-                "order_index": 2,
-                "heading_level": 1,
-                "text": "一、回购进展",
-            },
-            {
-                "kind": "text",
-                "raw_kind": "text",
-                "order_index": 3,
-                "text": "回购按计划推进。",
-            },
+            _element(0, text="公告封面原始说明"),
+            _element(1, text="第一节 正文"),
+            _element(2, text="业务事实"),
         ]
-
-        units, stats = build_unit_drafts_s1_s7(
-            {"elements": elements},
-            filing_type="annual_report",
-            document_title="某公司关于回购股份进展的公告",
-        )
-        self.assertEqual(stats.anchored_header_units, 1)
-        by_path = {tuple(unit.heading_path): unit for unit in units}
-        header = by_path[("某公司关于回购股份进展的公告",)]
-        self.assertIn("回购专用账户", str(header.payload))
-
-        units2, _ = build_unit_drafts_s1_s7(
-            {"elements": elements}, filing_type="annual_report"
-        )
-        by_path2 = {tuple(unit.heading_path): unit for unit in units2}
-        self.assertIn((), by_path2)
-        self.assertNotIn(("公告头信息",), by_path2)
-
-    def test_table_qa_text_is_not_published_as_duplicate_peer_unit(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 1,
-                        "table_caption": ["投关问答"],
-                        "table": {
-                            "headers": ["内容"],
-                            "rows": [["问:产能如何？\n答:产能稳定。"]],
-                        },
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "后续正文。",
-                    },
-                ]
-            },
-            filing_type="investor_relations",
+        units, _ = _build(
+            elements,
+            headings=[_heading(1, 1, text="第一节 正文", section_end=2)],
         )
 
-        self.assertEqual(
-            [unit.payload_kind for unit in units],
-            ["table", "text"],
-        )
-        self.assertIn("问:产能如何？", str(units[0].payload))
-        self.assertEqual(units[1].payload["text"], "后续正文。")
+        self.assertEqual(units[0].payload["text"], "公告封面原始说明")
+        self.assertIsNone(units[0].title)
+        self.assertEqual(units[1].title, "第一节 正文")
 
-    def test_s5_does_not_infer_continuation_from_shape_and_page(self) -> None:
-        stats = BuildStats()
+    def test_registered_title_cannot_change_unheaded_boundaries(self) -> None:
         elements = [
-            PreparedElement(
+            _element(0, text="正文说明"),
+            _element(
+                1,
                 kind="table",
-                order_index=1,
-                page_no=10,
-                table={"headers": [], "rows": [["项目", "金额"], ["收入", "10"]]},
-                table_footnote=["含追溯调整。"],
-                title="应收账款",
-            ),
-            PreparedElement(
-                kind="table",
-                order_index=2,
-                page_no=11,
-                table={"headers": [], "rows": []},
-                table_html="",
-            ),
-            PreparedElement(
-                kind="table",
-                order_index=3,
-                page_no=11,
-                table={"headers": [], "rows": [["项目", "金额"], ["成本", "8"]]},
-                table_caption=[],
-                title="应收账款",
-            ),
-        ]
-
-        units = s5_build_table_units(elements, stats)
-
-        self.assertEqual(len(units), 2)
-        self.assertEqual(units[0].payload["headers"], [])
-        self.assertEqual(
-            units[0].payload["rows"], [["项目", "金额"], ["收入", "10"]]
-        )
-        self.assertEqual(
-            units[1].payload["rows"], [["项目", "金额"], ["成本", "8"]]
-        )
-        self.assertEqual(units[0].payload["notes"], ["含追溯调整。"])
-        self.assertEqual(stats.dropped_by_kind["table_empty"], 1)
-
-    def test_s5_preserves_headerless_first_row_as_data(self) -> None:
-        units = s5_build_table_units(
-            [
-                PreparedElement(
-                    kind="table",
-                    order_index=1,
-                    table={
-                        "headers": [],
-                        "rows": [["2024", "100"], ["2025", "200"]],
-                    },
-                )
-            ],
-            BuildStats(),
-        )
-
-        self.assertEqual(units[0].payload["headers"], [])
-        self.assertEqual(
-            units[0].payload["rows"],
-            [["2024", "100"], ["2025", "200"]],
-        )
-
-    def test_caption_and_note_only_table_remains_searchable(self) -> None:
-        units = s5_build_table_units(
-            [
-                PreparedElement(
-                    kind="table",
-                    order_index=1,
-                    table_caption=["重大合同履行情况"],
-                    table_footnote=["注：截至期末尚未履行金额为1亿元。"],
-                    table={"headers": [], "rows": []},
-                )
-            ],
-            BuildStats(),
-        )
-
-        self.assertEqual(len(units), 1)
-        self.assertEqual(units[0].quality_status, "needs_review")
-        self.assertIn("1亿元", str(units[0].payload))
-
-    def test_truly_empty_table_carrier_is_still_dropped(self) -> None:
-        stats = BuildStats()
-        units = s5_build_table_units(
-            [
-                PreparedElement(
-                    kind="table",
-                    order_index=1,
-                    table={"headers": [], "rows": []},
-                )
-            ],
-            stats,
-        )
-
-        self.assertEqual(units, [])
-        self.assertEqual(stats.dropped_by_kind["table_empty"], 1)
-
-    def test_table_checkbox_caption_is_preserved_without_becoming_title(self) -> None:
-        for caption, applicability in (
-            ("√是 □否", None),
-            ("√适用 □不适用", "applicable"),
-        ):
-            with self.subTest(caption=caption):
-                units, _ = build_unit_drafts_s1_s7(
-                    {
-                        "elements": [
-                            {
-                                "kind": "table",
-                                "raw_kind": "table",
-                                "order_index": 1,
-                                "table_caption": [caption],
-                                "table": {
-                                    "headers": ["项目"],
-                                    "rows": [["事实"]],
-                                },
-                            }
-                        ]
-                    },
-                    filing_type="annual_report",
-                )
-
-                table = units[0]
-                self.assertEqual(table.payload["caption"], [caption])
-                self.assertIsNone(table.title)
-                self.assertEqual(table.applicability, applicability)
-
-    def test_s5_never_merges_tables_across_section_boundary(self) -> None:
-        # Audit-report expense notes share one 3-column shape; once cn_a_v6
-        # let their headings enter the stack, the tables became adjacent and
-        # column count alone merged 3. 销售费用 into 1. 营业收入 — the heading
-        # vanished from every path (ub-2026.07-18 swallowed-heading audit).
-        stats = BuildStats()
-        base = ["财务报表附注", "五、合并财务报表项目注释", "(二) 合并利润表项目注释"]
-        elements = [
-            PreparedElement(
-                kind="table",
-                order_index=1,
-                page_no=20,
+                raw_kind="table",
+                table_caption=["单位：股"],
+                table_footnote=[],
+                table_html="<table><tr><td>股份总数</td></tr></table>",
                 table={
-                    "headers": ["项目", "本期", "上期"],
-                    "rows": [["工资", "1", "2"]],
+                    "headers": [],
+                    "rows": [["股份总数"]],
+                    "merged_cells": [],
                 },
-                heading_path=[*base, "3. 销售费用"],
-                title="3. 销售费用",
             ),
-            PreparedElement(
-                kind="table",
-                order_index=2,
-                page_no=20,
-                table={
-                    "headers": ["项目", "本期", "上期"],
-                    "rows": [["折旧", "3", "4"]],
-                },
-                heading_path=[*base, "4. 管理费用"],
-                title="4. 管理费用",
-            ),
+            _element(2, text="表后解释"),
         ]
 
-        units = s5_build_table_units(elements, stats)
+        untitled, _ = _build(elements)
+        titled, _ = _build(
+            elements,
+            document_title="股份变动公告",
+        )
 
-        self.assertEqual(len(units), 2)
-        self.assertEqual(units[0].title, "3. 销售费用")
-        self.assertEqual(units[1].title, "4. 管理费用")
+        def boundary_signature(unit: UnitDraft) -> tuple[object, ...]:
+            return (
+                unit.payload_kind,
+                unit.source_order,
+                unit.heading_path,
+                unit.section_path,
+                unit.payload,
+            )
 
-    def test_s5_never_merges_independent_same_page_tables_by_shape(self) -> None:
-        stats = BuildStats()
-        path = ["一、经营情况"]
-        elements = [
-            PreparedElement(
-                kind="table",
-                order_index=1,
-                page_no=20,
-                table={"headers": ["项目", "金额"], "rows": [["收入", "10"]]},
-                heading_path=path,
-                structural_path=path,
-            ),
-            PreparedElement(
-                kind="table",
-                order_index=2,
-                page_no=20,
-                table={"headers": ["项目", "金额"], "rows": [["成本", "8"]]},
-                heading_path=path,
-                structural_path=path,
-            ),
-        ]
+        self.assertEqual(len(untitled), 3)
+        self.assertEqual(
+            [boundary_signature(unit) for unit in titled],
+            [boundary_signature(unit) for unit in untitled],
+        )
+        self.assertEqual(
+            [unit.payload_kind for unit in titled],
+            ["text", "table", "text"],
+        )
+        self.assertTrue(all(unit.title == "股份变动公告" for unit in titled))
+        self.assertTrue(all(unit.title is None for unit in untitled))
+        self.assertEqual(
+            titled[1].payload["caption"],
+            ["单位：股"],
+        )
 
-        units = s5_build_table_units(elements, stats)
-
-        self.assertEqual(len(units), 2)
-
-    def test_s5_empty_grid_with_html_fails_closed_even_without_upstream_flag(
+    def test_cross_page_qa_follows_proved_occurrences_not_lexical_markers(
         self,
     ) -> None:
-        units = s5_build_table_units(
-            [
-                PreparedElement(
-                    kind="table",
-                    order_index=1,
-                    table={"headers": [], "rows": []},
-                    table_html="<table><tr><td>收入</td></tr></table>",
-                    table_parse_failed=False,
-                )
-            ],
-            BuildStats(),
+        elements = [
+            _element(0, text="互动问答", page_no=1),
+            _element(1, text="问题一：请说明本期变化。", page_no=1),
+            _element(
+                2,
+                kind="table",
+                raw_kind="table",
+                page_no=1,
+                table_caption=["单位：万元"],
+                table_footnote=[],
+                table_html="<table><tr><td>本期</td><td>100</td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["本期", "100"]],
+                    "merged_cells": [],
+                },
+            ),
+            _element(3, text="回复：变化来自主营业务增长。", page_no=2),
+            _element(4, text="声明：上述数据以审计结果为准。", page_no=2),
+            _element(5, text="问题二", page_no=2),
+            _element(6, text="请说明下一事项。", page_no=2),
+        ]
+        headings = [
+            _heading(1, 0, text="互动问答", section_end=6),
+            _heading(
+                2,
+                5,
+                text="问题二",
+                section_end=6,
+                parent_node_id=1,
+                level=2,
+            ),
+        ]
+
+        units, _ = _build(elements, headings=headings)
+
+        self.assertEqual([unit.section_path for unit in units], [[1], [1, 2]])
+        self.assertEqual([unit.title for unit in units], ["互动问答", "问题二"])
+        self.assertEqual(units[0].payload_kind, "mixed")
+        self.assertEqual(
+            [part["kind"] for part in units[0].payload["parts"]],
+            ["text", "table", "text"],
+        )
+        self.assertIn(
+            "回复：变化来自主营业务增长。", _all_visible_text(units[0].payload)
+        )
+        self.assertIn(
+            "声明：上述数据以审计结果为准。", _all_visible_text(units[0].payload)
+        )
+        self.assertEqual(
+            _source_indices(
+                {
+                    "payload": units[0].payload,
+                    "locator": units[0].artifact_locator,
+                }
+            ),
+            set(range(5)),
+        )
+        self.assertEqual(units[1].payload["text"], "请说明下一事项。")
+
+
+class ConservationTests(unittest.TestCase):
+    def test_text_coalescing_is_ordered_and_locator_complete(self) -> None:
+        elements = [
+            _element(0, text="章节"),
+            _element(1, text="甲"),
+            _element(2, text="乙"),
+            _element(3, text="丙"),
+        ]
+        units, _ = _build(
+            elements,
+            headings=[_heading(1, 0, text="章节", section_end=3)],
         )
 
         self.assertEqual(len(units), 1)
-        self.assertIn("收入", units[0].payload["raw_html"])
+        self.assertEqual(units[0].payload["text"], "甲\n乙\n丙")
+        self.assertEqual(
+            _source_indices(units[0].artifact_locator),
+            {0, 1, 2, 3},
+        )
+
+    def test_proven_page_frame_deduplicates_only_its_members(self) -> None:
+        elements = [
+            _element(
+                0,
+                kind="page_furniture",
+                raw_kind="header",
+                text="重复页眉",
+                page_no=1,
+            ),
+            _element(1, text="第一页事实", page_no=1),
+            _element(
+                2,
+                kind="page_furniture",
+                raw_kind="header",
+                text="重复页眉",
+                page_no=2,
+            ),
+            _element(3, text="第二页事实", page_no=2),
+        ]
+        frames = [
+            {
+                "group_id": f"frame_{number}",
+                "role": "running_furniture",
+                "proof_kind": "native_artifact",
+                "member_source_item_indices": [source],
+                "representative_source_item_index": source,
+            }
+            for number, source in enumerate((0, 2), start=1)
+        ]
+        proved, stats = _build(elements, page_frames=frames)
+        visible = _all_visible_text([unit.payload for unit in proved])
+        self.assertEqual(visible.count("重复页眉"), 0)
+        self.assertEqual(stats.dropped_by_kind["proven_page_frame_externalized"], 2)
+        self.assertEqual(
+            [
+                (item["source_item_index"], item["role"], item["reason"])
+                for item in stats.source_dispositions
+            ],
+            [
+                (0, "external_metadata", "proven_running_furniture"),
+                (2, "external_metadata", "proven_running_furniture"),
+            ],
+        )
+
+        unproved, stats = _build(elements)
+        self.assertEqual(
+            _all_visible_text([unit.payload for unit in unproved]).count("重复页眉"),
+            2,
+        )
+        self.assertEqual(stats.dropped_by_kind["proven_page_frame_externalized"], 0)
+        self.assertTrue(all(unit.heading_path == [] for unit in unproved))
+
+    def test_unproved_page_furniture_is_neutral_inside_one_section(self) -> None:
+        elements = [
+            _element(0, text="章节", text_level=1, page_no=1),
+            _element(1, text="前段事实", page_no=1),
+            _element(
+                2,
+                kind="page_furniture",
+                raw_kind="header",
+                text="未证明页框",
+                page_no=2,
+            ),
+            _element(3, text="后段事实", page_no=2),
+        ]
+        units, _ = _build(
+            elements,
+            headings=[_heading(1, 0, text="章节", section_end=4)],
+        )
+
+        self.assertEqual(len(units), 1)
+        unit = units[0]
+        self.assertEqual(unit.heading_path, ["章节"])
+        self.assertEqual(unit.section_path, [1])
+        self.assertEqual(
+            [part.get("text") for part in unit.payload["parts"]],
+            ["前段事实", "未证明页框", "后段事实"],
+        )
+        self.assertEqual(
+            [part.get("role") for part in unit.payload["parts"]],
+            [None, None, None],
+        )
+        self.assertNotIn("heading_path", unit.payload["parts"][1])
+        self.assertEqual(
+            _source_indices(
+                {
+                    "payload": unit.payload,
+                    "locator": unit.artifact_locator,
+                }
+            ),
+            {0, 1, 2, 3},
+        )
+
+    def test_neutral_furniture_does_not_merge_distinct_sections(self) -> None:
+        elements = [
+            _element(0, text="甲节", page_no=1),
+            _element(1, text="甲事实", page_no=1),
+            _element(
+                2,
+                kind="page_furniture",
+                raw_kind="header",
+                text="未证明页框",
+                page_no=2,
+            ),
+            _element(3, text="乙节", page_no=2),
+            _element(4, text="乙事实", page_no=2),
+        ]
+        units, _ = _build(
+            elements,
+            headings=[
+                _heading(1, 0, text="甲节", section_end=2),
+                _heading(2, 3, text="乙节", section_end=4),
+            ],
+        )
+
+        self.assertEqual([unit.heading_path for unit in units], [["甲节"], ["乙节"]])
+        self.assertEqual(
+            [part.get("role") for part in units[0].payload["parts"]],
+            [None, None],
+        )
+        self.assertEqual(units[1].payload["text"], "乙事实")
+
+    def test_proved_empty_section_never_binds_its_page_furniture(self) -> None:
+        elements = [
+            _element(0, text="27、生物资产", text_level=1, page_no=1),
+            _element(
+                1,
+                kind="page_furniture",
+                raw_kind="header",
+                text="某某股份有限公司 2024 年年度报告",
+                page_no=2,
+            ),
+            _element(
+                2,
+                kind="page_furniture",
+                raw_kind="page_number",
+                text="第 128 页",
+                page_no=2,
+            ),
+            _element(3, text="28、油气资产", text_level=1, page_no=2),
+            _element(4, text="本期无油气资产。", page_no=2),
+        ]
+        headings = [
+            _heading(1, 0, text="27、生物资产", section_end=2),
+            _heading(2, 3, text="28、油气资产", section_end=4),
+        ]
+
+        units, report = _replay_and_audit(
+            elements,
+            headings=headings,
+            page_count=2,
+        )
+
+        self.assertEqual(
+            [(unit.payload_kind, unit.heading_path) for unit in units],
+            [
+                ("text", ["27、生物资产"]),
+                ("text", []),
+                ("text", []),
+                ("text", ["28、油气资产"]),
+            ],
+        )
+        self.assertEqual(units[0].payload, {"text": "27、生物资产"})
+        self.assertEqual(units[0].section_path, [1])
+        self.assertEqual(
+            [unit.payload["text"] for unit in units[1:3]],
+            ["某某股份有限公司 2024 年年度报告", "第 128 页"],
+        )
+        self.assertEqual([unit.section_path for unit in units[1:3]], [[], []])
+        self.assertTrue(all(unit.detached_from_section for unit in units[1:3]))
+        self.assertEqual(units[3].payload, {"text": "本期无油气资产。"})
+        self.assertTrue(report.ok, report.findings)
+
+    def test_cross_page_furniture_joins_the_section_its_content_proves(
+        self,
+    ) -> None:
+        elements = [
+            _element(0, text="七、合并财务报表项目注释", text_level=1, page_no=1),
+            _element(1, text="27、生物资产", text_level=2, page_no=1),
+            _element(
+                2,
+                kind="page_furniture",
+                raw_kind="header",
+                text="某某股份有限公司 2024 年年度报告",
+                page_no=2,
+            ),
+            _element(3, text="本期无生物资产。", page_no=2),
+        ]
+        headings = [
+            _heading(1, 0, text="七、合并财务报表项目注释", section_end=3),
+            _heading(
+                2,
+                1,
+                text="27、生物资产",
+                section_end=1,
+                parent_node_id=1,
+                level=2,
+            ),
+        ]
+
+        units, report = _replay_and_audit(
+            elements,
+            headings=headings,
+            page_count=2,
+        )
+
+        self.assertEqual(len(units), 1)
+        unit = units[0]
+        self.assertEqual(unit.payload_kind, "mixed")
+        self.assertEqual(unit.payload["semantic_type"], "section")
+        self.assertEqual(unit.heading_path, ["七、合并财务报表项目注释"])
+        self.assertEqual(unit.section_path, [1])
+        self.assertEqual(
+            [part.get("text") for part in unit.payload["parts"]],
+            [
+                "27、生物资产",
+                "某某股份有限公司 2024 年年度报告",
+                "本期无生物资产。",
+            ],
+        )
+        self.assertEqual(
+            [part.get("heading_path") for part in unit.payload["parts"]],
+            [
+                ["七、合并财务报表项目注释", "27、生物资产"],
+                None,
+                ["七、合并财务报表项目注释"],
+            ],
+        )
+        self.assertTrue(report.ok, report.findings)
+
+    def test_empty_child_headings_are_flat_parts_of_parent_occurrence(self) -> None:
+        elements = [
+            _element(0, text="父节"),
+            _element(1, text="父节事实"),
+            _element(2, text="空子节甲"),
+            _element(3, text="空子节乙"),
+        ]
+        units, stats = _build(
+            elements,
+            headings=[
+                _heading(1, 0, text="父节", section_end=3),
+                _heading(
+                    2,
+                    2,
+                    text="空子节甲",
+                    section_end=2,
+                    parent_node_id=1,
+                    level=2,
+                ),
+                _heading(
+                    3,
+                    3,
+                    text="空子节乙",
+                    section_end=3,
+                    parent_node_id=1,
+                    level=2,
+                ),
+            ],
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].heading_path, ["父节"])
+        parts = units[0].payload["parts"]
+        self.assertTrue(all(part["kind"] != "mixed" for part in parts))
+        self.assertEqual(
+            [part["heading_path"] for part in parts[1:]],
+            [["父节", "空子节甲"], ["父节", "空子节乙"]],
+        )
+        self.assertTrue(
+            all("role" not in part and "title" not in part for part in parts)
+        )
+        self.assertEqual(stats.heading_outline_units_generated, 1)
+
+    def test_unsupported_unknown_carrier_fails_closed(self) -> None:
+        elements = [
+            _element(0, kind="unknown", raw_kind="mystery", text="未知但可读事实")
+        ]
+        with self.assertRaisesRegex(
+            SourceEvidenceClosureError,
+            "unsupported NormalizedIR carrier kind",
+        ):
+            _build(elements)
+
+    def test_typed_carriers_preserve_their_structured_payload(self) -> None:
+        image_name = "images/" + "b" * 64 + ".png"
+        elements = [
+            _element(
+                0,
+                kind="text",
+                raw_kind="list",
+                text="第一项\n第二项",
+                list_items=["第一项", "第二项"],
+                list_subtype="ordered",
+            ),
+            _element(
+                1,
+                kind="text",
+                raw_kind="code",
+                text="算法\nreturn 1\n注释",
+                code_body="return 1",
+                code_caption=["算法"],
+                code_footnote=["注释"],
+                code_subtype="algorithm",
+            ),
+            _element(
+                2,
+                kind="equation",
+                raw_kind="equation",
+                text="x=1",
+                text_format="latex",
+            ),
+            _element(
+                3,
+                kind="image",
+                raw_kind="image",
+                image_path=image_name,
+                image_caption=["图一"],
+                image_footnote=["图注"],
+            ),
+            _element(
+                4,
+                kind="image",
+                raw_kind="chart",
+                image_path="images/" + "c" * 64 + ".png",
+                text="收入 10",
+                image_caption=["收入图"],
+                image_footnote=[],
+                visual_subtype="bar",
+            ),
+        ]
+        units, _ = _build(elements)
+        by_order = {unit.source_order: unit for unit in units}
+
+        self.assertEqual(by_order[0].payload["list_items"], ["第一项", "第二项"])
+        self.assertEqual(by_order[1].payload["code_body"], "return 1")
+        self.assertEqual(by_order[2].payload["text_format"], "latex")
+        expected_image_digest = hashlib.sha256(
+            f"fixture:{image_name}".encode()
+        ).hexdigest()
+        self.assertEqual(
+            by_order[3].payload["image_ref"],
+            f"images/{expected_image_digest}.png",
+        )
+        self.assertEqual(by_order[3].payload["notes"], ["图注"])
+        self.assertEqual(by_order[4].payload["visual_kind"], "chart")
+        self.assertEqual(by_order[4].payload["visual_subtype"], "bar")
+
+    def test_image_bytes_without_recognized_text_remain_reviewable(self) -> None:
+        elements = [
+            _element(
+                0,
+                kind="image",
+                raw_kind="image",
+                image_path="images/" + "d" * 64 + ".png",
+                image_caption=[],
+                image_footnote=[],
+            )
+        ]
+
+        units, _ = _build(elements)
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].payload["caption"], "")
+        self.assertEqual(units[0].payload["visual_kind"], "image")
+        self.assertTrue(units[0].payload["image_ref"].startswith("images/"))
         self.assertEqual(units[0].quality_status, "needs_review")
 
-    def test_full_s1_s7_preserves_table_parse_failed_raw_html(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 1,
-                        "table_caption": ["失败表"],
-                        "table_footnote": ["注"],
-                        "table_html": "<table>",
-                        "table_parse_failed": True,
-                        "table": {"headers": [], "rows": []},
-                    }
-                ]
-            },
-            filing_type="annual_report",
-        )
+
+class TablePayloadTests(unittest.TestCase):
+    def test_visual_only_table_remains_a_reviewable_evidence_unit(self) -> None:
+        elements = [
+            _element(
+                0,
+                kind="table",
+                raw_kind="table",
+                image_path="images/table.png",
+                table_caption=[],
+                table_footnote=[],
+                table_html="",
+                table={"headers": [], "rows": []},
+            )
+        ]
+
+        units, stats = _build(elements)
 
         self.assertEqual(len(units), 1)
         self.assertEqual(units[0].payload_kind, "table")
-        self.assertEqual(
-            units[0].payload,
-            {"caption": ["失败表"], "raw_html": "<table>", "notes": ["注"]},
-        )
+        self.assertEqual(units[0].payload["rows"], [])
         self.assertEqual(units[0].quality_status, "needs_review")
-        self.assertEqual(stats.generated_by_kind["table"], 1)
         self.assertEqual(stats.dropped_by_kind["table_empty"], 0)
+        artifacts = units[0].artifact_locator["evidence_artifacts"]
+        self.assertEqual(artifacts[0]["artifact_role"], "evidence_image_000000")
 
-    def test_payload_inner_key_contracts_by_kind(self) -> None:
-        text_unit = s3_build_text_units(
-            [PreparedElement(kind="text", order_index=1, text="正文")]
-        )[0]
-        image_unit = s1_preprocess_elements(
-            [
-                {
-                    "kind": "image",
-                    "raw_kind": "image",
-                    "order_index": 3,
-                    "image_path": f"images/{'c' * 64}.jpg",
-                    "caption": "股权结构图",
-                }
-            ]
-        ).elements[0]
-        table_unit = s5_build_table_units(
-            [
-                PreparedElement(
-                    kind="table",
-                    order_index=4,
-                    table_caption=["应收账款账龄"],
-                    table_footnote=["含追溯调整。"],
-                    table={"headers": ["账龄"], "rows": [["合计"]]},
-                )
-            ],
-            BuildStats(),
-        )[0]
-        failed_table = s5_build_table_units(
-            [
-                PreparedElement(
-                    kind="table",
-                    order_index=5,
-                    table_caption=["失败表"],
-                    table_footnote=["注"],
-                    table={"headers": [], "rows": []},
-                    table_html="<table>",
-                    table_parse_failed=True,
-                )
-            ],
-            BuildStats(),
-        )[0]
-
-        self.assertEqual(set(text_unit.payload), {"text"})
-        self.assertEqual(
-            set(image_unit.payload),
-            {"image_ref", "caption", "context", "visual_kind"},
-        )
-        self.assertEqual(image_unit.quality_status, "needs_review")
-        self.assertEqual(
-            set(table_unit.payload),
-            {"caption", "unit", "headers", "rows", "merged_cells", "notes"},
-        )
-        self.assertIn("追溯调整", table_unit.payload["notes"][0])
-        self.assertEqual(set(failed_table.payload), {"caption", "raw_html", "notes"})
-
-    def test_s6_preserves_vocabulary_named_sections(self) -> None:
-        stats = BuildStats()
-        kept = s6_filter_units(
-            [
-                UnitDraft(
-                    payload_kind="text",
-                    payload={"text": "释义内容"},
-                    source_order=1,
-                    heading_path=["释义"],
-                    title="释义",
-                ),
-                UnitDraft(
-                    payload_kind="text",
-                    payload={"text": "存在退市风险"},
-                    source_order=2,
-                    heading_path=["重要提示"],
-                    title="重要提示",
-                ),
-                UnitDraft(
-                    payload_kind="text",
-                    payload={"text": "存在风险"},
-                    source_order=3,
-                    heading_path=["风险提示"],
-                    title="风险提示",
-                ),
-            ],
-            stats,
-        )
-
-        self.assertEqual([unit.title for unit in kept], ["释义", "重要提示", "风险提示"])
-
-    def test_s7_semantic_key_and_quality(self) -> None:
-        stats = BuildStats()
-        units = s7_finalize_units(
-            [
-                UnitDraft(
-                    payload_kind="table",
-                    payload={
-                        "caption": ["应收账款账龄披露"],
-                        "unit": "元",
-                        "headers": ["账龄"],
-                        "rows": [["合计"]],
-                        "notes": [],
-                    },
-                    source_order=1,
-                    title="应收账款账龄披露",
-                ),
-                UnitDraft(
-                    payload_kind="text",
-                    payload={"text": "\ufffd" * 4 + "ab"},
-                    source_order=2,
-                    title="乱码",
-                ),
-                UnitDraft(
-                    payload_kind="text",
-                    payload={"text": "无进一步信息。"},
-                    source_order=3,
-                    heading_path=["其他说明"],
-                    title="其他说明",
-                ),
-            ],
-            filing_type="annual_report",
-            stats=stats,
-        )
-
-        self.assertEqual(units[0].semantic_key, "receivable_aging")
-        self.assertEqual(units[1].quality_status, "unusable")
-        # No vocabulary matches the title/path/text, so scalar and array both
-        # fall back to the single controlled document_content retrieval key.
-        self.assertEqual(units[2].semantic_key, "document_content")
-        self.assertEqual(units[2].semantic_keys, ["document_content"])
-        self.assertEqual(stats.generated_by_kind["table"], 1)
-        self.assertEqual(stats.unusable_count, 1)
-
-    def test_semantic_key_tariff_not_filing_type_limited(self) -> None:
-        unit = UnitDraft(
-            payload_kind="text",
-            payload={"text": "关税影响"},
-            source_order=1,
-            title="关税影响",
-        )
-
-        self.assertEqual(
-            semantic_keys_for_unit(unit, filing_type="other")[:1],
-            ["tariff_exposure"],
-        )
-
-    def test_cover_prelude_is_not_bulk_deleted_before_first_section(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "某某股份有限公司",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "heading_level": 1,
-                        "text": "2025 年年度报告",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "text": "股票代码：000000 股票简称：某某股份",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 4,
-                        "heading_level": 1,
-                        "text": "第一节 重要提示",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 5,
-                        "text": "公司存在退市风险，请投资者注意。",
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        self.assertEqual(len(units), 3)
-        by_path = {tuple(unit.heading_path): unit for unit in units}
-        self.assertIn(("某某股份有限公司",), by_path)
-        self.assertEqual(
-            by_path[("某某股份有限公司",)].payload["text"],
-            "某某股份有限公司",
-        )
-        self.assertIn("股票代码：000000", by_path[("2025 年年度报告",)].payload["text"])
-        self.assertEqual(
-            by_path[("第一节 重要提示",)].payload["text"],
-            "公司存在退市风险，请投资者注意。",
-        )
-
-    def test_cover_prelude_inactive_without_structural_sections(self) -> None:
-        # Short announcements have no 第X节 structure; nothing may be dropped.
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "某某股份有限公司董事会决议公告",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "本公司董事会于近日审议通过如下议案。",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-
-        self.assertEqual(len(units), 1)
-
-    def test_standalone_unit_declaration_is_preserved_with_its_table(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "第二节 主要财务指标",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "单位：元",
-                    },
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 3,
-                        "table": {"headers": ["项目"], "rows": [["营业收入"]]},
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        self.assertEqual([unit.payload_kind for unit in units], ["text", "table"])
-        self.assertEqual(units[0].payload["text"], "单位：元")
-        self.assertEqual(units[1].payload["unit"], "元")
-        self.assertEqual(units[0].heading_path, units[1].heading_path)
-
-    def test_table_unit_declaration_never_crosses_source_sections(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "一、金额表",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "单位：万元",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "heading_level": 1,
-                        "text": "二、人数表",
-                    },
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 4,
-                        "table": {
-                            "headers": ["部门", "人数"],
-                            "rows": [["研发", "10"]],
-                        },
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        table = next(unit for unit in units if unit.payload_kind == "table")
-        self.assertIsNone(table.payload["unit"])
-
-    def test_responsible_organization_is_not_parsed_as_measurement_unit(self) -> None:
-        placed = s2_apply_heading_tree(
-            [
-                PreparedElement(
-                    kind="text",
-                    order_index=1,
-                    text="负责单位：上海事业部",
-                    structural_path=["项目情况"],
-                ),
-                PreparedElement(
-                    kind="table",
-                    order_index=2,
-                    table={"headers": ["项目"], "rows": [["扩产"]]},
-                    structural_path=["项目情况"],
-                ),
-            ]
-        )
-
-        table = s5_build_table_units(placed, BuildStats())[0]
-
-        self.assertIsNone(table.payload["unit"])
-
-    def test_unit_declaration_merged_with_content_is_kept(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "text": "单位：元\n下表列示了主要科目变动。",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-
-        self.assertEqual(len(units), 1)
-        self.assertEqual(units[0].payload["text"], "单位：元\n下表列示了主要科目变动。")
-
-    def test_single_line_header_combo_keeps_announce_no(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "text": "证券代码：600519 证券简称：贵州茅台 公告编号：临 2026-027",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "分红实施公告正文。",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-
-        self.assertEqual(len(units), 1)
-        self.assertEqual(
-            units[0].payload["text"],
-            "证券代码：600519 证券简称：贵州茅台 公告编号：临 2026-027\n"
-            "分红实施公告正文。",
-        )
-
-    def test_text_units_carry_page_no_via_locator(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "page_no": 3,
-                        "ir_id": "x_ir_0001",
-                        "artifact_locator": {"page_no": 3},
-                        "text": "第三页的正文内容。",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-
-        self.assertEqual(len(units), 1)
-        locator = units[0].artifact_locator or {}
-        self.assertEqual(locator.get("page_no"), 3)
-
-    def test_marker_line_never_becomes_heading(self) -> None:
-        # MinerU sometimes tags the marker with text_level>=1 (kind=heading);
-        # it must stay out of the heading tree and strip like normal text.
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 2,
-                        "text": "二、非经常性损益",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "heading_level": 3,
-                        "text": "□适用 √不适用",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "text": "公司不存在其他符合非经常性损益定义的损益项目。",
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        self.assertEqual(len(units), 1)
-        self.assertEqual(units[0].heading_path, ["二、非经常性损益"])
-        self.assertNotIn("适用", units[0].title or "")
-        self.assertEqual(units[0].applicability, "not_applicable")
-        self.assertIn("非经常性损益", units[0].payload["text"])
-
-    def test_heading_trailing_applicability_marker_uses_clean_section_path(
+    def test_table_media_occurrences_publish_separate_content_addressed_edges(
         self,
     ) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "一、募集资金 √适用 □不适用",
-                    },
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 2,
-                        "table": {
-                            "headers": ["项目", "金额"],
-                            "rows": [["募投", "100"]],
-                        },
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        table = next(unit for unit in units if unit.payload_kind == "table")
-        self.assertEqual(table.heading_path, ["一、募集资金"])
-        self.assertEqual(table.applicability, "applicable")
-        self.assertEqual(stats.stripped_marker_lines, 1)
-
-    def test_heading_trailing_not_applicable_marker_keeps_disclosure(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "二、对外担保 □适用 √不适用",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "公司不存在对外担保。",
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        self.assertEqual(units[0].heading_path, ["二、对外担保"])
-        self.assertEqual(units[0].applicability, "not_applicable")
-
-    def test_header_kv_lines_stripped_but_announce_no_kept(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "text": "证券代码：600519\n证券简称：贵州茅台\n公告编号：临 2026-006",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "本公司董事会保证公告内容真实、准确、完整。",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-
-        # 同属空 heading 的两段被 S3 正常合并为一个 unit。
-        self.assertEqual(len(units), 1)
-        # 代码/简称是 document 元数据的重复；公告编号是独有信息，必须保留。
-        self.assertEqual(
-            units[0].payload["text"],
-            "证券代码：600519\n证券简称：贵州茅台\n公告编号：临 2026-006\n"
-            "本公司董事会保证公告内容真实、准确、完整。",
-        )
-        # 正文中出现的"被担保人证券代码"这类行不受影响。
-        units2, stats2 = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "text": "被担保人证券代码：600000，担保金额如下。",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-        self.assertIn("被担保人证券代码", units2[0].payload["text"])
-        self.assertIsNone(
-            rules.strip_header_kv_line("证券代码：000002 公司发生重大诉讼")
-        )
-
-        units3, stats3 = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "page_no": 3,
-                        "heading_level": 1,
-                        "text": "二、交易标的",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "page_no": 3,
-                        "text": "证券代码：123456\n该代码为交易标的证券代码。",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-        self.assertIn("证券代码：123456", str(units3[0].payload))
-
-    def test_ambiguous_spaced_security_name_is_preserved(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "text": "优先股代码：140002\n优先股简称：平银优 01",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "本行第十二届董事会审议通过了关联交易议案。",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-
-        self.assertEqual(len(units), 1)
-        self.assertIn("优先股代码：140002", units[0].payload["text"])
-        self.assertIn("优先股简称：平银优 01", units[0].payload["text"])
-
-    def test_fragment_labels_are_preserved_as_source_evidence(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "text": "营业收入：",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "2025年度",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-
-        payload = "\n".join(str(unit.payload) for unit in units)
-        self.assertIn("营业收入：", payload)
-        self.assertIn("2025年度", payload)
-
-    def test_standalone_announcement_number_is_losslessly_deduplicated(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "text": "公告编号：2023-026",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "heading_level": 1,
-                        "text": "一、交易概述",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "text": "公告编号：2023-026\n公司拟与关联方发生交易，金额为人民币一亿元。",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-
-        titles = [unit.title for unit in units]
-        self.assertNotIn("公告头信息", titles)
-        self.assertEqual(stats.dropped_by_kind.get("standalone_noise", 0), 0)
-        body = next(u for u in units if "交易概述" in (u.title or ""))
-        self.assertIn("公告编号：2023-026", body.payload["text"])
-        self.assertEqual(body.payload["text"].count("公告编号：2023-026"), 1)
-
-    def test_long_preheading_content_still_anchored(self) -> None:
-        # 31 个存量『公告头信息』unit 是真内容（首标题出现晚），必须继续锚定
-        # 而不是被噪声规则误杀。
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "text": "实现营业收入 4.80 亿元，同比增长 53.58%，毛利率 44.18%，"
-                        "该板块毛利率下降主要受并表影响；医药板块实现营业收入 2.06 亿元。",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "heading_level": 1,
-                        "text": "一、经营情况讨论",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "text": "报告期内公司经营稳健。",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-
-        # 首标题前的真内容应作为独立 L1 证据原子保留。
-        blob = " ".join(str(u.payload) for u in units)
-        self.assertIn("营业收入", blob)
-        self.assertNotIn(
-            "公告头信息", blob + " ".join(str(u.heading_path) for u in units)
-        )
-
-    def test_attachment_caption_opens_top_level_scope(self) -> None:
-        # 附件重置必须由唯一、完整的交易所投关表单结构证明；不能仅凭
-        # caption 词面把普通叙事表移出其解析器小节。
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "document_id": "doc_form",
-                        "ir_id": "ir_0000",
-                        "source_item_index": 0,
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 0,
-                        "table_caption": [],
-                        "table_footnote": [],
-                        "table": {
-                            "headers": [],
-                            "merged_cells": [],
-                            "rows": [
-                                ["投资者关系活动类别", "特定对象调研"],
-                                ["参与单位名称及人员姓名", "见附件"],
-                                ["时间", "2026-07-16"],
-                                ["地点", "电话会议"],
-                                ["上市公司接待人员姓名", "董事会秘书"],
-                                [
-                                    "投资者关系活动主要内容介绍",
-                                    "一、经营情况\n经营保持稳健。",
-                                ],
-                            ],
-                        },
-                    },
-                    {
-                        "document_id": "doc_form",
-                        "ir_id": "ir_0001",
-                        "source_item_index": 1,
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "三、主要交流问题",
-                    },
-                    {
-                        "document_id": "doc_form",
-                        "ir_id": "ir_0002",
-                        "source_item_index": 2,
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "问：公司下半年增长压力如何？答：经营保持稳健。",
-                    },
-                    {
-                        "document_id": "doc_form",
-                        "ir_id": "ir_0003",
-                        "source_item_index": 3,
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 3,
-                        "table_caption": ["附件 1：《参与机构名单》"],
-                        "table": {
-                            "headers": ["机构名称"],
-                            "rows": [["某某基金"], ["某某证券"]],
-                        },
-                    },
-                ]
-            },
-            filing_type="investor_relations",
-            document_title="某公司：投资者关系活动记录表",
-        )
-
-        paths = [tuple(unit.heading_path) for unit in units]
-        self.assertIn(("附件 1：《参与机构名单》",), paths)
-        for unit in units:
-            if unit.heading_path and unit.heading_path[0] == "三、主要交流问题":
-                self.assertNotIn("机构名称", str(unit.payload))
-
-    def test_captioned_table_before_first_heading_anchors_to_caption(self) -> None:
-        # round17：首标题前自带 caption 的表（投关记录表单头）锚到自身
-        # 标题，而不是文档标题或「公告头信息」。
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 1,
-                        "table_caption": [
-                            "华测检测认证集团股份有限公司投资者关系活动记录表"
-                        ],
-                        "table": {
-                            "headers": [],
-                            "rows": [
-                                ["投资者关系活动类别", "特定对象调研"],
-                                ["时间", "2023年8月11日"],
-                            ],
-                        },
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "heading_level": 1,
-                        "text": "一、公司基本情况",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "text": "公司主营检验检测服务。",
-                    },
-                ]
-            },
-            filing_type="investor_relations",
-            document_title="华测检测：投资者关系活动记录表",
-        )
-
-        form = next(u for u in units if "投资者关系活动类别" in str(u.payload))
-        self.assertEqual(
-            form.heading_path,
-            ["华测检测认证集团股份有限公司投资者关系活动记录表"],
-        )
-
-    def test_qa_form_footer_table_keeps_parser_section_ownership(self) -> None:
-        # 字段名看起来像表单尾部不足以证明它属于文档根。
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "三、主要交流问题",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "问：竞争格局如何？答：每个细分领域有不同的竞争者。",
-                    },
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 3,
-                        "table": {
-                            "headers": [],
-                            "rows": [
-                                ["附件清单（如有）", "《参会机构名单》"],
-                                ["日期", "2023-08-11~2023-08-17"],
-                            ],
-                        },
-                    },
-                ]
-            },
-            filing_type="investor_relations",
-            document_title="华测检测：投资者关系活动记录表",
-        )
-
-        footer = next(u for u in units if "附件清单" in str(u.payload))
-        self.assertEqual(footer.heading_path, ["三、主要交流问题"])
-        self.assertEqual(footer.title, "三、主要交流问题")
-        # 叙事小节里的业务表格不受影响——首列不是模板尾字段。
-        units2, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "二、经营数据",
-                    },
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 2,
-                        "table": {
-                            "headers": ["日期", "营业收入"],
-                            "rows": [["2023-06-30", "4.8亿元"]],
-                        },
-                    },
-                ]
-            },
-            filing_type="investor_relations",
-            document_title="华测检测：投资者关系活动记录表",
-        )
-        data_table = next(u for u in units2 if "营业收入" in str(u.payload))
-        self.assertEqual(data_table.heading_path[0], "二、经营数据")
-        # 「日期安排」类业务标签是前缀命中而非整格命中，不得触发重锚
-        # （复审 Major#2：尾字段词表整格精确匹配）。
-        units3, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "二、回购安排",
-                    },
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 2,
-                        "table": {
-                            "headers": [],
-                            "rows": [
-                                ["日期安排", "2026年7月至12月"],
-                                ["日期变更", "无"],
-                            ],
-                        },
-                    },
-                ]
-            },
-            filing_type="investor_relations",
-            document_title="某公司：投资者关系活动记录表",
-        )
-        biz_table = next(u for u in units3 if "日期变更" in str(u.payload))
-        self.assertEqual(biz_table.heading_path[0], "二、回购安排")
-
-    def test_attachment_caption_ignored_outside_qa_mode(self) -> None:
-        # 复审 Major#1：附件栈重置仅限表单模式（语料 11 例全部投关）。
-        # 叙事文档的文中附件若重置栈，其后的正文标题会错挂进附件分支。
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "一、审议事项",
-                    },
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 2,
-                        "table_caption": ["附件1：《股东名单》"],
-                        "table": {
-                            "headers": ["股东名称"],
-                            "rows": [["某某投资"]],
-                        },
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "heading_level": 1,
-                        "text": "二、表决结果",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 4,
-                        "text": "议案获得通过。",
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        vote = next(u for u in units if "议案获得通过" in str(u.payload))
-        self.assertEqual(vote.heading_path[0], "二、表决结果")
-        roster = next(u for u in units if "股东名称" in str(u.payload))
-        self.assertEqual(roster.heading_path[0], "一、审议事项")
-
-    def test_applicability_marker_becomes_payload_flag(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "第五节 重要事项",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "heading_level": 2,
-                        "text": "一、破产重整相关事项",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "text": "□适用 √不适用",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 4,
-                        "heading_level": 2,
-                        "text": "二、重大诉讼事项",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 5,
-                        "text": "√适用 □不适用\n公司报告期内存在如下诉讼。",
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        self.assertEqual([unit.payload_kind for unit in units], ["text", "text"])
-        bankruptcy, litigation = units
-        self.assertEqual(bankruptcy.applicability, "not_applicable")
-        self.assertIn("不适用", bankruptcy.payload["text"])
-        self.assertEqual(litigation.applicability, "applicable")
-        # The leading marker line is stripped; the prose remains.
-        self.assertEqual(litigation.payload["text"], "公司报告期内存在如下诉讼。")
-
-    def test_dangling_applicable_marker_sinks_onto_following_table(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 2,
-                        "text": "4、研发投入",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "√适用 □不适用",
-                    },
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 3,
-                        "table": {"headers": ["项目"], "rows": [["研发投入金额"]]},
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        # The bare marker must not survive as its own unit (user decision).
-        self.assertEqual([unit.payload_kind for unit in units], ["table"])
-        self.assertEqual(units[0].applicability, "applicable")
-        self.assertEqual(stats.stripped_marker_lines, 1)
-        self.assertEqual(
-            (units[0].artifact_locator or {})["applicability_source_locator"][
-                "order_index"
-            ],
-            2,
-        )
-
-    def test_applicability_is_parsed_per_source_carrier_before_coalescing(
-        self,
-    ) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "重大事项",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "适用 □不适用\n第一项说明。",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "text": "适用 □不适用\n第二项说明。",
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        self.assertEqual(
-            [unit.payload["text"] for unit in units],
-            ["第一项说明。", "第二项说明。"],
-        )
-        self.assertTrue(all(unit.applicability == "applicable" for unit in units))
-        self.assertTrue(all("适用" not in unit.payload["text"] for unit in units))
-
-    def test_dangling_applicable_marker_sinks_onto_following_text(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 2,
-                        "text": "五、重大合同",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "√适用 □不适用",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "text": "公司与某客户签署了重大销售合同。",
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        # Text followers receive the flag exactly like tables do.
-        self.assertEqual(len(units), 1)
-        self.assertEqual(units[0].payload_kind, "text")
-        self.assertEqual(units[0].applicability, "applicable")
-        self.assertEqual(units[0].payload["text"], "公司与某客户签署了重大销售合同。")
-        self.assertEqual(
-            (units[0].artifact_locator or {})["applicability_source_locator"][
-                "order_index"
-            ],
-            2,
-        )
-
-    def test_dangling_applicable_marker_preserves_following_image_payload(self) -> None:
-        digest = "a" * 64
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 2,
-                        "text": "六、股权结构",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "√适用 □不适用",
-                    },
-                    {
-                        "kind": "image",
-                        "raw_kind": "image",
-                        "order_index": 3,
-                        "image_path": f"images/{digest}.jpg",
-                        "caption": "股权结构图",
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        self.assertEqual(len(units), 1)
-        self.assertEqual(units[0].payload["image_ref"], f"images/{digest}.jpg")
-        self.assertEqual(units[0].applicability, "applicable")
-        self.assertNotIn("text", units[0].payload)
-        self.assertEqual(
-            (units[0].artifact_locator or {})["applicability_source_locator"][
-                "order_index"
-            ],
-            2,
-        )
-
-    def test_dangling_applicable_marker_sinks_into_child_section(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 2,
-                        "text": "十六、募集资金使用情况",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "√适用 □不适用",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "heading_level": 3,
-                        "text": "（一） 募集资金总体使用情况",
-                    },
-                    {
-                        "kind": "table",
-                        "raw_kind": "table",
-                        "order_index": 4,
-                        "table": {"headers": ["项目"], "rows": [["募集总额"]]},
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        # The follower opens a CHILD heading — still this section's content.
-        self.assertEqual([unit.payload_kind for unit in units], ["table"])
-        self.assertEqual(units[0].applicability, "applicable")
-
-    def test_dangling_applicable_without_sibling_keeps_declaration(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 2,
-                        "text": "一、孤例小节",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "√适用 □不适用",
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        self.assertEqual(len(units), 1)
-        self.assertEqual(units[0].payload["text"], "√适用 □不适用")
-        self.assertEqual(units[0].applicability, "applicable")
-
-    def test_label_then_marker_composite_is_flagged_but_untouched(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "text": "主要客户其他情况说明\n□适用 √不适用",
-                    },
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        self.assertEqual(len(units), 1)
-        self.assertEqual(units[0].applicability, "not_applicable")
-        self.assertIn("主要客户其他情况说明", units[0].payload["text"])
-        self.assertIn("不适用", units[0].payload["text"])
-
-    def test_full_s1_s7_redline_important_tip(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "page_furniture",
-                        "raw_kind": "header",
-                        "order_index": 1,
-                        "text": "重要提示",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "heading_level": 1,
-                        "text": "重要提示",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "text": "公司存在退市风险，请投资者注意。",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-
-        self.assertEqual(len(units), 1)
-        self.assertEqual(units[0].title, "重要提示")
-        self.assertIn("退市风险", units[0].payload["text"])
-        self.assertEqual(stats.dropped_by_kind["page_furniture_exact_duplicate"], 1)
-        heading_sources = (units[0].artifact_locator or {})[
-            "heading_source_locators"
+        elements = [
+            _element(
+                0,
+                kind="table",
+                raw_kind="table",
+                image_path="images/table.png",
+                table_caption=[],
+                table_footnote=[],
+                table_html=(
+                    '<table><tr><td>值<img src="images/shared.png"/>'
+                    '<img src="images/shared.png"/></td></tr></table>'
+                ),
+                table={
+                    "headers": [],
+                    "rows": [["值"]],
+                    "cells": [
+                        {
+                            "row": 0,
+                            "col": 0,
+                            "rowspan": 1,
+                            "colspan": 1,
+                            "text": "值",
+                            "is_header": False,
+                        }
+                    ],
+                    "embedded_media": [
+                        {
+                            "occurrence_index": occurrence,
+                            "cell_media_index": occurrence,
+                            "row": 0,
+                            "col": 0,
+                            "rowspan": 1,
+                            "colspan": 1,
+                            "image_path": "images/shared.png",
+                            "artifact_role": (
+                                f"evidence_table_media_000000_{occurrence:06d}"
+                            ),
+                        }
+                        for occurrence in range(2)
+                    ],
+                },
+            )
         ]
-        self.assertEqual(heading_sources[0]["heading_text"], "重要提示")
-        self.assertEqual(len(heading_sources[0]["source_locators"]), 2)
 
-    def test_full_s1_s7_redline_important_and_risk_tip_positive(self) -> None:
-        units, _ = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 1,
-                        "heading_level": 1,
-                        "text": "重要提示",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 2,
-                        "text": "公司存在退市风险，请投资者注意。",
-                    },
-                    {
-                        "kind": "heading",
-                        "raw_kind": "text",
-                        "order_index": 3,
-                        "heading_level": 1,
-                        "text": "风险提示",
-                    },
-                    {
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 4,
-                        "text": "原材料价格波动可能影响公司业绩。",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-
+        drafts, _ = _build(elements)
+        self.assertEqual(len(drafts), 1)
+        media = drafts[0].payload["embedded_media"]
+        self.assertEqual([item["occurrence_index"] for item in media], [0, 1])
+        self.assertEqual(media[0]["image_ref"], media[1]["image_ref"])
+        locator = drafts[0].artifact_locator
+        assert locator is not None
         self.assertEqual(
-            [unit.heading_path for unit in units],
-            [["重要提示"], ["风险提示"]],
-        )
-        self.assertIn("退市风险", units[0].payload["text"])
-        self.assertIn("原材料价格波动", units[1].payload["text"])
-
-    def test_full_s1_s7_redline_important_tip_repeated_header_negative(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    {
-                        "kind": "page_furniture",
-                        "raw_kind": "header",
-                        "order_index": 1,
-                        "text": "重要提示",
-                    },
-                    {
-                        "kind": "page_furniture",
-                        "raw_kind": "header",
-                        "order_index": 2,
-                        "text": "风险提示",
-                    },
-                ]
-            },
-            filing_type="other",
-        )
-
-        self.assertEqual(len(units), 1)
-        self.assertIn("重要提示", units[0].payload["text"])
-        self.assertIn("风险提示", units[0].payload["text"])
-        self.assertEqual(units[0].quality_status, "needs_review")
-        self.assertEqual(stats.dropped_by_kind["page_furniture"], 0)
-
-
-class TocRegionArbitrationTests(unittest.TestCase):
-    """TOC-page entries never enter the heading tree; the TOC's declared
-    top level outranks generic enumeration conventions in the degenerate
-    parser regime."""
-
-    @staticmethod
-    def _element(
-        kind: str, order_index: int, page_no: int, text: str
-    ) -> dict[str, object]:
-        element: dict[str, object] = {
-            "kind": kind,
-            "raw_kind": "text",
-            "order_index": order_index,
-            "page_no": page_no,
-            "text": text,
-        }
-        if kind == "heading":
-            element["heading_level"] = 1
-        return element
-
-    def test_page_annotated_toc_entry_headings_are_demoted(self) -> None:
-        units, stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    self._element("heading", 1, 1, "目录"),
-                    self._element("heading", 2, 1, "重要提示....1"),
-                    self._element("heading", 3, 1, "释义....4"),
-                    self._element("heading", 4, 1, "第一章 公司简介 5"),
-                    self._element("heading", 5, 1, "第二章 会计数据和财务指标....10"),
-                    self._element("heading", 6, 1, "第三章 管理层讨论与分析 …… 17"),
-                    self._element("heading", 7, 5, "第一章 公司简介"),
-                    self._element("text", 8, 5, "公司注册地为深圳市。"),
-                    self._element("heading", 9, 10, "第二章 会计数据和财务指标"),
-                    self._element("text", 10, 10, "报告期营业收入稳定。"),
-                ]
-            },
-            filing_type="annual_report",
-        )
-
-        self.assertEqual(stats.toc_entry_headings_demoted, 5)
-        roots = {unit.heading_path[0] for unit in units if unit.heading_path}
-        self.assertNotIn("第一章 公司简介 5", roots)
-        self.assertNotIn("第三章 管理层讨论与分析 …… 17", roots)
-        self.assertIn("第一章 公司简介", roots)
-        # The demoted entry lines survive as TOC text under 目录 (不漏).
-        toc_texts = [
-            str(unit.payload.get("text", ""))
-            for unit in units
-            if unit.heading_path and unit.heading_path[0] == "目录"
-        ]
-        self.assertTrue(
-            any("第一章 公司简介 5" in text for text in toc_texts)
-        )
-
-    def test_arabic_toc_declaration_pins_numbered_body_openers(self) -> None:
-        toc_lines = "\n".join(
+            [item["artifact_role"] for item in locator["evidence_artifacts"]],
             [
-                "1. 释义....5",
-                "2. 重要提示....8",
-                "3. 公司基本情况简介....9",
-                "4. 董事会报告....15",
-                "5. 监事会报告....20",
-            ]
-        )
-        units, _stats = build_unit_drafts_s1_s7(
-            {
-                "elements": [
-                    self._element("heading", 1, 1, "目录"),
-                    self._element("text", 2, 1, toc_lines),
-                    self._element("heading", 3, 5, "1. 释义"),
-                    self._element("text", 4, 5, "本报告中的释义如下。"),
-                    self._element("heading", 5, 8, "2. 重要提示"),
-                    self._element("text", 6, 8, "请投资者注意投资风险。"),
-                    self._element("heading", 7, 9, "3. 公司基本情况简介"),
-                    self._element("heading", 8, 9, "3.1 注册信息"),
-                    self._element("text", 9, 9, "注册资本保持不变。"),
-                ]
-            },
-            filing_type="annual_report",
+                "evidence_image_000000",
+                "evidence_table_media_000000_000000",
+                "evidence_table_media_000000_000001",
+            ],
         )
 
-        roots = {unit.heading_path[0] for unit in units if unit.heading_path}
-        # Declared arabic top-level entries pin as roots even though the
-        # "1." grammar alone would map them deeper than the TOC heading.
-        self.assertIn("1. 释义", roots)
-        self.assertIn("2. 重要提示", roots)
-        self.assertIn("3. 公司基本情况简介", roots)
-        # Dotted sub-numbering stays nested inside its declared section.
-        self.assertNotIn("3.1 注册信息", roots)
-        for unit in units:
-            if unit.heading_path and unit.heading_path[0] == "目录":
-                self.assertEqual(unit.payload_kind, "text")
-                self.assertNotIn("释义如下", str(unit.payload.get("text", "")))
+    def test_unheaded_table_never_uses_caption_as_title(self) -> None:
+        elements = [
+            _element(
+                0,
+                kind="table",
+                raw_kind="table",
+                table_caption=["单位：万元"],
+                table_footnote=["注：未经审计"],
+                table_html="<table><tr><td>收入</td><td>10</td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["收入", "10"]],
+                    "merged_cells": [{"row": 0, "col": 0, "rowspan": 1, "colspan": 2}],
+                },
+            )
+        ]
+        units, _ = _build(elements)
+        table = units[0]
+
+        self.assertIsNone(table.title)
+        self.assertEqual(table.heading_path, [])
+        self.assertEqual(table.payload["caption"], ["单位：万元"])
+        self.assertEqual(table.payload["notes"], ["注：未经审计"])
+        self.assertEqual(table.payload["rows"], [["收入", "10"]])
+        self.assertEqual(
+            table.payload["merged_cells"],
+            [{"row": 0, "col": 0, "rowspan": 1, "colspan": 2}],
+        )
+
+    def test_unreconciled_table_html_fails_closed(self) -> None:
+        for table_html in (
+            "<table><tr><td>仍可检索</td></tr></table>",
+            "<table></table>",
+        ):
+            elements = [
+                _element(
+                    0,
+                    kind="table",
+                    raw_kind="table",
+                    table_caption=[],
+                    table_footnote=[],
+                    table_html=table_html,
+                    table={"headers": [], "rows": [], "merged_cells": []},
+                )
+            ]
+            with (
+                self.subTest(table_html=table_html),
+                self.assertRaisesRegex(
+                    SourceEvidenceClosureError,
+                    "no reconciled logical grid",
+                ),
+            ):
+                _build(elements)
 
 
 if __name__ == "__main__":

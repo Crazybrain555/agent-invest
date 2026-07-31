@@ -6,11 +6,11 @@
   },
   "tests/contract/test_fixture_determinism.py": {
    "private_imports": [],
-   "tests": 1
+   "tests": 2
   },
   "tests/contract/test_normalized_ir_contract.py": {
    "private_imports": [],
-   "tests": 19
+   "tests": 14
   },
   "tests/contract/test_phase00_fixtures.py": {
    "private_imports": [],
@@ -32,6 +32,14 @@
    "private_imports": [],
    "tests": 1
   },
+  "tests/integration/test_corpus_reset.py": {
+   "private_imports": [],
+   "tests": 2
+  },
+  "tests/integration/test_derived_ownership_lock.py": {
+   "private_imports": [],
+   "tests": 6
+  },
   "tests/integration/test_filing_api_runtime.py": {
    "private_imports": [],
    "tests": 5
@@ -42,7 +50,7 @@
   },
   "tests/integration/test_ops_queue_views.py": {
    "private_imports": [],
-   "tests": 22
+   "tests": 25
   },
   "tests/integration/test_outbox_commit_order.py": {
    "private_imports": [],
@@ -74,7 +82,7 @@
   },
   "tests/integration/test_search_projection.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 11
   },
   "tests/integration/test_tracked_pool_api.py": {
    "private_imports": [
@@ -90,7 +98,7 @@
   },
   "tests/sample_corpus/test_mineru_table_reconciliation_real.py": {
    "private_imports": [],
-   "tests": 3
+   "tests": 1
   },
   "tests/sample_corpus/test_sample_filings.py": {
    "private_imports": [],
@@ -104,9 +112,22 @@
    "private_imports": [],
    "tests": 2
   },
+  "tests/unit/test_audit_unit_corpus.py": {
+   "private_imports": [
+    "_exception_failure_family",
+    "_source_observations",
+    "_summary",
+    "_validate_raw_struct_tree_citations"
+   ],
+   "tests": 3
+  },
   "tests/unit/test_build_units.py": {
    "private_imports": [],
    "tests": 18
+  },
+  "tests/unit/test_canonical_occurrence.py": {
+   "private_imports": [],
+   "tests": 13
   },
   "tests/unit/test_cninfo_client.py": {
    "private_imports": [],
@@ -130,6 +151,18 @@
    "private_imports": [],
    "tests": 1
   },
+  "tests/unit/test_corpus_reparse.py": {
+   "private_imports": [],
+   "tests": 18
+  },
+  "tests/unit/test_corpus_reset_backup.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_corpus_reset_digest.py": {
+   "private_imports": [],
+   "tests": 10
+  },
   "tests/unit/test_disclosure_source_port.py": {
    "private_imports": [],
    "tests": 5
@@ -139,7 +172,7 @@
     "_check_unit_snapshot_aggregate",
     "_invalid_process_class_overrides"
    ],
-   "tests": 15
+   "tests": 18
   },
   "tests/unit/test_doctor_render.py": {
    "private_imports": [],
@@ -147,7 +180,7 @@
   },
   "tests/unit/test_document_unit_audit.py": {
    "private_imports": [],
-   "tests": 25
+   "tests": 24
   },
   "tests/unit/test_download_document.py": {
    "private_imports": [],
@@ -178,6 +211,10 @@
    ],
    "tests": 12
   },
+  "tests/unit/test_gc_orphan_artifacts.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/unit/test_health.py": {
    "private_imports": [],
    "tests": 4
@@ -192,7 +229,7 @@
   },
   "tests/unit/test_integration_db_safety.py": {
    "private_imports": [],
-   "tests": 7
+   "tests": 8
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
@@ -200,15 +237,31 @@
   },
   "tests/unit/test_mineru_adapter.py": {
    "private_imports": [],
-   "tests": 22
+   "tests": 41
   },
   "tests/unit/test_mineru_backend_probe.py": {
    "private_imports": [],
    "tests": 5
   },
+  "tests/unit/test_mineru_middle_roles.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_mineru_table_html_structure.py": {
+   "private_imports": [],
+   "tests": 5
+  },
   "tests/unit/test_mineru_table_reconciler.py": {
    "private_imports": [],
-   "tests": 18
+   "tests": 10
+  },
+  "tests/unit/test_mineru_text_projection.py": {
+   "private_imports": [],
+   "tests": 12
+  },
+  "tests/unit/test_native_order_anchor.py": {
+   "private_imports": [],
+   "tests": 13
   },
   "tests/unit/test_parse_document.py": {
    "private_imports": [],
@@ -217,6 +270,22 @@
   "tests/unit/test_path_builder.py": {
    "private_imports": [],
    "tests": 6
+  },
+  "tests/unit/test_pdf_native_structure.py": {
+   "private_imports": [
+    "_destination_screen_y",
+    "_marked_content_ids",
+    "_stream_scoped_mcid_issue"
+   ],
+   "tests": 13
+  },
+  "tests/unit/test_pdf_native_text.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_pdf_visual_evidence.py": {
+   "private_imports": [],
+   "tests": 9
   },
   "tests/unit/test_pending_download_predicate.py": {
    "private_imports": [
@@ -227,6 +296,10 @@
   "tests/unit/test_pipeline_cli.py": {
    "private_imports": [],
    "tests": 16
+  },
+  "tests/unit/test_printed_toc.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_publish_run.py": {
    "private_imports": [
@@ -246,17 +319,37 @@
    "private_imports": [],
    "tests": 11
   },
+  "tests/unit/test_retire_derived_generation.py": {
+   "private_imports": [],
+   "tests": 2
+  },
   "tests/unit/test_search_projection.py": {
    "private_imports": [],
-   "tests": 21
+   "tests": 14
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],
    "tests": 3
   },
+  "tests/unit/test_source_evidence.py": {
+   "private_imports": [],
+   "tests": 40
+  },
+  "tests/unit/test_source_evidence_failures.py": {
+   "private_imports": [],
+   "tests": 40
+  },
+  "tests/unit/test_source_native_fallback.py": {
+   "private_imports": [],
+   "tests": 8
+  },
   "tests/unit/test_source_projection.py": {
    "private_imports": [],
-   "tests": 6
+   "tests": 2
+  },
+  "tests/unit/test_structure_proof.py": {
+   "private_imports": [],
+   "tests": 11
   },
   "tests/unit/test_subject_resolver.py": {
    "private_imports": [],
@@ -266,17 +359,13 @@
    "private_imports": [],
    "tests": 12
   },
-  "tests/unit/test_toc_alignment.py": {
-   "private_imports": [],
-   "tests": 24
-  },
   "tests/unit/test_track_companies.py": {
    "private_imports": [],
    "tests": 15
   },
   "tests/unit/test_unit_builder.py": {
    "private_imports": [],
-   "tests": 114
+   "tests": 27
   },
   "tests/unit/test_unit_hashing.py": {
    "private_imports": [],
@@ -290,9 +379,19 @@
    "private_imports": [],
    "tests": 14
   },
+  "tests/unit/test_visual_semantics.py": {
+   "private_imports": [],
+   "tests": 7
+  },
   "tests/unit/test_worker_cli.py": {
    "private_imports": [],
    "tests": 21
+  },
+  "tests/unit/test_worker_queries.py": {
+   "private_imports": [
+    "_classify_document_processing_row"
+   ],
+   "tests": 6
   },
   "tests/unit/test_worker_run_once.py": {
    "private_imports": [

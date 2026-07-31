@@ -10,7 +10,6 @@ from typing import Optional
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, sessionmaker
 
 from disclosure_anchor.domain.errors import ConfigurationError
 from disclosure_anchor.settings import Settings
@@ -81,7 +80,3 @@ def create_db_engine(
                 cursor.close()
 
     return engine
-
-
-def create_session_factory(engine: Engine) -> sessionmaker[Session]:
-    return sessionmaker(bind=engine, expire_on_commit=False, future=True)

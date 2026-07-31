@@ -12,9 +12,9 @@
 
 | sample | parsed pages | elements | document units | conclusion |
 |---|---:|---:|---|---|
-| short_announcement | 1-4 (full) | 31 | {'text': 20} | pass |
-| ir_activity | 1-24 (full) | 131 | {'table': 2, 'text': 46, 'qa': 36} | needs_rule_adjustment |
-| annual_report | 1-209 (full) | 2697 | {'text': 1144, 'table': 473} | pass |
+| short_announcement | 1-4 (full) | 31 | {'text': 7} | pass |
+| ir_activity | 1-24 (full) | 131 | {'mixed': 2, 'text': 38} | pass (L1 evidence preservation) |
+| annual_report | 1-209 (full) | 2697 | {'text': 260, 'table': 19, 'mixed': 287} | pass |
 
 ## IR v2 heading_level coverage
 
@@ -27,9 +27,9 @@
 
 ## Known Risks
 
-- IR first Q&A is embedded in the initial activity table; formal mapper needs table-body Q&A extraction.
-- Annual report full parse is table-heavy: 473 table units. Phase 04/05 must preserve raw table strings and normalize numeric values separately.
-- Annual report heading paths in the Phase 00 fixture are heuristic and sufficient for feasibility/golden checks, not the final sectioning rule.
+- IR first Q&A is embedded in the initial activity table. L1 preserves that typed table and the subsequent ordered structure blocks without using Q&A vocabulary to rewrite boundaries; L2 performs the Q&A extraction.
+- The annual-report replay groups consecutive text/table evidence under the same heading occurrence into complete structural blocks. Raw table strings and numeric source values remain provenance-bound rather than being normalized destructively.
+- Annual-report heading paths combine MinerU's typed headings with generic outline/TOC structure. The golden fixture guards evidence conservation and deterministic projection; it is not a market-wide parser-quality claim.
 - MinerU 3.4.0 wrote user-level `/Users/zhang/mineru.json`; it contains placeholders and external model paths, not secrets.
 - Local proxy env caused MinerU/httpx to fail without `socksio`; local parse succeeds when `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` are cleared and `NO_PROXY=*` is set.
 

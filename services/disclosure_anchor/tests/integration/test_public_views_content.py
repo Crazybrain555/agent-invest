@@ -97,7 +97,9 @@ class PublicViewContentTests(unittest.TestCase):
                 {"v": self.unit_id},
             )
             conn.execute(
-                text("DELETE FROM disclosure_core.processing_run WHERE processing_run_id = :v"),
+                text(
+                    "DELETE FROM disclosure_core.processing_run WHERE processing_run_id = :v"
+                ),
                 {"v": self.run_id},
             )
             conn.execute(
@@ -105,7 +107,9 @@ class PublicViewContentTests(unittest.TestCase):
                 {"v": self.document_id},
             )
             conn.execute(
-                text("DELETE FROM disclosure_core.source_access WHERE source_access_id = :v"),
+                text(
+                    "DELETE FROM disclosure_core.source_access WHERE source_access_id = :v"
+                ),
                 {"v": self.source_access_id},
             )
             conn.execute(
@@ -168,8 +172,9 @@ class PublicViewContentTests(unittest.TestCase):
             conn.execute(
                 text(
                     "INSERT INTO disclosure_core.processing_run "
-                    "(processing_run_id, document_id, run_kind, status) "
-                    "VALUES (:run_id, :document_id, 'full', 'succeeded')"
+                    "(processing_run_id, document_id, "
+                    "artifact_owner_processing_run_id, run_kind, status) "
+                    "VALUES (:run_id, :document_id, :run_id, 'full', 'succeeded')"
                 ),
                 {"run_id": run_id, "document_id": document_id},
             )
@@ -228,8 +233,7 @@ class PublicViewContentTests(unittest.TestCase):
                     report_period="2025A",
                     raw_file_hash=self.hash_a,
                     raw_file_relpath=(
-                        f"raw_documents/cninfo/002484/2025/{self.pid}/"
-                        "sha256_abcdef.pdf"
+                        f"raw_documents/cninfo/002484/2025/{self.pid}/sha256_abcdef.pdf"
                     ),
                 )
             )
@@ -237,6 +241,7 @@ class PublicViewContentTests(unittest.TestCase):
                 e.ProcessingRun(
                     processing_run_id=self.run_id,
                     document_id=self.document_id,
+                    artifact_owner_processing_run_id=self.run_id,
                     run_kind="full",
                     status="succeeded",
                     is_active=True,
@@ -282,17 +287,21 @@ class PublicViewContentTests(unittest.TestCase):
     def test_document_units_and_source_refs_views(self) -> None:
         self._seed()
         with self.engine.connect() as conn:
-            unit_row = conn.execute(
-                text(
-                    "SELECT payload_kind, contract_version, company_ref, "
-                    "security_ref, security_code, filing_type, report_period, "
-                    "source_ref, producer_action_ref, parent_ref, semantic_key, payload, "
-                    "asset_kind, source_tier, trace_level, raw_file_hash, query_projection_hash "
-                    "FROM disclosure_public.document_units_v1 "
-                    "WHERE asset_id = :v"
-                ),
-                {"v": self.unit_id},
-            ).mappings().one()
+            unit_row = (
+                conn.execute(
+                    text(
+                        "SELECT payload_kind, contract_version, company_ref, "
+                        "security_ref, security_code, filing_type, report_period, "
+                        "source_ref, producer_action_ref, parent_ref, semantic_key, payload, "
+                        "asset_kind, source_tier, trace_level, raw_file_hash, query_projection_hash "
+                        "FROM disclosure_public.document_units_v1 "
+                        "WHERE asset_id = :v"
+                    ),
+                    {"v": self.unit_id},
+                )
+                .mappings()
+                .one()
+            )
             self.assertEqual(unit_row["payload_kind"], "table")
             self.assertEqual(unit_row["contract_version"], "document_unit.v1")
             self.assertEqual(unit_row["company_ref"], self.company_id)
@@ -304,21 +313,27 @@ class PublicViewContentTests(unittest.TestCase):
             self.assertEqual(unit_row["producer_action_ref"], self.run_id)
             self.assertEqual(unit_row["parent_ref"], self.document_id)
             self.assertEqual(unit_row["semantic_key"], "receivable_aging")
-            self.assertEqual(unit_row["payload"], {"unit": "元", "rows": [["合计", "1"]]})
+            self.assertEqual(
+                unit_row["payload"], {"unit": "元", "rows": [["合计", "1"]]}
+            )
             self.assertEqual(unit_row["asset_kind"], "document_unit")
             self.assertEqual(unit_row["source_tier"], "tier_0a")
             self.assertEqual(unit_row["trace_level"], "G0")
             self.assertEqual(unit_row["raw_file_hash"], self.hash_a)
             self.assertEqual(unit_row["query_projection_hash"], "sha256:query")
 
-            ref_row = conn.execute(
-                text(
-                    "SELECT service, contract_version, provider, provider_document_id, raw_file_hash, "
-                    "unit_content_hash FROM disclosure_public.source_refs_v1 "
-                    "WHERE asset_id = :v"
-                ),
-                {"v": self.unit_id},
-            ).mappings().one()
+            ref_row = (
+                conn.execute(
+                    text(
+                        "SELECT service, contract_version, provider, provider_document_id, raw_file_hash, "
+                        "unit_content_hash FROM disclosure_public.source_refs_v1 "
+                        "WHERE asset_id = :v"
+                    ),
+                    {"v": self.unit_id},
+                )
+                .mappings()
+                .one()
+            )
             self.assertEqual(ref_row["service"], "disclosure_anchor")
             self.assertEqual(ref_row["contract_version"], "source_ref.v1")
             self.assertEqual(ref_row["provider"], "cninfo")
@@ -326,15 +341,19 @@ class PublicViewContentTests(unittest.TestCase):
             self.assertEqual(ref_row["raw_file_hash"], self.hash_a)
             self.assertEqual(ref_row["unit_content_hash"], "sha256:unit")
 
-            doc_row = conn.execute(
-                text(
-                    "SELECT status, raw_file_hash, contract_version, company_ref, "
-                    "security_ref, source_ref, provider_metadata "
-                    "FROM disclosure_public.documents_v1 "
-                    "WHERE document_id = :v"
-                ),
-                {"v": self.document_id},
-            ).mappings().one()
+            doc_row = (
+                conn.execute(
+                    text(
+                        "SELECT status, raw_file_hash, contract_version, company_ref, "
+                        "security_ref, source_ref, provider_metadata "
+                        "FROM disclosure_public.documents_v1 "
+                        "WHERE document_id = :v"
+                    ),
+                    {"v": self.document_id},
+                )
+                .mappings()
+                .one()
+            )
             self.assertEqual(doc_row["status"], "published")
             self.assertEqual(doc_row["contract_version"], "document.v1")
             self.assertEqual(doc_row["company_ref"], self.company_id)
@@ -344,31 +363,41 @@ class PublicViewContentTests(unittest.TestCase):
             # raw_file_relpath must not be a column in the view.
             self.assertNotIn("raw_file_relpath", doc_row)
 
-            change_rows = conn.execute(
-                text(
-                    "SELECT event_id, event_kind, change_kind, subject_kind, subject_ref, "
-                    "source, contract_version "
-                    "FROM disclosure_public.change_events_v1 "
-                    "WHERE event_id IN (:event_id, :observed_event_id)"
-                ),
-                {
-                    "event_id": self.event_id,
-                    "observed_event_id": self.observed_event_id,
-                },
-            ).mappings().all()
+            change_rows = (
+                conn.execute(
+                    text(
+                        "SELECT event_id, event_kind, change_kind, subject_kind, subject_ref, "
+                        "source, contract_version "
+                        "FROM disclosure_public.change_events_v1 "
+                        "WHERE event_id IN (:event_id, :observed_event_id)"
+                    ),
+                    {
+                        "event_id": self.event_id,
+                        "observed_event_id": self.observed_event_id,
+                    },
+                )
+                .mappings()
+                .all()
+            )
             change_by_id = {row["event_id"]: row for row in change_rows}
             self.assertEqual(
                 change_by_id[self.event_id]["event_kind"], "document_registered"
             )
             self.assertEqual(change_by_id[self.event_id]["change_kind"], "materialized")
             self.assertEqual(change_by_id[self.event_id]["subject_kind"], "document")
-            self.assertEqual(change_by_id[self.event_id]["subject_ref"], self.document_id)
+            self.assertEqual(
+                change_by_id[self.event_id]["subject_ref"], self.document_id
+            )
             self.assertEqual(change_by_id[self.event_id]["source"], "disclosure_anchor")
-            self.assertEqual(change_by_id[self.event_id]["contract_version"], "change_event.v1")
+            self.assertEqual(
+                change_by_id[self.event_id]["contract_version"], "change_event.v1"
+            )
             self.assertEqual(
                 change_by_id[self.observed_event_id]["event_kind"], "document_observed"
             )
-            self.assertEqual(change_by_id[self.observed_event_id]["change_kind"], "observed")
+            self.assertEqual(
+                change_by_id[self.observed_event_id]["change_kind"], "observed"
+            )
 
     def test_document_units_view_column_contract(self) -> None:
         expected = {
@@ -449,15 +478,19 @@ class PublicViewContentTests(unittest.TestCase):
             # classification, exactly like the rules loader does.
             refresh_document_classification(conn, document_id=document_id)
         with self.engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT filing_type, disclosure_topics, publisher_categories, "
-                    "market, content_categories "
-                    "FROM disclosure_public.documents_v1 "
-                    "WHERE document_id = :document_id"
-                ),
-                {"document_id": document_id},
-            ).mappings().one()
+            row = (
+                conn.execute(
+                    text(
+                        "SELECT filing_type, disclosure_topics, publisher_categories, "
+                        "market, content_categories "
+                        "FROM disclosure_public.documents_v1 "
+                        "WHERE document_id = :document_id"
+                    ),
+                    {"document_id": document_id},
+                )
+                .mappings()
+                .one()
+            )
         # equity_incentive (75) outranks dividend (68); both stay in topics
         self.assertEqual(row["filing_type"], "equity_incentive")
         self.assertEqual(
@@ -481,14 +514,18 @@ class PublicViewContentTests(unittest.TestCase):
             "codeless", title="江海股份：2025年半年度报告"
         )
         with self.engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT filing_type, disclosure_topics, content_categories "
-                    "FROM disclosure_public.documents_v1 "
-                    "WHERE document_id = :document_id"
-                ),
-                {"document_id": document_id},
-            ).mappings().one()
+            row = (
+                conn.execute(
+                    text(
+                        "SELECT filing_type, disclosure_topics, content_categories "
+                        "FROM disclosure_public.documents_v1 "
+                        "WHERE document_id = :document_id"
+                    ),
+                    {"document_id": document_id},
+                )
+                .mappings()
+                .one()
+            )
         # 半年度报告 must not be shadowed by the 年度报告 keyword (rule order).
         self.assertEqual(row["filing_type"], "semiannual_report")
         self.assertIsNone(row["disclosure_topics"])
@@ -518,9 +555,7 @@ class PublicViewContentTests(unittest.TestCase):
         self.assertEqual(by_id[broad_id]["filing_type"], "other")
         self.assertIsNone(by_id[broad_id]["disclosure_topics"])
         self.assertEqual(by_id[topic_id]["filing_type"], "risk_alert")
-        self.assertEqual(
-            list(by_id[topic_id]["disclosure_topics"]), ["risk_alert"]
-        )
+        self.assertEqual(list(by_id[topic_id]["disclosure_topics"]), ["risk_alert"])
         self.assertEqual(
             derive_primary_class("012399", "某公司2025年年度报告相关说明"),
             "other",
@@ -550,14 +585,18 @@ class PublicViewContentTests(unittest.TestCase):
             # classification, exactly like the rules loader does.
             refresh_document_classification(conn, document_id=document_id)
         with self.engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT filing_type, disclosure_topics "
-                    "FROM disclosure_public.documents_v1 "
-                    "WHERE document_id = :document_id"
-                ),
-                {"document_id": document_id},
-            ).mappings().one()
+            row = (
+                conn.execute(
+                    text(
+                        "SELECT filing_type, disclosure_topics "
+                        "FROM disclosure_public.documents_v1 "
+                        "WHERE document_id = :document_id"
+                    ),
+                    {"document_id": document_id},
+                )
+                .mappings()
+                .one()
+            )
         self.assertEqual(row["filing_type"], "operating_data")
         self.assertEqual(
             set(row["disclosure_topics"]), {"operating_data", "risk_alert"}
@@ -581,14 +620,18 @@ class PublicViewContentTests(unittest.TestCase):
             "annual_report", title="某公司2025年年度报告（含主要经营数据）"
         )
         with self.engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT filing_type, disclosure_topics "
-                    "FROM disclosure_public.documents_v1 "
-                    "WHERE document_id = :document_id"
-                ),
-                {"document_id": document_id},
-            ).mappings().one()
+            row = (
+                conn.execute(
+                    text(
+                        "SELECT filing_type, disclosure_topics "
+                        "FROM disclosure_public.documents_v1 "
+                        "WHERE document_id = :document_id"
+                    ),
+                    {"document_id": document_id},
+                )
+                .mappings()
+                .one()
+            )
         self.assertEqual(row["filing_type"], "annual_report")
         self.assertEqual(
             set(row["disclosure_topics"]), {"annual_report", "operating_data"}
@@ -603,14 +646,18 @@ class PublicViewContentTests(unittest.TestCase):
             "codeless", title="贵州茅台2026年第二季度主要经营数据公告"
         )
         with self.engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT filing_type, disclosure_topics "
-                    "FROM disclosure_public.documents_v1 "
-                    "WHERE document_id = :document_id"
-                ),
-                {"document_id": document_id},
-            ).mappings().one()
+            row = (
+                conn.execute(
+                    text(
+                        "SELECT filing_type, disclosure_topics "
+                        "FROM disclosure_public.documents_v1 "
+                        "WHERE document_id = :document_id"
+                    ),
+                    {"document_id": document_id},
+                )
+                .mappings()
+                .one()
+            )
         self.assertEqual(row["filing_type"], "operating_data")
         self.assertEqual(list(row["disclosure_topics"]), ["operating_data"])
         # Python evaluator parity on the code-less path.
@@ -634,55 +681,60 @@ class PublicViewContentTests(unittest.TestCase):
         class_map = load_class_map()
         facet_map = load_facet_map()
         bundle = load_filing_type_rule_bundle()
-        rows = [
-            {
-                "rule_set": "title",
-                "prefix": "%".join(rule.keywords) if rule.match == "all" else keyword,
-                "value": rule.filing_type,
-                "priority": 1000 - position,
-                "version": bundle.version,
-            }
-            for position, rule in enumerate(bundle.rules)
-            for keyword in (
-                [None] if rule.match == "all" else rule.keywords
-            )
-        ] + [
-            {
-                "rule_set": "class",
-                "prefix": prefix,
-                "value": name,
-                "priority": spec["priority"],
-                "version": class_map["version"],
-            }
-            for name, spec in class_map["classes"].items()
-            for prefix in spec["prefixes"]
-        ] + [
-            {
-                "rule_set": "facet",
-                "prefix": prefix,
-                "value": rule["facet"],
-                "priority": rule["priority"],
-                "version": facet_map["version"],
-            }
-            for rule in facet_map["rules"]
-            for prefix in rule["prefixes"]
-        ] + [
-            {
-                "rule_set": "title_topic",
-                "prefix": (
-                    "%".join(topic_rule.keywords)
-                    if topic_rule.match == "all"
-                    else keyword
-                ),
-                "value": topic_rule.class_name,
-                "priority": class_map["classes"][topic_rule.class_name]["priority"],
-                "version": bundle.version,
-            }
-            for topic_rule in bundle.topic_rules
-            for keyword in (
-                [None] if topic_rule.match == "all" else topic_rule.keywords
-            )
-        ]
+        rows = (
+            [
+                {
+                    "rule_set": "title",
+                    "prefix": "%".join(rule.keywords)
+                    if rule.match == "all"
+                    else keyword,
+                    "value": rule.filing_type,
+                    "priority": 1000 - position,
+                    "version": bundle.version,
+                }
+                for position, rule in enumerate(bundle.rules)
+                for keyword in ([None] if rule.match == "all" else rule.keywords)
+            ]
+            + [
+                {
+                    "rule_set": "class",
+                    "prefix": prefix,
+                    "value": name,
+                    "priority": spec["priority"],
+                    "version": class_map["version"],
+                }
+                for name, spec in class_map["classes"].items()
+                for prefix in spec["prefixes"]
+            ]
+            + [
+                {
+                    "rule_set": "facet",
+                    "prefix": prefix,
+                    "value": rule["facet"],
+                    "priority": rule["priority"],
+                    "version": facet_map["version"],
+                }
+                for rule in facet_map["rules"]
+                for prefix in rule["prefixes"]
+            ]
+            + [
+                {
+                    "rule_set": "title_topic",
+                    "prefix": (
+                        "%".join(topic_rule.keywords)
+                        if topic_rule.match == "all"
+                        else keyword
+                    ),
+                    "value": topic_rule.class_name,
+                    "priority": class_map["classes"][topic_rule.class_name]["priority"],
+                    "version": bundle.version,
+                }
+                for topic_rule in bundle.topic_rules
+                for keyword in (
+                    [None] if topic_rule.match == "all" else topic_rule.keywords
+                )
+            ]
+        )
         with self.engine.begin() as conn:
             conn.execute(
                 text(
@@ -701,14 +753,18 @@ class PublicViewContentTests(unittest.TestCase):
         _, briefing_unit_id = self._seed_extra_document_unit("performance_briefing")
 
         with self.engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    "SELECT asset_id, source_tier "
-                    "FROM disclosure_public.document_units_v1 "
-                    "WHERE asset_id = ANY(:ids)"
-                ),
-                {"ids": [self.unit_id, ir_unit_id, briefing_unit_id]},
-            ).mappings().all()
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT asset_id, source_tier "
+                        "FROM disclosure_public.document_units_v1 "
+                        "WHERE asset_id = ANY(:ids)"
+                    ),
+                    {"ids": [self.unit_id, ir_unit_id, briefing_unit_id]},
+                )
+                .mappings()
+                .all()
+            )
 
         tier_by_unit = {row["asset_id"]: row["source_tier"] for row in rows}
         self.assertEqual(tier_by_unit[self.unit_id], "tier_0a")
@@ -747,18 +803,20 @@ class PublicViewContentTests(unittest.TestCase):
             )
 
         with self.engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT superseded_by_document_id "
-                    "FROM disclosure_public.documents_v1 "
-                    "WHERE document_id = :document_id"
-                ),
-                {"document_id": self.document_id},
-            ).mappings().one()
+            row = (
+                conn.execute(
+                    text(
+                        "SELECT superseded_by_document_id "
+                        "FROM disclosure_public.documents_v1 "
+                        "WHERE document_id = :document_id"
+                    ),
+                    {"document_id": self.document_id},
+                )
+                .mappings()
+                .one()
+            )
 
-        self.assertEqual(
-            row["superseded_by_document_id"], self.superseding_document_id
-        )
+        self.assertEqual(row["superseded_by_document_id"], self.superseding_document_id)
 
     def test_change_kind_is_required_and_not_inferred_from_event_name(self) -> None:
         with self.engine.connect() as conn:
@@ -789,14 +847,18 @@ class PublicViewContentTests(unittest.TestCase):
             )
 
         with self.engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT event_kind, change_kind "
-                    "FROM disclosure_public.change_events_v1 "
-                    "WHERE event_id = :event_id"
-                ),
-                {"event_id": self.counterexample_event_id},
-            ).mappings().one()
+            row = (
+                conn.execute(
+                    text(
+                        "SELECT event_kind, change_kind "
+                        "FROM disclosure_public.change_events_v1 "
+                        "WHERE event_id = :event_id"
+                    ),
+                    {"event_id": self.counterexample_event_id},
+                )
+                .mappings()
+                .one()
+            )
 
         self.assertEqual(row["event_kind"], "document_observed_counterexample")
         self.assertEqual(row["change_kind"], "materialized")

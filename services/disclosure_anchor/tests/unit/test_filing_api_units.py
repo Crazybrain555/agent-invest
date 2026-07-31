@@ -1,4 +1,9 @@
+import copy
 from datetime import date, datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 
@@ -14,13 +19,22 @@ from disclosure_anchor.api.routers.units import (
     _validate_semantic_key_list,
     get_unit,
     get_unit_context,
+    get_unit_evidence,
     get_unit_source_ref,
     list_document_units,
+)
+from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
+from disclosure_anchor.application.contracts.normalized_ir import (
+    NormalizedIRVersionError,
+    validate_current_normalized_ir_for_write,
+    validate_normalized_ir_contract,
 )
 from disclosure_anchor.domain.services.unit_hashing import (
     canonical_json,
     sha256_prefixed,
 )
+from disclosure_anchor.settings import Settings
+from tests.unit._current_ir import write_text_ir_bundle
 
 
 def _document_row() -> dict:
@@ -177,10 +191,100 @@ class _Engine:
         return _Connection(self)
 
 
-def _request(engine: _Engine) -> SimpleNamespace:
+def _request(
+    engine: _Engine,
+    *,
+    settings: Settings | None = None,
+) -> SimpleNamespace:
+    state = SimpleNamespace(reader_db_engine=engine)
+    if settings is not None:
+        state.settings = settings
     return SimpleNamespace(
-        app=SimpleNamespace(state=SimpleNamespace(reader_db_engine=engine)),
+        app=SimpleNamespace(state=state),
         query_params={},
+    )
+
+
+def _settings(root: Path) -> Settings:
+    service_root = root / "service"
+    shared_root = root / "shared"
+    return Settings(
+        disclosure_data_root=service_root,
+        disclosure_shared_root=shared_root,
+        disclosure_runtime_root=service_root / "runtime",
+        mineru_model_cache=shared_root / "mineru",
+        hf_home=shared_root / "hf",
+        modelscope_cache=shared_root / "modelscope",
+    )
+
+
+def _evidence_bundle(
+    root: Path,
+) -> tuple[Settings, dict, dict, Path, bytes, str]:
+    settings = _settings(root)
+    paths = FileStorePathBuilder(settings)
+    ir_relpath = paths.normalized_ir_run_relpath(
+        provider="cninfo",
+        security_code="002484",
+        provider_document_id="pid-doc_1",
+        processing_run_id="run_parse_owner",
+    )
+    data_root = settings.disclosure_data_root / "data"
+    normalized_ir = write_text_ir_bundle(data_root, ir_relpath)
+    content = b"\x89PNG\r\n\x1a\nunit-evidence"
+    evidence_path = data_root / "parser" / "a" / "evidence.png"
+    evidence_path.write_bytes(content)
+    evidence_sha256 = "sha256:" + hashlib.sha256(content).hexdigest()
+    normalized_ir["parser_artifacts"]["files"]["source_bbox_visual_000001_000001"] = {
+        "availability": "present",
+        "relpath": str(evidence_path.relative_to(data_root)),
+        "sha256": evidence_sha256,
+        "size_bytes": len(content),
+    }
+    ir_path = data_root / ir_relpath
+    ir_content = json.dumps(
+        normalized_ir,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ).encode("utf-8")
+    ir_path.write_bytes(ir_content)
+    locator = {
+        "evidence_artifacts": [
+            {
+                "artifact_role": "source_bbox_visual_000001_000001",
+                "sha256": evidence_sha256,
+                "size_bytes": len(content),
+                "media_type": "image/png",
+                "pixel_width": 1200,
+                "pixel_height": 1800,
+            }
+        ]
+    }
+    row = {
+        "asset_id": "asset_1",
+        "document_id": "doc_1",
+        "processing_run_id": "run_rebuild_active",
+        "artifact_owner_processing_run_id": "run_parse_owner",
+        "resolved_artifact_owner_processing_run_id": "run_parse_owner",
+        "artifact_owner_document_id": "doc_1",
+        "artifact_owner_run_kind": "parse",
+        "payload_kind": "text",
+        "payload": {"text": "视觉证据"},
+        "artifact_locator": locator,
+        "provider": "cninfo",
+        "provider_document_id": "pid-doc_1",
+        "security_code": "002484",
+        "artifact_hash": "sha256:" + hashlib.sha256(ir_content).hexdigest(),
+        "producer_artifact_hash": ("sha256:" + hashlib.sha256(ir_content).hexdigest()),
+    }
+    return (
+        settings,
+        row,
+        normalized_ir,
+        evidence_path,
+        content,
+        evidence_sha256,
     )
 
 
@@ -323,12 +427,8 @@ class FilingApiUnitTests(unittest.TestCase):
             "u.semantic_key = :semantic_key OR u.semantic_keys ? :semantic_key",
             sql,
         )
-        self.assertIn(
-            "u.semantic_keys ?| CAST(:semantic_keys_any AS text[])", sql
-        )
-        self.assertIn(
-            "u.semantic_keys ?& CAST(:semantic_keys_all AS text[])", sql
-        )
+        self.assertIn("u.semantic_keys ?| CAST(:semantic_keys_any AS text[])", sql)
+        self.assertIn("u.semantic_keys ?& CAST(:semantic_keys_all AS text[])", sql)
         self.assertEqual(engine.params[1]["semantic_keys_any"], ["risk", "revenue"])
         self.assertEqual(engine.params[1]["semantic_keys_all"], ["risk", "governance"])
 
@@ -407,16 +507,44 @@ class FilingApiUnitTests(unittest.TestCase):
         self.assertEqual(engine.params[1]["cursor_asset_id"], "asset_1")
 
     def test_unit_get_and_source_ref_get(self) -> None:
-        unit = get_unit("asset_1", _request(_Engine([[_unit_row("asset_1")]])))
+        descriptor = {
+            "artifact_role": "evidence_image_000001",
+            "sha256": "sha256:" + "e" * 64,
+            "size_bytes": 123,
+            "media_type": "image/png",
+        }
+        unit_row = _unit_row("asset_1")
+        unit_row["artifact_locator"] = {"evidence_artifacts": [descriptor]}
+        unit = get_unit("asset_1", _request(_Engine([[unit_row]])))
         self.assertEqual(
             unit.asset_uri, "asset://disclosure_anchor/v1/document_unit/asset_1"
         )
-
-        source_ref = get_unit_source_ref(
-            "asset_1", _request(_Engine([[_source_ref_row()]]))
+        self.assertEqual(
+            unit.evidence_refs[0].uri,
+            "/v1/units/asset_1/evidence/" + "e" * 64,
         )
+        self.assertNotIn("artifact_role", unit.evidence_refs[0].model_dump())
+        self.assertNotIn("relpath", unit.evidence_refs[0].model_dump())
+
+        source_row = _source_ref_row()
+        source_row["payload_kind"] = "mixed"
+        source_row["_unit_payload"] = {
+            "parts": [
+                {
+                    "kind": "image",
+                    "artifact_locator": {"evidence_artifacts": [descriptor]},
+                }
+            ]
+        }
+        source_engine = _Engine([[source_row]])
+        source_ref = get_unit_source_ref("asset_1", _request(source_engine))
         self.assertEqual(source_ref.contract_version, "source_ref.v1")
         self.assertEqual(source_ref.unit_content_hash, "sha256:" + "b" * 64)
+        self.assertEqual(source_ref.evidence_refs, unit.evidence_refs)
+        self.assertIn(
+            "disclosure_public.document_units_v1",
+            source_engine.statements[0],
+        )
 
     def test_context_excerpt_uses_canonical_payload_json(self) -> None:
         engine = _Engine([[_unit_row("asset_1")], [_document_row()]])
@@ -431,11 +559,225 @@ class FilingApiUnitTests(unittest.TestCase):
         self.assertEqual(response.excerpt_hash, sha256_prefixed(excerpt))
         self.assertEqual(response.document.document_id, "doc_1")
 
-    def test_context_rejects_negative_max_chars(self) -> None:
         with self.assertRaises(HTTPException) as caught:
             get_unit_context("asset_1", _request(_Engine([])), max_chars=-1)
         self.assertEqual(caught.exception.status_code, 422)
         self.assertEqual(caught.exception.detail["error_code"], "VALIDATION_ERROR")
+
+    def test_unit_evidence_read_is_authorized_and_integrity_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            (
+                settings,
+                row,
+                normalized_ir,
+                evidence_path,
+                content,
+                evidence_sha256,
+            ) = _evidence_bundle(Path(tmp))
+            digest = evidence_sha256.removeprefix("sha256:")
+
+            engine = _Engine([[row]])
+            response = get_unit_evidence(
+                "asset_1",
+                digest,
+                _request(engine, settings=settings),
+            )
+            self.assertEqual(response.body, content)
+            self.assertEqual(response.media_type, "image/png")
+            self.assertEqual(response.headers["etag"], f'"{evidence_sha256}"')
+            self.assertEqual(
+                response.headers["cache-control"],
+                "public, max-age=31536000, immutable",
+            )
+            self.assertIn("disclosure_public.document_units_v1", engine.statements[0])
+            self.assertIn("disclosure_public.documents_v1", engine.statements[0])
+            self.assertIn("disclosure_public.processing_runs_v1", engine.statements[0])
+            self.assertEqual(
+                engine.statements[0].count("disclosure_public.processing_runs_v1"),
+                2,
+            )
+            self.assertNotIn("disclosure_core", engine.statements[0])
+            self.assertNotIn("disclosure_ops", engine.statements[0])
+
+            mixed_row = copy.deepcopy(row)
+            mixed_row["payload_kind"] = "mixed"
+            mixed_row["artifact_locator"] = None
+            mixed_row["payload"] = {
+                "parts": [
+                    {
+                        "kind": "image",
+                        "artifact_locator": row["artifact_locator"],
+                    }
+                ]
+            }
+            mixed_response = get_unit_evidence(
+                "asset_1",
+                digest,
+                _request(_Engine([[mixed_row]]), settings=settings),
+            )
+            self.assertEqual(mixed_response.body, content)
+
+            with self.assertRaises(HTTPException) as malformed:
+                get_unit_evidence(
+                    "asset_1",
+                    "A" * 64,
+                    _request(_Engine([]), settings=settings),
+                )
+            self.assertEqual(malformed.exception.status_code, 422)
+
+            with self.assertRaises(HTTPException) as unreferenced:
+                get_unit_evidence(
+                    "asset_1",
+                    "f" * 64,
+                    _request(_Engine([[row]]), settings=settings),
+                )
+            self.assertEqual(unreferenced.exception.status_code, 404)
+
+            def assert_integrity_error(
+                changed_row: dict,
+                expected_reason: str,
+            ) -> None:
+                with self.assertRaises(HTTPException) as caught:
+                    get_unit_evidence(
+                        "asset_1",
+                        digest,
+                        _request(_Engine([[changed_row]]), settings=settings),
+                    )
+                self.assertEqual(caught.exception.status_code, 500)
+                self.assertEqual(
+                    caught.exception.detail["error_code"],
+                    "EVIDENCE_INTEGRITY_ERROR",
+                )
+                self.assertEqual(
+                    caught.exception.detail["detail"]["reason"],
+                    expected_reason,
+                )
+
+            ir_hash_drift = copy.deepcopy(row)
+            ir_hash_drift["artifact_hash"] = "sha256:" + "0" * 64
+            assert_integrity_error(
+                ir_hash_drift,
+                "artifact_owner_hash_mismatch",
+            )
+            shared_hash_drift = copy.deepcopy(row)
+            shared_hash_drift["artifact_hash"] = "sha256:" + "0" * 64
+            shared_hash_drift["producer_artifact_hash"] = shared_hash_drift[
+                "artifact_hash"
+            ]
+            assert_integrity_error(
+                shared_hash_drift,
+                "normalized_ir_hash_mismatch",
+            )
+
+            wrong_owner = copy.deepcopy(row)
+            wrong_owner["artifact_owner_document_id"] = "doc_other"
+            assert_integrity_error(wrong_owner, "artifact_owner_invalid")
+
+            non_parse_owner = copy.deepcopy(row)
+            non_parse_owner["artifact_owner_run_kind"] = "rebuild_units"
+            assert_integrity_error(non_parse_owner, "artifact_owner_invalid")
+
+            manifest_drift = copy.deepcopy(row)
+            manifest_drift["artifact_locator"]["evidence_artifacts"][0][
+                "artifact_role"
+            ] = "source_page_visual_999999"
+            assert_integrity_error(manifest_drift, "evidence_manifest_mismatch")
+
+            unknown_descriptor = copy.deepcopy(row)
+            unknown_descriptor["artifact_locator"]["evidence_artifacts"][0][
+                "parser_path"
+            ] = "private.png"
+            assert_integrity_error(
+                unknown_descriptor,
+                "unit_evidence_locator_invalid",
+            )
+
+            data_root = settings.disclosure_data_root / "data"
+            ir_path = data_root / FileStorePathBuilder(
+                settings
+            ).normalized_ir_run_relpath(
+                provider="cninfo",
+                security_code="002484",
+                provider_document_id="pid-doc_1",
+                processing_run_id="run_parse_owner",
+            )
+            invalid_current_ir = copy.deepcopy(normalized_ir)
+            invalid_current_ir["elements"][1]["raw_kind"] = "unsupported_carrier"
+            self.assertEqual(
+                validate_normalized_ir_contract(
+                    invalid_current_ir,
+                    require_current=True,
+                ),
+                "normalized_ir.v4",
+            )
+            with self.assertRaises(NormalizedIRVersionError):
+                validate_current_normalized_ir_for_write(invalid_current_ir)
+            invalid_current_content = json.dumps(
+                invalid_current_ir,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8")
+            ir_path.write_bytes(invalid_current_content)
+            invalid_current_row = copy.deepcopy(row)
+            invalid_current_row["artifact_hash"] = (
+                "sha256:" + hashlib.sha256(invalid_current_content).hexdigest()
+            )
+            invalid_current_row["producer_artifact_hash"] = invalid_current_row[
+                "artifact_hash"
+            ]
+            assert_integrity_error(invalid_current_row, "normalized_ir_invalid")
+
+            unsafe_ir = copy.deepcopy(normalized_ir)
+            unsafe_ir["parser_artifacts"]["files"]["source_bbox_visual_000001_000001"][
+                "relpath"
+            ] = "../escape.png"
+            unsafe_content = json.dumps(
+                unsafe_ir,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8")
+            ir_path.write_bytes(unsafe_content)
+            unsafe_row = copy.deepcopy(row)
+            unsafe_row["artifact_hash"] = (
+                "sha256:" + hashlib.sha256(unsafe_content).hexdigest()
+            )
+            unsafe_row["producer_artifact_hash"] = unsafe_row["artifact_hash"]
+            assert_integrity_error(unsafe_row, "normalized_ir_invalid")
+
+            valid_ir_content = json.dumps(
+                normalized_ir,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8")
+            ir_path.write_bytes(valid_ir_content)
+
+            outside_path = Path(tmp) / "outside.png"
+            outside_path.write_bytes(content)
+            evidence_path.unlink()
+            evidence_path.symlink_to(outside_path)
+            assert_integrity_error(row, "evidence_artifact_path_invalid")
+
+            evidence_path.unlink()
+            assert_integrity_error(row, "evidence_artifact_missing")
+
+            evidence_path.write_bytes(content + b"x")
+            assert_integrity_error(row, "evidence_artifact_size_mismatch")
+
+            evidence_path.write_bytes(content[:-1] + b"f")
+            assert_integrity_error(row, "evidence_artifact_hash_mismatch")
+
+            evidence_path.write_bytes(content)
+            media_drift = copy.deepcopy(row)
+            media_drift["artifact_locator"]["evidence_artifacts"][0]["media_type"] = (
+                "image/jpeg"
+            )
+            assert_integrity_error(
+                media_drift,
+                "evidence_artifact_media_type_mismatch",
+            )
 
 
 if __name__ == "__main__":

@@ -13,11 +13,12 @@ from tests.integration._support import engine_or_skip
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_MODELS_ROOT = REPO_ROOT / "contracts" / "public_models"
-# is_active_run left DERIVED for source_ref only from 0011 on: document_units_v1
-# exposes it directly (round3 P1#7). tracked_company effective_* fields resolve
-# the config cascade in the API layer (0019: the global policy is a file).
+# is_active_run is a real view column from 0011 onward. evidence_refs are
+# derived from each unit's locator/payload; tracked_company effective_* fields
+# resolve the config cascade in the API layer (the global policy is a file).
 DERIVED = {
-    "document_unit": {"asset_uri"},
+    "document_unit": {"asset_uri", "evidence_refs"},
+    "source_ref": {"evidence_refs"},
     "tracked_company": {
         "effective_lookback_days",
         "effective_sync_seconds",
@@ -43,7 +44,9 @@ class FilingApiViewContractTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.engine.dispose()
 
-    def test_public_view_columns_match_exported_schema_minus_derived_fields(self) -> None:
+    def test_public_view_columns_match_exported_schema_minus_derived_fields(
+        self,
+    ) -> None:
         with self.engine.connect() as conn:
             for model_name, view_name in VIEW_BY_MODEL.items():
                 schema = json.loads(
@@ -51,7 +54,9 @@ class FilingApiViewContractTests(unittest.TestCase):
                         encoding="utf-8"
                     )
                 )
-                schema_fields = set(schema["properties"]) - DERIVED.get(model_name, set())
+                schema_fields = set(schema["properties"]) - DERIVED.get(
+                    model_name, set()
+                )
                 columns = {
                     row.column_name
                     for row in conn.execute(

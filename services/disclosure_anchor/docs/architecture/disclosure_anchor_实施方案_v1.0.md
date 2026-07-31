@@ -33,6 +33,13 @@ implementation_style: modular_monolith_with_ports_and_adapters
 > 漂移说明（2026-07-15）：payload kinds 自迁移 0011 起为 text/table/qa/mixed；ub-2026.07-26
 > 起新 builder 产物的 semantic_key/semantic_keys 均非空，无更窄概念时为
 > `document_content`；本文其余早期表述与 `service-purpose.md` 冲突处，以后者（canonical）为准。
+>
+> **结构契约覆盖（2026-07-26）**：本文后文的 publish/suppress profile、模板套话抑制、
+> provider-covered 表默认不发布、QA 词面切分、caption 晋升和标题/表族白名单均为已撤销的
+> 早期设计，不得再指导实现。现行规则是 canonical evidence 全量可检索：边界只来自 typed
+> source structure 与可回放 occurrence；taxonomy/profile 只能影响路由、排序、组包和复核强度，
+> 不能改变 title、边界、payload 或证据可见性。重复件只有在 provider linkage、内容哈希或明确
+> 版本关系证明后才可折叠，并必须保留 provenance。
 
 ---
 

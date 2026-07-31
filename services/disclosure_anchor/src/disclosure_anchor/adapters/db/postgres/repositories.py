@@ -55,7 +55,9 @@ class CompanyRepository:
         row = (
             self._session.query(models.Company)
             .filter(models.Company.legal_name == legal_name)
-            .order_by(models.Company.created_at.desc(), models.Company.company_id.desc())
+            .order_by(
+                models.Company.created_at.desc(), models.Company.company_id.desc()
+            )
             .first()
         )
         return mappers.company_to_entity(row) if row is not None else None
@@ -163,7 +165,9 @@ class SecurityRepository:
         row = self._session.get(models.Security, security_id)
         return mappers.security_to_entity(row) if row is not None else None
 
-    def get_by_code_exchange(self, security_code: str, exchange: str) -> Optional[e.Security]:
+    def get_by_code_exchange(
+        self, security_code: str, exchange: str
+    ) -> Optional[e.Security]:
         security_code, exchange = canonical_security_identity(security_code, exchange)
         row = (
             self._session.query(models.Security)
@@ -207,9 +211,13 @@ class TrackedCompanyRepository:
         return [mappers.tracked_company_to_entity(row) for row in rows]
 
     def update(self, tracked_company: e.TrackedCompany) -> e.TrackedCompany:
-        row = self._session.get(models.TrackedCompany, tracked_company.tracked_company_id)
+        row = self._session.get(
+            models.TrackedCompany, tracked_company.tracked_company_id
+        )
         if row is None:
-            raise KeyError(f"tracked company not found: {tracked_company.tracked_company_id}")
+            raise KeyError(
+                f"tracked company not found: {tracked_company.tracked_company_id}"
+            )
         updated = mappers.tracked_company_to_model(tracked_company)
         for column in (
             "company_id",
@@ -262,7 +270,9 @@ class SourceAccessRepository:
         snapshots: list[dict[str, object]] = []
         for row in rows:
             snapshot = row.result_snapshot
-            if isinstance(snapshot, dict) and isinstance(snapshot.get("candidates"), list):
+            if isinstance(snapshot, dict) and isinstance(
+                snapshot.get("candidates"), list
+            ):
                 snapshots.append(snapshot)
         return snapshots
 
@@ -290,7 +300,10 @@ class SourceAccessRepository:
         seen: set[str] = set()
         for candidate in candidates:
             provider_document_id = candidate.get("provider_document_id")
-            if not isinstance(provider_document_id, str) or provider_document_id in seen:
+            if (
+                not isinstance(provider_document_id, str)
+                or provider_document_id in seen
+            ):
                 continue
             seen.add(provider_document_id)
             if self._terminal_download_failure(
@@ -343,7 +356,9 @@ class SourceAccessRepository:
                 models.Document.provider == provider,
                 models.Document.provider_document_id == provider_document_id,
             )
-            .order_by(models.Document.created_at.desc(), models.Document.document_id.desc())
+            .order_by(
+                models.Document.created_at.desc(), models.Document.document_id.desc()
+            )
             .first()
         )
         return mappers.document_to_entity(row) if row is not None else None
@@ -367,7 +382,9 @@ def _coerce_date(value: object) -> date:
         return value
     if isinstance(value, str):
         return date.fromisoformat(value)
-    raise TypeError(f"overlap_start must be date or ISO string, got {type(value).__name__}")
+    raise TypeError(
+        f"overlap_start must be date or ISO string, got {type(value).__name__}"
+    )
 
 
 def _error_retryable(error: str | None) -> bool | None:
@@ -448,7 +465,9 @@ class SourceCheckpointRepository:
         row = self._session.get(models.SourceCheckpoint, source_checkpoint_id)
         return mappers.source_checkpoint_to_entity(row) if row is not None else None
 
-    def get_by_scope(self, provider: str, scope_key: str) -> Optional[e.SourceCheckpoint]:
+    def get_by_scope(
+        self, provider: str, scope_key: str
+    ) -> Optional[e.SourceCheckpoint]:
         row = (
             self._session.query(models.SourceCheckpoint)
             .filter(
@@ -460,9 +479,13 @@ class SourceCheckpointRepository:
         return mappers.source_checkpoint_to_entity(row) if row is not None else None
 
     def update(self, checkpoint: e.SourceCheckpoint) -> e.SourceCheckpoint:
-        row = self._session.get(models.SourceCheckpoint, checkpoint.source_checkpoint_id)
+        row = self._session.get(
+            models.SourceCheckpoint, checkpoint.source_checkpoint_id
+        )
         if row is None:
-            raise KeyError(f"source checkpoint not found: {checkpoint.source_checkpoint_id}")
+            raise KeyError(
+                f"source checkpoint not found: {checkpoint.source_checkpoint_id}"
+            )
         updated = mappers.source_checkpoint_to_model(checkpoint)
         row.provider = updated.provider
         row.scope_key = updated.scope_key
@@ -494,6 +517,10 @@ class DocumentRepository:
         refresh_document_classification(
             self._session.connection(), document_id=row.document_id
         )
+        # The refresh runs as explicit SQL, outside ORM state tracking. Reload
+        # before mapping so callers receive the materialized classification
+        # written in this transaction rather than the pre-refresh NULLs.
+        self._session.refresh(row)
         return mappers.document_to_entity(row)
 
     def get(self, document_id: str) -> Optional[e.Document]:
@@ -546,6 +573,7 @@ class DocumentRepository:
             refresh_document_classification(
                 self._session.connection(), document_id=row.document_id
             )
+            self._session.refresh(row)
         return mappers.document_to_entity(row)
 
     def get_by_provider_document_and_hash(
@@ -558,7 +586,9 @@ class DocumentRepository:
                 models.Document.provider_document_id == provider_document_id,
                 models.Document.raw_file_hash == raw_file_hash,
             )
-            .order_by(models.Document.created_at.desc(), models.Document.document_id.desc())
+            .order_by(
+                models.Document.created_at.desc(), models.Document.document_id.desc()
+            )
             .first()
         )
         return mappers.document_to_entity(row) if row is not None else None
@@ -572,7 +602,9 @@ class DocumentRepository:
                 models.Document.provider == provider,
                 models.Document.provider_document_id == provider_document_id,
             )
-            .order_by(models.Document.created_at.desc(), models.Document.document_id.desc())
+            .order_by(
+                models.Document.created_at.desc(), models.Document.document_id.desc()
+            )
             .first()
         )
         return mappers.document_to_entity(row) if row is not None else None
@@ -621,6 +653,7 @@ class ProcessingRunRepository:
         updated = mappers.processing_run_to_model(run)
         for column in (
             "document_id",
+            "artifact_owner_processing_run_id",
             "run_kind",
             "status",
             "parser_name",
@@ -628,6 +661,8 @@ class ProcessingRunRepository:
             "parser_backend",
             "parser_method",
             "parser_language",
+            "parser_target_identity",
+            "search_projection_error",
             "input_raw_file_hash",
             "parser_artifact_relpath",
             "artifact_hash",

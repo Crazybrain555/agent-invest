@@ -1,4 +1,35 @@
 {
+  "$defs": {
+    "EvidenceRefV1": {
+      "additionalProperties": false,
+      "properties": {
+        "media_type": {
+          "title": "Media Type",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "size_bytes": {
+          "title": "Size Bytes",
+          "type": "integer"
+        },
+        "uri": {
+          "title": "Uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri",
+        "sha256",
+        "size_bytes",
+        "media_type"
+      ],
+      "title": "EvidenceRefV1",
+      "type": "object"
+    }
+  },
   "additionalProperties": false,
   "properties": {
     "announcement_date": {
@@ -104,6 +135,13 @@
     "document_id": {
       "title": "Document Id",
       "type": "string"
+    },
+    "evidence_refs": {
+      "items": {
+        "$ref": "#/$defs/EvidenceRefV1"
+      },
+      "title": "Evidence Refs",
+      "type": "array"
     },
     "exchange": {
       "anyOf": [
@@ -395,7 +433,8 @@
     "market",
     "content_categories",
     "asset_uri",
-    "is_active_run"
+    "is_active_run",
+    "evidence_refs"
   ],
   "title": "DocumentUnitV1",
   "type": "object"

@@ -125,6 +125,17 @@ class Settings(BaseSettings):
             "DISCLOSURE_MINERU_SERVER_URL", "disclosure_mineru_server_url"
         ),
     )
+    # Operator/provider-attested immutable identity for the complete remote
+    # MinerU image, model set, and configuration.  The value is already a
+    # digest; callers must never turn a mutable label into an apparent hash.
+    disclosure_mineru_runtime_bundle_identity_sha256: Optional[str] = Field(
+        default=None,
+        pattern=r"^sha256:[a-f0-9]{64}$",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256",
+            "disclosure_mineru_runtime_bundle_identity_sha256",
+        ),
+    )
     cninfo_access_key: Optional[SecretStr] = Field(
         default=None,
         validation_alias=AliasChoices("CNINFO_ACCESS_KEY", "cninfo_access_key"),

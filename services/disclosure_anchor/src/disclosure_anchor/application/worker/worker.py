@@ -40,6 +40,9 @@ from disclosure_anchor.application.ports.file_store import (
     RawDocumentStorePort,
 )
 from disclosure_anchor.application.ports.parser import DocumentParserPort, ParserOptions
+from disclosure_anchor.application.ports.source_evidence import (
+    SourceEvidenceValidatorPort,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.use_cases.build_search_projection import (
     BuildSearchProjection,
@@ -71,6 +74,7 @@ from disclosure_anchor.application.worker import queries
 from disclosure_anchor.application.worker.locks import (  # noqa: F401  (re-export, 08 §2)
     DOC_NS,
     WORKER_NS,
+    acquire_corpus_write_xact_lock,
     stable_document_hash,
 )
 from disclosure_anchor.domain import entities as e
@@ -218,6 +222,7 @@ class WorkerDeps:
     path_builder: FileStorePathPort
     raw_store: RawDocumentStorePort
     artifact_store: ArtifactStorePort
+    source_evidence_validator: SourceEvidenceValidatorPort
     source_factory: Callable[[], DisclosureSourcePort]
     profile_loader_factory: Callable[
         [DisclosureSourcePort], Callable[[str], SourceCompanyProfile | None]
@@ -225,10 +230,10 @@ class WorkerDeps:
     parser_factory: Callable[[], DocumentParserPort]
     parse_expected_seconds: int
     config: WorkerConfig
+    parser_options: ParserOptions
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
     # Settings-driven parse defaults (backend/server_url cascade) — the CLI
     # builds this from env so GPU offload is a config flip, not a code change.
-    parser_options: ParserOptions = ParserOptions()
     # Read-only cost probe injected by the composition root. A failed/unknown
     # probe never blocks parsing, but enters the resource-conservative heavy
     # lane and uses the base expected-duration envelope rather than
@@ -252,6 +257,10 @@ class WorkerDeps:
     # waits. Losing that session must stop active MinerU groups before this
     # worker can overlap a replacement process.
     admission_guard: Callable[[], None] = lambda: None
+    # Present only for a manifest-bound destructive replay. The regular queue
+    # remains authoritative; this guard checks the archived raw identity at
+    # the last admission boundary before parsing.
+    replay_raw_identity_guard: Callable[[str, str | None], None] | None = None
 
 
 def _merge_acquisition_report(
@@ -296,6 +305,7 @@ def run_once(
             else max(0, stale_threshold_seconds)
         )
         with deps.engine.begin() as conn:
+            acquire_corpus_write_xact_lock(conn)
             report.stale_reclaimed = queries.reclaim_stale_runs(
                 conn, threshold_seconds=threshold_seconds
             )
@@ -887,6 +897,16 @@ def _parse_work_items(
 ) -> list[_ParseWorkItem]:
     items: list[_ParseWorkItem] = []
     for row in pending:
+        document_id = str(row["document_id"])
+        if deps.replay_raw_identity_guard is not None:
+            deps.replay_raw_identity_guard(
+                document_id,
+                (
+                    str(row["raw_file_hash"])
+                    if row.get("raw_file_hash") is not None
+                    else None
+                ),
+            )
         page_count: int | None = None
         raw_byte_count_value = row.get("raw_byte_count")
         raw_byte_count = (
@@ -908,7 +928,7 @@ def _parse_work_items(
                 page_count = probed
         items.append(
             _ParseWorkItem(
-                document_id=str(row["document_id"]),
+                document_id=document_id,
                 page_count=page_count,
                 raw_byte_count=raw_byte_count,
             )
@@ -1069,6 +1089,7 @@ def _finalize_one_document(
             path_builder=deps.path_builder,
             artifact_store=deps.artifact_store,
             uow_factory=deps.uow_factory,
+            source_evidence_validator=deps.source_evidence_validator,
         ).execute(
             BuildUnitsCommand(processing_run_id=processing_run_id)
         )
@@ -1510,6 +1531,7 @@ def _parse_one_batch(
         return "closed"
 
     candidate_limit = max(limit, deps.config.parse_candidate_window)
+    require_active_company_scope = deps.replay_raw_identity_guard is None
     known_ids: set[str] = set()
     successful_history: deque[str] = deque()
     deferred_retries: deque[tuple[int, str]] = deque()
@@ -1541,6 +1563,7 @@ def _parse_one_batch(
                     max_retries=deps.config.max_parse_retries,
                     limit=candidate_limit,
                     scope_classes=deps.config.process_scope_classes,
+                    require_active_company_scope=require_active_company_scope,
                     document_ids=tuple(due_retry_ids),
                 )
             selected.extend(due_rows)
@@ -1556,6 +1579,7 @@ def _parse_one_batch(
                     max_retries=deps.config.max_parse_retries,
                     limit=candidate_limit,
                     scope_classes=deps.config.process_scope_classes,
+                    require_active_company_scope=require_active_company_scope,
                     after_document_id=candidate_cursor,
                 )
             if not page:
@@ -2184,6 +2208,7 @@ def _build_stage(
         path_builder=deps.path_builder,
         artifact_store=deps.artifact_store,
         uow_factory=deps.uow_factory,
+        source_evidence_validator=deps.source_evidence_validator,
     )
     for row in pending:
         if should_stop():
@@ -2294,9 +2319,9 @@ def _project_stage(
     Unbounded on purpose: the delta anti-join selects exactly the units the
     projection is missing (or stamped with an older retrieval-rules version),
     so once caught up the per-round work equals that round's newly published
-    units. The stop signal is honored between batches, so a shutdown during
-    a large catch-up drain yields within seconds and the committed batches
-    resume next round. Failure-isolated like every other stage: a projection
+    units. The stop signal is honored between processing runs; a run's parent
+    rows and body windows remain atomic, and committed runs resume from the
+    next delta round. Failure-isolated like every other stage: a projection
     fault lands in the failure list under stage='project' and the round still
     completes. The projection is derived and regenerable, so a skipped round
     self-heals on the next round's drain or a CLI rebuild.
@@ -2304,7 +2329,7 @@ def _project_stage(
 
     try:
         result = BuildSearchProjection(engine=deps.engine).execute(
-            BuildSearchProjectionCommand(full=False, limit=None, prune=prune),
+            BuildSearchProjectionCommand(full=False, prune=prune),
             should_stop=should_stop,
             on_progress=deps.heartbeat,
         )
@@ -2320,6 +2345,17 @@ def _project_stage(
         )
         return
     report.projected += result.projected
+    for failure in result.failures:
+        report.failed += 1
+        report.failures.append(
+            WorkerFailure(
+                stage="project",
+                item_ref=failure.processing_run_id,
+                error_code=failure.error_code,
+                retryable=False,
+                message=failure.message[:500],
+            )
+        )
 
 
 def render_report_section(report: WorkerReport) -> str:

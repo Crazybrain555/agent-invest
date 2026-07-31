@@ -245,3 +245,8 @@ provider_document_id=文件名去后缀）。
   （tests/integration/test_filing_api_views_contract.py 与 contract-checklist §2 已同步）。
 - §1 的 32/36 列均为历史迁移口径；0014–0016 后当前 `document_units_v1` 为 **41 列**，
   `is_active_run` 是真实视图列，列全集以 contract-checklist §2 为准。
+- **2026-07-27 evidence bytes 契约补充**：unit locator 绑定的视觉 evidence 通过
+  `GET /v1/units/{asset_id}/evidence/{sha256}` 以内容 digest 读取；请求不得携带 role/path，
+  服务必须复核 run 的 NormalizedIR hash、v4 manifest 与 bytes 的 size/hash/media type。
+  `document_unit` 的 DERIVED 集相应为 `{asset_uri,evidence_refs}`，`source_ref` 的 DERIVED 集为
+  `{evidence_refs}`；新增公开错误码 `EVIDENCE_INTEGRITY_ERROR` 专用于已发布证据缺失或漂移。

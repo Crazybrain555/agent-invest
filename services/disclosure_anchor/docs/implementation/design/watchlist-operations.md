@@ -159,4 +159,4 @@ CSV 降级为导入/种子 + git 快照格式。**
 三层：`status=paused` 可逆停（原 qlib 模式保留）；`DELETE /v1/admin/tracked-companies/{code}`
 = `make untrack`（删订阅行，公司/文档留档；下载队列谓词同轮从"paused 才拦"翻转为
 "active 行才放行"，否则删行会重新打开积压下载）；`make purge-company CODE=.. PURGE=YES`
-（测试期专用，wipe-test-data 单公司版，撤销失误用）。
+（测试期专用、CORPUS exclusive，只撤销明确识别的单公司失误）。

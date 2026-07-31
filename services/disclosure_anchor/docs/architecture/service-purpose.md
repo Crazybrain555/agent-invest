@@ -69,8 +69,11 @@ not_produces: [standard_financial_dataset, event_fact, metric_observation, claim
 
 - **同一逻辑层，不等于同一数据库表。**
 - **标准数据侧是 provider 无关的。** Wind 只是首版示例，可整体或按 dataset 替换 / 并存为 Tushare、同花顺 iFinD、Choice 等；抽象由 `dataset_registry + provider_adapter` 承担，`dataset_key` 不绑定具体 provider。
-- 标准数据 provider 已稳定覆盖的标准财务数据，通过 `Dataset API` 使用，不复制成 `document_unit`。
-- PDF 中 provider 未覆盖、但对预测有价值的表格和文本，由本服务处理成 `document_unit`。
+- 标准数据 provider 已稳定覆盖的标准财务数据，通过 `Dataset API` 使用；本服务不把 PDF
+  内容再建设成第二套**标准化 dataset**，但 PDF 中实际出现的表格和正文仍作为可检索
+  `document_unit` 证据发布。
+- PDF 中所有有实质内容的表格、正文和视觉载体都进入结构化证据链；是否已被 provider 覆盖、
+  是否“对预测有价值”只影响 L2 路由、排序和采用，不影响 L1 证据是否存在。
 - 非标准 API、MCP、Web 查询、搜索、新闻等一次性来源，由对应 L1 adapter 登记为 `data_asset` 或
   `source_access` 后进入 `L2`；第一版不要求把它们转成 `document_unit`，也不由本服务承担（详见
   《财报与披露数据接入及切分方案》§1.2）。
@@ -82,17 +85,18 @@ not_produces: [standard_financial_dataset, event_fact, metric_observation, claim
 
 ```text
 L1 disclosure_anchor
-PDF → 章节 / 子标题 / 完整表格 / 完整问答
+PDF → 标题树 / 完整结构 evidence block（text / table / mixed）
 
 L2
-一个 document_unit → 0 到多条 evidence_record（observed_claim / relation_claim / numeric_observation 等）
+一个 document_unit → 可选 Q&A / event / fact 抽取 → 0 到多条 evidence_record
+（observed_claim / relation_claim / numeric_observation 等）
 ```
 
 因此：
 
 > `document_unit` 是最小的 L1 可寻址文档单元，不是最小事实，也不是 claim。
 
-一个完整问答、一个经营分析小节或一张应收账款账龄表，都可能在 `L2` 中产生多条
+一个包含完整问答上下文的结构块、一个经营分析小节或一张应收账款账龄表，都可能在 `L2` 中产生多条
 `evidence_record`。
 
 ---
@@ -130,20 +134,23 @@ L2
 
 ## 2.3 按业务结构切，不按版面和 token 切
 
-正文按标题层级、显式编号、完整问答和完整事项切分。
+正文按 PDF 中可回放的标题层级与标题 occurrence 切分。
 
 **单元边界是业务语义块，不是 parser 元素**（2026-07-06 phase008 审查定案）：
-一个 unit 必须表达一个完整的业务事实/事项/章节/证据块——大到足以让一个人读完后回答一个
-业务问题。payload kind（text/table）不决定 unit 边界；一个业务块内 text 与 table 交替时，
-产出 `mixed` 单元（payload = 有序 parts，每个 part 保留 kind、局部小标题、适用性标记）。
-粒度规则（rule bundle 内版本化）：
+一个 unit 必须表达一个完整的章节证据块——大到足以让 L2 命中其中任一内容后取得该真实章节下
+连续出现的文字、表格和视觉证据。payload kind（text/table/image）、caption 文本、监管 taxonomy、
+页码、字符数和 token 数都不决定边界。边界只来自可回放的源结构：
 
-- 短公告/决议/制度（可坍缩 filing_type 且正文 ≤ 阈值）→ 一个 document 级 unit；
-- 事项型公告（股东会/董事会决议）→ 每项议案一个 unit（审议结果+表决表+会议决定同体）；
-- 长结构化文档（年报等）→ 先按显式业务结构/受控附注边界定组，再在同一边界内把技术切片
-  合成 `mixed`；8,000 字符与 24 parts 仅是合组安全上限，不用于向上寻找更浅祖先；已经原子化的
-  超限 text/table 保持原子，交由 L2 窗口化，禁止为了凑阈值按 kind 或页码硬拆；
-- qa 单元天然完整，永不并组。
+- 有 typed heading 时，以完整标题树中的**具体 occurrence**为边界；相同标题文字在不同位置仍是
+  不同 occurrence；
+- 同一 occurrence 下连续出现的 text/table/image 合成一个 `mixed`，parts 保持原顺序、原 payload、
+  适用性和各自 locator；遇到下一个真实 heading 才闭合；
+- 没有 heading 的文档只能锚到登记文档标题，不能把 table/image caption、单位、脚注或业务短语
+  提升为虚构章节；
+- 原生文字 occurrence 的几何不可用时，保留同页其余可定位文字，并以类型化 issue + hash-bound
+  无损整页图闭合；视觉护栏补足证据模态但不产生标题、父子关系或业务边界；
+- 粒度过粗时由 L2 基于真实标题路径和逻辑表格行做临时 context packaging；不得反过来用
+  L2 taxonomy、内容词表、页码或固定阈值改写 L1 证据边界。
 
 第一版不把以下对象作为长期数据模型：
 
@@ -164,8 +171,8 @@ agent 运行时为了控制上下文长度，可以临时合并、截取或拆�
 证据；不引入 persistent chunk / RAG node / 独立向量库（边界与实现见 milestone 05-U7 / 06R；
 06R 为规划中的检索投影里程碑，规格文档尚未编写）。
 
-L2 的上下文包与 L1 的持久化边界不得混为一谈：L1 按显式业务/受控科目边界保留可寻址
-证据，8k 仅是 mixed unit 的安全硬上限；L2 按最终模型 tokenizer 对渲染后的 prompt +
+L2 的上下文包与 L1 的持久化边界不得混为一谈：L1 按源标题 occurrence 保留可寻址
+证据；L2 按最终模型 tokenizer 对渲染后的 prompt +
 sources 计数，并预留输出/工具开销。ub-2026.07-48 的 1,371 份历史离线重放按展开表格字符
 估算时呈双峰：1,292 份正文
 不超过 40,000 字符，79 份年报/半年报从 103,354 到 388,948 字符，两组之间无样本。
@@ -177,9 +184,9 @@ token 的 section packs；超长表格另建 1.5–3k token 的连续行窗口�
 
 ## 2.4 表格先保留完整结构，不急于全市场标准化
 
-PDF 表格默认保存为完整 `table` 单元：
+PDF 表格默认保存为完整 `table` part（无同节相邻内容时也可单独成为 unit）：
 
-- 表名；
+- 源 `table_caption`（关联文本，不假定为表名）；
 - 标题路径；
 - 单位；
 - 表头；
@@ -194,9 +201,10 @@ PDF 表格默认保存为完整 `table` 单元：
 
 ## 2.5 不重复建设标准数据
 
-三大报表、标准财务指标、业绩预告、业绩快报、审计意见等，若标准数据 provider 已稳定覆盖，本服务不从 PDF 重建第二套标准表。
-
-PDF 原文件和 parser artifact 仍可保留，但不为这些内容默认生成可查询的标准 `table` 单元。
+三大报表、标准财务指标、业绩预告、业绩快报、审计意见等，若标准数据 provider 已稳定覆盖，
+本服务不从 PDF 重建第二套统一口径、可替代 Dataset API 的标准表；但它们在 PDF 中的原始
+标题、表格、脚注和说明仍按源结构发布为可查询证据。`provider-covered` 是检索/采用 facet，
+不是 suppress 规则。
 
 ## 2.6 L1 不判断真伪和重要性
 
@@ -205,8 +213,8 @@ PDF 原文件和 parser artifact 仍可保留，但不为这些内容默认生�
 - 确定性去噪；
 - 标题树识别；
 - 表格抽取；
-- Q&A 识别；
-- 固定规则的保留 / 跳过；
+- 对 parser 已给出的结构关系做可回放校验；
+- 仅对有封闭 source type、位置和重复证明的外部版面元数据做抑制；
 - 粗粒度 `semantic_key` 标注；
 - 解析质量标记。
 
@@ -221,13 +229,13 @@ PDF 原文件和 parser artifact 仍可保留，但不为这些内容默认生�
 - 事件 canonical 化；
 - claim 抽取和入账。
 
-## 2.7 删除派生单元，不删除原文件
+## 2.7 轻量化不能以证据不可见为代价
 
-“去掉废话”在本服务中的含义是：
+原 PDF 和 parser artifact 不是 L2 自动检索的替代品。所谓“去掉废话”只允许发生在派生的
+检索排序、上下文组包或 L2 采用阶段：
 
-> 不为该内容生成 `document_unit`，但原始 PDF 和完整 parser artifact 仍然保留。
-
-这样可以显著减轻 L2 负担，同时允许未来规则变化后重新处理。
+> L1 仍发布每个有实质内容、可定位的 source carrier；检索投影可降低模板性内容的排序权重，
+> section pack 可按请求裁剪，但 canonical evidence、title/path 和 locator 不得因重要性判断消失。
 
 ---
 
@@ -468,7 +476,7 @@ artifact_locator（可选）
     "应收账款",
     "按账龄披露"
   ],
-  "title": "应收账款按账龄披露",
+  "title": "按账龄披露",
   "semantic_key": "receivable_aging",
   "payload": {
     "unit": "元",
@@ -490,13 +498,16 @@ artifact_locator（可选）
 
 > 示例取自江海股份（002484）2025 年年度报告"第八节 财务报告 / 应收账款 / 按账龄披露"。注意原表中"3 年以上"为小计行，其下再拆"3 至4 年 / 4 至5 年 / 5 年以上"三个子区间，下游做"合计=各账龄之和"校验时应避免重复计数。
 
-表格跨页时仍然只生成一个逻辑 `table` 单元。是否跨页不是调用方需要关心的业务属性。
+canonical `table` 一张只对应一个物理页。MinerU 的跨页合并在 provider 进程中关闭；
+content/model 必须以同页唯一 bbox 和完全相同的 logical cells 一一闭合，失败即中止解析。
+后续若证明多个页内表属于同一逻辑表，只能发布独立派生关系，不能改写 canonical grid、
+HTML、title、章节边界或来源 hash。
 
 ## 6.4 qa 单元
 
 > 历史值：旧产物存在、2026-07-16 起不再产出（QA 判别已移除，转写以 raw text 落地）。以下 schema 仅供历史行解读，新 run 不再生成 qa 单元。
 
-适用于投关记录、业绩说明会和公开交流中的完整问答。
+旧值曾用于投关记录、业绩说明会和公开交流问答；现行 L1 不再生成该类型。
 
 ```json
 {
@@ -513,12 +524,14 @@ artifact_locator（可选）
 
 > 示例取自美的集团（000333）2025 年 4 月 11 日投资者关系活动记录表（2024 年度业绩说明会，编号 2025-2）的第 1 问。
 
-一个回答即使很长，也不按 token 拆碎。L2 可以从中抽取多条 `evidence_record`。
+历史 qa 行中的回答即使很长也不按 token 拆碎。新 run 则按真实 heading occurrence
+保留问句、回答和表格上下文，由 L2 抽取多条 `evidence_record`。
 
 ## 6.5 mixed 单元
 
-适用于一个业务块内 text 与 table（或 image）交替的场景：短公告整体、股东会/董事会
-一项议案、年报里的一个业务小节（研发投入、附注某科目）。payload 是有序 parts；每个
+适用于同一个已证明结构区间内 text 与 table（或 image）交替的场景：短公告整体、
+股东会/董事会的一个 source-proved section、年报里的一个业务小节（研发投入、附注某科目）。
+payload 是有序 parts；每个
 part 的形状复用对应 kind 的 payload schema（part 级 `kind` ∈ {text, table, image}；image
 part 另带 `visual_kind` ∈ {image, chart, equation} 与可选 `visual_subtype`——MinerU sub_type
 透传，如 seal/bar），另带 `kind`、`order`，以及可选的 `local_heading`（**历史字段，新产物不再
@@ -530,9 +543,9 @@ part 另带 `visual_kind` ∈ {image, chart, equation} 与可选 `visual_subtype
 {
   "payload_kind": "mixed",
   "heading_path": ["二、议案审议情况"],
-  "title": "3.议案名称：《关于聘请2026年度财务审计机构和内控审计机构的议案》",
+  "title": "二、议案审议情况",
   "payload": {
-    "semantic_type": "meeting_proposal",
+    "semantic_type": "section",
     "parts": [
       {"kind": "text", "order": 12, "text": "审议结果：通过\n表决情况："},
       {"kind": "table", "order": 13, "headers": ["股东类型", "同意"], "rows": [["A股", "99.98%"]], "caption": [], "unit": null, "notes": []},
@@ -542,8 +555,9 @@ part 另带 `visual_kind` ∈ {image, chart, equation} 与可选 `visual_subtype
 }
 ```
 
-`semantic_type` 当前取值：`document`（短公告坍缩）、`meeting_proposal`（议案）、
-`section`（长文档业务小节）。单元级 `applicability` 只在各 parts 声明一致时置值，
+`semantic_type` 当前取值只有 `document`（登记文档整体）和 `section`（由结构证据证明的
+文档区间）。监管 taxonomy 可在组装完成后帮助 L2 路由，但不得反向决定 section 边界。
+单元级 `applicability` 只在各 parts 声明一致时置值，
 冲突时为 NULL、由 parts 承载细节。
 
 ---
@@ -599,6 +613,8 @@ part 另带 `visual_kind` ∈ {image, chart, equation} 与可选 `visual_subtype
 ## 7.2 artifact_locator
 
 `artifact_locator` 是可选的**技术位置**，用于回到 parser artifact 的真实页、bbox 与元素。
+`title`、heading_path 或 caption 发生争议时，必须沿 locator 回到 NormalizedIR、MinerU page/model
+artifact 和原始 PDF 查证；缺 locator 或源字段不是“保守猜一个值”的理由，而是 parser 质量故障。
 
 它可以包含：
 
@@ -606,9 +622,6 @@ part 另带 `visual_kind` ∈ {image, chart, equation} 与可选 `visual_subtype
 order_index
 page_no
 bbox
-page_span / page_bboxes
-model_table_indices / continuation_source_item_indices
-table_locator_algorithm
 merged_cells
 ```
 
@@ -623,12 +636,22 @@ merged_cells
 }
 ```
 
-它指回 parser 产物中该表所在位置，便于人工复核或重解析。跨页 aggregate 表保持一个逻辑
-table，locator 用连续 `page_span`、逐页 `page_bboxes` 和 model/ghost 索引覆盖所有页面；
+它指回 parser 产物中该表所在物理页，便于人工复核或重解析。当前 parser 不生产跨页
+aggregate table、ghost carrier 或 aggregate locator；每个 locator 只描述本页 canonical
+table。page-edge、表框横向对齐和相邻 model row 只能作为后续关系推导的输入，不能证明
+“断词续行”或反向改写页内 evidence。任何 content/model 缺失、歧义或不等价都在解析时
+fail closed，而不是用 `needs_review` 掩盖未闭合的表格证据。
 `merged_cells` 坐标始终相对最终 `[headers, *rows]` full grid。headers 仅在源 HTML 携带
 `<th>` 证据时非空（用户 2026-07-16 裁决：无证据不做首行提升，完整网格忠实保留在 rows，
 表头解释归 L2/视图层——本节示例中的 headers 值仅适用于有 th 证据的表）。mixed 中每个
 part 可有自己的 locator，unit 顶层 locator 不替代它；locator 不是 agent 的主查询键。
+
+locator 中登记的视觉 evidence artifact 通过
+`GET /v1/units/{asset_id}/evidence/{sha256}` 读取。请求只携带 unit 身份与内容 digest，
+不得携带或推导文件路径；服务先确认 digest 被该 unit（含 mixed part）引用，再校验
+processing run 登记的 NormalizedIR hash、v4 manifest descriptor 及返回 bytes 的
+size/hash/media type。未被 unit 引用的 digest 返回 `NOT_FOUND`；已发布 descriptor、manifest
+或文件发生缺失/漂移时返回明确的 `EVIDENCE_INTEGRITY_ERROR`，不得伪装成 404。
 
 ## 7.3 第一版追溯锚
 
@@ -651,29 +674,25 @@ exact table snapshot= {"账龄":"1 年以内（含1 年）","期末账面余额"
 
 ## 8.1 通用优先级
 
-按以下顺序识别逻辑边界：
+先从 parser typed heading、编号语法、TOC 对账和布局层级恢复完整标题树；再以具体 heading
+occurrence 划分连续 source carriers。表格、文字、图片、适用性声明和关联 caption 都是该结构下
+的证据 parts，不是新的边界。没有标题结构时使用登记文档标题作为唯一 document anchor。
 
-1. 文档级标题；
-2. 章节标题；
-3. 子标题；
-4. 显式编号条目；
-5. 完整 Q&A；
-6. 完整表格；
-7. 短公告中的完整事项说明。
-
-不使用固定字符数、固定 token 数和 overlap 作为持久化边界。
+不使用业务短语白名单/黑名单、监管 taxonomy、payload kind、页码、固定字符数、固定 token 数
+或 overlap 作为持久化边界。编号语法只说明源文档的 outline 形态，不说明其金融主题。
 
 ## 8.2 长文本处理
 
-如果一个逻辑小节本身很长，但没有更细的真实结构，第一版仍保存为一个 `text` 单元。
+如果一个逻辑小节本身很长，但没有更细的真实结构，第一版仍保存为一个 unit；其中不同
+source kinds 以有序 `mixed.parts` 保留。
 
 运行时 agent 可以按需摘取上下文，但数据库不为此生成长期 chunk。
 
 ## 8.3 表格和邻近解释
 
-一张表的标题、单位、表头、行数据、脚注和紧邻解释应尽量放在同一 `table` 单元中。
-
-与表格无关的后续管理层分析应另建 `text` 单元。
+`title` 只取 PDF 标题树的叶节点；`table_caption`、单位、表头、行数据和脚注分别保留在 table
+payload 中，不能互相冒充。表格与同一 heading occurrence 下的相邻解释进入一个有序 `mixed`。
+下一真实 heading occurrence 下的内容另建 unit；不按“是否像管理层分析”等词面语义猜边界。
 
 ## 8.4 短公告
 
@@ -685,85 +704,33 @@ exact table snapshot= {"账龄":"1 年以内（含1 年）","期末账面余额"
 
 # 9. 保留与跳过策略
 
-## 9.1 默认保留
+## 9.1 证据守恒
 
-优先生成单元的内容包括：
+NormalizedIR 中每个非空 source carrier 默认都必须进入 unit payload、mixed part、结构化投影或
+明确可审计的结构去重记录。L1 不根据“投资价值”、监管主题、标题短语或模板词表删除内容。
+目录、释义、责任声明、风险提示、签章、联系方式、标准财务报表等只要 parser 识别为非空正文，
+都仍是可检索证据；是否进入某个 L2 任务由检索路由和 context packaging 决定。
 
-**业务与经营**
+## 9.2 仅结构可证明时不重复发布
 
-- 主营业务、业务结构和经营模式；
-- 行业格局、竞争地位和市场环境分析；
-- 产品、客户、供应商、区域和渠道变化；
-- 价格、销量、订单、产能、产销量和库存；
-- 核心竞争力、品牌、专利和特许经营权。
+允许不生成独立业务 unit 的范围仅限：
 
-**财务表现与财务附注**
+- parser 明确标注且经页边位置或跨页重复证明的页码、running header/footer；
+- provider 明确声明为非内容且可由 source contract 验证的空载体；当前 MinerU table 不属于
+  该类，空 HTML/grid/crop 会使解析失败；
+- 与登记元数据逐字相等、且所有来源位置均保存在 locator/统计中的重复封面或证券元数据；
+- 没有内容寻址视觉资产、没有 caption、没有可用文本的纯空视觉载体。
 
-- 收入、成本、毛利率、费用、利润和现金流的变化及原因；
-- 分行业、分产品、分地区的收入和毛利率拆分；
-- 关键财务附注表（应收账款账龄及坏账、存货分类及跌价、商誉及减值、固定资产及在建工程、长期股权投资、债务及融资结构、收入确认、税项、关联交易等）；
-- 分部报告、合并范围变化和重要会计政策、会计估计变更；
-- 重要资本开支、并购重组、资产剥离和资产减值。
-
-**治理、资本与股东**
-
-- 公司治理结构、董监高履职和薪酬；
-- 股本结构、股份变动、股东和实际控制人情况；
-- 募集资金使用、利润分配和权益分派方案；
-- 股权激励、员工持股和回购方案；
-- 债券、可转债及其他融资工具的相关情况。
-
-**重大事项与公告**
-
-- 重大合同、对外担保、对外投资和委托理财；
-- 关联交易、同业竞争和承诺事项及履行情况；
-- 诉讼仲裁、行政处罚和其他或有事项；
-- 业绩预告、业绩快报和重大事项进展；
-- 监管问询函、关注函的单个问题及回复。
-
-**风险、展望与交流**
-
-- 风险因素和应对措施；
-- 未来发展战略、经营计划和未来展望；
-- 投资者关系活动、业绩说明会和公开交流中的完整问答；
-- 环境、社会和可持续发展（ESG）中的实质披露；
-
-等。
-
-## 9.2 默认不生成单元
-
-以下内容仍保留在原始 PDF 和 parser artifact，但默认不生成 `document_unit`：
-
-- 封面、扉页、目录、页眉、页脚和页码；
-- 释义和固定责任声明（董监高保证真实准确完整等套话）；「重要提示」板块**不得按标签整段跳过**（协议 §3.5 安全红线：常含退市风险、业绩大幅变动等实质内容，按 9.1 保留），仅其中纯模板句可跳过；
-- 签章、签字页、盖章、联系方式和备查文件目录；
-- 空表，以及只有表头、单位而无实质数据的表；
-- 只有“适用 / 不适用”“是 / 否”勾选而无实质内容的模板项；
-- 重复性极高的法定格式文字和标准化风险提示套话；
-- 财务报表附注中照抄会计准则的套话段落，包括重要会计政策的一般性表述、各会计科目的确认计量原则、金融工具 / 收入 / 租赁 / 合并报表编制等的标准定义，以及"遵循企业会计准则的声明""重要性判断标准"等模板（注意：会计政策 / 会计估计的**实际变更及其影响**仍按 9.1 保留）；
-- 独立董事、监事会、保荐机构、会计师等出具的标准格式意见中无个性化结论的模板段落；
-- 重复出现的免责声明、版权声明和前瞻性陈述提示；
-- 纯排版元素（分隔线、装饰图、二维码、占位空白）；
-- 标准数据 provider 已覆盖、且本服务不需要重建的标准财务报表；
-- 当前预测阶段明确不使用的形式化披露；
-
-等。
-
-> 9.1 和 9.2 都是**示意性清单，不是穷尽的硬编码规则**，目的是说明"按实质内容判断"的取舍倾向，而非要求实现逐条照搬。两个原则优先于具体条目：一是**有实质信息就保留、纯格式和重复套话才跳过**；二是**拿不准时倾向保留**（漏掉实质披露的代价远高于多生成一个单元）。同一类内容在不同文档里可能落在不同侧——例如"风险提示"，个性化、可量化的风险应保留，纯模板套话才跳过——应结合 9.3 的规则边界按文档类型和语义判断，不要机械匹配字面标题。
+这些判断都必须依赖 source type、位置、重复关系、哈希或登记元数据相等性，不得依赖业务词面。
+一旦所谓“噪声”含有无法由其他已发布字段逐字重放的信息，就必须保留并追查 parser/结构证据，
+不能以降级、黑名单或白名单掩盖。
 
 ## 9.3 规则边界
 
-保留 / 跳过应由：
-
-- 文档类型规则；
-- 标题规则；
-- 表格语义规则；
-- 明确的 allowlist / denylist；
-- 可版本化的机械分类器；
-
-共同决定。
-
-不得让 LLM 在 L1 自由判断“这段有没有投资价值”。
+结构去重只能由可版本化、可回放、与内容主题无关的机械证明决定。监管 taxonomy、
+`semantic_key(s)`、filing type 和 L2 查询同义词只用于路由/排序，绝不参与 heading_path、title、
+unit 边界、内容归属或删除。不得让 LLM 在 L1 自由判断“这段有没有投资价值”；若将来引入
+模型辅助结构判定，也必须输出可核验位置和独立证据，不能把模型猜测写成源事实。
 
 ---
 
@@ -930,13 +897,17 @@ heading_prefix），其余键经 DB 视图直读或后续 API 升版满足。
 ```text
 documents_v1 / document_units_v1 / document_categories_v1 /
 processing_runs_v1 / source_refs_v1 / change_events_v1 / tracked_companies_v1 /
-unit_search_projection_v1
+unit_search_projection_v1 / unit_body_search_windows_v1 / unit_search_atoms_v1
 ```
 
 `unit_search_projection_v1`（0025 迁移，06R 检索投影层）是**派生、可再生、无事件语义**的读面：
 每列可由已持久化 unit 经钉死 jieba 分词确定性再生，不进 content/query_projection 哈希、重建
 不发 outbox 事件，L2 直接消费加权 tsvector + pg_trgm 子串通道；证据引用始终回到 document_unit
 的 asset_id。
+
+`unit_search_atoms_v1`（0030）把 body 的每个 explicit search-target 字符串叶子保留为独立
+NFKC+casefold atom，供长度 ≥3 的精确子串候选；不得连接相邻 target/mixed part。GIN `LIKE`
+只是候选，L2 必须转义 pattern 并在同 atom 以 `strpos` 复核；1–2 字仍只走完整 word channel。
 
 `tracked_companies_v1`（0019+0020 迁移，contract_version `tracked_company.v1`，round22）
 暴露股票池配置与生命周期：真源是 `tracked_company` 表（watchlist.csv 降级为导入/快照格式，
@@ -993,6 +964,12 @@ order_index
 0008 迁移起，`processing_runs_v1` 投影 `builder_rules_version`，用于 05-U6 builder 规则
 归因；历史 run 可为 NULL，05 builder 成功落库的 run 必须等于当前 `rules.RULES_VERSION`。
 
+0031 迁移起，`processing_runs_v1` 只额外暴露不透明的
+`artifact_owner_processing_run_id`：parse run 指向自身，`rebuild_units` 指向实际拥有
+parser artifact / NormalizedIR 字节的根 parse run。public view 不暴露相对路径；
+evidence resolver 经 owner run 的 hash、document 和 run_kind 校验后使用统一 PathBuilder
+定位，禁止把 unit producer run 当成 artifact owner，也禁止从路径词面猜 owner。
+
 0010–0016 迁移起的 `document_units_v1` 增量列使当前列全集达到 **41 列**：04R-R7 的
 32 列 + 0010 `applicability`/`page_no` + 0011 `is_active_run` + 0013 `semantic_keys` +
 0014 `disclosure_topics` + 0015 `heading_path_text` + 0016 三维分类投影；0016/0017 后分类
@@ -1036,6 +1013,7 @@ NOT_FOUND                   对象不存在
 CONTRACT_VERSION_MISMATCH   请求契约版本与服务暴露版本不一致
 GONE_SUPERSEDED             对象已被新版本取代，响应携带 superseded_by 指引
 VALIDATION_ERROR            参数、过滤值或游标校验失败
+EVIDENCE_INTEGRITY_ERROR    已发布 evidence 的 IR/manifest/bytes 完整性校验失败
 ```
 
 错误响应不含内部堆栈与绝对路径。Phase006 Filing API 已落地该 envelope。
@@ -1106,7 +1084,8 @@ VALIDATION_ERROR            参数、过滤值或游标校验失败
 
 1. **好找**：可按公司、期间、公告类型和语义查询；
 2. **好读**：正文、表格和问答保持完整业务边界；
-3. **够轻**：不把模板废话和重复标准表全部推给 L2；
+3. **够轻**：通过检索排序、section pack 和按需上下文窗口控制 L2 输入量，不通过隐藏
+   canonical evidence 控制体量；
 4. **可追**：能回到原文件、处理运行和 exact snapshot；
 5. **不越界**：不提前形成事实、采信和预测判断。
 

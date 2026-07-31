@@ -172,7 +172,7 @@ class PathBuilderTests(unittest.TestCase):
                 normalized_relpath,
                 Path(
                     "derived/normalized_ir/cninfo/002484/1225087169/"
-                    "run_01K0000000000000000000000/normalized_ir.v3.json"
+                    "run_01K0000000000000000000000/normalized_ir.v4.json"
                 ),
             )
             self.assertEqual(

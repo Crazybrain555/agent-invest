@@ -63,21 +63,42 @@ class RebuildUnits:
                         "document_id": command.document_id,
                     }
                 )
+            owner = uow.processing_runs.get(source.artifact_owner_processing_run_id)
+            if (
+                owner is None
+                or owner.document_id != document.document_id
+                or owner.run_kind != "parse"
+                or owner.artifact_owner_processing_run_id != owner.processing_run_id
+                or owner.status != "succeeded"
+                or owner.normalized_ir_relpath != source.normalized_ir_relpath
+                or owner.parser_artifact_relpath != source.parser_artifact_relpath
+                or owner.artifact_hash != source.artifact_hash
+            ):
+                raise BuildUnitsError(
+                    {
+                        "stage": "rebuild_units",
+                        "error_code": "ARTIFACT_OWNER_INVALID",
+                        "retryable": False,
+                        "document_id": command.document_id,
+                    }
+                )
             run = uow.processing_runs.add(
                 e.ProcessingRun(
                     processing_run_id=ids.new_processing_run_id(),
                     document_id=document.document_id,
+                    artifact_owner_processing_run_id=(owner.processing_run_id),
                     run_kind="rebuild_units",
                     status="succeeded",
-                    parser_name=source.parser_name,
-                    parser_version=source.parser_version,
-                    parser_backend=source.parser_backend,
-                    parser_method=source.parser_method,
-                    parser_language=source.parser_language,
-                    input_raw_file_hash=source.input_raw_file_hash,
-                    parser_artifact_relpath=source.parser_artifact_relpath,
-                    artifact_hash=source.artifact_hash,
-                    normalized_ir_relpath=source.normalized_ir_relpath,
+                    parser_name=owner.parser_name,
+                    parser_version=owner.parser_version,
+                    parser_backend=owner.parser_backend,
+                    parser_method=owner.parser_method,
+                    parser_language=owner.parser_language,
+                    parser_target_identity=owner.parser_target_identity,
+                    input_raw_file_hash=owner.input_raw_file_hash,
+                    parser_artifact_relpath=owner.parser_artifact_relpath,
+                    artifact_hash=owner.artifact_hash,
+                    normalized_ir_relpath=owner.normalized_ir_relpath,
                     started_at=now,
                     finished_at=now,
                 )

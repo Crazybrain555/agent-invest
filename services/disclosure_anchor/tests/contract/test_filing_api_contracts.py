@@ -9,14 +9,19 @@ from pathlib import Path
 
 import yaml
 
-from disclosure_anchor.cli.export_contracts import PUBLIC_MODELS, export_contracts
+from disclosure_anchor.cli.export_contracts import (
+    NORMALIZED_IR_SCHEMA_SOURCES,
+    PUBLIC_MODELS,
+    export_contracts,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONTRACTS_ROOT = REPO_ROOT / "contracts"
 PUBLIC_MODELS_ROOT = CONTRACTS_ROOT / "public_models"
 DERIVED = {
-    "document_unit": {"asset_uri"},
+    "document_unit": {"asset_uri", "evidence_refs"},
+    "source_ref": {"evidence_refs"},
     "tracked_company": {
         "effective_lookback_days",
         "effective_sync_seconds",
@@ -37,6 +42,10 @@ class FilingApiContractsTests(unittest.TestCase):
                     PUBLIC_MODELS_ROOT / f"{name}.v1.json"
                     for name in sorted(PUBLIC_MODELS)
                 ),
+                *(
+                    CONTRACTS_ROOT / "normalized_ir" / f"{version}.json"
+                    for version in sorted(NORMALIZED_IR_SCHEMA_SOURCES)
+                ),
             ]
             for expected in expected_paths:
                 actual = output_root / expected.relative_to(CONTRACTS_ROOT)
@@ -55,6 +64,11 @@ class FilingApiContractsTests(unittest.TestCase):
             model_fields = set(model.model_fields)
             self.assertEqual(schema_fields, model_fields, name)
             self.assertTrue(DERIVED.get(name, set()).issubset(schema_fields), name)
+            if name in {"document_unit", "source_ref"}:
+                self.assertEqual(
+                    set(schema["$defs"]["EvidenceRefV1"]["properties"]),
+                    {"uri", "sha256", "size_bytes", "media_type"},
+                )
 
     def test_openapi_uses_public_error_contract_inputs(self) -> None:
         openapi = yaml.safe_load(
@@ -72,6 +86,7 @@ class FilingApiContractsTests(unittest.TestCase):
                 "L1_PROCESSING_REQUIRED",
                 "CONTRACT_VERSION_MISMATCH",
                 "VALIDATION_ERROR",
+                "EVIDENCE_INTEGRITY_ERROR",
             },
         )
 
@@ -106,6 +121,16 @@ class FilingApiContractsTests(unittest.TestCase):
                 any(param.get("name") == "reject_superseded" for param in parameters),
                 path,
             )
+
+        evidence = openapi["paths"]["/v1/units/{asset_id}/evidence/{sha256}"]["get"]
+        self.assertEqual(
+            evidence["responses"]["500"]["content"]["application/json"]["schema"],
+            {"$ref": "#/components/schemas/ErrorEnvelope"},
+        )
+        self.assertEqual(
+            set(evidence["responses"]["200"]["content"]),
+            {"image/gif", "image/jpeg", "image/png", "image/webp"},
+        )
 
 
 if __name__ == "__main__":

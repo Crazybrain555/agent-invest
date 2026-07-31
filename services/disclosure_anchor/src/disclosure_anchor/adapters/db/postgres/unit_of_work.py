@@ -8,14 +8,14 @@ rolls back, so use cases must commit deliberately.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Optional
-
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, sessionmaker
-
-from disclosure_anchor.adapters.db.postgres.connection import create_session_factory
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.orm import Session
 from disclosure_anchor.application.ports import repositories as ports_repos
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.worker.locks import (
+    acquire_corpus_write_session_lock,
+    release_corpus_write_session_lock,
+)
 from disclosure_anchor.adapters.db.postgres.repositories import (
     CompanyIdentifierRepository,
     CompanyRepository,
@@ -50,20 +50,36 @@ class SqlAlchemyUnitOfWork:
     def __init__(
         self,
         *,
-        engine: Optional[Engine] = None,
-        session_factory: Optional[sessionmaker[Session]] = None,
+        engine: Engine,
     ) -> None:
-        if session_factory is None:
-            if engine is None:
-                raise ValueError("either engine or session_factory is required")
-            session_factory = create_session_factory(engine)
-        self._session_factory = session_factory
-        self._session: Optional[Session] = None
+        self._engine = engine
+        self._connection: Connection | None = None
+        self._session: Session | None = None
+        self._corpus_write_lock_held = False
 
     # -- context management -------------------------------------------------
     def __enter__(self) -> "SqlAlchemyUnitOfWork":
-        self._session = self._session_factory()
-        self._bind_repositories(self._session)
+        # Session-level advisory locks belong to the physical PostgreSQL
+        # connection, not to SQLAlchemy's Session. Binding the Session to an
+        # explicitly checked-out Connection keeps that same backend pinned
+        # across commit()/rollback() until __exit__ releases the lock.
+        self._connection = self._engine.connect()
+        self._session = Session(
+            bind=self._connection,
+            expire_on_commit=False,
+            future=True,
+        )
+        try:
+            acquire_corpus_write_session_lock(self._session)
+            self._corpus_write_lock_held = True
+            self._bind_repositories(self._session)
+        except Exception:
+            self._session.rollback()
+            self._session.close()
+            self._connection.close()
+            self._session = None
+            self._connection = None
+            raise
         return self
 
     def __exit__(
@@ -80,8 +96,24 @@ class SqlAlchemyUnitOfWork:
                 self.rollback()
         finally:
             assert self._session is not None
-            self._session.close()
-            self._session = None
+            assert self._connection is not None
+            try:
+                if self._corpus_write_lock_held:
+                    release_corpus_write_session_lock(self._session)
+                    self._corpus_write_lock_held = False
+                self._session.commit()
+            except BaseException:
+                # Never return a connection with uncertain session-lock state
+                # to the pool. A dead connection releases PostgreSQL advisory
+                # locks server-side; an apparently live but inconsistent one
+                # must be invalidated explicitly.
+                self._connection.invalidate()
+                raise
+            finally:
+                self._session.close()
+                self._connection.close()
+                self._session = None
+                self._connection = None
 
     def _bind_repositories(self, session: Session) -> None:
         self.companies = CompanyRepository(session)

@@ -12,10 +12,21 @@ from pathlib import Path
 from typing import Any
 
 from disclosure_anchor.application.contracts.normalized_ir import (
+    CURRENT_NORMALIZED_IR_VERSION,
     NormalizedIRVersionError,
     validate_normalized_ir_contract,
     validate_normalized_ir_identity,
     validate_normalized_ir_path_version,
+)
+from disclosure_anchor.application.contracts.parser_target import (
+    ParserTargetIdentity,
+    ParserTargetIdentityError,
+)
+from disclosure_anchor.application.contracts.visual_semantics import (
+    VisualSemanticClosure,
+    VisualSemanticContractError,
+    ensure_no_unresolved_visuals,
+    validate_visual_semantic_manifest,
 )
 from disclosure_anchor.application.ports.file_store import FileStorePathPort
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
@@ -77,12 +88,16 @@ TERMINAL_PUBLICATION_ERROR_CODES = frozenset(
         "IR_HASH_MISMATCH",
         "IR_MISSING",
         "PARTIAL_PDF_NOT_PUBLISHABLE",
+        "PARSER_TARGET_IDENTITY_INVALID",
+        "PARSER_TARGET_IDENTITY_MISMATCH",
         "QUERY_PROJECTION_HASH_MISMATCH",
         "RUN_HASH_AGGREGATE_INVALID",
         "RUN_UNIT_HASH_INPUT_INVALID",
         "RUN_UNIT_HASH_INVALID",
         "RUN_UNIT_SEMANTIC_INVALID",
         "RUN_UNIT_SET_INVALID",
+        "VISUAL_SEMANTIC_CLOSURE_INVALID",
+        "VISUAL_SEMANTIC_CLOSURE_UNRESOLVED",
     }
 )
 
@@ -176,7 +191,40 @@ class NormalizedIRPublicationGuard:
                     message=str(exc),
                 )
             ) from exc
+        if version != CURRENT_NORMALIZED_IR_VERSION:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="IR_CONTRACT_TOO_OLD",
+                    reason_code="publish_requires_current_contract",
+                    message=(
+                        f"publish requires {CURRENT_NORMALIZED_IR_VERSION}; "
+                        f"run IR is {version} and must be reparsed before publish"
+                    ),
+                )
+            )
         parsed_pages = decoded["parsed_pages"]
+        try:
+            run_target = ParserTargetIdentity.from_payload(
+                run.parser_target_identity
+            )
+            ir_target = ParserTargetIdentity.from_payload(decoded.get("parser"))
+        except ParserTargetIdentityError as exc:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="PARSER_TARGET_IDENTITY_INVALID",
+                    message=str(exc),
+                )
+            ) from exc
+        if run_target != ir_target:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="PARSER_TARGET_IDENTITY_MISMATCH",
+                    message=(
+                        "processing run parser target differs from "
+                        "NormalizedIR"
+                    ),
+                )
+            )
         if parsed_pages.get("full_pdf") is not True:
             raise PublishRunError(
                 _structured_error(
@@ -187,6 +235,101 @@ class NormalizedIRPublicationGuard:
                     ),
                 )
             )
+        self._validate_visual_semantics(decoded)
+
+    def _validate_visual_semantics(self, normalized_ir: dict[str, Any]) -> None:
+        cache: dict[str, tuple[bytes, str]] = {}
+
+        def load(role: str) -> tuple[bytes, str]:
+            cached = cache.get(role)
+            if cached is not None:
+                return cached
+            parser_artifacts = normalized_ir.get("parser_artifacts")
+            files = (
+                parser_artifacts.get("files")
+                if isinstance(parser_artifacts, dict)
+                else None
+            )
+            descriptor = files.get(role) if isinstance(files, dict) else None
+            if (
+                not isinstance(descriptor, dict)
+                or descriptor.get("availability") != "present"
+                or not isinstance(descriptor.get("relpath"), str)
+                or not isinstance(descriptor.get("sha256"), str)
+                or not isinstance(descriptor.get("size_bytes"), int)
+            ):
+                raise PublishRunError(
+                    _structured_error(
+                        error_code="VISUAL_SEMANTIC_CLOSURE_INVALID",
+                        reason_code="artifact_descriptor_invalid",
+                        message=f"visual artifact descriptor is invalid: {role}",
+                    )
+                )
+            try:
+                payload = read_data_file_bytes(
+                    self._paths,
+                    Path(descriptor["relpath"]),
+                )
+            except DataFileMissingError as exc:
+                raise PublishRunError(
+                    _structured_error(
+                        error_code="VISUAL_SEMANTIC_CLOSURE_INVALID",
+                        reason_code="artifact_missing",
+                        message=str(exc),
+                    )
+                ) from exc
+            except DataStoreReadError as exc:
+                raise PublishRunError(
+                    _structured_error(
+                        error_code="IR_READ_FAILED",
+                        retryable=True,
+                        message=str(exc),
+                    )
+                ) from exc
+            actual = "sha256:" + hashlib.sha256(payload).hexdigest()
+            if (
+                actual != descriptor["sha256"]
+                or len(payload) != descriptor["size_bytes"]
+            ):
+                raise PublishRunError(
+                    _structured_error(
+                        error_code="VISUAL_SEMANTIC_CLOSURE_INVALID",
+                        reason_code="artifact_hash_mismatch",
+                        message=f"visual artifact bytes differ: {role}",
+                    )
+                )
+            cache[role] = (payload, actual)
+            return cache[role]
+
+        payload, artifact_sha256 = load("visual_semantics")
+        try:
+            closure = VisualSemanticClosure.from_payload(
+                json.loads(payload.decode("utf-8"))
+            )
+            validate_visual_semantic_manifest(
+                normalized_ir,
+                closure,
+                artifact_sha256=artifact_sha256,
+                load_artifact_sha256=lambda role: load(role)[1],
+            )
+            ensure_no_unresolved_visuals(closure)
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            VisualSemanticContractError,
+        ) as exc:
+            reason = getattr(exc, "reason_code", "invalid_json")
+            raise PublishRunError(
+                _structured_error(
+                    error_code=(
+                        "VISUAL_SEMANTIC_CLOSURE_UNRESOLVED"
+                        if reason == "visual_semantics_unresolved"
+                        else "VISUAL_SEMANTIC_CLOSURE_INVALID"
+                    ),
+                    reason_code=reason,
+                    message=str(exc),
+                )
+            ) from exc
 
 
 class PublishRun:

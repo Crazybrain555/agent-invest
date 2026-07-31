@@ -28,7 +28,7 @@ delivers_to: milestone 06
 ## 2. 本 milestone 锁定的契约决策
 
 - **U1 同 run 构建（04R-D8）**：builder 作用于一个 `status='succeeded'` 的 parse run，
-  unit 挂在同一 `processing_run_id` 下；`run_kind='rebuild_units'` 已于 2026-07-06 实现（用户裁决：规则迭代不重跑 MinerU）——`use_cases/rebuild_units.py` 复制最近 succeeded parse run 的解析出处与 artifact 引用生成 succeeded 重切 run，CLI `rebuild-units` 串 build+publish，实测全语料重切 5 秒（对比全解析 ~40 分钟）。
+  unit 挂在同一 `processing_run_id` 下；`run_kind='rebuild_units'` 已于 2026-07-06 实现（用户裁决：规则迭代不重跑 MinerU）——`use_cases/rebuild_units.py` 复用 source 的 immutable artifact 引用生成 succeeded 重切 run，不复制源字节；0031 起另以 `artifact_owner_processing_run_id` 明确传播根 parse owner。CLI `rebuild-units` 串 build+publish，实测全语料重切 5 秒（对比全解析 ~40 分钟）。
 - **U2 三哈希分层（unit 级；实现为 domain service `domain/services/unit_hashing.py`；
   canonical_json = `json.dumps(sort_keys=True, ensure_ascii=False,
   separators=(",", ":"))`）**。跨进程稳定性测试形态定死：新建
@@ -99,7 +99,7 @@ processing_run_published payload = {previous_processing_run_id|null, content_has
 - **U6 builder 规则版本可归因（协议 §2.6 rule_bundle_ref）**：新迁移
   `0008_unit_builder_provenance`：`processing_run` 加 `builder_rules_version varchar(32)`，
   `processing_runs_v1` 跟进。builder 规则表（噪声/保留/切分/semantic_key）集中在
-  `adapters/unit_builder/rules.py`，模块级 `RULES_VERSION = "ub-2026.07-1"`，规则变更必须升版。
+  `application/services/unit_builder/rules.py`，模块级 `RULES_VERSION = "ub-2026.07-1"`，规则变更必须升版。
   列值语义定死：`processing_run.builder_rules_version` 恒等于 `rules.RULES_VERSION` 字符串本身；
   `cn_a_v1` 只是 rules.py 内 `HEADING_RULESET_ID` 常量，**不拼接进列值**；变更任何规则
   （含 heading ruleset）必须升 RULES_VERSION。0008 迁移规格定死：新建
@@ -136,125 +136,89 @@ processing_run_published payload = {previous_processing_run_id|null, content_has
 
 按序七个阶段（每阶段独立纯函数，输入输出可单测）：
 
-**S1 噪声抑制与非文本元素处置**：丢弃 `kind='page_furniture'`。文本清理封闭为两条规则：
-剥离 Unicode 类别 Cc 字符（\n\t 除外）；整行匹配 `^[\s\-—―=_·•\*~～]{3,}$` 的纯分隔线行删除。
-水印首版不设独立规则（页级重复已由 page_furniture 承担），rules.py 留 `NOISE_LINE_PATTERNS`
-空扩展位。**任何丢弃都进 build 统计（按 kind 分桶计数），不允许静默消失**。
-`image`：不无条件丢弃——判定"有语境"= caption 非空，或紧邻标题（该元素之前最近的非
-page_furniture 元素是 kind='heading' 且同页）；有语境（股权结构图、组织架构图等实质图）
-→ 生成 `text` unit，payload `{"image_ref": ..., "caption": ..., "context": 邻近标题,
-"visual_kind": image|chart|equation, "visual_subtype"?: MinerU sub_type 透传}`（ub-2026.07-56
-起补齐 chart/equation 源身份与子类型，含 typed source projection 与审计比对）、
-quality_status='needs_review'。**image_ref 存跨 run 稳定的内容寻址图片名**（MinerU 输出的
-images/<sha256>.jpg 文件名；若非哈希命名则以图片 bytes 的 sha256 自算），**绝不存
-artifact_locator**——run 级路径进 payload 会使 content_hash 每次重解析必变，击穿"内容未变
-→ 0 unit 事件"；run 内定位只放 unit.artifact_locator 列（U2 已排除在 content_hash 外）。
-无语境的装饰图 → 丢弃入统计。
-`equation`：并入所在 text 流（MinerU 输出 latex 文本）。
-`unknown`（mapper 未映射的 raw type，raw_kind 原样保留）：有可读文本 → 并入所在 text 流并置
-quality_status='needs_review'；无可读内容 → 丢弃入统计（按 raw_kind 分桶，便于发现 parser
-升级引入的新类型，统计键 dropped_unknown_by_raw_kind）。页眉重复出现的「重要提示」四字
-属 page_furniture 噪声，不因含关键词而每页生成 unit（有反向测试）。
+**S1 source carrier 预处理（当前规范）**：
 
-**S2 heading tree**：对 `kind='heading'` 与文本形态像标题的 `kind='text'` 元素建层级：
+- 文本只做 Unicode 控制字符清理和纯排版分隔符清理；业务句、声明、目录、caption 和 marker
+  不按短语删除。
+- `page_furniture` 只有在 parser role、页边位置和跨页精确重复共同证明时才折叠；精确页码和
+  与登记 security metadata 完全相等的 header 可记入 disposition ledger。唯一、非空的
+  furniture 作为 detached `needs_review` 证据保留。
+- image/chart/equation 以内容 bytes 的 sha256 建立稳定 `image_ref`；caption、content、
+  footnote、visual subtype 和同页 source context 各自保留 typed provenance。无路径但有 caption
+  的视觉 carrier 仍保留；只有完全无资产、caption 和可读内容者可判空。
+- unknown 有可读文本则保留并标 `needs_review`；空 carrier 才进入 dropped 统计。任何抑制都要有
+  source identity、reason 和可复核 proof，不允许静默消失。
+- NormalizedIR 的任意 extra property 不能控制 builder 顺序、section ownership、source slice
+  或 region。派生 slice 和 projection graph 均由 builder 内部创建。
 
-```text
-主信号（正则，按优先级给层级）：
-  L1: ^第[一二三四五六七八九十百]+[节章]        （第八节 财务报告）
-  L2: ^[一二三四五六七八九十]+、               （一、主营业务分析）
-  L3: ^（[一二三四五六七八九十]+）              （（一）收入构成）
-  L4: ^\d+([.、．]|\s)                         （1. / 1、）
-  L5: ^[①②③④⑤⑥⑦⑧⑨⑩]                        （带圈编号，最低层级）
-kind='text' 的标题候选资格（三条同时满足，kind='heading' 元素不受限）：
-         单行（不含换行）、去首尾空白后 ≤ 40 字符、不以 。；，, 结尾
-         ——防"一、"开头的整段正文被误判成标题
-固定板块词直判（无编号也是标题，层级 = L1）：重要提示 / 释义 / 目录 / 备查文件
-辅助信号：IR heading_level——对 `kind='heading'` 元素（parser 已判定为标题）**允许在正则
-         未命中时单独定级**（clamp 1..5；2026-07-05 评审修订：否则无编号标题如"公司简介"
-         会整体降级为 text、丢失真实结构）；对 `kind='text'` 元素仍禁止单独定级
-         （必须正则命中 + 候选资格三条件）
-排除规则：以？/?结尾、或匹配 qa 起始模式（见 S4）的行绝不是标题——
-         防 Phase00 的"问句累积成 heading_path"回归（有专门回归测试）
-深度上限 4；入树时若将处于第 5 层（heading_path 长度将超 4），该元素按普通 text 处理，
-         不建层级不进 heading_path（L5 圈号只在当前深度 ≤3 时成为下一层）；
-heading_path = 祖先标题原文列表（保留编号前缀，与 golden fixtures 一致）
-规则集按市场/语言版本化（E8）：本期实现 `heading_rules=cn_a_v1`，作为 builder_rules_version
-的组成部分；hk/us 文档接入时新增 ruleset，不改 cn_a_v1
-```
+**S2 source heading tree（当前规范）**：
 
-**S3 text 切分（service-purpose §8.1 优先级）**：同一最深标题下的连续 text 元素合并为一个
-`text` unit；显式编号条目多且长时按条目拆分；长而无内部结构的小节保持单 unit（§8.2，
-不做字符数/token 切分）。`title` = 最近标题文本。
+- 只有 MinerU typed `kind='heading'`（或未来版本化 parser 明确给出的同等结构事实）能打开
+  heading occurrence；普通 text 即使长得像编号标题也不提升。
+- 标题深度优先采用通用章节/序号 grammar 与 TOC 声明；parser level 只在其分布有信息时使用。
+  业务板块短语、监管 taxonomy、问句词表、table/image caption 均不得开节或定级。
+- 目录页先按 marker + entry/page-number 结构整体识别；inline 或 detached page-number 的条目
+  按解析出的 entry identity 降为 TOC 内容，正文同名 heading 不受影响。
+- declaration line 不进入标题树。封面断行只在连续 page-1 heading 拼接后与登记 document title
+  精确相等时恢复，并保留每段 source locator。
+- `heading_path` 保存完整源标题文本；内部 `section_path` 保存具体 occurrence identity。相同标题
+  在不同位置仍是不同边界。
 
-> **历史（已废止，2026-07-16 用户裁决取代）**：以下 S4 qa builder 阶段整体被移除——QA 判别
-> 不再运行，投关/业绩说明会转写以 raw text 单元携完整溯源落地，L2 亦不做 qa 拆分，builder
-> 不再产出 `payload_kind="qa"`。下文保留为历史设计记录，勿据此实现新行为。
+**S3 text 归属（当前由 ub-2026.07-76/77 取代早期切分规则）**：同一具体 heading occurrence 下
+连续 text carrier 按源顺序合并；不按业务短语、问答词、页码或长度拆分。适用性 marker 原文留在
+text，只额外派生可回放的 applicability projection，不把 marker 下沉到下一 carrier。
+`title` 只等于标题树叶节点；无标题时此阶段不从正文或 caption 造 title。
 
-**S4 qa builder**（qa 识别对全部 filing_type 运行，但边界强度分层）：投关记录/业绩说明会
-允许“编号问句 + 无显式答标签的连续正文”；其他 filing_type 必须同时出现明确 `答/回复/A:`
-才生成 QA，避免把年报里的审计职责、声明或判断条件误拆成问答。原“投关/说明会触发”还限定
-S2 的 qa_heading_mode——该模式下编号标题不入 heading 树，防问句累积成 heading_path；所有
-模式仍使用下述稳定性判据与 needs_review 兜底：
+> **S4 历史（已废止）**：qa builder、`qa_heading_mode` 及其问答短语/编号状态机均已移除。
+> 投关、说明会和报告正文按原始 text + 源标题结构落地；问答识别只能在 L2 检索/抽取时进行，
+> 不得反向决定 L1 标题或边界。
 
-```text
-问题起始：^\s*(问题|问|Q\d*|投资者提问|提问)\s*\d*\s*[：:] 或
-          ^\s*\d+[、.．]\s*.{2,}[？?]\s*$（编号 + 问号结尾）
-回答起始：^\s*(答|回复|公司回复|A\d*)\s*[：:]
-边界规则：回答 = 回答起始行（或问题行之后）到下一问题起始之间的全部文本
-来源：text 元素序列 + 结构化表格 cell 内的多行文本（ir_activity 样本的问答嵌在
-      "投资者关系活动主要内容介绍" cell 里——按行拆后套同一规则）
-产出：每个 Q&A 对一个 qa unit，payload = {question, answer, raw_text}
-      （与 golden fixtures 契约一致）
-前缀/尾段保全：首个问题前的表单元数据、会议说明或上一问尾段单独保留为 text，不阻断其后
-完整 QA；若至少已有一个完整 QA，块尾因分页/跨表只剩“有问无答”的截断问题，则保留已闭合
-QA，并把尾段单独存为 text + needs_review。结构化表格本体始终保留，QA 只是其检索投影。
-"边界不稳"闭合判据（命中任一 → 除上述可证明的块尾截断外，整块存 text + needs_review）：
-  (a) 出现回答起始行但其前无未配对的问题起始；
-  (b) 问题起始后到下一问题起始无任何非空文本，或首个/唯一问题到块尾仍有问无答；
-  (c) 同一问题区间内出现 ≥2 个回答起始行
-全部模式用 re.match，不启用 IGNORECASE（Q/A 仅匹配大写）
-```
-
-**S5 table builder**：一个 IR table 元素 → 一个 `table` unit。payload：
+**S5 table builder**：一个非空 IR table 元素 → 一个 `table` part。payload：
 
 ```text
 {
   "caption":  table_caption 列表原样,
-  "unit":     从 caption / 表头 / 前一文本元素按规则识别（"单位：元/万元/千元"），识别不到为 null,
+  "unit":     仅从 MinerU 明确关联的 table_caption / table_footnote 中投影计量单位；值域不限,
   "headers":  IR 结构化 headers,
   "rows":     IR 结构化 rows,
   "notes":    table_footnote 列表原样
 }
-title = caption 首项或最近标题。**payload.headers 的来源（04R-R5.2 定死 IR headers 只含
+title = 最近 typed heading 的叶节点；caption 只作为 payload 证据，永不替代 title。
+`币种` 与计量单位是不同声明角色；`单位：元 币种：人民币` 只投影 unit=元，currency 原文仍在
+caption/footnote。表头或邻近 text 即使出现“单位：…”也不证明 table-wide measurement；
+它们保持可检索原文但不填 unit。多处计量单位值相同才填 scalar；冲突时
+unit=null + needs_review，所有原声明仍保留。
+**payload.headers 的来源（04R-R5.2 定死 IR headers 只含
 `<th>` 证据、MinerU 下通常为空；用户 2026-07-16 裁决废除首行提升启发式）**：IR headers
 非空（th 证据）→ 直接采用；为空 → **headers 保持空、全网格忠实保留在 rows**，表头解释
 归 L2/视图层（历史的"合并后首行提升"规则已随 corpus-reparse-audit-r1 移除，防错标续表/KV 表）。
 merged_cells 保留 row_span/col_span；空单元格、"-"、"—"、"不适用" 原样区分不归一。
 单位说明与脚注**绝不作为噪声丢弃**（脚注常含追溯调整/会计政策，红线）。
-IR 带 table_parse_failed → payload 落 {caption, raw_html, notes} 并
-quality_status='needs_review'。跨页表合并：相邻 table 元素间无非噪声元素、列数相同、
-后表无独立 caption → 合并 rows，**识别并删除续页重复表头行**（与首表首行——即待提升的
-表头候选行——逐 cell str.strip() 相等的行不得当数据行），payload 记
-`merge_reason='continued_table'` 与 page span（artifact_locator）；合并失败标 needs_review，
-不阻塞其他 unit（不确定即不合并）。"列数相同"定死：列数 = len(rows[0])（IR headers 非空时
-= len(headers)）；前后表该值相等才允许合并。**空表元素在合并判定中视为噪声**（headers 与
-rows 均空且 table_html 为空——2026-07-05 实测这是 MinerU 在续页页首表头带产出的无内容碎片，
-真实年报 75/473、审计报告 55/256）：跳过它、不阻断其前后真实表段的相邻性，计入 build 统计
-（dropped_by_kind.table_empty），不生成 unit。
+非空 MinerU table HTML 必须在 parser reconciliation 层形成可证明 logical grid；无法闭合
+就以 typed source-evidence failure 失败，不能发布 `table_parse_failed`、`raw_html` 或
+`visible_text` 占位 payload。原始 HTML 只保留在 hash-bound parser artifact/NormalizedIR
+身份链中，document_unit table payload 始终只有 caption/unit/headers/rows/notes。
+跨页 logical-table 关系只消费 parser reconciliation 的版本化
+locator：builder 不按“相邻、列数相同、caption 为空”等弱条件自行合表或删重复表头。
+MinerU aggregate 已包含的完整 grid 保持一个 table part；empty continuation ghosts 只提供
+provenance。分页造成的逻辑行断裂必须在 parser 结构恢复层形成 row-level repair ledger，保留
+raw HTML 和两侧 source identity；没有独立证明时暴露明确 parser defect，不在 builder 猜测。
+完全空 table carrier 可计入 dropped 统计，但非空 caption/footnote 本身就是证据。
 ```
 
-**S6 保留/跳过（service-purpose §9 + 红线）**：规则表驱动，首版跳过规则封闭定死：
-`SKIP_SECTION_TITLES = {"释义", "目录", "备查文件"}`（标题去空白后精确匹配，板块整体跳过）；
-空表 = rows 为空或全部 cell strip 后为空；封面/签章/页码类已由 page_furniture 通道处理；
-service-purpose §9.2 其余类目首版**一律保留**（拿不准 → 保留），扩充跳过词表必须升
-RULES_VERSION。**「重要提示」「风险提示」标题的板块必须生成 unit**，不得按标签跳过
-（协议 §3.5，有专门测试）。跳过项记入 build 统计（S8 报告），不写 DB。
+S3/S5 完成后，同一 heading occurrence 下连续的 text/table/image parts 合为一个 `mixed`；
+payload kind、caption、taxonomy、页码和 token 数不参与分组。无 heading 文档只可锚到登记文档标题。
+
+**S6 证据守恒（service-purpose §9）**：没有标题/业务内容黑白名单。只跳过可由 source type +
+位置/重复关系证明的 page furniture、完全空 table carrier 和完全无内容的视觉载体；非空目录、
+释义、声明、签章、表格、marker 和正文均保留。所谓噪声如果含独有文本，就必须追查位置与 parser
+来源，不能用 `needs_review` 或词表跳过来代替根因调查。
 
 **S7 semantic_key + quality_status（首版历史规则；由 §8.5 ub-2026.07-26 取代）**：
 semantic_key 由规则表给出（首版未命中 = null，禁止自由发明；当前未命中使用真实通用键
 `document_content`，新产物 scalar/array 均非空）。首版规则表定死
 （rules.py `SEMANTIC_KEY_RULES`，按序首个命中；匹配对象 = title +
-heading_path 末两级 + table caption 首项，qa 另加 question）：
+heading_path + table caption）：
 
 ```text
 receivable_aging       含"应收账款" 且 含"账龄|坏账"
@@ -272,6 +236,9 @@ quality_status：结构完整 → ok；表解析失败/QA 边界不稳/跨页合
 unusable 判据定死：主文本（text 取 payload["text"]；qa 取 question+answer；table 取全部
 cell 拼接）去空白后为空 → unusable；(Unicode 类别 C*（\n\t\r 除外）+ U+FFFD) 字符数 /
 总字符数 > 0.30 → unusable（常量 `GIBBERISH_RATIO_MAX = 0.30` 定义在 rules.py）。
+
+S7 的 taxonomy 只服务 L2 路由/过滤；它不得参与 S2 标题树、S3/S5 内容归属、mixed 边界或
+S6 保留决策。taxonomy 规则变化只能改变 query projection，不能改变证据 content identity。
 
 **S8 快照与落库（FS 与 DB 不是一个原子事务，顺序与失败策略定死，B9）**：
 
@@ -396,7 +363,7 @@ U5 multiset 配对 diff（重复 hash、仅投影变化、仅结构变化三分�
 （与 phase00 fixture 顶层一致）；**payload 内层键集按 kind 断言**：text={text}（image 壳=
 {image_ref, caption, context, visual_kind} + 可选 {content, notes, visual_subtype}，
 ub-2026.07-56 起）、qa={question, answer, raw_text}、table={caption, unit,
-headers, rows, notes}（table_parse_failed 时={caption, raw_html, notes}）；mixed 至少为
+headers, rows, notes}；mixed 至少为
 {semantic_type, parts}，parts 保留有序 kind/content 与局部标题/适用性/质量注解。
 phase00 fixtures 的 payload 内层是 v1 历史形态（{format,page_no,text} 等），
 **不作为 05 payload 契约来源**，payload 内层不与 fixture 比较。
@@ -407,6 +374,11 @@ phase00 fixtures 的 payload 内层是 v1 历史形态（{format,page_no,text} �
 - `make test` no-DB 与 live-DB 双绿；acceptance-matrix A19/A20/A21 置 pass。
 
 ## 8.5 实施后修订（2026-07-06，rule bundle ub-2026.07-2）
+
+> **历史取证区，不是现行规范。** 本节 ub-2 至 ub-53 记录旧实现怎样逐步暴露问题，其中出现的
+> 固定标题词、caption 晋升、QA 文法、表单区域、业务 allow/deny list、邻近文本单位和
+> builder 跨页合并均已被本文件 §3 的 current specification 取代。后续实现不得从这些速记
+> 复活结构补丁；保留它们仅用于解释旧数据和回归来源。
 
 用户裁决 + 协议 §3.5 核对后新增两条封闭规则（fixtures 已随规则重生成为真 golden，
 再生成脚本 scripts/regen_phase00_fixtures.py 现在同时产出 document_units.v1.jsonl）：
@@ -428,7 +400,7 @@ phase00 fixtures 的 payload 内层是 v1 历史形态（{format,page_no,text} �
 计数入 build_stats.dropped_unit_declarations。实测 908→712；"无/不适用/□是 否"类
 声明照旧保留（有信息量）。
 
-### ub-2026.07-4（2026-07-06 用户数据审查后定案）
+### ub-2026.07-4（历史实现，已被 source-projection 规则替代）
 
 用户裁决三条（数据库直查发现）：
 1. **applicability 是一等列不是 payload 键**：payload 只放原文；新列
@@ -438,7 +410,8 @@ phase00 fixtures 的 payload 内层是 v1 历史形态（{format,page_no,text} �
    首行为纯标记行 → 剥除并记 applicability（not_applicable 保留该行为 unit 原文，因为它就是
    该节的全部披露；applicable 且无剩余正文 → 占位下沉，标志落到同节紧随的下一个 unit 上，
    无后继时保留"适用"兜底）；短标签+次行标记的复合单元只打标不改文（原文中心）。
-3. 计数：stripped_marker_lines 进 build_stats；实测年报 712 → 688。
+3. 历史版本曾统计被删除的 marker 行；现行实现不再删除有信息的声明 carrier，
+   而是用精确字符区间同时投影原文与 `applicability`，因此该删除计数已移除。
 
 同日数据复审追加（同属 ub-2026.07-4）：
 4. **applicable 下沉放宽为前缀匹配**：声明后紧随的单元若进入子标题（heading_path 以声明节为
@@ -450,9 +423,9 @@ phase00 fixtures 的 payload 内层是 v1 历史形态（{format,page_no,text} �
 6b. **category_names 存证**：候选与 document.provider_metadata 增加 category_names
    （adapter 用 p_info3005 解码 F006V 的中文分类名数组；web 通道为 null）——filing_type
    保持 9 类契约粒度，原始分类语义完整可查。
-6c. **测试轮数据纪律**（用户指示）：每轮新测试用 `make wipe-test-data WIPE=YES` 全清业务数据
-   （DB TRUNCATE + 磁盘 cninfo 归档/derived/quarantine；_phase00 fixture 产物保留），
-   不得新老数据混跑；投产前同样全清。历史 run 保留策略（retention）为投产后议题。
+6c. **测试轮数据纪律**：旧的无清单全库 wipe 已删除。需要重建解析语料时保留 source
+   registry/raw PDF/hash lineage，只能经冻结 manifest、备份恢复证明、rollback rehearsal 与
+   write-once receipt 精确清理可再生 parse/run/unit/projection/files；不得新老代混跑。
 
 6. **公告眉头 KV 行剥离**：`证券/股票/债券/[ABH]股 + 代码/简称：值` 整行剥除
    （值即 document/security 元数据，同"单位：元"逻辑），计数 stripped_header_lines；
@@ -547,9 +520,11 @@ p.102）后定案，全部为标题树进栈规则问题，cn_a_v4：
 1. **rebuild_units 快速路径落地**（见 §2 U1）：轻/重测试分层——轻 = agent-check +
    `make rebuild-units`（秒级，规则改动的默认验证路径）；重 = `make process` 全解析
    （仅 parser/MinerU 变更时需要）。
-2. **prune-history 测试期工具**：`make prune-history PRUNE=YES` 删除全部非 active
-   run + 其 units + 相关 outbox 事件，库中只留当前代（用户裁决：测试期看不清新旧不可接受；
-   被删代的 U5 历史回放测试期放弃，投产 retention 另议）。
+2. **历史 prune-history 工具（已移除）**：早期
+   `make prune-history PRUNE=YES` 直接删除全部非 active run、units 和相关 outbox，
+   没有统一 DERIVED ownership 锁，也无法让文件生命周期与 DB ownership 原子闭合。
+   当前只允许 manifest 驱动的 DB-first `retire-derived`，随后由唯一的
+   `gc-orphans` 收集三个 derived family；不得恢复直连 SQL 删除旁路。
 3. **责任声明主语收网**：round6 发现"本公司及董事会全体成员保证…"变体漏网（及 在 董事会
    之前打败有序 alternation）——主语改为有界字符类，正负五例验证（鉴证报告"管理层的责任
    是提供真实…"等实质责任段不匹配、正确保留）。
@@ -573,10 +548,10 @@ Codex 以"新增公司、默认参数"的预期生产用法测试，对照真实
    document.title 为锚。被 MinerU 把整句碎进单元格的问答表 build 期不可恢复，按
    `QA_TABLE_CONTENT_MIN_CHARS` / `QA_TABLE_MARKER_RE` 判定并标 needs_review
    （不再 ok；parser 级修复留账）。
-4. **rebuild 源 run 查询放宽**：prune-history 删除被取代的 parse run 后，原 rebuild 源
-   查询只认 run_kind='parse'，rebuild-units 断链；现任何携带 normalized_ir_relpath 的
-   succeeded run（rebuild_units run 复制该字段，自身即合法源）都可作 rebuild 源，
-   provenance 链自愈。
+4. **历史 rebuild 源 run 查询放宽**：当时允许携带 normalized_ir_relpath 的 succeeded
+   rebuild 继续作为 source；0031 已补上此前缺失的根 artifact owner 关系。后续 rebuild
+   传播该根 parse owner，retirement 在所有引用解除前保留 owner，不再把 rebuild producer
+   自身误当作物理 artifact owner。
 
 语料（25 docs，含 Codex 新增的平安/招商/美的样本）经快速路径 8s 重建为单一
 ub-2026.07-9 代并 prune；门禁全绿。
@@ -667,7 +642,7 @@ ub-2026.07-9 代并 prune；门禁全绿。
   关闭报表 run。
 - **报表页眉恢复**：只有同页、视觉位于表格上方、水平相交且 exact 命中受控报表词表的
   单一 page_furniture 才补为 table caption；0/多候选不猜，显式 caption 优先。银行/公司/
-  合并及公司等报表别名进入 note_key_map（当时 r6；当前 r16）；`财务报表`改为 exact-only，避免把“注册会计师
+  合并及公司等报表别名进入 note_key_map（当时 r6；当前 r18）；`财务报表`改为 exact-only，避免把“注册会计师
   对财务报表审计的责任”误标为父节。结构树只接受完整受控报表标题（可带审计状态、年度/
   日期前缀和括号/横线“续”），包含“利润表内确认的金额”或多个页码的目录句不得开报表根；
   计数 `recovered_statement_captions` 进入 build_stats。
@@ -702,7 +677,7 @@ ub-2026.07-9 代并 prune；门禁全绿。
 
 - **-27〜-30 中间轮次**：连续重放投关、年报、审计报告、债券与普通公告，收敛原生文本
   direct-QA、正式表单门控、声明/报表/附注 sibling 标题树、公告头及页眉噪声、受控 caption
-  锚定；note_key_map 在该轮升至 r11（169 键；当前 r16/173 键、389 标签），event_key_map 保持 r2
+  锚定；note_key_map 在该轮升至 r11（169 键；当前 r18/173 键、391 标签），event_key_map 保持 r2
   （35 键）。这些
   同日版本是语料发现环的可复现中间代，不再作为上线目标代。
 - **-31 最终 builder 代**：以最多 3 个物理 carrier、显式 QA 信号、同章节与顺序距离为界，
@@ -725,7 +700,7 @@ ub-2026.07-9 代并 prune；门禁全绿。
   running header/page number 序列化在跨页 table carrier 之间时，仅允许跨页精确重复且不可能
   恢复为 statement caption/结构标题的 furniture 穿过；普通变列、正文间隔、唯一页眉或标题冲突
   仍 fail-closed，S5 最终表数保持不变。
-- **报表与附注边界**：受控科目词表当轮升至 note_key_map r13（172 键；当前 r16/173 键、389 标签）；补充每股收益、长期
+- **报表与附注边界**：受控科目词表当轮升至 note_key_map r13（172 键；当前 r18/173 键、391 标签）；补充每股收益、长期
   股权投资、共同经营、债券偿还等真实标题别名。模型把母公司利润表末行
   `（二）稀释每股收益(元/股)` 误标标题时，builder 只在“上一页 4 列利润表末两行 + 次页
   三位签字人 + 紧随现金流量表”全证据成立时恢复成表格行。重复页眉、跨碎片附注标题和
@@ -808,6 +783,140 @@ ub-2026.07-9 代并 prune；门禁全绿。
   feed 撤销旧 asset_id、刷新/重放对应 mixed 证据；完成一次迁移后，同内容只改路径/locator
   走 projection change，不再伪造内容变化。
 
+### ub-2026.07-76（2026-07-26：source structure / retrieval taxonomy 防火墙）
+
+- `title` 必须等于 `heading_path` 叶节点；caption、payload text、单位、脚注和 document taxonomy
+  不能满足 title provenance。审计器以同一不变量 fail loud。
+- 删除 official-form/source-projection 的业务投影器及所有输入可控的 `projection_*` region、
+  order、slice 和 derivation。结构只来自 MinerU typed blocks、TOC/序号 grammar、位置与
+  source occurrence；taxonomy 在 evidence assembly 后只追加检索 facet。
+- 同一 heading occurrence 下的连续 text/table/image 按源序组成完整 evidence block；粗切或细切
+  的最终验收是同一结构 cluster 中的 title/path 正确、证据全量可检索，不是固定 unit 数量。
+- table unit 只从 typed table caption/footnote 投影计量单位，币种单独保留；普通邻近 text 和
+  header cell 不能污染 table-wide unit。
+- 真实 `1217616113` 回放证明 wrong-caption-title 与解释碎片已修复，同时确认 MinerU aggregate
+  把一个跨页词语保存为两个物理行 `4、其` / `他`。v4 继续保持 locator-only，consumer grid 保持来源原样。
+  page/model/layout 能证明两行位于跨页物理边界，却不能排除下一页开始一条真实新行；因此不发布
+  logical-row/candidate schema、diagnostics 或自动 `needs_review`，更不能靠短语、标点、caption
+  或 taxonomy 拼接。若检索投影需要相邻首列别名，它只能扩大召回并在命中后返回完整原表，不能
+  改写 evidence payload、title、heading 或 boundary。
+
+### ub-2026.07-77（2026-07-26：歧义序号仲裁与来源边界证据闭环）
+
+- `N.<数字…>` 不再由点号词面单独决定层级。只有至少三个连续的非歧义 `N.` 前驱、
+  相同 MinerU heading role/level 与相容 bbox 左边界共同证明时，才把该 token 作为同级
+  ordinal；孤立小数、bounded dotted chain、序号不连续和缩进变化均保持歧义。真实
+  `ir_activity` 六个 `N.2024…` 标题及小数/缩进负例同时锁定 heading path。
+- 跨页相邻行不进入 `normalized_ir.v3` 的 semantic merge 或 candidate 扩展：相同 page-edge、
+  表框对齐、空值形态同时覆盖真实续行与真实新行，无法构成结构证明。IR 只保留 immutable
+  table grid 与 v4 page/model locator；召回别名若实现，归 search projection 且不得反向成为
+  结构或证据事实。
+
+### ub-2026.07-78（2026-07-26：页级附属物不再切断章节证据链）
+
+- MinerU 已显式标成 `page_furniture` 的页眉、页脚仍作为独立 document-level evidence
+  发布，绝不继承碰巧处于活动状态的业务标题；但它在同一 concrete heading occurrence
+  的 evidence assembly 中是透明载体，不再把前后正文/表格拆成两个无法稳定展开的单元。
+- 透明性只依赖 parser kind 与内部 heading occurrence identity，不读取页眉页脚短语。
+  同名标题再次出现会获得新的 occurrence identity，不能隔着 furniture 误合并；正反例同时
+  守门。mixed locator 显式记录跨越 detached furniture 的派生原因，成员 source locators
+  仍只列业务证据，附属物保留自己的 locator。
+- 启发式准入原则同步锁定：允许通用结构语法，但单一词面/标点不能决定标题、边界或归属；
+  必须有独立 typed role、层级、几何或序列证据共同证明，并有相邻反例与跨文档回放。监管
+  taxonomy 仍只做组装后的检索路由，不能反向参与结构推断。
+
+### ub-2026.07-79（2026-07-27：typed source evidence closure）
+
+- visual 是否有文件与其 typed 文本证据是两个正交事实。缺失 `image_path` 但仍有
+  caption/content/footnote 时，builder 生成带完整 source projection 的 `needs_review` 文本载体；
+  不再只保留 caption 而静默丢 content/footnote。路径与三类 typed 文本都为空时明确失败。
+- 本轮早期曾保留 `table_parse_failed/raw_html/visible_text` 兼容通道；该并行语义已在
+  ub-2026.07-81 删除。当前非空 HTML 不能闭合 logical grid 就明确失败，不能发布占位表。
+- source-identity audit 同时验证上述 typed selector 与投影值；“来源存在但输出不可寻址”是发布阻断，
+  不能靠检索词面补救。
+
+### ub-2026.07-80（2026-07-27：全语料 source-identity 闭环）
+
+- mixed unit 的 part locator 只声明该 part 实际发布的结构字段；省略嵌套
+  `heading_path` 或因冲突而不发布 applicability 时，同步移除对应 projection，禁止把
+  carrier 级结构声明伪装成 aggregate 级事实。登记证券头去重后的剩余文本则以精确
+  char span 重新绑定，重复载体只保留 exact-duplicate lineage。
+- typed heading slice 与同一 carrier 上的 marker slice 是一份来源的可证明分区；
+  source-identity audit 以 payload + structure selector 的并集检查覆盖，不再要求任一
+  projection 独占整块来源，也不放松 payload 间重叠检查。
+- 无可见 grid/caption/note/HTML 文本、但 MinerU 提供 `image_path` 的 typed table
+  按 visual evidence 发布并绑定实际文件哈希；路径也为空才是 proven-empty。正文阅读序
+  与 parser 明确标记的 `page_furniture` 辅助流分别校验，页眉页脚仍可检索，但不再改变
+  业务正文的单调顺序或章节边界。
+- 上述不变量来自 typed role、source selector、文件绑定和 occurrence identity，不读取
+  财报主题词；全量发布前以冻结的 active-IR manifest 做 source-identity replay。
+
+### ub-2026.07-81（2026-07-27：原生几何异常的视觉闭环）
+
+- Poppler 单词框缺失、非有限或非正面积时，不再把一个坏框升级成整份 PDF 失败，也不静默
+  丢词。原生页保留其余有效 atoms，并按 word occurrence 记录 text/hash/raw bbox/reason；
+  issue 页必须同时生成 hash-bound 无损整页视觉证据。有有效 atoms 时为
+  `native_text_with_visual_guard`，全页无有效框时为 `visual_page`，两者都不能伪装成真正空页。
+- issue 数、原生 atom/issue 顺序并集、page modality、fallback reason、视觉 renderer/file
+  descriptor 与 parser artifact manifest 必须完全闭合；任一漂移都阻止发布。visual guard
+  绑定该物理页上的普通或 mixed unit，并另保留无标题、document-level 的粗粒度 fallback，
+  不读取词面、不创造章节归属。
+- 真实根因样本 `1219956807` 是 0 号白色隐藏文本产生的 10 个零高 Poppler word；可见文本、
+  MinerU 与 PDFium 页面均完整。直接全量切换 PDFium 被拒绝：其 API 不提供 word/line layout，
+  且真实语料存在 inserted/excluded Unicode 差异；只有后续全语料 shadow 证明覆盖、顺序、
+  Unicode、旋转/CJK/forms、吞吐和代码量均不退化时才可替换。
+
+### ub-2026.07-82（2026-07-27：最终 evidence carrier 审计闭环）
+
+- 同一 source refs 的 heading level 或 native ancestry 冲突时，不再强制生成 level-1
+  heading；冲突 candidate 不发布，原 carrier 保留为可检索证据，relation 进入全量分布。
+- source-native/visual fallback 必须先与普通 drafts 合流，再经过同一 final audit；
+  audit 逐页精确回放 payload、locator、fallback reason、visual descriptor 和物理顺序，
+  防止“ledger 记录了缺口但最终 L2 单元未发布”的假绿。
+- BuildUnits 对每个 `source_page_visual_*` 实际读取并校验 manifest size/hash 后才绑定和发布；
+  corpus source replay 在临时目录销毁前校验渲染字节，并明确不把临时重建写成持久 publication
+  artifact 已验证。
+- 全量 audit v3 单列 structure conflicts、fallback pages/reasons、visual/native coverage；
+  删除许可要求零未知、零未分类，而不是只看 unit audit `error_count=0`。
+
+### ub-2026.07-83（2026-07-27：结构锚点与证据缺口解耦）
+
+- StructTree、bookmark、MinerU 的 source-local level 不再直接比较；相同 exact source
+  occurrence 先保留 heading anchor，父边由各来源内部图合并，最终 level 由已接受父图重算。
+  父边冲突、不连续或 native parent 不一致只收缩该 anchor 的 section span，不再删除标题文本。
+- PDF 的 P/TOCI/TD/Table 角色改为可审计的 role/containment evidence，不再充当全局否决票；
+  只有 TOC/真实表格容器且无独立 native/bookmark 标题证明时禁止向后传播。MinerU title 只能
+  对齐正文 text carrier，caption/note/footnote/table HTML 永不能反向成为 heading。
+- exact text+bbox 已闭合而读取顺序不同，只记录双侧 order conflict，不再生成重复整页 fallback；
+  缺字、定位不唯一、原生文本缺失或几何异常仍 fail closed。跨多个 MinerU carrier 的同文本
+  重叠候选不再贪心选首项，统一记为 locator unproved。
+
+### ub-2026.07-84（2026-07-27：MinerU 表格页内闭合 v5）
+
+- 本节取代 -38〜-53、-76/-77 中所有 aggregate restore/locator 现行语义。MinerU 进程明确关闭
+  跨页表合并；canonical content table 一张只代表一个物理页，reconciler 不再串接、恢复、
+  抑制续页首行或生成 aggregate/ghost locator。
+- `mineru-page-local-table-closure.v6` 对 content/model 做同页一一闭合：page+bbox、逻辑单元格和表内媒体字节必须唯一，
+  logical cell 的文本、`th/td`、rowspan、colspan 必须完全相同；每张 content table 还必须有
+  非空 HTML、可解析 grid 和已登记的安全 image crop。任一侧缺失、为空、歧义、数量不等或内容
+  不等立即使 parse 失败，不能以 `needs_review` 或词面猜测替代证据。
+- reconciler 返回原 content_list，不改证据内容或边界。diagnostics 仅保存当前算法、精确 model
+  hash、三方相等计数和闭合标志；model artifact 与 table crop 均进入 artifact manifest。
+  v3/v4 旧算法没有兼容分支，不能进入当前写入、BuildUnits 或发布。
+- 跨页逻辑关系若未来需要，只能在 canonical page-local evidence 之上作为独立派生关系证明；
+  不得反向改写表格 carrier、HTML、grid、title、章节边界或来源 hash。监管 taxonomy 仍只用于
+  检索路由，不能参与 PDF 切分。
+
+### ub-2026.07-85（2026-07-27：结构主权与单一路径收敛）
+
+- 当前 unit 边界只来自登记文档整体或 source-proved heading occurrence；删除
+  `meeting_proposal` 词面分组与 caption/编号/监管 taxonomy 反向切分路径。
+- `semantic_type` 只允许 `document|section`。同一结构区间内的 text/table/image 按原始
+  source order 组成一个 mixed，表格 caption 与 title 保持正交。
+- 删除 `table_parse_failed/raw_html/visible_text` 公共 fallback，以及 builder 从不产生的
+  cell/header/row 子选择器。MinerU 字段只经一个 typed decoder，source ledger 全验证只做
+  一次，映射后仅检查轻量 selector binding。
+
 ## 9. 明确不做
 
 - 不抽取 claim；不做 table_cell / page-bbox 核心索引；不做 LLM 语义价值判断；
@@ -824,7 +933,9 @@ build/publish/process CLI（08 worker 的执行单元）。
 
 ## 11. 常见失败与处理
 
-- 载体规范化误删实质内容：降级规则倾向保留；原文与 parser artifact 可重处理（红线）。
-- 表格跨页合并失败：needs_review，不阻塞 text/qa。
-- Q&A 边界不稳：保存为 text 或 needs_review，不自由拆。
+- 载体规范化误删实质内容：立即按 source identity 回查 PDF、page/model/middle/content-list 与
+  NormalizedIR；恢复可检索证据并补正反例，不能只说“原 artifact 还在”。
+- 表格闭合失败：parse fail loud，保留 raw PDF 与实际 MinerU artifact/hash 供根因调查；
+  不写 aggregate/双侧 locator 或错误 NormalizedIR，也不以 `needs_review` 替代修复。
+- 问答边界不稳：按 source heading/carrier 保留完整文本，由 L2 识别，不在 L1 增长问答词表。
 - 发布竞态：FOR UPDATE + one-active-run 索引兜底；IntegrityError 翻译为领域错误后重查。

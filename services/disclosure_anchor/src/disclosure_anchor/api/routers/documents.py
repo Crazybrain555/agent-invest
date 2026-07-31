@@ -73,6 +73,7 @@ DOCUMENT_COLUMNS = (
 PROCESSING_RUN_COLUMNS = (
     "processing_run_id",
     "document_id",
+    "artifact_owner_processing_run_id",
     "run_kind",
     "status",
     "parser_name",
@@ -117,12 +118,8 @@ def list_documents(
             company_ref=company_ref,
             security_code=security_code,
             filing_type=validate_multi_value("filing_type", filing_type),
-            disclosure_topic=validate_multi_value(
-                "disclosure_topic", disclosure_topic
-            ),
-            content_category=validate_multi_value(
-                "content_category", content_category
-            ),
+            disclosure_topic=validate_multi_value("disclosure_topic", disclosure_topic),
+            content_category=validate_multi_value("content_category", content_category),
             title_contains=validate_title_contains(title_contains),
             report_period=report_period,
             announcement_date_from=announcement_date_from,
@@ -207,11 +204,17 @@ def _select_one_document(*, engine: Engine, document_id: str) -> dict[str, Any] 
         f"FROM {PUBLIC_SCHEMA}.documents_v1 WHERE document_id = :document_id"
     )
     with engine.connect() as conn:
-        row = conn.execute(text(sql), {"document_id": document_id}).mappings().one_or_none()
+        row = (
+            conn.execute(text(sql), {"document_id": document_id})
+            .mappings()
+            .one_or_none()
+        )
     return dict(row) if row is not None else None
 
 
-def _select_processing_runs(*, engine: Engine, document_id: str) -> list[dict[str, Any]]:
+def _select_processing_runs(
+    *, engine: Engine, document_id: str
+) -> list[dict[str, Any]]:
     sql = (
         f"SELECT {', '.join(PROCESSING_RUN_COLUMNS)} "
         f"FROM {PUBLIC_SCHEMA}.processing_runs_v1 "
@@ -255,9 +258,7 @@ def _document_where(filters: DocumentFilters) -> tuple[list[str], dict[str, Any]
         where.append("(" + " OR ".join(clauses) + ")")
     if filters.title_contains is not None:
         where.append("title ILIKE :title_pattern ESCAPE '\\'")
-        params["title_pattern"] = (
-            "%" + _escape_like(filters.title_contains) + "%"
-        )
+        params["title_pattern"] = "%" + _escape_like(filters.title_contains) + "%"
     if filters.announcement_date_from is not None:
         where.append("announcement_date >= :announcement_date_from")
         params["announcement_date_from"] = filters.announcement_date_from
@@ -302,9 +303,7 @@ def validate_title_contains(value: str | None) -> str | None:
 
 
 def _escape_like(value: str) -> str:
-    return (
-        value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    )
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _append_document_cursor(

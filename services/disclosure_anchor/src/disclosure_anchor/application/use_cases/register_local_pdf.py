@@ -24,6 +24,7 @@ from disclosure_anchor.application.services.subject_resolver import (
     SubjectResolver,
 )
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.worker.locks import shared_corpus_writer
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import (
@@ -114,6 +115,14 @@ class RegisterLocalPdf:
         self._subject_resolver = subject_resolver or SubjectResolver()
 
     def execute(self, command: RegisterLocalPdfCommand) -> RegisterLocalPdfResult:
+        # Raw archive/quarantine writes and their database ownership record
+        # are one corpus-write lifecycle.  Reset cannot enter between them.
+        with shared_corpus_writer(self._uow_factory):
+            return self._execute_admitted(command)
+
+    def _execute_admitted(
+        self, command: RegisterLocalPdfCommand
+    ) -> RegisterLocalPdfResult:
         self._preflight_existing_subject(command)
 
         try:

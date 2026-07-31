@@ -56,6 +56,7 @@ def _run_row(processing_run_id: str) -> dict:
     return {
         "processing_run_id": processing_run_id,
         "document_id": "doc_1",
+        "artifact_owner_processing_run_id": processing_run_id,
         "run_kind": "full",
         "status": "succeeded",
         "parser_name": "MinerU",
@@ -125,7 +126,9 @@ def _request(engine: _Engine) -> SimpleNamespace:
     )
 
 
-def _request_with_query(engine: _Engine, query_params: dict[str, str]) -> SimpleNamespace:
+def _request_with_query(
+    engine: _Engine, query_params: dict[str, str]
+) -> SimpleNamespace:
     return SimpleNamespace(
         app=SimpleNamespace(state=SimpleNamespace(reader_db_engine=engine)),
         query_params=query_params,
@@ -169,7 +172,9 @@ class FilingApiDocumentTests(unittest.TestCase):
         self.assertNotIn("OFFSET", engine.statements[0].upper())
         self.assertEqual(engine.params[0]["limit_plus_one"], 2)
 
-    def test_documents_cursor_predicate_handles_non_null_announcement_date(self) -> None:
+    def test_documents_cursor_predicate_handles_non_null_announcement_date(
+        self,
+    ) -> None:
         engine = _Engine([_document_row("doc_1", None)])
         cursor = encode_document_cursor(
             DocumentCursor(announcement_date=date(2026, 7, 5), document_id="doc_2")
@@ -228,14 +233,18 @@ class FilingApiDocumentTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.status_code, 410)
         self.assertEqual(caught.exception.detail["error_code"], "GONE_SUPERSEDED")
-        self.assertEqual(caught.exception.detail["detail"], {"superseded_by": "doc_new"})
+        self.assertEqual(
+            caught.exception.detail["detail"], {"superseded_by": "doc_new"}
+        )
 
     def test_document_runs_order_is_pinned(self) -> None:
         engine = _Engine([_run_row("run_2"), _run_row("run_1")])
 
         response = list_document_runs("doc_1", _request(engine))
 
-        self.assertEqual([item.processing_run_id for item in response], ["run_2", "run_1"])
+        self.assertEqual(
+            [item.processing_run_id for item in response], ["run_2", "run_1"]
+        )
         self.assertIn(
             "ORDER BY started_at DESC, processing_run_id DESC",
             engine.statements[0],

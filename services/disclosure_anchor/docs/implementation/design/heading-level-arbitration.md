@@ -1,216 +1,146 @@
 ---
 id: disclosure_anchor_design_heading_level_arbitration
 project: disclosure_anchor
-title: 标题层级仲裁：文档级信号可靠度阶梯（假根根治）
-status: approved (用户 2026-07-17 批准主线；无编号归属排为第二阶段)
+title: 标题与章节结构：source-bound typed proof
+status: approved
 created_at: 2026-07-17
-depends_on: milestone 05 S2、rules.HEADING_PATTERNS、corpus-reparse-audit-r1 全量语料
+revised_at: 2026-07-27
+depends_on: NormalizedIR v4、document-structure.v1、source-evidence-conservation.v8
 ---
 
-# 标题层级仲裁：文档级信号可靠度阶梯
+# 标题与章节结构：source-bound typed proof
 
-## 1. 缺陷与证据
+## 1. 目标与边界
 
-**症状**：全库 5,390 个 active 单元（6.2%）的 `heading_path[0]` 是深层编号形态
-（`1）`/`（一）` 等），即"假根"——深层小节被置为根标题并吞并后续内容的归属。
-典型：华测 2023/2025 年报商誉附注（184 单元，12 页被一个「1）预计未来现金流量的
-现值」假根吞并）。
+L1 的任务不是“猜一个看起来合理的大纲”，而是把 PDF 中可验证的结构 occurrence 绑定到
+可检索证据。一个标题只有同时具备来源身份、页面位置和明确结构角色，才可进入
+`heading_path`；无法证明的文本仍须保留和可检索，但不能伪造标题、层级或父子关系。
 
-**根因（插桩重放，2026-07-17）**：`builder.py` source_level 计算
-（`heading_candidate.heading_level or level`）无条件 parser 优先，而现役语料的
-vlm 后端 parser 层级是全量退化噪声：
+以下信息彼此正交：
 
-- 华测文档所有 vlm 标题 `heading_level` 恒等于 1（栈快照 source_level 清一色 1）。
-- **语料分布（随机 120 份 active）**：118 份 constant-level + 2 份无标题，
-  **0 份有层级变化**。层级结构实际全部由编号文法（HEADING_PATTERNS 七级）承载。
-- `_place_patterned_heading` 保留条件 `entry.source_level < source_level OR
-  entry.logical_level < pattern_level`：source_level 恒 1 时第一子句永假；深层
-  pattern（digit_paren=6）连续区块中前代 L6 条目不满足第二子句 → 逐个互踢成根，
-  浅祖先一旦流失不可恢复。
+- heading/title/path：只来自本文件规定的结构 proof；
+- caption、unit、footnote、applicability：是 payload annotation；
+- 监管 taxonomy / semantic keys：只用于 L2/L3 检索路由；
+- source fallback / visual guard：用于补足原生文本或几何证据。
 
-**辅助信号实测（2026-07-17，为通用框架定权）**：
+后三类都不得反向改变 PDF 边界、标题或 ancestry。
 
-- **几何字高**（华测 1225051410 IR bbox 高度按 pattern 级分布）：级 1（第X节）
-  中位 22 可分；级 2 中位 18 区间 [13,38]；级 3–6 混杂在 13–15。→ 几何在本语料
-  只能区分顶级，深层无分辨力，只能做弱辅助。
-- **PDF 书签大纲**（pypdf 抽样 40/5107 份原始 PDF）：仅 6 份（15%）有大纲，
-  且多为 ≤2 层。→ 外部系统的一级权威信号在本语料覆盖不足。
+## 2. 已否决的旧实现
 
-**保护不变量（不可破坏，两个既有测试）**：
-- `test_numbering_never_discards_parser_proven_parent`：parser 层级 1/2/3 有变化时，
-  编号不得驱逐 parser 证明的父级。
-- `test_s2_preserves_parser_level_for_ambiguous_unnumbered_heading`：同 parser 层级
-  的无编号标题与编号标题互为兄弟可互切。
-两者前提都是 **parser 层级有信息**（pipeline 后端形态）。
+以下机制已从当前热路径删除：
 
-**已否决的两个单行修法**（实测）：`pattern 无条件优先` 破坏保护测试 1；
-`max(parser, pattern)` 破坏保护测试 2。→ 无条件改优先级不可行，仲裁必须
-**按信号在本文档内是否可靠** 分档。
+- `text_level >= 1` 直接把 MinerU legacy text carrier 升成 heading；
+- 用固定栏目名、财报业务短语、caption 或“单位：…”决定标题；
+- 用编号/标点正则、最近标题栈或文档级词面白名单推断父子关系；
+- 从目录文本匹配回写正文结构；
+- 证据冲突时强制改成 level 1；
+- 把碎片保留下来后交给 L2 猜测拼接。
 
-## 2. 外部对标（2026-07-17，7 个系统）
+旧语料研究仍可从 Git 历史追溯，但不再是现行设计或 agent 指令。
 
-| 系统 | 层级信号与仲裁 | 对我们的启示 |
-|---|---|---|
-| GROBID | CRF 只判"是不是标题"；**层级由编号文法确定性读出**（`3.1`→L2）；无编号则**不输出层级**而非猜深度 | 编号文法是确定性深度编码；退化时诚实降级 |
-| docling(+hierarchical-pdf) | 阶梯回退：书签元数据 → 编号文法 → 字体样式；**每级信号只在存在且有信息时作权威** | 可靠度门控表达为回退顺序 |
-| PaddleOCR/PP-Structure | 优先级阶梯：样式名 → 字号比 body 基线 → 中文编号 regex；另有 `relevel_titles` 重定级后处理 | 同上；中文编号 regex 是常规组成 |
-| marker | layout 模型提名标题，**层级由字高 K-Means 重推**（簇均值排序 + 合并阈值；离群落 default_level=2） | 结构信号不可靠时换客观信号重推；退化收敛到默认 |
-| Unstructured | 模型 category 全权威、编号不参与，误分类靠 chunk 合并兜底 | 反例：不仲裁的代价是过切分不可恢复 |
-| HELD (arXiv 2105.09297) | 文本+44 编号 regex+视觉+上下文特征，put-or-skip 插入；消融显示**去掉兄弟特征损失最大** | 序数/兄弟连续性是最强结构证明 |
-| Detect-Order-Construct / MTD | 学习式 parent/sibling 关系预测 + **解码时强制树合法性**（无事后修复 pass） | 单调性靠"构造即合法"，不靠后处理 |
+## 3. 可接受的结构证据
 
-**七条复现模式**（调研综合）：① 检测与定级分离；② 仲裁两族——确定性回退阶梯 vs
-学习式联合模型（工程系统全走阶梯）；③ 按信号权威度排序、逐档回退即"可靠度门控"；
-④ 序数/兄弟连续性是最强结构证明；⑤ 字号→层级是单调但低信任映射、必须设防；
-⑥ 优雅退化=收敛到诚实默认、从不编造深度；⑦ 单调性修复要么在构造中强制、
-要么不存在——事后 no-skip 修复器在 OSS 中基本不存在。
+`pdf_native_structure.py` 从原始 PDF 读取：
 
-## 3. 通用框架：文档级信号可靠度阶梯
+1. Tagged PDF 的 `StructTreeRoot`、标准 role（`H1`–`H6`、`TOC/TOCI`、
+   `Table/TH/TD` 等）与 ancestry；
+2. page-local marked content / MCID、文本与 bbox；
+3. PDF bookmark 的 title、level、destination page/y。
 
-**总原则**（对应模式 ③⑥⑦）：
+`structure_proof.py` 另可读取 MinerU v2 明确标成 `type=title` 且携带 level/bbox 的 block。
+它只能对齐正文 text carrier；table/image caption、note、footnote、unit 或 HTML 字段都不是
+heading carrier。MinerU v2 与 legacy content list 是同一个 provider block 的两种序列化：
+v2 text span 保留原字符，legacy text span 按 MinerU 3.4 官方规则转义 `* _ ` ~ $`，
+inline equation 由当前冻结 profile 包成 `$...$`。对齐必须先把 v2 精确投影成 legacy 表示，
+再要求同物理页、等价 bbox 和唯一 legacy text carrier；仅 bbox 相交、任意同 bbox
+`text_level` 或模糊反转义均不是证明。MinerU legacy `content_list.text_level` 只保留为
+provider annotation 和冲突诊断，不能单独产生 heading。唯一闭合的 MinerU v2 typed title
+可以按其显式 level/顺序建立 provider section；与 native 非 heading role、重复 occurrence
+或另一张结构图冲突时 fail closed，原 carrier 仍保留。
 
-1. **检测与定级分离**：什么是标题仍由 parser（kind=heading）决定，本设计只管定级。
-2. **每个信号有"权威条件"，按文档级证据一次性定权**，而非全局固定优先级，
-   也非逐标题启发式。
-3. **低可靠证据不得砍祖先**；退化时收敛到该信号的诚实默认值，从不编造深度。
-4. **单调性靠构造保证**：`_place_*` 栈机械本身就是"child 必深于 parent"的
-   合法性构造，不加事后修复 pass。
+所有候选必须按同一 source PDF hash、物理 page、bbox/MCID 与具体 MinerU carrier field
+唯一对齐。全局文本相等、相邻位置、业务语义或多个同源 JSON 的“一致投票”都不构成证明。
 
-**信号清单与权威条件**（阶梯从上到下）：
+## 4. 构造规则
 
-| 信号 | 权威条件 | 本语料实测 | 状态 |
-|---|---|---|---|
-| S0 PDF 书签大纲 | 存在且非平凡 | 15% 覆盖、多 ≤2 层 | **槽位保留，延后**（覆盖不足） |
-| S1 parser 版面层级 | 文档内去重层级数 ≥ 2 | vlm 100% 退化（constant-1） | **本次实装门控** |
-| S2 编号文法（七族+dotted/latin/roman） | 标题带模式 | 法定披露大纲语法，承载全部真实层级 | 已有，成为退化档权威 |
-| S3 法定锚点 FIXED_L1_TITLES | 命中固定标题 | 已有 | 不变 |
-| R1 序数连续性（兄弟证明） | 链上相邻序数 | dotted/latin/roman 链已实装 | 七族推广**延后**（无需求证据；同族同深，放置结果不变） |
-| S4 几何字高聚类 | 簇分离度足够 | 只分得出顶级 | **槽位保留，延后**（分辨力不足） |
+1. StructTree、bookmark、MinerU v2 分别在自己的图内建立 exact heading occurrence 和
+   parent edge；不同来源的 raw `H3/L2/L1` 数字不直接比较。
+2. 同一 source refs/text span 的正面 role evidence 合并为一个 anchor；native
+   `P/TOCI/TD/Table` 是 role/containment evidence，不是删除 anchor 的全局否决票。
+3. root-reachable 且 parent 一致的 native H、有效 destination bookmark 可提供父边；
+   source-bound MinerU v2 title 也可在自身 typed title 序列中按显式 level 提供父边。
+   父边一致或只有一张无冲突的有效结构图时采用；父节点真正冲突、逆序或跨过独立
+   reading-order branch 时切断。
+4. 最终 `heading_level` 是已接受 parent DAG 的 canonical depth，而不是复制任一来源的
+   local level。来源 level 差异保留为诊断，不能抹掉 anchor。
+5. 父图或 TOC/table containment 无法证明向后传播时，anchor 的 `section_span` 收缩到自身；
+   节点显式写 `propagates=false`。它仍可检索，但不控制后续 unit 的 title/path，也不能截断
+   其他已证明 section 的 span。其他 section span 才按 DAG 与 source order 计算。
+6. builder 只能消费该 proof，不能再建立第二棵结构树。表格 title 取最深 resolved section；
+   caption 永不反向补成结构标题。
 
-**仲裁规则（source_level 决策表）**：
+结果允许更粗，但不允许错误。无法唯一绑定的候选仍以普通 source carrier 保留；其 conflict
+relation、source item、native node/bookmark order 必须进入审计分布。
 
-| parser 有信息? | 标题带模式? | source_level |
-|---|---|---|
-| 是 | 任意 | parser 层级（模式缺失回退 `_heading_level_for`）——**现行语义零改动**，保护测试形态 |
-| 否 | 是 | 编号文法层级（`_heading_level_for` 本就模式优先） |
-| 否 | 否 | FIXED_L1_TITLES 命中→1；否则 parser 常量（vlm 真实根级判定，诚实默认） |
+## 5. 页框与页码
 
-`parser 有信息` 判据（文档级、客观、一次性）：本文档全部 `kind=heading` 元素的
-非空 `heading_level` 去重集合基数 ≥ 2。
+页眉、页脚、页码只有在来源 role 与物理版面共同证明时才可外部化：
 
-**通用性论证**：未来变化通过"新增/启停信号槽位+权威条件"吸收，不改放置机械——
-换回 pipeline 后端（parser 有信息）→ 决策表第一行自动恢复现行全部行为；
-新后端给出部分可信层级 → 仍由同一信息量判据定档；出现带书签的语料 →
-实装 S0 于阶梯顶端；出现字体丰富的语料 → 实装 S4 于 S2 之下。
+- PDF native `Artifact/Header/Footer`；
+- MinerU typed `header/footer` 在 top/bottom band 的连续重复 occurrence；
+- 仅有 MinerU v2 title 的 occurrence，在至少三个连续物理页以相同文本、相同 top/bottom
+  band 和既有 bbox 等价容差重复时；同一 occurrence 具有有效 StructTree H 或 bookmark
+  证据时永不按此规则外部化；
+- MinerU typed `page_number` 在 top/bottom band 的连续递增打印序列。
 
-## 4. 本次实施范围（阶梯的首个实例化）
+页码正则只解析 provider 已标成 `page_number` 的短数字格式，并且必须通过物理 band 与
+跨页单调序列；它不识别标题，也不影响业务 section。上述 title 复现判定只使用来源角色、
+连续页和版面位置，不使用公司名、栏目名或其他词表。页框 occurrence 仍保留为
+document-level evidence，并阻断跨页文本聚合，避免正文被静默吞掉。
 
-全部在 `builder.py`，无契约面变化：
+## 6. 证据缺口
 
-1. `build_unit_drafts_s1_s7` 入口对全文档 heading 元素做一次预扫，得
-   `parser_levels_informative: bool`，传入 `s2_apply_heading_tree`
-   （该函数可能按 region 被多次调用，故判据必须在文档级算好传入，不得在函数内算子集）。
-2. source_level 计算处（builder.py:1023-1026）改为：
-   `informative ? (heading_level or level) : level`，夹取 [1,7] 不变。
-3. 其余机械（`_place_unnumbered/_place_patterned/dotted 链/qa_heading_mode`）零改动。
-4. `RULES_VERSION` 升版（行为变化，触发全量 rebuild-units）。
+“无法对齐”是需要观测和追根的状态，不是完成状态：
 
-**退化档效果**：华测文档 `第X节`→1、`一、`→2、`（一）`→3、`1、`→4、`(1)`→6，
-source_level 与 pattern 一致 → `_place_*` 两个子句在一致证据上运作，深层
-digit_paren 保留全部浅祖先，假根家族消失。重复 `1）2）3）…1）2）` 区块：两轮
-同为级 6，同深互切、浅祖先保留——放置深度正确，无需序数连续性介入。
+- MinerU 漏文本：由独立 Poppler native occurrence ledger 记录并生成可搜索的整页
+  fallback unit；
+- 原生文本缺失：生成 hash-bound lossless full-page PNG；
+- 原生 word geometry 异常：保留有效 native text，同时绑定整页 visual guard；
+- PDF 有 typed heading 但 carrier 无法唯一对齐：记录结构 conflict，保留原 carrier，
+  不伪造 path；
+- exact text/bbox 已闭合但两种 extractor 阅读顺序不同：保留双侧 order 与 conflict 诊断，
+  不伪装成内容缺失，也不生成重复整页 fallback；
+- source evidence、fallback unit、visual descriptor 或实际 PNG bytes 任一不闭合：
+  BuildUnits fail loud，不发布该 run。
 
-## 5. 明确不做 / 有据延后
+`audit_unit_corpus.py --source-replay` 必须从 raw PDF、原 MinerU artifact 重建 v4 IR，
+把 fallback units 在最终 audit 前合流，并汇总所有 structure conflicts、fallback reasons、
+visual pages 和 native geometry issues。删除/重解析许可要求“零未知、零未分类”；诊断不必
+机械归零，但每个 material family 必须有真实样本、根因和明确处置。
 
-- 不引入逐标题启发式（字数/居中/字体猜测）；判据只看文档级层级集合基数。
-- 不改 HEADING_PATTERNS 词汇与 dotted/latin/roman 证据逻辑。
-- 不从纯文本 text 元素提升标题（红线不变——华测商誉附注的无版面中间标题仍
-  不可恢复，其小节挂最近真实标题下即证据忠实上限）。
-- 退化档无编号标题维持 parser 常量（成为根）：GROBID"无编号则无层级"与
-  "挂栈顶不砍祖先"是候选替代。**用户 2026-07-17 定序为第二阶段**，已完成
-  原型实验（见 §7），待批准后实施。
-- **LLM 兜底槽位（用户 2026-07-17 提出）**：确定性阶梯兜不住的残余归属可用
-  flash 级低成本 LLM 仲裁兜底；前置条件是 monorepo 根层级的统一 LLM 调用封装
-  （yaml/api facade，provider 无关——现有 codex/Claude CLI，未来会变），不得在
-  本 service 直连某家 CLI/SDK。确定性程序始终是主力；本槽位仅当第二阶段确证
-  程序方法有不可逾越残余时再启动根级 facade 设计。
-- S0 书签、S4 几何、R1 七族推广：槽位与实测证据已记录（§3），待证据出现再实装。
-- **S0'（文内目录）已实装（ub-2026.07-64）**：目录审计抓到招行 5 份定期报告的
-  章首标题（无"第X章"前缀的 heading）被退化档锚定吞进前章——目录逐字声明的
-  「第X章 标题」即其顶层证据。`toc_outline.toc_declared_root_keys` 从 TOC 形
-  文本块（≥5 行、双行文法多数派）提取带法定前缀的顶层节名（去前缀规范化），
-  退化档中无编号无 dotted 的标题命中即定根（栈条目带 `toc_proven`，后续无编号
-  标题正常嵌入其章内）。仅退化档生效；红线不变（只给既有 heading 定级，
-  不从纯文本提升标题——招行 2 个开章标题在解析中不存在，审计继续如实上报）。
+## 7. 与检索的关系
 
-## 6. 验证结果（2026-07-17，重放侧已完成）
+builder 发布两个层次：
 
-- 单测：655 全绿（两个保护测试零改动）；新增 3 例——退化档假根家族回归
-  （阴性对照：旧代码下精确复现 `['1）税前折现率的确定方法']` 假根）、同序列
-  parser 有信息负例、层级全缺失边界例。`make agent-check` 全绿。
-- 靶向：华测 92 份重放 6,438 单元假根 **0**（此前两份年报即 114）。
-- 全语料重放：1,635 份 / 86,683 单元 / audit **0 findings** / 0 失败。
-  同口径假根（模式级 ≥3 为根）**17,285 → 275（-98.4%）**，受影响文档逐份对照
-  **无一变差**。根层级分布：`一、`级根 18,204 → 16；无编号根承接了改判单元。
-- 残余 275 归因（非门控缺陷）：① 工行/招商 dotted 链（`1.`→`1.1`）与无编号标题
-  交错——无编号根重置毁掉浅祖先后 dotted 无证明切割把栈切空，属 §5 第二阶段
-  （无编号归属）的下游症状；② 能辉 IR/万科发布会等文档全篇仅有编号标题，
-  编号根即真顶层，是分类器口径多算，证据忠实。
-- fixture：检入 golden 在 r58 下零漂移；`regen_phase00_fixtures.py` 的
-  `_phase00` 原料目录在 SSD 上已不存在（本会话退役清单 0 命中，属先前遗留
-  工具缺口），已记录待修复。
+- 原子 evidence：保留 source order/page/bbox/hash/provenance；
+- structural evidence block：仅按同一已证明 heading occurrence 聚合连续证据。
 
-## 7. 第二阶段设计：退化档无编号标题锚定继承（proposed，原型已验证）
+命中原子成员时，L2/L3 可展开同一 structural block、table family 或 source-page fallback。
+taxonomy 可以增加召回入口，但不得改变成员、边界、标题或 source locator。表格 title 取
+最深已证明 heading；caption 始终留在 payload，绝不回填 title。
 
-**规则（仅退化档，信息档零改动）**：无编号、无 dotted、非 FIXED_L1 的标题不再
-取 parser 常量成根，而是**锚定栈顶**：
+## 8. 变更与验证
 
-- 栈顶带层级证据（模式/锚点）→ `source_level = min(7, top.source_level + 1)`
-  （作其子级，不砍任何祖先）；
-- 栈顶同为无证据标题 → `source_level = top.source_level`（互为兄弟，防连续
-  无编号无限加深）；
-- 空栈 → 维持根（文档首标题、目录/提示等真顶层天然保留）。
+任何结构行为变化必须：
 
-外部依据：GROBID"无编号则不声明层级"（不编造深度）+ 阶梯"低可靠证据不得砍
-祖先"总原则的自然推论；HELD 消融证明兄弟/前文格式连续性是最强上下文证据。
+1. 升 `RULES_VERSION`；
+2. 用正例与邻接负例覆盖 failure family；
+3. 对代表性真实 PDF 做 raw source → v4 IR → final units 重放；
+4. 汇总而不是隐藏 structure conflicts/fallback/visual 分布；
+5. 通过独立只读审查后，才可冻结全量 manifest 并进入 reset/reparse。
 
-**原型全语料重放（2026-07-17，实验补丁）**：
-
-- 假根 275 → **15**，且 15 个全部是真顶层（能辉 IR 9、平安 Q&A 4、万科 2）；
-  工行 90/88/53、招商 7/7/6/6 全归零——dotted×无编号交错家族根治。
-- 约 3.6 万单元找回法定祖先：无编号根 67,981 → 32,165，`第X节`级根
-  18,411 → 54,061。被收编的全是附注内部标题（专项应付款/工程物资/审计报告/
-  会计政策变更/财务报表附注(续)…）；保留为根的全是文档顶层（目录/重要内容
-  提示/公司简介/文档标题——空栈规则天然保护）。
-- 总单元数 86,683 → 86,271（-412，标题分组随路径加深变化）。
-
-**实施定稿（2026-07-17，ub-2026.07-59）**：无需新增字段——栈条目的
-`pattern_level`/`dotted_components` 已完整编码"有无深度证据"，FIXED 锚点顶
-（两者皆空）自然落入 +0 兄弟根档，与原型行为一致；对原型的修正是 dotted 顶
-（`1.1` 等）计为有证据（+1）。
-
-**audit 门抓住的回归与根治**：首轮全语料 audit 报 46 条 `source_atom_uncovered`
-（r58 为 0）。根因：退化档 dotted 标题（`1.2` 不匹配 HEADING_PATTERNS）的
-source_level 仍是 parser 常量 1，锚定子级取 top.src+1=2 后，
-`_place_unnumbered_heading` 的 parents 过滤器把栈中 src=5 的 `1. 信用风险(续)`
-滤除——该条目已被标记 represented 又不再发 heading carrier → 覆盖缺口。
-根治（同一不变量的补全）：**退化档 source_level 一律采用文法证据级
-`evidence.level`**（HEADING_PATTERNS 命中时数值不变，dotted 由此获得诚实深度）。
-修复后 ir_2123 覆盖恢复，且路径祖先质量进一步提升（`七、风险披露` 等中间祖先
-不再被错误驱逐）。
-
-验证链同 §8：5 例新单测（收编正例/连续兄弟/FIXED 锚点负例/空栈保留/信息档
-负例）+ 全语料双重放（假根计数 + audit 0 findings 门）+ 抽样复审（重点：
-审计报告 等独立大节落点、单元数变化、平安 Q&A 提问行误标家族另案处理）。
-
-## 8. 验证链（原计划）
-
-1. 单测：既有全部（含两个保护测试）绿；新增退化档正例（constant-1 文档中
-   digit_paren 保留浅祖先）+ 邻接负例（两级 parser 变化文档维持现行行为）
-   + 边界例（heading_level 全缺失文档走退化档）。
-2. 靶向：华测 2023/2025 两份重建——假根 114→0、现值小节挂最近真实祖先。
-3. 全语料重放：1,635 份 0 findings；假根计数 5,390 → 预期 ≈0；受影响文档清单
-   产出，抽样 ≥5 份人工复审路径合理性。**watch**：退化档无编号标题的根重置
-   路径（合并资产负债表类）是否引入新的浅祖先流失形态。
-4. fixture 决定性重生成 + 语义复审；`make agent-check` 全绿。
-5. 全量 rebuild-units（规则版驱动）→ 投影刷新 → SQL 假根计数复核 → 旧代退役。
+外部机制与可借鉴不变量来自
+[PDFium structure API](https://pdfium.googlesource.com/pdfium/+/main/public/fpdf_structtree.h)、
+[Docling](https://github.com/docling-project/docling) 和
+[Unstructured](https://github.com/Unstructured-IO/unstructured)；这些项目只提供机制对照，
+不覆盖本服务的产品契约，也不授权复制其项目特定启发式。

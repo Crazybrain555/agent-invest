@@ -1,33 +1,43 @@
 """Regenerate the 06R derived retrieval projection (milestone 06R §4/§5).
 
 Derived layer (U7 red line): every projection column regenerates
-deterministically from the persisted ``document_unit`` rows via the pinned
-application-side jieba tokenizer. This use case writes only
-``disclosure_core.unit_search_projection``; it emits no outbox events and puts
-nothing into content/query-projection hashes.
+deterministically from persisted ``document_unit`` rows. This use case replaces
+the projection tables and records/clears only the owning run's deterministic
+projection terminal fact; it emits no outbox events and puts nothing into
+content/query-projection hashes.
 
-Two modes:
+Both full and delta modes replace one complete ``processing_run`` per
+transaction.  Delta selects a run when any active unit lacks the current
+projection version; full selects every active run.  Orphan parents cascade
+their body windows.  A database probe proves that every source lexeme
+occurrence survives PostgreSQL's physical ``tsvector`` limits; unsafe bodies
+are split by deterministic half-open token ranges, never by vocabulary.
 
-* ``full``  — recompute every active-run unit (upsert), then delete projection
-  rows whose ``asset_id`` no longer belongs to an active-run unit.
-* delta     — recompute units missing a projection row (index-ordered merge
-  anti-join pass), then rows carrying a stale ``retrieval_rules_version``
-  (keyset pass); the worker drains it fully every round. Both modes end with
-  a batched orphan prune.
-
-Row computation is factored into pure module-level functions so the
-linearization and ``header_row_candidate`` rules are testable without a DB.
+Body text is replayed only from the unit's explicit ``search_targets`` source
+projection. No payload-field discovery or content-shaped header guess is part
+of retrieval. Each selected leaf is also stored as one normalized search atom;
+leaves are never joined in that substring channel.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import re
-from typing import Any
+from typing import Any, TypeVar
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import (
+    Integer,
+    Text,
+    and_,
+    column,
+    delete,
+    func,
+    or_,
+    select,
+    update,
+    values,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
@@ -35,24 +45,20 @@ from sqlalchemy.orm import Session
 from disclosure_anchor.adapters.db.postgres.models import (
     DocumentUnit,
     ProcessingRun,
+    UnitBodySearchWindow,
+    UnitSearchAtom,
     UnitSearchProjection,
 )
 from disclosure_anchor.adapters.retrieval import tokenizer
-from disclosure_anchor.domain import ids
+from disclosure_anchor.application.contracts.unit_source_projection import (
+    SearchTargetContractError,
+    search_text_values,
+)
+from disclosure_anchor.application.worker.locks import shared_corpus_mutation
 
-# Upsert flush size inside one keyset batch (memory bound on payload rows);
-# the outer keyset batch (_BATCH_SIZE) commits per batch — see execute().
+# DML flush size inside one processing-run transaction.
 _BATCH = 1000
-
-# Milestone 06R §4: a numeric-shaped cell after strip. Currency-magnitude words
-# are intentionally NOT part of this test — see the module note in the task
-# report; the annotation is a fail-safe diagnostic, so a conservative test only
-# flags fewer candidates.
-_NUMERIC_CELL_RE = re.compile(r"^[-+]?[\d,.]+%?$")
-# Controlled magnitude suffixes from the unit-declaration vocabulary
-# (rules._DECL_MAGNITUDE); kept as a literal mirror because application code
-# must not import the adapter's private regex fragments.
-_MAGNITUDE_SUFFIX_RE = re.compile(r"\s*(?:元|千元|万元|百万元|亿元)$")
+_PROBE_BATCH = 256
 
 _UPDATE_COLUMNS = (
     "retrieval_rules_version",
@@ -63,6 +69,7 @@ _UPDATE_COLUMNS = (
     "body_tokens",
     "key_tokens",
     "header_row_candidate",
+    "body_search_windowed",
     "built_at",
 )
 
@@ -76,19 +83,11 @@ class BuildSearchProjectionCommand:
     # only appear when a publish deactivates a run — so the worker passes the
     # round's deactivation signal here and skips the scan on quiet rounds.
     # A projection count exceeding the active-unit count forces the prune
-    # regardless (orphans then provably exist). Residual: orphans from a
-    # crash between publish and projection can outlive their round until the
-    # next deactivation round; bounded, and erased by the write-through
-    # design (§8.1 trigger).
+    # regardless (orphans then provably exist).  If one orphan and one
+    # missing row initially cancel in the counts, the exact delta drain adds
+    # the missing row; the following round then proves projection > active
+    # and prunes the orphan.
     prune: bool = True
-    # Upper bound on rows projected this call. None (the worker and CLI
-    # default) drains everything the delta finds: maintenance work must be
-    # proportional to new/changed units, never capped by a fixed constant —
-    # a borrowed document-scale limit once starved this unit-scale rebuild
-    # to 48% search coverage (2026-07-23). A bound remains available for
-    # explicitly time-boxed invocations; the remainder is reported as
-    # ``skipped``.
-    limit: int | None = None
 
 
 @dataclass(frozen=True)
@@ -96,28 +95,71 @@ class BuildSearchProjectionResult:
     projected: int = 0
     deleted: int = 0
     skipped: int = 0
+    failures: tuple[SearchProjectionFailure, ...] = ()
+
+
+@dataclass(frozen=True)
+class SearchProjectionFailure:
+    processing_run_id: str
+    error_code: str
+    message: str
+
+
+class SearchProjectionSafetyError(RuntimeError):
+    """PostgreSQL cannot represent a source token occurrence losslessly."""
+
+
+def _projection_error_code(
+    error: SearchProjectionSafetyError | SearchTargetContractError,
+) -> str:
+    if isinstance(error, SearchTargetContractError):
+        return "search_target_contract_invalid"
+    prefix, separator, _detail = str(error).partition(":")
+    return (
+        prefix
+        if separator and prefix.startswith("search_projection_")
+        else "search_projection_safety_error"
+    )
+
+
+def _terminal_projection_error(
+    error: SearchProjectionSafetyError | SearchTargetContractError,
+    *,
+    failed_at: datetime,
+) -> dict[str, object]:
+    return {
+        "stage": "search_projection",
+        "error_code": _projection_error_code(error),
+        "message": str(error)[:2000],
+        "retryable": False,
+        "retrieval_rules_version": tokenizer.RETRIEVAL_RULES_VERSION,
+        "failed_at": failed_at.isoformat(),
+    }
+
+
+@dataclass(frozen=True)
+class _BodyRange:
+    row_index: int
+    start: int
+    end: int
 
 
 class BuildSearchProjection:
     """Recompute the search projection from active-run units.
 
-    Uses a plain engine (not the UnitOfWork): it reads ``document_unit`` /
-    ``processing_run`` and writes only the projection table, so it needs no
-    repository wiring.
+    Uses a plain engine (not the UnitOfWork): one transaction locks the owning
+    ``processing_run``, replaces its projection rows, and clears its projection
+    terminal fact. Deterministic failures are recorded only after replacement
+    rollback.
     """
 
     def __init__(self, *, engine: Engine) -> None:
         self._engine = engine
 
-    # Discourse-style bounded reindex: keyset batches with a commit per
-    # batch, so a corpus-scale rebuild never rides one giant transaction
-    # (pinning vacuum, ballooning WAL, restarting from zero on failure) and
-    # never materializes millions of asset ids into Python
-    # (design: retrieval-scale-hardening.md §5). A full run is therefore not
-    # one MVCC snapshot: units activated below the moving cursor by a
-    # concurrent publish are picked up by the next delta round, and the
-    # doctor coverage check alerts if that ever stops converging.
-    _BATCH_SIZE = 2000
+    # A processing run is the atomic replacement boundary.  The outer
+    # keyset keeps corpus rebuilds bounded without splitting one run's parent
+    # rows from its body windows.
+    _RUN_BATCH_SIZE = 128
     # Orphan ids fetched per anti-join scan: bounds Python memory to a few MB
     # even when a rules-bump corpus rebuild deactivates runs corpus-wide
     # (orphan waves at unit scale), while the steady state pays one probe.
@@ -133,178 +175,151 @@ class BuildSearchProjection:
         built_at = datetime.now(timezone.utc)
         projected = 0
         deleted = 0
-        skipped = 0
-        remaining = command.limit
-        cursor: str | None = None
+        failures: tuple[SearchProjectionFailure, ...] = ()
 
         def stop_requested() -> bool:
             return should_stop is not None and should_stop()
 
-        stale_cursor: str | None = None
-        with Session(self._engine) as session:
-            if command.full:
-                projected, remaining, cursor = self._drain_keyset(
-                    session,
-                    self._active_units_stmt,
-                    built_at=built_at,
-                    remaining=remaining,
-                    stop_requested=stop_requested,
-                    on_progress=on_progress,
-                )
-                deleted = self._delete_orphans(session, should_stop=should_stop)
-            else:
-                # Order and gating carry the steady-state cost (§8.2 review,
-                # 2026-07-24: every "prove the delta is empty" scan is
-                # corpus-sized, so each one must be gated or range-pruned):
-                #
-                # 1. Prune orphans only when they can exist — the caller's
-                #    deactivation signal (command.prune) or a projection
-                #    count exceeding the active count. Pruning before the
-                #    other passes restores projection ⊆ active units (count
-                #    gate exact) and keeps the stale pass from re-stamping
-                #    rows whose run was just deactivated (they are gone).
-                # 2. Count gate: |projection| == |active units| under ⊆
-                #    means nothing is missing — skip the missing pass
-                #    without the corpus-wide anti-join probe (measured 19s
-                #    when caught up). The one blind spot — orphans and
-                #    missing rows in equal numbers — self-heals on the next
-                #    unequal round and is backstopped by the doctor
-                #    coverage alarm.
-                # 3. Missing pass scans from a ULID time floor: new units
-                #    carry fresh time-ordered ids, so the scan range is the
-                #    recent tail, not the corpus. Exactness does NOT rest on
-                #    that assumption — a recount after the drain falls back
-                #    to an unbounded scan if rows below the floor are still
-                #    missing (clock skew, out-of-band writes).
-                # 4. Stale pass runs only when the rules-version btree shows
-                #    any row outside the current version (two range probes,
-                #    ~ms) — after a bump nearly every row matches and the
-                #    scan is productive by construction.
-                projection_count, active_count = self._counts(session)
-                if (
-                    (command.prune or projection_count > active_count)
-                    and not stop_requested()
-                ):
+        with shared_corpus_mutation(self._engine):
+            with Session(self._engine) as session:
+                should_prune = command.full or command.prune
+                if not should_prune:
+                    projection_count, active_count = self._counts(session)
+                    should_prune = projection_count > active_count
+                if should_prune and not stop_requested():
                     deleted = self._delete_orphans(
                         session, should_stop=should_stop
                     )
-                    if deleted:
-                        projection_count -= deleted
-                if not stop_requested() and projection_count != active_count:
-                    floor = self._missing_scan_floor(session)
-                    projected, remaining, cursor = self._drain_keyset(
+
+                # The first empty keyset batch is the exact caught-up proof.
+                # Do not gate this anti-join on equal counts: one orphan plus
+                # one missing row can make counts agree while evidence is
+                # absent.
+                if not stop_requested():
+                    projected, failures = self._drain_runs(
                         session,
-                        self._missing_stmt,
+                        full=command.full,
                         built_at=built_at,
-                        remaining=remaining,
-                        stop_requested=stop_requested,
-                        start_after=floor,
-                        on_progress=on_progress,
-                    )
-                    if (
-                        floor is not None
-                        and not stop_requested()
-                        and (remaining is None or remaining > 0)
-                        and self._counts_diverge(session)
-                    ):
-                        repaired, remaining, cursor = self._drain_keyset(
-                            session,
-                            self._missing_stmt,
-                            built_at=built_at,
-                            remaining=remaining,
-                            stop_requested=stop_requested,
-                            on_progress=on_progress,
-                        )
-                        projected += repaired
-                if not stop_requested() and self._stale_rows_exist(session):
-                    restamped, remaining, stale_cursor = self._drain_keyset(
-                        session,
-                        self._stale_stmt,
-                        built_at=built_at,
-                        remaining=remaining,
                         stop_requested=stop_requested,
                         on_progress=on_progress,
                     )
-                    projected += restamped
-            if remaining is not None and remaining <= 0:
-                skipped = self._pending_count(
-                    session,
-                    full=command.full,
-                    after=cursor,
-                    stale_after=stale_cursor,
-                )
         return BuildSearchProjectionResult(
-            projected=projected, deleted=deleted, skipped=skipped
+            projected=projected,
+            deleted=deleted,
+            skipped=0,
+            failures=failures,
         )
 
-    def _drain_keyset(
+    def _drain_runs(
         self,
         session: Session,
-        stmt_builder: Callable[..., Any],
         *,
+        full: bool,
         built_at: datetime,
-        remaining: int | None,
         stop_requested: Callable[[], bool],
-        start_after: str | None = None,
         on_progress: Callable[[], None] | None = None,
-    ) -> tuple[int, int | None, str | None]:
-        """Batched keyset drain: select -> upsert -> commit -> advance."""
+    ) -> tuple[int, tuple[SearchProjectionFailure, ...]]:
+        """Replace complete processing runs, committing once per run."""
 
         projected = 0
-        cursor = start_after
+        failures: list[SearchProjectionFailure] = []
+        cursor: str | None = None
         while not stop_requested():
-            batch_cap = self._BATCH_SIZE
-            if remaining is not None:
-                batch_cap = min(batch_cap, remaining)
-                if batch_cap <= 0:
-                    break
-            asset_ids = list(
+            run_ids = list(
                 session.execute(
-                    stmt_builder(after=cursor).limit(batch_cap)
+                    self._candidate_runs_stmt(full=full, after=cursor).limit(
+                        self._RUN_BATCH_SIZE
+                    )
                 ).scalars()
             )
-            if not asset_ids:
-                break
-            projected += self._upsert(session, asset_ids, built_at=built_at)
             session.commit()
-            if on_progress is not None:
-                on_progress()
-            cursor = asset_ids[-1]
-            if remaining is not None:
-                remaining -= len(asset_ids)
-        return projected, remaining, cursor
+            if not run_ids:
+                break
+            for processing_run_id in run_ids:
+                if stop_requested():
+                    return projected, tuple(failures)
+                run_id = str(processing_run_id)
+                try:
+                    run_projected = self._replace_run(
+                        session,
+                        run_id,
+                        built_at=built_at,
+                    )
+                except (
+                    SearchProjectionSafetyError,
+                    SearchTargetContractError,
+                ) as exc:
+                    recorded = self._record_terminal_error(
+                        session,
+                        run_id,
+                        error=_terminal_projection_error(
+                            exc,
+                            failed_at=built_at,
+                        ),
+                    )
+                    if recorded:
+                        failures.append(
+                            SearchProjectionFailure(
+                                processing_run_id=run_id,
+                                error_code=_projection_error_code(exc),
+                                message=str(exc),
+                            )
+                        )
+                    run_projected = 0
+                cursor = run_id
+                projected += run_projected
+                if on_progress is not None:
+                    on_progress()
+            if len(run_ids) < self._RUN_BATCH_SIZE:
+                break
+        return projected, tuple(failures)
 
     # -- selection ----------------------------------------------------------
-    def _active_units_stmt(self, *, after: str | None) -> Any:
-        stmt = (
-            select(DocumentUnit.asset_id)
-            .join(
-                ProcessingRun,
-                ProcessingRun.processing_run_id == DocumentUnit.processing_run_id,
+    def _candidate_runs_stmt(self, *, full: bool, after: str | None) -> Any:
+        unit_exists = select(DocumentUnit.asset_id).where(
+            DocumentUnit.processing_run_id == ProcessingRun.processing_run_id
+        )
+        if not full:
+            body_window_exists = select(
+                UnitBodySearchWindow.asset_id
+            ).where(
+                UnitBodySearchWindow.asset_id == UnitSearchProjection.asset_id
             )
-            .where(ProcessingRun.is_active.is_(True))
+            current_projection_exists = select(
+                UnitSearchProjection.asset_id
+            ).where(
+                UnitSearchProjection.asset_id == DocumentUnit.asset_id,
+                UnitSearchProjection.retrieval_rules_version
+                == tokenizer.RETRIEVAL_RULES_VERSION,
+                or_(
+                    and_(
+                        UnitSearchProjection.body_search_windowed.is_(False),
+                        ~body_window_exists.exists(),
+                    ),
+                    and_(
+                        UnitSearchProjection.body_search_windowed.is_(True),
+                        body_window_exists.exists(),
+                    ),
+                ),
+            )
+            unit_exists = unit_exists.where(~current_projection_exists.exists())
+        stmt = select(ProcessingRun.processing_run_id).where(
+            ProcessingRun.is_active.is_(True),
+            unit_exists.exists(),
         )
+        if not full:
+            stmt = stmt.where(
+                or_(
+                    ProcessingRun.search_projection_error.is_(None),
+                    ProcessingRun.search_projection_error[
+                        "retrieval_rules_version"
+                    ].as_string()
+                    != tokenizer.RETRIEVAL_RULES_VERSION,
+                )
+            )
         if after is not None:
-            stmt = stmt.where(DocumentUnit.asset_id > after)
-        return stmt.order_by(DocumentUnit.asset_id)
-
-    def _missing_stmt(self, *, after: str | None) -> Any:
-        # NOT EXISTS (not an OUTER JOIN + OR) so the planner may pick a
-        # merge anti-join over the two asset_id PKs; see execute() pass 1.
-        return self._active_units_stmt(after=after).where(
-            ~select(UnitSearchProjection.asset_id)
-            .where(UnitSearchProjection.asset_id == DocumentUnit.asset_id)
-            .exists()
-        )
-
-    def _stale_stmt(self, *, after: str | None) -> Any:
-        stmt = select(UnitSearchProjection.asset_id).where(
-            UnitSearchProjection.retrieval_rules_version
-            != tokenizer.RETRIEVAL_RULES_VERSION
-        )
-        if after is not None:
-            stmt = stmt.where(UnitSearchProjection.asset_id > after)
-        return stmt.order_by(UnitSearchProjection.asset_id)
+            stmt = stmt.where(ProcessingRun.processing_run_id > after)
+        return stmt.order_by(ProcessingRun.processing_run_id)
 
     def _counts(self, session: Session) -> tuple[int, int]:
         # |projection| via index-only count; |active units| via the run
@@ -318,92 +333,118 @@ class BuildSearchProjection:
         )
         active_count = int(
             session.execute(
-                select(func.count()).select_from(
-                    self._active_units_stmt(after=None)
-                    .order_by(None)
-                    .subquery()
+                select(func.count())
+                .select_from(DocumentUnit)
+                .join(
+                    ProcessingRun,
+                    ProcessingRun.processing_run_id
+                    == DocumentUnit.processing_run_id,
                 )
+                .where(ProcessingRun.is_active.is_(True))
             ).scalar()
             or 0
         )
         return projection_count, active_count
 
-    def _counts_diverge(self, session: Session) -> bool:
-        projection_count, active_count = self._counts(session)
-        return projection_count != active_count
-
-    # In-flight margin for the missing-scan floor: a unit's ULID is minted
-    # inside BuildUnits moments before its transaction commits, so ids can
-    # land in the table at most minutes below the projected maximum. Two
-    # hours is deliberately extravagant — the recount fallback, not this
-    # margin, carries exactness.
-    _MISSING_FLOOR_BACKOFF_MS = 2 * 60 * 60 * 1000
-
-    def _missing_scan_floor(self, session: Session) -> str | None:
-        max_projected = session.execute(
-            select(func.max(UnitSearchProjection.asset_id))
-        ).scalar()
-        if not max_projected:
-            return None
-        return ids.id_time_floor(
-            str(max_projected), backoff_ms=self._MISSING_FLOOR_BACKOFF_MS
-        )
-
-    def _stale_rows_exist(self, session: Session) -> bool:
-        # ``!=`` is not btree-servable, but its two open ranges are: one
-        # probe below the current version, one above, each an instant index
-        # range scan on retrieval_rules_version.
-        current = tokenizer.RETRIEVAL_RULES_VERSION
-        below = (
-            select(UnitSearchProjection.asset_id)
-            .where(UnitSearchProjection.retrieval_rules_version < current)
-            .exists()
-        )
-        above = (
-            select(UnitSearchProjection.asset_id)
-            .where(UnitSearchProjection.retrieval_rules_version > current)
-            .exists()
-        )
-        return bool(session.execute(select(below | above)).scalar())
-
-    def _pending_count(
+    # -- mutation -----------------------------------------------------------
+    def _replace_run(
         self,
         session: Session,
+        processing_run_id: str,
         *,
-        full: bool,
-        after: str | None,
-        stale_after: str | None = None,
+        built_at: datetime,
     ) -> int:
-        if full:
-            stmt = self._active_units_stmt(after=after)
-            counted = select(func.count()).select_from(stmt.subquery())
-            return int(session.execute(counted).scalar() or 0)
-        total = 0
-        for pending_stmt in (
-            self._missing_stmt(after=after),
-            self._stale_stmt(after=stale_after),
-        ):
-            counted = select(func.count()).select_from(pending_stmt.subquery())
-            total += int(session.execute(counted).scalar() or 0)
-        return total
+        """Replace one active run's parents and windows in one transaction."""
 
-    # -- mutation -----------------------------------------------------------
-    def _upsert(
-        self, session: Session, asset_ids: Sequence[str], *, built_at: datetime
-    ) -> int:
-        projected = 0
-        upsert_stmt = _upsert_statement()
-        for chunk in _chunked(asset_ids, _BATCH):
-            batch = [
+        try:
+            active = session.execute(
+                select(ProcessingRun.is_active)
+                .where(
+                    ProcessingRun.processing_run_id == processing_run_id
+                )
+                .with_for_update()
+            ).scalar()
+            if active is not True:
+                session.commit()
+                return 0
+
+            units = _load_run_units(session, processing_run_id)
+            computed_rows = [
                 compute_search_projection_row(built_at=built_at, **unit)
-                for unit in _load_units(session, chunk)
+                for unit in units
             ]
-            if not batch:
-                continue
-            session.execute(upsert_stmt, batch)
-            session.flush()
-            projected += len(batch)
-        return projected
+            atom_rows = [
+                {
+                    "asset_id": str(row["asset_id"]),
+                    "atom_index": atom_index,
+                    "atom_text": atom_text,
+                }
+                for row in computed_rows
+                for atom_index, atom_text in enumerate(row.pop("body_atoms"))
+            ]
+            prepared_rows, window_rows = _prepare_search_rows(
+                session, computed_rows
+            )
+            asset_ids = [str(row["asset_id"]) for row in prepared_rows]
+
+            for asset_chunk in _chunked(asset_ids, _BATCH):
+                session.execute(
+                    delete(UnitBodySearchWindow).where(
+                        UnitBodySearchWindow.asset_id.in_(asset_chunk)
+                    )
+                )
+                session.execute(
+                    delete(UnitSearchAtom).where(
+                        UnitSearchAtom.asset_id.in_(asset_chunk)
+                    )
+                )
+            upsert_stmt = _upsert_statement()
+            for row_chunk in _chunked(prepared_rows, _BATCH):
+                session.execute(upsert_stmt, list(row_chunk))
+            for window_chunk in _chunked(window_rows, _BATCH):
+                session.execute(
+                    pg_insert(UnitBodySearchWindow),
+                    list(window_chunk),
+                )
+            for atom_chunk in _chunked(atom_rows, _BATCH):
+                session.execute(pg_insert(UnitSearchAtom), list(atom_chunk))
+            session.execute(
+                update(ProcessingRun)
+                .where(
+                    ProcessingRun.processing_run_id == processing_run_id,
+                    ProcessingRun.is_active.is_(True),
+                )
+                .values(search_projection_error=None)
+            )
+            session.commit()
+            return len(prepared_rows)
+        except BaseException:
+            session.rollback()
+            raise
+
+    def _record_terminal_error(
+        self,
+        session: Session,
+        processing_run_id: str,
+        *,
+        error: dict[str, object],
+    ) -> bool:
+        """Persist a deterministic run failure after replacement rollback."""
+
+        try:
+            result = session.connection().execute(
+                update(ProcessingRun)
+                .where(
+                    ProcessingRun.processing_run_id == processing_run_id,
+                    ProcessingRun.is_active.is_(True),
+                )
+                .values(search_projection_error=error)
+            )
+            session.commit()
+        except BaseException:
+            session.rollback()
+            raise
+        return int(result.rowcount or 0) == 1
 
     def _delete_orphans(
         self, session: Session, *, should_stop: Callable[[], bool] | None = None
@@ -414,7 +455,7 @@ class BuildSearchProjection:
         deactivates old runs corpus-wide, so the orphan set can reach unit
         scale in one wave. One unbatched DELETE would ride a single giant
         transaction (WAL spike, long row locks); instead fetch ids in bounded
-        scans and delete in ``_BATCH_SIZE`` chunks with a commit per chunk.
+        scans and delete in bounded chunks with a commit per chunk.
         Deleting a live unit's row is impossible to make permanent: each
         chunk deletes only ids the committed snapshot saw as inactive, and
         any row racing back to active is re-added by the next delta pass.
@@ -449,10 +490,10 @@ class BuildSearchProjection:
             )
             if not orphan_ids:
                 return deleted
-            for start in range(0, len(orphan_ids), self._BATCH_SIZE):
+            for start in range(0, len(orphan_ids), _BATCH):
                 if should_stop is not None and should_stop():
                     return deleted
-                chunk = orphan_ids[start : start + self._BATCH_SIZE]
+                chunk = orphan_ids[start : start + _BATCH]
                 # Route DML through the session's transactional connection:
                 # its ``CursorResult.rowcount`` is the prune count (the ORM
                 # ``Session.execute`` return type does not expose rowcount).
@@ -469,7 +510,9 @@ class BuildSearchProjection:
                 return deleted
 
 
-def _load_units(session: Session, asset_ids: Sequence[str]) -> list[dict[str, Any]]:
+def _load_run_units(
+    session: Session, processing_run_id: str
+) -> list[dict[str, Any]]:
     stmt = select(
         DocumentUnit.asset_id,
         DocumentUnit.title,
@@ -477,7 +520,10 @@ def _load_units(session: Session, asset_ids: Sequence[str]) -> list[dict[str, An
         DocumentUnit.payload_kind,
         DocumentUnit.payload,
         DocumentUnit.semantic_keys,
-    ).where(DocumentUnit.asset_id.in_(asset_ids))
+        DocumentUnit.artifact_locator,
+    ).where(
+        DocumentUnit.processing_run_id == processing_run_id
+    ).order_by(DocumentUnit.asset_id)
     return [
         {
             "asset_id": row.asset_id,
@@ -486,9 +532,192 @@ def _load_units(session: Session, asset_ids: Sequence[str]) -> list[dict[str, An
             "payload_kind": row.payload_kind,
             "payload": row.payload,
             "semantic_keys": row.semantic_keys,
+            "artifact_locator": row.artifact_locator,
         }
         for row in session.execute(stmt).all()
     ]
+
+
+def _prepare_search_rows(
+    session: Session,
+    parent_rows: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Prove every parent vector and derive lossless body windows when needed."""
+
+    prepared = [dict(row) for row in parent_rows]
+    full_safety = _probe_search_vector_safety(
+        session,
+        [
+            (
+                str(row["title_tokens"]),
+                str(row["path_tokens"]),
+                str(row["body_tokens"]),
+                str(row["key_tokens"]),
+            )
+            for row in prepared
+        ],
+    )
+    unsafe_indices: list[int] = []
+    for row_index, safe in enumerate(full_safety):
+        prepared[row_index]["body_search_windowed"] = not safe
+        if not safe:
+            unsafe_indices.append(row_index)
+    if not unsafe_indices:
+        return prepared, []
+
+    metadata_safety = _probe_search_vector_safety(
+        session,
+        [
+            (
+                str(prepared[row_index]["title_tokens"]),
+                str(prepared[row_index]["path_tokens"]),
+                "",
+                str(prepared[row_index]["key_tokens"]),
+            )
+            for row_index in unsafe_indices
+        ],
+    )
+    tokens_by_row: dict[int, tuple[str, ...]] = {}
+    for row_index, safe in zip(
+        unsafe_indices, metadata_safety, strict=True
+    ):
+        asset_id = str(prepared[row_index]["asset_id"])
+        if not safe:
+            raise SearchProjectionSafetyError(
+                "search_projection_metadata_vector_unsafe: "
+                f"asset_id={asset_id}"
+            )
+        body_tokens = str(prepared[row_index]["body_tokens"])
+        tokens = tuple(body_tokens.split(" ")) if body_tokens else ()
+        if (
+            not tokens
+            or any(not token for token in tokens)
+            or " ".join(tokens) != body_tokens
+        ):
+            raise SearchProjectionSafetyError(
+                "search_projection_empty_or_noncanonical_body: "
+                f"asset_id={asset_id}"
+            )
+        tokens_by_row[row_index] = tokens
+
+    pending = [
+        _BodyRange(row_index=row_index, start=0, end=len(tokens))
+        for row_index, tokens in tokens_by_row.items()
+    ]
+    accepted: dict[int, list[_BodyRange]] = {
+        row_index: [] for row_index in unsafe_indices
+    }
+    while pending:
+        range_safety = _probe_search_vector_safety(
+            session,
+            [
+                (
+                    "",
+                    "",
+                    " ".join(
+                        tokens_by_row[item.row_index][item.start : item.end]
+                    ),
+                    "",
+                )
+                for item in pending
+            ],
+        )
+        next_pending: list[_BodyRange] = []
+        for item, safe in zip(pending, range_safety, strict=True):
+            if safe:
+                accepted[item.row_index].append(item)
+                continue
+            if item.end - item.start == 1:
+                token = tokens_by_row[item.row_index][item.start]
+                raise SearchProjectionSafetyError(
+                    "search_projection_unsplittable_body_token: "
+                    f"asset_id={prepared[item.row_index]['asset_id']} "
+                    f"token_index={item.start} "
+                    f"token_utf8_bytes={len(token.encode('utf-8'))}"
+                )
+            midpoint = item.start + (item.end - item.start) // 2
+            next_pending.extend(
+                (
+                    _BodyRange(item.row_index, item.start, midpoint),
+                    _BodyRange(item.row_index, midpoint, item.end),
+                )
+            )
+        pending = next_pending
+
+    window_rows: list[dict[str, Any]] = []
+    for row_index in unsafe_indices:
+        tokens = tokens_by_row[row_index]
+        ranges = sorted(
+            accepted[row_index],
+            key=lambda item: (item.start, item.end),
+        )
+        cursor = 0
+        for window_index, item in enumerate(ranges):
+            if item.start != cursor or item.end <= item.start:
+                raise SearchProjectionSafetyError(
+                    "search_projection_window_coverage_gap: "
+                    f"asset_id={prepared[row_index]['asset_id']}"
+                )
+            window_rows.append(
+                {
+                    "asset_id": str(prepared[row_index]["asset_id"]),
+                    "window_index": window_index,
+                    "body_token_start": item.start,
+                    "body_token_end": item.end,
+                    "body_tokens": " ".join(tokens[item.start : item.end]),
+                }
+            )
+            cursor = item.end
+        if cursor != len(tokens):
+            raise SearchProjectionSafetyError(
+                "search_projection_window_coverage_incomplete: "
+                f"asset_id={prepared[row_index]['asset_id']}"
+            )
+    return prepared, window_rows
+
+
+def _probe_search_vector_safety(
+    session: Session,
+    candidates: Sequence[tuple[str, str, str, str]],
+) -> list[bool]:
+    """Bulk-evaluate PostgreSQL's exact source-occurrence safety predicate."""
+
+    results: list[bool | None] = [None] * len(candidates)
+    for start in range(0, len(candidates), _PROBE_BATCH):
+        chunk = candidates[start : start + _PROBE_BATCH]
+        candidate_values = values(
+            column("ordinal", Integer),
+            column("title_tokens", Text),
+            column("path_tokens", Text),
+            column("body_tokens", Text),
+            column("key_tokens", Text),
+            name="search_probe",
+        ).data(
+            [
+                (start + offset, *candidate)
+                for offset, candidate in enumerate(chunk)
+            ]
+        )
+        statement = (
+            select(
+                candidate_values.c.ordinal,
+                func.disclosure_core.search_tsvector_is_safe(
+                    candidate_values.c.title_tokens,
+                    candidate_values.c.path_tokens,
+                    candidate_values.c.body_tokens,
+                    candidate_values.c.key_tokens,
+                ).label("is_safe"),
+            )
+            .select_from(candidate_values)
+            .order_by(candidate_values.c.ordinal)
+        )
+        for ordinal, is_safe in session.execute(statement):
+            results[int(ordinal)] = bool(is_safe)
+    if any(result is None for result in results):
+        raise SearchProjectionSafetyError(
+            "search_projection_safety_probe_incomplete"
+        )
+    return [bool(result) for result in results]
 
 
 def _upsert_statement() -> Any:
@@ -500,7 +729,10 @@ def _upsert_statement() -> Any:
     )
 
 
-def _chunked(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
+_T = TypeVar("_T")
+
+
+def _chunked(items: Sequence[_T], size: int) -> Iterator[Sequence[_T]]:
     for start in range(0, len(items), size):
         yield items[start : start + size]
 
@@ -514,114 +746,37 @@ def compute_search_projection_row(
     payload_kind: str,
     payload: Mapping[str, Any] | None,
     semantic_keys: Sequence[str] | None,
+    artifact_locator: Mapping[str, Any] | None,
     built_at: datetime,
 ) -> dict[str, Any]:
     """Deterministic projection row for one unit (no ``search_tsv`` — generated)."""
 
     title_text = title or ""
     heading_path_text = " > ".join(str(item) for item in heading_path or [])
-    body_text = linearize_body(payload_kind, payload or {})
+    body_atoms = tuple(
+        normalized
+        for value in search_text_values(
+            payload_kind=payload_kind,
+            payload=payload or {},
+            artifact_locator=artifact_locator,
+        )
+        if (normalized := tokenizer.normalize_search_text(value)).strip()
+    )
+    body_text = " ".join(body_atoms)
     return {
         "asset_id": asset_id,
         "retrieval_rules_version": tokenizer.RETRIEVAL_RULES_VERSION,
         "title_text": title_text,
         "heading_path_text": heading_path_text,
-        "title_tokens": tokenizer.tokenize(title_text),
-        "path_tokens": tokenizer.tokenize(heading_path_text),
-        "body_tokens": tokenizer.tokenize(body_text),
+        "title_tokens": tokenizer.index_word_tokens(title_text),
+        "path_tokens": tokenizer.index_word_tokens(heading_path_text),
+        "body_tokens": tokenizer.index_word_tokens(body_text),
+        # Private handoff to the run-atomic child insert; not a parent column.
+        "body_atoms": body_atoms,
         # Semantic keys are controlled ASCII tokens; they bypass segmentation.
         "key_tokens": " ".join(semantic_keys or []),
-        "header_row_candidate": header_row_candidate(payload_kind, payload or {}),
+        # Retained until the DB compatibility column is retired. New
+        # projections never infer a header role from cell text.
+        "header_row_candidate": False,
         "built_at": built_at,
     }
-
-
-def linearize_body(payload_kind: str, payload: Mapping[str, Any]) -> str:
-    """Milestone 06R §4 body linearization, keyed on ``payload_kind``.
-
-    text  -> payload["text"]; table -> caption + unit + headers + row cells +
-    notes (EXCLUDING ``raw_html`` so tag noise never enters tokens); mixed ->
-    each part in order, recursively; anything else -> empty.
-    """
-
-    if payload_kind == "text":
-        return str(payload.get("text") or "")
-    if payload_kind == "table":
-        return _linearize_table(payload)
-    if payload_kind == "mixed":
-        return _linearize_parts(payload.get("parts") or [])
-    return ""
-
-
-def _linearize_table(payload: Mapping[str, Any]) -> str:
-    headers = payload.get("headers") or []
-    rows = payload.get("rows") or []
-    return " ".join(
-        [str(value) for value in payload.get("caption") or []]
-        + [str(payload.get("unit") or "")]
-        + [str(cell) for cell in headers]
-        + [str(cell) for row in rows for cell in row or []]
-        + [str(value) for value in payload.get("notes") or []]
-    )
-
-
-def _linearize_parts(parts: Iterable[Any]) -> str:
-    return " ".join(
-        _linearize_part(part) for part in parts if isinstance(part, Mapping)
-    )
-
-
-def _linearize_part(part: Mapping[str, Any]) -> str:
-    kind = str(part.get("kind", "text"))
-    if kind == "table":
-        return _linearize_table(part)
-    if kind == "image":
-        return " ".join(
-            piece
-            for piece in (
-                str(part.get("caption") or ""),
-                str(part.get("context") or ""),
-            )
-            if piece
-        )
-    if kind == "mixed":
-        return _linearize_parts(part.get("parts") or [])
-    return str(part.get("text") or "")
-
-
-def header_row_candidate(payload_kind: str, payload: Mapping[str, Any]) -> bool:
-    """Milestone 06R §4/§5 diagnostic: a headerless table whose first row is a
-    de-facto header (all-text labels) followed by numeric data rows.
-
-    A td-only numeric table (MinerU emitted no ``<th>`` so ``headers`` is empty
-    and the label row landed in ``rows``) flags true. KV forms fail because
-    their first row already pairs a label with a numeric value; tables with real
-    headers and single-row tables fail their own guards. Misjudgment only mis-
-    weights retrieval — it never touches the L1 evidence payload.
-    """
-
-    if payload_kind != "table":
-        return False
-    if any(str(cell).strip() for cell in payload.get("headers") or []):
-        return False
-    rows = payload.get("rows") or []
-    if len(rows) < 2:
-        return False
-    first_row = [str(cell).strip() for cell in rows[0] or []]
-    if not first_row or any(not cell for cell in first_row):
-        return False
-    if any(_is_numeric_cell(cell) for cell in first_row):
-        return False
-    return any(
-        _is_numeric_cell(str(cell).strip())
-        for row in rows[1:]
-        for cell in row or []
-    )
-
-
-def _is_numeric_cell(cell: str) -> bool:
-    # Milestone 06R §4 "含货币量级词": a magnitude-suffixed amount ("1,234.56
-    # 万元") is numeric. The suffix vocabulary is the existing controlled
-    # unit-declaration table (rules._DECL_MAGNITUDE), not a new phrase list.
-    stripped = _MAGNITUDE_SUFFIX_RE.sub("", cell.strip())
-    return bool(_NUMERIC_CELL_RE.match(stripped or cell.strip()))

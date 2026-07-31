@@ -9,6 +9,7 @@ from disclosure_anchor.adapters.runtime.doctor import (
     CheckResult,
     _check_unit_snapshot_aggregate,
     _invalid_process_class_overrides,
+    inventory_orphan_files,
     running_run_liveness_checks,
     run_doctor,
     run_startup_preflight,
@@ -340,6 +341,77 @@ class UnitSnapshotAggregateCheckTests(unittest.TestCase):
             )
             self.assertFalse(result.ok)
             self.assertIn("missing file", result.message)
+
+
+class OrphanFileInventoryTests(unittest.TestCase):
+    def test_prefix_mode_matches_only_exact_path_ancestors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data"
+            parser_root = data_root / "parser_artifacts"
+            owned_nested = parser_root / "run_1" / "nested" / "content.json"
+            owned_exact = parser_root / "standalone.json"
+            prefix_collision = parser_root / "run_10" / "content.json"
+            sibling = parser_root / "run_2" / "content.json"
+            for path in (
+                owned_nested,
+                owned_exact,
+                prefix_collision,
+                sibling,
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("x", encoding="utf-8")
+
+            orphans = inventory_orphan_files(
+                parser_root,
+                data_root=data_root,
+                expected_relpaths={
+                    "parser_artifacts/run_1",
+                    "parser_artifacts/standalone.json",
+                },
+                prefix_match=True,
+            )
+
+        self.assertEqual(
+            sorted(orphans),
+            [
+                "parser_artifacts/run_10/content.json",
+                "parser_artifacts/run_2/content.json",
+            ],
+        )
+
+    def test_empty_expected_set_marks_every_file_orphan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data"
+            parser_root = data_root / "parser_artifacts"
+            path = parser_root / "run" / "content.json"
+            path.parent.mkdir(parents=True)
+            path.write_text("x", encoding="utf-8")
+
+            orphans = inventory_orphan_files(
+                parser_root,
+                data_root=data_root,
+                expected_relpaths=set(),
+                prefix_match=True,
+            )
+
+        self.assertEqual(orphans, ["parser_artifacts/run/content.json"])
+
+    def test_exact_mode_does_not_treat_directory_as_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data"
+            raw_root = data_root / "raw_documents"
+            path = raw_root / "owner" / "document.pdf"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"%PDF-")
+
+            orphans = inventory_orphan_files(
+                raw_root,
+                data_root=data_root,
+                expected_relpaths={"raw_documents/owner"},
+                prefix_match=False,
+            )
+
+        self.assertEqual(orphans, ["raw_documents/owner/document.pdf"])
 
 
 if __name__ == "__main__":

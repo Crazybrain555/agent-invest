@@ -29,6 +29,7 @@ from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     INDEX_INTERFACE,
     WEB_INDEX_INTERFACE,
 )
+from disclosure_anchor.application.worker.locks import shared_corpus_writer
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import (
@@ -95,6 +96,14 @@ class DownloadDocument:
             )
 
     def execute(self, command: DownloadDocumentCommand) -> DownloadDocumentResult:
+        # Provider bytes, tmp/quarantine/raw files, and their database
+        # ownership record are admitted as one corpus-write lifecycle.
+        with shared_corpus_writer(self._uow_factory):
+            return self._execute_admitted(command)
+
+    def _execute_admitted(
+        self, command: DownloadDocumentCommand
+    ) -> DownloadDocumentResult:
         candidate = command.candidate
         # Every failure below must land as a status='failed' download
         # source_access: the retry budget and the dead-letter cutoff in

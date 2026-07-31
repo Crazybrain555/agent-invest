@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
 import tempfile
 import unittest
 
 from disclosure_anchor.application.contracts.normalized_ir import (
     CURRENT_NORMALIZED_IR_VERSION,
+    normalized_ir_filename,
+)
+from disclosure_anchor.application.contracts.document_structure import (
+    DOCUMENT_STRUCTURE_ALGORITHM,
+    DOCUMENT_STRUCTURE_VERSION,
+    carrier_set_sha256,
 )
 from disclosure_anchor.application.use_cases.publish_run import (
     NormalizedIRPublicationGuard,
@@ -25,6 +30,7 @@ from disclosure_anchor.domain.services.unit_hashing import (
     content_hash_aggregate,
     structure_hash_aggregate,
 )
+from tests.unit._current_ir import write_text_ir_bundle
 from tests.unit._fakes import FakeUnitOfWork
 
 
@@ -92,6 +98,7 @@ def _run(
     return e.ProcessingRun(
         processing_run_id=run_id,
         document_id="doc_1",
+        artifact_owner_processing_run_id=run_id,
         run_kind="parse",
         status="succeeded",
         unit_build_status="succeeded",
@@ -142,11 +149,14 @@ class _UnreadablePathBuilder(_PathBuilder):
 
 
 def _normalized_ir(*, full_pdf: bool) -> dict[str, object]:
+    elements: list[dict[str, object]] = []
     return {
         "contract_version": CURRENT_NORMALIZED_IR_VERSION,
         "created_at": "2026-07-25T00:00:00Z",
         "document_id": "doc_1",
         "source_pdf": "raw.pdf",
+        "source_pdf_sha256": "sha256:" + "a" * 64,
+        "source_pdf_page_count": 1,
         "title": "公告",
         "parser": {
             "name": "MinerU",
@@ -156,26 +166,72 @@ def _normalized_ir(*, full_pdf: bool) -> dict[str, object]:
             "language": "ch",
             "formula": False,
             "table": True,
+            "effort": None,
+            "image_analysis": False,
         },
         "parser_artifacts": {
             "artifact_root_relpath": "parser/a",
-            "content_list_relpath": "parser/a/content.json",
+            "files": {
+                "content_list": {
+                    "availability": "present",
+                    "relpath": "parser/a/content.json",
+                    "sha256": "sha256:" + ("a" * 64),
+                    "size_bytes": 2,
+                },
+                "model": {
+                    "availability": "present",
+                    "relpath": "parser/a/model.json",
+                    "sha256": "sha256:" + ("d" * 64),
+                    "size_bytes": 2,
+                },
+                "pdf_structure": {
+                    "availability": "present",
+                    "relpath": "parser/a/pdf_structure.json",
+                    "sha256": "sha256:" + ("b" * 64),
+                    "size_bytes": 2,
+                },
+                "source_evidence": {
+                    "availability": "present",
+                    "relpath": "parser/a/source_evidence.json",
+                    "sha256": "sha256:" + ("c" * 64),
+                    "size_bytes": 2,
+                },
+            },
         },
         "parsed_pages": {
             "start_page_no": 1,
             "end_page_no": 1,
             "full_pdf": full_pdf,
         },
-        "elements": [
-            {
-                "ir_id": "ir_1",
-                "kind": "text",
-                "raw_kind": "text",
-                "order_index": 1,
-                "source_item_index": 1,
-                "text": "正文",
+        "elements": elements,
+        "parser_diagnostics": {
+            "table_reconciliation": {
+                "algorithm_version": "mineru-page-local-table-closure.v6",
+                "model_hash": "sha256:" + ("d" * 64),
+                "content_tables": 0,
+                "model_tables": 0,
+                "matched_tables": 0,
+                "page_local_closed": True,
             }
-        ],
+        },
+        "structure_proof": {
+            "contract_version": DOCUMENT_STRUCTURE_VERSION,
+            "algorithm_version": DOCUMENT_STRUCTURE_ALGORITHM,
+            "source_pdf_sha256": "sha256:" + "a" * 64,
+            "source_pdf_page_count": 1,
+            "carrier_set_sha256": carrier_set_sha256(elements),
+            "native": {
+                "status": "untagged",
+                "artifact_role": "pdf_structure",
+            },
+            "headings": [],
+            "page_frames": [],
+            "conflicts": [],
+            "coverage": {
+                "heading_nodes": 0,
+                "page_frame_groups": 0,
+            },
+        },
     }
 
 
@@ -238,16 +294,14 @@ class PublishRunTests(unittest.TestCase):
     def test_built_partial_pdf_is_rejected_before_publish_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            relpath = Path("normalized_ir.v3.json")
-            raw = json.dumps(
-                _normalized_ir(full_pdf=False),
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            ).encode("utf-8")
-            (root / relpath).write_bytes(raw)
+            relpath = Path(normalized_ir_filename())
+            normalized_ir = write_text_ir_bundle(
+                root, relpath, full_pdf=False
+            )
+            raw = (root / relpath).read_bytes()
             uow = _uow_with_document()
             run = _run("run_partial")
+            run.parser_target_identity = normalized_ir["parser"]
             run.normalized_ir_relpath = str(relpath)
             run.artifact_hash = "sha256:" + hashlib.sha256(raw).hexdigest()
             uow.processing_runs.add(run)
@@ -278,7 +332,7 @@ class PublishRunTests(unittest.TestCase):
 
         unavailable_uow = _uow_with_document()
         unavailable_run = _run("run_storage_outage")
-        unavailable_run.normalized_ir_relpath = "normalized_ir.v3.json"
+        unavailable_run.normalized_ir_relpath = normalized_ir_filename()
         unavailable_uow.processing_runs.add(unavailable_run)
         unavailable_uow.document_units.add(
             _unit("du_storage_outage", "run_storage_outage")

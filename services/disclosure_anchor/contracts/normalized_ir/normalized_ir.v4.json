@@ -1,0 +1,1401 @@
+{
+  "$comment": "Canonical source: src/disclosure_anchor/application/contracts/schema_sources/normalized_ir.v4.json. The contracts/normalized_ir/normalized_ir.v4.json artifact is generated.",
+  "$defs": {
+    "current_element_base": {
+      "properties": {
+        "bbox": {
+          "items": false,
+          "maxItems": 4,
+          "minItems": 4,
+          "prefixItems": [
+            {
+              "maximum": 1000,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "maximum": 1000,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "maximum": 1000,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "maximum": 1000,
+              "minimum": 0,
+              "type": "number"
+            }
+          ],
+          "type": "array"
+        },
+        "ir_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "text",
+            "table",
+            "image",
+            "equation",
+            "page_furniture",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "order_index": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "page_idx": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "page_no": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "raw_kind": {
+          "type": "string"
+        },
+        "source_item_index": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_item_sha256": {
+          "$ref": "#/$defs/sha256_ref"
+        }
+      },
+      "required": [
+        "ir_id",
+        "kind",
+        "raw_kind",
+        "order_index",
+        "source_item_index",
+        "source_item_sha256",
+        "page_idx",
+        "page_no",
+        "bbox"
+      ],
+      "type": "object"
+    },
+    "parser_artifact_descriptor": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "availability": {
+              "const": "not_emitted"
+            }
+          },
+          "required": [
+            "availability"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "availability": {
+              "const": "present"
+            },
+            "relpath": {
+              "$ref": "#/$defs/relative_path"
+            },
+            "sha256": {
+              "pattern": "^sha256:[a-f0-9]{64}$",
+              "type": "string"
+            },
+            "size_bytes": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "availability",
+            "relpath",
+            "sha256",
+            "size_bytes"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "present_parser_artifact_descriptor": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/parser_artifact_descriptor"
+        },
+        {
+          "properties": {
+            "availability": {
+              "const": "present"
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "relative_path": {
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "^/"
+          },
+          {
+            "pattern": "^[A-Za-z]:/"
+          },
+          {
+            "pattern": "(^|/)\\.\\.?(/|$)"
+          },
+          {
+            "pattern": "\\\\"
+          },
+          {
+            "pattern": "//"
+          },
+          {
+            "pattern": "/$"
+          },
+          {
+            "pattern": "^file:"
+          }
+        ]
+      },
+      "type": "string"
+    },
+    "sha256_ref": {
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "type": "string"
+    },
+    "structure_conflict": {
+      "additionalProperties": false,
+      "properties": {
+        "bookmark_order": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "native_node_id": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "native_roles": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "relation": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_item_indices": {
+          "items": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "relation",
+        "source_item_indices"
+      ],
+      "type": "object"
+    },
+    "structure_heading": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "native_node_id"
+                  ]
+                },
+                {
+                  "required": [
+                    "native_role"
+                  ]
+                },
+                {
+                  "required": [
+                    "native_segment_id"
+                  ]
+                }
+              ]
+            }
+          },
+          "if": {
+            "properties": {
+              "evidence_kinds": {
+                "contains": {
+                  "const": "struct_tree"
+                }
+              }
+            },
+            "required": [
+              "evidence_kinds"
+            ]
+          },
+          "then": {
+            "required": [
+              "native_node_id",
+              "native_role",
+              "native_segment_id"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "evidence_kinds": {
+          "items": {
+            "enum": [
+              "bookmark",
+              "mineru_v2_title",
+              "printed_toc",
+              "struct_tree"
+            ]
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "heading_level": {
+          "maximum": 32,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "native_node_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "native_role": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "native_segment_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "node_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "parent_node_id": {
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "propagates": {
+          "type": "boolean"
+        },
+        "section_span": {
+          "items": false,
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "minimum": 0,
+              "type": "integer"
+            }
+          ],
+          "type": "array"
+        },
+        "source_refs": {
+          "items": {
+            "$ref": "#/$defs/structure_source_ref"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "node_id",
+        "heading_level",
+        "parent_node_id",
+        "propagates",
+        "section_span",
+        "source_refs",
+        "evidence_kinds"
+      ],
+      "type": "object"
+    },
+    "structure_page_frame": {
+      "additionalProperties": false,
+      "properties": {
+        "group_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "member_source_item_indices": {
+          "items": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "proof_kind": {
+          "enum": [
+            "native_artifact"
+          ]
+        },
+        "representative_source_item_index": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "role": {
+          "enum": [
+            "running_furniture"
+          ]
+        }
+      },
+      "required": [
+        "group_id",
+        "member_source_item_indices",
+        "proof_kind",
+        "representative_source_item_index",
+        "role"
+      ],
+      "type": "object"
+    },
+    "structure_proof": {
+      "additionalProperties": false,
+      "properties": {
+        "algorithm_version": {
+          "const": "document-structure-evidence.v8"
+        },
+        "carrier_set_sha256": {
+          "$ref": "#/$defs/sha256_ref"
+        },
+        "conflicts": {
+          "items": {
+            "$ref": "#/$defs/structure_conflict"
+          },
+          "type": "array"
+        },
+        "contract_version": {
+          "const": "document_structure.v1"
+        },
+        "coverage": {
+          "additionalProperties": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "headings": {
+          "items": {
+            "$ref": "#/$defs/structure_heading"
+          },
+          "type": "array"
+        },
+        "native": {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_role": {
+              "const": "pdf_structure"
+            },
+            "status": {
+              "enum": [
+                "malformed",
+                "partial",
+                "untagged",
+                "usable"
+              ]
+            }
+          },
+          "required": [
+            "artifact_role",
+            "status"
+          ],
+          "type": "object"
+        },
+        "page_frames": {
+          "items": {
+            "$ref": "#/$defs/structure_page_frame"
+          },
+          "type": "array"
+        },
+        "source_pdf_page_count": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "source_pdf_sha256": {
+          "$ref": "#/$defs/sha256_ref"
+        }
+      },
+      "required": [
+        "algorithm_version",
+        "carrier_set_sha256",
+        "conflicts",
+        "contract_version",
+        "coverage",
+        "headings",
+        "native",
+        "page_frames",
+        "source_pdf_page_count",
+        "source_pdf_sha256"
+      ],
+      "type": "object"
+    },
+    "structure_source_ref": {
+      "additionalProperties": false,
+      "properties": {
+        "field": {
+          "const": "text"
+        },
+        "source_item_index": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text_span": {
+          "items": false,
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "minimum": 1,
+              "type": "integer"
+            }
+          ],
+          "type": "array"
+        }
+      },
+      "required": [
+        "source_item_index",
+        "field",
+        "text_span"
+      ],
+      "type": "object"
+    },
+    "table_cell": {
+      "additionalProperties": false,
+      "properties": {
+        "col": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "colspan": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "is_header": {
+          "type": "boolean"
+        },
+        "row": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rowspan": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "row",
+        "col",
+        "rowspan",
+        "colspan",
+        "text",
+        "is_header"
+      ],
+      "type": "object"
+    },
+    "table_embedded_media": {
+      "additionalProperties": false,
+      "properties": {
+        "alt_text": {
+          "type": "string"
+        },
+        "artifact_role": {
+          "pattern": "^evidence_table_media_[0-9]{6}_[0-9]{6}$",
+          "type": "string"
+        },
+        "cell_media_index": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "col": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "colspan": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "image_path": {
+          "$ref": "#/$defs/relative_path"
+        },
+        "occurrence_index": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "row": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rowspan": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "semantic_text": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "title_text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "occurrence_index",
+        "cell_media_index",
+        "row",
+        "col",
+        "rowspan",
+        "colspan",
+        "image_path",
+        "artifact_role"
+      ],
+      "type": "object"
+    },
+    "table_grid": {
+      "additionalProperties": false,
+      "properties": {
+        "cells": {
+          "items": {
+            "$ref": "#/$defs/table_cell"
+          },
+          "type": "array"
+        },
+        "embedded_media": {
+          "items": {
+            "$ref": "#/$defs/table_embedded_media"
+          },
+          "type": "array"
+        },
+        "headers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "merged_cells": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "col": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "colspan": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "row": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "rowspan": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "row",
+              "col",
+              "rowspan",
+              "colspan"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "rows": {
+          "items": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "headers",
+        "rows",
+        "cells",
+        "embedded_media"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://local.disclosure-anchor/contracts/normalized_ir.v4.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "not": {
+        "required": [
+          "native_text"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "normalized_ir.v4"
+    },
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "document_id": {
+      "type": "string"
+    },
+    "elements": {
+      "items": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/$defs/current_element_base"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "const": "text"
+                  },
+                  "raw_kind": {
+                    "const": "text"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "text_level": {
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            ],
+            "unevaluatedProperties": false
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/$defs/current_element_base"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "const": "text"
+                  },
+                  "raw_kind": {
+                    "enum": [
+                      "ref_text",
+                      "phonetic",
+                      "aside_text",
+                      "page_footnote"
+                    ]
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            ],
+            "unevaluatedProperties": false
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/$defs/current_element_base"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "const": "page_furniture"
+                  },
+                  "raw_kind": {
+                    "enum": [
+                      "header",
+                      "footer",
+                      "page_number"
+                    ]
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            ],
+            "unevaluatedProperties": false
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/$defs/current_element_base"
+              },
+              {
+                "properties": {
+                  "image_path": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "kind": {
+                    "const": "table"
+                  },
+                  "raw_kind": {
+                    "const": "table"
+                  },
+                  "table": {
+                    "$ref": "#/$defs/table_grid"
+                  },
+                  "table_caption": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "table_footnote": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "table_html": {
+                    "minLength": 1,
+                    "pattern": "\\S",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "image_path",
+                  "table",
+                  "table_caption",
+                  "table_footnote",
+                  "table_html"
+                ],
+                "type": "object"
+              }
+            ],
+            "unevaluatedProperties": false
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/$defs/current_element_base"
+              },
+              {
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "text": {
+                          "pattern": "\\S",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "raw_kind",
+                        "text"
+                      ]
+                    },
+                    "then": {
+                      "required": [
+                        "text_provenance",
+                        "image_path"
+                      ]
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "raw_kind": {
+                          "const": "image"
+                        }
+                      },
+                      "required": [
+                        "raw_kind"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "text_provenance": {
+                          "const": "generated_annotation"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "raw_kind": {
+                          "const": "chart"
+                        }
+                      },
+                      "required": [
+                        "raw_kind"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "text_provenance": {
+                          "const": "visual_recognition"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "required": [
+                        "text_provenance"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "text": {
+                          "pattern": "\\S",
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                ],
+                "properties": {
+                  "image_caption": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "image_footnote": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "image_path": {
+                    "minLength": 1,
+                    "pattern": "\\S",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "const": "image"
+                  },
+                  "raw_kind": {
+                    "enum": [
+                      "image",
+                      "chart"
+                    ]
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "text_provenance": {
+                    "enum": [
+                      "generated_annotation",
+                      "visual_recognition"
+                    ]
+                  },
+                  "visual_semantic_text": {
+                    "minLength": 1,
+                    "pattern": "\\S",
+                    "type": "string"
+                  },
+                  "visual_subtype": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "image_caption",
+                  "image_footnote",
+                  "image_path"
+                ],
+                "type": "object"
+              }
+            ],
+            "unevaluatedProperties": false
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/$defs/current_element_base"
+              },
+              {
+                "properties": {
+                  "image_path": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "const": "equation"
+                  },
+                  "raw_kind": {
+                    "const": "equation"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "text_format": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "visual_semantic_text": {
+                    "minLength": 1,
+                    "pattern": "\\S",
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            ],
+            "unevaluatedProperties": false
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/$defs/current_element_base"
+              },
+              {
+                "properties": {
+                  "code_body": {
+                    "minLength": 1,
+                    "pattern": "\\S",
+                    "type": "string"
+                  },
+                  "code_caption": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "code_footnote": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "code_subtype": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "const": "text"
+                  },
+                  "raw_kind": {
+                    "const": "code"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code_body",
+                  "code_caption",
+                  "code_footnote",
+                  "text"
+                ],
+                "type": "object"
+              }
+            ],
+            "unevaluatedProperties": false
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/$defs/current_element_base"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "const": "text"
+                  },
+                  "list_items": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "list_subtype": {
+                    "type": "string"
+                  },
+                  "raw_kind": {
+                    "const": "list"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "list_items"
+                ],
+                "type": "object"
+              }
+            ],
+            "unevaluatedProperties": false
+          }
+        ]
+      },
+      "type": "array"
+    },
+    "parsed_pages": {
+      "additionalProperties": false,
+      "properties": {
+        "end_page_no": {
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "full_pdf": {
+          "type": "boolean"
+        },
+        "start_page_no": {
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "start_page_no",
+        "end_page_no",
+        "full_pdf"
+      ],
+      "type": "object"
+    },
+    "parser": {
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "enum": [
+            "pipeline",
+            "vlm-engine",
+            "vlm-http-client",
+            "hybrid-engine",
+            "hybrid-http-client"
+          ],
+          "type": "string"
+        },
+        "effort": {
+          "enum": [
+            "medium",
+            "high",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "end_page": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "formula": {
+          "type": "boolean"
+        },
+        "full_pdf": {
+          "type": "boolean"
+        },
+        "image_analysis": {
+          "type": "boolean"
+        },
+        "inline_equation_left": {
+          "const": "$"
+        },
+        "inline_equation_right": {
+          "const": "$"
+        },
+        "language": {
+          "type": "string"
+        },
+        "method": {
+          "enum": [
+            "auto",
+            "txt",
+            "ocr"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "package_version": {
+          "type": "string"
+        },
+        "runtime_bundle_identity_sha256": {
+          "pattern": "^sha256:[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "start_page": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "table": {
+          "type": "boolean"
+        },
+        "target_contract_version": {
+          "const": "parser-target.v1"
+        }
+      },
+      "required": [
+        "name",
+        "package_version",
+        "backend",
+        "method",
+        "language",
+        "formula",
+        "table",
+        "effort",
+        "image_analysis",
+        "full_pdf",
+        "start_page",
+        "end_page",
+        "runtime_bundle_identity_sha256",
+        "inline_equation_left",
+        "inline_equation_right",
+        "target_contract_version"
+      ],
+      "type": "object"
+    },
+    "parser_artifacts": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_root_relpath": {
+          "$ref": "#/$defs/relative_path"
+        },
+        "files": {
+          "additionalProperties": {
+            "$ref": "#/$defs/parser_artifact_descriptor"
+          },
+          "minProperties": 1,
+          "properties": {
+            "content_list": {
+              "$ref": "#/$defs/present_parser_artifact_descriptor"
+            },
+            "content_list_v2": {
+              "$ref": "#/$defs/present_parser_artifact_descriptor"
+            },
+            "middle": {
+              "$ref": "#/$defs/present_parser_artifact_descriptor"
+            },
+            "model": {
+              "$ref": "#/$defs/present_parser_artifact_descriptor"
+            },
+            "pdf_structure": {
+              "$ref": "#/$defs/present_parser_artifact_descriptor"
+            },
+            "source_evidence": {
+              "$ref": "#/$defs/present_parser_artifact_descriptor"
+            },
+            "visual_semantics": {
+              "$ref": "#/$defs/present_parser_artifact_descriptor"
+            }
+          },
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "required": [
+            "content_list",
+            "content_list_v2",
+            "middle",
+            "model",
+            "pdf_structure",
+            "source_evidence",
+            "visual_semantics"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "artifact_root_relpath",
+        "files"
+      ],
+      "type": "object"
+    },
+    "parser_diagnostics": {
+      "additionalProperties": true,
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "native_text_shadow"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "table_reconciliation": {
+          "additionalProperties": false,
+          "properties": {
+            "algorithm_version": {
+              "const": "mineru-page-local-table-closure.v6"
+            },
+            "content_tables": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "matched_tables": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "model_hash": {
+              "pattern": "^sha256:[a-f0-9]{64}$",
+              "type": "string"
+            },
+            "model_tables": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "page_local_closed": {
+              "const": true
+            }
+          },
+          "required": [
+            "algorithm_version",
+            "model_hash",
+            "content_tables",
+            "model_tables",
+            "matched_tables",
+            "page_local_closed"
+          ],
+          "type": "object"
+        },
+        "visual_semantics": {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_role": {
+              "const": "visual_semantics"
+            },
+            "artifact_sha256": {
+              "$ref": "#/$defs/sha256_ref"
+            },
+            "contract_version": {
+              "const": "visual-semantics.v1"
+            },
+            "disposition_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "status_counts": {
+              "additionalProperties": false,
+              "properties": {
+                "guard_only": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "semantic_text": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "unresolved": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "semantic_text",
+                "guard_only",
+                "unresolved"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "contract_version",
+            "artifact_role",
+            "artifact_sha256",
+            "disposition_count",
+            "status_counts"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "table_reconciliation",
+        "visual_semantics"
+      ],
+      "type": "object"
+    },
+    "source_pdf": {
+      "type": "string"
+    },
+    "source_pdf_page_count": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "source_pdf_sha256": {
+      "$ref": "#/$defs/sha256_ref"
+    },
+    "structure_proof": {
+      "$ref": "#/$defs/structure_proof"
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "contract_version",
+    "created_at",
+    "document_id",
+    "elements",
+    "parsed_pages",
+    "parser",
+    "parser_artifacts",
+    "parser_diagnostics",
+    "source_pdf",
+    "source_pdf_page_count",
+    "source_pdf_sha256",
+    "structure_proof",
+    "title"
+  ],
+  "title": "NormalizedIR v4",
+  "type": "object"
+}

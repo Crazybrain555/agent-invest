@@ -236,6 +236,11 @@ components:
         document_id:
           title: Document Id
           type: string
+        evidence_refs:
+          items:
+            $ref: '#/components/schemas/EvidenceRefV1'
+          title: Evidence Refs
+          type: array
         exchange:
           anyOf:
           - type: string
@@ -409,6 +414,7 @@ components:
       - content_categories
       - asset_uri
       - is_active_run
+      - evidence_refs
       title: DocumentUnitV1
       type: object
     DocumentV1:
@@ -586,6 +592,7 @@ components:
           - L1_PROCESSING_REQUIRED
           - CONTRACT_VERSION_MISMATCH
           - VALIDATION_ERROR
+          - EVIDENCE_INTEGRITY_ERROR
           type: string
         message:
           type: string
@@ -594,6 +601,28 @@ components:
       - message
       - detail
       title: ErrorEnvelope
+      type: object
+    EvidenceRefV1:
+      additionalProperties: false
+      properties:
+        media_type:
+          title: Media Type
+          type: string
+        sha256:
+          title: Sha256
+          type: string
+        size_bytes:
+          title: Size Bytes
+          type: integer
+        uri:
+          title: Uri
+          type: string
+      required:
+      - uri
+      - sha256
+      - size_bytes
+      - media_type
+      title: EvidenceRefV1
       type: object
     HealthResponse:
       properties:
@@ -661,6 +690,9 @@ components:
           - type: string
           - type: 'null'
           title: Artifact Hash
+        artifact_owner_processing_run_id:
+          title: Artifact Owner Processing Run Id
+          type: string
         builder_rules_version:
           anyOf:
           - type: string
@@ -752,6 +784,7 @@ components:
       required:
       - processing_run_id
       - document_id
+      - artifact_owner_processing_run_id
       - run_kind
       - status
       - parser_name
@@ -844,6 +877,11 @@ components:
         document_id:
           title: Document Id
           type: string
+        evidence_refs:
+          items:
+            $ref: '#/components/schemas/EvidenceRefV1'
+          title: Evidence Refs
+          type: array
         heading_path:
           items:
             type: string
@@ -916,6 +954,7 @@ components:
       - applicability
       - page_no
       - artifact_locator
+      - evidence_refs
       title: SourceRefV1
       type: object
     TrackedCompanyListResponse:
@@ -1061,6 +1100,11 @@ components:
           - type: integer
           - type: 'null'
           title: End
+        evidence_refs:
+          items:
+            $ref: '#/components/schemas/EvidenceRefV1'
+          title: Evidence Refs
+          type: array
         excerpt:
           anyOf:
           - type: string
@@ -1101,6 +1145,7 @@ components:
       - heading_path
       - title
       - payload
+      - evidence_refs
       title: UnitContextResponse
       type: object
     UnitListResponse:
@@ -1850,6 +1895,64 @@ paths:
               schema: *id001
           description: Validation error
       summary: Get Unit Context
+  /v1/units/{asset_id}/evidence/{sha256}:
+    get:
+      operationId: get_unit_evidence_v1_units__asset_id__evidence__sha256__get
+      parameters:
+      - in: path
+        name: asset_id
+        required: true
+        schema:
+          title: Asset Id
+          type: string
+      - in: path
+        name: sha256
+        required: true
+        schema:
+          title: Sha256
+          type: string
+      - *id002
+      responses:
+        '200':
+          content:
+            image/gif:
+              schema:
+                format: binary
+                type: string
+            image/jpeg:
+              schema:
+                format: binary
+                type: string
+            image/png:
+              schema:
+                format: binary
+                type: string
+            image/webp:
+              schema:
+                format: binary
+                type: string
+          description: Hash-verified unit evidence bytes
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '404':
+          content:
+            application/json:
+              schema: *id001
+          description: Not found
+        '422':
+          content:
+            application/json:
+              schema: *id001
+          description: Validation error
+        '500':
+          content:
+            application/json:
+              schema: *id001
+          description: Published evidence failed integrity verification
+      summary: Get Unit Evidence
   /v1/units/{asset_id}/source-ref:
     get:
       operationId: get_unit_source_ref_v1_units__asset_id__source_ref_get

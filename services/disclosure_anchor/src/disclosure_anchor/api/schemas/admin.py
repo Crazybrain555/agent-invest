@@ -59,6 +59,8 @@ class ParserOptionsRequest(AdminModel):
     language: Literal["ch", "en"] | None = None
     formula: bool | None = None
     table: bool | None = None
+    effort: Literal["medium", "high"] | None = None
+    image_analysis: bool | None = None
     start_page: int | None = None
     end_page: int | None = None
     timeout_seconds: int | None = None

@@ -2,7 +2,7 @@
 id: disclosure_anchor_design_retrieval_scale_hardening
 project: disclosure_anchor
 title: 检索/API 规模化加固（写时物化分类 + 索引 + 分批重建）
-status: implementing (0027)
+status: implementing (0028 scratch-validated; production reset/migration pending)
 created_at: 2026-07-21
 depends_on: 0022 分类视图、06R 检索投影、api routers
 ---
@@ -59,11 +59,13 @@ supersedes_document_id 无索引（视图每行 LATERAL 子扫）。
 - 部分索引 `supersedes_document_id WHERE NOT NULL`
 - `unit_search_projection.retrieval_rules_version` btree（delta 队列）
 
-## 5. 投影重建分批化（Discourse 形）
+## 5. 投影重建边界（0028 当前契约）
 
-BuildSearchProjection 改 keyset 游标循环：`asset_id > :cursor ORDER BY
-asset_id LIMIT :batch`，**逐批 upsert + commit**（默认 2,000/批）；full 与
-delta 同构，delta 由版本列索引直达。孤儿删除同样分批。用例接口不变。
+BuildSearchProjection 以 `processing_run_id` 作 keyset 和事务边界。只要 run 内任一 active
+unit 缺失或版本陈旧，就完整准备该 run 的 parent rows 与 lossless body windows，再在一个
+事务中替换；child 写失败回滚整 run。没有 row limit，stop 只在 run 间生效；孤儿删除仍按
+asset_id 有界提交。早期 asset-level batch 方案及其事故演进保留在 §8.1–§8.3 作为历史证据，
+但不再描述现行实现。
 
 ## 6. 明确不做（本轮）
 
@@ -89,7 +91,7 @@ delta 同构，delta 由版本列索引直达。孤儿删除同样分批。用�
 Zulip tsvector 触发器的共同形态）：**索引维护量与新增/变更内容成比例，禁止与任何
 固定常数或语料规模挂钩**。落地：
 
-- worker 每轮 delta **全排空**（`limit=None`；keyset 分批+逐批提交机制不变），追平后
+- worker 每轮 delta **全排空**（当时实现为 `limit=None`；0028 已删除 limit 参数），追平后
   每轮工作量自动等于该轮新发布单元数；
 - 孤儿清理从仅 full 扩展到**每轮**：`unit_search_projection_v1` 是裸投影读
   （无 is_active join），滞留行会持续服务被替代 run 的单元；
@@ -130,7 +132,8 @@ launchd 信号可达；此前三次 kickstart 均把 python 留成持锁孤儿�
    run 失活是本服务内孤儿的唯一来源，PublishRunResult 新增 `superseded_run_id`，
    worker 汇总为轮级 `runs_deactivated` 信号——本轮零替换即跳过扫描；投影数 >
    活跃数时无条件强制清理（孤儿必然存在）。残余：publish 与投影之间崩溃产生的
-   孤儿可跨轮滞留至下一次替换轮，有界且由 write-through 设计最终消除。
+   孤儿可跨轮滞留；0028 的 exact missing drain 会先补齐抵消计数的 missing，下一轮
+   `projection > active` 门即可证明并清除 orphan。当前没有 write-through trigger。
 2. **缺失 pass 稳态空探测 19s**（复审判 medium，实测 ~6GB 读/轮）：反连接必须吐出
    83 万非活跃单元再被过滤，LIMIT 永远填不满。修复为**计数门 + ULID 时间高水位**：
    清理后投影 ⊆ 活跃集，计数相等即证明无缺失（跳过扫描）；不等时从
@@ -143,3 +146,50 @@ launchd 信号可达；此前三次 kickstart 均把 python 留成持锁孤儿�
 稳态轮末投影成本实测构成：计数 1.7s + 陈旧门 3ms + 高水位 2ms ≈ **~2s/轮**
 （有替换的轮 + 清理 15.7s，事件比例摊销）。复审另一 low 发现（陈旧 pass 游标
 防的活锁在 FK CASCADE 下不可达）被对抗核查反驳，游标作为无害防御保留。
+
+## 8.4 §8.3 修订（2026-07-28，lossless tsvector + run 原子性）
+
+PostgreSQL 18.4 的 tsvector 在 1 MB 之前也会静默丢 occurrence：同 lexeme 第 256 个
+position、总 position 第 16,384 个以及超过 2,047 bytes 的 lexeme。固定 chunk size 无法
+覆盖这些不同物理边界。0028 因此采用数据库 source-occurrence probe：
+
+- safe parent 保留 A/B/C/D；unsafe body 由 probe 驱动 token 半开区间二分，parent 只存 A/B/D，
+  child 存 C；无词数、词面或文档类型阈值；
+- 每个 accepted window 由 DB CHECK 再证无丢失，所有窗口连续、无重叠且精确重建 body；
+- delta 始终执行一次 exact candidate-run anti-join，首个空 batch 即 caught-up 证明；不再使用
+  会掩盖 orphan+missing 等量对冲的 count-equality skip，也不重复预扫描；
+- parent/window 按完整 processing_run 单事务替换；这替代 asset-level 逐批提交，避免同一证据
+  run 的检索面处于半窗状态；
+- 跨窗 AND 保留 tokenizer 的 AND-of-OR groups，按 `(asset_id, group_id)` 聚合；禁止把同义词
+  alternatives 展平成全 AND、跨 asset 合并或要求全部 group 落在单一窗口。
+
+PG18 managed scratch 已覆盖 255/256、16383/16384、长 lexeme、1 MB、跨窗 AND、跨资产负例、
+GIN plan、downgrade fail-closed 与 child insert 整 run rollback。
+
+## 8.5 CJK analyzer 漏召回修订（2026-07-28，0030）
+
+研究问题：body 只有 jieba→tsvector 时，如何补足 analyzer 未产生 query lexeme 的精确子串召回，
+同时不让相邻 table cell/search target/mixed part 拼成不存在的证据。PostgreSQL 18 `pg_trgm`
+官方契约确认 GIN 支持非左锚定 `LIKE`，但 query 中可提取 trigram 越少效率越差、无 trigram
+会退化为 full-index scan；Elastic 官方 n-gram 指南同样建议固定 `min_gram=max_gram=3` 作为
+起点，gram 越短候选越泛。
+
+采纳不变量：每个 v2 explicit search-target 字符串叶子单独存为 NFKC→casefold atom；长度 ≥3
+的完整 normalized query 用 GIN `LIKE` 取候选，再以同 atom `strpos` 精确复核。word channel
+只有满足全部 query group 才命中，atom channel 只有一个 atom 含完整 query 才命中，最后才 OR。
+query gram 只用于找候选，绝不进入 payload/source_ref 或成为证据。
+
+否决方案：给 jieba 追加样本词表（无穷补丁且改变 analyzer 语义）；对 joined body 建 trgm
+（会跨证据边界造命中）；把 1–2 字 whole-atom equality 宣称成任意子串（语义不完整）。本轮
+1–2 字只走既有完整 word channel；若未来真实召回集证明需要短子串，另行评估 scoped scan 或
+source-bound 1/2-gram 的空间成本。
+
+验证：三个 analyzer 漏召回 canary、跨 atom 负例、`%/_/\` 转义、全半角/NFKC、GIN plan，以及 atom 删除后
+child 写失败的整 run rollback，均在 PG18 managed scratch 执行。
+
+外部证据：
+
+- PostgreSQL 18 `pg_trgm`：
+  https://www.postgresql.org/docs/18/pgtrgm.html
+- Elastic n-gram tokenizer（固定 gram 与 trigram 起点）：
+  https://www.elastic.co/docs/reference/text-analysis/analysis-ngram-tokenizer

@@ -12,6 +12,10 @@
       ],
       "title": "Artifact Hash"
     },
+    "artifact_owner_processing_run_id": {
+      "title": "Artifact Owner Processing Run Id",
+      "type": "string"
+    },
     "builder_rules_version": {
       "anyOf": [
         {
@@ -184,6 +188,7 @@
   "required": [
     "processing_run_id",
     "document_id",
+    "artifact_owner_processing_run_id",
     "run_kind",
     "status",
     "parser_name",

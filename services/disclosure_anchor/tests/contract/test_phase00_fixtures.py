@@ -169,21 +169,33 @@ class Phase00FixtureContractTests(unittest.TestCase):
         self.assertTrue(
             all("investor_communication" in unit["semantic_keys"] for unit in ir_units)
         )
-        # QA discrimination was removed 2026-07-16 (user decision): the investor
-        # relations transcript stays as raw text units under the form's narrative
-        # label with full question/answer text preserved — no payload_kind="qa".
-        # The narrative cell spans more than one source element, so its questions
-        # land across the narrative-label text carriers rather than a single unit.
-        narrative_units = [
-            unit
+        # L1 preserves the transcript in source-structure evidence blocks.  It
+        # must not require a business-form label or a particular text/table
+        # boundary in order to conserve the questions for downstream extraction.
+        ir_evidence = json.dumps(ir_units, ensure_ascii=False, sort_keys=True)
+        self.assertIn("美国加征关税对公司有什么影响", ir_evidence)
+        self.assertIn("请介绍集团现有业务矩阵", ir_evidence)
+        # These source headings expose an important punctuation ambiguity:
+        # ``N.2024...`` can be a decimal-like token in isolation.  In this
+        # fixture the preceding ordinal run plus identical parser/layout
+        # evidence proves that each is a top-level sibling.  Checking paths,
+        # rather than mere string presence, prevents nested false positives.
+        ambiguous_dot_siblings = {
+            "16.2024年美的海外自有品牌电商发展？",
+            "18.2024年美的海外自有品牌拓展情况？",
+            "34.2024 年公司主要 ToB 业务的收入增长情况？公司国内外的收入增速拆分？",
+            "36.2024年毛利率变动情况及主要原因？",
+            "37.2024年财报中其他流动负债大幅增加的原因？",
+            "43.2024年家电行业发展情况？",
+        }
+        paths_by_title = {
+            unit["title"]: unit["heading_path"]
             for unit in ir_units
-            if unit["payload_kind"] == "text"
-            and unit["heading_path"] == ["投资者关系活动主要内容介绍"]
-        ]
-        self.assertTrue(narrative_units)
-        narrative_text = "\n".join(unit["payload"]["text"] for unit in narrative_units)
-        self.assertIn("美国加征关税对公司有什么影响", narrative_text)
-        self.assertIn("请介绍集团现有业务矩阵", narrative_text)
+            if unit["title"] in ambiguous_dot_siblings
+        }
+        self.assertEqual(set(paths_by_title), ambiguous_dot_siblings)
+        for title, heading_path in paths_by_title.items():
+            self.assertEqual(heading_path, [title])
 
         for sample_units in fixtures.values():
             for unit in sample_units:

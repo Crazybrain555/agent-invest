@@ -27,6 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from disclosure_anchor.adapters.db.postgres.connection import create_db_engine
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
+from disclosure_anchor.adapters.parsers.mineru.source_evidence_validator import (
+    MinerUSourceEvidenceValidator,
+)
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.application.use_cases.build_units import (
@@ -42,7 +45,7 @@ from disclosure_anchor.application.use_cases.rebuild_units import (
     RebuildUnits,
     RebuildUnitsCommand,
 )
-from disclosure_anchor.adapters.unit_builder import rules
+from disclosure_anchor.application.services.unit_builder import rules
 from disclosure_anchor.cli.worker import _database_url
 from disclosure_anchor.settings import load_settings
 
@@ -112,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
                     path_builder=paths,
                     artifact_store=ArtifactStore(paths),
                     uow_factory=uow_factory,
+                    source_evidence_validator=MinerUSourceEvidenceValidator(),
                 ).execute(BuildUnitsCommand(processing_run_id=run_id))
                 if build.status != "succeeded":
                     record["failure"] = build.error

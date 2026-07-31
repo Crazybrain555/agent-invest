@@ -7,41 +7,62 @@ module writes business state except the pinned stale-run reclaim UPDATE.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA, OPS_SCHEMA
 
-# Parse failures that are properties of shared parser infrastructure rather
-# than of one document. Preserve legacy rows, and keep the new scoped local
-# spawn/backend-unavailable codes outside the ordinary item retry budget.
-# Task/deadline/output failures are intentionally absent and therefore consume
-# the bounded per-document budget.
-PARSE_INFRASTRUCTURE_ERROR_CODES: tuple[str, ...] = (
-    "parse_timeout",
-    "parser_timeout",
-    "parser_invocation_failed",
-    "ParserInvocationError",
-    "ParserTimeoutError",
-    "parser_version_probe_failed",
-    "parser_readiness_failed",
-    "parser_local_invocation_failed",
-    "parser_backend_unavailable",
-    "parser_backend_overloaded",
-    "OSError",
-    "stale_reclaimed",
-    "parser_cancelled",
-)
-PARSE_RETRY_NEUTRAL_ERROR_CODES: tuple[str, ...] = ("parser_cancelled",)
 _TERMINAL_PUBLISH_QUARANTINE_SQL = """
     COALESCE(r.unit_build_error->>'stage', '') = 'publish'
     AND COALESCE(
         (r.unit_build_error->>'retryable')::boolean,
         false
     ) = false
+"""
+# Retry charging is source-typed when the failure is created.  Scheduling
+# never infers infrastructure or cancellation semantics from error-code text.
+_PARSE_FAILURE_CONTRACT_VALID_SQL = """
+    NOT EXISTS (
+        SELECT 1
+          FROM disclosure_core.processing_run AS failed_run
+         WHERE failed_run.document_id = q.document_id
+           AND failed_run.run_kind = 'parse'
+           AND failed_run.status = 'failed'
+           AND (
+                jsonb_typeof(failed_run.error->'retryable')
+                    IS DISTINCT FROM 'boolean'
+                OR failed_run.error->>'retry_budget_class' IS NULL
+                OR failed_run.error->>'retry_budget_class'
+                   NOT IN ('item', 'infrastructure', 'neutral')
+           )
+    )
+"""
+_PARSE_ITEM_FAILURE_COUNT_SQL = """
+    (SELECT count(*)
+       FROM disclosure_core.processing_run AS item_failure
+      WHERE item_failure.document_id = q.document_id
+        AND item_failure.run_kind = 'parse'
+        AND item_failure.status = 'failed'
+        AND item_failure.error->>'retry_budget_class' = 'item')
+"""
+_PARSE_CHARGED_FAILURE_COUNT_SQL = """
+    (SELECT count(*)
+       FROM disclosure_core.processing_run AS charged_failure
+      WHERE charged_failure.document_id = q.document_id
+        AND charged_failure.run_kind = 'parse'
+        AND charged_failure.status = 'failed'
+        AND charged_failure.error->>'retry_budget_class'
+            IN ('item', 'infrastructure'))
+"""
+_PARSE_RETRY_ELIGIBLE_SQL = f"""
+    COALESCE(q.last_failed_retryable, true)
+    AND ({_PARSE_FAILURE_CONTRACT_VALID_SQL})
+    AND {_PARSE_ITEM_FAILURE_COUNT_SQL} < :max_retries
+    AND {_PARSE_CHARGED_FAILURE_COUNT_SQL} < :max_retries_ceiling
 """
 _BUILD_RETRY_ELIGIBLE_SQL = """
     q.unit_build_attempt_count < :max_retries
@@ -57,6 +78,27 @@ _BUILD_RETRY_ELIGIBLE_SQL = """
 # of max_retries, so a document that somehow always dies infra-coded cannot
 # churn forever.
 RETRY_CEILING_MULTIPLIER = 5
+
+ProcessingStateName = Literal[
+    "pending",
+    "terminal_failed",
+    "usable_published",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentProcessingState:
+    document_id: str
+    state: ProcessingStateName
+    reason_code: str
+    actionable_stage: str | None
+    processing_run_id: str | None
+    invariant_codes: tuple[str, ...]
+    item_failure_count: int
+    charged_failure_count: int
+    build_attempt_count: int
+    unit_count: int
+    projection_gap_count: int
 
 
 # Closed vocabulary for tracked_company.sync_frequency; unknown/null values
@@ -327,6 +369,7 @@ def pending_parse_backlog_count(
     conn: Connection,
     *,
     scope_classes: tuple[str, ...] | None = None,
+    require_active_company_scope: bool = True,
 ) -> int:
     """Count downloaded raw documents still awaiting a successful parse.
 
@@ -334,10 +377,17 @@ def pending_parse_backlog_count(
     and retry-exhausted documents still occupy raw storage and therefore
     remain part of the backfill admission pressure. The processing predicate
     is retained so metadata-only/noise documents do not consume the
-    processing watermark.
+    processing watermark. Ordinary scheduling admits only unbound documents
+    or documents whose company is currently tracked and active. A manifest-
+    bound frozen replay may explicitly disable that admission check.
     """
 
     scope_sql = ""
+    company_scope_sql = (
+        "AND (d.company_id IS NULL OR tc_scope.status = 'active')"
+        if require_active_company_scope
+        else ""
+    )
     params: dict[str, Any] = {}
     if scope_classes is not None:
         scope_sql = _processing_scope_sql(
@@ -352,9 +402,10 @@ def pending_parse_backlog_count(
             SELECT count(*)
               FROM {OPS_SCHEMA}.pending_parse_v1 q
               JOIN {CORE_SCHEMA}.document d ON d.document_id = q.document_id
-              LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
+             LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
                 ON tc_scope.company_id = d.company_id
              WHERE true
+               {company_scope_sql}
                {scope_sql}
             """
         ),
@@ -455,6 +506,7 @@ def pending_parse(
     max_retries: int,
     limit: int,
     scope_classes: tuple[str, ...] | None = None,
+    require_active_company_scope: bool = True,
     after_document_id: str | None = None,
     document_ids: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
@@ -468,14 +520,19 @@ def pending_parse(
     core class through classification_rule (0016 — classification is
     view-derived, so the queue joins the same rules); code-less channels fall
     back to the registration filing_type. None → parse everything ('all').
+    Current active-company admission is independent of that taxonomy scope;
+    only a raw-identity-guarded frozen replay may explicitly bypass it.
     """
 
     scope_sql = ""
+    company_scope_sql = (
+        "AND (d.company_id IS NULL OR tc_scope.status = 'active')"
+        if require_active_company_scope
+        else ""
+    )
     params: dict[str, Any] = {
         "max_retries": max_retries,
         "max_retries_ceiling": max_retries * RETRY_CEILING_MULTIPLIER,
-        "infra_error_codes": list(PARSE_INFRASTRUCTURE_ERROR_CODES),
-        "retry_neutral_error_codes": list(PARSE_RETRY_NEUTRAL_ERROR_CODES),
         "limit": limit,
     }
     if scope_classes is not None:
@@ -503,7 +560,7 @@ def pending_parse(
             f"""
             SELECT q.document_id, q.status, q.failed_parse_count,
                    q.last_failed_retryable,
-                   d.raw_file_relpath,
+                   d.raw_file_relpath, d.raw_file_hash,
                    CASE
                      WHEN jsonb_typeof(sa.result_snapshot->'byte_count') = 'number'
                      THEN (sa.result_snapshot->>'byte_count')::numeric::bigint
@@ -515,22 +572,8 @@ def pending_parse(
                 ON sa.source_access_id = d.source_access_id
               LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
                 ON tc_scope.company_id = d.company_id
-             WHERE COALESCE(q.last_failed_retryable, true)
-               AND (SELECT count(*)
-                      FROM {CORE_SCHEMA}.processing_run pr
-                     WHERE pr.document_id = q.document_id
-                       AND pr.run_kind = 'parse'
-                       AND pr.status = 'failed'
-                       AND COALESCE(pr.error->>'error_code', '')
-                           <> ALL(:infra_error_codes)) < :max_retries
-               AND (SELECT count(*)
-                      FROM {CORE_SCHEMA}.processing_run pr
-                     WHERE pr.document_id = q.document_id
-                       AND pr.run_kind = 'parse'
-                       AND pr.status = 'failed'
-                       AND COALESCE(pr.error->>'error_code', '')
-                           <> ALL(:retry_neutral_error_codes))
-                   < :max_retries_ceiling
+             WHERE ({_PARSE_RETRY_ELIGIBLE_SQL})
+               {company_scope_sql}
                {scope_sql}
                {cursor_sql}
              ORDER BY q.document_id
@@ -633,6 +676,605 @@ def pending_publish_count(conn: Connection) -> int:
     )
 
 
+def document_processing_states(
+    conn: Connection,
+    *,
+    document_ids: tuple[str, ...],
+    generation_started_at: Any,
+    target_identity: dict[str, Any],
+) -> list[DocumentProcessingState]:
+    """Classify an exact replay universe into one disjoint P/F/U state.
+
+    ``pending`` means the resident worker has a concrete automatic action.
+    Everything else is either fully usable by L2 or terminal; malformed state
+    is terminal with an explicit invariant code, never guessed from recency.
+    """
+
+    if not document_ids:
+        return []
+    if len(set(document_ids)) != len(document_ids):
+        raise ValueError("document_ids must be unique")
+    max_parse_retries = int(target_identity["max_parse_retries"])
+    max_build_retries = int(target_identity["max_build_retries"])
+    retrieval_rules_version = str(
+        target_identity["retrieval_rules_version"]
+    )
+    rows = conn.execute(
+        text(
+            f"""
+            WITH intended AS (
+                SELECT unnest(CAST(:document_ids AS text[])) AS document_id
+            ),
+            run_stats AS (
+                SELECT i.document_id,
+                       count(r.processing_run_id)::int AS generation_run_count,
+                       count(*) FILTER (
+                           WHERE r.processing_run_id IS NOT NULL
+                             AND r.run_kind <> 'parse')::int
+                           AS non_parse_run_count,
+                       count(*) FILTER (
+                           WHERE r.run_kind = 'parse'
+                             AND r.status = 'running')::int AS running_count,
+                       count(*) FILTER (
+                           WHERE r.run_kind = 'parse'
+                             AND r.status = 'succeeded')::int AS succeeded_count,
+                       count(*) FILTER (
+                           WHERE r.run_kind = 'parse'
+                             AND r.status = 'failed')::int AS failed_count,
+                       count(*) FILTER (WHERE r.is_active)::int AS active_count,
+                       count(*) FILTER (
+                           WHERE r.run_kind = 'parse'
+                             AND r.status = 'failed'
+                             AND (
+                                  jsonb_typeof(r.error->'retryable')
+                                      IS DISTINCT FROM 'boolean'
+                                  OR r.error->>'retry_budget_class' IS NULL
+                                  OR r.error->>'retry_budget_class'
+                                     NOT IN (
+                                         'item',
+                                         'infrastructure',
+                                         'neutral'
+                                     )
+                             ))::int AS invalid_failure_count,
+                       count(*) FILTER (
+                           WHERE r.run_kind = 'parse'
+                             AND r.status = 'failed'
+                             AND r.error->>'retry_budget_class' = 'item')::int
+                           AS item_failure_count,
+                       count(*) FILTER (
+                           WHERE r.run_kind = 'parse'
+                             AND r.status = 'failed'
+                             AND r.error->>'retry_budget_class'
+                                 IN ('item', 'infrastructure'))::int
+                           AS charged_failure_count
+                  FROM intended i
+                  LEFT JOIN {CORE_SCHEMA}.processing_run r
+                    ON r.document_id = i.document_id
+                   AND r.started_at >= :generation_started_at
+                 GROUP BY i.document_id
+            )
+            SELECT i.document_id,
+                   d.status AS document_status,
+                   d.raw_file_hash,
+                   d.current_processing_run_id,
+                   stats.generation_run_count,
+                   stats.non_parse_run_count,
+                   stats.running_count,
+                   stats.succeeded_count,
+                   stats.failed_count,
+                   stats.active_count,
+                   stats.invalid_failure_count,
+                   stats.item_failure_count,
+                   stats.charged_failure_count,
+                   latest_failed.retryable AS latest_failed_retryable,
+                   success.processing_run_id,
+                   success.started_at AS success_started_at,
+                   success.is_active,
+                   success.parser_target_identity,
+                   success.search_projection_error,
+                   success.input_raw_file_hash,
+                   success.unit_build_status,
+                   success.unit_build_attempt_count,
+                   success.unit_build_error,
+                   success.builder_rules_version,
+                   COALESCE(unit_state.unit_count, 0)::int AS unit_count,
+                   COALESCE(unit_state.projection_gap_count, 0)::int
+                       AS projection_gap_count,
+                   COALESCE(after_success.failed_after_success_count, 0)::int
+                       AS failed_after_success_count
+              FROM intended i
+              LEFT JOIN {CORE_SCHEMA}.document d
+                ON d.document_id = i.document_id
+              JOIN run_stats stats ON stats.document_id = i.document_id
+              LEFT JOIN LATERAL (
+                   SELECT CASE
+                            WHEN jsonb_typeof(r.error->'retryable') = 'boolean'
+                            THEN (r.error->>'retryable')::boolean
+                            ELSE NULL
+                          END AS retryable
+                     FROM {CORE_SCHEMA}.processing_run r
+                    WHERE r.document_id = i.document_id
+                      AND r.run_kind = 'parse'
+                      AND r.status = 'failed'
+                      AND r.started_at >= :generation_started_at
+                    ORDER BY r.started_at DESC, r.processing_run_id DESC
+                    LIMIT 1
+              ) latest_failed ON true
+              LEFT JOIN LATERAL (
+                   SELECT r.*
+                     FROM {CORE_SCHEMA}.processing_run r
+                    WHERE r.document_id = i.document_id
+                      AND r.run_kind = 'parse'
+                      AND r.status = 'succeeded'
+                      AND r.started_at >= :generation_started_at
+                    ORDER BY r.started_at, r.processing_run_id
+                    LIMIT 1
+              ) success ON true
+              LEFT JOIN LATERAL (
+                   SELECT count(u.asset_id)::int AS unit_count,
+                          count(*) FILTER (
+                              WHERE p.asset_id IS NULL
+                                 OR p.retrieval_rules_version
+                                    IS DISTINCT FROM :retrieval_rules_version
+                                 OR (
+                                     p.body_search_windowed
+                                     AND NOT EXISTS (
+                                         SELECT 1
+                                           FROM {CORE_SCHEMA}.unit_body_search_window w
+                                          WHERE w.asset_id = p.asset_id
+                                     )
+                                 )
+                                 OR (
+                                     NOT p.body_search_windowed
+                                     AND EXISTS (
+                                         SELECT 1
+                                           FROM {CORE_SCHEMA}.unit_body_search_window w
+                                          WHERE w.asset_id = p.asset_id
+                                     )
+                                 )
+                          )::int AS projection_gap_count
+                     FROM {CORE_SCHEMA}.document_unit u
+                     LEFT JOIN {CORE_SCHEMA}.unit_search_projection p
+                       ON p.asset_id = u.asset_id
+                    WHERE u.processing_run_id = success.processing_run_id
+              ) unit_state ON success.processing_run_id IS NOT NULL
+              LEFT JOIN LATERAL (
+                   SELECT count(*)::int AS failed_after_success_count
+                     FROM {CORE_SCHEMA}.processing_run later
+                    WHERE later.document_id = i.document_id
+                      AND later.run_kind = 'parse'
+                      AND later.status = 'failed'
+                      AND success.processing_run_id IS NOT NULL
+                      AND (
+                           later.started_at > success.started_at
+                           OR (
+                               later.started_at = success.started_at
+                               AND later.processing_run_id
+                                   > success.processing_run_id
+                           )
+                      )
+              ) after_success ON true
+             ORDER BY i.document_id
+            """
+        ),
+        {
+            "document_ids": list(document_ids),
+            "generation_started_at": generation_started_at,
+            "retrieval_rules_version": retrieval_rules_version,
+        },
+    ).mappings()
+    states = [
+        _classify_document_processing_row(
+            dict(row),
+            target_identity=target_identity,
+            max_parse_retries=max_parse_retries,
+            max_build_retries=max_build_retries,
+        )
+        for row in rows
+    ]
+    if (
+        len(states) != len(document_ids)
+        or {state.document_id for state in states} != set(document_ids)
+    ):
+        raise RuntimeError("processing-state query did not close over its universe")
+    return states
+
+
+def _classify_document_processing_row(
+    row: dict[str, Any],
+    *,
+    target_identity: dict[str, Any],
+    max_parse_retries: int,
+    max_build_retries: int,
+) -> DocumentProcessingState:
+    document_id = str(row["document_id"])
+    run_id = (
+        str(row["processing_run_id"])
+        if row.get("processing_run_id") is not None
+        else None
+    )
+    item_failures = int(row["item_failure_count"])
+    charged_failures = int(row["charged_failure_count"])
+    build_attempts = int(row.get("unit_build_attempt_count") or 0)
+    unit_count = int(row["unit_count"])
+    projection_gaps = int(row["projection_gap_count"])
+    projection_error = row.get("search_projection_error")
+    invariants: list[str] = []
+    if row.get("document_status") is None:
+        invariants.append("invariant_document_missing")
+    if int(row["generation_run_count"]) != sum(
+        int(row[field])
+        for field in (
+            "non_parse_run_count",
+            "running_count",
+            "succeeded_count",
+            "failed_count",
+        )
+    ):
+        invariants.append("invariant_generation_run_accounting")
+    if int(row["non_parse_run_count"]):
+        invariants.append("invariant_non_parse_generation_run")
+    if int(row["running_count"]) > 1:
+        invariants.append("invariant_multiple_running_parse_runs")
+    if int(row["succeeded_count"]) > 1:
+        invariants.append("invariant_multiple_succeeded_parse_runs")
+    if int(row["active_count"]) > 1:
+        invariants.append("invariant_multiple_active_runs")
+    if int(row["invalid_failure_count"]):
+        invariants.append("invariant_failure_contract")
+    if projection_error is not None and not _valid_search_projection_error(
+        projection_error
+    ):
+        invariants.append("invariant_search_projection_failure_contract")
+    if run_id is not None:
+        if row.get("parser_target_identity") != target_identity["parser_target"]:
+            invariants.append("invariant_parser_identity")
+        if row.get("input_raw_file_hash") != row.get("raw_file_hash"):
+            invariants.append("invariant_raw_identity")
+        if int(row["running_count"]):
+            invariants.append("invariant_running_after_parse_success")
+        if int(row["failed_after_success_count"]):
+            invariants.append("invariant_failed_run_after_parse_success")
+    if invariants:
+        return _processing_state(
+            document_id=document_id,
+            state="terminal_failed",
+            reason_code=invariants[0],
+            actionable_stage=None,
+            run_id=run_id,
+            invariants=invariants,
+            item_failures=item_failures,
+            charged_failures=charged_failures,
+            build_attempts=build_attempts,
+            unit_count=unit_count,
+            projection_gaps=projection_gaps,
+        )
+
+    if run_id is None:
+        if int(row["running_count"]) == 1:
+            return _processing_state(
+                document_id,
+                "pending",
+                "parse_running",
+                "parse",
+                None,
+                (),
+                item_failures,
+                charged_failures,
+                build_attempts,
+                unit_count,
+                projection_gaps,
+            )
+        state: ProcessingStateName
+        if row.get("latest_failed_retryable") is False:
+            state, reason = "terminal_failed", "parse_nonretryable"
+        elif item_failures >= max_parse_retries:
+            state, reason = "terminal_failed", "parse_item_budget_exhausted"
+        elif charged_failures >= (
+            max_parse_retries * RETRY_CEILING_MULTIPLIER
+        ):
+            state, reason = "terminal_failed", "parse_charge_ceiling_exhausted"
+        else:
+            state = "pending"
+            reason = (
+                "parse_not_started"
+                if int(row["failed_count"]) == 0
+                else "parse_retry_eligible"
+            )
+        return _processing_state(
+            document_id,
+            state,
+            reason,
+            "parse" if state == "pending" else None,
+            None,
+            (),
+            item_failures,
+            charged_failures,
+            build_attempts,
+            unit_count,
+            projection_gaps,
+        )
+
+    build_status = row.get("unit_build_status")
+    if build_status == "not_started":
+        return _processing_state(
+            document_id,
+            "pending",
+            "build_not_started",
+            "build",
+            run_id,
+            (),
+            item_failures,
+            charged_failures,
+            build_attempts,
+            unit_count,
+            projection_gaps,
+        )
+    if build_status == "running":
+        return _invariant_processing_state(
+            document_id,
+            "invariant_build_running",
+            run_id,
+            item_failures,
+            charged_failures,
+            build_attempts,
+            unit_count,
+            projection_gaps,
+        )
+    if build_status == "failed":
+        error = row.get("unit_build_error")
+        if (
+            not isinstance(error, dict)
+            or not isinstance(error.get("retryable"), bool)
+        ):
+            return _invariant_processing_state(
+                document_id,
+                "invariant_build_failure_contract",
+                run_id,
+                item_failures,
+                charged_failures,
+                build_attempts,
+                unit_count,
+                projection_gaps,
+            )
+        if error.get("stage") == "publish" and not error["retryable"]:
+            state, reason = "terminal_failed", "publish_terminal"
+        elif build_attempts < max_build_retries or (
+            error["retryable"]
+            and build_attempts
+            < max_build_retries * RETRY_CEILING_MULTIPLIER
+        ):
+            state, reason = "pending", "build_retry_eligible"
+        else:
+            state, reason = "terminal_failed", "build_budget_exhausted"
+        return _processing_state(
+            document_id,
+            state,
+            reason,
+            "build" if state == "pending" else None,
+            run_id,
+            (),
+            item_failures,
+            charged_failures,
+            build_attempts,
+            unit_count,
+            projection_gaps,
+        )
+    if build_status != "succeeded":
+        return _invariant_processing_state(
+            document_id,
+            "invariant_build_status",
+            run_id,
+            item_failures,
+            charged_failures,
+            build_attempts,
+            unit_count,
+            projection_gaps,
+        )
+    if row.get("builder_rules_version") != target_identity[
+        "builder_rules_version"
+    ]:
+        return _invariant_processing_state(
+            document_id,
+            "invariant_builder_identity",
+            run_id,
+            item_failures,
+            charged_failures,
+            build_attempts,
+            unit_count,
+            projection_gaps,
+        )
+    if unit_count == 0:
+        return _processing_state(
+            document_id,
+            "terminal_failed",
+            (
+                "published_empty_unit_set"
+                if row.get("is_active")
+                else "empty_unit_set"
+            ),
+            None,
+            run_id,
+            (),
+            item_failures,
+            charged_failures,
+            build_attempts,
+            unit_count,
+            projection_gaps,
+        )
+
+    is_active = bool(row.get("is_active"))
+    current_run_id = row.get("current_processing_run_id")
+    if not is_active:
+        if projection_error is not None:
+            return _invariant_processing_state(
+                document_id,
+                "invariant_search_projection_error_before_publish",
+                run_id,
+                item_failures,
+                charged_failures,
+                build_attempts,
+                unit_count,
+                projection_gaps,
+            )
+        if current_run_id is not None:
+            return _invariant_processing_state(
+                document_id,
+                "invariant_current_pointer_without_active_run",
+                run_id,
+                item_failures,
+                charged_failures,
+                build_attempts,
+                unit_count,
+                projection_gaps,
+            )
+        return _processing_state(
+            document_id,
+            "pending",
+            "publish_pending",
+            "publish",
+            run_id,
+            (),
+            item_failures,
+            charged_failures,
+            build_attempts,
+            unit_count,
+            projection_gaps,
+        )
+    if current_run_id != run_id or row.get("document_status") != "published":
+        return _invariant_processing_state(
+            document_id,
+            "invariant_active_pointer_status",
+            run_id,
+            item_failures,
+            charged_failures,
+            build_attempts,
+            unit_count,
+            projection_gaps,
+        )
+    if projection_gaps:
+        if (
+            isinstance(projection_error, dict)
+            and projection_error.get("retrieval_rules_version")
+            == target_identity["retrieval_rules_version"]
+        ):
+            return _processing_state(
+                document_id,
+                "terminal_failed",
+                "search_projection_terminal",
+                None,
+                run_id,
+                (),
+                item_failures,
+                charged_failures,
+                build_attempts,
+                unit_count,
+                projection_gaps,
+            )
+        return _processing_state(
+            document_id,
+            "pending",
+            "projection_pending",
+            "projection",
+            run_id,
+            (),
+            item_failures,
+            charged_failures,
+            build_attempts,
+            unit_count,
+            projection_gaps,
+        )
+    if projection_error is not None:
+        return _invariant_processing_state(
+            document_id,
+            "invariant_search_projection_error_without_gap",
+            run_id,
+            item_failures,
+            charged_failures,
+            build_attempts,
+            unit_count,
+            projection_gaps,
+        )
+    return _processing_state(
+        document_id,
+        "usable_published",
+        "usable_published",
+        None,
+        run_id,
+        (),
+        item_failures,
+        charged_failures,
+        build_attempts,
+        unit_count,
+        projection_gaps,
+    )
+
+
+def _valid_search_projection_error(error: object) -> bool:
+    return (
+        isinstance(error, dict)
+        and error.get("stage") == "search_projection"
+        and error.get("retryable") is False
+        and isinstance(error.get("error_code"), str)
+        and bool(str(error["error_code"]).strip())
+        and isinstance(error.get("retrieval_rules_version"), str)
+        and bool(str(error["retrieval_rules_version"]).strip())
+    )
+
+
+def _invariant_processing_state(
+    document_id: str,
+    reason_code: str,
+    run_id: str | None,
+    item_failures: int,
+    charged_failures: int,
+    build_attempts: int,
+    unit_count: int,
+    projection_gaps: int,
+) -> DocumentProcessingState:
+    return _processing_state(
+        document_id,
+        "terminal_failed",
+        reason_code,
+        None,
+        run_id,
+        (reason_code,),
+        item_failures,
+        charged_failures,
+        build_attempts,
+        unit_count,
+        projection_gaps,
+    )
+
+
+def _processing_state(
+    document_id: str,
+    state: ProcessingStateName,
+    reason_code: str,
+    actionable_stage: str | None,
+    run_id: str | None,
+    invariants: tuple[str, ...] | list[str],
+    item_failures: int,
+    charged_failures: int,
+    build_attempts: int,
+    unit_count: int,
+    projection_gaps: int,
+) -> DocumentProcessingState:
+    return DocumentProcessingState(
+        document_id=document_id,
+        state=state,
+        reason_code=reason_code,
+        actionable_stage=actionable_stage,
+        processing_run_id=run_id,
+        invariant_codes=tuple(invariants),
+        item_failure_count=item_failures,
+        charged_failure_count=charged_failures,
+        build_attempt_count=build_attempts,
+        unit_count=unit_count,
+        projection_gap_count=projection_gaps,
+    )
+
+
 def download_dead_letter_count(conn: Connection, *, max_retries: int) -> int:
     """Distinct candidates permanently out of the download queue: a terminal
     (retryable=false) failure or an exhausted retry budget. Same expressions
@@ -662,22 +1304,25 @@ def download_dead_letter_count(conn: Connection, *, max_retries: int) -> int:
 
 
 def parse_dead_letter_count(conn: Connection, *, max_retries: int) -> int:
-    """Documents whose parse retries are exhausted or terminally failed —
-    doctor's exhausted-parse口径."""
+    """Pending-parse facts with no legal automatic retry action."""
 
     return int(
         conn.execute(
             text(
-                f"SELECT count(*) FROM {OPS_SCHEMA}.pending_parse_v1 "
-                "WHERE failed_parse_count >= :max_retries "
-                "OR last_failed_retryable = false"
+                f"SELECT count(*) FROM {OPS_SCHEMA}.pending_parse_v1 q "
+                f"WHERE NOT ({_PARSE_RETRY_ELIGIBLE_SQL})"
             ),
-            {"max_retries": max_retries},
+            {
+                "max_retries": max_retries,
+                "max_retries_ceiling": (
+                    max_retries * RETRY_CEILING_MULTIPLIER
+                ),
+            },
         ).scalar_one()
     )
 
 
-def retrying_document_count(conn: Connection) -> int:
+def retrying_document_count(conn: Connection, *, max_retries: int) -> int:
     """Documents still pending whose latest failure is retryable — the
     actionable "currently failing, will be retried" gauge. The raw
     retryable_failed_run_v1 view counts historical failed RUNS and keeps
@@ -687,10 +1332,16 @@ def retrying_document_count(conn: Connection) -> int:
     return int(
         conn.execute(
             text(
-                f"SELECT count(*) FROM {OPS_SCHEMA}.pending_parse_v1 "
-                "WHERE failed_parse_count > 0 "
-                "AND last_failed_retryable IS NOT false"
-            )
+                f"SELECT count(*) FROM {OPS_SCHEMA}.pending_parse_v1 q "
+                "WHERE q.failed_parse_count > 0 "
+                f"AND ({_PARSE_RETRY_ELIGIBLE_SQL})"
+            ),
+            {
+                "max_retries": max_retries,
+                "max_retries_ceiling": (
+                    max_retries * RETRY_CEILING_MULTIPLIER
+                ),
+            },
         ).scalar_one()
     )
 
@@ -709,7 +1360,9 @@ def reclaim_stale_runs(conn: Connection, *, threshold_seconds: int) -> int:
             f"""
             UPDATE {CORE_SCHEMA}.processing_run
                SET status='failed', finished_at=now(),
-                   error='{{"stage"\\:"parse","error_code"\\:"stale_reclaimed","retryable"\\:true}}'::jsonb
+                   error='{{"stage"\\:"parse","error_code"\\:"stale_reclaimed",'
+                         '"retryable"\\:true,'
+                         '"retry_budget_class"\\:"infrastructure"}}'::jsonb
              WHERE processing_run_id IN (
                  SELECT processing_run_id FROM {OPS_SCHEMA}.stale_running_run_v1
                   WHERE started_at < now() - make_interval(secs => :threshold))

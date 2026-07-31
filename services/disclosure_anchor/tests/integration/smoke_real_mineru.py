@@ -136,6 +136,7 @@ class RealMinerUSmokeTest(unittest.TestCase):
             ParseDocument,
             ParseDocumentCommand,
         )
+        from disclosure_anchor.application.ports.parser import ParserOptions
         from disclosure_anchor.application.use_cases.register_local_pdf import (
             RegisterLocalPdf,
             RegisterLocalPdfCommand,
@@ -197,7 +198,14 @@ class RealMinerUSmokeTest(unittest.TestCase):
                 default_timeout_seconds=900,
             )
             result = parse.execute(
-                ParseDocumentCommand(document_id=registered.document_id)
+                ParseDocumentCommand(
+                    document_id=registered.document_id,
+                    options=ParserOptions(
+                        runtime_bundle_identity_sha256=(
+                            settings.disclosure_mineru_runtime_bundle_identity_sha256
+                        )
+                    ),
+                )
             )
             self.assertEqual(result.status, "succeeded", result.error)
 
@@ -205,7 +213,7 @@ class RealMinerUSmokeTest(unittest.TestCase):
                 settings.disclosure_data_root / "data" / result.normalized_ir_relpath
             )
             ir = json.loads(ir_path.read_text(encoding="utf-8"))
-            self.assertEqual(ir["contract_version"], "normalized_ir.v3")
+            self.assertEqual(ir["contract_version"], "normalized_ir.v4")
             self.assertGreater(len(ir["elements"]), 0)
             allowed = {
                 "text",
@@ -223,7 +231,6 @@ class RealMinerUSmokeTest(unittest.TestCase):
                 element
                 for element in ir["elements"]
                 if element["kind"] == "table"
-                and not element.get("table_parse_failed")
                 and not element["table"].get("rows")
                 and not element["table"].get("headers")
                 and element.get("table_html", "").strip()

@@ -40,6 +40,10 @@ PUBLIC_VIEWS = (
     "tracked_companies_v1",
     # 06R derived retrieval projection (regenerable, no event semantics).
     "unit_search_projection_v1",
+    # Sparse lossless body windows for PostgreSQL-unsafe parent vectors.
+    "unit_body_search_windows_v1",
+    # Source-bound normalized body atoms for exact substring candidates.
+    "unit_search_atoms_v1",
     # Derived per-document heading-tree skeleton (regenerable, no events).
     "document_outline_v1",
 )

@@ -1,52 +1,50 @@
-"""Manifest-driven two-phase retirement of superseded derived generations.
+"""Manifest-driven retirement of superseded derived generations.
 
-Replaces blanket ``prune_history.sh`` for the corpus-reparse cleanup: retire
-exactly the runs enumerated in a reviewed manifest, artifacts first, DB rows
-second, with raw PDFs and source lineage untouched by construction (only the
-three derived relpath families are ever deleted).
+Retirement deletes only DB ownership metadata in one guarded transaction.
+The independent orphan collector subsequently removes files that have no
+remaining owner.  This DB-first design is crash-safe: interruption can leave a
+harmless orphan, never a live row pointing at a file already deleted by a
+separate phase.
 
-Phases:
-  (no flags)          build + print the retirement manifest (dry-run; writes
-                      the manifest JSON under <data_root>/audit/gc/)
-  --apply-artifacts   delete the manifest runs' parser artifact trees,
-                      normalized IR files, and unit snapshot files
-  --apply-metadata    delete the manifest runs' outbox events, document
-                      units, and processing_run rows in ONE transaction
-                      (same predicates as prune_history.sh, scoped to the
-                      manifest run ids)
+Modes:
+  (no flags)  build + print the retirement manifest (dry-run)
+  --apply     atomically delete the reviewed manifest's derived DB metadata
+  --auto      keep the newest superseded run per document and retire older ones
 
 Guards:
   * only runs with NOT is_active AND status <> 'running' AND created_at <
     --before enter the manifest; runs referenced by any
     document.current_processing_run_id are excluded;
-  * both apply phases re-verify each guard against the live DB and abort on
-    any drift;
-  * artifact deletion refuses relpaths shared with any run outside the
-    manifest;
+  * apply re-verifies the complete manifest under exclusive corpus admission
+    before deleting any row;
+  * not-started/running builds are never retirement candidates;
   * U5 historical replay for retired runs is intentionally given up
     (authorized in HANDOFF corpus-reparse-audit-r1).
 
 Usage:
   .venv/bin/python scripts/retire_derived_generation.py --before <ISO8601>
-      [--manifest <path>] [--apply-artifacts | --apply-metadata]
+      [--manifest <path>] [--apply]
 """
 
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
-import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import sqlalchemy
 from sqlalchemy import text
-from sqlalchemy.engine import Connection
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from disclosure_anchor.adapters.db.postgres.connection import create_db_engine
+from disclosure_anchor.application.worker.locks import (
+    exclusive_corpus_mutation,
+)
 from disclosure_anchor.cli.worker import _database_url
 from disclosure_anchor.settings import Settings, load_settings
 
@@ -62,10 +60,17 @@ _SELECT_RETIREMENT = text(
       FROM disclosure_core.processing_run pr
      WHERE NOT pr.is_active
        AND pr.status <> 'running'
+       AND pr.unit_build_status IN ('succeeded', 'failed')
        AND pr.created_at < :before
        AND pr.processing_run_id NOT IN (
            SELECT current_processing_run_id FROM disclosure_core.document
             WHERE current_processing_run_id IS NOT NULL)
+       AND NOT EXISTS (
+           SELECT 1
+             FROM disclosure_core.processing_run dependent
+            WHERE dependent.artifact_owner_processing_run_id =
+                  pr.processing_run_id
+              AND dependent.processing_run_id <> pr.processing_run_id)
      ORDER BY pr.processing_run_id
     """
 )
@@ -84,14 +89,22 @@ _SELECT_AUTO_RETIREMENT = text(
       FROM disclosure_core.processing_run pr
      WHERE NOT pr.is_active
        AND pr.status <> 'running'
+       AND pr.unit_build_status IN ('succeeded', 'failed')
        AND pr.processing_run_id NOT IN (
            SELECT current_processing_run_id FROM disclosure_core.document
             WHERE current_processing_run_id IS NOT NULL)
+       AND NOT EXISTS (
+           SELECT 1
+             FROM disclosure_core.processing_run dependent
+            WHERE dependent.artifact_owner_processing_run_id =
+                  pr.processing_run_id
+              AND dependent.processing_run_id <> pr.processing_run_id)
        AND pr.processing_run_id NOT IN (
            SELECT DISTINCT ON (pr2.document_id) pr2.processing_run_id
              FROM disclosure_core.processing_run pr2
             WHERE NOT pr2.is_active
               AND pr2.status <> 'running'
+              AND pr2.unit_build_status IN ('succeeded', 'failed')
               AND pr2.processing_run_id NOT IN (
                   SELECT current_processing_run_id FROM disclosure_core.document
                    WHERE current_processing_run_id IS NOT NULL)
@@ -103,27 +116,14 @@ _SELECT_AUTO_RETIREMENT = text(
     """
 )
 
-_VERIFY_ONE = text(
-    """
-    SELECT NOT pr.is_active
-           AND pr.status <> 'running'
-           AND pr.processing_run_id NOT IN (
-               SELECT current_processing_run_id FROM disclosure_core.document
-                WHERE current_processing_run_id IS NOT NULL) AS retirable
-      FROM disclosure_core.processing_run pr
-     WHERE pr.processing_run_id = :run_id
-    """
-)
-
 
 def _build_manifest(
     engine: sqlalchemy.Engine, before: str, *, auto: bool = False
-) -> dict:
+) -> dict[str, Any]:
     with engine.connect() as conn:
         if auto:
             rows = [
-                dict(row)
-                for row in conn.execute(_SELECT_AUTO_RETIREMENT).mappings()
+                dict(row) for row in conn.execute(_SELECT_AUTO_RETIREMENT).mappings()
             ]
         else:
             rows = [
@@ -146,7 +146,11 @@ def _build_manifest(
 
 
 def _write_manifest(
-    manifest: dict, settings: Settings, *, prefix: str, override: Path | None = None
+    manifest: dict[str, Any],
+    settings: Settings,
+    *,
+    prefix: str,
+    override: Path | None = None,
 ) -> Path:
     out_dir = Path(settings.disclosure_data_root) / "audit" / "gc"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -158,72 +162,13 @@ def _write_manifest(
     return out_path
 
 
-def _shared_relpath_owners(
-    conn: Connection, column: str, relpath: str, manifest_ids: set[str]
-) -> list[str]:
-    rows = conn.execute(
-        text(
-            f"SELECT processing_run_id FROM disclosure_core.processing_run"
-            f" WHERE {column} = :relpath"
-        ),
-        {"relpath": relpath},
-    ).scalars()
-    return [run_id for run_id in rows if run_id not in manifest_ids]
-
-
-def _apply_artifacts(
-    engine: sqlalchemy.Engine, settings: Settings, manifest: dict, manifest_path: Path
+def _apply_metadata(
+    engine: sqlalchemy.Engine,
+    manifest: dict[str, Any],
 ) -> int:
-    data_root = Path(settings.disclosure_data_root) / "data"
-    manifest_ids = {run["processing_run_id"] for run in manifest["runs"]}
-    deleted_log = manifest_path.with_suffix(".artifacts-deleted.jsonl")
-    failures = 0
-    skipped_shared = 0
-    with engine.connect() as conn, deleted_log.open("a", encoding="utf-8") as log:
-        for run in manifest["runs"]:
-            run_id = run["processing_run_id"]
-            retirable = conn.execute(_VERIFY_ONE, {"run_id": run_id}).scalar()
-            if retirable is not True:
-                print(f"[abort-run] {run_id}: guard drifted (retirable={retirable})")
-                failures += 1
-                continue
-            for column, kind in (
-                ("parser_artifact_relpath", "tree"),
-                ("normalized_ir_relpath", "file"),
-                ("document_units_relpath", "file"),
-            ):
-                relpath = run.get(column)
-                if not relpath:
-                    continue
-                owners = _shared_relpath_owners(conn, column, relpath, manifest_ids)
-                if owners:
-                    # Expected whenever a rules-only rebuild shares parse
-                    # artifacts with the active generation — a guard skip,
-                    # not a failure.
-                    print(f"[skip-shared] {run_id} {column}={relpath} also owned by {owners}")
-                    skipped_shared += 1
-                    continue
-                if Path(relpath).is_absolute() or ".." in Path(relpath).parts:
-                    print(f"[skip-unsafe] {run_id} {column}={relpath}")
-                    failures += 1
-                    continue
-                target = data_root / relpath
-                if not target.exists():
-                    log.write(json.dumps({"run_id": run_id, "relpath": relpath, "result": "absent"}) + "\n")
-                    continue
-                if kind == "tree" and target.is_dir():
-                    shutil.rmtree(target)
-                else:
-                    target.unlink()
-                log.write(json.dumps({"run_id": run_id, "relpath": relpath, "result": "deleted"}) + "\n")
-    print(
-        f"[artifacts] processed {len(manifest['runs'])} runs, "
-        f"skipped_shared={skipped_shared}, failures={failures}, log={deleted_log}"
-    )
-    return 1 if failures else 0
-
-
-def _apply_metadata(engine: sqlalchemy.Engine, manifest: dict) -> int:
+    before = manifest.get("before")
+    if not isinstance(before, str) or not before:
+        raise SystemExit("[abort] manifest has no valid before cutoff")
     run_ids = [run["processing_run_id"] for run in manifest["runs"]]
     if not run_ids:
         print("[metadata] manifest empty — nothing to delete")
@@ -235,12 +180,21 @@ def _apply_metadata(engine: sqlalchemy.Engine, manifest: dict) -> int:
                 SELECT count(*) FROM disclosure_core.processing_run pr
                  WHERE pr.processing_run_id = ANY(:run_ids)
                    AND NOT pr.is_active AND pr.status <> 'running'
+                   AND pr.unit_build_status IN ('succeeded', 'failed')
+                   AND pr.created_at < :before
                    AND pr.processing_run_id NOT IN (
                        SELECT current_processing_run_id FROM disclosure_core.document
                         WHERE current_processing_run_id IS NOT NULL)
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM disclosure_core.processing_run dependent
+                        WHERE dependent.artifact_owner_processing_run_id =
+                              pr.processing_run_id
+                          AND dependent.processing_run_id <>
+                              pr.processing_run_id)
                 """
             ),
-            {"run_ids": run_ids},
+            {"run_ids": run_ids, "before": before},
         ).scalar_one()
         present = conn.execute(
             text(
@@ -249,10 +203,11 @@ def _apply_metadata(engine: sqlalchemy.Engine, manifest: dict) -> int:
             ),
             {"run_ids": run_ids},
         ).scalar_one()
-        if retirable != present:
+        if present != len(run_ids) or retirable != present:
             raise SystemExit(
-                f"[abort] {present - retirable} manifest runs no longer satisfy the"
-                " retirement guards — regenerate the manifest"
+                "[abort] manifest membership or retirement guards drifted "
+                f"(expected={len(run_ids)}, present={present}, "
+                f"retirable={retirable}) — regenerate the manifest"
             )
         events = conn.execute(
             text(
@@ -288,11 +243,16 @@ def _apply_metadata(engine: sqlalchemy.Engine, manifest: dict) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="retire_derived_generation")
-    parser.add_argument("--before", help="ISO8601 cutoff: only runs created before this retire")
-    parser.add_argument("--manifest", type=Path, help="existing manifest to apply / output path override")
+    parser.add_argument(
+        "--before", help="ISO8601 cutoff: only runs created before this retire"
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        help="existing manifest to apply / output path override",
+    )
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--apply-artifacts", action="store_true")
-    group.add_argument("--apply-metadata", action="store_true")
+    group.add_argument("--apply", action="store_true")
     group.add_argument(
         "--auto",
         action="store_true",
@@ -311,44 +271,48 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings()
     engine = create_db_engine(_database_url(settings))
     try:
-        if args.auto:
-            now = datetime.now(timezone.utc)
-            manifest = _build_manifest(engine, now.isoformat(), auto=True)
-            out_path = _write_manifest(manifest, settings, prefix="retire_auto")
-            print(
-                f"[auto] superseded-beyond-rollback runs={manifest['run_count']}"
-                f" units={manifest['unit_count']} manifest={out_path}"
+        destructive = bool((args.auto and not args.dry_run) or args.apply)
+        mutation_gate = (
+            exclusive_corpus_mutation(engine) if destructive else nullcontext()
+        )
+        with mutation_gate:
+            if args.auto:
+                now = datetime.now(timezone.utc)
+                manifest = _build_manifest(engine, now.isoformat(), auto=True)
+                out_path = _write_manifest(manifest, settings, prefix="retire_auto")
+                print(
+                    f"[auto] superseded-beyond-rollback runs={manifest['run_count']}"
+                    f" units={manifest['unit_count']} manifest={out_path}"
+                )
+                if manifest["run_count"] == 0 or args.dry_run:
+                    return 0
+                return _apply_metadata(engine, manifest)
+
+            if args.apply:
+                if not args.manifest or not args.manifest.is_file():
+                    raise SystemExit(
+                        "[abort] --apply requires --manifest pointing "
+                        "at a reviewed manifest file"
+                    )
+                manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+                if manifest.get("manifest_schema") != _MANIFEST_SCHEMA:
+                    raise SystemExit("[abort] manifest schema mismatch")
+                if manifest.get("before") != args.before:
+                    raise SystemExit(
+                        "[abort] --before does not match the manifest cutoff"
+                    )
+                return _apply_metadata(engine, manifest)
+
+            manifest = _build_manifest(engine, args.before)
+            out_path = _write_manifest(
+                manifest, settings, prefix="retire", override=args.manifest
             )
-            if manifest["run_count"] == 0 or args.dry_run:
-                return 0
-            artifacts_rc = _apply_artifacts(engine, settings, manifest, out_path)
-            if artifacts_rc:
-                # A guard tripped on the artifact side; leave metadata rows in
-                # place so nothing ever becomes a file-without-row orphan.
-                return artifacts_rc
-            return _apply_metadata(engine, manifest)
-
-        if args.apply_artifacts or args.apply_metadata:
-            if not args.manifest or not args.manifest.is_file():
-                raise SystemExit("[abort] apply phases require --manifest pointing at a reviewed manifest file")
-            manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-            if manifest.get("manifest_schema") != _MANIFEST_SCHEMA:
-                raise SystemExit("[abort] manifest schema mismatch")
-            if manifest.get("before") != args.before:
-                raise SystemExit("[abort] --before does not match the manifest cutoff")
-            if args.apply_artifacts:
-                return _apply_artifacts(engine, settings, manifest, args.manifest)
-            return _apply_metadata(engine, manifest)
-
-        manifest = _build_manifest(engine, args.before)
-        out_path = _write_manifest(
-            manifest, settings, prefix="retire", override=args.manifest
-        )
-        print(
-            f"[manifest] runs={manifest['run_count']} units={manifest['unit_count']}"
-            f" before={args.before} -> {out_path}"
-        )
-        return 0
+            print(
+                f"[manifest] runs={manifest['run_count']} "
+                f"units={manifest['unit_count']} before={args.before} "
+                f"-> {out_path}"
+            )
+            return 0
     finally:
         engine.dispose()
 

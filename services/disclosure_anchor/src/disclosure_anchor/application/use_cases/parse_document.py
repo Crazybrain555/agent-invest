@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
+import re
 from typing import Any, cast
 
 from disclosure_anchor.application.contracts.normalized_ir import (
@@ -15,6 +16,10 @@ from disclosure_anchor.application.contracts.normalized_ir import (
     validate_normalized_ir_identity,
     validate_normalized_ir_path_version,
 )
+from disclosure_anchor.application.contracts.parser_target import (
+    ParserTargetIdentity,
+    ParserTargetIdentityError,
+)
 from disclosure_anchor.application.ports.file_store import (
     ArtifactStorePort,
     FileStorePathPort,
@@ -22,12 +27,16 @@ from disclosure_anchor.application.ports.file_store import (
 )
 from disclosure_anchor.application.ports.parser import DocumentParserPort, ParserOptions
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
-from disclosure_anchor.application.worker.locks import maybe_lock_document
+from disclosure_anchor.application.worker.locks import (
+    exclusive_document_producer,
+    maybe_lock_document,
+)
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import (
     ParseDocumentError,
+    ParserError,
     ParserBackendOverloadedError,
     ParserCancelledError,
     ParserInvocationError,
@@ -38,13 +47,14 @@ from disclosure_anchor.domain.errors import (
     ParserTimeoutError,
     ParserUnknownError,
     ParserVersionProbeError,
+    ParserRetryBudgetClass,
 )
 
 
 @dataclass(frozen=True)
 class ParseDocumentCommand:
     document_id: str
-    options: ParserOptions = ParserOptions()
+    options: ParserOptions
 
 
 @dataclass(frozen=True)
@@ -58,18 +68,11 @@ class ParseDocumentResult:
 
 
 @dataclass(frozen=True)
-class _ArtifactRelpaths:
-    artifact_root: Path
-    content_list: Path
-    markdown: Path | None
-    model: Path | None
-
-
-@dataclass(frozen=True)
 class _ParseRunFailure(Exception):
     stage: str
     error_code: str
     retryable: bool
+    retry_budget_class: ParserRetryBudgetClass
     message: str
 
 
@@ -96,6 +99,18 @@ class ParseDocument:
         self._check_readiness = check_readiness
 
     def execute(self, command: ParseDocumentCommand) -> ParseDocumentResult:
+        # The producer UoW owns CORPUS(shared) and
+        # DOCUMENT_PRODUCER(exclusive) for one lifecycle. Both leases span
+        # parser filesystem writes and both DB transactions,
+        # so destructive maintenance cannot unlink an in-flight parse and
+        # another producer cannot race the same document lifecycle.
+        with exclusive_document_producer(
+            self._uow_factory,
+            command.document_id,
+        ):
+            return self._execute_owned(command)
+
+    def _execute_owned(self, command: ParseDocumentCommand) -> ParseDocumentResult:
         options = self._effective_options(command.options)
         context = self._prepare_run(command.document_id, options)
         if context.get("prepare_failed"):
@@ -116,24 +131,36 @@ class ParseDocument:
                 options=options,
                 document_metadata=context["document_metadata"],
             )
-            artifact_relpaths = self._artifact_relpaths(
+            expected_target = context["parser_target_identity"]
+            if (
+                not isinstance(expected_target, ParserTargetIdentity)
+                or parser_result.target_identity != expected_target
+            ):
+                raise ParserOutputContractError(
+                    "parser result target identity differs from the prepared run"
+                )
+            artifact_root_relpath = self._artifact_root_relpath(
                 artifact_root_relpath=context["artifact_root_relpath"],
                 artifact_root_path=context["artifact_root_path"],
                 artifact_root=parser_result.artifact_root,
-                content_list_path=parser_result.content_list_path,
-                markdown_path=parser_result.markdown_path,
-                model_path=parser_result.model_path,
             )
             normalized_ir = dict(parser_result.normalized_ir)
-            self._verify_model_diagnostic_binding(
-                normalized_ir,
-                model_path=parser_result.model_path,
-            )
-            normalized_ir["parser_artifacts"] = artifact_relpath_map(
-                artifact_root_relpath=artifact_relpaths.artifact_root,
-                content_list_relpath=artifact_relpaths.content_list,
-                markdown_relpath=artifact_relpaths.markdown,
-                model_relpath=artifact_relpaths.model,
+            try:
+                ir_target = ParserTargetIdentity.from_payload(
+                    normalized_ir.get("parser")
+                )
+            except ParserTargetIdentityError as exc:
+                raise ParserOutputContractError(
+                    f"invalid NormalizedIR parser target: {exc}"
+                ) from exc
+            if ir_target != expected_target:
+                raise ParserOutputContractError(
+                    "NormalizedIR parser target differs from the prepared run"
+                )
+            normalized_ir["parser_artifacts"] = build_parser_artifact_manifest(
+                artifact_root=parser_result.artifact_root,
+                artifact_root_relpath=artifact_root_relpath,
+                artifact_paths=parser_result.artifact_paths,
             )
             try:
                 version = validate_current_normalized_ir_for_write(normalized_ir)
@@ -187,6 +214,7 @@ class ParseDocument:
                     stage="parse_io",
                     error_code="OSError",
                     retryable=True,
+                    retry_budget_class="infrastructure",
                     message=str(exc),
                 ),
             )
@@ -205,6 +233,7 @@ class ParseDocument:
                     stage="parse",
                     error_code=exc.__class__.__name__,
                     retryable=False,
+                    retry_budget_class="item",
                     message=str(exc),
                 ),
             )
@@ -213,13 +242,8 @@ class ParseDocument:
         run = self._finish_run(
             processing_run_id=context["processing_run_id"],
             status="succeeded",
-            parser_name=parser_result.parser_name,
-            parser_version=parser_result.parser_version,
-            parser_backend=parser_result.parser_backend,
-            parser_method=parser_result.parser_method,
-            parser_language=parser_result.parser_language,
             input_raw_file_hash=context["document"].raw_file_hash,
-            parser_artifact_relpath=str(artifact_relpaths.artifact_root),
+            parser_artifact_relpath=str(artifact_root_relpath),
             normalized_ir_relpath=str(context["normalized_ir_relpath"]),
             artifact_hash=normalized_ir_hash,
         )
@@ -230,68 +254,6 @@ class ParseDocument:
             normalized_ir_relpath=run.normalized_ir_relpath,
             artifact_hash=run.artifact_hash,
         )
-
-    @staticmethod
-    def _verify_model_diagnostic_binding(
-        normalized_ir: dict[str, Any], *, model_path: Path | None
-    ) -> None:
-        diagnostics = normalized_ir.get("parser_diagnostics")
-        if not isinstance(diagnostics, dict):
-            return
-        reconciliation = diagnostics.get("table_reconciliation")
-        if not isinstance(reconciliation, dict):
-            return
-        status = reconciliation.get("model_status")
-        expected_hash = reconciliation.get("model_hash")
-        if status == "absent":
-            if model_path is not None or expected_hash is not None:
-                raise _ParseRunFailure(
-                    stage="parse_artifact",
-                    error_code="parser_model_binding_invalid",
-                    retryable=False,
-                    message="absent model diagnostics must not reference a model artifact",
-                )
-            return
-        if status == "unreadable":
-            if expected_hash is not None:
-                raise _ParseRunFailure(
-                    stage="parse_artifact",
-                    error_code="parser_model_binding_invalid",
-                    retryable=False,
-                    message="unreadable model diagnostics must not publish a model hash",
-                )
-            return
-        if status not in {"supported", "invalid_json", "unsupported_schema"}:
-            return
-        if model_path is None or not isinstance(expected_hash, str):
-            raise _ParseRunFailure(
-                stage="parse_artifact",
-                error_code="parser_model_binding_invalid",
-                retryable=False,
-                message=f"{status} model diagnostics require a path and sha256 hash",
-            )
-        try:
-            with model_path.open("rb") as model_file:
-                actual_hash = "sha256:" + hashlib.file_digest(
-                    model_file, "sha256"
-                ).hexdigest()
-        except OSError as exc:
-            raise _ParseRunFailure(
-                stage="parse_artifact",
-                error_code="parser_model_artifact_unreadable",
-                retryable=False,
-                message=str(exc),
-            ) from exc
-        if actual_hash != expected_hash:
-            raise _ParseRunFailure(
-                stage="parse_artifact",
-                error_code="parser_model_hash_mismatch",
-                retryable=False,
-                message=(
-                    f"model artifact hashes to {actual_hash}, diagnostics publish "
-                    f"{expected_hash}"
-                ),
-            )
 
     def _effective_options(self, options: ParserOptions) -> ParserOptions:
         if options.timeout_seconds is not None:
@@ -338,6 +300,7 @@ class ParseDocument:
                 processing_run_id=processing_run_id,
             )
             prepare_error: dict[str, Any] | None = None
+            parser_target_identity: ParserTargetIdentity | None = None
             try:
                 identity = self._parser.identity()
                 parser_name = identity.name
@@ -352,15 +315,31 @@ class ParseDocument:
                     # property of this PDF. Keep the item retryable so a
                     # repaired binary/service can resume after worker cooldown.
                     retryable=True,
+                    retry_budget_class="infrastructure",
                     message=str(exc),
                 )
             else:
+                try:
+                    parser_target_identity = options.target_identity(identity)
+                except ParserTargetIdentityError as exc:
+                    parser_target_identity = None
+                    prepare_error = self._structured_error(
+                        stage="parser_identity",
+                        error_code="parser_target_identity_invalid",
+                        retryable=False,
+                        retry_budget_class="infrastructure",
+                        message=str(exc),
+                    )
                 # Identity is stable package/configuration metadata. Runtime
                 # readiness is an admission check and must happen before the
                 # parser consumes this document, never after successful
                 # artifacts have already been produced.
                 readiness = getattr(self._parser, "readiness", None)
-                if self._check_readiness and callable(readiness):
+                if (
+                    prepare_error is None
+                    and self._check_readiness
+                    and callable(readiness)
+                ):
                     try:
                         readiness(options)
                     except ParserVersionProbeError as exc:
@@ -368,12 +347,14 @@ class ParseDocument:
                             stage="parser_readiness",
                             error_code="parser_readiness_failed",
                             retryable=True,
+                            retry_budget_class="infrastructure",
                             message=str(exc),
                         )
             run = uow.processing_runs.add(
                 e.ProcessingRun(
                     processing_run_id=processing_run_id,
                     document_id=document.document_id,
+                    artifact_owner_processing_run_id=processing_run_id,
                     run_kind="parse",
                     status="failed" if prepare_error else "running",
                     parser_name=parser_name,
@@ -381,6 +362,11 @@ class ParseDocument:
                     parser_backend=options.backend,
                     parser_method=options.method,
                     parser_language=options.language,
+                    parser_target_identity=(
+                        parser_target_identity.to_payload()
+                        if parser_target_identity is not None
+                        else None
+                    ),
                     input_raw_file_hash=document.raw_file_hash,
                     parser_artifact_relpath=str(artifact_root_relpath),
                     normalized_ir_relpath=str(normalized_ir_relpath),
@@ -416,10 +402,13 @@ class ParseDocument:
             "run": run,
             "prepare_failed": prepare_error is not None,
             "processing_run_id": run.processing_run_id,
-            "input_pdf": self._paths.data_path(Path(cast(str, document.raw_file_relpath))),
+            "input_pdf": self._paths.data_path(
+                Path(cast(str, document.raw_file_relpath))
+            ),
             "artifact_root_relpath": artifact_root_relpath,
             "artifact_root_path": self._paths.data_path(artifact_root_relpath),
             "normalized_ir_relpath": normalized_ir_relpath,
+            "parser_target_identity": parser_target_identity,
             "document_metadata": {
                 "document_id": document.document_id,
                 "title": document.title,
@@ -456,47 +445,46 @@ class ParseDocument:
         if verification.ok:
             return
         error_code = (
-            "raw_missing"
-            if verification.actual_hash is None
-            else "raw_hash_mismatch"
+            "raw_missing" if verification.actual_hash is None else "raw_hash_mismatch"
         )
         raise _ParseRunFailure(
             stage="raw_verification",
             error_code=error_code,
             retryable=False,
+            retry_budget_class="item",
             message=verification.message,
         )
 
-    def _artifact_relpaths(
+    def _artifact_root_relpath(
         self,
         *,
         artifact_root_relpath: Path,
         artifact_root_path: Path,
         artifact_root: Path,
-        content_list_path: Path,
-        markdown_path: Path | None,
-        model_path: Path | None,
-    ) -> _ArtifactRelpaths:
-        def relpath(path: Path) -> Path:
-            return artifact_root_relpath / path.relative_to(artifact_root_path)
-
-        return _ArtifactRelpaths(
-            artifact_root=relpath(artifact_root),
-            content_list=relpath(content_list_path),
-            markdown=relpath(markdown_path) if markdown_path is not None else None,
-            model=relpath(model_path) if model_path is not None else None,
-        )
+    ) -> Path:
+        try:
+            output_root = artifact_root_path.resolve(strict=True)
+            parser_root = artifact_root.resolve(strict=True)
+            relative = parser_root.relative_to(output_root)
+        except FileNotFoundError as exc:
+            raise ParserOutputContractError(
+                f"parser artifact root does not exist: {artifact_root}"
+            ) from exc
+        except ValueError as exc:
+            raise ParserOutputContractError(
+                f"parser artifact root escapes its run directory: {artifact_root}"
+            ) from exc
+        if not parser_root.is_dir():
+            raise ParserOutputContractError(
+                f"parser artifact root is not a directory: {artifact_root}"
+            )
+        return artifact_root_relpath / relative
 
     def _finish_run(
         self,
         *,
         processing_run_id: str,
         status: str,
-        parser_name: str | None = None,
-        parser_version: str | None = None,
-        parser_backend: str | None = None,
-        parser_method: str | None = None,
-        parser_language: str | None = None,
         input_raw_file_hash: str | None = None,
         parser_artifact_relpath: str | None = None,
         normalized_ir_relpath: str | None = None,
@@ -506,7 +494,9 @@ class ParseDocument:
         with self._uow_factory() as uow:
             run = uow.processing_runs.get(processing_run_id)
             if run is None:
-                raise ParseDocumentError(f"processing run not found: {processing_run_id}")
+                raise ParseDocumentError(
+                    f"processing run not found: {processing_run_id}"
+                )
             maybe_lock_document(uow, run.document_id)
             if run.status != "running":
                 # First terminal state wins: the stale reclaimer (or a
@@ -522,16 +512,13 @@ class ParseDocument:
                     "or duplicate finisher won)"
                 )
             run.status = status
-            run.parser_name = parser_name or run.parser_name
-            run.parser_version = parser_version or run.parser_version
-            run.parser_backend = parser_backend or run.parser_backend
-            run.parser_method = parser_method or run.parser_method
-            run.parser_language = parser_language or run.parser_language
             run.input_raw_file_hash = input_raw_file_hash or run.input_raw_file_hash
             run.parser_artifact_relpath = (
                 parser_artifact_relpath or run.parser_artifact_relpath
             )
-            run.normalized_ir_relpath = normalized_ir_relpath or run.normalized_ir_relpath
+            run.normalized_ir_relpath = (
+                normalized_ir_relpath or run.normalized_ir_relpath
+            )
             run.artifact_hash = artifact_hash or run.artifact_hash
             run.error = error
             finished_at = datetime.now(timezone.utc)
@@ -562,6 +549,7 @@ class ParseDocument:
                 stage=failure.stage,
                 error_code=failure.error_code,
                 retryable=failure.retryable,
+                retry_budget_class=failure.retry_budget_class,
                 message=failure.message,
             ),
         )
@@ -581,102 +569,145 @@ class ParseDocument:
         uow.documents.update(document)
 
     def _structured_error(
-        self, *, stage: str, error_code: str, retryable: bool, message: str
+        self,
+        *,
+        stage: str,
+        error_code: str,
+        retryable: bool,
+        retry_budget_class: ParserRetryBudgetClass,
+        message: str,
     ) -> dict[str, Any]:
         return {
             "stage": stage,
             "error_code": error_code,
             "retryable": retryable,
+            "retry_budget_class": retry_budget_class,
             "message": message,
         }
 
     def _parser_failure_from_exception(self, exc: Exception) -> _ParseRunFailure:
-        if isinstance(exc, ParserTimeoutError):
+        if not isinstance(exc, ParserError):
+            raise TypeError(f"unsupported parser failure type: {type(exc)!r}")
+
+        def typed(
+            stage: str,
+            error_code: str,
+            *,
+            retryable: bool,
+        ) -> _ParseRunFailure:
             return _ParseRunFailure(
-                stage="parse",
-                error_code="parse_timeout",
-                retryable=True,
+                stage=stage,
+                error_code=error_code,
+                retryable=retryable,
+                retry_budget_class=exc.retry_budget_class,
                 message=str(exc),
             )
+
+        if isinstance(exc, ParserTimeoutError):
+            return typed("parse", "parse_timeout", retryable=True)
         if isinstance(exc, ParserTaskDeadlineError):
-            return _ParseRunFailure(
-                stage="parse",
-                error_code="parser_task_deadline_exceeded",
+            return typed(
+                "parse",
+                "parser_task_deadline_exceeded",
                 retryable=True,
-                message=str(exc),
             )
         if isinstance(exc, ParserBackendOverloadedError):
-            return _ParseRunFailure(
-                stage="parse",
-                error_code="parser_backend_overloaded",
-                retryable=True,
-                message=str(exc),
-            )
+            return typed("parse", "parser_backend_overloaded", retryable=True)
         if isinstance(exc, ParserCancelledError):
-            return _ParseRunFailure(
-                stage="parse",
-                error_code="parser_cancelled",
-                retryable=True,
-                message=str(exc),
-            )
+            return typed("parse", "parser_cancelled", retryable=True)
         if isinstance(exc, ParserTaskError):
-            return _ParseRunFailure(
-                stage="parse",
-                error_code="parser_task_failed",
-                retryable=True,
-                message=str(exc),
-            )
+            return typed("parse", "parser_task_failed", retryable=True)
         if isinstance(exc, ParserLocalInvocationError):
-            return _ParseRunFailure(
-                stage="parse",
-                error_code="parser_local_invocation_failed",
+            return typed(
+                "parse",
+                "parser_local_invocation_failed",
                 retryable=True,
-                message=str(exc),
             )
         if isinstance(exc, ParserInvocationError):
-            return _ParseRunFailure(
-                stage="parse",
-                error_code="parser_invocation_failed",
-                retryable=True,
-                message=str(exc),
-            )
+            return typed("parse", "parser_invocation_failed", retryable=True)
         if isinstance(exc, ParserVersionProbeError):
-            return _ParseRunFailure(
-                stage="parser_identity",
-                error_code="parser_version_probe_failed",
+            return typed(
+                "parser_identity",
+                "parser_version_probe_failed",
                 retryable=True,
-                message=str(exc),
             )
         if isinstance(exc, ParserOutputContractError):
-            return _ParseRunFailure(
-                stage="parse_output",
-                error_code="parser_output_contract_failed",
+            return typed(
+                "parse_output",
+                "parser_output_contract_failed",
                 retryable=False,
-                message=str(exc),
             )
         if isinstance(exc, ParserUnknownError):
-            return _ParseRunFailure(
-                stage="parse",
-                error_code="parser_unknown_failed",
-                retryable=False,
-                message=str(exc),
-            )
+            return typed("parse", "parser_unknown_failed", retryable=False)
         raise TypeError(f"unsupported parser failure type: {type(exc)!r}")
 
 
-def artifact_relpath_map(
+_ARTIFACT_ROLE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def build_parser_artifact_manifest(
     *,
+    artifact_root: Path,
     artifact_root_relpath: Path,
-    content_list_relpath: Path,
-    markdown_relpath: Path | None,
-    model_relpath: Path | None = None,
-) -> dict[str, str]:
-    artifacts = {
+    artifact_paths: Mapping[str, Path | None],
+) -> dict[str, Any]:
+    """Hash a parser-neutral role map without inferring provider-specific roles."""
+
+    if (
+        artifact_root_relpath.is_absolute()
+        or ".." in artifact_root_relpath.parts
+        or not artifact_root_relpath.parts
+    ):
+        raise ParserOutputContractError("parser artifact root relpath is unsafe")
+    if not artifact_paths:
+        raise ParserOutputContractError("parser emitted no artifact roles")
+    try:
+        resolved_root = artifact_root.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ParserOutputContractError(
+            f"parser artifact root does not exist: {artifact_root}"
+        ) from exc
+    if not resolved_root.is_dir():
+        raise ParserOutputContractError(
+            f"parser artifact root is not a directory: {artifact_root}"
+        )
+
+    files: dict[str, dict[str, Any]] = {}
+    for role in sorted(artifact_paths):
+        if not isinstance(role, str) or _ARTIFACT_ROLE_RE.fullmatch(role) is None:
+            raise ParserOutputContractError(f"parser artifact role is unsafe: {role!r}")
+        path = artifact_paths[role]
+        if path is None:
+            files[role] = {"availability": "not_emitted"}
+            continue
+        if not isinstance(path, Path):
+            raise ParserOutputContractError(
+                f"parser artifact {role!r} path is not a pathlib.Path"
+            )
+        try:
+            resolved = path.resolve(strict=True)
+            relative = resolved.relative_to(resolved_root)
+        except FileNotFoundError as exc:
+            raise ParserOutputContractError(
+                f"parser artifact {role!r} does not exist: {path}"
+            ) from exc
+        except ValueError as exc:
+            raise ParserOutputContractError(
+                f"parser artifact {role!r} escapes artifact root: {path}"
+            ) from exc
+        if not relative.parts or not resolved.is_file():
+            raise ParserOutputContractError(
+                f"parser artifact {role!r} is not a file below artifact root: {path}"
+            )
+        with resolved.open("rb") as artifact_file:
+            digest = hashlib.file_digest(artifact_file, "sha256").hexdigest()
+        files[role] = {
+            "availability": "present",
+            "relpath": str(artifact_root_relpath / relative),
+            "sha256": f"sha256:{digest}",
+            "size_bytes": resolved.stat().st_size,
+        }
+    return {
         "artifact_root_relpath": str(artifact_root_relpath),
-        "content_list_relpath": str(content_list_relpath),
+        "files": files,
     }
-    if markdown_relpath is not None:
-        artifacts["markdown_relpath"] = str(markdown_relpath)
-    if model_relpath is not None:
-        artifacts["model_relpath"] = str(model_relpath)
-    return artifacts

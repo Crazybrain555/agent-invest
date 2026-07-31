@@ -115,11 +115,15 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                     )
                 )
                 created["document"] = document.document_id
+                self.assertEqual(document.class_filing_type, "annual_report")
+                self.assertIsNotNone(document.class_rules_version)
 
+                run_id = ids.new_processing_run_id()
                 run = uow.processing_runs.add(
                     e.ProcessingRun(
-                        processing_run_id=ids.new_processing_run_id(),
+                        processing_run_id=run_id,
                         document_id=document.document_id,
+                        artifact_owner_processing_run_id=run_id,
                         run_kind="full",
                         status="succeeded",
                         is_active=True,
@@ -138,7 +142,11 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                             "run_01K0000000000000000000000/normalized_ir.v2.json"
                         ),
                         builder_rules_version="ub-2026.07-1",
-                        error={"stage": "parse", "error_code": "noop", "retryable": False},
+                        error={
+                            "stage": "parse",
+                            "error_code": "noop",
+                            "retryable": False,
+                        },
                     )
                 )
                 created["run"] = run.processing_run_id
@@ -156,7 +164,10 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                         payload={"unit": "元", "headers": ["账龄"], "rows": [["合计"]]},
                         content_hash="sha256:unit",
                         query_projection_hash="sha256:query",
-                        artifact_locator={"artifact_kind": "normalized_ir", "order_index": 312},
+                        artifact_locator={
+                            "artifact_kind": "normalized_ir",
+                            "order_index": 312,
+                        },
                     )
                 )
                 created["unit"] = unit.asset_id
@@ -179,8 +190,17 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
 
             # Read back in a fresh UnitOfWork to confirm the commit persisted.
             with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
-                self.assertEqual(uow.companies.get(created["company"]).legal_name, "江海股份")
-                self.assertEqual(uow.documents.get(created["document"]).report_period, "2025A")
+                self.assertEqual(
+                    uow.companies.get(created["company"]).legal_name, "江海股份"
+                )
+                self.assertEqual(
+                    uow.documents.get(created["document"]).report_period, "2025A"
+                )
+                loaded_document = uow.documents.get(created["document"])
+                self.assertIsNotNone(loaded_document)
+                assert loaded_document is not None
+                self.assertEqual(loaded_document.class_filing_type, "annual_report")
+                self.assertIsNotNone(loaded_document.class_rules_version)
                 self.assertEqual(
                     uow.company_identifiers.get(created["identifier"]).scheme, "uscc"
                 )
@@ -196,7 +216,9 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                 self.assertEqual(got_run.parser_method, "auto")
                 self.assertEqual(got_run.parser_language, "ch")
                 self.assertEqual(got_run.input_raw_file_hash, "sha256:7c73103aa3c9")
-                self.assertTrue(got_run.parser_artifact_relpath.startswith("parser_artifacts/"))
+                self.assertTrue(
+                    got_run.parser_artifact_relpath.startswith("parser_artifacts/")
+                )
                 self.assertEqual(got_run.unit_build_status, "not_started")
                 self.assertEqual(got_run.unit_build_attempt_count, 0)
                 self.assertEqual(got_run.builder_rules_version, "ub-2026.07-1")
@@ -204,14 +226,18 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                 self.assertEqual(got_unit.semantic_key, "receivable_aging")
                 self.assertEqual(got_unit.heading_path[0], "第八节 财务报告")
                 self.assertEqual(got_unit.query_projection_hash, "sha256:query")
-                self.assertEqual(uow.outbox.get(created["event"]).event_kind, "run_published")
+                self.assertEqual(
+                    uow.outbox.get(created["event"]).event_kind, "run_published"
+                )
         finally:
             self._delete(created)
 
     def test_rollback_discards_writes(self) -> None:
         company_id = ids.new_company_id()
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
-            uow.companies.add(e.Company(company_id=company_id, legal_name="rollback-me"))
+            uow.companies.add(
+                e.Company(company_id=company_id, legal_name="rollback-me")
+            )
             self.assertIsNotNone(uow.companies.get(company_id))
             uow.rollback()
             self.assertIsNone(uow.companies.get(company_id))
@@ -230,12 +256,15 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
 
     def test_one_active_run_per_document(self) -> None:
         document_id = ids.new_document_id()
+        first_run_id = ids.new_processing_run_id()
+        second_run_id = ids.new_processing_run_id()
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
             uow.documents.add(e.Document(document_id=document_id, status="registered"))
             uow.processing_runs.add(
                 e.ProcessingRun(
-                    processing_run_id=ids.new_processing_run_id(),
+                    processing_run_id=first_run_id,
                     document_id=document_id,
+                    artifact_owner_processing_run_id=first_run_id,
                     run_kind="full",
                     status="succeeded",
                     is_active=True,
@@ -244,8 +273,9 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
             with self.assertRaises(IntegrityError):
                 uow.processing_runs.add(
                     e.ProcessingRun(
-                        processing_run_id=ids.new_processing_run_id(),
+                        processing_run_id=second_run_id,
                         document_id=document_id,
+                        artifact_owner_processing_run_id=second_run_id,
                         run_kind="full",
                         status="succeeded",
                         is_active=True,

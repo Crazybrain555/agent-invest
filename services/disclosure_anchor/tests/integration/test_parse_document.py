@@ -30,9 +30,17 @@ from disclosure_anchor.application.use_cases.register_local_pdf import (
 )
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
-from disclosure_anchor.domain.errors import ParserInvocationError, ParserVersionProbeError
+from disclosure_anchor.domain.errors import (
+    ParserInvocationError,
+    ParserVersionProbeError,
+)
 from disclosure_anchor.settings import Settings
 from tests.integration._support import engine_or_skip, numeric_provider_document_id
+from tests.unit._current_ir import (
+    TEST_RUNTIME_BUNDLE_SHA256,
+    artifact_paths_from_ir,
+    write_text_ir_bundle,
+)
 
 
 def _settings(root: Path) -> Settings:
@@ -48,14 +56,20 @@ def _settings(root: Path) -> Settings:
     )
 
 
+def _parse_command(document_id: str) -> ParseDocumentCommand:
+    return ParseDocumentCommand(
+        document_id=document_id,
+        options=ParserOptions(
+            runtime_bundle_identity_sha256=TEST_RUNTIME_BUNDLE_SHA256
+        ),
+    )
+
+
 class FakeParser:
     def identity(self) -> ParserIdentity:
         return ParserIdentity(
             name="MinerU",
             version="3.4.0",
-            backend="pipeline",
-            method="auto",
-            language="ch",
         )
 
     def parse(
@@ -66,55 +80,23 @@ class FakeParser:
         options: ParserOptions,
         document_metadata: dict[str, Any],
     ) -> ParserResult:
-        nested = output_dir / "sample" / "auto"
-        nested.mkdir(parents=True)
-        content_list = nested / "sample_content_list.json"
-        content_list.write_text(
-            json.dumps([{"type": "text", "text": "真实解析烟测", "page_idx": 0}]),
-            encoding="utf-8",
+        fixture_ir_path = Path("_fixture_normalized_ir.v4.json")
+        normalized_ir = write_text_ir_bundle(
+            output_dir,
+            fixture_ir_path,
+            texts=("真实解析烟测",),
+            document_id=str(document_metadata["document_id"]),
+            source_pdf=str(document_metadata["source_pdf"]),
+            document_title=str(document_metadata["title"]),
+            parser_target=options.target_identity(self.identity()),
         )
-        markdown = nested / "sample.md"
-        markdown.write_text("真实解析烟测", encoding="utf-8")
+        (output_dir / fixture_ir_path).unlink()
+        nested = output_dir / "parser" / "a"
         return ParserResult(
-            parser_name="MinerU",
-            parser_version="3.4.0",
-            parser_backend=options.backend,
-            parser_method=options.method,
-            parser_language=options.language,
+            target_identity=options.target_identity(self.identity()),
             artifact_root=nested,
-            content_list_path=content_list,
-            markdown_path=markdown,
-            normalized_ir={
-                "contract_version": "normalized_ir.v3",
-                "created_at": "2026-06-29T00:00:00+00:00",
-                "document_id": document_metadata["document_id"],
-                "source_pdf": document_metadata["source_pdf"],
-                "title": document_metadata["title"],
-                "parser": {
-                    "name": "MinerU",
-                    "package_version": "3.4.0",
-                    "backend": options.backend,
-                    "method": options.method,
-                    "language": options.language,
-                    "formula": options.formula,
-                    "table": options.table,
-                },
-                "parser_artifacts": {},
-                "parsed_pages": {"start_page_no": 1, "end_page_no": 1, "full_pdf": True},
-                "elements": [
-                    {
-                        "ir_id": "fake_ir_0000",
-                        "kind": "text",
-                        "raw_kind": "text",
-                        "order_index": 0,
-                        "source_item_index": 0,
-                        "page_idx": 0,
-                        "page_no": 1,
-                        "heading_level": None,
-                        "text": "真实解析烟测",
-                    }
-                ],
-            },
+            artifact_paths=artifact_paths_from_ir(output_dir, normalized_ir),
+            normalized_ir=normalized_ir,
         )
 
 
@@ -123,9 +105,6 @@ class FailingParser:
         return ParserIdentity(
             name="MinerU",
             version="3.4.0",
-            backend="pipeline",
-            method="auto",
-            language="ch",
         )
 
     def parse(self, **_: Any) -> ParserResult:
@@ -204,7 +183,9 @@ class ParseDocumentTests(unittest.TestCase):
                     {"id": document_id},
                 )
                 conn.execute(
-                    text("DELETE FROM disclosure_core.document WHERE document_id = :id"),
+                    text(
+                        "DELETE FROM disclosure_core.document WHERE document_id = :id"
+                    ),
                     {"id": document_id},
                 )
             for source_access_id in source_access_ids:
@@ -217,7 +198,9 @@ class ParseDocumentTests(unittest.TestCase):
                 )
             for security_id in security_ids:
                 conn.execute(
-                    text("DELETE FROM disclosure_core.security WHERE security_id = :id"),
+                    text(
+                        "DELETE FROM disclosure_core.security WHERE security_id = :id"
+                    ),
                     {"id": security_id},
                 )
             for company_id in company_ids:
@@ -276,16 +259,28 @@ class ParseDocumentTests(unittest.TestCase):
             uow_factory=lambda: SqlAlchemyUnitOfWork(engine=self.engine),
         )
 
-        result = use_case.execute(ParseDocumentCommand(document_id=document_id))
+        result = use_case.execute(_parse_command(document_id))
 
         self.assertEqual(result.status, "succeeded")
-        self.assertTrue(result.parser_artifact_relpath.startswith("parser_artifacts/cninfo/"))
-        self.assertTrue(result.normalized_ir_relpath.startswith("derived/normalized_ir/cninfo/"))
-        normalized_path = self.settings.disclosure_data_root / "data" / result.normalized_ir_relpath
+        self.assertTrue(
+            result.parser_artifact_relpath.startswith("parser_artifacts/cninfo/")
+        )
+        self.assertTrue(
+            result.normalized_ir_relpath.startswith("derived/normalized_ir/cninfo/")
+        )
+        normalized_path = (
+            self.settings.disclosure_data_root / "data" / result.normalized_ir_relpath
+        )
         self.assertTrue(normalized_path.is_file())
         normalized = json.loads(normalized_path.read_text(encoding="utf-8"))
-        self.assertEqual(normalized["parser_artifacts"]["artifact_root_relpath"], result.parser_artifact_relpath)
-        self.assertFalse(Path(normalized["parser_artifacts"]["content_list_relpath"]).is_absolute())
+        self.assertEqual(
+            normalized["parser_artifacts"]["artifact_root_relpath"],
+            result.parser_artifact_relpath,
+        )
+        content = normalized["parser_artifacts"]["files"]["content_list"]
+        self.assertEqual(content["availability"], "present")
+        self.assertFalse(Path(content["relpath"]).is_absolute())
+        self.assertRegex(content["sha256"], r"^sha256:[a-f0-9]{64}$")
 
         with self.engine.connect() as conn:
             row = conn.execute(
@@ -331,7 +326,9 @@ class ParseDocumentTests(unittest.TestCase):
         self.assertEqual(event.subject_ref, result.processing_run_id)
         self.assertEqual(document_status, "parsed")
 
-    def test_parser_failure_records_failed_run_without_disturbing_active_run(self) -> None:
+    def test_parser_failure_records_failed_run_without_disturbing_active_run(
+        self,
+    ) -> None:
         document_id = self._register_document()
         active_run_id = ids.new_processing_run_id()
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
@@ -339,6 +336,7 @@ class ParseDocumentTests(unittest.TestCase):
                 e.ProcessingRun(
                     processing_run_id=active_run_id,
                     document_id=document_id,
+                    artifact_owner_processing_run_id=active_run_id,
                     run_kind="publish",
                     status="succeeded",
                     is_active=True,
@@ -381,7 +379,7 @@ class ParseDocumentTests(unittest.TestCase):
             artifact_store=self.artifact_store,
             uow_factory=lambda: SqlAlchemyUnitOfWork(engine=self.engine),
         )
-        result = use_case.execute(ParseDocumentCommand(document_id=document_id))
+        result = use_case.execute(_parse_command(document_id))
 
         self.assertEqual(result.status, "failed")
         self.assertIsNotNone(result.error)
@@ -401,14 +399,18 @@ class ParseDocumentTests(unittest.TestCase):
                 ),
                 {"id": result.processing_run_id},
             ).one()
-            events = conn.execute(
-                text(
-                    "SELECT event_kind, change_kind, subject_kind, subject_ref, payload "
-                    "FROM disclosure_ops.outbox_event "
-                    "WHERE processing_run_id = :id ORDER BY event_kind"
-                ),
-                {"id": result.processing_run_id},
-            ).mappings().all()
+            events = (
+                conn.execute(
+                    text(
+                        "SELECT event_kind, change_kind, subject_kind, subject_ref, payload "
+                        "FROM disclosure_ops.outbox_event "
+                        "WHERE processing_run_id = :id ORDER BY event_kind"
+                    ),
+                    {"id": result.processing_run_id},
+                )
+                .mappings()
+                .all()
+            )
             document_status = conn.execute(
                 text(
                     "SELECT status, current_processing_run_id "
@@ -452,7 +454,7 @@ class ParseDocumentTests(unittest.TestCase):
             uow_factory=lambda: SqlAlchemyUnitOfWork(engine=self.engine),
         )
 
-        result = use_case.execute(ParseDocumentCommand(document_id=document_id))
+        result = use_case.execute(_parse_command(document_id))
 
         self.assertEqual(result.status, "failed")
         self.assertFalse(parser.called)
@@ -461,14 +463,18 @@ class ParseDocumentTests(unittest.TestCase):
         self.assertEqual(result.error["error_code"], "parser_version_probe_failed")
         self.assertTrue(result.error["retryable"])
         with self.engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT status, parser_name, parser_version, parser_backend, "
-                    "parser_method, parser_language, error "
-                    "FROM disclosure_core.processing_run WHERE processing_run_id = :id"
-                ),
-                {"id": result.processing_run_id},
-            ).mappings().one()
+            row = (
+                conn.execute(
+                    text(
+                        "SELECT status, parser_name, parser_version, parser_backend, "
+                        "parser_method, parser_language, error "
+                        "FROM disclosure_core.processing_run WHERE processing_run_id = :id"
+                    ),
+                    {"id": result.processing_run_id},
+                )
+                .mappings()
+                .one()
+            )
             document_status = conn.execute(
                 text(
                     "SELECT status FROM disclosure_core.document "
@@ -502,7 +508,9 @@ class ParseDocumentTests(unittest.TestCase):
             self.assertIsNotNone(document)
 
         assert document is not None
-        raw_path = self.settings.disclosure_data_root / "data" / document.raw_file_relpath
+        raw_path = (
+            self.settings.disclosure_data_root / "data" / document.raw_file_relpath
+        )
         raw_path.write_bytes(b"%PDF-1.4\ntampered raw bytes\n%%EOF\n")
         parser = TrackingParser()
         use_case = ParseDocument(
@@ -513,7 +521,7 @@ class ParseDocumentTests(unittest.TestCase):
             uow_factory=lambda: SqlAlchemyUnitOfWork(engine=self.engine),
         )
 
-        result = use_case.execute(ParseDocumentCommand(document_id=document_id))
+        result = use_case.execute(_parse_command(document_id))
 
         self.assertEqual(result.status, "failed")
         self.assertFalse(parser.called)

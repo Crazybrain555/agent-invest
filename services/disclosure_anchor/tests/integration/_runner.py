@@ -10,39 +10,25 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
-import hashlib
 import os
 from pathlib import Path
-import re
-import secrets
 import signal
 import subprocess
 import sys
 import tempfile
-import time
 from types import FrameType
 
 import sqlalchemy
-from sqlalchemy import text
-from sqlalchemy.engine import Connection
-from sqlalchemy.pool import NullPool
 
 from disclosure_anchor.adapters.db.postgres.bootstrap import (
     ensure_schemas_and_base_grants,
 )
-from disclosure_anchor.adapters.db.postgres.schema import OWNER_ROLE
-from tests.integration._support import (
-    TEST_DATABASE_COMMENT_PREFIX,
-    TEST_DATABASE_PREFIX,
-    is_managed_test_database_identity,
-    test_database_created_epoch,
+from scripts.managed_scratch_database import (
+    ManagedScratchDatabase,
 )
 
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
-_LIFECYCLE_LOCK_NS = 815005
-_ORPHAN_TTL_SECONDS = 6 * 60 * 60
-_SAFE_DATABASE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _DATABASE_ENV_KEYS = (
     "DISCLOSURE_TEST_DATABASE_URL",
     "DISCLOSURE_MIGRATION_DATABASE_URL",
@@ -56,54 +42,11 @@ _MINERU_RUNTIME_ENV_KEYS = (
     "DISCLOSURE_MINERU_SERVER_URL",
 )
 
-
-def _quote_identifier(value: str) -> str:
-    if _SAFE_DATABASE_NAME.fullmatch(value) is None:
-        raise ValueError(f"unsafe scratch database name: {value!r}")
-    return f'"{value}"'
-
-
-def _quote_literal(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
-def _database_lease_key(database_name: str) -> int:
-    """Return a stable signed bigint key in the integration-test namespace."""
-
-    digest = hashlib.blake2b(
-        database_name.encode("utf-8"),
-        digest_size=8,
-        person=b"disc-itest",
-    ).digest()
-    return int.from_bytes(digest, byteorder="big", signed=True)
-
-
-class ScratchIntegrationDatabase:
+class ScratchIntegrationDatabase(ManagedScratchDatabase):
     """Provision, lease, migrate, and destroy one integration-test database."""
 
     def __init__(self, base_url: str, *, real_mineru: bool = False) -> None:
-        created_at = int(time.time())
-        self.database_name = (
-            f"{TEST_DATABASE_PREFIX}{created_at}_{os.getpid()}_{secrets.token_hex(4)}"
-        )
-        _quote_identifier(self.database_name)
-        parsed_url = sqlalchemy.engine.make_url(base_url)
-        self.database_url = parsed_url.set(database=self.database_name).render_as_string(
-            hide_password=False
-        )
-        maintenance_url = parsed_url.set(database="postgres").render_as_string(
-            hide_password=False
-        )
-        self._created_at = created_at
-        self._admin_engine = sqlalchemy.create_engine(
-            maintenance_url,
-            isolation_level="AUTOCOMMIT",
-            poolclass=NullPool,
-        )
-        self._database_lease: Connection | None = None
-        self._lease_key = _database_lease_key(self.database_name)
-        self._created = False
-        self._closed = False
+        super().__init__(base_url)
         self._real_mineru = real_mineru
         self._roots = tempfile.TemporaryDirectory(prefix="disclosure-itest-")
 
@@ -126,36 +69,10 @@ class ScratchIntegrationDatabase:
         self.close()
 
     def _provision(self) -> None:
-        with self._admin_engine.connect() as admin:
-            self._lock_lifecycle(admin)
-            try:
-                self._reap_orphans(admin)
-                admin.exec_driver_sql(
-                    f"CREATE DATABASE {_quote_identifier(self.database_name)} "
-                    f'OWNER "{OWNER_ROLE}" TEMPLATE template0'
-                )
-                self._created = True
-                # Hold the liveness lease in the maintenance DB. A SIGKILL
-                # releases this session lock even if the unittest child keeps
-                # a target-DB connection alive.
-                self._database_lease = self._admin_engine.connect()
-                self._database_lease.execute(
-                    text("SELECT pg_advisory_lock(:lease_key)"),
-                    {"lease_key": self._lease_key},
-                )
-                comment = (
-                    f"{TEST_DATABASE_COMMENT_PREFIX}{self._created_at}:"
-                    f"{self.database_name}"
-                )
-                admin.exec_driver_sql(
-                    f"COMMENT ON DATABASE {_quote_identifier(self.database_name)} "
-                    f"IS {_quote_literal(comment)}"
-                )
-            finally:
-                self._unlock_lifecycle(admin)
-
+        self.provision()
         schema_engine = sqlalchemy.create_engine(
-            self.database_url, isolation_level="AUTOCOMMIT"
+            self.database_url,
+            isolation_level="AUTOCOMMIT",
         )
         try:
             ensure_schemas_and_base_grants(schema_engine)
@@ -225,109 +142,11 @@ class ScratchIntegrationDatabase:
                 f"{loaded.returncode}"
             )
 
-    def _reap_orphans(self, admin: Connection) -> None:
-        now = int(time.time())
-        rows = admin.execute(
-            text(
-                "SELECT d.datname, shobj_description(d.oid, 'pg_database') "
-                "FROM pg_database d "
-                "ORDER BY d.datname"
-            )
-        ).all()
-        for database_name, comment in rows:
-            name = str(database_name)
-            created_epoch = test_database_created_epoch(name)
-            if created_epoch is None:
-                continue
-            marker = None if comment is None else str(comment)
-            if marker is not None and not is_managed_test_database_identity(
-                name, marker
-            ):
-                continue
-            # An exact marker is published only after the parent owns the
-            # lease, so a free lease proves that parent is gone. Unmarked DBs
-            # retain a TTL for the tiny CREATE-before-lease crash window.
-            if marker is None and now - created_epoch < _ORPHAN_TTL_SECONDS:
-                continue
-            lease_key = _database_lease_key(name)
-            lease_acquired = bool(
-                admin.execute(
-                    text("SELECT pg_try_advisory_lock(:lease_key)"),
-                    {"lease_key": lease_key},
-                ).scalar()
-            )
-            if not lease_acquired:
-                print(
-                    f"[integration-db] retained active orphan candidate {name}",
-                    flush=True,
-                )
-                continue
-            try:
-                admin.exec_driver_sql(
-                    f"DROP DATABASE {_quote_identifier(name)} WITH (FORCE)"
-                )
-                print(f"[integration-db] reaped orphan {name}", flush=True)
-            finally:
-                admin.execute(
-                    text("SELECT pg_advisory_unlock(:lease_key)"),
-                    {"lease_key": lease_key},
-                )
-
-    @staticmethod
-    def _lock_lifecycle(admin: Connection) -> None:
-        admin.execute(
-            text("SELECT pg_advisory_lock(:namespace, 0)"),
-            {"namespace": _LIFECYCLE_LOCK_NS},
-        )
-
-    @staticmethod
-    def _unlock_lifecycle(admin: Connection) -> None:
-        admin.execute(
-            text("SELECT pg_advisory_unlock(:namespace, 0)"),
-            {"namespace": _LIFECYCLE_LOCK_NS},
-        )
-
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
         try:
-            if self._created:
-                with self._admin_engine.connect() as admin:
-                    self._lock_lifecycle(admin)
-                    try:
-                        self._release_database_lease()
-                        admin.exec_driver_sql(
-                            f"DROP DATABASE IF EXISTS "
-                            f"{_quote_identifier(self.database_name)} WITH (FORCE)"
-                        )
-                        print(
-                            f"[integration-db] dropped {self.database_name}",
-                            flush=True,
-                        )
-                    finally:
-                        self._unlock_lifecycle(admin)
+            super().close()
         finally:
-            self._release_database_lease()
-            self._admin_engine.dispose()
             self._roots.cleanup()
-
-    def _release_database_lease(self) -> None:
-        lease = self._database_lease
-        self._database_lease = None
-        if lease is None:
-            return
-        try:
-            lease.execute(
-                text("SELECT pg_advisory_unlock(:lease_key)"),
-                {"lease_key": self._lease_key},
-            )
-        except Exception:
-            # NullPool makes close a physical disconnect, which releases the
-            # session lock even when the explicit unlock cannot be delivered.
-            lease.invalidate()
-        finally:
-            lease.close()
 
 
 def _signal_process_group(child: subprocess.Popen[bytes], signum: int) -> None:

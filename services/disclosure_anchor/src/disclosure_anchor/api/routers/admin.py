@@ -15,6 +15,9 @@ from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA
 from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
 from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
+from disclosure_anchor.adapters.parsers.mineru.source_evidence_validator import (
+    MinerUSourceEvidenceValidator,
+)
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
@@ -117,6 +120,9 @@ def parse_document(
             server_url=settings.disclosure_mineru_server_url,
             http_request_concurrency=(
                 settings.mineru_http_request_concurrency
+            ),
+            runtime_bundle_identity_sha256=(
+                settings.disclosure_mineru_runtime_bundle_identity_sha256
             ),
         )
         if settings is not None
@@ -308,6 +314,7 @@ class AdminDeps:
             path_builder=self._paths,
             artifact_store=self._artifacts,
             uow_factory=self._uow_factory,
+            source_evidence_validator=MinerUSourceEvidenceValidator(),
         ).execute(BuildUnitsCommand(document_id=document_id))
 
     def publish_run(
@@ -528,6 +535,12 @@ def _parser_options(
         language=command.language if command.language is not None else defaults.language,
         formula=command.formula if command.formula is not None else defaults.formula,
         table=command.table if command.table is not None else defaults.table,
+        effort=command.effort if command.effort is not None else defaults.effort,
+        image_analysis=(
+            command.image_analysis
+            if command.image_analysis is not None
+            else defaults.image_analysis
+        ),
         start_page=command.start_page,
         end_page=command.end_page,
         timeout_seconds=command.timeout_seconds,
@@ -537,6 +550,9 @@ def _parser_options(
             else defaults.server_url
         ),
         http_request_concurrency=defaults.http_request_concurrency,
+        runtime_bundle_identity_sha256=(
+            defaults.runtime_bundle_identity_sha256
+        ),
     )
 
 

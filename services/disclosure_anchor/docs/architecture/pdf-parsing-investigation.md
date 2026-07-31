@@ -8,12 +8,21 @@
 > 调研时间：2026-06（2026-06-20 按 v1.0 canonical 设计对齐）。
 >
 > **对齐说明**：框架选型结论（默认 MinerU，Docling/Camelot/pdfplumber 按需）不变；但解析的**入库目标**已按
-> `service-purpose.md` 和 `财报与披露数据接入及切分方案.md` 改为 `document_unit`（text/table/qa），不再以复制
+> `service-purpose.md` 和 `财报与披露数据接入及切分方案.md` 改为 `document_unit`
+> （text/table/mixed；qa 仅为历史产物），不再以复制
 > parser 的 `page/block/cell` 为目标。表格“双解析对账”从“第一版每张财报页必做”改为**按需触发**（默认单 parser）。
 > 服务边界以 `service-purpose.md`（canonical）为准，实施顺序与取舍见《财报与披露数据接入及切分方案》（implementation_plan）。
 >
+> **2026-07-26 更新**：后文“标题正则足够”“MinerU 原生跨页合并完成”和“L1 生成 QA”的
+> 早期判断已被真实语料否定。当前把 MinerU typed blocks、page/model provenance、TOC/几何和页图
+> 视为结构证据；Markdown 只是展示格式。文档级结构恢复可借鉴
+> [MinerU-Popo](https://github.com/opendatalab/MinerU-Popo) 的页面图像 + OCR blocks +
+> document-tree 任务拆分，但其标点/短语候选启发式必须先经过本地跨公司正反语料校准，不能直接
+> 成为删除或边界规则。
+>
 > 服务目的见 `service-purpose.md`：我们要的不是“把 PDF 下载到文件夹”，也不是镜像 parser 的每一页每一格，而是把
-> 正文、完整表格、完整问答切成 L2 可直接使用的 `document_unit`。解析格式必须服务于这套结构，而不是只产出一坨给人看的文本。
+> 按真实文档结构形成包含正文、表格、caption/footnote 与视觉证据的完整 evidence block，
+> 让 L2 能从任一命中点取得可回放上下文。问答等业务语义由 L2 从这些证据中抽取。
 >
 > 本文中的 license / 平台支持等关键事实以各项目**官方仓库**为准（部分第三方对比博客信息已过期，见下方“事实更正”）。
 
@@ -27,8 +36,13 @@
 4. **格式不是“二选一”，而是双轨**：
    - 正文/章节/item → **Markdown**（可读、好切块）；
    - 表格 → **保留结构化形式（headers/rows/notes/原始字符串），不要拍平成 Markdown 管道符**。财报表格拍平成 `| a | b |` 会丢精度。
-   - 两者都来自同一个**结构化中间产物**（MinerU 的 `content_list.json` / DoclingDocument）。这个中间产物留在 `parser_artifacts/`（文件系统），是切分依据；真正入库的是从它派生出的 `document_unit` 内容快照。
-5. **你的假设“财报规则一样、没那么难”——对一半**：版面确实高度规则（封面/目录/重要提示/管理层讨论/三大报表/附注），**版面级切分确实不难**；但**表格里的数字保真是真正的难点**（合并单元格、跨页表、负号/括号表示负数、千分位、脚注关系）。已有专门的金融 OCR 基准（FinCriticalED）和金融专用模型（Agentar-Fin-OCR）就是冲着这个问题来的。所以第一版要带**轻量表格质量检查**，并在某张表即将进入重要 claim 时做**按需的更严格复核**——而不是对每张表都盲目跑双 parser 逐格对账。
+   - 两者都来自 parser artifact。MinerU 的 `middle.json` 保存
+     page→block→line→span 与 bbox 的结构化中间结果，`content_list.json`
+     是从中派生的扁平阅读序投影；两者都留在 `parser_artifacts/`，真正入库的是
+     可回放 source edge 所派生的 `document_unit` 内容快照。
+5. **你的假设“财报规则一样、没那么难”——只在模板层成立**：章节外观高度规则，
+   但 heading 识别、标题层级、caption 归属、跨页 logical row、阅读顺序与数字保真都会失真。
+   结构恢复和表格保真必须同等对待；每次修复都要有 source identity、结构证据和跨公司正负回放。
 
 ---
 
@@ -38,10 +52,13 @@
 
 **部分成立。**
 
-- ✅ **成立的部分**：A 股定期报告版面高度标准化。年报/季报基本都是「封面 → 重要提示 → 目录 → 公司简介 → 会计数据和财务指标 → 管理层讨论与分析 → 公司治理 → 财务报告（资产负债表/利润表/现金流量表/所有者权益变动表）→ 附注」。这种规则性让**章节切分**和**报告期识别**确实相对简单——可以靠标题正则 + 版面顺序搞定大部分，正好支撑按 `heading_path` 切 `text` 单元。
+- ✅ **成立的部分**：A 股定期报告有稳定的章节和编号语法，因此 parser typed heading、
+  文档自身 TOC、通用 outline grammar、bbox/阅读顺序可以互相校验。编号或标点只能作为
+  结构证据组合的一部分，不能靠标题词表/正则单独决定边界。
 - ❌ **不成立的部分**：**表格才是难点，而不是版面**。财报里的财务报表：
   - 大量**合并单元格**、多级表头（“本期/上期”、“合并/母公司”）；
-  - **跨页表格**需要正确合并成一个逻辑 `table` 单元（MinerU 支持，朴素方案会断）；
+  - **跨页表格**不能靠 parser 猜成一个逻辑 `table`；canonical evidence 先按物理页闭合，
+    跨页关系另行证明，且必须能回到 model/page bbox、crop 和源 HTML；
   - 数字格式坑：括号表负数 `(1,234)`、负号、千分位逗号、单位（元/万元/亿元）、`-` 表示空值；
   - 数字一旦 OCR 错位（小数点、负号、漏位），下游所有计算都错——这正是 **FinCriticalED**（2026 金融 fact-level OCR 基准）证明的：通用解析器在金融表格上“文本看着对、数字未必对”。
 
@@ -61,7 +78,9 @@
 **结论**：
 - 把 **Markdown 当正文（`document_unit(text)`）的展示/检索副本**，留在 `parser_artifacts/`；
 - 把解析器的**结构化中间产物（带 bbox/page/type/表格 HTML）作为切分依据**，也留在文件系统；
-- 入库的事实是从中派生的 `document_unit`：`text` 存正文，`table` 存 `headers/rows/notes/unit + 原始字符串`，`qa` 存完整问答。**不把 page/bbox/cell 作为持久化对象**（见 canonical §2.3、§11）。
+- 入库的事实是从中派生的 `document_unit`：`text` 存正文，`table` 存
+  `headers/rows/notes/unit`，`mixed` 按源顺序组合同一结构 occurrence 下的异构证据。
+  page/bbox/source item/hash chain 保存在 locator/provenance，不能因组块而丢失。
 
 ---
 
@@ -69,7 +88,7 @@
 
 | 框架 | 类型 | License | macOS/Apple Silicon | 中文/CJK | 表格 | 速度 | 输出 | 适合角色 |
 |---|---|---|---|---|---|---|---|---|
-| **MinerU** (v3.3.1) | 版面模型 + 可选 VLM | MinerU 协议（基于 Apache 2.0） | ✅ 14+，MPS / `vlm-mlx` 加速 | ✅✅✅ SOTA | ✅✅✅ HTML、跨页合并 | Pipeline 快(CPU可跑)，VLM 需 GPU | **Markdown + JSON（content_list，带 bbox/page）** | **默认后端** |
+| **MinerU** (现役 3.4.0) | 版面模型 + 可选 VLM | MinerU 协议（基于 Apache 2.0） | ✅ 14+，MPS / `vlm-mlx` 加速 | ✅✅✅ SOTA | ✅✅✅ HTML + page/model 结构；生产关闭跨页表合并并做页内闭合 | Pipeline 快(CPU可跑)，VLM 需 GPU | **Markdown + JSON（content_list/model，带 bbox/page）** | **默认后端** |
 | **Docling** | 版面模型 | MIT（Linux Foundation） | 部分（CPU 慢） | ✅ 好 | ✅✅ | 中等，CPU 偏慢 | DoclingDocument → md/json/html | **第二后端 / 交叉校验（按需）** |
 | **Marker** | 版面模型 | 商用有营收门槛（采用前复核） | ✅ MPS | ✅ 好 | ✅✅ | GPU 很快 | Markdown/JSON | 候补，授权需确认 |
 | **PaddleOCR-VL** | VLM | Apache 2.0 | 需确认 | ✅✅ 强 | ✅✅ | 需 GPU | Markdown/JSON | 中文 OCR 强，可作 VLM 候选 |
@@ -90,12 +109,18 @@
 针对“中文财报 + 本地数据库”这个具体场景，MinerU 的契合点：
 
 1. **中文是第一公民**：OmniDocBench 上 CJK 版面/识别 SOTA，支持 109 种语言；A 股 PDF 大多是数字版（非扫描），命中它最强的场景。
-2. **跨页表格合并**：财报三大报表经常跨页，MinerU 原生支持合并成一张表，正好喂一个逻辑 `table` 单元，省掉自己写拼接逻辑的坑。
+2. **页内表格闭合**：生产 MinerU 关闭跨页表合并；content/model 的每张表必须在同一
+   物理页以唯一 bbox 和完全相同的 logical cells 一一闭合，并保留非空 HTML、grid 与 crop。
+   任一侧缺失、为空、歧义或不等价即解析失败。跨页逻辑关系若需要，作为独立派生关系建立，
+   不拼接或改写 canonical page-local evidence。
 3. **输出天然分层**，正好用于派生 `document_unit`：
    - `*.md` → 正文 Markdown 副本（artifact）；
-   - `content_list.json` → 每个块的 `type`（text/title/table/equation/image）、`page_idx`、`bbox`、阅读顺序——作为切分依据；
+   - `middle.json` → page/block/line/span、bbox 与复杂版面结构，供缺陷回放和二次开发；
+   - `content_list.json` → 扁平阅读序载体；legacy 标题是
+     `type=text + text_level>=1`，不是 `type=title`；
    - 表格块以 **HTML** 给出（保结构），公式给 LaTeX。
-   - 这套结构可以按 `heading_path` 重组成 `document_unit(text)`，按表格语义重组成 `document_unit(table)`，问答段落识别成 `document_unit(qa)`。
+   - 这套结构按 heading occurrence 重组成完整 text/table/mixed evidence blocks；
+     问答、事件或财务事实属于 L2/L3 抽取，不在 L1 用词面重写。
 4. **两档后端，按 PDF 质量分流**：
    - **Pipeline 后端**：CPU 可跑（16GB+ RAM），适合干净的数字版 PDF（A 股年报多数属于此类），成本低；
    - **VLM/Hybrid 后端**：复杂版面/扫描件，精度更高（OmniDocBench ~95），需要 GPU（8GB+）或在 Apple Silicon 上用 `vlm-mlx`。
@@ -110,17 +135,20 @@
 
 ## 五、财报特有的硬骨头 + 质量策略
 
-FinCriticalED / Agentar-Fin-OCR 这类金融专用工作给出的明确信号：**通用解析器在金融数字上有错误率，需要工程兜底。** 但 v1.0 的兜底是“轻量检查 + needs_review 标记 + 按需复核”，不是“每张表强制双 parser 逐格对账”（见 canonical §14、财报方案 §15）：
+FinCriticalED / Agentar-Fin-OCR 这类金融专用工作给出的明确信号：**通用解析器在金融数字与结构上都有错误率**。
+`needs_review` 只能是故障信号，不能作为问题解决；命中后必须继续获取并比较 raw PDF、
+MinerU model/middle/content-list、页图或独立 parser 证据，直到证明修复或明确定位上游能力缺口：
 
 1. **数字版优先**：A 股 PDF 多为文本层 PDF。先判定“有无文本层”，有就走 pipeline / pdfplumber 直取，OCR 只作为扫描件的退路——能取文本层就别 OCR，精度最高。
 2. **表格按需双解析对账**：默认**单 parser**。只有出现以下情况才用 Camelot/pdfplumber 二次解析并比对关键数字（总资产、营收、净利润等可加总校验的行）：
    - 默认 parser 失败或关键表结构明显错误；
    - 某张表即将进入正式预测 / 重要 claim，需要增强复核；
    - 轻量质量检查（如显式合计加总）不通过。
-   不一致 → 标记 `needs_review`，不污染干净数据。**不做全量每表 cell 级对账，也不做所有 PDF 数字与标准数据 provider 的逐项核验。**
+   不一致 → 记录精确表/行/页/bbox 与 reason code，进入定向复核；不能静默选一份或只打状态。
+   是否扩大到全量 cell 对账由实际故障分布决定。
 3. **结构化保真**：表格存为 `document_unit(table)` 的 `headers/rows/notes` + **原始字符串**（行列结构保留，不拆 cell）。负号、括号、千分位、单位都按原值保留，规范化（转 float）放到下游 L2，并保留原值。表格 HTML/cell JSON 可作为 parser artifact 留在文件系统。
 4. **可重跑、可追溯**：每次解析写 `processing_run`，记录后端/版本/耗时/错误，永不覆盖旧结果——换 parser 或升级模型可以回溯对比；旧 claim 继续引用当时的 `processing_run + document_unit + exact snapshot`。
-5. **轻量勾稽校验**（质量检查的一部分）：有显式合计时做简单加总检查，例如账龄表“合计 = 各账龄之和”、利润表分项加总；失败的表打 `needs_review` 供人工抽查。不要求覆盖所有财报恒等式，也不自动修复。
+5. **轻量勾稽校验**（质量检查的一部分）：有显式合计时做简单加总检查，例如账龄表“合计 = 各账龄之和”、利润表分项加总。失败必须留下可定位证据并触发进一步调查；自动修复只接受可回放、可逆且经正负语料证明的结构族。
 
 ---
 
@@ -130,29 +158,36 @@ FinCriticalED / Agentar-Fin-OCR 这类金融专用工作给出的明确信号：
 
 ```text
 PDF
- └─ MinerU(pipeline 或 vlm)  → parser_artifacts/（文件系统，可重生成，不是 DB 事实）
-     ├─ document.md          → 正文 Markdown 副本（artifact）
-     └─ content_list.json    → 切分依据
-         ├─ type=title/text  → document_unit(kind=text)
-         │                      heading_path, title, semantic_key?, payload.text
-         ├─ type=table       → document_unit(kind=table)
-         │                      payload{unit, headers, rows, notes, nearby_explanation}
-         │                      （跨页合并为一个逻辑表；不拆 cell）
-         └─ Q&A 段落          → document_unit(kind=qa)
-                                payload{question, answer}（完整问答，不按 token 拆）
+ ├─ PDF native structure/text → StructTree/MCID/bookmark + 独立文本 occurrence
+ │   └─ 原生文本缺失或几何异常页 → hash-bound lossless full-page PNG
+ └─ MinerU(pipeline 或 vlm)    → parser_artifacts/（文件系统，可重生成，不是 DB 事实）
+     ├─ content_list.json      → typed carrier + 扁平阅读序
+     ├─ content_list_v2.json   → 可选 typed title block；按 MinerU 3.4 官方 serializer
+     │                           投影后与 legacy 同页/等价 bbox/唯一 carrier 闭合
+     ├─ model/middle.json      → page/block/line/span + bbox 结构回放依据
+     └─ source-bound proof     → 按 PDF hash/page/MCID/bbox/具体 field 唯一对齐
+         ├─ proved heading     → document_unit heading_path/title
+         ├─ type=table         → logical grid 闭合后 payload{unit, headers, rows, notes}
+         ├─ 同一 proved heading occurrence 下的异构证据 → mixed，保持 source order
+         └─ native/visual fallback → 无标题 document-level 粗证据，供 L2 直接召回
  └─ Camelot/pdfplumber(按需，仅 text-PDF 表格)
-     └─ 对账结果              → needs_review 标记 / 增强即将进入 claim 的表
+     └─ 对账结果              → 定位差异；needs_review 只是调查状态，不是终态
 processing_run: processor, processor_version, backend, status, error, duration, is_active_run
 artifact_locator(可选): artifact_path + artifact_unit_ref + order_index   # 回看用，不要求 page/bbox
 ```
 
-要点：**parser artifact 是切分依据但不入核心库；入库的是从它派生的 `document_unit` 内容快照。** 先有结构化中间产物，再从中切出业务单元，而不是反过来从 Markdown 反推结构。
+要点：**结构来自 source-bound typed proof，不来自业务词面或 legacy `text_level`。**
+v1/v2 的 Markdown escape 与 inline-equation delimiter 是同一 provider block 的格式差异，
+只能精确投影，不能用 bbox overlap、`text_level` 或模糊反转义补齐。
+parser artifact 本体不入核心库，但其 hash/role/locator 与派生的 `document_unit` 快照共同进入
+证据闭环；caption、unit、footnote 和 taxonomy 都不能反向决定标题或边界。
 
 ---
 
 ## 七、第一版建议路线
 
-1. **闭环先跑通一份真实 PDF（已完成，对应仓库 Phase 00 / 04）**：本地样本语料位于 `tmp/sample_filings/`（机器本地、git-ignored：江海股份 002484 / 美的集团 000333 / 海星股份 603115），已用 MinerU pipeline 后端落地 `*.md` + `content_list.json` 并映射为 NormalizedIR；`document_unit` 切分入库属仓库 Phase 005，尚未开始。
+1. **闭环与现役实现**：MinerU 产物已映射为 NormalizedIR 并生成/发布 document units；
+   结构变更必须用登记 source hash 绑定的真实 artifact 离线重放，不能只验证合成 fixture。
 2. **分流策略**：有文本层 → pipeline/pdfplumber；扫描/复杂 → VLM 后端（macOS 上 `vlm-mlx`，有 GPU 用 GPU）。
 3. **表格复核按需**：默认单 parser；仅在第五节列出的触发条件下用 Camelot/pdfplumber 二次解析与关键数字比对。
 4. **入库**：按第六节映射写 `document_unit` / `processing_run`，parser artifact 留文件系统，必要时记 `artifact_locator`。
@@ -166,7 +201,8 @@ artifact_locator(可选): artifact_path + artifact_unit_ref + order_index   # �
 
 - **license 复核**：MinerU 自有协议附加条款、Marker 商用门槛、PyMuPDF(4LLM) 的 AGPL，采用前都要再读一遍。本文以 2026-06 官方信息为准，license 会变（MinerU 就刚从 AGPL 改过）。
 - **算力**：VLM 后端要 GPU 才划算；纯 CPU/Mac 以 pipeline 后端为主，复杂件再考虑 `vlm-mlx` 或外置 GPU。
-- **数字保真上限**：再好的解析器在金融数字上都有错误率，“原值保留 + 轻量检查 + needs_review + 可重跑 + 按需复核”是工程兜底，而不是对每张表都跑重型对账。
+- **数字与结构保真上限**：再好的 parser 都会错。原值、页图、page/model/bbox、hash 与可重跑能力
+  是继续找证据的基础；`needs_review` 必须携带具体缺口并进入调查，不能替代修复或复核。
 - **是否需要金融专用模型**：Agentar-Fin-OCR / PaddleOCR-VL 等值得跟踪；但第一版用 MinerU + 轻量质量检查已足够，等闭环稳定后再评估是否引入。
 
 ---
@@ -174,8 +210,12 @@ artifact_locator(可选): artifact_path + artifact_unit_ref + order_index   # �
 ## 参考来源
 
 - MinerU 官方仓库（license / macOS / 后端 / 输出，v3.3.1）：https://github.com/opendatalab/MinerU
+- MinerU 官方结构化输出契约（title/table body/caption/footnote、page/bbox）：https://opendatalab.github.io/MinerU/reference/output_files/
+- MinerU-Popo 文档级后处理仓库与论文：https://github.com/opendatalab/MinerU-Popo ；https://arxiv.org/abs/2605.24973
 - MinerU Changelog（MLX 后端、协议变更）：https://opendatalab.github.io/MinerU/reference/changelog/
 - Docling 论文（MIT、DoclingDocument）：https://arxiv.org/pdf/2501.17887
+- Docling document hierarchy/provenance 与 hierarchical/hybrid chunking：https://docling-project.github.io/docling/concepts/docling_document/ ；https://docling-project.github.io/docling/concepts/chunking/
+- Unstructured `by_title` 与 `orig_elements` 来源恢复：https://docs.unstructured.io/open-source/core-functionality/chunking
 - OmniDocBench（CVPR 2025 文档解析基准，2026 更新 MinerU2.5 / PaddleOCR-VL）：https://github.com/opendatalab/OmniDocBench
 - FinCriticalED（金融 fact-level OCR 基准，数字保真难点）：https://arxiv.org/pdf/2511.14998
 - 开源 PDF→Markdown 工具对比（2026，Marker/Docling/MinerU/pdf-craft/PyMuPDF4LLM）：https://themenonlab.blog/blog/best-open-source-pdf-to-markdown-tools-2026

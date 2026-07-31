@@ -75,7 +75,10 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | run_kind | parse / rebuild_units（复用解析产物只重切，5 秒级） |
 | status | running / succeeded / failed；stale running 由 worker 按阈值回收 |
 | is_active | 每文档唯一 true（发布原子切换） |
-| builder_rules_version | 恒等于 rules.RULES_VERSION（当前 ub-2026.07-53）；单一代=同版本 |
+| artifact_owner_processing_run_id | 实际拥有 parser artifact / NormalizedIR 字节的根 parse run；parse=self，rebuild 传播根 owner，不能从路径文本反推 |
+| builder_rules_version | 恒等于 rules.RULES_VERSION（当前 ub-2026.07-83）；单一代=同版本 |
+| parser_target_identity | 产生该 run 的完整 parser target（backend/method/language/runtime bundle identity）；不从零散 parser_* 列反推 |
+| search_projection_error | 当前 retrieval_rules_version 的确定性、非重试检索投影终态；delta 不空转，full 可显式重试，成功替换时同事务清空 |
 | content_hash_aggregate / structure_hash | run 级聚合（U3）；"内容没变"只看前者 |
 | parser_* / *_relpath / artifact_hash | 解析出处与产物引用（相对路径） |
 | unit_build_status/attempt_count/error | 构建生命周期；error 为结构化 {stage,error_code,retryable} |
@@ -85,21 +88,21 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 |---|---|
 | asset_id | `du_`+ULID；跨 run 不承诺同 ID，身份=content_hash |
 | payload_kind | 闭集 text / table / qa「历史值：旧产物存在、2026-07-16 起不再产出（QA 判别已移除，转写以 raw text 落地）」/ **mixed**（业务块，payload=semantic_type+有序 parts）。mixed 的 part 级 kind ∈ {text, table, **image**}；image part/壳 payload = `{image_ref, caption, context, content?, notes?, visual_kind, visual_subtype?}`，其中 image_ref = 归档视觉产物的内容寻址 sha256，visual_kind ∈ {image, chart, equation}，visual_subtype? = MinerU sub_type 透传（如 seal/bar） |
-| heading_path | jsonb 1-4 级**多级标题**（必填非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text |
-| title | 叶子显示名（单值；多级在 heading_path，决策记录见 retrieval 设计文档 §4.5） |
-| semantic_key | 单值路由键（规则命中→词表键→事件键→`document_content` 通用内容键）；ub-2026.07-26 新产物非空，库列仅为历史兼容仍可空；`document_content` 表示“确定是文档证据、暂无更窄受控概念”，不是 `unknown`；btree 索引 |
-| semantic_keys | jsonb 非空数组=规则键∪词表键∪事件键；无更窄概念时为 `["document_content"]`（ub-2026.07-26；库列仅为历史兼容仍可空）；GIN(jsonb_ops) 支持 `? / ?| / ?&`；Filing API 的 `semantic_key` 精确匹配 scalar，跨 primary/secondary key 召回显式使用 comma-list any/all 过滤 |
-| payload | 原始证据内容；mixed payload 还保存 `semantic_type` 与每个 part 的路径/适用性/质量/定位注解。`content_hash` 使用去除这些规则与位置注解后的 canonical content projection，不直接 hash 整个 mixed payload |
+| heading_path | jsonb 完整**源标题路径**（有 heading 时非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text；路径来自 typed heading/outline 结构，不来自 caption 或 taxonomy |
+| title | 结构叶子显示名：有标题路径时等于其叶节点；无标题文档可等于登记文档标题；table/image caption、单位、脚注不得填入 title |
+| semantic_key | 单值 L2 路由键（通用规则→监管 taxonomy→`document_content` 通用内容键）；ub-2026.07-26 新产物非空，库列仅为历史兼容仍可空；不参与标题、边界、内容归属或删除；btree 索引 |
+| semantic_keys | jsonb 非空路由键数组；无更窄概念时为 `["document_content"]`（ub-2026.07-26；库列仅为历史兼容仍可空）；GIN(jsonb_ops) 支持 `? / ?| / ?&`；任何规则升级只改变检索投影，不得改变证据 payload/boundary |
+| payload | 原始证据内容；mixed payload 还保存 `semantic_type` 与每个 part 的路径/适用性/质量/定位注解。视觉 carrier 无资产文件但仍有 typed caption/content/footnote 时，以 `needs_review` 文本证据保留这些字段及 source projection；真正无路径且无可读 typed 字段才失败。当前表格必须有非空 HTML、可解析 grid、页内 model 闭合和 crop，失败时不发布错误 payload。`content_hash` 使用去除规则与位置注解后的 canonical content projection，不直接 hash 整个 mixed payload |
 | content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；projection 含 title/heading/semantic_key(s)/quality/applicability，以及 mixed part 的规则型路径、质量和适用性注解；来源 `artifact_locator` 不进入 content/query identity |
 | quality_status | ok / needs_review / unusable（乱码率>30%） |
 | applicability | vc16 CHECK：applicable / not_applicable / NULL（√适用声明列化；见 §5 讨论） |
 | page_no | 定位列（artifact_locator 首页码） |
-| artifact_locator | jsonb（order_index/page_no/bbox/merge 信息）；跨页 aggregate 表还含连续 `page_span`、逐页 `page_bboxes`、model/continuation 索引与 v4 locator algorithm。mixed 的每个 part 保留自己的 locator，不能只读 unit 顶层；`merged_cells` 坐标统一相对最终 `[headers, *rows]` full grid；JSONB(none_as_null) |
+| artifact_locator | jsonb（order_index/page_no/bbox/merge 信息）；table locator 只定位一个物理页的 canonical table，不含跨页 aggregate/ghost 映射。物理相邻行不因 page-edge/表框对齐而伪造 semantic merge 或 `needs_review`。mixed 的每个 part 保留自己的 locator，不能只读 unit 顶层；`merged_cells` 坐标统一相对 `[headers, *rows]` source grid；JSONB(none_as_null) |
 
 ### classification_rule（0016，词表的库内查询副本）
 | 列 | 含义 |
 |---|---|
-| rule_set | 闭集 class / facet / **title** / **title_topic** / **title_noise**。title 是无码通道 broad fallback；title_topic 对有码/无码都可追加窄主题；title_noise 是处理队列绝对硬排除，不改变登记事实，仅允许无新增金融事实的窄模板/明确重复/行政载体 |
+| rule_set | 闭集 class / facet / **title** / **title_topic** / **title_noise**。title 是无码通道 broad fallback；title_topic 对有码/无码都可追加窄主题；title_noise 只可作为路由/复核候选，不能凭标题 pattern 单独跳过已在处理范围内的 PDF；重复件需 provider linkage、内容哈希或明确版本关系证明 |
 | prefix / value / priority | F006V 前缀或标题模式 → 类名/维度名；priority=主分类阶梯档位（三层原则）/facet 长前缀优先；match=all 的标题模式以 `%` 编码并由 SQL/Python 同义匹配 |
 | version | 与仓内 JSON 词表一致；doctor 校验漂移；`make load-rules` 事务内重载 |
 
@@ -124,10 +127,16 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
   （legal_name_status pending/resolved、last_synced_at、synced_through——Miniflux
   checked_at 模式）；生效值与 sync_state（never_synced/due/fresh）由
   `GET /v1/tracked-companies` 在 API 层派生（全局 policy/间隔是文件与 env，SQL 看不见）。
-- **unit_search_projection_v1（0025 迁移，06R 派生检索投影层，U7）**：与 document_unit 1:1，
+- **unit_search_projection_v1（0025+0028，06R 派生检索投影层，U7）**：与 document_unit 1:1，
   全部列（title_text/heading_path_text/{title,path,body,key}_tokens/header_row_candidate/
   built_at/加权 search_tsv）可由已持久化 unit 确定性再生——应用侧 jieba 预分词 + `simple`
-  配置 + `setweight` 拼接 + 单 GIN，title/面包屑另建 pg_trgm GIN 子串兜底。**派生、非证据**：
+  配置 + `setweight` 拼接 + GIN，title/面包屑另建 pg_trgm GIN 子串兜底。物理上不安全的
+  body 进入 **unit_body_search_windows_v1** 连续半开 token 窗；parent 公开列集不变，private
+  window flag 不暴露。跨窗 AND 按 `(asset_id, query_group)` 聚合，不能跨资产拼命中。
+  **unit_search_atoms_v1（0030）**逐行暴露 explicit search target 的 NFKC+casefold 字符串叶子；
+  不连接 target/mixed part。仅归一化后长度 ≥3 的 query 走 GIN `LIKE` 候选 + 同 atom `strpos`
+  精确复核；1–2 字只走完整 word channel，不承诺任意子串。
+  **派生、非证据**：
   不进 content/query_projection 哈希，重建不产生 outbox 事件；`retrieval_rules_version` 是重建
   幂等键（词典/jieba 升版即全量重建）。CLI `make rebuild-search-projection`（`ALL=YES` 全量），
   worker 每轮 publish 后跑增量。
@@ -142,9 +151,9 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 | 文件 | 内容 | 当前版本 |
 |---|---|---|
-| adapters/unit_builder/rules.py | 切分/噪声/声明组合文法/语义规则 | RULES_VERSION ub-2026.07-53 |
-| adapters/unit_builder/note_key_map.json | 章节词表 **173 键、389 标签**（section facet；祖先继承+全类型开放） | 2026-07-r16 |
-| adapters/unit_builder/event_key_map.json | 事件键 **35 键**（DuEE-fin/CCKS/FewFC/CFinDEE 并集 + 经营数据/业绩/关联交易监管标题，标题派生） | 2026-07-r2 |
+| application/services/unit_builder/rules.py | source-bound structure proof 消费 + retrieval taxonomy（taxonomy 不改变证据或边界） | RULES_VERSION ub-2026.07-83 |
+| application/contracts/schema_sources/normalized_ir.v4.json | 当前 NormalizedIR v4 JSON Schema 唯一真源；`contracts/normalized_ir/normalized_ir.v4.json` 只能由 `export_contracts` 生成；v2/v3 只读历史 artifact 不得直接发布 | normalized_ir.v4 |
+| application/services/unit_builder/note_key_map.json | 章节词表 **173 键、391 标签**（section facet；祖先继承+全类型开放） | 2026-07-r18 |
 | adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs；r6 financing +011711 担保/011713 财务资助、meeting_resolution +01239910；r7 equity_share_change +0115 父级实码） | 2026-07-r7 |
 | adapters/sources/cninfo/facet_map.json | F006V 维度判定（market 精确码/publisher 0101） | 2026-07-r1 |
 | adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（intermediary carrier 词最前，briefing/inquiry 在定期报告前）+ 65 个 title_topic 词补码盲区 + 18 个 title_noise hard pattern。r12 金融复核将 41 个事实 pattern 与 26 个待可靠去重 pattern 移出绝对门（例行但含股本、稀释、债务、现金、募投或风险新事实的公告不再按标题硬杀）；r13 恢复 6 条自我标识副本/序次重复项（英文版/（英文）/H股季报年报/ST 退市链第 N 次提示），此类标题自带副本标识，无需主件 linkage 键 | 2026-07-r13 |
@@ -166,8 +175,8 @@ text+CHECK（int 码是无 CHECK 时代的习惯），存储差异在本规模�
 **semantic_key 用英文还是中文（round13 决策：英文规范键 + 词表即中文标签层）**：
 键是机器路由标识，ASCII 标识符在 SQL/API/代码中零引号零编码负担；XBRL 正是这个
 模式（英文 element name + 中文 standard label），tushare 同理（英文字段+中文文档）。
-中文层已经存在——note_key_map/event_key_map 的 names/aliases 就是法定中文名，
-即双语词典本体；L2 查询侧中文→键的映射用它（06R 同义词表正式化）。不做中英双写键
+中文层已经存在——note_key_map 的 names/aliases 与 class_map 的 zh 就是受控中文标签，
+即双语词典本体；L2 查询侧中文→键的映射用它们（06R 同义词表正式化）。不做中英双写键
 （同概念两拼写会碎化过滤）。若要行内可见中文，06R 投影的 controlled_keywords 可带
 中文标签进 search_text。
 

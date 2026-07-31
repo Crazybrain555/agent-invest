@@ -26,6 +26,9 @@ from disclosure_anchor.adapters.db.postgres.connection import (
 from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
 from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
+from disclosure_anchor.adapters.parsers.mineru.source_evidence_validator import (
+    MinerUSourceEvidenceValidator,
+)
 from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
 from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
@@ -164,8 +167,8 @@ def _parser() -> argparse.ArgumentParser:
     purge = subparsers.add_parser(
         "purge-company",
         help="TEST-PHASE ONLY: cascade-delete ONE company (tracked row, "
-        "security, documents, runs, units, events, files) — wipe-test-data "
-        "scoped to a single company",
+        "security, documents, runs, units, events, files) under exclusive "
+        "corpus admission",
     )
     purge.add_argument("--code", required=True, help="security code")
     purge.add_argument("--exchange", help="exchange (default: inferred from code)")
@@ -463,6 +466,9 @@ class _Deps:
             http_request_concurrency=(
                 self.settings.mineru_http_request_concurrency
             ),
+            runtime_bundle_identity_sha256=(
+                self.settings.disclosure_mineru_runtime_bundle_identity_sha256
+            ),
         )
 
     def parse(self) -> ParseDocument:
@@ -487,6 +493,7 @@ class _Deps:
             path_builder=self.paths,
             artifact_store=self.artifacts,
             uow_factory=self.uow_factory,
+            source_evidence_validator=MinerUSourceEvidenceValidator(),
         )
 
     def publish(self) -> PublishRun:
@@ -520,13 +527,23 @@ class _Deps:
         ).execute(codes)
 
     def purge_company(self, *, code: str, exchange: str) -> dict[str, Any]:
-        """TEST-PHASE cascade delete of one company (wipe_test_data, scoped).
+        """TEST-PHASE corpus-gated cascade delete of one company.
 
-        Order mirrors scripts/wipe_test_data.sh; file removal is best-effort
-        (missing files are fine). The company ledger row goes too — this is
-        for undoing mistakes/test residue, not an operations path.
+        File removal is best-effort (missing files are fine). The company
+        ledger row goes too — this is for undoing mistakes/test residue, not
+        an operations path.
         """
 
+        from disclosure_anchor.application.worker.locks import (
+            exclusive_corpus_mutation,
+        )
+
+        with exclusive_corpus_mutation(self.engine):
+            return self._purge_company_exclusive(code=code, exchange=exchange)
+
+    def _purge_company_exclusive(
+        self, *, code: str, exchange: str
+    ) -> dict[str, Any]:
         from sqlalchemy import text as sql_text
 
         removed_files = 0

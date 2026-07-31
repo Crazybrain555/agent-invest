@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
+
+ParserRetryBudgetClass = Literal["item", "infrastructure", "neutral"]
+
 
 class DisclosureAnchorError(Exception):
     """Base exception for service-defined failures."""
@@ -69,13 +74,19 @@ class SourceRequestError(DisclosureAnchorError):
 class ParserError(DisclosureAnchorError):
     """Raised when parser execution or artifact mapping fails."""
 
+    retry_budget_class: ParserRetryBudgetClass = "item"
+
 
 class ParserTimeoutError(ParserError):
     """Raised when parser execution exceeds the configured timeout."""
 
+    retry_budget_class: ParserRetryBudgetClass = "infrastructure"
+
 
 class ParserInvocationError(ParserError):
     """Raised when parser process invocation fails."""
+
+    retry_budget_class: ParserRetryBudgetClass = "infrastructure"
 
 
 class ParserLocalInvocationError(ParserInvocationError):
@@ -85,6 +96,8 @@ class ParserLocalInvocationError(ParserInvocationError):
 class ParserTaskError(ParserInvocationError):
     """Raised when a parser task fails after the local process starts."""
 
+    retry_budget_class: ParserRetryBudgetClass = "item"
+
 
 class ParserTaskDeadlineError(ParserTaskError):
     """Raised when the parser backend exceeds its item-local task deadline."""
@@ -92,6 +105,8 @@ class ParserTaskDeadlineError(ParserTaskError):
 
 class ParserCancelledError(ParserInvocationError):
     """Raised when the worker intentionally cancels MinerU during shutdown."""
+
+    retry_budget_class: ParserRetryBudgetClass = "neutral"
 
 
 class ParserBackendOverloadedError(ParserInvocationError):
@@ -101,9 +116,13 @@ class ParserBackendOverloadedError(ParserInvocationError):
 class ParserVersionProbeError(ParserError):
     """Raised when parser version probing fails."""
 
+    retry_budget_class: ParserRetryBudgetClass = "infrastructure"
+
 
 class ParserOutputContractError(ParserError):
     """Raised when parser output artifacts violate the adapter contract."""
+
+    reason_code = "parser_output_contract_error"
 
 
 class ParserUnknownError(ParserError):
