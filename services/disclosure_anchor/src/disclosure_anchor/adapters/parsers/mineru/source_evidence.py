@@ -58,7 +58,7 @@ from disclosure_anchor.domain.errors import ParserOutputContractError
 
 
 CONTRACT_VERSION = "source-evidence-conservation.v12"
-ALGORITHM_VERSION = "exact-native-middle-role-or-visual.v13"
+ALGORITHM_VERSION = "exact-native-middle-role-or-visual.v14"
 TEXT_PROJECTION = "nfkc-strip-whitespace.v1"
 
 _SHA256 = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -246,6 +246,7 @@ class _Occurrence:
 # conservation net and surface as redundant native recovery, never data loss.
 from disclosure_anchor.adapters.parsers.comparison import (  # noqa: E402
     comparison_text,
+    fold_provider_markup,
 )
 
 
@@ -2820,6 +2821,9 @@ def _reconcile_page(
     def locate(
         needle: str,
         atom_indices: Sequence[int],
+        *,
+        lower: tuple[int, int, int] | None = None,
+        upper: tuple[int, int, int] | None = None,
     ) -> tuple[list[_Occurrence], bool]:
         exact = [
             occurrence
@@ -2834,6 +2838,8 @@ def _reconcile_page(
                 for k in atom_indices
             )
             and not any(_overlaps(item, prior) for prior in used)
+            and (lower is None or item.position > lower)
+            and (upper is None or item.position < upper)
         ]
         located_carriers = {
             (
@@ -2870,6 +2876,12 @@ def _reconcile_page(
         run_end = index
         while run_end < total and run_end not in matches:
             run_end += 1
+        run_lower = (
+            matches[index - 1].position
+            if index > 0 and (index - 1) in matches
+            else None
+        )
+        run_upper = matches[run_end].position if run_end < total else None
         segment_start = index
         while segment_start < run_end:
             found_end = 0
@@ -2884,12 +2896,16 @@ def _reconcile_page(
                 if not needle or any(not piece for piece in pieces):
                     continue
                 located, _ = locate(
-                    needle, range(segment_start, segment_end)
+                    needle,
+                    range(segment_start, segment_end),
+                    lower=run_lower,
+                    upper=run_upper,
                 )
                 if not located:
                     continue
                 occurrence = min(located, key=lambda item: item.position)
                 used.append(occurrence)
+                run_lower = occurrence.position
                 offset = occurrence.start
                 for k in range(segment_start, segment_end):
                     piece_length = len(comparison_text(atoms[k].text))
@@ -2902,6 +2918,44 @@ def _reconcile_page(
                 found_end = segment_end
                 break
             segment_start = found_end if found_end else segment_start + 1
+        index = run_end
+
+    # Parallel provider values (near-identical sentences inside one list
+    # block) can repeat a wrapped fragment; geometry cannot discriminate
+    # inside one block, but the neighbours that did match pin the stream
+    # window. A sandwiched atom therefore retries with its neighbours'
+    # proven positions as exclusive bounds — the position decides.
+    index = 0
+    while index < total:
+        if index in matches:
+            index += 1
+            continue
+        run_end = index
+        while run_end < total and run_end not in matches:
+            run_end += 1
+        window_lower = (
+            matches[index - 1].position
+            if index > 0 and (index - 1) in matches
+            else None
+        )
+        window_upper = matches[run_end].position if run_end < total else None
+        if window_lower is not None or window_upper is not None:
+            for k in range(index, run_end):
+                needle = comparison_text(atoms[k].text)
+                if not needle:
+                    continue
+                located, _ = locate(
+                    needle,
+                    (k,),
+                    lower=window_lower,
+                    upper=window_upper,
+                )
+                if not located:
+                    continue
+                selected = min(located, key=lambda item: item.position)
+                used.append(selected)
+                matches[k] = selected
+                window_lower = selected.position
         index = run_end
 
     result: list[dict[str, Any]] = []
@@ -3004,7 +3058,12 @@ def _project_field(
             hard_boundaries.add(len(projected))
             boundaries.add(len(projected))
         after_whitespace = False
-        for char in unicodedata.normalize("NFKC", segment):
+        # The haystack folds provider markup exactly like the needle side
+        # (comparison_text): inline-equation delimiters and punctuation
+        # escapes never reach the native layer.
+        for char in unicodedata.normalize(
+            "NFKC", fold_provider_markup(segment)
+        ):
             if char.isspace():
                 after_whitespace = True
                 continue

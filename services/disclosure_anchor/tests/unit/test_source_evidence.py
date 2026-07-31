@@ -1635,6 +1635,81 @@ def _carrier_identity(disposition: Mapping[str, Any]) -> tuple[Any, ...]:
     )
 
 
+class SandwichDisambiguationTests(unittest.TestCase):
+    """Neighbour-pinned stream windows resolve repeated fragments.
+
+    Two near-identical provider values inside one block repeat a wrapped
+    fragment; geometry cannot discriminate inside the block, so the
+    fragment is ambiguous on its own. The neighbours that did match pin
+    the stream window and the position decides — never a vote.
+    """
+
+    _LIST = {
+        "type": "list",
+        "page_idx": 0,
+        "bbox": [0, 0, 1000, 500],
+        "list_items": [
+            "净利润为10,000.00万元到15,000.00万元有余",
+            "扣非净利润为500.00万元到4,500.00万元有余",
+        ],
+    }
+
+    def test_neighbours_pin_the_repeated_fragment(self) -> None:
+        ledger = _reconcile(
+            [self._LIST],
+            _page(
+                ("净利润为10,000.00", (10, 10, 30, 20)),
+                ("万元到", (40, 10, 60, 20)),
+                ("15,000.00万元有余", (70, 10, 90, 20)),
+                ("扣非净利润为500.00", (10, 30, 30, 40)),
+                ("万元到", (40, 30, 60, 40)),
+                ("4,500.00万元有余", (70, 30, 90, 40)),
+            ),
+        )
+
+        dispositions = _dispositions(ledger)
+        self.assertEqual(
+            [item["kind"] for item in dispositions],
+            ["mineru_carrier"] * 6,
+        )
+        # Each repeated fragment lands in its own list item, between its
+        # neighbours' proven positions.
+        self.assertEqual(
+            [
+                item["carrier"]["selector"].get("index")
+                for item in dispositions
+            ],
+            [0, 0, 0, 1, 1, 1],
+        )
+        self.assertEqual(
+            [item["source_order"] for item in dispositions],
+            ["monotonic"] * 6,
+        )
+
+    def test_a_window_spanning_both_values_stays_ambiguous(self) -> None:
+        # The window pins nothing when it spans both parallel values: the
+        # repeated fragment stays a native fallback instead of guessing.
+        ledger = _reconcile(
+            [self._LIST],
+            _page(
+                ("净利润为10,000.00", (10, 10, 30, 20)),
+                ("万元到", (40, 10, 60, 20)),
+                ("4,500.00万元有余", (70, 30, 90, 40)),
+            ),
+            visual_regions=(_region((0.0, 0.0, 1000.0, 500.0)),),
+        )
+
+        dispositions = _dispositions(ledger)
+        self.assertEqual(
+            [item["kind"] for item in dispositions],
+            [
+                "mineru_carrier",
+                "source_native_fallback",
+                "mineru_carrier",
+            ],
+        )
+
+
 class WrappedCellTokenTests(unittest.TestCase):
     """One cell value wrapped across source words stays inside that cell.
 

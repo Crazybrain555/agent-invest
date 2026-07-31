@@ -15,7 +15,7 @@ import unicodedata
 _GLYPH_EQUIVALENCE = str.maketrans({"\uf052": "\u2611", "\u2610": "\u25a1"})
 
 
-def _fold_provider_markup(value: str) -> str:
+def fold_provider_markup(value: str) -> str:
     """Fold serializer markup that never reaches the native text layer.
 
     The provider wraps inline equations in configured ``$`` delimiters and
@@ -49,7 +49,7 @@ def comparison_text(value: str) -> str:
     return "".join(
         char
         for char in unicodedata.normalize(
-            "NFKC", _fold_provider_markup(value).translate(_GLYPH_EQUIVALENCE)
+            "NFKC", fold_provider_markup(value).translate(_GLYPH_EQUIVALENCE)
         )
         if not char.isspace()
     )
