@@ -954,13 +954,10 @@ def _apply_native_line_grammar(
             blocks_cache[sii] = frozenset(merged)
         return blocks_cache[sii]
 
-    def single_ref(refs: tuple[_Ref, ...]) -> int | None:
-        return refs[0].source_item_index if len(refs) == 1 else None
-
-    title_groups = {
-        single_ref(refs): refs
+    title_groups: dict[int, tuple[_Ref, ...]] = {
+        refs[0].source_item_index: refs
         for refs in grouped
-        if single_ref(refs) is not None
+        if len(refs) == 1
     }
 
     # Merge the lines of one printed title (adjacent title carriers
