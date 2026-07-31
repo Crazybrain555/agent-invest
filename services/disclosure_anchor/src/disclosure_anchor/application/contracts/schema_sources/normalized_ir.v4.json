@@ -606,7 +606,7 @@
           "const": "document_structure.v1"
         },
         "algorithm_version": {
-          "const": "document-structure-evidence.v8"
+          "const": "document-structure-evidence.v9"
         },
         "source_pdf_sha256": {
           "$ref": "#/$defs/sha256_ref"

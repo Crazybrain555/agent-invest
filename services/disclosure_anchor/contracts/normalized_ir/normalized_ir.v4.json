@@ -387,7 +387,7 @@
       "additionalProperties": false,
       "properties": {
         "algorithm_version": {
-          "const": "document-structure-evidence.v8"
+          "const": "document-structure-evidence.v9"
         },
         "carrier_set_sha256": {
           "$ref": "#/$defs/sha256_ref"

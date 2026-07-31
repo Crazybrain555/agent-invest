@@ -1769,6 +1769,219 @@ class MinerUMapperTests(unittest.TestCase):
         )
         self.assertEqual(rejected["source_item_indices"], [1])
 
+    def _layout_atom(self, order, text, *, block, line, cx, cy):
+        from disclosure_anchor.adapters.parsers.pdf_native_text import (
+            NativeTextAtom,
+            NativeTextLayoutRef,
+        )
+
+        return NativeTextAtom(
+            page_idx=0,
+            order=order,
+            bbox=(cx - 10.0, cy - 4.0, cx + 10.0, cy + 4.0),
+            char_span=(0, len(text)),
+            text=text,
+            layout=NativeTextLayoutRef(
+                flow_index=0,
+                block_index=block,
+                line_index=line,
+                word_index=0,
+            ),
+        )
+
+    def _layout_page(self, atoms):
+        from disclosure_anchor.adapters.parsers.pdf_native_text import (
+            NativeTextPage,
+        )
+
+        return NativeTextPage(
+            page_idx=0,
+            width=600.0,
+            height=800.0,
+            text="".join(a.text for a in atoms),
+            atoms=tuple(atoms),
+        )
+
+    def test_wrapped_tail_typed_as_title_is_rejected_by_its_block(self) -> None:
+        # "票?" is the wrapped tail of the previous paragraph: both live
+        # in one native block, so the provider title claim is a wrapped
+        # sentence, not a heading.
+        content = [
+            {
+                "type": "text",
+                "text": "是否考虑回购股",
+                "page_idx": 0,
+                "bbox": [100, 80, 500, 105],
+                "text_level": None,
+            },
+            {
+                "type": "text",
+                "text": "票?",
+                "page_idx": 0,
+                "bbox": [100, 110, 500, 135],
+                "text_level": 1,
+            },
+        ]
+        page = self._layout_page(
+            [
+                self._layout_atom(0, "是否考虑回购股", block=3, line=0, cx=90, cy=74),
+                self._layout_atom(1, "票?", block=3, line=1, cx=90, cy=98),
+            ]
+        )
+        proof, _content = _v2_structure_proof(
+            native=native_index(page_count=1),
+            legacy_content_list=content,
+            content_list_v2=[
+                [
+                    _paragraph_block("是否考虑回购股", [100, 80, 500, 105]),
+                    _title_block("票?", [100, 110, 500, 135]),
+                ]
+            ],
+            source_pages=(page,),
+        )
+
+        self.assertEqual(proof["headings"], [])
+        self.assertIn(
+            "provider_title_midflow",
+            [conflict["relation"] for conflict in proof["conflicts"]],
+        )
+
+    def test_a_title_owning_its_block_still_opens_a_section(self) -> None:
+        content = [
+            {
+                "type": "text",
+                "text": "正文一段",
+                "page_idx": 0,
+                "bbox": [100, 80, 500, 105],
+                "text_level": None,
+            },
+            {
+                "type": "text",
+                "text": "一、经营情况",
+                "page_idx": 0,
+                "bbox": [100, 110, 500, 135],
+                "text_level": 1,
+            },
+        ]
+        page = self._layout_page(
+            [
+                self._layout_atom(0, "正文一段", block=3, line=0, cx=90, cy=74),
+                self._layout_atom(1, "一、经营情况", block=4, line=0, cx=90, cy=98),
+            ]
+        )
+        proof, _content = _v2_structure_proof(
+            native=native_index(page_count=1),
+            legacy_content_list=content,
+            content_list_v2=[
+                [
+                    _paragraph_block("正文一段", [100, 80, 500, 105]),
+                    _title_block("一、经营情况", [100, 110, 500, 135]),
+                ]
+            ],
+            source_pages=(page,),
+        )
+
+        self.assertEqual(len(proof["headings"]), 1)
+        self.assertEqual(
+            proof["headings"][0]["evidence_kinds"], ["mineru_v2_title"]
+        )
+
+    def test_split_printed_title_lines_merge_into_one_heading(self) -> None:
+        # A two-line centered document title typed as two adjacent
+        # provider titles: one native block proves one printed title, and
+        # the published heading joins both lines.
+        content = [
+            {
+                "type": "text",
+                "text": "财通证券股份有限公司",
+                "page_idx": 0,
+                "bbox": [300, 80, 700, 105],
+                "text_level": 1,
+            },
+            {
+                "type": "text",
+                "text": "投资者关系活动记录表",
+                "page_idx": 0,
+                "bbox": [300, 110, 700, 135],
+                "text_level": 1,
+            },
+            {
+                "type": "text",
+                "text": "正文内容",
+                "page_idx": 0,
+                "bbox": [100, 200, 500, 225],
+                "text_level": None,
+            },
+        ]
+        page = self._layout_page(
+            [
+                self._layout_atom(
+                    0, "财通证券股份有限公司", block=1, line=0, cx=300, cy=74
+                ),
+                self._layout_atom(
+                    1, "投资者关系活动记录表", block=1, line=1, cx=300, cy=98
+                ),
+                self._layout_atom(2, "正文内容", block=2, line=0, cx=90, cy=170),
+            ]
+        )
+        proof, _content = _v2_structure_proof(
+            native=native_index(page_count=1),
+            legacy_content_list=content,
+            content_list_v2=[
+                [
+                    _title_block("财通证券股份有限公司", [300, 80, 700, 105]),
+                    _title_block("投资者关系活动记录表", [300, 110, 700, 135]),
+                    _paragraph_block("正文内容", [100, 200, 500, 225]),
+                ]
+            ],
+            source_pages=(page,),
+        )
+
+        self.assertEqual(len(proof["headings"]), 1)
+        heading = proof["headings"][0]
+        self.assertEqual(
+            [ref["source_item_index"] for ref in heading["source_refs"]],
+            [0, 1],
+        )
+        self.assertEqual(heading["section_span"], [0, 2])
+
+    def test_adjacent_titles_in_distinct_blocks_stay_separate(self) -> None:
+        content = [
+            {
+                "type": "text",
+                "text": "第一章",
+                "page_idx": 0,
+                "bbox": [100, 80, 500, 105],
+                "text_level": 1,
+            },
+            {
+                "type": "text",
+                "text": "第二章",
+                "page_idx": 0,
+                "bbox": [100, 200, 500, 225],
+                "text_level": 1,
+            },
+        ]
+        page = self._layout_page(
+            [
+                self._layout_atom(0, "第一章", block=1, line=0, cx=90, cy=74),
+                self._layout_atom(1, "第二章", block=2, line=0, cx=90, cy=170),
+            ]
+        )
+        proof, _content = _v2_structure_proof(
+            native=native_index(page_count=1),
+            legacy_content_list=content,
+            content_list_v2=[
+                [
+                    _title_block("第一章", [100, 80, 500, 105]),
+                    _title_block("第二章", [100, 200, 500, 225]),
+                ]
+            ],
+            source_pages=(page,),
+        )
+
+        self.assertEqual(len(proof["headings"]), 2)
+
     def test_printed_toc_corroborates_an_outline_only_heading(self) -> None:
         # An untagged, typeset document: the outline is the only lane,
         # but the printed TOC names the same title on its declared page —

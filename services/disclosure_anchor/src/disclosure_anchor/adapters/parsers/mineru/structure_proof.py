@@ -8,7 +8,7 @@ from numbering or nearest-level proximity.
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -227,6 +227,13 @@ def build_mineru_structure_proof(
     ):
         grouped[candidate.refs].append(candidate)
 
+    if source_pages is not None:
+        _apply_native_line_grammar(
+            grouped,
+            carriers=carriers,
+            source_pages=source_pages,
+            conflicts=conflicts,
+        )
     selected = _select_candidates(
         grouped,
         nonheading_roles=nonheading_roles,
@@ -896,6 +903,118 @@ def _continuous_parents(
         )
         output[child] = None
     return output
+
+
+def _carrier_native_blocks(
+    carrier: _Carrier,
+    pages_by_idx: Mapping[int, NativeTextPage],
+) -> frozenset[tuple[int, int]]:
+    """Poppler blocks whose word centers fall inside the carrier bbox."""
+
+    page = pages_by_idx.get(carrier.page_idx)
+    if page is None:
+        return frozenset()
+    x0, y0, x1, y1 = carrier.bbox
+    blocks: set[tuple[int, int]] = set()
+    for atom in page.atoms:
+        center_x = (atom.bbox[0] + atom.bbox[2]) / 2 / page.width * 1000.0
+        center_y = (atom.bbox[1] + atom.bbox[3]) / 2 / page.height * 1000.0
+        if x0 <= center_x <= x1 and y0 <= center_y <= y1:
+            blocks.add((atom.layout.flow_index, atom.layout.block_index))
+    return frozenset(blocks)
+
+
+def _apply_native_line_grammar(
+    grouped: dict[tuple[_Ref, ...], list[_Candidate]],
+    *,
+    carriers: Sequence[_Carrier],
+    source_pages: tuple[NativeTextPage, ...],
+    conflicts: list[dict[str, Any]],
+) -> None:
+    """Let the native line layout arbitrate provider title claims.
+
+    A printed title always owns its own layout block. A provider-typed
+    title living inside another carrier's block is a wrapped sentence
+    tail, not a heading (rejected); two adjacent provider titles sharing
+    one block are the lines of a single printed title (merged, so the
+    published heading joins their text).
+    """
+
+    pages_by_idx = {page.page_idx: page for page in source_pages}
+    by_sii: dict[int, list[_Carrier]] = defaultdict(list)
+    for carrier in carriers:
+        by_sii[carrier.ref.source_item_index].append(carrier)
+    blocks_cache: dict[int, frozenset[tuple[int, int]]] = {}
+
+    def blocks(sii: int) -> frozenset[tuple[int, int]]:
+        if sii not in blocks_cache:
+            merged: set[tuple[int, int]] = set()
+            for carrier in by_sii.get(sii, []):
+                merged |= _carrier_native_blocks(carrier, pages_by_idx)
+            blocks_cache[sii] = frozenset(merged)
+        return blocks_cache[sii]
+
+    def single_ref(refs: tuple[_Ref, ...]) -> int | None:
+        return refs[0].source_item_index if len(refs) == 1 else None
+
+    title_groups = {
+        single_ref(refs): refs
+        for refs in grouped
+        if single_ref(refs) is not None
+    }
+
+    # Merge the lines of one printed title (adjacent title carriers
+    # sharing a native block), longest chains first.
+    merged_any = True
+    while merged_any:
+        merged_any = False
+        for sii in sorted(title_groups):
+            nxt = sii + 1
+            if nxt not in title_groups:
+                continue
+            if not (blocks(sii) and blocks(sii) & blocks(nxt)):
+                continue
+            left_refs = title_groups[sii]
+            right_refs = title_groups[nxt]
+            left = grouped.pop(left_refs)
+            right = grouped.pop(right_refs)
+            refs = (*left_refs, *right_refs)
+            evidence: set[str] = set()
+            for item in (*left, *right):
+                evidence |= item.evidence
+            grouped[refs] = [
+                _Candidate(
+                    refs=refs,
+                    level=left[0].level,
+                    evidence=evidence,
+                )
+            ]
+            del title_groups[sii]
+            del title_groups[nxt]
+            merged_any = True
+            break
+
+    # Reject a provider title that shares its block with a preceding
+    # non-title carrier: a wrapped tail is not a heading. StructTree
+    # evidence outranks the layout heuristic and is left alone.
+    for sii, refs in sorted(title_groups.items()):
+        candidates = grouped.get(refs)
+        if not candidates:
+            continue
+        if any("struct_tree" in item.evidence for item in candidates):
+            continue
+        prev = sii - 1
+        if prev < 0 or prev in title_groups or prev not in by_sii:
+            continue
+        shared = blocks(sii) & blocks(prev)
+        if shared:
+            conflicts.append(
+                {
+                    "relation": "provider_title_midflow",
+                    "source_item_indices": [sii],
+                }
+            )
+            del grouped[refs]
 
 
 def _bookmark_candidates(
