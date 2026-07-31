@@ -949,6 +949,25 @@ class MiddleRoleFailureTests(LedgerFailureCase):
         )
         self.assertEqual([role.text for role in grazed], ["真实附注"])
 
+        # Column detection can interleave a foreign word between the
+        # role's own words in reading order; ownership stays exactly
+        # center-inside and the slice joins only the owned words.
+        interleaved = resolve_middle_table_roles(
+            [_table_item()],
+            middle_artifact=_middle(_hint()),
+            source_pages=(
+                _role_page(
+                    ("附注甲", (130, 725, 200, 750)),
+                    ("表体", (130, 300, 200, 350)),
+                    ("附注乙", (300, 725, 400, 750)),
+                ),
+            ),
+        )
+        self.assertEqual(
+            [role.text for role in interleaved],
+            ["附注甲 附注乙"],
+        )
+
         geometry_page = replace(
             _role_page(("真实附注", (130, 725, 300, 750))),
             geometry_issues=(
@@ -977,15 +996,7 @@ class MiddleRoleFailureTests(LedgerFailureCase):
                 "middle_role_source_span_unproved",
                 _role_page(("真实附注", (130, 100, 300, 150))),
             ),
-            (
-                "role selects a discontinuous run",
-                "middle_role_source_span_unproved",
-                _role_page(
-                    ("附注甲", (130, 725, 200, 750)),
-                    ("表体", (130, 300, 200, 350)),
-                    ("附注乙", (300, 725, 400, 750)),
-                ),
-            ),
+
             (
                 "role text projects to nothing",
                 "middle_role_source_text_empty",

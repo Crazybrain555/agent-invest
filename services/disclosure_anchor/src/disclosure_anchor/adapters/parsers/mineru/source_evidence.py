@@ -282,12 +282,12 @@ def resolve_middle_table_roles(
             for atom_index, atom in enumerate(page.atoms)
             if _bbox_center_in_role(atom.bbox, hint.role_bbox, page)
         ]
-        if not selected or selected != list(range(selected[0], selected[-1] + 1)):
+        if not selected:
             _fail(
                 "middle_role_source_span_unproved",
                 "table role does not select one continuous native atom run",
             )
-        atoms = page.atoms[selected[0] : selected[-1] + 1]
+        atoms = [page.atoms[atom_index] for atom_index in selected]
         atom_keys = {(page.page_idx, atom.order) for atom in atoms}
         if used_atoms & atom_keys:
             _fail(
@@ -295,9 +295,15 @@ def resolve_middle_table_roles(
                 "table roles reuse the same native source atom",
             )
         used_atoms.update(atom_keys)
-        start = atoms[0].char_span[0]
-        end = atoms[-1].char_span[1]
-        text = page.text[start:end]
+        if selected == list(range(selected[0], selected[-1] + 1)):
+            text = page.text[
+                atoms[0].char_span[0] : atoms[-1].char_span[1]
+            ]
+        else:
+            # Column detection may interleave foreign words between the
+            # role's own words in reading order; ownership stays exactly
+            # center-inside, so the slice joins the owned words only.
+            text = " ".join(atom.text for atom in atoms)
         if not comparison_text(text):
             _fail(
                 "middle_role_source_text_empty",
