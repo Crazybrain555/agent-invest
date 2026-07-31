@@ -15,11 +15,41 @@ import unicodedata
 _GLYPH_EQUIVALENCE = str.maketrans({"\uf052": "\u2611", "\u2610": "\u25a1"})
 
 
+def _fold_provider_markup(value: str) -> str:
+    """Fold serializer markup that never reaches the native text layer.
+
+    The provider wraps inline equations in configured ``$`` delimiters and
+    escapes markdown punctuation with a backslash (``\\%``, ``\\*``,
+    ``\\$``); the native layer carries the bare characters. Folding is a
+    comparison-space equivalence only — payloads stay verbatim.
+    """
+
+    output: list[str] = []
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if (
+            char == "\\"
+            and index + 1 < len(value)
+            and not value[index + 1].isalnum()
+        ):
+            if value[index + 1] != "$":
+                output.append(value[index + 1])
+            index += 2
+            continue
+        if char == "$":
+            index += 1
+            continue
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+
 def comparison_text(value: str) -> str:
     return "".join(
         char
         for char in unicodedata.normalize(
-            "NFKC", value.translate(_GLYPH_EQUIVALENCE)
+            "NFKC", _fold_provider_markup(value).translate(_GLYPH_EQUIVALENCE)
         )
         if not char.isspace()
     )

@@ -1748,6 +1748,31 @@ class WrappedCellTokenTests(unittest.TestCase):
         )
 
 
+class ProviderMarkupFoldTests(unittest.TestCase):
+    """Inline-equation delimiters and punctuation escapes fold for matching.
+
+    The VLM serializer wraps figures as ``$50\\%$`` and escapes markdown
+    punctuation; the native layer carries bare characters. Folding is a
+    comparison-space equivalence — payloads stay verbatim.
+    """
+
+    def test_inline_equation_matches_its_bare_figure(self) -> None:
+        self.assertEqual(
+            comparison_text("$50\\%$"),
+            comparison_text("50%"),
+        )
+
+    def test_escaped_punctuation_matches_the_bare_character(self) -> None:
+        self.assertEqual(comparison_text("\\*"), comparison_text("*"))
+        self.assertEqual(
+            comparison_text("\\$100"),
+            comparison_text("100"),
+        )
+
+    def test_escaped_letters_stay_distinct(self) -> None:
+        self.assertNotEqual(comparison_text("\\a"), comparison_text("a"))
+
+
 class CheckboxGlyphEquivalenceTests(unittest.TestCase):
     def test_pua_checked_box_matches_the_provider_ballot_box(self) -> None:
         self.assertEqual(
