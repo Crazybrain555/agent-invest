@@ -961,7 +961,10 @@ def _apply_native_line_grammar(
     }
 
     # Merge the lines of one printed title (adjacent title carriers
-    # sharing a native block), longest chains first.
+    # sharing a native block). Corpus measurement rejected any looser
+    # geometric criterion: financial-note reports pack real adjacent
+    # same-level headings at line pitch, so only block co-membership is
+    # safe evidence that two lines are one printed title.
     merged_any = True
     while merged_any:
         merged_any = False
