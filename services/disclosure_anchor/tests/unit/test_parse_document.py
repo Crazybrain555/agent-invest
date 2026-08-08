@@ -280,6 +280,7 @@ class _Parser:
                     "artifact_role": "pdf_structure",
                 },
                 "headings": [],
+                "owner_scope_breaks": [],
                 "page_frames": [],
                 "conflicts": [],
                 "coverage": {

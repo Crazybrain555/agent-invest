@@ -212,6 +212,7 @@ class CarrierSourceSupport:
     page_idx: int
     bbox: BBox
     kind: str
+    source_atom_orders: tuple[int, ...]
     artifact_role: str | None
     artifact_sha256: str | None
 
@@ -1452,6 +1453,11 @@ def carrier_source_support_index(
             page_idx=cast(int, record["page_idx"]),
             bbox=cast(BBox, tuple(record["bbox"])),
             kind=kind,
+            source_atom_orders=(
+                tuple(cast(list[int], support["source_atom_orders"]))
+                if kind == "native_exact"
+                else ()
+            ),
             artifact_role=(
                 cast(str, artifact_mapping["artifact_role"])
                 if artifact_mapping is not None

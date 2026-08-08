@@ -8,18 +8,19 @@ from numbering or nearest-level proximity.
 from __future__ import annotations
 
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+import re
 from typing import Any, Literal
 
 from disclosure_anchor.adapters.parsers.mineru.content_list_contract import (
     mineru_provider_item_sha256,
 )
+from disclosure_anchor.adapters.parsers.comparison import comparison_text
 from disclosure_anchor.adapters.parsers.mineru.source_evidence import (
     CarrierSourceSupport,
     ResolvedTableRole,
-    comparison_text,
     iter_mineru_text_carriers,
 )
 from disclosure_anchor.adapters.parsers.mineru.text_projection import (
@@ -31,14 +32,22 @@ from disclosure_anchor.adapters.parsers.pdf_native_structure import (
     NativeStructureIndex,
     NativeStructureNode,
 )
-from disclosure_anchor.adapters.parsers.pdf_native_text import NativeTextPage
+from disclosure_anchor.adapters.parsers.pdf_native_text import (
+    NativeTextAtom,
+    NativeTextPage,
+)
 from disclosure_anchor.adapters.parsers.printed_toc import (
     printed_toc_witness,
 )
 from disclosure_anchor.application.contracts.document_structure import (
     DOCUMENT_STRUCTURE_ALGORITHM,
     DOCUMENT_STRUCTURE_VERSION,
+    LEGACY_DOCUMENT_STRUCTURE_ALGORITHM,
     carrier_set_sha256,
+    printed_number_rank,
+)
+from disclosure_anchor.application.contracts.unit_source_projection import (
+    source_value_sha256,
 )
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
@@ -57,6 +66,16 @@ _TEXT_KINDS = frozenset(
         "ref_text",
         "text",
     }
+)
+_PRINTED_NUMBER_PREFIX = re.compile(
+    r"^(?:"
+    r"第[〇零一二三四五六七八九十百千万两]+[编篇章节]"
+    r"|[〇零一二三四五六七八九十百千万两]+[、．.]"
+    r"|[（(][〇零一二三四五六七八九十百千万两]+[）)]"
+    r"|\d+(?:\.\d+)+(?:[、．.]|\s)+"
+    r"|\d{1,4}[、．.)）]"
+    r"|[（(]\d{1,4}[）)]"
+    r")\s*(?=\S)"
 )
 
 
@@ -98,6 +117,44 @@ class _Candidate:
     source_proven: bool = False
 
 
+@dataclass(frozen=True)
+class _NativeLayoutWitness:
+    page_idx: int
+    blocks: frozenset[tuple[int, int]]
+    line_bboxes: tuple[tuple[float, float, float, float], ...]
+    line_heights: tuple[float, ...]
+    exact_lines: bool
+    centered: bool
+    display_height: bool
+    near_document_left: bool
+    page_front: bool
+    component_closed: bool
+
+
+@dataclass(frozen=True)
+class _NativeVisualRow:
+    bbox: tuple[float, float, float, float]
+    line_refs: frozenset[tuple[int, int, int]]
+    height: float
+
+
+@dataclass(frozen=True)
+class _OwnerScopeCandidate:
+    """Source-bound layout point that may end, but never create, a section."""
+
+    ref: _Ref
+    source_atom_orders: tuple[int, ...]
+    eligibility_basis: Literal[
+        "numbered_caption_native_break",
+        "unnumbered_display_peer_break",
+    ]
+    boundary_carrier_scope: Literal[
+        "selected_only",
+        "selected_and_same_carrier",
+    ]
+    layout: _NativeLayoutWitness
+
+
 def build_mineru_structure_proof(
     *,
     native: NativeStructureIndex,
@@ -123,6 +180,19 @@ def build_mineru_structure_proof(
         raise ParserOutputContractError(
             "native PDF structure has an invalid page count"
         )
+    identity_items = (
+        identity_content_list
+        if identity_content_list is not None
+        else content_list
+    )
+    if len(identity_items) != len(content_list):
+        raise ParserOutputContractError(
+            "identity content list does not mirror the canonical list"
+        )
+    source_item_hashes = {
+        index: mineru_provider_item_sha256(item)
+        for index, item in enumerate(identity_items)
+    }
     conflicts: list[dict[str, Any]] = []
     carriers = _carriers(
         content_list,
@@ -133,6 +203,10 @@ def build_mineru_structure_proof(
         _require_source_supported_carriers(
             carriers,
             carrier_source_support=carrier_source_support,
+        )
+    if source_pages is not None and carrier_source_support is None:
+        raise ParserOutputContractError(
+            "native-layout structure proof requires validated carrier support"
         )
     by_ref = {carrier.ref: carrier for carrier in carriers}
     by_page: dict[int, list[_Carrier]] = defaultdict(list)
@@ -228,10 +302,13 @@ def build_mineru_structure_proof(
     ):
         grouped[candidate.refs].append(candidate)
 
+    owner_scope_candidates: tuple[_OwnerScopeCandidate, ...] = ()
+    native_layout_witnesses: Mapping[_Ref, _NativeLayoutWitness] = {}
     if source_pages is not None:
-        _apply_native_line_grammar(
+        owner_scope_candidates, native_layout_witnesses = _apply_native_line_grammar(
             grouped,
             carriers=carriers,
+            carrier_source_support=carrier_source_support,
             source_pages=source_pages,
             conflicts=conflicts,
         )
@@ -240,6 +317,7 @@ def build_mineru_structure_proof(
         nonheading_roles=nonheading_roles,
         conflicts=conflicts,
         toc_corroborated=toc_corroborated,
+        require_native_layout=source_pages is not None,
     )
     for refs, candidate in selected.items():
         if candidate.source_proven:
@@ -257,17 +335,26 @@ def build_mineru_structure_proof(
         selected,
         native_key_by_node=native_key_by_node,
         conflicts=conflicts,
+        flatten_unsafe_hierarchy=source_pages is not None,
     )
     parent_key_by_key = _continuous_parents(
         parent_key_by_key,
         selected=selected,
         conflicts=conflicts,
+        flatten_unsafe_hierarchy=source_pages is not None,
     )
     headings = _heading_nodes(
         selected,
         parent_key_by_key=parent_key_by_key,
         carriers_by_ref=by_ref,
         last_source_index=max(len(content_list) - 1, 0),
+    )
+    owner_scope_breaks = _owner_scope_breaks(
+        owner_scope_candidates,
+        headings=headings,
+        carriers_by_ref=by_ref,
+        native_layout_witnesses=native_layout_witnesses,
+        source_item_hashes=source_item_hashes,
     )
     proven_sources = {ref for candidate in selected.values() for ref in candidate.refs}
     for carrier in carriers:
@@ -292,25 +379,20 @@ def build_mineru_structure_proof(
     # Carrier identity is the provider's raw item, exactly as the mapper
     # stamps elements: hashing the projected copy would fork the identity
     # whenever the serializer lane rewrites text (escape cleanup).
-    identity_items = (
-        identity_content_list
-        if identity_content_list is not None
-        else content_list
-    )
-    if len(identity_items) != len(content_list):
-        raise ParserOutputContractError(
-            "identity content list does not mirror the canonical list"
-        )
     identities = [
         {
             "source_item_index": index,
-            "source_item_sha256": mineru_provider_item_sha256(item),
+            "source_item_sha256": source_item_hashes[index],
         }
         for index, item in enumerate(identity_items)
     ]
     return {
         "contract_version": DOCUMENT_STRUCTURE_VERSION,
-        "algorithm_version": DOCUMENT_STRUCTURE_ALGORITHM,
+        "algorithm_version": (
+            DOCUMENT_STRUCTURE_ALGORITHM
+            if source_pages is not None
+            else LEGACY_DOCUMENT_STRUCTURE_ALGORITHM
+        ),
         "source_pdf_sha256": source_pdf_sha256,
         "source_pdf_page_count": page_count,
         "carrier_set_sha256": carrier_set_sha256(identities),
@@ -319,6 +401,11 @@ def build_mineru_structure_proof(
             "artifact_role": "pdf_structure",
         },
         "headings": headings,
+        **(
+            {"owner_scope_breaks": owner_scope_breaks}
+            if source_pages is not None
+            else {}
+        ),
         "page_frames": frames,
         "conflicts": conflicts,
         "coverage": {
@@ -335,6 +422,7 @@ def build_mineru_structure_proof(
                 for block in page
             ),
             "proven_heading_nodes": len(headings),
+            "owner_scope_breaks": len(owner_scope_breaks),
             "page_frame_groups": len(frames),
         },
     }
@@ -446,6 +534,7 @@ def _select_candidates(
     nonheading_roles: Mapping[_Ref, set[str]],
     conflicts: list[dict[str, Any]],
     toc_corroborated: set[_Ref] = frozenset(),  # type: ignore[assignment]
+    require_native_layout: bool = False,
 ) -> dict[tuple[_Ref, ...], _Candidate]:
     selected: dict[tuple[_Ref, ...], _Candidate] = {}
     claimed: set[_Ref] = set()
@@ -495,7 +584,8 @@ def _select_candidates(
                 )
                 continue
         levels = {item.level for item in candidates}
-        if len(levels) > 1:
+        level_ambiguous = len(levels) > 1
+        if level_ambiguous:
             conflicts.append(
                 {
                     "relation": "heading_level_conflict",
@@ -506,6 +596,7 @@ def _select_candidates(
             candidates,
             refs=refs,
             conflicts=conflicts,
+            retain_ambiguous_identity=require_native_layout,
         )
         if sources is None:
             continue
@@ -520,9 +611,18 @@ def _select_candidates(
             if providers
             else candidates[0]
         )
-        chosen.source_proven = not hierarchy_ambiguous and bool(
-            native or bookmarks or (providers and not roles)
-        )
+        if require_native_layout:
+            rendered = any(
+                "native_layout" in item.evidence for item in candidates
+            )
+            printed = any(
+                "printed_toc" in item.evidence for item in candidates
+            )
+            chosen.source_proven = bool(rendered or printed)
+        else:
+            chosen.source_proven = not hierarchy_ambiguous and bool(
+                native or bookmarks or (providers and not roles)
+            )
         chosen.propagates = chosen.source_proven
         chosen.evidence.update(
             evidence
@@ -538,7 +638,11 @@ def _select_candidates(
             if role in _NON_SECTION_ANCESTOR_ROLES
         }
         if non_section_ancestor_roles:
-            chosen.propagates = False
+            if require_native_layout:
+                chosen.source_proven = False
+                chosen.propagates = False
+            else:
+                chosen.propagates = False
             conflicts.append(
                 {
                     "relation": "native_heading_non_section_ancestry",
@@ -546,25 +650,55 @@ def _select_candidates(
                     "source_item_indices": _ref_indices(refs),
                 }
             )
-        _merge_parent_hint(
-            chosen,
-            candidates=candidates,
-            field_name="bookmark_parent",
-            relation="bookmark_parent_conflict",
-            refs=refs,
-            conflicts=conflicts,
-        )
-        _merge_parent_hint(
-            chosen,
-            candidates=candidates,
-            field_name="provider_parent",
-            relation="provider_parent_conflict",
-            refs=refs,
-            conflicts=conflicts,
-        )
-        if roles.intersection({"TOC", "TOCI", "Table", "TD", "TH"}) and not (
-            native or bookmarks
-        ):
+        if require_native_layout:
+            # A rendered heading identity does not prove a parent edge.
+            # Preserve a single, internally consistent StructTree chain;
+            # otherwise publish the heading at document-root level.  Provider
+            # and bookmark parent hints remain observations only in v11.
+            chosen.bookmark_parent = None
+            chosen.provider_parent = None
+            if hierarchy_ambiguous or level_ambiguous or not native:
+                # StructTree is still retained in the bound native artifact and
+                # conflict receipts, but once its hierarchy is discarded it can
+                # no longer be claimed as exact evidence by the published
+                # heading.  Identity remains independently witnessed by the
+                # rendered native layout/provider title and is flattened to the
+                # document root.
+                chosen.evidence.discard("struct_tree")
+                chosen.level = 1
+                chosen.native_role = None
+                chosen.native_node_id = None
+                chosen.native_ancestor_roles = ()
+                chosen.native_ancestors = ()
+                chosen.native_segment_id = None
+                chosen.native_hierarchy_valid = False
+                if hierarchy_ambiguous or level_ambiguous:
+                    conflicts.append(
+                        {
+                            "relation": "heading_hierarchy_flattened",
+                            "source_item_indices": _ref_indices(refs),
+                        }
+                    )
+        else:
+            _merge_parent_hint(
+                chosen,
+                candidates=candidates,
+                field_name="bookmark_parent",
+                relation="bookmark_parent_conflict",
+                refs=refs,
+                conflicts=conflicts,
+            )
+            _merge_parent_hint(
+                chosen,
+                candidates=candidates,
+                field_name="provider_parent",
+                relation="provider_parent_conflict",
+                refs=refs,
+                conflicts=conflicts,
+            )
+        if roles.intersection({"TOC", "TOCI", "Table", "TD", "TH"}):
+            if require_native_layout:
+                chosen.source_proven = False
             chosen.propagates = False
         selected[refs] = chosen
         claimed.update(refs)
@@ -576,6 +710,7 @@ def _candidate_sources(
     *,
     refs: tuple[_Ref, ...],
     conflicts: list[dict[str, Any]],
+    retain_ambiguous_identity: bool = False,
 ) -> (
     tuple[
         list[_Candidate],
@@ -608,7 +743,10 @@ def _candidate_sources(
                 "source_item_indices": _ref_indices(refs),
             }
         )
-        candidates = [item for item in candidates if "struct_tree" not in item.evidence]
+        if not retain_ambiguous_identity:
+            candidates = [
+                item for item in candidates if "struct_tree" not in item.evidence
+            ]
         native = []
     if not candidates:
         return None
@@ -650,6 +788,7 @@ def _explicit_parents(
     *,
     native_key_by_node: Mapping[_NativeNodeKey, tuple[_Ref, ...]],
     conflicts: list[dict[str, Any]],
+    flatten_unsafe_hierarchy: bool = False,
 ) -> dict[tuple[_Ref, ...], tuple[_Ref, ...] | None]:
     output: dict[tuple[_Ref, ...], tuple[_Ref, ...] | None] = {}
     for key, candidate in selected.items():
@@ -663,6 +802,7 @@ def _explicit_parents(
                 selected=selected,
                 native_key_by_node=native_key_by_node,
                 conflicts=conflicts,
+                flatten_unsafe_hierarchy=flatten_unsafe_hierarchy,
             )
         else:
             parents = {
@@ -688,7 +828,8 @@ def _explicit_parents(
         if parent is not None and min(ref.source_item_index for ref in parent) > min(
             ref.source_item_index for ref in key
         ):
-            candidate.propagates = False
+            if not flatten_unsafe_hierarchy:
+                candidate.propagates = False
             conflicts.append(
                 {
                     "relation": "heading_parent_invalid",
@@ -707,6 +848,7 @@ def _native_parent(
     selected: Mapping[tuple[_Ref, ...], _Candidate],
     native_key_by_node: Mapping[_NativeNodeKey, tuple[_Ref, ...]],
     conflicts: list[dict[str, Any]],
+    flatten_unsafe_hierarchy: bool = False,
 ) -> tuple[_Ref, ...] | None:
     """Use only the current StructTreeRoot segment for a native parent."""
 
@@ -747,7 +889,8 @@ def _native_parent(
         or not parent_candidate.native_hierarchy_valid
         or parent_candidate.native_segment_id != segment_id
     ):
-        candidate.propagates = False
+        if not flatten_unsafe_hierarchy:
+            candidate.propagates = False
         conflicts.append(
             {
                 "relation": "native_heading_parent_unavailable",
@@ -848,11 +991,217 @@ def _heading_nodes(
     return output
 
 
+def _owner_scope_breaks(
+    candidates: Sequence[_OwnerScopeCandidate],
+    *,
+    headings: Sequence[Mapping[str, Any]],
+    carriers_by_ref: Mapping[_Ref, _Carrier],
+    native_layout_witnesses: Mapping[_Ref, _NativeLayoutWitness],
+    source_item_hashes: Mapping[int, str],
+) -> list[dict[str, Any]]:
+    """Close unsafe sibling carry-over without minting a missing heading.
+
+    A record is emitted only when the current accepted owner has an exact
+    native anchor and the source layout proves a new block start.  The record
+    is intentionally weaker than a heading: downstream may only lift content
+    to an already-proven ancestor or the document root.
+    """
+
+    heading_by_id = {int(heading["node_id"]): heading for heading in headings}
+
+    def depth(heading: Mapping[str, Any]) -> int:
+        result = 1
+        parent = heading.get("parent_node_id")
+        seen = {int(heading["node_id"])}
+        while isinstance(parent, int) and parent not in seen:
+            seen.add(parent)
+            result += 1
+            parent = heading_by_id[parent].get("parent_node_id")
+        return result
+
+    def heading_refs(heading: Mapping[str, Any]) -> tuple[_Ref, ...]:
+        return tuple(
+            _Ref(
+                int(ref["source_item_index"]),
+                str(ref["field"]),
+                int(ref["index"]) if ref.get("index") is not None else None,
+            )
+            for ref in heading["source_refs"]
+        )
+
+    accepted_refs = {
+        ref for heading in headings for ref in heading_refs(heading)
+    }
+    by_boundary: dict[int, list[_OwnerScopeCandidate]] = defaultdict(list)
+    for candidate in candidates:
+        if candidate.ref not in accepted_refs:
+            by_boundary[candidate.ref.source_item_index].append(candidate)
+
+    output: list[dict[str, Any]] = []
+    for boundary, boundary_candidates in sorted(by_boundary.items()):
+        if len(boundary_candidates) != 1:
+            continue
+        candidate = boundary_candidates[0]
+        owners = [
+            heading
+            for heading in headings
+            if bool(heading["propagates"])
+            and int(heading["section_span"][0]) < boundary
+            <= int(heading["section_span"][1])
+        ]
+        if not owners:
+            continue
+        owners.sort(key=depth)
+        owner = owners[-1]
+        owner_refs = heading_refs(owner)
+        owner_layouts = [
+            native_layout_witnesses.get(ref) for ref in owner_refs
+        ]
+        if not owner_layouts or any(layout is None for layout in owner_layouts):
+            continue
+        exact_owner_layouts = [
+            layout for layout in owner_layouts if layout is not None
+        ]
+        if not all(layout.exact_lines for layout in exact_owner_layouts):
+            continue
+        owner_text = "".join(
+            carriers_by_ref[ref].source_value for ref in owner_refs
+        )
+        relative_rank: Literal["peer", "higher", "unnumbered_peer"]
+        target_node_id: int | None
+        if candidate.eligibility_basis == "numbered_caption_native_break":
+            candidate_rank = printed_number_rank(
+                carriers_by_ref[candidate.ref].source_value
+            )
+            owner_rank = printed_number_rank(owner_text)
+            if candidate_rank is None or owner_rank is None:
+                continue
+            if candidate_rank > owner_rank:
+                # A deeper caption remains inside the current broad section.
+                continue
+            relative_rank = "peer" if candidate_rank == owner_rank else "higher"
+            owner_path: list[Mapping[str, Any]] = [owner]
+            parent_id = owner.get("parent_node_id")
+            while isinstance(parent_id, int):
+                parent = heading_by_id[parent_id]
+                owner_path.append(parent)
+                parent_id = parent.get("parent_node_id")
+            ranked_path = [
+                (
+                    ancestor,
+                    printed_number_rank(
+                        "".join(
+                            carriers_by_ref[ref].source_value
+                            for ref in heading_refs(ancestor)
+                        )
+                    ),
+                )
+                for ancestor in owner_path
+            ]
+            peer = next(
+                (
+                    ancestor
+                    for ancestor, rank in ranked_path
+                    if rank == candidate_rank
+                ),
+                None,
+            )
+            if peer is not None:
+                parent_id = peer.get("parent_node_id")
+                target_node_id = (
+                    int(parent_id) if isinstance(parent_id, int) else None
+                )
+            else:
+                target_node_id = next(
+                    (
+                        int(ancestor["node_id"])
+                        for ancestor, rank in ranked_path
+                        if rank is not None and rank < candidate_rank
+                    ),
+                    None,
+                )
+        else:
+            if _PRINTED_NUMBER_PREFIX.match(owner_text.lstrip()) is not None:
+                continue
+            if len(exact_owner_layouts) != 1 or not _same_native_display_style(
+                candidate.layout,
+                exact_owner_layouts[0],
+            ):
+                continue
+            relative_rank = "unnumbered_peer"
+            parent_node = owner.get("parent_node_id")
+            target_node_id = (
+                int(parent_node) if isinstance(parent_node, int) else None
+            )
+        selected_value = carriers_by_ref[candidate.ref].source_value
+        output.append(
+            {
+                "boundary_source_ref": {
+                    "source_item_index": candidate.ref.source_item_index,
+                    "source_item_sha256": source_item_hashes[
+                        candidate.ref.source_item_index
+                    ],
+                    "page_index": candidate.layout.page_idx,
+                    "field": candidate.ref.field,
+                    **(
+                        {"index": candidate.ref.index}
+                        if candidate.ref.index is not None
+                        else {}
+                    ),
+                    "text_span": [0, len(selected_value)],
+                    "value_sha256": source_value_sha256(selected_value),
+                },
+                "source_atom_orders": list(candidate.source_atom_orders),
+                "eligibility_basis": candidate.eligibility_basis,
+                "relative_rank": relative_rank,
+                "current_owner_node_id": int(owner["node_id"]),
+                "target_node_id": target_node_id,
+                "boundary_carrier_scope": candidate.boundary_carrier_scope,
+            }
+        )
+    return output
+
+
+def _same_native_display_style(
+    candidate: _NativeLayoutWitness,
+    accepted_owner: _NativeLayoutWitness,
+) -> bool:
+    """Match a repeated document-local display family without text semantics.
+
+    The already-accepted owner must itself be a page-local display line.  A
+    repeated candidate may be the modal line height on a table-heavy page, so
+    requiring a second independent ``display_height`` vote there would make
+    the boundary depend on the table's font distribution.  Exact geometry,
+    centering, page-front placement, component closure, and equality to the
+    accepted owner's native style remain mandatory.
+    """
+
+    if not (
+        candidate.exact_lines
+        and candidate.component_closed
+        and candidate.centered
+        and candidate.page_front
+        and accepted_owner.exact_lines
+        and accepted_owner.component_closed
+        and accepted_owner.centered
+        and accepted_owner.display_height
+        and accepted_owner.page_front
+    ):
+        return False
+    return bool(
+        len(candidate.line_heights) == len(accepted_owner.line_heights)
+        and len(candidate.blocks) == len(accepted_owner.blocks)
+        and round(statistics.median(candidate.line_heights), 2)
+        == round(statistics.median(accepted_owner.line_heights), 2)
+    )
+
+
 def _continuous_parents(
     parents: Mapping[tuple[_Ref, ...], tuple[_Ref, ...] | None],
     *,
     selected: Mapping[tuple[_Ref, ...], _Candidate],
     conflicts: list[dict[str, Any]],
+    flatten_unsafe_hierarchy: bool = False,
 ) -> dict[tuple[_Ref, ...], tuple[_Ref, ...] | None]:
     """Reject explicit edges that cross a separate reading-order branch."""
 
@@ -891,7 +1240,8 @@ def _continuous_parents(
                     "source_item_indices": _ref_indices(child),
                 }
             )
-            selected[child].propagates = False
+            if not flatten_unsafe_hierarchy:
+                selected[child].propagates = False
             output[child] = None
     for child, parent in list(output.items()):
         if parent is None or selected[parent].propagates:
@@ -906,183 +1256,905 @@ def _continuous_parents(
     return output
 
 
-def _carrier_native_blocks(
-    carrier: _Carrier,
-    pages_by_idx: Mapping[int, NativeTextPage],
-) -> frozenset[tuple[int, int]]:
-    """Poppler blocks whose word centers fall inside the carrier bbox."""
+def _native_visual_rows(
+    lines: Mapping[
+        tuple[int, int, int],
+        tuple[NativeTextAtom, ...],
+    ],
+) -> tuple[_NativeVisualRow, ...]:
+    """Merge adjacent native line fragments that paint one visual row."""
 
-    page = pages_by_idx.get(carrier.page_idx)
-    if page is None:
-        return frozenset()
-    x0, y0, x1, y1 = carrier.bbox
-    blocks: set[tuple[int, int]] = set()
-    for atom in page.atoms:
-        center_x = (atom.bbox[0] + atom.bbox[2]) / 2 / page.width * 1000.0
-        center_y = (atom.bbox[1] + atom.bbox[3]) / 2 / page.height * 1000.0
-        if x0 <= center_x <= x1 and y0 <= center_y <= y1:
-            blocks.add((atom.layout.flow_index, atom.layout.block_index))
-    return frozenset(blocks)
+    rows: list[_NativeVisualRow] = []
+    fragments: list[_NativeVisualRow] = []
+    for ref, atoms in lines.items():
+        if not atoms:
+            continue
+        bbox = (
+            min(atom.bbox[0] for atom in atoms),
+            min(atom.bbox[1] for atom in atoms),
+            max(atom.bbox[2] for atom in atoms),
+            max(atom.bbox[3] for atom in atoms),
+        )
+        fragments.append(
+            _NativeVisualRow(
+                bbox=bbox,
+                line_refs=frozenset({ref}),
+                height=statistics.median(
+                    atom.bbox[3] - atom.bbox[1] for atom in atoms
+                ),
+            )
+        )
+    fragments.sort(key=lambda row: (row.bbox[1], row.bbox[0]))
+    for fragment in fragments:
+        if not rows or not _same_visual_row(rows[-1], fragment):
+            rows.append(fragment)
+            continue
+        prior = rows[-1]
+        bbox = (
+            min(prior.bbox[0], fragment.bbox[0]),
+            min(prior.bbox[1], fragment.bbox[1]),
+            max(prior.bbox[2], fragment.bbox[2]),
+            max(prior.bbox[3], fragment.bbox[3]),
+        )
+        rows[-1] = _NativeVisualRow(
+            bbox=bbox,
+            line_refs=prior.line_refs.union(fragment.line_refs),
+            height=statistics.median((prior.height, fragment.height)),
+        )
+    return tuple(rows)
+
+
+def _same_visual_row(left: _NativeVisualRow, right: _NativeVisualRow) -> bool:
+    overlap = min(left.bbox[3], right.bbox[3]) - max(
+        left.bbox[1], right.bbox[1]
+    )
+    if overlap < 0.5 * min(left.height, right.height):
+        return False
+    horizontal_gap = max(
+        0.0,
+        max(left.bbox[0], right.bbox[0])
+        - min(left.bbox[2], right.bbox[2]),
+    )
+    return horizontal_gap <= 4 * max(left.height, right.height)
 
 
 def _apply_native_line_grammar(
     grouped: dict[tuple[_Ref, ...], list[_Candidate]],
     *,
     carriers: Sequence[_Carrier],
+    carrier_source_support: Mapping[
+        tuple[int, str, int | None],
+        CarrierSourceSupport,
+    ]
+    | None,
     source_pages: tuple[NativeTextPage, ...],
     conflicts: list[dict[str, Any]],
-) -> None:
-    """Let the native line layout arbitrate provider title claims.
+) -> tuple[
+    tuple[_OwnerScopeCandidate, ...],
+    Mapping[_Ref, _NativeLayoutWitness],
+]:
+    """Admit only rendered coarse headings and flatten uncertain detail.
 
-    A printed title always owns its own layout block. A provider-typed
-    title living inside another carrier's block is a wrapped sentence
-    tail, not a heading (rejected); two adjacent provider titles sharing
-    one block are the lines of a single printed title (merged, so the
-    published heading joins their text).
+    The provider, bookmark, and StructTree lanes may propose candidates.  The
+    native PDF supplies a separate, deterministic rendered witness: a closed
+    page-front display component or a complete numbered line at the document's
+    own text margin.  No fixed document-wide font multiplier is used.
     """
 
     pages_by_idx = {page.page_idx: page for page in source_pages}
     by_sii: dict[int, list[_Carrier]] = defaultdict(list)
+    carrier_by_ref = {carrier.ref: carrier for carrier in carriers}
     for carrier in carriers:
         by_sii[carrier.ref.source_item_index].append(carrier)
-    blocks_cache: dict[int, frozenset[tuple[int, int]]] = {}
 
-    def blocks(sii: int) -> frozenset[tuple[int, int]]:
-        if sii not in blocks_cache:
-            merged: set[tuple[int, int]] = set()
-            for carrier in by_sii.get(sii, []):
-                merged |= _carrier_native_blocks(carrier, pages_by_idx)
-            blocks_cache[sii] = frozenset(merged)
-        return blocks_cache[sii]
+    lines_by_page: dict[
+        int,
+        dict[tuple[int, int, int], tuple[NativeTextAtom, ...]],
+    ] = {}
+    visual_rows_by_page: dict[int, tuple[_NativeVisualRow, ...]] = {}
+    page_mode_height: dict[int, float] = {}
+    all_line_lefts: list[float] = []
+    for page in source_pages:
+        mutable_lines: dict[tuple[int, int, int], list[NativeTextAtom]] = (
+            defaultdict(list)
+        )
+        for atom in page.atoms:
+            mutable_lines[atom.layout.line_ref].append(atom)
+        lines = {
+            ref: tuple(sorted(atoms, key=lambda atom: atom.order))
+            for ref, atoms in mutable_lines.items()
+        }
+        lines_by_page[page.page_idx] = lines
+        visual_rows = _native_visual_rows(lines)
+        visual_rows_by_page[page.page_idx] = visual_rows
+        heights = [
+            round(
+                statistics.median(
+                    atom.bbox[3] - atom.bbox[1] for atom in atoms
+                ),
+                2,
+            )
+            for atoms in lines.values()
+            if atoms
+        ]
+        if heights:
+            counts = Counter(heights)
+            page_mode_height[page.page_idx] = max(
+                counts,
+                key=lambda height: (counts[height], -height),
+            )
+        for atoms in lines.values():
+            if atoms:
+                all_line_lefts.append(min(atom.bbox[0] for atom in atoms))
+    sorted_lefts = sorted(all_line_lefts)
+    document_left = (
+        sorted_lefts[int((len(sorted_lefts) - 1) * 0.05)]
+        if sorted_lefts
+        else 0.0
+    )
+
+    witness_cache: dict[_Ref, _NativeLayoutWitness | None] = {}
+    atom_cache: dict[_Ref, tuple[NativeTextAtom, ...] | None] = {}
+
+    def source_atoms(ref: _Ref) -> tuple[NativeTextAtom, ...] | None:
+        if ref in atom_cache:
+            return atom_cache[ref]
+        carrier = carrier_by_ref.get(ref)
+        if carrier is None:
+            atom_cache[ref] = None
+            return None
+        page = pages_by_idx.get(carrier.page_idx)
+        if page is None:
+            atom_cache[ref] = None
+            return None
+        support = (
+            carrier_source_support.get(
+                (
+                    carrier.ref.source_item_index,
+                    carrier.ref.field,
+                    carrier.ref.index,
+                )
+            )
+            if carrier_source_support is not None
+            else None
+        )
+        if support is not None and support.kind == "native_exact":
+            atoms_by_order = {atom.order: atom for atom in page.atoms}
+            atoms = tuple(
+                atoms_by_order[order]
+                for order in support.source_atom_orders
+                if order in atoms_by_order
+            )
+            if len(atoms) != len(support.source_atom_orders):
+                atom_cache[ref] = None
+                return None
+        else:
+            # A visual-bound carrier proves visibility, not native style.
+            # Missing support and provider bboxes are never allowed to mint a
+            # deterministic native-layout heading witness.
+            atom_cache[ref] = None
+            return None
+        if not atoms:
+            atom_cache[ref] = None
+            return None
+        atom_cache[ref] = atoms
+        return atoms
+
+    def witness_ref(ref: _Ref) -> _NativeLayoutWitness | None:
+        if ref in witness_cache:
+            return witness_cache[ref]
+        carrier = carrier_by_ref.get(ref)
+        if carrier is None:
+            witness_cache[ref] = None
+            return None
+        page = pages_by_idx.get(carrier.page_idx)
+        atoms = source_atoms(ref)
+        if page is None or atoms is None:
+            witness_cache[ref] = None
+            return None
+        selected_by_line: dict[
+            tuple[int, int, int],
+            list[NativeTextAtom],
+        ] = defaultdict(list)
+        for atom in atoms:
+            selected_by_line[atom.layout.line_ref].append(atom)
+        ordered_refs = sorted(
+            selected_by_line,
+            key=lambda ref: min(atom.order for atom in selected_by_line[ref]),
+        )
+        line_bboxes: list[tuple[float, float, float, float]] = []
+        line_heights: list[float] = []
+        exact_lines = True
+        for line_ref in ordered_refs:
+            selected = tuple(
+                sorted(selected_by_line[line_ref], key=lambda atom: atom.order)
+            )
+            complete = lines_by_page.get(page.page_idx, {}).get(line_ref, ())
+            if tuple(atom.order for atom in selected) != tuple(
+                atom.order for atom in complete
+            ):
+                exact_lines = False
+            line_bboxes.append(
+                (
+                    min(atom.bbox[0] for atom in selected),
+                    min(atom.bbox[1] for atom in selected),
+                    max(atom.bbox[2] for atom in selected),
+                    max(atom.bbox[3] for atom in selected),
+                )
+            )
+            line_heights.append(
+                statistics.median(
+                    atom.bbox[3] - atom.bbox[1] for atom in selected
+                )
+            )
+        selected_refs = frozenset(selected_by_line)
+        page_rows = visual_rows_by_page.get(page.page_idx, ())
+        selected_rows = tuple(
+            row for row in page_rows if row.line_refs.intersection(selected_refs)
+        )
+        rows_closed = bool(
+            selected_rows
+            and frozenset(
+                ref for row in selected_rows for ref in row.line_refs
+            )
+            == selected_refs
+        )
+        row_bboxes = tuple(row.bbox for row in selected_rows)
+        row_heights = tuple(row.height for row in selected_rows)
+        aligned = bool(
+            row_bboxes
+            and (
+                max(box[0] for box in row_bboxes)
+                - min(box[0] for box in row_bboxes)
+                <= 2.25 * statistics.median(row_heights)
+                or max((box[0] + box[2]) / 2 for box in row_bboxes)
+                - min((box[0] + box[2]) / 2 for box in row_bboxes)
+                <= 2.25 * statistics.median(row_heights)
+            )
+        )
+        compact = bool(
+            row_bboxes
+            and all(
+                right[1] - left[3]
+                <= 2 * max(left_height, right_height)
+                for (left, left_height), (right, right_height) in zip(
+                    zip(row_bboxes, row_heights, strict=True),
+                    zip(row_bboxes[1:], row_heights[1:], strict=True),
+                    strict=False,
+                )
+            )
+        )
+        consistent_height = bool(
+            row_heights
+            and max(row_heights) <= 1.25 * min(row_heights)
+        )
+        component_closed = bool(
+            rows_closed
+            and bool(selected_rows)
+            and aligned
+            and compact
+            and consistent_height
+        )
+        if comparison_text("".join(atom.text for atom in atoms)) != (
+            carrier.comparison_value
+        ):
+            exact_lines = False
+        modal_height = page_mode_height.get(page.page_idx, 0.0)
+        effective_boxes = row_bboxes or tuple(line_bboxes)
+        effective_heights = row_heights or tuple(line_heights)
+        centered = bool(
+            effective_boxes
+            and all(
+                abs(box[0] - (page.width - box[2])) <= 2 * height
+                for box, height in zip(
+                    effective_boxes,
+                    effective_heights,
+                    strict=True,
+                )
+            )
+        )
+        display_height = bool(
+            modal_height > 0
+            and effective_heights
+            and all(
+                round(height, 2) > modal_height
+                for height in effective_heights
+            )
+        )
+        result = _NativeLayoutWitness(
+            page_idx=page.page_idx,
+            blocks=frozenset(
+                (atom.layout.flow_index, atom.layout.block_index)
+                for atom in atoms
+            ),
+            line_bboxes=effective_boxes,
+            line_heights=effective_heights,
+            exact_lines=exact_lines,
+            centered=centered,
+            display_height=display_height,
+            near_document_left=bool(
+                effective_boxes
+                and effective_boxes[0][0]
+                <= document_left + 5 * effective_heights[0]
+            ),
+            page_front=bool(
+                effective_boxes
+                and max(box[3] for box in effective_boxes) <= page.height * 0.38
+            ),
+            component_closed=component_closed,
+        )
+        witness_cache[ref] = result
+        return result
+
+    def witness(sii: int) -> _NativeLayoutWitness | None:
+        text_refs = [
+            carrier.ref
+            for carrier in by_sii.get(sii, ())
+            if carrier.ref.field == "text" and carrier.raw_kind in _TEXT_KINDS
+        ]
+        return witness_ref(text_refs[0]) if len(text_refs) == 1 else None
+
+    def document_title_component(sources: tuple[int, ...]) -> bool:
+        layouts = [witness(source) for source in sources]
+        if not layouts or any(layout is None for layout in layouts):
+            return False
+        closed = [layout for layout in layouts if layout is not None]
+        if not all(
+            layout.page_idx == 0
+            and layout.exact_lines
+            and layout.component_closed
+            and layout.centered
+            and layout.display_height
+            and layout.page_front
+            for layout in closed
+        ):
+            return False
+        lines = sorted(
+            (
+                (box, height)
+                for layout in closed
+                for box, height in zip(
+                    layout.line_bboxes,
+                    layout.line_heights,
+                    strict=True,
+                )
+            ),
+            key=lambda item: (item[0][1], item[0][0]),
+        )
+        heights = [height for _, height in lines]
+        return bool(heights) and max(heights) <= 1.25 * min(heights) and all(
+            -0.5 * max(left_height, right_height)
+            <= right_box[1] - left_box[3]
+            <= 4 * max(left_height, right_height)
+            for (left_box, left_height), (right_box, right_height) in zip(
+                lines,
+                lines[1:],
+                strict=False,
+            )
+        )
+
+    def numbered_heading(
+        sii: int,
+        layout: _NativeLayoutWitness | None = None,
+        candidates: Sequence[_Candidate] = (),
+    ) -> bool:
+        layout = layout or witness(sii)
+        carrier = next(
+            (
+                item
+                for item in by_sii.get(sii, ())
+                if item.ref.field == "text"
+            ),
+            None,
+        )
+        return bool(
+            layout is not None
+            and carrier is not None
+            and any(
+                "mineru_v2_title" in candidate.evidence
+                for candidate in candidates
+            )
+            and layout.exact_lines
+            and layout.component_closed
+            and bool(layout.line_bboxes)
+            and layout.near_document_left
+            and _PRINTED_NUMBER_PREFIX.match(carrier.source_value.lstrip())
+            is not None
+        )
+
+    def display_heading(layout: _NativeLayoutWitness | None) -> bool:
+        return bool(
+            layout is not None
+            and layout.exact_lines
+            and layout.component_closed
+            and layout.line_bboxes
+            and layout.centered
+            and layout.display_height
+        )
+
+    def sentence_terminal(refs: tuple[_Ref, ...]) -> bool:
+        """Reject complete statements that only look like numbered titles.
+
+        Full-stop, question, exclamation, and semicolon endings close a
+        sentence in the filing body.  A colon deliberately remains eligible:
+        Chinese disclosures routinely use it for real section introductions.
+        This is a recall-reducing, topic-neutral boundary rule; the source
+        carrier remains ordinary content under its nearest reliable owner.
+        """
+
+        values: list[str] = []
+        for ref in refs:
+            carrier = next(
+                (item for item in carriers if item.ref == ref),
+                None,
+            )
+            if carrier is None:
+                return False
+            values.append(carrier.source_value)
+        return "".join(values).rstrip().endswith(
+            ("。", "！", "？", ".", "!", "?", "；", ";")
+        )
 
     title_groups: dict[int, tuple[_Ref, ...]] = {
         refs[0].source_item_index: refs
         for refs in grouped
         if len(refs) == 1
     }
+    text_ref_by_source = {
+        carrier.ref.source_item_index: carrier.ref
+        for carrier in carriers
+        if carrier.ref.field == "text" and carrier.raw_kind in _TEXT_KINDS
+    }
 
-    all_heights = [
-        atom.bbox[3] - atom.bbox[1]
-        for page in source_pages
-        for atom in page.atoms
-    ]
-    doc_line_height = statistics.median(all_heights) if all_heights else 0.0
-    line_height_cache: dict[int, float] = {}
-
-    def line_height(sii: int) -> float:
-        if sii not in line_height_cache:
-            heights: list[float] = []
-            for carrier in by_sii.get(sii, []):
-                page = pages_by_idx.get(carrier.page_idx)
-                if page is None:
-                    continue
-                x0, y0, x1, y1 = carrier.bbox
-                for atom in page.atoms:
-                    cx = (atom.bbox[0] + atom.bbox[2]) / 2 / page.width * 1000.0
-                    cy = (atom.bbox[1] + atom.bbox[3]) / 2 / page.height * 1000.0
-                    if x0 <= cx <= x1 and y0 <= cy <= y1:
-                        heights.append(atom.bbox[3] - atom.bbox[1])
-            line_height_cache[sii] = (
-                statistics.median(heights) if heights else 0.0
+    # A page-0 printed document title may be split by the provider into a
+    # title followed by paragraph carriers. Extend the provider anchor only
+    # when the adjacent carriers independently form one exact, centered native
+    # display component; the paragraph label itself contributes no title vote.
+    for source in sorted(tuple(title_groups)):
+        refs = title_groups.get(source)
+        if refs is None:
+            continue
+        run = [source]
+        while True:
+            nxt = run[-1] + 1
+            if nxt in title_groups or nxt not in text_ref_by_source:
+                break
+            candidate_run = (*run, nxt)
+            if not document_title_component(candidate_run):
+                break
+            run.append(nxt)
+        if len(run) == 1:
+            continue
+        candidates = grouped.pop(refs)
+        merged_refs = tuple(text_ref_by_source[item] for item in run)
+        grouped[merged_refs] = [
+            _Candidate(
+                refs=merged_refs,
+                level=candidates[0].level,
+                evidence=set().union(*(item.evidence for item in candidates)),
             )
-        return line_height_cache[sii]
-
-    def lines_of_one_printed_title(sii: int, nxt: int) -> bool:
-        # Two lines of one printed title: both carry display-size type
-        # (corpus calibration: real adjacent headings stay <= 1.14x the
-        # document line height, split document titles sit >= 1.33x), the
-        # same size as each other, at line pitch, centre-aligned, in one
-        # native flow. Block co-membership merges directly.
-        if blocks(sii) and blocks(sii) & blocks(nxt):
-            return True
-        left = by_sii.get(sii, [None])[0]
-        right = by_sii.get(nxt, [None])[0]
-        if left is None or right is None or left.page_idx != right.page_idx:
-            return False
-        left_flows = {flow for flow, _ in blocks(sii)}
-        right_flows = {flow for flow, _ in blocks(nxt)}
-        if not (left_flows and left_flows & right_flows):
-            return False
-        if doc_line_height <= 0:
-            return False
-        height_left = line_height(sii)
-        height_right = line_height(nxt)
-        if min(height_left, height_right) < 1.25 * doc_line_height:
-            return False
-        if abs(height_left - height_right) > 0.1 * max(
-            height_left, height_right
-        ):
-            return False
-        gap = right.bbox[1] - left.bbox[3]
-        pitch = min(
-            left.bbox[3] - left.bbox[1],
-            right.bbox[3] - right.bbox[1],
+        ]
+        title_groups[source] = merged_refs
+        conflicts.append(
+            {
+                "relation": "native_document_title_continuation",
+                "source_item_indices": run,
+            }
         )
-        if pitch <= 0 or gap > pitch:
-            return False
-        left_center = (left.bbox[0] + left.bbox[2]) / 2
-        right_center = (right.bbox[0] + right.bbox[2]) / 2
-        return abs(left_center - right_center) <= 100.0
 
-    # Merge the lines of one printed title, longest chains first.
-    merged_any = True
-    while merged_any:
-        merged_any = False
-        for sii in sorted(title_groups):
-            nxt = sii + 1
-            if nxt not in title_groups:
-                continue
-            if not lines_of_one_printed_title(sii, nxt):
-                continue
-            left_refs = title_groups[sii]
-            right_refs = title_groups[nxt]
-            if any(
-                "struct_tree" in item.evidence
-                for item in (*grouped[left_refs], *grouped[right_refs])
+    # Only a closed page-0 display component may merge adjacent candidates.
+    # Bookmark and StructTree claims from the same authored PDF may repeat the
+    # same wrong line split, so they remain recorded observations but are not
+    # carried forward as witnesses for the merged rendered title.
+    ordered_sources = sorted(title_groups)
+    position = 0
+    while position < len(ordered_sources):
+        run = [ordered_sources[position]]
+        cursor = position + 1
+        while cursor < len(ordered_sources):
+            nxt = ordered_sources[cursor]
+            if nxt != run[-1] + 1:
+                break
+            refs_in_run = [title_groups[source] for source in (*run, nxt)]
+            sides = [grouped[refs] for refs in refs_in_run]
+            if (
+                len({side[0].level for side in sides}) != 1
+                or not all(
+                    any(
+                        "mineru_v2_title" in item.evidence
+                        for item in side
+                    )
+                    for side in sides
+                )
+                or not document_title_component(tuple((*run, nxt)))
             ):
-                # Native-lane headings carry their own provenance and
-                # multi-ref mechanism; a merge would fabricate native
-                # claims the proof cannot back.
-                continue
-            left = grouped.pop(left_refs)
-            right = grouped.pop(right_refs)
-            refs = (*left_refs, *right_refs)
-            evidence: set[str] = set()
-            for item in (*left, *right):
-                evidence |= item.evidence
+                break
+            run.append(nxt)
+            cursor += 1
+        if len(run) > 1:
+            refs_in_run = [title_groups[source] for source in run]
+            candidates_in_run = [
+                item for refs in refs_in_run for item in grouped[refs]
+            ]
+            if any(
+                item.evidence.intersection({"bookmark", "struct_tree"})
+                for item in candidates_in_run
+            ):
+                conflicts.append(
+                    {
+                        "relation": (
+                            "authored_outline_split_rendered_document_title"
+                        ),
+                        "source_item_indices": run,
+                    }
+                )
+            refs = tuple(ref for group in refs_in_run for ref in group)
+            level = grouped[refs_in_run[0]][0].level
+            for old_refs in refs_in_run:
+                grouped.pop(old_refs)
+                del title_groups[old_refs[0].source_item_index]
             grouped[refs] = [
                 _Candidate(
                     refs=refs,
-                    level=left[0].level,
-                    evidence=evidence,
+                    level=level,
+                    evidence={"mineru_v2_title"},
                 )
             ]
-            del title_groups[sii]
-            del title_groups[nxt]
-            merged_any = True
-            break
+        position = max(cursor, position + 1)
 
-    # Reject a provider title that shares its block with a preceding
-    # non-title carrier: a wrapped tail is not a heading. StructTree
-    # evidence outranks the layout heuristic and is left alone.
-    for sii, refs in sorted(title_groups.items()):
-        candidates = grouped.get(refs)
-        if not candidates:
-            continue
-        if any("struct_tree" in item.evidence for item in candidates):
+    # A provider tail in the previous body block is not a heading.  The same
+    # fail-closed rule applies at a page edge when the first and last native
+    # lines have the same physical style and indent.
+    for sii, refs in sorted(tuple(title_groups.items())):
+        current_candidates = grouped.get(refs)
+        layout = witness(sii)
+        if not current_candidates or layout is None:
             continue
         prev = sii - 1
-        if prev < 0 or prev in title_groups or prev not in by_sii:
-            continue
-        shared = blocks(sii) & blocks(prev)
-        if shared:
-            conflicts.append(
-                {
-                    "relation": "provider_title_midflow",
-                    "source_item_indices": [sii],
-                }
+        same_page_midflow = bool(
+            prev >= 0
+            and prev not in title_groups
+            and (previous := witness(prev)) is not None
+            and previous.page_idx == layout.page_idx
+            and previous.blocks.intersection(layout.blocks)
+            and not numbered_heading(sii, layout, current_candidates)
+            and not display_heading(layout)
+        )
+        cross_page = False
+        if layout.page_idx > 0 and layout.line_bboxes:
+            current_page = pages_by_idx[layout.page_idx]
+            previous_page = pages_by_idx.get(layout.page_idx - 1)
+            prior_lines = (
+                list(lines_by_page.get(layout.page_idx - 1, {}).values())
+                if previous_page is not None
+                else []
             )
-            del grouped[refs]
+            substantial = [
+                atoms
+                for atoms in prior_lines
+                if atoms
+                and max(atom.bbox[2] for atom in atoms)
+                - min(atom.bbox[0] for atom in atoms)
+                > 4
+                * statistics.median(
+                    atom.bbox[3] - atom.bbox[1] for atom in atoms
+                )
+            ]
+            if substantial:
+                prior = max(
+                    substantial,
+                    key=lambda atoms: max(atom.bbox[3] for atom in atoms),
+                )
+                prior_box = (
+                    min(atom.bbox[0] for atom in prior),
+                    min(atom.bbox[1] for atom in prior),
+                    max(atom.bbox[2] for atom in prior),
+                    max(atom.bbox[3] for atom in prior),
+                )
+                prior_height = statistics.median(
+                    atom.bbox[3] - atom.bbox[1] for atom in prior
+                )
+                current_box = layout.line_bboxes[0]
+                current_height = layout.line_heights[0]
+                current_width = current_box[2] - current_box[0]
+                prior_width = prior_box[2] - prior_box[0]
+                cross_page = bool(
+                    previous_page is not None
+                    and current_box[1] <= current_page.height * 0.15
+                    and prior_box[3] >= previous_page.height * 0.85
+                    and round(prior_height, 2) == round(current_height, 2)
+                    and abs(prior_box[0] - current_box[0])
+                    <= max(prior_height, current_height)
+                    and current_width <= 8 * current_height
+                    and prior_width >= 2 * current_width
+                    and not numbered_heading(sii, layout, current_candidates)
+                )
+        if not same_page_midflow and not cross_page:
+            continue
+        conflicts.append(
+            {
+                "relation": (
+                    "provider_title_midflow"
+                    if same_page_midflow
+                    else "provider_title_cross_page_continuation"
+                ),
+                "source_item_indices": [sii],
+            }
+        )
+        del grouped[refs]
+        title_groups.pop(sii, None)
+
+    # A provider may style one numbered sentence as a title.  Native layout
+    # proves where and how it was painted, not that a sentence-ending statement
+    # is a section boundary.  More specific same/cross-page continuation proof
+    # is evaluated first so the audit retains the strongest structural reason.
+    # Remaining statements are suppressed before any display/numbered lane can
+    # grant ``native_layout`` authority.
+    for refs in tuple(grouped):
+        if not sentence_terminal(refs):
+            continue
+        conflicts.append(
+            {
+                "relation": "provider_title_sentence_terminal",
+                "source_item_indices": _ref_indices(refs),
+            }
+        )
+        grouped.pop(refs)
+
+    # Native layout qualifies an existing semantic claim; it never creates a
+    # heading.  Uncertain fine candidates remain content under their nearest
+    # accepted parent or the document root.
+    for refs, candidates in grouped.items():
+        sources = tuple(ref.source_item_index for ref in refs)
+        rendered = document_title_component(sources)
+        if not rendered and len(sources) == 1:
+            layout = witness(sources[0])
+            rendered = bool(
+                layout is not None
+                and layout.exact_lines
+                and (
+                    display_heading(layout)
+                    or numbered_heading(sources[0], layout, candidates)
+                )
+            )
+        if rendered:
+            for candidate in candidates:
+                candidate.evidence.add("native_layout")
+
+    def support_for(ref: _Ref) -> CarrierSourceSupport | None:
+        if carrier_source_support is None:
+            return None
+        return carrier_source_support.get(
+            (ref.source_item_index, ref.field, ref.index)
+        )
+
+    def source_blocks(ref: _Ref) -> frozenset[tuple[int, int]] | None:
+        atoms = source_atoms(ref)
+        if atoms is None:
+            return None
+        return frozenset(
+            (atom.layout.flow_index, atom.layout.block_index) for atom in atoms
+        )
+
+    def proved_table_body(ref: _Ref) -> _Carrier | None:
+        carrier = carrier_by_ref.get(ref)
+        support = support_for(ref)
+        if (
+            carrier is None
+            or support is None
+            or carrier.raw_kind != "table"
+            or ref.field != "table_html"
+            or support.kind not in {"native_exact", "visual_bound"}
+        ):
+            return None
+        return carrier
+
+    def normalized_line_height(layout: _NativeLayoutWitness) -> float:
+        page = pages_by_idx[layout.page_idx]
+        return statistics.median(layout.line_heights) * 1000.0 / page.height
+
+    def caption_table_transition(
+        carrier: _Carrier,
+        layout: _NativeLayoutWitness,
+    ) -> Literal["selected_only", "selected_and_same_carrier"] | None:
+        """Require a source-backed caption line outside a table grid.
+
+        MinerU may attach a heading-looking caption either to the table that
+        starts below it or to the preceding page-fragment table.  Both forms
+        are accepted only when the exact native line is geometrically between
+        two non-overlapping, source-supported table regions.  This qualifies a
+        conservative owner reset; it does not qualify a heading.
+        """
+
+        if not (
+            layout.exact_lines
+            and layout.component_closed
+            and layout.line_bboxes
+            and (layout.near_document_left or (layout.centered and layout.display_height))
+        ):
+            return None
+        body_ref = _Ref(carrier.ref.source_item_index, "table_html")
+        body = proved_table_body(body_ref)
+        if body is None or body.page_idx != carrier.page_idx:
+            return None
+        gap_limit = 4 * normalized_line_height(layout)
+        caption_box, body_box = carrier.bbox, body.bbox
+        carrier_scope: Literal[
+            "selected_only",
+            "selected_and_same_carrier",
+        ]
+        if caption_box[3] <= body_box[1]:
+            gap = body_box[1] - caption_box[3]
+            transition_body_ref: _Ref | None = body_ref
+            carrier_scope = "selected_and_same_carrier"
+        elif body_box[3] <= caption_box[1]:
+            gap = caption_box[1] - body_box[3]
+            transition_body_ref = next(
+                (
+                    candidate.ref
+                    for source in (carrier.ref.source_item_index + 1,)
+                    for candidate in by_sii[source]
+                    if candidate.page_idx == carrier.page_idx
+                    and candidate.ref.field == "table_html"
+                    and candidate.bbox[1] >= caption_box[3]
+                    and proved_table_body(candidate.ref) is not None
+                ),
+                None,
+            )
+            if transition_body_ref is None:
+                return None
+            transition_body = carrier_by_ref[transition_body_ref]
+            gap = max(gap, transition_body.bbox[1] - caption_box[3])
+            carrier_scope = "selected_only"
+        else:
+            return None
+        if gap < 0 or gap > gap_limit:
+            return None
+        assert transition_body_ref is not None
+        transition_support = support_for(transition_body_ref)
+        assert transition_support is not None
+        if transition_support.kind == "visual_bound":
+            return carrier_scope
+        table_blocks = source_blocks(transition_body_ref)
+        return (
+            carrier_scope
+            if table_blocks is not None and layout.blocks.isdisjoint(table_blocks)
+            else None
+        )
+
+    def immediate_table_after_display(
+        carrier: _Carrier,
+        layout: _NativeLayoutWitness,
+    ) -> bool:
+        if not (
+            layout.exact_lines
+            and layout.component_closed
+            and bool(layout.line_bboxes)
+            and layout.centered
+            and layout.page_front
+        ):
+            return False
+        # A stacked title/subtitle/date component has one boundary candidate:
+        # its first centered native line.  Later lines in that same block must
+        # not independently reset ownership merely because a table follows.
+        # This is source-layout evidence, not a text/date vocabulary.
+        for source in sorted(by_sii):
+            if source >= carrier.ref.source_item_index:
+                break
+            for prior in by_sii[source]:
+                if (
+                    prior.page_idx != carrier.page_idx
+                    or prior.raw_kind != "text"
+                    or prior.ref.field != "text"
+                ):
+                    continue
+                prior_layout = witness_ref(prior.ref)
+                if (
+                    prior_layout is not None
+                    and prior_layout.exact_lines
+                    and prior_layout.component_closed
+                    and prior_layout.centered
+                    and layout.blocks.intersection(prior_layout.blocks)
+                ):
+                    return False
+        intervening = 0
+        lower_edge = carrier.bbox[3]
+        for source in sorted(by_sii):
+            if source <= carrier.ref.source_item_index:
+                continue
+            source_carriers = by_sii[source]
+            if any(item.page_idx != carrier.page_idx for item in source_carriers):
+                break
+            body = next(
+                (
+                    item
+                    for item in source_carriers
+                    if item.ref.field == "table_html"
+                    and proved_table_body(item.ref) is not None
+                ),
+                None,
+            )
+            if body is not None:
+                gap = body.bbox[1] - lower_edge
+                return 0 <= gap <= 4 * normalized_line_height(layout)
+            text = next(
+                (
+                    item
+                    for item in source_carriers
+                    if item.ref.field == "text" and item.raw_kind == "text"
+                ),
+                None,
+            )
+            if text is None or intervening >= 1:
+                return False
+            text_layout = witness_ref(text.ref)
+            if (
+                text_layout is None
+                or not text_layout.exact_lines
+                or not text_layout.component_closed
+                or not text_layout.centered
+                or not layout.blocks.intersection(text_layout.blocks)
+                or text.bbox[1] < lower_edge
+            ):
+                return False
+            lower_edge = text.bbox[3]
+            intervening += 1
+        return False
+
+    owner_scope_candidates: list[_OwnerScopeCandidate] = []
+    for carrier in carriers:
+        support = support_for(carrier.ref)
+        if support is None or support.kind != "native_exact":
+            continue
+        layout = witness_ref(carrier.ref)
+        if layout is None:
+            continue
+        carrier_scope = (
+            caption_table_transition(carrier, layout)
+            if carrier.raw_kind == "table"
+            and carrier.ref.field == "table_caption"
+            and _PRINTED_NUMBER_PREFIX.match(carrier.source_value.lstrip())
+            else None
+        )
+        if (
+            carrier.raw_kind == "table"
+            and carrier.ref.field == "table_caption"
+            and _PRINTED_NUMBER_PREFIX.match(carrier.source_value.lstrip())
+            and carrier_scope is not None
+        ):
+            owner_scope_candidates.append(
+                _OwnerScopeCandidate(
+                    ref=carrier.ref,
+                    source_atom_orders=support.source_atom_orders,
+                    eligibility_basis="numbered_caption_native_break",
+                    boundary_carrier_scope=carrier_scope,
+                    layout=layout,
+                )
+            )
+        elif (
+            carrier.raw_kind == "text"
+            and carrier.ref.field == "text"
+            and _PRINTED_NUMBER_PREFIX.match(carrier.source_value.lstrip()) is None
+            and immediate_table_after_display(carrier, layout)
+        ):
+            owner_scope_candidates.append(
+                _OwnerScopeCandidate(
+                    ref=carrier.ref,
+                    source_atom_orders=support.source_atom_orders,
+                    eligibility_basis="unnumbered_display_peer_break",
+                    boundary_carrier_scope="selected_and_same_carrier",
+                    layout=layout,
+                )
+            )
+
+    return (
+        tuple(owner_scope_candidates),
+        {
+            ref: layout
+            for ref, layout in witness_cache.items()
+            if layout is not None
+        },
+    )
 
 
 def _bookmark_candidates(

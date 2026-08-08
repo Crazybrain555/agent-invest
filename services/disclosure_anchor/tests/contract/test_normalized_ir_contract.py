@@ -214,6 +214,66 @@ class NormalizedIRContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(NormalizedIRVersionError, pattern):
                     validate_current_normalized_ir_for_write(payload)
 
+    def test_v2_parser_target_is_readable_without_changing_v1_write_shape(
+        self,
+    ) -> None:
+        for model_name, selection in (
+            (None, "server_singleton_unattested"),
+            ("MinerU2.5-Pro-2605-1.2B", "explicit"),
+        ):
+            with self.subTest(selection=selection):
+                payload = _current_payload()
+                payload["parser"].update(
+                    backend="vlm-http-client",
+                    remote_model_name=model_name,
+                    remote_selection_mode=selection,
+                    target_contract_version="parser-target.v2",
+                )
+
+                self.assertEqual(_schema_errors(payload), [])
+                self.assertEqual(
+                    validate_current_normalized_ir_for_write(payload),
+                    "normalized_ir.v4",
+                )
+                self.assertEqual(payload["parser"]["remote_model_name"], model_name)
+
+        legacy = _current_payload()
+        self.assertNotIn("remote_model_name", legacy["parser"])
+        self.assertNotIn("remote_selection_mode", legacy["parser"])
+
+    def test_schema_and_runtime_reject_invalid_v2_parser_target_shapes(self) -> None:
+        def v2_payload() -> dict[str, object]:
+            payload = _current_payload()
+            payload["parser"].update(
+                backend="vlm-http-client",
+                remote_model_name=None,
+                remote_selection_mode="server_singleton_unattested",
+                target_contract_version="parser-target.v2",
+            )
+            return payload
+
+        cases = {
+            "missing_field": v2_payload(),
+            "extra_field": v2_payload(),
+            "null_explicit": v2_payload(),
+            "local_singleton": v2_payload(),
+            "blank_explicit": v2_payload(),
+        }
+        cases["missing_field"]["parser"].pop("remote_selection_mode")
+        cases["extra_field"]["parser"]["future_guess"] = True
+        cases["null_explicit"]["parser"]["remote_selection_mode"] = "explicit"
+        cases["local_singleton"]["parser"]["backend"] = "pipeline"
+        cases["blank_explicit"]["parser"].update(
+            remote_model_name="   ",
+            remote_selection_mode="explicit",
+        )
+
+        for label, payload in cases.items():
+            with self.subTest(label=label):
+                self.assertTrue(_schema_errors(payload))
+                with self.assertRaises(NormalizedIRVersionError):
+                    validate_current_normalized_ir_for_write(payload)
+
     def test_required_artifacts_must_be_present_and_hash_described(self) -> None:
         for role in (
             "content_list",

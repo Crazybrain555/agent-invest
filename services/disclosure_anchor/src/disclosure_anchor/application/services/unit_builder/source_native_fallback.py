@@ -1,4 +1,4 @@
-"""Materialize native source evidence as first-class canonical-stream units."""
+"""Shape native source evidence into internal canonical-stream bundles."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from disclosure_anchor.application.contracts.source_evidence_projection import (
     NativeEvidenceOccurrence,
     SourceEvidenceProjectionError,
     native_gap_physical_context,
-    native_gap_search_atoms,
 )
 from disclosure_anchor.application.contracts.unit_source_projection import (
     empty_projection_graph,
@@ -36,13 +35,12 @@ def native_stream_unit_drafts(
     *,
     element_orders: Mapping[int, int],
 ) -> list[UnitDraft]:
-    """Materialize each native gap run at its proven canonical position.
+    """Shape each native gap at its proven canonical position.
 
-    Placement is already decided by the stream; this function only shapes
-    payloads. There is no review lane for placement: every entry carries a
-    proven or attested position, and `detached_from_section=True` lets the
-    structural grouper keep a run inline inside the surrounding proven
-    section container without ever creating a business boundary.
+    These drafts are intermediate bundles, never durable document units.
+    The structural builder later flattens their leaves into a reliable
+    root/heading owner. Placement is already decided by the stream and no
+    bundle may create a business boundary.
     """
 
     drafts: list[UnitDraft] = []
@@ -65,7 +63,7 @@ def native_stream_unit_drafts(
         if entry.gap is None:
             continue
         gap = entry.gap
-        parts = [_native_part(occurrence) for occurrence in gap.occurrences]
+        parts = _native_parts(gap.occurrences)
         evidence_artifacts = _unique_artifacts(
             occurrence.visual_artifact
             for occurrence in gap.occurrences
@@ -79,7 +77,6 @@ def native_stream_unit_drafts(
             "transform": "ordered_parts.v1",
         }
         try:
-            graph["search_atoms"] = native_gap_search_atoms(gap)
             page_order_basis = page_bases.get(gap.page_idx)
             if page_order_basis is None:
                 raise SourceEvidenceClosureError(
@@ -106,7 +103,11 @@ def native_stream_unit_drafts(
         drafts.append(
             UnitDraft(
                 payload_kind="mixed",
-                payload={"semantic_type": "document", "parts": parts},
+                payload={
+                    "semantic_type": "document",
+                    "order_status": "unresolved_physical_fallback",
+                    "parts": parts,
+                },
                 source_order=entry.stream_order,
                 quality_status=quality_status,
                 artifact_locator=locator,
@@ -121,8 +122,50 @@ def native_stream_unit_drafts(
     return drafts
 
 
-def _native_part(occurrence: NativeEvidenceOccurrence) -> dict[str, Any]:
-    if occurrence.text is not None:
+def _native_parts(
+    occurrences: tuple[NativeEvidenceOccurrence, ...],
+) -> list[dict[str, Any]]:
+    """Keep visual occurrences atomic and coalesce one proven text run.
+
+    Poppler may expose a visually continuous table value as several word
+    atoms (for example ``"5,2"``, ``"94,"``, ``"161"``).  The typed source
+    proof already closes those atoms into a retrieval run.  Reusing that
+    boundary here makes the public leaf readable without guessing a row,
+    cell, sentence, or table continuation.
+    """
+
+    parts: list[dict[str, Any]] = []
+    pending: list[NativeEvidenceOccurrence] = []
+
+    def flush() -> None:
+        if pending:
+            parts.append(_native_text_part(tuple(pending)))
+            pending.clear()
+
+    for occurrence in occurrences:
+        if occurrence.text is None:
+            flush()
+            parts.append(_native_visual_part(occurrence))
+            continue
+        if pending and (
+            occurrence.retrieval_run is None
+            or occurrence.retrieval_run != pending[-1].retrieval_run
+        ):
+            flush()
+        pending.append(occurrence)
+    flush()
+    return parts
+
+
+def _native_text_part(
+    occurrences: tuple[NativeEvidenceOccurrence, ...],
+) -> dict[str, Any]:
+    if not occurrences or any(occurrence.text is None for occurrence in occurrences):
+        raise SourceEvidenceClosureError("native text run is empty or non-textual")
+    text = "".join(str(occurrence.text) for occurrence in occurrences)
+    selectors: list[dict[str, Any]] = []
+    evidence_artifacts: list[VisualArtifactProof] = []
+    for occurrence in occurrences:
         selector = source_selector(
             occurrence.source_ref,
             field="text",
@@ -132,29 +175,37 @@ def _native_part(occurrence: NativeEvidenceOccurrence) -> dict[str, Any]:
             raise SourceEvidenceClosureError(
                 f"native text source reference is invalid: {occurrence.occurrence_id}"
             )
-        graph = empty_projection_graph()
-        graph["payload"] = {
-            "kind": "text_identity_exact",
-            "sources": [selector],
-            "target_field": "payload.text",
-            "transform": "identity.v1",
-        }
-        graph["search_targets"] = ["payload.text"]
-        locator: dict[str, Any] = {"source_projection": graph}
         if occurrence.visual_artifact is not None:
-            locator["evidence_artifacts"] = [
-                occurrence.visual_artifact.as_dict()
-            ]
-        part: dict[str, Any] = {
-            "kind": "text",
-            "order": occurrence.word_order,
-            "text": occurrence.text,
-            "artifact_locator": locator,
-        }
-        if occurrence.needs_review:
-            part["quality_status"] = "needs_review"
-        return part
+            evidence_artifacts.append(occurrence.visual_artifact)
+        selectors.append(selector)
+    graph = empty_projection_graph()
+    graph["payload"] = {
+        "kind": (
+            "text_identity_exact" if len(selectors) == 1 else "text_concat"
+        ),
+        "sources": selectors,
+        "target_field": "payload.text",
+        "transform": "identity.v1" if len(selectors) == 1 else "exact_concat.v1",
+    }
+    graph["search_targets"] = ["payload.text"]
+    locator: dict[str, Any] = {"source_projection": graph}
+    unique_artifacts = _unique_artifacts(evidence_artifacts)
+    if unique_artifacts:
+        locator["evidence_artifacts"] = [
+            artifact.as_dict() for artifact in unique_artifacts
+        ]
+    part: dict[str, Any] = {
+        "kind": "text",
+        "order": occurrences[0].word_order,
+        "text": text,
+        "artifact_locator": locator,
+    }
+    if any(occurrence.needs_review for occurrence in occurrences):
+        part["quality_status"] = "needs_review"
+    return part
 
+
+def _native_visual_part(occurrence: NativeEvidenceOccurrence) -> dict[str, Any]:
     artifact = occurrence.visual_artifact
     if artifact is None:
         raise SourceEvidenceClosureError(

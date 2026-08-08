@@ -15,7 +15,7 @@ class MigrationStateTests(unittest.TestCase):
         heads = migration_heads()
         self.assertEqual(len(heads), 1)
         self.assertEqual(single_migration_head(), heads[0])
-        self.assertEqual(heads[0], "0031_artifact_owner_run")
+        self.assertEqual(heads[0], "0032_root_heading_path_text")
 
         migration = importlib.import_module(
             "disclosure_anchor.adapters.db.postgres.migrations.versions."
@@ -30,6 +30,21 @@ class MigrationStateTests(unittest.TestCase):
         ):
             migration.upgrade()
         execute.assert_not_called()
+
+    def test_root_heading_path_migration_is_reversible_without_fake_title(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0032_root_heading_path_text"
+        )
+
+        upgraded = migration._document_units_view_sql(root_empty_string=True)
+        downgraded = migration._document_units_view_sql(root_empty_string=False)
+
+        self.assertIn("COALESCE((SELECT string_agg", upgraded)
+        self.assertIn("''::text", upgraded)
+        self.assertNotIn("COALESCE((SELECT string_agg", downgraded)
+        self.assertIn("u.heading_path", upgraded)
+        self.assertIn("u.title", upgraded)
 
 
 if __name__ == "__main__":

@@ -210,6 +210,7 @@ def document_ir(
             "carrier_set_sha256": carrier_set_sha256(elements),
             "native": {"status": "untagged", "artifact_role": "pdf_structure"},
             "headings": list(headings),
+            "owner_scope_breaks": [],
             "page_frames": [],
             "conflicts": [],
             "coverage": {
@@ -245,7 +246,38 @@ def publish(
 def physical_context(draft: UnitDraft) -> dict[str, Any] | None:
     graph = (draft.artifact_locator or {}).get("source_projection")
     context = graph.get("physical_context") if isinstance(graph, dict) else None
-    return context if isinstance(context, dict) else None
+    if isinstance(context, dict):
+        return context
+    contexts = native_contexts(draft)
+    return contexts[0] if contexts else None
+
+
+def native_parts(draft: UnitDraft) -> list[dict[str, Any]]:
+    parts = draft.payload.get("parts") if draft.payload_kind == "mixed" else None
+    if not isinstance(parts, list):
+        return []
+    output: list[dict[str, Any]] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        locator = part.get("artifact_locator")
+        graph = (
+            locator.get("source_projection") if isinstance(locator, dict) else None
+        )
+        if isinstance(graph, dict) and isinstance(
+            graph.get("physical_context"), dict
+        ):
+            output.append(part)
+    return output
+
+
+def native_contexts(draft: UnitDraft) -> list[dict[str, Any]]:
+    contexts: list[dict[str, Any]] = []
+    for part in native_parts(draft):
+        context = part["artifact_locator"]["source_projection"]["physical_context"]
+        if not contexts or context != contexts[-1]:
+            contexts.append(context)
+    return contexts
 
 
 def published_shapes(drafts: list[UnitDraft]) -> list[tuple[str, Any]]:
@@ -257,18 +289,56 @@ def published_shapes(drafts: list[UnitDraft]) -> list[tuple[str, Any]]:
 
     shapes: list[tuple[str, Any]] = []
     for draft in drafts:
-        context = physical_context(draft)
-        if context is None:
-            shapes.append(("carrier", draft.source_order))
+        parts = draft.payload.get("parts") if draft.payload_kind == "mixed" else None
+        if (
+            isinstance(parts, list)
+            and not draft.heading_path
+            and not draft.section_path
+        ):
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                locator = part.get("artifact_locator")
+                graph = (
+                    locator.get("source_projection")
+                    if isinstance(locator, dict)
+                    else None
+                )
+                context = (
+                    graph.get("physical_context")
+                    if isinstance(graph, dict)
+                    else None
+                )
+                if isinstance(context, dict):
+                    shapes.append(
+                        (
+                            "gap",
+                            (context["page_no"], context["word_order_span"][0]),
+                        )
+                    )
+                else:
+                    shapes.append(("carrier", int(part["order"])))
             continue
-        shapes.append(
-            ("gap", (context["page_no"], context["word_order_span"][0]))
+        has_non_native = not isinstance(parts, list) or any(
+            part not in native_parts(draft)
+            for part in parts
+            if isinstance(part, dict)
         )
+        if has_non_native:
+            shapes.append(("carrier", draft.source_order))
+        for context in native_contexts(draft):
+            shapes.append(
+                ("gap", (context["page_no"], context["word_order_span"][0]))
+            )
     return shapes
 
 
 def gap_texts(draft: UnitDraft) -> list[str]:
-    return [part["text"] for part in draft.payload["parts"]]
+    return [
+        str(part["text"])
+        for part in native_parts(draft)
+        if part.get("kind") == "text"
+    ]
 
 
 class PublicationCase(unittest.TestCase):
@@ -328,10 +398,54 @@ class NativeGapPublicationOrderTests(PublicationCase):
             ],
         )
         self.assertEqual(
-            [gap_texts(drafts[1]), gap_texts(drafts[3])],
+            [texts for draft in drafts if (texts := gap_texts(draft))],
             [["原生乙"], ["原生甲"]],
         )
+        headings = [draft for draft in drafts if draft.heading_path]
+        residuals = [draft for draft in drafts if gap_texts(draft)]
+        self.assertEqual(len(headings), 2)
+        self.assertTrue(
+            all(draft.payload_kind == "text" and not gap_texts(draft) for draft in headings)
+        )
+        self.assertEqual(len(residuals), 2)
+        self.assertTrue(
+            all(
+                draft.heading_path == []
+                and draft.payload.get("semantic_type") == "document"
+                for draft in residuals
+            )
+        )
         self.assertEqual(stats.provider_attested_pages, 1)
+        self.assert_audit_ok(report)
+
+    def test_gap_inside_heading_source_flattens_without_creating_section_body(
+        self,
+    ) -> None:
+        normalized_ir, proof = build_case(
+            page_count=1,
+            elements=(Element(index=0, page=0),),
+            atoms=(
+                MappedAtom(carrier=0, page=0, word=0, block=0),
+                NativeAtom(text="标题缺字", page=0, word=1),
+                MappedAtom(carrier=0, page=0, word=2, block=0),
+            ),
+        )
+        document = document_ir(
+            normalized_ir,
+            carriers={0: carrier(text="第一节 甲", heading=True)},
+            headings=(heading_node(1, 0, text="第一节 甲", section_end=0),),
+        )
+
+        drafts, _stats, report = publish(document, proof)
+
+        heading = next(draft for draft in drafts if draft.heading_path)
+        residual = next(draft for draft in drafts if gap_texts(draft))
+        self.assertEqual(heading.payload_kind, "text")
+        self.assertEqual(heading.heading_path, ["第一节 甲"])
+        self.assertEqual(heading.quality_status, "needs_review")
+        self.assertEqual(residual.heading_path, [])
+        self.assertEqual(residual.payload["semantic_type"], "document")
+        self.assertEqual(gap_texts(residual), ["标题缺字"])
         self.assert_audit_ok(report)
 
     def test_document_leading_gap_publishes_before_every_carrier(self) -> None:
@@ -358,6 +472,34 @@ class NativeGapPublicationOrderTests(PublicationCase):
             physical_context(drafts[0])["relation"],
             "page_prefix",
         )
+        self.assert_audit_ok(report)
+
+    def test_native_only_root_never_acquires_business_taxonomy(self) -> None:
+        normalized_ir, proof = build_case(
+            page_count=1,
+            elements=(Element(index=0, page=0),),
+            atoms=(
+                NativeAtom(text="股东情况", page=0, word=0),
+                MappedAtom(carrier=0, page=0, word=1, block=0),
+            ),
+        )
+        document = document_ir(
+            normalized_ir,
+            carriers={0: carrier(text="正文载体")},
+        )
+
+        drafts, _stats, report = publish(document, proof)
+
+        residual = next(draft for draft in drafts if gap_texts(draft))
+        self.assertEqual(residual.semantic_key, "document_content")
+        self.assertEqual(residual.semantic_keys, ["document_content"])
+        self.assertEqual(residual.heading_path, [])
+        # The outer root may expose registered document metadata, but the
+        # native leaf itself cannot acquire a title, heading or taxonomy.
+        (native_part,) = native_parts(residual)
+        self.assertNotIn("title", native_part)
+        self.assertNotIn("heading_path", native_part)
+        self.assertNotIn("applicability", native_part)
         self.assert_audit_ok(report)
 
     def test_page_prefix_gap_follows_the_previous_page_last_carrier(
@@ -424,8 +566,8 @@ class NativeGapPublicationOrderTests(PublicationCase):
         )
         self.assertEqual(
             [
-                physical_context(draft)["relation"]
-                for draft in drafts[1:]
+                context["relation"]
+                for context in native_contexts(drafts[0])
             ],
             ["bounded_by_same_source", "page_suffix"],
         )
@@ -461,7 +603,8 @@ class NativeGapPublicationOrderTests(PublicationCase):
         # The run sits between the two section members physically, but a
         # native run may never split a proven section occurrence, so it is
         # held and published right after the whole container.
-        container, gap = drafts
+        self.assertEqual(len(drafts), 1)
+        container = drafts[0]
         self.assertEqual(
             published_shapes(drafts),
             [("carrier", 1), ("gap", (1, 2))],
@@ -470,9 +613,13 @@ class NativeGapPublicationOrderTests(PublicationCase):
         self.assertEqual(container.heading_path, ["第一节 概览"])
         self.assertEqual(
             [part["text"] for part in container.payload["parts"]],
-            ["一、甲事项\n二、乙事项", "三、丙事项\n四、丁事项"],
+            [
+                "一、甲事项\n二、乙事项",
+                "节内原生",
+                "三、丙事项\n四、丁事项",
+            ],
         )
-        self.assertEqual(gap_texts(gap), ["节内原生"])
+        self.assertEqual(gap_texts(container), ["节内原生"])
         self.assert_audit_ok(report)
 
 
@@ -506,16 +653,14 @@ class NativeGapSectionAttributionTests(PublicationCase):
 
         drafts, _stats, report = publish(document, proof)
 
-        section, gap = drafts
+        self.assertEqual(len(drafts), 1)
+        section = drafts[0]
         self.assertEqual(section.heading_path, ["第一节 概览"])
         self.assertEqual(
-            physical_context(gap)["anchor_heading_path"],
+            physical_context(section)["anchor_heading_path"],
             section.heading_path,
         )
-        # The recovery is located inside the section without claiming it: the
-        # public heading contract stays empty for an unproven unit.
-        self.assertEqual(gap.heading_path, [])
-        self.assertEqual(gap_texts(gap), ["节末原生"])
+        self.assertEqual(gap_texts(section), ["节末原生"])
         self.assert_audit_ok(report)
 
     def test_anchor_inside_a_container_attributes_the_container_path(
@@ -551,23 +696,27 @@ class NativeGapSectionAttributionTests(PublicationCase):
 
         drafts, _stats, report = publish(document, proof)
 
-        container, gap = drafts
+        self.assertEqual(len(drafts), 1)
+        container = drafts[0]
         self.assertEqual(container.payload["semantic_type"], "section")
         self.assertEqual(container.heading_path, ["第一节 概览"])
         self.assertEqual(
             [part["text"] for part in container.payload["parts"]],
-            ["一、甲事项\n二、乙事项", "某某股份有限公司2024年年度报告"],
+            [
+                "一、甲事项\n二、乙事项",
+                "某某股份有限公司2024年年度报告",
+                "页眉后原生",
+            ],
         )
         self.assertNotIn("heading_path", container.payload["parts"][1])
         self.assertEqual(
-            physical_context(gap)["predecessor"]["source"]["source_item_index"],
+            physical_context(container)["predecessor"]["source"]["source_item_index"],
             2,
         )
         self.assertEqual(
-            physical_context(gap)["anchor_heading_path"],
+            physical_context(container)["anchor_heading_path"],
             container.heading_path,
         )
-        self.assertEqual(gap.heading_path, [])
         self.assert_audit_ok(report)
 
     def test_unanchored_gap_never_borrows_the_section_that_follows(
@@ -627,6 +776,11 @@ class NativeGapPunctuationSuppressionTests(PublicationCase):
 
         self.assertEqual([draft.payload_kind for draft in drafts], ["text"])
         self.assertEqual(stats.punctuation_only_native_runs, 1)
+        self.assertEqual(report.metrics["coverage"]["uncovered"], 0)
+        self.assertEqual(
+            report.metrics["coverage"]["suppressed_nonsemantic"],
+            1,
+        )
         self.assert_audit_ok(report)
 
     def test_a_run_with_any_content_character_still_publishes(self) -> None:
@@ -688,12 +842,21 @@ class NativeGapCoverageFlagTests(PublicationCase):
 
         drafts, _stats, report = publish(document, proof)
 
-        owner, gap, neighbor = drafts
-        self.assertEqual(physical_context(gap)["relation"], "bounded_by_same_source")
-        self.assertEqual(physical_context(gap)["containment_owner"], 0)
-        self.assertEqual(owner.quality_status, "needs_review")
-        # Only the proven-lossy carrier is flagged, not the page's neighbors.
-        self.assertEqual(neighbor.quality_status, "ok")
+        (root,) = drafts
+        self.assertEqual(physical_context(root)["relation"], "bounded_by_same_source")
+        self.assertEqual(physical_context(root)["containment_owner"], 0)
+        self.assertEqual(root.quality_status, "needs_review")
+        carrier_parts = [
+            part
+            for part in root.payload["parts"]
+            if isinstance(part, dict) and part not in native_parts(root)
+        ]
+        # Only the proven-lossy carrier leaf is flagged; its page neighbor
+        # stays clean inside the same durable document-root owner.
+        self.assertEqual(
+            [part.get("quality_status") for part in carrier_parts],
+            ["needs_review", None],
+        )
         self.assert_audit_ok(report)
 
     def test_page_adjacency_anchor_leaves_its_carrier_ok(self) -> None:
@@ -712,9 +875,10 @@ class NativeGapCoverageFlagTests(PublicationCase):
 
         drafts, _stats, report = publish(document, proof)
 
-        anchor_carrier, gap = drafts
-        self.assertEqual(physical_context(gap)["relation"], "page_suffix")
-        self.assertIsNone(physical_context(gap)["containment_owner"])
+        self.assertEqual(len(drafts), 1)
+        anchor_carrier = drafts[0]
+        self.assertEqual(physical_context(anchor_carrier)["relation"], "page_suffix")
+        self.assertIsNone(physical_context(anchor_carrier)["containment_owner"])
         self.assertEqual(anchor_carrier.quality_status, "ok")
         self.assert_audit_ok(report)
 

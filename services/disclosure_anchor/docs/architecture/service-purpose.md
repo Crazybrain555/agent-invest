@@ -557,8 +557,8 @@ part 另带 `visual_kind` ∈ {image, chart, equation} 与可选 `visual_subtype
 
 `semantic_type` 当前取值只有 `document`（登记文档整体）和 `section`（由结构证据证明的
 文档区间）。监管 taxonomy 可在组装完成后帮助 L2 路由，但不得反向决定 section 边界。
-单元级 `applicability` 只在各 parts 声明一致时置值，
-冲突时为 NULL、由 parts 承载细节。
+mixed 外层的 `applicability` 始终为 NULL；原子 part 的声明及其 source projection 才是
+权威事实。不同 part 的声明相同或冲突都不改变 durable owner，也不在外层复制一个 winner。
 
 ---
 

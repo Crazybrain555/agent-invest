@@ -173,15 +173,8 @@
       "type": "array"
     },
     "heading_path_text": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Heading Path Text"
+      "title": "Heading Path Text",
+      "type": "string"
     },
     "is_active_run": {
       "title": "Is Active Run",

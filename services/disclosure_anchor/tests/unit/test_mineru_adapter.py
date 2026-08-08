@@ -23,8 +23,12 @@ from disclosure_anchor.adapters.parsers.mineru.structure_proof import (
     build_mineru_structure_proof,
 )
 from disclosure_anchor.adapters.parsers.mineru.source_evidence import (
+    CarrierSourceSupport,
+    ResolvedTableRole,
     SourceEvidenceContractError,
+    iter_mineru_text_carriers,
 )
+from disclosure_anchor.adapters.parsers.comparison import comparison_text
 from disclosure_anchor.adapters.parsers.mineru.table_html_structure import (
     ParsedHtmlTable,
     TableHtmlStructureError,
@@ -70,6 +74,9 @@ from disclosure_anchor.application.contracts.document_structure import (
 )
 from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation import (
     TableReconciliationContractError,
+)
+from disclosure_anchor.application.contracts.unit_source_projection import (
+    source_value_sha256,
 )
 from disclosure_anchor.domain.errors import (
     ParserBackendOverloadedError,
@@ -152,6 +159,10 @@ def _v2_structure_proof(
     start_page: int | None = None,
     end_page: int | None = None,
     source_pages: tuple[Any, ...] | None = None,
+    carrier_source_support: Mapping[
+        tuple[int, str, int | None], CarrierSourceSupport
+    ]
+    | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     page_count = native.source_pdf_page_count
     projections = build_mineru_text_projections(
@@ -162,6 +173,11 @@ def _v2_structure_proof(
         expected_page_count=page_count,
     )
     canonical_content = list(projections.canonical_items)
+    if source_pages is not None and carrier_source_support is None:
+        carrier_source_support = _test_carrier_source_support(
+            canonical_content,
+            source_pages=source_pages,
+        )
     return (
         build_mineru_structure_proof(
             native=native,
@@ -170,11 +186,79 @@ def _v2_structure_proof(
             content_list_v2=content_list_v2,
             text_projections=projections,
             source_pages=source_pages,
+            carrier_source_support=carrier_source_support,
             start_page=start_page,
             end_page=end_page,
         ),
         canonical_content,
     )
+
+
+def _test_carrier_source_support(
+    content_list: list[dict[str, Any]],
+    *,
+    source_pages: tuple[Any, ...],
+    table_role_overrides: tuple[ResolvedTableRole, ...] = (),
+) -> Mapping[tuple[int, str, int | None], CarrierSourceSupport]:
+    """Build explicit source support for synthetic native-layout tests.
+
+    The production path consumes a validated source-evidence ledger.  Tests
+    must model that boundary too: they may match complete native atom runs or
+    declare a visual-only carrier, but may never let a provider bbox mint a
+    native-layout witness.
+    """
+
+    atoms_by_page = {
+        page.page_idx: tuple(sorted(page.atoms, key=lambda atom: atom.order))
+        for page in source_pages
+    }
+    used: dict[int, set[int]] = {}
+    output: dict[
+        tuple[int, str, int | None],
+        CarrierSourceSupport,
+    ] = {}
+    for carrier in iter_mineru_text_carriers(
+        content_list,
+        table_role_overrides=table_role_overrides,
+    ):
+        if carrier.page_idx is None or carrier.bbox is None:
+            continue
+        target = carrier.comparison_value
+        available = atoms_by_page.get(carrier.page_idx, ())
+        selected: tuple[Any, ...] = ()
+        for start in range(len(available)):
+            parts: list[Any] = []
+            for atom in available[start:]:
+                if atom.order in used.setdefault(carrier.page_idx, set()):
+                    if parts:
+                        break
+                    continue
+                parts.append(atom)
+                value = comparison_text("".join(item.text for item in parts))
+                if value == target:
+                    selected = tuple(parts)
+                    break
+                if target and len(value) > len(target):
+                    break
+            if selected:
+                break
+        if selected:
+            used[carrier.page_idx].update(atom.order for atom in selected)
+        key = (carrier.source_item_index, carrier.field, carrier.index)
+        output[key] = CarrierSourceSupport(
+            source_item_index=carrier.source_item_index,
+            field=carrier.field,
+            index=carrier.index,
+            page_idx=carrier.page_idx,
+            bbox=carrier.bbox,
+            kind="native_exact" if selected else "visual_bound",
+            source_atom_orders=tuple(atom.order for atom in selected),
+            artifact_role=None if selected else "test_visual_occurrence",
+            artifact_sha256=(
+                None if selected else "sha256:" + "f" * 64
+            ),
+        )
+    return output
 
 
 def _structure_elements(
@@ -1769,14 +1853,24 @@ class MinerUMapperTests(unittest.TestCase):
         )
         self.assertEqual(rejected["source_item_indices"], [1])
 
-    def _layout_atom(self, order, text, *, block, line, cx, cy):
+    def _layout_atom(
+        self,
+        order,
+        text,
+        *,
+        block,
+        line,
+        cx,
+        cy,
+        page_idx=0,
+    ):
         from disclosure_anchor.adapters.parsers.pdf_native_text import (
             NativeTextAtom,
             NativeTextLayoutRef,
         )
 
         return NativeTextAtom(
-            page_idx=0,
+            page_idx=page_idx,
             order=order,
             bbox=(cx - 10.0, cy - 4.0, cx + 10.0, cy + 4.0),
             char_span=(0, len(text)),
@@ -1789,18 +1883,280 @@ class MinerUMapperTests(unittest.TestCase):
             ),
         )
 
-    def _layout_page(self, atoms):
+    def _layout_page(self, atoms, *, page_idx=0):
         from disclosure_anchor.adapters.parsers.pdf_native_text import (
             NativeTextPage,
         )
 
         return NativeTextPage(
-            page_idx=0,
+            page_idx=page_idx,
             width=600.0,
             height=800.0,
             text="".join(a.text for a in atoms),
             atoms=tuple(atoms),
         )
+
+    def test_numbered_table_caption_resets_only_peer_or_higher_owner(self) -> None:
+        def proof_for(owner: str, caption: str) -> dict[str, Any]:
+            content = [
+                {
+                    "type": "text",
+                    "text": owner,
+                    "page_idx": 0,
+                    "bbox": [300, 80, 700, 105],
+                },
+                {
+                    "type": "table",
+                    "table_caption": [caption],
+                    "table_footnote": [],
+                    "table_body": "<table><tr><td>值</td></tr></table>",
+                    "page_idx": 0,
+                    "bbox": [100, 230, 900, 700],
+                },
+            ]
+            owner_atom = replace(
+                self._layout_atom(
+                    0,
+                    owner,
+                    block=1,
+                    line=0,
+                    cx=300,
+                    cy=70,
+                ),
+                bbox=(250.0, 63.0, 350.0, 77.0),
+            )
+            page = self._layout_page(
+                [
+                    owner_atom,
+                    self._layout_atom(
+                        1,
+                        caption,
+                        block=2,
+                        line=0,
+                        cx=90,
+                        cy=170,
+                    ),
+                    self._layout_atom(
+                        2,
+                        "值",
+                        block=3,
+                        line=0,
+                        cx=90,
+                        cy=220,
+                    ),
+                ]
+            )
+            table_role = ResolvedTableRole(
+                source_item_index=1,
+                page_idx=0,
+                parent_bbox=(100.0, 230.0, 900.0, 700.0),
+                field="table_caption",
+                index=0,
+                bbox=(100.0, 200.0, 300.0, 220.0),
+                provider_deleted=False,
+                text=caption,
+            )
+            support = _test_carrier_source_support(
+                content,
+                source_pages=(page,),
+                table_role_overrides=(table_role,),
+            )
+            return build_mineru_structure_proof(
+                native=native_index(
+                    page_count=1,
+                    nodes=[native_node(1, "H1", [(0, 7)])],
+                    marked_objects=[
+                        marked_object(
+                            0,
+                            7,
+                            0,
+                            text=owner,
+                            bbox=content[0]["bbox"],
+                        )
+                    ],
+                ),
+                content_list=content,
+                source_pdf_sha256="sha256:" + "a" * 64,
+                source_pages=(page,),
+                carrier_source_support=support,
+                table_role_overrides=(table_role,),
+            )
+
+        peer = proof_for("二、原有章节", "三、新表格章节")
+        caption = "三、新表格章节"
+        caption_item = {
+            "type": "table",
+            "table_caption": [caption],
+            "table_footnote": [],
+            "table_body": "<table><tr><td>值</td></tr></table>",
+            "page_idx": 0,
+            "bbox": [100, 230, 900, 700],
+        }
+        self.assertEqual(
+            peer["owner_scope_breaks"],
+            [
+                {
+                    "boundary_source_ref": {
+                        "source_item_index": 1,
+                        "source_item_sha256": mineru_provider_item_sha256(
+                            caption_item
+                        ),
+                        "page_index": 0,
+                        "field": "table_caption",
+                        "index": 0,
+                        "text_span": [0, len(caption)],
+                        "value_sha256": source_value_sha256(caption),
+                    },
+                    "source_atom_orders": [1],
+                    "eligibility_basis": "numbered_caption_native_break",
+                    "relative_rank": "peer",
+                    "current_owner_node_id": 1,
+                    "target_node_id": None,
+                    "boundary_carrier_scope": "selected_and_same_carrier",
+                }
+            ],
+        )
+
+        deeper = proof_for("(三)资产、负债情况分析", "1.资产及负债状况")
+        self.assertEqual(deeper["owner_scope_breaks"], [])
+
+    def test_unnumbered_display_reset_requires_same_unnumbered_owner_family(
+        self,
+    ) -> None:
+        def proof_for(
+            owner: str,
+            *,
+            candidate_block: int = 2,
+        ) -> dict[str, Any]:
+            candidate = "母公司所有者权益变动表"
+            content = [
+                {
+                    "type": "text",
+                    "text": owner,
+                    "page_idx": 0,
+                    "bbox": [300, 80, 700, 105],
+                },
+                {
+                    "type": "text",
+                    "text": candidate,
+                    "page_idx": 0,
+                    "bbox": [300, 180, 700, 205],
+                },
+                {
+                    "type": "text",
+                    "text": "2023年1—12月",
+                    "page_idx": 0,
+                    "bbox": [400, 210, 600, 230],
+                },
+                {
+                    "type": "table",
+                    "table_caption": [],
+                    "table_footnote": [],
+                    "table_body": "<table><tr><td>值</td></tr></table>",
+                    "page_idx": 0,
+                    "bbox": [100, 245, 900, 700],
+                },
+            ]
+            atoms = [
+                replace(
+                    self._layout_atom(
+                        0, owner, block=1, line=0, cx=300, cy=70
+                    ),
+                    bbox=(250.0, 63.0, 350.0, 77.0),
+                ),
+                replace(
+                    self._layout_atom(
+                        1,
+                        candidate,
+                        block=candidate_block,
+                        line=0,
+                        cx=300,
+                        cy=150,
+                    ),
+                    bbox=(250.0, 143.0, 350.0, 157.0),
+                ),
+                self._layout_atom(
+                    2,
+                    "2023年1—12月",
+                    block=candidate_block,
+                    line=1,
+                    cx=300,
+                    cy=175,
+                ),
+                self._layout_atom(
+                    3,
+                    "值",
+                    block=3,
+                    line=0,
+                    cx=90,
+                    cy=220,
+                ),
+            ]
+            page = self._layout_page(atoms)
+            support = _test_carrier_source_support(
+                content,
+                source_pages=(page,),
+            )
+            return build_mineru_structure_proof(
+                native=native_index(
+                    page_count=1,
+                    nodes=[native_node(1, "H1", [(0, 7)])],
+                    marked_objects=[
+                        marked_object(
+                            0,
+                            7,
+                            0,
+                            text=owner,
+                            bbox=content[0]["bbox"],
+                        )
+                    ],
+                ),
+                content_list=content,
+                source_pdf_sha256="sha256:" + "a" * 64,
+                source_pages=(page,),
+                carrier_source_support=support,
+            )
+
+        repeated_display = proof_for("合并所有者权益变动表")
+        candidate = "母公司所有者权益变动表"
+        candidate_item = {
+            "type": "text",
+            "text": candidate,
+            "page_idx": 0,
+            "bbox": [300, 180, 700, 205],
+        }
+        self.assertEqual(
+            repeated_display["owner_scope_breaks"],
+            [
+                {
+                    "boundary_source_ref": {
+                        "source_item_index": 1,
+                        "source_item_sha256": mineru_provider_item_sha256(
+                            candidate_item
+                        ),
+                        "page_index": 0,
+                        "field": "text",
+                        "text_span": [0, len(candidate)],
+                        "value_sha256": source_value_sha256(candidate),
+                    },
+                    "source_atom_orders": [1],
+                    "eligibility_basis": "unnumbered_display_peer_break",
+                    "relative_rank": "unnumbered_peer",
+                    "current_owner_node_id": 1,
+                    "target_node_id": None,
+                    "boundary_carrier_scope": "selected_and_same_carrier",
+                }
+            ],
+        )
+
+        numbered_parent = proof_for("二、财务报表")
+        self.assertEqual(numbered_parent["owner_scope_breaks"], [])
+
+        stacked_subtitle = proof_for(
+            "合并所有者权益变动表",
+            candidate_block=1,
+        )
+        self.assertEqual(stacked_subtitle["owner_scope_breaks"], [])
 
     def test_wrapped_tail_typed_as_title_is_rejected_by_its_block(self) -> None:
         # "票?" is the wrapped tail of the previous paragraph: both live
@@ -1866,7 +2222,19 @@ class MinerUMapperTests(unittest.TestCase):
         page = self._layout_page(
             [
                 self._layout_atom(0, "正文一段", block=3, line=0, cx=90, cy=74),
-                self._layout_atom(1, "一、经营情况", block=4, line=0, cx=90, cy=98),
+                replace(
+                    self._layout_atom(
+                        1,
+                        "一、经营情况",
+                        block=4,
+                        line=0,
+                        cx=90,
+                        cy=98,
+                    ),
+                    bbox=(80.0, 91.0, 100.0, 105.0),
+                ),
+                self._layout_atom(2, "后续正文", block=5, line=0, cx=90, cy=130),
+                self._layout_atom(3, "更多正文", block=5, line=1, cx=90, cy=150),
             ]
         )
         proof, _content = _v2_structure_proof(
@@ -1883,7 +2251,8 @@ class MinerUMapperTests(unittest.TestCase):
 
         self.assertEqual(len(proof["headings"]), 1)
         self.assertEqual(
-            proof["headings"][0]["evidence_kinds"], ["mineru_v2_title"]
+            proof["headings"][0]["evidence_kinds"],
+            ["mineru_v2_title", "native_layout"],
         )
 
     def test_split_printed_title_lines_merge_into_one_heading(self) -> None:
@@ -1913,15 +2282,32 @@ class MinerUMapperTests(unittest.TestCase):
                 "text_level": None,
             },
         ]
+        title_atoms = [
+            self._layout_atom(
+                0, "财通证券股份有限公司", block=1, line=0, cx=300, cy=74
+            ),
+            self._layout_atom(
+                1, "投资者关系活动记录表", block=1, line=1, cx=300, cy=98
+            ),
+        ]
+        title_atoms = [
+            replace(
+                atom,
+                bbox=(
+                    atom.bbox[0],
+                    atom.bbox[1] - 3.0,
+                    atom.bbox[2],
+                    atom.bbox[3] + 3.0,
+                ),
+            )
+            for atom in title_atoms
+        ]
         page = self._layout_page(
             [
-                self._layout_atom(
-                    0, "财通证券股份有限公司", block=1, line=0, cx=300, cy=74
-                ),
-                self._layout_atom(
-                    1, "投资者关系活动记录表", block=1, line=1, cx=300, cy=98
-                ),
+                *title_atoms,
                 self._layout_atom(2, "正文内容", block=2, line=0, cx=90, cy=170),
+                self._layout_atom(3, "邻近正文", block=2, line=1, cx=90, cy=210),
+                self._layout_atom(4, "更多正文", block=2, line=2, cx=90, cy=250),
             ]
         )
         proof, _content = _v2_structure_proof(
@@ -1945,10 +2331,10 @@ class MinerUMapperTests(unittest.TestCase):
         )
         self.assertEqual(heading["section_span"], [0, 2])
 
-    def test_display_size_title_lines_merge_across_blocks(self) -> None:
-        # The two lines of a printed document title live in adjacent
-        # blocks but both carry display-size type at line pitch with
-        # aligned centres; body-size adjacent headings never merge.
+    def test_page_front_title_absorbs_exact_display_paragraph_line(self) -> None:
+        # The provider may type only the first line of a printed document
+        # title. The adjacent paragraph line joins it only through exact,
+        # centered page-front display geometry.
         content = [
             {
                 "type": "text",
@@ -1962,7 +2348,6 @@ class MinerUMapperTests(unittest.TestCase):
                 "text": "投资者关系活动记录表",
                 "page_idx": 0,
                 "bbox": [300, 110, 700, 136],
-                "text_level": 1,
             },
             {
                 "type": "text",
@@ -1977,23 +2362,21 @@ class MinerUMapperTests(unittest.TestCase):
                 0, "财通证券股份有限公司", block=1, line=0, cx=300, cy=74
             ),
             self._layout_atom(
-                1, "投资者关系活动记录表", block=2, line=0, cx=300, cy=98
+                1, "投资者关系活动记录表", block=2, line=0, cx=300, cy=152
             ),
         ]
-        # Display-size title atoms: taller boxes than the body words.
         atoms = [
-            a.__class__(
-                page_idx=a.page_idx,
-                order=a.order,
-                bbox=(a.bbox[0], a.bbox[1] - 3.0, a.bbox[2], a.bbox[3] + 3.0),
-                char_span=a.char_span,
-                text=a.text,
-                layout=a.layout,
-            )
-            for a in atoms
+            replace(
+                atoms[0],
+                bbox=(atoms[0].bbox[0], 64.0, atoms[0].bbox[2], 84.0),
+            ),
+            replace(
+                atoms[1],
+                bbox=(atoms[1].bbox[0], 144.0, atoms[1].bbox[2], 160.0),
+            ),
         ] + [
             self._layout_atom(
-                2 + i, text, block=3, line=i, cx=90, cy=170 + i * 10
+                2 + i, text, block=3, line=i, cx=90, cy=250 + i * 18
             )
             for i, text in enumerate(
                 ("正文内容", "甲乙丙丁", "戊己庚辛", "更多正文")
@@ -2006,7 +2389,10 @@ class MinerUMapperTests(unittest.TestCase):
             content_list_v2=[
                 [
                     _title_block("财通证券股份有限公司", [300, 80, 700, 106]),
-                    _title_block("投资者关系活动记录表", [300, 110, 700, 136]),
+                    _paragraph_block(
+                        "投资者关系活动记录表",
+                        [300, 110, 700, 136],
+                    ),
                     _paragraph_block(
                         "正文内容甲乙丙丁戊己庚辛", [100, 200, 500, 218]
                     ),
@@ -2028,14 +2414,14 @@ class MinerUMapperTests(unittest.TestCase):
         content = [
             {
                 "type": "text",
-                "text": "第一章",
+                "text": "第一章总则",
                 "page_idx": 0,
                 "bbox": [100, 80, 500, 105],
                 "text_level": 1,
             },
             {
                 "type": "text",
-                "text": "第二章",
+                "text": "第二章财务",
                 "page_idx": 0,
                 "bbox": [100, 200, 500, 225],
                 "text_level": 1,
@@ -2043,8 +2429,21 @@ class MinerUMapperTests(unittest.TestCase):
         ]
         page = self._layout_page(
             [
-                self._layout_atom(0, "第一章", block=1, line=0, cx=90, cy=74),
-                self._layout_atom(1, "第二章", block=2, line=0, cx=90, cy=170),
+                replace(
+                    self._layout_atom(
+                        0, "第一章总则", block=1, line=0, cx=90, cy=74
+                    ),
+                    bbox=(80.0, 67.0, 100.0, 81.0),
+                ),
+                replace(
+                    self._layout_atom(
+                        1, "第二章财务", block=2, line=0, cx=90, cy=170
+                    ),
+                    bbox=(80.0, 163.0, 100.0, 177.0),
+                ),
+                self._layout_atom(2, "正文一", block=3, line=0, cx=90, cy=230),
+                self._layout_atom(3, "正文二", block=3, line=1, cx=90, cy=250),
+                self._layout_atom(4, "正文三", block=3, line=2, cx=90, cy=270),
             ]
         )
         proof, _content = _v2_structure_proof(
@@ -2052,14 +2451,723 @@ class MinerUMapperTests(unittest.TestCase):
             legacy_content_list=content,
             content_list_v2=[
                 [
-                    _title_block("第一章", [100, 80, 500, 105]),
-                    _title_block("第二章", [100, 200, 500, 225]),
+                    _title_block("第一章总则", [100, 80, 500, 105]),
+                    _title_block("第二章财务", [100, 200, 500, 225]),
                 ]
             ],
             source_pages=(page,),
         )
 
         self.assertEqual(len(proof["headings"]), 2)
+
+    def test_cross_page_tail_is_rejected_but_numbered_heading_survives(
+        self,
+    ) -> None:
+        content = [
+            {
+                "type": "text",
+                "text": "是否考虑回购股",
+                "page_idx": 0,
+                "bbox": [100, 900, 700, 980],
+                "text_level": None,
+            },
+            {
+                "type": "text",
+                "text": "票?",
+                "page_idx": 1,
+                "bbox": [100, 40, 300, 100],
+                "text_level": 1,
+            },
+            {
+                "type": "text",
+                "text": "二、上年同期经营业绩和财务状况",
+                "page_idx": 1,
+                "bbox": [100, 150, 700, 210],
+                "text_level": 1,
+            },
+        ]
+        prior = replace(
+            self._layout_atom(
+                0,
+                "是否考虑回购股",
+                block=3,
+                line=0,
+                cx=240,
+                cy=760,
+                page_idx=0,
+            ),
+            bbox=(90.0, 756.0, 390.0, 764.0),
+        )
+        tail = self._layout_atom(
+            0,
+            "票?",
+            block=1,
+            line=0,
+            cx=100,
+            cy=60,
+            page_idx=1,
+        )
+        major = replace(
+            self._layout_atom(
+                1,
+                "二、上年同期经营业绩和财务状况",
+                block=2,
+                line=0,
+                cx=190,
+                cy=140,
+                page_idx=1,
+            ),
+            bbox=(90.0, 133.0, 290.0, 147.0),
+        )
+        proof, _content = _v2_structure_proof(
+            native=native_index(page_count=2),
+            legacy_content_list=content,
+            content_list_v2=[
+                [_paragraph_block("是否考虑回购股", [100, 900, 700, 980])],
+                [
+                    _title_block("票?", [100, 40, 300, 100]),
+                    _title_block(
+                        "二、上年同期经营业绩和财务状况",
+                        [100, 150, 700, 210],
+                    ),
+                ],
+            ],
+            source_pages=(
+                self._layout_page([prior], page_idx=0),
+                self._layout_page(
+                    [
+                        tail,
+                        major,
+                        self._layout_atom(
+                            2,
+                            "后续正文一",
+                            block=3,
+                            line=0,
+                            cx=100,
+                            cy=180,
+                            page_idx=1,
+                        ),
+                        self._layout_atom(
+                            3,
+                            "后续正文二",
+                            block=3,
+                            line=1,
+                            cx=100,
+                            cy=200,
+                            page_idx=1,
+                        ),
+                        self._layout_atom(
+                            4,
+                            "后续正文三",
+                            block=3,
+                            line=2,
+                            cx=100,
+                            cy=220,
+                            page_idx=1,
+                        ),
+                    ],
+                    page_idx=1,
+                ),
+            ),
+        )
+
+        self.assertEqual(len(proof["headings"]), 1)
+        self.assertEqual(
+            proof["headings"][0]["source_refs"][0]["source_item_index"],
+            2,
+        )
+        self.assertIn(
+            "provider_title_cross_page_continuation",
+            [conflict["relation"] for conflict in proof["conflicts"]],
+        )
+
+    def test_multiline_numbered_heading_uses_complete_native_lines(
+        self,
+    ) -> None:
+        title = "一、回购审批情况和回购方案内容"
+        content = [
+            {
+                "type": "text",
+                "text": title,
+                "page_idx": 0,
+                "bbox": [100, 100, 700, 180],
+                "text_level": 1,
+            }
+        ]
+        title_atoms = [
+            replace(
+                self._layout_atom(
+                    0,
+                    "一、回购审批情况",
+                    block=1,
+                    line=0,
+                    cx=140,
+                    cy=100,
+                ),
+                bbox=(149.0, 93.0, 169.0, 107.0),
+            ),
+            replace(
+                self._layout_atom(
+                    1,
+                    "和回购方案内容",
+                    block=2,
+                    line=0,
+                    cx=140,
+                    cy=120,
+                ),
+                bbox=(120.0, 113.0, 140.0, 127.0),
+            ),
+        ]
+        page = self._layout_page(
+            [
+                *title_atoms,
+                self._layout_atom(2, "正文一", block=3, line=0, cx=90, cy=180),
+                self._layout_atom(3, "正文二", block=3, line=1, cx=90, cy=200),
+                self._layout_atom(4, "正文三", block=3, line=2, cx=90, cy=220),
+            ]
+        )
+        proof, _content = _v2_structure_proof(
+            native=native_index(page_count=1),
+            legacy_content_list=content,
+            content_list_v2=[
+                [_title_block(title, [100, 100, 700, 180])]
+            ],
+            source_pages=(page,),
+        )
+
+        self.assertEqual(len(proof["headings"]), 1)
+        self.assertEqual(
+            proof["headings"][0]["evidence_kinds"],
+            ["mineru_v2_title", "native_layout"],
+        )
+
+    def test_native_exact_atom_orders_override_an_overbroad_provider_bbox(
+        self,
+    ) -> None:
+        content = [
+            {
+                "type": "text",
+                "text": "公司文档标题",
+                "page_idx": 0,
+                "bbox": [100, 80, 900, 900],
+                "text_level": 1,
+            },
+            {
+                "type": "text",
+                "text": "正文内容",
+                "page_idx": 0,
+                "bbox": [100, 300, 500, 340],
+                "text_level": None,
+            },
+        ]
+        title_atom = replace(
+            self._layout_atom(
+                0,
+                "公司文档标题",
+                block=1,
+                line=0,
+                cx=300,
+                cy=90,
+            ),
+            bbox=(250.0, 83.0, 350.0, 97.0),
+        )
+        body_atoms = [
+            self._layout_atom(
+                index + 1,
+                text,
+                block=2,
+                line=index,
+                cx=120,
+                cy=250 + index * 20,
+            )
+            for index, text in enumerate(
+                ("正文内容", "第二行正文", "第三行正文")
+            )
+        ]
+        page = self._layout_page([title_atom, *body_atoms])
+        support = {
+            (0, "text", None): CarrierSourceSupport(
+                source_item_index=0,
+                field="text",
+                index=None,
+                page_idx=0,
+                bbox=(100.0, 80.0, 900.0, 900.0),
+                kind="native_exact",
+                source_atom_orders=(0,),
+                artifact_role=None,
+                artifact_sha256=None,
+            ),
+            (1, "text", None): CarrierSourceSupport(
+                source_item_index=1,
+                field="text",
+                index=None,
+                page_idx=0,
+                bbox=(100.0, 300.0, 500.0, 340.0),
+                kind="native_exact",
+                source_atom_orders=(1,),
+                artifact_role=None,
+                artifact_sha256=None,
+            ),
+        }
+        proof, _content = _v2_structure_proof(
+            native=native_index(page_count=1),
+            legacy_content_list=content,
+            content_list_v2=[
+                [
+                    _title_block("公司文档标题", [100, 80, 900, 900]),
+                    _paragraph_block("正文内容", [100, 300, 500, 340]),
+                ]
+            ],
+            source_pages=(page,),
+            carrier_source_support=support,
+        )
+
+        self.assertEqual(len(proof["headings"]), 1)
+        self.assertEqual(
+            proof["headings"][0]["source_refs"][0]["source_item_index"],
+            0,
+        )
+
+    def test_native_layout_requires_validated_exact_carrier_support(self) -> None:
+        content = [
+            {
+                "type": "text",
+                "text": "一、经营情况",
+                "page_idx": 0,
+                "bbox": [100, 80, 500, 110],
+                "text_level": 1,
+            }
+        ]
+        page = self._layout_page(
+            [self._layout_atom(0, "一、经营情况", block=1, line=0, cx=90, cy=74)]
+        )
+
+        with self.assertRaises(ParserOutputContractError):
+            _v2_structure_proof(
+                native=native_index(page_count=1),
+                legacy_content_list=content,
+                content_list_v2=[
+                    [_title_block("一、经营情况", [100, 80, 500, 110])]
+                ],
+                source_pages=(page,),
+                carrier_source_support={},
+            )
+
+    def test_visual_bound_carrier_cannot_mint_native_layout_heading(self) -> None:
+        content = [
+            {
+                "type": "text",
+                "text": "一、经营情况",
+                "page_idx": 0,
+                "bbox": [100, 80, 500, 110],
+                "text_level": 1,
+            }
+        ]
+        page = self._layout_page(
+            [self._layout_atom(0, "一、经营情况", block=1, line=0, cx=90, cy=74)]
+        )
+        support = {
+            (0, "text", None): CarrierSourceSupport(
+                source_item_index=0,
+                field="text",
+                index=None,
+                page_idx=0,
+                bbox=(100.0, 80.0, 500.0, 110.0),
+                kind="visual_bound",
+                source_atom_orders=(),
+                artifact_role="test_visual_occurrence",
+                artifact_sha256="sha256:" + "f" * 64,
+            )
+        }
+
+        proof, _content = _v2_structure_proof(
+            native=native_index(page_count=1),
+            legacy_content_list=content,
+            content_list_v2=[
+                [_title_block("一、经营情况", [100, 80, 500, 110])]
+            ],
+            source_pages=(page,),
+            carrier_source_support=support,
+        )
+
+        self.assertEqual(proof["headings"], [])
+
+    def test_numbered_body_without_provider_title_is_flattened(self) -> None:
+        content = [
+            {
+                "type": "text",
+                "text": "普通正文",
+                "page_idx": 0,
+                "bbox": [100, 60, 500, 90],
+            },
+            {
+                "type": "text",
+                "text": "一、本段只是编号正文",
+                "page_idx": 0,
+                "bbox": [100, 100, 500, 130],
+            },
+        ]
+        page = self._layout_page(
+            [
+                self._layout_atom(0, "普通正文", block=1, line=0, cx=90, cy=60),
+                self._layout_atom(
+                    1,
+                    "一、本段只是编号正文",
+                    block=2,
+                    line=0,
+                    cx=90,
+                    cy=80,
+                ),
+                self._layout_atom(2, "后续正文一", block=3, line=0, cx=90, cy=100),
+                self._layout_atom(3, "后续正文二", block=3, line=1, cx=90, cy=120),
+                self._layout_atom(4, "后续正文三", block=3, line=2, cx=90, cy=140),
+            ]
+        )
+
+        proof, _content = _v2_structure_proof(
+            native=native_index(
+                page_count=1,
+                nodes=[native_node(1, "H1", [(0, 7)])],
+                marked_objects=[
+                    marked_object(
+                        0,
+                        7,
+                        0,
+                        text="一、本段只是编号正文",
+                        bbox=[100, 100, 500, 130],
+                    )
+                ],
+            ),
+            legacy_content_list=content,
+            content_list_v2=[
+                [
+                    _paragraph_block("普通正文", [100, 60, 500, 90]),
+                    _paragraph_block(
+                        "一、本段只是编号正文",
+                        [100, 100, 500, 130],
+                    ),
+                ]
+            ],
+            source_pages=(page,),
+        )
+
+        self.assertEqual(proof["headings"], [])
+
+    def test_numbered_sentence_with_terminal_punctuation_is_flattened(
+        self,
+    ) -> None:
+        text = "四、公司全体董事出席董事会会议。"
+        content = [
+            {
+                "type": "text",
+                "text": text,
+                "page_idx": 0,
+                "bbox": [100, 100, 500, 130],
+                "text_level": 1,
+            }
+        ]
+        page = self._layout_page(
+            [self._layout_atom(0, text, block=2, line=0, cx=90, cy=80)]
+        )
+
+        proof, _content = _v2_structure_proof(
+            native=native_index(
+                page_count=1,
+                nodes=[native_node(1, "H1", [(0, 7)])],
+                marked_objects=[
+                    marked_object(
+                        0,
+                        7,
+                        0,
+                        text=text,
+                        bbox=[100, 100, 500, 130],
+                    )
+                ],
+            ),
+            legacy_content_list=content,
+            content_list_v2=[[_title_block(text, [100, 100, 500, 130])]],
+            source_pages=(page,),
+            carrier_source_support={
+                (0, "text", None): CarrierSourceSupport(
+                    source_item_index=0,
+                    field="text",
+                    index=None,
+                    page_idx=0,
+                    bbox=(100.0, 100.0, 500.0, 130.0),
+                    kind="native_exact",
+                    source_atom_orders=(0,),
+                    artifact_role=None,
+                    artifact_sha256=None,
+                )
+            },
+        )
+
+        self.assertEqual(proof["headings"], [])
+        self.assertIn(
+            "provider_title_sentence_terminal",
+            [conflict["relation"] for conflict in proof["conflicts"]],
+        )
+
+    def test_numbered_heading_ending_in_colon_remains_eligible(self) -> None:
+        text = "一、重要事项："
+        content = [
+            {
+                "type": "text",
+                "text": text,
+                "page_idx": 0,
+                "bbox": [100, 100, 500, 130],
+                "text_level": 1,
+            }
+        ]
+        page = self._layout_page(
+            [self._layout_atom(0, text, block=2, line=0, cx=90, cy=80)]
+        )
+
+        proof, _content = _v2_structure_proof(
+            native=native_index(
+                page_count=1,
+                nodes=[native_node(1, "H1", [(0, 7)])],
+                marked_objects=[
+                    marked_object(
+                        0,
+                        7,
+                        0,
+                        text=text,
+                        bbox=[100, 100, 500, 130],
+                    )
+                ],
+            ),
+            legacy_content_list=content,
+            content_list_v2=[[_title_block(text, [100, 100, 500, 130])]],
+            source_pages=(page,),
+            carrier_source_support={
+                (0, "text", None): CarrierSourceSupport(
+                    source_item_index=0,
+                    field="text",
+                    index=None,
+                    page_idx=0,
+                    bbox=(100.0, 100.0, 500.0, 130.0),
+                    kind="native_exact",
+                    source_atom_orders=(0,),
+                    artifact_role=None,
+                    artifact_sha256=None,
+                )
+            },
+        )
+
+        self.assertEqual(len(proof["headings"]), 1)
+        self.assertEqual(
+            proof["headings"][0]["source_refs"][0]["source_item_index"],
+            0,
+        )
+
+    def test_noncohesive_multiline_numbered_claim_is_flattened(self) -> None:
+        title = "一、第一行第二行"
+        content = [
+            {
+                "type": "text",
+                "text": title,
+                "page_idx": 0,
+                "bbox": [100, 80, 500, 260],
+                "text_level": 1,
+            }
+        ]
+        page = self._layout_page(
+            [
+                self._layout_atom(0, "一、第一行", block=1, line=0, cx=90, cy=80),
+                self._layout_atom(1, "无关正文", block=2, line=0, cx=90, cy=140),
+                self._layout_atom(2, "第二行", block=3, line=0, cx=90, cy=220),
+            ]
+        )
+        support = {
+            (0, "text", None): CarrierSourceSupport(
+                source_item_index=0,
+                field="text",
+                index=None,
+                page_idx=0,
+                bbox=(100.0, 80.0, 500.0, 260.0),
+                kind="native_exact",
+                source_atom_orders=(0, 2),
+                artifact_role=None,
+                artifact_sha256=None,
+            )
+        }
+
+        proof, _content = _v2_structure_proof(
+            native=native_index(page_count=1),
+            legacy_content_list=content,
+            content_list_v2=[[_title_block(title, [100, 80, 500, 260])]],
+            source_pages=(page,),
+            carrier_source_support=support,
+        )
+
+        self.assertEqual(proof["headings"], [])
+
+    def test_table_role_vetoes_numbered_provider_title(self) -> None:
+        text = "一、表内编号内容"
+        content = [
+            {
+                "type": "text",
+                "text": text,
+                "page_idx": 0,
+                "bbox": [100, 80, 500, 110],
+                "text_level": 1,
+            }
+        ]
+        page = self._layout_page(
+            [
+                replace(
+                    self._layout_atom(0, text, block=1, line=0, cx=300, cy=74),
+                    bbox=(220.0, 67.0, 380.0, 81.0),
+                ),
+                self._layout_atom(1, "正文一", block=2, line=0, cx=90, cy=140),
+                self._layout_atom(2, "正文二", block=2, line=1, cx=90, cy=160),
+                self._layout_atom(3, "正文三", block=2, line=2, cx=90, cy=180),
+            ]
+        )
+
+        proof, _content = _v2_structure_proof(
+            native=native_index(
+                page_count=1,
+                nodes=[native_node(1, "Table", [(0, 7)])],
+                marked_objects=[
+                    marked_object(
+                        0,
+                        7,
+                        0,
+                        text=text,
+                        bbox=[100, 80, 500, 110],
+                    )
+                ],
+            ),
+            legacy_content_list=content,
+            content_list_v2=[[_title_block(text, [100, 80, 500, 110])]],
+            source_pages=(page,),
+        )
+
+        self.assertEqual(proof["headings"], [])
+
+    def test_rendered_identity_survives_ambiguous_hierarchy_at_root(self) -> None:
+        text = "第一章总则"
+        content = [
+            {
+                "type": "text",
+                "text": text,
+                "page_idx": 0,
+                "bbox": [100, 80, 500, 110],
+                "text_level": 1,
+            }
+        ]
+        page = self._layout_page(
+            [
+                replace(
+                    self._layout_atom(0, text, block=1, line=0, cx=300, cy=74),
+                    bbox=(220.0, 67.0, 380.0, 81.0),
+                ),
+                self._layout_atom(1, "正文一", block=2, line=0, cx=90, cy=140),
+                self._layout_atom(2, "正文二", block=2, line=1, cx=90, cy=160),
+                self._layout_atom(3, "正文三", block=2, line=2, cx=90, cy=180),
+            ]
+        )
+        native = native_index(
+            page_count=1,
+            nodes=[
+                native_node(1, "H1", [(0, 7)]),
+                native_node(2, "H2", [(0, 7)], ancestor_node_ids=(1,)),
+            ],
+            marked_objects=[
+                marked_object(
+                    0,
+                    7,
+                    0,
+                    text=text,
+                    bbox=[100, 80, 500, 110],
+                )
+            ],
+        )
+
+        proof, projected_content = _v2_structure_proof(
+            native=native,
+            legacy_content_list=content,
+            content_list_v2=[[_title_block(text, [100, 80, 500, 110])]],
+            source_pages=(page,),
+        )
+
+        self.assertEqual(len(proof["headings"]), 1)
+        heading = proof["headings"][0]
+        self.assertEqual(heading["heading_level"], 1)
+        self.assertIsNone(heading["parent_node_id"])
+        self.assertNotIn("native_role", heading)
+        self.assertNotIn("struct_tree", heading["evidence_kinds"])
+        self.assertIn("native_layout", heading["evidence_kinds"])
+        self.assertIn(
+            "heading_hierarchy_flattened",
+            [conflict["relation"] for conflict in proof["conflicts"]],
+        )
+        validate_document_structure(
+            proof,
+            elements=_structure_elements(projected_content),
+        )
+
+    def test_deeply_indented_numbered_provider_claim_is_suppressed(
+        self,
+    ) -> None:
+        content = [
+            {
+                "type": "text",
+                "text": "左侧正文",
+                "page_idx": 0,
+                "bbox": [100, 80, 500, 110],
+                "text_level": None,
+            },
+            {
+                "type": "text",
+                "text": "3. 表格单元格中的一段文字",
+                "page_idx": 0,
+                "bbox": [350, 140, 800, 180],
+                "text_level": 1,
+            },
+        ]
+        page = self._layout_page(
+            [
+                self._layout_atom(
+                    0,
+                    "左侧正文",
+                    block=1,
+                    line=0,
+                    cx=90,
+                    cy=74,
+                ),
+                self._layout_atom(
+                    1,
+                    "3. 表格单元格中的一段文字",
+                    block=2,
+                    line=0,
+                    cx=240,
+                    cy=120,
+                ),
+            ]
+        )
+        proof, _content = _v2_structure_proof(
+            native=native_index(page_count=1),
+            legacy_content_list=content,
+            content_list_v2=[
+                [
+                    _paragraph_block("左侧正文", [100, 80, 500, 110]),
+                    _title_block(
+                        "3. 表格单元格中的一段文字",
+                        [350, 140, 800, 180],
+                    ),
+                ]
+            ],
+            source_pages=(page,),
+        )
+
+        self.assertEqual(proof["headings"], [])
+        self.assertIn(
+            "provider_heading_unproved",
+            [conflict["relation"] for conflict in proof["conflicts"]],
+        )
 
     def test_printed_toc_corroborates_an_outline_only_heading(self) -> None:
         # An untagged, typeset document: the outline is the only lane,

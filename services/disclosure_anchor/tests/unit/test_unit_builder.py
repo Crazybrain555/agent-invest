@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import unittest
-from typing import Any
+from dataclasses import replace
+from typing import Any, Sequence
 from unittest.mock import patch
 
 from disclosure_anchor.application.services.unit_builder import retrieval_routing
@@ -19,16 +20,27 @@ from disclosure_anchor.application.services.unit_builder.builder import (
     UnitDraft,
     build_unit_drafts_s1_s7,
 )
+from disclosure_anchor.application.services.unit_builder.source_native_fallback import (
+    native_stream_unit_drafts,
+)
+from disclosure_anchor.application.contracts.canonical_occurrence import (
+    canonical_occurrence_stream,
+)
 from disclosure_anchor.application.contracts.document_structure import (
     DOCUMENT_STRUCTURE_ALGORITHM,
     DOCUMENT_STRUCTURE_VERSION,
     DocumentStructureContractError,
+    OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
     carrier_set_sha256,
 )
 from disclosure_anchor.application.contracts.source_evidence import (
+    RetrievalRunProof,
     SourceEvidenceProof,
     SourcePageProof,
     SourceProofIdentity,
+)
+from disclosure_anchor.application.contracts.unit_source_projection import (
+    source_value_sha256,
 )
 from disclosure_anchor.application.services.document_unit_audit import (
     AuditDocumentMetadata,
@@ -38,6 +50,13 @@ from disclosure_anchor.application.services.unit_preparation import (
     prepare_and_audit_units,
 )
 from tests.unit.test_document_unit_audit import _ir as write_valid_ir
+from tests.unit.test_canonical_occurrence import (
+    Element,
+    MappedAtom,
+    NativeAtom,
+    build_case,
+    text_sha256,
+)
 
 
 _SOURCE_PDF_SHA256 = "sha256:" + "a" * 64
@@ -105,6 +124,7 @@ def _proof(
     *,
     headings: list[dict[str, Any]] | None = None,
     page_frames: list[dict[str, Any]] | None = None,
+    owner_scope_breaks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     heading_values = list(headings or [])
     frame_values = list(page_frames or [])
@@ -122,6 +142,7 @@ def _proof(
             "artifact_role": "pdf_structure",
         },
         "headings": heading_values,
+        "owner_scope_breaks": list(owner_scope_breaks or []),
         "page_frames": frame_values,
         "conflicts": [],
         "coverage": {
@@ -136,8 +157,10 @@ def _build(
     *,
     headings: list[dict[str, Any]] | None = None,
     page_frames: list[dict[str, Any]] | None = None,
+    owner_scope_breaks: list[dict[str, Any]] | None = None,
     filing_type: str = "annual_report",
     document_title: str | None = None,
+    native_units: Sequence[UnitDraft] = (),
 ) -> tuple[list[UnitDraft], Any]:
     normalized_ir: dict[str, Any] = {
         "contract_version": "normalized_ir.v4",
@@ -147,6 +170,7 @@ def _build(
             elements,
             headings=headings,
             page_frames=page_frames,
+            owner_scope_breaks=owner_scope_breaks,
         ),
     }
     if document_title is not None:
@@ -161,6 +185,7 @@ def _build(
             size_bytes=len(content),
             media_type="image/png",
         ),
+        native_units=native_units,
     )
 
 
@@ -376,6 +401,210 @@ class BuilderBoundaryTests(unittest.TestCase):
 
 
 class StructureProofProjectionTests(unittest.TestCase):
+    def test_owner_scope_break_lifts_content_without_minting_heading(self) -> None:
+        caption = "三、未接纳的新块"
+        elements = [
+            _element(0, text="二、原有章节", text_level=1),
+            _element(1, text="原有章节正文"),
+            _element(
+                2,
+                kind="table",
+                raw_kind="table",
+                table_caption=[caption],
+                table_footnote=[],
+                table_html="<table><tr><td>旧表尾部</td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["旧表尾部"]],
+                    "merged_cells": [],
+                },
+            ),
+            _element(
+                3,
+                kind="table",
+                raw_kind="table",
+                table_caption=[],
+                table_footnote=[],
+                table_html="<table><tr><td>新表正文</td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["新表正文"]],
+                    "merged_cells": [],
+                },
+            ),
+        ]
+        headings = [
+            _heading(
+                1,
+                0,
+                text="二、原有章节",
+                section_end=3,
+            )
+        ]
+        scope_breaks = [
+            {
+                "boundary_source_ref": {
+                    "source_item_index": 2,
+                    "source_item_sha256": elements[2]["source_item_sha256"],
+                    "page_index": 0,
+                    "field": "table_caption",
+                    "index": 0,
+                    "text_span": [0, len(caption)],
+                    "value_sha256": source_value_sha256(caption),
+                },
+                "source_atom_orders": [7],
+                "eligibility_basis": "numbered_caption_native_break",
+                "relative_rank": "peer",
+                "current_owner_node_id": 1,
+                "target_node_id": None,
+                "boundary_carrier_scope": "selected_only",
+            }
+        ]
+
+        units, _ = _build(
+            elements,
+            headings=headings,
+            owner_scope_breaks=scope_breaks,
+        )
+
+        self.assertEqual(len(units), 2)
+        self.assertEqual(units[0].heading_path, ["二、原有章节"])
+        self.assertEqual(units[1].heading_path, [])
+        self.assertIsNone(units[1].title)
+        self.assertNotIn(caption, [unit.title for unit in units])
+        self.assertEqual(units[0].payload["parts"][1]["caption"], [])
+        self.assertEqual(units[0].payload["parts"][1]["rows"], [["旧表尾部"]])
+        self.assertEqual(
+            [part["kind"] for part in units[1].payload["parts"]],
+            ["text", "table"],
+        )
+        self.assertEqual(units[1].payload["parts"][0]["caption"], caption)
+        self.assertEqual(units[1].payload["parts"][1]["rows"], [["新表正文"]])
+        caption_projection = units[1].payload["parts"][0]["artifact_locator"][
+            "source_projection"
+        ]
+        self.assertEqual(caption_projection["search_targets"], [])
+        self.assertEqual(
+            _source_indices(
+                [
+                    {"payload": unit.payload, "locator": unit.artifact_locator}
+                    for unit in units
+                ]
+            ),
+            {0, 1, 2, 3},
+        )
+
+        legacy_ir = {
+            "contract_version": "normalized_ir.v4",
+            "source_pdf_sha256": _SOURCE_PDF_SHA256,
+            "elements": elements,
+            "structure_proof": {
+                **_proof(elements, headings=headings),
+                "algorithm_version": OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
+                "owner_scope_breaks": [
+                    {
+                        "page_index": 0,
+                        "source_atom_orders": [7],
+                        "boundary_start_order": 2,
+                        "eligibility_basis": "numbered_layout_break",
+                        "relative_rank": "peer_or_higher",
+                    }
+                ],
+            },
+        }
+        with self.assertRaisesRegex(
+            SourceEvidenceClosureError,
+            "legacy owner-scope breaks cannot drive current publication",
+        ):
+            build_unit_drafts_s1_s7(
+                legacy_ir,
+                filing_type="annual_report",
+                image_artifact_resolver=None,
+            )
+
+    def test_higher_rank_break_targets_parent_of_matching_rank_ancestor(
+        self,
+    ) -> None:
+        caption = "二、新同级"
+        elements = [
+            _element(0, text="第十节 财务报告", text_level=1),
+            _element(1, text="一、旧一级", text_level=2),
+            _element(2, text="（一）旧二级", text_level=3),
+            _element(3, text="旧二级正文"),
+            _element(
+                4,
+                kind="table",
+                raw_kind="table",
+                table_caption=[caption],
+                table_footnote=[],
+                table_html="<table><tr><td>新同级表格</td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["新同级表格"]],
+                    "merged_cells": [],
+                },
+            ),
+            _element(5, text="新同级后续正文"),
+        ]
+        headings = [
+            _heading(1, 0, text="第十节 财务报告", section_end=5),
+            _heading(
+                2,
+                1,
+                text="一、旧一级",
+                section_end=5,
+                parent_node_id=1,
+                level=2,
+            ),
+            _heading(
+                3,
+                2,
+                text="（一）旧二级",
+                section_end=5,
+                parent_node_id=2,
+                level=3,
+            ),
+        ]
+        scope_breaks = [
+            {
+                "boundary_source_ref": {
+                    "source_item_index": 4,
+                    "source_item_sha256": elements[4]["source_item_sha256"],
+                    "page_index": 0,
+                    "field": "table_caption",
+                    "index": 0,
+                    "text_span": [0, len(caption)],
+                    "value_sha256": source_value_sha256(caption),
+                },
+                "source_atom_orders": [9],
+                "eligibility_basis": "numbered_caption_native_break",
+                "relative_rank": "higher",
+                "current_owner_node_id": 3,
+                "target_node_id": 1,
+                "boundary_carrier_scope": "selected_and_same_carrier",
+            }
+        ]
+
+        units, _ = _build(
+            elements,
+            headings=headings,
+            owner_scope_breaks=scope_breaks,
+        )
+
+        self.assertEqual(
+            [unit.heading_path for unit in units],
+            [
+                ["第十节 财务报告", "一、旧一级", "（一）旧二级"],
+                ["第十节 财务报告"],
+            ],
+        )
+        self.assertEqual(units[0].payload["text"], "旧二级正文")
+        self.assertEqual(
+            [part["order"] for part in units[1].payload["parts"]],
+            [4, 5],
+        )
+        self.assertNotIn(caption, [unit.title for unit in units])
+
     def test_empty_visual_stays_in_mixed_section_with_sibling_evidence(self) -> None:
         elements = [
             _element(0, text="第一节 经营情况", text_level=1),
@@ -550,9 +779,20 @@ class StructureProofProjectionTests(unittest.TestCase):
         elements, _ = _sample_share_change()
         units, _ = _build(elements)
 
-        table = next(unit for unit in units if unit.payload_kind == "table")
-        self.assertIsNone(table.title)
-        self.assertEqual(table.heading_path, [])
+        self.assertEqual(len(units), 1)
+        root = units[0]
+        self.assertEqual(root.payload_kind, "mixed")
+        self.assertIsNone(root.title)
+        self.assertEqual(root.heading_path, [])
+        self.assertEqual(root.section_path, [])
+        self.assertEqual(
+            root.payload["order_status"],
+            "unresolved_physical_fallback",
+        )
+        self.assertEqual(
+            [part["kind"] for part in root.payload["parts"]],
+            ["text", "table", "text"],
+        )
         visible = _all_visible_text([unit.payload for unit in units])
         for expected in (
             "第七节 股份变动及股东情况",
@@ -685,19 +925,20 @@ class StructureProofProjectionTests(unittest.TestCase):
                 unit.payload,
             )
 
-        self.assertEqual(len(untitled), 3)
+        self.assertEqual(len(untitled), 1)
         self.assertEqual(
             [boundary_signature(unit) for unit in titled],
             [boundary_signature(unit) for unit in untitled],
         )
+        self.assertEqual([unit.payload_kind for unit in titled], ["mixed"])
         self.assertEqual(
-            [unit.payload_kind for unit in titled],
+            [part["kind"] for part in titled[0].payload["parts"]],
             ["text", "table", "text"],
         )
         self.assertTrue(all(unit.title == "股份变动公告" for unit in titled))
         self.assertTrue(all(unit.title is None for unit in untitled))
         self.assertEqual(
-            titled[1].payload["caption"],
+            titled[0].payload["parts"][1]["caption"],
             ["单位：股"],
         )
 
@@ -766,6 +1007,238 @@ class StructureProofProjectionTests(unittest.TestCase):
 
 
 class ConservationTests(unittest.TestCase):
+    def test_owner_duplicate_is_non_primary_but_conflict_stays_searchable(
+        self,
+    ) -> None:
+        native_ir, proof = build_case(
+            page_count=1,
+            elements=(Element(index=0, page=0),),
+            atoms=(
+                MappedAtom(carrier=0, page=0, word=0, block=0),
+                NativeAtom(text="50", page=0, word=1),
+                NativeAtom(text="真实冲突", page=0, word=2),
+                MappedAtom(carrier=0, page=0, word=3, block=0),
+            ),
+        )
+        proof = replace(
+            proof,
+            retrieval_runs=(
+                RetrievalRunProof(
+                    page_idx=0,
+                    run_index=0,
+                    atom_indices=(1,),
+                    text_sha256=text_sha256("50"),
+                ),
+                RetrievalRunProof(
+                    page_idx=0,
+                    run_index=1,
+                    atom_indices=(2,),
+                    text_sha256=text_sha256("真实冲突"),
+                ),
+            ),
+        )
+        stream = canonical_occurrence_stream(native_ir, proof)
+        (native_draft,) = native_stream_unit_drafts(
+            stream,
+            element_orders={0: 0},
+        )
+
+        units, stats = _build(
+            [_element(0, text="权威载体数值50")],
+            native_units=(native_draft,),
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].payload_kind, "mixed")
+        self.assertEqual(
+            [part.get("text") for part in units[0].payload["parts"]],
+            ["权威载体数值50", "50", "真实冲突"],
+        )
+        alternative = units[0].payload["parts"][1]
+        self.assertEqual(
+            alternative["representation_role"],
+            "unresolved_source_alternative",
+        )
+        self.assertEqual(alternative["search_policy"], "none")
+        self.assertEqual(
+            alternative["artifact_locator"]["source_projection"][
+                "search_targets"
+            ],
+            [],
+        )
+        self.assertEqual(stats.non_primary_source_alternative_count, 1)
+        self.assertEqual(stats.dropped_by_kind["native_exact_owner_support"], 0)
+        self.assertEqual(stats.source_dispositions, [])
+
+    def test_contiguous_cross_page_root_content_has_one_durable_owner(self) -> None:
+        elements = [
+            _element(
+                0,
+                kind="table",
+                raw_kind="table",
+                page_no=1,
+                table_caption=[],
+                table_footnote=[],
+                table_html="<table><tr><td>第一页主表</td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["第一页主表"]],
+                    "merged_cells": [],
+                },
+            ),
+            _element(1, text="同一文档的页首元数据", page_no=1),
+            _element(
+                2,
+                kind="table",
+                raw_kind="table",
+                page_no=2,
+                table_caption=[],
+                table_footnote=[],
+                table_html="<table><tr><td>第二页续表</td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["第二页续表"]],
+                    "merged_cells": [],
+                },
+            ),
+        ]
+
+        units, _ = _build(
+            elements,
+            document_title="投资者关系活动记录表",
+        )
+
+        self.assertEqual(len(units), 1)
+        root = units[0]
+        self.assertEqual(root.payload_kind, "mixed")
+        self.assertEqual(root.title, "投资者关系活动记录表")
+        self.assertEqual(root.heading_path, [])
+        self.assertEqual(root.section_path, [])
+        self.assertEqual(
+            [part["kind"] for part in root.payload["parts"]],
+            ["table", "text", "table"],
+        )
+        self.assertEqual(
+            _source_indices(
+                {
+                    "payload": root.payload,
+                    "locator": root.artifact_locator,
+                }
+            ),
+            {0, 1, 2},
+        )
+
+    def test_root_applicability_stays_on_part_without_splitting_owner(self) -> None:
+        elements = [
+            _element(
+                0,
+                kind="table",
+                raw_kind="table",
+                table_caption=["☑适用 □不适用"],
+                table_footnote=[],
+                table_html="<table><tr><td>第一页主表</td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["第一页主表"]],
+                    "merged_cells": [],
+                },
+            ),
+            _element(1, text="同一根容器正文"),
+            _element(
+                2,
+                kind="table",
+                raw_kind="table",
+                page_no=2,
+                table_caption=["□适用 ☑不适用"],
+                table_footnote=[],
+                table_html="<table><tr><td>第二页续表</td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["第二页续表"]],
+                    "merged_cells": [],
+                },
+            ),
+        ]
+
+        units, _ = _build(elements)
+
+        self.assertEqual(len(units), 1)
+        root = units[0]
+        self.assertIsNone(root.applicability)
+        self.assertEqual(
+            [part.get("applicability") for part in root.payload["parts"]],
+            ["applicable", None, "not_applicable"],
+        )
+
+    def test_unsafe_heading_subtree_flattens_before_carrier_suppression(self) -> None:
+        elements = [
+            _element(0, text="安全父标题"),
+            _element(1, text="异常\ue000子标题"),
+            _element(2, text="该子树正文事实"),
+        ]
+        headings = [
+            _heading(1, 0, text="安全父标题", section_end=2),
+            _heading(
+                2,
+                1,
+                text="异常\ue000子标题",
+                section_end=2,
+                parent_node_id=1,
+                level=2,
+            ),
+        ]
+
+        units, stats = _build(elements, headings=headings)
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].heading_path, ["安全父标题"])
+        self.assertEqual(units[0].title, "安全父标题")
+        visible = _all_visible_text(units[0].payload)
+        self.assertIn("异常", visible)
+        self.assertIn("子标题", visible)
+        self.assertIn("该子树正文事实", visible)
+        self.assertNotIn("\ue000", visible)
+        self.assertEqual(_source_indices(units[0].artifact_locator), {0, 1, 2})
+        self.assertEqual(stats.unsafe_heading_flattened_count, 1)
+
+    def test_unsafe_heading_blocks_safe_descendant_from_skipping_parent(self) -> None:
+        elements = [
+            _element(0, text="异常\ue000父标题"),
+            _element(1, text="表面安全的孙标题"),
+            _element(2, text="正文事实"),
+        ]
+        headings = [
+            _heading(1, 0, text="异常\ue000父标题", section_end=2),
+            _heading(
+                2,
+                1,
+                text="表面安全的孙标题",
+                section_end=2,
+                parent_node_id=1,
+                level=2,
+            ),
+        ]
+
+        units, stats = _build(elements, headings=headings)
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].heading_path, [])
+        self.assertIsNone(units[0].title)
+        self.assertIn("表面安全的孙标题", _all_visible_text(units[0].payload))
+        self.assertEqual(stats.unsafe_heading_flattened_count, 2)
+
+    def test_unsafe_document_metadata_title_does_not_label_root_owner(self) -> None:
+        units, stats = _build(
+            [_element(0, text="正文事实")],
+            document_title="文\ue000档标题",
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertIsNone(units[0].title)
+        self.assertEqual(units[0].heading_path, [])
+        self.assertEqual(units[0].payload["text"], "正文事实")
+        self.assertEqual(stats.unsafe_document_title_label_count, 1)
+
     def test_text_coalescing_is_ordered_and_locator_complete(self) -> None:
         elements = [
             _element(0, text="章节"),
@@ -1116,21 +1589,25 @@ class ConservationTests(unittest.TestCase):
             ),
         ]
         units, _ = _build(elements)
-        by_order = {unit.source_order: unit for unit in units}
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].payload_kind, "mixed")
+        by_order = {
+            int(part["order"]): part for part in units[0].payload["parts"]
+        }
 
-        self.assertEqual(by_order[0].payload["list_items"], ["第一项", "第二项"])
-        self.assertEqual(by_order[1].payload["code_body"], "return 1")
-        self.assertEqual(by_order[2].payload["text_format"], "latex")
+        self.assertEqual(by_order[0]["list_items"], ["第一项", "第二项"])
+        self.assertEqual(by_order[1]["code_body"], "return 1")
+        self.assertEqual(by_order[2]["text_format"], "latex")
         expected_image_digest = hashlib.sha256(
             f"fixture:{image_name}".encode()
         ).hexdigest()
         self.assertEqual(
-            by_order[3].payload["image_ref"],
+            by_order[3]["image_ref"],
             f"images/{expected_image_digest}.png",
         )
-        self.assertEqual(by_order[3].payload["notes"], ["图注"])
-        self.assertEqual(by_order[4].payload["visual_kind"], "chart")
-        self.assertEqual(by_order[4].payload["visual_subtype"], "bar")
+        self.assertEqual(by_order[3]["notes"], ["图注"])
+        self.assertEqual(by_order[4]["visual_kind"], "chart")
+        self.assertEqual(by_order[4]["visual_subtype"], "bar")
 
     def test_image_bytes_without_recognized_text_remain_reviewable(self) -> None:
         elements = [

@@ -27,6 +27,9 @@ from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
     ParserTargetIdentityError,
 )
+from disclosure_anchor.application.contracts.publication_safety import (
+    evaluate_publication_gate_v1,
+)
 from disclosure_anchor.application.contracts.unit_source_projection import (
     payload_page_no,
 )
@@ -199,20 +202,40 @@ class BuildUnits:
                 ),
                 source_proof=evidence.proof,
             )
-            if not report.ok:
+            publication_gate = evaluate_publication_gate_v1(report)
+            if publication_gate.decision != "publish":
                 sample = "; ".join(
                     f"{finding.code}:{finding.source_ref or '-'}"
                     for finding in report.findings[:8]
+                )
+                failed_checks = ",".join(
+                    name
+                    for name, passed in publication_gate.checks.items()
+                    if not passed
                 )
                 raise BuildUnitsError(
                     self._structured_error(
                         error_code="UNIT_SOURCE_AUDIT_FAILED",
                         message=(
-                            f"source replay rejected {report.metrics['error_count']} "
+                            "publication gate blocked source replay "
+                            f"({failed_checks}); "
+                            f"{report.metrics.get('error_count', -1)} "
                             f"unit finding(s): {sample}"
                         ),
                     )
                 )
+            source_files = normalized_ir["parser_artifacts"]["files"]
+            gate_receipt = {
+                **publication_gate.as_dict(),
+                "document_id": document.document_id,
+                "processing_run_id": run.processing_run_id,
+                "source_pdf_sha256": normalized_ir["source_pdf_sha256"],
+                "source_evidence_sha256": source_files["source_evidence"][
+                    "sha256"
+                ],
+                "normalized_ir_sha256": run.artifact_hash,
+                "parser_target_identity": dict(run.parser_target_identity or {}),
+            }
             units, snapshot_rows = self._materialize_units(
                 drafts=drafts,
                 document=context["document"],
@@ -271,6 +294,11 @@ class BuildUnits:
             self._artifact_store.write_json_atomic(
                 relpath=stats_relpath,
                 payload=stats.as_dict(),
+            )
+            gate_relpath = snapshot_relpath.parent / "publication_gate.v1.json"
+            self._artifact_store.write_json_atomic(
+                relpath=gate_relpath,
+                payload=gate_receipt,
             )
         except BuildUnitsError as exc:
             return self._mark_and_result(run.processing_run_id, exc.error)

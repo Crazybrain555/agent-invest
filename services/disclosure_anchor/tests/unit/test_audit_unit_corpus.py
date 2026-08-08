@@ -124,6 +124,33 @@ class RawStructTreeCitationOracleTests(unittest.TestCase):
         ir, native = _fixture()
         self.assertEqual(_validate_raw_struct_tree_citations(ir, native), 2)
 
+        spacing_ir, spacing_native = copy.deepcopy((ir, native))
+        spacing_native["nodes"][0]["mcid_refs"].extend(
+            [{"page_idx": 0, "mcid": 9}, {"page_idx": 0, "mcid": 10}]
+        )
+        spacing_native["marked_content"].extend(
+            [
+                {
+                    "page_idx": 0,
+                    "mcid": 9,
+                    "object_order": 3,
+                    "bbox": [120, 100, 121, 101],
+                    "text": " ",
+                },
+                {
+                    "page_idx": 0,
+                    "mcid": 10,
+                    "object_order": 4,
+                    "bbox": None,
+                    "text": None,
+                },
+            ]
+        )
+        self.assertEqual(
+            _validate_raw_struct_tree_citations(spacing_ir, spacing_native),
+            2,
+        )
+
         cases: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         toc_ir, toc_native = copy.deepcopy((ir, native))
         toc_native["nodes"][1]["ancestor_roles"].append("TOC")

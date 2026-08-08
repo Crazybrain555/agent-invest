@@ -364,6 +364,9 @@ def source_evidence_proof_from_validated_ledger(
                 carrier_order=cast(int, carrier["order"]),
                 carrier_bbox=_bbox(cast(list[int | float], carrier["bbox"])),
                 atom_bbox=_bbox(cast(list[int | float], source["bbox"])),
+                native_layout_path=_layout_path(
+                    cast(list[int], source["layout_path"])
+                ),
             )
         else:
             event = NativeTextEvent(
@@ -443,6 +446,8 @@ def source_evidence_proof_from_validated_ledger(
                 page_idx=page_idx,
                 events=events,
                 visual_only=visual_only,
+                width=float(raw_page["width"]),
+                height=float(raw_page["height"]),
             )
         )
 

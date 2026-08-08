@@ -69,6 +69,11 @@ class FilingApiContractsTests(unittest.TestCase):
                     set(schema["$defs"]["EvidenceRefV1"]["properties"]),
                     {"uri", "sha256", "size_bytes", "media_type"},
                 )
+            if name == "document_unit":
+                self.assertEqual(
+                    schema["properties"]["heading_path_text"],
+                    {"title": "Heading Path Text", "type": "string"},
+                )
 
     def test_openapi_uses_public_error_contract_inputs(self) -> None:
         openapi = yaml.safe_load(

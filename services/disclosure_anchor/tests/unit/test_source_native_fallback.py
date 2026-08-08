@@ -24,7 +24,9 @@ from disclosure_anchor.application.contracts.unit_source_projection import (
     empty_projection_graph,
     search_text_values,
 )
-from disclosure_anchor.application.services.unit_builder.builder import UnitDraft
+from disclosure_anchor.application.services.unit_builder.builder import (
+    UnitDraft,
+)
 from disclosure_anchor.application.services.unit_builder.source_native_fallback import (
     bind_visual_page_evidence,
     native_stream_unit_drafts,
@@ -328,18 +330,16 @@ class NativeStreamUnitDraftTests(unittest.TestCase):
         _gap_orders, (draft,) = self._drafts(normalized_ir, proof)
 
         graph = draft.artifact_locator["source_projection"]
-        self.assertEqual(
-            [
-                (atom["boundary"]["kind"], atom["target_fields"])
-                for atom in graph["search_atoms"]
-            ],
-            [
-                (
-                    "source_evidence_run",
-                    ["payload.parts.0.text", "payload.parts.1.text"],
-                )
-            ],
-        )
+        self.assertEqual(graph["search_atoms"], [])
+        self.assertEqual(len(draft.payload["parts"]), 1)
+        part = draft.payload["parts"][0]
+        self.assertEqual(part["text"], "股份变动")
+        part_graph = part["artifact_locator"]["source_projection"]
+        self.assertEqual(part_graph["payload"]["kind"], "text_concat")
+        self.assertEqual(part_graph["payload"]["transform"], "exact_concat.v1")
+        self.assertEqual(len(part_graph["payload"]["sources"]), 2)
+        self.assertEqual(part_graph["search_targets"], ["payload.text"])
+        self.assertEqual(part_graph["search_atoms"], [])
         self.assertEqual(
             search_text_values(
                 payload_kind=draft.payload_kind,
@@ -381,7 +381,6 @@ class NativeStreamUnitDraftTests(unittest.TestCase):
             part_graph["payload"]["sources"][0]["source"]["kind"],
             "source_evidence_atom",
         )
-
 
 def _visual_artifact(value: dict[str, object]) -> VisualArtifactProof:
     size_bytes = value["size_bytes"]

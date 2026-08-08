@@ -10,7 +10,7 @@
   },
   "tests/contract/test_normalized_ir_contract.py": {
    "private_imports": [],
-   "tests": 14
+   "tests": 16
   },
   "tests/contract/test_phase00_fixtures.py": {
    "private_imports": [],
@@ -180,7 +180,7 @@
   },
   "tests/unit/test_document_unit_audit.py": {
    "private_imports": [],
-   "tests": 24
+   "tests": 25
   },
   "tests/unit/test_download_document.py": {
    "private_imports": [],
@@ -233,11 +233,11 @@
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
-   "tests": 1
+   "tests": 2
   },
   "tests/unit/test_mineru_adapter.py": {
    "private_imports": [],
-   "tests": 46
+   "tests": 60
   },
   "tests/unit/test_mineru_backend_probe.py": {
    "private_imports": [],
@@ -261,11 +261,19 @@
   },
   "tests/unit/test_native_order_anchor.py": {
    "private_imports": [],
-   "tests": 13
+   "tests": 15
+  },
+  "tests/unit/test_ofcp_phase1_contracts.py": {
+   "private_imports": [],
+   "tests": 12
   },
   "tests/unit/test_parse_document.py": {
    "private_imports": [],
    "tests": 11
+  },
+  "tests/unit/test_parser_target.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/unit/test_path_builder.py": {
    "private_imports": [],
@@ -281,7 +289,7 @@
   },
   "tests/unit/test_pdf_native_text.py": {
    "private_imports": [],
-   "tests": 6
+   "tests": 7
   },
   "tests/unit/test_pdf_visual_evidence.py": {
    "private_imports": [],
@@ -325,7 +333,7 @@
   },
   "tests/unit/test_search_projection.py": {
    "private_imports": [],
-   "tests": 14
+   "tests": 15
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],
@@ -365,7 +373,7 @@
   },
   "tests/unit/test_unit_builder.py": {
    "private_imports": [],
-   "tests": 27
+   "tests": 35
   },
   "tests/unit/test_unit_hashing.py": {
    "private_imports": [],

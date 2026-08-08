@@ -72,6 +72,21 @@ class NativeTextLayoutTests(unittest.TestCase):
 
         self.assertEqual([atom.text for atom in pages[0].atoms], ["甲乙丙"])
 
+    def test_empty_decode_word_remains_in_geometry_inventory(self) -> None:
+        page = parse_pdftotext_bbox(
+            _xml(
+                "<flow><block><line>"
+                '<word xMin="10" yMin="10" xMax="20" yMax="20"></word>'
+                '<word xMin="30" yMin="10" xMax="40" yMax="20">乙</word>'
+                "</line></block></flow>"
+            )
+        )[0]
+
+        self.assertEqual([atom.text for atom in page.atoms], ["乙"])
+        self.assertEqual([atom.order for atom in page.atoms], [1])
+        self.assertEqual([word.order for word in page.word_geometries], [0, 1])
+        self.assertTrue(page.word_inventory_complete)
+
     def test_gap_and_layout_line_are_hard_run_boundaries(self) -> None:
         page = parse_pdftotext_bbox(
             _xml(
@@ -123,7 +138,6 @@ class NativeTextLayoutTests(unittest.TestCase):
                     '<word xMin="10" yMin="10" xMax="20" yMax="20">孤</word>'
                 )
             )
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -482,6 +482,7 @@
             "enum": [
               "bookmark",
               "mineru_v2_title",
+              "native_layout",
               "printed_toc",
               "struct_tree"
             ]
@@ -544,6 +545,110 @@
         }
       }
     },
+    "structure_owner_scope_break_v1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "boundary_start_order",
+        "eligibility_basis",
+        "page_index",
+        "relative_rank",
+        "source_atom_orders"
+      ],
+      "properties": {
+        "boundary_start_order": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "eligibility_basis": {
+          "enum": [
+            "numbered_layout_break",
+            "unnumbered_display_table_start"
+          ]
+        },
+        "page_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "relative_rank": {
+          "enum": [
+            "peer_or_higher",
+            "unknown"
+          ]
+        },
+        "source_atom_orders": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "structure_owner_scope_boundary_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "page_index",
+        "source_item_index",
+        "source_item_sha256",
+        "text_span",
+        "value_sha256"
+      ],
+      "properties": {
+        "source_item_index": {"type": "integer", "minimum": 0},
+        "source_item_sha256": {"$ref": "#/$defs/sha256_ref"},
+        "page_index": {"type": "integer", "minimum": 0},
+        "field": {"enum": ["table_caption", "text"]},
+        "index": {"type": "integer", "minimum": 0},
+        "text_span": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "value_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "structure_owner_scope_break": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "boundary_carrier_scope",
+        "boundary_source_ref",
+        "current_owner_node_id",
+        "eligibility_basis",
+        "relative_rank",
+        "source_atom_orders",
+        "target_node_id"
+      ],
+      "properties": {
+        "boundary_carrier_scope": {
+          "enum": ["selected_only", "selected_and_same_carrier"]
+        },
+        "boundary_source_ref": {
+          "$ref": "#/$defs/structure_owner_scope_boundary_ref"
+        },
+        "current_owner_node_id": {"type": "integer", "minimum": 1},
+        "eligibility_basis": {
+          "enum": [
+            "numbered_caption_native_break",
+            "unnumbered_display_peer_break"
+          ]
+        },
+        "relative_rank": {"enum": ["peer", "higher", "unnumbered_peer"]},
+        "source_atom_orders": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "target_node_id": {"type": ["integer", "null"], "minimum": 1}
+      }
+    },
     "structure_conflict": {
       "type": "object",
       "additionalProperties": false,
@@ -589,6 +694,107 @@
     "structure_proof": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "algorithm_version": {
+                "const": "document-structure-evidence.v10"
+              }
+            },
+            "required": [
+              "algorithm_version"
+            ]
+          },
+          "then": {
+            "properties": {
+              "headings": {
+                "items": {
+                  "properties": {
+                    "evidence_kinds": {
+                      "not": {
+                        "contains": {
+                          "const": "native_layout"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "algorithm_version": {
+                "const": "document-structure-evidence.v12"
+              }
+            },
+            "required": [
+              "algorithm_version"
+            ]
+          },
+          "then": {
+            "required": [
+              "owner_scope_breaks"
+            ],
+            "properties": {
+              "owner_scope_breaks": {
+                "items": {
+                  "$ref": "#/$defs/structure_owner_scope_break_v1"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "algorithm_version": {
+                "const": "document-structure-evidence.v13"
+              }
+            },
+            "required": [
+              "algorithm_version"
+            ]
+          },
+          "then": {
+            "required": [
+              "owner_scope_breaks"
+            ],
+            "properties": {
+              "owner_scope_breaks": {
+                "items": {
+                  "$ref": "#/$defs/structure_owner_scope_break"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "algorithm_version": {
+                "enum": [
+                  "document-structure-evidence.v10",
+                  "document-structure-evidence.v11"
+                ]
+              }
+            },
+            "required": [
+              "algorithm_version"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "owner_scope_breaks"
+              ]
+            }
+          }
+        }
+      ],
       "required": [
         "algorithm_version",
         "carrier_set_sha256",
@@ -606,7 +812,12 @@
           "const": "document_structure.v1"
         },
         "algorithm_version": {
-          "const": "document-structure-evidence.v10"
+          "enum": [
+            "document-structure-evidence.v10",
+            "document-structure-evidence.v11",
+            "document-structure-evidence.v12",
+            "document-structure-evidence.v13"
+          ]
         },
         "source_pdf_sha256": {
           "$ref": "#/$defs/sha256_ref"
@@ -643,6 +854,19 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/structure_heading"
+          }
+        },
+        "owner_scope_breaks": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/structure_owner_scope_break_v1"
+              },
+              {
+                "$ref": "#/$defs/structure_owner_scope_break"
+              }
+            ]
           }
         },
         "page_frames": {
@@ -715,6 +939,129 @@
     "parser": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "target_contract_version": {
+                "const": "parser-target.v1"
+              }
+            },
+            "required": [
+              "target_contract_version"
+            ]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "remote_model_name"
+                  ]
+                },
+                {
+                  "required": [
+                    "remote_selection_mode"
+                  ]
+                }
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "remote_model_name",
+              "remote_selection_mode"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "target_contract_version": {
+                "const": "parser-target.v2"
+              },
+              "backend": {
+                "enum": [
+                  "hybrid-http-client",
+                  "vlm-http-client"
+                ]
+              }
+            },
+            "required": [
+              "target_contract_version",
+              "backend"
+            ]
+          },
+          "then": {
+            "oneOf": [
+              {
+                "properties": {
+                  "remote_model_name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "^(?=.*\\S)[^\\u0000-\\u001f]+$"
+                  },
+                  "remote_selection_mode": {
+                    "const": "explicit"
+                  }
+                },
+                "required": [
+                  "remote_model_name",
+                  "remote_selection_mode"
+                ]
+              },
+              {
+                "properties": {
+                  "remote_model_name": {
+                    "type": "null"
+                  },
+                  "remote_selection_mode": {
+                    "const": "server_singleton_unattested"
+                  }
+                },
+                "required": [
+                  "remote_model_name",
+                  "remote_selection_mode"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "target_contract_version": {
+                "const": "parser-target.v2"
+              },
+              "backend": {
+                "enum": [
+                  "hybrid-engine",
+                  "pipeline",
+                  "vlm-engine"
+                ]
+              }
+            },
+            "required": [
+              "target_contract_version",
+              "backend"
+            ]
+          },
+          "then": {
+            "properties": {
+              "remote_model_name": {
+                "type": "null"
+              },
+              "remote_selection_mode": {
+                "const": "not_applicable"
+              }
+            },
+            "required": [
+              "remote_model_name",
+              "remote_selection_mode"
+            ]
+          }
+        }
+      ],
       "required": [
         "name",
         "package_version",
@@ -802,6 +1149,20 @@
           "type": "string",
           "pattern": "^sha256:[a-f0-9]{64}$"
         },
+        "remote_model_name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "remote_selection_mode": {
+          "enum": [
+            "explicit",
+            "not_applicable",
+            "server_singleton_unattested"
+          ]
+        },
         "inline_equation_left": {
           "const": "$"
         },
@@ -809,7 +1170,10 @@
           "const": "$"
         },
         "target_contract_version": {
-          "const": "parser-target.v1"
+          "enum": [
+            "parser-target.v1",
+            "parser-target.v2"
+          ]
         }
       }
     },

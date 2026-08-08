@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import contextlib
 import copy
 import hashlib
 import json
@@ -501,15 +500,22 @@ class BuildUnitsTests(unittest.TestCase):
             self.assertEqual(_prepared_bytes(production), _prepared_bytes(corpus))
             drafts, _stats, report = production
             self.assertTrue(report.ok, [item.as_dict() for item in report.findings])
-            supplemental = drafts[-1]
-            self.assertEqual(supplemental.payload_kind, "mixed")
-            self.assertEqual(supplemental.heading_path, [])
-            self.assertIsNone(supplemental.title)
-            self.assertEqual(
-                supplemental.payload["semantic_type"],
-                "document",
-            )
-            parts = supplemental.payload["parts"]
+            self.assertEqual(len(drafts), 1)
+            owner = drafts[0]
+            self.assertEqual(owner.payload_kind, "mixed")
+            self.assertEqual(owner.heading_path, ["重要提示"])
+            self.assertEqual(owner.title, "重要提示")
+            self.assertEqual(owner.payload["semantic_type"], "section")
+            parts = [
+                part
+                for part in owner.payload["parts"]
+                if (
+                    part.get("artifact_locator", {})
+                    .get("source_projection", {})
+                    .get("physical_context")
+                    is not None
+                )
+            ]
             self.assertEqual(
                 [part["text"] for part in parts],
                 ["MinerU遗漏但PDF可见", "不可定位字符"],
@@ -535,15 +541,32 @@ class BuildUnitsTests(unittest.TestCase):
             )
             self.assertEqual(
                 search_text_values(
-                    payload_kind=supplemental.payload_kind,
-                    payload=supplemental.payload,
-                    artifact_locator=supplemental.artifact_locator,
+                    payload_kind=owner.payload_kind,
+                    payload=owner.payload,
+                    artifact_locator=owner.artifact_locator,
                 ),
-                ("MinerU遗漏但PDF可见", "不可定位字符"),
+                (
+                    "公司存在退市风险，请投资者注意。",
+                    "MinerU遗漏但PDF可见",
+                    "不可定位字符",
+                    "模型生成的来源图片描述",
+                ),
             )
             rows = uow.document_units.list_by_processing_run("run_1")
-            self.assertEqual(len(rows), 2)
-            self.assertEqual(rows[-1].page_no, 1)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].page_no, 1)
+            run = uow.processing_runs.get("run_1")
+            gate_path = (
+                Path(tmp)
+                / "data"
+                / Path(str(run.document_units_relpath)).parent
+                / "publication_gate.v1.json"
+            )
+            gate = json.loads(gate_path.read_text(encoding="utf-8"))
+            self.assertEqual(gate["decision"], "publish")
+            self.assertEqual(gate["processing_run_id"], "run_1")
+            self.assertEqual(gate["document_id"], "doc_1")
+            self.assertTrue(all(gate["checks"].values()))
 
     def test_missing_one_native_occurrence_fails_the_shared_final_audit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -651,16 +674,19 @@ class BuildUnitsTests(unittest.TestCase):
             "heading",
             "taxonomy",
             "applicability",
-            "run_boundary",
             "physical_context",
             "anchor_heading_path",
             "part_order",
             "part_source_ref",
+            "drop_part",
+            "duplicate_part",
+            "outer_physical_context",
+            "ordinary_child_context",
+            "root_taxonomy",
+            "wrong_owner",
             "unit_order",
-            "split_gap",
-            "merge_gaps",
         )
-        two_gap_cases = {"merge_gaps", "unit_order"}
+        two_gap_cases = {"root_taxonomy", "wrong_owner", "unit_order"}
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -680,147 +706,118 @@ class BuildUnitsTests(unittest.TestCase):
                         native_only_texts=("MinerU遗漏但PDF可见",),
                         page_visual=True,
                     )
-                native_drafts = unit_preparation.native_stream_unit_drafts
-
-                def forge_native_gap(
-                    *args: Any,
-                    **kwargs: Any,
-                ) -> object:
-                    output = native_drafts(*args, **kwargs)
-                    if case in two_gap_cases:
-                        gaps = list(output)
-                        self.assertEqual(len(gaps), 2)
-                    if case == "merge_gaps":
-                        merged_payload = copy.deepcopy(gaps[0].payload)
-                        merged_payload["parts"].extend(
-                            copy.deepcopy(gaps[1].payload["parts"])
-                        )
-                        return [replace(gaps[0], payload=merged_payload)]
-                    if case == "unit_order":
-                        # Placement is the stream position: swapping the two
-                        # proven positions publishes the later gap first.
-                        return [
-                            replace(
-                                gaps[0],
-                                source_order=gaps[1].source_order,
-                                native_order_anchor=gaps[1].native_order_anchor,
-                            ),
-                            replace(
-                                gaps[1],
-                                source_order=gaps[0].source_order,
-                                native_order_anchor=gaps[0].native_order_anchor,
-                            ),
-                        ]
-                    supplemental = output[-1]
-                    payload = copy.deepcopy(supplemental.payload)
-                    locator = copy.deepcopy(supplemental.artifact_locator)
-                    replacement: dict[str, Any] = {
-                        "payload": payload,
-                        "artifact_locator": locator,
-                    }
-                    if case == "title":
-                        replacement["title"] = "公告"
-                    elif case == "heading":
-                        replacement["title"] = "伪章节"
-                        replacement["heading_path"] = ["伪章节"]
-                    elif case == "applicability":
-                        replacement["applicability"] = "applicable"
-                    elif case == "run_boundary":
-                        search_atoms = locator["source_projection"]["search_atoms"]
-                        search_atoms[0]["boundary"]["run_index"] += 1
-                    elif case == "physical_context":
-                        context = locator["source_projection"]["physical_context"]
-                        context["word_order_span"][1] += 1
-                    elif case == "part_order":
-                        payload["parts"][0]["order"] += 1
-                    elif case == "part_source_ref":
-                        source = payload["parts"][0]["artifact_locator"][
-                            "source_projection"
-                        ]["payload"]["sources"][0]["source"]
-                        source["atom_index"] += 1
-                    forged = replace(supplemental, **replacement)
-                    if case == "split_gap":
-                        left_payload = copy.deepcopy(payload)
-                        right_payload = copy.deepcopy(payload)
-                        left_payload["parts"] = left_payload["parts"][:1]
-                        right_payload["parts"] = right_payload["parts"][1:]
-                        return [
-                            *output[:-1],
-                            replace(forged, payload=left_payload),
-                            replace(forged, payload=right_payload),
-                        ]
-                    return [
-                        *output[:-1],
-                        forged,
-                    ]
-
                 bind_visuals = unit_preparation.bind_visual_page_evidence
 
-                def forge_taxonomy_after_finalize(
+                def forge_final_projection(
                     drafts: Any,
                     proof: Any,
                 ) -> Any:
-                    # s7 structurally normalizes native taxonomy, so the
-                    # forgery must land after finalize for the audit gate
-                    # itself to be exercised.
-                    return [
-                        (
-                            replace(
-                                unit,
-                                semantic_key="shareholder_structure",
-                                semantic_keys=["shareholder_structure"],
-                            )
-                            if isinstance(unit.artifact_locator, dict)
-                            and (
-                                unit.artifact_locator.get("source_projection")
-                                or {}
-                            ).get("physical_context")
-                            is not None
-                            else unit
+                    # Mutate the final public carrier/leaf shape. Patching the
+                    # retired intermediate gap envelope only tests that the
+                    # materializer discards unowned fields.
+                    output = [
+                        replace(
+                            unit,
+                            payload=copy.deepcopy(unit.payload),
+                            artifact_locator=copy.deepcopy(unit.artifact_locator),
                         )
                         for unit in bind_visuals(drafts, proof)
                     ]
-
-                def forge_anchor_after_attribution(
-                    drafts: Any,
-                    proof: Any,
-                ) -> Any:
-                    # Section attribution is a builder pass, so an invented
-                    # anchor path only reaches the audit gate when the
-                    # forgery lands after finalize.
-                    forged_units = []
-                    for unit in bind_visuals(drafts, proof):
-                        locator = copy.deepcopy(unit.artifact_locator)
-                        context = (
-                            (locator or {}).get("source_projection") or {}
-                        ).get("physical_context")
-                        if context is None:
-                            forged_units.append(unit)
-                            continue
-                        context["anchor_heading_path"] = ["伪章节"]
-                        forged_units.append(
-                            replace(unit, artifact_locator=locator)
+                    if case == "unit_order":
+                        return list(reversed(output))
+                    if case == "root_taxonomy":
+                        root_index = next(
+                            index
+                            for index, unit in enumerate(output)
+                            if unit.heading_path == []
                         )
-                    return forged_units
+                        output[root_index] = replace(
+                            output[root_index],
+                            semantic_key="shareholder_structure",
+                            semantic_keys=["shareholder_structure"],
+                        )
+                        return output
+                    native_positions: list[tuple[int, int]] = []
+                    ordinary_positions: list[tuple[int, int]] = []
+                    for unit_index, unit in enumerate(output):
+                        for part_index, part in enumerate(
+                            unit.payload.get("parts", [])
+                        ):
+                            graph = (
+                                part.get("artifact_locator", {})
+                                .get("source_projection", {})
+                            )
+                            target = (
+                                native_positions
+                                if graph.get("physical_context") is not None
+                                else ordinary_positions
+                            )
+                            target.append((unit_index, part_index))
+                    self.assertTrue(native_positions)
+                    unit_index, part_index = native_positions[0]
+                    owner = output[unit_index]
+                    part = owner.payload["parts"][part_index]
+                    child_graph = part["artifact_locator"]["source_projection"]
+                    if case == "wrong_owner":
+                        root_index = next(
+                            index
+                            for index, unit in enumerate(output)
+                            if unit.heading_path == []
+                        )
+                        section_index = next(
+                            index
+                            for index, unit in enumerate(output)
+                            if unit.heading_path
+                        )
+                        moved = output[root_index].payload["parts"].pop(0)
+                        output[section_index].payload["parts"].insert(1, moved)
+                        del output[root_index]
+                        return output
+                    if case == "title":
+                        part["title"] = "公告"
+                    elif case == "heading":
+                        part["heading_path"] = ["伪章节"]
+                    elif case == "taxonomy":
+                        part["semantic_key"] = "shareholder_structure"
+                    elif case == "applicability":
+                        part["applicability"] = "applicable"
+                    elif case == "physical_context":
+                        child_graph["physical_context"]["word_order_span"][1] += 1
+                    elif case == "anchor_heading_path":
+                        child_graph["physical_context"]["anchor_heading_path"] = [
+                            "伪章节"
+                        ]
+                    elif case == "part_order":
+                        part["order"] += 1
+                    elif case == "part_source_ref":
+                        child_graph["payload"]["sources"][0]["source"][
+                            "atom_index"
+                        ] += 1
+                    elif case == "drop_part":
+                        owner.payload["parts"].pop(part_index)
+                    elif case == "duplicate_part":
+                        owner.payload["parts"].insert(
+                            part_index + 1, copy.deepcopy(part)
+                        )
+                    elif case == "outer_physical_context":
+                        owner.artifact_locator["source_projection"][
+                            "physical_context"
+                        ] = copy.deepcopy(child_graph["physical_context"])
+                    elif case == "ordinary_child_context":
+                        ordinary_unit, ordinary_part = ordinary_positions[0]
+                        ordinary_graph = output[ordinary_unit].payload["parts"][
+                            ordinary_part
+                        ]["artifact_locator"]["source_projection"]
+                        ordinary_graph["physical_context"] = copy.deepcopy(
+                            child_graph["physical_context"]
+                        )
+                    return output
 
-                post_finalize = {
-                    "taxonomy": forge_taxonomy_after_finalize,
-                    "anchor_heading_path": forge_anchor_after_attribution,
-                }.get(case)
-                finalize_patch = (
-                    mock.patch.object(
-                        unit_preparation,
-                        "bind_visual_page_evidence",
-                        side_effect=post_finalize,
-                    )
-                    if post_finalize is not None
-                    else contextlib.nullcontext()
-                )
                 with mock.patch.object(
                     unit_preparation,
-                    "native_stream_unit_drafts",
-                    side_effect=forge_native_gap,
-                ), finalize_patch:
+                    "bind_visual_page_evidence",
+                    side_effect=forge_final_projection,
+                ):
                     result = _use_case(root, uow).execute(
                         BuildUnitsCommand(processing_run_id="run_1")
                     )
@@ -832,9 +829,10 @@ class BuildUnitsTests(unittest.TestCase):
                 )
                 expected_code = {
                     "anchor_heading_path": (
-                        "source_native_physical_context_invalid"
+                        "source_native_gap_membership_invalid"
                     ),
-                    "merge_gaps": "source_native_gap_membership_invalid",
+                    "wrong_owner": "source_native_owner_invalid",
+                    "root_taxonomy": "source_native_root_projection_invalid",
                     "unit_order": "source_native_linearization_invalid",
                 }.get(case)
                 if expected_code is not None:

@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 BBox = tuple[float, float, float, float]
 _DEFAULT_TIMEOUT_SECONDS = 300
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-NATIVE_TEXT_RUN_ALGORITHM = "poppler-line-geometry-contiguous.v1"
+NATIVE_TEXT_RUN_ALGORITHM = "poppler-line-geometry-contiguous.v2"
 
 
 class NativeTextExtractionError(RuntimeError):
@@ -27,7 +27,7 @@ class NativeTextExtractionError(RuntimeError):
 
 @dataclass(frozen=True)
 class NativeTextLayoutRef:
-    """Provider layout ancestry for one immutable Poppler word occurrence."""
+    """Poppler XML layout ancestry for one immutable native word occurrence."""
 
     flow_index: int
     block_index: int
@@ -49,6 +49,16 @@ class NativeTextAtom:
     layout: NativeTextLayoutRef
 
 
+@dataclass(frozen=True)
+class NativeTextWordGeometry:
+    """One Poppler ``<word>`` node, independent of Unicode decoding."""
+
+    page_idx: int
+    order: int
+    bbox: BBox
+    layout: NativeTextLayoutRef
+
+
 @dataclass(frozen=True, slots=True)
 class NativeTextRun:
     """Maximal Poppler-line run whose adjacent word boxes physically touch."""
@@ -61,7 +71,7 @@ class NativeTextRun:
 
 @dataclass(frozen=True)
 class NativeTextGeometryIssue:
-    """One Poppler word whose text exists but has no usable page geometry."""
+    """One Poppler ``<word>`` node whose page geometry is unusable."""
 
     page_idx: int
     word_order: int
@@ -78,6 +88,8 @@ class NativeTextPage:
     text: str
     atoms: tuple[NativeTextAtom, ...]
     geometry_issues: tuple[NativeTextGeometryIssue, ...] = ()
+    word_geometries: tuple[NativeTextWordGeometry, ...] = ()
+    word_inventory_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,6 +161,7 @@ def parse_pdftotext_bbox(xml_payload: str) -> tuple[NativeTextPage, ...]:
         seen_words: set[int] = set()
         chunks: list[str] = []
         atoms: list[NativeTextAtom] = []
+        word_geometries: list[NativeTextWordGeometry] = []
         geometry_issues: list[NativeTextGeometryIssue] = []
         offset = 0
         word_order = 0
@@ -181,21 +194,20 @@ def parse_pdftotext_bbox(xml_payload: str) -> tuple[NativeTextPage, ...]:
                             for char in "".join(word_node.itertext())
                             if not char.isspace()
                         )
-                        if text:
-                            words.append(
-                                (
-                                    word_node,
-                                    text,
-                                    word_order,
-                                    NativeTextLayoutRef(
-                                        flow_index=flow_index,
-                                        block_index=block_index,
-                                        line_index=line_index,
-                                        word_index=word_index,
-                                    ),
-                                )
+                        words.append(
+                            (
+                                word_node,
+                                text,
+                                word_order,
+                                NativeTextLayoutRef(
+                                    flow_index=flow_index,
+                                    block_index=block_index,
+                                    line_index=line_index,
+                                    word_index=word_index,
+                                ),
                             )
-                            word_order += 1
+                        )
+                        word_order += 1
                     if not words:
                         continue
                     line_has_atom = False
@@ -218,6 +230,16 @@ def parse_pdftotext_bbox(xml_payload: str) -> tuple[NativeTextPage, ...]:
                             )
                             continue
                         assert bbox is not None
+                        word_geometries.append(
+                            NativeTextWordGeometry(
+                                page_idx=page_idx,
+                                order=source_word_order,
+                                bbox=bbox,
+                                layout=layout,
+                            )
+                        )
+                        if not text:
+                            continue
                         if chunks:
                             separator = "\n" if not line_has_atom else " "
                             chunks.append(separator)
@@ -246,12 +268,16 @@ def parse_pdftotext_bbox(xml_payload: str) -> tuple[NativeTextPage, ...]:
             )
         pages.append(
             NativeTextPage(
-                page_idx,
-                width,
-                height,
-                "".join(chunks),
-                tuple(atoms),
-                tuple(geometry_issues),
+                page_idx=page_idx,
+                width=width,
+                height=height,
+                text="".join(chunks),
+                atoms=tuple(atoms),
+                geometry_issues=tuple(geometry_issues),
+                word_geometries=tuple(word_geometries),
+                word_inventory_complete=(
+                    len(word_geometries) + len(geometry_issues) == len(all_words)
+                ),
             )
         )
     return tuple(pages)
@@ -272,7 +298,14 @@ def extract_native_pages(
     _require_pdf_hash(pdf_path, expected_pdf_sha256, phase="before extraction")
     try:
         text_result = _run(
-            (pdftotext_binary, "-bbox-layout", "-enc", "UTF-8", str(pdf_path), "-"),
+            (
+                pdftotext_binary,
+                "-bbox-layout",
+                "-enc",
+                "UTF-8",
+                str(pdf_path),
+                "-",
+            ),
             timeout_seconds,
             "pdftotext failed",
         )

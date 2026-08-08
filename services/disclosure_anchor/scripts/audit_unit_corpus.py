@@ -709,7 +709,14 @@ def _close_native_heading_objects(
             cast(int, obj["object_order"]),
         )
         bbox, text = _oracle_bbox(obj.get("bbox")), _oracle_text(obj.get("text"))
-        if bbox is None or not text or identity in local_claims | object_claims:
+        # A StructTree MCID can also wrap spacing or non-text paint objects.
+        # They are not reader-visible heading text, so do not turn their
+        # absence into a false citation failure.  The exact concatenation
+        # check below still requires every substantive heading glyph to close
+        # against one source span.
+        if not text:
+            continue
+        if bbox is None or identity in local_claims | object_claims:
             raise ValueError("invalid or reused StructTree marked-content object")
         candidates = [
             index
@@ -785,7 +792,9 @@ def _validate_raw_native_parent(
 
 
 def _oracle_text(value: object) -> str:
-    return "".join(unicodedata.normalize("NFKC", cast(str, value)).split())
+    if not isinstance(value, str):
+        return ""
+    return "".join(unicodedata.normalize("NFKC", value).split())
 
 
 def _oracle_bbox(value: object) -> _OracleBBox | None:

@@ -225,6 +225,7 @@ def _normalized_ir(*, full_pdf: bool) -> dict[str, object]:
                 "artifact_role": "pdf_structure",
             },
             "headings": [],
+            "owner_scope_breaks": [],
             "page_frames": [],
             "conflicts": [],
             "coverage": {

@@ -118,6 +118,7 @@ def build_case(
                     carrier_order=atom.block,
                     carrier_bbox=(0.0, 0.0, 100.0, 20.0),
                     atom_bbox=atom_bbox(atom.word),
+                    native_layout_path=(0, atom.block, 0, atom.word),
                 )
             )
             continue

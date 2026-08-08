@@ -741,6 +741,7 @@ class StructureProofCleanEvidenceTests(unittest.TestCase):
                 "bookmark_candidates": 0,
                 "mineru_v2_title_candidates": 0,
                 "proven_heading_nodes": 3,
+                "owner_scope_breaks": 0,
                 "page_frame_groups": 0,
             },
         )

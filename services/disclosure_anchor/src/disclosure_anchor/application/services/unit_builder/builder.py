@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable
 from disclosure_anchor.application.contracts import content_annotations
 from disclosure_anchor.application.services.unit_builder import retrieval_routing
 from disclosure_anchor.application.contracts.document_structure import (
+    OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
     validate_document_structure,
 )
 from disclosure_anchor.application.contracts.source_evidence_occurrence import (
@@ -27,6 +28,14 @@ from disclosure_anchor.application.contracts.unit_source_projection import (
 )
 from disclosure_anchor.application.contracts.normalized_ir import (
     require_current_normalized_ir,
+)
+from disclosure_anchor.application.contracts.publication_safety import (
+    semantic_payload_without_unsafe_glyphs,
+    unsafe_semantic_characters,
+)
+from disclosure_anchor.domain.value_objects.comparison_text import (
+    source_carrier_search_surfaces,
+    strict_source_comparison_text,
 )
 
 
@@ -50,11 +59,13 @@ class SourceEvidenceClosureError(ValueError):
 class PreparedElement:
     kind: str
     order_index: int
+    source_order_phase: int = 0
     text: str | None = None
     raw_kind: str | None = None
     page_no: int | None = None
     table: dict[str, Any] | None = None
     table_caption: list[str] = field(default_factory=list)
+    table_caption_source_indices: list[int] = field(default_factory=list)
     table_footnote: list[str] = field(default_factory=list)
     table_html: str | None = None
     payload: dict[str, Any] | None = None
@@ -78,6 +89,7 @@ class UnitDraft:
     payload_kind: str
     payload: dict[str, Any]
     source_order: int
+    source_order_phase: int = 0
     heading_path: list[str] = field(default_factory=list)
     section_path: list[int] = field(default_factory=list)
     title: str | None = None
@@ -109,6 +121,12 @@ class BuildStats:
     order_conflict_events: int = 0
     span_overlap_pages: int = 0
     punctuation_only_native_runs: int = 0
+    native_recovery_gap_count: int = 0
+    native_recovery_leaf_count: int = 0
+    unsafe_semantic_payload_count: int = 0
+    unsafe_heading_flattened_count: int = 0
+    unsafe_document_title_label_count: int = 0
+    non_primary_source_alternative_count: int = 0
     # Per-source transform/exclusion ledger.  Counts explain volume; this
     # ledger makes every non-payload disposition independently auditable.
     source_dispositions: list[dict[str, Any]] = field(default_factory=list)
@@ -122,6 +140,20 @@ class BuildStats:
             "deduplicated_page_number_lines": self.deduplicated_page_number_lines,
             "needs_review_count": self.needs_review_count,
             "unusable_count": self.unusable_count,
+            "provider_attested_pages": self.provider_attested_pages,
+            "order_conflict_events": self.order_conflict_events,
+            "span_overlap_pages": self.span_overlap_pages,
+            "punctuation_only_native_runs": self.punctuation_only_native_runs,
+            "native_recovery_gap_count": self.native_recovery_gap_count,
+            "native_recovery_leaf_count": self.native_recovery_leaf_count,
+            "unsafe_semantic_payload_count": self.unsafe_semantic_payload_count,
+            "unsafe_heading_flattened_count": self.unsafe_heading_flattened_count,
+            "unsafe_document_title_label_count": (
+                self.unsafe_document_title_label_count
+            ),
+            "non_primary_source_alternative_count": (
+                self.non_primary_source_alternative_count
+            ),
             "source_dispositions": list(self.source_dispositions),
         }
 
@@ -663,6 +695,7 @@ def s1_preprocess_elements(
                 page_no=page_no,
                 table=table,
                 table_caption=captions,
+                table_caption_source_indices=list(range(len(captions))),
                 table_footnote=[
                     str(item) for item in element.get("table_footnote") or []
                 ],
@@ -868,6 +901,7 @@ def _with_table_payload_projection(
     locator: dict[str, Any] | None,
     *,
     captions: list[str],
+    caption_source_indices: list[int],
     notes: list[str],
     embedded_media: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
@@ -876,8 +910,12 @@ def _with_table_payload_projection(
     graph = _projection_graph(output)
     projection_sources = [selector]
     projection_sources.extend(
-        _required_source_selector(output, field="table_caption", index=index)
-        for index in range(len(captions))
+        _required_source_selector(
+            output,
+            field="table_caption",
+            index=source_index,
+        )
+        for source_index in caption_source_indices
     )
     projection_sources.extend(
         _required_source_selector(output, field="table_note", index=index)
@@ -916,6 +954,22 @@ class _ProvenHeading:
     refs: tuple[Mapping[str, Any], ...]
 
 
+@dataclass(frozen=True)
+class _OwnerScopeBreak:
+    boundary_source_item_index: int
+    boundary_field: str
+    boundary_index: int | None
+    boundary_text_span: tuple[int, int]
+    boundary_value_sha256: str
+    page_index: int
+    eligibility_basis: str
+    relative_rank: str
+    current_owner_node_id: int
+    target_node_id: int | None
+    boundary_carrier_scope: str
+    source_atom_orders: tuple[int, ...]
+
+
 def s2_apply_structure_proof(
     elements: Iterable[PreparedElement],
     *,
@@ -934,11 +988,15 @@ def s2_apply_structure_proof(
         for element in prepared
         if (source_index := _prepared_source_item_index(element)) is not None
     }
-    heading_anchors = _proven_headings(
-        structure_proof,
-        raw_by_index=raw_by_index,
+    heading_anchors = _publication_safe_heading_anchors(
+        _proven_headings(
+            structure_proof,
+            raw_by_index=raw_by_index,
+        ),
+        stats=stats,
     )
     headings = [heading for heading in heading_anchors if heading.propagates]
+    owner_scope_breaks = _proven_owner_scope_breaks(structure_proof)
     by_id = {heading.node_id: heading for heading in headings}
     paths = {
         heading.node_id: _proven_heading_path(heading, by_id=by_id)
@@ -970,29 +1028,62 @@ def s2_apply_structure_proof(
             )
             continue
         owner = _proven_heading_owner(source_index, headings=headings, paths=paths)
-        path = paths[owner.node_id] if owner is not None else ()
-        if (
-            source_index in heading_text_sources
-            and element.kind == "text"
-            and element.payload is None
-        ):
-            continue
-        if not _is_empty_table_element(element):
-            represented.update(item.node_id for item in path)
-        titles = [item.title for item in path]
-        placed.append(
-            replace(
-                element,
-                heading_path=titles,
-                section_path=[item.node_id for item in path],
-                title=titles[-1] if titles else None,
-                artifact_locator=_locator_with_proven_heading_sources(
-                    element.artifact_locator,
-                    path,
-                    prepared_by_index=prepared_by_index,
-                ),
-            )
+        selected_only = _selected_only_boundary_break(
+            source_index,
+            owner=owner,
+            scope_breaks=owner_scope_breaks,
         )
+        if selected_only is not None:
+            if element.kind != "table":
+                raise SourceEvidenceClosureError(
+                    "selected-only owner break does not select a table caption"
+                )
+            body, detached_caption = _split_owner_boundary_caption(
+                element,
+                scope_break=selected_only,
+            )
+            placed_body = _place_prepared_element(
+                body,
+                owner=owner,
+                paths=paths,
+                heading_text_sources=heading_text_sources,
+                represented=represented,
+                prepared_by_index=prepared_by_index,
+            )
+            if placed_body is not None:
+                placed.append(placed_body)
+            target = (
+                by_id[selected_only.target_node_id]
+                if selected_only.target_node_id is not None
+                else None
+            )
+            placed_caption = _place_prepared_element(
+                detached_caption,
+                owner=target,
+                paths=paths,
+                heading_text_sources=heading_text_sources,
+                represented=represented,
+                prepared_by_index=prepared_by_index,
+            )
+            assert placed_caption is not None
+            placed.append(placed_caption)
+            continue
+        owner = _owner_after_scope_break(
+            source_index,
+            owner=owner,
+            by_id=by_id,
+            scope_breaks=owner_scope_breaks,
+        )
+        placed_element = _place_prepared_element(
+            element,
+            owner=owner,
+            paths=paths,
+            heading_text_sources=heading_text_sources,
+            represented=represented,
+            prepared_by_index=prepared_by_index,
+        )
+        if placed_element is not None:
+            placed.append(placed_element)
 
     children = {
         heading.parent_node_id
@@ -1028,7 +1119,44 @@ def s2_apply_structure_proof(
         )
     if stats is not None:
         stats.heading_only_carriers_preserved += len(leaves)
-    return sorted(placed, key=lambda item: item.order_index)
+    return sorted(placed, key=lambda item: (item.order_index, item.source_order_phase))
+
+
+def _publication_safe_heading_anchors(
+    headings: Sequence[_ProvenHeading],
+    *,
+    stats: BuildStats | None,
+) -> list[_ProvenHeading]:
+    """Flatten an unsafe heading subtree before its carrier can be suppressed.
+
+    A title containing an undecoded glyph cannot be a semantic label.  Its
+    physical carrier must therefore remain ordinary content, and descendants
+    cannot skip over that unpublishable parent to create a finer owner.  The
+    nearest safe ancestor (or the document root) consequently owns the whole
+    subtree without any guessed glyph replacement.
+    """
+
+    blocked = {
+        heading.node_id
+        for heading in headings
+        if unsafe_semantic_characters(heading.title)
+    }
+    changed = True
+    while changed:
+        changed = False
+        for heading in headings:
+            if (
+                heading.node_id not in blocked
+                and heading.parent_node_id in blocked
+            ):
+                blocked.add(heading.node_id)
+                changed = True
+    if stats is not None:
+        stats.unsafe_heading_flattened_count += sum(
+            heading.propagates and heading.node_id in blocked
+            for heading in headings
+        )
+    return [heading for heading in headings if heading.node_id not in blocked]
 
 
 def _proven_headings(
@@ -1099,6 +1227,220 @@ def _proven_heading_owner(
             f"structure proof has overlapping owners at source {source_index}"
         )
     return owner
+
+
+def _proven_owner_scope_breaks(
+    structure_proof: Mapping[str, Any],
+) -> tuple[_OwnerScopeBreak, ...]:
+    values = structure_proof.get("owner_scope_breaks", [])
+    if (
+        structure_proof.get("algorithm_version")
+        == OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM
+        and values
+    ):
+        raise SourceEvidenceClosureError(
+            "legacy owner-scope breaks cannot drive current publication"
+        )
+    output: list[_OwnerScopeBreak] = []
+    for value in values:
+        ref = value["boundary_source_ref"]
+        output.append(
+            _OwnerScopeBreak(
+                boundary_source_item_index=int(ref["source_item_index"]),
+                boundary_field=str(ref["field"]),
+                boundary_index=(
+                    int(ref["index"]) if ref.get("index") is not None else None
+                ),
+                boundary_text_span=(
+                    int(ref["text_span"][0]),
+                    int(ref["text_span"][1]),
+                ),
+                boundary_value_sha256=str(ref["value_sha256"]),
+                page_index=int(ref["page_index"]),
+                eligibility_basis=str(value["eligibility_basis"]),
+                relative_rank=str(value["relative_rank"]),
+                current_owner_node_id=int(value["current_owner_node_id"]),
+                target_node_id=(
+                    int(value["target_node_id"])
+                    if value["target_node_id"] is not None
+                    else None
+                ),
+                boundary_carrier_scope=str(value["boundary_carrier_scope"]),
+                source_atom_orders=tuple(
+                    int(order) for order in value["source_atom_orders"]
+                ),
+            )
+        )
+    return tuple(output)
+
+
+def _selected_only_boundary_break(
+    source_index: int,
+    *,
+    owner: _ProvenHeading | None,
+    scope_breaks: Sequence[_OwnerScopeBreak],
+) -> _OwnerScopeBreak | None:
+    if owner is None:
+        return None
+    matches = [
+        scope_break
+        for scope_break in scope_breaks
+        if scope_break.boundary_source_item_index == source_index
+        and scope_break.current_owner_node_id == owner.node_id
+        and scope_break.boundary_carrier_scope == "selected_only"
+    ]
+    if len(matches) > 1:
+        raise SourceEvidenceClosureError("multiple selected-only boundary breaks")
+    return matches[0] if matches else None
+
+
+def _owner_after_scope_break(
+    source_index: int,
+    *,
+    owner: _ProvenHeading | None,
+    by_id: Mapping[int, _ProvenHeading],
+    scope_breaks: Sequence[_OwnerScopeBreak],
+) -> _ProvenHeading | None:
+    """Apply the latest exact break only within its original owner interval."""
+
+    if owner is None:
+        return None
+    applicable = [
+        scope_break
+        for scope_break in scope_breaks
+        if scope_break.current_owner_node_id == owner.node_id
+        and owner.section_start
+        < scope_break.boundary_source_item_index
+        <= source_index
+    ]
+    if not applicable:
+        return owner
+    latest = max(
+        applicable,
+        key=lambda scope_break: scope_break.boundary_source_item_index,
+    )
+    return by_id[latest.target_node_id] if latest.target_node_id is not None else None
+
+
+def _place_prepared_element(
+    element: PreparedElement,
+    *,
+    owner: _ProvenHeading | None,
+    paths: Mapping[int, tuple[_ProvenHeading, ...]],
+    heading_text_sources: set[int],
+    represented: set[int],
+    prepared_by_index: Mapping[int, PreparedElement],
+) -> PreparedElement | None:
+    source_index = _prepared_source_item_index(element)
+    assert source_index is not None
+    path = paths[owner.node_id] if owner is not None else ()
+    if (
+        source_index in heading_text_sources
+        and element.kind == "text"
+        and element.payload is None
+    ):
+        return None
+    if not _is_empty_table_element(element):
+        represented.update(item.node_id for item in path)
+    titles = [item.title for item in path]
+    return replace(
+        element,
+        heading_path=titles,
+        section_path=[item.node_id for item in path],
+        title=titles[-1] if titles else None,
+        artifact_locator=_locator_with_proven_heading_sources(
+            element.artifact_locator,
+            path,
+            prepared_by_index=prepared_by_index,
+        ),
+    )
+
+
+def _split_owner_boundary_caption(
+    element: PreparedElement,
+    *,
+    scope_break: _OwnerScopeBreak,
+) -> tuple[PreparedElement, PreparedElement]:
+    if (
+        scope_break.boundary_field != "table_caption"
+        or scope_break.boundary_index is None
+    ):
+        raise SourceEvidenceClosureError(
+            "selected-only owner break lacks an indexed table caption"
+        )
+    source_indices = _table_caption_source_indices(element)
+    positions = [
+        position
+        for position, source_index in enumerate(source_indices)
+        if source_index == scope_break.boundary_index
+    ]
+    if len(positions) != 1:
+        raise SourceEvidenceClosureError(
+            "selected-only owner break caption is absent or duplicated"
+        )
+    position = positions[0]
+    caption = element.table_caption[position]
+    if source_value_sha256(caption) != scope_break.boundary_value_sha256:
+        raise SourceEvidenceClosureError(
+            "selected-only owner break caption differs from its proof"
+        )
+    locator = {
+        key: value
+        for key, value in dict(element.artifact_locator or {}).items()
+        if key != "evidence_artifacts"
+    }
+    selector = source_selector(
+        locator,
+        field="table_caption",
+        index=scope_break.boundary_index,
+        char_span=list(scope_break.boundary_text_span),
+        value_sha256=scope_break.boundary_value_sha256,
+    )
+    if selector is None:
+        raise SourceEvidenceClosureError(
+            "selected-only owner break caption has no strict source selector"
+        )
+    caption_locator = _with_payload_projection(
+        locator,
+        {
+            "kind": "text_identity_exact",
+            "sources": [selector],
+            "target_field": "payload.caption",
+            "transform": "identity.v1",
+        },
+    )
+    body = replace(
+        element,
+        table_caption=[
+            value
+            for index, value in enumerate(element.table_caption)
+            if index != position
+        ],
+        table_caption_source_indices=[
+            value
+            for index, value in enumerate(source_indices)
+            if index != position
+        ],
+    )
+    detached = PreparedElement(
+        kind="text",
+        raw_kind="table_caption",
+        order_index=element.order_index,
+        source_order_phase=1,
+        page_no=element.page_no,
+        payload={"caption": caption},
+        quality_status="needs_review",
+        artifact_locator=caption_locator,
+    )
+    return body, detached
+
+
+def _table_caption_source_indices(element: PreparedElement) -> list[int]:
+    if not element.table_caption_source_indices:
+        return list(range(len(element.table_caption)))
+    if len(element.table_caption_source_indices) != len(element.table_caption):
+        raise SourceEvidenceClosureError("table caption source indices are invalid")
+    return list(element.table_caption_source_indices)
 
 
 def _prepared_source_item_index(element: PreparedElement) -> int | None:
@@ -1282,6 +1624,7 @@ def s3_build_text_units(elements: Iterable[PreparedElement]) -> list[UnitDraft]:
                         payload_kind="text",
                         payload=element.payload,
                         source_order=element.order_index,
+                        source_order_phase=element.source_order_phase,
                         heading_path=list(element.heading_path),
                         section_path=list(element.section_path),
                         title=element.title,
@@ -1485,6 +1828,7 @@ def _group_structural_units(
                 payload_kind="mixed",
                 payload={
                     "semantic_type": ("section" if section_path else "document"),
+                    "order_status": "unresolved_physical_fallback",
                     "parts": parts,
                 },
                 source_order=first.source_order,
@@ -1580,7 +1924,7 @@ def s7_finalize_units(
     )
     finalized: list[UnitDraft] = []
     for unit in units:
-        if _carries_native_context(unit):
+        if _carries_native_context(unit) or _is_native_only_mixed_owner(unit):
             # Native gap evidence never takes taxonomy labels: it stays on
             # the document-content fallback so retrieval routing can neither
             # invent structure nor hide the run behind a filing-level key.
@@ -1685,24 +2029,44 @@ def build_unit_drafts_s1_s7(
     # not an L1 concern and no payload_kind="qa" is emitted anymore.
     text_units = s3_build_text_units(placed)
     table_units = s5_build_table_units(placed, s1.stats)
-    for native_unit in native_units:
-        s1.stats.generated_by_kind[native_unit.payload_kind] += 1
+    s1.stats.native_recovery_gap_count = len(native_units)
+    s1.stats.native_recovery_leaf_count = sum(
+        len(parts)
+        for native_unit in native_units
+        if isinstance((parts := native_unit.payload.get("parts")), list)
+    )
     units = sorted(
         [*text_units, *table_units, *native_units], key=_unit_sort_key
     )
+    raw_document_title = (
+        str(normalized_ir["title"])
+        if isinstance(normalized_ir.get("title"), str)
+        and str(normalized_ir["title"]).strip()
+        else None
+    )
+    document_title = (
+        raw_document_title
+        if raw_document_title is not None
+        and not unsafe_semantic_characters(raw_document_title)
+        else None
+    )
+    if raw_document_title is not None and document_title is None:
+        s1.stats.unsafe_document_title_label_count += 1
     grouped = _group_structural_units(
         units,
-        document_title=(
-            str(normalized_ir["title"])
-            if isinstance(normalized_ir.get("title"), str)
-            and str(normalized_ir["title"]).strip()
-            else None
-        ),
+        document_title=document_title,
         stats=s1.stats,
     )
-    grouped = _attribute_native_units(grouped)
+    grouped = _classify_owner_native_alternatives(
+        grouped,
+        raw_elements=raw_elements,
+        stats=s1.stats,
+    )
     grouped = _flag_coverage_gap_owners(grouped)
     grouped = _suppress_punctuation_only_natives(grouped, stats=s1.stats)
+    grouped = _embed_native_recoveries(grouped)
+    grouped = _coalesce_adjacent_root_units(grouped)
+    grouped = _sanitize_unsafe_semantic_units(grouped, stats=s1.stats)
     return (
         s7_finalize_units(
             grouped,
@@ -1711,67 +2075,6 @@ def build_unit_drafts_s1_s7(
         ),
         s1.stats,
     )
-
-
-def _native_anchor_source_index(unit: UnitDraft) -> int | None:
-    locator = unit.artifact_locator
-    if not isinstance(locator, Mapping):
-        return None
-    graph = locator.get("source_projection")
-    context = (
-        graph.get("physical_context") if isinstance(graph, Mapping) else None
-    )
-    if not isinstance(context, Mapping):
-        return None
-    owner = context.get("containment_owner")
-    if isinstance(owner, int) and not isinstance(owner, bool):
-        return owner
-    predecessor = context.get("predecessor")
-    if isinstance(predecessor, Mapping):
-        ref = predecessor.get("source")
-        if isinstance(ref, Mapping):
-            index = ref.get("source_item_index")
-            if isinstance(index, int) and not isinstance(index, bool):
-                return index
-    return None
-
-
-def _attribute_native_units(units: list[UnitDraft]) -> list[UnitDraft]:
-    """Carry each anchor's published section onto its native recovery.
-
-    Attribution is transitive proof, not invention: the anchor relation is
-    word-order proven and the anchor's published unit already carries its
-    proven section path — including the container that swallowed a page
-    frame the recovery happens to trail. It rides inside the physical
-    context because the public heading_path contract demands projections
-    and proof ancestry that a recovery deliberately does not claim.
-    """
-
-    paths_by_source: dict[int, list[str]] = {}
-    for unit in units:
-        if _carries_native_context(unit):
-            continue
-        for source_index in _unit_source_item_indices_for_attribution(unit):
-            paths_by_source.setdefault(source_index, list(unit.heading_path))
-    output: list[UnitDraft] = []
-    for unit in units:
-        if not _carries_native_context(unit):
-            output.append(unit)
-            continue
-        anchor_index = _native_anchor_source_index(unit)
-        anchor_path = (
-            paths_by_source.get(anchor_index, [])
-            if anchor_index is not None
-            else []
-        )
-        locator = dict(unit.artifact_locator or {})
-        graph = dict(locator.get("source_projection") or {})
-        context = dict(graph.get("physical_context") or {})
-        context["anchor_heading_path"] = list(anchor_path)
-        graph["physical_context"] = context
-        locator["source_projection"] = graph
-        output.append(replace(unit, artifact_locator=locator))
-    return output
 
 
 def _native_containment_owner(unit: UnitDraft) -> int | None:
@@ -1788,6 +2091,427 @@ def _native_containment_owner(unit: UnitDraft) -> int | None:
     if isinstance(owner, int) and not isinstance(owner, bool):
         return owner
     return None
+
+
+def _embed_native_recoveries(units: list[UnitDraft]) -> list[UnitDraft]:
+    """Publish native recoveries as leaves of one existing coarse owner.
+
+    A source-native gap is evidence missing from the provider carrier, not a
+    business section.  Giving every gap its own ``document_units_v1`` row made
+    table digits look like stand-alone gibberish and created duplicate search
+    targets.  This pass keeps the exact selectors and physical context on the
+    leaf while assigning the leaf to a table/section/root unit.
+
+    Containment is authoritative. Otherwise equal predecessor/successor
+    owners are authoritative; a disagreement or missing side is flattened to
+    a document-root segment. No text phrase, issuer, filing, or document
+    identifier participates.
+    """
+
+    recoveries = [unit for unit in units if _carries_native_context(unit)]
+    if not recoveries:
+        return units
+    owners = [unit for unit in units if not _carries_native_context(unit)]
+    if not owners:
+        return [_native_only_document_owner(recoveries)]
+
+    owner_indices_by_source: dict[int, list[int]] = {}
+    for owner_index, owner in enumerate(owners):
+        for source_index in _unit_source_item_indices_for_attribution(owner):
+            owner_indices_by_source.setdefault(source_index, []).append(owner_index)
+
+    assigned: dict[int, list[UnitDraft]] = {}
+    root_recoveries: list[UnitDraft] = []
+    for recovery in recoveries:
+        recovery_owner_index = _native_recovery_owner_index(
+            recovery,
+            owners=owners,
+            owner_indices_by_source=owner_indices_by_source,
+        )
+        if recovery_owner_index is None:
+            root_recoveries.append(recovery)
+        else:
+            assigned.setdefault(recovery_owner_index, []).append(recovery)
+
+    output = [
+        _embed_recoveries_in_owner(owner, assigned.get(index, ()))
+        for index, owner in enumerate(owners)
+    ]
+    if root_recoveries:
+        # A page-only/prefix gap or a gap crossing sibling owners has no
+        # defensible section placement.  Each maximal gap remains an honest
+        # root *segment* at its physical position; combining non-contiguous
+        # root leaves across child sections would corrupt flat unit order.
+        output.extend(
+            _native_only_document_owner((recovery,))
+            for recovery in root_recoveries
+        )
+    return sorted(output, key=_unit_sort_key)
+
+
+def _native_recovery_owner_index(
+    recovery: UnitDraft,
+    *,
+    owners: list[UnitDraft],
+    owner_indices_by_source: Mapping[int, list[int]],
+) -> int | None:
+    context = _native_physical_context(recovery)
+    containment_owner = context.get("containment_owner")
+    if isinstance(containment_owner, int) and not isinstance(
+        containment_owner, bool
+    ):
+        candidates = owner_indices_by_source.get(containment_owner, [])
+        if len(candidates) == 1 and not _payload_is_own_heading(
+            owners[candidates[0]]
+        ):
+            return candidates[0]
+
+    predecessor = _context_source_index(context.get("predecessor"))
+    successor = _context_source_index(context.get("successor"))
+    relation = context.get("relation")
+    predecessor_owner = _unique_owner_index(
+        predecessor, owner_indices_by_source=owner_indices_by_source
+    )
+    successor_owner = _unique_owner_index(
+        successor, owner_indices_by_source=owner_indices_by_source
+    )
+    if relation in {"page_prefix", "page_only"}:
+        return None
+    if relation == "page_suffix":
+        # One-sided adjacency cannot turn a heading-only marker into a
+        # content owner. Keep the heading intact and flatten the residual to
+        # a root segment; a real table/paragraph/section carrier still owns
+        # its page suffix.
+        return (
+            predecessor_owner
+            if predecessor_owner is not None
+            and not _payload_is_own_heading(owners[predecessor_owner])
+            else None
+        )
+    if relation in {"between_mapped_sources", "bounded_by_same_source"}:
+        return (
+            predecessor_owner
+            if predecessor_owner is not None
+            and predecessor_owner == successor_owner
+            and not _payload_is_own_heading(owners[predecessor_owner])
+            else None
+        )
+    return None
+
+
+def _native_physical_context(unit: UnitDraft) -> Mapping[str, Any]:
+    locator = unit.artifact_locator
+    graph = (
+        locator.get("source_projection") if isinstance(locator, Mapping) else None
+    )
+    context = graph.get("physical_context") if isinstance(graph, Mapping) else None
+    if not isinstance(context, Mapping):
+        raise SourceEvidenceClosureError("native recovery has no physical context")
+    return context
+
+
+def _context_source_index(raw: object) -> int | None:
+    if not isinstance(raw, Mapping):
+        return None
+    source = raw.get("source")
+    value = source.get("source_item_index") if isinstance(source, Mapping) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _unique_owner_index(
+    source_index: int | None,
+    *,
+    owner_indices_by_source: Mapping[int, list[int]],
+) -> int | None:
+    if source_index is None:
+        return None
+    candidates = owner_indices_by_source.get(source_index, [])
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _payload_is_own_heading(unit: UnitDraft) -> bool:
+    """Return true when one atomic payload only repeats its heading source."""
+
+    if (
+        unit.payload_kind != "text"
+        or not unit.heading_path
+        or unit.payload.get("text") != unit.heading_path[-1]
+    ):
+        return False
+    graph = _projection_graph(dict(unit.artifact_locator or {}))
+    payload = graph.get("payload")
+    headings = graph.get("heading_path")
+    if (
+        not isinstance(payload, Mapping)
+        or not isinstance(headings, list)
+        or not headings
+    ):
+        return False
+    payload_sources = payload.get("sources")
+    last = headings[-1]
+    if not isinstance(payload_sources, list) or not isinstance(last, Mapping):
+        return False
+    heading_sources = last.get("sources")
+    if not isinstance(heading_sources, list):
+        selector = last.get("selector")
+        heading_sources = [selector] if isinstance(selector, Mapping) else []
+    return payload_sources == heading_sources
+
+
+def _embed_recoveries_in_owner(
+    owner: UnitDraft,
+    recoveries: Iterable[UnitDraft],
+) -> UnitDraft:
+    recovery_list = list(recoveries)
+    if not recovery_list:
+        return owner
+    owner_parts = (
+        [dict(part) for part in owner.payload.get("parts", ())]
+        if owner.payload_kind == "mixed"
+        else [_unit_part(owner)]
+    )
+    # Insert from the end so recoveries sharing one carrier anchor retain
+    # their canonical order instead of repeatedly occupying the same slot.
+    for recovery in reversed(sorted(recovery_list, key=_unit_sort_key)):
+        native_parts = _native_recovery_parts(
+            recovery,
+            owner_heading_path=owner.heading_path,
+        )
+        insertion = _native_insertion_index(owner_parts, recovery)
+        owner_parts[insertion:insertion] = native_parts
+
+    owner_was_mixed = owner.payload_kind == "mixed"
+    if owner_was_mixed:
+        locator = owner.artifact_locator
+    else:
+        graph = empty_projection_graph()
+        graph["payload"] = {
+            "kind": "container",
+            "sources": [],
+            "target_field": "payload.parts",
+            "transform": "ordered_parts.v1",
+        }
+        owner_graph = _projection_graph(dict(owner.artifact_locator or {}))
+        graph["heading_path"] = list(owner_graph["heading_path"])
+        locator = {"source_projection": graph}
+    return replace(
+        owner,
+        payload_kind="mixed",
+        payload={
+            "semantic_type": "section" if owner.section_path else "document",
+            "order_status": "unresolved_physical_fallback",
+            "parts": owner_parts,
+        },
+        quality_status=_worst_quality([owner, *recovery_list]),
+        # Converting an atomic owner into a container moves its typed
+        # applicability claim to the original atomic child via _unit_part().
+        # Keeping the same claim on the new outer container would either lack
+        # a matching source projection or publish the assertion twice.
+        applicability=owner.applicability if owner_was_mixed else None,
+        artifact_locator=locator,
+    )
+
+
+def _native_recovery_parts(
+    recovery: UnitDraft,
+    *,
+    owner_heading_path: list[str],
+) -> list[dict[str, Any]]:
+    context = dict(_native_physical_context(recovery))
+    context["anchor_heading_path"] = list(owner_heading_path)
+    parts = recovery.payload.get("parts")
+    if not isinstance(parts, list) or not parts:
+        raise SourceEvidenceClosureError("native recovery has no payload leaves")
+    output: list[dict[str, Any]] = []
+    for raw_part in parts:
+        if not isinstance(raw_part, Mapping):
+            raise SourceEvidenceClosureError("native recovery leaf is invalid")
+        part = dict(raw_part)
+        locator = dict(part.get("artifact_locator") or {})
+        graph = dict(locator.get("source_projection") or {})
+        graph["physical_context"] = context
+        locator["source_projection"] = graph
+        part["artifact_locator"] = locator
+        part.pop("heading_path", None)
+        part.pop("applicability", None)
+        output.append(part)
+    return output
+
+
+def _native_insertion_index(
+    owner_parts: list[dict[str, Any]],
+    recovery: UnitDraft,
+) -> int:
+    context = _native_physical_context(recovery)
+    containment = context.get("containment_owner")
+    predecessor = _context_source_index(context.get("predecessor"))
+    successor = _context_source_index(context.get("successor"))
+    after = (
+        containment
+        if isinstance(containment, int) and not isinstance(containment, bool)
+        else predecessor
+    )
+    if after is not None:
+        matches = [
+            index
+            for index, part in enumerate(owner_parts)
+            if after in _part_source_item_indices(part)
+        ]
+        if matches:
+            return matches[-1] + 1
+    if successor is not None:
+        matches = [
+            index
+            for index, part in enumerate(owner_parts)
+            if successor in _part_source_item_indices(part)
+        ]
+        if matches:
+            return matches[0]
+    return len(owner_parts)
+
+
+def _part_source_item_indices(part: Mapping[str, Any]) -> set[int]:
+    locator = part.get("artifact_locator")
+    refs = payload_source_refs(
+        payload_kind=str(part.get("kind")),
+        payload=part,
+        artifact_locator=locator if isinstance(locator, Mapping) else None,
+    )
+    return {
+        int(ref["source_item_index"])
+        for ref in refs
+        if isinstance(ref.get("source_item_index"), int)
+        and not isinstance(ref.get("source_item_index"), bool)
+    }
+
+
+def _native_only_document_owner(recoveries: Iterable[UnitDraft]) -> UnitDraft:
+    recovery_list = sorted(recoveries, key=_unit_sort_key)
+    graph = empty_projection_graph()
+    graph["payload"] = {
+        "kind": "container",
+        "sources": [],
+        "target_field": "payload.parts",
+        "transform": "ordered_parts.v1",
+    }
+    return UnitDraft(
+        payload_kind="mixed",
+        payload={
+            "semantic_type": "document",
+            "order_status": "unresolved_physical_fallback",
+            "parts": [
+                part
+                for recovery in recovery_list
+                for part in _native_recovery_parts(
+                    recovery,
+                    owner_heading_path=[],
+                )
+            ],
+        },
+        source_order=min(recovery.source_order for recovery in recovery_list),
+        quality_status=_worst_quality(recovery_list),
+        artifact_locator={"source_projection": graph},
+        native_order_anchor=recovery_list[0].native_order_anchor,
+    )
+
+
+def _coalesce_adjacent_root_units(units: list[UnitDraft]) -> list[UnitDraft]:
+    """Publish one durable document-root owner for each contiguous root span."""
+
+    output: list[UnitDraft] = []
+    pending: list[UnitDraft] = []
+
+    def eligible(unit: UnitDraft) -> bool:
+        return bool(
+            not unit.heading_path
+            and not unit.section_path
+            and not _carries_native_context(unit)
+        )
+
+    def flush() -> None:
+        if not pending:
+            return
+        if len(pending) == 1:
+            output.append(pending.pop())
+            return
+        if all(unit.detached_from_section for unit in pending):
+            output.extend(pending)
+            pending.clear()
+            return
+        titles = {unit.title for unit in pending if unit.title is not None}
+        if len(titles) > 1:
+            raise SourceEvidenceClosureError(
+                "one document-root span has conflicting metadata titles"
+            )
+        parts: list[dict[str, Any]] = []
+        evidence_artifacts: list[dict[str, Any]] = []
+        seen_artifacts: set[tuple[object, ...]] = set()
+        for unit in pending:
+            if unit.payload_kind == "mixed":
+                raw_parts = unit.payload.get("parts")
+                if not isinstance(raw_parts, list) or not all(
+                    isinstance(part, Mapping) for part in raw_parts
+                ):
+                    raise SourceEvidenceClosureError(
+                        "document-root mixed unit has invalid parts"
+                    )
+                parts.extend(dict(part) for part in raw_parts)
+            else:
+                parts.append(_unit_part(unit))
+            unit_locator = unit.artifact_locator
+            raw_artifacts = (
+                unit_locator.get("evidence_artifacts")
+                if isinstance(unit_locator, Mapping)
+                else None
+            )
+            if isinstance(raw_artifacts, list):
+                for artifact in raw_artifacts:
+                    if not isinstance(artifact, Mapping):
+                        continue
+                    identity = (
+                        artifact.get("artifact_role"),
+                        artifact.get("sha256"),
+                    )
+                    if identity in seen_artifacts:
+                        continue
+                    seen_artifacts.add(identity)
+                    evidence_artifacts.append(dict(artifact))
+        graph = empty_projection_graph()
+        graph["payload"] = {
+            "kind": "container",
+            "sources": [],
+            "target_field": "payload.parts",
+            "transform": "ordered_parts.v1",
+        }
+        root_locator: dict[str, Any] = {"source_projection": graph}
+        if evidence_artifacts:
+            root_locator["evidence_artifacts"] = evidence_artifacts
+        first = pending[0]
+        output.append(
+            UnitDraft(
+                payload_kind="mixed",
+                payload={
+                    "semantic_type": "document",
+                    "order_status": "unresolved_physical_fallback",
+                    "parts": parts,
+                },
+                source_order=first.source_order,
+                title=next(iter(titles)) if titles else None,
+                quality_status=_worst_quality(pending),
+                artifact_locator=root_locator,
+                native_order_anchor=first.native_order_anchor,
+            )
+        )
+        pending.clear()
+
+    for unit in units:
+        if eligible(unit):
+            pending.append(unit)
+            continue
+        flush()
+        output.append(unit)
+    flush()
+    return output
 
 
 def _flag_coverage_gap_owners(units: list[UnitDraft]) -> list[UnitDraft]:
@@ -1824,6 +2548,113 @@ def _flag_coverage_gap_owners(units: list[UnitDraft]) -> list[UnitDraft]:
     return output
 
 
+def _classify_owner_native_alternatives(
+    units: list[UnitDraft],
+    *,
+    raw_elements: Sequence[Mapping[str, Any]],
+    stats: BuildStats,
+) -> list[UnitDraft]:
+    """Keep coarse-owner duplicates as non-primary, positioned alternatives.
+
+    ``bounded_by_same_source`` proves a coarse owner, never a cell or physical
+    occurrence alias.  Consequently this pass must not delete a native leaf.
+    When the same strict surface is already searchable in that owner, the leaf
+    remains in payload/provenance but carries no second primary search edge.
+    Nonmatching residuals remain primary searchable recoveries.
+    """
+
+    owners = {
+        source_item_index: element
+        for element in raw_elements
+        if isinstance(
+            (source_item_index := element.get("source_item_index")), int
+        )
+        and not isinstance(source_item_index, bool)
+    }
+    output: list[UnitDraft] = []
+    for unit in units:
+        if not _carries_native_context(unit):
+            output.append(unit)
+            continue
+        context = _native_physical_context(unit)
+        owner_index = context.get("containment_owner")
+        owner = (
+            owners.get(owner_index)
+            if isinstance(owner_index, int) and not isinstance(owner_index, bool)
+            else None
+        )
+        carrier_surfaces = (
+            source_carrier_search_surfaces(owner)
+            if isinstance(owner, Mapping)
+            else ()
+        )
+        if not (
+            context.get("relation") == "bounded_by_same_source"
+            and context.get("order_basis") == "containment_proven"
+            and carrier_surfaces
+        ):
+            output.append(unit)
+            continue
+        parts = unit.payload.get("parts")
+        if not isinstance(parts, list) or not parts:
+            output.append(unit)
+            continue
+        classified: list[object] = []
+        alternative_count = 0
+        for part in parts:
+            if not isinstance(part, Mapping):
+                classified.append(part)
+                continue
+            native_text = part.get("text")
+            if part.get("kind") != "text" or not isinstance(native_text, str):
+                classified.append(part)
+                continue
+            residual = strict_source_comparison_text(native_text)
+            if (
+                not residual
+                or punctuation_only_text(native_text)
+                or not any(residual in surface for surface in carrier_surfaces)
+            ):
+                classified.append(part)
+                continue
+            locator = part.get("artifact_locator")
+            graph = (
+                locator.get("source_projection")
+                if isinstance(locator, Mapping)
+                else None
+            )
+            if not isinstance(locator, Mapping) or not isinstance(graph, Mapping):
+                raise SourceEvidenceClosureError(
+                    "native owner alternative has no source projection"
+                )
+            alternative_graph = dict(graph)
+            alternative_graph["search_targets"] = []
+            alternative_locator = dict(locator)
+            alternative_locator["source_projection"] = alternative_graph
+            classified.append(
+                {
+                    **part,
+                    "representation_role": "unresolved_source_alternative",
+                    "search_policy": "none",
+                    "quality_status": "needs_review",
+                    "artifact_locator": alternative_locator,
+                }
+            )
+            alternative_count += 1
+        if alternative_count == 0:
+            output.append(unit)
+            continue
+        stats.non_primary_source_alternative_count += alternative_count
+        output.append(
+            replace(
+                unit,
+                payload={**unit.payload, "parts": classified},
+                quality_status=_at_least_needs_review(unit.quality_status),
+            )
+        )
+    return output
+
+
 def _suppress_punctuation_only_natives(
     units: list[UnitDraft],
     *,
@@ -1841,31 +2672,217 @@ def _suppress_punctuation_only_natives(
 
     output: list[UnitDraft] = []
     for unit in units:
-        if _carries_native_context(unit):
-            parts = (
-                unit.payload.get("parts")
-                if isinstance(unit.payload, dict)
-                else None
-            )
-            texts = (
-                [
-                    part.get("text")
-                    for part in parts
-                    if isinstance(part, dict) and part.get("kind") == "text"
-                ]
-                if isinstance(parts, list)
-                else []
-            )
-            joined = "".join(text for text in texts if isinstance(text, str))
+        if not _carries_native_context(unit):
+            output.append(unit)
+            continue
+        parts = unit.payload.get("parts")
+        if not isinstance(parts, list) or not parts:
+            output.append(unit)
+            continue
+        retained: list[object] = []
+        suppressed = 0
+        for part in parts:
+            text = part.get("text") if isinstance(part, Mapping) else None
             if (
-                isinstance(parts, list)
-                and len(texts) == len(parts)
-                and punctuation_only_text(joined)
+                isinstance(part, Mapping)
+                and part.get("kind") == "text"
+                and isinstance(text, str)
+                and punctuation_only_text(text)
             ):
-                stats.punctuation_only_native_runs += 1
-                continue
-        output.append(unit)
+                suppressed += 1
+            else:
+                retained.append(part)
+        if suppressed == 0:
+            output.append(unit)
+            continue
+        stats.punctuation_only_native_runs += suppressed
+        if retained:
+            output.append(
+                replace(
+                    unit,
+                    payload={**unit.payload, "parts": retained},
+                )
+            )
     return output
+
+
+_SAFE_TEXT_TRANSFORMS = {
+    "clean_text.v1": "safe_clean_text.v1",
+    "identity.v1": "safe_identity.v1",
+    "exact_concat.v1": "safe_exact_concat.v1",
+    "ordered_text_concat.v1": "safe_ordered_text_concat.v1",
+    "ordered_visible_fields.v1": "safe_ordered_visible_fields.v1",
+}
+
+
+def _sanitize_unsafe_semantic_units(
+    units: list[UnitDraft],
+    *,
+    stats: BuildStats,
+) -> list[UnitDraft]:
+    """Keep undecoded glyphs in source evidence, never semantic payload text."""
+
+    output: list[UnitDraft] = []
+    for unit in units:
+        if _unsafe_text(unit.title) or any(_unsafe_text(item) for item in unit.heading_path):
+            raise SourceEvidenceClosureError(
+                "undecoded glyph cannot publish as a title or heading path"
+            )
+        if unit.payload_kind != "mixed":
+            payload, locator, changed = _sanitize_atomic_semantic_payload(
+                payload_kind=unit.payload_kind,
+                payload=unit.payload,
+                artifact_locator=unit.artifact_locator,
+            )
+            if not changed:
+                output.append(unit)
+                continue
+            stats.unsafe_semantic_payload_count += 1
+            output.append(
+                replace(
+                    unit,
+                    payload=payload,
+                    artifact_locator=locator,
+                    quality_status=_at_least_needs_review(unit.quality_status),
+                    applicability=None,
+                )
+            )
+            continue
+
+        raw_parts = unit.payload.get("parts")
+        if not isinstance(raw_parts, list):
+            output.append(unit)
+            continue
+        parts: list[object] = []
+        changed_count = 0
+        for raw_part in raw_parts:
+            if not isinstance(raw_part, Mapping):
+                parts.append(raw_part)
+                continue
+            raw_locator = raw_part.get("artifact_locator")
+            semantic_fields = {
+                key: value
+                for key, value in raw_part.items()
+                if key != "artifact_locator"
+            }
+            sanitized, locator, changed = _sanitize_atomic_semantic_payload(
+                payload_kind=str(raw_part.get("kind")),
+                payload=semantic_fields,
+                artifact_locator=(
+                    raw_locator if isinstance(raw_locator, Mapping) else None
+                ),
+            )
+            if not changed:
+                parts.append(raw_part)
+                continue
+            changed_count += 1
+            sanitized.pop("applicability", None)
+            sanitized["quality_status"] = _at_least_needs_review(
+                str(raw_part.get("quality_status") or "ok")
+            )
+            if locator is not None:
+                sanitized["artifact_locator"] = locator
+            parts.append(sanitized)
+        if changed_count == 0:
+            output.append(unit)
+            continue
+        stats.unsafe_semantic_payload_count += changed_count
+        output.append(
+            replace(
+                unit,
+                payload={**unit.payload, "parts": parts},
+                quality_status=_at_least_needs_review(unit.quality_status),
+                applicability=None,
+            )
+        )
+    return output
+
+
+def _sanitize_atomic_semantic_payload(
+    *,
+    payload_kind: str,
+    payload: Mapping[str, Any],
+    artifact_locator: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+    if not _semantic_value_has_unsafe_glyph(payload):
+        return dict(payload), (
+            dict(artifact_locator) if artifact_locator is not None else None
+        ), False
+    if payload_kind not in {"text", "table"}:
+        raise SourceEvidenceClosureError(
+            f"unsafe semantic glyph has no projection transform for {payload_kind!r}"
+        )
+    if not isinstance(artifact_locator, Mapping):
+        raise SourceEvidenceClosureError(
+            "unsafe semantic glyph has no source projection"
+        )
+    locator = dict(artifact_locator)
+    graph_raw = locator.get("source_projection")
+    if not isinstance(graph_raw, Mapping):
+        raise SourceEvidenceClosureError(
+            "unsafe semantic glyph has no source projection graph"
+        )
+    graph = dict(graph_raw)
+    edge_raw = graph.get("payload")
+    if not isinstance(edge_raw, Mapping):
+        raise SourceEvidenceClosureError(
+            "unsafe semantic glyph has no payload projection edge"
+        )
+    edge = dict(edge_raw)
+    transform = edge.get("transform")
+    if payload_kind == "table":
+        if edge.get("kind") != "table_identity" or transform != "table_identity.v1":
+            raise SourceEvidenceClosureError(
+                "unsafe table glyph lacks the exact table projection"
+            )
+        edge["transform"] = "safe_table_identity.v1"
+    else:
+        safe_transform = _SAFE_TEXT_TRANSFORMS.get(str(transform))
+        if safe_transform is None:
+            raise SourceEvidenceClosureError(
+                "unsafe text glyph lacks a closed semantic transform"
+            )
+        edge["transform"] = safe_transform
+    graph["payload"] = edge
+    structured = graph.get("structured")
+    if isinstance(structured, list):
+        graph["structured"] = [
+            dict(entry)
+            for entry in structured
+            if not (
+                isinstance(entry, Mapping)
+                and entry.get("target_field") == "applicability"
+            )
+        ]
+    locator["source_projection"] = graph
+    sanitized = semantic_payload_without_unsafe_glyphs(dict(payload))
+    if not isinstance(sanitized, dict):
+        raise SourceEvidenceClosureError("sanitized semantic payload is invalid")
+    return sanitized, locator, True
+
+
+def _semantic_value_has_unsafe_glyph(value: object) -> bool:
+    if isinstance(value, str):
+        return bool(unsafe_semantic_characters(value))
+    if isinstance(value, Mapping):
+        return any(
+            _semantic_value_has_unsafe_glyph(item)
+            for key, item in value.items()
+            if key != "artifact_locator"
+        )
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return any(_semantic_value_has_unsafe_glyph(item) for item in value)
+    return False
+
+
+def _unsafe_text(value: object) -> bool:
+    return isinstance(value, str) and bool(unsafe_semantic_characters(value))
+
+
+def _at_least_needs_review(value: str) -> str:
+    return "unusable" if value == "unusable" else "needs_review"
 
 
 def _unit_source_item_indices_for_attribution(unit: UnitDraft) -> set[int]:
@@ -1943,11 +2960,29 @@ def _carries_native_context(unit: UnitDraft) -> bool:
     )
 
 
-def _unit_sort_key(unit: UnitDraft) -> tuple[int, int, int, int]:
+def _is_native_only_mixed_owner(unit: UnitDraft) -> bool:
+    """Identify a root segment whose every leaf is source-native evidence."""
+
+    parts = unit.payload.get("parts") if unit.payload_kind == "mixed" else None
+    if not isinstance(parts, list) or not parts:
+        return False
+    for part in parts:
+        locator = part.get("artifact_locator") if isinstance(part, Mapping) else None
+        graph = (
+            locator.get("source_projection")
+            if isinstance(locator, Mapping)
+            else None
+        )
+        if not isinstance(graph, Mapping) or graph.get("physical_context") is None:
+            return False
+    return True
+
+
+def _unit_sort_key(unit: UnitDraft) -> tuple[int, int, int, int, int]:
     if unit.native_order_anchor is not None:
         anchor_order, page_idx, span_start = unit.native_order_anchor
-        return (anchor_order, 1, page_idx, span_start)
-    return (unit.source_order, 0, 0, 0)
+        return (anchor_order, 2, 0, page_idx, span_start)
+    return (unit.source_order, unit.source_order_phase, 0, 0, 0)
 
 
 def _note_keys_for_unit(unit: UnitDraft) -> list[str]:
@@ -2145,6 +3180,7 @@ def _table_to_unit(
         _with_table_payload_projection(
             first.artifact_locator,
             captions=first.table_caption,
+            caption_source_indices=_table_caption_source_indices(first),
             notes=notes,
             embedded_media=[
                 dict(value)
@@ -2181,6 +3217,7 @@ def _table_to_unit(
         payload_kind="table",
         payload=payload,
         source_order=first.order_index,
+        source_order_phase=first.source_order_phase,
         heading_path=list(first.heading_path),
         section_path=list(first.section_path),
         title=_table_title(first),
@@ -2206,7 +3243,11 @@ def _table_applicability(
     element: PreparedElement,
 ) -> tuple[str | None, dict[str, Any] | None]:
     matches: list[tuple[int, str, int, int, str]] = []
-    for index, caption in enumerate(element.table_caption):
+    for index, caption in zip(
+        _table_caption_source_indices(element),
+        element.table_caption,
+        strict=True,
+    ):
         offset = 0
         for source_line in caption.splitlines(keepends=True):
             line = source_line.rstrip("\r\n")
@@ -2255,8 +3296,12 @@ def _detect_unit_with_projection(
 
     candidates: list[tuple[str, str, int | None]] = [
         *(
-            (caption, "table_caption", index)
-            for index, caption in enumerate(element.table_caption)
+            (caption, "table_caption", source_index)
+            for source_index, caption in zip(
+                _table_caption_source_indices(element),
+                element.table_caption,
+                strict=True,
+            )
         ),
         *(
             (note, "table_note", index)
@@ -2375,7 +3420,13 @@ def _part_text(part: dict[str, Any]) -> str:
             for value in _payload_text_values(part.get(field))
             if value
         )
-    return str(part.get("text") or "")
+    if "text" in part:
+        return str(part.get("text") or "")
+    return " ".join(
+        str(value)
+        for value in _payload_text_values(part.get("caption"))
+        if value
+    )
 
 
 def _payload_text_values(value: Any) -> list[Any]:

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import math
 import re
-from typing import Literal, TypeAlias
+from typing import Literal, TypeAlias, cast
 
 
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -81,6 +81,7 @@ class MappedSourceEvent:
     carrier_order: int
     carrier_bbox: BBox
     atom_bbox: BBox
+    native_layout_path: LayoutPath
 
     def __post_init__(self) -> None:
         if (
@@ -95,6 +96,7 @@ class MappedSourceEvent:
             or not _index(self.carrier_order)
             or not _bbox(self.carrier_bbox)
             or not _bbox(self.atom_bbox)
+            or not _layout_path(self.native_layout_path)
         ):
             raise SourceEvidenceProofError("mapped source event is invalid")
 
@@ -170,9 +172,23 @@ class SourcePageProof:
     page_idx: int
     events: tuple[SourcePageEvent, ...]
     visual_only: VisualPageFallback | None = None
+    width: float | None = None
+    height: float | None = None
 
     def __post_init__(self) -> None:
-        if not _index(self.page_idx):
+        if (
+            not _index(self.page_idx)
+            or (self.width is None) != (self.height is None)
+            or (
+                self.width is not None
+                and (
+                    not math.isfinite(self.width)
+                    or not math.isfinite(cast(float, self.height))
+                    or self.width <= 0
+                    or cast(float, self.height) <= 0
+                )
+            )
+        ):
             raise SourceEvidenceProofError("source proof page index is invalid")
         if self.visual_only is not None and self.events:
             raise SourceEvidenceProofError(

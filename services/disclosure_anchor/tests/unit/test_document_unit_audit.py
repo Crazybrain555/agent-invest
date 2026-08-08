@@ -13,6 +13,7 @@ from disclosure_anchor.application.contracts.document_structure import (
     carrier_set_sha256,
 )
 from disclosure_anchor.application.contracts.source_evidence import (
+    MappedSourceEvent,
     NativeTextEvent,
     RetrievalRunProof,
     SourceEvidenceProof,
@@ -221,6 +222,7 @@ def _ir(
                 "artifact_role": "pdf_structure",
             },
             "headings": proof_headings,
+            "owner_scope_breaks": [],
             "page_frames": frames,
             "conflicts": [],
             "coverage": {
@@ -382,6 +384,7 @@ def _mixed_unit(
         payload_kind="mixed",
         payload={
             "semantic_type": semantic_type,
+            "order_status": "unresolved_physical_fallback",
             "parts": copy.deepcopy(parts),
         },
         title=heading_path[-1] if heading_path else "审计样本",
@@ -1008,6 +1011,108 @@ class DocumentUnitAuditTests(unittest.TestCase):
             "native text atom 0 belongs to no retrieval run",
             "\n".join(finding.message for finding in report.findings),
         )
+
+    def test_legacy_coarse_owner_support_receipt_is_rejected(self) -> None:
+        owner_text = "权威载体数值50"
+        residual = "50"
+
+        def digest(value: str) -> str:
+            return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+
+        proof = SourceEvidenceProof(
+            identity=SourceProofIdentity(
+                source_evidence_sha256="sha256:" + "b" * 64,
+                source_pdf_sha256=_SOURCE_PDF_SHA256,
+                page_count=1,
+            ),
+            pages=(
+                SourcePageProof(
+                    page_idx=0,
+                    events=(
+                        MappedSourceEvent(
+                            atom_index=0,
+                            word_order=0,
+                            source_item_index=0,
+                            order_state="monotonic",
+                            selector_field="text",
+                            selector_index=None,
+                            selector_char_span=(0, len(owner_text)),
+                            selector_value_sha256=digest(owner_text),
+                            carrier_order=0,
+                            carrier_bbox=(0.0, 0.0, 100.0, 20.0),
+                            atom_bbox=(0.0, 0.0, 10.0, 10.0),
+                            native_layout_path=(0, 0, 0, 0),
+                        ),
+                        NativeTextEvent(
+                            atom_index=1,
+                            word_order=1,
+                            text=residual,
+                            text_sha256=digest(residual),
+                            bbox=(10.0, 0.0, 20.0, 10.0),
+                            char_span=(0, len(residual)),
+                            layout_path=(0, 1, 0, 0),
+                        ),
+                        MappedSourceEvent(
+                            atom_index=2,
+                            word_order=2,
+                            source_item_index=0,
+                            order_state="monotonic",
+                            selector_field="text",
+                            selector_index=None,
+                            selector_char_span=(0, len(owner_text)),
+                            selector_value_sha256=digest(owner_text),
+                            carrier_order=0,
+                            carrier_bbox=(0.0, 0.0, 100.0, 20.0),
+                            atom_bbox=(20.0, 0.0, 30.0, 10.0),
+                            native_layout_path=(0, 0, 0, 2),
+                        ),
+                    ),
+                ),
+            ),
+            retrieval_runs=(
+                RetrievalRunProof(
+                    page_idx=0,
+                    run_index=0,
+                    atom_indices=(1,),
+                    text_sha256=digest(residual),
+                ),
+            ),
+            visual_bindings=(),
+            verified_visuals=(),
+        )
+        source = {
+            "kind": "source_evidence_atom",
+            "source_evidence_sha256": "sha256:" + "b" * 64,
+            "source_pdf_sha256": _SOURCE_PDF_SHA256,
+            "page_idx": 0,
+            "page_no": 1,
+            "atom_index": 1,
+            "atom_order": 1,
+            "bbox": [10.0, 0.0, 20.0, 10.0],
+            "char_span": [0, len(residual)],
+            "text_sha256": digest(residual),
+        }
+        disposition = {
+            "role": "support",
+            "reason": "coarse_owner_exact_text_coverage",
+            "source": source,
+            "owner_source_item_index": 0,
+            "comparison_algorithm": "source-owner-exact-substring.v1",
+        }
+        normalized = _ir([_element(0, text=owner_text)])
+        unit = _unit(1, payload_source=0, payload_text=owner_text)
+
+        report = audit_document(
+            normalized_ir=normalized,
+            units=[unit],
+            metadata=self.metadata,
+            source_proof=proof,
+            source_dispositions=[disposition],
+        )
+
+        self.assertFalse(report.ok)
+        self.assertIn("source_disposition_identity_unresolved", _codes(report))
+        self.assertIn("source_atom_uncovered", _codes(report))
 
     def test_visual_source_fallback_requires_verified_bytes_and_unit_binding(
         self,

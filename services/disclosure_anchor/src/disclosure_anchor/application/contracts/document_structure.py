@@ -10,10 +10,13 @@ from typing import Any, Never, cast
 
 
 DOCUMENT_STRUCTURE_VERSION = "document_structure.v1"
-DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v10"
+LEGACY_DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v10"
+PREVIOUS_DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v11"
+OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v12"
+DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v13"
 
 _SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
-_ROOT_FIELDS = frozenset(
+_LEGACY_ROOT_FIELDS = frozenset(
     {
         "algorithm_version",
         "carrier_set_sha256",
@@ -27,6 +30,7 @@ _ROOT_FIELDS = frozenset(
         "source_pdf_sha256",
     }
 )
+_ROOT_FIELDS = _LEGACY_ROOT_FIELDS | {"owner_scope_breaks"}
 _HEADING_FIELDS = frozenset(
     {
         "evidence_kinds",
@@ -50,9 +54,41 @@ _FRAME_FIELDS = frozenset(
         "role",
     }
 )
-_EVIDENCE = frozenset(
+_OWNER_SCOPE_BREAK_V1_FIELDS = frozenset(
+    {
+        "boundary_start_order",
+        "eligibility_basis",
+        "page_index",
+        "relative_rank",
+        "source_atom_orders",
+    }
+)
+_OWNER_SCOPE_BREAK_FIELDS = frozenset(
+    {
+        "boundary_carrier_scope",
+        "boundary_source_ref",
+        "current_owner_node_id",
+        "eligibility_basis",
+        "relative_rank",
+        "source_atom_orders",
+        "target_node_id",
+    }
+)
+_BOUNDARY_SOURCE_REF_FIELDS = frozenset(
+    {
+        "field",
+        "index",
+        "page_index",
+        "source_item_index",
+        "source_item_sha256",
+        "text_span",
+        "value_sha256",
+    }
+)
+_LEGACY_EVIDENCE = frozenset(
     {"bookmark", "mineru_v2_title", "printed_toc", "struct_tree"}
 )
+_EVIDENCE = _LEGACY_EVIDENCE | {"native_layout"}
 _HEADING_SOURCE_KIND_PAIRS = frozenset(
     {
         ("page_furniture", "footer"),
@@ -109,19 +145,32 @@ def validate_document_structure(
     """Validate binding, heading DAG, exact spans, and frame ownership."""
 
     proof = _mapping(value, "structure_proof_invalid")
-    if set(proof) != _ROOT_FIELDS:
-        _fail("structure_proof_fields_invalid", "root fields are not closed")
-    if (
-        proof["contract_version"] != DOCUMENT_STRUCTURE_VERSION
-        or proof["algorithm_version"] != DOCUMENT_STRUCTURE_ALGORITHM
-    ):
+    algorithm = proof.get("algorithm_version")
+    if proof.get("contract_version") != DOCUMENT_STRUCTURE_VERSION or algorithm not in {
+        LEGACY_DOCUMENT_STRUCTURE_ALGORITHM,
+        PREVIOUS_DOCUMENT_STRUCTURE_ALGORITHM,
+        OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
+        DOCUMENT_STRUCTURE_ALGORITHM,
+    }:
         _fail("structure_proof_version_unsupported", "unsupported proof version")
+    expected_fields = (
+        _ROOT_FIELDS
+        if algorithm
+        in {
+            OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
+            DOCUMENT_STRUCTURE_ALGORITHM,
+        }
+        else _LEGACY_ROOT_FIELDS
+    )
+    if set(proof) != expected_fields:
+        _fail("structure_proof_fields_invalid", "root fields are not closed")
     source_hash = proof["source_pdf_sha256"]
     if not isinstance(source_hash, str) or _SHA256_RE.fullmatch(source_hash) is None:
         _fail("structure_proof_source_hash_invalid", "invalid source PDF hash")
     if expected_source_pdf_sha256 is not None and source_hash != expected_source_pdf_sha256:
         _fail("structure_proof_source_hash_mismatch", "source PDF hash differs")
-    if _integer(proof["source_pdf_page_count"], minimum=1) is None:
+    page_count = _integer(proof["source_pdf_page_count"], minimum=1)
+    if page_count is None:
         _fail("structure_proof_page_count_invalid", "invalid source PDF page count")
     if proof["carrier_set_sha256"] != carrier_set_sha256(elements):
         _fail("structure_proof_carrier_hash_mismatch", "carrier set hash differs")
@@ -157,7 +206,16 @@ def validate_document_structure(
             heading["evidence_kinds"],
             "structure_proof_heading_evidence_invalid",
         )
-        if not evidence or len(evidence) != len(set(evidence)) or not set(evidence) <= _EVIDENCE:
+        allowed_evidence = (
+            _LEGACY_EVIDENCE
+            if algorithm == LEGACY_DOCUMENT_STRUCTURE_ALGORITHM
+            else _EVIDENCE
+        )
+        if (
+            not evidence
+            or len(evidence) != len(set(evidence))
+            or not set(evidence) <= allowed_evidence
+        ):
             _fail("structure_proof_heading_evidence_invalid", "invalid evidence")
         native_fields = {
             field
@@ -251,6 +309,37 @@ def validate_document_structure(
         heading_by_id[node_id] = heading
     _validate_parents(heading_by_id)
 
+    prior_boundary = -1
+    for raw_break in _list(
+        proof.get("owner_scope_breaks", []),
+        "structure_proof_owner_scope_breaks_invalid",
+    ):
+        scope_break = _mapping(
+            raw_break,
+            "structure_proof_owner_scope_break_invalid",
+        )
+        if algorithm == OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM:
+            boundary = _validate_owner_scope_break_v1(
+                scope_break,
+                elements_by_index=elements_by_index,
+                heading_members=heading_members,
+                page_count=page_count,
+            )
+        else:
+            boundary = _validate_owner_scope_break(
+                scope_break,
+                elements_by_index=elements_by_index,
+                headings=heading_by_id,
+                heading_members=heading_members,
+                page_count=page_count,
+            )
+        if boundary <= prior_boundary:
+            _fail(
+                "structure_proof_owner_scope_break_invalid",
+                "owner scope breaks are not strictly source ordered",
+            )
+        prior_boundary = boundary
+
     frame_members: set[int] = set()
     frame_ids: set[str] = set()
     for raw_frame in _list(
@@ -323,6 +412,364 @@ def validate_document_structure(
     if any(_integer(value, minimum=0) is None for value in coverage.values()):
         _fail("structure_proof_coverage_invalid", "coverage must be counts")
     return proof
+
+
+def _validate_owner_scope_break_v1(
+    scope_break: Mapping[str, Any],
+    *,
+    elements_by_index: Mapping[int, Mapping[str, Any]],
+    heading_members: set[int],
+    page_count: int,
+) -> int:
+    boundary = _integer(scope_break.get("boundary_start_order"), minimum=0)
+    page_index = _integer(scope_break.get("page_index"), minimum=0)
+    atoms = _owner_scope_atom_orders(scope_break)
+    basis = scope_break.get("eligibility_basis")
+    relative_rank = scope_break.get("relative_rank")
+    if (
+        set(scope_break) != _OWNER_SCOPE_BREAK_V1_FIELDS
+        or boundary is None
+        or boundary not in elements_by_index
+        or boundary in heading_members
+        or page_index is None
+        or page_index >= page_count
+        or not atoms
+        or basis
+        not in {"numbered_layout_break", "unnumbered_display_table_start"}
+        or (basis == "numbered_layout_break" and relative_rank != "peer_or_higher")
+        or (basis == "unnumbered_display_table_start" and relative_rank != "unknown")
+    ):
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "legacy owner scope break is not source-bound",
+        )
+    if _element_page_index(elements_by_index[boundary]) != page_index:
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "owner scope break page differs from its source carrier",
+        )
+    return boundary
+
+
+def _validate_owner_scope_break(
+    scope_break: Mapping[str, Any],
+    *,
+    elements_by_index: Mapping[int, Mapping[str, Any]],
+    headings: Mapping[int, Mapping[str, Any]],
+    heading_members: set[int],
+    page_count: int,
+) -> int:
+    if set(scope_break) != _OWNER_SCOPE_BREAK_FIELDS:
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "owner scope break fields are not closed",
+        )
+    raw_ref = _mapping(
+        scope_break.get("boundary_source_ref"),
+        "structure_proof_owner_scope_break_invalid",
+    )
+    allowed_ref_fields = _BOUNDARY_SOURCE_REF_FIELDS
+    if raw_ref.get("index") is None:
+        allowed_ref_fields = allowed_ref_fields - {"index"}
+    if set(raw_ref) != allowed_ref_fields:
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "owner scope boundary selector is not closed",
+        )
+    boundary = _integer(raw_ref.get("source_item_index"), minimum=0)
+    page_index = _integer(raw_ref.get("page_index"), minimum=0)
+    index = raw_ref.get("index")
+    typed_index = _integer(index, minimum=0) if index is not None else None
+    field = raw_ref.get("field")
+    if (
+        boundary is None
+        or boundary not in elements_by_index
+        or boundary in heading_members
+        or page_index is None
+        or page_index >= page_count
+        or (index is not None and typed_index is None)
+    ):
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "owner scope boundary identity is invalid",
+        )
+    element = elements_by_index[boundary]
+    selected = _selected_source_text(element, field=field, index=typed_index)
+    text_span = _range(
+        raw_ref.get("text_span"),
+        "structure_proof_owner_scope_break_invalid",
+    )
+    if (
+        text_span != (0, len(selected))
+        or raw_ref.get("value_sha256") != _source_value_sha256(selected)
+        or raw_ref.get("source_item_sha256") != element.get("source_item_sha256")
+        or _element_page_index(element) != page_index
+        or not _owner_scope_atom_orders(scope_break)
+    ):
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "owner scope boundary differs from its immutable source field",
+        )
+
+    owners = [
+        heading
+        for heading in headings.values()
+        if bool(heading["propagates"])
+        and int(heading["section_span"][0]) < boundary
+        <= int(heading["section_span"][1])
+    ]
+    if not owners:
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "owner scope break has no accepted current owner",
+        )
+    owners.sort(key=lambda heading: _heading_depth(heading, headings=headings))
+    owner = owners[-1]
+    owner_path = _heading_path(owner, headings=headings)
+    owner_ids = {int(item["node_id"]) for item in owner_path}
+    if any(int(item["node_id"]) not in owner_ids for item in owners):
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "owner scope break current owner is ambiguous",
+        )
+    owner_id = int(owner["node_id"])
+    if scope_break.get("current_owner_node_id") != owner_id:
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "owner scope break current owner was not independently derived",
+        )
+
+    basis = scope_break.get("eligibility_basis")
+    relative_rank = scope_break.get("relative_rank")
+    carrier_scope = scope_break.get("boundary_carrier_scope")
+    target: int | None
+    if basis == "numbered_caption_native_break":
+        if field != "table_caption" or typed_index is None:
+            _fail(
+                "structure_proof_owner_scope_break_invalid",
+                "numbered break must select one table caption",
+            )
+        candidate_rank = printed_number_rank(selected)
+        owner_rank = printed_number_rank(
+            _heading_text(owner, elements_by_index=elements_by_index)
+        )
+        expected_relative = (
+            "peer"
+            if candidate_rank is not None and candidate_rank == owner_rank
+            else "higher"
+            if candidate_rank is not None
+            and owner_rank is not None
+            and candidate_rank < owner_rank
+            else None
+        )
+        if (
+            expected_relative is None
+            or relative_rank != expected_relative
+            or carrier_scope not in {"selected_only", "selected_and_same_carrier"}
+        ):
+            _fail(
+                "structure_proof_owner_scope_break_invalid",
+                "numbered break rank or carrier scope is invalid",
+            )
+        assert candidate_rank is not None
+        ranked_path = [
+            (
+                ancestor,
+                printed_number_rank(
+                    _heading_text(
+                        ancestor,
+                        elements_by_index=elements_by_index,
+                    )
+                ),
+            )
+            for ancestor in reversed(owner_path)
+        ]
+        peer = next(
+            (
+                ancestor
+                for ancestor, rank in ranked_path
+                if rank == candidate_rank
+            ),
+            None,
+        )
+        if peer is not None:
+            parent = peer.get("parent_node_id")
+            target = int(parent) if isinstance(parent, int) else None
+        else:
+            target = next(
+                (
+                    int(ancestor["node_id"])
+                    for ancestor, rank in ranked_path
+                    if rank is not None and rank < candidate_rank
+                ),
+                None,
+            )
+    elif basis == "unnumbered_display_peer_break":
+        if (
+            field != "text"
+            or typed_index is not None
+            or relative_rank != "unnumbered_peer"
+            or carrier_scope != "selected_and_same_carrier"
+            or printed_number_rank(
+                _heading_text(owner, elements_by_index=elements_by_index)
+            )
+            is not None
+        ):
+            _fail(
+                "structure_proof_owner_scope_break_invalid",
+                "unnumbered peer break is invalid",
+            )
+        parent = owner.get("parent_node_id")
+        target = int(parent) if isinstance(parent, int) else None
+    else:
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "owner scope break eligibility is invalid",
+        )
+    if scope_break.get("target_node_id") != target:
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "owner scope break target was not independently derived",
+        )
+    return boundary
+
+
+def _owner_scope_atom_orders(scope_break: Mapping[str, Any]) -> tuple[int, ...]:
+    raw = _list(
+        scope_break.get("source_atom_orders"),
+        "structure_proof_owner_scope_break_invalid",
+    )
+    atoms = tuple(_integer(value, minimum=0) for value in raw)
+    if (
+        not atoms
+        or any(value is None for value in atoms)
+        or len(atoms) != len(set(atoms))
+        or tuple(sorted(cast(tuple[int, ...], atoms))) != atoms
+    ):
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "owner scope source atom orders are invalid",
+        )
+    return cast(tuple[int, ...], atoms)
+
+
+def _element_page_index(element: Mapping[str, Any]) -> int | None:
+    value = element.get("page_idx")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    page_no = element.get("page_no")
+    return (
+        page_no - 1
+        if isinstance(page_no, int) and not isinstance(page_no, bool)
+        else None
+    )
+
+
+def _heading_depth(
+    heading: Mapping[str, Any],
+    *,
+    headings: Mapping[int, Mapping[str, Any]],
+) -> int:
+    return len(_heading_path(heading, headings=headings))
+
+
+def _heading_path(
+    heading: Mapping[str, Any],
+    *,
+    headings: Mapping[int, Mapping[str, Any]],
+) -> tuple[Mapping[str, Any], ...]:
+    path = [heading]
+    parent = heading.get("parent_node_id")
+    while isinstance(parent, int):
+        current = headings[parent]
+        path.append(current)
+        parent = current.get("parent_node_id")
+    return tuple(reversed(path))
+
+
+def _heading_text(
+    heading: Mapping[str, Any],
+    *,
+    elements_by_index: Mapping[int, Mapping[str, Any]],
+) -> str:
+    parts: list[str] = []
+    for raw_ref in cast(list[Mapping[str, Any]], heading["source_refs"]):
+        value = _selected_source_text(
+            elements_by_index[int(raw_ref["source_item_index"])],
+            field=raw_ref.get("field"),
+            index=raw_ref.get("index"),
+        )
+        start, end = (int(item) for item in raw_ref["text_span"])
+        parts.append(value[start:end])
+    return "".join(parts)
+
+
+def _selected_source_text(
+    element: Mapping[str, Any],
+    *,
+    field: object,
+    index: object,
+) -> str:
+    if not isinstance(field, str):
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "source selector field is invalid",
+        )
+    value = element.get(field)
+    if index is not None:
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or not isinstance(value, list)
+            or index >= len(value)
+        ):
+            _fail(
+                "structure_proof_owner_scope_break_invalid",
+                "indexed source selector is invalid",
+            )
+        value = value[index]
+    if not isinstance(value, str):
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "owner scope source selector is not textual",
+        )
+    return value
+
+
+def _source_value_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def printed_number_rank(value: str) -> int | None:
+    """Return the closed coarse numbering rank used by break contracts."""
+
+    text = value.lstrip()
+    match = re.match(
+        r"^第[〇零一二三四五六七八九十百千万两]+([编篇章节])",
+        text,
+    )
+    if match is not None:
+        return {"编": 0, "篇": 0, "章": 1, "节": 2}[match.group(1)]
+    if re.match(r"^[〇零一二三四五六七八九十百千万两]+[、．.]", text):
+        return 1
+    if re.match(r"^[（(][〇零一二三四五六七八九十百千万两]+[）)]", text):
+        return 2
+    dotted = re.match(r"^(\d+(?:\.\d+)+)(?:[、．.]|\s)+", text)
+    if dotted is not None:
+        return 3 + dotted.group(1).count(".")
+    if re.match(r"^\d{1,4}、", text):
+        return 1
+    if re.match(r"^\d{1,4}[．.)）]", text):
+        return 3
+    if re.match(r"^[（(]\d{1,4}[）)]", text):
+        return 4
+    return None
 
 
 def _validate_parents(headings: Mapping[int, Mapping[str, Any]]) -> None:
@@ -439,7 +886,10 @@ def _fail(reason_code: str, message: str) -> Never:
 __all__ = [
     "DOCUMENT_STRUCTURE_ALGORITHM",
     "DOCUMENT_STRUCTURE_VERSION",
+    "LEGACY_DOCUMENT_STRUCTURE_ALGORITHM",
+    "OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM",
     "DocumentStructureContractError",
     "carrier_set_sha256",
+    "printed_number_rank",
     "validate_document_structure",
 ]

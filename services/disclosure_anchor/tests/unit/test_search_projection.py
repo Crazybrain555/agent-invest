@@ -7,6 +7,7 @@ projection; they are never discovered by recursively walking payload JSON.
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timezone
 import unittest
 
@@ -115,6 +116,43 @@ class TokenizerTests(unittest.TestCase):
 
 
 class SearchTargetTests(unittest.TestCase):
+    def test_non_primary_source_alternative_has_no_second_search_leaf(self) -> None:
+        payload = {
+            "text": "50",
+            "representation_role": "unresolved_source_alternative",
+            "search_policy": "none",
+        }
+        locator = _search_locator(
+            projection_kind="text_identity_exact",
+            projection_target="payload.text",
+            targets=[],
+        )
+
+        self.assertEqual(
+            search_text_values(
+                payload_kind="text",
+                payload=payload,
+                artifact_locator=locator,
+            ),
+            (),
+        )
+
+        primary = copy.deepcopy(locator)
+        primary["source_projection"]["search_targets"] = ["payload.text"]
+        with self.assertRaises(SearchTargetContractError):
+            search_text_values(
+                payload_kind="text",
+                payload=payload,
+                artifact_locator=primary,
+            )
+        malformed = {**payload, "search_policy": "primary"}
+        with self.assertRaises(SearchTargetContractError):
+            search_text_values(
+                payload_kind="text",
+                payload=malformed,
+                artifact_locator=locator,
+            )
+
     def test_text_has_one_explicit_payload_target(self) -> None:
         (unit,), _ = _build([_element(0, text="货币资金明细")])
 
@@ -156,6 +194,44 @@ class SearchTargetTests(unittest.TestCase):
                     ],
                     ["payload.text"],
                 )
+
+        unsafe_text = "福建\ue000表格\ufffd数值⟦未解码字形 cid=9⟧尾部"
+        (unsafe_unit,), _ = _build([_element(0, text=unsafe_text)])
+        self.assertEqual(unsafe_unit.payload["text"], "福建\n表格\n数值\n尾部")
+        self.assertNotIn("\ue000", unsafe_unit.payload["text"])
+        self.assertNotIn("\ufffd", unsafe_unit.payload["text"])
+        self.assertNotIn("未解码字形", unsafe_unit.payload["text"])
+        self.assertEqual(
+            search_text_values(
+                payload_kind=unsafe_unit.payload_kind,
+                payload=unsafe_unit.payload,
+                artifact_locator=unsafe_unit.artifact_locator,
+            ),
+            ("福建", "表格", "数值", "尾部"),
+        )
+        row = compute_search_projection_row(
+            asset_id="ua_unsafe_glyph_segments",
+            title=None,
+            heading_path=[],
+            payload_kind=unsafe_unit.payload_kind,
+            payload=unsafe_unit.payload,
+            semantic_keys=["document_content"],
+            artifact_locator=unsafe_unit.artifact_locator,
+            built_at=_BUILT_AT,
+        )
+        self.assertEqual(row["body_atoms"], ("福建", "表格", "数值", "尾部"))
+        self.assertNotIn("\ue000", row["body_tokens"])
+        self.assertNotIn("\ufffd", row["body_tokens"])
+        self.assertNotIn("未解码字形", row["body_tokens"])
+
+        missing = copy.deepcopy(unit.artifact_locator)
+        missing["source_projection"]["search_targets"] = []
+        with self.assertRaises(SearchTargetContractError):
+            search_text_values(
+                payload_kind=unit.payload_kind,
+                payload=unit.payload,
+                artifact_locator=missing,
+            )
 
     def test_table_indexes_only_source_owned_evidence_fields(self) -> None:
         (unit,), _ = _build(
@@ -199,6 +275,17 @@ class SearchTargetTests(unittest.TestCase):
         ):
             if excluded:
                 self.assertNotIn(excluded, body)
+
+        missing_rows = copy.deepcopy(unit.artifact_locator)
+        missing_rows["source_projection"]["search_targets"].remove(
+            "payload.rows"
+        )
+        with self.assertRaises(SearchTargetContractError):
+            search_text_values(
+                payload_kind=unit.payload_kind,
+                payload=unit.payload,
+                artifact_locator=missing_rows,
+            )
 
     def test_mixed_container_has_no_targets_and_replays_parts_in_order(self) -> None:
         elements, headings = _sample_share_change()

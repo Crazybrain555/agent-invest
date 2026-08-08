@@ -13,6 +13,10 @@ import math
 from collections.abc import Sequence
 from typing import Any, Mapping, cast
 
+from disclosure_anchor.application.contracts.publication_safety import (
+    conservative_semantic_segments,
+)
+
 
 UNIT_SOURCE_PROJECTION_VERSION = "unit-source-projection.v4"
 
@@ -459,7 +463,32 @@ def _atomic_search_text_values(
             "non-mixed payload cannot declare grouped search atoms"
         )
 
+    non_primary_alternative = _is_non_primary_source_alternative(
+        payload_kind=payload_kind,
+        payload=payload,
+    )
+    if non_primary_alternative:
+        if targets:
+            raise SearchTargetContractError(
+                "non-primary source alternative cannot declare a search target"
+            )
+        return ()
+
+    required_targets = _required_primary_search_targets(
+        payload_kind=payload_kind,
+        payload=payload,
+    )
+    if required_targets and tuple(targets) != required_targets:
+        raise SearchTargetContractError(
+            "reader-visible payload does not declare its complete primary "
+            "search target set"
+        )
+
     payload_projection = graph.get("payload")
+    safe_projection = bool(
+        isinstance(payload_projection, Mapping)
+        and str(payload_projection.get("transform", "")).startswith("safe_")
+    )
     structured = graph.get("structured")
     if not isinstance(structured, list):
         raise SearchTargetContractError("structured projection must be an array")
@@ -493,8 +522,118 @@ def _atomic_search_text_values(
             target_field=target_field,
         )
         value = projection_target_value(payload, target_field)
-        values.extend(_search_leaf_text(value, target_field=target_field))
-    return tuple(value for value in values if value)
+        for leaf in _search_leaf_text(value, target_field=target_field):
+            segments = conservative_semantic_segments(leaf)
+            if safe_projection:
+                values.extend(
+                    line
+                    for segment in segments
+                    for line in segment.splitlines()
+                    if line
+                )
+            else:
+                values.extend(segments)
+    return tuple(value for value in values if value.strip())
+
+
+def requires_primary_search_leaf(
+    *,
+    payload_kind: str,
+    payload: Mapping[str, Any],
+) -> bool:
+    """Whether ordinary reader-visible semantics require a search leaf."""
+
+    try:
+        if _is_non_primary_source_alternative(
+            payload_kind=payload_kind,
+            payload=payload,
+        ):
+            return False
+    except SearchTargetContractError:
+        # The full search-contract validator reports the malformed role.  A
+        # malformed marker must never make the carrier look exempt here.
+        return True
+
+    if payload_kind == "text" and "image_ref" not in payload:
+        return _has_safe_semantic_text(payload.get("text"))
+    if payload_kind != "table":
+        return False
+    if any(
+        _has_safe_semantic_text(payload.get(field))
+        for field in ("caption", "headers", "rows", "notes")
+    ):
+        return True
+    media = payload.get("embedded_media")
+    return isinstance(media, list) and any(
+        isinstance(item, Mapping)
+        and _has_safe_semantic_text(item.get("semantic_text"))
+        for item in media
+    )
+
+
+def _required_primary_search_targets(
+    *,
+    payload_kind: str,
+    payload: Mapping[str, Any],
+) -> tuple[str, ...]:
+    if not requires_primary_search_leaf(
+        payload_kind=payload_kind,
+        payload=payload,
+    ):
+        return ()
+    if payload_kind == "text":
+        return ("payload.text",)
+    media = payload.get("embedded_media")
+    media_targets = (
+        tuple(
+            f"payload.embedded_media.{index}.semantic_text"
+            for index, item in enumerate(media)
+            if isinstance(item, Mapping)
+            and isinstance(item.get("semantic_text"), str)
+            and bool(item["semantic_text"])
+        )
+        if isinstance(media, list)
+        else ()
+    )
+    return (
+        "payload.caption",
+        "payload.headers",
+        "payload.rows",
+        "payload.notes",
+        *media_targets,
+    )
+
+
+def _has_safe_semantic_text(value: object) -> bool:
+    if isinstance(value, str):
+        return any(part.strip() for part in conservative_semantic_segments(value))
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return any(_has_safe_semantic_text(item) for item in value)
+    return False
+
+
+def _is_non_primary_source_alternative(
+    *,
+    payload_kind: str,
+    payload: Mapping[str, Any],
+) -> bool:
+    """Validate and identify the one closed non-primary representation role."""
+
+    role = payload.get("representation_role")
+    policy = payload.get("search_policy")
+    if role is None and policy is None:
+        return False
+    if (
+        payload_kind != "text"
+        or role != "unresolved_source_alternative"
+        or policy != "none"
+    ):
+        raise SearchTargetContractError(
+            "representation_role/search_policy is open or invalid"
+        )
+    return True
 
 
 def _mixed_search_atom_values(

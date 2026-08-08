@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 import re
+import statistics
 from typing import Any, Callable, Iterable, Mapping, cast
 import unicodedata
 
@@ -43,6 +44,10 @@ from disclosure_anchor.application.contracts.source_evidence_occurrence import (
     native_text_occurrence,
     visual_page_occurrence,
 )
+from disclosure_anchor.application.contracts.publication_safety import (
+    semantic_payload_without_unsafe_glyphs,
+    unsafe_semantic_characters,
+)
 from disclosure_anchor.application.contracts.unit_source_projection import (
     HEADING_PROJECTION_KINDS,
     PAYLOAD_PROJECTION_KINDS,
@@ -53,12 +58,17 @@ from disclosure_anchor.application.contracts.unit_source_projection import (
     SearchTargetContractError,
     UNIT_SOURCE_PROJECTION_VERSION,
     projection_target_value,
+    requires_primary_search_leaf,
     search_text_values,
     source_ref_from_locator,
     source_ref_identity,
     source_value_sha256,
 )
-from disclosure_anchor.domain.value_objects.comparison_text import comparison_text
+from disclosure_anchor.domain.value_objects.comparison_text import (
+    comparison_text,
+    source_carrier_search_surfaces,
+    strict_source_comparison_text,
+)
 from disclosure_anchor.domain.value_objects.semantic_key import (
     SemanticKeyInvariantError,
     validate_semantic_key_state,
@@ -103,7 +113,7 @@ _TABLE_PAYLOAD_FIELDS = frozenset(
         "unit",
     }
 )
-_MIXED_PAYLOAD_FIELDS = frozenset({"parts", "semantic_type"})
+_MIXED_PAYLOAD_FIELDS = frozenset({"order_status", "parts", "semantic_type"})
 _MIXED_PART_FIELDS = frozenset(
     {
         "applicability",
@@ -112,6 +122,8 @@ _MIXED_PART_FIELDS = frozenset(
         "kind",
         "order",
         "quality_status",
+        "representation_role",
+        "search_policy",
     }
 )
 
@@ -219,6 +231,10 @@ class _CoverageState:
     )
     carrier_occurrences: list["_CarrierOccurrence"] = field(default_factory=list)
     carrier_quality: dict[str, str] = field(default_factory=dict)
+    required_search_carriers: set[str] = field(default_factory=set)
+    closed_search_carriers: set[str] = field(default_factory=set)
+    primary_search_leaf_count: int = 0
+    non_primary_source_alternative_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -285,9 +301,27 @@ class _ProofSourceRef:
 
 
 @dataclass(frozen=True)
+class _ProofOwnerScopeBreak:
+    boundary_source_item_index: int
+    boundary_ref: str
+    boundary_field: str
+    boundary_index: int | None
+    boundary_text_span: tuple[int, int]
+    boundary_value_sha256: str
+    page_index: int
+    eligibility_basis: str
+    relative_rank: str
+    current_owner_node_id: int
+    target_node_id: int | None
+    boundary_carrier_scope: str
+    source_atom_orders: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class _StructureProofIndex:
     headings: dict[int, _ProofHeading]
     frame_source_indices: frozenset[int]
+    owner_scope_breaks: tuple[_ProofOwnerScopeBreak, ...]
 
 
 @dataclass
@@ -342,6 +376,7 @@ def audit_document(
     structure = _build_structure_proof_index(
         normalized_ir,
         source=source,
+        source_proof=source_proof,
         findings=findings,
     )
     source, native_plan = _extend_source_index_with_native_evidence(
@@ -422,8 +457,9 @@ def audit_document(
         if "_native_source_ref" in source.elements[ref]
         and punctuation_only_text(str(source.elements[ref].get("text") or ""))
     }
+    uncovered_refs = substantive_refs - covered_refs - suppressed_refs
     for ref in sorted(
-        substantive_refs - covered_refs - suppressed_refs,
+        uncovered_refs,
         key=source_order(source),
     ):
         _audit_error(
@@ -485,9 +521,16 @@ def audit_document(
             )
             & dispositions.external_refs
         ),
+        "non_primary_source_alternative": (
+            state.non_primary_source_alternative_count
+        ),
         "proven_empty": len(empty_refs),
-        "uncovered": len(substantive_refs - covered_refs),
+        "suppressed_nonsemantic": len(suppressed_refs),
+        "uncovered": len(uncovered_refs),
     }
+    missing_search_carriers = (
+        state.required_search_carriers - state.closed_search_carriers
+    )
     metrics: dict[str, Any] = {
         "source_elements": len(source.elements),
         "substantive_source_atoms": len(substantive_refs),
@@ -498,6 +541,12 @@ def audit_document(
         "tiny_units_lt_50_chars": tiny_units,
         "visible_payload_chars": payload_chars,
         "typed_payload_projections": len(state.payload_projections),
+        "primary_search": {
+            "required_carriers": len(state.required_search_carriers),
+            "closed_carriers": len(state.closed_search_carriers),
+            "leaf_count": state.primary_search_leaf_count,
+            "missing_carriers": len(missing_search_carriers),
+        },
         "finding_count": len(findings),
         "error_count": sum(item.severity == "error" for item in findings),
     }
@@ -1040,9 +1089,17 @@ def _validate_source_visual_evidence(
     known_roles = {
         role for descriptors in expected_by_ref.values() for role in descriptors
     }
+    carriers_by_id = {
+        carrier.carrier_id: carrier for carrier in state.carrier_occurrences
+    }
     for carrier in state.carrier_occurrences:
         refs = set(carrier.payload_refs)
-        refs.update(
+        # Mixed parts are separately audited carriers. Requiring the outer
+        # envelope to duplicate every child visual descriptor creates two
+        # ownership claims for one artifact and breaks leaf-only native
+        # recovery. The envelope owns no child bytes of its own.
+        owned_refs = set(refs)
+        owned_refs.update(
             ref
             for part_refs, _carrier_id in carrier.container_parts
             for ref in part_refs
@@ -1050,10 +1107,19 @@ def _validate_source_visual_evidence(
         expected: dict[str, dict[str, Any]] = {}
         for ref in refs:
             expected.update(expected_by_ref.get(ref, {}))
-        owned_roles = {role for ref in refs for role in owned_roles_by_ref.get(ref, ())}
+        owned_roles = {
+            role for ref in owned_refs for role in owned_roles_by_ref.get(ref, ())
+        }
         actual: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for role, descriptor in carrier.artifacts:
             actual[role].append(descriptor)
+        child_actual: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for _part_refs, child_id in carrier.container_parts:
+            child = carriers_by_id.get(child_id)
+            if child is None:
+                continue
+            for role, descriptor in child.artifacts:
+                child_actual[role].append(descriptor)
         for role, descriptor in expected.items():
             if actual.get(role) != [descriptor]:
                 _audit_error(
@@ -1062,7 +1128,15 @@ def _validate_source_visual_evidence(
                     f"{carrier.carrier_id} lacks exact visual descriptor {role}",
                     unit_order=carrier.unit_order,
                 )
-        for role in set(actual) & known_roles - set(expected):
+        for role in set(actual) & set(child_actual) - set(expected):
+            if actual[role] != child_actual[role]:
+                _audit_error(
+                    findings,
+                    "source_visual_evidence_missing",
+                    f"{carrier.carrier_id} carries a forged child visual {role}",
+                    unit_order=carrier.unit_order,
+                )
+        for role in set(actual) & known_roles - set(expected) - owned_roles:
             _audit_error(
                 findings,
                 "source_visual_evidence_misbound",
@@ -1086,16 +1160,16 @@ def _validate_native_gap_units(
     state: _CoverageState,
     findings: list[AuditFinding],
 ) -> None:
-    """Validate units against an audit-owned partition of typed PDF events."""
+    """Validate native leaves inside independently chosen coarse owners."""
 
-    assigned: dict[int, AuditUnitView] = {}
-    anchor_paths: dict[int, list[str]] = {}
-    claimed_orders: set[int] = set()
     units_by_order = {unit.order_index: unit for unit in units}
     carriers = {
         occurrence.carrier_id: occurrence for occurrence in state.carrier_occurrences
     }
-    for gap_index, gap in enumerate(native_plan.gaps):
+    native_gap_refs: set[str] = set()
+    valid_native_carriers: set[str] = set()
+    last_native_part_by_anchor: dict[tuple[int, int, int], tuple[int, int]] = {}
+    for gap in native_plan.gaps:
         refs = tuple(
             source.by_identity.get(identity)
             for item in gap.occurrences
@@ -1109,6 +1183,7 @@ def _validate_native_gap_units(
             )
             continue
         resolved_refs = cast(tuple[str, ...], refs)
+        native_gap_refs.update(resolved_refs)
         gap_texts = [item.text for item in gap.occurrences]
         if all(isinstance(text, str) for text in gap_texts) and punctuation_only_text(
             "".join(cast(list[str], gap_texts))
@@ -1125,8 +1200,33 @@ def _validate_native_gap_units(
                         source_ref=ref,
                     )
             continue
+        punctuation_refs: set[str] = set()
+        ref_cursor = 0
+        for occurrences in _native_expected_part_groups(gap.occurrences):
+            group_refs = resolved_refs[ref_cursor : ref_cursor + len(occurrences)]
+            ref_cursor += len(occurrences)
+            group_text = (
+                "".join(str(occurrence.text) for occurrence in occurrences)
+                if all(occurrence.text is not None for occurrence in occurrences)
+                else ""
+            )
+            if group_text and punctuation_only_text(group_text):
+                punctuation_refs.update(group_refs)
+                for ref in group_refs:
+                    if state.selector_claims.get(ref):
+                        _audit_error(
+                            findings,
+                            "source_native_gap_suppression_invalid",
+                            "punctuation-only native leaf must not publish",
+                            source_ref=ref,
+                        )
+                continue
+        terminal_refs = punctuation_refs
+        emitted_refs = tuple(ref for ref in resolved_refs if ref not in terminal_refs)
+        if not emitted_refs:
+            continue
         owners: list[int] = []
-        for ref in resolved_refs:
+        for ref in emitted_refs:
             element = source.elements[ref]
             claims = state.selector_claims.get(ref, [])
             payload_claims = [claim for claim in claims if claim.role == "payload"]
@@ -1155,80 +1255,30 @@ def _validate_native_gap_units(
                     "source-native selector kind is not physical",
                     source_ref=ref,
                 )
-            if expected_field == "text" and ref not in state.searchable_payload_refs:
-                _audit_error(
-                    findings,
-                    "source_native_search_target_missing",
-                    "source-native text has no explicit search target",
-                    source_ref=ref,
-                )
         owner_orders = set(owners)
         unit = (
             units_by_order.get(next(iter(owner_orders)))
-            if len(owners) == len(resolved_refs) and len(owner_orders) == 1
+            if len(owners) == len(emitted_refs) and len(owner_orders) == 1
             else None
         )
         if unit is None:
             _audit_error(
                 findings,
                 "source_native_gap_unit_count_invalid",
-                "one maximal native gap requires exactly one unit, "
+                "one maximal native gap requires exactly one coarse owner, "
                 f"got {len(owner_orders)}",
             )
             continue
-        if unit.order_index in claimed_orders:
-            _audit_error(
-                findings,
-                "source_native_gap_unit_count_invalid",
-                "one unit cannot merge multiple native gaps",
-                unit_order=unit.order_index,
-            )
-            continue
-        claimed_orders.add(unit.order_index)
-        assigned[gap_index] = unit
-        anchor_heading_path: list[str] = []
-        # collected for the later context replay as well
-        anchor = gap.predecessor
-        if anchor is not None:
-            anchor_identity = source_ref_identity(anchor.source_ref)
-            anchor_ref = (
-                source.by_identity.get(anchor_identity)
-                if anchor_identity is not None
-                else None
-            )
-            anchor_claims = (
-                state.selector_claims.get(anchor_ref, [])
-                if anchor_ref is not None
-                else []
-            )
-            anchor_orders = {
-                claim.unit_order
-                for claim in anchor_claims
-                if claim.role == "payload"
-            }
-            if len(anchor_orders) == 1:
-                anchor_unit = units_by_order.get(next(iter(anchor_orders)))
-                if anchor_unit is not None:
-                    anchor_heading_path = list(anchor_unit.heading_path)
-        if state.refs_by_unit.get(unit.order_index, set()) != set(resolved_refs):
-            _audit_error(
-                findings,
-                "source_native_gap_membership_invalid",
-                "native gap unit does not exactly own its maximal "
-                "same-page occurrence set",
-                unit_order=unit.order_index,
-            )
-        anchor_paths[gap_index] = anchor_heading_path
-        _validate_native_gap_unit_shape(
-            unit,
-            gap=gap,
-            expected_refs=resolved_refs,
-            outer=carriers.get(f"unit:{unit.order_index}"),
-            findings=findings,
+        predecessor_owner = _native_anchor_owner_order(
+            gap.predecessor,
+            source=source,
+            state=state,
         )
-
-    for gap_index, unit in assigned.items():
-        gap = native_plan.gaps[gap_index]
+        successor_owner = _native_anchor_owner_order(
+            gap.successor,
+            source=source,
+            state=state,
+        )
         page_basis = native_plan.page_bases.get(gap.page_idx)
         if page_basis is None:
             _audit_error(
@@ -1238,19 +1288,106 @@ def _validate_native_gap_units(
                 unit_order=unit.order_index,
             )
             continue
-        graph = _unit_projection_graph(unit)
-        context = graph.get("physical_context") if graph is not None else None
-        if not _native_context_matches(
-            context,
-            gap=gap,
-            page_basis=page_basis,
-            anchor_heading_path=anchor_paths.get(gap_index, []),
+        root_owner = (
+            unit.heading_path == []
+            and unit.payload_kind == "mixed"
+            and unit.payload.get("semantic_type") == "document"
+        )
+        expected_owner = (
+            predecessor_owner
+            if gap.relation in {"bounded_by_same_source", "page_suffix"}
+            else (
+                predecessor_owner
+                if gap.relation == "between_mapped_sources"
+                and predecessor_owner is not None
+                and predecessor_owner == successor_owner
+                else None
+            )
+        )
+        if (
+            expected_owner is not None
+            and unit.order_index != expected_owner
+            and not root_owner
         ):
             _audit_error(
                 findings,
-                "source_native_physical_context_invalid",
-                "native gap physical context is not an exact replay",
+                "source_native_owner_invalid",
+                "native gap is neither in its proven owner nor conservatively "
+                "flattened to a document-root segment",
                 unit_order=unit.order_index,
+            )
+        if expected_owner is None and not root_owner:
+            _audit_error(
+                findings,
+                "source_native_owner_invalid",
+                "unresolved native gap must flatten to a document-root segment",
+                unit_order=unit.order_index,
+            )
+        root_fallback = root_owner and unit.order_index != expected_owner
+        if root_fallback:
+            root_order_valid = True
+            # A coalesced document-root owner may contain both the mapped
+            # anchor carrier and the native leaf.  Outer unit order cannot
+            # distinguish them; exact relative order is checked below against
+            # the mixed part indices.  Compare unit orders only when the
+            # anchor remains in a different durable owner.
+            if (
+                predecessor_owner is not None
+                and predecessor_owner != unit.order_index
+            ):
+                root_order_valid = unit.order_index > predecessor_owner
+            if (
+                root_order_valid
+                and page_basis == "native_proven"
+                and successor_owner is not None
+                and successor_owner != predecessor_owner
+                and successor_owner != unit.order_index
+            ):
+                root_order_valid = unit.order_index < successor_owner
+            if not root_order_valid:
+                _audit_error(
+                    findings,
+                    "source_native_linearization_invalid",
+                    "document-root native segment contradicts mapped anchors",
+                    unit_order=unit.order_index,
+                )
+        part_indices, carrier_ids = _validate_native_gap_parts(
+            unit,
+            gap=gap,
+            expected_refs=resolved_refs,
+            terminal_refs=terminal_refs,
+            outer=carriers.get(f"unit:{unit.order_index}"),
+            source=source,
+            page_basis=page_basis,
+            anchor_heading_path=list(unit.heading_path),
+            findings=findings,
+        )
+        valid_native_carriers.update(carrier_ids)
+        if part_indices:
+            predecessor_source_index = (
+                gap.predecessor.source_item_index
+                if gap.predecessor is not None
+                else -1
+            )
+            anchor_key = (
+                unit.order_index,
+                gap.page_idx,
+                predecessor_source_index,
+            )
+            previous = last_native_part_by_anchor.get(anchor_key)
+            if previous is not None and (
+                gap.word_order_span[0] <= previous[0]
+                or part_indices[0] <= previous[1]
+            ):
+                _audit_error(
+                    findings,
+                    "source_native_linearization_invalid",
+                    "native gaps sharing one anchor are not physically ordered",
+                    unit_order=unit.order_index,
+                )
+            last_native_part_by_anchor[anchor_key] = (
+                gap.word_order_span[0],
+                part_indices[-1],
             )
         if isinstance(unit.artifact_locator, Mapping) and (
             "review_reason" in unit.artifact_locator
@@ -1261,35 +1398,7 @@ def _validate_native_gap_units(
                 "placement has no review lane: review_reason is retired",
                 unit_order=unit.order_index,
             )
-
-    def gap_anchor_key(gap: _AuditedNativeGap) -> tuple[int, int, int]:
-        # Carriers always publish in provider order, so a gap's proven
-        # position is its predecessor anchor first, word order second; a
-        # page-global word order would wrongly reject conflict pages where
-        # provider order inverts the native word order.
-        anchor = (
-            gap.predecessor.source_item_index
-            if gap.predecessor is not None
-            else -1
-        )
-        return (gap.page_idx, anchor, gap.word_order_span[0])
-
-    publication_keys = [
-        gap_anchor_key(native_plan.gaps[gap_index])
-        for _order, gap_index in sorted(
-            (unit.order_index, gap_index)
-            for gap_index, unit in assigned.items()
-        )
-    ]
-    if publication_keys != sorted(publication_keys):
-        _audit_error(
-            findings,
-            "source_native_linearization_invalid",
-            "native gap publication order contradicts its proven anchors",
-        )
-    flagged_owner_orders: set[int] = set()
-    for gap_index, unit in assigned.items():
-        predecessor = native_plan.gaps[gap_index].predecessor
+        predecessor = gap.predecessor
         if predecessor is None:
             continue
         predecessor_identity = source_ref_identity(predecessor.source_ref)
@@ -1306,19 +1415,11 @@ def _validate_native_gap_units(
         owner_orders = {
             claim.unit_order for claim in claims if claim.role == "payload"
         }
-        if owner_orders and unit.order_index <= min(owner_orders):
-            _audit_error(
-                findings,
-                "source_native_linearization_invalid",
-                "native gap publishes before its predecessor carrier unit",
-                unit_order=unit.order_index,
-            )
-        if native_plan.gaps[gap_index].relation == "bounded_by_same_source":
+        if gap.relation == "bounded_by_same_source":
             # The audit re-derives the containment owner from its own
             # partition: proven interior words the owner's payload missed
             # mean the owner may not publish as a silent ok.
-            for owner_order in owner_orders - flagged_owner_orders:
-                flagged_owner_orders.add(owner_order)
+            for owner_order in owner_orders:
                 owner_unit = units_by_order.get(owner_order)
                 if owner_unit is not None and owner_unit.quality_status == "ok":
                     _audit_error(
@@ -1328,9 +1429,8 @@ def _validate_native_gap_units(
                         "unit to be marked for review",
                         unit_order=owner_order,
                     )
+
     for unit in units:
-        if unit.order_index in claimed_orders:
-            continue
         graph = _unit_projection_graph(unit)
         if graph is not None and (
             graph.get("physical_context") is not None or graph.get("search_atoms") != []
@@ -1338,80 +1438,208 @@ def _validate_native_gap_units(
             _audit_error(
                 findings,
                 "source_native_gap_membership_invalid",
-                "non-native unit cannot carry native gap context or retrieval runs",
+                "coarse owner cannot carry native gap context or retrieval runs",
+                unit_order=unit.order_index,
+            )
+        unit_refs = state.refs_by_unit.get(unit.order_index, set())
+        outer = carriers.get(f"unit:{unit.order_index}")
+        if outer is not None and isinstance(unit.payload.get("parts"), list):
+            for part, (_bindings, carrier_id) in zip(
+                cast(list[object], unit.payload["parts"]),
+                outer.container_parts,
+                strict=True,
+            ):
+                locator = (
+                    part.get("artifact_locator")
+                    if isinstance(part, Mapping)
+                    else None
+                )
+                child_graph = (
+                    locator.get("source_projection")
+                    if isinstance(locator, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(child_graph, Mapping)
+                    and child_graph.get("physical_context") is not None
+                    and carrier_id not in valid_native_carriers
+                ):
+                    _audit_error(
+                        findings,
+                        "source_native_physical_context_invalid",
+                        "ordinary owner leaf carries an unproved native context",
+                        unit_order=unit.order_index,
+                    )
+        if not (unit_refs & native_gap_refs):
+            continue
+        if outer is None or not outer.container_parts:
+            _audit_error(
+                findings,
+                "source_native_independent_unit_invalid",
+                "native evidence must be a mixed owner leaf, not a top-level gap",
+                unit_order=unit.order_index,
+            )
+            continue
+        native_only = all(
+            bool(bindings)
+            and all(
+                "_native_source_ref" in source.elements[ref]
+                for ref in bindings
+            )
+            for bindings, _carrier_id in outer.container_parts
+        )
+        if native_only and (
+            unit.heading_path != []
+            or unit.title is not None
+            or unit.applicability is not None
+            or unit.semantic_key != "document_content"
+            or unit.semantic_keys != ["document_content"]
+            or unit.payload.get("semantic_type") != "document"
+        ):
+            _audit_error(
+                findings,
+                "source_native_root_projection_invalid",
+                "native-only root segment cannot publish title, section, "
+                "applicability, or business taxonomy",
                 unit_order=unit.order_index,
             )
 
 
-def _validate_native_gap_unit_shape(
+def _validate_native_gap_parts(
     unit: AuditUnitView,
     *,
     gap: _AuditedNativeGap,
     expected_refs: tuple[str, ...],
+    terminal_refs: set[str],
     outer: _CarrierOccurrence | None,
+    source: _SourceIndex,
+    page_basis: str,
+    anchor_heading_path: list[str],
     findings: list[AuditFinding],
-) -> None:
-    graph = _unit_projection_graph(unit)
-    structure_invented = (
-        unit.payload_kind != "mixed"
-        or unit.title is not None
-        or unit.heading_path != []
-        or unit.applicability is not None
-        or unit.semantic_key != "document_content"
-        or unit.semantic_keys != ["document_content"]
-        or unit.payload.get("semantic_type") != "document"
-        or graph is None
-        or graph.get("heading_path") != []
-        or graph.get("structured") != []
-        or graph.get("provenance") != []
-        or graph.get("search_targets") != []
-    )
-    if structure_invented:
-        _audit_error(
-            findings,
-            "source_native_structure_invented",
-            "native gap stays untitled document-level evidence; heading "
-            "attribution may only mirror its proven anchor unit",
-            unit_order=unit.order_index,
-        )
-    if graph is None or not _native_search_atoms_match(
-        graph.get("search_atoms"),
-        gap,
-    ):
-        _audit_error(
-            findings,
-            "source_native_search_atoms_invalid",
-            "native search atoms differ from proved retrieval runs",
-            unit_order=unit.order_index,
-        )
+) -> tuple[list[int], set[str]]:
     parts = unit.payload.get("parts")
-    expected_bindings = tuple(frozenset({ref}) for ref in expected_refs)
-    bindings = (
-        tuple(binding for binding, _carrier_id in outer.container_parts)
-        if outer is not None
-        else ()
-    )
     if (
-        not isinstance(parts, list)
-        or len(parts) != len(gap.occurrences)
-        or bindings != expected_bindings
+        unit.payload_kind != "mixed"
+        or not isinstance(parts, list)
+        or outer is None
+        or len(outer.container_parts) != len(parts)
     ):
+        _audit_error(
+            findings,
+            "source_native_independent_unit_invalid",
+            "native gap requires leaves inside one mixed coarse owner",
+            unit_order=unit.order_index,
+        )
+        return [], set()
+
+    gap_ref_set = set(expected_refs) - terminal_refs
+    selected: list[tuple[int, Mapping[str, Any], frozenset[str], str]] = []
+    for owner_part_index, (part, (bindings, carrier_id)) in enumerate(
+        zip(parts, outer.container_parts, strict=True)
+    ):
+        overlap = set(bindings) & gap_ref_set
+        if not overlap:
+            continue
+        if set(bindings) - gap_ref_set or not isinstance(part, Mapping):
+            _audit_error(
+                findings,
+                "source_native_gap_membership_invalid",
+                "native leaf mixes one gap with another source",
+                unit_order=unit.order_index,
+            )
+            continue
+        if "/part:" not in carrier_id:
+            _audit_error(
+                findings,
+                "source_native_independent_unit_invalid",
+                "native claim is not owned by a mixed part",
+                unit_order=unit.order_index,
+            )
+        selected.append((owner_part_index, part, bindings, carrier_id))
+
+    if set().union(
+        *(set(bindings) for _index, _part, bindings, _carrier in selected)
+    ) != gap_ref_set:
         _audit_error(
             findings,
             "source_native_gap_membership_invalid",
-            "native gap parts do not exactly cover occurrences",
+            "native owner leaves do not exactly cover one maximal gap",
             unit_order=unit.order_index,
         )
-        return
-    for part_index, (part, occurrence) in enumerate(
-        zip(parts, gap.occurrences, strict=True)
+        return [], set()
+
+    selected_indices = [index for index, _part, _bindings, _carrier in selected]
+    if selected_indices != list(
+        range(selected_indices[0], selected_indices[-1] + 1)
     ):
-        expected_kind = "text" if occurrence.text is not None else "image"
+        _audit_error(
+            findings,
+            "source_native_linearization_invalid",
+            "one native gap is split by unrelated owner leaves",
+            unit_order=unit.order_index,
+        )
+
+    expected_groups: list[
+        tuple[tuple[SourceNativeOccurrence, ...], set[str]]
+    ] = []
+    ref_cursor = 0
+    for occurrences in _native_expected_part_groups(gap.occurrences):
+        group_refs = set(
+            expected_refs[ref_cursor : ref_cursor + len(occurrences)]
+        )
+        ref_cursor += len(occurrences)
+        terminal_overlap = group_refs & terminal_refs
+        if terminal_overlap:
+            if terminal_overlap != group_refs:
+                _audit_error(
+                    findings,
+                    "source_native_support_terminal_invalid",
+                    "one retrieval-run leaf cannot be partly terminal and partly payload",
+                    unit_order=unit.order_index,
+                )
+            continue
+        expected_groups.append((occurrences, group_refs))
+    if len(selected) != len(expected_groups):
+        _audit_error(
+            findings,
+            "source_native_gap_membership_invalid",
+            "native leaves do not preserve retrieval-run grouping",
+            unit_order=unit.order_index,
+        )
+        return selected_indices, {
+            carrier_id for _index, _part, _bindings, carrier_id in selected
+        }
+    for part_index, (
+        (_owner_part_index, part, bindings, _carrier_id),
+        (occurrences, expected_group_refs),
+    ) in enumerate(
+        zip(selected, expected_groups, strict=True)
+    ):
+        expected_kind = "text" if occurrences[0].text is not None else "image"
+        expected_text = (
+            "".join(str(occurrence.text) for occurrence in occurrences)
+            if expected_kind == "text"
+            else None
+        )
+        locator = part.get("artifact_locator")
+        child_graph = (
+            locator.get("source_projection") if isinstance(locator, Mapping) else None
+        )
+        payload_edge = (
+            child_graph.get("payload") if isinstance(child_graph, Mapping) else None
+        )
         if (
-            not isinstance(part, Mapping)
+            expected_text is not None
+            and isinstance(payload_edge, Mapping)
+            and str(payload_edge.get("transform", "")).startswith("safe_")
+        ):
+            safe_expected = semantic_payload_without_unsafe_glyphs(expected_text)
+            expected_text = safe_expected if isinstance(safe_expected, str) else None
+        if (
+            set(bindings) != expected_group_refs
             or part.get("kind") != expected_kind
-            or part.get("order") != occurrence.word_order
-            or (occurrence.text is not None and part.get("text") != occurrence.text)
+            or part.get("order") != occurrences[0].word_order
+            or (expected_text is not None and part.get("text") != expected_text)
             or part.get("heading_path", []) != []
             or part.get("applicability") is not None
         ):
@@ -1422,14 +1650,51 @@ def _validate_native_gap_unit_shape(
                 unit_order=unit.order_index,
             )
             continue
-        locator = part.get("artifact_locator")
-        child_graph = (
-            locator.get("source_projection") if isinstance(locator, Mapping) else None
+        expected_alternative = bool(
+            expected_text is not None
+            and _native_group_is_owner_search_alternative(
+                gap=gap,
+                text=expected_text,
+                source=source,
+            )
         )
+        alternative_shape_valid = (
+            part.get("representation_role")
+            == "unresolved_source_alternative"
+            and part.get("search_policy") == "none"
+            and part.get("quality_status") == "needs_review"
+        )
+        if expected_alternative != alternative_shape_valid or (
+            not expected_alternative
+            and (
+                "representation_role" in part
+                or "search_policy" in part
+            )
+        ):
+            _audit_error(
+                findings,
+                "source_native_alternative_role_invalid",
+                (
+                    "native leaf does not match its independently replayed "
+                    "owner-search role"
+                ),
+                unit_order=unit.order_index,
+            )
         if (
             not isinstance(child_graph, Mapping)
             or child_graph.get("search_atoms") != []
-            or child_graph.get("physical_context") is not None
+            or not _native_context_matches(
+                child_graph.get("physical_context"),
+                gap=gap,
+                page_basis=page_basis,
+                anchor_heading_path=anchor_heading_path,
+            )
+            or (
+                child_graph.get("search_targets")
+                != ([] if expected_alternative else ["payload.text"])
+                if expected_kind == "text"
+                else child_graph.get("search_targets") != []
+            )
         ):
             _audit_error(
                 findings,
@@ -1437,49 +1702,155 @@ def _validate_native_gap_unit_shape(
                 f"native gap part {part_index} source edge is not exact",
                 unit_order=unit.order_index,
             )
+    _validate_native_part_anchor_order(
+        unit,
+        gap=gap,
+        selected_indices=selected_indices,
+        outer=outer,
+        source=source,
+        page_basis=page_basis,
+        findings=findings,
+    )
+    return selected_indices, {
+        carrier_id for _index, _part, _bindings, carrier_id in selected
+    }
 
 
-def _native_search_atoms_match(
-    raw: object,
+def _native_group_is_owner_search_alternative(
+    *,
     gap: _AuditedNativeGap,
+    text: str,
+    source: _SourceIndex,
 ) -> bool:
-    if not isinstance(raw, list):
+    """Recompute a coarse-owner search redirect without claiming an alias."""
+
+    predecessor = gap.predecessor
+    successor = gap.successor
+    if (
+        gap.relation != "bounded_by_same_source"
+        or predecessor is None
+        or successor is None
+        or predecessor.source_item_index != successor.source_item_index
+    ):
         return False
-    expected: list[tuple[str, int, int] | None] = []
-    for occurrence in gap.occurrences:
-        if occurrence.text is None:
-            continue
-        run = occurrence.retrieval_run
-        key = (
-            None
-            if run is None
-            else (
-                cast(str, occurrence.source_ref["source_evidence_sha256"]),
-                *run,
-            )
+    owner_ref = source.by_source_item_index.get(predecessor.source_item_index)
+    if owner_ref is None:
+        return False
+    residual = strict_source_comparison_text(text)
+    if not residual or punctuation_only_text(text):
+        return False
+    return any(
+        residual in surface
+        for surface in source_carrier_search_surfaces(source.elements[owner_ref])
+    )
+
+
+def _native_anchor_owner_order(
+    anchor: SourceMappedAnchor | None,
+    *,
+    source: _SourceIndex,
+    state: _CoverageState,
+) -> int | None:
+    ref = _native_anchor_ref(anchor, source=source)
+    if ref is None:
+        return None
+    owners = {
+        claim.unit_order
+        for claim in state.selector_claims.get(ref, ())
+        if claim.role == "payload"
+    }
+    return next(iter(owners)) if len(owners) == 1 else None
+
+
+def _native_anchor_ref(
+    anchor: SourceMappedAnchor | None,
+    *,
+    source: _SourceIndex,
+) -> str | None:
+    if anchor is None:
+        return None
+    identity = source_ref_identity(anchor.source_ref)
+    return source.by_identity.get(identity) if identity is not None else None
+
+
+def _validate_native_part_anchor_order(
+    unit: AuditUnitView,
+    *,
+    gap: _AuditedNativeGap,
+    selected_indices: list[int],
+    outer: _CarrierOccurrence,
+    source: _SourceIndex,
+    page_basis: str,
+    findings: list[AuditFinding],
+) -> None:
+    if not selected_indices:
+        return
+
+    def bound_part_index(ref: str | None) -> int | None:
+        if ref is None:
+            return None
+        indices = [
+            index
+            for index, (bindings, _carrier_id) in enumerate(outer.container_parts)
+            if ref in bindings
+        ]
+        return indices[0] if len(indices) == 1 else None
+
+    predecessor_index = bound_part_index(
+        _native_anchor_ref(gap.predecessor, source=source)
+    )
+    successor_index = bound_part_index(
+        _native_anchor_ref(gap.successor, source=source)
+    )
+    valid = True
+    if predecessor_index is not None:
+        valid = selected_indices[0] > predecessor_index
+    if (
+        valid
+        and page_basis == "native_proven"
+        and gap.relation == "between_mapped_sources"
+        and successor_index is not None
+        and successor_index != predecessor_index
+    ):
+        valid = selected_indices[-1] < successor_index
+    if (
+        valid
+        and gap.relation == "page_prefix"
+        and successor_index is not None
+        and page_basis == "native_proven"
+    ):
+        valid = selected_indices[-1] < successor_index
+    if not valid:
+        _audit_error(
+            findings,
+            "source_native_linearization_invalid",
+            "native owner leaves contradict their mapped anchors",
+            unit_order=unit.order_index,
         )
-        if key is None or not expected or key != expected[-1]:
-            expected.append(key)
-    actual: list[tuple[str, int, int] | None] = []
-    for entry in raw:
-        boundary = entry.get("boundary") if isinstance(entry, Mapping) else None
-        if not isinstance(boundary, Mapping):
-            return False
-        if boundary.get("kind") == "source_occurrence_singleton":
-            actual.append(None)
+
+
+def _native_expected_part_groups(
+    occurrences: tuple[SourceNativeOccurrence, ...],
+) -> tuple[tuple[SourceNativeOccurrence, ...], ...]:
+    groups: list[tuple[SourceNativeOccurrence, ...]] = []
+    pending: list[SourceNativeOccurrence] = []
+    for occurrence in occurrences:
+        if occurrence.text is None:
+            if pending:
+                groups.append(tuple(pending))
+                pending.clear()
+            groups.append((occurrence,))
             continue
-        evidence_hash = boundary.get("source_evidence_sha256")
-        page_idx, run_index = boundary.get("page_idx"), boundary.get("run_index")
-        if (
-            not isinstance(evidence_hash, str)
-            or not isinstance(page_idx, int)
-            or isinstance(page_idx, bool)
-            or not isinstance(run_index, int)
-            or isinstance(run_index, bool)
+        if pending and (
+            occurrence.retrieval_run is None
+            or occurrence.retrieval_run != pending[-1].retrieval_run
         ):
-            return False
-        actual.append((evidence_hash, page_idx, run_index))
-    return actual == expected
+            groups.append(tuple(pending))
+            pending.clear()
+        pending.append(occurrence)
+    if pending:
+        groups.append(tuple(pending))
+    return tuple(groups)
 
 
 def _native_context_matches(
@@ -1602,7 +1973,11 @@ def _collect_unit_coverage(
         state.refs_by_unit[unit.order_index] = set(payload_refs)
         for ref in payload_refs:
             element = source.elements[ref]
-            if element.get("kind") == "table":
+            if element.get("kind") == "table" and _carrier_projects_table(
+                state,
+                carrier_id=f"unit:{unit.order_index}",
+                ref=ref,
+            ):
                 state.table_payloads[ref].append(
                     (f"unit:{unit.order_index}", unit.payload)
                 )
@@ -1725,7 +2100,11 @@ def _collect_unit_coverage(
             state.refs_by_unit[unit.order_index].update(part_payload_refs)
             for ref in part_payload_refs:
                 element = source.elements[ref]
-                if element.get("kind") == "table":
+                if element.get("kind") == "table" and _carrier_projects_table(
+                    state,
+                    carrier_id=carrier_id,
+                    ref=ref,
+                ):
                     state.table_payloads[ref].append((carrier_id, part))
                 if element.get("kind") in {"image", "equation"} or (
                     is_visual_only_table_element(element)
@@ -1757,6 +2136,20 @@ def _collect_unit_coverage(
     return state
 
 
+def _carrier_projects_table(
+    state: _CoverageState,
+    *,
+    carrier_id: str,
+    ref: str,
+) -> bool:
+    return any(
+        projection.carrier_id == carrier_id
+        and projection.kind == "table_identity"
+        and any(selector.ref == ref and selector.kind == "table" for selector in projection.selectors)
+        for projection in state.payload_projections
+    )
+
+
 def _validate_mixed_container_envelope(
     unit: AuditUnitView,
     *,
@@ -1774,6 +2167,16 @@ def _validate_mixed_container_envelope(
             unit=unit,
             code="mixed_container_semantic_type_invalid",
             message="mixed semantic_type must be document or section",
+        )
+    if unit.payload.get("order_status") != "unresolved_physical_fallback":
+        _projection_finding(
+            findings,
+            unit=unit,
+            code="mixed_container_order_status_invalid",
+            message=(
+                "mixed parts expose stable source order only; exact reading "
+                "order is not claimed"
+            ),
         )
     intervals: list[tuple[int, int]] = []
     non_furniture_parts = 0
@@ -1809,6 +2212,28 @@ def _validate_mixed_container_envelope(
             }
         )
         if not source_orders:
+            native_orders = sorted(
+                {
+                    int(source.elements[ref]["_native_word_order"])
+                    for ref in refs
+                    if isinstance(
+                        source.elements[ref].get("_native_word_order"), int
+                    )
+                    and not isinstance(
+                        source.elements[ref].get("_native_word_order"), bool
+                    )
+                }
+            )
+            if native_orders and part.get("order") != native_orders[0]:
+                _projection_finding(
+                    findings,
+                    unit=unit,
+                    code="mixed_part_order_invalid",
+                    message=(
+                        "native mixed part order must equal its first physical "
+                        "word order"
+                    ),
+                )
             continue
         interval = (source_orders[0], source_orders[-1])
         intervals.append(interval)
@@ -1850,12 +2275,13 @@ def _build_structure_proof_index(
     normalized_ir: Mapping[str, Any],
     *,
     source: _SourceIndex,
+    source_proof: SourceEvidenceProof,
     findings: list[AuditFinding],
 ) -> _StructureProofIndex:
     raw_elements = normalized_ir.get("elements")
     source_hash = normalized_ir.get("source_pdf_sha256")
     if not isinstance(raw_elements, list):
-        return _StructureProofIndex({}, frozenset())
+        return _StructureProofIndex({}, frozenset(), ())
     try:
         proof = validate_document_structure(
             normalized_ir.get("structure_proof"),
@@ -1870,7 +2296,7 @@ def _build_structure_proof_index(
             "structure_proof_invalid",
             f"{exc.reason_code}: {exc}",
         )
-        return _StructureProofIndex({}, frozenset())
+        return _StructureProofIndex({}, frozenset(), ())
 
     headings: dict[int, _ProofHeading] = {}
     for raw_heading in proof["headings"]:
@@ -1916,7 +2342,367 @@ def _build_structure_proof_index(
         for frame in proof["page_frames"]
         for source_index in frame["member_source_item_indices"]
     )
-    return _StructureProofIndex(headings, frames)
+    scope_breaks_list: list[_ProofOwnerScopeBreak] = []
+    for value in proof.get("owner_scope_breaks", []):
+        boundary = value["boundary_source_ref"]
+        source_index = int(boundary["source_item_index"])
+        scope_break = _ProofOwnerScopeBreak(
+            boundary_source_item_index=source_index,
+            boundary_ref=source.by_source_item_index[source_index],
+            boundary_field=str(boundary["field"]),
+            boundary_index=(
+                int(boundary["index"])
+                if boundary.get("index") is not None
+                else None
+            ),
+            boundary_text_span=(
+                int(boundary["text_span"][0]),
+                int(boundary["text_span"][1]),
+            ),
+            boundary_value_sha256=str(boundary["value_sha256"]),
+            page_index=int(boundary["page_index"]),
+            eligibility_basis=str(value["eligibility_basis"]),
+            relative_rank=str(value["relative_rank"]),
+            current_owner_node_id=int(value["current_owner_node_id"]),
+            target_node_id=(
+                int(value["target_node_id"])
+                if value["target_node_id"] is not None
+                else None
+            ),
+            boundary_carrier_scope=str(value["boundary_carrier_scope"]),
+            source_atom_orders=tuple(
+                int(order) for order in value["source_atom_orders"]
+            ),
+        )
+        _validate_owner_scope_break_witness(
+            scope_break,
+            source=source,
+            source_proof=source_proof,
+            headings=headings,
+            findings=findings,
+        )
+        scope_breaks_list.append(scope_break)
+    scope_breaks = tuple(scope_breaks_list)
+    return _StructureProofIndex(headings, frames, scope_breaks)
+
+
+def _validate_owner_scope_break_witness(
+    scope_break: _ProofOwnerScopeBreak,
+    *,
+    source: _SourceIndex,
+    source_proof: SourceEvidenceProof,
+    headings: Mapping[int, _ProofHeading],
+    findings: list[AuditFinding],
+) -> None:
+    page = next(
+        (item for item in source_proof.pages if item.page_idx == scope_break.page_index),
+        None,
+    )
+    selected = (
+        _mapped_selector_events(
+            page,
+            source_item_index=scope_break.boundary_source_item_index,
+            field=scope_break.boundary_field,
+            index=scope_break.boundary_index,
+        )
+        if page is not None
+        else ()
+    )
+    source_value = _proof_source_text(
+        source.elements[scope_break.boundary_ref],
+        field=scope_break.boundary_field,
+        index=scope_break.boundary_index,
+    )
+    spans = sorted(event.selector_char_span for event in selected)
+    expected_span_end = len(comparison_text(source_value))
+    exact_spans = bool(
+        spans
+        and spans[0][0] == 0
+        and spans[-1][1] == expected_span_end
+        and all(left[1] == right[0] for left, right in zip(spans, spans[1:]))
+    )
+    if (
+        page is None
+        or tuple(event.word_order for event in selected)
+        != scope_break.source_atom_orders
+        or any(event.source_item_index != scope_break.boundary_source_item_index for event in selected)
+        or not exact_spans
+        or not _events_are_closed_native_lines(page, selected)
+    ):
+        _audit_error(
+            findings,
+            "owner_scope_break_source_witness_invalid",
+            "owner scope break atoms do not close over one exact native selector",
+            source_ref=scope_break.boundary_ref,
+        )
+        return
+
+    if scope_break.eligibility_basis == "numbered_caption_native_break":
+        caption_boxes = {event.carrier_bbox for event in selected}
+        body = _mapped_selector_events(
+            page,
+            source_item_index=scope_break.boundary_source_item_index,
+            field="table_html",
+            index=None,
+        )
+        body_boxes = {event.carrier_bbox for event in body}
+        geometry_valid = len(caption_boxes) == len(body_boxes) == 1
+        if geometry_valid:
+            caption_box = next(iter(caption_boxes))
+            body_box = next(iter(body_boxes))
+            geometry_valid = not _positive_bbox_overlap(caption_box, body_box)
+            if scope_break.boundary_carrier_scope == "selected_and_same_carrier":
+                geometry_valid = geometry_valid and caption_box[3] <= body_box[1]
+            else:
+                successor = _mapped_selector_events(
+                    page,
+                    source_item_index=(
+                        scope_break.boundary_source_item_index + 1
+                    ),
+                    field="table_html",
+                    index=None,
+                )
+                successor_boxes = {event.carrier_bbox for event in successor}
+                geometry_valid = bool(
+                    geometry_valid
+                    and body_box[3] <= caption_box[1]
+                    and len(successor_boxes) == 1
+                    and caption_box[3] <= next(iter(successor_boxes))[1]
+                )
+        geometry_valid = geometry_valid and _numbered_break_layout_valid(
+            selected,
+            page=page,
+            source_proof=source_proof,
+        )
+        if not geometry_valid:
+            _audit_error(
+                findings,
+                "owner_scope_break_geometry_invalid",
+                "numbered owner break scope differs from exact native geometry",
+                source_ref=scope_break.boundary_ref,
+            )
+    else:
+        owner = headings.get(scope_break.current_owner_node_id)
+        owner_events = tuple(
+            event
+            for ref in (() if owner is None else owner.source_refs)
+            for event in _mapped_selector_events(
+                next(
+                    (
+                        item
+                        for item in source_proof.pages
+                        if item.page_idx
+                        == int(source.elements[ref.ref].get("page_idx", -1))
+                    ),
+                    None,
+                ),
+                source_item_index=int(
+                    source.elements[ref.ref]["source_item_index"]
+                ),
+                field=ref.field,
+                index=ref.index,
+            )
+        )
+        if not _same_native_display_family(
+            selected,
+            owner_events,
+            source_proof=source_proof,
+        ):
+            _audit_error(
+                findings,
+                "owner_scope_break_layout_invalid",
+                "unnumbered owner break does not repeat its accepted native style",
+                source_ref=scope_break.boundary_ref,
+            )
+
+
+def _mapped_selector_events(
+    page: object,
+    *,
+    source_item_index: int,
+    field: str,
+    index: int | None,
+) -> tuple[MappedSourceEvent, ...]:
+    events = getattr(page, "events", ())
+    return tuple(
+        sorted(
+            (
+                event
+                for event in events
+                if isinstance(event, MappedSourceEvent)
+                and event.source_item_index == source_item_index
+                and event.selector_field == field
+                and event.selector_index == index
+            ),
+            key=lambda event: event.word_order,
+        )
+    )
+
+
+def _events_are_closed_native_lines(
+    page: object,
+    selected: tuple[MappedSourceEvent, ...],
+) -> bool:
+    if not selected:
+        return False
+    selected_lines = {event.native_layout_path[:3] for event in selected}
+    all_events = getattr(page, "events", ())
+    selected_orders = {event.word_order for event in selected}
+    complete_orders = {
+        event.word_order
+        for event in all_events
+        if isinstance(event, (MappedSourceEvent, NativeTextEvent))
+        and (
+            event.native_layout_path[:3]
+            if isinstance(event, MappedSourceEvent)
+            else event.layout_path[:3]
+        )
+        in selected_lines
+    }
+    return selected_orders == complete_orders
+
+
+def _positive_bbox_overlap(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> bool:
+    return min(left[2], right[2]) > max(left[0], right[0]) and min(
+        left[3], right[3]
+    ) > max(left[1], right[1])
+
+
+def _native_line_metrics(
+    events: Iterable[MappedSourceEvent],
+) -> tuple[tuple[tuple[float, float, float, float], float], ...]:
+    by_line: dict[tuple[int, int, int], list[MappedSourceEvent]] = defaultdict(list)
+    for event in events:
+        by_line[event.native_layout_path[:3]].append(event)
+    return tuple(
+        (
+            (
+                min(event.atom_bbox[0] for event in line),
+                min(event.atom_bbox[1] for event in line),
+                max(event.atom_bbox[2] for event in line),
+                max(event.atom_bbox[3] for event in line),
+            ),
+            statistics.median(
+                event.atom_bbox[3] - event.atom_bbox[1] for event in line
+            ),
+        )
+        for line in by_line.values()
+    )
+
+
+def _page_line_heights(page: object) -> tuple[float, ...]:
+    by_line: dict[tuple[int, int, int], list[tuple[float, float, float, float]]] = (
+        defaultdict(list)
+    )
+    for event in getattr(page, "events", ()):
+        if isinstance(event, MappedSourceEvent):
+            by_line[event.native_layout_path[:3]].append(event.atom_bbox)
+        elif isinstance(event, NativeTextEvent):
+            by_line[event.layout_path[:3]].append(event.bbox)
+    return tuple(
+        statistics.median(box[3] - box[1] for box in boxes)
+        for boxes in by_line.values()
+    )
+
+
+def _numbered_break_layout_valid(
+    events: tuple[MappedSourceEvent, ...],
+    *,
+    page: object,
+    source_proof: SourceEvidenceProof,
+) -> bool:
+    metrics = _native_line_metrics(events)
+    if not metrics:
+        return False
+    all_lefts = sorted(
+        box[0]
+        for proof_page in source_proof.pages
+        for box, _height in _native_line_metrics(
+            tuple(
+                event
+                for event in proof_page.events
+                if isinstance(event, MappedSourceEvent)
+            )
+        )
+    )
+    document_left = all_lefts[int((len(all_lefts) - 1) * 0.05)] if all_lefts else 0
+    near_left = metrics[0][0][0] <= document_left + 5 * metrics[0][1]
+    page_width = getattr(page, "width", None)
+    centered = isinstance(page_width, float) and all(
+        abs(box[0] - (page_width - box[2])) <= 2 * height
+        for box, height in metrics
+    )
+    heights = _page_line_heights(page)
+    modal = (
+        Counter(round(height, 2) for height in heights).most_common(1)[0][0]
+        if heights
+        else 0
+    )
+    display = all(round(height, 2) > modal for _box, height in metrics)
+    return near_left or (centered and display)
+
+
+def _same_native_display_family(
+    candidate: tuple[MappedSourceEvent, ...],
+    owner: tuple[MappedSourceEvent, ...],
+    *,
+    source_proof: SourceEvidenceProof,
+) -> bool:
+    candidate_metrics = _native_line_metrics(candidate)
+    owner_metrics = _native_line_metrics(owner)
+    if not candidate_metrics or len(candidate_metrics) != len(owner_metrics):
+        return False
+    candidate_page = next(
+        (page for page in source_proof.pages if candidate[0] in page.events),
+        None,
+    )
+    owner_page = next(
+        (page for page in source_proof.pages if owner and owner[0] in page.events),
+        None,
+    )
+    if candidate_page is None or owner_page is None:
+        return False
+
+    def display_line(
+        metrics: tuple[tuple[tuple[float, float, float, float], float], ...],
+        page: object,
+        *,
+        require_display_height: bool,
+    ) -> bool:
+        width = getattr(page, "width", None)
+        height = getattr(page, "height", None)
+        if not isinstance(width, float) or not isinstance(height, float):
+            return False
+        centered = all(
+            abs(box[0] - (width - box[2])) <= 2 * line_height
+            for box, line_height in metrics
+        )
+        page_front = max(box[3] for box, _line_height in metrics) <= height * 0.38
+        if not require_display_height:
+            return centered and page_front
+        line_heights = _page_line_heights(page)
+        modal = (
+            Counter(round(value, 2) for value in line_heights).most_common(1)[0][0]
+            if line_heights
+            else 0
+        )
+        return centered and page_front and all(
+            round(value, 2) > modal for _box, value in metrics
+        )
+
+    return bool(
+        _events_are_closed_native_lines(candidate_page, candidate)
+        and _events_are_closed_native_lines(owner_page, owner)
+        and display_line(candidate_metrics, candidate_page, require_display_height=False)
+        and display_line(owner_metrics, owner_page, require_display_height=True)
+        and [round(value, 2) for _box, value in candidate_metrics]
+        == [round(value, 2) for _box, value in owner_metrics]
+        and len({event.native_layout_path[:2] for event in candidate})
+        == len({event.native_layout_path[:2] for event in owner})
+    )
 
 
 def _validate_structure_projections(
@@ -1936,6 +2722,7 @@ def _validate_structure_projections(
     def proved_path(
         refs: frozenset[str],
         *,
+        carrier_id: str,
         unit_order: int,
     ) -> tuple[_ProofHeading, ...] | None:
         if not refs or all(
@@ -1947,6 +2734,8 @@ def _validate_structure_projections(
             source=source,
             structure=structure,
             paths=paths,
+            state=state,
+            carrier_id=carrier_id,
             findings=findings,
             unit_order=unit_order,
         )
@@ -1965,6 +2754,7 @@ def _validate_structure_projections(
         if semantic_type is None:
             expected = proved_path(
                 occurrence.payload_refs,
+                carrier_id=occurrence.carrier_id,
                 unit_order=occurrence.unit_order,
             )
             if expected is None:
@@ -1974,8 +2764,16 @@ def _validate_structure_projections(
             for part_refs, carrier_id in occurrence.container_parts:
                 if not part_refs:
                     continue
+                if all(
+                    "_native_source_ref" in source.elements[ref]
+                    for ref in part_refs
+                ):
+                    # Native recovery leaves inherit the already verified
+                    # coarse owner. They are not new structure-proof claims.
+                    continue
                 part_path = proved_path(
                     part_refs,
+                    carrier_id=carrier_id,
                     unit_order=occurrence.unit_order,
                 )
                 if part_path is None:
@@ -2073,6 +2871,8 @@ def _proved_exact_path(
     source: _SourceIndex,
     structure: _StructureProofIndex,
     paths: Mapping[int, tuple[_ProofHeading, ...]],
+    state: _CoverageState,
+    carrier_id: str,
     findings: list[AuditFinding],
     unit_order: int,
 ) -> tuple[_ProofHeading, ...] | None:
@@ -2107,6 +2907,34 @@ def _proved_exact_path(
             )
             carrier_paths.append(())
             continue
+        applicable = [
+            scope_break
+            for scope_break in structure.owner_scope_breaks
+            if scope_break.current_owner_node_id == owner.node_id
+            and owner.section_start
+            < scope_break.boundary_source_item_index
+            <= source_index
+        ]
+        if applicable:
+            latest = max(
+                applicable,
+                key=lambda item: item.boundary_source_item_index,
+            )
+            if source_index != latest.boundary_source_item_index or (
+                latest.boundary_carrier_scope == "selected_and_same_carrier"
+                or _carrier_selects_owner_boundary(
+                    state,
+                    carrier_id=carrier_id,
+                    scope_break=latest,
+                    findings=findings,
+                    unit_order=unit_order,
+                )
+            ):
+                owner_path = (
+                    paths[latest.target_node_id]
+                    if latest.target_node_id is not None
+                    else ()
+                )
         carrier_paths.append(owner_path)
     if not carrier_paths:
         return ()
@@ -2124,6 +2952,42 @@ def _proved_exact_path(
         )
         return None
     return expected
+
+
+def _carrier_selects_owner_boundary(
+    state: _CoverageState,
+    *,
+    carrier_id: str,
+    scope_break: _ProofOwnerScopeBreak,
+    findings: list[AuditFinding],
+    unit_order: int,
+) -> bool:
+    selectors = [
+        selector
+        for projection in state.payload_projections
+        if projection.carrier_id == carrier_id
+        for selector in projection.selectors
+        if selector.ref == scope_break.boundary_ref
+    ]
+    selected = [
+        selector
+        for selector in selectors
+        if selector.kind == scope_break.boundary_field
+        and selector.field.get("index") == scope_break.boundary_index
+        and tuple(selector.field.get("char_span", ()))
+        == scope_break.boundary_text_span
+        and selector.field.get("value_sha256")
+        == scope_break.boundary_value_sha256
+    ]
+    if selected and len(selectors) != len(selected):
+        _audit_error(
+            findings,
+            "owner_scope_break_selector_mixed",
+            "selected-only boundary carrier also owns old-scope representations",
+            source_ref=scope_break.boundary_ref,
+            unit_order=unit_order,
+        )
+    return len(selected) == 1 and len(selectors) == 1
 
 
 def _heading_projection_matches_proof(
@@ -2820,6 +3684,19 @@ def _collect_projection_graph(
             code="provenance_projection_invalid",
             message="fresh source projections do not support provenance aliases",
         )
+    primary_required = requires_primary_search_leaf(
+        payload_kind=payload_kind,
+        payload=payload,
+    )
+    if (
+        payload_kind == "text"
+        and payload.get("representation_role")
+        == "unresolved_source_alternative"
+        and payload.get("search_policy") == "none"
+    ):
+        state.non_primary_source_alternative_count += 1
+    if primary_required:
+        state.required_search_carriers.add(carrier_id)
     try:
         search_values = search_text_values(
             payload_kind=payload_kind,
@@ -2833,7 +3710,27 @@ def _collect_projection_graph(
             code="search_target_contract_invalid",
             message=str(exc),
         )
+        if primary_required:
+            _projection_finding(
+                findings,
+                unit=unit,
+                code="primary_search_leaf_missing",
+                message="reader-visible carrier has no closed primary search leaf",
+            )
     else:
+        state.primary_search_leaf_count += len(search_values)
+        if primary_required:
+            if search_values:
+                state.closed_search_carriers.add(carrier_id)
+            else:
+                _projection_finding(
+                    findings,
+                    unit=unit,
+                    code="primary_search_leaf_missing",
+                    message=(
+                        "reader-visible carrier has no closed primary search leaf"
+                    ),
+                )
         if search_values:
             state.searchable_payload_refs.update(local_roles["payload"])
     state.carrier_occurrences.append(
@@ -3193,24 +4090,32 @@ def _validate_payload_projection_value(
         "text_identity",
         "text_concat",
     }:
+        safe = projection.transform.startswith("safe_")
+        transform = (
+            projection.transform.removeprefix("safe_")
+            if safe
+            else projection.transform
+        )
         values = [str(item.value).strip() for item in projection.selectors]
-        if projection.kind == "text_concat" and projection.transform in {
+        if projection.kind == "text_concat" and transform in {
             "ordered_text_concat.v1",
             "ordered_visible_fields.v1",
         }:
             expected = "\n".join(values)
         elif (
             projection.kind == "text_concat"
-            and projection.transform == "exact_concat.v1"
+            and transform == "exact_concat.v1"
         ):
             expected = "".join(values)
-        elif len(values) == 1 and projection.transform in {
+        elif len(values) == 1 and transform in {
             "clean_text.v1",
             "ordered_visible_fields.v1",
         }:
             expected = values[0]
         else:
             expected = None
+        if safe and expected is not None:
+            expected = semantic_payload_without_unsafe_glyphs(expected)
         if expected is None or expected != projection.target_value:
             _audit_error(
                 findings,
@@ -3223,7 +4128,15 @@ def _validate_payload_projection_value(
             )
     elif projection.kind == "text_identity_exact":
         selected = "".join(str(item.value) for item in projection.selectors)
-        if projection.transform != "identity.v1" or selected != projection.target_value:
+        expected = (
+            semantic_payload_without_unsafe_glyphs(selected)
+            if projection.transform == "safe_identity.v1"
+            else selected
+        )
+        if (
+            projection.transform not in {"identity.v1", "safe_identity.v1"}
+            or expected != projection.target_value
+        ):
             _audit_error(
                 findings,
                 "payload_projection_mismatch",
@@ -3280,7 +4193,12 @@ def _table_projection_matches(projection: _ResolvedPayloadProjection) -> bool:
     if len(grids) != 1 or not isinstance(grids[0].value, dict):
         return False
     table = grids[0].value
-    expected = {
+    if projection.transform not in {
+        "table_identity.v1",
+        "safe_table_identity.v1",
+    }:
+        return False
+    expected: dict[str, Any] = {
         "caption": [
             str(selector.value)
             for selector in projection.selectors
@@ -3297,6 +4215,11 @@ def _table_projection_matches(projection: _ResolvedPayloadProjection) -> bool:
     }
     if "cells" in table:
         expected["cells"] = [dict(value) for value in table.get("cells") or []]
+    if projection.transform == "safe_table_identity.v1":
+        safe_expected = semantic_payload_without_unsafe_glyphs(expected)
+        if not isinstance(safe_expected, dict):
+            return False
+        expected = safe_expected
     supported = {"table", "table_caption", "table_note"}
     if any(selector.kind not in supported for selector in projection.selectors):
         return False
@@ -3308,10 +4231,16 @@ def _table_projection_matches(projection: _ResolvedPayloadProjection) -> bool:
     return _table_media_projection_matches(
         table.get("embedded_media"),
         payload.get("embedded_media"),
+        safe=projection.transform == "safe_table_identity.v1",
     )
 
 
-def _table_media_projection_matches(source: object, target: object) -> bool:
+def _table_media_projection_matches(
+    source: object,
+    target: object,
+    *,
+    safe: bool = False,
+) -> bool:
     if source is None:
         return target is None
     if (
@@ -3328,6 +4257,11 @@ def _table_media_projection_matches(source: object, target: object) -> bool:
             for key, value in raw_source.items()
             if key not in {"artifact_role", "image_path"}
         }
+        if safe:
+            safe_expected = semantic_payload_without_unsafe_glyphs(expected)
+            if not isinstance(safe_expected, dict):
+                return False
+            expected = safe_expected
         if (
             set(raw_target) != {*expected, "image_ref"}
             or any(raw_target.get(key) != value for key, value in expected.items())
@@ -3877,6 +4811,26 @@ def _validate_units(
             "unit order_index values must be unique, contiguous, and ordered",
         )
     for unit in units:
+        unsafe = [
+            *(
+                unsafe_semantic_characters(unit.title)
+                if isinstance(unit.title, str)
+                else ()
+            ),
+            *(
+                char
+                for segment in unit.heading_path
+                for char in unsafe_semantic_characters(segment)
+            ),
+            *_unsafe_payload_characters(unit.payload),
+        ]
+        if unsafe:
+            _audit_error(
+                findings,
+                "unsafe_semantic_glyph_published",
+                "private-use, replacement, control, or display-placeholder glyph leaked into semantic output",
+                unit_order=unit.order_index,
+            )
         try:
             validate_semantic_key_state(unit.semantic_key, unit.semantic_keys)
         except SemanticKeyInvariantError as exc:
@@ -3915,6 +4869,25 @@ def _validate_units(
             document_title=document_title,
             findings=findings,
         )
+
+
+def _unsafe_payload_characters(value: object) -> list[str]:
+    if isinstance(value, str):
+        return list(unsafe_semantic_characters(value))
+    if isinstance(value, Mapping):
+        return [
+            char
+            for key, item in value.items()
+            if key != "artifact_locator"
+            for char in _unsafe_payload_characters(item)
+        ]
+    if isinstance(value, list):
+        return [
+            char
+            for item in value
+            for char in _unsafe_payload_characters(item)
+        ]
+    return []
 
 
 def _validate_title_projection(
@@ -4035,7 +5008,9 @@ def _payload_primary_text(kind: str, payload: dict[str, Any]) -> str:
             ]
             return "\n".join(value for value in values if value)
         value = payload.get("text")
-        return value if isinstance(value, str) else ""
+        if isinstance(value, str):
+            return value
+        return "\n".join(_string_list(payload.get("caption")))
     return ""
 
 
