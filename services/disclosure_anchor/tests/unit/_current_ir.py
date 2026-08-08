@@ -434,7 +434,11 @@ def write_text_ir_bundle(
     }
     normalized_ir["parser_diagnostics"] = {
         "table_reconciliation": {
-            "algorithm_version": "mineru-page-local-table-closure.v6",
+            "algorithm_version": "mineru-page-local-table-closure.v7",
+                "comparison_contract": (
+                    "reader-visible-table-projection.v1"
+                ),
+                "projection_root": "sha256:" + "c" * 64,
             "model_hash": _sha256(files["model"][1]),
             "content_tables": 0,
             "model_tables": 0,

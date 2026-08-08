@@ -377,6 +377,10 @@
    "private_imports": [],
    "tests": 12
   },
+  "tests/unit/test_table_projection_comparison.py": {
+   "private_imports": [],
+   "tests": 19
+  },
   "tests/unit/test_track_companies.py": {
    "private_imports": [],
    "tests": 15

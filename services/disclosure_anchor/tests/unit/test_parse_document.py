@@ -279,7 +279,11 @@ class _Parser:
             "elements": elements,
             "parser_diagnostics": {
                 "table_reconciliation": {
-                    "algorithm_version": "mineru-page-local-table-closure.v6",
+                    "algorithm_version": "mineru-page-local-table-closure.v7",
+                "comparison_contract": (
+                    "reader-visible-table-projection.v1"
+                ),
+                "projection_root": "sha256:" + "c" * 64,
                     "model_hash": ("sha256:" + hashlib.sha256(b"[]").hexdigest()),
                     "content_tables": 0,
                     "model_tables": 0,

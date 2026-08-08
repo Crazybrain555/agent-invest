@@ -58,6 +58,7 @@ from disclosure_anchor.application.services.data_file_reader import (
     read_data_file_bytes,
 )
 from disclosure_anchor.application.services.document_unit_audit import (
+    TableComparisonInputs,
     AuditDocumentMetadata,
 )
 from disclosure_anchor.application.services.unit_builder import rules
@@ -183,6 +184,9 @@ class BuildUnits:
                 normalized_ir=normalized_ir,
                 actual_normalized_ir_sha256=normalized_ir_sha256,
             )
+            table_comparison = self._load_table_comparison_inputs(
+                normalized_ir
+            )
             evidence = self._source_evidence_validator.validate(
                 normalized_ir,
                 load_artifact=lambda role: self._load_hashed_parser_artifact(
@@ -215,6 +219,7 @@ class BuildUnits:
                     image_hashes_by_role=image_hashes_by_role,
                 ),
                 source_proof=evidence.proof,
+                table_comparison=table_comparison,
             )
             publication_gate = evaluate_publication_gate_v1(report)
             if publication_gate.decision != "publish":
@@ -613,6 +618,28 @@ class BuildUnits:
             )
         self._validate_table_reconciliation(payload, version=version)
         return payload, actual
+
+    def _load_table_comparison_inputs(
+        self,
+        normalized_ir: Mapping[str, Any],
+    ) -> TableComparisonInputs | None:
+        """Load the raw comparison artifacts for table-bearing documents."""
+
+        has_tables = any(
+            element.get("raw_kind") == "table"
+            for element in normalized_ir.get("elements", ())
+            if isinstance(element, Mapping)
+        )
+        if not has_tables:
+            return None
+        return TableComparisonInputs(
+            model_bytes=self._load_hashed_parser_artifact(
+                normalized_ir, role="model"
+            ).payload,
+            content_list_bytes=self._load_hashed_parser_artifact(
+                normalized_ir, role="content_list"
+            ).payload,
+        )
 
     def _load_hashed_parser_artifact(
         self,

@@ -8,15 +8,25 @@ import re
 from typing import Any, NoReturn
 
 
-CURRENT_TABLE_RECONCILIATION_ALGORITHM = "mineru-page-local-table-closure.v6"
+# v6 compared exact cell text plus media bytes/alt/title; v7 compares the
+# reader-visible table projection and additionally commits to the matching
+# via a hashed receipt root. v6 stays readable forever; only v7 may drive
+# current writes and publication.
+LEGACY_TABLE_RECONCILIATION_ALGORITHM = "mineru-page-local-table-closure.v6"
+CURRENT_TABLE_RECONCILIATION_ALGORITHM = "mineru-page-local-table-closure.v7"
 TABLE_RECONCILIATION_ALGORITHM_VERSION = CURRENT_TABLE_RECONCILIATION_ALGORITHM
-_DIAGNOSTIC_FIELDS = {
+TABLE_COMPARISON_CONTRACT = "reader-visible-table-projection.v1"
+_LEGACY_DIAGNOSTIC_FIELDS = {
     "algorithm_version",
     "model_hash",
     "content_tables",
     "model_tables",
     "matched_tables",
     "page_local_closed",
+}
+_DIAGNOSTIC_FIELDS = _LEGACY_DIAGNOSTIC_FIELDS | {
+    "comparison_contract",
+    "projection_root",
 }
 _LEGACY_LOCATOR_FIELDS = frozenset(
     {
@@ -32,6 +42,7 @@ _SHA256_RE = re.compile(r"sha256:[a-f0-9]{64}")
 
 class ReconciliationCompatibility(str, Enum):
     NONE = "none"
+    LEGACY = "legacy"
     CURRENT = "current"
 
 
@@ -110,6 +121,16 @@ def assess_normalized_ir_table_reconciliation(
             algorithm_version=algorithm,
             compatibility=ReconciliationCompatibility.CURRENT,
         )
+    if algorithm == LEGACY_TABLE_RECONCILIATION_ALGORITHM:
+        diagnostics = _validated_legacy_diagnostics(reconciliation)
+        _validate_current_elements(
+            elements,
+            expected_tables=diagnostics["content_tables"],
+        )
+        return TableReconciliationAssessment(
+            algorithm_version=algorithm,
+            compatibility=ReconciliationCompatibility.LEGACY,
+        )
     if isinstance(algorithm, str):
         raise UnsupportedTableReconciliationAlgorithm(
             "unsupported_algorithm",
@@ -132,6 +153,38 @@ def _validated_current_diagnostics(value: Any) -> dict[str, Any]:
             "current_algorithm_required",
             "page-local table closure requires the current algorithm",
         )
+    if value.get("comparison_contract") != TABLE_COMPARISON_CONTRACT:
+        _invalid(
+            "comparison_contract",
+            "page-local table closure requires the reader-visible "
+            "projection contract",
+        )
+    projection_root = value.get("projection_root")
+    if (
+        not isinstance(projection_root, str)
+        or _SHA256_RE.fullmatch(projection_root) is None
+    ):
+        _invalid(
+            "projection_root",
+            "page-local table closure requires the projection receipt root",
+        )
+    _validated_shared_diagnostics(value)
+    return value
+
+
+def _validated_legacy_diagnostics(value: Any) -> dict[str, Any]:
+    """Keep the frozen v6 shape readable without gaining v7 semantics."""
+
+    if not isinstance(value, dict) or set(value) != _LEGACY_DIAGNOSTIC_FIELDS:
+        _invalid(
+            "diagnostic_fields",
+            "legacy page-local table closure diagnostics have invalid fields",
+        )
+    _validated_shared_diagnostics(value)
+    return value
+
+
+def _validated_shared_diagnostics(value: dict[str, Any]) -> None:
     model_hash = value.get("model_hash")
     if not isinstance(model_hash, str) or _SHA256_RE.fullmatch(model_hash) is None:
         _invalid(
@@ -158,7 +211,6 @@ def _validated_current_diagnostics(value: Any) -> dict[str, Any]:
             "closure_flag",
             "page-local table closure must be proven",
         )
-    return value
 
 
 def _validate_current_elements(

@@ -49,6 +49,8 @@ def audit_document(
 ) -> DocumentAuditReport:
     """Keep ordinary audit tests explicit about a closed, empty source proof."""
 
+    from tests.unit.test_unit_builder import _synthesized_table_comparison
+
     if source_proof is None:
         source_pdf_sha256 = normalized_ir.get("source_pdf_sha256")
         page_count = normalized_ir.get("source_pdf_page_count")
@@ -68,10 +70,19 @@ def audit_document(
             visual_bindings=(),
             verified_visuals=(),
         )
+    table_comparison = _synthesized_table_comparison(
+        normalized_ir,
+        [
+            element
+            for element in normalized_ir.get("elements", [])
+            if isinstance(element, dict)
+        ],
+    )
     return _audit_document(
         normalized_ir=normalized_ir,
         units=units,
         metadata=metadata,
+        table_comparison=table_comparison,
         source_proof=source_proof,
         source_dispositions=source_dispositions,
         image_hashes=image_hashes,
@@ -197,7 +208,11 @@ def _ir(
         },
         "parser_diagnostics": {
             "table_reconciliation": {
-                "algorithm_version": "mineru-page-local-table-closure.v6",
+                "algorithm_version": "mineru-page-local-table-closure.v7",
+                "comparison_contract": (
+                    "reader-visible-table-projection.v1"
+                ),
+                "projection_root": "sha256:" + "c" * 64,
                 "model_hash": "sha256:" + "b" * 64,
                 "content_tables": table_count,
                 "model_tables": table_count,
@@ -1746,7 +1761,9 @@ class DocumentUnitAuditTests(unittest.TestCase):
                 },
                 table_caption=[caption],
                 table_footnote=[],
-                table_html="",
+                table_html=(
+                    "<table><tr><th>显式结构标题</th></tr></table>"
+                ),
             ),
             _element(1, text="事实。"),
         ]

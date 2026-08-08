@@ -1777,40 +1777,89 @@
       ],
       "properties": {
         "table_reconciliation": {
-          "additionalProperties": false,
-          "properties": {
-            "algorithm_version": {
-              "const": "mineru-page-local-table-closure.v6"
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "algorithm_version": {
+                  "const": "mineru-page-local-table-closure.v7"
+                },
+                "comparison_contract": {
+                  "const": "reader-visible-table-projection.v1"
+                },
+                "content_tables": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "matched_tables": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "model_hash": {
+                  "pattern": "^sha256:[a-f0-9]{64}$",
+                  "type": "string"
+                },
+                "model_tables": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "page_local_closed": {
+                  "const": true
+                },
+                "projection_root": {
+                  "pattern": "^sha256:[a-f0-9]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "algorithm_version",
+                "comparison_contract",
+                "projection_root",
+                "model_hash",
+                "content_tables",
+                "model_tables",
+                "matched_tables",
+                "page_local_closed"
+              ],
+              "type": "object"
             },
-            "content_tables": {
-              "minimum": 0,
-              "type": "integer"
-            },
-            "matched_tables": {
-              "minimum": 0,
-              "type": "integer"
-            },
-            "model_hash": {
-              "pattern": "^sha256:[a-f0-9]{64}$",
-              "type": "string"
-            },
-            "model_tables": {
-              "minimum": 0,
-              "type": "integer"
-            },
-            "page_local_closed": {
-              "const": true
+            {
+              "additionalProperties": false,
+              "properties": {
+                "algorithm_version": {
+                  "const": "mineru-page-local-table-closure.v6"
+                },
+                "content_tables": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "matched_tables": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "model_hash": {
+                  "pattern": "^sha256:[a-f0-9]{64}$",
+                  "type": "string"
+                },
+                "model_tables": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "page_local_closed": {
+                  "const": true
+                }
+              },
+              "required": [
+                "algorithm_version",
+                "model_hash",
+                "content_tables",
+                "model_tables",
+                "matched_tables",
+                "page_local_closed"
+              ],
+              "type": "object"
             }
-          },
-          "required": [
-            "algorithm_version",
-            "model_hash",
-            "content_tables",
-            "model_tables",
-            "matched_tables",
-            "page_local_closed"
-          ],
-          "type": "object"
+          ]
         },
         "visual_semantics": {
           "additionalProperties": false,

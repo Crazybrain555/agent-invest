@@ -167,7 +167,11 @@ class NormalizedIRContractTests(unittest.TestCase):
         diagnostics = payload["parser_diagnostics"]["table_reconciliation"]
         self.assertEqual(
             diagnostics["algorithm_version"],
-            "mineru-page-local-table-closure.v6",
+            "mineru-page-local-table-closure.v7",
+        )
+        self.assertEqual(
+            diagnostics["comparison_contract"],
+            "reader-visible-table-projection.v1",
         )
         stale = copy.deepcopy(payload)
         stale["parser_diagnostics"]["table_reconciliation"] = {

@@ -689,10 +689,21 @@ def validate_current_normalized_ir_for_write(
             f"table_reconciliation_{exc.reason_code}",
             f"invalid table reconciliation payload: {exc}",
         ) from exc
-    if assessment.compatibility is not ReconciliationCompatibility.CURRENT:
+    if (
+        write_authority == "production"
+        and assessment.compatibility
+        is not ReconciliationCompatibility.CURRENT
+    ):
+        # The frozen legacy comparison stays readable; a new artifact must
+        # carry the current reader-visible projection closure.
         raise NormalizedIRVersionError(
             "table_reconciliation_current_required",
             "new NormalizedIR writes require current page-local table closure",
+        )
+    if assessment.compatibility is ReconciliationCompatibility.NONE:
+        raise NormalizedIRVersionError(
+            "table_reconciliation_current_required",
+            "NormalizedIR writes require a page-local table closure receipt",
         )
     validate_reconciliation_generation(
         version=version,

@@ -427,7 +427,9 @@ def _attach_closed_table_diagnostics(normalized: dict[str, Any]) -> None:
     )
     normalized["parser_diagnostics"] = {
         "table_reconciliation": {
-            "algorithm_version": "mineru-page-local-table-closure.v6",
+            "algorithm_version": "mineru-page-local-table-closure.v7",
+            "comparison_contract": "reader-visible-table-projection.v1",
+            "projection_root": "sha256:" + "c" * 64,
             "model_hash": "sha256:" + "a" * 64,
             "content_tables": table_count,
             "model_tables": table_count,
@@ -4256,7 +4258,14 @@ class MinerUDocumentParserTests(unittest.TestCase):
         diagnostics = result.normalized_ir["parser_diagnostics"]["table_reconciliation"]
         self.assertEqual(
             diagnostics["algorithm_version"],
-            "mineru-page-local-table-closure.v6",
+            "mineru-page-local-table-closure.v7",
+        )
+        self.assertEqual(
+            diagnostics["comparison_contract"],
+            "reader-visible-table-projection.v1",
+        )
+        self.assertRegex(
+            diagnostics["projection_root"], r"^sha256:[a-f0-9]{64}$"
         )
         self.assertEqual(diagnostics["content_tables"], 2)
         self.assertEqual(diagnostics["model_tables"], 2)

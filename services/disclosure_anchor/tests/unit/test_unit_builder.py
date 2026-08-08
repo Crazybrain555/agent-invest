@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import unittest
 from dataclasses import replace
 from typing import Any, Mapping, Sequence
@@ -58,7 +59,11 @@ from disclosure_anchor.application.contracts.unit_source_projection import (
     search_text_values,
     source_value_sha256,
 )
+from disclosure_anchor.application.contracts.table_comparison import (
+    replay_page_local_table_comparison,
+)
 from disclosure_anchor.application.services.document_unit_audit import (
+    TableComparisonInputs,
     AuditDocumentMetadata,
     AuditUnitView,
     DocumentAuditReport,
@@ -207,6 +212,105 @@ def _build(
     )
 
 
+def _synthesized_table_comparison(
+    normalized_ir: dict[str, Any],
+    elements: list[dict[str, Any]],
+) -> TableComparisonInputs | None:
+    """Materialize raw model/content artifacts coherent with the fixture.
+
+    The audit replays the comparison from these bytes, so the fixture
+    states the same physical facts through both artifacts and stamps the
+    replayed receipt into the diagnostics and manifest.
+    """
+
+    if not any(element.get("raw_kind") == "table" for element in elements):
+        return None
+    content_items: list[dict[str, Any]] = []
+    pages: dict[int, list[dict[str, Any]]] = {}
+    max_page = 0
+    for element in sorted(
+        elements, key=lambda item: int(item["source_item_index"])
+    ):
+        assert len(content_items) == int(element["source_item_index"])
+        page_idx = int(element["page_idx"])
+        max_page = max(max_page, page_idx)
+        if element.get("raw_kind") == "table":
+            raw_bbox = element.get("bbox") or [10.0, 10.0, 900.0, 900.0]
+            bbox = [float(part) for part in raw_bbox]
+            if bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
+                bbox = [10.0, 10.0, 900.0, 900.0]
+            item = {
+                "type": "table",
+                "page_idx": page_idx,
+                "bbox": bbox,
+                "table_body": element["table_html"],
+                "table_caption": list(element.get("table_caption") or []),
+                "table_footnote": list(element.get("table_footnote") or []),
+                "img_path": element.get("image_path") or "images/table.png",
+            }
+            content_items.append(item)
+            # Model-side media are data URIs; visible equality only sees
+            # opaque occurrence markers, so any well-formed bytes suffice.
+            model_html = re.sub(
+                r'src="[^"]*"',
+                'src="data:image/png;base64,aW1n"',
+                element["table_html"],
+            )
+            pages.setdefault(page_idx, []).append(
+                {
+                    "type": "table",
+                    "bbox": [part / 1000.0 for part in bbox],
+                    "content": model_html,
+                }
+            )
+        else:
+            content_items.append(
+                {
+                    "type": "text",
+                    "page_idx": page_idx,
+                    "bbox": [0.0, 0.0, 10.0, 10.0],
+                    "text": element.get("text") or "",
+                }
+            )
+    model_payload = [
+        pages.get(page_idx, []) for page_idx in range(max_page + 1)
+    ]
+    content_bytes = json.dumps(
+        content_items, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    model_bytes = json.dumps(
+        model_payload, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    replayed = replay_page_local_table_comparison(
+        model_bytes=model_bytes,
+        content_list_bytes=content_bytes,
+    )
+    normalized_ir["parser_diagnostics"]["table_reconciliation"] = {
+        "algorithm_version": "mineru-page-local-table-closure.v7",
+        "comparison_contract": "reader-visible-table-projection.v1",
+        "projection_root": replayed.projection_root,
+        "model_hash": replayed.model_hash,
+        "content_tables": replayed.content_tables,
+        "model_tables": replayed.model_tables,
+        "matched_tables": replayed.content_tables,
+        "page_local_closed": True,
+    }
+    files = normalized_ir["parser_artifacts"]["files"]
+    for role, raw in (
+        ("model", model_bytes),
+        ("content_list", content_bytes),
+    ):
+        files[role] = {
+            **files[role],
+            "sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
+            "size_bytes": len(raw),
+        }
+    return TableComparisonInputs(
+        model_bytes=model_bytes,
+        content_list_bytes=content_bytes,
+    )
+
+
 def _audit_case_environment(
     elements: list[dict[str, Any]],
     *,
@@ -273,7 +377,14 @@ def _audit_case_environment(
         visual_bindings=(),
         verified_visuals=(),
     )
-    return normalized_ir, source_proof, resolve_image, resolved_hashes
+    table_comparison = _synthesized_table_comparison(normalized_ir, elements)
+    return (
+        normalized_ir,
+        source_proof,
+        resolve_image,
+        resolved_hashes,
+        table_comparison,
+    )
 
 
 def _replay_and_audit(
@@ -292,7 +403,13 @@ def _replay_and_audit(
     maintain instead of restating it.
     """
 
-    normalized_ir, source_proof, resolve_image, resolved_hashes = (
+    (
+        normalized_ir,
+        source_proof,
+        resolve_image,
+        resolved_hashes,
+        table_comparison,
+    ) = (
         _audit_case_environment(
             elements,
             headings=headings,
@@ -303,6 +420,7 @@ def _replay_and_audit(
     )
     drafts, _stats, report = prepare_and_audit_units(
         normalized_ir=normalized_ir,
+        table_comparison=table_comparison,
         filing_type="annual_report",
         metadata=AuditDocumentMetadata(
             document_id=str(normalized_ir["document_id"]),
@@ -1125,7 +1243,13 @@ class StructureProofProjectionTests(unittest.TestCase):
         # the audit re-derives the expected owner path from the proof, so a
         # unit claiming the flattened child ancestry is a structure mismatch,
         # and dropping one flattened-heading selector breaks payload replay.
-        normalized_ir, source_proof, resolve_image, resolved_hashes = (
+        (
+            normalized_ir,
+            source_proof,
+            resolve_image,
+            resolved_hashes,
+            table_comparison,
+        ) = (
             _audit_case_environment(
                 elements,
                 headings=headings,
@@ -1136,6 +1260,7 @@ class StructureProofProjectionTests(unittest.TestCase):
         )
         drafts, stats, baseline = prepare_and_audit_units(
             normalized_ir=normalized_ir,
+            table_comparison=table_comparison,
             filing_type="annual_report",
             metadata=AuditDocumentMetadata(
                 document_id=str(normalized_ir["document_id"]),
@@ -1190,6 +1315,7 @@ class StructureProofProjectionTests(unittest.TestCase):
                 source_proof=source_proof,
                 source_dispositions=stats.source_dispositions,
                 image_hashes=dict(resolved_hashes),
+                table_comparison=table_comparison,
             )
 
         def claim_child_path(
@@ -2108,7 +2234,13 @@ class ConservationTests(unittest.TestCase):
             ),
         ]
         headings = [_heading(1, 0, text="一、经营情况", section_end=2)]
-        normalized_ir, source_proof, resolve_image, resolved_hashes = (
+        (
+            normalized_ir,
+            source_proof,
+            resolve_image,
+            resolved_hashes,
+            table_comparison,
+        ) = (
             _audit_case_environment(
                 elements,
                 headings=headings,
@@ -2117,6 +2249,7 @@ class ConservationTests(unittest.TestCase):
         )
         drafts, stats, baseline = prepare_and_audit_units(
             normalized_ir=normalized_ir,
+            table_comparison=table_comparison,
             filing_type="annual_report",
             metadata=AuditDocumentMetadata(
                 document_id=str(normalized_ir["document_id"]),
@@ -2917,7 +3050,7 @@ class LegacyStructureGoldenMatrixTests(unittest.TestCase):
             _element(1, text="章节正文"),
         ]
         headings = [_heading(1, 0, text="一、章节", section_end=1)]
-        normalized_ir, source_proof, _resolve, _hashes = (
+        normalized_ir, source_proof, _resolve, _hashes, _comparison = (
             _audit_case_environment(
                 elements,
                 headings=headings,
@@ -3123,7 +3256,7 @@ class LegacyStructureGoldenMatrixTests(unittest.TestCase):
             )
             proof["algorithm_version"] = algorithm
             proofs[name] = proof
-        normalized_ir, source_proof, _resolve, _hashes = (
+        normalized_ir, source_proof, _resolve, _hashes, _comparison = (
             _audit_case_environment(
                 elements,
                 headings=headings,
@@ -3147,6 +3280,7 @@ class LegacyStructureGoldenMatrixTests(unittest.TestCase):
                     ),
                     source_proof=source_proof,
                     image_hashes={},
+                    table_comparison=_comparison,
                 )
                 codes = {finding.code for finding in report.findings}
                 if name == "v14":
@@ -3213,7 +3347,7 @@ class LegacyStructureGoldenMatrixTests(unittest.TestCase):
             _element(1, text="章节正文"),
         ]
         headings = [_heading(1, 0, text="一、章节", section_end=1)]
-        normalized_ir, source_proof, _resolve, _hashes = (
+        normalized_ir, source_proof, _resolve, _hashes, _comparison = (
             _audit_case_environment(
                 elements,
                 headings=headings,
@@ -3234,6 +3368,7 @@ class LegacyStructureGoldenMatrixTests(unittest.TestCase):
             ),
             source_proof=source_proof,
             image_hashes={},
+            table_comparison=_comparison,
         )
         self.assertFalse(report.ok)
         codes = {finding.code for finding in report.findings}

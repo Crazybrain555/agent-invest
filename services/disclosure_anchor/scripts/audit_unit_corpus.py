@@ -72,6 +72,9 @@ from disclosure_anchor.application.services.unit_builder.builder import (
 from disclosure_anchor.application.services.unit_preparation import (
     prepare_and_audit_units,
 )
+from disclosure_anchor.application.services.document_unit_audit import (
+    TableComparisonInputs,
+)
 from disclosure_anchor.application.use_cases.parse_document import (
     build_parser_artifact_manifest,
 )
@@ -299,6 +302,10 @@ def _audit_one(argument: tuple[ManifestEntry, str, bool]) -> dict[str, Any]:
         )
         _drafts, stats, report = prepare_and_audit_units(
             normalized_ir=normalized_ir,
+            table_comparison=_table_comparison_inputs(
+                normalized_ir,
+                data_root=data_root,
+            ),
             filing_type=entry.filing_type,
             metadata=AuditDocumentMetadata(
                 document_id=entry.document_id,
@@ -1049,6 +1056,38 @@ def _verify_artifact_descriptor(
                 f"source replay parser artifact {role} hash mismatch: "
                 f"{actual} != {expected_sha256}"
             )
+
+
+def _table_comparison_inputs(
+    normalized_ir: dict[str, Any],
+    *,
+    data_root: Path,
+) -> TableComparisonInputs | None:
+    """Load the raw comparison artifacts for a table-bearing document.
+
+    The audit hash-verifies these bytes against the manifest itself; this
+    loader only fetches them from the hash-named artifact layout.
+    """
+
+    if not any(
+        element.get("raw_kind") == "table"
+        for element in normalized_ir.get("elements", ())
+        if isinstance(element, dict)
+    ):
+        return None
+    files = normalized_ir["parser_artifacts"]["files"]
+    payloads: dict[str, bytes] = {}
+    for role in ("model", "content_list"):
+        descriptor = files.get(role)
+        if not isinstance(descriptor, dict):
+            raise ValueError(f"manifest lacks the {role} artifact")
+        payloads[role] = (
+            data_root / "data" / str(descriptor["relpath"])
+        ).read_bytes()
+    return TableComparisonInputs(
+        model_bytes=payloads["model"],
+        content_list_bytes=payloads["content_list"],
+    )
 
 
 def _image_bindings(

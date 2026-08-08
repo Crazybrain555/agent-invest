@@ -7,6 +7,8 @@ otherwise one repeated heading could hide the loss of another occurrence.
 
 from __future__ import annotations
 
+import hashlib
+
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 import re
@@ -20,7 +22,22 @@ from disclosure_anchor.application.contracts.document_structure import (
     validate_document_structure,
 )
 from disclosure_anchor.application.contracts import content_annotations
+from disclosure_anchor.application.contracts.table_comparison import (
+    TableComparisonError,
+    raw_content_tables,
+    replay_page_local_table_comparison,
+)
+from disclosure_anchor.application.contracts.table_html_structure import (
+    TableHtmlStructureError,
+    parse_table_html_structure,
+    table_media_artifact_role,
+)
+from disclosure_anchor.application.contracts.table_projection import (
+    TableProjectionError,
+    project_table_html,
+)
 from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation import (
+    ReconciliationCompatibility,
     assess_normalized_ir_table_reconciliation,
 )
 from disclosure_anchor.application.contracts.normalized_ir import (
@@ -365,6 +382,18 @@ class _NativeAuditPlan:
     page_bases: Mapping[int, str]
 
 
+@dataclass(frozen=True)
+class TableComparisonInputs:
+    """Hash-bound raw artifacts for the independent table comparison.
+
+    The audit re-parses these bytes itself; it never consumes a producer
+    projection, candidate list, or match verdict.
+    """
+
+    model_bytes: bytes
+    content_list_bytes: bytes
+
+
 def audit_document(
     *,
     normalized_ir: dict[str, Any],
@@ -373,12 +402,17 @@ def audit_document(
     source_proof: SourceEvidenceProof,
     source_dispositions: Iterable[Mapping[str, Any]] = (),
     image_hashes: Mapping[str, str] | None = None,
+    table_comparison: TableComparisonInputs | None = None,
 ) -> DocumentAuditReport:
     """Audit one builder replay without database or filesystem access."""
 
     unit_list = list(units)
     findings: list[AuditFinding] = []
-    if not _validate_reconciliation(normalized_ir, findings=findings):
+    if not _validate_reconciliation(
+        normalized_ir,
+        findings=findings,
+        table_comparison=table_comparison,
+    ):
         return DocumentAuditReport(
             document_id=metadata.document_id,
             metrics={
@@ -845,7 +879,10 @@ def _build_native_audit_plan(
 
 
 def _validate_reconciliation(
-    normalized_ir: dict[str, Any], *, findings: list[AuditFinding]
+    normalized_ir: dict[str, Any],
+    *,
+    findings: list[AuditFinding],
+    table_comparison: TableComparisonInputs | None = None,
 ) -> bool:
     try:
         version = validate_normalized_ir_contract(normalized_ir)
@@ -881,7 +918,234 @@ def _validate_reconciliation(
             f"{exc.reason_code}: {exc}",
         )
         return False
+    if assessment.compatibility is not ReconciliationCompatibility.CURRENT:
+        # A legacy comparison generation cannot certify a current
+        # publication; the artifact must be reparsed under the current
+        # projection contract.
+        _audit_error(
+            findings,
+            "table_reconciliation_current_required",
+            "current publication requires the reader-visible projection "
+            "closure; reparse the document",
+        )
+        return False
+    if not _validate_table_grid_preservation(normalized_ir, findings):
+        return False
+    diagnostics = normalized_ir["parser_diagnostics"]["table_reconciliation"]
+    if diagnostics["content_tables"] > 0 and table_comparison is None:
+        _audit_error(
+            findings,
+            "table_comparison_replay_unavailable",
+            "a table-bearing publication requires the raw model and "
+            "content artifacts for the independent comparison replay",
+        )
+        return False
+    if table_comparison is not None and not _replay_table_comparison(
+        normalized_ir,
+        diagnostics=diagnostics,
+        inputs=table_comparison,
+        findings=findings,
+    ):
+        return False
     return True
+
+
+def _validate_table_grid_preservation(
+    normalized_ir: dict[str, Any],
+    findings: list[AuditFinding],
+) -> bool:
+    """Re-derive every stored table grid from its own HTML carrier.
+
+    The NIR's grid facts are derived data; the audit re-runs the same
+    closed derivation from ``table_html`` and requires the stored shape to
+    match exactly — domain, order, and multiplicity included.
+    """
+
+    ok = True
+    for element in normalized_ir.get("elements", ()):
+        if element.get("raw_kind") != "table":
+            continue
+        index = element.get("source_item_index")
+        html = element.get("table_html")
+        stored = element.get("table")
+        if not isinstance(html, str) or not isinstance(stored, dict):
+            _audit_error(
+                findings,
+                "table_projection_preservation_mismatch",
+                f"table element {index} lacks its HTML carrier or grid",
+            )
+            ok = False
+            continue
+        try:
+            derived = parse_table_html_structure(html)
+            project_table_html(
+                html,
+                extra_captions=tuple(element.get("table_caption") or ()),
+                extra_footnotes=tuple(element.get("table_footnote") or ()),
+            )
+        except (TableHtmlStructureError, TableProjectionError) as exc:
+            _audit_error(
+                findings,
+                "table_projection_preservation_mismatch",
+                f"table element {index} carrier cannot be re-derived: {exc}",
+            )
+            ok = False
+            continue
+        expected_cells = [
+            {
+                "row": cell.row,
+                "col": cell.col,
+                "rowspan": cell.rowspan,
+                "colspan": cell.colspan,
+                "text": cell.text,
+                "is_header": cell.is_header,
+            }
+            for cell in derived.cells
+        ]
+        expected_merged = [
+            {
+                "row": row,
+                "col": col,
+                "rowspan": rowspan,
+                "colspan": colspan,
+            }
+            for row, col, rowspan, colspan in derived.merged_cells
+        ]
+        stored_media_raw = stored.get("embedded_media")
+        stored_media: list[Any] = (
+            stored_media_raw if isinstance(stored_media_raw, list) else []
+        )
+        media_ok = isinstance(stored_media_raw, list) and len(
+            stored_media
+        ) == len(derived.embedded_media)
+        if media_ok:
+            for stored_item, media in zip(
+                stored_media, derived.embedded_media, strict=True
+            ):
+                expected_media = {
+                    "occurrence_index": media.occurrence_index,
+                    "cell_media_index": media.cell_media_index,
+                    "row": media.row,
+                    "col": media.col,
+                    "rowspan": media.rowspan,
+                    "colspan": media.colspan,
+                    "image_path": media.image_path,
+                    "artifact_role": table_media_artifact_role(
+                        int(index), media.occurrence_index
+                    ),
+                }
+                if media.alt_text is not None:
+                    expected_media["alt_text"] = media.alt_text
+                if media.title_text is not None:
+                    expected_media["title_text"] = media.title_text
+                if not isinstance(stored_item, dict) or any(
+                    stored_item.get(key) != value
+                    for key, value in expected_media.items()
+                ):
+                    media_ok = False
+                    break
+        if (
+            stored.get("headers") != list(derived.headers)
+            or stored.get("rows") != [list(row) for row in derived.rows]
+            or stored.get("cells") != expected_cells
+            or stored.get("merged_cells", []) != expected_merged
+            or not media_ok
+        ):
+            _audit_error(
+                findings,
+                "table_projection_preservation_mismatch",
+                f"table element {index} grid differs from its own carrier",
+            )
+            ok = False
+    return ok
+
+
+def _replay_table_comparison(
+    normalized_ir: dict[str, Any],
+    *,
+    diagnostics: Mapping[str, Any],
+    inputs: TableComparisonInputs,
+    findings: list[AuditFinding],
+) -> bool:
+    files = normalized_ir["parser_artifacts"]["files"]
+    for role, raw in (
+        ("model", inputs.model_bytes),
+        ("content_list", inputs.content_list_bytes),
+    ):
+        descriptor = files.get(role)
+        actual = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if (
+            not isinstance(descriptor, Mapping)
+            or descriptor.get("sha256") != actual
+        ):
+            _audit_error(
+                findings,
+                "table_comparison_input_hash_mismatch",
+                f"raw {role} bytes do not match the hashed manifest",
+            )
+            return False
+    try:
+        replayed = replay_page_local_table_comparison(
+            model_bytes=inputs.model_bytes,
+            content_list_bytes=inputs.content_list_bytes,
+        )
+        raw_tables = raw_content_tables(inputs.content_list_bytes)
+    except TableComparisonError as exc:
+        _audit_error(
+            findings,
+            "table_comparison_replay_failed",
+            f"independent table comparison replay failed: {exc}",
+        )
+        return False
+    if (
+        replayed.model_hash != diagnostics.get("model_hash")
+        or replayed.content_tables != diagnostics.get("content_tables")
+        or replayed.model_tables != diagnostics.get("model_tables")
+        or replayed.projection_root != diagnostics.get("projection_root")
+    ):
+        _audit_error(
+            findings,
+            "table_comparison_replay_mismatch",
+            "independently replayed table comparison disagrees with the "
+            "published reconciliation receipt",
+        )
+        return False
+    elements_by_index = {
+        element.get("source_item_index"): element
+        for element in normalized_ir.get("elements", ())
+        if element.get("raw_kind") == "table"
+    }
+    if set(elements_by_index) != {raw.index for raw in raw_tables}:
+        _audit_error(
+            findings,
+            "table_projection_preservation_mismatch",
+            "NormalizedIR table elements do not cover the content-artifact "
+            "table items",
+        )
+        return False
+    ok = True
+    for raw_table in raw_tables:
+        element = elements_by_index[raw_table.index]
+        # The carrier HTML must be byte-preserved. Caption/footnote VALUES
+        # pass through the canonical serializer lane (whose fidelity is
+        # closed by the text-projection contract), so the raw layer proves
+        # the domains themselves: assignment and multiplicity, in order of
+        # occurrence.
+        if (
+            element.get("table_html") != raw_table.html
+            or len(element.get("table_caption") or [])
+            != len(raw_table.captions)
+            or len(element.get("table_footnote") or [])
+            != len(raw_table.footnotes)
+        ):
+            _audit_error(
+                findings,
+                "table_projection_preservation_mismatch",
+                f"table element {raw_table.index} caption/footnote/"
+                "carrier domains differ from the content artifact",
+            )
+            ok = False
+    return ok
 
 
 def _validate_source_dispositions(

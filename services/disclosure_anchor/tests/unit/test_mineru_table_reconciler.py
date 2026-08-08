@@ -147,13 +147,18 @@ class MinerUTableReconcilerTests(unittest.TestCase):
         self.assertEqual(
             result.stats.as_dict(),
             {
-                "algorithm_version": "mineru-page-local-table-closure.v6",
+                "algorithm_version": "mineru-page-local-table-closure.v7",
+                "comparison_contract": "reader-visible-table-projection.v1",
+                "projection_root": result.stats.projection_root,
                 "model_hash": result.stats.model_hash,
                 "content_tables": 2,
                 "model_tables": 2,
                 "matched_tables": 2,
                 "page_local_closed": True,
             },
+        )
+        self.assertRegex(
+            result.stats.projection_root, r"^sha256:[a-f0-9]{64}$"
         )
 
     def test_vlm_normalized_geometry_is_supported(self) -> None:
@@ -227,7 +232,7 @@ class MinerUTableReconcilerTests(unittest.TestCase):
                         ],
                     )
 
-    def test_embedded_media_bytes_cell_and_occurrence_order_must_match(
+    def test_embedded_media_occurrence_layout_matches_bytes_stay_opaque(
         self,
     ) -> None:
         first_bytes = b"first-image"
@@ -255,16 +260,26 @@ class MinerUTableReconcilerTests(unittest.TestCase):
         )
         self.assertEqual(result.stats.matched_tables, 1)
 
+        # Bytes are opaque to the reader-visible projection: swapping the
+        # underlying images while keeping every occurrence in place still
+        # reconciles; artifact integrity is proven separately.
+        bytes_swapped = (
+            f'<table><tr><td>甲<img src="{_data_image(second_bytes)}"/>'
+            f'<img src="{_data_image(first_bytes)}"/></td>'
+            f'<td>乙<img src="{_data_image(first_bytes)}"/>'
+            "</td></tr></table>"
+        )
+        swapped_result = _reconcile(
+            content,
+            [_pipeline_page(0, ([100, 100, 900, 900], bytes_swapped))],
+            artifact_bytes=artifacts,
+        )
+        self.assertEqual(swapped_result.stats.matched_tables, 1)
+
         mismatches = (
             (
                 f'<table><tr><td>甲<img src="{_data_image(first_bytes)}"/>'
                 f'</td><td>乙<img src="{_data_image(second_bytes)}"/>'
-                "</td></tr></table>"
-            ),
-            (
-                f'<table><tr><td>甲<img src="{_data_image(second_bytes)}"/>'
-                f'<img src="{_data_image(first_bytes)}"/></td>'
-                f'<td>乙<img src="{_data_image(first_bytes)}"/>'
                 "</td></tr></table>"
             ),
             (
@@ -460,6 +475,7 @@ class MinerUTableReconcilerTests(unittest.TestCase):
             "content_tables": 1,
             "model_tables": 1,
             "matched_tables": 1,
+            "projection_root": "sha256:" + "b" * 64,
         }
         for override in (
             {"model_tables": 2},

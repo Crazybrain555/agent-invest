@@ -26,6 +26,7 @@ from disclosure_anchor.application.services.unit_builder.source_native_fallback 
     native_stream_unit_drafts,
 )
 from disclosure_anchor.application.services.document_unit_audit import (
+    TableComparisonInputs,
     AuditDocumentMetadata,
     AuditUnitView,
     DocumentAuditReport,
@@ -41,6 +42,7 @@ def prepare_and_audit_units(
     image_artifact_resolver: ImageArtifactResolver | None,
     image_hash_provider: Callable[[], Mapping[str, str]],
     source_proof: SourceEvidenceProof,
+    table_comparison: TableComparisonInputs | None = None,
 ) -> tuple[list[UnitDraft], BuildStats, DocumentAuditReport]:
     """Run the only unit-assembly composition used by publication and replay."""
 
@@ -77,6 +79,7 @@ def prepare_and_audit_units(
         stats.order_conflict_events += page.order_conflict_count
     report = audit_document(
         normalized_ir=normalized_ir,
+        table_comparison=table_comparison,
         units=(
             AuditUnitView(
                 order_index=index,
