@@ -381,6 +381,10 @@ def _artifact_manifest(
             **present,
             "relpath": f"{root}/content_list_v2.json",
         },
+        "parse_receipt": {
+            **present,
+            "relpath": f"{root}/parse_receipt.json",
+        },
         "middle": {
             **present,
             "relpath": f"{root}/middle.json",

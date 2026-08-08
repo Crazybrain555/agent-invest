@@ -18,6 +18,10 @@ from disclosure_anchor.application.contracts.normalized_ir import (
     validate_normalized_ir_identity,
     validate_normalized_ir_path_version,
 )
+from disclosure_anchor.application.contracts.publication_identity import (
+    PublicationIdentityViolation,
+    require_publishable_run_identity,
+)
 from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
     ParserTargetIdentityError,
@@ -87,9 +91,13 @@ TERMINAL_PUBLICATION_ERROR_CODES = frozenset(
         "IR_CONTRACT_UNSUPPORTED",
         "IR_HASH_MISMATCH",
         "IR_MISSING",
+        "PARSE_RECEIPT_INVALID",
+        "PARSE_RECEIPT_MISSING",
         "PARTIAL_PDF_NOT_PUBLISHABLE",
         "PARSER_TARGET_IDENTITY_INVALID",
         "PARSER_TARGET_IDENTITY_MISMATCH",
+        "REMOTE_MODEL_UNATTESTED",
+        "SOURCE_PDF_IDENTITY_MISMATCH",
         "QUERY_PROJECTION_HASH_MISMATCH",
         "RUN_HASH_AGGREGATE_INVALID",
         "RUN_UNIT_HASH_INPUT_INVALID",
@@ -113,7 +121,9 @@ class NormalizedIRPublicationGuard:
     def __init__(self, path_builder: FileStorePathPort) -> None:
         self._paths = path_builder
 
-    def __call__(self, run: e.ProcessingRun) -> None:
+    def __call__(
+        self, run: e.ProcessingRun, document: e.Document
+    ) -> None:
         relpath_text = run.normalized_ir_relpath
         if not relpath_text:
             raise PublishRunError(
@@ -235,6 +245,29 @@ class NormalizedIRPublicationGuard:
                     ),
                 )
             )
+        # Activation is callable on historically built runs, so the shared
+        # publication identity gate must hold here too: same immutable PDF
+        # across document/run/IR, current structure and parser target,
+        # explicit remote model, and a valid run-bound parse receipt.
+        try:
+            require_publishable_run_identity(
+                document_raw_file_hash=document.raw_file_hash,
+                run_input_raw_file_hash=run.input_raw_file_hash,
+                normalized_ir=decoded,
+                read_artifact_bytes=lambda artifact_relpath: (
+                    read_data_file_bytes(
+                        self._paths, Path(artifact_relpath)
+                    )
+                ),
+            )
+        except PublicationIdentityViolation as exc:
+            raise PublishRunError(
+                _structured_error(
+                    error_code=exc.error_code,
+                    reason_code=exc.reason_code,
+                    message=exc.message,
+                )
+            ) from exc
         self._validate_visual_semantics(decoded)
 
     def _validate_visual_semantics(self, normalized_ir: dict[str, Any]) -> None:
@@ -337,7 +370,7 @@ class PublishRun:
         self,
         *,
         uow_factory: Callable[[], UnitOfWork],
-        publication_guard: Callable[[e.ProcessingRun], None],
+        publication_guard: Callable[[e.ProcessingRun, e.Document], None],
     ) -> None:
         self._uow_factory = uow_factory
         self._publication_guard = publication_guard
@@ -400,7 +433,7 @@ class PublishRun:
                 else []
             )
             try:
-                self._publication_guard(run)
+                self._publication_guard(run, document)
                 new_units = uow.document_units.list_by_processing_run(
                     run.processing_run_id
                 )

@@ -36,6 +36,9 @@ from disclosure_anchor.application.use_cases.parse_document import (
     build_parser_artifact_manifest,
 )
 from disclosure_anchor.domain import entities as e
+from disclosure_anchor.application.contracts.parse_receipt import (
+    build_parse_receipt,
+)
 from disclosure_anchor.domain.errors import (
     ParseDocumentError,
     ParserBackendOverloadedError,
@@ -305,6 +308,24 @@ class _Parser:
                 },
             },
         }
+        parse_receipt = artifact_root / "sample_parse_receipt.json"
+        parse_receipt.write_text(
+            json.dumps(
+                build_parse_receipt(
+                    source_pdf_sha256=document_metadata["raw_file_hash"],
+                    parser_target_payload=target.to_payload(),
+                    server_url=options.server_url,
+                    http_request_concurrency=(
+                        options.http_request_concurrency
+                    ),
+                    timeout_seconds=options.timeout_seconds,
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
         return ParserResult(
             target_identity=target,
             artifact_root=artifact_root,
@@ -317,6 +338,7 @@ class _Parser:
                 "pdf_structure": pdf_structure,
                 "source_evidence": source_evidence,
                 "visual_semantics": visual_semantics,
+                "parse_receipt": parse_receipt,
             },
             normalized_ir=normalized_ir,
         )

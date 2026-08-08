@@ -84,7 +84,14 @@ from disclosure_anchor.application.contracts.normalized_ir import (  # noqa: E40
 from disclosure_anchor.application.contracts.parser_target import (  # noqa: E402
     ParserTargetIdentityError,
 )
+from disclosure_anchor.application.ports.parser import (  # noqa: E402
+    resolve_current_parser_target,
+)
 from disclosure_anchor.application.services.unit_builder.rules import RULES_VERSION  # noqa: E402
+from disclosure_anchor.domain.errors import (  # noqa: E402
+    ParserVersionProbeError,
+    RemoteModelAmbiguousError,
+)
 from disclosure_anchor.application.worker import queries  # noqa: E402
 from disclosure_anchor.application.worker.locks import (  # noqa: E402
     exclusive_corpus_mutation,
@@ -180,11 +187,20 @@ def _load_reparse_generation(
 def _target_identity(
     deps: WorkerDeps,
 ) -> dict[str, Any]:
-    parser_identity = deps.parser_factory().identity()
+    parser = deps.parser_factory()
     options = deps.parser_options
     try:
-        parser_target = options.target_identity(parser_identity)
-    except ParserTargetIdentityError as exc:
+        # Same resolver authority as run preparation: the manifest freezes
+        # the explicit remote target the actual runs will carry, or the
+        # export fails; an unattested HTTP target is never frozen.
+        parser_target, _resolved_options = resolve_current_parser_target(
+            parser, options
+        )
+    except (
+        ParserTargetIdentityError,
+        RemoteModelAmbiguousError,
+        ParserVersionProbeError,
+    ) as exc:
         raise ManifestError(f"invalid parser target: {exc}") from exc
     if not parser_target.full_pdf:
         raise ManifestError("corpus reparse parser must cover the full PDF")

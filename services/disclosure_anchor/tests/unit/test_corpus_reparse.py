@@ -119,6 +119,9 @@ class CorpusReparseManifestTests(unittest.TestCase):
             name="MinerU",
             version="3.4.0",
         )
+        deps.parser_factory.return_value.resolve_remote_model.return_value = (
+            "MinerU2.5-Pro-2605-1.2B"
+        )
         deps.parser_options = ParserOptions(
             backend="hybrid-http-client",
             formula=True,
@@ -144,6 +147,13 @@ class CorpusReparseManifestTests(unittest.TestCase):
             identity["normalized_ir_contract_version"],
             CURRENT_NORMALIZED_IR_VERSION,
         )
+        self.assertEqual(
+            parser_target["target_contract_version"], "parser-target.v2"
+        )
+        self.assertEqual(
+            parser_target["remote_model_name"], "MinerU2.5-Pro-2605-1.2B"
+        )
+        self.assertEqual(parser_target["remote_selection_mode"], "explicit")
 
         deps.parser_options = ParserOptions(
             backend="vlm-http-client",
@@ -151,6 +161,27 @@ class CorpusReparseManifestTests(unittest.TestCase):
             runtime_bundle_identity_sha256=_sha256(b"deployment"),
         )
         with self.assertRaisesRegex(ManifestError, "full PDF"):
+            reparse_corpus._target_identity(deps)
+
+    def test_manifest_never_freezes_an_unattested_remote_target(self) -> None:
+        from disclosure_anchor.domain.errors import RemoteModelAmbiguousError
+
+        deps = MagicMock()
+        deps.parser_factory.return_value.identity.return_value = ParserIdentity(
+            name="MinerU",
+            version="3.4.0",
+        )
+        deps.parser_factory.return_value.resolve_remote_model.side_effect = (
+            RemoteModelAmbiguousError("two models served")
+        )
+        deps.parser_options = ParserOptions(
+            backend="vlm-http-client",
+            runtime_bundle_identity_sha256=_sha256(b"deployment"),
+        )
+        deps.config.max_parse_retries = 4
+        deps.config.max_build_retries = 5
+
+        with self.assertRaisesRegex(ManifestError, "two models served"):
             reparse_corpus._target_identity(deps)
 
     def test_cli_help_imports_without_runtime_environment(self) -> None:

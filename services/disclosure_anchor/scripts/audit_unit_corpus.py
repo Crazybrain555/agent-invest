@@ -265,7 +265,7 @@ def _audit_one(argument: tuple[ManifestEntry, str, bool]) -> dict[str, Any]:
             # target currency applies to new production writes, not here.
             ir_version = validate_current_normalized_ir_for_write(
                 normalized_ir,
-                require_current_parser_target=False,
+                write_authority="frozen_generation",
             )
         else:
             normalized_ir = frozen_ir
@@ -583,7 +583,7 @@ def _replay_source_ir(
     )
     validate_current_normalized_ir_for_write(
         normalized_ir,
-        require_current_parser_target=False,
+        write_authority="frozen_generation",
     )
     raw_struct_tree_citations = _validate_raw_struct_tree_citations(
         normalized_ir,

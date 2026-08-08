@@ -7,7 +7,7 @@ from datetime import datetime
 import math
 from pathlib import PurePath, PurePosixPath
 import re
-from typing import Any, Mapping, cast
+from typing import Any, Mapping, cast, Literal
 
 from disclosure_anchor.application.contracts.document_structure import (
     DOCUMENT_STRUCTURE_ALGORITHM,
@@ -22,6 +22,9 @@ from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation 
     ReconciliationCompatibility,
     TableReconciliationContractError,
     assess_normalized_ir_table_reconciliation,
+)
+from disclosure_anchor.application.contracts.parse_receipt import (
+    PARSE_RECEIPT_ARTIFACT_ROLE,
 )
 from disclosure_anchor.application.contracts.parser_target import (
     CURRENT_PARSER_TARGET_CONTRACT_VERSION,
@@ -606,41 +609,64 @@ def _validate_element_artifact_bindings(
 def validate_current_normalized_ir_for_write(
     payload: Mapping[str, Any],
     *,
-    require_current_parser_target: bool = True,
+    write_authority: Literal["production", "frozen_generation"] = "production",
 ) -> str:
-    """Validate a new producer artifact at the parser-port boundary.
+    """Validate a producer-shaped artifact at the parser-port boundary.
 
-    ``require_current_parser_target=False`` exists only for the
-    source-identity replay of a frozen generation, whose parser payload is
-    asserted byte-equal to the stored artifact elsewhere; every production
-    write keeps the default and requires the current target contract.
+    ``production`` (every real write) additionally requires the current
+    generation: the current structure algorithm, the current v2 parser
+    target, and a present run-bound parse receipt. ``frozen_generation``
+    exists only for hash-bound stored artifacts — the source-identity
+    replay of a frozen generation and the serving of already-published
+    evidence — where the artifact's own generation is the authority and
+    integrity is anchored elsewhere; it still enforces the closed write
+    shape, element closure, and reconciliation contract.
     """
 
     version = validate_normalized_ir_contract(payload, require_current=True)
-    structure_proof = payload.get("structure_proof")
-    if (
-        isinstance(structure_proof, Mapping)
-        and structure_proof.get("algorithm_version")
-        != DOCUMENT_STRUCTURE_ALGORITHM
-    ):
-        # Historical algorithms stay readable for diagnostics, but a NEW
-        # artifact must never persist a legacy structure authority.
-        raise NormalizedIRVersionError(
-            "structure_proof_current_required",
-            "new NormalizedIR writes require the current structure algorithm",
+    if write_authority == "production":
+        structure_proof = payload.get("structure_proof")
+        if (
+            isinstance(structure_proof, Mapping)
+            and structure_proof.get("algorithm_version")
+            != DOCUMENT_STRUCTURE_ALGORITHM
+        ):
+            # Historical algorithms stay readable for diagnostics, but a NEW
+            # artifact must never persist a legacy structure authority.
+            raise NormalizedIRVersionError(
+                "structure_proof_current_required",
+                "new NormalizedIR writes require the current structure "
+                "algorithm",
+            )
+        parser_payload = payload.get("parser")
+        if (
+            not isinstance(parser_payload, Mapping)
+            or parser_payload.get("target_contract_version")
+            != CURRENT_PARSER_TARGET_CONTRACT_VERSION
+        ):
+            # The legacy v1 target stays readable, but a new artifact must
+            # close its remote model selection under the current contract.
+            raise NormalizedIRVersionError(
+                "parser_target_current_required",
+                "new NormalizedIR writes require the current parser target",
+            )
+        artifacts = payload.get("parser_artifacts")
+        files = (
+            artifacts.get("files") if isinstance(artifacts, Mapping) else None
         )
-    parser_payload = payload.get("parser")
-    if require_current_parser_target and (
-        not isinstance(parser_payload, Mapping)
-        or parser_payload.get("target_contract_version")
-        != CURRENT_PARSER_TARGET_CONTRACT_VERSION
-    ):
-        # The legacy v1 target stays readable, but a new artifact must close
-        # its remote model selection under the current target contract.
-        raise NormalizedIRVersionError(
-            "parser_target_current_required",
-            "new NormalizedIR writes require the current parser target",
+        receipt = (
+            files.get(PARSE_RECEIPT_ARTIFACT_ROLE)
+            if isinstance(files, Mapping)
+            else None
         )
+        if not isinstance(receipt, Mapping) or receipt.get(
+            "availability"
+        ) != "present":
+            raise NormalizedIRVersionError(
+                "parse_receipt_required",
+                "new NormalizedIR writes require a present run-bound "
+                "parse receipt artifact",
+            )
     elements = payload.get("elements")
     assert isinstance(elements, list)
     for position, element in enumerate(elements):

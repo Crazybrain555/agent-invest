@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -20,6 +19,9 @@ from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
 from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru.visual_semantic_enricher import (
     MinerUVisualSemanticEnricher,
+)
+from disclosure_anchor.application.contracts.parse_receipt import (
+    build_parse_receipt,
 )
 from disclosure_anchor.application.ports.parser import (
     ParserIdentity,
@@ -182,34 +184,15 @@ class MinerUDocumentParser:
         receipt_path = content_list_path.with_name(
             artifact_stem + "_parse_receipt.json"
         )
-        endpoint = {
-            "server_url": server_url,
-            "remote_model_name": parser_info.remote_model_name,
-        }
         _write_json_artifact(
             receipt_path,
-            {
-                "receipt_contract_version": "parse-receipt.v1",
-                "source_pdf_sha256": source_pdf_sha256,
-                "parser_target": parser_info.to_payload(),
-                "endpoint": {
-                    **endpoint,
-                    "endpoint_identity_sha256": "sha256:"
-                    + hashlib.sha256(
-                        json.dumps(
-                            endpoint,
-                            separators=(",", ":"),
-                            sort_keys=True,
-                        ).encode("utf-8")
-                    ).hexdigest(),
-                },
-                "request_profile": {
-                    "http_request_concurrency": (
-                        options.http_request_concurrency
-                    ),
-                    "timeout_seconds": options.timeout_seconds,
-                },
-            },
+            build_parse_receipt(
+                source_pdf_sha256=source_pdf_sha256,
+                parser_target_payload=parser_info.to_payload(),
+                server_url=server_url,
+                http_request_concurrency=options.http_request_concurrency,
+                timeout_seconds=options.timeout_seconds,
+            ),
             label="parse receipt",
         )
         return ParserResult(

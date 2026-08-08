@@ -8,6 +8,7 @@ NormalizedIR-compatible data and controlled artifact paths.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -107,6 +108,36 @@ class ParserOptions:
 class ParserIdentity:
     name: str
     version: str
+
+
+def resolve_current_parser_target(
+    parser: Any,
+    options: "ParserOptions",
+) -> tuple[ParserTargetIdentity, "ParserOptions"]:
+    """Single authority for the closed current parse target.
+
+    Every surface that freezes or persists a current target — run
+    preparation and corpus manifest capture alike — must resolve the
+    remote model through the parser itself, so an HTTP target is either
+    explicit or the caller fails closed; nothing ever freezes an
+    unattested target as its intended identity.
+    """
+
+    identity = parser.identity()
+    if options.backend.endswith("-http-client"):
+        resolver = getattr(parser, "resolve_remote_model", None)
+        if not callable(resolver):
+            from disclosure_anchor.domain.errors import (
+                RemoteModelAmbiguousError,
+            )
+
+            raise RemoteModelAmbiguousError(
+                "HTTP parser backend requires a remote-model resolver"
+            )
+        options = dataclasses.replace(
+            options, remote_model_name=resolver(options)
+        )
+    return options.target_identity(identity), options
 
 
 @dataclass(frozen=True)

@@ -434,8 +434,14 @@ class BuildPublishClosureTests(unittest.TestCase):
                 normalized_ir_relpath=str(relpath),
                 artifact_hash=_sha(raw),
             )
+            document = e.Document(
+                document_id="doc_1",
+                status="parsed",
+                raw_file_hash=normalized["source_pdf_sha256"],
+            )
+            run.input_raw_file_hash = normalized["source_pdf_sha256"]
             with self.assertRaises(PublishRunError) as raised:
-                NormalizedIRPublicationGuard(Paths(root))(run)
+                NormalizedIRPublicationGuard(Paths(root))(run, document)
         self.assertEqual(
             raised.exception.error["error_code"],
             "VISUAL_SEMANTIC_CLOSURE_UNRESOLVED",

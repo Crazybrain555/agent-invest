@@ -388,17 +388,20 @@ class MinerUProcess:
         data = payload.get("data") if isinstance(payload, dict) else None
         models: list[str] | None = None
         if isinstance(data, list):
-            models = [
-                model_id
-                for item in data
-                if isinstance(item, dict)
-                and isinstance(model_id := item.get("id"), str)
-                and model_id.strip()
-            ]
+            models = []
+            for item in data:
+                model_id = item.get("id") if isinstance(item, dict) else None
+                if not isinstance(model_id, str) or not model_id.strip():
+                    # A malformed entry hides how many models the server
+                    # really serves; ignoring it could make a multi-model
+                    # server look like a singleton. Fail closed instead.
+                    models = None
+                    break
+                models.append(model_id)
         if models is None or len(models) != 1:
             raise RemoteModelAmbiguousError(
-                "MinerU backend must serve exactly one model, got "
-                f"{sorted(models) if models else models}: {server_url}"
+                "MinerU backend must serve exactly one well-formed model, "
+                f"got {sorted(models) if models else models}: {server_url}"
             )
         return models[0]
 

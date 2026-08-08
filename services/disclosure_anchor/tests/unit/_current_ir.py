@@ -44,6 +44,9 @@ from disclosure_anchor.adapters.parsers.pdf_visual_evidence import (
     RENDER_OPTIONS,
     VisualPageEvidence,
 )
+from disclosure_anchor.application.contracts.parse_receipt import (
+    build_parse_receipt,
+)
 from disclosure_anchor.application.contracts.normalized_ir import (
     validate_current_normalized_ir_for_write,
 )
@@ -383,6 +386,18 @@ def write_text_ir_bundle(
         "visual_semantics": (
             artifact_root / "visual_semantics.json",
             visual_semantics_payload,
+        ),
+        "parse_receipt": (
+            artifact_root / "parse_receipt.json",
+            _json_bytes(
+                build_parse_receipt(
+                    source_pdf_sha256=SOURCE_PDF_SHA256,
+                    parser_target_payload=normalized_ir["parser"],
+                    server_url="http://fixture",
+                    http_request_concurrency=None,
+                    timeout_seconds=None,
+                )
+            ),
         ),
     }
     if page_visual:

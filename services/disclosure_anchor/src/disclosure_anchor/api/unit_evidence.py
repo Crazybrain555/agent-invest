@@ -176,7 +176,16 @@ def read_unit_evidence(
         evidence_integrity_error("normalized_ir_invalid")
     normalized_ir = cast(Mapping[str, Any], decoded)
     try:
-        version = validate_current_normalized_ir_for_write(normalized_ir)
+        # Evidence retrieval serves the stored artifact of the generation
+        # that published the unit: integrity is anchored by the unit-row
+        # hash equality above plus the closed write shape. The generational
+        # gates (current structure algorithm, current parser target, parse
+        # receipt) govern new publication, not serving already-published
+        # evidence, so the frozen-generation authority applies here.
+        version = validate_current_normalized_ir_for_write(
+            normalized_ir,
+            write_authority="frozen_generation",
+        )
         validate_normalized_ir_identity(normalized_ir, document_id=document_id)
         validate_normalized_ir_path_version(ir_relpath, version=version)
     except NormalizedIRVersionError:

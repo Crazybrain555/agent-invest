@@ -153,7 +153,7 @@
   },
   "tests/unit/test_corpus_reparse.py": {
    "private_imports": [],
-   "tests": 18
+   "tests": 19
   },
   "tests/unit/test_corpus_reset_backup.py": {
    "private_imports": [],
@@ -213,7 +213,7 @@
     "_validate_semantic_key",
     "_validate_semantic_key_list"
    ],
-   "tests": 12
+   "tests": 13
   },
   "tests/unit/test_gc_orphan_artifacts.py": {
    "private_imports": [],
@@ -319,7 +319,7 @@
    "private_imports": [
     "_validate_candidate_unit_set"
    ],
-   "tests": 20
+   "tests": 23
   },
   "tests/unit/test_raw_document_store.py": {
    "private_imports": [],

@@ -564,6 +564,56 @@ class FilingApiUnitTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 422)
         self.assertEqual(caught.exception.detail["error_code"], "VALIDATION_ERROR")
 
+    def test_unit_evidence_serves_legacy_generation_artifacts(self) -> None:
+        # Evidence retrieval serves whatever generation published the unit:
+        # a stored v1 parser target with an earlier structure algorithm and
+        # no parse receipt stays servable under its unit-row hash binding.
+        with tempfile.TemporaryDirectory() as tmp:
+            (
+                settings,
+                row,
+                normalized_ir,
+                _evidence_path,
+                content,
+                evidence_sha256,
+            ) = _evidence_bundle(Path(tmp))
+            normalized_ir["parser"]["target_contract_version"] = (
+                "parser-target.v1"
+            )
+            normalized_ir["parser"].pop("remote_model_name")
+            normalized_ir["parser"].pop("remote_selection_mode")
+            normalized_ir["parser_artifacts"]["files"].pop("parse_receipt")
+            normalized_ir["structure_proof"]["algorithm_version"] = (
+                "document-structure-evidence.v13"
+            )
+            data_root = settings.disclosure_data_root / "data"
+            paths = FileStorePathBuilder(settings)
+            ir_relpath = paths.normalized_ir_run_relpath(
+                provider="cninfo",
+                security_code="002484",
+                provider_document_id="pid-doc_1",
+                processing_run_id="run_parse_owner",
+            )
+            ir_content = json.dumps(
+                normalized_ir,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8")
+            (data_root / ir_relpath).write_bytes(ir_content)
+            row["artifact_hash"] = (
+                "sha256:" + hashlib.sha256(ir_content).hexdigest()
+            )
+            row["producer_artifact_hash"] = row["artifact_hash"]
+
+            response = get_unit_evidence(
+                "asset_1",
+                evidence_sha256.removeprefix("sha256:"),
+                _request(_Engine([[row]]), settings=settings),
+            )
+
+            self.assertEqual(response.body, content)
+
     def test_unit_evidence_read_is_authorized_and_integrity_bound(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             (

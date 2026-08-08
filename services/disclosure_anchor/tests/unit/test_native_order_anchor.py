@@ -55,6 +55,7 @@ _ARTIFACT_ROLES = (
     "content_list_v2",
     "middle",
     "model",
+    "parse_receipt",
     "pdf_structure",
     "source_evidence",
     "visual_semantics",

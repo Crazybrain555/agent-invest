@@ -17,6 +17,7 @@ from disclosure_anchor.application.contracts.document_structure import (
     carrier_set_sha256,
 )
 from disclosure_anchor.application.use_cases.publish_run import (
+    TERMINAL_PUBLICATION_ERROR_CODES,
     NormalizedIRPublicationGuard,
     PublishRun,
     PublishRunCommand,
@@ -131,7 +132,9 @@ def _sync_run_hashes(uow: FakeUnitOfWork, run_id: str) -> None:
     )
 
 
-def _allow_whole_pdf(_run: e.ProcessingRun) -> None:
+def _allow_whole_pdf(
+    _run: e.ProcessingRun, _document: e.Document
+) -> None:
     """Unit tests below isolate publish semantics from artifact I/O."""
 
 
@@ -850,6 +853,188 @@ class PublishRunTests(unittest.TestCase):
         self.assertEqual(
             event.payload["allow_empty_reason"], "fixture intentionally empty"
         )
+
+
+
+class PublicationIdentityGateTests(unittest.TestCase):
+    """Activation of historically built runs shares the identity gate."""
+
+    class _Paths:
+        def __init__(self, root: Path) -> None:
+            self._root = root
+
+        def data_path(self, relpath: Path) -> Path:
+            return self._root / relpath
+
+    def _environment(
+        self, root: Path
+    ) -> tuple[dict, e.ProcessingRun, e.Document, Path]:
+        relpath = Path("derived/normalized_ir/g/run_1/normalized_ir.v4.json")
+        normalized = write_text_ir_bundle(root, relpath)
+        raw = (root / relpath).read_bytes()
+        run = e.ProcessingRun(
+            processing_run_id="run_1",
+            document_id="doc_1",
+            artifact_owner_processing_run_id="run_1",
+            run_kind="parse",
+            status="succeeded",
+            parser_target_identity=normalized["parser"],
+            input_raw_file_hash=str(normalized["source_pdf_sha256"]),
+            normalized_ir_relpath=str(relpath),
+            artifact_hash="sha256:" + hashlib.sha256(raw).hexdigest(),
+        )
+        document = e.Document(
+            document_id="doc_1",
+            status="parsed",
+            raw_file_hash=str(normalized["source_pdf_sha256"]),
+        )
+        return normalized, run, document, relpath
+
+    def _rewrite(
+        self,
+        root: Path,
+        relpath: Path,
+        normalized: dict,
+        run: e.ProcessingRun,
+    ) -> None:
+        import json as _json
+
+        raw = _json.dumps(
+            normalized, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        (root / relpath).write_bytes(raw)
+        run.artifact_hash = "sha256:" + hashlib.sha256(raw).hexdigest()
+        run.parser_target_identity = normalized["parser"]
+
+    def test_untampered_current_run_passes_the_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, run, document, _ = self._environment(root)
+            NormalizedIRPublicationGuard(self._Paths(root))(run, document)
+
+    def test_historical_runs_never_activate_with_stale_identity(self) -> None:
+        cases = {
+            "built_v1_target": (
+                "IR_CONTRACT_TOO_OLD",
+                "parser_target_reparse_required",
+            ),
+            "built_singleton_model": (
+                "REMOTE_MODEL_UNATTESTED",
+                "remote_model_unattested",
+            ),
+            "broken_pdf_hash_chain": (
+                "SOURCE_PDF_IDENTITY_MISMATCH",
+                "source_pdf_identity_mismatch",
+            ),
+            "legacy_structure_algorithm": (
+                "IR_CONTRACT_TOO_OLD",
+                "structure_proof_reparse_required",
+            ),
+        }
+        for label, (error_code, reason_code) in cases.items():
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    normalized, run, document, relpath = self._environment(
+                        root
+                    )
+                    if label == "built_v1_target":
+                        normalized["parser"][
+                            "target_contract_version"
+                        ] = "parser-target.v1"
+                        normalized["parser"].pop("remote_model_name")
+                        normalized["parser"].pop("remote_selection_mode")
+                        self._rewrite(root, relpath, normalized, run)
+                    elif label == "built_singleton_model":
+                        normalized["parser"].update(
+                            backend="vlm-http-client",
+                            remote_model_name=None,
+                            remote_selection_mode=(
+                                "server_singleton_unattested"
+                            ),
+                        )
+                        self._rewrite(root, relpath, normalized, run)
+                    elif label == "broken_pdf_hash_chain":
+                        run.input_raw_file_hash = "sha256:" + "d" * 64
+                    elif label == "legacy_structure_algorithm":
+                        normalized["structure_proof"][
+                            "algorithm_version"
+                        ] = "document-structure-evidence.v13"
+                        self._rewrite(root, relpath, normalized, run)
+                    with self.assertRaises(PublishRunError) as raised:
+                        NormalizedIRPublicationGuard(self._Paths(root))(
+                            run, document
+                        )
+                    self.assertEqual(
+                        raised.exception.error["error_code"], error_code
+                    )
+                    self.assertEqual(
+                        raised.exception.error.get("reason_code"),
+                        reason_code,
+                    )
+                    self.assertIn(
+                        error_code, TERMINAL_PUBLICATION_ERROR_CODES
+                    )
+
+    def test_receipt_tampering_never_activates(self) -> None:
+        cases = (
+            "receipt_role_missing",
+            "receipt_bytes_tampered",
+            "receipt_semantic_mismatch",
+        )
+        for label in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    normalized, run, document, relpath = self._environment(
+                        root
+                    )
+                    files = normalized["parser_artifacts"]["files"]
+                    receipt_relpath = Path(
+                        files["parse_receipt"]["relpath"]
+                    )
+                    if label == "receipt_role_missing":
+                        files.pop("parse_receipt")
+                        self._rewrite(root, relpath, normalized, run)
+                        expected = "PARSE_RECEIPT_MISSING"
+                    elif label == "receipt_bytes_tampered":
+                        (root / receipt_relpath).write_bytes(b"{}")
+                        expected = "PARSE_RECEIPT_INVALID"
+                    else:
+                        import json as _json
+
+                        receipt = _json.loads(
+                            (root / receipt_relpath).read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                        receipt["endpoint"][
+                            "remote_model_name"
+                        ] = "forged-model"
+                        raw = _json.dumps(
+                            receipt,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ).encode("utf-8")
+                        (root / receipt_relpath).write_bytes(raw)
+                        files["parse_receipt"]["sha256"] = (
+                            "sha256:" + hashlib.sha256(raw).hexdigest()
+                        )
+                        files["parse_receipt"]["size_bytes"] = len(raw)
+                        self._rewrite(root, relpath, normalized, run)
+                        expected = "PARSE_RECEIPT_INVALID"
+                    with self.assertRaises(PublishRunError) as raised:
+                        NormalizedIRPublicationGuard(self._Paths(root))(
+                            run, document
+                        )
+                    self.assertEqual(
+                        raised.exception.error["error_code"], expected
+                    )
+                    self.assertIn(
+                        expected, TERMINAL_PUBLICATION_ERROR_CODES
+                    )
+
 
 
 if __name__ == "__main__":

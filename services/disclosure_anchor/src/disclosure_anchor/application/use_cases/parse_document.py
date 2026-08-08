@@ -25,7 +25,11 @@ from disclosure_anchor.application.ports.file_store import (
     FileStorePathPort,
     RawDocumentStorePort,
 )
-from disclosure_anchor.application.ports.parser import DocumentParserPort, ParserOptions
+from disclosure_anchor.application.ports.parser import (
+    DocumentParserPort,
+    ParserOptions,
+    resolve_current_parser_target,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.worker.locks import (
     exclusive_document_producer,
@@ -334,39 +338,30 @@ class ParseDocument:
                     message=str(exc),
                 )
             else:
-                # The remote model is part of the parse target: resolve it
-                # from the backend before the run row exists, so the run is
-                # created against a closed identity or not at all.
-                resolver = getattr(self._parser, "resolve_remote_model", None)
-                if options.backend.endswith("-http-client") and callable(
-                    resolver
-                ):
-                    try:
-                        options = replace(
-                            options,
-                            remote_model_name=resolver(options),
-                        )
-                    except RemoteModelAmbiguousError as exc:
-                        prepare_error = self._structured_error(
-                            stage="parser_identity",
-                            error_code="remote_model_ambiguous",
-                            retryable=False,
-                            retry_budget_class="infrastructure",
-                            message=str(exc),
-                        )
-                    except ParserVersionProbeError as exc:
-                        prepare_error = self._structured_error(
-                            stage="parser_identity",
-                            error_code="remote_model_unresolved",
-                            retryable=True,
-                            retry_budget_class="infrastructure",
-                            message=str(exc),
-                        )
+                # The remote model is part of the parse target: the single
+                # resolver authority closes it before the run row exists,
+                # so the run is created against a closed identity or not
+                # at all.
                 try:
-                    if prepare_error is None:
-                        parser_target_identity = options.target_identity(
-                            identity
-                        )
+                    parser_target_identity, options = (
+                        resolve_current_parser_target(self._parser, options)
+                    )
+                except RemoteModelAmbiguousError as exc:
+                    prepare_error = self._structured_error(
+                        stage="parser_identity",
+                        error_code="remote_model_ambiguous",
+                        retryable=False,
+                        retry_budget_class="infrastructure",
+                        message=str(exc),
+                    )
+                except ParserVersionProbeError as exc:
+                    prepare_error = self._structured_error(
+                        stage="parser_identity",
+                        error_code="remote_model_unresolved",
+                        retryable=True,
+                        retry_budget_class="infrastructure",
+                        message=str(exc),
+                    )
                 except ParserTargetIdentityError as exc:
                     parser_target_identity = None
                     prepare_error = self._structured_error(
@@ -682,6 +677,12 @@ class ParseDocument:
             return typed(
                 "parse_output",
                 "remote_model_changed",
+                retryable=False,
+            )
+        if isinstance(exc, RemoteModelAmbiguousError):
+            return typed(
+                "parse_output",
+                "remote_model_ambiguous",
                 retryable=False,
             )
         if isinstance(exc, StructureNativeEvidenceRequiredError):
