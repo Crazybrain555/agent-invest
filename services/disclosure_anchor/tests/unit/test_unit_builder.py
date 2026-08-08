@@ -2185,6 +2185,69 @@ class ConservationTests(unittest.TestCase):
             {finding.code for finding in duplicated.findings},
         )
 
+        # Tamper 3 (inverse binding): ordinary body text cannot buy the
+        # furniture exemption — a body leaf carrying the role must be
+        # rejected because its sources are not page_furniture elements.
+        def forge_role(payload: dict[str, Any]) -> None:
+            for part in payload.get("parts", []):
+                if isinstance(part, dict) and part.get("text") == "经营正常。":
+                    part["representation_role"] = "page_furniture_unproved"
+                    part["search_policy"] = "none"
+                    part["quality_status"] = "needs_review"
+                    part_locator = part.get("artifact_locator")
+                    if isinstance(part_locator, dict):
+                        part_locator["source_projection"]["search_targets"] = []
+
+        forged: list[AuditUnitView] = []
+        for view_index, draft in enumerate(drafts, start=1):
+            payload = json.loads(json.dumps(draft.payload))
+            locator = json.loads(json.dumps(draft.artifact_locator or {}))
+            forge_role(payload)
+            forged.append(view(view_index, draft, payload, locator))
+        misbound = audit(forged)
+        self.assertFalse(misbound.ok)
+        self.assertIn(
+            "page_furniture_support_misbound",
+            {finding.code for finding in misbound.findings},
+        )
+
+        # Mixed-source variant: a leaf whose sources span body and furniture
+        # elements must not claim the furniture exemption either.
+        def forge_mixed(payload: dict[str, Any]) -> None:
+            furniture_sources: list[Any] = []
+            for part in payload.get("parts", []):
+                if (
+                    isinstance(part, dict)
+                    and part.get("representation_role")
+                    == "page_furniture_unproved"
+                ):
+                    part_locator = part.get("artifact_locator")
+                    if isinstance(part_locator, dict):
+                        furniture_sources = part_locator["source_projection"][
+                            "payload"
+                        ]["sources"]
+            for part in payload.get("parts", []):
+                if isinstance(part, dict) and part.get("text") == "经营正常。":
+                    part["representation_role"] = "page_furniture_unproved"
+                    part["search_policy"] = "none"
+                    part_locator = part.get("artifact_locator")
+                    if isinstance(part_locator, dict):
+                        graph = part_locator["source_projection"]
+                        graph["search_targets"] = []
+                        graph["payload"]["sources"] = (
+                            list(graph["payload"]["sources"])
+                            + list(furniture_sources)
+                        )
+
+        mixed_views: list[AuditUnitView] = []
+        for view_index, draft in enumerate(drafts, start=1):
+            payload = json.loads(json.dumps(draft.payload))
+            locator = json.loads(json.dumps(draft.artifact_locator or {}))
+            forge_mixed(payload)
+            mixed_views.append(view(view_index, draft, payload, locator))
+        mixed_report = audit(mixed_views)
+        self.assertFalse(mixed_report.ok)
+
     def test_proved_empty_section_never_binds_its_page_furniture(self) -> None:
         elements = [
             _element(0, text="27、生物资产", text_level=1, page_no=1),

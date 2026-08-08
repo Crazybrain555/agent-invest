@@ -3781,6 +3781,29 @@ def _collect_projection_graph(
         and payload.get("search_policy") == "none"
     ):
         state.non_primary_source_alternative_count += 1
+    if (
+        payload_kind == "text"
+        and payload.get("representation_role") == "page_furniture_unproved"
+    ):
+        # Inverse binding: the role silently removes a leaf from primary
+        # search, so every payload ref must resolve to a provider-typed
+        # page_furniture element. Ordinary body text can never buy this
+        # exemption by carrying the marker.
+        support_refs = local_roles["payload"]
+        if not support_refs or any(
+            not isinstance((element := source.elements.get(ref)), Mapping)
+            or element.get("kind") != "page_furniture"
+            for ref in support_refs
+        ):
+            _projection_finding(
+                findings,
+                unit=unit,
+                code="page_furniture_support_misbound",
+                message=(
+                    "a page-furniture support leaf is not backed exclusively "
+                    "by page_furniture source elements"
+                ),
+            )
     if primary_required:
         state.required_search_carriers.add(carrier_id)
     try:
