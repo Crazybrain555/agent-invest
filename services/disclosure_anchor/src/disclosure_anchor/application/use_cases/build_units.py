@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
+from disclosure_anchor.application.contracts.document_structure import (
+    DocumentStructureContractError,
+    require_current_document_structure,
+)
 from disclosure_anchor.application.contracts.normalized_ir import (
     CURRENT_NORMALIZED_IR_VERSION,
     NormalizedIRVersionError,
@@ -517,6 +521,22 @@ class BuildUnits:
                     ),
                 )
             )
+        # A current envelope may still carry an earlier structure algorithm.
+        # Convert the central currency gate into the same typed terminal here
+        # instead of letting the builder's contract error surface as a
+        # generic preparation failure.
+        try:
+            require_current_document_structure(
+                cast(dict[str, Any], payload["structure_proof"])
+            )
+        except DocumentStructureContractError as exc:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="IR_CONTRACT_TOO_OLD",
+                    reason_code="structure_proof_reparse_required",
+                    message=str(exc),
+                )
+            ) from exc
         try:
             run_target = ParserTargetIdentity.from_payload(expected_parser_target)
             ir_target = ParserTargetIdentity.from_payload(payload.get("parser"))

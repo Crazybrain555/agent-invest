@@ -304,3 +304,59 @@ def build_proof_with_auto_native(**kwargs: Any) -> dict[str, Any]:
                 table_role_overrides=kwargs.get("table_role_overrides", ()),
             )
     return build_mineru_structure_proof(**kwargs)
+
+
+def native_page_from_lines(
+    lines: list[tuple[str, tuple[float, float, float, float]]],
+    *,
+    page_idx: int = 0,
+    width: float = 400.0,
+    height: float = 400.0,
+) -> Any:
+    """Build one native page from explicitly stated line geometry.
+
+    Unlike :func:`auto_native_pages`, nothing is inferred: the fixture
+    states each rendered line's text and box, so a test can model precise
+    physical facts (a stacked display component, a body-band line) without
+    deriving the geometry from the claim under test.
+    """
+
+    from disclosure_anchor.adapters.parsers.pdf_native_text import (
+        NativeTextAtom,
+        NativeTextLayoutRef,
+        NativeTextPage,
+    )
+
+    atoms: list[Any] = []
+    parts: list[str] = []
+    offset = 0
+    for text, box in lines:
+        if parts:
+            parts.append("\n")
+            offset += 1
+        start = offset
+        parts.append(text)
+        offset += len(text)
+        atoms.append(
+            NativeTextAtom(
+                page_idx=page_idx,
+                order=len(atoms),
+                bbox=(
+                    float(box[0]),
+                    float(box[1]),
+                    float(box[2]),
+                    float(box[3]),
+                ),
+                char_span=(start, offset),
+                text=text,
+                layout=NativeTextLayoutRef(0, len(atoms), 0, 0),
+            )
+        )
+    return NativeTextPage(
+        page_idx=page_idx,
+        width=width,
+        height=height,
+        text="".join(parts),
+        atoms=tuple(atoms),
+        geometry_issues=(),
+    )

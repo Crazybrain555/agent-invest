@@ -125,6 +125,19 @@ class ParserOutputContractError(ParserError):
     reason_code = "parser_output_contract_error"
 
 
+class StructureNativeEvidenceRequiredError(ParserOutputContractError):
+    """Raised when the current structure proof lacks its native source lane.
+
+    A missing native lane is not a provider contract defect and never
+    downgrades to a legacy algorithm: the document simply cannot enter the
+    canonical publication lane until its native evidence exists. The typed
+    terminal lets operations tell this state apart from genuinely broken
+    parser output.
+    """
+
+    reason_code = "structure_native_evidence_required"
+
+
 class ParserUnknownError(ParserError):
     """Raised when a parser adapter wraps an unexpected parser failure."""
 

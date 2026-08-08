@@ -48,7 +48,10 @@ from disclosure_anchor.application.contracts.document_structure import (
 from disclosure_anchor.application.contracts.unit_source_projection import (
     source_value_sha256,
 )
-from disclosure_anchor.domain.errors import ParserOutputContractError
+from disclosure_anchor.domain.errors import (
+    ParserOutputContractError,
+    StructureNativeEvidenceRequiredError,
+)
 
 
 _HEADING_ROLES = {f"H{level}": level for level in range(1, 7)}
@@ -204,9 +207,9 @@ def build_mineru_structure_proof(
         # algorithm: the document cannot enter the canonical publication
         # lane until its native evidence exists. Real extraction-tool errors
         # keep their own terminals upstream and are never converted here.
-        raise ParserOutputContractError(
-            "structure_native_evidence_required: the current structure proof "
-            "requires native source pages and validated carrier support"
+        raise StructureNativeEvidenceRequiredError(
+            "the current structure proof requires native source pages and "
+            "validated carrier support"
         )
     _require_source_supported_carriers(
         carriers,

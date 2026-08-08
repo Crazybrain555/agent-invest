@@ -36,18 +36,19 @@ from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import (
     ParseDocumentError,
-    ParserError,
     ParserBackendOverloadedError,
     ParserCancelledError,
+    ParserError,
     ParserInvocationError,
     ParserLocalInvocationError,
     ParserOutputContractError,
+    ParserRetryBudgetClass,
     ParserTaskDeadlineError,
     ParserTaskError,
     ParserTimeoutError,
     ParserUnknownError,
     ParserVersionProbeError,
-    ParserRetryBudgetClass,
+    StructureNativeEvidenceRequiredError,
 )
 
 
@@ -630,6 +631,12 @@ class ParseDocument:
                 "parser_identity",
                 "parser_version_probe_failed",
                 retryable=True,
+            )
+        if isinstance(exc, StructureNativeEvidenceRequiredError):
+            return typed(
+                "parse_output",
+                "structure_native_evidence_required",
+                retryable=False,
             )
         if isinstance(exc, ParserOutputContractError):
             return typed(

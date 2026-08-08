@@ -1012,6 +1012,34 @@ class BuildUnitsTests(unittest.TestCase):
                 [],
             )
 
+    def test_current_ir_with_legacy_structure_requires_reparse(self) -> None:
+        # A v4 envelope can still carry an earlier structure algorithm; the
+        # use case must answer with the typed reparse terminal instead of a
+        # generic preparation failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _setup(root)
+            payload = json.loads((root / ir_relpath).read_text(encoding="utf-8"))
+            payload["structure_proof"]["algorithm_version"] = (
+                "document-structure-evidence.v13"
+            )
+            _rewrite_ir(root, uow, ir_relpath, payload)
+
+            result = _use_case(root, uow).execute(
+                BuildUnitsCommand(processing_run_id="run_1")
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.error["error_code"], "IR_CONTRACT_TOO_OLD")
+            self.assertEqual(
+                result.error["reason_code"],
+                "structure_proof_reparse_required",
+            )
+            self.assertEqual(
+                uow.document_units.list_by_processing_run("run_1"),
+                [],
+            )
+
     def test_legacy_ir_requires_reparse_instead_of_guessing_structure(
         self,
     ) -> None:

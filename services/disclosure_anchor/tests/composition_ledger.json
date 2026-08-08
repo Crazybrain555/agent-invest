@@ -123,7 +123,7 @@
   },
   "tests/unit/test_build_units.py": {
    "private_imports": [],
-   "tests": 18
+   "tests": 19
   },
   "tests/unit/test_canonical_occurrence.py": {
    "private_imports": [],
@@ -275,7 +275,7 @@
   },
   "tests/unit/test_parse_document.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 12
   },
   "tests/unit/test_parser_target.py": {
    "private_imports": [],
@@ -363,7 +363,7 @@
   },
   "tests/unit/test_structure_proof.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 12
   },
   "tests/unit/test_subject_resolver.py": {
    "private_imports": [],
@@ -379,7 +379,7 @@
   },
   "tests/unit/test_unit_builder.py": {
    "private_imports": [],
-   "tests": 54
+   "tests": 56
   },
   "tests/unit/test_unit_hashing.py": {
    "private_imports": [],

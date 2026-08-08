@@ -48,6 +48,7 @@ from disclosure_anchor.domain.errors import (
     ParserTimeoutError,
     ParserUnknownError,
     ParserVersionProbeError,
+    StructureNativeEvidenceRequiredError,
 )
 from tests.unit._fakes import FakeUnitOfWork
 
@@ -489,6 +490,11 @@ class ParseDocumentUnitTests(unittest.TestCase):
                 "parser_output_contract_failed",
                 False,
             ),
+            (
+                StructureNativeEvidenceRequiredError("native lane missing"),
+                "structure_native_evidence_required",
+                False,
+            ),
             (ParserUnknownError("unknown"), "parser_unknown_failed", False),
         )
         for exc, error_code, retryable in cases:
@@ -512,6 +518,28 @@ class ParseDocumentUnitTests(unittest.TestCase):
         self.assertFalse(parser.called)
         self.assertEqual(result.error["error_code"], "parser_readiness_failed")
         self.assertTrue(result.error["retryable"])
+
+    def test_missing_native_evidence_is_typed_and_writes_no_ir(self) -> None:
+        # The native lane being absent is an operational state, not a broken
+        # provider artifact: it must persist as its own terminal and leave
+        # no NormalizedIR behind.
+        uow = _uow_with_document()
+        use_case, artifact_store = _use_case(
+            uow,
+            parser=_Parser(
+                error=StructureNativeEvidenceRequiredError("native lane missing")
+            ),
+        )
+
+        result = use_case.execute(_command())
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(
+            result.error["error_code"],
+            "structure_native_evidence_required",
+        )
+        self.assertFalse(result.error["retryable"])
+        self.assertEqual(artifact_store.payloads, {})
 
     def test_new_parse_rejects_legacy_ir_generation(self) -> None:
         uow = _uow_with_document()

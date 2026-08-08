@@ -13,8 +13,16 @@ from typing import Any
 from disclosure_anchor.adapters.parsers.mineru.content_list_contract import (
     mineru_provider_item_sha256,
 )
+from disclosure_anchor.domain.errors import (
+    StructureNativeEvidenceRequiredError,
+)
 from tests.unit._native_support import (
     build_proof_with_auto_native,
+    native_page_from_lines,
+    test_carrier_source_support,
+)
+from disclosure_anchor.adapters.parsers.mineru.structure_proof import (
+    build_mineru_structure_proof,
 )
 from disclosure_anchor.adapters.parsers.mineru.text_projection import (
     build_mineru_text_projections,
@@ -298,18 +306,43 @@ class StructureProofConflictTests(unittest.TestCase):
                 validate_document_structure(proof, elements=elements_for(content))
 
     def test_overlapping_native_headings_reject_the_later_claim(self) -> None:
+        # Explicit physical facts, stated independently of the claims under
+        # test: the first two lines form one cohesive page-front stacked
+        # display component; the third is an ordinary body line.
         content = body(("公司治理", "内部控制", "关联交易"))
-        proof = proof_for(
-            content,
-            nodes=(
-                heading_node(1, "H1", (0, 1)),
-                heading_node(
-                    2,
-                    "H2",
-                    (1, 2),
-                    ancestor_roles=("H1",),
-                    ancestors=(1,),
+        page = native_page_from_lines(
+            [
+                ("公司治理", (120.0, 100.0, 280.0, 124.0)),
+                ("内部控制", (120.0, 130.0, 280.0, 154.0)),
+                ("关联交易", (40.0, 220.0, 360.0, 232.0)),
+                ("·基准正文甲·", (30.0, 300.0, 370.0, 310.0)),
+                ("·基准正文乙·", (30.0, 320.0, 370.0, 330.0)),
+                ("·基准正文丙·", (30.0, 340.0, 370.0, 350.0)),
+                ("·基准正文丁·", (30.0, 360.0, 370.0, 370.0)),
+            ],
+            width=400.0,
+            height=420.0,
+        )
+        proof = build_proof_with_auto_native(
+            native=native_structure(
+                content,
+                nodes=(
+                    heading_node(1, "H1", (0, 1)),
+                    heading_node(
+                        2,
+                        "H2",
+                        (1, 2),
+                        ancestor_roles=("H1",),
+                        ancestors=(1,),
+                    ),
                 ),
+            ),
+            content_list=content,
+            source_pdf_sha256=SOURCE_PDF_SHA256,
+            source_pages=(page,),
+            carrier_source_support=test_carrier_source_support(
+                content,
+                source_pages=(page,),
             ),
         )
 
@@ -322,10 +355,44 @@ class StructureProofConflictTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(heading_shape(proof), [])
+        self.assertEqual(
+            heading_shape(proof),
+            [(1, None, True, [0, 2], [0, 1])],
+        )
         self.assertNotIn(2, heading_sources(proof))
-        self.assertEqual(proof["coverage"]["proven_heading_nodes"], 0)
+        self.assertEqual(proof["coverage"]["proven_heading_nodes"], 1)
         validate_document_structure(proof, elements=elements_for(content))
+
+    def test_missing_native_lane_is_the_typed_producer_terminal(self) -> None:
+        content = body(("正文",))
+        for label, kwargs in (
+            ("no_source_pages", {"source_pages": None}),
+            (
+                "no_carrier_support",
+                {
+                    "source_pages": (
+                        native_page_from_lines(
+                            [("正文", (30.0, 100.0, 200.0, 110.0))]
+                        ),
+                    ),
+                    "carrier_source_support": None,
+                },
+            ),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(
+                    StructureNativeEvidenceRequiredError
+                ) as ctx:
+                    build_mineru_structure_proof(
+                        native=native_structure(content),
+                        content_list=content,
+                        source_pdf_sha256=SOURCE_PDF_SHA256,
+                        **kwargs,
+                    )
+                self.assertEqual(
+                    ctx.exception.reason_code,
+                    "structure_native_evidence_required",
+                )
 
     def test_backward_native_parent_edge_is_rejected(self) -> None:
         content = body(("子标题", "正文段落", "章标题"))
@@ -384,7 +451,7 @@ class StructureProofConflictTests(unittest.TestCase):
             ],
         )
 
-    def test_non_propagating_native_parent_blocks_inheritance(self) -> None:
+    def test_unpublishable_native_parent_drops_and_child_roots(self) -> None:
         content = body(("目录中的章节名", "正文中的子标题"))
         proof = proof_for(
             content,
@@ -522,7 +589,7 @@ class StructureProofConflictTests(unittest.TestCase):
             ],
         )
 
-    def test_child_of_a_demoted_anchor_loses_its_edge(self) -> None:
+    def test_child_keeps_its_consistent_subchain_under_a_rooted_anchor(self) -> None:
         content = body(("第一章", "第二章", "第一章第一节", "第一章第一节之一"))
         proof = proof_for(
             content,
@@ -568,7 +635,7 @@ class StructureProofConflictTests(unittest.TestCase):
         )
         validate_document_structure(proof, elements=elements_for(content))
 
-    def test_disagreeing_bookmark_and_provider_parents_drop_the_edge(self) -> None:
+    def test_bookmark_and_provider_parent_hints_stay_observations(self) -> None:
         texts = ("书签父章节", "供方父章节", "冲突子标题")
         bookmarks = (
             bookmark(0, 1, texts[0], destination_y=115),
@@ -760,7 +827,7 @@ class StructureProofCleanEvidenceTests(unittest.TestCase):
                 elements=elements_for(canonical),
             )
 
-    def test_clean_bookmarks_publish_a_closed_heading_tree(self) -> None:
+    def test_clean_bookmark_titles_publish_root_heading_identities(self) -> None:
         texts = ("第一章总则", "第一节适用范围", "正文段落", "第二章财务")
         proof, content = v2_proof(
             body(texts, levels={0: 1, 1: 2, 3: 1}),

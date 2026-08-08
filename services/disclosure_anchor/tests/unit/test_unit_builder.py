@@ -3059,6 +3059,153 @@ class LegacyStructureGoldenMatrixTests(unittest.TestCase):
                 ):
                     require_current_document_structure(cases[name])
 
+    def test_break_carrying_rows_reject_in_audit_and_write_channels(self) -> None:
+        # Break-carrying v12/v13 envelopes must reach the same terminals as
+        # their break-free rows: the read contract accepts the stored shape,
+        # the audit answers with the reparse terminal, and the write contract
+        # rejects regardless of whether breaks happen to be present.
+        elements, headings, scope_breaks = (
+            StructureProofProjectionTests._noncontiguous_target_case()
+        )
+        elements[5]["image_path"] = "images/" + "e" * 64 + ".png"
+        elements[5]["table"] = {
+            **elements[5]["table"],
+            "cells": [
+                {
+                    "row": 0,
+                    "col": 0,
+                    "rowspan": 1,
+                    "colspan": 1,
+                    "text": "新同级表格",
+                    "is_header": False,
+                }
+            ],
+            "embedded_media": [],
+        }
+        v13_breaks = [
+            {
+                key: value
+                for key, value in scope_breaks[0].items()
+                if key
+                not in {"materialization_policy", "flatten_subtree_root_node_id"}
+            }
+        ]
+        table_index = next(
+            int(element["source_item_index"])
+            for element in elements
+            if element.get("raw_kind") == "table"
+        )
+        v12_breaks = [
+            {
+                "page_index": 0,
+                "source_atom_orders": [7],
+                "boundary_start_order": table_index,
+                "eligibility_basis": "numbered_layout_break",
+                "relative_rank": "peer_or_higher",
+            }
+        ]
+        proofs = {}
+        for name, algorithm, breaks in (
+            (
+                "v12_breaks",
+                OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
+                v12_breaks,
+            ),
+            (
+                "v13_breaks",
+                OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM,
+                v13_breaks,
+            ),
+            ("v14", DOCUMENT_STRUCTURE_ALGORITHM, scope_breaks),
+        ):
+            proof = _proof(
+                elements, headings=headings, owner_scope_breaks=breaks
+            )
+            proof["algorithm_version"] = algorithm
+            proofs[name] = proof
+        normalized_ir, source_proof, _resolve, _hashes = (
+            _audit_case_environment(
+                elements,
+                headings=headings,
+                page_count=1,
+            )
+        )
+        for name, proof in proofs.items():
+            payload = json.loads(json.dumps(normalized_ir))
+            payload["structure_proof"] = {
+                **proof,
+                "source_pdf_page_count": 1,
+            }
+            with self.subTest(row=name, channel="audit"):
+                report = audit_document(
+                    normalized_ir=payload,
+                    units=(),
+                    metadata=AuditDocumentMetadata(
+                        document_id=str(payload["document_id"]),
+                        title=None,
+                        filing_type="annual_report",
+                    ),
+                    source_proof=source_proof,
+                    image_hashes={},
+                )
+                codes = {finding.code for finding in report.findings}
+                if name == "v14":
+                    self.assertNotIn("structure_proof_reparse_required", codes)
+                else:
+                    self.assertIn("structure_proof_reparse_required", codes)
+                    self.assertFalse(report.ok)
+            with self.subTest(row=name, channel="write"):
+                if name == "v14":
+                    # This audit envelope keeps read-only element fields, so
+                    # the closed write-element check rejects it later; the
+                    # v14 write pass itself is pinned by the payload matrix.
+                    self.assertEqual(
+                        validate_normalized_ir_contract(payload),
+                        "normalized_ir.v4",
+                    )
+                    require_current_document_structure(
+                        payload["structure_proof"]
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        NormalizedIRVersionError,
+                        "current structure algorithm",
+                    ):
+                        validate_current_normalized_ir_for_write(payload)
+
+    def test_invalid_legacy_artifacts_fail_as_invalid_before_reparse(
+        self,
+    ) -> None:
+        # A corrupted legacy proof is an invalid artifact, not a reparse
+        # candidate: every validating channel must report the integrity
+        # failure; only the bare currency gate (which validates nothing)
+        # answers with the reparse terminal.
+        elements, _headings, rows = self._rows()
+        corrupted = json.loads(json.dumps(rows["v13_breaks"]))
+        corrupted["carrier_set_sha256"] = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(
+            DocumentStructureContractError, "carrier"
+        ):
+            validate_document_structure(corrupted, elements=elements)
+        ir = {
+            "contract_version": "normalized_ir.v4",
+            "source_pdf_sha256": _SOURCE_PDF_SHA256,
+            "elements": elements,
+            "structure_proof": corrupted,
+        }
+        with self.assertRaisesRegex(
+            DocumentStructureContractError, "carrier"
+        ):
+            build_unit_drafts_s1_s7(
+                ir,
+                filing_type="annual_report",
+                image_artifact_resolver=None,
+            )
+        with self.assertRaisesRegex(
+            DocumentStructureContractError, self._REPARSE
+        ):
+            require_current_document_structure(corrupted)
+
     def test_forged_v14_label_cannot_pass_the_audit(self) -> None:
         _elements, _headings, rows = self._rows()
         elements = [

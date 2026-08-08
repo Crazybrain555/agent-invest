@@ -1455,9 +1455,16 @@ class MinerUMapperTests(unittest.TestCase):
         ]
         for index, level in enumerate((1, 2, 2, 2)):
             content[index]["text_level"] = level
+        # The rendered display style of each title is a stated physical
+        # fact of this fixture, not something derived from the v2 claims
+        # under test.
+        display_texts = tuple(
+            item["text"] for item in content if item.get("text_level")
+        )
         proof, content = _v2_structure_proof(
             native=native_index(page_count=1),
             legacy_content_list=content,
+            heading_display_texts=display_texts,
             content_list_v2=[
                 [
                     _title_block(
@@ -1644,10 +1651,14 @@ class MinerUMapperTests(unittest.TestCase):
             elements=_structure_elements(content),
         )
 
-    def test_provider_title_layout_does_not_override_typed_structure(self) -> None:
+    def test_repeated_provider_titles_follow_their_rendered_witness(self) -> None:
+        # Repeated typed titles stand or fall with their native rendering:
+        # display-painted repeats stay headings on every page, while the
+        # same provider claims painted as ordinary body lines suppress.
         cases = {
             "two_pages": (
                 [("仅两页", page, [100, 80, 300, 105]) for page in range(2)],
+                (),
                 2,
             ),
             "changing_bbox": (
@@ -1655,14 +1666,16 @@ class MinerUMapperTests(unittest.TestCase):
                     ("位置变化", page, [100 + page * 4, 80, 300, 105])
                     for page in range(3)
                 ],
+                (),
                 3,
             ),
             "body_band": (
                 [("正文重复", page, [100, 400, 300, 425]) for page in range(3)],
-                3,
+                ("正文重复",),
+                0,
             ),
         }
-        for label, (values, _expected_headings) in cases.items():
+        for label, (values, body_texts, expected_headings) in cases.items():
             with self.subTest(label=label):
                 page_count = max(page for _, page, _ in values) + 1
                 legacy_content = [
@@ -1687,12 +1700,21 @@ class MinerUMapperTests(unittest.TestCase):
                         ]
                         for text, _, bbox in values
                     ],
+                    body_texts=body_texts,
                 )
 
                 self.assertEqual(
                     len(proof["headings"]),
-                    len(values),
+                    expected_headings,
                 )
+                if not expected_headings:
+                    self.assertIn(
+                        "provider_heading_unproved",
+                        {
+                            conflict["relation"]
+                            for conflict in proof["conflicts"]
+                        },
+                    )
                 self.assertEqual(proof["page_frames"], [])
 
     def test_bookmark_corroborated_repeated_titles_remain_headings(self) -> None:
