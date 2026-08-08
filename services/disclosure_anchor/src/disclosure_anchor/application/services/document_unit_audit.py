@@ -315,6 +315,8 @@ class _ProofOwnerScopeBreak:
     target_node_id: int | None
     boundary_carrier_scope: str
     source_atom_orders: tuple[int, ...]
+    materialization_policy: str
+    flatten_subtree_root_node_id: int | None
 
 
 @dataclass(frozen=True)
@@ -322,6 +324,9 @@ class _StructureProofIndex:
     headings: dict[int, _ProofHeading]
     frame_source_indices: frozenset[int]
     owner_scope_breaks: tuple[_ProofOwnerScopeBreak, ...]
+    # Node ids whose accepted subtree a flatten policy folds into a target,
+    # mapped to that target node id.
+    flattened_node_targets: Mapping[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -2373,6 +2378,12 @@ def _build_structure_proof_index(
             source_atom_orders=tuple(
                 int(order) for order in value["source_atom_orders"]
             ),
+            materialization_policy=str(value["materialization_policy"]),
+            flatten_subtree_root_node_id=(
+                int(value["flatten_subtree_root_node_id"])
+                if value["flatten_subtree_root_node_id"] is not None
+                else None
+            ),
         )
         _validate_owner_scope_break_witness(
             scope_break,
@@ -2383,7 +2394,44 @@ def _build_structure_proof_index(
         )
         scope_breaks_list.append(scope_break)
     scope_breaks = tuple(scope_breaks_list)
-    return _StructureProofIndex(headings, frames, scope_breaks)
+    return _StructureProofIndex(
+        headings,
+        frames,
+        scope_breaks,
+        _flattened_node_targets(scope_breaks, headings=headings),
+    )
+
+
+def _flattened_node_targets(
+    scope_breaks: tuple[_ProofOwnerScopeBreak, ...],
+    *,
+    headings: Mapping[int, _ProofHeading],
+) -> dict[int, int]:
+    """Map every flattened subtree node to the target that absorbs it."""
+
+    children: dict[int, list[int]] = {}
+    for node_id, heading in headings.items():
+        if heading.parent_node_id is not None:
+            children.setdefault(heading.parent_node_id, []).append(node_id)
+    targets: dict[int, int] = {}
+    for scope_break in scope_breaks:
+        if scope_break.materialization_policy != "flatten_intervening_subtree":
+            continue
+        root = scope_break.flatten_subtree_root_node_id
+        target = scope_break.target_node_id
+        if root is None or target is None or root not in headings:
+            # The structure-contract validation already reports this shape.
+            continue
+        stack = [root]
+        seen = {root}
+        while stack:
+            node = stack.pop()
+            targets[node] = target
+            for child in children.get(node, []):
+                if child not in seen:
+                    seen.add(child)
+                    stack.append(child)
+    return targets
 
 
 def _validate_owner_scope_break_witness(
@@ -2935,6 +2983,17 @@ def _proved_exact_path(
                     if latest.target_node_id is not None
                     else ()
                 )
+        if owner_path and structure.flattened_node_targets:
+            absorbed_target = next(
+                (
+                    structure.flattened_node_targets[item.node_id]
+                    for item in owner_path
+                    if item.node_id in structure.flattened_node_targets
+                ),
+                None,
+            )
+            if absorbed_target is not None:
+                owner_path = paths[absorbed_target]
         carrier_paths.append(owner_path)
     if not carrier_paths:
         return ()

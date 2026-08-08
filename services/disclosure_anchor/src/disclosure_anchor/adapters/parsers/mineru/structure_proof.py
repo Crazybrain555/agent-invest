@@ -349,13 +349,6 @@ def build_mineru_structure_proof(
         carriers_by_ref=by_ref,
         last_source_index=max(len(content_list) - 1, 0),
     )
-    owner_scope_breaks = _owner_scope_breaks(
-        owner_scope_candidates,
-        headings=headings,
-        carriers_by_ref=by_ref,
-        native_layout_witnesses=native_layout_witnesses,
-        source_item_hashes=source_item_hashes,
-    )
     proven_sources = {ref for candidate in selected.values() for ref in candidate.refs}
     for carrier in carriers:
         if carrier.provider_level is None or carrier.ref in proven_sources:
@@ -375,6 +368,19 @@ def build_mineru_structure_proof(
         carriers,
         native_artifact_sources=native_artifacts,
         heading_sources={ref.source_item_index for ref in proven_sources},
+    )
+    owner_scope_breaks = _owner_scope_breaks(
+        owner_scope_candidates,
+        headings=headings,
+        carriers_by_ref=by_ref,
+        native_layout_witnesses=native_layout_witnesses,
+        source_item_hashes=source_item_hashes,
+        content_list=content_list,
+        frame_member_indices={
+            int(index)
+            for frame in frames
+            for index in frame["member_source_item_indices"]
+        },
     )
     # Carrier identity is the provider's raw item, exactly as the mapper
     # stamps elements: hashing the projected copy would fork the identity
@@ -998,6 +1004,8 @@ def _owner_scope_breaks(
     carriers_by_ref: Mapping[_Ref, _Carrier],
     native_layout_witnesses: Mapping[_Ref, _NativeLayoutWitness],
     source_item_hashes: Mapping[int, str],
+    content_list: list[dict[str, Any]],
+    frame_member_indices: set[int],
 ) -> list[dict[str, Any]]:
     """Close unsafe sibling carry-over without minting a missing heading.
 
@@ -1159,7 +1167,224 @@ def _owner_scope_breaks(
                 "boundary_carrier_scope": candidate.boundary_carrier_scope,
             }
         )
+    _assign_owner_scope_materialization(
+        output,
+        heading_by_id=heading_by_id,
+        content_list=content_list,
+        frame_member_indices=frame_member_indices,
+    )
     return output
+
+
+def _assign_owner_scope_materialization(
+    records: list[dict[str, Any]],
+    *,
+    heading_by_id: Mapping[int, Mapping[str, Any]],
+    content_list: list[dict[str, Any]],
+    frame_member_indices: set[int],
+) -> None:
+    """Decide how each break's target occurrence stays one physical segment.
+
+    Placement never splits one proven section occurrence, so a non-root
+    target that already owns earlier direct content must flatten exactly the
+    one intervening accepted subtree.  Shapes this bounded policy cannot
+    close fail loudly here instead of falling back to the previous sibling.
+    """
+
+    for record in records:
+        target_node_id = record["target_node_id"]
+        policy = "direct_target"
+        flatten_root: int | None = None
+        if target_node_id is not None:
+            direct_runs = _owner_scope_target_runs(
+                int(target_node_id),
+                heading_by_id=heading_by_id,
+                records=records,
+                content_list=content_list,
+                frame_member_indices=frame_member_indices,
+                flattened_ids=frozenset(),
+            )
+            if direct_runs > 1:
+                node: Mapping[str, Any] | None = heading_by_id[
+                    int(record["current_owner_node_id"])
+                ]
+                while node is not None:
+                    parent = node.get("parent_node_id")
+                    if parent == target_node_id:
+                        flatten_root = int(node["node_id"])
+                        break
+                    node = (
+                        heading_by_id.get(parent)
+                        if isinstance(parent, int)
+                        else None
+                    )
+                if flatten_root is None:
+                    raise ParserOutputContractError(
+                        "owner scope break has no intervening subtree to flatten"
+                    )
+                flat_runs = _owner_scope_target_runs(
+                    int(target_node_id),
+                    heading_by_id=heading_by_id,
+                    records=records,
+                    content_list=content_list,
+                    frame_member_indices=frame_member_indices,
+                    flattened_ids=_owner_scope_subtree_ids(
+                        flatten_root,
+                        heading_by_id=heading_by_id,
+                    ),
+                )
+                if flat_runs != 1:
+                    raise ParserOutputContractError(
+                        "owner scope flatten cannot close the target occurrence"
+                    )
+                span = heading_by_id[int(target_node_id)]["section_span"]
+                for other in records:
+                    if other is record:
+                        continue
+                    other_boundary = int(
+                        other["boundary_source_ref"]["source_item_index"]
+                    )
+                    if int(span[0]) < other_boundary <= int(span[1]):
+                        raise ParserOutputContractError(
+                            "owner scope flatten overlaps another break"
+                        )
+                policy = "flatten_intervening_subtree"
+        record["materialization_policy"] = policy
+        record["flatten_subtree_root_node_id"] = flatten_root
+
+
+def _owner_scope_subtree_ids(
+    root_node_id: int,
+    *,
+    heading_by_id: Mapping[int, Mapping[str, Any]],
+) -> frozenset[int]:
+    children: dict[int, list[int]] = defaultdict(list)
+    for node_id, heading in heading_by_id.items():
+        parent = heading.get("parent_node_id")
+        if isinstance(parent, int):
+            children[parent].append(node_id)
+    subtree = {root_node_id}
+    stack = [root_node_id]
+    while stack:
+        for child in children[stack.pop()]:
+            if child not in subtree:
+                subtree.add(child)
+                stack.append(child)
+    return frozenset(subtree)
+
+
+def _owner_scope_target_runs(
+    target_node_id: int,
+    *,
+    heading_by_id: Mapping[int, Mapping[str, Any]],
+    records: Sequence[Mapping[str, Any]],
+    content_list: list[dict[str, Any]],
+    frame_member_indices: set[int],
+    flattened_ids: frozenset[int],
+) -> int:
+    """Mirror placement contiguity for one target over the provider stream."""
+
+    def path_ids(heading: Mapping[str, Any]) -> tuple[int, ...]:
+        path = [int(heading["node_id"])]
+        parent = heading.get("parent_node_id")
+        while isinstance(parent, int):
+            path.append(parent)
+            parent = heading_by_id[parent].get("parent_node_id")
+        return tuple(reversed(path))
+
+    target_path = path_ids(heading_by_id[target_node_id])
+    active = {
+        node_id: heading
+        for node_id, heading in heading_by_id.items()
+        if bool(heading["propagates"]) and node_id not in flattened_ids
+    }
+    dropped_carriers: set[int] = set()
+    for heading in active.values():
+        for raw_ref in heading["source_refs"]:
+            if (
+                raw_ref.get("field", "text") != "text"
+                or raw_ref.get("index") is not None
+            ):
+                continue
+            ref_index = int(raw_ref["source_item_index"])
+            value = content_list[ref_index].get("text")
+            if isinstance(value, str) and [
+                int(part) for part in raw_ref["text_span"]
+            ] == [0, len(value)]:
+                dropped_carriers.add(ref_index)
+    span = heading_by_id[target_node_id]["section_span"]
+    runs = 0
+    inside = False
+    for index in range(int(span[0]), min(int(span[1]) + 1, len(content_list))):
+        if index in frame_member_indices or index in dropped_carriers:
+            continue
+        item = content_list[index]
+        raw_kind = str(item.get("type", ""))
+        if raw_kind in {"header", "footer", "page_number"}:
+            continue
+        if raw_kind == "text":
+            text = item.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+        if raw_kind == "list":
+            list_items = item.get("list_items")
+            if not isinstance(list_items, list) or not any(
+                isinstance(value, str) and value.strip() for value in list_items
+            ):
+                continue
+        owners = [
+            heading
+            for heading in active.values()
+            if int(heading["section_span"][0])
+            <= index
+            <= int(heading["section_span"][1])
+        ]
+        identities: list[tuple[int, ...] | None] = []
+        if not owners:
+            identities.append(None)
+        else:
+            owners.sort(key=lambda heading: len(path_ids(heading)))
+            owner_path = path_ids(owners[-1])
+            applicable = [
+                other
+                for other in records
+                if int(other["current_owner_node_id"]) == owner_path[-1]
+                and int(owners[-1]["section_span"][0])
+                < int(other["boundary_source_ref"]["source_item_index"])
+                <= index
+            ]
+            if applicable:
+                latest = max(
+                    applicable,
+                    key=lambda other: int(
+                        other["boundary_source_ref"]["source_item_index"]
+                    ),
+                )
+                latest_boundary = int(
+                    latest["boundary_source_ref"]["source_item_index"]
+                )
+                latest_target = latest.get("target_node_id")
+                retargeted = (
+                    path_ids(heading_by_id[int(latest_target)])
+                    if latest_target is not None
+                    else None
+                )
+                if (
+                    index == latest_boundary
+                    and latest.get("boundary_carrier_scope") == "selected_only"
+                ):
+                    identities.append(owner_path)
+                    identities.append(retargeted)
+                else:
+                    identities.append(retargeted)
+            else:
+                identities.append(owner_path)
+        for identity in identities:
+            matches = identity == target_path
+            if matches and not inside:
+                runs += 1
+            inside = matches
+    return runs
 
 
 def _same_native_display_style(

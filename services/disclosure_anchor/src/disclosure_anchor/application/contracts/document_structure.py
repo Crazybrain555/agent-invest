@@ -69,10 +69,15 @@ _OWNER_SCOPE_BREAK_FIELDS = frozenset(
         "boundary_source_ref",
         "current_owner_node_id",
         "eligibility_basis",
+        "flatten_subtree_root_node_id",
+        "materialization_policy",
         "relative_rank",
         "source_atom_orders",
         "target_node_id",
     }
+)
+_OWNER_SCOPE_MATERIALIZATION_POLICIES = frozenset(
+    {"direct_target", "flatten_intervening_subtree"}
 )
 _BOUNDARY_SOURCE_REF_FIELDS = frozenset(
     {
@@ -310,6 +315,7 @@ def validate_document_structure(
     _validate_parents(heading_by_id)
 
     prior_boundary = -1
+    current_scope_breaks: list[Mapping[str, Any]] = []
     for raw_break in _list(
         proof.get("owner_scope_breaks", []),
         "structure_proof_owner_scope_breaks_invalid",
@@ -333,12 +339,20 @@ def validate_document_structure(
                 heading_members=heading_members,
                 page_count=page_count,
             )
+            current_scope_breaks.append(scope_break)
         if boundary <= prior_boundary:
             _fail(
                 "structure_proof_owner_scope_break_invalid",
                 "owner scope breaks are not strictly source ordered",
             )
         prior_boundary = boundary
+    if current_scope_breaks:
+        _validate_owner_scope_break_policies(
+            current_scope_breaks,
+            elements_by_index=elements_by_index,
+            headings=heading_by_id,
+            page_frames=proof["page_frames"],
+        )
 
     frame_members: set[int] = set()
     frame_ids: set[str] = set()
@@ -631,6 +645,16 @@ def _validate_owner_scope_break(
             "structure_proof_owner_scope_break_invalid",
             "owner scope break target was not independently derived",
         )
+    flatten_root = scope_break.get("flatten_subtree_root_node_id")
+    if scope_break.get(
+        "materialization_policy"
+    ) not in _OWNER_SCOPE_MATERIALIZATION_POLICIES or (
+        flatten_root is not None and _integer(flatten_root, minimum=1) is None
+    ):
+        _fail(
+            "structure_proof_owner_scope_break_invalid",
+            "owner scope break materialization is not a closed policy",
+        )
     return boundary
 
 
@@ -651,6 +675,257 @@ def _owner_scope_atom_orders(scope_break: Mapping[str, Any]) -> tuple[int, ...]:
             "owner scope source atom orders are invalid",
         )
     return cast(tuple[int, ...], atoms)
+
+
+def _validate_owner_scope_break_policies(
+    scope_breaks: Sequence[Mapping[str, Any]],
+    *,
+    elements_by_index: Mapping[int, Mapping[str, Any]],
+    headings: Mapping[int, Mapping[str, Any]],
+    page_frames: object,
+) -> None:
+    """Re-derive each break's materialization from the DAG and source order.
+
+    A stored policy is only transport: whether a non-root target stays one
+    physical occurrence is recomputed here from accepted section spans, the
+    carrier order, and every break's retargeting effect.  Producer node lists
+    are never trusted.
+    """
+
+    frame_members = {
+        index
+        for frame in cast(Sequence[Mapping[str, Any]], page_frames)
+        for index in cast(
+            Sequence[object], frame.get("member_source_item_indices", [])
+        )
+        if isinstance(index, int) and not isinstance(index, bool)
+    }
+    for scope_break in scope_breaks:
+        policy = scope_break.get("materialization_policy")
+        flatten_root = scope_break.get("flatten_subtree_root_node_id")
+        target = scope_break.get("target_node_id")
+        if target is None:
+            if policy != "direct_target" or flatten_root is not None:
+                _fail(
+                    "structure_proof_owner_scope_break_invalid",
+                    "a root-target break cannot flatten a subtree",
+                )
+            continue
+        direct_runs = _target_occurrence_runs(
+            int(target),
+            headings=headings,
+            elements_by_index=elements_by_index,
+            scope_breaks=scope_breaks,
+            frame_members=frame_members,
+            flattened_ids=frozenset(),
+        )
+        if policy == "direct_target":
+            if flatten_root is not None:
+                _fail(
+                    "structure_proof_owner_scope_break_invalid",
+                    "a direct-target break cannot carry a flatten root",
+                )
+            if direct_runs > 1:
+                _fail(
+                    "structure_proof_owner_scope_break_invalid",
+                    "noncontiguous target occurrence requires a flatten policy",
+                )
+            continue
+        owner = headings[int(cast(int, scope_break["current_owner_node_id"]))]
+        intervening: int | None = None
+        node: Mapping[str, Any] | None = owner
+        while node is not None:
+            parent = node.get("parent_node_id")
+            if parent == target:
+                intervening = int(node["node_id"])
+                break
+            node = headings.get(parent) if isinstance(parent, int) else None
+        if intervening is None or flatten_root != intervening:
+            _fail(
+                "structure_proof_owner_scope_break_invalid",
+                "flatten root is not the intervening child of the target",
+            )
+        if direct_runs <= 1:
+            _fail(
+                "structure_proof_owner_scope_break_invalid",
+                "flatten policy on an already contiguous target occurrence",
+            )
+        assert intervening is not None
+        flat_runs = _target_occurrence_runs(
+            int(target),
+            headings=headings,
+            elements_by_index=elements_by_index,
+            scope_breaks=scope_breaks,
+            frame_members=frame_members,
+            flattened_ids=_subtree_node_ids(intervening, headings=headings),
+        )
+        if flat_runs != 1:
+            _fail(
+                "structure_proof_owner_scope_break_invalid",
+                "flatten does not close the target occurrence",
+            )
+        span = cast(Sequence[int], headings[int(target)]["section_span"])
+        for other in scope_breaks:
+            if other is scope_break:
+                continue
+            other_boundary = int(
+                cast(
+                    Mapping[str, Any], other["boundary_source_ref"]
+                )["source_item_index"]
+            )
+            if int(span[0]) < other_boundary <= int(span[1]):
+                _fail(
+                    "structure_proof_owner_scope_break_invalid",
+                    "flatten overlaps another owner scope break",
+                )
+
+
+def _subtree_node_ids(
+    root_node_id: int,
+    *,
+    headings: Mapping[int, Mapping[str, Any]],
+) -> frozenset[int]:
+    children: dict[int, list[int]] = {}
+    for node_id, heading in headings.items():
+        parent = heading.get("parent_node_id")
+        if isinstance(parent, int):
+            children.setdefault(parent, []).append(node_id)
+    subtree = {root_node_id}
+    stack = [root_node_id]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in subtree:
+                subtree.add(child)
+                stack.append(child)
+    return frozenset(subtree)
+
+
+def _target_occurrence_runs(
+    target_node_id: int,
+    *,
+    headings: Mapping[int, Mapping[str, Any]],
+    elements_by_index: Mapping[int, Mapping[str, Any]],
+    scope_breaks: Sequence[Mapping[str, Any]],
+    frame_members: set[int],
+    flattened_ids: frozenset[int],
+) -> int:
+    """Count the physical segments one target occurrence would materialize.
+
+    Mirrors publication placement conservatively: proven full-text heading
+    carriers, page furniture, frame members, and blank text carriers never
+    open or close a run, while content owned by another section identity ends
+    the target's run.  Divergence from the real builder can only surface as a
+    loud closure failure there, never as a silent placement.
+    """
+
+    target = headings[target_node_id]
+    target_path = tuple(
+        int(item["node_id"])
+        for item in _heading_path(target, headings=headings)
+    )
+    active = {
+        node_id: heading
+        for node_id, heading in headings.items()
+        if bool(heading["propagates"]) and node_id not in flattened_ids
+    }
+    dropped_carriers: set[int] = set()
+    for heading in active.values():
+        for raw_ref in cast(Sequence[Mapping[str, Any]], heading["source_refs"]):
+            if raw_ref.get("field", "text") != "text" or raw_ref.get("index") is not None:
+                continue
+            ref_index = int(raw_ref["source_item_index"])
+            value = elements_by_index.get(ref_index, {}).get("text")
+            if isinstance(value, str) and tuple(
+                int(part) for part in raw_ref["text_span"]
+            ) == (0, len(value)):
+                dropped_carriers.add(ref_index)
+    span = cast(Sequence[int], target["section_span"])
+    runs = 0
+    inside = False
+    for index in sorted(elements_by_index):
+        if not int(span[0]) <= index <= int(span[1]):
+            continue
+        if index in frame_members or index in dropped_carriers:
+            continue
+        element = elements_by_index[index]
+        kind = element.get("kind")
+        if kind == "page_furniture":
+            continue
+        if kind == "text":
+            text = element.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+        owners = [
+            heading
+            for heading in active.values()
+            if int(heading["section_span"][0])
+            <= index
+            <= int(heading["section_span"][1])
+        ]
+        identities: list[tuple[int, ...] | None] = []
+        if not owners:
+            identities.append(None)
+        else:
+            owners.sort(key=lambda item: _heading_depth(item, headings=headings))
+            owner = owners[-1]
+            owner_path = tuple(
+                int(item["node_id"])
+                for item in _heading_path(owner, headings=headings)
+            )
+            applicable = [
+                item
+                for item in scope_breaks
+                if int(cast(int, item["current_owner_node_id"])) == owner_path[-1]
+                and int(owner["section_span"][0])
+                < int(
+                    cast(
+                        Mapping[str, Any], item["boundary_source_ref"]
+                    )["source_item_index"]
+                )
+                <= index
+            ]
+            if applicable:
+                latest = max(
+                    applicable,
+                    key=lambda item: int(
+                        cast(
+                            Mapping[str, Any], item["boundary_source_ref"]
+                        )["source_item_index"]
+                    ),
+                )
+                latest_boundary = int(
+                    cast(
+                        Mapping[str, Any], latest["boundary_source_ref"]
+                    )["source_item_index"]
+                )
+                latest_target = latest.get("target_node_id")
+                retargeted = (
+                    tuple(
+                        int(item["node_id"])
+                        for item in _heading_path(
+                            headings[int(latest_target)],
+                            headings=headings,
+                        )
+                    )
+                    if latest_target is not None
+                    else None
+                )
+                if (
+                    index == latest_boundary
+                    and latest.get("boundary_carrier_scope") == "selected_only"
+                ):
+                    identities.append(owner_path)
+                    identities.append(retargeted)
+                else:
+                    identities.append(retargeted)
+            else:
+                identities.append(owner_path)
+        for identity in identities:
+            matches = identity == target_path
+            if matches and not inside:
+                runs += 1
+            inside = matches
+    return runs
 
 
 def _element_page_index(element: Mapping[str, Any]) -> int | None:

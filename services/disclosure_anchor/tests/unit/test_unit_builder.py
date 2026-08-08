@@ -458,6 +458,8 @@ class StructureProofProjectionTests(unittest.TestCase):
                 "current_owner_node_id": 1,
                 "target_node_id": None,
                 "boundary_carrier_scope": "selected_only",
+                "materialization_policy": "direct_target",
+                "flatten_subtree_root_node_id": None,
             }
         ]
 
@@ -582,6 +584,8 @@ class StructureProofProjectionTests(unittest.TestCase):
                 "current_owner_node_id": 3,
                 "target_node_id": 1,
                 "boundary_carrier_scope": "selected_and_same_carrier",
+                "materialization_policy": "direct_target",
+                "flatten_subtree_root_node_id": None,
             }
         ]
 
@@ -604,6 +608,262 @@ class StructureProofProjectionTests(unittest.TestCase):
             [4, 5],
         )
         self.assertNotIn(caption, [unit.title for unit in units])
+
+    @staticmethod
+    def _noncontiguous_target_case(
+        *,
+        materialization_policy: str = "flatten_intervening_subtree",
+        flatten_subtree_root_node_id: int | None = 2,
+        with_intro: bool = True,
+        trailing_sibling: bool = False,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """Reviewer frontier: a proven non-root target with an earlier intro."""
+
+        caption = "二、新同级"
+        elements = [
+            _element(0, text="第十节 财务报告", text_level=1),
+            _element(1, text="顶层引言" if with_intro else ""),
+            _element(2, text="一、旧一级", text_level=2),
+            _element(3, text="（一）旧二级", text_level=3),
+            _element(4, text="旧二级正文"),
+            _element(
+                5,
+                kind="table",
+                raw_kind="table",
+                table_caption=[caption],
+                table_footnote=[],
+                table_html="<table><tr><td>新同级表格</td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["新同级表格"]],
+                    "merged_cells": [],
+                },
+            ),
+            _element(6, text="新同级后续正文"),
+        ]
+        section_end = 6
+        if trailing_sibling:
+            elements.extend(
+                [
+                    _element(7, text="三、后置一级", text_level=2),
+                    _element(8, text="后置一级正文"),
+                    _element(9, text="回到第十节的正文"),
+                ]
+            )
+            section_end = 9
+        headings = [
+            _heading(1, 0, text="第十节 财务报告", section_end=section_end),
+            _heading(
+                2,
+                2,
+                text="一、旧一级",
+                section_end=6,
+                parent_node_id=1,
+                level=2,
+            ),
+            _heading(
+                3,
+                3,
+                text="（一）旧二级",
+                section_end=6,
+                parent_node_id=2,
+                level=3,
+            ),
+        ]
+        if trailing_sibling:
+            headings.append(
+                _heading(
+                    4,
+                    7,
+                    text="三、后置一级",
+                    section_end=8,
+                    parent_node_id=1,
+                    level=2,
+                )
+            )
+        scope_breaks = [
+            {
+                "boundary_source_ref": {
+                    "source_item_index": 5,
+                    "source_item_sha256": elements[5]["source_item_sha256"],
+                    "page_index": 0,
+                    "field": "table_caption",
+                    "index": 0,
+                    "text_span": [0, len(caption)],
+                    "value_sha256": source_value_sha256(caption),
+                },
+                "source_atom_orders": [9],
+                "eligibility_basis": "numbered_caption_native_break",
+                "relative_rank": "higher",
+                "current_owner_node_id": 3,
+                "target_node_id": 1,
+                "boundary_carrier_scope": "selected_and_same_carrier",
+                "materialization_policy": materialization_policy,
+                "flatten_subtree_root_node_id": flatten_subtree_root_node_id,
+            }
+        ]
+        return elements, headings, scope_breaks
+
+    def test_noncontiguous_target_flattens_the_intervening_subtree(self) -> None:
+        elements, headings, scope_breaks = self._noncontiguous_target_case()
+
+        units, stats = _build(
+            elements,
+            headings=headings,
+            owner_scope_breaks=scope_breaks,
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].payload_kind, "mixed")
+        self.assertEqual(units[0].heading_path, ["第十节 财务报告"])
+        self.assertEqual(units[0].title, "第十节 财务报告")
+        parts = units[0].payload["parts"]
+        # Adjacent same-owner texts merge into one ordered leaf, so the
+        # flattened heading carriers ride inside the first text part with
+        # their provenance, exactly once and in source order.
+        self.assertEqual(
+            [part["order"] for part in parts],
+            [1, 5, 6],
+        )
+        self.assertEqual(
+            parts[0]["text"],
+            "顶层引言\n一、旧一级\n（一）旧二级\n旧二级正文",
+        )
+        self.assertEqual(parts[1]["caption"], ["二、新同级"])
+        self.assertEqual(parts[1]["rows"], [["新同级表格"]])
+        self.assertEqual(parts[2]["text"], "新同级后续正文")
+        self.assertNotIn(
+            "一、旧一级",
+            [unit.title for unit in units],
+        )
+        self.assertEqual(
+            [unit.heading_path for unit in units if not unit.heading_path],
+            [],
+        )
+        self.assertEqual(stats.owner_scope_flattened_heading_count, 2)
+        self.assertEqual(
+            _source_indices(
+                [
+                    {"payload": unit.payload, "locator": unit.artifact_locator}
+                    for unit in units
+                ]
+            ),
+            {0, 1, 2, 3, 4, 5, 6},
+        )
+
+    def test_contiguous_target_must_not_flatten(self) -> None:
+        elements, headings, scope_breaks = self._noncontiguous_target_case(
+            with_intro=False,
+        )
+        elements[1]["text"] = " "
+
+        with self.assertRaisesRegex(
+            DocumentStructureContractError,
+            "already contiguous target occurrence",
+        ):
+            _build(
+                elements,
+                headings=headings,
+                owner_scope_breaks=scope_breaks,
+            )
+
+    def test_noncontiguous_target_rejects_direct_policy(self) -> None:
+        elements, headings, scope_breaks = self._noncontiguous_target_case(
+            materialization_policy="direct_target",
+            flatten_subtree_root_node_id=None,
+        )
+
+        with self.assertRaisesRegex(
+            DocumentStructureContractError,
+            "requires a flatten policy",
+        ):
+            _build(
+                elements,
+                headings=headings,
+                owner_scope_breaks=scope_breaks,
+            )
+
+    def test_flatten_root_must_be_the_intervening_child(self) -> None:
+        for wrong_root in (3, 1):
+            elements, headings, scope_breaks = self._noncontiguous_target_case(
+                flatten_subtree_root_node_id=wrong_root,
+            )
+            with self.assertRaisesRegex(
+                DocumentStructureContractError,
+                "not the intervening child",
+            ):
+                _build(
+                    elements,
+                    headings=headings,
+                    owner_scope_breaks=scope_breaks,
+                )
+
+    def test_flatten_that_cannot_close_the_target_is_rejected(self) -> None:
+        elements, headings, scope_breaks = self._noncontiguous_target_case(
+            trailing_sibling=True,
+        )
+
+        with self.assertRaisesRegex(
+            DocumentStructureContractError,
+            "does not close the target occurrence",
+        ):
+            _build(
+                elements,
+                headings=headings,
+                owner_scope_breaks=scope_breaks,
+            )
+
+    def test_root_target_break_cannot_flatten(self) -> None:
+        caption = "三、未接纳的新块"
+        elements = [
+            _element(0, text="二、原有章节", text_level=1),
+            _element(1, text="原有章节正文"),
+            _element(
+                2,
+                kind="table",
+                raw_kind="table",
+                table_caption=[caption],
+                table_footnote=[],
+                table_html="<table><tr><td>旧表尾部</td></tr></table>",
+                table={
+                    "headers": [],
+                    "rows": [["旧表尾部"]],
+                    "merged_cells": [],
+                },
+            ),
+        ]
+        headings = [_heading(1, 0, text="二、原有章节", section_end=2)]
+        scope_breaks = [
+            {
+                "boundary_source_ref": {
+                    "source_item_index": 2,
+                    "source_item_sha256": elements[2]["source_item_sha256"],
+                    "page_index": 0,
+                    "field": "table_caption",
+                    "index": 0,
+                    "text_span": [0, len(caption)],
+                    "value_sha256": source_value_sha256(caption),
+                },
+                "source_atom_orders": [7],
+                "eligibility_basis": "numbered_caption_native_break",
+                "relative_rank": "peer",
+                "current_owner_node_id": 1,
+                "target_node_id": None,
+                "boundary_carrier_scope": "selected_only",
+                "materialization_policy": "flatten_intervening_subtree",
+                "flatten_subtree_root_node_id": 1,
+            }
+        ]
+
+        with self.assertRaisesRegex(
+            DocumentStructureContractError,
+            "root-target break cannot flatten",
+        ):
+            _build(
+                elements,
+                headings=headings,
+                owner_scope_breaks=scope_breaks,
+            )
 
     def test_empty_visual_stays_in_mixed_section_with_sibling_evidence(self) -> None:
         elements = [

@@ -621,6 +621,8 @@
         "boundary_source_ref",
         "current_owner_node_id",
         "eligibility_basis",
+        "flatten_subtree_root_node_id",
+        "materialization_policy",
         "relative_rank",
         "source_atom_orders",
         "target_node_id"
@@ -638,6 +640,13 @@
             "numbered_caption_native_break",
             "unnumbered_display_peer_break"
           ]
+        },
+        "flatten_subtree_root_node_id": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "materialization_policy": {
+          "enum": ["direct_target", "flatten_intervening_subtree"]
         },
         "relative_rank": {"enum": ["peer", "higher", "unnumbered_peer"]},
         "source_atom_orders": {

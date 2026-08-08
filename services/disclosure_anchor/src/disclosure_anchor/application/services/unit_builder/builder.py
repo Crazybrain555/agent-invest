@@ -125,6 +125,7 @@ class BuildStats:
     native_recovery_leaf_count: int = 0
     unsafe_semantic_payload_count: int = 0
     unsafe_heading_flattened_count: int = 0
+    owner_scope_flattened_heading_count: int = 0
     unsafe_document_title_label_count: int = 0
     non_primary_source_alternative_count: int = 0
     # Per-source transform/exclusion ledger.  Counts explain volume; this
@@ -148,6 +149,9 @@ class BuildStats:
             "native_recovery_leaf_count": self.native_recovery_leaf_count,
             "unsafe_semantic_payload_count": self.unsafe_semantic_payload_count,
             "unsafe_heading_flattened_count": self.unsafe_heading_flattened_count,
+            "owner_scope_flattened_heading_count": (
+                self.owner_scope_flattened_heading_count
+            ),
             "unsafe_document_title_label_count": (
                 self.unsafe_document_title_label_count
             ),
@@ -968,6 +972,8 @@ class _OwnerScopeBreak:
     target_node_id: int | None
     boundary_carrier_scope: str
     source_atom_orders: tuple[int, ...]
+    materialization_policy: str
+    flatten_subtree_root_node_id: int | None
 
 
 def s2_apply_structure_proof(
@@ -995,8 +1001,21 @@ def s2_apply_structure_proof(
         ),
         stats=stats,
     )
-    headings = [heading for heading in heading_anchors if heading.propagates]
     owner_scope_breaks = _proven_owner_scope_breaks(structure_proof)
+    flattened_ids = _owner_scope_flattened_node_ids(
+        owner_scope_breaks,
+        anchors=heading_anchors,
+    )
+    if stats is not None:
+        stats.owner_scope_flattened_heading_count += sum(
+            heading.propagates and heading.node_id in flattened_ids
+            for heading in heading_anchors
+        )
+    headings = [
+        heading
+        for heading in heading_anchors
+        if heading.propagates and heading.node_id not in flattened_ids
+    ]
     by_id = {heading.node_id: heading for heading in headings}
     paths = {
         heading.node_id: _proven_heading_path(heading, by_id=by_id)
@@ -1269,9 +1288,71 @@ def _proven_owner_scope_breaks(
                 source_atom_orders=tuple(
                     int(order) for order in value["source_atom_orders"]
                 ),
+                materialization_policy=str(value["materialization_policy"]),
+                flatten_subtree_root_node_id=(
+                    int(value["flatten_subtree_root_node_id"])
+                    if value["flatten_subtree_root_node_id"] is not None
+                    else None
+                ),
             )
         )
     return tuple(output)
+
+
+def _owner_scope_flattened_node_ids(
+    scope_breaks: Sequence[_OwnerScopeBreak],
+    *,
+    anchors: Sequence[_ProvenHeading],
+) -> frozenset[int]:
+    """Collect the accepted subtrees a flatten policy folds into its target.
+
+    The flattened nodes stay proven headings in the proof; they only lose
+    section materialization so their carriers become ordinary ordered leaves
+    of the target and the target keeps exactly one physical occurrence.
+    """
+
+    flattened: set[int] = set()
+    by_id = {anchor.node_id: anchor for anchor in anchors}
+    children: dict[int, list[int]] = {}
+    for anchor in anchors:
+        if anchor.parent_node_id is not None:
+            children.setdefault(anchor.parent_node_id, []).append(anchor.node_id)
+    for scope_break in scope_breaks:
+        if scope_break.materialization_policy == "direct_target":
+            if scope_break.flatten_subtree_root_node_id is not None:
+                raise SourceEvidenceClosureError(
+                    "direct-target owner break carries a flatten subtree root"
+                )
+            continue
+        if scope_break.materialization_policy != "flatten_intervening_subtree":
+            raise SourceEvidenceClosureError(
+                "owner scope break materialization policy is unknown"
+            )
+        root = scope_break.flatten_subtree_root_node_id
+        target = scope_break.target_node_id
+        if (
+            root is None
+            or target is None
+            or root not in by_id
+            or not by_id[root].propagates
+            or by_id[root].parent_node_id != target
+        ):
+            raise SourceEvidenceClosureError(
+                "owner scope flatten root is not an accepted child of its target"
+            )
+        subtree = {root}
+        stack = [root]
+        while stack:
+            for child in children.get(stack.pop(), []):
+                if child not in subtree:
+                    subtree.add(child)
+                    stack.append(child)
+        if scope_break.current_owner_node_id not in subtree:
+            raise SourceEvidenceClosureError(
+                "owner scope flatten subtree does not contain the boundary owner"
+            )
+        flattened.update(subtree)
+    return frozenset(flattened)
 
 
 def _selected_only_boundary_break(

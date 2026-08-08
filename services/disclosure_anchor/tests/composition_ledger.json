@@ -236,8 +236,10 @@
    "tests": 2
   },
   "tests/unit/test_mineru_adapter.py": {
-   "private_imports": [],
-   "tests": 60
+   "private_imports": [
+    "_assign_owner_scope_materialization"
+   ],
+   "tests": 65
   },
   "tests/unit/test_mineru_backend_probe.py": {
    "private_imports": [],
@@ -373,7 +375,7 @@
   },
   "tests/unit/test_unit_builder.py": {
    "private_imports": [],
-   "tests": 35
+   "tests": 41
   },
   "tests/unit/test_unit_hashing.py": {
    "private_imports": [],

@@ -20,6 +20,7 @@ from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
     MinerUToNormalizedIRMapper as _MinerUToNormalizedIRMapper,
 )
 from disclosure_anchor.adapters.parsers.mineru.structure_proof import (
+    _assign_owner_scope_materialization,
     build_mineru_structure_proof,
 )
 from disclosure_anchor.adapters.parsers.mineru.source_evidence import (
@@ -2013,6 +2014,8 @@ class MinerUMapperTests(unittest.TestCase):
                     "current_owner_node_id": 1,
                     "target_node_id": None,
                     "boundary_carrier_scope": "selected_and_same_carrier",
+                    "materialization_policy": "direct_target",
+                    "flatten_subtree_root_node_id": None,
                 }
             ],
         )
@@ -2145,6 +2148,8 @@ class MinerUMapperTests(unittest.TestCase):
                     "current_owner_node_id": 1,
                     "target_node_id": None,
                     "boundary_carrier_scope": "selected_and_same_carrier",
+                    "materialization_policy": "direct_target",
+                    "flatten_subtree_root_node_id": None,
                 }
             ],
         )
@@ -4498,6 +4503,175 @@ class MinerUDocumentParserTests(unittest.TestCase):
             with self.assertRaises(ParserVersionProbeError):
                 parser.readiness()
             self.assertEqual(process.probe_calls, 1)
+
+
+class OwnerScopeMaterializationTests(unittest.TestCase):
+    """Producer-side policy derivation over the raw provider stream.
+
+    The full native-layout path already proves break emission; these cases
+    pin the materialization decision itself: when a proven non-root target
+    stays contiguous, when it must flatten its one intervening subtree, and
+    when no bounded flatten can close it.
+    """
+
+    @staticmethod
+    def _heading(
+        node_id: int,
+        source_index: int,
+        *,
+        text: str,
+        section_end: int,
+        parent_node_id: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "node_id": node_id,
+            "parent_node_id": parent_node_id,
+            "propagates": True,
+            "section_span": [source_index, section_end],
+            "source_refs": [
+                {
+                    "source_item_index": source_index,
+                    "field": "text",
+                    "text_span": [0, len(text)],
+                }
+            ],
+        }
+
+    @staticmethod
+    def _case(
+        *,
+        with_intro: bool,
+        trailing_sibling: bool = False,
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[int, dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        content_list: list[dict[str, Any]] = [
+            {"type": "text", "text": "第十节 财务报告"},
+            {"type": "text", "text": "顶层引言" if with_intro else " "},
+            {"type": "text", "text": "一、旧一级"},
+            {"type": "text", "text": "（一）旧二级"},
+            {"type": "text", "text": "旧二级正文"},
+            {
+                "type": "table",
+                "table_caption": ["二、新同级"],
+                "table_footnote": [],
+                "table_body": "<table><tr><td>值</td></tr></table>",
+            },
+            {"type": "text", "text": "新同级后续正文"},
+        ]
+        section_end = 6
+        if trailing_sibling:
+            content_list.extend(
+                [
+                    {"type": "text", "text": "三、后置一级"},
+                    {"type": "text", "text": "后置一级正文"},
+                    {"type": "text", "text": "回到第十节的正文"},
+                ]
+            )
+            section_end = 9
+        make = OwnerScopeMaterializationTests._heading
+        headings = {
+            1: make(1, 0, text="第十节 财务报告", section_end=section_end),
+            2: make(2, 2, text="一、旧一级", section_end=6, parent_node_id=1),
+            3: make(3, 3, text="（一）旧二级", section_end=6, parent_node_id=2),
+        }
+        if trailing_sibling:
+            headings[4] = make(
+                4, 7, text="三、后置一级", section_end=8, parent_node_id=1
+            )
+        records = [
+            {
+                "boundary_source_ref": {"source_item_index": 5},
+                "current_owner_node_id": 3,
+                "target_node_id": 1,
+                "boundary_carrier_scope": "selected_and_same_carrier",
+            }
+        ]
+        return content_list, headings, records
+
+    def test_noncontiguous_target_derives_the_flatten_policy(self) -> None:
+        content_list, headings, records = self._case(with_intro=True)
+
+        _assign_owner_scope_materialization(
+            records,
+            heading_by_id=headings,
+            content_list=content_list,
+            frame_member_indices=set(),
+        )
+
+        self.assertEqual(
+            records[0]["materialization_policy"],
+            "flatten_intervening_subtree",
+        )
+        self.assertEqual(records[0]["flatten_subtree_root_node_id"], 2)
+
+    def test_contiguous_target_stays_direct(self) -> None:
+        content_list, headings, records = self._case(with_intro=False)
+
+        _assign_owner_scope_materialization(
+            records,
+            heading_by_id=headings,
+            content_list=content_list,
+            frame_member_indices=set(),
+        )
+
+        self.assertEqual(records[0]["materialization_policy"], "direct_target")
+        self.assertIsNone(records[0]["flatten_subtree_root_node_id"])
+
+    def test_root_target_never_flattens(self) -> None:
+        content_list, headings, records = self._case(with_intro=True)
+        records[0]["target_node_id"] = None
+
+        _assign_owner_scope_materialization(
+            records,
+            heading_by_id=headings,
+            content_list=content_list,
+            frame_member_indices=set(),
+        )
+
+        self.assertEqual(records[0]["materialization_policy"], "direct_target")
+        self.assertIsNone(records[0]["flatten_subtree_root_node_id"])
+
+    def test_unclosable_flatten_fails_loudly(self) -> None:
+        content_list, headings, records = self._case(
+            with_intro=True,
+            trailing_sibling=True,
+        )
+
+        with self.assertRaisesRegex(
+            ParserOutputContractError,
+            "cannot close the target occurrence",
+        ):
+            _assign_owner_scope_materialization(
+                records,
+                heading_by_id=headings,
+                content_list=content_list,
+                frame_member_indices=set(),
+            )
+
+    def test_flatten_rejects_a_second_break_inside_the_target(self) -> None:
+        content_list, headings, records = self._case(with_intro=True)
+        records.append(
+            {
+                "boundary_source_ref": {"source_item_index": 6},
+                "current_owner_node_id": 1,
+                "target_node_id": None,
+                "boundary_carrier_scope": "selected_and_same_carrier",
+            }
+        )
+
+        with self.assertRaisesRegex(
+            ParserOutputContractError,
+            "overlaps another break",
+        ):
+            _assign_owner_scope_materialization(
+                records,
+                heading_by_id=headings,
+                content_list=content_list,
+                frame_member_indices=set(),
+            )
 
 
 if __name__ == "__main__":

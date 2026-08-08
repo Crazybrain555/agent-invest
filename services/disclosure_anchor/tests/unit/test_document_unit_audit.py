@@ -28,6 +28,9 @@ from disclosure_anchor.application.services.document_unit_audit import (
     AuditDocumentMetadata,
     AuditUnitView,
     DocumentAuditReport,
+    _flattened_node_targets,
+    _ProofHeading,
+    _ProofOwnerScopeBreak,
     audit_document as _audit_document,
 )
 
@@ -1796,6 +1799,89 @@ class DocumentUnitAuditTests(unittest.TestCase):
 
         self.assertIn("quality_status_understated", _codes(report))
         self.assertIn("unit_source_order_invalid", _codes(report))
+
+
+class OwnerScopeFlattenIndexTests(unittest.TestCase):
+    """Audit-side flatten mapping stays a pure DAG recomputation."""
+
+    @staticmethod
+    def _heading(node_id: int, parent: int | None) -> _ProofHeading:
+        return _ProofHeading(
+            node_id=node_id,
+            parent_node_id=parent,
+            propagates=True,
+            section_start=node_id,
+            section_end=99,
+            title=f"节{node_id}",
+            source_refs=(),
+        )
+
+    @staticmethod
+    def _scope_break(
+        *,
+        policy: str,
+        flatten_root: int | None,
+        target: int | None,
+    ) -> _ProofOwnerScopeBreak:
+        return _ProofOwnerScopeBreak(
+            boundary_source_item_index=5,
+            boundary_ref="ir_0005",
+            boundary_field="table_caption",
+            boundary_index=0,
+            boundary_text_span=(0, 5),
+            boundary_value_sha256="sha256:" + "b" * 64,
+            page_index=0,
+            eligibility_basis="numbered_caption_native_break",
+            relative_rank="higher",
+            current_owner_node_id=3,
+            target_node_id=target,
+            boundary_carrier_scope="selected_and_same_carrier",
+            source_atom_orders=(9,),
+            materialization_policy=policy,
+            flatten_subtree_root_node_id=flatten_root,
+        )
+
+    def test_flatten_maps_the_whole_subtree_to_its_target(self) -> None:
+        headings = {
+            1: self._heading(1, None),
+            2: self._heading(2, 1),
+            3: self._heading(3, 2),
+            4: self._heading(4, 3),
+            5: self._heading(5, 1),
+        }
+
+        targets = _flattened_node_targets(
+            (
+                self._scope_break(
+                    policy="flatten_intervening_subtree",
+                    flatten_root=2,
+                    target=1,
+                ),
+            ),
+            headings=headings,
+        )
+
+        self.assertEqual(targets, {2: 1, 3: 1, 4: 1})
+
+    def test_direct_target_breaks_map_nothing(self) -> None:
+        headings = {
+            1: self._heading(1, None),
+            2: self._heading(2, 1),
+            3: self._heading(3, 2),
+        }
+
+        targets = _flattened_node_targets(
+            (
+                self._scope_break(
+                    policy="direct_target",
+                    flatten_root=None,
+                    target=1,
+                ),
+            ),
+            headings=headings,
+        )
+
+        self.assertEqual(targets, {})
 
 
 if __name__ == "__main__":
