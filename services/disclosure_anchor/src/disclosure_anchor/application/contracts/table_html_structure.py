@@ -11,6 +11,13 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 import re
 
+from disclosure_anchor.application.contracts.table_visibility import (
+    VOID_TAGS,
+    TableVisibilityError,
+    VisibilityTracker,
+    require_supported_markup,
+)
+
 
 class TableHtmlStructureError(ValueError):
     """The HTML carrier cannot be represented without structural loss."""
@@ -65,6 +72,13 @@ class _RawCell:
 
 
 class _TableParser(HTMLParser):
+    """Derive the published grid under the shared visibility policy.
+
+    The published rows/cells and the reader-visible comparison must see
+    one visible domain: invisible-content tags and hidden subtrees never
+    contribute text or media here either.
+    """
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.rows: list[list[_RawCell]] = []
@@ -74,6 +88,7 @@ class _TableParser(HTMLParser):
         self._cell_attrs: tuple[int, int, bool] | None = None
         self._cell_text: list[str] = []
         self._cell_media: list[_RawMedia] = []
+        self._visibility = VisibilityTracker()
 
     def handle_starttag(
         self,
@@ -81,16 +96,34 @@ class _TableParser(HTMLParser):
         attrs: list[tuple[str, str | None]],
     ) -> None:
         tag = tag.lower()
+        attr_map = _unique_attributes(attrs)
         if tag == "table":
             if self._table_depth or self._saw_table:
                 raise TableHtmlStructureError(
                     "table carrier must contain exactly one non-nested table"
                 )
+            try:
+                require_supported_markup(tag, attr_map)
+            except TableVisibilityError as exc:
+                raise TableHtmlStructureError(str(exc)) from exc
             self._table_depth = 1
             self._saw_table = True
             return
         if not self._table_depth:
             return
+        try:
+            element_visible = self._visibility.enter(tag, attr_map)
+        except TableVisibilityError as exc:
+            raise TableHtmlStructureError(str(exc)) from exc
+        if tag in {"caption", "tfoot"}:
+            # The published grid and the reader-visible comparison must
+            # share one domain assignment. Caption/tfoot content belongs
+            # to the caption/note domains, which this grid cannot express;
+            # a carrier using them blocks instead of silently diverging.
+            raise TableHtmlStructureError(
+                f"<{tag}> content cannot be represented in the published "
+                "grid without domain loss"
+            )
         if tag == "tr":
             if self._current_row is not None or self._cell_attrs is not None:
                 raise TableHtmlStructureError("table rows are nested or unclosed")
@@ -99,7 +132,6 @@ class _TableParser(HTMLParser):
         if tag in {"td", "th"}:
             if self._current_row is None or self._cell_attrs is not None:
                 raise TableHtmlStructureError("table cell is outside a row or nested")
-            attr_map = _unique_attributes(attrs)
             self._cell_attrs = (
                 _span_value(attr_map.get("rowspan")),
                 _span_value(attr_map.get("colspan")),
@@ -113,7 +145,8 @@ class _TableParser(HTMLParser):
                 raise TableHtmlStructureError(
                     "embedded table image is outside a logical cell"
                 )
-            attr_map = _unique_attributes(attrs)
+            if not element_visible:
+                return
             raw_path = attr_map.get("src")
             if (
                 raw_path is None
@@ -136,9 +169,16 @@ class _TableParser(HTMLParser):
         tag: str,
         attrs: list[tuple[str, str | None]],
     ) -> None:
+        tag = tag.lower()
+        if tag in VOID_TAGS:
+            self.handle_starttag(tag, attrs)
+            return
         self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
 
     def handle_data(self, data: str) -> None:
+        if not self._visibility.visible:
+            return
         if self._cell_attrs is not None:
             self._cell_text.append(data)
         elif self._table_depth and data.strip():
@@ -148,6 +188,8 @@ class _TableParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
+        if self._table_depth and tag != "table":
+            self._visibility.leave(tag)
         if tag in {"td", "th"}:
             if self._cell_attrs is None or self._current_row is None:
                 raise TableHtmlStructureError("table cell closing tag is unmatched")

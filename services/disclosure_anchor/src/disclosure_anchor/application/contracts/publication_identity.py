@@ -26,6 +26,11 @@ from disclosure_anchor.application.contracts.parse_receipt import (
     ParseReceiptContractError,
     validate_parse_receipt,
 )
+from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation import (
+    ReconciliationCompatibility,
+    TableReconciliationContractError,
+    assess_normalized_ir_table_reconciliation,
+)
 from disclosure_anchor.application.contracts.parser_target import (
     CURRENT_PARSER_TARGET_CONTRACT_VERSION,
     ParserTargetIdentity,
@@ -150,6 +155,25 @@ def require_publishable_run_identity(
             message=(
                 "HTTP-backend publication requires an explicitly resolved "
                 "remote model identity"
+            ),
+        )
+    try:
+        reconciliation = assess_normalized_ir_table_reconciliation(
+            dict(normalized_ir)
+        )
+    except TableReconciliationContractError as exc:
+        raise PublicationIdentityViolation(
+            error_code="IR_TABLE_RECONCILIATION_INVALID",
+            reason_code=f"table_reconciliation_{exc.reason_code}",
+            message=str(exc),
+        ) from exc
+    if reconciliation.compatibility is not ReconciliationCompatibility.CURRENT:
+        raise PublicationIdentityViolation(
+            error_code="IR_CONTRACT_TOO_OLD",
+            reason_code="table_reconciliation_reparse_required",
+            message=(
+                "a legacy table-comparison generation cannot drive current "
+                "publication; reparse the document"
             ),
         )
     _require_valid_receipt(

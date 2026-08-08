@@ -934,6 +934,10 @@ class PublicationIdentityGateTests(unittest.TestCase):
                 "IR_CONTRACT_TOO_OLD",
                 "structure_proof_reparse_required",
             ),
+            "built_v6_table_reconciliation": (
+                "IR_CONTRACT_TOO_OLD",
+                "table_reconciliation_reparse_required",
+            ),
         }
         for label, (error_code, reason_code) in cases.items():
             with self.subTest(label=label):
@@ -964,6 +968,16 @@ class PublicationIdentityGateTests(unittest.TestCase):
                         normalized["structure_proof"][
                             "algorithm_version"
                         ] = "document-structure-evidence.v13"
+                        self._rewrite(root, relpath, normalized, run)
+                    elif label == "built_v6_table_reconciliation":
+                        diagnostics = normalized["parser_diagnostics"][
+                            "table_reconciliation"
+                        ]
+                        diagnostics["algorithm_version"] = (
+                            "mineru-page-local-table-closure.v6"
+                        )
+                        diagnostics.pop("comparison_contract")
+                        diagnostics.pop("projection_root")
                         self._rewrite(root, relpath, normalized, run)
                     with self.assertRaises(PublishRunError) as raised:
                         NormalizedIRPublicationGuard(self._Paths(root))(

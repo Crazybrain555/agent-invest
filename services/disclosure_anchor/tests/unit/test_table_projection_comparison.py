@@ -38,6 +38,211 @@ def _sha(html: str) -> str:
     return project_table_html(html).body().sha256()
 
 
+class LiteralGoldenTests(unittest.TestCase):
+    """Pinned literal payload/hash goldens: any silent normalization or
+    canonicalization drift changes these values and fails loudly."""
+
+    _HTML = '<table><tr><th>项目</th><td>金额 1,234.56</td></tr></table>'
+
+    def test_canonical_payload_and_hashes_are_pinned(self) -> None:
+        projection = project_table_html(
+            self._HTML,
+            extra_captions=("主表",),
+            extra_footnotes=("注",),
+        )
+        self.assertEqual(
+            projection.canonical_payload(),
+            {
+                "projection_contract_version": (
+                    "reader-visible-table-projection.v1"
+                ),
+                "caption": ["主表"],
+                "cells": [
+                    {
+                        "ordinal": 0,
+                        "row": 0,
+                        "col": 0,
+                        "rowspan": 1,
+                        "colspan": 1,
+                        "role": "header",
+                        "items": [{"kind": "text", "value": "项目"}],
+                    },
+                    {
+                        "ordinal": 1,
+                        "row": 0,
+                        "col": 1,
+                        "rowspan": 1,
+                        "colspan": 1,
+                        "role": "body",
+                        "items": [
+                            {"kind": "text", "value": "金额 1,234.56"}
+                        ],
+                    },
+                ],
+                "notes": [],
+                "footnotes": ["注"],
+            },
+        )
+        self.assertEqual(
+            projection.sha256(),
+            "sha256:4c56d3a9f92042d4a19708aa0b5b675acabdeef0"
+            "39543224f34c9965a0946c45",
+        )
+        body_sha = projection.body().sha256()
+        self.assertEqual(
+            body_sha,
+            "sha256:dc0901245e8e8e3a0416d437e5b8eb5721ce1c47"
+            "683a4c62cdeccd2154523253",
+        )
+        from disclosure_anchor.application.contracts.table_comparison import (
+            projection_receipt_root,
+        )
+
+        self.assertEqual(
+            projection_receipt_root(
+                [
+                    {
+                        "content_index": 0,
+                        "model_index": 0,
+                        "projection_sha256": body_sha,
+                    }
+                ]
+            ),
+            "sha256:c85fceee4b47e5b22495c7235645fb0a4d0e5352"
+            "ed4b2d76e2ad8e2ae60dab0e",
+        )
+
+
+class UnifiedVisibleDomainTests(unittest.TestCase):
+    """The published grid and the comparison share one visible domain."""
+
+    def test_script_content_never_reaches_the_published_grid(self) -> None:
+        from disclosure_anchor.application.contracts.table_html_structure import (
+            parse_table_html_structure,
+        )
+
+        html = (
+            "<table><tr><td>营业收入<script>伪值</script></td></tr></table>"
+        )
+        derived = parse_table_html_structure(html)
+        self.assertEqual(derived.cells[0].text, "营业收入")
+        projection = project_table_html(html)
+        self.assertEqual(
+            projection.cells[0].items,
+            (type(projection.cells[0].items[0])(kind="text", value="营业收入"),),
+        )
+
+    def test_hidden_subtree_never_reaches_the_published_grid(self) -> None:
+        from disclosure_anchor.application.contracts.table_html_structure import (
+            parse_table_html_structure,
+        )
+
+        html = (
+            "<table><tr><td>可见<span hidden>不可见</span></td></tr></table>"
+        )
+        derived = parse_table_html_structure(html)
+        self.assertEqual(derived.cells[0].text, "可见")
+
+    def test_tfoot_blocks_the_grid_lane_instead_of_diverging(self) -> None:
+        from disclosure_anchor.application.contracts.table_html_structure import (
+            TableHtmlStructureError,
+            parse_table_html_structure,
+        )
+
+        html = (
+            "<table><tr><td>a</td></tr>"
+            "<tfoot><tr><td>注</td></tr></tfoot></table>"
+        )
+        with self.assertRaises(TableHtmlStructureError):
+            parse_table_html_structure(html)
+
+    def test_end_to_end_script_injection_is_domain_consistent(self) -> None:
+        # raw content → reconciler equality AND published grid must agree:
+        # the invisible injection neither breaks the match nor reaches the
+        # published cells; a published grid claiming the injected value is
+        # caught by the audit's re-derivation.
+        import json as _json
+
+        from tests.unit.test_unit_builder import (
+            _audit_case_environment,
+            _element,
+            _heading,
+        )
+        from disclosure_anchor.application.services.document_unit_audit import (
+            AuditDocumentMetadata,
+            audit_document,
+        )
+
+        html = (
+            "<table><tr><td>营业收入<script>伪值</script></td></tr></table>"
+        )
+        elements = [
+            _element(0, text="一、章节", text_level=1),
+            _element(
+                1,
+                kind="table",
+                raw_kind="table",
+                table_caption=[],
+                table_footnote=[],
+                table_html=html,
+                image_path="images/table.png",
+                table={
+                    "headers": [],
+                    "rows": [["营业收入"]],
+                    "cells": [
+                        {
+                            "row": 0,
+                            "col": 0,
+                            "rowspan": 1,
+                            "colspan": 1,
+                            "text": "营业收入",
+                            "is_header": False,
+                        }
+                    ],
+                    "embedded_media": [],
+                },
+            ),
+        ]
+        headings = [_heading(1, 0, text="一、章节", section_end=1)]
+        (
+            normalized_ir,
+            source_proof,
+            _resolve,
+            _hashes,
+            comparison,
+        ) = _audit_case_environment(elements, headings=headings, page_count=1)
+
+        def audit(payload):
+            return audit_document(
+                normalized_ir=payload,
+                units=(),
+                metadata=AuditDocumentMetadata(
+                    document_id=str(payload["document_id"]),
+                    title=None,
+                    filing_type="annual_report",
+                ),
+                source_proof=source_proof,
+                image_hashes={},
+                table_comparison=comparison,
+            )
+
+        clean = audit(normalized_ir)
+        codes = {finding.code for finding in clean.findings}
+        self.assertNotIn("table_comparison_replay_mismatch", codes)
+        self.assertNotIn("table_projection_preservation_mismatch", codes)
+
+        poisoned = _json.loads(_json.dumps(normalized_ir))
+        for element in poisoned["elements"]:
+            if element.get("raw_kind") == "table":
+                element["table"]["cells"][0]["text"] = "营业收入伪值"
+                element["table"]["rows"][0][0] = "营业收入伪值"
+        report = audit(poisoned)
+        self.assertIn(
+            "table_projection_preservation_mismatch",
+            {finding.code for finding in report.findings},
+        )
+
+
 class MarkupInvarianceTests(unittest.TestCase):
     """Markup, styling, and hidden attributes never affect equality."""
 
@@ -89,6 +294,16 @@ class MarkupInvarianceTests(unittest.TestCase):
         self.assertEqual(_sha(with_hidden), _sha(other_hidden))
         self.assertEqual(_sha(with_hidden), _sha(_BASE))
 
+    def test_hidden_void_elements_hide_only_themselves(self) -> None:
+        with_hidden_img = "<table><tr><td><img hidden src=\'x\'/>仍然可见</td></tr></table>".replace("\'", '"')
+        plain = "<table><tr><td>仍然可见</td></tr></table>"
+        with_img = '<table><tr><td><img src="x"/>仍然可见</td></tr></table>'
+        self.assertEqual(_sha(with_hidden_img), _sha(plain))
+        self.assertNotEqual(_sha(with_hidden_img), _sha(with_img))
+        hidden_br = "<table><tr><td>甲<br hidden>乙</td></tr></table>"
+        joined = "<table><tr><td>甲乙</td></tr></table>"
+        self.assertEqual(_sha(hidden_br), _sha(joined))
+
     def test_br_is_a_stable_boundary_not_markup(self) -> None:
         joined = "<table><tr><td>甲乙</td></tr></table>"
         broken = "<table><tr><td>甲<br>乙</td></tr></table>"
@@ -128,7 +343,8 @@ class VisibleFactRejectionTests(unittest.TestCase):
                 '<td>附图</td><td><img src="images/a.png"/></td>',
             ),
             "visible_becomes_hidden": _BASE.replace(
-                "<td>营业收入</td>", "<td hidden>营业收入</td>"
+                "<td>营业收入</td>",
+                "<td><span hidden>营业收入</span></td>",
             ),
         }
         for label, html in mutations.items():
@@ -143,6 +359,20 @@ class VisibleFactRejectionTests(unittest.TestCase):
             "overlapping_spans": (
                 '<table><tr><td>p</td><td rowspan="2">q</td></tr>'
                 '<tr><td colspan="2">r</td></tr></table>'
+            ),
+            "hidden_structural_cell": _BASE.replace(
+                "<td>营业收入</td>", "<td hidden>营业收入</td>"
+            ),
+            "hidden_structural_table": _BASE.replace(
+                "<table>", "<table hidden>"
+            ),
+            "visibility_affecting_style": _BASE.replace(
+                "<td>营业收入</td>",
+                '<td style="display:none">营业收入</td>',
+            ),
+            "unknown_style_property": _BASE.replace(
+                "<td>营业收入</td>",
+                '<td style="opacity:0">营业收入</td>',
             ),
         }.items():
             with self.subTest(label=label):

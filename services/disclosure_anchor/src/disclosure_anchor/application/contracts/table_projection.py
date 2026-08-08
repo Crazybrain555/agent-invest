@@ -30,10 +30,16 @@ from html.parser import HTMLParser
 import json
 import re
 
+from disclosure_anchor.application.contracts.table_visibility import (
+    VOID_TAGS,
+    TableVisibilityError,
+    VisibilityTracker,
+    require_supported_markup,
+)
+
 READER_VISIBLE_TABLE_PROJECTION_VERSION = "reader-visible-table-projection.v1"
 _PROJECTION_DOMAIN_TAG = "disclosure-anchor.reader-visible-table-projection.v1"
 
-_INVISIBLE_CONTENT_TAGS = frozenset({"script", "style", "template", "noscript"})
 _WS_RE = re.compile(r"\s+")
 
 
@@ -152,35 +158,10 @@ class _ProjectionParser(HTMLParser):
         self._caption_parts: list[str] | None = None
         self._current_row: list[_RawCell] | None = None
         self._cell: _RawCell | None = None
-        self._invisible_depth = 0
-        self._hidden_depth = 0
-        # Tags whose close must pop the hidden/invisible state, tracked as
-        # a stack of (tag, was_invisible, was_hidden) frames.
-        self._element_stack: list[tuple[str, bool, bool]] = []
-
-    # -- element visibility bookkeeping ---------------------------------
-
-    def _push_element(self, tag: str, attrs: dict[str, str | None]) -> None:
-        invisible = tag in _INVISIBLE_CONTENT_TAGS
-        hidden = "hidden" in attrs
-        self._element_stack.append((tag, invisible, hidden))
-        if invisible:
-            self._invisible_depth += 1
-        if hidden:
-            self._hidden_depth += 1
-
-    def _pop_element(self, tag: str) -> None:
-        while self._element_stack:
-            top_tag, invisible, hidden = self._element_stack.pop()
-            if invisible:
-                self._invisible_depth -= 1
-            if hidden:
-                self._hidden_depth -= 1
-            if top_tag == tag:
-                return
+        self._visibility = VisibilityTracker()
 
     def _content_visible(self) -> bool:
-        return not self._invisible_depth and not self._hidden_depth
+        return self._visibility.visible
 
     # -- parser events ---------------------------------------------------
 
@@ -196,18 +177,27 @@ class _ProjectionParser(HTMLParser):
                 raise TableProjectionError(
                     "table carrier must contain exactly one non-nested table"
                 )
+            try:
+                require_supported_markup(tag, attr_map)
+            except TableVisibilityError as exc:
+                raise TableProjectionError(str(exc)) from exc
             self._saw_table = True
             self._in_table = True
             return
         if not self._in_table:
             return
+        try:
+            element_visible = self._visibility.enter(tag, attr_map)
+        except TableVisibilityError as exc:
+            raise TableProjectionError(str(exc)) from exc
         if tag == "br":
-            if self._cell is not None and self._content_visible():
+            if not element_visible:
+                return
+            if self._cell is not None:
                 self._cell.pending_text.append(" ")
-            elif self._caption_parts is not None and self._content_visible():
+            elif self._caption_parts is not None:
                 self._caption_parts.append(" ")
             return
-        self._push_element(tag, attr_map)
         if tag == "caption":
             if self._current_row is not None or self._cell is not None:
                 raise TableProjectionError(
@@ -250,7 +240,7 @@ class _ProjectionParser(HTMLParser):
                 raise TableProjectionError(
                     "media inside tfoot notes is unsupported"
                 )
-            if self._content_visible():
+            if element_visible:
                 _flush_text(self._cell)
                 self._cell.items.append(
                     VisibleItem(kind="media_marker", value=None)
@@ -262,7 +252,7 @@ class _ProjectionParser(HTMLParser):
         attrs: list[tuple[str, str | None]],
     ) -> None:
         tag = tag.lower()
-        if tag in {"img", "br"}:
+        if tag in VOID_TAGS:
             self.handle_starttag(tag, attrs)
             return
         self.handle_starttag(tag, attrs)
@@ -299,13 +289,13 @@ class _ProjectionParser(HTMLParser):
                 raise TableProjectionError("caption closing tag is unmatched")
             self.captions.append(_collapse(" ".join(self._caption_parts)))
             self._caption_parts = None
-            self._pop_element(tag)
+            self._visibility.leave(tag)
             return
         if tag == "tfoot":
             if not self._in_tfoot or self._current_row is not None:
                 raise TableProjectionError("tfoot closing tag is unmatched")
             self._in_tfoot = False
-            self._pop_element(tag)
+            self._visibility.leave(tag)
             return
         if tag in {"td", "th"}:
             if self._cell is None or self._current_row is None:
@@ -315,7 +305,7 @@ class _ProjectionParser(HTMLParser):
             _flush_text(self._cell)
             self._current_row.append(self._cell)
             self._cell = None
-            self._pop_element(tag)
+            self._visibility.leave(tag)
             return
         if tag == "tr":
             if self._current_row is None or self._cell is not None:
@@ -325,9 +315,9 @@ class _ProjectionParser(HTMLParser):
             else:
                 self.rows.append(self._current_row)
             self._current_row = None
-            self._pop_element(tag)
+            self._visibility.leave(tag)
             return
-        self._pop_element(tag)
+        self._visibility.leave(tag)
 
     def finish(self) -> None:
         self.close()

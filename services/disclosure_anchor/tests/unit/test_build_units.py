@@ -1099,6 +1099,34 @@ class BuildUnitsTests(unittest.TestCase):
                 [],
             )
 
+    def test_legacy_table_reconciliation_requires_reparse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _setup(root)
+            payload = json.loads((root / ir_relpath).read_text(encoding="utf-8"))
+            diagnostics = payload["parser_diagnostics"]["table_reconciliation"]
+            diagnostics["algorithm_version"] = (
+                "mineru-page-local-table-closure.v6"
+            )
+            diagnostics.pop("comparison_contract")
+            diagnostics.pop("projection_root")
+            _rewrite_ir(root, uow, ir_relpath, payload)
+
+            result = _use_case(root, uow).execute(
+                BuildUnitsCommand(processing_run_id="run_1")
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.error["error_code"], "IR_CONTRACT_TOO_OLD")
+            self.assertEqual(
+                result.error["reason_code"],
+                "table_reconciliation_reparse_required",
+            )
+            self.assertEqual(
+                uow.document_units.list_by_processing_run("run_1"),
+                [],
+            )
+
     def test_broken_source_pdf_identity_chain_never_publishes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

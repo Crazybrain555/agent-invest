@@ -123,7 +123,7 @@
   },
   "tests/unit/test_build_units.py": {
    "private_imports": [],
-   "tests": 23
+   "tests": 24
   },
   "tests/unit/test_canonical_occurrence.py": {
    "private_imports": [],
@@ -379,7 +379,7 @@
   },
   "tests/unit/test_table_projection_comparison.py": {
    "private_imports": [],
-   "tests": 19
+   "tests": 25
   },
   "tests/unit/test_track_companies.py": {
    "private_imports": [],
