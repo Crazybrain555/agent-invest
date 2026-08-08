@@ -24,6 +24,7 @@ from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation 
     assess_normalized_ir_table_reconciliation,
 )
 from disclosure_anchor.application.contracts.parser_target import (
+    CURRENT_PARSER_TARGET_CONTRACT_VERSION,
     ParserTargetIdentity,
     ParserTargetIdentityError,
 )
@@ -602,8 +603,18 @@ def _validate_element_artifact_bindings(
             )
 
 
-def validate_current_normalized_ir_for_write(payload: Mapping[str, Any]) -> str:
-    """Validate a new producer artifact at the parser-port boundary."""
+def validate_current_normalized_ir_for_write(
+    payload: Mapping[str, Any],
+    *,
+    require_current_parser_target: bool = True,
+) -> str:
+    """Validate a new producer artifact at the parser-port boundary.
+
+    ``require_current_parser_target=False`` exists only for the
+    source-identity replay of a frozen generation, whose parser payload is
+    asserted byte-equal to the stored artifact elsewhere; every production
+    write keeps the default and requires the current target contract.
+    """
 
     version = validate_normalized_ir_contract(payload, require_current=True)
     structure_proof = payload.get("structure_proof")
@@ -617,6 +628,18 @@ def validate_current_normalized_ir_for_write(payload: Mapping[str, Any]) -> str:
         raise NormalizedIRVersionError(
             "structure_proof_current_required",
             "new NormalizedIR writes require the current structure algorithm",
+        )
+    parser_payload = payload.get("parser")
+    if require_current_parser_target and (
+        not isinstance(parser_payload, Mapping)
+        or parser_payload.get("target_contract_version")
+        != CURRENT_PARSER_TARGET_CONTRACT_VERSION
+    ):
+        # The legacy v1 target stays readable, but a new artifact must close
+        # its remote model selection under the current target contract.
+        raise NormalizedIRVersionError(
+            "parser_target_current_required",
+            "new NormalizedIR writes require the current parser target",
         )
     elements = payload.get("elements")
     assert isinstance(elements, list)

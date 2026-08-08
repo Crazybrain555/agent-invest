@@ -141,6 +141,8 @@ def _setup(
         page_visual=page_visual,
         image=image,
     )
+    document.raw_file_hash = str(normalized_ir["source_pdf_sha256"])
+    uow.documents.update(document)
     run = e.ProcessingRun(
         processing_run_id="run_1",
         document_id=document.document_id,
@@ -148,6 +150,7 @@ def _setup(
         run_kind="parse",
         status="succeeded",
         parser_target_identity=normalized_ir["parser"],
+        input_raw_file_hash=str(normalized_ir["source_pdf_sha256"]),
         normalized_ir_relpath=str(ir_relpath),
         artifact_hash=_sha256((root / ir_relpath).read_bytes()),
     )
@@ -1006,6 +1009,90 @@ class BuildUnitsTests(unittest.TestCase):
             self.assertEqual(
                 result.error["error_code"],
                 "ARTIFACT_WRITE_FAILED",
+            )
+            self.assertEqual(
+                uow.document_units.list_by_processing_run("run_1"),
+                [],
+            )
+
+    def test_legacy_parser_target_requires_reparse(self) -> None:
+        # A v1 parser target stays readable but cannot drive current
+        # publication: the run answers with the typed reparse terminal.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _setup(root)
+            payload = json.loads((root / ir_relpath).read_text(encoding="utf-8"))
+            payload["parser"]["target_contract_version"] = "parser-target.v1"
+            payload["parser"].pop("remote_model_name")
+            payload["parser"].pop("remote_selection_mode")
+            run = uow.processing_runs.get("run_1")
+            run.parser_target_identity = payload["parser"]
+            uow.processing_runs.update(run)
+            _rewrite_ir(root, uow, ir_relpath, payload)
+
+            result = _use_case(root, uow).execute(
+                BuildUnitsCommand(processing_run_id="run_1")
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.error["error_code"], "IR_CONTRACT_TOO_OLD")
+            self.assertEqual(
+                result.error["reason_code"],
+                "parser_target_reparse_required",
+            )
+            self.assertEqual(
+                uow.document_units.list_by_processing_run("run_1"),
+                [],
+            )
+
+    def test_unattested_remote_model_never_publishes(self) -> None:
+        # server_singleton_unattested is a valid recorded observation but
+        # not a publishable identity: HTTP-backend publication requires the
+        # explicitly resolved model.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, ir_relpath = _setup(root)
+            payload = json.loads((root / ir_relpath).read_text(encoding="utf-8"))
+            payload["parser"].update(
+                backend="vlm-http-client",
+                remote_model_name=None,
+                remote_selection_mode="server_singleton_unattested",
+            )
+            run = uow.processing_runs.get("run_1")
+            run.parser_target_identity = payload["parser"]
+            uow.processing_runs.update(run)
+            _rewrite_ir(root, uow, ir_relpath, payload)
+
+            result = _use_case(root, uow).execute(
+                BuildUnitsCommand(processing_run_id="run_1")
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(
+                result.error["error_code"],
+                "REMOTE_MODEL_UNATTESTED",
+            )
+            self.assertEqual(
+                uow.document_units.list_by_processing_run("run_1"),
+                [],
+            )
+
+    def test_broken_source_pdf_identity_chain_never_publishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, _ = _setup(root)
+            run = uow.processing_runs.get("run_1")
+            run.input_raw_file_hash = "sha256:" + "d" * 64
+            uow.processing_runs.update(run)
+
+            result = _use_case(root, uow).execute(
+                BuildUnitsCommand(processing_run_id="run_1")
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(
+                result.error["error_code"],
+                "SOURCE_PDF_IDENTITY_MISMATCH",
             )
             self.assertEqual(
                 uow.document_units.list_by_processing_run("run_1"),

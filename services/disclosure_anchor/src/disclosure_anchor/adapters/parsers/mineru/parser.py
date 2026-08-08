@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,10 @@ from disclosure_anchor.application.ports.parser import (
     ParserOptions,
     ParserResult,
 )
-from disclosure_anchor.domain.errors import ParserOutputContractError
+from disclosure_anchor.domain.errors import (
+    ParserOutputContractError,
+    RemoteModelAmbiguousError,
+)
 
 
 __all__ = ["MinerUDocumentParser"]
@@ -70,6 +74,24 @@ class MinerUDocumentParser:
         )
         if server_url:
             self._process.probe_server(server_url)
+
+    def resolve_remote_model(self, options: ParserOptions) -> str | None:
+        """Resolve the served model identity for HTTP backends.
+
+        Returns None for local backends. For *-http-client backends the
+        server must be configured and serve exactly one model; the caller
+        stamps the result into the parse target before the run exists.
+        """
+
+        if not options.backend.endswith("-http-client"):
+            return None
+        server_url = options.server_url or self._server_url
+        if not server_url:
+            raise RemoteModelAmbiguousError(
+                "HTTP parser backend requires a configured server_url to "
+                "resolve its remote model identity"
+            )
+        return self._process.resolve_server_model(server_url)
 
     def parse(
         self,
@@ -153,6 +175,43 @@ class MinerUDocumentParser:
             build.visual_semantics_bytes,
             label="visual semantics",
         )
+        # Run-bound parse receipt: together with the processing-run row
+        # (input_raw_file_hash, artifact_hash, parser_target_identity) it
+        # closes what produced this artifact — the immutable input, the
+        # closed v2 target, and the resolved endpoint identity.
+        receipt_path = content_list_path.with_name(
+            artifact_stem + "_parse_receipt.json"
+        )
+        endpoint = {
+            "server_url": server_url,
+            "remote_model_name": parser_info.remote_model_name,
+        }
+        _write_json_artifact(
+            receipt_path,
+            {
+                "receipt_contract_version": "parse-receipt.v1",
+                "source_pdf_sha256": source_pdf_sha256,
+                "parser_target": parser_info.to_payload(),
+                "endpoint": {
+                    **endpoint,
+                    "endpoint_identity_sha256": "sha256:"
+                    + hashlib.sha256(
+                        json.dumps(
+                            endpoint,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                },
+                "request_profile": {
+                    "http_request_concurrency": (
+                        options.http_request_concurrency
+                    ),
+                    "timeout_seconds": options.timeout_seconds,
+                },
+            },
+            label="parse receipt",
+        )
         return ParserResult(
             target_identity=parser_info,
             artifact_root=artifacts.root,
@@ -166,6 +225,7 @@ class MinerUDocumentParser:
                 "pdf_structure": native_path,
                 "source_evidence": source_evidence_path,
                 "visual_semantics": visual_semantics_path,
+                "parse_receipt": receipt_path,
             },
             normalized_ir=build.normalized_ir,
         )

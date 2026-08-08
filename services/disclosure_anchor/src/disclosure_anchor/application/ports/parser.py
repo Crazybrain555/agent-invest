@@ -46,6 +46,11 @@ class ParserOptions:
     # Immutable operator/provider attestation for the complete MinerU
     # package/image, model files, mineru.json, and content-affecting env.
     runtime_bundle_identity_sha256: str | None = None
+    # Remote model identity for *-http-client backends, resolved from the
+    # server before the run is created. None means the server model was not
+    # resolved; the resulting target records server_singleton_unattested and
+    # never enters current publication.
+    remote_model_name: str | None = None
 
     @property
     def effective_effort(self) -> Literal["medium", "high"] | None:
@@ -65,6 +70,18 @@ class ParserOptions:
     def target_identity(self, identity: ParserIdentity) -> ParserTargetIdentity:
         """Close every content-affecting option against one parser package."""
 
+        http_backend = self.backend.endswith("-http-client")
+        remote_model = self.remote_model_name if http_backend else None
+        if http_backend:
+            remote_selection: Literal[
+                "explicit",
+                "server_singleton_unattested",
+                "not_applicable",
+            ] = "explicit" if remote_model is not None else (
+                "server_singleton_unattested"
+            )
+        else:
+            remote_selection = "not_applicable"
         return ParserTargetIdentity(
             name=identity.name,
             package_version=identity.version,
@@ -81,6 +98,8 @@ class ParserOptions:
             runtime_bundle_identity_sha256=(
                 self.runtime_bundle_identity_sha256 or ""
             ),
+            remote_model_name=remote_model,
+            remote_selection_mode=remote_selection,
         )
 
 

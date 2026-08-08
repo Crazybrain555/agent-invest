@@ -28,6 +28,7 @@ from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation 
     assess_normalized_ir_table_reconciliation,
 )
 from disclosure_anchor.application.contracts.parser_target import (
+    CURRENT_PARSER_TARGET_CONTRACT_VERSION,
     ParserTargetIdentity,
     ParserTargetIdentityError,
 )
@@ -173,6 +174,11 @@ class BuildUnits:
                         ),
                     )
                 )
+            self._require_publishable_identity(
+                run=run,
+                document=context["document"],
+                normalized_ir=normalized_ir,
+            )
             evidence = self._source_evidence_validator.validate(
                 normalized_ir,
                 load_artifact=lambda role: self._load_hashed_parser_artifact(
@@ -432,6 +438,69 @@ class BuildUnits:
                     )
                 )
             return {"run": run, "document": document, "security": security}
+
+    def _require_publishable_identity(
+        self,
+        *,
+        run: e.ProcessingRun,
+        document: e.Document,
+        normalized_ir: dict[str, Any],
+    ) -> None:
+        """Close the run-bound identity chain before any placement work.
+
+        The registered document, the processing run's input, and the parser
+        output must name the same immutable raw PDF bytes, and the parser
+        target must be the current contract with an explicitly resolved
+        remote model for HTTP backends. A broken chain never publishes.
+        """
+
+        hashes = {
+            "document.raw_file_hash": document.raw_file_hash,
+            "run.input_raw_file_hash": run.input_raw_file_hash,
+            "normalized_ir.source_pdf_sha256": normalized_ir.get(
+                "source_pdf_sha256"
+            ),
+        }
+        if None in hashes.values() or len(set(hashes.values())) != 1:
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="SOURCE_PDF_IDENTITY_MISMATCH",
+                    reason_code="source_pdf_identity_mismatch",
+                    message=(
+                        "source PDF identity chain is broken across "
+                        f"document/run/NormalizedIR: {hashes}"
+                    ),
+                )
+            )
+        target = ParserTargetIdentity.from_payload(normalized_ir.get("parser"))
+        if (
+            target.target_contract_version
+            != CURRENT_PARSER_TARGET_CONTRACT_VERSION
+        ):
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="IR_CONTRACT_TOO_OLD",
+                    reason_code="parser_target_reparse_required",
+                    message=(
+                        "a legacy parser target cannot drive current "
+                        "publication; reparse the document"
+                    ),
+                )
+            )
+        if (
+            target.backend.endswith("-http-client")
+            and target.remote_selection_mode != "explicit"
+        ):
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="REMOTE_MODEL_UNATTESTED",
+                    reason_code="remote_model_unattested",
+                    message=(
+                        "HTTP-backend publication requires an explicitly "
+                        "resolved remote model identity"
+                    ),
+                )
+            )
 
     def _load_ir(
         self,

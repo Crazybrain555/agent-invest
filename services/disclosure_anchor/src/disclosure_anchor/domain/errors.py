@@ -138,6 +138,23 @@ class StructureNativeEvidenceRequiredError(ParserOutputContractError):
     reason_code = "structure_native_evidence_required"
 
 
+class RemoteModelAmbiguousError(ParserError):
+    """Raised when the remote backend does not serve exactly one model.
+
+    Zero or multiple served models make the parse target's model identity
+    undecidable before the run exists; this is a configuration state the
+    operator must resolve, not a transient outage.
+    """
+
+    reason_code = "remote_model_ambiguous"
+
+
+class RemoteModelChangedError(ParserOutputContractError):
+    """Raised when the served remote model changed during a parse run."""
+
+    reason_code = "remote_model_changed"
+
+
 class ParserUnknownError(ParserError):
     """Raised when a parser adapter wraps an unexpected parser failure."""
 

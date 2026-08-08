@@ -7,8 +7,11 @@ from dataclasses import asdict, dataclass
 import re
 from typing import Any, Literal, cast
 
-PARSER_TARGET_CONTRACT_VERSION = "parser-target.v1"
-READABLE_PARSER_TARGET_CONTRACT_VERSION = "parser-target.v2"
+# v1 is the frozen legacy shape: readable forever, never written anew, and
+# barred from current publication. v2 is the only shape new parses persist;
+# it additionally closes the remote model selection of HTTP backends.
+LEGACY_PARSER_TARGET_CONTRACT_VERSION = "parser-target.v1"
+CURRENT_PARSER_TARGET_CONTRACT_VERSION = "parser-target.v2"
 MINERU_INLINE_EQUATION_DELIMITERS = ("$", "$")
 
 _BACKENDS = frozenset(
@@ -53,14 +56,14 @@ class ParserTargetIdentity:
     ] = "not_applicable"
     inline_equation_left: str = MINERU_INLINE_EQUATION_DELIMITERS[0]
     inline_equation_right: str = MINERU_INLINE_EQUATION_DELIMITERS[1]
-    target_contract_version: str = PARSER_TARGET_CONTRACT_VERSION
+    target_contract_version: str = CURRENT_PARSER_TARGET_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
         _validate_target(self)
 
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)
-        if self.target_contract_version == PARSER_TARGET_CONTRACT_VERSION:
+        if self.target_contract_version == LEGACY_PARSER_TARGET_CONTRACT_VERSION:
             payload.pop("remote_model_name")
             payload.pop("remote_selection_mode")
         return payload
@@ -73,9 +76,9 @@ class ParserTargetIdentity:
             )
         version = value.get("target_contract_version")
         expected = set(cls.__dataclass_fields__)
-        if version == PARSER_TARGET_CONTRACT_VERSION:
+        if version == LEGACY_PARSER_TARGET_CONTRACT_VERSION:
             expected -= {"remote_model_name", "remote_selection_mode"}
-        elif version != READABLE_PARSER_TARGET_CONTRACT_VERSION:
+        elif version != CURRENT_PARSER_TARGET_CONTRACT_VERSION:
             raise ParserTargetIdentityError(
                 "parser target contract version is unsupported"
             )
@@ -85,7 +88,7 @@ class ParserTargetIdentity:
             )
         try:
             payload = dict(value)
-            if version == PARSER_TARGET_CONTRACT_VERSION:
+            if version == LEGACY_PARSER_TARGET_CONTRACT_VERSION:
                 payload.update(
                     remote_model_name=None,
                     remote_selection_mode="not_applicable",
@@ -105,8 +108,8 @@ def _validate_target(target: ParserTargetIdentity) -> None:
                 f"parser target {field} must be non-empty text"
             )
     if target.target_contract_version not in {
-        PARSER_TARGET_CONTRACT_VERSION,
-        READABLE_PARSER_TARGET_CONTRACT_VERSION,
+        LEGACY_PARSER_TARGET_CONTRACT_VERSION,
+        CURRENT_PARSER_TARGET_CONTRACT_VERSION,
     }:
         raise ParserTargetIdentityError(
             "parser target contract version is unsupported"
@@ -167,7 +170,7 @@ def _validate_target(target: ParserTargetIdentity) -> None:
         raise ParserTargetIdentityError(
             "parser target remote model name is invalid"
         )
-    if target.target_contract_version == PARSER_TARGET_CONTRACT_VERSION:
+    if target.target_contract_version == LEGACY_PARSER_TARGET_CONTRACT_VERSION:
         if (
             target.remote_model_name is not None
             or target.remote_selection_mode != "not_applicable"
@@ -203,8 +206,8 @@ def _validate_target(target: ParserTargetIdentity) -> None:
 
 __all__ = [
     "MINERU_INLINE_EQUATION_DELIMITERS",
-    "PARSER_TARGET_CONTRACT_VERSION",
-    "READABLE_PARSER_TARGET_CONTRACT_VERSION",
+    "LEGACY_PARSER_TARGET_CONTRACT_VERSION",
+    "CURRENT_PARSER_TARGET_CONTRACT_VERSION",
     "ParserTargetIdentity",
     "ParserTargetIdentityError",
 ]

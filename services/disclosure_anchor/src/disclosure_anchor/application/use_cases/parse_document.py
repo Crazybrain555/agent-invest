@@ -48,6 +48,8 @@ from disclosure_anchor.domain.errors import (
     ParserTimeoutError,
     ParserUnknownError,
     ParserVersionProbeError,
+    RemoteModelAmbiguousError,
+    RemoteModelChangedError,
     StructureNativeEvidenceRequiredError,
 )
 
@@ -126,12 +128,24 @@ class ParseDocument:
             )
         try:
             self._verify_raw_document(context)
+            options = cast(ParserOptions, context.get("options", options))
             parser_result = self._parser.parse(
                 input_pdf=context["input_pdf"],
                 output_dir=context["artifact_root_path"],
                 options=options,
                 document_metadata=context["document_metadata"],
             )
+            # The model serving the run must still be the model the run was
+            # created against; a swap mid-run breaks the target identity.
+            resolver = getattr(self._parser, "resolve_remote_model", None)
+            if options.backend.endswith("-http-client") and callable(resolver):
+                served_model = resolver(options)
+                if served_model != options.remote_model_name:
+                    raise RemoteModelChangedError(
+                        "remote model changed during the parse run: "
+                        f"prepared {options.remote_model_name!r}, "
+                        f"serving {served_model!r}"
+                    )
             expected_target = context["parser_target_identity"]
             if (
                 not isinstance(expected_target, ParserTargetIdentity)
@@ -320,8 +334,39 @@ class ParseDocument:
                     message=str(exc),
                 )
             else:
+                # The remote model is part of the parse target: resolve it
+                # from the backend before the run row exists, so the run is
+                # created against a closed identity or not at all.
+                resolver = getattr(self._parser, "resolve_remote_model", None)
+                if options.backend.endswith("-http-client") and callable(
+                    resolver
+                ):
+                    try:
+                        options = replace(
+                            options,
+                            remote_model_name=resolver(options),
+                        )
+                    except RemoteModelAmbiguousError as exc:
+                        prepare_error = self._structured_error(
+                            stage="parser_identity",
+                            error_code="remote_model_ambiguous",
+                            retryable=False,
+                            retry_budget_class="infrastructure",
+                            message=str(exc),
+                        )
+                    except ParserVersionProbeError as exc:
+                        prepare_error = self._structured_error(
+                            stage="parser_identity",
+                            error_code="remote_model_unresolved",
+                            retryable=True,
+                            retry_budget_class="infrastructure",
+                            message=str(exc),
+                        )
                 try:
-                    parser_target_identity = options.target_identity(identity)
+                    if prepare_error is None:
+                        parser_target_identity = options.target_identity(
+                            identity
+                        )
                 except ParserTargetIdentityError as exc:
                     parser_target_identity = None
                     prepare_error = self._structured_error(
@@ -410,6 +455,7 @@ class ParseDocument:
             "artifact_root_path": self._paths.data_path(artifact_root_relpath),
             "normalized_ir_relpath": normalized_ir_relpath,
             "parser_target_identity": parser_target_identity,
+            "options": options,
             "document_metadata": {
                 "document_id": document.document_id,
                 "title": document.title,
@@ -631,6 +677,12 @@ class ParseDocument:
                 "parser_identity",
                 "parser_version_probe_failed",
                 retryable=True,
+            )
+        if isinstance(exc, RemoteModelChangedError):
+            return typed(
+                "parse_output",
+                "remote_model_changed",
+                retryable=False,
             )
         if isinstance(exc, StructureNativeEvidenceRequiredError):
             return typed(

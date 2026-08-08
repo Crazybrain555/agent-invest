@@ -123,7 +123,7 @@
   },
   "tests/unit/test_build_units.py": {
    "private_imports": [],
-   "tests": 19
+   "tests": 22
   },
   "tests/unit/test_canonical_occurrence.py": {
    "private_imports": [],
@@ -247,7 +247,7 @@
   },
   "tests/unit/test_mineru_backend_probe.py": {
    "private_imports": [],
-   "tests": 5
+   "tests": 9
   },
   "tests/unit/test_mineru_middle_roles.py": {
    "private_imports": [],
@@ -275,11 +275,11 @@
   },
   "tests/unit/test_parse_document.py": {
    "private_imports": [],
-   "tests": 12
+   "tests": 15
   },
   "tests/unit/test_parser_target.py": {
    "private_imports": [],
-   "tests": 3
+   "tests": 4
   },
   "tests/unit/test_path_builder.py": {
    "private_imports": [],

@@ -8,7 +8,10 @@ from unittest import mock
 from disclosure_anchor.adapters.parsers.mineru import mineru_process
 from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
-from disclosure_anchor.domain.errors import ParserVersionProbeError
+from disclosure_anchor.domain.errors import (
+    ParserVersionProbeError,
+    RemoteModelAmbiguousError,
+)
 
 
 class BackendProbeTests(unittest.TestCase):
@@ -51,6 +54,87 @@ class BackendProbeTests(unittest.TestCase):
         parser.readiness()
 
         process.probe_server.assert_not_called()
+
+    def test_resolve_remote_model_is_backend_scoped_and_fail_closed(
+        self,
+    ) -> None:
+        from disclosure_anchor.application.ports.parser import ParserOptions
+
+        process = mock.Mock()
+        process.version.return_value = "2.9.9"
+        process.resolve_server_model.return_value = "MinerU2.5-Pro-2605-1.2B"
+        parser = MinerUDocumentParser(
+            process=process, server_url="http://gpu:30000"
+        )
+
+        self.assertIsNone(
+            parser.resolve_remote_model(ParserOptions(backend="pipeline"))
+        )
+        process.resolve_server_model.assert_not_called()
+
+        resolved = parser.resolve_remote_model(
+            ParserOptions(backend="vlm-http-client")
+        )
+        self.assertEqual(resolved, "MinerU2.5-Pro-2605-1.2B")
+        process.resolve_server_model.assert_called_once_with(
+            "http://gpu:30000"
+        )
+
+        bare = MinerUDocumentParser(process=process)
+        with self.assertRaises(RemoteModelAmbiguousError):
+            bare.resolve_remote_model(ParserOptions(backend="vlm-http-client"))
+
+
+class ResolveServerModelTests(unittest.TestCase):
+    """The OpenAI-compatible model listing must name exactly one model."""
+
+    def _resolve(self, payload: object) -> str:
+        process = MinerUProcess.__new__(MinerUProcess)
+        response = mock.MagicMock()
+        response.read.return_value = (
+            payload if isinstance(payload, bytes) else
+            __import__("json").dumps(payload).encode("utf-8")
+        )
+        response.__enter__.return_value = response
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(
+            mineru_process.urllib.request,
+            "build_opener",
+            return_value=opener,
+        ):
+            return process.resolve_server_model("http://gpu:30000")
+
+    def test_single_served_model_resolves(self) -> None:
+        self.assertEqual(
+            self._resolve({"object": "list", "data": [{"id": "model-a"}]}),
+            "model-a",
+        )
+
+    def test_zero_or_multiple_models_fail_closed(self) -> None:
+        for label, payload in (
+            ("empty", {"object": "list", "data": []}),
+            (
+                "multiple",
+                {"data": [{"id": "model-a"}, {"id": "model-b"}]},
+            ),
+            ("malformed", {"data": "nope"}),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(RemoteModelAmbiguousError):
+                    self._resolve(payload)
+
+    def test_transport_failure_is_a_probe_error(self) -> None:
+        process = MinerUProcess.__new__(MinerUProcess)
+        opener = mock.Mock()
+        opener.open.side_effect = OSError("connection refused")
+        with mock.patch.object(
+            mineru_process.urllib.request,
+            "build_opener",
+            return_value=opener,
+        ):
+            with self.assertRaises(ParserVersionProbeError):
+                process.resolve_server_model("http://gpu:30000")
 
 
 class ProbeSuccessCacheTests(unittest.TestCase):

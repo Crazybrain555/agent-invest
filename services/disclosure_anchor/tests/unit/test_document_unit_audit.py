@@ -165,7 +165,9 @@ def _ir(
             "runtime_bundle_identity_sha256": "sha256:" + "c" * 64,
             "inline_equation_left": "$",
             "inline_equation_right": "$",
-            "target_contract_version": "parser-target.v1",
+            "target_contract_version": "parser-target.v2",
+            "remote_model_name": None,
+            "remote_selection_mode": "not_applicable",
         },
         "parser_artifacts": {
             "artifact_root_relpath": "parser/audit",

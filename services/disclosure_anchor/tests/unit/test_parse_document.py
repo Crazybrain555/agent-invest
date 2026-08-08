@@ -48,6 +48,7 @@ from disclosure_anchor.domain.errors import (
     ParserTimeoutError,
     ParserUnknownError,
     ParserVersionProbeError,
+    RemoteModelAmbiguousError,
     StructureNativeEvidenceRequiredError,
 )
 from tests.unit._fakes import FakeUnitOfWork
@@ -163,6 +164,7 @@ class _Parser:
         identity_error: Exception | None = None,
         readiness_error: Exception | None = None,
         contract_version: str = CURRENT_NORMALIZED_IR_VERSION,
+        remote_models: tuple[object, ...] = (),
     ) -> None:
         self.error = error
         self.identity_error = identity_error
@@ -170,6 +172,19 @@ class _Parser:
         self.contract_version = contract_version
         self.called = False
         self.document_metadata: dict[str, Any] | None = None
+        # Scripted resolution results for successive resolve_remote_model
+        # calls: a string is the served model, an exception is raised.
+        self.remote_models = list(remote_models)
+
+    def resolve_remote_model(self, options: ParserOptions) -> str | None:
+        if not options.backend.endswith("-http-client"):
+            return None
+        assert self.remote_models, "unexpected resolve_remote_model call"
+        item = self.remote_models.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        assert item is None or isinstance(item, str)
+        return item
 
     def identity(self) -> ParserIdentity:
         if self.identity_error is not None:
@@ -518,6 +533,92 @@ class ParseDocumentUnitTests(unittest.TestCase):
         self.assertFalse(parser.called)
         self.assertEqual(result.error["error_code"], "parser_readiness_failed")
         self.assertTrue(result.error["retryable"])
+
+    def test_http_backend_stamps_the_resolved_model_into_the_run(self) -> None:
+        uow = _uow_with_document()
+        parser = _Parser(remote_models=("MinerU2.5-Pro-2605-1.2B",) * 2)
+        use_case, _ = _use_case(uow, parser=parser)
+
+        result = use_case.execute(
+            _command(
+                options=ParserOptions(
+                    backend="vlm-http-client",
+                    server_url="http://gpu.example:30000",
+                    runtime_bundle_identity_sha256=_RUNTIME_BUNDLE_HASH,
+                )
+            )
+        )
+
+        self.assertEqual(result.status, "succeeded")
+        run = uow.processing_runs.get(result.processing_run_id)
+        assert run is not None
+        target = run.parser_target_identity
+        assert isinstance(target, dict)
+        self.assertEqual(target["target_contract_version"], "parser-target.v2")
+        self.assertEqual(
+            target["remote_model_name"], "MinerU2.5-Pro-2605-1.2B"
+        )
+        self.assertEqual(target["remote_selection_mode"], "explicit")
+        self.assertEqual(parser.remote_models, [])
+
+    def test_unresolved_remote_model_fails_before_the_parser_runs(self) -> None:
+        for scripted, error_code, retryable in (
+            (
+                RemoteModelAmbiguousError("two models served"),
+                "remote_model_ambiguous",
+                False,
+            ),
+            (
+                ParserVersionProbeError("model listing unavailable"),
+                "remote_model_unresolved",
+                True,
+            ),
+        ):
+            with self.subTest(error_code=error_code):
+                uow = _uow_with_document()
+                parser = _Parser(remote_models=(scripted,))
+                use_case, artifact_store = _use_case(uow, parser=parser)
+
+                result = use_case.execute(
+                    _command(
+                        options=ParserOptions(
+                            backend="vlm-http-client",
+                            server_url="http://gpu.example:30000",
+                            runtime_bundle_identity_sha256=(
+                                _RUNTIME_BUNDLE_HASH
+                            ),
+                        )
+                    )
+                )
+
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.error["error_code"], error_code)
+                self.assertEqual(result.error["retryable"], retryable)
+                self.assertFalse(parser.called)
+                self.assertEqual(artifact_store.payloads, {})
+
+    def test_remote_model_change_mid_run_is_a_typed_terminal(self) -> None:
+        uow = _uow_with_document()
+        parser = _Parser(
+            remote_models=("MinerU2.5-Pro-2605-1.2B", "other-model")
+        )
+        use_case, artifact_store = _use_case(uow, parser=parser)
+
+        result = use_case.execute(
+            _command(
+                options=ParserOptions(
+                    backend="vlm-http-client",
+                    server_url="http://gpu.example:30000",
+                    runtime_bundle_identity_sha256=_RUNTIME_BUNDLE_HASH,
+                )
+            )
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.error["error_code"], "remote_model_changed")
+        self.assertFalse(result.error["retryable"])
+        self.assertTrue(parser.called)
+        self.assertEqual(artifact_store.payloads, {})
 
     def test_missing_native_evidence_is_typed_and_writes_no_ir(self) -> None:
         # The native lane being absent is an operational state, not a broken

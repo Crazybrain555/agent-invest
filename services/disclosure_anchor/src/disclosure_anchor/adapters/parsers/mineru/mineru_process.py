@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -24,6 +25,7 @@ from disclosure_anchor.domain.errors import (
     ParserTaskError,
     ParserTimeoutError,
     ParserVersionProbeError,
+    RemoteModelAmbiguousError,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -353,6 +355,52 @@ class MinerUProcess:
             stdout=stdout,
             stderr=stderr,
         )
+
+    def resolve_server_model(
+        self, server_url: str, *, timeout_seconds: float = 15.0
+    ) -> str:
+        """Return the single model the OpenAI-compatible backend serves.
+
+        The remote model is part of the parse target identity: it must be
+        known before a run is created and unchanged when the run finishes.
+        Transport failures are an infrastructure outage; anything other
+        than exactly one served model is an operator configuration state
+        and fails closed without retry.
+        """
+
+        url = server_url.rstrip("/") + "/v1/models"
+        request = urllib.request.Request(url, method="GET")
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({})
+        )
+        try:
+            with opener.open(request, timeout=timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            ValueError,
+        ) as exc:
+            raise ParserVersionProbeError(
+                f"MinerU backend model listing unavailable: {server_url}"
+            ) from exc
+        data = payload.get("data") if isinstance(payload, dict) else None
+        models: list[str] | None = None
+        if isinstance(data, list):
+            models = [
+                model_id
+                for item in data
+                if isinstance(item, dict)
+                and isinstance(model_id := item.get("id"), str)
+                and model_id.strip()
+            ]
+        if models is None or len(models) != 1:
+            raise RemoteModelAmbiguousError(
+                "MinerU backend must serve exactly one model, got "
+                f"{sorted(models) if models else models}: {server_url}"
+            )
+        return models[0]
 
     def probe_server(
         self, server_url: str, *, timeout_seconds: float = 15.0

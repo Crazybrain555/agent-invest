@@ -214,9 +214,7 @@ class NormalizedIRContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(NormalizedIRVersionError, pattern):
                     validate_current_normalized_ir_for_write(payload)
 
-    def test_v2_parser_target_is_readable_without_changing_v1_write_shape(
-        self,
-    ) -> None:
+    def test_v2_is_the_write_target_and_v1_stays_read_only(self) -> None:
         for model_name, selection in (
             (None, "server_singleton_unattested"),
             ("MinerU2.5-Pro-2605-1.2B", "explicit"),
@@ -237,9 +235,27 @@ class NormalizedIRContractTests(unittest.TestCase):
                 )
                 self.assertEqual(payload["parser"]["remote_model_name"], model_name)
 
+        # The current bundle writes v2 with closed remote fields.
+        current = _current_payload()
+        self.assertEqual(
+            current["parser"]["target_contract_version"], "parser-target.v2"
+        )
+        self.assertIn("remote_model_name", current["parser"])
+        self.assertIn("remote_selection_mode", current["parser"])
+
+        # A v1 payload stays readable but can no longer be newly written.
         legacy = _current_payload()
-        self.assertNotIn("remote_model_name", legacy["parser"])
-        self.assertNotIn("remote_selection_mode", legacy["parser"])
+        legacy["parser"]["target_contract_version"] = "parser-target.v1"
+        legacy["parser"].pop("remote_model_name")
+        legacy["parser"].pop("remote_selection_mode")
+        self.assertEqual(_schema_errors(legacy), [])
+        self.assertEqual(
+            validate_normalized_ir_contract(legacy), "normalized_ir.v4"
+        )
+        with self.assertRaisesRegex(
+            NormalizedIRVersionError, "current parser target"
+        ):
+            validate_current_normalized_ir_for_write(legacy)
 
     def test_schema_and_runtime_reject_invalid_v2_parser_target_shapes(self) -> None:
         def v2_payload() -> dict[str, object]:

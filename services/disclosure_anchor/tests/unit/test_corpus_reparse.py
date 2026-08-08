@@ -99,6 +99,8 @@ def _header(documents: list[dict[str, object]]) -> dict[str, object]:
                 table=True,
                 image_analysis=True,
                 runtime_bundle_identity_sha256=_sha256(b"deployment"),
+                remote_model_name="MinerU2.5-Pro-2605-1.2B",
+                remote_selection_mode="explicit",
             ).to_payload(),
             "max_parse_retries": 3,
             "max_build_retries": 3,

@@ -260,7 +260,13 @@ def _audit_one(argument: tuple[ManifestEntry, str, bool]) -> dict[str, Any]:
                 source_proof,
                 native_structure,
             ) = _replay_source_ir(frozen_ir, data_root=data_root)
-            ir_version = validate_current_normalized_ir_for_write(normalized_ir)
+            # Source-identity replay reproduces a frozen generation whose
+            # parser payload is asserted byte-equal to the stored artifact;
+            # target currency applies to new production writes, not here.
+            ir_version = validate_current_normalized_ir_for_write(
+                normalized_ir,
+                require_current_parser_target=False,
+            )
         else:
             normalized_ir = frozen_ir
             ir_version = validate_normalized_ir_contract(normalized_ir)
@@ -575,7 +581,10 @@ def _replay_source_ir(
         visual_hashes=source_visual_hashes,
         visual_semantics=build.visual_semantics,
     )
-    validate_current_normalized_ir_for_write(normalized_ir)
+    validate_current_normalized_ir_for_write(
+        normalized_ir,
+        require_current_parser_target=False,
+    )
     raw_struct_tree_citations = _validate_raw_struct_tree_citations(
         normalized_ir,
         build.native_structure,

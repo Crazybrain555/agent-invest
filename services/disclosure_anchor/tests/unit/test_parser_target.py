@@ -5,8 +5,8 @@ from __future__ import annotations
 import unittest
 
 from disclosure_anchor.application.contracts.parser_target import (
-    PARSER_TARGET_CONTRACT_VERSION,
-    READABLE_PARSER_TARGET_CONTRACT_VERSION,
+    CURRENT_PARSER_TARGET_CONTRACT_VERSION,
+    LEGACY_PARSER_TARGET_CONTRACT_VERSION,
     ParserTargetIdentity,
     ParserTargetIdentityError,
 )
@@ -24,33 +24,51 @@ class ParserTargetIdentityTests(unittest.TestCase):
             formula=True,
             table=True,
             runtime_bundle_identity_sha256="sha256:" + "b" * 64,
+            target_contract_version=LEGACY_PARSER_TARGET_CONTRACT_VERSION,
         ).to_payload()
 
     @classmethod
     def _v2_payload(cls, **changes: object) -> dict[str, object]:
         payload = cls._legacy_payload()
         payload.update(
-            target_contract_version=READABLE_PARSER_TARGET_CONTRACT_VERSION,
+            target_contract_version=CURRENT_PARSER_TARGET_CONTRACT_VERSION,
             remote_model_name=None,
             remote_selection_mode="not_applicable",
         )
         payload.update(changes)
         return payload
 
-    def test_v1_write_shape_remains_unchanged(self) -> None:
+    def test_v1_shape_stays_readable_without_remote_fields(self) -> None:
         payload = self._legacy_payload()
 
         self.assertEqual(
             payload["target_contract_version"],
-            PARSER_TARGET_CONTRACT_VERSION,
+            LEGACY_PARSER_TARGET_CONTRACT_VERSION,
         )
         self.assertNotIn("remote_model_name", payload)
         self.assertNotIn("remote_selection_mode", payload)
         self.assertEqual(ParserTargetIdentity.from_payload(payload).to_payload(), payload)
 
-    def test_v2_exact_shapes_round_trip_without_becoming_the_write_default(
-        self,
-    ) -> None:
+    def test_v2_is_the_construction_default(self) -> None:
+        target = ParserTargetIdentity(
+            name="MinerU",
+            package_version="3.4.0",
+            backend="pipeline",
+            method="auto",
+            language="ch",
+            formula=True,
+            table=True,
+            runtime_bundle_identity_sha256="sha256:" + "b" * 64,
+        )
+        self.assertEqual(
+            target.target_contract_version,
+            CURRENT_PARSER_TARGET_CONTRACT_VERSION,
+        )
+        payload = target.to_payload()
+        self.assertIn("remote_model_name", payload)
+        self.assertIn("remote_selection_mode", payload)
+
+    def test_exact_shapes_round_trip_under_both_versions(self) -> None:
         cases = (
             self._v2_payload(),
             self._v2_payload(
@@ -73,7 +91,7 @@ class ParserTargetIdentityTests(unittest.TestCase):
             ParserTargetIdentity.from_payload(
                 self._legacy_payload()
             ).target_contract_version,
-            PARSER_TARGET_CONTRACT_VERSION,
+            LEGACY_PARSER_TARGET_CONTRACT_VERSION,
         )
 
     def test_v2_remote_selection_matrix_and_closed_shapes_are_enforced(
