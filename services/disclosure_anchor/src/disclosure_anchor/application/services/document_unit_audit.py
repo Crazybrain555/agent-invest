@@ -1321,12 +1321,16 @@ def _validate_native_gap_units(
             and gap.predecessor is not None
             else None
         )
+        # bounded_by_same_source is a CLOSED containment lane: its expected
+        # owner comes only from the primary-field recomputation, never from
+        # the element-level anchor owner, which an associated caption/note
+        # claim could satisfy.
         expected_owner = (
             containment_primary_owner
-            if containment_primary_owner is not None
+            if gap.relation == "bounded_by_same_source"
             else (
                 predecessor_owner
-                if gap.relation in {"bounded_by_same_source", "page_suffix"}
+                if gap.relation == "page_suffix"
                 else (
                     predecessor_owner
                     if gap.relation == "between_mapped_sources"

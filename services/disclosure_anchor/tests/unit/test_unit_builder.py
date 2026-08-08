@@ -2314,6 +2314,59 @@ class ConservationTests(unittest.TestCase):
             )
         )
 
+        # The bounded containment lane is CLOSED: without a unique primary
+        # owner it flattens to root and never falls through to the
+        # element-level adjacency lanes, so a caption-only owner can never
+        # win from the side door.
+        from disclosure_anchor.application.services.unit_builder.builder import (
+            _native_recovery_owner_index,
+        )
+
+        def bounded_recovery() -> UnitDraft:
+            return UnitDraft(
+                payload_kind="mixed",
+                payload={
+                    "semantic_type": "document",
+                    "order_status": "unresolved_physical_fallback",
+                    "parts": [],
+                },
+                source_order=5,
+                heading_path=[],
+                section_path=[],
+                title=None,
+                quality_status="needs_review",
+                artifact_locator={
+                    "source_projection": {
+                        "version": "unit-source-projection.v4",
+                        "physical_context": {
+                            "relation": "bounded_by_same_source",
+                            "order_basis": "containment_proven",
+                            "containment_owner": 1127,
+                            "predecessor": {"source_item_index": 1127},
+                            "successor": {"source_item_index": 1127},
+                        },
+                    }
+                },
+            )
+
+        self.assertIsNone(
+            _native_recovery_owner_index(
+                bounded_recovery(),
+                owners=[caption_only],
+                owner_indices_by_source={1127: [0]},
+                element_kinds={1127: "table"},
+            )
+        )
+        self.assertEqual(
+            _native_recovery_owner_index(
+                bounded_recovery(),
+                owners=[caption_only, body_owner],
+                owner_indices_by_source={1127: [0, 1]},
+                element_kinds={1127: "table"},
+            ),
+            1,
+        )
+
     def test_proved_empty_section_never_binds_its_page_furniture(self) -> None:
         elements = [
             _element(0, text="27、生物资产", text_level=1, page_no=1),

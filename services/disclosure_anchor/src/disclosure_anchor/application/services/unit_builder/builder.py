@@ -2277,33 +2277,39 @@ def _native_recovery_owner_index(
     element_kinds: Mapping[int, str],
 ) -> int | None:
     context = _native_physical_context(recovery)
-    containment_owner = context.get("containment_owner")
-    if (
-        isinstance(containment_owner, int)
-        and not isinstance(containment_owner, bool)
-        and context.get("relation") == "bounded_by_same_source"
-        and context.get("order_basis") == "containment_proven"
-    ):
+    if context.get("relation") == "bounded_by_same_source":
         # Containment names a physical region inside one element's primary
         # body, so only primary payload selector ownership competes here: a
         # unit holding just an associated selector (e.g. a selected-only
         # detached table caption) never buys containment. A unique primary
         # owner wins even when it is heading-only — exact containment is the
         # proof that the missing native content is that section's own body.
-        expected_field = _CONTAINMENT_PRIMARY_FIELD_BY_KIND.get(
-            element_kinds.get(containment_owner, ""), "text"
-        )
-        primary = [
-            candidate
-            for candidate in owner_indices_by_source.get(containment_owner, [])
-            if _unit_claims_primary_payload_field(
-                owners[candidate],
-                source_index=containment_owner,
-                expected_field=expected_field,
+        # This branch is CLOSED: zero or multiple primary owners flatten to
+        # an honest root segment and never fall through to the element-level
+        # adjacency lanes, which would let an associated owner back in.
+        containment_owner = context.get("containment_owner")
+        if (
+            isinstance(containment_owner, int)
+            and not isinstance(containment_owner, bool)
+            and context.get("order_basis") == "containment_proven"
+        ):
+            expected_field = _CONTAINMENT_PRIMARY_FIELD_BY_KIND.get(
+                element_kinds.get(containment_owner, ""), "text"
             )
-        ]
-        if len(primary) == 1:
-            return primary[0]
+            primary = [
+                candidate
+                for candidate in owner_indices_by_source.get(
+                    containment_owner, []
+                )
+                if _unit_claims_primary_payload_field(
+                    owners[candidate],
+                    source_index=containment_owner,
+                    expected_field=expected_field,
+                )
+            ]
+            if len(primary) == 1:
+                return primary[0]
+        return None
 
     predecessor = _context_source_index(context.get("predecessor"))
     successor = _context_source_index(context.get("successor"))
@@ -2327,7 +2333,7 @@ def _native_recovery_owner_index(
             and not _payload_is_own_heading(owners[predecessor_owner])
             else None
         )
-    if relation in {"between_mapped_sources", "bounded_by_same_source"}:
+    if relation == "between_mapped_sources":
         return (
             predecessor_owner
             if predecessor_owner is not None
