@@ -93,6 +93,7 @@ TERMINAL_PUBLICATION_ERROR_CODES = frozenset(
         "IR_MISSING",
         "PARSE_RECEIPT_INVALID",
         "PARSE_RECEIPT_MISSING",
+        "RUN_ARTIFACT_HASH_MISSING",
         "PARTIAL_PDF_NOT_PUBLISHABLE",
         "PARSER_TARGET_IDENTITY_INVALID",
         "PARSER_TARGET_IDENTITY_MISMATCH",
@@ -150,19 +151,18 @@ class NormalizedIRPublicationGuard:
                     message=str(exc),
                 )
             ) from exc
-        if run.artifact_hash:
-            actual_hash = "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
-            if actual_hash != run.artifact_hash:
-                raise PublishRunError(
-                    _structured_error(
-                        error_code="IR_HASH_MISMATCH",
-                        message=(
-                            f"normalized IR at {relpath} hashes to "
-                            f"{actual_hash}, run.artifact_hash is "
-                            f"{run.artifact_hash}"
-                        ),
-                    )
+        actual_hash = "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
+        if run.artifact_hash and actual_hash != run.artifact_hash:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="IR_HASH_MISMATCH",
+                    message=(
+                        f"normalized IR at {relpath} hashes to "
+                        f"{actual_hash}, run.artifact_hash is "
+                        f"{run.artifact_hash}"
+                    ),
                 )
+            )
         try:
             decoded = json.loads(raw_bytes.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -249,16 +249,32 @@ class NormalizedIRPublicationGuard:
         # publication identity gate must hold here too: same immutable PDF
         # across document/run/IR, current structure and parser target,
         # explicit remote model, and a valid run-bound parse receipt.
+        def read_receipt_bytes(artifact_relpath: str) -> bytes:
+            try:
+                return read_data_file_bytes(
+                    self._paths, Path(artifact_relpath)
+                )
+            except DataFileMissingError as exc:
+                raise FileNotFoundError(str(exc)) from exc
+            except DataStoreReadError as exc:
+                # Storage/mount trouble stays retryable: a deterministic
+                # good run must never be quarantined by infrastructure.
+                raise PublishRunError(
+                    _structured_error(
+                        error_code="IR_READ_FAILED",
+                        retryable=True,
+                        message=str(exc),
+                    )
+                ) from exc
+
         try:
             require_publishable_run_identity(
                 document_raw_file_hash=document.raw_file_hash,
                 run_input_raw_file_hash=run.input_raw_file_hash,
+                run_normalized_ir_sha256=run.artifact_hash,
+                actual_normalized_ir_sha256=actual_hash,
                 normalized_ir=decoded,
-                read_artifact_bytes=lambda artifact_relpath: (
-                    read_data_file_bytes(
-                        self._paths, Path(artifact_relpath)
-                    )
-                ),
+                read_artifact_bytes=read_receipt_bytes,
             )
         except PublicationIdentityViolation as exc:
             raise PublishRunError(

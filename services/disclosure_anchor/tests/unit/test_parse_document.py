@@ -619,6 +619,60 @@ class ParseDocumentUnitTests(unittest.TestCase):
                 self.assertFalse(parser.called)
                 self.assertEqual(artifact_store.payloads, {})
 
+    def test_resolver_null_results_never_degrade_to_unattested(self) -> None:
+        for label, scripted in (("none", None), ("blank", "   ")):
+            with self.subTest(label=label):
+                uow = _uow_with_document()
+                parser = _Parser(remote_models=(scripted,))
+                use_case, artifact_store = _use_case(uow, parser=parser)
+
+                result = use_case.execute(
+                    _command(
+                        options=ParserOptions(
+                            backend="vlm-http-client",
+                            server_url="http://gpu.example:30000",
+                            runtime_bundle_identity_sha256=(
+                                _RUNTIME_BUNDLE_HASH
+                            ),
+                        )
+                    )
+                )
+
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(
+                    result.error["error_code"], "remote_model_ambiguous"
+                )
+                self.assertFalse(parser.called)
+                self.assertEqual(artifact_store.payloads, {})
+
+    def test_post_parse_model_ambiguity_is_a_typed_terminal(self) -> None:
+        uow = _uow_with_document()
+        parser = _Parser(
+            remote_models=(
+                "MinerU2.5-Pro-2605-1.2B",
+                RemoteModelAmbiguousError("now serving two models"),
+            )
+        )
+        use_case, artifact_store = _use_case(uow, parser=parser)
+
+        result = use_case.execute(
+            _command(
+                options=ParserOptions(
+                    backend="vlm-http-client",
+                    server_url="http://gpu.example:30000",
+                    runtime_bundle_identity_sha256=_RUNTIME_BUNDLE_HASH,
+                )
+            )
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(
+            result.error["error_code"], "remote_model_ambiguous"
+        )
+        self.assertFalse(result.error["retryable"])
+        self.assertTrue(parser.called)
+        self.assertEqual(artifact_store.payloads, {})
+
     def test_remote_model_change_mid_run_is_a_typed_terminal(self) -> None:
         uow = _uow_with_document()
         parser = _Parser(

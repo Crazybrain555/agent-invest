@@ -1077,6 +1077,28 @@ class BuildUnitsTests(unittest.TestCase):
                 [],
             )
 
+    def test_missing_run_artifact_hash_never_builds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uow, _ = _setup(root)
+            run = uow.processing_runs.get("run_1")
+            run.artifact_hash = None
+            uow.processing_runs.update(run)
+
+            result = _use_case(root, uow).execute(
+                BuildUnitsCommand(processing_run_id="run_1")
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(
+                result.error["error_code"],
+                "RUN_ARTIFACT_HASH_MISSING",
+            )
+            self.assertEqual(
+                uow.document_units.list_by_processing_run("run_1"),
+                [],
+            )
+
     def test_broken_source_pdf_identity_chain_never_publishes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

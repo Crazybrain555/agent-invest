@@ -207,6 +207,7 @@ class ParseDocument:
             ParserVersionProbeError,
             ParserOutputContractError,
             ParserUnknownError,
+            RemoteModelAmbiguousError,
         ) as exc:
             failure = (
                 exc

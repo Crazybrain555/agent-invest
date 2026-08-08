@@ -976,9 +976,69 @@ class PublicationIdentityGateTests(unittest.TestCase):
                         error_code, TERMINAL_PUBLICATION_ERROR_CODES
                     )
 
+    def test_missing_run_artifact_hash_never_activates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, run, document, _ = self._environment(root)
+            run.artifact_hash = None
+            with self.assertRaises(PublishRunError) as raised:
+                NormalizedIRPublicationGuard(self._Paths(root))(run, document)
+            self.assertEqual(
+                raised.exception.error["error_code"],
+                "RUN_ARTIFACT_HASH_MISSING",
+            )
+            self.assertIn(
+                "RUN_ARTIFACT_HASH_MISSING",
+                TERMINAL_PUBLICATION_ERROR_CODES,
+            )
+
+    def test_receipt_storage_outage_stays_retryable(self) -> None:
+        # Infrastructure trouble reading the receipt must never quarantine
+        # a deterministic good run: the terminal set excludes the code and
+        # the error stays retryable.
+        from unittest import mock
+
+        from disclosure_anchor.application.services.data_file_reader import (
+            DataStoreReadError,
+        )
+        from disclosure_anchor.application.use_cases import (
+            publish_run as publish_run_module,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            normalized, run, document, _ = self._environment(root)
+            receipt_relpath = normalized["parser_artifacts"]["files"][
+                "parse_receipt"
+            ]["relpath"]
+            real_reader = publish_run_module.read_data_file_bytes
+
+            def flaky_reader(paths: object, relpath: Path) -> bytes:
+                if str(relpath) == receipt_relpath:
+                    raise DataStoreReadError("data root offline")
+                return real_reader(paths, relpath)
+
+            with mock.patch.object(
+                publish_run_module,
+                "read_data_file_bytes",
+                side_effect=flaky_reader,
+            ):
+                with self.assertRaises(PublishRunError) as raised:
+                    NormalizedIRPublicationGuard(self._Paths(root))(
+                        run, document
+                    )
+            self.assertEqual(
+                raised.exception.error["error_code"], "IR_READ_FAILED"
+            )
+            self.assertTrue(raised.exception.error["retryable"])
+            self.assertNotIn(
+                "IR_READ_FAILED", TERMINAL_PUBLICATION_ERROR_CODES
+            )
+
     def test_receipt_tampering_never_activates(self) -> None:
         cases = (
             "receipt_role_missing",
+            "receipt_file_missing",
             "receipt_bytes_tampered",
             "receipt_semantic_mismatch",
         )
@@ -996,6 +1056,9 @@ class PublicationIdentityGateTests(unittest.TestCase):
                     if label == "receipt_role_missing":
                         files.pop("parse_receipt")
                         self._rewrite(root, relpath, normalized, run)
+                        expected = "PARSE_RECEIPT_MISSING"
+                    elif label == "receipt_file_missing":
+                        (root / receipt_relpath).unlink()
                         expected = "PARSE_RECEIPT_MISSING"
                     elif label == "receipt_bytes_tampered":
                         (root / receipt_relpath).write_bytes(b"{}")

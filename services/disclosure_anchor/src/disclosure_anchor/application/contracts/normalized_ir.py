@@ -623,6 +623,13 @@ def validate_current_normalized_ir_for_write(
     shape, element closure, and reconciliation contract.
     """
 
+    if write_authority not in {"production", "frozen_generation"}:
+        # The authority selector decides whether generational gates apply;
+        # an unknown value must never silently behave like the weaker one.
+        raise NormalizedIRVersionError(
+            "write_authority_invalid",
+            f"unknown write authority {write_authority!r}",
+        )
     version = validate_normalized_ir_contract(payload, require_current=True)
     if write_authority == "production":
         structure_proof = payload.get("structure_proof")

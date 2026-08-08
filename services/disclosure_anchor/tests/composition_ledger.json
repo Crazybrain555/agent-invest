@@ -123,7 +123,7 @@
   },
   "tests/unit/test_build_units.py": {
    "private_imports": [],
-   "tests": 22
+   "tests": 23
   },
   "tests/unit/test_canonical_occurrence.py": {
    "private_imports": [],
@@ -275,7 +275,11 @@
   },
   "tests/unit/test_parse_document.py": {
    "private_imports": [],
-   "tests": 15
+   "tests": 17
+  },
+  "tests/unit/test_parse_receipt.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_parser_target.py": {
    "private_imports": [],
@@ -319,7 +323,7 @@
    "private_imports": [
     "_validate_candidate_unit_set"
    ],
-   "tests": 23
+   "tests": 25
   },
   "tests/unit/test_raw_document_store.py": {
    "private_imports": [],

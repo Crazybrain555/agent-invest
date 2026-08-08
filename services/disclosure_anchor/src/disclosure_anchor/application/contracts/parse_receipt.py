@@ -80,6 +80,9 @@ def build_parse_receipt(
     """Construct the closed receipt payload the parser persists."""
 
     remote_model_name = parser_target_payload.get("remote_model_name")
+    backend = parser_target_payload.get("backend")
+    if not (isinstance(backend, str) and backend.endswith("-http-client")):
+        server_url = None
     return {
         "receipt_contract_version": PARSE_RECEIPT_CONTRACT_VERSION,
         "source_pdf_sha256": source_pdf_sha256,
@@ -141,11 +144,27 @@ def validate_parse_receipt(
             "parse receipt endpoint fields are not closed"
         )
     server_url = endpoint["server_url"]
-    if server_url is not None and (
-        not isinstance(server_url, str) or not server_url
-    ):
+    backend = parser_target_payload.get("backend")
+    http_backend = isinstance(backend, str) and backend.endswith(
+        "-http-client"
+    )
+    if http_backend:
+        # An HTTP run's receipt must name its endpoint: a normalized,
+        # non-empty http(s) URL with no trailing slash.
+        if (
+            not isinstance(server_url, str)
+            or not server_url
+            or server_url != _normalized_server_url(server_url)
+            or not server_url.lower().startswith(("http://", "https://"))
+        ):
+            raise ParseReceiptContractError(
+                "parse receipt for an HTTP backend requires a normalized "
+                f"http(s) server_url, got {server_url!r}"
+            )
+    elif server_url is not None:
+        # Local backends have no endpoint selection to bind.
         raise ParseReceiptContractError(
-            "parse receipt server_url must be text or null"
+            "parse receipt for a local backend must carry a null server_url"
         )
     if endpoint["remote_model_name"] != parser_target_payload.get(
         "remote_model_name"

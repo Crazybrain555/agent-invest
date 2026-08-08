@@ -184,6 +184,13 @@ class CorpusReparseManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ManifestError, "two models served"):
             reparse_corpus._target_identity(deps)
 
+        for label, scripted in (("none", None), ("blank", "  ")):
+            with self.subTest(label=label):
+                deps.parser_factory.return_value.resolve_remote_model.side_effect = None
+                deps.parser_factory.return_value.resolve_remote_model.return_value = scripted
+                with self.assertRaisesRegex(ManifestError, "no usable model"):
+                    reparse_corpus._target_identity(deps)
+
     def test_cli_help_imports_without_runtime_environment(self) -> None:
         root = Path(__file__).resolve().parents[2]
         for script in ("reparse_corpus.py", "reset_derived_corpus.py"):

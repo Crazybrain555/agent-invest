@@ -157,7 +157,7 @@ class BuildUnits:
         context = self._load_context(command)
         run = context["run"]
         try:
-            normalized_ir = self._load_ir(
+            normalized_ir, normalized_ir_sha256 = self._load_ir(
                 Path(run.normalized_ir_relpath or ""),
                 expected_artifact_hash=run.artifact_hash,
                 expected_document_id=run.document_id,
@@ -181,6 +181,7 @@ class BuildUnits:
                 run=run,
                 document=context["document"],
                 normalized_ir=normalized_ir,
+                actual_normalized_ir_sha256=normalized_ir_sha256,
             )
             evidence = self._source_evidence_validator.validate(
                 normalized_ir,
@@ -448,17 +449,34 @@ class BuildUnits:
         run: e.ProcessingRun,
         document: e.Document,
         normalized_ir: dict[str, Any],
+        actual_normalized_ir_sha256: str,
     ) -> None:
         """Close the shared publication identity gate before placement."""
+
+        def read_receipt_bytes(relpath: str) -> bytes:
+            try:
+                return read_data_file_bytes(self._paths, Path(relpath))
+            except DataFileMissingError as exc:
+                raise FileNotFoundError(str(exc)) from exc
+            except DataStoreReadError as exc:
+                # Storage/mount trouble is infrastructure, never a verdict
+                # about the run; keep the item retryable.
+                raise BuildUnitsError(
+                    self._structured_error(
+                        error_code="IR_READ_FAILED",
+                        retryable=True,
+                        message=str(exc),
+                    )
+                ) from exc
 
         try:
             require_publishable_run_identity(
                 document_raw_file_hash=document.raw_file_hash,
                 run_input_raw_file_hash=run.input_raw_file_hash,
+                run_normalized_ir_sha256=run.artifact_hash,
+                actual_normalized_ir_sha256=actual_normalized_ir_sha256,
                 normalized_ir=normalized_ir,
-                read_artifact_bytes=lambda relpath: read_data_file_bytes(
-                    self._paths, Path(relpath)
-                ),
+                read_artifact_bytes=read_receipt_bytes,
             )
         except PublicationIdentityViolation as exc:
             raise BuildUnitsError(
@@ -476,7 +494,7 @@ class BuildUnits:
         expected_artifact_hash: str | None = None,
         expected_document_id: str,
         expected_parser_target: object,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], str]:
         if not str(relpath):
             raise BuildUnitsError(
                 self._structured_error(
@@ -506,8 +524,8 @@ class BuildUnits:
         # and rebuild-units consumes it months later — a corrupted/overwritten
         # IR must fail loudly here, not publish self-consistent bad units
         # (round23). Runs predating artifact_hash skip the check.
+        actual = "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
         if expected_artifact_hash:
-            actual = "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
             if actual != expected_artifact_hash:
                 raise BuildUnitsError(
                     self._structured_error(
@@ -594,7 +612,7 @@ class BuildUnits:
                 )
             )
         self._validate_table_reconciliation(payload, version=version)
-        return payload
+        return payload, actual
 
     def _load_hashed_parser_artifact(
         self,

@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 import hashlib
 import json
+import re
 from typing import Any
 
 from disclosure_anchor.application.contracts.document_structure import (
@@ -48,21 +49,53 @@ class PublicationIdentityViolation(Exception):
         self.message = message
 
 
+_SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
+
+
 def require_publishable_run_identity(
     *,
     document_raw_file_hash: str | None,
     run_input_raw_file_hash: str | None,
+    run_normalized_ir_sha256: str | None,
+    actual_normalized_ir_sha256: str,
     normalized_ir: Mapping[str, Any],
     read_artifact_bytes: Callable[[str], bytes],
 ) -> None:
     """Close the run identity chain for one publication entry point.
 
     ``read_artifact_bytes`` receives a data-root-relative path and returns
-    the artifact bytes; the gate itself verifies the bytes against the
-    hashed parser-artifact manifest, so callers need no prior trust in
-    their loader.
+    the artifact bytes; a ``FileNotFoundError`` means the artifact truly
+    does not exist (a terminal state), while any other exception —
+    storage, mount, or permission trouble — propagates to the caller,
+    which owns retryability. The gate verifies receipt bytes against the
+    hashed manifest itself, so callers need no prior trust in their
+    loader.
     """
 
+    if (
+        run_normalized_ir_sha256 is None
+        or _SHA256_RE.fullmatch(run_normalized_ir_sha256) is None
+    ):
+        # A run without a recorded NormalizedIR hash proves nothing about
+        # which bytes it built; current publication requires the binding.
+        raise PublicationIdentityViolation(
+            error_code="RUN_ARTIFACT_HASH_MISSING",
+            reason_code="run_artifact_hash_missing",
+            message=(
+                "current publication requires the processing run to bind "
+                "its NormalizedIR bytes via a recorded artifact hash"
+            ),
+        )
+    if actual_normalized_ir_sha256 != run_normalized_ir_sha256:
+        raise PublicationIdentityViolation(
+            error_code="IR_HASH_MISMATCH",
+            reason_code="run_artifact_hash_mismatch",
+            message=(
+                "NormalizedIR bytes do not hash to the processing run's "
+                f"recorded artifact hash: {actual_normalized_ir_sha256} != "
+                f"{run_normalized_ir_sha256}"
+            ),
+        )
     hashes = {
         "document.raw_file_hash": document_raw_file_hash,
         "run.input_raw_file_hash": run_input_raw_file_hash,
@@ -158,12 +191,22 @@ def _require_valid_receipt(
         )
     try:
         raw = read_artifact_bytes(relpath)
-    except Exception as exc:
+    except FileNotFoundError as exc:
         raise PublicationIdentityViolation(
             error_code="PARSE_RECEIPT_MISSING",
             reason_code="parse_receipt_missing",
-            message=f"parse receipt artifact is unreadable: {exc}",
+            message=f"parse receipt artifact does not exist: {exc}",
         ) from exc
+    expected_size = descriptor.get("size_bytes")
+    if expected_size is not None and expected_size != len(raw):
+        raise PublicationIdentityViolation(
+            error_code="PARSE_RECEIPT_INVALID",
+            reason_code="parse_receipt_invalid",
+            message=(
+                "parse receipt size differs from the hashed manifest: "
+                f"{len(raw)} != {expected_size}"
+            ),
+        )
     actual_hash = "sha256:" + hashlib.sha256(raw).hexdigest()
     if actual_hash != expected_hash:
         raise PublicationIdentityViolation(

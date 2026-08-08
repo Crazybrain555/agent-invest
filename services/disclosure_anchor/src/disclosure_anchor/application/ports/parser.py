@@ -125,19 +125,35 @@ def resolve_current_parser_target(
 
     identity = parser.identity()
     if options.backend.endswith("-http-client"):
+        from disclosure_anchor.domain.errors import RemoteModelAmbiguousError
+
         resolver = getattr(parser, "resolve_remote_model", None)
         if not callable(resolver):
-            from disclosure_anchor.domain.errors import (
-                RemoteModelAmbiguousError,
-            )
-
             raise RemoteModelAmbiguousError(
                 "HTTP parser backend requires a remote-model resolver"
             )
+        resolved = resolver(options)
+        if not isinstance(resolved, str) or not resolved.strip():
+            # A resolver that quietly yields nothing must not degrade the
+            # target to an unattested singleton.
+            raise RemoteModelAmbiguousError(
+                "remote-model resolution yielded no usable model name: "
+                f"{resolved!r}"
+            )
         options = dataclasses.replace(
-            options, remote_model_name=resolver(options)
+            options, remote_model_name=resolved.strip()
         )
-    return options.target_identity(identity), options
+    target = options.target_identity(identity)
+    if options.backend.endswith("-http-client") and (
+        target.remote_selection_mode != "explicit"
+        or target.remote_model_name is None
+    ):
+        from disclosure_anchor.domain.errors import RemoteModelAmbiguousError
+
+        raise RemoteModelAmbiguousError(
+            "HTTP parse target failed to close an explicit remote model"
+        )
+    return target, options
 
 
 @dataclass(frozen=True)
