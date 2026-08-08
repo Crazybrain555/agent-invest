@@ -445,6 +445,25 @@ def validate_document_structure(
     return proof
 
 
+def require_current_document_structure(proof: Mapping[str, Any]) -> None:
+    """Reject a legal but non-current proof with the typed reparse terminal.
+
+    ``validate_document_structure`` keeps every historical algorithm readable
+    for diagnostics and migration triage; this single authority decides that
+    only the current algorithm may drive publication. Callers must validate
+    the proof FIRST so a corrupted artifact is never mislabeled as merely
+    reparse-required.
+    """
+
+    algorithm = proof.get("algorithm_version")
+    if algorithm != DOCUMENT_STRUCTURE_ALGORITHM:
+        raise DocumentStructureContractError(
+            "structure_proof_reparse_required",
+            f"structure proof algorithm {algorithm!r} predates the current "
+            "materialization contract; reparse the document",
+        )
+
+
 def _validate_owner_scope_break_v1(
     scope_break: Mapping[str, Any],
     *,
@@ -1192,5 +1211,6 @@ __all__ = [
     "DocumentStructureContractError",
     "carrier_set_sha256",
     "printed_number_rank",
+    "require_current_document_structure",
     "validate_document_structure",
 ]

@@ -161,7 +161,7 @@ class NormalizedIRContractTests(unittest.TestCase):
         )
         self.assertEqual(
             payload["structure_proof"]["headings"][0]["evidence_kinds"],
-            ["mineru_v2_title"],
+            ["mineru_v2_title", "native_layout"],
         )
         self.assertEqual(payload["elements"][0]["kind"], "text")
         diagnostics = payload["parser_diagnostics"]["table_reconciliation"]

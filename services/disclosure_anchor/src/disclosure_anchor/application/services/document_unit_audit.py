@@ -15,9 +15,8 @@ from typing import Any, Callable, Iterable, Mapping, cast
 import unicodedata
 
 from disclosure_anchor.application.contracts.document_structure import (
+    DOCUMENT_STRUCTURE_ALGORITHM,
     DocumentStructureContractError,
-    OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
-    OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM,
     validate_document_structure,
 )
 from disclosure_anchor.application.contracts import content_annotations
@@ -2432,18 +2431,16 @@ def _build_structure_proof_index(
         for frame in proof["page_frames"]
         for source_index in frame["member_source_item_indices"]
     )
-    if proof.get("algorithm_version") in {
-        OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
-        OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM,
-    } and proof.get("owner_scope_breaks"):
-        # Pre-v14 breaks carry neither the current selector shape (v12) nor
-        # a materialization policy (v13); auditing them against the current
-        # placement semantics would guess. Fail with a typed terminal.
+    if proof.get("algorithm_version") != DOCUMENT_STRUCTURE_ALGORITHM:
+        # The proof is legal for its own historical version (validated
+        # above), but only the current algorithm carries the placement
+        # semantics this audit replays. Fail with the typed reparse terminal
+        # instead of replaying legacy placement or reporting it invalid.
         _audit_error(
             findings,
             "structure_proof_reparse_required",
-            "legacy owner-scope breaks cannot be audited under the current "
-            "materialization contract; reparse the document",
+            "a legacy structure algorithm cannot be audited under the "
+            "current materialization contract; reparse the document",
         )
         return _StructureProofIndex({}, frozenset(), ())
     scope_breaks_list: list[_ProofOwnerScopeBreak] = []

@@ -42,7 +42,6 @@ from disclosure_anchor.adapters.parsers.printed_toc import (
 from disclosure_anchor.application.contracts.document_structure import (
     DOCUMENT_STRUCTURE_ALGORITHM,
     DOCUMENT_STRUCTURE_VERSION,
-    LEGACY_DOCUMENT_STRUCTURE_ALGORITHM,
     carrier_set_sha256,
     printed_number_rank,
 )
@@ -199,15 +198,20 @@ def build_mineru_structure_proof(
         table_role_overrides=table_role_overrides,
         conflicts=conflicts,
     )
-    if carrier_source_support is not None:
-        _require_source_supported_carriers(
-            carriers,
-            carrier_source_support=carrier_source_support,
-        )
-    if source_pages is not None and carrier_source_support is None:
+    if source_pages is None or carrier_source_support is None:
+        # A current structure proof is built only from native source-PDF
+        # evidence. A missing native lane is not a downgrade to a legacy
+        # algorithm: the document cannot enter the canonical publication
+        # lane until its native evidence exists. Real extraction-tool errors
+        # keep their own terminals upstream and are never converted here.
         raise ParserOutputContractError(
-            "native-layout structure proof requires validated carrier support"
+            "structure_native_evidence_required: the current structure proof "
+            "requires native source pages and validated carrier support"
         )
+    _require_source_supported_carriers(
+        carriers,
+        carrier_source_support=carrier_source_support,
+    )
     by_ref = {carrier.ref: carrier for carrier in carriers}
     by_page: dict[int, list[_Carrier]] = defaultdict(list)
     for carrier in carriers:
@@ -228,30 +232,29 @@ def build_mineru_structure_proof(
         text_projections=text_projections,
     )
     toc_corroborated: set[_Ref] = set()
-    if source_pages is not None:
-        pages_by_comparison: dict[str, list[int]] = defaultdict(list)
-        for carrier in carriers:
-            if carrier.raw_kind in _TEXT_KINDS and carrier.comparison_value:
-                pages_by_comparison[carrier.comparison_value].append(
-                    carrier.page_idx
-                )
-        witness = printed_toc_witness(
-            source_pages,
-            carrier_pages_by_comparison={
-                value: tuple(pages)
-                for value, pages in pages_by_comparison.items()
-            },
-        )
-        if witness is not None:
-            toc_corroborated = {
-                carrier.ref
-                for carrier in carriers
-                if carrier.raw_kind in _TEXT_KINDS
-                and carrier.comparison_value
-                and witness.corroborates(
-                    carrier.comparison_value, carrier.page_idx
-                )
-            }
+    pages_by_comparison: dict[str, list[int]] = defaultdict(list)
+    for carrier in carriers:
+        if carrier.raw_kind in _TEXT_KINDS and carrier.comparison_value:
+            pages_by_comparison[carrier.comparison_value].append(
+                carrier.page_idx
+            )
+    witness = printed_toc_witness(
+        source_pages,
+        carrier_pages_by_comparison={
+            value: tuple(pages)
+            for value, pages in pages_by_comparison.items()
+        },
+    )
+    if witness is not None:
+        toc_corroborated = {
+            carrier.ref
+            for carrier in carriers
+            if carrier.raw_kind in _TEXT_KINDS
+            and carrier.comparison_value
+            and witness.corroborates(
+                carrier.comparison_value, carrier.page_idx
+            )
+        }
     grouped: dict[tuple[_Ref, ...], list[_Candidate]] = defaultdict(list)
     native_key_by_node: dict[_NativeNodeKey, tuple[_Ref, ...]] = {}
     nonheading_roles: dict[_Ref, set[str]] = defaultdict(set)
@@ -302,22 +305,18 @@ def build_mineru_structure_proof(
     ):
         grouped[candidate.refs].append(candidate)
 
-    owner_scope_candidates: tuple[_OwnerScopeCandidate, ...] = ()
-    native_layout_witnesses: Mapping[_Ref, _NativeLayoutWitness] = {}
-    if source_pages is not None:
-        owner_scope_candidates, native_layout_witnesses = _apply_native_line_grammar(
-            grouped,
-            carriers=carriers,
-            carrier_source_support=carrier_source_support,
-            source_pages=source_pages,
-            conflicts=conflicts,
-        )
+    owner_scope_candidates, native_layout_witnesses = _apply_native_line_grammar(
+        grouped,
+        carriers=carriers,
+        carrier_source_support=carrier_source_support,
+        source_pages=source_pages,
+        conflicts=conflicts,
+    )
     selected = _select_candidates(
         grouped,
         nonheading_roles=nonheading_roles,
         conflicts=conflicts,
         toc_corroborated=toc_corroborated,
-        require_native_layout=source_pages is not None,
     )
     for refs, candidate in selected.items():
         if candidate.source_proven:
@@ -335,13 +334,11 @@ def build_mineru_structure_proof(
         selected,
         native_key_by_node=native_key_by_node,
         conflicts=conflicts,
-        flatten_unsafe_hierarchy=source_pages is not None,
     )
     parent_key_by_key = _continuous_parents(
         parent_key_by_key,
         selected=selected,
         conflicts=conflicts,
-        flatten_unsafe_hierarchy=source_pages is not None,
     )
     headings = _heading_nodes(
         selected,
@@ -394,11 +391,7 @@ def build_mineru_structure_proof(
     ]
     return {
         "contract_version": DOCUMENT_STRUCTURE_VERSION,
-        "algorithm_version": (
-            DOCUMENT_STRUCTURE_ALGORITHM
-            if source_pages is not None
-            else LEGACY_DOCUMENT_STRUCTURE_ALGORITHM
-        ),
+        "algorithm_version": DOCUMENT_STRUCTURE_ALGORITHM,
         "source_pdf_sha256": source_pdf_sha256,
         "source_pdf_page_count": page_count,
         "carrier_set_sha256": carrier_set_sha256(identities),
@@ -407,11 +400,7 @@ def build_mineru_structure_proof(
             "artifact_role": "pdf_structure",
         },
         "headings": headings,
-        **(
-            {"owner_scope_breaks": owner_scope_breaks}
-            if source_pages is not None
-            else {}
-        ),
+        "owner_scope_breaks": owner_scope_breaks,
         "page_frames": frames,
         "conflicts": conflicts,
         "coverage": {
@@ -540,7 +529,6 @@ def _select_candidates(
     nonheading_roles: Mapping[_Ref, set[str]],
     conflicts: list[dict[str, Any]],
     toc_corroborated: set[_Ref] = frozenset(),  # type: ignore[assignment]
-    require_native_layout: bool = False,
 ) -> dict[tuple[_Ref, ...], _Candidate]:
     selected: dict[tuple[_Ref, ...], _Candidate] = {}
     claimed: set[_Ref] = set()
@@ -602,7 +590,7 @@ def _select_candidates(
             candidates,
             refs=refs,
             conflicts=conflicts,
-            retain_ambiguous_identity=require_native_layout,
+            retain_ambiguous_identity=True,
         )
         if sources is None:
             continue
@@ -617,18 +605,13 @@ def _select_candidates(
             if providers
             else candidates[0]
         )
-        if require_native_layout:
-            rendered = any(
-                "native_layout" in item.evidence for item in candidates
-            )
-            printed = any(
-                "printed_toc" in item.evidence for item in candidates
-            )
-            chosen.source_proven = bool(rendered or printed)
-        else:
-            chosen.source_proven = not hierarchy_ambiguous and bool(
-                native or bookmarks or (providers and not roles)
-            )
+        rendered = any(
+            "native_layout" in item.evidence for item in candidates
+        )
+        printed = any(
+            "printed_toc" in item.evidence for item in candidates
+        )
+        chosen.source_proven = bool(rendered or printed)
         chosen.propagates = chosen.source_proven
         chosen.evidence.update(
             evidence
@@ -644,11 +627,8 @@ def _select_candidates(
             if role in _NON_SECTION_ANCESTOR_ROLES
         }
         if non_section_ancestor_roles:
-            if require_native_layout:
-                chosen.source_proven = False
-                chosen.propagates = False
-            else:
-                chosen.propagates = False
+            chosen.source_proven = False
+            chosen.propagates = False
             conflicts.append(
                 {
                     "relation": "native_heading_non_section_ancestry",
@@ -656,55 +636,36 @@ def _select_candidates(
                     "source_item_indices": _ref_indices(refs),
                 }
             )
-        if require_native_layout:
-            # A rendered heading identity does not prove a parent edge.
-            # Preserve a single, internally consistent StructTree chain;
-            # otherwise publish the heading at document-root level.  Provider
-            # and bookmark parent hints remain observations only in v11.
-            chosen.bookmark_parent = None
-            chosen.provider_parent = None
-            if hierarchy_ambiguous or level_ambiguous or not native:
-                # StructTree is still retained in the bound native artifact and
-                # conflict receipts, but once its hierarchy is discarded it can
-                # no longer be claimed as exact evidence by the published
-                # heading.  Identity remains independently witnessed by the
-                # rendered native layout/provider title and is flattened to the
-                # document root.
-                chosen.evidence.discard("struct_tree")
-                chosen.level = 1
-                chosen.native_role = None
-                chosen.native_node_id = None
-                chosen.native_ancestor_roles = ()
-                chosen.native_ancestors = ()
-                chosen.native_segment_id = None
-                chosen.native_hierarchy_valid = False
-                if hierarchy_ambiguous or level_ambiguous:
-                    conflicts.append(
-                        {
-                            "relation": "heading_hierarchy_flattened",
-                            "source_item_indices": _ref_indices(refs),
-                        }
-                    )
-        else:
-            _merge_parent_hint(
-                chosen,
-                candidates=candidates,
-                field_name="bookmark_parent",
-                relation="bookmark_parent_conflict",
-                refs=refs,
-                conflicts=conflicts,
-            )
-            _merge_parent_hint(
-                chosen,
-                candidates=candidates,
-                field_name="provider_parent",
-                relation="provider_parent_conflict",
-                refs=refs,
-                conflicts=conflicts,
-            )
+        # A rendered heading identity does not prove a parent edge.
+        # Preserve a single, internally consistent StructTree chain;
+        # otherwise publish the heading at document-root level.  Provider
+        # and bookmark parent hints remain recorded observations.
+        chosen.bookmark_parent = None
+        chosen.provider_parent = None
+        if hierarchy_ambiguous or level_ambiguous or not native:
+            # StructTree is still retained in the bound native artifact and
+            # conflict receipts, but once its hierarchy is discarded it can
+            # no longer be claimed as exact evidence by the published
+            # heading.  Identity remains independently witnessed by the
+            # rendered native layout/provider title and is flattened to the
+            # document root.
+            chosen.evidence.discard("struct_tree")
+            chosen.level = 1
+            chosen.native_role = None
+            chosen.native_node_id = None
+            chosen.native_ancestor_roles = ()
+            chosen.native_ancestors = ()
+            chosen.native_segment_id = None
+            chosen.native_hierarchy_valid = False
+            if hierarchy_ambiguous or level_ambiguous:
+                conflicts.append(
+                    {
+                        "relation": "heading_hierarchy_flattened",
+                        "source_item_indices": _ref_indices(refs),
+                    }
+                )
         if roles.intersection({"TOC", "TOCI", "Table", "TD", "TH"}):
-            if require_native_layout:
-                chosen.source_proven = False
+            chosen.source_proven = False
             chosen.propagates = False
         selected[refs] = chosen
         claimed.update(refs)
@@ -765,77 +726,32 @@ def _candidate_sources(
     )
 
 
-def _merge_parent_hint(
-    chosen: _Candidate,
-    *,
-    candidates: list[_Candidate],
-    field_name: Literal["bookmark_parent", "provider_parent"],
-    relation: str,
-    refs: tuple[_Ref, ...],
-    conflicts: list[dict[str, Any]],
-) -> None:
-    parents = {
-        value for item in candidates if (value := getattr(item, field_name)) is not None
-    }
-    if len(parents) == 1:
-        setattr(chosen, field_name, next(iter(parents)))
-    elif len(parents) > 1:
-        chosen.propagates = False
-        conflicts.append(
-            {
-                "relation": relation,
-                "source_item_indices": _ref_indices(refs),
-            }
-        )
-
-
 def _explicit_parents(
     selected: Mapping[tuple[_Ref, ...], _Candidate],
     *,
     native_key_by_node: Mapping[_NativeNodeKey, tuple[_Ref, ...]],
     conflicts: list[dict[str, Any]],
-    flatten_unsafe_hierarchy: bool = False,
 ) -> dict[tuple[_Ref, ...], tuple[_Ref, ...] | None]:
     output: dict[tuple[_Ref, ...], tuple[_Ref, ...] | None] = {}
     for key, candidate in selected.items():
         if not candidate.propagates:
             output[key] = None
             continue
-        if candidate.native_hierarchy_valid and candidate.native_segment_id is not None:
-            parent = _native_parent(
+        parent = (
+            _native_parent(
                 key,
                 candidate=candidate,
                 selected=selected,
                 native_key_by_node=native_key_by_node,
                 conflicts=conflicts,
-                flatten_unsafe_hierarchy=flatten_unsafe_hierarchy,
             )
-        else:
-            parents = {
-                parent
-                for parent in (
-                    candidate.bookmark_parent,
-                    candidate.provider_parent,
-                )
-                if parent is not None
-                and parent in selected
-                and selected[parent].propagates
-                and parent != key
-            }
-            parent = next(iter(parents)) if len(parents) == 1 else None
-            if len(parents) > 1:
-                candidate.propagates = False
-                conflicts.append(
-                    {
-                        "relation": "heading_parent_conflict",
-                        "source_item_indices": _ref_indices(key),
-                    }
-                )
+            if candidate.native_hierarchy_valid
+            and candidate.native_segment_id is not None
+            else None
+        )
         if parent is not None and min(ref.source_item_index for ref in parent) > min(
             ref.source_item_index for ref in key
         ):
-            if not flatten_unsafe_hierarchy:
-                candidate.propagates = False
             conflicts.append(
                 {
                     "relation": "heading_parent_invalid",
@@ -854,7 +770,6 @@ def _native_parent(
     selected: Mapping[tuple[_Ref, ...], _Candidate],
     native_key_by_node: Mapping[_NativeNodeKey, tuple[_Ref, ...]],
     conflicts: list[dict[str, Any]],
-    flatten_unsafe_hierarchy: bool = False,
 ) -> tuple[_Ref, ...] | None:
     """Use only the current StructTreeRoot segment for a native parent."""
 
@@ -869,24 +784,6 @@ def _native_parent(
         ),
         None,
     )
-    advisory_parents = {
-        value
-        for value in (
-            candidate.bookmark_parent,
-            candidate.provider_parent,
-        )
-        if value is not None and value in selected and value != key
-    }
-    if any(
-        selected[value].native_segment_id not in {None, segment_id}
-        for value in advisory_parents
-    ):
-        conflicts.append(
-            {
-                "relation": "heading_parent_segment_conflict",
-                "source_item_indices": _ref_indices(key),
-            }
-        )
     if parent is None:
         return None
     parent_candidate = selected[parent]
@@ -895,8 +792,6 @@ def _native_parent(
         or not parent_candidate.native_hierarchy_valid
         or parent_candidate.native_segment_id != segment_id
     ):
-        if not flatten_unsafe_hierarchy:
-            candidate.propagates = False
         conflicts.append(
             {
                 "relation": "native_heading_parent_unavailable",
@@ -1426,7 +1321,6 @@ def _continuous_parents(
     *,
     selected: Mapping[tuple[_Ref, ...], _Candidate],
     conflicts: list[dict[str, Any]],
-    flatten_unsafe_hierarchy: bool = False,
 ) -> dict[tuple[_Ref, ...], tuple[_Ref, ...] | None]:
     """Reject explicit edges that cross a separate reading-order branch."""
 
@@ -1465,8 +1359,6 @@ def _continuous_parents(
                     "source_item_indices": _ref_indices(child),
                 }
             )
-            if not flatten_unsafe_hierarchy:
-                selected[child].propagates = False
             output[child] = None
     for child, parent in list(output.items()):
         if parent is None or selected[parent].propagates:

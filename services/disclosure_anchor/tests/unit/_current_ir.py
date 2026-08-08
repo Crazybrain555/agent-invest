@@ -27,6 +27,7 @@ from disclosure_anchor.adapters.parsers.mineru.structure_proof import (
 from disclosure_anchor.adapters.parsers.mineru.text_projection import (
     build_mineru_text_projections,
 )
+from tests.unit._native_support import test_carrier_source_support
 from disclosure_anchor.adapters.parsers.pdf_native_text import (
     NativeTextAtom,
     NativeTextGeometryIssue,
@@ -172,6 +173,9 @@ def write_text_ir_bundle(
     native_page = _native_page(
         native_page_texts or (*texts, *native_only_texts),
         geometry_issue=page_visual,
+        heading_texts=frozenset(
+            texts[index] for index in heading_levels if index < len(texts)
+        ),
     )
     native_structure = _untagged_native_structure()
     proof = build_mineru_structure_proof(
@@ -184,6 +188,11 @@ def write_text_ir_bundle(
         content_list_v2=content_list_v2,
         text_projections=text_projections,
         source_pdf_sha256=SOURCE_PDF_SHA256,
+        source_pages=(native_page,),
+        carrier_source_support=test_carrier_source_support(
+            content_list,
+            source_pages=(native_page,),
+        ),
     )
     target = parser_target or MinerUParserInfo(
         name="MinerU",
@@ -445,6 +454,7 @@ def _native_page(
     texts: tuple[str, ...],
     *,
     geometry_issue: bool = False,
+    heading_texts: frozenset[str] = frozenset(),
 ) -> NativeTextPage:
     parts: list[str] = []
     atoms: list[NativeTextAtom] = []
@@ -457,11 +467,19 @@ def _native_page(
         parts.append(text)
         offset += len(text)
         y0 = 10.0 + order * 20.0
+        # A current-lane heading needs real native display evidence: the
+        # heading line is centered and taller than the body's modal line
+        # height, exactly like a printed display title.
+        bbox = (
+            (30.0, y0, 70.0, y0 + 14.0)
+            if text in heading_texts
+            else (0.0, y0, 100.0, y0 + 10.0)
+        )
         atoms.append(
             NativeTextAtom(
                 page_idx=0,
                 order=order,
-                bbox=(0.0, y0, 100.0, y0 + 10.0),
+                bbox=bbox,
                 char_span=(start, offset),
                 text=text,
                 layout=NativeTextLayoutRef(0, order, 0, 0),

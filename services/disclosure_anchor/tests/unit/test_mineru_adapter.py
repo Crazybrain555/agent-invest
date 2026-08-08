@@ -21,15 +21,16 @@ from disclosure_anchor.adapters.parsers.mineru.mapper_to_ir import (
 )
 from disclosure_anchor.adapters.parsers.mineru.structure_proof import (
     _assign_owner_scope_materialization,
-    build_mineru_structure_proof,
 )
 from disclosure_anchor.adapters.parsers.mineru.source_evidence import (
     CarrierSourceSupport,
     ResolvedTableRole,
     SourceEvidenceContractError,
-    iter_mineru_text_carriers,
 )
-from disclosure_anchor.adapters.parsers.comparison import comparison_text
+from tests.unit._native_support import (
+    build_proof_with_auto_native,
+    test_carrier_source_support as _test_carrier_source_support,
+)
 from disclosure_anchor.adapters.parsers.mineru.table_html_structure import (
     ParsedHtmlTable,
     TableHtmlStructureError,
@@ -115,7 +116,7 @@ def _untagged_proof(
     *,
     page_count: int = 1,
 ) -> dict[str, Any]:
-    return build_mineru_structure_proof(
+    return build_proof_with_auto_native(
         native=native_index(page_count=page_count),
         content_list=content_list,
         source_pdf_sha256="sha256:" + "a" * 64,
@@ -164,6 +165,8 @@ def _v2_structure_proof(
         tuple[int, str, int | None], CarrierSourceSupport
     ]
     | None = None,
+    heading_display_texts: tuple[str, ...] = (),
+    body_texts: tuple[str, ...] = (),
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     page_count = native.source_pdf_page_count
     projections = build_mineru_text_projections(
@@ -180,7 +183,7 @@ def _v2_structure_proof(
             source_pages=source_pages,
         )
     return (
-        build_mineru_structure_proof(
+        build_proof_with_auto_native(
             native=native,
             content_list=canonical_content,
             source_pdf_sha256=source_pdf_sha256,
@@ -190,78 +193,14 @@ def _v2_structure_proof(
             carrier_source_support=carrier_source_support,
             start_page=start_page,
             end_page=end_page,
+            heading_display_texts=heading_display_texts,
+            body_texts=body_texts,
         ),
         canonical_content,
     )
 
 
-def _test_carrier_source_support(
-    content_list: list[dict[str, Any]],
-    *,
-    source_pages: tuple[Any, ...],
-    table_role_overrides: tuple[ResolvedTableRole, ...] = (),
-) -> Mapping[tuple[int, str, int | None], CarrierSourceSupport]:
-    """Build explicit source support for synthetic native-layout tests.
-
-    The production path consumes a validated source-evidence ledger.  Tests
-    must model that boundary too: they may match complete native atom runs or
-    declare a visual-only carrier, but may never let a provider bbox mint a
-    native-layout witness.
-    """
-
-    atoms_by_page = {
-        page.page_idx: tuple(sorted(page.atoms, key=lambda atom: atom.order))
-        for page in source_pages
-    }
-    used: dict[int, set[int]] = {}
-    output: dict[
-        tuple[int, str, int | None],
-        CarrierSourceSupport,
-    ] = {}
-    for carrier in iter_mineru_text_carriers(
-        content_list,
-        table_role_overrides=table_role_overrides,
-    ):
-        if carrier.page_idx is None or carrier.bbox is None:
-            continue
-        target = carrier.comparison_value
-        available = atoms_by_page.get(carrier.page_idx, ())
-        selected: tuple[Any, ...] = ()
-        for start in range(len(available)):
-            parts: list[Any] = []
-            for atom in available[start:]:
-                if atom.order in used.setdefault(carrier.page_idx, set()):
-                    if parts:
-                        break
-                    continue
-                parts.append(atom)
-                value = comparison_text("".join(item.text for item in parts))
-                if value == target:
-                    selected = tuple(parts)
-                    break
-                if target and len(value) > len(target):
-                    break
-            if selected:
-                break
-        if selected:
-            used[carrier.page_idx].update(atom.order for atom in selected)
-        key = (carrier.source_item_index, carrier.field, carrier.index)
-        output[key] = CarrierSourceSupport(
-            source_item_index=carrier.source_item_index,
-            field=carrier.field,
-            index=carrier.index,
-            page_idx=carrier.page_idx,
-            bbox=carrier.bbox,
-            kind="native_exact" if selected else "visual_bound",
-            source_atom_orders=tuple(atom.order for atom in selected),
-            artifact_role=None if selected else "test_visual_occurrence",
-            artifact_sha256=(
-                None if selected else "sha256:" + "f" * 64
-            ),
-        )
-    return output
-
-
+# Shared implementation lives in tests/unit/_native_support.py.
 def _structure_elements(
     content_list: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -334,7 +273,7 @@ def _native_heading_case(
         ],
     )
     if provider_levels is None:
-        proof = build_mineru_structure_proof(
+        proof = build_proof_with_auto_native(
             native=native,
             content_list=content,
             source_pdf_sha256="sha256:" + "a" * 64,
@@ -1029,7 +968,7 @@ class MinerUMapperTests(unittest.TestCase):
             ParserOutputContractError,
             "lacks validated source-PDF support",
         ):
-            build_mineru_structure_proof(
+            build_proof_with_auto_native(
                 native=_validated_native_index(_untagged_native(1)),
                 content_list=content,
                 source_pdf_sha256="sha256:" + "a" * 64,
@@ -1322,7 +1261,7 @@ class MinerUMapperTests(unittest.TestCase):
         self.assertTrue(proof["headings"][0]["propagates"])
         self.assertEqual(
             proof["headings"][0]["evidence_kinds"],
-            ["mineru_v2_title", "struct_tree"],
+            ["mineru_v2_title", "native_layout"],
         )
         self.assertIn(
             "heading_level_conflict",
@@ -1353,19 +1292,23 @@ class MinerUMapperTests(unittest.TestCase):
                     heading["propagates"],
                     heading["heading_level"],
                     heading["parent_node_id"],
-                    heading["native_segment_id"],
-                    heading["native_node_id"],
+                    heading.get("native_segment_id"),
+                    heading.get("native_node_id"),
                 )
                 for heading in proof["headings"]
             ],
             [
                 (True, 1, None, "native_1", 1),
-                (True, 1, None, "native_2", 2),
-                (True, 2, 2, "native_2", 3),
+                (True, 1, None, None, None),
+                (True, 1, None, None, None),
             ],
         )
         self.assertIn(
-            "heading_parent_segment_conflict",
+            "heading_level_conflict",
+            [item["relation"] for item in proof["conflicts"]],
+        )
+        self.assertIn(
+            "heading_hierarchy_flattened",
             [item["relation"] for item in proof["conflicts"]],
         )
         validate_document_structure(
@@ -1386,14 +1329,7 @@ class MinerUMapperTests(unittest.TestCase):
             provider_levels=(2,),
         )
 
-        self.assertEqual(
-            (
-                toc_proof["headings"][0]["propagates"],
-                toc_proof["headings"][0]["parent_node_id"],
-                toc_proof["headings"][0]["section_span"],
-            ),
-            (False, None, [0, 0]),
-        )
+        self.assertEqual(toc_proof["headings"], [])
         toc_conflict = next(
             item
             for item in toc_proof["conflicts"]
@@ -1402,7 +1338,7 @@ class MinerUMapperTests(unittest.TestCase):
         self.assertEqual(toc_conflict["native_roles"], ["TOC", "TOCI"])
 
         first_node = native.nodes[0]
-        ambiguous = build_mineru_structure_proof(
+        ambiguous = build_proof_with_auto_native(
             native=replace(
                 native,
                 nodes=(first_node, replace(first_node, node_id=4)),
@@ -1411,7 +1347,20 @@ class MinerUMapperTests(unittest.TestCase):
             source_pdf_sha256="sha256:" + "a" * 64,
         )
 
-        self.assertEqual(ambiguous["headings"], [])
+        # The duplicated authored claim kills the StructTree chain, but the
+        # rendered native line still witnesses the heading identity at root.
+        self.assertEqual(
+            [
+                (
+                    heading["heading_level"],
+                    heading["parent_node_id"],
+                    heading["propagates"],
+                    heading["evidence_kinds"],
+                )
+                for heading in ambiguous["headings"]
+            ],
+            [(1, None, True, ["native_layout"])],
+        )
         self.assertIn(
             "native_heading_ancestry_conflict",
             [item["relation"] for item in ambiguous["conflicts"]],
@@ -1474,6 +1423,7 @@ class MinerUMapperTests(unittest.TestCase):
                     ),
                 ]
             ],
+            body_texts=("非经营性占用资金",),
         )
 
         self.assertEqual(proof["headings"], [])
@@ -1558,10 +1508,10 @@ class MinerUMapperTests(unittest.TestCase):
                 for heading in proof["headings"]
             ],
             [
-                (1, None, [0, 4], ["mineru_v2_title"]),
-                (2, 1, [1, 1], ["mineru_v2_title"]),
-                (2, 1, [2, 2], ["mineru_v2_title"]),
-                (2, 1, [3, 4], ["mineru_v2_title"]),
+                (1, None, [0, 0], ["mineru_v2_title", "native_layout"]),
+                (1, None, [1, 1], ["mineru_v2_title", "native_layout"]),
+                (1, None, [2, 2], ["mineru_v2_title", "native_layout"]),
+                (1, None, [3, 4], ["mineru_v2_title", "native_layout"]),
             ],
         )
         self.assertNotIn(
@@ -1787,7 +1737,8 @@ class MinerUMapperTests(unittest.TestCase):
         self.assertTrue(
             all(
                 heading["propagates"]
-                and heading["evidence_kinds"] == ["bookmark", "mineru_v2_title"]
+                and heading["evidence_kinds"]
+                == ["bookmark", "mineru_v2_title", "native_layout"]
                 for heading in proof["headings"]
             )
         )
@@ -1834,7 +1785,10 @@ class MinerUMapperTests(unittest.TestCase):
 
         self.assertEqual(len(proof["headings"]), 1)
         heading = proof["headings"][0]
-        self.assertEqual(heading["evidence_kinds"], ["mineru_v2_title"])
+        self.assertEqual(
+            heading["evidence_kinds"],
+            ["mineru_v2_title", "native_layout"],
+        )
         self.assertEqual(heading["section_span"], [0, 1])
         relations = sorted(
             conflict["relation"] for conflict in proof["conflicts"]
@@ -1962,7 +1916,7 @@ class MinerUMapperTests(unittest.TestCase):
                 source_pages=(page,),
                 table_role_overrides=(table_role,),
             )
-            return build_mineru_structure_proof(
+            return build_proof_with_auto_native(
                 native=native_index(
                     page_count=1,
                     nodes=[native_node(1, "H1", [(0, 7)])],
@@ -2100,7 +2054,7 @@ class MinerUMapperTests(unittest.TestCase):
                 content,
                 source_pages=(page,),
             )
-            return build_mineru_structure_proof(
+            return build_proof_with_auto_native(
                 native=native_index(
                     page_count=1,
                     nodes=[native_node(1, "H1", [(0, 7)])],
@@ -3300,7 +3254,10 @@ class MinerUMapperTests(unittest.TestCase):
 
         self.assertEqual(
             [heading["evidence_kinds"] for heading in proof["headings"]],
-            [["bookmark", "struct_tree"], ["bookmark", "struct_tree"]],
+            [
+                ["bookmark", "native_layout", "struct_tree"],
+                ["bookmark", "native_layout", "struct_tree"],
+            ],
         )
         self.assertEqual(
             [
@@ -3359,9 +3316,10 @@ class MinerUMapperTests(unittest.TestCase):
             "bbox": [100, 100, 400, 140],
             "text_level": 1,
         }
+        second = {**duplicate, "bbox": [100, 300, 400, 340]}
         repeated, _ = _v2_structure_proof(
             native=native_index(page_count=1),
-            legacy_content_list=[duplicate, dict(duplicate)],
+            legacy_content_list=[duplicate, second],
             content_list_v2=[
                 [
                     _title_block(
@@ -3370,7 +3328,7 @@ class MinerUMapperTests(unittest.TestCase):
                     ),
                     _title_block(
                         "重复 occurrence",
-                        [100, 100, 400, 140],
+                        [100, 300, 400, 340],
                     ),
                 ]
             ],

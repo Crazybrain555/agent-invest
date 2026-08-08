@@ -10,6 +10,7 @@ import re
 from typing import Any, Mapping, cast
 
 from disclosure_anchor.application.contracts.document_structure import (
+    DOCUMENT_STRUCTURE_ALGORITHM,
     DocumentStructureContractError,
     validate_document_structure,
 )
@@ -605,6 +606,18 @@ def validate_current_normalized_ir_for_write(payload: Mapping[str, Any]) -> str:
     """Validate a new producer artifact at the parser-port boundary."""
 
     version = validate_normalized_ir_contract(payload, require_current=True)
+    structure_proof = payload.get("structure_proof")
+    if (
+        isinstance(structure_proof, Mapping)
+        and structure_proof.get("algorithm_version")
+        != DOCUMENT_STRUCTURE_ALGORITHM
+    ):
+        # Historical algorithms stay readable for diagnostics, but a NEW
+        # artifact must never persist a legacy structure authority.
+        raise NormalizedIRVersionError(
+            "structure_proof_current_required",
+            "new NormalizedIR writes require the current structure algorithm",
+        )
     elements = payload.get("elements")
     assert isinstance(elements, list)
     for position, element in enumerate(elements):

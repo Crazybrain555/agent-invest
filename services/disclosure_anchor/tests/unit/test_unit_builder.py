@@ -32,10 +32,18 @@ from disclosure_anchor.application.contracts.document_structure import (
     DOCUMENT_STRUCTURE_ALGORITHM,
     DOCUMENT_STRUCTURE_VERSION,
     DocumentStructureContractError,
+    LEGACY_DOCUMENT_STRUCTURE_ALGORITHM,
     OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
     OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM,
+    PREVIOUS_DOCUMENT_STRUCTURE_ALGORITHM,
     carrier_set_sha256,
+    require_current_document_structure,
     validate_document_structure,
+)
+from disclosure_anchor.application.contracts.normalized_ir import (
+    NormalizedIRVersionError,
+    validate_current_normalized_ir_for_write,
+    validate_normalized_ir_contract,
 )
 from disclosure_anchor.adapters.parsers.comparison import comparison_text
 from disclosure_anchor.application.contracts.source_evidence import (
@@ -586,8 +594,8 @@ class StructureProofProjectionTests(unittest.TestCase):
             },
         }
         with self.assertRaisesRegex(
-            SourceEvidenceClosureError,
-            "legacy owner-scope breaks cannot drive current publication",
+            DocumentStructureContractError,
+            "predates the current materialization contract",
         ):
             build_unit_drafts_s1_s7(
                 legacy_ir,
@@ -962,8 +970,8 @@ class StructureProofProjectionTests(unittest.TestCase):
             "structure_proof": proof,
         }
         with self.assertRaisesRegex(
-            SourceEvidenceClosureError,
-            "v13 owner-scope breaks require a reparse",
+            DocumentStructureContractError,
+            "predates the current materialization contract",
         ):
             build_unit_drafts_s1_s7(
                 v13_ir,
@@ -971,6 +979,9 @@ class StructureProofProjectionTests(unittest.TestCase):
                 image_artifact_resolver=None,
             )
 
+        # Even a break-free v13 proof cannot drive current publication: the
+        # materialization contract is carried by the algorithm version, not
+        # by whether this document happened to need a break.
         empty_proof = _proof(elements, headings=headings)
         empty_proof["algorithm_version"] = (
             OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM
@@ -981,12 +992,15 @@ class StructureProofProjectionTests(unittest.TestCase):
             "elements": elements,
             "structure_proof": empty_proof,
         }
-        units, _ = build_unit_drafts_s1_s7(
-            empty_ir,
-            filing_type="annual_report",
-            image_artifact_resolver=None,
-        )
-        self.assertTrue(units)
+        with self.assertRaisesRegex(
+            DocumentStructureContractError,
+            "predates the current materialization contract",
+        ):
+            build_unit_drafts_s1_s7(
+                empty_ir,
+                filing_type="annual_report",
+                image_artifact_resolver=None,
+            )
 
     def test_flatten_overlapping_second_break_is_rejected_by_the_contract(
         self,
@@ -2758,6 +2772,342 @@ class TablePayloadTests(unittest.TestCase):
                 ),
             ):
                 _build(elements)
+
+
+class LegacyStructureGoldenMatrixTests(unittest.TestCase):
+    """Golden matrix: each historical algorithm across every consumer channel.
+
+    Every stored structure proof stays readable under its own shape rules,
+    but only the current algorithm may drive publication: the central gate,
+    the NormalizedIR write contract, the builder, and the independent audit
+    all reject earlier algorithms with the typed reparse terminal, while the
+    NormalizedIR read contract keeps historical envelopes inspectable.
+    """
+
+    _REPARSE = "predates the current materialization contract"
+
+    @staticmethod
+    def _rows() -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, dict[str, Any]],
+    ]:
+        elements, headings, scope_breaks = (
+            StructureProofProjectionTests._noncontiguous_target_case()
+        )
+        v13_breaks = [
+            {
+                key: value
+                for key, value in scope_breaks[0].items()
+                if key
+                not in {"materialization_policy", "flatten_subtree_root_node_id"}
+            }
+        ]
+        table_index = next(
+            int(element["source_item_index"])
+            for element in elements
+            if element.get("raw_kind") == "table"
+        )
+        v12_breaks = [
+            {
+                "page_index": 0,
+                "source_atom_orders": [7],
+                "boundary_start_order": table_index,
+                "eligibility_basis": "numbered_layout_break",
+                "relative_rank": "peer_or_higher",
+            }
+        ]
+
+        def proof_row(
+            algorithm: str,
+            *,
+            owner_scope_breaks: list[dict[str, Any]] | None = None,
+            legacy_root: bool = False,
+        ) -> dict[str, Any]:
+            proof = _proof(
+                elements,
+                headings=headings,
+                owner_scope_breaks=owner_scope_breaks,
+            )
+            proof["algorithm_version"] = algorithm
+            if legacy_root:
+                del proof["owner_scope_breaks"]
+            return proof
+
+        rows = {
+            "v10": proof_row(
+                LEGACY_DOCUMENT_STRUCTURE_ALGORITHM, legacy_root=True
+            ),
+            "v11": proof_row(
+                PREVIOUS_DOCUMENT_STRUCTURE_ALGORITHM, legacy_root=True
+            ),
+            "v12_empty": proof_row(OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM),
+            "v12_breaks": proof_row(
+                OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
+                owner_scope_breaks=v12_breaks,
+            ),
+            "v13_empty": proof_row(OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM),
+            "v13_breaks": proof_row(
+                OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM,
+                owner_scope_breaks=v13_breaks,
+            ),
+            "v14": proof_row(
+                DOCUMENT_STRUCTURE_ALGORITHM,
+                owner_scope_breaks=scope_breaks,
+            ),
+        }
+        return elements, headings, rows
+
+    def test_every_algorithm_row_stays_readable(self) -> None:
+        elements, _headings, rows = self._rows()
+        for name, proof in rows.items():
+            with self.subTest(row=name):
+                validated = validate_document_structure(
+                    proof, elements=elements
+                )
+                self.assertEqual(
+                    validated["algorithm_version"], proof["algorithm_version"]
+                )
+
+    def test_only_v14_passes_the_central_currency_gate(self) -> None:
+        _elements, _headings, rows = self._rows()
+        for name, proof in rows.items():
+            with self.subTest(row=name):
+                if name == "v14":
+                    require_current_document_structure(proof)
+                else:
+                    with self.assertRaisesRegex(
+                        DocumentStructureContractError, self._REPARSE
+                    ):
+                        require_current_document_structure(proof)
+
+    def test_only_v14_may_drive_the_builder(self) -> None:
+        elements, _headings, rows = self._rows()
+        for name, proof in rows.items():
+            ir = {
+                "contract_version": "normalized_ir.v4",
+                "source_pdf_sha256": _SOURCE_PDF_SHA256,
+                "elements": elements,
+                "structure_proof": proof,
+            }
+            with self.subTest(row=name):
+                if name == "v14":
+                    units, _ = build_unit_drafts_s1_s7(
+                        ir,
+                        filing_type="annual_report",
+                        image_artifact_resolver=None,
+                    )
+                    self.assertTrue(units)
+                else:
+                    with self.assertRaisesRegex(
+                        DocumentStructureContractError, self._REPARSE
+                    ):
+                        build_unit_drafts_s1_s7(
+                            ir,
+                            filing_type="annual_report",
+                            image_artifact_resolver=None,
+                        )
+
+    def test_only_v14_may_enter_the_independent_audit(self) -> None:
+        # The audit's currency guard reads only the algorithm version, so a
+        # text-only envelope keeps every row read-valid; break-carrying rows
+        # exercise their shapes through the other channels.
+        elements = [
+            _element(0, text="一、章节", text_level=1),
+            _element(1, text="章节正文"),
+        ]
+        headings = [_heading(1, 0, text="一、章节", section_end=1)]
+        normalized_ir, source_proof, _resolve, _hashes = (
+            _audit_case_environment(
+                elements,
+                headings=headings,
+                page_count=1,
+            )
+        )
+        rows: dict[str, dict[str, Any]] = {}
+        for name, algorithm, legacy_root in (
+            ("v10", LEGACY_DOCUMENT_STRUCTURE_ALGORITHM, True),
+            ("v11", PREVIOUS_DOCUMENT_STRUCTURE_ALGORITHM, True),
+            ("v12_empty", OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM, False),
+            ("v13_empty", OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM, False),
+            ("v14", DOCUMENT_STRUCTURE_ALGORITHM, False),
+        ):
+            proof = _proof(elements, headings=headings)
+            proof["algorithm_version"] = algorithm
+            if legacy_root:
+                del proof["owner_scope_breaks"]
+            rows[name] = proof
+        for name, proof in rows.items():
+            audited = json.loads(json.dumps(normalized_ir))
+            audited["structure_proof"] = {
+                **proof,
+                "source_pdf_page_count": 1,
+            }
+            with self.subTest(row=name):
+                report = audit_document(
+                    normalized_ir=audited,
+                    units=(),
+                    metadata=AuditDocumentMetadata(
+                        document_id=str(audited["document_id"]),
+                        title=None,
+                        filing_type="annual_report",
+                    ),
+                    source_proof=source_proof,
+                    image_hashes={},
+                )
+                codes = {finding.code for finding in report.findings}
+                if name == "v14":
+                    self.assertNotIn("structure_proof_reparse_required", codes)
+                else:
+                    self.assertIn("structure_proof_reparse_required", codes)
+                    self.assertFalse(report.ok)
+
+    def test_normalized_ir_reads_every_row_but_writes_only_v14(self) -> None:
+        base = _current_payload_for_matrix()
+        bundle_proof = base["structure_proof"]
+        assert isinstance(bundle_proof, dict)
+
+        def payload_row(
+            algorithm: str, *, legacy_root: bool = False
+        ) -> dict[str, Any]:
+            payload = json.loads(json.dumps(base))
+            proof = payload["structure_proof"]
+            proof["algorithm_version"] = algorithm
+            if legacy_root:
+                del proof["owner_scope_breaks"]
+            if algorithm == LEGACY_DOCUMENT_STRUCTURE_ALGORITHM:
+                for heading in proof["headings"]:
+                    heading["evidence_kinds"] = [
+                        kind
+                        for kind in heading["evidence_kinds"]
+                        if kind != "native_layout"
+                    ]
+            return payload
+
+        payloads = {
+            "v10": payload_row(
+                LEGACY_DOCUMENT_STRUCTURE_ALGORITHM, legacy_root=True
+            ),
+            "v11": payload_row(
+                PREVIOUS_DOCUMENT_STRUCTURE_ALGORITHM, legacy_root=True
+            ),
+            "v12_empty": payload_row(OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM),
+            "v13_empty": payload_row(OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM),
+            "v14": json.loads(json.dumps(base)),
+        }
+        for name, payload in payloads.items():
+            with self.subTest(row=name, channel="read"):
+                self.assertEqual(
+                    validate_normalized_ir_contract(payload),
+                    "normalized_ir.v4",
+                )
+            with self.subTest(row=name, channel="write"):
+                if name == "v14":
+                    self.assertEqual(
+                        validate_current_normalized_ir_for_write(payload),
+                        "normalized_ir.v4",
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        NormalizedIRVersionError,
+                        "current structure algorithm",
+                    ):
+                        validate_current_normalized_ir_for_write(payload)
+
+    def test_mislabeled_and_malformed_versions_fail_loudly(self) -> None:
+        elements, headings, rows = self._rows()
+        v14_breaks = rows["v14"]["owner_scope_breaks"]
+        v13_shape_breaks = rows["v13_breaks"]["owner_scope_breaks"]
+
+        forged_v14 = _proof(
+            elements, headings=headings, owner_scope_breaks=v13_shape_breaks
+        )
+        forged_v13 = _proof(
+            elements, headings=headings, owner_scope_breaks=v14_breaks
+        )
+        forged_v13["algorithm_version"] = (
+            OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM
+        )
+        missing = _proof(elements, headings=headings)
+        del missing["algorithm_version"]
+        missing["algorithm_version"] = None
+        unknown = _proof(elements, headings=headings)
+        unknown["algorithm_version"] = "document-structure-evidence.v15"
+        v10_with_breaks = _proof(elements, headings=headings)
+        v10_with_breaks["algorithm_version"] = (
+            LEGACY_DOCUMENT_STRUCTURE_ALGORITHM
+        )
+        v14_without_breaks = _proof(elements, headings=headings)
+        del v14_without_breaks["owner_scope_breaks"]
+
+        cases = {
+            "v14_label_on_v13_break_shape": forged_v14,
+            "v13_label_on_v14_break_shape": forged_v13,
+            "algorithm_missing": missing,
+            "algorithm_unknown": unknown,
+            "v10_with_breaks_field": v10_with_breaks,
+            "v14_without_breaks_field": v14_without_breaks,
+        }
+        for name, proof in cases.items():
+            with self.subTest(case=name, channel="readable"):
+                with self.assertRaises(DocumentStructureContractError):
+                    validate_document_structure(proof, elements=elements)
+        for name in ("algorithm_missing", "algorithm_unknown"):
+            with self.subTest(case=name, channel="require_current"):
+                with self.assertRaisesRegex(
+                    DocumentStructureContractError, self._REPARSE
+                ):
+                    require_current_document_structure(cases[name])
+
+    def test_forged_v14_label_cannot_pass_the_audit(self) -> None:
+        _elements, _headings, rows = self._rows()
+        elements = [
+            _element(0, text="一、章节", text_level=1),
+            _element(1, text="章节正文"),
+        ]
+        headings = [_heading(1, 0, text="一、章节", section_end=1)]
+        normalized_ir, source_proof, _resolve, _hashes = (
+            _audit_case_environment(
+                elements,
+                headings=headings,
+                page_count=1,
+            )
+        )
+        forged = json.loads(json.dumps(normalized_ir))
+        forged["structure_proof"]["owner_scope_breaks"] = rows["v13_breaks"][
+            "owner_scope_breaks"
+        ]
+        report = audit_document(
+            normalized_ir=forged,
+            units=(),
+            metadata=AuditDocumentMetadata(
+                document_id=str(forged["document_id"]),
+                title=None,
+                filing_type="annual_report",
+            ),
+            source_proof=source_proof,
+            image_hashes={},
+        )
+        self.assertFalse(report.ok)
+        codes = {finding.code for finding in report.findings}
+        self.assertTrue(
+            any(code.startswith("structure_proof_") for code in codes),
+            codes,
+        )
+
+
+def _current_payload_for_matrix() -> dict[str, Any]:
+    import tempfile
+    from pathlib import Path
+
+    from tests.unit._current_ir import write_text_ir_bundle
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        relpath = Path("derived/normalized_ir/matrix/normalized_ir.v4.json")
+        write_text_ir_bundle(root, relpath)
+        return json.loads((root / relpath).read_text(encoding="utf-8"))
+
 
 
 if __name__ == "__main__":

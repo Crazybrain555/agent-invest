@@ -13,8 +13,7 @@ from typing import Any, Callable, Iterable, cast
 from disclosure_anchor.application.contracts import content_annotations
 from disclosure_anchor.application.services.unit_builder import retrieval_routing
 from disclosure_anchor.application.contracts.document_structure import (
-    OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
-    OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM,
+    require_current_document_structure,
     validate_document_structure,
 )
 from disclosure_anchor.application.contracts.source_evidence_occurrence import (
@@ -1254,26 +1253,10 @@ def _proven_heading_owner(
 def _proven_owner_scope_breaks(
     structure_proof: Mapping[str, Any],
 ) -> tuple[_OwnerScopeBreak, ...]:
+    # The current-proof gate at the build entry already rejects every legacy
+    # algorithm with the typed reparse terminal, so only v14 breaks reach
+    # this parser.
     values = structure_proof.get("owner_scope_breaks", [])
-    if (
-        structure_proof.get("algorithm_version")
-        == OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM
-        and values
-    ):
-        raise SourceEvidenceClosureError(
-            "legacy owner-scope breaks cannot drive current publication"
-        )
-    if (
-        structure_proof.get("algorithm_version")
-        == OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM
-        and values
-    ):
-        # v13 breaks predate materialization policies; guessing a default
-        # would silently grant them v14 placement semantics.
-        raise SourceEvidenceClosureError(
-            "v13 owner-scope breaks require a reparse under the v14 "
-            "materialization contract before publication"
-        )
     output: list[_OwnerScopeBreak] = []
     for value in values:
         ref = value["boundary_source_ref"]
@@ -2108,6 +2091,11 @@ def build_unit_drafts_s1_s7(
             source_pdf_sha256 if isinstance(source_pdf_sha256, str) else None
         ),
     )
+    # Publication authority is current-only: a legal historical proof gets
+    # the typed reparse terminal here, before any placement, so no direct
+    # caller (tests, replay scripts, future entry points) can publish from a
+    # legacy structure algorithm.
+    require_current_document_structure(proof)
     s1 = s1_preprocess_elements(
         raw_elements,
         structure_proof=proof,

@@ -13,8 +13,8 @@ from typing import Any
 from disclosure_anchor.adapters.parsers.mineru.content_list_contract import (
     mineru_provider_item_sha256,
 )
-from disclosure_anchor.adapters.parsers.mineru.structure_proof import (
-    build_mineru_structure_proof,
+from tests.unit._native_support import (
+    build_proof_with_auto_native,
 )
 from disclosure_anchor.adapters.parsers.mineru.text_projection import (
     build_mineru_text_projections,
@@ -150,8 +150,9 @@ def proof_for(
     nodes: tuple[NativeStructureNode, ...] = (),
     bookmarks: tuple[NativeBookmark, ...] = (),
     page_count: int = 1,
+    heading_display_texts: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    return build_mineru_structure_proof(
+    return build_proof_with_auto_native(
         native=native_structure(
             content_list,
             nodes=nodes,
@@ -160,6 +161,7 @@ def proof_for(
         ),
         content_list=content_list,
         source_pdf_sha256=SOURCE_PDF_SHA256,
+        heading_display_texts=heading_display_texts,
     )
 
 
@@ -198,7 +200,7 @@ def v2_proof(
     )
     canonical = list(projections.canonical_items)
     return (
-        build_mineru_structure_proof(
+        build_proof_with_auto_native(
             native=native_structure(
                 canonical,
                 bookmarks=bookmarks,
@@ -320,12 +322,9 @@ class StructureProofConflictTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(
-            heading_shape(proof),
-            [(1, None, True, [0, 2], [0, 1])],
-        )
+        self.assertEqual(heading_shape(proof), [])
         self.assertNotIn(2, heading_sources(proof))
-        self.assertEqual(proof["coverage"]["proven_heading_nodes"], 1)
+        self.assertEqual(proof["coverage"]["proven_heading_nodes"], 0)
         validate_document_structure(proof, elements=elements_for(content))
 
     def test_backward_native_parent_edge_is_rejected(self) -> None:
@@ -356,7 +355,7 @@ class StructureProofConflictTests(unittest.TestCase):
         self.assertEqual(
             heading_shape(proof),
             [
-                (1, None, False, [0, 0], [0]),
+                (1, None, True, [0, 1], [0]),
                 (1, None, True, [2, 2], [2]),
             ],
         )
@@ -408,19 +407,29 @@ class StructureProofConflictTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            conflicts_named(proof, "native_heading_parent_unavailable"),
+            conflicts_named(proof, "native_heading_non_section_ancestry"),
             [
                 {
-                    "relation": "native_heading_parent_unavailable",
-                    "source_item_indices": [0, 1],
+                    "relation": "native_heading_non_section_ancestry",
+                    "native_roles": ["TOC"],
+                    "source_item_indices": [0],
                 }
             ],
         )
         self.assertEqual(
+            [
+                conflict["source_item_indices"]
+                for conflict in conflicts_named(
+                    proof,
+                    "provider_heading_unproved",
+                )
+            ],
+            [[0]],
+        )
+        self.assertEqual(
             heading_shape(proof),
             [
-                (1, None, False, [0, 0], [0]),
-                (1, None, False, [1, 1], [1]),
+                (1, None, True, [1, 1], [1]),
             ],
         )
         validate_document_structure(proof, elements=elements_for(content))
@@ -484,8 +493,8 @@ class StructureProofConflictTests(unittest.TestCase):
             heading_shape(proof),
             [
                 (1, None, True, [0, 0], [0]),
-                (1, None, True, [1, 2], [1]),
-                (1, None, False, [2, 2], [2]),
+                (1, None, True, [1, 1], [1]),
+                (1, None, True, [2, 2], [2]),
             ],
         )
         validate_document_structure(proof, elements=elements_for(content))
@@ -537,15 +546,7 @@ class StructureProofConflictTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(
-            conflicts_named(proof, "heading_parent_anchor_only"),
-            [
-                {
-                    "relation": "heading_parent_anchor_only",
-                    "source_item_indices": [3],
-                }
-            ],
-        )
+        self.assertEqual(conflicts_named(proof, "heading_parent_anchor_only"), [])
         self.assertEqual(
             [
                 conflict["source_item_indices"]
@@ -560,9 +561,9 @@ class StructureProofConflictTests(unittest.TestCase):
             heading_shape(proof),
             [
                 (1, None, True, [0, 0], [0]),
-                (1, None, True, [1, 2], [1]),
-                (1, None, False, [2, 2], [2]),
-                (1, None, True, [3, 3], [3]),
+                (1, None, True, [1, 1], [1]),
+                (1, None, True, [2, 3], [2]),
+                (2, 3, True, [3, 3], [3]),
             ],
         )
         validate_document_structure(proof, elements=elements_for(content))
@@ -585,30 +586,22 @@ class StructureProofConflictTests(unittest.TestCase):
             bookmarks=bookmarks,
         )
 
-        self.assertEqual(
-            conflicts_named(proof, "heading_parent_conflict"),
-            [
-                {
-                    "relation": "heading_parent_conflict",
-                    "source_item_indices": [2],
-                }
-            ],
-        )
+        self.assertEqual(conflicts_named(proof, "heading_parent_conflict"), [])
         self.assertEqual(
             heading_shape(proof),
             [
                 (1, None, True, [0, 0], [0]),
-                (1, None, True, [1, 2], [1]),
-                (1, None, False, [2, 2], [2]),
+                (1, None, True, [1, 1], [1]),
+                (1, None, True, [2, 2], [2]),
             ],
         )
         self.assertEqual(
             proof["headings"][0]["evidence_kinds"],
-            ["bookmark", "mineru_v2_title"],
+            ["bookmark", "mineru_v2_title", "native_layout"],
         )
         self.assertEqual(
             proof["headings"][2]["evidence_kinds"],
-            ["bookmark", "mineru_v2_title"],
+            ["bookmark", "mineru_v2_title", "native_layout"],
         )
         validate_document_structure(proof, elements=elements_for(canonical))
 
@@ -628,8 +621,8 @@ class StructureProofConflictTests(unittest.TestCase):
         self.assertEqual(
             heading_shape(agreeing),
             [
-                (1, None, True, [0, 2], [0]),
-                (2, 1, True, [2, 2], [2]),
+                (1, None, True, [0, 1], [0]),
+                (1, None, True, [2, 2], [2]),
             ],
         )
         validate_document_structure(
@@ -724,7 +717,7 @@ class StructureProofCleanEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(
             [heading["evidence_kinds"] for heading in proof["headings"]],
-            [["struct_tree"]] * 3,
+            [["native_layout", "struct_tree"]] * 3,
         )
         self.assertEqual(
             [
@@ -753,7 +746,7 @@ class StructureProofCleanEvidenceTests(unittest.TestCase):
         # mapper stamps onto elements, or the proof forks from the IR.
         raw = body((r"经营\~情况",))
         canonical = body(("经营~情况",))
-        proof = build_mineru_structure_proof(
+        proof = build_proof_with_auto_native(
             native=native_structure(canonical),
             content_list=canonical,
             source_pdf_sha256=SOURCE_PDF_SHA256,
@@ -790,14 +783,14 @@ class StructureProofCleanEvidenceTests(unittest.TestCase):
         self.assertEqual(
             heading_shape(proof),
             [
-                (1, None, True, [0, 2], [0]),
-                (2, 1, True, [1, 2], [1]),
+                (1, None, True, [0, 0], [0]),
+                (1, None, True, [1, 2], [1]),
                 (1, None, True, [3, 3], [3]),
             ],
         )
         self.assertEqual(
             [heading["evidence_kinds"] for heading in proof["headings"]],
-            [["bookmark", "mineru_v2_title"]] * 3,
+            [["bookmark", "mineru_v2_title", "native_layout"]] * 3,
         )
         self.assertEqual(heading_sources(proof), {0, 1, 3})
         self.assertEqual(proof["coverage"]["proven_heading_nodes"], 3)
