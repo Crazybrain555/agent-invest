@@ -10,6 +10,7 @@ report, so the passes stay covered by observable publication behaviour only.
 from __future__ import annotations
 
 import hashlib
+import json
 import unittest
 from typing import Any
 
@@ -23,6 +24,9 @@ from disclosure_anchor.application.contracts.normalized_ir import (
 )
 from disclosure_anchor.application.contracts.source_evidence import (
     SourceEvidenceProof,
+)
+from disclosure_anchor.application.contracts.unit_source_projection import (
+    empty_projection_graph,
 )
 from disclosure_anchor.application.services.document_unit_audit import (
     AuditDocumentMetadata,
@@ -418,9 +422,13 @@ class NativeGapPublicationOrderTests(PublicationCase):
         self.assertEqual(stats.provider_attested_pages, 1)
         self.assert_audit_ok(report)
 
-    def test_gap_inside_heading_source_flattens_without_creating_section_body(
+    def test_contained_gap_becomes_the_heading_only_sections_own_body(
         self,
     ) -> None:
+        """Exact containment proves the missing native text is this section's
+        body, so the unique heading-only primary owner absorbs it instead of
+        leaking an independent root residual segment."""
+
         normalized_ir, proof = build_case(
             page_count=1,
             elements=(Element(index=0, page=0),),
@@ -439,14 +447,174 @@ class NativeGapPublicationOrderTests(PublicationCase):
         drafts, _stats, report = publish(document, proof)
 
         heading = next(draft for draft in drafts if draft.heading_path)
-        residual = next(draft for draft in drafts if gap_texts(draft))
-        self.assertEqual(heading.payload_kind, "text")
+        self.assertEqual(heading.payload_kind, "mixed")
         self.assertEqual(heading.heading_path, ["第一节 甲"])
         self.assertEqual(heading.quality_status, "needs_review")
+        parts = heading.payload["parts"]
+        self.assertEqual(
+            [part.get("text") for part in parts],
+            ["第一节 甲", "标题缺字"],
+        )
+        self.assertEqual(
+            [draft.heading_path for draft in drafts if gap_texts(draft)],
+            [["第一节 甲"]],
+        )
+        self.assert_audit_ok(report)
+
+    def test_page_suffix_adjacency_never_feeds_a_heading_only_owner(
+        self,
+    ) -> None:
+        """One-sided adjacency proves position, not body ownership: the
+        containment allowance must not leak into the page-suffix lane."""
+
+        normalized_ir, proof = build_case(
+            page_count=1,
+            elements=(Element(index=0, page=0),),
+            atoms=(
+                MappedAtom(carrier=0, page=0, word=0, block=0),
+                NativeAtom(text="页尾残句", page=0, word=1),
+            ),
+        )
+        document = document_ir(
+            normalized_ir,
+            carriers={0: carrier(text="第一节 甲", heading=True)},
+            headings=(heading_node(1, 0, text="第一节 甲", section_end=0),),
+        )
+
+        drafts, _stats, report = publish(document, proof)
+
+        heading = next(draft for draft in drafts if draft.heading_path)
+        residual = next(draft for draft in drafts if gap_texts(draft))
+        self.assertEqual(heading.payload_kind, "text")
         self.assertEqual(residual.heading_path, [])
         self.assertEqual(residual.payload["semantic_type"], "document")
-        self.assertEqual(gap_texts(residual), ["标题缺字"])
+        self.assertEqual(gap_texts(residual), ["页尾残句"])
         self.assert_audit_ok(report)
+
+    def test_audit_rejects_a_contained_gap_moved_back_to_root(self) -> None:
+        """The independent placement gate: exact containment with one primary
+        owner leaves no honest-root escape."""
+
+        normalized_ir, proof = build_case(
+            page_count=1,
+            elements=(Element(index=0, page=0),),
+            atoms=(
+                MappedAtom(carrier=0, page=0, word=0, block=0),
+                NativeAtom(text="标题缺字", page=0, word=1),
+                MappedAtom(carrier=0, page=0, word=2, block=0),
+            ),
+        )
+        document = document_ir(
+            normalized_ir,
+            carriers={0: carrier(text="第一节 甲", heading=True)},
+            headings=(heading_node(1, 0, text="第一节 甲", section_end=0),),
+        )
+        drafts, stats, baseline = publish(document, proof)
+        self.assert_audit_ok(baseline)
+
+        tampered_views: list[AuditUnitView] = []
+        order = 0
+        for draft in drafts:
+            payload = json.loads(json.dumps(draft.payload))
+            locator = json.loads(json.dumps(draft.artifact_locator or {}))
+            if draft.payload_kind == "mixed" and native_parts(draft):
+                kept = [
+                    part
+                    for part in payload["parts"]
+                    if not isinstance(part.get("artifact_locator"), dict)
+                    or not isinstance(
+                        part["artifact_locator"]
+                        .get("source_projection", {})
+                        .get("physical_context"),
+                        dict,
+                    )
+                ]
+                moved = [
+                    part
+                    for part in payload["parts"]
+                    if part not in kept
+                ]
+                payload["parts"] = kept
+                order += 1
+                tampered_views.append(
+                    AuditUnitView(
+                        order_index=order,
+                        payload_kind=draft.payload_kind,
+                        payload=payload,
+                        title=draft.title,
+                        heading_path=list(draft.heading_path),
+                        semantic_key=draft.semantic_key,
+                        semantic_keys=draft.semantic_keys,
+                        quality_status=draft.quality_status,
+                        applicability=draft.applicability,
+                        artifact_locator=locator,
+                    )
+                )
+                for part in moved:
+                    part.pop("heading_path", None)
+                order += 1
+                tampered_views.append(
+                    AuditUnitView(
+                        order_index=order,
+                        payload_kind="mixed",
+                        payload={
+                            "semantic_type": "document",
+                            "order_status": "unresolved_physical_fallback",
+                            "parts": moved,
+                        },
+                        title=None,
+                        heading_path=[],
+                        semantic_key=None,
+                        semantic_keys=None,
+                        quality_status="needs_review",
+                        artifact_locator={
+                            "source_projection": {
+                                **empty_projection_graph(),
+                                "payload": {
+                                    "kind": "container",
+                                    "sources": [],
+                                    "target_field": "payload.parts",
+                                    "transform": "ordered_parts.v1",
+                                },
+                            }
+                        },
+                        applicability=None,
+                    )
+                )
+            else:
+                order += 1
+                tampered_views.append(
+                    AuditUnitView(
+                        order_index=order,
+                        payload_kind=draft.payload_kind,
+                        payload=payload,
+                        title=draft.title,
+                        heading_path=list(draft.heading_path),
+                        semantic_key=draft.semantic_key,
+                        semantic_keys=draft.semantic_keys,
+                        quality_status=draft.quality_status,
+                        applicability=draft.applicability,
+                        artifact_locator=locator,
+                    )
+                )
+
+        report = audit_document(
+            normalized_ir=document,
+            units=tampered_views,
+            metadata=AuditDocumentMetadata(
+                document_id=_DOCUMENT_ID,
+                title="排序样本",
+                filing_type="other",
+            ),
+            source_proof=proof,
+            source_dispositions=stats.source_dispositions,
+            image_hashes={},
+        )
+        self.assertFalse(report.ok)
+        self.assertIn(
+            "source_native_containment_owner_mismatch",
+            {finding.code for finding in report.findings},
+        )
 
     def test_document_leading_gap_publishes_before_every_carrier(self) -> None:
         normalized_ir, proof = build_case(

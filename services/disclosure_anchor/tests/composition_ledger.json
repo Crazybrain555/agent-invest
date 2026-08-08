@@ -267,7 +267,7 @@
   },
   "tests/unit/test_native_order_anchor.py": {
    "private_imports": [],
-   "tests": 15
+   "tests": 17
   },
   "tests/unit/test_ofcp_phase1_contracts.py": {
    "private_imports": [],
@@ -379,7 +379,7 @@
   },
   "tests/unit/test_unit_builder.py": {
    "private_imports": [],
-   "tests": 46
+   "tests": 47
   },
   "tests/unit/test_unit_hashing.py": {
    "private_imports": [],

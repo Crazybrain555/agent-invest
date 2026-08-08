@@ -2164,7 +2164,7 @@ def build_unit_drafts_s1_s7(
     )
     grouped = _flag_coverage_gap_owners(grouped)
     grouped = _suppress_punctuation_only_natives(grouped, stats=s1.stats)
-    grouped = _embed_native_recoveries(grouped)
+    grouped = _embed_native_recoveries(grouped, raw_elements=raw_elements)
     grouped = _coalesce_adjacent_root_units(grouped)
     grouped = _sanitize_unsafe_semantic_units(grouped, stats=s1.stats)
     return (
@@ -2193,7 +2193,11 @@ def _native_containment_owner(unit: UnitDraft) -> int | None:
     return None
 
 
-def _embed_native_recoveries(units: list[UnitDraft]) -> list[UnitDraft]:
+def _embed_native_recoveries(
+    units: list[UnitDraft],
+    *,
+    raw_elements: Sequence[Mapping[str, Any]],
+) -> list[UnitDraft]:
     """Publish native recoveries as leaves of one existing coarse owner.
 
     A source-native gap is evidence missing from the provider carrier, not a
@@ -2219,6 +2223,14 @@ def _embed_native_recoveries(units: list[UnitDraft]) -> list[UnitDraft]:
     for owner_index, owner in enumerate(owners):
         for source_index in _unit_source_item_indices_for_attribution(owner):
             owner_indices_by_source.setdefault(source_index, []).append(owner_index)
+    element_kinds = {
+        element_index: str(element.get("kind", ""))
+        for element in raw_elements
+        if isinstance(
+            (element_index := element.get("source_item_index")), int
+        )
+        and not isinstance(element_index, bool)
+    }
 
     assigned: dict[int, list[UnitDraft]] = {}
     root_recoveries: list[UnitDraft] = []
@@ -2227,6 +2239,7 @@ def _embed_native_recoveries(units: list[UnitDraft]) -> list[UnitDraft]:
             recovery,
             owners=owners,
             owner_indices_by_source=owner_indices_by_source,
+            element_kinds=element_kinds,
         )
         if recovery_owner_index is None:
             root_recoveries.append(recovery)
@@ -2249,22 +2262,48 @@ def _embed_native_recoveries(units: list[UnitDraft]) -> list[UnitDraft]:
     return sorted(output, key=_unit_sort_key)
 
 
+_CONTAINMENT_PRIMARY_FIELD_BY_KIND = {
+    "table": "table",
+    "image": "image",
+    "equation": "image",
+}
+
+
 def _native_recovery_owner_index(
     recovery: UnitDraft,
     *,
     owners: list[UnitDraft],
     owner_indices_by_source: Mapping[int, list[int]],
+    element_kinds: Mapping[int, str],
 ) -> int | None:
     context = _native_physical_context(recovery)
     containment_owner = context.get("containment_owner")
-    if isinstance(containment_owner, int) and not isinstance(
-        containment_owner, bool
+    if (
+        isinstance(containment_owner, int)
+        and not isinstance(containment_owner, bool)
+        and context.get("relation") == "bounded_by_same_source"
+        and context.get("order_basis") == "containment_proven"
     ):
-        candidates = owner_indices_by_source.get(containment_owner, [])
-        if len(candidates) == 1 and not _payload_is_own_heading(
-            owners[candidates[0]]
-        ):
-            return candidates[0]
+        # Containment names a physical region inside one element's primary
+        # body, so only primary payload selector ownership competes here: a
+        # unit holding just an associated selector (e.g. a selected-only
+        # detached table caption) never buys containment. A unique primary
+        # owner wins even when it is heading-only — exact containment is the
+        # proof that the missing native content is that section's own body.
+        expected_field = _CONTAINMENT_PRIMARY_FIELD_BY_KIND.get(
+            element_kinds.get(containment_owner, ""), "text"
+        )
+        primary = [
+            candidate
+            for candidate in owner_indices_by_source.get(containment_owner, [])
+            if _unit_claims_primary_payload_field(
+                owners[candidate],
+                source_index=containment_owner,
+                expected_field=expected_field,
+            )
+        ]
+        if len(primary) == 1:
+            return primary[0]
 
     predecessor = _context_source_index(context.get("predecessor"))
     successor = _context_source_index(context.get("successor"))
@@ -2297,6 +2336,48 @@ def _native_recovery_owner_index(
             else None
         )
     return None
+
+
+def _unit_claims_primary_payload_field(
+    unit: UnitDraft,
+    *,
+    source_index: int,
+    expected_field: str,
+) -> bool:
+    """Whether one unit's payload projection claims the element's primary field."""
+
+    locators: list[Mapping[str, Any]] = []
+    if unit.payload_kind == "mixed":
+        for part in unit.payload.get("parts", ()):
+            if isinstance(part, Mapping):
+                part_locator = part.get("artifact_locator")
+                if isinstance(part_locator, Mapping):
+                    locators.append(part_locator)
+    if isinstance(unit.artifact_locator, Mapping):
+        locators.append(unit.artifact_locator)
+    for locator in locators:
+        graph = locator.get("source_projection")
+        if not isinstance(graph, Mapping):
+            continue
+        payload_projection = graph.get("payload")
+        if not isinstance(payload_projection, Mapping):
+            continue
+        sources = payload_projection.get("sources")
+        if not isinstance(sources, list):
+            continue
+        for entry in sources:
+            if not isinstance(entry, Mapping):
+                continue
+            source = entry.get("source")
+            field = entry.get("field")
+            if (
+                isinstance(source, Mapping)
+                and isinstance(field, Mapping)
+                and source.get("source_item_index") == source_index
+                and field.get("kind") == expected_field
+            ):
+                return True
+    return False
 
 
 def _native_physical_context(unit: UnitDraft) -> Mapping[str, Any]:

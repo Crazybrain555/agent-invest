@@ -1311,18 +1311,47 @@ def _validate_native_gap_units(
             and unit.payload_kind == "mixed"
             and unit.payload.get("semantic_type") == "document"
         )
+        containment_primary_owner = (
+            _native_containment_primary_owner_order(
+                gap.predecessor.source_item_index,
+                source=source,
+                state=state,
+            )
+            if gap.relation == "bounded_by_same_source"
+            and gap.predecessor is not None
+            else None
+        )
         expected_owner = (
-            predecessor_owner
-            if gap.relation in {"bounded_by_same_source", "page_suffix"}
+            containment_primary_owner
+            if containment_primary_owner is not None
             else (
                 predecessor_owner
-                if gap.relation == "between_mapped_sources"
-                and predecessor_owner is not None
-                and predecessor_owner == successor_owner
-                else None
+                if gap.relation in {"bounded_by_same_source", "page_suffix"}
+                else (
+                    predecessor_owner
+                    if gap.relation == "between_mapped_sources"
+                    and predecessor_owner is not None
+                    and predecessor_owner == successor_owner
+                    else None
+                )
             )
         )
         if (
+            containment_primary_owner is not None
+            and unit.order_index != containment_primary_owner
+        ):
+            # Exact containment with a unique primary payload owner leaves no
+            # honest-root escape: the missing native content is that owner's
+            # own body, recomputed here from selector claims and NIR element
+            # kinds, never from builder placement markers.
+            _audit_error(
+                findings,
+                "source_native_containment_owner_mismatch",
+                "a contained native gap must live inside its unique primary "
+                "payload owner",
+                unit_order=unit.order_index,
+            )
+        elif (
             expected_owner is not None
             and unit.order_index != expected_owner
             and not root_owner
@@ -1334,7 +1363,7 @@ def _validate_native_gap_units(
                 "flattened to a document-root segment",
                 unit_order=unit.order_index,
             )
-        if expected_owner is None and not root_owner:
+        elif expected_owner is None and not root_owner:
             _audit_error(
                 findings,
                 "source_native_owner_invalid",
@@ -1869,6 +1898,45 @@ def _native_expected_part_groups(
     if pending:
         groups.append(tuple(pending))
     return tuple(groups)
+
+
+_NATIVE_CONTAINMENT_PRIMARY_FIELD_BY_KIND = {
+    "table": "table",
+    "image": "image",
+    "equation": "image",
+}
+
+
+def _native_containment_primary_owner_order(
+    source_item_index: int,
+    *,
+    source: _SourceIndex,
+    state: _CoverageState,
+) -> int | None:
+    """Unique unit owning the contained element through its primary field.
+
+    Containment names a region inside one element's primary body, so only a
+    payload claim on that element's primary field (``table``/``image``/
+    ``text``) qualifies; an associated caption/note selector — e.g. a
+    selected-only detached table caption — never buys containment ownership.
+    Zero or multiple qualified owners return None: nothing is picked.
+    """
+
+    ref = source.by_source_item_index.get(source_item_index)
+    if ref is None:
+        return None
+    element = source.elements.get(ref)
+    if not isinstance(element, Mapping):
+        return None
+    expected_field = _NATIVE_CONTAINMENT_PRIMARY_FIELD_BY_KIND.get(
+        str(element.get("kind", "")), "text"
+    )
+    orders = {
+        claim.unit_order
+        for claim in state.selector_claims.get(ref, [])
+        if claim.role == "payload" and claim.kind == expected_field
+    }
+    return next(iter(orders)) if len(orders) == 1 else None
 
 
 def _native_context_matches(
@@ -2864,7 +2932,23 @@ def _validate_structure_projections(
                     carrier_id=carrier_id,
                     heading=deepest,
                 ):
-                    contributions.append(part_path[:-1])
+                    # A heading row inside its OWN section container (the
+                    # container projects that same heading as its deepest
+                    # ancestry level — e.g. a heading-only owner that absorbed
+                    # a contained native gap) contributes the full path; a
+                    # child heading row folded into its parent's container
+                    # contributes the parent path, as before.
+                    own_heading_row = any(
+                        projection.target_index == len(part_path) - 1
+                        and _heading_projection_matches_proof(
+                            projection,
+                            heading=deepest,
+                        )
+                        for projection in occurrence.headings
+                    )
+                    contributions.append(
+                        part_path if own_heading_row else part_path[:-1]
+                    )
                 else:
                     contributions.append(part_path)
             expected = contributions[0] if contributions else ()

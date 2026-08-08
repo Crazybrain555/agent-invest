@@ -2248,6 +2248,72 @@ class ConservationTests(unittest.TestCase):
         mixed_report = audit(mixed_views)
         self.assertFalse(mixed_report.ok)
 
+    def test_containment_competition_needs_the_primary_payload_field(
+        self,
+    ) -> None:
+        """A detached caption selector never buys containment ownership, and
+        two primary owners never let one be picked."""
+
+        from disclosure_anchor.application.services.unit_builder.builder import (
+            _unit_claims_primary_payload_field,
+        )
+
+        def unit_with_selector(field_kind: str) -> UnitDraft:
+            return UnitDraft(
+                payload_kind="text",
+                payload={"caption": ["（2）标题"]},
+                source_order=1,
+                heading_path=[],
+                section_path=[],
+                title=None,
+                quality_status="ok",
+                artifact_locator={
+                    "source_projection": {
+                        "version": "unit-source-projection.v4",
+                        "payload": {
+                            "kind": "text_identity_exact",
+                            "sources": [
+                                {
+                                    "source": {
+                                        "kind": "normalized_ir_element",
+                                        "ir_id": "ir_1127",
+                                        "source_item_index": 1127,
+                                        "order_index": 1127,
+                                    },
+                                    "field": {"kind": field_kind, "index": 0},
+                                }
+                            ],
+                            "target_field": "payload.caption",
+                            "transform": "identity.v1",
+                        },
+                        "structured": [],
+                        "heading_path": [],
+                        "search_targets": [],
+                        "search_atoms": [],
+                        "provenance": [],
+                    }
+                },
+            )
+
+        caption_only = unit_with_selector("table_caption")
+        body_owner = unit_with_selector("table")
+        self.assertFalse(
+            _unit_claims_primary_payload_field(
+                caption_only, source_index=1127, expected_field="table"
+            )
+        )
+        self.assertTrue(
+            _unit_claims_primary_payload_field(
+                body_owner, source_index=1127, expected_field="table"
+            )
+        )
+        # A different element index never matches either.
+        self.assertFalse(
+            _unit_claims_primary_payload_field(
+                body_owner, source_index=999, expected_field="table"
+            )
+        )
+
     def test_proved_empty_section_never_binds_its_page_furniture(self) -> None:
         elements = [
             _element(0, text="27、生物资产", text_level=1, page_no=1),
