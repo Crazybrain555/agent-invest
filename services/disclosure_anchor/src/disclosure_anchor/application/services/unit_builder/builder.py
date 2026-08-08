@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import re
 import unicodedata
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, cast
 
 from disclosure_anchor.application.contracts import content_annotations
 from disclosure_anchor.application.services.unit_builder import retrieval_routing
@@ -129,6 +129,7 @@ class BuildStats:
     owner_scope_flattened_heading_count: int = 0
     unsafe_document_title_label_count: int = 0
     non_primary_source_alternative_count: int = 0
+    page_furniture_support_count: int = 0
     # Per-source transform/exclusion ledger.  Counts explain volume; this
     # ledger makes every non-payload disposition independently auditable.
     source_dispositions: list[dict[str, Any]] = field(default_factory=list)
@@ -159,6 +160,7 @@ class BuildStats:
             "non_primary_source_alternative_count": (
                 self.non_primary_source_alternative_count
             ),
+            "page_furniture_support_count": self.page_furniture_support_count,
             "source_dispositions": list(self.source_dispositions),
         }
 
@@ -2150,6 +2152,11 @@ def build_unit_drafts_s1_s7(
         document_title=document_title,
         stats=s1.stats,
     )
+    grouped = _classify_page_furniture_supports(
+        grouped,
+        raw_elements=raw_elements,
+        stats=s1.stats,
+    )
     grouped = _classify_owner_native_alternatives(
         grouped,
         raw_elements=raw_elements,
@@ -2638,6 +2645,134 @@ def _flag_coverage_gap_owners(units: list[UnitDraft]) -> list[UnitDraft]:
             output.append(unit)
             continue
         output.append(replace(unit, quality_status="needs_review"))
+    return output
+
+
+def _payload_projection_source_indices(
+    locator: object,
+) -> frozenset[int] | None:
+    """Source item indices behind one leaf's payload projection, if closed."""
+
+    if not isinstance(locator, Mapping):
+        return None
+    graph = locator.get("source_projection")
+    if not isinstance(graph, Mapping):
+        return None
+    payload_projection = graph.get("payload")
+    if not isinstance(payload_projection, Mapping):
+        return None
+    sources = payload_projection.get("sources")
+    if not isinstance(sources, list) or not sources:
+        return None
+    indices: set[int] = set()
+    for entry in sources:
+        source = entry.get("source") if isinstance(entry, Mapping) else None
+        index = source.get("source_item_index") if isinstance(source, Mapping) else None
+        if not isinstance(index, int) or isinstance(index, bool):
+            return None
+        indices.add(index)
+    return frozenset(indices)
+
+
+def _classify_page_furniture_supports(
+    units: list[UnitDraft],
+    *,
+    raw_elements: Sequence[Mapping[str, Any]],
+    stats: BuildStats,
+) -> list[UnitDraft]:
+    """Retained page furniture never becomes active primary search content.
+
+    An unproved header/footer/page-number carrier stays a published leaf for
+    display and provenance, but its provider-typed ``page_furniture`` kind —
+    never its text — closes its search role. Real body content that merely
+    repeats a furniture string keeps its primary search edge, so no phrase
+    list can leak in here.
+    """
+
+    furniture_indices = {
+        source_item_index
+        for element in raw_elements
+        if element.get("kind") == "page_furniture"
+        and isinstance(
+            (source_item_index := element.get("source_item_index")), int
+        )
+        and not isinstance(source_item_index, bool)
+    }
+    if not furniture_indices:
+        return units
+
+    def support_part(part: object) -> object:
+        if not isinstance(part, Mapping) or part.get("kind") != "text":
+            return part
+        if part.get("representation_role") is not None:
+            return part
+        indices = _payload_projection_source_indices(part.get("artifact_locator"))
+        if indices is None or not indices <= furniture_indices:
+            return part
+        locator = cast(Mapping[str, Any], part["artifact_locator"])
+        graph = dict(cast(Mapping[str, Any], locator["source_projection"]))
+        graph["search_targets"] = []
+        support_locator = dict(locator)
+        support_locator["source_projection"] = graph
+        return {
+            **part,
+            "representation_role": "page_furniture_unproved",
+            "search_policy": "none",
+            "quality_status": "needs_review",
+            "artifact_locator": support_locator,
+        }
+
+    output: list[UnitDraft] = []
+    for unit in units:
+        if unit.payload_kind == "mixed":
+            parts = unit.payload.get("parts")
+            if not isinstance(parts, list):
+                output.append(unit)
+                continue
+            classified = [support_part(part) for part in parts]
+            changed = sum(
+                original is not result
+                for original, result in zip(parts, classified, strict=True)
+            )
+            if changed:
+                stats.page_furniture_support_count += changed
+                output.append(
+                    replace(
+                        unit,
+                        payload={**unit.payload, "parts": classified},
+                    )
+                )
+            else:
+                output.append(unit)
+            continue
+        if unit.payload_kind == "text":
+            indices = _payload_projection_source_indices(unit.artifact_locator)
+            if (
+                indices is not None
+                and indices <= furniture_indices
+                and unit.payload.get("representation_role") is None
+            ):
+                locator = dict(unit.artifact_locator or {})
+                graph = dict(
+                    cast(Mapping[str, Any], locator["source_projection"])
+                )
+                graph["search_targets"] = []
+                locator["source_projection"] = graph
+                stats.page_furniture_support_count += 1
+                output.append(
+                    replace(
+                        unit,
+                        payload={
+                            **unit.payload,
+                            "representation_role": "page_furniture_unproved",
+                            "search_policy": "none",
+                        },
+                        artifact_locator=locator,
+                        quality_status="needs_review",
+                    )
+                )
+                continue
+        output.append(unit)
     return output
 
 

@@ -97,6 +97,8 @@ _TEXT_PAYLOAD_FIELDS = frozenset(
         "list_items",
         "list_subtype",
         "notes",
+        "representation_role",
+        "search_policy",
         "text",
         "text_format",
         "visual_kind",
@@ -237,6 +239,13 @@ class _CoverageState:
     closed_search_carriers: set[str] = field(default_factory=set)
     primary_search_leaf_count: int = 0
     non_primary_source_alternative_count: int = 0
+    # One active primary search leaf per payload source ref: counts recomputed
+    # here from elements and final units, never from builder markers.
+    active_search_ref_counts: dict[str, int] = field(
+        default_factory=lambda: defaultdict(int)
+    )
+    duplicate_active_primary_count: int = 0
+    page_furniture_active_search_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -552,6 +561,8 @@ def audit_document(
             "required_carriers": len(state.required_search_carriers),
             "closed_carriers": len(state.closed_search_carriers),
             "leaf_count": state.primary_search_leaf_count,
+            "duplicate_active_primary": state.duplicate_active_primary_count,
+            "page_furniture_active": state.page_furniture_active_search_count,
             "missing_carriers": len(missing_search_carriers),
         },
         "finding_count": len(findings),
@@ -3807,6 +3818,34 @@ def _collect_projection_graph(
                     ),
                 )
         if search_values:
+            for ref in sorted(local_roles["payload"]):
+                state.active_search_ref_counts[ref] += 1
+                if state.active_search_ref_counts[ref] == 2:
+                    state.duplicate_active_primary_count += 1
+                    _projection_finding(
+                        findings,
+                        unit=unit,
+                        code="duplicate_active_primary_search_projection",
+                        message=(
+                            "one payload source ref feeds more than one "
+                            "active primary search leaf"
+                        ),
+                    )
+                element = source.elements.get(ref)
+                if (
+                    isinstance(element, Mapping)
+                    and element.get("kind") == "page_furniture"
+                ):
+                    state.page_furniture_active_search_count += 1
+                    _projection_finding(
+                        findings,
+                        unit=unit,
+                        code="page_furniture_active_search",
+                        message=(
+                            "an unproved page-furniture carrier is active "
+                            "primary search content"
+                        ),
+                    )
             state.searchable_payload_refs.update(local_roles["payload"])
     state.carrier_occurrences.append(
         _CarrierOccurrence(

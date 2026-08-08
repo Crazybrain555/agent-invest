@@ -379,7 +379,7 @@
   },
   "tests/unit/test_unit_builder.py": {
    "private_imports": [],
-   "tests": 43
+   "tests": 46
   },
   "tests/unit/test_unit_hashing.py": {
    "private_imports": [],

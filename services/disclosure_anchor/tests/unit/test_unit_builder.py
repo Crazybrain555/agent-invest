@@ -46,6 +46,8 @@ from disclosure_anchor.application.contracts.source_evidence import (
     SourceProofIdentity,
 )
 from disclosure_anchor.application.contracts.unit_source_projection import (
+    SearchTargetContractError,
+    search_text_values,
     source_value_sha256,
 )
 from disclosure_anchor.application.services.document_unit_audit import (
@@ -1986,6 +1988,202 @@ class ConservationTests(unittest.TestCase):
             [None, None],
         )
         self.assertEqual(units[1].payload["text"], "乙事实")
+
+    def test_retained_furniture_is_published_but_never_primary_search(
+        self,
+    ) -> None:
+        """Provider-typed furniture loses its search edge; same-text body keeps it."""
+
+        header = "某某股份有限公司 2024 年年度报告"
+        elements = [
+            _element(0, text="一、经营情况", text_level=1, page_no=1),
+            # Real body content that happens to repeat the header string: the
+            # disposition is decided by element kind, so this stays active.
+            _element(1, text=header, page_no=1),
+            _element(
+                2,
+                kind="page_furniture",
+                raw_kind="header",
+                text=header,
+                page_no=2,
+            ),
+            _element(3, text="经营正常。", page_no=2),
+        ]
+        headings = [_heading(1, 0, text="一、经营情况", section_end=3)]
+
+        units, report = _replay_and_audit(
+            elements,
+            headings=headings,
+            page_count=2,
+        )
+
+        self.assertTrue(report.ok, tuple(report.findings))
+        primary = report.metrics["primary_search"]
+        self.assertEqual(primary["page_furniture_active"], 0)
+        self.assertEqual(primary["duplicate_active_primary"], 0)
+
+        furniture_leaves: list[dict[str, Any]] = []
+        active_texts: list[str] = []
+        for unit in units:
+            leaves = (
+                [
+                    (str(part.get("kind")), part, part.get("artifact_locator"))
+                    for part in unit.payload.get("parts", [])
+                ]
+                if unit.payload_kind == "mixed"
+                else [(unit.payload_kind, dict(unit.payload), unit.artifact_locator)]
+            )
+            for kind, payload, locator in leaves:
+                if kind != "text":
+                    continue
+                values = search_text_values(
+                    payload_kind="text",
+                    payload=payload,
+                    artifact_locator=(
+                        locator if isinstance(locator, dict) else None
+                    ),
+                )
+                if payload.get("representation_role") == "page_furniture_unproved":
+                    furniture_leaves.append(dict(payload))
+                    self.assertEqual(payload.get("search_policy"), "none")
+                    self.assertEqual(values, ())
+                elif values:
+                    active_texts.extend(values)
+        self.assertEqual(len(furniture_leaves), 1)
+        self.assertEqual(furniture_leaves[0]["text"], header)
+        self.assertIn(header, " ".join(active_texts))
+
+    def test_furniture_support_role_cannot_declare_a_search_target(self) -> None:
+        with self.assertRaisesRegex(
+            SearchTargetContractError,
+            "cannot declare a search target",
+        ):
+            search_text_values(
+                payload_kind="text",
+                payload={
+                    "text": "页眉",
+                    "representation_role": "page_furniture_unproved",
+                    "search_policy": "none",
+                },
+                artifact_locator={
+                    "source_projection": {
+                        "version": "unit-source-projection.v4",
+                        "payload": None,
+                        "structured": [],
+                        "heading_path": [],
+                        "search_targets": ["payload.text"],
+                        "search_atoms": [],
+                        "provenance": [],
+                    }
+                },
+            )
+
+    def test_audit_rejects_active_furniture_and_duplicate_active_refs(
+        self,
+    ) -> None:
+        header = "某某股份有限公司 2024 年年度报告"
+        elements = [
+            _element(0, text="一、经营情况", text_level=1, page_no=1),
+            _element(1, text="经营正常。", page_no=1),
+            _element(
+                2,
+                kind="page_furniture",
+                raw_kind="header",
+                text=header,
+                page_no=1,
+            ),
+        ]
+        headings = [_heading(1, 0, text="一、经营情况", section_end=2)]
+        normalized_ir, source_proof, resolve_image, resolved_hashes = (
+            _audit_case_environment(
+                elements,
+                headings=headings,
+                page_count=1,
+            )
+        )
+        drafts, stats, baseline = prepare_and_audit_units(
+            normalized_ir=normalized_ir,
+            filing_type="annual_report",
+            metadata=AuditDocumentMetadata(
+                document_id=str(normalized_ir["document_id"]),
+                title=str(normalized_ir["title"]),
+                filing_type="annual_report",
+            ),
+            image_artifact_resolver=resolve_image,
+            image_hash_provider=lambda: dict(resolved_hashes),
+            source_proof=source_proof,
+        )
+        self.assertTrue(baseline.ok, tuple(baseline.findings))
+        self.assertEqual(stats.page_furniture_support_count, 1)
+
+        def audit(views: list[AuditUnitView]) -> DocumentAuditReport:
+            return audit_document(
+                normalized_ir=normalized_ir,
+                units=views,
+                metadata=AuditDocumentMetadata(
+                    document_id=str(normalized_ir["document_id"]),
+                    title=str(normalized_ir["title"]),
+                    filing_type="annual_report",
+                ),
+                source_proof=source_proof,
+                source_dispositions=stats.source_dispositions,
+                image_hashes=dict(resolved_hashes),
+            )
+
+        def view(index: int, draft: UnitDraft, payload: dict[str, Any], locator: Any) -> AuditUnitView:
+            return AuditUnitView(
+                order_index=index,
+                payload_kind=draft.payload_kind,
+                payload=payload,
+                title=draft.title,
+                heading_path=list(draft.heading_path),
+                semantic_key=draft.semantic_key,
+                semantic_keys=draft.semantic_keys,
+                quality_status=draft.quality_status,
+                applicability=draft.applicability,
+                artifact_locator=locator,
+            )
+
+        # Tamper 1: strip the furniture role and restore its search target.
+        def strip_role(payload: dict[str, Any], locator: dict[str, Any]) -> None:
+            if payload.get("representation_role") == "page_furniture_unproved":
+                payload.pop("representation_role")
+                payload.pop("search_policy")
+                locator["source_projection"]["search_targets"] = ["payload.text"]
+            for part in payload.get("parts", []):
+                if isinstance(part, dict):
+                    part_locator = part.get("artifact_locator")
+                    if isinstance(part_locator, dict):
+                        strip_role(part, part_locator)
+
+        stripped: list[AuditUnitView] = []
+        for index, draft in enumerate(drafts, start=1):
+            payload = json.loads(json.dumps(draft.payload))
+            locator = json.loads(json.dumps(draft.artifact_locator or {}))
+            strip_role(payload, locator)
+            stripped.append(view(index, draft, payload, locator))
+        tampered = audit(stripped)
+        self.assertFalse(tampered.ok)
+        self.assertIn(
+            "page_furniture_active_search",
+            {finding.code for finding in tampered.findings},
+        )
+
+        # Tamper 2: publish the section twice — the same payload source ref
+        # must not feed two active primary search leaves.
+        doubled: list[AuditUnitView] = []
+        index = 0
+        for draft in drafts:
+            for _copy in range(2 if draft.payload_kind == "mixed" else 1):
+                index += 1
+                payload = json.loads(json.dumps(draft.payload))
+                locator = json.loads(json.dumps(draft.artifact_locator or {}))
+                doubled.append(view(index, draft, payload, locator))
+        duplicated = audit(doubled)
+        self.assertIn(
+            "duplicate_active_primary_search_projection",
+            {finding.code for finding in duplicated.findings},
+        )
 
     def test_proved_empty_section_never_binds_its_page_furniture(self) -> None:
         elements = [

@@ -614,12 +614,24 @@ def _has_safe_semantic_text(value: object) -> bool:
     return False
 
 
+_NON_PRIMARY_REPRESENTATION_ROLES = frozenset(
+    {
+        # A native residual whose strict surface is already searchable in its
+        # coarse owner: kept for payload/provenance, no second search edge.
+        "unresolved_source_alternative",
+        # A retained header/footer/page-number carrier without frame proof:
+        # published for display/provenance, never primary search content.
+        "page_furniture_unproved",
+    }
+)
+
+
 def _is_non_primary_source_alternative(
     *,
     payload_kind: str,
     payload: Mapping[str, Any],
 ) -> bool:
-    """Validate and identify the one closed non-primary representation role."""
+    """Validate and identify the closed non-primary representation roles."""
 
     role = payload.get("representation_role")
     policy = payload.get("search_policy")
@@ -627,7 +639,7 @@ def _is_non_primary_source_alternative(
         return False
     if (
         payload_kind != "text"
-        or role != "unresolved_source_alternative"
+        or role not in _NON_PRIMARY_REPRESENTATION_ROLES
         or policy != "none"
     ):
         raise SearchTargetContractError(
