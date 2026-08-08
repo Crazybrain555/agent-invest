@@ -14,6 +14,7 @@ from disclosure_anchor.application.contracts import content_annotations
 from disclosure_anchor.application.services.unit_builder import retrieval_routing
 from disclosure_anchor.application.contracts.document_structure import (
     OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
+    OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM,
     validate_document_structure,
 )
 from disclosure_anchor.application.contracts.source_evidence_occurrence import (
@@ -1259,6 +1260,17 @@ def _proven_owner_scope_breaks(
     ):
         raise SourceEvidenceClosureError(
             "legacy owner-scope breaks cannot drive current publication"
+        )
+    if (
+        structure_proof.get("algorithm_version")
+        == OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM
+        and values
+    ):
+        # v13 breaks predate materialization policies; guessing a default
+        # would silently grant them v14 placement semantics.
+        raise SourceEvidenceClosureError(
+            "v13 owner-scope breaks require a reparse under the v14 "
+            "materialization contract before publication"
         )
     output: list[_OwnerScopeBreak] = []
     for value in values:

@@ -179,8 +179,12 @@
    "tests": 2
   },
   "tests/unit/test_document_unit_audit.py": {
-   "private_imports": [],
-   "tests": 25
+   "private_imports": [
+    "_ProofHeading",
+    "_ProofOwnerScopeBreak",
+    "_flattened_node_targets"
+   ],
+   "tests": 27
   },
   "tests/unit/test_download_document.py": {
    "private_imports": [],
@@ -375,7 +379,7 @@
   },
   "tests/unit/test_unit_builder.py": {
    "private_imports": [],
-   "tests": 41
+   "tests": 43
   },
   "tests/unit/test_unit_hashing.py": {
    "private_imports": [],

@@ -13,7 +13,8 @@ DOCUMENT_STRUCTURE_VERSION = "document_structure.v1"
 LEGACY_DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v10"
 PREVIOUS_DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v11"
 OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v12"
-DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v13"
+OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v13"
+DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v14"
 
 _SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 _LEGACY_ROOT_FIELDS = frozenset(
@@ -63,19 +64,21 @@ _OWNER_SCOPE_BREAK_V1_FIELDS = frozenset(
         "source_atom_orders",
     }
 )
-_OWNER_SCOPE_BREAK_FIELDS = frozenset(
+_OWNER_SCOPE_BREAK_V13_FIELDS = frozenset(
     {
         "boundary_carrier_scope",
         "boundary_source_ref",
         "current_owner_node_id",
         "eligibility_basis",
-        "flatten_subtree_root_node_id",
-        "materialization_policy",
         "relative_rank",
         "source_atom_orders",
         "target_node_id",
     }
 )
+_OWNER_SCOPE_BREAK_FIELDS = _OWNER_SCOPE_BREAK_V13_FIELDS | {
+    "flatten_subtree_root_node_id",
+    "materialization_policy",
+}
 _OWNER_SCOPE_MATERIALIZATION_POLICIES = frozenset(
     {"direct_target", "flatten_intervening_subtree"}
 )
@@ -155,6 +158,7 @@ def validate_document_structure(
         LEGACY_DOCUMENT_STRUCTURE_ALGORITHM,
         PREVIOUS_DOCUMENT_STRUCTURE_ALGORITHM,
         OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
+        OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM,
         DOCUMENT_STRUCTURE_ALGORITHM,
     }:
         _fail("structure_proof_version_unsupported", "unsupported proof version")
@@ -163,6 +167,7 @@ def validate_document_structure(
         if algorithm
         in {
             OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
+            OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM,
             DOCUMENT_STRUCTURE_ALGORITHM,
         }
         else _LEGACY_ROOT_FIELDS
@@ -331,6 +336,17 @@ def validate_document_structure(
                 heading_members=heading_members,
                 page_count=page_count,
             )
+        elif algorithm == OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM:
+            # v13 predates materialization policies: its stored shape stays
+            # readable, but its breaks never gain the v14 semantics silently.
+            boundary = _validate_owner_scope_break(
+                scope_break,
+                elements_by_index=elements_by_index,
+                headings=heading_by_id,
+                heading_members=heading_members,
+                page_count=page_count,
+                materialization_required=False,
+            )
         else:
             boundary = _validate_owner_scope_break(
                 scope_break,
@@ -338,6 +354,7 @@ def validate_document_structure(
                 headings=heading_by_id,
                 heading_members=heading_members,
                 page_count=page_count,
+                materialization_required=True,
             )
             current_scope_breaks.append(scope_break)
         if boundary <= prior_boundary:
@@ -472,8 +489,14 @@ def _validate_owner_scope_break(
     headings: Mapping[int, Mapping[str, Any]],
     heading_members: set[int],
     page_count: int,
+    materialization_required: bool,
 ) -> int:
-    if set(scope_break) != _OWNER_SCOPE_BREAK_FIELDS:
+    expected_break_fields = (
+        _OWNER_SCOPE_BREAK_FIELDS
+        if materialization_required
+        else _OWNER_SCOPE_BREAK_V13_FIELDS
+    )
+    if set(scope_break) != expected_break_fields:
         _fail(
             "structure_proof_owner_scope_break_invalid",
             "owner scope break fields are not closed",
@@ -645,16 +668,17 @@ def _validate_owner_scope_break(
             "structure_proof_owner_scope_break_invalid",
             "owner scope break target was not independently derived",
         )
-    flatten_root = scope_break.get("flatten_subtree_root_node_id")
-    if scope_break.get(
-        "materialization_policy"
-    ) not in _OWNER_SCOPE_MATERIALIZATION_POLICIES or (
-        flatten_root is not None and _integer(flatten_root, minimum=1) is None
-    ):
-        _fail(
-            "structure_proof_owner_scope_break_invalid",
-            "owner scope break materialization is not a closed policy",
-        )
+    if materialization_required:
+        flatten_root = scope_break.get("flatten_subtree_root_node_id")
+        if scope_break.get(
+            "materialization_policy"
+        ) not in _OWNER_SCOPE_MATERIALIZATION_POLICIES or (
+            flatten_root is not None and _integer(flatten_root, minimum=1) is None
+        ):
+            _fail(
+                "structure_proof_owner_scope_break_invalid",
+                "owner scope break materialization is not a closed policy",
+            )
     return boundary
 
 
@@ -814,8 +838,9 @@ def _target_occurrence_runs(
     Mirrors publication placement conservatively: proven full-text heading
     carriers, page furniture, frame members, and blank text carriers never
     open or close a run, while content owned by another section identity ends
-    the target's run.  Divergence from the real builder can only surface as a
-    loud closure failure there, never as a silent placement.
+    the target's run.  This is a hand-mirrored approximation of the S1-S3
+    lanes, not the materializer itself; the builder's own occurrence guard
+    stays the final authority when a future carrier shape drifts from it.
     """
 
     target = headings[target_node_id]
@@ -1163,6 +1188,7 @@ __all__ = [
     "DOCUMENT_STRUCTURE_VERSION",
     "LEGACY_DOCUMENT_STRUCTURE_ALGORITHM",
     "OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM",
+    "OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM",
     "DocumentStructureContractError",
     "carrier_set_sha256",
     "printed_number_rank",

@@ -8,13 +8,15 @@ section ownership.
 from __future__ import annotations
 
 import hashlib
+import json
 import unittest
 from dataclasses import replace
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from unittest.mock import patch
 
 from disclosure_anchor.application.services.unit_builder import retrieval_routing
 from disclosure_anchor.application.services.unit_builder.builder import (
+    ImageArtifactResolver,
     ResolvedImageArtifact,
     SourceEvidenceClosureError,
     UnitDraft,
@@ -31,9 +33,13 @@ from disclosure_anchor.application.contracts.document_structure import (
     DOCUMENT_STRUCTURE_VERSION,
     DocumentStructureContractError,
     OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
+    OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM,
     carrier_set_sha256,
+    validate_document_structure,
 )
+from disclosure_anchor.adapters.parsers.comparison import comparison_text
 from disclosure_anchor.application.contracts.source_evidence import (
+    MappedSourceEvent,
     RetrievalRunProof,
     SourceEvidenceProof,
     SourcePageProof,
@@ -44,7 +50,9 @@ from disclosure_anchor.application.contracts.unit_source_projection import (
 )
 from disclosure_anchor.application.services.document_unit_audit import (
     AuditDocumentMetadata,
+    AuditUnitView,
     DocumentAuditReport,
+    audit_document,
 )
 from disclosure_anchor.application.services.unit_preparation import (
     prepare_and_audit_units,
@@ -189,11 +197,82 @@ def _build(
     )
 
 
+def _audit_case_environment(
+    elements: list[dict[str, Any]],
+    *,
+    headings: list[dict[str, Any]],
+    page_count: int,
+    owner_scope_breaks: list[dict[str, Any]] | None = None,
+    source_events: Mapping[int, tuple[Any, ...]] | None = None,
+) -> tuple[
+    dict[str, Any],
+    SourceEvidenceProof,
+    ImageArtifactResolver,
+    dict[str, str],
+]:
+    normalized_ir = write_valid_ir(elements, headings=headings)
+    normalized_ir["document_id"] = str(elements[0]["document_id"])
+    normalized_ir["source_pdf_page_count"] = page_count
+    normalized_ir["structure_proof"]["source_pdf_page_count"] = page_count
+    if owner_scope_breaks is not None:
+        normalized_ir["structure_proof"]["owner_scope_breaks"] = list(
+            owner_scope_breaks
+        )
+    normalized_ir["parsed_pages"]["end_page_no"] = page_count
+    artifacts = normalized_ir["parser_artifacts"]["files"]
+    for element in elements:
+        image_path = element.get("image_path")
+        if isinstance(image_path, str) and image_path:
+            crop_bytes = f"fixture:{image_path}".encode()
+            artifacts[
+                f"evidence_image_{int(element['source_item_index']):06d}"
+            ] = {
+                "availability": "present",
+                "relpath": f"parser/audit/{image_path}",
+                "sha256": "sha256:" + hashlib.sha256(crop_bytes).hexdigest(),
+                "size_bytes": len(crop_bytes),
+            }
+    resolved_hashes: dict[str, str] = {}
+
+    def resolve_image(role: str, path: str) -> ResolvedImageArtifact:
+        content = f"fixture:{path}".encode()
+        digest = hashlib.sha256(content).hexdigest()
+        resolved_hashes[role] = digest
+        return ResolvedImageArtifact(
+            content=content,
+            artifact_role=role,
+            sha256="sha256:" + digest,
+            size_bytes=len(content),
+            media_type="image/png",
+        )
+
+    source_proof = SourceEvidenceProof(
+        identity=SourceProofIdentity(
+            source_evidence_sha256=str(artifacts["source_evidence"]["sha256"]),
+            source_pdf_sha256=str(normalized_ir["source_pdf_sha256"]),
+            page_count=page_count,
+        ),
+        pages=tuple(
+            SourcePageProof(
+                page_idx=page_idx,
+                events=tuple((source_events or {}).get(page_idx, ())),
+            )
+            for page_idx in range(page_count)
+        ),
+        retrieval_runs=(),
+        visual_bindings=(),
+        verified_visuals=(),
+    )
+    return normalized_ir, source_proof, resolve_image, resolved_hashes
+
+
 def _replay_and_audit(
     elements: list[dict[str, Any]],
     *,
     headings: list[dict[str, Any]],
     page_count: int,
+    owner_scope_breaks: list[dict[str, Any]] | None = None,
+    source_events: Mapping[int, tuple[Any, ...]] | None = None,
 ) -> tuple[list[UnitDraft], DocumentAuditReport]:
     """Replay one case through publication assembly and the independent audit.
 
@@ -203,12 +282,15 @@ def _replay_and_audit(
     maintain instead of restating it.
     """
 
-    normalized_ir = write_valid_ir(elements, headings=headings)
-    normalized_ir["document_id"] = str(elements[0]["document_id"])
-    normalized_ir["source_pdf_page_count"] = page_count
-    normalized_ir["structure_proof"]["source_pdf_page_count"] = page_count
-    normalized_ir["parsed_pages"]["end_page_no"] = page_count
-    artifacts = normalized_ir["parser_artifacts"]["files"]
+    normalized_ir, source_proof, resolve_image, resolved_hashes = (
+        _audit_case_environment(
+            elements,
+            headings=headings,
+            page_count=page_count,
+            owner_scope_breaks=owner_scope_breaks,
+            source_events=source_events,
+        )
+    )
     drafts, _stats, report = prepare_and_audit_units(
         normalized_ir=normalized_ir,
         filing_type="annual_report",
@@ -217,22 +299,9 @@ def _replay_and_audit(
             title=str(normalized_ir["title"]),
             filing_type="annual_report",
         ),
-        image_artifact_resolver=None,
-        image_hash_provider=dict,
-        source_proof=SourceEvidenceProof(
-            identity=SourceProofIdentity(
-                source_evidence_sha256=str(artifacts["source_evidence"]["sha256"]),
-                source_pdf_sha256=str(normalized_ir["source_pdf_sha256"]),
-                page_count=page_count,
-            ),
-            pages=tuple(
-                SourcePageProof(page_idx=page_idx, events=())
-                for page_idx in range(page_count)
-            ),
-            retrieval_runs=(),
-            visual_bindings=(),
-            verified_visuals=(),
-        ),
+        image_artifact_resolver=resolve_image,
+        image_hash_provider=lambda: dict(resolved_hashes),
+        source_proof=source_proof,
     )
     return drafts, report
 
@@ -865,7 +934,285 @@ class StructureProofProjectionTests(unittest.TestCase):
                 owner_scope_breaks=scope_breaks,
             )
 
-    def test_empty_visual_stays_in_mixed_section_with_sibling_evidence(self) -> None:
+    def test_v13_breaks_stay_readable_but_require_reparse(self) -> None:
+        elements, headings, scope_breaks = self._noncontiguous_target_case()
+        v13_breaks = [
+            {
+                key: value
+                for key, value in scope_breaks[0].items()
+                if key
+                not in {"materialization_policy", "flatten_subtree_root_node_id"}
+            }
+        ]
+        proof = _proof(elements, headings=headings, owner_scope_breaks=v13_breaks)
+        proof["algorithm_version"] = OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM
+
+        validated = validate_document_structure(proof, elements=elements)
+        self.assertEqual(
+            validated["algorithm_version"],
+            OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM,
+        )
+
+        v13_ir = {
+            "contract_version": "normalized_ir.v4",
+            "source_pdf_sha256": _SOURCE_PDF_SHA256,
+            "elements": elements,
+            "structure_proof": proof,
+        }
+        with self.assertRaisesRegex(
+            SourceEvidenceClosureError,
+            "v13 owner-scope breaks require a reparse",
+        ):
+            build_unit_drafts_s1_s7(
+                v13_ir,
+                filing_type="annual_report",
+                image_artifact_resolver=None,
+            )
+
+        empty_proof = _proof(elements, headings=headings)
+        empty_proof["algorithm_version"] = (
+            OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM
+        )
+        empty_ir = {
+            "contract_version": "normalized_ir.v4",
+            "source_pdf_sha256": _SOURCE_PDF_SHA256,
+            "elements": elements,
+            "structure_proof": empty_proof,
+        }
+        units, _ = build_unit_drafts_s1_s7(
+            empty_ir,
+            filing_type="annual_report",
+            image_artifact_resolver=None,
+        )
+        self.assertTrue(units)
+
+    def test_flatten_overlapping_second_break_is_rejected_by_the_contract(
+        self,
+    ) -> None:
+        elements, headings, scope_breaks = self._noncontiguous_target_case()
+        second_caption = "（二）新二级"
+        elements[6] = _element(
+            6,
+            kind="table",
+            raw_kind="table",
+            table_caption=[second_caption],
+            table_footnote=[],
+            table_html="<table><tr><td>新二级表格</td></tr></table>",
+            table={
+                "headers": [],
+                "rows": [["新二级表格"]],
+                "merged_cells": [],
+            },
+        )
+        scope_breaks.append(
+            {
+                "boundary_source_ref": {
+                    "source_item_index": 6,
+                    "source_item_sha256": elements[6]["source_item_sha256"],
+                    "page_index": 0,
+                    "field": "table_caption",
+                    "index": 0,
+                    "text_span": [0, len(second_caption)],
+                    "value_sha256": source_value_sha256(second_caption),
+                },
+                "source_atom_orders": [12],
+                "eligibility_basis": "numbered_caption_native_break",
+                "relative_rank": "peer",
+                "current_owner_node_id": 3,
+                "target_node_id": 2,
+                "boundary_carrier_scope": "selected_and_same_carrier",
+                "materialization_policy": "direct_target",
+                "flatten_subtree_root_node_id": None,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            DocumentStructureContractError,
+            "overlaps another owner scope break",
+        ):
+            _build(
+                elements,
+                headings=headings,
+                owner_scope_breaks=scope_breaks,
+            )
+
+    def test_flattened_placement_survives_the_independent_audit(self) -> None:
+        """The audit accepts the real flatten output and rejects tampering."""
+
+        elements, headings, scope_breaks = self._noncontiguous_target_case()
+        caption = "二、新同级"
+        caption_span = (0, len(comparison_text(caption)))
+        scope_breaks[0]["source_atom_orders"] = [0]
+        elements[5]["image_path"] = "images/" + "e" * 64 + ".png"
+        elements[5]["table"] = {
+            **elements[5]["table"],
+            "cells": [
+                {
+                    "row": 0,
+                    "col": 0,
+                    "rowspan": 1,
+                    "colspan": 1,
+                    "text": "新同级表格",
+                    "is_header": False,
+                }
+            ],
+            "embedded_media": [],
+        }
+        events = (
+            MappedSourceEvent(
+                atom_index=0,
+                word_order=0,
+                source_item_index=5,
+                order_state="monotonic",
+                selector_field="table_caption",
+                selector_index=0,
+                selector_char_span=caption_span,
+                selector_value_sha256=text_sha256(caption),
+                carrier_order=5,
+                carrier_bbox=(100.0, 200.0, 300.0, 220.0),
+                atom_bbox=(100.0, 200.0, 300.0, 220.0),
+                native_layout_path=(0, 30, 0, 0),
+            ),
+            MappedSourceEvent(
+                atom_index=1,
+                word_order=1,
+                source_item_index=5,
+                order_state="monotonic",
+                selector_field="table_html",
+                selector_index=None,
+                selector_char_span=(0, 5),
+                selector_value_sha256=text_sha256("新同级表格"),
+                carrier_order=5,
+                carrier_bbox=(100.0, 230.0, 900.0, 700.0),
+                atom_bbox=(100.0, 230.0, 900.0, 700.0),
+                native_layout_path=(0, 40, 0, 1),
+            ),
+        )
+
+        drafts, report = _replay_and_audit(
+            elements,
+            headings=headings,
+            page_count=1,
+            owner_scope_breaks=scope_breaks,
+            source_events={0: events},
+        )
+
+        self.assertTrue(report.ok, tuple(report.findings))
+        flattened_units = [
+            draft
+            for draft in drafts
+            if draft.heading_path == ["第十节 财务报告"]
+        ]
+        self.assertEqual(len(flattened_units), 1)
+
+        # Tampering the flattened placement must fail the independent audit:
+        # the audit re-derives the expected owner path from the proof, so a
+        # unit claiming the flattened child ancestry is a structure mismatch,
+        # and dropping one flattened-heading selector breaks payload replay.
+        normalized_ir, source_proof, resolve_image, resolved_hashes = (
+            _audit_case_environment(
+                elements,
+                headings=headings,
+                page_count=1,
+                owner_scope_breaks=scope_breaks,
+                source_events={0: events},
+            )
+        )
+        drafts, stats, baseline = prepare_and_audit_units(
+            normalized_ir=normalized_ir,
+            filing_type="annual_report",
+            metadata=AuditDocumentMetadata(
+                document_id=str(normalized_ir["document_id"]),
+                title=str(normalized_ir["title"]),
+                filing_type="annual_report",
+            ),
+            image_artifact_resolver=resolve_image,
+            image_hash_provider=lambda: dict(resolved_hashes),
+            source_proof=source_proof,
+        )
+        self.assertTrue(baseline.ok, tuple(baseline.findings))
+
+        def views(
+            mutate: Any = None,
+        ) -> list[AuditUnitView]:
+            output = []
+            for index, draft in enumerate(drafts, start=1):
+                heading_path = list(draft.heading_path)
+                payload = json.loads(json.dumps(draft.payload))
+                locator = json.loads(json.dumps(draft.artifact_locator or {}))
+                if mutate is not None and draft.heading_path == [
+                    "第十节 财务报告"
+                ]:
+                    heading_path, payload, locator = mutate(
+                        heading_path, payload, locator
+                    )
+                output.append(
+                    AuditUnitView(
+                        order_index=index,
+                        payload_kind=draft.payload_kind,
+                        payload=payload,
+                        title=draft.title,
+                        heading_path=heading_path,
+                        semantic_key=draft.semantic_key,
+                        semantic_keys=draft.semantic_keys,
+                        quality_status=draft.quality_status,
+                        applicability=draft.applicability,
+                        artifact_locator=locator,
+                    )
+                )
+            return output
+
+        def audit(unit_views: list[AuditUnitView]) -> DocumentAuditReport:
+            return audit_document(
+                normalized_ir=normalized_ir,
+                units=unit_views,
+                metadata=AuditDocumentMetadata(
+                    document_id=str(normalized_ir["document_id"]),
+                    title=str(normalized_ir["title"]),
+                    filing_type="annual_report",
+                ),
+                source_proof=source_proof,
+                source_dispositions=stats.source_dispositions,
+                image_hashes=dict(resolved_hashes),
+            )
+
+        def claim_child_path(
+            heading_path: list[str],
+            payload: dict[str, Any],
+            locator: dict[str, Any],
+        ) -> tuple[list[str], dict[str, Any], dict[str, Any]]:
+            return (
+                ["第十节 财务报告", "一、旧一级"],
+                payload,
+                locator,
+            )
+
+        tampered_path = audit(views(claim_child_path))
+        self.assertFalse(tampered_path.ok)
+        self.assertIn(
+            "structure_proof_path_mismatch",
+            {finding.code for finding in tampered_path.findings},
+        )
+
+        def drop_flattened_selector(
+            heading_path: list[str],
+            payload: dict[str, Any],
+            locator: dict[str, Any],
+        ) -> tuple[list[str], dict[str, Any], dict[str, Any]]:
+            part_locator = payload["parts"][0]["artifact_locator"]
+            sources = part_locator["source_projection"]["payload"]["sources"]
+            del sources[1]
+            return heading_path, payload, locator
+
+        tampered_payload = audit(views(drop_flattened_selector))
+        self.assertFalse(tampered_payload.ok)
+        self.assertTrue(
+            any(
+                finding.severity == "error"
+                for finding in tampered_payload.findings
+            ),
+            tuple(tampered_payload.findings),
+        )
         elements = [
             _element(0, text="第一节 经营情况", text_level=1),
             _element(1, text="主营业务收入增长。"),

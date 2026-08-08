@@ -16,6 +16,8 @@ import unicodedata
 
 from disclosure_anchor.application.contracts.document_structure import (
     DocumentStructureContractError,
+    OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
+    OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM,
     validate_document_structure,
 )
 from disclosure_anchor.application.contracts import content_annotations
@@ -2347,6 +2349,20 @@ def _build_structure_proof_index(
         for frame in proof["page_frames"]
         for source_index in frame["member_source_item_indices"]
     )
+    if proof.get("algorithm_version") in {
+        OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM,
+        OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM,
+    } and proof.get("owner_scope_breaks"):
+        # Pre-v14 breaks carry neither the current selector shape (v12) nor
+        # a materialization policy (v13); auditing them against the current
+        # placement semantics would guess. Fail with a typed terminal.
+        _audit_error(
+            findings,
+            "structure_proof_reparse_required",
+            "legacy owner-scope breaks cannot be audited under the current "
+            "materialization contract; reparse the document",
+        )
+        return _StructureProofIndex({}, frozenset(), ())
     scope_breaks_list: list[_ProofOwnerScopeBreak] = []
     for value in proof.get("owner_scope_breaks", []):
         boundary = value["boundary_source_ref"]

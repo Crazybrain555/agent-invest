@@ -503,6 +503,63 @@
       ],
       "type": "object"
     },
+    "structure_owner_scope_break_v13": {
+      "additionalProperties": false,
+      "properties": {
+        "boundary_carrier_scope": {
+          "enum": [
+            "selected_only",
+            "selected_and_same_carrier"
+          ]
+        },
+        "boundary_source_ref": {
+          "$ref": "#/$defs/structure_owner_scope_boundary_ref"
+        },
+        "current_owner_node_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "eligibility_basis": {
+          "enum": [
+            "numbered_caption_native_break",
+            "unnumbered_display_peer_break"
+          ]
+        },
+        "relative_rank": {
+          "enum": [
+            "peer",
+            "higher",
+            "unnumbered_peer"
+          ]
+        },
+        "source_atom_orders": {
+          "items": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "target_node_id": {
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "boundary_carrier_scope",
+        "boundary_source_ref",
+        "current_owner_node_id",
+        "eligibility_basis",
+        "relative_rank",
+        "source_atom_orders",
+        "target_node_id"
+      ],
+      "type": "object"
+    },
     "structure_page_frame": {
       "additionalProperties": false,
       "properties": {
@@ -617,6 +674,30 @@
             "properties": {
               "owner_scope_breaks": {
                 "items": {
+                  "$ref": "#/$defs/structure_owner_scope_break_v13"
+                }
+              }
+            },
+            "required": [
+              "owner_scope_breaks"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "algorithm_version": {
+                "const": "document-structure-evidence.v14"
+              }
+            },
+            "required": [
+              "algorithm_version"
+            ]
+          },
+          "then": {
+            "properties": {
+              "owner_scope_breaks": {
+                "items": {
                   "$ref": "#/$defs/structure_owner_scope_break"
                 }
               }
@@ -655,7 +736,8 @@
             "document-structure-evidence.v10",
             "document-structure-evidence.v11",
             "document-structure-evidence.v12",
-            "document-structure-evidence.v13"
+            "document-structure-evidence.v13",
+            "document-structure-evidence.v14"
           ]
         },
         "carrier_set_sha256": {
@@ -709,6 +791,9 @@
             "oneOf": [
               {
                 "$ref": "#/$defs/structure_owner_scope_break_v1"
+              },
+              {
+                "$ref": "#/$defs/structure_owner_scope_break_v13"
               },
               {
                 "$ref": "#/$defs/structure_owner_scope_break"
