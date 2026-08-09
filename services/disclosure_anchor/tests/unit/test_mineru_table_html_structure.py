@@ -87,6 +87,20 @@ class MinerUTableHtmlStructureTests(unittest.TestCase):
                 self.assertEqual(structure.headers, ())
                 self.assertTrue(structure.rows)
 
+    def test_visible_br_adds_one_stable_cell_text_boundary(self) -> None:
+        structure = parse_table_html_structure(
+            "<table><tr><td>甲<br>乙</td></tr></table>"
+        )
+
+        self.assertEqual(structure.cells[0].text, "甲 乙")
+
+    def test_hidden_br_adds_no_cell_text_boundary(self) -> None:
+        structure = parse_table_html_structure(
+            "<table><tr><td>甲<br hidden>乙</td></tr></table>"
+        )
+
+        self.assertEqual(structure.cells[0].text, "甲乙")
+
     def test_overlap_and_unbound_media_fail_closed(self) -> None:
         cases = (
             (

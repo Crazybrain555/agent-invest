@@ -115,6 +115,10 @@ class _TableParser(HTMLParser):
             element_visible = self._visibility.enter(tag, attr_map)
         except TableVisibilityError as exc:
             raise TableHtmlStructureError(str(exc)) from exc
+        if tag == "br":
+            if element_visible and self._cell_attrs is not None:
+                self._cell_text.append(" ")
+            return
         if tag in {"caption", "tfoot"}:
             # The published grid and the reader-visible comparison must
             # share one domain assignment. Caption/tfoot content belongs

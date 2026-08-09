@@ -156,6 +156,19 @@ class UnifiedVisibleDomainTests(unittest.TestCase):
         with self.assertRaises(TableHtmlStructureError):
             parse_table_html_structure(html)
 
+    def test_caption_blocks_the_grid_lane_instead_of_diverging(self) -> None:
+        from disclosure_anchor.application.contracts.table_html_structure import (
+            TableHtmlStructureError,
+            parse_table_html_structure,
+        )
+
+        html = (
+            "<table><caption>主表</caption>"
+            "<tr><td>a</td></tr></table>"
+        )
+        with self.assertRaises(TableHtmlStructureError):
+            parse_table_html_structure(html)
+
     def test_end_to_end_script_injection_is_domain_consistent(self) -> None:
         # raw content → reconciler equality AND published grid must agree:
         # the invisible injection neither breaks the match nor reaches the
@@ -242,6 +255,69 @@ class UnifiedVisibleDomainTests(unittest.TestCase):
             {finding.code for finding in report.findings},
         )
 
+    def test_end_to_end_br_joined_grid_is_rejected(self) -> None:
+        from tests.unit.test_unit_builder import (
+            _audit_case_environment,
+            _element,
+            _heading,
+        )
+        from disclosure_anchor.application.services.document_unit_audit import (
+            AuditDocumentMetadata,
+            audit_document,
+        )
+
+        elements = [
+            _element(0, text="一、章节", text_level=1),
+            _element(
+                1,
+                kind="table",
+                raw_kind="table",
+                table_caption=[],
+                table_footnote=[],
+                table_html=(
+                    "<table><tr><td>甲<br>乙</td></tr></table>"
+                ),
+                image_path="images/table.png",
+                table={
+                    "headers": [],
+                    "rows": [["甲乙"]],
+                    "cells": [
+                        {
+                            "row": 0,
+                            "col": 0,
+                            "rowspan": 1,
+                            "colspan": 1,
+                            "text": "甲乙",
+                            "is_header": False,
+                        }
+                    ],
+                    "embedded_media": [],
+                },
+            ),
+        ]
+        headings = [_heading(1, 0, text="一、章节", section_end=1)]
+        normalized_ir, source_proof, _resolve, _hashes, comparison = (
+            _audit_case_environment(elements, headings=headings, page_count=1)
+        )
+
+        report = audit_document(
+            normalized_ir=normalized_ir,
+            units=(),
+            metadata=AuditDocumentMetadata(
+                document_id=str(normalized_ir["document_id"]),
+                title=None,
+                filing_type="annual_report",
+            ),
+            source_proof=source_proof,
+            image_hashes={},
+            table_comparison=comparison,
+        )
+
+        self.assertIn(
+            "table_projection_preservation_mismatch",
+            {finding.code for finding in report.findings},
+        )
+
 
 class MarkupInvarianceTests(unittest.TestCase):
     """Markup, styling, and hidden attributes never affect equality."""
@@ -250,7 +326,7 @@ class MarkupInvarianceTests(unittest.TestCase):
         base = _sha(_BASE)
         variants = {
             "attr_order_and_noise": (
-                '<table class="x" data-k="1"><tr><th style="color:red">项目'
+                '<table class="x" data-k="1"><tr><th style="font-weight:bold">项目'
                 '</th><th id="h2">金额</th></tr>'
                 '<tr><td>营业收入</td><td>1,234.56</td></tr>'
                 '<tr><td><img alt="册" title="t" src="other/b.jpg"/>附图'
@@ -378,6 +454,24 @@ class VisibleFactRejectionTests(unittest.TestCase):
             with self.subTest(label=label):
                 with self.assertRaises(TableProjectionError):
                     project_table_html(html)
+
+    def test_unparsed_color_styles_block_both_lanes(self) -> None:
+        from disclosure_anchor.application.contracts.table_html_structure import (
+            TableHtmlStructureError,
+            parse_table_html_structure,
+        )
+
+        for color in ("transparent", "rgba(0,0,0,0)"):
+            html = (
+                f'<table><tr><td style="color:{color}">甲</td>'
+                "</tr></table>"
+            )
+            with self.subTest(color=color, lane="projection"):
+                with self.assertRaises(TableProjectionError):
+                    project_table_html(html)
+            with self.subTest(color=color, lane="grid"):
+                with self.assertRaises(TableHtmlStructureError):
+                    parse_table_html_structure(html)
 
 
 class DomainPreservationTests(unittest.TestCase):

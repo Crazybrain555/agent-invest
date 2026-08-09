@@ -255,7 +255,7 @@
   },
   "tests/unit/test_mineru_table_html_structure.py": {
    "private_imports": [],
-   "tests": 5
+   "tests": 7
   },
   "tests/unit/test_mineru_table_reconciler.py": {
    "private_imports": [],
@@ -379,7 +379,7 @@
   },
   "tests/unit/test_table_projection_comparison.py": {
    "private_imports": [],
-   "tests": 25
+   "tests": 28
   },
   "tests/unit/test_track_companies.py": {
    "private_imports": [],

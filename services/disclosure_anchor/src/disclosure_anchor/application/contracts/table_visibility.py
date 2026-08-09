@@ -38,8 +38,6 @@ _STRUCTURAL_TAGS = frozenset(
 # content-visibility, opacity, clip, positioning, sizing — fails closed.
 _ALLOWED_STYLE_PROPERTIES = frozenset(
     {
-        "background",
-        "background-color",
         "border",
         "border-bottom",
         "border-collapse",
@@ -49,7 +47,6 @@ _ALLOWED_STYLE_PROPERTIES = frozenset(
         "border-style",
         "border-top",
         "border-width",
-        "color",
         "font-family",
         "font-style",
         "font-weight",
