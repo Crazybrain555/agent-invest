@@ -1,0 +1,589 @@
+{
+  "$id": "https://agent-invest.local/contracts/simple95-run-receipt.v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "canonical_units": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "additionalProperties": false,
+            "properties": {
+              "content_hash": {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "payload": {
+                "type": "object"
+              },
+              "payload_kind": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "payload_kind",
+              "payload",
+              "content_hash"
+            ],
+            "type": "object"
+          },
+          "query": {
+            "additionalProperties": false,
+            "properties": {
+              "projection": {
+                "additionalProperties": false,
+                "properties": {
+                  "applicability": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "heading_path": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "mixed_part_annotations": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "parts": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "applicability": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "heading_path": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "local_heading": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "quality_status": {
+                              "type": "string"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "semantic_type": {}
+                    },
+                    "required": [
+                      "semantic_type",
+                      "parts"
+                    ],
+                    "type": "object"
+                  },
+                  "payload_kind": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "quality_status": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "search_plan": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "atomic_targets": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "carrier": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "target_fields": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "transform": {
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "carrier",
+                            "target_fields",
+                            "transform"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "grouped_atoms": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "carrier": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "target_fields": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "transform": {
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "carrier",
+                            "target_fields",
+                            "transform"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "version": {
+                        "const": "unit-search-plan.v1"
+                      }
+                    },
+                    "required": [
+                      "version",
+                      "atomic_targets",
+                      "grouped_atoms"
+                    ],
+                    "type": "object"
+                  },
+                  "semantic_key": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "semantic_keys": {
+                    "oneOf": [
+                      {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "title": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "version": {
+                    "const": "unit-query-projection.v2"
+                  }
+                },
+                "required": [
+                  "payload_kind",
+                  "title",
+                  "heading_path",
+                  "semantic_key",
+                  "semantic_keys",
+                  "quality_status",
+                  "applicability",
+                  "version",
+                  "search_plan"
+                ],
+                "type": "object"
+              },
+              "query_projection_hash": {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "projection",
+              "query_projection_hash"
+            ],
+            "type": "object"
+          },
+          "search_atoms": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "structure": {
+            "additionalProperties": false,
+            "properties": {
+              "content_hash": {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "heading_path": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "native_order_anchor": {
+                "oneOf": [
+                  {
+                    "items": false,
+                    "maxItems": 3,
+                    "minItems": 3,
+                    "prefixItems": [
+                      {
+                        "minimum": -1,
+                        "type": "integer"
+                      },
+                      {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      {
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    ],
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "order_index": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "owner": {
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "document_root",
+                      "heading_section"
+                    ]
+                  },
+                  "section_path": {
+                    "items": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "section_path"
+                ],
+                "type": "object"
+              },
+              "payload_kind": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "source_order": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "source_order_phase": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "structure_hash": {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "order_index",
+              "content_hash",
+              "payload_kind",
+              "heading_path",
+              "owner",
+              "source_order",
+              "source_order_phase",
+              "native_order_anchor",
+              "structure_hash"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "content",
+          "structure",
+          "query",
+          "search_atoms"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "code_commit_sha": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "content_multiset_root": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "corpus_manifest_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "document_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "findings": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "severity": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unit_order": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "code",
+          "severity",
+          "message",
+          "source_ref",
+          "unit_order"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "findings_root": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "hierarchy_status": {
+      "const": "flattened_unresolved"
+    },
+    "normalized_ir_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "parse_receipt_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "parser_target_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "processing_run_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "provider_artifact_hashes": {
+      "additionalProperties": {
+        "additionalProperties": false,
+        "properties": {
+          "sha256": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "size_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sha256",
+          "size_bytes"
+        ],
+        "type": "object"
+      },
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]*$"
+      },
+      "required": [
+        "content_list",
+        "content_list_v2",
+        "middle",
+        "model",
+        "parse_receipt",
+        "pdf_structure",
+        "source_evidence",
+        "visual_semantics"
+      ],
+      "type": "object"
+    },
+    "provider_document_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "publication_gate": {
+      "additionalProperties": false,
+      "properties": {
+        "capability": {
+          "const": "source-evidence-bounded-content-conservation"
+        },
+        "checks": {
+          "additionalProperties": false,
+          "properties": {
+            "audit_ok": {
+              "type": "boolean"
+            },
+            "coverage_closed": {
+              "type": "boolean"
+            },
+            "error_count_zero": {
+              "type": "boolean"
+            },
+            "metric_shape_closed": {
+              "type": "boolean"
+            },
+            "primary_search_closed": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "metric_shape_closed",
+            "audit_ok",
+            "error_count_zero",
+            "coverage_closed",
+            "primary_search_closed"
+          ],
+          "type": "object"
+        },
+        "contract_version": {
+          "const": "publication-gate.v1"
+        },
+        "decision": {
+          "enum": [
+            "publish",
+            "block"
+          ]
+        },
+        "diagnostics": {
+          "additionalProperties": false,
+          "properties": {
+            "coverage_uncovered": {
+              "minimum": -1,
+              "type": "integer"
+            },
+            "error_count": {
+              "minimum": -1,
+              "type": "integer"
+            },
+            "primary_search_missing": {
+              "minimum": -1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "error_count",
+            "coverage_uncovered",
+            "primary_search_missing"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "contract_version",
+        "capability",
+        "decision",
+        "checks",
+        "diagnostics"
+      ],
+      "type": "object"
+    },
+    "query_projection_ordered_root": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "receipt_contract_version": {
+      "const": "simple95-run-receipt.v1"
+    },
+    "retrieval_rules_version": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "search_atoms_root": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "source_evidence_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "source_pdf_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "structure_ordered_root": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "unit_count": {
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "canonical_units",
+    "code_commit_sha",
+    "content_multiset_root",
+    "corpus_manifest_sha256",
+    "document_id",
+    "findings",
+    "findings_root",
+    "hierarchy_status",
+    "normalized_ir_sha256",
+    "parse_receipt_sha256",
+    "parser_target_sha256",
+    "processing_run_id",
+    "provider_artifact_hashes",
+    "provider_document_id",
+    "publication_gate",
+    "query_projection_ordered_root",
+    "receipt_contract_version",
+    "retrieval_rules_version",
+    "search_atoms_root",
+    "source_evidence_sha256",
+    "source_pdf_sha256",
+    "structure_ordered_root",
+    "unit_count"
+  ],
+  "title": "simple95-run-receipt.v1",
+  "type": "object"
+}

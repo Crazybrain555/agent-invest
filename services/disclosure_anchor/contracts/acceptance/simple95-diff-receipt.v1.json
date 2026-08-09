@@ -1,0 +1,375 @@
+{
+  "$id": "https://agent-invest.local/contracts/simple95-diff-receipt.v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "after_processing_run_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "after_receipt_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "before_processing_run_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "before_receipt_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "changed_fields": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "additionalProperties": false,
+          "properties": {
+            "content_hash_multiset": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "content_multiset_root": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "unit_count": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "unit_count",
+            "content_multiset_root",
+            "content_hash_multiset"
+          ],
+          "type": "object"
+        },
+        "publication_outcome": {
+          "additionalProperties": false,
+          "properties": {
+            "checks": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "decision": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "diagnostics": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "findings": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "findings_root": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "publication_gate": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "publication_gate",
+            "decision",
+            "checks",
+            "diagnostics",
+            "findings_root",
+            "findings"
+          ],
+          "type": "object"
+        },
+        "query_search_plan": {
+          "additionalProperties": false,
+          "properties": {
+            "query_projection": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "query_projection_ordered_root": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "retrieval_rules_version": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "search_atoms": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "search_atoms_root": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "search_plan": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query_projection_ordered_root",
+            "search_atoms_root",
+            "retrieval_rules_version",
+            "query_projection",
+            "search_plan",
+            "search_atoms"
+          ],
+          "type": "object"
+        },
+        "run_binding": {
+          "additionalProperties": false,
+          "properties": {
+            "code_commit_sha": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "corpus_manifest_sha256": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "normalized_ir_sha256": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "parse_receipt_sha256": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "parser_target_sha256": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "processing_run_id": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "provider_artifact_hashes": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "source_evidence_sha256": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "source_pdf_sha256": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "code_commit_sha",
+            "corpus_manifest_sha256",
+            "normalized_ir_sha256",
+            "parse_receipt_sha256",
+            "parser_target_sha256",
+            "processing_run_id",
+            "provider_artifact_hashes",
+            "source_evidence_sha256",
+            "source_pdf_sha256"
+          ],
+          "type": "object"
+        },
+        "structure_order_owner": {
+          "additionalProperties": false,
+          "properties": {
+            "content_hash": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "content_occurrence_owner_order_pairing": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "heading_path": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "hierarchy_status": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "native_order_anchor": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "order_index": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "owner": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "payload_kind": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "source_order": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "source_order_phase": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "structure_hash": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "structure_ordered_root": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "structure_ordered_root",
+            "hierarchy_status",
+            "content_occurrence_owner_order_pairing",
+            "content_hash",
+            "payload_kind",
+            "heading_path",
+            "owner",
+            "order_index",
+            "source_order",
+            "source_order_phase",
+            "native_order_anchor",
+            "structure_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "content",
+        "structure_order_owner",
+        "query_search_plan",
+        "publication_outcome",
+        "run_binding"
+      ],
+      "type": "object"
+    },
+    "content_delta": {
+      "type": "boolean"
+    },
+    "document_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "provider_document_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "publication_outcome_delta": {
+      "type": "boolean"
+    },
+    "query_search_plan_delta": {
+      "type": "boolean"
+    },
+    "receipt_contract_version": {
+      "const": "simple95-diff-receipt.v1"
+    },
+    "root_explanations": {
+      "additionalProperties": false,
+      "properties": {
+        "content_multiset_root": {
+          "items": {
+            "enum": [
+              "content_delta",
+              "structure_order_owner_delta",
+              "query_search_plan_delta",
+              "publication_outcome_delta"
+            ]
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "findings_root": {
+          "items": {
+            "enum": [
+              "content_delta",
+              "structure_order_owner_delta",
+              "query_search_plan_delta",
+              "publication_outcome_delta"
+            ]
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "query_projection_ordered_root": {
+          "items": {
+            "enum": [
+              "content_delta",
+              "structure_order_owner_delta",
+              "query_search_plan_delta",
+              "publication_outcome_delta"
+            ]
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "search_atoms_root": {
+          "items": {
+            "enum": [
+              "content_delta",
+              "structure_order_owner_delta",
+              "query_search_plan_delta",
+              "publication_outcome_delta"
+            ]
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "structure_ordered_root": {
+          "items": {
+            "enum": [
+              "content_delta",
+              "structure_order_owner_delta",
+              "query_search_plan_delta",
+              "publication_outcome_delta"
+            ]
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "type": "object"
+    },
+    "structure_order_owner_delta": {
+      "type": "boolean"
+    },
+    "unexplained_deltas": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 0,
+      "type": "array"
+    }
+  },
+  "required": [
+    "receipt_contract_version",
+    "document_id",
+    "provider_document_id",
+    "before_processing_run_id",
+    "after_processing_run_id",
+    "before_receipt_sha256",
+    "after_receipt_sha256",
+    "content_delta",
+    "structure_order_owner_delta",
+    "query_search_plan_delta",
+    "publication_outcome_delta",
+    "changed_fields",
+    "root_explanations",
+    "unexplained_deltas"
+  ],
+  "title": "simple95-diff-receipt.v1",
+  "type": "object"
+}

@@ -64,10 +64,12 @@ from disclosure_anchor.application.ports.source_evidence import (
 )
 from disclosure_anchor.application.services.document_unit_audit import (
     AuditDocumentMetadata,
+    DocumentAuditReport,
 )
 from disclosure_anchor.application.services.unit_builder import rules
 from disclosure_anchor.application.services.unit_builder.builder import (
     ResolvedImageArtifact,
+    UnitDraft,
 )
 from disclosure_anchor.application.services.unit_preparation import (
     prepare_and_audit_units,
@@ -174,6 +176,26 @@ class ManifestEntry:
         }
 
 
+@dataclass(frozen=True)
+class ReceiptAuditObservation:
+    """Successful audit composition exposed to read-only receipt tooling.
+
+    The legacy corpus reports keep using :func:`_audit_one` and therefore do
+    not serialize any of these values.  A receipt observer gets the exact
+    drafts/report from that same composition instead of rebuilding units via
+    a second authority.
+    """
+
+    entry: ManifestEntry
+    data_root: Path
+    frozen_normalized_ir_bytes: bytes
+    frozen_normalized_ir: dict[str, Any]
+    replayed_normalized_ir: dict[str, Any]
+    drafts: tuple[UnitDraft, ...]
+    report: DocumentAuditReport
+    audit_result: dict[str, Any]
+
+
 def load_manifest(path: Path) -> tuple[list[ManifestEntry], str]:
     raw = path.read_bytes()
     manifest_hash = "sha256:" + hashlib.sha256(raw).hexdigest()
@@ -229,7 +251,11 @@ def _exception_failure_family(exc: BaseException) -> str:
     return family or "audit_execution_error"
 
 
-def _audit_one(argument: tuple[ManifestEntry, str, bool]) -> dict[str, Any]:
+def _audit_one(
+    argument: tuple[ManifestEntry, str, bool],
+    *,
+    _receipt_observations: list[ReceiptAuditObservation] | None = None,
+) -> dict[str, Any]:
     entry, data_root_text, source_replay = argument
     data_root = Path(data_root_text).resolve()
     base = data_root / "data"
@@ -300,7 +326,7 @@ def _audit_one(argument: tuple[ManifestEntry, str, bool]) -> dict[str, Any]:
             normalized_ir,
             data_root=data_root,
         )
-        _drafts, stats, report = prepare_and_audit_units(
+        drafts, stats, report = prepare_and_audit_units(
             normalized_ir=normalized_ir,
             table_comparison=_table_comparison_inputs(
                 normalized_ir,
@@ -318,7 +344,7 @@ def _audit_one(argument: tuple[ManifestEntry, str, bool]) -> dict[str, Any]:
             image_artifact_resolver=image_resolver,
             image_hash_provider=lambda: image_hashes,
         )
-        return {
+        result = {
             **entry.as_dict(),
             "ok": report.ok,
             "failure_family": None,
@@ -328,6 +354,20 @@ def _audit_one(argument: tuple[ManifestEntry, str, bool]) -> dict[str, Any]:
             "source_observations": observations,
             "findings": [item.as_dict() for item in report.findings],
         }
+        if _receipt_observations is not None:
+            _receipt_observations.append(
+                ReceiptAuditObservation(
+                    entry=entry,
+                    data_root=data_root,
+                    frozen_normalized_ir_bytes=raw,
+                    frozen_normalized_ir=frozen_ir,
+                    replayed_normalized_ir=normalized_ir,
+                    drafts=tuple(drafts),
+                    report=report,
+                    audit_result=result,
+                )
+            )
+        return result
     except Exception as exc:
         failure_family = _exception_failure_family(exc)
         return {
@@ -348,6 +388,29 @@ def _audit_one(argument: tuple[ManifestEntry, str, bool]) -> dict[str, Any]:
                 }
             ],
         }
+
+
+def audit_document_for_receipt(
+    argument: tuple[ManifestEntry, str, bool],
+) -> ReceiptAuditObservation:
+    """Return the exact successful audit composition or fail closed.
+
+    Publication blocks caused by audit findings remain valid observations;
+    execution/contract failures do not.  The latter have no trustworthy draft
+    set from which a run receipt could be constructed.
+    """
+
+    observations: list[ReceiptAuditObservation] = []
+    result = _audit_one(argument, _receipt_observations=observations)
+    if not observations:
+        finding: Any = next(iter(result.get("findings") or ()), {})
+        message = finding.get("message") if isinstance(finding, Mapping) else None
+        raise ValueError(
+            "receipt audit composition failed: "
+            f"{result.get('failure_family') or 'audit_execution_error'}: "
+            f"{message or 'no trustworthy unit drafts'}"
+        )
+    return observations[0]
 
 
 def _replay_source_ir(

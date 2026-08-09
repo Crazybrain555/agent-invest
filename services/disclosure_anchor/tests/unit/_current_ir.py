@@ -84,10 +84,23 @@ def write_text_ir_bundle(
     source_pdf: str = "raw.pdf",
     document_title: str = "公告",
     parser_target: ParserTargetIdentity | None = None,
+    source_pdf_bytes: bytes | None = None,
 ) -> dict[str, Any]:
     """Write exact content/source-evidence artifacts and a matching v4 IR."""
 
     heading_levels = dict(heading_levels or {0: 1})
+    source_pdf_sha256 = (
+        _sha256(source_pdf_bytes)
+        if source_pdf_bytes is not None
+        else SOURCE_PDF_SHA256
+    )
+    if source_pdf_bytes is not None:
+        source_pdf_path = Path(source_pdf)
+        if source_pdf_path.is_absolute() or ".." in source_pdf_path.parts:
+            raise ValueError("source_pdf must be a safe relative path")
+        resolved_source_pdf = root / source_pdf_path
+        resolved_source_pdf.parent.mkdir(parents=True, exist_ok=True)
+        resolved_source_pdf.write_bytes(source_pdf_bytes)
     native_positions = (
         {
             text: position
@@ -180,17 +193,19 @@ def write_text_ir_bundle(
             texts[index] for index in heading_levels if index < len(texts)
         ),
     )
-    native_structure = _untagged_native_structure()
+    native_structure = _untagged_native_structure(
+        source_pdf_sha256=source_pdf_sha256
+    )
     proof = build_mineru_structure_proof(
         native=validate_pdf_structure_artifact(
             native_structure,
-            expected_source_pdf_sha256=SOURCE_PDF_SHA256,
+            expected_source_pdf_sha256=source_pdf_sha256,
             expected_page_count=1,
         ),
         content_list=content_list,
         content_list_v2=content_list_v2,
         text_projections=text_projections,
-        source_pdf_sha256=SOURCE_PDF_SHA256,
+        source_pdf_sha256=source_pdf_sha256,
         source_pages=(native_page,),
         carrier_source_support=test_carrier_source_support(
             content_list,
@@ -219,7 +234,7 @@ def write_text_ir_bundle(
             "title": document_title,
         },
         structure_proof=proof,
-        source_pdf_sha256=SOURCE_PDF_SHA256,
+        source_pdf_sha256=source_pdf_sha256,
         source_pdf_page_count=1,
         start_page=target.start_page,
         end_page=target.end_page,
@@ -284,7 +299,7 @@ def write_text_ir_bundle(
         generated_image_path.parent.mkdir(parents=True, exist_ok=True)
         generated_image_path.write_bytes(generated_image_payload)
     ledger = reconcile_source_evidence(
-        source_pdf_sha256=SOURCE_PDF_SHA256,
+        source_pdf_sha256=source_pdf_sha256,
         source_pdf_page_count=1,
         source_extractor=ExtractorIdentity("fixture-native", "1"),
         source_pages=(native_page,),
@@ -340,7 +355,7 @@ def write_text_ir_bundle(
         else ()
     )
     visual_semantics = VisualSemanticClosure(
-        source_pdf_sha256=SOURCE_PDF_SHA256,
+        source_pdf_sha256=source_pdf_sha256,
         source_pdf_page_count=1,
         source_evidence_sha256=_sha256(source_evidence_bytes),
         content_list_sha256=content_sha256,
@@ -391,7 +406,7 @@ def write_text_ir_bundle(
             artifact_root / "parse_receipt.json",
             _json_bytes(
                 build_parse_receipt(
-                    source_pdf_sha256=SOURCE_PDF_SHA256,
+                    source_pdf_sha256=source_pdf_sha256,
                     parser_target_payload=normalized_ir["parser"],
                     server_url="http://fixture",
                     http_request_concurrency=None,
@@ -526,10 +541,12 @@ def _native_page(
     )
 
 
-def _untagged_native_structure() -> dict[str, Any]:
+def _untagged_native_structure(
+    *, source_pdf_sha256: str = SOURCE_PDF_SHA256
+) -> dict[str, Any]:
     return {
         "contract_version": NATIVE_PDF_STRUCTURE_VERSION,
-        "source_pdf_sha256": SOURCE_PDF_SHA256,
+        "source_pdf_sha256": source_pdf_sha256,
         "source_pdf_page_count": 1,
         "native_status": "untagged",
         "pdfium_tagged": False,
