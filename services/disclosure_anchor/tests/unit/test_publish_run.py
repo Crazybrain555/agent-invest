@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 from pathlib import Path
 import tempfile
@@ -15,6 +16,9 @@ from disclosure_anchor.application.contracts.document_structure import (
     DOCUMENT_STRUCTURE_ALGORITHM,
     DOCUMENT_STRUCTURE_VERSION,
     carrier_set_sha256,
+)
+from disclosure_anchor.application.contracts.unit_source_projection import (
+    materialize_search_projection,
 )
 from disclosure_anchor.application.use_cases.publish_run import (
     TERMINAL_PUBLICATION_ERROR_CODES,
@@ -35,6 +39,85 @@ from tests.unit._current_ir import write_text_ir_bundle
 from tests.unit._fakes import FakeUnitOfWork
 
 
+def _search_locator(
+    *,
+    payload_kind: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    targets = (
+        ["payload.text"]
+        if payload_kind == "text"
+        else [
+            "payload.caption",
+            "payload.headers",
+            "payload.rows",
+            "payload.notes",
+        ]
+        if payload_kind == "table"
+        else []
+    )
+    target_field = (
+        "payload.text"
+        if payload_kind == "text"
+        else "payload"
+        if payload_kind == "table"
+        else "payload.parts"
+    )
+    return {
+        "source_projection": {
+            "version": "unit-source-projection.v4",
+            "payload": {
+                "kind": (
+                    "text_identity"
+                    if payload_kind == "text"
+                    else "table_identity"
+                    if payload_kind == "table"
+                    else "container"
+                ),
+                "sources": [],
+                "target_field": target_field,
+                "transform": "clean_text.v1",
+            },
+            "heading_path": [],
+            "structured": [],
+            "provenance": [],
+            "search_targets": targets,
+            "search_atoms": [],
+            "physical_context": None,
+        }
+    }
+
+
+def _materialized_payload(
+    *,
+    payload_kind: str,
+    payload: dict[str, object],
+    artifact_locator: dict[str, object] | None = None,
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    resolved_payload = copy.deepcopy(payload)
+    if payload_kind == "mixed":
+        parts = resolved_payload.get("parts")
+        assert isinstance(parts, list)
+        for part in parts:
+            assert isinstance(part, dict)
+            part_kind = str(part.get("kind"))
+            part["artifact_locator"] = _search_locator(
+                payload_kind=part_kind,
+                payload=part,
+            )
+    locator = copy.deepcopy(
+        artifact_locator
+        if artifact_locator is not None
+        else _search_locator(payload_kind=payload_kind, payload=resolved_payload)
+    )
+    materialized = materialize_search_projection(
+        payload_kind=payload_kind,
+        payload=resolved_payload,
+        artifact_locator=locator,
+    )
+    return resolved_payload, locator, materialized.plan
+
+
 def _unit(
     asset_id: str,
     run_id: str,
@@ -51,8 +134,13 @@ def _unit(
     applicability: str | None = None,
     payload_kind: str = "text",
     payload: dict[str, object] | None = None,
+    artifact_locator: dict[str, object] | None = None,
 ) -> e.DocumentUnit:
-    resolved_payload = payload or {"text": asset_id}
+    resolved_payload, resolved_locator, search_plan = _materialized_payload(
+        payload_kind=payload_kind,
+        payload=payload or {"text": asset_id},
+        artifact_locator=artifact_locator,
+    )
     resolved_heading_path = heading_path or ["第一节"]
     resolved_semantic_keys = (
         [semantic_key]
@@ -68,6 +156,7 @@ def _unit(
         semantic_keys=resolved_semantic_keys,
         quality_status=quality_status,
         order_index=order_index,
+        search_plan=search_plan,
         applicability=applicability,
     )
     return e.DocumentUnit(
@@ -86,6 +175,7 @@ def _unit(
         query_projection_hash=(query_projection_hash or hashes.query_projection_hash),
         structure_hash=structure_hash or hashes.structure_hash,
         applicability=applicability,
+        artifact_locator=resolved_locator,
     )
 
 
@@ -533,8 +623,24 @@ class PublishRunTests(unittest.TestCase):
             "quality_status": "ok",
             "order_index": 1,
         }
-        old_hash = compute_unit_hashes(payload=old_payload, **common)
-        new_hash = compute_unit_hashes(payload=new_payload, **common)
+        resolved_old, _old_locator, old_plan = _materialized_payload(
+            payload_kind="mixed",
+            payload=old_payload,
+        )
+        resolved_new, _new_locator, new_plan = _materialized_payload(
+            payload_kind="mixed",
+            payload=new_payload,
+        )
+        old_hash = compute_unit_hashes(
+            payload=resolved_old,
+            search_plan=old_plan,
+            **common,
+        )
+        new_hash = compute_unit_hashes(
+            payload=resolved_new,
+            search_plan=new_plan,
+            **common,
+        )
         old = _unit(
             "du_old",
             "run_old",
@@ -584,6 +690,65 @@ class PublishRunTests(unittest.TestCase):
         self.assertEqual(diff.created, [])
         self.assertEqual(diff.removed, [])
         self.assertEqual(diff.projection_changed, [])
+
+    def test_search_plan_change_is_an_explicit_projection_change(self) -> None:
+        payload = {"text": "甲\n乙"}
+        ordinary = _search_locator(payload_kind="text", payload=payload)
+        safe = copy.deepcopy(ordinary)
+        safe["source_projection"]["payload"]["transform"] = "safe_text.v1"
+        old = _unit(
+            "du_old",
+            "run_old",
+            payload=payload,
+            artifact_locator=ordinary,
+        )
+        new = _unit(
+            "du_new",
+            "run_new",
+            payload=payload,
+            artifact_locator=safe,
+        )
+
+        diff = diff_units(old_units=[old], new_units=[new])
+
+        self.assertEqual(diff.created, [])
+        self.assertEqual(diff.removed, [])
+        self.assertEqual(diff.projection_changed[0][2], ["search_plan"])
+
+    def test_uncomparable_historical_plan_stops_without_mutation(self) -> None:
+        uow = _uow_with_document()
+        document = uow.documents.get("doc_1")
+        document.current_processing_run_id = "run_old"
+        document.status = "published"
+        uow.processing_runs.add(_run("run_old", active=True))
+        uow.processing_runs.add(_run("run_new"))
+        old = _unit("du_old", "run_old", payload={"text": "same"})
+        assert old.artifact_locator is not None
+        old.artifact_locator["source_projection"]["version"] = (
+            "unit-source-projection.v3"
+        )
+        uow.document_units.add(old)
+        uow.document_units.add(
+            _unit("du_new", "run_new", payload={"text": "same"})
+        )
+        _sync_run_hashes(uow, "run_new")
+
+        with self.assertRaises(PublishRunError) as ctx:
+            _publisher(uow).execute(
+                PublishRunCommand(processing_run_id="run_new")
+            )
+
+        self.assertEqual(
+            ctx.exception.error["error_code"],
+            "HISTORICAL_QUERY_PROJECTION_UNCOMPARABLE",
+        )
+        self.assertEqual(document.current_processing_run_id, "run_old")
+        self.assertTrue(uow.processing_runs.get("run_old").is_active)
+        candidate = uow.processing_runs.get("run_new")
+        self.assertFalse(candidate.is_active)
+        self.assertEqual(candidate.unit_build_status, "succeeded")
+        self.assertIsNone(candidate.unit_build_error)
+        self.assertEqual(uow.outbox.all(), [])
 
     def test_diff_uses_canonical_payload_instead_of_stored_content_hash(self) -> None:
         same_stored = "sha256:" + "a" * 64
@@ -706,6 +871,11 @@ class PublishRunTests(unittest.TestCase):
             semantic_keys=unit.semantic_keys,
             quality_status=unit.quality_status,
             order_index=unit.order_index,
+            search_plan=materialize_search_projection(
+                payload_kind=unit.payload_kind,
+                payload=unit.payload,
+                artifact_locator=unit.artifact_locator,
+            ).plan,
             applicability=unit.applicability,
         )
         unit.content_hash = hashes.content_hash

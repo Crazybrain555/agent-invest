@@ -134,11 +134,14 @@ decides_for: 06R（检索投影里程碑，规格待编写）+ semantic_key 词�
 > `disclosure_core.unit_search_projection` 投影表 + `disclosure_public.unit_search_projection_v1`
 > 视图（应用侧 jieba 预分词 + `setweight` 加权 tsvector A=title/B=面包屑/C=正文/D=semantic keys +
 > 单 GIN；title/面包屑另建 pg_trgm GIN 子串兜底）。下表为原始设计草案，实际列集/权重以
-> migration 0025 与 milestone 06R 为准；投影仍是派生层，重建不发事件、不进哈希。
+> migration 0025 与 milestone 06R 为准；投影 rows 仍是派生层，重建不发事件。会改变 rows 的
+> source-bound canonical search plan 属查询身份，进入 query_projection_hash；输出文本/token
+> 本身不进哈希。
 
 U7 边界（05 §2，原文摘录）已锁定：投影是**派生层**，字段族
 heading_path_text / display_subtitle / search_text / controlled_keywords /
-extractive_keywords /（后置）summary；不进 content_hash、不替代 payload、
+extractive_keywords /（后置）summary；派生输出不进 content_hash 或 query_projection_hash；
+source-bound target/transform/grouping plan 进入 query_projection_hash；不替代 payload、
 不作证据、不引入 chunk/embedding；全部可由已持久化数据确定性再生。
 
 结合调研，最小落地形态（视图或投影作业 + 一张投影表）：

@@ -26,6 +26,10 @@ from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
     ParserTargetIdentityError,
 )
+from disclosure_anchor.application.contracts.unit_source_projection import (
+    SearchTargetContractError,
+    materialize_search_projection,
+)
 from disclosure_anchor.application.contracts.visual_semantics import (
     VisualSemanticClosure,
     VisualSemanticContractError,
@@ -468,7 +472,21 @@ class PublishRun:
                     run=run,
                     units=new_units,
                 )
-                diff = diff_units(old_units=old_units, new_units=new_units)
+                try:
+                    diff = diff_units(old_units=old_units, new_units=new_units)
+                except SearchTargetContractError as exc:
+                    raise PublishRunError(
+                        _structured_error(
+                            error_code=(
+                                "HISTORICAL_QUERY_PROJECTION_UNCOMPARABLE"
+                            ),
+                            reason_code="search_plan_invalid",
+                            message=(
+                                "active historical unit cannot be compared "
+                                f"under the current search plan: {exc}"
+                            ),
+                        )
+                    ) from exc
             except PublishRunError as exc:
                 if (
                     exc.error.get("error_code")
@@ -682,10 +700,20 @@ def _units_by_key(
 def _changed_projection_fields(old: e.DocumentUnit, new: e.DocumentUnit) -> list[str]:
     old_projection = _unit_query_projection(old)
     new_projection = _unit_query_projection(new)
+    compared_fields = (
+        "title",
+        "heading_path",
+        "semantic_key",
+        "semantic_keys",
+        "quality_status",
+        "applicability",
+        "mixed_part_annotations",
+        "search_plan",
+    )
     changed = [
         field
-        for field in old_projection
-        if field != "payload_kind" and old_projection[field] != new_projection[field]
+        for field in compared_fields
+        if old_projection.get(field) != new_projection.get(field)
     ]
     if not changed:
         raise PublishRunError(
@@ -701,6 +729,11 @@ def _changed_projection_fields(old: e.DocumentUnit, new: e.DocumentUnit) -> list
 
 
 def _unit_query_projection(unit: e.DocumentUnit) -> dict[str, Any]:
+    search_projection = materialize_search_projection(
+        payload_kind=unit.payload_kind,
+        payload=unit.payload,
+        artifact_locator=unit.artifact_locator,
+    )
     return query_projection(
         payload_kind=unit.payload_kind,
         title=unit.title,
@@ -708,6 +741,7 @@ def _unit_query_projection(unit: e.DocumentUnit) -> dict[str, Any]:
         semantic_key=unit.semantic_key,
         semantic_keys=unit.semantic_keys,
         quality_status=unit.quality_status,
+        search_plan=search_projection.plan,
         applicability=unit.applicability,
         payload=unit.payload,
     )
@@ -739,6 +773,11 @@ def _published_change_kind(*, old_run: e.ProcessingRun | None, diff: UnitDiff) -
 
 
 def _canonical_unit_hashes(unit: e.DocumentUnit) -> UnitHashes:
+    search_projection = materialize_search_projection(
+        payload_kind=unit.payload_kind,
+        payload=unit.payload,
+        artifact_locator=unit.artifact_locator,
+    )
     return compute_unit_hashes(
         payload_kind=unit.payload_kind,
         payload=unit.payload,
@@ -748,6 +787,7 @@ def _canonical_unit_hashes(unit: e.DocumentUnit) -> UnitHashes:
         semantic_keys=unit.semantic_keys,
         quality_status=unit.quality_status,
         order_index=unit.order_index,
+        search_plan=search_projection.plan,
         applicability=unit.applicability,
     )
 

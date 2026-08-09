@@ -7,7 +7,7 @@ from importlib import resources
 import json
 import re
 from dataclasses import dataclass
-RULES_VERSION = "ub-2026.07-86"
+RULES_VERSION = "ub-2026.07-87"
 # A real, controlled fallback concept for evidence that has no narrower
 # section/event match.  This is intentionally not ``unknown``: the unit is
 # known to be retrievable document content, while its narrower topic remains

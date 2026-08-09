@@ -43,9 +43,12 @@ content_hash          = "sha256:" + sha256(canonical_json({payload_kind, content
                         local_heading/heading_path/applicability/quality_status/artifact_locator 等规则与位置注解
 query_projection_hash = "sha256:" + sha256(canonical_json({payload_kind, title,
                         heading_path, semantic_key, semantic_keys, quality_status,
-                        applicability[, mixed_part_annotations]}))
+                        applicability[, mixed_part_annotations], version,
+                        search_plan}))
                         public 查询投影身份：这些字段不是内容，但 L2 按它们检索/路由，
-                        规则升级改变投影时必须可产生事件（落 document_unit 列，0007）
+                        search_plan 只含已经过 source_projection 合同验证的有序 target、实际
+                        分段变换及 grouped-atom 关系；不含输出文本或 page/bbox/runtime/hash provenance。
+                        规则升级改变检索路由时必须可产生事件（落 document_unit 列，0007）
 structure_hash        = "sha256:" + sha256(canonical_json({payload_kind, heading_path,
                         order_index}))
                         文档内结构位置身份，仅结构变化 → observed
@@ -78,7 +81,7 @@ structure_hash        = "sha256:" + sha256(canonical_json({payload_kind, heading
                  payload {old_asset_id, new_asset_id, content_hash,
                           old/new_query_projection_hash, changed_fields[]}
                  changed_fields 词表固定 = {title, heading_path, semantic_key, semantic_keys,
-                 quality_status, applicability, mixed_part_annotations} 的子集，逐字段比较旧/新值得出（payload_kind 在配对
+                 quality_status, applicability, mixed_part_annotations, search_plan} 的子集，逐字段比较旧/新值得出（payload_kind 在配对
                  key 中不可能变）
   配对且投影相同 → 不发事件（内容与投影都没变；旧 asset_id 永远可解析，L2 引用不失效）
 processing_run_published  每次发布 1 条：
@@ -113,9 +116,12 @@ processing_run_published payload = {previous_processing_run_id|null, content_has
   证据锚点（durable semantic retrieval anchor：可追溯、不可变、按业务结构切分）；检索发现层
   是其上的**派生投影**，不是新的核心对象——字段族为 heading_path_text / display_subtitle /
   search_text / controlled_keywords / extractive_keywords /（后置）LLM summary。硬边界：
-  投影不进 content_hash 与 query_projection_hash、不替代 payload、不作为证据或 claim、
+  派生的 token/text/window/search row 不进 content_hash 或 query_projection_hash；其经过
+  source_projection 验证、会决定最终检索 leaves 的 canonical search_plan 进入
+  query_projection_hash。派生投影不替代 payload、不作为证据或 claim、
   不新增 chunk / table_cell / embedding 核心对象。投影全部可由已持久化数据
-  （payload + title + heading_path + semantic_key + document 元数据）确定性再生，因此
+  （payload + title + heading_path + semantic_key(s) + quality/applicability +
+  artifact_locator 内的 typed source_projection + document 元数据）确定性再生，因此
   **本 milestone 不在 build 时生成 projection artifact**：检索规则（retrieval_rules_version）
   会独立于切分规则演进，耦合进 builder 会把可再生的发现层写进不可变 run 快照、放大
   builder_rules_version churn。06R 以派生层（视图或独立投影作业）+ PostgreSQL FTS/pg_trgm

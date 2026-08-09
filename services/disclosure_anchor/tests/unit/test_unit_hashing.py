@@ -9,6 +9,7 @@ import unittest
 from disclosure_anchor.domain.services.unit_hashing import (
     canonical_json,
     compute_unit_hashes,
+    compute_unit_hashes_v1,
 )
 from disclosure_anchor.domain.value_objects.semantic_key import (
     validate_semantic_key_state,
@@ -22,6 +23,12 @@ FIXTURE = (
     / "golden_hashes.json"
 )
 
+_EMPTY_SEARCH_PLAN = {
+    "version": "unit-search-plan.v1",
+    "atomic_targets": [],
+    "grouped_atoms": [],
+}
+
 
 class UnitHashingTests(unittest.TestCase):
     def test_golden_hashes_are_stable(self) -> None:
@@ -34,6 +41,16 @@ class UnitHashingTests(unittest.TestCase):
                     case["expected"]["query_projection_hash"],
                 )
                 self.assertEqual(got.structure_hash, case["expected"]["structure_hash"])
+                legacy_input = {
+                    key: value
+                    for key, value in case["input"].items()
+                    if key != "search_plan"
+                }
+                legacy = compute_unit_hashes_v1(**legacy_input)
+                self.assertEqual(
+                    legacy.query_projection_hash,
+                    case["expected"]["query_projection_hash_v1"],
+                )
 
     def test_golden_cases_carry_a_valid_controlled_semantic_state(self) -> None:
         for case in json.loads(FIXTURE.read_text(encoding="utf-8")):
@@ -63,6 +80,7 @@ class UnitHashingTests(unittest.TestCase):
             "semantic_key": None,
             "quality_status": "ok",
             "order_index": 1,
+            "search_plan": _EMPTY_SEARCH_PLAN,
         }
         first = compute_unit_hashes(**base)
         second = compute_unit_hashes(**{**base, "title": "新标题"})
@@ -80,6 +98,7 @@ class UnitHashingTests(unittest.TestCase):
             "semantic_key": None,
             "quality_status": "ok",
             "order_index": 1,
+            "search_plan": _EMPTY_SEARCH_PLAN,
         }
         first = compute_unit_hashes(**base)
         second = compute_unit_hashes(**{**base, "order_index": 2})
@@ -97,6 +116,7 @@ class UnitHashingTests(unittest.TestCase):
             "semantic_key": None,
             "quality_status": "ok",
             "order_index": 1,
+            "search_plan": _EMPTY_SEARCH_PLAN,
         }
         first = compute_unit_hashes(**base)
         second = compute_unit_hashes(
@@ -128,6 +148,7 @@ class UnitHashingTests(unittest.TestCase):
             "semantic_keys": ["document_content"],
             "quality_status": "ok",
             "order_index": 1,
+            "search_plan": _EMPTY_SEARCH_PLAN,
         }
         first = compute_unit_hashes(**base)
         changed_payload = {
@@ -165,6 +186,7 @@ class UnitHashingTests(unittest.TestCase):
             "semantic_key": "document_content",
             "quality_status": "ok",
             "order_index": 1,
+            "search_plan": _EMPTY_SEARCH_PLAN,
         }
         first = compute_unit_hashes(**base)
         changed_text = compute_unit_hashes(
@@ -207,6 +229,7 @@ class UnitHashingTests(unittest.TestCase):
             "semantic_key": "document_content",
             "quality_status": "ok",
             "order_index": 1,
+            "search_plan": _EMPTY_SEARCH_PLAN,
         }
         first = compute_unit_hashes(**base)
         second = compute_unit_hashes(
@@ -233,6 +256,7 @@ class UnitHashingTests(unittest.TestCase):
             "semantic_keys": ["document_content"],
             "quality_status": "ok",
             "order_index": 1,
+            "search_plan": _EMPTY_SEARCH_PLAN,
         }
         first = compute_unit_hashes(
             payload={
@@ -311,6 +335,7 @@ class UnitHashingTests(unittest.TestCase):
             "semantic_key": "document_content",
             "quality_status": "ok",
             "order_index": 1,
+            "search_plan": _EMPTY_SEARCH_PLAN,
         }
         for parts in (None, [], ["正文"]):
             with self.subTest(parts=parts):

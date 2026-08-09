@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import hashlib
 import json
@@ -23,6 +23,7 @@ _MIXED_PART_QUERY_FIELDS = (
     "applicability",
     "quality_status",
 )
+QUERY_PROJECTION_V2_VERSION = "unit-query-projection.v2"
 
 
 @dataclass(frozen=True)
@@ -83,7 +84,7 @@ def content_hash(*, payload_kind: str, payload: dict[str, Any]) -> str:
     )
 
 
-def query_projection_hash(
+def query_projection_hash_v1(
     *,
     payload_kind: str,
     title: str | None,
@@ -96,7 +97,7 @@ def query_projection_hash(
 ) -> str:
     return sha256_prefixed(
         canonical_json(
-            query_projection(
+            query_projection_v1(
                 payload_kind=payload_kind,
                 title=title,
                 heading_path=heading_path,
@@ -110,7 +111,7 @@ def query_projection_hash(
     )
 
 
-def query_projection(
+def query_projection_v1(
     *,
     payload_kind: str,
     title: str | None,
@@ -121,11 +122,10 @@ def query_projection(
     semantic_keys: list[str] | None = None,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return the one canonical projection used by hashing and publication.
+    """Return the frozen pre-search-plan query projection.
 
-    Keeping this materialized view shared prevents a projection-hash change
-    from producing an outbox event whose ``changed_fields`` is empty merely
-    because the publisher forgot a newly hashed field.
+    This exact byte profile remains available only for historical receipt and
+    golden replay. Current producers use the versioned v2 projection below.
     """
 
     projection: dict[str, Any] = {
@@ -144,6 +144,96 @@ def query_projection(
             payload_kind=payload_kind,
             payload=payload,
         )
+    return projection
+
+
+def query_projection_hash(
+    *,
+    payload_kind: str,
+    title: str | None,
+    heading_path: list[str],
+    semantic_key: str | None,
+    quality_status: str,
+    search_plan: Mapping[str, Any],
+    applicability: str | None = None,
+    semantic_keys: list[str] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> str:
+    return sha256_prefixed(
+        canonical_json(
+            query_projection_v2(
+                payload_kind=payload_kind,
+                title=title,
+                heading_path=heading_path,
+                semantic_key=semantic_key,
+                quality_status=quality_status,
+                search_plan=search_plan,
+                applicability=applicability,
+                semantic_keys=semantic_keys,
+                payload=payload,
+            )
+        )
+    )
+
+
+def query_projection(
+    *,
+    payload_kind: str,
+    title: str | None,
+    heading_path: list[str],
+    semantic_key: str | None,
+    quality_status: str,
+    search_plan: Mapping[str, Any],
+    applicability: str | None = None,
+    semantic_keys: list[str] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the current canonical projection used by hashing/publication."""
+
+    return query_projection_v2(
+        payload_kind=payload_kind,
+        title=title,
+        heading_path=heading_path,
+        semantic_key=semantic_key,
+        quality_status=quality_status,
+        search_plan=search_plan,
+        applicability=applicability,
+        semantic_keys=semantic_keys,
+        payload=payload,
+    )
+
+
+def query_projection_v2(
+    *,
+    payload_kind: str,
+    title: str | None,
+    heading_path: list[str],
+    semantic_key: str | None,
+    quality_status: str,
+    search_plan: Mapping[str, Any],
+    applicability: str | None = None,
+    semantic_keys: list[str] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Bind routing fields and one already-validated explicit search plan.
+
+    Keeping this materialized view shared prevents a projection-hash change
+    from producing an outbox event whose ``changed_fields`` is empty merely
+    because the publisher forgot a newly hashed field.
+    """
+
+    projection = query_projection_v1(
+        payload_kind=payload_kind,
+        title=title,
+        heading_path=heading_path,
+        semantic_key=semantic_key,
+        quality_status=quality_status,
+        applicability=applicability,
+        semantic_keys=semantic_keys,
+        payload=payload,
+    )
+    projection["version"] = QUERY_PROJECTION_V2_VERSION
+    projection["search_plan"] = dict(search_plan)
     return projection
 
 
@@ -208,7 +298,7 @@ def structure_hash(
     )
 
 
-def compute_unit_hashes(
+def compute_unit_hashes_v1(
     *,
     payload_kind: str,
     payload: dict[str, Any],
@@ -222,12 +312,73 @@ def compute_unit_hashes(
 ) -> UnitHashes:
     return UnitHashes(
         content_hash=content_hash(payload_kind=payload_kind, payload=payload),
+        query_projection_hash=query_projection_hash_v1(
+            payload_kind=payload_kind,
+            title=title,
+            heading_path=heading_path,
+            semantic_key=semantic_key,
+            quality_status=quality_status,
+            applicability=applicability,
+            semantic_keys=semantic_keys,
+            payload=payload,
+        ),
+        structure_hash=structure_hash(
+            payload_kind=payload_kind,
+            heading_path=heading_path,
+            order_index=order_index,
+        ),
+    )
+
+
+def compute_unit_hashes(
+    *,
+    payload_kind: str,
+    payload: dict[str, Any],
+    title: str | None,
+    heading_path: list[str],
+    semantic_key: str | None,
+    quality_status: str,
+    order_index: int,
+    search_plan: Mapping[str, Any],
+    applicability: str | None = None,
+    semantic_keys: list[str] | None = None,
+) -> UnitHashes:
+    return compute_unit_hashes_v2(
+        payload_kind=payload_kind,
+        payload=payload,
+        title=title,
+        heading_path=heading_path,
+        semantic_key=semantic_key,
+        quality_status=quality_status,
+        order_index=order_index,
+        search_plan=search_plan,
+        applicability=applicability,
+        semantic_keys=semantic_keys,
+    )
+
+
+def compute_unit_hashes_v2(
+    *,
+    payload_kind: str,
+    payload: dict[str, Any],
+    title: str | None,
+    heading_path: list[str],
+    semantic_key: str | None,
+    quality_status: str,
+    order_index: int,
+    search_plan: Mapping[str, Any],
+    applicability: str | None = None,
+    semantic_keys: list[str] | None = None,
+) -> UnitHashes:
+    return UnitHashes(
+        content_hash=content_hash(payload_kind=payload_kind, payload=payload),
         query_projection_hash=query_projection_hash(
             payload_kind=payload_kind,
             title=title,
             heading_path=heading_path,
             semantic_key=semantic_key,
             quality_status=quality_status,
+            search_plan=search_plan,
             applicability=applicability,
             semantic_keys=semantic_keys,
             payload=payload,

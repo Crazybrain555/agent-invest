@@ -39,6 +39,7 @@ from disclosure_anchor.application.contracts.publication_safety import (
     evaluate_publication_gate_v1,
 )
 from disclosure_anchor.application.contracts.unit_source_projection import (
+    materialize_search_projection,
     payload_page_no,
 )
 from disclosure_anchor.application.ports.file_store import (
@@ -796,6 +797,11 @@ class BuildUnits:
                         message=str(exc),
                     )
                 ) from exc
+            search_projection = materialize_search_projection(
+                payload_kind=draft.payload_kind,
+                payload=draft.payload,
+                artifact_locator=draft.artifact_locator,
+            )
             hashes = compute_unit_hashes(
                 payload_kind=draft.payload_kind,
                 payload=draft.payload,
@@ -804,6 +810,7 @@ class BuildUnits:
                 semantic_key=draft.semantic_key,
                 quality_status=draft.quality_status,
                 order_index=order_index,
+                search_plan=search_projection.plan,
                 applicability=draft.applicability,
                 semantic_keys=draft.semantic_keys,
             )

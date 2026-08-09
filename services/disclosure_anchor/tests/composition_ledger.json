@@ -323,7 +323,7 @@
    "private_imports": [
     "_validate_candidate_unit_set"
    ],
-   "tests": 25
+   "tests": 27
   },
   "tests/unit/test_raw_document_store.py": {
    "private_imports": [],
@@ -343,7 +343,7 @@
   },
   "tests/unit/test_search_projection.py": {
    "private_imports": [],
-   "tests": 15
+   "tests": 16
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],

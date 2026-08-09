@@ -19,6 +19,9 @@ from disclosure_anchor.application.use_cases.build_units import (
     BuildUnits,
     BuildUnitsCommand,
 )
+from disclosure_anchor.application.contracts.unit_source_projection import (
+    materialize_search_projection,
+)
 from disclosure_anchor.application.use_cases.publish_run import (
     NormalizedIRPublicationGuard,
     PublishRun,
@@ -117,6 +120,28 @@ def _unit(
         if semantic_keys is None and semantic_key is not None
         else semantic_keys
     )
+    artifact_locator = {
+        "source_projection": {
+            "version": "unit-source-projection.v4",
+            "payload": {
+                "kind": "text_identity",
+                "sources": [],
+                "target_field": "payload.text",
+                "transform": "clean_text.v1",
+            },
+            "heading_path": [],
+            "structured": [],
+            "provenance": [],
+            "search_targets": ["payload.text"],
+            "search_atoms": [],
+            "physical_context": None,
+        }
+    }
+    search_plan = materialize_search_projection(
+        payload_kind="text",
+        payload=resolved_payload,
+        artifact_locator=artifact_locator,
+    ).plan
     hashes = compute_unit_hashes(
         payload_kind="text",
         payload=resolved_payload,
@@ -126,6 +151,7 @@ def _unit(
         semantic_keys=resolved_semantic_keys,
         quality_status="ok",
         order_index=order_index,
+        search_plan=search_plan,
     )
     return e.DocumentUnit(
         asset_id=asset_id,
@@ -142,6 +168,7 @@ def _unit(
         quality_status="ok",
         query_projection_hash=(query_projection_hash or hashes.query_projection_hash),
         structure_hash=hashes.structure_hash,
+        artifact_locator=artifact_locator,
     )
 
 

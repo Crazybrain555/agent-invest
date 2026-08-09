@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, Mapping, cast
 
 from disclosure_anchor.application.contracts.publication_safety import (
@@ -19,6 +20,9 @@ from disclosure_anchor.application.contracts.publication_safety import (
 
 
 UNIT_SOURCE_PROJECTION_VERSION = "unit-source-projection.v4"
+UNIT_SEARCH_PLAN_VERSION = "unit-search-plan.v1"
+CONSERVATIVE_SEGMENT_TRANSFORM = "conservative_semantic_segments.v1"
+SAFE_LINE_SEGMENT_TRANSFORM = "safe_line_segments.v1"
 
 NORMALIZED_IR_SOURCE_KIND = "normalized_ir_element"
 SOURCE_EVIDENCE_ATOM_KIND = "source_evidence_atom"
@@ -78,6 +82,14 @@ HEADING_PROJECTION_KINDS = frozenset(
 
 class SearchTargetContractError(ValueError):
     """A search target is not closed over an audited source projection edge."""
+
+
+@dataclass(frozen=True)
+class SearchProjectionMaterialization:
+    """Validated query identity and ordered body values from one source graph."""
+
+    plan: dict[str, Any]
+    values: tuple[str, ...]
 
 
 def source_ref_from_locator(locator: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -387,6 +399,48 @@ def search_text_values(
     invent fields or duplicate content.
     """
 
+    return materialize_search_projection(
+        payload_kind=payload_kind,
+        payload=payload,
+        artifact_locator=artifact_locator,
+    ).values
+
+
+def materialize_search_projection(
+    *,
+    payload_kind: str,
+    payload: Mapping[str, Any],
+    artifact_locator: Mapping[str, Any] | None,
+) -> SearchProjectionMaterialization:
+    """Return one validated canonical plan with its ordered body values.
+
+    The plan deliberately excludes page/bbox/hash provenance after the full
+    source graph has passed validation.  It retains only ordered routing and
+    effective transforms that can change the derived search rows.
+    """
+
+    values = _replay_search_text_values(
+        payload_kind=payload_kind,
+        payload=payload,
+        artifact_locator=artifact_locator,
+    )
+    return SearchProjectionMaterialization(
+        plan=_canonical_search_plan(
+            payload_kind=payload_kind,
+            payload=payload,
+            artifact_locator=artifact_locator,
+        ),
+        values=values,
+    )
+
+
+def _replay_search_text_values(
+    *,
+    payload_kind: str,
+    payload: Mapping[str, Any],
+    artifact_locator: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+
     if payload_kind == "mixed":
         _atomic_search_text_values(
             payload_kind="mixed",
@@ -411,7 +465,7 @@ def search_text_values(
                 raise SearchTargetContractError("mixed part must be an object")
             part_locator = part.get("artifact_locator")
             values.extend(
-                search_text_values(
+                _replay_search_text_values(
                     payload_kind=str(part.get("kind")),
                     payload=part,
                     artifact_locator=(
@@ -429,6 +483,129 @@ def search_text_values(
         payload=payload,
         artifact_locator=artifact_locator,
     )
+
+
+def _canonical_search_plan(
+    *,
+    payload_kind: str,
+    payload: Mapping[str, Any],
+    artifact_locator: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Project one validated source graph into its retrieval identity."""
+
+    root_entry = _atomic_search_plan_entry(
+        carrier="unit",
+        payload_kind=payload_kind,
+        payload=payload,
+        artifact_locator=artifact_locator,
+    )
+    atomic_targets = [root_entry] if root_entry is not None else []
+    grouped_atoms: list[dict[str, Any]] = []
+    if payload_kind == "mixed":
+        parts = payload.get("parts")
+        if not isinstance(parts, list):
+            raise SearchTargetContractError("mixed payload parts must be an array")
+        for part_index, part in enumerate(parts):
+            if not isinstance(part, Mapping):
+                raise SearchTargetContractError("mixed part must be an object")
+            raw_locator = part.get("artifact_locator")
+            part_locator = raw_locator if isinstance(raw_locator, Mapping) else None
+            child = _canonical_search_plan(
+                payload_kind=str(part.get("kind")),
+                payload=part,
+                artifact_locator=part_locator,
+            )
+            for entry in child["atomic_targets"]:
+                prefixed = dict(entry)
+                child_carrier = str(prefixed["carrier"])
+                prefixed["carrier"] = (
+                    f"part:{part_index}"
+                    if child_carrier == "unit"
+                    else f"part:{part_index}/{child_carrier}"
+                )
+                atomic_targets.append(prefixed)
+            for entry in child["grouped_atoms"]:
+                prefixed = dict(entry)
+                child_carrier = str(prefixed["carrier"])
+                prefixed["carrier"] = (
+                    f"part:{part_index}"
+                    if child_carrier == "unit"
+                    else f"part:{part_index}/{child_carrier}"
+                )
+                grouped_atoms.append(prefixed)
+
+        graph = _source_projection_graph(artifact_locator)
+        raw_atoms = graph.get("search_atoms")
+        if not isinstance(raw_atoms, list):
+            raise SearchTargetContractError("search_atoms must be an array")
+        root_grouped_atoms = [
+            {
+                "carrier": "unit",
+                "target_fields": list(cast(list[str], entry["target_fields"])),
+                "transform": str(entry["transform"]),
+            }
+            for entry in cast(list[Mapping[str, Any]], raw_atoms)
+        ]
+        if root_grouped_atoms:
+            # Root grouping consumes every searchable direct text child and
+            # rejects any searchable non-text/nested child. Child projections
+            # are still validated while replaying values, but their inactive
+            # atomic transforms cannot enter effective query identity.
+            atomic_targets = []
+            grouped_atoms = root_grouped_atoms
+    return {
+        "version": UNIT_SEARCH_PLAN_VERSION,
+        "atomic_targets": atomic_targets,
+        "grouped_atoms": grouped_atoms,
+    }
+
+
+def _atomic_search_plan_entry(
+    *,
+    carrier: str,
+    payload_kind: str,
+    payload: Mapping[str, Any],
+    artifact_locator: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    graph = _source_projection_graph(artifact_locator)
+    targets = graph.get("search_targets")
+    if not isinstance(targets, list):
+        raise SearchTargetContractError("search_targets must be an array")
+    _is_non_primary_source_alternative(
+        payload_kind=payload_kind,
+        payload=payload,
+    )
+    payload_projection = graph.get("payload")
+    safe_projection = bool(
+        isinstance(payload_projection, Mapping)
+        and str(payload_projection.get("transform", "")).startswith("safe_")
+    )
+    if not targets:
+        return None
+    return {
+        "carrier": carrier,
+        "target_fields": list(cast(list[str], targets)),
+        "transform": (
+            SAFE_LINE_SEGMENT_TRANSFORM
+            if safe_projection
+            else CONSERVATIVE_SEGMENT_TRANSFORM
+        ),
+    }
+
+
+def _source_projection_graph(
+    artifact_locator: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    if not isinstance(artifact_locator, Mapping):
+        raise SearchTargetContractError("searchable payload lacks an artifact locator")
+    graph = artifact_locator.get("source_projection")
+    if not isinstance(graph, Mapping):
+        raise SearchTargetContractError("searchable payload lacks source_projection")
+    if graph.get("version") != UNIT_SOURCE_PROJECTION_VERSION:
+        raise SearchTargetContractError(
+            "searchable payload has an unsupported source_projection contract"
+        )
+    return graph
 
 
 def _atomic_search_text_values(
@@ -660,15 +837,19 @@ def _mixed_search_atom_values(
         if not isinstance(raw_part, Mapping):
             raise SearchTargetContractError("mixed part must be an object")
         part_kind = str(raw_part.get("kind"))
-        if part_kind != "text":
-            continue
         raw_locator = raw_part.get("artifact_locator")
         locator = raw_locator if isinstance(raw_locator, Mapping) else None
-        values = search_text_values(
+        values = _replay_search_text_values(
             payload_kind=part_kind,
             payload=raw_part,
             artifact_locator=locator,
         )
+        if part_kind != "text":
+            if values:
+                raise SearchTargetContractError(
+                    "grouped text atoms cannot bypass a searchable non-text part"
+                )
+            continue
         if values:
             if values != (raw_part.get("text"),):
                 raise SearchTargetContractError(

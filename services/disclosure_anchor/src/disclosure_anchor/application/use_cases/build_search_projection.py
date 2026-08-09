@@ -4,7 +4,8 @@ Derived layer (U7 red line): every projection column regenerates
 deterministically from persisted ``document_unit`` rows. This use case replaces
 the projection tables and records/clears only the owning run's deterministic
 projection terminal fact; it emits no outbox events and puts nothing into
-content/query-projection hashes.
+content hashes. Its source-bound target/transform/grouping plan is query
+identity; derived text, tokens, windows, and database rows are not hashed.
 
 Both full and delta modes replace one complete ``processing_run`` per
 transaction.  Delta selects a run when any active unit lacks the current
@@ -52,7 +53,7 @@ from disclosure_anchor.adapters.db.postgres.models import (
 from disclosure_anchor.adapters.retrieval import tokenizer
 from disclosure_anchor.application.contracts.unit_source_projection import (
     SearchTargetContractError,
-    search_text_values,
+    materialize_search_projection,
 )
 from disclosure_anchor.application.worker.locks import shared_corpus_mutation
 
@@ -753,13 +754,14 @@ def compute_search_projection_row(
 
     title_text = title or ""
     heading_path_text = " > ".join(str(item) for item in heading_path or [])
+    materialized_search = materialize_search_projection(
+        payload_kind=payload_kind,
+        payload=payload or {},
+        artifact_locator=artifact_locator,
+    )
     body_atoms = tuple(
         normalized
-        for value in search_text_values(
-            payload_kind=payload_kind,
-            payload=payload or {},
-            artifact_locator=artifact_locator,
-        )
+        for value in materialized_search.values
         if (normalized := tokenizer.normalize_search_text(value)).strip()
     )
     body_text = " ".join(body_atoms)

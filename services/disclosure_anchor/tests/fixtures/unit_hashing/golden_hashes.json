@@ -15,11 +15,23 @@
         "document_content"
       ],
       "quality_status": "ok",
+      "search_plan": {
+        "version": "unit-search-plan.v1",
+        "atomic_targets": [
+          {
+            "carrier": "unit",
+            "target_fields": ["payload.text"],
+            "transform": "conservative_semantic_segments.v1"
+          }
+        ],
+        "grouped_atoms": []
+      },
       "order_index": 1
     },
     "expected": {
       "content_hash": "sha256:0035f7615fda3c2fff4fe93799edd2999987ffc7afc8067d78f19ef8c4797ea7",
-      "query_projection_hash": "sha256:13b2d66a1af330a77995b90fdbad58fbc3c472b5520a4ff086e52a4fb83c2bcf",
+      "query_projection_hash": "sha256:0a7a9660e1bdbe3bbe34d613ab2039f14b63f695b11c9861ad19db5270061e3d",
+      "query_projection_hash_v1": "sha256:13b2d66a1af330a77995b90fdbad58fbc3c472b5520a4ff086e52a4fb83c2bcf",
       "structure_hash": "sha256:c4948f9f2d03c7edbb3a51e3699092ec3f5102f09b4f788268989e1a3994ac74"
     }
   },
@@ -60,11 +72,28 @@
         "receivable_aging"
       ],
       "quality_status": "ok",
+      "search_plan": {
+        "version": "unit-search-plan.v1",
+        "atomic_targets": [
+          {
+            "carrier": "unit",
+            "target_fields": [
+              "payload.caption",
+              "payload.headers",
+              "payload.rows",
+              "payload.notes"
+            ],
+            "transform": "conservative_semantic_segments.v1"
+          }
+        ],
+        "grouped_atoms": []
+      },
       "order_index": 2
     },
     "expected": {
       "content_hash": "sha256:15af01ea5e919319fdff7c394486f50ec0e0955a5cbbc200ed13936265f8c17b",
-      "query_projection_hash": "sha256:e648fa63df380435d88a150e0023176466cacce0cdadcd977ee8d657b4da470e",
+      "query_projection_hash": "sha256:c300db0a65baf7f7d8426c861d2e0243ae258b1c0806ae6d64e745f99d07eb47",
+      "query_projection_hash_v1": "sha256:e648fa63df380435d88a150e0023176466cacce0cdadcd977ee8d657b4da470e",
       "structure_hash": "sha256:a7d7c814b0ad54d6d775238b6e978f246e6c5b3eb3841e007e75aa25ca8f0598"
     }
   },
@@ -86,11 +115,17 @@
         "document_content"
       ],
       "quality_status": "needs_review",
+      "search_plan": {
+        "version": "unit-search-plan.v1",
+        "atomic_targets": [],
+        "grouped_atoms": []
+      },
       "order_index": 3
     },
     "expected": {
       "content_hash": "sha256:a137877582f5c9df33aca0e546d7969943878adcf2482bd949370406dcf870cd",
-      "query_projection_hash": "sha256:3b56f06814a50b90eee84d39dc38f803bb051f36166a75505d267855d1e12f42",
+      "query_projection_hash": "sha256:3fe7a50273a7a9b38b8397d959e58fc2678c0bd64276b97c0e5d40c57d1860d5",
+      "query_projection_hash_v1": "sha256:3b56f06814a50b90eee84d39dc38f803bb051f36166a75505d267855d1e12f42",
       "structure_hash": "sha256:5e2f1e49a3347c836fd41ba97f69540746fc40d55abf750b08d28d5e50eca1eb"
     }
   },
@@ -140,12 +175,34 @@
         "revenue"
       ],
       "quality_status": "ok",
+      "search_plan": {
+        "version": "unit-search-plan.v1",
+        "atomic_targets": [
+          {
+            "carrier": "part:0",
+            "target_fields": ["payload.text"],
+            "transform": "conservative_semantic_segments.v1"
+          },
+          {
+            "carrier": "part:1",
+            "target_fields": [
+              "payload.caption",
+              "payload.headers",
+              "payload.rows",
+              "payload.notes"
+            ],
+            "transform": "conservative_semantic_segments.v1"
+          }
+        ],
+        "grouped_atoms": []
+      },
       "applicability": null,
       "order_index": 4
     },
     "expected": {
       "content_hash": "sha256:c3edb065f408962add20361342d04194aa428ab1b8e19c87ce73f5ce9fe92c5d",
-      "query_projection_hash": "sha256:fe9e7ff7d3c18ddd17dd3fab2be45b18f7e21de681983cbefdeb05be1f272b42",
+      "query_projection_hash": "sha256:c01eb6f6b3b659f46c8818b4c58fa4a1e95ed5970023dd0877d04e260e6e011d",
+      "query_projection_hash_v1": "sha256:fe9e7ff7d3c18ddd17dd3fab2be45b18f7e21de681983cbefdeb05be1f272b42",
       "structure_hash": "sha256:42b9f44c722e5de44f9c8079a38d7d15126e217a7919edaf12385d4602c12993"
     }
   }

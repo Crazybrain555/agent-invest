@@ -10,9 +10,12 @@ decided_by: 用户 2026-07-17 三项确认（应用侧 jieba 预分词；pg_trgm
 
 # 06R 检索投影层（实施级规格）
 
-**U7 边界（不变）**：投影是派生层——全部字段可由已持久化数据确定性再生；不进 content_hash /
-query_projection_hash；重建不产生 outbox 事件；不替代 payload、不作证据；L1 API 不新增
-search 端点（红线不变），L2 经公开视图直接消费。
+**U7 边界（不变）**：投影是派生层——全部字段可由已持久化数据确定性再生；派生的
+text/token/window/row 不进 content_hash 或 query_projection_hash，重建不产生 outbox 事件。
+但决定这些 rows 的 source-bound 有序 target、有效分段变换与 grouped-atom 关系组成
+`unit-search-plan.v1`，由 builder/publisher/projector 共用一次严格 materialization，并进入
+`unit-query-projection.v2`；plan 不含输出文本或 page/bbox/runtime/hash provenance。投影不替代
+payload、不作证据；L1 API 不新增 search 端点（红线不变），L2 经公开视图直接消费。
 
 ## 1. 环境约束与选型（2026-07-17 探针 + 外部对标）
 

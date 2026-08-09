@@ -14,6 +14,7 @@ import unittest
 from disclosure_anchor.adapters.retrieval import tokenizer
 from disclosure_anchor.application.contracts.unit_source_projection import (
     SearchTargetContractError,
+    materialize_search_projection,
     search_text_values,
 )
 from disclosure_anchor.application.use_cases.build_search_projection import (
@@ -116,6 +117,115 @@ class TokenizerTests(unittest.TestCase):
 
 
 class SearchTargetTests(unittest.TestCase):
+    def test_search_plan_binds_transforms_and_grouping_not_provenance(self) -> None:
+        text_payload = {"text": "甲\n乙"}
+        ordinary_locator = _search_locator(
+            projection_kind="text_identity",
+            projection_target="payload.text",
+            targets=[("payload.text", "payload")],
+        )
+        safe_locator = copy.deepcopy(ordinary_locator)
+        safe_locator["source_projection"]["payload"]["transform"] = (
+            "safe_text.v1"
+        )
+        ordinary = materialize_search_projection(
+            payload_kind="text",
+            payload=text_payload,
+            artifact_locator=ordinary_locator,
+        )
+        safe = materialize_search_projection(
+            payload_kind="text",
+            payload=text_payload,
+            artifact_locator=safe_locator,
+        )
+        self.assertEqual(ordinary.values, ("甲\n乙",))
+        self.assertEqual(safe.values, ("甲", "乙"))
+        self.assertNotEqual(ordinary.plan, safe.plan)
+
+        parts = [
+            {
+                "kind": "text",
+                "text": value,
+                "artifact_locator": _search_locator(
+                    projection_kind="text_identity_exact",
+                    projection_target="payload.text",
+                    targets=[("payload.text", "payload")],
+                ),
+            }
+            for value in ("股", "份变动")
+        ]
+        mixed_payload = {"semantic_type": "document", "parts": parts}
+        ungrouped_locator = _search_locator(
+            projection_kind="container",
+            projection_target="payload.parts",
+            targets=[],
+        )
+        grouped_locator = copy.deepcopy(ungrouped_locator)
+        grouped_locator["source_projection"]["search_atoms"] = [
+            {
+                "boundary": {
+                    "kind": "source_evidence_run",
+                    "source_evidence_sha256": "sha256:" + "a" * 64,
+                    "page_idx": 0,
+                    "run_index": 0,
+                },
+                "target_fields": [
+                    "payload.parts.0.text",
+                    "payload.parts.1.text",
+                ],
+                "transform": "exact_concat.v1",
+            }
+        ]
+        ungrouped = materialize_search_projection(
+            payload_kind="mixed",
+            payload=mixed_payload,
+            artifact_locator=ungrouped_locator,
+        )
+        grouped = materialize_search_projection(
+            payload_kind="mixed",
+            payload=mixed_payload,
+            artifact_locator=grouped_locator,
+        )
+        self.assertEqual(ungrouped.values, ("股", "份变动"))
+        self.assertEqual(grouped.values, ("股份变动",))
+        self.assertNotEqual(ungrouped.plan, grouped.plan)
+
+        inactive_child_transform = copy.deepcopy(mixed_payload)
+        inactive_child_transform["parts"][0]["artifact_locator"][
+            "source_projection"
+        ]["payload"]["transform"] = "safe_text.v1"
+        same_grouped = materialize_search_projection(
+            payload_kind="mixed",
+            payload=inactive_child_transform,
+            artifact_locator=grouped_locator,
+        )
+        self.assertEqual(same_grouped, grouped)
+
+        provenance_only = copy.deepcopy(grouped_locator)
+        boundary = provenance_only["source_projection"]["search_atoms"][0][
+            "boundary"
+        ]
+        boundary["source_evidence_sha256"] = "sha256:" + "b" * 64
+        boundary["page_idx"] = 8
+        boundary["run_index"] = 3
+        provenance_materialized = materialize_search_projection(
+            payload_kind="mixed",
+            payload=mixed_payload,
+            artifact_locator=provenance_only,
+        )
+        self.assertEqual(provenance_materialized, grouped)
+
+        invalid = copy.deepcopy(grouped_locator)
+        invalid["source_projection"]["search_atoms"][0]["boundary"][
+            "source_evidence_sha256"
+        ] = "not-a-hash"
+        with self.assertRaises(SearchTargetContractError):
+            materialize_search_projection(
+                payload_kind="mixed",
+                payload=mixed_payload,
+                artifact_locator=invalid,
+            )
+
     def test_non_primary_source_alternative_has_no_second_search_leaf(self) -> None:
         payload = {
             "text": "50",
@@ -459,6 +569,47 @@ class SearchTargetTests(unittest.TestCase):
                         payload=payload,
                         artifact_locator=locator,
                     )
+
+        table = {
+            "kind": "table",
+            "caption": [],
+            "headers": ["项目"],
+            "rows": [["金额"]],
+            "notes": [],
+            "artifact_locator": _search_locator(
+                projection_kind="table_identity",
+                projection_target="payload",
+                targets=[
+                    ("payload.caption", "payload"),
+                    ("payload.headers", "payload"),
+                    ("payload.rows", "payload"),
+                    ("payload.notes", "payload"),
+                ],
+            ),
+        }
+        with_table = {**payload, "parts": [*parts, table]}
+        locator = _search_locator(
+            projection_kind="container",
+            projection_target="payload.parts",
+            targets=[],
+        )
+        locator["source_projection"]["search_atoms"] = [
+            {
+                "boundary": boundary,
+                "target_fields": [
+                    "payload.parts.0.text",
+                    "payload.parts.1.text",
+                    "payload.parts.2.text",
+                ],
+                "transform": "exact_concat.v1",
+            }
+        ]
+        with self.assertRaises(SearchTargetContractError):
+            search_text_values(
+                payload_kind="mixed",
+                payload=with_table,
+                artifact_locator=locator,
+            )
 
     def test_unproved_or_unknown_target_fails_closed(self) -> None:
         (unit,), _ = _build([_element(0, text="原文")])
