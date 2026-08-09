@@ -570,6 +570,16 @@ class BuildUnitsTests(unittest.TestCase):
             self.assertEqual(gate["processing_run_id"], "run_1")
             self.assertEqual(gate["document_id"], "doc_1")
             self.assertTrue(all(gate["checks"].values()))
+            self.assertEqual(
+                gate["hierarchy_capability"]["status"],
+                "flattened_unresolved",
+            )
+            self.assertEqual(
+                gate["hierarchy_capability"][
+                    "flattened_heading_authority_leak_count"
+                ],
+                0,
+            )
 
     def test_missing_one_native_occurrence_fails_the_shared_final_audit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

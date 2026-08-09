@@ -259,6 +259,12 @@ components:
         heading_path_text:
           title: Heading Path Text
           type: string
+        hierarchy_status:
+          enum:
+          - flattened_unresolved
+          - exact_proven
+          title: Hierarchy Status
+          type: string
         is_active_run:
           title: Is Active Run
           type: boolean
@@ -377,6 +383,7 @@ components:
       - payload_kind
       - heading_path
       - heading_path_text
+      - hierarchy_status
       - title
       - order_index
       - semantic_key
@@ -885,6 +892,12 @@ components:
             type: string
           title: Heading Path
           type: array
+        hierarchy_status:
+          enum:
+          - flattened_unresolved
+          - exact_proven
+          title: Hierarchy Status
+          type: string
         is_active_run:
           title: Is Active Run
           type: boolean
@@ -946,6 +959,7 @@ components:
       - is_active_run
       - payload_kind
       - heading_path
+      - hierarchy_status
       - title
       - unit_content_hash
       - quality_status
@@ -1118,6 +1132,12 @@ components:
             type: string
           title: Heading Path
           type: array
+        hierarchy_status:
+          enum:
+          - flattened_unresolved
+          - exact_proven
+          title: Hierarchy Status
+          type: string
         is_active_run:
           title: Is Active Run
           type: boolean
@@ -1141,6 +1161,7 @@ components:
       - is_active_run
       - document
       - heading_path
+      - hierarchy_status
       - title
       - payload
       - evidence_refs

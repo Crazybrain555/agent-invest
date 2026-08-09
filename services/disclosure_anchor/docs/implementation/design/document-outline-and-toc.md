@@ -15,7 +15,7 @@ depends_on: NormalizedIR v4、source-bound structure proof、06R 检索投影
 L2 先查看单份文件的章节、表格和附属证据，再进入具体 evidence block。L1 因此同时提供：
 
 1. 可验证的原子 document units；
-2. 由已证明 `heading_path` 派生的文件脉络；
+2. 由已发布 `heading_path` 派生、并显式标注层级能力的文件脉络；
 3. 命中任一成员后可展开的 structural evidence block / table family /
    source-page fallback。
 
@@ -32,9 +32,12 @@ L2 先查看单份文件的章节、表格和附属证据，再进入具体 evid
 - 去重的 semantic keys
 - page span
 - first order index
+- `hierarchy_status`（当前为 `flattened_unresolved`）
 
 该视图不进入 content hash、不发送 outbox，也不反向修改 document units。L2 可按
-`document_id, first_order_index` 读取整个文件的已证明骨架。
+`document_id, first_order_index` 读取已发布的导航投影。当前状态不宣称它是完整章节树；可靠粗框架
+可直接使用，缺证据的细层级已上收。未来只有全文件 ancestry 闭包通过的 run 才可标为
+`exact_proven`。
 
 ## 3. 目录不是结构白名单
 

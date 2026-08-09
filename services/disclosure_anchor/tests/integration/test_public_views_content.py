@@ -293,7 +293,8 @@ class PublicViewContentTests(unittest.TestCase):
                         "SELECT payload_kind, contract_version, company_ref, "
                         "security_ref, security_code, filing_type, report_period, "
                         "source_ref, producer_action_ref, parent_ref, semantic_key, payload, "
-                        "asset_kind, source_tier, trace_level, raw_file_hash, query_projection_hash "
+                        "asset_kind, source_tier, trace_level, raw_file_hash, "
+                        "query_projection_hash, hierarchy_status "
                         "FROM disclosure_public.document_units_v1 "
                         "WHERE asset_id = :v"
                     ),
@@ -321,12 +322,16 @@ class PublicViewContentTests(unittest.TestCase):
             self.assertEqual(unit_row["trace_level"], "G0")
             self.assertEqual(unit_row["raw_file_hash"], self.hash_a)
             self.assertEqual(unit_row["query_projection_hash"], "sha256:query")
+            self.assertEqual(
+                unit_row["hierarchy_status"], "flattened_unresolved"
+            )
 
             ref_row = (
                 conn.execute(
                     text(
                         "SELECT service, contract_version, provider, provider_document_id, raw_file_hash, "
-                        "unit_content_hash FROM disclosure_public.source_refs_v1 "
+                        "unit_content_hash, hierarchy_status "
+                        "FROM disclosure_public.source_refs_v1 "
                         "WHERE asset_id = :v"
                     ),
                     {"v": self.unit_id},
@@ -340,6 +345,26 @@ class PublicViewContentTests(unittest.TestCase):
             self.assertEqual(ref_row["provider_document_id"], self.pid)
             self.assertEqual(ref_row["raw_file_hash"], self.hash_a)
             self.assertEqual(ref_row["unit_content_hash"], "sha256:unit")
+            self.assertEqual(ref_row["hierarchy_status"], "flattened_unresolved")
+
+            outline_row = (
+                conn.execute(
+                    text(
+                        "SELECT path, hierarchy_status "
+                        "FROM disclosure_public.document_outline_v1 "
+                        "WHERE document_id = :document_id"
+                    ),
+                    {"document_id": self.document_id},
+                )
+                .mappings()
+                .one()
+            )
+            self.assertEqual(
+                outline_row["path"], ["第八节 财务报告", "应收账款"]
+            )
+            self.assertEqual(
+                outline_row["hierarchy_status"], "flattened_unresolved"
+            )
 
             doc_row = (
                 conn.execute(
@@ -399,6 +424,34 @@ class PublicViewContentTests(unittest.TestCase):
                 change_by_id[self.observed_event_id]["change_kind"], "observed"
             )
 
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.document_unit "
+                    "SET heading_path = '[]'::jsonb "
+                    "WHERE asset_id = :asset_id"
+                ),
+                {"asset_id": self.unit_id},
+            )
+        with self.engine.connect() as conn:
+            root = (
+                conn.execute(
+                    text(
+                        "SELECT heading_path, heading_path_text, title, "
+                        "hierarchy_status "
+                        "FROM disclosure_public.document_units_v1 "
+                        "WHERE asset_id = :asset_id"
+                    ),
+                    {"asset_id": self.unit_id},
+                )
+                .mappings()
+                .one()
+            )
+        self.assertEqual(root["heading_path"], [])
+        self.assertEqual(root["heading_path_text"], "")
+        self.assertIsNone(root["title"])
+        self.assertEqual(root["hierarchy_status"], "flattened_unresolved")
+
     def test_document_units_view_column_contract(self) -> None:
         expected = {
             "asset_id",
@@ -442,6 +495,7 @@ class PublicViewContentTests(unittest.TestCase):
             "publisher_categories",
             "market",
             "content_categories",
+            "hierarchy_status",
         }
         with self.engine.connect() as conn:
             columns = {
@@ -456,7 +510,7 @@ class PublicViewContentTests(unittest.TestCase):
             }
 
         self.assertEqual(columns, expected)
-        self.assertEqual(len(columns), 41)
+        self.assertEqual(len(columns), 42)
 
     def test_view_derives_classification_and_facets_from_raw_category(self) -> None:
         # 0016: one class map, two outputs — filing_type = argmax priority,

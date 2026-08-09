@@ -102,6 +102,7 @@ UNIT_COLUMNS = (
     "publisher_categories",
     "market",
     "content_categories",
+    "hierarchy_status",
 )
 
 SOURCE_REF_COLUMNS = (
@@ -123,6 +124,7 @@ SOURCE_REF_COLUMNS = (
     "applicability",
     "page_no",
     "artifact_locator",
+    "hierarchy_status",
 )
 
 
@@ -279,6 +281,7 @@ def get_unit_context(
         is_active_run=bool(unit["is_active_run"]),
         document=DocumentV1.model_validate(document),
         heading_path=list(unit["heading_path"]),
+        hierarchy_status=unit["hierarchy_status"],
         title=unit["title"],
         payload=payload,
         evidence_refs=unit_evidence_refs(

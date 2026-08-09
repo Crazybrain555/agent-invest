@@ -18,7 +18,7 @@ connection.py      create_db_engine / URL 解析（socket DSN 带 port=55432）
 ```
 
 读写边界：写侧只进 core/ops 表；**读契约只有 `disclosure_public.*_v1` 视图**
-（document_units_v1 当前 41 列；32/36 仅是历史迁移口径，列集以
+（document_units_v1 当前 42 列；32/36/41 仅是历史迁移口径，列集以
 `docs/implementation/checks/contract-checklist.md` §2 为准）；
 ops.pending_*_v1 队列视图只授 app 角色、只暴露事实列，
 阈值由调用方从 settings 施加。视图列变更 = 契约变更，必须同步

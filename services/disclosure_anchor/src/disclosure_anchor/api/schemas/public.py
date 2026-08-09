@@ -7,6 +7,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from disclosure_anchor.application.contracts.document_structure import (
+    HierarchyStatus,
+)
+
 
 class PublicModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -81,6 +85,7 @@ class DocumentUnitV1(PublicModel):
     payload_kind: str
     heading_path: list[str]
     heading_path_text: str
+    hierarchy_status: HierarchyStatus
     title: str | None
     order_index: int
     semantic_key: str | None
@@ -132,6 +137,7 @@ class SourceRefV1(PublicModel):
     is_active_run: bool
     payload_kind: str
     heading_path: list[str]
+    hierarchy_status: HierarchyStatus
     title: str | None
     unit_content_hash: str
     quality_status: str
@@ -258,6 +264,7 @@ class UnitContextResponse(PublicModel):
     is_active_run: bool
     document: DocumentV1
     heading_path: list[str]
+    hierarchy_status: HierarchyStatus
     title: str | None
     payload: dict[str, Any]
     evidence_refs: list[EvidenceRefV1]

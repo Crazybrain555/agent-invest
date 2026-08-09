@@ -81,7 +81,7 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
   部分索引 ix_document_unit_applicability；page_no：artifact_locator 首页码提升列）。
 0007 起 document_units_v1 追加 6 列：asset_kind / observed_at / source_tier /
   trace_level / raw_file_hash / query_projection_hash
-  （列全集：04R-R7 的 32 列 + 0010 applicability/page_no + 0011 is_active_run + 0013 semantic_keys + 0014 disclosure_topics + 0015 heading_path_text + 0016 publisher_categories/market/content_categories = **41 列**；0016/0017 起 filing_type/disclosure_topics 为视图现算；0021 起分类 = class 词表码命中 ∪ rule_set='title_topic' 标题追加命中（有码无码都咨询，argmax 同一优先级刻度），无码通道 filing_type 兜底 rule_set='title' 标题关键词规则，任何表列均不物化分类）
+  （列全集：04R-R7 的 32 列 + 0010 applicability/page_no + 0011 is_active_run + 0013 semantic_keys + 0014 disclosure_topics + 0015 heading_path_text + 0016 publisher_categories/market/content_categories + 0032 hierarchy_status = **42 列**；0016/0017 起 filing_type/disclosure_topics 为视图现算；0021 起分类 = class 词表码命中 ∪ rule_set='title_topic' 标题追加命中（有码无码都咨询，argmax 同一优先级刻度），无码通道 filing_type 兜底 rule_set='title' 标题关键词规则，任何表列均不物化分类）
 0007 起 change_events_v1 追加 change_kind（真实列）/ subject_kind / subject_ref /
   source / contract_version
 0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref /
@@ -96,6 +96,10 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
 0015 起 document_units_v1 增加 heading_path_text（视图内派生的面包屑文本
   "第八节 财务报告 > … > 75、其他综合收益"——多级标题的可检索形态；不入库、
   不进哈希；06R 投影将对同一字段建 FTS 索引）
+0032 起 document_units_v1 / source_refs_v1 / document_outline_v1 追加
+  hierarchy_status；当前 producer 固定发布 flattened_unresolved，表示路径可导航但不宣称全文件
+  ancestry exact closure。字段不从 path/title 猜测，不进入 unit/hash/owner/search identity；未来
+  exact_proven 必须由独立全层级证明门授权。
 0014 起 document/documents_v1/document_units_v1 增加 disclosure_topics（F006V→
   topic_map.json 派生的二级分类数组，GIN 部分索引；filing_type 保持粗桶，
   round9 用户裁决"两三级分类合理"；web 兜底通道无 F006V → null，0021 起
@@ -112,6 +116,7 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
 ```text
 disclosure_public.documents_v1
 disclosure_public.document_units_v1
+disclosure_public.document_outline_v1
 disclosure_public.document_categories_v1
 disclosure_public.processing_runs_v1
 disclosure_public.source_refs_v1

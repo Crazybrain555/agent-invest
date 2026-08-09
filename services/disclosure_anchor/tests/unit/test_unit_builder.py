@@ -30,6 +30,7 @@ from disclosure_anchor.application.contracts.canonical_occurrence import (
     canonical_occurrence_stream,
 )
 from disclosure_anchor.application.contracts.document_structure import (
+    CURRENT_PUBLIC_HIERARCHY_STATUS,
     DOCUMENT_STRUCTURE_ALGORITHM,
     DOCUMENT_STRUCTURE_VERSION,
     DocumentStructureContractError,
@@ -1174,6 +1175,9 @@ class StructureProofProjectionTests(unittest.TestCase):
         """The audit accepts the real flatten output and rejects tampering."""
 
         elements, headings, scope_breaks = self._noncontiguous_target_case()
+        # Keep the intro and first flattened heading text equal so selector
+        # order cannot be audited by comparing the projected string alone.
+        elements[1]["text"] = "一、旧一级"
         caption = "二、新同级"
         caption_span = (0, len(comparison_text(caption)))
         scope_breaks[0]["source_atom_orders"] = [0]
@@ -1272,6 +1276,16 @@ class StructureProofProjectionTests(unittest.TestCase):
             source_proof=source_proof,
         )
         self.assertTrue(baseline.ok, tuple(baseline.findings))
+        self.assertEqual(
+            baseline.metrics["hierarchy_capability"],
+            {
+                "status": CURRENT_PUBLIC_HIERARCHY_STATUS,
+                "max_published_heading_path_depth": 1,
+                "flattened_heading_count": 2,
+                "flattened_heading_carrier_count": 1,
+                "flattened_heading_authority_leak_count": 0,
+            },
+        )
 
         def views(
             mutate: Any = None,
@@ -1336,6 +1350,57 @@ class StructureProofProjectionTests(unittest.TestCase):
             {finding.code for finding in tampered_path.findings},
         )
 
+        def claim_child_owner(
+            heading_path: list[str],
+            payload: dict[str, Any],
+            locator: dict[str, Any],
+        ) -> tuple[list[str], dict[str, Any], dict[str, Any]]:
+            payload["parts"][0]["heading_path"] = [
+                "第十节 财务报告",
+                "一、旧一级",
+            ]
+            return heading_path, payload, locator
+
+        tampered_owner = audit(views(claim_child_owner))
+        self.assertFalse(tampered_owner.ok)
+        self.assertIn(
+            "flattened_heading_authority_leak",
+            {finding.code for finding in tampered_owner.findings},
+        )
+
+        def restore_heading_projection(
+            heading_path: list[str],
+            payload: dict[str, Any],
+            locator: dict[str, Any],
+        ) -> tuple[list[str], dict[str, Any], dict[str, Any]]:
+            part_graph = payload["parts"][0]["artifact_locator"][
+                "source_projection"
+            ]
+            flattened_source = part_graph["payload"]["sources"][1]["source"]
+            part_graph["heading_path"].append(
+                {
+                    "target_index": 1,
+                    "kind": "source_field",
+                    "selector": {
+                        "source": flattened_source,
+                        "field": {
+                            "kind": "text",
+                            "char_span": [0, len("一、旧一级")],
+                        },
+                    },
+                    "transform": "clean_text.v1",
+                }
+            )
+            payload["parts"][0]["heading_path"].append("一、旧一级")
+            return heading_path, payload, locator
+
+        tampered_heading = audit(views(restore_heading_projection))
+        self.assertFalse(tampered_heading.ok)
+        self.assertIn(
+            "flattened_heading_authority_leak",
+            {finding.code for finding in tampered_heading.findings},
+        )
+
         def drop_flattened_selector(
             heading_path: list[str],
             payload: dict[str, Any],
@@ -1348,12 +1413,90 @@ class StructureProofProjectionTests(unittest.TestCase):
 
         tampered_payload = audit(views(drop_flattened_selector))
         self.assertFalse(tampered_payload.ok)
-        self.assertTrue(
-            any(
-                finding.severity == "error"
-                for finding in tampered_payload.findings
+        self.assertIn(
+            "flattened_heading_authority_leak",
+            {finding.code for finding in tampered_payload.findings},
+        )
+
+        def reorder_flattened_source(
+            heading_path: list[str],
+            payload: dict[str, Any],
+            locator: dict[str, Any],
+        ) -> tuple[list[str], dict[str, Any], dict[str, Any]]:
+            sources = payload["parts"][0]["artifact_locator"][
+                "source_projection"
+            ]["payload"]["sources"]
+            sources[0], sources[1] = sources[1], sources[0]
+            return heading_path, payload, locator
+
+        tampered_order = audit(views(reorder_flattened_source))
+        self.assertFalse(tampered_order.ok)
+        self.assertIn(
+            "flattened_heading_authority_leak",
+            {finding.code for finding in tampered_order.findings},
+        )
+
+        moved_unit_views = views()
+        owner_index = next(
+            index
+            for index, view in enumerate(moved_unit_views)
+            if view.heading_path == ["第十节 财务报告"]
+        )
+        owner = moved_unit_views[owner_index]
+        moved_payload = json.loads(json.dumps(owner.payload))
+        moved_part = moved_payload["parts"].pop(0)
+        moved_unit_views[owner_index] = replace(
+            owner,
+            order_index=2,
+            payload=moved_payload,
+        )
+        moved_unit_views.insert(
+            0,
+            AuditUnitView(
+                order_index=1,
+                payload_kind="text",
+                payload={"text": moved_part["text"]},
+                title=owner.title,
+                heading_path=list(moved_part["heading_path"]),
+                semantic_key=owner.semantic_key,
+                semantic_keys=owner.semantic_keys,
+                quality_status=owner.quality_status,
+                applicability=owner.applicability,
+                artifact_locator=moved_part["artifact_locator"],
             ),
-            tuple(tampered_payload.findings),
+        )
+        tampered_independent_target = audit(moved_unit_views)
+        self.assertFalse(tampered_independent_target.ok)
+        self.assertNotIn(
+            "duplicate_active_primary_search_projection",
+            {finding.code for finding in tampered_independent_target.findings},
+        )
+        self.assertIn(
+            "flattened_heading_authority_leak",
+            {finding.code for finding in tampered_independent_target.findings},
+        )
+
+        duplicate_unit_views = views()
+        flattened_view = next(
+            view
+            for view in duplicate_unit_views
+            if view.heading_path == ["第十节 财务报告"]
+        )
+        duplicate_unit_views.append(
+            replace(
+                flattened_view,
+                order_index=max(view.order_index for view in duplicate_unit_views) + 1,
+            )
+        )
+        tampered_search = audit(duplicate_unit_views)
+        self.assertFalse(tampered_search.ok)
+        self.assertIn(
+            "duplicate_active_primary_search_projection",
+            {finding.code for finding in tampered_search.findings},
+        )
+        self.assertIn(
+            "flattened_heading_authority_leak",
+            {finding.code for finding in tampered_search.findings},
         )
         elements = [
             _element(0, text="第一节 经营情况", text_level=1),

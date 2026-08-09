@@ -970,9 +970,10 @@ parser artifact / NormalizedIR 字节的根 parse run。public view 不暴露相
 evidence resolver 经 owner run 的 hash、document 和 run_kind 校验后使用统一 PathBuilder
 定位，禁止把 unit producer run 当成 artifact owner，也禁止从路径词面猜 owner。
 
-0010–0016 迁移起的 `document_units_v1` 增量列使当前列全集达到 **41 列**：04R-R7 的
+0010–0032 迁移起的 `document_units_v1` 增量列使当前列全集达到 **42 列**：04R-R7 的
 32 列 + 0010 `applicability`/`page_no` + 0011 `is_active_run` + 0013 `semantic_keys` +
-0014 `disclosure_topics` + 0015 `heading_path_text` + 0016 三维分类投影；0016/0017 后分类
+0014 `disclosure_topics` + 0015 `heading_path_text` + 0016 三维分类投影 + 0032
+`hierarchy_status`；0016/0017 后分类
 由视图现算。完整列集以 `docs/implementation/checks/contract-checklist.md` §2 为准：
 
 - 0010：`applicability`（'applicable'|'not_applicable'|NULL，节适用性一等筛选列，部分索引）
@@ -981,6 +982,8 @@ evidence resolver 经 owner run 的 hash、document 和 run_kind 校验后使用
   （DB 直读方可直接过滤 active run）；同迁移将 `payload_kind` CHECK 扩为含 `mixed`（§6.5）；
 - 0013：`semantic_keys`（jsonb 数组 = 单元自身 `semantic_key` ∪ mixed parts 的 key，
   GIN 部分索引；纳入 `query_projection_hash` 与 outbox 投影字段）。
+- 0032：`hierarchy_status` 在 unit/source-ref/outline 公开读面固定声明当前层级能力为
+  `flattened_unresolved`；它不改 path/title/payload/hash，也不能从路径深度反推。
 
 `asset://` URI（顶层协议 §2.3）只在序列化边界派生，不落存储：
 

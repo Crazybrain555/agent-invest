@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 import hashlib
 import json
 import re
-from typing import Any, Never, cast
+from typing import Any, Literal, Never, cast
 
 
 DOCUMENT_STRUCTURE_VERSION = "document_structure.v1"
@@ -15,6 +15,22 @@ PREVIOUS_DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v11"
 OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v12"
 OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v13"
 DOCUMENT_STRUCTURE_ALGORITHM = "document-structure-evidence.v14"
+
+HierarchyStatus = Literal["flattened_unresolved", "exact_proven"]
+HIERARCHY_STATUS_FLATTENED_UNRESOLVED: HierarchyStatus = "flattened_unresolved"
+HIERARCHY_STATUS_EXACT_PROVEN: HierarchyStatus = "exact_proven"
+HIERARCHY_STATUSES = frozenset(
+    {
+        HIERARCHY_STATUS_FLATTENED_UNRESOLVED,
+        HIERARCHY_STATUS_EXACT_PROVEN,
+    }
+)
+# The conservative publisher proves a reliable coarse section owner, but it
+# intentionally flattens unresolved fine-grained ancestry.  This constant is
+# a public capability statement; it is not inferred from a path or title.
+CURRENT_PUBLIC_HIERARCHY_STATUS: HierarchyStatus = (
+    HIERARCHY_STATUS_FLATTENED_UNRESOLVED
+)
 
 _SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 _LEGACY_ROOT_FIELDS = frozenset(
@@ -1203,8 +1219,13 @@ def _fail(reason_code: str, message: str) -> Never:
 
 
 __all__ = [
+    "CURRENT_PUBLIC_HIERARCHY_STATUS",
     "DOCUMENT_STRUCTURE_ALGORITHM",
     "DOCUMENT_STRUCTURE_VERSION",
+    "HIERARCHY_STATUSES",
+    "HIERARCHY_STATUS_EXACT_PROVEN",
+    "HIERARCHY_STATUS_FLATTENED_UNRESOLVED",
+    "HierarchyStatus",
     "LEGACY_DOCUMENT_STRUCTURE_ALGORITHM",
     "OWNER_SCOPE_V1_DOCUMENT_STRUCTURE_ALGORITHM",
     "OWNER_SCOPE_V2_DOCUMENT_STRUCTURE_ALGORITHM",

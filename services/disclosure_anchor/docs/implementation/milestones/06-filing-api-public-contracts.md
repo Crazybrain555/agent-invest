@@ -17,9 +17,9 @@ delivers_to: milestone 07 / L2 / MCP 包装
 
 ## 1. 前置依赖
 
-- 05 完成（active run、unit 数据、事件流）；当前 `document_units_v1` 为 41 列（完整列集以
+- 05 完成（active run、unit 数据、事件流）；当前 `document_units_v1` 为 42 列（完整列集以
   contract-checklist §2 为准；32 列仅是 0007/0008 的历史基线），包含 active run、
-  applicability/page_no、semantic_keys、heading_path_text 与三维分类投影；
+  applicability/page_no、semantic_keys、heading_path_text、hierarchy_status 与三维分类投影；
   processing_runs_v1：builder_rules_version（0008，是 run 列不是 unit 列）；
 - `document.status` 枚举（04R-D4）——`L1_PROCESSING_REQUIRED` 的判定数据面。
 
@@ -243,7 +243,7 @@ provider_document_id=文件名去后缀）。
   `{asset_uri}`；`document_unit.v1.json` 的 properties 同时收录 asset_uri（派生）与
   is_active_run（视图列）；三方一致断言按 `DERIVED = {"asset_uri"}` 执行
   （tests/integration/test_filing_api_views_contract.py 与 contract-checklist §2 已同步）。
-- §1 的 32/36 列均为历史迁移口径；0014–0016 后当前 `document_units_v1` 为 **41 列**，
+- §1 的 32/36/41 列均为历史迁移口径；0032 后当前 `document_units_v1` 为 **42 列**，
   `is_active_run` 是真实视图列，列全集以 contract-checklist §2 为准。
 - **2026-07-27 evidence bytes 契约补充**：unit locator 绑定的视觉 evidence 通过
   `GET /v1/units/{asset_id}/evidence/{sha256}` 以内容 digest 读取；请求不得携带 role/path，

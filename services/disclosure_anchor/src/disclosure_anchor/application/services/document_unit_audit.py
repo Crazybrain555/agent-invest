@@ -17,6 +17,7 @@ from typing import Any, Callable, Iterable, Mapping, cast
 import unicodedata
 
 from disclosure_anchor.application.contracts.document_structure import (
+    CURRENT_PUBLIC_HIERARCHY_STATUS,
     DOCUMENT_STRUCTURE_ALGORITHM,
     DocumentStructureContractError,
     validate_document_structure,
@@ -469,6 +470,12 @@ def audit_document(
         state=state,
         findings=findings,
     )
+    hierarchy_capability = _validate_flattened_heading_authority(
+        source=source,
+        structure=structure,
+        state=state,
+        findings=findings,
+    )
     _validate_quality_lower_bounds(
         unit_list,
         source=source,
@@ -598,6 +605,7 @@ def audit_document(
             "page_furniture_active": state.page_furniture_active_search_count,
             "missing_carriers": len(missing_search_carriers),
         },
+        "hierarchy_capability": hierarchy_capability,
         "finding_count": len(findings),
         "error_count": sum(item.severity == "error" for item in findings),
     }
@@ -3273,6 +3281,234 @@ def _validate_structure_projections(
                     ),
                     unit_order=occurrence.unit_order,
                 )
+
+
+def _validate_flattened_heading_authority(
+    *,
+    source: _SourceIndex,
+    structure: _StructureProofIndex,
+    state: _CoverageState,
+    findings: list[AuditFinding],
+) -> dict[str, Any]:
+    """Prove that flattened headings remain content of one coarse owner.
+
+    A flatten receipt removes publication authority from the affected heading
+    nodes; it does not remove their reader-visible text.  Recompute that each
+    heading source occurs exactly once as payload, never as a breadcrumb, and
+    remains inside the accepted target section.  Other audit lanes continue to
+    prove payload value, physical order, and active-search uniqueness.
+    """
+
+    paths = {
+        node_id: _proof_heading_path(heading, headings=structure.headings)
+        for node_id, heading in structure.headings.items()
+    }
+    occurrences_by_ref: dict[str, list[_CarrierOccurrence]] = defaultdict(list)
+    for occurrence in state.carrier_occurrences:
+        for ref in occurrence.payload_refs:
+            occurrences_by_ref[ref].append(occurrence)
+
+    flattened_carriers: set[str] = set()
+    flattened_carriers_by_target: dict[int, set[str]] = defaultdict(set)
+    flattened_unit_orders_by_target: dict[int, set[int]] = defaultdict(set)
+    flattened_refs_by_target: dict[int, list[_ProofSourceRef]] = defaultdict(list)
+    leak_count = 0
+    for node_id, target_node_id in sorted(structure.flattened_node_targets.items()):
+        heading = structure.headings[node_id]
+        expected_path = tuple(
+            item.title for item in paths.get(target_node_id, ())
+        )
+        node_carriers: set[str] = set()
+        node_reasons: set[str] = set()
+        for proof_ref in heading.source_refs:
+            flattened_refs_by_target[target_node_id].append(proof_ref)
+            claims = [
+                claim
+                for claim in state.selector_claims.get(proof_ref.ref, ())
+                if _selector_covers_proof_source(
+                    claim,
+                    proof_ref=proof_ref,
+                    source=source,
+                )
+            ]
+            payload_claims = [claim for claim in claims if claim.role == "payload"]
+            structure_claims = [
+                claim for claim in claims if claim.role == "structure"
+            ]
+            if len(payload_claims) != 1:
+                node_reasons.add("source_not_exactly_once_as_payload")
+            if structure_claims:
+                node_reasons.add("source_retained_heading_projection")
+
+            occurrences = occurrences_by_ref.get(proof_ref.ref, ())
+            matching_occurrences = {
+                occurrence.carrier_id: occurrence
+                for occurrence in occurrences
+                if any(
+                    claim.carrier_id == occurrence.carrier_id
+                    for claim in payload_claims
+                )
+            }
+            if len(matching_occurrences) != 1:
+                node_reasons.add("source_has_no_single_coarse_owner")
+            for carrier_id, occurrence in matching_occurrences.items():
+                node_carriers.add(carrier_id)
+                flattened_carriers.add(carrier_id)
+                flattened_carriers_by_target[target_node_id].add(carrier_id)
+                flattened_unit_orders_by_target[target_node_id].add(
+                    occurrence.unit_order
+                )
+                if occurrence.heading_path != expected_path:
+                    node_reasons.add("source_claims_unaccepted_owner")
+                if any(
+                    any(
+                        selector.ref == proof_ref.ref
+                        for selector in projection.selectors
+                    )
+                    for projection in occurrence.headings
+                ):
+                    node_reasons.add("source_published_as_heading")
+            if state.active_search_ref_counts.get(proof_ref.ref, 0) > 1:
+                node_reasons.add("source_has_duplicate_active_search")
+
+        if len(node_carriers) != 1:
+            node_reasons.add("flattened_title_split_across_carriers")
+        if node_reasons:
+            leak_count += 1
+            _audit_error(
+                findings,
+                "flattened_heading_authority_leak",
+                (
+                    f"flattened heading node {node_id} escaped its coarse "
+                    f"owner: {', '.join(sorted(node_reasons))}"
+                ),
+                source_ref=(heading.source_refs[0].ref if heading.source_refs else None),
+            )
+
+    for target_node_id, proof_refs in sorted(flattened_refs_by_target.items()):
+        target_path = paths[target_node_id]
+        expected_titles = tuple(heading.title for heading in target_path)
+        target_unit_orders = {
+            occurrence.unit_order
+            for occurrence in state.carrier_occurrences
+            if occurrence.heading_path == expected_titles
+            and _occurrence_projects_proof_path(
+                occurrence,
+                expected=target_path,
+            )
+        }
+        target_reasons: set[str] = set()
+        if len(target_unit_orders) != 1 or (
+            flattened_unit_orders_by_target[target_node_id] != target_unit_orders
+        ):
+            target_reasons.add("flattened_source_has_independent_search_target")
+
+        flattened_carrier_ids = flattened_carriers_by_target[target_node_id]
+        for projection in state.payload_projections:
+            if projection.carrier_id not in flattened_carrier_ids or not any(
+                _selector_covers_proof_source(
+                    selector,
+                    proof_ref=proof_ref,
+                    source=source,
+                )
+                for selector in projection.selectors
+                for proof_ref in proof_refs
+            ):
+                continue
+            physical_order = tuple(
+                _selector_physical_order_key(selector, source=source)
+                for selector in projection.selectors
+            )
+            if physical_order != tuple(sorted(physical_order)):
+                target_reasons.add("flattened_payload_selector_order_invalid")
+        if target_reasons:
+            leak_count += 1
+            _audit_error(
+                findings,
+                "flattened_heading_authority_leak",
+                (
+                    f"flattened target node {target_node_id} escaped its "
+                    f"coarse owner: {', '.join(sorted(target_reasons))}"
+                ),
+                source_ref=(proof_refs[0].ref if proof_refs else None),
+            )
+
+    return {
+        "status": CURRENT_PUBLIC_HIERARCHY_STATUS,
+        "max_published_heading_path_depth": max(
+            (len(occurrence.heading_path) for occurrence in state.carrier_occurrences),
+            default=0,
+        ),
+        "flattened_heading_count": len(structure.flattened_node_targets),
+        "flattened_heading_carrier_count": len(flattened_carriers),
+        "flattened_heading_authority_leak_count": leak_count,
+    }
+
+
+def _selector_covers_proof_source(
+    selector: _ResolvedSelector,
+    *,
+    proof_ref: _ProofSourceRef,
+    source: _SourceIndex,
+) -> bool:
+    if selector.ref != proof_ref.ref or selector.kind != proof_ref.field:
+        return False
+    if selector.field.get("index") != proof_ref.index:
+        return False
+    raw_span = selector.field.get("char_span")
+    if raw_span is None:
+        value = source.elements[proof_ref.ref].get(proof_ref.field)
+        return bool(
+            isinstance(value, str)
+            and 0 <= proof_ref.text_span[0] <= proof_ref.text_span[1] <= len(value)
+        )
+    return tuple(raw_span) == proof_ref.text_span
+
+
+def _occurrence_projects_proof_path(
+    occurrence: _CarrierOccurrence,
+    *,
+    expected: tuple[_ProofHeading, ...],
+) -> bool:
+    projected = tuple(sorted(occurrence.headings, key=lambda item: item.target_index))
+    return bool(
+        len(projected) == len(expected)
+        and all(
+            actual.target_index == index
+            and _heading_projection_matches_proof(actual, heading=heading)
+            for index, (actual, heading) in enumerate(
+                zip(projected, expected, strict=True)
+            )
+        )
+    )
+
+
+def _selector_physical_order_key(
+    selector: _ResolvedSelector,
+    *,
+    source: _SourceIndex,
+) -> tuple[int, int, int, int]:
+    raw_order = source.elements[selector.ref].get("order_index")
+    order = (
+        raw_order
+        if isinstance(raw_order, int) and not isinstance(raw_order, bool)
+        else -1
+    )
+    raw_index = selector.field.get("index")
+    index = (
+        raw_index
+        if isinstance(raw_index, int) and not isinstance(raw_index, bool)
+        else -1
+    )
+    raw_span = selector.field.get("char_span")
+    span = (
+        tuple(raw_span)
+        if isinstance(raw_span, list)
+        and len(raw_span) == 2
+        and all(isinstance(value, int) for value in raw_span)
+        else (-1, -1)
+    )
+    return order, index, int(span[0]), int(span[1])
 
 
 def _proof_heading_path(

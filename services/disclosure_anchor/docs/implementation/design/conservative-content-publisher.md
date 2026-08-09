@@ -66,11 +66,12 @@ carrier，但后者的 provider 类型不提供标题票；全部 carrier 必须
 section 只由可信 heading start 建立；结束位置由下一个可信 start 自然产生。不再消费
 `accepted_content_interval`，也不要求 1,504 个历史 interval 的 exact endpoint。
 
-当前 simple95 cutover 只发布标题节点的物理顺序和 section start，不宣称已经恢复完整祖先层级。
-`heading_path` 在该能力级别最多包含当前标题本身，`hierarchy_status=flattened_unresolved`；因此 L2
-可以按标题和内容定位，但不能把单层 path 当成完整章节树。层级边缺失是 P2 召回/上下文能力缺口，
-不得用未经证明的编号栈、provider level 或旧 final units 补造。它不改变 payload 的唯一 owner、
-source order 或内容守恒。
+当前 simple95 cutover 发布可信标题节点、物理顺序和 section start，但不宣称所有祖先边均已恢复。
+`heading_path` 原样保留 producer 已发布的路径（包括有 source proof 的多段路径），不得为了能力声明
+截短；document/run 级 `hierarchy_status=flattened_unresolved` 明确表示这些路径不能被理解为全文件
+exact tree。层级边缺失是 P2 召回/上下文能力缺口，不得用未经证明的编号栈、provider level 或旧
+final units 补造。它不改变 payload 的唯一 owner、source order 或内容守恒。只有未来独立的完整
+层级证明门通过后，新 run 才可声明 `exact_proven`。
 
 ## 4. Owner 与内容守恒
 

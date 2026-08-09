@@ -246,6 +246,9 @@ class BuildUnits:
             source_files = normalized_ir["parser_artifacts"]["files"]
             gate_receipt = {
                 **publication_gate.as_dict(),
+                "hierarchy_capability": dict(
+                    cast(Mapping[str, Any], report.metrics["hierarchy_capability"])
+                ),
                 "document_id": document.document_id,
                 "processing_run_id": run.processing_run_id,
                 "source_pdf_sha256": normalized_ir["source_pdf_sha256"],

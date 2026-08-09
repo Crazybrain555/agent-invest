@@ -69,6 +69,10 @@ class FilingApiContractsTests(unittest.TestCase):
                     set(schema["$defs"]["EvidenceRefV1"]["properties"]),
                     {"uri", "sha256", "size_bytes", "media_type"},
                 )
+                self.assertEqual(
+                    set(schema["properties"]["hierarchy_status"]["enum"]),
+                    {"flattened_unresolved", "exact_proven"},
+                )
             if name == "document_unit":
                 self.assertEqual(
                     schema["properties"]["heading_path_text"],

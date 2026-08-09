@@ -1382,6 +1382,11 @@ def _summary(
     native_diagnostics: Counter[str] = Counter()
     native_unresolved_reasons: Counter[str] = Counter()
     native_object_issues: Counter[str] = Counter()
+    hierarchy_statuses: Counter[str] = Counter()
+    max_published_heading_path_depth = 0
+    flattened_heading_count = 0
+    flattened_heading_carrier_count = 0
+    flattened_heading_authority_leak_count = 0
     structure_conflict_documents = 0
     native_object_issue_documents = 0
     fallback_documents = 0
@@ -1399,6 +1404,22 @@ def _summary(
         unit_count = int(metrics.get("unit_count") or 0)
         total_units += unit_count
         unit_kinds.update(metrics.get("unit_kinds") or {})
+        hierarchy = metrics.get("hierarchy_capability") or {}
+        if isinstance(hierarchy, Mapping):
+            hierarchy_statuses[str(hierarchy.get("status") or "missing")] += 1
+            max_published_heading_path_depth = max(
+                max_published_heading_path_depth,
+                int(hierarchy.get("max_published_heading_path_depth") or 0),
+            )
+            flattened_heading_count += int(
+                hierarchy.get("flattened_heading_count") or 0
+            )
+            flattened_heading_carrier_count += int(
+                hierarchy.get("flattened_heading_carrier_count") or 0
+            )
+            flattened_heading_authority_leak_count += int(
+                hierarchy.get("flattened_heading_authority_leak_count") or 0
+            )
         observations = result.get("source_observations") or {}
         document_conflicts = observations.get("structure_conflicts") or {}
         structure_conflicts.update(document_conflicts)
@@ -1468,6 +1489,19 @@ def _summary(
         "unit_kinds": dict(sorted(unit_kinds.items())),
         "finding_codes": dict(sorted(finding_codes.items())),
         "failure_families": dict(sorted(failure_families.items())),
+        "hierarchy_capability": {
+            "status_counts": dict(sorted(hierarchy_statuses.items())),
+            "max_published_heading_path_depth": (
+                max_published_heading_path_depth
+            ),
+            "flattened_heading_count": flattened_heading_count,
+            "flattened_heading_carrier_count": (
+                flattened_heading_carrier_count
+            ),
+            "flattened_heading_authority_leak_count": (
+                flattened_heading_authority_leak_count
+            ),
+        },
         "source_observations": {
             "documents_with_structure_conflicts": (structure_conflict_documents),
             "structure_conflicts": dict(sorted(structure_conflicts.items())),

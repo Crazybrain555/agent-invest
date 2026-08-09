@@ -1,4 +1,4 @@
-"""Project a root heading path as the empty breadcrumb string.
+"""Project root breadcrumbs and the current hierarchy capability honestly.
 
 Revision ID: 0032_root_heading_path_text
 Revises: 0031_artifact_owner_run
@@ -17,6 +17,7 @@ from alembic import op
 from disclosure_anchor.adapters.db.postgres.schema import (
     CORE_SCHEMA,
     PUBLIC_SCHEMA,
+    READ_ONLY_PUBLIC_ROLES,
 )
 
 
@@ -27,14 +28,44 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute(_document_units_view_sql(root_empty_string=True))
+    op.execute(
+        _document_units_view_sql(
+            root_empty_string=True,
+            include_hierarchy_status=True,
+        )
+    )
+    op.execute(_source_refs_view_sql(include_hierarchy_status=True))
+    op.execute(_document_outline_view_sql(include_hierarchy_status=True))
 
 
 def downgrade() -> None:
-    op.execute(_document_units_view_sql(root_empty_string=False))
+    # CREATE OR REPLACE cannot remove a view column.  These three public views
+    # have no view-on-view dependency, so recreate their prior exact contracts
+    # and restore grants explicitly.
+    for view in ("document_outline_v1", "source_refs_v1", "document_units_v1"):
+        op.execute(f"DROP VIEW IF EXISTS {PUBLIC_SCHEMA}.{view}")
+    op.execute(
+        _document_units_view_sql(
+            root_empty_string=False,
+            include_hierarchy_status=False,
+        )
+    )
+    op.execute(_source_refs_view_sql(include_hierarchy_status=False))
+    op.execute(_document_outline_view_sql(include_hierarchy_status=False))
+    for role in READ_ONLY_PUBLIC_ROLES:
+        for view in (
+            "document_units_v1",
+            "source_refs_v1",
+            "document_outline_v1",
+        ):
+            op.execute(f"GRANT SELECT ON {PUBLIC_SCHEMA}.{view} TO {role}")
 
 
-def _document_units_view_sql(*, root_empty_string: bool) -> str:
+def _document_units_view_sql(
+    *,
+    root_empty_string: bool,
+    include_hierarchy_status: bool = True,
+) -> str:
     breadcrumb = """
         (SELECT string_agg(seg.value, ' > ' ORDER BY seg.ordinality)
            FROM jsonb_array_elements_text(u.heading_path)
@@ -43,6 +74,11 @@ def _document_units_view_sql(*, root_empty_string: bool) -> str:
     """.strip()
     if root_empty_string:
         breadcrumb = f"COALESCE({breadcrumb}, ''::text)"
+    hierarchy_status = (
+        ",\n        'flattened_unresolved'::text AS hierarchy_status"
+        if include_hierarchy_status
+        else ""
+    )
     return f"""
     CREATE OR REPLACE VIEW {PUBLIC_SCHEMA}.document_units_v1 AS
     SELECT
@@ -91,12 +127,74 @@ def _document_units_view_sql(*, root_empty_string: bool) -> str:
         u.query_projection_hash,
         d.class_publisher_categories AS publisher_categories,
         d.class_market AS market,
-        d.class_content_categories AS content_categories
+        d.class_content_categories AS content_categories{hierarchy_status}
     FROM {CORE_SCHEMA}.document_unit u
     JOIN {CORE_SCHEMA}.document d ON d.document_id = u.document_id
     LEFT JOIN {CORE_SCHEMA}.security s ON s.security_id = d.security_id
     JOIN {CORE_SCHEMA}.processing_run r
       ON r.processing_run_id = u.processing_run_id
+    """
+
+
+def _source_refs_view_sql(*, include_hierarchy_status: bool) -> str:
+    hierarchy_status = (
+        ",\n        'flattened_unresolved'::text AS hierarchy_status"
+        if include_hierarchy_status
+        else ""
+    )
+    return f"""
+    CREATE OR REPLACE VIEW {PUBLIC_SCHEMA}.source_refs_v1 AS
+    SELECT
+        'disclosure_anchor'::text AS service,
+        'source_ref.v1'::text AS contract_version,
+        u.asset_id,
+        d.source_access_id,
+        u.document_id,
+        d.provider,
+        d.provider_document_id,
+        d.raw_file_hash,
+        u.processing_run_id,
+        COALESCE(r.is_active, false) AS is_active_run,
+        u.payload_kind,
+        u.heading_path,
+        u.title,
+        u.content_hash AS unit_content_hash,
+        u.quality_status,
+        u.applicability,
+        u.page_no,
+        u.artifact_locator{hierarchy_status}
+    FROM {CORE_SCHEMA}.document_unit u
+    JOIN {CORE_SCHEMA}.document d ON d.document_id = u.document_id
+    JOIN {CORE_SCHEMA}.processing_run r
+      ON r.processing_run_id = u.processing_run_id
+    """
+
+
+def _document_outline_view_sql(*, include_hierarchy_status: bool) -> str:
+    hierarchy_status = (
+        ",\n               'flattened_unresolved'::text AS hierarchy_status"
+        if include_hierarchy_status
+        else ""
+    )
+    return f"""
+    CREATE OR REPLACE VIEW {PUBLIC_SCHEMA}.document_outline_v1 AS
+    SELECT u.document_id,
+           u.heading_path AS path,
+           jsonb_array_length(u.heading_path) AS depth,
+           count(*) AS unit_count,
+           count(*) FILTER (WHERE u.payload_kind = 'table') AS table_count,
+           count(*) FILTER (WHERE u.payload_kind = 'image') AS image_count,
+           array_agg(DISTINCT u.semantic_key)
+               FILTER (WHERE u.semantic_key IS NOT NULL) AS semantic_keys,
+           min(u.page_no) AS page_from,
+           max(u.page_no) AS page_to,
+           min(u.order_index) AS first_order_index,
+           'document_outline.v1'::text AS contract_version{hierarchy_status}
+      FROM {CORE_SCHEMA}.document_unit u
+      JOIN {CORE_SCHEMA}.processing_run pr
+        ON pr.processing_run_id = u.processing_run_id
+     WHERE pr.is_active
+     GROUP BY u.document_id, u.heading_path
     """
 
 

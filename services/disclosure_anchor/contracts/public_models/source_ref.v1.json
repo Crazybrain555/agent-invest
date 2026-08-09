@@ -81,6 +81,14 @@
       "title": "Heading Path",
       "type": "array"
     },
+    "hierarchy_status": {
+      "enum": [
+        "flattened_unresolved",
+        "exact_proven"
+      ],
+      "title": "Hierarchy Status",
+      "type": "string"
+    },
     "is_active_run": {
       "title": "Is Active Run",
       "type": "boolean"
@@ -185,6 +193,7 @@
     "is_active_run",
     "payload_kind",
     "heading_path",
+    "hierarchy_status",
     "title",
     "unit_content_hash",
     "quality_status",

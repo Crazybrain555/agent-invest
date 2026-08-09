@@ -88,7 +88,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 |---|---|
 | asset_id | `du_`+ULID；跨 run 不承诺同 ID，身份=content_hash |
 | payload_kind | 闭集 text / table / qa「历史值：旧产物存在、2026-07-16 起不再产出（QA 判别已移除，转写以 raw text 落地）」/ **mixed**（业务块，payload=semantic_type+有序 parts）。mixed 的 part 级 kind ∈ {text, table, **image**}；image part/壳 payload = `{image_ref, caption, context, content?, notes?, visual_kind, visual_subtype?}`，其中 image_ref = 归档视觉产物的内容寻址 sha256，visual_kind ∈ {image, chart, equation}，visual_subtype? = MinerU sub_type 透传（如 seal/bar） |
-| heading_path | jsonb 完整**源标题路径**（有 heading 时非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text；路径来自 typed heading/outline 结构，不来自 caption 或 taxonomy |
+| heading_path | jsonb 已发布标题路径（有 heading 时非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text；路径来自 typed heading/outline 结构，不来自 caption 或 taxonomy；是否具备完整祖先闭包由 public hierarchy_status 单独声明，不能从 path 深度猜测 |
 | title | 结构叶子显示名：有标题路径时等于其叶节点；无标题文档可等于登记文档标题；table/image caption、单位、脚注不得填入 title |
 | semantic_key | 单值 L2 路由键（通用规则→监管 taxonomy→`document_content` 通用内容键）；ub-2026.07-26 新产物非空，库列仅为历史兼容仍可空；不参与标题、边界、内容归属或删除；btree 索引 |
 | semantic_keys | jsonb 非空路由键数组；无更窄概念时为 `["document_content"]`（ub-2026.07-26；库列仅为历史兼容仍可空）；GIN(jsonb_ops) 支持 `? / ?| / ?&`；任何规则升级只改变检索投影，不得改变证据 payload/boundary |
@@ -116,12 +116,13 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 ## 3. disclosure_public 视图（唯一读契约）
 
-- **document_units_v1（41 列）**：core 列 + 派生（is_active_run、heading_path_text 面包屑、
+- **document_units_v1（42 列）**：core 列 + 派生（is_active_run、heading_path_text 面包屑、
   publisher_categories/market/content_categories 三维拆解、现算 filing_type/disclosure_topics、
   contract_version、company_ref/security_ref、security_code/exchange、filing_type、
   disclosure_topics、report_period、announcement_date、source_ref、parent_ref、asset_kind、
-  observed_at、source_tier、trace_level、raw_file_hash）。列集权威=contract-checklist §2。
-- documents_v1 / processing_runs_v1 / source_refs_v1 / change_events_v1 / document_categories_v1。
+  observed_at、source_tier、trace_level、raw_file_hash、hierarchy_status）。列集权威=contract-checklist §2。
+- documents_v1 / processing_runs_v1 / source_refs_v1 / document_outline_v1 / change_events_v1 /
+  document_categories_v1。
 - **tracked_companies_v1（0019+0020，round22）**：股票池读契约——真源是 tracked_company 表
   （watchlist.csv 降级为导入/快照）。视图只暴露 raw 覆盖列（NULL=继承）+ 生命周期事实列
   （legal_name_status pending/resolved、last_synced_at、synced_through——Miniflux

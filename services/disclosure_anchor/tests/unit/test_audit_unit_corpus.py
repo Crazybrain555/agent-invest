@@ -318,7 +318,17 @@ class CorpusObservabilityTests(unittest.TestCase):
                     "failure_family": None,
                     "company_name": "甲",
                     "filing_type": "annual_report",
-                    "metrics": {"unit_count": 1, "unit_kinds": {"table": 1}},
+                    "metrics": {
+                        "unit_count": 1,
+                        "unit_kinds": {"table": 1},
+                        "hierarchy_capability": {
+                            "status": "flattened_unresolved",
+                            "max_published_heading_path_depth": 2,
+                            "flattened_heading_count": 3,
+                            "flattened_heading_carrier_count": 1,
+                            "flattened_heading_authority_leak_count": 0,
+                        },
+                    },
                     "source_observations": observations,
                     "findings": [],
                 },
@@ -343,6 +353,19 @@ class CorpusObservabilityTests(unittest.TestCase):
         self.assertEqual(
             summary["failure_families"],
             {"native_structure_invalid": 1},
+        )
+        self.assertEqual(
+            summary["hierarchy_capability"],
+            {
+                "status_counts": {
+                    "flattened_unresolved": 1,
+                    "missing": 1,
+                },
+                "max_published_heading_path_depth": 2,
+                "flattened_heading_count": 3,
+                "flattened_heading_carrier_count": 1,
+                "flattened_heading_authority_leak_count": 0,
+            },
         )
         source_summary = summary["source_observations"]
         self.assertEqual(

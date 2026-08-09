@@ -37,14 +37,31 @@ class MigrationStateTests(unittest.TestCase):
             "0032_root_heading_path_text"
         )
 
-        upgraded = migration._document_units_view_sql(root_empty_string=True)
-        downgraded = migration._document_units_view_sql(root_empty_string=False)
+        upgraded = migration._document_units_view_sql(
+            root_empty_string=True,
+            include_hierarchy_status=True,
+        )
+        downgraded = migration._document_units_view_sql(
+            root_empty_string=False,
+            include_hierarchy_status=False,
+        )
 
         self.assertIn("COALESCE((SELECT string_agg", upgraded)
         self.assertIn("''::text", upgraded)
         self.assertNotIn("COALESCE((SELECT string_agg", downgraded)
         self.assertIn("u.heading_path", upgraded)
         self.assertIn("u.title", upgraded)
+        self.assertIn("flattened_unresolved", upgraded)
+        self.assertNotIn("hierarchy_status", downgraded)
+        self.assertIn(
+            "flattened_unresolved",
+            migration._source_refs_view_sql(include_hierarchy_status=True),
+        )
+        outline = migration._document_outline_view_sql(
+            include_hierarchy_status=True
+        )
+        self.assertIn("u.heading_path AS path", outline)
+        self.assertIn("flattened_unresolved", outline)
 
 
 if __name__ == "__main__":
