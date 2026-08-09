@@ -28,6 +28,7 @@ The table-driven mutations must prove:
 | target transform/grouping | query/search plan |
 | PublicationGate pass to block | publication outcome |
 | all asset IDs replaced | no receipt byte change |
+| provider changed with otherwise identical identity | receipt bytes change; diff rejects |
 | duplicate multiplicity | content change |
 | stored hash/root tamper | reject |
 | rules/version label only | never content |

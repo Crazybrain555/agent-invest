@@ -93,6 +93,7 @@ _BINDING_FIELDS = frozenset(
         "code_commit_sha",
         "corpus_manifest_sha256",
         "document_id",
+        "provider",
         "provider_document_id",
         "source_pdf_sha256",
         "processing_run_id",
@@ -528,7 +529,7 @@ def diff_run_receipts(
 
     validate_run_receipt(before)
     validate_run_receipt(after)
-    for field in ("document_id", "provider_document_id"):
+    for field in ("document_id", "provider", "provider_document_id"):
         if before[field] != after[field]:
             raise ReceiptContractError(
                 f"cannot diff receipts for different {field} values"
@@ -672,7 +673,10 @@ def diff_run_receipts(
         },
         "run_binding": {
             field: _changed(before[field], after[field])
-            for field in sorted(_BINDING_FIELDS - {"document_id", "provider_document_id"})
+            for field in sorted(
+                _BINDING_FIELDS
+                - {"document_id", "provider", "provider_document_id"}
+            )
         },
     }
     root_explanations: dict[str, list[str]] = {}
@@ -711,6 +715,7 @@ def diff_run_receipts(
     diff: dict[str, Any] = {
         "receipt_contract_version": DIFF_RECEIPT_VERSION,
         "document_id": before["document_id"],
+        "provider": before["provider"],
         "provider_document_id": before["provider_document_id"],
         "before_processing_run_id": before["processing_run_id"],
         "after_processing_run_id": after["processing_run_id"],
@@ -872,6 +877,7 @@ def _verified_run_binding(
             "code_commit_sha": code_commit_sha,
             "corpus_manifest_sha256": corpus_manifest_sha256,
             "document_id": entry.document_id,
+            "provider": entry.provider,
             "provider_document_id": entry.provider_document_id,
             "source_pdf_sha256": source_pdf_sha,
             "processing_run_id": entry.processing_run_id,
@@ -904,7 +910,12 @@ def _validated_binding(value: Mapping[str, Any]) -> dict[str, Any]:
         item = value[field]
         if not isinstance(item, str) or _SHA256_RE.fullmatch(item) is None:
             raise ReceiptContractError(f"{field} is not a SHA-256 digest")
-    for field in ("document_id", "provider_document_id", "processing_run_id"):
+    for field in (
+        "document_id",
+        "provider",
+        "provider_document_id",
+        "processing_run_id",
+    ):
         _required_text(value[field], field)
     artifacts = value["provider_artifact_hashes"]
     if not isinstance(artifacts, Mapping) or not artifacts:
@@ -1038,7 +1049,8 @@ def load_run_receipts(path: Path) -> list[dict[str, Any]]:
         validate_run_receipt(decoded)
         receipts.append(decoded)
     identities = [
-        (item["provider_document_id"], item["document_id"]) for item in receipts
+        (item["provider"], item["provider_document_id"], item["document_id"])
+        for item in receipts
     ]
     if len(identities) != len(set(identities)):
         raise ReceiptContractError("receipt file contains duplicate documents")
@@ -1332,6 +1344,7 @@ def _build_run_command(args: argparse.Namespace) -> int:
         )
     receipts.sort(
         key=lambda item: (
+            cast(str, item["provider"]),
             cast(str, item["provider_document_id"]),
             cast(str, item["document_id"]),
         )
@@ -1658,6 +1671,7 @@ RUN_RECEIPT_SCHEMA: dict[str, Any] = {
         "code_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "corpus_manifest_sha256": _DIGEST_SCHEMA,
         "document_id": {"type": "string", "minLength": 1},
+        "provider": {"type": "string", "minLength": 1},
         "provider_document_id": {"type": "string", "minLength": 1},
         "source_pdf_sha256": _DIGEST_SCHEMA,
         "processing_run_id": {"type": "string", "minLength": 1},
@@ -1733,7 +1747,9 @@ _PUBLICATION_COUNT_FIELDS = (
     "findings",
 )
 _RUN_BINDING_COUNT_FIELDS = tuple(
-    sorted(_BINDING_FIELDS - {"document_id", "provider_document_id"})
+    sorted(
+        _BINDING_FIELDS - {"document_id", "provider", "provider_document_id"}
+    )
 )
 _EXPLANATION_LABELS = [
     "content_delta",
@@ -1750,6 +1766,7 @@ DIFF_RECEIPT_SCHEMA: dict[str, Any] = {
     "required": [
         "receipt_contract_version",
         "document_id",
+        "provider",
         "provider_document_id",
         "before_processing_run_id",
         "after_processing_run_id",
@@ -1766,6 +1783,7 @@ DIFF_RECEIPT_SCHEMA: dict[str, Any] = {
     "properties": {
         "receipt_contract_version": {"const": DIFF_RECEIPT_VERSION},
         "document_id": {"type": "string", "minLength": 1},
+        "provider": {"type": "string", "minLength": 1},
         "provider_document_id": {"type": "string", "minLength": 1},
         "before_processing_run_id": {"type": "string", "minLength": 1},
         "after_processing_run_id": {"type": "string", "minLength": 1},

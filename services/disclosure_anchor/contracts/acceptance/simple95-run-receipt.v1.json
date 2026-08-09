@@ -412,6 +412,10 @@
       "minLength": 1,
       "type": "string"
     },
+    "provider": {
+      "minLength": 1,
+      "type": "string"
+    },
     "provider_artifact_hashes": {
       "additionalProperties": {
         "additionalProperties": false,
@@ -572,6 +576,7 @@
     "parse_receipt_sha256",
     "parser_target_sha256",
     "processing_run_id",
+    "provider",
     "provider_artifact_hashes",
     "provider_document_id",
     "publication_gate",

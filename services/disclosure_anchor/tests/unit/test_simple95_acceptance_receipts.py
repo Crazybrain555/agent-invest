@@ -58,6 +58,7 @@ def _binding(*, processing_run_id: str = "run_1") -> dict[str, object]:
         "code_commit_sha": "1" * 40,
         "corpus_manifest_sha256": _DIGEST,
         "document_id": "doc_1",
+        "provider": "fixture",
         "provider_document_id": "provider_doc_1",
         "source_pdf_sha256": _DIGEST,
         "processing_run_id": processing_run_id,
@@ -426,6 +427,18 @@ class Simple95AcceptanceReceiptTests(unittest.TestCase):
         self.assertFalse(diff["content_delta"])
         self.assertTrue(diff["query_search_plan_delta"])
 
+        other_provider_binding = _binding()
+        other_provider_binding["provider"] = "other_provider"
+        other_provider = _receipt(drafts, binding=other_provider_binding)
+        self.assertNotEqual(
+            canonical_receipt_bytes(first),
+            canonical_receipt_bytes(other_provider),
+        )
+        with self.assertRaisesRegex(
+            ReceiptContractError, "different provider values"
+        ):
+            diff_run_receipts(first, other_provider)
+
     def test_duplicate_multiplicity_is_detected(self) -> None:
         before = _receipt([_draft()])
         after = _receipt([_draft(), _draft()])
@@ -479,6 +492,7 @@ class Simple95AcceptanceReceiptTests(unittest.TestCase):
                 code_commit_sha="1" * 40,
                 corpus_manifest_sha256=_DIGEST,
             )
+            self.assertEqual(receipt["provider"], "fixture")
             self.assertEqual(receipt["parse_receipt_sha256"], receipt[
                 "provider_artifact_hashes"
             ]["parse_receipt"]["sha256"])

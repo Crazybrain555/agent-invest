@@ -28,6 +28,7 @@ _BINDING = {
     "code_commit_sha": "1" * 40,
     "corpus_manifest_sha256": _DIGEST,
     "document_id": "doc_1",
+    "provider": "fixture",
     "provider_document_id": "provider_doc_1",
     "source_pdf_sha256": _DIGEST,
     "processing_run_id": "run_1",

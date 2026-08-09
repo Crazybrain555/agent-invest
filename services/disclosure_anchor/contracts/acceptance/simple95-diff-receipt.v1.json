@@ -259,6 +259,10 @@
       "minLength": 1,
       "type": "string"
     },
+    "provider": {
+      "minLength": 1,
+      "type": "string"
+    },
     "provider_document_id": {
       "minLength": 1,
       "type": "string"
@@ -357,6 +361,7 @@
   "required": [
     "receipt_contract_version",
     "document_id",
+    "provider",
     "provider_document_id",
     "before_processing_run_id",
     "after_processing_run_id",

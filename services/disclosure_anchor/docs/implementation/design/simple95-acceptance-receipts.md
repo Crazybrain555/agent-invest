@@ -27,7 +27,8 @@ it does not claim RFC 8785/JCS conformance.
 Every receipt carries and validates:
 
 - full 40-character `code_commit_sha` and the exact corpus-manifest SHA-256;
-- document/provider/run identity and the verified source-PDF SHA-256;
+- `document_id`, `provider`, provider-scoped `provider_document_id`,
+  `processing_run_id` and the verified source-PDF SHA-256;
 - parser-target, parse-receipt, frozen NormalizedIR and source-evidence hashes;
 - a sorted role-to-`{sha256,size_bytes}` map for every present provider
   artifact, after reading and verifying the actual bytes;
@@ -39,6 +40,9 @@ Receipt generation requires `normalized_ir.v4`, the current
 semantics replay, and present core provider artifacts. Frozen v1 generations
 remain auditable but cannot receive a current run receipt. No null, placeholder
 or reconstructed parse-receipt identity is legal.
+Diffing rejects a change in `document_id`, `provider` or
+`provider_document_id`; a corpus-manifest digest is not a substitute for the
+explicit provider namespace carried by a standalone receipt.
 
 ## 3. Four semantic projections
 
