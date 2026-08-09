@@ -129,9 +129,10 @@ disclosure_public.unit_search_atoms_v1
 
 `unit_search_projection_v1`（0025+0028，06R 派生检索投影层）：原 11 列及顺序保持不变；
 `unit_body_search_windows_v1` 只承载 PostgreSQL 无法无损表示的 body token 连续窗。两者全部
-可由已持久化 unit
-确定性再生，不进 content/query_projection 哈希、重建不产生 outbox 事件；non-evidence 派生面，
-与 documents/units 事实视图区别对待。
+可由已持久化 unit 确定性再生；派生 search rows、atom_text、tokens 和 windows 不进入
+content_hash / query_projection_hash，重建不产生 outbox 事件。决定这些 rows 的 typed
+`source_projection` 必须先被验证，其 canonical `search_plan` 进入 query_projection_hash。
+这些 rows 是 non-evidence 派生面，与 documents/units 事实视图区别对待。
 
 `unit_search_atoms_v1`（0030）列顺序固定为 `asset_id / atom_index / atom_text /
 retrieval_rules_version / built_at`；每行来自 explicit search target 的一个非空叶子，禁止跨
@@ -171,6 +172,7 @@ is_active_run
 asset_id
 payload_kind
 heading_path
+hierarchy_status
 title
 unit_content_hash
 quality_status

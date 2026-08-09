@@ -52,8 +52,12 @@ GET /v1/units/{asset_id}/source-ref source_refs_v1 单行投影
 GET /v1/units/{asset_id}/context   运行时上下文包装（实施方案 §9.6/§14.3）。响应结构定死：
                                    {"asset_id","asset_uri","is_active_run",
                                     "document": <document.v1 DTO 全量>,
-                                    "heading_path","title","payload"
+                                    "heading_path","hierarchy_status","title","payload",
+                                    "evidence_refs"
                                     [,"excerpt","start","end","excerpt_hash"]}
+                                   当前 producer 的 hierarchy_status 固定为
+                                   flattened_unresolved；它声明路径可导航，但不宣称全文件祖先
+                                   层级已经 exact closure。
                                    excerpt 算法定死：源串 = canonical_json(payload)（复用
                                    05-U2 的 json.dumps 参数）；start/end 为 Unicode 码点偏移，
                                    start=0、end=min(max_chars, len(源串))，excerpt=源串[start:end]；

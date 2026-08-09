@@ -76,7 +76,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | status | running / succeeded / failed；stale running 由 worker 按阈值回收 |
 | is_active | 每文档唯一 true（发布原子切换） |
 | artifact_owner_processing_run_id | 实际拥有 parser artifact / NormalizedIR 字节的根 parse run；parse=self，rebuild 传播根 owner，不能从路径文本反推 |
-| builder_rules_version | 恒等于 rules.RULES_VERSION（当前 ub-2026.07-83）；单一代=同版本 |
+| builder_rules_version | 恒等于 `application/services/unit_builder/rules.py::RULES_VERSION`；单一代=同版本 |
 | parser_target_identity | 产生该 run 的完整 parser target（backend/method/language/runtime bundle identity）；不从零散 parser_* 列反推 |
 | search_projection_error | 当前 retrieval_rules_version 的确定性、非重试检索投影终态；delta 不空转，full 可显式重试，成功替换时同事务清空 |
 | content_hash_aggregate / structure_hash | run 级聚合（U3）；"内容没变"只看前者 |
@@ -93,7 +93,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | semantic_key | 单值 L2 路由键（通用规则→监管 taxonomy→`document_content` 通用内容键）；ub-2026.07-26 新产物非空，库列仅为历史兼容仍可空；不参与标题、边界、内容归属或删除；btree 索引 |
 | semantic_keys | jsonb 非空路由键数组；无更窄概念时为 `["document_content"]`（ub-2026.07-26；库列仅为历史兼容仍可空）；GIN(jsonb_ops) 支持 `? / ?| / ?&`；任何规则升级只改变检索投影，不得改变证据 payload/boundary |
 | payload | 原始证据内容；mixed payload 还保存 `semantic_type` 与每个 part 的路径/适用性/质量/定位注解。视觉 carrier 无资产文件但仍有 typed caption/content/footnote 时，以 `needs_review` 文本证据保留这些字段及 source projection；真正无路径且无可读 typed 字段才失败。当前表格必须有非空 HTML、可解析 grid、页内 model 闭合和 crop，失败时不发布错误 payload。`content_hash` 使用去除规则与位置注解后的 canonical content projection，不直接 hash 整个 mixed payload |
-| content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；projection 含 title/heading/semantic_key(s)/quality/applicability，以及 mixed part 的规则型路径、质量和适用性注解；来源 `artifact_locator` 不进入 content/query identity |
+| content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；projection 含 title/heading/semantic_key(s)/quality/applicability，以及 mixed part 的规则型路径、质量和适用性注解。raw `artifact_locator` 的 page/bbox/path/runtime/provenance hash 不进入 content/query identity；但 locator 中的 typed `source_projection` 必须先被验证并投影成 canonical `search_plan`，该 plan 进入 `query_projection_hash` |
 | quality_status | ok / needs_review / unusable（乱码率>30%） |
 | applicability | vc16 CHECK：applicable / not_applicable / NULL（√适用声明列化；见 §5 讨论） |
 | page_no | 定位列（artifact_locator 首页码） |
@@ -138,9 +138,11 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
   不连接 target/mixed part。仅归一化后长度 ≥3 的 query 走 GIN `LIKE` 候选 + 同 atom `strpos`
   精确复核；1–2 字只走完整 word channel，不承诺任意子串。
   **派生、非证据**：
-  不进 content/query_projection 哈希，重建不产生 outbox 事件；`retrieval_rules_version` 是重建
-  幂等键（词典/jieba 升版即全量重建）。CLI `make rebuild-search-projection`（`ALL=YES` 全量），
-  worker 每轮 publish 后跑增量。
+  search rows、atom_text、tokens 和 windows 不进 content/query_projection 哈希，重建不产生
+  outbox 事件；决定这些 rows 的 typed `source_projection` 经验证后形成 canonical
+  `search_plan`，该 plan 进入 `query_projection_hash`。`retrieval_rules_version` 是重建幂等键
+  （词典/jieba 升版即全量重建）。CLI `make rebuild-search-projection`（`ALL=YES` 全量），worker
+  每轮 publish 后跑增量。
 - **L2 直读纪律**：必须过滤 `is_active_run`（历史 run 行是 U5 审计语义）。
 
 ## 4. 词表/配置文件索引（versioned，改=升版）
@@ -152,7 +154,7 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 | 文件 | 内容 | 当前版本 |
 |---|---|---|
-| application/services/unit_builder/rules.py | source-bound structure proof 消费 + retrieval taxonomy（taxonomy 不改变证据或边界） | RULES_VERSION ub-2026.07-83 |
+| application/services/unit_builder/rules.py | source-bound structure proof 消费 + retrieval taxonomy（taxonomy 不改变证据或边界） | 当前值以该文件的 `RULES_VERSION` 常量为准 |
 | application/contracts/schema_sources/normalized_ir.v4.json | 当前 NormalizedIR v4 JSON Schema 唯一真源；`contracts/normalized_ir/normalized_ir.v4.json` 只能由 `export_contracts` 生成；v2/v3 只读历史 artifact 不得直接发布 | normalized_ir.v4 |
 | application/services/unit_builder/note_key_map.json | 章节词表 **173 键、391 标签**（section facet；祖先继承+全类型开放） | 2026-07-r18 |
 | adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs；r6 financing +011711 担保/011713 财务资助、meeting_resolution +01239910；r7 equity_share_change +0115 父级实码） | 2026-07-r7 |
