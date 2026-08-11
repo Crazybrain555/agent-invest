@@ -317,6 +317,16 @@
    "private_imports": [],
    "tests": 5
   },
+  "tests/unit/test_provider_document_admission.py": {
+   "private_imports": [
+    "_DOCUMENT = \"doc_01K00000000000000000000000\"",
+    "_OWNER = \"run_01K0000000000000000000000\"",
+    "_PROVIDER_DOCUMENT_ID = \"1225087169\"",
+    "_RECORD_RELPATH = Path(",
+    "_SOURCE_SHA = \"sha256:\" + \"a\" * 64"
+   ],
+   "tests": 9
+  },
   "tests/unit/test_provider_document_envelope.py": {
    "private_imports": [],
    "tests": 10
