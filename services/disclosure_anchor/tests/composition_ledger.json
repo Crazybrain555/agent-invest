@@ -253,7 +253,7 @@
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 9
   },
   "tests/unit/test_mineru_middle_roles.py": {
    "private_imports": [],
@@ -334,6 +334,10 @@
   "tests/unit/test_retire_derived_generation.py": {
    "private_imports": [],
    "tests": 2
+  },
+  "tests/unit/test_review_mineru_medium_outline.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_search_projection.py": {
    "private_imports": [],

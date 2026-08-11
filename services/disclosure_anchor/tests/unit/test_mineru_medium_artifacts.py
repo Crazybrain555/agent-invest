@@ -152,6 +152,34 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
                 [None, None, None],
             )
 
+    def test_annotation_binding_rejects_page_and_item_count_mismatch(self) -> None:
+        for mismatch in ("page_count", "item_count"):
+            with self.subTest(mismatch=mismatch), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _write_bundle(root)
+                typed_path = root / f"{_STEM}_content_list_v2.json"
+                typed = json.loads(typed_path.read_text(encoding="utf-8"))
+                if mismatch == "page_count":
+                    typed.pop()
+                else:
+                    typed[0].pop()
+                _write_json(typed_path, typed)
+
+                document = MinerUMediumArtifactReader().read(
+                    root,
+                    source_pdf_sha256=_SOURCE_SHA,
+                )
+
+                expected = (
+                    [None, None, None]
+                    if mismatch == "page_count"
+                    else [None, None, "table"]
+                )
+                self.assertEqual(
+                    [block.typed_annotation for block in document.blocks],
+                    expected,
+                )
+
     def test_unmatched_physical_table_segment_stays_unbound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

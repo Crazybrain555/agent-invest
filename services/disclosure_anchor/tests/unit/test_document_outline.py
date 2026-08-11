@@ -78,6 +78,13 @@ class DocumentOutlineTest(unittest.TestCase):
         self.assertEqual(outline.headings[0].placement_source, "bookmark")
         self.assertEqual(outline.headings[0].nominal_rank, 1)
 
+        style_only = build_document_outline(
+            document,
+            level_hints=(_level_hint(document, 1, "pdf_style", 3),),
+        )
+        self.assertEqual(style_only.headings[0].placement_source, "pdf_style")
+        self.assertEqual(style_only.headings[0].nominal_rank, 3)
+
     def test_hard_negatives_demote_but_preserve_every_block(self) -> None:
         title_in_table = _block(
             0,

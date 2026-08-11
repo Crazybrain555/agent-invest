@@ -121,6 +121,8 @@ class ProviderPhysicalTableSegment:
     def __post_init__(self) -> None:
         if self.page_index < 0 or self.order_in_page < 0 or self.provider_index < 0:
             raise ValueError("provider table segment indices cannot be negative")
+        if self.logical_stream_status not in {"retained", "deleted", "unbound"}:
+            raise ValueError("provider table segment status is unsupported")
         if self.crop_artifact_role == "":
             raise ValueError("provider table crop role must be non-empty when present")
         if self.cell_merge_json == "":
@@ -186,9 +188,20 @@ class ProviderDocument:
         for block in self.blocks:
             if not set(block.referenced_artifact_roles).issubset(role_set):
                 raise ValueError("provider block artifact role is not hash-bound")
+        expected_segment_order: dict[int, int] = {}
+        previous_segment_page = -1
         for segment in self.physical_table_segments:
             if segment.page_index >= len(self.pages):
                 raise ValueError("provider table segment page is out of range")
+            if segment.page_index < previous_segment_page:
+                raise ValueError("provider table segments must preserve page order")
+            expected_order = expected_segment_order.get(segment.page_index, 0)
+            if segment.order_in_page != expected_order:
+                raise ValueError(
+                    "provider table segment order must be contiguous within each page"
+                )
+            expected_segment_order[segment.page_index] = expected_order + 1
+            previous_segment_page = segment.page_index
             if (
                 segment.crop_artifact_role is not None
                 and segment.crop_artifact_role not in role_set

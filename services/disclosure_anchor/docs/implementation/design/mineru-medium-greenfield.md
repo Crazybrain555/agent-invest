@@ -69,6 +69,8 @@ not a newer learned model. The selected stable upstream is the official
 The counts and timings above are session evidence preserved by this decision record, not a
 permanent benchmark fixture; the DB-free implementation is revalidated visually against
 the immutable source PDFs rather than treating those numbers as an automated quality gate.
+The first tracked source-first result is
+[`mineru-medium-greenfield-visual-review.md`](../checks/mineru-medium-greenfield-visual-review.md).
 
 ## Greenfield pipeline
 
@@ -140,6 +142,11 @@ characters. Bookmark/printed-ToC matches likewise require bounded exact source b
 single monotonic parent stack materializes `parent_id` and ordered `headpath`. Every
 accepted heading retains its available provider locator, source occurrence, and the signal
 that determined its placement; no fabricated numeric confidence is emitted.
+
+The provider-emitted U+F052 marker is treated only as one checkbox-selection negative
+signal because the source-first JiangHai review verified it repeatedly at checkbox
+locations. It is preserved unchanged in payload and never translated or used as a heading
+or content repair dictionary.
 
 This project's signal priority is a local product decision. It is informed by mature,
 separate patterns demonstrated by other systems, not presented as their shared policy or
