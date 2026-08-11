@@ -6,22 +6,8 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import hashlib
-import json
-from pathlib import Path
 from typing import Any
 
-from disclosure_anchor.application.contracts.normalized_ir import (
-    CURRENT_NORMALIZED_IR_VERSION,
-    NormalizedIRVersionError,
-    validate_normalized_ir_contract,
-    validate_normalized_ir_identity,
-    validate_normalized_ir_path_version,
-)
-from disclosure_anchor.application.contracts.parser_target import (
-    ParserTargetIdentity,
-    ParserTargetIdentityError,
-)
 from disclosure_anchor.application.contracts.provider_document_admission import (
     ProviderDocumentAdmissionError,
 )
@@ -36,19 +22,7 @@ from disclosure_anchor.application.services.provider_document_admission import (
 from disclosure_anchor.application.services.provider_unit_builder import (
     build_provider_units,
 )
-from disclosure_anchor.application.contracts.visual_semantics import (
-    VisualSemanticClosure,
-    VisualSemanticContractError,
-    ensure_no_unresolved_visuals,
-    validate_visual_semantic_manifest,
-)
-from disclosure_anchor.application.ports.file_store import FileStorePathPort
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
-from disclosure_anchor.application.services.data_file_reader import (
-    DataFileMissingError,
-    DataStoreReadError,
-    read_data_file_bytes,
-)
 from disclosure_anchor.application.worker.locks import maybe_lock_document
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.entities import outbox_events
@@ -97,11 +71,6 @@ class UnitDiff:
 
 TERMINAL_PUBLICATION_ERROR_CODES = frozenset(
     {
-        "IR_CONTRACT_TOO_OLD",
-        "IR_CONTRACT_UNSUPPORTED",
-        "IR_HASH_MISMATCH",
-        "IR_MISSING",
-        "PARTIAL_PDF_NOT_PUBLISHABLE",
         "PARSER_TARGET_IDENTITY_INVALID",
         "PARSER_TARGET_IDENTITY_MISMATCH",
         "QUERY_PROJECTION_HASH_MISMATCH",
@@ -110,243 +79,11 @@ TERMINAL_PUBLICATION_ERROR_CODES = frozenset(
         "RUN_UNIT_HASH_INVALID",
         "RUN_UNIT_SEMANTIC_INVALID",
         "RUN_UNIT_SET_INVALID",
-        "VISUAL_SEMANTIC_CLOSURE_INVALID",
-        "VISUAL_SEMANTIC_CLOSURE_UNRESOLVED",
         "PROVIDER_DOCUMENT_ADMISSION_FAILED",
         "PROVIDER_UNIT_PROJECTION_INVALID",
         "RUN_OUTPUT_CONTRACT_UNSUPPORTED",
     }
 )
-
-
-class NormalizedIRPublicationGuard:
-    """Independently verify whole-document provenance before activation.
-
-    BuildUnits rejects new diagnostic page-range artifacts, but publication is
-    also callable on historical built runs. Re-reading the hash-bound IR here
-    closes that bypass without trusting a prior in-memory build decision.
-    """
-
-    def __init__(self, path_builder: FileStorePathPort) -> None:
-        self._paths = path_builder
-
-    def __call__(self, run: e.ProcessingRun) -> None:
-        relpath_text = run.normalized_ir_relpath
-        if not relpath_text:
-            raise PublishRunError(
-                _structured_error(
-                    error_code="IR_MISSING",
-                    message="normalized_ir_relpath is missing",
-                )
-            )
-        relpath = Path(relpath_text)
-        try:
-            raw_bytes = read_data_file_bytes(self._paths, relpath)
-        except DataFileMissingError as exc:
-            raise PublishRunError(
-                _structured_error(
-                    error_code="IR_MISSING",
-                    message=str(exc),
-                )
-            ) from exc
-        except DataStoreReadError as exc:
-            raise PublishRunError(
-                _structured_error(
-                    error_code="IR_READ_FAILED",
-                    retryable=True,
-                    message=str(exc),
-                )
-            ) from exc
-        if run.artifact_hash:
-            actual_hash = "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
-            if actual_hash != run.artifact_hash:
-                raise PublishRunError(
-                    _structured_error(
-                        error_code="IR_HASH_MISMATCH",
-                        message=(
-                            f"normalized IR at {relpath} hashes to "
-                            f"{actual_hash}, run.artifact_hash is "
-                            f"{run.artifact_hash}"
-                        ),
-                    )
-                )
-        try:
-            decoded = json.loads(raw_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise PublishRunError(
-                _structured_error(
-                    error_code="IR_CONTRACT_UNSUPPORTED",
-                    reason_code="invalid_json",
-                    message=f"normalized IR is not valid UTF-8 JSON: {exc}",
-                )
-            ) from exc
-        if not isinstance(decoded, dict):
-            raise PublishRunError(
-                _structured_error(
-                    error_code="IR_CONTRACT_UNSUPPORTED",
-                    reason_code="payload_not_object",
-                    message="normalized IR must be an object",
-                )
-            )
-        try:
-            version = validate_normalized_ir_contract(decoded)
-            validate_normalized_ir_identity(
-                decoded,
-                document_id=run.document_id,
-            )
-            validate_normalized_ir_path_version(relpath, version=version)
-        except NormalizedIRVersionError as exc:
-            error_code = (
-                "IR_CONTRACT_TOO_OLD"
-                if exc.reason_code == "contract_version_too_old"
-                else "IR_CONTRACT_UNSUPPORTED"
-            )
-            raise PublishRunError(
-                _structured_error(
-                    error_code=error_code,
-                    reason_code=exc.reason_code,
-                    message=str(exc),
-                )
-            ) from exc
-        if version != CURRENT_NORMALIZED_IR_VERSION:
-            raise PublishRunError(
-                _structured_error(
-                    error_code="IR_CONTRACT_TOO_OLD",
-                    reason_code="publish_requires_current_contract",
-                    message=(
-                        f"publish requires {CURRENT_NORMALIZED_IR_VERSION}; "
-                        f"run IR is {version} and must be reparsed before publish"
-                    ),
-                )
-            )
-        parsed_pages = decoded["parsed_pages"]
-        try:
-            run_target = ParserTargetIdentity.from_payload(
-                run.parser_target_identity
-            )
-            ir_target = ParserTargetIdentity.from_payload(decoded.get("parser"))
-        except ParserTargetIdentityError as exc:
-            raise PublishRunError(
-                _structured_error(
-                    error_code="PARSER_TARGET_IDENTITY_INVALID",
-                    message=str(exc),
-                )
-            ) from exc
-        if run_target != ir_target:
-            raise PublishRunError(
-                _structured_error(
-                    error_code="PARSER_TARGET_IDENTITY_MISMATCH",
-                    message=(
-                        "processing run parser target differs from "
-                        "NormalizedIR"
-                    ),
-                )
-            )
-        if parsed_pages.get("full_pdf") is not True:
-            raise PublishRunError(
-                _structured_error(
-                    error_code="PARTIAL_PDF_NOT_PUBLISHABLE",
-                    message=(
-                        "page-range diagnostic parses cannot become the "
-                        "active document run"
-                    ),
-                )
-            )
-        self._validate_visual_semantics(decoded)
-
-    def _validate_visual_semantics(self, normalized_ir: dict[str, Any]) -> None:
-        cache: dict[str, tuple[bytes, str]] = {}
-
-        def load(role: str) -> tuple[bytes, str]:
-            cached = cache.get(role)
-            if cached is not None:
-                return cached
-            parser_artifacts = normalized_ir.get("parser_artifacts")
-            files = (
-                parser_artifacts.get("files")
-                if isinstance(parser_artifacts, dict)
-                else None
-            )
-            descriptor = files.get(role) if isinstance(files, dict) else None
-            if (
-                not isinstance(descriptor, dict)
-                or descriptor.get("availability") != "present"
-                or not isinstance(descriptor.get("relpath"), str)
-                or not isinstance(descriptor.get("sha256"), str)
-                or not isinstance(descriptor.get("size_bytes"), int)
-            ):
-                raise PublishRunError(
-                    _structured_error(
-                        error_code="VISUAL_SEMANTIC_CLOSURE_INVALID",
-                        reason_code="artifact_descriptor_invalid",
-                        message=f"visual artifact descriptor is invalid: {role}",
-                    )
-                )
-            try:
-                payload = read_data_file_bytes(
-                    self._paths,
-                    Path(descriptor["relpath"]),
-                )
-            except DataFileMissingError as exc:
-                raise PublishRunError(
-                    _structured_error(
-                        error_code="VISUAL_SEMANTIC_CLOSURE_INVALID",
-                        reason_code="artifact_missing",
-                        message=str(exc),
-                    )
-                ) from exc
-            except DataStoreReadError as exc:
-                raise PublishRunError(
-                    _structured_error(
-                        error_code="IR_READ_FAILED",
-                        retryable=True,
-                        message=str(exc),
-                    )
-                ) from exc
-            actual = "sha256:" + hashlib.sha256(payload).hexdigest()
-            if (
-                actual != descriptor["sha256"]
-                or len(payload) != descriptor["size_bytes"]
-            ):
-                raise PublishRunError(
-                    _structured_error(
-                        error_code="VISUAL_SEMANTIC_CLOSURE_INVALID",
-                        reason_code="artifact_hash_mismatch",
-                        message=f"visual artifact bytes differ: {role}",
-                    )
-                )
-            cache[role] = (payload, actual)
-            return cache[role]
-
-        payload, artifact_sha256 = load("visual_semantics")
-        try:
-            closure = VisualSemanticClosure.from_payload(
-                json.loads(payload.decode("utf-8"))
-            )
-            validate_visual_semantic_manifest(
-                normalized_ir,
-                closure,
-                artifact_sha256=artifact_sha256,
-                load_artifact_sha256=lambda role: load(role)[1],
-            )
-            ensure_no_unresolved_visuals(closure)
-        except (
-            UnicodeDecodeError,
-            json.JSONDecodeError,
-            VisualSemanticContractError,
-        ) as exc:
-            reason = getattr(exc, "reason_code", "invalid_json")
-            raise PublishRunError(
-                _structured_error(
-                    error_code=(
-                        "VISUAL_SEMANTIC_CLOSURE_UNRESOLVED"
-                        if reason == "visual_semantics_unresolved"
-                        else "VISUAL_SEMANTIC_CLOSURE_INVALID"
-                    ),
-                    reason_code=reason,
-                    message=str(exc),
-                )
-            ) from exc
 
 
 class ProviderDocumentPublicationGuard:

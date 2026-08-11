@@ -81,9 +81,9 @@ launchd job 丢失时重装：`make install-ops-launchd`（postgres+doctor）、
 retry-neutral，且有效值至少 60 秒（worker 自身 graceful window 为 35 秒）会给官方
 cleanup 路径和 wrapper 回收留出余量。
 
-**GC label 的同等静默（派生全量重置前必做）**：静默 `com.agentinvest.disclosure-gc` 与
-worker 切换无关，但派生全量重置的静默门（`scripts/corpus_reset_quiescence.py:109`）逐个检查
-worker 和 GC **两个 label**，要求它们都既未 loaded、又已持久 disable，缺一即 fail loud。GC 是
+**GC label 的同等静默（未来获批的派生全量重置前必做）**：静默
+`com.agentinvest.disclosure-gc` 与 worker 切换无关；operator 必须逐个检查 worker 和 GC
+**两个 label**，要求它们都既未 loaded、又已持久 disable，缺一即 fail loud。GC 是
 19:30 日历作业、没有 KeepAlive，不需要上面的排空舞蹈：
 
 ```bash
@@ -112,67 +112,11 @@ canonical runtime manifest，至少绑定本地 client venv、远端 immutable i
 只测量本地 client venv，是 manifest 的一个输入，**不能直接冒充完整 runtime digest**。任一
 client、image、模型或配置变化都必须重做 manifest/digest 并重启 worker。
 
-### 1.2 全量派生重置后的 exact replay
+### 1.2 批量重解析与派生重置
 
-全量重解析没有第二个 scheduler、ledger 或 launchd label。reset 前冻结并验真
-`export-reparse-manifest`、备份及 reset receipt；reset 后在 machine-local
-`worker.env` 设置以下两个绝对路径，再重启原有
-`com.agentinvest.disclosure-worker`：
+旧 NormalizedIR corpus reset/exact replay 工具已经删除：它维护第二套 manifest、备份、调度和状态分类，并会把旧 writer 重新引入生产入口。当前没有 production 数据；开发期需要重放时，使用明确的 document 列表走正常 Provider writer，先在仓外保留原 PDF 与 provider artifact，再由 operator 单独授权 DB/AgentSSD 变更。
 
-0031 是显式 reset barrier：历史 rebuild 没有可安全回填的 artifact owner 时，迁移会在
-任何 DDL 前 fail loud。操作顺序固定为：在旧 schema 上完成 manifest-bound reset →
-升级到 repository head → 启动 exact replay；禁止先升级并通过拆解 artifact 路径猜 owner。
-
-```bash
-DISCLOSURE_REPLAY_MANIFEST=/.../reset.jsonl
-DISCLOSURE_REPLAY_RESET_RECEIPT=/.../pre-reset.dump.reset-receipt.json
-```
-
-同一个 resident worker 会关闭获取，以 manifest 的全量 document/raw 闭包守卫队列，
-并继续复用生产 parse/finalize pools、重试预算、stale recovery、projection 和
-watchdog。`make reparse-status MANIFEST=... RESET_RECEIPT=...` 在
-`complete=true` 前退出 75；任何代码、文档输入、raw hash、数据库身份或 parser
-deployment 漂移均 fail loud。完成后人工移除这两个环境值并重启同一 job；脚本不会
-自动恢复普通获取，也不会替运维者修改 launchd 状态。
-
-0032 切换后，历史 v4 parse 失败不消耗 Provider writer 的新 retry budget，这是有意的代际
-重试重置。旧 active v4 的检索投影在被 Provider run 替代前仍按旧版本可读；exact replay 全部
-完成并发布 Provider runs 后，显式执行 `make rebuild-search-projection ALL=YES`，确认 provider
-projection 全绿，再移除 replay 环境值并恢复普通获取。禁止在 Provider corpus 尚未闭合时把
-一次性的 legacy projection terminal 状态当成内容丢失或删除旧公开行。
-
-### 1.3 reset bundle 目录布局
-
-`validate_reset_bundle_paths`（`scripts/corpus_reparse_manifest.py:370`）强制：一次重置的**全部**
-控制文件必须直属于 `$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/` 这**一层**目录——不能再套
-子目录，不能散在别处，路径上也不允许有 symlink。理由是 manifest / backup 属于
-控制面证据，一旦落在派生族下面，reset 会把自己的回滚材料一起搬走。
-
-- 目录要**手工**建：`mkdir -p "$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>"`；没有脚本替你建。
-- `<name>` 自取，一次重置一个目录，建议带日期与目的（如 `20260728-heading-arbitration`）。
-- 一个 bundle 最终约 10 个文件，全部平铺在这一层：`reset.jsonl`、
-  `pre-reset.dump` 及其 `.metadata.json` / `.restore-proof.json` / `.reset-receipt.json`，
-  外加每个文件各自的 `.sha256` 旁挂。
-- 因此 `export-reparse-manifest` / `verify-reparse-manifest` / `create-reset-backup` /
-  `prove-reset-backup` / `reset-derived-rehearse` / `wipe-derived` / `reparse-status` /
-  `reparse-corpus` 的 `OUT`、`MANIFEST`、`BACKUP`、`RESET_RECEIPT` 必须全部指向同一个
-  bundle 目录，否则脚本 fail loud。
-- `reset-derived-rehearse` 只做 `reset_transaction(commit=False)` 演练并打印摘要，不产出
-  文件工件；它不是 `wipe-derived` 的前置门，但仍是唯一能在不破坏数据的前提下验证整条
-  reset 事务的手段。
-
-`wipe-derived` 不删旧代派生产物，而是移入 `$DISCLOSURE_DATA_ROOT/audit/reset-trash/<manifest-sha256>/`。
-那是唯一的回滚材料，所以 GC 不按时间自动清它，每日 `gc_daily.sh` 只在日志里打一行
-`[warn] reset-trash holds <size>; run 'make purge-reset-trash' after the new generation is verified`。
-删除用专用命令，不要裸 `rm -rf`：
-
-- `make purge-reset-trash MANIFEST=… RESET_RECEIPT=…`（默认路径）：内部先跑与 `reparse-status`
-  完全相同的校验链，只有回放完整且不变量为零（status exit 0）才允许删除；不带 `PURGE=YES`
-  时只做干跑报体积。
-- `make purge-reset-trash-force MANIFEST=… PURGE=YES`（逃生口）：跳过验证门直接删，用于
-  明确放弃该冻结代或磁盘告急时；等于放弃回滚路径，命令会响亮警告。
-
-两条路径都带 bundle 路径护栏与 symlink 拒绝，只会删 `audit/reset-trash/<manifest-sha>/` 这一棵树。
+任何未来的全量 destructive reset 都必须重新设计为 provider_document.v1 专用的一次性操作：先冻结 source identity，停 worker，显式列出目标，事务内改变 DB，再用正常 resident worker 重建；不得恢复 DISCLOSURE_REPLAY_* 环境变量、旧 reparse_corpus.py 或 reset-trash 控制面。
 
 ## 2. 告警通道
 
@@ -234,7 +178,7 @@ worker 以 exit 77 自杀 = TCC 拒绝访问外置盘（详见 `scripts/run_work
 
 ## 8. 数据质量巡检（周节律）
 
-`make audit-weekly` = 未映射码 + 样板公告 + 标题吞没三项审计，任一非零退出即有真 finding。
+`make audit-weekly` 当前只运行未映射 provider code 审计，任一非零退出即有真 finding。
 词表升级流程：改 JSON + 升版本 + `make load-rules`（见 adapters/sources/cninfo 的词表工程原则）。
 
 ## 9. 备份与恢复（占位，待新备份盘）
@@ -245,8 +189,8 @@ worker 以 exit 77 自杀 = TCC 拒绝访问外置盘（详见 `scripts/run_work
 ## 10. 危险边界（不要做的事）
 
 - `make purge-company`：仅限明确单一公司的测试残留清理，全程持 CORPUS exclusive；
-  生产禁用。旧的全库 `wipe-test-data` 已删除；派生全量重置只能走 manifest/backup/
-  restore-proof/receipt 约束的 `wipe-derived`。
+  生产禁用。旧的全库 wipe/reset/replay 工具均已删除；没有单独授权与新的一次性
+  provider-native 方案时，不做全量 DB/AgentSSD 清空。
 - `untrack` 是退订（保留全部文档档案），`paused` 是可逆暂停——想停采集永远先用 paused。
 - 已应用迁移一律冻结；改视图/约束开新迁移。
 - admin API 需要 `DISCLOSURE_ADMIN_TOKEN`（Bearer）且仅回环可用；token 在 worker.env，

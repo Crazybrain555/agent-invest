@@ -11,6 +11,10 @@ delivers_to: 常态运行（demo 期定时批处理，协议 §15）
 
 # Milestone 08: worker loop 与本地运行
 
+> 历史标识 `04R` 及其文件已随 legacy writer 删除；下文的 04R 引用只解释当时来源。
+> 当前队列 SQL 以已应用 migrations 为准，worker/doctor 以 `application/worker/queries.py`
+> 为唯一调用面，不得从 Git 历史复制旧 writer 或状态机。
+
 把 sync / download / parse / build / publish 串成可重复运行的本地 worker。worker 是**纯调度壳**：
 所有业务动作都是既有 use case（07 的 sync/download、04 的 parse、05 的 build/publish/process），
 worker 只做扫描、加锁、调用、重试和报告，不含业务逻辑。

@@ -29,7 +29,7 @@ from disclosure_anchor.domain.services.unit_hashing import (
     sha256_prefixed,
 )
 from disclosure_anchor.settings import Settings
-from tests.unit._current_ir import write_text_ir_bundle
+from tests.unit._historical_v4_fixture import write_text_ir_bundle
 
 
 def _document_row() -> dict:

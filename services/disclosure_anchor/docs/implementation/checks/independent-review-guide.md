@@ -109,7 +109,8 @@ S5 续表合并只看列数（cn_a_v6 后同构附注表跨科目误并，3. 销
 
 - **domain**：实体无 IO；枚举闭集走契约升版；错误分型 retryable 语义正确
   （尤其 quota_exhausted=请求内 fail-fast + 下轮可重试）。
-- **unit_builder**：规则全部在 rules.py 且版本化（改规则必升 RULES_VERSION）；
+- **provider unit builder**：薄的 source-bound 投影带显式版本；禁止恢复业务 taxonomy
+  rules、文档短语补丁或第二证明图；
   builder 纯函数无 IO；词表 JSON（note_key_map/class_map/facet_map/parse_scope）
   与代码读取键一致；内容哈希纯净性——payload 不得含任何规则派生值（U2）。
 - **worker**：队列谓词只在 queries.py；批次上限/背压/熔断路径有测试；

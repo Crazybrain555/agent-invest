@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import os
 import subprocess
 import sys
@@ -17,7 +16,6 @@ from sqlalchemy.orm import Session
 from disclosure_anchor.application.use_cases import (
     build_search_projection as projection_module,
 )
-from disclosure_anchor.application.worker import queries as worker_queries
 from disclosure_anchor.adapters.db.postgres.models import (
     Company,
     Document,
@@ -31,70 +29,87 @@ from disclosure_anchor.application.use_cases.build_search_projection import (
     BuildSearchProjectionCommand,
     SearchProjectionSafetyError,
 )
+from disclosure_anchor.application.contracts.provider_unit import (
+    ProviderSearchDestination,
+    ProviderUnitLocator,
+    ProviderUnitPartKind,
+    ProviderUnitPartRef,
+    ProviderUnitSearchBinding,
+    provider_unit_locator_to_payload,
+)
+from disclosure_anchor.application.contracts.retrieval_primary import (
+    RetrievalTarget,
+    SearchTransform,
+)
 from tests.integration._support import engine_or_skip
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _text_search_locator(order_index: int) -> dict[str, object]:
-    return {
-        "source_projection": {
-            "version": "unit-source-projection.v4",
-            "payload": {
-                "kind": "text_identity",
-                "sources": [
-                    {
-                        "source": {
-                            "kind": "normalized_ir_element",
-                            "ir_id": f"ir_sp_{order_index}",
-                            "source_item_index": order_index,
-                            "order_index": order_index,
-                        },
-                        "field": {"kind": "text"},
-                    }
-                ],
-                "target_field": "payload.text",
-                "transform": "clean_text.v1",
-            },
-            "heading_path": [],
-            "structured": [],
-            "provenance": [],
-            "search_targets": ["payload.text"],
-            "search_atoms": [],
-            "physical_context": None,
-        }
-    }
+    return _search_locator(
+        order_index,
+        kind="text",
+        targets=(("text", None, "identity.v1"),),
+    )
 
 
 def _table_search_locator(order_index: int) -> dict[str, object]:
-    source = {
-        "kind": "normalized_ir_element",
-        "ir_id": f"ir_sp_{order_index}",
-        "source_item_index": order_index,
-        "order_index": order_index,
-    }
-    return {
-        "source_projection": {
-            "version": "unit-source-projection.v4",
-            "payload": {
-                "kind": "table_identity",
-                "sources": [{"source": source, "field": {"kind": "table"}}],
-                "target_field": "payload",
-                "transform": "table_identity.v1",
-            },
-            "heading_path": [],
-            "structured": [],
-            "provenance": [],
-            "search_targets": [
-                "payload.caption",
-                "payload.headers",
-                "payload.rows",
-                "payload.notes",
-            ],
-            "search_atoms": [],
-            "physical_context": None,
-        }
-    }
+    return _search_locator(
+        order_index,
+        kind="table",
+        targets=(
+            ("table_body", None, "html_visible_text_segments.v1"),
+            ("table_caption", 0, "identity.v1"),
+        ),
+    )
+
+
+def _search_locator(
+    order_index: int,
+    *,
+    kind: ProviderUnitPartKind,
+    targets: tuple[tuple[str, int | None, SearchTransform], ...],
+) -> dict[str, object]:
+    source_index = order_index
+    raw_block_sha256 = f"sha256:{order_index:064x}"
+    bindings = tuple(
+        ProviderUnitSearchBinding(
+            source=RetrievalTarget(
+                target_id=f"block:{source_index}:payload:{payload_ordinal}",
+                source_index=source_index,
+                payload_ordinal=payload_ordinal,
+                field=field,
+                item_index=item_index,
+                transform=transform,
+                raw_block_sha256=raw_block_sha256,
+            ),
+            destination=ProviderSearchDestination(
+                kind="unit_payload",
+                field=field,
+                item_index=item_index,
+            ),
+        )
+        for payload_ordinal, (field, item_index, transform) in enumerate(targets)
+    )
+    return provider_unit_locator_to_payload(
+        ProviderUnitLocator(
+            provider_document_sha256=f"sha256:{'a' * 64}",
+            unit_index=order_index - 1,
+            heading_chain=(),
+            parts=(
+                ProviderUnitPartRef(
+                    part_index=0,
+                    kind=kind,
+                    block_source_indices=(source_index,),
+                ),
+            ),
+            evidence_only_block_source_indices=(),
+            unbound_table_parts=(),
+            evidence_artifacts=(),
+            search_targets=bindings,
+        )
+    )
 
 
 class SearchProjectionIntegrationTests(unittest.TestCase):
@@ -197,13 +212,14 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                 assert body_unit is not None
                 body_unit.payload_kind = "table"
                 body_unit.payload = {
-                    "caption": "甲乙丙丁戊己庚辛",
-                    "headers": ["应收账款账龄分析"],
-                    "rows": [
-                        ["股份变动及股东情况"],
-                        ["ＡＢＣ％ＤＥＦ＿ＧＨ＼Ｉ"],
-                    ],
-                    "notes": [],
+                    "provider_type": "table",
+                    "table_body": (
+                        "<table><tr><td>应收账款账龄分析</td></tr>"
+                        "<tr><td>股份变动及股东情况</td></tr>"
+                        "<tr><td>ＡＢＣ％ＤＥＦ＿ＧＨ＼Ｉ</td></tr></table>"
+                    ),
+                    "table_caption": ["甲乙丙丁戊己庚辛"],
+                    "table_footnote": [],
                 }
                 body_unit.artifact_locator = _table_search_locator(2)
                 session.commit()
@@ -530,7 +546,10 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
             with Session(self.engine) as session:
                 unsafe = session.get(DocumentUnit, ids_map["body_hit"])
                 assert unsafe is not None
-                unsafe.payload = {"text": unsafe_body}
+                unsafe.payload = {
+                    "provider_type": "text",
+                    "text": unsafe_body,
+                }
                 for asset_id, body, order_index in (
                     (ids_map["left_only"], "leftsentinel", 3),
                     (ids_map["right_only"], "rightsentinel", 4),
@@ -544,7 +563,7 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                             heading_path=["窗口负例"],
                             title="窗口负例",
                             order_index=order_index,
-                            payload={"text": body},
+                            payload={"provider_type": "text", "text": body},
                             content_hash=f"h_{asset_id}",
                             semantic_keys=[],
                             artifact_locator=_text_search_locator(order_index),
@@ -730,39 +749,6 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 stored_error["retrieval_rules_version"],
                 tokenizer.RETRIEVAL_RULES_VERSION,
-            )
-            parser_target = {"name": "scratch-parser", "version": "1"}
-            generation_started_at = datetime.now(timezone.utc) - timedelta(minutes=1)
-            with Session(self.engine) as session:
-                document = session.get(Document, ids_map["document"])
-                run = session.get(ProcessingRun, ids_map["run"])
-                assert document is not None
-                assert run is not None
-                document.current_processing_run_id = ids_map["run"]
-                document.raw_file_hash = "sha256:" + "a" * 64
-                run.run_kind = "parse"
-                run.parser_target_identity = parser_target
-                run.input_raw_file_hash = document.raw_file_hash
-                run.builder_rules_version = "builder.scratch"
-                run.started_at = datetime.now(timezone.utc)
-                session.commit()
-            with self.engine.connect() as conn:
-                (processing_state,) = worker_queries.document_processing_states(
-                    conn,
-                    document_ids=(ids_map["document"],),
-                    generation_started_at=generation_started_at,
-                    target_identity={
-                        "parser_target": parser_target,
-                        "builder_rules_version": "builder.scratch",
-                        "retrieval_rules_version": (tokenizer.RETRIEVAL_RULES_VERSION),
-                        "max_parse_retries": 3,
-                        "max_build_retries": 3,
-                    },
-                )
-            self.assertEqual(processing_state.state, "terminal_failed")
-            self.assertEqual(
-                processing_state.reason_code,
-                "search_projection_terminal",
             )
             with self.engine.connect() as conn:
                 transaction = conn.begin()
@@ -1021,6 +1007,10 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     status="succeeded",
                     is_active=True,
                     unit_build_status="succeeded",
+                    provider_document_relpath=(
+                        "derived/provider_documents/cninfo/600000/"
+                        f"T{suffix}/{ids['run']}/provider_document.v1.json"
+                    ),
                 )
             )
             session.flush()
@@ -1033,7 +1023,7 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     heading_path=[f"财务附注{suffix}", f"账龄{suffix}分析"],
                     title="应收账款",
                     order_index=1,
-                    payload={"text": "期末余额说明"},
+                    payload={"provider_type": "text", "text": "期末余额说明"},
                     content_hash=f"h1_{suffix}",
                     semantic_keys=["receivable_aging"],
                     artifact_locator=_text_search_locator(1),
@@ -1048,7 +1038,7 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     heading_path=[f"减值损失{suffix}"],
                     title="坏账准备",
                     order_index=2,
-                    payload={"text": "应收账款"},
+                    payload={"provider_type": "text", "text": "应收账款"},
                     content_hash=f"h2_{suffix}",
                     semantic_keys=["credit_impairment_loss"],
                     artifact_locator=_text_search_locator(2),

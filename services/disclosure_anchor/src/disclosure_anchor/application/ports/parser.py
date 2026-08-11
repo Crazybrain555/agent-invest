@@ -1,11 +1,9 @@
-"""Parser option and legacy compatibility contracts."""
+"""Parser identity and pinned writer options."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Literal
 
 from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
@@ -78,26 +76,3 @@ class ParserOptions:
 class ParserIdentity:
     name: str
     version: str
-
-
-@dataclass(frozen=True)
-class ParserResult:
-    target_identity: ParserTargetIdentity
-    artifact_root: Path
-    artifact_paths: Mapping[str, Path | None]
-    normalized_ir: dict[str, Any]
-
-
-class DocumentParserPort(Protocol):
-    def identity(self) -> ParserIdentity:
-        ...
-
-    def parse(
-        self,
-        *,
-        input_pdf: Path,
-        output_dir: Path,
-        options: ParserOptions,
-        document_metadata: dict[str, Any],
-    ) -> ParserResult:
-        ...

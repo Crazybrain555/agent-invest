@@ -86,28 +86,7 @@ echo "=== worker-$MODE $(date '+%F %T') ==="
 # earlier make->sh->python chain swallowed launchd's SIGTERM, which left
 # python orphaned holding the singleton lock on three kickstarts.
 export PYTHONPATH=src
-REPLAY_MANIFEST="${DISCLOSURE_REPLAY_MANIFEST:-}"
-REPLAY_RECEIPT="${DISCLOSURE_REPLAY_RESET_RECEIPT:-}"
-if [[ -n "$REPLAY_MANIFEST" || -n "$REPLAY_RECEIPT" ]]; then
-  if [[ "$MODE" != "loop" ]]; then
-    echo "exact replay is supported only by the resident loop" >&2
-    exit 64
-  fi
-  if [[ -z "$REPLAY_MANIFEST" || -z "$REPLAY_RECEIPT" ]]; then
-    echo "exact replay requires DISCLOSURE_REPLAY_MANIFEST," \
-      "and DISCLOSURE_REPLAY_RESET_RECEIPT" >&2
-    exit 78
-  fi
-  WORKER_COMMAND=(
-    scripts/reparse_corpus.py
-    --run
-    --manifest "$REPLAY_MANIFEST"
-    --reset-receipt "$REPLAY_RECEIPT"
-  )
-else
-  WORKER_COMMAND=(-m disclosure_anchor.cli.worker "$MODE")
-fi
-.venv/bin/python "${WORKER_COMMAND[@]}" &
+.venv/bin/python -m disclosure_anchor.cli.worker "$MODE" &
 WORKER_PID=$!
 trap 'kill -TERM "$WORKER_PID" 2>/dev/null' TERM INT
 WORKER_STATUS=0

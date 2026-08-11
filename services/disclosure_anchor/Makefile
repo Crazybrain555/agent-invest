@@ -24,10 +24,9 @@ DISCLOSURE_ENV_DIR ?= $(HOME)/.config/agent-invest/disclosure_anchor
 WITH_ENV = set -a; for f in worker.env cninfo.env; do [ -r "$(DISCLOSURE_ENV_DIR)/$$f" ] && . "$(DISCLOSURE_ENV_DIR)/$$f"; done; set +a;
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
-	test-mineru-smoke lint typecheck agent-check api archive pg-init pg-start pg-stop \
+	lint typecheck agent-check api archive pg-init pg-start pg-stop \
 	pg-status db-create migrate register parse build-units publish process rebuild-units rebuild-search-projection load-rules config-check track track-status track-export untrack purge-company sync worker-once worker-loop doctor-full \
-	worker-status worker-restart gc-orphans audit-unmapped-codes audit-unit-corpus export-unit-corpus-manifest audit-weekly install-ops-launchd export-reparse-manifest verify-reparse-manifest reparse-status reparse-corpus reset-derived-rehearse wipe-derived \
-	create-reset-backup prove-reset-backup purge-reset-trash purge-reset-trash-force
+	worker-status worker-restart gc-orphans audit-unmapped-codes audit-weekly install-ops-launchd
 
 doctor:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -40,7 +39,7 @@ typecheck:
 
 # Aggregate deterministic gate for AI-agent edits: lint + types + no-DB tests +
 # diff hygiene in one command. Live-DB tests and migration round trips stay in
-# the milestone protocol (04R section 6).
+# the scratch-DB integration runner and current migration contract.
 agent-check:
 	$(MAKE) lint
 	$(MAKE) typecheck
@@ -62,13 +61,6 @@ test-data:
 
 test-integration:
 	@$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tests.integration._runner
-
-# Explicit opt-in real-MinerU end-to-end smoke (not collected by `make test`).
-# Requires a local PostgreSQL cluster, DISCLOSURE_MINERU_BIN and the local
-# short_announcement sample PDF. The runner always uses a disposable database.
-test-mineru-smoke:
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tests.integration._runner \
-		--real-mineru -v tests.integration.smoke_real_mineru
 
 api:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m uvicorn disclosure_anchor.main:create_app --factory --host $(API_HOST) --port $(API_PORT)
@@ -206,15 +198,7 @@ gc-orphans:
 audit-unmapped-codes:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/audit_unmapped_codes.py
 
-# Deterministic file-only replay gate. Export is a separate read-only DB step
-# so every audit is bound to one manifest and exact IR file hashes.
-export-unit-corpus-manifest:
-	@test -n "$(OUT)" || (echo 'usage: make export-unit-corpus-manifest OUT=/private/tmp/corpus-manifest.jsonl' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/export_unit_corpus_manifest.py --output "$(OUT)"
-
-audit-unit-corpus:
-	@test -n "$(MANIFEST)" -a -n "$(OUT)" || (echo 'usage: make audit-unit-corpus MANIFEST=/path/manifest.jsonl OUT=/private/tmp/audit-dir [WORKERS=4] [LIMIT=N] [SOURCE_REPLAY=YES]' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/audit_unit_corpus.py --manifest "$(MANIFEST)" --out "$(OUT)" $(if $(WORKERS),--workers "$(WORKERS)") $(if $(LIMIT),--limit "$(LIMIT)") $(if $(filter YES,$(SOURCE_REPLAY)),--source-replay)
+# Legacy NIR corpus replay and reset commands were retired with the provider writer.
 
 # Weekly sweep keeps only audits that do not propose lexical parsing rules.
 audit-weekly: audit-unmapped-codes
@@ -225,58 +209,3 @@ install-ops-launchd:
 
 doctor-full:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor --full
-
-export-reparse-manifest:
-	@test -n "$(OUT)" || (echo 'usage: make export-reparse-manifest OUT=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reparse_corpus.py \
-		--export-manifest "$(OUT)"
-
-verify-reparse-manifest:
-	@test -n "$(MANIFEST)" || (echo 'usage: make verify-reparse-manifest MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reparse_corpus.py \
-		--verify --manifest "$(MANIFEST)"
-
-create-reset-backup:
-	@test -n "$(MANIFEST)" -a -n "$(BACKUP)" || (echo 'usage: make create-reset-backup MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl BACKUP=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump (one bundle dir holds manifest+plan+backup)' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/create_corpus_reset_backup.py \
-		--manifest "$(MANIFEST)" --backup "$(BACKUP)" \
-		--pg-dump "$(PG_BIN)/pg_dump"
-
-prove-reset-backup:
-	@test -n "$(MANIFEST)" -a -n "$(BACKUP)" || (echo 'usage: make prove-reset-backup MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl BACKUP=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump (one bundle dir holds manifest+plan+backup)' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/prove_corpus_reset_backup.py \
-		--manifest "$(MANIFEST)" --backup "$(BACKUP)" \
-		--pg-restore "$(PG_BIN)/pg_restore"
-
-reparse-status:
-	@test -n "$(MANIFEST)" -a -n "$(RESET_RECEIPT)" || (echo 'usage: make reparse-status MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl RESET_RECEIPT=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump.reset-receipt.json' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reparse_corpus.py \
-		--status --manifest "$(MANIFEST)" \
-		--reset-receipt "$(RESET_RECEIPT)"
-
-purge-reset-trash:
-	@test -n "$(MANIFEST)" -a -n "$(RESET_RECEIPT)" || (echo 'usage: make purge-reset-trash MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl RESET_RECEIPT=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump.reset-receipt.json [PURGE=YES]  (gated: refuses unless reparse --status exits 0; without PURGE=YES only reports size)' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reparse_corpus.py \
-		--purge-trash --manifest "$(MANIFEST)" \
-		--reset-receipt "$(RESET_RECEIPT)" $(if $(filter YES,$(PURGE)),--yes,)
-
-purge-reset-trash-force:
-	@test -n "$(MANIFEST)" || (echo 'usage: make purge-reset-trash-force MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl [PURGE=YES]  (skips the verified-generation gate and destroys the only rollback material; without PURGE=YES only reports size)' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reparse_corpus.py \
-		--purge-trash --force --manifest "$(MANIFEST)" $(if $(filter YES,$(PURGE)),--yes,)
-
-reparse-corpus:
-	@test -n "$(MANIFEST)" -a -n "$(RESET_RECEIPT)" || (echo 'usage: make reparse-corpus MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl RESET_RECEIPT=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump.reset-receipt.json' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reparse_corpus.py \
-		--run --manifest "$(MANIFEST)" \
-		--reset-receipt "$(RESET_RECEIPT)"
-
-reset-derived-rehearse:
-	@test -n "$(MANIFEST)" -a -n "$(BACKUP)" || (echo 'usage: make reset-derived-rehearse MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl BACKUP=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump (both in the same bundle dir)' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reset_derived_corpus.py \
-		--manifest "$(MANIFEST)" --backup "$(BACKUP)" --rehearse
-
-wipe-derived:
-	@test "$(WIPE)" = "YES" -a -n "$(MANIFEST)" -a -n "$(BACKUP)" || (echo 'usage: make wipe-derived WIPE=YES MANIFEST=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/reset.jsonl BACKUP=$$DISCLOSURE_DATA_ROOT/audit/reset-bundles/<name>/pre-reset.dump (both in the same bundle dir)' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/reset_derived_corpus.py \
-		--manifest "$(MANIFEST)" --backup "$(BACKUP)" --apply

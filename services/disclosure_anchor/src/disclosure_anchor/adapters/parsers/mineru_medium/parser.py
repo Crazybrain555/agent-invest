@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru_medium.artifacts import (
     MinerUMediumArtifactReader,
 )
+from disclosure_anchor.adapters.parsers.mineru_medium.process import MinerUProcess
 from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
 )

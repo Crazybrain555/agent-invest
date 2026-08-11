@@ -133,11 +133,6 @@ test_output/
 scratch/
 __codex_diagnostics__/
 
-# Phase 00 全量解析转储：体积大、含整篇年报内容、内嵌本机绝对路径，且可由 *_ref.txt 重新生成。
-# 仅本地保留，不入库。小体量 fixture（manual_review / *_ref.txt / 校验报告）照常跟踪。
-tests/fixtures/phase00/annual_report/document_units.v1.jsonl
-tests/fixtures/phase00/annual_report/normalized_ir.v2.json
-
 # ============================================================
 # 生产管道 & 调度器
 # ============================================================

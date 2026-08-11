@@ -147,8 +147,10 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
   - 修法：Drop the free-text message from outbox event payloads (keep stage/error_code/retryable, which is what the queue views consume), or sanitize messages to relpaths/basenames before they enter outbox_event.
 - [ ] (M/SECURITY AND CREDENTIALS POS) **DB role separation exists only on paper: runtime service, migrations login, and DBHub MCP all connec**
   - 修法：Before production: provision real LOGIN roles (disclosure_app member of disclosure_app group, disclosure_reader) with scram-sha-256 auth, re-init or update pg_hba away from trust for TCP, point DATABASE_URL at the app login and DISCLOSURE_READER_DATABASE_URL a
-- [ ] (M/TEST COVERAGE GAPS for produ) **Golden determinism baselines cover only 3 of 9 filing types; inquiry_reply, quarterly/semiannual, fo**
-  - 修法：Extend tests/fixtures/phase00 via the existing regen protocol (04R §6.4) with at least one real sample per remaining filing type — priority: inquiry_reply, quarterly_report or semiannual_report (适用/不适用-rich), performance_forecast — and fold them into the deter
+- [ ] (M/TEST COVERAGE GAPS for produ) **Provider-native source-identity replay 仍需扩展 filing type 覆盖**
+  - 修法：在仓外冻结的 MinerU 3.4.4 Hybrid-medium corpus 中增加 inquiry_reply、quarterly/
+    semiannual、performance_forecast 等类型；每类绑定原 PDF、provider bundle manifest 与
+    admission→Unit→search replay。禁止恢复 phase00 NormalizedIR golden 或其 regen protocol。
 - [ ] (S/TEST COVERAGE GAPS for produ) **Migration downgrade round-trips: only 0009 is automated; 0010–0013 downgrades have never been execut**
   - 修法：Generalize the scratch-DB round-trip test to walk head → 0009 → head (exercising every post-0009 downgrade/upgrade pair) and assert view/column shape at each stop; make 'add a migration' imply extending this test per the milestone protocol.
 - [ ] (M/TEST COVERAGE GAPS for produ) **Web fallback channel (CninfoWebSource) has zero end-to-end/integration coverage; queue view's hisAnn**

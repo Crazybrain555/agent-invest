@@ -144,6 +144,7 @@ PROVIDER_INFRASTRUCTURE_ERROR_CODES = frozenset(
 BUILD_INFRASTRUCTURE_ERROR_CODES = frozenset(
     {
         "ARTIFACT_WRITE_FAILED",
+        "ARTIFACT_READ_FAILED",
         "DB_WRITE_FAILED",
         "DatabaseError",
         "InterfaceError",
@@ -154,11 +155,11 @@ BUILD_INFRASTRUCTURE_ERROR_CODES = frozenset(
 )
 BUILD_ITEM_LOCAL_ERROR_CODES = frozenset(
     {
-        "IR_CONTRACT_TOO_OLD",
-        "IR_CONTRACT_UNSUPPORTED",
-        "IR_HASH_MISMATCH",
-        "IR_MISSING",
-        "PARTIAL_PDF_NOT_PUBLISHABLE",
+        "ARTIFACT_OWNER_INVALID",
+        "PROVIDER_DOCUMENT_ADMISSION_FAILED",
+        "PROVIDER_UNIT_PROJECTION_INVALID",
+        "RUN_OUTPUT_CONTRACT_UNSUPPORTED",
+        "UNASSIGNED_TABLE_EVIDENCE",
         "RUN_NOT_FOUND",
         "RUN_NOT_SUCCEEDED",
         "UNITS_ALREADY_BUILT",
@@ -264,10 +265,6 @@ class WorkerDeps:
     # waits. Losing that session must stop active MinerU groups before this
     # worker can overlap a replacement process.
     admission_guard: Callable[[], None] = lambda: None
-    # Present only for a manifest-bound destructive replay. The regular queue
-    # remains authoritative; this guard checks the archived raw identity at
-    # the last admission boundary before parsing.
-    replay_raw_identity_guard: Callable[[str, str | None], None] | None = None
 
 
 def _merge_acquisition_report(
@@ -905,15 +902,6 @@ def _parse_work_items(
     items: list[_ParseWorkItem] = []
     for row in pending:
         document_id = str(row["document_id"])
-        if deps.replay_raw_identity_guard is not None:
-            deps.replay_raw_identity_guard(
-                document_id,
-                (
-                    str(row["raw_file_hash"])
-                    if row.get("raw_file_hash") is not None
-                    else None
-                ),
-            )
         page_count: int | None = None
         raw_byte_count_value = row.get("raw_byte_count")
         raw_byte_count = (
@@ -1547,7 +1535,7 @@ def _parse_one_batch(
         return "closed"
 
     candidate_limit = max(limit, deps.config.parse_candidate_window)
-    require_active_company_scope = deps.replay_raw_identity_guard is None
+    require_active_company_scope = True
     known_ids: set[str] = set()
     successful_history: deque[str] = deque()
     deferred_retries: deque[tuple[int, str]] = deque()

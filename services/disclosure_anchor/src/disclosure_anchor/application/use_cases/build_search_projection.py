@@ -307,6 +307,8 @@ class BuildSearchProjection:
             unit_exists = unit_exists.where(~current_projection_exists.exists())
         stmt = select(ProcessingRun.processing_run_id).where(
             ProcessingRun.is_active.is_(True),
+            ProcessingRun.provider_document_relpath.is_not(None),
+            ProcessingRun.normalized_ir_relpath.is_(None),
             unit_exists.exists(),
         )
         if not full:

@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 import unittest
+from unittest import mock
+
+from sqlalchemy.dialects import postgresql
 
 from disclosure_anchor.adapters.retrieval import tokenizer
 from disclosure_anchor.application.contracts.provider_document import ProviderPayload
@@ -17,6 +20,7 @@ from disclosure_anchor.application.services.provider_unit_builder import (
     provider_unit_search_text_values,
 )
 from disclosure_anchor.application.use_cases.build_search_projection import (
+    BuildSearchProjection,
     compute_search_projection_row,
 )
 from tests.unit.test_provider_unit_builder import (
@@ -94,6 +98,20 @@ class TokenizerTests(unittest.TestCase):
 
 
 class ProviderSearchTargetTests(unittest.TestCase):
+    def test_projection_candidates_exclude_historical_v4_runs(self) -> None:
+        statement = BuildSearchProjection(
+            engine=mock.Mock()
+        )._candidate_runs_stmt(full=True, after=None)
+        sql = str(
+            statement.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+
+        self.assertIn("provider_document_relpath IS NOT NULL", sql)
+        self.assertIn("normalized_ir_relpath IS NULL", sql)
+
     def test_title_is_excluded_and_body_replays_only_explicit_bindings(self) -> None:
         draft = build_provider_units(_admitted(_representative_document())).units[1]
 

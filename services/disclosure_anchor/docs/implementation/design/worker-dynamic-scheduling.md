@@ -435,11 +435,10 @@ worker 生命周期继续向 GPU 发请求。
 
 - 29,777/29,777 都是 `parsed_pages.full_pdf=true`，其中 active 21,500/21,500；
   `false=0`、missing=0、不可读 0；
-- resident 调度路径没有自动 range parse 或把多个页段结果拼成 active IR；admin 契约仍允许
-  操作者显式指定 `start_page` / `end_page`；
-- page-range 产物现在是诊断产物：unit build 先以
-  `PARTIAL_PDF_NOT_PUBLISHABLE` fail closed；publish 还会独立重读并校验 hash 绑定的
-  NormalizedIR，再确认 `full_pdf=true`，历史已 build 的 run 也不能绕过；
+- 当前 Provider writer 与 admin/CLI/worker 均只接受 full-PDF MinerU 3.4.4
+  Hybrid-medium；page-window 只存在于 DB-free review 工具；
+- Build/Publish 只接 `provider_document.v1`，并独立核 source PDF hash/page count、canonical
+  record hash 和完整 provider bundle 重读；历史 NormalizedIR run 不能重新进入 writer；
 - 较早的 PDF/IR 尾页核对中，8,711 份页数一致；另 12 份少一个尾页，均为纯白页或单字符
   噪点，没有跨页表或正文被外部分片丢失的证据。
 

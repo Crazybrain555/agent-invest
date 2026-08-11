@@ -6,5 +6,14 @@ from disclosure_anchor.adapters.parsers.mineru_medium.artifacts import (
 from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
     MinerUMediumDocumentParser,
 )
+from disclosure_anchor.adapters.parsers.mineru_medium.process import (
+    MinerUProcess,
+    terminate_active_mineru_processes,
+)
 
-__all__ = ["MinerUMediumArtifactReader", "MinerUMediumDocumentParser"]
+__all__ = [
+    "MinerUMediumArtifactReader",
+    "MinerUMediumDocumentParser",
+    "MinerUProcess",
+    "terminate_active_mineru_processes",
+]

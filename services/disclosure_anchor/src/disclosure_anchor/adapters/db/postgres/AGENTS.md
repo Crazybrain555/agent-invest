@@ -23,4 +23,5 @@ connection.py      create_db_engine / URL 解析（socket DSN 带 port=55432）
 ops.pending_*_v1 队列视图只授 app 角色、只暴露事实列，
 阈值由调用方从 settings 施加。视图列变更 = 契约变更，必须同步
 contract 测试 + `docs/implementation/checks/contract-checklist.md`。
-迁移往返核验命令见 04R §6.2（六个根路径 env 缺一会报误导性的 "No migration database URL"）。
+迁移往返由 `tests/integration/_runner.py` 创建并销毁 scratch database，再运行迁移测试；必须同时
+注入 runner 生成的 DB URL 与六个 scratch root env，缺少任一 root 都应 fail closed。

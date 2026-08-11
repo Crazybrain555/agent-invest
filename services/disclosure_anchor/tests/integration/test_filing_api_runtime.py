@@ -29,7 +29,6 @@ from disclosure_anchor.domain.services.unit_hashing import (
 from disclosure_anchor.main import create_app
 from disclosure_anchor.settings import Settings
 from tests.integration._support import engine_or_skip, numeric_provider_document_id
-from tests.integration.smoke_real_mineru_build_publish import _mineru_bin_or_skip
 
 
 @dataclass(frozen=True)
@@ -100,18 +99,22 @@ def require_mineru_and_sample(sample: AdminSample) -> MinerUGate:
     return MinerUGate(engine=engine, mineru=mineru, sample_pdf=sample_pdf)
 
 
+def _mineru_bin_or_skip() -> Path:
+    value = os.environ.get("DISCLOSURE_MINERU_BIN")
+    if not value:
+        raise unittest.SkipTest("DISCLOSURE_MINERU_BIN is not set")
+    mineru = Path(value)
+    if not mineru.is_file():
+        raise unittest.SkipTest(f"MinerU executable absent: {mineru}")
+    return mineru
+
+
 def _sample_pdf_or_skip(label: str) -> Path:
-    ref = Path("tests/fixtures/phase00") / label / "parser_artifacts_ref.txt"
-    try:
-        lines = ref.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise unittest.SkipTest(
-            f"sample PDF reference unreadable: {ref}: {exc}"
-        ) from exc
-    source_lines = [line for line in lines if line.startswith("Source PDF:")]
-    if not source_lines:
-        raise unittest.SkipTest(f"sample PDF reference missing Source PDF line: {ref}")
-    sample_pdf = Path(source_lines[0].split(": ", 1)[1])
+    env_name = f"DISCLOSURE_TEST_{label.upper()}_PDF"
+    value = os.environ.get(env_name)
+    if not value:
+        raise unittest.SkipTest(f"{env_name} is not set")
+    sample_pdf = Path(value)
     if not sample_pdf.is_file():
         raise unittest.SkipTest(f"sample PDF absent: {sample_pdf}")
     return sample_pdf

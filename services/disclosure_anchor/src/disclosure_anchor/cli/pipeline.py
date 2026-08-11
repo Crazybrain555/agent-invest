@@ -24,10 +24,10 @@ from disclosure_anchor.adapters.db.postgres.connection import (
     migration_database_url,
 )
 from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
-from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
     MinerUMediumDocumentParser,
 )
+from disclosure_anchor.adapters.parsers.mineru_medium.process import MinerUProcess
 from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
 from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore

@@ -537,13 +537,16 @@ class MinerUProcess:
 
     def _env(self, *, options: ParserOptions | None = None) -> dict[str, str]:
         env = dict(os.environ)
-        # Local Phase 00 validation showed httpx can fail through proxy env
-        # unless socks extras are installed. MinerU uses local model cache here.
+        # Local validation showed httpx can fail through proxy env unless
+        # socks extras are installed. MinerU uses local model cache here.
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
             env.pop(key, None)
             env.pop(key.lower(), None)
         env["NO_PROXY"] = "*"
         env.update(self._extra_env)
+        # The writer uses MinerU 3.4.4's official merge-on default. Never let
+        # a stale shell/launchd/operator override silently change table shape.
+        env.pop("MINERU_TABLE_MERGE_ENABLE", None)
         if options is not None and options.timeout_seconds is not None:
             env["MINERU_LOCAL_API_STARTUP_TIMEOUT_SECONDS"] = str(
                 _LOCAL_API_STARTUP_TIMEOUT_SECONDS

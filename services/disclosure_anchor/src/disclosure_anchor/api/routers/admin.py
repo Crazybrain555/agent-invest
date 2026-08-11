@@ -13,10 +13,10 @@ from sqlalchemy.engine import Engine
 
 from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA
 from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
-from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
 from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
     MinerUMediumDocumentParser,
 )
+from disclosure_anchor.adapters.parsers.mineru_medium.process import MinerUProcess
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.provider_document_source import (

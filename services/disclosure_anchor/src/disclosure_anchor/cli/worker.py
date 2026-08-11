@@ -30,7 +30,7 @@ from disclosure_anchor.adapters.db.postgres.connection import (
     migration_database_url,
 )
 from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
-from disclosure_anchor.adapters.parsers.mineru.mineru_process import (
+from disclosure_anchor.adapters.parsers.mineru_medium.process import (
     MinerUProcess,
     terminate_active_mineru_processes,
 )
@@ -83,18 +83,6 @@ PROVIDER_ERROR_COOLDOWN_BASE_SECONDS = 60
 
 class WorkerSingletonGuardError(RuntimeError):
     """The process-lifetime singleton session can no longer be trusted."""
-
-
-@dataclass(frozen=True)
-class ExactReplayGuard:
-    """One fail-closed boundary around the regular resident worker."""
-
-    manifest_sha256: str
-    reset_boundary_at: datetime
-    document_count: int
-    runtime_check: Callable[[WorkerDeps], None]
-    database_check: Callable[[Engine], None]
-    raw_identity_check: Callable[[str, str | None], None]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -227,28 +215,10 @@ def _exit_wedged_worker() -> None:
 
 def run_resident_worker(
     settings: Settings,
-    *,
-    exact_replay_guard: ExactReplayGuard | None = None,
 ) -> int:
-    """Run the one resident worker, optionally bound to an exact replay.
-
-    Replay is an admission guard, not a second scheduler: it keeps the production
-    singleton, dispatcher, retry budgets, crash recovery, projection loop and
-    watchdog. Acquisition and taxonomy routing are disabled because the
-    immutable manifest owns corpus membership. The guard validates identity
-    on the resident composition, rechecks the source closure, and checks each
-    raw hash immediately before parse.
-    """
+    """Run the one resident worker."""
 
     _print_version_banner(settings)
-    if exact_replay_guard is not None:
-        print(
-            "[replay] exact manifest="
-            f"{exact_replay_guard.manifest_sha256} "
-            f"documents={exact_replay_guard.document_count} "
-            f"reset_boundary_at="
-            f"{exact_replay_guard.reset_boundary_at.isoformat()}"
-        )
     lock_engine = sqlalchemy.create_engine(
         _database_url(settings),
         poolclass=NullPool,
@@ -260,18 +230,9 @@ def run_resident_worker(
             text("SELECT pg_try_advisory_lock(:ns, 0)"), {"ns": WORKER_NS}
         ).scalar_one()
         if not acquired:
-            if exact_replay_guard is not None:
-                raise WorkerSingletonGuardError(
-                    "worker singleton lock is held; stop and drain the "
-                    "resident worker before exact replay"
-                )
             print(SKIP_MESSAGE)
             return 0
-        return _run_loop(
-            settings,
-            lock_conn=lock_conn,
-            exact_replay_guard=exact_replay_guard,
-        )
+        return _run_loop(settings, lock_conn=lock_conn)
     finally:
         lock_conn.close()
         lock_engine.dispose()
@@ -281,7 +242,6 @@ def _run_loop(
     settings: Settings,
     *,
     lock_conn: Connection,
-    exact_replay_guard: ExactReplayGuard | None = None,
 ) -> int:
     """Run a resident data plane with independent maintenance/reporting."""
 
@@ -289,38 +249,15 @@ def _run_loop(
     stop = _StopFlag()
     stop.install()
     base_limits = _limits(settings)
-    if exact_replay_guard is not None:
-        base_limits = replace(
-            base_limits,
-            sync=0,
-            sync_stage_seconds=0,
-            acquisition_seconds=0,
-            download=0,
-        )
 
     def admission_guard() -> None:
         _assert_singleton_or_cancel(lock_conn)
-        if exact_replay_guard is not None:
-            exact_replay_guard.database_check(engine)
 
     base_deps = _deps(
         settings,
         engine,
         admission_guard=admission_guard,
     )
-    if exact_replay_guard is not None:
-        base_deps = replace(
-            base_deps,
-            config=replace(
-                base_deps.config,
-                process_scope_classes=None,
-            ),
-            replay_raw_identity_guard=(
-                exact_replay_guard.raw_identity_check
-            ),
-        )
-        exact_replay_guard.runtime_check(base_deps)
-        exact_replay_guard.database_check(engine)
     deps = base_deps
     maintenance_deps = base_deps
     maintenance_progress: list[float] | None = None

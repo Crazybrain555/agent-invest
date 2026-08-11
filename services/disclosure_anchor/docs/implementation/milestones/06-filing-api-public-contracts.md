@@ -203,11 +203,9 @@ contract：schema↔视图↔DTO 三方列集一致（§3.5 两层断言）；�
 集成（DB-gated）：分页游标翻页完整性（含 announcement_date=null 行的 NULLS LAST 续页）；
 filings/latest 的取代/最新/同日 tie-break 语义；changes 幂等重读；
 admin POST 全链（register→parse→build→publish→units 可读）；权限（reader 只读）。
-全链测试的输入与门控定死：测试 PDF 从
-tests/fixtures/phase00/short_announcement/parser_artifacts_ref.txt 的 `Source PDF:` 行读取；
-该路径不存在或 MinerU 不可用 → unittest.SkipTest。门控**复用 05 已交付的实现**：
-tests/integration/smoke_real_mineru_build_publish.py 的 `_mineru_bin_or_skip()` 与样本缺失
-skip 逻辑（可提炼到 tests/integration/_support.py 共享），不重造同型 helper。
+全链测试的输入与门控由 machine-local 环境显式提供：`DISCLOSURE_MINERU_BIN` 与
+`DISCLOSURE_TEST_<LABEL>_PDF`。任一路径不存在时 `unittest.SkipTest`，不再从仓库内的
+历史 phase00 path reference 猜测本机文件。
 register 参数用 05 §5 三样本表的对应值（short_announcement：security_code=002484、
 exchange=szse、filing_type=other、report_period 省略、provider=cninfo、
 provider_document_id=文件名去后缀）。

@@ -5,7 +5,7 @@ routers/health.py      服务健康与降级状态
 routers/documents.py   documents_v1 与 processing_runs_v1 读端点
 routers/filings.py     latest filings 集合端点
 routers/units.py       document_units_v1 / source_refs_v1 / context 端点
-unit_evidence.py       unit locator 授权 + NormalizedIR manifest/hash-bound evidence 读取
+unit_evidence.py       provider_unit locator 授权 + provider/v4 双读的 hash-bound evidence
 routers/changes.py     change_events_v1 增量 feed
 routers/tracked.py     tracked_companies_v1 读端点（股票池真源在 DB，round22；
                        effective_* 级联生效值在此层解析——全局 policy 是文件，SQL 看不见）

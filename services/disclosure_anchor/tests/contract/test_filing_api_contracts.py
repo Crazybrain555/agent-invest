@@ -10,7 +10,6 @@ from pathlib import Path
 import yaml
 
 from disclosure_anchor.cli.export_contracts import (
-    NORMALIZED_IR_SCHEMA_SOURCES,
     PUBLIC_MODELS,
     export_contracts,
 )
@@ -41,10 +40,6 @@ class FilingApiContractsTests(unittest.TestCase):
                 *(
                     PUBLIC_MODELS_ROOT / f"{name}.v1.json"
                     for name in sorted(PUBLIC_MODELS)
-                ),
-                *(
-                    CONTRACTS_ROOT / "normalized_ir" / f"{version}.json"
-                    for version in sorted(NORMALIZED_IR_SCHEMA_SOURCES)
                 ),
             ]
             for expected in expected_paths:

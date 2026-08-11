@@ -71,8 +71,8 @@ PostgreSQL 18.4 实测存在四种静默或硬上限：同一 lexeme 第 256 个
 metadata 自身不安全、窗口 gap/overlap 或 DB probe 不完整均 fail loud，禁止丢词。
 
 0030 增加 `disclosure_core.unit_search_atom(asset_id, atom_index, atom_text)`：每个非空行只对应
-`source_projection.search_targets` 选中的一个字符串叶子，mixed 按 part 递归但绝不连接相邻
-target/part；`atom_text` 固定为 NFKC→casefold 后的原文。主键为 `(asset_id, atom_index)`，
+`provider_unit_locator.v1.search_targets` 选中的一个字符串叶子，绝不递归发现字段，也绝不连接
+相邻 target/part；`atom_text` 固定为 NFKC→casefold 后的原文。主键为 `(asset_id, atom_index)`，
 父投影删除时级联；`atom_text` 建 `gin_trgm_ops` GIN，公开只读面为
 `disclosure_public.unit_search_atoms_v1`。atom 是可再生候选投影，不是证据；命中后引用仍回到
 document_unit/source_ref。
@@ -80,14 +80,13 @@ document_unit/source_ref。
 ## 4. 投影内容（确定性线性化）
 
 - title_text = unit.title or ''；heading_path_text = " > ".join(heading_path)。
-- body 的唯一输入是 unit 的 v2 `source_projection.search_targets`；每个 target 必须由 payload/
-  structured 的显式 source edge 拥有。word channel 仅为兼容现有 tsvector 而以空格连接这些
+- body 的唯一输入是 `provider_unit_locator.v1.search_targets`；每个 target 必须绑定 provider
+  source block、字段/item 与 Unit payload destination。word channel 仅为兼容现有 tsvector 而连接这些
   原子；0030 substring channel 保留逐叶 atom，禁止跨 target/part 拼接。`raw_html`、context、
   文件路径、taxonomy 标签和未声明 payload 字段一律不能被递归发现。
 - key_tokens = " ".join(semantic_keys)（本就是受控 ASCII token，不过分词器）。
-- **header_row_candidate**（用户 2026-07-16 方向的落地，判错不污染证据）：
-  payload_kind='table' 且 headers 为空 且 len(rows)≥2，且 rows[0] 每个 cell 非空且不匹配
-  数值形态（`^[-+]?[\d,.]+%?$` 或含货币量级词），且其后至少一行含 ≥1 个数值形态 cell。
+- `header_row_candidate` 在 provider-native writer 中固定为 false；L1 不从 HTML `<td>` 或数值
+  形态猜表头。未来若需要 header role，只能来自可核验的 provider/source 结构证据。
 
 ## 5. 重建与增量
 

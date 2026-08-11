@@ -12,8 +12,7 @@ adapters/      db/postgres（迁移/模型/仓储/UoW）、parsers/mineru_medium
                Hybrid-medium 产物读取与 sole-writer adapter）、retrieval（jieba 钉版分词）、
                sources/cninfo（API/web 双通道）、storage、runtime(doctor)、publisher（预留空包）
 cli/           db.py(bootstrap) / doctor.py / pipeline.py / worker.py（once|loop，单例锁在专用 NullPool 连接上，拿不到锁打印 [skip] 并退出 0）
-               / export_contracts.py（OpenAPI + public model；历史 NIR schema export 待相邻
-               legacy 删除提交移除）
+               / export_contracts.py（只导出 OpenAPI + public model）
 api/           Filing API（milestone 06 已实现：documents/units/filings/changes/health 读侧 + admin 写侧）
 settings.py    fail-closed pydantic settings（缺 env 即抛错；env_file=None 不自动读 .env）
 main.py        create_app：快检 preflight + 进程级单 engine
@@ -22,7 +21,9 @@ main.py        create_app：快检 preflight + 进程级单 engine
 找东西的入口：
 
 - 业务契约与硬边界：`docs/architecture/service-purpose.md`（canonical）
-- 实施规格：`docs/implementation/milestones/`（00–08 与 06R 检索投影均已完成）；标题仲裁/脉络与目录/检索词表的设计权威在 `docs/implementation/design/`
+- 当前实施地图：`docs/implementation/README.md`；结构与检索设计见
+  `docs/implementation/design/document-outline-and-toc.md`、
+  `retrieval-and-semantic-keys.md` 和 `mineru-medium-greenfield.md`
 - 每个子目录有自己的 AGENTS.md（就近优先），细节看那里
 - 验收/测试政策：`docs/implementation/checks/`
 

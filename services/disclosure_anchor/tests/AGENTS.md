@@ -4,17 +4,16 @@
 
 ```text
 unit/          无 DB 无外部依赖；_fakes.py 提供内存仓储 + FakeUnitOfWork
-contract/      schema/fixture 契约（phase00 legacy-v2 golden fixtures + v2/v3 schemas）
-sample_corpus/ 本地样本存在性/形状检查
+contract/      public/API schema、greenfield import firewall 与删除边界契约
+sample_corpus/ 冻结 Provider bundle 的 source-identity 重放与形状检查
 integration/   DB-gated：`make test-integration` 从本机集群创建/迁移/销毁一个 suite-level
                `invest_engine_itest_*` 数据库，加载 tracked 分类规则，并覆盖子进程全部
                DB/file-root/cache 环境；默认把 MinerU binary 指向不存在的 scratch 路径，
                并移除远端 backend/server，不占生产 GPU。
                _support.engine_or_skip() 只认 runner 注入且带 marker 的
                DISCLOSURE_TEST_DATABASE_URL；绝不回退到生产 DATABASE_URL。
-integration/smoke_real_mineru.py  真 MinerU 全链冒烟，**不进默认发现**（无 test_ 前缀），
-               显式跑：make test-mineru-smoke（同样使用 disposable DB/产物根；
-               `--real-mineru` 有意识复用本机 MinerU/server/model cache）
+真实 MinerU/provider 验证必须显式 opt-in，并使用 disposable DB/产物根；默认发现不占用
+生产 GPU、远端 server 或 AgentSSD runtime。
 ```
 
 运行：`make test`（无 DB 门禁）/ `make test-unit|test-contract|test-data|test-integration`；
@@ -22,8 +21,8 @@ integration/smoke_real_mineru.py  真 MinerU 全链冒烟，**不进默认发现
 ——AI 改完代码的默认提交门禁（06 起写入 milestone 协议）。
 绿判据：no-DB 模式末行 `OK (skipped=N)`；live-DB 模式 `OK`——若未设 DISCLOSURE_MINERU_BIN
 则为 `OK (skipped=1)`（06 的 admin 全链测试三重门控 skip，属合法绿；配上 MINERU_BIN 才是零 skip）。
-（socket DSN 见 04R §6.3，免密码）。政策与 fixture 规范：
-`docs/implementation/checks/fixture-and-test-policy.md`；再生成协议：04R §6.4。
+政策与 fixture 规范见
+`docs/implementation/checks/fixture-and-test-policy.md`。
 集成测试不得写 `invest_engine`；需要 DB 的测试只能经 scratch runner 或显式、带 marker 的
 `DISCLOSURE_TEST_DATABASE_URL`。测试内 tearDown 仍负责相互隔离，但不是生产安全边界。
 Parser/builder 回归不能只固定一个 provider_document_id。行为变化至少需要：命中该 failure family 的

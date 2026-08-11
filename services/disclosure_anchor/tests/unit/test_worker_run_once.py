@@ -187,26 +187,21 @@ class RunOnceSchedulingTests(unittest.TestCase):
             scope_flags.append(bool(kwargs["require_active_company_scope"]))
             return []
 
-        replay_deps = replace(
-            deps,
-            replay_raw_identity_guard=mock.MagicMock(),
-        )
         with mock.patch.object(
             worker_module.queries,
             "pending_parse",
             side_effect=empty_queue,
         ):
-            for active_deps in (deps, replay_deps):
-                result = worker_module._parse_one_batch(
-                    report,
-                    active_deps,
-                    limit=200,
-                    should_stop=lambda: False,
-                    keep_refilling=lambda: True,
-                )
-                self.assertEqual(result, "empty")
+            result = worker_module._parse_one_batch(
+                report,
+                deps,
+                limit=200,
+                should_stop=lambda: False,
+                keep_refilling=lambda: True,
+            )
+            self.assertEqual(result, "empty")
 
-        self.assertEqual(scope_flags, [True, False])
+        self.assertEqual(scope_flags, [True])
 
     def test_parse_stage_overlaps_acquisition(self) -> None:
         # The acquisition thread (sync/download) must run beside the parse
@@ -472,7 +467,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             build_cls.return_value.execute.return_value = built
             publish_cls.return_value.execute.side_effect = PublishRunError(
                 {
-                    "error_code": "PARTIAL_PDF_NOT_PUBLISHABLE",
+                    "error_code": "RUN_OUTPUT_CONTRACT_UNSUPPORTED",
                     "retryable": False,
                 }
             )
@@ -497,11 +492,11 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self.assertEqual(report.failures[0].stage, "publish")
         self.assertEqual(
             report.failures[0].error_code,
-            "PARTIAL_PDF_NOT_PUBLISHABLE",
+            "RUN_OUTPUT_CONTRACT_UNSUPPORTED",
         )
         self.assertEqual(
             leftover_report.failures[0].error_code,
-            "PARTIAL_PDF_NOT_PUBLISHABLE",
+            "RUN_OUTPUT_CONTRACT_UNSUPPORTED",
         )
 
     def test_stop_submits_at_most_parse_concurrency(self) -> None:
@@ -639,7 +634,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             build_cls.return_value.execute.return_value = mock.MagicMock(
                 status="failed",
                 error={
-                    "error_code": "PARTIAL_PDF_NOT_PUBLISHABLE",
+                    "error_code": "RUN_OUTPUT_CONTRACT_UNSUPPORTED",
                     "retryable": False,
                 },
             )

@@ -11,6 +11,9 @@ delivers_to: milestone 08
 
 # Milestone 07: CNINFO 增量同步
 
+> 历史标识 `04R` 及其文件已随 legacy writer 删除；下文仅保留当时决策来源，当前权威是
+> `service-purpose.md`、现行 migrations 与 `register_document` 实现，不得据此恢复旧 writer。
+
 实现 CNINFO source adapter：精选股票池的公告索引增量同步、PDF 下载归档、source_access /
 checkpoint / 重试进入正式管道。下载后的登记**必须复用 04R-D10 的 `register_document` 核心与
 `SubjectResolver`**——本 milestone 不重新实现去重、supersedes、主体解析。

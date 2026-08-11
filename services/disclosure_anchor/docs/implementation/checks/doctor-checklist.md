@@ -59,13 +59,13 @@ MODELSCOPE_CACHE 指向外置盘
 
 ## 5. 数据一致性抽样检查
 
-抽样参数：默认 `--sample 20`（按 raw_file_relpath 排序取前 N ∪ 最新 N），`--full` 全量
-（04R-R6.1）。至少支持：
+抽样参数：默认 `--sample 20`（按 raw_file_relpath 排序取前 N ∪ 最新 N），`--full` 全量。
+至少支持：
 
 ```text
 抽样 document.raw_file_relpath 是否存在
 抽样 document.raw_file_hash 是否与文件 bytes 一致
-按 run 结局区分（04R-R6.3 / E11）：
+按 run 结局区分：
   succeeded parse/rebuild run → normalized_ir_relpath 与 provider_document_relpath 恰一存在，
                                 所选 primary artifact 与 artifact_hash 匹配
   failed run    → 只要求结构化 error 存在（合法 JSON），不报 artifact 缺失

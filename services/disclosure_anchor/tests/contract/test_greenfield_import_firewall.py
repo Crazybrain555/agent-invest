@@ -18,10 +18,13 @@ _GREENFIELD_CORE_FILES = (
     _SOURCE_ROOT / "application" / "contracts" / "provider_unit.py",
     _SOURCE_ROOT / "application" / "contracts" / "retrieval_primary.py",
     _SOURCE_ROOT / "application" / "services" / "document_outline.py",
+    _SOURCE_ROOT / "application" / "services" / "provider_document_admission.py",
     _SOURCE_ROOT / "application" / "services" / "provider_table_projection.py",
     _SOURCE_ROOT / "application" / "services" / "provider_unit_builder.py",
     _SOURCE_ROOT / "application" / "services" / "retrieval_primary.py",
     _SOURCE_ROOT / "adapters" / "parsers" / "mineru_medium" / "artifacts.py",
+    _SOURCE_ROOT / "adapters" / "parsers" / "mineru_medium" / "parser.py",
+    _SOURCE_ROOT / "adapters" / "storage" / "provider_document_source.py",
 )
 _HISTORICAL_EVIDENCE_FILES = (
     _SOURCE_ROOT / "api" / "unit_evidence.py",
@@ -45,10 +48,52 @@ _ALLOWED_DISCLOSURE_IMPORTS = (
     "disclosure_anchor.application.contracts.provider_unit",
     "disclosure_anchor.application.contracts.retrieval_primary",
     "disclosure_anchor.application.services.document_outline",
+    "disclosure_anchor.application.services.provider_document_admission",
     "disclosure_anchor.application.services.provider_table_projection",
+    "disclosure_anchor.application.services.provider_unit_builder",
     "disclosure_anchor.application.services.retrieval_primary",
+    "disclosure_anchor.application.ports.parser",
+    "disclosure_anchor.application.ports.file_store",
+    "disclosure_anchor.application.ports.provider_document_source",
+    "disclosure_anchor.application.ports.provider_parser",
+    "disclosure_anchor.adapters.parsers.pdf_page_probe",
     "disclosure_anchor.domain.errors",
+    "disclosure_anchor.domain",
     "disclosure_anchor.domain.services.unit_hashing",
+)
+_BANNED_IMPORT_PREFIXES = (
+    "disclosure_anchor.adapters.parsers.mineru",
+    "disclosure_anchor.adapters.parsers.comparison",
+    "disclosure_anchor.adapters.parsers.pdf_native_structure",
+    "disclosure_anchor.adapters.parsers.pdf_native_text",
+    "disclosure_anchor.adapters.parsers.pdf_visual_evidence",
+    "disclosure_anchor.adapters.parsers.pdfium_geometry",
+    "disclosure_anchor.adapters.parsers.printed_toc",
+    "disclosure_anchor.application.contracts.canonical_occurrence",
+    "disclosure_anchor.application.contracts.document_structure",
+    "disclosure_anchor.application.contracts.normalized_ir",
+    "disclosure_anchor.application.contracts.source_evidence",
+    "disclosure_anchor.application.contracts.unit_source_projection",
+    "disclosure_anchor.application.contracts.visual_semantics",
+    "disclosure_anchor.application.ports.source_evidence",
+    "disclosure_anchor.application.services.document_unit_audit",
+    "disclosure_anchor.application.services.unit_builder",
+    "disclosure_anchor.application.services.unit_preparation",
+)
+_DELETED_PATHS = (
+    _SOURCE_ROOT / "adapters" / "parsers" / "mineru",
+    _SOURCE_ROOT / "application" / "contracts" / "normalized_ir.py",
+    _SOURCE_ROOT / "application" / "contracts" / "source_evidence.py",
+    _SOURCE_ROOT / "application" / "contracts" / "unit_source_projection.py",
+    _SOURCE_ROOT / "application" / "services" / "unit_builder",
+    _SERVICE_ROOT / "contracts" / "normalized_ir",
+    _SERVICE_ROOT / "scripts" / "audit_unit_corpus.py",
+    _SERVICE_ROOT / "scripts" / "corpus_reparse_manifest.py",
+    _SERVICE_ROOT / "scripts" / "corpus_reset_backup.py",
+    _SERVICE_ROOT / "scripts" / "corpus_reset_quiescence.py",
+    _SERVICE_ROOT / "scripts" / "reparse_corpus.py",
+    _SERVICE_ROOT / "scripts" / "reset_derived_corpus.py",
+    _SERVICE_ROOT / "tests" / "fixtures" / "phase00",
 )
 
 
@@ -98,6 +143,28 @@ class GreenfieldImportFirewallTest(unittest.TestCase):
             if name.split(".", 1)[0] not in sys.stdlib_module_names
             and name != "__future__"
         ]
+        self.assertEqual(violations, [])
+
+    def test_legacy_writer_paths_and_imports_are_dead(self) -> None:
+        self.assertEqual(
+            [str(path.relative_to(_SERVICE_ROOT)) for path in _DELETED_PATHS if path.exists()],
+            [],
+        )
+        violations: list[str] = []
+        for root in (
+            _SOURCE_ROOT,
+            _SERVICE_ROOT / "scripts",
+            _SERVICE_ROOT / "tests",
+        ):
+            for path in root.rglob("*.py"):
+                for name in _imports(path):
+                    if any(
+                        name == banned or name.startswith(f"{banned}.")
+                        for banned in _BANNED_IMPORT_PREFIXES
+                    ):
+                        violations.append(
+                            f"{path.relative_to(_SERVICE_ROOT)}: {name}"
+                        )
         self.assertEqual(violations, [])
 
 

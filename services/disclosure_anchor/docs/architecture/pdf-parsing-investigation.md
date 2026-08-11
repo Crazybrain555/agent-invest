@@ -20,6 +20,10 @@
 > document-tree 任务拆分，但其标点/短语候选启发式必须先经过本地跨公司正反语料校准，不能直接
 > 成为删除或边界规则。
 >
+> **2026-08-12 cutover**：当前唯一 writer 是 MinerU 3.4.4 Hybrid-medium →
+> `provider_document.v1` → `provider_unit_locator.v1`。后文 NormalizedIR、双 parser、规则修复和
+>旧版本号只属于调研历史；不得据此恢复生产路径。
+>
 > 服务目的见 `service-purpose.md`：我们要的不是“把 PDF 下载到文件夹”，也不是镜像 parser 的每一页每一格，而是把
 > 按真实文档结构形成包含正文、表格、caption/footnote 与视觉证据的完整 evidence block，
 > 让 L2 能从任一命中点取得可回放上下文。问答等业务语义由 L2 从这些证据中抽取。

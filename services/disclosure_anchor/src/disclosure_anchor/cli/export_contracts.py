@@ -1,4 +1,4 @@
-"""Export generated API, public-model, and NormalizedIR contracts."""
+"""Export generated API and public-model contracts."""
 
 from __future__ import annotations
 
@@ -34,26 +34,10 @@ PUBLIC_MODELS: dict[str, type[Any]] = {
     "tracked_company": TrackedCompanyV1,
 }
 
-NORMALIZED_IR_SCHEMA_SOURCES = {
-    "normalized_ir.v4": (
-        REPO_ROOT
-        / "src"
-        / "disclosure_anchor"
-        / "application"
-        / "contracts"
-        / "schema_sources"
-        / "normalized_ir.v4.json"
-    )
-}
-
-
 def export_contracts(output_root: Path = DEFAULT_CONTRACTS_ROOT) -> list[Path]:
     output_root.mkdir(parents=True, exist_ok=True)
     public_models_root = output_root / "public_models"
     public_models_root.mkdir(parents=True, exist_ok=True)
-    normalized_ir_root = output_root / "normalized_ir"
-    normalized_ir_root.mkdir(parents=True, exist_ok=True)
-
     written: list[Path] = []
     openapi_path = output_root / "filing_api.openapi.yaml"
     openapi = create_app(_contract_settings(), validate_runtime=False).openapi()
@@ -72,14 +56,6 @@ def export_contracts(output_root: Path = DEFAULT_CONTRACTS_ROOT) -> list[Path]:
         )
         written.append(path)
 
-    for version, source_path in NORMALIZED_IR_SCHEMA_SOURCES.items():
-        path = normalized_ir_root / f"{version}.json"
-        schema = json.loads(source_path.read_text(encoding="utf-8"))
-        path.write_text(
-            json.dumps(schema, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        written.append(path)
     return written
 
 
