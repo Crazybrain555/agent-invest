@@ -4,6 +4,7 @@ from dataclasses import replace
 import unittest
 
 from disclosure_anchor.application.contracts.provider_document import (
+    ProviderArtifact,
     ProviderBlock,
     ProviderDocument,
     ProviderPage,
@@ -76,6 +77,44 @@ class RetrievalPrimaryTest(unittest.TestCase):
         ]
         self.assertEqual([target.source_index for target in duplicate_targets], [4, 5])
         self.assertNotEqual(duplicate_targets[0].target_id, duplicate_targets[1].target_id)
+
+    def test_visual_without_text_remains_distinct_from_an_empty_carrier(self) -> None:
+        artifact = ProviderArtifact(
+            role="image_0001",
+            relative_path="images/figure.png",
+            sha256="sha256:" + "c" * 64,
+            size_bytes=17,
+            media_type="image/png",
+        )
+        block = _block(
+            0,
+            0,
+            0,
+            "image",
+            (ProviderPayload("content", None, ""),),
+            annotation="image",
+            artifact_roles=(artifact.role,),
+        )
+        document = ProviderDocument(
+            source_pdf_sha256=_SOURCE_SHA,
+            parser_version="3.4.4",
+            backend="hybrid",
+            effort="medium",
+            ocr_enabled=False,
+            pages=(ProviderPage(0, (600.0, 800.0), (block,)),),
+            physical_table_segments=(),
+            artifacts=(artifact,),
+            bundle_sha256=provider_artifact_bundle_sha256((artifact,)),
+        )
+
+        projection = build_retrieval_primary_projection(
+            document,
+            build_document_outline(document),
+            build_provider_table_projection(document),
+        )
+
+        self.assertEqual(projection.targets, ())
+        self.assertEqual(projection.blocks[0].reason, "visual_without_text")
 
     def test_nested_table_text_is_emitted_once_in_source_order(self) -> None:
         self.assertEqual(
@@ -256,6 +295,7 @@ def _block(
     *,
     annotation: str | None,
     level: int | None = None,
+    artifact_roles: tuple[str, ...] = (),
 ) -> ProviderBlock:
     return ProviderBlock(
         source_index=source_index,
@@ -266,7 +306,7 @@ def _block(
         provider_level=level,
         bbox=None,
         payloads=payloads,
-        referenced_artifact_roles=(),
+        referenced_artifact_roles=artifact_roles,
         raw_item_json=f'{{"source":{source_index}}}',
         raw_item_sha256=_RAW_SHA,
     )

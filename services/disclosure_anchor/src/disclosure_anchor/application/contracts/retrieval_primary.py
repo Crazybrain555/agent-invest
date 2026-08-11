@@ -15,6 +15,7 @@ BlockRetrievalReason = Literal[
     "searchable_payload",
     "page_furniture",
     "empty_provider_carrier",
+    "visual_without_text",
 ]
 
 
@@ -66,7 +67,11 @@ class BlockRetrievalSelection:
         if self.disposition == "primary":
             if self.reason != "searchable_payload" or not self.target_ids:
                 raise ValueError("primary block must expose searchable payload")
-        elif self.reason not in {"page_furniture", "empty_provider_carrier"}:
+        elif self.reason not in {
+            "page_furniture",
+            "empty_provider_carrier",
+            "visual_without_text",
+        }:
             raise ValueError("evidence-only block has an invalid reason")
         elif self.target_ids:
             raise ValueError("evidence-only block cannot expose search targets")

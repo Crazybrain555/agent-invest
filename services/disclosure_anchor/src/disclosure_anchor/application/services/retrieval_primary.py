@@ -14,6 +14,7 @@ from disclosure_anchor.application.contracts.provider_table_projection import (
     ProviderTableProjection,
 )
 from disclosure_anchor.application.contracts.retrieval_primary import (
+    BlockRetrievalReason,
     BlockRetrievalSelection,
     RetrievalPrimaryProjection,
     RetrievalTarget,
@@ -71,12 +72,17 @@ def build_retrieval_primary_projection(
         targets.extend(block_targets)
         target_ids = tuple(target.target_id for target in block_targets)
         target_ids_by_source[block.source_index] = target_ids
+        evidence_reason: BlockRetrievalReason = (
+            "visual_without_text"
+            if block.referenced_artifact_roles and not target_ids
+            else "empty_provider_carrier"
+        )
         blocks.append(
             BlockRetrievalSelection(
                 source_index=block.source_index,
                 raw_block_sha256=block.raw_item_sha256,
                 disposition="primary" if target_ids else "evidence_only",
-                reason="searchable_payload" if target_ids else "empty_provider_carrier",
+                reason="searchable_payload" if target_ids else evidence_reason,
                 target_ids=target_ids,
             )
         )

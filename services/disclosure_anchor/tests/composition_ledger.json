@@ -104,6 +104,13 @@
    "private_imports": [],
    "tests": 1
   },
+  "tests/sample_corpus/test_provider_unit_builder_frozen.py": {
+   "private_imports": [
+    "_ROOT_ENV = \"DISCLOSURE_MEDIUM_FROZEN_ROOT\"",
+    "_SAMPLES = (\"zhongke\""
+   ],
+   "tests": 1
+  },
   "tests/sample_corpus/test_sample_filings.py": {
    "private_imports": [],
    "tests": 5
@@ -335,6 +342,10 @@
    "private_imports": [],
    "tests": 6
   },
+  "tests/unit/test_provider_unit_builder.py": {
+   "private_imports": [],
+   "tests": 10
+  },
   "tests/unit/test_publish_run.py": {
    "private_imports": [
     "_validate_candidate_unit_set"
@@ -355,7 +366,7 @@
   },
   "tests/unit/test_retrieval_primary.py": {
    "private_imports": [],
-   "tests": 7
+   "tests": 8
   },
   "tests/unit/test_review_mineru_medium_outline.py": {
    "private_imports": [],
