@@ -253,7 +253,7 @@
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],
-   "tests": 9
+   "tests": 10
   },
   "tests/unit/test_mineru_middle_roles.py": {
    "private_imports": [],
@@ -312,6 +312,10 @@
   "tests/unit/test_printed_toc.py": {
    "private_imports": [],
    "tests": 5
+  },
+  "tests/unit/test_provider_document_envelope.py": {
+   "private_imports": [],
+   "tests": 10
   },
   "tests/unit/test_publish_run.py": {
    "private_imports": [

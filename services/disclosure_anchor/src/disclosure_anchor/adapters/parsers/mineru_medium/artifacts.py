@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import codecs
 import hashlib
 import json
 import math
@@ -21,6 +22,7 @@ from disclosure_anchor.application.contracts.provider_document import (
     ProviderPage,
     ProviderPayload,
     ProviderPhysicalTableSegment,
+    provider_artifact_bundle_sha256,
 )
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
@@ -208,7 +210,7 @@ class MinerUMediumArtifactReader:
             pages=pages,
             physical_table_segments=physical_table_segments,
             artifacts=artifacts_tuple,
-            bundle_sha256=_bundle_sha256(artifacts_tuple),
+            bundle_sha256=provider_artifact_bundle_sha256(artifacts_tuple),
         )
 
 
@@ -340,18 +342,56 @@ def _artifact_record(
     try:
         digest = hashlib.sha256()
         size_bytes = 0
+        leading_bytes = b""
+        markdown_decoder = (
+            codecs.getincrementaldecoder("utf-8")(errors="strict")
+            if role == "markdown"
+            else None
+        )
         with resolved.open("rb") as stream:
             while chunk := stream.read(1024 * 1024):
+                if not leading_bytes:
+                    leading_bytes = chunk[:16]
+                if markdown_decoder is not None:
+                    markdown_decoder.decode(chunk, final=False)
                 digest.update(chunk)
                 size_bytes += len(chunk)
-    except OSError as exc:
+        if markdown_decoder is not None:
+            markdown_decoder.decode(b"", final=True)
+    except (OSError, UnicodeDecodeError) as exc:
         raise ParserOutputContractError(f"cannot read MinerU artifact role={role}") from exc
     return ProviderArtifact(
         role=role,
         relative_path=resolved.relative_to(root).as_posix(),
         sha256="sha256:" + digest.hexdigest(),
         size_bytes=size_bytes,
+        media_type=_artifact_media_type(
+            role=role,
+            leading_bytes=leading_bytes,
+        ),
     )
+
+
+def _artifact_media_type(*, role: str, leading_bytes: bytes) -> str:
+    if role in _PARSED_JSON_ROLES:
+        return "application/json"
+    if role == "markdown":
+        return "text/markdown"
+    if leading_bytes.startswith(b"%PDF-"):
+        return "application/pdf"
+    if leading_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if leading_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if leading_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if (
+        len(leading_bytes) >= 12
+        and leading_bytes[:4] == b"RIFF"
+        and leading_bytes[8:12] == b"WEBP"
+    ):
+        return "image/webp"
+    return "application/octet-stream"
 
 
 def _read_artifact_bytes(
@@ -856,24 +896,6 @@ def _canonical_value_json(value: object, *, label: str) -> str:
 
 def _canonical_item_json(item: Mapping[str, object], *, source_index: int) -> str:
     return _canonical_value_json(item, label=f"item {source_index}")
-
-
-def _bundle_sha256(artifacts: tuple[ProviderArtifact, ...]) -> str:
-    payload = json.dumps(
-        [
-            {
-                "relative_path": artifact.relative_path,
-                "role": artifact.role,
-                "sha256": artifact.sha256,
-                "size_bytes": artifact.size_bytes,
-            }
-            for artifact in artifacts
-        ],
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return _sha256(payload)
 
 
 def _sha256(payload: bytes) -> str:

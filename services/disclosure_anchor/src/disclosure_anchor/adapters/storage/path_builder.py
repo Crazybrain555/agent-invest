@@ -9,6 +9,9 @@ from pathlib import Path
 from disclosure_anchor.application.contracts.normalized_ir import (
     normalized_ir_filename,
 )
+from disclosure_anchor.application.contracts.provider_document_envelope import (
+    PROVIDER_DOCUMENT_FILENAME,
+)
 from disclosure_anchor.domain.errors import PathSafetyError
 from disclosure_anchor.settings import Settings
 
@@ -173,6 +176,28 @@ class FileStorePathBuilder:
             / _safe_provider_document_id(provider_document_id)
             / _safe_component(processing_run_id, label="processing_run_id")
             / "document_units.v1.jsonl"
+        )
+        return _assert_relative(relpath)
+
+    def provider_document_relpath(
+        self,
+        *,
+        provider: str,
+        security_code: str,
+        provider_document_id: str,
+        artifact_owner_processing_run_id: str,
+    ) -> Path:
+        relpath = (
+            Path("derived")
+            / "provider_documents"
+            / _safe_component(provider, label="provider")
+            / _safe_component(security_code, label="security_code")
+            / _safe_provider_document_id(provider_document_id)
+            / _safe_component(
+                artifact_owner_processing_run_id,
+                label="artifact_owner_processing_run_id",
+            )
+            / PROVIDER_DOCUMENT_FILENAME
         )
         return _assert_relative(relpath)
 

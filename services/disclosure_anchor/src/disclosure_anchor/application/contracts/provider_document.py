@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import math
+from pathlib import PurePosixPath
 import re
 from typing import Literal
+import unicodedata
 
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ARTIFACT_ROLE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_MEDIA_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,18 +47,32 @@ class ProviderArtifact:
     relative_path: str
     sha256: str
     size_bytes: int
+    media_type: str
 
     def __post_init__(self) -> None:
         if not _ARTIFACT_ROLE_RE.fullmatch(self.role):
             raise ValueError("provider artifact role must be opaque and identifier-safe")
-        if not self.relative_path or self.relative_path.startswith("/"):
+        if (
+            not self.relative_path
+            or self.relative_path.startswith("/")
+            or "\\" in self.relative_path
+            or any(
+                unicodedata.category(char).startswith("C")
+                for char in self.relative_path
+            )
+        ):
             raise ValueError("provider artifact path must be relative")
-        if ".." in self.relative_path.split("/"):
+        path = PurePosixPath(self.relative_path)
+        if path.as_posix() != self.relative_path or any(
+            part in {"", ".", ".."} for part in path.parts
+        ):
             raise ValueError("provider artifact path cannot escape its root")
         if not _SHA256_RE.fullmatch(self.sha256):
             raise ValueError("provider artifact sha256 must be canonical")
         if self.size_bytes < 0:
             raise ValueError("provider artifact size cannot be negative")
+        if not _MEDIA_TYPE_RE.fullmatch(self.media_type):
+            raise ValueError("provider artifact media type must be canonical")
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,7 +203,16 @@ class ProviderDocument:
         roles = [artifact.role for artifact in self.artifacts]
         if len(roles) != len(set(roles)):
             raise ValueError("provider artifact roles must be unique")
+        relative_paths = [artifact.relative_path for artifact in self.artifacts]
+        if len(relative_paths) != len(set(relative_paths)):
+            raise ValueError("provider artifact paths must be unique")
+        if relative_paths != sorted(relative_paths):
+            raise ValueError("provider artifacts must preserve canonical path order")
         role_set = set(roles)
+        if self.bundle_sha256 != provider_artifact_bundle_sha256(self.artifacts):
+            raise ValueError(
+                "provider bundle sha256 does not match its artifact inventory"
+            )
         for block in self.blocks:
             if not set(block.referenced_artifact_roles).issubset(role_set):
                 raise ValueError("provider block artifact role is not hash-bound")
@@ -218,6 +246,32 @@ class ProviderDocument:
         )
 
 
+def provider_artifact_bundle_sha256(
+    artifacts: tuple[ProviderArtifact, ...],
+) -> str:
+    """Hash provider file identity in path order.
+
+    Media type is a validated envelope descriptor, but not part of this stable
+    byte-inventory identity. The envelope's own artifact hash binds it.
+    """
+
+    payload = json.dumps(
+        [
+            {
+                "relative_path": artifact.relative_path,
+                "role": artifact.role,
+                "sha256": artifact.sha256,
+                "size_bytes": artifact.size_bytes,
+            }
+            for artifact in artifacts
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
 __all__ = [
     "PhysicalTableLogicalStatus",
     "ProviderArtifact",
@@ -227,4 +281,5 @@ __all__ = [
     "ProviderPage",
     "ProviderPayload",
     "ProviderPhysicalTableSegment",
+    "provider_artifact_bundle_sha256",
 ]

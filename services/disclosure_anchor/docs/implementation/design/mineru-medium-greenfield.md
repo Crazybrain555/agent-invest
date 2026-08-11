@@ -105,6 +105,40 @@ a reconciliation graph among these artifacts. An annotation that cannot bind uni
 ignored or leaves the primary block coarse; it is never recovered by fuzzy text or bbox
 matching.
 
+## Provider-document persistence boundary
+
+The parse-owned file contract is `provider_document.v1`. Its envelope binds the registered
+document, root parse owner, source PDF relative path/hash/page count, the complete existing
+`ParserTargetIdentity`, the independent parser-artifact root, and the full provider-native
+document. The provider artifact inventory has canonical, unique relative paths and opaque
+roles plus hash, size, and validated media type. Raw block and physical-table records keep
+their canonical provider JSON and a recomputed hash. The envelope is serialized in one
+canonical byte form so the existing `ProcessingRun.artifact_hash` can later bind those exact
+bytes.
+
+The envelope lives outside the parser bundle that it inventories:
+
+```text
+derived/provider_documents/<provider>/<security>/<provider_document_id>/
+  <artifact_owner_processing_run_id>/provider_document.v1.json
+```
+
+`parser_artifact_relpath` continues to identify the immutable MinerU bundle root. The
+provider-document file never appears in that bundle's own inventory, avoiding a recursive
+hash. Outline, headpath, coarse units, builder rules, search ownership, audit output, and
+generation time are deliberately absent: the same parse owner can be rebuilt by one later
+deterministic builder version without rewriting or rerunning MinerU.
+
+This contract and path land DB-free. There is no transitional migration or dormant
+provider row while the runtime still has only a NormalizedIR writer. The sole-writer cutover
+will use the next append-only migration (`0032` at the current `0031` head) in the same
+change set as all new Parse/Build/Publish entry points. That migration adds only the private
+`provider_document_relpath` needed for the new output. For parse owners, exactly one of
+`normalized_ir_relpath` and `provider_document_relpath` is present; the output contract is
+derived from that exclusive pair rather than stored as a third, drift-prone core fact.
+`artifact_hash` remains the bytes hash of whichever tagged primary parse output exists.
+Queue admission does not change before that cutover and becomes provider-only with it.
+
 ## Content conservation
 
 1. Provider text, table, image, caption, footnote, available position, and source identity
@@ -226,6 +260,12 @@ is imported by the greenfield writer and cannot build, publish, or rebuild old u
 Build and Publish paths reject v2-v4 inputs. The resolver is deleted only after all active
 and historical public references are migrated or explicitly retired, or after an
 authorized change retires the historical-evidence contract.
+
+Unattended maintenance therefore performs orphan-only artifact collection. It cannot
+retire a processing run, unit, outbox record, or evidence byte that remains reachable by a
+public run or asset reference. The old automatic superseded-generation retirement path is
+removed rather than retained as a silent footgun; a future retention policy requires an
+explicit public-contract decision before any replacement tool is introduced.
 
 ## Explicit non-goals
 

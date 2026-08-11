@@ -42,6 +42,14 @@ class PathBuilderTests(unittest.TestCase):
                     document_id="doc_01K00000000000000000000000",
                     processing_run_id="run_01K0000000000000000000000",
                 ),
+                builder.provider_document_relpath(
+                    provider="cninfo",
+                    security_code="002484",
+                    provider_document_id="1225087169",
+                    artifact_owner_processing_run_id=(
+                        "run_01K0000000000000000000000"
+                    ),
+                ),
                 builder.document_units_snapshot_relpath(
                     provider="cninfo",
                     security_code="002484",
@@ -53,6 +61,14 @@ class PathBuilderTests(unittest.TestCase):
             for path in paths:
                 self.assertFalse(path.is_absolute())
                 self.assertNotIn("..", path.parts)
+
+            self.assertEqual(
+                paths[3],
+                Path(
+                    "derived/provider_documents/cninfo/002484/1225087169/"
+                    "run_01K0000000000000000000000/provider_document.v1.json"
+                ),
+            )
 
     def test_runtime_tmp_path_stays_under_runtime_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

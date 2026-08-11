@@ -72,6 +72,19 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
             self.assertTrue(
                 all(":" not in artifact.role for artifact in document.artifacts)
             )
+            media_types = {
+                artifact.relative_path: artifact.media_type
+                for artifact in document.artifacts
+            }
+            self.assertEqual(
+                media_types[f"{_STEM}_content_list.json"],
+                "application/json",
+            )
+            self.assertEqual(media_types[f"{_STEM}.md"], "text/markdown")
+            self.assertEqual(
+                media_types["images/owner.jpg"],
+                "application/octet-stream",
+            )
 
     def test_rejects_dangling_block_artifact_role(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -104,6 +117,18 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
             after = reader.read(root, source_pdf_sha256=_SOURCE_SHA)
 
             self.assertNotEqual(before.bundle_sha256, after.bundle_sha256)
+
+    def test_rejects_non_utf8_markdown_media(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_bundle(root)
+            (root / f"{_STEM}.md").write_bytes(b"\xff\xfe\x00\x80")
+
+            with self.assertRaises(ParserOutputContractError):
+                MinerUMediumArtifactReader().read(
+                    root,
+                    source_pdf_sha256=_SOURCE_SHA,
+                )
 
     def test_rejects_wrong_lane(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

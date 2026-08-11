@@ -85,6 +85,16 @@ class FileStorePathPort(Protocol):
     ) -> Path:
         ...
 
+    def provider_document_relpath(
+        self,
+        *,
+        provider: str,
+        security_code: str,
+        provider_document_id: str,
+        artifact_owner_processing_run_id: str,
+    ) -> Path:
+        ...
+
     def document_units_snapshot_relpath(
         self,
         *,

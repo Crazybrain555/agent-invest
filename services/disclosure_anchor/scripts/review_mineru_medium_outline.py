@@ -79,6 +79,8 @@ def build_review_payload(
             raise ValueError("heading candidate disposition has no matching resolution")
 
     provider_record = asdict(document)
+    for artifact in provider_record["artifacts"]:
+        artifact.pop("media_type")
     for page in provider_record["pages"]:
         for block in page["blocks"]:
             block.pop("raw_item_json")

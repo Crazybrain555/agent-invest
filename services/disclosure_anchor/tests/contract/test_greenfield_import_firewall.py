@@ -11,13 +11,16 @@ _SOURCE_ROOT = _SERVICE_ROOT / "src" / "disclosure_anchor"
 _GREENFIELD_FILES = (
     _SOURCE_ROOT / "application" / "contracts" / "document_outline.py",
     _SOURCE_ROOT / "application" / "contracts" / "provider_document.py",
+    _SOURCE_ROOT / "application" / "contracts" / "provider_document_envelope.py",
     _SOURCE_ROOT / "application" / "services" / "document_outline.py",
     *sorted((_SOURCE_ROOT / "adapters" / "parsers" / "mineru_medium").rglob("*.py")),
 )
 _ALLOWED_DISCLOSURE_IMPORTS = (
     "disclosure_anchor.adapters.parsers.mineru_medium",
     "disclosure_anchor.application.contracts.document_outline",
+    "disclosure_anchor.application.contracts.parser_target",
     "disclosure_anchor.application.contracts.provider_document",
+    "disclosure_anchor.application.contracts.provider_document_envelope",
     "disclosure_anchor.application.services.document_outline",
     "disclosure_anchor.domain.errors",
 )

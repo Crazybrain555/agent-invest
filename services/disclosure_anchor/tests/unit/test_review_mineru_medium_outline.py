@@ -15,12 +15,14 @@ from scripts.review_mineru_medium_outline import (
 )
 
 from disclosure_anchor.application.contracts.provider_document import (
+    ProviderArtifact,
     ProviderBBox,
     ProviderBlock,
     ProviderDocument,
     ProviderPage,
     ProviderPayload,
     ProviderPhysicalTableSegment,
+    provider_artifact_bundle_sha256,
 )
 from disclosure_anchor.application.services.document_outline import (
     build_document_outline,
@@ -28,7 +30,6 @@ from disclosure_anchor.application.services.document_outline import (
 
 
 _SOURCE_SHA = "sha256:" + "a" * 64
-_BUNDLE_SHA = "sha256:" + "b" * 64
 _RAW_SHA = "sha256:" + "c" * 64
 
 
@@ -67,6 +68,7 @@ class ReviewMinerUMediumOutlineTest(unittest.TestCase):
         self.assertNotIn("raw_item_json", pages[0]["blocks"][0])
         self.assertNotIn("raw_segment_json", segments[0])
         self.assertIn("page_local_html_sha256", segments[0])
+        self.assertNotIn("media_type", provider["artifacts"][0])
         self.assertEqual(len(payload["outline"]["headings"]), 1)
 
     def test_review_rejects_stale_outline_or_provider_block(self) -> None:
@@ -220,6 +222,15 @@ def _document() -> ProviderDocument:
         _segment(0, 7, table_bbox, "retained", "前页"),
         _segment(1, 8, table_bbox, "deleted", "续页"),
     )
+    artifacts = (
+        ProviderArtifact(
+            role="content_list",
+            relative_path="content_list.json",
+            sha256="sha256:" + "d" * 64,
+            size_bytes=1,
+            media_type="application/json",
+        ),
+    )
     return ProviderDocument(
         source_pdf_sha256=_SOURCE_SHA,
         parser_version="3.4.4",
@@ -228,8 +239,8 @@ def _document() -> ProviderDocument:
         ocr_enabled=False,
         pages=(page,),
         physical_table_segments=segments,
-        artifacts=(),
-        bundle_sha256=_BUNDLE_SHA,
+        artifacts=artifacts,
+        bundle_sha256=provider_artifact_bundle_sha256(artifacts),
     )
 
 

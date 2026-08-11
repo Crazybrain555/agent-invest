@@ -16,6 +16,7 @@ from disclosure_anchor.application.contracts.provider_document import (
     ProviderPage,
     ProviderPayload,
     ProviderPhysicalTableSegment,
+    provider_artifact_bundle_sha256,
 )
 from disclosure_anchor.application.services.document_outline import (
     build_document_outline,
@@ -23,7 +24,7 @@ from disclosure_anchor.application.services.document_outline import (
 
 
 _SHA = "sha256:" + "a" * 64
-_BUNDLE_SHA = "sha256:" + "b" * 64
+_BUNDLE_SHA = provider_artifact_bundle_sha256(())
 
 
 class DocumentOutlineTest(unittest.TestCase):
