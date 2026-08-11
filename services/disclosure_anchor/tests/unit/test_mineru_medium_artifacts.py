@@ -56,8 +56,11 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
                 ],
                 ["<table><tr><td>前页</td></tr></table>", "<table><tr><td>续页</td></tr></table>"],
             )
+            first_segment_bbox = document.physical_table_segments[0].bbox
+            self.assertIsNotNone(first_segment_bbox)
+            assert first_segment_bbox is not None
             self.assertEqual(
-                document.physical_table_segments[0].bbox.as_tuple(),
+                first_segment_bbox.as_tuple(),
                 (100.0, 100.0, 900.0, 875.0),
             )
             self.assertIsNotNone(
@@ -65,6 +68,9 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
             )
             self.assertTrue(
                 any(artifact.relative_path == "notes.bin" for artifact in document.artifacts)
+            )
+            self.assertTrue(
+                all(":" not in artifact.role for artifact in document.artifacts)
             )
 
     def test_rejects_dangling_block_artifact_role(self) -> None:
@@ -131,7 +137,9 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
             _write_json(content_path, content)
             typed_path = root / f"{_STEM}_content_list_v2.json"
             typed = json.loads(typed_path.read_text(encoding="utf-8"))
-            _write_json(typed_path, typed[:1])
+            typed[0][1]["bbox"] = [101, 100, 900, 875]
+            typed[1][0]["type"] = "paragraph"
+            _write_json(typed_path, typed)
 
             document = MinerUMediumArtifactReader().read(
                 root,
@@ -139,8 +147,9 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
             )
 
             self.assertIsNone(document.blocks[0].bbox)
-            self.assertTrue(
-                all(block.typed_annotation is None for block in document.blocks)
+            self.assertEqual(
+                [block.typed_annotation for block in document.blocks],
+                [None, None, None],
             )
 
     def test_unmatched_physical_table_segment_stays_unbound(self) -> None:

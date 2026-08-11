@@ -20,8 +20,11 @@ that escape hatch explicitly.
 The internal `parser -> structure -> DocumentUnit` path will be rewritten as a small,
 independent seam. New code must not import the existing structure-proof, source-evidence
 graph, ledger, relation, repair, legacy unit-builder, or document-audit systems. They
-remain frozen only until the greenfield writer is accepted, then are removed in the same
-cutover commit. Git history is the archive; no `legacy/` copy will be kept in the tree.
+remain frozen only until the greenfield writer is accepted. Cutover then uses two adjacent
+commits with no deployment between them: the first switches every runtime entry point and
+proves that the legacy writer has zero callers; the second is mechanical deletion only.
+There is no dual-write, fallback, or mixed-runtime window. Git history is the archive; no
+`legacy/` copy will be kept in the tree.
 
 The stable service shell mechanics and current public-v1 surface remain the integration
 boundary for later phases:
@@ -39,9 +42,11 @@ and does not change a public contract or migration.
 
 Codex owns the main implementation line, code changes, real-sample validation, and final
 technical decision. ChatGPT Pro is used for major architecture and plan review and for
-adversarial review before material commits. Claude Fable is a second independent view for
-checking whether a plan is over-designed, locating concrete bugs, reviewing small diffs,
-and, when useful, implementing one explicitly bounded subtask.
+adversarial review before material commits. Its broader reasoning is reserved for difficult
+architecture, planning, trade-off, and adjudication work; verbose or over-corrective findings
+remain hypotheses until the repository or real samples support them. Claude Fable is a second
+independent view for plan review, concrete bug diagnosis, test design, code review, and, when
+useful, implementing one explicitly bounded subtask. It is not limited to over-design checks.
 
 Reviewer output is evidence to investigate, not a vote or authority transfer. A finding is
 adopted only when it is supported by the governing contract, exact code, or a real source
@@ -160,12 +165,14 @@ loop is added.
 
 ## Tables and page boundaries
 
-The DB-free slice retains each provider table representation exactly as emitted, including
-its available HTML/grid, ancillary text, crop, page/bbox, order, empty state, and artifact
-hash. A coarse diagnostic unit may contain several ordered page-local table parts; this
-does **not** assert that they are one logical table. Adjacent pages are never merged or
-deduplicated merely by visual or textual similarity. The greenfield path does not invent
-cells, headers, or cross-page rows.
+The DB-free provider record retains each provider table representation exactly as emitted,
+including its available HTML/grid, ancillary text, crop, page/bbox, order, empty state, and
+artifact hash. The outline resolver neither consumes nor deletes those physical segments.
+The mandatory review projection must account for every segment exactly once and may
+associate several ordered page-local parts with a coarse diagnostic unit; this does **not**
+assert that they are one logical table. Adjacent pages are never merged or deduplicated
+merely by visual or textual similarity. The greenfield path does not invent cells, headers,
+or cross-page rows.
 
 The existing public contract currently treats tables as page-local and rejects empty
 table payloads. Therefore the first slice makes no DB, searchability, continuation, or
@@ -191,8 +198,10 @@ headpath, ordered unit parts, page/bbox locators, and diagnostic alias status fo
 - Sanfu p134-p151 and a visually similar but independent table negative.
 
 Only after this review may the model reviewer, DB persistence, or retrieval-owner contract
-be implemented. Cutover to the greenfield writer and deletion of the frozen legacy write
-kernel happen in the same commit, so there is no dual-write or fallback window.
+be implemented. Runtime cutover and physical deletion are two adjacent commits with no
+deployment between them. The cutover commit makes the greenfield writer the sole writer
+and proves every legacy caller is gone; the immediately following deletion commit contains
+no business-logic change. At no point is there a runtime dual-write or fallback path.
 
 The delete manifest includes the legacy MinerU mapper/structure/source-evidence/table and
 visual repair path; PDF native/printed-ToC/character/glyph/ledger path; application NIR,

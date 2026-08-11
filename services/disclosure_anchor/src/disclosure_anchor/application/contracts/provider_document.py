@@ -9,6 +9,7 @@ from typing import Literal
 
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_ARTIFACT_ROLE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,8 +44,8 @@ class ProviderArtifact:
     size_bytes: int
 
     def __post_init__(self) -> None:
-        if not self.role:
-            raise ValueError("provider artifact role must be non-empty")
+        if not _ARTIFACT_ROLE_RE.fullmatch(self.role):
+            raise ValueError("provider artifact role must be opaque and identifier-safe")
         if not self.relative_path or self.relative_path.startswith("/"):
             raise ValueError("provider artifact path must be relative")
         if ".." in self.relative_path.split("/"):

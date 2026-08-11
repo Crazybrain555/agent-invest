@@ -62,6 +62,13 @@ _SEQUENCE_PAYLOAD_FIELDS = (
     "list_items",
 )
 _IMAGE_PATH_FIELDS = ("img_path", "image_path", "image")
+_COMPATIBLE_TYPED_ANNOTATIONS = frozenset(
+    {
+        ("header", "page_header"),
+        ("text", "paragraph"),
+        ("text", "title"),
+    }
+)
 
 
 class MinerUMediumArtifactReader:
@@ -142,6 +149,7 @@ class MinerUMediumArtifactReader:
             _bind_typed_annotations(
                 typed_pages=typed_pages,
                 content_indices_by_page=content_indices_by_page,
+                content_items=content_items,
             )
             if len(typed_pages) == len(page_sizes)
             else {}
@@ -310,10 +318,16 @@ def _artifact_roles(
     relative_paths = {path.relative_to(root).as_posix() for path in files}
     if not set(explicit_by_relative).issubset(relative_paths):
         raise ParserOutputContractError("MinerU artifact bundle is incomplete")
-    return {
-        relative: explicit_by_relative.get(relative, f"sidecar:{relative}")
-        for relative in sorted(relative_paths)
-    }
+    roles: dict[str, str] = {}
+    next_sidecar = 0
+    for relative in sorted(relative_paths):
+        explicit_role = explicit_by_relative.get(relative)
+        if explicit_role is not None:
+            roles[relative] = explicit_role
+            continue
+        roles[relative] = f"sidecar_{next_sidecar:06d}"
+        next_sidecar += 1
+    return roles
 
 
 def _artifact_record(
@@ -505,6 +519,7 @@ def _bind_typed_annotations(
     *,
     typed_pages: list[list[dict[str, Any]]],
     content_indices_by_page: list[list[int]],
+    content_items: list[dict[str, Any]],
 ) -> dict[int, str]:
     annotations: dict[int, str] = {}
     for page_index, source_indices in enumerate(content_indices_by_page):
@@ -515,8 +530,30 @@ def _bind_typed_annotations(
             typed_type = typed_block.get("type")
             if not isinstance(typed_type, str) or not typed_type:
                 continue
+            primary_item = content_items[source_index]
+            primary_type = primary_item.get("type")
+            if not isinstance(primary_type, str) or not _types_are_compatible(
+                primary_type=primary_type,
+                typed_type=typed_type,
+            ):
+                continue
+            primary_bbox = _bbox_or_none(primary_item.get("bbox"), strict=False)
+            typed_bbox = _bbox_or_none(typed_block.get("bbox"), strict=False)
+            if (
+                primary_bbox is None
+                or typed_bbox is None
+                or primary_bbox.as_tuple() != typed_bbox.as_tuple()
+            ):
+                continue
             annotations[source_index] = typed_type
     return annotations
+
+
+def _types_are_compatible(*, primary_type: str, typed_type: str) -> bool:
+    return primary_type == typed_type or (
+        primary_type,
+        typed_type,
+    ) in _COMPATIBLE_TYPED_ANNOTATIONS
 
 
 def _provider_payloads(

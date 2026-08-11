@@ -182,6 +182,10 @@
    "private_imports": [],
    "tests": 2
   },
+  "tests/unit/test_document_outline.py": {
+   "private_imports": [],
+   "tests": 10
+  },
   "tests/unit/test_document_unit_audit.py": {
    "private_imports": [],
    "tests": 24
