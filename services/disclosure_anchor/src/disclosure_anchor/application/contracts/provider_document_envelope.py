@@ -1,4 +1,10 @@
-"""Persist one source-bound MinerU Medium provider document without legacy NIR."""
+"""Encode one closed MinerU Medium provider-document record without legacy NIR.
+
+This module is a structural codec, not the source-admission boundary.  The
+sole-writer path must re-read the immutable MinerU bundle and require exact
+``ProviderDocument`` equality before any decoded record reaches Build,
+retrieval, or publication.
+"""
 
 from __future__ import annotations
 
@@ -41,12 +47,12 @@ _PUBLIC_IMAGE_MEDIA_TYPES = frozenset(
 
 
 class ProviderDocumentEnvelopeError(ValueError):
-    """The persisted provider document is incomplete or contradictory."""
+    """The provider-document record is structurally invalid or noncanonical."""
 
 
 @dataclass(frozen=True, slots=True)
 class ProviderDocumentEnvelope:
-    """One immutable parse-owner projection used by later deterministic builds."""
+    """One canonical parse-owner record awaiting source admission."""
 
     document_id: str
     artifact_owner_processing_run_id: str
@@ -246,7 +252,13 @@ def _provider_document_envelope_payload(
 
 
 def provider_document_envelope_from_payload(value: object) -> ProviderDocumentEnvelope:
-    """Load and validate one exact ``provider_document.v1`` JSON value."""
+    """Structurally decode one closed ``provider_document.v1`` JSON value.
+
+    This checks the record's own shape, paths, identities, and canonical raw
+    fragment hashes.  It deliberately does not prove that duplicated typed
+    projections equal the hash-bound MinerU files; that stronger check belongs
+    to the sole-writer source-admission path.
+    """
 
     payload = _exact_mapping(
         value,
@@ -309,7 +321,11 @@ def provider_document_envelope_to_bytes(
 def provider_document_envelope_from_bytes(
     value: bytes,
 ) -> ProviderDocumentEnvelope:
-    """Decode only the canonical byte representation of one envelope."""
+    """Structurally decode only the canonical bytes of one envelope.
+
+    Decoding alone never authorizes the returned object for Build, retrieval,
+    or publication.  See the module-level source-admission requirement.
+    """
 
     try:
         decoded = json.loads(

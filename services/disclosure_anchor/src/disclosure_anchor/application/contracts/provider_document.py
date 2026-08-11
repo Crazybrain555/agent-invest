@@ -110,7 +110,7 @@ class ProviderArtifact:
 
 @dataclass(frozen=True, slots=True)
 class ProviderPayload:
-    """One source-order string field emitted by the provider item."""
+    """One provider string field in the service's canonical contract order."""
 
     field: str
     item_index: int | None
@@ -175,7 +175,9 @@ class ProviderBlock:
                     "provider payload field is not valid for its block type"
                 )
             if rank < previous_rank:
-                raise ValueError("provider payload fields must follow provider order")
+                raise ValueError(
+                    "provider payload fields must follow canonical contract order"
+                )
             previous_rank = rank
             if payload.field in scalar_fields:
                 if payload.item_index is not None or payload.field in seen_scalar_fields:

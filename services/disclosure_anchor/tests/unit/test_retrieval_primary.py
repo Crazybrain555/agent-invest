@@ -85,6 +85,18 @@ class RetrievalPrimaryTest(unittest.TestCase):
             ),
             ("外前", "内", "外后", "末"),
         )
+        self.assertEqual(
+            html_visible_text_segments(
+                "<p>前言</p><table><td>甲</td></table><p>后记</p>"
+            ),
+            ("前言", "甲", "后记"),
+        )
+        self.assertEqual(
+            html_visible_text_segments(
+                "<template><table><td>隐藏</td></table></template>可见"
+            ),
+            ("可见",),
+        )
 
     def test_unknown_payload_field_and_stale_identity_fail_closed(self) -> None:
         document = _document()

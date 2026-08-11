@@ -107,14 +107,35 @@ matching.
 
 ## Provider-document persistence boundary
 
-The parse-owned file contract is `provider_document.v1`. Its envelope binds the registered
-document, root parse owner, source PDF relative path/hash/page count, the complete existing
-`ParserTargetIdentity`, the independent parser-artifact root, and the full provider-native
-document. The provider artifact inventory has canonical, unique relative paths and opaque
-roles plus hash, size, and validated media type. Raw block and physical-table records keep
-their canonical provider JSON and a recomputed hash. The envelope is serialized in one
-canonical byte form so the existing `ProcessingRun.artifact_hash` can later bind those exact
-bytes.
+The parse-owned file contract is `provider_document.v1`. Its structural codec records the
+registered document, root parse owner, source PDF relative path/hash/page count, the complete
+existing `ParserTargetIdentity`, the independent parser-artifact root, and the projected
+provider-native document. The provider artifact inventory has canonical, unique relative
+paths and opaque roles plus hash, size, and validated media type. Raw block and physical-table
+fragments keep their canonical provider JSON and a recomputed self-hash. The record is
+serialized in one canonical byte form so the existing `ProcessingRun.artifact_hash` can later
+bind those exact bytes.
+
+Decoding those bytes is deliberately **not** source admission. Several useful typed fields,
+including `content_list_v2` annotations and middle-json retained/deleted status, are derived
+from a different artifact than the local raw fragment stored beside them. Reimplementing a
+partial validator in the codec would duplicate the artifact reader while still leaving gaps.
+The sole-writer cutover therefore has one stronger mandatory admission path, before Build or
+retrieval can consume the record:
+
+1. resolve the immutable source PDF and parser bundle without symlink or root escape;
+2. independently verify the PDF hash and page count;
+3. run `MinerUMediumArtifactReader` over that exact bundle and source hash, then require the
+   regenerated `ProviderDocument` to equal the envelope's projected document exactly;
+4. require the canonical envelope-byte hash to equal `ProcessingRun.artifact_hash`, and bind
+   document, parse owner, parser target, and artifact root to the run;
+5. expose only the admitted object to Build/retrieval/publication; no runtime consumer may
+   call the structural codec and trust its result directly.
+
+Cutover regression tests must independently mutate a valid envelope's projected payload text
+and its physical-segment HTML/status/index while leaving the adjacent raw fragment/hash
+unchanged; both must fail source admission. This is one full-reader equality check, not a new
+field-by-field reconciliation or proof graph.
 
 The envelope lives outside the parser bundle that it inventories:
 
@@ -122,6 +143,12 @@ The envelope lives outside the parser bundle that it inventories:
 derived/provider_documents/<provider>/<security>/<provider_document_id>/
   <artifact_owner_processing_run_id>/provider_document.v1.json
 ```
+
+`provider_document.v1` is still a pre-cutover development contract: no runtime writer,
+database row, Build/retrieval loader, or persisted consumer exists. Its field set may be
+corrected in this DB-free phase without a compatibility reader; the first sole-writer
+admission commit freezes the versioned bytes. After that point, removing or changing a field
+requires a new contract version and explicit read compatibility rather than this exception.
 
 `parser_artifact_relpath` continues to identify the immutable MinerU bundle root. The
 provider-document file never appears in that bundle's own inventory, avoiding a recursive

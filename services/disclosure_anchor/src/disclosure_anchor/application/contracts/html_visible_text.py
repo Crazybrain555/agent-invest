@@ -17,16 +17,15 @@ class _VisibleTextParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self._suppressed_depth = 0
-        self._cell_parts: list[str] = []
-        self._cell_fragments: list[str] = []
+        self._hard_parts: list[str] = []
+        self._hard_fragments: list[str] = []
         self._cell_stack: list[str] = []
-        self._saw_cell = False
 
-    def _flush_cell(self) -> None:
-        value = " ".join(self._cell_fragments)
+    def _flush_hard_segment(self) -> None:
+        value = " ".join(self._hard_fragments)
         if value:
-            self._cell_parts.append(value)
-        self._cell_fragments = []
+            self._hard_parts.append(value)
+        self._hard_fragments = []
 
     def handle_starttag(
         self,
@@ -34,23 +33,26 @@ class _VisibleTextParser(HTMLParser):
         attrs: list[tuple[str, str | None]],
     ) -> None:
         del attrs
-        if tag.lower() in _NON_VISIBLE_ELEMENTS:
+        normalized = tag.lower()
+        if self._suppressed_depth:
+            if normalized in _NON_VISIBLE_ELEMENTS:
+                self._suppressed_depth += 1
+            return
+        if normalized in _NON_VISIBLE_ELEMENTS:
             self._suppressed_depth += 1
             return
-        if tag.lower() in {"caption", "td", "th"}:
-            self._flush_cell()
-            self._cell_stack.append(tag.lower())
-            self._saw_cell = True
+        if normalized in {"caption", "td", "th"}:
+            self._flush_hard_segment()
+            self._cell_stack.append(normalized)
 
     def handle_endtag(self, tag: str) -> None:
-        if (
-            tag.lower() in _NON_VISIBLE_ELEMENTS
-            and self._suppressed_depth > 0
-        ):
-            self._suppressed_depth -= 1
+        normalized = tag.lower()
+        if self._suppressed_depth:
+            if normalized in _NON_VISIBLE_ELEMENTS:
+                self._suppressed_depth -= 1
             return
-        if self._cell_stack and tag.lower() == self._cell_stack[-1]:
-            self._flush_cell()
+        if self._cell_stack and normalized == self._cell_stack[-1]:
+            self._flush_hard_segment()
             self._cell_stack.pop()
 
     def handle_data(self, data: str) -> None:
@@ -59,18 +61,14 @@ class _VisibleTextParser(HTMLParser):
         collapsed = " ".join(data.split())
         if collapsed:
             self.parts.append(collapsed)
-            if self._cell_stack:
-                self._cell_fragments.append(collapsed)
+            self._hard_fragments.append(collapsed)
 
     def close(self) -> None:
         super().close()
-        self._flush_cell()
+        self._flush_hard_segment()
 
     def hard_segments(self) -> tuple[str, ...]:
-        if self._saw_cell:
-            return tuple(self._cell_parts)
-        text = " ".join(self.parts)
-        return (text,) if text else ()
+        return tuple(self._hard_parts)
 
 
 def html_visible_text(value: str) -> str:
