@@ -31,6 +31,23 @@ being resumed, parallel worktrees are involved, or shared runtime state may be m
   Resume in that checkout or perform an explicit handoff. Transfer or close all user gates, premise guards, and
   runtime obligations before archiving/deleting a task or worktree.
 
+### Recovery receipt
+
+- Trigger recovery whenever task history is incomplete or unclear, including after compaction, resume, interruption,
+  a steered follow-up, or a mismatch between the conversation and the worktree. Do not require the agent to know
+  which mechanism caused the gap.
+- Before mutating, re-read the applicable instruction chain and HANDOFF, then inspect current `HEAD`, status/diff,
+  and the narrow read-only runtime or external identity needed by the pending action. Reconcile three authorities:
+  the current user request controls intent and authorization; tracked/durable records preserve decisions and task
+  receipts; current repository or external observations establish descriptive state. A conversation summary alone
+  never authorizes an action or proves that it remains pending.
+- Treat every HANDOFF `Completed / do not repeat` item as closed. Repeat it only when its recorded invalidation
+  condition is met, fresh read-only evidence proves the result no longer holds, or the user explicitly requests a
+  repeat. If sources conflict and the conflict cannot be closed read-only, stop before the side effect and report it.
+- Refresh HANDOFF immediately after a material commit/push, external-state action, authorization change, user
+  decision, validation/review gate, or change of execution phase. Do not defer all task-state writing until the end
+  of a long turn. The receipt records the result and evidence, not a transcript of the work.
+
 ## 3. Parking and closing
 
 - Parking is one step: write `docs/agent/parked/<task-key>.md` and delete HANDOFF. It requires no uncommitted task
@@ -45,8 +62,8 @@ being resumed, parallel worktrees are involved, or shared runtime state may be m
 - Reviewers/helpers are read-only. Parallel mutating tasks use `scripts/agent_worktree.sh spawn <task-key>`, which
   creates `../agent-invest-worktrees/<task-key>` on `task/<task-key>`, copies `.worktreeinclude`, and surfaces the
   primary checkout's parked guards.
-- Spawning authorizes local commits only on that task branch. Push, merge into `main`, branch deletion, and history
-  rewrite still require explicit user authorization; the primary writer or user performs the merge.
+- Spawning isolates a mutating task but does not authorize commits. Commit, push, merge into `main`, branch
+  deletion, and history rewrite require explicit user authorization; the primary writer or user performs the merge.
 - `reap` requires a clean worktree, no unclosed handoff, no unresolved/untransferred parked record, and no retained
   runtime claim.
 
@@ -61,11 +78,18 @@ being resumed, parallel worktrees are involved, or shared runtime state may be m
 
 ## 6. Record schemas and history
 
-- HANDOFF is at most 80 lines and contains only: task key/title, scope, state, authority, user intent/acceptance,
-  authorization boundary, research/decision evidence, next action, blockers, worktree/branch/base, changed paths,
-  latest current-session validation/review, runtime claims, writer, and updated time.
+- HANDOFF is at most 80 lines and contains only: task key/title, scope, state/current phase, authority, user
+  intent/acceptance, authorization boundary, research/decision evidence, `Completed / do not repeat` receipts
+  (result, stable evidence, and any invalidation condition), pending actions in execution order, blockers,
+  worktree/branch/base, dirty or changed paths, latest current-session validation/review, runtime claims, writer,
+  and updated time. External observations include an observation time or identity and are never silently treated as
+  permanent facts.
+- `Completed / do not repeat` and `Pending / next action` are disjoint. Moving an item between them requires a
+  recorded reason. A `closed` or `completed` record has no pending action, blocker, or retained runtime claim; it
+  may keep only a concise completion receipt or be removed once durable results are tracked elsewhere.
 - A parked record is at most 40 lines and contains only: key/title, state, pending decision/re-entry condition,
-  guarded premises, retained runtime claims, next action, branch/base, brief origin note, and updated time.
+  guarded premises, a concise `Completed / do not repeat` receipt with stable evidence and invalidation condition,
+  retained runtime claims, next action, branch/base, brief origin note, and updated time.
 - Long-lived facts belong in tracked contracts/docs. Never put secrets, chat transcripts, duplicated repository
   facts, or volatile ops snapshots in task records.
 - Legacy `Prompt/Plan/Status/Documentation/Implement/code_review`, `archive/`, and `notes/` are read-only history,

@@ -1,6 +1,6 @@
 ---
-name: opus-executor
-description: 执行型子代理（固定跑 Opus）。当主循环（Fable）已把任务规格写清楚时，用它做具体实现：代码修改、写测试、跑验收命令、脚本/runbook/文档编写等机械性执行工作。方案设计、语义精细的修复（并发/可见性边界类）和独立复审不要用它，留给主循环。Use proactively for well-specified implementation and mechanical execution tasks; not for design decisions or independent review.
+name: disclosure-anchor-opus-executor
+description: disclosure_anchor 执行型子代理（固定跑 Opus）。当主代理已把任务规格和机械验收写清楚时，用它做具体实现：代码修改、写测试、跑验收命令、脚本/runbook/文档编写等边界明确的执行工作。方案设计、语义敏感修复和独立复审留给主代理。Use for well-specified disclosure_anchor implementation and mechanical execution, not design decisions or independent review.
 model: opus
 effort: max
 ---

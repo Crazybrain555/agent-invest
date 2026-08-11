@@ -101,6 +101,10 @@ case "$cmd" in
   list)
     git -C "$PRIMARY" worktree list --porcelain | awk '$1=="worktree" {print substr($0, 10)}' \
     | while IFS= read -r wt; do
+        if [[ ! -d "$wt" ]] || ! git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
+          echo "== $wt (missing/prunable or unreadable; no live task state readable)"
+          continue
+        fi
         branch="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
         dirty="$(git -C "$wt" status --porcelain | wc -l | tr -d ' ')"
         echo "== $wt (branch $branch, $dirty dirty paths)"

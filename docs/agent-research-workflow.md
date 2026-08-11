@@ -6,8 +6,12 @@ runtime protocol live in `docs/agent-workflow.md`.
 
 ## 1. Trigger
 
-The gate applies to every change that may alter normative semantics or observable application behavior. It
-always triggers; only the external-research step may be skipped (§2).
+The gate applies to every decision or change that may alter normative semantics or observable application
+behavior. It always requires the governing local contract, current implementation, and a representative real
+case when one is available and applicable. External research is required when the decision depends on an
+external mechanism, has material or unresolved design alternatives, or a nearer component rule or the user
+requires it. Reuse research already closed in the active task when the question, source version, and deployed
+identity have not changed.
 
 Observable application behavior includes: accepted/rejected inputs; produced outputs; persisted state;
 emitted events (outbox/change feed); public API/CLI semantics; state transitions; scheduling, retry,
@@ -18,24 +22,21 @@ contract confirms is defining behavior and passes the gate too.
 Evidence-only inspection, reproduction, and a failing regression test that encodes an already-authoritative
 contract may precede external research when they establish no new semantics.
 
-The gate is keyed to **decisions, not just code edits** (user refinement 2026-07-16): every significant
-decision — including removals, simplifications, adjudications between designs, new mechanisms/tooling, and
-ops procedure designs — checks 1–2 external analogues before execution, unless it is trivially simple or the
-question was already researched in this task. **User direction or authorization does not exempt the external
-check**: a user-approved removal still gets its analogue lookup (it usually confirms the decision cheaply,
-e.g. Unstructured neither splits Q&A transcripts nor infers td-only table headers — recorded evidence for the
-2026-07-16 simplifications). When the external evidence contradicts the intended decision, surface it to the
-user before executing.
+The gate is keyed to decisions, not just code edits: removals, simplifications, tool choices, and operational
+designs count when they change behavior. User authorization sets scope but does not replace relevant mechanism
+research. When external evidence conflicts with the intended product semantics, surface the conflict before
+executing; do not browse merely to satisfy a source count after the decision is already closed. An explicit
+no-network instruction controls the research method: use available local/attached evidence and report the
+resulting limitation instead of browsing.
 
 ## 2. Permitted skip of external research
 
-Every gated change still produces a before-edit record (§5); skipping affects only the external-research
-step, never the gate. External research may be skipped only when the change is provably design-neutral, so
-external evidence cannot affect the design: formatting, spelling, comments, a documentation correction of an
-already-established fact, a pure mechanical rename with all references and tests updated, or a refactor whose
-behavior equivalence is demonstrated by existing characterization tests. Record the skip reason and the
-equivalence evidence — the mere existence of tests, an obvious-looking bug, agent confidence, time pressure,
-or an existing fixture is not sufficient.
+Every gated change still produces a before-edit record (§5); skipping affects only the external step. It may be
+skipped when external evidence cannot materially change the decision: a design-neutral edit; a local correction
+fully determined by an authoritative repository contract with no external mechanism involved; or the same
+question already closed in the active task against unchanged source and runtime identities. Record the reason
+and supporting contract or equivalence evidence. Agent confidence, time pressure, or a convenient fixture is
+not evidence.
 
 ## 3. Evidence by question
 
@@ -44,20 +45,30 @@ or an existing fixture is not sufficient.
   source for the dependency actually deployed.
 - Current behavior: code, schemas, runtime commands, raw artifacts, and representative real data.
 - Design alternatives: maintainer design records, issues/PRs, and mature implementations.
-- Discovery tools (Context7, DeepWiki, GitHub/web search, DBHub) locate and summarize evidence; their
-  summaries are never authorities by themselves.
+- Tools do not create a new evidence class; classify the underlying source. DeepWiki and search snippets supply
+  code maps or hypotheses. Context7 locates candidate or version-relevant documentation; the official page and
+  version remain the evidence. A GitHub exact file proves only that repository/ref/path; issues/PRs and
+  default-branch files do not establish released or deployed behavior. A read-only DBHub result is direct
+  current-behavior evidence only for its recorded environment, query, and observation time. Two tools exposing
+  the same upstream artifact are one lineage, not independent corroboration.
+- For behavior claims from upstream code, record the repository, exact source path and immutable commit SHA,
+  plus release/tag association and issue/PR state when relevant; verify its mapping to the locally deployed
+  version. Distinguish representational capacity from implemented behavior: a data model's ability to express an
+  outcome does not prove that a detection, linking, continuation, or reconstruction algorithm exists.
 
 ## 4. Depth and stop condition
 
-- Routine, contract-determined fix: inspect the local authority and the relevant official external contract.
+- Routine, contract-determined fix: inspect the local authority and, when an external mechanism is involved,
+  the relevant official external contract.
 - Non-novel design choice: add 1–2 mature analogues.
 - Material architecture, cross-service contract, dependency, provider framework, security, migration, or
   ops change: compare 2–4 independent relevant sources or implementations, including at least one competing
   approach.
 - Domain-specific work follows the nearest component `AGENTS.md` research-source requirements.
 
-Source count is not the goal. Stop when the local authority, a representative case, the governing external
-contract, the adopted invariant, the main rejected alternative, and the validation plan are settled.
+Source count is not the goal. Stop when the local authority, an available applicable representative case, any
+governing external contract, the adopted invariant, the main rejected alternative, and the validation plan are
+settled.
 
 ## 5. Before-edit record
 
@@ -88,6 +99,10 @@ Material changes additionally:
 - Official external contract vs repository product contract: never silently pick one; identify the required
   contract revision or adapter, and obtain user authorization when product semantics would change.
 - Conflicting official versions: anchor to the deployed version; verify with a minimal reproduction if needed.
+- Discovery summary vs primary artifact: the primary artifact at the relevant ref wins; correct the claim
+  before design.
+- Upstream main, issue, or PR vs deployed runtime: match merged, released, and deployed identities; otherwise
+  the upstream material remains comparative evidence.
 - Within conflict resolution, escalate to the user only when product semantics, acceptance criteria, or
   authorization boundaries must change; broader ask-before duties in root `AGENTS.md` §3 are unaffected.
 

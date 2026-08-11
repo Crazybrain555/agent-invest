@@ -19,9 +19,9 @@ Use the authority that governs the question:
 - **Descriptive truth:** actual files, schemas, commands, and observed results describe what currently exists.
   A mismatch with a normative authority is implementation/doc drift to reconcile; it never silently overrides
   v0.8 or a component's normative contract.
-- **Comparative design evidence:** maintainer design records, issues/PRs, and mature implementations inform
-  design choices; they are never semantic authorities. Discovery tools (Context7, DeepWiki, GitHub/web search,
-  DBHub) locate and summarize evidence; a tool's summary is not an authority either.
+- **Comparative design evidence:** maintainer records, issues/PRs, and mature implementations inform design but
+  never override product semantics. Discovery tools provide maps and hypotheses, not authority; verify material
+  behavior claims in the exact official artifact or source at a pinned ref and map them to the deployed version.
 
 ```text
 services/disclosure_anchor/   L1 disclosure/PDF path (live; blueprint for service mechanics)
@@ -33,12 +33,10 @@ docs/archive/pre-restart/     frozen Quant_agent-era evidence; never current pol
 (planned) services/upload_service/   independent L1 human-upload service
 ```
 
-Instruction files load from the repository root toward the working directory. Nearer files add or narrow
-subtree rules and take precedence only when the same subject conflicts; they do not erase unrelated parent
-rules. `AGENTS.md` is the shared tool-neutral operating contract; tool-specific adapters (root `CLAUDE.md`,
-Codex configuration) may add loading, memory, or tool mechanics but never duplicate or redefine shared
-semantics or hard boundaries. `docs/archive/pre-restart/` remains frozen even if it contains old instruction
-files.
+Instruction files layer from the repository root toward the working directory; nearer files add or narrow rules
+for their subtree, so keep the chain non-contradictory. `AGENTS.md` is the shared tool-neutral contract. Root
+`CLAUDE.md` and Codex configuration are thin tool adapters and do not duplicate product rules.
+`docs/archive/pre-restart/` is frozen even when it contains old instruction files.
 
 ## 2. Cross-service invariants
 
@@ -54,17 +52,17 @@ files.
 5. **Secrets:** real credentials live in environment variables or private user-level config. Tracked files and
    examples contain placeholders only; replace exposed credentials and tell the user to rotate them.
 6. **Git/external actions:** do not commit, push, rewrite history, publish, or make other external writes unless
-   the user explicitly asks. Local commits on a spawned `task/<task-key>` branch are the one standing
-   exception (§3). Never run destructive cleanup without explicit approval.
+   the user explicitly asks. Creating a task branch or worktree does not grant that authorization. Never run
+   destructive cleanup without explicit approval.
 7. **Service ownership:** migrations write only the owning component's schemas/roles. Shared-package changes and
    public-contract changes update all affected consumers, exports, tests, and docs together.
 
 ## 3. Work selection, research, and task state
 
 - Default to bounded, in-scope work. Read-only requests authorize inspection/reporting; change/fix requests
-  authorize requested local edits and non-destructive validation. Ask before destructive, external, costly,
-  credential/permission, commit/push, or materially scope-expanding actions. Preserve unrelated user changes:
-  never revert or overwrite working-tree edits that are not the current task's.
+  authorize requested local edits and non-destructive validation. Ask before destructive, costly,
+  credential/permission, commit/push, external-write/message, or materially scope-expanding actions. Preserve
+  unrelated user changes: never revert or overwrite working-tree edits that are not the current task's.
 - Durable task state is required when work crosses sessions; touches architecture, a public contract,
   migration/data boundaries, or high-risk operations; has material unknowns; is explicitly requested as durable;
   resumes an existing durable task; or pauses for a user decision. Before the first mutation, fully read and follow
@@ -72,23 +70,18 @@ files.
 - At session start, inspect root and affected-service HANDOFF/parked records before mutation and announce each
   active gate once. An unclosed HANDOFF holds the worktree write gate; only its named writer may mutate. Read and
   claim the primary checkout's `docs/agent/RUNTIME.md` before shared PG, AgentSSD, or worker mutations.
+- If task history looks incomplete, stale, resumed, or compacted, reconcile the current user request, applicable
+  HANDOFF, Git/worktree truth, and any in-scope external state before another mutation or side effect. Conversation
+  summaries are hints, not execution state; never repeat an action recorded as completed solely because it reappears
+  as pending in chat context. Follow the recovery receipt in `docs/agent-workflow.md` §2.
 - Legacy `Prompt/Plan/Status/Documentation/Implement/code_review`, `archive/`, and `notes/` are read-only history,
   never current authority. Do not recreate, update, or delete ignored legacy state without explicit approval.
-- **Pre-design research gate:** every change that may alter normative semantics or observable application
-  behavior passes this gate before the first design commitment or behavior-affecting edit. Familiarity, low
-  difficulty, and existing local tests are not exemptions—difficulty changes research depth, not whether the
-  gate applies. First inspect the governing repository contract, the current implementation, and a
-  representative real case. For non-novel work, presume an official contract or mature prior art exists and
-  run a bounded external check; skip external research only when the change is provably design-neutral (e.g.
-  formatting or a pure mechanical rename; canonical classes in the workflow doc §2) and record the skip
-  reason with equivalence evidence—agent confidence alone is never one. Before editing, record the research
-  question, governing authority, adopted invariant with the main rejected alternative, validation plan, and
-  any skip reason. Material architecture, cross-service contract, dependency, provider, security, migration,
-  or ops changes additionally record the material fields of the workflow doc §5 and compare 2–4 independent
-  relevant sources or implementations. Cross-check candidates against normative contracts, current code, and real
-  data; adopt invariants and tests, not project-specific patches or copied code. External evidence never
-  silently revises a normative repository contract—surface a required contract revision explicitly. Follow
-  `docs/agent-research-workflow.md` for evidence classes, depth, stop conditions, and conflict resolution.
+- **Pre-design evidence gate:** before a behavior-affecting decision or edit, inspect the governing contract,
+  current implementation, and a representative real case when one is available and applicable. Follow
+  `docs/agent-research-workflow.md` for when external research is required, source authority, depth, the
+  before-edit record, and stop conditions; nearer
+  component rules may deliberately be stricter. Adopt general invariants and positive/negative tests, not
+  project-specific patches or copied internals. External evidence never silently revises a repository contract.
 - For DB-backed parsing, projection, publication, or retrieval work, calibrate against the real versioned public
   view/read model with read-only SQL when available (DBHub is suitable): inspect the live schema before naming
   columns, then sample active rows and distributions across representative types/owners. Historical tests and
