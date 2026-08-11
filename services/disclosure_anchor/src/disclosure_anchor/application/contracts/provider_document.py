@@ -16,6 +16,39 @@ _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ARTIFACT_ROLE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _MEDIA_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$")
 
+_SCALAR_PAYLOAD_FIELDS_BY_TYPE: dict[str, tuple[str, ...]] = {
+    "aside_text": ("text",),
+    "chart": ("content",),
+    "code": ("code_body",),
+    "equation": ("text",),
+    "footer": ("text",),
+    "header": ("text",),
+    "image": ("content",),
+    "list": (),
+    "page_footnote": ("text",),
+    "page_number": ("text",),
+    "phonetic": ("text",),
+    "ref_text": ("text",),
+    "table": ("table_body",),
+    "text": ("text",),
+}
+_SEQUENCE_PAYLOAD_FIELDS_BY_TYPE: dict[str, tuple[str, ...]] = {
+    "aside_text": (),
+    "chart": ("chart_caption", "chart_footnote"),
+    "code": ("code_caption",),
+    "equation": (),
+    "footer": (),
+    "header": (),
+    "image": ("image_caption", "image_footnote"),
+    "list": ("list_items",),
+    "page_footnote": (),
+    "page_number": (),
+    "phonetic": (),
+    "ref_text": (),
+    "table": ("table_caption", "table_footnote"),
+    "text": (),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ProviderBBox:
@@ -90,6 +123,20 @@ class ProviderPayload:
             raise ValueError("provider payload item index cannot be negative")
 
 
+def provider_payload_field_contract(
+    provider_type: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return MinerU 3.4.4's scalar and sequence fields for one block type."""
+
+    try:
+        return (
+            _SCALAR_PAYLOAD_FIELDS_BY_TYPE[provider_type],
+            _SEQUENCE_PAYLOAD_FIELDS_BY_TYPE[provider_type],
+        )
+    except KeyError as exc:
+        raise ValueError("provider block type is not supported") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderBlock:
     """One flat content-list item with no inferred document semantics."""
@@ -111,6 +158,36 @@ class ProviderBlock:
             raise ValueError("provider block indices cannot be negative")
         if not self.provider_type:
             raise ValueError("provider block type must be non-empty")
+        scalar_fields, sequence_fields = provider_payload_field_contract(
+            self.provider_type
+        )
+        field_order = {
+            field: index
+            for index, field in enumerate((*scalar_fields, *sequence_fields))
+        }
+        previous_rank = -1
+        seen_scalar_fields: set[str] = set()
+        next_sequence_index = {field: 0 for field in sequence_fields}
+        for payload in self.payloads:
+            rank = field_order.get(payload.field)
+            if rank is None:
+                raise ValueError(
+                    "provider payload field is not valid for its block type"
+                )
+            if rank < previous_rank:
+                raise ValueError("provider payload fields must follow provider order")
+            previous_rank = rank
+            if payload.field in scalar_fields:
+                if payload.item_index is not None or payload.field in seen_scalar_fields:
+                    raise ValueError("provider scalar payload must occur exactly once")
+                seen_scalar_fields.add(payload.field)
+                continue
+            expected_index = next_sequence_index[payload.field]
+            if payload.item_index != expected_index:
+                raise ValueError(
+                    "provider sequence payload indices must be contiguous"
+                )
+            next_sequence_index[payload.field] = expected_index + 1
         if self.typed_annotation == "":
             raise ValueError("typed annotation must be non-empty when present")
         if self.provider_level is not None and self.provider_level < 0:
@@ -133,7 +210,6 @@ class ProviderPhysicalTableSegment:
     page_local_html: str
     crop_artifact_role: str | None
     logical_stream_status: PhysicalTableLogicalStatus
-    cell_merge_json: str | None
     raw_segment_json: str
     raw_segment_sha256: str
 
@@ -144,8 +220,6 @@ class ProviderPhysicalTableSegment:
             raise ValueError("provider table segment status is unsupported")
         if self.crop_artifact_role == "":
             raise ValueError("provider table crop role must be non-empty when present")
-        if self.cell_merge_json == "":
-            raise ValueError("cell-merge JSON must be non-empty when present")
         if not _SHA256_RE.fullmatch(self.raw_segment_sha256):
             raise ValueError("provider table segment sha256 must be canonical")
 
@@ -282,4 +356,5 @@ __all__ = [
     "ProviderPayload",
     "ProviderPhysicalTableSegment",
     "provider_artifact_bundle_sha256",
+    "provider_payload_field_contract",
 ]

@@ -18,16 +18,15 @@ class _VisibleTextParser(HTMLParser):
         self.parts: list[str] = []
         self._suppressed_depth = 0
         self._cell_parts: list[str] = []
-        self._cell_fragments: list[str] | None = None
+        self._cell_fragments: list[str] = []
+        self._cell_stack: list[str] = []
         self._saw_cell = False
 
     def _flush_cell(self) -> None:
-        if self._cell_fragments is None:
-            return
         value = " ".join(self._cell_fragments)
         if value:
             self._cell_parts.append(value)
-        self._cell_fragments = None
+        self._cell_fragments = []
 
     def handle_starttag(
         self,
@@ -40,7 +39,7 @@ class _VisibleTextParser(HTMLParser):
             return
         if tag.lower() in {"caption", "td", "th"}:
             self._flush_cell()
-            self._cell_fragments = []
+            self._cell_stack.append(tag.lower())
             self._saw_cell = True
 
     def handle_endtag(self, tag: str) -> None:
@@ -50,8 +49,9 @@ class _VisibleTextParser(HTMLParser):
         ):
             self._suppressed_depth -= 1
             return
-        if tag.lower() in {"caption", "td", "th"}:
+        if self._cell_stack and tag.lower() == self._cell_stack[-1]:
             self._flush_cell()
+            self._cell_stack.pop()
 
     def handle_data(self, data: str) -> None:
         if self._suppressed_depth:
@@ -59,7 +59,7 @@ class _VisibleTextParser(HTMLParser):
         collapsed = " ".join(data.split())
         if collapsed:
             self.parts.append(collapsed)
-            if self._cell_fragments is not None:
+            if self._cell_stack:
                 self._cell_fragments.append(collapsed)
 
     def close(self) -> None:

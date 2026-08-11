@@ -28,9 +28,15 @@ from disclosure_anchor.application.contracts.provider_document import (
 from disclosure_anchor.application.services.document_outline import (
     build_document_outline,
 )
+from disclosure_anchor.application.services.provider_table_projection import (
+    build_provider_table_projection,
+)
+from disclosure_anchor.application.services.retrieval_primary import (
+    build_retrieval_primary_projection,
+)
 
 
-_SCHEMA = "mineru-medium-visual-review.v1"
+_SCHEMA = "mineru-medium-visual-review.v2"
 _DPI = 144
 _PAGES_RE = re.compile(r"^Pages:\s+([0-9]+)\s*$", re.MULTILINE)
 
@@ -42,7 +48,7 @@ def build_review_payload(
     source_page_offset: int,
     selected_provider_pages: Sequence[int],
 ) -> dict[str, Any]:
-    """Serialize existing DTOs without inferring aliases or cross-page tables."""
+    """Serialize exact DTOs plus the provider table and retrieval projections."""
 
     selected = tuple(selected_provider_pages)
     if source_page_offset < 0:
@@ -78,6 +84,44 @@ def build_review_payload(
         ):
             raise ValueError("heading candidate disposition has no matching resolution")
 
+    table_projection = build_provider_table_projection(document)
+    retrieval_projection = build_retrieval_primary_projection(
+        document,
+        outline,
+        table_projection,
+    )
+    retrieval_by_source = {
+        block.source_index: block for block in retrieval_projection.blocks
+    }
+    table_relation_by_segment: dict[int, dict[str, object]] = {}
+    for table_index, logical_table in enumerate(table_projection.logical_tables):
+        owner_source = logical_table.owner.block_source_index
+        assert owner_source is not None
+        for role, part in (
+            ("owner", logical_table.owner),
+            *(("continuation", item) for item in logical_table.continuations),
+        ):
+            assert part.block_source_index is not None
+            assert part.physical_segment_index is not None
+            table_relation_by_segment[part.physical_segment_index] = {
+                "relation": role,
+                "flat_block_source_index": part.block_source_index,
+                "logical_owner_source_index": owner_source,
+                "logical_table_index": table_index,
+                "unbound_reason": None,
+            }
+    for unbound in table_projection.unbound_parts:
+        segment_index = unbound.part.physical_segment_index
+        if segment_index is None:
+            continue
+        table_relation_by_segment[segment_index] = {
+            "relation": "unbound",
+            "flat_block_source_index": unbound.part.block_source_index,
+            "logical_owner_source_index": None,
+            "logical_table_index": None,
+            "unbound_reason": unbound.reason,
+        }
+
     provider_record = asdict(document)
     for artifact in provider_record["artifacts"]:
         artifact.pop("media_type")
@@ -91,6 +135,33 @@ def build_review_payload(
         segment["page_local_html_sha256"] = _sha256_bytes(encoded)
         segment["page_local_html_size_bytes"] = len(encoded)
         segment["page_local_html_preview"] = html[:300]
+
+    physical_table_inventory: list[dict[str, object]] = []
+    for segment_index, segment in enumerate(document.physical_table_segments):
+        relation = table_relation_by_segment.get(segment_index)
+        if relation is None:
+            raise ValueError("table projection omitted a physical segment")
+        relation_owner = relation.get("logical_owner_source_index")
+        unit_index = (
+            units_by_source[relation_owner]
+            if isinstance(relation_owner, int)
+            else None
+        )
+        physical_table_inventory.append(
+            {
+                "segment_index": segment_index,
+                "stable_key": [
+                    segment.page_index,
+                    segment.order_in_page,
+                    segment.provider_index,
+                    segment.raw_segment_sha256,
+                ],
+                "source_page_index": source_page_offset + segment.page_index,
+                "source_page_number": source_page_offset + segment.page_index + 1,
+                **relation,
+                "unit_index": unit_index,
+            }
+        )
 
     return {
         "schema": _SCHEMA,
@@ -108,6 +179,8 @@ def build_review_payload(
         "alias_evaluator": "not_implemented",
         "provider_document": provider_record,
         "outline": asdict(outline),
+        "provider_table_projection": asdict(table_projection),
+        "retrieval_primary": asdict(retrieval_projection),
         "review": {
             "block_assignments": [
                 {
@@ -117,6 +190,13 @@ def build_review_payload(
                     "source_page_number": source_page_offset + block.page_index + 1,
                     "alias_status": "not_evaluated",
                     "alias_group_id": None,
+                    "retrieval_disposition": retrieval_by_source[
+                        block.source_index
+                    ].disposition,
+                    "retrieval_reason": retrieval_by_source[block.source_index].reason,
+                    "retrieval_target_ids": list(
+                        retrieval_by_source[block.source_index].target_ids
+                    ),
                 }
                 for block in document.blocks
             ],
@@ -130,24 +210,7 @@ def build_review_payload(
                 }
                 for candidate in outline.candidates
             ],
-            "physical_table_segment_inventory": [
-                {
-                    "segment_index": segment_index,
-                    "stable_key": [
-                        segment.page_index,
-                        segment.order_in_page,
-                        segment.provider_index,
-                        segment.raw_segment_sha256,
-                    ],
-                    "source_page_index": source_page_offset + segment.page_index,
-                    "source_page_number": source_page_offset + segment.page_index + 1,
-                    "flat_block_association": "not_asserted",
-                    "unit_index": None,
-                }
-                for segment_index, segment in enumerate(
-                    document.physical_table_segments
-                )
-            ],
+            "physical_table_segment_inventory": physical_table_inventory,
         },
     }
 
@@ -563,6 +626,22 @@ def _markdown(
         candidate.source_index: candidate for candidate in outline.candidates
     }
     resolved_by_id = {heading.heading_id: heading for heading in outline.headings}
+    retrieval = payload["retrieval_primary"]
+    table_projection = payload["provider_table_projection"]
+    review = payload["review"]
+    assert isinstance(retrieval, dict)
+    assert isinstance(table_projection, dict)
+    assert isinstance(review, dict)
+    retrieval_by_source = {
+        int(item["source_index"]): item
+        for item in retrieval["blocks"]
+        if isinstance(item, dict)
+    }
+    table_inventory = {
+        int(item["segment_index"]): item
+        for item in review["physical_table_segment_inventory"]
+        if isinstance(item, dict)
+    }
     lines = [
         "# MinerU Medium visual review",
         "",
@@ -571,8 +650,11 @@ def _markdown(
         f"- Blocks / accepted headings / units / physical table segments: "
         f"`{len(document.blocks)} / {len(outline.headings)} / {len(outline.units)} / "
         f"{len(document.physical_table_segments)}`",
-        "- Alias evaluator: `not_implemented`; every block is `not_evaluated`.",
-        "- Table segments are independent evidence; no flat-block, unit, or cross-page association is asserted.",
+        f"- Retrieval targets / provider logical tables / unbound table parts: "
+        f"`{len(retrieval['targets'])} / {len(table_projection['logical_tables'])} / "
+        f"{len(table_projection['unbound_parts'])}`",
+        "- Same-page alias evaluator: `not_implemented`; no content-list blocks are deduplicated.",
+        "- Cross-page table relations replay only MinerU retained/deleted state and page boundaries; no HTML or cell repair is performed.",
         f"- `report.json` SHA-256: `{report_sha256}`",
         "",
     ]
@@ -618,7 +700,9 @@ def _markdown(
                 f"annotation=`{block.typed_annotation}` bbox=`{_bbox(block)}` "
                 f"unit=`{unit_by_source[block.source_index]}` "
                 f"heading=`{None if candidate is None else candidate.disposition}` "
-                f"level=`{None if resolved is None else resolved.level}` alias=`not_evaluated`"
+                f"level=`{None if resolved is None else resolved.level}` "
+                f"retrieval=`{retrieval_by_source[block.source_index]['disposition']}` "
+                f"alias=`not_evaluated`"
             )
             if resolved is not None:
                 lines.append(f"  - headpath: {' > '.join(resolved.headpath)}")
@@ -634,10 +718,12 @@ def _markdown(
         if not segments:
             lines.append("- none")
         for segment in segments:
+            segment_index = document.physical_table_segments.index(segment)
+            relation = table_inventory[segment_index]
             lines.append(
                 f"- order=`{segment.order_in_page}` provider_index=`{segment.provider_index}` "
                 f"status=`{segment.logical_stream_status}` bbox=`{_bbox(segment)}` "
-                "association=`not_asserted`"
+                f"relation=`{relation['relation']}` owner=`{relation['logical_owner_source_index']}`"
             )
             lines.append(
                 f"  - HTML: `{_escape(_one_line(segment.page_local_html, 180))}`"

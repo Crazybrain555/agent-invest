@@ -389,7 +389,6 @@ def _provider_document() -> ProviderDocument:
         page_local_html="<table><tr><td>正文</td></tr></table>",
         crop_artifact_role=None,
         logical_stream_status="unbound",
-        cell_merge_json=None,
         raw_segment_json=raw_segment,
         raw_segment_sha256=_sha(raw_segment),
     )

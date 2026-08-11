@@ -127,7 +127,6 @@ class DocumentOutlineTest(unittest.TestCase):
                     page_local_html="<table></table>",
                     crop_artifact_role=None,
                     logical_stream_status="retained",
-                    cell_merge_json=None,
                     raw_segment_json="{}",
                     raw_segment_sha256=_SHA,
                 ),

@@ -62,8 +62,15 @@ class ReviewMinerUMediumOutlineTest(unittest.TestCase):
         self.assertEqual(len(inventory), 2)
         self.assertEqual([item["segment_index"] for item in inventory], [0, 1])
         self.assertTrue(
-            all(item["flat_block_association"] == "not_asserted" for item in inventory)
+            all(item["relation"] == "unbound" for item in inventory)
         )
+        self.assertEqual(
+            [item["retrieval_disposition"] for item in assignments],
+            ["primary", "primary", "evidence_only"],
+        )
+        self.assertEqual(payload["schema"], "mineru-medium-visual-review.v2")
+        self.assertIn("provider_table_projection", payload)
+        self.assertIn("retrieval_primary", payload)
         self.assertEqual(assignments[0]["source_page_number"], 43)
         self.assertNotIn("raw_item_json", pages[0]["blocks"][0])
         self.assertNotIn("raw_segment_json", segments[0])
@@ -287,7 +294,6 @@ def _segment(
         page_local_html=f"<table><tr><td>{text}</td></tr></table>",
         crop_artifact_role=None,
         logical_stream_status=status,  # type: ignore[arg-type]
-        cell_merge_json=None,
         raw_segment_json=f'{{"order":{order}}}',
         raw_segment_sha256="sha256:" + str(order + 1) * 64,
     )

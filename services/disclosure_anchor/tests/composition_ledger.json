@@ -253,7 +253,7 @@
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 11
   },
   "tests/unit/test_mineru_middle_roles.py": {
    "private_imports": [],
@@ -321,6 +321,10 @@
    "private_imports": [],
    "tests": 10
   },
+  "tests/unit/test_provider_table_projection.py": {
+   "private_imports": [],
+   "tests": 6
+  },
   "tests/unit/test_publish_run.py": {
    "private_imports": [
     "_validate_candidate_unit_set"
@@ -338,6 +342,10 @@
   "tests/unit/test_register_document.py": {
    "private_imports": [],
    "tests": 11
+  },
+  "tests/unit/test_retrieval_primary.py": {
+   "private_imports": [],
+   "tests": 7
   },
   "tests/unit/test_review_mineru_medium_outline.py": {
    "private_imports": [],

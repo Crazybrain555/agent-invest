@@ -95,8 +95,8 @@ Artifact responsibilities are deliberately one-way:
 - `content_list` is the primary visible semantic carrier and provider output order;
 - `content_list_v2` contributes typed/page-grouped provider annotations, not a second text
   truth, and only when provider page/order/ID binds uniquely to the primary carrier;
-- `middle_json` contributes page geometry or a lower-level locator aid only; it never
-  repairs or overrides visible text;
+- `middle_json` contributes page geometry, page-local table evidence, and MinerU's typed
+  `retained` / `lines_deleted` merge result; it never repairs or overrides visible text;
 - `model_json` is hash-bound diagnostic material, not a public payload or structure oracle;
 - provider PDFs and crops support visual review.
 
@@ -150,11 +150,15 @@ Queue admission does not change before that cutover and becomes provider-only wi
 3. The immutable PDF is always retained. A special scalar actually emitted by the provider
    is preserved with its available context and is not force-translated to another Unicode
    character. A scalar the provider did not emit or cannot map is not fabricated here.
-4. The first slice may mark same-page, materially overlapping, role-compatible
-   representations as diagnostic alias candidates, while keeping every payload and its
-   provenance. This is not a public retrieval owner. A later L1 retrieval-primary
-   projection consumed by L2 requires an explicit contract; no global string
-   deduplication is used, and this service does not implement L2 claims or forecasts.
+4. The first retrieval-primary projection selects each non-empty, type-valid provider
+   payload field exactly once and keeps all other blocks as evidence. The pinned 3.4.4
+   provider type determines the only legal scalar and sequence fields; a known field in
+   the wrong block type or an unsupported parallel body field fails closed. Provider page
+   furniture and empty carriers contribute no search target, but remain in the immutable
+   provider record. No content-list block is deduplicated in v1: the reviewed corpus has
+   no positive same-page duplicate case, so adding a generic alias rule would be
+   speculative. Any later alias rule requires a separate real positive and adjacent
+   negative corpus. This service does not implement L2 claims or forecasts.
 
 ## Heading hierarchy
 
@@ -209,19 +213,46 @@ loop is added.
 The DB-free provider record retains each provider table representation exactly as emitted,
 including its available HTML/grid, ancillary text, crop, page/bbox, order, empty state, and
 artifact hash. The outline resolver neither consumes nor deletes those physical segments.
-The mandatory review projection must account for every segment exactly once and may
-associate several ordered page-local parts with a coarse diagnostic unit; this does **not**
-assert that they are one logical table. Adjacent pages are never merged or deduplicated
-merely by visual or textual similarity. The greenfield path does not invent cells, headers,
-or cross-page rows.
+A separate DB-free provider-table projection replays only MinerU's explicit merge result:
+
+- content-list table blocks and middle table segments bind by page-local table ordinal;
+- a non-empty block with a `retained` segment starts one provider logical owner;
+- an empty block with a `lines_deleted` segment may continue that owner only on the next
+  physical page, where the previous member is the last table and the continuation is the
+  first table, with only typed page furniture between them;
+- any count, state, page-boundary, or ordering mismatch remains an unbound physical part.
+
+Every content table block and physical segment appears exactly once as an owner,
+continuation, or unbound part. The relation is explicitly a **provider merge assertion**,
+not an endorsement of its cell reconstruction. Aggregate content-list HTML is retained
+unchanged as the one visible/searchable owner; each page-local middle HTML, crop, page,
+bbox, and raw hash remains supporting evidence. The projection never compares or rewrites
+HTML, consults `cell_merge`, or merges adjacent pages by visual or textual similarity.
 
 The existing public contract currently treats tables as page-local and rejects empty
-table payloads. Therefore the first slice makes no DB, searchability, continuation, or
-canonical-table claim about MinerU merged carriers and empty stubs. Their eventual public
-mapping must reconcile the current service/public implementation with v0.8's cross-page
-logical-unit semantics through an explicit contract decision after the real-sample visual
-stop. An empty stub is not searchable content in the diagnostic DTO and is not governed
-by same-page alias grouping.
+table payloads. The DB-free slice now fixes the future mapping decision without changing
+the live DB/public writer: one provider logical owner is the sole search candidate and its
+empty stubs are evidence-only. The sole-writer cutover must revise `service-purpose.md`,
+the table/mixed payload locator, evidence API, and source-conservation checks atomically so
+that this mapping reconciles current public behavior with v0.8's cross-page logical-unit
+semantics. Until then it remains a diagnostic projection and makes no publication claim.
+
+## Retrieval primary
+
+The DB-free retrieval projection is a list of references, not another content universe.
+It binds the exact source PDF, provider bundle, outline, table projection, provider block
+hash, payload ordinal, field, and transform. Registered text/caption/footnote fields replay
+with identity; the official 3.4.4 `table_body` field replays only its visible cell segments so search
+cannot match across two distinct cells. Raw JSON is never recursively scanned and an
+unknown or type-invalid provider field fails closed.
+
+Each coarse unit receives the ordered targets of its provider blocks and the logical-table
+owners wholly contained by that unit. The projection does not copy text, invent a summary,
+select semantic topics, or create an L2 object. Registered document metadata title is not
+an input: `DocumentUnit.title` and `heading_path` will come only from accepted source
+heading occurrences, while an unheaded unit remains `title = null`, `heading_path = []`.
+The registered title stays at document scope instead of being repeated as A-weight search
+text on every unit.
 
 Document metadata title, source-printed title occurrences, table continuation, heading
 hierarchy, and the L1 retrieval-primary projection consumed by L2 are separate concerns.

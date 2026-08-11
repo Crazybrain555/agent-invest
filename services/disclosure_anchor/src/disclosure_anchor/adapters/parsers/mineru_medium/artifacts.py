@@ -23,6 +23,7 @@ from disclosure_anchor.application.contracts.provider_document import (
     ProviderPayload,
     ProviderPhysicalTableSegment,
     provider_artifact_bundle_sha256,
+    provider_payload_field_contract,
 )
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
@@ -45,23 +46,23 @@ _OPTIONAL_SUFFIXES = {
     "layout_pdf": "_layout.pdf",
     "origin_pdf": "_origin.pdf",
 }
-_SCALAR_PAYLOAD_FIELDS = (
-    "text",
-    "content",
-    "table_body",
-    "table_html",
-    "code_body",
-)
-_SEQUENCE_PAYLOAD_FIELDS = (
-    "table_caption",
-    "table_footnote",
-    "image_caption",
-    "image_footnote",
-    "chart_caption",
-    "chart_footnote",
-    "code_caption",
-    "code_footnote",
-    "list_items",
+_KNOWN_PAYLOAD_FIELDS = frozenset(
+    {
+        "chart_caption",
+        "chart_footnote",
+        "code_body",
+        "code_caption",
+        "code_footnote",
+        "content",
+        "image_caption",
+        "image_footnote",
+        "list_items",
+        "table_body",
+        "table_caption",
+        "table_footnote",
+        "table_html",
+        "text",
+    }
 )
 _IMAGE_PATH_FIELDS = ("img_path", "image_path", "image")
 _COMPATIBLE_TYPED_ANNOTATIONS = frozenset(
@@ -165,7 +166,11 @@ class MinerUMediumArtifactReader:
                     f"MinerU content-list item {source_index} has no type"
                 )
             raw_item_json = _canonical_item_json(item, source_index=source_index)
-            payloads = _provider_payloads(item, source_index=source_index)
+            payloads = _provider_payloads(
+                item,
+                provider_type=provider_type,
+                source_index=source_index,
+            )
             image_roles = _referenced_image_roles(
                 item=item,
                 source_index=source_index,
@@ -599,10 +604,30 @@ def _types_are_compatible(*, primary_type: str, typed_type: str) -> bool:
 def _provider_payloads(
     item: Mapping[str, object],
     *,
+    provider_type: str,
     source_index: int,
 ) -> tuple[ProviderPayload, ...]:
+    try:
+        scalar_fields, sequence_fields = provider_payload_field_contract(
+            provider_type
+        )
+    except ValueError as exc:
+        raise ParserOutputContractError(
+            f"MinerU item {source_index} has unsupported type {provider_type}"
+        ) from exc
+    allowed_fields = frozenset((*scalar_fields, *sequence_fields))
+    misplaced_fields = sorted(
+        field
+        for field in _KNOWN_PAYLOAD_FIELDS
+        if field in item and field not in allowed_fields
+    )
+    if misplaced_fields:
+        raise ParserOutputContractError(
+            f"MinerU item {source_index} fields are invalid for type "
+            f"{provider_type}: {', '.join(misplaced_fields)}"
+        )
     payloads: list[ProviderPayload] = []
-    for field in _SCALAR_PAYLOAD_FIELDS:
+    for field in scalar_fields:
         if field not in item or item[field] is None:
             continue
         value = item[field]
@@ -611,17 +636,15 @@ def _provider_payloads(
                 f"MinerU item {source_index} field {field} must be text"
             )
         payloads.append(ProviderPayload(field=field, item_index=None, text=value))
-    for field in _SEQUENCE_PAYLOAD_FIELDS:
+    for field in sequence_fields:
         if field not in item or item[field] is None:
             continue
         value = item[field]
-        if isinstance(value, str):
-            values = [value]
-        elif isinstance(value, list) and all(isinstance(entry, str) for entry in value):
+        if isinstance(value, list) and all(isinstance(entry, str) for entry in value):
             values = value
         else:
             raise ParserOutputContractError(
-                f"MinerU item {source_index} field {field} must be text or text array"
+                f"MinerU item {source_index} field {field} must be a text array"
             )
         payloads.extend(
             ProviderPayload(field=field, item_index=index, text=text)
@@ -711,7 +734,6 @@ def _physical_table_segments(
                 block,
                 label=f"middle page {page_index} table {provider_index}",
             )
-            cell_merge = block.get("cell_merge")
             segments.append(
                 ProviderPhysicalTableSegment(
                     page_index=page_index,
@@ -726,17 +748,6 @@ def _physical_table_segments(
                     logical_stream_status=_table_logical_stream_status(
                         preproc_block=block,
                         para_blocks=para_blocks,
-                    ),
-                    cell_merge_json=(
-                        None
-                        if cell_merge is None
-                        else _canonical_value_json(
-                            cell_merge,
-                            label=(
-                                f"middle page {page_index} table {provider_index} "
-                                "cell_merge"
-                            ),
-                        )
                     ),
                     raw_segment_json=raw_segment_json,
                     raw_segment_sha256=_sha256(raw_segment_json.encode("utf-8")),

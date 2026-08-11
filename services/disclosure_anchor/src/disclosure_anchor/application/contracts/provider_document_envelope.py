@@ -390,7 +390,6 @@ def _physical_table_segment_payload(
 ) -> dict[str, object]:
     return {
         "bbox": _bbox_payload(segment.bbox),
-        "cell_merge_json": segment.cell_merge_json,
         "crop_artifact_role": segment.crop_artifact_role,
         "logical_stream_status": segment.logical_stream_status,
         "order_in_page": segment.order_in_page,
@@ -561,7 +560,6 @@ def _physical_table_segment_from_payload(
         value,
         keys={
             "bbox",
-            "cell_merge_json",
             "crop_artifact_role",
             "logical_stream_status",
             "order_in_page",
@@ -574,7 +572,6 @@ def _physical_table_segment_from_payload(
         label="provider physical table segment",
     )
     crop_role = payload["crop_artifact_role"]
-    cell_merge = payload["cell_merge_json"]
     status = _text(payload["logical_stream_status"], "logical_stream_status")
     if status not in {"retained", "deleted", "unbound"}:
         raise ProviderDocumentEnvelopeError("unsupported table segment status")
@@ -590,9 +587,6 @@ def _physical_table_segment_from_payload(
             None if crop_role is None else _text(crop_role, "crop_artifact_role")
         ),
         logical_stream_status=cast(PhysicalTableLogicalStatus, status),
-        cell_merge_json=(
-            None if cell_merge is None else _text(cell_merge, "cell_merge_json")
-        ),
         raw_segment_json=_text(payload["raw_segment_json"], "raw_segment_json"),
         raw_segment_sha256=_text(payload["raw_segment_sha256"], "raw_segment_sha256"),
     )

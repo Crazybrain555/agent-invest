@@ -224,6 +224,30 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
                 "unbound",
             )
 
+    def test_rejects_payload_field_outside_provider_type_contract(self) -> None:
+        cases = (
+            ("table_html", "重复正文", "invalid for type table"),
+            ("text", "重复正文", "invalid for type table"),
+            ("table_caption", "非数组标题", "must be a text array"),
+        )
+        for field, value, error in cases:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _write_bundle(root)
+                content_path = root / f"{_STEM}_content_list.json"
+                content = json.loads(content_path.read_text(encoding="utf-8"))
+                content[1][field] = value
+                _write_json(content_path, content)
+
+                with self.assertRaisesRegex(
+                    ParserOutputContractError,
+                    error,
+                ):
+                    MinerUMediumArtifactReader().read(
+                        root,
+                        source_pdf_sha256=_SOURCE_SHA,
+                    )
+
     def test_rejects_symlink_in_artifact_tree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
