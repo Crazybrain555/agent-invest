@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 import hashlib
-import json
 from pathlib import Path
 import re
 from typing import Any, cast
@@ -14,11 +13,10 @@ from urllib.parse import quote
 from disclosure_anchor.api.errors import evidence_integrity_error
 from disclosure_anchor.api.schemas.public import EvidenceRefV1
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
-from disclosure_anchor.application.contracts.normalized_ir import (
-    NormalizedIRVersionError,
-    validate_current_normalized_ir_for_write,
-    validate_normalized_ir_identity,
-    validate_normalized_ir_path_version,
+from disclosure_anchor.application.contracts.normalized_ir_v4_evidence import (
+    HistoricalEvidenceClaim,
+    HistoricalNormalizedIRV4EvidenceError,
+    resolve_historical_normalized_ir_v4_evidence,
 )
 from disclosure_anchor.domain.errors import PathSafetyError
 
@@ -146,8 +144,25 @@ def read_unit_evidence(
         row.get("producer_artifact_hash"),
         "producer_artifact_hash",
     )
+    source_pdf_sha256 = _required_sha256(
+        row.get("raw_file_hash"),
+        "raw_file_hash",
+    )
+    producer_source_sha256 = _required_sha256(
+        row.get("producer_input_raw_file_hash"),
+        "producer_input_raw_file_hash",
+    )
+    owner_source_sha256 = _required_sha256(
+        row.get("artifact_owner_input_raw_file_hash"),
+        "artifact_owner_input_raw_file_hash",
+    )
     if producer_ir_hash != expected_ir_hash:
         evidence_integrity_error("artifact_owner_hash_mismatch")
+    if (
+        producer_source_sha256 != source_pdf_sha256
+        or owner_source_sha256 != source_pdf_sha256
+    ):
+        evidence_integrity_error("artifact_owner_source_hash_mismatch")
     try:
         ir_relpath = paths.normalized_ir_run_relpath(
             provider=provider,
@@ -169,49 +184,34 @@ def read_unit_evidence(
     if actual_ir_hash != expected_ir_hash:
         evidence_integrity_error("normalized_ir_hash_mismatch")
     try:
-        decoded = json.loads(ir_content.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        evidence_integrity_error("normalized_ir_invalid")
-    if not isinstance(decoded, Mapping):
-        evidence_integrity_error("normalized_ir_invalid")
-    normalized_ir = cast(Mapping[str, Any], decoded)
-    try:
-        version = validate_current_normalized_ir_for_write(normalized_ir)
-        validate_normalized_ir_identity(normalized_ir, document_id=document_id)
-        validate_normalized_ir_path_version(ir_relpath, version=version)
-    except NormalizedIRVersionError:
-        evidence_integrity_error("normalized_ir_invalid")
-
-    parser_artifacts = cast(Mapping[str, Any], normalized_ir["parser_artifacts"])
-    files = cast(Mapping[str, Any], parser_artifacts["files"])
-    selected_manifest: Mapping[str, Any] | None = None
-    for descriptor in matching:
-        manifest = files.get(descriptor.artifact_role)
-        if (
-            not isinstance(manifest, Mapping)
-            or manifest.get("availability") != "present"
-            or manifest.get("sha256") != descriptor.sha256
-            or manifest.get("size_bytes") != descriptor.size_bytes
-        ):
-            evidence_integrity_error("evidence_manifest_mismatch")
-        if selected_manifest is None:
-            selected_manifest = manifest
-    assert selected_manifest is not None
-    relpath_value = selected_manifest.get("relpath")
-    if not isinstance(relpath_value, str):
-        evidence_integrity_error("evidence_manifest_mismatch")
+        artifact = resolve_historical_normalized_ir_v4_evidence(
+            ir_content,
+            ir_relpath=ir_relpath,
+            expected_document_id=document_id,
+            expected_source_pdf_sha256=source_pdf_sha256,
+            claims=tuple(
+                HistoricalEvidenceClaim(
+                    artifact_role=descriptor.artifact_role,
+                    sha256=descriptor.sha256,
+                    size_bytes=descriptor.size_bytes,
+                )
+                for descriptor in matching
+            ),
+        )
+    except HistoricalNormalizedIRV4EvidenceError as exc:
+        evidence_integrity_error(exc.reason)
     try:
         artifact_content = _read_data_bytes(
             paths,
-            Path(relpath_value),
-            expected_size=matching[0].size_bytes,
+            Path(artifact.relpath),
+            expected_size=artifact.size_bytes,
             missing_reason="evidence_artifact_missing",
             unreadable_reason="evidence_artifact_unreadable",
             path_invalid_reason="evidence_artifact_path_invalid",
         )
     except PathSafetyError:
         evidence_integrity_error("evidence_artifact_path_invalid")
-    if len(artifact_content) != matching[0].size_bytes:
+    if len(artifact_content) != artifact.size_bytes:
         evidence_integrity_error("evidence_artifact_size_mismatch")
     if _sha256(artifact_content) != requested_sha256:
         evidence_integrity_error("evidence_artifact_hash_mismatch")

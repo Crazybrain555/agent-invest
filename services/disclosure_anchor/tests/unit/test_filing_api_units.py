@@ -24,11 +24,6 @@ from disclosure_anchor.api.routers.units import (
     list_document_units,
 )
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
-from disclosure_anchor.application.contracts.normalized_ir import (
-    NormalizedIRVersionError,
-    validate_current_normalized_ir_for_write,
-    validate_normalized_ir_contract,
-)
 from disclosure_anchor.domain.services.unit_hashing import (
     canonical_json,
     sha256_prefixed,
@@ -275,6 +270,9 @@ def _evidence_bundle(
         "provider": "cninfo",
         "provider_document_id": "pid-doc_1",
         "security_code": "002484",
+        "raw_file_hash": normalized_ir["source_pdf_sha256"],
+        "producer_input_raw_file_hash": normalized_ir["source_pdf_sha256"],
+        "artifact_owner_input_raw_file_hash": normalized_ir["source_pdf_sha256"],
         "artifact_hash": "sha256:" + hashlib.sha256(ir_content).hexdigest(),
         "producer_artifact_hash": ("sha256:" + hashlib.sha256(ir_content).hexdigest()),
     }
@@ -598,6 +596,7 @@ class FilingApiUnitTests(unittest.TestCase):
             )
             self.assertNotIn("disclosure_core", engine.statements[0])
             self.assertNotIn("disclosure_ops", engine.statements[0])
+            self.assertNotIn("IS_ACTIVE", engine.statements[0].upper())
 
             mixed_row = copy.deepcopy(row)
             mixed_row["payload_kind"] = "mixed"
@@ -673,6 +672,31 @@ class FilingApiUnitTests(unittest.TestCase):
             wrong_owner["artifact_owner_document_id"] = "doc_other"
             assert_integrity_error(wrong_owner, "artifact_owner_invalid")
 
+            wrong_source = copy.deepcopy(row)
+            wrong_source["raw_file_hash"] = "sha256:" + "0" * 64
+            assert_integrity_error(
+                wrong_source,
+                "artifact_owner_source_hash_mismatch",
+            )
+
+            wrong_producer_source = copy.deepcopy(row)
+            wrong_producer_source["producer_input_raw_file_hash"] = (
+                "sha256:" + "0" * 64
+            )
+            assert_integrity_error(
+                wrong_producer_source,
+                "artifact_owner_source_hash_mismatch",
+            )
+
+            wrong_owner_source = copy.deepcopy(row)
+            wrong_owner_source["artifact_owner_input_raw_file_hash"] = (
+                "sha256:" + "0" * 64
+            )
+            assert_integrity_error(
+                wrong_owner_source,
+                "artifact_owner_source_hash_mismatch",
+            )
+
             non_parse_owner = copy.deepcopy(row)
             non_parse_owner["artifact_owner_run_kind"] = "rebuild_units"
             assert_integrity_error(non_parse_owner, "artifact_owner_invalid")
@@ -703,15 +727,6 @@ class FilingApiUnitTests(unittest.TestCase):
             )
             invalid_current_ir = copy.deepcopy(normalized_ir)
             invalid_current_ir["elements"][1]["raw_kind"] = "unsupported_carrier"
-            self.assertEqual(
-                validate_normalized_ir_contract(
-                    invalid_current_ir,
-                    require_current=True,
-                ),
-                "normalized_ir.v4",
-            )
-            with self.assertRaises(NormalizedIRVersionError):
-                validate_current_normalized_ir_for_write(invalid_current_ir)
             invalid_current_content = json.dumps(
                 invalid_current_ir,
                 ensure_ascii=False,
@@ -726,7 +741,15 @@ class FilingApiUnitTests(unittest.TestCase):
             invalid_current_row["producer_artifact_hash"] = invalid_current_row[
                 "artifact_hash"
             ]
-            assert_integrity_error(invalid_current_row, "normalized_ir_invalid")
+            historical_response = get_unit_evidence(
+                "asset_1",
+                digest,
+                _request(
+                    _Engine([[invalid_current_row]]),
+                    settings=settings,
+                ),
+            )
+            self.assertEqual(historical_response.body, content)
 
             unsafe_ir = copy.deepcopy(normalized_ir)
             unsafe_ir["parser_artifacts"]["files"]["source_bbox_visual_000001_000001"][

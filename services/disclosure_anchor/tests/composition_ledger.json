@@ -10,7 +10,7 @@
   },
   "tests/contract/test_greenfield_import_firewall.py": {
    "private_imports": [],
-   "tests": 1
+   "tests": 3
   },
   "tests/contract/test_normalized_ir_contract.py": {
    "private_imports": [],
@@ -274,6 +274,10 @@
   "tests/unit/test_native_order_anchor.py": {
    "private_imports": [],
    "tests": 13
+  },
+  "tests/unit/test_normalized_ir_v4_evidence.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_parse_document.py": {
    "private_imports": [],

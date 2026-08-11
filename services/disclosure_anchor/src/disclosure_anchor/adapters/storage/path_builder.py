@@ -6,8 +6,8 @@ import re
 import unicodedata
 from pathlib import Path
 
-from disclosure_anchor.application.contracts.normalized_ir import (
-    normalized_ir_filename,
+from disclosure_anchor.application.contracts.normalized_ir_v4_evidence import (
+    NORMALIZED_IR_V4_FILENAME,
 )
 from disclosure_anchor.application.contracts.provider_document_envelope import (
     PROVIDER_DOCUMENT_FILENAME,
@@ -137,7 +137,7 @@ class FileStorePathBuilder:
             / "normalized_ir"
             / _safe_component(document_id, label="document_id")
             / _safe_component(processing_run_id, label="processing_run_id")
-            / normalized_ir_filename()
+            / NORMALIZED_IR_V4_FILENAME
         )
         return _assert_relative(relpath)
 
@@ -156,7 +156,7 @@ class FileStorePathBuilder:
             / _safe_component(security_code, label="security_code")
             / _safe_provider_document_id(provider_document_id)
             / _safe_component(processing_run_id, label="processing_run_id")
-            / normalized_ir_filename()
+            / NORMALIZED_IR_V4_FILENAME
         )
         return _assert_relative(relpath)
 
