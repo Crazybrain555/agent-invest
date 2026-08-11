@@ -631,9 +631,9 @@ class ProcessingRunRepository:
             self._session.query(models.ProcessingRun)
             .filter(
                 models.ProcessingRun.document_id == document_id,
-                # rebuild_units runs copy the parse artifacts references, so
-                # they are equally valid rebuild sources (prune-history may
-                # have removed the original parse run; provenance chains).
+                # rebuild_units runs copy the parse artifact references and
+                # remain valid legacy rebuild sources through their recorded
+                # provenance chain, even when the original parse is absent.
                 models.ProcessingRun.run_kind.in_(("parse", "rebuild_units")),
                 models.ProcessingRun.status == "succeeded",
                 models.ProcessingRun.normalized_ir_relpath.isnot(None),

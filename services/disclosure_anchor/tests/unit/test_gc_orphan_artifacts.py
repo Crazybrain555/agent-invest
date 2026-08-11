@@ -16,6 +16,7 @@ from scripts.gc_orphan_artifacts import (
     _build_manifest,
     _collect_orphans,
     _scan_old_candidates,
+    _snapshot_expected_owners,
     _write_manifest_before_delete,
     main,
 )
@@ -117,6 +118,62 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         self.assertEqual(initially_skipped["normalized_ir"], 0)
         self.assertEqual(orphans, [])
         self.assertEqual(recheck_skipped["normalized_ir"], 1)
+
+    def test_owner_snapshot_keeps_active_and_inactive_history(self) -> None:
+        active = (
+            "parser_artifacts/cninfo/000001/doc/active",
+            "derived/normalized_ir/doc/active/normalized_ir.v4.json",
+            "derived/document_unit_snapshots/doc/active/document_units.v1.jsonl",
+        )
+        inactive = (
+            "parser_artifacts/cninfo/000001/doc/inactive",
+            "derived/normalized_ir/doc/inactive/normalized_ir.v4.json",
+            "derived/document_unit_snapshots/doc/inactive/document_units.v1.jsonl",
+        )
+        conn = MagicMock()
+        conn.execute.return_value = [active, inactive]
+
+        expected = _snapshot_expected_owners(conn)
+
+        statement = " ".join(
+            str(conn.execute.call_args.args[0]).upper().split()
+        )
+        self.assertNotIn("WHERE", statement)
+        self.assertNotIn("IS_ACTIVE", statement)
+        self.assertEqual(expected["parser_artifacts"], {active[0], inactive[0]})
+        self.assertEqual(expected["normalized_ir"], {active[1], inactive[1]})
+        self.assertEqual(
+            expected["document_unit_snapshots"],
+            {active[2], inactive[2]},
+        )
+        for relpath in (*active, *inactive):
+            self._file(relpath)
+        candidates, _ = _scan_old_candidates(
+            self.data_root,
+            now_ts=self.now_ts,
+        )
+        orphans, _ = _collect_orphans(
+            candidates,
+            data_root=self.data_root,
+            expected=expected,
+            now_ts=self.now_ts,
+        )
+        self.assertEqual(orphans, [])
+
+    def test_daily_job_is_orphan_only(self) -> None:
+        service_root = Path(__file__).resolve().parents[2]
+        script = (service_root / "scripts" / "gc_daily.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn("retire_derived_generation", script)
+        self.assertNotIn("--auto", script)
+        self.assertIn("gc_orphan_artifacts.py --apply", script)
+        self.assertFalse(
+            (service_root / "scripts" / "retire_derived_generation.py").exists()
+        )
+        makefile = (service_root / "Makefile").read_text(encoding="utf-8")
+        self.assertNotIn("retire-derived:", makefile)
 
     def test_manifest_records_family_and_file_identity_before_deletion(
         self,

@@ -3,10 +3,8 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.agentinvest.disclosure-gc</string>
-  <!-- Daily unattended retirement of superseded derived generations at
-       19:30 (after the 18:30 doctor sweep). Keeps the newest superseded
-       run per document as rollback insurance; guards identical to the
-       manual retirement flow. -->
+  <!-- Daily orphan-only derived-artifact collection at 19:30 (after the
+       18:30 doctor sweep). Processing runs and public history are retained. -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>

@@ -306,9 +306,10 @@ semantic_keys（scalar 在规则未命中时回落 note key）。实测：附注
   （定价政策及定价依据|定价依据，防 MD&A 产品定价误标）。
 - **(c) 查询侧同义表（qs-2026.07-1）复审加固**：同义缓存独立锁（冷启动死锁根治，
   带秩序无关回归测试）、token 自别名去重。
-- **(d) 旧代治理机制**：retire --auto（每文档保留最新**成功**被取代 run 作回滚保险，
-  其余自动清；工件阶段失败则跳过元数据阶段防孤儿文件）+ 每日 19:30 launchd
-  作业（com.agentinvest.disclosure-gc），失败经 notify.sh 告警。
+- **(d) 旧代治理机制（2026-08-11 已废止）**：当时采用 retire --auto（每文档保留最新
+  **成功**被取代 run 作回滚保险）+ 每日 19:30 launchd。该方案会破坏 public v1 的显式
+  历史 run/asset 解引用，现由 `mineru-medium-greenfield.md` 的 orphan-only 裁决取代；
+  launchd 只清理无任何 DB owner 的派生文件。
 - **(e) 脉络方向**：见 document-outline-and-toc.md（两步方案：脉络视图 + 目录审计）。
 
 ## 问答/实录类切分外部验证（2026-07-18）

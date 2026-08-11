@@ -136,7 +136,10 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
 - [ ] (M/OPERATIONS AND DEPLOYMENT) **The one human-maintained input — the company list — has no operator tooling: no bulk seed, no list/p**
   - 修法：Add a `tracked-companies` CLI (import CSV of scodes with default backfill window, list, pause/resume) reusing the existing upsert; make the worker skip-and-report companies without securities once (mark tracked_company status or write a checkpoint) instead of 
 - [ ] (M/OPERATIONS AND DEPLOYMENT) **Disk growth is unmanaged: ~17x artifact amplification per parse, retries and superseded runs never g**
-  - 修法：Add a GC command that removes artifact/derived dirs for runs that are (a) failed and retry-exhausted or (b) pruned/superseded beyond a retention window, keeping the DB as source of truth; add a doctor WARN/FAIL on free-space thresholds for data root and PGDATA
+  - 2026-08-11 superseded：public v1 允许按 run/asset 解引用历史记录，因此只要 active 或
+    inactive run 仍拥有 artifact，便不得按失败、年龄或 superseded 状态删除。自动维护只回收 DB 中
+    没有 owner 的真 orphan；若未来要退役已公开历史，须先有显式 public-contract 决策与逐引用迁移。
+    磁盘容量与 data root / PGDATA free-space doctor 告警仍是未完成事项。
 - [x] (S/OPERATIONS AND DEPLOYMENT) **旧 `wipe_test_data.sh` 可绕过证据与恢复门禁**
   - 2026-07-28 已删除脚本及 Makefile 入口。全量派生清理只走 manifest-bound reset；
     单公司测试残留只走持 CORPUS exclusive 的 `purge-company`。
@@ -154,6 +157,8 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
   - `prune_history.sh` 与 `wipe_test_data.sh` 均已删除；历史退役统一为带 CORPUS exclusive、复核 manifest 和事务内
     membership recheck 的 `retire_derived_generation.py`，文件只由带 24h guard 的统一 orphan
     collector 后置清理；manifest-bound reset 在 managed scratch DB 做 rollback/restore 集成门禁。
+  - 2026-08-11 superseded：`retire_derived_generation.py` 仍会破坏 public v1 的显式历史
+    run/asset 与 change-feed 回放，因此也已删除；定时任务现仅运行 orphan collector。
 - [ ] (L/TEST COVERAGE GAPS for produ) **No load/volume testing; pending_download_v1 and pending_parse_v1 predicates lack supporting indexes **
   - 修法：Add a volume smoke on the scratch DB: seed 500 tracked companies and a few thousand synthetic source_access snapshots, assert queries.py helpers stay under a latency bound (or EXPLAIN shows no full-corpus jsonb re-explosion); pair with a new migration adding (
 - [ ] (M/TEST COVERAGE GAPS for produ) **rebuild_units path tested only against in-memory fakes: real repository query, CLI chain, and supers**

@@ -2,9 +2,8 @@
 
 The database is the ownership authority.  Parser artifacts use directory
 ownership (a processing-run relpath owns every descendant); normalized IR and
-document-unit snapshots use exact-file ownership.  Retirement therefore only
-removes database ownership first, and this one collector later removes files
-that no remaining run owns.
+document-unit snapshots use exact-file ownership. This collector removes only
+files that no active or historical processing run owns.
 
 Default is DRY-RUN. ``--apply`` holds the derived-state mutation lock from the
 ownership snapshot through deletion, rechecks the 24-hour age guard, and writes

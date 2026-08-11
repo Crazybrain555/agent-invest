@@ -2,7 +2,7 @@
 # Install the ops launchd jobs (batch 4, 2026-07-14). Idempotent.
 #   com.agentinvest.postgres          — boot-time one-shot pg_ctl start
 #   com.agentinvest.disclosure-doctor — daily 18:30 doctor + freshness alerts
-#   com.agentinvest.disclosure-gc     — daily 19:30 superseded-generation GC
+#   com.agentinvest.disclosure-gc     — daily 19:30 orphan-only artifact GC
 # The resident worker job stays owned by scripts/install_launchd.sh.
 set -euo pipefail
 
@@ -31,7 +31,7 @@ for label in com.agentinvest.postgres com.agentinvest.disclosure-doctor com.agen
     # RunAtLoad one-shot whose wrapper exits 0 on an already-running cluster,
     # so an explicit kickstart is idempotent and makes recovery deterministic.
     # The 18:30/19:30 calendar jobs are never kickstarted here: that would fire
-    # a doctor sweep or a destructive GC pass at install time.
+    # a doctor sweep or orphan-GC pass at install time.
     launchctl kickstart "$DOMAIN/$label"
   fi
   echo "installed: $PLIST"

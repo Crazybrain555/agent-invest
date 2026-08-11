@@ -29,8 +29,8 @@ DOC_NS = 815002
 # the integration-test suite namespace (tests/integration/_support.py).
 OUTBOX_NS = 815004
 # Corpus-wide admission for every service UoW and filesystem writer.  Full
-# reset, superseded-generation retirement, and orphan GC take the exclusive
-# side across their complete DB/filesystem critical section.
+# reset and orphan GC take the exclusive side across their complete
+# DB/filesystem critical section.
 CORPUS_WRITE_NS = 815006
 # Session lease for one document's multi-transaction producer lifecycle.
 # This must be a different key from DOC_NS: nested UnitOfWork transactions

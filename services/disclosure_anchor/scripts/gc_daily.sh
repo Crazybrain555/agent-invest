@@ -1,11 +1,8 @@
 #!/bin/zsh
-# Daily unattended retirement of superseded derived generations: per
-# document the newest superseded run stays as
-# rollback insurance; anything older is retired through the guarded
-# manifest-driven flow (retire_derived_generation.py --auto). Raw PDFs,
-# lineage, and any relpath shared with a live run are untouchable by
-# construction. Scheduled by com.agentinvest.disclosure-gc (launchd, 19:30
-# daily, after the 18:30 doctor sweep).
+# Daily orphan-only collection for derived files that no processing run owns.
+# Active and historical runs, units, outbox records, and raw PDFs are never
+# retired by this job. Scheduled by com.agentinvest.disclosure-gc (launchd,
+# 19:30 daily, after the 18:30 doctor sweep).
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -18,17 +15,8 @@ set +a
 
 NOTIFY="$REPO/scripts/notify.sh"
 
-GC_OUT=$(cd "$REPO" && .venv/bin/python scripts/retire_derived_generation.py --auto 2>&1)
-GC_EXIT=$?
-echo "$GC_OUT"
-if [ "$GC_EXIT" -ne 0 ]; then
-  "$NOTIFY" "derived-generation GC FAIL" \
-    "exit=$GC_EXIT — see ~/Library/Logs/agent-invest/disclosure-gc.out and audit/gc manifests"
-fi
-
-# Retirement works run by run, so artifacts whose run is already gone (every
-# full-corpus rebuild leaves some) were never anybody's job. doctor only
-# WARNed about the growing pile; nothing collected it.
+# Only files whose DB owner no longer exists can enter this collector. The
+# 24-hour age guard and ownership recheck remain independent fail-closed gates.
 ORPHAN_OUT=$(cd "$REPO" && .venv/bin/python scripts/gc_orphan_artifacts.py --apply 2>&1)
 ORPHAN_EXIT=$?
 echo "$ORPHAN_OUT"

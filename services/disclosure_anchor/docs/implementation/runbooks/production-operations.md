@@ -215,10 +215,9 @@ worker 以 exit 77 自杀 = TCC 拒绝访问外置盘（详见 `scripts/run_work
 ## 7. 磁盘与产物治理
 
 - doctor 有双卷剩余空间检查（<10% WARN）。
-- 派生代退役只走 DB-first 流程：先
-  `make retire-derived BEFORE=<ISO8601> MANIFEST=/path/retire.json` 生成清单并人工复核，
-  再以相同 `BEFORE`、`MANIFEST` 和 `APPLY=YES` 原子撤销仍满足条件的 DB ownership。
-  已删除绕开锁和清单的 `prune-history` 入口。
+- processing run、document unit、outbox 与公开 evidence 不按年龄自动或人工退役；显式历史
+  run/asset 引用保持可解引用。未来若改变 retention 语义，必须先作为公开契约变更单独裁决，
+  不能恢复按 cutoff 删除 DB ownership 的旧入口。
 - 派生孤儿统一由 `make gc-orphans`（dry-run）盘点，覆盖 `parser_artifacts`、
   `derived/normalized_ir` 和 `derived/document_unit_snapshots`；确认后
   `make gc-orphans APPLY=YES`。apply 全程持 CORPUS exclusive，文件必须至少 24 小时，

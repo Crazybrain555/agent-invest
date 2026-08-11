@@ -754,8 +754,8 @@ def _database_consistency_checks(settings: Settings, engine: Engine) -> list[Che
         if seq_stats["event_count"] == 0:
             checks.append(_pass("outbox seq", "no outbox events"))
         else:
-            # Holes are structural, not a defect: every rolled-back
-            # transaction and prune_history run leaves one. Ordering safety
+            # Holes are structural, not a defect: rolled-back transactions
+            # and legacy maintenance may leave them. Ordering safety
             # is enforced at the writer (OutboxRepository commit-order lock,
             # locks.OUTBOX_NS); a no-gap assertion here only cried wolf
             # (round23: 29k false-positive WARNs).
@@ -765,7 +765,7 @@ def _database_consistency_checks(settings: Settings, engine: Engine) -> list[Che
                     (
                         f"count={seq_stats['event_count']} "
                         f"span=[{seq_stats['min_seq']},{seq_stats['max_seq']}]; "
-                        "holes expected (rollbacks/prune)"
+                        "holes expected (rollbacks/legacy maintenance)"
                     ),
                 )
             )

@@ -25,7 +25,7 @@ WITH_ENV = set -a; for f in worker.env cninfo.env; do [ -r "$(DISCLOSURE_ENV_DIR
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	test-mineru-smoke lint typecheck agent-check api archive pg-init pg-start pg-stop \
-	pg-status db-create migrate register parse build-units publish process rebuild-units rebuild-search-projection retire-derived load-rules config-check track track-status track-export untrack purge-company sync worker-once worker-loop doctor-full \
+	pg-status db-create migrate register parse build-units publish process rebuild-units rebuild-search-projection load-rules config-check track track-status track-export untrack purge-company sync worker-once worker-loop doctor-full \
 	worker-status worker-restart gc-orphans audit-unmapped-codes audit-unit-corpus export-unit-corpus-manifest audit-weekly install-ops-launchd export-reparse-manifest verify-reparse-manifest reparse-status reparse-corpus reset-derived-rehearse wipe-derived \
 	create-reset-backup prove-reset-backup purge-reset-trash purge-reset-trash-force
 
@@ -130,16 +130,6 @@ rebuild-units:
 # full recompute + orphan prune after a retrieval rules/dictionary version bump.
 rebuild-search-projection:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline rebuild-search-projection $(if $(filter YES,$(ALL)),--all)
-
-# Review-first, DB-first retirement. The first invocation writes a manifest;
-# APPLY=YES requires that exact reviewed manifest and atomically removes only
-# its still-retirable DB ownership. Files are collected later by gc-orphans.
-retire-derived:
-	@test -n "$(BEFORE)" || (echo 'usage: make retire-derived BEFORE=<ISO8601> [MANIFEST=/path/retire.json] [APPLY=YES]' && exit 2)
-	@test "$(APPLY)" != "YES" -o -n "$(MANIFEST)" || (echo 'APPLY=YES requires MANIFEST=/path/to/reviewed-manifest.json' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/retire_derived_generation.py \
-		--before "$(BEFORE)" $(if $(MANIFEST),--manifest "$(MANIFEST)") \
-		$(if $(filter YES,$(APPLY)),--apply)
 
 # Load class_map.json + facet_map.json + filing_type_map.json into
 # disclosure_core.classification_rule.

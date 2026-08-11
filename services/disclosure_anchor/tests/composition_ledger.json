@@ -221,7 +221,7 @@
   },
   "tests/unit/test_gc_orphan_artifacts.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 6
   },
   "tests/unit/test_health.py": {
    "private_imports": [],
@@ -334,10 +334,6 @@
   "tests/unit/test_register_document.py": {
    "private_imports": [],
    "tests": 11
-  },
-  "tests/unit/test_retire_derived_generation.py": {
-   "private_imports": [],
-   "tests": 2
   },
   "tests/unit/test_review_mineru_medium_outline.py": {
    "private_imports": [],

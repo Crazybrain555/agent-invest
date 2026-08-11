@@ -523,8 +523,9 @@ p.102）后定案，全部为标题树进栈规则问题，cn_a_v4：
 2. **历史 prune-history 工具（已移除）**：早期
    `make prune-history PRUNE=YES` 直接删除全部非 active run、units 和相关 outbox，
    没有统一 DERIVED ownership 锁，也无法让文件生命周期与 DB ownership 原子闭合。
-   当前只允许 manifest 驱动的 DB-first `retire-derived`，随后由唯一的
-   `gc-orphans` 收集三个 derived family；不得恢复直连 SQL 删除旁路。
+   后续 manifest 驱动的 DB-first `retire-derived` 也已于 2026-08-11 废止：public v1
+   允许显式历史 run/asset 解引用，按 cutoff 删除 run/unit/outbox 仍会破坏契约。当前只允许
+   `gc-orphans` 收集三个无 DB owner 的 derived family；不得恢复任何历史 metadata 删除旁路。
 3. **责任声明主语收网**：round6 发现"本公司及董事会全体成员保证…"变体漏网（及 在 董事会
    之前打败有序 alternation）——主语改为有界字符类，正负五例验证（鉴证报告"管理层的责任
    是提供真实…"等实质责任段不匹配、正确保留）。
