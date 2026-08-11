@@ -35,6 +35,19 @@ boundary for later phases:
 The first vertical slice is DB-free, emits diagnostic DTOs rather than a new NormalizedIR,
 and does not change a public contract or migration.
 
+## Implementation and review roles
+
+Codex owns the main implementation line, code changes, real-sample validation, and final
+technical decision. ChatGPT Pro is used for major architecture and plan review and for
+adversarial review before material commits. Claude Fable is a second independent view for
+checking whether a plan is over-designed, locating concrete bugs, reviewing small diffs,
+and, when useful, implementing one explicitly bounded subtask.
+
+Reviewer output is evidence to investigate, not a vote or authority transfer. A finding is
+adopted only when it is supported by the governing contract, exact code, or a real source
+artifact. Reviewers do not edit the same file set concurrently; one writer owns each diff,
+and Codex reconciles conflicting recommendations against the source evidence.
+
 ## Decision evidence
 
 The source-first comparison covered ten real documents: short announcements, multi-page

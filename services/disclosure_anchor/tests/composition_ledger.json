@@ -8,6 +8,10 @@
    "private_imports": [],
    "tests": 2
   },
+  "tests/contract/test_greenfield_import_firewall.py": {
+   "private_imports": [],
+   "tests": 1
+  },
   "tests/contract/test_normalized_ir_contract.py": {
    "private_imports": [],
    "tests": 14
@@ -242,6 +246,10 @@
   "tests/unit/test_mineru_backend_probe.py": {
    "private_imports": [],
    "tests": 5
+  },
+  "tests/unit/test_mineru_medium_artifacts.py": {
+   "private_imports": [],
+   "tests": 8
   },
   "tests/unit/test_mineru_middle_roles.py": {
    "private_imports": [],
