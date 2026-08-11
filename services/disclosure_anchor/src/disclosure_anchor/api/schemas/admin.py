@@ -41,30 +41,9 @@ class RegisterLocalPdfResponse(AdminModel):
 
 
 class ParserOptionsRequest(AdminModel):
-    # Closed vocabularies: these values become MinerU argv; free strings
-    # starting with '-' would inject CLI flags into the subprocess.
-    # Backend set = MinerU 3.4; *-http-client offloads to a remote
-    # mineru-openai-server and requires server_url.
-    method: Literal["auto", "txt", "ocr"] | None = None
-    backend: (
-        Literal[
-            "pipeline",
-            "vlm-engine",
-            "hybrid-engine",
-            "vlm-http-client",
-            "hybrid-http-client",
-        ]
-        | None
-    ) = None
-    language: Literal["ch", "en"] | None = None
-    formula: bool | None = None
-    table: bool | None = None
-    effort: Literal["medium", "high"] | None = None
-    image_analysis: bool | None = None
-    start_page: int | None = None
-    end_page: int | None = None
+    # Content-affecting options are not an admin surface. The writer is pinned
+    # to the selected full-document Hybrid-medium profile.
     timeout_seconds: int | None = None
-    server_url: str | None = Field(default=None, pattern=r"^https?://")
 
 
 class ParseDocumentResponse(AdminModel):
@@ -72,6 +51,7 @@ class ParseDocumentResponse(AdminModel):
     status: str
     parser_artifact_relpath: str | None = None
     normalized_ir_relpath: str | None = None
+    provider_document_relpath: str | None = None
     artifact_hash: str | None = None
     error: dict[str, Any] | None = None
 

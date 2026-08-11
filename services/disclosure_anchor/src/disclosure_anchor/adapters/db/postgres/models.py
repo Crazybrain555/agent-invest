@@ -389,6 +389,13 @@ class ProcessingRun(Base):
             "artifact_owner_processing_run_id <> processing_run_id",
             name="ck_processing_run_rebuild_artifact_owner",
         ),
+        CheckConstraint(
+            "(run_kind NOT IN ('parse', 'rebuild_units') OR "
+            "num_nonnulls(normalized_ir_relpath, provider_document_relpath) = 1) "
+            "AND (provider_document_relpath IS NULL OR "
+            "run_kind IN ('parse', 'rebuild_units'))",
+            name="ck_processing_run_primary_output_exactly_one",
+        ),
         Index("ix_processing_run_document", "document_id"),
         Index(
             "ix_processing_run_artifact_owner",
@@ -435,6 +442,10 @@ class ProcessingRun(Base):
     parser_artifact_relpath: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     artifact_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     normalized_ir_relpath: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    provider_document_relpath: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
     document_units_relpath: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     content_hash_aggregate: Mapped[Optional[str]] = mapped_column(
         String(128), nullable=True

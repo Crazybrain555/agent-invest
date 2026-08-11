@@ -31,6 +31,8 @@ _PARSE_FAILURE_CONTRACT_VALID_SQL = """
           FROM disclosure_core.processing_run AS failed_run
          WHERE failed_run.document_id = q.document_id
            AND failed_run.run_kind = 'parse'
+           AND failed_run.provider_document_relpath IS NOT NULL
+           AND failed_run.normalized_ir_relpath IS NULL
            AND failed_run.status = 'failed'
            AND (
                 jsonb_typeof(failed_run.error->'retryable')
@@ -46,6 +48,8 @@ _PARSE_ITEM_FAILURE_COUNT_SQL = """
        FROM disclosure_core.processing_run AS item_failure
       WHERE item_failure.document_id = q.document_id
         AND item_failure.run_kind = 'parse'
+        AND item_failure.provider_document_relpath IS NOT NULL
+        AND item_failure.normalized_ir_relpath IS NULL
         AND item_failure.status = 'failed'
         AND item_failure.error->>'retry_budget_class' = 'item')
 """
@@ -54,6 +58,8 @@ _PARSE_CHARGED_FAILURE_COUNT_SQL = """
        FROM disclosure_core.processing_run AS charged_failure
       WHERE charged_failure.document_id = q.document_id
         AND charged_failure.run_kind = 'parse'
+        AND charged_failure.provider_document_relpath IS NOT NULL
+        AND charged_failure.normalized_ir_relpath IS NULL
         AND charged_failure.status = 'failed'
         AND charged_failure.error->>'retry_budget_class'
             IN ('item', 'infrastructure'))

@@ -108,12 +108,10 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("DISCLOSURE_MINERU_BIN", "disclosure_mineru_bin"),
     )
-    # MinerU 3.4 backend vocabulary: pipeline | vlm-engine | hybrid-engine |
-    # vlm-http-client | hybrid-http-client. The *-http-client backends need
-    # DISCLOSURE_MINERU_SERVER_URL pointing at a mineru-openai-server
-    # (GPU box) and shift VLM inference off this machine.
-    disclosure_mineru_backend: str = Field(
-        default="pipeline",
+    # Sole writer contract: exact MinerU 3.4.4 Hybrid-medium over the remote
+    # OpenAI-compatible backend. Alternative lanes are DB-free diagnostics.
+    disclosure_mineru_backend: Literal["hybrid-http-client"] = Field(
+        default="hybrid-http-client",
         validation_alias=AliasChoices(
             "DISCLOSURE_MINERU_BACKEND", "disclosure_mineru_backend"
         ),

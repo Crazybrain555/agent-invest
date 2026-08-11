@@ -1,9 +1,4 @@
-"""Parser port contracts.
-
-Application use cases depend on these parser-neutral DTOs. Concrete adapters
-may use MinerU artifacts internally, but domain/application code receives only
-NormalizedIR-compatible data and controlled artifact paths.
-"""
+"""Parser option and legacy compatibility contracts."""
 
 from __future__ import annotations
 
@@ -20,19 +15,14 @@ from disclosure_anchor.application.contracts.parser_target import (
 @dataclass(frozen=True)
 class ParserOptions:
     method: str = "auto"
-    backend: str = "pipeline"
+    backend: str = "hybrid-http-client"
     language: str = "ch"
-    # Accuracy-first disclosures must not intentionally suppress an evidence
-    # class that MinerU can recognize. Image-backed equations without text
-    # otherwise survive as unsearchable visuals.
     formula: bool = True
     table: bool = True
-    # MinerU 3.4's hybrid default is medium, which disables image/chart
-    # analysis even when --image-analysis is true. Accuracy-first disclosure
-    # parsing therefore requests high explicitly and records the effective
-    # choice in NormalizedIR.
-    effort: Literal["medium", "high"] = "high"
-    image_analysis: bool = True
+    # The production writer is pinned to official Hybrid-medium. High and
+    # page-window variants belong only to DB-free diagnostic tools.
+    effort: Literal["medium", "high"] = "medium"
+    image_analysis: bool = False
     start_page: int | None = None
     end_page: int | None = None
     timeout_seconds: int | None = None

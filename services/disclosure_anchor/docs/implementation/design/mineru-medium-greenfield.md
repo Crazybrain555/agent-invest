@@ -144,11 +144,9 @@ derived/provider_documents/<provider>/<security>/<provider_document_id>/
   <artifact_owner_processing_run_id>/provider_document.v1.json
 ```
 
-`provider_document.v1` is still a pre-cutover development contract: no runtime writer,
-database row, Build/retrieval loader, or persisted consumer exists. Its field set may be
-corrected in this DB-free phase without a compatibility reader; the first sole-writer
-admission commit freezes the versioned bytes. After that point, removing or changing a field
-requires a new contract version and explicit read compatibility rather than this exception.
+`provider_document.v1` was frozen by the source-admission slice and is now the sole-writer
+parse record. Removing or changing a field requires a new contract version and explicit read
+compatibility; the earlier DB-free pre-cutover exception has ended.
 
 `parser_artifact_relpath` continues to identify the immutable MinerU bundle root. The
 provider-document file never appears in that bundle's own inventory, avoiding a recursive
@@ -156,15 +154,13 @@ hash. Outline, headpath, coarse units, builder rules, search ownership, audit ou
 generation time are deliberately absent: the same parse owner can be rebuilt by one later
 deterministic builder version without rewriting or rerunning MinerU.
 
-This contract and path land DB-free. There is no transitional migration or dormant
-provider row while the runtime still has only a NormalizedIR writer. The sole-writer cutover
-will use the next append-only migration (`0032` at the current `0031` head) in the same
-change set as all new Parse/Build/Publish entry points. That migration adds only the private
+The append-only sole-writer migration `0032` lands in the same change set as all new
+Parse/Build/Publish entry points. It adds only the private
 `provider_document_relpath` needed for the new output. For parse owners, exactly one of
 `normalized_ir_relpath` and `provider_document_relpath` is present; the output contract is
 derived from that exclusive pair rather than stored as a third, drift-prone core fact.
 `artifact_hash` remains the bytes hash of whichever tagged primary parse output exists.
-Queue admission does not change before that cutover and becomes provider-only with it.
+Queue admission is provider-only after this cutover.
 
 ## Content conservation
 

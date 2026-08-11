@@ -14,12 +14,14 @@ from sqlalchemy.engine import Engine
 from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA
 from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
 from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
-from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
-from disclosure_anchor.adapters.parsers.mineru.source_evidence_validator import (
-    MinerUSourceEvidenceValidator,
+from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
+    MinerUMediumDocumentParser,
 )
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
+from disclosure_anchor.adapters.storage.provider_document_source import (
+    ProviderDocumentFileSource,
+)
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
 from disclosure_anchor.api.errors import (
     CONFLICT,
@@ -46,6 +48,9 @@ from disclosure_anchor.api.schemas.admin import (
     UntrackCompanyResponse,
 )
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.services.provider_document_admission import (
+    ProviderDocumentAdmission,
+)
 from disclosure_anchor.application.use_cases.build_units import (
     BuildUnits,
     BuildUnitsCommand,
@@ -57,7 +62,7 @@ from disclosure_anchor.application.use_cases.parse_document import (
     ParseDocumentResult,
 )
 from disclosure_anchor.application.use_cases.publish_run import (
-    NormalizedIRPublicationGuard,
+    ProviderDocumentPublicationGuard,
     PublishRun,
     PublishRunCommand,
 )
@@ -274,6 +279,7 @@ class AdminDeps:
         self._engine = engine
         self._paths = FileStorePathBuilder(settings)
         self._artifacts = ArtifactStore(self._paths)
+        self._provider_source = ProviderDocumentFileSource(self._paths)
         self._uow_factory = unit_of_work_factory(engine)
 
     def register_local_pdf(
@@ -288,13 +294,14 @@ class AdminDeps:
         self, *, document_id: str, options: ParserOptions
     ) -> ParseDocumentResult:
         executable = self._settings.disclosure_mineru_bin or Path("mineru")
-        parser = MinerUDocumentParser(
+        parser = MinerUMediumDocumentParser(
             process=MinerUProcess(executable=executable),
             server_url=self._settings.disclosure_mineru_server_url,
         )
         with exclusive_worker_admission(self._engine):
             return ParseDocument(
                 parser=parser,
+                provider_source=self._provider_source,
                 path_builder=self._paths,
                 raw_store=RawDocumentStore(self._paths),
                 artifact_store=self._artifacts,
@@ -314,7 +321,10 @@ class AdminDeps:
             path_builder=self._paths,
             artifact_store=self._artifacts,
             uow_factory=self._uow_factory,
-            source_evidence_validator=MinerUSourceEvidenceValidator(),
+            admission=ProviderDocumentAdmission(
+                path_builder=self._paths,
+                source=self._provider_source,
+            ),
         ).execute(BuildUnitsCommand(document_id=document_id))
 
     def publish_run(
@@ -326,7 +336,12 @@ class AdminDeps:
     ) -> PublishRunResponse:
         result = PublishRun(
             uow_factory=self._uow_factory,
-            publication_guard=NormalizedIRPublicationGuard(self._paths),
+            publication_guard=ProviderDocumentPublicationGuard(
+                ProviderDocumentAdmission(
+                    path_builder=self._paths,
+                    source=self._provider_source,
+                )
+            ),
         ).execute(
             PublishRunCommand(
                 processing_run_id=processing_run_id,
@@ -530,25 +545,17 @@ def _parser_options(
 ) -> ParserOptions:
     defaults = defaults or ParserOptions()
     return ParserOptions(
-        method=command.method if command.method is not None else defaults.method,
-        backend=command.backend if command.backend is not None else defaults.backend,
-        language=command.language if command.language is not None else defaults.language,
-        formula=command.formula if command.formula is not None else defaults.formula,
-        table=command.table if command.table is not None else defaults.table,
-        effort=command.effort if command.effort is not None else defaults.effort,
-        image_analysis=(
-            command.image_analysis
-            if command.image_analysis is not None
-            else defaults.image_analysis
-        ),
-        start_page=command.start_page,
-        end_page=command.end_page,
+        method="auto",
+        backend="hybrid-http-client",
+        language="ch",
+        formula=True,
+        table=True,
+        effort="medium",
+        image_analysis=False,
+        start_page=None,
+        end_page=None,
         timeout_seconds=command.timeout_seconds,
-        server_url=(
-            command.server_url
-            if command.server_url is not None
-            else defaults.server_url
-        ),
+        server_url=defaults.server_url,
         http_request_concurrency=defaults.http_request_concurrency,
         runtime_bundle_identity_sha256=(
             defaults.runtime_bundle_identity_sha256

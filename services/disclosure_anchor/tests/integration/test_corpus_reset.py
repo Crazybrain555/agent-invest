@@ -24,9 +24,6 @@ from scripts.corpus_reparse_manifest import (
     load_manifest,
     write_manifest,
 )
-from disclosure_anchor.application.contracts.normalized_ir import (
-    CURRENT_NORMALIZED_IR_VERSION,
-)
 from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
 )
@@ -384,7 +381,6 @@ class CorpusResetIntegrationTests(unittest.TestCase):
                     "max_build_retries": 3,
                     "builder_rules_version": "ub-test",
                     "retrieval_rules_version": "rp-test",
-                    "normalized_ir_contract_version": (CURRENT_NORMALIZED_IR_VERSION),
                 },
                 "code_snapshot": code_snapshot,
             },

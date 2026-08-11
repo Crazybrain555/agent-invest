@@ -39,7 +39,8 @@ disclosure_core / disclosure_public / disclosure_ops 存在
 ```text
 raw_documents 可读写
 parser_artifacts 可读写
-derived/normalized_ir 可读写
+derived/normalized_ir 可读（历史 v4 evidence/GC；新 writer 不再写）
+derived/provider_documents 可读写
 document_unit_snapshots 可读写
 runtime/inbox 可读写
 runtime/quarantine 可读写
@@ -65,7 +66,8 @@ MODELSCOPE_CACHE 指向外置盘
 抽样 document.raw_file_relpath 是否存在
 抽样 document.raw_file_hash 是否与文件 bytes 一致
 按 run 结局区分（04R-R6.3 / E11）：
-  succeeded run → normalized_ir_relpath 存在且 artifact_hash 匹配
+  succeeded parse/rebuild run → normalized_ir_relpath 与 provider_document_relpath 恰一存在，
+                                所选 primary artifact 与 artifact_hash 匹配
   failed run    → 只要求结构化 error 存在（合法 JSON），不报 artifact 缺失
   unit_build_status='succeeded' → document_units_relpath 存在且快照哈希与 DB 聚合一致
 抽样 document_unit.artifact_locator 是否可回指

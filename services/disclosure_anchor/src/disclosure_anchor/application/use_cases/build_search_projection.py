@@ -50,9 +50,11 @@ from disclosure_anchor.adapters.db.postgres.models import (
     UnitSearchProjection,
 )
 from disclosure_anchor.adapters.retrieval import tokenizer
-from disclosure_anchor.application.contracts.unit_source_projection import (
-    SearchTargetContractError,
-    search_text_values,
+from disclosure_anchor.application.contracts.provider_unit import (
+    ProviderUnitSearchContractError,
+)
+from disclosure_anchor.application.services.provider_unit_builder import (
+    provider_unit_search_text_values,
 )
 from disclosure_anchor.application.worker.locks import shared_corpus_mutation
 
@@ -110,9 +112,9 @@ class SearchProjectionSafetyError(RuntimeError):
 
 
 def _projection_error_code(
-    error: SearchProjectionSafetyError | SearchTargetContractError,
+    error: SearchProjectionSafetyError | ProviderUnitSearchContractError,
 ) -> str:
-    if isinstance(error, SearchTargetContractError):
+    if isinstance(error, ProviderUnitSearchContractError):
         return "search_target_contract_invalid"
     prefix, separator, _detail = str(error).partition(":")
     return (
@@ -123,7 +125,7 @@ def _projection_error_code(
 
 
 def _terminal_projection_error(
-    error: SearchProjectionSafetyError | SearchTargetContractError,
+    error: SearchProjectionSafetyError | ProviderUnitSearchContractError,
     *,
     failed_at: datetime,
 ) -> dict[str, object]:
@@ -247,7 +249,7 @@ class BuildSearchProjection:
                     )
                 except (
                     SearchProjectionSafetyError,
-                    SearchTargetContractError,
+                    ProviderUnitSearchContractError,
                 ) as exc:
                     recorded = self._record_terminal_error(
                         session,
@@ -755,9 +757,10 @@ def compute_search_projection_row(
     heading_path_text = " > ".join(str(item) for item in heading_path or [])
     body_atoms = tuple(
         normalized
-        for value in search_text_values(
+        for value in provider_unit_search_text_values(
             payload_kind=payload_kind,
             payload=payload or {},
+            title=title,
             artifact_locator=artifact_locator,
         )
         if (normalized := tokenizer.normalize_search_text(value)).strip()

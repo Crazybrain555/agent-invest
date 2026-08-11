@@ -49,10 +49,10 @@
 
 - **本目录 = 运营策略**：文件改动（或 `make track`）进入审计；resident worker 缓存策略，
   改动或 `make load-rules` 后须重启 launchd job 并再跑 doctor，不能等待自动刷新。
-- **包内词表 = 规则契约**（`adapters/sources/cninfo/class_map.json`、`facet_map.json`、
-  `filing_type_map.json`；`adapters/unit_builder/note_key_map.json`、`event_key_map.json`）：
-  版本号写进数据库行，改动 = 升版 + `make load-rules`（分类词表）或升 RULES_VERSION +
-  `make rebuild-units`（切分词表）。清单与版本见 `docs/architecture/data-dictionary.md` §4。
+- **包内分类词表 = 规则契约**（`adapters/sources/cninfo/class_map.json`、`facet_map.json`、
+  `filing_type_map.json`）：版本号写入加载表，改动 = 升版 + `make load-rules`。Provider Unit
+  builder 不再读取章节/事件词表，也不按业务词面改变标题、边界或 payload。清单与版本见
+  `docs/architecture/data-dictionary.md` §4。
 
 ## 常用环境变量（machine-local，~/.config/agent-invest/disclosure_anchor/*.env）
 
@@ -63,6 +63,9 @@
 | DISCLOSURE_INITIAL_LOOKBACK_DAYS | 1095 | 首次回补窗口（三年底线） |
 | DISCLOSURE_SYNC_INTERVAL_SECONDS | 86400 | 全局同步间隔 |
 | DISCLOSURE_PROCESSING_POLICY | config/processing_policy.json | 策略文件路径 |
+| DISCLOSURE_MINERU_BACKEND | hybrid-http-client | sole writer 固定值；其他 lane 仅可作 DB-free 诊断 |
+| DISCLOSURE_MINERU_SERVER_URL | — | pinned MinerU 3.4.4 remote endpoint；缺失时 writer 在建 run 前失败 |
+| DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256 | — | 远端 immutable image/model/config 的 operator/provider attested digest；不得用 mutable tag 伪装 |
 | DISCLOSURE_BACKFILL_MAX_PENDING_DOWNLOADS | 2000 | 首回补处理总在途水位（兼容旧变量名）：待下载 + 已下载待解析；单公司原子同步可越线一次 |
 | WORKER_BATCH_SYNC | 13 | 每轮到期公司上限；常驻模式零等待轮转，但首回补还受总在途水位约束，不要直接升到 200 |
 | WORKER_BATCH_DOWNLOAD | 50 | 每轮下载上限；下载只把工作从 pending-download 搬到 pending-parse，总在途水位避免 GPU 故障时 raw 无界增长 |

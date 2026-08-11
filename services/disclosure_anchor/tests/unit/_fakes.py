@@ -205,14 +205,17 @@ class ProcessingRunRepo(_Repo[e.ProcessingRun]):
     def _key(self, item: e.ProcessingRun) -> str:
         return item.processing_run_id
 
-    def latest_succeeded_parse_for_document(self, document_id: str) -> e.ProcessingRun | None:
+    def latest_succeeded_provider_run_for_document(
+        self, document_id: str
+    ) -> e.ProcessingRun | None:
         matches = [
             item
             for item in self.items.values()
             if item.document_id == document_id
             and item.run_kind in ("parse", "rebuild_units")
             and item.status == "succeeded"
-            and item.normalized_ir_relpath is not None
+            and item.provider_document_relpath is not None
+            and item.normalized_ir_relpath is None
         ]
         matches.sort(key=lambda item: (item.started_at is not None, item.started_at, item.processing_run_id))
         return matches[-1] if matches else None

@@ -134,7 +134,7 @@
   },
   "tests/unit/test_build_units.py": {
    "private_imports": [],
-   "tests": 18
+   "tests": 6
   },
   "tests/unit/test_canonical_occurrence.py": {
    "private_imports": [],
@@ -248,7 +248,7 @@
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
-   "tests": 1
+   "tests": 4
   },
   "tests/unit/test_mineru_adapter.py": {
    "private_imports": [],
@@ -288,7 +288,7 @@
   },
   "tests/unit/test_parse_document.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 6
   },
   "tests/unit/test_path_builder.py": {
    "private_imports": [],
@@ -325,14 +325,8 @@
    "tests": 5
   },
   "tests/unit/test_provider_document_admission.py": {
-   "private_imports": [
-    "_DOCUMENT = \"doc_01K00000000000000000000000\"",
-    "_OWNER = \"run_01K0000000000000000000000\"",
-    "_PROVIDER_DOCUMENT_ID = \"1225087169\"",
-    "_RECORD_RELPATH = Path(",
-    "_SOURCE_SHA = \"sha256:\" + \"a\" * 64"
-   ],
-   "tests": 9
+   "private_imports": [],
+   "tests": 10
   },
   "tests/unit/test_provider_document_envelope.py": {
    "private_imports": [],
@@ -344,13 +338,17 @@
   },
   "tests/unit/test_provider_unit_builder.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 11
+  },
+  "tests/unit/test_provider_unit_evidence.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/unit/test_publish_run.py": {
    "private_imports": [
     "_validate_candidate_unit_set"
    ],
-   "tests": 20
+   "tests": 21
   },
   "tests/unit/test_raw_document_store.py": {
    "private_imports": [],
@@ -374,7 +372,7 @@
   },
   "tests/unit/test_search_projection.py": {
    "private_imports": [],
-   "tests": 14
+   "tests": 9
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],

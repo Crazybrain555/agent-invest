@@ -42,6 +42,7 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         return {
             "parser_artifacts": set(),
             "normalized_ir": set(),
+            "provider_documents": set(),
             "document_unit_snapshots": set(),
         }
 
@@ -58,6 +59,13 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         sibling_ir = self._file(
             "derived/normalized_ir/doc/run/unowned-sibling.json"
         )
+        owned_provider = self._file(
+            "derived/provider_documents/cninfo/000001/pid/run/"
+            "provider_document.v1.json"
+        )
+        sibling_provider = self._file(
+            "derived/provider_documents/cninfo/000001/pid/run/unowned.json"
+        )
         owned_units = self._file(
             "derived/document_unit_snapshots/doc/run/document_units.v1.jsonl"
         )
@@ -71,6 +79,10 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         )
         expected["normalized_ir"].add(
             "derived/normalized_ir/doc/run/normalized_ir.v3.json"
+        )
+        expected["provider_documents"].add(
+            "derived/provider_documents/cninfo/000001/pid/run/"
+            "provider_document.v1.json"
         )
         expected["document_unit_snapshots"].add(
             "derived/document_unit_snapshots/doc/run/"
@@ -92,10 +104,11 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         self.assertEqual(sum(recheck_skipped.values()), 0)
         self.assertEqual(
             {orphan.path for orphan in orphans},
-            {orphan_parser, sibling_ir, orphan_units},
+            {orphan_parser, sibling_ir, sibling_provider, orphan_units},
         )
         self.assertNotIn(owned_parser, {orphan.path for orphan in orphans})
         self.assertNotIn(owned_ir, {orphan.path for orphan in orphans})
+        self.assertNotIn(owned_provider, {orphan.path for orphan in orphans})
         self.assertNotIn(owned_units, {orphan.path for orphan in orphans})
 
     def test_age_is_rechecked_after_the_ownership_snapshot(self) -> None:
@@ -123,11 +136,15 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         active = (
             "parser_artifacts/cninfo/000001/doc/active",
             "derived/normalized_ir/doc/active/normalized_ir.v4.json",
+            "derived/provider_documents/cninfo/000001/pid/active/"
+            "provider_document.v1.json",
             "derived/document_unit_snapshots/doc/active/document_units.v1.jsonl",
         )
         inactive = (
             "parser_artifacts/cninfo/000001/doc/inactive",
             "derived/normalized_ir/doc/inactive/normalized_ir.v4.json",
+            "derived/provider_documents/cninfo/000001/pid/inactive/"
+            "provider_document.v1.json",
             "derived/document_unit_snapshots/doc/inactive/document_units.v1.jsonl",
         )
         conn = MagicMock()
@@ -143,8 +160,12 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         self.assertEqual(expected["parser_artifacts"], {active[0], inactive[0]})
         self.assertEqual(expected["normalized_ir"], {active[1], inactive[1]})
         self.assertEqual(
-            expected["document_unit_snapshots"],
+            expected["provider_documents"],
             {active[2], inactive[2]},
+        )
+        self.assertEqual(
+            expected["document_unit_snapshots"],
+            {active[3], inactive[3]},
         )
         for relpath in (*active, *inactive):
             self._file(relpath)
@@ -201,7 +222,7 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         _write_manifest_before_delete(audit_path, manifest)
 
         stored = json.loads(audit_path.read_text(encoding="utf-8"))
-        self.assertEqual(stored["manifest_schema"], "orphan-derived-artifacts.v2")
+        self.assertEqual(stored["manifest_schema"], "orphan-derived-artifacts.v3")
         self.assertEqual(stored["families"]["document_unit_snapshots"]["files"], 1)
         self.assertEqual(
             stored["files"][0]["relpath"],

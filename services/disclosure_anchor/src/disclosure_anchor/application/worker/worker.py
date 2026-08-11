@@ -39,9 +39,12 @@ from disclosure_anchor.application.ports.file_store import (
     FileStorePathPort,
     RawDocumentStorePort,
 )
-from disclosure_anchor.application.ports.parser import DocumentParserPort, ParserOptions
-from disclosure_anchor.application.ports.source_evidence import (
-    SourceEvidenceValidatorPort,
+from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.ports.provider_document_source import (
+    ProviderDocumentSourcePort,
+)
+from disclosure_anchor.application.ports.provider_parser import (
+    ProviderDocumentParserPort,
 )
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.use_cases.build_search_projection import (
@@ -61,10 +64,13 @@ from disclosure_anchor.application.use_cases.parse_document import (
     ParseDocumentCommand,
 )
 from disclosure_anchor.application.use_cases.publish_run import (
-    NormalizedIRPublicationGuard,
+    ProviderDocumentPublicationGuard,
     PublishRun,
     PublishRunCommand,
     TERMINAL_PUBLICATION_ERROR_CODES,
+)
+from disclosure_anchor.application.services.provider_document_admission import (
+    ProviderDocumentAdmission,
 )
 from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     SyncDisclosureIndex,
@@ -81,6 +87,7 @@ from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import (
     DisclosureAnchorError,
+    ParserOutputContractError,
     ParserVersionProbeError,
 )
 
@@ -222,12 +229,12 @@ class WorkerDeps:
     path_builder: FileStorePathPort
     raw_store: RawDocumentStorePort
     artifact_store: ArtifactStorePort
-    source_evidence_validator: SourceEvidenceValidatorPort
+    provider_source: ProviderDocumentSourcePort
     source_factory: Callable[[], DisclosureSourcePort]
     profile_loader_factory: Callable[
         [DisclosureSourcePort], Callable[[str], SourceCompanyProfile | None]
     ]
-    parser_factory: Callable[[], DocumentParserPort]
+    parser_factory: Callable[[], ProviderDocumentParserPort]
     parse_expected_seconds: int
     config: WorkerConfig
     parser_options: ParserOptions
@@ -1023,6 +1030,7 @@ def _parse_one_document(
     try:
         parse_use_case = ParseDocument(
             parser=deps.parser_factory(),
+            provider_source=deps.provider_source,
             path_builder=deps.path_builder,
             raw_store=deps.raw_store,
             artifact_store=deps.artifact_store,
@@ -1089,7 +1097,10 @@ def _finalize_one_document(
             path_builder=deps.path_builder,
             artifact_store=deps.artifact_store,
             uow_factory=deps.uow_factory,
-            source_evidence_validator=deps.source_evidence_validator,
+            admission=ProviderDocumentAdmission(
+                path_builder=deps.path_builder,
+                source=deps.provider_source,
+            ),
         ).execute(
             BuildUnitsCommand(processing_run_id=processing_run_id)
         )
@@ -1139,7 +1150,12 @@ def _publish_one_document(
     try:
         publish_result = PublishRun(
             uow_factory=deps.uow_factory,
-            publication_guard=NormalizedIRPublicationGuard(deps.path_builder),
+            publication_guard=ProviderDocumentPublicationGuard(
+                ProviderDocumentAdmission(
+                    path_builder=deps.path_builder,
+                    source=deps.provider_source,
+                )
+            ),
         ).execute(
             PublishRunCommand(processing_run_id=processing_run_id)
         )
@@ -1630,8 +1646,16 @@ def _parse_one_batch(
             readiness = getattr(parser, "readiness", None)
             if callable(readiness):
                 readiness(deps.parser_options)
-        except ParserVersionProbeError as exc:
-            readiness_failures += 1
+        except (ParserVersionProbeError, ParserOutputContractError) as exc:
+            retryable = isinstance(exc, ParserVersionProbeError)
+            already_recorded = (
+                readiness_failures >= PARSER_READINESS_FAILURE_THRESHOLD
+            )
+            readiness_failures = (
+                readiness_failures + 1
+                if retryable
+                else PARSER_READINESS_FAILURE_THRESHOLD
+            )
             readiness_retry_at = (
                 time.monotonic() + PARSER_READINESS_RETRY_SECONDS
             )
@@ -1641,14 +1665,17 @@ def _parse_one_batch(
                 PARSER_READINESS_FAILURE_THRESHOLD,
                 exc,
             )
-            if readiness_failures >= PARSER_READINESS_FAILURE_THRESHOLD:
+            if (
+                readiness_failures >= PARSER_READINESS_FAILURE_THRESHOLD
+                and not already_recorded
+            ):
                 report.failed += 1
                 report.failures.append(
                     WorkerFailure(
                         stage="parse",
                         item_ref="parser",
                         error_code="parser_readiness_failed",
-                        retryable=True,
+                        retryable=retryable,
                         message=str(exc)[:500],
                     )
                 )
@@ -2208,7 +2235,10 @@ def _build_stage(
         path_builder=deps.path_builder,
         artifact_store=deps.artifact_store,
         uow_factory=deps.uow_factory,
-        source_evidence_validator=deps.source_evidence_validator,
+        admission=ProviderDocumentAdmission(
+            path_builder=deps.path_builder,
+            source=deps.provider_source,
+        ),
     )
     for row in pending:
         if should_stop():
@@ -2260,7 +2290,12 @@ def _publish_stage(
         pending = queries.pending_publish(conn, limit=limit)
     use_case = PublishRun(
         uow_factory=deps.uow_factory,
-        publication_guard=NormalizedIRPublicationGuard(deps.path_builder),
+        publication_guard=ProviderDocumentPublicationGuard(
+            ProviderDocumentAdmission(
+                path_builder=deps.path_builder,
+                source=deps.provider_source,
+            )
+        ),
     )
     for row in pending:
         if should_stop():

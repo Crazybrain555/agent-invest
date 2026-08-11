@@ -1,19 +1,14 @@
-"""Rebuild document units from an existing parse run's artifacts.
-
-Rule-bundle changes only affect the build stage (S1-S8), so re-running MinerU
-for every rules iteration wastes ~13 GPU-minutes per annual report. A rebuild
-run copies the parser provenance and artifact references from the latest
-succeeded parse run and goes straight to build+publish (05 §2 U1
-run_kind='rebuild_units', implemented 2026-07-06 on user direction).
-"""
+"""Create a deterministic provider-native Unit rebuild without rerunning MinerU."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import NoReturn
 
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.worker.locks import exclusive_document_producer
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.entities import outbox_events
@@ -33,60 +28,41 @@ class RebuildUnitsResult:
 
 
 class RebuildUnits:
-    """Create a succeeded rebuild run pointing at the source run's IR."""
+    """Alias one succeeded self-owned provider parse for a new Unit build."""
 
     def __init__(self, *, uow_factory: Callable[[], UnitOfWork]) -> None:
         self._uow_factory = uow_factory
 
     def execute(self, command: RebuildUnitsCommand) -> RebuildUnitsResult:
+        with exclusive_document_producer(self._uow_factory, command.document_id):
+            return self._execute_owned(command)
+
+    def _execute_owned(self, command: RebuildUnitsCommand) -> RebuildUnitsResult:
         now = datetime.now(timezone.utc)
         with self._uow_factory() as uow:
             document = uow.documents.get(command.document_id)
             if document is None:
-                raise BuildUnitsError(
-                    {
-                        "stage": "rebuild_units",
-                        "error_code": "DOCUMENT_NOT_FOUND",
-                        "retryable": False,
-                        "document_id": command.document_id,
-                    }
-                )
-            source = uow.processing_runs.latest_succeeded_parse_for_document(
+                self._fail("DOCUMENT_NOT_FOUND", command.document_id)
+            candidate = uow.processing_runs.latest_succeeded_provider_run_for_document(
                 command.document_id
             )
-            if source is None or not source.normalized_ir_relpath:
-                raise BuildUnitsError(
-                    {
-                        "stage": "rebuild_units",
-                        "error_code": "NO_SUCCEEDED_PARSE_RUN",
-                        "retryable": False,
-                        "document_id": command.document_id,
-                    }
-                )
-            owner = uow.processing_runs.get(source.artifact_owner_processing_run_id)
-            if (
-                owner is None
-                or owner.document_id != document.document_id
-                or owner.run_kind != "parse"
-                or owner.artifact_owner_processing_run_id != owner.processing_run_id
-                or owner.status != "succeeded"
-                or owner.normalized_ir_relpath != source.normalized_ir_relpath
-                or owner.parser_artifact_relpath != source.parser_artifact_relpath
-                or owner.artifact_hash != source.artifact_hash
+            if candidate is None:
+                self._fail("NO_SUCCEEDED_PARSE_RUN", command.document_id)
+            owner = uow.processing_runs.get(
+                candidate.artifact_owner_processing_run_id
+            )
+            if not self._valid_owner(
+                document_id=command.document_id,
+                candidate=candidate,
+                owner=owner,
             ):
-                raise BuildUnitsError(
-                    {
-                        "stage": "rebuild_units",
-                        "error_code": "ARTIFACT_OWNER_INVALID",
-                        "retryable": False,
-                        "document_id": command.document_id,
-                    }
-                )
+                self._fail("ARTIFACT_OWNER_INVALID", command.document_id)
+            assert owner is not None
             run = uow.processing_runs.add(
                 e.ProcessingRun(
                     processing_run_id=ids.new_processing_run_id(),
-                    document_id=document.document_id,
-                    artifact_owner_processing_run_id=(owner.processing_run_id),
+                    document_id=command.document_id,
+                    artifact_owner_processing_run_id=owner.processing_run_id,
                     run_kind="rebuild_units",
                     status="succeeded",
                     parser_name=owner.parser_name,
@@ -98,14 +74,15 @@ class RebuildUnits:
                     input_raw_file_hash=owner.input_raw_file_hash,
                     parser_artifact_relpath=owner.parser_artifact_relpath,
                     artifact_hash=owner.artifact_hash,
-                    normalized_ir_relpath=owner.normalized_ir_relpath,
+                    normalized_ir_relpath=None,
+                    provider_document_relpath=owner.provider_document_relpath,
                     started_at=now,
                     finished_at=now,
                 )
             )
             uow.outbox.add(
                 outbox_events.processing_run_created(
-                    document_id=document.document_id,
+                    document_id=command.document_id,
                     processing_run_id=run.processing_run_id,
                     occurred_at=now,
                     status="succeeded",
@@ -114,6 +91,58 @@ class RebuildUnits:
             uow.commit()
         return RebuildUnitsResult(
             processing_run_id=run.processing_run_id,
-            source_processing_run_id=source.processing_run_id,
+            source_processing_run_id=owner.processing_run_id,
             status=run.status,
         )
+
+    @staticmethod
+    def _valid_owner(
+        *,
+        document_id: str,
+        candidate: e.ProcessingRun,
+        owner: e.ProcessingRun | None,
+    ) -> bool:
+        if owner is None:
+            return False
+        copied = (
+            "input_raw_file_hash",
+            "parser_artifact_relpath",
+            "artifact_hash",
+            "provider_document_relpath",
+            "parser_name",
+            "parser_version",
+            "parser_backend",
+            "parser_method",
+            "parser_language",
+            "parser_target_identity",
+        )
+        return (
+            candidate.document_id == document_id
+            and candidate.run_kind in {"parse", "rebuild_units"}
+            and candidate.status == "succeeded"
+            and candidate.normalized_ir_relpath is None
+            and candidate.provider_document_relpath is not None
+            and owner.document_id == document_id
+            and owner.run_kind == "parse"
+            and owner.status == "succeeded"
+            and owner.artifact_owner_processing_run_id == owner.processing_run_id
+            and owner.normalized_ir_relpath is None
+            and owner.provider_document_relpath is not None
+            and candidate.artifact_owner_processing_run_id
+            == owner.processing_run_id
+            and all(getattr(candidate, field) == getattr(owner, field) for field in copied)
+        )
+
+    @staticmethod
+    def _fail(error_code: str, document_id: str) -> NoReturn:
+        raise BuildUnitsError(
+            {
+                "stage": "rebuild_units",
+                "error_code": error_code,
+                "retryable": False,
+                "document_id": document_id,
+            }
+        )
+
+
+__all__ = ["RebuildUnits", "RebuildUnitsCommand", "RebuildUnitsResult"]

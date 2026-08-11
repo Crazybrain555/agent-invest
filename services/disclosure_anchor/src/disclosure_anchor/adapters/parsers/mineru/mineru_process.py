@@ -554,10 +554,4 @@ class MinerUProcess:
             env["MINERU_TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS"] = str(
                 _TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS
             )
-        # MinerU's default cross-page table merge rewrites the leading
-        # table HTML and empties continuation-page carriers.  Physical-page
-        # tables are the canonical evidence boundary here. Cross-page
-        # semantic relations, if needed, belong to retrieval and cannot
-        # rewrite the source table payload.
-        env["MINERU_TABLE_MERGE_ENABLE"] = "0"
         return env

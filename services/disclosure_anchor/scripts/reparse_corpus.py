@@ -78,13 +78,12 @@ from disclosure_anchor.adapters.db.postgres.schema import (  # noqa: E402
 from disclosure_anchor.adapters.retrieval.tokenizer import (  # noqa: E402
     RETRIEVAL_RULES_VERSION,
 )
-from disclosure_anchor.application.contracts.normalized_ir import (  # noqa: E402
-    CURRENT_NORMALIZED_IR_VERSION,
-)
 from disclosure_anchor.application.contracts.parser_target import (  # noqa: E402
     ParserTargetIdentityError,
 )
-from disclosure_anchor.application.services.unit_builder.rules import RULES_VERSION  # noqa: E402
+from disclosure_anchor.application.contracts.provider_unit import (  # noqa: E402
+    PROVIDER_UNIT_BUILDER_VERSION,
+)
 from disclosure_anchor.application.worker import queries  # noqa: E402
 from disclosure_anchor.application.worker.locks import (  # noqa: E402
     exclusive_corpus_mutation,
@@ -192,9 +191,8 @@ def _target_identity(
         "parser_target": parser_target.to_payload(),
         "max_parse_retries": deps.config.max_parse_retries,
         "max_build_retries": deps.config.max_build_retries,
-        "builder_rules_version": RULES_VERSION,
+        "builder_rules_version": PROVIDER_UNIT_BUILDER_VERSION,
         "retrieval_rules_version": RETRIEVAL_RULES_VERSION,
-        "normalized_ir_contract_version": CURRENT_NORMALIZED_IR_VERSION,
     }
 
 

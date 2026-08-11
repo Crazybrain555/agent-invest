@@ -129,6 +129,7 @@ class ProcessingRun:
     parser_artifact_relpath: Optional[str] = None
     artifact_hash: Optional[str] = None
     normalized_ir_relpath: Optional[str] = None
+    provider_document_relpath: Optional[str] = None
     document_units_relpath: Optional[str] = None
     content_hash_aggregate: Optional[str] = None
     structure_hash: Optional[str] = None

@@ -2,21 +2,28 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import re
-from typing import Literal
+from typing import Literal, cast
 
 from disclosure_anchor.application.contracts.provider_table_projection import (
+    ProviderTablePartRef,
     UnboundProviderTablePart,
+    UnboundTablePartReason,
 )
 from disclosure_anchor.application.contracts.document_outline import (
     HeadingPlacementSource,
 )
-from disclosure_anchor.application.contracts.retrieval_primary import RetrievalTarget
+from disclosure_anchor.application.contracts.retrieval_primary import (
+    RetrievalTarget,
+    SearchTransform,
+)
 
 
 PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v1"
 PROVIDER_UNIT_SEMANTIC_KEY = "document_content"
+PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v1"
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -27,6 +34,10 @@ ProviderSearchDestinationKind = Literal[
     "unit_payload",
     "mixed_part",
 ]
+
+
+class ProviderUnitSearchContractError(ValueError):
+    """A persisted provider Unit cannot replay its explicit search bindings."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +127,21 @@ class ProviderUnitSearchBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderUnitEvidenceArtifact:
+    """One path-free evidence descriptor authorized by this Unit."""
+
+    sha256: str
+    size_bytes: int
+    media_type: str
+
+    def __post_init__(self) -> None:
+        if not _SHA256_RE.fullmatch(self.sha256):
+            raise ValueError("provider Unit evidence hash must be canonical")
+        if self.size_bytes < 0 or not self.media_type:
+            raise ValueError("provider Unit evidence metadata is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderUnitLocator:
     """One thin locator; the hash-bound ProviderDocument supplies all detail."""
 
@@ -125,6 +151,7 @@ class ProviderUnitLocator:
     parts: tuple[ProviderUnitPartRef, ...]
     evidence_only_block_source_indices: tuple[int, ...]
     unbound_table_parts: tuple[UnboundProviderTablePart, ...]
+    evidence_artifacts: tuple[ProviderUnitEvidenceArtifact, ...]
     search_targets: tuple[ProviderUnitSearchBinding, ...]
     contract_version: str = PROVIDER_UNIT_LOCATOR_VERSION
 
@@ -145,6 +172,9 @@ class ProviderUnitLocator:
         search_ids = [binding.source.target_id for binding in self.search_targets]
         if len(search_ids) != len(set(search_ids)):
             raise ValueError("provider unit locator cannot repeat a search target")
+        evidence_hashes = [artifact.sha256 for artifact in self.evidence_artifacts]
+        if len(evidence_hashes) != len(set(evidence_hashes)):
+            raise ValueError("provider unit locator cannot repeat evidence bytes")
         if any(
             part.part.block_source_index is None
             for part in self.unbound_table_parts
@@ -271,6 +301,14 @@ def provider_unit_locator_to_payload(
             }
             for part in locator.unbound_table_parts
         ],
+        "evidence_artifacts": [
+            {
+                "media_type": artifact.media_type,
+                "sha256": artifact.sha256,
+                "size_bytes": artifact.size_bytes,
+            }
+            for artifact in locator.evidence_artifacts
+        ],
         "search_targets": [
             {
                 "destination": {
@@ -292,18 +330,268 @@ def provider_unit_locator_to_payload(
     }
 
 
+def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
+    """Decode the persisted locator with no permissive fallback."""
+
+    root = _closed_mapping(
+        payload,
+        fields={
+            "contract_version",
+            "provider_document_sha256",
+            "unit_index",
+            "heading_chain",
+            "parts",
+            "evidence_only_block_source_indices",
+            "unbound_table_parts",
+            "evidence_artifacts",
+            "search_targets",
+        },
+        label="provider Unit locator",
+    )
+    headings = tuple(
+        _heading_from_payload(item)
+        for item in _array(root["heading_chain"], label="heading chain")
+    )
+    parts = tuple(
+        _part_from_payload(item)
+        for item in _array(root["parts"], label="provider Unit parts")
+    )
+    unbound = tuple(
+        _unbound_from_payload(item)
+        for item in _array(
+            root["unbound_table_parts"],
+            label="unbound table parts",
+        )
+    )
+    evidence = tuple(
+        _evidence_from_payload(item)
+        for item in _array(root["evidence_artifacts"], label="evidence artifacts")
+    )
+    search = tuple(
+        _search_binding_from_payload(item)
+        for item in _array(root["search_targets"], label="search targets")
+    )
+    return ProviderUnitLocator(
+        contract_version=_text(root["contract_version"], label="contract version"),
+        provider_document_sha256=_text(
+            root["provider_document_sha256"],
+            label="provider document hash",
+        ),
+        unit_index=_integer(root["unit_index"], label="unit index"),
+        heading_chain=headings,
+        parts=parts,
+        evidence_only_block_source_indices=_integer_tuple(
+            root["evidence_only_block_source_indices"],
+            label="evidence-only block indices",
+        ),
+        unbound_table_parts=unbound,
+        evidence_artifacts=evidence,
+        search_targets=search,
+    )
+
+
+def _heading_from_payload(payload: object) -> ProviderUnitHeadingRef:
+    item = _closed_mapping(
+        payload,
+        fields={"heading_id", "placement_source", "source_index"},
+        label="provider Unit heading",
+    )
+    return ProviderUnitHeadingRef(
+        heading_id=_text(item["heading_id"], label="heading id"),
+        source_index=_integer(item["source_index"], label="heading source index"),
+        placement_source=cast(
+            HeadingPlacementSource,
+            _text(item["placement_source"], label="heading placement source"),
+        ),
+    )
+
+
+def _part_from_payload(payload: object) -> ProviderUnitPartRef:
+    item = _closed_mapping(
+        payload,
+        fields={
+            "block_source_indices",
+            "kind",
+            "logical_table_index",
+            "part_index",
+            "physical_table_segment_indices",
+        },
+        label="provider Unit part",
+    )
+    return ProviderUnitPartRef(
+        part_index=_integer(item["part_index"], label="part index"),
+        kind=cast(
+            ProviderUnitPartKind,
+            _text(item["kind"], label="part kind"),
+        ),
+        block_source_indices=_integer_tuple(
+            item["block_source_indices"],
+            label="part block indices",
+        ),
+        physical_table_segment_indices=_integer_tuple(
+            item["physical_table_segment_indices"],
+            label="part segment indices",
+        ),
+        logical_table_index=_optional_integer(
+            item["logical_table_index"],
+            label="logical table index",
+        ),
+    )
+
+
+def _unbound_from_payload(payload: object) -> UnboundProviderTablePart:
+    item = _closed_mapping(
+        payload,
+        fields={"block_source_index", "physical_table_segment_index", "reason"},
+        label="provider Unit unbound table part",
+    )
+    return UnboundProviderTablePart(
+        part=ProviderTablePartRef(
+            block_source_index=_optional_integer(
+                item["block_source_index"],
+                label="unbound block index",
+            ),
+            physical_segment_index=_optional_integer(
+                item["physical_table_segment_index"],
+                label="unbound segment index",
+            ),
+        ),
+        reason=cast(
+            UnboundTablePartReason,
+            _text(item["reason"], label="unbound reason"),
+        ),
+    )
+
+
+def _evidence_from_payload(payload: object) -> ProviderUnitEvidenceArtifact:
+    item = _closed_mapping(
+        payload,
+        fields={"media_type", "sha256", "size_bytes"},
+        label="provider Unit evidence artifact",
+    )
+    return ProviderUnitEvidenceArtifact(
+        sha256=_text(item["sha256"], label="evidence hash"),
+        size_bytes=_integer(item["size_bytes"], label="evidence size"),
+        media_type=_text(item["media_type"], label="evidence media type"),
+    )
+
+
+def _search_binding_from_payload(payload: object) -> ProviderUnitSearchBinding:
+    item = _closed_mapping(
+        payload,
+        fields={
+            "destination",
+            "field",
+            "item_index",
+            "payload_ordinal",
+            "raw_block_sha256",
+            "source_index",
+            "target_id",
+            "transform",
+        },
+        label="provider Unit search binding",
+    )
+    destination = _closed_mapping(
+        item["destination"],
+        fields={"field", "item_index", "kind", "part_index"},
+        label="provider Unit search destination",
+    )
+    return ProviderUnitSearchBinding(
+        source=RetrievalTarget(
+            target_id=_text(item["target_id"], label="target id"),
+            source_index=_integer(item["source_index"], label="target source index"),
+            payload_ordinal=_integer(
+                item["payload_ordinal"],
+                label="target payload ordinal",
+            ),
+            field=_text(item["field"], label="target field"),
+            item_index=_optional_integer(item["item_index"], label="target item index"),
+            transform=cast(
+                SearchTransform,
+                _text(item["transform"], label="target transform"),
+            ),
+            raw_block_sha256=_text(
+                item["raw_block_sha256"],
+                label="target block hash",
+            ),
+        ),
+        destination=ProviderSearchDestination(
+            kind=cast(
+                ProviderSearchDestinationKind,
+                _text(destination["kind"], label="destination kind"),
+            ),
+            part_index=_optional_integer(
+                destination["part_index"],
+                label="destination part index",
+            ),
+            field=_optional_text(destination["field"], label="destination field"),
+            item_index=_optional_integer(
+                destination["item_index"],
+                label="destination item index",
+            ),
+        ),
+    )
+
+
+def _closed_mapping(
+    value: object,
+    *,
+    fields: set[str],
+    label: str,
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError(f"{label} fields are invalid")
+    if not all(isinstance(key, str) for key in value):
+        raise ValueError(f"{label} keys must be strings")
+    return cast(Mapping[str, object], value)
+
+
+def _array(value: object, *, label: str) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be an array")
+    return cast(list[object], value)
+
+
+def _integer_tuple(value: object, *, label: str) -> tuple[int, ...]:
+    return tuple(_integer(item, label=label) for item in _array(value, label=label))
+
+
+def _integer(value: object, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer")
+    return value
+
+
+def _optional_integer(value: object, *, label: str) -> int | None:
+    return None if value is None else _integer(value, label=label)
+
+
+def _text(value: object, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be text")
+    return value
+
+
+def _optional_text(value: object, *, label: str) -> str | None:
+    return None if value is None else _text(value, label=label)
+
+
 __all__ = [
     "PROVIDER_UNIT_LOCATOR_VERSION",
+    "PROVIDER_UNIT_BUILDER_VERSION",
     "PROVIDER_UNIT_SEMANTIC_KEY",
     "ProviderSearchDestination",
     "ProviderSearchDestinationKind",
     "ProviderUnitBuildResult",
     "ProviderUnitDraft",
+    "ProviderUnitEvidenceArtifact",
     "ProviderUnitHeadingRef",
     "ProviderUnitLocator",
     "ProviderUnitPartKind",
     "ProviderUnitPartRef",
     "ProviderUnitPayloadKind",
     "ProviderUnitSearchBinding",
+    "ProviderUnitSearchContractError",
+    "provider_unit_locator_from_payload",
     "provider_unit_locator_to_payload",
 ]

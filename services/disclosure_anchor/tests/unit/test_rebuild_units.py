@@ -39,13 +39,19 @@ def _parse_run(document_id: str = "doc_1") -> e.ProcessingRun:
         artifact_owner_processing_run_id="run_parse_1",
         run_kind="parse",
         status="succeeded",
-        parser_name="mineru",
-        parser_version="2.9",
-        parser_backend="pipeline",
+        parser_name="MinerU",
+        parser_version="3.4.4",
+        parser_backend="hybrid-http-client",
+        parser_method="auto",
+        parser_language="ch",
+        parser_target_identity={"effort": "medium"},
         input_raw_file_hash="sha256:" + "a" * 64,
         parser_artifact_relpath="parser_artifacts/x",
         artifact_hash="sha256:" + "b" * 64,
-        normalized_ir_relpath="derived/normalized_ir/x.json",
+        provider_document_relpath=(
+            "derived/provider_documents/cninfo/000001/pid-1/run_parse_1/"
+            "provider_document.v1.json"
+        ),
     )
 
 
@@ -67,8 +73,13 @@ class RebuildUnitsTests(unittest.TestCase):
             run.artifact_owner_processing_run_id,
             "run_parse_1",
         )
-        self.assertEqual(run.normalized_ir_relpath, "derived/normalized_ir/x.json")
-        self.assertEqual(run.parser_name, "mineru")
+        self.assertIsNone(run.normalized_ir_relpath)
+        self.assertEqual(
+            run.provider_document_relpath,
+            "derived/provider_documents/cninfo/000001/pid-1/run_parse_1/"
+            "provider_document.v1.json",
+        )
+        self.assertEqual(run.parser_name, "MinerU")
         self.assertEqual(run.input_raw_file_hash, "sha256:" + "a" * 64)
         events = [
             event
@@ -83,13 +94,17 @@ class RebuildUnitsTests(unittest.TestCase):
         )
         self.assertEqual(
             chained.source_processing_run_id,
-            result.processing_run_id,
+            "run_parse_1",
         )
         self.assertEqual(
             uow.processing_runs.get(
                 chained.processing_run_id
             ).artifact_owner_processing_run_id,
             "run_parse_1",
+        )
+        self.assertEqual(
+            uow.processing_runs.get(chained.processing_run_id).provider_document_relpath,
+            _parse_run().provider_document_relpath,
         )
 
         invalid_uow = FakeUnitOfWork()

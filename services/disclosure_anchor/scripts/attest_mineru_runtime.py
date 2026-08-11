@@ -1,11 +1,10 @@
-"""Attest the MinerU runtime bundle with a deterministic package-set digest.
+"""Measure the local MinerU client venv with a deterministic package digest.
 
-The parser target contract refuses to parse without
-``DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256``: replayed artifacts must
-name the exact parser runtime that produced them. This tool derives that
-digest from the venv's full frozen package manifest plus its interpreter
-version — it changes whenever the bundle changes and is stable otherwise.
-It never mutates anything; paste the printed line into worker.env yourself.
+This is one input to an operator/provider runtime attestation, not the complete
+remote Hybrid runtime identity. It does not observe the server image, model
+revision, MinerU config, or content-affecting server environment and therefore
+must never be copied directly into
+``DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256``. It never mutates state.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ import subprocess
 import sys
 
 
-def bundle_digest(mineru_bin: Path) -> str:
+def client_bundle_digest(mineru_bin: Path) -> str:
     python = mineru_bin.parent / "python"
     if not python.is_file():
         raise SystemExit(f"[abort] venv python not found next to {mineru_bin}")
@@ -63,12 +62,9 @@ def main(argv: list[str] | None = None) -> int:
         help="path to the venv's mineru executable (DISCLOSURE_MINERU_BIN)",
     )
     args = parser.parse_args(argv)
-    digest = bundle_digest(args.mineru_bin)
+    digest = client_bundle_digest(args.mineru_bin)
     print(digest)
-    print(
-        f"export DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256={digest}",
-        file=sys.stderr,
-    )
+    print("local client digest only; not a remote runtime attestation", file=sys.stderr)
     return 0
 
 

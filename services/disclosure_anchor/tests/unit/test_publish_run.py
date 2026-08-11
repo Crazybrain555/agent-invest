@@ -2,22 +2,21 @@
 
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
-import tempfile
+from dataclasses import replace
 import unittest
 
-from disclosure_anchor.application.contracts.normalized_ir import (
-    CURRENT_NORMALIZED_IR_VERSION,
-    normalized_ir_filename,
+from disclosure_anchor.application.contracts.provider_document_admission import (
+    AdmittedProviderDocument,
 )
-from disclosure_anchor.application.contracts.document_structure import (
-    DOCUMENT_STRUCTURE_ALGORITHM,
-    DOCUMENT_STRUCTURE_VERSION,
-    carrier_set_sha256,
+from disclosure_anchor.application.contracts.provider_unit import (
+    PROVIDER_UNIT_BUILDER_VERSION,
+    provider_unit_locator_to_payload,
+)
+from disclosure_anchor.application.services.provider_unit_builder import (
+    build_provider_units,
 )
 from disclosure_anchor.application.use_cases.publish_run import (
-    NormalizedIRPublicationGuard,
+    ProviderDocumentPublicationGuard,
     PublishRun,
     PublishRunCommand,
     _validate_candidate_unit_set,
@@ -30,8 +29,11 @@ from disclosure_anchor.domain.services.unit_hashing import (
     content_hash_aggregate,
     structure_hash_aggregate,
 )
-from tests.unit._current_ir import write_text_ir_bundle
 from tests.unit._fakes import FakeUnitOfWork
+from tests.unit.test_provider_unit_builder import (
+    _admitted,
+    _representative_document,
+)
 
 
 def _unit(
@@ -102,6 +104,15 @@ def _run(
         run_kind="parse",
         status="succeeded",
         unit_build_status="succeeded",
+        parser_name="MinerU",
+        parser_version="3.4.4",
+        parser_backend="hybrid-http-client",
+        parser_method="auto",
+        parser_language="ch",
+        provider_document_relpath=(
+            f"derived/provider_documents/cninfo/002484/pid_1/{run_id}/"
+            "provider_document.v1.json"
+        ),
         is_active=active,
         content_hash_aggregate=(
             content_hash_aggregate or content_hash_aggregate_for([])
@@ -112,7 +123,25 @@ def _run(
 
 def _uow_with_document() -> FakeUnitOfWork:
     uow = FakeUnitOfWork()
-    uow.documents.add(e.Document(document_id="doc_1", status="parsed"))
+    company = uow.companies.add(e.Company(company_id="co_1", legal_name="江海股份"))
+    security = uow.securities.add(
+        e.Security(
+            security_id="sec_1",
+            company_id=company.company_id,
+            security_code="002484",
+            exchange="SZSE",
+        )
+    )
+    uow.documents.add(
+        e.Document(
+            document_id="doc_1",
+            status="parsed",
+            company_id=company.company_id,
+            security_id=security.security_id,
+            provider="cninfo",
+            provider_document_id="pid_1",
+        )
+    )
     return uow
 
 
@@ -131,114 +160,14 @@ def _sync_run_hashes(uow: FakeUnitOfWork, run_id: str) -> None:
     )
 
 
-def _allow_whole_pdf(_run: e.ProcessingRun) -> None:
+def _allow_provider_units(**_kwargs: object) -> None:
     """Unit tests below isolate publish semantics from artifact I/O."""
-
-
-class _PathBuilder:
-    def __init__(self, root: Path) -> None:
-        self._root = root
-
-    def data_path(self, relpath: Path) -> Path:
-        return self._root / relpath
-
-
-class _UnreadablePathBuilder(_PathBuilder):
-    def data_path(self, relpath: Path) -> Path:
-        raise PermissionError("simulated shared data-store outage")
-
-
-def _normalized_ir(*, full_pdf: bool) -> dict[str, object]:
-    elements: list[dict[str, object]] = []
-    return {
-        "contract_version": CURRENT_NORMALIZED_IR_VERSION,
-        "created_at": "2026-07-25T00:00:00Z",
-        "document_id": "doc_1",
-        "source_pdf": "raw.pdf",
-        "source_pdf_sha256": "sha256:" + "a" * 64,
-        "source_pdf_page_count": 1,
-        "title": "公告",
-        "parser": {
-            "name": "MinerU",
-            "package_version": "3.4.0",
-            "backend": "pipeline",
-            "method": "auto",
-            "language": "ch",
-            "formula": False,
-            "table": True,
-            "effort": None,
-            "image_analysis": False,
-        },
-        "parser_artifacts": {
-            "artifact_root_relpath": "parser/a",
-            "files": {
-                "content_list": {
-                    "availability": "present",
-                    "relpath": "parser/a/content.json",
-                    "sha256": "sha256:" + ("a" * 64),
-                    "size_bytes": 2,
-                },
-                "model": {
-                    "availability": "present",
-                    "relpath": "parser/a/model.json",
-                    "sha256": "sha256:" + ("d" * 64),
-                    "size_bytes": 2,
-                },
-                "pdf_structure": {
-                    "availability": "present",
-                    "relpath": "parser/a/pdf_structure.json",
-                    "sha256": "sha256:" + ("b" * 64),
-                    "size_bytes": 2,
-                },
-                "source_evidence": {
-                    "availability": "present",
-                    "relpath": "parser/a/source_evidence.json",
-                    "sha256": "sha256:" + ("c" * 64),
-                    "size_bytes": 2,
-                },
-            },
-        },
-        "parsed_pages": {
-            "start_page_no": 1,
-            "end_page_no": 1,
-            "full_pdf": full_pdf,
-        },
-        "elements": elements,
-        "parser_diagnostics": {
-            "table_reconciliation": {
-                "algorithm_version": "mineru-page-local-table-closure.v6",
-                "model_hash": "sha256:" + ("d" * 64),
-                "content_tables": 0,
-                "model_tables": 0,
-                "matched_tables": 0,
-                "page_local_closed": True,
-            }
-        },
-        "structure_proof": {
-            "contract_version": DOCUMENT_STRUCTURE_VERSION,
-            "algorithm_version": DOCUMENT_STRUCTURE_ALGORITHM,
-            "source_pdf_sha256": "sha256:" + "a" * 64,
-            "source_pdf_page_count": 1,
-            "carrier_set_sha256": carrier_set_sha256(elements),
-            "native": {
-                "status": "untagged",
-                "artifact_role": "pdf_structure",
-            },
-            "headings": [],
-            "page_frames": [],
-            "conflicts": [],
-            "coverage": {
-                "heading_nodes": 0,
-                "page_frame_groups": 0,
-            },
-        },
-    }
 
 
 def _publisher(
     uow: FakeUnitOfWork,
     *,
-    publication_guard=_allow_whole_pdf,  # noqa: ANN001
+    publication_guard=_allow_provider_units,  # noqa: ANN001
 ) -> PublishRun:
     return PublishRun(
         uow_factory=lambda: uow,
@@ -246,7 +175,134 @@ def _publisher(
     )
 
 
+class _FixedAdmission:
+    def __init__(self, admitted: AdmittedProviderDocument) -> None:
+        self.admitted = admitted
+
+    def admit(self, **_kwargs: object) -> AdmittedProviderDocument:
+        return self.admitted
+
+
+def _provider_guard_fixture() -> tuple[
+    ProviderDocumentPublicationGuard,
+    e.ProcessingRun,
+    e.Document,
+    list[e.DocumentUnit],
+]:
+    admitted = _admitted(_representative_document())
+    envelope = admitted.envelope
+    document = e.Document(
+        document_id=envelope.document_id,
+        status="parsed",
+        provider=envelope.provider,
+        provider_document_id=envelope.provider_document_id,
+        raw_file_relpath=envelope.source_pdf_relpath,
+        raw_file_hash=envelope.input_raw_file_hash,
+    )
+    run = e.ProcessingRun(
+        processing_run_id=envelope.artifact_owner_processing_run_id,
+        document_id=document.document_id,
+        artifact_owner_processing_run_id=envelope.artifact_owner_processing_run_id,
+        run_kind="parse",
+        status="succeeded",
+        unit_build_status="succeeded",
+        parser_name="MinerU",
+        parser_version="3.4.4",
+        parser_backend="hybrid-http-client",
+        parser_method="auto",
+        parser_language="ch",
+        parser_target_identity=envelope.parser_target_identity.to_payload(),
+        input_raw_file_hash=envelope.input_raw_file_hash,
+        parser_artifact_relpath=envelope.parser_artifact_root_relpath,
+        artifact_hash=admitted.provider_document_sha256,
+        provider_document_relpath=admitted.provider_document_relpath.as_posix(),
+        builder_rules_version=PROVIDER_UNIT_BUILDER_VERSION,
+    )
+    units = []
+    for draft in build_provider_units(admitted).units:
+        units.append(
+            e.DocumentUnit(
+                asset_id=f"asset_{draft.unit_index}",
+                document_id=document.document_id,
+                processing_run_id=run.processing_run_id,
+                provider_document_id=document.provider_document_id,
+                payload_kind=draft.payload_kind,
+                payload=dict(draft.payload),
+                content_hash=draft.content_hash,
+                title=draft.title,
+                heading_path=list(draft.heading_path),
+                order_index=draft.unit_index + 1,
+                semantic_key=draft.semantic_key,
+                semantic_keys=list(draft.semantic_keys),
+                quality_status=draft.quality_status,
+                query_projection_hash=draft.query_projection_hash,
+                structure_hash=draft.structure_hash,
+                page_no=draft.page_no,
+                artifact_locator=provider_unit_locator_to_payload(draft.locator),
+            )
+        )
+    return (
+        ProviderDocumentPublicationGuard(_FixedAdmission(admitted)),  # type: ignore[arg-type]
+        run,
+        document,
+        units,
+    )
+
+
 class PublishRunTests(unittest.TestCase):
+    def test_provider_guard_replays_every_persisted_field(self) -> None:
+        guard, run, document, units = _provider_guard_fixture()
+
+        guard(
+            run=run,
+            document=document,
+            artifact_owner=run,
+            security_code="000001",
+            units=units,
+        )
+
+        cases = {
+            "provider_document_id": replace(
+                units[0], provider_document_id="forged"
+            ),
+            "page_no": replace(units[0], page_no=999),
+            "artifact_locator": replace(
+                units[0], artifact_locator={"contract_version": "forged.v1"}
+            ),
+        }
+        for reason, bad_unit in cases.items():
+            with self.subTest(reason=reason), self.assertRaises(PublishRunError) as caught:
+                guard(
+                    run=run,
+                    document=document,
+                    artifact_owner=run,
+                    security_code="000001",
+                    units=[bad_unit, *units[1:]],
+                )
+            self.assertEqual(
+                caught.exception.error["reason_code"],
+                f"{reason}_mismatch",
+            )
+
+    def test_provider_guard_rejects_legacy_candidate(self) -> None:
+        guard, run, document, units = _provider_guard_fixture()
+        run.provider_document_relpath = None
+        run.normalized_ir_relpath = "derived/normalized_ir/v4.json"
+
+        with self.assertRaises(PublishRunError) as caught:
+            guard(
+                run=run,
+                document=document,
+                artifact_owner=run,
+                security_code="000001",
+                units=units,
+            )
+
+        self.assertEqual(
+            caught.exception.error["error_code"],
+            "RUN_OUTPUT_CONTRACT_UNSUPPORTED",
+        )
+
     def test_first_publish_creates_unit_events_then_published(self) -> None:
         uow = _uow_with_document()
         uow.processing_runs.add(_run("run_new"))
@@ -290,70 +346,6 @@ class PublishRunTests(unittest.TestCase):
 
         self.assertTrue(result.idempotent)
         self.assertEqual(uow.outbox.all(), [])
-
-    def test_built_partial_pdf_is_rejected_before_publish_mutation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            relpath = Path(normalized_ir_filename())
-            normalized_ir = write_text_ir_bundle(
-                root, relpath, full_pdf=False
-            )
-            raw = (root / relpath).read_bytes()
-            uow = _uow_with_document()
-            run = _run("run_partial")
-            run.parser_target_identity = normalized_ir["parser"]
-            run.normalized_ir_relpath = str(relpath)
-            run.artifact_hash = "sha256:" + hashlib.sha256(raw).hexdigest()
-            uow.processing_runs.add(run)
-            uow.document_units.add(_unit("du_partial", "run_partial"))
-            _sync_run_hashes(uow, "run_partial")
-
-            with self.assertRaises(PublishRunError) as ctx:
-                _publisher(
-                    uow,
-                    publication_guard=NormalizedIRPublicationGuard(
-                        _PathBuilder(root)
-                    ),
-                ).execute(PublishRunCommand(processing_run_id="run_partial"))
-
-        self.assertEqual(
-            ctx.exception.error["error_code"],
-            "PARTIAL_PDF_NOT_PUBLISHABLE",
-        )
-        self.assertIsNone(uow.documents.get("doc_1").current_processing_run_id)
-        self.assertFalse(run.is_active)
-        self.assertEqual(run.unit_build_status, "failed")
-        self.assertEqual(
-            run.unit_build_error["error_code"],
-            "PARTIAL_PDF_NOT_PUBLISHABLE",
-        )
-        self.assertEqual(run.unit_build_attempt_count, 1)
-        self.assertEqual(uow.outbox.all(), [])
-
-        unavailable_uow = _uow_with_document()
-        unavailable_run = _run("run_storage_outage")
-        unavailable_run.normalized_ir_relpath = normalized_ir_filename()
-        unavailable_uow.processing_runs.add(unavailable_run)
-        unavailable_uow.document_units.add(
-            _unit("du_storage_outage", "run_storage_outage")
-        )
-        _sync_run_hashes(unavailable_uow, "run_storage_outage")
-        with self.assertRaises(PublishRunError) as unavailable_ctx:
-            _publisher(
-                unavailable_uow,
-                publication_guard=NormalizedIRPublicationGuard(
-                    _UnreadablePathBuilder(Path("/unused"))
-                ),
-            ).execute(
-                PublishRunCommand(processing_run_id="run_storage_outage")
-            )
-        self.assertEqual(
-            unavailable_ctx.exception.error["error_code"],
-            "IR_READ_FAILED",
-        )
-        self.assertTrue(unavailable_ctx.exception.error["retryable"])
-        self.assertEqual(unavailable_run.unit_build_status, "succeeded")
-        self.assertIsNone(unavailable_run.unit_build_error)
 
     def test_multiset_duplicate_delete_removes_one_old_unit(self) -> None:
         old_units = [

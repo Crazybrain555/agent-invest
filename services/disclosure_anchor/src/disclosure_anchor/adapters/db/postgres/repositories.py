@@ -624,19 +624,19 @@ class ProcessingRunRepository:
         row = self._session.get(models.ProcessingRun, processing_run_id)
         return mappers.processing_run_to_entity(row) if row is not None else None
 
-    def latest_succeeded_parse_for_document(
+    def latest_succeeded_provider_run_for_document(
         self, document_id: str
     ) -> Optional[e.ProcessingRun]:
         row = (
             self._session.query(models.ProcessingRun)
             .filter(
                 models.ProcessingRun.document_id == document_id,
-                # rebuild_units runs copy the parse artifact references and
-                # remain valid legacy rebuild sources through their recorded
-                # provenance chain, even when the original parse is absent.
+                # Provider rebuild runs alias one self-owned parse artifact
+                # and remain valid deterministic build candidates.
                 models.ProcessingRun.run_kind.in_(("parse", "rebuild_units")),
                 models.ProcessingRun.status == "succeeded",
-                models.ProcessingRun.normalized_ir_relpath.isnot(None),
+                models.ProcessingRun.provider_document_relpath.isnot(None),
+                models.ProcessingRun.normalized_ir_relpath.is_(None),
             )
             .order_by(
                 models.ProcessingRun.started_at.desc().nullslast(),
@@ -667,6 +667,7 @@ class ProcessingRunRepository:
             "parser_artifact_relpath",
             "artifact_hash",
             "normalized_ir_relpath",
+            "provider_document_relpath",
             "document_units_relpath",
             "content_hash_aggregate",
             "structure_hash",

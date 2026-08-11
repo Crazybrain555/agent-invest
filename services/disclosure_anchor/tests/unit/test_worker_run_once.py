@@ -71,7 +71,7 @@ def _deps() -> WorkerDeps:
         path_builder=mock.MagicMock(),
         raw_store=mock.MagicMock(),
         artifact_store=mock.MagicMock(),
-        source_evidence_validator=mock.MagicMock(),
+        provider_source=mock.MagicMock(),
         source_factory=lambda: mock.MagicMock(),
         profile_loader_factory=lambda source: (lambda code: None),
         parser_factory=lambda: mock.MagicMock(),

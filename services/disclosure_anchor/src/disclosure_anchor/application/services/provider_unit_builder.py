@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from disclosure_anchor.application.contracts.document_outline import (
@@ -35,12 +35,15 @@ from disclosure_anchor.application.contracts.provider_unit import (
     ProviderSearchDestination,
     ProviderUnitBuildResult,
     ProviderUnitDraft,
+    ProviderUnitEvidenceArtifact,
     ProviderUnitHeadingRef,
     ProviderUnitLocator,
     ProviderUnitPartKind,
     ProviderUnitPartRef,
     ProviderUnitPayloadKind,
     ProviderUnitSearchBinding,
+    ProviderUnitSearchContractError,
+    provider_unit_locator_from_payload,
 )
 from disclosure_anchor.application.contracts.retrieval_primary import (
     RetrievalPrimaryProjection,
@@ -272,6 +275,7 @@ class _BuildContext:
             parts=tuple(part.ref for part in parts),
             evidence_only_block_source_indices=tuple(evidence_only),
             unbound_table_parts=tuple(bound_unbound),
+            evidence_artifacts=self._evidence_artifacts(parts),
             search_targets=tuple(search_bindings),
         )
         heading_path = () if heading is None else heading.headpath
@@ -380,6 +384,40 @@ class _BuildContext:
             for target_id in self.target_ids_by_source[source_index]
         )
 
+    def _evidence_artifacts(
+        self,
+        parts: list[_Part],
+    ) -> tuple[ProviderUnitEvidenceArtifact, ...]:
+        roles: list[str] = []
+        for part in parts:
+            if part.ref.kind == "visual":
+                for source_index in part.ref.block_source_indices:
+                    roles.extend(self.blocks[source_index].referenced_artifact_roles)
+            for segment_index in part.ref.physical_table_segment_indices:
+                role = self.document.physical_table_segments[
+                    segment_index
+                ].crop_artifact_role
+                if role is not None:
+                    roles.append(role)
+
+        by_hash: dict[str, ProviderUnitEvidenceArtifact] = {}
+        ordered: list[ProviderUnitEvidenceArtifact] = []
+        for role in roles:
+            artifact = self.artifacts[role]
+            descriptor = ProviderUnitEvidenceArtifact(
+                sha256=artifact.sha256,
+                size_bytes=artifact.size_bytes,
+                media_type=artifact.media_type,
+            )
+            existing = by_hash.get(descriptor.sha256)
+            if existing is not None:
+                if existing != descriptor:
+                    raise ValueError("provider evidence metadata conflicts for one digest")
+                continue
+            by_hash[descriptor.sha256] = descriptor
+            ordered.append(descriptor)
+        return tuple(ordered)
+
 
 def replay_provider_unit_search_binding(
     admitted: AdmittedProviderDocument,
@@ -400,6 +438,46 @@ def replay_provider_unit_search_binding(
         title=draft.title,
         binding=binding,
     )
+
+
+def provider_unit_search_text_values(
+    *,
+    payload_kind: str,
+    payload: Mapping[str, object],
+    title: str | None,
+    artifact_locator: object,
+) -> tuple[str, ...]:
+    """Replay body atoms from one persisted provider locator, never discovery."""
+
+    try:
+        locator = provider_unit_locator_from_payload(artifact_locator)
+        values: list[str] = []
+        payload_value = dict(payload)
+        for binding in locator.search_targets:
+            _validate_binding_owner(locator=locator, binding=binding)
+            if binding.destination.kind == "unit_title":
+                if title is None or _destination_text(
+                    payload=payload_value,
+                    payload_kind=payload_kind,
+                    title=title,
+                    destination=binding.destination,
+                ) != title:
+                    raise ValueError("provider Unit title binding is invalid")
+                continue
+            destination_text = _destination_text(
+                payload=payload_value,
+                payload_kind=payload_kind,
+                title=title,
+                destination=binding.destination,
+            )
+            if binding.source.transform == "identity.v1":
+                if destination_text.strip():
+                    values.append(destination_text)
+            else:
+                values.extend(html_visible_text_segments(destination_text))
+        return tuple(values)
+    except (TypeError, ValueError) as exc:
+        raise ProviderUnitSearchContractError(str(exc)) from exc
 
 
 def _validate_binding_owner(
@@ -688,5 +766,6 @@ def _validate_build(
 
 __all__ = [
     "build_provider_units",
+    "provider_unit_search_text_values",
     "replay_provider_unit_search_binding",
 ]

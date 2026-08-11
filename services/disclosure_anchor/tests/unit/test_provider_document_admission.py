@@ -35,11 +35,14 @@ from disclosure_anchor.application.ports.provider_document_source import (
 from disclosure_anchor.application.services.provider_document_admission import (
     ProviderDocumentAdmission,
 )
-from disclosure_anchor.domain import entities as e
+from disclosure_anchor.domain import (
+    entities as e,
+)
 
 
 _SOURCE_SHA = "sha256:" + "a" * 64
 _OWNER = "run_01K0000000000000000000000"
+_REBUILD = "run_01K0000000000000000000001"
 _DOCUMENT = "doc_01K00000000000000000000000"
 _PROVIDER_DOCUMENT_ID = "1225087169"
 _RECORD_RELPATH = Path(
@@ -54,11 +57,12 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
         record = provider_document_envelope_to_bytes(envelope)
         source = _FakeSource(record=record, rebuilt=envelope.provider_document)
 
+        run = _run(artifact_hash=_sha_bytes(record))
         admitted = _admission(source).admit(
             document=_document(),
-            run=_run(artifact_hash=_sha_bytes(record)),
+            run=run,
+            artifact_owner=run,
             security_code="000001",
-            provider_document_relpath=_RECORD_RELPATH,
         )
 
         self.assertEqual(admitted.envelope, envelope)
@@ -76,6 +80,36 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_admits_rebuild_only_through_its_exact_parse_owner(self) -> None:
+        envelope = _envelope()
+        record = provider_document_envelope_to_bytes(envelope)
+        source = _FakeSource(record=record, rebuilt=envelope.provider_document)
+        owner = _run(artifact_hash=_sha_bytes(record))
+        rebuild = replace(
+            owner,
+            processing_run_id=_REBUILD,
+            run_kind="rebuild_units",
+            artifact_owner_processing_run_id=_OWNER,
+        )
+
+        admitted = _admission(source).admit(
+            document=_document(),
+            run=rebuild,
+            artifact_owner=owner,
+            security_code="000001",
+        )
+
+        self.assertEqual(admitted.envelope.artifact_owner_processing_run_id, _OWNER)
+        drifted = replace(rebuild, artifact_hash="sha256:" + "0" * 64)
+        with self.assertRaises(ProviderDocumentAdmissionError) as caught:
+            _admission(source).admit(
+                document=_document(),
+                run=drifted,
+                artifact_owner=owner,
+                security_code="000001",
+            )
+        self.assertEqual(caught.exception.reason_code, "parse_owner_identity_mismatch")
 
     def test_rejects_legacy_dual_or_ineligible_parse_owner(self) -> None:
         record = provider_document_envelope_to_bytes(_envelope())
@@ -95,8 +129,8 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
                 _admission(source).admit(
                     document=_document(),
                     run=run,
+                    artifact_owner=run,
                     security_code="000001",
-                    provider_document_relpath=_RECORD_RELPATH,
                 )
 
     def test_rejects_path_record_and_source_identity_drift(self) -> None:
@@ -105,14 +139,17 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
         cases = (
             (
                 _FakeSource(record=record, rebuilt=envelope.provider_document),
-                _run(artifact_hash=_sha_bytes(record)),
-                Path("derived/provider_documents/wrong/provider_document.v1.json"),
+                replace(
+                    _run(artifact_hash=_sha_bytes(record)),
+                    provider_document_relpath=(
+                        "derived/provider_documents/wrong/provider_document.v1.json"
+                    ),
+                ),
                 "provider_document_path_mismatch",
             ),
             (
                 _FakeSource(record=record, rebuilt=envelope.provider_document),
                 _run(artifact_hash="sha256:" + "0" * 64),
-                _RECORD_RELPATH,
                 "provider_document_hash_mismatch",
             ),
             (
@@ -125,19 +162,18 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
                     ),
                 ),
                 _run(artifact_hash=_sha_bytes(record)),
-                _RECORD_RELPATH,
                 "source_pdf_identity_mismatch",
             ),
         )
 
-        for source, run, relpath, reason_code in cases:
+        for source, run, reason_code in cases:
             with self.subTest(reason_code=reason_code):
                 with self.assertRaises(ProviderDocumentAdmissionError) as caught:
                     _admission(source).admit(
                         document=_document(),
                         run=run,
+                        artifact_owner=run,
                         security_code="000001",
-                        provider_document_relpath=relpath,
                     )
                 self.assertEqual(caught.exception.reason_code, reason_code)
 
@@ -183,12 +219,13 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
                 record=record,
                 rebuilt=original.provider_document,
             )
+            run = _run(artifact_hash=_sha_bytes(record))
             with self.assertRaises(ProviderDocumentAdmissionError) as caught:
                 _admission(source).admit(
                     document=_document(),
-                    run=_run(artifact_hash=_sha_bytes(record)),
+                    run=run,
+                    artifact_owner=run,
                     security_code="000001",
-                    provider_document_relpath=_RECORD_RELPATH,
                 )
             self.assertEqual(
                 caught.exception.reason_code,
@@ -209,8 +246,8 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
                 _admission(source).admit(
                     document=document,
                     run=run,
+                    artifact_owner=run,
                     security_code="000001",
-                    provider_document_relpath=_RECORD_RELPATH,
                 )
 
     def test_wraps_nested_envelope_value_errors_as_contract_failures(self) -> None:
@@ -226,12 +263,13 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
         ).encode("utf-8")
         source = _FakeSource(record=record, rebuilt=_provider_document())
 
+        run = _run(artifact_hash=_sha_bytes(record))
         with self.assertRaises(ProviderDocumentAdmissionError) as caught:
             _admission(source).admit(
                 document=_document(),
-                run=_run(artifact_hash=_sha_bytes(record)),
+                run=run,
+                artifact_owner=run,
                 security_code="000001",
-                provider_document_relpath=_RECORD_RELPATH,
             )
 
         self.assertEqual(
@@ -442,6 +480,7 @@ def _run(*, artifact_hash: str | None = None) -> e.ProcessingRun:
             provider_document_envelope_to_bytes(_envelope())
         ),
         normalized_ir_relpath=None,
+        provider_document_relpath=_RECORD_RELPATH.as_posix(),
     )
 
 

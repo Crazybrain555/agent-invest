@@ -77,12 +77,18 @@ _COMPATIBLE_TYPED_ANNOTATIONS = frozenset(
 class MinerUMediumArtifactReader:
     """Project the unique content-list directory subtree into diagnostic records."""
 
+    def locate_artifact_root(self, output_dir: Path) -> Path:
+        """Return the unique official artifact leaf without reading semantics."""
+
+        root = _resolved_plain_directory(output_dir)
+        return _resolved_plain_directory(_locate_content_list(root).parent)
+
     def read(self, output_dir: Path, *, source_pdf_sha256: str) -> ProviderDocument:
         if not _SHA256_RE.fullmatch(source_pdf_sha256):
             raise ParserOutputContractError("source PDF sha256 must be canonical")
         root = _resolved_plain_directory(output_dir)
-        content_path = _locate_content_list(root)
-        artifact_root = _resolved_plain_directory(content_path.parent)
+        artifact_root = self.locate_artifact_root(root)
+        content_path = _locate_content_list(artifact_root)
         stem = content_path.name.removesuffix("_content_list.json")
         expected_stem = source_pdf_sha256.replace("sha256:", "sha256_", 1)
         if stem != expected_stem:

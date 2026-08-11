@@ -75,29 +75,29 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | run_kind | parse / rebuild_units（复用解析产物只重切，5 秒级） |
 | status | running / succeeded / failed；stale running 由 worker 按阈值回收 |
 | is_active | 每文档唯一 true（发布原子切换） |
-| artifact_owner_processing_run_id | 实际拥有 parser artifact / NormalizedIR 字节的根 parse run；parse=self，rebuild 传播根 owner，不能从路径文本反推 |
-| builder_rules_version | 恒等于 rules.RULES_VERSION（当前 ub-2026.07-83）；单一代=同版本 |
+| artifact_owner_processing_run_id | 实际拥有 parser artifact 与 primary parse artifact 字节的根 parse run；parse=self，rebuild 传播根 owner，不能从路径文本反推 |
+| builder_rules_version | 新 writer 恒等于 `provider_unit.v1`；历史 run 保留原规则版本，不能回写 |
 | parser_target_identity | 产生该 run 的完整 parser target（backend/method/language/runtime bundle identity）；不从零散 parser_* 列反推 |
 | search_projection_error | 当前 retrieval_rules_version 的确定性、非重试检索投影终态；delta 不空转，full 可显式重试，成功替换时同事务清空 |
 | content_hash_aggregate / structure_hash | run 级聚合（U3）；"内容没变"只看前者 |
-| parser_* / *_relpath / artifact_hash | 解析出处与产物引用（相对路径） |
+| parser_* / normalized_ir_relpath / provider_document_relpath / artifact_hash | 解析出处与 primary artifact 引用；parse/rebuild 必须精确选择一个输出 arm。新 writer 只写私有 `provider_document_relpath`，历史 v4 只读 `normalized_ir_relpath`；`artifact_hash` 是所选 primary artifact 的精确字节哈希，public view 不暴露路径 |
 | unit_build_status/attempt_count/error | 构建生命周期；error 为结构化 {stage,error_code,retryable} |
 
 ### document_unit（L2 消费的最小可寻址单元）
 | 列 | 含义 |
 |---|---|
 | asset_id | `du_`+ULID；跨 run 不承诺同 ID，身份=content_hash |
-| payload_kind | 闭集 text / table / qa「历史值：旧产物存在、2026-07-16 起不再产出（QA 判别已移除，转写以 raw text 落地）」/ **mixed**（业务块，payload=semantic_type+有序 parts）。mixed 的 part 级 kind ∈ {text, table, **image**}；image part/壳 payload = `{image_ref, caption, context, content?, notes?, visual_kind, visual_subtype?}`，其中 image_ref = 归档视觉产物的内容寻址 sha256，visual_kind ∈ {image, chart, equation}，visual_subtype? = MinerU sub_type 透传（如 seal/bar） |
+| payload_kind | 闭集 text / table / qa（历史只读）/ **mixed**。新 writer：单一正文块提升为 text，单一逻辑表 owner 提升为 table；多块或视觉块使用 mixed，parts 按 source 顺序保存 `kind ∈ {text,table,visual}` 与 provider-native 浅字段 |
 | heading_path | jsonb 完整**源标题路径**（有 heading 时非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text；路径来自 typed heading/outline 结构，不来自 caption 或 taxonomy |
-| title | 结构叶子显示名：有标题路径时等于其叶节点；无标题文档可等于登记文档标题；table/image caption、单位、脚注不得填入 title |
-| semantic_key | 单值 L2 路由键（通用规则→监管 taxonomy→`document_content` 通用内容键）；ub-2026.07-26 新产物非空，库列仅为历史兼容仍可空；不参与标题、边界、内容归属或删除；btree 索引 |
-| semantic_keys | jsonb 非空路由键数组；无更窄概念时为 `["document_content"]`（ub-2026.07-26；库列仅为历史兼容仍可空）；GIN(jsonb_ops) 支持 `? / ?| / ?&`；任何规则升级只改变检索投影，不得改变证据 payload/boundary |
-| payload | 原始证据内容；mixed payload 还保存 `semantic_type` 与每个 part 的路径/适用性/质量/定位注解。视觉 carrier 无资产文件但仍有 typed caption/content/footnote 时，以 `needs_review` 文本证据保留这些字段及 source projection；真正无路径且无可读 typed 字段才失败。当前表格必须有非空 HTML、可解析 grid、页内 model 闭合和 crop，失败时不发布错误 payload。`content_hash` 使用去除规则与位置注解后的 canonical content projection，不直接 hash 整个 mixed payload |
-| content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；projection 含 title/heading/semantic_key(s)/quality/applicability，以及 mixed part 的规则型路径、质量和适用性注解；来源 `artifact_locator` 不进入 content/query identity |
+| title | 只取已接受 source heading 的叶节点，并与 heading_path 末项相等；无可靠 heading 时为 NULL。登记文档标题只留 document scope；caption、单位、脚注不得填入 title |
+| semantic_key | 新 writer 固定 `document_content`，仅作通用 L1→L2 路由，不推断业务 taxonomy；历史行可保留旧值或 NULL；btree 索引 |
+| semantic_keys | 新 writer 固定 `["document_content"]`；GIN(jsonb_ops) 支持 `? / ?| / ?&`；不得用 taxonomy 改写证据 payload 或边界 |
+| payload | ProviderDocument 的 source-bound 浅投影：text 保存 `{provider_type,text}`；table 保存原始 `table_body` HTML 与 caption/footnote 数组；mixed 保存 `semantic_type` 和有序 parts。视觉 part 的 `content_artifacts` 仅含 hash/size/media，使视觉内容进入 content hash；路径、raw JSON、表格 crop 不进入 payload。L1 不解析 grid、不修复 cell、不用 middle HTML 覆盖 content-list owner |
+| content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；content 绑定 payload（含视觉内容 digest），query 绑定 title/heading/key/quality/applicability，structure 绑定 kind/path/order。locator/page/provider identity 不混入哈希，发布前由 fresh ProviderDocument admission + deterministic rebuild 精确复核 |
 | quality_status | ok / needs_review / unusable（乱码率>30%） |
 | applicability | vc16 CHECK：applicable / not_applicable / NULL（√适用声明列化；见 §5 讨论） |
 | page_no | 定位列（artifact_locator 首页码） |
-| artifact_locator | jsonb（order_index/page_no/bbox/merge 信息）；table locator 只定位一个物理页的 canonical table，不含跨页 aggregate/ghost 映射。物理相邻行不因 page-edge/表框对齐而伪造 semantic merge 或 `needs_review`。mixed 的每个 part 保留自己的 locator，不能只读 unit 顶层；`merged_cells` 坐标统一相对 `[headers, *rows]` source grid；JSONB(none_as_null) |
+| artifact_locator | 新 writer 为闭合的 `provider_unit_locator.v1`：绑定 ProviderDocument hash、source heading/block、parts、逻辑表 owner 与逐页 physical segment、无路径 evidence descriptors、显式 search bindings。跨页关系只接受 MinerU merge-on 的 typed owner/stub assertion；不按相似度猜、不复制 HTML、不存 raw JSON/path；JSONB(none_as_null) |
 
 ### classification_rule（0016，词表的库内查询副本）
 | 列 | 含义 |
@@ -151,9 +151,9 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 | 文件 | 内容 | 当前版本 |
 |---|---|---|
-| application/services/unit_builder/rules.py | source-bound structure proof 消费 + retrieval taxonomy（taxonomy 不改变证据或边界） | RULES_VERSION ub-2026.07-83 |
-| application/contracts/schema_sources/normalized_ir.v4.json | 当前 NormalizedIR v4 JSON Schema 唯一真源；`contracts/normalized_ir/normalized_ir.v4.json` 只能由 `export_contracts` 生成；v2/v3 只读历史 artifact 不得直接发布 | normalized_ir.v4 |
-| application/services/unit_builder/note_key_map.json | 章节词表 **173 键、391 标签**（section facet；祖先继承+全类型开放） | 2026-07-r18 |
+| application/contracts/provider_document_envelope.py | 新 writer 的 canonical primary parse artifact codec；必须经独立 PDF 校验与 MinerU bundle 全量重读 admission，codec 本身不是 source trust boundary | provider_document.v1 |
+| application/contracts/provider_unit.py + application/services/provider_unit_builder.py | 闭合 Unit locator/search binding 与 deterministic coarse Unit 投影；不含业务 taxonomy、proof graph 或 cell repair | provider_unit.v1 |
+| application/contracts/normalized_ir_v4_evidence.py | 冻结历史 v4 evidence manifest 的最小只读 resolver；不得被新 writer import，也不支持 Build/Publish/Rebuild | normalized_ir.v4 read-only |
 | adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs；r6 financing +011711 担保/011713 财务资助、meeting_resolution +01239910；r7 equity_share_change +0115 父级实码） | 2026-07-r7 |
 | adapters/sources/cninfo/facet_map.json | F006V 维度判定（market 精确码/publisher 0101） | 2026-07-r1 |
 | adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（intermediary carrier 词最前，briefing/inquiry 在定期报告前）+ 65 个 title_topic 词补码盲区 + 18 个 title_noise hard pattern。r12 金融复核将 41 个事实 pattern 与 26 个待可靠去重 pattern 移出绝对门（例行但含股本、稀释、债务、现金、募投或风险新事实的公告不再按标题硬杀）；r13 恢复 6 条自我标识副本/序次重复项（英文版/（英文）/H股季报年报/ST 退市链第 N 次提示），此类标题自带副本标识，无需主件 linkage 键 | 2026-07-r13 |
@@ -175,10 +175,9 @@ text+CHECK（int 码是无 CHECK 时代的习惯），存储差异在本规模�
 **semantic_key 用英文还是中文（round13 决策：英文规范键 + 词表即中文标签层）**：
 键是机器路由标识，ASCII 标识符在 SQL/API/代码中零引号零编码负担；XBRL 正是这个
 模式（英文 element name + 中文 standard label），tushare 同理（英文字段+中文文档）。
-中文层已经存在——note_key_map 的 names/aliases 与 class_map 的 zh 就是受控中文标签，
-即双语词典本体；L2 查询侧中文→键的映射用它们（06R 同义词表正式化）。不做中英双写键
-（同概念两拼写会碎化过滤）。若要行内可见中文，06R 投影的 controlled_keywords 可带
-中文标签进 search_text。
+新 Provider writer 不再在 L1 推断章节 taxonomy，统一写 `document_content`。若 L2 后续需要受控
+业务键，应在自己的派生层建立英文规范键与中文标签映射，不能回写 L1 payload、标题或边界；
+也不做同一概念的中英双写键。
 
 **semantic_keys 为什么用 jsonb 数组不用关联表**：多值标签三种形态中，
 jsonb+GIN（现状）查询 `? key` 走索引（已 EXPLAIN 验证）、随行读取零 join；

@@ -942,6 +942,7 @@ def _processing_run_checks(settings: Settings, engine: Engine) -> list[CheckResu
         rows = conn.execute(
             text(
                 f"SELECT processing_run_id, status, normalized_ir_relpath, "
+                f"provider_document_relpath, "
                 f"artifact_hash, error, unit_build_status, document_units_relpath, "
                 f"content_hash_aggregate FROM {CORE_SCHEMA}.processing_run "
                 "WHERE status IN ('succeeded', 'failed') "
@@ -955,12 +956,26 @@ def _processing_run_checks(settings: Settings, engine: Engine) -> list[CheckResu
     for row in rows:
         run_id = row["processing_run_id"]
         if row["status"] == "succeeded":
+            normalized_relpath = row["normalized_ir_relpath"]
+            provider_relpath = row["provider_document_relpath"]
+            if (normalized_relpath is None) == (provider_relpath is None):
+                checks.append(
+                    _fail(
+                        "primary parse artifact",
+                        f"{run_id} must reference exactly one primary output",
+                    )
+                )
+                continue
             checks.append(
                 _check_artifact_hash(
                     settings=settings,
-                    name="normalized IR artifact",
+                    name=(
+                        "provider document artifact"
+                        if provider_relpath is not None
+                        else "normalized IR artifact"
+                    ),
                     object_id=run_id,
-                    relpath=row["normalized_ir_relpath"],
+                    relpath=provider_relpath or normalized_relpath,
                     expected_hash=row["artifact_hash"],
                 )
             )

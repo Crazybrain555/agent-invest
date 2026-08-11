@@ -138,14 +138,15 @@ L2
 
 **单元边界是业务语义块，不是 parser 元素**（2026-07-06 phase008 审查定案）：
 一个 unit 必须表达一个完整的章节证据块——大到足以让 L2 命中其中任一内容后取得该真实章节下
-连续出现的文字、表格和视觉证据。payload kind（text/table/image）、caption 文本、监管 taxonomy、
+连续出现的文字、表格和视觉证据。payload kind（text/table/mixed）、caption 文本、监管 taxonomy、
 页码、字符数和 token 数都不决定边界。边界只来自可回放的源结构：
 
 - 有 typed heading 时，以完整标题树中的**具体 occurrence**为边界；相同标题文字在不同位置仍是
   不同 occurrence；
 - 同一 occurrence 下连续出现的 text/table/image 合成一个 `mixed`，parts 保持原顺序、原 payload、
   适用性和各自 locator；遇到下一个真实 heading 才闭合；
-- 没有 heading 的文档只能锚到登记文档标题，不能把 table/image caption、单位、脚注或业务短语
+- 没有可靠 heading 的内容进入 `title=null, heading_path=[]` 的 coarse root unit；登记文档标题只留
+  document scope，不能复制成 Unit 标题，也不能把 table/image caption、单位、脚注或业务短语
   提升为虚构章节；
 - 原生文字 occurrence 的几何不可用时，保留同页其余可定位文字，并以类型化 issue + hash-bound
   无损整页图闭合；视觉护栏补足证据模态但不产生标题、父子关系或业务边界；
@@ -411,8 +412,8 @@ payload_kind
 heading_path
 title
 order_index
-semantic_key（ub-2026.07-26 新产物必有；历史 run 可空）
-semantic_keys（ub-2026.07-26 新产物为非空数组；无窄键时为 document_content）
+semantic_key（Provider writer 固定为 document_content；历史 run 可空或保留旧值）
+semantic_keys（Provider writer 固定为 [document_content]）
 payload
 content_hash
 quality_status
@@ -445,8 +446,9 @@ artifact_locator（可选）
     "一、报告期内公司从事的主要业务"
   ],
   "title": "报告期内公司从事的主要业务",
-  "semantic_key": "business_overview",
+  "semantic_key": "document_content",
   "payload": {
+    "provider_type": "text",
     "text": "报告期内，铝电解电容器……"
   }
 }
@@ -477,31 +479,21 @@ artifact_locator（可选）
     "按账龄披露"
   ],
   "title": "按账龄披露",
-  "semantic_key": "receivable_aging",
+  "semantic_key": "document_content",
   "payload": {
-    "unit": "元",
-    "headers": ["账龄", "期末账面余额", "期初账面余额"],
-    "rows": [
-      ["1 年以内（含1 年）", "1,765,831,017.43", "1,653,778,854.38"],
-      ["1 至2 年", "23,872,757.96", "35,360,192.57"],
-      ["2 至3 年", "14,382,374.82", "7,076,511.89"],
-      ["3 年以上", "73,573,362.32", "78,454,116.92"],
-      ["3 至4 年", "1,443,796.67", "11,272,000.94"],
-      ["4 至5 年", "5,272,677.17", "450,708.56"],
-      ["5 年以上", "66,856,888.48", "66,731,407.42"],
-      ["合计", "1,877,659,512.53", "1,774,669,675.76"]
-    ],
-    "notes": []
+    "provider_type": "table",
+    "table_body": "<table><tr><th>账龄</th><th>期末账面余额</th><th>期初账面余额</th></tr><tr><td>1 年以内（含1 年）</td><td>1,765,831,017.43</td><td>1,653,778,854.38</td></tr></table>",
+    "table_caption": ["按账龄披露"],
+    "table_footnote": []
   }
 }
 ```
 
-> 示例取自江海股份（002484）2025 年年度报告"第八节 财务报告 / 应收账款 / 按账龄披露"。注意原表中"3 年以上"为小计行，其下再拆"3 至4 年 / 4 至5 年 / 5 年以上"三个子区间，下游做"合计=各账龄之和"校验时应避免重复计数。
-
-canonical `table` 一张只对应一个物理页。MinerU 的跨页合并在 provider 进程中关闭；
-content/model 必须以同页唯一 bbox 和完全相同的 logical cells 一一闭合，失败即中止解析。
-后续若证明多个页内表属于同一逻辑表，只能发布独立派生关系，不能改写 canonical grid、
-HTML、title、章节边界或来源 hash。
+新 writer 保留 MinerU 3.4.4 Hybrid-medium merge-on 的 provider-native 表达：非空
+content-list owner 携带唯一可见/可检索的原始聚合 HTML；后续空 stub 不另发正文，而在 locator
+中连接逐页 physical segment、crop、page/bbox 和 raw hash。L1 不把 HTML 解析成 canonical grid，
+不修 cell，不用 middle HTML 覆盖 owner，也不按相似度自行跨页合表。关系不闭合时保留原始
+ProviderDocument occurrence 并 fail closed 或 `needs_review`，不得造逻辑 owner。
 
 ## 6.4 qa 单元
 
@@ -531,13 +523,10 @@ HTML、title、章节边界或来源 hash。
 
 适用于同一个已证明结构区间内 text 与 table（或 image）交替的场景：短公告整体、
 股东会/董事会的一个 source-proved section、年报里的一个业务小节（研发投入、附注某科目）。
-payload 是有序 parts；每个
-part 的形状复用对应 kind 的 payload schema（part 级 `kind` ∈ {text, table, image}；image
-part 另带 `visual_kind` ∈ {image, chart, equation} 与可选 `visual_subtype`——MinerU sub_type
-透传，如 seal/bar），另带 `kind`、`order`，以及可选的 `local_heading`（**历史字段，新产物不再
-产出**——被公开深度挤出的深层子标题现各自成 unit，仅存于冻结的历史 fixture 与哈希输入枚举）、
-`heading_path`（document 级坍缩时的完整路径）、`applicability`、`quality_status`、
-`artifact_locator`。定位信息属于各 part，消费者不能只读取 mixed unit 顶层 locator。
+payload 是有序 parts；每个 part 只保存 `kind`、`provider_type` 与该 provider type 的浅字段。
+视觉 part 额外保存内容型 artifact 的 `{sha256,size_bytes,media_type}`，使图像变化进入
+`content_hash`；路径、crop、bbox、search binding 与 supporting evidence 只在 Unit 顶层
+`provider_unit_locator.v1`，不复制到每个 part，也不形成第二套证据图。
 
 ```json
 {
@@ -547,9 +536,9 @@ part 另带 `visual_kind` ∈ {image, chart, equation} 与可选 `visual_subtype
   "payload": {
     "semantic_type": "section",
     "parts": [
-      {"kind": "text", "order": 12, "text": "审议结果：通过\n表决情况："},
-      {"kind": "table", "order": 13, "headers": ["股东类型", "同意"], "rows": [["A股", "99.98%"]], "caption": [], "unit": null, "notes": []},
-      {"kind": "text", "order": 14, "text": "会议决定，聘请天健会计师事务所……"}
+      {"kind": "text", "provider_type": "text", "text": "审议结果：通过\n表决情况："},
+      {"kind": "table", "provider_type": "table", "table_body": "<table><tr><td>A股</td><td>99.98%</td></tr></table>", "table_caption": [], "table_footnote": []},
+      {"kind": "text", "provider_type": "text", "text": "会议决定，聘请天健会计师事务所……"}
     ]
   }
 }
@@ -612,45 +601,47 @@ part 另带 `visual_kind` ∈ {image, chart, equation} 与可选 `visual_subtype
 
 ## 7.2 artifact_locator
 
-`artifact_locator` 是可选的**技术位置**，用于回到 parser artifact 的真实页、bbox 与元素。
-`title`、heading_path 或 caption 发生争议时，必须沿 locator 回到 NormalizedIR、MinerU page/model
-artifact 和原始 PDF 查证；缺 locator 或源字段不是“保守猜一个值”的理由，而是 parser 质量故障。
+`artifact_locator` 是可选的**技术位置**。新产物使用闭合的
+`provider_unit_locator.v1`，绑定 `provider_document.v1` hash、source block index、标题链、
+Unit parts、物理表格段、evidence digest 与显式 search target。`title`、heading_path 或 caption
+发生争议时，必须沿 locator 回到 ProviderDocument、MinerU 原始 artifact 和不可变 PDF 查证；
+缺 locator 或源字段不是“保守猜一个值”的理由，而是 parser 质量故障。
 
 它可以包含：
 
 ```text
-order_index
-page_no
-bbox
-merged_cells
+contract_version
+provider_document_sha256
+heading_chain
+parts / physical_table_segment_indices
+evidence_artifacts
+search_targets
 ```
 
-以江海股份 receivable_aging 单元为例（document 来自 CNINFO textid `1225087169`）：
+示意：
 
 ```json
 {
-  "order_index": 312,
-  "page_no": 88,
-  "bbox": [91.0, 166.0, 906.0, 691.0],
-  "merged_cells": [{"row": 0, "col": 0, "rowspan": 2, "colspan": 1}]
+  "contract_version": "provider_unit_locator.v1",
+  "provider_document_sha256": "sha256:...",
+  "heading_chain": [{"source_index": 42, "placement_source": "numbering"}],
+  "parts": [{"part_index": 0, "block_source_indices": [43, 44],
+              "physical_table_segment_indices": [7, 8]}]
 }
 ```
 
-它指回 parser 产物中该表所在物理页，便于人工复核或重解析。当前 parser 不生产跨页
-aggregate table、ghost carrier 或 aggregate locator；每个 locator 只描述本页 canonical
-table。page-edge、表框横向对齐和相邻 model row 只能作为后续关系推导的输入，不能证明
-“断词续行”或反向改写页内 evidence。任何 content/model 缺失、歧义或不等价都在解析时
-fail closed，而不是用 `needs_review` 掩盖未闭合的表格证据。
-`merged_cells` 坐标始终相对最终 `[headers, *rows]` full grid。headers 仅在源 HTML 携带
-`<th>` 证据时非空（用户 2026-07-16 裁决：无证据不做首行提升，完整网格忠实保留在 rows，
-表头解释归 L2/视图层——本节示例中的 headers 值仅适用于有 th 证据的表）。mixed 中每个
-part 可有自己的 locator，unit 顶层 locator 不替代它；locator 不是 agent 的主查询键。
+MinerU merge-on 输出中的非空 content-list table owner 是唯一逻辑/检索 payload；后续空 table
+stub 不另发正文，只通过 locator 连接其逐页 physical segment、crop、page/bbox 和 raw hash。
+ProviderDocument 永久保留 owner/stub 与所有 page-local segment；L1 不解析 grid、不修 cell、
+不按相似度跨页合表。关系证据缺失或歧义时保留 provider occurrence 并 fail closed 或标记
+`needs_review`，绝不猜 owner。locator 不是 agent 的主查询键。
 
 locator 中登记的视觉 evidence artifact 通过
 `GET /v1/units/{asset_id}/evidence/{sha256}` 读取。请求只携带 unit 身份与内容 digest，
 不得携带或推导文件路径；服务先确认 digest 被该 unit（含 mixed part）引用，再校验
-processing run 登记的 NormalizedIR hash、v4 manifest descriptor 及返回 bytes 的
-size/hash/media type。未被 unit 引用的 digest 返回 `NOT_FOUND`；已发布 descriptor、manifest
+processing run 登记的 primary artifact hash、provider manifest（新产物）或冻结 v4 manifest
+（历史产物）及返回 bytes 的 size/hash/media type。分派只看 locator contract，不靠文件存在性
+或 parser 名猜版本。未被 unit 引用的 digest 返回 `NOT_FOUND`；已发布 descriptor、manifest
 或文件发生缺失/漂移时返回明确的 `EVIDENCE_INTEGRITY_ERROR`，不得伪装成 404。
 
 ## 7.3 第一版追溯锚
@@ -674,9 +665,10 @@ exact table snapshot= {"账龄":"1 年以内（含1 年）","期末账面余额"
 
 ## 8.1 通用优先级
 
-先从 parser typed heading、编号语法、TOC 对账和布局层级恢复完整标题树；再以具体 heading
+先从 parser typed heading、编号语法、TOC 对账和布局层级恢复保守标题树；再以具体 heading
 occurrence 划分连续 source carriers。表格、文字、图片、适用性声明和关联 caption 都是该结构下
-的证据 parts，不是新的边界。没有标题结构时使用登记文档标题作为唯一 document anchor。
+的证据 parts，不是新的边界。没有可靠标题结构时生成 `title=null, heading_path=[]` 的 coarse
+unit；登记文档标题只留 document scope，不复制进 Unit 或 A-weight body。
 
 不使用业务短语白名单/黑名单、监管 taxonomy、payload kind、页码、固定字符数、固定 token 数
 或 overlap 作为持久化边界。编号语法只说明源文档的 outline 形态，不说明其金融主题。
@@ -706,7 +698,8 @@ payload 中，不能互相冒充。表格与同一 heading occurrence 下的相�
 
 ## 9.1 证据守恒
 
-NormalizedIR 中每个非空 source carrier 默认都必须进入 unit payload、mixed part、结构化投影或
+ProviderDocument 中每个非空 source carrier 默认都必须进入 unit payload、mixed part、标题投影、
+明确的 continuation/evidence-only 位置或
 明确可审计的结构去重记录。L1 不根据“投资价值”、监管主题、标题短语或模板词表删除内容。
 目录、释义、责任声明、风险提示、签章、联系方式、标准财务报表等只要 parser 识别为非空正文，
 都仍是可检索证据；是否进入某个 L2 任务由检索路由和 context packaging 决定。
@@ -716,8 +709,9 @@ NormalizedIR 中每个非空 source carrier 默认都必须进入 unit payload�
 允许不生成独立业务 unit 的范围仅限：
 
 - parser 明确标注且经页边位置或跨页重复证明的页码、running header/footer；
-- provider 明确声明为非内容且可由 source contract 验证的空载体；当前 MinerU table 不属于
-  该类，空 HTML/grid/crop 会使解析失败；
+- provider 明确声明为非内容且可由 source contract 验证的空载体；MinerU merge-on 的空 table
+  continuation stub 仅在它与 page-local deleted segment、前序逻辑 owner 唯一绑定时属于该类，
+  其逐页 crop/HTML/page/bbox 仍保留为 evidence；
 - 与登记元数据逐字相等、且所有来源位置均保存在 locator/统计中的重复封面或证券元数据；
 - 没有内容寻址视觉资产、没有 caption、没有可用文本的纯空视觉载体。
 
@@ -854,7 +848,7 @@ company("002484").filings(
 filing.text_units()
 filing.tables()
 filing.qa_items()
-filing.units(semantic_key="receivable_aging")
+filing.units(semantic_key="document_content")
 filing.units(heading_path="第三节/管理层讨论与分析")
 ```
 
@@ -867,9 +861,8 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - `payload_kind`；
 - `heading_path`；
 - `semantic_key`；
-- `semantic_keys`（0013 起的 jsonb 数组列；**mixed 单元的召回必须用它**——单值
-  `semantic_key` 查不到并入 parts 的 key；ub-2026.07-26 新产物至少含
-  `document_content` 通用内容键）；
+- `semantic_keys`（0013 起的 jsonb 数组列；新 Provider writer 固定为
+  `["document_content"]`，历史 run 仍可带旧的窄键）；
 - `applicability`（0010 起，节适用性一等筛选列）；
 - `page_no`（0010 起，定位与审查的一等筛选参数）；
 - `quality_status`；
@@ -961,14 +954,16 @@ order_index
 另投影 `query_projection_hash`（document_unit 存储列，05-U2 查询投影哈希）——0007 新增共
 6 列，至 04R-R7 为 32 列（仅历史基线）。
 
-0008 迁移起，`processing_runs_v1` 投影 `builder_rules_version`，用于 05-U6 builder 规则
-归因；历史 run 可为 NULL，05 builder 成功落库的 run 必须等于当前 `rules.RULES_VERSION`。
+0008 迁移起，`processing_runs_v1` 投影 `builder_rules_version`，用于确定性 Unit builder 归因；
+历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 必须等于 `provider_unit.v1`。
 
 0031 迁移起，`processing_runs_v1` 只额外暴露不透明的
 `artifact_owner_processing_run_id`：parse run 指向自身，`rebuild_units` 指向实际拥有
-parser artifact / NormalizedIR 字节的根 parse run。public view 不暴露相对路径；
-evidence resolver 经 owner run 的 hash、document 和 run_kind 校验后使用统一 PathBuilder
-定位，禁止把 unit producer run 当成 artifact owner，也禁止从路径词面猜 owner。
+parser artifact 与 primary parse artifact 字节的根 parse run。0032 为 core 增加私有
+`provider_document_relpath`，parse/rebuild 必须在历史 `normalized_ir_relpath` 与新路径之间精确
+选择一个；public view 仍不暴露任何相对路径。evidence resolver 经 owner run 的 hash、document、
+run_kind 与 locator contract 校验后使用统一 PathBuilder 定位，禁止把 unit producer run 当成
+artifact owner，也禁止从文件存在性或路径词面猜版本。
 
 0010–0016 迁移起的 `document_units_v1` 增量列使当前列全集达到 **41 列**：04R-R7 的
 32 列 + 0010 `applicability`/`page_no` + 0011 `is_active_run` + 0013 `semantic_keys` +

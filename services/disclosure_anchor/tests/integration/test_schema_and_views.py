@@ -105,6 +105,7 @@ class SchemaShapeTests(unittest.TestCase):
             {
                 "artifact_owner_processing_run_id",
                 "parser_target_identity",
+                "provider_document_relpath",
                 "search_projection_error",
             },
             processing_run_columns,
@@ -115,6 +116,7 @@ class SchemaShapeTests(unittest.TestCase):
                 "ck_processing_run_rebuild_artifact_owner",
                 "fk_processing_run_artifact_owner",
                 "ck_processing_run_parser_target_identity",
+                "ck_processing_run_primary_output_exactly_one",
                 "ck_processing_run_search_projection_error",
             },
             processing_run_constraints,

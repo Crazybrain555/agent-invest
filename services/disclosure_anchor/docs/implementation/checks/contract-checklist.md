@@ -89,10 +89,10 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
 0011 起 document_unit.payload_kind 增加 'mixed'（round3 P0#1 业务语义块：
   当前 semantic_type = document / section，payload.parts 承载同一 source-proved
   结构区间内的有序部件；监管 taxonomy 不参与切分）
-0013 起 document_unit 增加 semantic_keys（jsonb 数组 = 单元自身 semantic_key ∪ mixed
-  parts 的 semantic_key；GIN 部分索引支持 `semantic_keys ? 'revenue_breakdown'`；
-  纳入 query_projection_hash 与 outbox PROJECTION_FIELDS；ub-2026.07-26 新产物在无更窄
-  受控键时以 `document_content` 兜底，因此 scalar/array 均非空，SQL NULL 只兼容历史 run）
+0013 起 document_unit 增加 semantic_keys（jsonb 数组；GIN 部分索引）；新 Provider writer
+  不做 L1 业务 taxonomy，`semantic_key='document_content'` 且
+  `semantic_keys=['document_content']`，并纳入 query_projection_hash 与 outbox
+  PROJECTION_FIELDS。历史 run 可保留旧窄键或 SQL NULL；不得用键改变 source payload/boundary
 0015 起 document_units_v1 增加 heading_path_text（视图内派生的面包屑文本
   "第八节 财务报告 > … > 75、其他综合收益"——多级标题的可检索形态；不入库、
   不进哈希；06R 投影将对同一字段建 FTS 索引）
@@ -134,9 +134,10 @@ target/part 连接。`atom_text` 是 NFKC+casefold 候选投影，不是证据�
 
 `processing_runs_v1`（0031）暴露
 `artifact_owner_processing_run_id` opaque provenance id，但继续禁止暴露
-`normalized_ir_relpath` / `parser_artifact_relpath`。parse owner=self；
+`normalized_ir_relpath` / `provider_document_relpath` / `parser_artifact_relpath`。parse owner=self；
 rebuild owner 必须解析到同 document 的根 parse run，且 producer/owner artifact hash
-一致。
+一致。0032 只增加 private provider path 并将新 writer 队列限制为 provider-native；public
+view 列集不变。
 
 检查项：
 

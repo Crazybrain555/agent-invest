@@ -1,63 +1,34 @@
-"""Build document_unit snapshots from supported NormalizedIR generations."""
+"""Build document Units from one source-admitted provider document."""
 
 from __future__ import annotations
 
-import hashlib
-import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 from typing import Any, cast
 
-from disclosure_anchor.application.contracts.normalized_ir import (
-    CURRENT_NORMALIZED_IR_VERSION,
-    NormalizedIRVersionError,
-    validate_normalized_ir_contract,
-    validate_normalized_ir_identity,
-    validate_normalized_ir_path_version,
-    validate_reconciliation_generation,
+from disclosure_anchor.application.contracts.provider_document_admission import (
+    ProviderDocumentAdmissionError,
 )
-from disclosure_anchor.application.contracts.normalized_ir_table_reconciliation import (
-    TableReconciliationContractError,
-    UnsupportedTableReconciliationAlgorithm,
-    assess_normalized_ir_table_reconciliation,
-)
-from disclosure_anchor.application.contracts.parser_target import (
-    ParserTargetIdentity,
-    ParserTargetIdentityError,
-)
-from disclosure_anchor.application.contracts.unit_source_projection import (
-    payload_page_no,
+from disclosure_anchor.application.contracts.provider_unit import (
+    PROVIDER_UNIT_BUILDER_VERSION,
+    ProviderUnitBuildResult,
+    ProviderUnitDraft,
+    provider_unit_locator_to_payload,
 )
 from disclosure_anchor.application.ports.file_store import (
     ArtifactStorePort,
     ArtifactWriteResult,
     FileStorePathPort,
 )
-from disclosure_anchor.application.ports.source_evidence import (
-    SourceEvidenceValidationError,
-    SourceEvidenceValidatorPort,
-    VerifiedParserArtifact,
-)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
-from disclosure_anchor.application.services.data_file_reader import (
-    DataFileMissingError,
-    DataStoreReadError,
-    read_data_file_bytes,
+from disclosure_anchor.application.services.provider_document_admission import (
+    ProviderDocumentAdmission,
 )
-from disclosure_anchor.application.services.document_unit_audit import (
-    AuditDocumentMetadata,
-)
-from disclosure_anchor.application.services.unit_builder import rules
-from disclosure_anchor.application.services.unit_builder.builder import (
-    ImageArtifactResolver,
-    ResolvedImageArtifact,
-    SourceEvidenceClosureError,
-    UnitDraft,
-)
-from disclosure_anchor.application.services.unit_preparation import (
-    prepare_and_audit_units,
+from disclosure_anchor.application.services.provider_unit_builder import (
+    build_provider_units,
 )
 from disclosure_anchor.application.worker.locks import (
     exclusive_document_producer,
@@ -75,6 +46,7 @@ from disclosure_anchor.domain.value_objects.semantic_key import (
     SemanticKeyInvariantError,
     validate_semantic_key_state,
 )
+
 
 SNAPSHOT_KEYS = {
     "applicability",
@@ -113,149 +85,94 @@ class BuildUnitsResult:
 
 
 class BuildUnits:
+    """Materialize the deterministic provider projection under one document lock."""
+
     def __init__(
         self,
         *,
         path_builder: FileStorePathPort,
         artifact_store: ArtifactStorePort,
         uow_factory: Callable[[], UnitOfWork],
-        source_evidence_validator: SourceEvidenceValidatorPort,
+        admission: ProviderDocumentAdmission,
     ) -> None:
         self._paths = path_builder
         self._artifact_store = artifact_store
         self._uow_factory = uow_factory
-        self._source_evidence_validator = source_evidence_validator
+        self._admission = admission
 
     def execute(self, command: BuildUnitsCommand) -> BuildUnitsResult:
         initial = self._load_context(command)
-        run = initial["run"]
-        # The producer UoW owns both corpus admission and the document lease
-        # across IR/image reads, snapshot writes, and every DB transaction.
-        with exclusive_document_producer(
-            self._uow_factory,
-            run.document_id,
-        ):
+        run = cast(e.ProcessingRun, initial["run"])
+        with exclusive_document_producer(self._uow_factory, run.document_id):
             return self._execute_owned(command)
 
-    def _execute_owned(
-        self,
-        command: BuildUnitsCommand,
-    ) -> BuildUnitsResult:
-        # Re-read after document admission. A concurrent winner may have
-        # completed between initial resolution and the document lease.
+    def _execute_owned(self, command: BuildUnitsCommand) -> BuildUnitsResult:
         context = self._load_context(command)
-        run = context["run"]
+        run = cast(e.ProcessingRun, context["run"])
         try:
-            normalized_ir = self._load_ir(
-                Path(run.normalized_ir_relpath or ""),
-                expected_artifact_hash=run.artifact_hash,
-                expected_document_id=run.document_id,
-                expected_parser_target=run.parser_target_identity,
+            admitted = self._admission.admit(
+                document=cast(e.Document, context["document"]),
+                run=run,
+                artifact_owner=cast(e.ProcessingRun, context["artifact_owner"]),
+                security_code=cast(str, context["security_code"]),
             )
-            parsed_pages = normalized_ir.get("parsed_pages")
-            if (
-                not isinstance(parsed_pages, dict)
-                or parsed_pages.get("full_pdf") is not True
-            ):
+            build = build_provider_units(admitted)
+            if build.unassigned_table_parts:
                 raise BuildUnitsError(
                     self._structured_error(
-                        error_code="PARTIAL_PDF_NOT_PUBLISHABLE",
+                        error_code="UNASSIGNED_TABLE_EVIDENCE",
                         message=(
-                            "page-range diagnostic parses cannot enter the "
-                            "document-unit publication pipeline"
-                        ),
-                    )
-                )
-            evidence = self._source_evidence_validator.validate(
-                normalized_ir,
-                load_artifact=lambda role: self._load_hashed_parser_artifact(
-                    normalized_ir,
-                    role=role,
-                ),
-            )
-            document = context["document"]
-            security = context["security"]
-            # Retrieval taxonomy consumes the classification materialized on
-            # the document.  Parser/build structure must never be reclassified
-            # from provider metadata or title text at this downstream stage.
-            filing_type = document.class_filing_type
-            image_hashes_by_role: dict[str, str] = {}
-            drafts, stats, report = prepare_and_audit_units(
-                normalized_ir=normalized_ir,
-                filing_type=filing_type,
-                metadata=AuditDocumentMetadata(
-                    document_id=document.document_id,
-                    title=document.title,
-                    filing_type=filing_type,
-                    security_code=security.security_code,
-                ),
-                image_artifact_resolver=self._image_artifact_resolver(
-                    normalized_ir,
-                    image_hashes_by_role=image_hashes_by_role,
-                ),
-                image_hash_provider=lambda: _image_hashes_by_source(
-                    normalized_ir,
-                    image_hashes_by_role=image_hashes_by_role,
-                ),
-                source_proof=evidence.proof,
-            )
-            if not report.ok:
-                sample = "; ".join(
-                    f"{finding.code}:{finding.source_ref or '-'}"
-                    for finding in report.findings[:8]
-                )
-                raise BuildUnitsError(
-                    self._structured_error(
-                        error_code="UNIT_SOURCE_AUDIT_FAILED",
-                        message=(
-                            f"source replay rejected {report.metrics['error_count']} "
-                            f"unit finding(s): {sample}"
+                            "provider table evidence has no source-bound Unit owner; "
+                            "the builder will not guess one"
                         ),
                     )
                 )
             units, snapshot_rows = self._materialize_units(
-                drafts=drafts,
-                document=context["document"],
+                build=build,
+                document=cast(e.Document, context["document"]),
                 run=run,
             )
-        except SourceEvidenceClosureError as exc:
+            stats = self._build_stats(build)
+        except ProviderDocumentAdmissionError as exc:
             return self._mark_and_result(
                 run.processing_run_id,
                 self._structured_error(
-                    error_code="SOURCE_EVIDENCE_UNADDRESSABLE",
-                    message=str(exc),
-                ),
-            )
-        except SourceEvidenceValidationError as exc:
-            return self._mark_and_result(
-                run.processing_run_id,
-                self._structured_error(
-                    error_code="SOURCE_EVIDENCE_INVALID",
+                    error_code="PROVIDER_DOCUMENT_ADMISSION_FAILED",
                     reason_code=exc.reason_code,
+                    retryable=exc.retryable,
                     message=str(exc),
                 ),
             )
         except BuildUnitsError as exc:
             return self._mark_and_result(run.processing_run_id, exc.error)
+        except (TypeError, ValueError) as exc:
+            return self._mark_and_result(
+                run.processing_run_id,
+                self._structured_error(
+                    error_code="PROVIDER_UNIT_PROJECTION_INVALID",
+                    message=str(exc),
+                ),
+            )
         except OSError as exc:
             return self._mark_and_result(
                 run.processing_run_id,
                 self._structured_error(
                     error_code="ARTIFACT_READ_FAILED",
+                    retryable=True,
                     message=str(exc),
                 ),
             )
         except Exception as exc:
-            # Persist the actual cause: a fixed message made every unknown
-            # builder failure untraceable without re-running locally (round23).
             error = self._structured_error(
                 error_code="BUILD_PREPARATION_FAILED",
                 message=(
-                    f"unit preparation failed: {type(exc).__name__}: {str(exc)[:400]}"
+                    "provider Unit preparation failed: "
+                    f"{type(exc).__name__}: {str(exc)[:400]}"
                 ),
             )
             self._mark_failed(run.processing_run_id, error)
             raise BuildUnitsError(error) from exc
+
         try:
             snapshot_relpath = self._snapshot_relpath(context)
             snapshot_result = self._artifact_store.write_jsonl_atomic(
@@ -267,10 +184,9 @@ class BuildUnits:
                 expected_rows=len(snapshot_rows),
                 write_result=snapshot_result,
             )
-            stats_relpath = snapshot_relpath.parent / "build_stats.v1.json"
             self._artifact_store.write_json_atomic(
-                relpath=stats_relpath,
-                payload=stats.as_dict(),
+                relpath=snapshot_relpath.parent / "build_stats.v1.json",
+                payload=stats,
             )
         except BuildUnitsError as exc:
             return self._mark_and_result(run.processing_run_id, exc.error)
@@ -289,13 +205,15 @@ class BuildUnits:
                 run_id=run.processing_run_id,
                 units=units,
                 snapshot_relpath=snapshot_relpath,
-                content_hash_aggregate=_content_hash_aggregate(units),
-                structure_hash=_structure_hash_aggregate(units),
+                content_aggregate=content_hash_aggregate(
+                    unit.content_hash for unit in units
+                ),
+                structure_aggregate=structure_hash_aggregate(
+                    cast(str, unit.structure_hash) for unit in units
+                ),
             )
         except BuildUnitsError as exc:
             if exc.error.get("error_code") == "UNITS_ALREADY_BUILT":
-                # Lost a concurrent build race under the document lock: the
-                # winner's persisted state stands untouched (round23).
                 with self._uow_factory() as uow:
                     existing = uow.processing_runs.get(run.processing_run_id)
                 return BuildUnitsResult(
@@ -327,22 +245,12 @@ class BuildUnits:
             status=updated.unit_build_status,
             unit_count=len(units),
             document_units_relpath=updated.document_units_relpath,
-            build_stats=stats.as_dict(),
+            build_stats=stats,
             content_hash_aggregate=updated.content_hash_aggregate,
             structure_hash=updated.structure_hash,
         )
 
-    def _mark_and_result(
-        self, processing_run_id: str, error: dict[str, Any]
-    ) -> BuildUnitsResult:
-        failed = self._mark_failed(processing_run_id, error)
-        return BuildUnitsResult(
-            processing_run_id=failed.processing_run_id,
-            status=failed.unit_build_status,
-            error=failed.unit_build_error,
-        )
-
-    def _load_context(self, command: BuildUnitsCommand) -> dict[str, Any]:
+    def _load_context(self, command: BuildUnitsCommand) -> dict[str, object]:
         if bool(command.document_id) == bool(command.processing_run_id):
             raise BuildUnitsError(
                 self._structured_error(
@@ -355,7 +263,7 @@ class BuildUnits:
                 run = uow.processing_runs.get(command.processing_run_id)
             else:
                 assert command.document_id is not None
-                run = uow.processing_runs.latest_succeeded_parse_for_document(
+                run = uow.processing_runs.latest_succeeded_provider_run_for_document(
                     command.document_id
                 )
             if run is None:
@@ -370,6 +278,16 @@ class BuildUnits:
                     self._structured_error(
                         error_code="RUN_NOT_SUCCEEDED",
                         message=f"run status is {run.status}",
+                    )
+                )
+            if (
+                run.provider_document_relpath is None
+                or run.normalized_ir_relpath is not None
+            ):
+                raise BuildUnitsError(
+                    self._structured_error(
+                        error_code="RUN_OUTPUT_CONTRACT_UNSUPPORTED",
+                        message="only provider_document.v1 runs can build Units",
                     )
                 )
             document = uow.documents.get(run.document_id)
@@ -392,6 +310,16 @@ class BuildUnits:
                         message=f"document security not found: {document.security_id}",
                     )
                 )
+            artifact_owner = uow.processing_runs.get(
+                run.artifact_owner_processing_run_id
+            )
+            if artifact_owner is None:
+                raise BuildUnitsError(
+                    self._structured_error(
+                        error_code="ARTIFACT_OWNER_INVALID",
+                        message="provider parse owner is missing",
+                    )
+                )
             if uow.document_units.list_by_processing_run(run.processing_run_id):
                 raise BuildUnitsError(
                     self._structured_error(
@@ -399,262 +327,28 @@ class BuildUnits:
                         message=f"run already has units: {run.processing_run_id}",
                     )
                 )
-            return {"run": run, "document": document, "security": security}
-
-    def _load_ir(
-        self,
-        relpath: Path,
-        *,
-        expected_artifact_hash: str | None = None,
-        expected_document_id: str,
-        expected_parser_target: object,
-    ) -> dict[str, Any]:
-        if not str(relpath):
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="IR_MISSING",
-                    message="normalized_ir_relpath is missing",
-                )
-            )
-        try:
-            raw_bytes = read_data_file_bytes(self._paths, relpath)
-        except DataFileMissingError as exc:
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="IR_MISSING",
-                    message=str(exc),
-                )
-            ) from exc
-        except DataStoreReadError as exc:
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="IR_READ_FAILED",
-                    retryable=True,
-                    message=str(exc),
-                )
-            ) from exc
-        # Ingress hash check, symmetric with parse's raw-PDF verification
-        # (parse_document.py): the IR lives in the overwritable derived area
-        # and rebuild-units consumes it months later — a corrupted/overwritten
-        # IR must fail loudly here, not publish self-consistent bad units
-        # (round23). Runs predating artifact_hash skip the check.
-        if expected_artifact_hash:
-            actual = "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
-            if actual != expected_artifact_hash:
-                raise BuildUnitsError(
-                    self._structured_error(
-                        error_code="IR_HASH_MISMATCH",
-                        message=(
-                            f"normalized IR at {relpath} hashes to {actual}, "
-                            f"run.artifact_hash is {expected_artifact_hash}; "
-                            "re-parse or investigate the derived area"
-                        ),
-                    )
-                )
-        decoded: object = json.loads(raw_bytes.decode("utf-8"))
-        if not isinstance(decoded, dict):
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="IR_CONTRACT_UNSUPPORTED",
-                    reason_code="payload_not_object",
-                    message="normalized IR must be an object",
-                )
-            )
-        payload = cast(dict[str, Any], decoded)
-        try:
-            version = validate_normalized_ir_contract(payload)
-            validate_normalized_ir_identity(payload, document_id=expected_document_id)
-            validate_normalized_ir_path_version(relpath, version=version)
-        except NormalizedIRVersionError as exc:
-            error_code = (
-                "IR_CONTRACT_TOO_OLD"
-                if exc.reason_code == "contract_version_too_old"
-                else "IR_CONTRACT_UNSUPPORTED"
-            )
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code=error_code,
-                    reason_code=exc.reason_code,
-                    message=str(exc),
-                )
-            ) from exc
-        if version != CURRENT_NORMALIZED_IR_VERSION:
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="IR_CONTRACT_TOO_OLD",
-                    reason_code="structure_proof_reparse_required",
-                    message=(
-                        f"{version} has no source-bound document structure "
-                        "and must be re-parsed before building units"
-                    ),
-                )
-            )
-        try:
-            run_target = ParserTargetIdentity.from_payload(expected_parser_target)
-            ir_target = ParserTargetIdentity.from_payload(payload.get("parser"))
-        except ParserTargetIdentityError as exc:
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="PARSER_TARGET_IDENTITY_INVALID",
-                    message=str(exc),
-                )
-            ) from exc
-        if run_target != ir_target:
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="PARSER_TARGET_IDENTITY_MISMATCH",
-                    message=(
-                        "processing run parser target differs from "
-                        "NormalizedIR"
-                    ),
-                )
-            )
-        self._validate_table_reconciliation(payload, version=version)
-        return payload
-
-    def _load_hashed_parser_artifact(
-        self,
-        normalized_ir: Mapping[str, Any],
-        *,
-        role: str,
-    ) -> VerifiedParserArtifact:
-        parser_artifacts = cast(
-            Mapping[str, Any],
-            normalized_ir["parser_artifacts"],
-        )
-        files = cast(Mapping[str, Any], parser_artifacts["files"])
-        descriptor = cast(Mapping[str, Any], files[role])
-        relpath = Path(cast(str, descriptor["relpath"]))
-        expected_sha256 = cast(str, descriptor["sha256"])
-        expected_size = cast(int, descriptor["size_bytes"])
-        try:
-            payload = read_data_file_bytes(self._paths, relpath)
-        except DataFileMissingError as exc:
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="PARSER_ARTIFACT_MISSING",
-                    message=f"{role}: {exc}",
-                )
-            ) from exc
-        except DataStoreReadError as exc:
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="PARSER_ARTIFACT_READ_FAILED",
-                    retryable=True,
-                    message=f"{role}: {exc}",
-                )
-            ) from exc
-        actual_sha256 = "sha256:" + hashlib.sha256(payload).hexdigest()
-        if len(payload) != expected_size or actual_sha256 != expected_sha256:
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="PARSER_ARTIFACT_IDENTITY_MISMATCH",
-                    message=(
-                        f"{role} at {relpath} has size/hash "
-                        f"{len(payload)}/{actual_sha256}; expected "
-                        f"{expected_size}/{expected_sha256}"
-                    ),
-                )
-            )
-        return VerifiedParserArtifact(payload=payload, sha256=actual_sha256)
-
-    def _validate_table_reconciliation(
-        self, payload: dict[str, Any], *, version: str
-    ) -> None:
-        """Validate the shared IR extension and act on evidence compatibility."""
-        try:
-            assessment = assess_normalized_ir_table_reconciliation(payload)
-        except UnsupportedTableReconciliationAlgorithm as exc:
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="IR_TABLE_RECONCILIATION_UNSUPPORTED",
-                    reason_code=exc.reason_code,
-                    message=str(exc),
-                )
-            ) from exc
-        except TableReconciliationContractError as exc:
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="IR_TABLE_RECONCILIATION_INVALID",
-                    reason_code=exc.reason_code,
-                    message=f"invalid normalized IR table reconciliation: {exc}",
-                )
-            ) from exc
-        try:
-            validate_reconciliation_generation(
-                version=version,
-                algorithm_version=assessment.algorithm_version,
-            )
-        except NormalizedIRVersionError as exc:
-            raise BuildUnitsError(
-                self._structured_error(
-                    error_code="IR_TABLE_RECONCILIATION_CONTRACT_MISMATCH",
-                    reason_code=exc.reason_code,
-                    message=str(exc),
-                )
-            ) from exc
-    def _image_artifact_resolver(
-        self,
-        normalized_ir: dict[str, Any],
-        *,
-        image_hashes_by_role: dict[str, str] | None = None,
-    ) -> ImageArtifactResolver | None:
-        parser_artifacts = normalized_ir.get("parser_artifacts")
-        if not isinstance(parser_artifacts, Mapping):
-            return None
-        artifact_root = parser_artifacts.get("artifact_root_relpath")
-        files = parser_artifacts.get("files")
-        if not isinstance(artifact_root, str) or not isinstance(files, Mapping):
-            return None
-        artifact_root_relpath = Path(artifact_root)
-
-        def resolve(artifact_role: str, image_path: str) -> ResolvedImageArtifact:
-            role = artifact_role
-            descriptor = files.get(role)
-            if not isinstance(descriptor, Mapping):
-                raise SourceEvidenceClosureError(
-                    f"image artifact role is missing: {role}"
-                )
-            expected_relpath = artifact_root_relpath / Path(image_path)
-            if (
-                descriptor.get("availability") != "present"
-                or descriptor.get("relpath") != str(expected_relpath)
-            ):
-                raise SourceEvidenceClosureError(
-                    f"image artifact role does not bind image_path: {role}"
-                )
-            artifact = self._load_hashed_parser_artifact(
-                normalized_ir,
-                role=role,
-            )
-            if image_hashes_by_role is not None:
-                image_hashes_by_role[role] = artifact.sha256.removeprefix(
-                    "sha256:"
-                )
-            return ResolvedImageArtifact(
-                content=artifact.payload,
-                artifact_role=role,
-                sha256=artifact.sha256,
-                size_bytes=len(artifact.payload),
-                media_type=_image_media_type(artifact.payload),
-            )
-
-        return resolve
+            return {
+                "run": run,
+                "artifact_owner": artifact_owner,
+                "document": document,
+                "security_code": security.security_code,
+            }
 
     def _materialize_units(
         self,
         *,
-        drafts: list[UnitDraft],
+        build: ProviderUnitBuildResult,
         document: e.Document,
         run: e.ProcessingRun,
     ) -> tuple[list[e.DocumentUnit], list[dict[str, Any]]]:
         units: list[e.DocumentUnit] = []
         rows: list[dict[str, Any]] = []
-        for order_index, draft in enumerate(drafts, start=1):
+        for draft in build.units:
+            self._validate_draft_hashes(draft)
             try:
                 validate_semantic_key_state(
                     draft.semantic_key,
-                    draft.semantic_keys,
+                    list(draft.semantic_keys),
                 )
             except SemanticKeyInvariantError as exc:
                 raise BuildUnitsError(
@@ -664,40 +358,25 @@ class BuildUnits:
                         message=str(exc),
                     )
                 ) from exc
-            hashes = compute_unit_hashes(
-                payload_kind=draft.payload_kind,
-                payload=draft.payload,
-                title=draft.title,
-                heading_path=draft.heading_path,
-                semantic_key=draft.semantic_key,
-                quality_status=draft.quality_status,
-                order_index=order_index,
-                applicability=draft.applicability,
-                semantic_keys=draft.semantic_keys,
-            )
             unit = e.DocumentUnit(
                 asset_id=ids.new_asset_id(),
                 document_id=document.document_id,
                 processing_run_id=run.processing_run_id,
                 provider_document_id=document.provider_document_id,
                 payload_kind=draft.payload_kind,
-                heading_path=draft.heading_path,
+                heading_path=list(draft.heading_path),
                 title=draft.title,
-                order_index=order_index,
+                order_index=draft.unit_index + 1,
                 semantic_key=draft.semantic_key,
-                semantic_keys=draft.semantic_keys,
-                payload=draft.payload,
-                content_hash=hashes.content_hash,
-                structure_hash=hashes.structure_hash,
+                semantic_keys=list(draft.semantic_keys),
+                payload=cast(dict[str, Any], dict(draft.payload)),
+                content_hash=draft.content_hash,
+                structure_hash=draft.structure_hash,
                 quality_status=draft.quality_status,
-                applicability=draft.applicability,
-                page_no=payload_page_no(
-                    payload_kind=draft.payload_kind,
-                    payload=draft.payload,
-                    artifact_locator=draft.artifact_locator,
-                ),
-                query_projection_hash=hashes.query_projection_hash,
-                artifact_locator=draft.artifact_locator,
+                applicability=None,
+                page_no=draft.page_no,
+                query_projection_hash=draft.query_projection_hash,
+                artifact_locator=provider_unit_locator_to_payload(draft.locator),
             )
             units.append(unit)
             row = {
@@ -721,14 +400,36 @@ class BuildUnits:
             rows.append(row)
         return units, rows
 
-    def _snapshot_relpath(self, context: dict[str, Any]) -> Path:
-        document = context["document"]
-        security = context["security"]
-        run = context["run"]
+    def _validate_draft_hashes(self, draft: ProviderUnitDraft) -> None:
+        hashes = compute_unit_hashes(
+            payload_kind=draft.payload_kind,
+            payload=cast(dict[str, Any], draft.payload),
+            title=draft.title,
+            heading_path=list(draft.heading_path),
+            semantic_key=draft.semantic_key,
+            semantic_keys=list(draft.semantic_keys),
+            quality_status=draft.quality_status,
+            order_index=draft.unit_index + 1,
+        )
+        if (
+            hashes.content_hash != draft.content_hash
+            or hashes.query_projection_hash != draft.query_projection_hash
+            or hashes.structure_hash != draft.structure_hash
+        ):
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="PROVIDER_UNIT_HASH_MISMATCH",
+                    message="provider Unit draft hashes do not replay canonically",
+                )
+            )
+
+    def _snapshot_relpath(self, context: dict[str, object]) -> Path:
+        document = cast(e.Document, context["document"])
+        run = cast(e.ProcessingRun, context["run"])
         return self._paths.document_units_snapshot_relpath(
-            provider=document.provider,
-            security_code=security.security_code,
-            provider_document_id=document.provider_document_id,
+            provider=cast(str, document.provider),
+            security_code=cast(str, context["security_code"]),
+            provider_document_id=cast(str, document.provider_document_id),
             processing_run_id=run.processing_run_id,
         )
 
@@ -739,9 +440,8 @@ class BuildUnits:
         expected_rows: int,
         write_result: ArtifactWriteResult,
     ) -> None:
-        path = self._paths.data_path(relpath)
         try:
-            content = path.read_bytes()
+            content = self._paths.data_path(relpath).read_bytes()
         except OSError as exc:
             raise BuildUnitsError(
                 self._structured_error(
@@ -771,8 +471,8 @@ class BuildUnits:
         run_id: str,
         units: list[e.DocumentUnit],
         snapshot_relpath: Path,
-        content_hash_aggregate: str,
-        structure_hash: str,
+        content_aggregate: str,
+        structure_aggregate: str,
     ) -> e.ProcessingRun:
         with self._uow_factory() as uow:
             run = uow.processing_runs.get(run_id)
@@ -783,10 +483,6 @@ class BuildUnits:
                         message=f"processing run not found: {run_id}",
                     )
                 )
-            # Serialize with any concurrent CLI/worker build of the same
-            # document, then re-check under the lock: without this, the
-            # loser of a concurrent build overwrote the winner's succeeded
-            # state with failed (round23).
             maybe_lock_document(uow, run.document_id)
             if uow.document_units.list_by_processing_run(run_id):
                 raise BuildUnitsError(
@@ -797,9 +493,9 @@ class BuildUnits:
                 )
             uow.document_units.add_many(units)
             run.document_units_relpath = str(snapshot_relpath)
-            run.content_hash_aggregate = content_hash_aggregate
-            run.structure_hash = structure_hash
-            run.builder_rules_version = rules.RULES_VERSION
+            run.content_hash_aggregate = content_aggregate
+            run.structure_hash = structure_aggregate
+            run.builder_rules_version = PROVIDER_UNIT_BUILDER_VERSION
             run.unit_build_status = "succeeded"
             run.unit_build_error = None
             run.unit_build_attempt_count += 1
@@ -807,6 +503,16 @@ class BuildUnits:
             updated = uow.processing_runs.update(run)
             uow.commit()
             return updated
+
+    def _mark_and_result(
+        self, processing_run_id: str, error: dict[str, Any]
+    ) -> BuildUnitsResult:
+        failed = self._mark_failed(processing_run_id, error)
+        return BuildUnitsResult(
+            processing_run_id=failed.processing_run_id,
+            status=failed.unit_build_status,
+            error=failed.unit_build_error,
+        )
 
     def _mark_failed(self, run_id: str, error: dict[str, Any]) -> e.ProcessingRun:
         with self._uow_factory() as uow:
@@ -819,9 +525,6 @@ class BuildUnits:
                     )
                 )
             if run.unit_build_status == "succeeded":
-                # Never downgrade a persisted success: rebuilds get a NEW
-                # run, so a late failure here is always a losing racer
-                # (round23, defense in depth behind the document lock).
                 return run
             run.unit_build_status = "failed"
             run.unit_build_error = error
@@ -830,8 +533,18 @@ class BuildUnits:
             uow.commit()
             return updated
 
+    @staticmethod
+    def _build_stats(build: ProviderUnitBuildResult) -> dict[str, Any]:
+        return {
+            "contract_version": "provider_unit_build_stats.v1",
+            "builder_rules_version": PROVIDER_UNIT_BUILDER_VERSION,
+            "provider_document_sha256": build.provider_document_sha256,
+            "unit_count": len(build.units),
+            "unassigned_table_part_count": len(build.unassigned_table_parts),
+        }
+
+    @staticmethod
     def _structured_error(
-        self,
         *,
         error_code: str,
         message: str,
@@ -849,50 +562,4 @@ class BuildUnits:
         return error
 
 
-def _image_hashes_by_source(
-    normalized_ir: Mapping[str, Any],
-    *,
-    image_hashes_by_role: Mapping[str, str],
-) -> dict[str, str]:
-    output = dict(image_hashes_by_role)
-    elements = normalized_ir.get("elements")
-    if not isinstance(elements, list):
-        return output
-    for element in elements:
-        if not isinstance(element, Mapping):
-            continue
-        ir_id = element.get("ir_id")
-        source_item_index = element.get("source_item_index")
-        if (
-            isinstance(ir_id, str)
-            and isinstance(source_item_index, int)
-            and not isinstance(source_item_index, bool)
-            and (
-                role := f"evidence_image_{source_item_index:06d}"
-            ) in image_hashes_by_role
-        ):
-            output[ir_id] = image_hashes_by_role[role]
-    return output
-
-
-def _image_media_type(content: bytes) -> str:
-    if content.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if content.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if content.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
-        return "image/webp"
-    raise SourceEvidenceClosureError("image artifact has an unsupported media type")
-
-
-def _content_hash_aggregate(units: list[e.DocumentUnit]) -> str:
-    return content_hash_aggregate(unit.content_hash for unit in units)
-
-
-def _structure_hash_aggregate(units: list[e.DocumentUnit]) -> str:
-    return structure_hash_aggregate(
-        unit.structure_hash or ""
-        for unit in sorted(units, key=lambda item: item.order_index)
-    )
+__all__ = ["BuildUnits", "BuildUnitsCommand", "BuildUnitsResult", "SNAPSHOT_KEYS"]

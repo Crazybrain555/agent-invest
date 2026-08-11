@@ -105,11 +105,12 @@ true、`print` 退出 0）。
 ### 1.1a MinerU runtime bundle attestation（任何 fresh parse 的前置）
 
 parser target 契约要求 `DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256`
-（否则 parse 在 parser_identity 阶段 fail loud）。digest 用
-`scripts/attest_mineru_runtime.py --mineru-bin "$DISCLOSURE_MINERU_BIN"`
-生成（venv 包清单+解释器版本的规范哈希，幂等），stderr 会给出可直接粘进
-worker.env 的 export 行。**MinerU venv 任何变更（升级/重装）后必须重新生成**，
-否则新产物会带旧运行时身份；worker 重启后生效。
+（否则 parse 在 parser_identity 阶段 fail loud）。它必须来自 operator/provider 保存于仓外的
+canonical runtime manifest，至少绑定本地 client venv、远端 immutable image digest、模型仓库与
+不可变 revision、MinerU 配置 hash，以及内容相关 server env；hash 该 manifest 的精确 bytes 后
+写入 worker.env。`scripts/attest_mineru_runtime.py --mineru-bin "$DISCLOSURE_MINERU_BIN"`
+只测量本地 client venv，是 manifest 的一个输入，**不能直接冒充完整 runtime digest**。任一
+client、image、模型或配置变化都必须重做 manifest/digest 并重启 worker。
 
 ### 1.2 全量派生重置后的 exact replay
 
@@ -133,6 +134,12 @@ watchdog。`make reparse-status MANIFEST=... RESET_RECEIPT=...` 在
 `complete=true` 前退出 75；任何代码、文档输入、raw hash、数据库身份或 parser
 deployment 漂移均 fail loud。完成后人工移除这两个环境值并重启同一 job；脚本不会
 自动恢复普通获取，也不会替运维者修改 launchd 状态。
+
+0032 切换后，历史 v4 parse 失败不消耗 Provider writer 的新 retry budget，这是有意的代际
+重试重置。旧 active v4 的检索投影在被 Provider run 替代前仍按旧版本可读；exact replay 全部
+完成并发布 Provider runs 后，显式执行 `make rebuild-search-projection ALL=YES`，确认 provider
+projection 全绿，再移除 replay 环境值并恢复普通获取。禁止在 Provider corpus 尚未闭合时把
+一次性的 legacy projection terminal 状态当成内容丢失或删除旧公开行。
 
 ### 1.3 reset bundle 目录布局
 
@@ -219,10 +226,11 @@ worker 以 exit 77 自杀 = TCC 拒绝访问外置盘（详见 `scripts/run_work
   run/asset 引用保持可解引用。未来若改变 retention 语义，必须先作为公开契约变更单独裁决，
   不能恢复按 cutoff 删除 DB ownership 的旧入口。
 - 派生孤儿统一由 `make gc-orphans`（dry-run）盘点，覆盖 `parser_artifacts`、
-  `derived/normalized_ir` 和 `derived/document_unit_snapshots`；确认后
+  `derived/normalized_ir`、`derived/provider_documents` 和
+  `derived/document_unit_snapshots`；确认后
   `make gc-orphans APPLY=YES`。apply 全程持 CORPUS exclusive，文件必须至少 24 小时，
   且删除前把 family、relpath、大小和文件身份写入 `audit/gc/` 清单。parser ownership
-  是 run 目录前缀；另外两类是精确文件 ownership。原始 PDF 永不在 GC 范围内。
+  是 run 目录前缀；其余三类是精确文件 ownership。原始 PDF 永不在 GC 范围内。
 
 ## 8. 数据质量巡检（周节律）
 

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from disclosure_anchor.api.errors import FilingApiError
 from disclosure_anchor.api.routers.admin import (
@@ -86,7 +87,7 @@ class _Deps:
             processing_run_id="run_1",
             status="succeeded",
             parser_artifact_relpath="parser/run_1",
-            normalized_ir_relpath="normalized/run_1.json",
+            provider_document_relpath="provider/run_1.json",
             artifact_hash="sha256:" + "a" * 64,
         )
 
@@ -244,52 +245,38 @@ class FilingApiAdminTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 422)
         self.assertIsNone(deps.register_command)
 
-    def test_parse_uses_parser_options_defaults_and_overrides(self) -> None:
+    def test_parse_is_pinned_and_only_timeout_is_overridable(self) -> None:
         deps = _Deps()
 
         response = parse_document(
             "doc_1",
             _request(deps),
-            ParserOptionsRequest(method="ocr", table=False, timeout_seconds=30),
+            ParserOptionsRequest(timeout_seconds=30),
         )
 
         self.assertEqual(response.processing_run_id, "run_1")
+        self.assertEqual(response.provider_document_relpath, "provider/run_1.json")
         self.assertEqual(deps.parse_document_id, "doc_1")
-        self.assertEqual(deps.parse_options.method, "ocr")
-        self.assertEqual(deps.parse_options.backend, "pipeline")
+        self.assertEqual(deps.parse_options.method, "auto")
+        self.assertEqual(deps.parse_options.backend, "hybrid-http-client")
         self.assertEqual(deps.parse_options.language, "ch")
-        self.assertFalse(deps.parse_options.table)
+        self.assertEqual(deps.parse_options.effort, "medium")
+        self.assertTrue(deps.parse_options.table)
+        self.assertTrue(deps.parse_options.formula)
+        self.assertFalse(deps.parse_options.image_analysis)
+        self.assertIsNone(deps.parse_options.start_page)
+        self.assertIsNone(deps.parse_options.end_page)
         self.assertEqual(deps.parse_options.timeout_seconds, 30)
 
-    def test_http_backend_override_keeps_shared_request_cap(self) -> None:
-        deps = _Deps()
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            settings = Settings(
-                disclosure_data_root=root / "service",
-                disclosure_shared_root=root / "shared",
-                disclosure_runtime_root=root / "runtime",
-                mineru_model_cache=root / "mineru",
-                hf_home=root / "hf",
-                modelscope_cache=root / "modelscope",
-                disclosure_mineru_backend="pipeline",
-            )
-
-            parse_document(
-                "doc_1",
-                _request(deps, settings=settings),
-                ParserOptionsRequest(
-                    backend="vlm-http-client",
-                    server_url="http://127.0.0.1:30000",
-                ),
-            )
-
-        self.assertEqual(deps.parse_options.backend, "vlm-http-client")
-        self.assertEqual(
-            deps.parse_options.http_request_concurrency,
-            settings.mineru_http_request_concurrency,
-        )
-        self.assertEqual(deps.parse_options.http_request_concurrency, 100)
+    def test_content_affecting_parser_overrides_are_not_an_admin_surface(self) -> None:
+        for override in (
+            {"backend": "vlm-http-client"},
+            {"method": "ocr"},
+            {"table": False},
+            {"start_page": 3},
+        ):
+            with self.subTest(override=override), self.assertRaises(ValidationError):
+                ParserOptionsRequest(**override)
 
     def test_parse_reports_busy_worker_as_conflict(self) -> None:
         deps = _Deps()

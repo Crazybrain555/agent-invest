@@ -22,6 +22,20 @@ from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
     ParserTargetIdentityError,
 )
+from disclosure_anchor.application.contracts.provider_document_admission import (
+    ProviderDocumentAdmissionError,
+)
+from disclosure_anchor.application.contracts.provider_unit import (
+    PROVIDER_UNIT_BUILDER_VERSION,
+    ProviderUnitDraft,
+    provider_unit_locator_to_payload,
+)
+from disclosure_anchor.application.services.provider_document_admission import (
+    ProviderDocumentAdmission,
+)
+from disclosure_anchor.application.services.provider_unit_builder import (
+    build_provider_units,
+)
 from disclosure_anchor.application.contracts.visual_semantics import (
     VisualSemanticClosure,
     VisualSemanticContractError,
@@ -98,6 +112,9 @@ TERMINAL_PUBLICATION_ERROR_CODES = frozenset(
         "RUN_UNIT_SET_INVALID",
         "VISUAL_SEMANTIC_CLOSURE_INVALID",
         "VISUAL_SEMANTIC_CLOSURE_UNRESOLVED",
+        "PROVIDER_DOCUMENT_ADMISSION_FAILED",
+        "PROVIDER_UNIT_PROJECTION_INVALID",
+        "RUN_OUTPUT_CONTRACT_UNSUPPORTED",
     }
 )
 
@@ -332,12 +349,136 @@ class NormalizedIRPublicationGuard:
             ) from exc
 
 
+class ProviderDocumentPublicationGuard:
+    """Re-admit source bytes and replay every persisted provider Unit."""
+
+    def __init__(self, admission: ProviderDocumentAdmission) -> None:
+        self._admission = admission
+
+    def __call__(
+        self,
+        *,
+        run: e.ProcessingRun,
+        document: e.Document,
+        artifact_owner: e.ProcessingRun,
+        security_code: str,
+        units: list[e.DocumentUnit],
+    ) -> None:
+        if (
+            run.provider_document_relpath is None
+            or run.normalized_ir_relpath is not None
+        ):
+            raise PublishRunError(
+                _structured_error(
+                    error_code="RUN_OUTPUT_CONTRACT_UNSUPPORTED",
+                    message="only provider_document.v1 runs can publish",
+                )
+            )
+        try:
+            admitted = self._admission.admit(
+                document=document,
+                run=run,
+                artifact_owner=artifact_owner,
+                security_code=security_code,
+            )
+        except ProviderDocumentAdmissionError as exc:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="PROVIDER_DOCUMENT_ADMISSION_FAILED",
+                    reason_code=exc.reason_code,
+                    retryable=exc.retryable,
+                    message=str(exc),
+                )
+            ) from exc
+        try:
+            build = build_provider_units(admitted)
+        except (TypeError, ValueError) as exc:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="PROVIDER_UNIT_PROJECTION_INVALID",
+                    message=str(exc),
+                )
+            ) from exc
+        if build.unassigned_table_parts:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="PROVIDER_UNIT_PROJECTION_INVALID",
+                    reason_code="unassigned_table_evidence",
+                    message="provider table evidence has no source-bound Unit owner",
+                )
+            )
+        if run.builder_rules_version != PROVIDER_UNIT_BUILDER_VERSION:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="PROVIDER_UNIT_PROJECTION_INVALID",
+                    reason_code="builder_rules_version_mismatch",
+                    message="candidate run was not built by the current provider rules",
+                )
+            )
+        ordered = sorted(units, key=lambda item: item.order_index)
+        if len(ordered) != len(build.units):
+            raise PublishRunError(
+                _structured_error(
+                    error_code="PROVIDER_UNIT_PROJECTION_INVALID",
+                    reason_code="unit_count_mismatch",
+                    message="persisted Unit count differs from fresh source replay",
+                )
+            )
+        for draft, unit in zip(build.units, ordered, strict=True):
+            self._validate_unit(
+                draft=draft,
+                unit=unit,
+                run=run,
+                document=document,
+            )
+
+    @staticmethod
+    def _validate_unit(
+        *,
+        draft: ProviderUnitDraft,
+        unit: e.DocumentUnit,
+        run: e.ProcessingRun,
+        document: e.Document,
+    ) -> None:
+        expected: dict[str, object] = {
+            "document_id": document.document_id,
+            "processing_run_id": run.processing_run_id,
+            "provider_document_id": document.provider_document_id,
+            "payload_kind": draft.payload_kind,
+            "payload": draft.payload,
+            "title": draft.title,
+            "heading_path": list(draft.heading_path),
+            "order_index": draft.unit_index + 1,
+            "semantic_key": draft.semantic_key,
+            "semantic_keys": list(draft.semantic_keys),
+            "quality_status": draft.quality_status,
+            "applicability": None,
+            "page_no": draft.page_no,
+            "artifact_locator": provider_unit_locator_to_payload(draft.locator),
+            "content_hash": draft.content_hash,
+            "query_projection_hash": draft.query_projection_hash,
+            "structure_hash": draft.structure_hash,
+        }
+        for field, value in expected.items():
+            if getattr(unit, field) != value:
+                raise PublishRunError(
+                    _structured_error(
+                        error_code="PROVIDER_UNIT_PROJECTION_INVALID",
+                        reason_code=f"{field}_mismatch",
+                        message=(
+                            "persisted Unit differs from fresh source replay: "
+                            f"order={unit.order_index} field={field}"
+                        ),
+                    )
+                )
+
+
 class PublishRun:
     def __init__(
         self,
         *,
         uow_factory: Callable[[], UnitOfWork],
-        publication_guard: Callable[[e.ProcessingRun], None],
+        publication_guard: ProviderDocumentPublicationGuard,
     ) -> None:
         self._uow_factory = uow_factory
         self._publication_guard = publication_guard
@@ -399,10 +540,32 @@ class PublishRun:
                 if old_run is not None
                 else []
             )
+            artifact_owner = uow.processing_runs.get(
+                run.artifact_owner_processing_run_id
+            )
+            security = (
+                uow.securities.get(document.security_id)
+                if document.security_id is not None
+                else None
+            )
+            if artifact_owner is None or security is None:
+                raise PublishRunError(
+                    _structured_error(
+                        error_code="PROVIDER_DOCUMENT_ADMISSION_FAILED",
+                        reason_code="provider_owner_or_security_missing",
+                        message="provider artifact owner or document security is missing",
+                    )
+                )
             try:
-                self._publication_guard(run)
                 new_units = uow.document_units.list_by_processing_run(
                     run.processing_run_id
+                )
+                self._publication_guard(
+                    run=run,
+                    document=document,
+                    artifact_owner=artifact_owner,
+                    security_code=security.security_code,
+                    units=new_units,
                 )
                 if not new_units and not command.allow_empty:
                     raise PublishRunError(
@@ -676,6 +839,17 @@ def _validate_publishable(run: e.ProcessingRun) -> None:
             _structured_error(
                 error_code="UNITS_NOT_BUILT",
                 message=f"unit_build_status is {run.unit_build_status}",
+            )
+        )
+    if (
+        run.run_kind not in {"parse", "rebuild_units"}
+        or run.provider_document_relpath is None
+        or run.normalized_ir_relpath is not None
+    ):
+        raise PublishRunError(
+            _structured_error(
+                error_code="RUN_OUTPUT_CONTRACT_UNSUPPORTED",
+                message="only provider_document.v1 parse/rebuild runs can publish",
             )
         )
 

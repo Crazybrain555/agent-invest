@@ -26,6 +26,7 @@ from disclosure_anchor.application.contracts.provider_document_envelope import (
 )
 from disclosure_anchor.application.contracts.provider_unit import (
     ProviderUnitLocator,
+    provider_unit_locator_from_payload,
     provider_unit_locator_to_payload,
 )
 from disclosure_anchor.application.contracts.provider_table_projection import (
@@ -108,6 +109,14 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         )
 
         locator_payload = provider_unit_locator_to_payload(section.locator)
+        self.assertEqual(
+            provider_unit_locator_from_payload(locator_payload),
+            section.locator,
+        )
+        self.assertEqual(
+            [item.sha256 for item in section.locator.evidence_artifacts],
+            ["sha256:" + "f" * 64],
+        )
         encoded = json.dumps(locator_payload, ensure_ascii=False)
         self.assertNotIn("relative_path", encoded)
         self.assertNotIn("raw_item_json", encoded)
@@ -134,6 +143,7 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         self.assertEqual(first.payload_kind, "table")
         self.assertEqual(len(first.locator.search_targets), 1)
         self.assertIn("content_artifacts", first.payload)
+        self.assertEqual(len(first.locator.evidence_artifacts), 1)
         self.assertNotEqual(first.content_hash, second.content_hash)
         self.assertEqual(first.query_projection_hash, second.query_projection_hash)
 
@@ -149,6 +159,7 @@ class ProviderUnitBuilderTests(unittest.TestCase):
 
         self.assertEqual(first.payload_kind, "table")
         self.assertNotIn("content_artifacts", first.payload)
+        self.assertEqual(len(first.locator.evidence_artifacts), 1)
         self.assertEqual(first.content_hash, second.content_hash)
         self.assertEqual(first.query_projection_hash, second.query_projection_hash)
 
@@ -169,8 +180,24 @@ class ProviderUnitBuilderTests(unittest.TestCase):
                         reason="page_table_count_mismatch",
                     ),
                 ),
+                evidence_artifacts=(),
                 search_targets=(),
             )
+
+    def test_unit_locator_decoder_rejects_unknown_and_malformed_fields(self) -> None:
+        locator = build_provider_units(
+            _admitted(_representative_document())
+        ).units[1].locator
+        payload = provider_unit_locator_to_payload(locator)
+        payload["unexpected"] = True
+        with self.assertRaisesRegex(ValueError, "locator fields"):
+            provider_unit_locator_from_payload(payload)
+
+        payload = provider_unit_locator_to_payload(locator)
+        parts = cast(list[dict[str, object]], payload["parts"])
+        parts[0]["part_index"] = True
+        with self.assertRaisesRegex(ValueError, "part index"):
+            provider_unit_locator_from_payload(payload)
 
     def test_heading_only_unit_keeps_structure_without_body_duplication(self) -> None:
         document = _document(

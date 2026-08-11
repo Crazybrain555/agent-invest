@@ -18,6 +18,14 @@ from disclosure_anchor.application.contracts.normalized_ir_v4_evidence import (
     HistoricalNormalizedIRV4EvidenceError,
     resolve_historical_normalized_ir_v4_evidence,
 )
+from disclosure_anchor.application.contracts.provider_document_envelope import (
+    ProviderDocumentEnvelopeError,
+    provider_document_envelope_from_bytes,
+)
+from disclosure_anchor.application.contracts.provider_unit import (
+    PROVIDER_UNIT_LOCATOR_VERSION,
+    provider_unit_locator_from_payload,
+)
 from disclosure_anchor.domain.errors import PathSafetyError
 
 
@@ -36,7 +44,7 @@ _MAX_MIXED_DEPTH = 16
 
 @dataclass(frozen=True, slots=True)
 class EvidenceArtifactDescriptor:
-    artifact_role: str
+    artifact_role: str | None
     sha256: str
     size_bytes: int
     media_type: str
@@ -105,13 +113,14 @@ def read_unit_evidence(
     """
 
     requested_sha256 = f"sha256:{digest}"
+    artifact_locator = _optional_mapping(
+        row.get("artifact_locator"),
+        field="artifact_locator",
+    )
     descriptors = _unit_evidence_descriptors(
         payload_kind=_required_text(row, "payload_kind"),
         payload=_optional_mapping(row.get("payload"), field="payload"),
-        artifact_locator=_optional_mapping(
-            row.get("artifact_locator"),
-            field="artifact_locator",
-        ),
+        artifact_locator=artifact_locator,
     )
     matching = tuple(
         descriptor
@@ -163,6 +172,24 @@ def read_unit_evidence(
         or owner_source_sha256 != source_pdf_sha256
     ):
         evidence_integrity_error("artifact_owner_source_hash_mismatch")
+    if (
+        artifact_locator is not None
+        and artifact_locator.get("contract_version")
+        == PROVIDER_UNIT_LOCATOR_VERSION
+    ):
+        return _read_provider_unit_evidence(
+            paths=paths,
+            artifact_locator=artifact_locator,
+            matching=matching,
+            requested_sha256=requested_sha256,
+            document_id=document_id,
+            artifact_owner_id=artifact_owner_id,
+            expected_record_hash=expected_ir_hash,
+            source_pdf_sha256=source_pdf_sha256,
+            provider=provider,
+            security_code=security_code,
+            provider_document_id=provider_document_id,
+        )
     try:
         ir_relpath = paths.normalized_ir_run_relpath(
             provider=provider,
@@ -191,7 +218,7 @@ def read_unit_evidence(
             expected_source_pdf_sha256=source_pdf_sha256,
             claims=tuple(
                 HistoricalEvidenceClaim(
-                    artifact_role=descriptor.artifact_role,
+                    artifact_role=cast(str, descriptor.artifact_role),
                     sha256=descriptor.sha256,
                     size_bytes=descriptor.size_bytes,
                 )
@@ -225,12 +252,119 @@ def read_unit_evidence(
     )
 
 
+def _read_provider_unit_evidence(
+    *,
+    paths: FileStorePathBuilder,
+    artifact_locator: Mapping[str, Any],
+    matching: tuple[EvidenceArtifactDescriptor, ...],
+    requested_sha256: str,
+    document_id: str,
+    artifact_owner_id: str,
+    expected_record_hash: str,
+    source_pdf_sha256: str,
+    provider: str,
+    security_code: str,
+    provider_document_id: str,
+) -> VerifiedUnitEvidence:
+    try:
+        locator = provider_unit_locator_from_payload(artifact_locator)
+    except ValueError:
+        evidence_integrity_error("unit_evidence_locator_invalid")
+    if locator.provider_document_sha256 != expected_record_hash:
+        evidence_integrity_error("provider_document_hash_mismatch")
+    try:
+        record_relpath = paths.provider_document_relpath(
+            provider=provider,
+            security_code=security_code,
+            provider_document_id=provider_document_id,
+            artifact_owner_processing_run_id=artifact_owner_id,
+        )
+        record_content = _read_data_bytes(
+            paths,
+            record_relpath,
+            missing_reason="provider_document_missing",
+            unreadable_reason="provider_document_unreadable",
+            path_invalid_reason="provider_document_path_invalid",
+        )
+    except PathSafetyError:
+        evidence_integrity_error("provider_document_path_invalid")
+    if _sha256(record_content) != expected_record_hash:
+        evidence_integrity_error("provider_document_hash_mismatch")
+    try:
+        envelope = provider_document_envelope_from_bytes(record_content)
+    except (ProviderDocumentEnvelopeError, ValueError):
+        evidence_integrity_error("provider_document_contract_invalid")
+    source_parts = Path(envelope.source_pdf_relpath).parts
+    if (
+        envelope.document_id != document_id
+        or envelope.artifact_owner_processing_run_id != artifact_owner_id
+        or envelope.provider != provider
+        or envelope.provider_document_id != provider_document_id
+        or envelope.input_raw_file_hash != source_pdf_sha256
+        or len(source_parts) < 3
+        or source_parts[2] != security_code
+    ):
+        evidence_integrity_error("provider_document_identity_mismatch")
+    descriptor = matching[0]
+    candidates = tuple(
+        artifact
+        for artifact in envelope.provider_document.artifacts
+        if artifact.sha256 == descriptor.sha256
+        and artifact.size_bytes == descriptor.size_bytes
+        and artifact.media_type == descriptor.media_type
+    )
+    if not candidates:
+        evidence_integrity_error("evidence_artifact_not_in_provider_document")
+    artifact = sorted(candidates, key=lambda item: item.relative_path)[0]
+    try:
+        artifact_content = _read_data_bytes(
+            paths,
+            Path(envelope.parser_artifact_root_relpath) / artifact.relative_path,
+            expected_size=artifact.size_bytes,
+            missing_reason="evidence_artifact_missing",
+            unreadable_reason="evidence_artifact_unreadable",
+            path_invalid_reason="evidence_artifact_path_invalid",
+        )
+    except PathSafetyError:
+        evidence_integrity_error("evidence_artifact_path_invalid")
+    if _sha256(artifact_content) != requested_sha256:
+        evidence_integrity_error("evidence_artifact_hash_mismatch")
+    actual_media_type = _image_media_type(artifact_content)
+    if actual_media_type != descriptor.media_type:
+        evidence_integrity_error("evidence_artifact_media_type_mismatch")
+    return VerifiedUnitEvidence(
+        content=artifact_content,
+        sha256=requested_sha256,
+        media_type=actual_media_type,
+    )
+
+
 def _unit_evidence_descriptors(
     *,
     payload_kind: str,
     payload: Mapping[str, Any] | None,
     artifact_locator: Mapping[str, Any] | None,
 ) -> tuple[EvidenceArtifactDescriptor, ...]:
+    if artifact_locator is not None:
+        locator_version = artifact_locator.get("contract_version")
+        if locator_version is not None:
+            if locator_version != PROVIDER_UNIT_LOCATOR_VERSION:
+                evidence_integrity_error("unit_evidence_locator_invalid")
+            try:
+                provider_locator = provider_unit_locator_from_payload(
+                    artifact_locator
+                )
+            except ValueError:
+                evidence_integrity_error("unit_evidence_locator_invalid")
+            return tuple(
+                EvidenceArtifactDescriptor(
+                    artifact_role=None,
+                    sha256=artifact.sha256,
+                    size_bytes=artifact.size_bytes,
+                    media_type=artifact.media_type,
+                )
+                for artifact in provider_locator.evidence_artifacts
+            )
     descriptors: list[EvidenceArtifactDescriptor] = []
     if artifact_locator is not None:
         descriptors.extend(_locator_descriptors(artifact_locator))

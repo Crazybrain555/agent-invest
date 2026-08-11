@@ -38,9 +38,6 @@ from disclosure_anchor.application.ports.parser import (
     ParserIdentity,
     ParserOptions,
 )
-from disclosure_anchor.application.contracts.normalized_ir import (
-    CURRENT_NORMALIZED_IR_VERSION,
-)
 from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
 )
@@ -104,7 +101,6 @@ def _header(documents: list[dict[str, object]]) -> dict[str, object]:
             "max_build_retries": 3,
             "builder_rules_version": "ub-test",
             "retrieval_rules_version": "rp-test",
-            "normalized_ir_contract_version": CURRENT_NORMALIZED_IR_VERSION,
         },
         "code_snapshot": code_snapshot,
     }
@@ -138,10 +134,6 @@ class CorpusReparseManifestTests(unittest.TestCase):
         self.assertEqual(identity["max_parse_retries"], 4)
         self.assertEqual(identity["max_build_retries"], 5)
         self.assertIn("retrieval_rules_version", identity)
-        self.assertEqual(
-            identity["normalized_ir_contract_version"],
-            CURRENT_NORMALIZED_IR_VERSION,
-        )
 
         deps.parser_options = ParserOptions(
             backend="vlm-http-client",

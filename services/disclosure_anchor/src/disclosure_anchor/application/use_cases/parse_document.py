@@ -1,4 +1,4 @@
-"""Parse a registered raw document into parser artifacts and NormalizedIR."""
+"""Parse a registered raw document into one provider-native source record."""
 
 from __future__ import annotations
 
@@ -10,22 +10,30 @@ from pathlib import Path
 import re
 from typing import Any, cast
 
-from disclosure_anchor.application.contracts.normalized_ir import (
-    NormalizedIRVersionError,
-    validate_current_normalized_ir_for_write,
-    validate_normalized_ir_identity,
-    validate_normalized_ir_path_version,
-)
 from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
     ParserTargetIdentityError,
+)
+from disclosure_anchor.application.contracts.provider_document_envelope import (
+    ProviderDocumentEnvelope,
+    provider_document_envelope_to_bytes,
+)
+from disclosure_anchor.application.contracts.provider_document_admission import (
+    SourcePdfObservation,
 )
 from disclosure_anchor.application.ports.file_store import (
     ArtifactStorePort,
     FileStorePathPort,
     RawDocumentStorePort,
 )
-from disclosure_anchor.application.ports.parser import DocumentParserPort, ParserOptions
+from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.ports.provider_document_source import (
+    ProviderDocumentSourceError,
+    ProviderDocumentSourcePort,
+)
+from disclosure_anchor.application.ports.provider_parser import (
+    ProviderDocumentParserPort,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.worker.locks import (
     exclusive_document_producer,
@@ -63,6 +71,7 @@ class ParseDocumentResult:
     status: str
     parser_artifact_relpath: str | None = None
     normalized_ir_relpath: str | None = None
+    provider_document_relpath: str | None = None
     artifact_hash: str | None = None
     error: dict[str, Any] | None = None
 
@@ -82,7 +91,8 @@ class ParseDocument:
     def __init__(
         self,
         *,
-        parser: DocumentParserPort,
+        parser: ProviderDocumentParserPort,
+        provider_source: ProviderDocumentSourcePort,
         path_builder: FileStorePathPort,
         raw_store: RawDocumentStorePort,
         artifact_store: ArtifactStorePort,
@@ -91,6 +101,7 @@ class ParseDocument:
         check_readiness: bool = True,
     ) -> None:
         self._parser = parser
+        self._provider_source = provider_source
         self._paths = path_builder
         self._raw_store = raw_store
         self._artifact_store = artifact_store
@@ -120,16 +131,17 @@ class ParseDocument:
                 status=run.status,
                 parser_artifact_relpath=run.parser_artifact_relpath,
                 normalized_ir_relpath=run.normalized_ir_relpath,
+                provider_document_relpath=run.provider_document_relpath,
                 artifact_hash=run.artifact_hash,
                 error=run.error,
             )
         try:
-            self._verify_raw_document(context)
+            source_observation = self._verify_raw_document(context)
             parser_result = self._parser.parse(
                 input_pdf=context["input_pdf"],
                 output_dir=context["artifact_root_path"],
                 options=options,
-                document_metadata=context["document_metadata"],
+                source_pdf_sha256=source_observation.sha256,
             )
             expected_target = context["parser_target_identity"]
             if (
@@ -144,43 +156,25 @@ class ParseDocument:
                 artifact_root_path=context["artifact_root_path"],
                 artifact_root=parser_result.artifact_root,
             )
-            normalized_ir = dict(parser_result.normalized_ir)
-            try:
-                ir_target = ParserTargetIdentity.from_payload(
-                    normalized_ir.get("parser")
-                )
-            except ParserTargetIdentityError as exc:
-                raise ParserOutputContractError(
-                    f"invalid NormalizedIR parser target: {exc}"
-                ) from exc
-            if ir_target != expected_target:
-                raise ParserOutputContractError(
-                    "NormalizedIR parser target differs from the prepared run"
-                )
-            normalized_ir["parser_artifacts"] = build_parser_artifact_manifest(
-                artifact_root=parser_result.artifact_root,
-                artifact_root_relpath=artifact_root_relpath,
-                artifact_paths=parser_result.artifact_paths,
+            document = context["document"]
+            envelope = ProviderDocumentEnvelope.build(
+                document_id=document.document_id,
+                artifact_owner_processing_run_id=(
+                    context["processing_run_id"]
+                ),
+                provider=cast(str, document.provider),
+                provider_document_id=cast(str, document.provider_document_id),
+                source_pdf_relpath=cast(str, document.raw_file_relpath),
+                source_pdf_page_count=source_observation.page_count,
+                parser_artifact_root_relpath=artifact_root_relpath.as_posix(),
+                parser_target_identity=expected_target,
+                provider_document=parser_result.provider_document,
             )
-            try:
-                version = validate_current_normalized_ir_for_write(normalized_ir)
-                validate_normalized_ir_identity(
-                    normalized_ir,
-                    document_id=context["document"].document_id,
-                    source_pdf=str(context["document_metadata"]["source_pdf"]),
-                )
-                validate_normalized_ir_path_version(
-                    context["normalized_ir_relpath"], version=version
-                )
-            except NormalizedIRVersionError as exc:
-                raise ParserOutputContractError(
-                    f"invalid NormalizedIR contract [{exc.reason_code}]: {exc}"
-                ) from exc
-            normalized_ir_result = self._artifact_store.write_json_atomic(
-                relpath=context["normalized_ir_relpath"],
-                payload=normalized_ir,
+            record_bytes = provider_document_envelope_to_bytes(envelope)
+            provider_result = self._artifact_store.write_text_atomic(
+                relpath=context["provider_document_relpath"],
+                text=record_bytes.decode("utf-8"),
             )
-            normalized_ir_hash = normalized_ir_result.artifact_hash
         except (
             _ParseRunFailure,
             ParserTimeoutError,
@@ -200,6 +194,7 @@ class ParseDocument:
                 status=run.status,
                 parser_artifact_relpath=run.parser_artifact_relpath,
                 normalized_ir_relpath=run.normalized_ir_relpath,
+                provider_document_relpath=run.provider_document_relpath,
                 artifact_hash=run.artifact_hash,
                 error=run.error,
             )
@@ -223,6 +218,7 @@ class ParseDocument:
                 status=run.status,
                 parser_artifact_relpath=run.parser_artifact_relpath,
                 normalized_ir_relpath=run.normalized_ir_relpath,
+                provider_document_relpath=run.provider_document_relpath,
                 artifact_hash=run.artifact_hash,
                 error=run.error,
             )
@@ -244,14 +240,15 @@ class ParseDocument:
             status="succeeded",
             input_raw_file_hash=context["document"].raw_file_hash,
             parser_artifact_relpath=str(artifact_root_relpath),
-            normalized_ir_relpath=str(context["normalized_ir_relpath"]),
-            artifact_hash=normalized_ir_hash,
+            provider_document_relpath=str(context["provider_document_relpath"]),
+            artifact_hash=provider_result.artifact_hash,
         )
         return ParseDocumentResult(
             processing_run_id=run.processing_run_id,
             status=run.status,
             parser_artifact_relpath=run.parser_artifact_relpath,
             normalized_ir_relpath=run.normalized_ir_relpath,
+            provider_document_relpath=run.provider_document_relpath,
             artifact_hash=run.artifact_hash,
         )
 
@@ -293,11 +290,11 @@ class ParseDocument:
                 provider_document_id=provider_document_id,
                 processing_run_id=processing_run_id,
             )
-            normalized_ir_relpath = self._paths.normalized_ir_run_relpath(
+            provider_document_relpath = self._paths.provider_document_relpath(
                 provider=provider,
                 security_code=security.security_code,
                 provider_document_id=provider_document_id,
-                processing_run_id=processing_run_id,
+                artifact_owner_processing_run_id=processing_run_id,
             )
             prepare_error: dict[str, Any] | None = None
             parser_target_identity: ParserTargetIdentity | None = None
@@ -305,16 +302,20 @@ class ParseDocument:
                 identity = self._parser.identity()
                 parser_name = identity.name
                 parser_version = identity.version
-            except ParserVersionProbeError as exc:
+            except (ParserVersionProbeError, ParserOutputContractError) as exc:
                 parser_name = self._parser.__class__.__name__
                 parser_version = None
                 prepare_error = self._structured_error(
                     stage="parser_identity",
-                    error_code="parser_version_probe_failed",
+                    error_code=(
+                        "parser_version_probe_failed"
+                        if isinstance(exc, ParserVersionProbeError)
+                        else "parser_output_contract_failed"
+                    ),
                     # Parser identity is process/configuration health, not a
                     # property of this PDF. Keep the item retryable so a
                     # repaired binary/service can resume after worker cooldown.
-                    retryable=True,
+                    retryable=isinstance(exc, ParserVersionProbeError),
                     retry_budget_class="infrastructure",
                     message=str(exc),
                 )
@@ -342,11 +343,15 @@ class ParseDocument:
                 ):
                     try:
                         readiness(options)
-                    except ParserVersionProbeError as exc:
+                    except (ParserVersionProbeError, ParserOutputContractError) as exc:
                         prepare_error = self._structured_error(
                             stage="parser_readiness",
-                            error_code="parser_readiness_failed",
-                            retryable=True,
+                            error_code=(
+                                "parser_readiness_failed"
+                                if isinstance(exc, ParserVersionProbeError)
+                                else "parser_output_contract_failed"
+                            ),
+                            retryable=isinstance(exc, ParserVersionProbeError),
                             retry_budget_class="infrastructure",
                             message=str(exc),
                         )
@@ -369,7 +374,8 @@ class ParseDocument:
                     ),
                     input_raw_file_hash=document.raw_file_hash,
                     parser_artifact_relpath=str(artifact_root_relpath),
-                    normalized_ir_relpath=str(normalized_ir_relpath),
+                    normalized_ir_relpath=None,
+                    provider_document_relpath=str(provider_document_relpath),
                     started_at=now,
                     finished_at=now if prepare_error else None,
                     error=prepare_error,
@@ -407,7 +413,7 @@ class ParseDocument:
             ),
             "artifact_root_relpath": artifact_root_relpath,
             "artifact_root_path": self._paths.data_path(artifact_root_relpath),
-            "normalized_ir_relpath": normalized_ir_relpath,
+            "provider_document_relpath": provider_document_relpath,
             "parser_target_identity": parser_target_identity,
             "document_metadata": {
                 "document_id": document.document_id,
@@ -436,24 +442,53 @@ class ParseDocument:
                 f"document {document.document_id} missing parse metadata: {missing}"
             )
 
-    def _verify_raw_document(self, context: dict[str, Any]) -> None:
+    def _verify_raw_document(
+        self, context: dict[str, Any]
+    ) -> SourcePdfObservation:
         document = context["document"]
         verification = self._raw_store.verify_raw_document(
             relpath=Path(document.raw_file_relpath),
             expected_hash=document.raw_file_hash,
         )
-        if verification.ok:
-            return
-        error_code = (
-            "raw_missing" if verification.actual_hash is None else "raw_hash_mismatch"
-        )
-        raise _ParseRunFailure(
-            stage="raw_verification",
-            error_code=error_code,
-            retryable=False,
-            retry_budget_class="item",
-            message=verification.message,
-        )
+        if not verification.ok:
+            error_code = (
+                "raw_missing"
+                if verification.actual_hash is None
+                else "raw_hash_mismatch"
+            )
+            raise _ParseRunFailure(
+                stage="raw_verification",
+                error_code=error_code,
+                retryable=False,
+                retry_budget_class="item",
+                message=verification.message,
+            )
+        try:
+            observation = self._provider_source.observe_source_pdf(
+                Path(document.raw_file_relpath)
+            )
+        except ProviderDocumentSourceError as exc:
+            raise _ParseRunFailure(
+                stage="raw_verification",
+                error_code=exc.reason_code,
+                retryable=exc.retryable,
+                retry_budget_class=(
+                    "infrastructure" if exc.retryable else "item"
+                ),
+                message=str(exc),
+            ) from exc
+        if observation.sha256 != document.raw_file_hash:
+            raise _ParseRunFailure(
+                stage="raw_verification",
+                error_code="raw_hash_mismatch",
+                retryable=False,
+                retry_budget_class="item",
+                message=(
+                    "independent source observation differs from the registered "
+                    "raw file hash"
+                ),
+            )
+        return observation
 
     def _artifact_root_relpath(
         self,
@@ -487,7 +522,7 @@ class ParseDocument:
         status: str,
         input_raw_file_hash: str | None = None,
         parser_artifact_relpath: str | None = None,
-        normalized_ir_relpath: str | None = None,
+        provider_document_relpath: str | None = None,
         artifact_hash: str | None = None,
         error: dict[str, Any] | None = None,
     ) -> e.ProcessingRun:
@@ -516,8 +551,8 @@ class ParseDocument:
             run.parser_artifact_relpath = (
                 parser_artifact_relpath or run.parser_artifact_relpath
             )
-            run.normalized_ir_relpath = (
-                normalized_ir_relpath or run.normalized_ir_relpath
+            run.provider_document_relpath = (
+                provider_document_relpath or run.provider_document_relpath
             )
             run.artifact_hash = artifact_hash or run.artifact_hash
             run.error = error

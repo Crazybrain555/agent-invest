@@ -1,6 +1,6 @@
 """Immutable manifest contract shared by corpus reset and reparse tools.
 
-The v6 manifest records a closed catalog-bound PostgreSQL binary-COPY state
+The v7 manifest records a closed catalog-bound PostgreSQL binary-COPY state
 matrix, raw-file hashes, and run-owned artifact paths. Every preserved raw
 document is a replay target; filing taxonomy and title text cannot narrow that
 closure. Older count/sample manifests cannot authorize any operation.
@@ -24,15 +24,12 @@ from scripts.corpus_reset_digest import (
     ResetDigestError,
     validate_state_matrix,
 )
-from disclosure_anchor.application.contracts.normalized_ir import (
-    CURRENT_NORMALIZED_IR_VERSION,
-)
 from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
     ParserTargetIdentityError,
 )
 
-MANIFEST_SCHEMA = "corpus-reparse-reset-manifest.v6"
+MANIFEST_SCHEMA = "corpus-reparse-reset-manifest.v7"
 _HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 PathFamily = Literal[
     "raw",
@@ -575,7 +572,6 @@ def _validate_header(
     for field in (
         "builder_rules_version",
         "retrieval_rules_version",
-        "normalized_ir_contract_version",
     ):
         _required_string(target, field)
     expected_target_fields = {
@@ -584,7 +580,6 @@ def _validate_header(
         "max_build_retries",
         "builder_rules_version",
         "retrieval_rules_version",
-        "normalized_ir_contract_version",
     }
     if set(target) != expected_target_fields:
         raise ManifestError("manifest target_identity field coverage mismatch")
@@ -598,13 +593,6 @@ def _validate_header(
         ) from exc
     if not parser_target.full_pdf:
         raise ManifestError("corpus reparse target must cover the full PDF")
-    if (
-        target["normalized_ir_contract_version"]
-        != CURRENT_NORMALIZED_IR_VERSION
-    ):
-        raise ManifestError(
-            "manifest target_identity normalized IR contract is unsupported"
-        )
     for field in ("max_parse_retries", "max_build_retries"):
         if _required_nonnegative_int(target, field) < 1:
             raise ManifestError(

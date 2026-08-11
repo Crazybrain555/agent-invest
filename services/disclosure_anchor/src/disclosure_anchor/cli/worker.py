@@ -34,9 +34,8 @@ from disclosure_anchor.adapters.parsers.mineru.mineru_process import (
     MinerUProcess,
     terminate_active_mineru_processes,
 )
-from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
-from disclosure_anchor.adapters.parsers.mineru.source_evidence_validator import (
-    MinerUSourceEvidenceValidator,
+from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
+    MinerUMediumDocumentParser,
 )
 from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
 from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
@@ -44,6 +43,9 @@ from disclosure_anchor.adapters.sources.cninfo.source import CninfoWebIndexSourc
 from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
+from disclosure_anchor.adapters.storage.provider_document_source import (
+    ProviderDocumentFileSource,
+)
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
 from disclosure_anchor.application.dto.worker_report import (
     WorkerFailure,
@@ -52,6 +54,9 @@ from disclosure_anchor.application.dto.worker_report import (
 )
 from disclosure_anchor.application.ports.disclosure_source import DisclosureSourcePort
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.contracts.provider_unit import (
+    PROVIDER_UNIT_BUILDER_VERSION,
+)
 from disclosure_anchor.application.worker.locks import WORKER_NS
 from disclosure_anchor.application.worker.worker import (
     WorkerConfig,
@@ -951,7 +956,7 @@ def _deps(
             return lambda _security_code: None
         return loader
 
-    def parser_factory() -> MinerUDocumentParser:
+    def parser_factory() -> MinerUMediumDocumentParser:
         nonlocal parser_version
         executable = settings.disclosure_mineru_bin or Path("mineru")
         process = MinerUProcess(executable=executable)
@@ -959,19 +964,20 @@ def _deps(
             with parser_version_lock:
                 if parser_version is None:
                     parser_version = process.version()
-        return MinerUDocumentParser(
+        return MinerUMediumDocumentParser(
             process=process,
             parser_version=parser_version,
             server_url=settings.disclosure_mineru_server_url,
         )
 
+    provider_source = ProviderDocumentFileSource(paths)
     return WorkerDeps(
         engine=engine,
         uow_factory=unit_of_work_factory(engine),
         path_builder=paths,
         raw_store=RawDocumentStore(paths),
         artifact_store=ArtifactStore(paths),
-        source_evidence_validator=MinerUSourceEvidenceValidator(),
+        provider_source=provider_source,
         source_factory=source_factory,
         profile_loader_factory=profile_loader_factory,
         parser_factory=parser_factory,
@@ -1015,7 +1021,9 @@ def _deps(
         ),
         clock=lambda: datetime.now(timezone.utc),
         parser_options=ParserOptions(
-            backend=settings.disclosure_mineru_backend,
+            backend="hybrid-http-client",
+            effort="medium",
+            image_analysis=False,
             server_url=settings.disclosure_mineru_server_url,
             http_request_concurrency=(
                 settings.mineru_http_request_concurrency
@@ -1056,13 +1064,12 @@ def _print_version_banner(settings: Settings) -> None:
     logs. DB rule versions are best-effort — a down DB must not block boot.
     """
 
-    from disclosure_anchor.application.services.unit_builder import rules as builder_rules
-
     scope = _process_scope_classes(settings)
     per_document_cap = settings.mineru_http_request_concurrency or 0
     line = (
         f"[versions] policy={settings.disclosure_processing_policy_path.name} "
-        f"scope_classes={len(scope)} builder_rules={builder_rules.RULES_VERSION} "
+        f"scope_classes={len(scope)} "
+        f"builder_rules={PROVIDER_UNIT_BUILDER_VERSION} "
         f"gpu_request_cap="
         f"{settings.worker_parse_concurrency}x"
         f"{per_document_cap}"

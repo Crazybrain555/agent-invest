@@ -1,75 +1,61 @@
+from __future__ import annotations
+
 import hashlib
-import json
 from pathlib import Path
 import tempfile
 import unittest
-from typing import Any
 
+from disclosure_anchor.application.contracts.provider_document_admission import (
+    SourcePdfObservation,
+)
+from disclosure_anchor.application.contracts.provider_document_envelope import (
+    provider_document_envelope_from_bytes,
+)
 from disclosure_anchor.application.ports.file_store import (
     ArtifactWriteResult,
     RawDocumentVerification,
 )
-from disclosure_anchor.application.contracts.normalized_ir import (
-    CURRENT_NORMALIZED_IR_VERSION,
-    normalized_ir_filename,
+from disclosure_anchor.application.ports.parser import ParserIdentity, ParserOptions
+from disclosure_anchor.application.ports.provider_document_source import (
+    ProviderDocumentSourceError,
 )
-from disclosure_anchor.application.contracts.document_structure import (
-    DOCUMENT_STRUCTURE_ALGORITHM,
-    DOCUMENT_STRUCTURE_VERSION,
-    carrier_set_sha256,
-)
-from disclosure_anchor.application.contracts.visual_semantics import (
-    MINERU_VL_UTILS_PACKAGE_VERSION,
-    VisualSemanticClosure,
-    parser_target_sha256,
-    visual_semantic_bytes,
-    visual_semantic_diagnostics,
-)
-from disclosure_anchor.application.ports.parser import (
-    ParserIdentity,
-    ParserOptions,
-    ParserResult,
-)
+from disclosure_anchor.application.ports.provider_parser import ProviderParserResult
 from disclosure_anchor.application.use_cases.parse_document import (
     ParseDocument,
     ParseDocumentCommand,
-    build_parser_artifact_manifest,
 )
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.errors import (
     ParseDocumentError,
-    ParserBackendOverloadedError,
-    ParserCancelledError,
-    ParserInvocationError,
-    ParserLocalInvocationError,
     ParserOutputContractError,
-    ParserTaskDeadlineError,
-    ParserTaskError,
     ParserTimeoutError,
-    ParserUnknownError,
-    ParserVersionProbeError,
 )
 from tests.unit._fakes import FakeUnitOfWork
+from tests.unit.test_provider_document_admission import _provider_document
 
 
 _RAW_HASH = "sha256:" + "a" * 64
-_RUNTIME_BUNDLE_HASH = "sha256:" + "b" * 64
+_RUNTIME_HASH = "sha256:" + "b" * 64
+_RAW_RELPATH = Path(
+    "raw_documents/cninfo/002484/2026/pid_1/sha256_" + "a" * 64 + ".pdf"
+)
 
 
-def _command(
-    *,
-    options: ParserOptions | None = None,
-) -> ParseDocumentCommand:
-    return ParseDocumentCommand(
-        document_id="doc_1",
-        options=options
-        or ParserOptions(runtime_bundle_identity_sha256=_RUNTIME_BUNDLE_HASH),
-    )
+def _options(**overrides: object) -> ParserOptions:
+    values: dict[str, object] = {
+        "backend": "hybrid-http-client",
+        "effort": "medium",
+        "image_analysis": False,
+        "server_url": "http://127.0.0.1:30000",
+        "runtime_bundle_identity_sha256": _RUNTIME_HASH,
+    }
+    values.update(overrides)
+    return ParserOptions(**values)  # type: ignore[arg-type]
 
 
 class _PathBuilder:
-    def __init__(self) -> None:
-        self.root = Path("/tmp/disclosure-anchor-test")
+    def __init__(self, root: Path) -> None:
+        self.root = root
 
     def data_path(self, relpath: Path) -> Path:
         return self.root / relpath
@@ -90,68 +76,88 @@ class _PathBuilder:
             / processing_run_id
         )
 
-    def normalized_ir_run_relpath(
+    def provider_document_relpath(
         self,
         *,
         provider: str,
         security_code: str,
         provider_document_id: str,
-        processing_run_id: str,
+        artifact_owner_processing_run_id: str,
     ) -> Path:
         return (
-            Path("derived/normalized_ir")
+            Path("derived/provider_documents")
             / provider
             / security_code
             / provider_document_id
-            / processing_run_id
-            / normalized_ir_filename()
+            / artifact_owner_processing_run_id
+            / "provider_document.v1.json"
         )
 
 
 class _RawStore:
-    def __init__(self, *, ok: bool = True, actual_hash: str | None = _RAW_HASH) -> None:
+    def __init__(self, *, ok: bool = True) -> None:
         self.ok = ok
-        self.actual_hash = actual_hash
 
-    def verify_raw_document(self, *, relpath: Path, expected_hash: str):
+    def verify_raw_document(
+        self, *, relpath: Path, expected_hash: str
+    ) -> RawDocumentVerification:
         return RawDocumentVerification(
             relpath=relpath,
             expected_hash=expected_hash,
-            actual_hash=self.actual_hash,
+            actual_hash=_RAW_HASH if self.ok else None,
             ok=self.ok,
-            message="ok" if self.ok else "raw verification failed",
+            message="ok" if self.ok else "raw missing",
         )
 
-    def put_raw_document(self, **_):
-        raise AssertionError("not used by parse tests")
 
-    def quarantine_raw_document(self, **_):
-        raise AssertionError("not used by parse tests")
+class _ProviderSource:
+    def __init__(
+        self,
+        *,
+        observation: SourcePdfObservation | None = None,
+        error: ProviderDocumentSourceError | None = None,
+    ) -> None:
+        self.observation = observation or SourcePdfObservation(
+            sha256=_RAW_HASH,
+            page_count=1,
+        )
+        self.error = error
+
+    def observe_source_pdf(self, _relpath: Path) -> SourcePdfObservation:
+        if self.error is not None:
+            raise self.error
+        return self.observation
+
+    def read_provider_document_record(self, _relpath: Path) -> bytes:
+        raise AssertionError("parse does not read a provider record")
+
+    def rebuild_provider_document(self, *_args: object, **_kwargs: object) -> object:
+        raise AssertionError("parse does not re-admit its new record")
 
 
 class _ArtifactStore:
-    def __init__(self) -> None:
-        self.payloads: dict[str, object] = {}
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.records: dict[Path, bytes] = {}
 
-    def write_json_atomic(self, *, relpath: Path, payload: object):
-        self.payloads[str(relpath)] = payload
+    def write_text_atomic(
+        self, *, relpath: Path, text: str
+    ) -> ArtifactWriteResult:
+        if self.fail:
+            raise OSError("artifact volume unavailable")
+        payload = text.encode("utf-8")
+        self.records[relpath] = payload
         return ArtifactWriteResult(
             relpath=relpath,
-            artifact_hash="sha256:artifact",
-            byte_count=10,
+            artifact_hash=_sha(payload),
+            byte_count=len(payload),
         )
 
-    def write_jsonl_atomic(self, **_):
-        raise AssertionError("not used by parse tests")
+    def write_json_atomic(self, **_kwargs: object) -> ArtifactWriteResult:
+        raise AssertionError("provider record must use canonical text bytes")
 
-    def write_text_atomic(self, **_):
-        raise AssertionError("not used by parse tests")
-
-
-class _UnavailableArtifactStore(_ArtifactStore):
-    def write_json_atomic(self, *, relpath: Path, payload: object):
-        del relpath, payload
-        raise OSError("artifact volume unavailable")
+    def write_jsonl_atomic(self, **_kwargs: object) -> ArtifactWriteResult:
+        raise AssertionError("not used")
 
 
 class _Parser:
@@ -159,26 +165,16 @@ class _Parser:
         self,
         *,
         error: Exception | None = None,
-        identity_error: Exception | None = None,
         readiness_error: Exception | None = None,
-        contract_version: str = CURRENT_NORMALIZED_IR_VERSION,
     ) -> None:
         self.error = error
-        self.identity_error = identity_error
         self.readiness_error = readiness_error
-        self.contract_version = contract_version
         self.called = False
-        self.document_metadata: dict[str, Any] | None = None
 
     def identity(self) -> ParserIdentity:
-        if self.identity_error is not None:
-            raise self.identity_error
-        return ParserIdentity(
-            name="MinerU",
-            version="3.4.0",
-        )
+        return ParserIdentity(name="MinerU", version="3.4.4")
 
-    def readiness(self, _options: ParserOptions | None = None) -> None:
+    def readiness(self, _options: ParserOptions) -> None:
         if self.readiness_error is not None:
             raise self.readiness_error
 
@@ -188,128 +184,24 @@ class _Parser:
         input_pdf: Path,
         output_dir: Path,
         options: ParserOptions,
-        document_metadata: dict[str, Any],
-    ) -> ParserResult:
+        source_pdf_sha256: str,
+    ) -> ProviderParserResult:
+        del input_pdf
         self.called = True
-        self.document_metadata = document_metadata
         if self.error is not None:
             raise self.error
-        artifact_root = output_dir / "sample" / "auto"
-        artifact_root.mkdir(parents=True)
-        content_list = artifact_root / "sample_content_list.json"
-        content_list.write_text("[]", encoding="utf-8")
-        content_list_v2 = artifact_root / "sample_content_list_v2.json"
-        content_list_v2.write_text("[[]]", encoding="utf-8")
-        markdown = artifact_root / "sample.md"
-        markdown.write_text("sample", encoding="utf-8")
-        model = artifact_root / "sample_model.json"
-        model.write_text("[]", encoding="utf-8")
-        middle = artifact_root / "sample_middle.json"
-        middle.write_text("{}", encoding="utf-8")
-        pdf_structure = artifact_root / "sample_pdf_structure.json"
-        pdf_structure.write_text(
-            json.dumps(
-                {
-                    "source_pdf_sha256": document_metadata["raw_file_hash"],
-                    "source_pdf_page_count": 1,
-                }
-            ),
-            encoding="utf-8",
-        )
-        source_evidence = artifact_root / "sample_source_evidence.json"
-        source_evidence.write_text("{}", encoding="utf-8")
-        elements: list[dict[str, Any]] = []
         target = options.target_identity(self.identity())
-        visual_closure = VisualSemanticClosure(
-            source_pdf_sha256=document_metadata["raw_file_hash"],
-            source_pdf_page_count=1,
-            source_evidence_sha256=_hash_bytes(b"{}"),
-            content_list_sha256=_hash_bytes(b"[]"),
-            content_list_v2_sha256=_hash_bytes(b"[[]]"),
-            middle_sha256=_hash_bytes(b"{}"),
-            model_sha256=_hash_bytes(b"[]"),
-            parser_target_sha256=parser_target_sha256(target.to_payload()),
-            runtime_bundle_identity_sha256=_RUNTIME_BUNDLE_HASH,
-            mineru_package_version="3.4.0",
-            mineru_vl_utils_version=MINERU_VL_UTILS_PACKAGE_VERSION,
-            enrichment_backend="http-client",
-            enrichment_image_analysis=True,
-            server_url_sha256=_hash_bytes(b"fixture-server"),
-            formula_enabled=True,
-            dispositions=(),
-        )
-        visual_semantics = artifact_root / "sample_visual_semantics.json"
-        visual_semantics.write_bytes(visual_semantic_bytes(visual_closure))
-        normalized_ir: dict[str, Any] = {
-            "contract_version": self.contract_version,
-            "created_at": "2026-07-16T00:00:00Z",
-            "document_id": document_metadata["document_id"],
-            "source_pdf": document_metadata["source_pdf"],
-            "source_pdf_sha256": document_metadata["raw_file_hash"],
-            "source_pdf_page_count": 1,
-            "title": document_metadata["title"],
-            "parser": target.to_payload(),
-            "parser_artifacts": {},
-            # Current write contract: parsed_pages carries exactly these three keys,
-            # with full_pdf derived from whether a page window was requested.
-            "parsed_pages": {
-                "start_page_no": 1,
-                "end_page_no": 1,
-                "full_pdf": options.start_page is None and options.end_page is None,
-            },
-            "elements": elements,
-            "parser_diagnostics": {
-                "table_reconciliation": {
-                    "algorithm_version": "mineru-page-local-table-closure.v6",
-                    "model_hash": ("sha256:" + hashlib.sha256(b"[]").hexdigest()),
-                    "content_tables": 0,
-                    "model_tables": 0,
-                    "matched_tables": 0,
-                    "page_local_closed": True,
-                },
-                "visual_semantics": visual_semantic_diagnostics(visual_closure),
-            },
-            "structure_proof": {
-                "contract_version": DOCUMENT_STRUCTURE_VERSION,
-                "algorithm_version": DOCUMENT_STRUCTURE_ALGORITHM,
-                "source_pdf_sha256": document_metadata["raw_file_hash"],
-                "source_pdf_page_count": 1,
-                "carrier_set_sha256": carrier_set_sha256(elements),
-                "native": {
-                    "status": "untagged",
-                    "artifact_role": "pdf_structure",
-                },
-                "headings": [],
-                "page_frames": [],
-                "conflicts": [],
-                "coverage": {
-                    "heading_nodes": 0,
-                    "page_frame_groups": 0,
-                },
-            },
-        }
-        return ParserResult(
+        leaf = output_dir / ("sha256_" + source_pdf_sha256.removeprefix("sha256:"))
+        leaf = leaf / "hybrid_auto"
+        leaf.mkdir(parents=True)
+        return ProviderParserResult(
             target_identity=target,
-            artifact_root=artifact_root,
-            artifact_paths={
-                "content_list": content_list,
-                "content_list_v2": content_list_v2,
-                "markdown": markdown,
-                "middle": middle,
-                "model": model,
-                "pdf_structure": pdf_structure,
-                "source_evidence": source_evidence,
-                "visual_semantics": visual_semantics,
-            },
-            normalized_ir=normalized_ir,
+            artifact_root=leaf,
+            provider_document=_provider_document(),
         )
 
 
-def _hash_bytes(value: bytes) -> str:
-    return "sha256:" + hashlib.sha256(value).hexdigest()
-
-
-def _uow_with_document() -> FakeUnitOfWork:
+def _uow() -> FakeUnitOfWork:
     uow = FakeUnitOfWork()
     company = uow.companies.add(e.Company(company_id="co_1", legal_name="江海股份"))
     security = uow.securities.add(
@@ -329,286 +221,170 @@ def _uow_with_document() -> FakeUnitOfWork:
             provider="cninfo",
             provider_document_id="pid_1",
             title="公告",
-            raw_file_relpath="raw_documents/doc.pdf",
+            raw_file_relpath=str(_RAW_RELPATH),
             raw_file_hash=_RAW_HASH,
         )
     )
     return uow
 
 
-def _use_case(
-    uow: FakeUnitOfWork,
-    *,
-    parser: _Parser | None = None,
-    raw_store: _RawStore | None = None,
-    artifact_store: _ArtifactStore | None = None,
-) -> tuple[ParseDocument, _ArtifactStore]:
-    artifact_store = artifact_store or _ArtifactStore()
-    return (
-        ParseDocument(
-            parser=parser or _Parser(),
-            path_builder=_PathBuilder(),
-            raw_store=raw_store or _RawStore(),
-            artifact_store=artifact_store,
-            uow_factory=lambda: uow,
-            default_timeout_seconds=42,
-        ),
-        artifact_store,
-    )
-
-
-class ParseDocumentUnitTests(unittest.TestCase):
-    def test_artifact_manifest_hashes_roles_and_rejects_root_escape(self) -> None:
+class ParseDocumentTests(unittest.TestCase):
+    def test_writes_one_canonical_provider_record_and_no_nir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "artifact_root"
-            root.mkdir()
-            content = root / "sample_content_list.json"
-            content_bytes = b"[]"
-            content.write_bytes(content_bytes)
-            manifest = build_parser_artifact_manifest(
-                artifact_root=root,
-                artifact_root_relpath=Path("parser/run/auto"),
-                artifact_paths={
-                    "content_list": content,
-                    "middle": None,
-                },
+            uow = _uow()
+            store = _ArtifactStore()
+            parser = _Parser()
+            use_case = ParseDocument(
+                parser=parser,
+                provider_source=_ProviderSource(),
+                path_builder=_PathBuilder(Path(tmp)),
+                raw_store=_RawStore(),
+                artifact_store=store,
+                uow_factory=lambda: uow,
             )
-            self.assertEqual(
-                manifest["files"]["content_list"],
-                {
-                    "availability": "present",
-                    "relpath": "parser/run/auto/sample_content_list.json",
-                    "sha256": "sha256:" + hashlib.sha256(content_bytes).hexdigest(),
-                    "size_bytes": len(content_bytes),
-                },
+
+            result = use_case.execute(
+                ParseDocumentCommand(document_id="doc_1", options=_options())
             )
-            self.assertEqual(
-                manifest["files"]["middle"],
-                {"availability": "not_emitted"},
-            )
-            outside = Path(tmp) / "outside.json"
-            outside.write_text("{}", encoding="utf-8")
-            with self.assertRaisesRegex(
-                ParserOutputContractError,
-                "escapes artifact root",
-            ):
-                build_parser_artifact_manifest(
-                    artifact_root=root,
-                    artifact_root_relpath=Path("parser/run/auto"),
-                    artifact_paths={"content_list": outside},
-                )
 
-    def test_raw_missing_and_hash_mismatch_fail_before_parser(self) -> None:
-        for actual_hash, expected_code in (
-            (None, "raw_missing"),
-            ("sha256:other", "raw_hash_mismatch"),
-        ):
-            with self.subTest(expected_code=expected_code):
-                uow = _uow_with_document()
-                parser = _Parser()
-                use_case, _ = _use_case(
-                    uow,
-                    parser=parser,
-                    raw_store=_RawStore(ok=False, actual_hash=actual_hash),
-                )
+        self.assertEqual(result.status, "succeeded")
+        self.assertIsNone(result.normalized_ir_relpath)
+        self.assertIsNotNone(result.provider_document_relpath)
+        run = uow.processing_runs.get(result.processing_run_id)
+        assert run is not None and result.provider_document_relpath is not None
+        self.assertIsNone(run.normalized_ir_relpath)
+        self.assertEqual(run.provider_document_relpath, result.provider_document_relpath)
+        record = store.records[Path(result.provider_document_relpath)]
+        envelope = provider_document_envelope_from_bytes(record)
+        self.assertEqual(envelope.document_id, "doc_1")
+        self.assertEqual(envelope.artifact_owner_processing_run_id, run.processing_run_id)
+        self.assertEqual(run.artifact_hash, _sha(record))
+        self.assertTrue(parser.called)
 
-                result = use_case.execute(_command())
-
-                self.assertEqual(result.status, "failed")
-                self.assertEqual(result.error["error_code"], expected_code)
-                self.assertFalse(parser.called)
-
-    def test_missing_metadata_rejects_before_run_creation(self) -> None:
-        uow = _uow_with_document()
-        document = uow.documents.get("doc_1")
-        document.raw_file_hash = None
-        use_case, _ = _use_case(uow)
-
-        with self.assertRaises(ParseDocumentError):
-            use_case.execute(_command())
-
-        self.assertEqual(len(uow.processing_runs.all()), 0)
-
-    def test_successive_parses_create_independent_runs(self) -> None:
-        uow = _uow_with_document()
-        use_case, artifact_store = _use_case(uow)
-
-        first = use_case.execute(_command())
-        second = use_case.execute(
-            _command(
-                options=ParserOptions(
-                    start_page=0,
-                    end_page=0,
-                    runtime_bundle_identity_sha256=_RUNTIME_BUNDLE_HASH,
-                )
-            )
-        )
-
-        self.assertNotEqual(first.processing_run_id, second.processing_run_id)
-        self.assertEqual(len(uow.processing_runs.all()), 2)
-        self.assertEqual(uow.documents.get("doc_1").status, "parsed")
-        latest_payload = artifact_store.payloads[second.normalized_ir_relpath]
-        self.assertFalse(latest_payload["parsed_pages"]["full_pdf"])
-        self.assertEqual(
-            latest_payload["parser_artifacts"]["files"]["model"]["availability"],
-            "present",
-        )
-        self.assertRegex(
-            latest_payload["parser_artifacts"]["files"]["model"]["sha256"],
-            r"^sha256:[a-f0-9]{64}$",
-        )
-
-    def test_typed_parser_exceptions_map_to_structured_errors(self) -> None:
-        cases = (
-            (ParserTimeoutError("timeout"), "parse_timeout", True),
-            (
-                ParserTaskDeadlineError("task deadline"),
-                "parser_task_deadline_exceeded",
-                True,
-            ),
-            (ParserTaskError("task failed"), "parser_task_failed", True),
-            (
-                ParserCancelledError("worker stopped"),
-                "parser_cancelled",
-                True,
-            ),
-            (
-                ParserLocalInvocationError("spawn failed"),
-                "parser_local_invocation_failed",
-                True,
-            ),
-            (
-                ParserBackendOverloadedError("capacity rejected"),
-                "parser_backend_overloaded",
-                True,
-            ),
-            (ParserInvocationError("invoke"), "parser_invocation_failed", True),
-            (
-                ParserOutputContractError("bad output"),
-                "parser_output_contract_failed",
-                False,
-            ),
-            (ParserUnknownError("unknown"), "parser_unknown_failed", False),
-        )
-        for exc, error_code, retryable in cases:
-            with self.subTest(error_code=error_code):
-                uow = _uow_with_document()
-                use_case, _ = _use_case(uow, parser=_Parser(error=exc))
-
-                result = use_case.execute(_command())
-
-                self.assertEqual(result.status, "failed")
-                self.assertEqual(result.error["error_code"], error_code)
-                self.assertEqual(result.error["retryable"], retryable)
-
-        uow = _uow_with_document()
-        parser = _Parser(readiness_error=ParserVersionProbeError("remote unavailable"))
-        use_case, _ = _use_case(uow, parser=parser)
-
-        result = use_case.execute(_command())
+    def test_failed_raw_verification_keeps_planned_provider_address(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            uow = _uow()
+            parser = _Parser()
+            result = ParseDocument(
+                parser=parser,
+                provider_source=_ProviderSource(),
+                path_builder=_PathBuilder(Path(tmp)),
+                raw_store=_RawStore(ok=False),
+                artifact_store=_ArtifactStore(),
+                uow_factory=lambda: uow,
+            ).execute(ParseDocumentCommand(document_id="doc_1", options=_options()))
 
         self.assertEqual(result.status, "failed")
+        self.assertEqual(result.error["error_code"], "raw_missing")
+        self.assertIsNotNone(result.provider_document_relpath)
+        self.assertIsNone(result.normalized_ir_relpath)
         self.assertFalse(parser.called)
-        self.assertEqual(result.error["error_code"], "parser_readiness_failed")
-        self.assertTrue(result.error["retryable"])
 
-    def test_new_parse_rejects_legacy_ir_generation(self) -> None:
-        uow = _uow_with_document()
-        use_case, artifact_store = _use_case(
-            uow, parser=_Parser(contract_version="normalized_ir.v3")
+    def test_independent_source_drift_and_static_io_fail_closed(self) -> None:
+        cases = (
+            (
+                _ProviderSource(
+                    observation=SourcePdfObservation(
+                        sha256="sha256:" + "0" * 64,
+                        page_count=1,
+                    )
+                ),
+                "raw_hash_mismatch",
+                False,
+            ),
+            (
+                _ProviderSource(
+                    error=ProviderDocumentSourceError(
+                        "source_pdf_read_failed",
+                        "unsafe source path",
+                        retryable=False,
+                    )
+                ),
+                "source_pdf_read_failed",
+                False,
+            ),
         )
+        for source, code, retryable in cases:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp:
+                uow = _uow()
+                result = ParseDocument(
+                    parser=_Parser(),
+                    provider_source=source,
+                    path_builder=_PathBuilder(Path(tmp)),
+                    raw_store=_RawStore(),
+                    artifact_store=_ArtifactStore(),
+                    uow_factory=lambda: uow,
+                ).execute(
+                    ParseDocumentCommand(document_id="doc_1", options=_options())
+                )
+            self.assertEqual(result.error["error_code"], code)
+            self.assertEqual(result.error["retryable"], retryable)
 
-        result = use_case.execute(_command())
+    def test_parser_and_artifact_failures_are_classified(self) -> None:
+        cases = (
+            (_Parser(error=ParserTimeoutError("timeout")), _ArtifactStore(), "parse_timeout", True),
+            (_Parser(), _ArtifactStore(fail=True), "OSError", True),
+        )
+        for parser, store, code, retryable in cases:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp:
+                uow = _uow()
+                result = ParseDocument(
+                    parser=parser,
+                    provider_source=_ProviderSource(),
+                    path_builder=_PathBuilder(Path(tmp)),
+                    raw_store=_RawStore(),
+                    artifact_store=store,
+                    uow_factory=lambda: uow,
+                ).execute(
+                    ParseDocumentCommand(document_id="doc_1", options=_options())
+                )
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.error["error_code"], code)
+            self.assertEqual(result.error["retryable"], retryable)
+
+    def test_invalid_writer_profile_fails_before_parser_consumes_pdf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            uow = _uow()
+            parser = _Parser(
+                readiness_error=ParserOutputContractError("High is diagnostic only")
+            )
+            result = ParseDocument(
+                parser=parser,
+                provider_source=_ProviderSource(),
+                path_builder=_PathBuilder(Path(tmp)),
+                raw_store=_RawStore(),
+                artifact_store=_ArtifactStore(),
+                uow_factory=lambda: uow,
+            ).execute(ParseDocumentCommand(document_id="doc_1", options=_options()))
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.error["error_code"], "parser_output_contract_failed")
-        self.assertEqual(artifact_store.payloads, {})
-
-    def test_version_probe_failure_fails_closed_without_parse(self) -> None:
-        uow = _uow_with_document()
-        parser = _Parser(identity_error=ParserVersionProbeError("version failed"))
-        use_case, _ = _use_case(uow, parser=parser)
-
-        result = use_case.execute(_command())
-
-        self.assertEqual(result.status, "failed")
+        self.assertFalse(result.error["retryable"])
         self.assertFalse(parser.called)
-        self.assertEqual(result.error["error_code"], "parser_version_probe_failed")
-        self.assertTrue(result.error["retryable"])
-        self.assertEqual(uow.documents.get("doc_1").status, "parse_failed")
 
-    def test_unknown_exception_persists_failed_run_then_reraises(self) -> None:
-        uow = _uow_with_document()
-        use_case, _ = _use_case(uow, parser=_Parser(error=RuntimeError("boom")))
-
-        with self.assertRaises(RuntimeError):
-            use_case.execute(_command())
-
-        run = uow.processing_runs.all()[0]
-        self.assertEqual(run.status, "failed")
-        self.assertEqual(run.error["error_code"], "RuntimeError")
-        self.assertFalse(run.error["retryable"])
-
-    def test_artifact_io_failure_is_retryable_shared_infrastructure(self) -> None:
-        uow = _uow_with_document()
-        use_case, _ = _use_case(
-            uow,
-            artifact_store=_UnavailableArtifactStore(),
-        )
-
-        result = use_case.execute(_command())
-
-        self.assertEqual(result.status, "failed")
-        self.assertEqual(result.error["stage"], "parse_io")
-        self.assertEqual(result.error["error_code"], "OSError")
-        self.assertTrue(result.error["retryable"])
-
-    def test_published_document_parse_failure_does_not_downgrade(self) -> None:
-        uow = _uow_with_document()
-        active_run = uow.processing_runs.add(
-            e.ProcessingRun(
-                processing_run_id="run_active",
-                document_id="doc_1",
-                artifact_owner_processing_run_id="run_active",
-                run_kind="publish",
-                status="succeeded",
-                is_active=True,
-            )
-        )
+    def test_missing_document_metadata_rejects_before_run_creation(self) -> None:
+        uow = _uow()
         document = uow.documents.get("doc_1")
-        document.status = "published"
-        document.current_processing_run_id = active_run.processing_run_id
-        use_case, _ = _use_case(
-            uow,
-            parser=_Parser(error=ParserInvocationError("failed reparse")),
-        )
-
-        result = use_case.execute(_command())
-
-        self.assertEqual(result.status, "failed")
-        self.assertEqual(document.status, "published")
-        self.assertEqual(document.current_processing_run_id, "run_active")
-
-    def test_parse_events_include_envelope_fields_and_occurred_at(self) -> None:
-        uow = _uow_with_document()
-        use_case, _ = _use_case(uow)
-
-        result = use_case.execute(_command())
-
-        run = uow.processing_runs.get(result.processing_run_id)
-        self.assertEqual(
-            run.artifact_owner_processing_run_id,
-            result.processing_run_id,
-        )
-        events = uow.outbox.all()
-        self.assertEqual(len(events), 1)
-        event = events[0]
-        self.assertEqual(event.event_kind, "processing_run_created")
-        self.assertEqual(event.change_kind, "observed")
-        self.assertEqual(event.subject_kind, "processing_run")
-        self.assertEqual(event.subject_ref, result.processing_run_id)
-        self.assertIsNotNone(event.occurred_at)
+        assert document is not None
+        document.raw_file_hash = None
+        uow.documents.update(document)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ParseDocumentError):
+                ParseDocument(
+                    parser=_Parser(),
+                    provider_source=_ProviderSource(),
+                    path_builder=_PathBuilder(Path(tmp)),
+                    raw_store=_RawStore(),
+                    artifact_store=_ArtifactStore(),
+                    uow_factory=lambda: uow,
+                ).execute(
+                    ParseDocumentCommand(document_id="doc_1", options=_options())
+                )
+        self.assertEqual(uow.processing_runs.items, {})
 
 
-if __name__ == "__main__":
-    unittest.main()
+def _sha(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+__all__ = ["ParseDocumentTests"]

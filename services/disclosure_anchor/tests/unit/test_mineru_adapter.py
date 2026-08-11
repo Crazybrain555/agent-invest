@@ -531,7 +531,7 @@ class MinerUProcessTests(unittest.TestCase):
         self.assertIn("-m", command)
         self.assertIn("auto", command)
         self.assertIn("-b", command)
-        self.assertIn("pipeline", command)
+        self.assertIn("hybrid-http-client", command)
         self.assertIn("-f", command)
         self.assertEqual(command[command.index("-f") + 1], "true")
         self.assertIn("-t", command)
@@ -541,9 +541,9 @@ class MinerUProcessTests(unittest.TestCase):
         self.assertIn("-e", command)
         self.assertIn("2", command)
         self.assertNotIn("-u", command)
-        self.assertNotIn("--max-concurrency", command)
-        self.assertNotIn("--image-analysis", command)
-        self.assertNotIn("--effort", command)
+        self.assertEqual(command[command.index("--max-concurrency") + 1], "3")
+        self.assertEqual(command[command.index("--image-analysis") + 1], "false")
+        self.assertEqual(command[command.index("--effort") + 1], "medium")
 
     def test_command_appends_server_url_for_http_client_backend(self) -> None:
         process = MinerUProcess(executable=Path("/opt/mineru/bin/mineru"))
@@ -552,6 +552,7 @@ class MinerUProcessTests(unittest.TestCase):
             output_dir=Path("out"),
             options=ParserOptions(
                 backend="vlm-http-client",
+                image_analysis=True,
                 server_url="http://192.168.1.50:30000",
                 http_request_concurrency=3,
             ),
@@ -569,7 +570,11 @@ class MinerUProcessTests(unittest.TestCase):
         command = process.command_for(
             input_pdf=Path("input.pdf"),
             output_dir=Path("out"),
-            options=ParserOptions(backend="hybrid-engine"),
+            options=ParserOptions(
+                backend="hybrid-engine",
+                effort="high",
+                image_analysis=True,
+            ),
         )
 
         self.assertEqual(command[command.index("--effort") + 1], "high")
@@ -636,7 +641,7 @@ class MinerUProcessTests(unittest.TestCase):
             )
             self.assertEqual(
                 popen.call_args.kwargs["env"]["MINERU_TABLE_MERGE_ENABLE"],
-                "0",
+                "1",
             )
 
             with mock.patch.object(
@@ -2956,6 +2961,7 @@ class MinerUDocumentParserTests(unittest.TestCase):
                     input_pdf=input_pdf,
                     output_dir=root / "out",
                     options=ParserOptions(
+                        backend="pipeline",
                         runtime_bundle_identity_sha256="sha256:" + "b" * 64
                     ),
                     document_metadata={
@@ -3135,6 +3141,7 @@ class MinerUDocumentParserTests(unittest.TestCase):
                     input_pdf=input_pdf,
                     output_dir=root / "out",
                     options=ParserOptions(
+                        backend="pipeline",
                         runtime_bundle_identity_sha256="sha256:" + "b" * 64
                     ),
                     document_metadata={
@@ -3375,6 +3382,7 @@ class MinerUDocumentParserTests(unittest.TestCase):
                     input_pdf=input_pdf,
                     output_dir=root / "out",
                     options=ParserOptions(
+                        backend="pipeline",
                         runtime_bundle_identity_sha256="sha256:" + "b" * 64
                     ),
                     document_metadata={

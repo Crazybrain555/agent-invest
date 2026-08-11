@@ -310,21 +310,21 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 mineru_model_cache=root / "shared" / "mineru",
                 hf_home=root / "shared" / "hf",
                 modelscope_cache=root / "shared" / "modelscope",
-                disclosure_mineru_backend="vlm-http-client",
+                disclosure_mineru_backend="hybrid-http-client",
                 disclosure_mineru_server_url="http://127.0.0.1:30000",
                 worker_parse_concurrency=16,
                 worker_gpu_request_budget=112,
                 worker_gpu_max_sequences=128,
             )
             with mock.patch.object(
-                worker_cli.MinerUProcess, "version", return_value="3.4.0"
+                worker_cli.MinerUProcess, "version", return_value="3.4.4"
             ) as version:
                 deps = worker_cli._deps(settings, mock.MagicMock())
                 first = deps.parser_factory()
                 second = deps.parser_factory()
 
-        self.assertEqual(first.identity().version, "3.4.0")
-        self.assertEqual(second.identity().version, "3.4.0")
+        self.assertEqual(first.identity().version, "3.4.4")
+        self.assertEqual(second.identity().version, "3.4.4")
         self.assertEqual(deps.parser_options.http_request_concurrency, 7)
         self.assertEqual(deps.config.parse_runaway_timeout_seconds, 86400)
         with mock.patch.object(worker_cli, "_exit_wedged_worker") as exit_worker:
@@ -397,7 +397,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             path_builder=mock.MagicMock(),
             raw_store=mock.MagicMock(),
             artifact_store=mock.MagicMock(),
-            source_evidence_validator=mock.MagicMock(),
+            provider_source=mock.MagicMock(),
             source_factory=lambda: mock.MagicMock(),
             profile_loader_factory=lambda _source: lambda _code: None,
             parser_factory=lambda: mock.MagicMock(),

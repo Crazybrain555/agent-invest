@@ -25,19 +25,24 @@ from disclosure_anchor.adapters.db.postgres.connection import (
 )
 from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
 from disclosure_anchor.adapters.parsers.mineru.mineru_process import MinerUProcess
-from disclosure_anchor.adapters.parsers.mineru.parser import MinerUDocumentParser
-from disclosure_anchor.adapters.parsers.mineru.source_evidence_validator import (
-    MinerUSourceEvidenceValidator,
+from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
+    MinerUMediumDocumentParser,
 )
 from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
 from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
+from disclosure_anchor.adapters.storage.provider_document_source import (
+    ProviderDocumentFileSource,
+)
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.services.subject_resolver import (
     PENDING_LEGAL_NAME_PREFIX,
+)
+from disclosure_anchor.application.services.provider_document_admission import (
+    ProviderDocumentAdmission,
 )
 from disclosure_anchor.application.use_cases.build_search_projection import (
     BuildSearchProjection,
@@ -56,7 +61,7 @@ from disclosure_anchor.application.use_cases.parse_document import (
     ParseDocumentCommand,
 )
 from disclosure_anchor.application.use_cases.publish_run import (
-    NormalizedIRPublicationGuard,
+    ProviderDocumentPublicationGuard,
     PublishRun,
     PublishRunCommand,
 )
@@ -450,6 +455,7 @@ class _Deps:
         self.settings = settings
         self.paths = FileStorePathBuilder(settings)
         self.artifacts = ArtifactStore(self.paths)
+        self.provider_source = ProviderDocumentFileSource(self.paths)
         self.engine = create_db_engine(_database_url(settings))
         self.uow_factory = unit_of_work_factory(self.engine)
 
@@ -461,7 +467,9 @@ class _Deps:
 
     def parser_options(self) -> ParserOptions:
         return ParserOptions(
-            backend=self.settings.disclosure_mineru_backend,
+            backend="hybrid-http-client",
+            effort="medium",
+            image_analysis=False,
             server_url=self.settings.disclosure_mineru_server_url,
             http_request_concurrency=(
                 self.settings.mineru_http_request_concurrency
@@ -473,12 +481,13 @@ class _Deps:
 
     def parse(self) -> ParseDocument:
         executable = self.settings.disclosure_mineru_bin or Path("mineru")
-        parser = MinerUDocumentParser(
+        parser = MinerUMediumDocumentParser(
             process=MinerUProcess(executable=executable),
             server_url=self.settings.disclosure_mineru_server_url,
         )
         return ParseDocument(
             parser=parser,
+            provider_source=self.provider_source,
             path_builder=self.paths,
             raw_store=RawDocumentStore(self.paths),
             artifact_store=self.artifacts,
@@ -493,13 +502,21 @@ class _Deps:
             path_builder=self.paths,
             artifact_store=self.artifacts,
             uow_factory=self.uow_factory,
-            source_evidence_validator=MinerUSourceEvidenceValidator(),
+            admission=ProviderDocumentAdmission(
+                path_builder=self.paths,
+                source=self.provider_source,
+            ),
         )
 
     def publish(self) -> PublishRun:
         return PublishRun(
             uow_factory=self.uow_factory,
-            publication_guard=NormalizedIRPublicationGuard(self.paths),
+            publication_guard=ProviderDocumentPublicationGuard(
+                ProviderDocumentAdmission(
+                    path_builder=self.paths,
+                    source=self.provider_source,
+                )
+            ),
         )
 
     def rebuild_units(self) -> RebuildUnits:
@@ -570,7 +587,8 @@ class _Deps:
             for row in conn.execute(
                 sql_text(
                     "SELECT parser_artifact_relpath, normalized_ir_relpath, "
-                    "document_units_relpath FROM disclosure_core.processing_run r "
+                    "provider_document_relpath, document_units_relpath "
+                    "FROM disclosure_core.processing_run r "
                     "JOIN disclosure_core.document d ON d.document_id = r.document_id "
                     "WHERE d.company_id = :cid"
                 ),

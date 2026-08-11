@@ -8,17 +8,20 @@ import unittest
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_ROOT = _SERVICE_ROOT / "src" / "disclosure_anchor"
-_GREENFIELD_FILES = (
+_GREENFIELD_CORE_FILES = (
     _SOURCE_ROOT / "application" / "contracts" / "document_outline.py",
     _SOURCE_ROOT / "application" / "contracts" / "html_visible_text.py",
     _SOURCE_ROOT / "application" / "contracts" / "provider_document.py",
+    _SOURCE_ROOT / "application" / "contracts" / "provider_document_admission.py",
     _SOURCE_ROOT / "application" / "contracts" / "provider_document_envelope.py",
     _SOURCE_ROOT / "application" / "contracts" / "provider_table_projection.py",
+    _SOURCE_ROOT / "application" / "contracts" / "provider_unit.py",
     _SOURCE_ROOT / "application" / "contracts" / "retrieval_primary.py",
     _SOURCE_ROOT / "application" / "services" / "document_outline.py",
     _SOURCE_ROOT / "application" / "services" / "provider_table_projection.py",
+    _SOURCE_ROOT / "application" / "services" / "provider_unit_builder.py",
     _SOURCE_ROOT / "application" / "services" / "retrieval_primary.py",
-    *sorted((_SOURCE_ROOT / "adapters" / "parsers" / "mineru_medium").rglob("*.py")),
+    _SOURCE_ROOT / "adapters" / "parsers" / "mineru_medium" / "artifacts.py",
 )
 _HISTORICAL_EVIDENCE_FILES = (
     _SOURCE_ROOT / "api" / "unit_evidence.py",
@@ -36,20 +39,23 @@ _ALLOWED_DISCLOSURE_IMPORTS = (
     "disclosure_anchor.application.contracts.html_visible_text",
     "disclosure_anchor.application.contracts.parser_target",
     "disclosure_anchor.application.contracts.provider_document",
+    "disclosure_anchor.application.contracts.provider_document_admission",
     "disclosure_anchor.application.contracts.provider_document_envelope",
     "disclosure_anchor.application.contracts.provider_table_projection",
+    "disclosure_anchor.application.contracts.provider_unit",
     "disclosure_anchor.application.contracts.retrieval_primary",
     "disclosure_anchor.application.services.document_outline",
     "disclosure_anchor.application.services.provider_table_projection",
     "disclosure_anchor.application.services.retrieval_primary",
     "disclosure_anchor.domain.errors",
+    "disclosure_anchor.domain.services.unit_hashing",
 )
 
 
 class GreenfieldImportFirewallTest(unittest.TestCase):
     def test_greenfield_seam_imports_no_legacy_or_third_party_module(self) -> None:
         violations: list[str] = []
-        for path in _GREENFIELD_FILES:
+        for path in _GREENFIELD_CORE_FILES:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):

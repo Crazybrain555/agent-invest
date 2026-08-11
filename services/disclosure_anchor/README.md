@@ -6,9 +6,10 @@ parses them with MinerU, slices them into L2-ready `document_unit` rows, and pub
 processing run behind stable public read contracts.
 
 Pipeline: sync (CNINFO index, API/web channels) → download (immutable raw archive) → parse
-(MinerU → NormalizedIR v2) → build units (S1–S8 semantic slicing; payload kinds
-text/table/qa/mixed) → publish active run (+ change events). A worker loop drives the queues;
-the Filing API exposes the `disclosure_public.*_v1` views; DB migrations run 0001–0013.
+(pinned MinerU 3.4.4 Hybrid-medium → `provider_document.v1`) → build source-bound coarse
+units → publish active run (+ change events). A worker loop drives provider-native queues;
+the Filing API exposes the unchanged `disclosure_public.*_v1` views. Historical NormalizedIR
+v4 runs remain readable evidence but cannot re-enter Build or Publish.
 
 ## Setup
 
@@ -23,7 +24,7 @@ Set service runtime paths in your shell or a private env file outside this check
 ## Common commands
 
 ```bash
-make db-create migrate    # bootstrap roles/database, apply migrations 0001-0013
+make db-create migrate    # bootstrap roles/database, apply the append-only migration head
 make track FILE=...       # upsert the tracked-company watchlist (offline, idempotent)
 make sync COMPANY=<scode> [WINDOW=n]   # sync one company's disclosure index
 make worker-once          # one worker round: sync -> download -> parse -> build -> publish

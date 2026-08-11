@@ -39,10 +39,11 @@ from disclosure_anchor.application.worker.locks import (
 from disclosure_anchor.settings import load_settings
 
 _MIN_AGE_SECONDS = 24 * 3600
-_MANIFEST_SCHEMA = "orphan-derived-artifacts.v2"
+_MANIFEST_SCHEMA = "orphan-derived-artifacts.v3"
 _FAMILY_ROOTS = {
     "parser_artifacts": Path("parser_artifacts"),
     "normalized_ir": Path("derived/normalized_ir"),
+    "provider_documents": Path("derived/provider_documents"),
     "document_unit_snapshots": Path("derived/document_unit_snapshots"),
 }
 _PREFIX_OWNERSHIP_FAMILIES = frozenset({"parser_artifacts"})
@@ -100,15 +101,16 @@ def _snapshot_expected_owners(conn: Connection) -> dict[str, set[str]]:
         text(
             f"""
             SELECT parser_artifact_relpath, normalized_ir_relpath,
-                   document_units_relpath
+                   provider_document_relpath, document_units_relpath
               FROM {CORE_SCHEMA}.processing_run
             """
         )
     )
-    for parser_relpath, normalized_relpath, units_relpath in rows:
+    for parser_relpath, normalized_relpath, provider_relpath, units_relpath in rows:
         values = {
             "parser_artifacts": parser_relpath,
             "normalized_ir": normalized_relpath,
+            "provider_documents": provider_relpath,
             "document_unit_snapshots": units_relpath,
         }
         for family, value in values.items():

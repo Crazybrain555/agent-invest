@@ -167,6 +167,7 @@ def _admit_and_build(
         parser_artifact_relpath=bundle_relpath,
         artifact_hash=_sha_bytes(record),
         normalized_ir_relpath=None,
+        provider_document_relpath=record_relpath.as_posix(),
     )
     source = _FrozenSource(
         record=record,
@@ -183,8 +184,8 @@ def _admit_and_build(
     admitted = admission.admit(
         document=document,
         run=run,
+        artifact_owner=run,
         security_code=security_code,
-        provider_document_relpath=record_relpath,
     )
     first = build_provider_units(admitted)
     second = build_provider_units(admitted)

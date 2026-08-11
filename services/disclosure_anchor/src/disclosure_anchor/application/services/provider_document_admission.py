@@ -41,12 +41,19 @@ class ProviderDocumentAdmission:
         *,
         document: e.Document,
         run: e.ProcessingRun,
+        artifact_owner: e.ProcessingRun,
         security_code: str,
-        provider_document_relpath: Path,
     ) -> AdmittedProviderDocument:
-        """Admit one succeeded, self-owned parse result and nothing else."""
+        """Admit one provider parse/rebuild through its self-owned parse root."""
 
-        self._validate_run(document=document, run=run)
+        self._validate_run(
+            document=document,
+            run=run,
+            artifact_owner=artifact_owner,
+        )
+        provider_document_relpath = Path(
+            _required(run.provider_document_relpath, "provider document path")
+        )
         provider = _required(document.provider, "document provider")
         provider_document_id = _required(
             document.provider_document_id,
@@ -73,7 +80,7 @@ class ProviderDocumentAdmission:
             provider=provider,
             security_code=security_code,
             provider_document_id=provider_document_id,
-            artifact_owner_processing_run_id=run.processing_run_id,
+            artifact_owner_processing_run_id=(artifact_owner.processing_run_id),
         )
         if provider_document_relpath != expected_record_relpath:
             self._fail(
@@ -92,7 +99,7 @@ class ProviderDocumentAdmission:
                 retryable=exc.retryable,
             ) from exc
         record_sha256 = _sha256(record_bytes)
-        if record_sha256 != run.artifact_hash:
+        if record_sha256 != artifact_owner.artifact_hash:
             self._fail(
                 "provider_document_hash_mismatch",
                 "provider document bytes differ from the processing run hash",
@@ -105,16 +112,18 @@ class ProviderDocumentAdmission:
                 str(exc),
             ) from exc
 
-        target = self._run_target(run)
+        target = self._run_target(artifact_owner)
         expected_facts = {
             "document_id": document.document_id,
-            "artifact_owner_processing_run_id": run.processing_run_id,
+            "artifact_owner_processing_run_id": (
+                artifact_owner.processing_run_id
+            ),
             "provider": provider,
             "provider_document_id": provider_document_id,
             "source_pdf_relpath": source_pdf_relpath,
             "input_raw_file_hash": source_pdf_sha256,
             "parser_artifact_root_relpath": _required(
-                run.parser_artifact_relpath,
+                artifact_owner.parser_artifact_relpath,
                 "parser artifact root",
             ),
             "parser_target_identity": target,
@@ -172,21 +181,24 @@ class ProviderDocumentAdmission:
         *,
         document: e.Document,
         run: e.ProcessingRun,
+        artifact_owner: e.ProcessingRun,
     ) -> None:
         if (
             run.document_id != document.document_id
-            or run.run_kind != "parse"
+            or run.run_kind not in {"parse", "rebuild_units"}
             or run.status != "succeeded"
-            or run.artifact_owner_processing_run_id != run.processing_run_id
         ):
             self._fail(
                 "parse_owner_invalid",
-                "provider document admission requires a succeeded self-owned parse",
+                "provider document admission requires a succeeded provider run",
             )
-        if run.normalized_ir_relpath is not None:
+        if (
+            run.normalized_ir_relpath is not None
+            or run.provider_document_relpath is None
+        ):
             self._fail(
                 "run_output_contract_unsupported",
-                "legacy or dual-tagged parse output cannot enter provider admission",
+                "legacy, missing, or dual-tagged output cannot enter admission",
             )
         if run.input_raw_file_hash != document.raw_file_hash:
             self._fail(
@@ -198,6 +210,39 @@ class ProviderDocumentAdmission:
                 "parse_owner_identity_mismatch",
                 "parse owner has no provider document hash",
             )
+        if (
+            artifact_owner.document_id != document.document_id
+            or artifact_owner.run_kind != "parse"
+            or artifact_owner.status != "succeeded"
+            or artifact_owner.artifact_owner_processing_run_id
+            != artifact_owner.processing_run_id
+            or artifact_owner.normalized_ir_relpath is not None
+            or artifact_owner.provider_document_relpath is None
+            or run.artifact_owner_processing_run_id
+            != artifact_owner.processing_run_id
+        ):
+            self._fail(
+                "parse_owner_invalid",
+                "provider run does not reference a succeeded self-owned parse",
+            )
+        copied_fields = (
+            "input_raw_file_hash",
+            "parser_artifact_relpath",
+            "artifact_hash",
+            "provider_document_relpath",
+            "parser_name",
+            "parser_version",
+            "parser_backend",
+            "parser_method",
+            "parser_language",
+            "parser_target_identity",
+        )
+        for field in copied_fields:
+            if getattr(run, field) != getattr(artifact_owner, field):
+                self._fail(
+                    "parse_owner_identity_mismatch",
+                    f"provider run field {field} differs from its parse owner",
+                )
 
     def _run_target(self, run: e.ProcessingRun) -> ParserTargetIdentity:
         try:

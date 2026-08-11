@@ -12,7 +12,7 @@ from __future__ import annotations
 import threading
 import unicodedata
 
-RETRIEVAL_RULES_VERSION = "rp-2026.07-5"
+RETRIEVAL_RULES_VERSION = "rp-2026.08-provider-unit-v1"
 
 _lock = threading.Lock()
 _tokenizer = None

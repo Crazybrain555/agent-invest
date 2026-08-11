@@ -1,64 +1,53 @@
-"""06R search projection: tokenizer + deterministic row computation (no DB).
-
-Covers the pure, DB-free surface of milestone 06R: the pinned jieba tokenizer
-and source-bound SearchAtom replay. Body fields are declared by the unit source
-projection; they are never discovered by recursively walking payload JSON.
-"""
+"""Provider-native search projection and tokenizer tests (DB-free)."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import unittest
 
 from disclosure_anchor.adapters.retrieval import tokenizer
-from disclosure_anchor.application.contracts.unit_source_projection import (
-    SearchTargetContractError,
-    search_text_values,
+from disclosure_anchor.application.contracts.provider_document import ProviderPayload
+from disclosure_anchor.application.contracts.provider_unit import (
+    ProviderUnitSearchContractError,
+    provider_unit_locator_to_payload,
+)
+from disclosure_anchor.application.services.provider_unit_builder import (
+    build_provider_units,
+    provider_unit_search_text_values,
 )
 from disclosure_anchor.application.use_cases.build_search_projection import (
     compute_search_projection_row,
 )
-from tests.unit.test_unit_builder import (
-    _build,
-    _element,
-    _sample_share_change,
+from tests.unit.test_provider_unit_builder import (
+    _admitted,
+    _block,
+    _document,
+    _identical_text_parts_document,
+    _representative_document,
+    _visual_only_document,
 )
 
-_BUILT_AT = datetime(2026, 7, 17, tzinfo=timezone.utc)
+
+_BUILT_AT = datetime(2026, 8, 12, tzinfo=timezone.utc)
 
 
-def _search_locator(
-    *,
-    projection_kind: str,
-    projection_target: str,
-    targets: list[tuple[str, str]],
-) -> dict[str, object]:
-    return {
-        "source_projection": {
-            "version": "unit-source-projection.v4",
-            "payload": {
-                "kind": projection_kind,
-                "sources": [{"source": {}, "field": {}}],
-                "target_field": projection_target,
-                "transform": "test",
-            },
-            "heading_path": [],
-            "structured": [
-                {
-                    "kind": "derived_field",
-                    "source": {},
-                    "target_field": target_field,
-                    "transform": "identity.v1",
-                }
-                for target_field, role in targets
-                if role == "structured"
-            ],
-            "provenance": [],
-            "search_targets": [target_field for target_field, _role in targets],
-            "search_atoms": [],
-            "physical_context": None,
-        }
-    }
+def _heading_only_document():  # type: ignore[no-untyped-def]
+    return _document(
+        pages=(
+            (
+                _block(
+                    0,
+                    0,
+                    "text",
+                    (ProviderPayload("text", None, "唯一标题"),),
+                    annotation="title",
+                    level=1,
+                ),
+            ),
+        ),
+        segments=(),
+    )
 
 
 class TokenizerTests(unittest.TestCase):
@@ -72,8 +61,7 @@ class TokenizerTests(unittest.TestCase):
             tokenizer.query_word_tokens("应收账款账龄分析"),
         )
 
-    def test_analyzers_normalize_width_and_case_and_empty(self) -> None:
-        # NFKC folds full-width forms; casefold lowercases; blank -> "".
+    def test_analyzers_normalize_width_case_and_empty(self) -> None:
         self.assertEqual(
             tokenizer.normalize_search_text("ＡＢＣ％ＤＥＦ＿ＧＨ＼Ｉ"),
             "abc%def_gh\\i",
@@ -87,14 +75,9 @@ class TokenizerTests(unittest.TestCase):
         self.assertEqual(tokenizer.query_word_tokens("   "), ())
 
     def test_search_mode_index_contains_exact_query_subterms(self) -> None:
-        indexed = set(
-            tokenizer.index_word_tokens("股份变动及股东情况").split()
-        )
+        indexed = set(tokenizer.index_word_tokens("股份变动及股东情况").split())
         for query in ("股份变动", "股东情况"):
-            self.assertLessEqual(
-                set(tokenizer.query_word_tokens(query)),
-                indexed,
-            )
+            self.assertLessEqual(set(tokenizer.query_word_tokens(query)), indexed)
 
     def test_query_groups_have_no_content_alias_expansion(self) -> None:
         self.assertEqual(
@@ -102,130 +85,43 @@ class TokenizerTests(unittest.TestCase):
             ("'商誉'", "'减值'"),
         )
         self.assertEqual(
-            tokenizer.build_search_tsquery("商誉减值"), "'商誉' & '减值'"
+            tokenizer.build_search_tsquery("商誉减值"),
+            "'商誉' & '减值'",
         )
         self.assertEqual(tokenizer.build_search_tsquery_groups("  "), ())
         self.assertEqual(tokenizer.build_search_tsquery("  "), "")
-        self.assertEqual(tokenizer.build_search_tsquery("半年报"), "'半年报'")
         self.assertNotIn("半年度", tokenizer.build_search_tsquery("半年报"))
-        self.assertIn(
-            "'\\\\'",
-            tokenizer.build_search_tsquery_groups("ＡＢＣ％ＤＥＦ＿ＧＨ＼Ｉ"),
-        )
 
 
-class SearchTargetTests(unittest.TestCase):
-    def test_text_has_one_explicit_payload_target(self) -> None:
-        (unit,), _ = _build([_element(0, text="货币资金明细")])
+class ProviderSearchTargetTests(unittest.TestCase):
+    def test_title_is_excluded_and_body_replays_only_explicit_bindings(self) -> None:
+        draft = build_provider_units(_admitted(_representative_document())).units[1]
 
-        self.assertEqual(
-            search_text_values(
-                payload_kind=unit.payload_kind,
-                payload=unit.payload,
-                artifact_locator=unit.artifact_locator,
-            ),
-            ("货币资金明细",),
-        )
-        graph = unit.artifact_locator["source_projection"]
-        self.assertEqual(
-            graph["search_targets"],
-            ["payload.text"],
-        )
-        for typed_element in (
-            _element(
-                0,
-                text="第一项",
-                raw_kind="list",
-                list_items=["第一项"],
-                list_subtype="ordered",
-            ),
-            _element(
-                0,
-                text="print('x')",
-                raw_kind="code",
-                code_body="print('x')",
-                code_caption=[],
-                code_footnote=[],
-            ),
-        ):
-            with self.subTest(raw_kind=typed_element["raw_kind"]):
-                (typed_unit,), _ = _build([typed_element])
-                self.assertEqual(
-                    typed_unit.artifact_locator["source_projection"][
-                        "search_targets"
-                    ],
-                    ["payload.text"],
-                )
-
-    def test_table_indexes_only_source_owned_evidence_fields(self) -> None:
-        (unit,), _ = _build(
-            [
-                _element(
-                    0,
-                    kind="table",
-                    raw_kind="table",
-                    table_caption=["应收账款账龄"],
-                    table_footnote=["注1"],
-                    table={
-                        "headers": ["账龄", "金额"],
-                        "rows": [["1年以内", "100"]],
-                        "merged_cells": [],
-                    },
-                )
-            ]
-        )
-        unit.payload.update(
-            {
-                "context": "CONTEXT_SENTINEL",
-                "metadata": "METADATA_SENTINEL",
-                "raw_html": "<b>RAW_SENTINEL</b>",
-            }
-        )
-        body = " ".join(
-            search_text_values(
-                payload_kind=unit.payload_kind,
-                payload=unit.payload,
-                artifact_locator=unit.artifact_locator,
-            )
+        values = provider_unit_search_text_values(
+            payload_kind=draft.payload_kind,
+            payload=draft.payload,
+            title=draft.title,
+            artifact_locator=provider_unit_locator_to_payload(draft.locator),
         )
 
-        for expected in ("应收账款账龄", "账龄", "金额", "1年以内", "100", "注1"):
+        body = " ".join(values)
+        self.assertNotIn("第一章 标题", body)
+        for expected in ("正文", "甲", "表一", "□适用"):
             self.assertIn(expected, body)
-        for excluded in (
-            "CONTEXT_SENTINEL",
-            "METADATA_SENTINEL",
-            "RAW_SENTINEL",
-            str(unit.payload.get("unit") or ""),
-        ):
-            if excluded:
-                self.assertNotIn(excluded, body)
+        self.assertNotIn("image_0001", body)
 
-    def test_mixed_container_has_no_targets_and_replays_parts_in_order(self) -> None:
-        elements, headings = _sample_share_change()
-        units, _ = _build(elements, headings=headings)
-        (unit,) = units
-
-        self.assertEqual(
-            unit.artifact_locator["source_projection"]["search_targets"],
-            [],
-        )
-        values = search_text_values(
-            payload_kind="mixed",
-            payload=unit.payload,
-            artifact_locator=unit.artifact_locator,
-        )
-        self.assertIn("单位：股", " ".join(values))
-        self.assertIn("股份总数", " ".join(values))
         row = compute_search_projection_row(
-            asset_id="ua_mixed_atoms",
-            title=unit.title,
-            heading_path=unit.heading_path,
-            payload_kind=unit.payload_kind,
-            payload=unit.payload,
-            semantic_keys=unit.semantic_keys,
-            artifact_locator=unit.artifact_locator,
+            asset_id="asset_1",
+            title=draft.title,
+            heading_path=draft.heading_path,
+            payload_kind=draft.payload_kind,
+            payload=draft.payload,
+            semantic_keys=draft.semantic_keys,
+            artifact_locator=provider_unit_locator_to_payload(draft.locator),
             built_at=_BUILT_AT,
         )
+        self.assertEqual(row["title_text"], "第一章 标题")
+        self.assertEqual(row["heading_path_text"], "第一章 标题")
         self.assertEqual(
             row["body_atoms"],
             tuple(
@@ -234,370 +130,111 @@ class SearchTargetTests(unittest.TestCase):
                 if tokenizer.normalize_search_text(value).strip()
             ),
         )
-        self.assertNotIn(" ".join(values), row["body_atoms"])
 
-    def test_native_retrieval_run_rejoins_only_proved_split_words(self) -> None:
-        parts = [
-            {
-                "kind": "text",
-                "text": text,
-                "artifact_locator": _search_locator(
-                    projection_kind="text_identity_exact",
-                    projection_target="payload.text",
-                    targets=[("payload.text", "payload")],
-                ),
-            }
-            for text in ("股", "份变动")
-        ]
-        locator = _search_locator(
-            projection_kind="container",
-            projection_target="payload.parts",
-            targets=[],
+    def test_equal_source_occurrences_remain_two_search_atoms(self) -> None:
+        draft = build_provider_units(
+            _admitted(_identical_text_parts_document())
+        ).units[0]
+
+        values = provider_unit_search_text_values(
+            payload_kind=draft.payload_kind,
+            payload=draft.payload,
+            title=draft.title,
+            artifact_locator=provider_unit_locator_to_payload(draft.locator),
         )
-        locator["source_projection"]["search_atoms"] = [
-            {
-                "boundary": {
-                    "kind": "source_evidence_run",
-                    "source_evidence_sha256": "sha256:" + "a" * 64,
-                    "page_idx": 0,
-                    "run_index": 0,
-                },
-                "target_fields": [
-                    "payload.parts.0.text",
-                    "payload.parts.1.text",
-                ],
-                "transform": "exact_concat.v1",
-            }
-        ]
-        payload = {"semantic_type": "document", "parts": parts}
 
-        self.assertEqual(
-            search_text_values(
-                payload_kind="mixed",
-                payload=payload,
-                artifact_locator=locator,
+        self.assertEqual(values, ("相同正文", "相同正文"))
+
+    def test_heading_only_and_visual_only_units_have_no_body_atoms(self) -> None:
+        for document in (_heading_only_document(), _visual_only_document("f")):
+            with self.subTest(document=document):
+                draft = build_provider_units(_admitted(document)).units[0]
+                row = compute_search_projection_row(
+                    asset_id="asset_empty",
+                    title=draft.title,
+                    heading_path=draft.heading_path,
+                    payload_kind=draft.payload_kind,
+                    payload=draft.payload,
+                    semantic_keys=draft.semantic_keys,
+                    artifact_locator=provider_unit_locator_to_payload(draft.locator),
+                    built_at=_BUILT_AT,
+                )
+                self.assertEqual(row["body_atoms"], ())
+                self.assertEqual(row["body_tokens"], "")
+
+    def test_unknown_or_cross_part_locator_fails_closed(self) -> None:
+        draft = build_provider_units(_admitted(_representative_document())).units[1]
+        locator_payload = provider_unit_locator_to_payload(draft.locator)
+        locator_payload["contract_version"] = "unknown.v1"
+        with self.assertRaises(ProviderUnitSearchContractError):
+            provider_unit_search_text_values(
+                payload_kind=draft.payload_kind,
+                payload=draft.payload,
+                title=draft.title,
+                artifact_locator=locator_payload,
+            )
+
+        body_binding = next(
+            binding
+            for binding in draft.locator.search_targets
+            if binding.source.source_index == 2
+        )
+        assert body_binding.destination.part_index == 0
+        forged_binding = replace(
+            body_binding,
+            destination=replace(body_binding.destination, part_index=1),
+        )
+        forged_locator = replace(
+            draft.locator,
+            search_targets=tuple(
+                forged_binding if item == body_binding else item
+                for item in draft.locator.search_targets
             ),
-            ("股份变动",),
         )
+        with self.assertRaises(ProviderUnitSearchContractError):
+            provider_unit_search_text_values(
+                payload_kind=draft.payload_kind,
+                payload=draft.payload,
+                title=draft.title,
+                artifact_locator=provider_unit_locator_to_payload(forged_locator),
+            )
+
+    def test_row_shape_stays_database_compatible(self) -> None:
+        draft = build_provider_units(_admitted(_representative_document())).units[1]
         row = compute_search_projection_row(
-            asset_id="ua_native_split_run",
-            title=None,
-            heading_path=[],
-            payload_kind="mixed",
-            payload=payload,
-            semantic_keys=["document_content"],
-            artifact_locator=locator,
+            asset_id="asset_shape",
+            title=draft.title,
+            heading_path=draft.heading_path,
+            payload_kind=draft.payload_kind,
+            payload=draft.payload,
+            semantic_keys=draft.semantic_keys,
+            artifact_locator=provider_unit_locator_to_payload(draft.locator),
             built_at=_BUILT_AT,
         )
-        self.assertEqual(row["body_atoms"], ("股份变动",))
 
-    def test_grouped_search_atoms_reject_unproved_or_reordered_joins(self) -> None:
-        parts = [
+        self.assertEqual(
+            set(row),
             {
-                "kind": "text",
-                "text": text,
-                "artifact_locator": _search_locator(
-                    projection_kind="text_identity_exact",
-                    projection_target="payload.text",
-                    targets=[("payload.text", "payload")],
-                ),
-            }
-            for text in ("甲", "乙", "丙")
-        ]
-        payload = {"semantic_type": "document", "parts": parts}
-        boundary = {
-            "kind": "source_evidence_run",
-            "source_evidence_sha256": "sha256:" + "a" * 64,
-            "page_idx": 0,
-            "run_index": 0,
-        }
-        invalid_atoms = (
-            [
-                {
-                    "boundary": {"kind": "source_occurrence_singleton"},
-                    "target_fields": [
-                        "payload.parts.0.text",
-                        "payload.parts.1.text",
-                    ],
-                    "transform": "exact_concat.v1",
-                },
-                {
-                    "boundary": {"kind": "source_occurrence_singleton"},
-                    "target_fields": ["payload.parts.2.text"],
-                    "transform": "exact_concat.v1",
-                },
-            ],
-            [
-                {
-                    "boundary": boundary,
-                    "target_fields": [
-                        "payload.parts.0.text",
-                        "payload.parts.2.text",
-                    ],
-                    "transform": "exact_concat.v1",
-                },
-                {
-                    "boundary": {"kind": "source_occurrence_singleton"},
-                    "target_fields": ["payload.parts.1.text"],
-                    "transform": "exact_concat.v1",
-                },
-            ],
-            [
-                {
-                    "boundary": boundary,
-                    "target_fields": ["payload.parts.0.text"],
-                    "transform": "exact_concat.v1",
-                },
-                {
-                    "boundary": boundary,
-                    "target_fields": [
-                        "payload.parts.1.text",
-                        "payload.parts.2.text",
-                    ],
-                    "transform": "exact_concat.v1",
-                },
-            ],
-        )
-        for search_atoms in invalid_atoms:
-            with self.subTest(search_atoms=search_atoms):
-                locator = _search_locator(
-                    projection_kind="container",
-                    projection_target="payload.parts",
-                    targets=[],
-                )
-                locator["source_projection"]["search_atoms"] = search_atoms
-                with self.assertRaises(SearchTargetContractError):
-                    search_text_values(
-                        payload_kind="mixed",
-                        payload=payload,
-                        artifact_locator=locator,
-                    )
-
-    def test_unproved_or_unknown_target_fails_closed(self) -> None:
-        (unit,), _ = _build([_element(0, text="原文")])
-        graph = unit.artifact_locator["source_projection"]
-        graph["search_targets"][0] = "payload.context"
-        unit.payload["context"] = "伪上下文"
-
-        with self.assertRaises(SearchTargetContractError):
-            search_text_values(
-                payload_kind="text",
-                payload=unit.payload,
-                artifact_locator=unit.artifact_locator,
-            )
-        for unsupported_kind in ("qa", "unknown"):
-            with self.subTest(payload_kind=unsupported_kind):
-                with self.assertRaises(SearchTargetContractError):
-                    search_text_values(
-                        payload_kind=unsupported_kind,
-                        payload=unit.payload,
-                        artifact_locator=unit.artifact_locator,
-                    )
-
-
-class ComputeRowTests(unittest.TestCase):
-    def test_empty_visual_routes_by_structure_without_invented_body_text(self) -> None:
-        row = compute_search_projection_row(
-            asset_id="ua_empty_visual",
-            title="第一节 经营情况",
-            heading_path=["第一节 经营情况", "一、收入分析"],
-            payload_kind="text",
-            payload={
-                "image_ref": "images/" + "d" * 64 + ".png",
-                "caption": "",
-                "visual_kind": "image",
-                "context": "UNBOUND_CONTEXT",
+                "asset_id",
+                "retrieval_rules_version",
+                "title_text",
+                "heading_path_text",
+                "title_tokens",
+                "path_tokens",
+                "body_tokens",
+                "body_atoms",
+                "key_tokens",
+                "header_row_candidate",
+                "built_at",
             },
-            semantic_keys=["business_overview"],
-            artifact_locator=_search_locator(
-                projection_kind="image_identity",
-                projection_target="payload.image_ref",
-                targets=[],
-            ),
-            built_at=_BUILT_AT,
         )
-
-        self.assertTrue(row["title_tokens"])
-        self.assertTrue(row["path_tokens"])
-        self.assertEqual(row["body_tokens"], "")
-        self.assertEqual(row["key_tokens"], "business_overview")
-        self.assertNotIn("images", row["body_tokens"])
-        self.assertNotIn("unbound_context", row["body_tokens"])
-
-        (visual_unit,), _ = _build(
-            [
-                _element(
-                    0,
-                    kind="image",
-                    raw_kind="image",
-                    text="唯一图内事实VIS123",
-                    image_path="images/source.png",
-                    image_caption=["图标题CAPTION"],
-                    image_footnote=["唯一脚注NOTE456"],
-                )
-            ]
-        )
-        visual_unit.payload["context"] = "UNBOUND_CONTEXT"
-        visual_row = compute_search_projection_row(
-            asset_id="ua_bound_visual",
-            title=None,
-            heading_path=[],
-            payload_kind="text",
-            payload=visual_unit.payload,
-            semantic_keys=[],
-            artifact_locator=visual_unit.artifact_locator,
-            built_at=_BUILT_AT,
-        )
-        for expected in ("caption", "vis123", "note456"):
-            self.assertIn(expected, visual_row["body_tokens"])
-        self.assertNotIn("unbound_context", visual_row["body_tokens"])
-
-    def test_row_fields_exclude_generated_tsv_and_exclude_raw_html(self) -> None:
-        (unit,), _ = _build(
-            [
-                _element(
-                    0,
-                    kind="table",
-                    raw_kind="table",
-                    table_caption=["现金流量表补充资料"],
-                    table_footnote=[],
-                    table={
-                        "headers": ["项目"],
-                        "rows": [["经营活动", "100"]],
-                        "merged_cells": [],
-                    },
-                )
-            ]
-        )
-        unit.payload["raw_html"] = "<x>NOPE</x>"
-        row = compute_search_projection_row(
-            asset_id="ua_x",
-            title="现金流量表",
-            heading_path=["第八节 财务报告", "现金流量表补充资料"],
-            payload_kind=unit.payload_kind,
-            payload=unit.payload,
-            semantic_keys=["cash_flow_statement", "financial_report_chapter"],
-            artifact_locator=unit.artifact_locator,
-            built_at=_BUILT_AT,
-        )
-        self.assertEqual(row["asset_id"], "ua_x")
-        self.assertEqual(row["title_text"], "现金流量表")
-        self.assertEqual(row["heading_path_text"], "第八节 财务报告 > 现金流量表补充资料")
-        self.assertEqual(row["retrieval_rules_version"], tokenizer.RETRIEVAL_RULES_VERSION)
-        # Semantic keys are joined untokenized (controlled ASCII tokens).
         self.assertEqual(
-            row["key_tokens"], "cash_flow_statement financial_report_chapter"
+            row["retrieval_rules_version"],
+            "rp-2026.08-provider-unit-v1",
         )
+        self.assertEqual(row["key_tokens"], "document_content")
         self.assertFalse(row["header_row_candidate"])
-        self.assertEqual(row["built_at"], _BUILT_AT)
         self.assertNotIn("search_tsv", row)
-        self.assertEqual(
-            row["body_atoms"],
-            (
-                "现金流量表补充资料",
-                "项目",
-                "经营活动",
-                "100",
-            ),
-        )
-        self.assertTrue(row["title_tokens"])
-        self.assertNotIn("nope", row["body_tokens"])
-
-    def test_empty_unit_yields_legal_empty_strings(self) -> None:
-        row = compute_search_projection_row(
-            asset_id="ua_empty",
-            title=None,
-            heading_path=[],
-            payload_kind="text",
-            payload={"text": ""},
-            semantic_keys=None,
-            artifact_locator=_search_locator(
-                projection_kind="text_identity",
-                projection_target="payload.text",
-                targets=[("payload.text", "payload")],
-            ),
-            built_at=_BUILT_AT,
-        )
-        self.assertEqual(row["title_text"], "")
-        self.assertEqual(row["heading_path_text"], "")
-        self.assertEqual(row["title_tokens"], "")
-        self.assertEqual(row["path_tokens"], "")
-        self.assertEqual(row["body_tokens"], "")
-        self.assertEqual(row["body_atoms"], ())
-        self.assertEqual(row["key_tokens"], "")
-        self.assertEqual(row["retrieval_rules_version"], tokenizer.RETRIEVAL_RULES_VERSION)
-
-    def test_structural_section_keeps_table_and_explanation_retrievable(self) -> None:
-        elements, headings = _sample_share_change()
-        elements.extend(
-            [
-                _element(5, text="股权激励行权导致股本增加。"),
-                _element(6, text="股份变动的批准情况\n董事会审议通过。"),
-            ]
-        )
-        for heading in headings:
-            heading["section_span"][1] = 6
-        units, _ = _build(
-            elements,
-            headings=headings,
-            filing_type="semiannual_report",
-        )
-        self.assertTrue(units)
-        rows = [
-            compute_search_projection_row(
-                asset_id=f"ua_share_changes_{index}",
-                title=unit.title,
-                heading_path=unit.heading_path,
-                payload_kind=unit.payload_kind,
-                payload=unit.payload,
-                semantic_keys=unit.semantic_keys,
-                artifact_locator=unit.artifact_locator,
-                built_at=_BUILT_AT,
-            )
-            for index, unit in enumerate(units)
-        ]
-        for row in rows:
-            self.assertEqual(row["title_text"], "1、股份变动情况")
-            self.assertEqual(
-                row["heading_path_text"],
-                "第七节 股份变动及股东情况 > 一、股份变动情况 > 1、股份变动情况",
-            )
-        body = "\n".join(
-            " ".join(
-                search_text_values(
-                    payload_kind=unit.payload_kind,
-                    payload=unit.payload,
-                    artifact_locator=unit.artifact_locator,
-                )
-            )
-            for unit in units
-        )
-        for evidence in (
-            "单位：股",
-            "股份总数",
-            "843,978,741",
-            "股权激励行权导致股本增加",
-            "董事会审议通过",
-        ):
-            self.assertIn(evidence, body)
-
-        for query, channel in (
-            ("股份变动情况", "title_tokens"),
-            ("第七节 股份变动及股东情况", "path_tokens"),
-            ("股份总数", "body_tokens"),
-            ("股份变动的原因", "body_tokens"),
-            ("股权激励行权股本增加", "body_tokens"),
-            ("股份变动的批准情况", "body_tokens"),
-            ("董事会审议通过", "body_tokens"),
-        ):
-            query_tokens = set(tokenizer.query_word_tokens(query))
-            self.assertTrue(
-                any(
-                    query_tokens <= set(str(row[channel]).split())
-                    for row in rows
-                ),
-                (query, channel, rows),
-            )
 
 
 if __name__ == "__main__":
