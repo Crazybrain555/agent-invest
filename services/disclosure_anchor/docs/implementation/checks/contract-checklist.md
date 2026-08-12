@@ -87,8 +87,9 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
 0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref /
   supersedes 链 / superseded_by_document_id / provider_metadata
 0011 起 document_unit.payload_kind 增加 'mixed'（round3 P0#1 业务语义块：
-  当前 semantic_type = document / section，payload.parts 承载同一 source-proved
-  结构区间内的有序部件；监管 taxonomy 不参与切分）
+  payload.parts 承载同一 source-proved 结构区间内的有序部件；每个 part 仅保留
+  provider-native `provider_type`，document/section 由 title/headpath/locator 推导；
+  监管 taxonomy 不参与切分）
 0013 起 document_unit 增加 semantic_keys（jsonb 数组；GIN 部分索引）；新 Provider writer
   不做 L1 业务 taxonomy，`semantic_key='document_content'` 且
   `semantic_keys=['document_content']`，并纳入 query_projection_hash 与 outbox

@@ -55,7 +55,7 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         self.assertEqual(len(result.units), 2)
         preamble, section = result.units
         self.assertEqual(preamble.payload_kind, "text")
-        self.assertEqual(preamble.payload["text"], "")
+        self.assertEqual(preamble.payload, {"text": ""})
         self.assertEqual(
             preamble.locator.evidence_only_block_source_indices,
             (0,),
@@ -68,14 +68,11 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         self.assertIsInstance(parts, list)
         assert isinstance(parts, list)
         self.assertEqual(
-            [(part["kind"], part["provider_type"]) for part in parts],
-            [
-                ("text", "text"),
-                ("table", "table"),
-                ("visual", "image"),
-                ("text", "text"),
-            ],
+            [part["provider_type"] for part in parts],
+            ["text", "table", "image", "text"],
         )
+        self.assertNotIn("semantic_type", section.payload)
+        self.assertTrue(all("kind" not in part for part in parts))
         self.assertNotIn("第一章 标题", json.dumps(section.payload, ensure_ascii=False))
         self.assertIn("□适用", json.dumps(section.payload, ensure_ascii=False))
 
@@ -141,6 +138,7 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         ).units[0]
 
         self.assertEqual(first.payload_kind, "table")
+        self.assertNotIn("provider_type", first.payload)
         self.assertEqual(len(first.locator.search_targets), 1)
         self.assertIn("content_artifacts", first.payload)
         self.assertEqual(len(first.locator.evidence_artifacts), 1)
@@ -158,6 +156,7 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         ).units[0]
 
         self.assertEqual(first.payload_kind, "table")
+        self.assertNotIn("provider_type", first.payload)
         self.assertNotIn("content_artifacts", first.payload)
         self.assertEqual(len(first.locator.evidence_artifacts), 1)
         self.assertEqual(first.content_hash, second.content_hash)
@@ -222,7 +221,7 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         self.assertEqual(draft.payload_kind, "text")
         self.assertEqual(
             draft.payload,
-            {"provider_type": "text", "text": ""},
+            {"text": ""},
         )
         self.assertEqual(len(draft.locator.search_targets), 1)
         self.assertEqual(
@@ -276,9 +275,10 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         self.assertEqual(draft.payload_kind, "mixed")
         parts = cast(list[dict[str, object]], draft.payload["parts"])
         self.assertEqual(
-            [(part["provider_type"], part["kind"]) for part in parts],
-            [("text", "text"), ("image", "visual")],
+            [part["provider_type"] for part in parts],
+            ["text", "image"],
         )
+        self.assertTrue(all("kind" not in part for part in parts))
         self.assertEqual(draft.locator.evidence_only_block_source_indices, (0,))
         self.assertEqual(
             [binding.source.source_index for binding in draft.locator.search_targets],

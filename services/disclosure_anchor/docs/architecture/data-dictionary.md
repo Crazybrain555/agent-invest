@@ -87,12 +87,12 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | 列 | 含义 |
 |---|---|
 | asset_id | `du_`+ULID；跨 run 不承诺同 ID，身份=content_hash |
-| payload_kind | 闭集 text / table / qa（历史只读）/ **mixed**。新 writer：单一正文块提升为 text，单一逻辑表 owner 提升为 table；多块或视觉块使用 mixed，parts 按 source 顺序保存 `kind ∈ {text,table,visual}` 与 provider-native 浅字段 |
+| payload_kind | 闭集 text / table / qa（历史只读）/ **mixed**。新 writer：单一正文块提升为 text，单一逻辑表 owner 提升为 table；多块或视觉块使用 mixed，parts 按 source 顺序保存一份 provider-native `provider_type` 与浅字段；粗粒度 owner/evidence kind 只留 locator |
 | heading_path | jsonb 完整**源标题路径**（有 heading 时非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text；路径来自 typed heading/outline 结构，不来自 caption 或 taxonomy |
 | title | 只取已接受 source heading 的叶节点，并与 heading_path 末项相等；无可靠 heading 时为 NULL。登记文档标题只留 document scope；caption、单位、脚注不得填入 title |
 | semantic_key | 新 writer 固定 `document_content`，仅作通用 L1→L2 路由，不推断业务 taxonomy；历史行可保留旧值或 NULL；btree 索引 |
 | semantic_keys | 新 writer 固定 `["document_content"]`；GIN(jsonb_ops) 支持 `? / ?| / ?&`；不得用 taxonomy 改写证据 payload 或边界 |
-| payload | ProviderDocument 的 source-bound 浅投影：text 保存 `{provider_type,text}`；table 保存原始 `table_body` HTML 与 caption/footnote 数组；mixed 保存 `semantic_type` 和有序 parts。视觉 part 的 `content_artifacts` 仅含 hash/size/media，使视觉内容进入 content hash；路径、raw JSON、表格 crop 不进入 payload。L1 不解析 grid、不修复 cell、不用 middle HTML 覆盖 content-list owner |
+| payload | ProviderDocument 的 source-bound 浅投影：顶层 text 只保存 `{text}`；顶层 table 保存原始 `table_body` HTML 与 caption/footnote 数组；mixed 保存仅带一个 `provider_type` 的有序 parts。document/section 由 title/headpath/locator 推导，不另存 `semantic_type`。视觉 part 的 `content_artifacts` 仅含 hash/size/media，使视觉内容进入 content hash；路径、raw JSON、表格 crop 不进入 payload。L1 不解析 grid、不修复 cell、不用 middle HTML 覆盖 content-list owner |
 | content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；content 绑定 payload（含视觉内容 digest），query 绑定 title/heading/key/quality/applicability，structure 绑定 kind/path/order。locator/page/provider identity 不混入哈希，发布前由 fresh ProviderDocument admission + deterministic rebuild 精确复核 |
 | quality_status | ok / needs_review / unusable（乱码率>30%） |
 | applicability | vc16 CHECK：applicable / not_applicable / NULL（√适用声明列化；见 §5 讨论） |

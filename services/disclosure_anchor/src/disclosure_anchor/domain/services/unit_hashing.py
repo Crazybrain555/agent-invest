@@ -156,7 +156,6 @@ def mixed_part_annotations(
         return None
     parts = _mixed_parts(payload)
     return {
-        "semantic_type": payload.get("semantic_type"),
         "parts": [
             {field: part[field] for field in _MIXED_PART_QUERY_FIELDS if field in part}
             for part in parts

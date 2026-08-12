@@ -99,10 +99,9 @@
     "input": {
       "payload_kind": "mixed",
       "payload": {
-        "semantic_type": "section",
         "parts": [
           {
-            "kind": "text",
+            "provider_type": "text",
             "order": 12,
             "text": "正文",
             "local_heading": [
@@ -111,7 +110,7 @@
             "applicability": "applicable"
           },
           {
-            "kind": "table",
+            "provider_type": "table",
             "order": 13,
             "caption": [],
             "unit": "元",
@@ -144,8 +143,8 @@
       "order_index": 4
     },
     "expected": {
-      "content_hash": "sha256:c3edb065f408962add20361342d04194aa428ab1b8e19c87ce73f5ce9fe92c5d",
-      "query_projection_hash": "sha256:fe9e7ff7d3c18ddd17dd3fab2be45b18f7e21de681983cbefdeb05be1f272b42",
+      "content_hash": "sha256:8b6e51ebe41e8f3d9f70850d52a173b55c30c69cbed8bfc1790edaf67ca11484",
+      "query_projection_hash": "sha256:d32d6223ff376c586b95bc4c47d4290be05b5e79d065013a25f618e2e69d154a",
       "structure_hash": "sha256:42b9f44c722e5de44f9c8079a38d7d15126e217a7919edaf12385d4602c12993"
     }
   }

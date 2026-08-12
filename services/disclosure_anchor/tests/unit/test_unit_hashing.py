@@ -107,7 +107,9 @@ class UnitHashingTests(unittest.TestCase):
         self.assertEqual(first.query_projection_hash, second.query_projection_hash)
         self.assertEqual(first.structure_hash, second.structure_hash)
 
-    def test_mixed_annotations_are_projection_not_content(self) -> None:
+    def test_mixed_annotations_are_projection_not_content_and_legacy_type_is_ignored(
+        self,
+    ) -> None:
         base = {
             "payload_kind": "mixed",
             "payload": {
@@ -130,9 +132,14 @@ class UnitHashingTests(unittest.TestCase):
             "order_index": 1,
         }
         first = compute_unit_hashes(**base)
+        legacy_type_only = compute_unit_hashes(
+            **{
+                **base,
+                "payload": {**base["payload"], "semantic_type": "document"},
+            }
+        )
         changed_payload = {
             **base["payload"],
-            "semantic_type": "document",
             "parts": [
                 {
                     **base["payload"]["parts"][0],
@@ -146,6 +153,7 @@ class UnitHashingTests(unittest.TestCase):
             **{**base, "payload": changed_payload}
         )
 
+        self.assertEqual(first, legacy_type_only)
         self.assertEqual(first.content_hash, second.content_hash)
         self.assertNotEqual(first.query_projection_hash, second.query_projection_hash)
         self.assertEqual(first.structure_hash, second.structure_hash)

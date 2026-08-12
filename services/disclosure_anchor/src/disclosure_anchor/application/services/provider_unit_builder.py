@@ -266,7 +266,7 @@ class _BuildContext:
             raise ValueError(
                 "provider Unit builder did not classify every source block"
             )
-        payload_kind, payload = _unit_payload(parts, headed=heading is not None)
+        payload_kind, payload = _unit_payload(parts)
         for part in parts:
             for target in part.targets:
                 destination = _target_destination(
@@ -579,10 +579,7 @@ def _part_payload(
     artifacts: dict[str, ProviderArtifact],
     content_artifact_roles: tuple[str, ...],
 ) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "kind": kind,
-        "provider_type": block.provider_type,
-    }
+    payload: dict[str, object] = {"provider_type": block.provider_type}
     scalar_fields, sequence_fields = provider_payload_field_contract(
         block.provider_type
     )
@@ -624,11 +621,9 @@ def _part_kind(block: ProviderBlock) -> ProviderUnitPartKind:
 
 def _unit_payload(
     parts: list[_Part],
-    *,
-    headed: bool,
 ) -> tuple[ProviderUnitPayloadKind, dict[str, object]]:
     if not parts:
-        return "text", {"provider_type": "text", "text": ""}
+        return "text", {"text": ""}
     if len(parts) == 1:
         part = parts[0]
         if part.ref.kind == "table":
@@ -637,15 +632,16 @@ def _unit_payload(
             return "text", _top_level_payload(part.payload)
     return (
         "mixed",
-        {
-            "semantic_type": "section" if headed else "document",
-            "parts": [dict(part.payload) for part in parts],
-        },
+        {"parts": [dict(part.payload) for part in parts]},
     )
 
 
 def _top_level_payload(payload: dict[str, object]) -> dict[str, object]:
-    return {key: value for key, value in payload.items() if key != "kind"}
+    return {
+        key: value
+        for key, value in payload.items()
+        if key != "provider_type"
+    }
 
 
 def _target_destination(

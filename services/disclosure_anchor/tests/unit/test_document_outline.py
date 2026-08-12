@@ -256,6 +256,72 @@ class DocumentOutlineTest(unittest.TestCase):
         )
         self.assertIsNone(outline.headings[8].parent_heading_id)
 
+    def test_english_sections_and_roman_ordinals_form_sibling_levels(self) -> None:
+        document = _document(
+            _block(0, "V. Other related information", level=2),
+            _block(1, "Section III Management Discussion and Analysis", level=2),
+            _block(2, "I. Major businesses", level=2),
+            _block(3, "II. Industry situation", level=2),
+            _block(4, "1. Consumption field", level=2),
+            _block(5, "2. Industrial field", level=2),
+            _block(6, "III. Core competence analysis", level=2),
+            _block(7, "Section IV Corporate Governance", level=2),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(
+            [heading.nominal_rank for heading in outline.headings],
+            [2, 1, 2, 2, 5, 5, 2, 1],
+        )
+        self.assertEqual(
+            outline.headings[3].headpath,
+            (
+                "Section III Management Discussion and Analysis",
+                "II. Industry situation",
+            ),
+        )
+        self.assertEqual(
+            outline.headings[5].headpath,
+            (
+                "Section III Management Discussion and Analysis",
+                "II. Industry situation",
+                "2. Industrial field",
+            ),
+        )
+        self.assertEqual(
+            outline.headings[6].headpath,
+            (
+                "Section III Management Discussion and Analysis",
+                "III. Core competence analysis",
+            ),
+        )
+        self.assertIsNone(outline.headings[7].parent_heading_id)
+
+    def test_lowercase_lettered_lists_are_not_roman_sections(self) -> None:
+        document = _document(
+            _block(0, "Section III Risk analysis", level=2),
+            _block(1, "a) Market risk", level=2),
+            _block(2, "b) Credit risk", level=2),
+            _block(3, "c) Interest-rate risk", level=2),
+            _block(4, "d) Liquidity risk", level=2),
+            _block(5, "i. Global market development", level=2),
+            _block(6, "iii. Domestic market development", level=2),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(
+            [heading.nominal_rank for heading in outline.headings],
+            [1, 6, 6, 6, 6, 6, 6],
+        )
+        self.assertTrue(
+            all(
+                heading.parent_heading_id == outline.headings[0].heading_id
+                for heading in outline.headings[1:]
+            )
+        )
+
     def test_provider_only_title_is_a_leaf_and_does_not_capture_numbered_sibling(
         self,
     ) -> None:

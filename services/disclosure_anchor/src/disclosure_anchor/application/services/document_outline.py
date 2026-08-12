@@ -37,6 +37,12 @@ _PAREN_CHINESE_RE = re.compile(rf"^[（(][{_CHINESE_NUMBER}]+[）)]")
 _DOTTED_ARABIC_RE = re.compile(r"^(?P<number>[0-9]+(?:\.[0-9]+)+)(?:[、.]|\s|$)")
 _ARABIC_ORDINAL_RE = re.compile(r"^(?P<ordinal>[0-9]{1,3})(?:[、.]|\s+)")
 _PAREN_ARABIC_RE = re.compile(r"^(?:[（(][0-9]+[）)]|[0-9]+[）)])")
+_ENGLISH_SECTION_RE = re.compile(
+    r"^Section\s+(?:[IVXLCDM]+|[0-9]+)(?:[.:)]|\s|$)",
+    re.IGNORECASE,
+)
+_ROMAN_ORDINAL_RE = re.compile(r"^[IVXLCDM]+[.)](?:\s|$)")
+_LOWER_ROMAN_ORDINAL_RE = re.compile(r"^[ivxlcdm]+[.)](?:\s|$)")
 _LETTER_ORDINAL_RE = re.compile(r"^[A-Za-z][.)、]")
 _BOX_MARKERS = ("□", "☐", "☑", "\uf052")
 _CHECKBOX_MARKERS = (*_BOX_MARKERS, "√")
@@ -859,6 +865,12 @@ def _placement(
 
 def _numbering(text: str) -> tuple[str | None, int | None]:
     prefix = text.lstrip()
+    if _ENGLISH_SECTION_RE.match(prefix):
+        return "Section X", 1
+    if _ROMAN_ORDINAL_RE.match(prefix):
+        return "Roman ordinal", 2
+    if _LOWER_ROMAN_ORDINAL_RE.match(prefix):
+        return "lower Roman ordinal", 6
     if match := _CHAPTER_RE.match(prefix):
         kind = match.group("kind")
         if kind in {"编", "篇", "部", "章"}:

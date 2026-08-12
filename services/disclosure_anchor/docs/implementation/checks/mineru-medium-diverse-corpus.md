@@ -27,20 +27,20 @@ runtime branches.
 
 | Process class | Representative source evidence | Coverage kind |
 |---|---|---|
-| annual_report | 571286, 573256, 1213105553, 1219768304, 1222856328 | provider-classified; old and current formats |
-| semiannual_report | 1217616113, 1221054498 | provider-classified; table-dense and multilingual |
+| annual_report | 571286, 573256, 1213105553, 1219768304, 1222856328, 1225374514 | provider-classified; old, current, Chinese, and English formats |
+| semiannual_report | 1217616113, 1221054498, 1225468066 | provider-classified; table-dense and multilingual |
 | quarterly_report | 1221570547 | provider-classified |
-| performance_forecast | 1225450112 | provider-classified; correction and numeric ranges |
+| performance_forecast | 1225450112, 1225455464 | provider-classified; correction and numeric ranges |
 | performance_flash | 1225457637 | provider-classified; compact financial table |
-| operating_data | 1217574006 | provider-classified; multiple short tables |
+| operating_data | 1217574006, 1225452785 | provider-classified; short and wide operating tables |
 | investor_relations | 100001036802 | provider-classified; Q&A without reliable headings |
-| performance_briefing | 100001053504 | provider-classified; Q&A |
+| performance_briefing | 100001053504, 1225346988 | provider-classified; Q&A |
 | inquiry_regulatory | 1222355452 | provider-classified; multi-line document title |
-| restructuring_assets | 1225469289 | provider-classified; deep outline and long mixed content |
-| additional_issuance | 1225469289 | provider topic on the same source filing |
+| restructuring_assets | 1225469289, 1225086656 | provider-classified; deep outline, inquiry reply, and long mixed content |
+| additional_issuance | 1225469289, 1225412520 | provider topic plus a standalone issuance report |
 | convertible_bond | 1220510536 | official CNInfo source re-query derives this class; local baseline registration omitted raw category |
 | rights_issue | 1225464994 | provider-classified; source numbering typo retained |
-| share_buyback | 1223032208 | exact business form covered; CNInfo parent code classifies this source as `equity_share_change`, which is also processed |
+| share_buyback | 1223032208, 1225441582 | exact business forms; result notice and adjacent-scenario table coverage |
 | major_contract | 1225437561 | provider-classified; one-page announcement |
 | risk_alert | 1223236784 and 1225448705 | provider-classified/topic; signature and delisting variants |
 | delisting_risk | 1225448705 | provider-classified; multi-line printed title |
@@ -93,34 +93,50 @@ writer. Source SHA-256 identifies the immutable PDF.
 | 600919 / 1225457637 | 3 | performance-flash financial table | `e0aa91c79217a662e0fab2814566e2b32d647f36df49aa1962e9327974298b78` |
 | 300176 / 1225464994 | 11 | rights issue; source-authored numbering inconsistency | `40da12f5339258328393cf0714c383c04223c2a2e92f1f712e54a58de85a9b94` |
 | 000670 / 1225469289 | 73 | restructuring, issuance, deep outline, mixed tables/text | `05bf588c073517d13b05752d65841f1db140dfb7efd79b78df508391288a7542` |
+| 688981 / 1225086656 | 130 | asset-restructuring inquiry reply; long Q&A, mixed text, and 112 physical tables | `0de075d9d50de77aae5ccb14a5d35609fc64982932740d1187ab71c2c6b0ec9c` |
+| 600150 / 1225346988 | 9 | performance briefing with compact investor Q&A | `b7bdf8a1b4bf728f8b979f2b55e2bf85502ba30cc09a8fd82473b4aff1724abb` |
+| 000651 / 1225374514 | 265 | English annual report; `Section` plus Roman-ordinal hierarchy and 357 physical tables | `b8e0a1d49f5928866e2581283ad90b0ccacc8683d7e605ea0642fce115a9a4f7` |
+| 688012 / 1225412520 | 47 | standalone issuance report with deep numbered hierarchy | `f871f55919bcb2a2b1d167ea180e3cf2b1d00cd2c5b41b99e4113a83ef09a22f` |
+| 300750 / 1225441582 | 9 | buyback result notice and share-change table | `3ddd79599606517fe80de61e10f722a1cacc114665390feb3e0c1abf0ddc80fb` |
+| 002594 / 1225452785 | 2 | wide monthly production/sales table | `85b4caf3c6380f51a1c9a8acd7d051c9bb80455a715fc7af6175147023c1a934` |
+| 688012 / 1225455464 | 4 | short performance forecast with numeric ranges | `020a8e984e8dbe30397b167cdbb468bd7bdec0667923490c674b18ed70f425fc` |
+| 601138 / 1225468066 | 221 | current semiannual report, dense financial tables, and yes/no front matter | `34d02741f6651eba443de0b3ec16562a43d22b31c12d548e4f17004ed618ba2d` |
 
 ## Current mechanical receipt
 
-The clean development database contains 22 current documents and 3,513 active
-Units: 2,005 mixed, 101 table, and 1,407 text. The current search projection
-contains 57,376 atoms. After the independent row review, 3,509 Units are `ok`
+The clean development database contains 30 current documents and 4,955 active
+Units: 2,804 mixed, 188 table, and 1,963 text. The current search projection
+contains 86,407 atoms. After the independent row review, 4,951 Units are `ok`
 and four source-bound Beigene titles are explicitly `needs_review`: MinerU
 retained only `<sup>®</sup>` plus BAT1706/BTK/PD-1/PARP1-PARP2 while the PDF and
 body text retain the adjacent Chinese drug names. No text was synthesized or
 overwritten. Across the active Provider records:
 
-- 16,849 provider blocks, 1,577 physical table segments, 1,261 logical tables,
-  and 14,628 retrieval targets have complete, exactly-once ownership;
+- 24,252 provider blocks, 2,364 physical table segments, 1,838 logical tables,
+  and 20,934 retrieval targets have complete, exactly-once ownership;
 - zero logical-table relations are unbound and every active Unit uses the
   closed `provider_unit_locator.v1` contract;
-- all 3,513 active Unit search projections replay exactly from the current
+- all 4,955 active Unit search projections replay exactly from the current
   payload and locator; no title/path target is duplicated into body search;
   word-token projection uses visible inline-HTML text while exact body atoms
   retain the provider scalar, and all rows use `rp-2026.08-provider-unit-v2`;
 - all 69 evidence references on the six newly added provider-classified
   documents resolved to hash- and size-matching JPEG bytes (11,590,058 bytes);
-- rebuild replay for the four documents affected by the latest outline rules
-  completed with zero unassigned table parts.
+- rebuild replay for every active document matched by the newest numbering
+  families completed with zero unassigned table parts. This includes English
+  `Section` plus uppercase Roman siblings, the older uppercase Roman auditor
+  notes, and lowercase Roman/lettered deep lists; uppercase Roman is rank 2,
+  while lowercase Roman and lettered lists share the conservative deep rank 6.
 
 Visual source checks confirmed every newly admitted numbered heading on its
 rendered PDF page. The checks included long Chinese headings, compact risk
-sections, annual-report chapter transitions, the JiangHai p49-50 narrow table,
-and the hard-negative adjacent tables in Sanfu and Midea.
+sections, English `Section`/Roman-ordinal transitions, the JiangHai p49-50
+narrow table, and the hard-negative adjacent tables in Sanfu and Midea. The
+final eight-document round completed Parse -> Build -> Publish with 1,442 Units
+and zero unassigned table parts. It also verified that title-only payloads are
+represented minimally as `{"text":""}` and are not evidence of loss by
+themselves: sampled cases were printed headings whose content belongs to a
+following child or sibling Unit.
 
 ## Residuals and limits
 
@@ -142,6 +158,11 @@ These are explicit residuals, not silently repaired data:
 5. Pure image-only scans are outside the current processing-policy acceptance
    boundary. The immutable PDF is still retained if such a document is ever
    registered, but scan-specific reconstruction is not a release gate.
+6. In source 1225468066 page 2, MinerU omits the printed `否` beneath item seven
+   and merges the item-nine `否` into the title. The latter scalar survives and
+   the former remains recoverable only from the immutable PDF. The service does
+   not invent a second PDF-text universe or move an answer by layout guess;
+   source page/bbox provenance remains available for L2 or human review.
 
 ## Acceptance rule
 

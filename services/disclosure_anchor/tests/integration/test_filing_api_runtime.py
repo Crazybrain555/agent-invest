@@ -237,7 +237,11 @@ def _unit_table_parts(unit: dict[str, Any]) -> list[dict[str, Any]]:
     if unit.get("payload_kind") == "table":
         return [payload]
     if unit.get("payload_kind") == "mixed":
-        return [p for p in payload.get("parts", []) if p.get("kind") == "table"]
+        return [
+            p
+            for p in payload.get("parts", [])
+            if p.get("provider_type") == "table"
+        ]
     return []
 
 
@@ -1052,8 +1056,7 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
         self, *, sample: AdminSample, units: list[dict[str, Any]]
     ) -> None:
         if sample.label == "annual_report":
-            # ub-2026.07-5+ semantic grouping: business sections are mixed
-            # units with ordered parts; recall keys live in semantic_keys.
+            # Provider-native business sections remain searchable mixed units.
             self.assertTrue(
                 any(
                     "管理层讨论与分析" in " ".join(unit["heading_path"])
@@ -1061,21 +1064,23 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
                     for unit in units
                 )
             )
-            receivable_units = [
-                unit
-                for unit in units
-                if "receivable_aging" in (unit.get("semantic_keys") or [])
-                or unit.get("semantic_key") == "receivable_aging"
-            ]
-            self.assertTrue(receivable_units)
+            self.assertTrue(
+                all(
+                    unit.get("semantic_key") == "document_content"
+                    and unit.get("semantic_keys") == ["document_content"]
+                    for unit in units
+                )
+            )
             tables = [
-                part for unit in receivable_units for part in _unit_table_parts(unit)
+                part for unit in units for part in _unit_table_parts(unit)
             ]
-            # User decision 2026-07-16: no first-row header guessing — without
-            # <th> evidence the full faithful grid lives in rows and headers
-            # stay empty; interpretation belongs to L2/the view layer.
-            self.assertTrue(any(part.get("rows") for part in tables))
-            self.assertTrue(any(part.get("unit") for part in tables))
+            self.assertTrue(
+                any(
+                    part.get("provider_type") == "table"
+                    and part.get("table_body")
+                    for part in tables
+                )
+            )
         elif sample.label == "ir_activity":
             # QA discrimination removed 2026-07-16: the transcript stays raw
             # text under the official narrative label, question and answer

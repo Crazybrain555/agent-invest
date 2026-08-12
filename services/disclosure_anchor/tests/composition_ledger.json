@@ -134,7 +134,7 @@
   },
   "tests/unit/test_document_outline.py": {
    "private_imports": [],
-   "tests": 28
+   "tests": 30
   },
   "tests/unit/test_download_document.py": {
    "private_imports": [],

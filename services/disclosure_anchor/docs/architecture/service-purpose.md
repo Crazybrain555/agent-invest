@@ -448,7 +448,6 @@ artifact_locator（可选）
   "title": "报告期内公司从事的主要业务",
   "semantic_key": "document_content",
   "payload": {
-    "provider_type": "text",
     "text": "报告期内，铝电解电容器……"
   }
 }
@@ -481,7 +480,6 @@ artifact_locator（可选）
   "title": "按账龄披露",
   "semantic_key": "document_content",
   "payload": {
-    "provider_type": "table",
     "table_body": "<table><tr><th>账龄</th><th>期末账面余额</th><th>期初账面余额</th></tr><tr><td>1 年以内（含1 年）</td><td>1,765,831,017.43</td><td>1,653,778,854.38</td></tr></table>",
     "table_caption": ["按账龄披露"],
     "table_footnote": []
@@ -523,7 +521,9 @@ ProviderDocument occurrence 并 fail closed 或 `needs_review`，不得造逻辑
 
 适用于同一个已证明结构区间内 text 与 table（或 image）交替的场景：短公告整体、
 股东会/董事会的一个 source-proved section、年报里的一个业务小节（研发投入、附注某科目）。
-payload 是有序 parts；每个 part 只保存 `kind`、`provider_type` 与该 provider type 的浅字段。
+payload 是有序 parts；每个 part 只保存一份 MinerU 原生 `provider_type` 与该 type 的浅字段。
+用于 owner/evidence 校验的粗粒度 `text|table|visual` kind 只存在 Unit locator，不在内容
+payload 重复；顶层 text/table 的类型由 `payload_kind` 唯一表达。
 视觉 part 额外保存内容型 artifact 的 `{sha256,size_bytes,media_type}`，使图像变化进入
 `content_hash`；路径、crop、bbox、search binding 与 supporting evidence 只在 Unit 顶层
 `provider_unit_locator.v1`，不复制到每个 part，也不形成第二套证据图。
@@ -534,18 +534,18 @@ payload 是有序 parts；每个 part 只保存 `kind`、`provider_type` 与该 
   "heading_path": ["二、议案审议情况"],
   "title": "二、议案审议情况",
   "payload": {
-    "semantic_type": "section",
     "parts": [
-      {"kind": "text", "provider_type": "text", "text": "审议结果：通过\n表决情况："},
-      {"kind": "table", "provider_type": "table", "table_body": "<table><tr><td>A股</td><td>99.98%</td></tr></table>", "table_caption": [], "table_footnote": []},
-      {"kind": "text", "provider_type": "text", "text": "会议决定，聘请天健会计师事务所……"}
+      {"provider_type": "text", "text": "审议结果：通过\n表决情况："},
+      {"provider_type": "table", "table_body": "<table><tr><td>A股</td><td>99.98%</td></tr></table>", "table_caption": [], "table_footnote": []},
+      {"provider_type": "text", "text": "会议决定，聘请天健会计师事务所……"}
     ]
   }
 }
 ```
 
-`semantic_type` 当前取值只有 `document`（登记文档整体）和 `section`（由结构证据证明的
-文档区间）。监管 taxonomy 可在组装完成后帮助 L2 路由，但不得反向决定 section 边界。
+`document|section` 不作为 payload 字段重复保存：是否属于结构 section 已由 `title`、
+`heading_path` 和 locator 中的 source-bound heading chain 唯一表达；无标题的根区间自然是
+document preamble。监管 taxonomy 可在组装完成后帮助 L2 路由，但不得反向决定 section 边界。
 单元级 `applicability` 只在各 parts 声明一致时置值，
 冲突时为 NULL、由 parts 承载细节。
 
@@ -571,7 +571,8 @@ payload 是有序 parts；每个 part 只保存 `kind`、`provider_type` 与该 
 ]
 ```
 
-财务附注里的表格则是更深的层级（对应 6.3 的 receivable_aging 单元）：
+财务附注里的表格则是更深的层级（单元仍使用通用
+`document_content` 语义键，业务解释留给 L2）：
 
 ```text
 第八节 财务报告
@@ -646,15 +647,17 @@ processing run 登记的 primary artifact hash、provider manifest（新产物�
 
 ## 7.3 第一版追溯锚
 
-进入 L2/L3 的披露证据可以使用（以江海股份 receivable_aging 单元为例）：
+进入 L2/L3 的披露证据使用通用来源锚，不依赖 L1 业务词典。例如：
 
 ```text
-source_access_id    = cninfo:p_info3015
-document_id         = 1225087169        # CNINFO textid
-raw_file_hash       = sha256:7c73103aa3c93778d2d1d18bcf55a2f76413887a8aa3f6b50f0749038edc19b3
-processing_run_id   = run_20260618_v3
-asset_id            = du_receivable_aging_002484_2025
-exact table snapshot= {"账龄":"1 年以内（含1 年）","期末账面余额":"1,765,831,017.43", ...}
+source_access_id    = sa_...
+document_id         = doc_...
+provider_document_id= ...
+raw_file_hash       = sha256:...
+processing_run_id   = run_...
+asset_id            = du_...
+semantic_key        = document_content
+exact payload       = {"table_body":"<table>...</table>"}
 ```
 
 这已经能说明来源文件、处理版本和当时实际使用的内容。
