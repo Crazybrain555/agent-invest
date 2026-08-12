@@ -208,6 +208,14 @@ components:
           - type: string
           - type: 'null'
           title: Company Ref
+        content_categories:
+          anyOf:
+          - items:
+              additionalProperties: true
+              type: object
+            type: array
+          - type: 'null'
+          title: Content Categories
         content_hash:
           title: Content Hash
           type: string
@@ -322,6 +330,13 @@ components:
           - type: string
           - type: 'null'
           title: Semantic Key
+        semantic_keys:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Semantic Keys
         source_ref:
           anyOf:
           - type: string
@@ -354,6 +369,7 @@ components:
       - title
       - order_index
       - semantic_key
+      - semantic_keys
       - payload
       - content_hash
       - structure_hash
@@ -369,6 +385,7 @@ components:
       - exchange
       - filing_type
       - disclosure_topics
+      - content_categories
       - report_period
       - announcement_date
       - producer_action_ref
@@ -1452,7 +1469,8 @@ paths:
           - type: string
           - type: 'null'
           title: Payload Kind
-      - description: Lowercase ASCII controlled semantic key.
+      - description: Lowercase ASCII controlled semantic key; recalls Units where
+          the key is either the primary route or a secondary semantic route.
         in: query
         name: semantic_key
         required: false
@@ -1461,8 +1479,37 @@ paths:
           - pattern: ^[a-z][a-z0-9_]{0,127}$
             type: string
           - type: 'null'
-          description: Lowercase ASCII controlled semantic key.
+          description: Lowercase ASCII controlled semantic key; recalls Units where
+            the key is either the primary route or a secondary semantic route.
           title: Semantic Key
+      - description: Comma-separated lowercase ASCII controlled semantic keys (max
+          50).
+        in: query
+        name: semantic_keys_any
+        required: false
+        schema:
+          anyOf:
+          - maxLength: 8192
+            pattern: ^ *[a-z][a-z0-9_]{0,127} *(?:, *[a-z][a-z0-9_]{0,127} *)*$
+            type: string
+          - type: 'null'
+          description: Comma-separated lowercase ASCII controlled semantic keys (max
+            50).
+          title: Semantic Keys Any
+      - description: Comma-separated lowercase ASCII controlled semantic keys (max
+          50).
+        in: query
+        name: semantic_keys_all
+        required: false
+        schema:
+          anyOf:
+          - maxLength: 8192
+            pattern: ^ *[a-z][a-z0-9_]{0,127} *(?:, *[a-z][a-z0-9_]{0,127} *)*$
+            type: string
+          - type: 'null'
+          description: Comma-separated lowercase ASCII controlled semantic keys (max
+            50).
+          title: Semantic Keys All
       - in: query
         name: quality_status
         required: false

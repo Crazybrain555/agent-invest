@@ -11,6 +11,9 @@
         "重要提示"
       ],
       "semantic_key": "document_content",
+      "semantic_keys": [
+        "document_content"
+      ],
       "quality_status": "ok",
       "order_index": 1
     },
@@ -53,6 +56,9 @@
         "应收账款"
       ],
       "semantic_key": "receivable_aging",
+      "semantic_keys": [
+        "receivable_aging"
+      ],
       "quality_status": "ok",
       "order_index": 2
     },
@@ -76,6 +82,9 @@
         "投资者关系活动记录表"
       ],
       "semantic_key": "document_content",
+      "semantic_keys": [
+        "document_content"
+      ],
       "quality_status": "needs_review",
       "order_index": 3
     },
@@ -123,13 +132,17 @@
         "一、经营情况"
       ],
       "semantic_key": "revenue",
+      "semantic_keys": [
+        "revenue",
+        "segment_performance"
+      ],
       "quality_status": "ok",
       "applicability": null,
       "order_index": 4
     },
     "expected": {
       "content_hash": "sha256:50e12a3abaac7551e934fdf5a99ca598564a86d9dc6cfe34be6bee294ce1b310",
-      "query_projection_hash": "sha256:19b2371e125cdc67a05489bd5ee298dd79da7a87f47eddc5d31e99ac1fccbefe",
+      "query_projection_hash": "sha256:f4d3640f1351e8d7de79b815f42a53cc621d82bcd3680da0d29512b7d825650c",
       "structure_hash": "sha256:42b9f44c722e5de44f9c8079a38d7d15126e217a7919edaf12385d4602c12993"
     }
   }

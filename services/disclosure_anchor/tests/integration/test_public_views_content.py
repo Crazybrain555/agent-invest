@@ -256,6 +256,7 @@ class PublicViewContentTests(unittest.TestCase):
                     order_index=0,
                     heading_path=["第八节 财务报告", "应收账款"],
                     semantic_key="receivable_aging",
+                    semantic_keys=["receivable_aging"],
                     payload={"unit": "元", "rows": [["合计", "1"]]},
                     content_hash="sha256:unit",
                     query_projection_hash="sha256:query",
@@ -412,6 +413,7 @@ class PublicViewContentTests(unittest.TestCase):
             "title",
             "order_index",
             "semantic_key",
+            "semantic_keys",
             "payload",
             "content_hash",
             "structure_hash",
@@ -427,6 +429,7 @@ class PublicViewContentTests(unittest.TestCase):
             "exchange",
             "filing_type",
             "disclosure_topics",
+            "content_categories",
             "report_period",
             "announcement_date",
             "producer_action_ref",
@@ -452,14 +455,14 @@ class PublicViewContentTests(unittest.TestCase):
             }
 
         self.assertEqual(columns, expected)
-        self.assertEqual(len(columns), 37)
+        self.assertEqual(len(columns), 39)
 
     def test_view_derives_classification_and_facets_from_raw_category(self) -> None:
         # 0016: one class map, two outputs — filing_type = argmax priority,
         # disclosure_topics = full hit set; facet columns split the segments.
         self._seed()
         self._ensure_classification_rules()
-        document_id, _ = self._seed_extra_document_unit("other")
+        document_id, unit_id = self._seed_extra_document_unit("other")
         with self.engine.begin() as conn:
             conn.execute(
                 text(
@@ -500,6 +503,16 @@ class PublicViewContentTests(unittest.TestCase):
             {item["code"] for item in row["content_categories"]},
             {"011301", "012325"},
         )
+        with self.engine.connect() as conn:
+            unit_categories = conn.execute(
+                text(
+                    "SELECT content_categories "
+                    "FROM disclosure_public.document_units_v1 "
+                    "WHERE asset_id = :asset_id"
+                ),
+                {"asset_id": unit_id},
+            ).scalar_one()
+        self.assertEqual(unit_categories, row["content_categories"])
 
     def test_view_falls_back_to_title_rules_without_codes(self) -> None:
         # 0017: code-less channels classify through the stored title and the

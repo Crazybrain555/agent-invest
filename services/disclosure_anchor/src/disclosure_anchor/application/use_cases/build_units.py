@@ -44,7 +44,7 @@ from disclosure_anchor.domain.services.unit_hashing import (
 )
 from disclosure_anchor.domain.value_objects.semantic_key import (
     SemanticKeyInvariantError,
-    validate_optional_semantic_key,
+    validate_optional_semantic_key_state,
 )
 
 
@@ -61,6 +61,7 @@ SNAPSHOT_KEYS = {
     "payload_kind",
     "quality_status",
     "semantic_key",
+    "semantic_keys",
     "title",
 }
 
@@ -345,7 +346,10 @@ class BuildUnits:
         for draft in build.units:
             self._validate_draft_hashes(draft)
             try:
-                validate_optional_semantic_key(draft.semantic_key)
+                validate_optional_semantic_key_state(
+                    draft.semantic_key,
+                    list(draft.semantic_keys) if draft.semantic_keys is not None else None,
+                )
             except SemanticKeyInvariantError as exc:
                 raise BuildUnitsError(
                     self._structured_error(
@@ -364,6 +368,11 @@ class BuildUnits:
                 title=draft.title,
                 order_index=draft.unit_index + 1,
                 semantic_key=draft.semantic_key,
+                semantic_keys=(
+                    list(draft.semantic_keys)
+                    if draft.semantic_keys is not None
+                    else None
+                ),
                 payload=cast(dict[str, Any], dict(draft.payload)),
                 content_hash=draft.content_hash,
                 structure_hash=draft.structure_hash,
@@ -387,6 +396,7 @@ class BuildUnits:
                 "payload_kind": unit.payload_kind,
                 "quality_status": unit.quality_status,
                 "semantic_key": unit.semantic_key,
+                "semantic_keys": unit.semantic_keys,
                 "title": unit.title,
             }
             if set(row) != SNAPSHOT_KEYS:
@@ -401,6 +411,9 @@ class BuildUnits:
             title=draft.title,
             heading_path=list(draft.heading_path),
             semantic_key=draft.semantic_key,
+            semantic_keys=(
+                list(draft.semantic_keys) if draft.semantic_keys is not None else None
+            ),
             quality_status=draft.quality_status,
             order_index=draft.unit_index + 1,
         )

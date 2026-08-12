@@ -1043,6 +1043,7 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     payload={"text": "期末余额说明"},
                     content_hash=f"h1_{suffix}",
                     semantic_key="receivable_aging",
+                    semantic_keys=["receivable_aging"],
                     artifact_locator=_text_search_locator(1),
                 )
             )
@@ -1058,6 +1059,7 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     payload={"text": "应收账款"},
                     content_hash=f"h2_{suffix}",
                     semantic_key="credit_impairment_loss",
+                    semantic_keys=["credit_impairment_loss"],
                     artifact_locator=_text_search_locator(2),
                 )
             )

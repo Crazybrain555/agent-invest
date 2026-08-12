@@ -74,14 +74,15 @@ tracked_company DTO 派生字段全集 = {effective_lookback_days / effective_sy
   占位名判别）/ last_synced_at（checkpoint 时间，NULL=从未同步）/ synced_through
   （cursor window_end 覆盖日期）
 scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（数组前缀语义，
-  见 06 §3.8）/ semantic_key（可选单值参数，精确匹配 nullable scalar 列）/
+  见 06 §3.8）/ semantic_key（兼容召回 primary 或 secondary route）/
+  semantic_keys_any / semantic_keys_all /
   quality_status 等）
 0010 起 document_units_v1 追加 applicability / page_no 列（applicability：
   'applicable'|'not_applicable'|NULL，节适用性声明的一等筛选列，payload 保持纯原文，
   部分索引 ix_document_unit_applicability；page_no：artifact_locator 首页码提升列）。
 0007 起 document_units_v1 追加 6 列：asset_kind / observed_at / source_tier /
   trace_level / raw_file_hash / query_projection_hash
-  （0033 当前列全集 = **37 列**；移除重复 semantic_keys 和 Unit 级三维分类复制，三维分类只留 documents_v1/document_categories_v1；filing_type/disclosure_topics 仍为 Unit 路由字段）
+  （0034 当前列全集 = **39 列**；恢复 semantic_keys 与继承的 content_categories；publisher/market 只留 documents_v1/document_categories_v1）
 0007 起 change_events_v1 追加 change_kind（真实列）/ subject_kind / subject_ref /
   source / contract_version
 0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref /
@@ -90,9 +91,9 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
   payload.parts 承载同一 source-proved 结构区间内的有序浅内容；精确 provider type 留在
   ProviderDocument，粗 kind/source owner 留在 locator，不在 payload 重复；document/section 由 title/headpath/locator 推导；
   监管 taxonomy 不参与切分）
-0033 删除 0013 semantic_keys 存储/索引/API 集合过滤；nullable scalar semantic_key 保留为
-  顶层协议可选 Unit 查询键。Provider writer 不做 L1 业务 taxonomy，写 NULL；不得用键改变
-  source payload/boundary
+0034 恢复 semantic_keys 存储/GIN/API 集合过滤；nullable scalar semantic_key 是 primary，
+  数组是完整有序 route set。Provider writer 不做 L1 业务 taxonomy，当前两者都写 NULL；
+  不得用键改变 source payload/boundary，也不得恢复旧词面规则堆
 0015 起 document_units_v1 增加 heading_path_text（视图内派生的面包屑文本
   "第八节 财务报告 > … > 75、其他综合收益"——多级标题的可检索形态；不入库、
   不进哈希；06R 投影将对同一字段建 FTS 索引）
@@ -240,4 +241,15 @@ Provider writer 不再写 document_content 占位语义，semantic_key=NULL；mi
 本服务尚无生产/外部消费者，用户授权保留 document_unit.v1 做开发期原地删字段；若存在真实消费者则必须升 v2
 不就地 NULL 旧 semantic_key（会破坏 query_projection_hash）；清理开发库后由新 writer 全量重放，
   同时替换因 mixed payload 去重而变化的 content_hash
+```
+
+2026-08-13（0034 Unit 检索路由纠偏）：
+
+```text
+0033 的 15,690 行审计只证明当时 writer 写出了 duplicate-only 数据，不证明 plural route capacity 无用
+恢复 semantic_keys：首项必须等于 semantic_key；secondary keys 为 mixed Unit 提供完整 recall；GIN + any/all API 恢复
+恢复 content_categories 到 document_units_v1 / DocumentUnitV1，但值仍由 Document join 继承，不复制进 Unit 表或全文 token
+publisher_categories / market 保持 Document-only
+当前 Provider writer 没有可信分类器，semantic_key/semantic_keys 都写 NULL；不伪造 document_content
+singleton 数组不重复改变 query_projection_hash；只有真实 secondary route 扩展 query hash，避免无信息的全量哈希翻转
 ```

@@ -157,6 +157,7 @@ class DocumentUnit:
     heading_path: list[str] = field(default_factory=list)
     title: Optional[str] = None
     semantic_key: Optional[str] = None
+    semantic_keys: Optional[list[str]] = None
     structure_hash: Optional[str] = None
     quality_status: str = "ok"
     # Section applicability declared by √适用/□不适用 marker lines (05 §8.5).

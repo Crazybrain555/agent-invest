@@ -496,12 +496,26 @@ class DocumentUnit(Base):
             "applicability IN ('applicable','not_applicable')",
             name="ck_document_unit_applicability",
         ),
+        CheckConstraint(
+            "(semantic_key IS NULL AND semantic_keys IS NULL) OR ("
+            "semantic_key IS NOT NULL "
+            "AND jsonb_typeof(semantic_keys) = 'array' "
+            "AND jsonb_array_length(semantic_keys) > 0 "
+            "AND semantic_keys ->> 0 = semantic_key)",
+            name="ck_document_unit_semantic_key_set",
+        ),
         UniqueConstraint(
             "processing_run_id", "order_index", name="uq_document_unit_run_order"
         ),
         Index("ix_document_unit_document", "document_id"),
         Index("ix_document_unit_run", "processing_run_id"),
         Index("ix_document_unit_semantic_key", "semantic_key"),
+        Index(
+            "ix_document_unit_semantic_keys",
+            "semantic_keys",
+            postgresql_using="gin",
+            postgresql_where=text("semantic_keys IS NOT NULL"),
+        ),
         Index(
             "ix_document_unit_run_order",
             "document_id",
@@ -536,6 +550,13 @@ class DocumentUnit(Base):
     title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     order_index: Mapped[int] = mapped_column(Integer, nullable=False)
     semantic_key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Python None is the deliberate "no semantic claim" state and must bind
+    # as SQL NULL.  JSON ``null`` would fail the scalar/array pairing CHECK
+    # while looking deceptively null through JSON-oriented clients.
+    semantic_keys: Mapped[Optional[list[str]]] = mapped_column(
+        JSONB(none_as_null=True),
+        nullable=True,
+    )
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
     structure_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)

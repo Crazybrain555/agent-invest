@@ -82,6 +82,7 @@ def _unit_row(
         "title": "风险提示",
         "order_index": order_index,
         "semantic_key": "risk",
+        "semantic_keys": ["risk", "governance"],
         "payload": {"b": 2, "a": "披露"},
         "content_hash": "sha256:" + "b" * 64,
         "structure_hash": "sha256:" + "c" * 64,
@@ -97,6 +98,7 @@ def _unit_row(
         "exchange": "szse",
         "filing_type": "annual_report",
         "disclosure_topics": None,
+        "content_categories": None,
         "report_period": "2025A",
         "announcement_date": date(2026, 7, 5),
         "producer_action_ref": processing_run_id,
@@ -392,7 +394,7 @@ class FilingApiUnitTests(unittest.TestCase):
         self.assertEqual(engine.params[1]["heading_prefix_json"], '["第一节","风险"]')
         self.assertEqual(engine.params[1]["payload_kind"], "text")
 
-    def test_semantic_filter_matches_only_the_optional_scalar_key(self) -> None:
+    def test_semantic_filters_cover_scalar_and_array_keys(self) -> None:
         engine = _Engine(
             [
                 [_document_row()],
@@ -411,11 +413,49 @@ class FilingApiUnitTests(unittest.TestCase):
             "doc_1",
             _request(engine),
             semantic_key="risk",
+            semantic_keys_any="risk, revenue ,risk",
+            semantic_keys_all="risk,governance",
         )
 
         sql = engine.statements[1]
-        self.assertIn("u.semantic_key = :semantic_key", sql)
-        self.assertNotIn("semantic_keys", sql)
+        self.assertIn(
+            "u.semantic_key = :semantic_key OR u.semantic_keys ? :semantic_key",
+            sql,
+        )
+        self.assertIn("u.semantic_keys ?| CAST(:semantic_keys_any AS text[])", sql)
+        self.assertIn("u.semantic_keys ?& CAST(:semantic_keys_all AS text[])", sql)
+        self.assertEqual(engine.params[1]["semantic_keys_any"], ["risk", "revenue"])
+        self.assertEqual(engine.params[1]["semantic_keys_all"], ["risk", "governance"])
+
+    def test_semantic_key_list_validation_is_bounded_and_rejects_empty_items(
+        self,
+    ) -> None:
+        with self.assertRaises(HTTPException) as caught:
+            list_document_units(
+                "doc_1",
+                _request(_Engine([[_document_row()]])),
+                semantic_keys_any="risk,,revenue",
+            )
+        self.assertEqual(caught.exception.status_code, 422)
+
+        with self.assertRaises(HTTPException):
+            list_document_units(
+                "doc_1",
+                _request(_Engine([[_document_row()]])),
+                semantic_keys_all=",".join(f"key{index}" for index in range(51)),
+            )
+        with self.assertRaises(HTTPException):
+            list_document_units(
+                "doc_1",
+                _request(_Engine([[_document_row()]])),
+                semantic_keys_any=",".join("risk" for _ in range(51)),
+            )
+        with self.assertRaises(HTTPException):
+            list_document_units(
+                "doc_1",
+                _request(_Engine([[_document_row()]])),
+                semantic_keys_any="x" * 129,
+            )
 
     def test_semantic_key_filters_reject_non_contract_and_control_characters(
         self,
@@ -436,6 +476,13 @@ class FilingApiUnitTests(unittest.TestCase):
                 with self.assertRaises(HTTPException) as caught:
                     _validate_semantic_key("semantic_key", value)
                 self.assertEqual(caught.exception.status_code, 422)
+                with self.assertRaises(HTTPException) as list_caught:
+                    list_document_units(
+                        "doc_1",
+                        _request(_Engine([[_document_row()]])),
+                        semantic_keys_any=value,
+                    )
+                self.assertEqual(list_caught.exception.status_code, 422)
 
         self.assertEqual(
             _validate_semantic_key("semantic_key", "cash_flow_note_2"),

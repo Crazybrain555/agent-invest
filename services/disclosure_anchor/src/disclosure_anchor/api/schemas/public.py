@@ -84,6 +84,7 @@ class DocumentUnitV1(PublicModel):
     title: str | None
     order_index: int
     semantic_key: str | None
+    semantic_keys: list[str] | None
     payload: dict[str, Any]
     content_hash: str
     structure_hash: str | None
@@ -99,6 +100,7 @@ class DocumentUnitV1(PublicModel):
     exchange: str | None
     filing_type: str | None
     disclosure_topics: list[str] | None
+    content_categories: list[dict[str, Any]] | None
     report_period: str | None
     announcement_date: date | None
     producer_action_ref: str

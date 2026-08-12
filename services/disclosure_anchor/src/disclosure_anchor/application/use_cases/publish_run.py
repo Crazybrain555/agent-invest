@@ -36,7 +36,7 @@ from disclosure_anchor.domain.services.unit_hashing import (
 )
 from disclosure_anchor.domain.value_objects.semantic_key import (
     SemanticKeyInvariantError,
-    validate_optional_semantic_key,
+    validate_optional_semantic_key_state,
 )
 
 
@@ -187,6 +187,9 @@ class ProviderDocumentPublicationGuard:
             "heading_path": list(draft.heading_path),
             "order_index": draft.unit_index + 1,
             "semantic_key": draft.semantic_key,
+            "semantic_keys": (
+                list(draft.semantic_keys) if draft.semantic_keys is not None else None
+            ),
             "quality_status": draft.quality_status,
             "applicability": None,
             "page_no": draft.page_no,
@@ -533,8 +536,9 @@ def _changed_projection_fields(old: e.DocumentUnit, new: e.DocumentUnit) -> list
     new_projection = _unit_query_projection(new)
     changed = [
         field
-        for field in old_projection
-        if field != "payload_kind" and old_projection[field] != new_projection[field]
+        for field in dict.fromkeys((*old_projection, *new_projection))
+        if field != "payload_kind"
+        and old_projection.get(field) != new_projection.get(field)
     ]
     if not changed:
         raise PublishRunError(
@@ -555,6 +559,7 @@ def _unit_query_projection(unit: e.DocumentUnit) -> dict[str, Any]:
         title=unit.title,
         heading_path=unit.heading_path,
         semantic_key=unit.semantic_key,
+        semantic_keys=unit.semantic_keys,
         quality_status=unit.quality_status,
         applicability=unit.applicability,
         payload=unit.payload,
@@ -604,6 +609,7 @@ def _canonical_unit_hashes(unit: e.DocumentUnit) -> UnitHashes:
         title=unit.title,
         heading_path=unit.heading_path,
         semantic_key=unit.semantic_key,
+        semantic_keys=unit.semantic_keys,
         quality_status=unit.quality_status,
         order_index=unit.order_index,
         applicability=unit.applicability,
@@ -619,7 +625,10 @@ def _validate_candidate_run(
     canonical: dict[int, UnitHashes] = {}
     for unit in units:
         try:
-            validate_optional_semantic_key(unit.semantic_key)
+            validate_optional_semantic_key_state(
+                unit.semantic_key,
+                unit.semantic_keys,
+            )
         except SemanticKeyInvariantError as exc:
             raise PublishRunError(
                 _structured_error(

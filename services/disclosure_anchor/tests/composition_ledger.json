@@ -58,7 +58,7 @@
   },
   "tests/integration/test_schema_and_views.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 9
   },
   "tests/integration/test_search_projection.py": {
    "private_imports": [],
@@ -162,7 +162,7 @@
    "private_imports": [
     "_validate_semantic_key"
    ],
-   "tests": 11
+   "tests": 12
   },
   "tests/unit/test_gc_orphan_artifacts.py": {
    "private_imports": [],
@@ -186,7 +186,7 @@
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
-   "tests": 6
+   "tests": 8
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],
@@ -242,7 +242,7 @@
    "private_imports": [
     "_validate_candidate_unit_set"
    ],
-   "tests": 21
+   "tests": 22
   },
   "tests/unit/test_raw_document_store.py": {
    "private_imports": [],
@@ -266,7 +266,7 @@
   },
   "tests/unit/test_search_projection.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 12
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],
@@ -286,7 +286,7 @@
   },
   "tests/unit/test_unit_hashing.py": {
    "private_imports": [],
-   "tests": 12
+   "tests": 14
   },
   "tests/unit/test_unmapped_code_audit.py": {
    "private_imports": [],

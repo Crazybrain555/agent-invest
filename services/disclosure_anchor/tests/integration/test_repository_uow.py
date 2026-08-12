@@ -33,6 +33,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
     def _delete(self, created: dict[str, str]) -> None:
         """Best-effort cleanup of rows a committing test created."""
         order = [
+            ("disclosure_core.document_unit", "asset_id", "unit_null"),
             ("disclosure_core.document_unit", "asset_id", "unit"),
             ("disclosure_ops.outbox_event", "event_id", "event"),
             ("disclosure_core.processing_run", "processing_run_id", "run"),
@@ -161,6 +162,7 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                         heading_path=["第八节 财务报告", "应收账款", "按账龄披露"],
                         title="应收账款按账龄披露",
                         semantic_key="receivable_aging",
+                        semantic_keys=["receivable_aging"],
                         payload={"unit": "元", "headers": ["账龄"], "rows": [["合计"]]},
                         content_hash="sha256:unit",
                         query_projection_hash="sha256:query",
@@ -171,6 +173,22 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                     )
                 )
                 created["unit"] = unit.asset_id
+
+                null_route_unit = uow.document_units.add(
+                    e.DocumentUnit(
+                        asset_id=ids.new_asset_id(),
+                        document_id=document.document_id,
+                        processing_run_id=run.processing_run_id,
+                        payload_kind="text",
+                        order_index=1,
+                        semantic_key=None,
+                        semantic_keys=None,
+                        payload={"text": "无受控语义路由"},
+                        content_hash="sha256:null-route-unit",
+                        query_projection_hash="sha256:null-route-query",
+                    )
+                )
+                created["unit_null"] = null_route_unit.asset_id
 
                 event = uow.outbox.add(
                     e.OutboxEvent(
@@ -226,6 +244,9 @@ class RepositoryUnitOfWorkTests(unittest.TestCase):
                 self.assertEqual(got_unit.semantic_key, "receivable_aging")
                 self.assertEqual(got_unit.heading_path[0], "第八节 财务报告")
                 self.assertEqual(got_unit.query_projection_hash, "sha256:query")
+                got_null_route = uow.document_units.get(created["unit_null"])
+                self.assertIsNone(got_null_route.semantic_key)
+                self.assertIsNone(got_null_route.semantic_keys)
                 self.assertEqual(
                     uow.outbox.get(created["event"]).event_kind, "run_published"
                 )

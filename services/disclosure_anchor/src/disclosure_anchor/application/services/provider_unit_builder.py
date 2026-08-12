@@ -307,6 +307,7 @@ class _BuildContext:
             title=None if heading is None else heading.text,
             heading_path=list(heading_path),
             semantic_key=None,
+            semantic_keys=None,
             quality_status=quality_status,
             order_index=unit.unit_index + 1,
         )
@@ -317,6 +318,7 @@ class _BuildContext:
             title=None if heading is None else heading.text,
             heading_path=heading_path,
             semantic_key=None,
+            semantic_keys=None,
             quality_status=quality_status,
             page_no=self.blocks[unit.block_source_indices[0]].page_index + 1,
             locator=locator,

@@ -90,9 +90,9 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | payload_kind | 闭集 text / table / qa（历史只读）/ **mixed**。新 writer：单一正文块提升为 text，单一逻辑表 owner 提升为 table；多块或视觉块使用 mixed。parts 只存浅内容字段；精确 provider type 留在 ProviderDocument，粗粒度 owner/evidence kind 只留 locator |
 | heading_path | jsonb 完整**源标题路径**（有 heading 时非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text；路径来自 typed heading/outline 结构，不来自 caption 或 taxonomy |
 | title | 只取已接受 source heading 的叶节点，并与 heading_path 末项相等；无可靠 heading 时为 NULL。登记文档标题只留 document scope；caption、单位、脚注不得填入 title |
-| semantic_key | 可选的受控 Unit 级路由键；Provider writer 当前写 NULL，不以 `document_content` 冒充语义。历史真实窄键仍可读；btree 索引 |
+| semantic_key / semantic_keys | 可选的受控 Unit 级路由：scalar 是 primary，JSONB 数组是完整有序路由集且首项必须等于 scalar；mixed Unit 可保留多个真实路由，GIN 支持 any/all recall。Provider writer 当前没有可信分类器，因而两者都写 NULL，不以 `document_content` 冒充语义 |
 | payload | ProviderDocument 的 source-bound 浅投影：顶层 text 只保存 `{text}`；顶层 table 保存原始 `table_body` HTML 与 caption/footnote 数组；mixed 只保存有序浅内容 fields，不重复 `provider_type`/kind/semantic_type。精确 source type 与粗 owner kind 分别在 ProviderDocument/locator。视觉 part 的 `content_artifacts` 仅含 hash/size/media，使视觉内容进入 content hash；路径、raw JSON、表格 crop 不进入 payload。L1 不解析 grid、不修复 cell、不用 middle HTML 覆盖 content-list owner |
-| content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；content 绑定 payload（含视觉内容 digest），query 绑定 title/heading/key/quality/applicability，structure 绑定 kind/path/order。locator/page/provider identity 不混入哈希，发布前由 fresh ProviderDocument admission + deterministic rebuild 精确复核 |
+| content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；content 绑定 payload（含视觉内容 digest），query 绑定 title/heading/primary key/真实 secondary routes/quality/applicability，structure 绑定 kind/path/order。singleton `semantic_keys=[semantic_key]` 不重复改变 query hash；locator/page/provider identity 不混入哈希，发布前由 fresh ProviderDocument admission + deterministic rebuild 精确复核 |
 | quality_status | ok / needs_review / unusable（乱码率>30%） |
 | applicability | vc16 CHECK：applicable / not_applicable / NULL（√适用声明列化；见 §5 讨论） |
 | page_no | 定位列（artifact_locator 首页码） |
@@ -115,10 +115,10 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 ## 3. disclosure_public 视图（唯一读契约）
 
-- **document_units_v1（37 列）**：core 列 + 派生（is_active_run、heading_path_text 面包屑、
+- **document_units_v1（39 列）**：core 列 + 派生（is_active_run、heading_path_text 面包屑、
   现算 filing_type/disclosure_topics、
   contract_version、company_ref/security_ref、security_code/exchange、filing_type、
-  disclosure_topics、report_period、announcement_date、source_ref、parent_ref、asset_kind、
+  disclosure_topics、content_categories、report_period、announcement_date、source_ref、parent_ref、asset_kind、
   observed_at、source_tier、trace_level、raw_file_hash）。列集权威=contract-checklist §2。
 - documents_v1 / processing_runs_v1 / source_refs_v1 / change_events_v1 / document_categories_v1。
 - **tracked_companies_v1（0019+0020，round22）**：股票池读契约——真源是 tracked_company 表
@@ -174,7 +174,7 @@ text+CHECK（int 码是无 CHECK 时代的习惯），存储差异在本规模�
 **semantic_key 用英文还是中文（round13 决策：英文规范键 + 词表即中文标签层）**：
 键是机器路由标识，ASCII 标识符在 SQL/API/代码中零引号零编码负担；XBRL 正是这个
 模式（英文 element name + 中文 standard label），tushare 同理（英文字段+中文文档）。
-新 Provider writer 不再在 L1 推断章节 taxonomy，因此写 NULL；`document_content` 不是语义，
-不能作为占位键。若未来存在真实受控 Unit 键，仍用英文规范 scalar；L2 的多值标签属于自己的
-派生层，不能回写 L1 payload、标题或边界。0033 已删除重复的 `semantic_keys` JSONB 数组与
-集合过滤接口。
+新 Provider writer 不再在 L1 推断章节 taxonomy，因此两列都写 NULL；`document_content` 不是
+语义，不能作为占位键。若后续存在可信的 Unit 路由阶段，仍用英文规范键：`semantic_key`
+保存 primary，`semantic_keys` 保存完整有序集合并保留 mixed Unit 的 secondary recall。它们是
+检索路由，不得回写 payload、标题或边界。0034 恢复了这项容量，但没有恢复旧词面规则堆。

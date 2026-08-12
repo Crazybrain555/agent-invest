@@ -11,7 +11,7 @@ from disclosure_anchor.domain.services.unit_hashing import (
     compute_unit_hashes,
 )
 from disclosure_anchor.domain.value_objects.semantic_key import (
-    validate_optional_semantic_key,
+    validate_optional_semantic_key_state,
 )
 
 
@@ -35,10 +35,13 @@ class UnitHashingTests(unittest.TestCase):
                 )
                 self.assertEqual(got.structure_hash, case["expected"]["structure_hash"])
 
-    def test_golden_cases_carry_a_valid_optional_semantic_key(self) -> None:
+    def test_golden_cases_carry_a_valid_optional_semantic_state(self) -> None:
         for case in json.loads(FIXTURE.read_text(encoding="utf-8")):
             with self.subTest(case=case["name"]):
-                validate_optional_semantic_key(case["input"]["semantic_key"])
+                validate_optional_semantic_key_state(
+                    case["input"]["semantic_key"],
+                    case["input"]["semantic_keys"],
+                )
 
     def test_canonical_json_shape_is_pinned(self) -> None:
         self.assertEqual(
@@ -124,6 +127,7 @@ class UnitHashingTests(unittest.TestCase):
             "title": "经营情况",
             "heading_path": ["第三节 管理层讨论与分析", "一、经营情况"],
             "semantic_key": "document_content",
+            "semantic_keys": ["document_content"],
             "quality_status": "ok",
             "order_index": 1,
         }
@@ -167,6 +171,7 @@ class UnitHashingTests(unittest.TestCase):
             "title": "业务",
             "heading_path": ["一、业务"],
             "semantic_key": "document_content",
+            "semantic_keys": ["document_content"],
             "quality_status": "ok",
             "order_index": 1,
         }
@@ -209,6 +214,7 @@ class UnitHashingTests(unittest.TestCase):
             "title": "业务",
             "heading_path": ["一、业务"],
             "semantic_key": "document_content",
+            "semantic_keys": ["document_content"],
             "quality_status": "ok",
             "order_index": 1,
         }
@@ -234,6 +240,7 @@ class UnitHashingTests(unittest.TestCase):
             "title": "业务",
             "heading_path": ["一、业务"],
             "semantic_key": "document_content",
+            "semantic_keys": ["document_content"],
             "quality_status": "ok",
             "order_index": 1,
         }
@@ -312,6 +319,7 @@ class UnitHashingTests(unittest.TestCase):
             "title": "业务",
             "heading_path": ["一、业务"],
             "semantic_key": "document_content",
+            "semantic_keys": ["document_content"],
             "quality_status": "ok",
             "order_index": 1,
         }
@@ -322,6 +330,42 @@ class UnitHashingTests(unittest.TestCase):
                         payload={"semantic_type": "section", "parts": parts},
                         **common,
                     )
+
+    def test_secondary_semantic_route_changes_only_query_projection(self) -> None:
+        common = {
+            "payload_kind": "text",
+            "payload": {"text": "正文"},
+            "title": "经营情况",
+            "heading_path": ["一、经营情况"],
+            "semantic_key": "revenue",
+            "quality_status": "ok",
+            "order_index": 1,
+        }
+        first = compute_unit_hashes(semantic_keys=["revenue"], **common)
+        second = compute_unit_hashes(
+            semantic_keys=["revenue", "segment_performance"],
+            **common,
+        )
+
+        self.assertEqual(first.content_hash, second.content_hash)
+        self.assertNotEqual(first.query_projection_hash, second.query_projection_hash)
+        self.assertEqual(first.structure_hash, second.structure_hash)
+
+    def test_singleton_route_set_does_not_duplicate_scalar_hash_identity(self) -> None:
+        common = {
+            "payload_kind": "text",
+            "payload": {"text": "正文"},
+            "title": "经营情况",
+            "heading_path": ["一、经营情况"],
+            "semantic_key": "revenue",
+            "quality_status": "ok",
+            "order_index": 1,
+        }
+
+        self.assertEqual(
+            compute_unit_hashes(semantic_keys=None, **common),
+            compute_unit_hashes(semantic_keys=["revenue"], **common),
+        )
 
 
 if __name__ == "__main__":

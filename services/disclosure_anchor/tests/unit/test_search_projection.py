@@ -134,7 +134,7 @@ class ProviderSearchTargetTests(unittest.TestCase):
             heading_path=draft.heading_path,
             payload_kind=draft.payload_kind,
             payload=draft.payload,
-            semantic_key=draft.semantic_key,
+            semantic_keys=draft.semantic_keys,
             artifact_locator=provider_unit_locator_to_payload(draft.locator),
             built_at=_BUILT_AT,
         )
@@ -173,7 +173,7 @@ class ProviderSearchTargetTests(unittest.TestCase):
                     heading_path=draft.heading_path,
                     payload_kind=draft.payload_kind,
                     payload=draft.payload,
-                    semantic_key=draft.semantic_key,
+                    semantic_keys=draft.semantic_keys,
                     artifact_locator=provider_unit_locator_to_payload(draft.locator),
                     built_at=_BUILT_AT,
                 )
@@ -213,7 +213,7 @@ class ProviderSearchTargetTests(unittest.TestCase):
             heading_path=draft.heading_path,
             payload_kind=draft.payload_kind,
             payload=draft.payload,
-            semantic_key=draft.semantic_key,
+            semantic_keys=draft.semantic_keys,
             artifact_locator=provider_unit_locator_to_payload(draft.locator),
             built_at=_BUILT_AT,
         )
@@ -271,7 +271,7 @@ class ProviderSearchTargetTests(unittest.TestCase):
             heading_path=draft.heading_path,
             payload_kind=draft.payload_kind,
             payload=draft.payload,
-            semantic_key=draft.semantic_key,
+            semantic_keys=draft.semantic_keys,
             artifact_locator=provider_unit_locator_to_payload(draft.locator),
             built_at=_BUILT_AT,
         )
@@ -294,11 +294,26 @@ class ProviderSearchTargetTests(unittest.TestCase):
         )
         self.assertEqual(
             row["retrieval_rules_version"],
-            "rp-2026.08-provider-unit-v2",
+            "rp-2026.08-provider-unit-v3",
         )
         self.assertEqual(row["key_tokens"], "")
         self.assertFalse(row["header_row_candidate"])
         self.assertNotIn("search_tsv", row)
+
+    def test_all_semantic_routes_enter_key_tokens_in_contract_order(self) -> None:
+        draft = build_provider_units(_admitted(_representative_document())).units[1]
+        row = compute_search_projection_row(
+            asset_id="asset_routes",
+            title=draft.title,
+            heading_path=draft.heading_path,
+            payload_kind=draft.payload_kind,
+            payload=draft.payload,
+            semantic_keys=("revenue", "segment_performance"),
+            artifact_locator=provider_unit_locator_to_payload(draft.locator),
+            built_at=_BUILT_AT,
+        )
+
+        self.assertEqual(row["key_tokens"], "revenue segment_performance")
 
 
 if __name__ == "__main__":

@@ -102,15 +102,60 @@ writer. Source SHA-256 identifies the immutable PDF.
 | 688012 / 1225455464 | 4 | short performance forecast with numeric ranges | `020a8e984e8dbe30397b167cdbb468bd7bdec0667923490c674b18ed70f425fc` |
 | 601138 / 1225468066 | 221 | current semiannual report, dense financial tables, and yes/no front matter | `34d02741f6651eba443de0b3ec16562a43d22b31c12d548e4f17004ed618ba2d` |
 
-## Current mechanical receipt
+## Latest clean replay receipt (2026-08-13)
 
-The clean development database contains 30 current documents and 4,955 active
-Units: 2,804 mixed, 188 table, and 1,963 text. The current search projection
-contains 86,407 atoms. After the independent row review, 4,951 Units are `ok`
-and four source-bound Beigene titles are explicitly `needs_review`: MinerU
-retained only `<sup>®</sup>` plus BAT1706/BTK/PD-1/PARP1-PARP2 while the PDF and
-body text retain the adjacent Chinese drug names. No text was synthesized or
-overwritten. Across the active Provider records:
+The final Unit-schema QA replay keeps ten diverse documents in the development
+database and deliberately replaces the preceding replay generation. It contains
+805 active Units: 446 mixed, 12 table, and 347 text. The `provider_unit.v3`
+search projection contains 805 parent rows and 25,954 source-bound atoms under
+`rp-2026.08-provider-unit-v3`. Mechanical and source checks found:
+
+- all ten documents have exactly one parse run; all runs are succeeded,
+  published, and have zero unassigned table parts;
+- the Provider records contain 360 pages, 4,150 blocks, 337 physical table
+  segments, 269 logical tables, and 3,209 retrieval targets with complete Unit
+  ownership;
+- no persisted Unit payload contains `provider_type`, `kind`, or
+  `semantic_type`; the payload shapes are only shallow text, table, visual, and
+  ordered mixed parts;
+- all 156 `{"text":""}` payloads are accepted source headings with non-empty
+  `title` and `heading_path`; there is no unexplained empty carrier, empty mixed
+  text part, or empty table body;
+- `semantic_key` and `semantic_keys` are both NULL on all 805 Units because this
+  writer has no trusted route classifier. Consequently all current `key_tokens`
+  are empty rather than carrying a fake `document_content` placeholder;
+- `content_categories` is inherited only where the Document has actual CNInfo
+  category metadata: 23 Units across the operating-data and convertible-bond
+  documents. Local test registrations without provider category metadata remain
+  NULL; `publisher_categories` and `market` are not repeated on the Unit view;
+- 804 Units are `ok`. One quarterly-report Unit is `needs_review` because a
+  physical table continuation cannot be bound at a provider-declared page
+  boundary (`continuation_not_page_boundary`). On the same source page MinerU
+  also omitted `2026年1-3月`, `1.77%`, `1.83%`, `5`, and `8` from a narrative
+  sentence; the adjacent table and hash-bound visual artifact preserve those
+  values. The service does not synthesize the missing sentence values;
+- all 340 Unit evidence descriptors resolve to matching bytes, media type, size,
+  and SHA-256 (57,677,277 bytes total); all ten raw PDFs, Provider records, Unit
+  snapshots, active-run uniqueness, and search coverage pass `doctor --full`.
+
+The first short-document build exposed and closed one real integration bug:
+Python `None` for `semantic_keys` was initially bound as JSON `null`, which the
+SQL scalar/array pairing CHECK correctly rejected. `JSONB(none_as_null=True)`
+now persists the intended SQL NULL and a real-PostgreSQL regression test pins
+that boundary. The same parse run was retried at Build and published; no second
+parse was created.
+
+## Earlier full-scope acceptance receipt (2026-08-12)
+
+The earlier 30-document source matrix above produced 4,955 active Units: 2,804
+mixed, 188 table, and 1,963 text, plus 86,407 search atoms. Those development
+rows were intentionally deleted before the latest clean replay; this paragraph
+is historical acceptance evidence, not a claim about current database state.
+After the independent row review, 4,951 Units were `ok` and four source-bound
+Beigene titles were explicitly `needs_review`: MinerU retained only `<sup>®</sup>`
+plus BAT1706/BTK/PD-1/PARP1-PARP2 while the PDF and body text retained the
+adjacent Chinese drug names. No text was synthesized or overwritten. Across
+those Provider records:
 
 - 24,252 provider blocks, 2,364 physical table segments, 1,838 logical tables,
   and 20,934 retrieval targets have complete, exactly-once ownership;
@@ -163,6 +208,18 @@ These are explicit residuals, not silently repaired data:
    the former remains recoverable only from the immutable PDF. The service does
    not invent a second PDF-text universe or move an answer by layout guess;
    source page/bbox provenance remains available for L2 or human review.
+7. In source 100020384132 page 1, MinerU keeps only `编号：2026-` and drops the
+   separately printed trailing `003`, so no semantic provider artifact contains
+   the complete small form number `2026-003`. The registered document title does
+   carry the complete value and the immutable PDF is authoritative; this is a
+   provider form-header omission, not a Unit projection loss. A future
+   source-coverage metric may flag this family, but no document-ID repair is
+   permitted.
+8. One annual-report cover Unit (`du_01KZVBVAK4E4ABGZ3NPM2QER7E`) is a
+   source-bound logo image with no title or provider text. It is reachable by
+   document/order/locator and its JPEG digest participates in content identity,
+   but it intentionally has no full-text search atom. Do not fabricate OCR text
+   merely to make the cover keyword-searchable.
 
 ## Acceptance rule
 

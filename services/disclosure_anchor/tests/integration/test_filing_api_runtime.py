@@ -448,7 +448,12 @@ class FilingApiRuntimeTests(unittest.TestCase):
             self.app,
             "GET",
             f"/v1/documents/{seeded['document_id']}/units",
-            query={"semantic_key": "governance", "limit": 10},
+            query={
+                "semantic_key": "board_oversight",
+                "semantic_keys_any": "board_oversight,revenue",
+                "semantic_keys_all": "governance,board_oversight",
+                "limit": 10,
+            },
         )
         self.assertEqual(response.status_code, 200, response.body)
         semantic_payload = response.json()
@@ -684,7 +689,9 @@ class FilingApiRuntimeTests(unittest.TestCase):
         payload: dict[str, Any],
         title: str,
         semantic_key: str = "risk_factor",
+        semantic_keys: list[str] | None = None,
     ) -> None:
+        resolved_semantic_keys = semantic_keys or [semantic_key]
         self.asset_ids.append(asset_id)
         with self.engine.begin() as conn:
             conn.execute(
@@ -692,10 +699,11 @@ class FilingApiRuntimeTests(unittest.TestCase):
                     "INSERT INTO disclosure_core.document_unit "
                     "(asset_id, document_id, processing_run_id, provider_document_id, "
                     "payload_kind, heading_path, title, order_index, semantic_key, "
+                    "semantic_keys, "
                     "payload, content_hash, query_projection_hash) "
                     "VALUES (:asset_id, :document_id, :run_id, :provider_document_id, "
                     "'text', CAST(:heading_path AS jsonb), :title, :order_index, "
-                    ":semantic_key, "
+                    ":semantic_key, CAST(:semantic_keys AS jsonb), "
                     "CAST(:payload AS jsonb), :content_hash, "
                     ":query_projection_hash)"
                 ),
@@ -707,6 +715,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
                     "heading_path": json.dumps(heading_path, ensure_ascii=False),
                     "title": title,
                     "semantic_key": semantic_key,
+                    "semantic_keys": json.dumps(resolved_semantic_keys),
                     "order_index": order_index,
                     "payload": json.dumps(payload, ensure_ascii=False),
                     "content_hash": f"sha256:{asset_id}",
@@ -769,6 +778,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
             payload=prefix_payload,
             title="风险提示",
             semantic_key="governance",
+            semantic_keys=["governance", "board_oversight"],
         )
         self._insert_unit(
             asset_id=counter_asset_id,
@@ -1062,7 +1072,7 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
             self.assertTrue(
                 all(
                     unit.get("semantic_key") is None
-                    and "semantic_keys" not in unit
+                    and unit.get("semantic_keys") is None
                     for unit in units
                 )
             )

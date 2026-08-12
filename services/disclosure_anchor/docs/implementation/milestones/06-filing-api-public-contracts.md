@@ -11,9 +11,9 @@ delivers_to: milestone 07 / L2 / MCP 包装
 
 # Milestone 06: Filing API 与 public 契约
 
-> 2026-08-12：本文件保留里程碑完成时的历史契约。0033 已删除 Unit 级
-> `semantic_keys`、`semantic_keys_any/all` 与三维分类复制；当前列集和过滤器以
-> `docs/implementation/checks/contract-checklist.md` 为准。
+> 2026-08-13：本文件保留里程碑完成时的历史契约。0034 恢复 Unit 的
+> `semantic_keys`、`semantic_keys_any/all` 与继承的 `content_categories`；
+> `publisher_categories`/`market` 仍为 Document-only。当前列集以 contract-checklist 为准。
 
 把 `disclosure_public.*_v1` 的读契约以 HTTP API 形式暴露（协议 §3.11 的 L1 对外契约六条），
 并冻结 JSON schema。API 是视图的薄投影：**不引入视图之外的新语义**，读侧语义与
@@ -21,7 +21,7 @@ delivers_to: milestone 07 / L2 / MCP 包装
 
 ## 1. 前置依赖
 
-- 05 完成（active run、unit 数据、事件流）；里程碑完成时 `document_units_v1` 为 41 列（当前
+- 05 完成（active run、unit 数据、事件流）；里程碑完成时 `document_units_v1` 为 41 列（0034 当前为 39 列；
   完整列集以 contract-checklist §2 为准；32 列仅是 0007/0008 的历史基线），包含 active run、
   applicability/page_no、semantic_keys、heading_path_text 与三维分类投影；
   processing_runs_v1：builder_rules_version（0008，是 run 列不是 unit 列）；

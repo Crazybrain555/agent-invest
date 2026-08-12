@@ -24,8 +24,13 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 1. `title`：已接受的 source heading 叶标题；metadata document title 绝不复制到 Unit。
 2. `heading_path`：已接受 heading occurrence 的完整根到叶路径。
 3. body：只回放 `provider_unit_locator.v1.search_targets` 明确列出的 provider payload destination。
-4. `semantic_key`：可选的真实受控 scalar；当前 Provider writer 不在 L1 推断业务 taxonomy，
-   因而写 NULL，检索 key channel 为空。
+4. `semantic_key` / `semantic_keys`：可选的真实受控 Unit 路由；scalar 是 primary，数组是
+   完整有序集合，所有项都进入 key channel，避免 mixed Unit 的 secondary route 漏召回。
+   当前 Provider writer 没有可信分类器，因而两者都写 NULL；不以 `document_content` 占位。
+
+Query hash 只额外绑定真正独立的 secondary routes；singleton 数组不重复 primary scalar 的
+哈希身份。检索投影则在存在 routes 时索引完整数组，规则版本为
+`rp-2026.08-provider-unit-v3`。
 
 不得递归扫描 payload、按字段名猜正文、按相同字符串去重、把 metadata title 注入每个 Unit，
 或把 caption/页眉/粗体小计自动升格成标题。
@@ -68,6 +73,10 @@ supporting table crop 只作 evidence，不成为第二份可检索正文。
 
 `header_row_candidate` 对 provider-native Unit 固定为 false。未来如需表头 role，必须有明确
 source/provider 结构证据，不能恢复数值/词面启发式。
+
+`content_categories` 是 Document 的 provider/classification 粗分类，并继承到 Unit public view
+供 SQL/L2 做 facet 过滤；它不复制进 Unit 表，也不重复加入每个 Unit 的全文 key tokens。
+`publisher_categories` 与 `market` 保持 Document-only。
 
 ## 6. 版本与验证
 

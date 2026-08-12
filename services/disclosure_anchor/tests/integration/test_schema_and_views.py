@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import subprocess
+import sys
 import unittest
 
 from sqlalchemy import exc, text
@@ -28,6 +32,7 @@ EXPECTED_CORE_TABLES = {
     "processing_run",
     "document_unit",
 }
+SERVICE_ROOT = Path(__file__).resolve().parents[2]
 
 
 class SchemaShapeTests(unittest.TestCase):
@@ -208,6 +213,52 @@ class SchemaShapeTests(unittest.TestCase):
                 {"s": PUBLIC_SCHEMA},
             ).all()
         self.assertEqual(leaking, [], f"public views leak internal columns: {leaking}")
+
+    def test_0034_semantic_routes_upgrade_downgrade_upgrade(self) -> None:
+        self.addCleanup(self._restore_migration_head)
+
+        down = self._alembic("downgrade", "0033_unit_schema_convergence")
+        self.assertEqual(down.returncode, 0, down.stderr[-500:])
+        with self.engine.connect() as conn:
+            columns = set(
+                conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = 'disclosure_public' "
+                        "AND table_name = 'document_units_v1'"
+                    )
+                ).scalars()
+            )
+        self.assertNotIn("semantic_keys", columns)
+        self.assertNotIn("content_categories", columns)
+
+        up = self._alembic("upgrade", "head")
+        self.assertEqual(up.returncode, 0, up.stderr[-500:])
+        with self.engine.connect() as conn:
+            columns = set(
+                conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = 'disclosure_public' "
+                        "AND table_name = 'document_units_v1'"
+                    )
+                ).scalars()
+            )
+        self.assertLessEqual({"semantic_keys", "content_categories"}, columns)
+
+    @staticmethod
+    def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "alembic", *args],
+            cwd=SERVICE_ROOT,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+        )
+
+    def _restore_migration_head(self) -> None:
+        restored = self._alembic("upgrade", "head")
+        self.assertEqual(restored.returncode, 0, restored.stderr[-500:])
 
 
 if __name__ == "__main__":

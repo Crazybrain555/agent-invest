@@ -90,6 +90,7 @@ def query_projection_hash(
     heading_path: list[str],
     semantic_key: str | None,
     quality_status: str,
+    semantic_keys: list[str] | None = None,
     applicability: str | None = None,
     payload: dict[str, Any] | None = None,
 ) -> str:
@@ -100,6 +101,7 @@ def query_projection_hash(
                 title=title,
                 heading_path=heading_path,
                 semantic_key=semantic_key,
+                semantic_keys=semantic_keys,
                 quality_status=quality_status,
                 applicability=applicability,
                 payload=payload,
@@ -115,6 +117,7 @@ def query_projection(
     heading_path: list[str],
     semantic_key: str | None,
     quality_status: str,
+    semantic_keys: list[str] | None = None,
     applicability: str | None = None,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -133,6 +136,11 @@ def query_projection(
         "quality_status": quality_status,
         "applicability": applicability,
     }
+    # The singleton route set carries no information beyond semantic_key.
+    # Preserve the 0033 hash profile for null/singleton routes and bind only
+    # genuinely independent secondary recall to the query projection.
+    if semantic_keys is not None and semantic_keys != [semantic_key]:
+        projection["semantic_keys"] = semantic_keys
     if payload_kind == "mixed":
         if payload is None:
             raise ValueError("mixed query projection requires payload")
@@ -212,6 +220,7 @@ def compute_unit_hashes(
     semantic_key: str | None,
     quality_status: str,
     order_index: int,
+    semantic_keys: list[str] | None = None,
     applicability: str | None = None,
 ) -> UnitHashes:
     return UnitHashes(
@@ -221,6 +230,7 @@ def compute_unit_hashes(
             title=title,
             heading_path=heading_path,
             semantic_key=semantic_key,
+            semantic_keys=semantic_keys,
             quality_status=quality_status,
             applicability=applicability,
             payload=payload,

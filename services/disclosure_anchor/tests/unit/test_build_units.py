@@ -192,6 +192,7 @@ class BuildUnitsTests(unittest.TestCase):
             for unit in units:
                 provider_unit_locator_from_payload(unit.artifact_locator)
                 self.assertIsNone(unit.semantic_key)
+                self.assertIsNone(unit.semantic_keys)
                 self.assertIsNone(unit.applicability)
             rows = (Path(tmp) / run.document_units_relpath).read_text().splitlines()
             self.assertEqual(len(rows), len(units))
@@ -293,6 +294,7 @@ class BuildUnitsTests(unittest.TestCase):
                 "applicability", "page_no", "artifact_locator", "asset_id",
                 "content_hash", "document_id", "heading_path", "order_index",
                 "payload", "payload_kind", "quality_status", "semantic_key",
+                "semantic_keys",
                 "title",
             },
         )

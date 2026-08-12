@@ -16,13 +16,13 @@ class MigrationStateTests(unittest.TestCase):
         heads = migration_heads()
         self.assertEqual(len(heads), 1)
         self.assertEqual(single_migration_head(), heads[0])
-        self.assertEqual(heads[0], "0033_unit_schema_convergence")
+        self.assertEqual(heads[0], "0034_unit_semantic_routes")
 
         migration = importlib.import_module(
             "disclosure_anchor.adapters.db.postgres.migrations.versions."
-            "0033_unit_schema_convergence"
+            "0034_unit_semantic_routes"
         )
-        self.assertEqual(migration.down_revision, "0032_provider_document_output")
+        self.assertEqual(migration.down_revision, "0033_unit_schema_convergence")
 
     def test_0033_unit_view_keeps_only_unit_owned_scope_fields(self) -> None:
         migration = importlib.import_module(
@@ -57,6 +57,40 @@ class MigrationStateTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "information not present"),
         ):
             migration.upgrade()
+        execute.assert_not_called()
+        drop_column.assert_not_called()
+
+    def test_0034_restores_unit_routes_and_only_the_content_facet(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0034_unit_semantic_routes"
+        )
+
+        current = migration._document_units_view_sql(include_semantic_routes=True)
+        self.assertIn("u.semantic_key", current)
+        self.assertIn("u.semantic_keys", current)
+        self.assertIn("class_content_categories AS content_categories", current)
+        self.assertNotIn("publisher_categories", current)
+        self.assertNotIn("class_market", current)
+
+        prior = migration._document_units_view_sql(include_semantic_routes=False)
+        self.assertNotIn("u.semantic_keys", prior)
+        self.assertNotIn("content_categories", prior)
+
+    def test_0034_refuses_to_discard_secondary_routes(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0034_unit_semantic_routes"
+        )
+        connection = MagicMock()
+        connection.execute.return_value.scalar_one.return_value = 1
+        with (
+            patch.object(migration.op, "get_bind", return_value=connection),
+            patch.object(migration.op, "execute") as execute,
+            patch.object(migration.op, "drop_column") as drop_column,
+            self.assertRaisesRegex(RuntimeError, "secondary Unit routes"),
+        ):
+            migration.downgrade()
         execute.assert_not_called()
         drop_column.assert_not_called()
 

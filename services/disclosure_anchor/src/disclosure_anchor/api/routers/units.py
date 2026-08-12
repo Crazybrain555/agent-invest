@@ -72,6 +72,7 @@ UNIT_COLUMNS = (
     "title",
     "order_index",
     "semantic_key",
+    "semantic_keys",
     "payload",
     "content_hash",
     "structure_hash",
@@ -98,6 +99,7 @@ UNIT_COLUMNS = (
     "trace_level",
     "raw_file_hash",
     "query_projection_hash",
+    "content_categories",
 )
 
 SOURCE_REF_COLUMNS = (
@@ -133,7 +135,23 @@ def _semantic_key_query_default() -> Any:
         return None
     return Query(
         pattern=r"^[a-z][a-z0-9_]{0,127}$",
-        description="Lowercase ASCII controlled semantic key.",
+        description=(
+            "Lowercase ASCII controlled semantic key; recalls Units where the "
+            "key is either the primary route or a secondary semantic route."
+        ),
+    )
+
+
+def _semantic_key_list_query_default() -> Any:
+    if Query is None:  # pragma: no cover
+        return None
+    return Query(
+        max_length=8192,
+        pattern=(
+            r"^ *[a-z][a-z0-9_]{0,127} *"
+            r"(?:, *[a-z][a-z0-9_]{0,127} *)*$"
+        ),
+        description="Comma-separated lowercase ASCII controlled semantic keys (max 50).",
     )
 
 
@@ -144,6 +162,8 @@ def list_document_units(
     reject_superseded: bool = False,
     payload_kind: str | None = None,
     semantic_key: Annotated[str | None, _semantic_key_query_default()] = None,
+    semantic_keys_any: Annotated[str | None, _semantic_key_list_query_default()] = None,
+    semantic_keys_all: Annotated[str | None, _semantic_key_list_query_default()] = None,
     quality_status: str | None = None,
     heading_prefix: Annotated[list[str] | None, _query_default()] = None,
     cursor: str | None = None,
@@ -173,6 +193,12 @@ def list_document_units(
         filters=UnitFilters(
             payload_kind=payload_kind,
             semantic_key=_validate_semantic_key("semantic_key", semantic_key),
+            semantic_keys_any=_validate_semantic_key_list(
+                "semantic_keys_any", semantic_keys_any
+            ),
+            semantic_keys_all=_validate_semantic_key_list(
+                "semantic_keys_all", semantic_keys_all
+            ),
             quality_status=quality_status,
             heading_prefix=heading_prefix or [],
         ),
@@ -279,11 +305,15 @@ class UnitFilters:
         *,
         payload_kind: str | None = None,
         semantic_key: str | None = None,
+        semantic_keys_any: list[str] | None = None,
+        semantic_keys_all: list[str] | None = None,
         quality_status: str | None = None,
         heading_prefix: list[str] | None = None,
     ) -> None:
         self.payload_kind = payload_kind
         self.semantic_key = semantic_key
+        self.semantic_keys_any = semantic_keys_any
+        self.semantic_keys_all = semantic_keys_all
         self.quality_status = quality_status
         self.heading_prefix = heading_prefix or []
 
@@ -446,8 +476,16 @@ def _unit_where(filters: UnitFilters) -> tuple[list[str], dict[str, Any]]:
     params: dict[str, Any] = {}
     _add_filter(where, params, "payload_kind", filters.payload_kind)
     if filters.semantic_key is not None:
-        where.append("u.semantic_key = :semantic_key")
+        where.append(
+            "(u.semantic_key = :semantic_key OR u.semantic_keys ? :semantic_key)"
+        )
         params["semantic_key"] = filters.semantic_key
+    if filters.semantic_keys_any is not None:
+        where.append("u.semantic_keys ?| CAST(:semantic_keys_any AS text[])")
+        params["semantic_keys_any"] = filters.semantic_keys_any
+    if filters.semantic_keys_all is not None:
+        where.append("u.semantic_keys ?& CAST(:semantic_keys_all AS text[])")
+        params["semantic_keys_all"] = filters.semantic_keys_all
     _add_filter(where, params, "quality_status", filters.quality_status)
     if filters.heading_prefix:
         params["heading_prefix_json"] = json.dumps(
@@ -463,6 +501,23 @@ def _unit_where(filters: UnitFilters) -> tuple[list[str], dict[str, Any]]:
             params[key] = value
             where.append(f"u.heading_path ->> {index} = :{key}")
     return where, params
+
+
+def _validate_semantic_key_list(field: str, value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    raw_items = value.split(",")
+    if len(raw_items) > 50:
+        raise validation_error(field, "must contain at most 50 keys")
+    items = [item.strip(" ") for item in raw_items]
+    if not items or any(not item for item in items):
+        raise validation_error(
+            field, "must contain only non-empty comma-separated keys"
+        )
+    deduplicated = list(dict.fromkeys(items))
+    for item in deduplicated:
+        _validate_semantic_key(field, item)
+    return deduplicated
 
 
 def _validate_semantic_key(field: str, value: str | None) -> str | None:
