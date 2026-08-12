@@ -133,9 +133,9 @@ class ProviderUnitBuilderTests(unittest.TestCase):
     def test_table_without_body_keeps_crop_digest_in_content_hash(
         self,
     ) -> None:
-        first = build_provider_units(
-            _admitted(_table_visual_only_document("f"))
-        ).units[0]
+        first = build_provider_units(_admitted(_table_visual_only_document("f"))).units[
+            0
+        ]
         second = build_provider_units(
             _admitted(_table_visual_only_document("e"))
         ).units[0]
@@ -185,9 +185,9 @@ class ProviderUnitBuilderTests(unittest.TestCase):
             )
 
     def test_unit_locator_decoder_rejects_unknown_and_malformed_fields(self) -> None:
-        locator = build_provider_units(
-            _admitted(_representative_document())
-        ).units[1].locator
+        locator = (
+            build_provider_units(_admitted(_representative_document())).units[1].locator
+        )
         payload = provider_unit_locator_to_payload(locator)
         payload["unexpected"] = True
         with self.assertRaisesRegex(ValueError, "locator fields"):
@@ -201,7 +201,18 @@ class ProviderUnitBuilderTests(unittest.TestCase):
 
     def test_heading_only_unit_keeps_structure_without_body_duplication(self) -> None:
         document = _document(
-            pages=((_block(0, 0, "text", (ProviderPayload("text", None, "唯一标题"),), annotation="title", level=1),),),
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "唯一标题"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                ),
+            ),
             segments=(),
         )
 
@@ -219,6 +230,86 @@ class ProviderUnitBuilderTests(unittest.TestCase):
             "unit_title",
         )
 
+    def test_empty_text_carrier_is_evidence_only_but_visual_content_survives(
+        self,
+    ) -> None:
+        artifact = ProviderArtifact(
+            role="image_0001",
+            relative_path="e_images/figure.jpg",
+            sha256="sha256:" + "f" * 64,
+            size_bytes=321,
+            media_type="image/jpeg",
+        )
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, ""),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "正文"),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "image",
+                        (ProviderPayload("content", None, ""),),
+                        annotation="image",
+                        artifact_roles=(artifact.role,),
+                    ),
+                ),
+            ),
+            segments=(),
+            extra_artifacts=(artifact,),
+        )
+
+        draft = build_provider_units(_admitted(document)).units[0]
+
+        self.assertEqual(draft.payload_kind, "mixed")
+        parts = cast(list[dict[str, object]], draft.payload["parts"])
+        self.assertEqual(
+            [(part["provider_type"], part["kind"]) for part in parts],
+            [("text", "text"), ("image", "visual")],
+        )
+        self.assertEqual(draft.locator.evidence_only_block_source_indices, (0,))
+        self.assertEqual(
+            [binding.source.source_index for binding in draft.locator.search_targets],
+            [1],
+        )
+
+    def test_unique_typed_header_is_content_not_semantic_furniture(self) -> None:
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "header",
+                        (ProviderPayload("text", None, "证券代码：000001"),),
+                        annotation="page_header",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+
+        draft = build_provider_units(_admitted(document)).units[0]
+
+        self.assertEqual(draft.payload_kind, "mixed")
+        parts = cast(list[dict[str, object]], draft.payload["parts"])
+        self.assertEqual(parts[0]["provider_type"], "header")
+        self.assertEqual(parts[0]["text"], "证券代码：000001")
+        self.assertEqual(draft.locator.evidence_only_block_source_indices, ())
+        self.assertEqual(len(draft.locator.search_targets), 1)
+
     def test_unbound_block_is_published_and_segment_only_parts_are_not_guessed(
         self,
     ) -> None:
@@ -229,7 +320,11 @@ class ProviderUnitBuilderTests(unittest.TestCase):
                         0,
                         0,
                         "table",
-                        (ProviderPayload("table_body", None, "<table><td>A</td></table>"),),
+                        (
+                            ProviderPayload(
+                                "table_body", None, "<table><td>A</td></table>"
+                            ),
+                        ),
                         annotation="table",
                     ),
                 ),
@@ -247,19 +342,113 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         self.assertEqual(draft.quality_status, "needs_review")
         self.assertEqual(len(draft.locator.unbound_table_parts), 1)
         self.assertEqual(
-            [part.part.physical_segment_index for part in result.unassigned_table_parts],
+            [
+                part.part.physical_segment_index
+                for part in result.unassigned_table_parts
+            ],
             [0, 1],
         )
         self.assertEqual(draft.locator.parts[0].physical_table_segment_indices, ())
+
+    def test_improbable_ascii_glyph_map_marks_unit_for_review_without_rewriting(
+        self,
+    ) -> None:
+        damaged = r"""!"#\$%&'()\* ,-./0123456%&'()\* 789:9;<=>?,@ABCDEFGHI"""
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, damaged),),
+                        annotation="title",
+                        level=2,
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+
+        draft = build_provider_units(_admitted(document)).units[0]
+
+        self.assertEqual(draft.quality_status, "needs_review")
+        self.assertEqual(draft.title, damaged)
+        self.assertEqual(draft.heading_path, (damaged,))
+
+    def test_ordinary_english_and_code_titles_do_not_trigger_glyph_review(self) -> None:
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "EUSA Pharma / BGB-11417"),),
+                        annotation="title",
+                        level=2,
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+
+        draft = build_provider_units(_admitted(document)).units[0]
+
+        self.assertEqual(draft.quality_status, "ok")
+
+    def test_markup_only_non_cjk_title_is_reviewed_without_rewriting(self) -> None:
+        damaged = "<sup>®</sup> BTK"
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, damaged),),
+                        annotation="title",
+                        level=2,
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+
+        draft = build_provider_units(_admitted(document)).units[0]
+
+        self.assertEqual(draft.quality_status, "needs_review")
+        self.assertEqual(draft.title, damaged)
+        self.assertEqual(draft.heading_path, (damaged,))
+
+    def test_markup_title_with_visible_chinese_is_not_flagged(self) -> None:
+        intact = "百悦泽<sup>®</sup>"
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, intact),),
+                        annotation="title",
+                        level=2,
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+
+        draft = build_provider_units(_admitted(document)).units[0]
+
+        self.assertEqual(draft.quality_status, "ok")
+        self.assertEqual(draft.title, intact)
 
     def test_payload_tampering_breaks_exact_search_replay(self) -> None:
         admitted = _admitted(_representative_document())
         draft = build_provider_units(admitted).units[1]
         payload = dict(draft.payload)
-        parts = [
-            dict(part)
-            for part in cast(list[dict[str, object]], payload["parts"])
-        ]
+        parts = [dict(part) for part in cast(list[dict[str, object]], payload["parts"])]
         parts[0]["text"] = "伪造正文"
         payload["parts"] = parts
         tampered = replace(draft, payload=payload)
@@ -320,22 +509,49 @@ def _representative_document() -> ProviderDocument:
     return _document(
         pages=(
             (
-                _block(0, 0, "header", (ProviderPayload("text", None, "页眉"),), annotation="page_header"),
-                _block(1, 0, "text", (ProviderPayload("text", None, "第一章 标题"),), annotation="title", level=2),
-                _block(2, 0, "text", (ProviderPayload("text", None, "正文"),), annotation="paragraph"),
+                _block(
+                    0,
+                    0,
+                    "header",
+                    (ProviderPayload("text", None, "页眉"),),
+                    annotation="page_header",
+                ),
+                _block(
+                    1,
+                    0,
+                    "text",
+                    (ProviderPayload("text", None, "第一章 标题"),),
+                    annotation="title",
+                    level=2,
+                ),
+                _block(
+                    2,
+                    0,
+                    "text",
+                    (ProviderPayload("text", None, "正文"),),
+                    annotation="paragraph",
+                ),
                 _block(
                     3,
                     0,
                     "table",
                     (
-                        ProviderPayload("table_body", None, "<table><td>甲</td></table>"),
+                        ProviderPayload(
+                            "table_body", None, "<table><td>甲</td></table>"
+                        ),
                         ProviderPayload("table_caption", 0, "表一"),
                     ),
                     annotation="table",
                 ),
             ),
             (
-                _block(4, 1, "header", (ProviderPayload("text", None, "页眉"),), annotation="page_header"),
+                _block(
+                    4,
+                    1,
+                    "header",
+                    (ProviderPayload("text", None, "页眉"),),
+                    annotation="page_header",
+                ),
                 _block(5, 1, "table", (), annotation="table"),
                 _block(
                     6,
@@ -345,7 +561,14 @@ def _representative_document() -> ProviderDocument:
                     annotation="image",
                     artifact_roles=(image_role,),
                 ),
-                _block(7, 1, "text", (ProviderPayload("text", None, "□适用 \uf052不适用"),), annotation="title", level=2),
+                _block(
+                    7,
+                    1,
+                    "text",
+                    (ProviderPayload("text", None, "□适用 \uf052不适用"),),
+                    annotation="title",
+                    level=2,
+                ),
             ),
         ),
         segments=(
@@ -525,7 +748,10 @@ def _document(
         for page_index, blocks in enumerate(pages)
     )
     artifacts = tuple(
-        sorted((*_required_artifacts(), *extra_artifacts), key=lambda item: item.relative_path)
+        sorted(
+            (*_required_artifacts(), *extra_artifacts),
+            key=lambda item: item.relative_path,
+        )
     )
     return ProviderDocument(
         source_pdf_sha256=_SOURCE_SHA,

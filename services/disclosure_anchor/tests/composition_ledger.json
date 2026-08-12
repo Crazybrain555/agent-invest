@@ -134,7 +134,7 @@
   },
   "tests/unit/test_document_outline.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 28
   },
   "tests/unit/test_download_document.py": {
    "private_imports": [],
@@ -233,7 +233,7 @@
   },
   "tests/unit/test_provider_unit_builder.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 17
   },
   "tests/unit/test_provider_unit_evidence.py": {
    "private_imports": [],
@@ -259,7 +259,7 @@
   },
   "tests/unit/test_retrieval_primary.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 9
   },
   "tests/unit/test_review_mineru_medium_outline.py": {
    "private_imports": [],
@@ -267,7 +267,7 @@
   },
   "tests/unit/test_search_projection.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 11
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],

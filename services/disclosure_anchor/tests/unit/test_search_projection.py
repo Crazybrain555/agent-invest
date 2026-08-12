@@ -99,9 +99,9 @@ class TokenizerTests(unittest.TestCase):
 
 class ProviderSearchTargetTests(unittest.TestCase):
     def test_projection_candidates_exclude_historical_v4_runs(self) -> None:
-        statement = BuildSearchProjection(
-            engine=mock.Mock()
-        )._candidate_runs_stmt(full=True, after=None)
+        statement = BuildSearchProjection(engine=mock.Mock())._candidate_runs_stmt(
+            full=True, after=None
+        )
         sql = str(
             statement.compile(
                 dialect=postgresql.dialect(),
@@ -150,9 +150,9 @@ class ProviderSearchTargetTests(unittest.TestCase):
         )
 
     def test_equal_source_occurrences_remain_two_search_atoms(self) -> None:
-        draft = build_provider_units(
-            _admitted(_identical_text_parts_document())
-        ).units[0]
+        draft = build_provider_units(_admitted(_identical_text_parts_document())).units[
+            0
+        ]
 
         values = provider_unit_search_text_values(
             payload_kind=draft.payload_kind,
@@ -179,6 +179,52 @@ class ProviderSearchTargetTests(unittest.TestCase):
                 )
                 self.assertEqual(row["body_atoms"], ())
                 self.assertEqual(row["body_tokens"], "")
+
+    def test_word_tokens_use_visible_html_without_rewriting_atoms(self) -> None:
+        title = "<sup>®</sup> BTK"
+        body = "百泽安<sup>®</sup> PD-1"
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, title),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, body),),
+                        annotation="paragraph",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        draft = build_provider_units(_admitted(document)).units[0]
+
+        row = compute_search_projection_row(
+            asset_id="asset_markup",
+            title=draft.title,
+            heading_path=draft.heading_path,
+            payload_kind=draft.payload_kind,
+            payload=draft.payload,
+            semantic_keys=draft.semantic_keys,
+            artifact_locator=provider_unit_locator_to_payload(draft.locator),
+            built_at=_BUILT_AT,
+        )
+
+        self.assertEqual(row["title_text"], title)
+        self.assertEqual(row["body_atoms"], (tokenizer.normalize_search_text(body),))
+        self.assertNotIn("sup", str(row["title_tokens"]).split())
+        self.assertNotIn("sup", str(row["path_tokens"]).split())
+        self.assertNotIn("sup", str(row["body_tokens"]).split())
+        self.assertIn("btk", str(row["title_tokens"]).split())
+        self.assertIn("百泽安", str(row["body_tokens"]))
 
     def test_unknown_or_cross_part_locator_fails_closed(self) -> None:
         draft = build_provider_units(_admitted(_representative_document())).units[1]
@@ -248,7 +294,7 @@ class ProviderSearchTargetTests(unittest.TestCase):
         )
         self.assertEqual(
             row["retrieval_rules_version"],
-            "rp-2026.08-provider-unit-v1",
+            "rp-2026.08-provider-unit-v2",
         )
         self.assertEqual(row["key_tokens"], "document_content")
         self.assertFalse(row["header_row_candidate"])

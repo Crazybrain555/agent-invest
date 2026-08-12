@@ -19,6 +19,10 @@ HeadingDispositionReason = Literal[
     "table_contained",
     "checkbox_selector",
     "page_continuation",
+    "body_text_conflict",
+    "terminal_signature",
+    "non_semantic_glyph",
+    "repeated_page_header",
 ]
 HeadingPlacementSource = Literal[
     "bookmark",
@@ -26,6 +30,7 @@ HeadingPlacementSource = Literal[
     "numbering",
     "pdf_style",
     "provider",
+    "provider_style",
     "flattened",
 ]
 
@@ -103,6 +108,17 @@ class HeadingCandidate:
             raise ValueError("heading candidate provider level cannot be negative")
         if self.nominal_rank is not None and self.nominal_rank < 1:
             raise ValueError("heading candidate nominal rank must be positive")
+        if self.disposition_reason not in {
+            "accepted",
+            "table_contained",
+            "checkbox_selector",
+            "page_continuation",
+            "body_text_conflict",
+            "terminal_signature",
+            "non_semantic_glyph",
+            "repeated_page_header",
+        }:
+            raise ValueError("heading candidate disposition reason is unsupported")
         if self.disposition == "accepted":
             if self.disposition_reason != "accepted":
                 raise ValueError("accepted heading has a demotion reason")

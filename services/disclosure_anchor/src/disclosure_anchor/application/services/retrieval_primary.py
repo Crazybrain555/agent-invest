@@ -22,7 +22,7 @@ from disclosure_anchor.application.contracts.retrieval_primary import (
     UnitRetrievalSelection,
 )
 from disclosure_anchor.application.services.provider_table_projection import (
-    is_provider_page_furniture,
+    semantic_page_furniture_source_indices,
 )
 
 
@@ -55,9 +55,10 @@ def build_retrieval_primary_projection(
     targets: list[RetrievalTarget] = []
     blocks: list[BlockRetrievalSelection] = []
     target_ids_by_source: dict[int, tuple[str, ...]] = {}
+    semantic_furniture = semantic_page_furniture_source_indices(document)
 
     for block in document.blocks:
-        if is_provider_page_furniture(block):
+        if block.source_index in semantic_furniture:
             selection = BlockRetrievalSelection(
                 source_index=block.source_index,
                 raw_block_sha256=block.raw_item_sha256,
@@ -107,7 +108,9 @@ def build_retrieval_primary_projection(
             for source_index in raw_member_sources
             if source_index is not None
         )
-        resolved_units = {unit_by_source[source_index] for source_index in member_sources}
+        resolved_units = {
+            unit_by_source[source_index] for source_index in member_sources
+        }
         if len(resolved_units) != 1:
             raise ValueError("one logical table crosses coarse-unit boundaries")
         table_indices_by_unit[resolved_units.pop()].append(table_index)
@@ -215,9 +218,7 @@ def _block_targets(block: ProviderBlock) -> tuple[RetrievalTarget, ...]:
             continue
         targets.append(
             RetrievalTarget(
-                target_id=(
-                    f"target:{block.source_index:08d}:{payload_ordinal:04d}"
-                ),
+                target_id=(f"target:{block.source_index:08d}:{payload_ordinal:04d}"),
                 source_index=block.source_index,
                 payload_ordinal=payload_ordinal,
                 field=payload.field,

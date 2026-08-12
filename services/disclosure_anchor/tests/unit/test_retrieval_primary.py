@@ -15,7 +15,9 @@ from disclosure_anchor.application.contracts.provider_document import (
 from disclosure_anchor.application.contracts.html_visible_text import (
     html_visible_text_segments,
 )
-from disclosure_anchor.application.services.document_outline import build_document_outline
+from disclosure_anchor.application.services.document_outline import (
+    build_document_outline,
+)
 from disclosure_anchor.application.services.provider_table_projection import (
     build_provider_table_projection,
 )
@@ -33,7 +35,9 @@ _RAW_SHA = "sha256:" + "b" * 64
 
 
 class RetrievalPrimaryTest(unittest.TestCase):
-    def test_explicit_payloads_are_selected_once_and_stubs_remain_evidence(self) -> None:
+    def test_explicit_payloads_are_selected_once_and_stubs_remain_evidence(
+        self,
+    ) -> None:
         document = _document()
         outline = build_document_outline(document)
         tables = build_provider_table_projection(document)
@@ -41,9 +45,12 @@ class RetrievalPrimaryTest(unittest.TestCase):
         projection = build_retrieval_primary_projection(document, outline, tables)
 
         self.assertEqual(
-            [(block.source_index, block.disposition, block.reason) for block in projection.blocks],
             [
-                (0, "evidence_only", "page_furniture"),
+                (block.source_index, block.disposition, block.reason)
+                for block in projection.blocks
+            ],
+            [
+                (0, "primary", "searchable_payload"),
                 (1, "primary", "searchable_payload"),
                 (2, "primary", "searchable_payload"),
                 (3, "evidence_only", "empty_provider_carrier"),
@@ -51,8 +58,10 @@ class RetrievalPrimaryTest(unittest.TestCase):
                 (5, "primary", "searchable_payload"),
             ],
         )
-        self.assertEqual(len(projection.targets), 5)
-        table_target = next(target for target in projection.targets if target.field == "table_body")
+        self.assertEqual(len(projection.targets), 6)
+        table_target = next(
+            target for target in projection.targets if target.field == "table_body"
+        )
         self.assertEqual(
             replay_retrieval_target(document, table_target),
             ("甲", "乙"),
@@ -62,6 +71,38 @@ class RetrievalPrimaryTest(unittest.TestCase):
             unit for unit in projection.units if unit.logical_table_indices
         )
         self.assertEqual(owner_unit.logical_table_indices, (0,))
+
+    def test_only_repeated_headers_and_page_numbers_are_semantic_furniture(
+        self,
+    ) -> None:
+        document = _furniture_document()
+
+        projection = build_retrieval_primary_projection(
+            document,
+            build_document_outline(document),
+            build_provider_table_projection(document),
+        )
+
+        self.assertEqual(
+            [
+                (item.source_index, item.disposition, item.reason)
+                for item in projection.blocks
+            ],
+            [
+                (0, "evidence_only", "page_furniture"),
+                (1, "primary", "searchable_payload"),
+                (2, "evidence_only", "page_furniture"),
+                (3, "evidence_only", "page_furniture"),
+                (4, "primary", "searchable_payload"),
+                (5, "evidence_only", "page_furniture"),
+            ],
+        )
+        values = [
+            value
+            for target in projection.targets
+            for value in replay_retrieval_target(document, target)
+        ]
+        self.assertEqual(values, ["证券代码：000001", "特此公告。"])
 
     def test_same_text_on_distinct_blocks_is_never_globally_deduplicated(self) -> None:
         document = _document()
@@ -76,7 +117,9 @@ class RetrievalPrimaryTest(unittest.TestCase):
             if replay_retrieval_target(document, target) == ("单位：元",)
         ]
         self.assertEqual([target.source_index for target in duplicate_targets], [4, 5])
-        self.assertNotEqual(duplicate_targets[0].target_id, duplicate_targets[1].target_id)
+        self.assertNotEqual(
+            duplicate_targets[0].target_id, duplicate_targets[1].target_id
+        )
 
     def test_visual_without_text_remains_distinct_from_an_empty_carrier(self) -> None:
         artifact = ProviderArtifact(
@@ -177,7 +220,9 @@ class RetrievalPrimaryTest(unittest.TestCase):
             for value in replay_retrieval_target(document, target)
         ]
         self.assertNotIn("登记元数据标题", values)
-        self.assertTrue(all("document_title" not in target.field for target in projection.targets))
+        self.assertTrue(
+            all("document_title" not in target.field for target in projection.targets)
+        )
 
     def test_unknown_block_disposition_fails_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "disposition is unsupported"):
@@ -244,15 +289,34 @@ def _document() -> ProviderDocument:
             page_index=0,
             page_size=(600.0, 800.0),
             blocks=(
-                _block(0, 0, 0, "header", (ProviderPayload("text", None, "证券代码"),), annotation="page_header"),
-                _block(1, 0, 1, "text", (ProviderPayload("text", None, "第一章 标题"),), annotation="title", level=2),
+                _block(
+                    0,
+                    0,
+                    0,
+                    "header",
+                    (ProviderPayload("text", None, "证券代码"),),
+                    annotation="page_header",
+                ),
+                _block(
+                    1,
+                    0,
+                    1,
+                    "text",
+                    (ProviderPayload("text", None, "第一章 标题"),),
+                    annotation="title",
+                    level=2,
+                ),
                 _block(
                     2,
                     0,
                     2,
                     "table",
                     (
-                        ProviderPayload("table_body", None, "<table><tr><td>甲</td><td>乙</td></tr></table>"),
+                        ProviderPayload(
+                            "table_body",
+                            None,
+                            "<table><tr><td>甲</td><td>乙</td></tr></table>",
+                        ),
                         ProviderPayload("table_caption", 0, "表一"),
                     ),
                     annotation="table",
@@ -264,8 +328,22 @@ def _document() -> ProviderDocument:
             page_size=(600.0, 800.0),
             blocks=(
                 _block(3, 1, 0, "table", (), annotation="table"),
-                _block(4, 1, 1, "text", (ProviderPayload("text", None, "单位：元"),), annotation="paragraph"),
-                _block(5, 1, 2, "text", (ProviderPayload("text", None, "单位：元"),), annotation="paragraph"),
+                _block(
+                    4,
+                    1,
+                    1,
+                    "text",
+                    (ProviderPayload("text", None, "单位：元"),),
+                    annotation="paragraph",
+                ),
+                _block(
+                    5,
+                    1,
+                    2,
+                    "text",
+                    (ProviderPayload("text", None, "单位：元"),),
+                    annotation="paragraph",
+                ),
             ),
         ),
     )
@@ -281,6 +359,75 @@ def _document() -> ProviderDocument:
         ocr_enabled=False,
         pages=pages,
         physical_table_segments=segments,
+        artifacts=(),
+        bundle_sha256=provider_artifact_bundle_sha256(()),
+    )
+
+
+def _furniture_document() -> ProviderDocument:
+    pages = (
+        ProviderPage(
+            0,
+            (600.0, 800.0),
+            (
+                _block(
+                    0,
+                    0,
+                    0,
+                    "header",
+                    (ProviderPayload("text", None, "重复页眉"),),
+                    annotation="page_header",
+                ),
+                _block(
+                    1,
+                    0,
+                    1,
+                    "header",
+                    (ProviderPayload("text", None, "证券代码：000001"),),
+                    annotation="page_header",
+                ),
+                _block(
+                    2,
+                    0,
+                    2,
+                    "page_number",
+                    (ProviderPayload("text", None, "1"),),
+                    annotation="page_number",
+                ),
+            ),
+        ),
+        ProviderPage(
+            1,
+            (600.0, 800.0),
+            (
+                _block(
+                    3,
+                    1,
+                    0,
+                    "header",
+                    (ProviderPayload("text", None, "重复页眉"),),
+                    annotation="page_header",
+                ),
+                _block(
+                    4,
+                    1,
+                    1,
+                    "footer",
+                    (ProviderPayload("text", None, "特此公告。"),),
+                    annotation="page_footer",
+                ),
+                _block(5, 1, 2, "footer", (), annotation="page_footer"),
+            ),
+        ),
+    )
+    return ProviderDocument(
+        source_pdf_sha256=_SOURCE_SHA,
+        parser_version="3.4.4",
+        backend="hybrid",
+        effort="medium",
+        ocr_enabled=False,
+        pages=pages,
+        physical_table_segments=(),
         artifacts=(),
         bundle_sha256=provider_artifact_bundle_sha256(()),
     )

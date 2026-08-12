@@ -665,7 +665,11 @@ exact table snapshot= {"账龄":"1 年以内（含1 年）","期末账面余额"
 
 ## 8.1 通用优先级
 
-先从 parser typed heading、编号语法、TOC 对账和布局层级恢复保守标题树；再以具体 heading
+先从 parser typed heading、编号语法、TOC 对账和全篇重复的单栏缩进/布局层级恢复保守标题树；
+单次位置或双栏间距不构成层级证据。编号层级按整份文档是否存在更高的编/篇/部/章定标，
+长标题只有在页首且被同族 N-1/N+1 真标题夹住、期间无同级或更高边界时，才可从 paragraph
+补为候选。正式章节前的无编号标题只有同时满足非封面页、页首、居中，才可成为 front-matter
+根。再以具体 heading
 occurrence 划分连续 source carriers。表格、文字、图片、适用性声明和关联 caption 都是该结构下
 的证据 parts，不是新的边界。没有可靠标题结构时生成 `title=null, heading_path=[]` 的 coarse
 unit；登记文档标题只留 document scope，不复制进 Unit 或 A-weight body。
@@ -708,7 +712,9 @@ ProviderDocument 中每个非空 source carrier 默认都必须进入 unit paylo
 
 允许不生成独立业务 unit 的范围仅限：
 
-- parser 明确标注且经页边位置或跨页重复证明的页码、running header/footer；
+- parser 明确标注的页码，以及同一 frame role、同一规范化文字在至少两个不同页面逐字重复的
+  running header/footer；仅有 provider header/footer 类型或页边位置而未跨页重复的非空文字仍是
+  source content，例如唯一出现的证券代码、公告编号和末页公告语句；
 - provider 明确声明为非内容且可由 source contract 验证的空载体；MinerU merge-on 的空 table
   continuation stub 仅在它与 page-local deleted segment、前序逻辑 owner 唯一绑定时属于该类，
   其逐页 crop/HTML/page/bbox 仍保留为 evidence；

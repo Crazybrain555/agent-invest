@@ -50,6 +50,7 @@ from disclosure_anchor.adapters.db.postgres.models import (
     UnitSearchProjection,
 )
 from disclosure_anchor.adapters.retrieval import tokenizer
+from disclosure_anchor.application.contracts.html_visible_text import html_visible_text
 from disclosure_anchor.application.contracts.provider_unit import (
     ProviderUnitSearchContractError,
 )
@@ -189,9 +190,7 @@ class BuildSearchProjection:
                     projection_count, active_count = self._counts(session)
                     should_prune = projection_count > active_count
                 if should_prune and not stop_requested():
-                    deleted = self._delete_orphans(
-                        session, should_stop=should_stop
-                    )
+                    deleted = self._delete_orphans(session, should_stop=should_stop)
 
                 # The first empty keyset batch is the exact caught-up proof.
                 # Do not gate this anti-join on equal counts: one orphan plus
@@ -282,14 +281,10 @@ class BuildSearchProjection:
             DocumentUnit.processing_run_id == ProcessingRun.processing_run_id
         )
         if not full:
-            body_window_exists = select(
-                UnitBodySearchWindow.asset_id
-            ).where(
+            body_window_exists = select(UnitBodySearchWindow.asset_id).where(
                 UnitBodySearchWindow.asset_id == UnitSearchProjection.asset_id
             )
-            current_projection_exists = select(
-                UnitSearchProjection.asset_id
-            ).where(
+            current_projection_exists = select(UnitSearchProjection.asset_id).where(
                 UnitSearchProjection.asset_id == DocumentUnit.asset_id,
                 UnitSearchProjection.retrieval_rules_version
                 == tokenizer.RETRIEVAL_RULES_VERSION,
@@ -341,8 +336,7 @@ class BuildSearchProjection:
                 .select_from(DocumentUnit)
                 .join(
                     ProcessingRun,
-                    ProcessingRun.processing_run_id
-                    == DocumentUnit.processing_run_id,
+                    ProcessingRun.processing_run_id == DocumentUnit.processing_run_id,
                 )
                 .where(ProcessingRun.is_active.is_(True))
             ).scalar()
@@ -363,9 +357,7 @@ class BuildSearchProjection:
         try:
             active = session.execute(
                 select(ProcessingRun.is_active)
-                .where(
-                    ProcessingRun.processing_run_id == processing_run_id
-                )
+                .where(ProcessingRun.processing_run_id == processing_run_id)
                 .with_for_update()
             ).scalar()
             if active is not True:
@@ -386,9 +378,7 @@ class BuildSearchProjection:
                 for row in computed_rows
                 for atom_index, atom_text in enumerate(row.pop("body_atoms"))
             ]
-            prepared_rows, window_rows = _prepare_search_rows(
-                session, computed_rows
-            )
+            prepared_rows, window_rows = _prepare_search_rows(session, computed_rows)
             asset_ids = [str(row["asset_id"]) for row in prepared_rows]
 
             for asset_chunk in _chunked(asset_ids, _BATCH):
@@ -514,20 +504,20 @@ class BuildSearchProjection:
                 return deleted
 
 
-def _load_run_units(
-    session: Session, processing_run_id: str
-) -> list[dict[str, Any]]:
-    stmt = select(
-        DocumentUnit.asset_id,
-        DocumentUnit.title,
-        DocumentUnit.heading_path,
-        DocumentUnit.payload_kind,
-        DocumentUnit.payload,
-        DocumentUnit.semantic_keys,
-        DocumentUnit.artifact_locator,
-    ).where(
-        DocumentUnit.processing_run_id == processing_run_id
-    ).order_by(DocumentUnit.asset_id)
+def _load_run_units(session: Session, processing_run_id: str) -> list[dict[str, Any]]:
+    stmt = (
+        select(
+            DocumentUnit.asset_id,
+            DocumentUnit.title,
+            DocumentUnit.heading_path,
+            DocumentUnit.payload_kind,
+            DocumentUnit.payload,
+            DocumentUnit.semantic_keys,
+            DocumentUnit.artifact_locator,
+        )
+        .where(DocumentUnit.processing_run_id == processing_run_id)
+        .order_by(DocumentUnit.asset_id)
+    )
     return [
         {
             "asset_id": row.asset_id,
@@ -582,14 +572,11 @@ def _prepare_search_rows(
         ],
     )
     tokens_by_row: dict[int, tuple[str, ...]] = {}
-    for row_index, safe in zip(
-        unsafe_indices, metadata_safety, strict=True
-    ):
+    for row_index, safe in zip(unsafe_indices, metadata_safety, strict=True):
         asset_id = str(prepared[row_index]["asset_id"])
         if not safe:
             raise SearchProjectionSafetyError(
-                "search_projection_metadata_vector_unsafe: "
-                f"asset_id={asset_id}"
+                f"search_projection_metadata_vector_unsafe: asset_id={asset_id}"
             )
         body_tokens = str(prepared[row_index]["body_tokens"])
         tokens = tuple(body_tokens.split(" ")) if body_tokens else ()
@@ -599,8 +586,7 @@ def _prepare_search_rows(
             or " ".join(tokens) != body_tokens
         ):
             raise SearchProjectionSafetyError(
-                "search_projection_empty_or_noncanonical_body: "
-                f"asset_id={asset_id}"
+                f"search_projection_empty_or_noncanonical_body: asset_id={asset_id}"
             )
         tokens_by_row[row_index] = tokens
 
@@ -618,9 +604,7 @@ def _prepare_search_rows(
                 (
                     "",
                     "",
-                    " ".join(
-                        tokens_by_row[item.row_index][item.start : item.end]
-                    ),
+                    " ".join(tokens_by_row[item.row_index][item.start : item.end]),
                     "",
                 )
                 for item in pending
@@ -696,12 +680,7 @@ def _probe_search_vector_safety(
             column("body_tokens", Text),
             column("key_tokens", Text),
             name="search_probe",
-        ).data(
-            [
-                (start + offset, *candidate)
-                for offset, candidate in enumerate(chunk)
-            ]
-        )
+        ).data([(start + offset, *candidate) for offset, candidate in enumerate(chunk)])
         statement = (
             select(
                 candidate_values.c.ordinal,
@@ -718,9 +697,7 @@ def _probe_search_vector_safety(
         for ordinal, is_safe in session.execute(statement):
             results[int(ordinal)] = bool(is_safe)
     if any(result is None for result in results):
-        raise SearchProjectionSafetyError(
-            "search_projection_safety_probe_incomplete"
-        )
+        raise SearchProjectionSafetyError("search_projection_safety_probe_incomplete")
     return [bool(result) for result in results]
 
 
@@ -767,15 +744,19 @@ def compute_search_projection_row(
         )
         if (normalized := tokenizer.normalize_search_text(value)).strip()
     )
-    body_text = " ".join(body_atoms)
+    title_token_text = html_visible_text(title_text)
+    path_token_text = " > ".join(
+        html_visible_text(str(item)) for item in heading_path or []
+    )
+    body_token_text = " ".join(html_visible_text(atom) for atom in body_atoms)
     return {
         "asset_id": asset_id,
         "retrieval_rules_version": tokenizer.RETRIEVAL_RULES_VERSION,
         "title_text": title_text,
         "heading_path_text": heading_path_text,
-        "title_tokens": tokenizer.index_word_tokens(title_text),
-        "path_tokens": tokenizer.index_word_tokens(heading_path_text),
-        "body_tokens": tokenizer.index_word_tokens(body_text),
+        "title_tokens": tokenizer.index_word_tokens(title_token_text),
+        "path_tokens": tokenizer.index_word_tokens(path_token_text),
+        "body_tokens": tokenizer.index_word_tokens(body_token_text),
         # Private handoff to the run-atomic child insert; not a parent column.
         "body_atoms": body_atoms,
         # Semantic keys are controlled ASCII tokens; they bypass segmentation.

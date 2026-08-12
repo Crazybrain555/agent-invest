@@ -277,6 +277,548 @@ class DocumentOutlineTest(unittest.TestCase):
             outline.headings[2].parent_heading_id, outline.headings[1].heading_id
         )
 
+    def test_repeated_single_column_indentation_can_reset_a_stale_numbered_parent(
+        self,
+    ) -> None:
+        document = _paged_document(
+            (
+                _block(0, "前部大标题", level=2, bbox=ProviderBBox(150, 100, 300, 120)),
+                _block(1, "前部小标题", level=2, bbox=ProviderBBox(190, 150, 340, 166)),
+            ),
+            (
+                _block(2, "中部大标题", level=2, bbox=ProviderBBox(151, 100, 301, 120)),
+                _block(3, "中部小标题", level=2, bbox=ProviderBBox(191, 150, 341, 166)),
+                _block(4, "（三）旧编号父级", level=2),
+            ),
+            (
+                _block(5, "后部大标题", level=2, bbox=ProviderBBox(149, 100, 299, 120)),
+                _block(6, "后部小标题", level=2, bbox=ProviderBBox(189, 150, 339, 166)),
+            ),
+        )
+
+        outline = build_document_outline(document)
+
+        headings = {heading.text: heading for heading in outline.headings}
+        self.assertEqual(headings["后部大标题"].placement_source, "provider_style")
+        self.assertEqual(headings["后部大标题"].nominal_rank, 2)
+        self.assertIsNone(headings["后部大标题"].parent_heading_id)
+        self.assertEqual(
+            headings["后部小标题"].parent_heading_id,
+            headings["后部大标题"].heading_id,
+        )
+
+    def test_two_column_spacing_does_not_become_a_style_hierarchy(self) -> None:
+        document = _paged_document(
+            (
+                _block(0, "左栏一", level=2, bbox=ProviderBBox(100, 100, 220, 120)),
+                _block(1, "右栏一", level=2, bbox=ProviderBBox(500, 100, 620, 120)),
+            ),
+            (
+                _block(2, "左栏二", level=2, bbox=ProviderBBox(101, 100, 221, 120)),
+                _block(3, "右栏二", level=2, bbox=ProviderBBox(501, 100, 621, 120)),
+            ),
+            (
+                _block(4, "左栏三", level=2, bbox=ProviderBBox(99, 100, 219, 120)),
+                _block(5, "右栏三", level=2, bbox=ProviderBBox(499, 100, 619, 120)),
+            ),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(
+            [heading.placement_source for heading in outline.headings],
+            ["provider"] * 6,
+        )
+        self.assertTrue(
+            all(heading.parent_heading_id is None for heading in outline.headings)
+        )
+
+    def test_equal_line_height_indent_clusters_remain_provider_leaves(self) -> None:
+        document = _paged_document(
+            (
+                _block(0, "外层一", level=2, bbox=ProviderBBox(150, 100, 270, 120)),
+                _block(1, "内层一", level=2, bbox=ProviderBBox(190, 150, 310, 170)),
+            ),
+            (
+                _block(2, "外层二", level=2, bbox=ProviderBBox(151, 100, 271, 120)),
+                _block(3, "内层二", level=2, bbox=ProviderBBox(191, 150, 311, 170)),
+            ),
+            (
+                _block(4, "外层三", level=2, bbox=ProviderBBox(149, 100, 269, 120)),
+                _block(5, "内层三", level=2, bbox=ProviderBBox(189, 150, 309, 170)),
+            ),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(
+            [heading.placement_source for heading in outline.headings],
+            ["provider"] * 6,
+        )
+
+    def test_symbol_only_provider_titles_are_demoted_without_dropping_text(
+        self,
+    ) -> None:
+        document = _document(
+            _block(0, "®", level=2),
+            _block(1, "<sup>®</sup>▼", level=2),
+            _block(2, "® BAT1706", level=2),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(
+            [candidate.disposition_reason for candidate in outline.candidates],
+            ["non_semantic_glyph", "non_semantic_glyph", "accepted"],
+        )
+        self.assertEqual([heading.text for heading in outline.headings], ["® BAT1706"])
+        self.assertEqual(outline.units[0].block_source_indices, (0, 1))
+
+    def test_weak_short_title_conflicting_with_body_is_demoted_but_centered_title_survives(
+        self,
+    ) -> None:
+        document = _document(
+            _block(
+                0,
+                "无",
+                annotation="title",
+                level=2,
+                bbox=ProviderBBox(90, 100, 112, 114),
+            ),
+            _block(
+                1, "无", annotation="paragraph", bbox=ProviderBBox(90, 150, 112, 164)
+            ),
+            _block(
+                2,
+                "目录",
+                annotation="title",
+                level=2,
+                bbox=ProviderBBox(460, 200, 520, 224),
+            ),
+            _block(
+                3, "目录", annotation="paragraph", bbox=ProviderBBox(90, 250, 150, 274)
+            ),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(
+            [
+                (item.source_index, item.disposition_reason)
+                for item in outline.candidates
+            ],
+            [(0, "body_text_conflict"), (2, "accepted")],
+        )
+        self.assertEqual([heading.text for heading in outline.headings], ["目录"])
+        self.assertEqual(outline.units[0].block_source_indices, (0, 1))
+
+    def test_authoritative_hint_overrides_weak_body_text_conflict(self) -> None:
+        document = _document(
+            _block(
+                0,
+                "无",
+                annotation="title",
+                level=2,
+                bbox=ProviderBBox(90, 100, 112, 114),
+            ),
+            _block(
+                1, "无", annotation="paragraph", bbox=ProviderBBox(90, 150, 112, 164)
+            ),
+        )
+
+        outline = build_document_outline(
+            document,
+            level_hints=(_level_hint(document, 0, "bookmark", 1),),
+        )
+
+        self.assertEqual(outline.candidates[0].disposition, "accepted")
+        self.assertEqual(outline.headings[0].placement_source, "bookmark")
+
+    def test_terminal_right_aligned_signature_followed_by_date_is_demoted(self) -> None:
+        document = _document(
+            _block(
+                0,
+                "示例股份有限公司董事会",
+                annotation="title",
+                level=1,
+                bbox=ProviderBBox(541, 126, 811, 146),
+            ),
+            _block(
+                1,
+                "2025 年 4 月 22 日",
+                annotation="paragraph",
+                bbox=ProviderBBox(603, 154, 774, 173),
+            ),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(outline.candidates[0].disposition_reason, "terminal_signature")
+        self.assertEqual(outline.headings, ())
+        self.assertEqual(outline.units[0].block_source_indices, (0, 1))
+
+    def test_numbered_paragraph_can_only_complete_a_proved_sequence(self) -> None:
+        document = _document(
+            _block(
+                0,
+                "1、第一项",
+                annotation="title",
+                level=2,
+                bbox=ProviderBBox(90, 100, 240, 116),
+            ),
+            _block(
+                1,
+                "2、第二项",
+                annotation="title",
+                level=2,
+                bbox=ProviderBBox(90, 150, 240, 166),
+            ),
+            _block(
+                2,
+                "3、第三项",
+                annotation="paragraph",
+                bbox=ProviderBBox(88, 200, 240, 215),
+            ),
+            _block(
+                3,
+                "4、其他",
+                annotation="paragraph",
+                bbox=ProviderBBox(87, 250, 161, 265),
+            ),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(
+            [item.source_index for item in outline.candidates], [0, 1, 2, 3]
+        )
+        self.assertEqual(
+            [item.placement_source for item in outline.candidates],
+            ["numbering", "numbering", "numbering", "numbering"],
+        )
+        self.assertEqual([heading.text for heading in outline.headings][-1], "4、其他")
+
+    def test_numbered_body_list_or_style_mismatch_does_not_create_headings(
+        self,
+    ) -> None:
+        plain_list = _document(
+            _block(0, "1、事实一", annotation="paragraph"),
+            _block(1, "2、事实二", annotation="paragraph"),
+            _block(2, "3、事实三", annotation="paragraph"),
+        )
+        style_mismatch = _document(
+            _block(
+                0,
+                "1、第一项",
+                annotation="title",
+                level=2,
+                bbox=ProviderBBox(90, 100, 240, 116),
+            ),
+            _block(
+                1,
+                "2、第二项",
+                annotation="title",
+                level=2,
+                bbox=ProviderBBox(90, 150, 240, 166),
+            ),
+            _block(
+                2,
+                "3、正文列表",
+                annotation="paragraph",
+                bbox=ProviderBBox(180, 200, 400, 240),
+            ),
+        )
+
+        self.assertEqual(build_document_outline(plain_list).headings, ())
+        mismatch_outline = build_document_outline(style_mismatch)
+        self.assertEqual(
+            [heading.source_index for heading in mismatch_outline.headings], [0, 1]
+        )
+
+    def test_page_leading_numbered_paragraph_between_siblings_is_admitted(
+        self,
+    ) -> None:
+        document = _paged_document(
+            (
+                _block(0, "四、前一节", annotation="title", level=2),
+                _block(1, "第四节正文", annotation="paragraph"),
+            ),
+            (
+                _block(
+                    2,
+                    "五、这是一个换行后被 provider 降成 paragraph 的长标题",
+                    annotation="paragraph",
+                    bbox=ProviderBBox(90, 90, 900, 210),
+                ),
+                _block(3, "第五节正文", annotation="paragraph"),
+            ),
+            (
+                _block(4, "六、后一节", annotation="title", level=2),
+                _block(5, "第六节正文", annotation="paragraph"),
+            ),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(
+            [heading.text for heading in outline.headings],
+            [
+                "四、前一节",
+                "五、这是一个换行后被 provider 降成 paragraph 的长标题",
+                "六、后一节",
+            ],
+        )
+        self.assertEqual(outline.headings[1].placement_source, "numbering")
+
+    def test_bracketed_numbered_body_is_not_admitted_without_page_leading_geometry(
+        self,
+    ) -> None:
+        document = _paged_document(
+            (_block(0, "四、前一节", annotation="title", level=2),),
+            (
+                _block(1, "页首正文", annotation="paragraph"),
+                _block(2, "五、正文列表项", annotation="paragraph"),
+            ),
+            (_block(3, "六、后一节", annotation="title", level=2),),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual([heading.source_index for heading in outline.headings], [0, 3])
+
+    def test_centered_page_leading_front_matter_resets_before_first_chapter(
+        self,
+    ) -> None:
+        document = _paged_document(
+            (
+                _block(
+                    0,
+                    "文档封面标题",
+                    annotation="title",
+                    level=2,
+                    bbox=ProviderBBox(400, 300, 600, 324),
+                ),
+            ),
+            (
+                _block(
+                    1,
+                    "释义",
+                    annotation="title",
+                    level=2,
+                    bbox=ProviderBBox(430, 90, 570, 112),
+                ),
+                _block(2, "一、普通术语", annotation="title", level=2),
+            ),
+            (
+                _block(
+                    3,
+                    "重大事项提示",
+                    annotation="title",
+                    level=2,
+                    bbox=ProviderBBox(410, 90, 590, 112),
+                ),
+                _block(4, "提示正文", annotation="paragraph"),
+            ),
+            (
+                _block(5, "第一节 正文", annotation="title", level=2),
+                _block(6, "一、主题", annotation="title", level=2),
+            ),
+            (
+                _block(
+                    7,
+                    "财务报表名称",
+                    annotation="title",
+                    level=2,
+                    bbox=ProviderBBox(410, 90, 590, 112),
+                ),
+            ),
+        )
+
+        outline = build_document_outline(document)
+        headings = {heading.text: heading for heading in outline.headings}
+
+        self.assertEqual(
+            headings["一、普通术语"].parent_heading_id,
+            headings["释义"].heading_id,
+        )
+        self.assertIsNone(headings["重大事项提示"].parent_heading_id)
+        self.assertEqual(
+            headings["重大事项提示"].placement_source,
+            "provider_style",
+        )
+        self.assertIsNone(headings["第一节 正文"].parent_heading_id)
+        self.assertEqual(
+            headings["财务报表名称"].parent_heading_id,
+            headings["一、主题"].heading_id,
+        )
+        self.assertEqual(
+            headings["财务报表名称"].placement_source,
+            "provider",
+        )
+
+    def test_section_remains_below_chapter_when_higher_division_exists(
+        self,
+    ) -> None:
+        outline = build_document_outline(
+            _document(
+                _block(0, "第一章 总则", annotation="title", level=2),
+                _block(1, "第一节 范围", annotation="title", level=2),
+                _block(2, "第二节 原则", annotation="title", level=2),
+            )
+        )
+        headings = {heading.text: heading for heading in outline.headings}
+
+        self.assertEqual(
+            headings["第一节 范围"].parent_heading_id,
+            headings["第一章 总则"].heading_id,
+        )
+        self.assertEqual(
+            headings["第二节 原则"].parent_heading_id,
+            headings["第一章 总则"].heading_id,
+        )
+
+    def test_whitespace_can_stand_for_a_dropped_numbering_separator(self) -> None:
+        document = _document(
+            _block(0, "2001 年年度报告", level=1),
+            _block(1, "第二节 数据摘要", level=2),
+            _block(2, "三 审计差异", level=2),
+            _block(3, "1 境内审计数", level=2),
+            _block(4, "2 境外审计数", level=2),
+            _block(5, "第三节 业务数据", level=2),
+            _block(6, "(一)前三年数据", level=2),
+            _block(7, "二 年均指标", level=2),
+            _block(8, "三 分支机构", level=2),
+        )
+
+        outline = build_document_outline(document)
+        headings = {heading.text: heading for heading in outline.headings}
+
+        self.assertEqual(headings["2001 年年度报告"].placement_source, "provider")
+        self.assertEqual(
+            headings["1 境内审计数"].headpath,
+            ("第二节 数据摘要", "三 审计差异", "1 境内审计数"),
+        )
+        self.assertEqual(
+            headings["2 境外审计数"].headpath,
+            ("第二节 数据摘要", "三 审计差异", "2 境外审计数"),
+        )
+        self.assertEqual(
+            headings["二 年均指标"].headpath,
+            ("第三节 业务数据", "二 年均指标"),
+        )
+        self.assertEqual(
+            headings["三 分支机构"].headpath,
+            ("第三节 业务数据", "三 分支机构"),
+        )
+
+    def test_repeated_page_leading_provider_title_is_page_furniture(self) -> None:
+        repeated = "公司对会计报表相关的内部控制"
+        document = _paged_document(
+            (
+                _block(0, repeated, level=1, bbox=ProviderBBox(200, 50, 500, 90)),
+                _block(1, "第一页正文", annotation="paragraph"),
+            ),
+            (
+                _block(2, repeated, level=1, bbox=ProviderBBox(201, 51, 501, 91)),
+                _block(3, "第二页正文", annotation="paragraph"),
+            ),
+            (
+                _block(4, repeated, level=1, bbox=ProviderBBox(199, 49, 499, 89)),
+                _block(5, "第三页正文", annotation="paragraph"),
+            ),
+            (
+                _block(6, repeated, level=1, bbox=ProviderBBox(200, 400, 500, 440)),
+                _block(7, "真正章节正文", annotation="paragraph"),
+            ),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(
+            [candidate.disposition_reason for candidate in outline.candidates],
+            [
+                "accepted",
+                "repeated_page_header",
+                "repeated_page_header",
+                "accepted",
+            ],
+        )
+        self.assertEqual([heading.source_index for heading in outline.headings], [0, 6])
+        self.assertEqual(outline.units[0].block_source_indices, (0, 1, 2, 3, 4, 5))
+
+    def test_two_similar_page_leading_titles_are_not_enough_for_demotion(
+        self,
+    ) -> None:
+        document = _paged_document(
+            (_block(0, "独立标题", level=1, bbox=ProviderBBox(200, 50, 500, 90)),),
+            (_block(1, "独立标题", level=1, bbox=ProviderBBox(201, 51, 501, 91)),),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(
+            [candidate.disposition_reason for candidate in outline.candidates],
+            ["accepted", "accepted"],
+        )
+
+    def test_repeated_titles_below_normalized_top_quarter_are_not_headers(
+        self,
+    ) -> None:
+        document = _paged_document(
+            (
+                _block(
+                    0,
+                    "页面中部的重复标题",
+                    level=1,
+                    bbox=ProviderBBox(200, 260, 500, 300),
+                ),
+            ),
+            (
+                _block(
+                    1,
+                    "页面中部的重复标题",
+                    level=1,
+                    bbox=ProviderBBox(201, 261, 501, 301),
+                ),
+            ),
+            (
+                _block(
+                    2,
+                    "页面中部的重复标题",
+                    level=1,
+                    bbox=ProviderBBox(199, 259, 499, 299),
+                ),
+            ),
+            page_size=(600.0, 2_000.0),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(
+            [candidate.disposition_reason for candidate in outline.candidates],
+            ["accepted", "accepted", "accepted"],
+        )
+
+    def test_repeated_standalone_cover_titles_remain_headings(self) -> None:
+        pages: list[tuple[ProviderBlock, ...]] = [() for _ in range(11)]
+        for source_index, page_index in enumerate((0, 5, 10)):
+            pages[page_index] = (
+                _block(
+                    source_index,
+                    "同一机构的独立文件封面",
+                    level=1,
+                    bbox=ProviderBBox(200, 50, 500, 90),
+                ),
+            )
+        document = _paged_document(*pages)
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(
+            [candidate.disposition_reason for candidate in outline.candidates],
+            ["accepted", "accepted", "accepted"],
+        )
+
     def test_outline_record_rejects_missing_or_inconsistent_resolved_heading(
         self,
     ) -> None:
@@ -354,12 +896,28 @@ def _document(
     *blocks: ProviderBlock,
     segments: tuple[ProviderPhysicalTableSegment, ...] = (),
 ) -> ProviderDocument:
-    page = ProviderPage(
-        page_index=0,
-        page_size=(600.0, 800.0),
-        blocks=tuple(
-            replace(block, order_in_page=order) for order, block in enumerate(blocks)
-        ),
+    return _paged_document(tuple(blocks), segments=segments)
+
+
+def _paged_document(
+    *page_blocks: tuple[ProviderBlock, ...],
+    segments: tuple[ProviderPhysicalTableSegment, ...] = (),
+    page_size: tuple[float, float] = (600.0, 800.0),
+) -> ProviderDocument:
+    pages = tuple(
+        ProviderPage(
+            page_index=page_index,
+            page_size=page_size,
+            blocks=tuple(
+                replace(
+                    block,
+                    page_index=page_index,
+                    order_in_page=order,
+                )
+                for order, block in enumerate(blocks)
+            ),
+        )
+        for page_index, blocks in enumerate(page_blocks)
     )
     return ProviderDocument(
         source_pdf_sha256=_SHA,
@@ -367,7 +925,7 @@ def _document(
         backend="hybrid",
         effort="medium",
         ocr_enabled=False,
-        pages=(page,),
+        pages=pages,
         physical_table_segments=segments,
         artifacts=(),
         bundle_sha256=_BUNDLE_SHA,

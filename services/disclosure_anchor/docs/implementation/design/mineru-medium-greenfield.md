@@ -195,14 +195,53 @@ signal order:
 4. MinerU level as a weak provider hint;
 5. flatten to the nearest reliable parent or document root.
 
-Page furniture, table-contained rows, captions, footnotes, bold subtotals, and a sentence
-continuing across a page boundary are negative evidence. Numbering and style never create
-a title from text that is absent from the candidate set. PDF style extraction is bound to
-an existing provider candidate and cannot create a second text universe or repair source
-characters. Bookmark/printed-ToC matches likewise require bounded exact source binding. A
-single monotonic parent stack materializes `parent_id` and ordered `headpath`. Every
-accepted heading retains its available provider locator, source occurrence, and the signal
-that determined its placement; no fabricated numeric confidence is emitted.
+Repeated page furniture, table-contained rows, captions, footnotes, bold subtotals, and a
+sentence continuing across a page boundary are negative evidence. A non-empty typed
+header/footer is semantic furniture only when the same normalized text repeats in the same
+frame role on at least two distinct pages; a unique typed header/footer remains source
+content. PDF style extraction is bound to an existing provider candidate and cannot create
+a second text universe or repair source characters. Bookmark/printed-ToC matches likewise
+require bounded exact source binding. Until a font-style adapter exists, repeated provider
+title indentation may supply the weakest document-wide style signal only when at least two
+single-column clusters each recur three times and adjacent clusters remain within a bounded
+indent step, and the outer cluster has a materially larger document-wide median line height.
+A lone cluster, equal-height labels, or a column-sized gap stays on the provider-leaf fallback.
+
+Numbering normally ranks only an already admitted candidate. A provider paragraph may be
+admitted through either of two bounded source-sequence proofs: it completes two immediately
+preceding accepted siblings of the same numbered family with consecutive ordinals and
+matching normalized left alignment/line height; or it is the first substantive block on a
+page and is bracketed by accepted `N-1` and `N+1` siblings with no intervening peer-or-higher
+heading. The latter permits a genuinely long wrapped heading whose height differs from its
+short siblings. Any missing ordinal, competing heading, table containment, checkbox selector,
+or explicit negative keeps the occurrence as body. These rules recovered visually confirmed
+missed headings without promoting ordinary numbered body lists.
+
+The numbering scale is document-relative: `第X节` is a root division only when no accepted
+`编/篇/部/章` exists; otherwise it remains below that higher division. Before the first such
+formal division, an unnumbered weak provider title may be a front-matter root only when it is
+centered, page-leading, and on a page after the cover. This prevents a contents label from
+owning an entire section-based report while keeping declarations, definitions, major notices,
+and major risks as separate front-matter roots. A single monotonic parent stack then
+materializes `parent_id` and ordered `headpath`.
+
+A weak unnumbered provider title is conservatively demoted when a short exact occurrence is
+also emitted elsewhere as ordinary body text (unless centered or backed by a stronger
+outline hint), or when it is a right-aligned final-page signature immediately followed by a
+right-aligned date. A provider-only title whose visible text contains no letter, number, or
+Chinese character is likewise demoted rather than opening a unit; the original markup and
+symbols remain body evidence. Demotion never deletes the occurrence. Every accepted or demoted
+candidate retains its available provider locator, source occurrence, and the signal that
+determined its placement; no fabricated numeric confidence is emitted.
+
+An occurrence that is mostly a high-diversity ASCII punctuation sequence is not repaired from
+the PDF text layer or a dictionary. Its Unit is marked `needs_review`, while the exact provider
+scalar, bbox, raw hash, and source PDF remain authoritative. A later visual OCR/model pass may
+propose a source-bound alternate only through an explicit reviewed contract; it cannot silently
+overwrite the provider occurrence. The same conservative status applies when an accepted title
+contains inline superscript/subscript markup but its visible provider text has no Chinese
+character: real samples showed MinerU retaining only a trademark/drug-code suffix while dropping
+the adjacent Chinese name. The scalar remains unchanged; this is a review signal, not a repair.
 
 The provider-emitted U+F052 marker is treated only as one checkbox-selection negative
 signal because the source-first JiangHai review verified it repeatedly at checkbox

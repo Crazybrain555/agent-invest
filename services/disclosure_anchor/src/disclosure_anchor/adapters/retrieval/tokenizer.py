@@ -9,16 +9,26 @@ remain outside content tokenization.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 import threading
+from typing import Protocol, cast
 import unicodedata
 
-RETRIEVAL_RULES_VERSION = "rp-2026.08-provider-unit-v1"
+RETRIEVAL_RULES_VERSION = "rp-2026.08-provider-unit-v2"
 
 _lock = threading.Lock()
-_tokenizer = None
 
 
-def _load_tokenizer():  # type: ignore[no-untyped-def]
+class _TokenizerProtocol(Protocol):
+    def cut_for_search(self, sentence: str, HMM: bool = True) -> Iterable[str]: ...
+
+    def lcut(self, sentence: str, HMM: bool = True) -> list[str]: ...
+
+
+_tokenizer: _TokenizerProtocol | None = None
+
+
+def _load_tokenizer() -> _TokenizerProtocol:
     global _tokenizer
     if _tokenizer is not None:
         return _tokenizer
@@ -26,7 +36,7 @@ def _load_tokenizer():  # type: ignore[no-untyped-def]
         if _tokenizer is None:
             import jieba
 
-            _tokenizer = jieba.Tokenizer()
+            _tokenizer = cast(_TokenizerProtocol, jieba.Tokenizer())
     return _tokenizer
 
 
@@ -55,10 +65,7 @@ def query_word_tokens(text: str) -> tuple[str, ...]:
     normalized = normalize_search_text(text)
     if not normalized.strip():
         return ()
-    tokens = (
-        token.strip()
-        for token in _load_tokenizer().lcut(normalized, HMM=True)
-    )
+    tokens = (token.strip() for token in _load_tokenizer().lcut(normalized, HMM=True))
     return tuple(token for token in tokens if token)
 
 
@@ -70,8 +77,7 @@ def build_search_tsquery_groups(query: str) -> tuple[str, ...]:
     """Return exact word-token groups whose conjunction represents a query."""
 
     return tuple(
-        _quote_lexeme(token)
-        for token in dict.fromkeys(query_word_tokens(query))
+        _quote_lexeme(token) for token in dict.fromkeys(query_word_tokens(query))
     )
 
 

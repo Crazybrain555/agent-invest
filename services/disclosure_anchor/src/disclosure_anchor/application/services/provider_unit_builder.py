@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+import string
 
 from disclosure_anchor.application.contracts.document_outline import (
     CoarseUnit,
@@ -13,6 +14,7 @@ from disclosure_anchor.application.contracts.document_outline import (
     ResolvedHeading,
 )
 from disclosure_anchor.application.contracts.html_visible_text import (
+    html_visible_text,
     html_visible_text_segments,
 )
 from disclosure_anchor.application.contracts.provider_document import (
@@ -54,7 +56,7 @@ from disclosure_anchor.application.services.document_outline import (
 )
 from disclosure_anchor.application.services.provider_table_projection import (
     build_provider_table_projection,
-    is_provider_page_furniture,
+    semantic_page_furniture_source_indices,
 )
 from disclosure_anchor.application.services.retrieval_primary import (
     build_retrieval_primary_projection,
@@ -95,9 +97,7 @@ def build_provider_units(
     )
     drafts = tuple(context.build_unit(unit) for unit in outline.units)
     unassigned = tuple(
-        part
-        for part in tables.unbound_parts
-        if part.part.block_source_index is None
+        part for part in tables.unbound_parts if part.part.block_source_index is None
     )
     result = ProviderUnitBuildResult(
         provider_document_sha256=admitted.provider_document_sha256,
@@ -146,12 +146,11 @@ class _BuildContext:
             for part in tables.unbound_parts
             if part.part.block_source_index is not None
         }
+        self.semantic_furniture = semantic_page_furniture_source_indices(self.document)
 
     def build_unit(self, unit: CoarseUnit) -> ProviderUnitDraft:
         unit_sources = set(unit.block_source_indices)
-        heading = (
-            None if unit.heading_id is None else self.headings[unit.heading_id]
-        )
+        heading = None if unit.heading_id is None else self.headings[unit.heading_id]
         heading_chain = self._heading_chain(heading)
         parts: list[_Part] = []
         evidence_only: list[int] = []
@@ -161,7 +160,9 @@ class _BuildContext:
         if heading is not None:
             heading_targets = self._targets_for_source(heading.source_index)
             if len(heading_targets) != 1:
-                raise ValueError("accepted heading must expose exactly one source target")
+                raise ValueError(
+                    "accepted heading must expose exactly one source target"
+                )
             target = heading_targets[0]
             if _source_payload_text(self.document, target) != heading.text:
                 raise ValueError("accepted heading target differs from its source text")
@@ -191,7 +192,9 @@ class _BuildContext:
                 )
                 if any(member is None for member in member_sources):
                     raise ValueError("logical table contains an unbound provider block")
-                sources = tuple(member for member in member_sources if member is not None)
+                sources = tuple(
+                    member for member in member_sources if member is not None
+                )
                 if not set(sources).issubset(unit_sources):
                     raise ValueError("logical table crosses a coarse Unit")
                 segment_indices = tuple(
@@ -199,7 +202,9 @@ class _BuildContext:
                     for part in (logical_table.owner, *logical_table.continuations)
                 )
                 if any(index is None for index in segment_indices):
-                    raise ValueError("logical table contains an unbound physical segment")
+                    raise ValueError(
+                        "logical table contains an unbound physical segment"
+                    )
                 part = self._part(
                     block=block,
                     part_index=len(parts),
@@ -232,12 +237,17 @@ class _BuildContext:
                 consumed.add(source_index)
                 continue
             if block.provider_type == "table":
-                raise ValueError("table block is missing from the complete table projection")
-            if is_provider_page_furniture(block):
+                raise ValueError(
+                    "table block is missing from the complete table projection"
+                )
+            if source_index in self.semantic_furniture:
                 evidence_only.append(source_index)
                 consumed.add(source_index)
                 continue
-            if block.payloads or block.referenced_artifact_roles:
+            if (
+                self._targets_for_source(source_index)
+                or block.referenced_artifact_roles
+            ):
                 parts.append(
                     self._part(
                         block=block,
@@ -253,7 +263,9 @@ class _BuildContext:
             consumed.add(source_index)
 
         if consumed != unit_sources:
-            raise ValueError("provider Unit builder did not classify every source block")
+            raise ValueError(
+                "provider Unit builder did not classify every source block"
+            )
         payload_kind, payload = _unit_payload(parts, headed=heading is not None)
         for part in parts:
             for target in part.targets:
@@ -279,7 +291,16 @@ class _BuildContext:
             search_targets=tuple(search_bindings),
         )
         heading_path = () if heading is None else heading.headpath
-        quality_status = "needs_review" if bound_unbound else "ok"
+        quality_status = (
+            "needs_review"
+            if bound_unbound
+            or _has_suspected_truncated_markup_title(heading)
+            or any(
+                _has_suspected_encoded_text(self.blocks[source_index])
+                for source_index in unit_sources
+            )
+            else "ok"
+        )
         hashes = compute_unit_hashes(
             payload_kind=payload_kind,
             payload=payload,
@@ -357,9 +378,7 @@ class _BuildContext:
             is not None
         )
         content_artifact_roles = tuple(
-            dict.fromkeys(
-                (*block.referenced_artifact_roles, *segment_artifact_roles)
-            )
+            dict.fromkeys((*block.referenced_artifact_roles, *segment_artifact_roles))
         )
         return _Part(
             ref=ProviderUnitPartRef(
@@ -412,11 +431,47 @@ class _BuildContext:
             existing = by_hash.get(descriptor.sha256)
             if existing is not None:
                 if existing != descriptor:
-                    raise ValueError("provider evidence metadata conflicts for one digest")
+                    raise ValueError(
+                        "provider evidence metadata conflicts for one digest"
+                    )
                 continue
             by_hash[descriptor.sha256] = descriptor
             ordered.append(descriptor)
         return tuple(ordered)
+
+
+def _has_suspected_encoded_text(block: ProviderBlock) -> bool:
+    """Flag improbable ASCII-glyph maps without replacing their source text."""
+
+    for payload in block.payloads:
+        if payload.field not in {"text", "content"}:
+            continue
+        visible = "".join(html_visible_text(payload.text).split())
+        if len(visible) < 24 or any("\u4e00" <= char <= "\u9fff" for char in visible):
+            continue
+        punctuation = [char for char in visible if char in string.punctuation]
+        if len(punctuation) / len(visible) >= 0.45 and len(set(punctuation)) >= 12:
+            return True
+    return False
+
+
+def _has_suspected_truncated_markup_title(
+    heading: ResolvedHeading | None,
+) -> bool:
+    """Flag a provider title reduced to inline markup and non-CJK residue.
+
+    MinerU can preserve a superscript trademark while dropping the adjacent
+    Chinese drug name.  The source scalar remains untouched; this only makes
+    the unresolved provider damage visible to downstream review.
+    """
+
+    if heading is None:
+        return False
+    folded = heading.text.casefold()
+    if "<sup" not in folded and "<sub" not in folded:
+        return False
+    visible = html_visible_text(heading.text)
+    return not any("\u4e00" <= character <= "\u9fff" for character in visible)
 
 
 def replay_provider_unit_search_binding(
@@ -456,12 +511,16 @@ def provider_unit_search_text_values(
         for binding in locator.search_targets:
             _validate_binding_owner(locator=locator, binding=binding)
             if binding.destination.kind == "unit_title":
-                if title is None or _destination_text(
-                    payload=payload_value,
-                    payload_kind=payload_kind,
-                    title=title,
-                    destination=binding.destination,
-                ) != title:
+                if (
+                    title is None
+                    or _destination_text(
+                        payload=payload_value,
+                        payload_kind=payload_kind,
+                        title=title,
+                        destination=binding.destination,
+                    )
+                    != title
+                ):
                     raise ValueError("provider Unit title binding is invalid")
                 continue
             destination_text = _destination_text(
@@ -541,8 +600,7 @@ def _part_payload(
     if content_artifact_roles and (
         kind == "visual"
         or not any(
-            item.field in scalar_fields and item.text.strip()
-            for item in block.payloads
+            item.field in scalar_fields and item.text.strip() for item in block.payloads
         )
     ):
         payload["content_artifacts"] = [
@@ -575,10 +633,7 @@ def _unit_payload(
         part = parts[0]
         if part.ref.kind == "table":
             return "table", _top_level_payload(part.payload)
-        if (
-            part.ref.kind == "text"
-            and part.payload.get("provider_type") == "text"
-        ):
+        if part.ref.kind == "text" and part.payload.get("provider_type") == "text":
             return "text", _top_level_payload(part.payload)
     return (
         "mixed",
@@ -683,7 +738,9 @@ def _destination_text(
         try:
             candidate = parts[destination.part_index]
         except IndexError as exc:
-            raise ValueError("provider search part destination is out of range") from exc
+            raise ValueError(
+                "provider search part destination is out of range"
+            ) from exc
         if not isinstance(candidate, dict):
             raise ValueError("provider search part destination is invalid")
         container = candidate
@@ -700,7 +757,9 @@ def _destination_text(
     try:
         item = value[destination.item_index]
     except IndexError as exc:
-        raise ValueError("provider search sequence destination is out of range") from exc
+        raise ValueError(
+            "provider search sequence destination is out of range"
+        ) from exc
     if not isinstance(item, str):
         raise ValueError("provider search sequence item is invalid")
     return item
@@ -730,7 +789,9 @@ def _validate_build(
             retrieval_unit.unit_index != draft.unit_index
             or retrieval_unit.target_ids != draft_target_ids
         ):
-            raise ValueError("provider Unit search targets differ from their coarse Unit")
+            raise ValueError(
+                "provider Unit search targets differ from their coarse Unit"
+            )
         if draft.title != unit.title or draft.heading_path != unit.headpath:
             raise ValueError("provider Unit heading differs from its coarse Unit")
         if draft.locator.heading_chain:
@@ -749,17 +810,20 @@ def _validate_build(
         for part in result.unassigned_table_parts
         if part.part.physical_segment_index is not None
     )
-    if (
-        sorted(owned_blocks) != list(range(len(context.document.blocks)))
-        or len(owned_blocks) != len(set(owned_blocks))
-    ):
+    if sorted(owned_blocks) != list(range(len(context.document.blocks))) or len(
+        owned_blocks
+    ) != len(set(owned_blocks)):
         raise ValueError("provider Unit build must own every block exactly once")
     if sorted(owned_segments) != list(
         range(len(context.document.physical_table_segments))
     ) or len(owned_segments) != len(set(owned_segments)):
-        raise ValueError("provider Unit build must own every physical table segment once")
+        raise ValueError(
+            "provider Unit build must own every physical table segment once"
+        )
     if search_targets != [target.target_id for target in context.retrieval.targets]:
-        raise ValueError("provider Unit build must bind every retrieval target in order")
+        raise ValueError(
+            "provider Unit build must bind every retrieval target in order"
+        )
     if logical_tables != list(range(len(context.tables.logical_tables))):
         raise ValueError("provider Unit build must own every logical table in order")
 
