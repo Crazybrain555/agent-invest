@@ -160,10 +160,9 @@
   },
   "tests/unit/test_filing_api_units.py": {
    "private_imports": [
-    "_validate_semantic_key",
-    "_validate_semantic_key_list"
+    "_validate_semantic_key"
    ],
-   "tests": 12
+   "tests": 11
   },
   "tests/unit/test_gc_orphan_artifacts.py": {
    "private_imports": [],
@@ -187,7 +186,7 @@
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 6
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],

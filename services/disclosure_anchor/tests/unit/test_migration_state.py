@@ -16,13 +16,49 @@ class MigrationStateTests(unittest.TestCase):
         heads = migration_heads()
         self.assertEqual(len(heads), 1)
         self.assertEqual(single_migration_head(), heads[0])
-        self.assertEqual(heads[0], "0032_provider_document_output")
+        self.assertEqual(heads[0], "0033_unit_schema_convergence")
 
         migration = importlib.import_module(
             "disclosure_anchor.adapters.db.postgres.migrations.versions."
-            "0032_provider_document_output"
+            "0033_unit_schema_convergence"
         )
-        self.assertEqual(migration.down_revision, "0031_artifact_owner_run")
+        self.assertEqual(migration.down_revision, "0032_provider_document_output")
+
+    def test_0033_unit_view_keeps_only_unit_owned_scope_fields(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0033_unit_schema_convergence"
+        )
+
+        current = migration._document_units_view_sql(
+            include_legacy_duplicates=False
+        )
+        self.assertIn("u.semantic_key", current)
+        self.assertNotIn("u.semantic_keys", current)
+        self.assertNotIn("publisher_categories", current)
+        self.assertNotIn("class_market", current)
+        self.assertNotIn("content_categories", current)
+
+        legacy = migration._document_units_view_sql(include_legacy_duplicates=True)
+        self.assertIn("u.semantic_keys", legacy)
+        self.assertIn("publisher_categories", legacy)
+
+    def test_0033_refuses_to_drop_independent_plural_semantics(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0033_unit_schema_convergence"
+        )
+        connection = MagicMock()
+        connection.execute.return_value.scalar_one.return_value = 1
+        with (
+            patch.object(migration.op, "get_bind", return_value=connection),
+            patch.object(migration.op, "execute") as execute,
+            patch.object(migration.op, "drop_column") as drop_column,
+            self.assertRaisesRegex(RuntimeError, "information not present"),
+        ):
+            migration.upgrade()
+        execute.assert_not_called()
+        drop_column.assert_not_called()
 
     def test_0031_reset_gate_remains_immutable_history(self) -> None:
 

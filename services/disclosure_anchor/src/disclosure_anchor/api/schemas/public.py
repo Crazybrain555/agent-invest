@@ -84,7 +84,6 @@ class DocumentUnitV1(PublicModel):
     title: str | None
     order_index: int
     semantic_key: str | None
-    semantic_keys: list[str] | None
     payload: dict[str, Any]
     content_hash: str
     structure_hash: str | None
@@ -111,9 +110,6 @@ class DocumentUnitV1(PublicModel):
     trace_level: str
     raw_file_hash: str | None
     query_projection_hash: str | None
-    publisher_categories: list[dict[str, Any]] | None
-    market: str | None
-    content_categories: list[dict[str, Any]] | None
     asset_uri: str
     is_active_run: bool
     evidence_refs: list[EvidenceRefV1]

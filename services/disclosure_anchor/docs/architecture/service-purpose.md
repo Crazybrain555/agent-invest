@@ -11,7 +11,7 @@ scope: self_maintained_exchange_disclosures
 output_kind: l2_ready_document_units
 output_form: queryable_database_plus_filing_api
 payload_kinds: [text, table, qa, mixed]
-query_keys: [company_ref, security_ref, report_period, announcement_date, filing_type, document_id, asset_id, payload_kind, heading_path, semantic_key, semantic_keys, applicability, page_no, quality_status, content_hash, source_ref, producer_action_ref]
+query_keys: [company_ref, security_ref, report_period, announcement_date, filing_type, document_id, asset_id, payload_kind, heading_path, semantic_key, applicability, page_no, quality_status, content_hash, source_ref, producer_action_ref]
 core_objects: [company, security, source_access, document, processing_run, document_unit]
 optional_objects: [source_checkpoint, provider_category]
 primary_store: postgresql
@@ -412,8 +412,7 @@ payload_kind
 heading_path
 title
 order_index
-semantic_key（Provider writer 固定为 document_content；历史 run 可空或保留旧值）
-semantic_keys（Provider writer 固定为 [document_content]）
+semantic_key（可选；只有存在受控的真实 Unit 级路由键时才填写）
 payload
 content_hash
 quality_status
@@ -446,7 +445,6 @@ artifact_locator（可选）
     "一、报告期内公司从事的主要业务"
   ],
   "title": "报告期内公司从事的主要业务",
-  "semantic_key": "document_content",
   "payload": {
     "text": "报告期内，铝电解电容器……"
   }
@@ -478,7 +476,6 @@ artifact_locator（可选）
     "按账龄披露"
   ],
   "title": "按账龄披露",
-  "semantic_key": "document_content",
   "payload": {
     "table_body": "<table><tr><th>账龄</th><th>期末账面余额</th><th>期初账面余额</th></tr><tr><td>1 年以内（含1 年）</td><td>1,765,831,017.43</td><td>1,653,778,854.38</td></tr></table>",
     "table_caption": ["按账龄披露"],
@@ -521,9 +518,10 @@ ProviderDocument occurrence 并 fail closed 或 `needs_review`，不得造逻辑
 
 适用于同一个已证明结构区间内 text 与 table（或 image）交替的场景：短公告整体、
 股东会/董事会的一个 source-proved section、年报里的一个业务小节（研发投入、附注某科目）。
-payload 是有序 parts；每个 part 只保存一份 MinerU 原生 `provider_type` 与该 type 的浅字段。
-用于 owner/evidence 校验的粗粒度 `text|table|visual` kind 只存在 Unit locator，不在内容
-payload 重复；顶层 text/table 的类型由 `payload_kind` 唯一表达。
+payload 是有序 parts；每个 part 只保存 source-bound 浅内容字段，不重复类型标签。
+精确 MinerU type 留在 hash-bound ProviderDocument，owner/evidence 的粗粒度
+`text|table|visual` kind 与 source block 索引只存在 Unit locator；顶层 text/table 的类型由
+`payload_kind` 唯一表达。
 视觉 part 额外保存内容型 artifact 的 `{sha256,size_bytes,media_type}`，使图像变化进入
 `content_hash`；路径、crop、bbox、search binding 与 supporting evidence 只在 Unit 顶层
 `provider_unit_locator.v1`，不复制到每个 part，也不形成第二套证据图。
@@ -535,9 +533,9 @@ payload 重复；顶层 text/table 的类型由 `payload_kind` 唯一表达。
   "title": "二、议案审议情况",
   "payload": {
     "parts": [
-      {"provider_type": "text", "text": "审议结果：通过\n表决情况："},
-      {"provider_type": "table", "table_body": "<table><tr><td>A股</td><td>99.98%</td></tr></table>", "table_caption": [], "table_footnote": []},
-      {"provider_type": "text", "text": "会议决定，聘请天健会计师事务所……"}
+      {"text": "审议结果：通过\n表决情况："},
+      {"table_body": "<table><tr><td>A股</td><td>99.98%</td></tr></table>", "table_caption": [], "table_footnote": []},
+      {"text": "会议决定，聘请天健会计师事务所……"}
     ]
   }
 }
@@ -571,8 +569,7 @@ document preamble。监管 taxonomy 可在组装完成后帮助 L2 路由，但�
 ]
 ```
 
-财务附注里的表格则是更深的层级（单元仍使用通用
-`document_content` 语义键，业务解释留给 L2）：
+财务附注里的表格则是更深的层级（Provider writer 不填写 `semantic_key`，业务解释留给 L2）：
 
 ```text
 第八节 财务报告
@@ -656,7 +653,7 @@ provider_document_id= ...
 raw_file_hash       = sha256:...
 processing_run_id   = run_...
 asset_id            = du_...
-semantic_key        = document_content
+semantic_key        = NULL（当前 Provider writer 不伪造业务语义）
 exact payload       = {"table_body":"<table>...</table>"}
 ```
 
@@ -731,7 +728,7 @@ ProviderDocument 中每个非空 source carrier 默认都必须进入 unit paylo
 ## 9.3 规则边界
 
 结构去重只能由可版本化、可回放、与内容主题无关的机械证明决定。监管 taxonomy、
-`semantic_key(s)`、filing type 和 L2 查询同义词只用于路由/排序，绝不参与 heading_path、title、
+`semantic_key`、filing type 和 L2 查询同义词只用于路由/排序，绝不参与 heading_path、title、
 unit 边界、内容归属或删除。不得让 LLM 在 L1 自由判断“这段有没有投资价值”；若将来引入
 模型辅助结构判定，也必须输出可核验位置和独立证据，不能把模型猜测写成源事实。
 
@@ -857,7 +854,7 @@ company("002484").filings(
 filing.text_units()
 filing.tables()
 filing.qa_items()
-filing.units(semantic_key="document_content")
+filing.units(semantic_key="receivable_aging")  # 仅当真实受控键存在
 filing.units(heading_path="第三节/管理层讨论与分析")
 ```
 
@@ -870,8 +867,6 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - `payload_kind`；
 - `heading_path`；
 - `semantic_key`；
-- `semantic_keys`（0013 起的 jsonb 数组列；新 Provider writer 固定为
-  `["document_content"]`，历史 run 仍可带旧的窄键）；
 - `applicability`（0010 起，节适用性一等筛选列）；
 - `page_no`（0010 起，定位与审查的一等筛选参数）；
 - `quality_status`；
@@ -884,7 +879,7 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 查询面说明：上述键在 `disclosure_public.*_v1` 视图上全部可作谓词（DB 直读满足全集）；
 Filing API 首版只暴露其中一部分为查询参数（documents：company_ref / security_code /
 filing_type / report_period / announcement_date_from,to / status；units：payload_kind /
-semantic_key（单值参数，精确匹配 scalar 列）/ semantic_keys_any / semantic_keys_all / quality_status /
+semantic_key（可选单值参数，精确匹配 nullable scalar 列）/ quality_status /
 heading_prefix），其余键经 DB 视图直读或后续 API 升版满足。
 
 全文关键词检索可以后加，但不是证据对象，也不要求向量化。
@@ -974,17 +969,17 @@ parser artifact 与 primary parse artifact 字节的根 parse run。0032 为 cor
 run_kind 与 locator contract 校验后使用统一 PathBuilder 定位，禁止把 unit producer run 当成
 artifact owner，也禁止从文件存在性或路径词面猜版本。
 
-0010–0016 迁移起的 `document_units_v1` 增量列使当前列全集达到 **41 列**：04R-R7 的
-32 列 + 0010 `applicability`/`page_no` + 0011 `is_active_run` + 0013 `semantic_keys` +
-0014 `disclosure_topics` + 0015 `heading_path_text` + 0016 三维分类投影；0016/0017 后分类
-由视图现算。完整列集以 `docs/implementation/checks/contract-checklist.md` §2 为准：
+0033 收敛后 `document_units_v1` 为 **37 列**：保留 Unit 自有 scope/provenance 与
+`filing_type`/`disclosure_topics` 路由字段；删除重复的 `semantic_keys`，并把
+`publisher_categories`/`market`/`content_categories` 只留在 `documents_v1` 与
+`document_categories_v1`。完整列集以 `docs/implementation/checks/contract-checklist.md` §2 为准：
 
 - 0010：`applicability`（'applicable'|'not_applicable'|NULL，节适用性一等筛选列，部分索引）
   与 `page_no`（artifact_locator 首页码提升列）；
 - 0011：`is_active_run` 成为 `document_units_v1` / `source_refs_v1` 的真实视图列
   （DB 直读方可直接过滤 active run）；同迁移将 `payload_kind` CHECK 扩为含 `mixed`（§6.5）；
-- 0013：`semantic_keys`（jsonb 数组 = 单元自身 `semantic_key` ∪ mixed parts 的 key，
-  GIN 部分索引；纳入 `query_projection_hash` 与 outbox 投影字段）。
+- 0033：删除 0013 的 `semantic_keys` 存储/索引/API 集合过滤；nullable scalar
+  `semantic_key` 继续满足顶层协议的可选 Unit 查询键，但 Provider writer 当前写 NULL。
 
 `asset://` URI（顶层协议 §2.3）只在序列化边界派生，不落存储：
 

@@ -67,9 +67,10 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         parts = section.payload["parts"]
         self.assertIsInstance(parts, list)
         assert isinstance(parts, list)
+        self.assertTrue(all("provider_type" not in part for part in parts))
         self.assertEqual(
-            [part["provider_type"] for part in parts],
-            ["text", "table", "image", "text"],
+            [part.kind for part in section.locator.parts],
+            ["text", "table", "visual", "text"],
         )
         self.assertNotIn("semantic_type", section.payload)
         self.assertTrue(all("kind" not in part for part in parts))
@@ -274,9 +275,10 @@ class ProviderUnitBuilderTests(unittest.TestCase):
 
         self.assertEqual(draft.payload_kind, "mixed")
         parts = cast(list[dict[str, object]], draft.payload["parts"])
+        self.assertTrue(all("provider_type" not in part for part in parts))
         self.assertEqual(
-            [part["provider_type"] for part in parts],
-            ["text", "image"],
+            [part.kind for part in draft.locator.parts],
+            ["text", "visual"],
         )
         self.assertTrue(all("kind" not in part for part in parts))
         self.assertEqual(draft.locator.evidence_only_block_source_indices, (0,))
@@ -305,8 +307,10 @@ class ProviderUnitBuilderTests(unittest.TestCase):
 
         self.assertEqual(draft.payload_kind, "mixed")
         parts = cast(list[dict[str, object]], draft.payload["parts"])
-        self.assertEqual(parts[0]["provider_type"], "header")
+        self.assertNotIn("provider_type", parts[0])
         self.assertEqual(parts[0]["text"], "证券代码：000001")
+        self.assertEqual(document.blocks[0].provider_type, "header")
+        self.assertEqual(draft.locator.parts[0].kind, "text")
         self.assertEqual(draft.locator.evidence_only_block_source_indices, ())
         self.assertEqual(len(draft.locator.search_targets), 1)
 

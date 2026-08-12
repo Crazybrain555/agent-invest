@@ -150,12 +150,9 @@ S5 续表合并只看列数（cn_a_v6 后同构附注表跨科目误并，3. 销
 - "详见附注 X"交叉引用单元——真实内容，保留。
 - 金融工具风险节内部 1、/(一) 层级倒置的次级归属（不窜根即可）。
 - web 兜底通道 disclosure_topics=null、三维拆解列=null（接口无 F006V），filing_type 走标题规则（rule_set='title'）——设计内。
-- semantic_keys 覆盖纪律（round13 用户裁决"检索靠它，不能少"）：词表键做祖先继承
-  （无科目语义的叶子从最近科目祖先取键+章级键），并对全部 filing_type 开放；
-  验收口径=年报/审计报告附注 NULL 为 0、全库覆盖 ≥95%；剩余 NULL 仅限公告头存根
-  与词表外标题（当前 **12** 个：round13 的 11 项 + round15 救回的文内扉页存根；Codex 验收逐条核过全为接受类），每轮类扫描复核该清单未增长。
-- semantic_key 用英文规范键 + 词表文件即中文标签层（XBRL 模式，round13 决策，
-  见 data-dictionary §5）；不做中英双写键。
+- 0033 起不再追求 L1 semantic-key 覆盖率：Provider writer 写 NULL，禁止用
+  `document_content` 或祖先词表填充占位语义。若未来出现真实受控 scalar，仍使用英文规范键；
+  多值主题与中文标签属于 L2 派生层。
 
 ## 5. 开放背账（review 时核对是否恶化）
 

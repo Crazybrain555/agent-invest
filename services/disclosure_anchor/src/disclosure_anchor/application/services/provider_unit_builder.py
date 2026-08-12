@@ -33,7 +33,6 @@ from disclosure_anchor.application.contracts.provider_table_projection import (
     UnboundProviderTablePart,
 )
 from disclosure_anchor.application.contracts.provider_unit import (
-    PROVIDER_UNIT_SEMANTIC_KEY,
     ProviderSearchDestination,
     ProviderUnitBuildResult,
     ProviderUnitDraft,
@@ -68,6 +67,7 @@ from disclosure_anchor.domain.services.unit_hashing import compute_unit_hashes
 @dataclass(frozen=True, slots=True)
 class _Part:
     ref: ProviderUnitPartRef
+    provider_type: str
     payload: dict[str, object]
     targets: tuple[RetrievalTarget, ...]
 
@@ -306,8 +306,7 @@ class _BuildContext:
             payload=payload,
             title=None if heading is None else heading.text,
             heading_path=list(heading_path),
-            semantic_key=PROVIDER_UNIT_SEMANTIC_KEY,
-            semantic_keys=[PROVIDER_UNIT_SEMANTIC_KEY],
+            semantic_key=None,
             quality_status=quality_status,
             order_index=unit.unit_index + 1,
         )
@@ -317,8 +316,7 @@ class _BuildContext:
             payload=payload,
             title=None if heading is None else heading.text,
             heading_path=heading_path,
-            semantic_key=PROVIDER_UNIT_SEMANTIC_KEY,
-            semantic_keys=(PROVIDER_UNIT_SEMANTIC_KEY,),
+            semantic_key=None,
             quality_status=quality_status,
             page_no=self.blocks[unit.block_source_indices[0]].page_index + 1,
             locator=locator,
@@ -388,6 +386,7 @@ class _BuildContext:
                 physical_table_segment_indices=physical_segment_indices,
                 logical_table_index=logical_table_index,
             ),
+            provider_type=block.provider_type,
             payload=_part_payload(
                 block,
                 kind=kind,
@@ -579,7 +578,7 @@ def _part_payload(
     artifacts: dict[str, ProviderArtifact],
     content_artifact_roles: tuple[str, ...],
 ) -> dict[str, object]:
-    payload: dict[str, object] = {"provider_type": block.provider_type}
+    payload: dict[str, object] = {}
     scalar_fields, sequence_fields = provider_payload_field_contract(
         block.provider_type
     )
@@ -627,22 +626,13 @@ def _unit_payload(
     if len(parts) == 1:
         part = parts[0]
         if part.ref.kind == "table":
-            return "table", _top_level_payload(part.payload)
-        if part.ref.kind == "text" and part.payload.get("provider_type") == "text":
-            return "text", _top_level_payload(part.payload)
+            return "table", dict(part.payload)
+        if part.ref.kind == "text" and part.provider_type == "text":
+            return "text", dict(part.payload)
     return (
         "mixed",
         {"parts": [dict(part.payload) for part in parts]},
     )
-
-
-def _top_level_payload(payload: dict[str, object]) -> dict[str, object]:
-    return {
-        key: value
-        for key, value in payload.items()
-        if key != "provider_type"
-    }
-
 
 def _target_destination(
     *,

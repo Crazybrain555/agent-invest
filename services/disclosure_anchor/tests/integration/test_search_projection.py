@@ -212,7 +212,6 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                 assert body_unit is not None
                 body_unit.payload_kind = "table"
                 body_unit.payload = {
-                    "provider_type": "table",
                     "table_body": (
                         "<table><tr><td>应收账款账龄分析</td></tr>"
                         "<tr><td>股份变动及股东情况</td></tr>"
@@ -547,7 +546,6 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                 unsafe = session.get(DocumentUnit, ids_map["body_hit"])
                 assert unsafe is not None
                 unsafe.payload = {
-                    "provider_type": "text",
                     "text": unsafe_body,
                 }
                 for asset_id, body, order_index in (
@@ -563,9 +561,8 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                             heading_path=["窗口负例"],
                             title="窗口负例",
                             order_index=order_index,
-                            payload={"provider_type": "text", "text": body},
+                            payload={"text": body},
                             content_hash=f"h_{asset_id}",
-                            semantic_keys=[],
                             artifact_locator=_text_search_locator(order_index),
                         )
                     )
@@ -662,6 +659,26 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     )
                 )
             self.assertIn("ix_unit_body_search_window_tsv", plan)
+            # This test targets the older window-projection downgrade guard.
+            # Retag the synthetic run as a legacy primary artifact so the
+            # newer 0032 provider-output guard does not correctly stop first.
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE disclosure_core.processing_run "
+                        "SET normalized_ir_relpath = :normalized_ir_relpath, "
+                        "provider_document_relpath = NULL "
+                        "WHERE processing_run_id = :run"
+                    ),
+                    {
+                        "run": ids_map["run"],
+                        "normalized_ir_relpath": (
+                            "derived/normalized_ir/"
+                            f"{ids_map['document']}/{ids_map['run']}/"
+                            "normalized_ir.v4.json"
+                        ),
+                    },
+                )
             refused = self._alembic("downgrade", "0027_materialized_classification")
             self.assertNotEqual(refused.returncode, 0)
             self.assertIn(
@@ -1023,9 +1040,9 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     heading_path=[f"财务附注{suffix}", f"账龄{suffix}分析"],
                     title="应收账款",
                     order_index=1,
-                    payload={"provider_type": "text", "text": "期末余额说明"},
+                    payload={"text": "期末余额说明"},
                     content_hash=f"h1_{suffix}",
-                    semantic_keys=["receivable_aging"],
+                    semantic_key="receivable_aging",
                     artifact_locator=_text_search_locator(1),
                 )
             )
@@ -1038,9 +1055,9 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     heading_path=[f"减值损失{suffix}"],
                     title="坏账准备",
                     order_index=2,
-                    payload={"provider_type": "text", "text": "应收账款"},
+                    payload={"text": "应收账款"},
                     content_hash=f"h2_{suffix}",
-                    semantic_keys=["credit_impairment_loss"],
+                    semantic_key="credit_impairment_loss",
                     artifact_locator=_text_search_locator(2),
                 )
             )

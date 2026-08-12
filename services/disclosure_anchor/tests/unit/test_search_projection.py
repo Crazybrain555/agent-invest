@@ -134,7 +134,7 @@ class ProviderSearchTargetTests(unittest.TestCase):
             heading_path=draft.heading_path,
             payload_kind=draft.payload_kind,
             payload=draft.payload,
-            semantic_keys=draft.semantic_keys,
+            semantic_key=draft.semantic_key,
             artifact_locator=provider_unit_locator_to_payload(draft.locator),
             built_at=_BUILT_AT,
         )
@@ -173,7 +173,7 @@ class ProviderSearchTargetTests(unittest.TestCase):
                     heading_path=draft.heading_path,
                     payload_kind=draft.payload_kind,
                     payload=draft.payload,
-                    semantic_keys=draft.semantic_keys,
+                    semantic_key=draft.semantic_key,
                     artifact_locator=provider_unit_locator_to_payload(draft.locator),
                     built_at=_BUILT_AT,
                 )
@@ -213,7 +213,7 @@ class ProviderSearchTargetTests(unittest.TestCase):
             heading_path=draft.heading_path,
             payload_kind=draft.payload_kind,
             payload=draft.payload,
-            semantic_keys=draft.semantic_keys,
+            semantic_key=draft.semantic_key,
             artifact_locator=provider_unit_locator_to_payload(draft.locator),
             built_at=_BUILT_AT,
         )
@@ -271,7 +271,7 @@ class ProviderSearchTargetTests(unittest.TestCase):
             heading_path=draft.heading_path,
             payload_kind=draft.payload_kind,
             payload=draft.payload,
-            semantic_keys=draft.semantic_keys,
+            semantic_key=draft.semantic_key,
             artifact_locator=provider_unit_locator_to_payload(draft.locator),
             built_at=_BUILT_AT,
         )
@@ -296,7 +296,7 @@ class ProviderSearchTargetTests(unittest.TestCase):
             row["retrieval_rules_version"],
             "rp-2026.08-provider-unit-v2",
         )
-        self.assertEqual(row["key_tokens"], "document_content")
+        self.assertEqual(row["key_tokens"], "")
         self.assertFalse(row["header_row_candidate"])
         self.assertNotIn("search_tsv", row)
 

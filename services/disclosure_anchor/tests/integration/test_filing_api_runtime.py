@@ -240,7 +240,7 @@ def _unit_table_parts(unit: dict[str, Any]) -> list[dict[str, Any]]:
         return [
             p
             for p in payload.get("parts", [])
-            if p.get("provider_type") == "table"
+            if isinstance(p, dict) and "table_body" in p
         ]
     return []
 
@@ -444,25 +444,18 @@ class FilingApiRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(unit_payload["warning"], "LATEST_PROCESSING_FAILED")
 
-        semantic_responses = []
-        for query in (
-            {"semantic_key": "governance", "limit": 10},
-            {"semantic_keys_any": "missing,governance", "limit": 10},
-            {"semantic_keys_all": "risk_factor,governance", "limit": 10},
-        ):
-            response = _api_request(
-                self.app,
-                "GET",
-                f"/v1/documents/{seeded['document_id']}/units",
-                query=query,
-            )
-            self.assertEqual(response.status_code, 200, response.body)
-            payload = response.json()
-            self.assertEqual(
-                [item["asset_id"] for item in payload["items"]],
-                [seeded["prefix_asset_id"]],
-            )
-            semantic_responses.append(payload)
+        response = _api_request(
+            self.app,
+            "GET",
+            f"/v1/documents/{seeded['document_id']}/units",
+            query={"semantic_key": "governance", "limit": 10},
+        )
+        self.assertEqual(response.status_code, 200, response.body)
+        semantic_payload = response.json()
+        self.assertEqual(
+            [item["asset_id"] for item in semantic_payload["items"]],
+            [seeded["prefix_asset_id"]],
+        )
 
         active_unit = _api_request(
             self.app,
@@ -535,7 +528,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
             source_ref,
             context_payload,
             bad_cursor.json(),
-            *semantic_responses,
+            semantic_payload,
         ):
             _assert_no_leaks(self, self.settings, payload)
 
@@ -660,9 +653,10 @@ class FilingApiRuntimeTests(unittest.TestCase):
                     "(processing_run_id, document_id, "
                     "artifact_owner_processing_run_id, run_kind, status, is_active, "
                     "unit_build_status, unit_build_attempt_count, started_at, "
-                    "finished_at, builder_rules_version) "
+                    "finished_at, builder_rules_version, normalized_ir_relpath) "
                     "VALUES (:run_id, :document_id, :run_id, 'parse', :status, :is_active, "
-                    ":unit_build_status, 1, :started_at, :started_at, 'm06')"
+                    ":unit_build_status, 1, :started_at, :started_at, 'm06', "
+                    ":normalized_ir_relpath)"
                 ),
                 {
                     "run_id": run_id,
@@ -671,6 +665,10 @@ class FilingApiRuntimeTests(unittest.TestCase):
                     "is_active": is_active,
                     "unit_build_status": unit_build_status,
                     "started_at": started_at,
+                    "normalized_ir_relpath": (
+                        f"derived/normalized_ir/{document_id}/{run_id}/"
+                        "normalized_ir.v4.json"
+                    ),
                 },
             )
 
@@ -685,7 +683,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
         heading_path: list[str],
         payload: dict[str, Any],
         title: str,
-        semantic_keys: list[str] | None = None,
+        semantic_key: str = "risk_factor",
     ) -> None:
         self.asset_ids.append(asset_id)
         with self.engine.begin() as conn:
@@ -694,10 +692,10 @@ class FilingApiRuntimeTests(unittest.TestCase):
                     "INSERT INTO disclosure_core.document_unit "
                     "(asset_id, document_id, processing_run_id, provider_document_id, "
                     "payload_kind, heading_path, title, order_index, semantic_key, "
-                    "semantic_keys, payload, content_hash, query_projection_hash) "
+                    "payload, content_hash, query_projection_hash) "
                     "VALUES (:asset_id, :document_id, :run_id, :provider_document_id, "
                     "'text', CAST(:heading_path AS jsonb), :title, :order_index, "
-                    "'risk_factor', CAST(:semantic_keys AS jsonb), "
+                    ":semantic_key, "
                     "CAST(:payload AS jsonb), :content_hash, "
                     ":query_projection_hash)"
                 ),
@@ -708,9 +706,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
                     "provider_document_id": provider_document_id,
                     "heading_path": json.dumps(heading_path, ensure_ascii=False),
                     "title": title,
-                    "semantic_keys": json.dumps(
-                        semantic_keys or ["risk_factor"], ensure_ascii=True
-                    ),
+                    "semantic_key": semantic_key,
                     "order_index": order_index,
                     "payload": json.dumps(payload, ensure_ascii=False),
                     "content_hash": f"sha256:{asset_id}",
@@ -772,7 +768,7 @@ class FilingApiRuntimeTests(unittest.TestCase):
             heading_path=["第一节", "风险", "详情"],
             payload=prefix_payload,
             title="风险提示",
-            semantic_keys=["risk_factor", "governance"],
+            semantic_key="governance",
         )
         self._insert_unit(
             asset_id=counter_asset_id,
@@ -783,7 +779,6 @@ class FilingApiRuntimeTests(unittest.TestCase):
             heading_path=["风险", "第一节"],
             payload={"text": "containment counterexample"},
             title="误匹配样本",
-            semantic_keys=["risk_factor"],
         )
         self._insert_unit(
             asset_id=history_asset_id,
@@ -1066,8 +1061,8 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
             )
             self.assertTrue(
                 all(
-                    unit.get("semantic_key") == "document_content"
-                    and unit.get("semantic_keys") == ["document_content"]
+                    unit.get("semantic_key") is None
+                    and "semantic_keys" not in unit
                     for unit in units
                 )
             )
@@ -1076,8 +1071,7 @@ class FilingApiAdminFullChainTests(unittest.TestCase):
             ]
             self.assertTrue(
                 any(
-                    part.get("provider_type") == "table"
-                    and part.get("table_body")
+                    "provider_type" not in part and part.get("table_body")
                     for part in tables
                 )
             )

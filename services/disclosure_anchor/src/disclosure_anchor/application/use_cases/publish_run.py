@@ -36,7 +36,7 @@ from disclosure_anchor.domain.services.unit_hashing import (
 )
 from disclosure_anchor.domain.value_objects.semantic_key import (
     SemanticKeyInvariantError,
-    validate_semantic_key_state,
+    validate_optional_semantic_key,
 )
 
 
@@ -187,7 +187,6 @@ class ProviderDocumentPublicationGuard:
             "heading_path": list(draft.heading_path),
             "order_index": draft.unit_index + 1,
             "semantic_key": draft.semantic_key,
-            "semantic_keys": list(draft.semantic_keys),
             "quality_status": draft.quality_status,
             "applicability": None,
             "page_no": draft.page_no,
@@ -556,7 +555,6 @@ def _unit_query_projection(unit: e.DocumentUnit) -> dict[str, Any]:
         title=unit.title,
         heading_path=unit.heading_path,
         semantic_key=unit.semantic_key,
-        semantic_keys=unit.semantic_keys,
         quality_status=unit.quality_status,
         applicability=unit.applicability,
         payload=unit.payload,
@@ -606,7 +604,6 @@ def _canonical_unit_hashes(unit: e.DocumentUnit) -> UnitHashes:
         title=unit.title,
         heading_path=unit.heading_path,
         semantic_key=unit.semantic_key,
-        semantic_keys=unit.semantic_keys,
         quality_status=unit.quality_status,
         order_index=unit.order_index,
         applicability=unit.applicability,
@@ -622,7 +619,7 @@ def _validate_candidate_run(
     canonical: dict[int, UnitHashes] = {}
     for unit in units:
         try:
-            validate_semantic_key_state(unit.semantic_key, unit.semantic_keys)
+            validate_optional_semantic_key(unit.semantic_key)
         except SemanticKeyInvariantError as exc:
             raise PublishRunError(
                 _structured_error(

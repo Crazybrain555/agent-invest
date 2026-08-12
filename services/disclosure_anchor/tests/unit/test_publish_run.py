@@ -45,7 +45,6 @@ def _unit(
     title: str | None = "标题",
     heading_path: list[str] | None = None,
     semantic_key: str | None = "document_content",
-    semantic_keys: list[str] | None = None,
     quality_status: str = "ok",
     query_projection_hash: str | None = None,
     structure_hash: str | None = None,
@@ -55,18 +54,12 @@ def _unit(
 ) -> e.DocumentUnit:
     resolved_payload = payload or {"text": asset_id}
     resolved_heading_path = heading_path or ["第一节"]
-    resolved_semantic_keys = (
-        [semantic_key]
-        if semantic_keys is None and semantic_key is not None
-        else semantic_keys
-    )
     hashes = compute_unit_hashes(
         payload_kind=payload_kind,
         payload=resolved_payload,
         title=title,
         heading_path=resolved_heading_path,
         semantic_key=semantic_key,
-        semantic_keys=resolved_semantic_keys,
         quality_status=quality_status,
         order_index=order_index,
         applicability=applicability,
@@ -82,7 +75,6 @@ def _unit(
         title=title,
         heading_path=resolved_heading_path,
         semantic_key=semantic_key,
-        semantic_keys=resolved_semantic_keys,
         quality_status=quality_status,
         query_projection_hash=(query_projection_hash or hashes.query_projection_hash),
         structure_hash=structure_hash or hashes.structure_hash,
@@ -233,7 +225,6 @@ def _provider_guard_fixture() -> tuple[
                 heading_path=list(draft.heading_path),
                 order_index=draft.unit_index + 1,
                 semantic_key=draft.semantic_key,
-                semantic_keys=list(draft.semantic_keys),
                 quality_status=draft.quality_status,
                 query_projection_hash=draft.query_projection_hash,
                 structure_hash=draft.structure_hash,
@@ -429,7 +420,7 @@ class PublishRunTests(unittest.TestCase):
         self.assertEqual(diff.removed, [])
         self.assertEqual(
             diff.projection_changed[0][2],
-            ["title", "semantic_key", "semantic_keys"],
+            ["title", "semantic_key"],
         )
 
     def test_applicability_only_change_reports_changed_fields(self) -> None:
@@ -513,7 +504,6 @@ class PublishRunTests(unittest.TestCase):
             "title": "经营情况",
             "heading_path": ["一、经营情况"],
             "semantic_key": "document_content",
-            "semantic_keys": ["document_content"],
             "quality_status": "ok",
             "order_index": 1,
         }
@@ -527,7 +517,6 @@ class PublishRunTests(unittest.TestCase):
             title="经营情况",
             heading_path=["一、经营情况"],
             semantic_key="document_content",
-            semantic_keys=["document_content"],
             content_hash=old_hash.content_hash,
             query_projection_hash=old_hash.query_projection_hash,
         )
@@ -539,7 +528,6 @@ class PublishRunTests(unittest.TestCase):
             title="经营情况",
             heading_path=["一、经营情况"],
             semantic_key="document_content",
-            semantic_keys=["document_content"],
             content_hash=new_hash.content_hash,
             query_projection_hash=new_hash.query_projection_hash,
         )
@@ -680,14 +668,13 @@ class PublishRunTests(unittest.TestCase):
         uow = _uow_with_document()
         uow.processing_runs.add(_run("run_new"))
         unit = _unit("du_new", "run_new")
-        unit.semantic_keys = []
+        unit.semantic_key = "INVALID"
         hashes = compute_unit_hashes(
             payload_kind=unit.payload_kind,
             payload=unit.payload,
             title=unit.title,
             heading_path=unit.heading_path,
             semantic_key=unit.semantic_key,
-            semantic_keys=unit.semantic_keys,
             quality_status=unit.quality_status,
             order_index=unit.order_index,
             applicability=unit.applicability,

@@ -544,9 +544,6 @@ class DocumentUnit(Base):
     )
     applicability: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     page_no: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    semantic_keys: Mapped[Optional[list[str]]] = mapped_column(
-        JSONB(none_as_null=True), nullable=True
-    )
     query_projection_hash: Mapped[Optional[str]] = mapped_column(
         String(128), nullable=True
     )

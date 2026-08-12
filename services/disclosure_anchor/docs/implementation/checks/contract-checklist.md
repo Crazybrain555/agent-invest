@@ -74,26 +74,25 @@ tracked_company DTO 派生字段全集 = {effective_lookback_days / effective_sy
   占位名判别）/ last_synced_at（checkpoint 时间，NULL=从未同步）/ synced_through
   （cursor window_end 覆盖日期）
 scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（数组前缀语义，
-  见 06 §3.8）/ semantic_key（单值参数，精确匹配 scalar 列）/ semantic_keys_any / semantic_keys_all /
+  见 06 §3.8）/ semantic_key（可选单值参数，精确匹配 nullable scalar 列）/
   quality_status 等）
 0010 起 document_units_v1 追加 applicability / page_no 列（applicability：
   'applicable'|'not_applicable'|NULL，节适用性声明的一等筛选列，payload 保持纯原文，
   部分索引 ix_document_unit_applicability；page_no：artifact_locator 首页码提升列）。
 0007 起 document_units_v1 追加 6 列：asset_kind / observed_at / source_tier /
   trace_level / raw_file_hash / query_projection_hash
-  （列全集：基础 32 列 + 0010 applicability/page_no + 0011 is_active_run + 0013 semantic_keys + 0014 disclosure_topics + 0015 heading_path_text + 0016 publisher_categories/market/content_categories = **41 列**；0016/0017 起 filing_type/disclosure_topics 为视图现算；0021 起分类 = class 词表码命中 ∪ rule_set='title_topic' 标题追加命中（有码无码都咨询，argmax 同一优先级刻度），无码通道 filing_type 兜底 rule_set='title' 标题关键词规则，任何表列均不物化分类）
+  （0033 当前列全集 = **37 列**；移除重复 semantic_keys 和 Unit 级三维分类复制，三维分类只留 documents_v1/document_categories_v1；filing_type/disclosure_topics 仍为 Unit 路由字段）
 0007 起 change_events_v1 追加 change_kind（真实列）/ subject_kind / subject_ref /
   source / contract_version
 0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref /
   supersedes 链 / superseded_by_document_id / provider_metadata
 0011 起 document_unit.payload_kind 增加 'mixed'（round3 P0#1 业务语义块：
-  payload.parts 承载同一 source-proved 结构区间内的有序部件；每个 part 仅保留
-  provider-native `provider_type`，document/section 由 title/headpath/locator 推导；
+  payload.parts 承载同一 source-proved 结构区间内的有序浅内容；精确 provider type 留在
+  ProviderDocument，粗 kind/source owner 留在 locator，不在 payload 重复；document/section 由 title/headpath/locator 推导；
   监管 taxonomy 不参与切分）
-0013 起 document_unit 增加 semantic_keys（jsonb 数组；GIN 部分索引）；新 Provider writer
-  不做 L1 业务 taxonomy，`semantic_key='document_content'` 且
-  `semantic_keys=['document_content']`，并纳入 query_projection_hash 与 outbox
-  PROJECTION_FIELDS。历史 run 可保留旧窄键或 SQL NULL；不得用键改变 source payload/boundary
+0033 删除 0013 semantic_keys 存储/索引/API 集合过滤；nullable scalar semantic_key 保留为
+  顶层协议可选 Unit 查询键。Provider writer 不做 L1 业务 taxonomy，写 NULL；不得用键改变
+  source payload/boundary
 0015 起 document_units_v1 增加 heading_path_text（视图内派生的面包屑文本
   "第八节 财务报告 > … > 75、其他综合收益"——多级标题的可检索形态；不入库、
   不进哈希；06R 投影将对同一字段建 FTS 索引）
@@ -226,4 +225,19 @@ GET /v1/documents、/v1/filings/latest：filing_type / disclosure_topic 支持�
   LIKE 元字符转义，≤100 字符）
 读路由（documents/filings/units/tracked/changes）未知查询参数 → 422 VALIDATION_ERROR（此前静默忽略）；
   health/admin 保持宽松
+```
+
+2026-08-12（0033 开发期 Unit schema 收敛，用户明确授权原地清理后重放）：
+
+```text
+document_units_v1 / DocumentUnitV1 删除 semantic_keys、publisher_categories、market、content_categories；
+  三维分类事实继续由 documents_v1 / document_categories_v1 暴露
+units API 删除 semantic_keys_any / semantic_keys_all；保留 v0.8 要求的 nullable scalar semantic_key 精确过滤
+Provider writer 不再写 document_content 占位语义，semantic_key=NULL；mixed parts 不再重复 provider_type
+精确 provider type 仍在 hash-bound ProviderDocument，coarse part kind/source owner 仍在 provider_unit_locator.v1
+迁移前只读审计：15,690/15,690 历史 Unit 的 semantic_keys 都与单值 semantic_key 完全相同，
+  0 行含 plural-only 信息；document_units_v1 无下游数据库依赖视图
+本服务尚无生产/外部消费者，用户授权保留 document_unit.v1 做开发期原地删字段；若存在真实消费者则必须升 v2
+不就地 NULL 旧 semantic_key（会破坏 query_projection_hash）；清理开发库后由新 writer 全量重放，
+  同时替换因 mixed payload 去重而变化的 content_hash
 ```

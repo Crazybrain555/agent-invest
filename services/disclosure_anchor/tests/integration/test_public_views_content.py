@@ -412,7 +412,6 @@ class PublicViewContentTests(unittest.TestCase):
             "title",
             "order_index",
             "semantic_key",
-            "semantic_keys",
             "payload",
             "content_hash",
             "structure_hash",
@@ -439,9 +438,6 @@ class PublicViewContentTests(unittest.TestCase):
             "trace_level",
             "raw_file_hash",
             "query_projection_hash",
-            "publisher_categories",
-            "market",
-            "content_categories",
         }
         with self.engine.connect() as conn:
             columns = {
@@ -456,7 +452,7 @@ class PublicViewContentTests(unittest.TestCase):
             }
 
         self.assertEqual(columns, expected)
-        self.assertEqual(len(columns), 41)
+        self.assertEqual(len(columns), 37)
 
     def test_view_derives_classification_and_facets_from_raw_category(self) -> None:
         # 0016: one class map, two outputs — filing_type = argmax priority,

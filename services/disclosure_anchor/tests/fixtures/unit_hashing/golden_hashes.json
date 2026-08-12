@@ -11,15 +11,12 @@
         "重要提示"
       ],
       "semantic_key": "document_content",
-      "semantic_keys": [
-        "document_content"
-      ],
       "quality_status": "ok",
       "order_index": 1
     },
     "expected": {
       "content_hash": "sha256:0035f7615fda3c2fff4fe93799edd2999987ffc7afc8067d78f19ef8c4797ea7",
-      "query_projection_hash": "sha256:13b2d66a1af330a77995b90fdbad58fbc3c472b5520a4ff086e52a4fb83c2bcf",
+      "query_projection_hash": "sha256:37b37ead76b5b8d62c43f68428f363fb1230bd599e5512c1b1ba02f644d658db",
       "structure_hash": "sha256:c4948f9f2d03c7edbb3a51e3699092ec3f5102f09b4f788268989e1a3994ac74"
     }
   },
@@ -56,15 +53,12 @@
         "应收账款"
       ],
       "semantic_key": "receivable_aging",
-      "semantic_keys": [
-        "receivable_aging"
-      ],
       "quality_status": "ok",
       "order_index": 2
     },
     "expected": {
       "content_hash": "sha256:15af01ea5e919319fdff7c394486f50ec0e0955a5cbbc200ed13936265f8c17b",
-      "query_projection_hash": "sha256:e648fa63df380435d88a150e0023176466cacce0cdadcd977ee8d657b4da470e",
+      "query_projection_hash": "sha256:1cf4066dbb749f3d8cc33e22ff5e619c040f3aba82772bbabf40224821151f16",
       "structure_hash": "sha256:a7d7c814b0ad54d6d775238b6e978f246e6c5b3eb3841e007e75aa25ca8f0598"
     }
   },
@@ -82,15 +76,12 @@
         "投资者关系活动记录表"
       ],
       "semantic_key": "document_content",
-      "semantic_keys": [
-        "document_content"
-      ],
       "quality_status": "needs_review",
       "order_index": 3
     },
     "expected": {
       "content_hash": "sha256:a137877582f5c9df33aca0e546d7969943878adcf2482bd949370406dcf870cd",
-      "query_projection_hash": "sha256:3b56f06814a50b90eee84d39dc38f803bb051f36166a75505d267855d1e12f42",
+      "query_projection_hash": "sha256:8f787d4f6cf1c05fdcf107ab3ff07e52754ae40bdcc37f4f3e0f9df2d4fbf334",
       "structure_hash": "sha256:5e2f1e49a3347c836fd41ba97f69540746fc40d55abf750b08d28d5e50eca1eb"
     }
   },
@@ -101,7 +92,6 @@
       "payload": {
         "parts": [
           {
-            "provider_type": "text",
             "order": 12,
             "text": "正文",
             "local_heading": [
@@ -110,7 +100,6 @@
             "applicability": "applicable"
           },
           {
-            "provider_type": "table",
             "order": 13,
             "caption": [],
             "unit": "元",
@@ -134,17 +123,13 @@
         "一、经营情况"
       ],
       "semantic_key": "revenue",
-      "semantic_keys": [
-        "document_content",
-        "revenue"
-      ],
       "quality_status": "ok",
       "applicability": null,
       "order_index": 4
     },
     "expected": {
-      "content_hash": "sha256:8b6e51ebe41e8f3d9f70850d52a173b55c30c69cbed8bfc1790edaf67ca11484",
-      "query_projection_hash": "sha256:d32d6223ff376c586b95bc4c47d4290be05b5e79d065013a25f618e2e69d154a",
+      "content_hash": "sha256:50e12a3abaac7551e934fdf5a99ca598564a86d9dc6cfe34be6bee294ce1b310",
+      "query_projection_hash": "sha256:19b2371e125cdc67a05489bd5ee298dd79da7a87f47eddc5d31e99ac1fccbefe",
       "structure_hash": "sha256:42b9f44c722e5de44f9c8079a38d7d15126e217a7919edaf12385d4602c12993"
     }
   }

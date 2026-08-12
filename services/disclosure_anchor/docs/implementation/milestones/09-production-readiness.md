@@ -76,8 +76,9 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
     均首错断批，sync 30→60→120m cooldown；尚欠持久的按interface计量/预算和报警，故本项不关闭。
 - [ ] (S/DOCS/CONTRACT DRIFT) **Canonical service-purpose §5.2 still says document_unit has only three kinds (text/table/qa), contra**
   - 修法：Update §5.2 to list four payload kinds (or say "three content kinds plus mixed composition, see §6.5") and change the v0.7 wording to v0.8 so the canonical contract is internally consistent.
-- [ ] (S/DOCS/CONTRACT DRIFT) **Canonical query-key list omits semantic_keys / applicability / page_no, which 0010/0013 made first-c**
-  - 修法：Add semantic_keys, applicability, page_no to the frontmatter query_keys and §12 entrance list (with a note that mixed-unit recall requires semantic_keys), and state explicitly which keys are Filing-API filters vs DB-view-only predicates.
+- [x] (SUPERSEDED 2026-08-12 by 0033) `semantic_keys` was proven duplicate-only and removed from
+  Unit storage/API/filter surfaces; nullable scalar `semantic_key`, `applicability`, and `page_no`
+  remain governed by the current contract checklist. Do not reintroduce the plural field.
 - [x] (S/DOCS/CONTRACT DRIFT) **service-purpose 的 document_units_v1 列数已对齐当前契约。**
   - 2026-07-16：service-purpose/data-dictionary/milestone 06/postgres AGENTS 统一为当前 41 列；
     32/36 只保留为历史迁移口径，全集以 contract-checklist §2 为准。

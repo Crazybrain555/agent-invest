@@ -10,6 +10,9 @@ decided_by: 用户 2026-07-17 三项确认（应用侧 jieba 预分词；pg_trgm
 
 # 06R 检索投影层（实施级规格）
 
+> 2026-08-12：本文件保留里程碑完成时的历史输入形状。0033 删除了重复的
+> `semantic_keys` 数组；当前 `key_tokens` 只取 nullable scalar `semantic_key`，无值为空。
+
 **U7 边界（不变）**：投影是派生层——全部字段可由已持久化数据确定性再生；不进 content_hash /
 query_projection_hash；重建不产生 outbox 事件；不替代 payload、不作证据；L1 API 不新增
 search 端点（红线不变），L2 经公开视图直接消费。

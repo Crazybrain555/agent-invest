@@ -22,8 +22,7 @@ from disclosure_anchor.application.contracts.retrieval_primary import (
 
 
 PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v1"
-PROVIDER_UNIT_SEMANTIC_KEY = "document_content"
-PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v1"
+PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v2"
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -193,8 +192,7 @@ class ProviderUnitDraft:
     payload: dict[str, object]
     title: str | None
     heading_path: tuple[str, ...]
-    semantic_key: str
-    semantic_keys: tuple[str, ...]
+    semantic_key: str | None
     quality_status: str
     page_no: int
     locator: ProviderUnitLocator
@@ -214,11 +212,8 @@ class ProviderUnitDraft:
             raise ValueError("provider unit title must end its heading path")
         if len(self.heading_path) != len(self.locator.heading_chain):
             raise ValueError("provider unit heading chain differs from its path")
-        if (
-            self.semantic_key != PROVIDER_UNIT_SEMANTIC_KEY
-            or self.semantic_keys != (PROVIDER_UNIT_SEMANTIC_KEY,)
-        ):
-            raise ValueError("provider unit must use the generic L1 retrieval key")
+        if self.semantic_key is not None:
+            raise ValueError("provider unit cannot invent a semantic key")
         if not self.quality_status or self.page_no < 1:
             raise ValueError("provider unit quality and page must be complete")
         for value in (
@@ -579,7 +574,6 @@ def _optional_text(value: object, *, label: str) -> str | None:
 __all__ = [
     "PROVIDER_UNIT_LOCATOR_VERSION",
     "PROVIDER_UNIT_BUILDER_VERSION",
-    "PROVIDER_UNIT_SEMANTIC_KEY",
     "ProviderSearchDestination",
     "ProviderSearchDestinationKind",
     "ProviderUnitBuildResult",

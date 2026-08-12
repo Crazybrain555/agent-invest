@@ -91,7 +91,6 @@ def query_projection_hash(
     semantic_key: str | None,
     quality_status: str,
     applicability: str | None = None,
-    semantic_keys: list[str] | None = None,
     payload: dict[str, Any] | None = None,
 ) -> str:
     return sha256_prefixed(
@@ -103,7 +102,6 @@ def query_projection_hash(
                 semantic_key=semantic_key,
                 quality_status=quality_status,
                 applicability=applicability,
-                semantic_keys=semantic_keys,
                 payload=payload,
             )
         )
@@ -118,7 +116,6 @@ def query_projection(
     semantic_key: str | None,
     quality_status: str,
     applicability: str | None = None,
-    semantic_keys: list[str] | None = None,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the one canonical projection used by hashing and publication.
@@ -133,7 +130,6 @@ def query_projection(
         "title": title,
         "heading_path": heading_path,
         "semantic_key": semantic_key,
-        "semantic_keys": semantic_keys,
         "quality_status": quality_status,
         "applicability": applicability,
     }
@@ -217,7 +213,6 @@ def compute_unit_hashes(
     quality_status: str,
     order_index: int,
     applicability: str | None = None,
-    semantic_keys: list[str] | None = None,
 ) -> UnitHashes:
     return UnitHashes(
         content_hash=content_hash(payload_kind=payload_kind, payload=payload),
@@ -228,7 +223,6 @@ def compute_unit_hashes(
             semantic_key=semantic_key,
             quality_status=quality_status,
             applicability=applicability,
-            semantic_keys=semantic_keys,
             payload=payload,
         ),
         structure_hash=structure_hash(

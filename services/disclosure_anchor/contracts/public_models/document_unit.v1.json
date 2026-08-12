@@ -90,21 +90,6 @@
       ],
       "title": "Company Ref"
     },
-    "content_categories": {
-      "anyOf": [
-        {
-          "items": {
-            "additionalProperties": true,
-            "type": "object"
-          },
-          "type": "array"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Content Categories"
-    },
     "content_hash": {
       "title": "Content Hash",
       "type": "string"
@@ -187,17 +172,6 @@
       "title": "Is Active Run",
       "type": "boolean"
     },
-    "market": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Market"
-    },
     "observed_at": {
       "format": "date-time",
       "title": "Observed At",
@@ -249,21 +223,6 @@
         }
       ],
       "title": "Provider Document Id"
-    },
-    "publisher_categories": {
-      "anyOf": [
-        {
-          "items": {
-            "additionalProperties": true,
-            "type": "object"
-          },
-          "type": "array"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Publisher Categories"
     },
     "quality_status": {
       "title": "Quality Status",
@@ -335,20 +294,6 @@
       ],
       "title": "Semantic Key"
     },
-    "semantic_keys": {
-      "anyOf": [
-        {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Semantic Keys"
-    },
     "source_ref": {
       "anyOf": [
         {
@@ -402,7 +347,6 @@
     "title",
     "order_index",
     "semantic_key",
-    "semantic_keys",
     "payload",
     "content_hash",
     "structure_hash",
@@ -429,9 +373,6 @@
     "trace_level",
     "raw_file_hash",
     "query_projection_hash",
-    "publisher_categories",
-    "market",
-    "content_categories",
     "asset_uri",
     "is_active_run",
     "evidence_refs"

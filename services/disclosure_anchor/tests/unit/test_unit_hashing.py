@@ -11,7 +11,7 @@ from disclosure_anchor.domain.services.unit_hashing import (
     compute_unit_hashes,
 )
 from disclosure_anchor.domain.value_objects.semantic_key import (
-    validate_semantic_key_state,
+    validate_optional_semantic_key,
 )
 
 
@@ -35,13 +35,10 @@ class UnitHashingTests(unittest.TestCase):
                 )
                 self.assertEqual(got.structure_hash, case["expected"]["structure_hash"])
 
-    def test_golden_cases_carry_a_valid_controlled_semantic_state(self) -> None:
+    def test_golden_cases_carry_a_valid_optional_semantic_key(self) -> None:
         for case in json.loads(FIXTURE.read_text(encoding="utf-8")):
             with self.subTest(case=case["name"]):
-                validate_semantic_key_state(
-                    case["input"]["semantic_key"],
-                    case["input"]["semantic_keys"],
-                )
+                validate_optional_semantic_key(case["input"]["semantic_key"])
 
     def test_canonical_json_shape_is_pinned(self) -> None:
         self.assertEqual(
@@ -127,7 +124,6 @@ class UnitHashingTests(unittest.TestCase):
             "title": "经营情况",
             "heading_path": ["第三节 管理层讨论与分析", "一、经营情况"],
             "semantic_key": "document_content",
-            "semantic_keys": ["document_content"],
             "quality_status": "ok",
             "order_index": 1,
         }
@@ -238,7 +234,6 @@ class UnitHashingTests(unittest.TestCase):
             "title": "业务",
             "heading_path": ["一、业务"],
             "semantic_key": "document_content",
-            "semantic_keys": ["document_content"],
             "quality_status": "ok",
             "order_index": 1,
         }

@@ -159,9 +159,6 @@ class DocumentUnit:
     semantic_key: Optional[str] = None
     structure_hash: Optional[str] = None
     quality_status: str = "ok"
-    # All recall keys on the unit: its own semantic_key plus mixed parts'
-    # keys (Codex round4 P1#1 — grouping must not swallow recall).
-    semantic_keys: Optional[list[str]] = None
     # Section applicability declared by √适用/□不适用 marker lines (05 §8.5).
     applicability: Optional[str] = None
     # First source page of the unit (from the parser artifact locator).

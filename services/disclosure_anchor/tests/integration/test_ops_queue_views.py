@@ -218,9 +218,9 @@ class OpsQueueViewTests(unittest.TestCase):
                 "(processing_run_id, document_id, "
                 " artifact_owner_processing_run_id, run_kind, status, "
                 " unit_build_status, is_active, started_at, error, "
-                " unit_build_attempt_count) "
+                " unit_build_attempt_count, provider_document_relpath) "
                 "VALUES (:id, :doc, :id, 'parse', :status, :ubs, :active, :started, "
-                "        CAST(:error AS jsonb), :attempts)"
+                "        CAST(:error AS jsonb), :attempts, :provider_document_relpath)"
             ),
             {
                 "id": run_id,
@@ -231,6 +231,10 @@ class OpsQueueViewTests(unittest.TestCase):
                 "started": started_at or datetime.now(timezone.utc),
                 "error": json.dumps(error) if error is not None else None,
                 "attempts": attempts,
+                "provider_document_relpath": (
+                    f"derived/provider_documents/cninfo/000001/{document_id}/"
+                    f"{run_id}/provider_document.v1.json"
+                ),
             },
         )
         self.run_ids.append(run_id)

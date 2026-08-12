@@ -24,7 +24,8 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 1. `title`：已接受的 source heading 叶标题；metadata document title 绝不复制到 Unit。
 2. `heading_path`：已接受 heading occurrence 的完整根到叶路径。
 3. body：只回放 `provider_unit_locator.v1.search_targets` 明确列出的 provider payload destination。
-4. `semantic_keys`：当前新 Unit 固定通用键 `document_content`，不在 L1 推断业务 taxonomy。
+4. `semantic_key`：可选的真实受控 scalar；当前 Provider writer 不在 L1 推断业务 taxonomy，
+   因而写 NULL，检索 key channel 为空。
 
 不得递归扫描 payload、按字段名猜正文、按相同字符串去重、把 metadata title 注入每个 Unit，
 或把 caption/页眉/粗体小计自动升格成标题。

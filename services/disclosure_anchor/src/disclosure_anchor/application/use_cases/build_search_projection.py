@@ -512,7 +512,7 @@ def _load_run_units(session: Session, processing_run_id: str) -> list[dict[str, 
             DocumentUnit.heading_path,
             DocumentUnit.payload_kind,
             DocumentUnit.payload,
-            DocumentUnit.semantic_keys,
+            DocumentUnit.semantic_key,
             DocumentUnit.artifact_locator,
         )
         .where(DocumentUnit.processing_run_id == processing_run_id)
@@ -525,7 +525,7 @@ def _load_run_units(session: Session, processing_run_id: str) -> list[dict[str, 
             "heading_path": row.heading_path,
             "payload_kind": row.payload_kind,
             "payload": row.payload,
-            "semantic_keys": row.semantic_keys,
+            "semantic_key": row.semantic_key,
             "artifact_locator": row.artifact_locator,
         }
         for row in session.execute(stmt).all()
@@ -726,7 +726,7 @@ def compute_search_projection_row(
     heading_path: Any,
     payload_kind: str,
     payload: Mapping[str, Any] | None,
-    semantic_keys: Sequence[str] | None,
+    semantic_key: str | None,
     artifact_locator: Mapping[str, Any] | None,
     built_at: datetime,
 ) -> dict[str, Any]:
@@ -759,8 +759,8 @@ def compute_search_projection_row(
         "body_tokens": tokenizer.index_word_tokens(body_token_text),
         # Private handoff to the run-atomic child insert; not a parent column.
         "body_atoms": body_atoms,
-        # Semantic keys are controlled ASCII tokens; they bypass segmentation.
-        "key_tokens": " ".join(semantic_keys or []),
+        # The optional scalar key is controlled ASCII and bypasses segmentation.
+        "key_tokens": semantic_key or "",
         # Retained until the DB compatibility column is retired. New
         # projections never infer a header role from cell text.
         "header_row_candidate": False,
