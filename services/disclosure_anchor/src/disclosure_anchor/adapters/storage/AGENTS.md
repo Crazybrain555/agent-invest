@@ -1,13 +1,12 @@
-# adapters/storage — 文件存储（不可变归档 + 原子派生）
+# storage-adapter boundary
 
-```text
-path_builder.py        FileStorePathBuilder 是**唯一**路径生成入口（组件消毒、逃逸防护、
-                       只产相对路径；实际落盘 = data_root/"data"/<relpath>，注意有 data/ 一层）
-raw_document_store.py  原始 PDF 不可变归档：tmp 写入+fsync → hardlink 防覆盖 → 写后重哈希
-                       → %PDF- 魔数校验；quarantine 走 runtime/quarantine + manifest
-artifact_store.py      派生物原子写（write_json_atomic / write_jsonl_atomic，返回 hash/字节数）
-```
-
-硬规则：任何新路径需求先加 path_builder 方法 + 测试，严禁在 store/use case 里拼路径；
-raw 只追加不覆盖（provider_document_id 换文件 = 新版本 + supersedes，不是覆盖）；
-绝对路径不入库不出 API（DB 里只存 relpath / basename）。
+- The path builder is the single authority for relative service paths. Reject traversal/escape and do not build
+  runtime paths ad hoc in stores, use cases, API, tests, or scripts.
+- Raw documents are immutable and append-only: write through a temporary file, make publication atomic, verify
+  format/hash after write, and represent changed bytes as a new version with lineage rather than overwrite.
+- Derived artifacts are atomic and content-addressed/integrity-checked according to their contract. Partial files
+  never become published success.
+- Database/public contracts store only approved relative locators or basenames. Absolute AgentSSD paths never enter
+  API responses, tracked fixtures, exports, or logs.
+- Quarantine preserves evidence and reason without turning untrusted content into an active/published artifact.
+- Current directory layouts and method inventories belong in the storage design/runbook and code tests.

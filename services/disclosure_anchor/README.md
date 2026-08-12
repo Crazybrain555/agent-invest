@@ -32,7 +32,8 @@ make worker-loop          # continuous worker (singleton advisory lock)
 make api                  # Filing API on 127.0.0.1:8711 (fails closed without env/mount sentinel)
 make doctor               # environment + data integrity checks
 make agent-check          # lint + strict mypy + no-DB tests + diff check
-make test                 # live-DB gates
+make test                 # deterministic unittest; no live DB
+make test-integration     # scratch-DB migration/integration gate
 make archive              # clean source archive from tracked files (git archive)
 ```
 
