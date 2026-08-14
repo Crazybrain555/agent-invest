@@ -387,14 +387,26 @@ if APIRouter is not None:
     # Registered here (not a new top-level router) so the vocabulary catalog
     # behind documents_v1.disclosure_topics/filing_type mounts without a
     # main.py change. Imported at point of use to avoid an import cycle.
-    from disclosure_anchor.api.routers.classification import get_classification
-    from disclosure_anchor.api.schemas.public import ClassificationResponse
+    from disclosure_anchor.api.routers.classification import (
+        get_classification,
+        get_semantic_routes,
+    )
+    from disclosure_anchor.api.schemas.public import (
+        ClassificationResponse,
+        SemanticRouteCatalogResponse,
+    )
 
     router.add_api_route(
         "/v1/classification",
         get_classification,
         methods=["GET"],
         response_model=ClassificationResponse,
+    )
+    router.add_api_route(
+        "/v1/semantic-routes",
+        get_semantic_routes,
+        methods=["GET"],
+        response_model=SemanticRouteCatalogResponse,
     )
 else:
     router = None

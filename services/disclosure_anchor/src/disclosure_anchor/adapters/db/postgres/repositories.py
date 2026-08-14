@@ -669,6 +669,7 @@ class ProcessingRunRepository:
             "normalized_ir_relpath",
             "provider_document_relpath",
             "document_units_relpath",
+            "semantic_route_receipts_hash",
             "content_hash_aggregate",
             "structure_hash",
             "builder_rules_version",

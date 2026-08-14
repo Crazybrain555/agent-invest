@@ -2,8 +2,9 @@
 
 The database is the ownership authority.  Parser artifacts use directory
 ownership (a processing-run relpath owns every descendant); normalized IR and
-document-unit snapshots use exact-file ownership. This collector removes only
-files that no active or historical processing run owns.
+document-unit snapshots and their hash-bound semantic-route receipts use
+exact-file ownership. This collector removes only files that no active or
+historical processing run owns.
 
 Default is DRY-RUN. ``--apply`` holds the derived-state mutation lock from the
 ownership snapshot through deletion, rechecks the 24-hour age guard, and writes
@@ -33,6 +34,9 @@ from sqlalchemy.engine import Connection
 
 from disclosure_anchor.adapters.db.postgres.connection import create_db_engine
 from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA
+from disclosure_anchor.application.contracts.semantic_routes import (
+    SEMANTIC_ROUTE_RECEIPTS_FILENAME,
+)
 from disclosure_anchor.application.worker.locks import (
     exclusive_corpus_mutation,
 )
@@ -101,12 +105,19 @@ def _snapshot_expected_owners(conn: Connection) -> dict[str, set[str]]:
         text(
             f"""
             SELECT parser_artifact_relpath, normalized_ir_relpath,
-                   provider_document_relpath, document_units_relpath
+                   provider_document_relpath, document_units_relpath,
+                   semantic_route_receipts_hash
               FROM {CORE_SCHEMA}.processing_run
             """
         )
     )
-    for parser_relpath, normalized_relpath, provider_relpath, units_relpath in rows:
+    for (
+        parser_relpath,
+        normalized_relpath,
+        provider_relpath,
+        units_relpath,
+        receipt_hash,
+    ) in rows:
         values = {
             "parser_artifacts": parser_relpath,
             "normalized_ir": normalized_relpath,
@@ -116,6 +127,11 @@ def _snapshot_expected_owners(conn: Connection) -> dict[str, set[str]]:
         for family, value in values.items():
             if value is not None:
                 expected[family].add(str(value).rstrip("/"))
+        if units_relpath is not None and receipt_hash is not None:
+            snapshot = PurePosixPath(str(units_relpath))
+            expected["document_unit_snapshots"].add(
+                (snapshot.parent / SEMANTIC_ROUTE_RECEIPTS_FILENAME).as_posix()
+            )
     return expected
 
 

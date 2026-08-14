@@ -85,6 +85,7 @@ class DocumentUnitV1(PublicModel):
     order_index: int
     semantic_key: str | None
     semantic_keys: list[str] | None
+    section_keys: list[str] | None
     payload: dict[str, Any]
     content_hash: str
     structure_hash: str | None
@@ -232,6 +233,21 @@ class ClassificationResponse(PublicModel):
     classes: list[ProcessingClassV1]
     rule_sets: list[ClassificationRuleSetV1]
     note: str | None = None
+
+
+class SemanticRouteV1(PublicModel):
+    key: str
+    description: str
+    labels: list[str]
+    scopes: list[str]
+    usable_as_section_key: bool
+
+
+class SemanticRouteCatalogResponse(PublicModel):
+    contract_version: str
+    taxonomy_version: str
+    route_count: int
+    routes: list[SemanticRouteV1]
 
 
 class DocumentListResponse(PublicModel):

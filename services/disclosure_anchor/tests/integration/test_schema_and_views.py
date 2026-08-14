@@ -112,6 +112,7 @@ class SchemaShapeTests(unittest.TestCase):
                 "parser_target_identity",
                 "provider_document_relpath",
                 "search_projection_error",
+                "semantic_route_receipts_hash",
             },
             processing_run_columns,
         )
@@ -123,6 +124,7 @@ class SchemaShapeTests(unittest.TestCase):
                 "ck_processing_run_parser_target_identity",
                 "ck_processing_run_primary_output_exactly_one",
                 "ck_processing_run_search_projection_error",
+                "ck_processing_run_semantic_receipt_hash",
             },
             processing_run_constraints,
         )
@@ -230,6 +232,7 @@ class SchemaShapeTests(unittest.TestCase):
                 ).scalars()
             )
         self.assertNotIn("semantic_keys", columns)
+        self.assertNotIn("section_keys", columns)
         self.assertNotIn("content_categories", columns)
 
         up = self._alembic("upgrade", "head")
@@ -244,7 +247,9 @@ class SchemaShapeTests(unittest.TestCase):
                     )
                 ).scalars()
             )
-        self.assertLessEqual({"semantic_keys", "content_categories"}, columns)
+        self.assertLessEqual(
+            {"semantic_keys", "section_keys", "content_categories"}, columns
+        )
 
     @staticmethod
     def _alembic(*args: str) -> subprocess.CompletedProcess[str]:

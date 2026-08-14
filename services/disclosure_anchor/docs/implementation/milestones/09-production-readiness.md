@@ -78,7 +78,8 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
   - 修法：Update §5.2 to list four payload kinds (or say "three content kinds plus mixed composition, see §6.5") and change the v0.7 wording to v0.8 so the canonical contract is internally consistent.
 - [x] (SUPERSEDED 2026-08-13 by 0034) 0033 只证明当时 writer 的 `semantic_keys` 数据是
   duplicate-only，不能据此删除 mixed Unit 的 secondary-route 容量。0034 恢复 plural storage、
-  GIN 与 any/all API；当前 writer 无可信分类器时 scalar/array 都写 NULL，且不恢复旧词面规则堆。
+  GIN 与 any/all API；同日后续的 source-bound 闭集 router 已能写入真实 scalar/array，证据不足
+  时仍 NULL，且不恢复旧自由词面/公司专例规则堆。
 - [x] (S/DOCS/CONTRACT DRIFT) **service-purpose 的 document_units_v1 列数已对齐当前契约。**
   - 2026-07-16：service-purpose/data-dictionary/milestone 06/postgres AGENTS 统一为当前 41 列；
     32/36 只保留为历史迁移口径，全集以 contract-checklist §2 为准。

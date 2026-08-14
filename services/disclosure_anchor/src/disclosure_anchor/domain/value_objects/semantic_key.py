@@ -52,3 +52,25 @@ def validate_optional_semantic_key_state(
             "primary_not_first",
             "semantic_key must be the first semantic_keys item",
         )
+
+
+def validate_optional_section_keys(section_keys: Any) -> None:
+    """Accept no normalized section claim or one ordered unique key chain."""
+
+    if section_keys is None:
+        return
+    if not isinstance(section_keys, list) or not section_keys:
+        raise SemanticKeyInvariantError(
+            "section_array_empty",
+            "section_keys must be null or a non-empty array",
+        )
+    if any(not is_valid_semantic_key(key) for key in section_keys):
+        raise SemanticKeyInvariantError(
+            "section_item_invalid",
+            "section_keys contains an invalid key",
+        )
+    if len(section_keys) != len(set(section_keys)):
+        raise SemanticKeyInvariantError(
+            "section_array_duplicate",
+            "section_keys must not contain duplicates",
+        )

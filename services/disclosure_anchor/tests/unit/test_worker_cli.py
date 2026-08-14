@@ -339,21 +339,25 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "singleton advisory lock was lost"):
             worker_cli._assert_singleton_lock(lock_conn)
 
-    def test_lost_singleton_lock_cancels_active_mineru_before_raising(self) -> None:
+    def test_lost_singleton_lock_cancels_all_active_external_work(self) -> None:
         lock_conn = mock.MagicMock()
         lock_conn.execute.return_value.scalar_one.return_value = False
 
         with (
             mock.patch.object(
                 worker_cli, "terminate_active_mineru_processes"
-            ) as terminate,
+            ) as terminate_mineru,
+            mock.patch.object(
+                worker_cli, "terminate_active_semantic_processes"
+            ) as terminate_semantic,
             self.assertRaisesRegex(
                 RuntimeError, "singleton advisory lock was lost"
             ),
         ):
             worker_cli._assert_singleton_or_cancel(lock_conn)
 
-        terminate.assert_called_once_with()
+        terminate_mineru.assert_called_once_with()
+        terminate_semantic.assert_called_once_with()
 
     def test_resident_exits_after_process_lifetime_shutdown_latch(self) -> None:
         stop = mock.MagicMock()
@@ -401,6 +405,8 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             source_factory=lambda: mock.MagicMock(),
             profile_loader_factory=lambda _source: lambda _code: None,
             parser_factory=lambda: mock.MagicMock(),
+            semantic_router=mock.MagicMock(),
+            semantic_receipts=mock.MagicMock(),
             parse_expected_seconds=1,
             config=mock.MagicMock(),
             parser_options=ParserOptions(
@@ -539,15 +545,21 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             worker_cli.RATE_LIMIT_COOLDOWN_BASE_SECONDS,
         )
 
-    def test_signal_stops_refill_and_terminates_active_mineru_groups(self) -> None:
+    def test_signal_stops_refill_and_terminates_all_external_groups(self) -> None:
         stop = worker_cli._StopFlag()
-        with mock.patch.object(
-            worker_cli, "terminate_active_mineru_processes"
-        ) as terminate:
+        with (
+            mock.patch.object(
+                worker_cli, "terminate_active_mineru_processes"
+            ) as terminate_mineru,
+            mock.patch.object(
+                worker_cli, "terminate_active_semantic_processes"
+            ) as terminate_semantic,
+        ):
             stop._handle(15, None)
 
         self.assertTrue(stop.is_set())
-        terminate.assert_called_once_with()
+        terminate_mineru.assert_called_once_with()
+        terminate_semantic.assert_called_once_with()
 
     def test_wedge_exit_terminates_parser_groups_before_hard_exit(self) -> None:
         events: list[object] = []
@@ -555,7 +567,12 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             mock.patch.object(
                 worker_cli,
                 "terminate_active_mineru_processes",
-                side_effect=lambda: events.append("terminated") or 2,
+                side_effect=lambda: events.append("mineru") or 2,
+            ),
+            mock.patch.object(
+                worker_cli,
+                "terminate_active_semantic_processes",
+                side_effect=lambda: events.append("semantic") or 1,
             ),
             mock.patch(
                 "os._exit",
@@ -564,7 +581,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         ):
             worker_cli._exit_wedged_worker()
 
-        self.assertEqual(events, ["terminated", ("exit", 70)])
+        self.assertEqual(events, ["mineru", "semantic", ("exit", 70)])
 
 
 if __name__ == "__main__":

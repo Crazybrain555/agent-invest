@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import subprocess
+import urllib.error
+import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -46,6 +49,11 @@ _PYTHON_STRIP_CHARS_SQL = (
 )
 _CANONICAL_CODE_SQL = f"btrim(security_code, {_PYTHON_STRIP_CHARS_SQL})"
 _CANONICAL_EXCHANGE_SQL = f"upper(btrim(exchange, {_PYTHON_STRIP_CHARS_SQL}))"
+_MINERU_CANARY_PNG_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8A"
+    "AQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 @dataclass(frozen=True)
@@ -102,6 +110,71 @@ def _check_writable_dir(name: str, path: Path) -> CheckResult:
     if _is_writable_dir(path):
         return _pass(name, str(path))
     return _fail(name, f"not writable directory: {path}")
+
+
+def mineru_remote_inference_check(settings: Settings) -> CheckResult:
+    """Exercise the remote multimodal path; `/health` alone is insufficient."""
+
+    server_url = settings.disclosure_mineru_server_url
+    if server_url is None:
+        return _warn("MinerU remote inference", "server URL is not configured")
+    api_root = server_url.rstrip("/")
+    if not api_root.endswith("/v1"):
+        api_root += "/v1"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(
+            api_root + "/models",
+            timeout=15,
+        ) as response:
+            models_payload = json.loads(response.read())
+        models = models_payload.get("data")
+        if not isinstance(models, list) or len(models) != 1:
+            raise ValueError("expected exactly one served MinerU model")
+        model = models[0]
+        if not isinstance(model, dict) or not isinstance(model.get("id"), str):
+            raise ValueError("served MinerU model identity is invalid")
+        request_payload = {
+            "model": model["id"],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Return one OCR token for this image.",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": _MINERU_CANARY_PNG_DATA_URL},
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": 8,
+            "temperature": 0,
+        }
+        request = urllib.request.Request(
+            api_root + "/chat/completions",
+            data=json.dumps(request_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(request, timeout=90) as response:
+            completion_payload = json.loads(response.read())
+        choices = completion_payload.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1:
+            raise ValueError("multimodal canary returned no unique choice")
+    except (
+        OSError,
+        TimeoutError,
+        http.client.HTTPException,
+        urllib.error.URLError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        return _fail("MinerU remote inference", str(exc))
+    return _pass("MinerU remote inference", "multimodal canary passed")
 
 
 def _check_under_root(name: str, path: Path, root: Path) -> CheckResult:
@@ -361,6 +434,7 @@ def run_doctor(
     checks = _environment_checks(settings)
     checks.extend(_reader_database_url_checks(settings))
     checks.append(_mineru_orphan_check())
+    checks.append(mineru_remote_inference_check(settings))
     checks.extend(_disk_headroom_checks(settings))
     checks.append(_ops_launchd_check())
     if settings.database_url is None:

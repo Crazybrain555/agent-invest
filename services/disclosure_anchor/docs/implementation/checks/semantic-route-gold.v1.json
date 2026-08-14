@@ -1,0 +1,181 @@
+{
+  "contract_version": "semantic_route_gold.v1",
+  "cases": [
+    {
+      "provider_document_id": "100020384132",
+      "unit_index": 0,
+      "title": "中国石油化工股份有限公司投资者关系活动记录表",
+      "expected_keys": [
+        "investor_relations_overview",
+        "investor_questions_answers",
+        "participant_information"
+      ],
+      "rationale": "表单同时直接给出活动概况、参与者和多组问题回复。"
+    },
+    {
+      "provider_document_id": "1225460373",
+      "unit_index": 3,
+      "title": "一、2026 年7月份销售情况简报",
+      "expected_keys": ["price_changes", "sales_volume"],
+      "rationale": "正文和表格分别直接给出价格与销量，泛化 operating_metrics 不应重复。"
+    },
+    {
+      "provider_document_id": "1225460373",
+      "unit_index": 5,
+      "title": "三、其他提示",
+      "expected_keys": [],
+      "rationale": "指定媒体和理性投资模板不是独立业务风险事实，应诚实 NULL。"
+    },
+    {
+      "provider_document_id": "1225339310",
+      "unit_index": 0,
+      "title": "东方财富信息股份有限公司关于2024 年限制性股票激励计划首次授予限制性股票第二个归属期归属结果暨股份上市的公告",
+      "required_keys": ["incentive_vesting_exercise"],
+      "forbidden_keys": ["incentive_grant"],
+      "rationale": "首次授予是历史批次标识，当前事件是归属结果，不是再次授予。"
+    },
+    {
+      "provider_document_id": "1225339310",
+      "unit_index": 3,
+      "title": "（1）授予日期：2024 年4月12 日",
+      "expected_keys": ["incentive_grant", "incentive_recipients"],
+      "rationale": "标题是授予日期，表格独立列出姓名、职务和获授数量。"
+    },
+    {
+      "provider_document_id": "1225339310",
+      "unit_index": 4,
+      "title": "（三）预留限制性股票授予情况",
+      "expected_keys": [
+        "incentive_grant",
+        "incentive_adjustment",
+        "incentive_recipients",
+        "incentive_cancellation",
+        "incentive_condition_satisfaction"
+      ],
+      "rationale": "同一长 Unit 有相互独立的授予、价格调整、对象表、作废和条件成就事实。"
+    },
+    {
+      "provider_document_id": "1225339310",
+      "unit_index": 6,
+      "title": "三、本次限制性股票归属的具体情况",
+      "expected_keys": ["incentive_vesting_exercise", "incentive_recipients"],
+      "rationale": "归属表直接列出对象、职务和归属数量。"
+    },
+    {
+      "provider_document_id": "1225420563",
+      "unit_index": 4,
+      "title": "（一）业绩预告期间",
+      "expected_keys": [],
+      "rationale": "只有日期区间，没有预告结论、范围、原因或风险事实，应诚实 NULL。"
+    },
+    {
+      "provider_document_id": "1225420563",
+      "unit_index": 5,
+      "title": "（二）业绩预告情况",
+      "expected_keys": ["performance_forecast_summary", "performance_forecast_range"],
+      "rationale": "直接披露亏损结论和数值区间。"
+    },
+    {
+      "provider_document_id": "1225433840",
+      "unit_index": 0,
+      "title": "赛力斯集团股份有限公司关于公司董事、高级管理人员及骨干团队增持A 股及 H 股股份结果的更正公告",
+      "expected_keys": ["correction_item", "corrected_data"],
+      "rationale": "正文明确列出原值、更正值和更正项目；原因/影响并未独立披露。"
+    },
+    {
+      "provider_document_id": "1225231394",
+      "unit_index": 22,
+      "title": "所有者权益",
+      "expected_keys": [
+        "foreign_currency_translation",
+        "other_comprehensive_income",
+        "retained_earnings"
+      ],
+      "rationale": "段落直接给出未分配利润、其他综合收益和外币财务报表折算差额的变化；该折算差额与外币货币性项目是准则中的不同概念。"
+    },
+    {
+      "provider_document_id": "1225231394",
+      "unit_index": 29,
+      "title": "4.6 资本充足率",
+      "expected_keys": ["bank_capital_adequacy"],
+      "rationale": "标题和段落直接披露资本充足率；‘加强资本管理’是改进方向而非第二个独立 Unit 主题，仍须由 lexical 检索命中。"
+    },
+    {
+      "provider_document_id": "1225370759",
+      "unit_index": 2,
+      "title": "重要内容提示：",
+      "expected_keys": [
+        "share_buyback_plan",
+        "share_buyback_price_volume",
+        "share_buyback_method",
+        "share_buyback_purpose",
+        "share_buyback_risk",
+        "share_buyback_term",
+        "share_buyback_funding"
+      ],
+      "rationale": "概览逐项直接给出方案、金额价格、方式、用途、风险、期限和资金。"
+    },
+    {
+      "provider_document_id": "1225370759",
+      "unit_index": 5,
+      "title": "本次回购方案的主要内容如下：",
+      "expected_keys": [
+        "share_buyback_plan",
+        "share_buyback_method",
+        "share_buyback_term",
+        "share_buyback_price_volume",
+        "share_buyback_purpose",
+        "share_buyback_account",
+        "share_buyback_funding"
+      ],
+      "rationale": "方案表逐字段直接披露，并列出回购专用证券账户；没有独立完成结果或风险字段。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 292,
+      "title": "五、其他信息",
+      "forbidden_keys": ["audit_opinion", "financial_statements_section"],
+      "rationale": "本节只界定其他信息与财务报表、审计意见的排除范围和注册会计师责任，没有披露财务报表内容或实际审计意见。"
+    },
+    {
+      "provider_document_id": "1225466824",
+      "unit_index": 6,
+      "title": "（2）年利息计算",
+      "required_keys": ["interest_terms"],
+      "forbidden_keys": ["bond_interest_dates"],
+      "rationale": "本节直接定义年利息公式和票面利率；付息债权登记日仅作为公式变量定义，未披露本次具体日期安排。"
+    },
+    {
+      "provider_document_id": "1225339310",
+      "unit_index": 1,
+      "title": "一、本次限制性股票激励计划实施情况概要",
+      "required_keys": [
+        "incentive_plan_overview",
+        "incentive_vesting_exercise"
+      ],
+      "forbidden_keys": ["decision_procedures"],
+      "rationale": "Unit 直接给出计划概要与归属时间比例；这里只引用历史名单披露并列归属安排，没有实际对象名单。归属安排的法定禁止期间也没有披露一次实际决策程序。"
+    },
+    {
+      "provider_document_id": "1225466824",
+      "unit_index": 2,
+      "title": "可转换公司债券 2026 年付息的公告",
+      "expected_keys": [],
+      "rationale": "该 Unit 只有公告标题和真实性保证模板；具体付息条款、日期与对象由后续 Units 承载，避免封面重复路由。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 102,
+      "title": "八、获准许的弥偿条文",
+      "expected_keys": ["director_indemnity_insurance"],
+      "rationale": "标题和正文直接披露董事弥偿安排及董事、监事责任保险，不应因旧词表缺项而保持 NULL。"
+    },
+    {
+      "provider_document_id": "1225370759",
+      "unit_index": 18,
+      "title": "四、 其他事项说明",
+      "expected_keys": ["share_buyback_account"],
+      "rationale": "虽然标题泛化为其他事项，正文直接披露回购专用证券账户的开立、账号和限定用途，应使用精确主题而非 other。"
+    }
+  ]
+}

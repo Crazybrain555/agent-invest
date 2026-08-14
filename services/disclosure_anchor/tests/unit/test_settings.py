@@ -99,6 +99,8 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(settings.cninfo_max_retries, 3)
             self.assertEqual(settings.cninfo_overlap_days, 7)
             self.assertEqual(settings.cninfo_oversized_kb, 10240)
+            self.assertEqual(settings.disclosure_semantic_model, "gpt-5.6-luna")
+            self.assertEqual(settings.disclosure_semantic_reasoning_effort, "low")
 
     def test_secrets_are_optional_and_masked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -121,6 +123,8 @@ class SettingsTests(unittest.TestCase):
                     "DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS": "360",
                     "WORKER_REPORT_INTERVAL_SECONDS": "77",
                     "DISCLOSURE_MINERU_BIN": "/opt/mineru/bin/mineru",
+                    "DISCLOSURE_SEMANTIC_MODEL": "gpt-5.3-codex-spark",
+                    "DISCLOSURE_SEMANTIC_REASONING_EFFORT": "high",
                 }
             )
             with patch.dict(os.environ, env, clear=True):
@@ -153,6 +157,14 @@ class SettingsTests(unittest.TestCase):
                 self.assertEqual(settings.cninfo_max_retries, 5)
                 self.assertEqual(settings.cninfo_overlap_days, 14)
                 self.assertEqual(settings.cninfo_oversized_kb, 20480)
+                self.assertEqual(
+                    settings.disclosure_semantic_model,
+                    "gpt-5.3-codex-spark",
+                )
+                self.assertEqual(
+                    settings.disclosure_semantic_reasoning_effort,
+                    "high",
+                )
 
 
 if __name__ == "__main__":

@@ -315,6 +315,22 @@ class ProviderSearchTargetTests(unittest.TestCase):
 
         self.assertEqual(row["key_tokens"], "revenue segment_performance")
 
+    def test_section_routes_do_not_enter_direct_key_tokens(self) -> None:
+        draft = build_provider_units(_admitted(_representative_document())).units[1]
+        row = compute_search_projection_row(
+            asset_id="asset_sections",
+            title=draft.title,
+            heading_path=draft.heading_path,
+            payload_kind=draft.payload_kind,
+            payload=draft.payload,
+            semantic_keys=("revenue",),
+            section_keys=("business_review", "important_matters"),
+            artifact_locator=provider_unit_locator_to_payload(draft.locator),
+            built_at=_BUILT_AT,
+        )
+
+        self.assertEqual(row["key_tokens"], "revenue")
+
 
 if __name__ == "__main__":
     unittest.main()

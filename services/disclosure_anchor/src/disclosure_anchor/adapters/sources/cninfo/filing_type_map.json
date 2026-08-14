@@ -1,5 +1,5 @@
 {
-  "version": "2026-07-r13",
+  "version": "2026-08-r15",
   "rules": [
     {
       "filing_type": "intermediary_report",
@@ -74,6 +74,14 @@
       "match": "any"
     },
     {
+      "filing_type": "correction_supplement",
+      "keywords": [
+        "更正公告",
+        "补充更正"
+      ],
+      "match": "any"
+    },
+    {
       "filing_type": "investor_relations",
       "keywords": [
         "投资者关系",
@@ -83,6 +91,22 @@
     }
   ],
   "topic_rules": [
+    {
+      "class": "performance_forecast",
+      "keywords": [
+        "业绩预告",
+        "业绩预盈",
+        "业绩预亏"
+      ]
+    },
+    {
+      "class": "equity_incentive",
+      "keywords": [
+        "限制性股票激励计划",
+        "股票期权激励计划",
+        "员工持股计划"
+      ]
+    },
     {
       "class": "operating_data",
       "keywords": [

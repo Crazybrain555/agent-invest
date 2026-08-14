@@ -102,6 +102,18 @@ writer. Source SHA-256 identifies the immutable PDF.
 | 688012 / 1225455464 | 4 | short performance forecast with numeric ranges | `020a8e984e8dbe30397b167cdbb468bd7bdec0667923490c674b18ed70f425fc` |
 | 601138 / 1225468066 | 221 | current semiannual report, dense financial tables, and yes/no front matter | `34d02741f6651eba443de0b3ec16562a43d22b31c12d548e4f17004ed618ba2d` |
 
+On 2026-08-13 this 221-page source produced the same remote failure twice in
+its first processing window. The MinerU client terminal recorded the exact
+marker `Unexpected status code: [500]`; the paired vLLM 0.21 container log was
+`AssertionError: Expected a cached item for mm_hash=...` in the multimodal IPC
+cache. After the pinned container command added `--mm-processor-cache-gb 0`, a
+fixed image-completion canary, the formerly failing page window, and the full
+14-window / 221-page run all succeeded. The strict Provider reader accepted
+221 pages, 3,062 blocks, 290 physical table segments, and 297 artifacts with
+bundle digest
+`sha256:c9d1afe81c6cafd7ee5d59dbc5845d435d2c681bb3c70166a1bf98a289b6ef3b`.
+This is backend-availability evidence, not a PDF-specific repair rule.
+
 ## Latest clean replay receipt (2026-08-13)
 
 The final Unit-schema QA replay keeps ten diverse documents in the development
@@ -121,9 +133,12 @@ search projection contains 805 parent rows and 25,954 source-bound atoms under
 - all 156 `{"text":""}` payloads are accepted source headings with non-empty
   `title` and `heading_path`; there is no unexplained empty carrier, empty mixed
   text part, or empty table body;
-- `semantic_key` and `semantic_keys` are both NULL on all 805 Units because this
-  writer has no trusted route classifier. Consequently all current `key_tokens`
-  are empty rather than carrying a fake `document_content` placeholder;
+- at the time of this clean replay, `semantic_key` and `semantic_keys` were both
+  NULL on all 805 Units because the then-current writer had no trusted route
+  classifier. Consequently that replay's `key_tokens` were empty rather than
+  carrying a fake `document_content` placeholder. The subsequent controlled-
+  taxonomy router is evaluated in a separate offline receipt before any new
+  replay; this paragraph remains a historical DB observation;
 - `content_categories` is inherited only where the Document has actual CNInfo
   category metadata: 23 Units across the operating-data and convertible-bond
   documents. Local test registrations without provider category metadata remain

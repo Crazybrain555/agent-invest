@@ -11,7 +11,7 @@ scope: self_maintained_exchange_disclosures
 output_kind: l2_ready_document_units
 output_form: queryable_database_plus_filing_api
 payload_kinds: [text, table, qa, mixed]
-query_keys: [company_ref, security_ref, report_period, announcement_date, filing_type, document_id, asset_id, payload_kind, heading_path, semantic_key, semantic_keys, applicability, page_no, quality_status, content_hash, source_ref, producer_action_ref]
+query_keys: [company_ref, security_ref, report_period, announcement_date, filing_type, document_id, asset_id, payload_kind, heading_path, semantic_key, semantic_keys, section_keys, applicability, page_no, quality_status, content_hash, source_ref, producer_action_ref]
 core_objects: [company, security, source_access, document, processing_run, document_unit]
 optional_objects: [source_checkpoint, provider_category]
 primary_store: postgresql
@@ -414,6 +414,7 @@ title
 order_index
 semantic_key（可选；只有存在受控的真实 Unit 级路由键时才填写）
 semantic_keys（可选；完整有序路由集，首项等于 semantic_key）
+section_keys（可选；从可靠 heading_path 精确归一的完整结构位置路由）
 payload
 content_hash
 quality_status
@@ -654,7 +655,7 @@ provider_document_id= ...
 raw_file_hash       = sha256:...
 processing_run_id   = run_...
 asset_id            = du_...
-semantic_key        = NULL（当前 Provider writer 不伪造业务语义）
+semantic_key        = source-bound 受控路由或 NULL（证据不足时不伪造）
 exact payload       = {"table_body":"<table>...</table>"}
 ```
 
@@ -869,6 +870,7 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - `heading_path`；
 - `semantic_key`；
 - `semantic_keys`（mixed Unit 的完整路由集合）；
+- `section_keys`（定期报告的规范化章节位置集合）；
 - `applicability`（0010 起，节适用性一等筛选列）；
 - `page_no`（0010 起，定位与审查的一等筛选参数）；
 - `quality_status`；
@@ -881,7 +883,8 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 查询面说明：上述键在 `disclosure_public.*_v1` 视图上全部可作谓词（DB 直读满足全集）；
 Filing API 首版只暴露其中一部分为查询参数（documents：company_ref / security_code /
 filing_type / report_period / announcement_date_from,to / status；units：payload_kind /
-semantic_key（兼容召回 primary 或 secondary route）/ semantic_keys_any / semantic_keys_all / quality_status /
+semantic_key（兼容召回 primary 或 secondary route）/ semantic_keys_any / semantic_keys_all /
+section_keys_any / section_keys_all / quality_status /
 heading_prefix），其余键经 DB 视图直读或后续 API 升版满足。
 
 全文关键词检索可以后加，但不是证据对象，也不要求向量化。
@@ -971,8 +974,9 @@ parser artifact 与 primary parse artifact 字节的根 parse run。0032 为 cor
 run_kind 与 locator contract 校验后使用统一 PathBuilder 定位，禁止把 unit producer run 当成
 artifact owner，也禁止从文件存在性或路径词面猜版本。
 
-0034 后 `document_units_v1` 为 **39 列**：保留 Unit 自有 scope/provenance、
+0036 后 `document_units_v1` 为 **40 列**：保留 Unit 自有 scope/provenance、
 `semantic_key`/`semantic_keys` 检索路由，以及 `filing_type`/`disclosure_topics` 路由字段；
+`section_keys` 单独提供确定性的规范化章节召回；
 `content_categories` 从 Document 继承到 Unit 读面，便于 L2 单次查询做粗分类过滤，
 但不复制存储、不进入每个 Unit 的全文 token。`publisher_categories`/`market` 仍只留在
 `documents_v1` 与 `document_categories_v1`。完整列集以 contract-checklist §2 为准：
@@ -983,8 +987,13 @@ artifact owner，也禁止从文件存在性或路径词面猜版本。
   （DB 直读方可直接过滤 active run）；同迁移将 `payload_kind` CHECK 扩为含 `mixed`（§6.5）；
 - 0033：开发期误把当时 duplicate-only 的观测推广为 schema 结论，删除了 plural route；
 - 0034：恢复 `semantic_keys` 存储/GIN/API any/all recall，并恢复 Unit 视图继承的
-  `content_categories`。当前 Provider writer 没有可信分类器，所以 scalar/array 均写 NULL；
-  这不等于删除以后写入真实路由的能力，也不授权恢复旧的词面分类规则堆。
+  `content_categories`。当前 Provider writer 使用版本化受控词表、filing/topic scope、Unit-local
+  精确标题与 recall-only 包含/字符相似候选，再由闭集 Luna 裁决真实 route；模型只能选择候选或弃权。
+  一跳 overview 标记只负责在具体子标题 Unit 中去掉上位容器，真实概要/汇总 Unit 仍可保留
+  container 与独立字段 routes，且绝不自动补父键。Build 冻结
+  receipt、Publish 只重放。证据不足时 scalar/array 均为 NULL，不授权恢复旧的自由词面规则堆。
+- 0036：新增 `section_keys` 存储/GIN/API any/all recall。它只从定期报告已接受 heading_path 的
+  显式 context-container 精确匹配生成，不调用模型、不与直接主题竞争，也不复制 Document facet。
 
 `asset://` URI（顶层协议 §2.3）只在序列化边界派生，不落存储：
 

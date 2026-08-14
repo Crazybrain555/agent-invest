@@ -12,8 +12,14 @@ from disclosure_anchor.application.contracts.provider_unit import (
     PROVIDER_UNIT_BUILDER_VERSION,
     provider_unit_locator_to_payload,
 )
+from disclosure_anchor.application.contracts.semantic_routes import (
+    SemanticRouteReceiptRow,
+)
 from disclosure_anchor.application.services.provider_unit_builder import (
     build_provider_units,
+)
+from disclosure_anchor.application.ports.semantic_routes import (
+    SemanticRouteReceiptStoreError,
 )
 from disclosure_anchor.application.use_cases.publish_run import (
     ProviderDocumentPublicationGuard,
@@ -30,6 +36,10 @@ from disclosure_anchor.domain.services.unit_hashing import (
     structure_hash_aggregate,
 )
 from tests.unit._fakes import FakeUnitOfWork
+from tests.unit._semantic_routes import (
+    MemorySemanticReceiptStore,
+    PassthroughSemanticRouter,
+)
 from tests.unit.test_provider_unit_builder import (
     _admitted,
     _representative_document,
@@ -212,9 +222,17 @@ def _provider_guard_fixture() -> tuple[
         artifact_hash=admitted.provider_document_sha256,
         provider_document_relpath=admitted.provider_document_relpath.as_posix(),
         builder_rules_version=PROVIDER_UNIT_BUILDER_VERSION,
+        document_units_relpath=(
+            "derived/document_unit_snapshots/cninfo/000001/"
+            "pid_1/run_1/document_units.v1.jsonl"
+        ),
+        semantic_route_receipts_hash="sha256:" + "d" * 64,
     )
     units = []
-    for draft in build_provider_units(admitted).units:
+    drafts = build_provider_units(admitted).units
+    router = PassthroughSemanticRouter()
+    routed = router.route(drafts=drafts)
+    for draft in routed.units:
         units.append(
             e.DocumentUnit(
                 asset_id=f"asset_{draft.unit_index}",
@@ -240,8 +258,21 @@ def _provider_guard_fixture() -> tuple[
                 artifact_locator=provider_unit_locator_to_payload(draft.locator),
             )
         )
+    receipts = MemorySemanticReceiptStore()
+    receipts.rows = tuple(
+        SemanticRouteReceiptRow(
+            asset_id=unit.asset_id,
+            order_index=unit.order_index,
+            receipt=receipt,
+        )
+        for unit, receipt in zip(units, routed.receipts, strict=True)
+    )
     return (
-        ProviderDocumentPublicationGuard(_FixedAdmission(admitted)),  # type: ignore[arg-type]
+        ProviderDocumentPublicationGuard(
+            _FixedAdmission(admitted),  # type: ignore[arg-type]
+            semantic_router=router,  # type: ignore[arg-type]
+            semantic_receipts=receipts,
+        ),
         run,
         document,
         units,
@@ -301,6 +332,50 @@ class PublishRunTests(unittest.TestCase):
             caught.exception.error["error_code"],
             "RUN_OUTPUT_CONTRACT_UNSUPPORTED",
         )
+
+    def test_provider_guard_rejects_semantic_receipt_hash_drift(self) -> None:
+        guard, run, document, units = _provider_guard_fixture()
+        run.semantic_route_receipts_hash = "sha256:" + "e" * 64
+
+        with self.assertRaises(PublishRunError) as caught:
+            guard(
+                run=run,
+                document=document,
+                artifact_owner=run,
+                security_code="000001",
+                units=units,
+            )
+
+        self.assertEqual(
+            caught.exception.error["reason_code"],
+            "semantic_receipt_invalid",
+        )
+
+    def test_provider_guard_classifies_transient_receipt_read_as_retryable(self) -> None:
+        guard, run, document, units = _provider_guard_fixture()
+
+        class _UnavailableReceiptStore:
+            def read(self, **_kwargs):  # type: ignore[no-untyped-def]
+                raise SemanticRouteReceiptStoreError(
+                    "AgentSSD is temporarily unavailable",
+                    retryable=True,
+                )
+
+        guard._semantic_receipts = _UnavailableReceiptStore()  # type: ignore[assignment]
+        with self.assertRaises(PublishRunError) as caught:
+            guard(
+                run=run,
+                document=document,
+                artifact_owner=run,
+                security_code="000001",
+                units=units,
+            )
+
+        self.assertEqual(
+            caught.exception.error["error_code"],
+            "PROVIDER_UNIT_PROJECTION_UNAVAILABLE",
+        )
+        self.assertTrue(caught.exception.error["retryable"])
 
     def test_first_publish_creates_unit_events_then_published(self) -> None:
         uow = _uow_with_document()
@@ -671,6 +746,31 @@ class PublishRunTests(unittest.TestCase):
                     "RUN_UNIT_HASH_INVALID",
                 )
                 self.assertEqual(uow.outbox.all(), [])
+
+    def test_retryable_guard_failure_keeps_built_run_for_next_publish(self) -> None:
+        uow = _uow_with_document()
+        uow.processing_runs.add(_run("run_new"))
+        uow.document_units.add(_unit("du_new", "run_new"))
+        _sync_run_hashes(uow, "run_new")
+
+        def retryable_guard(**_kwargs: object) -> None:
+            raise PublishRunError(
+                {
+                    "error_code": "PROVIDER_UNIT_PROJECTION_INVALID",
+                    "message": "temporary shared-storage read failure",
+                    "retryable": True,
+                }
+            )
+
+        with self.assertRaises(PublishRunError):
+            _publisher(uow, publication_guard=retryable_guard).execute(
+                PublishRunCommand(processing_run_id="run_new")
+            )
+
+        run = uow.processing_runs.get("run_new")
+        self.assertEqual(run.unit_build_status, "succeeded")
+        self.assertIsNone(run.unit_build_error)
+        self.assertFalse(run.is_active)
 
     def test_candidate_aggregate_mismatch_fails_before_publish_mutation(self) -> None:
         for field in ("content_hash_aggregate", "structure_hash"):

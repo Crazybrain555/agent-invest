@@ -76,13 +76,14 @@ tracked_company DTO 派生字段全集 = {effective_lookback_days / effective_sy
 scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（数组前缀语义，
   见 06 §3.8）/ semantic_key（兼容召回 primary 或 secondary route）/
   semantic_keys_any / semantic_keys_all /
+  section_keys_any / section_keys_all /
   quality_status 等）
 0010 起 document_units_v1 追加 applicability / page_no 列（applicability：
   'applicable'|'not_applicable'|NULL，节适用性声明的一等筛选列，payload 保持纯原文，
   部分索引 ix_document_unit_applicability；page_no：artifact_locator 首页码提升列）。
 0007 起 document_units_v1 追加 6 列：asset_kind / observed_at / source_tier /
   trace_level / raw_file_hash / query_projection_hash
-  （0034 当前列全集 = **39 列**；恢复 semantic_keys 与继承的 content_categories；publisher/market 只留 documents_v1/document_categories_v1）
+  （0036 当前列全集 = **40 列**；semantic_keys=直接主题，section_keys=规范化章节位置，content_categories=继承的 Document facet；publisher/market 只留 documents_v1/document_categories_v1）
 0007 起 change_events_v1 追加 change_kind（真实列）/ subject_kind / subject_ref /
   source / contract_version
 0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref /
@@ -92,8 +93,11 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
   ProviderDocument，粗 kind/source owner 留在 locator，不在 payload 重复；document/section 由 title/headpath/locator 推导；
   监管 taxonomy 不参与切分）
 0034 恢复 semantic_keys 存储/GIN/API 集合过滤；nullable scalar semantic_key 是 primary，
-  数组是完整有序 route set。Provider writer 不做 L1 业务 taxonomy，当前两者都写 NULL；
-  不得用键改变 source payload/boundary，也不得恢复旧词面规则堆
+  数组是完整有序 route set。Provider writer 的独立 route 阶段只接受 source-bound 闭集候选，
+  唯一精确标题可确定性落键，歧义候选由 Luna 只选 candidate ID 或弃权；不得用键改变 source
+  payload/boundary，也不得恢复旧自由词面/公司专例规则堆
+0036 新增 section_keys 存储/GIN/API 集合过滤；只从可靠 heading_path 的显式 context-container
+  做精确、可重建的结构归一，不调用模型，不占 semantic route cap，不改变 Unit 边界
 0015 起 document_units_v1 增加 heading_path_text（视图内派生的面包屑文本
   "第八节 财务报告 > … > 75、其他综合收益"——多级标题的可检索形态；不入库、
   不进哈希；06R 投影将对同一字段建 FTS 索引）
@@ -250,6 +254,16 @@ Provider writer 不再写 document_content 占位语义，semantic_key=NULL；mi
 恢复 semantic_keys：首项必须等于 semantic_key；secondary keys 为 mixed Unit 提供完整 recall；GIN + any/all API 恢复
 恢复 content_categories 到 document_units_v1 / DocumentUnitV1，但值仍由 Document join 继承，不复制进 Unit 表或全文 token
 publisher_categories / market 保持 Document-only
-当前 Provider writer 没有可信分类器，semantic_key/semantic_keys 都写 NULL；不伪造 document_content
+Provider writer 使用版本化受控词表 + filing scope + Unit-local candidate gate；唯一精确标题可确定性落键，
+歧义候选由闭集 Luna 裁决，Build receipt 冻结、Publish 只重放；证据不足仍为 NULL，不伪造 document_content
 singleton 数组不重复改变 query_projection_hash；只有真实 secondary route 扩展 query hash，避免无信息的全量哈希翻转
+```
+
+2026-08-13（0036 直接主题与章节位置分权）：
+
+```text
+semantic_key(s) 只保存 Unit 自身直接主题；不再把父章节混进模型候选或 receipt
+section_keys 保存定期报告已接受 heading_path 的精确 context-container 链，完整根到叶、无相似/包含匹配
+两列均进入 key-token 检索；section_keys 独立进入 query_projection_hash，并提供 any/all API
+content_categories 仍仅是 Document provider facet，经 Unit public view 继承；不能填充任一 Unit route
 ```

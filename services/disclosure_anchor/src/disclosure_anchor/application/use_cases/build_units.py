@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
@@ -18,17 +18,33 @@ from disclosure_anchor.application.contracts.provider_unit import (
     ProviderUnitDraft,
     provider_unit_locator_to_payload,
 )
+from disclosure_anchor.application.contracts.semantic_routes import (
+    SEMANTIC_ROUTE_RECEIPTS_FILENAME,
+    SEMANTIC_ROUTER_VERSION,
+    SemanticRouteContractError,
+    SemanticRouteReceipt,
+    SemanticRouteReceiptRow,
+)
 from disclosure_anchor.application.ports.file_store import (
     ArtifactStorePort,
     ArtifactWriteResult,
     FileStorePathPort,
 )
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.ports.semantic_routes import (
+    SemanticRouteAdjudicatorError,
+    SemanticRouteReceiptStoreError,
+    SemanticRouteReceiptStorePort,
+)
 from disclosure_anchor.application.services.provider_document_admission import (
     ProviderDocumentAdmission,
 )
 from disclosure_anchor.application.services.provider_unit_builder import (
     build_provider_units,
+)
+from disclosure_anchor.application.services.semantic_router import (
+    SemanticRouter,
+    semantic_document_context,
 )
 from disclosure_anchor.application.worker.locks import (
     exclusive_document_producer,
@@ -44,6 +60,7 @@ from disclosure_anchor.domain.services.unit_hashing import (
 )
 from disclosure_anchor.domain.value_objects.semantic_key import (
     SemanticKeyInvariantError,
+    validate_optional_section_keys,
     validate_optional_semantic_key_state,
 )
 
@@ -62,6 +79,7 @@ SNAPSHOT_KEYS = {
     "quality_status",
     "semantic_key",
     "semantic_keys",
+    "section_keys",
     "title",
 }
 
@@ -94,11 +112,15 @@ class BuildUnits:
         artifact_store: ArtifactStorePort,
         uow_factory: Callable[[], UnitOfWork],
         admission: ProviderDocumentAdmission,
+        semantic_router: SemanticRouter,
+        semantic_receipts: SemanticRouteReceiptStorePort,
     ) -> None:
         self._paths = path_builder
         self._artifact_store = artifact_store
         self._uow_factory = uow_factory
         self._admission = admission
+        self._semantic_router = semantic_router
+        self._semantic_receipts = semantic_receipts
 
     def execute(self, command: BuildUnitsCommand) -> BuildUnitsResult:
         initial = self._load_context(command)
@@ -116,7 +138,15 @@ class BuildUnits:
                 artifact_owner=cast(e.ProcessingRun, context["artifact_owner"]),
                 security_code=cast(str, context["security_code"]),
             )
-            build = build_provider_units(admitted)
+            base_build = build_provider_units(admitted)
+            routed = self._semantic_router.route(
+                admitted=admitted,
+                document=semantic_document_context(
+                    cast(e.Document, context["document"])
+                ),
+                drafts=base_build.units,
+            )
+            build = replace(base_build, units=routed.units)
             if build.unassigned_table_parts:
                 raise BuildUnitsError(
                     self._structured_error(
@@ -127,12 +157,37 @@ class BuildUnits:
                         ),
                     )
                 )
-            units, snapshot_rows = self._materialize_units(
+            units, snapshot_rows, receipt_rows = self._materialize_units(
                 build=build,
+                receipts=routed.receipts,
                 document=cast(e.Document, context["document"]),
                 run=run,
             )
             stats = self._build_stats(build)
+        except SemanticRouteAdjudicatorError as exc:
+            if exc.reason_code == "invalid_decision":
+                error_code = "SEMANTIC_ROUTE_INVALID"
+            elif exc.retryable:
+                error_code = "SEMANTIC_ROUTE_ADJUDICATION_UNAVAILABLE"
+            else:
+                error_code = "SEMANTIC_ROUTE_ADJUDICATION_FAILED"
+            return self._mark_and_result(
+                run.processing_run_id,
+                self._structured_error(
+                    error_code=error_code,
+                    reason_code=exc.reason_code,
+                    retryable=exc.retryable,
+                    message=str(exc),
+                ),
+            )
+        except SemanticRouteContractError as exc:
+            return self._mark_and_result(
+                run.processing_run_id,
+                self._structured_error(
+                    error_code="SEMANTIC_ROUTE_INVALID",
+                    message=str(exc),
+                ),
+            )
         except ProviderDocumentAdmissionError as exc:
             return self._mark_and_result(
                 run.processing_run_id,
@@ -184,12 +239,47 @@ class BuildUnits:
                 expected_rows=len(snapshot_rows),
                 write_result=snapshot_result,
             )
+            receipt_relpath = snapshot_relpath.parent / SEMANTIC_ROUTE_RECEIPTS_FILENAME
+            receipt_result = self._semantic_receipts.write(
+                relpath=receipt_relpath,
+                rows=receipt_rows,
+            )
+            if self._semantic_receipts.read(
+                relpath=receipt_relpath,
+                expected_hash=receipt_result.artifact_hash,
+            ) != receipt_rows:
+                raise BuildUnitsError(
+                    self._structured_error(
+                        error_code="ARTIFACT_WRITE_FAILED",
+                        retryable=True,
+                        message="semantic route receipt verification failed",
+                    )
+                )
+            stats["semantic_route_receipts_relpath"] = str(receipt_relpath)
+            stats["semantic_route_receipts_hash"] = receipt_result.artifact_hash
             self._artifact_store.write_json_atomic(
                 relpath=snapshot_relpath.parent / "build_stats.v1.json",
                 payload=stats,
             )
         except BuildUnitsError as exc:
             return self._mark_and_result(run.processing_run_id, exc.error)
+        except SemanticRouteContractError as exc:
+            return self._mark_and_result(
+                run.processing_run_id,
+                self._structured_error(
+                    error_code="SEMANTIC_ROUTE_RECEIPT_INVALID",
+                    message=str(exc),
+                ),
+            )
+        except SemanticRouteReceiptStoreError as exc:
+            return self._mark_and_result(
+                run.processing_run_id,
+                self._structured_error(
+                    error_code="SEMANTIC_ROUTE_RECEIPT_UNAVAILABLE",
+                    retryable=exc.retryable,
+                    message=str(exc),
+                ),
+            )
         except OSError as exc:
             return self._mark_and_result(
                 run.processing_run_id,
@@ -205,6 +295,7 @@ class BuildUnits:
                 run_id=run.processing_run_id,
                 units=units,
                 snapshot_relpath=snapshot_relpath,
+                semantic_route_receipts_hash=receipt_result.artifact_hash,
                 content_aggregate=content_hash_aggregate(
                     unit.content_hash for unit in units
                 ),
@@ -338,17 +429,33 @@ class BuildUnits:
         self,
         *,
         build: ProviderUnitBuildResult,
+        receipts: tuple[SemanticRouteReceipt, ...],
         document: e.Document,
         run: e.ProcessingRun,
-    ) -> tuple[list[e.DocumentUnit], list[dict[str, Any]]]:
+    ) -> tuple[
+        list[e.DocumentUnit],
+        list[dict[str, Any]],
+        tuple[SemanticRouteReceiptRow, ...],
+    ]:
+        if len(build.units) != len(receipts):
+            raise BuildUnitsError(
+                self._structured_error(
+                    error_code="SEMANTIC_ROUTE_INVALID",
+                    message="semantic receipt count differs from Unit count",
+                )
+            )
         units: list[e.DocumentUnit] = []
         rows: list[dict[str, Any]] = []
-        for draft in build.units:
+        receipt_rows: list[SemanticRouteReceiptRow] = []
+        for draft, receipt in zip(build.units, receipts, strict=True):
             self._validate_draft_hashes(draft)
             try:
                 validate_optional_semantic_key_state(
                     draft.semantic_key,
                     list(draft.semantic_keys) if draft.semantic_keys is not None else None,
+                )
+                validate_optional_section_keys(
+                    list(draft.section_keys) if draft.section_keys is not None else None,
                 )
             except SemanticKeyInvariantError as exc:
                 raise BuildUnitsError(
@@ -373,6 +480,11 @@ class BuildUnits:
                     if draft.semantic_keys is not None
                     else None
                 ),
+                section_keys=(
+                    list(draft.section_keys)
+                    if draft.section_keys is not None
+                    else None
+                ),
                 payload=cast(dict[str, Any], dict(draft.payload)),
                 content_hash=draft.content_hash,
                 structure_hash=draft.structure_hash,
@@ -383,6 +495,13 @@ class BuildUnits:
                 artifact_locator=provider_unit_locator_to_payload(draft.locator),
             )
             units.append(unit)
+            receipt_rows.append(
+                SemanticRouteReceiptRow(
+                    asset_id=unit.asset_id,
+                    order_index=unit.order_index,
+                    receipt=receipt,
+                )
+            )
             row = {
                 "applicability": unit.applicability,
                 "page_no": unit.page_no,
@@ -397,12 +516,13 @@ class BuildUnits:
                 "quality_status": unit.quality_status,
                 "semantic_key": unit.semantic_key,
                 "semantic_keys": unit.semantic_keys,
+                "section_keys": unit.section_keys,
                 "title": unit.title,
             }
             if set(row) != SNAPSHOT_KEYS:
                 raise AssertionError("snapshot row key drift")
             rows.append(row)
-        return units, rows
+        return units, rows, tuple(receipt_rows)
 
     def _validate_draft_hashes(self, draft: ProviderUnitDraft) -> None:
         hashes = compute_unit_hashes(
@@ -413,6 +533,9 @@ class BuildUnits:
             semantic_key=draft.semantic_key,
             semantic_keys=(
                 list(draft.semantic_keys) if draft.semantic_keys is not None else None
+            ),
+            section_keys=(
+                list(draft.section_keys) if draft.section_keys is not None else None
             ),
             quality_status=draft.quality_status,
             order_index=draft.unit_index + 1,
@@ -477,6 +600,7 @@ class BuildUnits:
         run_id: str,
         units: list[e.DocumentUnit],
         snapshot_relpath: Path,
+        semantic_route_receipts_hash: str,
         content_aggregate: str,
         structure_aggregate: str,
     ) -> e.ProcessingRun:
@@ -499,6 +623,7 @@ class BuildUnits:
                 )
             uow.document_units.add_many(units)
             run.document_units_relpath = str(snapshot_relpath)
+            run.semantic_route_receipts_hash = semantic_route_receipts_hash
             run.content_hash_aggregate = content_aggregate
             run.structure_hash = structure_aggregate
             run.builder_rules_version = PROVIDER_UNIT_BUILDER_VERSION
@@ -539,13 +664,23 @@ class BuildUnits:
             uow.commit()
             return updated
 
-    @staticmethod
-    def _build_stats(build: ProviderUnitBuildResult) -> dict[str, Any]:
+    def _build_stats(self, build: ProviderUnitBuildResult) -> dict[str, Any]:
+        narrow_count = sum(unit.semantic_key is not None for unit in build.units)
+        section_count = sum(unit.section_keys is not None for unit in build.units)
+        identity = self._semantic_router.adjudicator.identity
         return {
             "contract_version": "provider_unit_build_stats.v1",
             "builder_rules_version": PROVIDER_UNIT_BUILDER_VERSION,
             "provider_document_sha256": build.provider_document_sha256,
             "unit_count": len(build.units),
+            "semantic_narrow_unit_count": narrow_count,
+            "semantic_fallback_unit_count": len(build.units) - narrow_count,
+            "section_routed_unit_count": section_count,
+            "semantic_route_taxonomy_version": self._semantic_router.taxonomy.version,
+            "semantic_route_router_version": SEMANTIC_ROUTER_VERSION,
+            "semantic_route_adjudicator_adapter": identity.adapter,
+            "semantic_route_adjudicator_model": identity.model,
+            "semantic_route_prompt_version": identity.prompt_version,
             "unassigned_table_part_count": len(build.unassigned_table_parts),
         }
 

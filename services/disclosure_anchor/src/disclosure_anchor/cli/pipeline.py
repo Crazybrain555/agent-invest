@@ -28,6 +28,7 @@ from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
     MinerUMediumDocumentParser,
 )
 from disclosure_anchor.adapters.parsers.mineru_medium.process import MinerUProcess
+from disclosure_anchor.adapters.semantics.runtime import build_semantic_runtime
 from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
 from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
@@ -498,6 +499,11 @@ class _Deps:
         )
 
     def build_units(self) -> BuildUnits:
+        semantic = build_semantic_runtime(
+            settings=self.settings,
+            paths=self.paths,
+            artifacts=self.artifacts,
+        )
         return BuildUnits(
             path_builder=self.paths,
             artifact_store=self.artifacts,
@@ -506,16 +512,25 @@ class _Deps:
                 path_builder=self.paths,
                 source=self.provider_source,
             ),
+            semantic_router=semantic.router,
+            semantic_receipts=semantic.receipts,
         )
 
     def publish(self) -> PublishRun:
+        semantic = build_semantic_runtime(
+            settings=self.settings,
+            paths=self.paths,
+            artifacts=self.artifacts,
+        )
         return PublishRun(
             uow_factory=self.uow_factory,
             publication_guard=ProviderDocumentPublicationGuard(
                 ProviderDocumentAdmission(
                     path_builder=self.paths,
                     source=self.provider_source,
-                )
+                ),
+                semantic_router=semantic.router,
+                semantic_receipts=semantic.receipts,
             ),
         )
 

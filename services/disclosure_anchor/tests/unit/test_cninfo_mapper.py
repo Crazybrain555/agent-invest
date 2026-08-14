@@ -27,7 +27,7 @@ class CninfoMapperTests(unittest.TestCase):
     def test_filing_type_rule_bundle_has_required_seed_rules(self) -> None:
         bundle = load_filing_type_rule_bundle()
 
-        self.assertEqual(bundle.version, "2026-07-r13")
+        self.assertEqual(bundle.version, "2026-08-r15")
         self.assertEqual(
             {rule.filing_type for rule in bundle.rules},
             {
@@ -37,6 +37,7 @@ class CninfoMapperTests(unittest.TestCase):
                 "quarterly_report",
                 "performance_forecast",
                 "performance_flash",
+                "correction_supplement",
                 "investor_relations",
                 "performance_briefing",
                 "inquiry_regulatory",
@@ -80,6 +81,11 @@ class CninfoMapperTests(unittest.TestCase):
         # r7 generalization audit: provider-code blind spots per class.
         self.assertIn("保费收入", by_class["operating_data"].keywords)
         self.assertIn("业绩快报", by_class["performance_flash"].keywords)
+        self.assertIn("业绩预亏", by_class["performance_forecast"].keywords)
+        self.assertIn(
+            "限制性股票激励计划",
+            by_class["equity_incentive"].keywords,
+        )
         self.assertIn("减值准备", by_class["risk_alert"].keywords)
         self.assertIn("问询函", by_class["inquiry_regulatory"].keywords)
         self.assertIn("重整", by_class["delisting_risk"].keywords)
@@ -233,6 +239,19 @@ class CninfoMapperTests(unittest.TestCase):
             "operating_data",
         )
 
+    def test_standard_event_titles_fill_scope_before_semantic_routing(self) -> None:
+        self.assertEqual(
+            derive_primary_class(None, "某公司2026年半年度业绩预亏公告"),
+            "performance_forecast",
+        )
+        self.assertEqual(
+            derive_primary_class(
+                None,
+                "某公司2024年限制性股票激励计划第二个归属期归属结果暨股份上市公告",
+            ),
+            "equity_incentive",
+        )
+
     def test_r7_topic_rules_fill_generalization_blind_spots(self) -> None:
         # 保费收入/偿付能力: insurers' operating data files under generic
         # codes only (01010501||010113||012399) — topic grants class AND
@@ -330,6 +349,22 @@ class CninfoMapperTests(unittest.TestCase):
         self.assertEqual(
             map_filing_type("第一季度报告", category_names_by_code={}),
             "quarterly_report",
+        )
+
+    def test_event_correction_maps_without_shadowing_periodic_correction(self) -> None:
+        self.assertEqual(
+            map_filing_type(
+                "关于股份增持结果的更正公告",
+                category_names_by_code={},
+            ),
+            "correction_supplement",
+        )
+        self.assertEqual(
+            map_filing_type(
+                "2025年年度报告更正公告",
+                category_names_by_code={},
+            ),
+            "annual_report",
         )
 
     def test_research_activity_category_maps_to_investor_relations(self) -> None:

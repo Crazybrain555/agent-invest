@@ -93,7 +93,7 @@
   },
   "tests/unit/test_build_units.py": {
    "private_imports": [],
-   "tests": 6
+   "tests": 8
   },
   "tests/unit/test_cninfo_client.py": {
    "private_imports": [],
@@ -101,7 +101,7 @@
   },
   "tests/unit/test_cninfo_mapper.py": {
    "private_imports": [],
-   "tests": 21
+   "tests": 23
   },
   "tests/unit/test_cninfo_source.py": {
    "private_imports": [
@@ -126,7 +126,7 @@
     "_check_unit_snapshot_aggregate",
     "_invalid_process_class_overrides"
    ],
-   "tests": 18
+   "tests": 22
   },
   "tests/unit/test_doctor_render.py": {
    "private_imports": [],
@@ -134,7 +134,7 @@
   },
   "tests/unit/test_document_outline.py": {
    "private_imports": [],
-   "tests": 30
+   "tests": 31
   },
   "tests/unit/test_download_document.py": {
    "private_imports": [],
@@ -147,6 +147,10 @@
   "tests/unit/test_filing_api_changes_errors.py": {
    "private_imports": [],
    "tests": 6
+  },
+  "tests/unit/test_filing_api_classification.py": {
+   "private_imports": [],
+   "tests": 2
   },
   "tests/unit/test_filing_api_documents.py": {
    "private_imports": [],
@@ -166,7 +170,7 @@
   },
   "tests/unit/test_gc_orphan_artifacts.py": {
    "private_imports": [],
-   "tests": 6
+   "tests": 7
   },
   "tests/unit/test_health.py": {
    "private_imports": [],
@@ -186,7 +190,7 @@
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 11
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],
@@ -242,7 +246,7 @@
    "private_imports": [
     "_validate_candidate_unit_set"
    ],
-   "tests": 22
+   "tests": 25
   },
   "tests/unit/test_raw_document_store.py": {
    "private_imports": [],
@@ -258,7 +262,7 @@
   },
   "tests/unit/test_retrieval_primary.py": {
    "private_imports": [],
-   "tests": 9
+   "tests": 10
   },
   "tests/unit/test_review_mineru_medium_outline.py": {
    "private_imports": [],
@@ -266,7 +270,19 @@
   },
   "tests/unit/test_search_projection.py": {
    "private_imports": [],
-   "tests": 12
+   "tests": 13
+  },
+  "tests/unit/test_semantic_codex_cli.py": {
+   "private_imports": [],
+   "tests": 11
+  },
+  "tests/unit/test_semantic_route_store.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_semantic_router.py": {
+   "private_imports": [],
+   "tests": 80
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],
@@ -286,7 +302,7 @@
   },
   "tests/unit/test_unit_hashing.py": {
    "private_imports": [],
-   "tests": 14
+   "tests": 15
   },
   "tests/unit/test_unmapped_code_audit.py": {
    "private_imports": [],
@@ -304,7 +320,7 @@
    "private_imports": [
     "_sync_window_start"
    ],
-   "tests": 56
+   "tests": 59
   }
  },
  "schema": "test-composition-ledger.v1"

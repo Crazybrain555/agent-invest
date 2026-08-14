@@ -23,6 +23,9 @@ from disclosure_anchor.application.contracts.provider_unit import (
 from disclosure_anchor.application.ports.file_store import (
     ArtifactWriteResult,
 )
+from disclosure_anchor.application.ports.semantic_routes import (
+    SemanticRouteAdjudicatorError,
+)
 from disclosure_anchor.application.services.provider_unit_builder import (
     build_provider_units,
 )
@@ -41,6 +44,10 @@ from disclosure_anchor.domain.errors import (
     BuildUnitsError,
 )
 from tests.unit._fakes import FakeUnitOfWork
+from tests.unit._semantic_routes import (
+    MemorySemanticReceiptStore,
+    PassthroughSemanticRouter,
+)
 from tests.unit.test_provider_unit_builder import (
     _admitted,
     _representative_document,
@@ -94,6 +101,15 @@ class _BadHashArtifactStore(ArtifactStore):
     ) -> ArtifactWriteResult:
         result = super().write_jsonl_atomic(relpath=relpath, rows=rows)
         return replace(result, artifact_hash="sha256:" + "0" * 64)
+
+
+class _FailingSemanticRouter(PassthroughSemanticRouter):
+    def __init__(self, error: SemanticRouteAdjudicatorError) -> None:
+        super().__init__()
+        self.error = error
+
+    def route(self, **_kwargs):  # type: ignore[no-untyped-def]
+        raise self.error
 
 
 def _uow(*, legacy: bool = False) -> FakeUnitOfWork:
@@ -156,6 +172,7 @@ def _use_case(
     *,
     admission: _Admission | None = None,
     artifact_store: ArtifactStore | None = None,
+    semantic_router: object | None = None,
 ) -> tuple[BuildUnits, _Admission]:
     paths = _Paths(root)
     source_admission = admission or _Admission()
@@ -165,12 +182,61 @@ def _use_case(
             artifact_store=artifact_store or ArtifactStore(paths),
             uow_factory=lambda: uow,
             admission=source_admission,  # type: ignore[arg-type]
+            semantic_router=(
+                semantic_router or PassthroughSemanticRouter()
+            ),  # type: ignore[arg-type]
+            semantic_receipts=MemorySemanticReceiptStore(),
         ),
         source_admission,
     )
 
 
 class BuildUnitsTests(unittest.TestCase):
+    def test_retryable_semantic_failure_is_shared_unavailability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            use_case, _ = _use_case(
+                Path(tmp),
+                _uow(),
+                semantic_router=_FailingSemanticRouter(
+                    SemanticRouteAdjudicatorError(
+                        "quota unavailable",
+                        reason_code="rate_limited",
+                        retryable=True,
+                    )
+                ),
+            )
+
+            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+        self.assertEqual(result.status, "failed")
+        assert result.error is not None
+        self.assertEqual(
+            result.error["error_code"],
+            "SEMANTIC_ROUTE_ADJUDICATION_UNAVAILABLE",
+        )
+        self.assertTrue(result.error["retryable"])
+
+    def test_repeated_invalid_semantic_decision_is_nonretryable_item_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            use_case, _ = _use_case(
+                Path(tmp),
+                _uow(),
+                semantic_router=_FailingSemanticRouter(
+                    SemanticRouteAdjudicatorError(
+                        "invalid twice",
+                        reason_code="invalid_decision",
+                        retryable=False,
+                    )
+                ),
+            )
+
+            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+        self.assertEqual(result.status, "failed")
+        assert result.error is not None
+        self.assertEqual(result.error["error_code"], "SEMANTIC_ROUTE_INVALID")
+        self.assertFalse(result.error["retryable"])
+
     def test_materializes_provider_units_snapshot_and_hash_aggregates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             uow = _uow()
@@ -183,6 +249,10 @@ class BuildUnitsTests(unittest.TestCase):
             run = uow.processing_runs.get("run_1")
             assert run is not None and run.document_units_relpath is not None
             self.assertEqual(run.builder_rules_version, PROVIDER_UNIT_BUILDER_VERSION)
+            self.assertEqual(
+                run.semantic_route_receipts_hash,
+                "sha256:" + "d" * 64,
+            )
             units = uow.document_units.list_by_processing_run("run_1")
             self.assertEqual(len(units), result.unit_count)
             self.assertEqual(
@@ -201,6 +271,16 @@ class BuildUnitsTests(unittest.TestCase):
                 "builder_rules_version",
                 "provider_document_sha256",
                 "unit_count",
+                "semantic_narrow_unit_count",
+                "semantic_fallback_unit_count",
+                "section_routed_unit_count",
+                "semantic_route_receipts_relpath",
+                "semantic_route_receipts_hash",
+                "semantic_route_taxonomy_version",
+                "semantic_route_router_version",
+                "semantic_route_adjudicator_adapter",
+                "semantic_route_adjudicator_model",
+                "semantic_route_prompt_version",
                 "unassigned_table_part_count",
             })
 
@@ -294,7 +374,7 @@ class BuildUnitsTests(unittest.TestCase):
                 "applicability", "page_no", "artifact_locator", "asset_id",
                 "content_hash", "document_id", "heading_path", "order_index",
                 "payload", "payload_kind", "quality_status", "semantic_key",
-                "semantic_keys",
+                "semantic_keys", "section_keys",
                 "title",
             },
         )

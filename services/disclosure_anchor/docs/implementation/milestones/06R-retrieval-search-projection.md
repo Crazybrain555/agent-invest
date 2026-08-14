@@ -11,8 +11,10 @@ decided_by: 用户 2026-07-17 三项确认（应用侧 jieba 预分词；pg_trgm
 # 06R 检索投影层（实施级规格）
 
 > 2026-08-13：0034 恢复 Unit 的完整 route set。当前 `key_tokens` 按顺序取
-> `semantic_keys` 全集；Provider writer 尚无可信分类器时两列均为 NULL、channel 为空。
-> 0033 的 duplicate-only 观测仍是历史事实，但不再被当作删除检索容量的依据。
+> `semantic_keys` 全集。当前 Provider writer 使用版本化闭集 taxonomy、Unit-local source
+> candidate 和受限 Luna chooser；唯一精确来源标题可以确定性落键，歧义候选只能从闭集选取
+> 或弃权。无充分证据时两列仍为 NULL，`document_content` 只作私有 receipt fallback 标记，
+> 不进入公开 route。0033 的 duplicate-only 观测仍是历史事实，但不再被当作删除检索容量的依据。
 
 **U7 边界（不变）**：投影是派生层——全部字段可由已持久化数据确定性再生；不进 content_hash /
 query_projection_hash；重建不产生 outbox 事件；不替代 payload、不作证据；L1 API 不新增

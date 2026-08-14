@@ -513,6 +513,7 @@ def _load_run_units(session: Session, processing_run_id: str) -> list[dict[str, 
             DocumentUnit.payload_kind,
             DocumentUnit.payload,
             DocumentUnit.semantic_keys,
+            DocumentUnit.section_keys,
             DocumentUnit.artifact_locator,
         )
         .where(DocumentUnit.processing_run_id == processing_run_id)
@@ -526,6 +527,7 @@ def _load_run_units(session: Session, processing_run_id: str) -> list[dict[str, 
             "payload_kind": row.payload_kind,
             "payload": row.payload,
             "semantic_keys": row.semantic_keys,
+            "section_keys": row.section_keys,
             "artifact_locator": row.artifact_locator,
         }
         for row in session.execute(stmt).all()
@@ -729,6 +731,7 @@ def compute_search_projection_row(
     semantic_keys: Sequence[str] | None,
     artifact_locator: Mapping[str, Any] | None,
     built_at: datetime,
+    section_keys: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Deterministic projection row for one unit (no ``search_tsv`` — generated)."""
 
@@ -760,7 +763,10 @@ def compute_search_projection_row(
         # Private handoff to the run-atomic child insert; not a parent column.
         "body_atoms": body_atoms,
         # Controlled semantic routes bypass natural-language segmentation.
-        "key_tokens": " ".join(semantic_keys or []),
+        # Direct Unit themes are a ranked search signal.  Structural section
+        # context remains separately filterable and must not compete at the
+        # same weight in the full-text key channel.
+        "key_tokens": " ".join(dict.fromkeys(semantic_keys or ())),
         # Retained until the DB compatibility column is retired. New
         # projections never infer a header role from cell text.
         "header_row_candidate": False,

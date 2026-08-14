@@ -24,6 +24,11 @@ from disclosure_anchor.api.schemas.public import (
     ClassificationResponse,
     ClassificationRuleSetV1,
     ProcessingClassV1,
+    SemanticRouteCatalogResponse,
+    SemanticRouteV1,
+)
+from disclosure_anchor.application.services.semantic_taxonomy import (
+    load_semantic_route_taxonomy,
 )
 from disclosure_anchor.settings import Settings
 
@@ -58,6 +63,28 @@ def get_classification(request: Request) -> ClassificationResponse:
         classes=classes,
         rule_sets=_rule_sets(request),
         note=note,
+    )
+
+
+def get_semantic_routes() -> SemanticRouteCatalogResponse:
+    """Expose the one vocabulary used by Unit route filters and section keys."""
+
+    taxonomy = load_semantic_route_taxonomy()
+    routes = [
+        SemanticRouteV1(
+            key=definition.key,
+            description=definition.description,
+            labels=list(definition.labels),
+            scopes=list(definition.scopes),
+            usable_as_section_key=definition.context_container,
+        )
+        for definition in taxonomy.definitions
+    ]
+    return SemanticRouteCatalogResponse(
+        contract_version="semantic_routes_catalog.v1",
+        taxonomy_version=taxonomy.version,
+        route_count=len(routes),
+        routes=routes,
     )
 
 

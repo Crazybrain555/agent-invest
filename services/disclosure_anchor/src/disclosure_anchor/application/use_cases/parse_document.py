@@ -44,9 +44,10 @@ from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import (
     ParseDocumentError,
-    ParserError,
+    ParserBackendUnavailableError,
     ParserBackendOverloadedError,
     ParserCancelledError,
+    ParserError,
     ParserInvocationError,
     ParserLocalInvocationError,
     ParserOutputContractError,
@@ -648,6 +649,8 @@ class ParseDocument:
             )
         if isinstance(exc, ParserBackendOverloadedError):
             return typed("parse", "parser_backend_overloaded", retryable=True)
+        if isinstance(exc, ParserBackendUnavailableError):
+            return typed("parse", "parser_backend_unavailable", retryable=True)
         if isinstance(exc, ParserCancelledError):
             return typed("parse", "parser_cancelled", retryable=True)
         if isinstance(exc, ParserTaskError):

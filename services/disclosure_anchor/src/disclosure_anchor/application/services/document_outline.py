@@ -899,6 +899,9 @@ def _resolve_headings(
 ) -> tuple[ResolvedHeading, ...]:
     resolved: list[ResolvedHeading] = []
     stack: list[ResolvedHeading] = []
+    candidate_by_heading_id = {
+        candidate.heading_id: candidate for candidate in candidates
+    }
     for candidate in candidates:
         if candidate.disposition != "accepted":
             continue
@@ -908,7 +911,35 @@ def _resolve_headings(
             raise ValueError("accepted heading has no placement")
         parent_eligible = placement_source not in {"provider", "flattened"}
         if parent_eligible:
+            # Dotted siblings such as 4.6/4.7 are structurally stronger than
+            # inferred style-only subheads between them.  Apply this only when
+            # an earlier dotted sibling of the same depth is still on the
+            # stack; other numbering families keep their existing front-matter
+            # and style-reset behavior.
+            has_dotted_sibling_ancestor = (
+                candidate.numbering_family == "点分阿拉伯序号"
+                and any(
+                    candidate_by_heading_id[item.heading_id].numbering_family
+                    == "点分阿拉伯序号"
+                    and item.nominal_rank == nominal_rank
+                    for item in stack
+                )
+            )
+            if has_dotted_sibling_ancestor:
+                while stack and stack[-1].placement_source in {
+                    "pdf_style",
+                    "provider_style",
+                }:
+                    stack.pop()
             while stack and stack[-1].nominal_rank >= nominal_rank:
+                if (
+                    placement_source in {"pdf_style", "provider_style"}
+                    and candidate_by_heading_id[
+                        stack[-1].heading_id
+                    ].numbering_family
+                    == "点分阿拉伯序号"
+                ):
+                    break
                 stack.pop()
         parent = stack[-1] if stack else None
         heading = ResolvedHeading(

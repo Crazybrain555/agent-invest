@@ -16,13 +16,13 @@ class MigrationStateTests(unittest.TestCase):
         heads = migration_heads()
         self.assertEqual(len(heads), 1)
         self.assertEqual(single_migration_head(), heads[0])
-        self.assertEqual(heads[0], "0034_unit_semantic_routes")
+        self.assertEqual(heads[0], "0036_unit_section_routes")
 
         migration = importlib.import_module(
             "disclosure_anchor.adapters.db.postgres.migrations.versions."
-            "0034_unit_semantic_routes"
+            "0036_unit_section_routes"
         )
-        self.assertEqual(migration.down_revision, "0033_unit_schema_convergence")
+        self.assertEqual(migration.down_revision, "0035_semantic_receipt_integrity")
 
     def test_0033_unit_view_keeps_only_unit_owned_scope_fields(self) -> None:
         migration = importlib.import_module(
@@ -89,6 +89,58 @@ class MigrationStateTests(unittest.TestCase):
             patch.object(migration.op, "execute") as execute,
             patch.object(migration.op, "drop_column") as drop_column,
             self.assertRaisesRegex(RuntimeError, "secondary Unit routes"),
+        ):
+            migration.downgrade()
+        execute.assert_not_called()
+        drop_column.assert_not_called()
+
+    def test_0035_refuses_to_discard_hash_bound_semantic_receipts(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0035_semantic_receipt_integrity"
+        )
+        connection = MagicMock()
+        connection.execute.return_value.scalar_one.return_value = 1
+        with (
+            patch.object(migration.op, "get_bind", return_value=connection),
+            patch.object(migration.op, "drop_constraint") as drop_constraint,
+            patch.object(migration.op, "drop_column") as drop_column,
+            self.assertRaisesRegex(RuntimeError, "bound receipts"),
+        ):
+            migration.downgrade()
+        drop_constraint.assert_not_called()
+        drop_column.assert_not_called()
+
+    def test_0036_separates_section_routes_from_unit_topics(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0036_unit_section_routes"
+        )
+
+        current = migration._document_units_view_sql(include_section_keys=True)
+        self.assertIn("u.semantic_keys", current)
+        self.assertIn("u.section_keys", current)
+        self.assertIn("class_content_categories AS content_categories", current)
+        self.assertNotIn("publisher_categories", current)
+        self.assertNotIn("class_market", current)
+
+        prior = migration._document_units_view_sql(include_section_keys=False)
+        self.assertIn("u.semantic_keys", prior)
+        self.assertNotIn("u.section_keys", prior)
+        self.assertIn("class_content_categories AS content_categories", prior)
+
+    def test_0036_refuses_to_discard_section_routes(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0036_unit_section_routes"
+        )
+        connection = MagicMock()
+        connection.execute.return_value.scalar_one.return_value = 1
+        with (
+            patch.object(migration.op, "get_bind", return_value=connection),
+            patch.object(migration.op, "execute") as execute,
+            patch.object(migration.op, "drop_column") as drop_column,
+            self.assertRaisesRegex(RuntimeError, "normalized section routes"),
         ):
             migration.downgrade()
         execute.assert_not_called()

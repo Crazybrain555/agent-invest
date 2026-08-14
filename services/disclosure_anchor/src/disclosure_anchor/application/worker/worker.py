@@ -46,6 +46,9 @@ from disclosure_anchor.application.ports.provider_document_source import (
 from disclosure_anchor.application.ports.provider_parser import (
     ProviderDocumentParserPort,
 )
+from disclosure_anchor.application.ports.semantic_routes import (
+    SemanticRouteReceiptStorePort,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.use_cases.build_search_projection import (
     BuildSearchProjection,
@@ -72,6 +75,7 @@ from disclosure_anchor.application.use_cases.publish_run import (
 from disclosure_anchor.application.services.provider_document_admission import (
     ProviderDocumentAdmission,
 )
+from disclosure_anchor.application.services.semantic_router import SemanticRouter
 from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     SyncDisclosureIndex,
     SyncDisclosureIndexCommand,
@@ -151,6 +155,8 @@ BUILD_INFRASTRUCTURE_ERROR_CODES = frozenset(
         "IR_READ_FAILED",
         "OSError",
         "OperationalError",
+        "SEMANTIC_ROUTE_ADJUDICATION_FAILED",
+        "SEMANTIC_ROUTE_ADJUDICATION_UNAVAILABLE",
     }
 )
 BUILD_ITEM_LOCAL_ERROR_CODES = frozenset(
@@ -162,6 +168,7 @@ BUILD_ITEM_LOCAL_ERROR_CODES = frozenset(
         "UNASSIGNED_TABLE_EVIDENCE",
         "RUN_NOT_FOUND",
         "RUN_NOT_SUCCEEDED",
+        "SEMANTIC_ROUTE_INVALID",
         "UNITS_ALREADY_BUILT",
     }
 )
@@ -231,6 +238,8 @@ class WorkerDeps:
     raw_store: RawDocumentStorePort
     artifact_store: ArtifactStorePort
     provider_source: ProviderDocumentSourcePort
+    semantic_router: SemanticRouter
+    semantic_receipts: SemanticRouteReceiptStorePort
     source_factory: Callable[[], DisclosureSourcePort]
     profile_loader_factory: Callable[
         [DisclosureSourcePort], Callable[[str], SourceCompanyProfile | None]
@@ -1089,14 +1098,28 @@ def _finalize_one_document(
                 path_builder=deps.path_builder,
                 source=deps.provider_source,
             ),
+            semantic_router=deps.semantic_router,
+            semantic_receipts=deps.semantic_receipts,
         ).execute(
             BuildUnitsCommand(processing_run_id=processing_run_id)
         )
         if build_result.status != "succeeded":
+            structured_error = build_result.error
             outcome.failure = WorkerFailure(
                 stage="build",
                 item_ref=document_id,
-                error_code=_error_code(build_result.error),
+                error_code=_error_code(structured_error),
+                retryable=(
+                    bool(structured_error.get("retryable"))
+                    if isinstance(structured_error, dict)
+                    and structured_error.get("retryable") is not None
+                    else None
+                ),
+                message=(
+                    str(structured_error.get("message", ""))[:500]
+                    if isinstance(structured_error, dict)
+                    else None
+                ),
             )
             return outcome
         outcome.built = True
@@ -1112,6 +1135,13 @@ def _finalize_one_document(
                 if isinstance(structured_error, dict)
                 else type(exc).__name__
             ),
+            retryable=(
+                bool(structured_error.get("retryable"))
+                if isinstance(structured_error, dict)
+                and structured_error.get("retryable") is not None
+                else None
+            ),
+            message=str(exc)[:500],
         )
         return outcome
 
@@ -1142,7 +1172,9 @@ def _publish_one_document(
                 ProviderDocumentAdmission(
                     path_builder=deps.path_builder,
                     source=deps.provider_source,
-                )
+                ),
+                semantic_router=deps.semantic_router,
+                semantic_receipts=deps.semantic_receipts,
             ),
         ).execute(
             PublishRunCommand(processing_run_id=processing_run_id)
@@ -2227,6 +2259,8 @@ def _build_stage(
             path_builder=deps.path_builder,
             source=deps.provider_source,
         ),
+        semantic_router=deps.semantic_router,
+        semantic_receipts=deps.semantic_receipts,
     )
     for row in pending:
         if should_stop():
@@ -2282,7 +2316,9 @@ def _publish_stage(
             ProviderDocumentAdmission(
                 path_builder=deps.path_builder,
                 source=deps.provider_source,
-            )
+            ),
+            semantic_router=deps.semantic_router,
+            semantic_receipts=deps.semantic_receipts,
         ),
     )
     for row in pending:

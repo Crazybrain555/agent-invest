@@ -1,6 +1,6 @@
 # Provider-native 检索投影与语义键
 
-状态：current（2026-08-12）。本文件只描述当前 writer；旧 NormalizedIR/unit-source-projection
+状态：current（2026-08-13）。本文件只描述当前 writer；旧 NormalizedIR/unit-source-projection
 实现从工作树删除，需要考古时查 Git。
 
 ## 1. 边界
@@ -24,12 +24,51 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 1. `title`：已接受的 source heading 叶标题；metadata document title 绝不复制到 Unit。
 2. `heading_path`：已接受 heading occurrence 的完整根到叶路径。
 3. body：只回放 `provider_unit_locator.v1.search_targets` 明确列出的 provider payload destination。
-4. `semantic_key` / `semantic_keys`：可选的真实受控 Unit 路由；scalar 是 primary，数组是
-   完整有序集合，所有项都进入 key channel，避免 mixed Unit 的 secondary route 漏召回。
-   当前 Provider writer 没有可信分类器，因而两者都写 NULL；不以 `document_content` 占位。
+4. `semantic_key` / `semantic_keys`：可选的真实受控 Unit **直接主题**；scalar 是稳定 lead，数组是
+   完整有序集合，所有项都进入 key channel，避免 mixed/长 Unit 的 secondary route 漏召回。
+   Provider writer 使用版本化闭集词表和 source-bound candidate gate：Document 的 filing type 和
+   authoritative disclosure topics 只负责开放对应 scope，不能独立成为 Unit route 证据；provider
+   content categories 只作 facet/模型上下文，绝不授权 scope。
+   Unit 自身标题标准化后唯一精确命中可确定性落键；严格两列表单字段与有结构证据的表头也可
+   形成 Unit-local direct route；标题包含式/字符相似命中只生成候选；其余候选才可能由低成本模型
+   逐候选返回闭合布尔裁决。模型不能造 key、决定 Unit 边界，或只凭文档标题、
+   父标题、类别传播 route。无充分证据时两列仍写 NULL；不以 `document_content` 占位。
+5. `section_keys`：定期报告的确定性结构位置。只从已接受 `heading_path` 根到叶精确匹配 taxonomy
+   中显式 `context_container` 的 key；无 contains/similarity、无模型、无 Document facet 传播，
+   heading-only/空 Unit 不继承。它与 direct topic 分列、分过滤器；只有 direct topic 进入全文
+   key token channel，section route 由显式数组过滤参与 L2/L3 查询联合。
 
-Query hash 只额外绑定真正独立的 secondary routes；singleton 数组不重复 primary scalar 的
-哈希身份。检索投影则在存在 routes 时索引完整数组，规则版本为
+不存在通用的 `other_information` / “其他信息” direct route。源标题确实是“其他信息”“其他事项”时，
+原文标题仍由 `title` / `heading_path` 保真；该 Unit 内若有回购账户、风险提示等具体事实，只落对应的
+具体 route。没有可确认具体主题时 direct route 保持 NULL，绝不为了填满字段而发明“其他”占位键。
+
+当前身份是 taxonomy `semantic-taxonomy-2026-08-r34`、router `semantic_router.v53`、prompt
+`semantic_route_adjudication.v31`，当前候选 adjudicator 为 `codex_cli.v4.low` / `gpt-5.6-luna`；
+候选与 direct route 都最多 8 个。model/effort 与 cache/receipt identity 绑定。定期报告正文/表格也
+可以生成 Unit-local 直接主题候选；章节上下文另走 section_keys，不参与 shortlist。截断时，Unit
+自身标题/正文/表格直接证据先于
+纯字符相似或文档上下文召回，避免弱相似候选挤掉表单字段。候选若只出现在解释另一个主题的
+原因、背景、影响或条件从句中，不成为独立 route；必须另行披露其自身余额、金额、比率、结果或
+安排。唯一精确的定期报告标题仍直接成为唯一 route。事件公告
+允许独立表单字段或正文直接事实产生 secondary；仅靠低阈值标题相似度、没有其他直接证据的
+候选在任何 Unit 中都不得成为 secondary；真实 overview Unit 也必须有标题包含、正文或表格的
+直接证据才能保留 secondary。taxonomy 只标识一跳的 overview container，不构建父子图、不传播父键：具体子标题
+Unit 无论模型只选 overview，还是同时选 overview 与 direct route，程序都会在 receipt 冻结前去掉
+overview；“重要内容提示”、
+“主要内容”、概要/概况/报告书等真实 overview Unit 仍允许 container 与独立字段 route 同列。
+Build 将候选定义、source IDs、裁决来源及模型/cache 身份冻结到
+私有 receipt sidecar；Publish 重新 admission/Build 并只重放 receipt，绝不再次调用模型。词表、候选
+定义、source 或上下文变化都会改变输入哈希，旧缓存/receipt 必须 fail closed。sidecar 原始字节的
+SHA-256 由 private ProcessingRun 持有；每日 GC 仅在 snapshot owner 与该 hash 同时存在时保护固定
+receipt sibling，失败/WIP 的无主 sidecar 仍可回收。
+
+事件文类与 route scope 分层：年度/半年度/季度报告更正仍保持原报告文类；其他标题明确含
+“更正公告/补充更正”的事件件才归 `correction_supplement`。`更正如下`/`更正为`、业绩预告中的
+`净利润为…` 等格式信号只增加同 scope candidate 及 source witness，绝不绕过 Luna 直接落键。
+回购“完成/结果”和未来“注销安排”是两个不同 route，避免用计划性文字污染完成结果检索。
+
+Query hash 绑定真正独立的 secondary routes 与 section routes；singleton semantic 数组不重复
+primary scalar 的哈希身份。检索投影索引 semantic/section 两个数组去重后的并集，规则版本为
 `rp-2026.08-provider-unit-v3`。
 
 不得递归扫描 payload、按字段名猜正文、按相同字符串去重、把 metadata title 注入每个 Unit，
@@ -49,8 +88,12 @@ occurrence 仍是两个 atom；跨 target/part 不拼成一个 substring atom。
 
 ## 4. 表格与视觉内容
 
-表格 body 保存 MinerU owner 的原始 `table_body` HTML。检索时仅投影其可见文本片段；raw HTML
-始终留在 Unit payload。L1 不解析 grid、不恢复 cell continuation、不猜 header row。
+表格 body 保存 MinerU owner 的原始 `table_body` HTML。检索时投影其可见文本片段；raw HTML
+始终留在 Unit payload。L1 不重建 grid、不恢复 cell continuation，也不按词面猜表头。为避免
+MinerU 3.4.4 的 `td`-only HTML 丢失监管表单语义，只接受两类机械闭合 role：严格两列多行
+`label/value` 表的左列字段，以及矩形首行表头（或一个跨全列标题后的矩形第二行表头）。嵌套、
+畸形、span 不闭合或可见文本不守恒时全部退化为普通 `table_text`；单行 `td` 表不做隐式
+表头推断，只有 provider 已显式给出的 `th` / `thead` 语义原样保留；普通数据格永不升级。
 
 MinerU merge-on 的跨页表只发布一个逻辑 owner body；continuation stub 没有搜索目标。每个物理页
 segment/crop 仍以 page/bbox/hash-bound evidence 留在 locator/ProviderDocument。相邻相似表不会因
@@ -78,6 +121,9 @@ source/provider 结构证据，不能恢复数值/词面启发式。
 供 SQL/L2 做 facet 过滤；它不复制进 Unit 表，也不重复加入每个 Unit 的全文 key tokens。
 `publisher_categories` 与 `market` 保持 Document-only。
 
+`GET /v1/semantic-routes` 直接从同一 taxonomy 公开 key、中文 labels、scopes、版本与
+`usable_as_section_key`，避免 L2 复制 L1 私有 JSON；它不创建第二套 registry。
+
 ## 6. 版本与验证
 
 任何 tokenizer、Unicode normalization、binding/HTML transform 或 atom/window 行为变化都必须升
@@ -88,8 +134,14 @@ source/provider 结构证据，不能恢复数值/词面启发式。
 - table HTML visible text、caption/footnote 与跨页 stub owner 守恒；
 - visual-only Unit 为零 body atom但 content hash 随 artifact digest 变化；
 - malformed/unknown/cross-part locator fail closed；
+- 标准定期/临时公告标题确定性命中；已知 scope 拒绝外族 key；低重叠词面不制造候选；
+- 模型只能选择当前 Unit 的 candidate IDs 或 abstain，receipt/source/taxonomy 漂移 fail closed；
 - active historical v4 run 不进入新投影候选；
 - parent/window/atom 的 run-atomic replacement、orphan prune 与 PostgreSQL safety probe。
+
+805-Unit 的完整 source-identity 数据质量结果见
+[`semantic-route-pilot-20260813.md`](../checks/semantic-route-pilot-20260813.md)。覆盖率只作诊断；
+unsupported narrow key 是 stop，而有证据缺口的 NULL 是允许的保守结果。
 
 公开 `document_unit`、search projection view 与 source/evidence 引用仍保持现有 v1 列面；新旧 Unit
 通过 locator contract 区分，绝不按文件存在性、parser 版本或字符串形状猜代际。

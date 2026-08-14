@@ -1,0 +1,1477 @@
+{
+  "version": "semantic-events-2026-08-r25",
+  "_about": "Unit 事件与通用章节的闭集路由词表。labels/description 只用于精确标题命中、候选缩小和模型闭集解释；不授权短语出现即判定、文档类别直接传播或父节继承。",
+  "fallback_key": "document_content",
+  "quantitative_fact_keys": [
+    "performance_forecast_range",
+    "operating_metrics",
+    "production_volume",
+    "sales_volume",
+    "price_changes",
+    "issue_price",
+    "issue_size",
+    "share_buyback_price_volume",
+    "contract_value",
+    "cumulative_external_guarantees",
+    "cumulative_related_party_transactions"
+  ],
+  "exclusive_container_keys": [
+    "performance_flash_data"
+  ],
+  "overview_container_keys": [
+    "convertible_bond_overview",
+    "correction_overview",
+    "fundraising_overview",
+    "guarantee_overview",
+    "incentive_plan_overview",
+    "investor_relations_overview",
+    "major_contract_overview",
+    "performance_forecast_summary",
+    "performance_briefing_overview",
+    "related_party_overview",
+    "restructuring_transaction_overview",
+    "share_buyback_plan"
+  ],
+  "entries": [
+    {
+      "key": "definitions",
+      "description": "公告或报告的释义与定义",
+      "labels": [
+        "释义",
+        "定义"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "table_of_contents",
+      "description": "公告或报告目录",
+      "labels": [
+        "目录"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "reference_documents",
+      "description": "备查文件与查阅文件",
+      "labels": [
+        "备查文件",
+        "备查文件目录"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "performance_forecast_summary",
+      "description": "业绩预告的结论、盈亏方向或预计变化",
+      "labels": [
+        "业绩预告",
+        "业绩预告情况",
+        "预计盈利",
+        "预计亏损",
+        "业绩预盈",
+        "业绩预亏"
+      ],
+      "scopes": [
+        "performance_forecast"
+      ]
+    },
+    {
+      "key": "performance_forecast_range",
+      "description": "业绩预告中的利润、收入或同比变动区间",
+      "labels": [
+        "预计业绩区间",
+        "预计净利润区间",
+        "预计变动幅度",
+        "净利润为"
+      ],
+      "scopes": [
+        "performance_forecast"
+      ]
+    },
+    {
+      "key": "performance_forecast_basis",
+      "description": "业绩预告的测算依据与主要原因",
+      "labels": [
+        "业绩变动原因",
+        "业绩预告原因",
+        "预计业绩的主要原因",
+        "本期业绩变动的主要原因",
+        "业绩变动的主要原因"
+      ],
+      "scopes": [
+        "performance_forecast"
+      ]
+    },
+    {
+      "key": "performance_forecast_risk",
+      "description": "业绩预告的不确定性、审计差异或风险提示",
+      "labels": [
+        "业绩预告风险",
+        "不确定性说明",
+        "与会计师沟通情况"
+      ],
+      "scopes": [
+        "performance_forecast"
+      ]
+    },
+    {
+      "key": "performance_forecast_comparison",
+      "description": "业绩预告所列上年同期经营业绩和财务状况",
+      "labels": [
+        "上年同期经营业绩和财务状况",
+        "上年同期业绩"
+      ],
+      "scopes": [
+        "performance_forecast"
+      ]
+    },
+    {
+      "key": "performance_flash_summary",
+      "description": "业绩快报的总体结论",
+      "labels": [
+        "业绩快报",
+        "经营业绩和财务状况情况说明",
+        "经营业绩和财务状况说明"
+      ],
+      "scopes": [
+        "performance_flash"
+      ]
+    },
+    {
+      "key": "performance_flash_data",
+      "description": "业绩快报披露的主要财务数据和指标",
+      "labels": [
+        "主要财务数据和指标",
+        "业绩快报数据"
+      ],
+      "scopes": [
+        "performance_flash"
+      ]
+    },
+    {
+      "key": "performance_flash_variance",
+      "description": "业绩快报中财务指标增减变动及原因",
+      "labels": [
+        "增减变动幅度达30%以上项目的主要原因",
+        "业绩变动原因"
+      ],
+      "scopes": [
+        "performance_flash"
+      ]
+    },
+    {
+      "key": "performance_flash_correction",
+      "description": "业绩快报修正或与定期报告差异",
+      "labels": [
+        "业绩快报修正",
+        "业绩快报差异"
+      ],
+      "scopes": [
+        "performance_flash"
+      ]
+    },
+    {
+      "key": "operating_metrics",
+      "description": "月度或季度经营数据的核心指标",
+      "labels": [
+        "经营数据",
+        "经营指标",
+        "业务指标",
+        "其他重要业务指标",
+        "经营简报",
+        "销售简报"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report",
+        "quarterly_report",
+        "operating_data"
+      ]
+    },
+    {
+      "key": "production_volume",
+      "description": "产量、产能或生产进度",
+      "labels": [
+        "产量",
+        "生产量",
+        "产能"
+      ],
+      "scopes": [
+        "operating_data"
+      ]
+    },
+    {
+      "key": "sales_volume",
+      "description": "销量、销售收入或销售结构",
+      "labels": [
+        "销量",
+        "销售量",
+        "销售收入"
+      ],
+      "scopes": [
+        "operating_data"
+      ]
+    },
+    {
+      "key": "price_changes",
+      "description": "产品、原料或服务价格变动",
+      "labels": [
+        "销售价格",
+        "产品价格",
+        "价格变动"
+      ],
+      "scopes": [
+        "operating_data"
+      ]
+    },
+    {
+      "key": "operating_data_explanation",
+      "description": "经营数据变化原因与口径说明",
+      "labels": [
+        "经营数据说明",
+        "经营数据变动原因",
+        "数据口径说明"
+      ],
+      "scopes": [
+        "operating_data"
+      ]
+    },
+    {
+      "key": "investor_relations_overview",
+      "description": "投资者关系或调研活动的基本情况",
+      "labels": [
+        "投资者关系活动",
+        "调研活动",
+        "活动基本情况"
+      ],
+      "scopes": [
+        "investor_relations",
+        "performance_briefing"
+      ]
+    },
+    {
+      "key": "investor_questions_answers",
+      "description": "投资者提出的问题及答复",
+      "labels": [
+        "问答交流",
+        "问题及回复",
+        "投资者问答",
+        "交流内容",
+        "交流内容及具体问答记录",
+        "具体问答记录",
+        "问题一：",
+        "提问内容",
+        "回复内容"
+      ],
+      "scopes": [
+        "investor_relations",
+        "performance_briefing"
+      ]
+    },
+    {
+      "key": "management_responses",
+      "description": "管理层对经营、战略或风险问题的回应",
+      "labels": [
+        "管理层回复",
+        "公司回复",
+        "公司回答"
+      ],
+      "scopes": [
+        "investor_relations",
+        "performance_briefing"
+      ]
+    },
+    {
+      "key": "participant_information",
+      "description": "调研、说明会或接待活动参与人员",
+      "labels": [
+        "参与单位及人员",
+        "参会人员",
+        "接待人员"
+      ],
+      "scopes": [
+        "investor_relations",
+        "performance_briefing"
+      ]
+    },
+    {
+      "key": "performance_briefing_overview",
+      "description": "业绩说明会安排、召开与整体说明",
+      "labels": [
+        "业绩说明会",
+        "业绩说明会召开情况"
+      ],
+      "scopes": [
+        "investor_relations",
+        "performance_briefing"
+      ]
+    },
+    {
+      "key": "operating_outlook",
+      "description": "管理层对未来经营、战略或行业的展望",
+      "labels": [
+        "经营展望",
+        "未来展望",
+        "发展展望"
+      ],
+      "scopes": [
+        "investor_relations",
+        "performance_briefing"
+      ]
+    },
+    {
+      "key": "inquiry_question",
+      "description": "监管问询、关注或反馈的具体问题",
+      "labels": [
+        "问询问题",
+        "关注问题",
+        "反馈问题"
+      ],
+      "scopes": [
+        "inquiry_regulatory"
+      ]
+    },
+    {
+      "key": "inquiry_response",
+      "description": "公司对监管问询或反馈的逐项回复",
+      "labels": [
+        "问询回复",
+        "审核问询函回复",
+        "回复意见",
+        "问题回复"
+      ],
+      "scopes": [
+        "inquiry_regulatory"
+      ]
+    },
+    {
+      "key": "regulator_concern",
+      "description": "监管机构关注的合规、财务或交易事项",
+      "labels": [
+        "监管关注事项",
+        "重点关注事项"
+      ],
+      "scopes": [
+        "inquiry_regulatory"
+      ]
+    },
+    {
+      "key": "verification_opinion",
+      "description": "会计师、律师、保荐人或财务顾问的核查结论",
+      "labels": [
+        "核查意见",
+        "专项核查意见",
+        "中介机构核查意见"
+      ],
+      "scopes": [
+        "inquiry_regulatory"
+      ]
+    },
+    {
+      "key": "restructuring_transaction_overview",
+      "description": "资产重组或重大交易的方案与概况",
+      "labels": [
+        "交易概述",
+        "重组方案",
+        "交易方案"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
+      "key": "transaction_scheme_adjustment",
+      "description": "资产重组或重大交易方案的调整及重大调整认定",
+      "labels": [
+        "本次交易方案调整情况",
+        "本次交易方案调整构成交易方案重大调整",
+        "交易方案调整前后对比情况",
+        "交易方案重大调整"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
+      "key": "target_asset",
+      "description": "交易标的、标的资产或标的公司情况",
+      "labels": [
+        "交易标的",
+        "标的资产",
+        "标的公司"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
+      "key": "valuation_pricing",
+      "description": "估值方法、评估结果、定价依据与公允性",
+      "labels": [
+        "评估与定价",
+        "估值与定价",
+        "定价依据"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
+      "key": "consideration_payment",
+      "description": "交易对价及现金、股份等支付安排",
+      "labels": [
+        "交易对价",
+        "支付方式",
+        "对价支付"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
+      "key": "transaction_risk",
+      "description": "交易实施、审批、整合与估值风险",
+      "labels": [
+        "交易风险",
+        "重大风险提示",
+        "与本次交易相关的风险",
+        "本次交易方案重大调整的风险"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
+      "key": "performance_commitment",
+      "description": "业绩承诺、补偿安排及履约情况",
+      "labels": [
+        "业绩承诺",
+        "补偿安排",
+        "业绩补偿"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
+      "key": "supporting_financing",
+      "description": "资产重组募集配套资金的具体方案",
+      "labels": [
+        "募集配套资金具体方案",
+        "发行股份募集配套资金具体方案",
+        "募集配套资金情况的简要介绍",
+        "募集配套资金概况"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
+      "key": "regulatory_approval",
+      "description": "交易、发行或事项所需审批及进展",
+      "labels": [
+        "审批程序",
+        "批准情况",
+        "尚需履行的程序"
+      ],
+      "scopes": [
+        "restructuring_assets",
+        "additional_issuance",
+        "rights_issue",
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "issuance_plan",
+      "description": "股票、配股或其他证券发行方案",
+      "labels": [
+        "发行方案",
+        "发行预案",
+        "配股方案"
+      ],
+      "scopes": [
+        "additional_issuance",
+        "rights_issue",
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "issue_price",
+      "description": "发行、配售或转股价格及定价原则",
+      "labels": [
+        "发行价格",
+        "配股价格",
+        "定价基准日"
+      ],
+      "scopes": [
+        "additional_issuance",
+        "rights_issue",
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "issue_size",
+      "description": "发行数量、募集规模或配售比例",
+      "labels": [
+        "发行数量",
+        "发行规模",
+        "配售比例",
+        "配股基数、比例和数量"
+      ],
+      "scopes": [
+        "additional_issuance",
+        "rights_issue",
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "use_of_proceeds",
+      "description": "募集资金用途与投向",
+      "labels": [
+        "募集资金用途",
+        "募集资金使用",
+        "募集资金投资项目",
+        "归属募集资金的使用计划",
+        "配股募集资金的规模和用途"
+      ],
+      "scopes": [
+        "additional_issuance",
+        "rights_issue",
+        "convertible_bond",
+        "equity_incentive"
+      ]
+    },
+    {
+      "key": "dilution_impact",
+      "description": "发行、转股或股本变动的摊薄与稀释影响",
+      "labels": [
+        "摊薄即期回报",
+        "稀释影响",
+        "股本摊薄",
+        "归属后对公司财务指标的影响"
+      ],
+      "scopes": [
+        "additional_issuance",
+        "rights_issue",
+        "convertible_bond",
+        "equity_share_change",
+        "equity_incentive"
+      ]
+    },
+    {
+      "key": "convertible_bond_overview",
+      "description": "可转换公司债券的基本情况",
+      "labels": [
+        "可转换公司债券概况",
+        "可转换公司债券基本概况",
+        "可转债基本情况",
+        "债券基本情况"
+      ],
+      "scopes": [
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "conversion_terms",
+      "description": "转股期、转股价格及转股安排",
+      "labels": [
+        "转股安排",
+        "转股价格",
+        "转股期"
+      ],
+      "scopes": [
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "redemption_terms",
+      "description": "可转债赎回条件、价格及实施安排",
+      "labels": [
+        "赎回条款",
+        "赎回安排",
+        "提前赎回"
+      ],
+      "scopes": [
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "resale_terms",
+      "description": "可转债回售条件、价格及实施安排",
+      "labels": [
+        "回售条款",
+        "回售安排"
+      ],
+      "scopes": [
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "interest_terms",
+      "description": "债券计息、付息、票面利率与兑付安排",
+      "labels": [
+        "年利息计算",
+        "付息方案",
+        "付息安排",
+        "票面利率",
+        "本息兑付"
+      ],
+      "scopes": [
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "bond_interest_dates",
+      "description": "可转债付息债权登记日、除息日与兑息日",
+      "labels": [
+        "本次付息债权登记日和付息日",
+        "付息债权登记日和付息日",
+        "债权登记日、除息日和付息日",
+        "债权登记日和付息日",
+        "债权登记日",
+        "除息日",
+        "付息日"
+      ],
+      "scopes": [
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "bond_interest_holders",
+      "description": "可转债本次付息对象",
+      "labels": [
+        "本次付息对象",
+        "付息对象"
+      ],
+      "scopes": [
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "bond_interest_method",
+      "description": "可转债本次付息实施办法",
+      "labels": [
+        "本次付息办法",
+        "付息办法",
+        "付息方式",
+        "债券付息方法"
+      ],
+      "scopes": [
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "bond_interest_tax",
+      "description": "可转债利息所得税代扣代缴安排",
+      "labels": [
+        "关于债券利息所得税的说明",
+        "关于本次付息对象缴纳公司债券利息所得税的说明",
+        "债券利息所得税的说明",
+        "利息所得税",
+        "债券利息所得税的征收",
+        "利息所得税的征收"
+      ],
+      "scopes": [
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "bond_risk",
+      "description": "可转债信用、转股、赎回、回售或交易风险",
+      "labels": [
+        "可转债风险",
+        "债券风险提示"
+      ],
+      "scopes": [
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "share_buyback_plan",
+      "description": "股份回购目的、方案与主要安排",
+      "labels": [
+        "回购方案",
+        "回购报告书",
+        "回购股份方案"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "share_buyback_progress",
+      "description": "股份回购实施进展",
+      "labels": [
+        "回购进展",
+        "回购股份进展"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "share_buyback_purpose",
+      "description": "股份回购的目的与拟解决事项",
+      "labels": [
+        "回购股份的目的",
+        "股份回购目的",
+        "回购股份用途",
+        "回购用途"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "share_buyback_share_type",
+      "description": "拟回购股份的类别或种类",
+      "labels": [
+        "拟回购股份的种类",
+        "回购股份的种类"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "share_buyback_method",
+      "description": "股份回购采用的交易方式",
+      "labels": [
+        "回购股份的方式",
+        "股份回购方式",
+        "回购股份方式",
+        "回购方式"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "share_buyback_term",
+      "description": "股份回购的实施期限",
+      "labels": [
+        "回购股份的实施期限",
+        "股份回购期限",
+        "回购股份期限",
+        "回购方案实施期限",
+        "回购期限"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "share_buyback_creditor_protection",
+      "description": "股份回购或注销中的债权人保护安排",
+      "labels": [
+        "公司防范侵害债权人利益的相关安排",
+        "债权人利益保护安排"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "share_buyback_authorization",
+      "description": "股东会对办理股份回购事项的授权",
+      "labels": [
+        "股东会对董事会办理本次回购股份事宜的具体授权",
+        "办理回购股份事宜的授权"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "share_buyback_account",
+      "description": "股份回购专用账户的开立与用途",
+      "labels": [
+        "股份回购专用账户",
+        "回购专用证券账户",
+        "回购专用账户",
+        "回购证券账户名称",
+        "证券账户号码"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "share_buyback_completion",
+      "description": "股份回购完成、期限届满或结果",
+      "labels": [
+        "回购结果",
+        "回购完成"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "share_buyback_cancellation_arrangement",
+      "description": "回购股份后拟注销股份及办理注销的安排",
+      "labels": [
+        "回购股份后依法注销的相关安排",
+        "回购股份注销安排"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "share_buyback_funding",
+      "description": "回购资金来源与资金安排",
+      "labels": [
+        "回购资金来源",
+        "资金来源",
+        "回购股份的资金来源",
+        "回购股份资金来源"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "share_buyback_price_volume",
+      "description": "回购价格、数量、比例和金额",
+      "labels": [
+        "回购价格",
+        "回购数量",
+        "回购股份金额",
+        "预计回购金额",
+        "回购股份的价格和数量",
+        "回购股份的价格",
+        "拟回购股份的用途、数量、占公司总股本的比例、资金总额"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "share_buyback_risk",
+      "description": "股份回购无法实施、价格波动或审批风险",
+      "labels": [
+        "回购风险",
+        "回购方案风险提示",
+        "回购方案的不确定性风险",
+        "相关风险提示"
+      ],
+      "scopes": [
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "major_contract_overview",
+      "description": "重大合同或协议的基本情况",
+      "labels": [
+        "重大合同概述",
+        "合同概述",
+        "协议概述",
+        "签署重大合同的公告"
+      ],
+      "scopes": [
+        "major_contract"
+      ]
+    },
+    {
+      "key": "contract_counterparty",
+      "description": "合同交易对方及履约能力",
+      "labels": [
+        "合同对方",
+        "交易对方",
+        "对方基本情况"
+      ],
+      "scopes": [
+        "major_contract"
+      ]
+    },
+    {
+      "key": "contract_value",
+      "description": "合同金额、计价方式及收入规模",
+      "labels": [
+        "合同金额",
+        "协议金额",
+        "交易金额"
+      ],
+      "scopes": [
+        "major_contract"
+      ]
+    },
+    {
+      "key": "contract_performance",
+      "description": "合同履行期限、进度与关键义务",
+      "labels": [
+        "合同履行",
+        "履约安排",
+        "合同进展"
+      ],
+      "scopes": [
+        "major_contract"
+      ]
+    },
+    {
+      "key": "financial_impact",
+      "description": "事项对收入、利润、现金流或资产负债的影响",
+      "labels": [
+        "对公司的影响",
+        "财务影响",
+        "对经营业绩的影响"
+      ],
+      "scopes": [
+        "major_contract",
+        "correction_supplement"
+      ]
+    },
+    {
+      "key": "contract_risk",
+      "description": "合同执行、收款、交付或违约风险",
+      "labels": [
+        "合同风险",
+        "履约风险"
+      ],
+      "scopes": [
+        "major_contract"
+      ]
+    },
+    {
+      "key": "risk_warning",
+      "description": "公告集中披露的风险提示与不确定性",
+      "labels": [
+        "风险提示",
+        "特别风险提示",
+        "其他说明及风险提示"
+      ],
+      "scopes": [
+        "risk_alert",
+        "delisting_risk",
+        "performance_forecast"
+      ]
+    },
+    {
+      "key": "operating_risk",
+      "description": "生产经营、供应链、客户或行业风险",
+      "labels": [
+        "经营风险",
+        "生产经营风险"
+      ],
+      "scopes": [
+        "risk_alert",
+        "delisting_risk"
+      ]
+    },
+    {
+      "key": "financial_risk",
+      "description": "流动性、偿债、亏损、减值或资金风险",
+      "labels": [
+        "财务风险",
+        "偿债风险",
+        "流动性风险"
+      ],
+      "scopes": [
+        "risk_alert",
+        "delisting_risk"
+      ]
+    },
+    {
+      "key": "legal_regulatory_risk",
+      "description": "诉讼、处罚、合规或政策监管风险",
+      "labels": [
+        "法律风险",
+        "合规风险",
+        "监管风险"
+      ],
+      "scopes": [
+        "risk_alert",
+        "delisting_risk",
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "delisting_risk",
+      "description": "终止上市、退市指标触及与风险警示",
+      "labels": [
+        "退市风险",
+        "终止上市风险",
+        "退市风险警示",
+        "交易类强制退市",
+        "重大违法强制退市",
+        "可能被终止上市的原因",
+        "终止上市风险提示公告的披露情况"
+      ],
+      "scopes": [
+        "risk_alert",
+        "delisting_risk"
+      ]
+    },
+    {
+      "key": "delisting_progress",
+      "description": "退市相关程序、整改或审议进展",
+      "labels": [
+        "退市进展",
+        "整改进展",
+        "终止上市程序"
+      ],
+      "scopes": [
+        "risk_alert",
+        "delisting_risk"
+      ]
+    },
+    {
+      "key": "resumption_conditions",
+      "description": "撤销风险警示、恢复上市或整改条件",
+      "labels": [
+        "撤销风险警示条件",
+        "恢复上市条件",
+        "整改要求"
+      ],
+      "scopes": [
+        "risk_alert",
+        "delisting_risk"
+      ]
+    },
+    {
+      "key": "incentive_plan_overview",
+      "description": "股权激励或员工持股计划的目的与总体方案",
+      "labels": [
+        "激励计划概述",
+        "限制性股票激励计划",
+        "限制性股票激励计划实施情况概要",
+        "员工持股计划"
+      ],
+      "scopes": [
+        "equity_incentive"
+      ]
+    },
+    {
+      "key": "incentive_recipients",
+      "description": "激励对象范围、名单和分配",
+      "labels": [
+        "激励对象",
+        "激励对象名单"
+      ],
+      "scopes": [
+        "equity_incentive"
+      ]
+    },
+    {
+      "key": "incentive_grant",
+      "description": "授予日、授予数量、授予价格与登记上市",
+      "labels": [
+        "授予安排",
+        "授予日期",
+        "授予结果",
+        "首次授予限制性股票情况",
+        "首次授予限制性股票的情况",
+        "预留限制性股票授予情况"
+      ],
+      "scopes": [
+        "equity_incentive"
+      ]
+    },
+    {
+      "key": "incentive_vesting_exercise",
+      "description": "归属、行权、解除限售及上市流通安排",
+      "labels": [
+        "归属安排",
+        "行权安排",
+        "解除限售",
+        "归属结果",
+        "归属的具体情况",
+        "限制性股票归属的具体情况",
+        "验资及股份登记情况"
+      ],
+      "scopes": [
+        "equity_incentive"
+      ]
+    },
+    {
+      "key": "incentive_performance_assessment",
+      "description": "公司与个人层面的业绩考核条件",
+      "labels": [
+        "业绩考核",
+        "绩效考核",
+        "考核指标"
+      ],
+      "scopes": [
+        "equity_incentive"
+      ]
+    },
+    {
+      "key": "incentive_condition_satisfaction",
+      "description": "行权、归属或解除限售条件的成就情况",
+      "labels": [
+        "条件成就",
+        "满足归属条件",
+        "符合行权条件",
+        "激励对象符合归属条件的说明"
+      ],
+      "scopes": [
+        "equity_incentive"
+      ]
+    },
+    {
+      "key": "incentive_adjustment",
+      "description": "激励数量、价格、对象或安排调整",
+      "labels": [
+        "激励计划调整",
+        "授予价格调整",
+        "授予数量调整",
+        "限制性股票数量及授予价格的历次变动情况"
+      ],
+      "scopes": [
+        "equity_incentive"
+      ]
+    },
+    {
+      "key": "incentive_cancellation",
+      "description": "激励权益作废、注销、终止或回购注销",
+      "labels": [
+        "作废失效",
+        "作废",
+        "作废部分",
+        "回购注销",
+        "激励计划终止"
+      ],
+      "scopes": [
+        "equity_incentive"
+      ]
+    },
+    {
+      "key": "share_capital_change",
+      "description": "股份总数、股本结构或股份类别变动",
+      "labels": [
+        "股本变动",
+        "股份变动",
+        "股本结构变动",
+        "归属后新增股份对公司的影响",
+        "回购注销后公司股权结构的变动情况"
+      ],
+      "scopes": [
+        "equity_share_change",
+        "equity_incentive",
+        "share_buyback"
+      ]
+    },
+    {
+      "key": "restricted_shares",
+      "description": "限售股份、限售条件和限售股东",
+      "labels": [
+        "限售股份",
+        "有限售条件股份",
+        "限售股"
+      ],
+      "scopes": [
+        "equity_share_change"
+      ]
+    },
+    {
+      "key": "unlock_schedule",
+      "description": "解除限售、上市流通与解禁时间安排",
+      "labels": [
+        "解除限售安排",
+        "上市流通安排",
+        "解禁安排",
+        "限制性股票归属股票的上市流通安排"
+      ],
+      "scopes": [
+        "equity_share_change",
+        "equity_incentive"
+      ]
+    },
+    {
+      "key": "shareholder_change",
+      "description": "股东增持、减持、持股比例或权益变动",
+      "labels": [
+        "股东持股变动",
+        "增持结果",
+        "减持结果",
+        "权益变动"
+      ],
+      "scopes": [
+        "equity_share_change"
+      ]
+    },
+    {
+      "key": "correction_overview",
+      "description": "公告、报告或数据更正的总体说明",
+      "labels": [
+        "更正公告",
+        "补充更正",
+        "更正说明",
+        "更正如下"
+      ],
+      "scopes": [
+        "correction_supplement"
+      ]
+    },
+    {
+      "key": "correction_item",
+      "description": "被更正的章节、事项或披露内容",
+      "labels": [
+        "更正事项",
+        "更正内容",
+        "原公告",
+        "更正前"
+      ],
+      "scopes": [
+        "correction_supplement"
+      ]
+    },
+    {
+      "key": "corrected_data",
+      "description": "更正后的文本、数据或表格",
+      "labels": [
+        "更正后",
+        "更正为",
+        "修订后数据",
+        "更正数据"
+      ],
+      "scopes": [
+        "correction_supplement"
+      ]
+    },
+    {
+      "key": "correction_impact",
+      "description": "更正对财务报表、经营结果或其他披露的影响",
+      "labels": [
+        "更正影响",
+        "对财务报表的影响",
+        "对公司的影响"
+      ],
+      "scopes": [
+        "correction_supplement"
+      ]
+    },
+    {
+      "key": "correction_reason",
+      "description": "错误产生原因及内部控制说明",
+      "labels": [
+        "更正原因",
+        "差错原因",
+        "错误原因"
+      ],
+      "scopes": [
+        "correction_supplement"
+      ]
+    },
+    {
+      "key": "fundraising_overview",
+      "description": "募集资金到位、规模与基本情况",
+      "labels": [
+        "募集资金基本情况",
+        "募集资金概况"
+      ],
+      "scopes": [
+        "additional_issuance",
+        "rights_issue",
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "fundraising_custody",
+      "description": "募集资金专户存放与监管协议",
+      "labels": [
+        "募集资金存放",
+        "募集资金专户",
+        "监管协议"
+      ],
+      "scopes": [
+        "additional_issuance",
+        "rights_issue",
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "fundraising_repurposing",
+      "description": "募集资金用途或募投项目变更",
+      "labels": [
+        "变更募集资金",
+        "改变募集资金用途"
+      ],
+      "scopes": [
+        "additional_issuance",
+        "rights_issue",
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "fundraising_replacement",
+      "description": "募集资金置换预先投入或自筹资金",
+      "labels": [
+        "募集资金置换",
+        "置换预先投入"
+      ],
+      "scopes": [
+        "additional_issuance",
+        "rights_issue",
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "fundraising_project_status",
+      "description": "募投项目实施、延期、结项及节余",
+      "labels": [
+        "募投项目进展",
+        "募投项目结项",
+        "节余募集资金"
+      ],
+      "scopes": [
+        "additional_issuance",
+        "rights_issue",
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "guarantee_overview",
+      "description": "对外担保或反担保事项概述",
+      "labels": [
+        "担保事项概述",
+        "担保情况概述"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "guarantee_progress",
+      "description": "担保额度、实施与履约进展",
+      "labels": [
+        "担保进展",
+        "担保实施情况"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "guaranteed_party_profile",
+      "description": "被担保方基本情况与信用状况",
+      "labels": [
+        "被担保人基本情况",
+        "被担保方基本情况"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "guarantee_agreement_terms",
+      "description": "担保合同、期限、范围与主要条款",
+      "labels": [
+        "担保协议",
+        "担保合同主要内容"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "cumulative_external_guarantees",
+      "description": "累计对外担保余额、比例与逾期情况",
+      "labels": [
+        "累计对外担保",
+        "担保余额"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "related_party_overview",
+      "description": "关联交易事项和关联关系概述",
+      "labels": [
+        "关联交易概述",
+        "关联交易事项"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "related_party_profile",
+      "description": "关联方或关联人的基本情况",
+      "labels": [
+        "关联方基本情况",
+        "关联人基本情况"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "transaction_pricing_basis",
+      "description": "交易定价政策、依据和公允性",
+      "labels": [
+        "定价政策及定价依据",
+        "交易定价依据"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "transaction_agreement_terms",
+      "description": "交易协议主要内容与履约安排",
+      "labels": [
+        "交易协议的主要内容",
+        "关联交易协议"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "cumulative_related_party_transactions",
+      "description": "累计关联交易金额和执行情况",
+      "labels": [
+        "累计关联交易",
+        "累计已发生的关联交易"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "decision_procedures",
+      "description": "董事会、股东大会或其他决策审批程序",
+      "labels": [
+        "决策程序",
+        "审议程序",
+        "回购方案的审议及实施程序"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "intermediary_opinion",
+      "description": "独立财务顾问、律师、会计师或保荐人的专业意见",
+      "labels": [
+        "中介机构意见",
+        "法律意见",
+        "独立财务顾问意见"
+      ],
+      "scopes": []
+    },
+    {
+      "key": "board_meetings_held",
+      "description": "报告期内董事会会议召开、审议与披露情况",
+      "labels": [
+        "报告期内召开的董事会会议",
+        "董事会召开情况",
+        "董事会会议召开情况",
+        "董事会会议情况"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "supervisory_board_meetings_held",
+      "description": "报告期内监事会会议召开、审议与披露情况",
+      "labels": [
+        "报告期内召开的监事会会议",
+        "监事会会议召开情况",
+        "监事会会议情况"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "audit_firm_engagement",
+      "description": "会计师事务所聘任、改聘、报酬与服务情况",
+      "labels": [
+        "聘任会计师事务所情况",
+        "聘请的会计师事务所和律师事务所",
+        "会计师事务所聘任情况",
+        "改聘会计师事务所情况",
+        "会计师事务所报酬情况"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    }
+  ]
+}

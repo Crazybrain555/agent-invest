@@ -21,12 +21,13 @@ from disclosure_anchor.application.contracts.retrieval_primary import (
 )
 from disclosure_anchor.domain.value_objects.semantic_key import (
     SemanticKeyInvariantError,
+    validate_optional_section_keys,
     validate_optional_semantic_key_state,
 )
 
 
 PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v1"
-PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v3"
+PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v4"
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -196,6 +197,7 @@ class ProviderUnitDraft:
     payload: dict[str, object]
     title: str | None
     heading_path: tuple[str, ...]
+    section_keys: tuple[str, ...] | None
     semantic_key: str | None
     semantic_keys: tuple[str, ...] | None
     quality_status: str
@@ -218,6 +220,9 @@ class ProviderUnitDraft:
         if len(self.heading_path) != len(self.locator.heading_chain):
             raise ValueError("provider unit heading chain differs from its path")
         try:
+            validate_optional_section_keys(
+                list(self.section_keys) if self.section_keys is not None else None,
+            )
             validate_optional_semantic_key_state(
                 self.semantic_key,
                 list(self.semantic_keys) if self.semantic_keys is not None else None,

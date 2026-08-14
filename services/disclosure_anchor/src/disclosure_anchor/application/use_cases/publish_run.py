@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from disclosure_anchor.application.contracts.provider_document_admission import (
@@ -16,13 +17,25 @@ from disclosure_anchor.application.contracts.provider_unit import (
     ProviderUnitDraft,
     provider_unit_locator_to_payload,
 )
+from disclosure_anchor.application.contracts.semantic_routes import (
+    SEMANTIC_ROUTE_RECEIPTS_FILENAME,
+    SemanticRouteContractError,
+)
 from disclosure_anchor.application.services.provider_document_admission import (
     ProviderDocumentAdmission,
 )
 from disclosure_anchor.application.services.provider_unit_builder import (
     build_provider_units,
 )
+from disclosure_anchor.application.services.semantic_router import (
+    SemanticRouter,
+    semantic_document_context,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.ports.semantic_routes import (
+    SemanticRouteReceiptStoreError,
+    SemanticRouteReceiptStorePort,
+)
 from disclosure_anchor.application.worker.locks import maybe_lock_document
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.entities import outbox_events
@@ -36,6 +49,7 @@ from disclosure_anchor.domain.services.unit_hashing import (
 )
 from disclosure_anchor.domain.value_objects.semantic_key import (
     SemanticKeyInvariantError,
+    validate_optional_section_keys,
     validate_optional_semantic_key_state,
 )
 
@@ -89,8 +103,16 @@ TERMINAL_PUBLICATION_ERROR_CODES = frozenset(
 class ProviderDocumentPublicationGuard:
     """Re-admit source bytes and replay every persisted provider Unit."""
 
-    def __init__(self, admission: ProviderDocumentAdmission) -> None:
+    def __init__(
+        self,
+        admission: ProviderDocumentAdmission,
+        *,
+        semantic_router: SemanticRouter,
+        semantic_receipts: SemanticRouteReceiptStorePort,
+    ) -> None:
         self._admission = admission
+        self._semantic_router = semantic_router
+        self._semantic_receipts = semantic_receipts
 
     def __call__(
         self,
@@ -127,8 +149,68 @@ class ProviderDocumentPublicationGuard:
                     message=str(exc),
                 )
             ) from exc
+        if run.builder_rules_version != PROVIDER_UNIT_BUILDER_VERSION:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="PROVIDER_UNIT_PROJECTION_INVALID",
+                    reason_code="builder_rules_version_mismatch",
+                    message="candidate run was not built by the current provider rules",
+                )
+            )
+        if (
+            run.document_units_relpath is None
+            or run.semantic_route_receipts_hash is None
+        ):
+            raise PublishRunError(
+                _structured_error(
+                    error_code="PROVIDER_UNIT_PROJECTION_INVALID",
+                    reason_code="semantic_receipt_path_missing",
+                    message="candidate run has no hash-bound semantic receipt sidecar",
+                )
+            )
         try:
-            build = build_provider_units(admitted)
+            base_build = build_provider_units(admitted)
+            receipt_rows = self._semantic_receipts.read(
+                relpath=(
+                    Path(run.document_units_relpath).parent
+                    / SEMANTIC_ROUTE_RECEIPTS_FILENAME
+                ),
+                expected_hash=run.semantic_route_receipts_hash,
+            )
+            ordered = sorted(units, key=lambda item: item.order_index)
+            if len(receipt_rows) != len(ordered):
+                raise SemanticRouteContractError(
+                    "semantic receipt count differs from persisted Units"
+                )
+            for row, unit in zip(receipt_rows, ordered, strict=True):
+                if row.order_index != unit.order_index or row.asset_id != unit.asset_id:
+                    raise SemanticRouteContractError(
+                        "semantic receipt row differs from persisted Unit identity"
+                    )
+            routed = self._semantic_router.replay(
+                admitted=admitted,
+                document=semantic_document_context(document),
+                drafts=base_build.units,
+                receipts=tuple(row.receipt for row in receipt_rows),
+            )
+            build = replace(base_build, units=routed.units)
+        except SemanticRouteContractError as exc:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="PROVIDER_UNIT_PROJECTION_INVALID",
+                    reason_code="semantic_receipt_invalid",
+                    message=str(exc),
+                )
+            ) from exc
+        except SemanticRouteReceiptStoreError as exc:
+            raise PublishRunError(
+                _structured_error(
+                    error_code="PROVIDER_UNIT_PROJECTION_UNAVAILABLE",
+                    reason_code="semantic_receipt_unavailable",
+                    retryable=exc.retryable,
+                    message=str(exc),
+                )
+            ) from exc
         except (TypeError, ValueError) as exc:
             raise PublishRunError(
                 _structured_error(
@@ -142,14 +224,6 @@ class ProviderDocumentPublicationGuard:
                     error_code="PROVIDER_UNIT_PROJECTION_INVALID",
                     reason_code="unassigned_table_evidence",
                     message="provider table evidence has no source-bound Unit owner",
-                )
-            )
-        if run.builder_rules_version != PROVIDER_UNIT_BUILDER_VERSION:
-            raise PublishRunError(
-                _structured_error(
-                    error_code="PROVIDER_UNIT_PROJECTION_INVALID",
-                    reason_code="builder_rules_version_mismatch",
-                    message="candidate run was not built by the current provider rules",
                 )
             )
         ordered = sorted(units, key=lambda item: item.order_index)
@@ -189,6 +263,9 @@ class ProviderDocumentPublicationGuard:
             "semantic_key": draft.semantic_key,
             "semantic_keys": (
                 list(draft.semantic_keys) if draft.semantic_keys is not None else None
+            ),
+            "section_keys": (
+                list(draft.section_keys) if draft.section_keys is not None else None
             ),
             "quality_status": draft.quality_status,
             "applicability": None,
@@ -325,6 +402,7 @@ class PublishRun:
                 if (
                     exc.error.get("error_code")
                     in TERMINAL_PUBLICATION_ERROR_CODES
+                    and exc.error.get("retryable") is not True
                 ):
                     # Historical built runs may predate current IR/unit
                     # invariants. Quarantine deterministic poison once while
@@ -560,6 +638,7 @@ def _unit_query_projection(unit: e.DocumentUnit) -> dict[str, Any]:
         heading_path=unit.heading_path,
         semantic_key=unit.semantic_key,
         semantic_keys=unit.semantic_keys,
+        section_keys=unit.section_keys,
         quality_status=unit.quality_status,
         applicability=unit.applicability,
         payload=unit.payload,
@@ -610,6 +689,7 @@ def _canonical_unit_hashes(unit: e.DocumentUnit) -> UnitHashes:
         heading_path=unit.heading_path,
         semantic_key=unit.semantic_key,
         semantic_keys=unit.semantic_keys,
+        section_keys=unit.section_keys,
         quality_status=unit.quality_status,
         order_index=unit.order_index,
         applicability=unit.applicability,
@@ -629,6 +709,7 @@ def _validate_candidate_run(
                 unit.semantic_key,
                 unit.semantic_keys,
             )
+            validate_optional_section_keys(unit.section_keys)
         except SemanticKeyInvariantError as exc:
             raise PublishRunError(
                 _structured_error(

@@ -15,6 +15,7 @@ from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
 from disclosure_anchor.adapters.parsers.mineru_medium.process import MinerUProcess
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.domain.errors import (
+    ParserBackendUnavailableError,
     ParserBackendOverloadedError,
     ParserCancelledError,
     ParserLocalInvocationError,
@@ -143,6 +144,11 @@ class MinerUProcessTests(unittest.TestCase):
                     '{"task_id":"task-3","status":"failed",'
                     '"error":"HTTP 429 Too Many Requests"}',
                     ParserBackendOverloadedError,
+                ),
+                (
+                    '{"task_id":"task-4","status":"failed",'
+                    '"error":"Unexpected status code: [500]"}',
+                    ParserBackendUnavailableError,
                 ),
                 (
                     "Local mineru-api exited before becoming healthy.",

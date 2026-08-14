@@ -113,6 +113,10 @@ class ParserBackendOverloadedError(ParserInvocationError):
     """Raised only for an explicit remote capacity rejection."""
 
 
+class ParserBackendUnavailableError(ParserInvocationError):
+    """Raised when the remote inference service fails a request with 5xx."""
+
+
 class ParserVersionProbeError(ParserError):
     """Raised when parser version probing fails."""
 

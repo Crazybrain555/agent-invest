@@ -276,6 +276,20 @@
       ],
       "title": "Report Period"
     },
+    "section_keys": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Section Keys"
+    },
     "security_code": {
       "anyOf": [
         {
@@ -377,6 +391,7 @@
     "order_index",
     "semantic_key",
     "semantic_keys",
+    "section_keys",
     "payload",
     "content_hash",
     "structure_hash",

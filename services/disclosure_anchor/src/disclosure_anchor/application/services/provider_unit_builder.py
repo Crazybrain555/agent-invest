@@ -317,6 +317,7 @@ class _BuildContext:
             payload=payload,
             title=None if heading is None else heading.text,
             heading_path=heading_path,
+            section_keys=None,
             semantic_key=None,
             semantic_keys=None,
             quality_status=quality_status,
@@ -494,6 +495,30 @@ def replay_provider_unit_search_binding(
         title=draft.title,
         binding=binding,
     )
+
+
+def replay_provider_unit_search_binding_source_text(
+    admitted: AdmittedProviderDocument,
+    draft: ProviderUnitDraft,
+    binding: ProviderUnitSearchBinding,
+) -> str:
+    """Replay the immutable scalar before its retrieval transform."""
+
+    if draft.locator.provider_document_sha256 != admitted.provider_document_sha256:
+        raise ValueError("provider Unit locator belongs to a different document")
+    if binding not in draft.locator.search_targets:
+        raise ValueError("search binding does not belong to the provider Unit")
+    _validate_binding_owner(locator=draft.locator, binding=binding)
+    source_text = _source_payload_text(admitted.provider_document, binding.source)
+    destination_text = _destination_text(
+        payload=draft.payload,
+        payload_kind=draft.payload_kind,
+        title=draft.title,
+        destination=binding.destination,
+    )
+    if destination_text != source_text:
+        raise ValueError("provider Unit search destination differs from its source")
+    return source_text
 
 
 def provider_unit_search_text_values(
@@ -820,4 +845,5 @@ __all__ = [
     "build_provider_units",
     "provider_unit_search_text_values",
     "replay_provider_unit_search_binding",
+    "replay_provider_unit_search_binding_source_text",
 ]

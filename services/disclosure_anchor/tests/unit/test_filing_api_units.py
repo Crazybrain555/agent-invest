@@ -83,6 +83,7 @@ def _unit_row(
         "order_index": order_index,
         "semantic_key": "risk",
         "semantic_keys": ["risk", "governance"],
+        "section_keys": ["important_matters", "risk_section"],
         "payload": {"b": 2, "a": "披露"},
         "content_hash": "sha256:" + "b" * 64,
         "structure_hash": "sha256:" + "c" * 64,
@@ -415,6 +416,8 @@ class FilingApiUnitTests(unittest.TestCase):
             semantic_key="risk",
             semantic_keys_any="risk, revenue ,risk",
             semantic_keys_all="risk,governance",
+            section_keys_any="important_matters,risk_section",
+            section_keys_all="important_matters",
         )
 
         sql = engine.statements[1]
@@ -424,8 +427,17 @@ class FilingApiUnitTests(unittest.TestCase):
         )
         self.assertIn("u.semantic_keys ?| CAST(:semantic_keys_any AS text[])", sql)
         self.assertIn("u.semantic_keys ?& CAST(:semantic_keys_all AS text[])", sql)
+        self.assertIn("u.section_keys ?| CAST(:section_keys_any AS text[])", sql)
+        self.assertIn("u.section_keys ?& CAST(:section_keys_all AS text[])", sql)
         self.assertEqual(engine.params[1]["semantic_keys_any"], ["risk", "revenue"])
         self.assertEqual(engine.params[1]["semantic_keys_all"], ["risk", "governance"])
+        self.assertEqual(
+            engine.params[1]["section_keys_any"],
+            ["important_matters", "risk_section"],
+        )
+        self.assertEqual(
+            engine.params[1]["section_keys_all"], ["important_matters"]
+        )
 
     def test_semantic_key_list_validation_is_bounded_and_rejects_empty_items(
         self,

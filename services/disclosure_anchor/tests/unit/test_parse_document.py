@@ -27,6 +27,7 @@ from disclosure_anchor.application.use_cases.parse_document import (
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.errors import (
     ParseDocumentError,
+    ParserBackendUnavailableError,
     ParserOutputContractError,
     ParserTimeoutError,
 )
@@ -322,10 +323,23 @@ class ParseDocumentTests(unittest.TestCase):
 
     def test_parser_and_artifact_failures_are_classified(self) -> None:
         cases = (
-            (_Parser(error=ParserTimeoutError("timeout")), _ArtifactStore(), "parse_timeout", True),
-            (_Parser(), _ArtifactStore(fail=True), "OSError", True),
+            (
+                _Parser(error=ParserTimeoutError("timeout")),
+                _ArtifactStore(),
+                "parse_timeout",
+                True,
+                "infrastructure",
+            ),
+            (
+                _Parser(error=ParserBackendUnavailableError("remote 500")),
+                _ArtifactStore(),
+                "parser_backend_unavailable",
+                True,
+                "infrastructure",
+            ),
+            (_Parser(), _ArtifactStore(fail=True), "OSError", True, "infrastructure"),
         )
-        for parser, store, code, retryable in cases:
+        for parser, store, code, retryable, budget_class in cases:
             with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp:
                 uow = _uow()
                 result = ParseDocument(
@@ -341,6 +355,7 @@ class ParseDocumentTests(unittest.TestCase):
             self.assertEqual(result.status, "failed")
             self.assertEqual(result.error["error_code"], code)
             self.assertEqual(result.error["retryable"], retryable)
+            self.assertEqual(result.error["retry_budget_class"], budget_class)
 
     def test_invalid_writer_profile_fails_before_parser_consumes_pdf(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

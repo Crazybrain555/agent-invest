@@ -396,6 +396,12 @@ class ProcessingRun(Base):
             "run_kind IN ('parse', 'rebuild_units'))",
             name="ck_processing_run_primary_output_exactly_one",
         ),
+        CheckConstraint(
+            "semantic_route_receipts_hash IS NULL OR "
+            "(semantic_route_receipts_hash ~ '^sha256:[0-9a-f]{64}$' AND "
+            "document_units_relpath IS NOT NULL)",
+            name="ck_processing_run_semantic_receipt_hash",
+        ),
         Index("ix_processing_run_document", "document_id"),
         Index(
             "ix_processing_run_artifact_owner",
@@ -447,6 +453,9 @@ class ProcessingRun(Base):
         nullable=True,
     )
     document_units_relpath: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    semantic_route_receipts_hash: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
     content_hash_aggregate: Mapped[Optional[str]] = mapped_column(
         String(128), nullable=True
     )
@@ -516,6 +525,18 @@ class DocumentUnit(Base):
             postgresql_using="gin",
             postgresql_where=text("semantic_keys IS NOT NULL"),
         ),
+        CheckConstraint(
+            "section_keys IS NULL OR ("
+            "jsonb_typeof(section_keys) = 'array' "
+            "AND jsonb_array_length(section_keys) > 0)",
+            name="ck_document_unit_section_keys",
+        ),
+        Index(
+            "ix_document_unit_section_keys",
+            "section_keys",
+            postgresql_using="gin",
+            postgresql_where=text("section_keys IS NOT NULL"),
+        ),
         Index(
             "ix_document_unit_run_order",
             "document_id",
@@ -554,6 +575,10 @@ class DocumentUnit(Base):
     # as SQL NULL.  JSON ``null`` would fail the scalar/array pairing CHECK
     # while looking deceptively null through JSON-oriented clients.
     semantic_keys: Mapped[Optional[list[str]]] = mapped_column(
+        JSONB(none_as_null=True),
+        nullable=True,
+    )
+    section_keys: Mapped[Optional[list[str]]] = mapped_column(
         JSONB(none_as_null=True),
         nullable=True,
     )

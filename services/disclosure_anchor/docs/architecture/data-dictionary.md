@@ -90,9 +90,10 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | payload_kind | 闭集 text / table / qa（历史只读）/ **mixed**。新 writer：单一正文块提升为 text，单一逻辑表 owner 提升为 table；多块或视觉块使用 mixed。parts 只存浅内容字段；精确 provider type 留在 ProviderDocument，粗粒度 owner/evidence kind 只留 locator |
 | heading_path | jsonb 完整**源标题路径**（有 heading 时非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text；路径来自 typed heading/outline 结构，不来自 caption 或 taxonomy |
 | title | 只取已接受 source heading 的叶节点，并与 heading_path 末项相等；无可靠 heading 时为 NULL。登记文档标题只留 document scope；caption、单位、脚注不得填入 title |
-| semantic_key / semantic_keys | 可选的受控 Unit 级路由：scalar 是 primary，JSONB 数组是完整有序路由集且首项必须等于 scalar；mixed Unit 可保留多个真实路由，GIN 支持 any/all recall。Provider writer 当前没有可信分类器，因而两者都写 NULL，不以 `document_content` 冒充语义 |
+| semantic_key / semantic_keys | 可选的受控 Unit **直接主题**路由：scalar 是稳定 canonical lead，JSONB 数组是完整有序主题集且首项等于 scalar；mixed/长 Unit 可保留多个独立事实主题，GIN 支持 any/all recall。唯一精确 Unit 标题可确定性落键，其余标题/正文/表格只生成至多 8 个 source-bound 候选；低成本模型必须逐候选返回闭合布尔裁决，不能造 key、决定边界或把原因/背景/影响误作主题。Document filing type + authoritative disclosure topics 只开放 scope；provider content categories 只作 facet/context。证据不足时两列为 NULL，不以 `document_content` 冒充语义；Build 冻结 receipt，Publish 只重放不调模型 |
+| section_keys | 可选的受控**结构位置**路由，与直接主题分离。只在定期报告中，从已接受 heading_path 的根到叶精确匹配显式 `context_container`；无 contains/similarity、无模型、无 Document 类别传播，空/heading-only Unit 不继承。完整链可让 L2 按“管理层讨论/财务报告/重要事项”等章节批量召回，又不与 Unit 直接主题竞争。JSONB 非空数组、GIN、API any/all；变化进入 query_projection_hash |
 | payload | ProviderDocument 的 source-bound 浅投影：顶层 text 只保存 `{text}`；顶层 table 保存原始 `table_body` HTML 与 caption/footnote 数组；mixed 只保存有序浅内容 fields，不重复 `provider_type`/kind/semantic_type。精确 source type 与粗 owner kind 分别在 ProviderDocument/locator。视觉 part 的 `content_artifacts` 仅含 hash/size/media，使视觉内容进入 content hash；路径、raw JSON、表格 crop 不进入 payload。L1 不解析 grid、不修复 cell、不用 middle HTML 覆盖 content-list owner |
-| content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；content 绑定 payload（含视觉内容 digest），query 绑定 title/heading/primary key/真实 secondary routes/quality/applicability，structure 绑定 kind/path/order。singleton `semantic_keys=[semantic_key]` 不重复改变 query hash；locator/page/provider identity 不混入哈希，发布前由 fresh ProviderDocument admission + deterministic rebuild 精确复核 |
+| content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；content 绑定 payload（含视觉内容 digest），query 绑定 title/heading/直接主题 routes/section routes/quality/applicability，structure 绑定 kind/path/order。singleton `semantic_keys=[semantic_key]` 不重复改变 query hash；locator/page/provider identity 不混入哈希，发布前由 fresh ProviderDocument admission + deterministic rebuild 精确复核 |
 | quality_status | ok / needs_review / unusable（乱码率>30%） |
 | applicability | vc16 CHECK：applicable / not_applicable / NULL（√适用声明列化；见 §5 讨论） |
 | page_no | 定位列（artifact_locator 首页码） |
@@ -115,10 +116,10 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 ## 3. disclosure_public 视图（唯一读契约）
 
-- **document_units_v1（39 列）**：core 列 + 派生（is_active_run、heading_path_text 面包屑、
+- **document_units_v1（40 列）**：core 列 + 派生（is_active_run、heading_path_text 面包屑、
   现算 filing_type/disclosure_topics、
   contract_version、company_ref/security_ref、security_code/exchange、filing_type、
-  disclosure_topics、content_categories、report_period、announcement_date、source_ref、parent_ref、asset_kind、
+  disclosure_topics、semantic_keys、section_keys、content_categories、report_period、announcement_date、source_ref、parent_ref、asset_kind、
   observed_at、source_tier、trace_level、raw_file_hash）。列集权威=contract-checklist §2。
 - documents_v1 / processing_runs_v1 / source_refs_v1 / change_events_v1 / document_categories_v1。
 - **tracked_companies_v1（0019+0020，round22）**：股票池读契约——真源是 tracked_company 表
@@ -155,7 +156,7 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 | application/contracts/normalized_ir_v4_evidence.py | 冻结历史 v4 evidence manifest 的最小只读 resolver；不得被新 writer import，也不支持 Build/Publish/Rebuild | normalized_ir.v4 read-only |
 | adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs；r6 financing +011711 担保/011713 财务资助、meeting_resolution +01239910；r7 equity_share_change +0115 父级实码） | 2026-07-r7 |
 | adapters/sources/cninfo/facet_map.json | F006V 维度判定（market 精确码/publisher 0101） | 2026-07-r1 |
-| adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（intermediary carrier 词最前，briefing/inquiry 在定期报告前）+ 65 个 title_topic 词补码盲区 + 18 个 title_noise hard pattern。r12 金融复核将 41 个事实 pattern 与 26 个待可靠去重 pattern 移出绝对门（例行但含股本、稀释、债务、现金、募投或风险新事实的公告不再按标题硬杀）；r13 恢复 6 条自我标识副本/序次重复项（英文版/（英文）/H股季报年报/ST 退市链第 N 次提示），此类标题自带副本标识，无需主件 linkage 键 | 2026-07-r13 |
+| adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（intermediary carrier 词最前，briefing/inquiry 在定期报告前）+ 65 个 title_topic 词补码盲区 + 18 个 title_noise hard pattern。r12 金融复核将 41 个事实 pattern 与 26 个待可靠去重 pattern 移出绝对门；r13 恢复 6 条自我标识副本/序次重复项；r14 补齐业绩预告与股权激励的标准公告标题；r15 在定期报告优先级之后补齐事件更正公告，使 Document filing scope 能约束 Unit semantic candidates且不把年度报告更正降成事件件 | 2026-08-r15 |
 | **config/processing_policy.json** | process 20 类=下载+解析；r4 将 equity_share_change 纳入以覆盖当前股数、流通/限售与未来解禁，register_only 11 类=只登记；carrier 类共码不放行，除非其自身在生效集合；按公司覆盖=watchlist process_classes | 2026-07-r4 |
 | config/watchlist.csv | 股票池唯一真源 + 按公司级联覆盖 | git 即版本 |
 
@@ -174,7 +175,9 @@ text+CHECK（int 码是无 CHECK 时代的习惯），存储差异在本规模�
 **semantic_key 用英文还是中文（round13 决策：英文规范键 + 词表即中文标签层）**：
 键是机器路由标识，ASCII 标识符在 SQL/API/代码中零引号零编码负担；XBRL 正是这个
 模式（英文 element name + 中文 standard label），tushare 同理（英文字段+中文文档）。
-新 Provider writer 不再在 L1 推断章节 taxonomy，因此两列都写 NULL；`document_content` 不是
-语义，不能作为占位键。若后续存在可信的 Unit 路由阶段，仍用英文规范键：`semantic_key`
-保存 primary，`semantic_keys` 保存完整有序集合并保留 mixed Unit 的 secondary recall。它们是
-检索路由，不得回写 payload、标题或边界。0034 恢复了这项容量，但没有恢复旧词面规则堆。
+当前 Provider writer 在 Unit 构建后执行独立的检索路由阶段，不改变切分、payload、标题或
+headpath。它使用英文规范 key、中文标准标签的版本化闭集：`semantic_key` 保存 primary，
+`semantic_keys` 保存完整有序的 Unit 直接主题；`section_keys` 单独保存可重建的规范化章节位置。
+低成本模型只能逐项裁决最多 8 个直接主题候选；章节键完全确定性生成。`document_content` 仅是
+私有 receipt 的成功 fallback 标记，绝不入库冒充窄语义。0034/0036 恢复两条检索轴，但不复活
+历史自由词面、全部祖先传播或公司专例规则堆。

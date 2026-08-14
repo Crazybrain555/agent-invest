@@ -73,6 +73,7 @@ UNIT_COLUMNS = (
     "order_index",
     "semantic_key",
     "semantic_keys",
+    "section_keys",
     "payload",
     "content_hash",
     "structure_hash",
@@ -164,6 +165,8 @@ def list_document_units(
     semantic_key: Annotated[str | None, _semantic_key_query_default()] = None,
     semantic_keys_any: Annotated[str | None, _semantic_key_list_query_default()] = None,
     semantic_keys_all: Annotated[str | None, _semantic_key_list_query_default()] = None,
+    section_keys_any: Annotated[str | None, _semantic_key_list_query_default()] = None,
+    section_keys_all: Annotated[str | None, _semantic_key_list_query_default()] = None,
     quality_status: str | None = None,
     heading_prefix: Annotated[list[str] | None, _query_default()] = None,
     cursor: str | None = None,
@@ -198,6 +201,12 @@ def list_document_units(
             ),
             semantic_keys_all=_validate_semantic_key_list(
                 "semantic_keys_all", semantic_keys_all
+            ),
+            section_keys_any=_validate_semantic_key_list(
+                "section_keys_any", section_keys_any
+            ),
+            section_keys_all=_validate_semantic_key_list(
+                "section_keys_all", section_keys_all
             ),
             quality_status=quality_status,
             heading_prefix=heading_prefix or [],
@@ -307,6 +316,8 @@ class UnitFilters:
         semantic_key: str | None = None,
         semantic_keys_any: list[str] | None = None,
         semantic_keys_all: list[str] | None = None,
+        section_keys_any: list[str] | None = None,
+        section_keys_all: list[str] | None = None,
         quality_status: str | None = None,
         heading_prefix: list[str] | None = None,
     ) -> None:
@@ -314,6 +325,8 @@ class UnitFilters:
         self.semantic_key = semantic_key
         self.semantic_keys_any = semantic_keys_any
         self.semantic_keys_all = semantic_keys_all
+        self.section_keys_any = section_keys_any
+        self.section_keys_all = section_keys_all
         self.quality_status = quality_status
         self.heading_prefix = heading_prefix or []
 
@@ -486,6 +499,12 @@ def _unit_where(filters: UnitFilters) -> tuple[list[str], dict[str, Any]]:
     if filters.semantic_keys_all is not None:
         where.append("u.semantic_keys ?& CAST(:semantic_keys_all AS text[])")
         params["semantic_keys_all"] = filters.semantic_keys_all
+    if filters.section_keys_any is not None:
+        where.append("u.section_keys ?| CAST(:section_keys_any AS text[])")
+        params["section_keys_any"] = filters.section_keys_any
+    if filters.section_keys_all is not None:
+        where.append("u.section_keys ?& CAST(:section_keys_all AS text[])")
+        params["section_keys_all"] = filters.section_keys_all
     _add_filter(where, params, "quality_status", filters.quality_status)
     if filters.heading_prefix:
         params["heading_prefix_json"] = json.dumps(

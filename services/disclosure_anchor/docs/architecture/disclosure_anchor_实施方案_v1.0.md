@@ -30,9 +30,11 @@ implementation_style: modular_monolith_with_ports_and_adapters
 >
 > 它定义代码边界、模块职责、数据对象、解析适配层、运行管道、发布语义、API 和实施顺序；不定义详细测试方案。测试策略、测试样本矩阵和验收用例将在独立文档中编写。
 >
-> 漂移说明（2026-08-12）：payload kinds 为 text/table/qa/mixed；0033 起删除重复
-> semantic_keys，Provider writer 不在 L1 推断业务 taxonomy，nullable semantic_key 写 NULL。
-> 本文其余早期表述与 `service-purpose.md` 冲突处，以后者（canonical）为准。
+> 漂移说明（2026-08-13）：payload kinds 为 text/table/qa/mixed；0034 恢复 ordered
+> semantic_keys 与 any/all recall。当前 Provider writer 只做来源绑定的受控检索路由：闭集
+> candidate + bounded chooser，不解释 claim、不改变内容/边界；证据不足时 nullable
+> semantic_key(s) 写 NULL。本文其余早期表述与 `service-purpose.md` 冲突处，以后者
+> （canonical）为准。
 >
 > **结构契约覆盖（2026-07-26）**：本文后文的 publish/suppress profile、模板套话抑制、
 > provider-covered 表默认不发布、QA 词面切分、caption 晋升和标题/表族白名单均为已撤销的
@@ -746,8 +748,8 @@ payload_kind                 text / table / qa / mixed（0011 起，见 service-
 order_index
 heading_path
 title
-semantic_key（新 builder 产物非空；历史 run 的库列可空）
-semantic_key_version（可空）
+semantic_key（可空的 primary 受控 route）
+semantic_keys（可空的完整有序 route set；首项等于 semantic_key）
 payload_schema_version
 payload
 content_hash
@@ -1267,7 +1269,9 @@ future_outlook
 
 - 允许为空；
 - 不允许模型自由创造不可追踪的 key；
-- 每个匹配记录 rule id/version；
+- 每个匹配记录 taxonomy/router/prompt version 与来源 witness；
+- 只有唯一精确来源标题可确定性落键；歧义 candidate 由闭集模型选择或弃权；
+- `document_content` 不作为公开窄 route 入库；
 - key 只是粗路由，不是事实 schema；
 - 表族晋级为标准 dataset 后，原 table unit 仍保留。
 

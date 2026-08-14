@@ -343,6 +343,37 @@ class DocumentOutlineTest(unittest.TestCase):
             outline.headings[2].parent_heading_id, outline.headings[1].heading_id
         )
 
+    def test_dotted_numbered_siblings_escape_intervening_style_subheads(self) -> None:
+        document = _document(
+            _block(0, "4.6 资本充足率", level=2),
+            _block(1, "高级法下资本充足率", level=2),
+            _block(2, "权重法下资本充足率", level=2),
+            _block(3, "4.7 其他重要业务指标", level=2),
+        )
+        outline = build_document_outline(
+            document,
+            level_hints=(
+                _level_hint(document, 1, "pdf_style", 2),
+                _level_hint(document, 2, "pdf_style", 2),
+            ),
+        )
+
+        headings = {heading.text: heading for heading in outline.headings}
+        capital = headings["4.6 资本充足率"]
+        self.assertEqual(
+            headings["高级法下资本充足率"].parent_heading_id,
+            capital.heading_id,
+        )
+        self.assertEqual(
+            headings["权重法下资本充足率"].parent_heading_id,
+            capital.heading_id,
+        )
+        self.assertIsNone(headings["4.7 其他重要业务指标"].parent_heading_id)
+        self.assertEqual(
+            headings["4.7 其他重要业务指标"].headpath,
+            ("4.7 其他重要业务指标",),
+        )
+
     def test_repeated_single_column_indentation_can_reset_a_stale_numbered_parent(
         self,
     ) -> None:

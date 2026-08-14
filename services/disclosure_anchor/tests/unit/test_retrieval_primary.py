@@ -13,6 +13,7 @@ from disclosure_anchor.application.contracts.provider_document import (
     provider_artifact_bundle_sha256,
 )
 from disclosure_anchor.application.contracts.html_visible_text import (
+    html_table_semantic_segments,
     html_visible_text_segments,
 )
 from disclosure_anchor.application.services.document_outline import (
@@ -178,6 +179,72 @@ class RetrievalPrimaryTest(unittest.TestCase):
                 "<template><table><td>隐藏</td></table></template>可见"
             ),
             ("可见",),
+        )
+
+    def test_table_semantic_roles_require_closed_row_structure(self) -> None:
+        form = html_table_semantic_segments(
+            "<table><tr><td>资金来源</td><td>自有资金</td></tr>"
+            "<tr><td>实施期限</td><td>三个月</td></tr></table>"
+        )
+        self.assertEqual(
+            tuple(item.role for item in form),
+            (
+                "table_field_label",
+                "table_text",
+                "table_field_label",
+                "table_text",
+            ),
+        )
+
+        grid = html_table_semantic_segments(
+            "<table><tr><td>激励对象姓名</td><td>职务</td><td>数量</td></tr>"
+            "<tr><td>张三</td><td>董事</td><td>1000</td></tr></table>"
+        )
+        self.assertEqual(
+            tuple(item.role for item in grid),
+            (
+                "table_column_header",
+                "table_column_header",
+                "table_column_header",
+                "table_text",
+                "table_text",
+                "table_text",
+            ),
+        )
+
+        titled_grid = html_table_semantic_segments(
+            "<table>"
+            '<tr><td colspan="3">交流要点</td></tr>'
+            "<tr><td>序号</td><td>提问内容</td><td>回复内容</td></tr>"
+            "<tr><td>1</td><td>经营情况？</td><td>经营正常。</td></tr>"
+            "</table>"
+        )
+        self.assertEqual(
+            tuple((item.text, item.role) for item in titled_grid),
+            (
+                ("交流要点", "table_text"),
+                ("序号", "table_column_header"),
+                ("提问内容", "table_column_header"),
+                ("回复内容", "table_column_header"),
+                ("1", "table_text"),
+                ("经营情况？", "table_text"),
+                ("经营正常。", "table_text"),
+            ),
+        )
+
+        self.assertEqual(
+            html_table_semantic_segments(
+                "<table><tr><td>外<table><tr><td>内</td></tr></table></td>"
+                "</tr></table>"
+            ),
+            (),
+        )
+        one_row = html_table_semantic_segments(
+            "<table><tr><td>标的公司</td><td>3000</td></tr></table>"
+        )
+        self.assertEqual(
+            tuple(item.role for item in one_row),
+            ("table_text", "table_text"),
         )
 
     def test_unknown_payload_field_and_stale_identity_fail_closed(self) -> None:

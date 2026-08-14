@@ -38,6 +38,10 @@ from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
     MinerUMediumDocumentParser,
 )
 from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
+from disclosure_anchor.adapters.semantics.runtime import build_semantic_runtime
+from disclosure_anchor.adapters.semantics.codex_cli import (
+    terminate_active_semantic_processes,
+)
 from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
 from disclosure_anchor.adapters.sources.cninfo.source import CninfoWebIndexSource
 from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
@@ -210,6 +214,7 @@ def _exit_wedged_worker() -> None:
     # remove those groups; otherwise the replacement singleton worker starts
     # with orphan requests still consuming the same GPU budget.
     terminate_active_mineru_processes()
+    terminate_active_semantic_processes()
     os._exit(70)
 
 
@@ -318,6 +323,7 @@ def _run_loop(
             fatal.set()
             work_available.set()
             terminate_active_mineru_processes()
+            terminate_active_semantic_processes()
 
     try:
         # Stale runs belong to a prior singleton owner. Recover them and any
@@ -367,6 +373,7 @@ def _run_loop(
         fatal.set()
         work_available.set()
         terminate_active_mineru_processes()
+        terminate_active_semantic_processes()
         raise
     finally:
         fatal.set()
@@ -807,6 +814,7 @@ def _assert_singleton_or_cancel(lock_conn: Connection) -> None:
         _assert_singleton_lock(lock_conn)
     except Exception as exc:
         terminate_active_mineru_processes()
+        terminate_active_semantic_processes()
         raise WorkerSingletonGuardError(str(exc)) from exc
 
 
@@ -828,6 +836,7 @@ class _StopFlag:
         del signum, frame
         self._stopped = True
         terminate_active_mineru_processes()
+        terminate_active_semantic_processes()
 
     def is_set(self) -> bool:
         return self._stopped
@@ -908,13 +917,21 @@ def _deps(
         )
 
     provider_source = ProviderDocumentFileSource(paths)
+    artifacts = ArtifactStore(paths)
+    semantic = build_semantic_runtime(
+        settings=settings,
+        paths=paths,
+        artifacts=artifacts,
+    )
     return WorkerDeps(
         engine=engine,
         uow_factory=unit_of_work_factory(engine),
         path_builder=paths,
         raw_store=RawDocumentStore(paths),
-        artifact_store=ArtifactStore(paths),
+        artifact_store=artifacts,
         provider_source=provider_source,
+        semantic_router=semantic.router,
+        semantic_receipts=semantic.receipts,
         source_factory=source_factory,
         profile_loader_factory=profile_loader_factory,
         parser_factory=parser_factory,

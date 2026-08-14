@@ -139,6 +139,7 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
             "derived/provider_documents/cninfo/000001/pid/active/"
             "provider_document.v1.json",
             "derived/document_unit_snapshots/doc/active/document_units.v1.jsonl",
+            "sha256:" + "a" * 64,
         )
         inactive = (
             "parser_artifacts/cninfo/000001/doc/inactive",
@@ -146,6 +147,7 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
             "derived/provider_documents/cninfo/000001/pid/inactive/"
             "provider_document.v1.json",
             "derived/document_unit_snapshots/doc/inactive/document_units.v1.jsonl",
+            "sha256:" + "b" * 64,
         )
         conn = MagicMock()
         conn.execute.return_value = [active, inactive]
@@ -165,10 +167,25 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         )
         self.assertEqual(
             expected["document_unit_snapshots"],
-            {active[3], inactive[3]},
+            {
+                active[3],
+                inactive[3],
+                "derived/document_unit_snapshots/doc/active/"
+                "semantic_route_receipts.v1.jsonl",
+                "derived/document_unit_snapshots/doc/inactive/"
+                "semantic_route_receipts.v1.jsonl",
+            },
         )
-        for relpath in (*active, *inactive):
+        for relpath in (*active[:4], *inactive[:4]):
             self._file(relpath)
+        self._file(
+            "derived/document_unit_snapshots/doc/active/"
+            "semantic_route_receipts.v1.jsonl"
+        )
+        self._file(
+            "derived/document_unit_snapshots/doc/inactive/"
+            "semantic_route_receipts.v1.jsonl"
+        )
         candidates, _ = _scan_old_candidates(
             self.data_root,
             now_ts=self.now_ts,
@@ -180,6 +197,28 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
             now_ts=self.now_ts,
         )
         self.assertEqual(orphans, [])
+
+    def test_owner_snapshot_does_not_protect_unbound_receipt_sidecar(self) -> None:
+        units_relpath = (
+            "derived/document_unit_snapshots/doc/run/document_units.v1.jsonl"
+        )
+        conn = MagicMock()
+        conn.execute.return_value = [(None, None, None, units_relpath, None)]
+        receipt = self._file(
+            "derived/document_unit_snapshots/doc/run/"
+            "semantic_route_receipts.v1.jsonl"
+        )
+
+        expected = _snapshot_expected_owners(conn)
+        candidates, _ = _scan_old_candidates(self.data_root, now_ts=self.now_ts)
+        orphans, _ = _collect_orphans(
+            candidates,
+            data_root=self.data_root,
+            expected=expected,
+            now_ts=self.now_ts,
+        )
+
+        self.assertEqual([orphan.path for orphan in orphans], [receipt])
 
     def test_daily_job_is_orphan_only(self) -> None:
         service_root = Path(__file__).resolve().parents[2]

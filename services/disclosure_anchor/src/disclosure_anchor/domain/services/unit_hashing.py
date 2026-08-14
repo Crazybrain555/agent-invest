@@ -91,6 +91,7 @@ def query_projection_hash(
     semantic_key: str | None,
     quality_status: str,
     semantic_keys: list[str] | None = None,
+    section_keys: list[str] | None = None,
     applicability: str | None = None,
     payload: dict[str, Any] | None = None,
 ) -> str:
@@ -102,6 +103,7 @@ def query_projection_hash(
                 heading_path=heading_path,
                 semantic_key=semantic_key,
                 semantic_keys=semantic_keys,
+                section_keys=section_keys,
                 quality_status=quality_status,
                 applicability=applicability,
                 payload=payload,
@@ -118,6 +120,7 @@ def query_projection(
     semantic_key: str | None,
     quality_status: str,
     semantic_keys: list[str] | None = None,
+    section_keys: list[str] | None = None,
     applicability: str | None = None,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -141,6 +144,8 @@ def query_projection(
     # genuinely independent secondary recall to the query projection.
     if semantic_keys is not None and semantic_keys != [semantic_key]:
         projection["semantic_keys"] = semantic_keys
+    if section_keys is not None:
+        projection["section_keys"] = section_keys
     if payload_kind == "mixed":
         if payload is None:
             raise ValueError("mixed query projection requires payload")
@@ -221,6 +226,7 @@ def compute_unit_hashes(
     quality_status: str,
     order_index: int,
     semantic_keys: list[str] | None = None,
+    section_keys: list[str] | None = None,
     applicability: str | None = None,
 ) -> UnitHashes:
     return UnitHashes(
@@ -231,6 +237,7 @@ def compute_unit_hashes(
             heading_path=heading_path,
             semantic_key=semantic_key,
             semantic_keys=semantic_keys,
+            section_keys=section_keys,
             quality_status=quality_status,
             applicability=applicability,
             payload=payload,

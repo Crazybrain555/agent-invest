@@ -1,6 +1,8 @@
 import json
+import http.client
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -9,6 +11,7 @@ from disclosure_anchor.adapters.runtime.doctor import (
     CheckResult,
     _check_unit_snapshot_aggregate,
     _invalid_process_class_overrides,
+    mineru_remote_inference_check,
     inventory_orphan_files,
     running_run_liveness_checks,
     run_doctor,
@@ -48,6 +51,109 @@ def _create_roots(root: Path) -> None:
 
 
 class DoctorTests(unittest.TestCase):
+    def test_mineru_remote_inference_check_exercises_image_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(Path(tmp)).model_copy(
+                update={"disclosure_mineru_server_url": "http://gpu:30000"}
+            )
+        models = MagicMock()
+        models.__enter__.return_value.read.return_value = json.dumps(
+            {"data": [{"id": "mineru-model"}]}
+        ).encode()
+        completion = MagicMock()
+        completion.__enter__.return_value.read.return_value = json.dumps(
+            {"choices": [{"finish_reason": "stop"}]}
+        ).encode()
+        opener = MagicMock()
+        opener.open.side_effect = [models, completion]
+
+        with patch(
+            "disclosure_anchor.adapters.runtime.doctor.urllib.request.build_opener",
+            return_value=opener,
+        ):
+            result = mineru_remote_inference_check(settings)
+
+        self.assertEqual(result.status, "PASS")
+        request = opener.open.call_args_list[1].args[0]
+        payload = json.loads(request.data)
+        self.assertEqual(payload["model"], "mineru-model")
+        self.assertEqual(
+            payload["messages"][0]["content"][1]["type"],
+            "image_url",
+        )
+
+    def test_mineru_remote_inference_check_fails_on_remote_5xx(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(Path(tmp)).model_copy(
+                update={"disclosure_mineru_server_url": "http://gpu:30000"}
+            )
+        opener = MagicMock()
+        opener.open.side_effect = urllib.error.HTTPError(
+            "http://gpu:30000/v1/models",
+            500,
+            "internal error",
+            hdrs=None,
+            fp=None,
+        )
+
+        with patch(
+            "disclosure_anchor.adapters.runtime.doctor.urllib.request.build_opener",
+            return_value=opener,
+        ):
+            result = mineru_remote_inference_check(settings)
+
+        self.assertEqual(result.status, "FAIL")
+
+    def test_mineru_remote_inference_check_fails_closed_on_bad_http_status_line(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(Path(tmp)).model_copy(
+                update={"disclosure_mineru_server_url": "http://gpu:30000"}
+            )
+        opener = MagicMock()
+        opener.open.side_effect = http.client.BadStatusLine("partial response")
+
+        with patch(
+            "disclosure_anchor.adapters.runtime.doctor.urllib.request.build_opener",
+            return_value=opener,
+        ):
+            result = mineru_remote_inference_check(settings)
+
+        self.assertEqual(result.status, "FAIL")
+
+    def test_mineru_remote_inference_check_accepts_v1_api_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(Path(tmp)).model_copy(
+                update={"disclosure_mineru_server_url": "http://gpu:30000/v1"}
+            )
+        models = MagicMock()
+        models.__enter__.return_value.read.return_value = json.dumps(
+            {"data": [{"id": "mineru-model"}]}
+        ).encode()
+        completion = MagicMock()
+        completion.__enter__.return_value.read.return_value = json.dumps(
+            {"choices": [{"finish_reason": "stop"}]}
+        ).encode()
+        opener = MagicMock()
+        opener.open.side_effect = [models, completion]
+
+        with patch(
+            "disclosure_anchor.adapters.runtime.doctor.urllib.request.build_opener",
+            return_value=opener,
+        ):
+            result = mineru_remote_inference_check(settings)
+
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(
+            opener.open.call_args_list[0].args[0],
+            "http://gpu:30000/v1/models",
+        )
+        self.assertEqual(
+            opener.open.call_args_list[1].args[0].full_url,
+            "http://gpu:30000/v1/chat/completions",
+        )
+
     def test_running_run_liveness_separates_parse_runaway_from_stale_work(
         self,
     ) -> None:

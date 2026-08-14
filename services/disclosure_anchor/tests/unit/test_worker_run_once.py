@@ -7,7 +7,7 @@ from datetime import date, timedelta, datetime, timezone
 import unittest
 from unittest import mock
 
-from disclosure_anchor.application.dto.worker_report import WorkerLimits
+from disclosure_anchor.application.dto.worker_report import WorkerFailure, WorkerLimits
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.worker import worker as worker_module
 from disclosure_anchor.application.worker.locks import stable_document_hash
@@ -15,6 +15,7 @@ from disclosure_anchor.application.worker.worker import (
     WorkerConfig,
     WorkerDeps,
     _sync_window_start,
+    build_failures_indicate_outage,
     render_report_section,
     run_once,
 )
@@ -75,6 +76,8 @@ def _deps() -> WorkerDeps:
         source_factory=lambda: mock.MagicMock(),
         profile_loader_factory=lambda source: (lambda code: None),
         parser_factory=lambda: mock.MagicMock(),
+        semantic_router=mock.MagicMock(),
+        semantic_receipts=mock.MagicMock(),
         parse_expected_seconds=1800,
         config=_config(),
         parser_options=ParserOptions(
@@ -103,6 +106,34 @@ class StableHashTests(unittest.TestCase):
             self.assertTrue(-(2**31) <= stable_document_hash(value) < 2**31)
 
 
+class SemanticBuildControlTests(unittest.TestCase):
+    def test_one_retryable_semantic_unavailability_opens_existing_breaker(self) -> None:
+        self.assertTrue(
+            build_failures_indicate_outage(
+                (
+                    WorkerFailure(
+                        stage="build",
+                        item_ref="doc_1",
+                        error_code="SEMANTIC_ROUTE_ADJUDICATION_UNAVAILABLE",
+                        retryable=True,
+                    ),
+                )
+            )
+        )
+
+    def test_invalid_semantic_membership_stays_item_local(self) -> None:
+        self.assertFalse(
+            build_failures_indicate_outage(
+                (
+                    WorkerFailure(
+                        stage="build",
+                        item_ref="doc_1",
+                        error_code="SEMANTIC_ROUTE_INVALID",
+                        retryable=False,
+                    ),
+                )
+            )
+        )
 class SyncWindowStartTests(unittest.TestCase):
     def test_existing_cursor_looks_back_overlap_days(self) -> None:
         self.assertEqual(
@@ -140,6 +171,20 @@ class SyncWindowStartTests(unittest.TestCase):
 
 
 class RunOnceSchedulingTests(unittest.TestCase):
+    def test_remote_parser_5xx_closes_parse_refill(self) -> None:
+        failure = WorkerFailure(
+            stage="parse",
+            item_ref="document-1",
+            error_code="parser_backend_unavailable",
+        )
+
+        self.assertTrue(
+            worker_module._halts_parse_refill(
+                worker_module._DocOutcome(failure=failure),
+                [failure],
+            )
+        )
+
     def test_direct_parse_stage_never_opens_a_second_count_batch(self) -> None:
         deps = _deps()
         report = worker_module.WorkerReport(

@@ -17,6 +17,7 @@ from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
     MinerUMediumDocumentParser,
 )
 from disclosure_anchor.adapters.parsers.mineru_medium.process import MinerUProcess
+from disclosure_anchor.adapters.semantics.runtime import build_semantic_runtime
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.provider_document_source import (
@@ -317,6 +318,11 @@ class AdminDeps:
             )
 
     def build_units(self, *, document_id: str) -> BuildUnitsResult:
+        semantic = build_semantic_runtime(
+            settings=self._settings,
+            paths=self._paths,
+            artifacts=self._artifacts,
+        )
         return BuildUnits(
             path_builder=self._paths,
             artifact_store=self._artifacts,
@@ -325,6 +331,8 @@ class AdminDeps:
                 path_builder=self._paths,
                 source=self._provider_source,
             ),
+            semantic_router=semantic.router,
+            semantic_receipts=semantic.receipts,
         ).execute(BuildUnitsCommand(document_id=document_id))
 
     def publish_run(
@@ -334,13 +342,20 @@ class AdminDeps:
         allow_empty: bool,
         reason: str | None,
     ) -> PublishRunResponse:
+        semantic = build_semantic_runtime(
+            settings=self._settings,
+            paths=self._paths,
+            artifacts=self._artifacts,
+        )
         result = PublishRun(
             uow_factory=self._uow_factory,
             publication_guard=ProviderDocumentPublicationGuard(
                 ProviderDocumentAdmission(
                     path_builder=self._paths,
                     source=self._provider_source,
-                )
+                ),
+                semantic_router=semantic.router,
+                semantic_receipts=semantic.receipts,
             ),
         ).execute(
             PublishRunCommand(

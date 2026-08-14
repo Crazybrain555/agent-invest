@@ -367,6 +367,29 @@ class UnitHashingTests(unittest.TestCase):
             compute_unit_hashes(semantic_keys=["revenue"], **common),
         )
 
+    def test_section_routes_change_only_query_projection(self) -> None:
+        common = {
+            "payload_kind": "text",
+            "payload": {"text": "正文"},
+            "title": "客户存款",
+            "heading_path": ["经营情况", "客户存款"],
+            "semantic_key": "bank_customer_deposits",
+            "semantic_keys": ["bank_customer_deposits"],
+            "quality_status": "ok",
+            "order_index": 1,
+        }
+        without_section = compute_unit_hashes(section_keys=None, **common)
+        with_section = compute_unit_hashes(
+            section_keys=["business_review"], **common
+        )
+
+        self.assertEqual(without_section.content_hash, with_section.content_hash)
+        self.assertNotEqual(
+            without_section.query_projection_hash,
+            with_section.query_projection_hash,
+        )
+        self.assertEqual(without_section.structure_hash, with_section.structure_hash)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -106,6 +106,8 @@ class Document:
     supersedes_document_id: Optional[str] = None
     correction_of_document_id: Optional[str] = None
     class_filing_type: Optional[str] = None
+    class_disclosure_topics: Optional[list[Any]] = None
+    class_content_categories: Optional[list[Any]] = None
     class_rules_version: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -131,6 +133,7 @@ class ProcessingRun:
     normalized_ir_relpath: Optional[str] = None
     provider_document_relpath: Optional[str] = None
     document_units_relpath: Optional[str] = None
+    semantic_route_receipts_hash: Optional[str] = None
     content_hash_aggregate: Optional[str] = None
     structure_hash: Optional[str] = None
     builder_rules_version: Optional[str] = None
@@ -158,6 +161,7 @@ class DocumentUnit:
     title: Optional[str] = None
     semantic_key: Optional[str] = None
     semantic_keys: Optional[list[str]] = None
+    section_keys: Optional[list[str]] = None
     structure_hash: Optional[str] = None
     quality_status: str = "ok"
     # Section applicability declared by √适用/□不适用 marker lines (05 §8.5).

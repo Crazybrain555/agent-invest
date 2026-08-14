@@ -16,6 +16,7 @@ from pathlib import Path
 
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.domain.errors import (
+    ParserBackendUnavailableError,
     ParserBackendOverloadedError,
     ParserCancelledError,
     ParserInvocationError,
@@ -50,6 +51,9 @@ _BACKEND_OVERLOAD_MARKERS = (
     "Unexpected status code: [429]",
     "RESOURCE_EXHAUSTED",
     "resource_exhausted",
+)
+_BACKEND_UNAVAILABLE_STATUS = re.compile(
+    r"Unexpected status code: \[(?:5[0-9]{2})\]"
 )
 _LOCAL_API_STARTUP_TIMEOUT_SECONDS = 120
 _TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS = 120
@@ -519,6 +523,13 @@ class MinerUProcess:
             if _contains_any(raw_detail, _BACKEND_OVERLOAD_MARKERS):
                 raise ParserBackendOverloadedError(
                     f"MinerU backend explicitly rejected capacity{detail}"
+                )
+            if _BACKEND_UNAVAILABLE_STATUS.search(raw_detail) is not None:
+                # The remote OpenAI-compatible VLM service owns a 5xx. It is
+                # shared infrastructure, not evidence that this PDF is bad.
+                # Let the worker's parser-backend circuit pause admissions.
+                raise ParserBackendUnavailableError(
+                    f"MinerU backend failed an inference request{detail}"
                 )
             if _contains_any(raw_detail, _LOCAL_API_FAILURE_MARKERS):
                 raise ParserLocalInvocationError(

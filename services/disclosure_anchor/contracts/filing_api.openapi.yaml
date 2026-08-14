@@ -315,6 +315,13 @@ components:
           - type: string
           - type: 'null'
           title: Report Period
+        section_keys:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Section Keys
         security_code:
           anyOf:
           - type: string
@@ -370,6 +377,7 @@ components:
       - order_index
       - semantic_key
       - semantic_keys
+      - section_keys
       - payload
       - content_hash
       - structure_hash
@@ -838,6 +846,60 @@ components:
       - backfill_pending
       - last_outbox_event_at
       title: QueueStatus
+      type: object
+    SemanticRouteCatalogResponse:
+      additionalProperties: false
+      properties:
+        contract_version:
+          title: Contract Version
+          type: string
+        route_count:
+          title: Route Count
+          type: integer
+        routes:
+          items:
+            $ref: '#/components/schemas/SemanticRouteV1'
+          title: Routes
+          type: array
+        taxonomy_version:
+          title: Taxonomy Version
+          type: string
+      required:
+      - contract_version
+      - taxonomy_version
+      - route_count
+      - routes
+      title: SemanticRouteCatalogResponse
+      type: object
+    SemanticRouteV1:
+      additionalProperties: false
+      properties:
+        description:
+          title: Description
+          type: string
+        key:
+          title: Key
+          type: string
+        labels:
+          items:
+            type: string
+          title: Labels
+          type: array
+        scopes:
+          items:
+            type: string
+          title: Scopes
+          type: array
+        usable_as_section_key:
+          title: Usable As Section Key
+          type: boolean
+      required:
+      - key
+      - description
+      - labels
+      - scopes
+      - usable_as_section_key
+      title: SemanticRouteV1
       type: object
     SourceRefV1:
       additionalProperties: false
@@ -1510,6 +1572,34 @@ paths:
           description: Comma-separated lowercase ASCII controlled semantic keys (max
             50).
           title: Semantic Keys All
+      - description: Comma-separated lowercase ASCII controlled semantic keys (max
+          50).
+        in: query
+        name: section_keys_any
+        required: false
+        schema:
+          anyOf:
+          - maxLength: 8192
+            pattern: ^ *[a-z][a-z0-9_]{0,127} *(?:, *[a-z][a-z0-9_]{0,127} *)*$
+            type: string
+          - type: 'null'
+          description: Comma-separated lowercase ASCII controlled semantic keys (max
+            50).
+          title: Section Keys Any
+      - description: Comma-separated lowercase ASCII controlled semantic keys (max
+          50).
+        in: query
+        name: section_keys_all
+        required: false
+        schema:
+          anyOf:
+          - maxLength: 8192
+            pattern: ^ *[a-z][a-z0-9_]{0,127} *(?:, *[a-z][a-z0-9_]{0,127} *)*$
+            type: string
+          - type: 'null'
+          description: Comma-separated lowercase ASCII controlled semantic keys (max
+            50).
+          title: Section Keys All
       - in: query
         name: quality_status
         required: false
@@ -1720,6 +1810,31 @@ paths:
               schema: *id001
           description: Validation error
       summary: Get Health
+  /v1/semantic-routes:
+    get:
+      description: Expose the one vocabulary used by Unit route filters and section
+        keys.
+      operationId: get_semantic_routes_v1_semantic_routes_get
+      parameters:
+      - *id002
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SemanticRouteCatalogResponse'
+          description: Successful Response
+        '400':
+          content:
+            application/json:
+              schema: *id001
+          description: Contract version mismatch
+        '422':
+          content:
+            application/json:
+              schema: *id001
+          description: Validation error
+      summary: Get Semantic Routes
   /v1/tracked-companies:
     get:
       operationId: list_tracked_companies_v1_tracked_companies_get

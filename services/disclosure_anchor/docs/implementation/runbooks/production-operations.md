@@ -112,6 +112,12 @@ canonical runtime manifest，至少绑定本地 client venv、远端 immutable i
 只测量本地 client venv，是 manifest 的一个输入，**不能直接冒充完整 runtime digest**。任一
 client、image、模型或配置变化都必须重做 manifest/digest 并重启 worker。
 
+当前 vLLM 0.21 MinerU2.5-Pro 服务还必须把
+`--mm-processor-cache-gb 0` 纳入远端容器命令和上述 manifest。2026-08-13 的 221 页半年度
+样本连续两次触发 vLLM 多模态 IPC cache 失步（`Expected a cached item for mm_hash`），远端
+返回 500；关闭该 cache 后同一页窗口与完整文档重放恢复。这个参数是运行时身份的一部分，
+不能只在手工 compose 中修改而继续沿用旧 digest。
+
 ### 1.2 批量重解析与派生重置
 
 旧 NormalizedIR corpus reset/exact replay 工具已经删除：它维护第二套 manifest、备份、调度和状态分类，并会把旧 writer 重新引入生产入口。当前没有 production 数据；开发期需要重放时，使用明确的 document 列表走正常 Provider writer，先在仓外保留原 PDF 与 provider artifact，再由 operator 单独授权 DB/AgentSSD 变更。
@@ -125,12 +131,19 @@ client、image、模型或配置变化都必须重做 manifest/digest 并重启 
 - worker 每轮：source 断供或单轮失败 ≥5 → macOS 通知（每小时同题限流）。
 - 通知历史落 `$DISCLOSURE_RUNTIME_ROOT/notify-markers/alerts.log`（错过弹窗看这里）。
 
-## 3. MinerU 端点故障（实案：2026-07-12，45 个 parse 失败）
+## 3. MinerU 端点故障（实案：2026-07-12 / 2026-08-13）
 
 症状：worker 报告 parse 失败堆积，`processing_run.error` 为
 `parser_invocation_failed` + `httpx.ConnectTimeout`（远端 VLM 端点，如 100.107.19.82:30000）。
-处置：确认端点恢复（`curl -m 5 <server_url>/health` 或问 GPU 机器）→ 什么都不用做，
-worker 按重试预算自动重解析。恢复核对（应为 0 且失败文档最终 published）：
+`/health` 只证明进程存活，不能证明图像推理链路可用。每日 doctor 会先读取 singleton
+`/v1/models`，再用固定 1x1 PNG 调一次 `/v1/chat/completions`；这个 multimodal canary
+失败时不得开始批量 parse。
+
+处置：先看远端容器日志。连接超时、429/容量拒绝、任意 5xx 都按共享基础设施故障处理，
+不是坏 PDF；worker 会关闭本轮 parse admission，进入已有退避/恢复探测，不应对每个 PDF
+机械消耗 item retry。若日志含 `Expected a cached item for mm_hash`，核对 pinned vLLM 0.21
+容器命令和 runtime manifest 均含 `--mm-processor-cache-gb 0`，重建容器后必须先过上述
+multimodal canary，再重放原失败页窗口。恢复核对（应为 0 且失败文档最终 published）：
 
 ```sql
 SELECT count(*) FROM disclosure_ops.pending_parse_v1 WHERE failed_parse_count > 0;

@@ -1,0 +1,193 @@
+{
+  "contract_version": "semantic_retrieval_query_gold.v1",
+  "_about": "Source-reviewed L2-style retrieval cases. Route keys are explicit planner inputs from the public semantic route catalog; the check measures direct Unit routes, structural section routes, and lexical fallback together without embeddings.",
+  "cases": [
+    {
+      "id": "buyback_funding",
+      "query": "回购资金来源",
+      "semantic_keys_all": ["share_buyback_funding"],
+      "section_keys_any": [],
+      "review_k": 3,
+      "min_precision": 1.0,
+      "relevant": [["1225370759", 2], ["1225370759", 5], ["1225370759", 12]],
+      "must_include": [["1225370759", 12]],
+      "forbidden": []
+    },
+    {
+      "id": "buyback_account",
+      "query": "回购专用证券账户",
+      "semantic_keys_all": ["share_buyback_account"],
+      "section_keys_any": [],
+      "review_k": 2,
+      "min_precision": 1.0,
+      "relevant": [["1225370759", 5], ["1225370759", 18]],
+      "must_include": [["1225370759", 5], ["1225370759", 18]],
+      "forbidden": []
+    },
+    {
+      "id": "vesting_recipients",
+      "query": "限制性股票归属对象名单",
+      "semantic_keys_all": ["incentive_recipients", "incentive_vesting_exercise"],
+      "section_keys_any": [],
+      "review_k": 1,
+      "min_precision": 1.0,
+      "relevant": [["1225339310", 6]],
+      "must_include": [["1225339310", 6]],
+      "forbidden": []
+    },
+    {
+      "id": "forecast_loss_range",
+      "query": "业绩预告亏损区间",
+      "semantic_keys_all": ["performance_forecast_range"],
+      "section_keys_any": [],
+      "review_k": 4,
+      "min_precision": 1.0,
+      "relevant": [["1225420563", 2], ["1225420563", 5], ["1225420563", 6], ["1225420563", 7]],
+      "must_include": [["1225420563", 2], ["1225420563", 5]],
+      "forbidden": []
+    },
+    {
+      "id": "capital_adequacy",
+      "query": "资本充足率",
+      "semantic_keys_all": ["bank_capital_adequacy"],
+      "section_keys_any": [],
+      "review_k": 3,
+      "min_precision": 1.0,
+      "relevant": [["1225231394", 29], ["1225231394", 30], ["1225231394", 31]],
+      "must_include": [["1225231394", 29]],
+      "forbidden": [["1225231394", 32], ["1225231394", 33]]
+    },
+    {
+      "id": "annual_interest_calculation",
+      "query": "年利息计算",
+      "semantic_keys_all": ["interest_terms"],
+      "section_keys_any": [],
+      "review_k": 3,
+      "min_precision": 1.0,
+      "relevant": [["1225466824", 4], ["1225466824", 6], ["1225466824", 8]],
+      "must_include": [["1225466824", 6]],
+      "forbidden": []
+    },
+    {
+      "id": "quarterly_metrics",
+      "query": "分季度主要财务指标",
+      "semantic_keys_all": ["company_profile_metrics"],
+      "section_keys_any": [],
+      "review_k": 5,
+      "min_precision": 1.0,
+      "relevant": [["1225067794", 9], ["1225067794", 16], ["1225067794", 17], ["1225067794", 18], ["1225067794", 65], ["1225231394", 5], ["1225231394", 6]],
+      "must_include": [["1225067794", 18]],
+      "forbidden": []
+    },
+    {
+      "id": "major_customers",
+      "query": "主要客户",
+      "semantic_keys_all": ["customer_concentration"],
+      "section_keys_any": [],
+      "review_k": 1,
+      "min_precision": 1.0,
+      "relevant": [["1225067794", 100]],
+      "must_include": [["1225067794", 100]],
+      "forbidden": []
+    },
+    {
+      "id": "major_suppliers",
+      "query": "主要供应商",
+      "semantic_keys_all": ["supplier_concentration"],
+      "section_keys_any": [],
+      "review_k": 1,
+      "min_precision": 1.0,
+      "relevant": [["1225067794", 99]],
+      "must_include": [["1225067794", 99]],
+      "forbidden": []
+    },
+    {
+      "id": "audit_opinion_not_other_information",
+      "query": "审计意见",
+      "semantic_keys_all": ["audit_opinion"],
+      "section_keys_any": [],
+      "review_k": 5,
+      "min_precision": 1.0,
+      "relevant": [["1225067794", 185], ["1225067794", 203], ["1225067794", 204], ["1225067794", 277], ["1225067794", 278], ["1225067794", 279], ["1225067794", 281], ["1225067794", 282], ["1225067794", 283], ["1225067794", 284], ["1225067794", 285], ["1225067794", 287], ["1225067794", 289], ["1225067794", 290], ["1225067794", 295]],
+      "must_include": [["1225067794", 278]],
+      "forbidden": [["1225067794", 292]]
+    },
+    {
+      "id": "sales_volume_and_price",
+      "query": "销量价格",
+      "semantic_keys_all": ["sales_volume", "price_changes"],
+      "section_keys_any": [],
+      "review_k": 1,
+      "min_precision": 1.0,
+      "relevant": [["1225460373", 3]],
+      "must_include": [["1225460373", 3]],
+      "forbidden": []
+    },
+    {
+      "id": "investor_questions",
+      "query": "投资者问答",
+      "semantic_keys_all": ["investor_questions_answers"],
+      "section_keys_any": [],
+      "review_k": 3,
+      "min_precision": 1.0,
+      "relevant": [["100020384132", 0], ["1225109223", 2]],
+      "must_include": [["100020384132", 0], ["1225109223", 2]],
+      "forbidden": []
+    },
+    {
+      "id": "quarterly_equity_components",
+      "query": "未分配利润 其他综合收益",
+      "semantic_keys_all": ["retained_earnings", "other_comprehensive_income"],
+      "section_keys_any": [],
+      "review_k": 1,
+      "min_precision": 1.0,
+      "relevant": [["1225231394", 22]],
+      "must_include": [["1225231394", 22]],
+      "forbidden": []
+    },
+    {
+      "id": "capital_management_lexical",
+      "query": "资本管理",
+      "semantic_keys_all": [],
+      "section_keys_any": [],
+      "review_k": 3,
+      "min_precision": 1.0,
+      "relevant": [["1225067794", 639], ["1225067794", 640], ["1225231394", 29]],
+      "must_include": [["1225231394", 29]],
+      "forbidden": []
+    },
+    {
+      "id": "corrected_shareholding_data",
+      "query": "更正后的增持数据",
+      "semantic_keys_all": ["corrected_data", "correction_item"],
+      "section_keys_any": [],
+      "review_k": 1,
+      "min_precision": 1.0,
+      "relevant": [["1225433840", 0]],
+      "must_include": [["1225433840", 0]],
+      "forbidden": []
+    },
+    {
+      "id": "business_risk_section",
+      "query": "业务风险",
+      "semantic_keys_all": [],
+      "section_keys_any": ["risk_management"],
+      "review_k": 5,
+      "min_precision": 1.0,
+      "relevant": [["1225067794", 170], ["1225067794", 171], ["1225067794", 172], ["1225067794", 173], ["1225067794", 174], ["1225067794", 175], ["1225067794", 176], ["1225067794", 177], ["1225067794", 178]],
+      "must_include": [["1225067794", 174]],
+      "forbidden": []
+    },
+    {
+      "id": "literal_other_information_lexical_fallback",
+      "query": "其他信息",
+      "semantic_keys_all": [],
+      "section_keys_any": [],
+      "review_k": 1,
+      "min_precision": 1.0,
+      "relevant": [["1225067794", 292]],
+      "must_include": [["1225067794", 292]],
+      "forbidden": []
+    }
+  ]
+}

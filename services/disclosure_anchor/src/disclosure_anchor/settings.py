@@ -134,6 +134,49 @@ class Settings(BaseSettings):
             "disclosure_mineru_runtime_bundle_identity_sha256",
         ),
     )
+    # Unit semantic routing uses Codex only as a closed-vocabulary chooser.
+    # The deterministic router owns candidates and exact-title routes; the
+    # model may select candidate IDs or abstain, and Publish never calls it.
+    disclosure_semantic_codex_bin: Path = Field(
+        default=Path("codex"),
+        validation_alias=AliasChoices(
+            "DISCLOSURE_SEMANTIC_CODEX_BIN",
+            "disclosure_semantic_codex_bin",
+        ),
+    )
+    disclosure_semantic_model: str = Field(
+        default="gpt-5.6-luna",
+        min_length=1,
+        pattern=r"^\S+$",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_SEMANTIC_MODEL",
+            "disclosure_semantic_model",
+        ),
+    )
+    disclosure_semantic_reasoning_effort: Literal["low", "medium", "high"] = Field(
+        default="low",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_SEMANTIC_REASONING_EFFORT",
+            "disclosure_semantic_reasoning_effort",
+        ),
+    )
+    disclosure_semantic_timeout_seconds: int = Field(
+        default=600,
+        ge=1,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_SEMANTIC_TIMEOUT_SECONDS",
+            "disclosure_semantic_timeout_seconds",
+        ),
+    )
+    disclosure_semantic_batch_size: int = Field(
+        default=16,
+        ge=1,
+        le=32,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_SEMANTIC_BATCH_SIZE",
+            "disclosure_semantic_batch_size",
+        ),
+    )
     cninfo_access_key: Optional[SecretStr] = Field(
         default=None,
         validation_alias=AliasChoices("CNINFO_ACCESS_KEY", "cninfo_access_key"),
