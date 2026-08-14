@@ -282,7 +282,7 @@
   },
   "tests/unit/test_semantic_router.py": {
    "private_imports": [],
-   "tests": 80
+   "tests": 81
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],

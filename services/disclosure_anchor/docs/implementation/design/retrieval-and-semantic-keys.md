@@ -42,7 +42,7 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 原文标题仍由 `title` / `heading_path` 保真；该 Unit 内若有回购账户、风险提示等具体事实，只落对应的
 具体 route。没有可确认具体主题时 direct route 保持 NULL，绝不为了填满字段而发明“其他”占位键。
 
-当前身份是 taxonomy `semantic-taxonomy-2026-08-r34`、router `semantic_router.v53`、prompt
+当前身份是 taxonomy `semantic-taxonomy-2026-08-r35`、router `semantic_router.v53`、prompt
 `semantic_route_adjudication.v31`，当前候选 adjudicator 为 `codex_cli.v4.low` / `gpt-5.6-luna`；
 候选与 direct route 都最多 8 个。model/effort 与 cache/receipt identity 绑定。定期报告正文/表格也
 可以生成 Unit-local 直接主题候选；章节上下文另走 section_keys，不参与 shortlist。截断时，Unit

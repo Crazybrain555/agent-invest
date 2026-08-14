@@ -1,15 +1,14 @@
 # Semantic route and retrieval pilot — 2026-08-13
 
-This is the current pre-write data-quality receipt for Unit semantic routing.
-It does not describe the semantic fields currently published in the development
-database: those 805 rows were built before this router and still have NULL
-`semantic_key` / `semantic_keys`. The replay read the current immutable PDFs,
-Provider records, Units, and public search projections without mutating
-PostgreSQL or AgentSSD.
+This is the current data-quality receipt for Unit semantic routing. The clean
+development replay has already published v53/r34 routes for all 805 Units. The
+r35 candidate below independently re-read the same immutable PDFs and Provider
+records without mutating PostgreSQL or AgentSSD; its one taxonomy delta remains
+pending the reviewed Unit-only replay described under production gates.
 
 ## Current contract
 
-- taxonomy: `semantic-taxonomy-2026-08-r34`, containing 182 financial and
+- taxonomy: `semantic-taxonomy-2026-08-r35`, containing 182 financial and
   115 event routes;
 - router: `semantic_router.v53`;
 - optional adjudicator: `codex_cli.v4.low`, `gpt-5.6-luna`, prompt
@@ -42,7 +41,7 @@ statistical claim about 5,000 issuers.
 
 | filing type | Units | direct route | section route | either |
 |---|---:|---:|---:|---:|
-| annual_report | 687 | 261 | 467 | 541 |
+| annual_report | 687 | 261 | 512 | 580 |
 | quarterly_report | 47 | 39 | 19 | 41 |
 | convertible_bond | 17 | 12 | 0 | 12 |
 | equity_incentive | 14 | 14 | 0 | 14 |
@@ -52,23 +51,35 @@ statistical claim about 5,000 issuers.
 | performance_briefing | 3 | 2 | 0 | 2 |
 | investor_relations | 1 | 1 | 0 | 1 |
 | correction_supplement | 1 | 1 | 0 | 1 |
-| **total** | **805** | **357** | **486** | **639** |
+| **total** | **805** | **357** | **531** | **678** |
 
 Decision sources are 357 deterministic, 150 deterministic rule abstentions,
 and 298 no-candidate fallbacks. Direct route cardinality is: 448 zero, 331 one,
 19 two, three three, two five, and two seven.
-No Unit exceeds the eight-route cap. Section cardinality is 319 zero, 208 one,
-and 278 two.
+No Unit exceeds the eight-route cap. Section cardinality is 274 zero, 233 one,
+and 298 two.
 
-The full replay deliberately configured the adjudicator executable as
-`/usr/bin/false`. It still completed with zero calls and zero model tokens.
+The full replay deliberately configured a nonexistent adjudicator executable.
+It still completed with zero calls and zero model tokens.
 Convertible-bond `1225466824/u6`, “（2）年利息计算”, is now routed by a canonical
 regulatory subheading rather than a model. The current replay is
-`/private/tmp/disclosure-semantic-route-v53-tax34-full-current-no-model.json`
-(SHA-256 `40b2f6c064e304c6229c9858e7d7580b65d10d895446e18c06547e1488db5a3c`).
+`/private/tmp/disclosure-semantic-route-v53-tax35-full-current-no-model.json`
+(SHA-256 `8f2a859b6bf8c8c1f7fdb060caa97bc1103a628f0b31f5239c3dbe55e87093dc`).
 It is session evidence, not a tracked production artifact. Zero calls prove
 that this corpus does not depend on the optional adapter; they do not by
 themselves qualify that adapter for a future truly ambiguous Unit.
+
+The r34 baseline is
+`/private/tmp/disclosure-semantic-route-v53-tax34-full-current-no-model.json`
+(SHA-256 `40b2f6c064e304c6229c9858e7d7580b65d10d895446e18c06547e1488db5a3c`).
+The exact r34→r35 diff contains 65 section-array changes, all beneath the
+accepted annual-report heading `第五节 公司治理报告暨企业管治报告` in provider document
+`1225067794`. Direct routes remain byte-for-byte unchanged at 357. Thirty-nine
+previously nonempty lexical-only Units gain the existing `governance` section
+route, reducing lexical-only coverage from 166 to 127; no other document and no
+model decision changes. Diff receipt:
+`/private/tmp/disclosure-semantic-route-v53-tax35-diff.json` (SHA-256
+`4da1ab1fab5e867a18b360ec3e3aae83e5cb4339c0f7b60c09eea6e6fe3a3048`).
 
 An independent DB-free replay covers 822 Units across performance flash,
 inquiry notice, major contract, delisting risk, rights issue, restructuring,
@@ -135,7 +146,7 @@ does not return annual-report Unit `u292` (“五、其他信息”) in its top 
 separate literal query for `其他信息` does return that Unit at rank one through
 lexical search even though it has no fabricated narrow semantic key.
 
-The current query review is
+The pre-r35 live query baseline is
 `/private/tmp/disclosure-semantic-retrieval-query-v53-tax34.json`
 (SHA-256 `2309510216e08ffbe677738dbc1e43d612e2d83b101bf55abdac686eb3774fe3`).
 The tracked query gold SHA-256 is
@@ -155,13 +166,13 @@ not carry a CNInfo category facet. The router must not fill that provider field
 from Unit topics. Filing type, disclosure topics, Unit routes, section routes,
 and lexical search are separate retrieval surfaces.
 
-The current read-only public-view audit makes that distinction concrete: all
-805 live Units still have NULL semantic routes because they predate this
-router, while `content_categories` is non-NULL for 23 Units belonging to the
-two Documents whose CNInfo records actually carry that facet, and NULL for the
+The current read-only public-view audit makes that distinction concrete: the
+v53/r34 clean replay has 357 direct-routed Units and 486 section-routed Units,
+while `content_categories` is non-NULL for 23 Units belonging to the two
+Documents whose CNInfo records actually carry that facet, and NULL for the
 remaining 782 Units across eight Documents. Content-bearing Units must not be
 used to fabricate a missing provider category; their retrieval support comes
-from the v53 direct/section/lexical surfaces above.
+from the direct/section/lexical surfaces above.
 
 ## Remaining production gates
 
@@ -171,9 +182,9 @@ from the v53 direct/section/lexical surfaces above.
   production canary; do not infer adapter eligibility from the zero-call run.
 - The 17-query gold proves the reviewed cases, not full query-language recall.
   Held-out process classes and atypical PDF layouts remain required.
-- The live development rows and search projections still predate this router.
-  Do not ask users to judge live semantic fields until the final reviewed reset,
-  migration, rebuild, publish, and search replay completes.
-- Final focused/full tests, scratch migration round trip, independent exact-
-  diff/data-quality review, and held-out source inspection are still required
-  before the approved clean replay.
+- The live development rows/search projections still carry the reviewed r34
+  baseline. Write r35 only after its focused/full tests and independent exact-
+  diff review pass, then rerun route/query gold and row-level data-quality
+  inspection against the public views.
+- A final doctor/canary pass and held-out source inspection remain required
+  before a production-readiness claim or worker enablement.

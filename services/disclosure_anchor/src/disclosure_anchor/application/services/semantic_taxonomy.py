@@ -15,7 +15,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
 )
 
 
-SEMANTIC_TAXONOMY_VERSION = "semantic-taxonomy-2026-08-r34"
+SEMANTIC_TAXONOMY_VERSION = "semantic-taxonomy-2026-08-r35"
 _FINANCIAL_RESOURCE = "semantic_financial_routes.v1.json"
 _EVENT_RESOURCE = "semantic_event_routes.v1.json"
 _PERIODIC_SCOPES = ("annual_report", "semiannual_report", "quarterly_report")
@@ -52,7 +52,7 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
         "version",
     }:
         raise SemanticRouteContractError("event semantic taxonomy fields drift")
-    if financial.get("version") != "semantic-financial-2026-08-r16":
+    if financial.get("version") != "semantic-financial-2026-08-r17":
         raise SemanticRouteContractError("financial semantic taxonomy version drift")
     if events.get("version") != "semantic-events-2026-08-r25":
         raise SemanticRouteContractError("event semantic taxonomy version drift")

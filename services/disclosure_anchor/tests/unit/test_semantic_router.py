@@ -431,6 +431,11 @@ class SemanticTaxonomyTests(unittest.TestCase):
     ) -> None:
         cases = (
             (
+                "第五节 公司治理报告暨企业管治报告",
+                "公司年度治理工作回顾",
+                ("governance",),
+            ),
+            (
                 "第六节 公司治理",
                 "2025年度薪酬情况",
                 ("governance", "directors_management"),
@@ -474,6 +479,35 @@ class SemanticTaxonomyTests(unittest.TestCase):
                 self.assertIsNone(result.units[1].semantic_keys)
                 self.assertEqual(result.units[1].section_keys, expected)
                 self.assertEqual(adjudicator.calls, 0)
+
+    def test_nearby_governance_heading_does_not_widen_exact_section_alias(
+        self,
+    ) -> None:
+        admitted, drafts = _drafts_with_parent_heading(
+            "第七节 企业管治报告",
+            "报告期内主要工作",
+            "公司按照监管要求推进本期工作。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("an inexact section must not call the model")
+        )
+
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertIsNone(result.units[1].semantic_keys)
+        self.assertIsNone(result.units[1].section_keys)
+        self.assertEqual(adjudicator.calls, 0)
 
     def test_other_information_is_not_a_synthetic_route(self) -> None:
         admitted, drafts = _drafts_with_body(
