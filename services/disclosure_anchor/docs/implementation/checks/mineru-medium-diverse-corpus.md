@@ -139,10 +139,10 @@ search projection contains 805 parent rows and 25,954 source-bound atoms under
   carrying a fake `document_content` placeholder. The subsequent controlled-
   taxonomy router is evaluated in a separate offline receipt before any new
   replay; this paragraph remains a historical DB observation;
-- `content_categories` is inherited only where the Document has actual CNInfo
-  category metadata: 23 Units across the operating-data and convertible-bond
-  documents. Local test registrations without provider category metadata remain
-  NULL; `publisher_categories` and `market` are not repeated on the Unit view;
+- the pre-0037 audit found actual CNInfo `content_categories` on two Documents
+  (then repeated across 23 Unit rows). 0037 keeps that fact Document-only; local
+  test registrations without provider category metadata remain NULL, and no
+  provider facet is repeated on the Unit view;
 - 804 Units are `ok`. One quarterly-report Unit is `needs_review` because a
   physical table continuation cannot be bound at a provider-declared page
   boundary (`continuation_not_page_boundary`). On the same source page MinerU

@@ -132,9 +132,9 @@ text 或 hash/page 漂移一律不修；native reader 固定 `pypdfium2==5.13.0`
 `header_row_candidate` 对 provider-native Unit 固定为 false。未来如需表头 role，必须有明确
 source/provider 结构证据，不能恢复数值/词面启发式。
 
-`content_categories` 是 Document 的 provider/classification 粗分类，并继承到 Unit public view
-供 SQL/L2 做 facet 过滤；它不复制进 Unit 表，也不重复加入每个 Unit 的全文 key tokens。
-`publisher_categories` 与 `market` 保持 Document-only。
+`content_categories` 是 Document 的 provider/classification 粗分类，与
+`publisher_categories`、`market` 一样保持 Document-only。SQL/L2 如需 facet 粗筛，先查询
+Document，再以 document_id 获取 Units；它不进入 Unit public view，也不加入全文 key tokens。
 
 `GET /v1/semantic-routes` 直接从同一 taxonomy 公开 key、中文 labels、scopes、版本与
 `usable_as_section_key`；后者同时覆盖定期报告 context-container 与事件 section-container，避免

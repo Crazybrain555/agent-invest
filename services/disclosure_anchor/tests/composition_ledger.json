@@ -58,7 +58,7 @@
   },
   "tests/integration/test_schema_and_views.py": {
    "private_imports": [],
-   "tests": 9
+   "tests": 10
   },
   "tests/integration/test_search_projection.py": {
    "private_imports": [],
@@ -190,7 +190,7 @@
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 12
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],

@@ -90,21 +90,6 @@
       ],
       "title": "Company Ref"
     },
-    "content_categories": {
-      "anyOf": [
-        {
-          "items": {
-            "additionalProperties": true,
-            "type": "object"
-          },
-          "type": "array"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Content Categories"
-    },
     "content_hash": {
       "title": "Content Hash",
       "type": "string"
@@ -407,7 +392,6 @@
     "exchange",
     "filing_type",
     "disclosure_topics",
-    "content_categories",
     "report_period",
     "announcement_date",
     "producer_action_ref",

@@ -21,8 +21,8 @@ below are the resulting live development state.
   only a small section-container allowlist gated by filing type or authoritative
   disclosure-topic scope. It is deterministic,
   never a model candidate, and ranks below a direct Unit route;
-- `content_categories` remains a CNInfo Document facet. It is not fabricated
-  from Unit text and cannot prove a Unit route;
+- `content_categories` remains a CNInfo Document facet exposed on Document
+  reads only. It is not fabricated from Unit text and cannot prove a Unit route;
 - no direct or section evidence leaves the two route fields NULL. The exact
   title/path/body search projection remains available, so NULL does not mean
   unfindable;
@@ -263,13 +263,13 @@ not carry a CNInfo category facet. The router must not fill that provider field
 from Unit topics. Filing type, disclosure topics, Unit routes, section routes,
 and lexical search are separate retrieval surfaces.
 
-The current read-only public-view audit makes that distinction concrete: the
-r37/v54 clean replay has 357 direct-routed Units and 540 section-routed Units,
-while `content_categories` is non-NULL for 23 Units belonging to the two
-Documents whose CNInfo records actually carry that facet, and NULL for the
-remaining 782 Units across eight Documents. Content-bearing Units must not be
-used to fabricate a missing provider category; their retrieval support comes
-from the direct/section/lexical surfaces above.
+The pre-0037 read-only public-view audit makes that distinction concrete: the
+r37/v54 clean replay has 357 direct-routed Units and 540 section-routed Units.
+Only two Documents carried a non-NULL CNInfo content facet; it was then repeated
+across 23 Unit rows while the other 782 Unit rows were NULL. 0037 removes that
+repetition from Unit reads. Content-bearing Units must not be used to fabricate
+a missing provider category; their retrieval support comes from the
+direct/section/lexical surfaces above.
 
 The same audit finds 156 `{"text": ""}` payloads. All 156 are heading-only
 Units with a non-NULL title, nonempty hash-bound heading chain and nonempty

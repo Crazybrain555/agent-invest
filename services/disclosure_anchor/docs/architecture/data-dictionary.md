@@ -116,10 +116,10 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 ## 3. disclosure_public 视图（唯一读契约）
 
-- **document_units_v1（40 列）**：core 列 + 派生（is_active_run、heading_path_text 面包屑、
+- **document_units_v1（39 列）**：core 列 + 派生（is_active_run、heading_path_text 面包屑、
   现算 filing_type/disclosure_topics、
   contract_version、company_ref/security_ref、security_code/exchange、filing_type、
-  disclosure_topics、semantic_keys、section_keys、content_categories、report_period、announcement_date、source_ref、parent_ref、asset_kind、
+  disclosure_topics、semantic_keys、section_keys、report_period、announcement_date、source_ref、parent_ref、asset_kind、
   observed_at、source_tier、trace_level、raw_file_hash）。列集权威=contract-checklist §2。
 - documents_v1 / processing_runs_v1 / source_refs_v1 / change_events_v1 / document_categories_v1。
 - **tracked_companies_v1（0019+0020，round22）**：股票池读契约——真源是 tracked_company 表

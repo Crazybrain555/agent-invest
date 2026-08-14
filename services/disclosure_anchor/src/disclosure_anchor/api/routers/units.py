@@ -100,7 +100,6 @@ UNIT_COLUMNS = (
     "trace_level",
     "raw_file_hash",
     "query_projection_hash",
-    "content_categories",
 )
 
 SOURCE_REF_COLUMNS = (

@@ -101,7 +101,6 @@ class DocumentUnitV1(PublicModel):
     exchange: str | None
     filing_type: str | None
     disclosure_topics: list[str] | None
-    content_categories: list[dict[str, Any]] | None
     report_period: str | None
     announcement_date: date | None
     producer_action_ref: str

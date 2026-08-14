@@ -1000,12 +1000,12 @@ parser artifact 与 primary parse artifact 字节的根 parse run。0032 为 cor
 run_kind 与 locator contract 校验后使用统一 PathBuilder 定位，禁止把 unit producer run 当成
 artifact owner，也禁止从文件存在性或路径词面猜版本。
 
-0036 后 `document_units_v1` 为 **40 列**：保留 Unit 自有 scope/provenance、
+0037 后 `document_units_v1` 为 **39 列**：保留 Unit 自有 scope/provenance、
 `semantic_key`/`semantic_keys` 检索路由，以及 `filing_type`/`disclosure_topics` 路由字段；
 `section_keys` 单独提供确定性的规范化章节召回；
-`content_categories` 从 Document 继承到 Unit 读面，便于 L2 单次查询做粗分类过滤，
-但不复制存储、不进入每个 Unit 的全文 token。`publisher_categories`/`market` 仍只留在
-`documents_v1` 与 `document_categories_v1`。完整列集以 contract-checklist §2 为准：
+`content_categories`、`publisher_categories`、`market` 均只留在 `documents_v1` 与
+`document_categories_v1`。L2 如需 provider 粗分类，先筛 Document 再按 document_id 取 Units，
+不能把 Document facet 冒充 Unit 内容标签。完整列集以 contract-checklist §2 为准：
 
 - 0010：`applicability`（'applicable'|'not_applicable'|NULL，节适用性一等筛选列，部分索引）
   与 `page_no`（artifact_locator 首页码提升列）；
@@ -1022,6 +1022,9 @@ artifact owner，也禁止从文件存在性或路径词面猜版本。
   显式结构容器精确匹配生成：定期报告使用 context-container，事件公告仅使用命中 filing_type/
   authoritative disclosure_topics scope 的窄 section-container。它不调用模型、不与直接主题竞争，
   也不复制 Document facet。
+- 0037：从 `document_units_v1` / `DocumentUnitV1` 删除继承的 `content_categories`；CNInfo
+  原始分类、Document materialized facet、documents API/filter 与 semantic router 的 Document
+  context 均保留。
 
 `asset://` URI（顶层协议 §2.3）只在序列化边界派生，不落存储：
 

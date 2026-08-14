@@ -16,13 +16,13 @@ class MigrationStateTests(unittest.TestCase):
         heads = migration_heads()
         self.assertEqual(len(heads), 1)
         self.assertEqual(single_migration_head(), heads[0])
-        self.assertEqual(heads[0], "0036_unit_section_routes")
+        self.assertEqual(heads[0], "0037_unit_facets")
 
         migration = importlib.import_module(
             "disclosure_anchor.adapters.db.postgres.migrations.versions."
-            "0036_unit_section_routes"
+            "0037_remove_unit_content_categories"
         )
-        self.assertEqual(migration.down_revision, "0035_semantic_receipt_integrity")
+        self.assertEqual(migration.down_revision, "0036_unit_section_routes")
 
     def test_0033_unit_view_keeps_only_unit_owned_scope_fields(self) -> None:
         migration = importlib.import_module(
@@ -145,6 +145,22 @@ class MigrationStateTests(unittest.TestCase):
             migration.downgrade()
         execute.assert_not_called()
         drop_column.assert_not_called()
+
+    def test_0037_keeps_content_categories_document_only(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0037_remove_unit_content_categories"
+        )
+
+        current = migration._document_units_view_sql(
+            include_content_categories=False
+        )
+        self.assertIn("u.semantic_keys", current)
+        self.assertIn("u.section_keys", current)
+        self.assertNotIn("content_categories", current)
+
+        prior = migration._document_units_view_sql(include_content_categories=True)
+        self.assertIn("class_content_categories AS content_categories", prior)
 
     def test_0031_reset_gate_remains_immutable_history(self) -> None:
 

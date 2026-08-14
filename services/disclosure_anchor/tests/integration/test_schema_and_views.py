@@ -247,9 +247,50 @@ class SchemaShapeTests(unittest.TestCase):
                     )
                 ).scalars()
             )
-        self.assertLessEqual(
-            {"semantic_keys", "section_keys", "content_categories"}, columns
-        )
+        self.assertLessEqual({"semantic_keys", "section_keys"}, columns)
+        self.assertNotIn("content_categories", columns)
+
+    def test_0037_removes_only_the_unit_content_facet(self) -> None:
+        self.addCleanup(self._restore_migration_head)
+
+        with self.engine.connect() as conn:
+            unit_columns = set(
+                conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = 'disclosure_public' "
+                        "AND table_name = 'document_units_v1'"
+                    )
+                ).scalars()
+            )
+            document_columns = set(
+                conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = 'disclosure_public' "
+                        "AND table_name = 'documents_v1'"
+                    )
+                ).scalars()
+            )
+        self.assertNotIn("content_categories", unit_columns)
+        self.assertIn("content_categories", document_columns)
+
+        down = self._alembic("downgrade", "0036_unit_section_routes")
+        self.assertEqual(down.returncode, 0, down.stderr[-500:])
+        with self.engine.connect() as conn:
+            downgraded_unit_columns = set(
+                conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = 'disclosure_public' "
+                        "AND table_name = 'document_units_v1'"
+                    )
+                ).scalars()
+            )
+        self.assertIn("content_categories", downgraded_unit_columns)
+
+        up = self._alembic("upgrade", "head")
+        self.assertEqual(up.returncode, 0, up.stderr[-500:])
 
     @staticmethod
     def _alembic(*args: str) -> subprocess.CompletedProcess[str]:

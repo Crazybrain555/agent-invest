@@ -99,7 +99,6 @@ def _unit_row(
         "exchange": "szse",
         "filing_type": "annual_report",
         "disclosure_topics": None,
-        "content_categories": None,
         "report_period": "2025A",
         "announcement_date": date(2026, 7, 5),
         "producer_action_ref": processing_run_id,

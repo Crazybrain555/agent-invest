@@ -84,7 +84,7 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
   部分索引 ix_document_unit_applicability；page_no：artifact_locator 首页码提升列）。
 0007 起 document_units_v1 追加 6 列：asset_kind / observed_at / source_tier /
   trace_level / raw_file_hash / query_projection_hash
-  （0036 当前列全集 = **40 列**；semantic_keys=直接主题，section_keys=规范化章节位置，content_categories=继承的 Document facet；publisher/market 只留 documents_v1/document_categories_v1）
+  （0037 当前列全集 = **39 列**；semantic_keys=直接主题，section_keys=规范化章节位置；publisher/market/content_categories 只留 documents_v1/document_categories_v1）
 0007 起 change_events_v1 追加 change_kind（真实列）/ subject_kind / subject_ref /
   source / contract_version
 0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref /
@@ -271,6 +271,14 @@ section_keys 保存已接受 heading_path 的精确结构容器链：定期报�
 只有 semantic_keys 进入全文 key-token 检索；section_keys 独立进入 query_projection_hash，并仅由
 any/all 结构过滤参与 L2/L3 联合召回，避免把父章节词复制到每个正文 Unit
 content_categories 仍仅是 Document provider facet，经 Unit public view 继承；不能填充任一 Unit route
+```
+
+2026-08-14（0037 Unit 与 Document facet 分权）:
+
+```text
+document_units_v1 / DocumentUnitV1 删除 content_categories；Unit 公共列由 40 收敛为 39
+documents_v1 / document_categories_v1、Document materialized facet、CNInfo F006V 原始事实与 documents API/filter 保留
+L2 如需 provider facet 粗筛，先筛 Document 再按 document_id 获取 Units；Unit 主题召回只使用 semantic_keys、section_keys 与 lexical search
 ```
 
 2026-08-14（semantic route 公共目录）：
