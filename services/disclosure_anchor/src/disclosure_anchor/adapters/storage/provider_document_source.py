@@ -15,10 +15,12 @@ from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
 from disclosure_anchor.application.contracts.provider_document import ProviderDocument
 from disclosure_anchor.application.contracts.provider_document_admission import (
     SourcePdfObservation,
+    SourcePdfTextObservation,
 )
 from disclosure_anchor.application.ports.file_store import FileStorePathPort
 from disclosure_anchor.application.ports.provider_document_source import (
     ProviderDocumentSourceError,
+    SourcePdfTextReaderPort,
 )
 from disclosure_anchor.domain.errors import ParserOutputContractError, PathSafetyError
 
@@ -33,12 +35,14 @@ class ProviderDocumentFileSource:
         self,
         path_builder: FileStorePathPort,
         *,
+        text_reader: SourcePdfTextReaderPort,
         reader: MinerUMediumArtifactReader | None = None,
         page_counter: Callable[[Path], int] = count_pdf_pages,
     ) -> None:
         self._paths = path_builder
         self._reader = reader or MinerUMediumArtifactReader()
         self._page_counter = page_counter
+        self._text_reader = text_reader
 
     def read_provider_document_record(self, relpath: Path) -> bytes:
         try:
@@ -101,6 +105,30 @@ class ProviderDocumentFileSource:
             raise ProviderDocumentSourceError(
                 "provider_bundle_read_failed",
                 f"cannot read provider bundle: {exc}",
+                retryable=isinstance(exc, OSError),
+            ) from exc
+
+    def observe_source_pdf_text(
+        self,
+        relpath: Path,
+        *,
+        document: ProviderDocument,
+        expected_sha256: str,
+    ) -> tuple[SourcePdfTextObservation, ...]:
+        """Read native PDF text only inside exact provider text rectangles."""
+
+        try:
+            path = self._checked_file(relpath)
+            if _hash_regular_file(path) != expected_sha256:
+                raise PathSafetyError("source PDF hash changed before native text read")
+            observations = self._text_reader(path, document=document)
+            if _hash_regular_file(self._checked_file(relpath)) != expected_sha256:
+                raise PathSafetyError("source PDF hash changed during native text read")
+            return observations
+        except (OSError, PathSafetyError, RuntimeError, ValueError) as exc:
+            raise ProviderDocumentSourceError(
+                "source_pdf_text_read_failed",
+                f"cannot read native source PDF text: {exc}",
                 retryable=isinstance(exc, OSError),
             ) from exc
 

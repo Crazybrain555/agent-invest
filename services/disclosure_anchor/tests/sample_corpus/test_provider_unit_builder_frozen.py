@@ -11,10 +11,14 @@ from disclosure_anchor.adapters.parsers.mineru_medium.artifacts import (
     MinerUMediumArtifactReader,
 )
 from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
+from disclosure_anchor.adapters.parsers.pdf_text_observation import (
+    observe_pdf_text_rectangles,
+)
 from disclosure_anchor.application.contracts.parser_target import ParserTargetIdentity
 from disclosure_anchor.application.contracts.provider_document import ProviderDocument
 from disclosure_anchor.application.contracts.provider_document_admission import (
     SourcePdfObservation,
+    SourcePdfTextObservation,
 )
 from disclosure_anchor.application.contracts.provider_document_envelope import (
     ProviderDocumentEnvelope,
@@ -249,6 +253,24 @@ class _FrozenSource:
         return MinerUMediumArtifactReader().read(
             self.bundle_path,
             source_pdf_sha256=source_pdf_sha256,
+        )
+
+    def observe_source_pdf_text(
+        self,
+        relpath: Path,
+        *,
+        document: ProviderDocument,
+        expected_sha256: str,
+    ) -> tuple[SourcePdfTextObservation, ...]:
+        if relpath != self.source_relpath:
+            raise AssertionError("admission requested the wrong source PDF")
+        if document.source_pdf_sha256 != expected_sha256:
+            raise AssertionError("native text request used the wrong source hash")
+        if _sha_file(self.source_path) != expected_sha256:
+            raise AssertionError("frozen source PDF bytes changed before native text read")
+        return observe_pdf_text_rectangles(
+            self.source_path,
+            document=document,
         )
 
 

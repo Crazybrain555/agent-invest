@@ -26,8 +26,12 @@ from disclosure_anchor.domain.value_objects.semantic_key import (
 )
 
 
-PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v1"
-PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v4"
+LEGACY_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v1"
+PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v2"
+SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS = frozenset(
+    {LEGACY_PROVIDER_UNIT_LOCATOR_VERSION, PROVIDER_UNIT_LOCATOR_VERSION}
+)
+PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v5"
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -146,6 +150,33 @@ class ProviderUnitEvidenceArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderUnitSourceTextReconciliation:
+    """Path-free provenance for one native-PDF numeric text correction."""
+
+    source_index: int
+    payload_ordinal: int
+    raw_block_sha256: str
+    provider_text_sha256: str
+    source_text_sha256: str
+    source_kind: str
+
+    def __post_init__(self) -> None:
+        if min(self.source_index, self.payload_ordinal) < 0:
+            raise ValueError("provider Unit source reconciliation index is invalid")
+        if self.source_kind != "source_pdf_native_numeric.v1":
+            raise ValueError("provider Unit source reconciliation kind is unsupported")
+        if not all(
+            _SHA256_RE.fullmatch(value)
+            for value in (
+                self.raw_block_sha256,
+                self.provider_text_sha256,
+                self.source_text_sha256,
+            )
+        ):
+            raise ValueError("provider Unit source reconciliation hash is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderUnitLocator:
     """One thin locator; the hash-bound ProviderDocument supplies all detail."""
 
@@ -157,11 +188,19 @@ class ProviderUnitLocator:
     unbound_table_parts: tuple[UnboundProviderTablePart, ...]
     evidence_artifacts: tuple[ProviderUnitEvidenceArtifact, ...]
     search_targets: tuple[ProviderUnitSearchBinding, ...]
+    source_text_reconciliations: tuple[
+        ProviderUnitSourceTextReconciliation, ...
+    ] = ()
     contract_version: str = PROVIDER_UNIT_LOCATOR_VERSION
 
     def __post_init__(self) -> None:
-        if self.contract_version != PROVIDER_UNIT_LOCATOR_VERSION:
+        if self.contract_version not in SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS:
             raise ValueError("provider unit locator version is unsupported")
+        if (
+            self.contract_version == LEGACY_PROVIDER_UNIT_LOCATOR_VERSION
+            and self.source_text_reconciliations
+        ):
+            raise ValueError("legacy provider unit locator cannot claim source repairs")
         if not _SHA256_RE.fullmatch(self.provider_document_sha256):
             raise ValueError("provider unit locator hash must be canonical")
         if self.unit_index < 0:
@@ -179,6 +218,16 @@ class ProviderUnitLocator:
         evidence_hashes = [artifact.sha256 for artifact in self.evidence_artifacts]
         if len(evidence_hashes) != len(set(evidence_hashes)):
             raise ValueError("provider unit locator cannot repeat evidence bytes")
+        reconciliation_ids = [
+            (item.source_index, item.payload_ordinal)
+            for item in self.source_text_reconciliations
+        ]
+        if reconciliation_ids != sorted(reconciliation_ids) or len(
+            reconciliation_ids
+        ) != len(set(reconciliation_ids)):
+            raise ValueError(
+                "provider unit source reconciliations must be unique and ordered"
+            )
         if any(
             part.part.block_source_index is None
             for part in self.unbound_table_parts
@@ -274,7 +323,7 @@ def provider_unit_locator_to_payload(
 ) -> dict[str, object]:
     """Serialize the one closed locator without provider paths or raw JSON."""
 
-    return {
+    payload: dict[str, object] = {
         "contract_version": locator.contract_version,
         "provider_document_sha256": locator.provider_document_sha256,
         "unit_index": locator.unit_index,
@@ -338,24 +387,45 @@ def provider_unit_locator_to_payload(
             for binding in locator.search_targets
         ],
     }
+    if locator.contract_version == PROVIDER_UNIT_LOCATOR_VERSION:
+        payload["source_text_reconciliations"] = [
+            {
+                "payload_ordinal": item.payload_ordinal,
+                "provider_text_sha256": item.provider_text_sha256,
+                "raw_block_sha256": item.raw_block_sha256,
+                "source_index": item.source_index,
+                "source_kind": item.source_kind,
+                "source_text_sha256": item.source_text_sha256,
+            }
+            for item in locator.source_text_reconciliations
+        ]
+    return payload
 
 
 def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
     """Decode the persisted locator with no permissive fallback."""
 
+    if not isinstance(payload, Mapping):
+        raise ValueError("provider Unit locator fields are invalid")
+    version = payload.get("contract_version")
+    base_fields = {
+        "contract_version",
+        "provider_document_sha256",
+        "unit_index",
+        "heading_chain",
+        "parts",
+        "evidence_only_block_source_indices",
+        "unbound_table_parts",
+        "evidence_artifacts",
+        "search_targets",
+    }
+    if version == PROVIDER_UNIT_LOCATOR_VERSION:
+        base_fields.add("source_text_reconciliations")
+    elif version != LEGACY_PROVIDER_UNIT_LOCATOR_VERSION:
+        raise ValueError("provider unit locator version is unsupported")
     root = _closed_mapping(
         payload,
-        fields={
-            "contract_version",
-            "provider_document_sha256",
-            "unit_index",
-            "heading_chain",
-            "parts",
-            "evidence_only_block_source_indices",
-            "unbound_table_parts",
-            "evidence_artifacts",
-            "search_targets",
-        },
+        fields=base_fields,
         label="provider Unit locator",
     )
     headings = tuple(
@@ -381,6 +451,17 @@ def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
         _search_binding_from_payload(item)
         for item in _array(root["search_targets"], label="search targets")
     )
+    reconciliations = (
+        tuple(
+            _source_text_reconciliation_from_payload(item)
+            for item in _array(
+                root["source_text_reconciliations"],
+                label="source text reconciliations",
+            )
+        )
+        if version == PROVIDER_UNIT_LOCATOR_VERSION
+        else ()
+    )
     return ProviderUnitLocator(
         contract_version=_text(root["contract_version"], label="contract version"),
         provider_document_sha256=_text(
@@ -396,6 +477,7 @@ def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
         ),
         unbound_table_parts=unbound,
         evidence_artifacts=evidence,
+        source_text_reconciliations=reconciliations,
         search_targets=search,
     )
 
@@ -483,6 +565,40 @@ def _evidence_from_payload(payload: object) -> ProviderUnitEvidenceArtifact:
         sha256=_text(item["sha256"], label="evidence hash"),
         size_bytes=_integer(item["size_bytes"], label="evidence size"),
         media_type=_text(item["media_type"], label="evidence media type"),
+    )
+
+
+def _source_text_reconciliation_from_payload(
+    payload: object,
+) -> ProviderUnitSourceTextReconciliation:
+    item = _closed_mapping(
+        payload,
+        fields={
+            "payload_ordinal",
+            "provider_text_sha256",
+            "raw_block_sha256",
+            "source_index",
+            "source_kind",
+            "source_text_sha256",
+        },
+        label="provider Unit source text reconciliation",
+    )
+    return ProviderUnitSourceTextReconciliation(
+        source_index=_integer(item["source_index"], label="source index"),
+        payload_ordinal=_integer(
+            item["payload_ordinal"],
+            label="payload ordinal",
+        ),
+        raw_block_sha256=_text(item["raw_block_sha256"], label="block hash"),
+        provider_text_sha256=_text(
+            item["provider_text_sha256"],
+            label="provider text hash",
+        ),
+        source_text_sha256=_text(
+            item["source_text_sha256"],
+            label="source text hash",
+        ),
+        source_kind=_text(item["source_kind"], label="source kind"),
     )
 
 
@@ -587,8 +703,10 @@ def _optional_text(value: object, *, label: str) -> str | None:
 
 
 __all__ = [
+    "LEGACY_PROVIDER_UNIT_LOCATOR_VERSION",
     "PROVIDER_UNIT_LOCATOR_VERSION",
     "PROVIDER_UNIT_BUILDER_VERSION",
+    "SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS",
     "ProviderSearchDestination",
     "ProviderSearchDestinationKind",
     "ProviderUnitBuildResult",
@@ -601,6 +719,7 @@ __all__ = [
     "ProviderUnitPayloadKind",
     "ProviderUnitSearchBinding",
     "ProviderUnitSearchContractError",
+    "ProviderUnitSourceTextReconciliation",
     "provider_unit_locator_from_payload",
     "provider_unit_locator_to_payload",
 ]

@@ -19,6 +19,7 @@ from disclosure_anchor.application.contracts.provider_document import (
 )
 from disclosure_anchor.application.contracts.provider_document_admission import (
     AdmittedProviderDocument,
+    SourceTextReconciliation,
 )
 from disclosure_anchor.application.contracts.provider_document_envelope import (
     ProviderDocumentEnvelope,
@@ -45,6 +46,114 @@ _DOCUMENT = "doc_01K00000000000000000000000"
 
 
 class ProviderUnitBuilderTests(unittest.TestCase):
+    def test_source_native_numeric_repair_is_payload_and_locator_provenance(self) -> None:
+        provider_text = "年 月，本集团净利差 。"
+        source_text = "2026年1-3月，本集团净利差1.77%。"
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, provider_text),),
+                        annotation="paragraph",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        block = document.blocks[0]
+        admitted = replace(
+            _admitted(document),
+            source_text_reconciliations=(
+                SourceTextReconciliation(
+                    source_index=0,
+                    payload_ordinal=0,
+                    raw_block_sha256=block.raw_item_sha256,
+                    provider_text_sha256=_sha_text(provider_text),
+                    source_text_sha256=_sha_text(source_text),
+                    source_text=source_text,
+                ),
+            ),
+        )
+
+        unit = build_provider_units(admitted).units[0]
+
+        self.assertEqual(unit.payload, {"text": source_text})
+        self.assertEqual(len(unit.locator.source_text_reconciliations), 1)
+        self.assertEqual(
+            provider_unit_locator_from_payload(
+                provider_unit_locator_to_payload(unit.locator)
+            ),
+            unit.locator,
+        )
+        for binding in unit.locator.search_targets:
+            self.assertEqual(
+                replay_provider_unit_search_binding(admitted, unit, binding),
+                (source_text,),
+            )
+
+    def test_ancestor_source_repair_is_bound_to_descendant_heading_chain(
+        self,
+    ) -> None:
+        provider_text = "章 总则"
+        source_text = "第一章 总则"
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, provider_text),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "一、范围"),),
+                        annotation="title",
+                        level=2,
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "正文"),),
+                        annotation="paragraph",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        block = document.blocks[0]
+        admitted = replace(
+            _admitted(document),
+            source_text_reconciliations=(
+                SourceTextReconciliation(
+                    source_index=0,
+                    payload_ordinal=0,
+                    raw_block_sha256=block.raw_item_sha256,
+                    provider_text_sha256=_sha_text(provider_text),
+                    source_text_sha256=_sha_text(source_text),
+                    source_text=source_text,
+                ),
+            ),
+        )
+
+        parent, descendant = build_provider_units(admitted).units
+
+        self.assertEqual(descendant.heading_path, (source_text, "一、范围"))
+        self.assertEqual(len(parent.locator.source_text_reconciliations), 1)
+        self.assertEqual(len(descendant.locator.source_text_reconciliations), 1)
+        self.assertEqual(
+            descendant.locator.source_text_reconciliations,
+            parent.locator.source_text_reconciliations,
+        )
+
     def test_heading_table_visual_and_demoted_content_are_conserved_once(
         self,
     ) -> None:
@@ -198,6 +307,25 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         parts[0]["part_index"] = True
         with self.assertRaisesRegex(ValueError, "part index"):
             provider_unit_locator_from_payload(payload)
+
+    def test_locator_decoder_keeps_legacy_v1_read_compatibility(self) -> None:
+        locator = (
+            build_provider_units(_admitted(_representative_document())).units[1].locator
+        )
+        payload = provider_unit_locator_to_payload(locator)
+        payload["contract_version"] = "provider_unit_locator.v1"
+        payload.pop("source_text_reconciliations")
+
+        decoded = provider_unit_locator_from_payload(payload)
+
+        self.assertEqual(decoded.contract_version, "provider_unit_locator.v1")
+        self.assertFalse(decoded.source_text_reconciliations)
+        self.assertEqual(
+            provider_unit_locator_from_payload(
+                provider_unit_locator_to_payload(decoded)
+            ),
+            decoded,
+        )
 
     def test_heading_only_unit_keeps_structure_without_body_duplication(self) -> None:
         document = _document(

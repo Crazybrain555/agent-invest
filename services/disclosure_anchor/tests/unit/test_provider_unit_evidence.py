@@ -146,24 +146,26 @@ class ProviderUnitEvidenceTests(unittest.TestCase):
                 "evidence_artifact_hash_mismatch",
             )
 
-    def test_unknown_locator_version_fails_closed(self) -> None:
+    def test_unknown_or_malformed_locator_version_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths, row, _draft, _record_path, _artifact_path = _fixture(Path(tmp))
-            locator = dict(row["artifact_locator"])
-            locator["contract_version"] = "unknown.v1"
-            row["artifact_locator"] = locator
+            for version in ("unknown.v1", [], {}):
+                with self.subTest(version=version):
+                    locator = dict(row["artifact_locator"])
+                    locator["contract_version"] = version
+                    row["artifact_locator"] = locator
 
-            with self.assertRaises(HTTPException) as caught:
-                unit_evidence_refs(
-                    asset_id=row["asset_id"],
-                    payload_kind=row["payload_kind"],
-                    payload=row["payload"],
-                    artifact_locator=row["artifact_locator"],
-                )
-            self.assertEqual(
-                caught.exception.detail["detail"]["reason"],
-                "unit_evidence_locator_invalid",
-            )
+                    with self.assertRaises(HTTPException) as caught:
+                        unit_evidence_refs(
+                            asset_id=row["asset_id"],
+                            payload_kind=row["payload_kind"],
+                            payload=row["payload"],
+                            artifact_locator=row["artifact_locator"],
+                        )
+                    self.assertEqual(
+                        caught.exception.detail["detail"]["reason"],
+                        "unit_evidence_locator_invalid",
+                    )
             self.assertIsNotNone(paths)
 
 

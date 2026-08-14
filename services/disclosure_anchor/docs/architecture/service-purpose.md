@@ -526,7 +526,7 @@ payload 是有序 parts；每个 part 只保存 source-bound 浅内容字段，�
 `payload_kind` 唯一表达。
 视觉 part 额外保存内容型 artifact 的 `{sha256,size_bytes,media_type}`，使图像变化进入
 `content_hash`；路径、crop、bbox、search binding 与 supporting evidence 只在 Unit 顶层
-`provider_unit_locator.v1`，不复制到每个 part，也不形成第二套证据图。
+`provider_unit_locator.v2`，不复制到每个 part，也不形成第二套证据图。
 
 ```json
 {
@@ -602,7 +602,7 @@ document preamble。监管 taxonomy 可在组装完成后帮助 L2 路由，但�
 ## 7.2 artifact_locator
 
 `artifact_locator` 是可选的**技术位置**。新产物使用闭合的
-`provider_unit_locator.v1`，绑定 `provider_document.v1` hash、source block index、标题链、
+`provider_unit_locator.v2`，绑定 `provider_document.v1` hash、source block index、标题链、
 Unit parts、物理表格段、evidence digest 与显式 search target。`title`、heading_path 或 caption
 发生争议时，必须沿 locator 回到 ProviderDocument、MinerU 原始 artifact 和不可变 PDF 查证；
 缺 locator 或源字段不是“保守猜一个值”的理由，而是 parser 质量故障。
@@ -616,19 +616,35 @@ heading_chain
 parts / physical_table_segment_indices
 evidence_artifacts
 search_targets
+source_text_reconciliations（仅 native-PDF 数字校正时）
 ```
 
 示意：
 
 ```json
 {
-  "contract_version": "provider_unit_locator.v1",
+  "contract_version": "provider_unit_locator.v2",
   "provider_document_sha256": "sha256:...",
   "heading_chain": [{"source_index": 42, "placement_source": "numbering"}],
   "parts": [{"part_index": 0, "block_source_indices": [43, 44],
               "physical_table_segment_indices": [7, 8]}]
 }
 ```
+
+locator v2 允许一种窄的 source-PDF 校正：若 MinerU 的一个 `text` block 在 exact bbox 内只漏数字，
+admission 可读取同一不可变 PDF 的 native text。只有 PDF hash/page count、block/raw hash、bbox 与
+payload identity 全部闭合，且 MinerU 文本可由 native text 仅删除完整数字核心（可连同或保留
+`%/‰`）得到；被删除数字 token 位置的相邻 ASCII 横向空格/Tab 可随 token 缺失或作为 MinerU 占位保留，其余字符
+（包括宽窄字符、标点、空白）和
+已有数字保持原序逐字相等时，Unit payload 才使用
+source PDF 文字。唯一 reader 规范化是 PDFium bounded-text 生成的、非首尾孤立 `CRLF`（ASCII
+单词边界保留一个空格）；CRLF 周围水平空格仍须逐字匹配，且仅在同一观察含该软换行时移除一个、
+不能是多个的矩形末尾空格。NUL、裸 `CR/LF`、空白行及其他空白均拒绝。ProviderDocument 始终保留 MinerU 原文。locator 的
+`source_text_reconciliations` 只保存两侧 text hash 与 source identity，不存第二份路径或结构。
+每个 Unit locator 覆盖本 Unit source blocks 及其完整 heading chain 所依赖的校正；Publish 必须从
+PDF 重新生成同一结果。表格、数字替换/重排、非数字差异、无 text layer、旋转/页面形状不闭合、
+高度重叠 bbox 或任何歧义均不修。native reader 固定使用 `pypdfium2==5.13.0`。
+历史 `provider_unit_locator.v1` 继续只读，但不能声明该校正。
 
 MinerU merge-on 输出中的非空 content-list table owner 是唯一逻辑/检索 payload；后续空 table
 stub 不另发正文，只通过 locator 连接其逐页 physical segment、crop、page/bbox 和 raw hash。
@@ -675,6 +691,16 @@ exact payload       = {"table_body":"<table>...</table>"}
 occurrence 划分连续 source carriers。表格、文字、图片、适用性声明和关联 caption 都是该结构下
 的证据 parts，不是新的边界。没有可靠标题结构时生成 `title=null, heading_path=[]` 的 coarse
 unit；登记文档标题只留 document scope，不复制进 Unit 或 A-weight body。
+
+编号单调栈还必须抵抗 provider style 的弱层级漂移：仍在栈内的同族、同 rank 且 ordinal 递增
+标题按 source order 回到共同父级；若前一编号已被弱 style root 挤出栈，只允许连续 ordinal、且
+两者之间全为无编号 `provider_style/pdf_style` 标题时恢复其父链。长文中新的“(一)/(1)”序列不能
+只凭页距重置；只有当前 plain-numbered parent 自身带 continuation marker、距新序列至少八页，且
+区间内同一无编号 provider title 在至少两个不同页面以近同 bbox 重复，才允许弹出 stale parent。
+表格和 payload kind 永远不作为缺失章节的代理边界。若一个无编号弱标题的紧邻 source block
+明确从同族 ordinal one 重启，该弱标题先退出已完成的括号编号 subgroup；较远的编号、仅仅
+变小的 ordinal 或中间出现表格都不得移动它。
+序号重启、新强边界、单页重复、不同版位、短间隔或正文短语均不得触发重置。
 
 不使用业务短语白名单/黑名单、监管 taxonomy、payload kind、页码、固定字符数、固定 token 数
 或 overlap 作为持久化边界。编号语法只说明源文档的 outline 形态，不说明其金融主题。
@@ -870,7 +896,7 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - `heading_path`；
 - `semantic_key`；
 - `semantic_keys`（mixed Unit 的完整路由集合）；
-- `section_keys`（定期报告的规范化章节位置集合）；
+- `section_keys`（已接受标题树中的规范化章节位置集合）；
 - `applicability`（0010 起，节适用性一等筛选列）；
 - `page_no`（0010 起，定位与审查的一等筛选参数）；
 - `quality_status`；
@@ -964,7 +990,7 @@ order_index
 6 列，至 04R-R7 为 32 列（仅历史基线）。
 
 0008 迁移起，`processing_runs_v1` 投影 `builder_rules_version`，用于确定性 Unit builder 归因；
-历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 必须等于 `provider_unit.v1`。
+历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 当前必须等于 `provider_unit.v5`。
 
 0031 迁移起，`processing_runs_v1` 只额外暴露不透明的
 `artifact_owner_processing_run_id`：parse run 指向自身，`rebuild_units` 指向实际拥有
@@ -992,8 +1018,10 @@ artifact owner，也禁止从文件存在性或路径词面猜版本。
   一跳 overview 标记只负责在具体子标题 Unit 中去掉上位容器，真实概要/汇总 Unit 仍可保留
   container 与独立字段 routes，且绝不自动补父键。Build 冻结
   receipt、Publish 只重放。证据不足时 scalar/array 均为 NULL，不授权恢复旧的自由词面规则堆。
-- 0036：新增 `section_keys` 存储/GIN/API any/all recall。它只从定期报告已接受 heading_path 的
-  显式 context-container 精确匹配生成，不调用模型、不与直接主题竞争，也不复制 Document facet。
+- 0036：新增 `section_keys` 存储/GIN/API any/all recall。当前 writer 只从已接受 heading_path 的
+  显式结构容器精确匹配生成：定期报告使用 context-container，事件公告仅使用命中 filing_type/
+  authoritative disclosure_topics scope 的窄 section-container。它不调用模型、不与直接主题竞争，
+  也不复制 Document facet。
 
 `asset://` URI（顶层协议 §2.3）只在序列化边界派生，不落存储：
 

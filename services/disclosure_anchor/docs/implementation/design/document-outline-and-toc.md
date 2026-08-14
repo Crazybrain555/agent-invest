@@ -4,7 +4,7 @@ project: disclosure_anchor
 title: 文件脉络与标题层级边界
 status: implemented
 revised_at: 2026-08-12
-depends_on: provider_document.v1、provider_unit.v1、06R 检索投影
+depends_on: provider_document.v1、provider_unit.v5、06R 检索投影
 ---
 
 # 文件脉络与标题层级边界
@@ -35,6 +35,10 @@ caption/footnote 与跨页续句不能开节。
 accepted candidate 按 reading order 用单调栈生成 parent 与完整 headpath。每一级保留
 `source_index` 和 `placement_source`，从 ProviderDocument 可回放 page、bbox、text 与 raw hash。
 不确定 candidate 降为 body 或挂到最近可靠父级；不得猜一个具体 sibling parent。
+
+编号重启只在 source-bound 结构证据下纠正。表格和 payload kind 不得作为缺失章节的代理边界，
+也不得使可靠 plain-numbered parent 出栈。无编号弱标题仅在紧邻 provider source block 明确从同族
+ordinal one 重启时退出已完成 subgroup；较远或只是变小的 ordinal 保持原父级。
 
 每个 accepted heading 开一个 coarse Unit；文首内容进入无标题 preamble Unit。registered
 document title 不进入 Unit title/headpath。demoted candidate 仍按普通 body 保存。

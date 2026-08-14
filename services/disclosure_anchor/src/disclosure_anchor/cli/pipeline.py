@@ -28,6 +28,9 @@ from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
     MinerUMediumDocumentParser,
 )
 from disclosure_anchor.adapters.parsers.mineru_medium.process import MinerUProcess
+from disclosure_anchor.adapters.parsers.pdf_text_observation import (
+    observe_pdf_text_rectangles,
+)
 from disclosure_anchor.adapters.semantics.runtime import build_semantic_runtime
 from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
 from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
@@ -456,7 +459,10 @@ class _Deps:
         self.settings = settings
         self.paths = FileStorePathBuilder(settings)
         self.artifacts = ArtifactStore(self.paths)
-        self.provider_source = ProviderDocumentFileSource(self.paths)
+        self.provider_source = ProviderDocumentFileSource(
+            self.paths,
+            text_reader=observe_pdf_text_rectangles,
+        )
         self.engine = create_db_engine(_database_url(settings))
         self.uow_factory = unit_of_work_factory(self.engine)
 

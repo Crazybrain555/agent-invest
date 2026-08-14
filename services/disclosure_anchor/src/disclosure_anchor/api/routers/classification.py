@@ -76,7 +76,9 @@ def get_semantic_routes() -> SemanticRouteCatalogResponse:
             description=definition.description,
             labels=list(definition.labels),
             scopes=list(definition.scopes),
-            usable_as_section_key=definition.context_container,
+            usable_as_section_key=(
+                definition.context_container or definition.section_container
+            ),
         )
         for definition in taxonomy.definitions
     ]

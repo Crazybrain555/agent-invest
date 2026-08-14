@@ -38,6 +38,9 @@ from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
     MinerUMediumDocumentParser,
 )
 from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
+from disclosure_anchor.adapters.parsers.pdf_text_observation import (
+    observe_pdf_text_rectangles,
+)
 from disclosure_anchor.adapters.semantics.runtime import build_semantic_runtime
 from disclosure_anchor.adapters.semantics.codex_cli import (
     terminate_active_semantic_processes,
@@ -916,7 +919,10 @@ def _deps(
             server_url=settings.disclosure_mineru_server_url,
         )
 
-    provider_source = ProviderDocumentFileSource(paths)
+    provider_source = ProviderDocumentFileSource(
+        paths,
+        text_reader=observe_pdf_text_rectangles,
+    )
     artifacts = ArtifactStore(paths)
     semantic = build_semantic_runtime(
         settings=settings,

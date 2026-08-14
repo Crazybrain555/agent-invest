@@ -68,6 +68,8 @@ _REPEATED_HEADER_MAX_PAGE_GAP = 3
 _REPEATED_HEADER_TOP_FRACTION = 0.25
 _REPEATED_HEADER_BBOX_TOLERANCE = 4.0
 _NORMALIZED_PAGE_AXIS = 1_000.0
+_STALE_NUMBERED_PARENT_MIN_PAGE_GAP = 8
+_CONTINUATION_MARKER_RE = re.compile(r"(?:^|[\s（(\-—–])续[）)]?\s*$")
 
 
 def build_document_outline(
@@ -125,7 +127,7 @@ def build_document_outline(
     candidates = _apply_document_numbering_scale(candidates)
     candidates = _apply_front_matter_root_placements(document, candidates)
     candidates = _apply_provider_style_placements(document, candidates)
-    headings = _resolve_headings(candidates)
+    headings = _resolve_headings(candidates, blocks=document.blocks)
     units = _coarse_units(document, headings)
     return DocumentOutline(
         source_pdf_sha256=document.source_pdf_sha256,
@@ -896,21 +898,39 @@ def _numbering(text: str) -> tuple[str | None, int | None]:
 
 def _resolve_headings(
     candidates: tuple[HeadingCandidate, ...],
+    *,
+    blocks: tuple[ProviderBlock, ...],
 ) -> tuple[ResolvedHeading, ...]:
     resolved: list[ResolvedHeading] = []
     stack: list[ResolvedHeading] = []
     candidate_by_heading_id = {
         candidate.heading_id: candidate for candidate in candidates
     }
-    for candidate in candidates:
-        if candidate.disposition != "accepted":
-            continue
+    accepted = tuple(
+        candidate for candidate in candidates if candidate.disposition == "accepted"
+    )
+    for candidate in accepted:
         nominal_rank = candidate.nominal_rank
         placement_source = candidate.placement_source
         if nominal_rank is None or placement_source is None:
             raise ValueError("accepted heading has no placement")
+        if _weak_heading_starts_new_numbered_subgroup(
+            candidate,
+            blocks=blocks,
+            stack=stack,
+            resolved=resolved,
+            candidate_by_heading_id=candidate_by_heading_id,
+        ):
+            stack.pop()
         parent_eligible = placement_source not in {"provider", "flattened"}
         if parent_eligible:
+            historical_parent_stack = _numbered_history_parent_stack(
+                candidate,
+                resolved=resolved,
+                candidate_by_heading_id=candidate_by_heading_id,
+            )
+            if historical_parent_stack is not None:
+                stack[:] = historical_parent_stack
             # Dotted siblings such as 4.6/4.7 are structurally stronger than
             # inferred style-only subheads between them.  Apply this only when
             # an earlier dotted sibling of the same depth is still on the
@@ -931,6 +951,20 @@ def _resolve_headings(
                     "provider_style",
                 }:
                     stack.pop()
+            sibling_ancestor_index = _numbered_sibling_ancestor_index(
+                candidate,
+                stack=stack,
+                candidate_by_heading_id=candidate_by_heading_id,
+            )
+            if sibling_ancestor_index is not None:
+                del stack[sibling_ancestor_index + 1 :]
+            if _starts_after_stale_numbered_parent(
+                candidate,
+                stack=stack,
+                candidates=candidates,
+                candidate_by_heading_id=candidate_by_heading_id,
+            ):
+                stack.pop()
             while stack and stack[-1].nominal_rank >= nominal_rank:
                 if (
                     placement_source in {"pdf_style", "provider_style"}
@@ -960,6 +994,215 @@ def _resolve_headings(
         if parent_eligible:
             stack.append(heading)
     return tuple(resolved)
+
+
+def _weak_heading_starts_new_numbered_subgroup(
+    candidate: HeadingCandidate,
+    *,
+    blocks: tuple[ProviderBlock, ...],
+    stack: list[ResolvedHeading],
+    resolved: list[ResolvedHeading],
+    candidate_by_heading_id: dict[str, HeadingCandidate],
+) -> bool:
+    """Detach a weak leaf only when the next source block restarts at one.
+
+    MinerU sometimes marks the ordinal-one line after a weak subgroup label as
+    a paragraph, so accepted-candidate lookahead is not source-complete.  The
+    immediate provider block is still a bounded structural signal.  A later
+    or merely smaller ordinal is not enough to move the weak label.
+    """
+
+    if (
+        candidate.numbering_family is not None
+        or candidate.placement_source
+        not in {"provider", "flattened", "pdf_style", "provider_style"}
+        or not stack
+        or not resolved
+        or resolved[-1].heading_id != stack[-1].heading_id
+    ):
+        return False
+    prior = candidate_by_heading_id[stack[-1].heading_id]
+    prior_signature = _parenthesized_signature(prior.text)
+    if prior_signature is None or prior_signature[1] <= 1:
+        return False
+    following = next(
+        (block for block in blocks if block.source_index > candidate.source_index),
+        None,
+    )
+    if following is None:
+        return False
+    following_signature = _parenthesized_signature(_block_text(following))
+    return following_signature == (prior_signature[0], 1)
+
+
+def _parenthesized_signature(text: str) -> tuple[str, int] | None:
+    family, _rank = _numbering(text)
+    if family not in {"括号中文序号", "括号阿拉伯序号"}:
+        return None
+    ordinal = _parenthesized_ordinal(text)
+    if ordinal is None:
+        return None
+    return family, ordinal
+
+
+def _numbered_history_parent_stack(
+    candidate: HeadingCandidate,
+    *,
+    resolved: list[ResolvedHeading],
+    candidate_by_heading_id: dict[str, HeadingCandidate],
+) -> list[ResolvedHeading] | None:
+    """Recover a numbered sibling displaced only by weak style headings.
+
+    A run of provider/PDF style table titles can pop a numbered heading from
+    the monotonic stack even though the next consecutive ordinal is its
+    sibling.  Historical recovery is deliberately narrower than ordinary
+    stack placement: the ordinal must be consecutive and every accepted
+    heading since the prior sibling must be an unnumbered weak style heading.
+    Any new numbered/outline boundary or ordinal restart leaves the current
+    stack untouched.
+    """
+
+    signature = _numbering_signature(candidate.text)
+    if signature is None:
+        return None
+    family, rank, ordinal = signature
+    if ordinal <= 1:
+        return None
+    prior_index: int | None = None
+    for index in range(len(resolved) - 1, -1, -1):
+        prior = candidate_by_heading_id[resolved[index].heading_id]
+        if _numbering_signature(prior.text) == (family, rank, ordinal - 1):
+            prior_index = index
+            break
+    if prior_index is None:
+        return None
+    for intervening in resolved[prior_index + 1 :]:
+        intervening_candidate = candidate_by_heading_id[intervening.heading_id]
+        if (
+            intervening.placement_source not in {"pdf_style", "provider_style"}
+            or intervening_candidate.numbering_family is not None
+        ):
+            return None
+
+    resolved_by_id = {heading.heading_id: heading for heading in resolved}
+    parent_id = resolved[prior_index].parent_heading_id
+    reversed_parents: list[ResolvedHeading] = []
+    while parent_id is not None:
+        parent = resolved_by_id[parent_id]
+        reversed_parents.append(parent)
+        parent_id = parent.parent_heading_id
+    return list(reversed(reversed_parents))
+
+
+def _numbered_sibling_ancestor_index(
+    candidate: HeadingCandidate,
+    *,
+    stack: list[ResolvedHeading],
+    candidate_by_heading_id: dict[str, HeadingCandidate],
+) -> int | None:
+    """Restore ordinary sibling semantics across weak inferred subheads.
+
+    A same-rank numbered ancestor would already be popped by the monotonic
+    stack if every intervening heading had a faithful rank.  MinerU style
+    hints can instead assign one intervening leaf a numerically stronger rank;
+    an increasing source ordinal is the bounded evidence that the incoming
+    heading is still a sibling of the earlier numbered occurrence.
+    """
+
+    signature = _numbering_signature(candidate.text)
+    if signature is None:
+        return None
+    family, rank, ordinal = signature
+    for index in range(len(stack) - 1, -1, -1):
+        ancestor = candidate_by_heading_id[stack[index].heading_id]
+        ancestor_signature = _numbering_signature(ancestor.text)
+        if ancestor_signature is None:
+            continue
+        ancestor_family, ancestor_rank, ancestor_ordinal = ancestor_signature
+        if (
+            ancestor_family == family
+            and ancestor_rank == rank
+            and ancestor_ordinal < ordinal
+        ):
+            return index
+    return None
+
+
+def _starts_after_stale_numbered_parent(
+    candidate: HeadingCandidate,
+    *,
+    stack: list[ResolvedHeading],
+    candidates: tuple[HeadingCandidate, ...],
+    candidate_by_heading_id: dict[str, HeadingCandidate],
+) -> bool:
+    """Detect a new ordinal-one sequence after repeated page-level furniture.
+
+    Page distance alone is never a boundary.  The reset requires an ordinal-one
+    child, a long gap from its numbered parent, and the same unnumbered provider
+    title repeated on at least two distinct intervening pages.  This handles a
+    provider-missed section boundary without naming any report or heading.
+    """
+
+    if not stack or candidate.numbering_family not in {
+        "括号中文序号",
+        "括号阿拉伯序号",
+    }:
+        return False
+    ordinal = _parenthesized_ordinal(candidate.text)
+    if ordinal != 1:
+        return False
+    parent = stack[-1]
+    parent_candidate = candidate_by_heading_id[parent.heading_id]
+    if (
+        parent_candidate.numbering_family not in {"中文序号", "阿拉伯序号"}
+        or _CONTINUATION_MARKER_RE.search(parent_candidate.text) is None
+        or candidate.page_index - parent.page_index
+        < _STALE_NUMBERED_PARENT_MIN_PAGE_GAP
+    ):
+        return False
+    candidates_by_text: dict[str, list[HeadingCandidate]] = {}
+    for item in candidates:
+        if not (parent.source_index < item.source_index < candidate.source_index):
+            continue
+        if (
+            item.disposition != "accepted"
+            or item.numbering_family is not None
+            or item.placement_source not in {"provider", "flattened"}
+            or item.bbox is None
+        ):
+            continue
+        candidates_by_text.setdefault(_normalized_text(item.text), []).append(
+            item
+        )
+    for repeated in candidates_by_text.values():
+        for index, first in enumerate(repeated):
+            for second in repeated[index + 1 :]:
+                if (
+                    first.page_index != second.page_index
+                    and first.bbox is not None
+                    and second.bbox is not None
+                    and all(
+                        abs(left - right) <= _REPEATED_HEADER_BBOX_TOLERANCE
+                        for left, right in zip(
+                            first.bbox.as_tuple(),
+                            second.bbox.as_tuple(),
+                            strict=True,
+                        )
+                    )
+                ):
+                    return True
+    return False
+
+
+def _parenthesized_ordinal(text: str) -> int | None:
+    prefix = text.lstrip()
+    chinese = re.match(rf"^[（(](?P<ordinal>[{_CHINESE_NUMBER}]+)[）)]", prefix)
+    if chinese is not None:
+        return _chinese_ordinal_value(chinese.group("ordinal"))
+    arabic = re.match(r"^[（(](?P<ordinal>[0-9]+)[）)]", prefix)
+    if arabic is not None:
+        return int(arabic.group("ordinal"))
+    return None
 
 
 def _coarse_units(

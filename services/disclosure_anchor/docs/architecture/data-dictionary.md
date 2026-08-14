@@ -76,7 +76,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | status | running / succeeded / failed；stale running 由 worker 按阈值回收 |
 | is_active | 每文档唯一 true（发布原子切换） |
 | artifact_owner_processing_run_id | 实际拥有 parser artifact 与 primary parse artifact 字节的根 parse run；parse=self，rebuild 传播根 owner，不能从路径文本反推 |
-| builder_rules_version | 新 writer 恒等于 `provider_unit.v1`；历史 run 保留原规则版本，不能回写 |
+| builder_rules_version | 新 writer 当前恒等于 `provider_unit.v5`；历史 run 保留原规则版本，不能回写 |
 | parser_target_identity | 产生该 run 的完整 parser target（backend/method/language/runtime bundle identity）；不从零散 parser_* 列反推 |
 | search_projection_error | 当前 retrieval_rules_version 的确定性、非重试检索投影终态；delta 不空转，full 可显式重试，成功替换时同事务清空 |
 | content_hash_aggregate / structure_hash | run 级聚合（U3）；"内容没变"只看前者 |
@@ -91,13 +91,13 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | heading_path | jsonb 完整**源标题路径**（有 heading 时非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text；路径来自 typed heading/outline 结构，不来自 caption 或 taxonomy |
 | title | 只取已接受 source heading 的叶节点，并与 heading_path 末项相等；无可靠 heading 时为 NULL。登记文档标题只留 document scope；caption、单位、脚注不得填入 title |
 | semantic_key / semantic_keys | 可选的受控 Unit **直接主题**路由：scalar 是稳定 canonical lead，JSONB 数组是完整有序主题集且首项等于 scalar；mixed/长 Unit 可保留多个独立事实主题，GIN 支持 any/all recall。唯一精确 Unit 标题可确定性落键，其余标题/正文/表格只生成至多 8 个 source-bound 候选；低成本模型必须逐候选返回闭合布尔裁决，不能造 key、决定边界或把原因/背景/影响误作主题。Document filing type + authoritative disclosure topics 只开放 scope；provider content categories 只作 facet/context。证据不足时两列为 NULL，不以 `document_content` 冒充语义；Build 冻结 receipt，Publish 只重放不调模型 |
-| section_keys | 可选的受控**结构位置**路由，与直接主题分离。只在定期报告中，从已接受 heading_path 的根到叶精确匹配显式 `context_container`；无 contains/similarity、无模型、无 Document 类别传播，空/heading-only Unit 不继承。完整链可让 L2 按“管理层讨论/财务报告/重要事项”等章节批量召回，又不与 Unit 直接主题竞争。JSONB 非空数组、GIN、API any/all；变化进入 query_projection_hash |
-| payload | ProviderDocument 的 source-bound 浅投影：顶层 text 只保存 `{text}`；顶层 table 保存原始 `table_body` HTML 与 caption/footnote 数组；mixed 只保存有序浅内容 fields，不重复 `provider_type`/kind/semantic_type。精确 source type 与粗 owner kind 分别在 ProviderDocument/locator。视觉 part 的 `content_artifacts` 仅含 hash/size/media，使视觉内容进入 content hash；路径、raw JSON、表格 crop 不进入 payload。L1 不解析 grid、不修复 cell、不用 middle HTML 覆盖 content-list owner |
+| section_keys | 可选的受控**结构位置**路由，与直接主题分离。从已接受 heading_path 的根到叶精确匹配显式结构容器：定期报告使用 `context_container`，事件公告只开放少量命中 filing_type/authoritative disclosure_topics scope 的 `section_container`。无 contains/similarity、无模型、无 Document 类别直接传播，空/heading-only Unit 不继承。完整链可让 L2 按“管理层讨论/财务报告/认购方法/交易风险”等章节批量召回，又不与 Unit 直接主题竞争。JSONB 非空数组、GIN、API any/all；变化进入 query_projection_hash |
+| payload | ProviderDocument 的 source-bound 浅投影：顶层 text 只保存 `{text}`；顶层 table 保存原始 `table_body` HTML 与 caption/footnote 数组；mixed 只保存有序浅内容 fields，不重复 `provider_type`/kind/semantic_type。精确 source type 与粗 owner kind 分别在 ProviderDocument/locator。视觉 part 的 `content_artifacts` 仅含 hash/size/media，使视觉内容进入 content hash；路径、raw JSON、表格 crop 不进入 payload。仅当同一不可变 PDF、同一 MinerU text bbox 中 native text 相对 MinerU 只新增完整数字核心（可连同或保留 `%/‰`），其余字符和已有数字保持原序逐字相等时，v2 locator 才允许把 native PDF text 投影为 payload 并记录双侧 hash；ProviderDocument 仍保留原 MinerU 文字。L1 不解析 grid、不修复 cell、不用 middle HTML 覆盖 content-list owner |
 | content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；content 绑定 payload（含视觉内容 digest），query 绑定 title/heading/直接主题 routes/section routes/quality/applicability，structure 绑定 kind/path/order。singleton `semantic_keys=[semantic_key]` 不重复改变 query hash；locator/page/provider identity 不混入哈希，发布前由 fresh ProviderDocument admission + deterministic rebuild 精确复核 |
 | quality_status | ok / needs_review / unusable（乱码率>30%） |
 | applicability | vc16 CHECK：applicable / not_applicable / NULL（√适用声明列化；见 §5 讨论） |
 | page_no | 定位列（artifact_locator 首页码） |
-| artifact_locator | 新 writer 为闭合的 `provider_unit_locator.v1`：绑定 ProviderDocument hash、source heading/block、parts、逻辑表 owner 与逐页 physical segment、无路径 evidence descriptors、显式 search bindings。跨页关系只接受 MinerU merge-on 的 typed owner/stub assertion；不按相似度猜、不复制 HTML、不存 raw JSON/path；JSONB(none_as_null) |
+| artifact_locator | 新 writer 为闭合的 `provider_unit_locator.v2`：绑定 ProviderDocument hash、source heading/block、parts、逻辑表 owner 与逐页 physical segment、无路径 evidence descriptors、显式 search bindings，以及可选的 native-PDF 数字校正 provenance。历史 v1 继续只读。跨页关系只接受 MinerU merge-on 的 typed owner/stub assertion；不按相似度猜、不复制 HTML、不存 raw JSON/path；JSONB(none_as_null) |
 
 ### classification_rule（0016，词表的库内查询副本）
 | 列 | 含义 |
@@ -152,7 +152,7 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 | 文件 | 内容 | 当前版本 |
 |---|---|---|
 | application/contracts/provider_document_envelope.py | 新 writer 的 canonical primary parse artifact codec；必须经独立 PDF 校验与 MinerU bundle 全量重读 admission，codec 本身不是 source trust boundary | provider_document.v1 |
-| application/contracts/provider_unit.py + application/services/provider_unit_builder.py | 闭合 Unit locator/search binding 与 deterministic coarse Unit 投影；不含业务 taxonomy、proof graph 或 cell repair | provider_unit.v1 |
+| application/contracts/provider_unit.py + application/services/provider_unit_builder.py | 闭合 Unit locator/search binding 与 deterministic coarse Unit 投影；不含业务 taxonomy、proof graph 或 cell repair | provider_unit.v5 |
 | application/contracts/normalized_ir_v4_evidence.py | 冻结历史 v4 evidence manifest 的最小只读 resolver；不得被新 writer import，也不支持 Build/Publish/Rebuild | normalized_ir.v4 read-only |
 | adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs；r6 financing +011711 担保/011713 财务资助、meeting_resolution +01239910；r7 equity_share_change +0115 父级实码） | 2026-07-r7 |
 | adapters/sources/cninfo/facet_map.json | F006V 维度判定（market 精确码/publisher 0101） | 2026-07-r1 |

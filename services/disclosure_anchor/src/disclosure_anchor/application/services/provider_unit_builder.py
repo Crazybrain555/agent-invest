@@ -44,6 +44,7 @@ from disclosure_anchor.application.contracts.provider_unit import (
     ProviderUnitPayloadKind,
     ProviderUnitSearchBinding,
     ProviderUnitSearchContractError,
+    ProviderUnitSourceTextReconciliation,
     provider_unit_locator_from_payload,
 )
 from disclosure_anchor.application.contracts.retrieval_primary import (
@@ -80,7 +81,7 @@ def build_provider_units(
 ) -> ProviderUnitBuildResult:
     """Build deterministic drafts; the capability cannot be bypassed with a DTO."""
 
-    document = admitted.provider_document
+    document = admitted.effective_provider_document
     outline = build_document_outline(
         document,
         level_hints=level_hints,
@@ -288,6 +289,22 @@ class _BuildContext:
             evidence_only_block_source_indices=tuple(evidence_only),
             unbound_table_parts=tuple(bound_unbound),
             evidence_artifacts=self._evidence_artifacts(parts),
+            source_text_reconciliations=tuple(
+                ProviderUnitSourceTextReconciliation(
+                    source_index=item.source_index,
+                    payload_ordinal=item.payload_ordinal,
+                    raw_block_sha256=item.raw_block_sha256,
+                    provider_text_sha256=item.provider_text_sha256,
+                    source_text_sha256=item.source_text_sha256,
+                    source_kind=item.source_kind,
+                )
+                for item in self.admitted.source_text_reconciliations
+                if item.source_index
+                in {
+                    *unit_sources,
+                    *(heading_ref.source_index for heading_ref in heading_chain),
+                }
+            ),
             search_targets=tuple(search_bindings),
         )
         heading_path = () if heading is None else heading.headpath
@@ -489,7 +506,7 @@ def replay_provider_unit_search_binding(
         raise ValueError("search binding does not belong to the provider Unit")
     _validate_binding_owner(locator=draft.locator, binding=binding)
     return _replay_binding(
-        document=admitted.provider_document,
+        document=admitted.effective_provider_document,
         payload=draft.payload,
         payload_kind=draft.payload_kind,
         title=draft.title,
@@ -509,7 +526,10 @@ def replay_provider_unit_search_binding_source_text(
     if binding not in draft.locator.search_targets:
         raise ValueError("search binding does not belong to the provider Unit")
     _validate_binding_owner(locator=draft.locator, binding=binding)
-    source_text = _source_payload_text(admitted.provider_document, binding.source)
+    source_text = _source_payload_text(
+        admitted.effective_provider_document,
+        binding.source,
+    )
     destination_text = _destination_text(
         payload=draft.payload,
         payload_kind=draft.payload_kind,
@@ -787,6 +807,7 @@ def _validate_build(
     owned_segments: list[int] = []
     search_targets: list[str] = []
     logical_tables: list[int] = []
+    covered_reconciliations: set[tuple[int, int]] = set()
     for unit, retrieval_unit, draft in zip(
         context.outline.units,
         context.retrieval.units,
@@ -807,6 +828,11 @@ def _validate_build(
             )
         if draft.title != unit.title or draft.heading_path != unit.headpath:
             raise ValueError("provider Unit heading differs from its coarse Unit")
+        expected_heading_chain = context._heading_chain(
+            None if unit.heading_id is None else context.headings[unit.heading_id]
+        )
+        if draft.locator.heading_chain != expected_heading_chain:
+            raise ValueError("provider Unit heading locator differs from its source")
         if draft.locator.heading_chain:
             owned_blocks.append(draft.locator.heading_chain[-1].source_index)
         for part in draft.locator.parts:
@@ -818,6 +844,24 @@ def _validate_build(
         search_targets.extend(
             binding.source.target_id for binding in draft.locator.search_targets
         )
+        actual_reconciliations = tuple(
+            (item.source_index, item.payload_ordinal)
+            for item in draft.locator.source_text_reconciliations
+        )
+        dependency_sources = {
+            *unit.block_source_indices,
+            *(item.source_index for item in expected_heading_chain),
+        }
+        expected_reconciliations = tuple(
+            (item.source_index, item.payload_ordinal)
+            for item in context.admitted.source_text_reconciliations
+            if item.source_index in dependency_sources
+        )
+        if actual_reconciliations != expected_reconciliations:
+            raise ValueError(
+                "provider Unit source repairs differ from its source dependencies"
+            )
+        covered_reconciliations.update(actual_reconciliations)
     owned_segments.extend(
         part.part.physical_segment_index
         for part in result.unassigned_table_parts
@@ -839,6 +883,11 @@ def _validate_build(
         )
     if logical_tables != list(range(len(context.tables.logical_tables))):
         raise ValueError("provider Unit build must own every logical table in order")
+    if covered_reconciliations != {
+        (item.source_index, item.payload_ordinal)
+        for item in context.admitted.source_text_reconciliations
+    }:
+        raise ValueError("provider Unit build must bind every source repair")
 
 
 __all__ = [

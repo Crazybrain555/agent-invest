@@ -7,7 +7,9 @@ import unittest
 
 from disclosure_anchor.application.contracts.provider_document_admission import (
     SourcePdfObservation,
+    SourcePdfTextObservation,
 )
+from disclosure_anchor.application.contracts.provider_document import ProviderDocument
 from disclosure_anchor.application.contracts.provider_document_envelope import (
     provider_document_envelope_from_bytes,
 )
@@ -132,8 +134,24 @@ class _ProviderSource:
     def read_provider_document_record(self, _relpath: Path) -> bytes:
         raise AssertionError("parse does not read a provider record")
 
-    def rebuild_provider_document(self, *_args: object, **_kwargs: object) -> object:
+    def rebuild_provider_document(
+        self,
+        _bundle_relpath: Path,
+        *,
+        source_pdf_sha256: str,
+    ) -> ProviderDocument:
         raise AssertionError("parse does not re-admit its new record")
+
+    def observe_source_pdf_text(
+        self,
+        _relpath: Path,
+        *,
+        document: ProviderDocument,
+        expected_sha256: str,
+    ) -> tuple[SourcePdfTextObservation, ...]:
+        raise AssertionError(
+            "parse must not read native PDF text before provider admission"
+        )
 
 
 class _ArtifactStore:

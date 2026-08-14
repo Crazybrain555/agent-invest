@@ -134,7 +134,7 @@
   },
   "tests/unit/test_document_outline.py": {
    "private_imports": [],
-   "tests": 31
+   "tests": 42
   },
   "tests/unit/test_download_document.py": {
    "private_imports": [],
@@ -224,7 +224,7 @@
   },
   "tests/unit/test_provider_document_admission.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 17
   },
   "tests/unit/test_provider_document_envelope.py": {
    "private_imports": [],
@@ -236,7 +236,7 @@
   },
   "tests/unit/test_provider_unit_builder.py": {
    "private_imports": [],
-   "tests": 17
+   "tests": 20
   },
   "tests/unit/test_provider_unit_evidence.py": {
    "private_imports": [],
@@ -282,7 +282,7 @@
   },
   "tests/unit/test_semantic_router.py": {
    "private_imports": [],
-   "tests": 81
+   "tests": 87
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],

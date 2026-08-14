@@ -15,7 +15,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
 )
 
 
-SEMANTIC_TAXONOMY_VERSION = "semantic-taxonomy-2026-08-r35"
+SEMANTIC_TAXONOMY_VERSION = "semantic-taxonomy-2026-08-r37"
 _FINANCIAL_RESOURCE = "semantic_financial_routes.v1.json"
 _EVENT_RESOURCE = "semantic_event_routes.v1.json"
 _PERIODIC_SCOPES = ("annual_report", "semiannual_report", "quarterly_report")
@@ -49,12 +49,13 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
         "fallback_key",
         "overview_container_keys",
         "quantitative_fact_keys",
+        "section_container_keys",
         "version",
     }:
         raise SemanticRouteContractError("event semantic taxonomy fields drift")
-    if financial.get("version") != "semantic-financial-2026-08-r17":
+    if financial.get("version") != "semantic-financial-2026-08-r18":
         raise SemanticRouteContractError("financial semantic taxonomy version drift")
-    if events.get("version") != "semantic-events-2026-08-r25":
+    if events.get("version") != "semantic-events-2026-08-r26":
         raise SemanticRouteContractError("event semantic taxonomy version drift")
     if events.get("fallback_key") != SEMANTIC_FALLBACK_KEY:
         raise SemanticRouteContractError("event semantic fallback key drift")
@@ -126,6 +127,10 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
         events.get("quantitative_fact_keys"),
         label="event quantitative fact keys",
     )
+    event_section_containers = _key_set(
+        events.get("section_container_keys"),
+        label="event section container keys",
+    )
     if not event_containers.issubset(event_keys):
         raise SemanticRouteContractError("event exclusive container key is not defined")
     if not event_overviews.issubset(event_keys):
@@ -133,6 +138,12 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
     if not event_quantitative_facts.issubset(event_keys):
         raise SemanticRouteContractError(
             "event quantitative fact key is not defined"
+        )
+    if not event_section_containers.issubset(event_keys):
+        raise SemanticRouteContractError("event section container key is not defined")
+    if event_section_containers & (event_containers | event_overviews):
+        raise SemanticRouteContractError(
+            "event section container conflicts with another container policy"
         )
     if event_containers & event_overviews:
         raise SemanticRouteContractError(
@@ -158,6 +169,7 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
                 scopes=_text_array(raw_entry["scopes"], label=f"{key} scopes"),
                 exclusive_container=key in event_containers,
                 overview_container=key in event_overviews,
+                section_container=key in event_section_containers,
                 quantitative_fact=key in event_quantitative_facts,
             )
         )

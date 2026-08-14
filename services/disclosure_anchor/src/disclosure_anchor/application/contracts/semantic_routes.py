@@ -10,7 +10,7 @@ from typing import Literal, cast, get_args
 
 SEMANTIC_ROUTE_RECEIPT_VERSION = "semantic_route_receipt.v1"
 SEMANTIC_ROUTE_RECEIPTS_FILENAME = "semantic_route_receipts.v1.jsonl"
-SEMANTIC_ROUTER_VERSION = "semantic_router.v53"
+SEMANTIC_ROUTER_VERSION = "semantic_router.v54"
 SEMANTIC_PROMPT_VERSION = "semantic_route_adjudication.v31"
 SEMANTIC_FALLBACK_KEY = "document_content"
 MAX_SEMANTIC_ROUTES = 8
@@ -43,6 +43,7 @@ SemanticRouteEvidenceKind = Literal[
     "source_heading_exact",
     "source_heading_candidate",
     "source_heading_similarity",
+    "source_heading_risk_suffix",
     "source_body_candidate",
     "source_table_candidate",
     "source_labeled_field_exact",
@@ -69,6 +70,7 @@ class SemanticRouteDefinition:
     exclusive_container: bool = False
     overview_container: bool = False
     context_container: bool = False
+    section_container: bool = False
     quantitative_fact: bool = False
 
     def __post_init__(self) -> None:
@@ -96,6 +98,14 @@ class SemanticRouteDefinition:
             raise SemanticRouteContractError(
                 f"semantic route {self.key} cannot mix context and event containers"
             )
+        if self.section_container and (
+            self.context_container
+            or self.exclusive_container
+            or self.overview_container
+        ):
+            raise SemanticRouteContractError(
+                f"semantic route {self.key} has an invalid section-container policy"
+            )
         if not isinstance(self.quantitative_fact, bool):
             raise SemanticRouteContractError(
                 f"semantic route {self.key} quantitative-fact policy must be boolean"
@@ -117,7 +127,9 @@ class SemanticRouteTaxonomy:
         if len(keys) != len(set(keys)):
             raise SemanticRouteContractError("semantic taxonomy repeats a key")
         context_definitions = tuple(
-            item for item in self.definitions if item.context_container
+            item
+            for item in self.definitions
+            if item.context_container or item.section_container
         )
         for index, left in enumerate(context_definitions):
             left_labels = {_normalize_context_label(label) for label in left.labels}

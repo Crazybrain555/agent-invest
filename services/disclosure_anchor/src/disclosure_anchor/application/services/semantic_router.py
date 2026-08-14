@@ -461,6 +461,21 @@ class SemanticRouter:
         has_unit_content = any(
             source.kind in {"body_text", "table_text"} for source in sources
         )
+        risk_title_source_ids: set[str] = set()
+        risk_state = state.get("transaction_risk")
+        if document.filing_type == "restructuring_assets" and risk_state is not None:
+            for source in sources:
+                if source.kind != "unit_title":
+                    continue
+                title_core = _normalize_title(source.text)
+                if len(title_core) > len("风险") and title_core.endswith("风险"):
+                    risk_title_source_ids.add(source.source_id)
+                    risk_state.add(
+                        score=1200,
+                        source_id=source.source_id,
+                        evidence_kind="source_heading_risk_suffix",
+                        locked=True,
+                    )
         definitions_context = self._definitions.get("definitions")
         is_definitions_context = (
             definitions_context is not None
@@ -528,6 +543,16 @@ class SemanticRouter:
             for source_index, source in enumerate(sources):
                 normalized = _normalize_match_text(source.text)
                 title_core = _normalize_title(source.text)
+                if (
+                    source.kind == "unit_title"
+                    and source.source_id in risk_title_source_ids
+                    and definition.key != "transaction_risk"
+                ):
+                    # In a restructuring risk heading, the semantic centre is
+                    # the risk assertion.  Embedded nouns such as 标的资产 or
+                    # 业绩承诺 remain body candidates, but the title cannot
+                    # lock them as the Unit's primary topic.
+                    continue
                 for label in labels:
                     if not label:
                         continue
@@ -831,9 +856,7 @@ class SemanticRouter:
     ) -> tuple[str, ...] | None:
         """Derive normalized structural position without model adjudication."""
 
-        if document.filing_type not in _PERIODIC_FILING_TYPES or not any(
-            source.kind in {"body_text", "table_text"} for source in sources
-        ):
+        if not any(source.kind in {"body_text", "table_text"} for source in sources):
             return None
         classification_scopes = {
             value
@@ -847,7 +870,7 @@ class SemanticRouter:
                 definition.key
                 for definition in self.taxonomy.definitions
                 if (
-                    definition.context_container
+                    (definition.context_container or definition.section_container)
                     and (
                         not definition.scopes
                         or bool(set(definition.scopes) & classification_scopes)
@@ -1694,6 +1717,9 @@ def _semantic_input_hash(
                     "overview_container": definitions[
                         candidate.key
                     ].overview_container,
+                    "section_container": definitions[
+                        candidate.key
+                    ].section_container,
                     "scopes": list(definitions[candidate.key].scopes),
                 }
                 for candidate in candidates

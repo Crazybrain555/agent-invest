@@ -49,6 +49,7 @@ GET /v1/units/{asset_id}/evidence/{sha256}
 GET /v1/filings/latest
 GET /v1/changes
 GET /v1/tracked-companies
+GET /v1/semantic-routes
 ```
 
 检查项（语义细则以 milestone 06 为唯一权威，本清单只列覆盖面）：
@@ -96,8 +97,10 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
   数组是完整有序 route set。Provider writer 的独立 route 阶段只接受 source-bound 闭集候选，
   唯一精确标题可确定性落键，歧义候选由 Luna 只选 candidate ID 或弃权；不得用键改变 source
   payload/boundary，也不得恢复旧自由词面/公司专例规则堆
-0036 新增 section_keys 存储/GIN/API 集合过滤；只从可靠 heading_path 的显式 context-container
-  做精确、可重建的结构归一，不调用模型，不占 semantic route cap，不改变 Unit 边界
+0036 新增 section_keys 存储/GIN/API 集合过滤；只从可靠 heading_path 的显式结构容器
+  做精确、可重建的结构归一（定期报告 context-container；事件公告命中 filing_type/
+  authoritative disclosure_topics scope 的窄
+  section-container），不调用模型，不占 semantic route cap，不改变 Unit 边界
 0015 起 document_units_v1 增加 heading_path_text（视图内派生的面包屑文本
   "第八节 财务报告 > … > 75、其他综合收益"——多级标题的可检索形态；不入库、
   不进哈希；06R 投影将对同一字段建 FTS 索引）
@@ -263,7 +266,33 @@ singleton 数组不重复改变 query_projection_hash；只有真实 secondary r
 
 ```text
 semantic_key(s) 只保存 Unit 自身直接主题；不再把父章节混进模型候选或 receipt
-section_keys 保存定期报告已接受 heading_path 的精确 context-container 链，完整根到叶、无相似/包含匹配
-两列均进入 key-token 检索；section_keys 独立进入 query_projection_hash，并提供 any/all API
+section_keys 保存已接受 heading_path 的精确结构容器链：定期报告 context-container 与事件公告
+命中 filing_type/authoritative disclosure_topics scope 的窄 section-container；完整根到叶、无相似/包含匹配
+只有 semantic_keys 进入全文 key-token 检索；section_keys 独立进入 query_projection_hash，并仅由
+any/all 结构过滤参与 L2/L3 联合召回，避免把父章节词复制到每个正文 Unit
 content_categories 仍仅是 Document provider facet，经 Unit public view 继承；不能填充任一 Unit route
+```
+
+2026-08-14（semantic route 公共目录）：
+
+```text
+GET /v1/semantic-routes 返回 semantic_routes_catalog.v1；直接从当前 taxonomy 投影 key/description/
+labels/scopes/usable_as_section_key，taxonomy_version 随资源版本变化
+usable_as_section_key 同时覆盖定期报告 context-container 与事件 section-container；document_content
+fallback 不作为真实 route 暴露；L2/L3 不复制 L1 私有 JSON
+```
+
+2026-08-14（provider Unit v5 / locator v2 数字保真）：
+
+```text
+ProviderDocument 仍逐字保存 MinerU 3.4.4 Hybrid-medium 输出；不引入双 parser 或第二搜索流
+admission 可在同一 raw PDF hash/page count、同一 MinerU text bbox 与 raw block 下读取 native text
+只有 native 相对 MinerU 仅新增完整数字核心（可连同或保留 `%/‰`），且除数字 token 位置相邻 ASCII 横向空格/Tab
+可随 token 缺失或保留占位外，其余字符（包括宽窄字符、标点、空白）与已有数字原序逐字相等时才投影
+唯一 reader 规范化为非首尾孤立 PDFium `CRLF`，并仅在同一多行观察移除一个矩形末尾空格；CRLF 周围
+空白、多个末尾空格、NUL、裸 `CR/LF`、空白行均拒绝；数字替换/重排、表格、
+非数字差异、旋转/页面形状不闭合、高度重叠 bbox 和歧义不修
+provider_unit_locator.v2 记录 source_index/payload ordinal/raw block hash/provider+source text hash/source kind
+每个 locator 覆盖本 Unit blocks 与 heading chain 的 repair 依赖；Publish 从不可变 PDF 重放校正；
+reader pin `pypdfium2==5.13.0`；历史 locator v1 继续读 evidence/search，但不能声明 source repair
 ```

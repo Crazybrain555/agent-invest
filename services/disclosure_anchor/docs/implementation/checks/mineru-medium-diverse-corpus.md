@@ -153,6 +153,16 @@ search projection contains 805 parent rows and 25,954 source-bound atoms under
   and SHA-256 (57,677,277 bytes total); all ten raw PDFs, Provider records, Unit
   snapshots, active-run uniqueness, and search coverage pass `doctor --full`.
 
+The bullets above describe the earlier published replay. The 2026-08-14
+`provider_unit.v5` candidate now restores that sentence and seven other
+numeric-only omissions from two PDFs through the exact-bbox native-text rule in
+`provider_unit_locator.v2`. A full read-only pass observed 2,860 MinerU text
+rectangles: eight repairs and 2,852 unchanged. The source pages were rendered
+and checked for the restored heading number, dates, periods, percentages,
+footnote ordinals, basis points and share-lock figures. ProviderDocument remains
+byte-for-byte MinerU; only the Unit projection changes, and the candidate is not
+described as published until the final manifest-bound Unit replay succeeds.
+
 The first short-document build exposed and closed one real integration bug:
 Python `None` for `semantic_keys` was initially bound as JSON `null`, which the
 SQL scalar/array pairing CHECK correctly rejected. `JSONB(none_as_null=True)`

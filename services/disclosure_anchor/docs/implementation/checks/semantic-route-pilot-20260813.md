@@ -1,23 +1,25 @@
 # Semantic route and retrieval pilot — 2026-08-13
 
 This is the current data-quality receipt for Unit semantic routing. The clean
-development replay has already published v53/r34 routes for all 805 Units. The
-r35 candidate below independently re-read the same immutable PDFs and Provider
-records without mutating PostgreSQL or AgentSSD; its one taxonomy delta remains
-pending the reviewed Unit-only replay described under production gates.
+development database currently publishes v53/r35 for all 805 Units. The r37/v54
+candidate below independently re-read the same immutable PDFs, Provider records,
+and native PDF text without mutating PostgreSQL or AgentSSD. It remains pending
+the reviewed Unit-only replay described under production gates.
 
 ## Current contract
 
-- taxonomy: `semantic-taxonomy-2026-08-r35`, containing 182 financial and
-  115 event routes;
-- router: `semantic_router.v53`;
+- taxonomy: `semantic-taxonomy-2026-08-r37`, containing 182 financial and
+  120 event routes;
+- router: `semantic_router.v54`;
 - optional adjudicator: `codex_cli.v4.low`, `gpt-5.6-luna`, prompt
   `semantic_route_adjudication.v31`;
 - `semantic_keys` contains direct Unit topics only; `semantic_key` is its
   deterministic first member;
-- `section_keys` contains exact normalized positions from accepted periodic-
-  report heading paths. It is deterministic, never a model candidate, and
-  ranks below a direct Unit route;
+- `section_keys` contains exact normalized positions from accepted heading
+  paths. Periodic reports use explicit context containers; event filings expose
+  only a small section-container allowlist gated by filing type or authoritative
+  disclosure-topic scope. It is deterministic,
+  never a model candidate, and ranks below a direct Unit route;
 - `content_categories` remains a CNInfo Document facet. It is not fabricated
   from Unit text and cannot prove a Unit route;
 - no direct or section evidence leaves the two route fields NULL. The exact
@@ -41,54 +43,101 @@ statistical claim about 5,000 issuers.
 
 | filing type | Units | direct route | section route | either |
 |---|---:|---:|---:|---:|
-| annual_report | 687 | 261 | 512 | 580 |
-| quarterly_report | 47 | 39 | 19 | 41 |
+| annual_report | 687 | 261 | 518 | 585 |
+| quarterly_report | 47 | 39 | 21 | 41 |
 | convertible_bond | 17 | 12 | 0 | 12 |
-| equity_incentive | 14 | 14 | 0 | 14 |
+| equity_incentive | 14 | 14 | 1 | 14 |
 | share_buyback | 19 | 18 | 0 | 18 |
 | performance_forecast | 10 | 6 | 0 | 6 |
 | operating_data | 6 | 3 | 0 | 3 |
 | performance_briefing | 3 | 2 | 0 | 2 |
 | investor_relations | 1 | 1 | 0 | 1 |
 | correction_supplement | 1 | 1 | 0 | 1 |
-| **total** | **805** | **357** | **531** | **678** |
+| **total** | **805** | **357** | **540** | **683** |
 
 Decision sources are 357 deterministic, 150 deterministic rule abstentions,
 and 298 no-candidate fallbacks. Direct route cardinality is: 448 zero, 331 one,
 19 two, three three, two five, and two seven.
-No Unit exceeds the eight-route cap. Section cardinality is 274 zero, 233 one,
+No Unit exceeds the eight-route cap. Section cardinality is 265 zero, 242 one,
 and 298 two.
 
-The full replay deliberately configured a nonexistent adjudicator executable.
-It still completed with zero calls and zero model tokens.
+The full replay completed with zero calls and zero model tokens.
 Convertible-bond `1225466824/u6`, “（2）年利息计算”, is now routed by a canonical
-regulatory subheading rather than a model. The current replay is
-`/private/tmp/disclosure-semantic-route-v53-tax35-full-current-no-model.json`
-(SHA-256 `8f2a859b6bf8c8c1f7fdb060caa97bc1103a628f0b31f5239c3dbe55e87093dc`).
+regulatory subheading rather than a model. The final reviewed replay is
+`/private/tmp/disclosure-semantic-route-r37-source-native-v54-final-fable-fix.json`
+(SHA-256 `89d7b3918885c427beb990fea3ecf2ffa20a82fbe157a2d2e5565982f19f780a`).
 It is session evidence, not a tracked production artifact. Zero calls prove
 that this corpus does not depend on the optional adapter; they do not by
 themselves qualify that adapter for a future truly ambiguous Unit.
 
-The r34 baseline is
-`/private/tmp/disclosure-semantic-route-v53-tax34-full-current-no-model.json`
-(SHA-256 `40b2f6c064e304c6229c9858e7d7580b65d10d895446e18c06547e1488db5a3c`).
-The exact r34→r35 diff contains 65 section-array changes, all beneath the
-accepted annual-report heading `第五节 公司治理报告暨企业管治报告` in provider document
-`1225067794`. Direct routes remain byte-for-byte unchanged at 357. Thirty-nine
-previously nonempty lexical-only Units gain the existing `governance` section
-route, reducing lexical-only coverage from 166 to 127; no other document and no
-model decision changes. Diff receipt:
-`/private/tmp/disclosure-semantic-route-v53-tax35-diff.json` (SHA-256
-`4da1ab1fab5e867a18b360ec3e3aae83e5cb4339c0f7b60c09eea6e6fe3a3048`).
+The previous source-identity candidate was
+`/private/tmp/disclosure-semantic-route-r36-source-native-final.json`
+(SHA-256 `3ca6a451e21c2686b73aa6d55b2eb7416ffb887f1af84e66c4066acbe8622e6d`).
+The r36→r37/v54 exact row diff changes no title, heading path, direct route,
+primary route or decision source. Only equity-incentive `1225339310/u11`, whose
+accepted source heading is exactly “本次归属后对公司财务指标的影响”, additionally
+gains the scope-authorized `dilution_impact` structural key.
+
+The published r35 baseline is
+`/private/tmp/disclosure-semantic-route-v53-tax35-full-current-no-model.json`
+(SHA-256 `8f2a859b6bf8c8c1f7fdb060caa97bc1103a628f0b31f5239c3dbe55e87093dc`).
+The r35→r36 source replay changes no direct-route cardinality. Six annual Units
+beneath the exact accepted heading `公司投资情况` gain `investment_analysis`;
+the quarterly `3/4/5/6` numbered roots and their following paths are corrected;
+units 11–12 newly inherit the `share_changes` section route from `3 股东信息`;
+generic `利息收入`、`利息支出`、`资本管理` routes lose the misleading `bank_`
+prefix while genuinely bank-specific routes retain it. A continuation-marked
+stale audit ancestor is removed only after a long page gap plus the same
+unnumbered provider title at near-identical bbox positions on two intervening
+pages; non-continuation, different-position and adjacent one-page negatives
+remain nested.
+
+The same replay calibrated native-PDF numeric reconciliation over all ten source
+documents: 2,860 exact MinerU text rectangles yielded eight repairs in two PDFs
+and 2,852 unchanged observations. The repairs restore only omitted numbers such
+as dates, periods, percentages and short numeric headings. Admission requires
+the same immutable PDF hash/page count, the exact provider block/bbox, and a
+deletion-only proof: native text may add complete numeric cores (with a trailing
+`%/‰` removed or retained), while every other character and existing number
+remains in source order; ASCII space/tab immediately adjacent to a deleted
+numeric token may disappear with that token or remain as the MinerU placeholder.
+Malformed grouping that lexes into adjacent unsigned numeric atoms is rejected
+rather than treated as another omitted number. Isolated PDFium-generated `CRLF`
+line breaks preserve an ASCII word boundary, so
+a repaired wrapped English phrase cannot be fused; one calibrated terminal
+rectangle space is removed only when that same bounded-text observation contains
+a PDFium-generated line break, while NUL, bare `CR/LF`, blank lines and all other
+boundary/inner spacing (including whitespace adjacent to `CRLF`) remain exact. ProviderDocument
+keeps the original MinerU text; `provider_unit_locator.v2` stores raw-block plus
+provider/source text hashes and Publish replays the PDF. No table, nonnumeric
+difference, alternate reading order, or second parser structure is admitted.
 
 An independent DB-free replay covers 822 Units across performance flash,
 inquiry notice, major contract, delisting risk, rights issue, restructuring,
-and a full 221-page semiannual filing. It has 333 direct-routed Units, 511
-section-routed Units, 624 with either route surface, 198 lexical-only Units,
-and zero model calls. Report:
-`/private/tmp/disclosure-heldout-20260813-r1/heldout-eval-semantic_router.v53.json`
-(SHA-256 `a0c232ffb6ad2288a97af51a328336d322404578cc0a2253e14f0dd40404715a`).
-The final spanning-title/header-row rule changes exactly one of 805 current
+and a full 221-page semiannual filing. It has 364 direct-routed Units, 580
+section-routed Units, 688 with either route surface, 134 lexical-only Units,
+and zero model calls. Final report:
+`/private/tmp/disclosure-heldout-20260813-r1/heldout-eval-semantic_router.v54.json`
+(SHA-256 `3674b57444257d1434cfdab6ea2a465af0553bce6a71d6e42fd9e5d39e1beaec`).
+The event slice adds exact, scoped section recall for rights-issue issuance/
+subscription/outcome sections and restructuring impact/risk/rationale/
+classification/supporting-finance sections. A 12-case source-reviewed direct-
+and-section gold passes 12/12 (gold SHA-256
+`f23106e2960e1471465a2abac96426f5f5610e94517005cca528cf3d9ffc5ead`;
+review SHA-256 `201137c13931ae932169bf0af81a5f9de7a3ba4390747162461bd4d75a9dc736`).
+Risk headings such as “标的资产评估值风险” are centred on `transaction_risk`
+instead of treating the embedded noun as the Unit's primary topic.
+
+The 221-page semiannual source also constrained two outline rules. A provider
+table by itself is evidence content, never proof of a missing section boundary;
+the environmental subsection therefore remains conservatively under the last
+source-bound parent rather than inventing a heading that MinerU merged into a
+caption. An unnumbered weak label exits a completed parenthesized subgroup only
+when the immediately following provider block explicitly restarts the same
+numbering family at one. This fixes the source-visible receivables subgroup
+labels while distant or lower-ordinal lookahead remains nested.
+
+The earlier spanning-title/header-row rule changes exactly one of 805 current
 Units—the actual Q&A table whose second row is “序号/提问内容/回复内容”—and zero
 of these 822 held-out Units. The earlier typed-field slice changes only six
 current rows, all source-reviewed form/header or canonical bond-heading
@@ -167,7 +216,7 @@ from Unit topics. Filing type, disclosure topics, Unit routes, section routes,
 and lexical search are separate retrieval surfaces.
 
 The current read-only public-view audit makes that distinction concrete: the
-v53/r34 clean replay has 357 direct-routed Units and 486 section-routed Units,
+v53/r35 clean replay has 357 direct-routed Units and 531 section-routed Units,
 while `content_categories` is non-NULL for 23 Units belonging to the two
 Documents whose CNInfo records actually carry that facet, and NULL for the
 remaining 782 Units across eight Documents. Content-bearing Units must not be
@@ -182,9 +231,9 @@ from the direct/section/lexical surfaces above.
   production canary; do not infer adapter eligibility from the zero-call run.
 - The 17-query gold proves the reviewed cases, not full query-language recall.
   Held-out process classes and atypical PDF layouts remain required.
-- The live development rows/search projections still carry the reviewed r34
-  baseline. Write r35 only after its focused/full tests and independent exact-
-  diff review pass, then rerun route/query gold and row-level data-quality
-  inspection against the public views.
+- The live development rows/search projections still carry the reviewed r35
+  baseline. Write r37/v54 only after its current-byte independent reviews and
+  commit pass, then rerun route/query gold and row-level data-quality inspection
+  against the public views through one manifest-bound Unit-only replay.
 - A final doctor/canary pass and held-out source inspection remain required
   before a production-readiness claim or worker enablement.

@@ -292,8 +292,8 @@ class SemanticTaxonomyTests(unittest.TestCase):
     def test_packaged_taxonomy_is_closed_and_has_no_fake_fallback_route(self) -> None:
         taxonomy = load_semantic_route_taxonomy()
 
-        self.assertEqual(len(taxonomy.definitions), 297)
-        self.assertEqual(len(taxonomy.by_key()), 297)
+        self.assertEqual(len(taxonomy.definitions), 302)
+        self.assertEqual(len(taxonomy.by_key()), 302)
         self.assertNotIn(taxonomy.fallback_key, taxonomy.by_key())
         self.assertNotIn("other_information", taxonomy.by_key())
         self.assertNotIn("other_significant_events", taxonomy.by_key())
@@ -312,6 +312,9 @@ class SemanticTaxonomyTests(unittest.TestCase):
         self.assertTrue(taxonomy.by_key()["business_review"].context_container)
         self.assertTrue(taxonomy.by_key()["board_committees"].context_container)
         self.assertTrue(taxonomy.by_key()["risk_management"].context_container)
+        self.assertTrue(taxonomy.by_key()["issuance_plan"].section_container)
+        self.assertTrue(taxonomy.by_key()["transaction_risk"].section_container)
+        self.assertFalse(taxonomy.by_key()["issuance_plan"].context_container)
         self.assertFalse(taxonomy.by_key()["revenue_and_cost"].context_container)
         self.assertFalse(taxonomy.by_key()["decision_procedures"].overview_container)
         self.assertIn("share_buyback_cancellation_arrangement", taxonomy.by_key())
@@ -426,6 +429,116 @@ class SemanticTaxonomyTests(unittest.TestCase):
         self.assertEqual(result.receipts[1].decision_source, "fallback")
         self.assertEqual(adjudicator.calls, 0)
 
+    def test_exact_event_heading_projects_section_without_propagating_direct_key(
+        self,
+    ) -> None:
+        admitted, drafts = _drafts_with_parent_heading(
+            "二、本次配股的认购方法",
+            "（一）办理事项",
+            "投资者应当在规定时间内办理相关手续。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("an exact event section must not call model")
+        )
+
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(title=None, filing_type="rights_issue"),
+            drafts=drafts,
+        )
+
+        self.assertIsNone(result.units[1].semantic_keys)
+        self.assertEqual(
+            result.units[1].section_keys,
+            ("subscription_arrangements",),
+        )
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_event_section_requires_exact_heading_scope_and_unit_content(self) -> None:
+        cases = (
+            ("二、本次配股的认购方法说明", "rights_issue", True),
+            ("二、本次配股的认购方法", "annual_report", True),
+            ("二、本次配股的认购方法", "rights_issue", False),
+        )
+        for parent, filing_type, has_content in cases:
+            with self.subTest(
+                parent=parent,
+                filing_type=filing_type,
+                has_content=has_content,
+            ):
+                admitted, drafts = _drafts_with_parent_heading(
+                    parent,
+                    "（一）办理事项",
+                    "投资者应当在规定时间内办理相关手续。",
+                )
+                selected = drafts if has_content else drafts[:1]
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda _batch: self.fail(
+                            "an ineligible event section must not call model"
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type=filing_type,
+                    ),
+                    drafts=selected,
+                )
+
+                self.assertTrue(
+                    all(unit.section_keys is None for unit in result.units)
+                )
+
+    def test_restructuring_risk_suffix_is_the_direct_semantic_centre(self) -> None:
+        for title in (
+            "（三）标的资产的评估值风险",
+            "（五）业绩承诺及其执行风险",
+        ):
+            with self.subTest(title=title):
+                admitted, drafts = _drafts_with_body(
+                    title,
+                    "相关标的资产和业绩承诺存在执行与估值不确定性。",
+                )
+                adjudicator = _Adjudicator(
+                    lambda _batch: self.fail(
+                        "a restructuring risk heading must be deterministic"
+                    )
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=adjudicator,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type="restructuring_assets",
+                    ),
+                    drafts=drafts,
+                )
+
+                self.assertEqual(
+                    result.units[0].semantic_keys,
+                    ("transaction_risk",),
+                )
+                self.assertNotIn(
+                    "target_asset",
+                    result.units[0].semantic_keys or (),
+                )
+                self.assertNotIn(
+                    "performance_commitment",
+                    result.units[0].semantic_keys or (),
+                )
+                self.assertEqual(adjudicator.calls, 0)
+
     def test_official_year_prefixed_and_risk_sections_project_without_model(
         self,
     ) -> None:
@@ -508,6 +621,64 @@ class SemanticTaxonomyTests(unittest.TestCase):
         self.assertIsNone(result.units[1].semantic_keys)
         self.assertIsNone(result.units[1].section_keys)
         self.assertEqual(adjudicator.calls, 0)
+
+    def test_official_company_investment_heading_projects_exact_section(self) -> None:
+        admitted, drafts = _drafts_with_parent_heading(
+            "第四节 董事会报告",
+            "二、公司投资情况",
+            "报告期内公司按监管要求披露本节投资事项。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("an exact investment section must not call model")
+        )
+
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(title=None, filing_type="annual_report"),
+            drafts=drafts,
+        )
+
+        self.assertEqual(result.units[1].section_keys, ("investment_analysis",))
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_nearby_investment_phrase_does_not_widen_exact_section_alias(self) -> None:
+        admitted, drafts = _drafts_with_parent_heading(
+            "第四节 董事会报告",
+            "二、公司投资情况说明补充",
+            "报告期内公司按监管要求披露本节投资事项。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("an inexact investment section must not call model")
+        )
+
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(title=None, filing_type="annual_report"),
+            drafts=drafts,
+        )
+
+        self.assertIsNone(result.units[1].section_keys)
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_generic_financial_titles_do_not_claim_bank_only_routes(self) -> None:
+        taxonomy = load_semantic_route_taxonomy()
+        keys = {definition.key for definition in taxonomy.definitions}
+
+        self.assertIn("interest_income", keys)
+        self.assertIn("interest_expense", keys)
+        self.assertIn("capital_management", keys)
+        self.assertNotIn("bank_interest_income", keys)
+        self.assertNotIn("bank_interest_expense", keys)
+        self.assertNotIn("bank_capital_management", keys)
+        self.assertIn("bank_net_interest_income", keys)
 
     def test_other_information_is_not_a_synthetic_route(self) -> None:
         admitted, drafts = _drafts_with_body(

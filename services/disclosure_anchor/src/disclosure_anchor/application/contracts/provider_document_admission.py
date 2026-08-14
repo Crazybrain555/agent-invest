@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import hashlib
 from pathlib import Path
 import re
 
-from disclosure_anchor.application.contracts.provider_document import ProviderDocument
+from disclosure_anchor.application.contracts.provider_document import (
+    ProviderBlock,
+    ProviderDocument,
+    ProviderPage,
+)
 from disclosure_anchor.application.contracts.provider_document_envelope import (
     ProviderDocumentEnvelope,
 )
@@ -34,12 +39,60 @@ class SourcePdfObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class SourcePdfTextObservation:
+    """Native PDF text measured inside one provider-owned block rectangle."""
+
+    source_index: int
+    page_index: int
+    payload_ordinal: int
+    raw_block_sha256: str
+    text: str
+
+    def __post_init__(self) -> None:
+        if min(self.source_index, self.page_index, self.payload_ordinal) < 0:
+            raise ValueError("source PDF text observation indices cannot be negative")
+        if not _SHA256_RE.fullmatch(self.raw_block_sha256) or not self.text.strip():
+            raise ValueError("source PDF text observation is not source-bound")
+
+
+@dataclass(frozen=True, slots=True)
+class SourceTextReconciliation:
+    """One numeric-only MinerU correction bound to native PDF text."""
+
+    source_index: int
+    payload_ordinal: int
+    raw_block_sha256: str
+    provider_text_sha256: str
+    source_text_sha256: str
+    source_text: str
+    source_kind: str = "source_pdf_native_numeric.v1"
+
+    def __post_init__(self) -> None:
+        if min(self.source_index, self.payload_ordinal) < 0:
+            raise ValueError("source text reconciliation indices cannot be negative")
+        if self.source_kind != "source_pdf_native_numeric.v1":
+            raise ValueError("source text reconciliation kind is unsupported")
+        if not all(
+            _SHA256_RE.fullmatch(value)
+            for value in (
+                self.raw_block_sha256,
+                self.provider_text_sha256,
+                self.source_text_sha256,
+            )
+        ):
+            raise ValueError("source text reconciliation hashes must be canonical")
+        if not self.source_text or _sha_text(self.source_text) != self.source_text_sha256:
+            raise ValueError("source text reconciliation text hash drifted")
+
+
+@dataclass(frozen=True, slots=True)
 class AdmittedProviderDocument:
     """A canonical record whose typed projection was rebuilt from its bundle."""
 
     provider_document_relpath: Path
     provider_document_sha256: str
     envelope: ProviderDocumentEnvelope
+    source_text_reconciliations: tuple[SourceTextReconciliation, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -49,10 +102,57 @@ class AdmittedProviderDocument:
             raise ValueError("admitted provider document path must be relative")
         if not _SHA256_RE.fullmatch(self.provider_document_sha256):
             raise ValueError("admitted provider document hash must be canonical")
+        identities = [
+            (item.source_index, item.payload_ordinal)
+            for item in self.source_text_reconciliations
+        ]
+        if identities != sorted(identities) or len(identities) != len(set(identities)):
+            raise ValueError(
+                "source text reconciliations must be unique and source ordered"
+            )
+        blocks = self.envelope.provider_document.blocks
+        for item in self.source_text_reconciliations:
+            if item.source_index >= len(blocks):
+                raise ValueError("source text reconciliation block is out of range")
+            block = blocks[item.source_index]
+            if (
+                block.raw_item_sha256 != item.raw_block_sha256
+                or item.payload_ordinal >= len(block.payloads)
+                or _sha_text(block.payloads[item.payload_ordinal].text)
+                != item.provider_text_sha256
+            ):
+                raise ValueError("source text reconciliation differs from its provider")
 
     @property
     def provider_document(self) -> ProviderDocument:
         return self.envelope.provider_document
+
+    @property
+    def effective_provider_document(self) -> ProviderDocument:
+        """Return the admitted semantic view with source-bound numeric repairs."""
+
+        if not self.source_text_reconciliations:
+            return self.provider_document
+        by_identity = {
+            (item.source_index, item.payload_ordinal): item
+            for item in self.source_text_reconciliations
+        }
+        pages: list[ProviderPage] = []
+        for page in self.provider_document.pages:
+            blocks: list[ProviderBlock] = []
+            for block in page.blocks:
+                payloads = tuple(
+                    replace(
+                        payload,
+                        text=by_identity[(block.source_index, payload_ordinal)].source_text,
+                    )
+                    if (block.source_index, payload_ordinal) in by_identity
+                    else payload
+                    for payload_ordinal, payload in enumerate(block.payloads)
+                )
+                blocks.append(replace(block, payloads=payloads))
+            pages.append(replace(page, blocks=tuple(blocks)))
+        return replace(self.provider_document, pages=tuple(pages))
 
 
 class ProviderDocumentAdmissionError(ValueError):
@@ -74,4 +174,10 @@ __all__ = [
     "AdmittedProviderDocument",
     "ProviderDocumentAdmissionError",
     "SourcePdfObservation",
+    "SourcePdfTextObservation",
+    "SourceTextReconciliation",
 ]
+
+
+def _sha_text(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()

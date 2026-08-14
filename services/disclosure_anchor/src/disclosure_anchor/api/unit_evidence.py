@@ -23,7 +23,7 @@ from disclosure_anchor.application.contracts.provider_document_envelope import (
     provider_document_envelope_from_bytes,
 )
 from disclosure_anchor.application.contracts.provider_unit import (
-    PROVIDER_UNIT_LOCATOR_VERSION,
+    SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS,
     provider_unit_locator_from_payload,
 )
 from disclosure_anchor.domain.errors import PathSafetyError
@@ -172,11 +172,15 @@ def read_unit_evidence(
         or owner_source_sha256 != source_pdf_sha256
     ):
         evidence_integrity_error("artifact_owner_source_hash_mismatch")
+    locator_version = (
+        None if artifact_locator is None else artifact_locator.get("contract_version")
+    )
     if (
-        artifact_locator is not None
-        and artifact_locator.get("contract_version")
-        == PROVIDER_UNIT_LOCATOR_VERSION
+        isinstance(locator_version, str)
+        and locator_version in SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS
     ):
+        if artifact_locator is None:
+            evidence_integrity_error("unit_evidence_locator_invalid")
         return _read_provider_unit_evidence(
             paths=paths,
             artifact_locator=artifact_locator,
@@ -348,7 +352,10 @@ def _unit_evidence_descriptors(
     if artifact_locator is not None:
         locator_version = artifact_locator.get("contract_version")
         if locator_version is not None:
-            if locator_version != PROVIDER_UNIT_LOCATOR_VERSION:
+            if (
+                not isinstance(locator_version, str)
+                or locator_version not in SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS
+            ):
                 evidence_integrity_error("unit_evidence_locator_invalid")
             try:
                 provider_locator = provider_unit_locator_from_payload(

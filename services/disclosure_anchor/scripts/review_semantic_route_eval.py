@@ -18,6 +18,9 @@ _GOLD_KEYS = {
     "expected_keys",
     "required_keys",
     "forbidden_keys",
+    "expected_section_keys",
+    "required_section_keys",
+    "forbidden_section_keys",
     "rationale",
 }
 
@@ -40,7 +43,10 @@ def _string_list(value: object, *, field: str) -> list[str]:
 
 
 def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any]:
-    if evaluation.get("contract_version") != "semantic_route_model_eval.v1":
+    if evaluation.get("contract_version") not in {
+        "semantic_route_model_eval.v1",
+        "heldout_provider_unit_semantic_review.v1",
+    }:
         raise ValueError("semantic route evaluation contract is unsupported")
     if gold.get("contract_version") != "semantic_route_gold.v1":
         raise ValueError("semantic route gold contract is unsupported")
@@ -68,7 +74,7 @@ def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any
     coverage_by_type: dict[str, Counter[str]] = defaultdict(Counter)
     for row in row_by_identity.values():
         source = row.get("decision_source")
-        filing_type = row.get("effective_filing_type")
+        filing_type = row.get("effective_filing_type", row.get("filing_type"))
         keys = _string_list(row.get("semantic_keys"), field="semantic_keys")
         section_keys = _string_list(
             row.get("section_keys", []), field="section_keys"
@@ -112,28 +118,61 @@ def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any
         forbidden = _string_list(
             raw_case.get("forbidden_keys", []), field="forbidden_keys"
         )
-        if expected is None and not (required or forbidden):
+        expected_sections = (
+            _string_list(
+                raw_case["expected_section_keys"],
+                field="expected_section_keys",
+            )
+            if "expected_section_keys" in raw_case
+            else None
+        )
+        required_sections = _string_list(
+            raw_case.get("required_section_keys", []),
+            field="required_section_keys",
+        )
+        forbidden_sections = _string_list(
+            raw_case.get("forbidden_section_keys", []),
+            field="forbidden_section_keys",
+        )
+        if expected is None and expected_sections is None and not (
+            required or forbidden or required_sections or forbidden_sections
+        ):
             raise ValueError("semantic gold case has no acceptance assertion")
         row = row_by_identity.get((provider_document_id, unit_index))
         reasons: list[str] = []
         actual: list[str] = []
+        actual_sections: list[str] = []
         if row is None:
             reasons.append("row_missing")
         else:
             if row.get("title") != title:
                 reasons.append("title_drift")
             actual = _string_list(row.get("semantic_keys"), field="semantic_keys")
+            actual_sections = _string_list(
+                row.get("section_keys", []), field="section_keys"
+            )
             actual_set = set(actual)
+            actual_section_set = set(actual_sections)
             if expected is not None and actual_set != set(expected):
                 reasons.append("exact_route_set_differs")
             if not set(required).issubset(actual_set):
                 reasons.append("required_route_missing")
             if set(forbidden) & actual_set:
                 reasons.append("forbidden_route_selected")
+            if (
+                expected_sections is not None
+                and actual_section_set != set(expected_sections)
+            ):
+                reasons.append("exact_section_set_differs")
+            if not set(required_sections).issubset(actual_section_set):
+                reasons.append("required_section_missing")
+            if set(forbidden_sections) & actual_section_set:
+                reasons.append("forbidden_section_selected")
         if reasons:
             findings.append(
                 {
                     "actual_keys": actual,
+                    "actual_section_keys": actual_sections,
                     "provider_document_id": provider_document_id,
                     "reasons": reasons,
                     "unit_index": unit_index,

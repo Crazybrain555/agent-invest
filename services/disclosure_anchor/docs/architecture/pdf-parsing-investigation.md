@@ -21,8 +21,15 @@
 > 成为删除或边界规则。
 >
 > **2026-08-12 cutover**：当前唯一 writer 是 MinerU 3.4.4 Hybrid-medium →
-> `provider_document.v1` → `provider_unit_locator.v1`。后文 NormalizedIR、双 parser、规则修复和
+> `provider_document.v1` → `provider_unit_locator.v2`（历史 v1 只读）。后文 NormalizedIR、双 parser、规则修复和
 >旧版本号只属于调研历史；不得据此恢复生产路径。
+>
+> **2026-08-14 数字保真边界**：不恢复默认双 parser。MinerU 仍唯一拥有 block/order/bbox/table；
+> admission 只可在同一 hash-bound PDF、同一 MinerU text bbox 内，用 native PDF text 修正“native
+> 相对 MinerU 仅新增完整数字核心（可连同或保留 `%/‰`），其余字符与已有数字原序逐字相等”的
+> 漏数，并在 locator v2 记录双侧 hash。无 text layer、表格、数字替换/重排、非数字差异、旋转、
+> 高度重叠 bbox 或坐标/身份不闭合时仅保持 MinerU 原文；当前不额外声称已产生独立质量告警。
+> native reader 固定 `pypdfium2==5.13.0`。
 >
 > 服务目的见 `service-purpose.md`：我们要的不是“把 PDF 下载到文件夹”，也不是镜像 parser 的每一页每一格，而是把
 > 按真实文档结构形成包含正文、表格、caption/footnote 与视觉证据的完整 evidence block，

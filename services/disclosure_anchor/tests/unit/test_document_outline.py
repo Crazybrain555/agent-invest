@@ -343,6 +343,83 @@ class DocumentOutlineTest(unittest.TestCase):
             outline.headings[2].parent_heading_id, outline.headings[1].heading_id
         )
 
+    def test_weak_label_escapes_completed_numbered_subgroup(self) -> None:
+        document = _document(
+            _block(0, "第八节 财务报告", level=2),
+            _block(1, "9、其他应收款", level=2),
+            _block(2, "(6) 本期实际核销的应收利息情况", level=2),
+            _block(3, "应收股利", level=2),
+            _block(4, "(1) 应收股利", annotation="paragraph"),
+            _block(5, "(2) 重要的账龄超过 1 年的应收股利", level=2),
+        )
+
+        headings = {
+            heading.text: heading for heading in build_document_outline(document).headings
+        }
+
+        self.assertEqual(
+            headings["应收股利"].headpath,
+            ("第八节 财务报告", "9、其他应收款", "应收股利"),
+        )
+        self.assertEqual(
+            headings["(2) 重要的账龄超过 1 年的应收股利"].headpath,
+            (
+                "第八节 财务报告",
+                "9、其他应收款",
+                "(2) 重要的账龄超过 1 年的应收股利",
+            ),
+        )
+
+    def test_distant_restart_does_not_move_an_unrelated_weak_label(self) -> None:
+        document = _document(
+            _block(0, "第八节 财务报告", level=2),
+            _block(1, "9、其他应收款", level=2),
+            _block(2, "(6) 本期实际核销情况", level=2),
+            _block(3, "补充说明", level=2),
+            _block(4, "正文", annotation="paragraph"),
+            _block(5, "(1) 新序列", level=2),
+        )
+
+        headings = {
+            heading.text: heading for heading in build_document_outline(document).headings
+        }
+
+        self.assertEqual(
+            headings["补充说明"].headpath,
+            (
+                "第八节 财务报告",
+                "9、其他应收款",
+                "(6) 本期实际核销情况",
+                "补充说明",
+            ),
+        )
+
+    def test_table_does_not_create_an_unheaded_section_boundary(
+        self,
+    ) -> None:
+        table = replace(
+            _block(3, "", annotation="table", provider_type="table"),
+            payloads=(ProviderPayload("table_body", None, "<table></table>"),),
+        )
+        document = _paged_document(
+            (
+                _block(0, "第四节 公司治理", level=2),
+                _block(1, "三、员工激励", level=2),
+                _block(2, "(二) 后续进展", level=2),
+            ),
+            (table,),
+            (_block(4, "(一) 环境措施", level=2),),
+        )
+
+        headings = {
+            heading.text: heading for heading in build_document_outline(document).headings
+        }
+
+        self.assertEqual(
+            headings["(一) 环境措施"].headpath,
+            ("第四节 公司治理", "三、员工激励", "(一) 环境措施"),
+        )
+
     def test_dotted_numbered_siblings_escape_intervening_style_subheads(self) -> None:
         document = _document(
             _block(0, "4.6 资本充足率", level=2),
@@ -372,6 +449,231 @@ class DocumentOutlineTest(unittest.TestCase):
         self.assertEqual(
             headings["4.7 其他重要业务指标"].headpath,
             ("4.7 其他重要业务指标",),
+        )
+
+    def test_plain_numbered_sibling_escapes_intervening_style_subhead(self) -> None:
+        document = _document(
+            _block(0, "2 主要财务数据", level=2),
+            _block(1, "3.2 优先股", level=2),
+            _block(2, "优先股赎回情况", level=2),
+            _block(3, "4 管理层讨论与分析", level=2),
+        )
+        outline = build_document_outline(
+            document,
+            level_hints=(_level_hint(document, 2, "pdf_style", 2),),
+        )
+
+        headings = {heading.text: heading for heading in outline.headings}
+        self.assertEqual(
+            headings["优先股赎回情况"].parent_heading_id,
+            headings["3.2 优先股"].heading_id,
+        )
+        self.assertIsNone(headings["4 管理层讨论与分析"].parent_heading_id)
+
+    def test_plain_numbered_sibling_recovers_after_style_root_replaces_stack(
+        self,
+    ) -> None:
+        document = _document(
+            _block(0, "5 财务报表", level=2),
+            _block(1, "未经审计现金流量表（续）", level=2),
+            _block(2, "6 流动性覆盖率信息", level=2),
+        )
+        outline = build_document_outline(
+            document,
+            level_hints=(_level_hint(document, 1, "pdf_style", 2),),
+        )
+
+        headings = {heading.text: heading for heading in outline.headings}
+        self.assertIsNone(headings["5 财务报表"].parent_heading_id)
+        self.assertIsNone(headings["未经审计现金流量表（续）"].parent_heading_id)
+        self.assertIsNone(headings["6 流动性覆盖率信息"].parent_heading_id)
+
+    def test_style_history_does_not_bridge_an_ordinal_restart(self) -> None:
+        document = _document(
+            _block(0, "5 原序列", level=2),
+            _block(1, "样式标题", level=2),
+            _block(2, "1 新序列", level=2),
+        )
+        outline = build_document_outline(
+            document,
+            level_hints=(_level_hint(document, 1, "pdf_style", 2),),
+        )
+
+        headings = {heading.text: heading for heading in outline.headings}
+        self.assertEqual(
+            headings["1 新序列"].parent_heading_id,
+            headings["样式标题"].heading_id,
+        )
+
+    def test_style_history_does_not_cross_a_new_numbered_parent(self) -> None:
+        document = _document(
+            _block(0, "第一节 旧父级", level=2),
+            _block(1, "5 旧序列", level=2),
+            _block(2, "旧样式标题", level=2),
+            _block(3, "第二节 新父级", level=2),
+            _block(4, "6 新父级内标题", level=2),
+        )
+        outline = build_document_outline(
+            document,
+            level_hints=(_level_hint(document, 2, "pdf_style", 3),),
+        )
+
+        headings = {heading.text: heading for heading in outline.headings}
+        self.assertEqual(
+            headings["6 新父级内标题"].parent_heading_id,
+            headings["第二节 新父级"].heading_id,
+        )
+
+    def test_repeated_page_titles_can_end_a_stale_numbered_parent(self) -> None:
+        pages = [
+            (_block(0, "第九节 财务报告", level=2),),
+            (_block(1, "七、审计责任 -续", level=2),),
+        ]
+        pages.extend((_block(index, f"正文{index}", annotation="paragraph"),) for index in range(2, 6))
+        pages.append(
+            (
+                _block(
+                    6,
+                    "附注为财务报表的组成部分",
+                    level=2,
+                    bbox=ProviderBBox(50, 500, 220, 525),
+                ),
+            )
+        )
+        pages.extend((_block(index, f"正文{index}", annotation="paragraph"),) for index in range(7, 10))
+        pages.append(
+            (
+                _block(
+                    10,
+                    "附注为财务报表的组成部分",
+                    level=2,
+                    bbox=ProviderBBox(51, 501, 221, 526),
+                ),
+            )
+        )
+        pages.append((_block(11, "正文11", annotation="paragraph"),))
+        pages.append((_block(12, "(一) 公司基本情况", level=2),))
+        document = _paged_document(*pages)
+
+        headings = {
+            heading.text: heading for heading in build_document_outline(document).headings
+        }
+
+        self.assertEqual(
+            headings["(一) 公司基本情况"].parent_heading_id,
+            headings["第九节 财务报告"].heading_id,
+        )
+
+    def test_repeated_legal_titles_do_not_end_a_noncontinuation_parent(self) -> None:
+        pages = [
+            (_block(0, "第一节 风险管理", level=2),),
+            (_block(1, "一、风险概况", level=2),),
+        ]
+        pages.extend(
+            (_block(index, f"正文{index}", annotation="paragraph"),)
+            for index in range(2, 6)
+        )
+        pages.append(
+            (
+                _block(
+                    6,
+                    "风险管理",
+                    level=2,
+                    bbox=ProviderBBox(50, 500, 220, 525),
+                ),
+            )
+        )
+        pages.extend(
+            (_block(index, f"正文{index}", annotation="paragraph"),)
+            for index in range(7, 10)
+        )
+        pages.append(
+            (
+                _block(
+                    10,
+                    "风险管理",
+                    level=2,
+                    bbox=ProviderBBox(51, 501, 221, 526),
+                ),
+            )
+        )
+        pages.append((_block(11, "正文11", annotation="paragraph"),))
+        pages.append((_block(12, "(一) 市场风险", level=2),))
+
+        headings = {
+            heading.text: heading
+            for heading in build_document_outline(_paged_document(*pages)).headings
+        }
+
+        self.assertEqual(
+            headings["(一) 市场风险"].parent_heading_id,
+            headings["一、风险概况"].heading_id,
+        )
+
+    def test_repeated_titles_at_different_positions_do_not_reset_parent(self) -> None:
+        pages = [
+            (_block(0, "第九节 财务报告", level=2),),
+            (_block(1, "七、审计责任 -续", level=2),),
+        ]
+        pages.extend(
+            (_block(index, f"正文{index}", annotation="paragraph"),)
+            for index in range(2, 6)
+        )
+        pages.append(
+            (
+                _block(
+                    6,
+                    "合法同名标题",
+                    level=2,
+                    bbox=ProviderBBox(50, 200, 220, 225),
+                ),
+            )
+        )
+        pages.extend(
+            (_block(index, f"正文{index}", annotation="paragraph"),)
+            for index in range(7, 10)
+        )
+        pages.append(
+            (
+                _block(
+                    10,
+                    "合法同名标题",
+                    level=2,
+                    bbox=ProviderBBox(50, 700, 220, 725),
+                ),
+            )
+        )
+        pages.append((_block(11, "正文11", annotation="paragraph"),))
+        pages.append((_block(12, "(一) 公司基本情况", level=2),))
+
+        headings = {
+            heading.text: heading
+            for heading in build_document_outline(_paged_document(*pages)).headings
+        }
+
+        self.assertEqual(
+            headings["(一) 公司基本情况"].parent_heading_id,
+            headings["七、审计责任 -续"].heading_id,
+        )
+
+    def test_single_page_title_does_not_end_a_numbered_parent(self) -> None:
+        pages = [
+            (_block(0, "第九节 财务报告", level=2),),
+            (_block(1, "七、审计责任 -续", level=2),),
+        ]
+        pages.extend((_block(index, f"正文{index}", annotation="paragraph"),) for index in range(2, 9))
+        pages.append((_block(9, "附注为财务报表的组成部分", level=2),))
+        pages.extend((_block(index, f"正文{index}", annotation="paragraph"),) for index in range(10, 12))
+        pages.append((_block(12, "(一) 公司基本情况", level=2),))
+        document = _paged_document(*pages)
+
+        headings = {
+            heading.text: heading for heading in build_document_outline(document).headings
+        }
+
+        self.assertEqual(
+            headings["(一) 公司基本情况"].parent_heading_id,
+            headings["七、审计责任 -续"].heading_id,
         )
 
     def test_repeated_single_column_indentation_can_reset_a_stale_numbered_parent(

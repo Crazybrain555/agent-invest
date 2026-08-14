@@ -1,6 +1,6 @@
 {
-  "version": "semantic-events-2026-08-r25",
-  "_about": "Unit 事件与通用章节的闭集路由词表。labels/description 只用于精确标题命中、候选缩小和模型闭集解释；不授权短语出现即判定、文档类别直接传播或父节继承。",
+  "version": "semantic-events-2026-08-r26",
+  "_about": "Unit 事件与通用章节的闭集路由词表。labels/description 只用于精确标题命中、候选缩小和模型闭集解释；不授权短语出现即判定或文档类别直接传播。section_container_keys 仅允许同 scope、已接受 heading_path 的精确结构上下文进入独立 section_keys，不传播为 Unit 直接主题。",
   "fallback_key": "document_content",
   "quantitative_fact_keys": [
     "performance_forecast_range",
@@ -31,6 +31,17 @@
     "related_party_overview",
     "restructuring_transaction_overview",
     "share_buyback_plan"
+  ],
+  "section_container_keys": [
+    "dilution_impact",
+    "issuance_outcome",
+    "issuance_plan",
+    "subscription_arrangements",
+    "supporting_financing",
+    "transaction_classification",
+    "transaction_impact",
+    "transaction_rationale",
+    "transaction_risk"
   ],
   "entries": [
     {
@@ -441,6 +452,39 @@
       ]
     },
     {
+      "key": "transaction_impact",
+      "description": "资产重组或交易对上市公司业务、股权和财务指标的影响",
+      "labels": [
+        "本次交易对上市公司的影响",
+        "本次重组对上市公司的影响"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
+      "key": "transaction_rationale",
+      "description": "资产重组或交易的背景和目的",
+      "labels": [
+        "本次交易的背景和目的",
+        "本次重组的背景和目的"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
+      "key": "transaction_classification",
+      "description": "资产重组或交易的监管性质与分类",
+      "labels": [
+        "本次交易的性质",
+        "本次重组的性质"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
       "key": "performance_commitment",
       "description": "业绩承诺、补偿安排及履约情况",
       "labels": [
@@ -486,12 +530,36 @@
       "labels": [
         "发行方案",
         "发行预案",
-        "配股方案"
+        "配股方案",
+        "本次发行的基本情况",
+        "本次配股发行的基本情况"
       ],
       "scopes": [
         "additional_issuance",
         "rights_issue",
         "convertible_bond"
+      ]
+    },
+    {
+      "key": "subscription_arrangements",
+      "description": "配股或证券发行的认购、缴款与认购地点安排",
+      "labels": [
+        "本次配股的认购方法",
+        "配股认购方法"
+      ],
+      "scopes": [
+        "rights_issue"
+      ]
+    },
+    {
+      "key": "issuance_outcome",
+      "description": "证券发行结果、失败退款及结果公告后的交易安排",
+      "labels": [
+        "发行结果处理",
+        "配股发行结果处理"
+      ],
+      "scopes": [
+        "rights_issue"
       ]
     },
     {
@@ -547,14 +615,16 @@
         "摊薄即期回报",
         "稀释影响",
         "股本摊薄",
-        "归属后对公司财务指标的影响"
+        "归属后对公司财务指标的影响",
+        "本次重组摊薄即期回报的情况及填补措施"
       ],
       "scopes": [
         "additional_issuance",
         "rights_issue",
         "convertible_bond",
         "equity_share_change",
-        "equity_incentive"
+        "equity_incentive",
+        "restructuring_assets"
       ]
     },
     {

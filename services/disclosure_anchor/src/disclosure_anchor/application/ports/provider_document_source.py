@@ -8,6 +8,7 @@ from typing import Protocol
 from disclosure_anchor.application.contracts.provider_document import ProviderDocument
 from disclosure_anchor.application.contracts.provider_document_admission import (
     SourcePdfObservation,
+    SourcePdfTextObservation,
 )
 
 
@@ -26,6 +27,16 @@ class ProviderDocumentSourceError(RuntimeError):
         self.retryable = retryable
 
 
+class SourcePdfTextReaderPort(Protocol):
+    def __call__(
+        self,
+        path: Path,
+        *,
+        document: ProviderDocument,
+    ) -> tuple[SourcePdfTextObservation, ...]:
+        ...
+
+
 class ProviderDocumentSourcePort(Protocol):
     def read_provider_document_record(self, relpath: Path) -> bytes:
         ...
@@ -41,5 +52,18 @@ class ProviderDocumentSourcePort(Protocol):
     ) -> ProviderDocument:
         ...
 
+    def observe_source_pdf_text(
+        self,
+        relpath: Path,
+        *,
+        document: ProviderDocument,
+        expected_sha256: str,
+    ) -> tuple[SourcePdfTextObservation, ...]:
+        ...
 
-__all__ = ["ProviderDocumentSourceError", "ProviderDocumentSourcePort"]
+
+__all__ = [
+    "ProviderDocumentSourceError",
+    "ProviderDocumentSourcePort",
+    "SourcePdfTextReaderPort",
+]

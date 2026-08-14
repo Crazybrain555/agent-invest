@@ -12,8 +12,8 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 当前唯一新 writer 是 MinerU 3.4.4 Hybrid-medium：
 
 - `provider_document.v1` 保存官方 provider artifact 的闭合投影与 hash-bound inventory；
-- `provider_unit_locator.v1` 保存 Unit 对 source block、逻辑表物理段、evidence digest 与检索目标的
-  显式引用；
+- `provider_unit_locator.v2` 保存 Unit 对 source block、逻辑表物理段、evidence digest、检索目标与
+  可选的 source-PDF 数字校正 provenance；历史 v1 继续只读；
 - 历史 `normalized_ir.v4` 只允许通过窄 resolver 读取已发布 evidence，不再 Build、Rebuild、
   Publish 或重建检索投影。
 
@@ -23,7 +23,7 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 
 1. `title`：已接受的 source heading 叶标题；metadata document title 绝不复制到 Unit。
 2. `heading_path`：已接受 heading occurrence 的完整根到叶路径。
-3. body：只回放 `provider_unit_locator.v1.search_targets` 明确列出的 provider payload destination。
+3. body：只回放 `provider_unit_locator.v2.search_targets` 明确列出的 provider payload destination。
 4. `semantic_key` / `semantic_keys`：可选的真实受控 Unit **直接主题**；scalar 是稳定 lead，数组是
    完整有序集合，所有项都进入 key channel，避免 mixed/长 Unit 的 secondary route 漏召回。
    Provider writer 使用版本化闭集词表和 source-bound candidate gate：Document 的 filing type 和
@@ -33,16 +33,18 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
    形成 Unit-local direct route；标题包含式/字符相似命中只生成候选；其余候选才可能由低成本模型
    逐候选返回闭合布尔裁决。模型不能造 key、决定 Unit 边界，或只凭文档标题、
    父标题、类别传播 route。无充分证据时两列仍写 NULL；不以 `document_content` 占位。
-5. `section_keys`：定期报告的确定性结构位置。只从已接受 `heading_path` 根到叶精确匹配 taxonomy
-   中显式 `context_container` 的 key；无 contains/similarity、无模型、无 Document facet 传播，
-   heading-only/空 Unit 不继承。它与 direct topic 分列、分过滤器；只有 direct topic 进入全文
-   key token channel，section route 由显式数组过滤参与 L2/L3 查询联合。
+5. `section_keys`：确定性的结构位置。只从已接受 `heading_path` 根到叶精确匹配 taxonomy
+   中显式结构容器；定期报告使用 `context_container`，事件公告仅开放少量命中 filing_type/
+   authoritative disclosure_topics scope 的
+   `section_container`。无 contains/similarity、无模型、无 Document facet 直接传播，heading-only/
+   空 Unit 不继承。它与 direct topic 分列、分过滤器；只有 direct topic 进入全文 key token
+   channel，section route 由显式数组过滤参与 L2/L3 查询联合。
 
 不存在通用的 `other_information` / “其他信息” direct route。源标题确实是“其他信息”“其他事项”时，
 原文标题仍由 `title` / `heading_path` 保真；该 Unit 内若有回购账户、风险提示等具体事实，只落对应的
 具体 route。没有可确认具体主题时 direct route 保持 NULL，绝不为了填满字段而发明“其他”占位键。
 
-当前身份是 taxonomy `semantic-taxonomy-2026-08-r35`、router `semantic_router.v53`、prompt
+当前身份是 taxonomy `semantic-taxonomy-2026-08-r37`、router `semantic_router.v54`、prompt
 `semantic_route_adjudication.v31`，当前候选 adjudicator 为 `codex_cli.v4.low` / `gpt-5.6-luna`；
 候选与 direct route 都最多 8 个。model/effort 与 cache/receipt identity 绑定。定期报告正文/表格也
 可以生成 Unit-local 直接主题候选；章节上下文另走 section_keys，不参与 shortlist。截断时，Unit
@@ -102,6 +104,19 @@ segment/crop 仍以 page/bbox/hash-bound evidence 留在 locator/ProviderDocumen
 无文字的 image/chart 仍通过 `content_artifacts` digest 参与 content hash，但没有 body atom。
 supporting table crop 只作 evidence，不成为第二份可检索正文。
 
+MinerU content-list 若只漏掉一个 text block 中的数字，Build admission 可读取**同一不可变 PDF、
+同一 MinerU bbox**内的 native text。只有 block type=`text`、raw block/hash/page 精确绑定，且
+MinerU 文本可由 native text 仅删除完整数字核心（可连同或保留 `%/‰`）得到，其余字符与已有数字
+保持原序逐字相等，且只有数字 token 位置的相邻 ASCII 横向空格/Tab 可随 token 缺失或保留 MinerU 占位，才用
+source-PDF 文字形成 Unit payload。PDFium bounded-text 明确生成的、非首尾孤立 `CRLF` 软换行会按文字边界移除（ASCII
+单词间保留一个边界），CRLF 前后的水平空格仍须逐字匹配，且仅在同一观察中出现软换行时移除已校准的单个矩形末尾空格；宽窄字符、
+标点、NUL、裸 `CR/LF`、空白行、其他空白或多个末尾空格差异均拒绝。ProviderDocument
+仍原样保留 MinerU 输出。locator v2 记录 raw block、provider/source text hash 与固定
+`source_pdf_native_numeric.v1` provenance，覆盖 Unit 自身 blocks 和 heading-chain 依赖，Publish 每次
+从 PDF 重放。数字替换/重排、非数字差异、表格、高度重叠 bbox、旋转/页面形状不闭合、无 native
+text 或 hash/page 漂移一律不修；native reader 固定 `pypdfium2==5.13.0`，不得据此引入第二套
+阅读顺序、标题树或表格结构。
+
 ## 5. PostgreSQL 派生层
 
 `BuildSearchProjection` 只选择 active provider-document runs；历史 v4 active row 不被重新解释。
@@ -122,7 +137,8 @@ source/provider 结构证据，不能恢复数值/词面启发式。
 `publisher_categories` 与 `market` 保持 Document-only。
 
 `GET /v1/semantic-routes` 直接从同一 taxonomy 公开 key、中文 labels、scopes、版本与
-`usable_as_section_key`，避免 L2 复制 L1 私有 JSON；它不创建第二套 registry。
+`usable_as_section_key`；后者同时覆盖定期报告 context-container 与事件 section-container，避免
+L2 复制 L1 私有 JSON；它不创建第二套 registry。
 
 ## 6. 版本与验证
 

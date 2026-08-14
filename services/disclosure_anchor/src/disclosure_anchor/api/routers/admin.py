@@ -17,6 +17,9 @@ from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
     MinerUMediumDocumentParser,
 )
 from disclosure_anchor.adapters.parsers.mineru_medium.process import MinerUProcess
+from disclosure_anchor.adapters.parsers.pdf_text_observation import (
+    observe_pdf_text_rectangles,
+)
 from disclosure_anchor.adapters.semantics.runtime import build_semantic_runtime
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
@@ -280,7 +283,10 @@ class AdminDeps:
         self._engine = engine
         self._paths = FileStorePathBuilder(settings)
         self._artifacts = ArtifactStore(self._paths)
-        self._provider_source = ProviderDocumentFileSource(self._paths)
+        self._provider_source = ProviderDocumentFileSource(
+            self._paths,
+            text_reader=observe_pdf_text_rectangles,
+        )
         self._uow_factory = unit_of_work_factory(engine)
 
     def register_local_pdf(

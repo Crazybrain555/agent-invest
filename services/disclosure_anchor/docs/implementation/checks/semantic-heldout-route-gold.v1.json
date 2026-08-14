@@ -1,0 +1,99 @@
+{
+  "contract_version": "semantic_route_gold.v1",
+  "cases": [
+    {
+      "provider_document_id": "1225464994",
+      "unit_index": 6,
+      "title": "（三）配股基数、比例和数量",
+      "required_keys": ["issue_size"],
+      "required_section_keys": ["issuance_plan"],
+      "rationale": "配股数量是 Unit 直接主题，同时位于本次发行基本情况章节。"
+    },
+    {
+      "provider_document_id": "1225464994",
+      "unit_index": 14,
+      "title": "（一）配股缴款时间",
+      "expected_keys": [],
+      "required_section_keys": ["subscription_arrangements"],
+      "rationale": "缴款时间属于认购安排章节检索面，不需要把每个程序性子标题都造为 direct key。"
+    },
+    {
+      "provider_document_id": "1225464994",
+      "unit_index": 20,
+      "title": "（三）发行失败的退款处理",
+      "expected_keys": [],
+      "required_section_keys": ["issuance_outcome"],
+      "rationale": "退款处理属于发行结果章节，应能按 canonical section 批量召回。"
+    },
+    {
+      "provider_document_id": "1225464994",
+      "unit_index": 21,
+      "title": "四、发行费用",
+      "expected_section_keys": [],
+      "forbidden_section_keys": ["issuance_plan", "subscription_arrangements", "issuance_outcome"],
+      "rationale": "相邻但独立的发行费用章节不得继承此前事件容器。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 19,
+      "title": "（一）本次重组对上市公司主营业务的影响",
+      "required_section_keys": ["transaction_impact"],
+      "rationale": "主营业务影响位于交易影响的 accepted heading path 下。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 37,
+      "title": "2、公司对防范本次交易摊薄即期回报的具体措施",
+      "required_section_keys": ["dilution_impact"],
+      "rationale": "填补措施应由摊薄回报章节提供 canonical batch recall。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 54,
+      "title": "（三）标的资产的评估值风险",
+      "expected_keys": ["transaction_risk"],
+      "required_section_keys": ["transaction_risk"],
+      "forbidden_keys": ["target_asset", "valuation_pricing"],
+      "rationale": "标题语义中心是风险；标的资产和评估值只是风险对象。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 56,
+      "title": "（五）业绩承诺及其执行风险",
+      "expected_keys": ["transaction_risk"],
+      "required_section_keys": ["transaction_risk"],
+      "forbidden_keys": ["performance_commitment"],
+      "rationale": "本 Unit 披露执行风险，不是新的业绩承诺安排。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 82,
+      "title": "1、国家高度重视支持集成电路产业发展",
+      "expected_keys": [],
+      "required_section_keys": ["transaction_rationale"],
+      "rationale": "行业背景正文应由交易背景和目的章节召回，而非强造 direct topic。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 105,
+      "title": "2、发行方式、发行对象及认购方式",
+      "required_section_keys": ["supporting_financing"],
+      "rationale": "配套融资具体方案下的认购方式应保留该结构上下文。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 127,
+      "title": "（一）本次交易构成重大资产重组",
+      "required_section_keys": ["transaction_classification"],
+      "rationale": "监管交易性质是稳定的章节级批量检索面。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 132,
+      "title": "（一）本次交易已经履行的主要决策程序及报批程序",
+      "required_keys": ["decision_procedures"],
+      "forbidden_section_keys": ["transaction_classification", "transaction_impact", "transaction_rationale"],
+      "rationale": "后续独立决策程序章节不得继承已结束的交易性质、影响或背景容器。"
+    }
+  ]
+}
