@@ -7,12 +7,15 @@ on:
       - '.github/workflows/tcf_blind_forecast.yml'
 permissions:
   contents: read
-  models: read
+  copilot-requests: write
 jobs:
   forecast:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+      - name: Install Copilot CLI
+        run: npm install -g @github/copilot
       - name: Apply deterministic runtime hardening
         run: |
           python - <<'PY'
@@ -26,6 +29,27 @@ jobs:
           old="weights=forecast['mechanism_map'].get('weights', forecast['mechanism_map'])\nif not isinstance(weights,dict) or not weights: weights={'recurring-contract-software':1.0}\ns=sum(float(v) for v in weights.values()); weights={k:float(v)/s for k,v in weights.items()}"
           new="weights=forecast['mechanism_map'].get('weights', {}) if isinstance(forecast['mechanism_map'],dict) else {}\nweights={str(k):float(v) for k,v in weights.items() if isinstance(v,(int,float)) or str(v).replace('.','',1).isdigit()}\nif not weights: weights={'recurring-contract-software':1.0}\ns=sum(weights.values()); weights={k:v/s for k,v in weights.items()}"
           s=s.replace(old,new)
+
+          start=s.index('payload = {')
+          end=s.index('try:\n    forecast = json.loads(raw)')
+          cli_call="""prompt = system + '\\n\\nINPUT BUNDLE:\\n' + user
+cli_root = Path('/tmp/tcf-blind-copilot')
+cli_root.mkdir(parents=True, exist_ok=True)
+copilot = subprocess.run([
+    'copilot', '-p', prompt, '-s',
+    '--model', MODEL_ID,
+    '-C', str(cli_root),
+    '--no-ask-user',
+    '--no-custom-instructions',
+    '--disable-builtin-mcps',
+    '--excluded-tools=bash,list_bash,read_bash,stop_bash,write_bash,apply_patch,create,edit,view,list_agents,read_agent,task,write_agent,ask_user,glob,grep,skill,web_fetch'
+], capture_output=True, text=True, timeout=900)
+if copilot.returncode != 0:
+    raise SystemExit('copilot cli failed\\n' + copilot.stderr)
+raw = copilot.stdout.strip()
+api = {'provider':'github-copilot-cli','model':MODEL_ID,'choices':[{'message':{'content':raw}}]}
+"""
+          s=s[:start]+cli_call+s[end:]
           p.write_text(s)
 
           bundle_path=Path('tcf_blind/case_alpha/case_bundle.json')
@@ -59,7 +83,7 @@ jobs:
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          MODEL_ID: openai/gpt-4.1
+          MODEL_ID: gpt-5.4
         run: |
           mkdir -p tcf_blind/case_alpha/run_diagnostics
           set +e
