@@ -33,22 +33,23 @@ jobs:
           start=s.index('payload = {')
           end=s.index('try:\n    forecast = json.loads(raw)')
           cli_call="""prompt = system + '\\n\\nINPUT BUNDLE:\\n' + user
-cli_root = Path('/tmp/tcf-blind-copilot')
-cli_root.mkdir(parents=True, exist_ok=True)
-copilot = subprocess.run([
-    'copilot', '-p', prompt, '-s',
-    '--model', MODEL_ID,
-    '-C', str(cli_root),
-    '--no-ask-user',
-    '--no-custom-instructions',
-    '--disable-builtin-mcps',
-    '--excluded-tools=bash,list_bash,read_bash,stop_bash,write_bash,apply_patch,create,edit,view,list_agents,read_agent,task,write_agent,ask_user,glob,grep,skill,web_fetch'
-], capture_output=True, text=True, timeout=900)
-if copilot.returncode != 0:
-    raise SystemExit('copilot cli failed\\n' + copilot.stderr)
-raw = copilot.stdout.strip()
-api = {'provider':'github-copilot-cli','model':MODEL_ID,'choices':[{'message':{'content':raw}}]}
-"""
+          cli_root = Path('/tmp/tcf-blind-copilot')
+          cli_root.mkdir(parents=True, exist_ok=True)
+          copilot = subprocess.run([
+              'copilot', '-p', prompt, '-s',
+              '--model', MODEL_ID,
+              '-C', str(cli_root),
+              '--no-ask-user',
+              '--no-custom-instructions',
+              '--disable-builtin-mcps',
+              '--excluded-tools=bash,list_bash,read_bash,stop_bash,write_bash,apply_patch,create,edit,view,list_agents,read_agent,task,write_agent,ask_user,glob,grep,skill,web_fetch'
+          ], capture_output=True, text=True, timeout=900)
+          if copilot.returncode != 0:
+              raise SystemExit('copilot cli failed\\n' + copilot.stderr)
+          raw = copilot.stdout.strip()
+          api = {'provider':'github-copilot-cli','model':MODEL_ID,'choices':[{'message':{'content':raw}}]}
+          """
+          cli_call='\n'.join(line[10:] if line.startswith('          ') else line for line in cli_call.splitlines())+'\n'
           s=s[:start]+cli_call+s[end:]
           p.write_text(s)
 
