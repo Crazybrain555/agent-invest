@@ -37,7 +37,6 @@ jobs:
           cli_root.mkdir(parents=True, exist_ok=True)
           copilot = subprocess.run([
               'copilot', '-p', prompt, '-s',
-              '--model', MODEL_ID,
               '-C', str(cli_root),
               '--no-ask-user',
               '--no-custom-instructions',
@@ -84,7 +83,7 @@ jobs:
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          MODEL_ID: gpt-5.4
+          MODEL_ID: copilot-default
         run: |
           mkdir -p tcf_blind/case_alpha/run_diagnostics
           set +e
