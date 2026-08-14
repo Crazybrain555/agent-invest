@@ -25,6 +25,9 @@ from disclosure_anchor.application.services.semantic_router import SemanticRoute
 from disclosure_anchor.application.services.semantic_taxonomy import (
     load_semantic_route_taxonomy,
 )
+from disclosure_anchor.domain.services.unit_hashing import (
+    compute_unit_hashes,
+)
 from tests.unit.test_provider_unit_builder import (
     _admitted,
     _block,
@@ -1533,6 +1536,55 @@ class SemanticTaxonomyTests(unittest.TestCase):
 
 
 class SemanticRouterTests(unittest.TestCase):
+    def test_semantic_routing_preserves_applicability_in_query_hash(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "营业收入",
+            "□适用 √不适用",
+        )
+        self.assertEqual(drafts[0].applicability, "not_applicable")
+
+        result = SemanticRouter(
+            taxonomy=_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("exact revenue title must not call the model")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        routed = result.units[0]
+        expected_hashes = compute_unit_hashes(
+            payload_kind=routed.payload_kind,
+            payload=routed.payload,
+            title=routed.title,
+            heading_path=list(routed.heading_path),
+            semantic_key=routed.semantic_key,
+            semantic_keys=(
+                list(routed.semantic_keys)
+                if routed.semantic_keys is not None
+                else None
+            ),
+            section_keys=(
+                list(routed.section_keys)
+                if routed.section_keys is not None
+                else None
+            ),
+            applicability=routed.applicability,
+            quality_status=routed.quality_status,
+            order_index=routed.unit_index + 1,
+        )
+        self.assertEqual(routed.applicability, "not_applicable")
+        self.assertEqual(
+            routed.query_projection_hash,
+            expected_hashes.query_projection_hash,
+        )
+
     def test_historical_grant_cohort_does_not_become_a_current_grant(self) -> None:
         admitted, drafts = _drafts_with_body(
             "本次限制性股票归属的具体情况",

@@ -81,7 +81,9 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
   quality_status 等）
 0010 起 document_units_v1 追加 applicability / page_no 列（applicability：
   'applicable'|'not_applicable'|NULL，节适用性声明的一等筛选列，payload 保持纯原文，
-  部分索引 ix_document_unit_applicability；page_no：artifact_locator 首页码提升列）。
+  仅由同一 CoarseUnit 自有 ProviderBlock 内受控、成对且一致的勾选声明确定；不跨 Unit
+  继承，普通文字/双选/双空/冲突均为 NULL；部分索引 ix_document_unit_applicability；
+  page_no：artifact_locator 首页码提升列）。
 0007 起 document_units_v1 追加 6 列：asset_kind / observed_at / source_tier /
   trace_level / raw_file_hash / query_projection_hash
   （0037 当前列全集 = **39 列**；semantic_keys=直接主题，section_keys=规范化章节位置；publisher/market/content_categories 只留 documents_v1/document_categories_v1）

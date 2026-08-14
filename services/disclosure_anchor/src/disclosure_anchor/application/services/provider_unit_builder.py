@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+import re
 import string
 
 from disclosure_anchor.application.contracts.document_outline import (
@@ -35,6 +36,7 @@ from disclosure_anchor.application.contracts.provider_table_projection import (
 from disclosure_anchor.application.contracts.provider_unit import (
     ProviderSearchDestination,
     ProviderUnitBuildResult,
+    ProviderUnitApplicability,
     ProviderUnitDraft,
     ProviderUnitEvidenceArtifact,
     ProviderUnitHeadingRef,
@@ -63,6 +65,21 @@ from disclosure_anchor.application.services.retrieval_primary import (
     replay_retrieval_target,
 )
 from disclosure_anchor.domain.services.unit_hashing import compute_unit_hashes
+
+
+_CHECKED_APPLICABILITY_MARKERS = "√☑✓\uf052"
+_UNCHECKED_APPLICABILITY_MARKERS = "□☐"
+_ALL_APPLICABILITY_MARKERS = (
+    _CHECKED_APPLICABILITY_MARKERS + _UNCHECKED_APPLICABILITY_MARKERS
+)
+_HORIZONTAL_SPACE = r"[^\S\r\n]*"
+_APPLICABILITY_PAIR_RE = re.compile(
+    rf"(?P<applicable>[{_ALL_APPLICABILITY_MARKERS}])"
+    rf"{_HORIZONTAL_SPACE}适{_HORIZONTAL_SPACE}用"
+    rf"{_HORIZONTAL_SPACE}"
+    rf"(?P<not_applicable>[{_ALL_APPLICABILITY_MARKERS}])"
+    rf"{_HORIZONTAL_SPACE}不{_HORIZONTAL_SPACE}适{_HORIZONTAL_SPACE}用"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +335,9 @@ class _BuildContext:
             )
             else "ok"
         )
+        applicability = _unit_applicability(
+            self.blocks[source_index] for source_index in unit.block_source_indices
+        )
         hashes = compute_unit_hashes(
             payload_kind=payload_kind,
             payload=payload,
@@ -325,6 +345,7 @@ class _BuildContext:
             heading_path=list(heading_path),
             semantic_key=None,
             semantic_keys=None,
+            applicability=applicability,
             quality_status=quality_status,
             order_index=unit.unit_index + 1,
         )
@@ -337,6 +358,7 @@ class _BuildContext:
             section_keys=None,
             semantic_key=None,
             semantic_keys=None,
+            applicability=applicability,
             quality_status=quality_status,
             page_no=self.blocks[unit.block_source_indices[0]].page_index + 1,
             locator=locator,
@@ -457,6 +479,41 @@ class _BuildContext:
             by_hash[descriptor.sha256] = descriptor
             ordered.append(descriptor)
         return tuple(ordered)
+
+
+def _unit_applicability(
+    blocks: Iterable[ProviderBlock],
+) -> ProviderUnitApplicability | None:
+    """Project only explicit, unanimous checkbox pairs owned by one Unit."""
+
+    values: set[ProviderUnitApplicability] = set()
+    ambiguous = False
+    for block in blocks:
+        for payload in block.payloads:
+            text = (
+                html_visible_text(payload.text)
+                if payload.field == "table_body"
+                else payload.text
+            )
+            for match in _APPLICABILITY_PAIR_RE.finditer(text):
+                applicable_marker = match.group("applicable")
+                not_applicable_marker = match.group("not_applicable")
+                applicable_checked = (
+                    applicable_marker in _CHECKED_APPLICABILITY_MARKERS
+                )
+                not_applicable_checked = (
+                    not_applicable_marker in _CHECKED_APPLICABILITY_MARKERS
+                )
+                if applicable_checked and not_applicable_checked:
+                    ambiguous = True
+                elif applicable_checked:
+                    values.add("applicable")
+                elif not_applicable_checked:
+                    values.add("not_applicable")
+                # Two unchecked boxes carry no selected declaration.
+    if ambiguous or len(values) != 1:
+        return None
+    return next(iter(values))
 
 
 def _has_suspected_encoded_text(block: ProviderBlock) -> bool:

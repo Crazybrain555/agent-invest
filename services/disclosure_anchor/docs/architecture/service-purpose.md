@@ -546,8 +546,11 @@ payload 是有序 parts；每个 part 只保存 source-bound 浅内容字段，�
 `document|section` 不作为 payload 字段重复保存：是否属于结构 section 已由 `title`、
 `heading_path` 和 locator 中的 source-bound heading chain 唯一表达；无标题的根区间自然是
 document preamble。监管 taxonomy 可在组装完成后帮助 L2 路由，但不得反向决定 section 边界。
-单元级 `applicability` 只在各 parts 声明一致时置值，
-冲突时为 NULL、由 parts 承载细节。
+单元级 `applicability` 只从该 CoarseUnit 自己拥有的 ProviderBlock 中投影：仅受控的
+`checked + 适用 / unchecked + 不适用` 成对勾选可确定 `applicable`，反向勾选可确定
+`not_applicable`；多个有效声明必须一致。普通“适用/不适用”文字、双选、双空、冲突，
+以及只出现在祖先标题、相邻 Unit 或上一页的声明一律保持 NULL，原始细节仍由 payload
+与 source-bound locator 承载。
 
 ---
 
@@ -990,7 +993,7 @@ order_index
 6 列，至 04R-R7 为 32 列（仅历史基线）。
 
 0008 迁移起，`processing_runs_v1` 投影 `builder_rules_version`，用于确定性 Unit builder 归因；
-历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 当前必须等于 `provider_unit.v5`。
+历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 当前必须等于 `provider_unit.v6`。
 
 0031 迁移起，`processing_runs_v1` 只额外暴露不透明的
 `artifact_owner_processing_run_id`：parse run 指向自身，`rebuild_units` 指向实际拥有

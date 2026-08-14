@@ -263,7 +263,10 @@ class BuildUnitsTests(unittest.TestCase):
                 provider_unit_locator_from_payload(unit.artifact_locator)
                 self.assertIsNone(unit.semantic_key)
                 self.assertIsNone(unit.semantic_keys)
-                self.assertIsNone(unit.applicability)
+            self.assertEqual(
+                [unit.applicability for unit in units],
+                [None, "not_applicable"],
+            )
             rows = (Path(tmp) / run.document_units_relpath).read_text().splitlines()
             self.assertEqual(len(rows), len(units))
             self.assertEqual(set(result.build_stats or {}), {

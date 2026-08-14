@@ -489,7 +489,7 @@ class BuildUnits:
                 content_hash=draft.content_hash,
                 structure_hash=draft.structure_hash,
                 quality_status=draft.quality_status,
-                applicability=None,
+                applicability=draft.applicability,
                 page_no=draft.page_no,
                 query_projection_hash=draft.query_projection_hash,
                 artifact_locator=provider_unit_locator_to_payload(draft.locator),
@@ -537,6 +537,7 @@ class BuildUnits:
             section_keys=(
                 list(draft.section_keys) if draft.section_keys is not None else None
             ),
+            applicability=draft.applicability,
             quality_status=draft.quality_status,
             order_index=draft.unit_index + 1,
         )

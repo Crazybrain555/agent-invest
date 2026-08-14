@@ -268,7 +268,7 @@ class ProviderDocumentPublicationGuard:
                 list(draft.section_keys) if draft.section_keys is not None else None
             ),
             "quality_status": draft.quality_status,
-            "applicability": None,
+            "applicability": draft.applicability,
             "page_no": draft.page_no,
             "artifact_locator": provider_unit_locator_to_payload(draft.locator),
             "content_hash": draft.content_hash,

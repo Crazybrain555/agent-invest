@@ -31,12 +31,13 @@ PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v2"
 SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS = frozenset(
     {LEGACY_PROVIDER_UNIT_LOCATOR_VERSION, PROVIDER_UNIT_LOCATOR_VERSION}
 )
-PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v5"
+PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v6"
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 ProviderUnitPayloadKind = Literal["text", "table", "mixed"]
 ProviderUnitPartKind = Literal["text", "table", "visual"]
+ProviderUnitApplicability = Literal["applicable", "not_applicable"]
 ProviderSearchDestinationKind = Literal[
     "unit_title",
     "unit_payload",
@@ -249,6 +250,7 @@ class ProviderUnitDraft:
     section_keys: tuple[str, ...] | None
     semantic_key: str | None
     semantic_keys: tuple[str, ...] | None
+    applicability: ProviderUnitApplicability | None
     quality_status: str
     page_no: int
     locator: ProviderUnitLocator
@@ -278,6 +280,8 @@ class ProviderUnitDraft:
             )
         except SemanticKeyInvariantError as exc:
             raise ValueError("provider unit semantic routes are invalid") from exc
+        if self.applicability not in {None, "applicable", "not_applicable"}:
+            raise ValueError("provider unit applicability is invalid")
         if not self.quality_status or self.page_no < 1:
             raise ValueError("provider unit quality and page must be complete")
         for value in (
@@ -710,6 +714,7 @@ __all__ = [
     "ProviderSearchDestination",
     "ProviderSearchDestinationKind",
     "ProviderUnitBuildResult",
+    "ProviderUnitApplicability",
     "ProviderUnitDraft",
     "ProviderUnitEvidenceArtifact",
     "ProviderUnitHeadingRef",

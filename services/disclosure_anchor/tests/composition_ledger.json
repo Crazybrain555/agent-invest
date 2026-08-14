@@ -236,7 +236,7 @@
   },
   "tests/unit/test_provider_unit_builder.py": {
    "private_imports": [],
-   "tests": 20
+   "tests": 24
   },
   "tests/unit/test_provider_unit_evidence.py": {
    "private_imports": [],
@@ -282,7 +282,7 @@
   },
   "tests/unit/test_semantic_router.py": {
    "private_imports": [],
-   "tests": 87
+   "tests": 88
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],

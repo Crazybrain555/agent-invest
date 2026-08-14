@@ -1672,6 +1672,7 @@ def _apply_receipt(
         semantic_key=None if semantic_keys is None else semantic_keys[0],
         semantic_keys=None if semantic_keys is None else list(semantic_keys),
         section_keys=None if section_keys is None else list(section_keys),
+        applicability=draft.applicability,
         quality_status=draft.quality_status,
         order_index=draft.unit_index + 1,
     )

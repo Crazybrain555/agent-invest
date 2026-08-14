@@ -38,6 +38,9 @@ from disclosure_anchor.application.services.provider_unit_builder import (
     build_provider_units,
     replay_provider_unit_search_binding,
 )
+from disclosure_anchor.domain.services.unit_hashing import (
+    compute_unit_hashes,
+)
 
 
 _SOURCE_SHA = "sha256:" + "a" * 64
@@ -185,6 +188,7 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         self.assertTrue(all("kind" not in part for part in parts))
         self.assertNotIn("第一章 标题", json.dumps(section.payload, ensure_ascii=False))
         self.assertIn("□适用", json.dumps(section.payload, ensure_ascii=False))
+        self.assertEqual(section.applicability, "not_applicable")
 
         table_ref = section.locator.parts[1]
         self.assertEqual(table_ref.block_source_indices, (3, 5))
@@ -227,6 +231,189 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         encoded = json.dumps(locator_payload, ensure_ascii=False)
         self.assertNotIn("relative_path", encoded)
         self.assertNotIn("raw_item_json", encoded)
+
+    def test_applicability_is_unit_local_explicit_and_hash_bound(self) -> None:
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "第一节"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (
+                            ProviderPayload(
+                                "text",
+                                None,
+                                "☑适用 ☐不适用；✓适用 □不适用",
+                            ),
+                        ),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "第二节"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        3,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "资金来源：不适用"),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        4,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "第三节"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        5,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "□适用 √不适用"),),
+                        annotation="paragraph",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+
+        units = build_provider_units(_admitted(document)).units
+
+        self.assertEqual(
+            [unit.applicability for unit in units],
+            ["applicable", None, "not_applicable"],
+        )
+        not_applicable = units[2]
+        without_applicability = compute_unit_hashes(
+            payload_kind=not_applicable.payload_kind,
+            payload=dict(not_applicable.payload),
+            title=not_applicable.title,
+            heading_path=list(not_applicable.heading_path),
+            semantic_key=not_applicable.semantic_key,
+            semantic_keys=None,
+            section_keys=None,
+            applicability=None,
+            quality_status=not_applicable.quality_status,
+            order_index=not_applicable.unit_index + 1,
+        )
+        self.assertEqual(not_applicable.content_hash, without_applicability.content_hash)
+        self.assertEqual(
+            not_applicable.structure_hash,
+            without_applicability.structure_hash,
+        )
+        self.assertNotEqual(
+            not_applicable.query_projection_hash,
+            without_applicability.query_projection_hash,
+        )
+        same_source_different_projection = replace(
+            not_applicable,
+            applicability=None,
+            query_projection_hash=without_applicability.query_projection_hash,
+        )
+        self.assertEqual(
+            same_source_different_projection.locator,
+            not_applicable.locator,
+        )
+
+    def test_applicability_conflicts_and_invalid_pairs_remain_null(self) -> None:
+        cases = (
+            "□适用 □不适用",
+            "√适用 √不适用",
+            "√适用 □不适用；□适用 √不适用",
+            "本事项不适用于公司",
+            "√适用",
+            "□不适用",
+        )
+        for source_text in cases:
+            with self.subTest(source_text=source_text):
+                document = _document(
+                    pages=(
+                        (
+                            _block(
+                                0,
+                                0,
+                                "text",
+                                (ProviderPayload("text", None, source_text),),
+                                annotation="paragraph",
+                            ),
+                        ),
+                    ),
+                    segments=(),
+                )
+
+                draft = build_provider_units(_admitted(document)).units[0]
+
+                self.assertIsNone(draft.applicability)
+
+    def test_applicability_reads_visible_table_text(self) -> None:
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "table",
+                        (
+                            ProviderPayload(
+                                "table_body",
+                                None,
+                                (
+                                    "<table><tr><td>&#61522;<span>适用</span></td>"
+                                    "<td>&nbsp;□<br>不适用</td></tr></table>"
+                                ),
+                            ),
+                        ),
+                        annotation="table",
+                    ),
+                ),
+            ),
+            segments=(_segment(0, 0, "retained"),),
+        )
+
+        draft = build_provider_units(_admitted(document)).units[0]
+
+        self.assertEqual(draft.applicability, "applicable")
+
+    def test_applicability_gold_is_exact_unique_and_disjoint(self) -> None:
+        gold_path = (
+            Path(__file__).resolve().parents[2]
+            / "docs/implementation/checks/provider-unit-applicability-gold.v1.json"
+        )
+        gold = json.loads(gold_path.read_text(encoding="utf-8"))
+        expected = gold["expected"]
+        ordinary_text_null = gold["ordinary_text_null"]
+
+        expected_identities = {(row[0], row[1]) for row in expected}
+        ordinary_identities = {(row[0], row[1]) for row in ordinary_text_null}
+        self.assertEqual(gold["source_active_unit_count"], 805)
+        self.assertEqual(len(expected), 55)
+        self.assertEqual(len(expected_identities), 55)
+        self.assertEqual(
+            sum(row[2] == "applicable" for row in expected),
+            16,
+        )
+        self.assertEqual(
+            sum(row[2] == "not_applicable" for row in expected),
+            39,
+        )
+        self.assertEqual(len(ordinary_text_null), 14)
+        self.assertEqual(len(ordinary_identities), 14)
+        self.assertTrue(expected_identities.isdisjoint(ordinary_identities))
 
     def test_visual_digest_changes_content_hash_without_a_search_target(self) -> None:
         first = build_provider_units(_admitted(_visual_only_document("f"))).units[0]

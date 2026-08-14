@@ -251,6 +251,7 @@ def _provider_guard_fixture() -> tuple[
                     if draft.semantic_keys is not None
                     else None
                 ),
+                applicability=draft.applicability,
                 quality_status=draft.quality_status,
                 query_projection_hash=draft.query_projection_hash,
                 structure_hash=draft.structure_hash,
@@ -313,6 +314,21 @@ class PublishRunTests(unittest.TestCase):
                 caught.exception.error["reason_code"],
                 f"{reason}_mismatch",
             )
+
+        tampered_applicability = [*units]
+        tampered_applicability[1] = replace(units[1], applicability=None)
+        with self.assertRaises(PublishRunError) as caught:
+            guard(
+                run=run,
+                document=document,
+                artifact_owner=run,
+                security_code="000001",
+                units=tampered_applicability,
+            )
+        self.assertEqual(
+            caught.exception.error["reason_code"],
+            "applicability_mismatch",
+        )
 
     def test_provider_guard_rejects_legacy_candidate(self) -> None:
         guard, run, document, units = _provider_guard_fixture()
