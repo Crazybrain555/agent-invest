@@ -1,10 +1,11 @@
 # Semantic route and retrieval pilot — 2026-08-13
 
 This is the current data-quality receipt for Unit semantic routing. The clean
-development database currently publishes v53/r35 for all 805 Units. The r37/v54
-candidate below independently re-read the same immutable PDFs, Provider records,
-and native PDF text without mutating PostgreSQL or AgentSSD. It remains pending
-the reviewed Unit-only replay described under production gates.
+development database publishes r37/v54 for all 805 Units from commit `0f4eefb`.
+The manifest-bound Unit-only reset and replay re-read the same immutable PDFs,
+Provider records, parser bundles and native PDF text while preserving every
+source/parse artifact. The public rows, search projection and replay evidence
+below are the resulting live development state.
 
 ## Current contract
 
@@ -69,6 +70,38 @@ regulatory subheading rather than a model. The final reviewed replay is
 It is session evidence, not a tracked production artifact. Zero calls prove
 that this corpus does not depend on the optional adapter; they do not by
 themselves qualify that adapter for a future truly ambiguous Unit.
+The DB-free report header records its configured but unused evaluation adapter
+as `codex_cli.v4.high` / `gpt-5.3-codex-spark`; the live Build receipts record
+the current configured but unused default `codex_cli.v4.low` /
+`gpt-5.6-luna`. Because calls and tokens are zero, all 357 direct routes are
+deterministic and the differing dormant adapter identity changes no Unit row.
+
+The reviewed candidate was then committed and replayed through the actual
+Build/Publish/Search path. The exact ten-run target manifest has SHA-256
+`9eeb6b77f630e4b97c88f167bb7271aa969b1ca9312af136a319977d7e52d577`.
+The reset removed only the prior 805 Units, 805 search parents, eight body
+windows, 25,955 search atoms, 815 Unit/publish outbox rows and 30 Unit sidecars;
+all ten raw PDFs, ProviderDocument records, parser trees and processing runs
+remained hash-bound and present. Reset receipt:
+`/private/tmp/disclosure-final-replay-20260814-r37.5xyg2x/unit_rebuild_reset_receipt_r37.json`
+(SHA-256 `cafb633234fe8c2b9a54f89529cd18a253e13b0353ba182903cf8d917cb4d95e`).
+Build and Publish succeeded for all ten exact runs, and Search rebuilt all 805
+parents with no failure. Replay receipt:
+`/private/tmp/disclosure-final-replay-20260814-r37.5xyg2x/unit_rebuild_replay_receipt_r37.json`
+(SHA-256 `7cf5d7c86b1a85a9b8ae9081ab760017d6a3313497798ce7958dffae239692cc`).
+
+The live public-view audit reports 805 distinct assets and 805 distinct
+Document/order identities, all active. Title, heading path, direct keys,
+section keys and filing type match the source replay 805/805. Payloads contain
+zero `provider_type` or `semantic_type` residue. The search projection contains
+805 parents, eight windows and 25,955 atoms. All ten Documents have exactly one
+active and one total run in this clean development database. Audit receipt:
+`/private/tmp/disclosure-final-replay-20260814-r37.5xyg2x/unit_data_quality_audit_r37.json`
+(SHA-256 `12acf55a42866ba5cf76c78f79f8a8dd51e5b3beb77edbbaa825b83475dfb6f4`).
+The 17-query L2/L3 gold passes 17/17 against these live rows, and the full
+doctor passes raw/Provider/Unit hashes, PostgreSQL/migrations/views/roles,
+search cardinality, remote MinerU canary, queues and orphan checks. Resident
+worker and GC jobs remain deliberately unloaded.
 
 The previous source-identity candidate was
 `/private/tmp/disclosure-semantic-route-r36-source-native-final.json`
@@ -111,6 +144,21 @@ boundary/inner spacing (including whitespace adjacent to `CRLF`) remain exact. P
 keeps the original MinerU text; `provider_unit_locator.v2` stores raw-block plus
 provider/source text hashes and Publish replays the PDF. No table, nonnumeric
 difference, alternate reading order, or second parser structure is admitted.
+
+A post-replay rejection audit examined all 18 rectangles where native PDF text
+contained more numeric tokens but the deletion-only proof correctly abstained.
+For 15/18, the complete native text (ignoring provider spacing) already exists
+in the final Unit: these are cross-page or split-block empty carriers, not lost
+search content. Three rectangles contain real, visually confirmed MinerU
+omissions that cannot be repaired without also tolerating nonnumeric drift:
+`1225067794/source_index=1476` omits the note reference/year,
+`1225067794/source_index=3424` omits dates and part of the bond name, and
+`1225231394/source_index=121` omits `(2)`, `2024` and `=`. Their surrounding
+body/table content, heading context and direct/section retrieval routes remain
+present. The service preserves the conservative Provider text rather than
+weakening the source proof from three examples. Audit receipt:
+`/private/tmp/disclosure-final-replay-20260814-r37.5xyg2x/native_rejected_numeric_audit_r37.json`
+(SHA-256 `3f80a5c33ad42f53e70bee92fd840ec4b1e4982ec9c06a8a145c2d16357eecd8`).
 
 An independent DB-free replay covers 822 Units across performance flash,
 inquiry notice, major contract, delisting risk, rights issue, restructuring,
@@ -216,12 +264,18 @@ from Unit topics. Filing type, disclosure topics, Unit routes, section routes,
 and lexical search are separate retrieval surfaces.
 
 The current read-only public-view audit makes that distinction concrete: the
-v53/r35 clean replay has 357 direct-routed Units and 531 section-routed Units,
+r37/v54 clean replay has 357 direct-routed Units and 540 section-routed Units,
 while `content_categories` is non-NULL for 23 Units belonging to the two
 Documents whose CNInfo records actually carry that facet, and NULL for the
 remaining 782 Units across eight Documents. Content-bearing Units must not be
 used to fabricate a missing provider category; their retrieval support comes
 from the direct/section/lexical surfaces above.
+
+The same audit finds 156 `{"text": ""}` payloads. All 156 are heading-only
+Units with a non-NULL title, nonempty hash-bound heading chain and nonempty
+title search tokens; none is a body block silently replaced by an empty value.
+Of those, 102 are intentionally lexical-only because neither a direct nor a
+section route is honestly supported.
 
 ## Remaining production gates
 
@@ -231,9 +285,11 @@ from the direct/section/lexical surfaces above.
   production canary; do not infer adapter eligibility from the zero-call run.
 - The 17-query gold proves the reviewed cases, not full query-language recall.
   Held-out process classes and atypical PDF layouts remain required.
-- The live development rows/search projections still carry the reviewed r35
-  baseline. Write r37/v54 only after its current-byte independent reviews and
-  commit pass, then rerun route/query gold and row-level data-quality inspection
-  against the public views through one manifest-bound Unit-only replay.
-- A final doctor/canary pass and held-out source inspection remain required
-  before a production-readiness claim or worker enablement.
+- The three visually confirmed local MinerU omissions above are retained as an
+  explicit upstream quality limit. Broadening native-PDF repair to nonnumeric
+  drift requires a new source-bound contract and cross-document evidence; it
+  is not authorized by these samples.
+- The manifest-bound replay, live row inspection, held-out source inspection
+  and full doctor/canary pass are complete. Independent live-data review is
+  also complete; user visual acceptance remains required before a production-
+  readiness claim or worker enablement.
