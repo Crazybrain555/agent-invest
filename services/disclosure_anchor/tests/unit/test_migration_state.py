@@ -16,13 +16,13 @@ class MigrationStateTests(unittest.TestCase):
         heads = migration_heads()
         self.assertEqual(len(heads), 1)
         self.assertEqual(single_migration_head(), heads[0])
-        self.assertEqual(heads[0], "0037_unit_facets")
+        self.assertEqual(heads[0], "0038_unit_contract_v2")
 
         migration = importlib.import_module(
             "disclosure_anchor.adapters.db.postgres.migrations.versions."
-            "0037_remove_unit_content_categories"
+            "0038_version_unit_public_view"
         )
-        self.assertEqual(migration.down_revision, "0036_unit_section_routes")
+        self.assertEqual(migration.down_revision, "0037_unit_facets")
 
     def test_0033_unit_view_keeps_only_unit_owned_scope_fields(self) -> None:
         migration = importlib.import_module(
@@ -161,6 +161,29 @@ class MigrationStateTests(unittest.TestCase):
 
         prior = migration._document_units_view_sql(include_content_categories=True)
         self.assertIn("class_content_categories AS content_categories", prior)
+
+    def test_0038_versions_the_breaking_unit_view_change(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0038_version_unit_public_view"
+        )
+
+        v1 = migration._document_units_view_sql(
+            view_name="document_units_v1",
+            contract_version="document_unit.v1",
+            include_content_categories=True,
+        )
+        v2 = migration._document_units_view_sql(
+            view_name="document_units_v2",
+            contract_version="document_unit.v2",
+            include_content_categories=False,
+        )
+
+        self.assertIn("class_content_categories AS content_categories", v1)
+        self.assertIn("'document_unit.v1'::text", v1)
+        self.assertNotIn("content_categories", v2)
+        self.assertIn("AS body_status", v2)
+        self.assertIn("'document_unit.v2'::text", v2)
 
     def test_0031_reset_gate_remains_immutable_history(self) -> None:
 

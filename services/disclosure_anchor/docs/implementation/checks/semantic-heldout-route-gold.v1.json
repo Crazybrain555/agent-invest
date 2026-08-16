@@ -51,19 +51,18 @@
       "provider_document_id": "1225469289",
       "unit_index": 54,
       "title": "（三）标的资产的评估值风险",
-      "expected_keys": ["transaction_risk"],
+      "expected_keys": ["transaction_risk", "target_asset"],
       "required_section_keys": ["transaction_risk"],
-      "forbidden_keys": ["target_asset", "valuation_pricing"],
-      "rationale": "标题语义中心是风险；标的资产和评估值只是风险对象。"
+      "forbidden_keys": ["valuation_pricing"],
+      "rationale": "风险是披露角色，标题直接命名且正文印证的标的资产仍是 Unit-local 粗主题；评估定价未形成独立 source-bound 主题。"
     },
     {
       "provider_document_id": "1225469289",
       "unit_index": 56,
       "title": "（五）业绩承诺及其执行风险",
-      "expected_keys": ["transaction_risk"],
+      "expected_keys": ["transaction_risk", "performance_commitment"],
       "required_section_keys": ["transaction_risk"],
-      "forbidden_keys": ["performance_commitment"],
-      "rationale": "本 Unit 披露执行风险，不是新的业绩承诺安排。"
+      "rationale": "风险是披露角色，标题直接命名且正文印证的业绩承诺仍是 Unit-local 粗主题；L2 再解释其风险模态。"
     },
     {
       "provider_document_id": "1225469289",
@@ -94,6 +93,99 @@
       "required_keys": ["decision_procedures"],
       "forbidden_section_keys": ["transaction_classification", "transaction_impact", "transaction_rationale"],
       "rationale": "后续独立决策程序章节不得继承已结束的交易性质、影响或背景容器。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 41,
+      "title": "4、卓越的管理团队及人才培养机制",
+      "expected_keys": ["revenue_and_cost"],
+      "required_section_keys": ["business_review"],
+      "rationale": "Unit 正文直接说明营业收入增长及原因；因果性属于 L2 模态，不抹掉 L1 收入成本主题。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 60,
+      "title": "(一) 可能面对的风险",
+      "expected_keys": ["business_risk"],
+      "required_section_keys": ["business_review"],
+      "rationale": "有正文的明确风险标题形成粗风险主题；条件、预测和风险模态留给 L2 解释。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 65,
+      "title": "5、主要原材料价格波动风险",
+      "expected_keys": ["business_risk", "revenue_and_cost"],
+      "required_section_keys": ["business_review"],
+      "rationale": "明确风险标题与正文收入成本 witness 独立成立；条件和风险模态不抹掉任一 L1 主题。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 74,
+      "title": "第四节 公司治理、环境和社会",
+      "expected_keys": [],
+      "expected_section_keys": [],
+      "expected_heading_path": ["第四节 公司治理、环境和社会"],
+      "rationale": "复合章标题是结构锚，不把两个上下文容器伪装成标题 Unit 的 direct 或 inherited route。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 79,
+      "title": "四、纳入环境信息依法披露企业名单的上市公司及其主要子公司的环境信息情况√适用 □不适用",
+      "expected_keys": [],
+      "expected_section_keys": ["governance", "environment_social"],
+      "expected_heading_path": [
+        "第四节 公司治理、环境和社会",
+        "四、纳入环境信息依法披露企业名单的上市公司及其主要子公司的环境信息情况√适用 □不适用"
+      ],
+      "rationale": "MinerU 合入 table_caption 的强编号环境标题必须成为 source-bound section owner，并脱离此前激励子树。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 80,
+      "title": "(一) 在报告期内为减少污染物排放及提升资源利用效率所采取的措施及效果",
+      "expected_keys": [],
+      "expected_section_keys": [],
+      "expected_heading_path": [
+        "第四节 公司治理、环境和社会",
+        "四、纳入环境信息依法披露企业名单的上市公司及其主要子公司的环境信息情况√适用 □不适用",
+        "(一) 在报告期内为减少污染物排放及提升资源利用效率所采取的措施及效果"
+      ],
+      "rationale": "heading-only 子节保留精确层级但不继承 section route；其内容后代再获得结构召回。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 81,
+      "title": "1、排污信息",
+      "expected_keys": [],
+      "expected_section_keys": ["governance", "environment_social"],
+      "expected_heading_path": [
+        "第四节 公司治理、环境和社会",
+        "四、纳入环境信息依法披露企业名单的上市公司及其主要子公司的环境信息情况√适用 □不适用",
+        "(一) 在报告期内为减少污染物排放及提升资源利用效率所采取的措施及效果",
+        "1、排污信息"
+      ],
+      "rationale": "环境正文后代必须同时保留复合章的两个结构检索面，且不得回挂激励章节。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 270,
+      "title": "(ii) 信用风险显著增加和已发生信用减值的判断",
+      "expected_keys": ["credit_risk"],
+      "expected_section_keys": ["financial_report_chapter", "accounting_policies"],
+      "rationale": "会计政策中的信用风险判断保留具体信用风险键，但不得被粗业务风险标题规则误收。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 226,
+      "title": "20、 投资性房地产",
+      "expected_keys": ["investment_property"],
+      "expected_section_keys": ["financial_report_chapter", "accounting_policies"],
+      "expected_heading_path": [
+        "第八节 财务报告",
+        "五、重要会计政策及会计估计",
+        "20、 投资性房地产"
+      ],
+      "rationale": "裸“不适用”必须守恒为本标题正文，不得再次被误判成独立 heading Unit。"
     }
   ]
 }

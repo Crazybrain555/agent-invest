@@ -112,6 +112,7 @@ class DocumentUnitV1(PublicModel):
     trace_level: str
     raw_file_hash: str | None
     query_projection_hash: str | None
+    content_categories: list[dict[str, Any]] | None
     asset_uri: str
     is_active_run: bool
     evidence_refs: list[EvidenceRefV1]

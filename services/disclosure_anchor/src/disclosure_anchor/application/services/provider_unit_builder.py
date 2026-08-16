@@ -174,12 +174,17 @@ class _BuildContext:
         evidence_only: list[int] = []
         bound_unbound: list[UnboundProviderTablePart] = []
         search_bindings: list[ProviderUnitSearchBinding] = []
+        heading_payload_ordinal: int | None = None
 
         if heading is not None:
-            heading_targets = self._targets_for_source(heading.source_index)
+            heading_targets = tuple(
+                target
+                for target in self._targets_for_source(heading.source_index)
+                if target.payload_ordinal == heading.payload_ordinal
+            )
             if len(heading_targets) != 1:
                 raise ValueError(
-                    "accepted heading must expose exactly one source target"
+                    "accepted heading must expose exactly one source payload target"
                 )
             target = heading_targets[0]
             if _source_payload_text(self.document, target) != heading.text:
@@ -190,13 +195,18 @@ class _BuildContext:
                     destination=ProviderSearchDestination(kind="unit_title"),
                 )
             )
+            heading_payload_ordinal = heading.payload_ordinal
 
         consumed: set[int] = set()
         for source_index in unit.block_source_indices:
             if source_index in consumed:
                 continue
             block = self.blocks[source_index]
-            if heading is not None and source_index == heading.source_index:
+            if (
+                heading is not None
+                and source_index == heading.source_index
+                and block.provider_type == "text"
+            ):
                 consumed.add(source_index)
                 continue
             if source_index in self.logical_by_continuation:
@@ -232,6 +242,13 @@ class _BuildContext:
                         index for index in segment_indices if index is not None
                     ),
                     logical_table_index=table_index,
+                    excluded_payload_ordinals=(
+                        frozenset({heading_payload_ordinal})
+                        if heading is not None
+                        and source_index == heading.source_index
+                        and heading_payload_ordinal is not None
+                        else frozenset()
+                    ),
                 )
                 parts.append(part)
                 consumed.update(sources)
@@ -249,6 +266,13 @@ class _BuildContext:
                         if segment_index is None
                         else (segment_index,),
                         logical_table_index=None,
+                        excluded_payload_ordinals=(
+                            frozenset({heading_payload_ordinal})
+                            if heading is not None
+                            and source_index == heading.source_index
+                            and heading_payload_ordinal is not None
+                            else frozenset()
+                        ),
                     )
                 )
                 bound_unbound.append(unbound)
@@ -274,6 +298,13 @@ class _BuildContext:
                         block_source_indices=(source_index,),
                         physical_segment_indices=(),
                         logical_table_index=None,
+                        excluded_payload_ordinals=(
+                            frozenset({heading_payload_ordinal})
+                            if heading is not None
+                            and source_index == heading.source_index
+                            and heading_payload_ordinal is not None
+                            else frozenset()
+                        ),
                     )
                 )
             else:
@@ -297,6 +328,12 @@ class _BuildContext:
                     destination=destination,
                 )
                 search_bindings.append(binding)
+        search_bindings.sort(
+            key=lambda binding: (
+                binding.source.source_index,
+                binding.source.payload_ordinal,
+            )
+        )
 
         locator = ProviderUnitLocator(
             provider_document_sha256=self.admitted.provider_document_sha256,
@@ -392,6 +429,7 @@ class _BuildContext:
             ProviderUnitHeadingRef(
                 heading_id=item.heading_id,
                 source_index=item.source_index,
+                payload_ordinal=item.payload_ordinal,
                 placement_source=item.placement_source,
             )
             for item in chain
@@ -406,6 +444,7 @@ class _BuildContext:
         block_source_indices: tuple[int, ...],
         physical_segment_indices: tuple[int, ...],
         logical_table_index: int | None,
+        excluded_payload_ordinals: frozenset[int] = frozenset(),
     ) -> _Part:
         segment_artifact_roles = tuple(
             role
@@ -434,8 +473,13 @@ class _BuildContext:
                 kind=kind,
                 artifacts=self.artifacts,
                 content_artifact_roles=content_artifact_roles,
+                excluded_payload_ordinals=excluded_payload_ordinals,
             ),
-            targets=self._targets_for_source(block.source_index),
+            targets=tuple(
+                target
+                for target in self._targets_for_source(block.source_index)
+                if target.payload_ordinal not in excluded_payload_ordinals
+            ),
         )
 
     def _targets_for_source(self, source_index: int) -> tuple[RetrievalTarget, ...]:
@@ -653,6 +697,8 @@ def _validate_binding_owner(
         if (
             not locator.heading_chain
             or locator.heading_chain[-1].source_index != source_index
+            or locator.heading_chain[-1].payload_ordinal
+            != binding.source.payload_ordinal
         ):
             raise ValueError("provider search title source is not the Unit heading")
         return
@@ -681,13 +727,16 @@ def _part_payload(
     kind: ProviderUnitPartKind,
     artifacts: dict[str, ProviderArtifact],
     content_artifact_roles: tuple[str, ...],
+    excluded_payload_ordinals: frozenset[int] = frozenset(),
 ) -> dict[str, object]:
     payload: dict[str, object] = {}
     scalar_fields, sequence_fields = provider_payload_field_contract(
         block.provider_type
     )
     by_field: dict[str, list[ProviderPayload]] = {}
-    for item in block.payloads:
+    for payload_ordinal, item in enumerate(block.payloads):
+        if payload_ordinal in excluded_payload_ordinals:
+            continue
         by_field.setdefault(item.field, []).append(item)
     for field in scalar_fields:
         values = by_field.get(field, [])
@@ -700,7 +749,10 @@ def _part_payload(
     if content_artifact_roles and (
         kind == "visual"
         or not any(
-            item.field in scalar_fields and item.text.strip() for item in block.payloads
+            payload_ordinal not in excluded_payload_ordinals
+            and item.field in scalar_fields
+            and item.text.strip()
+            for payload_ordinal, item in enumerate(block.payloads)
         )
     ):
         payload["content_artifacts"] = [
@@ -890,8 +942,16 @@ def _validate_build(
         )
         if draft.locator.heading_chain != expected_heading_chain:
             raise ValueError("provider Unit heading locator differs from its source")
+        part_sources = {
+            source_index
+            for part in draft.locator.parts
+            for source_index in part.block_source_indices
+        }
+        evidence_sources = set(draft.locator.evidence_only_block_source_indices)
         if draft.locator.heading_chain:
-            owned_blocks.append(draft.locator.heading_chain[-1].source_index)
+            heading_source = draft.locator.heading_chain[-1].source_index
+            if heading_source not in part_sources | evidence_sources:
+                owned_blocks.append(heading_source)
         for part in draft.locator.parts:
             owned_blocks.extend(part.block_source_indices)
             owned_segments.extend(part.physical_table_segment_indices)

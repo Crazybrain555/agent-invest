@@ -495,6 +495,12 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "part index"):
             provider_unit_locator_from_payload(payload)
 
+        payload = provider_unit_locator_to_payload(locator)
+        headings = cast(list[dict[str, object]], payload["heading_chain"])
+        headings[0].pop("payload_ordinal")
+        with self.assertRaisesRegex(ValueError, "heading fields"):
+            provider_unit_locator_from_payload(payload)
+
     def test_locator_decoder_keeps_legacy_v1_read_compatibility(self) -> None:
         locator = (
             build_provider_units(_admitted(_representative_document())).units[1].locator
@@ -502,6 +508,8 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         payload = provider_unit_locator_to_payload(locator)
         payload["contract_version"] = "provider_unit_locator.v1"
         payload.pop("source_text_reconciliations")
+        for heading in cast(list[dict[str, object]], payload["heading_chain"]):
+            heading.pop("payload_ordinal")
 
         decoded = provider_unit_locator_from_payload(payload)
 
@@ -513,6 +521,21 @@ class ProviderUnitBuilderTests(unittest.TestCase):
             ),
             decoded,
         )
+
+    def test_locator_decoder_keeps_v2_source_repair_read_compatibility(self) -> None:
+        locator = (
+            build_provider_units(_admitted(_representative_document())).units[1].locator
+        )
+        payload = provider_unit_locator_to_payload(locator)
+        payload["contract_version"] = "provider_unit_locator.v2"
+        for heading in cast(list[dict[str, object]], payload["heading_chain"]):
+            heading.pop("payload_ordinal")
+
+        decoded = provider_unit_locator_from_payload(payload)
+
+        self.assertEqual(decoded.contract_version, "provider_unit_locator.v2")
+        self.assertTrue(decoded.source_text_reconciliations == ())
+        self.assertTrue(all(item.payload_ordinal == 0 for item in decoded.heading_chain))
 
     def test_heading_only_unit_keeps_structure_without_body_duplication(self) -> None:
         document = _document(
@@ -544,6 +567,130 @@ class ProviderUnitBuilderTests(unittest.TestCase):
             draft.locator.search_targets[0].destination.kind,
             "unit_title",
         )
+
+    def test_bare_applicability_title_is_conserved_once_as_body(self) -> None:
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "20、 投资性房地产"),),
+                        annotation="title",
+                        level=2,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "不适用"),),
+                        annotation="title",
+                        level=3,
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "21、 固定资产"),),
+                        annotation="title",
+                        level=2,
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+
+        first, second = build_provider_units(_admitted(document)).units
+
+        self.assertEqual(first.title, "20、 投资性房地产")
+        self.assertEqual(first.heading_path, ("20、 投资性房地产",))
+        self.assertEqual(first.payload, {"text": "不适用"})
+        self.assertEqual(
+            tuple(
+                source_index
+                for part in first.locator.parts
+                for source_index in part.block_source_indices
+            ),
+            (1,),
+        )
+        self.assertEqual(
+            [
+                binding.source.source_index
+                for binding in first.locator.search_targets
+            ],
+            [0, 1],
+        )
+        self.assertIsNone(first.applicability)
+        self.assertEqual(second.title, "21、 固定资产")
+        self.assertEqual(second.payload, {"text": ""})
+
+    def test_numbered_table_caption_opens_a_section_without_duplicating_text(
+        self,
+    ) -> None:
+        caption = (
+            "四、纳入环境信息依法披露企业名单的上市公司及其主要"
+            "子公司的环境信息情况√适用 □不适用"
+        )
+        table_body = "<table><td>企业数量</td><td>9</td></table>"
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "第四节 公司治理、环境和社会"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "table",
+                        (
+                            ProviderPayload("table_body", None, table_body),
+                            ProviderPayload("table_caption", 0, caption),
+                        ),
+                        annotation="table",
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "text",
+                        (
+                            ProviderPayload(
+                                "text",
+                                None,
+                                "(一) 在报告期内为减少污染物排放所采取的措施",
+                            ),
+                        ),
+                        annotation="title",
+                        level=2,
+                    ),
+                ),
+            ),
+            segments=(_segment(0, 0, "retained"),),
+        )
+
+        chapter, table, child = build_provider_units(_admitted(document)).units
+
+        self.assertEqual(chapter.title, "第四节 公司治理、环境和社会")
+        self.assertEqual(table.title, caption)
+        self.assertEqual(table.heading_path, (chapter.title, caption))
+        self.assertEqual(table.payload_kind, "table")
+        self.assertEqual(table.payload, {"table_body": table_body})
+        self.assertEqual(table.locator.heading_chain[-1].source_index, 1)
+        self.assertEqual(table.locator.heading_chain[-1].payload_ordinal, 1)
+        self.assertEqual(
+            [
+                (binding.source.payload_ordinal, binding.destination.kind)
+                for binding in table.locator.search_targets
+            ],
+            [(0, "unit_payload"), (1, "unit_title")],
+        )
+        self.assertNotIn(caption, json.dumps(table.payload, ensure_ascii=False))
+        self.assertEqual(child.heading_path, (chapter.title, caption, child.title))
 
     def test_empty_text_carrier_is_evidence_only_but_visual_content_survives(
         self,

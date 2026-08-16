@@ -70,6 +70,23 @@ class SchemaShapeTests(unittest.TestCase):
             views = set(view_names(conn, schema=PUBLIC_SCHEMA))
         self.assertEqual(set(PUBLIC_VIEWS), views)
 
+    def test_unit_public_view_versions_are_granted_to_all_readers(self) -> None:
+        with self.engine.connect() as conn:
+            for role in (
+                "disclosure_app",
+                "disclosure_reader",
+                "future_l2_reader",
+            ):
+                for view_name in ("document_units_v1", "document_units_v2"):
+                    allowed = conn.execute(
+                        text("SELECT has_table_privilege(:role, :view, 'SELECT')"),
+                        {
+                            "role": role,
+                            "view": f"disclosure_public.{view_name}",
+                        },
+                    ).scalar_one()
+                    self.assertTrue(allowed, (role, view_name))
+
     def test_alembic_version_in_ops_schema_and_at_head(self) -> None:
         with self.engine.connect() as conn:
             present = conn.execute(
@@ -247,19 +264,29 @@ class SchemaShapeTests(unittest.TestCase):
                     )
                 ).scalars()
             )
-        self.assertLessEqual({"semantic_keys", "section_keys"}, columns)
-        self.assertNotIn("content_categories", columns)
+        self.assertLessEqual(
+            {"semantic_keys", "section_keys", "content_categories"}, columns
+        )
 
-    def test_0037_removes_only_the_unit_content_facet(self) -> None:
+    def test_0038_versions_the_unit_content_facet_removal(self) -> None:
         self.addCleanup(self._restore_migration_head)
 
         with self.engine.connect() as conn:
-            unit_columns = set(
+            v1_columns = set(
                 conn.execute(
                     text(
                         "SELECT column_name FROM information_schema.columns "
                         "WHERE table_schema = 'disclosure_public' "
                         "AND table_name = 'document_units_v1'"
+                    )
+                ).scalars()
+            )
+            v2_columns = set(
+                conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = 'disclosure_public' "
+                        "AND table_name = 'document_units_v2'"
                     )
                 ).scalars()
             )
@@ -272,13 +299,14 @@ class SchemaShapeTests(unittest.TestCase):
                     )
                 ).scalars()
             )
-        self.assertNotIn("content_categories", unit_columns)
+        self.assertIn("content_categories", v1_columns)
+        self.assertNotIn("content_categories", v2_columns)
         self.assertIn("content_categories", document_columns)
 
-        down = self._alembic("downgrade", "0036_unit_section_routes")
+        down = self._alembic("downgrade", "0037_unit_facets")
         self.assertEqual(down.returncode, 0, down.stderr[-500:])
         with self.engine.connect() as conn:
-            downgraded_unit_columns = set(
+            preserved_v1_columns = set(
                 conn.execute(
                     text(
                         "SELECT column_name FROM information_schema.columns "
@@ -287,7 +315,18 @@ class SchemaShapeTests(unittest.TestCase):
                     )
                 ).scalars()
             )
-        self.assertIn("content_categories", downgraded_unit_columns)
+            preserved_v2 = conn.execute(
+                text("SELECT to_regclass('disclosure_public.document_units_v2')")
+            ).scalar_one_or_none()
+            current_revision = conn.execute(
+                text(
+                    f"SELECT version_num FROM "
+                    f"{ALEMBIC_VERSION_TABLE_SCHEMA}.alembic_version"
+                )
+            ).scalar_one()
+        self.assertIn("content_categories", preserved_v1_columns)
+        self.assertIsNone(preserved_v2)
+        self.assertEqual(current_revision, "0037_unit_facets")
 
         up = self._alembic("upgrade", "head")
         self.assertEqual(up.returncode, 0, up.stderr[-500:])

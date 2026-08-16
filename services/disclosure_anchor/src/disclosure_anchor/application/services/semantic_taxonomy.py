@@ -10,12 +10,13 @@ from typing import Any
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_FALLBACK_KEY,
     SemanticRouteContractError,
+    SemanticCompositeSection,
     SemanticRouteDefinition,
     SemanticRouteTaxonomy,
 )
 
 
-SEMANTIC_TAXONOMY_VERSION = "semantic-taxonomy-2026-08-r37"
+SEMANTIC_TAXONOMY_VERSION = "semantic-taxonomy-2026-08-r43"
 _FINANCIAL_RESOURCE = "semantic_financial_routes.v1.json"
 _EVENT_RESOURCE = "semantic_event_routes.v1.json"
 _PERIODIC_SCOPES = ("annual_report", "semiannual_report", "quarterly_report")
@@ -36,9 +37,11 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
     )
     if set(financial) != {
         "_about",
+        "composite_context_labels",
         "context_container_keys",
         "exclusive_container_keys",
         "keys",
+        "quantitative_topic_keys",
         "version",
     }:
         raise SemanticRouteContractError("financial semantic taxonomy fields drift")
@@ -48,14 +51,15 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
         "exclusive_container_keys",
         "fallback_key",
         "overview_container_keys",
-        "quantitative_fact_keys",
+        "quantitative_topic_keys",
+        "role_anchor_keys",
         "section_container_keys",
         "version",
     }:
         raise SemanticRouteContractError("event semantic taxonomy fields drift")
-    if financial.get("version") != "semantic-financial-2026-08-r18":
+    if financial.get("version") != "semantic-financial-2026-08-r20":
         raise SemanticRouteContractError("financial semantic taxonomy version drift")
-    if events.get("version") != "semantic-events-2026-08-r26":
+    if events.get("version") != "semantic-events-2026-08-r31":
         raise SemanticRouteContractError("event semantic taxonomy version drift")
     if events.get("fallback_key") != SEMANTIC_FALLBACK_KEY:
         raise SemanticRouteContractError("event semantic fallback key drift")
@@ -86,6 +90,14 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
         raise SemanticRouteContractError(
             "financial context container cannot be exclusive"
         )
+    financial_quantitative_topics = _key_set(
+        financial.get("quantitative_topic_keys"),
+        label="financial quantitative topic keys",
+    )
+    if not financial_quantitative_topics.issubset(raw_keys):
+        raise SemanticRouteContractError(
+            "financial quantitative topic key is not defined"
+        )
     for key, raw_entry in raw_keys.items():
         if not isinstance(key, str) or not isinstance(raw_entry, dict):
             raise SemanticRouteContractError("financial semantic route is invalid")
@@ -104,6 +116,36 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
                 scopes=_PERIODIC_SCOPES,
                 exclusive_container=key in financial_containers,
                 context_container=key in financial_context_containers,
+                quantitative_topic=key in financial_quantitative_topics,
+            )
+        )
+
+    raw_composites = financial.get("composite_context_labels")
+    if not isinstance(raw_composites, list):
+        raise SemanticRouteContractError(
+            "financial composite context labels must be an array"
+        )
+    composite_sections: list[SemanticCompositeSection] = []
+    for raw_composite in raw_composites:
+        if not isinstance(raw_composite, dict) or set(raw_composite) != {
+            "keys",
+            "label",
+        }:
+            raise SemanticRouteContractError(
+                "financial composite context label fields are invalid"
+            )
+        label = raw_composite["label"]
+        if not isinstance(label, str):
+            raise SemanticRouteContractError(
+                "financial composite context label is invalid"
+            )
+        composite_sections.append(
+            SemanticCompositeSection(
+                label=label,
+                keys=_text_array(
+                    raw_composite["keys"],
+                    label="financial composite context keys",
+                ),
             )
         )
 
@@ -123,9 +165,13 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
         events.get("overview_container_keys"),
         label="event overview container keys",
     )
-    event_quantitative_facts = _key_set(
-        events.get("quantitative_fact_keys"),
-        label="event quantitative fact keys",
+    event_quantitative_topics = _key_set(
+        events.get("quantitative_topic_keys"),
+        label="event quantitative topic keys",
+    )
+    event_role_anchors = _key_set(
+        events.get("role_anchor_keys"),
+        label="event role anchor keys",
     )
     event_section_containers = _key_set(
         events.get("section_container_keys"),
@@ -135,10 +181,12 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
         raise SemanticRouteContractError("event exclusive container key is not defined")
     if not event_overviews.issubset(event_keys):
         raise SemanticRouteContractError("event overview container key is not defined")
-    if not event_quantitative_facts.issubset(event_keys):
+    if not event_quantitative_topics.issubset(event_keys):
         raise SemanticRouteContractError(
-            "event quantitative fact key is not defined"
+            "event quantitative topic key is not defined"
         )
+    if not event_role_anchors.issubset(event_keys):
+        raise SemanticRouteContractError("event role anchor key is not defined")
     if not event_section_containers.issubset(event_keys):
         raise SemanticRouteContractError("event section container key is not defined")
     if event_section_containers & (event_containers | event_overviews):
@@ -148,6 +196,12 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
     if event_containers & event_overviews:
         raise SemanticRouteContractError(
             "event container cannot be both exclusive and overview"
+        )
+    if event_role_anchors & (
+        event_containers | event_overviews | event_section_containers
+    ):
+        raise SemanticRouteContractError(
+            "event role anchor conflicts with a container policy"
         )
     for raw_entry in raw_entries:
         if not isinstance(raw_entry, dict) or set(raw_entry) != {
@@ -170,12 +224,14 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
                 exclusive_container=key in event_containers,
                 overview_container=key in event_overviews,
                 section_container=key in event_section_containers,
-                quantitative_fact=key in event_quantitative_facts,
+                quantitative_topic=key in event_quantitative_topics,
+                role_anchor=key in event_role_anchors,
             )
         )
     return SemanticRouteTaxonomy(
         version=SEMANTIC_TAXONOMY_VERSION,
         definitions=tuple(definitions),
+        composite_sections=tuple(composite_sections),
     )
 
 

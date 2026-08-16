@@ -174,6 +174,10 @@ class SemanticRouter:
             for item in taxonomy.definitions
             if item.key != taxonomy.fallback_key
         }
+        self._composite_sections = {
+            _normalize_title(item.label): item.keys
+            for item in taxonomy.composite_sections
+        }
 
     def route(
         self,
@@ -416,10 +420,16 @@ class SemanticRouter:
         draft: ProviderUnitDraft,
     ) -> SemanticRouteUnitInput:
         sources = _unit_sources(admitted=admitted, document=document, draft=draft)
+        section_keys = self._section_keys(
+            document=document,
+            draft=draft,
+            sources=sources,
+        ) or ()
         candidates = self._candidates(
             document=document,
             unit_index=draft.unit_index,
             sources=sources,
+            section_keys=section_keys,
         )
         input_hash = _semantic_input_hash(
             taxonomy=self.taxonomy,
@@ -441,6 +451,7 @@ class SemanticRouter:
         document: SemanticDocumentContext,
         unit_index: int,
         sources: tuple[SemanticRouteSource, ...],
+        section_keys: tuple[str, ...],
     ) -> tuple[SemanticRouteCandidate, ...]:
         state: dict[str, _CandidateState] = {
             key: _CandidateState(key=key) for key in self._definitions
@@ -461,7 +472,32 @@ class SemanticRouter:
         has_unit_content = any(
             source.kind in {"body_text", "table_text"} for source in sources
         )
-        risk_title_source_ids: set[str] = set()
+        business_risk_state = state.get("business_risk")
+        business_risk_definition = self._definitions.get("business_risk")
+        if (
+            business_risk_state is not None
+            and business_risk_definition is not None
+            and has_unit_content
+            and "accounting_policies" not in section_keys
+            and (
+                not business_risk_definition.scopes
+                or bool(
+                    set(business_risk_definition.scopes)
+                    & classification_scopes
+                )
+            )
+        ):
+            for source in sources:
+                if source.kind != "unit_title":
+                    continue
+                title_core = _normalize_title(source.text)
+                if "风险" in title_core:
+                    business_risk_state.add(
+                        score=1200,
+                        source_id=source.source_id,
+                        evidence_kind="source_heading_risk_topic",
+                        locked=True,
+                    )
         risk_state = state.get("transaction_risk")
         if document.filing_type == "restructuring_assets" and risk_state is not None:
             for source in sources:
@@ -469,7 +505,6 @@ class SemanticRouter:
                     continue
                 title_core = _normalize_title(source.text)
                 if len(title_core) > len("风险") and title_core.endswith("风险"):
-                    risk_title_source_ids.add(source.source_id)
                     risk_state.add(
                         score=1200,
                         source_id=source.source_id,
@@ -543,16 +578,6 @@ class SemanticRouter:
             for source_index, source in enumerate(sources):
                 normalized = _normalize_match_text(source.text)
                 title_core = _normalize_title(source.text)
-                if (
-                    source.kind == "unit_title"
-                    and source.source_id in risk_title_source_ids
-                    and definition.key != "transaction_risk"
-                ):
-                    # In a restructuring risk heading, the semantic centre is
-                    # the risk assertion.  Embedded nouns such as 标的资产 or
-                    # 业绩承诺 remain body candidates, but the title cannot
-                    # lock them as the Unit's primary topic.
-                    continue
                 for label in labels:
                     if not label:
                         continue
@@ -631,10 +656,34 @@ class SemanticRouter:
                             )
                         )
                     ):
-                        quantitative_exact = _is_standardized_quantitative_fact(
+                        quantitative_topic = _is_standardized_quantitative_topic(
                             definition=definition,
                             normalized_label=label,
                             source=source,
+                            longer_labels=tuple(
+                                candidate_label.rstrip(":")
+                                for candidate_definition in self.taxonomy.definitions
+                                if (
+                                    candidate_definition.key != definition.key
+                                    and candidate_definition.quantitative_topic
+                                    and (
+                                        not candidate_definition.scopes
+                                        or bool(
+                                            set(candidate_definition.scopes)
+                                            & classification_scopes
+                                        )
+                                    )
+                                )
+                                for candidate_label in self._normalized_labels[
+                                    candidate_definition.key
+                                ]
+                                if (
+                                    len(candidate_label.rstrip(":"))
+                                    > len(label.rstrip(":"))
+                                    and label.rstrip(":")
+                                    in candidate_label.rstrip(":")
+                                )
+                            ),
                         )
                         resolved_proposal_exact = _is_resolved_proposal_fact(
                             definition=definition,
@@ -651,7 +700,7 @@ class SemanticRouter:
                             score=(
                                 900
                                 if (
-                                    quantitative_exact
+                                    quantitative_topic
                                     or resolved_proposal_exact
                                     or labeled_field_exact
                                 )
@@ -665,8 +714,8 @@ class SemanticRouter:
                                     "source_labeled_field_exact"
                                     if labeled_field_exact
                                     else (
-                                        "source_quantitative_exact"
-                                        if quantitative_exact
+                                        "source_quantitative_topic"
+                                        if quantitative_topic
                                         else (
                                             "source_table_candidate"
                                             if source.kind.startswith("table_")
@@ -676,7 +725,7 @@ class SemanticRouter:
                                 )
                             ),
                             locked=(
-                                quantitative_exact
+                                quantitative_topic
                                 or resolved_proposal_exact
                                 or labeled_field_exact
                             ),
@@ -738,7 +787,7 @@ class SemanticRouter:
                     "source_body_candidate",
                     "source_table_candidate",
                     "source_labeled_field_exact",
-                    "source_quantitative_exact",
+                    "source_quantitative_topic",
                     "source_resolved_proposal_exact",
                 }
             ):
@@ -777,6 +826,41 @@ class SemanticRouter:
                 )
             )
         ]
+        locked_role_anchors = {
+            item.key
+            for item in populated
+            if (
+                item.locked
+                and self._definitions[item.key].role_anchor
+                and item.evidence_kinds is not None
+                and "source_heading_exact" in item.evidence_kinds
+            )
+        }
+        if locked_role_anchors:
+            # Exact disclosure roles (for example forecast comparison versus
+            # forecast basis) are mutually source-bound.  A number inside one
+            # role cannot manufacture a different role anchor.  Preserve a
+            # second role only when it carries its own exact heading or typed
+            # field witness; otherwise the first role would incorrectly veto
+            # an independently visible source field.
+            populated = [
+                item
+                for item in populated
+                if (
+                    not self._definitions[item.key].role_anchor
+                    or item.key in locked_role_anchors
+                    or (
+                        item.evidence_kinds is not None
+                        and bool(
+                            {
+                                "source_heading_exact",
+                                "source_labeled_field_exact",
+                            }
+                            & set(item.evidence_kinds)
+                        )
+                    )
+                )
+            ]
         overview_keys = {
             item.key
             for item in populated
@@ -815,9 +899,9 @@ class SemanticRouter:
             if item.locked and self._definitions[item.key].exclusive_container
         ]
         if locked_exclusive:
-            # A source-exact exclusive container cannot legally carry a
-            # secondary route.  Drop incidental body candidates before model
-            # admission instead of paying for a decision with one valid result.
+            # A source-exact mechanical container cannot legally carry a
+            # secondary route.  Role anchors are a separate policy and may
+            # coexist with independently witnessed Unit topics.
             populated = locked_exclusive
         # Similarity and document context are recall signals, not stronger
         # evidence than a direct source heading/body/table occurrence.  Keep
@@ -866,6 +950,17 @@ class SemanticRouter:
         keys: list[str] = []
         for heading in draft.heading_path:
             title_core = _normalize_title(heading)
+            composite = self._composite_sections.get(title_core)
+            if composite is not None:
+                for key in composite:
+                    definition = self._definitions[key]
+                    if definition.scopes and not (
+                        set(definition.scopes) & classification_scopes
+                    ):
+                        continue
+                    if key not in keys:
+                        keys.append(key)
+                continue
             matching = {
                 definition.key
                 for definition in self.taxonomy.definitions
@@ -1710,14 +1805,13 @@ def _semantic_input_hash(
             "candidate_definitions": [
                 {
                     "description": definitions[candidate.key].description,
-                    "exclusive_container": definitions[
-                        candidate.key
-                    ].exclusive_container,
+                    "exclusive_container": definitions[candidate.key].exclusive_container,
                     "key": candidate.key,
                     "labels": list(definitions[candidate.key].labels),
                     "overview_container": definitions[
                         candidate.key
                     ].overview_container,
+                    "role_anchor": definitions[candidate.key].role_anchor,
                     "section_container": definitions[
                         candidate.key
                     ].section_container,
@@ -1761,46 +1855,90 @@ def _candidate_is_similarity_only(item: _CandidateState) -> bool:
     )
 
 
-def _is_standardized_quantitative_fact(
+def _is_standardized_quantitative_topic(
     *,
     definition: SemanticRouteDefinition,
     normalized_label: str,
     source: SemanticRouteSource,
+    longer_labels: tuple[str, ...],
 ) -> bool:
-    """Lock an event metric or a strict periodic metric subject statement.
+    """Lock a source-bound quantitative Unit topic.
 
-    Event metrics use the versioned taxonomy allowlist.  Periodic facts use a
-    narrower grammar: the controlled metric name must itself be the statement
-    subject and be followed immediately by a number or a change result.  A
-    number elsewhere in the paragraph, a collateral list, or an accounting
-    scope phrase therefore cannot manufacture a route.
+    Both event and periodic topics use versioned positive allowlists.  The
+    controlled label must be followed by an adjacent numeric value, optionally
+    through a closed connector; periodic topics may also state an explicit
+    directional result.  History, risk, conditions, plans and causality are L2
+    modality—not reasons to erase the Unit's L1 retrieval topic.  A number
+    elsewhere in the paragraph or a longer controlled label still cannot
+    manufacture this route.
     """
 
     if (
         definition.overview_container
         or definition.exclusive_container
         or definition.context_container
-        or source.kind not in {"body_text", "table_text"}
+        or source.kind != "body_text"
         or len(normalized_label.rstrip(":")) < 4
+        or not definition.quantitative_topic
     ):
         return False
     label = normalized_label.rstrip(":")
     normalized_source = _normalize_match_text(source.text)
-    if definition.quantitative_fact:
-        return (
-            re.search(r"[0-9０-９%％]", source.text) is not None
-            and label in normalized_source
-        )
-    if set(definition.scopes) != _PERIODIC_FILING_TYPES or source.kind != "body_text":
-        return False
-    direct_result = re.compile(
-        re.escape(label)
-        + r"(?::)?(?:为|达)?(?:人民币)?[+\-－−]?[0-9０-９]"
-        + r"|"
-        + re.escape(label)
-        + r"(?:增加|减少|增长|下降|上升|降低)"
+    value = r"(?:人民币)?[+\-－−]?[0-9０-９]"
+    connectors = (
+        "为",
+        "达",
+        "达到",
+        "实现",
+        "增加",
+        "减少",
+        "增长",
+        "下降",
+        "上升",
+        "降低",
+        "同比增长",
+        "同比下降",
+        "变动幅度为",
     )
-    return direct_result.search(normalized_source) is not None
+    if label.endswith(connectors):
+        direct_result = re.compile(re.escape(label) + value)
+    else:
+        connector = "|".join(
+            re.escape(item) for item in sorted(connectors, key=len, reverse=True)
+        )
+        link = rf"(?::)?(?:(?:{connector}))?"
+        direct_result = re.compile(re.escape(label) + link + value)
+    matches = list(direct_result.finditer(normalized_source))
+    if set(definition.scopes) == _PERIODIC_FILING_TYPES:
+        directional = "|".join(
+            re.escape(item)
+            for item in (
+                "同比增长",
+                "同比下降",
+                "增加",
+                "减少",
+                "增长",
+                "下降",
+                "上升",
+                "降低",
+            )
+        )
+        matches.extend(
+            re.compile(re.escape(label) + rf"(?:{directional})").finditer(
+                normalized_source
+            )
+        )
+    if not matches:
+        return False
+    for match in matches:
+        if any(
+            longer_match.start() <= match.start() < longer_match.end()
+            for longer_label in longer_labels
+            for longer_match in re.finditer(re.escape(longer_label), normalized_source)
+        ):
+            continue
+        return True
+    return False
 
 
 def _is_labeled_field_fact(
@@ -1810,7 +1948,16 @@ def _is_labeled_field_fact(
     source: SemanticRouteSource,
     following_sources: Sequence[SemanticRouteSource],
 ) -> bool:
-    """Lock an explicit non-periodic field, table header, or subheading."""
+    """Lock one explicit typed field/header or non-periodic labeled field.
+
+    A controlled field label establishes the L1 topic even when its value is
+    negative, absent, not applicable, historical, or planned.  Those value
+    semantics belong to L2.  Periodic reports stay deterministic only for
+    typed table fields/headers on the quantitative-topic allowlist; visible
+    table text remains lexical/candidate evidence.
+    """
+
+    periodic_definition = set(definition.scopes) == _PERIODIC_FILING_TYPES
 
     if (
         definition.overview_container
@@ -1823,7 +1970,14 @@ def _is_labeled_field_fact(
             "table_field_label",
             "table_column_header",
         }
-        or set(definition.scopes) == _PERIODIC_FILING_TYPES
+        or (
+            periodic_definition
+            and (
+                not definition.quantitative_topic
+                or source.kind
+                not in {"table_field_label", "table_column_header"}
+            )
+        )
         or len(normalized_label.rstrip(":")) < 3
     ):
         return False
@@ -1833,10 +1987,6 @@ def _is_labeled_field_fact(
         return False
     suffix = normalized_source[len(label) :].strip()
     value = suffix[1:].strip() if suffix.startswith(":") else suffix
-    if value.startswith(
-        ("不适用", "不涉及", "无", "尚未", "未发生")
-    ):
-        return False
     if source.kind in {"table_field_label", "table_column_header"}:
         return True
     if source.kind == "table_text":

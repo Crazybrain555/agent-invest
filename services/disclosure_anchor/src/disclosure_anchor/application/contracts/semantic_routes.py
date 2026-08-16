@@ -10,7 +10,7 @@ from typing import Literal, cast, get_args
 
 SEMANTIC_ROUTE_RECEIPT_VERSION = "semantic_route_receipt.v1"
 SEMANTIC_ROUTE_RECEIPTS_FILENAME = "semantic_route_receipts.v1.jsonl"
-SEMANTIC_ROUTER_VERSION = "semantic_router.v54"
+SEMANTIC_ROUTER_VERSION = "semantic_router.v73"
 SEMANTIC_PROMPT_VERSION = "semantic_route_adjudication.v31"
 SEMANTIC_FALLBACK_KEY = "document_content"
 MAX_SEMANTIC_ROUTES = 8
@@ -44,10 +44,11 @@ SemanticRouteEvidenceKind = Literal[
     "source_heading_candidate",
     "source_heading_similarity",
     "source_heading_risk_suffix",
+    "source_heading_risk_topic",
     "source_body_candidate",
     "source_table_candidate",
     "source_labeled_field_exact",
-    "source_quantitative_exact",
+    "source_quantitative_topic",
     "source_resolved_proposal_exact",
     "document_context_candidate",
     "model_adjudicated",
@@ -71,7 +72,8 @@ class SemanticRouteDefinition:
     overview_container: bool = False
     context_container: bool = False
     section_container: bool = False
-    quantitative_fact: bool = False
+    quantitative_topic: bool = False
+    role_anchor: bool = False
 
     def __post_init__(self) -> None:
         if not _KEY_RE.fullmatch(self.key):
@@ -106,9 +108,42 @@ class SemanticRouteDefinition:
             raise SemanticRouteContractError(
                 f"semantic route {self.key} has an invalid section-container policy"
             )
-        if not isinstance(self.quantitative_fact, bool):
+        if self.role_anchor and (
+            self.context_container
+            or self.exclusive_container
+            or self.overview_container
+            or self.section_container
+        ):
             raise SemanticRouteContractError(
-                f"semantic route {self.key} quantitative-fact policy must be boolean"
+                f"semantic route {self.key} has an invalid role-anchor policy"
+            )
+        if not isinstance(self.quantitative_topic, bool):
+            raise SemanticRouteContractError(
+                f"semantic route {self.key} quantitative-topic policy must be boolean"
+            )
+        if not isinstance(self.role_anchor, bool):
+            raise SemanticRouteContractError(
+                f"semantic route {self.key} role-anchor policy must be boolean"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticCompositeSection:
+    """One exact source heading that intentionally denotes several sections."""
+
+    label: str
+    keys: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.label.strip() or len(self.keys) < 2:
+            raise SemanticRouteContractError(
+                "semantic composite section needs one label and several keys"
+            )
+        if len(self.keys) != len(set(self.keys)) or any(
+            not _KEY_RE.fullmatch(key) for key in self.keys
+        ):
+            raise SemanticRouteContractError(
+                "semantic composite section keys are invalid"
             )
 
 
@@ -118,6 +153,7 @@ class SemanticRouteTaxonomy:
 
     version: str
     definitions: tuple[SemanticRouteDefinition, ...]
+    composite_sections: tuple[SemanticCompositeSection, ...] = ()
     fallback_key: str = SEMANTIC_FALLBACK_KEY
 
     def __post_init__(self) -> None:
@@ -144,6 +180,23 @@ class SemanticRouteTaxonomy:
                 }:
                     raise SemanticRouteContractError(
                         "semantic context labels collide within one scope"
+                    )
+        definitions_by_key = self.by_key()
+        composite_labels: set[str] = set()
+        for composite in self.composite_sections:
+            normalized = _normalize_context_label(composite.label)
+            if normalized in composite_labels:
+                raise SemanticRouteContractError(
+                    "semantic composite section repeats a label"
+                )
+            composite_labels.add(normalized)
+            for key in composite.keys:
+                definition = definitions_by_key.get(key)
+                if definition is None or not (
+                    definition.context_container or definition.section_container
+                ):
+                    raise SemanticRouteContractError(
+                        "semantic composite section references a non-section key"
                     )
 
     def by_key(self) -> dict[str, SemanticRouteDefinition]:

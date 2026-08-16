@@ -94,3 +94,18 @@ being resumed, parallel worktrees are involved, or shared runtime state may be m
   facts, or volatile ops snapshots in task records.
 - Legacy `Prompt/Plan/Status/Documentation/Implement/code_review`, `archive/`, and `notes/` are read-only history,
   never current authority. Do not update/recreate them, or delete ignored legacy state without explicit approval.
+
+## 7. External interactive reviews
+
+- Before starting a visible AI review of repository state, freeze the review target and record its exact commit,
+  status, dirty patch, in-scope untracked files, governing contracts, and representative evidence. A public repository
+  URL or connector supplements this packet; it never substitutes for local uncommitted bytes or evidence.
+- Upload the complete SHA-manifested packet and verify every attachment before sending the review prompt. Keep packet
+  versions in one explicit review directory; never overwrite a version after it has been sent. Exclude credentials,
+  private runtime state, and source artifacts that the user did not authorize for disclosure.
+- Do not mutate reviewed bytes, regenerate cited evidence, append prompts, or perform parallel implementation while
+  the reviewer is working. If the target changes, the old answer is stale and a new exact-target review is required.
+  A thinking state, partial response, interruption, timeout, or quota failure is not a verdict.
+- Reproduce material findings locally before editing. Record the final verdict, conversation identity, packet SHAs,
+  verified or rejected findings, resulting fixes, and invalidation condition in HANDOFF. After all follow-up work is
+  closed and the durable receipt exists, remove only the exact completed packet through a recoverable operation.

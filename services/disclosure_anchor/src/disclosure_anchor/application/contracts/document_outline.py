@@ -18,6 +18,7 @@ HeadingDispositionReason = Literal[
     "accepted",
     "table_contained",
     "checkbox_selector",
+    "selector_statement",
     "page_continuation",
     "body_text_conflict",
     "terminal_signature",
@@ -84,6 +85,7 @@ class HeadingCandidate:
 
     heading_id: str
     source_index: int
+    payload_ordinal: int
     page_index: int
     bbox: ProviderBBox | None
     text: str
@@ -98,7 +100,7 @@ class HeadingCandidate:
     def __post_init__(self) -> None:
         if not self.heading_id:
             raise ValueError("heading candidate id must be non-empty")
-        if self.source_index < 0 or self.page_index < 0:
+        if self.source_index < 0 or self.payload_ordinal < 0 or self.page_index < 0:
             raise ValueError("heading candidate indices cannot be negative")
         if not self.text:
             raise ValueError("heading candidate text must be non-empty")
@@ -112,6 +114,7 @@ class HeadingCandidate:
             "accepted",
             "table_contained",
             "checkbox_selector",
+            "selector_statement",
             "page_continuation",
             "body_text_conflict",
             "terminal_signature",
@@ -139,6 +142,7 @@ class ResolvedHeading:
 
     heading_id: str
     source_index: int
+    payload_ordinal: int
     page_index: int
     bbox: ProviderBBox | None
     text: str
@@ -151,7 +155,7 @@ class ResolvedHeading:
     def __post_init__(self) -> None:
         if not self.heading_id or not self.text:
             raise ValueError("resolved heading identity must be complete")
-        if self.source_index < 0 or self.page_index < 0:
+        if self.source_index < 0 or self.payload_ordinal < 0 or self.page_index < 0:
             raise ValueError("resolved heading indices cannot be negative")
         if self.nominal_rank < 1 or self.level < 1:
             raise ValueError("resolved heading levels must be positive")
@@ -232,6 +236,7 @@ class DocumentOutline:
             candidate = accepted_by_id[heading.heading_id]
             if (
                 heading.source_index != candidate.source_index
+                or heading.payload_ordinal != candidate.payload_ordinal
                 or heading.page_index != candidate.page_index
                 or heading.bbox != candidate.bbox
                 or heading.text != candidate.text

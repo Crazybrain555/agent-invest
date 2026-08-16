@@ -27,11 +27,16 @@ from disclosure_anchor.domain.value_objects.semantic_key import (
 
 
 LEGACY_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v1"
-PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v2"
+SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v2"
+PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v3"
 SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS = frozenset(
-    {LEGACY_PROVIDER_UNIT_LOCATOR_VERSION, PROVIDER_UNIT_LOCATOR_VERSION}
+    {
+        LEGACY_PROVIDER_UNIT_LOCATOR_VERSION,
+        SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION,
+        PROVIDER_UNIT_LOCATOR_VERSION,
+    }
 )
-PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v6"
+PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v8"
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -55,10 +60,16 @@ class ProviderUnitHeadingRef:
 
     heading_id: str
     source_index: int
+    payload_ordinal: int
     placement_source: HeadingPlacementSource
 
     def __post_init__(self) -> None:
-        if not self.heading_id or self.source_index < 0 or not self.placement_source:
+        if (
+            not self.heading_id
+            or self.source_index < 0
+            or self.payload_ordinal < 0
+            or not self.placement_source
+        ):
             raise ValueError("provider unit heading reference is invalid")
 
 
@@ -336,6 +347,11 @@ def provider_unit_locator_to_payload(
                 "heading_id": heading.heading_id,
                 "placement_source": heading.placement_source,
                 "source_index": heading.source_index,
+                **(
+                    {"payload_ordinal": heading.payload_ordinal}
+                    if locator.contract_version == PROVIDER_UNIT_LOCATOR_VERSION
+                    else {}
+                ),
             }
             for heading in locator.heading_chain
         ],
@@ -391,7 +407,10 @@ def provider_unit_locator_to_payload(
             for binding in locator.search_targets
         ],
     }
-    if locator.contract_version == PROVIDER_UNIT_LOCATOR_VERSION:
+    if locator.contract_version in {
+        SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION,
+        PROVIDER_UNIT_LOCATOR_VERSION,
+    }:
         payload["source_text_reconciliations"] = [
             {
                 "payload_ordinal": item.payload_ordinal,
@@ -423,7 +442,10 @@ def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
         "evidence_artifacts",
         "search_targets",
     }
-    if version == PROVIDER_UNIT_LOCATOR_VERSION:
+    if version in {
+        SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION,
+        PROVIDER_UNIT_LOCATOR_VERSION,
+    }:
         base_fields.add("source_text_reconciliations")
     elif version != LEGACY_PROVIDER_UNIT_LOCATOR_VERSION:
         raise ValueError("provider unit locator version is unsupported")
@@ -433,7 +455,7 @@ def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
         label="provider Unit locator",
     )
     headings = tuple(
-        _heading_from_payload(item)
+        _heading_from_payload(item, version=version)
         for item in _array(root["heading_chain"], label="heading chain")
     )
     parts = tuple(
@@ -463,7 +485,11 @@ def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
                 label="source text reconciliations",
             )
         )
-        if version == PROVIDER_UNIT_LOCATOR_VERSION
+        if version
+        in {
+            SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION,
+            PROVIDER_UNIT_LOCATOR_VERSION,
+        }
         else ()
     )
     return ProviderUnitLocator(
@@ -486,15 +512,27 @@ def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
     )
 
 
-def _heading_from_payload(payload: object) -> ProviderUnitHeadingRef:
+def _heading_from_payload(
+    payload: object,
+    *,
+    version: object,
+) -> ProviderUnitHeadingRef:
+    fields = {"heading_id", "placement_source", "source_index"}
+    if version == PROVIDER_UNIT_LOCATOR_VERSION:
+        fields.add("payload_ordinal")
     item = _closed_mapping(
         payload,
-        fields={"heading_id", "placement_source", "source_index"},
+        fields=fields,
         label="provider Unit heading",
     )
     return ProviderUnitHeadingRef(
         heading_id=_text(item["heading_id"], label="heading id"),
         source_index=_integer(item["source_index"], label="heading source index"),
+        payload_ordinal=(
+            _integer(item["payload_ordinal"], label="heading payload ordinal")
+            if version == PROVIDER_UNIT_LOCATOR_VERSION
+            else 0
+        ),
         placement_source=cast(
             HeadingPlacementSource,
             _text(item["placement_source"], label="heading placement source"),
@@ -709,6 +747,7 @@ def _optional_text(value: object, *, label: str) -> str | None:
 __all__ = [
     "LEGACY_PROVIDER_UNIT_LOCATOR_VERSION",
     "PROVIDER_UNIT_LOCATOR_VERSION",
+    "SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION",
     "PROVIDER_UNIT_BUILDER_VERSION",
     "SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS",
     "ProviderSearchDestination",

@@ -3,7 +3,7 @@
 本目录记录当前实现的设计、检查、操作和仍有价值的工程历史。Agent 运行规则只由
 仓库根工作流、服务合同和最近的源目录合同维护；`003-agent-execution-rules.md` 是短期兼容
 指针，不是第三套工作流。已由
-`provider_document.v1` / `provider_unit.v6` 取代的 NormalizedIR writer、旧证明图、
+`provider_document.v1` / `provider_unit.v8` 取代的 NormalizedIR writer、旧证明图、
 旧 unit-builder、phase00 fixture 与 corpus reset/reparse 工具不再保留在工作树；需要
 考古时直接查看 Git 历史。
 

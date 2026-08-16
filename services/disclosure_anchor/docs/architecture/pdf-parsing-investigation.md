@@ -21,7 +21,7 @@
 > 成为删除或边界规则。
 >
 > **2026-08-12 cutover**：当前唯一 writer 是 MinerU 3.4.4 Hybrid-medium →
-> `provider_document.v1` → `provider_unit_locator.v2`（历史 v1 只读）。后文 NormalizedIR、双 parser、规则修复和
+> `provider_document.v1` → `provider_unit_locator.v3`（历史 v1/v2 只读）。后文 NormalizedIR、双 parser、规则修复和
 >旧版本号只属于调研历史；不得据此恢复生产路径。
 >
 > **2026-08-14 数字保真边界**：不恢复默认双 parser。MinerU 仍唯一拥有 block/order/bbox/table；

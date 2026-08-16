@@ -32,6 +32,33 @@ event_key_map 不得作为当前审查对象，现状勘误见 retrieval 设计�
 - 语料状态：`make track-status`；确认单一规则代
   （`SELECT DISTINCT builder_rules_version FROM ... WHERE is_active`）。
 
+## 0.2 可见 Pro/Fable 外部审查交付
+
+当 ChatGPT/Claude 的仓库连接器不可用、读不到私有历史，或需要把本地未跟踪的质量证据
+一起交给 reviewer 时，不要只粘贴零散代码。建立可复现的 review packet，并把交付事实写入
+`docs/agent/HANDOFF.md`：
+
+1. 在 `/Users/zhang/Downloads/buddle_code/<review-id>/` 集中准备完整 tracked source snapshot、
+   verified Git bundle、当前 staged/unstaged binary patch、全部 in-scope untracked 文件、审查提示、
+   SHA manifest，以及 current/held-out 行级报告和 reset/replay receipt。准备阶段可在该目录更新；
+   一旦上传即冻结该版本，后续字节变化另建 versioned review-id，禁止覆盖已发 packet。禁止放入
+   `.env`、凭据、数据库 URL、HANDOFF/RUNTIME 私有状态、raw PDF 或 AgentSSD artifact tree。
+2. 附件过大时拆为 `source.zip`、`review-evidence.zip`、`review-history.zip`。通过用户指定的
+   Codex App `@Browser` 自有 file/binary upload 接口上传，不切换 Chrome、Computer Use 或 Mac
+   原生 file picker。ChatGPT 可能把附件改成 UUID 文件名，必须在 prompt 中列出“网页文件名 →
+   本地逻辑名 → SHA-256”的映射；附件未全部可见前不得发送审查 prompt。
+3. prompt 同时给出公开仓库 URL 与 exact commit，要求 reviewer 先读附件，缺文件时只按该
+   commit 从 Web 补读。公开 URL 是缺口补读，不替代附件内的未跟踪证据或精确 commit 绑定。
+4. HANDOFF 记录 exact commit、每个附件 SHA、conversation/session URL、最终 verdict、经本地
+   exact bytes 验证的 findings 与采取的修复。acknowledgement、`thinking`、中断、额度耗尽或
+   旧 artifact 的结论都不是 verdict；不得据此重复上传、重复清库或重复外部动作。
+5. reviewer 只读；其 finding 是待验证 claim，不是自动改代码的授权。P0/P1 先在当前 tree、
+   public view 和代表性行上复现，再做最小通用修复；P2 必须说明是否值得当前阶段处理。
+6. reviewer 思考期间不得修改被审字节、重生引用证据、追加 prompt 或并行实施。若 target 已变化，
+   原回答只可记为 stale evidence，必须用新 packet 重审。`thinking`、半截回答、超时、中断或额度
+   错误都不是 verdict。完整答复、本地验证和必要复审全部关闭且 HANDOFF 已记 SHA/结论后，才将
+   该 exact review-id packet 移入废纸篓；不得递归删除共享 `buddle_code` 根或其他 active packet。
+
 ## 1. 表字段 review（逐表逐列，问四个问题）
 
 对 `disclosure_core` 每张表的每一列问：①语义是否唯一清楚（与 service-purpose §5-§7
@@ -124,6 +151,10 @@ S5 续表合并只看列数（cn_a_v6 后同构附注表跨科目误并，3. 销
   export_contracts 重导）；已应用迁移不改。
 - **tests**：新行为必有回归测试；集成测试 tearDown 自清理；对真库敏感的测试
   （LIMIT/日期排序）必须对积压免疫。
+- **L2/L3 检索评测**：graded judgment 必须覆盖 full/ablation 的全部实际评测池，未判定结果
+  不能默认 grade 0；每个 judgment 同时绑定 `query_projection_hash` 与 answer-bearing
+  `content_hash`，source replay 与 live public search 两边都须逐 Unit 相等。仅按
+  `(provider_document_id, unit_index)` 或只绑 query hash 的旧 receipt 不能证明数据质量。
 
 ## 4. 已知接受项（不要重复开 finding）
 

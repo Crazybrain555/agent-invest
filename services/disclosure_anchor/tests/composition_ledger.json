@@ -46,7 +46,7 @@
   },
   "tests/integration/test_public_views_content.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 12
   },
   "tests/integration/test_register_local_pdf.py": {
    "private_imports": [],
@@ -58,7 +58,7 @@
   },
   "tests/integration/test_schema_and_views.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 11
   },
   "tests/integration/test_search_projection.py": {
    "private_imports": [],
@@ -134,7 +134,7 @@
   },
   "tests/unit/test_document_outline.py": {
    "private_imports": [],
-   "tests": 42
+   "tests": 46
   },
   "tests/unit/test_download_document.py": {
    "private_imports": [],
@@ -190,7 +190,7 @@
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
-   "tests": 12
+   "tests": 13
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],
@@ -236,7 +236,7 @@
   },
   "tests/unit/test_provider_unit_builder.py": {
    "private_imports": [],
-   "tests": 24
+   "tests": 27
   },
   "tests/unit/test_provider_unit_evidence.py": {
    "private_imports": [],
@@ -268,6 +268,14 @@
    "private_imports": [],
    "tests": 5
   },
+  "tests/unit/test_review_semantic_retrieval_query_eval.py": {
+   "private_imports": [],
+   "tests": 9
+  },
+  "tests/unit/test_review_semantic_route_eval.py": {
+   "private_imports": [],
+   "tests": 2
+  },
   "tests/unit/test_search_projection.py": {
    "private_imports": [],
    "tests": 13
@@ -282,7 +290,7 @@
   },
   "tests/unit/test_semantic_router.py": {
    "private_imports": [],
-   "tests": 88
+   "tests": 104
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],

@@ -77,7 +77,7 @@ PostgreSQL 18.4 实测存在四种静默或硬上限：同一 lexeme 第 256 个
 metadata 自身不安全、窗口 gap/overlap 或 DB probe 不完整均 fail loud，禁止丢词。
 
 0030 增加 `disclosure_core.unit_search_atom(asset_id, atom_index, atom_text)`：每个非空行只对应
-`provider_unit_locator.v2.search_targets` 选中的一个字符串叶子；历史 v1 使用同一闭合 decoder。
+`provider_unit_locator.v3.search_targets` 选中的一个字符串叶子；历史 v1/v2 使用同一闭合 decoder。
 两者都绝不递归发现字段，也绝不连接
 相邻 target/part；`atom_text` 固定为 NFKC→casefold 后的原文。主键为 `(asset_id, atom_index)`，
 父投影删除时级联；`atom_text` 建 `gin_trgm_ops` GIN，公开只读面为
@@ -87,7 +87,7 @@ document_unit/source_ref。
 ## 4. 投影内容（确定性线性化）
 
 - title_text = unit.title or ''；heading_path_text = " > ".join(heading_path)。
-- body 的唯一输入是当前 writer 的 `provider_unit_locator.v2.search_targets`（历史 v1 同义）；每个 target 必须绑定 provider
+- body 的唯一输入是当前 writer 的 `provider_unit_locator.v3.search_targets`（历史 v1/v2 同义）；每个 target 必须绑定 provider
   source block、字段/item 与 Unit payload destination。word channel 仅为兼容现有 tsvector 而连接这些
   原子；0030 substring channel 保留逐叶 atom，禁止跨 target/part 拼接。`raw_html`、context、
   文件路径、taxonomy 标签和未声明 payload 字段一律不能被递归发现。

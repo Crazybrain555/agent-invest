@@ -12,8 +12,8 @@ delivers_to: milestone 07 / L2 / MCP 包装
 # Milestone 06: Filing API 与 public 契约
 
 > 2026-08-14：本文件保留里程碑完成时的历史契约。0034/0036 恢复 Unit 的
-> `semantic_keys`、`semantic_keys_any/all` 与 `section_keys`；0037 又从 Unit 读面删除
-> 继承的 `content_categories`，使全部 provider facets 保持 Document-only。当前列集以
+> `semantic_keys`、`semantic_keys_any/all` 与 `section_keys`；0037 从 Unit 读面删除
+> 继承的 `content_categories`，0038 随后以 v1 兼容 + v2 当前读面修复版本边界。当前列集以
 > contract-checklist 为准。
 
 把 `disclosure_public.*_v1` 的读契约以 HTTP API 形式暴露（协议 §3.11 的 L1 对外契约六条），
@@ -22,7 +22,8 @@ delivers_to: milestone 07 / L2 / MCP 包装
 
 ## 1. 前置依赖
 
-- 05 完成（active run、unit 数据、事件流）；里程碑完成时 `document_units_v1` 为 41 列（0037 当前为 39 列；
+- 05 完成（active run、unit 数据、事件流）；里程碑完成时 `document_units_v1` 为 41 列（0038 当前
+  v1 兼容面为 40 列、v2 当前面为 40 列（用 body_status 取代弃用 facet）；
   完整列集以 contract-checklist §2 为准；32 列仅是 0007/0008 的历史基线），包含 active run、
   applicability/page_no、semantic_keys、heading_path_text 与三维分类投影；
   processing_runs_v1：builder_rules_version（0008，是 run 列不是 unit 列）；
@@ -246,8 +247,9 @@ provider_document_id=文件名去后缀）。
   `{asset_uri}`；`document_unit.v1.json` 的 properties 同时收录 asset_uri（派生）与
   is_active_run（视图列）；三方一致断言按 `DERIVED = {"asset_uri"}` 执行
   （tests/integration/test_filing_api_views_contract.py 与 contract-checklist §2 已同步）。
-- §1 的 32/36 列与 0014–0016 的 41 列均为历史迁移口径；0037 后当前
-  `document_units_v1` 为 **39 列**，`is_active_run` 是真实视图列，列全集以
+- §1 的 32/36 列与 0014–0016 的 41 列均为历史迁移口径；0038 后
+  `document_units_v1` 为 **40 列 deprecated compatibility**，`document_units_v2` 为
+  **40 列当前 DB 读面**；`is_active_run` 是真实视图列，列全集以
   contract-checklist §2 为准。
 - **2026-07-27 evidence bytes 契约补充**：unit locator 绑定的视觉 evidence 通过
   `GET /v1/units/{asset_id}/evidence/{sha256}` 以内容 digest 读取；请求不得携带 role/path，

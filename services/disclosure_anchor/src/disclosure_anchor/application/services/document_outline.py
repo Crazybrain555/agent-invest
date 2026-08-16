@@ -46,6 +46,7 @@ _LOWER_ROMAN_ORDINAL_RE = re.compile(r"^[ivxlcdm]+[.)](?:\s|$)")
 _LETTER_ORDINAL_RE = re.compile(r"^[A-Za-z][.)、]")
 _BOX_MARKERS = ("□", "☐", "☑", "\uf052")
 _CHECKBOX_MARKERS = (*_BOX_MARKERS, "√")
+_BARE_APPLICABILITY_STATEMENTS = frozenset({"适用", "不适用"})
 _TABLE_CONTAINMENT_TOLERANCE = 1.0
 _HINT_PRIORITY = {"bookmark": 0, "printed_toc": 1, "pdf_style": 2}
 _DATE_LINE_RE = re.compile(
@@ -200,8 +201,44 @@ def _heading_candidate(
     repeated_page_headers: frozenset[int],
     sequence_admitted: bool,
 ) -> HeadingCandidate | None:
-    if block.provider_type.casefold() != "text":
+    caption_heading = _numbered_table_caption(block)
+    if block.provider_type.casefold() != "text" and caption_heading is None:
         return None
+    if caption_heading is not None:
+        payload_ordinal, text = caption_heading
+        numbering_family, numbering_rank = _numbering(text)
+        assert numbering_family is not None and numbering_rank is not None
+        if externally_negative:
+            return HeadingCandidate(
+                heading_id=f"heading:{block.source_index:08d}:{payload_ordinal:04d}",
+                source_index=block.source_index,
+                payload_ordinal=payload_ordinal,
+                page_index=block.page_index,
+                bbox=block.bbox,
+                text=text,
+                raw_block_sha256=block.raw_item_sha256,
+                provider_level=None,
+                numbering_family=numbering_family,
+                nominal_rank=None,
+                disposition="demoted",
+                disposition_reason="page_continuation",
+                placement_source=None,
+            )
+        return HeadingCandidate(
+            heading_id=f"heading:{block.source_index:08d}:{payload_ordinal:04d}",
+            source_index=block.source_index,
+            payload_ordinal=payload_ordinal,
+            page_index=block.page_index,
+            bbox=block.bbox,
+            text=text,
+            raw_block_sha256=block.raw_item_sha256,
+            provider_level=None,
+            numbering_family=numbering_family,
+            nominal_rank=numbering_rank,
+            disposition="accepted",
+            disposition_reason="accepted",
+            placement_source="numbering",
+        )
     annotation = (block.typed_annotation or "").casefold()
     provider_title = annotation == "title"
     provider_level_fallback = (
@@ -217,7 +254,7 @@ def _heading_candidate(
         and not sequence_admitted
     ):
         return None
-    text = _block_text(block)
+    payload_ordinal, text = _block_heading_payload(block)
     if not text.strip():
         return None
     heading_id = f"heading:{block.source_index:08d}"
@@ -248,6 +285,7 @@ def _heading_candidate(
         return HeadingCandidate(
             heading_id=heading_id,
             source_index=block.source_index,
+            payload_ordinal=payload_ordinal,
             page_index=block.page_index,
             bbox=block.bbox,
             text=text,
@@ -267,6 +305,7 @@ def _heading_candidate(
     return HeadingCandidate(
         heading_id=heading_id,
         source_index=block.source_index,
+        payload_ordinal=payload_ordinal,
         page_index=block.page_index,
         bbox=block.bbox,
         text=text,
@@ -280,11 +319,50 @@ def _heading_candidate(
     )
 
 
-def _block_text(block: ProviderBlock) -> str:
-    for payload in block.payloads:
+def _block_heading_payload(block: ProviderBlock) -> tuple[int, str]:
+    for payload_ordinal, payload in enumerate(block.payloads):
         if payload.field in {"text", "content"} and payload.text:
-            return payload.text
-    return ""
+            return payload_ordinal, payload.text
+    return 0, ""
+
+
+def _block_text(block: ProviderBlock) -> str:
+    return _block_heading_payload(block)[1]
+
+
+def _numbered_table_caption(block: ProviderBlock) -> tuple[int, str] | None:
+    """Expose one strong, provider-typed caption occurrence as a heading.
+
+    MinerU 3.4.4 occasionally embeds a source section heading in the table's
+    dedicated ``table_caption`` field rather than emitting a separate text
+    block.  This is not inferred from HTML or cell text: the exact payload
+    ordinal remains the source occurrence and only strong root-style numbering
+    may open a section.  Ordinary captions, ``表4`` labels, parenthesized table
+    notes, and incidental numbering stay table payload.
+    """
+
+    if block.provider_type.casefold() != "table":
+        return None
+    captions = tuple(
+        (payload_ordinal, payload.text)
+        for payload_ordinal, payload in enumerate(block.payloads)
+        if payload.field == "table_caption" and payload.text.strip()
+    )
+    if len(captions) != 1:
+        return None
+    payload_ordinal, text = captions[0]
+    family, _rank = _numbering(text)
+    if family not in {
+        "第X编",
+        "第X篇",
+        "第X部",
+        "第X章",
+        "第X节",
+        "中文序号",
+        "阿拉伯序号",
+    }:
+        return None
+    return payload_ordinal, text
 
 
 def _demotion_reason(
@@ -308,6 +386,8 @@ def _demotion_reason(
     if repeated_page_header:
         return "repeated_page_header"
     if weak_provider_only:
+        if _normalized_text(text) in _BARE_APPLICABILITY_STATEMENTS:
+            return "selector_statement"
         if not any(character.isalnum() for character in html_visible_text(text)):
             return "non_semantic_glyph"
         normalized = _normalized_text(text)
@@ -979,6 +1059,7 @@ def _resolve_headings(
         heading = ResolvedHeading(
             heading_id=candidate.heading_id,
             source_index=candidate.source_index,
+            payload_ordinal=candidate.payload_ordinal,
             page_index=candidate.page_index,
             bbox=candidate.bbox,
             text=candidate.text,

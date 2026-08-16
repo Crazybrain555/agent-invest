@@ -33,6 +33,7 @@ ALEMBIC_VERSION_TABLE_SCHEMA = OPS_SCHEMA
 PUBLIC_VIEWS = (
     "documents_v1",
     "document_units_v1",
+    "document_units_v2",
     "document_categories_v1",
     "processing_runs_v1",
     "source_refs_v1",

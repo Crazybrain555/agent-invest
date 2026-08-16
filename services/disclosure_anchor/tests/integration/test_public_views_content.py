@@ -291,10 +291,7 @@ class PublicViewContentTests(unittest.TestCase):
             unit_row = (
                 conn.execute(
                     text(
-                        "SELECT payload_kind, contract_version, company_ref, "
-                        "security_ref, security_code, filing_type, report_period, "
-                        "source_ref, producer_action_ref, parent_ref, semantic_key, payload, "
-                        "asset_kind, source_tier, trace_level, raw_file_hash, query_projection_hash "
+                        "SELECT * "
                         "FROM disclosure_public.document_units_v1 "
                         "WHERE asset_id = :v"
                     ),
@@ -322,6 +319,25 @@ class PublicViewContentTests(unittest.TestCase):
             self.assertEqual(unit_row["trace_level"], "G0")
             self.assertEqual(unit_row["raw_file_hash"], self.hash_a)
             self.assertEqual(unit_row["query_projection_hash"], "sha256:query")
+
+            v2_row = (
+                conn.execute(
+                    text(
+                        "SELECT * FROM disclosure_public.document_units_v2 "
+                        "WHERE asset_id = :v"
+                    ),
+                    {"v": self.unit_id},
+                )
+                .mappings()
+                .one()
+            )
+            self.assertEqual(v2_row["contract_version"], "document_unit.v2")
+            self.assertEqual(v2_row["body_status"], "content")
+            self.assertNotIn("content_categories", v2_row)
+            for key, value in v2_row.items():
+                if key in {"body_status", "contract_version"}:
+                    continue
+                self.assertEqual(value, unit_row[key], key)
 
             ref_row = (
                 conn.execute(
@@ -400,8 +416,50 @@ class PublicViewContentTests(unittest.TestCase):
                 change_by_id[self.observed_event_id]["change_kind"], "observed"
             )
 
+    def test_document_units_v2_body_status_is_unit_owned(self) -> None:
+        self._seed()
+        heading_id = ids.new_asset_id()
+        empty_id = ids.new_asset_id()
+        self.extra_unit_ids.extend((heading_id, empty_id))
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.document_unit "
+                    "(asset_id, document_id, processing_run_id, payload_kind, "
+                    "heading_path, title, order_index, payload, content_hash) "
+                    "VALUES "
+                    "(:heading_id, :document_id, :run_id, 'text', "
+                    "jsonb_build_array('一、标题'), '一、标题', 1, "
+                    "'{\"text\": \"\"}'::jsonb, 'sha256:heading'), "
+                    "(:empty_id, :document_id, :run_id, 'text', "
+                    "'[]'::jsonb, NULL, 2, "
+                    "'{\"text\": \"\"}'::jsonb, 'sha256:empty')"
+                ),
+                {
+                    "document_id": self.document_id,
+                    "empty_id": empty_id,
+                    "heading_id": heading_id,
+                    "run_id": self.run_id,
+                },
+            )
+        with self.engine.connect() as conn:
+            statuses = dict(
+                conn.execute(
+                    text(
+                        "SELECT asset_id, body_status "
+                        "FROM disclosure_public.document_units_v2 "
+                        "WHERE asset_id = ANY(:ids)"
+                    ),
+                    {"ids": [self.unit_id, heading_id, empty_id]},
+                ).all()
+            )
+
+        self.assertEqual(statuses[self.unit_id], "content")
+        self.assertEqual(statuses[heading_id], "heading_only")
+        self.assertEqual(statuses[empty_id], "empty")
+
     def test_document_units_view_column_contract(self) -> None:
-        expected = {
+        common_expected = (
             "asset_id",
             "document_id",
             "processing_run_id",
@@ -441,21 +499,35 @@ class PublicViewContentTests(unittest.TestCase):
             "trace_level",
             "raw_file_hash",
             "query_projection_hash",
-        }
+        )
         with self.engine.connect() as conn:
-            columns = {
+            v1_columns = tuple(
                 row.column_name
                 for row in conn.execute(
                     text(
                         "SELECT column_name FROM information_schema.columns "
                         "WHERE table_schema = 'disclosure_public' "
-                        "AND table_name = 'document_units_v1'"
+                        "AND table_name = 'document_units_v1' "
+                        "ORDER BY ordinal_position"
                     )
                 )
-            }
+            )
+            v2_columns = tuple(
+                row.column_name
+                for row in conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = 'disclosure_public' "
+                        "AND table_name = 'document_units_v2' "
+                        "ORDER BY ordinal_position"
+                    )
+                )
+            )
 
-        self.assertEqual(columns, expected)
-        self.assertEqual(len(columns), 39)
+        self.assertEqual(v2_columns, common_expected + ("body_status",))
+        self.assertEqual(v1_columns, common_expected + ("content_categories",))
+        self.assertEqual(len(v2_columns), 40)
+        self.assertEqual(len(v1_columns), 40)
 
     def test_view_derives_classification_and_facets_from_raw_category(self) -> None:
         # 0016: one class map, two outputs — filing_type = argmax priority,

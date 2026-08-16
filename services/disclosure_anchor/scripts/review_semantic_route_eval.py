@@ -21,6 +21,7 @@ _GOLD_KEYS = {
     "expected_section_keys",
     "required_section_keys",
     "forbidden_section_keys",
+    "expected_heading_path",
     "rationale",
 }
 
@@ -39,6 +40,14 @@ def _string_list(value: object, *, field: str) -> list[str]:
         raise ValueError(f"{field} must be a list of non-empty strings")
     if len(value) != len(set(value)):
         raise ValueError(f"{field} repeats a key")
+    return value
+
+
+def _ordered_string_list(value: object, *, field: str) -> list[str]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        raise ValueError(f"{field} must be a list of non-empty strings")
     return value
 
 
@@ -95,6 +104,7 @@ def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any
 
     findings: list[dict[str, object]] = []
     passed = 0
+    gold_identities: set[tuple[str, int]] = set()
     for raw_case in cases:
         if not isinstance(raw_case, dict) or not set(raw_case).issubset(_GOLD_KEYS):
             raise ValueError("semantic gold case has unknown fields")
@@ -107,6 +117,10 @@ def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any
             or not isinstance(title, str)
         ):
             raise ValueError("semantic gold identity is invalid")
+        identity = (provider_document_id, unit_index)
+        if identity in gold_identities:
+            raise ValueError(f"semantic gold repeats case {identity}")
+        gold_identities.add(identity)
         expected = (
             _string_list(raw_case["expected_keys"], field="expected_keys")
             if "expected_keys" in raw_case
@@ -126,6 +140,14 @@ def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any
             if "expected_section_keys" in raw_case
             else None
         )
+        expected_heading_path = (
+            _ordered_string_list(
+                raw_case["expected_heading_path"],
+                field="expected_heading_path",
+            )
+            if "expected_heading_path" in raw_case
+            else None
+        )
         required_sections = _string_list(
             raw_case.get("required_section_keys", []),
             field="required_section_keys",
@@ -134,14 +156,20 @@ def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any
             raw_case.get("forbidden_section_keys", []),
             field="forbidden_section_keys",
         )
-        if expected is None and expected_sections is None and not (
-            required or forbidden or required_sections or forbidden_sections
+        if (
+            expected is None
+            and expected_sections is None
+            and expected_heading_path is None
+            and not (
+                required or forbidden or required_sections or forbidden_sections
+            )
         ):
             raise ValueError("semantic gold case has no acceptance assertion")
-        row = row_by_identity.get((provider_document_id, unit_index))
+        row = row_by_identity.get(identity)
         reasons: list[str] = []
         actual: list[str] = []
         actual_sections: list[str] = []
+        actual_heading_path: list[str] = []
         if row is None:
             reasons.append("row_missing")
         else:
@@ -150,6 +178,9 @@ def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any
             actual = _string_list(row.get("semantic_keys"), field="semantic_keys")
             actual_sections = _string_list(
                 row.get("section_keys", []), field="section_keys"
+            )
+            actual_heading_path = _ordered_string_list(
+                row.get("heading_path", []), field="heading_path"
             )
             actual_set = set(actual)
             actual_section_set = set(actual_sections)
@@ -168,10 +199,16 @@ def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any
                 reasons.append("required_section_missing")
             if set(forbidden_sections) & actual_section_set:
                 reasons.append("forbidden_section_selected")
+            if (
+                expected_heading_path is not None
+                and actual_heading_path != expected_heading_path
+            ):
+                reasons.append("heading_path_differs")
         if reasons:
             findings.append(
                 {
                     "actual_keys": actual,
+                    "actual_heading_path": actual_heading_path,
                     "actual_section_keys": actual_sections,
                     "provider_document_id": provider_document_id,
                     "reasons": reasons,

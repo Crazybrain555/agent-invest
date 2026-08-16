@@ -110,6 +110,7 @@ def _unit_row(
         "trace_level": "G0",
         "raw_file_hash": "sha256:" + "a" * 64,
         "query_projection_hash": "sha256:" + "d" * 64,
+        "content_categories": None,
         "asset_uri": f"asset://disclosure_anchor/v1/document_unit/{asset_id}",
         "is_active_run": is_active_run,
     }

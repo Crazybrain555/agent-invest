@@ -150,6 +150,112 @@ class DocumentOutlineTest(unittest.TestCase):
         self.assertEqual(outline.units[0].block_source_indices, (0, 1, 2))
         self.assertEqual(outline.units[1].block_source_indices, (3, 4))
 
+    def test_bare_applicability_statement_is_body_not_a_heading(self) -> None:
+        document = _document(
+            _block(0, "20、 投资性房地产", annotation="title", level=2),
+            _block(1, "不适用", annotation="title", level=3),
+            _block(2, "21、 固定资产", annotation="title", level=2),
+            _block(3, "适用范围", annotation="title", level=3),
+            _block(4, "一、适用", annotation="title", level=3),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(
+            [item.disposition_reason for item in outline.candidates],
+            [
+                "accepted",
+                "selector_statement",
+                "accepted",
+                "accepted",
+                "accepted",
+            ],
+        )
+        self.assertEqual(
+            [(item.title, item.block_source_indices) for item in outline.units],
+            [
+                ("20、 投资性房地产", (0, 1)),
+                ("21、 固定资产", (2,)),
+                ("适用范围", (3,)),
+                ("一、适用", (4,)),
+            ],
+        )
+
+    def test_strong_numbered_table_caption_is_a_source_bound_heading(self) -> None:
+        document = _document(
+            _block(0, "第四节 公司治理、环境和社会", annotation="title", level=1),
+            _table_block(
+                1,
+                caption=(
+                    "四、纳入环境信息依法披露企业名单的上市公司及其主要"
+                    "子公司的环境信息情况√适用 □不适用"
+                ),
+            ),
+            _block(
+                2,
+                "(一) 在报告期内为减少污染物排放所采取的措施",
+                annotation="title",
+                level=2,
+            ),
+            segments=(
+                ProviderPhysicalTableSegment(
+                    page_index=0,
+                    order_in_page=0,
+                    provider_index=0,
+                    bbox=ProviderBBox(100, 150, 900, 190),
+                    page_local_html="<table><td>企业数量</td><td>9</td></table>",
+                    crop_artifact_role=None,
+                    logical_stream_status="retained",
+                    raw_segment_json="{}",
+                    raw_segment_sha256=_SHA,
+                ),
+            ),
+        )
+
+        outline = build_document_outline(document)
+
+        caption = outline.headings[1]
+        child = outline.headings[2]
+        self.assertEqual(caption.source_index, 1)
+        self.assertEqual(caption.payload_ordinal, 1)
+        self.assertEqual(caption.placement_source, "numbering")
+        self.assertEqual(caption.parent_heading_id, outline.headings[0].heading_id)
+        self.assertEqual(child.parent_heading_id, caption.heading_id)
+        self.assertEqual(outline.units[1].block_source_indices, (1,))
+
+    def test_bound_page_continuation_demotes_numbered_table_caption(self) -> None:
+        document = _document(
+            _table_block(0, caption="四、环境信息（续）"),
+            _block(1, "本页继续列示上一页环境数据。", annotation="paragraph"),
+        )
+
+        outline = build_document_outline(
+            document,
+            negative_hints=(_negative_hint(document, 0, "page_continuation"),),
+        )
+
+        self.assertEqual(len(outline.candidates), 1)
+        self.assertEqual(outline.candidates[0].disposition, "demoted")
+        self.assertEqual(
+            outline.candidates[0].disposition_reason,
+            "page_continuation",
+        )
+        self.assertFalse(outline.headings)
+        self.assertEqual(outline.units[0].block_source_indices, (0, 1))
+
+    def test_ordinary_or_incidental_table_captions_do_not_open_sections(self) -> None:
+        document = _document(
+            _table_block(0, caption="表4 环境信息"),
+            _table_block(1, caption="本表说明四、环境风险"),
+            _table_block(2, caption="√适用 □不适用"),
+            _table_block(3, caption="(一) 普通表内分组"),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertFalse(outline.candidates)
+        self.assertEqual(outline.units[0].block_source_indices, (0, 1, 2, 3))
+
     def test_no_heading_has_one_preamble_and_empty_stub_is_not_dropped(self) -> None:
         document = _document(
             _block(0, "正文", annotation="paragraph"),
@@ -1285,6 +1391,30 @@ def _block(
         bbox=bbox
         or ProviderBBox(100, 100 + source_index * 50, 900, 140 + source_index * 50),
         payloads=() if not text else (ProviderPayload("text", None, text),),
+        referenced_artifact_roles=(),
+        raw_item_json="{}",
+        raw_item_sha256=_SHA,
+    )
+
+
+def _table_block(source_index: int, *, caption: str) -> ProviderBlock:
+    return ProviderBlock(
+        source_index=source_index,
+        page_index=0,
+        order_in_page=source_index,
+        provider_type="table",
+        typed_annotation="table",
+        provider_level=None,
+        bbox=ProviderBBox(
+            100,
+            100 + source_index * 50,
+            900,
+            140 + source_index * 50,
+        ),
+        payloads=(
+            ProviderPayload("table_body", None, "<table><td>正文</td></table>"),
+            ProviderPayload("table_caption", 0, caption),
+        ),
         referenced_artifact_roles=(),
         raw_item_json="{}",
         raw_item_sha256=_SHA,

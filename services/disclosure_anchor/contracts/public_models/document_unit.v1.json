@@ -90,6 +90,21 @@
       ],
       "title": "Company Ref"
     },
+    "content_categories": {
+      "anyOf": [
+        {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Content Categories"
+    },
     "content_hash": {
       "title": "Content Hash",
       "type": "string"
@@ -403,6 +418,7 @@
     "trace_level",
     "raw_file_hash",
     "query_projection_hash",
+    "content_categories",
     "asset_uri",
     "is_active_run",
     "evidence_refs"

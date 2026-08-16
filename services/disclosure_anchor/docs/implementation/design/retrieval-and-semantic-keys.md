@@ -12,8 +12,8 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 当前唯一新 writer 是 MinerU 3.4.4 Hybrid-medium：
 
 - `provider_document.v1` 保存官方 provider artifact 的闭合投影与 hash-bound inventory；
-- `provider_unit_locator.v2` 保存 Unit 对 source block、逻辑表物理段、evidence digest、检索目标与
-  可选的 source-PDF 数字校正 provenance；历史 v1 继续只读；
+- `provider_unit_locator.v3` 保存 Unit 对 source block、标题 payload ordinal、逻辑表物理段、
+  evidence digest、检索目标与可选的 source-PDF 数字校正 provenance；历史 v1/v2 继续只读；
 - 历史 `normalized_ir.v4` 只允许通过窄 resolver 读取已发布 evidence，不再 Build、Rebuild、
   Publish 或重建检索投影。
 
@@ -23,7 +23,7 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 
 1. `title`：已接受的 source heading 叶标题；metadata document title 绝不复制到 Unit。
 2. `heading_path`：已接受 heading occurrence 的完整根到叶路径。
-3. body：只回放 `provider_unit_locator.v2.search_targets` 明确列出的 provider payload destination。
+3. body：只回放 `provider_unit_locator.v3.search_targets` 明确列出的 provider payload destination。
 4. `semantic_key` / `semantic_keys`：可选的真实受控 Unit **直接主题**；scalar 是稳定 lead，数组是
    完整有序集合，所有项都进入 key channel，避免 mixed/长 Unit 的 secondary route 漏召回。
    Provider writer 使用版本化闭集词表和 source-bound candidate gate：Document 的 filing type 和
@@ -44,15 +44,23 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 原文标题仍由 `title` / `heading_path` 保真；该 Unit 内若有回购账户、风险提示等具体事实，只落对应的
 具体 route。没有可确认具体主题时 direct route 保持 NULL，绝不为了填满字段而发明“其他”占位键。
 
-当前身份是 taxonomy `semantic-taxonomy-2026-08-r37`、router `semantic_router.v54`、prompt
+当前身份是 taxonomy `semantic-taxonomy-2026-08-r43`、router `semantic_router.v73`、prompt
 `semantic_route_adjudication.v31`，当前候选 adjudicator 为 `codex_cli.v4.low` / `gpt-5.6-luna`；
 候选与 direct route 都最多 8 个。model/effort 与 cache/receipt identity 绑定。定期报告正文/表格也
 可以生成 Unit-local 直接主题候选；章节上下文另走 section_keys，不参与 shortlist。截断时，Unit
 自身标题/正文/表格直接证据先于
-纯字符相似或文档上下文召回，避免弱相似候选挤掉表单字段。候选若只出现在解释另一个主题的
-原因、背景、影响或条件从句中，不成为独立 route；必须另行披露其自身余额、金额、比率、结果或
-安排。唯一精确的定期报告标题仍直接成为唯一 route。事件公告
-允许独立表单字段或正文直接事实产生 secondary；仅靠低阈值标题相似度、没有其他直接证据的
+纯字符相似或文档上下文召回，避免弱相似候选挤掉表单字段。direct route 是有边界、偏召回的
+Unit-local **主题**，不表示陈述为真、已实现、属于本期、无条件或可采信；历史、风险、预测、计划、
+条件、因果、否定、无发生与不适用由 L2 解释，不能抹掉已成立的 L1 主题 witness。定期报告的
+allowlisted label 紧邻数值/方向，以及严格 typed table field/header，均可确定性落粗主题；普通
+table_text 和数据格只保留 lexical/candidate。唯一精确的定期报告标题仍直接成为唯一 route。
+
+taxonomy 内部明确区分三类策略：`topic` 是可多标签的粗主题；`role_anchor` 是 forecast period/range/
+comparison/basis/risk 等精确披露角色，同一 Unit 可同时保留独立粗主题，也可保留由自身精确标题或
+typed field/header 独立证明的另一个角色，但一个角色中的共享数字不能反向制造另一个角色；
+`exclusive_container` 只用于目录、完整报表/整表等机械独占载体。机械
+exclusive 可清掉本载体的偶然行项目，role anchor 不可作为全 Unit topic veto。事件公告允许独立
+表单字段或正文 source-bound 主题产生 secondary；仅靠低阈值标题相似度、没有其他直接证据的
 候选在任何 Unit 中都不得成为 secondary；真实 overview Unit 也必须有标题包含、正文或表格的
 直接证据才能保留 secondary。taxonomy 只标识一跳的 overview container，不构建父子图、不传播父键：具体子标题
 Unit 无论模型只选 overview，还是同时选 overview 与 direct route，程序都会在 receipt 冻结前去掉
@@ -63,6 +71,12 @@ Build 将候选定义、source IDs、裁决来源及模型/cache 身份冻结到
 定义、source 或上下文变化都会改变输入哈希，旧缓存/receipt 必须 fail closed。sidecar 原始字节的
 SHA-256 由 private ProcessingRun 持有；每日 GC 仅在 snapshot owner 与该 hash 同时存在时保护固定
 receipt sibling，失败/WIP 的无主 sidecar 仍可回收。
+
+粗 `business_risk` 主题只在定期报告/经营数据公告中由 **Unit 自身**明确含“风险”的标题、同 Unit
+实际正文/表格和合法文类 scope 共同证明；heading-only 锚点不冒充答案，`accounting_policies`
+中的信用风险计量规则也不升级为业务风险。它是偏召回的检索主题，不是事实已发生、风险大小或
+可采信性的判断。L2 可将它与更具体的 `credit_risk`、`liquidity_risk`、section route 及词法证据
+联合排序，而不是靠“看到风险就抹掉事实”或把所有风险正文塞进一个大 Unit。
 
 事件文类与 route scope 分层：年度/半年度/季度报告更正仍保持原报告文类；其他标题明确含
 “更正公告/补充更正”的事件件才归 `correction_supplement`。`更正如下`/`更正为`、业绩预告中的
@@ -111,7 +125,7 @@ MinerU 文本可由 native text 仅删除完整数字核心（可连同或保留
 source-PDF 文字形成 Unit payload。PDFium bounded-text 明确生成的、非首尾孤立 `CRLF` 软换行会按文字边界移除（ASCII
 单词间保留一个边界），CRLF 前后的水平空格仍须逐字匹配，且仅在同一观察中出现软换行时移除已校准的单个矩形末尾空格；宽窄字符、
 标点、NUL、裸 `CR/LF`、空白行、其他空白或多个末尾空格差异均拒绝。ProviderDocument
-仍原样保留 MinerU 输出。locator v2 记录 raw block、provider/source text hash 与固定
+仍原样保留 MinerU 输出。当前 locator v3 保留 v2 的 raw block、provider/source text hash 与固定
 `source_pdf_native_numeric.v1` provenance，覆盖 Unit 自身 blocks 和 heading-chain 依赖，Publish 每次
 从 PDF 重放。数字替换/重排、非数字差异、表格、高度重叠 bbox、旋转/页面形状不闭合、无 native
 text 或 hash/page 漂移一律不修；native reader 固定 `pypdfium2==5.13.0`，不得据此引入第二套
@@ -134,7 +148,8 @@ source/provider 结构证据，不能恢复数值/词面启发式。
 
 `content_categories` 是 Document 的 provider/classification 粗分类，与
 `publisher_categories`、`market` 一样保持 Document-only。SQL/L2 如需 facet 粗筛，先查询
-Document，再以 document_id 获取 Units；它不进入 Unit public view，也不加入全文 key tokens。
+Document，再以 document_id 获取 Units；deprecated `document_units_v1` 只为兼容保留该 join，
+当前 `document_units_v2` 不暴露它，两者都不把它加入全文 key tokens。
 
 `GET /v1/semantic-routes` 直接从同一 taxonomy 公开 key、中文 labels、scopes、版本与
 `usable_as_section_key`；后者同时覆盖定期报告 context-container 与事件 section-container，避免
@@ -159,5 +174,23 @@ L2 复制 L1 私有 JSON；它不创建第二套 registry。
 [`semantic-route-pilot-20260813.md`](../checks/semantic-route-pilot-20260813.md)。覆盖率只作诊断；
 unsupported narrow key 是 stop，而有证据缺口的 NULL 是允许的保守结果。
 
-公开 `document_unit`、search projection view 与 source/evidence 引用仍保持现有 v1 列面；新旧 Unit
-通过 locator contract 区分，绝不按文件存在性、parser 版本或字符串形状猜代际。
+L2/L3 准备度不得只用 key 覆盖率或 binary must-include 证明。当前 graded query gate 对回答 Unit、
+直接相关证据与相邻上下文分别标 3/2/1 级，联合 direct topic、role anchor、section、fielded lexical
+与最多一跳同文档相邻 Unit，计算 Success@5、Recall@10/20、nDCG@10、窄/宽查询 precision，并输出
+去掉 direct/section/lexical/neighbour 的消融。direct 命中只增加排序权重，不能删除同时成立的
+lexical/section 结果；查询计划可分别表达 `semantic_keys_any`、`semantic_keys_all`，以及 source-bound
+lexical phrase、多个独立短语的 ANY 联合或显式 AND-token 操作，不能把所有查询都硬套成同一种
+短语匹配。已知文类可作为排序 preference，而不是删除其他文类相关结果的隐式过滤器；preference
+本身不能召回没有 direct/section/lexical witness 的 Unit。
+任何验收必须把离线 source replay 与 live search row
+逐 Unit 对齐同一 `query_projection_hash` 和 answer-bearing `content_hash`；只按
+provider_document_id/unit_index 拼接旧投影无效。所有进入 full/ablation top-20 评测池的 Unit
+必须有显式 0--3 级人工 judgment 并绑定这两个哈希；未 judgment 的结果是 unknown，验收应 fail
+closed，不能默认为 grade 0。除此以外，还必须在 ranker 之外按 taxonomy/查询词、结构位置、超长
+Unit 与有界邻居扫描全量 source rows；该扫描确认的相关 Unit 即使没有被任何 ranker 返回，也必须
+进入 qrels 和 Recall 分母。这样既不会把“完全漏召回”藏在 pool 外，也不会在正文或表格改变但
+query projection 未变时继承旧评分。
+
+公开 `document_units_v1` 保留兼容列面，`document_units_v2` 提供无 Document facet 且带 Unit-owned
+`body_status` 的当前读面；HTTP Filing API 仍只交付 v1。新旧 Unit 通过 locator contract 区分，
+绝不按文件存在性、parser 版本或字符串形状猜代际。

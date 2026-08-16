@@ -65,8 +65,8 @@
       "provider_document_id": "1225420563",
       "unit_index": 4,
       "title": "（一）业绩预告期间",
-      "expected_keys": [],
-      "rationale": "只有日期区间，没有预告结论、范围、原因或风险事实，应诚实 NULL。"
+      "expected_keys": ["performance_forecast_period"],
+      "rationale": "精确标准标题与日期正文共同标识预告覆盖期间；它是披露角色，不冒充预告结论或数值范围。"
     },
     {
       "provider_document_id": "1225420563",
@@ -76,11 +76,40 @@
       "rationale": "直接披露亏损结论和数值区间。"
     },
     {
+      "provider_document_id": "1225420563",
+      "unit_index": 6,
+      "title": "二、上年同期经营业绩和财务状况",
+      "expected_keys": ["performance_forecast_comparison"],
+      "rationale": "明确的上年同期比较标题是 direct route；它与正文偶然提到历史数字不同。"
+    },
+    {
+      "provider_document_id": "1225420563",
+      "unit_index": 7,
+      "title": "三、本期业绩变动的主要原因",
+      "expected_keys": ["performance_forecast_basis"],
+      "rationale": "明确的变动原因标题是 direct route；正文中的因果性收入或成本提及不能反向制造其他 direct route。"
+    },
+    {
       "provider_document_id": "1225433840",
       "unit_index": 0,
       "title": "赛力斯集团股份有限公司关于公司董事、高级管理人员及骨干团队增持A 股及 H 股股份结果的更正公告",
       "expected_keys": ["correction_item", "corrected_data"],
       "rationale": "正文明确列出原值、更正值和更正项目；原因/影响并未独立披露。"
+    },
+    {
+      "provider_document_id": "1225231394",
+      "unit_index": 14,
+      "title": "4.1 总体经营情况分析",
+      "required_keys": ["bank_net_interest_income"],
+      "forbidden_keys": ["interest_income"],
+      "rationale": "正文只披露净利息收入；较短的利息收入标签不得在同一受控长字段内部重复命中。"
+    },
+    {
+      "provider_document_id": "1225231394",
+      "unit_index": 16,
+      "title": "净利息收入",
+      "required_keys": ["bank_net_interest_income", "interest_income"],
+      "rationale": "标题与正文披露净利息收入，独立表格又列示利息收入列；最长字段去重不能吞掉另一来源的真实主题。"
     },
     {
       "provider_document_id": "1225231394",
@@ -129,6 +158,15 @@
         "share_buyback_funding"
       ],
       "rationale": "方案表逐字段直接披露，并列出回购专用证券账户；没有独立完成结果或风险字段。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 276,
+      "title": "第九节 财务报告",
+      "expected_keys": [],
+      "required_section_keys": ["financial_report_chapter"],
+      "forbidden_keys": ["audit_opinion"],
+      "rationale": "财务报告目录只提供章节结构；审计报告页码范围不能被量化规则误当作实际审计意见。"
     },
     {
       "provider_document_id": "1225067794",

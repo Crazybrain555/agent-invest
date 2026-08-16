@@ -1,8 +1,8 @@
 {
-  "version": "semantic-events-2026-08-r26",
-  "_about": "Unit 事件与通用章节的闭集路由词表。labels/description 只用于精确标题命中、候选缩小和模型闭集解释；不授权短语出现即判定或文档类别直接传播。section_container_keys 仅允许同 scope、已接受 heading_path 的精确结构上下文进入独立 section_keys，不传播为 Unit 直接主题。",
+  "version": "semantic-events-2026-08-r31",
+  "_about": "Unit 事件与通用章节的闭集主题路由词表。labels/description 只用于 source-bound 标题、表单字段与正文主题证据，不授权文档类别直接传播。历史、风险、条件、计划、因果、否定与不适用属于 L2 模态，不抹掉 Unit 的直接主题。role_anchor_keys 是精确披露角色，可与独立粗主题并存但不得由别的角色中的数字反向制造。exclusive_container_keys 只保留目录、整表等机械独占载体。section_container_keys 仅允许同 scope、已接受 heading_path 的精确结构上下文进入独立 section_keys。",
   "fallback_key": "document_content",
-  "quantitative_fact_keys": [
+  "quantitative_topic_keys": [
     "performance_forecast_range",
     "operating_metrics",
     "production_volume",
@@ -16,7 +16,15 @@
     "cumulative_related_party_transactions"
   ],
   "exclusive_container_keys": [
+    "table_of_contents",
     "performance_flash_data"
+  ],
+  "role_anchor_keys": [
+    "performance_forecast_period",
+    "performance_forecast_range",
+    "performance_forecast_basis",
+    "performance_forecast_comparison",
+    "performance_forecast_risk"
   ],
   "overview_container_keys": [
     "convertible_bond_overview",
@@ -80,6 +88,16 @@
         "预计亏损",
         "业绩预盈",
         "业绩预亏"
+      ],
+      "scopes": [
+        "performance_forecast"
+      ]
+    },
+    {
+      "key": "performance_forecast_period",
+      "description": "业绩预告所覆盖的明确报告期间",
+      "labels": [
+        "业绩预告期间"
       ],
       "scopes": [
         "performance_forecast"
@@ -227,6 +245,7 @@
       "description": "产品、原料或服务价格变动",
       "labels": [
         "销售价格",
+        "销售均价",
         "产品价格",
         "价格变动"
       ],
@@ -680,6 +699,7 @@
       "description": "债券计息、付息、票面利率与兑付安排",
       "labels": [
         "年利息计算",
+        "付息的期限和方式",
         "付息方案",
         "付息安排",
         "票面利率",
@@ -1014,6 +1034,19 @@
         "risk_alert",
         "delisting_risk",
         "performance_forecast"
+      ]
+    },
+    {
+      "key": "business_risk",
+      "description": "定期报告或经营披露中由本 Unit 明确风险标题承载的业务、经营或金融风险主题",
+      "labels": [
+        "业务风险"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report",
+        "quarterly_report",
+        "operating_data"
       ]
     },
     {

@@ -4,7 +4,7 @@ project: disclosure_anchor
 title: 文件脉络与标题层级边界
 status: implemented
 revised_at: 2026-08-12
-depends_on: provider_document.v1、provider_unit.v6、06R 检索投影
+depends_on: provider_document.v1、provider_unit.v8、06R 检索投影
 ---
 
 # 文件脉络与标题层级边界
@@ -17,8 +17,11 @@ L1 给 L2 一棵可追溯、保守的章节树和对应 coarse Units。脉络是
 ## 2. 输入与裁决
 
 MinerU Medium 提供 reading order、title candidate、page/bbox 与原始 payload。层级阶段只处理
-已有 candidate，绝不从普通正文创造标题。通用负证据先行：page furniture、表内 carrier、
-caption/footnote 与跨页续句不能开节。
+已有 source occurrence，绝不从普通正文创造标题。通用负证据先行：page furniture、表内 carrier、
+普通 caption/footnote 与跨页续句不能开节。唯一窄例外是 Provider 将缺失标题合入 table block，
+且恰有一个非空 `table_caption` 以强根编号开头；它以 source index + payload ordinal 成为 candidate。
+“表4”、括号子组、checkbox-only 或无编号 selector、正文偶现编号及多 caption 均不满足；
+强编号 table-caption 即使同时携带适用性选择，仍按上一条 source-bound 窄例外裁决。
 
 层级信号顺序是本项目决策：
 
@@ -33,8 +36,10 @@ caption/footnote 与跨页续句不能开节。
 ## 3. parent/headpath
 
 accepted candidate 按 reading order 用单调栈生成 parent 与完整 headpath。每一级保留
-`source_index` 和 `placement_source`，从 ProviderDocument 可回放 page、bbox、text 与 raw hash。
-不确定 candidate 降为 body 或挂到最近可靠父级；不得猜一个具体 sibling parent。
+`source_index`、`payload_ordinal` 和 `placement_source`，从 ProviderDocument 可回放 page、bbox、text 与 raw hash。
+不确定 candidate 降为 body 或挂到最近可靠父级；不得猜一个具体 sibling parent。弱 provider-only、
+无编号且全文精确等于“适用”或“不适用”的 selector statement 必须降为 body；“适用范围”等
+有实质语义的标题及带可靠编号的标题不受此规则影响。
 
 编号重启只在 source-bound 结构证据下纠正。表格和 payload kind 不得作为缺失章节的代理边界，
 也不得使可靠 plain-numbered parent 出栈。无编号弱标题仅在紧邻 provider source block 明确从同族
@@ -56,7 +61,8 @@ page span 和 first order index；同名标题的内部 identity 仍由 locator/
   回退 deterministic outline；
 - logical table owner、continuation stub、physical segment 与 search primary 完全由独立阶段处理，
   不进入 heading arbitration；
-- caption、业务 taxonomy、搜索召回与 metadata title 不反向改变结构。
+- 除上述强编号 table-caption source occurrence 外，caption、业务 taxonomy、搜索召回与 metadata title
+  不反向改变结构。
 
 ## 6. 验收
 

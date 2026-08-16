@@ -187,7 +187,8 @@ token 的 section packs；超长表格另建 1.5–3k token 的连续行窗口�
 
 PDF 表格默认保存为完整 `table` part（无同节相邻内容时也可单独成为 unit）：
 
-- 源 `table_caption`（关联文本，不假定为表名）；
+- 源 `table_caption`（通常只是关联文本，不假定为表名；唯一的强编号标题子 occurrence
+  例外见 §8.3）；
 - 标题路径；
 - 单位；
 - 表头；
@@ -526,7 +527,7 @@ payload 是有序 parts；每个 part 只保存 source-bound 浅内容字段，�
 `payload_kind` 唯一表达。
 视觉 part 额外保存内容型 artifact 的 `{sha256,size_bytes,media_type}`，使图像变化进入
 `content_hash`；路径、crop、bbox、search binding 与 supporting evidence 只在 Unit 顶层
-`provider_unit_locator.v2`，不复制到每个 part，也不形成第二套证据图。
+`provider_unit_locator.v3`，不复制到每个 part，也不形成第二套证据图。
 
 ```json
 {
@@ -574,7 +575,9 @@ document preamble。监管 taxonomy 可在组装完成后帮助 L2 路由，但�
 ]
 ```
 
-财务附注里的表格则是更深的层级（Provider writer 不填写 `semantic_key`，业务解释留给 L2）：
+财务附注里的表格则是更深的层级。Provider writer 只允许严格 typed field/header 或其他
+Unit-local 受控 witness 产生粗主题 `semantic_key(s)`；普通 table text/data cell 不造 route，
+具体数值口径、事实性与业务解释仍留给 L2：
 
 ```text
 第八节 财务报告
@@ -605,7 +608,7 @@ document preamble。监管 taxonomy 可在组装完成后帮助 L2 路由，但�
 ## 7.2 artifact_locator
 
 `artifact_locator` 是可选的**技术位置**。新产物使用闭合的
-`provider_unit_locator.v2`，绑定 `provider_document.v1` hash、source block index、标题链、
+`provider_unit_locator.v3`，绑定 `provider_document.v1` hash、source block index + payload ordinal、标题链、
 Unit parts、物理表格段、evidence digest 与显式 search target。`title`、heading_path 或 caption
 发生争议时，必须沿 locator 回到 ProviderDocument、MinerU 原始 artifact 和不可变 PDF 查证；
 缺 locator 或源字段不是“保守猜一个值”的理由，而是 parser 质量故障。
@@ -626,7 +629,7 @@ source_text_reconciliations（仅 native-PDF 数字校正时）
 
 ```json
 {
-  "contract_version": "provider_unit_locator.v2",
+  "contract_version": "provider_unit_locator.v3",
   "provider_document_sha256": "sha256:...",
   "heading_chain": [{"source_index": 42, "placement_source": "numbering"}],
   "parts": [{"part_index": 0, "block_source_indices": [43, 44],
@@ -647,7 +650,8 @@ source PDF 文字。唯一 reader 规范化是 PDFium bounded-text 生成的、�
 每个 Unit locator 覆盖本 Unit source blocks 及其完整 heading chain 所依赖的校正；Publish 必须从
 PDF 重新生成同一结果。表格、数字替换/重排、非数字差异、无 text layer、旋转/页面形状不闭合、
 高度重叠 bbox 或任何歧义均不修。native reader 固定使用 `pypdfium2==5.13.0`。
-历史 `provider_unit_locator.v1` 继续只读，但不能声明该校正。
+历史 `provider_unit_locator.v1/v2` 继续只读；v1 不能声明该校正，v1/v2 的 heading
+默认绑定 source block 的首个 payload。只有 v3 可把标题精确绑定到非首个 payload occurrence。
 
 MinerU merge-on 输出中的非空 content-list table owner 是唯一逻辑/检索 payload；后续空 table
 stub 不另发正文，只通过 locator 连接其逐页 physical segment、crop、page/bbox 和 raw hash。
@@ -717,8 +721,13 @@ source kinds 以有序 `mixed.parts` 保留。
 
 ## 8.3 表格和邻近解释
 
-`title` 只取 PDF 标题树的叶节点；`table_caption`、单位、表头、行数据和脚注分别保留在 table
-payload 中，不能互相冒充。表格与同一 heading occurrence 下的相邻解释进入一个有序 `mixed`。
+`title` 只取 PDF 标题树的叶节点。通常 `table_caption`、单位、表头、行数据和脚注分别保留在
+table payload 中，不能互相冒充；唯一窄例外是 Provider 已把缺失标题并入 table block，且该 block
+恰有一个非空 `table_caption`、caption 以强根编号（如“第四节”或“四、”）开头时，该 caption
+以 `(source_index,payload_ordinal)` 成为 source-bound heading occurrence。它从 table payload
+移出并只出现在 Unit title/search 一次，table_body 与 footnote 原样保留。普通“表4”、括号子组、
+checkbox-only 或无编号 selector、正文中偶现编号均不能开节；这不排除上行已绑定的强编号
+table-caption 中同时包含适用性选择。表格与同一 heading occurrence 下的相邻解释进入一个有序 `mixed`。
 下一真实 heading occurrence 下的内容另建 unit；不按“是否像管理层分析”等词面语义猜边界。
 
 ## 8.4 短公告
@@ -993,7 +1002,7 @@ order_index
 6 列，至 04R-R7 为 32 列（仅历史基线）。
 
 0008 迁移起，`processing_runs_v1` 投影 `builder_rules_version`，用于确定性 Unit builder 归因；
-历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 当前必须等于 `provider_unit.v6`。
+历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 当前必须等于 `provider_unit.v8`。
 
 0031 迁移起，`processing_runs_v1` 只额外暴露不透明的
 `artifact_owner_processing_run_id`：parse run 指向自身，`rebuild_units` 指向实际拥有
@@ -1003,12 +1012,15 @@ parser artifact 与 primary parse artifact 字节的根 parse run。0032 为 cor
 run_kind 与 locator contract 校验后使用统一 PathBuilder 定位，禁止把 unit producer run 当成
 artifact owner，也禁止从文件存在性或路径词面猜版本。
 
-0037 后 `document_units_v1` 为 **39 列**：保留 Unit 自有 scope/provenance、
+0038 后 `document_units_v2` 为当前 **40 列** Unit 读面：保留 Unit 自有 scope/provenance、
 `semantic_key`/`semantic_keys` 检索路由，以及 `filing_type`/`disclosure_topics` 路由字段；
 `section_keys` 单独提供确定性的规范化章节召回；
-`content_categories`、`publisher_categories`、`market` 均只留在 `documents_v1` 与
-`document_categories_v1`。L2 如需 provider 粗分类，先筛 Document 再按 document_id 取 Units，
-不能把 Document facet 冒充 Unit 内容标签。完整列集以 contract-checklist §2 为准：
+`content_categories`、`publisher_categories`、`market` 的当前事实面均只在 `documents_v1` 与
+`document_categories_v1`。L2 如需 provider 粗分类，先筛 Document 再按 document_id 取 v2 Units，
+不能把 Document facet 冒充 Unit 内容标签。`document_units_v1` 为兼容既有消费者恢复弃用的
+末列 `content_categories`（40 列，仅 join、不存 Unit）；v2 用 Unit 自有
+`body_status=content|heading_only|empty` 取代该 Document facet，新消费者不得依赖 v1 弃用列。完整列集以
+contract-checklist §2 为准：
 
 - 0010：`applicability`（'applicable'|'not_applicable'|NULL，节适用性一等筛选列，部分索引）
   与 `page_no`（artifact_locator 首页码提升列）；
@@ -1028,6 +1040,11 @@ artifact owner，也禁止从文件存在性或路径词面猜版本。
 - 0037：从 `document_units_v1` / `DocumentUnitV1` 删除继承的 `content_categories`；CNInfo
   原始分类、Document materialized facet、documents API/filter 与 semantic router 的 Document
   context 均保留。
+- 0038：不改写 0037，恢复 40 列 `document_units_v1` 兼容面，并新增无该字段、带
+  `body_status` 的 40 列 `document_units_v2`；两者分别投影 `document_unit.v1` / `document_unit.v2`。当前 Filing API
+  仍仅实现 v1，完整 HTTP v2 未落地前拒绝 `X-Contract-Version:v2`。该迁移 downgrade 只移除 v2，
+  继续保留已恢复的 40 列 v1，避免以回滚名义重新暴露 0037 的已知破坏形状；更深历史回退仍由各自
+  migration 处理。
 
 `asset://` URI（顶层协议 §2.3）只在序列化边界派生，不落存储：
 

@@ -90,8 +90,10 @@ topics 成为完备分类（NULL 仅剩无码通道）。词表 JSON 形态：
 
 ### 3.3 视图新增/改造列（0016 历史方案）
 
-> 0037 部分取代：三类 provider facets 当前只由 `documents_v1` / `document_categories_v1`
-> 暴露，不再重复到 `document_units_v1`。下表保留 0016 最初的分类形态与来源设计。
+> 0038 当前边界：三类 provider facets 的事实面只由 `documents_v1` /
+> `document_categories_v1` 暴露；`document_units_v2` 不重复这些字段。为兼容既有 v1 consumer，
+> `document_units_v1` 末列暂保留弃用的 `content_categories` join。下表保留 0016 最初的
+> 分类形态与来源设计。
 
 | 视图列 | 形态 | 样例（真实数据） |
 |---|---|---|

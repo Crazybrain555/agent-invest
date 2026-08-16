@@ -86,7 +86,8 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
   page_no：artifact_locator 首页码提升列）。
 0007 起 document_units_v1 追加 6 列：asset_kind / observed_at / source_tier /
   trace_level / raw_file_hash / query_projection_hash
-  （0037 当前列全集 = **39 列**；semantic_keys=直接主题，section_keys=规范化章节位置；publisher/market/content_categories 只留 documents_v1/document_categories_v1）
+  （0038 当前 v1 为 **40 列**兼容面，末列 `content_categories` 已弃用；v2 也为 **40 列**当前面，
+  以 Unit 自有 `body_status` 取代该 Document facet。semantic_keys=直接主题，section_keys=规范化章节位置）
 0007 起 change_events_v1 追加 change_kind（真实列）/ subject_kind / subject_ref /
   source / contract_version
 0007 起 documents_v1 追加 contract_version / company_ref / security_ref / source_ref /
@@ -122,6 +123,7 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
 ```text
 disclosure_public.documents_v1
 disclosure_public.document_units_v1
+disclosure_public.document_units_v2
 disclosure_public.document_categories_v1
 disclosure_public.processing_runs_v1
 disclosure_public.source_refs_v1
@@ -283,6 +285,17 @@ documents_v1 / document_categories_v1、Document materialized facet、CNInfo F00
 L2 如需 provider facet 粗筛，先筛 Document 再按 document_id 获取 Units；Unit 主题召回只使用 semantic_keys、section_keys 与 lexical search
 ```
 
+2026-08-15（0038 Unit 公共读契约版本化修复）:
+
+```text
+0037 删除 public v1 字段属于 breaking change；不改写已应用迁移，追加 0038 修复版本边界
+document_units_v1 恢复末列 content_categories 仅作 deprecated compatibility join，contract_version=document_unit.v1
+document_units_v2 暴露无 content_categories、带 body_status 的 40 列当前读面，contract_version=document_unit.v2
+v2 consumer 如需 provider facet，先读 documents_v1/document_categories_v1 再按 document_id 取 Units
+Filing API 当前仍只有 v1；X-Contract-Version:v2 在完整 v2 HTTP 契约落地前继续 fail closed
+0038 downgrade 只删除 v2，并保留已恢复的 40 列 v1；绝不以回滚名义重新暴露 0037 的已知破坏形状，继续向更早 revision 回退仍由各自 migration 处理
+```
+
 2026-08-14（semantic route 公共目录）：
 
 ```text
@@ -302,7 +315,8 @@ admission 可在同一 raw PDF hash/page count、同一 MinerU text bbox 与 raw
 唯一 reader 规范化为非首尾孤立 PDFium `CRLF`，并仅在同一多行观察移除一个矩形末尾空格；CRLF 周围
 空白、多个末尾空格、NUL、裸 `CR/LF`、空白行均拒绝；数字替换/重排、表格、
 非数字差异、旋转/页面形状不闭合、高度重叠 bbox 和歧义不修
-provider_unit_locator.v2 记录 source_index/payload ordinal/raw block hash/provider+source text hash/source kind
+provider_unit_locator.v2 记录 source_index/payload ordinal/raw block hash/provider+source text hash/source kind；
+provider_unit_locator.v3 进一步让 heading_chain 明确绑定 payload ordinal，以支持 Provider 表格 block 中唯一的强编号 caption 标题 occurrence
 每个 locator 覆盖本 Unit blocks 与 heading chain 的 repair 依赖；Publish 从不可变 PDF 重放校正；
 reader pin `pypdfium2==5.13.0`；历史 locator v1 继续读 evidence/search，但不能声明 source repair
 ```
