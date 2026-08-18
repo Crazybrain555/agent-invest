@@ -81,6 +81,21 @@
     },
     {
       "provider_document_id": "1225469289",
+      "unit_index": 97,
+      "title": "5、发行股份的定价依据、定价基准日和发行价格",
+      "expected_keys": ["valuation_pricing", "issue_price"],
+      "rationale": "购买资产发行定价标题同时直接命名估值定价安排和发行价格，两个检索面必须并存。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 106,
+      "title": "3、发行股份的定价基准日、定价依据和发行价格",
+      "expected_keys": ["valuation_pricing", "issue_price"],
+      "required_section_keys": ["supporting_financing"],
+      "rationale": "配套融资发行定价标题同时直接命名估值定价安排和发行价格，并保留配套融资结构上下文。"
+    },
+    {
+      "provider_document_id": "1225469289",
       "unit_index": 127,
       "title": "（一）本次交易构成重大资产重组",
       "required_section_keys": ["transaction_classification"],
@@ -96,7 +111,7 @@
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 41,
+      "unit_index": 40,
       "title": "4、卓越的管理团队及人才培养机制",
       "expected_keys": ["revenue_and_cost"],
       "required_section_keys": ["business_review"],
@@ -104,7 +119,7 @@
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 60,
+      "unit_index": 59,
       "title": "(一) 可能面对的风险",
       "expected_keys": ["business_risk"],
       "required_section_keys": ["business_review"],
@@ -112,7 +127,7 @@
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 65,
+      "unit_index": 64,
       "title": "5、主要原材料价格波动风险",
       "expected_keys": ["business_risk", "revenue_and_cost"],
       "required_section_keys": ["business_review"],
@@ -120,7 +135,7 @@
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 74,
+      "unit_index": 73,
       "title": "第四节 公司治理、环境和社会",
       "expected_keys": [],
       "expected_section_keys": [],
@@ -129,7 +144,7 @@
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 79,
+      "unit_index": 78,
       "title": "四、纳入环境信息依法披露企业名单的上市公司及其主要子公司的环境信息情况√适用 □不适用",
       "expected_keys": [],
       "expected_section_keys": ["governance", "environment_social"],
@@ -141,7 +156,7 @@
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 80,
+      "unit_index": 79,
       "title": "(一) 在报告期内为减少污染物排放及提升资源利用效率所采取的措施及效果",
       "expected_keys": [],
       "expected_section_keys": [],
@@ -154,7 +169,7 @@
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 81,
+      "unit_index": 80,
       "title": "1、排污信息",
       "expected_keys": [],
       "expected_section_keys": ["governance", "environment_social"],
@@ -168,7 +183,7 @@
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 270,
+      "unit_index": 269,
       "title": "(ii) 信用风险显著增加和已发生信用减值的判断",
       "expected_keys": ["credit_risk"],
       "expected_section_keys": ["financial_report_chapter", "accounting_policies"],
@@ -176,7 +191,7 @@
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 226,
+      "unit_index": 225,
       "title": "20、 投资性房地产",
       "expected_keys": ["investment_property"],
       "expected_section_keys": ["financial_report_chapter", "accounting_policies"],

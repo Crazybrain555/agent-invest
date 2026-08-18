@@ -295,8 +295,8 @@ class SemanticTaxonomyTests(unittest.TestCase):
     def test_packaged_taxonomy_is_closed_and_has_no_fake_fallback_route(self) -> None:
         taxonomy = load_semantic_route_taxonomy()
 
-        self.assertEqual(len(taxonomy.definitions), 304)
-        self.assertEqual(len(taxonomy.by_key()), 304)
+        self.assertEqual(len(taxonomy.definitions), 307)
+        self.assertEqual(len(taxonomy.by_key()), 307)
         self.assertNotIn(taxonomy.fallback_key, taxonomy.by_key())
         self.assertNotIn("other_information", taxonomy.by_key())
         self.assertNotIn("other_significant_events", taxonomy.by_key())
@@ -313,11 +313,19 @@ class SemanticTaxonomyTests(unittest.TestCase):
             taxonomy.by_key()["performance_forecast_summary"].overview_container
         )
         self.assertTrue(taxonomy.by_key()["business_review"].context_container)
+        self.assertTrue(taxonomy.by_key()["directors_report"].context_container)
         self.assertTrue(taxonomy.by_key()["board_committees"].context_container)
         self.assertTrue(taxonomy.by_key()["risk_management"].context_container)
         self.assertFalse(taxonomy.by_key()["business_risk"].context_container)
         self.assertTrue(taxonomy.by_key()["issuance_plan"].section_container)
         self.assertTrue(taxonomy.by_key()["transaction_risk"].section_container)
+        self.assertTrue(taxonomy.by_key()["definitions"].section_container)
+        self.assertTrue(
+            taxonomy.by_key()["performance_commitment"].section_container
+        )
+        self.assertTrue(
+            taxonomy.by_key()["transaction_commitments"].section_container
+        )
         self.assertFalse(taxonomy.by_key()["issuance_plan"].context_container)
         self.assertFalse(taxonomy.by_key()["revenue_and_cost"].context_container)
         self.assertTrue(taxonomy.by_key()["revenue_and_cost"].quantitative_topic)
@@ -367,6 +375,18 @@ class SemanticTaxonomyTests(unittest.TestCase):
         self.assertIn(
             "其他重要业务指标",
             taxonomy.by_key()["operating_metrics"].labels,
+        )
+        self.assertIn(
+            "主要控股、参股企业分析",
+            taxonomy.by_key()["subsidiaries_analysis"].labels,
+        )
+        self.assertIn(
+            "restructuring_assets",
+            taxonomy.by_key()["issue_size"].scopes,
+        )
+        self.assertIn(
+            "performance_flash",
+            taxonomy.by_key()["risk_warning"].scopes,
         )
         self.assertTrue(
             {"annual_report", "semiannual_report", "quarterly_report"}.issubset(
@@ -456,6 +476,327 @@ class SemanticTaxonomyTests(unittest.TestCase):
         self.assertEqual(result.units[1].section_keys, ("business_review",))
         self.assertEqual(result.receipts[1].decision_source, "fallback")
         self.assertEqual(adjudicator.calls, 0)
+
+    def test_combined_company_profile_heading_keeps_direct_and_section_routes(
+        self,
+    ) -> None:
+        admitted, drafts = _drafts_with_body(
+            "第二节 公司简介和主要财务指标",
+            "公司基本信息及主要会计数据如下。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail(
+                "an exact direct route must not be weakened by its section alias"
+            )
+        )
+
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="semiannual_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertEqual(result.units[0].semantic_keys, ("company_profile_metrics",))
+        self.assertEqual(result.units[0].section_keys, ("company_profile",))
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_exact_context_heading_substrings_do_not_create_direct_locks(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "与金融工具相关的风险",
+                "本集团持有金融工具并披露相关风险及风险管理政策。",
+                "financial_instruments_policy",
+                "financial_instrument_risk",
+            ),
+            (
+                "财务报表的编制基础",
+                "本节披露相关具体情况。",
+                "financial_statements_section",
+                "basis_of_preparation",
+            ),
+            (
+                "合并财务报表主要项目注释",
+                "本节披露相关具体情况。",
+                "financial_statements_section",
+                "consolidated_notes",
+            ),
+            (
+                "母公司财务报表主要项目注释",
+                "本节披露相关具体情况。",
+                "financial_statements_section",
+                "parent_company_notes",
+            ),
+        )
+        for title, body, forbidden_direct, required_section in cases:
+            with self.subTest(title=title):
+                admitted, drafts = _drafts_with_body(title, body)
+                adjudicator = _Adjudicator(
+                    lambda _batch: self.fail(
+                        "an exact context heading must not need model adjudication"
+                    )
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=adjudicator,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type="annual_report",
+                    ),
+                    drafts=drafts,
+                )
+
+                self.assertNotIn(
+                    forbidden_direct,
+                    result.units[0].semantic_keys or (),
+                )
+                self.assertIn(
+                    required_section,
+                    result.units[0].section_keys or (),
+                )
+                self.assertEqual(adjudicator.calls, 0)
+
+    def test_source_reviewed_context_direct_overlaps_remain_intentional(
+        self,
+    ) -> None:
+        admitted, drafts = _drafts_with_table(
+            "（二）内部控制审计报告",
+            "<table><tr><td>内控审计报告意见类型</td>"
+            "<td>标准无保留意见</td></tr></table>",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("the source-reviewed overlap is deterministic")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertEqual(result.units[0].semantic_keys, ("audit_opinion",))
+        self.assertEqual(result.units[0].section_keys, ("internal_control",))
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_internal_control_context_without_opinion_evidence_stays_section_only(
+        self,
+    ) -> None:
+        admitted, drafts = _drafts_with_body(
+            "（二）内部控制审计报告",
+            "公司持续完善内部控制制度并强化监督检查。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail(
+                "a context heading without opinion evidence must not call the model"
+            )
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertIsNone(result.units[0].semantic_keys)
+        self.assertEqual(result.units[0].section_keys, ("internal_control",))
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_combined_restructuring_pricing_headings_keep_broad_and_narrow_routes(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "5、发行股份的定价依据、定价基准日和发行价格",
+                "根据《重组管理办法》规定，上市公司发行股份的价格不得低于市场参考价的80%。本次发行价格为6.85元/股。",
+            ),
+            (
+                "3、发行股份的定价基准日、定价依据和发行价格",
+                "本次发行股份募集配套资金的定价基准日为发行期首日，发行价格不低于市场参考价的80%。",
+            ),
+        )
+        for title, body in cases:
+            with self.subTest(title=title):
+                admitted, drafts = _drafts_with_body(title, body)
+                adjudicator = _Adjudicator(
+                    lambda _batch: self.fail(
+                        "exact combined pricing headings must be deterministic"
+                    )
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=adjudicator,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type="restructuring_assets",
+                    ),
+                    drafts=drafts,
+                )
+
+                self.assertEqual(
+                    result.units[0].semantic_keys,
+                    ("valuation_pricing", "issue_price"),
+                )
+                self.assertEqual(adjudicator.calls, 0)
+
+    def test_directors_report_context_and_exact_periodic_topics_are_source_bound(
+        self,
+    ) -> None:
+        admitted, drafts = _drafts_with_parent_heading(
+            "第四节 董事会报告",
+            "九、管理合约",
+            "报告期内不存在有关重大部分业务的管理合约。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("exact periodic routes must be deterministic")
+        )
+        router = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        )
+
+        context_result = router.route(
+            admitted=admitted,
+            document=SemanticDocumentContext(title=None, filing_type="annual_report"),
+            drafts=drafts,
+        )
+        self.assertEqual(
+            context_result.units[1].section_keys,
+            ("directors_report",),
+        )
+
+        for title, expected in (
+            ("第二节 致股东", "shareholder_letter"),
+            ("四、主要控股、参股企业分析", "subsidiaries_analysis"),
+        ):
+            with self.subTest(title=title):
+                direct_admitted, direct_drafts = _drafts_with_body(
+                    title,
+                    "本节按报告期事实披露相关情况。",
+                )
+                direct_result = router.route(
+                    admitted=direct_admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type="annual_report",
+                    ),
+                    drafts=direct_drafts,
+                )
+                self.assertEqual(direct_result.units[0].semantic_keys, (expected,))
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_event_section_contexts_and_scope_extensions_are_exact(self) -> None:
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("exact event routes must be deterministic")
+        )
+        router = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        )
+        for parent, child, expected in (
+            ("第一节 释义", "（一）普通术语", "definitions"),
+            ("（七）业绩补偿安排", "2、补偿数额的确定", "performance_commitment"),
+            (
+                "六、本次重组相关方作出的重要承诺",
+                "（一）上市公司作出的重要承诺",
+                "transaction_commitments",
+            ),
+        ):
+            with self.subTest(parent=parent):
+                admitted, drafts = _drafts_with_parent_heading(
+                    parent,
+                    child,
+                    "本节披露与该标题直接相关的具体内容。",
+                )
+                result = router.route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type="restructuring_assets",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertIn(expected, result.units[1].section_keys or ())
+
+        for filing_type, title, expected in (
+            ("performance_flash", "三、风险提示", "risk_warning"),
+            ("restructuring_assets", "6、发行数量", "issue_size"),
+            ("restructuring_assets", "发行价格", "issue_price"),
+        ):
+            with self.subTest(filing_type=filing_type, title=title):
+                admitted, drafts = _drafts_with_body(
+                    title,
+                    "本节披露与该标题直接相关的具体内容。",
+                )
+                result = router.route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type=filing_type,
+                    ),
+                    drafts=drafts,
+                )
+                self.assertIn(expected, result.units[0].semantic_keys or ())
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_nearby_semantic_phrases_do_not_widen_new_exact_routes(self) -> None:
+        cases = (
+            ("致股东事项说明", "annual_report"),
+            ("董事会专项工作报告", "annual_report"),
+            ("普通术语补充", "restructuring_assets"),
+            ("相关方一般承诺", "restructuring_assets"),
+        )
+        for title, filing_type in cases:
+            with self.subTest(title=title):
+                admitted, drafts = _drafts_with_body(
+                    title,
+                    "本节为相邻但不等同于受控标题的内容。",
+                )
+                adjudicator = _Adjudicator(
+                    lambda _batch: self.fail("inexact labels must not call the model")
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=adjudicator,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type=filing_type,
+                    ),
+                    drafts=drafts,
+                )
+                self.assertIsNone(result.units[0].semantic_keys)
+                self.assertIsNone(result.units[0].section_keys)
+                self.assertEqual(adjudicator.calls, 0)
 
     def test_exact_event_heading_projects_section_without_propagating_direct_key(
         self,
@@ -719,7 +1060,10 @@ class SemanticTaxonomyTests(unittest.TestCase):
             drafts=drafts,
         )
 
-        self.assertEqual(result.units[1].section_keys, ("investment_analysis",))
+        self.assertEqual(
+            result.units[1].section_keys,
+            ("directors_report", "investment_analysis"),
+        )
         self.assertEqual(adjudicator.calls, 0)
 
     def test_nearby_investment_phrase_does_not_widen_exact_section_alias(self) -> None:
@@ -742,7 +1086,7 @@ class SemanticTaxonomyTests(unittest.TestCase):
             drafts=drafts,
         )
 
-        self.assertIsNone(result.units[1].section_keys)
+        self.assertEqual(result.units[1].section_keys, ("directors_report",))
         self.assertEqual(adjudicator.calls, 0)
 
     def test_generic_financial_titles_do_not_claim_bank_only_routes(self) -> None:

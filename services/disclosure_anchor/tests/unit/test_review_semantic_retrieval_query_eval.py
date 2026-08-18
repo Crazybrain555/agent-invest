@@ -188,6 +188,7 @@ class ReviewSemanticRetrievalQueryEvalTests(unittest.TestCase):
         )
         search_rows = _search_rows()
         search_rows[("pid", 4)] = {
+            "contract_version": "document_unit.v2",
             "content_hash": _CONTENT_HASH,
             "query_projection_hash": _HASH,
             "title_text": "其他正文",
@@ -232,6 +233,32 @@ class ReviewSemanticRetrievalQueryEvalTests(unittest.TestCase):
         self.assertTrue(result["judgment_pool_complete"])
         self.assertEqual(result["results"][0]["metrics"]["grade2_recall_at_20"], 0.5)
         self.assertEqual(result["results"][0]["top"][0]["unit_index"], 0)
+
+    def test_graded_review_rejects_deprecated_unit_surface(self) -> None:
+        search_rows = _search_rows()
+        search_rows[("pid", 0)]["contract_version"] = "document_unit.v1"
+
+        with self.assertRaisesRegex(ValueError, "not from document_unit.v2"):
+            review(
+                evaluation=_evaluation(),
+                gold={
+                    "contract_version": "semantic_retrieval_query_gold.v4",
+                    "_about": "current public Unit surface test",
+                    "evaluation_id": "eval",
+                    "taxonomy_version": "taxonomy",
+                    "router_version": "router",
+                    "judged_units": [
+                        ["pid", 0, _HASH, _CONTENT_HASH],
+                        ["pid", 2, _HASH, _CONTENT_HASH],
+                    ],
+                    "thresholds": _permissive_thresholds(),
+                    "cases": [
+                        _case("narrow", "收入", qrels=[["pid", 0, 3]]),
+                        _case("broad", "风险", qrels=[["pid", 2, 3]]),
+                    ],
+                },
+                search_rows=search_rows,
+            )
 
     def test_and_lexical_operator_keeps_unit_level_conjunctive_match(self) -> None:
         search_rows = _search_rows()
@@ -473,6 +500,7 @@ def _evaluation() -> dict[str, object]:
 def _search_rows() -> dict[tuple[str, int], dict[str, object]]:
     return {
         ("pid", 0): {
+            "contract_version": "document_unit.v2",
             "content_hash": _CONTENT_HASH,
             "query_projection_hash": _HASH,
             "title_text": "营业收入",
@@ -481,6 +509,7 @@ def _search_rows() -> dict[tuple[str, int], dict[str, object]]:
             "atom_text": "营业收入增长",
         },
         ("pid", 1): {
+            "contract_version": "document_unit.v2",
             "content_hash": _CONTENT_HASH,
             "query_projection_hash": _HASH,
             "title_text": "目录",
@@ -489,6 +518,7 @@ def _search_rows() -> dict[tuple[str, int], dict[str, object]]:
             "atom_text": "",
         },
         ("pid", 2): {
+            "contract_version": "document_unit.v2",
             "content_hash": _CONTENT_HASH,
             "query_projection_hash": _HASH,
             "title_text": "风险管理",
@@ -497,6 +527,7 @@ def _search_rows() -> dict[tuple[str, int], dict[str, object]]:
             "atom_text": "",
         },
         ("pid", 3): {
+            "contract_version": "document_unit.v2",
             "content_hash": _CONTENT_HASH,
             "query_projection_hash": _HASH,
             "title_text": "应对措施",

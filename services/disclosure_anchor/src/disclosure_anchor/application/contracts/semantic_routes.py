@@ -10,7 +10,7 @@ from typing import Literal, cast, get_args
 
 SEMANTIC_ROUTE_RECEIPT_VERSION = "semantic_route_receipt.v1"
 SEMANTIC_ROUTE_RECEIPTS_FILENAME = "semantic_route_receipts.v1.jsonl"
-SEMANTIC_ROUTER_VERSION = "semantic_router.v73"
+SEMANTIC_ROUTER_VERSION = "semantic_router.v77"
 SEMANTIC_PROMPT_VERSION = "semantic_route_adjudication.v31"
 SEMANTIC_FALLBACK_KEY = "document_content"
 MAX_SEMANTIC_ROUTES = 8

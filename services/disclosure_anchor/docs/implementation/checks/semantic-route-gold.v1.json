@@ -214,6 +214,45 @@
       "title": "四、 其他事项说明",
       "expected_keys": ["share_buyback_account"],
       "rationale": "虽然标题泛化为其他事项，正文直接披露回购专用证券账户的开立、账号和限定用途，应使用精确主题而非 other。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 6,
+      "title": "第一节 释义",
+      "expected_keys": ["definitions"],
+      "required_section_keys": ["definitions"],
+      "rationale": "释义根既是本 Unit 的直接主题，也是其术语子表的精确结构上下文。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 7,
+      "title": "第二节 致股东",
+      "expected_keys": ["shareholder_letter"],
+      "rationale": "标准致股东章节本身承载管理层面向股东的年度回顾和展望，不应依赖正文偶然短语召回。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 8,
+      "title": "第三节 公司简介和主要财务指标",
+      "expected_keys": ["company_profile_metrics"],
+      "required_section_keys": ["company_profile"],
+      "rationale": "合并式标准章节同时保留主要指标直接主题，并为公司信息子节提供公司简介结构上下文。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 95,
+      "title": "四、主要控股、参股企业分析",
+      "expected_keys": ["subsidiaries_analysis"],
+      "required_section_keys": ["directors_report"],
+      "rationale": "企业/公司用词变体仍是标准控股参股企业分析主题，并准确位于董事会报告章节。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 102,
+      "title": "九、管理合约",
+      "expected_keys": [],
+      "required_section_keys": ["directors_report"],
+      "rationale": "精确董事会报告路径为本 Unit 提供可批量检索的结构位置；不为管理合约正文另造低复用主题键。"
     }
   ]
 }

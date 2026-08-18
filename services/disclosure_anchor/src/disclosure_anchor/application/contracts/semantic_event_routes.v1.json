@@ -1,5 +1,5 @@
 {
-  "version": "semantic-events-2026-08-r31",
+  "version": "semantic-events-2026-08-r33",
   "_about": "Unit 事件与通用章节的闭集主题路由词表。labels/description 只用于 source-bound 标题、表单字段与正文主题证据，不授权文档类别直接传播。历史、风险、条件、计划、因果、否定与不适用属于 L2 模态，不抹掉 Unit 的直接主题。role_anchor_keys 是精确披露角色，可与独立粗主题并存但不得由别的角色中的数字反向制造。exclusive_container_keys 只保留目录、整表等机械独占载体。section_container_keys 仅允许同 scope、已接受 heading_path 的精确结构上下文进入独立 section_keys。",
   "fallback_key": "document_content",
   "quantitative_topic_keys": [
@@ -41,13 +41,16 @@
     "share_buyback_plan"
   ],
   "section_container_keys": [
+    "definitions",
     "dilution_impact",
     "issuance_outcome",
     "issuance_plan",
+    "performance_commitment",
     "subscription_arrangements",
     "supporting_financing",
     "transaction_classification",
     "transaction_impact",
+    "transaction_commitments",
     "transaction_rationale",
     "transaction_risk"
   ],
@@ -439,7 +442,9 @@
       "labels": [
         "评估与定价",
         "估值与定价",
-        "定价依据"
+        "定价依据",
+        "发行股份的定价依据、定价基准日和发行价格",
+        "发行股份的定价基准日、定价依据和发行价格"
       ],
       "scopes": [
         "restructuring_assets"
@@ -509,7 +514,20 @@
       "labels": [
         "业绩承诺",
         "补偿安排",
-        "业绩补偿"
+        "业绩补偿",
+        "业绩补偿安排"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
+      "key": "transaction_commitments",
+      "description": "重大资产重组相关方作出的重要承诺",
+      "labels": [
+        "本次重组相关方作出的重要承诺",
+        "本次交易相关方作出的重要承诺",
+        "重组相关方作出的重要承诺"
       ],
       "scopes": [
         "restructuring_assets"
@@ -592,7 +610,8 @@
       "scopes": [
         "additional_issuance",
         "rights_issue",
-        "convertible_bond"
+        "convertible_bond",
+        "restructuring_assets"
       ]
     },
     {
@@ -607,7 +626,8 @@
       "scopes": [
         "additional_issuance",
         "rights_issue",
-        "convertible_bond"
+        "convertible_bond",
+        "restructuring_assets"
       ]
     },
     {
@@ -1033,7 +1053,8 @@
       "scopes": [
         "risk_alert",
         "delisting_risk",
-        "performance_forecast"
+        "performance_forecast",
+        "performance_flash"
       ]
     },
     {

@@ -379,6 +379,63 @@ receiving fabricated fallback keys. `make doctor-full` passes migration,
 views/ACLs, raw/Provider/Unit hashes, search coverage, queues, remote MinerU
 canary and orphan checks.
 
+## 2026-08-19 source-bound semantic candidate
+
+The post-front-matter code candidate is provider_unit.v9 / taxonomy r45 / router
+v77; the development database remains on the 805-row provider_unit.v8 / r43 /
+v73 generation until this candidate completes independent review. A DB-free
+full replay of all ten current ProviderDocuments is
+`/private/tmp/disclosure-semantic-route-r45-v77-current-v1.json` (SHA-256
+`16e904829a63005de50766c166437571cb613f459c61e1a0d54e1751e029f50a`).
+It contains 800 Units after the separately reviewed five-cover merge, makes
+zero model calls, and passes the expanded 30/30 source-reviewed route gold.
+
+The candidate changes exactly 86 route records. Three gain direct topics:
+`shareholder_letter` once and `subsidiaries_analysis` twice. Exact structural
+context adds `company_profile` to the combined company-profile chapter,
+`definitions` to its root, and `directors_report` across the accepted board-
+report subtree. The exact financial-instrument-risk context no longer creates
+the unrelated `financial_instruments_policy` direct route; the source-bound
+`business_risk` direct route and both financial-report section routes remain.
+Direct/section/either totals
+move from 373/540/685 to 376/562/691. Content-bearing rows with neither route
+move from 17 to 11; the remaining rows are company/report covers, legal-
+responsibility templates, contact/signature or explicit other/risk-tail text
+and retain title/path/body lexical retrieval instead of receiving placeholder
+keys. The 631/649 live diagnostic and this 11-row source replay are not
+population targets: acceptance remains source accuracy plus graded L2-style
+retrieval, not 100% key fill.
+
+The same taxonomy also adds exact event-section capabilities for definitions,
+performance-compensation descendants and restructuring commitments, plus the
+reviewed `performance_flash` risk-warning and restructuring issue price/size
+scope gaps. All seven held-out source PDFs were re-read from their immutable
+hashes and regenerated under the disposable `/private/tmp` scope after the
+Windows GPU endpoint passed the fixed multimodal canary. The 221-page report
+completed 221/221 pages without the former vLLM MM-cache 500. The exact fresh
+replay is
+`/private/tmp/disclosure-heldout-20260813-r1/heldout-eval-r45-v77-current.json`
+(SHA-256 `f6620d21d9a19c9329b8a51658571dd593ff1db59fab577306d3db81ff914640`):
+821 Units after three lossless cover merges, direct/section/either
+380/634/733, and zero possible model calls because the executable was
+deliberately non-invokable. Relative to the prior 824-row r43/v73 evidence,
+all 821 surviving titles match by source occurrence; only the three mechanical
+cover rows disappear. Seven rows gain an independently witnessed direct topic,
+26 gain exact section context, and their union is 32 rows. The two distinct
+issuance-pricing headings both carry the additive
+`valuation_pricing + issue_price` routes. The source-reviewed held-out gold is
+23/23 (gold SHA-256
+`9f2d2bd5fa0de727a4daa95896aa38f3dfb7df6f7f8e07fec713812b498d1ba2`).
+
+The fresh held-out payload audit finds zero rows without either body text or a
+source title/path, zero deprecated payload type/facet keys, and no fabricated
+fallback route. Of 713 text-bearing Units, 673 have a direct or section route;
+the remaining 40 keep exact lexical title/path/body retrieval. The 108
+non-text Units are structural anchors; one also carries a hash-bound cover
+image and an exact company-name title. Five pairs of identical not-applicable
+note templates remain separate source occurrences on distinct pages; they are
+not duplicate parser runs or invented rows.
+
 ## Accepted NULL semantics
 
 `semantic_keys = NULL` is acceptable only when it remains honest and

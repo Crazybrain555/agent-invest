@@ -44,7 +44,7 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 原文标题仍由 `title` / `heading_path` 保真；该 Unit 内若有回购账户、风险提示等具体事实，只落对应的
 具体 route。没有可确认具体主题时 direct route 保持 NULL，绝不为了填满字段而发明“其他”占位键。
 
-当前身份是 taxonomy `semantic-taxonomy-2026-08-r43`、router `semantic_router.v73`、prompt
+当前候选身份是 taxonomy `semantic-taxonomy-2026-08-r45`、router `semantic_router.v77`、prompt
 `semantic_route_adjudication.v31`，当前候选 adjudicator 为 `codex_cli.v4.low` / `gpt-5.6-luna`；
 候选与 direct route 都最多 8 个。model/effort 与 cache/receipt identity 绑定。定期报告正文/表格也
 可以生成 Unit-local 直接主题候选；章节上下文另走 section_keys，不参与 shortlist。截断时，Unit
@@ -71,6 +71,12 @@ Build 将候选定义、source IDs、裁决来源及模型/cache 身份冻结到
 定义、source 或上下文变化都会改变输入哈希，旧缓存/receipt 必须 fail closed。sidecar 原始字节的
 SHA-256 由 private ProcessingRun 持有；每日 GC 仅在 snapshot owner 与该 hash 同时存在时保护固定
 receipt sibling，失败/WIP 的无主 sidecar 仍可回收。
+
+结构上下文只扩展可复用的精确法定章节，不把普通父标题泛化成业务主题。当前窄集合包括合并式
+“公司简介和主要财务指标”→`company_profile`、标准“董事会报告”→`directors_report`，以及事件件的
+“释义”→`definitions`、“业绩补偿安排”→`performance_commitment`、重组相关方重要承诺→
+`transaction_commitments`。这些键只从已接受 heading path 逐级精确回放；近似标题、正文 contains、
+文档分类和模型都不能制造 section route。父 Unit 若同时拥有直接主题，direct/section 两个维度可并存。
 
 粗 `business_risk` 主题只在定期报告/经营数据公告中由 **Unit 自身**明确含“风险”的标题、同 Unit
 实际正文/表格和合法文类 scope 共同证明；heading-only 锚点不冒充答案，`accounting_policies`

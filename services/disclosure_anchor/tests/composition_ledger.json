@@ -270,7 +270,7 @@
   },
   "tests/unit/test_review_semantic_retrieval_query_eval.py": {
    "private_imports": [],
-   "tests": 9
+   "tests": 10
   },
   "tests/unit/test_review_semantic_route_eval.py": {
    "private_imports": [],
@@ -290,7 +290,7 @@
   },
   "tests/unit/test_semantic_router.py": {
    "private_imports": [],
-   "tests": 104
+   "tests": 112
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],

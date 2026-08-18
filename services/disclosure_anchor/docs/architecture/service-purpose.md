@@ -918,7 +918,8 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - 标题；
 - `asset_id`。
 
-查询面说明：上述键在 `disclosure_public.*_v1` 视图上全部可作谓词（DB 直读满足全集）；
+查询面说明：上述键在适用的版本化 `disclosure_public` 视图上全部可作谓词（新 DB Unit consumer
+使用 `document_units_v2`，弃用的 `document_units_v1` 仅作兼容；DB 直读满足全集）；
 Filing API 首版只暴露其中一部分为查询参数（documents：company_ref / security_code /
 filing_type / report_period / announcement_date_from,to / status；units：payload_kind /
 semantic_key（兼容召回 primary 或 secondary route）/ semantic_keys_any / semantic_keys_all /
@@ -929,13 +930,13 @@ heading_prefix），其余键经 DB 视图直读或后续 API 升版满足。
 
 ## 12.1 Public view 读契约
 
-跨服务读侧只经 `disclosure_public.*_v1` 或等价 Filing API 暴露，不要求下游理解
+跨服务读侧只经适用的版本化 `disclosure_public` 视图或等价 Filing API 暴露，不要求下游理解
 `disclosure_core` / `disclosure_ops` 私有表。
 
 当前 public view 全集（与 `contract-checklist.md` §3 一致）：
 
 ```text
-documents_v1 / document_units_v1 / document_categories_v1 /
+documents_v1 / document_units_v1 / document_units_v2 / document_categories_v1 /
 processing_runs_v1 / source_refs_v1 / change_events_v1 / tracked_companies_v1 /
 unit_search_projection_v1 / unit_body_search_windows_v1 / unit_search_atoms_v1
 ```
@@ -1207,7 +1208,8 @@ L2 收到一个 unit 后负责：
 本文件已对齐 `投研预测引擎顶层框架协议_v0.8.md`，尤其是 §3.10
 对 `disclosure_anchor` 的三点补强：
 
-1. `document_units_v1` 保留 unit 级 scope keys，方便 L2 / MCP / API 检索；
+1. `document_units_v2` 保留当前 unit 级 scope keys，供新 DB L2 consumer 检索；弃用的
+   `document_units_v1` 仅兼容既有 consumer，当前 Filing API 仍为 v1；
 2. 术语已收敛：`document_unit_id → asset_id`、`unit_kind → payload_kind`、outbox
    `event_type → event_kind`；`processing_run` 保留为 `action_log` 的 L1 特化；
 3. change feed 以 `change_events_v1` / `GET /v1/changes` 暴露，区分 observed / materialized。

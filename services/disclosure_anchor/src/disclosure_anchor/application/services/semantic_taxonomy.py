@@ -16,7 +16,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
 )
 
 
-SEMANTIC_TAXONOMY_VERSION = "semantic-taxonomy-2026-08-r43"
+SEMANTIC_TAXONOMY_VERSION = "semantic-taxonomy-2026-08-r45"
 _FINANCIAL_RESOURCE = "semantic_financial_routes.v1.json"
 _EVENT_RESOURCE = "semantic_event_routes.v1.json"
 _PERIODIC_SCOPES = ("annual_report", "semiannual_report", "quarterly_report")
@@ -57,18 +57,18 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
         "version",
     }:
         raise SemanticRouteContractError("event semantic taxonomy fields drift")
-    if financial.get("version") != "semantic-financial-2026-08-r20":
+    if financial.get("version") != "semantic-financial-2026-08-r21":
         raise SemanticRouteContractError("financial semantic taxonomy version drift")
-    if events.get("version") != "semantic-events-2026-08-r31":
+    if events.get("version") != "semantic-events-2026-08-r33":
         raise SemanticRouteContractError("event semantic taxonomy version drift")
     if events.get("fallback_key") != SEMANTIC_FALLBACK_KEY:
         raise SemanticRouteContractError("event semantic fallback key drift")
 
     definitions: list[SemanticRouteDefinition] = []
     raw_keys = financial.get("keys")
-    if not isinstance(raw_keys, dict) or len(raw_keys) != 182:
+    if not isinstance(raw_keys, dict) or len(raw_keys) != 184:
         raise SemanticRouteContractError(
-            "financial semantic taxonomy must contain exactly 182 routes"
+            "financial semantic taxonomy must contain exactly 184 routes"
         )
     financial_containers = _key_set(
         financial.get("exclusive_container_keys"),

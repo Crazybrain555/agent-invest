@@ -145,6 +145,7 @@ def _public_search_rows() -> dict[Identity, dict[str, Any]]:
         )
         SELECT u.provider_document_id,
                u.order_index - 1 AS unit_index,
+               u.contract_version,
                u.content_hash,
                u.query_projection_hash,
                p.title_text,
@@ -152,7 +153,7 @@ def _public_search_rows() -> dict[Identity, dict[str, Any]]:
                concat_ws(' ', p.title_tokens, p.path_tokens, p.body_tokens,
                          windows.window_tokens) AS search_tokens,
                coalesce(atoms.atom_text, '') AS atom_text
-          FROM disclosure_public.document_units_v1 u
+          FROM disclosure_public.document_units_v2 u
           JOIN disclosure_public.unit_search_projection_v1 p USING (asset_id)
           LEFT JOIN windows USING (asset_id)
           LEFT JOIN atoms USING (asset_id)
@@ -714,6 +715,16 @@ def review(
     )
     if set(semantic_rows) != set(search_rows):
         raise ValueError("offline semantic rows and public search rows do not align")
+    invalid_contracts = sorted(
+        identity
+        for identity, row in search_rows.items()
+        if row.get("contract_version") != "document_unit.v2"
+    )
+    if invalid_contracts:
+        raise ValueError(
+            "public search rows are not from document_unit.v2: "
+            f"{invalid_contracts[:5]}"
+        )
     if require_hashes:
         query_mismatches = [
             identity

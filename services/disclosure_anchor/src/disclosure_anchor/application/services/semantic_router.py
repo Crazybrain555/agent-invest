@@ -84,6 +84,13 @@ _PERIODIC_FILING_TYPES = {
 }
 _MODEL_MIN_CANDIDATES = 2
 _MODEL_MAX_CANDIDATES = MAX_SEMANTIC_CANDIDATES
+# Exact structural headings normally cannot corroborate a direct route whose
+# label is only a substring of that context.  The internal-control audit table
+# is the sole source-reviewed exception because it independently reports an
+# opinion; exact company-profile direct and section routes use separate paths.
+_INTENTIONAL_CONTEXT_DIRECT_OVERLAPS = {
+    ("internal_control", "audit_opinion"),
+}
 _OVERVIEW_TITLE_MARKERS = (
     "重要内容提示",
     "重大事项提示",
@@ -468,6 +475,7 @@ class SemanticRouter:
             tag != "other" for tag in classification_scopes
         )
         exact_scoped_matches: dict[str, set[str]] = {}
+        exact_context_matches: dict[str, set[str]] = {}
         contains_scoped_matches: dict[str, set[str]] = {}
         has_unit_content = any(
             source.kind in {"body_text", "table_text"} for source in sources
@@ -534,7 +542,24 @@ class SemanticRouter:
                 definition.key
                 for definition in self.taxonomy.definitions
                 if (
+                    not definition.context_container
+                    and
                     any(
+                        _title_is_exact_field(title_core, label)
+                        for label in self._normalized_labels[definition.key]
+                    )
+                    and (
+                        not definition.scopes
+                        or bool(set(definition.scopes) & classification_scopes)
+                    )
+                )
+            }
+            exact_context_matches[source.source_id] = {
+                definition.key
+                for definition in self.taxonomy.definitions
+                if (
+                    definition.context_container
+                    and any(
                         _title_is_exact_field(title_core, label)
                         for label in self._normalized_labels[definition.key]
                     )
@@ -608,6 +633,16 @@ class SemanticRouter:
                         )
                     elif (
                         source.kind == "unit_title"
+                        and (
+                            not exact_context_matches[source.source_id]
+                            or all(
+                                (context_key, definition.key)
+                                in _INTENTIONAL_CONTEXT_DIRECT_OVERLAPS
+                                for context_key in exact_context_matches[
+                                    source.source_id
+                                ]
+                            )
+                        )
                         and min(len(title_core), len(label)) >= 4
                         and (label in title_core or title_core in label)
                         and (

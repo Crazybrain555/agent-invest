@@ -14,8 +14,10 @@ ownership and safety boundaries.
 
 ## Hard boundaries
 
-1. Write only `disclosure_core` and `disclosure_ops`. Consumers read `disclosure_public.*_v1`, the Filing API,
-   change feed, or explicit source references; no cross-service private-table dependency.
+1. Write only `disclosure_core` and `disclosure_ops`. Consumers read the applicable versioned
+   `disclosure_public` view (`document_units_v2` for new DB Unit consumers; `document_units_v1` only for
+   deprecated compatibility), the current v1 Filing API, the change feed, or explicit source references;
+   no cross-service private-table dependency.
 2. Applied migrations are append-only. Public-view columns, exported contracts, error shapes, CLI/API behavior,
    and migration semantics change together with their tests and canonical checklist.
 3. Runtime files live under `/Volumes/AgentSSD/agent_system/services/disclosure_anchor/`. Paths come from settings
