@@ -14,14 +14,14 @@
     },
     {
       "provider_document_id": "1225460373",
-      "unit_index": 3,
+      "unit_index": 2,
       "title": "一、2026 年7月份销售情况简报",
       "expected_keys": ["price_changes", "sales_volume"],
       "rationale": "正文和表格分别直接给出价格与销量，泛化 operating_metrics 不应重复。"
     },
     {
       "provider_document_id": "1225460373",
-      "unit_index": 5,
+      "unit_index": 4,
       "title": "三、其他提示",
       "expected_keys": [],
       "rationale": "指定媒体和理性投资模板不是独立业务风险事实，应诚实 NULL。"
@@ -98,7 +98,7 @@
     },
     {
       "provider_document_id": "1225231394",
-      "unit_index": 14,
+      "unit_index": 13,
       "title": "4.1 总体经营情况分析",
       "required_keys": ["bank_net_interest_income"],
       "forbidden_keys": ["interest_income"],
@@ -106,14 +106,14 @@
     },
     {
       "provider_document_id": "1225231394",
-      "unit_index": 16,
+      "unit_index": 15,
       "title": "净利息收入",
       "required_keys": ["bank_net_interest_income", "interest_income"],
       "rationale": "标题与正文披露净利息收入，独立表格又列示利息收入列；最长字段去重不能吞掉另一来源的真实主题。"
     },
     {
       "provider_document_id": "1225231394",
-      "unit_index": 22,
+      "unit_index": 21,
       "title": "所有者权益",
       "expected_keys": [
         "foreign_currency_translation",
@@ -124,7 +124,7 @@
     },
     {
       "provider_document_id": "1225231394",
-      "unit_index": 29,
+      "unit_index": 28,
       "title": "4.6 资本充足率",
       "expected_keys": ["bank_capital_adequacy"],
       "rationale": "标题和段落直接披露资本充足率；‘加强资本管理’是改进方向而非第二个独立 Unit 主题，仍须由 lexical 检索命中。"
@@ -161,7 +161,7 @@
     },
     {
       "provider_document_id": "1225067794",
-      "unit_index": 276,
+      "unit_index": 275,
       "title": "第九节 财务报告",
       "expected_keys": [],
       "required_section_keys": ["financial_report_chapter"],
@@ -170,14 +170,14 @@
     },
     {
       "provider_document_id": "1225067794",
-      "unit_index": 292,
+      "unit_index": 291,
       "title": "五、其他信息",
       "forbidden_keys": ["audit_opinion", "financial_statements_section"],
       "rationale": "本节只界定其他信息与财务报表、审计意见的排除范围和注册会计师责任，没有披露财务报表内容或实际审计意见。"
     },
     {
       "provider_document_id": "1225466824",
-      "unit_index": 6,
+      "unit_index": 5,
       "title": "（2）年利息计算",
       "required_keys": ["interest_terms"],
       "forbidden_keys": ["bond_interest_dates"],
@@ -196,14 +196,14 @@
     },
     {
       "provider_document_id": "1225466824",
-      "unit_index": 2,
+      "unit_index": 1,
       "title": "可转换公司债券 2026 年付息的公告",
       "expected_keys": [],
       "rationale": "该 Unit 只有公告标题和真实性保证模板；具体付息条款、日期与对象由后续 Units 承载，避免封面重复路由。"
     },
     {
       "provider_document_id": "1225067794",
-      "unit_index": 102,
+      "unit_index": 101,
       "title": "八、获准许的弥偿条文",
       "expected_keys": ["director_indemnity_insurance"],
       "rationale": "标题和正文直接披露董事弥偿安排及董事、监事责任保险，不应因旧词表缺项而保持 NULL。"

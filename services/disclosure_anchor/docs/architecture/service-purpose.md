@@ -1002,7 +1002,7 @@ order_index
 6 列，至 04R-R7 为 32 列（仅历史基线）。
 
 0008 迁移起，`processing_runs_v1` 投影 `builder_rules_version`，用于确定性 Unit builder 归因；
-历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 当前必须等于 `provider_unit.v8`。
+历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 当前必须等于 `provider_unit.v9`。
 
 0031 迁移起，`processing_runs_v1` 只额外暴露不透明的
 `artifact_owner_processing_run_id`：parse run 指向自身，`rebuild_units` 指向实际拥有

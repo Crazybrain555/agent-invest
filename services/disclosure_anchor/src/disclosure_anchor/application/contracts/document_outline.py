@@ -293,8 +293,15 @@ class DocumentOutline:
             unit_heading = heading_by_id.get(unit.heading_id)
             if unit_heading is None:
                 raise ValueError("coarse unit references an unknown heading")
-            if unit.block_source_indices[0] != unit_heading.source_index:
-                raise ValueError("headed unit must begin with its heading block")
+            if unit_heading.source_index not in unit.block_source_indices:
+                raise ValueError("headed unit does not contain its heading block")
+            if (
+                unit.block_source_indices[0] != unit_heading.source_index
+                and unit.unit_index != 0
+            ):
+                raise ValueError(
+                    "only the first headed unit may retain leading source blocks"
+                )
             if (
                 unit.title != unit_heading.text
                 or unit.headpath != unit_heading.headpath

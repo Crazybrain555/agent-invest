@@ -134,7 +134,7 @@
   },
   "tests/unit/test_document_outline.py": {
    "private_imports": [],
-   "tests": 46
+   "tests": 48
   },
   "tests/unit/test_download_document.py": {
    "private_imports": [],
@@ -236,7 +236,7 @@
   },
   "tests/unit/test_provider_unit_builder.py": {
    "private_imports": [],
-   "tests": 27
+   "tests": 28
   },
   "tests/unit/test_provider_unit_evidence.py": {
    "private_imports": [],

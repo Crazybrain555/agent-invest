@@ -4,7 +4,7 @@ project: disclosure_anchor
 title: 文件脉络与标题层级边界
 status: implemented
 revised_at: 2026-08-12
-depends_on: provider_document.v1、provider_unit.v8、06R 检索投影
+depends_on: provider_document.v1、provider_unit.v9、06R 检索投影
 ---
 
 # 文件脉络与标题层级边界
@@ -45,7 +45,10 @@ accepted candidate 按 reading order 用单调栈生成 parent 与完整 headpat
 也不得使可靠 plain-numbered parent 出栈。无编号弱标题仅在紧邻 provider source block 明确从同族
 ordinal one 重启时退出已完成 subgroup；较远或只是变小的 ordinal 保持原父级。
 
-每个 accepted heading 开一个 coarse Unit；文首内容进入无标题 preamble Unit。registered
+每个 accepted heading 开一个 coarse Unit；文首内容默认进入无标题 preamble Unit。只有同页、位于首个
+heading 之前、且全部是闭合集合内的证券/债券代码与简称、公告编号或无文字 hash-bound 图像时，
+这些机械封面块并入首个有标题 Unit；源 block、搜索文本、图像 digest 与顺序全部保留，未知标签、
+句式正文、跨页前言仍保持独立 preamble。registered
 document title 不进入 Unit title/headpath。demoted candidate 仍按普通 body 保存。
 
 ## 4. document_outline_v1

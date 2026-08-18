@@ -36,7 +36,7 @@ SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS = frozenset(
         PROVIDER_UNIT_LOCATOR_VERSION,
     }
 )
-PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v8"
+PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v9"
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 

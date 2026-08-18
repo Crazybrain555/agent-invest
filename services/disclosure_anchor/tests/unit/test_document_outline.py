@@ -42,6 +42,58 @@ class DocumentOutlineTest(unittest.TestCase):
         self.assertEqual(outline.units[0].block_source_indices, (0,))
         self.assertEqual(outline.units[1].block_source_indices, (1, 2))
 
+    def test_same_page_exchange_identity_preamble_joins_first_heading(self) -> None:
+        document = _document(
+            _block(0, "证券代码：002714", annotation="paragraph"),
+            _block(1, "证券简称：牧原股份", annotation="paragraph"),
+            _block(2, "公告编号：2026-067", annotation="paragraph"),
+            _block(3, "2025年度报告", annotation="title", level=1),
+            _block(4, "报告正文", annotation="paragraph"),
+        )
+
+        outline = build_document_outline(document)
+
+        self.assertEqual(len(outline.units), 1)
+        self.assertEqual(outline.units[0].title, "2025年度报告")
+        self.assertEqual(outline.units[0].block_source_indices, (0, 1, 2, 3, 4))
+
+    def test_unknown_or_cross_page_front_matter_remains_a_preamble(self) -> None:
+        unknown = build_document_outline(
+            _document(
+                _block(0, "证券代码相关说明：详见正文", annotation="paragraph"),
+                _block(1, "2025年度报告", annotation="title", level=1),
+            )
+        )
+        sentence_value = build_document_outline(
+            _document(
+                _block(
+                    0,
+                    "证券代码：002714；本公告以交易所披露为准",
+                    annotation="paragraph",
+                ),
+                _block(1, "2025年度报告", annotation="title", level=1),
+            )
+        )
+        cross_page = build_document_outline(
+            _paged_document(
+                (_block(0, "证券代码：002714", annotation="paragraph"),),
+                (_block(1, "2025年度报告", annotation="title", level=1),),
+            )
+        )
+
+        self.assertEqual(
+            [unit.block_source_indices for unit in unknown.units],
+            [(0,), (1,)],
+        )
+        self.assertEqual(
+            [unit.block_source_indices for unit in sentence_value.units],
+            [(0,), (1,)],
+        )
+        self.assertEqual(
+            [unit.block_source_indices for unit in cross_page.units],
+            [(0,), (1,)],
+        )
+
     def test_source_bound_hint_can_admit_provider_missed_title(self) -> None:
         document = _document(
             _block(0, "文档总标题", annotation="paragraph"),

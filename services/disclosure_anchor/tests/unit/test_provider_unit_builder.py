@@ -232,6 +232,76 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         self.assertNotIn("relative_path", encoded)
         self.assertNotIn("raw_item_json", encoded)
 
+    def test_cover_identity_and_logo_join_first_titled_unit_without_loss(
+        self,
+    ) -> None:
+        artifact = ProviderArtifact(
+            role="cover_logo",
+            relative_path="e_images/logo.jpg",
+            sha256="sha256:" + "f" * 64,
+            size_bytes=8505,
+            media_type="image/jpeg",
+        )
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "A股简称：示例公司"),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "A 股代码：600001"),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "image",
+                        (ProviderPayload("content", None, ""),),
+                        annotation="image",
+                        artifact_roles=(artifact.role,),
+                    ),
+                    _block(
+                        3,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "2025年度报告"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                ),
+            ),
+            segments=(),
+            extra_artifacts=(artifact,),
+        )
+
+        result = build_provider_units(_admitted(document))
+
+        self.assertEqual(len(result.units), 1)
+        unit = result.units[0]
+        self.assertEqual(unit.title, "2025年度报告")
+        self.assertEqual(unit.heading_path, ("2025年度报告",))
+        self.assertEqual(unit.payload_kind, "mixed")
+        self.assertEqual(
+            [part.kind for part in unit.locator.parts],
+            ["text", "text", "visual"],
+        )
+        self.assertEqual(
+            [binding.source.source_index for binding in unit.locator.search_targets],
+            [0, 1, 3],
+        )
+        self.assertEqual(
+            [item.sha256 for item in unit.locator.evidence_artifacts],
+            [artifact.sha256],
+        )
+        self.assertIn(artifact.sha256, json.dumps(unit.payload, ensure_ascii=False))
+
     def test_applicability_is_unit_local_explicit_and_hash_bound(self) -> None:
         document = _document(
             pages=(
@@ -400,7 +470,7 @@ class ProviderUnitBuilderTests(unittest.TestCase):
 
         expected_identities = {(row[0], row[1]) for row in expected}
         ordinary_identities = {(row[0], row[1]) for row in ordinary_text_null}
-        self.assertEqual(gold["source_active_unit_count"], 805)
+        self.assertEqual(gold["source_active_unit_count"], 800)
         self.assertEqual(len(expected), 55)
         self.assertEqual(len(expected_identities), 55)
         self.assertEqual(

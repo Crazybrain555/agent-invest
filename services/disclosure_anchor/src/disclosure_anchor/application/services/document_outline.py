@@ -71,6 +71,12 @@ _REPEATED_HEADER_BBOX_TOLERANCE = 4.0
 _NORMALIZED_PAGE_AXIS = 1_000.0
 _STALE_NUMBERED_PARENT_MIN_PAGE_GAP = 8
 _CONTINUATION_MARKER_RE = re.compile(r"(?:^|[\s（(\-—–])续[）)]?\s*$")
+_FRONT_MATTER_IDENTITY_LABEL_RE = re.compile(
+    r"(?:公司|证券|股票|债券|可转债|[ABH]\s*股|优先股)\s*(?:代码|简称)"
+    r"|公告编号"
+)
+_FRONT_MATTER_IDENTITY_VALUE_MAX_CHARS = 40
+_FRONT_MATTER_IDENTITY_SENTENCE_MARKS = frozenset("。；;！？!?：:")
 
 
 def build_document_outline(
@@ -1317,11 +1323,80 @@ def _coarse_units(
     for block in document.blocks:
         heading = heading_by_source.get(block.source_index)
         if heading is not None:
-            flush()
+            if not _mergeable_leading_front_matter(
+                document,
+                pending_indices=tuple(pending_indices),
+                heading=heading,
+                has_prior_units=bool(units),
+                pending_heading=pending_heading,
+            ):
+                flush()
             pending_heading = heading
         pending_indices.append(block.source_index)
     flush()
     return tuple(units)
+
+
+def _mergeable_leading_front_matter(
+    document: ProviderDocument,
+    *,
+    pending_indices: tuple[int, ...],
+    heading: ResolvedHeading,
+    has_prior_units: bool,
+    pending_heading: ResolvedHeading | None,
+) -> bool:
+    """Attach only same-page mechanical cover carriers to the first heading.
+
+    A logo or exchange identity line has no useful standalone retrieval
+    boundary, but it remains source content and evidence.  Merging it into the
+    first titled Unit preserves every block and artifact without inventing a
+    title or deleting the carrier.  Any substantive text, unknown label, page
+    boundary, or prior Unit keeps the ordinary leading preamble.
+    """
+
+    if (
+        not pending_indices
+        or has_prior_units
+        or pending_heading is not None
+    ):
+        return False
+    blocks = tuple(document.blocks[index] for index in pending_indices)
+    if any(block.page_index != heading.page_index for block in blocks):
+        return False
+    return all(_is_mechanical_front_matter_block(block) for block in blocks)
+
+
+def _is_mechanical_front_matter_block(block: ProviderBlock) -> bool:
+    nonblank_payloads = tuple(
+        payload.text.strip() for payload in block.payloads if payload.text.strip()
+    )
+    if block.referenced_artifact_roles and not nonblank_payloads:
+        return True
+    return bool(nonblank_payloads) and all(
+        _is_exchange_identity_text(text) for text in nonblank_payloads
+    )
+
+
+def _is_exchange_identity_text(text: str) -> bool:
+    """Accept a complete sequence of closed exchange identity label/value pairs."""
+
+    normalized = " ".join(text.split())
+    labels = tuple(_FRONT_MATTER_IDENTITY_LABEL_RE.finditer(normalized))
+    if not labels or normalized[: labels[0].start()].strip():
+        return False
+    for index, label in enumerate(labels):
+        value_start = label.end()
+        if value_start >= len(normalized) or normalized[value_start] not in {":", "："}:
+            return False
+        value_end = labels[index + 1].start() if index + 1 < len(labels) else len(normalized)
+        value = normalized[value_start + 1 : value_end].strip()
+        if (
+            not value
+            or len(value) > _FRONT_MATTER_IDENTITY_VALUE_MAX_CHARS
+            or any(mark in value for mark in _FRONT_MATTER_IDENTITY_SENTENCE_MARKS)
+        ):
+            return False
+    return True
 
 
 __all__ = ["build_document_outline"]
