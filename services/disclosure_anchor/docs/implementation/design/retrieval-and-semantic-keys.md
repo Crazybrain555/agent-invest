@@ -176,7 +176,7 @@ L2 复制 L1 私有 JSON；它不创建第二套 registry。
 - active historical v4 run 不进入新投影候选；
 - parent/window/atom 的 run-atomic replacement、orphan prune 与 PostgreSQL safety probe。
 
-805-Unit 的完整 source-identity 数据质量结果见
+当前 800-Unit 的完整 source-identity 数据质量结果见
 [`semantic-route-pilot-20260813.md`](../checks/semantic-route-pilot-20260813.md)。覆盖率只作诊断；
 unsupported narrow key 是 stop，而有证据缺口的 NULL 是允许的保守结果。
 

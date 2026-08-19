@@ -1,18 +1,18 @@
 # Semantic route and retrieval pilot — 2026-08-13
 
-This receipt distinguishes the current source-identity candidate from the last
-committed development baseline. The development database is now at migration
-0038 and all ten active Documents publish provider_unit.v8 / taxonomy r43 /
-router v73. The same current bytes were replayed DB-free over the ten immutable
-Provider documents and seven held-out documents, then exercised through the
-live Build/Publish/Search path without resetting parse or Provider artifacts.
-Historical r37 receipts remain below only as comparison evidence.
+This receipt distinguishes the current source-identity generation from the
+historical development baselines retained below. The development database is
+at migration 0038 and all ten active Documents publish provider_unit.v9 /
+taxonomy r45 / router v77. The same current bytes were replayed DB-free over the
+ten immutable Provider documents and seven held-out documents, then exercised
+through the live Build/Publish/Search path without resetting parse or Provider
+artifacts. Historical r37/r43 receipts remain only as comparison evidence.
 
 ## Current contract
 
-- taxonomy: `semantic-taxonomy-2026-08-r43`, containing 182 financial and
-  122 event routes;
-- router: `semantic_router.v73`;
+- taxonomy: `semantic-taxonomy-2026-08-r45`, containing 184 financial and
+  123 event routes;
+- router: `semantic_router.v77`;
 - optional adjudicator: `codex_cli.v4.low`, `gpt-5.6-luna`, prompt
   `semantic_route_adjudication.v31`;
 - `semantic_keys` contains direct Unit topics only; `semantic_key` is its
@@ -42,41 +42,42 @@ group.
 ## Full-corpus replay
 
 The current replay covers every active Unit in ten in-scope filings, including
-one full 687-Unit annual report. It is a cross-shape development corpus, not a
+one full 686-Unit annual report. It is a cross-shape development corpus, not a
 statistical claim about 5,000 issuers.
 
 | filing type | Units | direct route | section route | either |
 |---|---:|---:|---:|---:|
-| annual_report | 687 | 274 | 518 | 585 |
-| quarterly_report | 47 | 40 | 21 | 41 |
-| convertible_bond | 17 | 13 | 0 | 13 |
+| annual_report | 686 | 277 | 540 | 591 |
+| quarterly_report | 46 | 40 | 21 | 41 |
+| convertible_bond | 16 | 13 | 0 | 13 |
 | equity_incentive | 14 | 14 | 1 | 14 |
 | share_buyback | 19 | 18 | 0 | 18 |
 | performance_forecast | 10 | 7 | 0 | 7 |
-| operating_data | 6 | 3 | 0 | 3 |
-| performance_briefing | 3 | 2 | 0 | 2 |
+| operating_data | 5 | 3 | 0 | 3 |
+| performance_briefing | 2 | 2 | 0 | 2 |
 | investor_relations | 1 | 1 | 0 | 1 |
 | correction_supplement | 1 | 1 | 0 | 1 |
-| **total** | **805** | **373** | **540** | **685** |
+| **total** | **800** | **376** | **562** | **691** |
 
-Decision sources are 373 deterministic, 142 deterministic rule abstentions,
-and 290 no-candidate fallbacks. Direct route cardinality is: 432 zero, 344 one,
-22 two, three three, one four, one five, and two seven.
-No Unit exceeds the eight-route cap. Section cardinality is 265 zero, 242 one,
-and 298 two.
+Decision sources are 376 deterministic, 137 deterministic rule abstentions,
+and 287 no-candidate fallbacks. Direct route cardinality is: 424 zero, 348 one,
+21 two, three three, one four, one five, and two seven. No Unit exceeds the
+eight-route cap. Section cardinality is 238 zero, 207 one, 350 two, and five
+three.
 
 The current DB-free replay completed with zero calls and zero model tokens.
-Convertible-bond `1225466824/u6`, “（2）年利息计算”, is now routed by a canonical
-regulatory subheading rather than a model. The final reviewed replay is
-`/private/tmp/disclosure-semantic-route-r43-v73-current-chash-20260816.json`
-(SHA-256 `d1de1652e2e9963c275be3cedb4503fd9dffd58d3ad2dd07d6b84cf523b9b3f4`).
+The final reviewed replay is
+`/private/tmp/disclosure-semantic-route-r45-v77-post-pro-p2-current.json`
+(SHA-256 `0d5df1f520120314d3e4d8009ba670e839454805a0be8c410ba73c8aa2969098`).
 It is session evidence, not a tracked production artifact. Zero calls prove
 that this corpus does not depend on the optional adapter; they do not by
 themselves qualify that adapter for a future truly ambiguous Unit.
-Because calls and tokens are zero, all 373 direct routes are deterministic and
-the configured dormant adapter identity changes no Unit row. All 805 rows carry
-their source-rebuilt `query_projection_hash`; route/title/path fields are exact-
-equal to the earlier v71 replay without that receipt field.
+Because calls and tokens are zero, all 376 direct routes are deterministic and
+the configured dormant adapter identity changes no Unit row. All 800 rows carry
+their source-rebuilt `query_projection_hash` and match the current live
+generation exactly.
+
+## Historical r43/r37 comparison evidence
 
 Relative to the published r37 baseline, r43/v73 treats direct routes as
 bounded Unit-local topics rather than realized-fact assertions. History, risk,
@@ -379,62 +380,63 @@ receiving fabricated fallback keys. `make doctor-full` passes migration,
 views/ACLs, raw/Provider/Unit hashes, search coverage, queues, remote MinerU
 canary and orphan checks.
 
-## 2026-08-19 source-bound semantic candidate
+## 2026-08-19 current live generation
 
-The post-front-matter code candidate is provider_unit.v9 / taxonomy r45 / router
-v77; the development database remains on the 805-row provider_unit.v8 / r43 /
-v73 generation until this candidate completes independent review. A DB-free
-full replay of all ten current ProviderDocuments is
-`/private/tmp/disclosure-semantic-route-r45-v77-current-v1.json` (SHA-256
-`16e904829a63005de50766c166437571cb613f459c61e1a0d54e1751e029f50a`).
-It contains 800 Units after the separately reviewed five-cover merge, makes
-zero model calls, and passes the expanded 30/30 source-reviewed route gold.
+The reviewed provider_unit.v9 / taxonomy r45 / router v77 bytes are committed
+as `276be7e` and published through the actual Build/Publish/Search path for all
+ten development Documents. DB-free replay
+`/private/tmp/disclosure-semantic-route-r45-v77-post-pro-p2-current.json`
+(SHA-256 `0d5df1f520120314d3e4d8009ba670e839454805a0be8c410ba73c8aa2969098`)
+contains 800 Units, makes zero model calls, and passes the 30/30 direct-route
+gold. Live audit
+`/private/tmp/disclosure-live-unit-audit-r45-v77-v9-20260819.json`
+(SHA-256 `9aac1ef4287b3bd9dca4c0c976fed1bc2097384d7cb4439941d655840f534037`)
+matches all 800 source identities and every title, heading path, direct key,
+section key, content hash and query hash with zero differences.
 
-The candidate changes exactly 86 route records. Three gain direct topics:
-`shareholder_letter` once and `subsidiaries_analysis` twice. Exact structural
-context adds `company_profile` to the combined company-profile chapter,
-`definitions` to its root, and `directors_report` across the accepted board-
-report subtree. The exact financial-instrument-risk context no longer creates
-the unrelated `financial_instruments_policy` direct route; the source-bound
-`business_risk` direct route and both financial-report section routes remain.
-Direct/section/either totals
-move from 373/540/685 to 376/562/691. Content-bearing rows with neither route
-move from 17 to 11; the remaining rows are company/report covers, legal-
-responsibility templates, contact/signature or explicit other/risk-tail text
-and retain title/path/body lexical retrieval instead of receiving placeholder
-keys. The 631/649 live diagnostic and this 11-row source replay are not
-population targets: acceptance remains source accuracy plus graded L2-style
-retrieval, not 100% key fill.
+The live distribution is direct/section/either 376/562/691. There are 648
+content-bearing and 152 heading-only Units. Exactly 11 content-bearing Units
+have neither direct nor section routes; manual row review classifies them as
+company/report covers, legal-responsibility templates, contact/signature or
+explicit other/risk-tail text. They retain exact title/path/body lexical
+retrieval instead of receiving a placeholder key. All 98 remaining no-route
+Units are source-bound structural anchors. The database has no Unit whose
+title, heading path, payload text and content artifact are all empty, and no
+artifact-only Unit without a title or heading path. Payloads contain zero
+deprecated `provider_type`, `semantic_type`, nested `kind`, publisher/market
+or Document-category fields.
 
-The same taxonomy also adds exact event-section capabilities for definitions,
-performance-compensation descendants and restructuring commitments, plus the
-reviewed `performance_flash` risk-warning and restructuring issue price/size
-scope gaps. All seven held-out source PDFs were re-read from their immutable
-hashes and regenerated under the disposable `/private/tmp` scope after the
-Windows GPU endpoint passed the fixed multimodal canary. The 221-page report
-completed 221/221 pages without the former vLLM MM-cache 500. The exact fresh
-replay is
-`/private/tmp/disclosure-heldout-20260813-r1/heldout-eval-r45-v77-current.json`
-(SHA-256 `f6620d21d9a19c9329b8a51658571dd593ff1db59fab577306d3db81ff914640`):
-821 Units after three lossless cover merges, direct/section/either
-380/634/733, and zero possible model calls because the executable was
-deliberately non-invokable. Relative to the prior 824-row r43/v73 evidence,
-all 821 surviving titles match by source occurrence; only the three mechanical
-cover rows disappear. Seven rows gain an independently witnessed direct topic,
-26 gain exact section context, and their union is 32 rows. The two distinct
-issuance-pricing headings both carry the additive
-`valuation_pricing + issue_price` routes. The source-reviewed held-out gold is
-23/23 (gold SHA-256
-`9f2d2bd5fa0de727a4daa95896aa38f3dfb7df6f7f8e07fec713812b498d1ba2`).
+The active search projection has 800 parents, eight body windows and 25,955
+atoms. The tracked 18-query v4 gold (SHA-256
+`52a379bec3a5c05b8e3a44e0f64e63fd31b86b8b20abc033e9120e396aad6151`)
+binds 138 reviewed Unit identities to both content and query hashes. Live
+receipt `/private/tmp/disclosure-semantic-retrieval-query-r45-v77-v9-post-cleanup.json`
+(SHA-256 `828c27ea3bf65bc3f9802c06ac33de210f1c7002d809b7b275e2fdaaf7a8416b`)
+passes with Success@5 1.00, grade-3 Recall@20 1.00, grade>=2 Recall@10/20
+0.905247/0.961420, nDCG@10 0.886143, narrow returned-precision@5 1.00,
+broad returned-precision@10 0.816667, no grade-0 top-five result and no
+mechanical top-ten carrier.
 
-The fresh held-out payload audit finds zero rows without either body text or a
-source title/path, zero deprecated payload type/facet keys, and no fabricated
-fallback route. Of 713 text-bearing Units, 673 have a direct or section route;
-the remaining 40 keep exact lexical title/path/body retrieval. The 108
-non-text Units are structural anchors; one also carries a hash-bound cover
-image and an exact company-name title. Five pairs of identical not-applicable
-note templates remain separate source occurrences on distinct pages; they are
-not duplicate parser runs or invented rows.
+The user-authorized development cleanup removed 4,830 inactive Unit rows,
+50 inactive rebuild runs, 60 obsolete Unit snapshot directories and their
+Unit/publish outbox history. It preserved all ten raw PDFs, ten root parse runs,
+ProviderDocument records, parser bundles, ten active rebuild runs and 800
+current Units. Post-cleanup state is 20 runs and 800/800 active Units with zero
+inactive Units; `make doctor-full` passes every database, source, artifact,
+search, queue, canary and orphan check. Receipt:
+`/private/tmp/disclosure-v9-unit-history-cleanup-receipt.json`.
+
+All seven held-out source PDFs were also regenerated after the Windows GPU
+multimodal canary passed; the 221-page report completed 221/221 pages without
+the former MM-cache 500. Final held-out replay
+`/private/tmp/disclosure-heldout-20260813-r1/heldout-eval-r45-v77-post-pro-p2.json`
+(SHA-256 `e75e1c618a9f545d0a9971b2c62ef36e02937d338b27a3774e246f69c3059e92`)
+has 821 Units, direct/section/either 380/634/733, zero model calls and gold
+23/23. Visual PDF review retains two disclosed P2 hierarchy nuances instead of
+adding risky paragraph-title heuristics: a restructuring list whose numbered
+subsections lost provider title typing, and repeated not-applicable financial-
+note selectors under weak unnumbered parents. Their body/table/search content
+is intact and source occurrences remain distinct.
 
 ## Accepted NULL semantics
 
@@ -459,10 +461,10 @@ introduces `document_units_v2` without the field. Content-bearing Units must not
 be used to fabricate a missing provider category; their retrieval support comes
 from the direct/section/lexical surfaces above.
 
-The same audit finds 156 `{"text": ""}` payloads. All 156 are heading-only
+The current audit finds 152 `{"text": ""}` payloads. All 152 are heading-only
 Units with a non-NULL title, nonempty hash-bound heading chain and nonempty
 title search tokens; none is a body block silently replaced by an empty value.
-Of those, 102 are intentionally lexical-only because neither a direct nor a
+Of those, 98 are intentionally lexical-only because neither a direct nor a
 section route is honestly supported.
 
 ## Remaining production gates
@@ -477,7 +479,7 @@ section route is honestly supported.
   explicit upstream quality limit. Broadening native-PDF repair to nonnumeric
   drift requires a new source-bound contract and cross-document evidence; it
   is not authorized by these samples.
-- The r43/v73 source replays, live Build/Publish/Search generation, graded
-  query review, row audit, scratch migration and doctor are complete. The
-  exact-current independent review, final repository gate and user visual
-  acceptance remain before commit/push or any production-readiness claim.
+- The r45/v77 source replays, live Build/Publish/Search generation, graded
+  query review, row audit, development-history cleanup and doctor are complete.
+  A final repository gate, post-documentation independent review and user
+  visual acceptance remain before any production-readiness claim.
