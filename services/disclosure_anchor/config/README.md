@@ -132,63 +132,48 @@ vLLM running/waiting/KV 与 GPU exporter 的真实 compute utilization 始终分
 UUID 绑定的 nvidia-smi exporter，Linux 可使用 DCGM，未配置时不得用 KV cache 代替 GPU 占用。
 探针失败还区分 `endpoint_unreachable` 与 `metric_contract_unsatisfied`，便于告警和升级处置。
 
-默认 `config/watchlist.csv` 是 `research_priority_universe` 的 1,463 行部署快照；
-`config/watchlist-screen.v1.json` 把它绑定到冻结的公开 screen hash、抓取回执 hash、显式硬门槛、
-排除计数和有序 membership hash。它是研究优先级 universe，不是投资推荐或收益排序；审计意见、
+默认 `config/watchlist.csv` 是 1,463 行的
+`a_share_research_priority.v11-candidate.phase1` 部署候选；精确 Pro 结论是 `STOP`、
+`best attainable phase-1 candidate / still not GO`，不能把它表述成已经证明的“未来最优”股票池。
+`config/watchlist-screen.v1.json` 是部署侧 sidecar；CSV 注释里的 `watchlist-v11-manifest.json` 是
+Pro 原始附件的逻辑文件名，两者字节完全相同。sidecar 把 CSV 绑定到 5,548 行全量审计、显式硬门槛、
+排除计数、CSV hash 和有序 membership hash。它是研究优先级 universe，不是投资推荐或收益排序；审计意见、
 处罚历史、长期流动性、管理层诚信、治理评分、会计重述风险、前瞻一致预期、行业空间/催化剂、
 估值和价格动量目前均明确标记为未覆盖。所有信号都来自已经实现的后视年度会计数据，未做行业
 周期调整；当前成分股快照也不是 point-in-time 数据，不能据此做无偏历史回测。
-当前 `a_share_research_priority.v10` 只覆盖沪主板、深主板、科创板、创业板；板块身份取自完整
+V11 候选只覆盖沪主板、深主板、科创板、创业板；板块身份取自完整
 CNINFO 行的 `F004V`，BSE/NEEQ 不进入默认研究池，但通用 tracking contract 仍可正确表达 BSE。
 约 1,500 是首轮研究资源规模，不是强行补齐的名额。上市日须不晚于 2023-02-23，按 2026-08-23
-冻结时点留足 42 个自然月；市值至少 20 亿元，2025 归母净利润须为正、每股净资产不低于 1 元，
-三年利润/营收/加权 ROE 均须完整，三个年度中至少两个归母净利为正，且 2025 加权 ROE 不低于
-5%。通过基础硬门后，还须至少满足一种未来研究
-路径：2023→2025 营收复合增速不低于 5%、归母净利复合增速不低于 10%、2024→2025 归母净利
-增速不低于 10%、三年平均 ROE 不低于 15%且营收/利润复合增速均不低于 2%的质量复利，或最近
-一年从非正利润转正（较早转正则最新利润不得回落）且 2025 ROE 不低于 8%的盈利拐点。利润 CAGR
-和最近一年利润增长还要求各自基期净利率不低于 1%，避免极小利润基数制造虚假高增速。当日
-`trade=0` 可能只是停牌，不作为质量门槛；总市值不参与未来潜力 membership 或证据排序。阈值
-自然产生 1,463 家，必须落在 1,400–1,600 的人工复审闸门内，禁止为卡死 1,500 强制补入。
+冻结时点留足 42 个自然月；市值至少 20 亿元，并要求正常 A 股状态、非风险警示、非定义中的持续
+亏损。通过硬门后按财务质量、增长、现金质量、行业策略和异常惩罚进行确定性 Decimal 评分；阈值
+自然产生 1,463 家并落在 1,400–1,600 的人工复审闸门内，禁止为卡死 1,500 强制补入。
 A/B/C 只是入选证据强度分层和确定性审计展示顺序；CSV 导入数据库后所有成员地位相同，行序不是
-运行时调度优先级。规则对象必须逐字段精确匹配 v10，不能只改
+运行时调度优先级。规则对象必须逐字段精确匹配 V11 phase-1，不能只改
 说明而继续沿用同一规则版本。
 
-1% 基期净利率门槛会让结构性薄利行业更难仅凭“利润增长”路径入选；营收增长路径不受该门槛
-影响。这是已接受的通用质量偏置，不等于行业判断。最近一年同比增长也允许尚未完全恢复到 2023
-利润水平的周期修复公司：V10 中 144 家仅靠该信号入选，其中 87 家 2025 利润仍低于 2023；它们
-属于值得进一步研究的恢复候选，不应把这条后视信号当成已经证明的长期增长。
+V10 的后视信号门槛和生成器仍保留作历史兼容与测试基线，但不再描述默认部署池，也不能用其输出
+与当前 `config/watchlist.csv` / `config/watchlist-screen.v1.json` 做相等比较。
 
-已冻结 source bundle 的机械重建命令（不联网、不读数据库）是：
+V11 默认候选的部署字节与完整审计证据检查（不联网、不读数据库）是：
 
 ```bash
-WATCHLIST_SOURCE_ROOT="$DISCLOSURE_DATA_ROOT/evidence/watchlist/a_share_research_priority.v3/2026-08-23/sources"
-WATCHLIST_V10_ROOT="$DISCLOSURE_DATA_ROOT/evidence/watchlist/a_share_research_priority.v10/2026-08-23"
-WATCHLIST_REBUILD_ROOT="$(mktemp -d)"
-.venv/bin/python scripts/assemble_research_watchlist_screen.py \
-  --source-root "$WATCHLIST_SOURCE_ROOT" \
-  --source-evidence-relpath watchlist/a_share_research_priority.v3/2026-08-23/sources \
-  --output "$WATCHLIST_REBUILD_ROOT/public-a-share-screen-input.v10.json"
-.venv/bin/python scripts/build_research_watchlist.py \
-  --input "$WATCHLIST_REBUILD_ROOT/public-a-share-screen-input.v10.json" \
-  --fetch-receipt "$WATCHLIST_SOURCE_ROOT/source-fetch-receipt.json" \
-  --screen-evidence-relpath watchlist/a_share_research_priority.v10/2026-08-23/public-a-share-screen-input.v10.json \
-  --fetch-receipt-evidence-relpath watchlist/a_share_research_priority.v3/2026-08-23/sources/source-fetch-receipt.json \
-  --out "$WATCHLIST_REBUILD_ROOT/watchlist.csv" \
-  --manifest-out "$WATCHLIST_REBUILD_ROOT/watchlist-screen.v1.json"
-cmp "$WATCHLIST_REBUILD_ROOT/public-a-share-screen-input.v10.json" "$WATCHLIST_V10_ROOT/public-a-share-screen-input.v10.json"
-cmp "$WATCHLIST_REBUILD_ROOT/watchlist.csv" config/watchlist.csv
-cmp "$WATCHLIST_REBUILD_ROOT/watchlist-screen.v1.json" config/watchlist-screen.v1.json
+WATCHLIST_V11_ROOT="$DISCLOSURE_DATA_ROOT/evidence/watchlist/a_share_research_priority.v11-candidate.phase1/2026-08-23"
+cmp config/watchlist.csv "$WATCHLIST_V11_ROOT/watchlist-v11-candidate.csv"
+cmp config/watchlist-screen.v1.json "$WATCHLIST_V11_ROOT/watchlist-v11-manifest.json"
+shasum -a 256 \
+  config/watchlist.csv \
+  config/watchlist-screen.v1.json \
+  "$WATCHLIST_V11_ROOT/watchlist-v11-selection-audit.csv" \
+  "$WATCHLIST_V11_ROOT/generate_watchlist_v11_candidate.py"
 make config-check
 ```
 
 `make config-check` 校验 Git CSV 与 sidecar 的闭合形状、规则/限制、CSV hash、membership hash、数量、
-exchange 和日期，但不会读取 42MB 的冻结 screen。`selected_board_counts`、证据层计数、最低市值及
-hard-gate 统计由 screen 和独立全量审计证明，不能把 config-check 单独理解为原始数据复算。排除原因
-是可重叠多标签，计数不能相加当作公司数；`no_future_research_signal` 只在一家公司已经通过全部
-基础硬门后才记录。完整来源/投影证明必须运行上述三项 `cmp` 和独立逐行审计。
+exchange、board、日期、市值下限、5,548 行审计闭合与 V10 变更计数，但不会重新执行归档的 Pro
+生成器。完整来源/投影证明必须运行上述 `cmp`、核对四个已固定 SHA，并检查完整 selection audit；
+不能把 `config-check` 单独理解为前瞻治理和行业证据已经补齐。
 
-两条生成命令都使用 mode 0444 的 new-only 输出。若要刷新公开来源，必须先把新日期目录作为独立目标运行
+历史 V10 的 assemble/build 脚本都使用 mode 0444 的 new-only 输出。若要刷新公开来源，必须先把新日期目录作为独立目标运行
 `scripts/fetch_research_watchlist_inputs.py --output <new-sources-dir>`，再人工核验完整来源回执；不能覆盖
 当前冻结证据，也不能在一次“重建”里静默联网换观察时点。
 

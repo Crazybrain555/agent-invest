@@ -46,6 +46,7 @@ from disclosure_anchor.adapters.parsers.pdf_text_observation import (
 )
 from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     MinerUDeploymentChecker,
+    MinerUDeploymentUnavailableError,
 )
 from disclosure_anchor.adapters.runtime.worker_progress import (
     append_worker_progress,
@@ -80,6 +81,7 @@ from disclosure_anchor.application.worker.locks import WORKER_NS
 from disclosure_anchor.application.worker.worker import (
     WorkerConfig,
     WorkerDeps,
+    WorkerAdmissionUnavailableError,
     _is_provider_infrastructure_error,
     build_failures_indicate_outage,
     publish_failures_indicate_outage,
@@ -322,11 +324,15 @@ def _run_loop(
             mineru_checker=mineru_checker,
         )
 
+    def ownership_guard() -> None:
+        _assert_singleton_or_cancel(lock_conn)
+
     try:
         base_deps = _deps(
             settings,
             engine,
             admission_guard=admission_guard,
+            ownership_guard=ownership_guard,
         )
     except BaseException:
         engine.dispose()
@@ -940,7 +946,10 @@ def _assert_worker_admission(
 
     _assert_singleton_or_cancel(lock_conn)
     if mineru_checker is not None:
-        mineru_checker.assert_admission()
+        try:
+            mineru_checker.assert_admission()
+        except MinerUDeploymentUnavailableError as exc:
+            raise WorkerAdmissionUnavailableError(str(exc)) from exc
 
 
 def assert_worker_singleton_or_cancel(lock_conn: Connection) -> None:
@@ -990,6 +999,7 @@ def _deps(
     engine: Engine,
     *,
     admission_guard: Callable[[], None] = lambda: None,
+    ownership_guard: Callable[[], None] = lambda: None,
     process_scope_classes: tuple[str, ...] | None = None,
 ) -> WorkerDeps:
     paths = FileStorePathBuilder(settings)
@@ -1116,6 +1126,7 @@ def _deps(
         source_close_after_round=False,
         close_source=close_source,
         admission_guard=admission_guard,
+        ownership_guard=ownership_guard,
     )
 
 

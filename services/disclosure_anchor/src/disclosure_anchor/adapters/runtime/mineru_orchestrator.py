@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import http.client
 import json
 import threading
 import time
@@ -19,12 +20,24 @@ MINERU_API_PROCESSING_WINDOW_SIZE = 16
 MINERU_API_TASK_RETENTION_SECONDS = 600
 MINERU_API_CLEANUP_INTERVAL_SECONDS = 30
 MAX_HEALTH_BYTES = 64 * 1024
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 _INCIDENT_LOCK = threading.Lock()
 _INCIDENT_GENERATION = 0
+_INCIDENT_DRAINS_IN_PROGRESS: set[int] = set()
 
 
 class MinerUOrchestratorError(RuntimeError):
     """The dedicated API cannot prove its fixed health contract."""
+
+
+class MinerUOrchestratorUnavailableError(MinerUOrchestratorError):
+    """The dedicated API endpoint was temporarily unreachable."""
+
+
+@dataclass(frozen=True)
+class MinerUOrchestratorIncidentState:
+    generation: int
+    drains_in_progress: int
 
 
 def mark_mineru_orchestrator_incident() -> int:
@@ -40,12 +53,31 @@ def mark_mineru_orchestrator_incident() -> int:
     global _INCIDENT_GENERATION
     with _INCIDENT_LOCK:
         _INCIDENT_GENERATION += 1
-        return _INCIDENT_GENERATION
+        token = _INCIDENT_GENERATION
+        _INCIDENT_DRAINS_IN_PROGRESS.add(token)
+        return token
+
+
+def finish_mineru_orchestrator_incident(token: int) -> None:
+    """Release one drain owner without claiming that the API is healthy."""
+
+    with _INCIDENT_LOCK:
+        if token not in _INCIDENT_DRAINS_IN_PROGRESS:
+            raise ValueError("unknown or already-finished MinerU incident token")
+        _INCIDENT_DRAINS_IN_PROGRESS.remove(token)
 
 
 def mineru_orchestrator_incident_generation() -> int:
     with _INCIDENT_LOCK:
         return _INCIDENT_GENERATION
+
+
+def mineru_orchestrator_incident_state() -> MinerUOrchestratorIncidentState:
+    with _INCIDENT_LOCK:
+        return MinerUOrchestratorIncidentState(
+            generation=_INCIDENT_GENERATION,
+            drains_in_progress=len(_INCIDENT_DRAINS_IN_PROGRESS),
+        )
 
 
 @dataclass(frozen=True)
@@ -92,8 +124,23 @@ def fetch_mineru_orchestrator_health(
     try:
         with opener.open(request, timeout=timeout_seconds) as response:
             payload = response.read(MAX_HEALTH_BYTES + 1)
-    except (OSError, TimeoutError, urllib.error.URLError) as exc:
-        raise MinerUOrchestratorError("MinerU API health endpoint unavailable") from exc
+    except urllib.error.HTTPError as exc:
+        if exc.code in _RETRYABLE_HTTP_STATUS_CODES:
+            raise MinerUOrchestratorUnavailableError(
+                "MinerU API health endpoint temporarily rejected the probe"
+            ) from exc
+        raise MinerUOrchestratorError(
+            f"MinerU API health endpoint returned non-retryable HTTP {exc.code}"
+        ) from exc
+    except (
+        OSError,
+        TimeoutError,
+        http.client.HTTPException,
+        urllib.error.URLError,
+    ) as exc:
+        raise MinerUOrchestratorUnavailableError(
+            "MinerU API health endpoint unavailable"
+        ) from exc
     if len(payload) > MAX_HEALTH_BYTES:
         raise MinerUOrchestratorError("MinerU API health response exceeds safety limit")
     try:
@@ -195,8 +242,12 @@ __all__ = [
     "MINERU_API_VERSION",
     "MinerUOrchestratorError",
     "MinerUOrchestratorHealth",
+    "MinerUOrchestratorIncidentState",
+    "MinerUOrchestratorUnavailableError",
     "fetch_mineru_orchestrator_health",
+    "finish_mineru_orchestrator_incident",
     "mark_mineru_orchestrator_incident",
     "mineru_orchestrator_incident_generation",
+    "mineru_orchestrator_incident_state",
     "wait_for_mineru_orchestrator_idle",
 ]

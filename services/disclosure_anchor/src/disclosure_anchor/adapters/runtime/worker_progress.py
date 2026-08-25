@@ -717,6 +717,19 @@ def render_worker_progress(event: dict[str, Any]) -> str:
             f"parse={interval['parsed']} build={interval['built']} "
             f"publish={interval['published']} failed={interval['failed']}"
         )
+        admission = interval.get("admission")
+        if admission is not None:
+            admission_label = f"admission={admission['status']}"
+            if admission["consecutive_failures"]:
+                admission_label += (
+                    " consecutive_failures="
+                    f"{admission['consecutive_failures']}"
+                )
+            if admission["next_probe_at"] is not None:
+                admission_label += f" next_probe={admission['next_probe_at']}"
+            if admission["reason"] is not None:
+                admission_label += f" reason={admission['reason']}"
+            lines.append(admission_label)
     return "\n".join(lines)
 
 

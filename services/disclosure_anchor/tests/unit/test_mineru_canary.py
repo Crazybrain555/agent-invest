@@ -8,10 +8,12 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import MagicMock, patch
 
 from disclosure_anchor.adapters.runtime.mineru_canary import (
     MinerUCanaryError,
+    MinerUCanaryUnavailableError,
     canary_cache_is_fresh,
     canary_request_sha256,
     probe_mineru_served_model,
@@ -354,6 +356,28 @@ class MinerUCanaryTests(unittest.TestCase):
                 "http://gpu:30000",
                 expected_model_id="attested-model",
             )
+
+    def test_light_probe_classifies_http_statuses(self) -> None:
+        opener = MagicMock()
+        with patch(
+            "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
+            return_value=opener,
+        ):
+            for status, expected_error in (
+                (404, MinerUCanaryError),
+                (503, MinerUCanaryUnavailableError),
+                (501, MinerUCanaryError),
+            ):
+                with self.subTest(status=status):
+                    opener.open.side_effect = urllib.error.HTTPError(
+                        "http://gpu:30000/v1/models",
+                        status,
+                        "probe failed",
+                        {},
+                        None,
+                    )
+                    with self.assertRaises(expected_error):
+                        probe_mineru_served_model("http://gpu:30000")
 
     def test_runtime_manifest_rejects_duplicate_safety_flag(self) -> None:
         manifest = _manifest(duplicate_max_num_seqs=True)

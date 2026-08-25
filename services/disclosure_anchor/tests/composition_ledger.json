@@ -234,11 +234,11 @@
   },
   "tests/unit/test_mineru_canary.py": {
    "private_imports": [],
-   "tests": 13
+   "tests": 14
   },
   "tests/unit/test_mineru_deployment_gate.py": {
    "private_imports": [],
-   "tests": 23
+   "tests": 26
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
@@ -250,11 +250,11 @@
   },
   "tests/unit/test_mineru_orchestrator.py": {
    "private_imports": [],
-   "tests": 2
+   "tests": 4
   },
   "tests/unit/test_mineru_process.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 11
   },
   "tests/unit/test_mineru_smoke.py": {
    "private_imports": [],
@@ -408,7 +408,7 @@
   },
   "tests/unit/test_worker_cli.py": {
    "private_imports": [],
-   "tests": 26
+   "tests": 27
   },
   "tests/unit/test_worker_progress.py": {
    "private_imports": [],
@@ -418,7 +418,7 @@
    "private_imports": [
     "_sync_window_start"
    ],
-   "tests": 59
+   "tests": 61
   }
  },
  "schema": "test-composition-ledger.v1"

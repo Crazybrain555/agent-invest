@@ -11,12 +11,14 @@ import unittest
 from unittest.mock import patch
 
 from disclosure_anchor.adapters.runtime.mineru_canary import (
+    MinerUCanaryError,
     canary_request_sha256,
     model_id_sha256,
 )
 from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     MinerUDeploymentChecker,
     MinerUDeploymentGateError,
+    MinerUDeploymentUnavailableError,
     require_mineru_deployment_gate,
 )
 from disclosure_anchor.adapters.runtime.mineru_identity import (
@@ -29,6 +31,8 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
 )
 from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
     MinerUOrchestratorHealth,
+    MinerUOrchestratorUnavailableError,
+    finish_mineru_orchestrator_incident,
     mark_mineru_orchestrator_incident,
 )
 from disclosure_anchor.application.contracts.parser_target import (
@@ -930,6 +934,33 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 self.assertEqual(probe.call_count, 2)
                 self.assertEqual(orchestrator_probe.call_count, 2)
 
+    def test_live_transport_outage_has_typed_transient_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            passed_at = datetime.now(UTC)
+            settings, _, _, client = self._fixture(Path(tmp), passed_at=passed_at)
+            client_patch, code_patch = self._identity_patches(client)
+            with (
+                client_patch,
+                code_patch,
+                patch(
+                    "disclosure_anchor.adapters.runtime.mineru_deployment_gate."
+                    "fetch_mineru_orchestrator_health",
+                    side_effect=MinerUOrchestratorUnavailableError(
+                        "endpoint unavailable"
+                    ),
+                ),
+            ):
+                checker = MinerUDeploymentChecker(
+                    settings,
+                    wall_clock=lambda: passed_at,
+                    monotonic_clock=lambda: 0.0,
+                )
+                with self.assertRaisesRegex(
+                    MinerUDeploymentUnavailableError,
+                    "probe unavailable",
+                ):
+                    checker.assert_admission()
+
     def test_resident_checker_keeps_live_lease_after_static_startup_age(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             passed_at = datetime.now(UTC)
@@ -964,7 +995,55 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             self.assertEqual(probe.call_count, 2)
             self.assertEqual(orchestrator_probe.call_count, 2)
 
-    def test_process_local_api_incident_permanently_invalidates_checker(self) -> None:
+    def test_process_local_api_incident_pauses_until_idle_then_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            passed_at = datetime.now(UTC)
+            settings, _, _, client = self._fixture(Path(tmp), passed_at=passed_at)
+            client_patch, code_patch = self._identity_patches(client)
+            with (
+                client_patch,
+                code_patch,
+                patch(
+                    "disclosure_anchor.adapters.runtime.mineru_deployment_gate."
+                    "probe_mineru_served_model",
+                    return_value=MODEL_ID,
+                ) as model_probe,
+                patch(
+                    "disclosure_anchor.adapters.runtime.mineru_deployment_gate."
+                    "fetch_mineru_orchestrator_health",
+                    side_effect=(
+                        orchestrator_health(completed=100),
+                        orchestrator_health(completed=100, queued=1),
+                        orchestrator_health(completed=101),
+                    ),
+                ) as orchestrator_probe,
+            ):
+                checker = MinerUDeploymentChecker(
+                    settings,
+                    wall_clock=lambda: passed_at,
+                    monotonic_clock=lambda: 0.0,
+                )
+                checker.assert_admission()
+                incident_token = mark_mineru_orchestrator_incident()
+                try:
+                    with self.assertRaisesRegex(
+                        MinerUDeploymentUnavailableError,
+                        "drain is still in progress",
+                    ):
+                        checker.assert_admission()
+                finally:
+                    finish_mineru_orchestrator_incident(incident_token)
+                with self.assertRaisesRegex(
+                    MinerUDeploymentUnavailableError,
+                    "undrained work",
+                ):
+                    checker.assert_admission()
+                checker.assert_admission()
+                checker.assert_admission()
+            self.assertEqual(orchestrator_probe.call_count, 3)
+            self.assertEqual(model_probe.call_count, 2)
+
+    def test_incident_recovery_keeps_permanent_model_drift_fatal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             passed_at = datetime.now(UTC)
             settings, _, _, client = self._fixture(Path(tmp), passed_at=passed_at)
@@ -975,12 +1054,64 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                     wall_clock=lambda: passed_at,
                     monotonic_clock=lambda: 0.0,
                 )
-            mark_mineru_orchestrator_incident()
-            with self.assertRaisesRegex(
-                MinerUDeploymentGateError,
-                "incident invalidated",
+            incident_token = mark_mineru_orchestrator_incident()
+            finish_mineru_orchestrator_incident(incident_token)
+            with (
+                patch(
+                    "disclosure_anchor.adapters.runtime.mineru_deployment_gate."
+                    "fetch_mineru_orchestrator_health",
+                    return_value=orchestrator_health(completed=100),
+                ),
+                patch(
+                    "disclosure_anchor.adapters.runtime.mineru_deployment_gate."
+                    "probe_mineru_served_model",
+                    side_effect=MinerUCanaryError("model identity drifted"),
+                ),
             ):
-                checker.assert_admission()
+                with self.assertRaises(MinerUDeploymentGateError) as raised:
+                    checker.assert_admission()
+            self.assertIs(type(raised.exception), MinerUDeploymentGateError)
+
+    def test_new_incident_during_live_proof_keeps_admission_paused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            passed_at = datetime.now(UTC)
+            settings, _, _, client = self._fixture(Path(tmp), passed_at=passed_at)
+            client_patch, code_patch = self._identity_patches(client)
+            with client_patch, code_patch:
+                checker = MinerUDeploymentChecker(
+                    settings,
+                    wall_clock=lambda: passed_at,
+                    monotonic_clock=lambda: 0.0,
+                )
+            incident_token = mark_mineru_orchestrator_incident()
+            finish_mineru_orchestrator_incident(incident_token)
+            proof_incident_tokens: list[int] = []
+
+            def mark_during_model_probe(*_args: object, **_kwargs: object) -> str:
+                proof_incident_tokens.append(mark_mineru_orchestrator_incident())
+                return MODEL_ID
+
+            try:
+                with (
+                    patch(
+                        "disclosure_anchor.adapters.runtime.mineru_deployment_gate."
+                        "fetch_mineru_orchestrator_health",
+                        return_value=orchestrator_health(completed=100),
+                    ),
+                    patch(
+                        "disclosure_anchor.adapters.runtime.mineru_deployment_gate."
+                        "probe_mineru_served_model",
+                        side_effect=mark_during_model_probe,
+                    ),
+                    self.assertRaisesRegex(
+                        MinerUDeploymentUnavailableError,
+                        "changed during live admission proof",
+                    ),
+                ):
+                    checker.assert_admission()
+            finally:
+                for token in proof_incident_tokens:
+                    finish_mineru_orchestrator_incident(token)
 
     def test_parse_disabled_does_not_require_remote_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

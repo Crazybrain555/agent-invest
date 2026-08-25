@@ -13,6 +13,10 @@ from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
     MinerUMediumDocumentParser,
 )
 from disclosure_anchor.adapters.parsers.mineru_medium.process import MinerUProcess
+from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
+    MinerUOrchestratorError,
+    mineru_orchestrator_incident_state,
+)
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.domain.errors import (
     ParserBackendUnavailableError,
@@ -79,6 +83,51 @@ class MinerUProcessTests(unittest.TestCase):
         self.assertEqual(
             local_api_command[local_api_command.index("--max-concurrency") + 1],
             "3",
+        )
+
+    def test_external_api_drain_owner_is_released_on_success_and_failure(
+        self,
+    ) -> None:
+        runner = MinerUProcess(executable=Path("/opt/mineru/bin/mineru"))
+        options = ParserOptions(
+            api_url="http://127.0.0.1:30002",
+            api_drain_timeout_seconds=10,
+        )
+        active_counts: list[int] = []
+
+        def observe_success(*_args: object, **_kwargs: object) -> object:
+            active_counts.append(
+                mineru_orchestrator_incident_state().drains_in_progress
+            )
+            return object()
+
+        with mock.patch.object(
+            mineru_process,
+            "wait_for_mineru_orchestrator_idle",
+            side_effect=observe_success,
+        ):
+            runner._drain_external_api(options)
+
+        def observe_failure(*_args: object, **_kwargs: object) -> object:
+            active_counts.append(
+                mineru_orchestrator_incident_state().drains_in_progress
+            )
+            raise MinerUOrchestratorError("health transport failed")
+
+        with (
+            mock.patch.object(
+                mineru_process,
+                "wait_for_mineru_orchestrator_idle",
+                side_effect=observe_failure,
+            ),
+            self.assertRaises(ParserBackendUnavailableError),
+        ):
+            runner._drain_external_api(options)
+
+        self.assertEqual(active_counts, [1, 1])
+        self.assertEqual(
+            mineru_orchestrator_incident_state().drains_in_progress,
+            0,
         )
 
     def test_medium_parser_requires_exact_version_and_server_readiness(self) -> None:

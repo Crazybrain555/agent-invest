@@ -1147,6 +1147,171 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self.assertEqual(report.parsed, 1)
         self.assertEqual(parse_cls.return_value.execute.call_count, 1)
 
+    def test_resident_live_probe_outage_pauses_refill_then_recovers(self) -> None:
+        import threading
+
+        deps = _deps()
+        object.__setattr__(
+            deps,
+            "config",
+            replace(
+                deps.config,
+                parse_concurrency=1,
+                finalize_concurrency=1,
+                parse_candidate_window=10,
+            ),
+        )
+        parse_started = threading.Event()
+        release_first = threading.Event()
+        guard_calls = 0
+        parse_guard_calls: list[tuple[str, int]] = []
+        emitted: list[worker_module.WorkerReport] = []
+
+        def admission_guard() -> None:
+            nonlocal guard_calls
+            guard_calls += 1
+            if guard_calls == 2:
+                self.assertTrue(parse_started.is_set())
+                release_first.set()
+                raise worker_module.WorkerAdmissionUnavailableError(
+                    "MinerU API unavailable"
+                )
+            if guard_calls == 3:
+                raise worker_module.WorkerAdmissionUnavailableError(
+                    "MinerU API unavailable"
+                )
+
+        def parse_one(
+            _deps: WorkerDeps,
+            item: worker_module._ParseWorkItem,
+        ) -> worker_module._DocOutcome:
+            parse_guard_calls.append((item.document_id, guard_calls))
+            if item.document_id == "doc_0":
+                parse_started.set()
+                self.assertTrue(release_first.wait(timeout=2))
+            return worker_module._DocOutcome(
+                parsed=True,
+                processing_run_id=f"run_{item.document_id}",
+            )
+
+        real_wait = worker_module.wait
+        wait_calls = 0
+
+        def controlled_wait(*args: object, **kwargs: object):  # noqa: ANN202
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                return set(), set(args[0])
+            return real_wait(*args, **kwargs)
+
+        object.__setattr__(deps, "admission_guard", admission_guard)
+        ownership_guard = mock.Mock()
+        object.__setattr__(deps, "ownership_guard", ownership_guard)
+        controller = worker_module._ResidentAdmissionController(
+            deps,
+            emit_report=emitted.append,
+            initial_backoff_seconds=0.001,
+            maximum_backoff_seconds=0.002,
+        )
+
+        with (
+            mock.patch.object(
+                worker_module.queries,
+                "pending_parse",
+                return_value=[
+                    {
+                        "document_id": "doc_0",
+                        "raw_file_relpath": "doc_0.pdf",
+                        "oversized": False,
+                    },
+                    {
+                        "document_id": "doc_1",
+                        "raw_file_relpath": "doc_1.pdf",
+                        "oversized": False,
+                    },
+                ],
+            ),
+            mock.patch.object(
+                worker_module,
+                "_parse_one_document",
+                side_effect=parse_one,
+            ),
+            mock.patch.object(
+                worker_module,
+                "_finalize_one_document",
+                return_value=worker_module._DocOutcome(
+                    built=True,
+                    published=True,
+                ),
+            ),
+            mock.patch.object(
+                worker_module,
+                "wait",
+                side_effect=controlled_wait,
+            ),
+        ):
+            report = worker_module.WorkerReport(
+                started_at=datetime.now(timezone.utc)
+            )
+            result = worker_module._parse_one_batch(
+                report,
+                deps,
+                limit=200,
+                should_stop=lambda: False,
+                keep_refilling=lambda: True,
+                resident_hooks=worker_module._ResidentParseHooks(
+                    report_interval_seconds=60.0,
+                    emit_report=emitted.append,
+                    admission_ready=controller.ready,
+                    admission_retry_remaining=controller.retry_remaining,
+                ),
+            )
+
+        self.assertEqual(result, "done")
+        self.assertEqual([item[0] for item in parse_guard_calls], ["doc_0", "doc_1"])
+        self.assertEqual(parse_guard_calls[0][1], 1)
+        self.assertGreaterEqual(parse_guard_calls[1][1], 4)
+        admission_reports = [
+            item for item in emitted if item.admission_status is not None
+        ]
+        self.assertEqual(
+            [item.admission_status for item in admission_reports],
+            ["unavailable", "unavailable", "available"],
+        )
+        self.assertEqual(
+            [
+                item.admission_consecutive_failures
+                for item in admission_reports
+            ],
+            [1, 2, 2],
+        )
+        self.assertTrue(all(item.failed == 0 for item in admission_reports))
+        self.assertGreaterEqual(ownership_guard.call_count, 1)
+
+    def test_resident_permanent_admission_error_remains_fatal(self) -> None:
+        deps = _deps()
+        object.__setattr__(
+            deps,
+            "admission_guard",
+            mock.Mock(
+                side_effect=RuntimeError(
+                    "served MinerU model identity drifted"
+                )
+            ),
+        )
+        emitted: list[worker_module.WorkerReport] = []
+        controller = worker_module._ResidentAdmissionController(
+            deps,
+            emit_report=emitted.append,
+            initial_backoff_seconds=0.001,
+            maximum_backoff_seconds=0.002,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "model identity drifted"):
+            controller.ready()
+
+        self.assertEqual(emitted, [])
+
     def test_report_rotation_does_not_drain_all_heavy_refill(self) -> None:
         import threading
         import time

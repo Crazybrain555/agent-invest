@@ -16,6 +16,7 @@ from disclosure_anchor.application.dto.worker_report import (
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     MinerUDeploymentGateError,
+    MinerUDeploymentUnavailableError,
 )
 from disclosure_anchor.cli import worker as worker_cli
 from disclosure_anchor.domain.errors import ConfigurationError
@@ -584,6 +585,40 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             )
 
         self.assertEqual(events, ["lock", "mineru"])
+
+    def test_worker_admission_maps_only_typed_live_outage_to_retry(self) -> None:
+        lock_conn = mock.MagicMock()
+        checker = mock.MagicMock(spec=worker_cli.MinerUDeploymentChecker)
+        checker.assert_admission.side_effect = MinerUDeploymentUnavailableError(
+            "tunnel unavailable"
+        )
+
+        with (
+            mock.patch.object(worker_cli, "_assert_singleton_or_cancel"),
+            self.assertRaisesRegex(
+                worker_cli.WorkerAdmissionUnavailableError,
+                "tunnel unavailable",
+            ),
+        ):
+            worker_cli._assert_worker_admission(
+                lock_conn,
+                mineru_checker=checker,
+            )
+
+        checker.assert_admission.side_effect = MinerUDeploymentGateError(
+            "served model identity drifted"
+        )
+        with (
+            mock.patch.object(worker_cli, "_assert_singleton_or_cancel"),
+            self.assertRaisesRegex(
+                MinerUDeploymentGateError,
+                "identity drifted",
+            ),
+        ):
+            worker_cli._assert_worker_admission(
+                lock_conn,
+                mineru_checker=checker,
+            )
 
     def test_work_engine_identity_failure_disposes_before_dependency_build(
         self,

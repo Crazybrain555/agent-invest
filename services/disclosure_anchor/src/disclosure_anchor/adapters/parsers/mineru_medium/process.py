@@ -15,12 +15,13 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
     MinerUOrchestratorError,
+    finish_mineru_orchestrator_incident,
     mark_mineru_orchestrator_incident,
     wait_for_mineru_orchestrator_idle,
 )
+from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.domain.errors import (
     ParserBackendUnavailableError,
     ParserBackendOverloadedError,
@@ -607,10 +608,9 @@ class MinerUProcess:
         if options.api_url is None:
             return
         # Publish the incident before blocking. Existing worker/admin/pipeline
-        # admission checkers become permanently invalid for their lifetime, so
-        # another completed Future cannot refill the queue while this client
-        # waits for natural drain.
-        mark_mineru_orchestrator_incident()
+        # admission checkers must discard their cached live proof and freshly
+        # prove idle state before they can refill the queue.
+        incident_token = mark_mineru_orchestrator_incident()
         try:
             wait_for_mineru_orchestrator_idle(
                 options.api_url,
@@ -620,6 +620,8 @@ class MinerUProcess:
             raise ParserBackendUnavailableError(
                 "MinerU API remote task drain could not be proved"
             ) from exc
+        finally:
+            finish_mineru_orchestrator_incident(incident_token)
 
     def _env(self, *, options: ParserOptions | None = None) -> dict[str, str]:
         # MinerU and its temporary fast_api are parser mechanisms, not service

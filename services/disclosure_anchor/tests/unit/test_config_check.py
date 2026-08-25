@@ -26,36 +26,27 @@ class WatchlistConfigCheckTests(unittest.TestCase):
             validate_screen_manifest(snapshot, DEFAULT_SCREEN_MANIFEST),
             [],
         )
-        for tamper, expected in (
-            ("missing_sources", "manifest fields are not closed"),
-            ("eligible_over_screen", "eligibility/exclusion counts"),
-            ("impossible_exclusion", "eligibility/exclusion counts"),
-            ("invalid_board_counts", "selected_board_counts"),
-            ("invalid_observed_at", "aware timestamp"),
+        for tamper in (
+            "missing_input",
+            "invalid_board_counts",
+            "invalid_observed_at",
+            "claim_not_verified",
         ):
             with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as tmp:
                 manifest = json.loads(json.dumps(baseline))
-                if tamper == "missing_sources":
-                    del manifest["sources"]
-                elif tamper == "eligible_over_screen":
-                    manifest["screen"]["row_count"] = 1_500
-                    manifest["result"]["eligible_after_hard_gates"] = 9_999
-                    manifest["result"]["exclusion_reason_counts"][
-                        "no_future_research_signal"
-                    ] = 8_499
-                elif tamper == "impossible_exclusion":
-                    manifest["result"]["exclusion_reason_counts"][
-                        "risk_warning_name"
-                    ] = 999_999
+                if tamper == "missing_input":
+                    del manifest["input"]
                 elif tamper == "invalid_board_counts":
                     manifest["result"]["selected_board_counts"] = {"BSE": 1_500}
-                else:
+                elif tamper == "invalid_observed_at":
                     manifest["observed_at_utc"] = "not-a-timestamp"
+                else:
+                    manifest["verification"]["unique_identities_verified"] = False
                 path = Path(tmp) / "sidecar.json"
                 path.write_text(json.dumps(manifest), encoding="utf-8")
                 errors = validate_screen_manifest(snapshot, path)
                 self.assertTrue(
-                    any(expected in error for error in errors),
+                    any("exact Pro-reviewed bytes" in error for error in errors),
                     errors,
                 )
 
@@ -88,7 +79,7 @@ class WatchlistConfigCheckTests(unittest.TestCase):
                 separators=(",", ":"),
             ).encode("utf-8")
             baseline["result"]["watchlist_csv_sha256"] = snapshot.sha256
-            baseline["result"]["selected_identity_sha256"] = hashlib.sha256(
+            baseline["result"]["ordered_identity_sha256"] = hashlib.sha256(
                 identity_bytes
             ).hexdigest()
             baseline["result"]["selected_exchange_counts"]["SSE"] -= 1

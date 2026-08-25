@@ -19,6 +19,7 @@ import uuid
 from disclosure_anchor.adapters.runtime.mineru_canary import (
     CANARY_SCHEMA,
     MinerUCanaryError,
+    MinerUCanaryUnavailableError,
     canary_cache_is_fresh,
     canary_request_sha256,
     model_id_sha256,
@@ -36,8 +37,9 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
 )
 from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
     MinerUOrchestratorError,
+    MinerUOrchestratorUnavailableError,
     fetch_mineru_orchestrator_health,
-    mineru_orchestrator_incident_generation,
+    mineru_orchestrator_incident_state,
 )
 from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
@@ -67,6 +69,10 @@ class MinerUDeploymentGateError(RuntimeError):
     """The current process cannot prove its MinerU deployment gate."""
 
 
+class MinerUDeploymentUnavailableError(MinerUDeploymentGateError):
+    """A live admission endpoint is temporarily unavailable."""
+
+
 @dataclass(frozen=True)
 class VerifiedMinerUDeployment:
     api_url: str
@@ -91,6 +97,10 @@ class VerifiedMinerUDeployment:
                 self.observability_url,
                 expected_model_id=self.served_model_id,
             )
+        except MinerUCanaryUnavailableError as exc:
+            raise MinerUDeploymentUnavailableError(
+                f"MinerU live served-model probe unavailable: {exc}"
+            ) from exc
         except MinerUCanaryError as exc:
             raise MinerUDeploymentGateError(
                 f"MinerU live served-model probe failed: {exc}"
@@ -105,12 +115,16 @@ class VerifiedMinerUDeployment:
                     self.task_cleanup_interval_seconds
                 ),
             )
+        except MinerUOrchestratorUnavailableError as exc:
+            raise MinerUDeploymentUnavailableError(
+                f"MinerU API live health probe unavailable: {exc}"
+            ) from exc
         except MinerUOrchestratorError as exc:
             raise MinerUDeploymentGateError(
                 f"MinerU API live health probe failed: {exc}"
             ) from exc
         if require_idle and health.active_tasks != 0:
-            raise MinerUDeploymentGateError(
+            raise MinerUDeploymentUnavailableError(
                 "MinerU API has undrained work before process admission"
             )
 
@@ -149,36 +163,60 @@ class MinerUDeploymentChecker:
         # Force the first admission to probe before any document can start.
         self._last_probe_success: float | None = None
         self._initial_idle_proved = False
-        self._incident_generation = mineru_orchestrator_incident_generation()
+        self._incident_generation = (
+            mineru_orchestrator_incident_state().generation
+        )
         self._probe_lock = threading.Lock()
 
     def assert_admission(self) -> None:
         evidence = self._evidence
         if evidence is None:
             return
-        if (
-            mineru_orchestrator_incident_generation()
-            != self._incident_generation
-        ):
-            raise MinerUDeploymentGateError(
-                "MinerU API incident invalidated this process admission; "
-                "recompose only after natural drain"
+        incident_state = mineru_orchestrator_incident_state()
+        if incident_state.drains_in_progress:
+            raise MinerUDeploymentUnavailableError(
+                "MinerU API incident drain is still in progress"
             )
+        incident_generation = incident_state.generation
+        incident_changed = incident_generation != self._incident_generation
         observed = self._monotonic_clock()
         if (
-            self._last_probe_success is not None
+            not incident_changed
+            and self._last_probe_success is not None
             and observed - self._last_probe_success < self._probe_interval_seconds
         ):
             return
         with self._probe_lock:
+            incident_state = mineru_orchestrator_incident_state()
+            if incident_state.drains_in_progress:
+                raise MinerUDeploymentUnavailableError(
+                    "MinerU API incident drain is still in progress"
+                )
+            incident_generation = incident_state.generation
+            incident_changed = incident_generation != self._incident_generation
             observed = self._monotonic_clock()
             if (
-                self._last_probe_success is not None
+                not incident_changed
+                and self._last_probe_success is not None
                 and observed - self._last_probe_success < self._probe_interval_seconds
             ):
                 return
-            evidence.probe_orchestrator(require_idle=not self._initial_idle_proved)
+            # An incident invalidates only the cached live proof. Recovery is
+            # safe after this checker freshly proves the fixed API is idle and
+            # the exact served-model identity still matches attestation.
+            evidence.probe_orchestrator(
+                require_idle=(not self._initial_idle_proved or incident_changed)
+            )
             evidence.probe_live_model()
+            confirmed_incident_state = mineru_orchestrator_incident_state()
+            if (
+                confirmed_incident_state.drains_in_progress
+                or confirmed_incident_state.generation != incident_generation
+            ):
+                raise MinerUDeploymentUnavailableError(
+                    "MinerU API incident changed during live admission proof"
+                )
+            self._incident_generation = incident_generation
             self._initial_idle_proved = True
             self._last_probe_success = self._monotonic_clock()
 
@@ -1186,6 +1224,7 @@ def _is_prefixed_sha256(value: object) -> bool:
 __all__ = [
     "MinerUDeploymentChecker",
     "MinerUDeploymentGateError",
+    "MinerUDeploymentUnavailableError",
     "VerifiedMinerUDeployment",
     "require_mineru_deployment_gate",
     "verify_mineru_deployment_gate",

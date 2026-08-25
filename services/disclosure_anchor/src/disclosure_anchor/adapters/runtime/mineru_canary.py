@@ -36,10 +36,15 @@ _CANARY_PNG_DATA_URL = (
     "IAJEgAgQASJAJAJEgAiQ7voLQALBt0Fva2UAAAAASUVORK5CYII="
 )
 _MAX_RESPONSE_BYTES = 1024 * 1024
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 
 
 class MinerUCanaryError(RuntimeError):
     """The remote OpenAI-compatible multimodal path failed closed."""
+
+
+class MinerUCanaryUnavailableError(MinerUCanaryError):
+    """The remote model endpoint was temporarily unreachable."""
 
 
 @dataclass(frozen=True)
@@ -95,17 +100,28 @@ def probe_mineru_served_model(
             _api_root(server_url),
             timeout_seconds=timeout_seconds,
         )
-        if expected_model_id is not None and model_id != expected_model_id:
-            raise ValueError("served MinerU model identity drifted from attestation")
+    except urllib.error.HTTPError as exc:
+        if exc.code in _RETRYABLE_HTTP_STATUS_CODES:
+            raise MinerUCanaryUnavailableError(str(exc)) from exc
+        raise MinerUCanaryError(
+            f"served-model endpoint returned non-retryable HTTP {exc.code}"
+        ) from exc
     except (
         OSError,
         TimeoutError,
         http.client.HTTPException,
         urllib.error.URLError,
+    ) as exc:
+        raise MinerUCanaryUnavailableError(str(exc)) from exc
+    except (
         ValueError,
         json.JSONDecodeError,
     ) as exc:
         raise MinerUCanaryError(str(exc)) from exc
+    if expected_model_id is not None and model_id != expected_model_id:
+        raise MinerUCanaryError(
+            "served MinerU model identity drifted from attestation"
+        )
     return model_id
 
 
@@ -312,6 +328,7 @@ __all__ = [
     "CANARY_EXPECTED_TEXT",
     "CANARY_SCHEMA",
     "MinerUCanaryError",
+    "MinerUCanaryUnavailableError",
     "MinerUCanaryEvidence",
     "canary_request_sha256",
     "canary_cache_is_fresh",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 import hashlib
 import io
 import json
@@ -108,6 +109,31 @@ _OBSERVATION_FIELDS = frozenset(
     }
 )
 _EXCLUSION_REASON_FIELDS = EXCLUSION_REASONS
+_V11_PHASE1_SCHEMA = "research_priority_universe_candidate.v11.phase1"
+_V11_PHASE1_RULE_VERSION = "a_share_research_priority.v11-candidate.phase1"
+_V11_PHASE1_MANIFEST_SHA256 = (
+    "8c62e487395b1a4b6fa68a9a6fe8e5fdb89f8dc9973bc669a7eb1ade822df488"
+)
+_V11_PHASE1_MANIFEST_FIELDS = frozenset(
+    {
+        "authoritative_commit",
+        "authoritative_repository",
+        "candidate_label",
+        "decimal_contract",
+        "evidence_limitations",
+        "input",
+        "joined_date",
+        "observed_at_utc",
+        "purpose",
+        "reason_taxonomy",
+        "result",
+        "rules",
+        "schema",
+        "selection_rule_version",
+        "verdict",
+        "verification",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -288,6 +314,13 @@ def validate_screen_manifest(
         return [f"{manifest_path}: invalid JSON: {exc}"]
     if not isinstance(manifest, dict):
         return [f"{manifest_path}: root must be an object"]
+    if manifest.get("schema") == _V11_PHASE1_SCHEMA:
+        return _validate_v11_phase1_manifest(
+            snapshot,
+            manifest_path,
+            manifest_bytes,
+            manifest,
+        )
     _validate_closed_shape(
         errors,
         manifest_path=manifest_path,
@@ -434,6 +467,192 @@ def validate_screen_manifest(
         result=result,
         rows=rows,
     )
+    return errors
+
+
+def _validate_v11_phase1_manifest(
+    snapshot: WatchlistSnapshot,
+    manifest_path: Path,
+    manifest_bytes: bytes,
+    manifest: dict[str, Any],
+) -> list[str]:
+    """Validate the exact Pro-reviewed phase-1 candidate and CSV closure."""
+
+    errors: list[str] = []
+    _validate_closed_shape(
+        errors,
+        manifest_path=manifest_path,
+        label="manifest",
+        value=manifest,
+        expected=_V11_PHASE1_MANIFEST_FIELDS,
+    )
+    if hashlib.sha256(manifest_bytes).hexdigest() != _V11_PHASE1_MANIFEST_SHA256:
+        errors.append(
+            f"{manifest_path}: v11 phase-1 manifest must retain exact "
+            "Pro-reviewed bytes"
+        )
+    if manifest.get("purpose") != PURPOSE:
+        errors.append(f"{manifest_path}: purpose must be {PURPOSE}")
+    if manifest.get("selection_rule_version") != _V11_PHASE1_RULE_VERSION:
+        errors.append(
+            f"{manifest_path}: selection_rule_version must be "
+            f"{_V11_PHASE1_RULE_VERSION}"
+        )
+    if manifest.get("verdict") != "STOP" or manifest.get("candidate_label") != (
+        "best attainable phase-1 candidate / still not GO"
+    ):
+        errors.append(
+            f"{manifest_path}: phase-1 limitation verdict/label drifted"
+        )
+    observed_at = manifest.get("observed_at_utc")
+    joined_date = manifest.get("joined_date")
+    try:
+        parsed_observed_at = (
+            datetime.fromisoformat(observed_at)
+            if isinstance(observed_at, str)
+            else None
+        )
+    except ValueError:
+        parsed_observed_at = None
+    if parsed_observed_at is None or parsed_observed_at.tzinfo is None:
+        errors.append(f"{manifest_path}: observed_at_utc must be an aware timestamp")
+    elif (
+        not isinstance(joined_date, str)
+        or not DATE_RE.fullmatch(joined_date)
+        or joined_date != parsed_observed_at.astimezone(UTC).date().isoformat()
+    ):
+        errors.append(
+            f"{manifest_path}: joined_date must equal observed_at_utc UTC date"
+        )
+
+    result = manifest.get("result")
+    rules = manifest.get("rules")
+    verification = manifest.get("verification")
+    if not isinstance(result, dict) or not isinstance(rules, dict):
+        return [*errors, f"{manifest_path}: result and rules must be objects"]
+    if (
+        rules.get("markets") != ["SSE", "SZSE"]
+        or rules.get("boards")
+        != ["SSE_MAIN", "SZSE_MAIN", "STAR", "CHINEXT"]
+        or rules.get("minimum_listing_age_months") != 42
+        or rules.get("market_cap_min_cny") != "2000000000.00"
+        or rules.get("name_or_security_code_branches") is not False
+        or rules.get("selection_count_semantics")
+        != "threshold_outcome_not_forced_fill"
+    ):
+        errors.append(f"{manifest_path}: v11 phase-1 hard rules drifted")
+    if (
+        not isinstance(verification, dict)
+        or not verification
+        or any(value is not True for value in verification.values())
+    ):
+        errors.append(f"{manifest_path}: v11 verification claims are incomplete")
+
+    rows = [
+        row
+        for row in snapshot.rows
+        if (row.get("security_code") or "").strip()
+    ]
+    selected_count = result.get("selected_count")
+    selection_min = rules.get("selection_count_min")
+    selection_max = rules.get("selection_count_max")
+    if (
+        isinstance(selected_count, bool)
+        or not isinstance(selected_count, int)
+        or isinstance(selection_min, bool)
+        or not isinstance(selection_min, int)
+        or isinstance(selection_max, bool)
+        or not isinstance(selection_max, int)
+        or not selection_min <= selected_count <= selection_max
+        or selected_count != len(rows)
+    ):
+        errors.append(
+            f"{manifest_path}: v11 selection band/result/CSV counts differ"
+        )
+    if result.get("watchlist_csv_sha256") != snapshot.sha256:
+        errors.append(
+            f"{manifest_path}: watchlist_csv_sha256 does not match "
+            f"{snapshot.requested_path}"
+        )
+    identities = [
+        {
+            "security_code": (row.get("security_code") or "").strip(),
+            "exchange": (row.get("exchange") or "").strip(),
+        }
+        for row in rows
+    ]
+    identity_bytes = json.dumps(
+        identities,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if result.get("ordered_identity_sha256") != hashlib.sha256(
+        identity_bytes
+    ).hexdigest():
+        errors.append(
+            f"{manifest_path}: ordered_identity_sha256 does not match "
+            f"{snapshot.requested_path}"
+        )
+    actual_exchange_counts = {
+        exchange: sum(
+            identity["exchange"] == exchange for identity in identities
+        )
+        for exchange in ("SSE", "SZSE")
+    }
+    if (
+        result.get("selected_exchange_counts") != actual_exchange_counts
+        or sum(actual_exchange_counts.values()) != len(rows)
+    ):
+        errors.append(
+            f"{manifest_path}: selected_exchange_counts does not match "
+            f"{snapshot.requested_path}"
+        )
+    board_counts = result.get("selected_board_counts")
+    if (
+        not isinstance(board_counts, dict)
+        or not set(board_counts).issubset(
+            {"SSE_MAIN", "SZSE_MAIN", "STAR", "CHINEXT"}
+        )
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in board_counts.values()
+        )
+        or not isinstance(selected_count, int)
+        or sum(board_counts.values()) != selected_count
+    ):
+        errors.append(f"{manifest_path}: selected_board_counts are invalid")
+    try:
+        selected_floor = Decimal(str(result.get("selected_min_market_cap_cny")))
+    except InvalidOperation:
+        selected_floor = Decimal("0")
+    if selected_floor < Decimal("2000000000.00"):
+        errors.append(
+            f"{manifest_path}: selected_min_market_cap_cny is invalid"
+        )
+    if (
+        result.get("audit_row_count") != 5_548
+        or result.get("total_input_rows") != 5_548
+        or result.get("unique_security_codes") != 5_548
+        or result.get("excluded_count") != 5_548 - len(rows)
+    ):
+        errors.append(f"{manifest_path}: v11 input/audit closure is invalid")
+    changes = result.get("changes_vs_v10")
+    if (
+        not isinstance(changes, dict)
+        or changes.get("retained") != 1_219
+        or changes.get("added") != 244
+        or changes.get("removed") != 244
+        or changes.get("still_excluded") != 3_841
+        or changes.get("retained", 0) + changes.get("added", 0) != len(rows)
+    ):
+        errors.append(f"{manifest_path}: v11/v10 membership delta is invalid")
+    for field in (
+        "selection_audit_csv_sha256",
+        "generator_sha256",
+    ):
+        if not SHA256_RE.fullmatch(str(result.get(field, ""))):
+            errors.append(f"{manifest_path}: result.{field} is invalid")
     return errors
 
 

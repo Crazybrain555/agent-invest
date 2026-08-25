@@ -503,6 +503,29 @@ class WorkerProgressTests(unittest.TestCase):
         )
         self.assertIn("current parse:600519", rendered)
 
+        event["latest_interval"] = {
+            "synced_companies": 0,
+            "downloaded": 0,
+            "parsed": 0,
+            "built": 0,
+            "published": 0,
+            "failed": 0,
+            "admission": {
+                "status": "unavailable",
+                "reason": "MinerU API unreachable",
+                "first_failure_at": "2026-08-24T12:00:00+00:00",
+                "consecutive_failures": 2,
+                "next_probe_at": "2026-08-24T12:04:00+00:00",
+            },
+        }
+        unavailable = render_worker_progress(event)
+        self.assertIn(
+            "admission=unavailable consecutive_failures=2 "
+            "next_probe=2026-08-24T12:04:00+00:00 "
+            "reason=MinerU API unreachable",
+            unavailable,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

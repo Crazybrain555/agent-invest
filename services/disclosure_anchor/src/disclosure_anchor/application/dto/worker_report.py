@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -60,6 +60,11 @@ class WorkerReport:
     parse_unknown_page_count: int = 0
     source_outage_break: bool = False
     deferred_backfill: int = 0
+    admission_status: Literal["available", "unavailable"] | None = None
+    admission_reason: str | None = None
+    admission_first_failure_at: datetime | None = None
+    admission_consecutive_failures: int = 0
+    admission_next_probe_at: datetime | None = None
     failures: list[WorkerFailure] = field(default_factory=list)
     build_stats: list[dict[str, Any]] = field(default_factory=list)
 
@@ -81,6 +86,25 @@ class WorkerReport:
             "parse_unknown_page_count": self.parse_unknown_page_count,
             "source_outage_break": self.source_outage_break,
             "deferred_backfill": self.deferred_backfill,
+            "admission": (
+                None
+                if self.admission_status is None
+                else {
+                    "status": self.admission_status,
+                    "reason": self.admission_reason,
+                    "first_failure_at": (
+                        self.admission_first_failure_at.isoformat()
+                        if self.admission_first_failure_at is not None
+                        else None
+                    ),
+                    "consecutive_failures": self.admission_consecutive_failures,
+                    "next_probe_at": (
+                        self.admission_next_probe_at.isoformat()
+                        if self.admission_next_probe_at is not None
+                        else None
+                    ),
+                }
+            ),
             "parsed": self.parsed,
             "built": self.built,
             "published": self.published,

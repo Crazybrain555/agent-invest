@@ -1,10 +1,13 @@
 import io
+import http.client
 import json
 import unittest
+import urllib.error
 from unittest.mock import Mock, patch
 
 from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
     MinerUOrchestratorError,
+    MinerUOrchestratorUnavailableError,
     fetch_mineru_orchestrator_health,
     wait_for_mineru_orchestrator_idle,
 )
@@ -99,6 +102,46 @@ class MinerUOrchestratorTests(unittest.TestCase):
             )
         self.assertEqual(health.active_tasks, 0)
         self.assertEqual(opener.open.call_count, 3)
+
+    def test_health_probe_classifies_http_statuses(self) -> None:
+        opener = Mock()
+        with patch(
+            "disclosure_anchor.adapters.runtime.mineru_orchestrator.urllib.request.build_opener",
+            return_value=opener,
+        ):
+            for status, expected_error in (
+                (404, MinerUOrchestratorError),
+                (503, MinerUOrchestratorUnavailableError),
+                (501, MinerUOrchestratorError),
+            ):
+                with self.subTest(status=status):
+                    opener.open.side_effect = urllib.error.HTTPError(
+                        "http://127.0.0.1:30002/health",
+                        status,
+                        "probe failed",
+                        {},
+                        None,
+                    )
+                    with self.assertRaises(expected_error):
+                        fetch_mineru_orchestrator_health(
+                            "http://127.0.0.1:30002"
+                        )
+
+    def test_health_probe_classifies_truncated_response_as_unavailable(self) -> None:
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+        response.read.side_effect = http.client.IncompleteRead(b"{", 100)
+        opener = Mock()
+        opener.open.return_value = response
+        with (
+            patch(
+                "disclosure_anchor.adapters.runtime.mineru_orchestrator.urllib.request.build_opener",
+                return_value=opener,
+            ),
+            self.assertRaises(MinerUOrchestratorUnavailableError),
+        ):
+            fetch_mineru_orchestrator_health("http://127.0.0.1:30002")
 
 
 if __name__ == "__main__":

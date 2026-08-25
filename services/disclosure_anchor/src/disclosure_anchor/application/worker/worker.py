@@ -113,6 +113,12 @@ PARSER_READINESS_RETRY_SECONDS = 5.0
 # report cadence: rotating observability must neither erase nor create a
 # circuit signal.
 DOWNSTREAM_CONTROL_EVIDENCE_SECONDS = 300.0
+
+
+class WorkerAdmissionUnavailableError(RuntimeError):
+    """A typed transient service outage paused new resident admissions."""
+
+
 # Single source in worker/queries.py: the queue's retry-budget predicate and
 # the scheduler's outage detection must agree on what "infrastructure" means.
 # Only explicit, current global-capacity signals may halt rolling admission.
@@ -274,6 +280,9 @@ class WorkerDeps:
     # waits. Losing that session must stop active MinerU groups before this
     # worker can overlap a replacement process.
     admission_guard: Callable[[], None] = lambda: None
+    # The singleton/ownership lease must remain observable even while the
+    # remote MinerU probe is in a bounded retry backoff.
+    ownership_guard: Callable[[], None] = lambda: None
 
 
 def _merge_acquisition_report(
@@ -901,6 +910,113 @@ class _ResidentParseHooks:
     emit_report: Callable[[WorkerReport], None]
     build_recovery_limit: int = 0
     publish_recovery_limit: int = 0
+    admission_backoff_initial_seconds: float = 120.0
+    admission_backoff_max_seconds: float = 1800.0
+    admission_ready: Callable[[], bool] = lambda: True
+    admission_retry_remaining: Callable[[], float] = lambda: 0.0
+
+
+class _ResidentAdmissionController:
+    """Pause only new parse admission across typed live-service outages."""
+
+    def __init__(
+        self,
+        deps: WorkerDeps,
+        *,
+        emit_report: Callable[[WorkerReport], None],
+        initial_backoff_seconds: float,
+        maximum_backoff_seconds: float,
+    ) -> None:
+        self._deps = deps
+        self._emit_report = emit_report
+        self._initial_backoff_seconds = initial_backoff_seconds
+        self._maximum_backoff_seconds = max(
+            initial_backoff_seconds,
+            maximum_backoff_seconds,
+        )
+        self._delay_seconds = initial_backoff_seconds
+        self._retry_at_monotonic = 0.0
+        self._first_failure_at: datetime | None = None
+        self._consecutive_failures = 0
+        self._latest_reason: str | None = None
+
+    def retry_remaining(self) -> float:
+        return max(0.0, self._retry_at_monotonic - time.monotonic())
+
+    def ready(self) -> bool:
+        if self.retry_remaining() > 0:
+            # Remote probe backoff must not hide loss of the singleton owner.
+            self._deps.ownership_guard()
+            return False
+        try:
+            self._deps.admission_guard()
+        except WorkerAdmissionUnavailableError as exc:
+            observed_at = self._deps.clock()
+            if self._first_failure_at is None:
+                self._first_failure_at = observed_at
+            self._consecutive_failures += 1
+            self._latest_reason = str(exc)[:500]
+            retry_delay = self._delay_seconds
+            self._retry_at_monotonic = time.monotonic() + retry_delay
+            next_probe_at = observed_at + timedelta(seconds=retry_delay)
+            self._emit_report(
+                WorkerReport(
+                    started_at=observed_at,
+                    admission_status="unavailable",
+                    admission_reason=self._latest_reason,
+                    admission_first_failure_at=self._first_failure_at,
+                    admission_consecutive_failures=(
+                        self._consecutive_failures
+                    ),
+                    admission_next_probe_at=next_probe_at,
+                    failures=[
+                        WorkerFailure(
+                            stage="admission",
+                            item_ref="mineru_live_probe",
+                            error_code=type(exc).__name__,
+                            retryable=True,
+                            message=self._latest_reason,
+                        )
+                    ],
+                )
+            )
+            LOGGER.warning(
+                "MinerU live admission unavailable (%s consecutive); "
+                "new parses paused for %.1fs: %s",
+                self._consecutive_failures,
+                retry_delay,
+                exc,
+            )
+            self._delay_seconds = min(
+                self._maximum_backoff_seconds,
+                retry_delay * 2,
+            )
+            return False
+        if self._first_failure_at is not None:
+            observed_at = self._deps.clock()
+            self._emit_report(
+                WorkerReport(
+                    started_at=observed_at,
+                    admission_status="available",
+                    admission_reason=None,
+                    admission_first_failure_at=self._first_failure_at,
+                    admission_consecutive_failures=(
+                        self._consecutive_failures
+                    ),
+                    admission_next_probe_at=None,
+                )
+            )
+            LOGGER.info(
+                "MinerU live admission recovered after %s consecutive "
+                "failure(s)",
+                self._consecutive_failures,
+            )
+        self._delay_seconds = self._initial_backoff_seconds
+        self._retry_at_monotonic = 0.0
+        self._first_failure_at = None
+        self._consecutive_failures = 0
+        self._latest_reason = None
+        return True
 
 
 def _parse_work_items(
@@ -1245,6 +1361,7 @@ def _report_has_observations(report: WorkerReport) -> bool:
             report.parse_heavy_dispatched,
             report.parse_huge_dispatched,
             report.parse_unknown_page_count,
+            report.admission_status,
             report.failures,
             report.build_stats,
         )
@@ -1417,15 +1534,26 @@ def run_resident_parse(
         outage_backoff_initial_seconds, outage_backoff_max_seconds
     )
     wake = work_available or threading.Event()
-    outage_delay = outage_backoff_initial_seconds
+    downstream_outage_delay = outage_backoff_initial_seconds
+    admission = _ResidentAdmissionController(
+        deps,
+        emit_report=emit_report,
+        initial_backoff_seconds=outage_backoff_initial_seconds,
+        maximum_backoff_seconds=outage_backoff_max_seconds,
+    )
 
     def wait_interruptibly(seconds: float, *, wake_for_work: bool) -> None:
         deadline = time.monotonic() + seconds
+        ownership_probe_at = 0.0
         while not should_stop():
             # Queue-empty and outage backoff are intentional responsive
             # states, not lost ownership. Renew only from this coordinator;
             # a deadlocked future path cannot reach this loop.
             deps.heartbeat()
+            now = time.monotonic()
+            if now >= ownership_probe_at:
+                deps.ownership_guard()
+                ownership_probe_at = now + PARSE_HEARTBEAT_INTERVAL_SECONDS
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
@@ -1484,7 +1612,12 @@ def run_resident_parse(
         # sets the event and either appears in the read or wakes the empty
         # fallback wait; no notification can be lost into a long idle sleep.
         wake.clear()
-        deps.admission_guard()
+        if not admission.ready():
+            wait_interruptibly(
+                max(0.001, admission.retry_remaining()),
+                wake_for_work=False,
+            )
+            continue
         deps.heartbeat()
         if limit <= 0:
             wait_interruptibly(idle_poll_seconds, wake_for_work=True)
@@ -1502,6 +1635,12 @@ def run_resident_parse(
                 emit_report=emit_report,
                 build_recovery_limit=max(0, build_recovery_limit),
                 publish_recovery_limit=max(0, publish_recovery_limit),
+                admission_backoff_initial_seconds=(
+                    outage_backoff_initial_seconds
+                ),
+                admission_backoff_max_seconds=outage_backoff_max_seconds,
+                admission_ready=admission.ready,
+                admission_retry_remaining=admission.retry_remaining,
             ),
         )
         if should_stop():
@@ -1514,34 +1653,43 @@ def run_resident_parse(
             ran_for = time.monotonic() - batch_started
             probe_failed = False
             while not should_stop():
-                wait_interruptibly(outage_delay, wake_for_work=False)
+                wait_interruptibly(
+                    downstream_outage_delay,
+                    wake_for_work=False,
+                )
                 if should_stop():
                     return
                 probe_failed = recover_finalize_tail()
                 if not probe_failed:
                     break
-                outage_delay = min(
-                    outage_backoff_max_seconds, outage_delay * 2
+                downstream_outage_delay = min(
+                    outage_backoff_max_seconds,
+                    downstream_outage_delay * 2,
                 )
             if ran_for >= report_interval_seconds:
-                outage_delay = outage_backoff_initial_seconds
+                downstream_outage_delay = outage_backoff_initial_seconds
             elif not probe_failed:
-                outage_delay = min(
-                    outage_backoff_max_seconds, outage_delay * 2
+                downstream_outage_delay = min(
+                    outage_backoff_max_seconds,
+                    downstream_outage_delay * 2,
                 )
             continue
         recovery_failed = recover_finalize_tail()
         while recovery_failed and not should_stop():
-            wait_interruptibly(outage_delay, wake_for_work=False)
+            wait_interruptibly(
+                downstream_outage_delay,
+                wake_for_work=False,
+            )
             if should_stop():
                 return
-            outage_delay = min(
-                outage_backoff_max_seconds, outage_delay * 2
+            downstream_outage_delay = min(
+                outage_backoff_max_seconds,
+                downstream_outage_delay * 2,
             )
             recovery_failed = recover_finalize_tail()
         if should_stop():
             return
-        outage_delay = outage_backoff_initial_seconds
+        downstream_outage_delay = outage_backoff_initial_seconds
         wait_interruptibly(idle_poll_seconds, wake_for_work=True)
 
 
@@ -1657,6 +1805,7 @@ def _parse_one_batch(
     readiness_failures = 0
     readiness_retry_at = 0.0
     readiness_deferred = False
+    admission_deferred = False
 
     def parser_ready() -> bool:
         nonlocal readiness_failures, readiness_retry_at
@@ -1764,9 +1913,10 @@ def _parse_one_batch(
         control_failures: deque[tuple[float, WorkerFailure]] = deque()
 
         def halt_admission() -> None:
-            nonlocal halt_refill, readiness_deferred
+            nonlocal halt_refill, readiness_deferred, admission_deferred
             halt_refill = True
             readiness_deferred = False
+            admission_deferred = False
 
         def rotate_report(*, force: bool = False) -> None:
             nonlocal report, report_started_monotonic, report_due_monotonic
@@ -2011,7 +2161,7 @@ def _parse_one_batch(
             return True
 
         def refill() -> None:
-            nonlocal readiness_deferred
+            nonlocal readiness_deferred, admission_deferred
             if (
                 halt_refill
                 or should_stop()
@@ -2028,7 +2178,15 @@ def _parse_one_batch(
                 # still resume. Closing the window or halting must not leave
                 # a zero-time wait state behind.
                 readiness_deferred = False
+                admission_deferred = False
                 return
+            if resident_hooks is not None:
+                if not resident_hooks.admission_ready():
+                    admission_deferred = True
+                    return
+                admission_deferred = False
+            else:
+                deps.admission_guard()
             if (
                 readiness_deferred
                 and time.monotonic() < readiness_retry_at
@@ -2039,7 +2197,6 @@ def _parse_one_batch(
             # boundary still fails closed before another document starts.
             # A transient failure pauses admission in this dispatcher; it does
             # not end the round unless the consecutive-failure threshold trips.
-            deps.admission_guard()
             if not parser_ready():
                 if readiness_failures >= PARSER_READINESS_FAILURE_THRESHOLD:
                     halt_admission()
@@ -2057,8 +2214,17 @@ def _parse_one_batch(
                 pass
 
         refill()
-        while parse_futures or finalize_futures or readiness_deferred:
-            if readiness_deferred and not parse_futures and not finalize_futures:
+        while (
+            parse_futures
+            or finalize_futures
+            or readiness_deferred
+            or admission_deferred
+        ):
+            if (
+                (readiness_deferred or admission_deferred)
+                and not parse_futures
+                and not finalize_futures
+            ):
                 if should_stop():
                     halt_admission()
                     break
@@ -2067,9 +2233,21 @@ def _parse_one_batch(
                     and not admission_open()
                 ):
                     readiness_deferred = False
+                    admission_deferred = False
                     break
-                remaining = max(0.0, readiness_retry_at - time.monotonic())
+                remaining_candidates = []
+                if readiness_deferred:
+                    remaining_candidates.append(
+                        max(0.0, readiness_retry_at - time.monotonic())
+                    )
+                if admission_deferred and resident_hooks is not None:
+                    remaining_candidates.append(
+                        resident_hooks.admission_retry_remaining()
+                    )
+                remaining = min(remaining_candidates, default=0.0)
                 if remaining > 0:
+                    deps.ownership_guard()
+                    deps.heartbeat()
                     time.sleep(min(0.5, remaining))
                     continue
                 refill()
@@ -2082,6 +2260,11 @@ def _parse_one_batch(
                 wait_timeout = min(
                     wait_timeout,
                     max(0.0, readiness_retry_at - time.monotonic()),
+                )
+            if admission_deferred and resident_hooks is not None:
+                wait_timeout = min(
+                    wait_timeout,
+                    resident_hooks.admission_retry_remaining(),
                 )
             completed, _ = wait(
                 futures,
@@ -2133,8 +2316,20 @@ def _parse_one_batch(
                 )
                 expected_duration_warned.add(future)
             if not completed:
-                deps.admission_guard()
-                if readiness_deferred and now >= readiness_retry_at:
+                deps.ownership_guard()
+                if admission_deferred and resident_hooks is not None:
+                    if resident_hooks.admission_retry_remaining() <= 0:
+                        refill()
+                elif resident_hooks is not None:
+                    if not resident_hooks.admission_ready():
+                        admission_deferred = True
+                else:
+                    deps.admission_guard()
+                if (
+                    not admission_deferred
+                    and readiness_deferred
+                    and now >= readiness_retry_at
+                ):
                     refill()
                 if any(
                     now < admitted.runaway_until_monotonic
@@ -2443,6 +2638,22 @@ def render_report_section(report: WorkerReport) -> str:
         f"- parse_huge_dispatched: {report.parse_huge_dispatched}",
         f"- parse_unknown_page_count: {report.parse_unknown_page_count}",
         f"- source_outage_break: {report.source_outage_break}",
+        f"- admission_status: {report.admission_status}",
+        f"- admission_reason: {report.admission_reason}",
+        "- admission_first_failure_at: "
+        + (
+            report.admission_first_failure_at.isoformat()
+            if report.admission_first_failure_at is not None
+            else "None"
+        ),
+        "- admission_consecutive_failures: "
+        f"{report.admission_consecutive_failures}",
+        "- admission_next_probe_at: "
+        + (
+            report.admission_next_probe_at.isoformat()
+            if report.admission_next_probe_at is not None
+            else "None"
+        ),
     ]
     if report.failures:
         lines.append("- failures:")
