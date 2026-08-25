@@ -148,7 +148,10 @@ window/served-model/request identity、cleanup 和有效期；缺失、陈旧或
 cache 代替。租约只裁决一次 process composition，避免一个健康多日任务因固定时间戳在中途停止补槽；
 任何新进程仍重新检查完整租约。常驻 admission 按 `DISCLOSURE_MINERU_LIVE_PROBE_INTERVAL_SECONDS`
 （默认 300 秒）核对 API health/orchestrator 合同和 `/v1/models` 唯一 model ID，process-local incident
-立即永久关闭当前 checker；这些 live probe 不是逐文档 full OCR，也不能替代部署 smoke。
+立即作废当前 checker 的缓存 proof，并在任一 remote-drain owner 活跃时暂停新 admission；最后一个
+owner 退出后仍须重新证明 API idle、精确模型身份和稳定 incident generation 才能恢复。transport、
+408/429/500/502/503/504 与截断响应进入有界退避；4xx/501、schema/version/capacity/model drift 仍
+fail closed。这些 live probe 不是逐文档 full OCR，也不能替代部署 smoke。
 v3 manifest 是闭合字段合同且会内嵌到 mode 0600 的私有 receipt；其中只能存不可变身份、hash 与
 非秘密启动参数，command 出现 credential flag 会 fail closed，原始 token/密码不得进入 manifest。
 
