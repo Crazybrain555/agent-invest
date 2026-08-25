@@ -21,7 +21,7 @@
 > 成为删除或边界规则。
 >
 > **2026-08-12 cutover**：当前唯一 writer 是 MinerU 3.4.4 Hybrid-medium →
-> `provider_document.v1` → `provider_unit_locator.v8`（历史 v1-v7 只读）。后文 NormalizedIR、双 parser、规则修复和
+> `provider_document.v1` → `provider_unit_locator.v9`（历史 v1-v8 只读）。后文 NormalizedIR、双 parser、规则修复和
 >旧版本号只属于调研历史；不得据此恢复生产路径。
 >
 > **2026-08-14 数字保真边界**：不恢复默认双 parser。MinerU 仍唯一拥有 block/order/bbox/table；
@@ -34,8 +34,10 @@
 > 无 text layer、数字替换/重排、
 > 非数字差异、旋转、高度重叠 bbox 或坐标/身份不闭合时仅保持 MinerU 原文。
 > native reader 固定 `pypdfium2==5.13.0`。
-> locator v7 是只读历史版本，曾新增监管模板 heading placement；当前 locator v8 保留 v6 的
-> source-bound 证据 vocabulary，但普通 paragraph 一律不凭整句词面提升为标题。
+> locator v7 是只读历史版本，曾新增监管模板 heading placement；locator v8 保留 v6 的
+> source-bound 证据 vocabulary，但普通 paragraph 一律不凭整句词面提升为标题。当前 locator v9
+> 只新增 finding-only 的正文完整 token omission、截断后仍至少两位的单数字末位截断与
+> cell-scoped 畸形数字分组证据；不改写 payload。
 >
 > **2026-08-21 MinerU 3.4.4 Hybrid 根因边界**：对一份 172 页 text-PDF 的完整 Unit、原 PDF、
 > 冻结 parser artifact 和 native text 做逐层回放后，确认两类上游错误。表格 crop 与 PDF 字形正确，

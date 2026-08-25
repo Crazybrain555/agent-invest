@@ -115,6 +115,10 @@ class SourceQualityFinding:
                 "identifier_confusable_mismatch"
             },
             "source_pdf_native_text_quality.v2": {"cjk_bracket_omission"},
+            "source_pdf_native_text_quality.v3": {
+                "native_text_omission",
+                "numeric_token_truncation",
+            },
         }
         if self.reason not in allowed_reasons.get(self.source_kind, set()):
             raise ValueError("source quality finding reason is unsupported")

@@ -386,10 +386,31 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
             (
                 "如财务报表附注 五 所述， 年度管理层存在偏向风险。",
                 " 如财务报表附注(五)42 所述，2025 年度管理层存在偏向风险。",
+                "source_pdf_native_text_quality.v1",
+                "native_text_omission",
             ),
-            ("余额100", "余额100 2025"),
+            (
+                "余额100",
+                "余额100 2025",
+                "source_pdf_native_text_quality.v1",
+                "native_text_omission",
+            ),
+            (
+                "抗IL-33；产生 、 、 和 等细胞因子；可见， 的作用机制"
+                "与疾病(COPD)匹配。",
+                "抗 IL-33；产生 IL-5、IL-13、IL-6 和 IL-8 等细胞因子；"
+                "可见，621 的作用机制与疾病 (COPD)匹配。",
+                "source_pdf_native_text_quality.v3",
+                "native_text_omission",
+            ),
+            (
+                "经审计，202年度净利润为49,297,357.94元。",
+                "经审计，2022 年度净利润为 49,297,357.94 元。",
+                "source_pdf_native_text_quality.v3",
+                "numeric_token_truncation",
+            ),
         )
-        for provider_text, native_text in cases:
+        for provider_text, native_text, source_kind, reason in cases:
             with self.subTest(provider_text=provider_text, native_text=native_text):
                 admitted = _admit_single_text_observation(provider_text, native_text)
 
@@ -403,7 +424,7 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
                         (item.source_kind, item.reason)
                         for item in admitted.source_quality_findings
                     ],
-                    [("source_pdf_native_text_quality.v1", "native_text_omission")],
+                    [(source_kind, reason)],
                 )
 
     def test_native_text_omission_finding_rejects_non_deletion_drift(self) -> None:
@@ -416,6 +437,11 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
             ("附注五所述，2025年度", "附注  五所述，2025年度"),
             ("余 额", "余额2025"),
             ("A B余额", "AB余额2025"),
+            ("研发 IL-33 机制", "研发IL-33机制"),
+            ("报告期1月", "报告期12月"),
+            ("经审计，205年度", "经审计，2025年度"),
+            ("经审计，202年度", "经审计，20222年度"),
+            ("经审计，202年度", "经审计，2022年度补充"),
         )
         for provider_text, native_text in cases:
             with self.subTest(provider_text=provider_text, native_text=native_text):
@@ -554,6 +580,18 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
                 "malformed_numeric_grouping",
             ),
             (
+                "<table><tr><td>账面价值</td><td>246,8 45,256.40</td>"
+                "</tr></table>",
+                "账面价值 246,845,256.40",
+                "malformed_numeric_grouping",
+            ),
+            (
+                "<table><tr><td>账面价值</td><td>240,940.074.94</td>"
+                "</tr></table>",
+                "账面价值 240,9\r\n40,07\r\n4.94",
+                "malformed_numeric_grouping",
+            ),
+            (
                 "<table><tr><td>项目</td><td>2025</td><td>2024</td></tr>"
                 "<tr><td>合计</td><td>152,886,112,625.30</td>"
                 "<td>100,000,000,000.00</td></tr></table>",
@@ -654,6 +692,42 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
         )
 
         self.assertFalse(admitted.source_quality_findings)
+        for provider_html, native_text in (
+            (
+                "<table><tr><td>利率</td><td>3.2%-3.6%</td></tr></table>",
+                "利率 3.2%-3.6%",
+            ),
+            (
+                "<table><tr><td>日期</td><td>2022.001.01</td></tr></table>",
+                "日期 2022.001.01",
+            ),
+            (
+                "<table><tr><td>链接</td>"
+                "<td>http://222.143.24.250:8247/report</td></tr></table>",
+                "链接 http://222.143.24.250:8247/report",
+            ),
+            (
+                "<table><tr><td>账面价值</td><td>246,8 45,256.40</td>"
+                "</tr></table>",
+                "账面价值 未披露",
+            ),
+            (
+                "<table><tr><td>账面价值</td><td>240,940.074.94</td>"
+                "</tr></table>",
+                "账面价值 未披露",
+            ),
+            (
+                "<table><tr><td>金额</td><td>240,940,074.94</td>"
+                "</tr></table>",
+                "金额 240,940,074.94",
+            ),
+        ):
+            with self.subTest(provider_html=provider_html):
+                candidate = _admit_single_table_observation(
+                    provider_html,
+                    native_text,
+                )
+                self.assertFalse(candidate.source_quality_findings)
 
     def test_does_not_reconcile_when_nonnumeric_source_text_differs(self) -> None:
         envelope = _envelope()

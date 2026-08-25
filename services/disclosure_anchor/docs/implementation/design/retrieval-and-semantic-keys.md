@@ -12,9 +12,9 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 当前唯一新 writer 是 MinerU 3.4.4 Hybrid-medium：
 
 - `provider_document.v1` 保存官方 provider artifact 的闭合投影与 hash-bound inventory；
-- `provider_unit_locator.v8` 保存 Unit 对 source block、标题 payload ordinal/换行 fragment、逻辑表物理段、
+- `provider_unit_locator.v9` 保存 Unit 对 source block、标题 payload ordinal/换行 fragment、逻辑表物理段、
   evidence digest、检索目标、source-PDF text reconciliation 与 source-bound quality findings。普通 paragraph
-  即使紧邻 selector 也不能凭整句词面提升为标题；历史 v1-v7 继续只读；
+  即使紧邻 selector 也不能凭整句词面提升为标题；历史 v1-v8 继续只读；
 - 历史 `normalized_ir.v4` 只允许通过窄 resolver 读取已发布 evidence，不再 Build、Rebuild、
   Publish 或重建检索投影。
 
@@ -24,7 +24,7 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 
 1. `title`：已接受的 source heading 叶标题；metadata document title 绝不复制到 Unit。
 2. `heading_path`：已接受 heading occurrence 的完整根到叶路径。
-3. body：只回放 `provider_unit_locator.v8.search_targets` 明确列出的 provider payload destination。
+3. body：只回放 `provider_unit_locator.v9.search_targets` 明确列出的 provider payload destination。
 4. `semantic_keys`（公共与私有唯一直接主题面；0047 已删除冗余 scalar）：可选的真实受控
    Unit **直接主题**完整有序集合，所有项都进入 key channel，避免 mixed/长 Unit 的 secondary route 漏召回。
    Provider writer 使用版本化闭集词表和 source-bound candidate gate：Document 的 filing type 和
@@ -149,7 +149,7 @@ MinerU 文本可由 native text 仅删除完整数字核心（可连同或保留
 source-PDF 文字形成 Unit payload。PDFium bounded-text 明确生成的、非首尾孤立 `CRLF` 软换行会按文字边界移除（ASCII
 单词间保留一个边界），CRLF 前后的水平空格仍须逐字匹配，且仅在同一观察中出现软换行时移除已校准的单个矩形末尾空格；宽窄字符、
 标点、NUL、裸 `CR/LF`、空白行、其他空白或多个末尾空格差异均拒绝。ProviderDocument
-仍原样保留 MinerU 输出。当前 locator v8 保留 raw block、provider/source text hash，并记录
+仍原样保留 MinerU 输出。当前 locator v9 保留 raw block、provider/source text hash，并记录
 `source_pdf_native_numeric.v1`、窄 `source_pdf_native_identifier.v1`，或只允许一处 `=` 与完整数字 atom
 同时漏失的 `source_pdf_native_identifier.v2` provenance，覆盖 Unit 自身 blocks
 和 heading-chain 依赖，Publish 每次从 PDF 重放。identifier 只允许完整数字 atom、数字相邻 ASCII 空格
@@ -161,7 +161,12 @@ USCC 的唯一 `O/0` checksum 冲突或 source-only 单个 `〔〕` 漏失记录
 payload。text/native 若能证明
 source-only omission 且至少漏一个完整数字 atom、又不满足任何闭合 repair，则只产生
 `source_pdf_native_text_quality.v1/native_text_omission` 并保留 MinerU payload；finding proof 只忽略
-处在矩形首尾或直接紧邻数字 atom 的单个 ASCII 空格/Tab atom，其他正文空白逐字一致；native reader固定
+处在矩形首尾或直接紧邻数字 atom 的单个 ASCII 空格/Tab atom，其他正文空白逐字一致。locator v9
+另只增加 finding-only 的 `source_pdf_native_text_quality.v3`：同一 text bbox 仅折叠每处严格
+CJK/ASCII 边界的单个 ASCII 空格/Tab 后，仍须逐字证明完整 token omission，或一个原本至少三位、
+截断后仍至少两位的数字 atom 只少末位字符；表格新增的畸形分组
+检测只扫描单个 cell，且多小数点金额必须先有千分位逗号，避免 URL/IP 误报。两类均不改 payload。
+native reader 固定
 `pypdfium2==5.13.0`，不得据此引入第二套
 阅读顺序、标题树或表格结构。
 

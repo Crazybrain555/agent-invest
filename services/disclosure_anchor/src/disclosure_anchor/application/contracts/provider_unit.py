@@ -33,7 +33,8 @@ NATIVE_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v4"
 TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v5"
 IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v6"
 STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v7"
-PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v8"
+HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v8"
+PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v9"
 SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS = frozenset(
     {
         LEGACY_PROVIDER_UNIT_LOCATOR_VERSION,
@@ -43,10 +44,11 @@ SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS = frozenset(
         TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
         IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
         STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION,
+        HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION,
         PROVIDER_UNIT_LOCATOR_VERSION,
     }
 )
-PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v22"
+PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v23"
 
 _SOURCE_REPAIR_LOCATOR_VERSIONS = frozenset(
     {
@@ -56,6 +58,7 @@ _SOURCE_REPAIR_LOCATOR_VERSIONS = frozenset(
         TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
         IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
         STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION,
+        HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION,
         PROVIDER_UNIT_LOCATOR_VERSION,
     }
 )
@@ -66,6 +69,7 @@ _PAYLOAD_BOUND_LOCATOR_VERSIONS = frozenset(
         TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
         IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
         STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION,
+        HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION,
         PROVIDER_UNIT_LOCATOR_VERSION,
     }
 )
@@ -75,6 +79,7 @@ _CONTINUATION_FRAGMENT_LOCATOR_VERSIONS = frozenset(
         TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
         IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
         STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION,
+        HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION,
         PROVIDER_UNIT_LOCATOR_VERSION,
     }
 )
@@ -109,6 +114,13 @@ _SOURCE_RECONCILIATION_KINDS_BY_LOCATOR_VERSION = {
         }
     ),
     STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {
+            "source_pdf_native_numeric.v1",
+            "source_pdf_native_identifier.v1",
+            "source_pdf_native_identifier.v2",
+        }
+    ),
+    HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
         {
             "source_pdf_native_numeric.v1",
             "source_pdf_native_identifier.v1",
@@ -152,12 +164,21 @@ _SOURCE_QUALITY_KINDS_BY_LOCATOR_VERSION = {
             "source_pdf_native_text_quality.v2",
         }
     ),
+    HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {
+            "source_pdf_native_table_quality.v1",
+            "source_pdf_native_text_quality.v1",
+            "source_pdf_native_identifier_quality.v1",
+            "source_pdf_native_text_quality.v2",
+        }
+    ),
     PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
         {
             "source_pdf_native_table_quality.v1",
             "source_pdf_native_text_quality.v1",
             "source_pdf_native_identifier_quality.v1",
             "source_pdf_native_text_quality.v2",
+            "source_pdf_native_text_quality.v3",
         }
     ),
 }
@@ -195,6 +216,9 @@ _HEADING_PLACEMENT_SOURCES_BY_LOCATOR_VERSION = {
             "table_container",
             "statutory_template",
         )
+    ),
+    HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        (*_BASE_HEADING_PLACEMENT_SOURCES, "table_label", "table_container")
     ),
     PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
         (*_BASE_HEADING_PLACEMENT_SOURCES, "table_label", "table_container")
@@ -419,6 +443,10 @@ class ProviderUnitSourceQualityFinding:
                 "identifier_confusable_mismatch"
             },
             "source_pdf_native_text_quality.v2": {"cjk_bracket_omission"},
+            "source_pdf_native_text_quality.v3": {
+                "native_text_omission",
+                "numeric_token_truncation",
+            },
         }
         if self.reason not in allowed_reasons.get(self.source_kind, set()):
             raise ValueError("provider Unit quality finding reason is unsupported")
@@ -1140,6 +1168,7 @@ def _optional_text(value: object, *, label: str) -> str | None:
 
 
 __all__ = [
+    "HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION",
     "LEGACY_PROVIDER_UNIT_LOCATOR_VERSION",
     "NATIVE_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION",
     "PAYLOAD_BOUND_PROVIDER_UNIT_LOCATOR_VERSION",

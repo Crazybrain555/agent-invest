@@ -457,10 +457,11 @@ reader pin `pypdfium2==5.13.0`。provider_unit_locator.v6 只新增严格两列 
 单一 `O/0` checksum 冲突与 CJK `〔〕` 单括号漏失两种 finding-only vocabulary，均不改 payload；
 历史 locator v1-v5 继续按原 vocabulary 读取：v2/v3 只接受 numeric.v1，v4 才接受
 identifier.v1/table-quality，v5 才接受 identifier.v2/text-quality，且不得声明 v6 evidence；v1-v3
-也不得声明 v4 才引入的 `unit_title_fragment` search destination。当前 writer
-`provider_unit_locator.v8` 保留 v6 的 source-bound vocabulary，但不凭普通 paragraph
-整句词面创造 heading placement。历史 v7 只读，仍可解码其 `statutory_template` placement；v1-v6
-不得声明该 v7 vocabulary，v8 writer 也不得重新发出。若 ProviderDocument 没有明确标题 occurrence，
+也不得声明 v4 才引入的 `unit_title_fragment` search destination。locator v8 保留 v6 的
+source-bound vocabulary，但不凭普通 paragraph 整句词面创造 heading placement；历史 v7 只读，仍可
+解码其 `statutory_template` placement。当前 writer `provider_unit_locator.v9` 只新增 finding-only 的
+完整 token omission、截断后仍至少两位的单数字末位截断与 cell-scoped 畸形数字分组证据，不改 payload。v1-v6 不得声明 v7
+vocabulary，v8/v9 writer 不得重新发出，v8 也不得声明 v9 quality kind。若 ProviderDocument 没有明确标题 occurrence，
 prompt 与 selector 留在既有 Unit；只有完整 headed Unit 在同页按 source 顺序恰含一个 prompt part 和
 一个 closed selector part也不足以证明 Unit-level ownership，仍保持 NULL，直到 Provider 提供明确
 prompt role。

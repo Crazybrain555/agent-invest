@@ -528,7 +528,7 @@ payload 是有序 parts；每个 part 只保存 source-bound 浅内容字段，�
 `payload_kind` 唯一表达。
 视觉 part 额外保存内容型 artifact 的 `{sha256,size_bytes,media_type}`，使图像变化进入
 `content_hash`；路径、crop、bbox、search binding 与 supporting evidence 只在 Unit 顶层
-`provider_unit_locator.v8`，不复制到每个 part，也不形成第二套证据图。
+`provider_unit_locator.v9`，不复制到每个 part，也不形成第二套证据图。
 
 ```json
 {
@@ -612,7 +612,7 @@ Unit-local 受控 witness 产生粗主题 `semantic_keys`；普通 table text/da
 ## 7.2 artifact_locator
 
 `artifact_locator` 是可选的**技术位置**。新产物使用闭合的
-`provider_unit_locator.v8`，绑定 `provider_document.v1` hash、source block index + payload ordinal、标题链、
+`provider_unit_locator.v9`，绑定 `provider_document.v1` hash、source block index + payload ordinal、标题链、
 同页换行标题的 source `continuation_fragments`、Unit parts、物理表格段、evidence digest、显式 search target、
 native-PDF text reconciliation 与 table quality finding。`title`、heading_path 或 caption
 发生争议时，必须沿 locator 回到 ProviderDocument、MinerU 原始 artifact 和不可变 PDF 查证；
@@ -634,7 +634,7 @@ source_text_reconciliations / source_quality_findings（仅命中闭合 native-P
 
 ```json
 {
-  "contract_version": "provider_unit_locator.v8",
+  "contract_version": "provider_unit_locator.v9",
   "provider_document_sha256": "sha256:...",
   "heading_chain": [{"source_index": 42, "placement_source": "numbering"}],
   "parts": [{"part_index": 0, "block_source_indices": [43, 44],
@@ -672,13 +672,16 @@ native reader 固定使用 `pypdfium2==5.13.0`。locator v7 是只读历史版�
 `statutory_template` heading placement；locator v8 保留 v6 的 source-bound 证据 vocabulary，但不再
 凭普通 paragraph 的整句词面发出该 placement。没有明确 source heading occurrence 时，prompt 与
 selector 留在既有 Unit；同页、连续、唯一 prompt+closed-selector 形态本身也不授权 Unit-level
-applicability。历史
-`provider_unit_locator.v1-v7` 继续只读；v1 不能声明校正，
+applicability。locator v9 只新增 finding-only 的 `source_pdf_native_text_quality.v3`：仅折叠每处严格
+CJK/ASCII 边界的单个 ASCII 空格/Tab 后，必须逐字证明完整 token omission，或一个原本至少三位、
+截断后仍至少两位的数字 atom 只少一个末位；表格畸形数字
+分组只在单个 cell 内判断，多小数点金额还必须先有千分位逗号。两类均不改 payload。历史
+`provider_unit_locator.v1-v8` 继续只读；v1 不能声明校正，
 v1/v2 的 heading 默认绑定 source block 的首个 payload；v3 起可绑定非首 payload，v4 起还可绑定
 同页换行标题 fragment 与 table quality finding。v2/v3 只读 numeric.v1，v4 才可读取 identifier.v1，
 v5 才可读取 identifier.v2/text-quality，v6 才可读取上述 identifier/CJK quality；v1-v3 也不得声明
-v4 才引入的 `unit_title_fragment` search destination，v1-v6 不得声明 v7 placement，v8 writer 不得
-重新发出 `statutory_template`。历史 locator
+v4 才引入的 `unit_title_fragment` search destination，v1-v6 不得声明 v7 placement，v8/v9 writer 不得
+重新发出 `statutory_template`，v8 也不得声明 v9 quality kind。历史 locator
 不得声明后代 vocabulary。
 
 MinerU merge-on 输出中的非空 content-list table owner 是唯一逻辑/检索 payload；后续空 table
@@ -1038,7 +1041,7 @@ order_index
 6 列，至 04R-R7 为 32 列（仅历史基线）。
 
 0008 迁移起，`processing_runs_v1` 投影 `builder_rules_version`，用于确定性 Unit builder 归因；
-历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 当前必须等于 `provider_unit.v22`。
+历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 当前必须等于 `provider_unit.v23`。
 
 0031 迁移起，`processing_runs_v1` 只额外暴露不透明的
 `artifact_owner_processing_run_id`：parse run 指向自身，`rebuild_units` 指向实际拥有

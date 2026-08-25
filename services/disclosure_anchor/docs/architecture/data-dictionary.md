@@ -76,7 +76,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | status | running / succeeded / failed；stale running 由 worker 按阈值回收 |
 | is_active | 每文档唯一 true（发布原子切换） |
 | artifact_owner_processing_run_id | 实际拥有 parser artifact 与 primary parse artifact 字节的根 parse run；parse=self，rebuild 传播根 owner，不能从路径文本反推 |
-| builder_rules_version | 新 writer 当前恒等于 `provider_unit.v22`；历史 run 保留原规则版本，不能回写 |
+| builder_rules_version | 新 writer 当前恒等于 `provider_unit.v23`；历史 run 保留原规则版本，不能回写 |
 | parser_target_identity | 产生该 run 的完整 parser target（backend/method/language/runtime bundle identity）；不从零散 parser_* 列反推 |
 | search_projection_error | 当前 retrieval_rules_version 的确定性、非重试检索投影终态；delta 不空转，full 可显式重试，成功替换时同事务清空 |
 | content_hash_aggregate / structure_hash | run 级聚合（U3）；"内容没变"只看前者 |
@@ -100,7 +100,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | quality_status | ok / needs_review / unusable（乱码率>30%） |
 | applicability | vc16 CHECK：applicable / not_applicable / NULL；只列化当前叶标题自有 selector，或第一个实质/视觉 part 之前 declaration-only leading part 的受控成对勾选。普通 paragraph 不因整句匹配变成标题或 prompt role；实质、visual/table carrier 之后以及嵌套 child 的 selector 不提升为整个 Unit 状态；不跨 Unit 继承（见 §5 讨论） |
 | page_no | 定位列（artifact_locator 首页码） |
-| artifact_locator | 新 writer 为闭合的 `provider_unit_locator.v8`：保留 v6 的 ProviderDocument hash、source heading block + payload ordinal、parts、逻辑表 owner/physical segment、evidence/search bindings、`continuation_fragments`、native-PDF reconciliation 与 quality findings，不凭普通 paragraph 的整句词面发明标题。历史 v1-v7 继续按各自 vocabulary 只读；v7 可解码其历史 `statutory_template` placement，但 v8 不发出；v1-v3 不得声明 v4 才引入的 `unit_title_fragment` search destination，v1-v6 不得声明 v7 placement。跨页关系只接受 MinerU merge-on 的 typed owner/stub assertion；上一页表尾 exact `page_footnote` 只可作为 physical boundary，下一页 leading footnote 仍阻断；不按相似度猜、不复制 HTML、不存 raw JSON/path；JSONB(none_as_null) |
+| artifact_locator | 新 writer 为闭合的 `provider_unit_locator.v9`：保留 v8 的 ProviderDocument hash、source heading block + payload ordinal、parts、逻辑表 owner/physical segment、evidence/search bindings、`continuation_fragments`、native-PDF reconciliation 与 quality findings，不凭普通 paragraph 的整句词面发明标题；只新增 finding-only 的完整 token omission、截断后仍至少两位的单数字末位截断和 cell-scoped 畸形数字分组证据，不改 payload。历史 v1-v8 继续按各自 vocabulary 只读；v7 可解码其历史 `statutory_template` placement，v8/v9 不发出，v8 也不得声明 v9 quality kind；v1-v3 不得声明 v4 才引入的 `unit_title_fragment` search destination，v1-v6 不得声明 v7 placement。跨页关系只接受 MinerU merge-on 的 typed owner/stub assertion；上一页表尾 exact `page_footnote` 只可作为 physical boundary，下一页 leading footnote 仍阻断；不按相似度猜、不复制 HTML、不存 raw JSON/path；JSONB(none_as_null) |
 
 ### classification_rule（0016，词表的库内查询副本）
 | 列 | 含义 |
@@ -178,7 +178,7 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 | 文件 | 内容 | 当前版本 |
 |---|---|---|
 | application/contracts/provider_document_envelope.py | 新 writer 的 canonical primary parse artifact codec；必须经独立 PDF 校验与 MinerU bundle 全量重读 admission，codec 本身不是 source trust boundary | provider_document.v1 |
-| application/contracts/provider_unit.py + application/services/provider_unit_builder.py | 闭合 Unit locator/search binding 与 deterministic coarse Unit 投影；不含业务 taxonomy、proof graph 或 cell repair | provider_unit.v22 |
+| application/contracts/provider_unit.py + application/services/provider_unit_builder.py | 闭合 Unit locator/search binding 与 deterministic coarse Unit 投影；不含业务 taxonomy、proof graph 或 cell repair | provider_unit.v23 |
 | application/contracts/normalized_ir_v4_evidence.py | 冻结历史 v4 evidence manifest 的最小只读 resolver；不得被新 writer import，也不支持 Build/Publish/Rebuild | normalized_ir.v4 read-only |
 | adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs；r6 financing +011711 担保/011713 财务资助、meeting_resolution +01239910；r7 equity_share_change +0115 父级实码） | 2026-07-r7 |
 | adapters/sources/cninfo/facet_map.json | F006V 维度判定（market 精确码/publisher 0101） | 2026-07-r1 |

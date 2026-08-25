@@ -405,6 +405,18 @@ _MALFORMED_GROUPING_SPACE_RE = re.compile(
     r"(?<![0-9])[0-9]{1,3}(?:,[0-9]{3})+,(?:\s+[0-9]{3},)+"
     r"\s*[0-9]{3}\.[0-9]{2}(?![0-9])"
 )
+_MALFORMED_GROUPING_SPLIT_TRIPLET_RE = re.compile(
+    r"(?<![0-9])(?:[0-9]{1,3},)*[0-9]{1,2}[ \t][0-9]{1,2}"
+    r"(?:,[0-9]{3})+\.[0-9]{2}(?![0-9])"
+)
+_MALFORMED_GROUPING_MULTI_DOT_RE = re.compile(
+    r"(?<![0-9])(?:[0-9]{1,3},)+[0-9]{3}\.[0-9]{3}\.[0-9]{2}"
+    r"(?![0-9])"
+)
+_CJK_ASCII_LAYOUT_SPACE_RE = re.compile(
+    r"(?:(?<=[^\x00-\x7f])[ \t](?=[A-Za-z(])|"
+    r"(?<=[A-Za-z)])[ \t](?=[^\x00-\x7f]))"
+)
 
 
 def _source_quality_findings(
@@ -460,6 +472,12 @@ def _source_quality_findings(
                     native_text=observation.text,
                 )
                 source_kind = "source_pdf_native_text_quality.v1"
+                if reason is None:
+                    reason = _layout_text_quality_reason(
+                        provider_text=payload.text,
+                        native_text=observation.text,
+                    )
+                    source_kind = "source_pdf_native_text_quality.v3"
         else:
             continue
         if reason is None:
@@ -567,6 +585,22 @@ def _table_quality_reason(
             _MALFORMED_GROUPING_SPACE_RE.search(provider_visible) is not None
             and _MALFORMED_GROUPING_SPACE_RE.search(native_text) is None
         )
+        or (
+            _has_source_proved_table_cell_malformed_grouping(
+                _MALFORMED_GROUPING_SPLIT_TRIPLET_RE,
+                provider_html=provider_html,
+                native_text=native_text,
+                correction="remove_internal_space",
+            )
+        )
+        or (
+            _has_source_proved_table_cell_malformed_grouping(
+                _MALFORMED_GROUPING_MULTI_DOT_RE,
+                provider_html=provider_html,
+                native_text=native_text,
+                correction="first_dot_to_comma",
+            )
+        )
     ):
         return "malformed_numeric_grouping"
     if (
@@ -576,6 +610,38 @@ def _table_quality_reason(
     ):
         return "numeric_token_mismatch"
     return None
+
+
+def _has_source_proved_table_cell_malformed_grouping(
+    pattern: re.Pattern[str],
+    *,
+    provider_html: str,
+    native_text: str,
+    correction: str,
+) -> bool:
+    native_proofs = {
+        re.sub(r"\s+", " ", native_text),
+        re.sub(
+            r"\s+",
+            " ",
+            re.sub(r"(?<=\d)\s+(?=\d)", "", native_text),
+        ),
+    }
+    for raw_cell in _TABLE_CELL_RE.findall(provider_html):
+        cell_text = html_visible_text(raw_cell)
+        for match in pattern.finditer(cell_text):
+            candidate = re.sub(r"\s+", " ", match.group(0))
+            if correction == "remove_internal_space":
+                repaired = re.sub(r"(?<=\d) (?=\d)", "", candidate, count=1)
+            elif correction == "first_dot_to_comma":
+                repaired = candidate.replace(".", ",", 1)
+            else:
+                raise ValueError("table malformed-grouping correction is unsupported")
+            if not any(candidate in proof for proof in native_proofs) and any(
+                repaired in proof for proof in native_proofs
+            ):
+                return True
+    return False
 
 
 def _numeric_source_replacement(
@@ -675,6 +741,27 @@ def _text_quality_reason(*, provider_text: str, native_text: str) -> str | None:
         return None
     if _is_source_omission_with_full_numeric_atom(provider_text, source):
         return "native_text_omission"
+    return None
+
+
+def _layout_text_quality_reason(
+    *,
+    provider_text: str,
+    native_text: str,
+) -> str | None:
+    """Flag source-proved clipping after one bounded CJK/ASCII space fold."""
+
+    source = _canonical_native_text(native_text)
+    if source is None or not provider_text.strip() or not source:
+        return None
+    provider_proof = _CJK_ASCII_LAYOUT_SPACE_RE.sub("", provider_text)
+    source_proof = _CJK_ASCII_LAYOUT_SPACE_RE.sub("", source)
+    if provider_proof == source_proof:
+        return None
+    if _is_source_omission_with_full_numeric_atom(provider_proof, source_proof):
+        return "native_text_omission"
+    if _is_single_numeric_atom_truncation(provider_proof, source_proof):
+        return "numeric_token_truncation"
     return None
 
 
@@ -949,6 +1036,41 @@ def _has_ambiguous_adjacent_numeric_atoms(
         and right[1][0] not in {"+", "-", "−"}
         for left, right in zip(atoms, atoms[1:], strict=False)
     )
+
+
+def _is_single_numeric_atom_truncation(provider: str, source: str) -> bool:
+    """Prove exactly one source numeric atom lost one trailing character."""
+
+    raw_provider_atoms = _numeric_atoms(provider)
+    raw_source_atoms = _numeric_atoms(source)
+    if _has_ambiguous_adjacent_numeric_atoms(
+        raw_provider_atoms
+    ) or _has_ambiguous_adjacent_numeric_atoms(raw_source_atoms):
+        return False
+    provider_atoms = _numeric_quality_proof_atoms(raw_provider_atoms)
+    source_atoms = _numeric_quality_proof_atoms(raw_source_atoms)
+    if len(provider_atoms) != len(source_atoms):
+        return False
+    truncated = False
+    for provider_atom, source_atom in zip(
+        provider_atoms,
+        source_atoms,
+        strict=True,
+    ):
+        if provider_atom == source_atom:
+            continue
+        if truncated or provider_atom[0] != "number" or source_atom[0] != "number":
+            return False
+        provider_number = provider_atom[1]
+        source_number = source_atom[1]
+        if (
+            len(provider_number) < 2
+            or len(source_number) != len(provider_number) + 1
+            or not source_number.startswith(provider_number)
+        ):
+            return False
+        truncated = True
+    return truncated
 
 
 def _numeric_atoms(value: str) -> tuple[tuple[str, str], ...]:

@@ -113,7 +113,7 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         self.assertIn(template, json.dumps(parent_unit.payload, ensure_ascii=False))
         self.assertEqual(
             parent_unit.locator.contract_version,
-            "provider_unit_locator.v8",
+            "provider_unit_locator.v9",
         )
         with self.assertRaisesRegex(ValueError, "heading placement"):
             replace(
@@ -1079,6 +1079,7 @@ class ProviderUnitBuilderTests(unittest.TestCase):
             "provider_unit_locator.v6": "table_container",
             "provider_unit_locator.v7": "statutory_template",
             "provider_unit_locator.v8": "table_container",
+            "provider_unit_locator.v9": "table_container",
         }
         for version, placement_source in accepted.items():
             with self.subTest(version=version, accepted=placement_source):
@@ -1120,6 +1121,7 @@ class ProviderUnitBuilderTests(unittest.TestCase):
             ("provider_unit_locator.v2", "table_label"),
             ("provider_unit_locator.v6", "statutory_template"),
             ("provider_unit_locator.v8", "statutory_template"),
+            ("provider_unit_locator.v9", "statutory_template"),
         ):
             with self.subTest(version=version, rejected=placement_source):
                 with self.assertRaisesRegex(ValueError, "heading placement"):
@@ -1238,6 +1240,33 @@ class ProviderUnitBuilderTests(unittest.TestCase):
                 source_quality_findings=(finding,),
             )
             self.assertEqual(accepted.source_quality_findings, (finding,))
+
+        layout_finding = ProviderUnitSourceQualityFinding(
+            source_index=100,
+            payload_ordinal=0,
+            raw_block_sha256=digest,
+            provider_text_sha256=digest,
+            source_text_sha256=digest,
+            reason="numeric_token_truncation",
+            source_kind="source_pdf_native_text_quality.v3",
+        )
+        with self.assertRaisesRegex(ValueError, "quality kind"):
+            replace(
+                locator,
+                contract_version="provider_unit_locator.v8",
+                source_text_reconciliations=(),
+                source_quality_findings=(layout_finding,),
+            )
+        accepted_layout = replace(
+            locator,
+            contract_version="provider_unit_locator.v9",
+            source_text_reconciliations=(),
+            source_quality_findings=(layout_finding,),
+        )
+        self.assertEqual(
+            accepted_layout.source_quality_findings,
+            (layout_finding,),
+        )
 
     def test_locator_versions_reject_later_title_fragment_search_vocabulary(
         self,
@@ -1400,7 +1429,7 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         draft = build_provider_units(admitted).units[0]
 
         self.assertEqual(draft.title, "（七）担保情况及对债券投资者权益的影响")
-        self.assertEqual(draft.locator.contract_version, "provider_unit_locator.v8")
+        self.assertEqual(draft.locator.contract_version, "provider_unit_locator.v9")
         self.assertEqual(
             [
                 fragment.source_index
