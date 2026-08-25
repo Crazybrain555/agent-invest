@@ -1,5 +1,5 @@
 {
-  "version": "semantic-events-2026-08-r33",
+  "version": "semantic-events-2026-08-r49",
   "_about": "Unit 事件与通用章节的闭集主题路由词表。labels/description 只用于 source-bound 标题、表单字段与正文主题证据，不授权文档类别直接传播。历史、风险、条件、计划、因果、否定与不适用属于 L2 模态，不抹掉 Unit 的直接主题。role_anchor_keys 是精确披露角色，可与独立粗主题并存但不得由别的角色中的数字反向制造。exclusive_container_keys 只保留目录、整表等机械独占载体。section_container_keys 仅允许同 scope、已接受 heading_path 的精确结构上下文进入独立 section_keys。",
   "fallback_key": "document_content",
   "quantitative_topic_keys": [
@@ -10,6 +10,7 @@
     "price_changes",
     "issue_price",
     "issue_size",
+    "consideration_payment",
     "share_buyback_price_volume",
     "contract_value",
     "cumulative_external_guarantees",
@@ -45,14 +46,18 @@
     "dilution_impact",
     "issuance_outcome",
     "issuance_plan",
+    "investor_protection_arrangements",
     "performance_commitment",
+    "regulatory_approval",
+    "restructuring_transaction_overview",
     "subscription_arrangements",
     "supporting_financing",
     "transaction_classification",
     "transaction_impact",
     "transaction_commitments",
     "transaction_rationale",
-    "transaction_risk"
+    "transaction_risk",
+    "transaction_scheme_adjustment"
   ],
   "entries": [
     {
@@ -138,8 +143,12 @@
       "description": "业绩预告的不确定性、审计差异或风险提示",
       "labels": [
         "业绩预告风险",
+        "风险提示",
         "不确定性说明",
         "与会计师沟通情况"
+      ],
+      "heading_labels": [
+        "与会计师事务所沟通情况"
       ],
       "scopes": [
         "performance_forecast"
@@ -184,6 +193,7 @@
       "description": "业绩快报中财务指标增减变动及原因",
       "labels": [
         "增减变动幅度达30%以上项目的主要原因",
+        "变动幅度达30%以上指标的说明",
         "业绩变动原因"
       ],
       "scopes": [
@@ -403,6 +413,7 @@
       "key": "restructuring_transaction_overview",
       "description": "资产重组或重大交易的方案与概况",
       "labels": [
+        "本次交易概况",
         "交易概述",
         "重组方案",
         "交易方案"
@@ -443,6 +454,8 @@
         "评估与定价",
         "估值与定价",
         "定价依据",
+        "确保本次交易的定价公平、公允",
+        "交易定价公平、公允",
         "发行股份的定价依据、定价基准日和发行价格",
         "发行股份的定价基准日、定价依据和发行价格"
       ],
@@ -457,6 +470,30 @@
         "交易对价",
         "支付方式",
         "对价支付"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
+      "key": "transaction_share_lockup",
+      "description": "资产重组交易对方取得股份的锁定期与分批解锁安排",
+      "labels": [
+        "锁定期安排",
+        "股份锁定安排",
+        "股份锁定期"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
+      "key": "transition_period_profit_loss",
+      "description": "资产重组过渡期或损益归属期间的损益承担安排",
+      "labels": [
+        "期间损益安排",
+        "过渡期损益安排",
+        "损益归属期间安排"
       ],
       "scopes": [
         "restructuring_assets"
@@ -480,7 +517,9 @@
       "description": "资产重组或交易对上市公司业务、股权和财务指标的影响",
       "labels": [
         "本次交易对上市公司的影响",
-        "本次重组对上市公司的影响"
+        "本次重组对上市公司的影响",
+        "后续安排及对本次交易的影响",
+        "对上市公司流动性的影响"
       ],
       "scopes": [
         "restructuring_assets"
@@ -522,6 +561,18 @@
       ]
     },
     {
+      "key": "investor_protection_arrangements",
+      "description": "资产重组中保护中小投资者权益的程序与安排",
+      "labels": [
+        "本次重组对中小投资者权益保护的安排",
+        "本次交易对中小投资者权益保护的安排",
+        "中小投资者权益保护安排"
+      ],
+      "scopes": [
+        "restructuring_assets"
+      ]
+    },
+    {
       "key": "transaction_commitments",
       "description": "重大资产重组相关方作出的重要承诺",
       "labels": [
@@ -539,6 +590,8 @@
       "labels": [
         "募集配套资金具体方案",
         "发行股份募集配套资金具体方案",
+        "募集配套资金用途",
+        "募集配套资金的发行安排及实施基础",
         "募集配套资金情况的简要介绍",
         "募集配套资金概况"
       ],
@@ -552,6 +605,8 @@
       "labels": [
         "审批程序",
         "批准情况",
+        "本次交易决策过程和批准情况",
+        "本次重组决策过程和批准情况",
         "尚需履行的程序"
       ],
       "scopes": [
@@ -631,6 +686,21 @@
       ]
     },
     {
+      "key": "issue_allottees",
+      "description": "证券发行、配售或认购对象范围",
+      "labels": [
+        "配售对象",
+        "发行对象",
+        "认购对象"
+      ],
+      "scopes": [
+        "additional_issuance",
+        "rights_issue",
+        "convertible_bond",
+        "restructuring_assets"
+      ]
+    },
+    {
       "key": "use_of_proceeds",
       "description": "募集资金用途与投向",
       "labels": [
@@ -686,6 +756,9 @@
         "转股安排",
         "转股价格",
         "转股期"
+      ],
+      "heading_labels": [
+        "转股起止日期"
       ],
       "scopes": [
         "convertible_bond"
@@ -785,6 +858,32 @@
       ]
     },
     {
+      "key": "bond_guarantee_terms",
+      "description": "可转债本次发行的担保或无担保条款",
+      "labels": [
+        "可转债担保条款"
+      ],
+      "heading_labels": [
+        "担保情况"
+      ],
+      "scopes": [
+        "convertible_bond"
+      ]
+    },
+    {
+      "key": "bond_credit_rating",
+      "description": "可转债当前主体、债项信用评级与展望",
+      "labels": [
+        "可转债信用评级"
+      ],
+      "heading_labels": [
+        "信用评级"
+      ],
+      "scopes": [
+        "convertible_bond"
+      ]
+    },
+    {
       "key": "bond_risk",
       "description": "可转债信用、转股、赎回、回售或交易风险",
       "labels": [
@@ -802,6 +901,9 @@
         "回购方案",
         "回购报告书",
         "回购股份方案"
+      ],
+      "heading_labels": [
+        "回购方案的主要内容"
       ],
       "scopes": [
         "share_buyback"
@@ -1000,7 +1102,12 @@
       "labels": [
         "合同金额",
         "协议金额",
-        "交易金额"
+        "交易金额",
+        "交易对价",
+        "技术转让费",
+        "首付款",
+        "权利金",
+        "转让总价格"
       ],
       "scopes": [
         "major_contract"
@@ -1038,6 +1145,9 @@
         "合同风险",
         "履约风险"
       ],
+      "heading_labels": [
+        "风险提示"
+      ],
       "scopes": [
         "major_contract"
       ]
@@ -1053,7 +1163,6 @@
       "scopes": [
         "risk_alert",
         "delisting_risk",
-        "performance_forecast",
         "performance_flash"
       ]
     },
@@ -1122,9 +1231,15 @@
         "可能被终止上市的原因",
         "终止上市风险提示公告的披露情况"
       ],
+      "heading_labels": [
+        "年度报告披露后面临暂停上市和终止上市情况",
+        "年度报告披露后面临退市风险警示和终止上市情况"
+      ],
       "scopes": [
         "risk_alert",
-        "delisting_risk"
+        "delisting_risk",
+        "annual_report",
+        "semiannual_report"
       ]
     },
     {
@@ -1289,12 +1404,25 @@
       ]
     },
     {
+      "key": "incentive_implementation",
+      "description": "定期报告中的股权激励、员工持股或其他员工激励措施实施情况",
+      "labels": [
+        "公司股权激励计划、员工持股计划或其他员工激励措施的实施情况",
+        "股权激励计划、员工持股计划或其他员工激励措施的实施情况"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
       "key": "unlock_schedule",
       "description": "解除限售、上市流通与解禁时间安排",
       "labels": [
         "解除限售安排",
         "上市流通安排",
         "解禁安排",
+        "归属股票上市流通日",
         "限制性股票归属股票的上市流通安排"
       ],
       "scopes": [
@@ -1312,7 +1440,8 @@
         "权益变动"
       ],
       "scopes": [
-        "equity_share_change"
+        "equity_share_change",
+        "correction_supplement"
       ]
     },
     {
@@ -1450,7 +1579,14 @@
       "description": "对外担保或反担保事项概述",
       "labels": [
         "担保事项概述",
-        "担保情况概述"
+        "担保情况概述",
+        "担保情况"
+      ],
+      "heading_labels": [
+        "重大担保",
+        "关联担保情况",
+        "担保的基本情况",
+        "为其他单位提供债务担保形成的或有负债及其财务影响"
       ],
       "scopes": []
     },
@@ -1470,6 +1606,9 @@
         "被担保人基本情况",
         "被担保方基本情况"
       ],
+      "heading_labels": [
+        "担保对象及基本情况"
+      ],
       "scopes": []
     },
     {
@@ -1477,7 +1616,12 @@
       "description": "担保合同、期限、范围与主要条款",
       "labels": [
         "担保协议",
-        "担保合同主要内容"
+        "担保合同主要内容",
+        "担保费情况"
+      ],
+      "heading_labels": [
+        "担保协议主要内容",
+        "担保协议的主要内容"
       ],
       "scopes": []
     },
@@ -1488,6 +1632,10 @@
         "累计对外担保",
         "担保余额"
       ],
+      "heading_labels": [
+        "累计担保情况",
+        "累计对外担保数量及逾期担保的数量"
+      ],
       "scopes": []
     },
     {
@@ -1496,6 +1644,11 @@
       "labels": [
         "关联交易概述",
         "关联交易事项"
+      ],
+      "heading_labels": [
+        "重大关联交易",
+        "其他重大关联交易",
+        "关于规范关联交易的承诺"
       ],
       "scopes": []
     },
@@ -1524,6 +1677,9 @@
         "交易协议的主要内容",
         "关联交易协议"
       ],
+      "heading_labels": [
+        "协议主要内容"
+      ],
       "scopes": []
     },
     {
@@ -1536,12 +1692,260 @@
       "scopes": []
     },
     {
+      "key": "annual_commitment_fulfillment",
+      "description": "年度承诺事项及其履行进展",
+      "labels": [
+        "承诺事项履行情况",
+        "承诺履行情况"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "asset_profit_forecast_fulfillment",
+      "description": "资产或项目盈利预测及达成情况",
+      "labels": [
+        "资产盈利预测",
+        "项目盈利预测",
+        "盈利预测达成情况"
+      ],
+      "heading_labels": [
+        "公司资产或项目存在盈利预测，且报告期仍处在盈利预测期间，公司就资产或项目达到原盈利预测及其原因做出说明"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "non_operating_funds_occupation",
+      "description": "控股股东及其他关联方非经营性资金占用",
+      "labels": [
+        "非经营性资金占用",
+        "资金占用情况"
+      ],
+      "heading_labels": [
+        "控股股东及其关联方对上市公司的非经营性占用资金情况",
+        "控股股东及其他关联方非经营性占用资金情况",
+        "是否存在被控股股东及其他关联方非经营性占用资金情况"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "illegal_external_guarantees",
+      "description": "违反规定程序作出的对外担保",
+      "labels": [
+        "违规对外担保",
+        "违规担保"
+      ],
+      "heading_labels": [
+        "违规对外担保情况",
+        "违规担保情况"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "bankruptcy_reorganization",
+      "description": "破产、重整、和解或清算事项",
+      "labels": [
+        "破产重整",
+        "破产清算",
+        "重整事项"
+      ],
+      "heading_labels": [
+        "破产重整相关事项"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "major_litigation_arbitration",
+      "description": "重大诉讼、仲裁及案件进展",
+      "labels": [
+        "重大诉讼",
+        "重大仲裁",
+        "重大诉讼仲裁"
+      ],
+      "heading_labels": [
+        "重大诉讼、仲裁事项",
+        "未决诉讼仲裁形成的或有负债及其财务影响"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "regulatory_penalties_remediation",
+      "description": "监管处罚、纪律处分及整改情况",
+      "labels": [
+        "处罚及整改",
+        "监管处罚",
+        "纪律处分"
+      ],
+      "heading_labels": [
+        "处罚及整改情况",
+        "报告期内，公司及公司董事、高级管理人员受监管部门处罚等情况",
+        "上市公司及其董事、高级管理人员、控股股东、实际控制人涉嫌违法违规、受到处罚及整改情况"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "controller_creditworthiness",
+      "description": "公司及控股股东、实际控制人的诚信和债务履约状况",
+      "labels": [
+        "诚信状况",
+        "债务履约状况"
+      ],
+      "heading_labels": [
+        "公司及其第一大股东的诚信状况",
+        "公司及其控股股东、实际控制人的诚信状况",
+        "报告期内公司及其控股股东、实际控制人诚信状况的说明"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "major_asset_acquisition_progress",
+      "description": "重大资产或股权收购及其进展",
+      "labels": [
+        "重大资产收购",
+        "重大股权收购",
+        "重大收购进展"
+      ],
+      "heading_labels": [
+        "重大收购资产事项进展情况"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "daily_related_party_transactions",
+      "description": "与日常经营相关的关联交易",
+      "labels": [
+        "日常关联交易",
+        "日常经营关联交易"
+      ],
+      "heading_labels": [
+        "与日常经营相关的关联交易",
+        "购销商品、提供和接受劳务的关联交易"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "related_party_asset_equity_transactions",
+      "description": "关联方之间的资产或股权收购、出售交易",
+      "labels": [
+        "关联资产交易",
+        "关联股权交易"
+      ],
+      "heading_labels": [
+        "资产或股权收购、出售发生的关联交易"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "related_party_joint_investments",
+      "description": "关联方共同对外投资交易",
+      "labels": [
+        "关联共同投资"
+      ],
+      "heading_labels": [
+        "共同对外投资的关联交易"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "related_party_debt_dealings",
+      "description": "关联方债权、债务往来及余额",
+      "labels": [
+        "关联债权债务余额"
+      ],
+      "heading_labels": [
+        "关联债权债务往来",
+        "是否存在非经营性关联债权债务往来"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "related_finance_company_dealings",
+      "description": "上市公司、控股财务公司与关联方的资金往来",
+      "labels": [
+        "关联财务公司往来"
+      ],
+      "heading_labels": [
+        "与存在关联关系的财务公司的往来情况",
+        "公司控股的财务公司与关联方的往来情况"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "entrusted_wealth_management",
+      "description": "委托理财余额、收益和风险情况",
+      "labels": [
+        "委托理财情况",
+        "委托理财"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
+      "key": "entrusted_loans",
+      "description": "委托贷款余额、对象和风险情况",
+      "labels": [
+        "委托贷款情况",
+        "委托贷款"
+      ],
+      "scopes": [
+        "annual_report",
+        "semiannual_report"
+      ]
+    },
+    {
       "key": "decision_procedures",
       "description": "董事会、股东大会或其他决策审批程序",
       "labels": [
         "决策程序",
         "审议程序",
         "回购方案的审议及实施程序"
+      ],
+      "heading_labels": [
+        "已履行的相关决策程序",
+        "董事会会议的召开、审议和表决情况"
       ],
       "scopes": []
     },
@@ -1563,6 +1967,9 @@
         "董事会召开情况",
         "董事会会议召开情况",
         "董事会会议情况"
+      ],
+      "heading_labels": [
+        "召开临时董事会会议"
       ],
       "scopes": [
         "annual_report",
@@ -1591,6 +1998,10 @@
         "会计师事务所聘任情况",
         "改聘会计师事务所情况",
         "会计师事务所报酬情况"
+      ],
+      "heading_labels": [
+        "聘任、解聘会计师事务所情况",
+        "审计师聘任及酬金"
       ],
       "scopes": [
         "annual_report",

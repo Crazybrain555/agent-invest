@@ -418,6 +418,160 @@ def pending_processing_backlog_count(
     ) + pending_parse_backlog_count(conn, scope_classes=scope_classes)
 
 
+def worker_progress_database_snapshot(
+    conn: Connection,
+    *,
+    max_download_retries: int,
+    max_parse_retries: int,
+    max_build_retries: int,
+    scope_classes: tuple[str, ...] | None,
+) -> dict[str, Any]:
+    """Return one read-only, frontend-safe snapshot of the durable pipeline.
+
+    The two progress denominators intentionally remain separate. Company
+    synchronization measures discovery coverage over the active research
+    universe. Document publication measures only the currently known,
+    process-eligible documents for active companies; its denominator can grow
+    as synchronization discovers more disclosures and must never be presented
+    as a fixed global total.
+    """
+
+    universe = conn.execute(
+        text(
+            f"""
+            SELECT count(*) FILTER (WHERE tc.status = 'active')::int
+                       AS active_companies,
+                   count(*) FILTER (WHERE tc.status = 'paused')::int
+                       AS paused_companies,
+                   count(*) FILTER (
+                       WHERE tc.status = 'active'
+                         AND EXISTS (
+                             SELECT 1
+                               FROM {CORE_SCHEMA}.source_checkpoint sc
+                              WHERE sc.provider = 'cninfo'
+                                AND sc.scope_key =
+                                    tc.company_id || chr(58) || 'p_info3015'
+                         )
+                   )::int AS synced_companies
+              FROM {CORE_SCHEMA}.tracked_company tc
+            """
+        )
+    ).mappings().one()
+
+    scope_sql = ""
+    scope_params: dict[str, Any] = {}
+    if scope_classes is not None:
+        scope_sql = _processing_scope_sql(
+            category_expr="d.provider_metadata->>'raw_category'",
+            title_expr="d.title",
+        )
+        scope_params["scope_classes"] = list(scope_classes)
+        scope_params["carrier_classes"] = list(CARRIER_CLASSES)
+    documents = conn.execute(
+        text(
+            f"""
+            SELECT count(*)::int AS known_process_documents,
+                   count(*) FILTER (WHERE d.status = 'published')::int
+                       AS published_documents
+              FROM {CORE_SCHEMA}.document d
+              JOIN {CORE_SCHEMA}.tracked_company tc_scope
+                ON tc_scope.company_id = d.company_id
+               AND tc_scope.status = 'active'
+             WHERE true
+               {scope_sql}
+            """
+        ),
+        scope_params,
+    ).mappings().one()
+
+    current_rows = conn.execute(
+        text(
+            f"""
+            SELECT CASE
+                       WHEN r.status = 'running' THEN 'parse'
+                       ELSE 'build'
+                   END AS stage,
+                   r.processing_run_id,
+                   r.document_id,
+                   s.security_code,
+                   left(COALESCE(d.title, ''), 120) AS title,
+                   r.started_at
+              FROM {CORE_SCHEMA}.processing_run r
+              JOIN {CORE_SCHEMA}.document d
+                ON d.document_id = r.document_id
+              LEFT JOIN {CORE_SCHEMA}.security s
+                ON s.security_id = d.security_id
+             WHERE (r.run_kind = 'parse' AND r.status = 'running')
+                OR r.unit_build_status = 'running'
+             ORDER BY r.started_at, r.processing_run_id
+             LIMIT 16
+            """
+        )
+    ).mappings()
+
+    return {
+        "universe": {
+            "active_companies": int(universe["active_companies"] or 0),
+            "paused_companies": int(universe["paused_companies"] or 0),
+            "synced_companies": int(universe["synced_companies"] or 0),
+        },
+        "documents": {
+            "known_process_documents": int(
+                documents["known_process_documents"] or 0
+            ),
+            "published_documents": int(documents["published_documents"] or 0),
+            "denominator_is_dynamic": True,
+        },
+        "queues": {
+            "pending_download": pending_download_count(
+                conn,
+                max_retries=max_download_retries,
+                scope_classes=scope_classes,
+            ),
+            "pending_parse": pending_parse_backlog_count(
+                conn,
+                scope_classes=scope_classes,
+            ),
+            "pending_build": pending_build_count(
+                conn,
+                max_retries=max_build_retries,
+            ),
+            "pending_publish": pending_publish_count(conn),
+            "download_dead_letters": download_dead_letter_count(
+                conn,
+                max_retries=max_download_retries,
+            ),
+            "parse_dead_letters": parse_dead_letter_count(
+                conn,
+                max_retries=max_parse_retries,
+            ),
+            "build_dead_letters": build_dead_letter_count(
+                conn,
+                max_retries=max_build_retries,
+            ),
+        },
+        "current_work": [
+            {
+                "stage": str(row["stage"]),
+                "processing_run_id": str(row["processing_run_id"]),
+                "document_id": str(row["document_id"]),
+                "security_code": (
+                    str(row["security_code"])
+                    if row["security_code"] is not None
+                    else None
+                ),
+                "title": str(row["title"]),
+                "started_at": (
+                    row["started_at"].isoformat()
+                    if row["started_at"] is not None
+                    else None
+                ),
+            }
+            for row in current_rows
+        ],
+    }
+
+
 def pending_downloads(
     conn: Connection,
     *,
@@ -654,6 +808,84 @@ def pending_publish_count(conn: Connection) -> int:
                        SELECT 1 FROM {CORE_SCHEMA}.document_unit u
                         WHERE u.processing_run_id = q.processing_run_id)
                 """
+            )
+        ).scalar_one()
+    )
+
+
+def retrying_build_count(conn: Connection, *, max_retries: int) -> int:
+    """Failed Unit builds that still have a legal automatic retry."""
+
+    return int(
+        conn.execute(
+            text(
+                f"SELECT count(*) FROM {OPS_SCHEMA}.pending_build_v1 q "
+                f"JOIN {CORE_SCHEMA}.processing_run r "
+                "ON r.processing_run_id = q.processing_run_id "
+                "WHERE q.unit_build_status = 'failed' "
+                f"AND ({_BUILD_RETRY_ELIGIBLE_SQL})"
+            ),
+            {
+                "max_retries": max_retries,
+                "max_retries_ceiling": (
+                    max_retries * RETRY_CEILING_MULTIPLIER
+                ),
+            },
+        ).scalar_one()
+    )
+
+
+def build_dead_letter_count(conn: Connection, *, max_retries: int) -> int:
+    """Failed Unit builds that no longer have an automatic retry action."""
+
+    return int(
+        conn.execute(
+            text(
+                f"SELECT count(*) FROM {OPS_SCHEMA}.pending_build_v1 q "
+                f"JOIN {CORE_SCHEMA}.processing_run r "
+                "ON r.processing_run_id = q.processing_run_id "
+                "WHERE q.unit_build_status = 'failed' "
+                f"AND NOT ({_BUILD_RETRY_ELIGIBLE_SQL})"
+            ),
+            {
+                "max_retries": max_retries,
+                "max_retries_ceiling": (
+                    max_retries * RETRY_CEILING_MULTIPLIER
+                ),
+            },
+        ).scalar_one()
+    )
+
+
+def build_dead_letter_ids(
+    conn: Connection, *, max_retries: int
+) -> tuple[str, ...]:
+    rows = conn.execute(
+        text(
+            f"SELECT q.processing_run_id FROM {OPS_SCHEMA}.pending_build_v1 q "
+            f"JOIN {CORE_SCHEMA}.processing_run r "
+            "ON r.processing_run_id = q.processing_run_id "
+            "WHERE q.unit_build_status = 'failed' "
+            f"AND NOT ({_BUILD_RETRY_ELIGIBLE_SQL}) "
+            "ORDER BY q.processing_run_id"
+        ),
+        {
+            "max_retries": max_retries,
+            "max_retries_ceiling": max_retries * RETRY_CEILING_MULTIPLIER,
+        },
+    ).scalars()
+    return tuple(str(value) for value in rows)
+
+
+def degraded_build_count(conn: Connection, *, active_only: bool = False) -> int:
+    active_sql = "AND is_active" if active_only else ""
+    return int(
+        conn.execute(
+            text(
+                f"SELECT count(*) FROM {CORE_SCHEMA}.processing_run "
+                "WHERE unit_build_status = 'succeeded' "
+                "AND semantic_adjudication_status = 'degraded_unavailable' "
+                f"{active_sql}"
             )
         ).scalar_one()
     )

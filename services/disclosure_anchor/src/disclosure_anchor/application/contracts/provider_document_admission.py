@@ -57,7 +57,7 @@ class SourcePdfTextObservation:
 
 @dataclass(frozen=True, slots=True)
 class SourceTextReconciliation:
-    """One numeric-only MinerU correction bound to native PDF text."""
+    """One source-bound MinerU text correction proven by native PDF text."""
 
     source_index: int
     payload_ordinal: int
@@ -70,7 +70,11 @@ class SourceTextReconciliation:
     def __post_init__(self) -> None:
         if min(self.source_index, self.payload_ordinal) < 0:
             raise ValueError("source text reconciliation indices cannot be negative")
-        if self.source_kind != "source_pdf_native_numeric.v1":
+        if self.source_kind not in {
+            "source_pdf_native_numeric.v1",
+            "source_pdf_native_identifier.v1",
+            "source_pdf_native_identifier.v2",
+        }:
             raise ValueError("source text reconciliation kind is unsupported")
         if not all(
             _SHA256_RE.fullmatch(value)
@@ -86,6 +90,46 @@ class SourceTextReconciliation:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceQualityFinding:
+    """One source-bound native-PDF mismatch that forbids silent trust."""
+
+    source_index: int
+    payload_ordinal: int
+    raw_block_sha256: str
+    provider_text_sha256: str
+    source_text_sha256: str
+    reason: str
+    source_kind: str = "source_pdf_native_table_quality.v1"
+
+    def __post_init__(self) -> None:
+        if min(self.source_index, self.payload_ordinal) < 0:
+            raise ValueError("source quality finding indices cannot be negative")
+        allowed_reasons = {
+            "source_pdf_native_table_quality.v1": {
+                "empty_table_tail",
+                "malformed_numeric_grouping",
+                "numeric_token_mismatch",
+            },
+            "source_pdf_native_text_quality.v1": {"native_text_omission"},
+            "source_pdf_native_identifier_quality.v1": {
+                "identifier_confusable_mismatch"
+            },
+            "source_pdf_native_text_quality.v2": {"cjk_bracket_omission"},
+        }
+        if self.reason not in allowed_reasons.get(self.source_kind, set()):
+            raise ValueError("source quality finding reason is unsupported")
+        if not all(
+            _SHA256_RE.fullmatch(value)
+            for value in (
+                self.raw_block_sha256,
+                self.provider_text_sha256,
+                self.source_text_sha256,
+            )
+        ):
+            raise ValueError("source quality finding hash is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class AdmittedProviderDocument:
     """A canonical record whose typed projection was rebuilt from its bundle."""
 
@@ -93,6 +137,7 @@ class AdmittedProviderDocument:
     provider_document_sha256: str
     envelope: ProviderDocumentEnvelope
     source_text_reconciliations: tuple[SourceTextReconciliation, ...] = ()
+    source_quality_findings: tuple[SourceQualityFinding, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -110,6 +155,16 @@ class AdmittedProviderDocument:
             raise ValueError(
                 "source text reconciliations must be unique and source ordered"
             )
+        finding_identities = [
+            (item.source_index, item.payload_ordinal)
+            for item in self.source_quality_findings
+        ]
+        if finding_identities != sorted(finding_identities) or len(
+            finding_identities
+        ) != len(set(finding_identities)):
+            raise ValueError("source quality findings must be unique and source ordered")
+        if set(identities) & set(finding_identities):
+            raise ValueError("source reconciliation and quality finding cannot overlap")
         blocks = self.envelope.provider_document.blocks
         for item in self.source_text_reconciliations:
             if item.source_index >= len(blocks):
@@ -122,6 +177,17 @@ class AdmittedProviderDocument:
                 != item.provider_text_sha256
             ):
                 raise ValueError("source text reconciliation differs from its provider")
+        for finding in self.source_quality_findings:
+            if finding.source_index >= len(blocks):
+                raise ValueError("source quality finding block is out of range")
+            block = blocks[finding.source_index]
+            if (
+                block.raw_item_sha256 != finding.raw_block_sha256
+                or finding.payload_ordinal >= len(block.payloads)
+                or _sha_text(block.payloads[finding.payload_ordinal].text)
+                != finding.provider_text_sha256
+            ):
+                raise ValueError("source quality finding differs from its provider")
 
     @property
     def provider_document(self) -> ProviderDocument:
@@ -175,6 +241,7 @@ __all__ = [
     "ProviderDocumentAdmissionError",
     "SourcePdfObservation",
     "SourcePdfTextObservation",
+    "SourceQualityFinding",
     "SourceTextReconciliation",
 ]
 

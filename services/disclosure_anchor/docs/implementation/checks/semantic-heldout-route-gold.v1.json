@@ -5,8 +5,12 @@
       "provider_document_id": "1225464994",
       "unit_index": 6,
       "title": "（三）配股基数、比例和数量",
-      "required_keys": ["issue_size"],
-      "required_section_keys": ["issuance_plan"],
+      "required_keys": [
+        "issue_size"
+      ],
+      "required_section_keys": [
+        "issuance_plan"
+      ],
       "rationale": "配股数量是 Unit 直接主题，同时位于本次发行基本情况章节。"
     },
     {
@@ -14,7 +18,9 @@
       "unit_index": 14,
       "title": "（一）配股缴款时间",
       "expected_keys": [],
-      "required_section_keys": ["subscription_arrangements"],
+      "required_section_keys": [
+        "subscription_arrangements"
+      ],
       "rationale": "缴款时间属于认购安排章节检索面，不需要把每个程序性子标题都造为 direct key。"
     },
     {
@@ -22,7 +28,9 @@
       "unit_index": 20,
       "title": "（三）发行失败的退款处理",
       "expected_keys": [],
-      "required_section_keys": ["issuance_outcome"],
+      "required_section_keys": [
+        "issuance_outcome"
+      ],
       "rationale": "退款处理属于发行结果章节，应能按 canonical section 批量召回。"
     },
     {
@@ -30,149 +38,282 @@
       "unit_index": 21,
       "title": "四、发行费用",
       "expected_section_keys": [],
-      "forbidden_section_keys": ["issuance_plan", "subscription_arrangements", "issuance_outcome"],
+      "forbidden_section_keys": [
+        "issuance_plan",
+        "subscription_arrangements",
+        "issuance_outcome"
+      ],
       "rationale": "相邻但独立的发行费用章节不得继承此前事件容器。"
     },
     {
       "provider_document_id": "1225469289",
       "unit_index": 19,
       "title": "（一）本次重组对上市公司主营业务的影响",
-      "required_section_keys": ["transaction_impact"],
+      "required_section_keys": [
+        "transaction_impact"
+      ],
       "rationale": "主营业务影响位于交易影响的 accepted heading path 下。"
+    },
+    {
+      "provider_document_id": "1222355452",
+      "unit_index": 2,
+      "title": "及募集说明书等申请文件修订的提示性公告",
+      "expected_keys": [],
+      "forbidden_keys": [
+        "inquiry_response",
+        "inquiry_question"
+      ],
+      "rationale": "本 Unit 只提示回复和申请文件已经修订并要求详见另一公告，不承载逐项问询或回复正文；保留 lexical 检索，不冒充 direct route。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 24,
+      "title": "六、本次重组对中小投资者权益保护的安排",
+      "expected_keys": [],
+      "expected_section_keys": [
+        "investor_protection_arrangements"
+      ],
+      "rationale": "heading-only 法定投资者保护章只提供自身及后代的精确结构锚，不冒充答案正文。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 30,
+      "title": "（六）股份锁定期安排",
+      "expected_keys": [
+        "transaction_share_lockup"
+      ],
+      "required_section_keys": [
+        "investor_protection_arrangements"
+      ],
+      "rationale": "来源标题直接命名股份锁定期，保留 Unit-local direct key；投资者保护结构位置继续提供批量召回。"
     },
     {
       "provider_document_id": "1225469289",
       "unit_index": 37,
       "title": "2、公司对防范本次交易摊薄即期回报的具体措施",
-      "required_section_keys": ["dilution_impact"],
+      "required_section_keys": [
+        "dilution_impact"
+      ],
       "rationale": "填补措施应由摊薄回报章节提供 canonical batch recall。"
     },
     {
       "provider_document_id": "1225469289",
-      "unit_index": 54,
+      "unit_index": 55,
       "title": "（三）标的资产的评估值风险",
-      "expected_keys": ["transaction_risk", "target_asset"],
-      "required_section_keys": ["transaction_risk"],
-      "forbidden_keys": ["valuation_pricing"],
+      "expected_keys": [
+        "transaction_risk",
+        "target_asset"
+      ],
+      "required_section_keys": [
+        "transaction_risk"
+      ],
+      "forbidden_keys": [
+        "valuation_pricing"
+      ],
       "rationale": "风险是披露角色，标题直接命名且正文印证的标的资产仍是 Unit-local 粗主题；评估定价未形成独立 source-bound 主题。"
     },
     {
       "provider_document_id": "1225469289",
-      "unit_index": 56,
+      "unit_index": 57,
       "title": "（五）业绩承诺及其执行风险",
-      "expected_keys": ["transaction_risk", "performance_commitment"],
-      "required_section_keys": ["transaction_risk"],
+      "expected_keys": [
+        "transaction_risk",
+        "performance_commitment"
+      ],
+      "required_section_keys": [
+        "transaction_risk"
+      ],
       "rationale": "风险是披露角色，标题直接命名且正文印证的业绩承诺仍是 Unit-local 粗主题；L2 再解释其风险模态。"
     },
     {
       "provider_document_id": "1225469289",
-      "unit_index": 82,
+      "unit_index": 83,
       "title": "1、国家高度重视支持集成电路产业发展",
       "expected_keys": [],
-      "required_section_keys": ["transaction_rationale"],
+      "required_section_keys": [
+        "transaction_rationale"
+      ],
       "rationale": "行业背景正文应由交易背景和目的章节召回，而非强造 direct topic。"
     },
     {
       "provider_document_id": "1225469289",
-      "unit_index": 105,
+      "unit_index": 80,
+      "title": "第一节 本次交易概况",
+      "expected_keys": [],
+      "expected_section_keys": [
+        "restructuring_transaction_overview"
+      ],
+      "rationale": "heading-only 交易概况章只提供章内方案正文的精确结构锚，不冒充答案正文。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 101,
+      "title": "7、锁定期安排",
+      "expected_keys": [
+        "transaction_share_lockup"
+      ],
+      "required_section_keys": [
+        "restructuring_transaction_overview"
+      ],
+      "rationale": "方案细项由标准锁定期标题直接落闭集主题，同时保留本次交易概况结构召回。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 107,
       "title": "2、发行方式、发行对象及认购方式",
-      "required_section_keys": ["supporting_financing"],
+      "required_section_keys": [
+        "supporting_financing"
+      ],
       "rationale": "配套融资具体方案下的认购方式应保留该结构上下文。"
     },
     {
       "provider_document_id": "1225469289",
-      "unit_index": 97,
+      "unit_index": 99,
       "title": "5、发行股份的定价依据、定价基准日和发行价格",
-      "expected_keys": ["valuation_pricing", "issue_price"],
+      "expected_keys": [
+        "valuation_pricing",
+        "issue_price"
+      ],
       "rationale": "购买资产发行定价标题同时直接命名估值定价安排和发行价格，两个检索面必须并存。"
     },
     {
       "provider_document_id": "1225469289",
-      "unit_index": 106,
+      "unit_index": 108,
       "title": "3、发行股份的定价基准日、定价依据和发行价格",
-      "expected_keys": ["valuation_pricing", "issue_price"],
-      "required_section_keys": ["supporting_financing"],
+      "expected_keys": [
+        "valuation_pricing",
+        "issue_price"
+      ],
+      "required_section_keys": [
+        "supporting_financing"
+      ],
       "rationale": "配套融资发行定价标题同时直接命名估值定价安排和发行价格，并保留配套融资结构上下文。"
     },
     {
       "provider_document_id": "1225469289",
-      "unit_index": 127,
+      "unit_index": 129,
       "title": "（一）本次交易构成重大资产重组",
-      "required_section_keys": ["transaction_classification"],
+      "required_section_keys": [
+        "transaction_classification"
+      ],
       "rationale": "监管交易性质是稳定的章节级批量检索面。"
     },
     {
       "provider_document_id": "1225469289",
-      "unit_index": 132,
+      "unit_index": 133,
+      "title": "五、本次交易决策过程和批准情况",
+      "expected_keys": [],
+      "required_section_keys": [
+        "restructuring_transaction_overview",
+        "regulatory_approval"
+      ],
+      "rationale": "heading-only 批准情况标题在交易概况章内开启精确结构位置，不冒充直接审批正文。"
+    },
+    {
+      "provider_document_id": "1225469289",
+      "unit_index": 134,
       "title": "（一）本次交易已经履行的主要决策程序及报批程序",
-      "required_keys": ["decision_procedures"],
-      "forbidden_section_keys": ["transaction_classification", "transaction_impact", "transaction_rationale"],
+      "required_keys": [
+        "decision_procedures"
+      ],
+      "forbidden_section_keys": [
+        "transaction_classification",
+        "transaction_impact",
+        "transaction_rationale"
+      ],
       "rationale": "后续独立决策程序章节不得继承已结束的交易性质、影响或背景容器。"
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 40,
+      "unit_index": 41,
       "title": "4、卓越的管理团队及人才培养机制",
-      "expected_keys": ["revenue_and_cost"],
-      "required_section_keys": ["business_review"],
+      "expected_keys": [
+        "revenue_and_cost"
+      ],
+      "required_section_keys": [
+        "business_review"
+      ],
       "rationale": "Unit 正文直接说明营业收入增长及原因；因果性属于 L2 模态，不抹掉 L1 收入成本主题。"
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 59,
+      "unit_index": 62,
       "title": "(一) 可能面对的风险",
-      "expected_keys": ["business_risk"],
-      "required_section_keys": ["business_review"],
+      "expected_keys": [
+        "business_risk"
+      ],
+      "required_section_keys": [
+        "business_review"
+      ],
       "rationale": "有正文的明确风险标题形成粗风险主题；条件、预测和风险模态留给 L2 解释。"
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 64,
+      "unit_index": 67,
       "title": "5、主要原材料价格波动风险",
-      "expected_keys": ["business_risk", "revenue_and_cost"],
-      "required_section_keys": ["business_review"],
+      "expected_keys": [
+        "business_risk",
+        "revenue_and_cost"
+      ],
+      "required_section_keys": [
+        "business_review"
+      ],
       "rationale": "明确风险标题与正文收入成本 witness 独立成立；条件和风险模态不抹掉任一 L1 主题。"
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 73,
+      "unit_index": 76,
       "title": "第四节 公司治理、环境和社会",
       "expected_keys": [],
-      "expected_section_keys": [],
-      "expected_heading_path": ["第四节 公司治理、环境和社会"],
-      "rationale": "复合章标题是结构锚，不把两个上下文容器伪装成标题 Unit 的 direct 或 inherited route。"
+      "expected_section_keys": [
+        "governance",
+        "environment_social"
+      ],
+      "expected_heading_path": [
+        "第四节 公司治理、环境和社会"
+      ],
+      "rationale": "复合章标题是 hash-bound 结构锚：两个精确结构位置进入 section_keys，但不伪装成 direct semantic_keys。"
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 78,
+      "unit_index": 82,
       "title": "四、纳入环境信息依法披露企业名单的上市公司及其主要子公司的环境信息情况√适用 □不适用",
-      "expected_keys": [],
-      "expected_section_keys": ["governance", "environment_social"],
+      "expected_keys": ["environment_social"],
+      "expected_section_keys": [
+        "governance",
+        "environment_social"
+      ],
       "expected_heading_path": [
         "第四节 公司治理、环境和社会",
         "四、纳入环境信息依法披露企业名单的上市公司及其主要子公司的环境信息情况√适用 □不适用"
       ],
-      "rationale": "MinerU 合入 table_caption 的强编号环境标题必须成为 source-bound section owner，并脱离此前激励子树。"
+      "rationale": "强编号环境标题拥有实际环境信息披露企业表格，因此同时提供 Unit-local direct 与 environment_social 结构召回，并已脱离此前激励子树。"
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 79,
+      "unit_index": 83,
       "title": "(一) 在报告期内为减少污染物排放及提升资源利用效率所采取的措施及效果",
       "expected_keys": [],
-      "expected_section_keys": [],
+      "expected_section_keys": [
+        "governance",
+        "environment_social"
+      ],
       "expected_heading_path": [
         "第四节 公司治理、环境和社会",
         "四、纳入环境信息依法披露企业名单的上市公司及其主要子公司的环境信息情况√适用 □不适用",
         "(一) 在报告期内为减少污染物排放及提升资源利用效率所采取的措施及效果"
       ],
-      "rationale": "heading-only 子节保留精确层级但不继承 section route；其内容后代再获得结构召回。"
+      "rationale": "heading-only 子节从 accepted heading_path 精确继承 governance/environment_social 结构位置；direct semantic_keys 继续诚实留空。"
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 80,
+      "unit_index": 84,
       "title": "1、排污信息",
       "expected_keys": [],
-      "expected_section_keys": ["governance", "environment_social"],
+      "expected_section_keys": [
+        "governance",
+        "environment_social"
+      ],
       "expected_heading_path": [
         "第四节 公司治理、环境和社会",
         "四、纳入环境信息依法披露企业名单的上市公司及其主要子公司的环境信息情况√适用 □不适用",
@@ -183,24 +324,184 @@
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 269,
+      "unit_index": 278,
       "title": "(ii) 信用风险显著增加和已发生信用减值的判断",
-      "expected_keys": ["credit_risk"],
-      "expected_section_keys": ["financial_report_chapter", "accounting_policies"],
+      "expected_keys": [
+        "credit_risk"
+      ],
+      "expected_section_keys": [
+        "financial_report_chapter",
+        "accounting_policies"
+      ],
       "rationale": "会计政策中的信用风险判断保留具体信用风险键，但不得被粗业务风险标题规则误收。"
     },
     {
       "provider_document_id": "1225468066",
-      "unit_index": 225,
+      "unit_index": 234,
       "title": "20、 投资性房地产",
-      "expected_keys": ["investment_property"],
-      "expected_section_keys": ["financial_report_chapter", "accounting_policies"],
+      "expected_keys": [
+        "investment_property"
+      ],
+      "expected_section_keys": [
+        "financial_report_chapter",
+        "accounting_policies",
+        "investment_property"
+      ],
       "expected_heading_path": [
         "第八节 财务报告",
         "五、重要会计政策及会计估计",
         "20、 投资性房地产"
       ],
       "rationale": "裸“不适用”必须守恒为本标题正文，不得再次被误判成独立 heading Unit。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 107,
+      "title": "一、承诺事项履行情况",
+      "expected_keys": [
+        "annual_commitment_fulfillment"
+      ],
+      "required_section_keys": [
+        "annual_commitment_fulfillment"
+      ],
+      "rationale": "另一公司半年度模板复现承诺履行 direct/section 双检索面。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 109,
+      "title": "三、违规担保情况",
+      "expected_keys": [
+        "illegal_external_guarantees"
+      ],
+      "required_section_keys": [
+        "illegal_external_guarantees"
+      ],
+      "rationale": "无“对外”二字的监管模板变体仍是精确违规担保主题。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 112,
+      "title": "六、破产重整相关事项",
+      "expected_keys": [
+        "bankruptcy_reorganization"
+      ],
+      "required_section_keys": [
+        "bankruptcy_reorganization"
+      ],
+      "rationale": "另一公司半年度模板复现破产重整 direct/section 双检索面。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 113,
+      "title": "七、重大诉讼、仲裁事项",
+      "expected_keys": [
+        "major_litigation_arbitration"
+      ],
+      "required_section_keys": [
+        "major_litigation_arbitration"
+      ],
+      "rationale": "另一公司半年度模板复现重大诉讼仲裁 direct/section 双检索面。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 114,
+      "title": "八、上市公司及其董事、高级管理人员、控股股东、实际控制人涉嫌违法违规、受到处罚及整改情况",
+      "expected_keys": [
+        "regulatory_penalties_remediation"
+      ],
+      "required_section_keys": [
+        "regulatory_penalties_remediation"
+      ],
+      "rationale": "完整长标题是处罚整改监管模板变体，不能只落宽泛重要事项。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 115,
+      "title": "九、报告期内公司及其控股股东、实际控制人诚信状况的说明",
+      "expected_keys": [
+        "controller_creditworthiness"
+      ],
+      "required_section_keys": [
+        "controller_creditworthiness"
+      ],
+      "rationale": "完整长标题是公司及控制方诚信状况模板变体。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 117,
+      "title": "(一) 与日常经营相关的关联交易",
+      "expected_keys": [
+        "daily_related_party_transactions"
+      ],
+      "required_section_keys": [
+        "related_party_overview",
+        "daily_related_party_transactions"
+      ],
+      "rationale": "半年度模板中日常关联交易仍须独立可检索。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 128,
+      "title": "(四) 关联债权债务往来",
+      "expected_keys": [
+        "related_party_debt_dealings"
+      ],
+      "required_section_keys": [
+        "related_party_overview",
+        "related_party_debt_dealings"
+      ],
+      "rationale": "半年度模板中关联债权债务往来仍须独立可检索。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 134,
+      "title": "十一、重大合同及其履行情况",
+      "expected_keys": [],
+      "required_section_keys": [
+        "important_matters",
+        "major_contracts"
+      ],
+      "rationale": "重大合同父标题是 heading-only 结构容器，只为子项提供 important_matters/major_contracts 批量召回，不伪造 direct 答案。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 223,
+      "title": "存货类别、发出计价方法、盘存制度、低值易耗品和包装物的摊销方法",
+      "expected_keys": [
+        "inventory"
+      ],
+      "required_section_keys": [
+        "accounting_policies",
+        "inventory"
+      ],
+      "rationale": "无点分编号的同义监管标题也证明存货 direct/section 双检索面可跨公司泛化。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 284,
+      "title": "(iv) 存货可变现净值",
+      "expected_keys": [
+        "inventory"
+      ],
+      "required_section_keys": [
+        "financial_report_chapter",
+        "accounting_policies",
+        "inventory"
+      ],
+      "rationale": "存货可变现净值及跌价准备是反复出现的会计政策主题；精确来源标题提供 inventory direct/section 双检索面，不依赖模型猜测。"
+    },
+    {
+      "provider_document_id": "1225468066",
+      "unit_index": 108,
+      "title": "二、报告期内控股股东及其他关联方非经营性占用资金情况",
+      "expected_keys": [
+        "non_operating_funds_occupation"
+      ],
+      "required_section_keys": [
+        "important_matters",
+        "non_operating_funds_occupation"
+      ],
+      "rationale": "半年报模板在闭集标题前加“报告期内”指示语；去掉该前缀后的整体仍是同一监管标题，direct 与 section 都必须可检索。"
     }
   ]
 }

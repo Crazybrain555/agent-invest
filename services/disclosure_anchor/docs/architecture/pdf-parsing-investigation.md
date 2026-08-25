@@ -21,15 +21,40 @@
 > 成为删除或边界规则。
 >
 > **2026-08-12 cutover**：当前唯一 writer 是 MinerU 3.4.4 Hybrid-medium →
-> `provider_document.v1` → `provider_unit_locator.v3`（历史 v1/v2 只读）。后文 NormalizedIR、双 parser、规则修复和
+> `provider_document.v1` → `provider_unit_locator.v8`（历史 v1-v7 只读）。后文 NormalizedIR、双 parser、规则修复和
 >旧版本号只属于调研历史；不得据此恢复生产路径。
 >
 > **2026-08-14 数字保真边界**：不恢复默认双 parser。MinerU 仍唯一拥有 block/order/bbox/table；
 > admission 只可在同一 hash-bound PDF、同一 MinerU text bbox 内，用 native PDF text 修正“native
 > 相对 MinerU 仅新增完整数字核心（可连同或保留 `%/‰`），其余字符与已有数字原序逐字相等”的
-> 漏数，并在 locator v2 记录双侧 hash。无 text layer、表格、数字替换/重排、非数字差异、旋转、
-> 高度重叠 bbox 或坐标/身份不闭合时仅保持 MinerU 原文；当前不额外声称已产生独立质量告警。
+> 漏数，并在 locator v2 起记录双侧 hash；locator v4 另允许闭合的数字 identifier/单开引号补全，
+> locator v5 再只允许一处 `=` 与完整数字 atom 同时漏失的 identifier.v2；locator v6 只新增 USCC
+> `O/0` checksum 冲突和 CJK `〔〕` 单括号漏失两种 finding-only 证据。表格永不由 flat native text
+> 自动改写；table/text/identifier quality 只记 source-bound finding 与 `needs_review`。
+> 无 text layer、数字替换/重排、
+> 非数字差异、旋转、高度重叠 bbox 或坐标/身份不闭合时仅保持 MinerU 原文。
 > native reader 固定 `pypdfium2==5.13.0`。
+> locator v7 是只读历史版本，曾新增监管模板 heading placement；当前 locator v8 保留 v6 的
+> source-bound 证据 vocabulary，但普通 paragraph 一律不凭整句词面提升为标题。
+>
+> **2026-08-21 MinerU 3.4.4 Hybrid 根因边界**：对一份 172 页 text-PDF 的完整 Unit、原 PDF、
+> 冻结 parser artifact 和 native text 做逐层回放后，确认两类上游错误。表格 crop 与 PDF 字形正确，
+> grid/cell 结构也正确，但错误字符已存在于每页 `model.json` 的 page-local table HTML；最早坏边界是
+> table image/crop → 远端 Hybrid VLM HTML，跨页 merge、ProviderDocument、Unit builder 和发布层只按原值传递。
+> 没有远端 inference trace 时，不继续猜测 tokenizer、视觉编码器或 decoder 内部原因。正文漏数则最早出现于
+> `middle.json`；`ocr_enable=false` 时 Hybrid 仍以 `rec=False` 的检测行 bbox 接收 native PDF chars。
+> 在当前保留的 client venv（实测 MinerU 3.4.4、pdftext 0.6.3、pypdfium2 4.30.0）只运行 char-fill
+> 路径即可复现严格 bbox/font-metric clipping，包括本次会话观测到约 `0.002pt` 的边界失败。
+> 旧 run attestation 只具名 MinerU 3.4.4，其余 client 依赖仅绑定 opaque package-set hash；因此该复现
+> 证明机制，不反向声称 pdftext/pypdfium2 的具名版本就是当次 run 的精确版本。
+> 这不是原 PDF、ToUnicode、OCR recognition 或下游生成错误。
+>
+> 同次安全审计覆盖 1,560 个 Unit、16 份 PDF、7,565 个 provider block、5,929 个 native observation
+> 和 650 个物理表段；990 个 native/parser mismatch 中 965 个机制异质，不能由单一宽泛 fallback 解释。
+> 因此现役边界不变：保留 source-faithful payload 与完整原始 provenance，不补写表格字符，不放宽全局 bbox
+> 阈值，不因孤例升级依赖或重解析。局部数字 omission finding 只保留为离线候选；生产化至少需要跨 PDF、
+> 跨字体/布局的独立正例、确定性局部 proof、全 corpus 与 adversarial 反例零假阳性，并对 partial-token、
+> 重复 anchor、替换/重排和跨页歧义全部 abstain。
 >
 > 服务目的见 `service-purpose.md`：我们要的不是“把 PDF 下载到文件夹”，也不是镜像 parser 的每一页每一格，而是把
 > 按真实文档结构形成包含正文、表格、caption/footnote 与视觉证据的完整 evidence block，

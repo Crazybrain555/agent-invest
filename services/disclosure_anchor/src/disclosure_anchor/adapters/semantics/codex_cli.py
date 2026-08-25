@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import inspect
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import tempfile
@@ -13,13 +16,16 @@ import time
 
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_PROMPT_VERSION,
+    SEMANTIC_OUTPUT_SCHEMA_VERSION,
     SemanticAdjudicatedRoute,
     SemanticAdjudicationDecision,
     SemanticRouteContractError,
+    SemanticProviderIdentity,
 )
 from disclosure_anchor.application.ports.semantic_routes import (
     SemanticAdjudicationBatch,
     SemanticAdjudicatorIdentity,
+    SemanticProviderResult,
     SemanticRouteAdjudicatorError,
 )
 
@@ -28,7 +34,6 @@ _ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
 _CANCELLED_PROCESSES: set[subprocess.Popen[str]] = set()
 _ACTIVE_PROCESSES_LOCK = threading.RLock()
 _SEMANTIC_SHUTDOWN_REQUESTED = threading.Event()
-_SEMANTIC_ADJUDICATION_SLOT = threading.BoundedSemaphore(1)
 _GRACEFUL_STOP_SECONDS = 5.0
 _DISABLED_CODE_MODE_WARNING = (
     "Code Mode is unavailable because code-mode host is disabled. "
@@ -41,10 +46,13 @@ _SAFE_ENVIRONMENT_KEYS = (
     "HOME",
     "LANG",
     "LC_ALL",
+    "LOGNAME",
     "PATH",
+    "SHELL",
     "SSL_CERT_DIR",
     "SSL_CERT_FILE",
     "TMPDIR",
+    "USER",
 )
 
 _DISABLED_FEATURES = (
@@ -73,6 +81,62 @@ _DISABLED_FEATURES = (
     "view_image",
     "workspace_dependencies",
 )
+
+_AUTH_DIAGNOSTICS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"not logged in(?:\s*[·;:.,-]\s*(?:please\s+)?run\s+/login)?[.!]?",
+        r"(?:please\s+)?run\s+/login[.!]?",
+        r"oauth access token has expired(?:[.!]?\s*(?:please\s+)?re-?authenticate)?[.!]?",
+        r"oauth token revoked(?:[.!]?\s*(?:please\s+)?run\s+/login)?[.!]?",
+        r"login expired(?:[.!]?\s*(?:please\s+)?run\s+/login)?[.!]?",
+        r"authentication error(?:[.!]?\s*this may be a temporary network issue, please try again)?[.!]?",
+        (
+            r"api error:\s*401(?:\s+(?:unauthorized"
+            r"|oauth access token has expired[.!]?(?:\s*(?:please\s+)?re-?authenticate)?"
+            r"|invalid (?:api key|auth token)))?[.!]?"
+        ),
+        r"invalid (?:api key|auth token)(?:\s*[·;:.,-]\s*(?:please\s+)?run\s+/login)?[.!]?",
+    )
+)
+_CAPACITY_DIAGNOSTICS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        (
+            r"api error:\s*429(?:\s+(?:too many requests"
+            r"|rate limit(?:ed| exceeded| reached)?|capacity exceeded))?[.!]?"
+        ),
+        r"(?:http\s+)?429\s+too many requests[.!]?",
+        r"rate limit(?:ed| exceeded| reached)?[.!]?",
+        r"quota exceeded[.!]?",
+        r"credit balance is too low[.?!]?",
+    )
+)
+
+
+class _ClosedJsonError(ValueError):
+    pass
+
+
+def _closed_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise _ClosedJsonError(f"duplicate key: {key}")
+        payload[key] = value
+    return payload
+
+
+def _reject_json_constant(value: str) -> object:
+    raise _ClosedJsonError(f"invalid constant: {value}")
+
+
+def _strict_json_loads(raw: str) -> object:
+    return json.loads(
+        raw,
+        object_pairs_hook=_closed_json_object,
+        parse_constant=_reject_json_constant,
+    )
 
 
 class _SemanticProcessCancelled(RuntimeError):
@@ -218,8 +282,8 @@ def _validate_event_stream(stdout: str, stderr: str) -> None:
         if not raw_line.strip():
             continue
         try:
-            event = json.loads(raw_line)
-        except json.JSONDecodeError as exc:
+            event = _strict_json_loads(raw_line)
+        except (json.JSONDecodeError, _ClosedJsonError) as exc:
             raise SemanticRouteAdjudicatorError(
                 "Codex semantic event stream is not closed JSONL",
                 reason_code="invalid_runtime_protocol",
@@ -265,6 +329,210 @@ def _validate_event_stream(stdout: str, stderr: str) -> None:
         )
 
 
+def _nonzero_event_error_messages(stdout: str, stderr: str) -> tuple[str, ...]:
+    """Read only provider-owned error events; reject tools and unknown shapes."""
+
+    if "codex_core::tools::router" in stderr:
+        raise SemanticRouteAdjudicatorError(
+            "Codex semantic adjudicator attempted a disabled tool",
+            reason_code="forbidden_tool_call",
+            retryable=False,
+        )
+    messages: list[str] = []
+    for raw_line in stdout.splitlines():
+        if not raw_line.strip():
+            continue
+        try:
+            event = _strict_json_loads(raw_line)
+        except (json.JSONDecodeError, _ClosedJsonError) as exc:
+            raise SemanticRouteAdjudicatorError(
+                "Codex semantic event stream is not closed JSONL",
+                reason_code="invalid_runtime_protocol",
+                retryable=False,
+            ) from exc
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            raise SemanticRouteAdjudicatorError(
+                "Codex semantic event stream is invalid",
+                reason_code="invalid_runtime_protocol",
+                retryable=False,
+            )
+        event_type = event["type"]
+        if event_type == "thread.started":
+            if set(event) != {"type", "thread_id"} or not isinstance(
+                event.get("thread_id"), str
+            ):
+                raise SemanticRouteAdjudicatorError(
+                    "Codex semantic thread-start shape is invalid",
+                    reason_code="invalid_runtime_protocol",
+                    retryable=False,
+                )
+            continue
+        if event_type == "turn.started":
+            if set(event) != {"type"}:
+                raise SemanticRouteAdjudicatorError(
+                    "Codex semantic turn-start shape is invalid",
+                    reason_code="invalid_runtime_protocol",
+                    retryable=False,
+                )
+            continue
+        if event_type == "turn.completed":
+            raise SemanticRouteAdjudicatorError(
+                "Codex nonzero semantic stream reported a completed turn",
+                reason_code="invalid_runtime_protocol",
+                retryable=False,
+            )
+        if event_type in {"item.started", "item.completed"}:
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                if set(event) != {"type", "item"} or not {
+                    "type",
+                    "text",
+                }.issubset(item) or set(item) - {"id", "type", "text"}:
+                    raise SemanticRouteAdjudicatorError(
+                        "Codex semantic agent-message shape is invalid",
+                        reason_code="invalid_runtime_protocol",
+                        retryable=False,
+                    )
+                if not isinstance(item.get("text"), str) or (
+                    "id" in item and not isinstance(item["id"], str)
+                ):
+                    raise SemanticRouteAdjudicatorError(
+                        "Codex semantic agent-message fields are invalid",
+                        reason_code="invalid_runtime_protocol",
+                        retryable=False,
+                    )
+                raise SemanticRouteAdjudicatorError(
+                    "Codex nonzero semantic stream emitted an agent message",
+                    reason_code="invalid_runtime_protocol",
+                    retryable=False,
+                )
+            if isinstance(item, dict) and item.get("type") == "error":
+                if set(event) != {"type", "item"} or not {
+                    "type",
+                    "message",
+                }.issubset(item) or set(item) - {"id", "type", "message"}:
+                    raise SemanticRouteAdjudicatorError(
+                        "Codex semantic error item shape is invalid",
+                        reason_code="invalid_runtime_protocol",
+                        retryable=False,
+                    )
+                if "id" in item and not isinstance(item["id"], str):
+                    raise SemanticRouteAdjudicatorError(
+                        "Codex semantic error item identity is invalid",
+                        reason_code="invalid_runtime_protocol",
+                        retryable=False,
+                    )
+                message = item.get("message")
+                if not isinstance(message, str) or not message.strip():
+                    raise SemanticRouteAdjudicatorError(
+                        "Codex semantic error event is invalid",
+                        reason_code="invalid_runtime_protocol",
+                        retryable=False,
+                    )
+                messages.append(message)
+                continue
+            raise SemanticRouteAdjudicatorError(
+                "Codex semantic adjudicator attempted a tool",
+                reason_code="forbidden_tool_call",
+                retryable=False,
+            )
+        if event_type == "error":
+            if set(event) != {"type", "message"}:
+                raise SemanticRouteAdjudicatorError(
+                    "Codex semantic error event shape is invalid",
+                    reason_code="invalid_runtime_protocol",
+                    retryable=False,
+                )
+            message = event.get("message")
+            if not isinstance(message, str) or not message.strip():
+                raise SemanticRouteAdjudicatorError(
+                    "Codex semantic error event is invalid",
+                    reason_code="invalid_runtime_protocol",
+                    retryable=False,
+                )
+            messages.append(message)
+            continue
+        if event_type == "turn.failed":
+            if set(event) != {"type", "error"}:
+                raise SemanticRouteAdjudicatorError(
+                    "Codex semantic failed-turn shape is invalid",
+                    reason_code="invalid_runtime_protocol",
+                    retryable=False,
+                )
+            error = event.get("error")
+            if isinstance(error, dict):
+                if set(error) != {"message"}:
+                    raise SemanticRouteAdjudicatorError(
+                        "Codex semantic failed-turn error shape is invalid",
+                        reason_code="invalid_runtime_protocol",
+                        retryable=False,
+                    )
+                message = error.get("message")
+            else:
+                message = error
+            if not isinstance(message, str) or not message.strip():
+                raise SemanticRouteAdjudicatorError(
+                    "Codex semantic failed-turn event is invalid",
+                    reason_code="invalid_runtime_protocol",
+                    retryable=False,
+                )
+            messages.append(message)
+            continue
+        raise SemanticRouteAdjudicatorError(
+            "Codex semantic event stream contains an unsupported event",
+            reason_code="invalid_runtime_protocol",
+            retryable=False,
+        )
+    return tuple(messages)
+
+
+def _matched_availability_families(
+    line: str,
+    *,
+    auth_diagnostics: tuple[re.Pattern[str], ...] = _AUTH_DIAGNOSTICS,
+    capacity_diagnostics: tuple[re.Pattern[str], ...] = _CAPACITY_DIAGNOSTICS,
+) -> frozenset[str]:
+    matches = tuple(
+        reason
+        for reason, patterns in (
+            ("not_authenticated", auth_diagnostics),
+            ("capacity_unavailable", capacity_diagnostics),
+        )
+        for pattern in patterns
+        if pattern.fullmatch(line)
+    )
+    if len(matches) != 1:
+        return frozenset()
+    return frozenset(matches)
+
+
+def _known_availability_reason(
+    diagnostics: tuple[str, ...],
+    *,
+    auth_diagnostics: tuple[re.Pattern[str], ...] = _AUTH_DIAGNOSTICS,
+    capacity_diagnostics: tuple[re.Pattern[str], ...] = _CAPACITY_DIAGNOSTICS,
+) -> str | None:
+    reasons: set[str] = set()
+    saw_line = False
+    for diagnostic in diagnostics:
+        for raw_line in diagnostic.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            saw_line = True
+            families = _matched_availability_families(
+                line,
+                auth_diagnostics=auth_diagnostics,
+                capacity_diagnostics=capacity_diagnostics,
+            )
+            if not families:
+                return None
+            reasons.update(families)
+    if not saw_line or len(reasons) != 1:
+        return None
+    return next(iter(reasons))
+
+
 class CodexCliSemanticAdjudicator:
     """Use Codex only as a chooser among deterministic candidate IDs."""
 
@@ -276,15 +544,18 @@ class CodexCliSemanticAdjudicator:
         model: str = "gpt-5.6-luna",
         reasoning_effort: str = "low",
         timeout_seconds: int = 600,
+        provider_id: str = "luna-primary",
+        max_concurrency: int = 1,
     ) -> None:
-        if not model or reasoning_effort not in {"low", "medium", "high"}:
+        if not model or not provider_id or reasoning_effort not in {"low", "medium", "high"}:
             raise ValueError("Codex semantic adjudicator configuration is invalid")
-        if timeout_seconds < 1:
+        if timeout_seconds < 1 or max_concurrency < 1:
             raise ValueError("Codex semantic adjudicator timeout is invalid")
         self._executable = executable
         self._runtime_tmp_root = runtime_tmp_root
         self._reasoning_effort = reasoning_effort
         self._timeout_seconds = timeout_seconds
+        self._slot = threading.BoundedSemaphore(max_concurrency)
         self._identity = SemanticAdjudicatorIdentity(
             # Reasoning effort changes the adjudication mechanism and must be
             # part of cache/receipt identity.  Encoding it in the adapter ID
@@ -294,16 +565,40 @@ class CodexCliSemanticAdjudicator:
             model=model,
             prompt_version=SEMANTIC_PROMPT_VERSION,
         )
+        self._provider_identity = SemanticProviderIdentity(
+            provider_id=provider_id,
+            provider="openai",
+            adapter_kind="codex_cli",
+            adapter_version="codex_cli.v6",
+            canonical_model=model,
+            inference_profile=reasoning_effort,
+            prompt_version=SEMANTIC_PROMPT_VERSION,
+            prompt_sha256=_contract_hash("prompt", SEMANTIC_PROMPT_VERSION),
+            output_schema_version=SEMANTIC_OUTPUT_SCHEMA_VERSION,
+            output_schema_sha256=_contract_hash(
+                "output-schema", SEMANTIC_OUTPUT_SCHEMA_VERSION
+            ),
+        )
 
     @property
     def identity(self) -> SemanticAdjudicatorIdentity:
         return self._identity
 
+    @property
+    def provider_identity(self) -> SemanticProviderIdentity:
+        return self._provider_identity
+
     def adjudicate(
         self,
         batch: SemanticAdjudicationBatch,
     ) -> tuple[SemanticAdjudicationDecision, ...]:
-        while not _SEMANTIC_ADJUDICATION_SLOT.acquire(timeout=0.1):
+        return self.adjudicate_with_result(batch).decisions
+
+    def adjudicate_with_result(
+        self,
+        batch: SemanticAdjudicationBatch,
+    ) -> SemanticProviderResult:
+        while not self._slot.acquire(timeout=0.1):
             if _SEMANTIC_SHUTDOWN_REQUESTED.is_set():
                 raise SemanticRouteAdjudicatorError(
                     "Codex semantic adjudication was cancelled before admission",
@@ -319,12 +614,12 @@ class CodexCliSemanticAdjudicator:
                 )
             return self._adjudicate_serial(batch)
         finally:
-            _SEMANTIC_ADJUDICATION_SLOT.release()
+            self._slot.release()
 
     def _adjudicate_serial(
         self,
         batch: SemanticAdjudicationBatch,
-    ) -> tuple[SemanticAdjudicationDecision, ...]:
+    ) -> SemanticProviderResult:
         self._runtime_tmp_root.mkdir(parents=True, exist_ok=True)
         prompt = _prompt(batch)
         try:
@@ -424,7 +719,25 @@ class CodexCliSemanticAdjudicator:
                 ),
                 retryable=not unavailable,
             ) from exc
-        return _decode_result(raw_result, batch)
+        return SemanticProviderResult(
+            decisions=_decode_result(raw_result, batch),
+            response_sha256="sha256:" + hashlib.sha256(
+                raw_result.encode("utf-8")
+            ).hexdigest(),
+        )
+
+
+def _contract_hash(kind: str, version: str) -> str:
+    implementation = {
+        "prompt": _prompt,
+        "output-schema": _output_schema,
+    }.get(kind)
+    if implementation is None:
+        raise ValueError("semantic contract hash kind is unsupported")
+    raw = (
+        f"{kind}:{version}\n" + inspect.getsource(implementation)
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
 def _prompt(batch: SemanticAdjudicationBatch) -> str:
@@ -519,6 +832,10 @@ def _prompt(batch: SemanticAdjudicationBatch) -> str:
         "检索。法律法规、禁售窗口或通用条款中把某事项写成触发条件、禁止期间或定义，并不表示"
         "公司在本 Unit 实际发生或披露了该事项。例如仅出现‘进入决策程序之日’不等于披露了"
         "本次决策程序。"
+        "但会计政策或会计估计 Unit 的直接主题本来就是确认、计量和列报规则，不要求本期已发生"
+        "金额：若正文用‘包括/分为/确认/终止确认/重新计量/调整/计入’等语法，直接定义候选科目"
+        "的组成或规定其会计处理，该候选应填 true；计算中顺带出现的另一个科目、金额组成或"
+        "排除范围仍填 false。不要把这种 source-bound 会计处理规则误当成通用法规背景。"
         "若当前 Unit 的自身标题就是概况、方案、报告书或主要内容等容器，可选择容器 route，"
         "其正文中明确并列的独立字段可以作为 secondary；若当前 Unit 是具体子标题，选择最具体的"
         " direct route，不要再附加其上位方案、公告总览、对象或表单容器，即使正文或文档标题"
@@ -534,6 +851,9 @@ def _prompt(batch: SemanticAdjudicationBatch) -> str:
         "就降为历史背景；只有作为另一事实的来龙去脉且没有独立决定/数值/结果时才是背景。"
         "同一活动记录表若实际包含多个反复出现的问题与回复对，问答是 overview 之外的直接字段；"
         "若表单只引用附件而没有问答正文，则不能选择问答 route。"
+        "问询或申请文件的提示性公告若只说公司已经/将要回复、文件已经修订，并要求读者详见"
+        "另一个公告或附件，而本 Unit 没有逐项问题与回复正文，也不得选择 inquiry_question 或"
+        "inquiry_response。"
         "investor_questions_answers 已包含问题和回复；不能只因为问答中的答复来自管理层就重复选择"
         " management_responses，后者只用于问答格式之外另设的管理层回应字段或小节。"
         "overview_container=true 是可带直接 secondary 的概览 route；在具体子标题 Unit 中不要选择它。"
@@ -596,8 +916,8 @@ def _decode_result(
     batch: SemanticAdjudicationBatch,
 ) -> tuple[SemanticAdjudicationDecision, ...]:
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        payload = _strict_json_loads(raw)
+    except (json.JSONDecodeError, _ClosedJsonError) as exc:
         raise SemanticRouteAdjudicatorError(
             "Codex semantic result is not JSON",
             reason_code="invalid_json",
@@ -670,19 +990,23 @@ def _decode_result(
 
 
 def _command_error(completed: subprocess.CompletedProcess[str]) -> SemanticRouteAdjudicatorError:
-    output = f"{completed.stderr}\n{completed.stdout}".lower()
-    if "not logged in" in output or "run /login" in output:
-        reason = "not_authenticated"
-        retryable = False
-    elif "invalid_json_schema" in output:
+    try:
+        structured_messages = _nonzero_event_error_messages(
+            completed.stdout,
+            completed.stderr,
+        )
+    except SemanticRouteAdjudicatorError as exc:
+        return exc
+    diagnostics = (
+        *structured_messages,
+        *((completed.stderr,) if completed.stderr.strip() else ()),
+    )
+    if any("invalid_json_schema" in item.casefold() for item in diagnostics):
         reason = "invalid_output_schema"
         retryable = False
-    elif any(token in output for token in ("rate limit", "quota", "429", "temporar")):
-        reason = "capacity_unavailable"
-        retryable = True
     else:
-        reason = "command_failed"
-        retryable = True
+        reason = _known_availability_reason(diagnostics) or "command_failed"
+        retryable = reason != "not_authenticated"
     return SemanticRouteAdjudicatorError(
         f"Codex semantic adjudicator failed with exit {completed.returncode}",
         reason_code=reason,

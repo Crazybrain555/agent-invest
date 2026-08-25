@@ -122,6 +122,7 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
         self.assertIn("features.code_mode.enabled=false", args)
         self.assertEqual(adapter.identity.adapter, "codex_cli.v4.low")
         self.assertEqual(adapter.identity.model, "gpt-5.6-luna")
+        self.assertEqual(adapter.provider_identity.adapter_version, "codex_cli.v6")
         for feature in ("shell_tool", "unified_exec", "apps", "view_image"):
             self.assertIn(feature, args)
         self.assertLess(args.index("--disable"), args.index("-"))
@@ -152,6 +153,8 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
         self.assertIn("公式变量、术语定义、未来约定", prompt)
         self.assertIn("真实性保证、指定媒体、风险提示模板", prompt)
         self.assertIn("进入决策程序之日", prompt)
+        self.assertIn("直接定义候选科目的组成或规定其会计处理", prompt)
+        self.assertIn("另一个公告或附件", prompt)
         self.assertNotIn("显式 context container", prompt)
         self.assertNotIn("heading_path 容器精确命中", prompt)
         self.assertIn("incentive_recipients", prompt)
@@ -191,6 +194,319 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
         self.assertEqual(caught.exception.reason_code, "not_authenticated")
         self.assertFalse(caught.exception.retryable)
 
+    def test_only_closed_stderr_diagnostics_are_failover_eligible(self) -> None:
+        cases = (
+            ("Not logged in · Please run /login", "not_authenticated", False),
+            ("API Error: 429 Too Many Requests", "capacity_unavailable", True),
+            ("quota exceeded", "capacity_unavailable", True),
+            (
+                "API Error: 429 Too Many Requests\nRate limit exceeded.",
+                "capacity_unavailable",
+                True,
+            ),
+            ("temporary invalid runtime protocol", "command_failed", True),
+            (
+                "Security policy rejected a temporary tool file",
+                "command_failed",
+                True,
+            ),
+            ("invalid runtime protocol; trace request_429_bad", "command_failed", True),
+            ("invalid schema property quota", "command_failed", True),
+            ("rate limit parser crashed on malformed response", "command_failed", True),
+            (
+                "API Error: 429 Too Many Requests\nfatal protocol parser crashed",
+                "command_failed",
+                True,
+            ),
+            (
+                "API Error: 429 Too Many Requests; security policy rejected a forbidden tool call",
+                "command_failed",
+                True,
+            ),
+            ("Please run /login to continue parsing", "command_failed", True),
+            ("API Error: 401 Unauthorized; forbidden tool", "command_failed", True),
+            ("Invalid API key; forbidden tool call", "command_failed", True),
+            ("HTTP 429 Too Many Requests; invalid schema drift", "command_failed", True),
+            ("rate limit: protocol parser crashed", "command_failed", True),
+            ("quota exceeded while protocol parser crashed", "command_failed", True),
+            ("credit balance is too low? forbidden tool", "command_failed", True),
+            ("repeated 529 overloaded errors; protocol failure", "command_failed", True),
+            (
+                "server is temporarily limiting requests (not your usage limit). security failure",
+                "command_failed",
+                True,
+            ),
+            ("overloaded_error: forbidden tool call", "command_failed", True),
+            ("API Error: overloaded; invalid schema drift", "command_failed", True),
+            ("API Error: 529 Overloaded", "command_failed", True),
+            ("repeated 529 overloaded errors", "command_failed", True),
+            (
+                "server is temporarily limiting requests (not your usage limit)",
+                "command_failed",
+                True,
+            ),
+            ("overloaded_error", "command_failed", True),
+            ("API Error: overloaded", "command_failed", True),
+            ("Anthropic profile login expired.", "command_failed", True),
+            (
+                "Not logged in · Please run /login\nAPI Error: 429 Too Many Requests",
+                "command_failed",
+                True,
+            ),
+        )
+        for stderr, reason_code, retryable in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                adapter = CodexCliSemanticAdjudicator(
+                    executable=Path("/opt/codex"),
+                    runtime_tmp_root=Path(tmp),
+                )
+                with (
+                    self.subTest(stderr=stderr),
+                    mock.patch(
+                        "disclosure_anchor.adapters.semantics.codex_cli._run_process",
+                        return_value=subprocess.CompletedProcess(
+                            ["codex"], 1, "", stderr
+                        ),
+                    ),
+                    self.assertRaises(SemanticRouteAdjudicatorError) as caught,
+                ):
+                    adapter.adjudicate(_batch())
+            self.assertEqual(caught.exception.reason_code, reason_code)
+            self.assertEqual(caught.exception.retryable, retryable)
+
+    def test_nonzero_jsonl_uses_error_events_but_rejects_tools_and_protocol(self) -> None:
+        cases = (
+            (
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": "API Error: 429 Too Many Requests",
+                    }
+                ),
+                "API Error: 429 Too Many Requests",
+                "capacity_unavailable",
+                True,
+            ),
+            (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "quota login temporary 429",
+                        },
+                    }
+                ),
+                "unexpected internal failure",
+                "invalid_runtime_protocol",
+                False,
+            ),
+            (
+                "\n".join(
+                    (
+                        json.dumps(
+                            {
+                                "type": "thread.started",
+                                "thread_id": "thread-1",
+                            }
+                        ),
+                        json.dumps({"type": "turn.started"}),
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "message": "API Error: 429 Too Many Requests",
+                            }
+                        ),
+                    )
+                ),
+                "",
+                "capacity_unavailable",
+                True,
+            ),
+            (
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": "API Error: 429 Too Many Requests",
+                        "code": "invalid_json_schema",
+                    }
+                ),
+                "",
+                "invalid_runtime_protocol",
+                False,
+            ),
+            (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "security policy rejected a forbidden tool call",
+                        },
+                    }
+                ),
+                "API Error: 429 Too Many Requests",
+                "invalid_runtime_protocol",
+                False,
+            ),
+            (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "error",
+                            "message": "API Error: 429 Too Many Requests",
+                            "tool": "shell",
+                        },
+                    }
+                ),
+                "",
+                "invalid_runtime_protocol",
+                False,
+            ),
+            (
+                json.dumps(
+                    {
+                        "type": "turn.failed",
+                        "error": {
+                            "message": "API Error: 429 Too Many Requests",
+                            "code": "invalid_json_schema",
+                        },
+                    }
+                ),
+                "",
+                "invalid_runtime_protocol",
+                False,
+            ),
+            (
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {},
+                        "error": "forbidden tool call",
+                    }
+                ),
+                "API Error: 429 Too Many Requests",
+                "invalid_runtime_protocol",
+                False,
+            ),
+            (
+                json.dumps(
+                    {
+                        "type": "item.started",
+                        "item": {
+                            "type": "mcp_tool_call",
+                            "tool": "request_429_bad",
+                        },
+                    }
+                ),
+                "API Error: 429 Too Many Requests",
+                "forbidden_tool_call",
+                False,
+            ),
+            (
+                "\n".join(
+                    (
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "message": "API Error: 429 Too Many Requests",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "message": "fatal protocol parser crashed",
+                            }
+                        ),
+                    )
+                ),
+                "",
+                "command_failed",
+                True,
+            ),
+            (
+                (
+                    '{"type":"error","message":"forbidden tool call",'
+                    '"message":"API Error: 429 Too Many Requests"}'
+                ),
+                "",
+                "invalid_runtime_protocol",
+                False,
+            ),
+            (
+                (
+                    '{"type":"item.completed","item":{'
+                    '"type":"mcp_tool_call","type":"error",'
+                    '"message":"API Error: 429 Too Many Requests"}}'
+                ),
+                "",
+                "invalid_runtime_protocol",
+                False,
+            ),
+            (
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": "API Error: 429 Too Many Requests",
+                    }
+                ),
+                "invalid_json_schema: forbidden schema drift",
+                "invalid_output_schema",
+                False,
+            ),
+            (
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": "API Error: 429 Too Many Requests",
+                    }
+                ),
+                "security policy rejected a forbidden tool call",
+                "command_failed",
+                True,
+            ),
+        )
+        for stdout, stderr, reason_code, retryable in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                adapter = CodexCliSemanticAdjudicator(
+                    executable=Path("/opt/codex"),
+                    runtime_tmp_root=Path(tmp),
+                )
+                with (
+                    self.subTest(reason_code=reason_code),
+                    mock.patch(
+                        "disclosure_anchor.adapters.semantics.codex_cli._run_process",
+                        return_value=subprocess.CompletedProcess(
+                            ["codex"], 1, stdout, stderr
+                        ),
+                    ),
+                    self.assertRaises(SemanticRouteAdjudicatorError) as caught,
+                ):
+                    adapter.adjudicate(_batch())
+            self.assertEqual(caught.exception.reason_code, reason_code)
+            self.assertEqual(caught.exception.retryable, retryable)
+
+    def test_nonzero_malformed_jsonl_overrides_availability_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = CodexCliSemanticAdjudicator(
+                executable=Path("/opt/codex"),
+                runtime_tmp_root=Path(tmp),
+            )
+            with (
+                mock.patch(
+                    "disclosure_anchor.adapters.semantics.codex_cli._run_process",
+                    return_value=subprocess.CompletedProcess(
+                        ["codex"], 1, "not-json", "API Error: 429 Too Many Requests"
+                    ),
+                ),
+                self.assertRaises(SemanticRouteAdjudicatorError) as caught,
+            ):
+                adapter.adjudicate(_batch())
+
+        self.assertEqual(caught.exception.reason_code, "invalid_runtime_protocol")
+        self.assertFalse(caught.exception.retryable)
+
     def test_unsupported_output_schema_is_controlled_and_nonretryable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             adapter = CodexCliSemanticAdjudicator(
@@ -216,27 +532,39 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
         self.assertFalse(caught.exception.retryable)
 
     def test_malformed_model_contract_is_nonretryable(self) -> None:
+        cases = (
+            ('{"decisions": [{"bad": true}]}', "invalid_contract"),
+            (
+                '{"decisions":{"0":{"verdicts":{'
+                '"forecast_summary":true,"forecast_summary":false}}}}',
+                "invalid_json",
+            ),
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            def run(*, args, **_kwargs):  # type: ignore[no-untyped-def]
-                result_path = Path(args[args.index("--output-last-message") + 1])
-                result_path.write_text('{"decisions": [{"bad": true}]}', encoding="utf-8")
-                return subprocess.CompletedProcess(args, 0, "", "")
-
             adapter = CodexCliSemanticAdjudicator(
                 executable=Path("/opt/codex"),
                 runtime_tmp_root=Path(tmp),
             )
-            with (
-                mock.patch(
-                    "disclosure_anchor.adapters.semantics.codex_cli._run_process",
-                    side_effect=run,
-                ),
-                self.assertRaises(SemanticRouteAdjudicatorError) as caught,
-            ):
-                adapter.adjudicate(_batch())
+            for result, reason_code in cases:
+                def run(*, args, **_kwargs):  # type: ignore[no-untyped-def]
+                    result_path = Path(
+                        args[args.index("--output-last-message") + 1]
+                    )
+                    result_path.write_text(result, encoding="utf-8")
+                    return subprocess.CompletedProcess(args, 0, "", "")
 
-        self.assertEqual(caught.exception.reason_code, "invalid_contract")
-        self.assertFalse(caught.exception.retryable)
+                with (
+                    self.subTest(reason_code=reason_code),
+                    mock.patch(
+                        "disclosure_anchor.adapters.semantics.codex_cli._run_process",
+                        side_effect=run,
+                    ),
+                    self.assertRaises(SemanticRouteAdjudicatorError) as caught,
+                ):
+                    adapter.adjudicate(_batch())
+
+                self.assertEqual(caught.exception.reason_code, reason_code)
+                self.assertFalse(caught.exception.retryable)
 
     def test_missing_candidate_verdict_is_nonretryable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -292,38 +620,54 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
 
     def test_any_tool_event_is_rejected_even_with_a_valid_final_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            def run(*, args, **_kwargs):  # type: ignore[no-untyped-def]
-                result_path = Path(args[args.index("--output-last-message") + 1])
-                result_path.write_text(
-                    '{"decisions":{"0":{"verdicts":{"forecast_summary":false}}}}',
-                    encoding="utf-8",
-                )
-                event = {
-                    "type": "item.started",
-                    "item": {"type": "mcp_tool_call", "tool": "list_mcp_resources"},
-                }
-                return subprocess.CompletedProcess(
-                    args,
-                    0,
-                    json.dumps(event),
-                    "",
-                )
-
             adapter = CodexCliSemanticAdjudicator(
                 executable=Path("/opt/codex"),
                 runtime_tmp_root=Path(tmp),
             )
-            with (
-                mock.patch(
-                    "disclosure_anchor.adapters.semantics.codex_cli._run_process",
-                    side_effect=run,
+            event_streams = (
+                (
+                    json.dumps(
+                        {
+                            "type": "item.started",
+                            "item": {
+                                "type": "mcp_tool_call",
+                                "tool": "list_mcp_resources",
+                            },
+                        }
+                    ),
+                    "forbidden_tool_call",
                 ),
-                self.assertRaises(SemanticRouteAdjudicatorError) as caught,
-            ):
-                adapter.adjudicate(_batch())
+                (
+                    '{"type":"item.completed","item":{'
+                    '"type":"mcp_tool_call","type":"agent_message",'
+                    '"text":"safe"}}',
+                    "invalid_runtime_protocol",
+                ),
+            )
+            for stdout, reason_code in event_streams:
+                def run(*, args, **_kwargs):  # type: ignore[no-untyped-def]
+                    result_path = Path(
+                        args[args.index("--output-last-message") + 1]
+                    )
+                    result_path.write_text(
+                        '{"decisions":{"0":{"verdicts":{'
+                        '"forecast_summary":false}}}}',
+                        encoding="utf-8",
+                    )
+                    return subprocess.CompletedProcess(args, 0, stdout, "")
 
-        self.assertEqual(caught.exception.reason_code, "forbidden_tool_call")
-        self.assertFalse(caught.exception.retryable)
+                with (
+                    self.subTest(reason_code=reason_code),
+                    mock.patch(
+                        "disclosure_anchor.adapters.semantics.codex_cli._run_process",
+                        side_effect=run,
+                    ),
+                    self.assertRaises(SemanticRouteAdjudicatorError) as caught,
+                ):
+                    adapter.adjudicate(_batch())
+
+                self.assertEqual(caught.exception.reason_code, reason_code)
+                self.assertFalse(caught.exception.retryable)
 
     def test_exact_disabled_code_mode_receipt_is_nonfatal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

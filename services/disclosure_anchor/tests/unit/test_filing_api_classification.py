@@ -22,10 +22,7 @@ class SemanticRouteCatalogTests(unittest.TestCase):
         )
         self.assertEqual(
             [route.usable_as_section_key for route in response.routes],
-            [
-                definition.context_container or definition.section_container
-                for definition in taxonomy.definitions
-            ],
+            [True for _definition in taxonomy.definitions],
         )
 
     def test_catalog_exposes_labels_and_scopes_without_private_fallback(self) -> None:
@@ -39,6 +36,8 @@ class SemanticRouteCatalogTests(unittest.TestCase):
         self.assertTrue(by_key["business_review"].labels)
         self.assertTrue(by_key["subscription_arrangements"].usable_as_section_key)
         self.assertIn("rights_issue", by_key["subscription_arrangements"].scopes)
+        self.assertTrue(by_key["revenue_and_cost"].usable_as_section_key)
+        self.assertTrue(by_key["fixed_assets"].usable_as_section_key)
 
 
 if __name__ == "__main__":

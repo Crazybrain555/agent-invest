@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from disclosure_anchor.domain.errors import ConfigurationError, MissingDependencyError
 from disclosure_anchor.settings import SENTINEL_NAME, Settings
@@ -49,24 +49,26 @@ class AppStartupTests(unittest.TestCase):
             app = self._create_app_or_skip(_settings(root), validate_runtime=False)
             self.assertEqual(app.title, "disclosure_anchor")
 
-    def test_create_app_uses_one_engine_when_reader_url_falls_back(self) -> None:
+    def test_create_app_fails_closed_when_reader_url_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch(
             "disclosure_anchor.main.create_db_engine"
         ) as create_db_engine:
             root = Path(tmp)
             _create_roots(root)
-            app_engine = object()
+            app_engine = MagicMock()
             create_db_engine.return_value = app_engine
 
-            app = self._create_app_or_skip(
-                _settings(root, database_url="postgresql+psycopg://app/db"),
-                validate_runtime=False,
-            )
+            with self.assertRaisesRegex(
+                ConfigurationError,
+                "DISCLOSURE_READER_DATABASE_URL",
+            ):
+                self._create_app_or_skip(
+                    _settings(root, database_url="postgresql+psycopg://app/db"),
+                    validate_runtime=False,
+                )
 
         create_db_engine.assert_called_once_with("postgresql+psycopg://app/db")
-        self.assertIs(app.state.app_db_engine, app_engine)
-        self.assertIs(app.state.reader_db_engine, app_engine)
-        self.assertIs(app.state.db_engine, app_engine)
+        app_engine.dispose.assert_called_once_with()
 
     def test_create_app_uses_distinct_reader_engine_when_configured(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch(

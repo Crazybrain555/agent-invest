@@ -3,12 +3,18 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest import mock
 
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from disclosure_anchor.api.errors import FilingApiError
+from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
+    MinerUDeploymentChecker,
+    MinerUDeploymentGateError,
+)
+from disclosure_anchor.api.errors import FilingApiError, SERVICE_UNAVAILABLE
 from disclosure_anchor.api.routers.admin import (
+    AdminDeps,
     build_document_units,
     parse_document,
     publish_run,
@@ -37,7 +43,9 @@ from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.worker.locks import WorkerBusyError
 from disclosure_anchor.application.use_cases.build_units import BuildUnitsResult
 from disclosure_anchor.application.use_cases.parse_document import ParseDocumentResult
-from disclosure_anchor.application.use_cases.register_local_pdf import RegisterLocalPdfResult
+from disclosure_anchor.application.use_cases.register_local_pdf import (
+    RegisterLocalPdfResult,
+)
 from disclosure_anchor.application.use_cases.track_companies import (
     DriftEntry,
     TrackCompaniesResult,
@@ -99,7 +107,9 @@ class _Deps:
             unit_count=7,
         )
 
-    def publish_run(self, *, processing_run_id: str, allow_empty: bool, reason: str | None):
+    def publish_run(
+        self, *, processing_run_id: str, allow_empty: bool, reason: str | None
+    ):
         self.publish_args = (processing_run_id, allow_empty, reason)
         if self.publish_error is not None:
             raise self.publish_error
@@ -138,8 +148,13 @@ class _Deps:
         return self.sync_allowed
 
     def sync_company(
-        self, *, security_code, exchange, window_days,
-        window_start=None, window_end=None,
+        self,
+        *,
+        security_code,
+        exchange,
+        window_days,
+        window_start=None,
+        window_end=None,
     ):
         self.sync_args = (security_code, exchange, window_days)
         self.sync_window_range = (window_start, window_end)
@@ -190,13 +205,9 @@ class _Deps:
         )
 
 
-def _request(
-    deps: _Deps, *, settings: Settings | None = None
-) -> SimpleNamespace:
+def _request(deps: _Deps, *, settings: Settings | None = None) -> SimpleNamespace:
     return SimpleNamespace(
-        app=SimpleNamespace(
-            state=SimpleNamespace(admin_deps=deps, settings=settings)
-        )
+        app=SimpleNamespace(state=SimpleNamespace(admin_deps=deps, settings=settings))
     )
 
 
@@ -247,10 +258,17 @@ class FilingApiAdminTests(unittest.TestCase):
 
     def test_parse_is_pinned_and_only_timeout_is_overridable(self) -> None:
         deps = _Deps()
+        settings = SimpleNamespace(
+            disclosure_mineru_backend="hybrid-http-client",
+            disclosure_mineru_api_url="http://127.0.0.1:30000",
+            disclosure_mineru_inference_upstream_url=("http://127.0.0.1:30001/v1"),
+            mineru_http_request_concurrency=7,
+            disclosure_mineru_runtime_bundle_identity_sha256=("sha256:" + "a" * 64),
+        )
 
         response = parse_document(
             "doc_1",
-            _request(deps),
+            _request(deps, settings=settings),
             ParserOptionsRequest(timeout_seconds=30),
         )
 
@@ -267,6 +285,14 @@ class FilingApiAdminTests(unittest.TestCase):
         self.assertIsNone(deps.parse_options.start_page)
         self.assertIsNone(deps.parse_options.end_page)
         self.assertEqual(deps.parse_options.timeout_seconds, 30)
+        self.assertEqual(
+            deps.parse_options.api_url,
+            "http://127.0.0.1:30000",
+        )
+        self.assertEqual(
+            deps.parse_options.server_url,
+            "http://127.0.0.1:30001/v1",
+        )
 
     def test_content_affecting_parser_overrides_are_not_an_admin_surface(self) -> None:
         for override in (
@@ -290,6 +316,44 @@ class FilingApiAdminTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.status_code, 409)
+
+    def test_parse_reports_mineru_gate_failure_as_service_unavailable(self) -> None:
+        deps = _Deps()
+        deps.parse_error = MinerUDeploymentGateError("GPU identity unavailable")
+
+        with self.assertRaises(FilingApiError) as raised:
+            parse_document(
+                "doc_1",
+                _request(deps),
+                ParserOptionsRequest(),
+            )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.error_code, SERVICE_UNAVAILABLE)
+
+    def test_admin_gate_failure_precedes_parser_and_database_admission(self) -> None:
+        deps = AdminDeps.__new__(AdminDeps)
+        deps._mineru_checker = mock.MagicMock(spec=MinerUDeploymentChecker)
+        deps._mineru_checker.assert_admission.side_effect = MinerUDeploymentGateError(
+            "GPU identity unavailable"
+        )
+
+        with (
+            mock.patch(
+                "disclosure_anchor.api.routers.admin.exclusive_worker_admission"
+            ) as database_admission,
+            mock.patch(
+                "disclosure_anchor.api.routers.admin.MinerUMediumDocumentParser"
+            ) as parser,
+            self.assertRaisesRegex(MinerUDeploymentGateError, "identity unavailable"),
+        ):
+            deps.parse_document(
+                document_id="doc_1",
+                options=ParserOptions(),
+            )
+
+        database_admission.assert_not_called()
+        parser.assert_not_called()
 
     def test_build_units_response_shape(self) -> None:
         deps = _Deps()
@@ -384,6 +448,36 @@ class FilingApiAdminTests(unittest.TestCase):
         self.assertEqual(entry.cleared_overrides, ["lookback", "process_classes"])
         self.assertEqual(entry.status_change, "active->paused")
         self.assertEqual(response.created_count, 0)
+
+    def test_small_admin_track_keeps_transitional_profile_resolution(self) -> None:
+        deps = _Deps()
+
+        track_companies(
+            _request(deps),
+            TrackCompaniesRequest(
+                entries=[TrackEntryRequest(security_code="600519", exchange="SSE")]
+            ),
+        )
+
+        self.assertEqual(deps.resolved_codes, (("600519", "SSE"),))
+
+    def test_bulk_admin_track_skips_post_commit_profile_resolution(self) -> None:
+        deps = _Deps()
+
+        track_companies(
+            _request(deps),
+            TrackCompaniesRequest(
+                entries=[
+                    TrackEntryRequest(
+                        security_code=f"{600000 + index:06d}",
+                        exchange="SSE",
+                    )
+                    for index in range(21)
+                ]
+            ),
+        )
+
+        self.assertFalse(hasattr(deps, "resolved_codes"))
 
     def test_untrack_company_returns_removal_with_retained_documents(self) -> None:
         deps = _Deps()

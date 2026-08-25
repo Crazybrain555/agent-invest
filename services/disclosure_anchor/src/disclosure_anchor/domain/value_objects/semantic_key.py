@@ -54,6 +54,33 @@ def validate_optional_semantic_key_state(
         )
 
 
+def validate_optional_semantic_keys(semantic_keys: Any) -> None:
+    """Accept no route claim or one ordered unique plural route set."""
+
+    if semantic_keys is None:
+        return
+    if not isinstance(semantic_keys, list) or not semantic_keys:
+        raise SemanticKeyInvariantError(
+            "array_empty",
+            "semantic_keys must be null or a non-empty array",
+        )
+    if len(semantic_keys) > 8:
+        raise SemanticKeyInvariantError(
+            "array_too_large",
+            "semantic_keys must contain at most eight keys",
+        )
+    if any(not is_valid_semantic_key(key) for key in semantic_keys):
+        raise SemanticKeyInvariantError(
+            "array_item_invalid",
+            "semantic_keys contains an invalid key",
+        )
+    if len(semantic_keys) != len(set(semantic_keys)):
+        raise SemanticKeyInvariantError(
+            "array_duplicate",
+            "semantic_keys must not contain duplicates",
+        )
+
+
 def validate_optional_section_keys(section_keys: Any) -> None:
     """Accept no normalized section claim or one ordered unique key chain."""
 

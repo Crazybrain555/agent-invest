@@ -1,94 +1,69 @@
 """Offline config validation (Home Assistant check_config pattern).
 
-Validates the two operator-owned config files BEFORE anything applies them —
-file/line-anchored errors, non-zero exit on any error, no DB access:
+Validates operator-owned config before anything applies it, with no DB access:
 
-  config/watchlist.csv          columns, code/exchange/status/date shapes,
-                                lookback int, sync_frequency vocabulary,
-                                process_classes ⊆ class_map
-  config/processing_policy.json process ∪ register_only == class_map classes,
-                                disjoint, no unknown names
+* watchlist CSV columns, canonical identities, values, and duplicates;
+* the research-universe sidecar's exact CSV byte/hash and rule binding;
+* processing-policy coverage and disjoint assignments.
 
-`make config-check` runs this; `make track` runs it first (validate → apply).
+``make config-check`` runs this; ``make track`` also validates the exact
+in-memory CSV snapshot that it applies.
 """
 
 from __future__ import annotations
 
-import csv
+import argparse
 import json
-import re
-import sys
 from pathlib import Path
+import sys
 
 from disclosure_anchor.adapters.sources.cninfo.mapper import load_class_map
-from disclosure_anchor.application.use_cases.track_companies import SYNC_FREQUENCIES
-from disclosure_anchor.domain.value_objects import canonical_security_identity
+from disclosure_anchor.adapters.watchlist_config import (
+    DEFAULT_PROCESSING_POLICY,
+    DEFAULT_SCREEN_MANIFEST,
+    DEFAULT_WATCHLIST,
+    WatchlistSnapshot,
+    load_watchlist_snapshot,
+    screen_manifest_for_snapshot,
+    validate_screen_manifest,
+    validate_watchlist_snapshot,
+)
 
-WATCHLIST = Path("config/watchlist.csv")
-POLICY = Path("config/processing_policy.json")
-EXCHANGES = {"BSE", "SSE", "SZSE"}
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CODE_RE = re.compile(r"^\d{6}$")
+
+WATCHLIST = DEFAULT_WATCHLIST
+SCREEN_MANIFEST = DEFAULT_SCREEN_MANIFEST
+POLICY = DEFAULT_PROCESSING_POLICY
 
 
-def check_watchlist(errors: list[str], known_classes: frozenset[str]) -> None:
-    if not WATCHLIST.exists():
-        errors.append(f"{WATCHLIST}: missing")
+def check_watchlist(
+    errors: list[str],
+    known_classes: frozenset[str],
+    *,
+    watchlist: Path | None = None,
+    snapshot: WatchlistSnapshot | None = None,
+) -> None:
+    path = watchlist or WATCHLIST
+    try:
+        resolved_snapshot = snapshot or load_watchlist_snapshot(path)
+    except ValueError as exc:
+        errors.append(str(exc))
         return
-    with WATCHLIST.open(encoding="utf-8") as fh:
-        lines = [line for line in fh]
-    reader = csv.DictReader(
-        (line for line in lines if not line.startswith("#")),
-    )
-    required = {"security_code", "exchange", "status", "joined_date"}
-    if reader.fieldnames is None or not required <= set(reader.fieldnames):
-        errors.append(
-            f"{WATCHLIST}: header must contain {sorted(required)}; "
-            f"got {reader.fieldnames}"
-        )
+    errors.extend(validate_watchlist_snapshot(resolved_snapshot, known_classes))
+
+
+def check_screen_manifest(
+    errors: list[str],
+    *,
+    watchlist: Path,
+    manifest_path: Path,
+    snapshot: WatchlistSnapshot | None = None,
+) -> None:
+    try:
+        resolved_snapshot = snapshot or load_watchlist_snapshot(watchlist)
+    except ValueError as exc:
+        errors.append(str(exc))
         return
-    if "process_classes" not in reader.fieldnames:
-        errors.append(
-            f"{WATCHLIST}: header missing process_classes (renamed from "
-            "filing_categories in 0018)"
-        )
-    seen: dict[str, int] = {}
-    for lineno, row in enumerate(reader, start=1):
-        where = f"{WATCHLIST}:{lineno}"
-        code = (row.get("security_code") or "").strip()
-        if not code:
-            continue
-        if not CODE_RE.match(code):
-            errors.append(f"{where}: security_code {code!r} is not 6 digits")
-        if code in seen:
-            errors.append(f"{where}: duplicate security_code {code} (first at row {seen[code]})")
-        seen[code] = lineno
-        exchange = (row.get("exchange") or "").strip()
-        if exchange and exchange not in EXCHANGES:
-            errors.append(f"{where}: exchange {exchange!r} not in {sorted(EXCHANGES)}")
-        elif exchange and CODE_RE.match(code):
-            try:
-                canonical_security_identity(code, exchange)
-            except ValueError as exc:
-                errors.append(f"{where}: {exc}")
-        status = (row.get("status") or "").strip() or "active"
-        if status not in ("active", "paused"):
-            errors.append(f"{where}: status {status!r} must be active|paused")
-        joined = (row.get("joined_date") or "").strip()
-        if joined and not DATE_RE.match(joined):
-            errors.append(f"{where}: joined_date {joined!r} is not YYYY-MM-DD")
-        lookback = (row.get("lookback_days") or "").strip()
-        if lookback and (not lookback.isdigit()):
-            errors.append(f"{where}: lookback_days {lookback!r} is not a non-negative int")
-        frequency = (row.get("sync_frequency") or "").strip()
-        if frequency and frequency not in SYNC_FREQUENCIES:
-            errors.append(f"{where}: sync_frequency {frequency!r} not in {SYNC_FREQUENCIES}")
-        classes_raw = (row.get("process_classes") or "").strip()
-        for item in (seg.strip() for seg in classes_raw.split(";") if seg.strip()):
-            if item not in known_classes:
-                errors.append(
-                    f"{where}: unknown process_classes value {item!r} (see class_map.json)"
-                )
+    errors.extend(validate_screen_manifest(resolved_snapshot, manifest_path))
 
 
 def check_policy(errors: list[str], known_classes: frozenset[str]) -> None:
@@ -116,17 +91,51 @@ def check_policy(errors: list[str], known_classes: frozenset[str]) -> None:
         )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="config_check", description=__doc__)
+    parser.add_argument("--watchlist", type=Path)
+    parser.add_argument("--screen-manifest", type=Path)
+    args = parser.parse_args(argv)
+    watchlist = args.watchlist or WATCHLIST
     known_classes = frozenset(load_class_map()["classes"])
     errors: list[str] = []
-    check_watchlist(errors, known_classes)
+    try:
+        snapshot = load_watchlist_snapshot(watchlist)
+    except ValueError as exc:
+        snapshot = None
+        errors.append(str(exc))
+
+    screen_manifest = args.screen_manifest
+    if snapshot is not None:
+        screen_manifest = screen_manifest_for_snapshot(
+            snapshot,
+            explicit_manifest=screen_manifest,
+            default_watchlist=WATCHLIST,
+            default_manifest=SCREEN_MANIFEST,
+        )
+        check_watchlist(
+            errors,
+            known_classes,
+            watchlist=watchlist,
+            snapshot=snapshot,
+        )
+        if screen_manifest is not None:
+            check_screen_manifest(
+                errors,
+                watchlist=watchlist,
+                manifest_path=screen_manifest,
+                snapshot=snapshot,
+            )
     check_policy(errors, known_classes)
     for line in errors:
         print(f"ERROR {line}", file=sys.stderr)
     if errors:
         print(f"config-check: {len(errors)} error(s)", file=sys.stderr)
         return 1
-    print("config-check: OK (watchlist + processing_policy)")
+    checked = "watchlist + processing_policy"
+    if screen_manifest is not None:
+        checked = "watchlist + research-universe manifest + processing_policy"
+    print(f"config-check: OK ({checked})")
     return 0
 
 

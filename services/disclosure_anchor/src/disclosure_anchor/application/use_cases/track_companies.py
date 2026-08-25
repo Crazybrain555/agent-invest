@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from disclosure_anchor.application.ports.disclosure_source import SourceCompanyProfile
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
@@ -21,12 +22,20 @@ from disclosure_anchor.application.services.subject_resolver import (
     SubjectCandidate,
     SubjectResolver,
 )
+from disclosure_anchor.application.services.cninfo_profile_access import (
+    add_cninfo_profile_access,
+    add_failed_cninfo_profile_access,
+)
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import DisclosureAnchorError
 from disclosure_anchor.domain.value_objects import canonical_security_identity
 
 SYNC_FREQUENCIES = ("hourly", "daily", "weekly")
+# Transitional compatibility only: direct small-code adds may still resolve a
+# name immediately. File/bulk imports never run this unaudited post-commit
+# provider phase; the worker's provenance-recording sync owns bulk enrichment.
+INLINE_PROFILE_RESOLUTION_MAX = 20
 # The pool has exactly two lifecycle states; the empty/None default of "active"
 # is applied by the CSV/API intake layers before an entry reaches here.
 TRACK_STATUSES = ("active", "paused")
@@ -155,13 +164,39 @@ class ResolveTrackedProfiles:
                     PENDING_LEGAL_NAME_PREFIX
                 ):
                     continue  # already resolved (or unknown) — nothing to do
-                try:
-                    profile = self._profile_loader(security_code)
-                    if profile is None or not profile.legal_name:
-                        results.append(
-                            ProfileResolution(security_code, exchange, None, False)
-                        )
-                        continue
+            observed_at = datetime.now(timezone.utc)
+            try:
+                profile = self._profile_loader(security_code)
+            except DisclosureAnchorError as exc:
+                with self._uow_factory() as uow:
+                    add_failed_cninfo_profile_access(
+                        uow=uow,
+                        security_code=security_code,
+                        error=exc,
+                        accessed_at=observed_at,
+                    )
+                    uow.commit()
+                results.append(
+                    ProfileResolution(security_code, exchange, None, False)
+                )
+                if getattr(exc, "error_code", None) == "quota_exhausted":
+                    break
+                continue
+            with self._uow_factory() as uow:
+                profile_access = add_cninfo_profile_access(
+                    uow=uow,
+                    security_code=security_code,
+                    profile=profile,
+                    accessed_at=observed_at,
+                )
+                uow.commit()
+            if profile is None or not profile.legal_name:
+                results.append(
+                    ProfileResolution(security_code, exchange, None, False)
+                )
+                continue
+            try:
+                with self._uow_factory() as uow:
                     self._resolver.resolve(
                         uow,
                         SubjectCandidate(
@@ -170,6 +205,12 @@ class ResolveTrackedProfiles:
                             legal_name=profile.legal_name,
                             board=None,
                             credit_code=profile.uscc,
+                            identifier_source_access_id=(
+                                profile_access.source_access_id if profile.uscc else None
+                            ),
+                            identifier_observed_at=(
+                                profile_access.accessed_at if profile.uscc else None
+                            ),
                         ),
                     )
                     uow.commit()
@@ -178,16 +219,12 @@ class ResolveTrackedProfiles:
                             security_code, exchange, profile.legal_name, True
                         )
                     )
-                except DisclosureAnchorError as exc:
-                    # Offline/quota/conflict: keep the placeholder, next sync heals.
-                    results.append(
-                        ProfileResolution(security_code, exchange, None, False)
-                    )
-                    if getattr(exc, "error_code", None) == "quota_exhausted":
-                        # Quota is batch-wide. Do not burn one request per
-                        # remaining code; placeholders are deliberately healed
-                        # by the worker's first sync on a later quota window.
-                        break
+            except DisclosureAnchorError:
+                # Conflict keeps the placeholder; the durable profile access
+                # above remains available for operator review and later sync.
+                results.append(
+                    ProfileResolution(security_code, exchange, None, False)
+                )
         return tuple(results)
 
 
@@ -213,8 +250,8 @@ class UntrackCompanies:
     and CAN be hard-deleted; the company/security ledger rows and any
     acquired documents are evidence and stay. Acquisition stops because the
     download queue only serves companies with an ACTIVE tracked row. For a
-    reversible stop use status=paused instead; for full test-data removal
-    use the purge-company CLI (test-phase tool).
+    reversible stop use status=paused instead. Corpus deletion is deliberately
+    absent from the service CLI; tests use the isolated scratch runner.
     """
 
     def __init__(self, *, uow_factory: Callable[[], UnitOfWork]) -> None:

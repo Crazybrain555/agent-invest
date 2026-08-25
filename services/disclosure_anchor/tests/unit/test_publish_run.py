@@ -70,7 +70,6 @@ def _unit(
         payload=resolved_payload,
         title=title,
         heading_path=resolved_heading_path,
-        semantic_key=semantic_key,
         semantic_keys=semantic_keys,
         quality_status=quality_status,
         order_index=order_index,
@@ -86,7 +85,6 @@ def _unit(
         content_hash=content_hash or hashes.content_hash,
         title=title,
         heading_path=resolved_heading_path,
-        semantic_key=semantic_key,
         semantic_keys=semantic_keys,
         quality_status=quality_status,
         query_projection_hash=(query_projection_hash or hashes.query_projection_hash),
@@ -245,7 +243,6 @@ def _provider_guard_fixture() -> tuple[
                 title=draft.title,
                 heading_path=list(draft.heading_path),
                 order_index=draft.unit_index + 1,
-                semantic_key=draft.semantic_key,
                 semantic_keys=(
                     list(draft.semantic_keys)
                     if draft.semantic_keys is not None
@@ -316,7 +313,7 @@ class PublishRunTests(unittest.TestCase):
             )
 
         tampered_applicability = [*units]
-        tampered_applicability[1] = replace(units[1], applicability=None)
+        tampered_applicability[1] = replace(units[1], applicability="applicable")
         with self.assertRaises(PublishRunError) as caught:
             guard(
                 run=run,
@@ -823,7 +820,6 @@ class PublishRunTests(unittest.TestCase):
         uow = _uow_with_document()
         uow.processing_runs.add(_run("run_new"))
         unit = _unit("du_new", "run_new")
-        unit.semantic_key = "INVALID"
         unit.semantic_keys = ["INVALID"]
         hashes = compute_unit_hashes(
             payload_kind=unit.payload_kind,

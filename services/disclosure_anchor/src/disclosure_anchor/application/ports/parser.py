@@ -24,8 +24,15 @@ class ParserOptions:
     start_page: int | None = None
     end_page: int | None = None
     timeout_seconds: int | None = None
-    # OpenAI-compatible MinerU server for the *-http-client backends
-    # (mineru-openai-server on a GPU box); None for local backends.
+    # Mac-reachable fixed mineru-api orchestration endpoint. When configured,
+    # the MinerU CLI submits to this existing API instead of starting a
+    # temporary local FastAPI process.
+    api_url: str | None = None
+    # Official MinerU 3.4.4 has no cancel endpoint. After a local timeout or
+    # stop, the client must wait for queued/processing remote tasks to drain.
+    api_drain_timeout_seconds: int = 86400
+    # OpenAI-compatible VLM upstream as resolved inside the fixed mineru-api's
+    # Windows network namespace; None for local backends.
     server_url: str | None = None
     # Per-document HTTP fan-out inside MinerU. This is distinct from the
     # worker's document concurrency: each *-http-client process can otherwise
@@ -44,10 +51,7 @@ class ParserOptions:
         return bool(
             self.image_analysis
             and self.backend != "pipeline"
-            and not (
-                self.backend.startswith("hybrid-")
-                and self.effort == "medium"
-            )
+            and not (self.backend.startswith("hybrid-") and self.effort == "medium")
         )
 
     def target_identity(self, identity: ParserIdentity) -> ParserTargetIdentity:
@@ -66,9 +70,7 @@ class ParserOptions:
             full_pdf=self.start_page is None and self.end_page is None,
             start_page=self.start_page,
             end_page=self.end_page,
-            runtime_bundle_identity_sha256=(
-                self.runtime_bundle_identity_sha256 or ""
-            ),
+            runtime_bundle_identity_sha256=(self.runtime_bundle_identity_sha256 or ""),
         )
 
 

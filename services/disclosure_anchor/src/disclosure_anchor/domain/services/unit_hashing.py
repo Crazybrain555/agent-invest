@@ -88,8 +88,8 @@ def query_projection_hash(
     payload_kind: str,
     title: str | None,
     heading_path: list[str],
-    semantic_key: str | None,
     quality_status: str,
+    semantic_key: str | None = None,
     semantic_keys: list[str] | None = None,
     section_keys: list[str] | None = None,
     applicability: str | None = None,
@@ -117,8 +117,8 @@ def query_projection(
     payload_kind: str,
     title: str | None,
     heading_path: list[str],
-    semantic_key: str | None,
     quality_status: str,
+    semantic_key: str | None = None,
     semantic_keys: list[str] | None = None,
     section_keys: list[str] | None = None,
     applicability: str | None = None,
@@ -131,18 +131,25 @@ def query_projection(
     because the publisher forgot a newly hashed field.
     """
 
+    if semantic_keys is None and semantic_key is not None:
+        # Read-only compatibility for historical hash fixtures/snapshots.
+        # New domain state and persistence are plural-only.
+        semantic_keys = [semantic_key]
+    lead = semantic_keys[0] if semantic_keys else None
+    if semantic_key is not None and semantic_key != lead:
+        raise ValueError("legacy semantic_key differs from semantic_keys[0]")
     projection: dict[str, Any] = {
         "payload_kind": payload_kind,
         "title": title,
         "heading_path": heading_path,
-        "semantic_key": semantic_key,
+        "semantic_key": lead,
         "quality_status": quality_status,
         "applicability": applicability,
     }
     # The singleton route set carries no information beyond semantic_key.
     # Preserve the 0033 hash profile for null/singleton routes and bind only
     # genuinely independent secondary recall to the query projection.
-    if semantic_keys is not None and semantic_keys != [semantic_key]:
+    if semantic_keys is not None and semantic_keys != [lead]:
         projection["semantic_keys"] = semantic_keys
     if section_keys is not None:
         projection["section_keys"] = section_keys
@@ -222,9 +229,9 @@ def compute_unit_hashes(
     payload: dict[str, Any],
     title: str | None,
     heading_path: list[str],
-    semantic_key: str | None,
     quality_status: str,
     order_index: int,
+    semantic_key: str | None = None,
     semantic_keys: list[str] | None = None,
     section_keys: list[str] | None = None,
     applicability: str | None = None,

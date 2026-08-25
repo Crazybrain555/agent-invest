@@ -58,6 +58,15 @@ event_key_map 不得作为当前审查对象，现状勘误见 retrieval 设计�
    原回答只可记为 stale evidence，必须用新 packet 重审。`thinking`、半截回答、超时、中断或额度
    错误都不是 verdict。完整答复、本地验证和必要复审全部关闭且 HANDOFF 已记 SHA/结论后，才将
    该 exact review-id packet 移入废纸篓；不得递归删除共享 `buddle_code` 根或其他 active packet。
+7. “live 与 source replay 零差异”必须由仓库内可复跑的只读脚本生成。receipt 至少列明比较字段、
+   source/replay 身份、live generation 标记，并给双方规范化行集的独立聚合哈希；只有
+   `mismatch_count=0`、没有字段清单/聚合哈希/生成脚本的 JSON 不是可证伪的验收证据。脚本必须从
+   同一份已读取字节同时解析 replay 和计算 receipt SHA，禁止比较后再次按路径读取；replay 每个
+   比较字段必须显式存在，route arrays 必须是数组。只有 live public-view 的
+   `semantic_keys/section_keys NULL` 可按声明归一化为 `[]`；哈希字段必须是 lowercase hex SHA-256。
+   live 查询范围必须从 replay 的完整 provider-document 集合机械派生，并读取这些 provider 的全部
+   active Units（不得只按 expected identity join，也不得无条件扫描其他 provider）；receipt 绑定排序后的
+   provider 集合哈希、各 active run ID 与同一只读 repeatable-read snapshot，额外/缺失 unit_index 均失败。
 
 ## 1. 表字段 review（逐表逐列，问四个问题）
 
@@ -68,7 +77,9 @@ event_key_map 不得作为当前审查对象，现状勘误见 retrieval 设计�
 重点核对项：
 - company/company_identifier/security：USCC 唯一、identifier 有 source_access、
   exchange 全大写、无 PENDING_LEGAL_NAME 残留（有=该公司从未成功同步过）。
-- tracked_company：与 config/watchlist.csv 对账零漂移（`make track` 输出 drift=0）；
+- tracked_company：运行时以 DB 为权威，逐行检查状态/覆盖/生效值；config/watchlist.csv 只是
+  导入/快照文件。库/文件差异必须报告并解释，未经明确 prune/import 指令不得以“零漂移”为目标
+  自动改任一侧；
   lookback/filing_categories/sync_frequency 三列有值时 worker 真在用（queries.sync_due）。
 - document：表列 filing_type 仅为注册兜底；**消费面以视图为准**——filing_type=
   class 词表 argmax（30 类）、disclosure_topics=命中集合、三维拆解列与
@@ -103,30 +114,33 @@ SELECT count(*) FROM disclosure_public.document_units_v1 WHERE is_active_run AND
 -- 声明残留（单位/保证/适用 三族）
 SELECT count(*) FROM disclosure_public.document_units_v1
 WHERE is_active_run AND payload->>'text' ~ '单位(均)?[为是]?[：:]\S{1,12}$';
--- 附注子项失怙（cn_a_v6 驱逐 bug 回归探测）：点号子项直挂 、号章级（3 层且
--- 尾项=title）= 科目父级被吞的签名，判读清单（当前正本语料为 0；宽式
--- 「无 \d、祖先」不可作门——决议议案/审计报告科目层合法直用点号）
+-- 附注点分子项失怙：N.M / N.M.K 标题的 heading_path 必须保留最近的 N、父级。
+-- 先列出所有点分标题供人工判读；不能使用 `(?!\d)`，它会把真正的点分编号
+-- 排除在探针之外，也不能只以固定三层路径作唯一签名。
 SELECT provider_document_id, title, heading_path FROM disclosure_public.document_units_v1
-WHERE is_active_run AND title ~ '^\d{1,3}[.．](?!\d)'
-  AND jsonb_array_length(heading_path) = 3
-  AND heading_path->>1 ~ '^[一二三四五六七八九十]+、' AND heading_path->>2 = title;
+WHERE is_active_run AND title ~ '^\d{1,3}([.．]\d{1,3})+'
+ORDER BY provider_document_id, order_index;
 -- 过碎审计：filing_type='other' 且 units>=10 且总字数<8000 的文档需逐一给理由
 -- 过粗审计：单 unit chars>15000 的抽查其 parts 是否同主题
 ```
-标题吞没对账环（round15 制度化——**DB 内类扫描看不见"从未入库"的丢失**，
-本环是唯一能系统抓住该类的手段）：
-`PYTHONPATH=src .venv/bin/python scripts/audit_heading_coverage.py`
-——逐文档核对 IR 里每个 heading 元素必须出现在单元的 title/heading_path/
-parts.local_heading/parts.heading_path/正文行之一；自动分类扉页标题行与空节
-（信息性）。预期残余=1（江海年报"（1）在子公司所有者权益份额…"模板反转，
-见 §4）；新增 SWALLOWED 即为切分 bug。round15 用它抓出两个真 bug：
-S5 续表合并只看列数（cn_a_v6 后同构附注表跨科目误并，3. 销售费用类标题
-全域蒸发）与 S6 把 headers-only 表判空丢弃（分部信息类整支路径蒸发）。
+Provider 原生完整性对账环（**DB 内类扫描看不见“进入 provider projection 前”的丢失**）：
 
-变体发现环（业界定式：C4/eDiscovery 频率法，round11 调研落地）：
-`PYTHONPATH=src .venv/bin/python scripts/audit_boilerplate_candidates.py`
-——跨文档高频短行且未被现有模式族覆盖的 = 候选新套话变体，人工确认后
-晋级进 rules 模式族并升 RULES_VERSION；切分时永远只跑确定性模式。
+1. `make doctor-full` 必须逐个验证 source PDF、provider-document artifact、Unit snapshot 和
+   active semantic receipt 的 owner/hash；任何缺失或漂移均失败。
+2. 先用 `make generate-current-source-replay EVALUATION=<新 evaluation> RECEIPT=<新 source receipt>
+   SOURCE_REVISION=<不可变源码版本>` 在单一 `REPEATABLE READ READ ONLY` 事务中遍历全部 active
+   generation。该命令必须重新读取 immutable source PDF、ProviderDocument/bundle 与 hash-bound
+   semantic receipts，走生产 publication guard 重建 `provider_unit` 并逐字段核对 private Unit；
+   receipt 同时绑定当前源码树、taxonomy/router/builder、每份 source/artifact/receipt hash 与 DB snapshot。
+   evidence 文件只允许新建，不覆盖旧收据。
+3. 再用 `make audit-live-unit-replay REPLAY=<上一步 evaluation> OUTPUT=<新 live 收据>
+   SOURCE_REVISION=<同一源码版本>` 对 replay 中每个 provider 的全部 active Units 做第二个
+   repeatable-read public-view 对账；字段清单、provider 集合、active run、双方聚合哈希及额外/缺失
+   索引都必须闭合。
+4. source replay 证明的是“冻结 provider projection → live Unit”的完整性，不能单独证明 PDF
+   从未被 MinerU 漏读。对 `source_quality_findings`、表格和可疑标题页必须回到同一 hash-bound
+   PDF 渲染目检；新增 provider 形态要加入冻结代表样本和确定性回归，不得引用已退役的
+   NormalizedIR heading/boilerplate 脚本，也不得把跨文档频率启发式重新写回 L1。
 
 目检协议：随机抽 ≥5 份不同 filing_type 的文档，`pdftoppm` 渲染对应页
 （page_no 列可定位），逐单元对照 PDF 判断：边界是否业务完整、标题归属是否正确、
@@ -181,9 +195,11 @@ S5 续表合并只看列数（cn_a_v6 后同构附注表跨科目误并，3. 销
 - "详见附注 X"交叉引用单元——真实内容，保留。
 - 金融工具风险节内部 1、/(一) 层级倒置的次级归属（不窜根即可）。
 - web 兜底通道 disclosure_topics=null、三维拆解列=null（接口无 F006V），filing_type 走标题规则（rule_set='title'）——设计内。
-- 0033 起不再追求 L1 semantic-key 覆盖率：Provider writer 写 NULL，禁止用
-  `document_content` 或祖先词表填充占位语义。若未来出现真实受控 scalar，仍使用英文规范键；
-  多值主题与中文标签属于 L2 派生层。
+- L1 不追求 semantic-key 机械满覆盖，也禁止用 `document_content`、`other_information` 或
+  Document facet 填充占位语义；但当前 writer 会从 Unit 自身标题/正文/表格的闭合证据生成
+  `semantic_keys`（直接主题），并从 hash-bound accepted heading path 的精确结构容器生成
+  `section_keys`（章节位置）。两者都用英文规范键并对 L2 公布同源 catalog；真实无证据行允许
+  NULL，仍由 title/path/body 词法检索承载。审查必须同时防止可恢复的系统性 NULL 和无证据补键。
 
 ## 5. 开放背账（review 时核对是否恶化）
 

@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import date
 import hmac
 from pathlib import Path
+import threading
 from typing import Any
 
 from sqlalchemy import text
@@ -20,6 +21,10 @@ from disclosure_anchor.adapters.parsers.mineru_medium.process import MinerUProce
 from disclosure_anchor.adapters.parsers.pdf_text_observation import (
     observe_pdf_text_rectangles,
 )
+from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
+    MinerUDeploymentChecker,
+    MinerUDeploymentGateError,
+)
 from disclosure_anchor.adapters.semantics.runtime import build_semantic_runtime
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
@@ -30,6 +35,7 @@ from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentSto
 from disclosure_anchor.api.errors import (
     CONFLICT,
     FORBIDDEN,
+    SERVICE_UNAVAILABLE,
     UNAUTHORIZED,
     FilingApiError,
     not_found,
@@ -82,6 +88,7 @@ from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     compute_sync_window,
 )
 from disclosure_anchor.application.use_cases.track_companies import (
+    INLINE_PROFILE_RESOLUTION_MAX,
     ResolveTrackedProfiles,
     TrackCompanies,
     TrackCompaniesCommand,
@@ -126,10 +133,16 @@ def parse_document(
     defaults = (
         ParserOptions(
             backend=settings.disclosure_mineru_backend,
-            server_url=settings.disclosure_mineru_server_url,
-            http_request_concurrency=(
-                settings.mineru_http_request_concurrency
+            api_url=settings.disclosure_mineru_api_url,
+            api_drain_timeout_seconds=(
+                getattr(
+                    settings,
+                    "disclosure_mineru_api_drain_timeout_seconds",
+                    86400,
+                )
             ),
+            server_url=settings.disclosure_mineru_inference_upstream_url,
+            http_request_concurrency=None,
             runtime_bundle_identity_sha256=(
                 settings.disclosure_mineru_runtime_bundle_identity_sha256
             ),
@@ -146,6 +159,12 @@ def parse_document(
         raise FilingApiError(
             status_code=409,
             error_code=CONFLICT,
+            message=str(exc),
+        ) from exc
+    except MinerUDeploymentGateError as exc:
+        raise FilingApiError(
+            status_code=503,
+            error_code=SERVICE_UNAVAILABLE,
             message=str(exc),
         ) from exc
     return ParseDocumentResponse.model_validate(asdict(result))
@@ -216,10 +235,9 @@ def track_companies(
         # TrackCompanies rejects unknown sync_frequency/process_classes and
         # negative lookback with ValueError — surface as the envelope's 422.
         raise validation_error("entries", str(exc)) from exc
-    if not command.dry_run:
-        # On-add metadata fetch (Miniflux pattern), best-effort: pending
-        # legal names resolve now when credentials allow; the worker's
-        # first sync heals whatever this pass could not.
+    if not command.dry_run and len(result.results) <= INLINE_PROFILE_RESOLUTION_MAX:
+        # Transitional compatibility for small admin adds only. Bulk imports
+        # leave enrichment to the worker's audited source_access path.
         deps.resolve_profiles(
             tuple((item.security_code, item.exchange) for item in result.results)
         )
@@ -288,6 +306,8 @@ class AdminDeps:
             text_reader=observe_pdf_text_rectangles,
         )
         self._uow_factory = unit_of_work_factory(engine)
+        self._mineru_checker: MinerUDeploymentChecker | None = None
+        self._mineru_checker_lock = threading.Lock()
 
     def register_local_pdf(
         self, command: RegisterLocalPdfCommand
@@ -300,10 +320,12 @@ class AdminDeps:
     def parse_document(
         self, *, document_id: str, options: ParserOptions
     ) -> ParseDocumentResult:
+        self._require_mineru_admission()
         executable = self._settings.disclosure_mineru_bin or Path("mineru")
         parser = MinerUMediumDocumentParser(
             process=MinerUProcess(executable=executable),
-            server_url=self._settings.disclosure_mineru_server_url,
+            api_url=self._settings.disclosure_mineru_api_url,
+            server_url=(self._settings.disclosure_mineru_inference_upstream_url),
         )
         with exclusive_worker_admission(self._engine):
             return ParseDocument(
@@ -322,6 +344,19 @@ class AdminDeps:
                     options=options,
                 )
             )
+
+    def _require_mineru_admission(self) -> None:
+        checker = self._mineru_checker
+        if checker is None:
+            with self._mineru_checker_lock:
+                checker = self._mineru_checker
+                if checker is None:
+                    checker = MinerUDeploymentChecker(
+                        self._settings,
+                        parse_enabled=True,
+                    )
+                    self._mineru_checker = checker
+        checker.assert_admission()
 
     def build_units(self, *, document_id: str) -> BuildUnitsResult:
         semantic = build_semantic_runtime(
@@ -395,10 +430,13 @@ class AdminDeps:
         )
 
         source = CninfoSource(CninfoClient.from_settings(settings))
-        ResolveTrackedProfiles(
-            uow_factory=self._uow_factory,
-            profile_loader=source.profile_for_security,
-        ).execute(codes)
+        try:
+            ResolveTrackedProfiles(
+                uow_factory=self._uow_factory,
+                profile_loader=source.profile_for_security,
+            ).execute(codes)
+        finally:
+            source.close()
 
     def can_sync(self) -> bool:
         return bool(
@@ -552,9 +590,7 @@ def _register_response(result: RegisterLocalPdfResult) -> RegisterLocalPdfRespon
 
 def _track_response(result: TrackCompaniesResult) -> TrackCompaniesResponse:
     return TrackCompaniesResponse(
-        results=[
-            TrackEntryResultResponse(**asdict(item)) for item in result.results
-        ],
+        results=[TrackEntryResultResponse(**asdict(item)) for item in result.results],
         drift=[TrackDriftResponse(**asdict(item)) for item in result.drift],
         dry_run=result.dry_run,
         created_count=result.created_count,
@@ -576,11 +612,11 @@ def _parser_options(
         start_page=None,
         end_page=None,
         timeout_seconds=command.timeout_seconds,
+        api_url=defaults.api_url,
+        api_drain_timeout_seconds=defaults.api_drain_timeout_seconds,
         server_url=defaults.server_url,
         http_request_concurrency=defaults.http_request_concurrency,
-        runtime_bundle_identity_sha256=(
-            defaults.runtime_bundle_identity_sha256
-        ),
+        runtime_bundle_identity_sha256=(defaults.runtime_bundle_identity_sha256),
     )
 
 

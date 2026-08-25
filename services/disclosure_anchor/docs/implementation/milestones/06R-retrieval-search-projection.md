@@ -2,7 +2,7 @@
 id: disclosure_anchor_milestone_06R
 project: disclosure_anchor
 title: 06R — 检索投影层（写入时分词 + 加权 tsvector + trgm 兜底）
-status: implemented; 0028 lossless windows + 0030 source-bound atoms validated in scratch (production migration pending reset)
+status: implemented; 0028 lossless windows + 0030 source-bound atoms + 0044 strict Q&A row atoms validated in scratch (development migration pending clean replay)
 created_at: 2026-07-17
 depends_on: milestone 05/06、design/retrieval-and-semantic-keys.md §5/§6.3
 decided_by: 用户 2026-07-17 三项确认（应用侧 jieba 预分词；pg_trgm 兜底本期做；CLI 重建 + worker 增量）
@@ -12,7 +12,7 @@ decided_by: 用户 2026-07-17 三项确认（应用侧 jieba 预分词；pg_trgm
 
 > 2026-08-13：0034 恢复 Unit 的完整 route set。当前 `key_tokens` 按顺序取
 > `semantic_keys` 全集。当前 Provider writer 使用版本化闭集 taxonomy、Unit-local source
-> candidate 和受限 Luna chooser；唯一精确来源标题可以确定性落键，歧义候选只能从闭集选取
+> candidate 和受限 Luna chooser；仅有内容 Unit 的唯一精确来源标题可以确定性落键，歧义候选只能从闭集选取
 > 或弃权。无充分证据时两列仍为 NULL，`document_content` 只作私有 receipt fallback 标记，
 > 不进入公开 route。0033 的 duplicate-only 观测仍是历史事实，但不再被当作删除检索容量的依据。
 
@@ -32,7 +32,7 @@ search 端点（红线不变），L2 经公开视图直接消费。
 - 依赖锁定：`jieba==0.42.1`（纯 Python）；精确模式 `lcut(text, HMM=True)`。
 - 不加载领域短语词典或样本同义词；analyzer 漏召回由 0030 source-bound atom channel 补足，
   不靠持续追加词面。
-- 版本钉死：`RETRIEVAL_RULES_VERSION = "rp-2026.07-5"`；jieba/Unicode 归一化、source-target
+- 版本钉死：`RETRIEVAL_RULES_VERSION = "rp-2026.08-provider-unit-v5"`；jieba/Unicode 归一化、source-target
   或 atom 投影契约变化必须升版并全量重建。
 - 归一化：NFKC → casefold → 去空 token；数字/英文原样保留为独立 token。
 - 输出：空格连接的 token 文本（供 `to_tsvector('simple', …)`）。
@@ -77,21 +77,35 @@ PostgreSQL 18.4 实测存在四种静默或硬上限：同一 lexeme 第 256 个
 metadata 自身不安全、窗口 gap/overlap 或 DB probe 不完整均 fail loud，禁止丢词。
 
 0030 增加 `disclosure_core.unit_search_atom(asset_id, atom_index, atom_text)`：每个非空行只对应
-`provider_unit_locator.v3.search_targets` 选中的一个字符串叶子；历史 v1/v2 使用同一闭合 decoder。
+`provider_unit_locator.v8.search_targets` 选中的一个字符串叶子；历史 v1-v7 使用同一闭合 decoder。
 两者都绝不递归发现字段，也绝不连接
 相邻 target/part；`atom_text` 固定为 NFKC→casefold 后的原文。主键为 `(asset_id, atom_index)`，
 父投影删除时级联；`atom_text` 建 `gin_trgm_ops` GIN，公开只读面为
 `disclosure_public.unit_search_atoms_v1`。atom 是可再生候选投影，不是证据；命中后引用仍回到
 document_unit/source_ref。
 
+0044 增加 `disclosure_core.unit_search_row_atom`，只接受同一 explicit table target 中机械闭合的
+三列表格：可选单行总标题后必须是精确 `序号/提问内容/回复内容` 表头，后续数据行无 span、序号
+从 1 连续且问答非空；任一歧义则整表不生成。主键 `(asset_id,row_atom_index)`；
+`table_target_id/source_row_index` 保留源行地址，其中 `source_row_index` 是原 HTML `<tr>` 的
+zero-based 序号；`row_text` 为三格可见文字的 NFKC+casefold 连接，
+`row_search_tsv` 为 C 权重 GIN。公开只读面 `unit_search_row_atoms_v1` 固定 8 列；命中仍引用 parent
+Unit/source row，不建立新 Unit。每个 `row_tokens` 写入前复用 §3 的 PostgreSQL exact safety probe；
+不安全行仅省略该可选增强，parent word、leaf atom 与 lossless body window 继续保留。私表 CHECK
+再次拒绝静默 position/lexeme 丢失。private parent 另存 builder-complete ready flag、safe-row count +
+manifest hash，children 携带同一 manifest identity；delta caught-up 同时核对 ready、实际数量与
+identity，child 缺失/额外/旧版本或 0044 降升后的 unready parent 会替换完整 owning run，严格
+弃权或安全省略后的 ready 零 child 仍可精确 no-op。
+
 ## 4. 投影内容（确定性线性化）
 
 - title_text = unit.title or ''；heading_path_text = " > ".join(heading_path)。
-- body 的唯一输入是当前 writer 的 `provider_unit_locator.v3.search_targets`（历史 v1/v2 同义）；每个 target 必须绑定 provider
+- body 的唯一输入是当前 writer 的 `provider_unit_locator.v8.search_targets`（历史 v1-v7 同义）；每个 target 必须绑定 provider
   source block、字段/item 与 Unit payload destination。word channel 仅为兼容现有 tsvector 而连接这些
   原子；0030 substring channel 保留逐叶 atom，禁止跨 target/part 拼接。`raw_html`、context、
   文件路径、taxonomy 标签和未声明 payload 字段一律不能被递归发现。
-- key_tokens = " ".join(semantic_keys)（本就是受控 ASCII token，不过分词器）。
+- key_tokens = direct semantic_keys（受控 ASCII token，不过分词器）+ 每个键的中文规范标签
+  经索引分词器展开的 token（rp v4 起；section 键不注入，保持结构通道纯过滤）。
 - `header_row_candidate` 在 provider-native writer 中固定为 false；L1 不从 HTML `<td>` 或数值
   形态猜表头。未来若需要 header role，只能来自可核验的 provider/source 结构证据。
 
@@ -164,6 +178,14 @@ UNION
 SELECT asset_id FROM atom_hits;
 ```
 
+### 5.3 Q&A 同行候选契约（L2 直读）
+
+L2 将一个查询的全部 word groups 作用于**同一** `row_search_tsv`。只有同一 source row 同时包含
+问题侧和回答侧词时，该 row atom 才命中；不得先按 group 扫描再按 asset_id 聚合，否则会把不同问答
+行拼成伪相关。row hit 用 `asset_id + table_target_id + source_row_index` 作为精读地址，引用和证据
+仍回 parent Unit/source ref。未产生 row atom 的严格弃权表、单格 Q&A 或安全省略行继续走 parent
+word/window 与 leaf atom 通道，保证召回降级而非整表消失。
+
 ## 6. 验收
 
 - 单元：分词器确定性（同输入同输出、词典 sha 校验拒漂移）、线性化各 payload_kind 正反例、
@@ -173,5 +195,6 @@ SELECT asset_id FROM atom_hits;
   （"应收账款账龄"命中 receivable_aging 表投影；title 权重 > body）；trgm 子串命中简称；
   255/256、16383/16384、长 lexeme、1 MB、连续覆盖、跨窗 AND、跨资产负例、GIN plan 与
   child insert failure 的 run rollback；body atom 三个 analyzer canary、跨 atom 负例、LIKE 符号转义、
-  NFKC/全半角、atom GIN plan 与删除后失败的事务回滚。
+  NFKC/全半角、atom GIN plan 与删除后失败的事务回滚；Q&A 严格 admission、同行正例、跨行负例、
+  单格/畸形零 row，以及超 PostgreSQL position/datum 安全边界时省略 row 但 parent windows 保留。
 - 契约：视图列集冻结导出；tests ledger --update。

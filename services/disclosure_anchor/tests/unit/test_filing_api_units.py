@@ -81,7 +81,6 @@ def _unit_row(
         "heading_path_text": "第一节 > 风险",
         "title": "风险提示",
         "order_index": order_index,
-        "semantic_key": "risk",
         "semantic_keys": ["risk", "governance"],
         "section_keys": ["important_matters", "risk_section"],
         "payload": {"b": 2, "a": "披露"},
@@ -110,7 +109,7 @@ def _unit_row(
         "trace_level": "G0",
         "raw_file_hash": "sha256:" + "a" * 64,
         "query_projection_hash": "sha256:" + "d" * 64,
-        "content_categories": None,
+        "body_status": "content",
         "asset_uri": f"asset://disclosure_anchor/v1/document_unit/{asset_id}",
         "is_active_run": is_active_run,
     }
@@ -413,7 +412,6 @@ class FilingApiUnitTests(unittest.TestCase):
         list_document_units(
             "doc_1",
             _request(engine),
-            semantic_key="risk",
             semantic_keys_any="risk, revenue ,risk",
             semantic_keys_all="risk,governance",
             section_keys_any="important_matters,risk_section",
@@ -421,10 +419,8 @@ class FilingApiUnitTests(unittest.TestCase):
         )
 
         sql = engine.statements[1]
-        self.assertIn(
-            "u.semantic_key = :semantic_key OR u.semantic_keys ? :semantic_key",
-            sql,
-        )
+        self.assertNotIn(":semantic_key ", sql)
+        self.assertNotIn("u.semantic_key ", sql)
         self.assertIn("u.semantic_keys ?| CAST(:semantic_keys_any AS text[])", sql)
         self.assertIn("u.semantic_keys ?& CAST(:semantic_keys_all AS text[])", sql)
         self.assertIn("u.section_keys ?| CAST(:section_keys_any AS text[])", sql)
@@ -435,9 +431,7 @@ class FilingApiUnitTests(unittest.TestCase):
             engine.params[1]["section_keys_any"],
             ["important_matters", "risk_section"],
         )
-        self.assertEqual(
-            engine.params[1]["section_keys_all"], ["important_matters"]
-        )
+        self.assertEqual(engine.params[1]["section_keys_all"], ["important_matters"])
 
     def test_semantic_key_list_validation_is_bounded_and_rejects_empty_items(
         self,
@@ -705,9 +699,7 @@ class FilingApiUnitTests(unittest.TestCase):
             )
 
             wrong_producer_source = copy.deepcopy(row)
-            wrong_producer_source["producer_input_raw_file_hash"] = (
-                "sha256:" + "0" * 64
-            )
+            wrong_producer_source["producer_input_raw_file_hash"] = "sha256:" + "0" * 64
             assert_integrity_error(
                 wrong_producer_source,
                 "artifact_owner_source_hash_mismatch",

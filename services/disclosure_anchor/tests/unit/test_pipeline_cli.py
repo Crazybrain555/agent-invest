@@ -7,12 +7,19 @@ from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from datetime import date
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from disclosure_anchor.cli import pipeline
+from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
+    MinerUDeploymentChecker,
+    MinerUDeploymentGateError,
+)
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.services.subject_resolver import (
     PENDING_LEGAL_NAME_PREFIX,
@@ -22,12 +29,103 @@ from disclosure_anchor.application.use_cases.parse_document import ParseDocument
 from disclosure_anchor.application.use_cases.register_local_pdf import (
     RegisterLocalPdfResult,
 )
+from disclosure_anchor.application.use_cases.track_companies import (
+    TrackCompaniesResult,
+    TrackEntryResult,
+)
 from disclosure_anchor.domain import entities as e
+from disclosure_anchor.domain.errors import ConfigurationError
 
 from tests.unit._fakes import FakeUnitOfWork
 
 
 class PipelineCliTests(unittest.TestCase):
+    def test_production_parser_composition_keeps_api_and_upstream_distinct(
+        self,
+    ) -> None:
+        deps = pipeline._Deps.__new__(pipeline._Deps)
+        deps.settings = SimpleNamespace(
+            disclosure_mineru_bin=Path("/opt/mineru/bin/mineru"),
+            disclosure_mineru_api_url="http://127.0.0.1:30000",
+            disclosure_mineru_inference_upstream_url=("http://127.0.0.1:30001/v1"),
+            mineru_http_request_concurrency=7,
+            disclosure_mineru_runtime_bundle_identity_sha256=("sha256:" + "a" * 64),
+            disclosure_parse_runaway_timeout_seconds=86400,
+        )
+        deps.provider_source = MagicMock()
+        deps.paths = MagicMock()
+        deps.artifacts = MagicMock()
+        deps.uow_factory = MagicMock()
+
+        options = deps.parser_options()
+        self.assertEqual(options.api_url, "http://127.0.0.1:30000")
+        self.assertEqual(options.server_url, "http://127.0.0.1:30001/v1")
+
+        with (
+            patch.object(pipeline, "MinerUProcess") as process,
+            patch.object(pipeline, "MinerUMediumDocumentParser") as parser,
+            patch.object(pipeline, "ParseDocument") as parse_use_case,
+            patch.object(pipeline, "RawDocumentStore"),
+        ):
+            deps.parse()
+
+        process.assert_called_once_with(executable=Path("/opt/mineru/bin/mineru"))
+        parser.assert_called_once_with(
+            process=process.return_value,
+            api_url="http://127.0.0.1:30000",
+            server_url="http://127.0.0.1:30001/v1",
+        )
+        parse_use_case.assert_called_once()
+
+    def test_parse_gate_failure_precedes_dependency_and_database_composition(
+        self,
+    ) -> None:
+        checker = MagicMock(spec=MinerUDeploymentChecker)
+        checker.assert_admission.side_effect = MinerUDeploymentGateError(
+            "GPU identity unavailable"
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            patch.object(pipeline, "load_settings", return_value=object()),
+            patch.object(
+                pipeline,
+                "MinerUDeploymentChecker",
+                return_value=checker,
+            ),
+            patch.object(pipeline, "_Deps") as deps,
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            code = pipeline.main(["parse", "--document-id", "doc_1"])
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("GPU identity unavailable", stderr.getvalue())
+        deps.assert_not_called()
+
+    def test_track_file_and_codes_are_mutually_exclusive(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            pipeline._parser().parse_args(
+                ["track", "--file", "watchlist.csv", "--codes", "600519"]
+            )
+
+    def test_destructive_company_purge_is_not_a_cli_command(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            pipeline._parser().parse_args(
+                ["purge-company", "--code", "600519", "--yes"]
+            )
+
+    def test_pipeline_database_url_never_falls_back_to_migration_owner(self) -> None:
+        settings = MagicMock(
+            database_url=None,
+            disclosure_migration_database_url="postgresql+psycopg://owner/db",
+        )
+
+        with self.assertRaisesRegex(ConfigurationError, "DATABASE_URL"):
+            pipeline._database_url(settings)
+
     def test_subcommands_are_registered(self) -> None:
         parser = pipeline._parser()
         cases = {
@@ -41,7 +139,9 @@ class PipelineCliTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(parser.parse_args(argv).command, command)
 
-    def test_register_command_defaults_provider_document_id_to_safe_suffix(self) -> None:
+    def test_register_command_defaults_provider_document_id_to_safe_suffix(
+        self,
+    ) -> None:
         args = pipeline._parser().parse_args(
             [
                 "register",
@@ -68,7 +168,9 @@ class PipelineCliTests(unittest.TestCase):
 
         self.assertEqual(
             command.file_path,
-            Path("2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169.pdf"),
+            Path(
+                "2026-04-10__periodic__002484__江海股份：2025年年度报告__1225087169.pdf"
+            ),
         )
         self.assertEqual(command.provider_document_id, "1225087169")
         self.assertEqual(str(command.report_period), "2025A")
@@ -135,7 +237,9 @@ class PipelineCliTests(unittest.TestCase):
         payload = json.loads(stderr)
         self.assertEqual(payload["stage"], "parse")
         self.assertEqual(payload["status"], "failed")
-        self.assertEqual(payload["result"]["error"]["error_code"], "parser_invocation_failed")
+        self.assertEqual(
+            payload["result"]["error"]["error_code"], "parser_invocation_failed"
+        )
 
     def test_build_units_failed_result_returns_nonzero(self) -> None:
         deps = _deps_type(
@@ -156,7 +260,9 @@ class PipelineCliTests(unittest.TestCase):
         payload = json.loads(stderr)
         self.assertEqual(payload["stage"], "build-units")
         self.assertEqual(payload["status"], "failed")
-        self.assertEqual(payload["result"]["error"]["error_code"], "ARTIFACT_WRITE_FAILED")
+        self.assertEqual(
+            payload["result"]["error"]["error_code"], "ARTIFACT_WRITE_FAILED"
+        )
 
     def test_process_stops_after_parse_failed_result(self) -> None:
         deps = _deps_type(
@@ -176,7 +282,9 @@ class PipelineCliTests(unittest.TestCase):
         payload = json.loads(stderr)
         self.assertEqual(payload["stage"], "parse")
         self.assertEqual(payload["status"], "failed")
-        self.assertEqual(payload["result"]["error"]["error_code"], "parser_invocation_failed")
+        self.assertEqual(
+            payload["result"]["error"]["error_code"], "parser_invocation_failed"
+        )
 
     def test_process_stops_after_build_failed_result(self) -> None:
         deps = _deps_type(
@@ -204,7 +312,9 @@ class PipelineCliTests(unittest.TestCase):
     def test_sync_command_prints_json_result(self) -> None:
         deps = _deps_type(sync_result={"company": "000001", "download_count": 0})
 
-        code, stdout, stderr = _run_main(["sync", "--company", "000001", "--window", "7"], deps)
+        code, stdout, stderr = _run_main(
+            ["sync", "--company", "000001", "--window", "7"], deps
+        )
 
         self.assertEqual(code, 0)
         self.assertEqual(stderr, "")
@@ -212,7 +322,9 @@ class PipelineCliTests(unittest.TestCase):
         self.assertEqual(payload["company"], "000001")
 
     def test_sync_command_missing_checkpoint_returns_exit_2(self) -> None:
-        deps = _deps_type(sync_result=ValueError("first sync requires explicit --window"))
+        deps = _deps_type(
+            sync_result=ValueError("first sync requires explicit --window")
+        )
 
         code, stdout, stderr = _run_main(["sync", "--company", "000001"], deps)
 
@@ -226,7 +338,9 @@ class PipelineCliTests(unittest.TestCase):
         self.assertIn(".PHONY:", makefile)
         self.assertIn("sync", makefile)
         self.assertIn("usage: make sync COMPANY=<scode> [WINDOW=N]", makefile)
-        self.assertIn("disclosure_anchor.cli.pipeline sync --company $(COMPANY)", makefile)
+        self.assertIn(
+            "disclosure_anchor.cli.pipeline sync --company $(COMPANY)", makefile
+        )
 
     def test_register_reuses_resolved_ledger_legal_name(self) -> None:
         # No --company-legal-name given: reuse the ledger's real name for the
@@ -362,9 +476,7 @@ class PipelineCliTests(unittest.TestCase):
             handle.write(csv_text)
             path = handle.name
         try:
-            entries = pipeline._track_entries(
-                argparse.Namespace(codes=None, file=path)
-            )
+            entries = pipeline._track_entries(argparse.Namespace(codes=None, file=path))
         finally:
             Path(path).unlink()
 
@@ -376,6 +488,162 @@ class PipelineCliTests(unittest.TestCase):
         self.assertEqual(entry.lookback_days, 30)
         self.assertEqual(entry.sync_frequency, "daily")
         self.assertEqual(entry.process_classes, ("dividend", "meeting_resolution"))
+
+    def test_track_parses_the_same_snapshot_it_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "watchlist.csv"
+            path.write_text(
+                "security_code,exchange,status,joined_date,process_classes\n"
+                "600519,SSE,active,2026-08-23,\n",
+                encoding="utf-8",
+            )
+
+            def mutate_after_snapshot(*_args: object, **_kwargs: object) -> list[str]:
+                path.write_text(
+                    "security_code,exchange,status,joined_date,process_classes\n"
+                    "000001,SZSE,active,2026-08-23,\n",
+                    encoding="utf-8",
+                )
+                return []
+
+            with patch.object(
+                pipeline,
+                "validate_watchlist_snapshot",
+                side_effect=mutate_after_snapshot,
+            ):
+                entries = pipeline._track_entries(
+                    argparse.Namespace(
+                        codes=None,
+                        file=path,
+                        screen_manifest=None,
+                    )
+                )
+
+        self.assertEqual(
+            [(item.security_code, item.exchange) for item in entries],
+            [("600519", "SSE")],
+        )
+
+    def test_invalid_track_file_fails_before_database_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "watchlist.csv"
+            path.write_text(
+                "security_code,exchange,status,joined_date,process_classes\n"
+                "600519,SZSE,active,2026-08-23,\n",
+                encoding="utf-8",
+            )
+
+            class ForbiddenDeps:
+                def __init__(self, _settings: object) -> None:
+                    raise AssertionError("DB dependencies must not be built")
+
+            code, stdout, stderr = _run_main(
+                ["track", "--file", str(path)],
+                ForbiddenDeps,
+            )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("belongs to SSE, not SZSE", stderr)
+
+    def test_file_import_skips_post_commit_profile_resolution(self) -> None:
+        result = _track_result(1)
+        calls: list[tuple[tuple[str, str], ...]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "watchlist.csv"
+            path.write_text(
+                "security_code,exchange,status,joined_date,process_classes\n"
+                "600519,SSE,active,2026-08-23,\n",
+                encoding="utf-8",
+            )
+            code, _stdout, stderr = _run_main(
+                ["track", "--file", str(path)],
+                _track_deps(result, calls),
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [])
+        self.assertIn("audited first sync", stderr)
+
+    def test_direct_code_profile_compatibility_is_capped_at_twenty(self) -> None:
+        for count, expected_calls in ((20, 1), (21, 0)):
+            with self.subTest(count=count):
+                result = _track_result(count)
+                calls: list[tuple[tuple[str, str], ...]] = []
+                codes = ",".join(f"{600000 + index:06d}" for index in range(count))
+
+                code, _stdout, _stderr = _run_main(
+                    ["track", "--codes", codes],
+                    _track_deps(result, calls),
+                )
+
+                self.assertEqual(code, 0)
+                self.assertEqual(len(calls), expected_calls)
+
+    def test_makefile_boolean_tokens_are_closed_allowlists(self) -> None:
+        makefile = Path("Makefile").read_text(encoding="utf-8")
+
+        self.assertIn('case "$(PRUNE_DRIFT)" in ""|YES)', makefile)
+        self.assertIn('case "$(DRY_RUN)" in ""|1)', makefile)
+        self.assertIn(
+            'case "$(SKIP_PROFILE_RESOLUTION)" in ""|YES)',
+            makefile,
+        )
+        self.assertEqual(
+            makefile.count('case "$(ALLOW_EMPTY)" in ""|YES)'),
+            3,
+        )
+        self.assertEqual(
+            makefile.count("$(if $(filter YES,$(ALLOW_EMPTY)),--allow-empty)"),
+            3,
+        )
+        self.assertIn(
+            "usage: make track-export OUT=/timestamped/path/watchlist.csv",
+            makefile,
+        )
+        self.assertNotIn("$(or $(OUT),config/watchlist.csv)", makefile)
+        self.assertNotIn("purge-company", makefile)
+        self.assertNotIn('case "$(strip $(PRUNE_DRIFT))"', makefile)
+
+    def test_make_track_rejects_invalid_tokens_and_conflicting_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "watchlist.csv"
+            path.write_text(
+                "security_code,exchange,status,joined_date,process_classes\n"
+                "600519,SSE,active,2026-08-23,\n",
+                encoding="utf-8",
+            )
+            clean_env = os.environ.copy()
+            for name in (
+                "PRUNE_DRIFT",
+                "DRY_RUN",
+                "SKIP_PROFILE_RESOLUTION",
+                "FILE",
+                "CODES",
+                "SCREEN_MANIFEST",
+            ):
+                clean_env.pop(name, None)
+            cases = (
+                ([f"FILE={path}", "PRUNE_DRIFT=1"], "PRUNE_DRIFT"),
+                ([f"FILE={path}", "DRY_RUN=YES"], "DRY_RUN"),
+                (
+                    [f"FILE={path}", "SKIP_PROFILE_RESOLUTION=1"],
+                    "SKIP_PROFILE_RESOLUTION",
+                ),
+                ([f"FILE={path}", "CODES=600519"], "mutually exclusive"),
+            )
+            for variables, message in cases:
+                with self.subTest(variables=variables):
+                    completed = subprocess.run(
+                        ["make", "track", *variables],
+                        cwd=Path(__file__).resolve().parents[2],
+                        env=clean_env,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(completed.returncode, 2, completed.stderr)
+                    self.assertIn(message, completed.stderr)
 
 
 def _register_argv(*, legal_name: str | None = None) -> list[str]:
@@ -479,11 +747,51 @@ def _deps_type(
     return _FakeDeps
 
 
+def _track_result(count: int) -> TrackCompaniesResult:
+    return TrackCompaniesResult(
+        results=tuple(
+            TrackEntryResult(
+                security_code=f"{600000 + index:06d}",
+                exchange="SSE",
+                tracked_company_id=f"tc_{index}",
+                company_id=f"co_{index}",
+                created=True,
+            )
+            for index in range(count)
+        )
+    )
+
+
+def _track_deps(
+    result: TrackCompaniesResult,
+    profile_calls: list[tuple[tuple[str, str], ...]],
+):
+    class _TrackDeps:
+        def __init__(self, settings: object) -> None:
+            self.settings = settings
+            self.engine = object()
+
+        def track(self) -> _UseCase:
+            return _UseCase(result)
+
+        def resolve_profiles(self, codes: tuple[tuple[str, str], ...]) -> tuple[()]:
+            profile_calls.append(codes)
+            return ()
+
+    return _TrackDeps
+
+
 def _run_main(argv: list[str], deps) -> tuple[int, str, str]:  # noqa: ANN001
     stdout = io.StringIO()
     stderr = io.StringIO()
+    checker = MagicMock(spec=MinerUDeploymentChecker)
     with (
         patch.object(pipeline, "load_settings", return_value=object()),
+        patch.object(
+            pipeline,
+            "MinerUDeploymentChecker",
+            return_value=checker,
+        ),
         patch.object(pipeline, "_Deps", deps),
         patch.object(
             pipeline,

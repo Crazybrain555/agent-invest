@@ -79,6 +79,15 @@
       "title": "Asset Uri",
       "type": "string"
     },
+    "body_status": {
+      "enum": [
+        "content",
+        "heading_only",
+        "empty"
+      ],
+      "title": "Body Status",
+      "type": "string"
+    },
     "company_ref": {
       "anyOf": [
         {
@@ -89,21 +98,6 @@
         }
       ],
       "title": "Company Ref"
-    },
-    "content_categories": {
-      "anyOf": [
-        {
-          "items": {
-            "additionalProperties": true,
-            "type": "object"
-          },
-          "type": "array"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Content Categories"
     },
     "content_hash": {
       "title": "Content Hash",
@@ -277,18 +271,11 @@
       "title": "Report Period"
     },
     "section_keys": {
-      "anyOf": [
-        {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Section Keys"
+      "items": {
+        "type": "string"
+      },
+      "title": "Section Keys",
+      "type": "array"
     },
     "security_code": {
       "anyOf": [
@@ -312,30 +299,12 @@
       ],
       "title": "Security Ref"
     },
-    "semantic_key": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Semantic Key"
-    },
     "semantic_keys": {
-      "anyOf": [
-        {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Semantic Keys"
+      "items": {
+        "type": "string"
+      },
+      "title": "Semantic Keys",
+      "type": "array"
     },
     "source_ref": {
       "anyOf": [
@@ -389,7 +358,6 @@
     "heading_path_text",
     "title",
     "order_index",
-    "semantic_key",
     "semantic_keys",
     "section_keys",
     "payload",
@@ -418,7 +386,7 @@
     "trace_level",
     "raw_file_hash",
     "query_projection_hash",
-    "content_categories",
+    "body_status",
     "asset_uri",
     "is_active_run",
     "evidence_refs"

@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import http.client
 import json
 import os
 import subprocess
-import urllib.error
-import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -16,8 +13,10 @@ from pathlib import Path, PurePosixPath
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
-from disclosure_anchor.adapters.db.postgres.connection import create_db_engine
-from disclosure_anchor.adapters.db.postgres.connection import uses_reader_database_url_fallback
+from disclosure_anchor.adapters.db.postgres.connection import (
+    create_db_engine,
+    inspect_runtime_database_identity,
+)
 from disclosure_anchor.adapters.db.postgres.catalog import view_names
 from disclosure_anchor.adapters.db.postgres.migration_state import single_migration_head
 from disclosure_anchor.adapters.db.postgres.schema import (
@@ -33,8 +32,20 @@ from disclosure_anchor.adapters.db.postgres.schema import (
     PUBLIC_VIEWS,
     READ_ONLY_PUBLIC_ROLES,
 )
+from disclosure_anchor.adapters.runtime.mineru_canary import (
+    MinerUCanaryError,
+    run_mineru_multimodal_canary,
+)
+from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
+    MinerUOrchestratorError,
+    fetch_mineru_orchestrator_health,
+)
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
+from disclosure_anchor.application.contracts.semantic_routes import (
+    SEMANTIC_ROUTE_RECEIPT_VERSION,
+    semantic_route_receipt_row_from_payload,
+)
 from disclosure_anchor.domain.services.unit_hashing import content_hash_aggregate
 from disclosure_anchor.settings import Settings
 
@@ -49,13 +60,6 @@ _PYTHON_STRIP_CHARS_SQL = (
 )
 _CANONICAL_CODE_SQL = f"btrim(security_code, {_PYTHON_STRIP_CHARS_SQL})"
 _CANONICAL_EXCHANGE_SQL = f"upper(btrim(exchange, {_PYTHON_STRIP_CHARS_SQL}))"
-_MINERU_CANARY_PNG_DATA_URL = (
-    "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8A"
-    "AQUBAScY42YAAAAASUVORK5CYII="
-)
-
-
 @dataclass(frozen=True)
 class CheckResult:
     name: str
@@ -115,66 +119,40 @@ def _check_writable_dir(name: str, path: Path) -> CheckResult:
 def mineru_remote_inference_check(settings: Settings) -> CheckResult:
     """Exercise the remote multimodal path; `/health` alone is insufficient."""
 
-    server_url = settings.disclosure_mineru_server_url
+    server_url = settings.disclosure_mineru_observability_url
     if server_url is None:
         return _warn("MinerU remote inference", "server URL is not configured")
-    api_root = server_url.rstrip("/")
-    if not api_root.endswith("/v1"):
-        api_root += "/v1"
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(
-            api_root + "/models",
-            timeout=15,
-        ) as response:
-            models_payload = json.loads(response.read())
-        models = models_payload.get("data")
-        if not isinstance(models, list) or len(models) != 1:
-            raise ValueError("expected exactly one served MinerU model")
-        model = models[0]
-        if not isinstance(model, dict) or not isinstance(model.get("id"), str):
-            raise ValueError("served MinerU model identity is invalid")
-        request_payload = {
-            "model": model["id"],
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Return one OCR token for this image.",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": _MINERU_CANARY_PNG_DATA_URL},
-                        },
-                    ],
-                }
-            ],
-            "max_tokens": 8,
-            "temperature": 0,
-        }
-        request = urllib.request.Request(
-            api_root + "/chat/completions",
-            data=json.dumps(request_payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with opener.open(request, timeout=90) as response:
-            completion_payload = json.loads(response.read())
-        choices = completion_payload.get("choices")
-        if not isinstance(choices, list) or len(choices) != 1:
-            raise ValueError("multimodal canary returned no unique choice")
-    except (
-        OSError,
-        TimeoutError,
-        http.client.HTTPException,
-        urllib.error.URLError,
-        ValueError,
-        json.JSONDecodeError,
-    ) as exc:
+        evidence = run_mineru_multimodal_canary(server_url)
+    except MinerUCanaryError as exc:
         return _fail("MinerU remote inference", str(exc))
-    return _pass("MinerU remote inference", "multimodal canary passed")
+    model_sha256 = hashlib.sha256(evidence.model_id.encode("utf-8")).hexdigest()
+    return _pass(
+        "MinerU remote inference",
+        f"multimodal canary passed; model_sha256={model_sha256}",
+    )
+
+
+def mineru_orchestrator_check(settings: Settings) -> CheckResult:
+    api_url = settings.disclosure_mineru_api_url
+    if api_url is None:
+        return _warn("MinerU orchestration", "API URL is not configured")
+    try:
+        health = fetch_mineru_orchestrator_health(
+            api_url,
+            expected_task_retention_seconds=(
+                settings.disclosure_mineru_api_task_retention_seconds
+            ),
+            expected_cleanup_interval_seconds=(
+                settings.disclosure_mineru_api_cleanup_interval_seconds
+            ),
+        )
+    except MinerUOrchestratorError as exc:
+        return _fail("MinerU orchestration", str(exc))
+    return _pass(
+        "MinerU orchestration",
+        f"queued={health.queued_tasks} processing={health.processing_tasks} ",
+    )
 
 
 def _check_under_root(name: str, path: Path, root: Path) -> CheckResult:
@@ -390,16 +368,14 @@ def _ops_launchd_check() -> CheckResult:
 
 
 def _reader_database_url_checks(settings: Settings) -> list[CheckResult]:
-    if uses_reader_database_url_fallback(settings):
-        return [
-            _warn(
-                "DISCLOSURE_READER_DATABASE_URL",
-                "missing; read API will use DATABASE_URL fallback",
-            )
-        ]
     if settings.disclosure_reader_database_url is not None:
         return [_pass("DISCLOSURE_READER_DATABASE_URL", "configured")]
-    return []
+    return [
+        _fail(
+            "DISCLOSURE_READER_DATABASE_URL",
+            "missing; public read surfaces require the exact reader role",
+        )
+    ]
 
 
 def run_startup_preflight(
@@ -434,6 +410,7 @@ def run_doctor(
     checks = _environment_checks(settings)
     checks.extend(_reader_database_url_checks(settings))
     checks.append(_mineru_orphan_check())
+    checks.append(mineru_orchestrator_check(settings))
     checks.append(mineru_remote_inference_check(settings))
     checks.extend(_disk_headroom_checks(settings))
     checks.append(_ops_launchd_check())
@@ -461,14 +438,37 @@ def run_doctor(
 def _database_ping_and_migration_checks(engine: Engine) -> list[CheckResult]:
     checks: list[CheckResult] = []
     with engine.connect() as conn:
-        current_database = conn.execute(text("SELECT current_database()")).scalar_one()
-        if current_database == DATABASE_NAME:
-            checks.append(_pass("pg connection", f"database={current_database}"))
+        identity = inspect_runtime_database_identity(conn)
+        if identity.database_name == DATABASE_NAME:
+            checks.append(_pass("pg connection", f"database={identity.database_name}"))
         else:
             checks.append(
                 _fail(
                     "pg connection",
-                    f"expected database={DATABASE_NAME}, got {current_database}",
+                    f"expected database={DATABASE_NAME}, got {identity.database_name}",
+                )
+            )
+        if (
+            identity.session_role == APP_ROLE
+            and identity.current_role == APP_ROLE
+            and not identity.session_superuser
+            and not identity.current_superuser
+        ):
+            checks.append(
+                _pass(
+                    "runtime DB role",
+                    f"session_user=current_user={APP_ROLE}; rolsuper=false",
+                )
+            )
+        else:
+            checks.append(
+                _fail(
+                    "runtime DB role",
+                    "DATABASE_URL must authenticate directly as non-superuser "
+                    f"{APP_ROLE}; got session_user/current_user="
+                    f"{identity.session_role}/{identity.current_role}, "
+                    "session/current rolsuper="
+                    f"{identity.session_superuser}/{identity.current_superuser}",
                 )
             )
         current_revision = conn.execute(
@@ -867,7 +867,10 @@ def _database_consistency_checks(settings: Settings, engine: Engine) -> list[Che
         )
 
         from disclosure_anchor.application.worker.queries import (
+            build_dead_letter_count,
+            degraded_build_count,
             parse_dead_letter_count,
+            retrying_build_count,
         )
 
         exhausted_parse = parse_dead_letter_count(
@@ -880,6 +883,39 @@ def _database_consistency_checks(settings: Settings, engine: Engine) -> list[Che
             else _warn(
                 "parse dead letters",
                 f"count={exhausted_parse}; exhausted or non-retryable",
+            )
+        )
+        exhausted_build = build_dead_letter_count(
+            conn,
+            max_retries=settings.disclosure_max_build_retries,
+        )
+        checks.append(
+            _pass("build dead letters", "none")
+            if exhausted_build == 0
+            else _fail(
+                "build dead letters",
+                f"count={exhausted_build}; automatic retries are exhausted",
+            )
+        )
+        retrying_builds = retrying_build_count(
+            conn,
+            max_retries=settings.disclosure_max_build_retries,
+        )
+        checks.append(
+            _pass("retrying Unit builds", "none")
+            if retrying_builds == 0
+            else _warn(
+                "retrying Unit builds",
+                f"count={retrying_builds}; unresolved retryable failures",
+            )
+        )
+        degraded_builds = degraded_build_count(conn)
+        checks.append(
+            _pass("degraded semantic builds", "none")
+            if degraded_builds == 0
+            else _warn(
+                "degraded semantic builds",
+                f"count={degraded_builds}; use rebuild-units after provider recovery",
             )
         )
     return checks
@@ -1018,7 +1054,11 @@ def _processing_run_checks(settings: Settings, engine: Engine) -> list[CheckResu
                 f"SELECT processing_run_id, status, normalized_ir_relpath, "
                 f"provider_document_relpath, "
                 f"artifact_hash, error, unit_build_status, document_units_relpath, "
-                f"content_hash_aggregate FROM {CORE_SCHEMA}.processing_run "
+                f"content_hash_aggregate, unit_build_error, "
+                f"semantic_adjudication_status, semantic_degraded_unit_count, "
+                f"semantic_adjudication_summary, semantic_route_receipts_relpath, "
+                f"semantic_route_receipts_contract_version, "
+                f"semantic_route_receipts_hash FROM {CORE_SCHEMA}.processing_run "
                 "WHERE status IN ('succeeded', 'failed') "
                 "OR unit_build_status = 'succeeded'"
             )
@@ -1073,7 +1113,83 @@ def _processing_run_checks(settings: Settings, engine: Engine) -> list[CheckResu
                     expected_aggregate=row["content_hash_aggregate"],
                 )
             )
+            if row["semantic_route_receipts_relpath"] is not None:
+                checks.append(
+                    _semantic_receipt_check(
+                        settings=settings,
+                        object_id=str(run_id),
+                        relpath=row["semantic_route_receipts_relpath"],
+                        contract_version=row[
+                            "semantic_route_receipts_contract_version"
+                        ],
+                        expected_hash=row["semantic_route_receipts_hash"],
+                        semantic_status=row["semantic_adjudication_status"],
+                        expected_degraded_count=row[
+                            "semantic_degraded_unit_count"
+                        ],
+                        summary=row["semantic_adjudication_summary"],
+                    )
+                )
+        elif row["unit_build_status"] == "failed":
+            error = row["unit_build_error"]
+            if not (
+                isinstance(error, dict)
+                and {"stage", "error_code", "retryable"} <= error.keys()
+            ):
+                checks.append(
+                    _fail(
+                        "failed Unit build error",
+                        f"processing_run_id={run_id} lacks structured error",
+                    )
+                )
     return checks
+
+
+def _semantic_receipt_check(
+    *,
+    settings: Settings,
+    object_id: str,
+    relpath: str,
+    contract_version: str | None,
+    expected_hash: str | None,
+    semantic_status: str | None,
+    expected_degraded_count: int | None,
+    summary: object,
+) -> CheckResult:
+    name = "semantic route receipt v2"
+    if contract_version != SEMANTIC_ROUTE_RECEIPT_VERSION or not expected_hash:
+        return _fail(name, f"{object_id} locator/version/hash is inconsistent")
+    path = settings.disclosure_data_root / "data" / relpath
+    try:
+        if path.is_symlink() or not path.is_file():
+            return _fail(name, f"{object_id} receipt is not a regular file")
+        raw = path.read_bytes()
+        actual_hash = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if actual_hash != expected_hash:
+            return _fail(name, f"{object_id} receipt hash mismatch")
+        rows = tuple(
+            semantic_route_receipt_row_from_payload(json.loads(line))
+            for line in raw.splitlines()
+            if line.strip()
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        return _fail(name, f"{object_id} receipt cannot be verified: {exc}")
+    if any(row.receipt.contract_version != contract_version for row in rows):
+        return _fail(name, f"{object_id} receipt rows mix contract versions")
+    degraded_count = sum(
+        row.receipt.decision_source == "adjudicator_unavailable_abstain"
+        for row in rows
+    )
+    if degraded_count != (expected_degraded_count or 0):
+        return _fail(name, f"{object_id} degraded receipt count drifted")
+    if not isinstance(summary, dict) or summary.get("status") != semantic_status:
+        return _fail(name, f"{object_id} semantic summary/status drifted")
+    if semantic_status == "degraded_unavailable":
+        return _warn(
+            name,
+            f"{object_id} verified with {degraded_count} unavailable Units",
+        )
+    return _pass(name, f"{object_id} verified ({len(rows)} units)")
 
 
 def _check_artifact_hash(

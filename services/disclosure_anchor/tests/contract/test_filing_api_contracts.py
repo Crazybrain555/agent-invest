@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
-import tempfile
-import unittest
 from pathlib import Path
+import tempfile
+from typing import Literal, get_args, get_origin
+import unittest
 
 import yaml
 
+from disclosure_anchor.api.schemas.public import DocumentUnitV1
 from disclosure_anchor.cli.export_contracts import (
     PUBLIC_MODELS,
     export_contracts,
@@ -28,9 +30,77 @@ DERIVED = {
         "sync_state",
     },
 }
+DOCUMENT_UNIT_V1_FIELDS = (
+    "asset_id",
+    "document_id",
+    "processing_run_id",
+    "provider_document_id",
+    "payload_kind",
+    "heading_path",
+    "heading_path_text",
+    "title",
+    "order_index",
+    "semantic_keys",
+    "section_keys",
+    "payload",
+    "content_hash",
+    "structure_hash",
+    "quality_status",
+    "applicability",
+    "page_no",
+    "artifact_locator",
+    "created_at",
+    "contract_version",
+    "company_ref",
+    "security_ref",
+    "security_code",
+    "exchange",
+    "filing_type",
+    "disclosure_topics",
+    "report_period",
+    "announcement_date",
+    "producer_action_ref",
+    "source_ref",
+    "parent_ref",
+    "asset_kind",
+    "observed_at",
+    "source_tier",
+    "trace_level",
+    "raw_file_hash",
+    "query_projection_hash",
+    "body_status",
+    "asset_uri",
+    "is_active_run",
+    "evidence_refs",
+)
 
 
 class FilingApiContractsTests(unittest.TestCase):
+    def test_document_unit_v1_shape_is_an_explicit_frozen_contract(self) -> None:
+        self.assertEqual(tuple(DocumentUnitV1.model_fields), DOCUMENT_UNIT_V1_FIELDS)
+        self.assertTrue(
+            all(field.is_required() for field in DocumentUnitV1.model_fields.values())
+        )
+        for name in ("semantic_keys", "section_keys"):
+            annotation = DocumentUnitV1.model_fields[name].annotation
+            self.assertIs(get_origin(annotation), list)
+            self.assertEqual(get_args(annotation), (str,))
+        body_status = DocumentUnitV1.model_fields["body_status"].annotation
+        self.assertIs(get_origin(body_status), Literal)
+        self.assertEqual(get_args(body_status), ("content", "heading_only", "empty"))
+
+        schema = json.loads(
+            (PUBLIC_MODELS_ROOT / "document_unit.v1.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            tuple(schema["properties"]), tuple(sorted(DOCUMENT_UNIT_V1_FIELDS))
+        )
+        self.assertEqual(tuple(schema["required"]), DOCUMENT_UNIT_V1_FIELDS)
+        self.assertNotIn("semantic_key", schema["properties"])
+        self.assertNotIn("content_categories", schema["properties"])
+
     def test_exported_contracts_match_fresh_export_byte_for_byte(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output_root = Path(tmp) / "contracts"
@@ -98,6 +168,7 @@ class FilingApiContractsTests(unittest.TestCase):
                 for response in operation.get("responses", {}).values():
                     encoded = json.dumps(response, sort_keys=True)
                     self.assertNotIn("HTTPValidationError", encoded)
+
                 if "422" in operation.get("responses", {}):
                     self.assertEqual(
                         operation["responses"]["422"]["content"]["application/json"][
@@ -126,6 +197,36 @@ class FilingApiContractsTests(unittest.TestCase):
             set(evidence["responses"]["200"]["content"]),
             {"image/gif", "image/jpeg", "image/png", "image/webp"},
         )
+
+    def test_document_unit_v1_api_filter_names_are_frozen(self) -> None:
+        openapi = yaml.safe_load(
+            (CONTRACTS_ROOT / "filing_api.openapi.yaml").read_text(encoding="utf-8")
+        )
+        parameters = openapi["paths"]["/v1/documents/{document_id}/units"][
+            "get"
+        ]["parameters"]
+        query_names = {
+            item["name"]
+            for item in parameters
+            if isinstance(item, dict) and item.get("in") == "query"
+        }
+        self.assertEqual(
+            query_names,
+            {
+                "processing_run_id",
+                "reject_superseded",
+                "payload_kind",
+                "semantic_keys_any",
+                "semantic_keys_all",
+                "section_keys_any",
+                "section_keys_all",
+                "quality_status",
+                "heading_prefix",
+                "cursor",
+                "limit",
+            },
+        )
+        self.assertNotIn("semantic_key", query_names)
 
 
 if __name__ == "__main__":

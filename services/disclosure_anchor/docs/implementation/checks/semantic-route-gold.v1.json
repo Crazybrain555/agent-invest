@@ -36,30 +36,24 @@
     },
     {
       "provider_document_id": "1225339310",
-      "unit_index": 3,
+      "unit_index": 4,
       "title": "（1）授予日期：2024 年4月12 日",
       "expected_keys": ["incentive_grant", "incentive_recipients"],
       "rationale": "标题是授予日期，表格独立列出姓名、职务和获授数量。"
     },
     {
       "provider_document_id": "1225339310",
-      "unit_index": 4,
+      "unit_index": 5,
       "title": "（三）预留限制性股票授予情况",
-      "expected_keys": [
-        "incentive_grant",
-        "incentive_adjustment",
-        "incentive_recipients",
-        "incentive_cancellation",
-        "incentive_condition_satisfaction"
-      ],
-      "rationale": "同一长 Unit 有相互独立的授予、价格调整、对象表、作废和条件成就事实。"
+      "expected_keys": ["incentive_grant", "incentive_recipients"],
+      "rationale": "该 source-bound Unit 只承载预留授予及对象表；后续价格调整、作废和条件成就已由恢复的（四）同级 Unit 独立承载。"
     },
     {
       "provider_document_id": "1225339310",
-      "unit_index": 6,
+      "unit_index": 8,
       "title": "三、本次限制性股票归属的具体情况",
-      "expected_keys": ["incentive_vesting_exercise", "incentive_recipients"],
-      "rationale": "归属表直接列出对象、职务和归属数量。"
+      "expected_keys": ["incentive_vesting_exercise", "incentive_cancellation", "incentive_performance_assessment", "incentive_recipients"],
+      "rationale": "归属表直接列出对象、职务、归属数量、考核结果和因不合格作废的股份。"
     },
     {
       "provider_document_id": "1225420563",
@@ -93,8 +87,8 @@
       "provider_document_id": "1225433840",
       "unit_index": 0,
       "title": "赛力斯集团股份有限公司关于公司董事、高级管理人员及骨干团队增持A 股及 H 股股份结果的更正公告",
-      "expected_keys": ["correction_item", "corrected_data"],
-      "rationale": "正文明确列出原值、更正值和更正项目；原因/影响并未独立披露。"
+      "expected_keys": ["correction_overview", "shareholder_change", "corrected_data", "correction_item"],
+      "rationale": "Unit 既是更正公告概览，也明确更正股份增持结果，并逐项给出原值和更正值；原因和影响未独立披露。"
     },
     {
       "provider_document_id": "1225231394",
@@ -135,12 +129,12 @@
       "title": "重要内容提示：",
       "expected_keys": [
         "share_buyback_plan",
-        "share_buyback_price_volume",
+        "share_buyback_funding",
         "share_buyback_method",
+        "share_buyback_price_volume",
         "share_buyback_purpose",
         "share_buyback_risk",
-        "share_buyback_term",
-        "share_buyback_funding"
+        "share_buyback_term"
       ],
       "rationale": "概览逐项直接给出方案、金额价格、方式、用途、风险、期限和资金。"
     },
@@ -150,18 +144,18 @@
       "title": "本次回购方案的主要内容如下：",
       "expected_keys": [
         "share_buyback_plan",
+        "share_buyback_account",
+        "share_buyback_funding",
         "share_buyback_method",
-        "share_buyback_term",
         "share_buyback_price_volume",
         "share_buyback_purpose",
-        "share_buyback_account",
-        "share_buyback_funding"
+        "share_buyback_term"
       ],
       "rationale": "方案表逐字段直接披露，并列出回购专用证券账户；没有独立完成结果或风险字段。"
     },
     {
       "provider_document_id": "1225067794",
-      "unit_index": 275,
+      "unit_index": 279,
       "title": "第九节 财务报告",
       "expected_keys": [],
       "required_section_keys": ["financial_report_chapter"],
@@ -170,7 +164,7 @@
     },
     {
       "provider_document_id": "1225067794",
-      "unit_index": 291,
+      "unit_index": 295,
       "title": "五、其他信息",
       "forbidden_keys": ["audit_opinion", "financial_statements_section"],
       "rationale": "本节只界定其他信息与财务报表、审计意见的排除范围和注册会计师责任，没有披露财务报表内容或实际审计意见。"
@@ -187,12 +181,10 @@
       "provider_document_id": "1225339310",
       "unit_index": 1,
       "title": "一、本次限制性股票激励计划实施情况概要",
-      "required_keys": [
-        "incentive_plan_overview",
-        "incentive_vesting_exercise"
-      ],
+      "expected_keys": [],
+      "required_section_keys": ["incentive_plan_overview"],
       "forbidden_keys": ["decision_procedures"],
-      "rationale": "Unit 直接给出计划概要与归属时间比例；这里只引用历史名单披露并列归属安排，没有实际对象名单。归属安排的法定禁止期间也没有披露一次实际决策程序。"
+      "rationale": "该 Unit 是恢复后的 heading-only 计划概要容器；它为子孙提供计划结构召回，但不冒充归属或对象答案正文。"
     },
     {
       "provider_document_id": "1225466824",
@@ -203,14 +195,14 @@
     },
     {
       "provider_document_id": "1225067794",
-      "unit_index": 101,
+      "unit_index": 102,
       "title": "八、获准许的弥偿条文",
       "expected_keys": ["director_indemnity_insurance"],
       "rationale": "标题和正文直接披露董事弥偿安排及董事、监事责任保险，不应因旧词表缺项而保持 NULL。"
     },
     {
       "provider_document_id": "1225370759",
-      "unit_index": 18,
+      "unit_index": 20,
       "title": "四、 其他事项说明",
       "expected_keys": ["share_buyback_account"],
       "rationale": "虽然标题泛化为其他事项，正文直接披露回购专用证券账户的开立、账号和限定用途，应使用精确主题而非 other。"
@@ -240,7 +232,7 @@
     },
     {
       "provider_document_id": "1225067794",
-      "unit_index": 95,
+      "unit_index": 96,
       "title": "四、主要控股、参股企业分析",
       "expected_keys": ["subsidiaries_analysis"],
       "required_section_keys": ["directors_report"],
@@ -248,11 +240,397 @@
     },
     {
       "provider_document_id": "1225067794",
-      "unit_index": 102,
+      "unit_index": 103,
       "title": "九、管理合约",
       "expected_keys": [],
       "required_section_keys": ["directors_report"],
       "rationale": "精确董事会报告路径为本 Unit 提供可批量检索的结构位置；不为管理合约正文另造低复用主题键。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 193,
+      "title": "“一、上市公司的人员独立",
+      "expected_keys": ["corporate_independence"],
+      "required_section_keys": ["corporate_independence"],
+      "rationale": "来源标题边缘多出一个开放引号，但精确监管标题仍同时提供直接主题与结构主题；正文中的引号引用不得获得该路由。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 201,
+      "title": "二、控股股东及其关联方对上市公司的非经营性占用资金情况",
+      "expected_keys": ["non_operating_funds_occupation"],
+      "required_section_keys": ["non_operating_funds_occupation"],
+      "rationale": "年度监管模板精确披露非经营性资金占用，不能只落在宽泛重要事项章节。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 202,
+      "title": "三、违规对外担保情况",
+      "expected_keys": ["illegal_external_guarantees"],
+      "required_section_keys": ["illegal_external_guarantees"],
+      "rationale": "违规担保是年度固定披露项；合规担保近似标题不得命中。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 206,
+      "title": "七、与上年度财务报告相比，合并报表范围发生变化的情况说明",
+      "expected_keys": ["scope_of_consolidation"],
+      "required_section_keys": ["scope_of_consolidation"],
+      "rationale": "年度固定标题直接标识合并范围变更，不应只靠会计章节宽泛召回。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 209,
+      "title": "十、破产重整相关事项",
+      "expected_keys": ["bankruptcy_reorganization"],
+      "required_section_keys": ["bankruptcy_reorganization"],
+      "rationale": "破产重整是高价值年度固定事项，即使不适用也保留该 Unit 的直接主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 210,
+      "title": "十一、重大诉讼、仲裁事项",
+      "expected_keys": ["major_litigation_arbitration"],
+      "required_section_keys": ["major_litigation_arbitration"],
+      "rationale": "重大诉讼仲裁是监管固定主题；一般合同纠纷近似标题不得命中。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 211,
+      "title": "十二、处罚及整改情况",
+      "expected_keys": ["regulatory_penalties_remediation"],
+      "required_section_keys": ["regulatory_penalties_remediation"],
+      "rationale": "处罚整改是年度固定主题，直接与结构检索面均须可用。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 212,
+      "title": "十三、公司及其第一大股东的诚信状况",
+      "expected_keys": ["controller_creditworthiness"],
+      "required_section_keys": ["controller_creditworthiness"],
+      "rationale": "公司和控制方诚信、债务履约状态是高价值固定披露主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 213,
+      "title": "十四、重大收购资产事项进展情况",
+      "expected_keys": ["major_asset_acquisition_progress"],
+      "required_section_keys": ["major_asset_acquisition_progress"],
+      "rationale": "重大资产收购进展是精确年度主题；普通资产出售标题不得命中。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 215,
+      "title": "（一）与日常经营相关的关联交易",
+      "expected_keys": ["daily_related_party_transactions"],
+      "required_section_keys": ["related_party_overview", "daily_related_party_transactions"],
+      "rationale": "重大关联交易下的日常关联交易子类应可独立批量检索。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 216,
+      "title": "（二）资产或股权收购、出售发生的关联交易",
+      "expected_keys": ["related_party_asset_equity_transactions"],
+      "required_section_keys": ["related_party_overview", "related_party_asset_equity_transactions"],
+      "rationale": "资产或股权关联交易是年度模板中的独立子类，只以完整精确标题授权。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 217,
+      "title": "（三）共同对外投资的关联交易",
+      "expected_keys": ["related_party_joint_investments"],
+      "required_section_keys": ["related_party_overview", "related_party_joint_investments"],
+      "rationale": "关联共同投资是年度模板中的独立子类，只以完整精确标题授权。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 218,
+      "title": "（四）关联债权债务往来",
+      "expected_keys": ["related_party_debt_dealings"],
+      "required_section_keys": ["related_party_overview", "related_party_debt_dealings"],
+      "rationale": "关联债权债务往来是独立直接主题，并为其下方适用性回答提供结构上下文。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 219,
+      "title": "是否存在非经营性关联债权债务往来",
+      "expected_keys": ["related_party_debt_dealings"],
+      "required_section_keys": ["related_party_debt_dealings"],
+      "rationale": "否定式勾选仍是非经营性关联债权债务往来的直接答案载体；direct 与真实父级 section 同时保留。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 220,
+      "title": "（五）与存在关联关系的财务公司的往来情况",
+      "expected_keys": ["related_finance_company_dealings"],
+      "required_section_keys": ["related_party_overview", "related_finance_company_dealings"],
+      "rationale": "关联财务公司往来是年度模板中的独立子类。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 230,
+      "title": "1、委托理财情况",
+      "expected_keys": ["entrusted_wealth_management"],
+      "required_section_keys": ["entrusted_wealth_management"],
+      "rationale": "委托理财是年度重大合同/现金管理固定披露项。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 231,
+      "title": "2、委托贷款情况",
+      "expected_keys": ["entrusted_loans"],
+      "required_section_keys": ["entrusted_loans"],
+      "rationale": "委托贷款是年度重大合同/现金管理固定披露项。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 64,
+      "title": "5、存货分析",
+      "expected_keys": ["inventory"],
+      "required_section_keys": ["inventory"],
+      "rationale": "年度经营分析中直接列示存货余额和跌价准备，标题与正文共同证明存货主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 72,
+      "title": "12、或有负债",
+      "expected_keys": ["commitments_contingencies"],
+      "required_section_keys": ["commitments_contingencies"],
+      "rationale": "按揭担保和或有负债是 Unit 自身直接主题，不应只落在经营分析宽章节。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 86,
+      "title": "（二）非募集资金使用情况",
+      "expected_keys": [],
+      "required_section_keys": ["non_fundraising_usage"],
+      "rationale": "空正文标题锚点不制造 direct key，但必须为下属金融及股权投资提供独立结构召回。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 107,
+      "title": "十三、市值管理制度和估值提升计划的制定落实情况",
+      "expected_keys": [],
+      "required_section_keys": ["market_value_management"],
+      "rationale": "标题锚点为空时只建立精确市值管理结构面，子 Unit 保留自己的 direct 主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 160,
+      "title": "十一、报告期内，公司及公司董事、高级管理人员受监管部门处罚等情况",
+      "expected_keys": ["regulatory_penalties_remediation"],
+      "required_section_keys": ["regulatory_penalties_remediation"],
+      "rationale": "年度固定监管处罚披露即使结论为不存在，也保留直接主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 179,
+      "title": "十七、报告期内的内部控制制度建设及实施情况",
+      "expected_keys": ["internal_control"],
+      "required_section_keys": ["internal_control"],
+      "rationale": "正文直接说明内控体系、评价范围和实施结果，不能只标治理宽章节。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 184,
+      "title": "（一）内控评价报告",
+      "expected_keys": ["internal_control"],
+      "required_section_keys": ["internal_control"],
+      "rationale": "对同日内控评价报告的明确引用仍是 Unit 本身的内控主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 187,
+      "title": "二十一、环境信息披露情况",
+      "expected_keys": ["environment_social"],
+      "required_section_keys": ["environment_social"],
+      "rationale": "重点排污单位适用性属于环境披露主题，否定答案不抹掉主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 188,
+      "title": "二十二、社会责任情况",
+      "expected_keys": ["environment_social"],
+      "required_section_keys": ["environment_social"],
+      "rationale": "可持续发展报告引用直接证明社会责任主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 189,
+      "title": "二十三、巩固拓展脱贫攻坚成果、乡村振兴的情况",
+      "expected_keys": ["environment_social"],
+      "required_section_keys": ["environment_social"],
+      "rationale": "乡村振兴是年度环境社会责任固定子主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 223,
+      "title": "十六、重大合同及其履行情况",
+      "expected_keys": [],
+      "required_section_keys": ["major_contracts"],
+      "rationale": "空正文重大合同标题只提供结构召回，其子项保留租赁、担保、理财等独立 direct keys。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 235,
+      "title": "十九、购买、出售或赎回本公司之上市证券",
+      "expected_keys": ["listed_securities_transactions"],
+      "required_section_keys": ["listed_securities_transactions"],
+      "rationale": "库存股出售及附属公司回购是标准上市证券交易披露。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 242,
+      "title": "（一）报告期内证券发行情况",
+      "expected_keys": ["securities_issuance_in_period"],
+      "required_section_keys": ["securities_issuance_in_period"],
+      "rationale": "不适用是值域状态，证券发行仍是明确直接主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 251,
+      "title": "四、股份回购在报告期的具体实施情况",
+      "expected_keys": ["share_buyback_implementation"],
+      "required_section_keys": ["share_buyback_implementation"],
+      "rationale": "年度报告中的回购实施情况与单次回购公告路由分开。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 254,
+      "title": "七、按照《联交所上市规则》关于公众持股量的说明",
+      "expected_keys": ["public_float_statement"],
+      "required_section_keys": ["public_float_statement"],
+      "rationale": "联交所公众持股量合规说明是标准年度披露主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 260,
+      "title": "（三）发行人或投资者选择权条款、投资者保护条款的触发和执行情况",
+      "expected_keys": ["bond_option_investor_protection"],
+      "required_section_keys": ["bond_option_investor_protection"],
+      "rationale": "公司债选择权和投资者保护条款执行情况是固定债券主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 263,
+      "title": "（六）报告期内信用评级结果调整情况",
+      "expected_keys": ["bond_credit_rating_change"],
+      "required_section_keys": ["bond_credit_rating_change"],
+      "rationale": "评级终止或调整是独立债券检索主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 264,
+      "title": "（七）担保情况、偿债计划及其他偿债保障措施在报告期内的执行情况和变化情况及对债券投资者权益的影响",
+      "expected_keys": ["bond_repayment_safeguards"],
+      "rationale": "两个 source-bound 标题 fragment 经 locator.v4 保守拼接；完整标题直接证明偿债保障主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 268,
+      "title": "（三）发行人或投资者选择权条款、投资者保护条款的触发和执行情况",
+      "expected_keys": ["bond_option_investor_protection"],
+      "required_section_keys": ["bond_option_investor_protection"],
+      "rationale": "非金融企业债务融资工具下的同一监管固定项采用同一闭集主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 272,
+      "title": "（六）报告期内信用评级结果调整情况",
+      "expected_keys": ["bond_credit_rating_change"],
+      "required_section_keys": ["bond_credit_rating_change"],
+      "rationale": "中期票据评级调整与公司债评级调整共享同一主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 275,
+      "title": "五、报告期内合并报表范围亏损超过上年末净资产 10%",
+      "expected_keys": ["bond_major_loss_trigger"],
+      "required_section_keys": ["bond_major_loss_trigger"],
+      "rationale": "监管阈值触发的大额亏损是固定债券主题，不等同普通亏损分析。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 276,
+      "title": "六、报告期末除债券外的有息债务逾期情况",
+      "expected_keys": ["overdue_debt"],
+      "required_section_keys": ["overdue_debt"],
+      "rationale": "有息债务逾期固定标题复用既有 overdue_debt 主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 516,
+      "title": "(3)存货明细表",
+      "expected_keys": ["inventory"],
+      "required_section_keys": ["inventory"],
+      "rationale": "存货明细表标题直接证明存货主题，不能只依赖祖先 note section。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 382,
+      "title": "14.1.1 存货类别",
+      "expected_keys": ["inventory"],
+      "required_section_keys": ["accounting_policies", "inventory"],
+      "expected_heading_path": [
+        "第九节 财务报告",
+        "财务报表",
+        "(三) 重要会计政策和会计估计 -续",
+        "14、存货",
+        "14.1存货类别、发出计价方法、盘存制度、低值易耗品和包装物的摊销方法",
+        "14.1.1 存货类别"
+      ],
+      "rationale": "无空格点分编号必须保留完整父子层级；恢复的财务报表 source-bound 容器、会计政策和存货路径共同支撑结构检索。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 222,
+      "title": "（七）其他重大关联交易",
+      "expected_keys": ["related_party_overview"],
+      "required_section_keys": ["important_matters", "related_party_overview"],
+      "rationale": "固定年度披露标题直接承载其他重大关联交易答案；否定或不适用不抹去主题。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 285,
+      "title": "审计报告 - 续",
+      "expected_keys": [],
+      "required_section_keys": ["key_audit_matters", "audit_opinion"],
+      "forbidden_keys": ["key_audit_matters", "audit_opinion"],
+      "rationale": "正文只有审计报告文号和页码；保留章节位置，但不得把机械续页元数据当直接审计答案。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 293,
+      "title": "四、关键审计事项 -续",
+      "expected_keys": [],
+      "required_section_keys": ["key_audit_matters"],
+      "forbidden_keys": ["key_audit_matters"],
+      "rationale": "正文只有页码，关键审计事项 direct 必须由实质内容而不是 continuation 标题锁定。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 298,
+      "title": "审计报告 - 续",
+      "expected_keys": [],
+      "required_section_keys": ["audit_opinion"],
+      "forbidden_keys": ["audit_opinion"],
+      "rationale": "纯文号/页码载体只保留审计意见结构上下文，不生成 direct。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 650,
+      "title": "(1)关联担保情况",
+      "expected_keys": ["guarantee_overview"],
+      "required_section_keys": ["related_party_note", "guarantee_overview"],
+      "rationale": "关联担保明细是 Unit-local 担保答案载体，并保留关联方附注上下文。"
+    },
+    {
+      "provider_document_id": "1225067794",
+      "unit_index": 664,
+      "title": "(2)为其他单位提供债务担保形成的或有负债及其财务影响",
+      "expected_keys": ["guarantee_overview"],
+      "required_section_keys": ["commitments_contingencies", "guarantee_overview"],
+      "rationale": "对外债务担保及其财务影响是直接担保主题；诉讼或其他或有事项不得复用该 exact heading。"
     }
   ]
 }

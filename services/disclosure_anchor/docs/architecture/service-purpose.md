@@ -1,7 +1,7 @@
 ---
 id: disclosure_anchor
 title: disclosure_anchor 服务目的
-contract_version: v1.2
+contract_version: v1.3
 status: canonical
 layer: L1
 layer_name: 披露文件接入与结构化准备层
@@ -11,7 +11,7 @@ scope: self_maintained_exchange_disclosures
 output_kind: l2_ready_document_units
 output_form: queryable_database_plus_filing_api
 payload_kinds: [text, table, qa, mixed]
-query_keys: [company_ref, security_ref, report_period, announcement_date, filing_type, document_id, asset_id, payload_kind, heading_path, semantic_key, semantic_keys, section_keys, applicability, page_no, quality_status, content_hash, source_ref, producer_action_ref]
+query_keys: [company_ref, security_ref, report_period, announcement_date, filing_type, document_id, asset_id, payload_kind, heading_path, semantic_keys, section_keys, applicability, page_no, quality_status, content_hash, source_ref, producer_action_ref]
 core_objects: [company, security, source_access, document, processing_run, document_unit]
 optional_objects: [source_checkpoint, provider_category]
 primary_store: postgresql
@@ -126,7 +126,7 @@ L2
 可重生成资产
 - Markdown / JSON / HTML 等 parser artifact
 - document_unit
-- semantic_key
+- semantic_keys
 - 查询索引
 ```
 
@@ -217,7 +217,7 @@ PDF 表格默认保存为完整 `table` part（无同节相邻内容时也可单
 - 表格抽取；
 - 对 parser 已给出的结构关系做可回放校验；
 - 仅对有封闭 source type、位置和重复证明的外部版面元数据做抑制；
-- 粗粒度 `semantic_key` 标注；
+- 粗粒度 `semantic_keys` 标注；
 - 解析质量标记。
 
 本服务不做：
@@ -285,8 +285,8 @@ watchlist.csv + `make track`（批量导入/恢复，`make track-export` 回写 
 读侧：`GET /v1/tracked-companies` / `tracked_companies_v1` 视图。
 删除三层语义（round22）：`status=paused` 可逆停；`DELETE /v1/admin/tracked-companies/{code}`
 （= `make untrack`）删订阅行、公司与已获取文档留档（下载队列只放行有 active 行的公司）；
-`make purge-company`（测试期专用 CLI）单公司级联清除——登记账本按 GLEIF 模式从不经
-运营路径删除。
+corpus/raw/source_access 不提供运营删除入口——登记账本按 GLEIF 模式从不经股票池路径删除；
+测试残留只由隔离 scratch runner 清理。
 
 其他参数均为有默认值的配置：
 
@@ -346,7 +346,9 @@ watchlist.csv + `make track`（批量导入/恢复，`make track-export` 回写 
 ```text
 registered → parsed | parse_failed →（发布后）published
 published 后重解析失败不降级：status 保持 published，旧 active run 继续可读，
-失败只体现在 processing_run 层（unit_build_status / failed run + observed 事件）
+失败只体现在 processing_run 层（unit_build_status / semantic_adjudication_status、
+`disclosure_ops.unit_build_terminal_v1`、health/doctor/dead-letter 与 observed 事件）；任何
+parse succeeded / Unit build failed 都必须在运维面可见，不能被称为成功处理。
 ```
 
 `report_period` 可空（B8）：定期报告（annual/semiannual/quarterly_report）必填；
@@ -413,8 +415,7 @@ payload_kind
 heading_path
 title
 order_index
-semantic_key（可选；只有存在受控的真实 Unit 级路由键时才填写）
-semantic_keys（可选；完整有序路由集，首项等于 semantic_key）
+semantic_keys（可选；完整有序的受控 Unit 级直接主题路由集，至多 8 个）
 section_keys（可选；从可靠 heading_path 精确归一的完整结构位置路由）
 payload
 content_hash
@@ -504,7 +505,7 @@ ProviderDocument occurrence 并 fail closed 或 `needs_review`，不得造逻辑
   "payload_kind": "qa",
   "heading_path": ["投资者关系活动主要内容介绍"],
   "title": "美国加征关税对公司有什么影响？",
-  "semantic_key": "tariff_exposure",
+  "semantic_keys": ["tariff_exposure"],
   "payload": {
     "question": "美国加征关税对公司有什么影响？",
     "answer": "美的集团是一家覆盖智能家居、新能源及工业技术、智能建筑科技、机器人与自动化、健康医疗、智慧物流等业务的全球领先的科技集团，已建立ToC与ToB并重发展的业务矩阵，既可为消费者提供各类智能家居的产品与服务，也可为企业客户提供多元化的商业及工业解决方案。目前，公司业务遍及200多个国家和地区，其中美国收入占比很低。在海外设有22个研发中心和23个主要制造基地，遍布南美洲、北美洲、欧洲、亚洲、非洲等区域的十多个国家。未来，公司还将持续拓展海外制造布局，推动海外新工厂的建设与投产。美的持续加强自有品牌产品研发投入，并通过本地化用户洞察与创新，不断完善全球各区域产品布局和产品竞争力，2024年美的系自有品牌在多个国家和多个家电品类均取得市场突破，如美的系冰箱产品在马来西亚、沙特、智利等国家取得市场份额第一，在越南、泰国等国家提升至市场份额第二；美的系洗衣机产品在马来西亚和沙特的市场份额分别达到第一和第二；家用空调产品在巴西、埃及的市场份额连续多年位居第一；此外，美的系微波炉、洗碗机、风扇、电压力锅等品类产品在部分新兴市场国家的市场份额亦位居前列。"
@@ -527,7 +528,7 @@ payload 是有序 parts；每个 part 只保存 source-bound 浅内容字段，�
 `payload_kind` 唯一表达。
 视觉 part 额外保存内容型 artifact 的 `{sha256,size_bytes,media_type}`，使图像变化进入
 `content_hash`；路径、crop、bbox、search binding 与 supporting evidence 只在 Unit 顶层
-`provider_unit_locator.v3`，不复制到每个 part，也不形成第二套证据图。
+`provider_unit_locator.v8`，不复制到每个 part，也不形成第二套证据图。
 
 ```json
 {
@@ -547,11 +548,14 @@ payload 是有序 parts；每个 part 只保存 source-bound 浅内容字段，�
 `document|section` 不作为 payload 字段重复保存：是否属于结构 section 已由 `title`、
 `heading_path` 和 locator 中的 source-bound heading chain 唯一表达；无标题的根区间自然是
 document preamble。监管 taxonomy 可在组装完成后帮助 L2 路由，但不得反向决定 section 边界。
-单元级 `applicability` 只从该 CoarseUnit 自己拥有的 ProviderBlock 中投影：仅受控的
-`checked + 适用 / unchecked + 不适用` 成对勾选可确定 `applicable`，反向勾选可确定
-`not_applicable`；多个有效声明必须一致。普通“适用/不适用”文字、双选、双空、冲突，
-以及只出现在祖先标题、相邻 Unit 或上一页的声明一律保持 NULL，原始细节仍由 payload
-与 source-bound locator 承载。
+单元级 `applicability` 只从当前叶标题自身，或第一个实质/visual part 之前的
+declaration-only leading part 投影：仅受控的 `checked + 适用 / unchecked + 不适用` 成对勾选
+可确定 `applicable`，反向勾选可确定 `not_applicable`；多个有效 leading 声明必须一致。
+一旦遇到实质正文、表格或视觉 carrier，后续 selector 视为 child-local，不再提升成整个 Unit 状态。
+普通 paragraph 即使词面等于监管模板也不能据此变成标题；没有 source heading occurrence 时，prompt
+和 selector 原位保留在既有 Unit，且在没有 Provider 明确 prompt role 时不提升为 Unit applicability。
+普通“适用/不适用”文字、双选、双空、冲突，以及只出现在祖先标题、嵌套子题、相邻 Unit
+或上一页的声明一律保持 NULL，原始细节仍由 payload 与 source-bound locator 承载。
 
 ---
 
@@ -576,7 +580,7 @@ document preamble。监管 taxonomy 可在组装完成后帮助 L2 路由，但�
 ```
 
 财务附注里的表格则是更深的层级。Provider writer 只允许严格 typed field/header 或其他
-Unit-local 受控 witness 产生粗主题 `semantic_key(s)`；普通 table text/data cell 不造 route，
+Unit-local 受控 witness 产生粗主题 `semantic_keys`；普通 table text/data cell 不造 route，
 具体数值口径、事实性与业务解释仍留给 L2：
 
 ```text
@@ -608,8 +612,9 @@ Unit-local 受控 witness 产生粗主题 `semantic_key(s)`；普通 table text/
 ## 7.2 artifact_locator
 
 `artifact_locator` 是可选的**技术位置**。新产物使用闭合的
-`provider_unit_locator.v3`，绑定 `provider_document.v1` hash、source block index + payload ordinal、标题链、
-Unit parts、物理表格段、evidence digest 与显式 search target。`title`、heading_path 或 caption
+`provider_unit_locator.v8`，绑定 `provider_document.v1` hash、source block index + payload ordinal、标题链、
+同页换行标题的 source `continuation_fragments`、Unit parts、物理表格段、evidence digest、显式 search target、
+native-PDF text reconciliation 与 table quality finding。`title`、heading_path 或 caption
 发生争议时，必须沿 locator 回到 ProviderDocument、MinerU 原始 artifact 和不可变 PDF 查证；
 缺 locator 或源字段不是“保守猜一个值”的理由，而是 parser 质量故障。
 
@@ -622,14 +627,14 @@ heading_chain
 parts / physical_table_segment_indices
 evidence_artifacts
 search_targets
-source_text_reconciliations（仅 native-PDF 数字校正时）
+source_text_reconciliations / source_quality_findings（仅命中闭合 native-PDF 规则时）
 ```
 
 示意：
 
 ```json
 {
-  "contract_version": "provider_unit_locator.v3",
+  "contract_version": "provider_unit_locator.v8",
   "provider_document_sha256": "sha256:...",
   "heading_chain": [{"source_index": 42, "placement_source": "numbering"}],
   "parts": [{"part_index": 0, "block_source_indices": [43, 44],
@@ -637,7 +642,7 @@ source_text_reconciliations（仅 native-PDF 数字校正时）
 }
 ```
 
-locator v2 允许一种窄的 source-PDF 校正：若 MinerU 的一个 `text` block 在 exact bbox 内只漏数字，
+locator v2 起允许一种窄的 source-PDF 校正：若 MinerU 的一个 `text` block 在 exact bbox 内只漏数字，
 admission 可读取同一不可变 PDF 的 native text。只有 PDF hash/page count、block/raw hash、bbox 与
 payload identity 全部闭合，且 MinerU 文本可由 native text 仅删除完整数字核心（可连同或保留
 `%/‰`）得到；被删除数字 token 位置的相邻 ASCII 横向空格/Tab 可随 token 缺失或作为 MinerU 占位保留，其余字符
@@ -649,14 +654,39 @@ source PDF 文字。唯一 reader 规范化是 PDFium bounded-text 生成的、�
 `source_text_reconciliations` 只保存两侧 text hash 与 source identity，不存第二份路径或结构。
 每个 Unit locator 覆盖本 Unit source blocks 及其完整 heading chain 所依赖的校正；Publish 必须从
 PDF 重新生成同一结果。表格、数字替换/重排、非数字差异、无 text layer、旋转/页面形状不闭合、
-高度重叠 bbox 或任何歧义均不修。native reader 固定使用 `pypdfium2==5.13.0`。
-历史 `provider_unit_locator.v1/v2` 继续只读；v1 不能声明该校正，v1/v2 的 heading
-默认绑定 source block 的首个 payload。只有 v3 可把标题精确绑定到非首个 payload occurrence。
+高度重叠 bbox 或任何歧义均不修。locator v4 的 `source_pdf_native_identifier.v1` 只在相同证据边界内
+补回完整数字 atom 与至多一个 source-proved 开引号；只可忽略数字相邻 ASCII 空格，其他空白逐字相等。
+table observation 永不改写 HTML；`source_pdf_native_table_quality.v1` 只把空尾、畸形数字分组或
+numeric token 变异记录为 finding 并将 Unit 标为 `needs_review`。locator v5 另允许恰好一处 `=` 与
+至少一个完整数字 atom 同时漏失的 `source_pdf_native_identifier.v2`；provider 已有 `=`、多处 `=`、
+其他符号/文字差异或数字替换一律拒绝；仅可在实际删除的 `=`/数字 atom 位点消费 MinerU 留下的
+ASCII 空格/Tab 占位。不能安全修复、但能证明 source-only omission 且至少漏一个完整数字 atom 时，
+仅记录 `source_pdf_native_text_quality.v1/native_text_omission` 并保留 MinerU payload；该 finding 的
+proof 只忽略处在矩形首尾、或直接紧邻数字 atom 的单个 ASCII 空格/Tab atom，其他正文空白必须逐字一致。
+locator v6 只新增两种 finding-only 证据：严格两列表单 `统一社会信用代码` 中唯一 18 位 code 的
+单一 `O/0` 差异，且仅 source code 通过统一社会信用代码 checksum；以及 native source 相对 provider
+只多一个 `〔` 或 `〕`、数字串逐字守恒、source 括号平衡而 provider 恰差一个括号的 CJK 引用号漏失。
+两者分别记录 `source_pdf_native_identifier_quality.v1/identifier_confusable_mismatch` 与
+`source_pdf_native_text_quality.v2/cjk_bracket_omission`，均不改 payload，只将 Unit 置 `needs_review`。
+native reader 固定使用 `pypdfium2==5.13.0`。locator v7 是只读历史版本，曾新增
+`statutory_template` heading placement；locator v8 保留 v6 的 source-bound 证据 vocabulary，但不再
+凭普通 paragraph 的整句词面发出该 placement。没有明确 source heading occurrence 时，prompt 与
+selector 留在既有 Unit；同页、连续、唯一 prompt+closed-selector 形态本身也不授权 Unit-level
+applicability。历史
+`provider_unit_locator.v1-v7` 继续只读；v1 不能声明校正，
+v1/v2 的 heading 默认绑定 source block 的首个 payload；v3 起可绑定非首 payload，v4 起还可绑定
+同页换行标题 fragment 与 table quality finding。v2/v3 只读 numeric.v1，v4 才可读取 identifier.v1，
+v5 才可读取 identifier.v2/text-quality，v6 才可读取上述 identifier/CJK quality；v1-v3 也不得声明
+v4 才引入的 `unit_title_fragment` search destination，v1-v6 不得声明 v7 placement，v8 writer 不得
+重新发出 `statutory_template`。历史 locator
+不得声明后代 vocabulary。
 
 MinerU merge-on 输出中的非空 content-list table owner 是唯一逻辑/检索 payload；后续空 table
 stub 不另发正文，只通过 locator 连接其逐页 physical segment、crop、page/bbox 和 raw hash。
 ProviderDocument 永久保留 owner/stub 与所有 page-local segment；L1 不解析 grid、不修 cell、
-不按相似度跨页合表。关系证据缺失或歧义时保留 provider occurrence 并 fail closed 或标记
+不按相似度跨页合表。物理边界只允许上一页 owner 之后的 page frame 与 exact `page_footnote`，以及
+下一页 stub 之前的 page frame；下一页 leading footnote 仍阻断，footnote 也不因此变成 semantic furniture。
+关系证据缺失或歧义时保留 provider occurrence 并 fail closed 或标记
 `needs_review`，绝不猜 owner。locator 不是 agent 的主查询键。
 
 locator 中登记的视觉 evidence artifact 通过
@@ -678,7 +708,7 @@ provider_document_id= ...
 raw_file_hash       = sha256:...
 processing_run_id   = run_...
 asset_id            = du_...
-semantic_key        = source-bound 受控路由或 NULL（证据不足时不伪造）
+semantic_keys       = source-bound 受控路由有序集合或 NULL（证据不足时不伪造）
 exact payload       = {"table_body":"<table>...</table>"}
 ```
 
@@ -768,7 +798,7 @@ ProviderDocument 中每个非空 source carrier 默认都必须进入 unit paylo
 ## 9.3 规则边界
 
 结构去重只能由可版本化、可回放、与内容主题无关的机械证明决定。监管 taxonomy、
-`semantic_key`、filing type 和 L2 查询同义词只用于路由/排序，绝不参与 heading_path、title、
+`semantic_keys`、filing type 和 L2 查询同义词只用于路由/排序，绝不参与 heading_path、title、
 unit 边界、内容归属或删除。不得让 LLM 在 L1 自由判断“这段有没有投资价值”；若将来引入
 模型辅助结构判定，也必须输出可核验位置和独立证据，不能把模型猜测写成源事实。
 
@@ -784,6 +814,11 @@ unit 边界、内容归属或删除。不得让 LLM 在 L1 自由判断“这段
 
 - `company_id` 是本服务铸造的本地不透明 ID；L4 Subject Registry 上线前不承诺全局主体身份，
   届时按强键 crosswalk 回填 `subject_ref`（视图加列，兼容变更），`company_ref` 语义不变；
+- 当前 `document.company_id/security_id` 绑定的是 provider 获取/登记范围（source scope），不是对 PDF
+  全部正文的 canonical content subject 断言。母公司代发子公司附件时两者可以合法不同；在 run-bound、
+  source-bound 的内容身份 assessment 上线前，`company_ref/security_ref/security_code` 不得单独用于
+  issuer-safe 事实归因、同主体 join 或预测输入。正文中的公司名/证券代码也不得反向静默改写 provider
+  identity；跨主体归一仍由 L4 Subject Registry 和显式关系承担；
 - 强键"有则必填"：中国注册实体的统一社会信用代码经 `company_credit_code` 采集（scheme = uscc）；
   `(exchange, security_code)` 已必填（证券级中键）；美股 / 港股主体接入时同规范采集
   sec_cik / hk_cr / lei；
@@ -894,7 +929,7 @@ company("002484").filings(
 filing.text_units()
 filing.tables()
 filing.qa_items()
-filing.units(semantic_key="receivable_aging")  # 仅当真实受控键存在
+filing.units(semantic_keys_any="receivable_aging")  # 单键召回也走集合谓词
 filing.units(heading_path="第三节/管理层讨论与分析")
 ```
 
@@ -906,7 +941,6 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - 公告类型；
 - `payload_kind`；
 - `heading_path`；
-- `semantic_key`；
 - `semantic_keys`（mixed Unit 的完整路由集合）；
 - `section_keys`（已接受标题树中的规范化章节位置集合）；
 - `applicability`（0010 起，节适用性一等筛选列）；
@@ -918,11 +952,11 @@ filing.units(heading_path="第三节/管理层讨论与分析")
 - 标题；
 - `asset_id`。
 
-查询面说明：上述键在适用的版本化 `disclosure_public` 视图上全部可作谓词（新 DB Unit consumer
-使用 `document_units_v2`，弃用的 `document_units_v1` 仅作兼容；DB 直读满足全集）；
+查询面说明：上述键在唯一的 `disclosure_public.document_units_v1` 上全部可作谓词
+（DB 直读满足全集）；
 Filing API 首版只暴露其中一部分为查询参数（documents：company_ref / security_code /
 filing_type / report_period / announcement_date_from,to / status；units：payload_kind /
-semantic_key（兼容召回 primary 或 secondary route）/ semantic_keys_any / semantic_keys_all /
+semantic_keys_any / semantic_keys_all /
 section_keys_any / section_keys_all / quality_status /
 heading_prefix），其余键经 DB 视图直读或后续 API 升版满足。
 
@@ -936,7 +970,7 @@ heading_prefix），其余键经 DB 视图直读或后续 API 升版满足。
 当前 public view 全集（与 `contract-checklist.md` §3 一致）：
 
 ```text
-documents_v1 / document_units_v1 / document_units_v2 / document_categories_v1 /
+documents_v1 / document_units_v1 / document_categories_v1 /
 processing_runs_v1 / source_refs_v1 / change_events_v1 / tracked_companies_v1 /
 unit_search_projection_v1 / unit_body_search_windows_v1 / unit_search_atoms_v1
 ```
@@ -976,7 +1010,7 @@ report_period
 announcement_date
 payload_kind
 heading_path
-semantic_key
+semantic_keys
 quality_status
 content_hash
 contract_version
@@ -988,8 +1022,9 @@ order_index
 
 映射关系：
 
-- `company_ref` = `document.company_id`（本地不透明 ID，见 §10.1 主体匹配键采集义务）；
-- `security_ref` = `document.security_id`；
+- `company_ref` = `document.company_id`（本地不透明的 source-scope/acquisition identity，见 §10.1；
+  不是 canonical content subject）；
+- `security_ref` = `document.security_id`（同属 source scope；`security_code/exchange` 亦然）；
 - `payload_kind` = `document_unit.payload_kind`（0006 起列名已收敛，不再映射）；
 - `producer_action_ref` = `processing_run_id`，即顶层 `action_log` 的 L1 特化；
 - `parent_ref` = 所属 `document_id`；
@@ -1003,7 +1038,7 @@ order_index
 6 列，至 04R-R7 为 32 列（仅历史基线）。
 
 0008 迁移起，`processing_runs_v1` 投影 `builder_rules_version`，用于确定性 Unit builder 归因；
-历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 当前必须等于 `provider_unit.v9`。
+历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 当前必须等于 `provider_unit.v22`。
 
 0031 迁移起，`processing_runs_v1` 只额外暴露不透明的
 `artifact_owner_processing_run_id`：parse run 指向自身，`rebuild_units` 指向实际拥有
@@ -1013,14 +1048,15 @@ parser artifact 与 primary parse artifact 字节的根 parse run。0032 为 cor
 run_kind 与 locator contract 校验后使用统一 PathBuilder 定位，禁止把 unit producer run 当成
 artifact owner，也禁止从文件存在性或路径词面猜版本。
 
-0038 后 `document_units_v2` 为当前 **40 列** Unit 读面：保留 Unit 自有 scope/provenance、
-`semantic_key`/`semantic_keys` 检索路由，以及 `filing_type`/`disclosure_topics` 路由字段；
+0039 收口唯一 `document_units_v1`；0041 移除冗余公共 scalar `semantic_key`，0047 再在
+只读一致性 preflight 后删除私有 scalar 列与索引；hash/旧快照仍从 `semantic_keys[0]` 派生兼容 lead，
+当前读面为 **39 列**：保留 Unit 自有 scope/provenance、
+`semantic_keys` 检索路由（完整召回唯一入口），以及 `filing_type`/`disclosure_topics` 路由字段；
 `section_keys` 单独提供确定性的规范化章节召回；
 `content_categories`、`publisher_categories`、`market` 的当前事实面均只在 `documents_v1` 与
-`document_categories_v1`。L2 如需 provider 粗分类，先筛 Document 再按 document_id 取 v2 Units，
-不能把 Document facet 冒充 Unit 内容标签。`document_units_v1` 为兼容既有消费者恢复弃用的
-末列 `content_categories`（40 列，仅 join、不存 Unit）；v2 用 Unit 自有
-`body_status=content|heading_only|empty` 取代该 Document facet，新消费者不得依赖 v1 弃用列。完整列集以
+`document_categories_v1`。L2 如需 provider 粗分类，先筛 Document 再按 document_id 取 Units，
+不能把 Document facet 冒充 Unit 内容标签。Unit 读面以自有
+`body_status=content|heading_only|empty` 表达内容形态，不再继承 `content_categories`。完整列集以
 contract-checklist §2 为准：
 
 - 0010：`applicability`（'applicable'|'not_applicable'|NULL，节适用性一等筛选列，部分索引）
@@ -1046,6 +1082,24 @@ contract-checklist §2 为准：
   仍仅实现 v1，完整 HTTP v2 未落地前拒绝 `X-Contract-Version:v2`。该迁移 downgrade 只移除 v2，
   继续保留已恢复的 40 列 v1，避免以回滚名义重新暴露 0037 的已知破坏形状；更深历史回退仍由各自
   migration 处理。
+- 0039：开发期最终收敛为一个公开 Unit 契约。删除 `document_units_v2`，并让唯一的
+  `document_units_v1` 使用 0038 的干净结构：保留 `body_status`、不含 Document-only
+  `content_categories`，`contract_version=document_unit.v1`。DB 与 Filing API 不保留别名或双 serializer。
+- 0040：不改私有缺失语义，也不制造占位 key；唯一 `document_units_v1` 将缺失的
+  `semantic_keys` / `section_keys` 统一投影为 `[]`。当时私有 `semantic_key` 仍为 nullable lead，
+  public Pydantic/OpenAPI 的两个 plural 字段是 required array，方便 L2 稳定执行 any/all 与集合运算。
+- 0045：冻结 receipt v2 的路径/版本与 provider-attempt 终态，清理 JSON literal `null`，并新增
+  `disclosure_ops.unit_build_terminal_v1`；0046 撤销 reader 对私有 `provider_category` 的遗留直读；
+  0047 删除私有 `document_unit.semantic_key`，只保留 `semantic_keys` JSONB（1..8 或 SQL NULL）；
+  0048 让 pending/terminal build 运维视图排除已被后续成功 Unit 代际修复的旧失败，同时保留
+  成功代际之后发生的最新失败；0049 仅授 app 读取 migration head 的权限，使非 superuser
+  health/doctor 可验证 schema 版本；沿用 0024 已明确授予两个 reader 的同一窄读权限，所有这些
+  角色均不可修改版本表。0047 保持不可改写；online Alembic env 在跨越它前以 NULL-safe
+  scalar/plural 比较 fail closed，0050 只验证删除后仍可证明的 plural-only 数组状态，不把已删除
+  scalar 假装成可由 downgrade 恢复。receipt v2 Replay 从冻结 receipt 的连续 group 成员恢复历史
+  分组并重算 group hash/lineage，不使用当前 semantic batch size 重分。0039/0041 的无消费者开发期
+  clean v1 自此由 schema/model/view/API literal golden 冻结；下一次 breaking 变化必须升 v2 并按
+  顶层协议 §2.7 保留 v1 弃用期。
 
 `asset://` URI（顶层协议 §2.3）只在序列化边界派生，不落存储：
 
@@ -1199,7 +1253,7 @@ L2 收到一个 unit 后负责：
 | `section_path` | 新文档统一使用 `heading_path` |
 | 全量三大表 PDF 重建 | 删除；标准数据 provider 为默认来源（首版 Wind） |
 | 多 parser 常态交叉验证 | 删除；只在明确失败或高价值复核时启用 |
-| 独立 topic/tag 关系表 | 第一版只保留可选 `semantic_key` |
+| 独立 topic/tag 关系表 | 第一版只保留可选 `semantic_keys` JSONB 集合 |
 
 ---
 
@@ -1208,8 +1262,8 @@ L2 收到一个 unit 后负责：
 本文件已对齐 `投研预测引擎顶层框架协议_v0.8.md`，尤其是 §3.10
 对 `disclosure_anchor` 的三点补强：
 
-1. `document_units_v2` 保留当前 unit 级 scope keys，供新 DB L2 consumer 检索；弃用的
-   `document_units_v1` 仅兼容既有 consumer，当前 Filing API 仍为 v1；
+1. 唯一的 `document_units_v1` 保留当前 unit 级 scope keys 与 `body_status`，同时供 DB L2 consumer
+   与当前 Filing API 使用；
 2. 术语已收敛：`document_unit_id → asset_id`、`unit_kind → payload_kind`、outbox
    `event_type → event_kind`；`processing_run` 保留为 `action_log` 的 L1 特化；
 3. change feed 以 `change_events_v1` / `GET /v1/changes` 暴露，区分 observed / materialized。

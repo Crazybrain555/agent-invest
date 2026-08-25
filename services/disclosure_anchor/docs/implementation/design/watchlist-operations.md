@@ -158,5 +158,5 @@ CSV 降级为导入/种子 + git 快照格式。**
 §3 经验三"没有项目提供 add/remove CLI"随真源翻转一并失效——DB 真源下 CRUD 就是接口。
 三层：`status=paused` 可逆停（原 qlib 模式保留）；`DELETE /v1/admin/tracked-companies/{code}`
 = `make untrack`（删订阅行，公司/文档留档；下载队列谓词同轮从"paused 才拦"翻转为
-"active 行才放行"，否则删行会重新打开积压下载）；`make purge-company CODE=.. PURGE=YES`
-（测试期专用、CORPUS exclusive，只撤销明确识别的单公司失误）。
+"active 行才放行"，否则删行会重新打开积压下载）。corpus/raw/source_access 不属于股票池
+运维删除语义；测试数据由隔离 scratch runner 持有和清理。

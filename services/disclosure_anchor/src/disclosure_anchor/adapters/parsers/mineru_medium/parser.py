@@ -28,11 +28,13 @@ class MinerUMediumDocumentParser:
         process: MinerUProcess,
         reader: MinerUMediumArtifactReader | None = None,
         parser_version: str | None = None,
+        api_url: str | None = None,
         server_url: str | None = None,
     ) -> None:
         self._process = process
         self._reader = reader or MinerUMediumArtifactReader()
         self._version_cache = parser_version
+        self._api_url = api_url
         self._server_url = server_url
 
     def identity(self) -> ParserIdentity:
@@ -47,12 +49,8 @@ class MinerUMediumDocumentParser:
 
     def readiness(self, options: ParserOptions) -> None:
         self._target(options)
-        server_url = options.server_url or self._server_url
-        if not server_url:
-            raise ParserOutputContractError(
-                "hybrid-http-client writer requires a server URL"
-            )
-        self._process.probe_server(server_url)
+        api_url, _server_url = self._endpoints(options)
+        self._process.probe_server(api_url)
 
     def parse(
         self,
@@ -63,6 +61,7 @@ class MinerUMediumDocumentParser:
         source_pdf_sha256: str,
     ) -> ProviderParserResult:
         target = self._target(options)
+        api_url, server_url = self._endpoints(options)
         run_options = ParserOptions(
             method=options.method,
             backend=options.backend,
@@ -74,11 +73,11 @@ class MinerUMediumDocumentParser:
             start_page=options.start_page,
             end_page=options.end_page,
             timeout_seconds=options.timeout_seconds,
-            server_url=options.server_url or self._server_url,
+            api_url=api_url,
+            api_drain_timeout_seconds=options.api_drain_timeout_seconds,
+            server_url=server_url,
             http_request_concurrency=options.http_request_concurrency,
-            runtime_bundle_identity_sha256=(
-                options.runtime_bundle_identity_sha256
-            ),
+            runtime_bundle_identity_sha256=(options.runtime_bundle_identity_sha256),
         )
         result = self._process.run(
             input_pdf=input_pdf,
@@ -94,6 +93,27 @@ class MinerUMediumDocumentParser:
             artifact_root=self._reader.locate_artifact_root(result.output_dir),
             provider_document=provider_document,
         )
+
+    def _endpoints(self, options: ParserOptions) -> tuple[str, str]:
+        if self._api_url and options.api_url and options.api_url != self._api_url:
+            raise ParserOutputContractError("MinerU API URL override drifted")
+        if (
+            self._server_url
+            and options.server_url
+            and options.server_url != self._server_url
+        ):
+            raise ParserOutputContractError("MinerU upstream URL override drifted")
+        api_url = options.api_url or self._api_url
+        server_url = options.server_url or self._server_url
+        if not api_url:
+            raise ParserOutputContractError(
+                "hybrid-http-client writer requires a fixed MinerU API URL"
+            )
+        if not server_url:
+            raise ParserOutputContractError(
+                "hybrid-http-client writer requires a VLM upstream server URL"
+            )
+        return api_url, server_url
 
     def _target(self, options: ParserOptions) -> ParserTargetIdentity:
         target = options.target_identity(self.identity())

@@ -35,7 +35,7 @@ from sqlalchemy.engine import Connection
 from disclosure_anchor.adapters.db.postgres.connection import create_db_engine
 from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA
 from disclosure_anchor.application.contracts.semantic_routes import (
-    SEMANTIC_ROUTE_RECEIPTS_FILENAME,
+    SEMANTIC_ROUTE_RECEIPTS_V1_FILENAME,
 )
 from disclosure_anchor.application.worker.locks import (
     exclusive_corpus_mutation,
@@ -106,7 +106,9 @@ def _snapshot_expected_owners(conn: Connection) -> dict[str, set[str]]:
             f"""
             SELECT parser_artifact_relpath, normalized_ir_relpath,
                    provider_document_relpath, document_units_relpath,
-                   semantic_route_receipts_hash
+                   semantic_route_receipts_hash,
+                   semantic_route_receipts_relpath,
+                   semantic_route_receipts_contract_version
               FROM {CORE_SCHEMA}.processing_run
             """
         )
@@ -117,6 +119,8 @@ def _snapshot_expected_owners(conn: Connection) -> dict[str, set[str]]:
         provider_relpath,
         units_relpath,
         receipt_hash,
+        receipt_relpath,
+        receipt_version,
     ) in rows:
         values = {
             "parser_artifacts": parser_relpath,
@@ -128,10 +132,21 @@ def _snapshot_expected_owners(conn: Connection) -> dict[str, set[str]]:
             if value is not None:
                 expected[family].add(str(value).rstrip("/"))
         if units_relpath is not None and receipt_hash is not None:
-            snapshot = PurePosixPath(str(units_relpath))
-            expected["document_unit_snapshots"].add(
-                (snapshot.parent / SEMANTIC_ROUTE_RECEIPTS_FILENAME).as_posix()
-            )
+            if receipt_relpath is not None:
+                if receipt_version != "semantic_route_receipt.v2":
+                    raise RuntimeError(
+                        "processing_run semantic receipt version is unsupported"
+                    )
+                expected["document_unit_snapshots"].add(str(receipt_relpath))
+            else:
+                if receipt_version is not None:
+                    raise RuntimeError(
+                        "processing_run semantic receipt identity is incomplete"
+                    )
+                snapshot = PurePosixPath(str(units_relpath))
+                expected["document_unit_snapshots"].add(
+                    (snapshot.parent / SEMANTIC_ROUTE_RECEIPTS_V1_FILENAME).as_posix()
+                )
     return expected
 
 

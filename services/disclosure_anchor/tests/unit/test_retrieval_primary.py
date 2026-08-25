@@ -13,6 +13,7 @@ from disclosure_anchor.application.contracts.provider_document import (
     provider_artifact_bundle_sha256,
 )
 from disclosure_anchor.application.contracts.html_visible_text import (
+    html_qa_row_atoms,
     html_table_semantic_segments,
     html_visible_text_segments,
 )
@@ -246,6 +247,189 @@ class RetrievalPrimaryTest(unittest.TestCase):
             tuple(item.role for item in one_row),
             ("table_text", "table_text"),
         )
+
+    def test_table_semantic_roles_preserve_empty_cells_and_spanned_headers(
+        self,
+    ) -> None:
+        related_party = html_table_semantic_segments(
+            "<table><tr><td>关联方</td><td>关联交易内容</td>"
+            "<td>本期发生额</td><td>上期发生额</td></tr>"
+            "<tr><td>某财务公司</td><td>利息收入</td><td></td>"
+            "<td>11.31</td></tr></table>"
+        )
+        self.assertEqual(
+            tuple((item.text, item.role) for item in related_party),
+            (
+                ("关联方", "table_column_header"),
+                ("关联交易内容", "table_column_header"),
+                ("本期发生额", "table_column_header"),
+                ("上期发生额", "table_column_header"),
+                ("某财务公司", "table_text"),
+                ("利息收入", "table_field_label"),
+                ("11.31", "table_text"),
+            ),
+        )
+
+        multirow = html_table_semantic_segments(
+            '<table><tr><td rowspan="2">子公司名称</td>'
+            '<td colspan="2">期末余额</td></tr>'
+            "<tr><td>营业收入</td><td>净利润</td></tr>"
+            "<tr><td>甲公司</td><td>100</td><td>20</td></tr></table>"
+        )
+        self.assertEqual(
+            tuple((item.text, item.role) for item in multirow),
+            (
+                ("子公司名称", "table_column_header"),
+                ("期末余额", "table_column_header"),
+                ("营业收入", "table_column_header"),
+                ("净利润", "table_column_header"),
+                ("甲公司", "table_text"),
+                ("100", "table_text"),
+                ("20", "table_text"),
+            ),
+        )
+
+        malformed_grid = html_table_semantic_segments(
+            '<table><tr><td rowspan="2">名称</td><td>金额</td></tr>'
+            "<tr><td>重复占位</td><td>10</td></tr></table>"
+        )
+        self.assertEqual(
+            tuple(item.role for item in malformed_grid),
+            ("table_text", "table_text", "table_text", "table_text"),
+        )
+
+    def test_table_semantic_roles_fail_closed_for_ragged_or_spanned_data_rows(
+        self,
+    ) -> None:
+        for ragged in (
+            "<table><tr><td>营业收入</td><td>本期数</td><td>上期数</td></tr>"
+            "<tr><td>甲</td><td>1</td><td>2</td></tr>"
+            "<tr><td>乙</td><td>3</td></tr></table>",
+            "<table><tr><th>营业收入</th><th>本期数</th><th>上期数</th>"
+            "<th>变动</th></tr><tr><td>甲</td><td>1</td><td>2</td></tr>"
+            "<tr><td>乙</td><td>3</td><td>4</td><td>5</td></tr></table>",
+        ):
+            with self.subTest(ragged=ragged):
+                self.assertTrue(
+                    all(
+                        item.role == "table_text"
+                        for item in html_table_semantic_segments(ragged)
+                    )
+                )
+
+    def test_table_semantic_roles_reject_ambiguous_markup_and_empty_headers(
+        self,
+    ) -> None:
+        for malformed in (
+            '<table><tr><th colspan="2" colspan="3">利息收入</th>'
+            '<td>11.31</td></tr></table>',
+            '<table><tr><thead><td>利息收入</td><td>金额</td></thead></tr>'
+            '<tr><td>x</td><td>11.31</td></tr></table>',
+            '<table><tr><td></td><td>利息收入</td></tr>'
+            '<tr><td>甲</td><td>11.31</td></tr></table>',
+        ):
+            with self.subTest(malformed=malformed):
+                segments = html_table_semantic_segments(malformed)
+                self.assertTrue(
+                    all(item.role == "table_text" for item in segments)
+                )
+
+        for spanned_data in (
+            "<table><tr><td>科目</td><td>本期数</td><td>上年同期数</td>"
+            "<td>变动比例</td></tr><tr><td rowspan='2'>营业收入</td>"
+            "<td>10</td><td>9</td><td>11%</td></tr>"
+            "<tr><td>3</td><td>2</td><td>50%</td></tr></table>",
+            "<table><tr><td>关联方</td><td>关联交易内容</td>"
+            "<td>本期发生额</td><td>上期发生额</td></tr>"
+            "<tr><td rowspan='2'>甲公司</td><td>利息收入</td>"
+            "<td>2</td><td>1</td></tr><tr><td>出售商品、提供劳务</td>"
+            "<td>3</td><td>2</td></tr></table>",
+            "<table><tr><td>科目</td><td>本期数</td><td>上年同期数</td>"
+            "<td>变动比例</td></tr><tr><td colspan='2'>营业收入</td>"
+            "<td>9</td><td>11%</td></tr></table>",
+        ):
+            with self.subTest(spanned_data=spanned_data):
+                self.assertNotIn(
+                    "table_field_label",
+                    tuple(
+                        item.role
+                        for item in html_table_semantic_segments(spanned_data)
+                    ),
+                )
+
+    def test_table_semantic_roles_require_closed_section_and_wrapper_grammar(
+        self,
+    ) -> None:
+        malformed_tables = (
+            "<table><tfoot><tr><td>营业收入</td><td>100</td></tr></tfoot>"
+            "<tfoot><tr><td>研发费用</td><td>20</td></tr></tfoot></table>",
+            "<table><div><tr><td>营业收入</td><td>100</td></tr>"
+            "<tr><td>研发费用</td><td>20</td></tr></div></table>",
+            "<table><tbody><div><tr><td>营业收入</td><td>100</td></tr>"
+            "</div></tbody></table>",
+            "<table><tr><div><td>营业收入</td><td>100</td></div>"
+            "</tr></table>",
+            "<table><tr><td>营业收入</td><td>100</td></tr>"
+            "<tbody><tr><td>研发费用</td><td>20</td></tr></tbody></table>",
+            "<table><tfoot><tr><td>营业收入</td><td>100</td></tr>"
+            "</tfoot><tr><td>研发费用</td><td>20</td></tr></table>",
+        )
+        for malformed in malformed_tables:
+            with self.subTest(malformed=malformed):
+                self.assertEqual(html_table_semantic_segments(malformed), ())
+                self.assertTrue(html_visible_text_segments(malformed))
+
+        valid = (
+            "<table><thead><tr><th>科目</th><th>本期数</th><th>上期数</th>"
+            "</tr></thead><tbody><tr><td><div>营业收入</div></td>"
+            "<td>100</td><td>90</td></tr></tbody><tbody><tr>"
+            "<td><span>研发费用</span></td><td>20</td><td>18</td></tr>"
+            "</tbody><tfoot><tr><td>合计</td><td>120</td><td>108</td>"
+            "</tr></tfoot></table>"
+        )
+        segments = html_table_semantic_segments(valid)
+        self.assertEqual(
+            tuple((item.text, item.role) for item in segments),
+            (
+                ("科目", "table_column_header"),
+                ("本期数", "table_column_header"),
+                ("上期数", "table_column_header"),
+                ("营业收入", "table_text"),
+                ("100", "table_text"),
+                ("90", "table_text"),
+                ("研发费用", "table_text"),
+                ("20", "table_text"),
+                ("18", "table_text"),
+                ("合计", "table_text"),
+                ("120", "table_text"),
+                ("108", "table_text"),
+            ),
+        )
+
+    def test_qa_row_atoms_require_exact_header_contiguous_rows_and_no_spans(self) -> None:
+        valid = (
+            '<table><tr><td colspan="3">交流要点</td></tr>'
+            "<tr><td>序号</td><td>提问内容</td><td>回复内容</td></tr>"
+            "<tr><td>1</td><td>能繁母猪数量？</td><td>期末312.9万头。</td></tr>"
+            "<tr><td>2</td><td>AI时代如何发展？</td><td>构建产业互联平台。</td></tr>"
+            "</table>"
+        )
+        self.assertEqual(
+            tuple((item.source_row_index, item.row_text) for item in html_qa_row_atoms(valid)),
+            (
+                (2, "1 能繁母猪数量？ 期末312.9万头。"),
+                (3, "2 AI时代如何发展？ 构建产业互联平台。"),
+            ),
+        )
+        for invalid in (
+            valid.replace("提问内容", "问题"),
+            valid.replace("<td>2</td>", "<td>3</td>"),
+            valid.replace("<td>期末312.9万头。</td>", '<td colspan="2">期末312.9万头。</td>'),
+            valid.replace("AI时代如何发展？", ""),
+            valid.replace("构建产业互联平台。", "<table><tr><td>嵌套</td></tr></table>"),
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(html_qa_row_atoms(invalid), ())
 
     def test_unknown_payload_field_and_stale_identity_fail_closed(self) -> None:
         document = _document()

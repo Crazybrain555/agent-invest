@@ -134,6 +134,12 @@ class ProcessingRun:
     provider_document_relpath: Optional[str] = None
     document_units_relpath: Optional[str] = None
     semantic_route_receipts_hash: Optional[str] = None
+    semantic_route_receipts_relpath: Optional[str] = None
+    semantic_route_receipts_contract_version: Optional[str] = None
+    semantic_adjudication_status: Optional[str] = None
+    semantic_degraded_unit_count: Optional[int] = None
+    semantic_failover_group_count: Optional[int] = None
+    semantic_adjudication_summary: Optional[dict[str, Any]] = None
     content_hash_aggregate: Optional[str] = None
     structure_hash: Optional[str] = None
     builder_rules_version: Optional[str] = None
@@ -159,7 +165,6 @@ class DocumentUnit:
     content_hash: str
     heading_path: list[str] = field(default_factory=list)
     title: Optional[str] = None
-    semantic_key: Optional[str] = None
     semantic_keys: Optional[list[str]] = None
     section_keys: Optional[list[str]] = None
     structure_hash: Optional[str] = None
@@ -172,6 +177,12 @@ class DocumentUnit:
     provider_document_id: Optional[str] = None
     artifact_locator: Optional[dict[str, Any]] = None
     created_at: Optional[datetime] = None
+
+    @property
+    def semantic_key(self) -> Optional[str]:
+        """Derived legacy lead; private persistence is plural-only."""
+
+        return self.semantic_keys[0] if self.semantic_keys else None
 
 
 @dataclass

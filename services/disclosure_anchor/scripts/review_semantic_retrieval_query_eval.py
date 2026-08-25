@@ -146,14 +146,15 @@ def _public_search_rows() -> dict[Identity, dict[str, Any]]:
         SELECT u.provider_document_id,
                u.order_index - 1 AS unit_index,
                u.contract_version,
+               u.body_status,
                u.content_hash,
                u.query_projection_hash,
                p.title_text,
                p.heading_path_text,
                concat_ws(' ', p.title_tokens, p.path_tokens, p.body_tokens,
-                         windows.window_tokens) AS search_tokens,
+                         p.key_tokens, windows.window_tokens) AS search_tokens,
                coalesce(atoms.atom_text, '') AS atom_text
-          FROM disclosure_public.document_units_v2 u
+          FROM disclosure_public.document_units_v1 u
           JOIN disclosure_public.unit_search_projection_v1 p USING (asset_id)
           LEFT JOIN windows USING (asset_id)
           LEFT JOIN atoms USING (asset_id)
@@ -387,6 +388,40 @@ def _ndcg_at(
     return _dcg(actual) / ideal_dcg if ideal_dcg else 1.0
 
 
+def _ranking_metrics(
+    ranking: Sequence[tuple[int, Identity, Mapping[str, Any], tuple[str, ...]]],
+    *,
+    grades: Mapping[Identity, int],
+    mechanical_forbidden: set[Identity],
+) -> dict[str, float | int | bool]:
+    identities = tuple(item[1] for item in ranking)
+    top5 = identities[:5]
+    top10 = identities[:10]
+    return {
+        "success_at_5": any(grades[identity] == 3 for identity in top5),
+        "grade3_recall_at_20": round(
+            _recall_at(identities, grades, k=20, minimum_grade=3), 6
+        ),
+        "grade2_recall_at_10": round(
+            _recall_at(identities, grades, k=10, minimum_grade=2), 6
+        ),
+        "grade2_recall_at_20": round(
+            _recall_at(identities, grades, k=20, minimum_grade=2), 6
+        ),
+        "ndcg_at_10": round(_ndcg_at(identities, grades, k=10), 6),
+        "returned_precision_at_5": round(
+            _returned_precision_at(identities, grades, k=5, minimum_grade=1), 6
+        ),
+        "returned_precision_at_10": round(
+            _returned_precision_at(identities, grades, k=10, minimum_grade=1), 6
+        ),
+        "grade0_top5": sum(grades[identity] == 0 for identity in top5),
+        "mechanical_top10": sum(
+            identity in mechanical_forbidden for identity in top10
+        ),
+    }
+
+
 def _graded_case_result(
     case: Mapping[str, Any],
     *,
@@ -513,31 +548,16 @@ def _graded_case_result(
             f"{unjudged[:5]}"
         )
 
-    full = rankings["full"]
-    identities = tuple(item[1] for item in full)
-    top5 = identities[:5]
-    top10 = identities[:10]
-    metrics = {
-        "success_at_5": any(grades[identity] == 3 for identity in top5),
-        "grade3_recall_at_20": round(
-            _recall_at(identities, grades, k=20, minimum_grade=3), 6
-        ),
-        "grade2_recall_at_10": round(
-            _recall_at(identities, grades, k=10, minimum_grade=2), 6
-        ),
-        "grade2_recall_at_20": round(
-            _recall_at(identities, grades, k=20, minimum_grade=2), 6
-        ),
-        "ndcg_at_10": round(_ndcg_at(identities, grades, k=10), 6),
-        "returned_precision_at_5": round(
-            _returned_precision_at(identities, grades, k=5, minimum_grade=1), 6
-        ),
-        "returned_precision_at_10": round(
-            _returned_precision_at(identities, grades, k=10, minimum_grade=1), 6
-        ),
-        "grade0_top5": sum(grades[identity] == 0 for identity in top5),
-        "mechanical_top10": sum(identity in mechanical_forbidden for identity in top10),
+    metrics_by_mode = {
+        mode: _ranking_metrics(
+            ranking,
+            grades=grades,
+            mechanical_forbidden=mechanical_forbidden,
+        )
+        for mode, ranking in rankings.items()
     }
+    full = rankings["full"]
+    metrics = metrics_by_mode["full"]
     return {
         "id": case_id,
         "query": query,
@@ -546,6 +566,26 @@ def _graded_case_result(
         "filing_types_preferred": sorted(filing_types_preferred),
         "intent": intent,
         "metrics": metrics,
+        "ablation_metrics": {
+            mode: values
+            for mode, values in metrics_by_mode.items()
+            if mode != "full"
+        },
+        "contribution_delta_from_full": {
+            mode: {
+                key: round(float(metrics[key]) - float(values[key]), 6)
+                for key in (
+                    "grade3_recall_at_20",
+                    "grade2_recall_at_10",
+                    "grade2_recall_at_20",
+                    "ndcg_at_10",
+                    "returned_precision_at_5",
+                    "returned_precision_at_10",
+                )
+            }
+            for mode, values in metrics_by_mode.items()
+            if mode != "full"
+        },
         "ablations": {
             mode: [
                 [identity[0], identity[1]]
@@ -679,6 +719,56 @@ def _mean(values: Sequence[float]) -> float:
     return sum(values) / len(values)
 
 
+def _aggregate_graded_metrics(
+    results: Sequence[Mapping[str, Any]],
+    *,
+    mode: str,
+) -> dict[str, float | int]:
+    values = [
+        (
+            result["metrics"]
+            if mode == "full"
+            else result["ablation_metrics"][mode]
+        )
+        for result in results
+    ]
+    return {
+        "success_at_5": _mean(
+            [float(metrics["success_at_5"]) for metrics in values]
+        ),
+        "grade3_recall_at_20": _mean(
+            [float(metrics["grade3_recall_at_20"]) for metrics in values]
+        ),
+        "grade2_recall_at_10": _mean(
+            [float(metrics["grade2_recall_at_10"]) for metrics in values]
+        ),
+        "grade2_recall_at_20": _mean(
+            [float(metrics["grade2_recall_at_20"]) for metrics in values]
+        ),
+        "ndcg_at_10": _mean(
+            [float(metrics["ndcg_at_10"]) for metrics in values]
+        ),
+        "narrow_returned_precision_at_5": _mean(
+            [
+                float(metrics["returned_precision_at_5"])
+                for result, metrics in zip(results, values, strict=True)
+                if result["intent"] == "narrow"
+            ]
+        ),
+        "broad_returned_precision_at_10": _mean(
+            [
+                float(metrics["returned_precision_at_10"])
+                for result, metrics in zip(results, values, strict=True)
+                if result["intent"] == "broad"
+            ]
+        ),
+        "max_grade0_top5": max(int(metrics["grade0_top5"]) for metrics in values),
+        "max_mechanical_top10": max(
+            int(metrics["mechanical_top10"]) for metrics in values
+        ),
+    }
+
+
 def review(
     *,
     evaluation: Mapping[str, Any],
@@ -718,12 +808,32 @@ def review(
     invalid_contracts = sorted(
         identity
         for identity, row in search_rows.items()
-        if row.get("contract_version") != "document_unit.v2"
+        if row.get("contract_version") != "document_unit.v1"
     )
     if invalid_contracts:
         raise ValueError(
-            "public search rows are not from document_unit.v2: "
-            f"{invalid_contracts[:5]}"
+            f"public search rows are not from document_unit.v1: {invalid_contracts[:5]}"
+        )
+    invalid_body_status = sorted(
+        identity
+        for identity, row in search_rows.items()
+        if row.get("body_status") not in {"content", "heading_only", "empty"}
+    )
+    if invalid_body_status:
+        raise ValueError(
+            "public search rows have invalid body_status: "
+            f"{invalid_body_status[:5]}"
+        )
+    direct_noncontent = sorted(
+        identity
+        for identity, semantic in semantic_rows.items()
+        if semantic.get("semantic_keys")
+        and search_rows[identity].get("body_status") != "content"
+    )
+    if direct_noncontent:
+        raise ValueError(
+            "non-content Units cannot carry direct semantic keys: "
+            f"{direct_noncontent[:5]}"
         )
     if require_hashes:
         query_mismatches = [
@@ -837,43 +947,7 @@ def review(
         )
         for case in cases
     ]
-    metrics = {
-        "success_at_5": _mean(
-            [float(result["metrics"]["success_at_5"]) for result in results]
-        ),
-        "grade3_recall_at_20": _mean(
-            [float(result["metrics"]["grade3_recall_at_20"]) for result in results]
-        ),
-        "grade2_recall_at_10": _mean(
-            [float(result["metrics"]["grade2_recall_at_10"]) for result in results]
-        ),
-        "grade2_recall_at_20": _mean(
-            [float(result["metrics"]["grade2_recall_at_20"]) for result in results]
-        ),
-        "ndcg_at_10": _mean(
-            [float(result["metrics"]["ndcg_at_10"]) for result in results]
-        ),
-        "narrow_returned_precision_at_5": _mean(
-            [
-                float(result["metrics"]["returned_precision_at_5"])
-                for result in results
-                if result["intent"] == "narrow"
-            ]
-        ),
-        "broad_returned_precision_at_10": _mean(
-            [
-                float(result["metrics"]["returned_precision_at_10"])
-                for result in results
-                if result["intent"] == "broad"
-            ]
-        ),
-        "max_grade0_top5": max(
-            int(result["metrics"]["grade0_top5"]) for result in results
-        ),
-        "max_mechanical_top10": max(
-            int(result["metrics"]["mechanical_top10"]) for result in results
-        ),
-    }
+    metrics = _aggregate_graded_metrics(results, mode="full")
     rounded_metrics = {
         key: round(value, 6) if isinstance(value, float) else value
         for key, value in metrics.items()
@@ -887,6 +961,32 @@ def review(
             else rounded_metrics[key] < thresholds[key]
         )
     ]
+    ablation_metrics = {
+        mode: {
+            key: round(value, 6) if isinstance(value, float) else value
+            for key, value in _aggregate_graded_metrics(results, mode=mode).items()
+        }
+        for mode in (
+            "without_direct",
+            "without_section",
+            "without_lexical",
+            "without_neighbors",
+        )
+    }
+    contribution_deltas = {
+        mode: {
+            key: round(float(rounded_metrics[key]) - float(values[key]), 6)
+            for key in (
+                "grade3_recall_at_20",
+                "grade2_recall_at_10",
+                "grade2_recall_at_20",
+                "ndcg_at_10",
+                "narrow_returned_precision_at_5",
+                "broad_returned_precision_at_10",
+            )
+        }
+        for mode, values in ablation_metrics.items()
+    }
     return {
         "contract_version": "semantic_retrieval_query_review.v4",
         "evaluation_id": evaluation.get("evaluation_id"),
@@ -899,6 +999,16 @@ def review(
         "judgment_pool_complete": True,
         "query_hash_bound": True,
         "metrics": rounded_metrics,
+        "ablation_metrics": ablation_metrics,
+        "contribution_delta_from_full": contribution_deltas,
+        "contributed_case_count": {
+            mode: sum(
+                float(result["metrics"]["ndcg_at_10"])
+                > float(result["ablation_metrics"][mode]["ndcg_at_10"])
+                for result in results
+            )
+            for mode in ablation_metrics
+        },
         "thresholds": thresholds,
         "passed": not findings,
         "findings": findings,

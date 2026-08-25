@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
@@ -21,13 +21,18 @@ from disclosure_anchor.application.services.subject_resolver import (
     SubjectCandidate,
     SubjectResolver,
 )
+from disclosure_anchor.application.services.cninfo_profile_access import (
+    CNINFO_PROFILE_INTERFACE,
+    add_cninfo_profile_access,
+    add_failed_cninfo_profile_access,
+)
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import DisclosureAnchorError, SourceRequestError
 
 
 CNINFO_PROVIDER = "cninfo"
-PROFILE_INTERFACE = "cninfo:p_stock2100"
+PROFILE_INTERFACE = CNINFO_PROFILE_INTERFACE
 INDEX_INTERFACE = "cninfo:p_info3015"
 # Credential-free public-website channel (same provider namespace; see
 # adapters/sources/cninfo/web_source.py for the verified id/size equivalence).
@@ -185,6 +190,7 @@ class SyncDisclosureIndex:
                 uow=uow,
                 command=command,
                 profile=profile,
+                profile_access=profile_access,
             )
             self._record_cninfo_org_identifier(
                 uow=uow,
@@ -276,26 +282,11 @@ class SyncDisclosureIndex:
         now: datetime,
     ) -> e.SourceAccess:
         with self._uow_factory() as uow:
-            access = uow.source_accesses.add(
-                e.SourceAccess(
-                    source_access_id=ids.new_source_access_id(),
-                    provider=CNINFO_PROVIDER,
-                    provider_interface="cninfo:p_stock2100",
-                    dataset_key="p_stock2100",
-                    query_params={"scode": command.security_code},
-                    accessed_at=now,
-                    status="failed",
-                    error=_json(
-                        error.to_error(stage="profile")
-                        if isinstance(error, SourceRequestError)
-                        else {
-                            "stage": "profile",
-                            "error_code": type(error).__name__,
-                            "retryable": False,
-                        }
-                    ),
-                    result_snapshot={"reason": str(error)},
-                )
+            access = add_failed_cninfo_profile_access(
+                uow=uow,
+                security_code=command.security_code,
+                error=error,
+                accessed_at=now,
             )
             uow.commit()
         return access
@@ -308,29 +299,11 @@ class SyncDisclosureIndex:
         profile: SourceCompanyProfile | None,
         now: datetime,
     ) -> e.SourceAccess:
-        snapshot: dict[str, object]
-        status: str
-        error: str | None = None
-        if profile is None:
-            status = "warning"
-            snapshot = {"warning": "p_stock2100 profile unavailable"}
-            error = _json({"stage": "index", "error_code": "profile_unavailable", "retryable": True})
-        else:
-            status = "ok"
-            snapshot = {"profile": asdict(profile)}
-        return uow.source_accesses.add(
-            e.SourceAccess(
-                source_access_id=ids.new_source_access_id(),
-                provider=CNINFO_PROVIDER,
-                provider_interface=PROFILE_INTERFACE,
-                dataset_key="p_stock2100",
-                query_params={"scode": command.security_code},
-                accessed_at=now,
-                status=status,
-                result_hash=_canonical_sha256(snapshot),
-                error=error,
-                result_snapshot=snapshot,
-            )
+        return add_cninfo_profile_access(
+            uow=uow,
+            security_code=command.security_code,
+            profile=profile,
+            accessed_at=now,
         )
 
     def _resolve_subject(
@@ -339,6 +312,7 @@ class SyncDisclosureIndex:
         uow: UnitOfWork,
         command: SyncDisclosureIndexCommand,
         profile: SourceCompanyProfile | None,
+        profile_access: e.SourceAccess,
     ) -> Any:
         # No profile (e.g. web fallback channel) → no legal-name claim; the
         # resolver treats None as "unknown", never as a conflicting name.
@@ -351,6 +325,16 @@ class SyncDisclosureIndex:
                 legal_name=legal_name,
                 board=_board_from_exchange(command.exchange),
                 credit_code=profile.uscc if profile else None,
+                identifier_source_access_id=(
+                    profile_access.source_access_id
+                    if profile is not None and profile.uscc
+                    else None
+                ),
+                identifier_observed_at=(
+                    profile_access.accessed_at
+                    if profile is not None and profile.uscc
+                    else None
+                ),
             ),
         )
 

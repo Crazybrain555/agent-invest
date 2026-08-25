@@ -8,10 +8,14 @@ import re
 from typing import Literal, cast, get_args
 
 
-SEMANTIC_ROUTE_RECEIPT_VERSION = "semantic_route_receipt.v1"
-SEMANTIC_ROUTE_RECEIPTS_FILENAME = "semantic_route_receipts.v1.jsonl"
-SEMANTIC_ROUTER_VERSION = "semantic_router.v77"
-SEMANTIC_PROMPT_VERSION = "semantic_route_adjudication.v31"
+SEMANTIC_ROUTE_RECEIPT_V1 = "semantic_route_receipt.v1"
+SEMANTIC_ROUTE_RECEIPT_VERSION = "semantic_route_receipt.v2"
+SEMANTIC_ROUTE_RECEIPTS_V1_FILENAME = "semantic_route_receipts.v1.jsonl"
+SEMANTIC_ROUTE_RECEIPTS_FILENAME = "semantic_route_receipts.v2.jsonl"
+SEMANTIC_FAILOVER_POLICY_VERSION = "availability_only.v1"
+SEMANTIC_OUTPUT_SCHEMA_VERSION = "semantic_route_output.v1"
+SEMANTIC_ROUTER_VERSION = "semantic_router.v101"
+SEMANTIC_PROMPT_VERSION = "semantic_route_adjudication.v32"
 SEMANTIC_FALLBACK_KEY = "document_content"
 MAX_SEMANTIC_ROUTES = 8
 MAX_SEMANTIC_ROUTES_PER_UNIT = MAX_SEMANTIC_ROUTES
@@ -19,13 +23,23 @@ MAX_SEMANTIC_CANDIDATES = 8
 
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,127}$")
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_ROUTER_VERSION_RE = re.compile(r"^semantic_router\.v[1-9][0-9]*$")
 
 SemanticRouteDecisionSource = Literal[
     "deterministic",
     "rule_abstain",
+    "adjudicator_unavailable_abstain",
     "model",
     "model_abstain",
     "fallback",
+]
+SemanticProviderAttemptOutcome = Literal[
+    "cache_hit",
+    "succeeded",
+    "succeeded_cache_write_failed",
+    "availability_failed",
+    "cancelled",
+    "failed_closed",
 ]
 SemanticRouteSourceKind = Literal[
     "unit_title",
@@ -41,6 +55,7 @@ SemanticRouteSourceKind = Literal[
 ]
 SemanticRouteEvidenceKind = Literal[
     "source_heading_exact",
+    "source_section_exact",
     "source_heading_candidate",
     "source_heading_similarity",
     "source_heading_risk_suffix",
@@ -67,6 +82,7 @@ class SemanticRouteDefinition:
     key: str
     description: str
     labels: tuple[str, ...]
+    heading_labels: tuple[str, ...] = ()
     scopes: tuple[str, ...] = ()
     exclusive_container: bool = False
     overview_container: bool = False
@@ -90,6 +106,18 @@ class SemanticRouteDefinition:
             raise SemanticRouteContractError(
                 f"semantic route {self.key} repeats a label"
             )
+        if any(not label.strip() for label in self.heading_labels):
+            raise SemanticRouteContractError(
+                f"semantic route {self.key} has an empty heading label"
+            )
+        if len(self.heading_labels) != len(set(self.heading_labels)):
+            raise SemanticRouteContractError(
+                f"semantic route {self.key} repeats a heading label"
+            )
+        if set(self.labels) & set(self.heading_labels):
+            raise SemanticRouteContractError(
+                f"semantic route {self.key} repeats a label across evidence tiers"
+            )
         if len(self.scopes) != len(set(self.scopes)):
             raise SemanticRouteContractError(
                 f"semantic route {self.key} repeats a scope"
@@ -103,7 +131,6 @@ class SemanticRouteDefinition:
         if self.section_container and (
             self.context_container
             or self.exclusive_container
-            or self.overview_container
         ):
             raise SemanticRouteContractError(
                 f"semantic route {self.key} has an invalid section-container policy"
@@ -154,6 +181,7 @@ class SemanticRouteTaxonomy:
     version: str
     definitions: tuple[SemanticRouteDefinition, ...]
     composite_sections: tuple[SemanticCompositeSection, ...] = ()
+    direct_composites: tuple[SemanticCompositeSection, ...] = ()
     fallback_key: str = SEMANTIC_FALLBACK_KEY
 
     def __post_init__(self) -> None:
@@ -168,7 +196,10 @@ class SemanticRouteTaxonomy:
             if item.context_container or item.section_container
         )
         for index, left in enumerate(context_definitions):
-            left_labels = {_normalize_context_label(label) for label in left.labels}
+            left_labels = {
+                _normalize_context_label(label)
+                for label in (*left.labels, *left.heading_labels)
+            }
             for right in context_definitions[index + 1 :]:
                 scopes_overlap = (
                     not left.scopes
@@ -176,14 +207,15 @@ class SemanticRouteTaxonomy:
                     or bool(set(left.scopes) & set(right.scopes))
                 )
                 if scopes_overlap and left_labels & {
-                    _normalize_context_label(label) for label in right.labels
+                    _normalize_context_label(label)
+                    for label in (*right.labels, *right.heading_labels)
                 }:
                     raise SemanticRouteContractError(
                         "semantic context labels collide within one scope"
                     )
         definitions_by_key = self.by_key()
         composite_labels: set[str] = set()
-        for composite in self.composite_sections:
+        for composite in (*self.composite_sections, *self.direct_composites):
             normalized = _normalize_context_label(composite.label)
             if normalized in composite_labels:
                 raise SemanticRouteContractError(
@@ -192,11 +224,9 @@ class SemanticRouteTaxonomy:
             composite_labels.add(normalized)
             for key in composite.keys:
                 definition = definitions_by_key.get(key)
-                if definition is None or not (
-                    definition.context_container or definition.section_container
-                ):
+                if definition is None:
                     raise SemanticRouteContractError(
-                        "semantic composite section references a non-section key"
+                        "semantic composite section references an unknown key"
                     )
 
     def by_key(self) -> dict[str, SemanticRouteDefinition]:
@@ -333,6 +363,113 @@ class SemanticAdjudicationDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticProviderIdentity:
+    """Exact configured and attested identity of one adjudication provider."""
+
+    provider_id: str
+    provider: str
+    adapter_kind: str
+    adapter_version: str
+    canonical_model: str
+    inference_profile: str
+    prompt_version: str
+    prompt_sha256: str
+    output_schema_version: str
+    output_schema_sha256: str
+
+    def __post_init__(self) -> None:
+        if not all(
+            (
+                self.provider_id,
+                self.provider,
+                self.adapter_kind,
+                self.adapter_version,
+                self.canonical_model,
+                self.inference_profile,
+                self.prompt_version,
+                self.output_schema_version,
+            )
+        ):
+            raise SemanticRouteContractError("semantic provider identity is incomplete")
+        if not _SHA256_RE.fullmatch(self.prompt_sha256) or not _SHA256_RE.fullmatch(
+            self.output_schema_sha256
+        ):
+            raise SemanticRouteContractError("semantic provider contract hash is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticProviderAttempt:
+    """One ordered provider/cache attempt for a fixed adjudication group."""
+
+    ordinal: int
+    provider: SemanticProviderIdentity
+    outcome: SemanticProviderAttemptOutcome
+    reason_code: str | None = None
+    availability_abstain_eligible: bool = False
+    cache_key: str | None = None
+    response_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 1:
+            raise SemanticRouteContractError("semantic provider attempt ordinal is invalid")
+        if self.cache_key is not None and not _SHA256_RE.fullmatch(self.cache_key):
+            raise SemanticRouteContractError("semantic provider cache key is invalid")
+        if self.response_sha256 is not None and not _SHA256_RE.fullmatch(
+            self.response_sha256
+        ):
+            raise SemanticRouteContractError("semantic provider response hash is invalid")
+        if self.outcome in {"cache_hit", "succeeded", "succeeded_cache_write_failed"}:
+            if self.reason_code is not None or self.response_sha256 is None:
+                raise SemanticRouteContractError("successful provider attempt is inconsistent")
+        elif not self.reason_code:
+            raise SemanticRouteContractError("failed provider attempt needs a reason")
+        if self.availability_abstain_eligible != (
+            self.outcome == "availability_failed"
+        ):
+            raise SemanticRouteContractError("provider availability marker is inconsistent")
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticAdjudicationReceipt:
+    """Group-level provider lineage copied into every affected Unit receipt."""
+
+    policy_version: str
+    group_hash: str
+    attempts: tuple[SemanticProviderAttempt, ...]
+    actual_result_attempt: int | None
+    actual_result_identity: SemanticProviderIdentity | None
+    group_response_sha256: str | None
+
+    def __post_init__(self) -> None:
+        if self.policy_version != SEMANTIC_FAILOVER_POLICY_VERSION:
+            raise SemanticRouteContractError("semantic failover policy is unsupported")
+        if not _SHA256_RE.fullmatch(self.group_hash) or not self.attempts:
+            raise SemanticRouteContractError("semantic adjudication receipt is incomplete")
+        if tuple(item.ordinal for item in self.attempts) != tuple(
+            range(1, len(self.attempts) + 1)
+        ):
+            raise SemanticRouteContractError("semantic provider attempts are not contiguous")
+        has_result = self.actual_result_attempt is not None
+        if has_result != (self.actual_result_identity is not None):
+            raise SemanticRouteContractError("semantic actual-result identity is inconsistent")
+        if has_result != (self.group_response_sha256 is not None):
+            raise SemanticRouteContractError("semantic group-response hash is inconsistent")
+        if has_result:
+            assert self.actual_result_attempt is not None
+            if self.actual_result_attempt > len(self.attempts):
+                raise SemanticRouteContractError("semantic actual-result attempt is invalid")
+            attempt = self.attempts[self.actual_result_attempt - 1]
+            if attempt.provider != self.actual_result_identity:
+                raise SemanticRouteContractError("semantic actual-result provider drifted")
+            if attempt.response_sha256 != self.group_response_sha256:
+                raise SemanticRouteContractError("semantic actual-result hash drifted")
+        elif not all(item.availability_abstain_eligible for item in self.attempts):
+            raise SemanticRouteContractError(
+                "semantic unavailable abstention contains a non-availability failure"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class SemanticAdjudicatorMetadata:
     """Auditable identity for a model decision or its exact cache replay."""
 
@@ -381,19 +518,32 @@ class SemanticRouteReceipt:
     decision_source: SemanticRouteDecisionSource
     evidence: tuple[SemanticRouteEvidence, ...]
     adjudicator: SemanticAdjudicatorMetadata | None = None
-    contract_version: str = SEMANTIC_ROUTE_RECEIPT_VERSION
+    adjudication: SemanticAdjudicationReceipt | None = None
+    # Existing constructors remain v1 for deterministic replay.  New runtime
+    # writers opt in to v2 explicitly after producing provider-attempt lineage.
+    contract_version: str = SEMANTIC_ROUTE_RECEIPT_V1
 
     def __post_init__(self) -> None:
-        if self.contract_version != SEMANTIC_ROUTE_RECEIPT_VERSION:
+        if self.contract_version not in {
+            SEMANTIC_ROUTE_RECEIPT_V1,
+            SEMANTIC_ROUTE_RECEIPT_VERSION,
+        }:
             raise SemanticRouteContractError("semantic route receipt version is unsupported")
-        if not self.taxonomy_version or self.router_version != SEMANTIC_ROUTER_VERSION:
+        # Receipt artifacts are immutable evidence and older router generations
+        # must remain structurally readable by Doctor.  Current-router equality
+        # is a replay concern and is enforced by SemanticRouter._validate_receipt.
+        if not self.taxonomy_version or not _ROUTER_VERSION_RE.fullmatch(
+            self.router_version
+        ):
             raise SemanticRouteContractError("semantic route receipt identity is invalid")
         if not _SHA256_RE.fullmatch(self.input_hash):
             raise SemanticRouteContractError("semantic route receipt input hash is invalid")
         if len(self.candidate_keys) != len(set(self.candidate_keys)):
             raise SemanticRouteContractError("semantic route receipt repeats a candidate")
-        if not self.semantic_keys or len(self.semantic_keys) > MAX_SEMANTIC_ROUTES:
-            raise SemanticRouteContractError("semantic route receipt needs routes")
+        if len(self.semantic_keys) > MAX_SEMANTIC_ROUTES:
+            raise SemanticRouteContractError("semantic route receipt has too many routes")
+        if self.contract_version == SEMANTIC_ROUTE_RECEIPT_V1 and not self.semantic_keys:
+            raise SemanticRouteContractError("semantic route v1 receipt needs routes")
         if len(self.semantic_keys) != len(set(self.semantic_keys)):
             raise SemanticRouteContractError("semantic route receipt repeats a route")
         evidence_keys = tuple(item.key for item in self.evidence)
@@ -401,9 +551,21 @@ class SemanticRouteReceipt:
             raise SemanticRouteContractError(
                 "semantic route receipt evidence must follow every selected route"
             )
+        if self.contract_version == SEMANTIC_ROUTE_RECEIPT_V1:
+            if self.adjudication is not None:
+                raise SemanticRouteContractError("semantic route v1 cannot carry v2 adjudication")
+        elif self.adjudicator is not None:
+            raise SemanticRouteContractError("semantic route v2 cannot carry v1 adjudicator")
         if self.decision_source in {"model", "model_abstain"}:
-            if self.adjudicator is None:
-                raise SemanticRouteContractError("model route receipt needs adjudicator metadata")
+            if self.contract_version == SEMANTIC_ROUTE_RECEIPT_V1:
+                if self.adjudicator is None:
+                    raise SemanticRouteContractError(
+                        "model route receipt needs adjudicator metadata"
+                    )
+            elif self.adjudication is None or self.adjudication.actual_result_identity is None:
+                raise SemanticRouteContractError(
+                    "semantic route v2 model receipt needs actual-result identity"
+                )
             if self.decision_source == "model" and any(
                 key not in self.candidate_keys for key in self.semantic_keys
             ):
@@ -412,9 +574,36 @@ class SemanticRouteReceipt:
             raise SemanticRouteContractError(
                 "non-model route receipt cannot claim adjudicator metadata"
             )
-        if self.decision_source in {"fallback", "rule_abstain", "model_abstain"}:
-            if self.semantic_keys != (SEMANTIC_FALLBACK_KEY,):
-                raise SemanticRouteContractError("fallback receipt must be fallback-only")
+        if self.decision_source == "adjudicator_unavailable_abstain":
+            if self.contract_version != SEMANTIC_ROUTE_RECEIPT_VERSION:
+                raise SemanticRouteContractError(
+                    "unavailable abstention requires semantic route receipt v2"
+                )
+            if self.adjudication is None or self.adjudication.actual_result_identity is not None:
+                raise SemanticRouteContractError(
+                    "unavailable abstention needs exhausted provider attempts"
+                )
+        elif self.decision_source not in {"model", "model_abstain"} and self.adjudication:
+            raise SemanticRouteContractError(
+                "non-adjudicated route receipt cannot claim provider attempts"
+            )
+        if self.decision_source in {
+            "fallback",
+            "rule_abstain",
+            "model_abstain",
+        }:
+            expected = (
+                (SEMANTIC_FALLBACK_KEY,)
+                if self.contract_version == SEMANTIC_ROUTE_RECEIPT_V1
+                else ()
+            )
+            if self.semantic_keys != expected:
+                raise SemanticRouteContractError("abstain receipt selected routes are invalid")
+        elif self.decision_source == "adjudicator_unavailable_abstain":
+            if self.semantic_keys:
+                raise SemanticRouteContractError(
+                    "unavailable abstention cannot invent a semantic route"
+                )
         elif SEMANTIC_FALLBACK_KEY in self.semantic_keys:
             raise SemanticRouteContractError(
                 "narrow semantic routes cannot include the fallback key"
@@ -422,7 +611,7 @@ class SemanticRouteReceipt:
 
     @property
     def semantic_key(self) -> str:
-        return self.semantic_keys[0]
+        return self.semantic_keys[0] if self.semantic_keys else SEMANTIC_FALLBACK_KEY
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,6 +656,29 @@ def semantic_route_receipt_row_from_payload(payload: object) -> SemanticRouteRec
 def semantic_route_receipt_to_payload(receipt: SemanticRouteReceipt) -> dict[str, object]:
     """Serialize a receipt as a closed private snapshot object."""
 
+    if receipt.contract_version == SEMANTIC_ROUTE_RECEIPT_VERSION:
+        return {
+            "adjudication": (
+                None
+                if receipt.adjudication is None
+                else _adjudication_receipt_to_payload(receipt.adjudication)
+            ),
+            "candidate_keys": list(receipt.candidate_keys),
+            "contract_version": receipt.contract_version,
+            "decision_source": receipt.decision_source,
+            "evidence": [
+                {
+                    "key": item.key,
+                    "kinds": list(item.kinds),
+                    "source_ids": list(item.source_ids),
+                }
+                for item in receipt.evidence
+            ],
+            "input_hash": receipt.input_hash,
+            "router_version": receipt.router_version,
+            "selected_keys": list(receipt.semantic_keys),
+            "taxonomy_version": receipt.taxonomy_version,
+        }
     return {
         "adjudicator": (
             None
@@ -499,7 +711,15 @@ def semantic_route_receipt_to_payload(receipt: SemanticRouteReceipt) -> dict[str
 
 
 def semantic_route_receipt_from_payload(payload: object) -> SemanticRouteReceipt:
-    """Decode one private snapshot receipt with no legacy fallback."""
+    """Decode one private snapshot receipt by its frozen contract version."""
+
+    if not isinstance(payload, Mapping):
+        raise SemanticRouteContractError("semantic route receipt must be an object")
+    contract_version = payload.get("contract_version")
+    if contract_version == SEMANTIC_ROUTE_RECEIPT_VERSION:
+        return _semantic_route_receipt_v2_from_payload(payload)
+    if contract_version != SEMANTIC_ROUTE_RECEIPT_V1:
+        raise SemanticRouteContractError("semantic route receipt version is unsupported")
 
     root = _closed_mapping(
         payload,
@@ -576,6 +796,205 @@ def semantic_route_receipt_from_payload(payload: object) -> SemanticRouteReceipt
     )
 
 
+def _semantic_route_receipt_v2_from_payload(
+    payload: object,
+) -> SemanticRouteReceipt:
+    root = _closed_mapping(
+        payload,
+        fields={
+            "adjudication",
+            "candidate_keys",
+            "contract_version",
+            "decision_source",
+            "evidence",
+            "input_hash",
+            "router_version",
+            "selected_keys",
+            "taxonomy_version",
+        },
+        label="semantic route receipt v2",
+    )
+    decision_source = _text(root["decision_source"], label="decision source")
+    if decision_source not in {
+        "deterministic",
+        "rule_abstain",
+        "adjudicator_unavailable_abstain",
+        "model",
+        "model_abstain",
+        "fallback",
+    }:
+        raise SemanticRouteContractError("semantic decision source is unsupported")
+    raw_adjudication = root["adjudication"]
+    adjudication = (
+        None
+        if raw_adjudication is None
+        else _adjudication_receipt_from_payload(raw_adjudication)
+    )
+    return SemanticRouteReceipt(
+        contract_version=SEMANTIC_ROUTE_RECEIPT_VERSION,
+        taxonomy_version=_text(root["taxonomy_version"], label="taxonomy version"),
+        router_version=_text(root["router_version"], label="router version"),
+        input_hash=_text(root["input_hash"], label="semantic input hash"),
+        candidate_keys=tuple(
+            _text(item, label="candidate key")
+            for item in _array(root["candidate_keys"], label="candidate keys")
+        ),
+        semantic_keys=tuple(
+            _text(item, label="selected key")
+            for item in _array(root["selected_keys"], label="selected keys")
+        ),
+        decision_source=cast(SemanticRouteDecisionSource, decision_source),
+        evidence=tuple(
+            _evidence_from_payload(item)
+            for item in _array(root["evidence"], label="semantic route evidence")
+        ),
+        adjudication=adjudication,
+    )
+
+
+def _provider_identity_to_payload(
+    identity: SemanticProviderIdentity,
+) -> dict[str, object]:
+    return {
+        "adapter_kind": identity.adapter_kind,
+        "adapter_version": identity.adapter_version,
+        "canonical_model": identity.canonical_model,
+        "inference_profile": identity.inference_profile,
+        "output_schema_sha256": identity.output_schema_sha256,
+        "output_schema_version": identity.output_schema_version,
+        "prompt_sha256": identity.prompt_sha256,
+        "prompt_version": identity.prompt_version,
+        "provider": identity.provider,
+        "provider_id": identity.provider_id,
+    }
+
+
+def _provider_identity_from_payload(payload: object) -> SemanticProviderIdentity:
+    fields = {
+        "adapter_kind",
+        "adapter_version",
+        "canonical_model",
+        "inference_profile",
+        "output_schema_sha256",
+        "output_schema_version",
+        "prompt_sha256",
+        "prompt_version",
+        "provider",
+        "provider_id",
+    }
+    item = _closed_mapping(payload, fields=fields, label="semantic provider identity")
+    return SemanticProviderIdentity(
+        **{field: _text(item[field], label=field) for field in fields}
+    )
+
+
+def _provider_attempt_to_payload(attempt: SemanticProviderAttempt) -> dict[str, object]:
+    return {
+        "availability_abstain_eligible": attempt.availability_abstain_eligible,
+        "cache_key": attempt.cache_key,
+        "ordinal": attempt.ordinal,
+        "outcome": attempt.outcome,
+        "provider": _provider_identity_to_payload(attempt.provider),
+        "reason_code": attempt.reason_code,
+        "response_sha256": attempt.response_sha256,
+    }
+
+
+def _provider_attempt_from_payload(payload: object) -> SemanticProviderAttempt:
+    item = _closed_mapping(
+        payload,
+        fields={
+            "availability_abstain_eligible",
+            "cache_key",
+            "ordinal",
+            "outcome",
+            "provider",
+            "reason_code",
+            "response_sha256",
+        },
+        label="semantic provider attempt",
+    )
+    ordinal = item["ordinal"]
+    availability = item["availability_abstain_eligible"]
+    if type(ordinal) is not int or type(availability) is not bool:
+        raise SemanticRouteContractError("semantic provider attempt fields are invalid")
+    outcome = _text(item["outcome"], label="semantic attempt outcome")
+    if outcome not in set(get_args(SemanticProviderAttemptOutcome)):
+        raise SemanticRouteContractError("semantic provider attempt outcome is unsupported")
+    reason = item["reason_code"]
+    cache_key = item["cache_key"]
+    response_hash = item["response_sha256"]
+    for value, label in (
+        (reason, "semantic attempt reason"),
+        (cache_key, "semantic attempt cache key"),
+        (response_hash, "semantic attempt response hash"),
+    ):
+        if value is not None and (not isinstance(value, str) or not value):
+            raise SemanticRouteContractError(f"{label} is invalid")
+    return SemanticProviderAttempt(
+        ordinal=ordinal,
+        provider=_provider_identity_from_payload(item["provider"]),
+        outcome=cast(SemanticProviderAttemptOutcome, outcome),
+        reason_code=cast(str | None, reason),
+        availability_abstain_eligible=availability,
+        cache_key=cast(str | None, cache_key),
+        response_sha256=cast(str | None, response_hash),
+    )
+
+
+def _adjudication_receipt_to_payload(
+    receipt: SemanticAdjudicationReceipt,
+) -> dict[str, object]:
+    return {
+        "actual_result_attempt": receipt.actual_result_attempt,
+        "actual_result_identity": (
+            None
+            if receipt.actual_result_identity is None
+            else _provider_identity_to_payload(receipt.actual_result_identity)
+        ),
+        "attempts": [_provider_attempt_to_payload(item) for item in receipt.attempts],
+        "group_hash": receipt.group_hash,
+        "group_response_sha256": receipt.group_response_sha256,
+        "policy_version": receipt.policy_version,
+    }
+
+
+def _adjudication_receipt_from_payload(payload: object) -> SemanticAdjudicationReceipt:
+    item = _closed_mapping(
+        payload,
+        fields={
+            "actual_result_attempt",
+            "actual_result_identity",
+            "attempts",
+            "group_hash",
+            "group_response_sha256",
+            "policy_version",
+        },
+        label="semantic adjudication receipt",
+    )
+    actual_attempt = item["actual_result_attempt"]
+    if actual_attempt is not None and type(actual_attempt) is not int:
+        raise SemanticRouteContractError("semantic actual-result attempt is invalid")
+    response_hash = item["group_response_sha256"]
+    if response_hash is not None and not isinstance(response_hash, str):
+        raise SemanticRouteContractError("semantic group-response hash is invalid")
+    return SemanticAdjudicationReceipt(
+        policy_version=_text(item["policy_version"], label="semantic policy version"),
+        group_hash=_text(item["group_hash"], label="semantic group hash"),
+        attempts=tuple(
+            _provider_attempt_from_payload(value)
+            for value in _array(item["attempts"], label="semantic attempts")
+        ),
+        actual_result_attempt=actual_attempt,
+        actual_result_identity=(
+            None
+            if item["actual_result_identity"] is None
+            else _provider_identity_from_payload(item["actual_result_identity"])
+        ),
+        group_response_sha256=response_hash,
+    )
+
+
 def _evidence_from_payload(payload: object) -> SemanticRouteEvidence:
     item = _closed_mapping(
         payload,
@@ -630,11 +1049,16 @@ __all__ = [
     "MAX_SEMANTIC_ROUTES_PER_UNIT",
     "SEMANTIC_FALLBACK_KEY",
     "SEMANTIC_PROMPT_VERSION",
+    "SEMANTIC_FAILOVER_POLICY_VERSION",
+    "SEMANTIC_OUTPUT_SCHEMA_VERSION",
+    "SEMANTIC_ROUTE_RECEIPT_V1",
     "SEMANTIC_ROUTE_RECEIPT_VERSION",
+    "SEMANTIC_ROUTE_RECEIPTS_V1_FILENAME",
     "SEMANTIC_ROUTE_RECEIPTS_FILENAME",
     "SEMANTIC_ROUTER_VERSION",
     "SemanticAdjudicatedRoute",
     "SemanticAdjudicationDecision",
+    "SemanticAdjudicationReceipt",
     "SemanticAdjudicatorMetadata",
     "SemanticDocumentContext",
     "SemanticRouteCandidate",
@@ -646,6 +1070,8 @@ __all__ = [
     "SemanticRouteSource",
     "SemanticRouteTaxonomy",
     "SemanticRouteUnitInput",
+    "SemanticProviderAttempt",
+    "SemanticProviderIdentity",
     "semantic_route_receipt_from_payload",
     "semantic_route_receipt_row_from_payload",
     "semantic_route_receipt_row_to_payload",

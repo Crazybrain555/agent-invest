@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-import re
 import string
 
+from disclosure_anchor.application.contracts.applicability_selector import (
+    applicability_selector_pairs,
+    strip_applicability_selector_pairs,
+)
 from disclosure_anchor.application.contracts.document_outline import (
     CoarseUnit,
     DocumentOutline,
@@ -15,6 +18,7 @@ from disclosure_anchor.application.contracts.document_outline import (
     ResolvedHeading,
 )
 from disclosure_anchor.application.contracts.html_visible_text import (
+    html_qa_row_atoms,
     html_visible_text,
     html_visible_text_segments,
 )
@@ -39,6 +43,7 @@ from disclosure_anchor.application.contracts.provider_unit import (
     ProviderUnitApplicability,
     ProviderUnitDraft,
     ProviderUnitEvidenceArtifact,
+    ProviderUnitHeadingFragmentRef,
     ProviderUnitHeadingRef,
     ProviderUnitLocator,
     ProviderUnitPartKind,
@@ -47,6 +52,7 @@ from disclosure_anchor.application.contracts.provider_unit import (
     ProviderUnitSearchBinding,
     ProviderUnitSearchContractError,
     ProviderUnitSourceTextReconciliation,
+    ProviderUnitSourceQualityFinding,
     provider_unit_locator_from_payload,
 )
 from disclosure_anchor.application.contracts.retrieval_primary import (
@@ -67,27 +73,21 @@ from disclosure_anchor.application.services.retrieval_primary import (
 from disclosure_anchor.domain.services.unit_hashing import compute_unit_hashes
 
 
-_CHECKED_APPLICABILITY_MARKERS = "√☑✓\uf052"
-_UNCHECKED_APPLICABILITY_MARKERS = "□☐"
-_ALL_APPLICABILITY_MARKERS = (
-    _CHECKED_APPLICABILITY_MARKERS + _UNCHECKED_APPLICABILITY_MARKERS
-)
-_HORIZONTAL_SPACE = r"[^\S\r\n]*"
-_APPLICABILITY_PAIR_RE = re.compile(
-    rf"(?P<applicable>[{_ALL_APPLICABILITY_MARKERS}])"
-    rf"{_HORIZONTAL_SPACE}适{_HORIZONTAL_SPACE}用"
-    rf"{_HORIZONTAL_SPACE}"
-    rf"(?P<not_applicable>[{_ALL_APPLICABILITY_MARKERS}])"
-    rf"{_HORIZONTAL_SPACE}不{_HORIZONTAL_SPACE}适{_HORIZONTAL_SPACE}用"
-)
-
-
 @dataclass(frozen=True, slots=True)
 class _Part:
     ref: ProviderUnitPartRef
     provider_type: str
     payload: dict[str, object]
     targets: tuple[RetrievalTarget, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderUnitSearchRowAtom:
+    """One source-target-bound Q&A row for the derived search projection."""
+
+    table_target_id: str
+    source_row_index: int
+    row_text: str
 
 
 def build_provider_units(
@@ -174,28 +174,45 @@ class _BuildContext:
         evidence_only: list[int] = []
         bound_unbound: list[UnboundProviderTablePart] = []
         search_bindings: list[ProviderUnitSearchBinding] = []
-        heading_payload_ordinal: int | None = None
+        leaf_heading_payloads: dict[int, frozenset[int]] = {}
 
         if heading is not None:
-            heading_targets = tuple(
-                target
-                for target in self._targets_for_source(heading.source_index)
-                if target.payload_ordinal == heading.payload_ordinal
-            )
-            if len(heading_targets) != 1:
-                raise ValueError(
-                    "accepted heading must expose exactly one source payload target"
+            fragment_count = len(heading.source_fragments)
+            for fragment_index, fragment in enumerate(heading.source_fragments):
+                heading_targets = tuple(
+                    target
+                    for target in self._targets_for_source(fragment.source_index)
+                    if target.payload_ordinal == fragment.payload_ordinal
                 )
-            target = heading_targets[0]
-            if _source_payload_text(self.document, target) != heading.text:
-                raise ValueError("accepted heading target differs from its source text")
-            search_bindings.append(
-                ProviderUnitSearchBinding(
-                    source=target,
-                    destination=ProviderSearchDestination(kind="unit_title"),
+                if len(heading_targets) != 1:
+                    raise ValueError(
+                        "accepted heading fragment must expose exactly one source target"
+                    )
+                target = heading_targets[0]
+                if _source_payload_text(self.document, target) != fragment.text:
+                    raise ValueError(
+                        "accepted heading fragment differs from its source text"
+                    )
+                search_bindings.append(
+                    ProviderUnitSearchBinding(
+                        source=target,
+                        destination=ProviderSearchDestination(
+                            kind=(
+                                "unit_title"
+                                if fragment_count == 1
+                                else "unit_title_fragment"
+                            ),
+                            item_index=(
+                                None if fragment_count == 1 else fragment_index
+                            ),
+                        ),
+                    )
                 )
-            )
-            heading_payload_ordinal = heading.payload_ordinal
+                leaf_heading_payloads[fragment.source_index] = frozenset(
+                    {fragment.payload_ordinal}
+                )
+            if "".join(item.text for item in heading.source_fragments) != heading.text:
+                raise ValueError("accepted heading differs from its source fragments")
 
         consumed: set[int] = set()
         for source_index in unit.block_source_indices:
@@ -204,7 +221,7 @@ class _BuildContext:
             block = self.blocks[source_index]
             if (
                 heading is not None
-                and source_index == heading.source_index
+                and source_index in leaf_heading_payloads
                 and block.provider_type == "text"
             ):
                 consumed.add(source_index)
@@ -242,12 +259,9 @@ class _BuildContext:
                         index for index in segment_indices if index is not None
                     ),
                     logical_table_index=table_index,
-                    excluded_payload_ordinals=(
-                        frozenset({heading_payload_ordinal})
-                        if heading is not None
-                        and source_index == heading.source_index
-                        and heading_payload_ordinal is not None
-                        else frozenset()
+                    excluded_payload_ordinals=leaf_heading_payloads.get(
+                        source_index,
+                        frozenset(),
                     ),
                 )
                 parts.append(part)
@@ -266,12 +280,9 @@ class _BuildContext:
                         if segment_index is None
                         else (segment_index,),
                         logical_table_index=None,
-                        excluded_payload_ordinals=(
-                            frozenset({heading_payload_ordinal})
-                            if heading is not None
-                            and source_index == heading.source_index
-                            and heading_payload_ordinal is not None
-                            else frozenset()
+                        excluded_payload_ordinals=leaf_heading_payloads.get(
+                            source_index,
+                            frozenset(),
                         ),
                     )
                 )
@@ -298,12 +309,9 @@ class _BuildContext:
                         block_source_indices=(source_index,),
                         physical_segment_indices=(),
                         logical_table_index=None,
-                        excluded_payload_ordinals=(
-                            frozenset({heading_payload_ordinal})
-                            if heading is not None
-                            and source_index == heading.source_index
-                            and heading_payload_ordinal is not None
-                            else frozenset()
+                        excluded_payload_ordinals=leaf_heading_payloads.get(
+                            source_index,
+                            frozenset(),
                         ),
                     )
                 )
@@ -357,7 +365,25 @@ class _BuildContext:
                 in {
                     *unit_sources,
                     *(heading_ref.source_index for heading_ref in heading_chain),
+                    *(
+                        fragment.source_index
+                        for heading_ref in heading_chain
+                        for fragment in heading_ref.continuation_fragments
+                    ),
                 }
+            ),
+            source_quality_findings=tuple(
+                ProviderUnitSourceQualityFinding(
+                    source_index=item.source_index,
+                    payload_ordinal=item.payload_ordinal,
+                    raw_block_sha256=item.raw_block_sha256,
+                    provider_text_sha256=item.provider_text_sha256,
+                    source_text_sha256=item.source_text_sha256,
+                    reason=item.reason,
+                    source_kind=item.source_kind,
+                )
+                for item in self.admitted.source_quality_findings
+                if item.source_index in unit_sources
             ),
             search_targets=tuple(search_bindings),
         )
@@ -365,6 +391,7 @@ class _BuildContext:
         quality_status = (
             "needs_review"
             if bound_unbound
+            or locator.source_quality_findings
             or _has_suspected_truncated_markup_title(heading)
             or any(
                 _has_suspected_encoded_text(self.blocks[source_index])
@@ -373,14 +400,14 @@ class _BuildContext:
             else "ok"
         )
         applicability = _unit_applicability(
-            self.blocks[source_index] for source_index in unit.block_source_indices
+            heading=heading,
+            parts=parts,
         )
         hashes = compute_unit_hashes(
             payload_kind=payload_kind,
             payload=payload,
             title=None if heading is None else heading.text,
             heading_path=list(heading_path),
-            semantic_key=None,
             semantic_keys=None,
             applicability=applicability,
             quality_status=quality_status,
@@ -393,7 +420,6 @@ class _BuildContext:
             title=None if heading is None else heading.text,
             heading_path=heading_path,
             section_keys=None,
-            semantic_key=None,
             semantic_keys=None,
             applicability=applicability,
             quality_status=quality_status,
@@ -431,6 +457,13 @@ class _BuildContext:
                 source_index=item.source_index,
                 payload_ordinal=item.payload_ordinal,
                 placement_source=item.placement_source,
+                continuation_fragments=tuple(
+                    ProviderUnitHeadingFragmentRef(
+                        source_index=fragment.source_index,
+                        payload_ordinal=fragment.payload_ordinal,
+                    )
+                    for fragment in item.source_fragments[1:]
+                ),
             )
             for item in chain
         )
@@ -526,38 +559,76 @@ class _BuildContext:
 
 
 def _unit_applicability(
-    blocks: Iterable[ProviderBlock],
+    *,
+    heading: ResolvedHeading | None,
+    parts: list[_Part],
 ) -> ProviderUnitApplicability | None:
-    """Project only explicit, unanimous checkbox pairs owned by one Unit."""
+    """Project only a leaf selector or a leading declaration-only selector."""
+
+    if heading is not None:
+        heading_values, heading_ambiguous, heading_has_pair = (
+            _applicability_values(heading.text)
+        )
+        if heading_has_pair:
+            return _resolved_applicability(heading_values, heading_ambiguous)
 
     values: set[ProviderUnitApplicability] = set()
     ambiguous = False
-    for block in blocks:
-        for payload in block.payloads:
-            text = (
-                html_visible_text(payload.text)
-                if payload.field == "table_body"
-                else payload.text
-            )
-            for match in _APPLICABILITY_PAIR_RE.finditer(text):
-                applicable_marker = match.group("applicable")
-                not_applicable_marker = match.group("not_applicable")
-                applicable_checked = (
-                    applicable_marker in _CHECKED_APPLICABILITY_MARKERS
-                )
-                not_applicable_checked = (
-                    not_applicable_marker in _CHECKED_APPLICABILITY_MARKERS
-                )
-                if applicable_checked and not_applicable_checked:
-                    ambiguous = True
-                elif applicable_checked:
-                    values.add("applicable")
-                elif not_applicable_checked:
-                    values.add("not_applicable")
-                # Two unchecked boxes carry no selected declaration.
+    for part in parts:
+        text = _part_visible_text(part.payload)
+        part_values, part_ambiguous, has_pair = _applicability_values(text)
+        residue = strip_applicability_selector_pairs(text)
+        declaration_only = not any(character.isalnum() for character in residue)
+        if has_pair and declaration_only:
+            values.update(part_values)
+            ambiguous = ambiguous or part_ambiguous
+            continue
+        if part.ref.kind != "text":
+            break
+        if any(character.isalnum() for character in text):
+            break
+    return _resolved_applicability(values, ambiguous)
+
+
+def _applicability_values(
+    text: str,
+) -> tuple[set[ProviderUnitApplicability], bool, bool]:
+    values: set[ProviderUnitApplicability] = set()
+    ambiguous = False
+    has_pair = False
+    for match in applicability_selector_pairs(text):
+        has_pair = True
+        if match.applicable_checked and match.not_applicable_checked:
+            ambiguous = True
+        elif match.applicable_checked:
+            values.add("applicable")
+        elif match.not_applicable_checked:
+            values.add("not_applicable")
+    return values, ambiguous, has_pair
+
+
+def _resolved_applicability(
+    values: set[ProviderUnitApplicability],
+    ambiguous: bool,
+) -> ProviderUnitApplicability | None:
     if ambiguous or len(values) != 1:
         return None
     return next(iter(values))
+
+
+def _part_visible_text(payload: dict[str, object]) -> str:
+    values: list[str] = []
+    for field, value in payload.items():
+        if field == "content_artifacts":
+            continue
+        if isinstance(value, str):
+            values.append(html_visible_text(value) if field == "table_body" else value)
+        elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+            values.extend(
+                html_visible_text(item) if field == "table_body" else item
+                for item in value
+            )
+    return "\n".join(values)
 
 
 def _has_suspected_encoded_text(block: ProviderBlock) -> bool:
@@ -631,6 +702,10 @@ def replay_provider_unit_search_binding_source_text(
         admitted.effective_provider_document,
         binding.source,
     )
+    if binding.destination.kind == "unit_title_fragment":
+        if draft.title is None:
+            raise ValueError("provider Unit title fragment has no title")
+        return source_text
     destination_text = _destination_text(
         payload=draft.payload,
         payload_kind=draft.payload_kind,
@@ -657,16 +732,10 @@ def provider_unit_search_text_values(
         payload_value = dict(payload)
         for binding in locator.search_targets:
             _validate_binding_owner(locator=locator, binding=binding)
-            if binding.destination.kind == "unit_title":
+            if binding.destination.kind in {"unit_title", "unit_title_fragment"}:
                 if (
                     title is None
-                    or _destination_text(
-                        payload=payload_value,
-                        payload_kind=payload_kind,
-                        title=title,
-                        destination=binding.destination,
-                    )
-                    != title
+                    or not title.strip()
                 ):
                     raise ValueError("provider Unit title binding is invalid")
                 continue
@@ -686,6 +755,46 @@ def provider_unit_search_text_values(
         raise ProviderUnitSearchContractError(str(exc)) from exc
 
 
+def provider_unit_search_row_atoms(
+    *,
+    payload_kind: str,
+    payload: Mapping[str, object],
+    title: str | None,
+    artifact_locator: object,
+) -> tuple[ProviderUnitSearchRowAtom, ...]:
+    """Replay strict Q&A rows from explicit table-body search bindings only."""
+
+    try:
+        locator = provider_unit_locator_from_payload(artifact_locator)
+        atoms: list[ProviderUnitSearchRowAtom] = []
+        payload_value = dict(payload)
+        for binding in locator.search_targets:
+            _validate_binding_owner(locator=locator, binding=binding)
+            if (
+                binding.destination.kind in {"unit_title", "unit_title_fragment"}
+                or binding.destination.field != "table_body"
+                or binding.source.transform != "html_visible_text_segments.v1"
+            ):
+                continue
+            table_body = _destination_text(
+                payload=payload_value,
+                payload_kind=payload_kind,
+                title=title,
+                destination=binding.destination,
+            )
+            atoms.extend(
+                ProviderUnitSearchRowAtom(
+                    table_target_id=binding.source.target_id,
+                    source_row_index=row.source_row_index,
+                    row_text=row.row_text,
+                )
+                for row in html_qa_row_atoms(table_body)
+            )
+        return tuple(atoms)
+    except (TypeError, ValueError) as exc:
+        raise ProviderUnitSearchContractError(str(exc)) from exc
+
+
 def _validate_binding_owner(
     *,
     locator: ProviderUnitLocator,
@@ -693,12 +802,24 @@ def _validate_binding_owner(
 ) -> None:
     source_index = binding.source.source_index
     destination = binding.destination
-    if destination.kind == "unit_title":
+    if destination.kind in {"unit_title", "unit_title_fragment"}:
+        if not locator.heading_chain:
+            raise ValueError("provider search title source has no Unit heading")
+        leaf = locator.heading_chain[-1]
+        fragment_identities = (
+            (leaf.source_index, leaf.payload_ordinal),
+            *(
+                (fragment.source_index, fragment.payload_ordinal)
+                for fragment in leaf.continuation_fragments
+            ),
+        )
+        expected_index = 0 if destination.kind == "unit_title" else destination.item_index
         if (
-            not locator.heading_chain
-            or locator.heading_chain[-1].source_index != source_index
-            or locator.heading_chain[-1].payload_ordinal
-            != binding.source.payload_ordinal
+            expected_index is None
+            or expected_index >= len(fragment_identities)
+            or fragment_identities[expected_index]
+            != (source_index, binding.source.payload_ordinal)
+            or (destination.kind == "unit_title" and len(fragment_identities) != 1)
         ):
             raise ValueError("provider search title source is not the Unit heading")
         return
@@ -819,6 +940,8 @@ def _replay_binding(
     binding: ProviderUnitSearchBinding,
 ) -> tuple[str, ...]:
     source_text = _source_payload_text(document, binding.source)
+    if binding.destination.kind == "unit_title_fragment":
+        return replay_retrieval_target(document, binding.source)
     destination_text = _destination_text(
         payload=payload,
         payload_kind=payload_kind,
@@ -917,6 +1040,7 @@ def _validate_build(
     search_targets: list[str] = []
     logical_tables: list[int] = []
     covered_reconciliations: set[tuple[int, int]] = set()
+    covered_quality_findings: set[tuple[int, int]] = set()
     for unit, retrieval_unit, draft in zip(
         context.outline.units,
         context.retrieval.units,
@@ -949,9 +1073,16 @@ def _validate_build(
         }
         evidence_sources = set(draft.locator.evidence_only_block_source_indices)
         if draft.locator.heading_chain:
-            heading_source = draft.locator.heading_chain[-1].source_index
-            if heading_source not in part_sources | evidence_sources:
-                owned_blocks.append(heading_source)
+            leaf_heading = draft.locator.heading_chain[-1]
+            for heading_source in (
+                leaf_heading.source_index,
+                *(
+                    fragment.source_index
+                    for fragment in leaf_heading.continuation_fragments
+                ),
+            ):
+                if heading_source not in part_sources | evidence_sources:
+                    owned_blocks.append(heading_source)
         for part in draft.locator.parts:
             owned_blocks.extend(part.block_source_indices)
             owned_segments.extend(part.physical_table_segment_indices)
@@ -968,6 +1099,11 @@ def _validate_build(
         dependency_sources = {
             *unit.block_source_indices,
             *(item.source_index for item in expected_heading_chain),
+            *(
+                fragment.source_index
+                for item in expected_heading_chain
+                for fragment in item.continuation_fragments
+            ),
         }
         expected_reconciliations = tuple(
             (item.source_index, item.payload_ordinal)
@@ -979,6 +1115,20 @@ def _validate_build(
                 "provider Unit source repairs differ from its source dependencies"
             )
         covered_reconciliations.update(actual_reconciliations)
+        actual_quality_findings = tuple(
+            (item.source_index, item.payload_ordinal)
+            for item in draft.locator.source_quality_findings
+        )
+        expected_quality_findings = tuple(
+            (item.source_index, item.payload_ordinal)
+            for item in context.admitted.source_quality_findings
+            if item.source_index in unit.block_source_indices
+        )
+        if actual_quality_findings != expected_quality_findings:
+            raise ValueError(
+                "provider Unit source quality findings differ from dependencies"
+            )
+        covered_quality_findings.update(actual_quality_findings)
     owned_segments.extend(
         part.part.physical_segment_index
         for part in result.unassigned_table_parts
@@ -1005,6 +1155,11 @@ def _validate_build(
         for item in context.admitted.source_text_reconciliations
     }:
         raise ValueError("provider Unit build must bind every source repair")
+    if covered_quality_findings != {
+        (item.source_index, item.payload_ordinal)
+        for item in context.admitted.source_quality_findings
+    }:
+        raise ValueError("provider Unit build must bind every source quality finding")
 
 
 __all__ = [

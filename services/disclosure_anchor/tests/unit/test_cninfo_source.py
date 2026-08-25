@@ -10,9 +10,11 @@ import httpx
 from disclosure_anchor.adapters.sources.cninfo.client import CninfoClient
 from disclosure_anchor.adapters.sources.cninfo.source import (
     CninfoSource,
+    CninfoWebIndexSource,
     _window_chunks,
 )
 from disclosure_anchor.application.ports.disclosure_source import (
+    AnnouncementRef,
     DisclosureWindow,
     SourceSecurity,
 )
@@ -20,6 +22,21 @@ from disclosure_anchor.domain.errors import SourceRequestError
 
 
 ACCESS_TOKEN = "unit-access-token"
+
+
+def _ref(security_code: str) -> AnnouncementRef:
+    return AnnouncementRef(
+        provider="cninfo",
+        provider_document_id=f"doc-{security_code}",
+        title="test",
+        download_url="https://static.cninfo.example/test.pdf",
+        raw_category="test",
+        announcement_date=date(2026, 8, 23),
+        security_code=security_code,
+        security_name=None,
+        file_size=None,
+        index_updated_at=None,
+    )
 
 
 def _record(textid: str, title: str, category: str) -> dict[str, object]:
@@ -302,12 +319,7 @@ if __name__ == "__main__":
 
 
 class CninfoWebIndexSourceTests(unittest.TestCase):
-    def test_index_and_download_route_to_web_profile_to_api(self) -> None:
-        from disclosure_anchor.adapters.sources.cninfo.source import (
-            CninfoWebIndexSource,
-        )
-        from disclosure_anchor.domain.errors import SourceRequestError
-
+    def test_sse_index_and_download_route_to_web_profile_to_api(self) -> None:
         calls: list[str] = []
 
         class _Web:
@@ -338,8 +350,11 @@ class CninfoWebIndexSourceTests(unittest.TestCase):
                 calls.append("api.close")
 
         hybrid = CninfoWebIndexSource(web=_Web(), api_profile_source=_Api(False))
-        hybrid.search_announcements(None, None)
-        self.assertEqual(hybrid.download_pdf(None), b"pdf")
+        hybrid.search_announcements(
+            SourceSecurity("600941", "SSE"),
+            DisclosureWindow(date(2026, 8, 1), date(2026, 8, 23)),
+        )
+        self.assertEqual(hybrid.download_pdf(_ref("600941")), b"pdf")
         self.assertEqual(hybrid.profile_for_security("600941"), "profile")
         hybrid.close()
         self.assertEqual(
@@ -347,12 +362,100 @@ class CninfoWebIndexSourceTests(unittest.TestCase):
             ["web.search", "web.download", "api.profile", "web.close", "api.close"],
         )
 
-    def test_profile_degrades_to_none_on_api_refusal_or_absence(self) -> None:
-        from disclosure_anchor.adapters.sources.cninfo.source import (
-            CninfoWebIndexSource,
-        )
-        from disclosure_anchor.domain.errors import SourceRequestError
+    def test_bse_index_and_download_route_to_credentialed_api(self) -> None:
+        calls: list[str] = []
 
+        class _Web:
+            def search_announcements(self, security, window):
+                calls.append("web.search")
+                return []
+
+            def download_pdf(self, ref):
+                calls.append("web.download")
+                return b"web"
+
+            def close(self):
+                calls.append("web.close")
+
+        class _Api:
+            def search_announcements(self, security, window):
+                calls.append(f"api.search:{security.security_code}")
+                return []
+
+            def download_pdf(self, ref):
+                calls.append(f"api.download:{ref.security_code}")
+                return b"api"
+
+            def profile_for_security(self, security_code):
+                calls.append("api.profile")
+                return "profile"
+
+            def close(self):
+                calls.append("api.close")
+
+        hybrid = CninfoWebIndexSource(web=_Web(), api_profile_source=_Api())
+        window = DisclosureWindow(date(2026, 8, 1), date(2026, 8, 23))
+        for code in ("920001", "430001", "830001"):
+            hybrid.search_announcements(SourceSecurity(code, "BSE"), window)
+            self.assertEqual(hybrid.download_pdf(_ref(code)), b"api")
+
+        self.assertEqual(
+            calls,
+            [
+                "api.search:920001",
+                "api.download:920001",
+                "api.search:430001",
+                "api.download:430001",
+                "api.search:830001",
+                "api.download:830001",
+            ],
+        )
+
+    def test_bse_index_and_download_fail_closed_without_api(self) -> None:
+        calls: list[str] = []
+
+        class _Web:
+            def search_announcements(self, security, window):
+                calls.append("web.search")
+                return []
+
+            def download_pdf(self, ref):
+                calls.append("web.download")
+                return b"web"
+
+            def close(self):
+                pass
+
+        hybrid = CninfoWebIndexSource(web=_Web(), api_profile_source=None)
+        with self.assertRaises(SourceRequestError) as search_error:
+            hybrid.search_announcements(
+                SourceSecurity("920001", "BSE"),
+                DisclosureWindow(date(2026, 8, 1), date(2026, 8, 23)),
+            )
+        with self.assertRaises(SourceRequestError) as download_error:
+            hybrid.download_pdf(_ref("920001"))
+
+        for error in (search_error.exception, download_error.exception):
+            self.assertEqual(error.error_code, "bse_api_required")
+            self.assertFalse(error.retryable)
+        self.assertEqual(calls, [])
+
+    def test_search_fails_closed_on_code_exchange_mismatch(self) -> None:
+        class _Web:
+            def close(self):
+                pass
+
+        hybrid = CninfoWebIndexSource(web=_Web(), api_profile_source=None)
+        with self.assertRaises(SourceRequestError) as caught:
+            hybrid.search_announcements(
+                SourceSecurity("920001", "SSE"),
+                DisclosureWindow(date(2026, 8, 1), date(2026, 8, 23)),
+            )
+
+        self.assertEqual(caught.exception.error_code, "invalid_security_identity")
+        self.assertFalse(caught.exception.retryable)
+
+    def test_profile_degrades_to_none_on_api_refusal_or_absence(self) -> None:
         class _Web:
             def close(self):
                 pass

@@ -76,9 +76,10 @@ def get_semantic_routes() -> SemanticRouteCatalogResponse:
             description=definition.description,
             labels=list(definition.labels),
             scopes=list(definition.scopes),
-            usable_as_section_key=(
-                definition.context_container or definition.section_container
-            ),
+            # _section_keys accepts an exact, scope-valid heading for every
+            # exposed taxonomy definition.  Container flags govern inheritance
+            # and direct-route behavior; they are not section-key eligibility.
+            usable_as_section_key=True,
         )
         for definition in taxonomy.definitions
     ]

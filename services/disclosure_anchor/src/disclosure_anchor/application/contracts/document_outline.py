@@ -21,6 +21,8 @@ HeadingDispositionReason = Literal[
     "selector_statement",
     "page_continuation",
     "body_text_conflict",
+    "table_footnote_conflict",
+    "interstitial_notice",
     "terminal_signature",
     "non_semantic_glyph",
     "repeated_page_header",
@@ -32,6 +34,9 @@ HeadingPlacementSource = Literal[
     "pdf_style",
     "provider",
     "provider_style",
+    "table_label",
+    "table_container",
+    "statutory_template",
     "flattened",
 ]
 
@@ -80,6 +85,25 @@ class HeadingNegativeHint:
 
 
 @dataclass(frozen=True, slots=True)
+class HeadingSourceFragment:
+    """One immutable provider occurrence contributing to a heading string."""
+
+    source_index: int
+    payload_ordinal: int
+    page_index: int
+    text: str
+    raw_block_sha256: str
+
+    def __post_init__(self) -> None:
+        if min(self.source_index, self.payload_ordinal, self.page_index) < 0:
+            raise ValueError("heading fragment indices cannot be negative")
+        if not self.text:
+            raise ValueError("heading fragment text must be non-empty")
+        if not _SHA256_RE.fullmatch(self.raw_block_sha256):
+            raise ValueError("heading fragment block hash must be canonical")
+
+
+@dataclass(frozen=True, slots=True)
 class HeadingCandidate:
     """One source occurrence considered for the outline."""
 
@@ -96,6 +120,7 @@ class HeadingCandidate:
     disposition: HeadingDisposition
     disposition_reason: HeadingDispositionReason
     placement_source: HeadingPlacementSource | None
+    source_fragments: tuple[HeadingSourceFragment, ...]
 
     def __post_init__(self) -> None:
         if not self.heading_id:
@@ -106,6 +131,18 @@ class HeadingCandidate:
             raise ValueError("heading candidate text must be non-empty")
         if not _SHA256_RE.fullmatch(self.raw_block_sha256):
             raise ValueError("heading candidate block hash must be canonical")
+        fragment_indices = [item.source_index for item in self.source_fragments]
+        if (
+            not self.source_fragments
+            or self.source_fragments[0].source_index != self.source_index
+            or self.source_fragments[0].payload_ordinal != self.payload_ordinal
+            or self.source_fragments[0].page_index != self.page_index
+            or self.source_fragments[0].raw_block_sha256 != self.raw_block_sha256
+            or fragment_indices != sorted(fragment_indices)
+            or len(fragment_indices) != len(set(fragment_indices))
+            or "".join(item.text for item in self.source_fragments) != self.text
+        ):
+            raise ValueError("heading candidate fragments differ from its source")
         if self.provider_level is not None and self.provider_level < 0:
             raise ValueError("heading candidate provider level cannot be negative")
         if self.nominal_rank is not None and self.nominal_rank < 1:
@@ -117,6 +154,8 @@ class HeadingCandidate:
             "selector_statement",
             "page_continuation",
             "body_text_conflict",
+            "table_footnote_conflict",
+            "interstitial_notice",
             "terminal_signature",
             "non_semantic_glyph",
             "repeated_page_header",
@@ -151,6 +190,7 @@ class ResolvedHeading:
     parent_heading_id: str | None
     headpath: tuple[str, ...]
     placement_source: HeadingPlacementSource
+    source_fragments: tuple[HeadingSourceFragment, ...]
 
     def __post_init__(self) -> None:
         if not self.heading_id or not self.text:
@@ -161,6 +201,13 @@ class ResolvedHeading:
             raise ValueError("resolved heading levels must be positive")
         if not self.headpath or self.headpath[-1] != self.text:
             raise ValueError("resolved heading path must include itself")
+        if (
+            not self.source_fragments
+            or self.source_fragments[0].source_index != self.source_index
+            or self.source_fragments[0].payload_ordinal != self.payload_ordinal
+            or "".join(item.text for item in self.source_fragments) != self.text
+        ):
+            raise ValueError("resolved heading fragments differ from its source")
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,11 +315,6 @@ class DocumentOutline:
             range(len(self.units))
         ):
             raise ValueError("coarse unit indices must be contiguous")
-        preamble_indices = [
-            index for index, unit in enumerate(self.units) if unit.heading_id is None
-        ]
-        if preamble_indices not in ([], [0]):
-            raise ValueError("a coarse outline may have only one leading preamble")
         unit_heading_ids = [
             unit.heading_id for unit in self.units if unit.heading_id is not None
         ]
@@ -283,9 +325,12 @@ class DocumentOutline:
             for unit in self.units
             for source_index in unit.block_source_indices
         )
-        if partition != tuple(range(self.block_count)):
+        if (
+            sorted(partition) != list(range(self.block_count))
+            or len(partition) != len(set(partition))
+        ):
             raise ValueError(
-                "coarse units must partition every provider block in order"
+                "coarse units must own every provider block exactly once"
             )
         for unit in self.units:
             if unit.heading_id is None:
@@ -320,5 +365,6 @@ __all__ = [
     "HeadingNegativeHint",
     "HeadingNegativeReason",
     "HeadingPlacementSource",
+    "HeadingSourceFragment",
     "ResolvedHeading",
 ]

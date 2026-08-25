@@ -20,11 +20,24 @@ from disclosure_anchor.application.contracts.provider_unit import (
     PROVIDER_UNIT_BUILDER_VERSION,
     provider_unit_locator_from_payload,
 )
+from disclosure_anchor.application.contracts.semantic_routes import (
+    SEMANTIC_FAILOVER_POLICY_VERSION,
+    SEMANTIC_ROUTE_RECEIPT_VERSION,
+    SEMANTIC_ROUTER_VERSION,
+    SemanticAdjudicationReceipt,
+    SemanticProviderAttempt,
+    SemanticProviderIdentity,
+    SemanticRouteReceipt,
+)
 from disclosure_anchor.application.ports.file_store import (
     ArtifactWriteResult,
 )
 from disclosure_anchor.application.ports.semantic_routes import (
+    SemanticAdjudicationOutcome,
     SemanticRouteAdjudicatorError,
+)
+from disclosure_anchor.application.services.semantic_router import (
+    SemanticRouteBatchResult,
 )
 from disclosure_anchor.application.services.provider_unit_builder import (
     build_provider_units,
@@ -112,6 +125,77 @@ class _FailingSemanticRouter(PassthroughSemanticRouter):
         raise self.error
 
 
+class _V2DegradedRouter(PassthroughSemanticRouter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.adjudicator = None
+        identity = SemanticProviderIdentity(
+            provider_id="luna-primary",
+            provider="openai",
+            adapter_kind="codex_cli",
+            adapter_version="codex_cli.v5",
+            canonical_model="gpt-5.6-luna",
+            inference_profile="low",
+            prompt_version="semantic-test.v1",
+            prompt_sha256="sha256:" + "1" * 64,
+            output_schema_version="semantic-test.v1",
+            output_schema_sha256="sha256:" + "2" * 64,
+        )
+        self.executor = type(
+            "Executor",
+            (),
+            {"provider_identities": (identity,)},
+        )()
+        self._identity = identity
+
+    def route(self, *, drafts, **_kwargs):  # type: ignore[no-untyped-def]
+        attempt = SemanticProviderAttempt(
+            ordinal=1,
+            provider=self._identity,
+            outcome="availability_failed",
+            reason_code="capacity_unavailable",
+            availability_abstain_eligible=True,
+            cache_key="sha256:" + "3" * 64,
+        )
+        adjudication = SemanticAdjudicationReceipt(
+            policy_version=SEMANTIC_FAILOVER_POLICY_VERSION,
+            group_hash="sha256:" + "4" * 64,
+            attempts=(attempt,),
+            actual_result_attempt=None,
+            actual_result_identity=None,
+            group_response_sha256=None,
+        )
+        receipts = tuple(
+            SemanticRouteReceipt(
+                contract_version=SEMANTIC_ROUTE_RECEIPT_VERSION,
+                taxonomy_version=self.taxonomy.version,
+                router_version=SEMANTIC_ROUTER_VERSION,
+                input_hash="sha256:" + f"{index + 10:064x}"[-64:],
+                candidate_keys=("forecast_summary",),
+                semantic_keys=(),
+                decision_source="adjudicator_unavailable_abstain",
+                evidence=(),
+                adjudication=adjudication,
+            )
+            for index, _draft in enumerate(drafts)
+        )
+        outcome = SemanticAdjudicationOutcome(
+            policy_version=SEMANTIC_FAILOVER_POLICY_VERSION,
+            group_hash=adjudication.group_hash,
+            attempts=(attempt,),
+            decisions=(),
+            actual_result_attempt=None,
+            actual_result_identity=None,
+            group_response_sha256=None,
+            degraded_unavailable=True,
+        )
+        return SemanticRouteBatchResult(
+            units=tuple(drafts),
+            receipts=receipts,
+            adjudication_outcomes=(outcome,),
+        )
+
+
 def _uow(*, legacy: bool = False) -> FakeUnitOfWork:
     uow = FakeUnitOfWork()
     company = uow.companies.add(e.Company(company_id="co_1", legal_name="江海股份"))
@@ -192,6 +276,58 @@ def _use_case(
 
 
 class BuildUnitsTests(unittest.TestCase):
+    def test_v2_all_provider_outage_preserves_units_and_records_degradation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            uow = _uow()
+            use_case, _ = _use_case(
+                Path(tmp),
+                uow,
+                semantic_router=_V2DegradedRouter(),
+            )
+
+            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertGreater(result.unit_count, 0)
+        run = uow.processing_runs.get("run_1")
+        assert run is not None
+        self.assertEqual(run.semantic_adjudication_status, "degraded_unavailable")
+        self.assertEqual(run.semantic_degraded_unit_count, result.unit_count)
+        self.assertEqual(run.semantic_failover_group_count, 0)
+        self.assertEqual(
+            run.semantic_route_receipts_contract_version,
+            SEMANTIC_ROUTE_RECEIPT_VERSION,
+        )
+        assert run.semantic_route_receipts_relpath is not None
+        self.assertTrue(run.semantic_route_receipts_relpath.endswith(".v2.jsonl"))
+        self.assertEqual(
+            len(uow.document_units.list_by_processing_run("run_1")),
+            result.unit_count,
+        )
+
+    def test_cancelled_semantic_process_is_retry_neutral(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            uow = _uow()
+            use_case, _ = _use_case(
+                Path(tmp),
+                uow,
+                semantic_router=_FailingSemanticRouter(
+                    SemanticRouteAdjudicatorError(
+                        "cancelled",
+                        reason_code="cancelled",
+                        retryable=True,
+                    )
+                ),
+            )
+
+            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+        self.assertEqual(result.status, "failed")
+        run = uow.processing_runs.get("run_1")
+        assert run is not None
+        self.assertEqual(run.unit_build_attempt_count, 0)
+        self.assertIsNone(run.semantic_adjudication_status)
+
     def test_retryable_semantic_failure_is_shared_unavailability(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             use_case, _ = _use_case(
@@ -215,6 +351,32 @@ class BuildUnitsTests(unittest.TestCase):
             "SEMANTIC_ROUTE_ADJUDICATION_UNAVAILABLE",
         )
         self.assertTrue(result.error["retryable"])
+
+    def test_unknown_cli_failure_stays_failed_closed_and_never_degrades(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            uow = _uow()
+            use_case, _ = _use_case(
+                Path(tmp),
+                uow,
+                semantic_router=_FailingSemanticRouter(
+                    SemanticRouteAdjudicatorError(
+                        "unknown CLI failure",
+                        reason_code="command_failed",
+                        retryable=False,
+                    )
+                ),
+            )
+
+            result = use_case.execute(BuildUnitsCommand(processing_run_id="run_1"))
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.unit_count, 0)
+        run = uow.processing_runs.get("run_1")
+        assert run is not None
+        self.assertEqual(run.unit_build_status, "failed")
+        self.assertEqual(run.semantic_adjudication_status, "failed_closed")
+        self.assertIsNone(run.semantic_degraded_unit_count)
+        self.assertIsNone(run.semantic_failover_group_count)
 
     def test_repeated_invalid_semantic_decision_is_nonretryable_item_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,7 +427,7 @@ class BuildUnitsTests(unittest.TestCase):
                 self.assertIsNone(unit.semantic_keys)
             self.assertEqual(
                 [unit.applicability for unit in units],
-                [None, "not_applicable"],
+                [None, None],
             )
             rows = (Path(tmp) / run.document_units_relpath).read_text().splitlines()
             self.assertEqual(len(rows), len(units))
@@ -276,6 +438,11 @@ class BuildUnitsTests(unittest.TestCase):
                 "unit_count",
                 "semantic_narrow_unit_count",
                 "semantic_fallback_unit_count",
+                "semantic_adjudicator_unavailable_unit_count",
+                "semantic_adjudication_status",
+                "semantic_degraded_unit_count",
+                "semantic_failover_group_count",
+                "semantic_adjudication_summary",
                 "section_routed_unit_count",
                 "semantic_route_receipts_relpath",
                 "semantic_route_receipts_hash",

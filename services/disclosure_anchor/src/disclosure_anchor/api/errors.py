@@ -48,6 +48,9 @@ EVIDENCE_INTEGRITY_ERROR = "EVIDENCE_INTEGRITY_ERROR"
 # so its operational 409s carry this code in the same envelope shape without
 # widening the public read-side vocabulary.
 CONFLICT = "CONFLICT"
+# Local-ops admin-only availability code. Like CONFLICT, this is intentionally
+# absent from the public read-side OpenAPI error-code vocabulary.
+SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
 UNAUTHORIZED = "UNAUTHORIZED"
 FORBIDDEN = "FORBIDDEN"
 

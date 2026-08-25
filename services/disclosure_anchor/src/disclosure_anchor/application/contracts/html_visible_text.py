@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 import re
 from typing import Literal
+import unicodedata
 
 
 _NON_VISIBLE_ELEMENTS = frozenset(
@@ -25,6 +26,14 @@ class HtmlTableSemanticSegment:
 
     text: str
     role: HtmlTableSemanticRole
+
+
+@dataclass(frozen=True, slots=True)
+class HtmlQARowAtom:
+    """One mechanically closed question/answer row from provider HTML."""
+
+    source_row_index: int
+    row_text: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +116,12 @@ class _TableStructureParser(HTMLParser):
         self._table_depth = 0
         self._table_count = 0
         self._thead_depth = 0
+        self._section_tag: str | None = None
+        self._last_section_rank = -1
+        self._seen_thead = False
+        self._seen_tbody = False
+        self._seen_tfoot = False
+        self._seen_direct_row = False
         self._suppressed_depth = 0
         self._row: list[_TableCell] | None = None
         self._cell_tag: str | None = None
@@ -134,17 +149,47 @@ class _TableStructureParser(HTMLParser):
             if self._table_count != 1 or self._table_depth != 1:
                 self.invalid = True
             return
-        if normalized == "thead":
-            if self._table_depth != 1:
+        if normalized in {"thead", "tbody", "tfoot"}:
+            rank = {"thead": 0, "tbody": 1, "tfoot": 2}[normalized]
+            if (
+                self._table_depth != 1
+                or self._row is not None
+                or self._cell_tag is not None
+                or self._section_tag is not None
+                or rank < self._last_section_rank
+                or (normalized == "thead" and (self._seen_thead or self.rows))
+                or (normalized == "tbody" and self._seen_direct_row)
+                or (normalized == "tfoot" and self._seen_tfoot)
+            ):
                 self.invalid = True
-            self._thead_depth += 1
+                return
+            self._section_tag = normalized
+            self._last_section_rank = rank
+            if normalized == "thead":
+                self._seen_thead = True
+                self._thead_depth = 1
+            elif normalized == "tbody":
+                self._seen_tbody = True
+            else:
+                self._seen_tfoot = True
             return
         if normalized == "tr":
-            if self._table_depth != 1 or self._row is not None:
+            if (
+                self._table_depth != 1
+                or self._row is not None
+                or (
+                    self._section_tag is None
+                    and (self._seen_tbody or self._seen_tfoot)
+                )
+            ):
                 self.invalid = True
+            if self._section_tag is None:
+                self._seen_direct_row = True
             self._row = []
             return
         if normalized not in {"td", "th"}:
+            if self._table_depth and self._cell_tag is None:
+                self.invalid = True
             return
         if self._table_depth != 1 or self._row is None or self._cell_tag is not None:
             self.invalid = True
@@ -185,16 +230,25 @@ class _TableStructureParser(HTMLParser):
             self.rows.append(tuple(self._row))
             self._row = None
             return
-        if normalized == "thead":
-            if self._thead_depth <= 0:
+        if normalized in {"thead", "tbody", "tfoot"}:
+            if (
+                self._section_tag != normalized
+                or self._row is not None
+                or self._cell_tag is not None
+            ):
                 self.invalid = True
             else:
-                self._thead_depth -= 1
+                self._section_tag = None
+                if normalized == "thead":
+                    self._thead_depth = 0
             return
         if normalized == "table":
             if self._table_depth != 1 or self._row is not None:
                 self.invalid = True
             self._table_depth = max(0, self._table_depth - 1)
+            return
+        if self._table_depth and self._cell_tag is None:
+            self.invalid = True
 
     def handle_data(self, data: str) -> None:
         if self._suppressed_depth:
@@ -214,6 +268,7 @@ class _TableStructureParser(HTMLParser):
             self._table_count != 1
             or self._table_depth
             or self._thead_depth
+            or self._section_tag is not None
             or self._row is not None
             or self._cell_tag is not None
         ):
@@ -224,7 +279,11 @@ class _TableStructureParser(HTMLParser):
         attrs: list[tuple[str, str | None]],
         name: str,
     ) -> int:
-        raw = next((value for key, value in attrs if key.lower() == name), None)
+        matches = [value for key, value in attrs if key.lower() == name]
+        if len(matches) > 1:
+            self.invalid = True
+            return 1
+        raw = matches[0] if matches else None
         if raw is None:
             return 1
         try:
@@ -293,14 +352,16 @@ def html_table_semantic_segments(
     if parser.invalid or not parser.rows:
         return ()
     cells = tuple(cell for row in parser.rows for cell in row)
+    nonempty_cells = tuple(cell for cell in cells if cell.text)
     visible = html_visible_text_segments(value)
-    if tuple(cell.text for cell in cells) != visible or any(
-        not cell.text for cell in cells
-    ):
+    if tuple(cell.text for cell in nonempty_cells) != visible:
         return ()
 
     roles: list[HtmlTableSemanticRole] = ["table_text"] * len(cells)
-    if _is_two_column_field_form(parser.rows):
+    grid_width = _rectangular_grid_width(parser.rows)
+    if grid_width is None:
+        pass
+    elif _is_two_column_field_form(parser.rows):
         offset = 0
         for row in parser.rows:
             roles[offset] = "table_field_label"
@@ -308,18 +369,91 @@ def html_table_semantic_segments(
     else:
         offset = 0
         implicit_header_row = _implicit_column_header_row(parser.rows)
+        multirow_header_rows = _implicit_multirow_column_header_rows(parser.rows)
+        typed_data_labels = _typed_data_label_cells(parser.rows)
         for row_index, row in enumerate(parser.rows):
             for cell_index, cell in enumerate(row):
                 if cell.tag == "th" or cell.in_thead:
                     roles[offset + cell_index] = "table_column_header"
-            if row_index == implicit_header_row:
+                if (row_index, cell_index) in typed_data_labels:
+                    roles[offset + cell_index] = "table_field_label"
+            if row_index == implicit_header_row or row_index in multirow_header_rows:
                 for cell_index in range(len(row)):
                     roles[offset + cell_index] = "table_column_header"
             offset += len(row)
     return tuple(
         HtmlTableSemanticSegment(text=cell.text, role=role)
         for cell, role in zip(cells, roles, strict=True)
+        if cell.text
     )
+
+
+def html_qa_row_atoms(value: str) -> tuple[HtmlQARowAtom, ...]:
+    """Project only an explicit three-column Q&A table into row atoms.
+
+    This is deliberately narrower than generic table parsing.  The table may
+    have one leading three-column title row, but it must then contain the exact
+    ``序号 / 提问内容 / 回复内容`` header and contiguous integer data rows.
+    Spans, nesting, missing cells, duplicate/gapped ordinals, or any visible
+    text mismatch make the complete table ineligible; callers retain the
+    ordinary parent/leaf search channels.
+    """
+
+    if not value.strip():
+        return ()
+    parser = _TableStructureParser()
+    parser.feed(value)
+    parser.close()
+    if parser.invalid or not parser.rows:
+        return ()
+    cells = tuple(cell for row in parser.rows for cell in row)
+    if tuple(cell.text for cell in cells) != html_visible_text_segments(value):
+        return ()
+    header_index = 0
+    first = parser.rows[0]
+    if (
+        len(first) == 1
+        and first[0].colspan == 3
+        and first[0].rowspan == 1
+        and first[0].text
+    ):
+        header_index = 1
+    if header_index >= len(parser.rows) - 1:
+        return ()
+    header = parser.rows[header_index]
+    if (
+        len(header) != 3
+        or any(cell.colspan != 1 or cell.rowspan != 1 for cell in header)
+        or tuple(_compact_cell_text(cell.text) for cell in header)
+        != ("序号", "提问内容", "回复内容")
+    ):
+        return ()
+    atoms: list[HtmlQARowAtom] = []
+    for expected_ordinal, source_row_index in enumerate(
+        range(header_index + 1, len(parser.rows)),
+        start=1,
+    ):
+        row = parser.rows[source_row_index]
+        if (
+            len(row) != 3
+            or any(
+                not cell.text or cell.colspan != 1 or cell.rowspan != 1
+                for cell in row
+            )
+            or _compact_cell_text(row[0].text) != str(expected_ordinal)
+        ):
+            return ()
+        atoms.append(
+            HtmlQARowAtom(
+                source_row_index=source_row_index,
+                row_text=" ".join(cell.text for cell in row),
+            )
+        )
+    return tuple(atoms)
+
+
+def _compact_cell_text(value: str) -> str:
+    return "".join(unicodedata.normalize("NFKC", value).split())
 
 
 def _is_two_column_field_form(rows: list[tuple[_TableCell, ...]]) -> bool:
@@ -341,7 +475,7 @@ def _is_two_column_field_form(rows: list[tuple[_TableCell, ...]]) -> bool:
 def _implicit_column_header_row(
     rows: list[tuple[_TableCell, ...]],
 ) -> int | None:
-    if len(rows) < 2:
+    if len(rows) < 2 or _rectangular_grid_width(rows) is None:
         return None
     header_index = 0
     if (
@@ -359,7 +493,8 @@ def _implicit_column_header_row(
     if len(first) < 2:
         return None
     if any(
-        cell.colspan != 1
+        not cell.text
+        or cell.colspan != 1
         or cell.rowspan != 1
         or re.search(r"[0-9０-９%％]", cell.text)
         for cell in first
@@ -374,8 +509,122 @@ def _implicit_column_header_row(
     return None
 
 
+def _implicit_multirow_column_header_rows(
+    rows: list[tuple[_TableCell, ...]],
+) -> frozenset[int]:
+    """Recognize one closed two-row header band with explicit spans."""
+
+    if len(rows) < 3 or _rectangular_grid_width(rows) is None:
+        return frozenset()
+    first, second, data = rows[0], rows[1], rows[2]
+    if (
+        (len(first) == 1 and first[0].colspan > 1 and first[0].rowspan == 1)
+        or not any(cell.colspan > 1 or cell.rowspan > 1 for cell in first)
+        or any(
+            not cell.text or re.search(r"[0-9０-９%％]", cell.text)
+            for cell in (*first, *second)
+        )
+        or not any(re.search(r"[0-9０-９]", cell.text) for cell in data)
+    ):
+        return frozenset()
+    return frozenset({0, 1})
+
+
+def _typed_data_label_cells(
+    rows: list[tuple[_TableCell, ...]],
+) -> frozenset[tuple[int, int]]:
+    """Return source cells that a closed table schema proves are fact labels."""
+
+    if (
+        len(rows) < 2
+        or _rectangular_grid_width(rows) is None
+        or any(
+            cell.rowspan != 1 or cell.colspan != 1
+            for row in rows[1:]
+            for cell in row
+        )
+    ):
+        return frozenset()
+    header = tuple(_compact_cell_text(cell.text) for cell in rows[0])
+    positions: set[tuple[int, int]] = set()
+    if (
+        len(header) >= 4
+        and header[0] == "科目"
+        and sum(
+            any(marker in item for marker in ("本期", "上年同期", "变动"))
+            for item in header[1:]
+        )
+        >= 2
+    ):
+        for row_index, row in enumerate(rows[1:], start=1):
+            if row[0].text and any(
+                re.search(r"[0-9０-９]", cell.text) for cell in row[1:]
+            ):
+                positions.add((row_index, 0))
+    related_party_headers = {
+        "关联方",
+        "关联交易内容",
+        "本期发生额",
+        "上期发生额",
+    }
+    if related_party_headers.issubset(set(header)):
+        topic_index = header.index("关联交易内容")
+        amount_indices = tuple(
+            index
+            for index, item in enumerate(header)
+            if item in {"本期发生额", "上期发生额"}
+        )
+        for row_index, row in enumerate(rows[1:], start=1):
+            if (
+                topic_index < len(row)
+                and row[topic_index].text
+                and any(
+                    index < len(row)
+                    and re.search(r"[0-9０-９]", row[index].text)
+                    for index in amount_indices
+                )
+            ):
+                positions.add((row_index, topic_index))
+    return frozenset(positions)
+
+
+def _rectangular_grid_width(rows: list[tuple[_TableCell, ...]]) -> int | None:
+    """Validate one non-overlapping rowspan/colspan grid and return its width."""
+
+    active: dict[int, int] = {}
+    widths: list[int] = []
+    for row in rows:
+        occupied = set(active)
+        next_active = {
+            column: remaining - 1
+            for column, remaining in active.items()
+            if remaining > 1
+        }
+        column = 0
+        for cell in row:
+            while column in occupied:
+                column += 1
+            span = range(column, column + cell.colspan)
+            if any(item in occupied for item in span):
+                return None
+            for item in span:
+                occupied.add(item)
+                if cell.rowspan > 1:
+                    next_active[item] = cell.rowspan - 1
+            column += cell.colspan
+        if not occupied or occupied != set(range(max(occupied) + 1)):
+            return None
+        widths.append(max(occupied) + 1)
+        active = next_active
+    if active or len(set(widths)) != 1:
+        return None
+    return widths[0]
+
+
 __all__ = [
+    "HtmlQARowAtom",
     "HtmlTableSemanticSegment",
+    "html_qa_row_atoms",
     "html_table_semantic_segments",
     "html_visible_text",
     "html_visible_text_segments",

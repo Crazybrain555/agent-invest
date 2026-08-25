@@ -32,8 +32,17 @@ def health_payload(
 ) -> HealthResponse:
     data_root_mounted = True if settings is None else settings.sentinel_path.exists()
     migration_head = _migration_head(engine) if data_root_mounted else None
+    queues = _queue_status(settings, ops_engine)
+    queue_degraded = settings is not None and ops_engine is not None and (
+        queues is None
+        or queues.retrying_builds > 0
+        or queues.build_dead_letters > 0
+        or queues.active_degraded_builds > 0
+    )
     status: Literal["ok", "degraded"] = (
-        "ok" if data_root_mounted and migration_head is not None else "degraded"
+        "ok"
+        if data_root_mounted and migration_head is not None and not queue_degraded
+        else "degraded"
     )
     return HealthResponse(
         status=status,
@@ -41,7 +50,7 @@ def health_payload(
         version=__version__,
         migration_head=migration_head,
         data_root_mounted=data_root_mounted,
-        queues=_queue_status(settings, ops_engine),
+        queues=queues,
     )
 
 
@@ -79,9 +88,19 @@ def _queue_status(
                 parse_dead_letters=queries.parse_dead_letter_count(
                     conn, max_retries=settings.disclosure_max_parse_retries
                 ),
+                build_dead_letters=queries.build_dead_letter_count(
+                    conn, max_retries=settings.disclosure_max_build_retries
+                ),
                 retrying_documents=queries.retrying_document_count(
                     conn,
                     max_retries=settings.disclosure_max_parse_retries,
+                ),
+                retrying_builds=queries.retrying_build_count(
+                    conn, max_retries=settings.disclosure_max_build_retries
+                ),
+                degraded_builds=queries.degraded_build_count(conn),
+                active_degraded_builds=queries.degraded_build_count(
+                    conn, active_only=True
                 ),
                 sync_due=len(
                     queries.sync_due(

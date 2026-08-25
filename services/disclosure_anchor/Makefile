@@ -8,6 +8,7 @@ API_HOST ?= 127.0.0.1
 API_PORT ?= 8711
 ARCHIVE_DIR ?= dist
 ARCHIVE_NAME ?= disclosure-anchor-source.tar.gz
+SSH_PORT ?= 22
 
 # Local PostgreSQL cluster (Homebrew postgresql@18, PGDATA on AgentSSD).
 # Override on the command line or via the environment; never hard-code secrets.
@@ -22,11 +23,13 @@ PGPORT ?= 55432
 # `make track` works in a fresh shell. Values are exported silently.
 DISCLOSURE_ENV_DIR ?= $(HOME)/.config/agent-invest/disclosure_anchor
 WITH_ENV = set -a; for f in worker.env cninfo.env; do [ -r "$(DISCLOSURE_ENV_DIR)/$$f" ] && . "$(DISCLOSURE_ENV_DIR)/$$f"; done; set +a;
+WITH_WORKER_ENV = set -a; [ -r "$(DISCLOSURE_ENV_DIR)/worker.env" ] && . "$(DISCLOSURE_ENV_DIR)/worker.env"; set +a;
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	lint typecheck agent-check api archive pg-init pg-start pg-stop \
-	pg-status db-create migrate register parse build-units publish process rebuild-units rebuild-search-projection load-rules config-check track track-status track-export untrack purge-company sync worker-once worker-loop doctor-full \
-	worker-status worker-restart gc-orphans audit-unmapped-codes audit-weekly install-ops-launchd
+	pg-status db-create migrate register parse build-units publish process rebuild-units rebuild-search-projection load-rules config-check track track-status track-export untrack sync worker-once worker-loop doctor-full \
+	worker-status worker-restart mineru-smoke mineru-staged-load mineru-tunnel-status install-mineru-tunnel mineru-remote-attest mineru-admission gc-orphans audit-unmapped-codes audit-weekly install-ops-launchd \
+	generate-current-source-replay audit-live-unit-replay
 
 doctor:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -58,6 +61,30 @@ test-contract:
 
 test-data:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m unittest discover -s tests/sample_corpus -t . -p 'test_*.py'
+
+audit-live-unit-replay:
+	@test -n "$(REPLAY)" || { echo "REPLAY is required" >&2; exit 64; }
+	@test -n "$(OUTPUT)" || { echo "OUTPUT is required" >&2; exit 64; }
+	@test -n "$(SOURCE_REVISION)" || { echo "SOURCE_REVISION is required" >&2; exit 64; }
+	@set -a; \
+	. "$(DISCLOSURE_ENV_DIR)/worker.env"; \
+	set +a; \
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/audit_live_unit_replay.py \
+		--replay "$(REPLAY)" \
+		--output "$(OUTPUT)" \
+		--source-revision "$(SOURCE_REVISION)"
+
+generate-current-source-replay:
+	@test -n "$(EVALUATION)" || { echo "EVALUATION is required" >&2; exit 64; }
+	@test -n "$(RECEIPT)" || { echo "RECEIPT is required" >&2; exit 64; }
+	@test -n "$(SOURCE_REVISION)" || { echo "SOURCE_REVISION is required" >&2; exit 64; }
+	@set -a; \
+	. "$(DISCLOSURE_ENV_DIR)/worker.env"; \
+	set +a; \
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/generate_current_source_replay.py \
+		--evaluation-output "$(EVALUATION)" \
+		--receipt-output "$(RECEIPT)" \
+		--source-revision "$(SOURCE_REVISION)"
 
 test-integration:
 	@$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tests.integration._runner
@@ -109,14 +136,17 @@ build-units:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline build-units --document-id "$(DOC)"
 
 publish:
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline publish --processing-run-id "$(RUN)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
+	@case "$(ALLOW_EMPTY)" in ""|YES) ;; *) echo 'ALLOW_EMPTY must be empty or YES' >&2; exit 2;; esac
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline publish --processing-run-id "$(RUN)" $(if $(filter YES,$(ALLOW_EMPTY)),--allow-empty) $(if $(REASON),--reason "$(REASON)")
 
 process:
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline process --document-id "$(DOC)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
+	@case "$(ALLOW_EMPTY)" in ""|YES) ;; *) echo 'ALLOW_EMPTY must be empty or YES' >&2; exit 2;; esac
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline process --document-id "$(DOC)" $(if $(filter YES,$(ALLOW_EMPTY)),--allow-empty) $(if $(REASON),--reason "$(REASON)")
 
 # Rules-only iteration: reuse the latest succeeded parse artifacts, no MinerU.
 rebuild-units:
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline rebuild-units --document-id "$(DOC)" $(if $(ALLOW_EMPTY),--allow-empty) $(if $(REASON),--reason "$(REASON)")
+	@case "$(ALLOW_EMPTY)" in ""|YES) ;; *) echo 'ALLOW_EMPTY must be empty or YES' >&2; exit 2;; esac
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline rebuild-units --document-id "$(DOC)" $(if $(filter YES,$(ALLOW_EMPTY)),--allow-empty) $(if $(REASON),--reason "$(REASON)")
 
 # Rebuild the 06R derived search projection (U7): delta by default, ALL=YES for a
 # full recompute + orphan prune after a retrieval rules/dictionary version bump.
@@ -129,36 +159,44 @@ rebuild-search-projection:
 load-rules:
 	$(WITH_ENV) PYTHONPATH=src .venv/bin/python scripts/load_classification_rules.py
 
-# Offline validation of config/watchlist.csv + config/processing_policy.json
-# (HA check_config pattern): file/line errors, no DB access.
+# Offline validation of watchlist + default research-universe sidecar + policy
+# (HA check_config pattern): file/line errors, no DB access. FILE validates the
+# exact custom import file; SCREEN_MANIFEST optionally binds its provenance.
 config-check:
-	PYTHONPATH=src .venv/bin/python scripts/config_check.py
+	@PYTHONPATH=src .venv/bin/python scripts/config_check.py \
+		$(if $(FILE),--watchlist "$(FILE)") \
+		$(if $(SCREEN_MANIFEST),--screen-manifest "$(SCREEN_MANIFEST)")
 
 # Import companies into tracked_company (the DB is the pool's source of
-# truth; the CSV is the import/seed + git-snapshot format). Offline +
-# idempotent; the worker backfills new companies on its next round.
+# truth; the CSV is the import/seed + git-snapshot format). The DB write is
+# idempotent; file/bulk profile enrichment is deferred to the audited worker.
 track: config-check
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline track $(if $(FILE),--file "$(FILE)") $(if $(CODES),--codes "$(CODES)") $(if $(PRUNE_DRIFT),--prune-drift) $(if $(DRY_RUN),--dry-run)
+	@case "$(PRUNE_DRIFT)" in ""|YES) ;; *) echo 'PRUNE_DRIFT must be empty or YES' >&2; exit 2;; esac
+	@case "$(DRY_RUN)" in ""|1) ;; *) echo 'DRY_RUN must be empty or 1' >&2; exit 2;; esac
+	@case "$(SKIP_PROFILE_RESOLUTION)" in ""|YES) ;; *) echo 'SKIP_PROFILE_RESOLUTION must be empty or YES' >&2; exit 2;; esac
+	@{ [ -z "$(FILE)" ] || [ -z "$(CODES)" ]; } || { echo 'FILE and CODES are mutually exclusive' >&2; exit 2; }
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline track \
+		$(if $(FILE),--file "$(FILE)") \
+		$(if $(CODES),--codes "$(CODES)") \
+		$(if $(SCREEN_MANIFEST),--screen-manifest "$(SCREEN_MANIFEST)") \
+		$(if $(filter YES,$(PRUNE_DRIFT)),--prune-drift) \
+		$(if $(filter 1,$(DRY_RUN)),--dry-run) \
+		$(if $(CODES),$(if $(filter YES,$(SKIP_PROFILE_RESOLUTION)),--skip-profile-resolution),--skip-profile-resolution)
 
 track-status:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline track-status
 
-# Snapshot the DB pool back into config/watchlist.csv (git point-in-time
-# backup; round-trips with `make track`). OUT=path overrides the target.
+# Snapshot the DB pool to an explicit path. Never default to the reviewed
+# config/watchlist.csv: pre-import evidence must not be overwritten by export.
 track-export:
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline track-export --out "$(or $(OUT),config/watchlist.csv)"
+	@test -n "$(OUT)" || (echo 'usage: make track-export OUT=/timestamped/path/watchlist.csv' >&2; exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline track-export --out "$(OUT)"
 
 # Remove companies from the pool (deletes tracked rows; company/documents
 # stay). Reversible stop is status=paused via track/PUT instead.
 untrack:
 	@test -n "$(CODES)" || (echo 'usage: make untrack CODES=600887[,601318]' && exit 2)
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline untrack --codes "$(CODES)"
-
-# TEST-PHASE ONLY: corpus-gated cascade delete of one company (rows + files)
-# for undoing a specifically identified mistake or test residue.
-purge-company:
-	@test "$(PURGE)" = "YES" || (echo 'usage: make purge-company CODE=600887 PURGE=YES  (test-phase only!)' && exit 2)
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline purge-company --code "$(CODE)" $(if $(EXCHANGE),--exchange "$(EXCHANGE)") --yes
 
 sync:
 	@test -n "$(COMPANY)" || (echo 'usage: make sync COMPANY=<scode> [WINDOW=N]' && exit 2); \
@@ -168,7 +206,72 @@ worker-once:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker once
 
 worker-loop:
-	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker loop
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker loop --progress terminal
+
+# DB-free deployment gate: repeated multimodal canary + one frozen full-PDF
+# official writer parse. The command removes its temporary parse tree and
+# persists only explicit receipt/cache paths.
+mineru-smoke:
+	@test -n "$(RUNTIME_MANIFEST)" || (echo 'usage: make mineru-smoke RUNTIME_MANIFEST=/path/runtime.json RECEIPT=/path/receipt.json CANARY_CACHE=/path/canary.json [INPUT=/path/file.pdf EXPECTED_SHA256=...]' && exit 2)
+	@test -n "$(RECEIPT)" || (echo 'mineru-smoke: RECEIPT is required' && exit 2)
+	@test -n "$(CANARY_CACHE)" || (echo 'mineru-smoke: CANARY_CACHE is required' && exit 2)
+	$(WITH_WORKER_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/mineru_smoke.py \
+		--runtime-manifest "$(RUNTIME_MANIFEST)" \
+		--receipt-out "$(RECEIPT)" \
+		--canary-cache-out "$(CANARY_CACHE)" \
+		$(if $(INPUT),--input "$(INPUT)") \
+		$(if $(EXPECTED_SHA256),--expected-input-sha256 "$(EXPECTED_SHA256)")
+
+# DB/queue-free fixed-API load gate. Stages are intentionally not configurable:
+# 4/8/16 clients submit documents to 3 API task slots; each active task has a
+# service-side inference cap of 7, so the active upper bound remains 21.
+mineru-staged-load:
+	@test -n "$(RUNTIME_MANIFEST)" || (echo 'usage: make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json INPUT=/path/frozen-multipage.pdf EXPECTED_SHA256=<sha256> RECEIPT=/path/new-receipt.json [WORK_ROOT=/private/scratch TIMEOUT_SECONDS=1800]' && exit 2)
+	@test -n "$(INPUT)" || (echo 'mineru-staged-load: INPUT is required' && exit 2)
+	@test -n "$(EXPECTED_SHA256)" || (echo 'mineru-staged-load: EXPECTED_SHA256 is required' && exit 2)
+	@test -n "$(RECEIPT)" || (echo 'mineru-staged-load: RECEIPT is required' && exit 2)
+	$(WITH_WORKER_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/mineru_staged_load.py \
+		--runtime-manifest "$(RUNTIME_MANIFEST)" \
+		--input "$(INPUT)" \
+		--expected-input-sha256 "$(EXPECTED_SHA256)" \
+		--receipt-out "$(RECEIPT)" \
+		$(if $(WORK_ROOT),--work-root "$(WORK_ROOT)") \
+		$(if $(TIMEOUT_SECONDS),--timeout-seconds "$(TIMEOUT_SECONDS)")
+
+# Fixed API transport is a separate LaunchAgent from the worker. It may stay
+# resident while the worker is unloaded, but never exposes a non-loopback port.
+mineru-tunnel-status:
+	@./scripts/mineru_tunnel_status.sh
+
+install-mineru-tunnel:
+	@./scripts/install_mineru_tunnel_launchd.sh
+
+# Read-only v3 attestation uses the operator identity because it executes the
+# fixed PowerShell collector. It must never use the forwarding-only tunnel key.
+mineru-remote-attest:
+	@test -n "$(MINERU_BIN)" || { echo 'MINERU_BIN is required' >&2; exit 64; }
+	@test -n "$(SSH_HOST)" || { echo 'SSH_HOST is required' >&2; exit 64; }
+	@test -n "$(SSH_USER)" || { echo 'SSH_USER is required' >&2; exit 64; }
+	@test -n "$(SSH_IDENTITY)" || { echo 'SSH_IDENTITY is required' >&2; exit 64; }
+	@test -n "$(SSH_KNOWN_HOSTS)" || { echo 'SSH_KNOWN_HOSTS is required' >&2; exit 64; }
+	@test -n "$(MANIFEST)" || { echo 'MANIFEST is required' >&2; exit 64; }
+	@test -n "$(OBSERVATION)" || { echo 'OBSERVATION is required' >&2; exit 64; }
+	@PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/attest_mineru_remote_runtime.py \
+		--mineru-bin "$(MINERU_BIN)" \
+		--ssh-host "$(SSH_HOST)" \
+		--ssh-user "$(SSH_USER)" \
+		--ssh-port "$(SSH_PORT)" \
+		--identity-file "$(SSH_IDENTITY)" \
+		--known-hosts-file "$(SSH_KNOWN_HOSTS)" \
+		--expected-compose "$(CURDIR)/config/mineru-windows.compose.yaml" \
+		--collector-source "$(CURDIR)/scripts/windows/collect_mineru_runtime.ps1" \
+		--manifest-out "$(MANIFEST)" \
+		--observation-out "$(OBSERVATION)"
+
+# DB-free resident admission check against the current private worker.env.
+mineru-admission:
+	@$(WITH_WORKER_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -c \
+		'from disclosure_anchor.adapters.runtime.mineru_deployment_gate import require_mineru_deployment_gate; from disclosure_anchor.settings import load_settings; require_mineru_deployment_gate(load_settings(), parse_enabled=True); print("MinerU admission: PASS")'
 
 # Resident worker control. kickstart reloads code/env only for a job whose
 # installed plist is already current; plist changes require the staged
@@ -176,9 +279,7 @@ worker-loop:
 worker-status:
 	@launchctl print gui/$$(id -u)/com.agentinvest.disclosure-worker 2>/dev/null \
 		| grep -E "state|pid|last exit" || echo "[warn] worker job not loaded"
-	@echo "--- latest report ---"
-	@$(WITH_ENV) tail -n 30 "$$DISCLOSURE_RUNTIME_ROOT/reports/worker/$$(date +%F).md" 2>/dev/null \
-		|| echo "[note] no report for today yet"
+	@$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker status
 
 worker-restart:
 	launchctl kickstart -k gui/$$(id -u)/com.agentinvest.disclosure-worker

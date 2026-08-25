@@ -26,6 +26,10 @@ from disclosure_anchor.application.ports.disclosure_source import (
 )
 from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
 from disclosure_anchor.domain.errors import SourceRequestError
+from disclosure_anchor.domain.value_objects import (
+    canonical_security_identity,
+    infer_mainland_exchange,
+)
 
 
 # Observed 2026-07-06: the gateway intermittently rejects large-span windows
@@ -231,12 +235,13 @@ def _fallback_category_names() -> dict[str, str]:
 
 
 class CninfoWebIndexSource:
-    """Web-channel index/download with API-channel company profiles.
+    """Web-first source with a credentialed API route for BSE.
 
     The listing API carries a per-account allowance that walls off large
-    backfills while the profile API keeps answering, so the index and PDF
-    downloads ride the public website channel and profiles stay on the API —
-    degrading to the web channel's None whenever the API refuses.
+    backfills, so SSE/SZSE index and PDF traffic stays on the public website.
+    The website channel has no verified BSE column: BSE index and PDF traffic
+    therefore uses the injected credentialed API or fails closed.  Company
+    profiles remain API-only and degrade to ``None`` when the API refuses.
     """
 
     def __init__(
@@ -251,10 +256,38 @@ class CninfoWebIndexSource:
     def search_announcements(
         self, security: SourceSecurity, window: DisclosureWindow
     ) -> list[AnnouncementRef]:
+        try:
+            _, exchange = canonical_security_identity(
+                security.security_code,
+                security.exchange,
+            )
+        except ValueError as exc:
+            raise SourceRequestError(
+                f"invalid CNINFO security identity: {exc}",
+                error_code="invalid_security_identity",
+                retryable=False,
+            ) from exc
+        if exchange == "BSE":
+            return self._bse_api().search_announcements(security, window)
         return self._web.search_announcements(security, window)
 
     def download_pdf(self, ref: AnnouncementRef) -> bytes:
+        try:
+            exchange = infer_mainland_exchange(ref.security_code)
+        except ValueError:
+            exchange = None
+        if exchange == "BSE":
+            return self._bse_api().download_pdf(ref)
         return self._web.download_pdf(ref)
+
+    def _bse_api(self) -> CninfoSource:
+        if self._api is None:
+            raise SourceRequestError(
+                "CNINFO BSE index/download requires the credentialed API channel",
+                error_code="bse_api_required",
+                retryable=False,
+            )
+        return self._api
 
     def profile_for_security(
         self, security_code: str

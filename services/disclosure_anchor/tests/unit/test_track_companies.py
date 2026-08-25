@@ -322,6 +322,11 @@ class PlaceholderUpgradeTests(unittest.TestCase):
         self.assertFalse(by_code["301046"].resolved)
         names = {c.legal_name for c in uow.companies.items.values()}
         self.assertIn("华测检测认证集团股份有限公司", names)
+        accesses = uow.source_accesses.all()
+        self.assertEqual(len(accesses), 2)
+        self.assertEqual(accesses[0].provider_interface, "cninfo:p_stock2100")
+        self.assertEqual(accesses[0].status, "ok")
+        self.assertEqual(accesses[1].status, "failed")
         # Failure keeps the placeholder (first sync heals it later).
         self.assertTrue(
             any(n.startswith(PENDING_LEGAL_NAME_PREFIX) for n in names)
@@ -359,6 +364,9 @@ class PlaceholderUpgradeTests(unittest.TestCase):
         self.assertEqual(calls, ["300012"])
         self.assertEqual(len(results), 1)
         self.assertFalse(results[0].resolved)
+        access = uow.source_accesses.all()[0]
+        self.assertEqual(access.provider_interface, "cninfo:p_stock2100")
+        self.assertEqual(access.status, "failed")
 
     def test_real_name_conflict_still_contested(self) -> None:
         from disclosure_anchor.domain.errors import SubjectIdentityConflictError

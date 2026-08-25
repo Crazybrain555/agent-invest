@@ -9,6 +9,7 @@ import unittest
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_ROOT = _SERVICE_ROOT / "src" / "disclosure_anchor"
 _GREENFIELD_CORE_FILES = (
+    _SOURCE_ROOT / "application" / "contracts" / "applicability_selector.py",
     _SOURCE_ROOT / "application" / "contracts" / "document_outline.py",
     _SOURCE_ROOT / "application" / "contracts" / "html_visible_text.py",
     _SOURCE_ROOT / "application" / "contracts" / "provider_document.py",
@@ -38,6 +39,7 @@ _HISTORICAL_EVIDENCE_CONTRACT = (
 )
 _ALLOWED_DISCLOSURE_IMPORTS = (
     "disclosure_anchor.adapters.parsers.mineru_medium",
+    "disclosure_anchor.application.contracts.applicability_selector",
     "disclosure_anchor.application.contracts.document_outline",
     "disclosure_anchor.application.contracts.html_visible_text",
     "disclosure_anchor.application.contracts.parser_target",

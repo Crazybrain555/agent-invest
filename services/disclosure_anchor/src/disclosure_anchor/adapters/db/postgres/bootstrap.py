@@ -1,12 +1,12 @@
 """Idempotent database/role/schema bootstrap.
 
-This runs *before* migrations. It creates the cluster-level roles, the service
-database (owned by ``disclosure_owner``) and the three schemas with their
-schema-level USAGE grants. Table/view grants are applied by the migration once
-the objects exist.
+This runs *before* migrations. It creates the cluster-level roles, verifies the
+shared ``invest_engine`` database already exists, and creates the three owned
+schemas with their schema-level USAGE grants. Table/view grants are applied by
+the migration once the objects exist.
 
-All statements are safe to re-run. ``CREATE DATABASE`` cannot run inside a
-transaction, so the admin engine uses AUTOCOMMIT.
+The service never creates or owns the shared database; database provisioning is
+a repository-level operation outside this component boundary.
 """
 
 from __future__ import annotations
@@ -23,7 +23,9 @@ from disclosure_anchor.adapters.db.postgres.schema import (
     OWNER_ROLE,
     PUBLIC_SCHEMA,
     READ_ONLY_PUBLIC_ROLES,
+    SHARED_DATABASE_OWNER_ROLE,
 )
+from disclosure_anchor.domain.errors import ConfigurationError
 
 
 def _quote_ident(identifier: str) -> str:
@@ -63,19 +65,27 @@ def ensure_roles(admin_engine: Engine) -> None:
 
 
 def ensure_database(admin_engine: Engine) -> None:
-    """Create the service database owned by ``disclosure_owner`` if absent."""
+    """Fail unless the existing shared database is not service-owned."""
 
     with admin_engine.connect() as conn:
-        exists = conn.execute(
-            text("SELECT 1 FROM pg_database WHERE datname = :name"),
+        database_owner = conn.execute(
+            text(
+                "SELECT r.rolname FROM pg_database AS d "
+                "JOIN pg_roles AS r ON r.oid = d.datdba "
+                "WHERE d.datname = :name"
+            ),
             {"name": DATABASE_NAME},
         ).scalar()
-        if not exists:
-            conn.execute(
-                text(
-                    f"CREATE DATABASE {_quote_ident(DATABASE_NAME)} "
-                    f"OWNER {_quote_ident(OWNER_ROLE)}"
-                )
+        if database_owner is None:
+            raise ConfigurationError(
+                f"shared database {DATABASE_NAME!r} does not exist; "
+                "provision it at the repository level before service bootstrap"
+            )
+        if database_owner != SHARED_DATABASE_OWNER_ROLE:
+            raise ConfigurationError(
+                f"shared database {DATABASE_NAME!r} must be owned by repository "
+                f"role {SHARED_DATABASE_OWNER_ROLE!r}, got {database_owner!r}; "
+                "reassign ownership outside this service before bootstrap"
             )
 
 
@@ -110,7 +120,7 @@ def ensure_schemas_and_base_grants(target_engine: Engine) -> None:
 
 
 def bootstrap_all(admin_engine: Engine, target_engine: Engine) -> None:
-    """Full bootstrap: roles + database (admin), then schemas/grants (target)."""
+    """Full bootstrap: roles + shared DB check, then owned schemas/grants."""
 
     ensure_roles(admin_engine)
     ensure_database(admin_engine)

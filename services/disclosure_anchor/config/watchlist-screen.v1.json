@@ -1,0 +1,166 @@
+{
+  "schema": "research_priority_universe.v5",
+  "purpose": "research_priority_universe",
+  "selection_rule_version": "a_share_research_priority.v10",
+  "observed_at_utc": "2026-08-23T05:11:09+00:00",
+  "joined_date": "2026-08-23",
+  "screen": {
+    "logical_name": "public-a-share-screen-input.v10.json",
+    "schema": "public_a_share_screen_input.v6",
+    "sha256": "94e1673d384585cc40e94e9ae83efa0372cb72816fa424fad4b4d625182bc9a9",
+    "bytes": 42058482,
+    "row_count": 5548,
+    "evidence_relpath": "watchlist/a_share_research_priority.v10/2026-08-23/public-a-share-screen-input.v10.json"
+  },
+  "fetch_receipt": {
+    "logical_name": "source-fetch-receipt.json",
+    "sha256": "fccaff5f728daef24a0801537f8a3de57595a75c0c10810d9474e8bbfd48d60c",
+    "bytes": 60633,
+    "evidence_relpath": "watchlist/a_share_research_priority.v3/2026-08-23/sources/source-fetch-receipt.json"
+  },
+  "sources": {
+    "identity": {
+      "provider": "CNINFO p_stock2101",
+      "evidence_relpath": "watchlist/a_share_research_priority.v3/2026-08-23/sources/cninfo/p-stock2101.json",
+      "rows": 7408,
+      "sha256": "4876a03b52d46a358301dac9cd8083126c2bdae3cb094843c61c8f92c83c0ac7",
+      "source_bundle_receipt_sha256": "fccaff5f728daef24a0801537f8a3de57595a75c0c10810d9474e8bbfd48d60c"
+    },
+    "quotes": {
+      "provider": "Sina Market Center hs_a",
+      "evidence_relpath": "watchlist/a_share_research_priority.v3/2026-08-23/sources/sina",
+      "rows": 5548,
+      "source_bundle_receipt_sha256": "fccaff5f728daef24a0801537f8a3de57595a75c0c10810d9474e8bbfd48d60c",
+      "unit_note": "mktcap/nmc multiplied by 10,000 to CNY"
+    },
+    "annual": {
+      "provider": "Eastmoney data center RPT_LICO_FN_CPD",
+      "evidence_relpath": "watchlist/a_share_research_priority.v3/2026-08-23/sources/eastmoney",
+      "raw_rows": 34735,
+      "source_bundle_receipt_sha256": "fccaff5f728daef24a0801537f8a3de57595a75c0c10810d9474e8bbfd48d60c",
+      "years": [
+        2023,
+        2024,
+        2025
+      ]
+    }
+  },
+  "rules": {
+    "markets": [
+      "SSE",
+      "SZSE"
+    ],
+    "boards": [
+      "SSE_MAIN",
+      "SZSE_MAIN",
+      "STAR",
+      "CHINEXT"
+    ],
+    "board_source": "CNINFO_F004V",
+    "security_type": "A股",
+    "normal_listing_required": true,
+    "risk_warning_name_excluded": true,
+    "minimum_listing_age_months": 42,
+    "listing_date_on_or_before": "2023-02-23",
+    "market_cap_min_cny": 2000000000,
+    "current_trade_price_required": false,
+    "annual_years": [
+      2023,
+      2024,
+      2025
+    ],
+    "complete_annual_profit_revenue_roe_required": true,
+    "latest_parent_profit_positive_required": true,
+    "minimum_positive_parent_profit_years": 2,
+    "future_research_signals": [
+      "revenue_cagr_meets_floor",
+      "parent_profit_cagr_meets_floor_and_base_quality",
+      "latest_parent_profit_growth_meets_floor_and_base_quality",
+      "durable_quality_compounder",
+      "profitable_turnaround_with_quality_floor"
+    ],
+    "revenue_cagr_2023_to_2025_min_ratio": 0.05,
+    "parent_profit_cagr_2023_to_2025_min_ratio": 0.1,
+    "parent_profit_growth_2024_to_2025_min_ratio": 0.1,
+    "profit_signal_prior_year_net_margin_min_ratio": 0.01,
+    "durable_quality_average_roe_min_pct": 15.0,
+    "durable_quality_revenue_cagr_min_ratio": 0.02,
+    "durable_quality_parent_profit_cagr_min_ratio": 0.02,
+    "profitable_turnaround_roe_2025_min_pct": 8.0,
+    "turnaround_continuity_required": true,
+    "roe_2025_min_pct": 5.0,
+    "bps_2025_min_cny": 1.0,
+    "ranking": "future_evidence_strength_then_growth_quality_then_security_code",
+    "csv_order_semantics": "deterministic_audit_presentation_not_runtime_scheduling",
+    "selection_count_min": 1400,
+    "selection_count_max": 1600,
+    "selection_count_semantics": "threshold_outcome_not_forced_fill"
+  },
+  "evidence_limitations": [
+    "audit_opinion_quality_not_screened",
+    "regulatory_penalty_history_not_screened",
+    "historical_liquidity_stability_not_screened",
+    "management_integrity_not_screened",
+    "governance_score_not_screened",
+    "accounting_restatement_risk_not_screened",
+    "state_ownership_not_used_as_governance_proxy",
+    "forward_consensus_estimates_not_screened",
+    "industry_runway_and_catalysts_not_screened",
+    "valuation_and_price_momentum_not_used_for_company_potential",
+    "signals_are_realized_backward_looking_annual_accounting_not_forecasts",
+    "industry_cycle_classification_not_screened",
+    "snapshot_is_not_point_in_time_and_must_not_be_used_for_backtesting",
+    "screen_is_research_priority_not_an_investment_recommendation"
+  ],
+  "result": {
+    "selected_count": 1463,
+    "selected_exchange_counts": {
+      "SSE": 678,
+      "SZSE": 785
+    },
+    "selected_board_counts": {
+      "CHINEXT": 367,
+      "SSE_MAIN": 515,
+      "STAR": 163,
+      "SZSE_MAIN": 418
+    },
+    "selected_min_market_cap_cny": 2000966757.3,
+    "selected_evidence_tier_counts": {
+      "A": 573,
+      "B": 413,
+      "C": 477
+    },
+    "eligible_after_hard_gates": 1987,
+    "exclusion_reason_counts": {
+      "cninfo_not_a_share": 0,
+      "cninfo_not_normal_listed": 206,
+      "fewer_than_two_positive_parent_profit_years": 1167,
+      "latest_parent_profit_nonpositive": 1385,
+      "listing_age_lt_3_5y": 597,
+      "market_cap_lt_2bn": 405,
+      "missing_annual_financial": 89,
+      "missing_cninfo_identity": 0,
+      "missing_listing_date": 0,
+      "missing_or_low_2025_bps": 347,
+      "missing_or_low_2025_roe": 2977,
+      "no_future_research_signal": 524,
+      "outside_research_boards": 338,
+      "risk_warning_name": 206,
+      "unsupported_exchange": 0
+    },
+    "observation_counts": {
+      "latest_two_parent_losses_all_rows": 991,
+      "latest_two_parent_losses_selected": 0,
+      "latest_parent_profit_nonpositive_all_rows": 1458,
+      "latest_parent_profit_nonpositive_selected": 0,
+      "future_research_signal_all_rows": 3080,
+      "future_research_signal_selected": 1463,
+      "ocf_per_share_missing_all_rows": 2,
+      "ocf_per_share_missing_selected": 0,
+      "ocf_per_share_nonpositive_all_rows": 990,
+      "ocf_per_share_nonpositive_selected": 103
+    },
+    "selected_identity_sha256": "305bac2283ac5873b98d3db9d6c3c6c277049265801547e36572a30f31d02b7c",
+    "watchlist_csv_sha256": "45745f2450fe9499376fe79f05b32d78a266829431d9ff2d27c617e32baa680b"
+  }
+}

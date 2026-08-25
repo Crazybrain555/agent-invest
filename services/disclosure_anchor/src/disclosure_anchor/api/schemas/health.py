@@ -18,7 +18,11 @@ class QueueStatus(BaseModel):
     pending_publish: int
     download_dead_letters: int
     parse_dead_letters: int
+    build_dead_letters: int
     retrying_documents: int
+    retrying_builds: int
+    degraded_builds: int
+    active_degraded_builds: int
     sync_due: int
     # backfill admission watermark = pending_download + pending_parse backlog
     # (queries.pending_processing_backlog_count).

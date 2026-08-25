@@ -1,0 +1,984 @@
+{
+  "contract_version": "provider_unit_applicability_gold.v2",
+  "evaluations": {
+    "source": {
+      "coverage_policy": "all_non_null_plus_reviewed_null",
+      "evaluation_sha256": "sha256:d864485c5639e0af8a5fa0e6c78de331a70d7ce89428532757737be997f8f068",
+      "evaluation_id": "long-v18-r62-v98-final-collateral",
+      "taxonomy_version": "semantic-taxonomy-2026-08-r62",
+      "router_version": "semantic_router.v98",
+      "row_count": 883,
+      "projection_sha256": "sha256:d4691c204ed48923e482b1592d6937ec058fdb3de074ba7128799f82f06056fc",
+      "applicability_counts": {
+        "null": 826,
+        "applicable": 18,
+        "not_applicable": 39
+      },
+      "expected_non_null": [
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 69,
+          "title": "（3）研发投入资本化率大幅变动的原因及其合理性说明",
+          "heading_path": [
+            "第四节 董事会报告",
+            "一、经营情况讨论与分析",
+            "（六）经营和财务状况分析",
+            "9、研发投入",
+            "（3）研发投入资本化率大幅变动的原因及其合理性说明"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:c2647b487b4a73cbd8637448a513f3dcef7986ba550e4d475cf2a6b3402e4d16",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 74,
+          "title": "14、主要控股、参股企业分析",
+          "heading_path": [
+            "第四节 董事会报告",
+            "一、经营情况讨论与分析",
+            "（六）经营和财务状况分析",
+            "14、主要控股、参股企业分析"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:23989e1024623857844f3cd2431075d1c5ddaab5005416e02ce0837b1c8c4e3a",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 75,
+          "title": "15、根据《深圳证券交易所上市公司自律监管指引第 3号——行业信息披露》相关要求披露主要项目",
+          "heading_path": [
+            "第四节 董事会报告",
+            "一、经营情况讨论与分析",
+            "（六）经营和财务状况分析",
+            "15、根据《深圳证券交易所上市公司自律监管指引第 3号——行业信息披露》相关要求披露主要项目"
+          ],
+          "content_hash": "sha256:6cf63502c23017f12c1c37dc61910265ab94a247d72a25052d7570521764da3a",
+          "query_projection_hash": "sha256:7968f99b8584b902c809c735cfe7daf4985086a4755ec2b02f7779124ea1108f",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 85,
+          "title": "（一）募集资金使用情况",
+          "heading_path": [
+            "第四节 董事会报告",
+            "二、公司投资情况",
+            "（一）募集资金使用情况"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:b915b9eb0e3c4d9442545645d021bf2aa7a2903df211924902c1a7f2c1b8b507",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 96,
+          "title": "四、主要控股、参股企业分析",
+          "heading_path": [
+            "第四节 董事会报告",
+            "四、主要控股、参股企业分析"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:6000389aa96ea33e82e172a037a85985bfb20a887c912b9c01b823a53ae251de",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 97,
+          "title": "五、公司控制的结构化主体情况",
+          "heading_path": [
+            "第四节 董事会报告",
+            "五、公司控制的结构化主体情况"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:4ed99b8e4f1097df7eedd264f99ed93877386f345ec6f32900a6d3ca660af4ad",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 116,
+          "title": "三、同业竞争情况",
+          "heading_path": [
+            "第五节 公司治理报告暨企业管治报告",
+            "三、同业竞争情况"
+          ],
+          "content_hash": "sha256:ba45e3b9d9140498005945153caa6016c3b0df070b1c8baf18dcaaa68a5f7512",
+          "query_projection_hash": "sha256:ea17909328ef80440afa58029aea9814c245be680108e588bb58c3b4c524597d",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 120,
+          "title": "（二）表决权恢复的优先股股东请求召开临时股东会",
+          "heading_path": [
+            "第五节 公司治理报告暨企业管治报告",
+            "四、股东与股东会有关情况",
+            "（二）表决权恢复的优先股股东请求召开临时股东会"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:4f119457a3dff045776239f25ada63824b08d1f650ea5b3f2d03b05eb956884a",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 186,
+          "title": "二十、上市公司治理专项行动自查问题整改情况",
+          "heading_path": [
+            "第五节 公司治理报告暨企业管治报告",
+            "二十、上市公司治理专项行动自查问题整改情况"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:4a774469fc901a023bef705f241dcec0225bf287a3fc4cd46892968cd1d3f862",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 200,
+          "title": "（二）公司资产或项目存在盈利预测，且报告期仍处在盈利预测期间，公司就资产或项目达到原盈利预测及其原因做出说明",
+          "heading_path": [
+            "第六节 重要事项",
+            "一、承诺事项履行情况",
+            "（二）公司资产或项目存在盈利预测，且报告期仍处在盈利预测期间，公司就资产或项目达到原盈利预测及其原因做出说明"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:52109c19ae92307bfeecf9a170b9812eace2b4509bd61719ce745d16a4121e70",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 201,
+          "title": "二、控股股东及其关联方对上市公司的非经营性占用资金情况",
+          "heading_path": [
+            "第六节 重要事项",
+            "二、控股股东及其关联方对上市公司的非经营性占用资金情况"
+          ],
+          "content_hash": "sha256:b7f32f7d9fadf0152d6ad8770e97eac3241302d1a688fc6c25e6157b424c433c",
+          "query_projection_hash": "sha256:8d496a158fa1c51a912ff85b8781d8881bc0eb7ef79435a04510e818d4625e4a",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 202,
+          "title": "三、违规对外担保情况",
+          "heading_path": [
+            "第六节 重要事项",
+            "三、违规对外担保情况"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:8dd3806cda2f07411ca9629ab21cd8bccb36032a3505dabe1e3ac143563e7e10",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 203,
+          "title": "四、董事会对最近一期“非标准审计报告”相关情况的说明",
+          "heading_path": [
+            "第六节 重要事项",
+            "四、董事会对最近一期“非标准审计报告”相关情况的说明"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:0072b162f21cc3a03a42384c7702f436eda5496b31be57b3948d686c4e976bd1",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 204,
+          "title": "五、董事会对会计师事务所本报告期“非标准审计报告”的说明",
+          "heading_path": [
+            "第六节 重要事项",
+            "五、董事会对会计师事务所本报告期“非标准审计报告”的说明"
+          ],
+          "content_hash": "sha256:b7ed5705e37b44a0d41e62adf55de17913125f32648b5ccf250183be68980433",
+          "query_projection_hash": "sha256:e9974401dd8c264a49993a7b662350f7eccb1c8bbede3fd0d71a19207959f949",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 205,
+          "title": "六、与上年度财务报告相比，会计政策、会计估计变更或重大会计差错核算更正的情况说明",
+          "heading_path": [
+            "第六节 重要事项",
+            "六、与上年度财务报告相比，会计政策、会计估计变更或重大会计差错核算更正的情况说明"
+          ],
+          "content_hash": "sha256:899e9206eda2893f806df9b0cc0f001159e165934c73bdc94d3c44dd60f8d31b",
+          "query_projection_hash": "sha256:ec2b1fe1a0c1badc0cf3431c80a690c9073c5ec511ab553a3fbaddb8a7915740",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 206,
+          "title": "七、与上年度财务报告相比，合并报表范围发生变化的情况说明",
+          "heading_path": [
+            "第六节 重要事项",
+            "七、与上年度财务报告相比，合并报表范围发生变化的情况说明"
+          ],
+          "content_hash": "sha256:bb5a1a58bca42e2624a06efb178293ccdd789685ba900ae22a65ae1b65be85ea",
+          "query_projection_hash": "sha256:fd1cc42f76f12e272a446afcce278c86852868856d1e29be9f125067827d3363",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 208,
+          "title": "九、年度报告披露后面临暂停上市和终止上市情况",
+          "heading_path": [
+            "第六节 重要事项",
+            "九、年度报告披露后面临暂停上市和终止上市情况"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:7d52df968aefcb04ea3e7eafc111968ac19c7ad646dad738513a7a676119f41b",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 209,
+          "title": "十、破产重整相关事项",
+          "heading_path": [
+            "第六节 重要事项",
+            "十、破产重整相关事项"
+          ],
+          "content_hash": "sha256:a293e0da4ff0352c255bcb44d3c230a84852a171daa06c49b9c05fc2ceb07e09",
+          "query_projection_hash": "sha256:5f04c47e1db36ee5f43102b46f0f95832d2580f00e99ab2df30ce2b9dc2a9644",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 210,
+          "title": "十一、重大诉讼、仲裁事项",
+          "heading_path": [
+            "第六节 重要事项",
+            "十一、重大诉讼、仲裁事项"
+          ],
+          "content_hash": "sha256:8a6e0fabc63bacc64b73a767fa59528f832e6b8671a4701e62fa430bca30f343",
+          "query_projection_hash": "sha256:fae9e8ab9b550d21d37a9fa445a94ee9a64197f40aa45d65c10eacea48c8476a",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 211,
+          "title": "十二、处罚及整改情况",
+          "heading_path": [
+            "第六节 重要事项",
+            "十二、处罚及整改情况"
+          ],
+          "content_hash": "sha256:552e9dc55fa3e0c3adebb2d58b1b6b1f4045d09ffb3ca09eee7f377578747c19",
+          "query_projection_hash": "sha256:c93c47f4cc842d1ccf85c652131fd310ac40f8685339ab58f4215a233ca9022c",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 215,
+          "title": "（一）与日常经营相关的关联交易",
+          "heading_path": [
+            "第六节 重要事项",
+            "十五、重大关联交易",
+            "（一）与日常经营相关的关联交易"
+          ],
+          "content_hash": "sha256:928555aeaab870539ca131fa383c6ccdcb01b8869d97dd9ddb9e3a0347fba357",
+          "query_projection_hash": "sha256:c156718eb666c101ac5164c909299288172f56bc1398b9db70a5a0bb9e862ac9",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 216,
+          "title": "（二）资产或股权收购、出售发生的关联交易",
+          "heading_path": [
+            "第六节 重要事项",
+            "十五、重大关联交易",
+            "（二）资产或股权收购、出售发生的关联交易"
+          ],
+          "content_hash": "sha256:473bb2dbbea9c0342dfef112e74e1b28c8502b9ee9667c22d9cb45cf701df1f1",
+          "query_projection_hash": "sha256:52780173a78e3442ec3719747c1e5ec91a9c1d6b05d40b3dcafb4b54f43d6f6d",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 217,
+          "title": "（三）共同对外投资的关联交易",
+          "heading_path": [
+            "第六节 重要事项",
+            "十五、重大关联交易",
+            "（三）共同对外投资的关联交易"
+          ],
+          "content_hash": "sha256:313965372d49f15064fa9f6d1c076f5c788ca1ce05033425a95b9510864a4c07",
+          "query_projection_hash": "sha256:cfe5d3d7f195a5ee241b623d92a2943f1593a9039f0217171970dabb5669b231",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 218,
+          "title": "（四）关联债权债务往来",
+          "heading_path": [
+            "第六节 重要事项",
+            "十五、重大关联交易",
+            "（四）关联债权债务往来"
+          ],
+          "content_hash": "sha256:bac43ed5031a3795d16b0408c0d6a22e462d4a1705be973e3b55fa9fb2311616",
+          "query_projection_hash": "sha256:f0b7e18062b1152918bd1fd1892109897c3f5b7c64d6e645ce437ed40296fe37",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 220,
+          "title": "（五）与存在关联关系的财务公司的往来情况",
+          "heading_path": [
+            "第六节 重要事项",
+            "十五、重大关联交易",
+            "（五）与存在关联关系的财务公司的往来情况"
+          ],
+          "content_hash": "sha256:276a9862a1e98587d38e4cede337eca3503bc9005296182b30e8b1f0a4b57b9e",
+          "query_projection_hash": "sha256:986207313397ff6574e9328ce186f25929fccaafa7326cc334aa378a7e322309",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 221,
+          "title": "（六）公司控股的财务公司与关联方的往来情况",
+          "heading_path": [
+            "第六节 重要事项",
+            "十五、重大关联交易",
+            "（六）公司控股的财务公司与关联方的往来情况"
+          ],
+          "content_hash": "sha256:ba45e3b9d9140498005945153caa6016c3b0df070b1c8baf18dcaaa68a5f7512",
+          "query_projection_hash": "sha256:8d767750aaafa20a21e2588a0cb31ce99de88274c4b73c6caf1bf1bfe6f78ec5",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 222,
+          "title": "（七）其他重大关联交易",
+          "heading_path": [
+            "第六节 重要事项",
+            "十五、重大关联交易",
+            "（七）其他重大关联交易"
+          ],
+          "content_hash": "sha256:42522b57c056df0b449cb5c18d8138185c0a7e1fe36ba7759b7fed7c0e30a667",
+          "query_projection_hash": "sha256:46ba3215a60bfa88426cc309ca7efb8587c6ab367e0966ccde6f4d4022b33182",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 230,
+          "title": "1、委托理财情况",
+          "heading_path": [
+            "第六节 重要事项",
+            "十六、重大合同及其履行情况",
+            "（三）委托他人进行现金资产管理情况",
+            "1、委托理财情况"
+          ],
+          "content_hash": "sha256:169658174a82d20d7ba5817fa33ec34fb92a7e64391e6a16a3b4683bb0839d20",
+          "query_projection_hash": "sha256:d61069ebebfa97dbdd04ffbf65d625e7f41685b3ce2e6321ae14a55406a088fa",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 231,
+          "title": "2、委托贷款情况",
+          "heading_path": [
+            "第六节 重要事项",
+            "十六、重大合同及其履行情况",
+            "（三）委托他人进行现金资产管理情况",
+            "2、委托贷款情况"
+          ],
+          "content_hash": "sha256:ce1686dd2821f343358f1219f61131ef37dbb885c47d3b71e1a0e4ad6f62f238",
+          "query_projection_hash": "sha256:2dba6b85146d98a2cfd296dcff4522d8177a34053ec744b906bd73a86e213d22",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 234,
+          "title": "十八、公司子公司重大事项",
+          "heading_path": [
+            "第六节 重要事项",
+            "十八、公司子公司重大事项"
+          ],
+          "content_hash": "sha256:51a9733956d2e80eb5675382baa01de24feaadf3920022852abef2e73b7d534e",
+          "query_projection_hash": "sha256:5f7e386fe1cc05e816c9362085c3ad4603d6049347b2a491877f11c50b9d0089",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 235,
+          "title": "十九、购买、出售或赎回本公司之上市证券",
+          "heading_path": [
+            "第六节 重要事项",
+            "十九、购买、出售或赎回本公司之上市证券"
+          ],
+          "content_hash": "sha256:7748b37346126f30dc466338d8adea559a435867a143d0b058db6dde9946398d",
+          "query_projection_hash": "sha256:5d2a635ab13fd47160b3ee1cdac481493792815de87981b5f468640f67326d6f",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 242,
+          "title": "（一）报告期内证券发行情况",
+          "heading_path": [
+            "第七节 股份变动及股东情况",
+            "二、证券发行与上市情况",
+            "（一）报告期内证券发行情况"
+          ],
+          "content_hash": "sha256:ba45e3b9d9140498005945153caa6016c3b0df070b1c8baf18dcaaa68a5f7512",
+          "query_projection_hash": "sha256:afb133083433d989b50709368d506aaeb3e44f74c102f5de34e5678dba764c75",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 243,
+          "title": "（二）公司股份总数及股东结构的变动、公司资产和负债结构的变动情况说明",
+          "heading_path": [
+            "第七节 股份变动及股东情况",
+            "二、证券发行与上市情况",
+            "（二）公司股份总数及股东结构的变动、公司资产和负债结构的变动情况说明"
+          ],
+          "content_hash": "sha256:fa059e551cbedabcc99e0023a34f9056d12263e4ec0cd8c4d336458c00c9dad1",
+          "query_projection_hash": "sha256:8ef3255926da1764815aa1b0916bea065978d0a3b8177d3974e0234e19358171",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 248,
+          "title": "（四）公司第一大股东累计质押股份数量占其所持公司股份数量比例达到 80%",
+          "heading_path": [
+            "第七节 股份变动及股东情况",
+            "三、股东情况介绍（截至 2025年 12月 31日）",
+            "（四）公司第一大股东累计质押股份数量占其所持公司股份数量比例达到 80%"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:71542389e4586ebab96c2ac935e430901d141a2a4e31ec642b6177318aa91729",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 250,
+          "title": "（六）控股股东、实际控制人、重组方及其他承诺主体股份限制减持情况",
+          "heading_path": [
+            "第七节 股份变动及股东情况",
+            "三、股东情况介绍（截至 2025年 12月 31日）",
+            "（六）控股股东、实际控制人、重组方及其他承诺主体股份限制减持情况"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:a969b1c73a22ec125446255e49084e6c16083496f047c7acf0d871d47a083c3b",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 251,
+          "title": "四、股份回购在报告期的具体实施情况",
+          "heading_path": [
+            "第七节 股份变动及股东情况",
+            "四、股份回购在报告期的具体实施情况"
+          ],
+          "content_hash": "sha256:ba45e3b9d9140498005945153caa6016c3b0df070b1c8baf18dcaaa68a5f7512",
+          "query_projection_hash": "sha256:6ce60e16437391b1a372588b4beb6451e6c132208a3cd6086c0d8f325e869adf",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 252,
+          "title": "五、优先股相关情况",
+          "heading_path": [
+            "第七节 股份变动及股东情况",
+            "五、优先股相关情况"
+          ],
+          "content_hash": "sha256:f3d58364745dfa328b25bc347c90e9be0f166ca777e902b80d5a5d36adfff3d4",
+          "query_projection_hash": "sha256:031e2448ec563ad26fa97127dd159cd53989344df46ca00cc86658c4797d0ecb",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 256,
+          "title": "一、企业债券",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "一、企业债券"
+          ],
+          "content_hash": "sha256:ba45e3b9d9140498005945153caa6016c3b0df070b1c8baf18dcaaa68a5f7512",
+          "query_projection_hash": "sha256:f5c9faa6b66302d087f8d5bddd8726d18706967529b6ab62c2628a1703befa70",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 257,
+          "title": "二、公司债券",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "二、公司债券"
+          ],
+          "content_hash": "sha256:4f660c98051076fb3efb9e7914a62493ac896dae550f5ef047e5cb84ae424ca4",
+          "query_projection_hash": "sha256:1d06f0f9d8ed4f36c41282270db979c6c3afdb182b68e97d59b71e3360717431",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 259,
+          "title": "（二）逾期未偿还债券",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "二、公司债券",
+            "（二）逾期未偿还债券"
+          ],
+          "content_hash": "sha256:fd1377918d4bb4eee58fa576903009b364ebd68b192f0ca01698f98be4eed721",
+          "query_projection_hash": "sha256:5c3f93f9205ffa414d6694aaa7343ac4af0b030250a8f5e8fa05fa4504c912ae",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 260,
+          "title": "（三）发行人或投资者选择权条款、投资者保护条款的触发和执行情况",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "二、公司债券",
+            "（三）发行人或投资者选择权条款、投资者保护条款的触发和执行情况"
+          ],
+          "content_hash": "sha256:7f5a600fb2fe1131a0f1bb3786142302dc21e8d7dc213905cd19c1ce9c9ef472",
+          "query_projection_hash": "sha256:8b2237ee836ed41c1528e136845bed79a25638abbf2b83ae2044bb7c4633c41d",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 263,
+          "title": "（六）报告期内信用评级结果调整情况",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "二、公司债券",
+            "（六）报告期内信用评级结果调整情况"
+          ],
+          "content_hash": "sha256:7024e75f409aa66cab93b7ca9aa3cddaef0f2b00d5226d494525ca8a7f48c87d",
+          "query_projection_hash": "sha256:7019ecc0f7fd911933c6cf49447e66fc2f5f8f9135f2d3e168896e1a4a92c9af",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 264,
+          "title": "（七）担保情况、偿债计划及其他偿债保障措施在报告期内的执行情况和变化情况及对债券投资者权益的影响",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "二、公司债券",
+            "（七）担保情况、偿债计划及其他偿债保障措施在报告期内的执行情况和变化情况及对债券投资者权益的影响"
+          ],
+          "content_hash": "sha256:1d099195c8ad1494d4b02986e9f2a3af931fe36e26a6cf6f1bd0362950b37cd2",
+          "query_projection_hash": "sha256:175df71d38523379377a7e9fb99ed75f52492150f94a905414a0891d48227ce6",
+          "expected_applicability": "applicable",
+          "rationale": "locator.v4 修复标题 fragment 后，Unit-own leading selector仍明确适用。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 265,
+          "title": "三、非金融企业债务融资工具",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "三、非金融企业债务融资工具"
+          ],
+          "content_hash": "sha256:4f660c98051076fb3efb9e7914a62493ac896dae550f5ef047e5cb84ae424ca4",
+          "query_projection_hash": "sha256:e05e7441e1641b64b770fd8704148ce3decad2c8b131383e77662e003b0e728b",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 267,
+          "title": "（二）逾期未偿还债券",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "三、非金融企业债务融资工具",
+            "（二）逾期未偿还债券"
+          ],
+          "content_hash": "sha256:ba45e3b9d9140498005945153caa6016c3b0df070b1c8baf18dcaaa68a5f7512",
+          "query_projection_hash": "sha256:dd2fbdabf492db5b385c4808cfea19433c4e03ba1355fb0e71235cf46257b788",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 268,
+          "title": "（三）发行人或投资者选择权条款、投资者保护条款的触发和执行情况",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "三、非金融企业债务融资工具",
+            "（三）发行人或投资者选择权条款、投资者保护条款的触发和执行情况"
+          ],
+          "content_hash": "sha256:3f01db4b25af02415bf8684dbc93d805978568e1768fcbd0032b13d88e13973a",
+          "query_projection_hash": "sha256:34241988db43b87061d838ea17b7d36f1fd29e11b21b548a96efb88c86627cc7",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 272,
+          "title": "（六）报告期内信用评级结果调整情况",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "三、非金融企业债务融资工具",
+            "（六）报告期内信用评级结果调整情况"
+          ],
+          "content_hash": "sha256:3582d0be4800cea4306eca9f7b01d7988f32b09a08bb2a22d6089f80f654a0c7",
+          "query_projection_hash": "sha256:b3e492ddcdadf2a298df6deac4e52865f7c94a676364298ab5030a535bb7f826",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 273,
+          "title": "（七）担保情况、偿债计划及其他偿债保障措施在报告期内的执行情况和变化情况及对债券投资者权益的影响",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "三、非金融企业债务融资工具",
+            "（七）担保情况、偿债计划及其他偿债保障措施在报告期内的执行情况和变化情况及对债券投资者权益的影响"
+          ],
+          "content_hash": "sha256:3112fea5fd9ae3ca490a55df3a9f0f5040cab18ab9e50e611c56bfc4fba98747",
+          "query_projection_hash": "sha256:b4288cb4dccf5ffdbc12b638b4cd3d7f5170d50c0a91f545d9d17afb1188c85b",
+          "expected_applicability": "applicable",
+          "rationale": "恢复的同级债券 Unit 自有 leading selector，必须保留适用状态。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 274,
+          "title": "四、可转换公司债券",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "四、可转换公司债券"
+          ],
+          "content_hash": "sha256:aee050f65c35406c09c6716afa3e389f2256df96cf41da6c08f1bb1e43ff31b7",
+          "query_projection_hash": "sha256:6f2f172f8c14bde1cdcd5366b08f842679e587dede6085aeb68d02e934b0bed1",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 275,
+          "title": "五、报告期内合并报表范围亏损超过上年末净资产 10%",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "五、报告期内合并报表范围亏损超过上年末净资产 10%"
+          ],
+          "content_hash": "sha256:e05479eeef68d1dd3395e57f3fc4aa18e91b518008e082da5a249732c0694033",
+          "query_projection_hash": "sha256:1bd7fd932ba2f6e8f641074f29c034be3180bed7dd386ee5961cd83f9c1ecfa3",
+          "expected_applicability": "applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 276,
+          "title": "六、报告期末除债券外的有息债务逾期情况",
+          "heading_path": [
+            "第八节 债券相关情况",
+            "六、报告期末除债券外的有息债务逾期情况"
+          ],
+          "content_hash": "sha256:ba45e3b9d9140498005945153caa6016c3b0df070b1c8baf18dcaaa68a5f7512",
+          "query_projection_hash": "sha256:5173da5169e963fea6a5484404cede27aa7df807bdc0c58a9032fc0b29fb53df",
+          "expected_applicability": "not_applicable",
+          "rationale": "逐行审阅的 source-bound selector；纳入 source replay 全部非空 applicability 闭集。"
+        },
+        {
+          "provider_document_id": "1225475808",
+          "unit_index": 7,
+          "title": "3、境内外会计准则下会计数据差异原因说明",
+          "heading_path": [
+            "三、会计数据和财务指标",
+            "3.2 主要会计数据和财务指标",
+            "境内外会计准则下会计数据差异",
+            "3、境内外会计准则下会计数据差异原因说明"
+          ],
+          "content_hash": "sha256:ba45e3b9d9140498005945153caa6016c3b0df070b1c8baf18dcaaa68a5f7512",
+          "query_projection_hash": "sha256:6aef77020e629af3fb90c11efa9371172f68deeca40783dad0a8dff11cf0d79e",
+          "expected_applicability": "not_applicable",
+          "rationale": "标题自有闭合 selector 为不适用；相邻会计准则差异正文不改变本 Unit 的独立状态。"
+        },
+        {
+          "provider_document_id": "1225475808",
+          "unit_index": 9,
+          "title": "非经常性损益项目及金额",
+          "heading_path": [
+            "三、会计数据和财务指标",
+            "3.2 主要会计数据和财务指标",
+            "非经常性损益项目及金额"
+          ],
+          "content_hash": "sha256:607c87d5645410e68a78bbaf2c3e97b15d3412f7d4199d0bedbd847448032145",
+          "query_projection_hash": "sha256:fbaa2fa65b9f2259541dff02e21a8aa276e312f4733b9b487267fd150780eba1",
+          "expected_applicability": "applicable",
+          "rationale": "Unit 开头明确勾选适用，随后表格给出非经常性损益项目和金额。"
+        },
+        {
+          "provider_document_id": "1225475808",
+          "unit_index": 24,
+          "title": "五、在半年度报告批准报出日存续的债券情况",
+          "heading_path": [
+            "五、在半年度报告批准报出日存续的债券情况"
+          ],
+          "content_hash": "sha256:ba45e3b9d9140498005945153caa6016c3b0df070b1c8baf18dcaaa68a5f7512",
+          "query_projection_hash": "sha256:f27b835ec4e406397b53686f0ff5a4d480a3f85e5c04f724adf4de89a54f2dcc",
+          "expected_applicability": "not_applicable",
+          "rationale": "债券情况标题下只有闭合不适用 selector，状态属于该 Unit。"
+        },
+        {
+          "provider_document_id": "1225482969",
+          "unit_index": 6,
+          "title": "2.4 截至报告期末的优先股股东总数、前 10 名优先股股东情况表",
+          "heading_path": [
+            "第二节 公司基本情况",
+            "2.4 截至报告期末的优先股股东总数、前 10 名优先股股东情况表"
+          ],
+          "content_hash": "sha256:ba45e3b9d9140498005945153caa6016c3b0df070b1c8baf18dcaaa68a5f7512",
+          "query_projection_hash": "sha256:2362589120f417852b5be46dece9acb1b6f18c41a60df4e2e0fa007659076276",
+          "expected_applicability": "not_applicable",
+          "rationale": "优先股股东情况标题下只有闭合不适用 selector。"
+        },
+        {
+          "provider_document_id": "1225482969",
+          "unit_index": 7,
+          "title": "2.5 控股股东或实际控制人变更情况",
+          "heading_path": [
+            "第二节 公司基本情况",
+            "2.5 控股股东或实际控制人变更情况"
+          ],
+          "content_hash": "sha256:ba45e3b9d9140498005945153caa6016c3b0df070b1c8baf18dcaaa68a5f7512",
+          "query_projection_hash": "sha256:69dacbb97d4417378aaa643e04a8dde771b7a57f0c7c88bf9614cf7910b0fb21",
+          "expected_applicability": "not_applicable",
+          "rationale": "控制人变更标题下只有闭合不适用 selector。"
+        },
+        {
+          "provider_document_id": "1225482969",
+          "unit_index": 8,
+          "title": "2.6 在半年度报告批准报出日存续的债券情况",
+          "heading_path": [
+            "第二节 公司基本情况",
+            "2.6 在半年度报告批准报出日存续的债券情况"
+          ],
+          "content_hash": "sha256:ba45e3b9d9140498005945153caa6016c3b0df070b1c8baf18dcaaa68a5f7512",
+          "query_projection_hash": "sha256:6bf91b87d40950c9ed8fdec2b0d90999bee8bb401c4e59d3aa5dec6d87d968a5",
+          "expected_applicability": "not_applicable",
+          "rationale": "债券情况标题下只有闭合不适用 selector。"
+        }
+      ],
+      "reviewed_null": [
+        {
+          "provider_document_id": "1225482969",
+          "unit_index": 9,
+          "title": "第三节 重要事项",
+          "heading_path": [
+            "第三节 重要事项"
+          ],
+          "content_hash": "sha256:31046b5b4d1d0205af97c030ce23c3e8bf8288a39b7e03214aafc0aaa0492331",
+          "query_projection_hash": "sha256:08fcbe0f4138a0386ebcfd23b09490676aebbb4998ceec55163ba2db9105263a",
+          "expected_applicability": null,
+          "rationale": "标题后的普通 paragraph 未提供 source-derived prompt role；其相邻 selector 不足以授权整个 Unit 的 applicability。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 68,
+          "title": "9、研发投入",
+          "heading_path": [
+            "第四节 董事会报告",
+            "一、经营情况讨论与分析",
+            "（六）经营和财务状况分析",
+            "9、研发投入"
+          ],
+          "content_hash": "sha256:99a4f6f1429435828cad0323cf70bbd32c242534f7ff2a62d3d082e14c885c1e",
+          "query_projection_hash": "sha256:97dbb15710d79edd66307e4b306cfa4a85517158a477f721ee139a2080a0f58c",
+          "expected_applicability": null,
+          "rationale": "研发正文和数据表后的子问题不适用不得污染父 Unit。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 87,
+          "title": "1、金融资产投资",
+          "heading_path": [
+            "第四节 董事会报告",
+            "二、公司投资情况",
+            "（二）非募集资金使用情况",
+            "1、金融资产投资"
+          ],
+          "content_hash": "sha256:319b4dc26f0f82e23a22f8e19a989ffed5031120a0e38e46fa44747437b8e4df",
+          "query_projection_hash": "sha256:f88242a620642367990bdcb41757e05b404bfab8f9167f0a59fe3a1f09ad1d88",
+          "expected_applicability": null,
+          "rationale": "证券投资子问不适用与同 Unit 衍生品实质表并存，父 Unit 诚实为 NULL。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 150,
+          "title": "2、在其他单位任职情况",
+          "heading_path": [
+            "第五节 公司治理报告暨企业管治报告",
+            "七、董事和高级管理人员情况（截至本报告披露日）",
+            "（二）现任董事、高级管理人员于报告期内在其他单位任职情况",
+            "2、在其他单位任职情况"
+          ],
+          "content_hash": "sha256:319ff2323cb8b957a289d8a3194b3f72ee11ca2d43fa9298a10984d2e6639ac3",
+          "query_projection_hash": "sha256:653cc8c956e4da093717f5e8625cdc16dbcdea3c913bf0a0bd6e67b329028d9b",
+          "expected_applicability": null,
+          "rationale": "任职表后的处罚子问不适用不代表任职主题不适用。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 168,
+          "title": "十四、利润分配及分红派息预案",
+          "heading_path": [
+            "第五节 公司治理报告暨企业管治报告",
+            "十四、利润分配及分红派息预案"
+          ],
+          "content_hash": "sha256:0c46a079188ab50393fb9f115d3f067a5396382a3dbf17353d6941bb2f13baa9",
+          "query_projection_hash": "sha256:cb534d4fb90e9ddb9bf8530e18286f1507d9b55b24d7617f3cbe384854e95576",
+          "expected_applicability": null,
+          "rationale": "利润分配实质答案后的两个子问状态不扩张成整 Unit 状态。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 219,
+          "title": "是否存在非经营性关联债权债务往来",
+          "heading_path": [
+            "第六节 重要事项",
+            "十五、重大关联交易",
+            "（四）关联债权债务往来",
+            "是否存在非经营性关联债权债务往来"
+          ],
+          "content_hash": "sha256:fd6c74cf00e27e42f2b2cdc2207e908a6600c31a01b926c8df8c8a8f3b21ef22",
+          "query_projection_hash": "sha256:fa2f7b90ad3b598f7fd4662a626c44c7c08be21d16b92c9db125536bc3368af7",
+          "expected_applicability": null,
+          "rationale": "标题后已有实质 carrier；非 leading selector 不提升为 Unit 状态。"
+        },
+        {
+          "provider_document_id": "1225067794",
+          "unit_index": 245,
+          "title": "（一）股东情况表",
+          "heading_path": [
+            "第七节 股份变动及股东情况",
+            "三、股东情况介绍（截至 2025年 12月 31日）",
+            "（一）股东情况表"
+          ],
+          "content_hash": "sha256:be7315f4e11d62e6a09c21dd8742bee0bc7ee3f7360316fae3c4a1e973d9cac8",
+          "query_projection_hash": "sha256:8eef84cbe4aa8efa2682cc36f17e0d482d0b4e4c87c95e7b811ae13ac0656b8b",
+          "expected_applicability": null,
+          "rationale": "股东表后的转融通子问不适用不得隐藏股东表。"
+        }
+      ]
+    },
+    "heldout": {
+      "coverage_policy": "reviewed_sentinels_with_projection_lock",
+      "evaluation_sha256": "sha256:980579139683f300f295667b351d2d0768ecc82f868d8122b36a6748bf171e92",
+      "evaluation_id": null,
+      "taxonomy_version": "semantic-taxonomy-2026-08-r60",
+      "router_version": "semantic_router.v94",
+      "row_count": 852,
+      "projection_sha256": "sha256:a51781dd2497555f22922bc9ba8228567aaa8c44dba7e7e9bd5a0cc4d77c98e9",
+      "applicability_counts": {
+        "null": 439,
+        "applicable": 187,
+        "not_applicable": 226
+      },
+      "reviewed_cases": [
+        {
+          "provider_document_id": "1225468066",
+          "unit_index": 499,
+          "title": "(5) 不涉及当期现金收支、但影响企业财务状况或在未来可能影响企业现金流量的重大活动及财务影响",
+          "heading_path": [
+            "第八节 财务报告",
+            "七、合并财务报表项目注释",
+            "78、 现金流量表项目",
+            "(5) 不涉及当期现金收支、但影响企业财务状况或在未来可能影响企业现金流量的重大活动及财务影响"
+          ],
+          "query_projection_hash": "sha256:e966e2e2789e2ee303834842652f9250de3315e92ce83bc2a11e01632b0241a5",
+          "expected_applicability": "not_applicable",
+          "rationale": "恢复的独立现金流披露项自有 selector。"
+        },
+        {
+          "provider_document_id": "1225468066",
+          "unit_index": 501,
+          "title": "(1) 现金流量表补充资料",
+          "heading_path": [
+            "第八节 财务报告",
+            "七、合并财务报表项目注释",
+            "79、 现金流量表补充资料",
+            "(1) 现金流量表补充资料"
+          ],
+          "query_projection_hash": "sha256:d90400d9b25bea1cd0c264fca434c707a03412af208318e47324cb27e7424e36",
+          "expected_applicability": "applicable",
+          "rationale": "相邻现金流补充资料的 leading selector保持独立适用。"
+        },
+        {
+          "provider_document_id": "1225468066",
+          "unit_index": 572,
+          "title": "(4) 关联担保情况",
+          "heading_path": [
+            "第八节 财务报告",
+            "十四、关联方及关联交易",
+            "5、 关联交易情况",
+            "(4) 关联担保情况"
+          ],
+          "query_projection_hash": "sha256:29ba0603ed91bb9d0bd1afa1359574f33bb03113d0f9075d82cb5b6f6b2734e7",
+          "expected_applicability": null,
+          "rationale": "三组 child-local 不适用 selector 不得合成为关联担保父 Unit 状态。"
+        },
+        {
+          "provider_document_id": "1225468066",
+          "unit_index": 573,
+          "title": "(5) 关联方资金拆借",
+          "heading_path": [
+            "第八节 财务报告",
+            "十四、关联方及关联交易",
+            "5、 关联交易情况",
+            "(5) 关联方资金拆借"
+          ],
+          "query_projection_hash": "sha256:b3b3a8d40e8208843629364ef21ffb46d61b5f215f5c918662ba690f3a009667",
+          "expected_applicability": "not_applicable",
+          "rationale": "同级 Unit 自有 leading selector保持不适用。"
+        },
+        {
+          "provider_document_id": "1225468066",
+          "unit_index": 574,
+          "title": "(6) 关联方资产转让、债务重组情况",
+          "heading_path": [
+            "第八节 财务报告",
+            "十四、关联方及关联交易",
+            "5、 关联交易情况",
+            "(6) 关联方资产转让、债务重组情况"
+          ],
+          "query_projection_hash": "sha256:44e68f36da4cc5829f4b44cebe92659890aba15369003e73817f1e079ed76486",
+          "expected_applicability": "applicable",
+          "rationale": "同级 Unit 自有 leading selector保持适用。"
+        }
+      ]
+    }
+  }
+}

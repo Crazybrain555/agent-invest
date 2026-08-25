@@ -32,6 +32,8 @@ class SubjectCandidate:
     legal_name: str | None
     board: str | None = None
     credit_code: str | None = None
+    identifier_source_access_id: str | None = None
+    identifier_observed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         security_code, exchange = canonical_security_identity(
@@ -39,6 +41,10 @@ class SubjectCandidate:
         )
         object.__setattr__(self, "security_code", security_code)
         object.__setattr__(self, "exchange", exchange)
+        if self.identifier_source_access_id is not None and not self.credit_code:
+            raise ValueError(
+                "identifier provenance requires a credit-code observation"
+            )
 
 
 @dataclass(frozen=True)
@@ -70,11 +76,12 @@ class SubjectResolver:
                 and candidate.credit_code
             ):
                 if identifier is not None:
+                    self._fill_missing_identifier_provenance(identifier, candidate)
                     identifier.status = "contested"
                     uow.company_identifiers.update(identifier)
                 else:
                     self._add_contested_uscc_identifier(
-                        uow, company, candidate.credit_code
+                        uow, company, candidate
                     )
                 uow.commit()
                 raise SubjectIdentityConflictError(
@@ -82,7 +89,7 @@ class SubjectResolver:
                     f"{candidate.security_code}.{candidate.exchange} belongs to "
                     f"{company.legal_name!r}, got {candidate.legal_name!r}"
                 )
-            company = self._sync_uscc_identifier(uow, company, candidate.credit_code)
+            company = self._sync_uscc_identifier(uow, company, candidate)
             self._validate_legal_name(
                 company=company, candidate=candidate, identifier=identifier, uow=uow
             )
@@ -106,7 +113,7 @@ class SubjectResolver:
                     uow=uow,
                 )
                 ledger_company = self._sync_uscc_identifier(
-                    uow, ledger_company, candidate.credit_code
+                    uow, ledger_company, candidate
                 )
                 security = self._add_security(
                     uow, company=ledger_company, candidate=candidate
@@ -122,7 +129,7 @@ class SubjectResolver:
             )
         )
         if candidate.credit_code:
-            self._add_uscc_identifier(uow, company, candidate.credit_code)
+            self._add_uscc_identifier(uow, company, candidate)
         security = self._add_security(uow, company=company, candidate=candidate)
         return ResolvedSubject(company=company, security=security)
 
@@ -169,8 +176,9 @@ class SubjectResolver:
         )
 
     def _sync_uscc_identifier(
-        self, uow: UnitOfWork, company: e.Company, credit_code: str | None
+        self, uow: UnitOfWork, company: e.Company, candidate: SubjectCandidate
     ) -> e.Company:
+        credit_code = candidate.credit_code
         if not credit_code:
             return company
         normalized = _normalize_identifier(credit_code)
@@ -186,7 +194,7 @@ class SubjectResolver:
             company.unified_social_credit_code
             and _normalize_identifier(company.unified_social_credit_code) != normalized
         ):
-            self._add_contested_uscc_identifier(uow, company, credit_code)
+            self._add_contested_uscc_identifier(uow, company, candidate)
             uow.commit()
             raise SubjectIdentityConflictError(
                 "company unified_social_credit_code conflicts with candidate uscc"
@@ -195,7 +203,9 @@ class SubjectResolver:
             company.unified_social_credit_code = credit_code
             company = uow.companies.update(company)
         if active is None:
-            self._add_uscc_identifier(uow, company, credit_code)
+            self._add_uscc_identifier(uow, company, candidate)
+        elif self._fill_missing_identifier_provenance(active, candidate):
+            uow.company_identifiers.update(active)
         return company
 
     def _add_security(
@@ -213,8 +223,9 @@ class SubjectResolver:
         )
 
     def _add_uscc_identifier(
-        self, uow: UnitOfWork, company: e.Company, credit_code: str
+        self, uow: UnitOfWork, company: e.Company, candidate: SubjectCandidate
     ) -> e.CompanyIdentifier:
+        credit_code = _required_credit_code(candidate)
         return uow.company_identifiers.add(
             e.CompanyIdentifier(
                 identifier_id=ids.new_company_identifier_id(),
@@ -223,14 +234,16 @@ class SubjectResolver:
                 raw_value=credit_code,
                 normalized_value=_normalize_identifier(credit_code),
                 jurisdiction="CN",
+                source_access_id=candidate.identifier_source_access_id,
                 status="active",
-                observed_at=_observed_at(company),
+                observed_at=_observed_at(company, candidate),
             )
         )
 
     def _add_contested_uscc_identifier(
-        self, uow: UnitOfWork, company: e.Company, credit_code: str
+        self, uow: UnitOfWork, company: e.Company, candidate: SubjectCandidate
     ) -> e.CompanyIdentifier:
+        credit_code = _required_credit_code(candidate)
         return uow.company_identifiers.add(
             e.CompanyIdentifier(
                 identifier_id=ids.new_company_identifier_id(),
@@ -239,15 +252,42 @@ class SubjectResolver:
                 raw_value=credit_code,
                 normalized_value=_normalize_identifier(credit_code),
                 jurisdiction="CN",
+                source_access_id=candidate.identifier_source_access_id,
                 status="contested",
-                observed_at=_observed_at(company),
+                observed_at=_observed_at(company, candidate),
             )
         )
+
+    @staticmethod
+    def _fill_missing_identifier_provenance(
+        identifier: e.CompanyIdentifier, candidate: SubjectCandidate
+    ) -> bool:
+        """Attach the first source-bound observation without rewriting lineage."""
+
+        if (
+            identifier.source_access_id is not None
+            or candidate.identifier_source_access_id is None
+        ):
+            return False
+        identifier.source_access_id = candidate.identifier_source_access_id
+        if candidate.identifier_observed_at is not None:
+            identifier.observed_at = candidate.identifier_observed_at
+        return True
 
 
 def _normalize_identifier(value: str) -> str:
     return value.strip().upper()
 
 
-def _observed_at(company: e.Company) -> datetime:
-    return company.created_at or datetime.now(timezone.utc)
+def _required_credit_code(candidate: SubjectCandidate) -> str:
+    if not candidate.credit_code:
+        raise ValueError("credit code is required for a USCC identifier")
+    return candidate.credit_code
+
+
+def _observed_at(company: e.Company, candidate: SubjectCandidate) -> datetime:
+    return (
+        candidate.identifier_observed_at
+        or company.created_at
+        or datetime.now(timezone.utc)
+    )

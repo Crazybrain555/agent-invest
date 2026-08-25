@@ -16,10 +16,11 @@ from disclosure_anchor.application.contracts.semantic_routes import (
 )
 
 
-SEMANTIC_TAXONOMY_VERSION = "semantic-taxonomy-2026-08-r45"
+SEMANTIC_TAXONOMY_VERSION = "semantic-taxonomy-2026-08-r64"
 _FINANCIAL_RESOURCE = "semantic_financial_routes.v1.json"
 _EVENT_RESOURCE = "semantic_event_routes.v1.json"
 _PERIODIC_SCOPES = ("annual_report", "semiannual_report", "quarterly_report")
+_ALLOWED_FINANCIAL_EVENT_SCOPE_EXTENSIONS = frozenset({"risk_alert"})
 
 
 @lru_cache(maxsize=1)
@@ -37,8 +38,10 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
     )
     if set(financial) != {
         "_about",
+        "composite_direct_labels",
         "composite_context_labels",
         "context_container_keys",
+        "event_scope_extensions",
         "exclusive_container_keys",
         "keys",
         "quantitative_topic_keys",
@@ -57,19 +60,36 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
         "version",
     }:
         raise SemanticRouteContractError("event semantic taxonomy fields drift")
-    if financial.get("version") != "semantic-financial-2026-08-r21":
+    if financial.get("version") != "semantic-financial-2026-08-r34":
         raise SemanticRouteContractError("financial semantic taxonomy version drift")
-    if events.get("version") != "semantic-events-2026-08-r33":
+    if events.get("version") != "semantic-events-2026-08-r49":
         raise SemanticRouteContractError("event semantic taxonomy version drift")
     if events.get("fallback_key") != SEMANTIC_FALLBACK_KEY:
         raise SemanticRouteContractError("event semantic fallback key drift")
 
     definitions: list[SemanticRouteDefinition] = []
     raw_keys = financial.get("keys")
-    if not isinstance(raw_keys, dict) or len(raw_keys) != 184:
+    if not isinstance(raw_keys, dict) or len(raw_keys) != 198:
         raise SemanticRouteContractError(
-            "financial semantic taxonomy must contain exactly 184 routes"
+            "financial semantic taxonomy must contain exactly 198 routes"
         )
+    raw_scope_extensions = financial.get("event_scope_extensions")
+    if not isinstance(raw_scope_extensions, dict) or not set(
+        raw_scope_extensions
+    ).issubset(raw_keys):
+        raise SemanticRouteContractError(
+            "financial event scope extensions are invalid"
+        )
+    financial_scope_extensions: dict[str, tuple[str, ...]] = {}
+    for key, raw_scopes in raw_scope_extensions.items():
+        scopes = _text_array(raw_scopes, label=f"{key} event scope extensions")
+        if len(scopes) != len(set(scopes)) or not set(scopes).issubset(
+            _ALLOWED_FINANCIAL_EVENT_SCOPE_EXTENSIONS
+        ):
+            raise SemanticRouteContractError(
+                f"financial event scope extensions for {key} are invalid"
+            )
+        financial_scope_extensions[key] = scopes
     financial_containers = _key_set(
         financial.get("exclusive_container_keys"),
         label="financial exclusive container keys",
@@ -101,19 +121,31 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
     for key, raw_entry in raw_keys.items():
         if not isinstance(key, str) or not isinstance(raw_entry, dict):
             raise SemanticRouteContractError("financial semantic route is invalid")
-        if set(raw_entry) != {"names", "aliases"}:
+        if set(raw_entry) not in (
+            {"names", "aliases"},
+            {"names", "aliases", "heading_aliases"},
+        ):
             raise SemanticRouteContractError(
                 f"financial semantic route {key} fields are not closed"
             )
         names = _text_array(raw_entry["names"], label=f"{key} names")
         aliases = _text_array(raw_entry["aliases"], label=f"{key} aliases")
+        heading_aliases = _text_array(
+            raw_entry.get("heading_aliases", []),
+            label=f"{key} heading aliases",
+        )
         labels = tuple(dict.fromkeys((*names, *aliases)))
         definitions.append(
             SemanticRouteDefinition(
                 key=key,
                 description=f"财务披露主题：{names[0]}",
                 labels=labels,
-                scopes=_PERIODIC_SCOPES,
+                heading_labels=heading_aliases,
+                scopes=tuple(
+                    dict.fromkeys(
+                        (*_PERIODIC_SCOPES, *financial_scope_extensions.get(key, ()))
+                    )
+                ),
                 exclusive_container=key in financial_containers,
                 context_container=key in financial_context_containers,
                 quantitative_topic=key in financial_quantitative_topics,
@@ -145,6 +177,34 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
                 keys=_text_array(
                     raw_composite["keys"],
                     label="financial composite context keys",
+                ),
+            )
+        )
+    raw_direct_composites = financial.get("composite_direct_labels")
+    if not isinstance(raw_direct_composites, list):
+        raise SemanticRouteContractError(
+            "financial composite direct labels must be an array"
+        )
+    direct_composites: list[SemanticCompositeSection] = []
+    for raw_composite in raw_direct_composites:
+        if not isinstance(raw_composite, dict) or set(raw_composite) != {
+            "keys",
+            "label",
+        }:
+            raise SemanticRouteContractError(
+                "financial composite direct label fields are invalid"
+            )
+        label = raw_composite["label"]
+        if not isinstance(label, str):
+            raise SemanticRouteContractError(
+                "financial composite direct label is invalid"
+            )
+        direct_composites.append(
+            SemanticCompositeSection(
+                label=label,
+                keys=_text_array(
+                    raw_composite["keys"],
+                    label="financial composite direct keys",
                 ),
             )
         )
@@ -189,9 +249,9 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
         raise SemanticRouteContractError("event role anchor key is not defined")
     if not event_section_containers.issubset(event_keys):
         raise SemanticRouteContractError("event section container key is not defined")
-    if event_section_containers & (event_containers | event_overviews):
+    if event_section_containers & event_containers:
         raise SemanticRouteContractError(
-            "event section container conflicts with another container policy"
+            "event section container conflicts with an exclusive container policy"
         )
     if event_containers & event_overviews:
         raise SemanticRouteContractError(
@@ -204,12 +264,10 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
             "event role anchor conflicts with a container policy"
         )
     for raw_entry in raw_entries:
-        if not isinstance(raw_entry, dict) or set(raw_entry) != {
-            "key",
-            "description",
-            "labels",
-            "scopes",
-        }:
+        if not isinstance(raw_entry, dict) or set(raw_entry) not in (
+            {"key", "description", "labels", "scopes"},
+            {"key", "description", "labels", "heading_labels", "scopes"},
+        ):
             raise SemanticRouteContractError("event semantic route fields are not closed")
         key = raw_entry["key"]
         description = raw_entry["description"]
@@ -220,6 +278,10 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
                 key=key,
                 description=description,
                 labels=_text_array(raw_entry["labels"], label=f"{key} labels"),
+                heading_labels=_text_array(
+                    raw_entry.get("heading_labels", []),
+                    label=f"{key} heading labels",
+                ),
                 scopes=_text_array(raw_entry["scopes"], label=f"{key} scopes"),
                 exclusive_container=key in event_containers,
                 overview_container=key in event_overviews,
@@ -232,6 +294,7 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
         version=SEMANTIC_TAXONOMY_VERSION,
         definitions=tuple(definitions),
         composite_sections=tuple(composite_sections),
+        direct_composites=tuple(direct_composites),
     )
 
 

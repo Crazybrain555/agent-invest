@@ -14,7 +14,11 @@ from disclosure_anchor.application.dto.worker_report import (
     WorkerReport,
 )
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
+    MinerUDeploymentGateError,
+)
 from disclosure_anchor.cli import worker as worker_cli
+from disclosure_anchor.domain.errors import ConfigurationError
 from disclosure_anchor.settings import Settings
 
 
@@ -28,13 +32,15 @@ def _report(**values: int | bool) -> WorkerReport:
 class AdaptiveLoopControllerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.controller = worker_cli._AdaptiveLoopController(900, 1800)
-        self.limits = WorkerLimits(sync=13, download=300, parse=50, build=10, publish=10)
+        self.limits = WorkerLimits(
+            sync=13, download=300, parse=50, build=10, publish=10
+        )
 
     def test_progress_runs_next_round_without_wait(self) -> None:
+        self.assertEqual(self.controller.observe(_report(downloaded=1), now=10.0), 0)
         self.assertEqual(
-            self.controller.observe(_report(downloaded=1), now=10.0), 0
+            self.controller.effective_limits(self.limits, now=10.0), self.limits
         )
-        self.assertEqual(self.controller.effective_limits(self.limits, now=10.0), self.limits)
 
     def test_idle_backoff_is_fifteen_then_thirty_minutes(self) -> None:
         self.assertEqual(self.controller.observe(_report(), now=0.0), 900)
@@ -111,6 +117,15 @@ class AdaptiveLoopControllerTests(unittest.TestCase):
 
 
 class ResidentLoopBoundaryTests(unittest.TestCase):
+    def test_worker_database_url_never_falls_back_to_migration_owner(self) -> None:
+        settings = mock.MagicMock(
+            database_url=None,
+            disclosure_migration_database_url="postgresql+psycopg://owner/db",
+        )
+
+        with self.assertRaisesRegex(ConfigurationError, "DATABASE_URL"):
+            worker_cli.worker_database_url(settings)
+
     def test_startup_recovery_retries_before_first_admission(self) -> None:
         settings = mock.MagicMock(worker_loop_max_interval_seconds=1800)
         projection_failed = _report(failed=1)
@@ -171,10 +186,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         self.assertIs(fourth, drained)
         self.assertEqual(run_once.call_count, 4)
         self.assertEqual(
-            [
-                call.kwargs["reclaim_stale"]
-                for call in run_once.call_args_list
-            ],
+            [call.kwargs["reclaim_stale"] for call in run_once.call_args_list],
             [True, True, False, False],
         )
         self.assertEqual(
@@ -185,17 +197,11 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             [0, 0, None, None],
         )
         self.assertEqual(
-            [
-                call.kwargs["run_projection"]
-                for call in run_once.call_args_list
-            ],
+            [call.kwargs["run_projection"] for call in run_once.call_args_list],
             [True, True, True, True],
         )
         self.assertEqual(
-            [
-                call.kwargs["projection_prune"]
-                for call in run_once.call_args_list
-            ],
+            [call.kwargs["projection_prune"] for call in run_once.call_args_list],
             [True, True, True, False],
         )
         self.assertEqual(wait.call_count, 2)
@@ -244,9 +250,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         report = _report(downloaded=1)
         should_stop = mock.Mock(side_effect=[False, False, True])
 
-        with mock.patch.object(
-            worker_cli, "run_once", return_value=report
-        ) as run_once:
+        with mock.patch.object(worker_cli, "run_once", return_value=report) as run_once:
             worker_cli._run_maintenance_loop(
                 mock.MagicMock(
                     worker_loop_interval_seconds=1,
@@ -311,9 +315,13 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 hf_home=root / "shared" / "hf",
                 modelscope_cache=root / "shared" / "modelscope",
                 disclosure_mineru_backend="hybrid-http-client",
-                disclosure_mineru_server_url="http://127.0.0.1:30000",
+                disclosure_mineru_api_url="http://127.0.0.1:30002",
+                disclosure_mineru_observability_url="http://127.0.0.1:30001/v1",
+                disclosure_mineru_inference_upstream_url=(
+                    "http://mineru-openai-server:30000/v1"
+                ),
                 worker_parse_concurrency=16,
-                worker_gpu_request_budget=112,
+                worker_gpu_request_budget=21,
                 worker_gpu_max_sequences=128,
             )
             with mock.patch.object(
@@ -325,7 +333,15 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
 
         self.assertEqual(first.identity().version, "3.4.4")
         self.assertEqual(second.identity().version, "3.4.4")
-        self.assertEqual(deps.parser_options.http_request_concurrency, 7)
+        self.assertEqual(
+            deps.parser_options.api_url,
+            "http://127.0.0.1:30002",
+        )
+        self.assertEqual(
+            deps.parser_options.server_url,
+            "http://mineru-openai-server:30000/v1",
+        )
+        self.assertIsNone(deps.parser_options.http_request_concurrency)
         self.assertEqual(deps.config.parse_runaway_timeout_seconds, 86400)
         with mock.patch.object(worker_cli, "_exit_wedged_worker") as exit_worker:
             deps.on_parse_runaway("doc_wedged")
@@ -350,9 +366,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             mock.patch.object(
                 worker_cli, "terminate_active_semantic_processes"
             ) as terminate_semantic,
-            self.assertRaisesRegex(
-                RuntimeError, "singleton advisory lock was lost"
-            ),
+            self.assertRaisesRegex(RuntimeError, "singleton advisory lock was lost"),
         ):
             worker_cli._assert_singleton_or_cancel(lock_conn)
 
@@ -371,10 +385,10 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         )
         with (
             mock.patch.object(worker_cli, "_StopFlag", return_value=stop),
-            mock.patch.object(
-                worker_cli, "create_db_engine", return_value=engine
-            ),
+            mock.patch.object(worker_cli, "create_db_engine", return_value=engine),
+            mock.patch.object(worker_cli, "require_runtime_app_engine"),
             mock.patch.object(worker_cli, "_deps", return_value=deps),
+            mock.patch.object(worker_cli, "_emit_progress_snapshot"),
             mock.patch.object(
                 worker_cli,
                 "_run_startup_recovery",
@@ -382,12 +396,20 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                     "singleton advisory lock was lost"
                 ),
             ),
+            mock.patch.object(
+                worker_cli, "terminate_active_mineru_processes"
+            ) as terminate_mineru,
+            mock.patch.object(
+                worker_cli, "terminate_active_semantic_processes"
+            ) as terminate_semantic,
             self.assertRaises(worker_cli.WorkerSingletonGuardError),
         ):
             worker_cli._run_loop(settings, lock_conn=mock.MagicMock())
 
         deps.close_source.assert_called_once_with()
         engine.dispose.assert_called_once_with()
+        terminate_mineru.assert_called_once_with()
+        terminate_semantic.assert_called_once_with()
 
     def test_maintenance_heartbeat_cannot_mask_parse_plane(self) -> None:
         import itertools
@@ -422,9 +444,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             worker_report_interval_seconds=300,
             worker_wedge_timeout_seconds=2700,
         )
-        limits = WorkerLimits(
-            sync=1, download=1, parse=1, build=1, publish=1
-        )
+        limits = WorkerLimits(sync=1, download=1, parse=1, build=1, publish=1)
         progress: dict[str, list[float]] = {}
         initial_parse_progress: list[float] = []
         maintenance_pulsed = threading.Event()
@@ -464,42 +484,128 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 initial_parse_progress[0],
             )
             parse_deps.heartbeat()
-            self.assertGreater(
-                progress["parse"][0], initial_parse_progress[0]
-            )
+            self.assertGreater(progress["parse"][0], initial_parse_progress[0])
 
         with (
             mock.patch.object(worker_cli, "_StopFlag", return_value=stop),
-            mock.patch.object(
-                worker_cli, "create_db_engine", return_value=engine
-            ),
+            mock.patch.object(worker_cli, "create_db_engine", return_value=engine),
+            mock.patch.object(worker_cli, "require_runtime_app_engine"),
             mock.patch.object(worker_cli, "_deps", return_value=deps),
             mock.patch.object(worker_cli, "_limits", return_value=limits),
+            mock.patch.object(worker_cli, "_emit_progress_snapshot"),
             mock.patch.object(worker_cli, "_run_startup_recovery"),
             mock.patch.object(
                 worker_cli,
                 "_run_maintenance_loop",
                 side_effect=maintenance,
             ),
-            mock.patch.object(
-                worker_cli, "run_resident_parse", side_effect=resident
-            ),
-            mock.patch.object(
-                worker_cli, "_wedge_watchdog", side_effect=watchdog
-            ),
+            mock.patch.object(worker_cli, "run_resident_parse", side_effect=resident),
+            mock.patch.object(worker_cli, "_wedge_watchdog", side_effect=watchdog),
             mock.patch.object(
                 worker_cli.time,
                 "monotonic",
                 side_effect=lambda: float(next(clocks)),
             ),
         ):
-            result = worker_cli._run_loop(
-                settings, lock_conn=mock.MagicMock()
-            )
+            result = worker_cli._run_loop(settings, lock_conn=mock.MagicMock())
 
         self.assertEqual(result, 0)
         self.assertEqual(set(progress), {"parse", "maintenance"})
         close_source.assert_called_once_with()
+        engine.dispose.assert_called_once_with()
+
+    def test_once_rejects_runtime_role_before_advisory_lock(self) -> None:
+        settings = mock.MagicMock()
+        checker = mock.MagicMock(spec=worker_cli.MinerUDeploymentChecker)
+        lock_conn = mock.MagicMock()
+        lock_engine = mock.MagicMock()
+        lock_engine.connect.return_value = lock_conn
+
+        with (
+            mock.patch.object(worker_cli, "load_settings", return_value=settings),
+            mock.patch.object(
+                worker_cli,
+                "MinerUDeploymentChecker",
+                return_value=checker,
+            ),
+            mock.patch.object(worker_cli, "_print_version_banner"),
+            mock.patch.object(
+                worker_cli.sqlalchemy, "create_engine", return_value=lock_engine
+            ),
+            mock.patch.object(
+                worker_cli,
+                "require_runtime_app_connection",
+                side_effect=ConfigurationError("unsafe role"),
+            ),
+            self.assertRaisesRegex(ConfigurationError, "unsafe role"),
+        ):
+            worker_cli.main(["once"])
+
+        lock_conn.execute.assert_not_called()
+        lock_conn.close.assert_called_once_with()
+        lock_engine.dispose.assert_called_once_with()
+
+    def test_once_mineru_gate_fails_before_database_connection(self) -> None:
+        settings = mock.MagicMock()
+        checker = mock.MagicMock(spec=worker_cli.MinerUDeploymentChecker)
+        checker.assert_admission.side_effect = MinerUDeploymentGateError(
+            "GPU identity unavailable"
+        )
+
+        with (
+            mock.patch.object(worker_cli, "load_settings", return_value=settings),
+            mock.patch.object(
+                worker_cli,
+                "MinerUDeploymentChecker",
+                return_value=checker,
+            ),
+            mock.patch.object(worker_cli.sqlalchemy, "create_engine") as create_engine,
+            self.assertRaisesRegex(MinerUDeploymentGateError, "identity unavailable"),
+        ):
+            worker_cli.main(["once"])
+
+        checker.assert_admission.assert_called_once_with()
+        create_engine.assert_not_called()
+
+    def test_worker_admission_checks_lock_before_live_mineru(self) -> None:
+        lock_conn = mock.MagicMock()
+        checker = mock.MagicMock(spec=worker_cli.MinerUDeploymentChecker)
+        events: list[str] = []
+
+        with mock.patch.object(
+            worker_cli,
+            "_assert_singleton_or_cancel",
+            side_effect=lambda _conn: events.append("lock"),
+        ):
+            checker.assert_admission.side_effect = lambda: events.append("mineru")
+            worker_cli._assert_worker_admission(
+                lock_conn,
+                mineru_checker=checker,
+            )
+
+        self.assertEqual(events, ["lock", "mineru"])
+
+    def test_work_engine_identity_failure_disposes_before_dependency_build(
+        self,
+    ) -> None:
+        engine = mock.MagicMock()
+        with (
+            mock.patch.object(worker_cli, "create_db_engine", return_value=engine),
+            mock.patch.object(
+                worker_cli,
+                "require_runtime_app_engine",
+                side_effect=ConfigurationError("unsafe role"),
+            ),
+            mock.patch.object(worker_cli, "_deps") as deps,
+            self.assertRaisesRegex(ConfigurationError, "unsafe role"),
+        ):
+            worker_cli._run_rounds(
+                mock.MagicMock(),
+                rounds=1,
+                lock_conn=mock.MagicMock(),
+            )
+
+        deps.assert_not_called()
         engine.dispose.assert_called_once_with()
 
     def test_alert_message_triggers_on_outage_and_failure_burst(self) -> None:
@@ -521,6 +627,12 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         message = worker_cli._alert_message(burst)
         self.assertIn("5 failures", message)
         self.assertIn("parse", message)
+
+        degraded = WorkerReport(started_at=datetime.now(timezone.utc))
+        degraded.build_stats = [{"semantic_adjudicator_unavailable_unit_count": 2}]
+        message = worker_cli._alert_message(degraded)
+        self.assertIn("semantic adjudicator unavailable", message)
+        self.assertIn("2 Units", message)
 
     def test_rate_limit_cooldown_decays_on_progress_instead_of_resetting(
         self,

@@ -20,7 +20,11 @@ from disclosure_anchor.application.contracts.provider_unit import (
 )
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_ROUTE_RECEIPTS_FILENAME,
+    SEMANTIC_ROUTE_RECEIPTS_V1_FILENAME,
+    SEMANTIC_ROUTE_RECEIPT_V1,
+    SEMANTIC_ROUTE_RECEIPT_VERSION,
     SEMANTIC_ROUTER_VERSION,
+    SemanticProviderAttempt,
     SemanticRouteContractError,
     SemanticRouteReceipt,
     SemanticRouteReceiptRow,
@@ -32,6 +36,7 @@ from disclosure_anchor.application.ports.file_store import (
 )
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.ports.semantic_routes import (
+    SemanticAdjudicationOutcome,
     SemanticRouteAdjudicatorError,
     SemanticRouteReceiptStoreError,
     SemanticRouteReceiptStorePort,
@@ -61,7 +66,7 @@ from disclosure_anchor.domain.services.unit_hashing import (
 from disclosure_anchor.domain.value_objects.semantic_key import (
     SemanticKeyInvariantError,
     validate_optional_section_keys,
-    validate_optional_semantic_key_state,
+    validate_optional_semantic_keys,
 )
 
 
@@ -163,7 +168,11 @@ class BuildUnits:
                 document=cast(e.Document, context["document"]),
                 run=run,
             )
-            stats = self._build_stats(build)
+            stats = self._build_stats(
+                build,
+                receipts=routed.receipts,
+                outcomes=routed.adjudication_outcomes,
+            )
         except SemanticRouteAdjudicatorError as exc:
             if exc.reason_code == "invalid_decision":
                 error_code = "SEMANTIC_ROUTE_INVALID"
@@ -179,6 +188,10 @@ class BuildUnits:
                     retryable=exc.retryable,
                     message=str(exc),
                 ),
+                semantic_status=(
+                    None if exc.reason_code == "cancelled" else "failed_closed"
+                ),
+                semantic_summary=_failed_adjudication_summary(exc.attempts),
             )
         except SemanticRouteContractError as exc:
             return self._mark_and_result(
@@ -239,7 +252,29 @@ class BuildUnits:
                 expected_rows=len(snapshot_rows),
                 write_result=snapshot_result,
             )
-            receipt_relpath = snapshot_relpath.parent / SEMANTIC_ROUTE_RECEIPTS_FILENAME
+            receipt_versions = {
+                row.receipt.contract_version for row in receipt_rows
+            }
+            if len(receipt_versions) != 1:
+                raise BuildUnitsError(
+                    self._structured_error(
+                        error_code="SEMANTIC_ROUTE_RECEIPT_INVALID",
+                        message="semantic receipt sidecar mixes contract versions",
+                    )
+                )
+            receipt_contract_version = next(iter(receipt_versions))
+            if receipt_contract_version == SEMANTIC_ROUTE_RECEIPT_VERSION:
+                receipt_filename = SEMANTIC_ROUTE_RECEIPTS_FILENAME
+            elif receipt_contract_version == SEMANTIC_ROUTE_RECEIPT_V1:
+                receipt_filename = SEMANTIC_ROUTE_RECEIPTS_V1_FILENAME
+            else:
+                raise BuildUnitsError(
+                    self._structured_error(
+                        error_code="SEMANTIC_ROUTE_RECEIPT_INVALID",
+                        message="semantic receipt contract version is unsupported",
+                    )
+                )
+            receipt_relpath = snapshot_relpath.parent / receipt_filename
             receipt_result = self._semantic_receipts.write(
                 relpath=receipt_relpath,
                 rows=receipt_rows,
@@ -296,6 +331,28 @@ class BuildUnits:
                 units=units,
                 snapshot_relpath=snapshot_relpath,
                 semantic_route_receipts_hash=receipt_result.artifact_hash,
+                semantic_route_receipts_relpath=(
+                    receipt_relpath
+                    if receipt_contract_version == SEMANTIC_ROUTE_RECEIPT_VERSION
+                    else None
+                ),
+                semantic_route_receipts_contract_version=(
+                    receipt_contract_version
+                    if receipt_contract_version == SEMANTIC_ROUTE_RECEIPT_VERSION
+                    else None
+                ),
+                semantic_adjudication_status=cast(
+                    str, stats["semantic_adjudication_status"]
+                ),
+                semantic_degraded_unit_count=cast(
+                    int, stats["semantic_degraded_unit_count"]
+                ),
+                semantic_failover_group_count=cast(
+                    int, stats["semantic_failover_group_count"]
+                ),
+                semantic_adjudication_summary=cast(
+                    dict[str, Any], stats["semantic_adjudication_summary"]
+                ),
                 content_aggregate=content_hash_aggregate(
                     unit.content_hash for unit in units
                 ),
@@ -450,8 +507,7 @@ class BuildUnits:
         for draft, receipt in zip(build.units, receipts, strict=True):
             self._validate_draft_hashes(draft)
             try:
-                validate_optional_semantic_key_state(
-                    draft.semantic_key,
+                validate_optional_semantic_keys(
                     list(draft.semantic_keys) if draft.semantic_keys is not None else None,
                 )
                 validate_optional_section_keys(
@@ -474,7 +530,6 @@ class BuildUnits:
                 heading_path=list(draft.heading_path),
                 title=draft.title,
                 order_index=draft.unit_index + 1,
-                semantic_key=draft.semantic_key,
                 semantic_keys=(
                     list(draft.semantic_keys)
                     if draft.semantic_keys is not None
@@ -530,7 +585,6 @@ class BuildUnits:
             payload=cast(dict[str, Any], draft.payload),
             title=draft.title,
             heading_path=list(draft.heading_path),
-            semantic_key=draft.semantic_key,
             semantic_keys=(
                 list(draft.semantic_keys) if draft.semantic_keys is not None else None
             ),
@@ -602,6 +656,12 @@ class BuildUnits:
         units: list[e.DocumentUnit],
         snapshot_relpath: Path,
         semantic_route_receipts_hash: str,
+        semantic_route_receipts_relpath: Path | None,
+        semantic_route_receipts_contract_version: str | None,
+        semantic_adjudication_status: str,
+        semantic_degraded_unit_count: int,
+        semantic_failover_group_count: int,
+        semantic_adjudication_summary: dict[str, Any],
         content_aggregate: str,
         structure_aggregate: str,
     ) -> e.ProcessingRun:
@@ -625,6 +685,18 @@ class BuildUnits:
             uow.document_units.add_many(units)
             run.document_units_relpath = str(snapshot_relpath)
             run.semantic_route_receipts_hash = semantic_route_receipts_hash
+            run.semantic_route_receipts_relpath = (
+                str(semantic_route_receipts_relpath)
+                if semantic_route_receipts_relpath is not None
+                else None
+            )
+            run.semantic_route_receipts_contract_version = (
+                semantic_route_receipts_contract_version
+            )
+            run.semantic_adjudication_status = semantic_adjudication_status
+            run.semantic_degraded_unit_count = semantic_degraded_unit_count
+            run.semantic_failover_group_count = semantic_failover_group_count
+            run.semantic_adjudication_summary = semantic_adjudication_summary
             run.content_hash_aggregate = content_aggregate
             run.structure_hash = structure_aggregate
             run.builder_rules_version = PROVIDER_UNIT_BUILDER_VERSION
@@ -637,16 +709,33 @@ class BuildUnits:
             return updated
 
     def _mark_and_result(
-        self, processing_run_id: str, error: dict[str, Any]
+        self,
+        processing_run_id: str,
+        error: dict[str, Any],
+        *,
+        semantic_status: str | None = None,
+        semantic_summary: dict[str, Any] | None = None,
     ) -> BuildUnitsResult:
-        failed = self._mark_failed(processing_run_id, error)
+        failed = self._mark_failed(
+            processing_run_id,
+            error,
+            semantic_status=semantic_status,
+            semantic_summary=semantic_summary,
+        )
         return BuildUnitsResult(
             processing_run_id=failed.processing_run_id,
             status=failed.unit_build_status,
             error=failed.unit_build_error,
         )
 
-    def _mark_failed(self, run_id: str, error: dict[str, Any]) -> e.ProcessingRun:
+    def _mark_failed(
+        self,
+        run_id: str,
+        error: dict[str, Any],
+        *,
+        semantic_status: str | None = None,
+        semantic_summary: dict[str, Any] | None = None,
+    ) -> e.ProcessingRun:
         with self._uow_factory() as uow:
             run = uow.processing_runs.get(run_id)
             if run is None:
@@ -660,15 +749,36 @@ class BuildUnits:
                 return run
             run.unit_build_status = "failed"
             run.unit_build_error = error
-            run.unit_build_attempt_count += 1
+            if error.get("reason_code") != "cancelled":
+                run.unit_build_attempt_count += 1
+            run.semantic_adjudication_status = semantic_status
+            run.semantic_adjudication_summary = semantic_summary
             updated = uow.processing_runs.update(run)
             uow.commit()
             return updated
 
-    def _build_stats(self, build: ProviderUnitBuildResult) -> dict[str, Any]:
-        narrow_count = sum(unit.semantic_key is not None for unit in build.units)
+    def _build_stats(
+        self,
+        build: ProviderUnitBuildResult,
+        *,
+        receipts: tuple[SemanticRouteReceipt, ...],
+        outcomes: tuple[SemanticAdjudicationOutcome, ...],
+    ) -> dict[str, Any]:
+        narrow_count = sum(unit.semantic_keys is not None for unit in build.units)
         section_count = sum(unit.section_keys is not None for unit in build.units)
-        identity = self._semantic_router.adjudicator.identity
+        semantic_summary = _successful_adjudication_summary(outcomes)
+        semantic_status = cast(str, semantic_summary["status"])
+        executor = getattr(self._semantic_router, "executor", None)
+        provider_identities = (
+            executor.provider_identities
+            if executor is not None
+            else ()
+        )
+        legacy_identity = (
+            self._semantic_router.adjudicator.identity
+            if self._semantic_router.adjudicator is not None
+            else None
+        )
         return {
             "contract_version": "provider_unit_build_stats.v1",
             "builder_rules_version": PROVIDER_UNIT_BUILDER_VERSION,
@@ -676,12 +786,39 @@ class BuildUnits:
             "unit_count": len(build.units),
             "semantic_narrow_unit_count": narrow_count,
             "semantic_fallback_unit_count": len(build.units) - narrow_count,
+            "semantic_adjudicator_unavailable_unit_count": sum(
+                receipt.decision_source == "adjudicator_unavailable_abstain"
+                for receipt in receipts
+            ),
+            "semantic_adjudication_status": semantic_status,
+            "semantic_degraded_unit_count": sum(
+                receipt.decision_source == "adjudicator_unavailable_abstain"
+                for receipt in receipts
+            ),
+            "semantic_failover_group_count": sum(
+                len(outcome.attempts) > 1 for outcome in outcomes
+            ),
+            "semantic_adjudication_summary": semantic_summary,
             "section_routed_unit_count": section_count,
             "semantic_route_taxonomy_version": self._semantic_router.taxonomy.version,
             "semantic_route_router_version": SEMANTIC_ROUTER_VERSION,
-            "semantic_route_adjudicator_adapter": identity.adapter,
-            "semantic_route_adjudicator_model": identity.model,
-            "semantic_route_prompt_version": identity.prompt_version,
+            "semantic_route_adjudicator_adapter": (
+                legacy_identity.adapter if legacy_identity is not None else "provider_chain.v1"
+            ),
+            "semantic_route_adjudicator_model": (
+                legacy_identity.model
+                if legacy_identity is not None
+                else ",".join(item.canonical_model for item in provider_identities)
+            ),
+            "semantic_route_prompt_version": (
+                legacy_identity.prompt_version
+                if legacy_identity is not None
+                else (
+                    provider_identities[0].prompt_version
+                    if provider_identities
+                    else "not_required"
+                )
+            ),
             "unassigned_table_part_count": len(build.unassigned_table_parts),
         }
 
@@ -702,6 +839,73 @@ class BuildUnits:
         if reason_code is not None:
             error["reason_code"] = reason_code
         return error
+
+
+def _successful_adjudication_summary(
+    outcomes: tuple[SemanticAdjudicationOutcome, ...],
+) -> dict[str, Any]:
+    if any(item.degraded_unavailable for item in outcomes):
+        status = "degraded_unavailable"
+    elif any((item.actual_result_attempt or 0) > 1 for item in outcomes):
+        status = "complete_backup"
+    elif outcomes:
+        status = "complete_primary"
+    else:
+        status = "not_required"
+    attempts = tuple(
+        attempt for outcome in outcomes for attempt in outcome.attempts
+    )
+    summary = _attempt_summary(attempts)
+    summary.update(
+        {
+            "contract_version": "semantic_adjudication_summary.v1",
+            "group_count": len(outcomes),
+            "policy_version": (
+                outcomes[0].policy_version if outcomes else "availability_only.v1"
+            ),
+            "status": status,
+        }
+    )
+    return summary
+
+
+def _failed_adjudication_summary(
+    attempts: tuple[SemanticProviderAttempt, ...],
+) -> dict[str, Any]:
+    summary = _attempt_summary(attempts)
+    summary.update(
+        {
+            "contract_version": "semantic_adjudication_summary.v1",
+            "group_count": 1 if attempts else 0,
+            "policy_version": "availability_only.v1",
+            "status": "failed_closed",
+        }
+    )
+    return summary
+
+
+def _attempt_summary(
+    attempts: tuple[SemanticProviderAttempt, ...],
+) -> dict[str, Any]:
+    outcome_counts: dict[str, int] = {}
+    reason_counts: dict[str, int] = {}
+    provider_counts: dict[str, int] = {}
+    provider_models: dict[str, str] = {}
+    for attempt in attempts:
+        outcome_counts[attempt.outcome] = outcome_counts.get(attempt.outcome, 0) + 1
+        provider_id = attempt.provider.provider_id
+        provider_counts[provider_id] = provider_counts.get(provider_id, 0) + 1
+        provider_models[provider_id] = attempt.provider.canonical_model
+        if attempt.reason_code is not None:
+            reason_counts[attempt.reason_code] = (
+                reason_counts.get(attempt.reason_code, 0) + 1
+            )
+    return {
+        "attempt_outcome_counts": dict(sorted(outcome_counts.items())),
+        "provider_attempt_counts": dict(sorted(provider_counts.items())),
+        "provider_models": dict(sorted(provider_models.items())),
+        "reason_counts": dict(sorted(reason_counts.items())),
+    }
 
 
 __all__ = ["BuildUnits", "BuildUnitsCommand", "BuildUnitsResult", "SNAPSHOT_KEYS"]

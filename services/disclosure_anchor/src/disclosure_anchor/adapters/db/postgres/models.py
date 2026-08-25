@@ -402,6 +402,49 @@ class ProcessingRun(Base):
             "document_units_relpath IS NOT NULL)",
             name="ck_processing_run_semantic_receipt_hash",
         ),
+        CheckConstraint(
+            "(semantic_route_receipts_relpath IS NULL AND "
+            "semantic_route_receipts_contract_version IS NULL) OR ("
+            "semantic_route_receipts_relpath IS NOT NULL AND "
+            "semantic_route_receipts_contract_version = "
+            "'semantic_route_receipt.v2' AND "
+            "semantic_route_receipts_hash IS NOT NULL)",
+            name="ck_processing_run_semantic_receipt_locator",
+        ),
+        CheckConstraint(
+            "semantic_adjudication_status IS NULL OR "
+            "semantic_adjudication_status IN ('not_required','complete_primary',"
+            "'complete_backup','degraded_unavailable','failed_closed')",
+            name="ck_processing_run_semantic_adjudication_status",
+        ),
+        CheckConstraint(
+            "semantic_degraded_unit_count IS NULL OR "
+            "semantic_degraded_unit_count >= 0",
+            name="ck_processing_run_semantic_degraded_count",
+        ),
+        CheckConstraint(
+            "semantic_failover_group_count IS NULL OR "
+            "semantic_failover_group_count >= 0",
+            name="ck_processing_run_semantic_failover_count",
+        ),
+        CheckConstraint(
+            "semantic_adjudication_summary IS NULL OR "
+            "jsonb_typeof(semantic_adjudication_summary) = 'object'",
+            name="ck_processing_run_semantic_summary",
+        ),
+        CheckConstraint(
+            "error IS NULL OR (jsonb_typeof(error) = 'object' AND "
+            "error ?& ARRAY['stage','error_code','retryable'] AND "
+            "jsonb_typeof(error->'retryable') = 'boolean')",
+            name="ck_processing_run_error_object",
+        ),
+        CheckConstraint(
+            "unit_build_error IS NULL OR ("
+            "jsonb_typeof(unit_build_error) = 'object' AND "
+            "unit_build_error ?& ARRAY['stage','error_code','retryable'] AND "
+            "jsonb_typeof(unit_build_error->'retryable') = 'boolean')",
+            name="ck_processing_run_unit_build_error_object",
+        ),
         Index("ix_processing_run_document", "document_id"),
         Index(
             "ix_processing_run_artifact_owner",
@@ -456,6 +499,24 @@ class ProcessingRun(Base):
     semantic_route_receipts_hash: Mapped[Optional[str]] = mapped_column(
         String(128), nullable=True
     )
+    semantic_route_receipts_relpath: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    semantic_route_receipts_contract_version: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    semantic_adjudication_status: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True
+    )
+    semantic_degraded_unit_count: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
+    semantic_failover_group_count: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
+    semantic_adjudication_summary: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
     content_hash_aggregate: Mapped[Optional[str]] = mapped_column(
         String(128), nullable=True
     )
@@ -470,7 +531,7 @@ class ProcessingRun(Base):
         String(16), nullable=False, server_default=text("'not_started'")
     )
     unit_build_error: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        JSONB, nullable=True
+        JSONB(none_as_null=True), nullable=True
     )
     unit_build_attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
@@ -484,7 +545,9 @@ class ProcessingRun(Base):
     finished_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    error: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+    error: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -506,19 +569,16 @@ class DocumentUnit(Base):
             name="ck_document_unit_applicability",
         ),
         CheckConstraint(
-            "(semantic_key IS NULL AND semantic_keys IS NULL) OR ("
-            "semantic_key IS NOT NULL "
-            "AND jsonb_typeof(semantic_keys) = 'array' "
-            "AND jsonb_array_length(semantic_keys) > 0 "
-            "AND semantic_keys ->> 0 = semantic_key)",
-            name="ck_document_unit_semantic_key_set",
+            "semantic_keys IS NULL OR ("
+            "jsonb_typeof(semantic_keys) = 'array' "
+            "AND jsonb_array_length(semantic_keys) BETWEEN 1 AND 8)",
+            name="ck_document_unit_semantic_keys",
         ),
         UniqueConstraint(
             "processing_run_id", "order_index", name="uq_document_unit_run_order"
         ),
         Index("ix_document_unit_document", "document_id"),
         Index("ix_document_unit_run", "processing_run_id"),
-        Index("ix_document_unit_semantic_key", "semantic_key"),
         Index(
             "ix_document_unit_semantic_keys",
             "semantic_keys",
@@ -570,7 +630,6 @@ class DocumentUnit(Base):
     )
     title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     order_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    semantic_key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     # Python None is the deliberate "no semantic claim" state and must bind
     # as SQL NULL.  JSON ``null`` would fail the scalar/array pairing CHECK
     # while looking deceptively null through JSON-oriented clients.
@@ -650,6 +709,7 @@ _SEARCH_TSV_EXPRESSION = (
     "END"
 )
 _BODY_SEARCH_TSV_EXPRESSION = "setweight(to_tsvector('simple', body_tokens), 'C')"
+_ROW_SEARCH_TSV_EXPRESSION = "setweight(to_tsvector('simple', row_tokens), 'C')"
 
 
 class UnitSearchProjection(Base):
@@ -665,6 +725,22 @@ class UnitSearchProjection(Base):
 
     __tablename__ = "unit_search_projection"
     __table_args__ = (
+        CheckConstraint(
+            "row_atom_count >= 0 AND "
+            "row_atom_manifest_hash ~ '^sha256:[0-9a-f]{64}$' AND "
+            "((row_atom_manifest_ready = false AND row_atom_count = 0 AND "
+            "row_atom_manifest_hash = "
+            "'sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5"
+            "ed12ab4d8e11ba873c2f11161202b945') OR "
+            "(row_atom_manifest_ready = true AND "
+            "((row_atom_count = 0 AND row_atom_manifest_hash = "
+            "'sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5"
+            "ed12ab4d8e11ba873c2f11161202b945') OR "
+            "(row_atom_count > 0 AND row_atom_manifest_hash <> "
+            "'sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5"
+            "ed12ab4d8e11ba873c2f11161202b945')))",
+            name="ck_unit_search_projection_row_atom_manifest",
+        ),
         CheckConstraint(
             f"{CORE_SCHEMA}.search_tsvector_is_safe("
             "title_tokens, path_tokens, "
@@ -709,6 +785,20 @@ class UnitSearchProjection(Base):
     )
     body_search_windowed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
+    )
+    row_atom_manifest_ready: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    row_atom_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    row_atom_manifest_hash: Mapped[str] = mapped_column(
+        String(71),
+        nullable=False,
+        server_default=text(
+            "'sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5"
+            "ed12ab4d8e11ba873c2f11161202b945'"
+        ),
     )
     built_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     search_tsv: Mapped[Any] = mapped_column(
@@ -798,3 +888,54 @@ class UnitSearchAtom(Base):
     )
     atom_index: Mapped[int] = mapped_column(Integer, primary_key=True)
     atom_text: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class UnitSearchRowAtom(Base):
+    """One source-bound Q&A table row, derived without changing Unit identity."""
+
+    __tablename__ = "unit_search_row_atom"
+    __table_args__ = (
+        CheckConstraint(
+            "row_atom_index >= 0 AND source_row_index >= 0",
+            name="ck_unit_search_row_atom_indices",
+        ),
+        CheckConstraint(
+            "btrim(table_target_id) <> '' AND btrim(row_text) <> '' "
+            "AND btrim(row_tokens) <> ''",
+            name="ck_unit_search_row_atom_text",
+        ),
+        CheckConstraint(
+            f"{CORE_SCHEMA}.search_tsvector_is_safe('', '', row_tokens, '')",
+            name="ck_unit_search_row_atom_tsv_safe",
+        ),
+        CheckConstraint(
+            "row_atom_manifest_hash ~ '^sha256:[0-9a-f]{64}$'",
+            name="ck_unit_search_row_atom_manifest_hash",
+        ),
+        Index(
+            "ix_unit_search_row_atom_tsv",
+            "search_tsv",
+            postgresql_using="gin",
+        ),
+        {"schema": CORE_SCHEMA},
+    )
+
+    asset_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey(
+            f"{CORE_SCHEMA}.unit_search_projection.asset_id",
+            ondelete="CASCADE",
+        ),
+        primary_key=True,
+    )
+    row_atom_index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    table_target_id: Mapped[str] = mapped_column(Text, nullable=False)
+    source_row_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    row_text: Mapped[str] = mapped_column(Text, nullable=False)
+    row_tokens: Mapped[str] = mapped_column(Text, nullable=False)
+    row_atom_manifest_hash: Mapped[str] = mapped_column(String(71), nullable=False)
+    search_tsv: Mapped[Any] = mapped_column(
+        TSVECTOR(),
+        Computed(_ROW_SEARCH_TSV_EXPRESSION, persisted=True),
+        nullable=False,
+    )

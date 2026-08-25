@@ -133,7 +133,11 @@ class IntegrationDatabaseSafetyTests(unittest.TestCase):
         inherited = {
             "DISCLOSURE_MINERU_BIN": "/production/mineru",
             "DISCLOSURE_MINERU_BACKEND": "vlm-http-client",
-            "DISCLOSURE_MINERU_SERVER_URL": "http://gpu.internal:30000",
+            "DISCLOSURE_MINERU_API_URL": "http://127.0.0.1:30002",
+            "DISCLOSURE_MINERU_OBSERVABILITY_URL": "http://127.0.0.1:30001/v1",
+            "DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL": (
+                "http://mineru-openai-server:30000/v1"
+            ),
             "MINERU_MODEL_CACHE": "/production/cache/mineru",
             "HF_HOME": "/production/cache/huggingface",
             "MODELSCOPE_CACHE": "/production/cache/modelscope",
@@ -159,7 +163,7 @@ class IntegrationDatabaseSafetyTests(unittest.TestCase):
             inherited["DISCLOSURE_MINERU_BIN"],
         )
         self.assertNotIn(
-            inherited["DISCLOSURE_MINERU_SERVER_URL"],
+            inherited["DISCLOSURE_MINERU_API_URL"],
             isolated_env.values(),
         )
         self.assertNotIn(

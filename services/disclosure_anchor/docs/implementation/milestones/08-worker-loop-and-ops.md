@@ -59,8 +59,9 @@ pending_download_v1:
 ```text
 pending_parse_v1        document.status IN ('registered','parse_failed') 且无 running run；
                         暴露 failed_parse_count 与 last_failed_retryable 事实列
-pending_build_v1        run.status='succeeded' 且 unit_build_status IN ('not_started','failed')；
-                        暴露 unit_build_attempt_count
+pending_build_v1        run.status='succeeded' 且 unit_build_status IN ('not_started','failed')，
+                        并且不存在按 started_at/run id 排序更晚的成功 Unit 代际；
+                        暴露 unit_build_attempt_count。0048 起已修复旧失败不再重复入队/死信
 pending_publish_v1      run.status='succeeded' 且 unit_build_status='succeeded' 且
                         is_active=false 且晚于当前 active run（无 active run 时恒入队，
                         COALESCE '-infinity' 已处理）；worker 对同一 document 只处理
@@ -153,16 +154,23 @@ maintenance/report 周期禁止重复执行，正常长任务绝不按年龄回�
    到期后经同一 PostgreSQL 资格/次数谓词按 exact ID 重新准入；普通候选扫描使用固定页
    大小 keyset，游标只推进到实际检查行，禁止随进程内已见集合扩大 SQL `LIMIT`。因此即使
    新 ULID 持续到达也不热重试、不饿死，内存和查询成本都有界。
-4. 报告路径与写入语义定死：`<DISCLOSURE_RUNTIME_ROOT>/reports/worker/YYYY-MM-DD.md` 与
+4. 报告路径与写入语义定死：`<DISCLOSURE_RUNTIME_ROOT>/reports/worker/YYYY-MM-DD.md`、
    `<DISCLOSURE_RUNTIME_ROOT>/reports/parse_quality/YYYY-MM-DD.md`（date = 本地时区的轮次
    开始日期；**同日多快照追加写入**，每个所有权已转移的 WorkerReport 一个
    `## run <ISO8601 开始时间>` 小节——覆盖式写法会让挂机一晚只剩最后一轮）。内容：
    WorkerReport 全字段 + 失败清单（document_id + error_code）；parse_quality 汇入 05 的
-   build_stats.v1.json 统计。不进 git。报告 I/O/告警失败与数据面隔离，不得停止健康 parse。
-5. CLI 与 Makefile 定死：cli/worker.py 用 argparse 子命令 `once|loop`；Makefile 追加
+   build_stats.v1.json 统计。不进 git。另有 append-only、mode 0600 的
+   `<DISCLOSURE_RUNTIME_ROOT>/reports/progress/YYYY-MM-DD.jsonl`，每行是闭合
+   `worker_progress.v2`：producer instance + 单调 sequence/event ID、active/checkpointed 公司、动态 process-document 分母、四段 DB 队列、
+   当前 running item、最近区间计数、固定 MinerU API queued/processing/completed/failed、vLLM running/waiting/KV
+   与可选的 source-discriminated GPU exporter telemetry（Linux DCGM 或 Windows nvidia-smi）。
+   vLLM KV 不是 GPU 利用率；没有真实 exporter 时 GPU 字段必须是 unavailable。报告 I/O/探针/告警失败
+   与数据面隔离，不得停止健康 parse。
+5. CLI 与 Makefile 定死：cli/worker.py 用 argparse 子命令 `once|loop|status`；Makefile 追加
    （并入 .PHONY）：
    `worker-once:` → `PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker once`
-   `worker-loop:` → `PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker loop`
+   `worker-loop:` → `PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker loop --progress terminal`
+   `worker-status:` → 读取同一 DB snapshot；`status --format json` 给 Agent/未来 frontend adapter
    `doctor-full:` → `PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor --full`
    拿不到单例锁的行为定死：stdout 打印 `[skip] another worker holds the singleton lock`，
    **退出码 0**（launchd/make 不得把正常互斥当失败），不写报告文件。

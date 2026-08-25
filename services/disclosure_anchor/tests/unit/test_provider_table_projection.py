@@ -4,6 +4,7 @@ from dataclasses import replace
 import unittest
 
 from disclosure_anchor.application.contracts.provider_document import (
+    ProviderBBox,
     ProviderBlock,
     ProviderDocument,
     ProviderPage,
@@ -13,6 +14,7 @@ from disclosure_anchor.application.contracts.provider_document import (
 )
 from disclosure_anchor.application.services.provider_table_projection import (
     build_provider_table_projection,
+    semantic_page_furniture_source_indices,
 )
 
 
@@ -21,6 +23,250 @@ _RAW_SHA = "sha256:" + "b" * 64
 
 
 class ProviderTableProjectionTest(unittest.TestCase):
+    def test_exact_repeated_header_admits_only_same_geometry_bilingual_variant(
+        self,
+    ) -> None:
+        base = "3S 三生国健药业(上海)股份有限公司"
+        bilingual = base + "Sunshine Guojian Pharmaceutical(Shanghai)Co.,Ltd."
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "header",
+                        base,
+                        annotation="page_header",
+                        bbox=ProviderBBox(159, 52, 608, 84),
+                    ),
+                ),
+                (
+                    _block(
+                        1,
+                        1,
+                        "header",
+                        bilingual,
+                        annotation="page_header",
+                        bbox=ProviderBBox(159, 52, 606, 83),
+                    ),
+                ),
+                (
+                    _block(
+                        2,
+                        2,
+                        "header",
+                        base,
+                        annotation="page_header",
+                        bbox=ProviderBBox(159, 52, 608, 84),
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+
+        self.assertEqual(
+            semantic_page_furniture_source_indices(document),
+            frozenset({0, 1, 2}),
+        )
+
+    def test_repeated_header_variant_gate_keeps_adjacent_content(self) -> None:
+        base = "3S 三生国健药业(上海)股份有限公司"
+        candidates = (
+            (
+                "different_cjk",
+                _block(
+                    2,
+                    2,
+                    "header",
+                    "3S 三生国健药业经营情况说明",
+                    annotation="page_header",
+                    bbox=ProviderBBox(159, 52, 608, 84),
+                ),
+            ),
+            (
+                "shared_short_company_token",
+                _block(
+                    2,
+                    2,
+                    "header",
+                    "三生国健风险提示",
+                    annotation="page_header",
+                    bbox=ProviderBBox(159, 52, 608, 84),
+                ),
+            ),
+            (
+                "different_geometry",
+                _block(
+                    2,
+                    2,
+                    "header",
+                    base + "Sunshine Guojian Pharmaceutical",
+                    annotation="page_header",
+                    bbox=ProviderBBox(159, 180, 608, 212),
+                ),
+            ),
+            (
+                "provider_type_not_header",
+                _block(
+                    2,
+                    2,
+                    "text",
+                    base + "Sunshine Guojian Pharmaceutical",
+                    annotation="page_header",
+                    bbox=ProviderBBox(159, 52, 608, 84),
+                ),
+            ),
+            (
+                "annotation_not_header",
+                _block(
+                    2,
+                    2,
+                    "header",
+                    base + "Sunshine Guojian Pharmaceutical",
+                    annotation="paragraph",
+                    bbox=ProviderBBox(159, 52, 608, 84),
+                ),
+            ),
+        )
+        for name, candidate in candidates:
+            with self.subTest(name=name):
+                document = _document(
+                    pages=(
+                        (
+                            _block(
+                                0,
+                                0,
+                                "header",
+                                base,
+                                annotation="page_header",
+                                bbox=ProviderBBox(159, 52, 608, 84),
+                            ),
+                        ),
+                        (
+                            _block(
+                                1,
+                                1,
+                                "header",
+                                base,
+                                annotation="page_header",
+                                bbox=ProviderBBox(159, 52, 608, 84),
+                            ),
+                        ),
+                        (candidate,),
+                    ),
+                    segments=(),
+                )
+
+                self.assertEqual(
+                    semantic_page_furniture_source_indices(document),
+                    frozenset({0, 1}),
+                )
+
+        latin_identity_document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "header",
+                        "ABC科技有限公司",
+                        annotation="page_header",
+                        bbox=ProviderBBox(159, 52, 608, 84),
+                    ),
+                ),
+                (
+                    _block(
+                        1,
+                        1,
+                        "header",
+                        "ABC科技有限公司",
+                        annotation="page_header",
+                        bbox=ProviderBBox(159, 52, 608, 84),
+                    ),
+                ),
+                (
+                    _block(
+                        2,
+                        2,
+                        "header",
+                        "XYZ科技有限公司",
+                        annotation="page_header",
+                        bbox=ProviderBBox(159, 52, 608, 84),
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        self.assertEqual(
+            semantic_page_furniture_source_indices(latin_identity_document),
+            frozenset({0, 1}),
+        )
+
+    def test_unique_identity_header_requires_typed_top_frame_and_exact_field(self) -> None:
+        positive = _document(
+            pages=((
+                _block(
+                    0,
+                    0,
+                    "header",
+                    "赛力斯",
+                    annotation="page_header",
+                    bbox=ProviderBBox(190, 55, 355, 100),
+                ),
+                _block(1, 0, "text", "公司简称：赛力斯"),
+            ),),
+            segments=(),
+        )
+
+        self.assertEqual(
+            semantic_page_furniture_source_indices(positive),
+            frozenset({0}),
+        )
+
+        negatives = (
+            _block(
+                0,
+                0,
+                "header",
+                "赛力斯",
+                annotation="paragraph",
+                bbox=ProviderBBox(190, 55, 355, 100),
+            ),
+            _block(
+                0,
+                0,
+                "text",
+                "赛力斯",
+                annotation="page_header",
+                bbox=ProviderBBox(190, 55, 355, 100),
+            ),
+            _block(
+                0,
+                0,
+                "header",
+                "赛力斯",
+                annotation="page_header",
+                bbox=ProviderBBox(190, 800, 355, 840),
+            ),
+        )
+        for header in negatives:
+            with self.subTest(
+                provider_type=header.provider_type,
+                annotation=header.typed_annotation,
+                bbox=header.bbox,
+            ):
+                document = _document(
+                    pages=((
+                        header,
+                        _block(1, 0, "text", "公司简称：赛力斯"),
+                    ),),
+                    segments=(),
+                )
+                self.assertNotIn(
+                    0,
+                    semantic_page_furniture_source_indices(document),
+                )
+
     def test_provider_retained_owner_and_three_deleted_stubs_form_one_table(
         self,
     ) -> None:
@@ -98,6 +344,78 @@ class ProviderTableProjectionTest(unittest.TestCase):
         self.assertEqual(projection.logical_tables[0].continuations, ())
         self.assertEqual(
             [(item.part.block_source_index, item.reason) for item in projection.unbound_parts],
+            [(2, "continuation_not_page_boundary")],
+        )
+
+    def test_previous_page_footnote_can_precede_an_empty_continuation_stub(
+        self,
+    ) -> None:
+        document = _document(
+            pages=(
+                (
+                    _block(0, 0, "table", "<table><td>完整跨页表</td></table>"),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        "2 资产管理手续费说明",
+                        annotation="page_footnote",
+                    ),
+                    _block(2, 0, "page_number", "1", annotation="page_number"),
+                ),
+                (
+                    _block(3, 1, "header", "页眉", annotation="page_header"),
+                    _block(4, 1, "table", ""),
+                ),
+            ),
+            segments=(
+                _segment(0, 0, "retained"),
+                _segment(1, 0, "deleted"),
+            ),
+        )
+
+        projection = build_provider_table_projection(document)
+
+        self.assertEqual(
+            [
+                part.block_source_index
+                for part in projection.logical_tables[0].continuations
+            ],
+            [4],
+        )
+        self.assertEqual(projection.unbound_parts, ())
+
+    def test_next_page_leading_footnote_does_not_authorize_a_continuation(
+        self,
+    ) -> None:
+        document = _document(
+            pages=(
+                (_block(0, 0, "table", "<table><td>表</td></table>"),),
+                (
+                    _block(
+                        1,
+                        1,
+                        "text",
+                        "2 另一主题脚注",
+                        annotation="page_footnote",
+                    ),
+                    _block(2, 1, "table", ""),
+                ),
+            ),
+            segments=(
+                _segment(0, 0, "retained"),
+                _segment(1, 0, "deleted"),
+            ),
+        )
+
+        projection = build_provider_table_projection(document)
+
+        self.assertEqual(projection.logical_tables[0].continuations, ())
+        self.assertEqual(
+            [
+                (item.part.block_source_index, item.reason)
+                for item in projection.unbound_parts
+            ],
             [(2, "continuation_not_page_boundary")],
         )
 
@@ -215,6 +533,7 @@ def _block(
     text: str,
     *,
     annotation: str | None = None,
+    bbox: ProviderBBox | None = None,
 ) -> ProviderBlock:
     if not text:
         payloads: tuple[ProviderPayload, ...] = ()
@@ -229,7 +548,7 @@ def _block(
         provider_type=provider_type,
         typed_annotation=annotation,
         provider_level=None,
-        bbox=None,
+        bbox=bbox,
         payloads=payloads,
         referenced_artifact_roles=(),
         raw_item_json=f'{{"source":{source_index}}}',

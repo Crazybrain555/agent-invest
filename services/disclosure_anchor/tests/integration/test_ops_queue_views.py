@@ -103,6 +103,48 @@ class OpsQueueViewTests(unittest.TestCase):
         self.doc_ids.append(document_id)
         return document_id
 
+    def test_worker_progress_snapshot_executes_against_real_queue_views(self) -> None:
+        self.company_id = f"co_qv{self.suffix}"
+        self.tracked_id = f"trk_qv{self.suffix}"
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company (company_id, legal_name) "
+                    "VALUES (:company_id, :legal_name)"
+                ),
+                {
+                    "company_id": self.company_id,
+                    "legal_name": f"progress snapshot {self.suffix}",
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.tracked_company "
+                    "(tracked_company_id, company_id, status) "
+                    "VALUES (:tracked_id, :company_id, 'active')"
+                ),
+                {
+                    "tracked_id": self.tracked_id,
+                    "company_id": self.company_id,
+                },
+            )
+            self._insert_document(conn, company_id=self.company_id)
+
+            snapshot = queries.worker_progress_database_snapshot(
+                conn,
+                max_download_retries=3,
+                max_parse_retries=3,
+                max_build_retries=3,
+                scope_classes=None,
+            )
+
+        self.assertEqual(snapshot["universe"]["active_companies"], 1)
+        self.assertEqual(snapshot["universe"]["synced_companies"], 0)
+        self.assertEqual(snapshot["documents"]["known_process_documents"], 1)
+        self.assertEqual(snapshot["documents"]["published_documents"], 0)
+        self.assertEqual(snapshot["queues"]["pending_parse"], 1)
+        self.assertEqual(snapshot["current_work"], [])
+
     def test_pending_parse_requires_current_active_research_scope(self) -> None:
         """Company-bound PDFs follow structural tracking state; local PDFs do not."""
 
@@ -269,6 +311,108 @@ class OpsQueueViewTests(unittest.TestCase):
             self._insert_unit(conn, document_id, run_id)
             rows = queries.pending_publish(conn, limit=500000)
         self.assertIn(run_id, [row["processing_run_id"] for row in rows])
+
+    def test_later_success_remediates_old_build_failure_without_hiding_new_one(
+        self,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        with self.engine.begin() as conn:
+            document_id = self._insert_document(conn, status="parsed")
+            old_failure = self._insert_run(
+                conn,
+                document_id,
+                status="succeeded",
+                unit_build_status="failed",
+                started_at=now - timedelta(minutes=2),
+                attempts=1,
+            )
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.processing_run "
+                    "SET unit_build_error = CAST(:error AS jsonb) "
+                    "WHERE processing_run_id = :run"
+                ),
+                {
+                    "run": old_failure,
+                    "error": (
+                        '{"stage":"build_units",'
+                        '"error_code":"SEMANTIC_ROUTE_ADJUDICATION_UNAVAILABLE",'
+                        '"reason_code":"command_failed","retryable":true}'
+                    ),
+                },
+            )
+            self._insert_run(
+                conn,
+                document_id,
+                status="succeeded",
+                unit_build_status="succeeded",
+                is_active=True,
+                started_at=now - timedelta(minutes=1),
+            )
+
+            pending_after_success = {
+                row["processing_run_id"]
+                for row in queries.pending_build(
+                    conn, max_retries=3, limit=500000
+                )
+            }
+            terminal_after_success = set(
+                conn.execute(
+                    text(
+                        "SELECT processing_run_id "
+                        "FROM disclosure_ops.unit_build_terminal_v1 "
+                        "WHERE document_id = :document_id"
+                    ),
+                    {"document_id": document_id},
+                ).scalars()
+            )
+
+            latest_failure = self._insert_run(
+                conn,
+                document_id,
+                status="succeeded",
+                unit_build_status="failed",
+                started_at=now,
+                attempts=1,
+            )
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.processing_run "
+                    "SET unit_build_error = CAST(:error AS jsonb) "
+                    "WHERE processing_run_id = :run"
+                ),
+                {
+                    "run": latest_failure,
+                    "error": (
+                        '{"stage":"build_units",'
+                        '"error_code":"SEMANTIC_ROUTE_ADJUDICATION_UNAVAILABLE",'
+                        '"reason_code":"command_failed","retryable":true}'
+                    ),
+                },
+            )
+            pending_after_new_failure = {
+                row["processing_run_id"]
+                for row in queries.pending_build(
+                    conn, max_retries=3, limit=500000
+                )
+            }
+            terminal_after_new_failure = set(
+                conn.execute(
+                    text(
+                        "SELECT processing_run_id "
+                        "FROM disclosure_ops.unit_build_terminal_v1 "
+                        "WHERE document_id = :document_id"
+                    ),
+                    {"document_id": document_id},
+                ).scalars()
+            )
+
+        self.assertNotIn(old_failure, pending_after_success)
+        self.assertNotIn(old_failure, terminal_after_success)
+        self.assertNotIn(old_failure, pending_after_new_failure)
+        self.assertNotIn(old_failure, terminal_after_new_failure)
+        self.assertIn(latest_failure, pending_after_new_failure)
+        self.assertIn(latest_failure, terminal_after_new_failure)
 
     def test_pending_publish_excludes_real_empty_run_poison(self) -> None:
         with self.engine.begin() as conn:

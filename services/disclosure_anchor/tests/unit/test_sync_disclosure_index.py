@@ -16,6 +16,7 @@ from disclosure_anchor.adapters.sources.cninfo.mapper import (
 from disclosure_anchor.application.ports.disclosure_source import (
     AnnouncementRef,
     DisclosureWindow,
+    SourceCompanyProfile,
     SourceSecurity,
 )
 from disclosure_anchor.application.use_cases.sync_disclosure_index import (
@@ -107,13 +108,22 @@ class SyncDisclosureIndexTests(unittest.TestCase):
         result = use_case.execute(_command())
 
         tracked = uow.tracked_companies.get_by_company_id(result.company_id)
-        identifier = uow.company_identifiers.get_by_scheme_value(
+        org_identifier = uow.company_identifiers.get_by_scheme_value(
             "cninfo_org_id", "cninfo-org-test-000001"
+        )
+        uscc_identifier = uow.company_identifiers.get_by_scheme_value(
+            "uscc", _profile().uscc
         )
         self.assertEqual(tracked.security_id, result.security_id)
         self.assertIsNone(tracked.process_classes)
-        self.assertEqual(identifier.company_id, result.company_id)
-        self.assertEqual(identifier.source_access_id, result.profile_source_access_id)
+        self.assertEqual(org_identifier.company_id, result.company_id)
+        self.assertEqual(
+            org_identifier.source_access_id, result.profile_source_access_id
+        )
+        self.assertEqual(uscc_identifier.company_id, result.company_id)
+        self.assertEqual(
+            uscc_identifier.source_access_id, result.profile_source_access_id
+        )
 
     def test_untracked_company_is_rejected_before_any_provider_call(self) -> None:
         uow = FakeUnitOfWork()
@@ -333,7 +343,7 @@ def _refs() -> list[AnnouncementRef]:
     ]
 
 
-def _profile() -> object:
+def _profile() -> SourceCompanyProfile:
     payload = json.loads(
         (FIXTURE_ROOT / "p_stock2100_sample.json").read_text(encoding="utf-8")
     )

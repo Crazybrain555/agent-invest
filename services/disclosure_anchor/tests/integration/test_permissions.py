@@ -39,6 +39,18 @@ class PermissionTests(unittest.TestCase):
             finally:
                 trans.rollback()
 
+    def test_reader_cannot_read_private_provider_category(self) -> None:
+        with self.engine.connect() as conn:
+            trans = conn.begin()
+            try:
+                conn.execute(text(f'SET ROLE "{READER_ROLE}"'))
+                with self.assertRaises(ProgrammingError):
+                    conn.execute(
+                        text("SELECT * FROM disclosure_core.provider_category")
+                    )
+            finally:
+                trans.rollback()
+
     def test_reader_can_read_public_view(self) -> None:
         with self.engine.connect() as catalog_conn:
             public_views = view_names(catalog_conn, schema=PUBLIC_SCHEMA)
@@ -114,6 +126,7 @@ class PermissionTests(unittest.TestCase):
             "pending_publish_v1",
             "retryable_failed_run_v1",
             "stale_running_run_v1",
+            "unit_build_terminal_v1",
         ):
             with self.engine.connect() as conn:
                 trans = conn.begin()
@@ -137,6 +150,22 @@ class PermissionTests(unittest.TestCase):
                     )
             finally:
                 trans.rollback()
+
+    def test_health_roles_can_read_migration_head(self) -> None:
+        for role in (APP_ROLE, READER_ROLE, FUTURE_L2_READER_ROLE):
+            with self.engine.connect() as conn:
+                trans = conn.begin()
+                try:
+                    conn.execute(text(f'SET ROLE "{role}"'))
+                    version = conn.execute(
+                        text(
+                            "SELECT version_num "
+                            "FROM disclosure_ops.alembic_version"
+                        )
+                    ).scalar_one()
+                    self.assertTrue(version)
+                finally:
+                    trans.rollback()
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
 ## 已完成（2026-07-07 第一批）
 
 - [x] **[blocker]** No batch company-list intake → pipeline track + config/watchlist.csv（离线幂等，PENDING_LEGAL_NAME 占位+首同步升级）
-- [x] **[blocker]** No default initial backfill window → DISCLOSURE_INITIAL_LOOKBACK_DAYS=1095（用户裁决三年底线）+ tracked.lookback 覆盖，CLI/worker 双路径
+- [x] **[blocker]** No default initial backfill window → DISCLOSURE_INITIAL_LOOKBACK_DAYS=1280（规模启动改为 3.5 年并留日历缓冲）+ tracked.lookback 覆盖，CLI/worker 双路径
 - [x] **[blocker]** 大文档永久占 parse batch 槽 → 2026-07-25 复核后废止大小硬排除；
   pending_parse 返回归档 actual byte_count，worker 送入可借用 HUGE lane
 - [x] **[blocker]** No mechanism delivers required environment to automated runs; the shipped launch → ~/.config/agent-invest/disclosure_anchor/{worker,cninfo}.env + scripts/run_worker_once.sh + launchd 模板/安装脚本
@@ -34,8 +34,8 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
 - [x] **[major]** PENDING_LEGAL_NAME placeholder companies poison the first credentialed sync — bl → resolver 占位名就地升级，真名冲突仍 contested（回归测试）
 - [x] **[minor]** Live CNINFO credentials sit in the working-tree .env under a header claiming it  → 同上（凭据迁出+轮换提示）
 - [x] **[acceptance follow-up]** 2026-07-08 clean-DB P0/P1 → `781e7ec` 为 launchd 日志增加
-  TCC 失败时的用户日志目录回退，并让 `purge-company` 清除按 scode/security_code 关联的 unlinked
-  CNINFO profile `source_access`；旧本地 acceptance report 不再是当前 No-Go 权威。
+  TCC 失败时的用户日志目录回退。历史 `purge-company` 后续因可破坏 raw/source provenance 已从
+  服务 CLI 和 Makefile 删除；旧本地 acceptance report 不再是当前 No-Go 权威。
 
 ## 设计评审文档（2026-07-07 round8 后，先设计后实施）
 
@@ -144,7 +144,7 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
     磁盘容量与 data root / PGDATA free-space doctor 告警仍是未完成事项。
 - [x] (S/OPERATIONS AND DEPLOYMENT) **旧 `wipe_test_data.sh` 可绕过证据与恢复门禁**
   - 2026-07-28 已删除脚本及 Makefile 入口。全量派生清理只走 manifest-bound reset；
-    单公司测试残留只走持 CORPUS exclusive 的 `purge-company`。
+    2026-08-24 再收口：服务 CLI 不再提供单公司 corpus 删除；测试残留只由隔离 scratch runner 清理。
 - [ ] (S/SECURITY AND CREDENTIALS POS) **Parse-failure error text (MinerU stderr, absolute paths) leaks into the public change feed and /v1/c**
   - 修法：Drop the free-text message from outbox event payloads (keep stage/error_code/retryable, which is what the queue views consume), or sanitize messages to relpaths/basenames before they enter outbox_event.
 - [ ] (M/SECURITY AND CREDENTIALS POS) **DB role separation exists only on paper: runtime service, migrations login, and DBHub MCP all connec**
@@ -215,20 +215,23 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
   - 修法：Validate at settings load (or worker start) that stale_run_threshold_seconds >= 2× parse_timeout_seconds, or derive the default threshold from the configured timeout; document that manual long-timeout runs require pausing worker-loop or raising the threshold.
 - [ ] (S/OPERATIONS AND DEPLOYMENT) **Worker and pipeline CLIs skip the mount-sentinel/preflight that the API enforces, writing to data/ru**
   - 修法：Run the fast `_environment_checks` (roots writable + sentinel present) at worker and pipeline startup, exiting with a clear `[FAIL]` before acquiring the lock or touching the DB.
-- [ ] (S/OPERATIONS AND DEPLOYMENT) **Worker and pipeline silently fall back to the migration-owner DSN when DATABASE_URL is unset, runnin**
-  - 修法：Remove the fallback (require DATABASE_URL for worker/pipeline, erroring with the existing ConfigurationError message), or gate it behind an explicit flag for bootstrap-only scenarios.
+- [x] (S/OPERATIONS AND DEPLOYMENT) **Worker and pipeline migration-owner fallback removed（2026-08-22）**
+  - 落地：worker/pipeline 只接受 `DATABASE_URL`；doctor 要求 current_user=`disclosure_app` 且非 superuser。`DISCLOSURE_MIGRATION_DATABASE_URL` 仅供迁移。
 - [ ] (M/OPERATIONS AND DEPLOYMENT) **Makefile entry points are machine-specific with a misleading Python fallback, and there is no end-to**
   - 修法：Replace the conda fallback with an explicit error (`$(error .venv missing — run make venv)`); write a single ops runbook (docs/implementation/runbooks/production-bringup.md) covering cluster init settings, migration, seeding, worker + API supervision, doctor/b
-- [ ] (S/SECURITY AND CREDENTIALS POS) **Reader API engine silently falls back to the write-capable app credentials**
-  - 修法：In production mode treat a missing DISCLOSURE_READER_DATABASE_URL as a startup failure (turn the doctor WARN into FAIL behind a production flag) so reads always run on the reader role.
+- [x] (S/SECURITY AND CREDENTIALS POS) **Reader API engine write-capable fallback removed（2026-08-24）**
+  - 落地：读侧始终使用显式 `DISCLOSURE_READER_DATABASE_URL`；缺失 DSN、非直连
+    `disclosure_reader`、superuser 或非 `invest_engine` 均在启动/doctor 时 fail closed，
+    不再回落 `DATABASE_URL`。
 - [ ] (S/SECURITY AND CREDENTIALS POS) **Absolute filesystem paths persisted into core DB error/reason columns, violating the stated relpath-**
   - 修法：Normalize exception messages before persistence: have raw_document_store raise messages with basenames/relpaths, or scrub known roots (data_root/runtime_root) in the use cases that persist str(exc).
 - [ ] (S/SECURITY AND CREDENTIALS POS) **CNINFO web fallback channel fetches index and PDFs over cleartext HTTP into the immutable corpus**
   - 修法：Switch the three web-channel constants to https:// (CNINFO serves both hosts over TLS) and keep the existing dedup/file-signature logic unchanged.
-- [ ] (S/SECURITY AND CREDENTIALS POS) **MinerU subprocess inherits the full service environment including CNINFO secrets and DB DSNs**
-  - 修法：Replace dict(os.environ) with a minimal allowlist (PATH, HOME, LANG, MINERU_MODEL_CACHE, HF_HOME, MODELSCOPE_CACHE, NO_PROXY) plus extra_env.
-- [ ] (S/SECURITY AND CREDENTIALS POS) **Migration 0012 grants SELECT on a disclosure_core table to the reader role, eroding the views-only r**
-  - 修法：Issue a follow-up migration revoking the reader grant on disclosure_core.provider_category; if readers need the category dimension, expose it through a disclosure_public view (document_categories_v1 already exists for the join case).
+- [x] (S/SECURITY AND CREDENTIALS POS) **MinerU subprocess environment allowlisted（2026-08-23）**
+  - 落地：`MinerUProcess._env` 仅继承明确的运行/证书/locale/cache 键和 `LC_*`，再叠加受控
+    `extra_env`；DB、CNINFO、admin token、semantic provider 与无关凭据不进入 MinerU 子进程。
+- [x] (S/SECURITY AND CREDENTIALS POS) **Private provider-category reader grant revoked（0046）**
+  - 落地：reader 不能直读 `disclosure_core.provider_category`；继续通过 `document_categories_v1` 消费公开分类。
 - [ ] (S/TEST COVERAGE GAPS for produ) **Worker loop mode, interruptible sleep, and successful-run report writing are untested**
   - 修法：Extend the existing subprocess worker test: run `worker once` with zero limits but the lock free and assert both report files gain a '## run' section; add a loop test with a 1-second interval that SIGTERMs after the first round and asserts clean exit 0 with ex
 - [ ] (S/TEST COVERAGE GAPS for produ) **sync_due interval boundary predicate untested: only the never-synced (NULL checkpoint) arm has cover**

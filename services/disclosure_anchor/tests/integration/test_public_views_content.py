@@ -13,6 +13,9 @@ from disclosure_anchor.adapters.db.postgres.classification_refresh import (
 )
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
 from disclosure_anchor.adapters.sources.cninfo.mapper import derive_primary_class
+from disclosure_anchor.application.contracts.document_unit_body_status import (
+    derive_document_unit_body_status,
+)
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from tests.integration._support import engine_or_skip
@@ -255,7 +258,6 @@ class PublicViewContentTests(unittest.TestCase):
                     payload_kind="table",
                     order_index=0,
                     heading_path=["第八节 财务报告", "应收账款"],
-                    semantic_key="receivable_aging",
                     semantic_keys=["receivable_aging"],
                     payload={"unit": "元", "rows": [["合计", "1"]]},
                     content_hash="sha256:unit",
@@ -310,7 +312,7 @@ class PublicViewContentTests(unittest.TestCase):
             self.assertEqual(unit_row["source_ref"], self.source_access_id)
             self.assertEqual(unit_row["producer_action_ref"], self.run_id)
             self.assertEqual(unit_row["parent_ref"], self.document_id)
-            self.assertEqual(unit_row["semantic_key"], "receivable_aging")
+            self.assertEqual(unit_row["semantic_keys"], ["receivable_aging"])
             self.assertEqual(
                 unit_row["payload"], {"unit": "元", "rows": [["合计", "1"]]}
             )
@@ -319,25 +321,8 @@ class PublicViewContentTests(unittest.TestCase):
             self.assertEqual(unit_row["trace_level"], "G0")
             self.assertEqual(unit_row["raw_file_hash"], self.hash_a)
             self.assertEqual(unit_row["query_projection_hash"], "sha256:query")
-
-            v2_row = (
-                conn.execute(
-                    text(
-                        "SELECT * FROM disclosure_public.document_units_v2 "
-                        "WHERE asset_id = :v"
-                    ),
-                    {"v": self.unit_id},
-                )
-                .mappings()
-                .one()
-            )
-            self.assertEqual(v2_row["contract_version"], "document_unit.v2")
-            self.assertEqual(v2_row["body_status"], "content")
-            self.assertNotIn("content_categories", v2_row)
-            for key, value in v2_row.items():
-                if key in {"body_status", "contract_version"}:
-                    continue
-                self.assertEqual(value, unit_row[key], key)
+            self.assertEqual(unit_row["body_status"], "content")
+            self.assertNotIn("content_categories", unit_row)
 
             ref_row = (
                 conn.execute(
@@ -416,11 +401,28 @@ class PublicViewContentTests(unittest.TestCase):
                 change_by_id[self.observed_event_id]["change_kind"], "observed"
             )
 
-    def test_document_units_v2_body_status_is_unit_owned(self) -> None:
+    def test_document_units_v1_body_status_is_unit_owned(self) -> None:
         self._seed()
         heading_id = ids.new_asset_id()
         empty_id = ids.new_asset_id()
-        self.extra_unit_ids.extend((heading_id, empty_id))
+        visual_heading_id = ids.new_asset_id()
+        visual_empty_id = ids.new_asset_id()
+        qa_id = ids.new_asset_id()
+        tab_id = ids.new_asset_id()
+        newline_id = ids.new_asset_id()
+        ideographic_space_id = ids.new_asset_id()
+        self.extra_unit_ids.extend(
+            (
+                heading_id,
+                empty_id,
+                visual_heading_id,
+                visual_empty_id,
+                qa_id,
+                tab_id,
+                newline_id,
+                ideographic_space_id,
+            )
+        )
         with self.engine.begin() as conn:
             conn.execute(
                 text(
@@ -433,13 +435,46 @@ class PublicViewContentTests(unittest.TestCase):
                     "'{\"text\": \"\"}'::jsonb, 'sha256:heading'), "
                     "(:empty_id, :document_id, :run_id, 'text', "
                     "'[]'::jsonb, NULL, 2, "
-                    "'{\"text\": \"\"}'::jsonb, 'sha256:empty')"
+                    "'{\"text\": \"\"}'::jsonb, 'sha256:empty'), "
+                    "(:visual_heading_id, :document_id, :run_id, 'mixed', "
+                    "jsonb_build_array('封面'), '封面', 3, "
+                    "'{\"parts\": [{\"content\": \"\", \"content_artifacts\": "
+                    "[{\"sha256\": \"sha256:visual\", \"size_bytes\": 8, "
+                    "\"media_type\": \"image/jpeg\"}]}]}'::jsonb, "
+                    "'sha256:visual-heading'), "
+                    "(:visual_empty_id, :document_id, :run_id, 'mixed', "
+                    "'[]'::jsonb, NULL, 4, "
+                    "'{\"parts\": [{\"content\": \"\", \"content_artifacts\": "
+                    "[{\"sha256\": \"sha256:visual\", \"size_bytes\": 8, "
+                    "\"media_type\": \"image/jpeg\"}]}]}'::jsonb, "
+                    "'sha256:visual-empty'), "
+                    "(:qa_id, :document_id, :run_id, 'qa', '[]'::jsonb, NULL, 5, "
+                    "'{\"question\": \"\", \"answer\": \"\"}'::jsonb, "
+                    "'sha256:qa'), "
+                    "(:tab_id, :document_id, :run_id, 'mixed', '[]'::jsonb, NULL, 6, "
+                    "jsonb_build_object('parts', jsonb_build_array("
+                    "jsonb_build_object('content', E'\\t'))), 'sha256:tab'), "
+                    "(:newline_id, :document_id, :run_id, 'mixed', "
+                    "jsonb_build_array('标题'), '标题', 7, "
+                    "jsonb_build_object('parts', jsonb_build_array("
+                    "jsonb_build_object('values', jsonb_build_array(E'\\n')))), "
+                    "'sha256:newline'), "
+                    "(:ideographic_space_id, :document_id, :run_id, 'mixed', "
+                    "'[]'::jsonb, NULL, 8, "
+                    "'{\"parts\": [{\"content\": \"　\"}]}'::jsonb, "
+                    "'sha256:ideographic-space')"
                 ),
                 {
                     "document_id": self.document_id,
                     "empty_id": empty_id,
                     "heading_id": heading_id,
                     "run_id": self.run_id,
+                    "qa_id": qa_id,
+                    "tab_id": tab_id,
+                    "newline_id": newline_id,
+                    "ideographic_space_id": ideographic_space_id,
+                    "visual_empty_id": visual_empty_id,
+                    "visual_heading_id": visual_heading_id,
                 },
             )
         with self.engine.connect() as conn:
@@ -447,16 +482,183 @@ class PublicViewContentTests(unittest.TestCase):
                 conn.execute(
                     text(
                         "SELECT asset_id, body_status "
-                        "FROM disclosure_public.document_units_v2 "
+                        "FROM disclosure_public.document_units_v1 "
                         "WHERE asset_id = ANY(:ids)"
                     ),
-                    {"ids": [self.unit_id, heading_id, empty_id]},
+                    {
+                        "ids": [
+                            self.unit_id,
+                            heading_id,
+                            empty_id,
+                            visual_heading_id,
+                            visual_empty_id,
+                            qa_id,
+                            tab_id,
+                            newline_id,
+                            ideographic_space_id,
+                        ]
+                    },
                 ).all()
             )
 
-        self.assertEqual(statuses[self.unit_id], "content")
-        self.assertEqual(statuses[heading_id], "heading_only")
-        self.assertEqual(statuses[empty_id], "empty")
+        expected = {
+            self.unit_id: derive_document_unit_body_status(
+                payload_kind="table",
+                payload={"unit": "元", "rows": [["合计", "1"]]},
+                title=None,
+            ),
+            heading_id: derive_document_unit_body_status(
+                payload_kind="text",
+                payload={"text": ""},
+                title="一、标题",
+            ),
+            empty_id: derive_document_unit_body_status(
+                payload_kind="text",
+                payload={"text": ""},
+                title=None,
+            ),
+            visual_heading_id: derive_document_unit_body_status(
+                payload_kind="mixed",
+                payload={
+                    "parts": [
+                        {
+                            "content": "",
+                            "content_artifacts": [
+                                {
+                                    "sha256": "sha256:visual",
+                                    "size_bytes": 8,
+                                    "media_type": "image/jpeg",
+                                }
+                            ],
+                        }
+                    ]
+                },
+                title="封面",
+            ),
+            visual_empty_id: derive_document_unit_body_status(
+                payload_kind="mixed",
+                payload={
+                    "parts": [
+                        {
+                            "content": "",
+                            "content_artifacts": [
+                                {
+                                    "sha256": "sha256:visual",
+                                    "size_bytes": 8,
+                                    "media_type": "image/jpeg",
+                                }
+                            ],
+                        }
+                    ]
+                },
+                title=None,
+            ),
+            qa_id: derive_document_unit_body_status(
+                payload_kind="qa",
+                payload={"question": "", "answer": ""},
+                title=None,
+            ),
+            tab_id: derive_document_unit_body_status(
+                payload_kind="mixed",
+                payload={"parts": [{"content": "\t"}]},
+                title=None,
+            ),
+            newline_id: derive_document_unit_body_status(
+                payload_kind="mixed",
+                payload={"parts": [{"values": ["\n"]}]},
+                title="标题",
+            ),
+            ideographic_space_id: derive_document_unit_body_status(
+                payload_kind="mixed",
+                payload={"parts": [{"content": "　"}]},
+                title=None,
+            ),
+        }
+        self.assertEqual(statuses, expected)
+
+    def test_document_units_v1_route_arrays_are_never_null(self) -> None:
+        self._seed()
+        route_free_id = ids.new_asset_id()
+        self.extra_unit_ids.append(route_free_id)
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.document_unit "
+                    "(asset_id, document_id, processing_run_id, payload_kind, "
+                    "heading_path, title, order_index, payload, content_hash) "
+                    "VALUES (:asset_id, :document_id, :run_id, 'text', "
+                    "'[]'::jsonb, '封面', 99, '{\"text\": \"封面\"}'::jsonb, "
+                    "'sha256:route-free')"
+                ),
+                {
+                    "asset_id": route_free_id,
+                    "document_id": self.document_id,
+                    "run_id": self.run_id,
+                },
+            )
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT semantic_keys, section_keys "
+                    "FROM disclosure_public.document_units_v1 "
+                    "WHERE asset_id = :asset_id"
+                ),
+                {"asset_id": route_free_id},
+            ).one()
+
+        self.assertEqual(row.semantic_keys, [])
+        self.assertEqual(row.section_keys, [])
+
+    def test_document_outline_aggregates_full_route_arrays_as_varchar(self) -> None:
+        self._seed()
+        shared_path = '["第九节 财务报告", "路由聚合节点"]'
+        route_sets = (
+            '["alpha_route", "beta_route"]',
+            '["beta_route", "gamma_route"]',
+            None,
+        )
+        for index, semantic_keys in enumerate(route_sets):
+            asset_id = ids.new_asset_id()
+            self.extra_unit_ids.append(asset_id)
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO disclosure_core.document_unit "
+                        "(asset_id, document_id, processing_run_id, payload_kind, "
+                        "heading_path, title, order_index, payload, content_hash, "
+                        "semantic_keys) "
+                        "VALUES (:asset_id, :document_id, :run_id, 'text', "
+                        "CAST(:path AS jsonb), '路由聚合节点', :order_index, "
+                        "'{\"text\": \"正文\"}'::jsonb, :content_hash, "
+                        "CAST(:semantic_keys AS jsonb))"
+                    ),
+                    {
+                        "asset_id": asset_id,
+                        "document_id": self.document_id,
+                        "run_id": self.run_id,
+                        "path": shared_path,
+                        "order_index": 200 + index,
+                        "content_hash": f"sha256:outline-{index}",
+                        "semantic_keys": semantic_keys,
+                    },
+                )
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT unit_count, semantic_keys, "
+                    "pg_typeof(semantic_keys)::text AS sql_type "
+                    "FROM disclosure_public.document_outline_v1 "
+                    "WHERE document_id = :document_id "
+                    "AND path = CAST(:path AS jsonb)"
+                ),
+                {"document_id": self.document_id, "path": shared_path},
+            ).one()
+
+        self.assertEqual(row.unit_count, 3)
+        self.assertEqual(
+            row.semantic_keys, ["alpha_route", "beta_route", "gamma_route"]
+        )
+        self.assertEqual(row.sql_type, "character varying[]")
 
     def test_document_units_view_column_contract(self) -> None:
         common_expected = (
@@ -470,7 +672,6 @@ class PublicViewContentTests(unittest.TestCase):
             "heading_path_text",
             "title",
             "order_index",
-            "semantic_key",
             "semantic_keys",
             "section_keys",
             "payload",
@@ -512,22 +713,13 @@ class PublicViewContentTests(unittest.TestCase):
                     )
                 )
             )
-            v2_columns = tuple(
-                row.column_name
-                for row in conn.execute(
-                    text(
-                        "SELECT column_name FROM information_schema.columns "
-                        "WHERE table_schema = 'disclosure_public' "
-                        "AND table_name = 'document_units_v2' "
-                        "ORDER BY ordinal_position"
-                    )
-                )
-            )
+            v2 = conn.execute(
+                text("SELECT to_regclass('disclosure_public.document_units_v2')")
+            ).scalar_one_or_none()
 
-        self.assertEqual(v2_columns, common_expected + ("body_status",))
-        self.assertEqual(v1_columns, common_expected + ("content_categories",))
-        self.assertEqual(len(v2_columns), 40)
-        self.assertEqual(len(v1_columns), 40)
+        self.assertEqual(v1_columns, common_expected + ("body_status",))
+        self.assertEqual(len(v1_columns), 39)
+        self.assertIsNone(v2)
 
     def test_view_derives_classification_and_facets_from_raw_category(self) -> None:
         # 0016: one class map, two outputs — filing_type = argmax priority,

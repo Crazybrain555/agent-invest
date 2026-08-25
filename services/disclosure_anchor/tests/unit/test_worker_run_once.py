@@ -142,14 +142,15 @@ class SyncWindowStartTests(unittest.TestCase):
         )
 
     def test_missing_cursor_defaults_to_initial_backfill(self) -> None:
-        # User decision 2026-07-06: 三年是底线 — a never-synced company backfills
-        # the full initial window, not the incremental overlap.
+        # A never-synced company gets a three-year window plus safety lead,
+        # not merely the incremental overlap.
         self.assertEqual(
             _sync_window_start(
-                None, today=date(2026, 7, 6), overlap_days=7,
-                initial_lookback_days=1095,
+                None,
+                today=date(2026, 7, 6),
+                overlap_days=7,
             ),
-            date(2026, 7, 6) - timedelta(days=1095),
+            date(2026, 7, 6) - timedelta(days=1280),
         )
 
     def test_missing_cursor_honors_per_company_lookback_override(self) -> None:

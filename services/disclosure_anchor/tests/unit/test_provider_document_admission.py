@@ -26,9 +26,11 @@ from disclosure_anchor.application.contracts.provider_document import (
     provider_artifact_bundle_sha256,
 )
 from disclosure_anchor.application.contracts.provider_document_admission import (
+    AdmittedProviderDocument,
     ProviderDocumentAdmissionError,
     SourcePdfObservation,
     SourcePdfTextObservation,
+    SourceTextReconciliation,
 )
 from disclosure_anchor.application.contracts.provider_document_envelope import (
     ProviderDocumentEnvelope,
@@ -214,6 +216,444 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
             admitted.effective_provider_document.blocks[0].payloads[0].text,
             "Company Limited 净利率1.77%。",
         )
+
+    def test_repairs_source_bound_numeric_identifier_and_one_missing_quote(
+        self,
+    ) -> None:
+        original = _provider_document()
+        page = original.pages[0]
+        block = page.blocks[0]
+        provider_text = (
+            "于 年 月， 万科 召开 年第一次持有人会议，并调整 万科02”回售安排，"
+            "40%于 2026 年 1 月 30日兑付。"
+        )
+        native_text = (
+            "于 2026 年 1 月，21 万科 02 召开 2026 年第一次持有人会议，"
+            "并调整“21 万科\r\n02”回售安排，40%于 2026 年 1 月 30\r\n日兑付。"
+        )
+        expected = (
+            "于 2026 年 1 月，21 万科 02 召开 2026 年第一次持有人会议，"
+            "并调整“21 万科02”回售安排，40%于 2026 年 1 月 30日兑付。"
+        )
+        provider_document = replace(
+            original,
+            pages=(
+                replace(
+                    page,
+                    blocks=(
+                        replace(
+                            block,
+                            payloads=(ProviderPayload("text", None, provider_text),),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        envelope = replace(_envelope(), provider_document=provider_document)
+        record = provider_document_envelope_to_bytes(envelope)
+        source = _FakeSource(
+            record=record,
+            rebuilt=provider_document,
+            text_observations=(
+                SourcePdfTextObservation(
+                    source_index=0,
+                    page_index=0,
+                    payload_ordinal=0,
+                    raw_block_sha256=block.raw_item_sha256,
+                    text=native_text,
+                ),
+            ),
+        )
+
+        admitted = _admission(source).admit(
+            document=_document(),
+            run=_run(artifact_hash=_sha_bytes(record)),
+            artifact_owner=_run(artifact_hash=_sha_bytes(record)),
+            security_code="000001",
+        )
+
+        self.assertEqual(
+            admitted.effective_provider_document.blocks[0].payloads[0].text,
+            expected,
+        )
+        self.assertEqual(
+            admitted.source_text_reconciliations[0].source_kind,
+            "source_pdf_native_identifier.v1",
+        )
+
+    def test_identifier_repair_rejects_substitution_reordering_and_text_changes(
+        self,
+    ) -> None:
+        cases = (
+            ("21万科02”到期", "“21万科03”到期"),
+            ("21万科02”到期", "“02万科21”到期"),
+            ("21万科02”到期", "“21金科02”到期"),
+            ("21万科02”到期", "“21万科02”“到期"),
+            ("报告 年，Company AB 到期。", "报告 2026 年，Company A B 到期。"),
+            ("万科 A债于 年到期", "万科 A 债于 2026 年到期"),
+        )
+        original = _provider_document()
+        page = original.pages[0]
+        block = page.blocks[0]
+        for provider_text, native_text in cases:
+            with self.subTest(provider_text=provider_text, native_text=native_text):
+                provider_document = replace(
+                    original,
+                    pages=(
+                        replace(
+                            page,
+                            blocks=(
+                                replace(
+                                    block,
+                                    payloads=(
+                                        ProviderPayload("text", None, provider_text),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+                envelope = replace(_envelope(), provider_document=provider_document)
+                record = provider_document_envelope_to_bytes(envelope)
+                source = _FakeSource(
+                    record=record,
+                    rebuilt=provider_document,
+                    text_observations=(
+                        SourcePdfTextObservation(
+                            source_index=0,
+                            page_index=0,
+                            payload_ordinal=0,
+                            raw_block_sha256=block.raw_item_sha256,
+                            text=native_text,
+                        ),
+                    ),
+                )
+
+                admitted = _admission(source).admit(
+                    document=_document(),
+                    run=_run(artifact_hash=_sha_bytes(record)),
+                    artifact_owner=_run(artifact_hash=_sha_bytes(record)),
+                    security_code="000001",
+                )
+
+                self.assertFalse(admitted.source_text_reconciliations)
+
+    def test_repairs_one_source_bound_equals_with_numeric_identifiers_v2(
+        self,
+    ) -> None:
+        provider_text = (
+            "（ ）自 年起按照资本管理办法的规定计算杠杆率"
+            "（杠杆率 一级资本净额╱调整后的表内外资产余额）"
+        )
+        native_text = (
+            "（2）自2024年起按照资本管理办法的规定计算杠杆率"
+            "（杠杆率=一级资本净额╱调整后的表内外资产余额）"
+        )
+
+        admitted = _admit_single_text_observation(provider_text, native_text)
+
+        self.assertEqual(
+            admitted.effective_provider_document.blocks[0].payloads[0].text,
+            native_text,
+        )
+        self.assertEqual(
+            [item.source_kind for item in admitted.source_text_reconciliations],
+            ["source_pdf_native_identifier.v2"],
+        )
+        self.assertFalse(admitted.source_quality_findings)
+
+    def test_identifier_v2_rejects_ambiguous_or_non_equals_symbol_changes(
+        self,
+    ) -> None:
+        cases = (
+            ("（ ）自 年起，A B", "（2）自2024年起，A=B=C"),
+            ("（ ）自 年起，A=B", "（2）自2024年起，A=B=C"),
+            ("（ ）自 年起，A B", "（2）自2024年起，A==B"),
+            ("（ ）自 年起，A B", "（2）自2024年起，A+B"),
+            ("（ ）自 年起，A B", "（2）自2024年起，A≠B"),
+            ("（ ）自 年起，A B", "（2）自2024年起，A：B"),
+            ("自2024年起，A B", "自2024年起，A=B"),
+            ("（3）自 年起，A B", "（2）自2024年起，A=B"),
+            ("（ ）自 年起，A B", "（2）至2024年起，A=B"),
+        )
+        for provider_text, native_text in cases:
+            with self.subTest(provider_text=provider_text, native_text=native_text):
+                admitted = _admit_single_text_observation(provider_text, native_text)
+                self.assertFalse(admitted.source_text_reconciliations)
+
+    def test_flags_native_text_omission_without_rewriting_payload(self) -> None:
+        cases = (
+            (
+                "如财务报表附注 五 所述， 年度管理层存在偏向风险。",
+                " 如财务报表附注(五)42 所述，2025 年度管理层存在偏向风险。",
+            ),
+            ("余额100", "余额100 2025"),
+        )
+        for provider_text, native_text in cases:
+            with self.subTest(provider_text=provider_text, native_text=native_text):
+                admitted = _admit_single_text_observation(provider_text, native_text)
+
+                self.assertIs(
+                    admitted.effective_provider_document,
+                    admitted.provider_document,
+                )
+                self.assertFalse(admitted.source_text_reconciliations)
+                self.assertEqual(
+                    [
+                        (item.source_kind, item.reason)
+                        for item in admitted.source_quality_findings
+                    ],
+                    [("source_pdf_native_text_quality.v1", "native_text_omission")],
+                )
+
+    def test_native_text_omission_finding_rejects_non_deletion_drift(self) -> None:
+        cases = (
+            ("附注五所述，2025年度", "附注六所述，2025年度"),
+            ("附注五所述，205年度", "附注五所述，2025年度"),
+            ("附注五所述，2025年度", "附注五所述，2024年度"),
+            ("附注五所述， 年度", "年度附注五所述，2025"),
+            ("附注五所述， 年度", "附注五所述， 年度"),
+            ("附注五所述，2025年度", "附注  五所述，2025年度"),
+            ("余 额", "余额2025"),
+            ("A B余额", "AB余额2025"),
+        )
+        for provider_text, native_text in cases:
+            with self.subTest(provider_text=provider_text, native_text=native_text):
+                admitted = _admit_single_text_observation(provider_text, native_text)
+                self.assertFalse(admitted.source_quality_findings)
+
+    def test_flags_one_source_proved_cjk_bracket_omission_without_repair(self) -> None:
+        for provider_text, native_text in (
+            ("财会〔20267号", "财会〔2026〕7号"),
+            ("财会2026〕7号", "财会〔2026〕7号"),
+        ):
+            with self.subTest(provider_text=provider_text):
+                admitted = _admit_single_text_observation(provider_text, native_text)
+                self.assertFalse(admitted.source_text_reconciliations)
+                self.assertEqual(
+                    [
+                        (item.source_kind, item.reason)
+                        for item in admitted.source_quality_findings
+                    ],
+                    [("source_pdf_native_text_quality.v2", "cjk_bracket_omission")],
+                )
+                self.assertEqual(
+                    admitted.effective_provider_document.blocks[0].payloads[0].text,
+                    provider_text,
+                )
+
+        for provider_text, native_text in (
+            ("财会〔20267号", "财会〔2025〕7号"),
+            ("财会20267号", "财会〔2026〕7号"),
+            ("财会〔20267号", "财会〔20267号"),
+            ("财会〔2026)7号", "财会〔2026〕7号"),
+        ):
+            with self.subTest(rejected_provider_text=provider_text):
+                admitted = _admit_single_text_observation(provider_text, native_text)
+                self.assertFalse(admitted.source_quality_findings)
+
+    def test_flags_one_checksum_proved_uscc_o_zero_confusable_without_repair(
+        self,
+    ) -> None:
+        provider_code = "91150121MAOQUD2F5U"
+        native_code = "91150121MA0QUD2F5U"
+        admitted = _admit_single_table_observation(
+            (
+                "<table><tr><td>统一社会信用代码</td>"
+                f"<td>{provider_code}</td></tr></table>"
+            ),
+            f"统一社会信用代码 {native_code}",
+        )
+
+        self.assertFalse(admitted.source_text_reconciliations)
+        self.assertEqual(
+            [
+                (item.source_kind, item.reason)
+                for item in admitted.source_quality_findings
+            ],
+            [
+                (
+                    "source_pdf_native_identifier_quality.v1",
+                    "identifier_confusable_mismatch",
+                )
+            ],
+        )
+        self.assertIn(
+            provider_code,
+            admitted.effective_provider_document.blocks[0].payloads[0].text,
+        )
+
+        rejected = (
+            (
+                "<table><tr><td>统一社会信用代码</td>"
+                f"<td>{native_code}</td></tr></table>",
+                f"统一社会信用代码 {native_code}",
+            ),
+            (
+                "<table><tr><td>统一社会信用代码</td><td>备注</td>"
+                f"<td>{provider_code}</td></tr></table>",
+                f"统一社会信用代码 {native_code}",
+            ),
+            (
+                "<table><tr><td>统一社会信用代码</td>"
+                f"<td>{provider_code}</td></tr></table>",
+                f"统一社会信用代码 {provider_code}",
+            ),
+            (
+                "<table><tr><td>统一社会信用代码</td>"
+                f"<td>{provider_code}</td></tr></table>",
+                f"统一社会信用代码 {native_code} {native_code}",
+            ),
+        )
+        for provider_html, native_text in rejected:
+            with self.subTest(native_text=native_text):
+                candidate = _admit_single_table_observation(
+                    provider_html,
+                    native_text,
+                )
+                self.assertFalse(candidate.source_quality_findings)
+
+    def test_admitted_document_rejects_overlapping_repair_and_quality_evidence(
+        self,
+    ) -> None:
+        admitted = _admit_single_text_observation(
+            "如财务报表附注 五 所述， 年度管理层存在偏向风险。",
+            " 如财务报表附注(五)42 所述，2025 年度管理层存在偏向风险。",
+        )
+        finding = admitted.source_quality_findings[0]
+
+        with self.assertRaisesRegex(ValueError, "cannot overlap"):
+            replace(
+                admitted,
+                source_text_reconciliations=(
+                    SourceTextReconciliation(
+                        source_index=finding.source_index,
+                        payload_ordinal=finding.payload_ordinal,
+                        raw_block_sha256=finding.raw_block_sha256,
+                        provider_text_sha256=finding.provider_text_sha256,
+                        source_text="source-native-text",
+                        source_text_sha256=_sha_text("source-native-text"),
+                        source_kind="source_pdf_native_numeric.v1",
+                    ),
+                ),
+            )
+
+    def test_flags_only_source_proved_table_loss_or_numeric_mutation(self) -> None:
+        cases = (
+            (
+                "<table><tr><td>项目</td><td>金额</td></tr>"
+                "<tr><td>期初</td><td>100</td></tr>"
+                "<tr><td></td><td></td></tr>"
+                "<tr><td></td><td></td></tr></table>",
+                "项目 金额 期初 100 期末 200 本年增加 50",
+                "empty_table_tail",
+            ),
+            (
+                "<table><tr><td>期初</td><td>44,137.872,679.12</td></tr></table>",
+                "期初 44,137,872,679.12",
+                "malformed_numeric_grouping",
+            ),
+            (
+                "<table><tr><td>项目</td><td>2025</td><td>2024</td></tr>"
+                "<tr><td>合计</td><td>152,886,112,625.30</td>"
+                "<td>100,000,000,000.00</td></tr></table>",
+                "项目 2025 2024 合计 152,896,112,625.30 100,000,000,000.00",
+                "numeric_token_mismatch",
+            ),
+        )
+        original = _provider_document()
+        page = original.pages[0]
+        block = page.blocks[0]
+        for provider_html, native_text, expected_reason in cases:
+            with self.subTest(expected_reason=expected_reason):
+                table_block = replace(
+                    block,
+                    provider_type="table",
+                    typed_annotation="table",
+                    payloads=(ProviderPayload("table_body", None, provider_html),),
+                )
+                provider_document = replace(
+                    original,
+                    pages=(replace(page, blocks=(table_block,)),),
+                )
+                envelope = replace(_envelope(), provider_document=provider_document)
+                record = provider_document_envelope_to_bytes(envelope)
+                source = _FakeSource(
+                    record=record,
+                    rebuilt=provider_document,
+                    text_observations=(
+                        SourcePdfTextObservation(
+                            source_index=0,
+                            page_index=0,
+                            payload_ordinal=0,
+                            raw_block_sha256=block.raw_item_sha256,
+                            text=native_text,
+                        ),
+                    ),
+                )
+
+                admitted = _admission(source).admit(
+                    document=_document(),
+                    run=_run(artifact_hash=_sha_bytes(record)),
+                    artifact_owner=_run(artifact_hash=_sha_bytes(record)),
+                    security_code="000001",
+                )
+
+                self.assertFalse(admitted.source_text_reconciliations)
+                self.assertEqual(
+                    [item.reason for item in admitted.source_quality_findings],
+                    [expected_reason],
+                )
+                self.assertIs(
+                    admitted.effective_provider_document,
+                    admitted.provider_document,
+                )
+
+    def test_does_not_flag_legitimate_empty_or_partial_native_table_observation(
+        self,
+    ) -> None:
+        original = _provider_document()
+        page = original.pages[0]
+        block = page.blocks[0]
+        provider_html = (
+            "<table><tr><td>项目</td><td>金额</td></tr>"
+            "<tr><td>期初</td><td>100</td></tr>"
+            "<tr><td></td><td></td></tr><tr><td></td><td></td></tr></table>"
+        )
+        table_block = replace(
+            block,
+            provider_type="table",
+            typed_annotation="table",
+            payloads=(ProviderPayload("table_body", None, provider_html),),
+        )
+        provider_document = replace(
+            original,
+            pages=(replace(page, blocks=(table_block,)),),
+        )
+        envelope = replace(_envelope(), provider_document=provider_document)
+        record = provider_document_envelope_to_bytes(envelope)
+        source = _FakeSource(
+            record=record,
+            rebuilt=provider_document,
+            text_observations=(
+                SourcePdfTextObservation(
+                    source_index=0,
+                    page_index=0,
+                    payload_ordinal=0,
+                    raw_block_sha256=block.raw_item_sha256,
+                    text="项目 金额 期初 100",
+                ),
+            ),
+        )
+
+        admitted = _admission(source).admit(
+            document=_document(),
+            run=_run(artifact_hash=_sha_bytes(record)),
+            artifact_owner=_run(artifact_hash=_sha_bytes(record)),
+            security_code="000001",
+        )
+
+        self.assertFalse(admitted.source_quality_findings)
 
     def test_does_not_reconcile_when_nonnumeric_source_text_differs(self) -> None:
         envelope = _envelope()
@@ -761,6 +1201,55 @@ class PdfTextObservationTests(unittest.TestCase):
                 self.assertEqual(len(observations), expected_count)
                 self.assertEqual(len(text_page.bounds), expected_count)
 
+    def test_cross_type_bbox_overlap_suppresses_only_text_observation(self) -> None:
+        base = _provider_document()
+        text_block = base.blocks[0]
+        page = base.pages[0]
+        table_block = replace(
+            text_block,
+            source_index=1,
+            order_in_page=1,
+            provider_type="table",
+            payloads=(
+                ProviderPayload(
+                    "table_body",
+                    None,
+                    "<table><tr><td>项目</td><td>2026</td></tr></table>",
+                ),
+            ),
+        )
+        for table_payloads, expected_indices in (
+            (table_block.payloads, [1]),
+            ((ProviderPayload("table_caption", 0, "项目表"),), []),
+        ):
+            with self.subTest(table_payloads=table_payloads):
+                blocker = replace(table_block, payloads=table_payloads)
+                document = replace(
+                    base,
+                    pages=(
+                        replace(
+                            page,
+                            page_size=(1_000.0, 2_000.0),
+                            blocks=(text_block, blocker),
+                        ),
+                    ),
+                )
+                text_page = _FakePdfTextPage("项目 2026")
+                pdf = _FakePdfDocument(_FakePdfPage(text_page))
+                with patch(
+                    "disclosure_anchor.adapters.parsers.pdf_text_observation.pdfium.PdfDocument",
+                    return_value=pdf,
+                ):
+                    observations = observe_pdf_text_rectangles(
+                        Path("source.pdf"),
+                        document=document,
+                    )
+
+                self.assertEqual(
+                    [observation.source_index for observation in observations],
+                    expected_indices,
+                )
+
 
 class _FakeSource:
     def __init__(
@@ -903,6 +1392,98 @@ def _admission(source: _FakeSource) -> ProviderDocumentAdmission:
     return ProviderDocumentAdmission(
         path_builder=_PathBuilder(),  # type: ignore[arg-type]
         source=source,
+    )
+
+
+def _admit_single_text_observation(
+    provider_text: str,
+    native_text: str,
+) -> AdmittedProviderDocument:
+    original = _provider_document()
+    page = original.pages[0]
+    block = page.blocks[0]
+    provider_document = replace(
+        original,
+        pages=(
+            replace(
+                page,
+                blocks=(
+                    replace(
+                        block,
+                        payloads=(ProviderPayload("text", None, provider_text),),
+                    ),
+                ),
+            ),
+        ),
+    )
+    envelope = replace(_envelope(), provider_document=provider_document)
+    record = provider_document_envelope_to_bytes(envelope)
+    source = _FakeSource(
+        record=record,
+        rebuilt=provider_document,
+        text_observations=(
+            SourcePdfTextObservation(
+                source_index=0,
+                page_index=0,
+                payload_ordinal=0,
+                raw_block_sha256=block.raw_item_sha256,
+                text=native_text,
+            ),
+        ),
+    )
+    return _admission(source).admit(
+        document=_document(),
+        run=_run(artifact_hash=_sha_bytes(record)),
+        artifact_owner=_run(artifact_hash=_sha_bytes(record)),
+        security_code="000001",
+    )
+
+
+def _admit_single_table_observation(
+    provider_html: str,
+    native_text: str,
+) -> AdmittedProviderDocument:
+    original = _provider_document()
+    page = original.pages[0]
+    block = page.blocks[0]
+    provider_document = replace(
+        original,
+        pages=(
+            replace(
+                page,
+                blocks=(
+                    replace(
+                        block,
+                        provider_type="table",
+                        typed_annotation="table",
+                        payloads=(
+                            ProviderPayload("table_body", None, provider_html),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    envelope = replace(_envelope(), provider_document=provider_document)
+    record = provider_document_envelope_to_bytes(envelope)
+    source = _FakeSource(
+        record=record,
+        rebuilt=provider_document,
+        text_observations=(
+            SourcePdfTextObservation(
+                source_index=0,
+                page_index=0,
+                payload_ordinal=0,
+                raw_block_sha256=block.raw_item_sha256,
+                text=native_text,
+            ),
+        ),
+    )
+    return _admission(source).admit(
+        document=_document(),
+        run=_run(artifact_hash=_sha_bytes(record)),
+        artifact_owner=_run(artifact_hash=_sha_bytes(record)),
+        security_code="000001",
     )
 
 

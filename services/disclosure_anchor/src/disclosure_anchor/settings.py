@@ -8,12 +8,67 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Optional
+from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, SecretStr, model_validator
+from pydantic import AliasChoices, BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 SENTINEL_NAME = "MOUNT_SENTINEL_DO_NOT_CREATE_ON_INTERNAL"
+
+
+def _validate_mineru_endpoint(
+    label: str,
+    value: str,
+    *,
+    allowed_paths: frozenset[str],
+) -> None:
+    """Reject ambiguous or credential-bearing operational endpoints."""
+
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "http"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            f"{label} must be an HTTP URL without credentials, query, or fragment"
+        )
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{label} has an invalid port") from exc
+    if port is None:
+        raise ValueError(f"{label} must pin an explicit port")
+    if parsed.path not in allowed_paths:
+        raise ValueError(f"{label} has an unsupported path")
+
+
+class SemanticProviderConfig(BaseModel):
+    """Secret-free provider composition parsed from one closed JSON value."""
+
+    id: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9-]{1,63}$")
+    kind: Literal["codex_cli", "claude_cli"]
+    provider: Literal["openai", "anthropic"]
+    executable: Path
+    canonical_model: str = Field(min_length=1, pattern=r"^\S+$")
+    profile: Literal["low", "medium", "high"] = "low"
+    timeout_seconds: int = Field(default=600, ge=1)
+    max_concurrency: int = Field(default=1, ge=1, le=8)
+
+    @model_validator(mode="after")
+    def _validate_adapter_identity(self) -> "SemanticProviderConfig":
+        if self.kind == "codex_cli" and self.provider != "openai":
+            raise ValueError("codex_cli semantic provider must be openai")
+        if self.kind == "claude_cli":
+            if self.provider != "anthropic":
+                raise ValueError("claude_cli semantic provider must be anthropic")
+            if self.canonical_model != "claude-sonnet-5":
+                raise ValueError("claude_cli requires canonical_model=claude-sonnet-5")
+        return self
 
 
 class Settings(BaseSettings):
@@ -30,10 +85,14 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("DISCLOSURE_DATA_ROOT", "disclosure_data_root")
     )
     disclosure_shared_root: Path = Field(
-        validation_alias=AliasChoices("DISCLOSURE_SHARED_ROOT", "disclosure_shared_root")
+        validation_alias=AliasChoices(
+            "DISCLOSURE_SHARED_ROOT", "disclosure_shared_root"
+        )
     )
     disclosure_runtime_root: Path = Field(
-        validation_alias=AliasChoices("DISCLOSURE_RUNTIME_ROOT", "disclosure_runtime_root")
+        validation_alias=AliasChoices(
+            "DISCLOSURE_RUNTIME_ROOT", "disclosure_runtime_root"
+        )
     )
     database_url: Optional[SecretStr] = Field(
         default=None,
@@ -59,6 +118,18 @@ class Settings(BaseSettings):
     )
     mineru_model_cache: Path = Field(
         validation_alias=AliasChoices("MINERU_MODEL_CACHE", "mineru_model_cache")
+    )
+    # Keep this as an integer range instead of Literal[16]: pydantic-settings
+    # receives environment values as strings and does not coerce an integer
+    # Literal, which would reject the valid `MINERU_PROCESSING_WINDOW_SIZE=16`.
+    mineru_processing_window_size: int = Field(
+        default=16,
+        ge=16,
+        le=16,
+        validation_alias=AliasChoices(
+            "MINERU_PROCESSING_WINDOW_SIZE",
+            "mineru_processing_window_size",
+        ),
     )
     hf_home: Path = Field(validation_alias=AliasChoices("HF_HOME", "hf_home"))
     modelscope_cache: Path = Field(
@@ -116,11 +187,117 @@ class Settings(BaseSettings):
             "DISCLOSURE_MINERU_BACKEND", "disclosure_mineru_backend"
         ),
     )
-    disclosure_mineru_server_url: Optional[str] = Field(
+    # Three different network namespaces participate in the fixed MinerU API
+    # topology.  They are intentionally separate: a Mac-reachable endpoint is
+    # not evidence that the Windows orchestrator can resolve the same URL.
+    disclosure_mineru_api_url: Optional[str] = Field(
         default=None,
         pattern=r"^https?://",
         validation_alias=AliasChoices(
-            "DISCLOSURE_MINERU_SERVER_URL", "disclosure_mineru_server_url"
+            "DISCLOSURE_MINERU_API_URL", "disclosure_mineru_api_url"
+        ),
+    )
+    disclosure_mineru_observability_url: Optional[str] = Field(
+        default=None,
+        pattern=r"^https?://",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_OBSERVABILITY_URL",
+            "disclosure_mineru_observability_url",
+        ),
+    )
+    disclosure_mineru_inference_upstream_url: Optional[str] = Field(
+        default=None,
+        pattern=r"^https?://",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL",
+            "disclosure_mineru_inference_upstream_url",
+        ),
+    )
+    # These are service-side limits of the attested Windows orchestrator.
+    # They are not CLI fan-out controls: MinerU ignores the CLI's unknown
+    # --max-concurrency option when --api-url selects an existing API.
+    disclosure_mineru_api_task_slots: int = Field(
+        default=3,
+        ge=3,
+        le=3,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_API_TASK_SLOTS",
+            "disclosure_mineru_api_task_slots",
+        ),
+    )
+    disclosure_mineru_api_inference_concurrency: int = Field(
+        default=7,
+        ge=7,
+        le=7,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_API_INFERENCE_CONCURRENCY",
+            "disclosure_mineru_api_inference_concurrency",
+        ),
+    )
+    disclosure_mineru_api_task_retention_seconds: int = Field(
+        default=600,
+        ge=600,
+        le=600,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_API_TASK_RETENTION_SECONDS",
+            "disclosure_mineru_api_task_retention_seconds",
+        ),
+    )
+    disclosure_mineru_api_cleanup_interval_seconds: int = Field(
+        default=30,
+        ge=30,
+        le=30,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_API_CLEANUP_INTERVAL_SECONDS",
+            "disclosure_mineru_api_cleanup_interval_seconds",
+        ),
+    )
+    disclosure_mineru_api_drain_timeout_seconds: int = Field(
+        default=86400,
+        ge=60,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_API_DRAIN_TIMEOUT_SECONDS",
+            "disclosure_mineru_api_drain_timeout_seconds",
+        ),
+    )
+    # vLLM queue/KV metrics are not GPU compute utilization. Only an explicit
+    # GPU exporter may populate utilization in the worker progress contract.
+    # The generic URL supports DCGM on Linux and the pinned nvidia-smi exporter
+    # on Windows; the older DCGM-only name remains a compatibility fallback.
+    disclosure_gpu_metrics_url: Optional[str] = Field(
+        default=None,
+        pattern=r"^https?://",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_GPU_METRICS_URL",
+            "disclosure_gpu_metrics_url",
+        ),
+    )
+    disclosure_dcgm_metrics_url: Optional[str] = Field(
+        default=None,
+        pattern=r"^https?://",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_DCGM_METRICS_URL",
+            "disclosure_dcgm_metrics_url",
+        ),
+    )
+    disclosure_gpu_expected_uuid: Optional[str] = Field(
+        default=None,
+        pattern=(
+            r"^(?:GPU-)?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+            r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+        ),
+        validation_alias=AliasChoices(
+            "DISCLOSURE_GPU_EXPECTED_UUID",
+            "disclosure_gpu_expected_uuid",
+        ),
+    )
+    worker_progress_metrics_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=30,
+        validation_alias=AliasChoices(
+            "WORKER_PROGRESS_METRICS_TIMEOUT_SECONDS",
+            "worker_progress_metrics_timeout_seconds",
         ),
     )
     # Operator/provider-attested immutable identity for the complete remote
@@ -132,6 +309,61 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices(
             "DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256",
             "disclosure_mineru_runtime_bundle_identity_sha256",
+        ),
+    )
+    disclosure_mineru_smoke_receipt: Optional[Path] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_SMOKE_RECEIPT",
+            "disclosure_mineru_smoke_receipt",
+        ),
+    )
+    disclosure_mineru_canary_cache: Optional[Path] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_CANARY_CACHE",
+            "disclosure_mineru_canary_cache",
+        ),
+    )
+    disclosure_mineru_staged_load_receipt: Optional[Path] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_STAGED_LOAD_RECEIPT",
+            "disclosure_mineru_staged_load_receipt",
+        ),
+    )
+    disclosure_mineru_staged_load_confirmation_receipt: Optional[Path] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_STAGED_LOAD_CONFIRMATION_RECEIPT",
+            "disclosure_mineru_staged_load_confirmation_receipt",
+        ),
+    )
+    # Hash of the operator-selected, multipage representative PDF used by both
+    # independent 4/8/16 deployment rehearsals.  The receipt cannot choose its
+    # own oracle: resident admission compares both runs with this pinned value.
+    disclosure_mineru_staged_input_sha256: Optional[str] = Field(
+        default=None,
+        pattern=r"^sha256:[a-f0-9]{64}$",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_STAGED_INPUT_SHA256",
+            "disclosure_mineru_staged_input_sha256",
+        ),
+    )
+    disclosure_mineru_canary_max_age_seconds: int = Field(
+        default=2592000,
+        ge=1,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_CANARY_MAX_AGE_SECONDS",
+            "disclosure_mineru_canary_max_age_seconds",
+        ),
+    )
+    disclosure_mineru_live_probe_interval_seconds: int = Field(
+        default=300,
+        ge=1,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_LIVE_PROBE_INTERVAL_SECONDS",
+            "disclosure_mineru_live_probe_interval_seconds",
         ),
     )
     # Unit semantic routing uses Codex only as a closed-vocabulary chooser.
@@ -177,6 +409,22 @@ class Settings(BaseSettings):
             "disclosure_semantic_batch_size",
         ),
     )
+    disclosure_semantic_providers_json: Optional[tuple[SemanticProviderConfig, ...]] = (
+        Field(
+            default=None,
+            validation_alias=AliasChoices(
+                "DISCLOSURE_SEMANTIC_PROVIDERS_JSON",
+                "disclosure_semantic_providers_json",
+            ),
+        )
+    )
+    disclosure_semantic_failover_policy: Literal["availability_only.v1"] = Field(
+        default="availability_only.v1",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_SEMANTIC_FAILOVER_POLICY",
+            "disclosure_semantic_failover_policy",
+        ),
+    )
     cninfo_access_key: Optional[SecretStr] = Field(
         default=None,
         validation_alias=AliasChoices("CNINFO_ACCESS_KEY", "cninfo_access_key"),
@@ -214,10 +462,11 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias=AliasChoices("CNINFO_OVERLAP_DAYS", "cninfo_overlap_days"),
     )
-    # First-sync historical backfill (user decision 2026-07-06: 三年是底线 —
-    # three years of financial reports plus the important announcements).
+    # First-sync historical backfill.  The scale-rollout decision supersedes
+    # the old three-year floor: use 3.5 years plus a small leap-day/calendar
+    # buffer so a days-based provider API cannot silently undershoot 42 months.
     disclosure_initial_lookback_days: int = Field(
-        default=1095,
+        default=1280,
         ge=0,
         validation_alias=AliasChoices(
             "DISCLOSURE_INITIAL_LOOKBACK_DAYS", "disclosure_initial_lookback_days"
@@ -354,7 +603,7 @@ class Settings(BaseSettings):
     # inside MinerU. Bound the aggregate request fan-out independently from
     # document concurrency; production divides this budget across slots.
     worker_gpu_request_budget: int = Field(
-        default=112,
+        default=21,
         ge=1,
         validation_alias=AliasChoices(
             "WORKER_GPU_REQUEST_BUDGET", "worker_gpu_request_budget"
@@ -471,6 +720,88 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _validate_parallel_parser_backend(self) -> "Settings":
         if (
+            self.disclosure_gpu_metrics_url is not None
+            and self.disclosure_dcgm_metrics_url is not None
+            and self.disclosure_gpu_metrics_url != self.disclosure_dcgm_metrics_url
+        ):
+            raise ValueError(
+                "DISCLOSURE_GPU_METRICS_URL and legacy "
+                "DISCLOSURE_DCGM_METRICS_URL disagree"
+            )
+        if self.disclosure_gpu_metrics_url is not None:
+            gpu_metrics = urlsplit(self.disclosure_gpu_metrics_url)
+            if (
+                gpu_metrics.scheme != "http"
+                or gpu_metrics.hostname != "127.0.0.1"
+                or gpu_metrics.port != 30004
+                or gpu_metrics.path != "/metrics"
+                or gpu_metrics.username is not None
+                or gpu_metrics.password is not None
+                or gpu_metrics.query
+                or gpu_metrics.fragment
+            ):
+                raise ValueError(
+                    "DISCLOSURE_GPU_METRICS_URL must be the audited "
+                    "http://127.0.0.1:30004/metrics SSH forward"
+                )
+        mineru_urls = {
+            "DISCLOSURE_MINERU_API_URL": self.disclosure_mineru_api_url,
+            "DISCLOSURE_MINERU_OBSERVABILITY_URL": (
+                self.disclosure_mineru_observability_url
+            ),
+            "DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL": (
+                self.disclosure_mineru_inference_upstream_url
+            ),
+        }
+        configured_url_count = sum(value is not None for value in mineru_urls.values())
+        if configured_url_count not in {0, len(mineru_urls)}:
+            raise ValueError("MinerU fixed-API topology requires all three URLs")
+        endpoint_paths = {
+            "DISCLOSURE_MINERU_API_URL": frozenset({"", "/"}),
+            "DISCLOSURE_MINERU_OBSERVABILITY_URL": frozenset({"/v1", "/v1/"}),
+            "DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL": frozenset({"/v1", "/v1/"}),
+        }
+        for label, value in mineru_urls.items():
+            if value is not None:
+                _validate_mineru_endpoint(
+                    label,
+                    value,
+                    allowed_paths=endpoint_paths[label],
+                )
+        if self.disclosure_mineru_api_url is not None:
+            api_host = (urlsplit(self.disclosure_mineru_api_url).hostname or "").lower()
+            if api_host != "127.0.0.1":
+                raise ValueError(
+                    "DISCLOSURE_MINERU_API_URL must use a loopback SSH forward"
+                )
+        if self.disclosure_mineru_observability_url is not None:
+            observability_host = (
+                urlsplit(self.disclosure_mineru_observability_url).hostname or ""
+            ).lower()
+            if observability_host != "127.0.0.1":
+                raise ValueError(
+                    "DISCLOSURE_MINERU_OBSERVABILITY_URL must use a loopback SSH forward"
+                )
+        if self.disclosure_mineru_inference_upstream_url is not None:
+            upstream_host = (
+                urlsplit(self.disclosure_mineru_inference_upstream_url).hostname or ""
+            ).lower()
+            if (
+                not upstream_host
+                or "." in upstream_host
+                or upstream_host in {"localhost", "host.docker.internal"}
+                or not all(
+                    character.islower()
+                    or character.isdigit()
+                    or character == "-"
+                    for character in upstream_host
+                )
+            ):
+                raise ValueError(
+                    "DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL must use a "
+                    "single-label internal Docker service name"
+                )
+        if (
             self.disclosure_parse_timeout_max_seconds
             < self.disclosure_parse_timeout_seconds
         ):
@@ -488,8 +819,15 @@ class Settings(BaseSettings):
             )
         if self.worker_gpu_request_budget > self.worker_gpu_max_sequences:
             raise ValueError(
-                "WORKER_GPU_REQUEST_BUDGET must not exceed "
-                "WORKER_GPU_MAX_SEQUENCES"
+                "WORKER_GPU_REQUEST_BUDGET must not exceed WORKER_GPU_MAX_SEQUENCES"
+            )
+        if (
+            self.worker_gpu_request_budget
+            != self.mineru_effective_inference_request_upper_bound
+        ):
+            raise ValueError(
+                "WORKER_GPU_REQUEST_BUDGET must equal the attested "
+                "MinerU API task-slots x inference-concurrency envelope"
             )
         if self.worker_parse_concurrency > 1:
             if not self.disclosure_mineru_backend.endswith("-http-client"):
@@ -497,10 +835,10 @@ class Settings(BaseSettings):
                     "WORKER_PARSE_CONCURRENCY > 1 requires a MinerU "
                     "*-http-client backend; local parallel MinerU is unsafe"
                 )
-            if self.disclosure_mineru_server_url is None:
+            if configured_url_count != len(mineru_urls):
                 raise ValueError(
-                    "WORKER_PARSE_CONCURRENCY > 1 requires "
-                    "DISCLOSURE_MINERU_SERVER_URL"
+                    "WORKER_PARSE_CONCURRENCY > 1 requires the complete "
+                    "MinerU fixed-API topology"
                 )
             if self.worker_gpu_request_budget < self.worker_parse_concurrency:
                 raise ValueError(
@@ -515,10 +853,7 @@ class Settings(BaseSettings):
                 "WORKER_PARSE_HUGE_PAGE_THRESHOLD must exceed "
                 "WORKER_PARSE_HEAVY_PAGE_THRESHOLD"
             )
-        if (
-            self.worker_parse_candidate_window
-            < self.worker_parse_concurrency
-        ):
+        if self.worker_parse_candidate_window < self.worker_parse_concurrency:
             raise ValueError(
                 "WORKER_PARSE_CANDIDATE_WINDOW must be at least "
                 "WORKER_PARSE_CONCURRENCY"
@@ -535,19 +870,52 @@ class Settings(BaseSettings):
 
     @property
     def mineru_http_request_concurrency(self) -> int:
-        """Numeric per-document cap shared by every repository parse entry.
+        """Attested service-side VLM cap for one active API task."""
 
-        The effective backend can be overridden by an admin request, so this
-        value cannot depend on the configured default backend. MinerU's
-        command builder decides whether an HTTP backend should receive it.
-        """
+        return self.disclosure_mineru_api_inference_concurrency
 
-        return min(
-            100,
-            max(
-                1,
-                self.worker_gpu_request_budget
-                // self.worker_parse_concurrency,
+    @property
+    def mineru_effective_inference_request_upper_bound(self) -> int:
+        """Conservative active request envelope; submitted documents may queue."""
+
+        return (
+            self.disclosure_mineru_api_task_slots
+            * self.disclosure_mineru_api_inference_concurrency
+        )
+
+    @property
+    def semantic_provider_configs(self) -> tuple[SemanticProviderConfig, ...]:
+        """Return the explicit chain or the subscription-CLI default chain."""
+
+        if self.disclosure_semantic_providers_json is not None:
+            if not self.disclosure_semantic_providers_json:
+                raise ValueError("DISCLOSURE_SEMANTIC_PROVIDERS_JSON cannot be empty")
+            provider_ids = tuple(
+                item.id for item in self.disclosure_semantic_providers_json
+            )
+            if len(provider_ids) != len(set(provider_ids)):
+                raise ValueError("semantic provider configuration repeats an id")
+            return self.disclosure_semantic_providers_json
+        return (
+            SemanticProviderConfig(
+                id="luna-primary",
+                kind="codex_cli",
+                provider="openai",
+                executable=self.disclosure_semantic_codex_bin,
+                canonical_model=self.disclosure_semantic_model,
+                profile=self.disclosure_semantic_reasoning_effort,
+                timeout_seconds=self.disclosure_semantic_timeout_seconds,
+                max_concurrency=1,
+            ),
+            SemanticProviderConfig(
+                id="sonnet-backup",
+                kind="claude_cli",
+                provider="anthropic",
+                executable=Path("claude"),
+                canonical_model="claude-sonnet-5",
+                profile="low",
+                timeout_seconds=self.disclosure_semantic_timeout_seconds,
+                max_concurrency=1,
             ),
         )
 

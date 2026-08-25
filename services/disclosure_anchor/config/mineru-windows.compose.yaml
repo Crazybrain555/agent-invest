@@ -1,0 +1,169 @@
+name: mineru-tailnet
+
+services:
+  mineru-openai-server:
+    image: mineru@sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458
+    pull_policy: never
+    container_name: mineru-openai-server
+    restart: always
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: ["mineru-openai-server"]
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "30000"
+      - --max-num-seqs
+      - "128"
+      - --mm-processor-cache-gb
+      - "0"
+    ports:
+      - name: vllm-observability
+        target: 30000
+        host_ip: 127.0.0.1
+        published: "30001"
+        protocol: tcp
+    ipc: host
+    security_opt:
+      - label=disable
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --show-error http://127.0.0.1:30000/health >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 300s
+      start_interval: 5s
+    networks:
+      - runtime
+      - inference
+
+  mineru-api:
+    image: mineru@sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458
+    pull_policy: never
+    container_name: mineru-api
+    restart: always
+    environment:
+      MINERU_MODEL_SOURCE: local
+      MINERU_API_MAX_CONCURRENT_REQUESTS: "3"
+      MINERU_PROCESSING_WINDOW_SIZE: "16"
+      MINERU_API_OUTPUT_ROOT: /var/lib/mineru-api-output
+      MINERU_API_TASK_RETENTION_SECONDS: "600"
+      MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS: "30"
+      MINERU_API_DISABLE_ACCESS_LOG: "true"
+      MINERU_API_ENABLE_FASTAPI_DOCS: "false"
+    entrypoint: ["mineru-api"]
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --allow-public-http-client
+      - --max-concurrency
+      - "7"
+    volumes:
+      - type: bind
+        source: C:/ProgramData/agent-invest/mineru-api-output
+        target: /var/lib/mineru-api-output
+    depends_on:
+      mineru-openai-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --show-error http://127.0.0.1:8000/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+      start_interval: 3s
+    networks:
+      - inference
+
+  mineru-api-proxy:
+    image: mineru@sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458
+    pull_policy: never
+    container_name: mineru-api-proxy
+    restart: always
+    entrypoint: ["/usr/bin/python3.12"]
+    command:
+      - -I
+      - -c
+      - |
+        import asyncio
+
+        async def copy_stream(source, destination):
+            try:
+                while data := await source.read(65536):
+                    destination.write(data)
+                    await destination.drain()
+            finally:
+                try:
+                    destination.write_eof()
+                except (AttributeError, OSError):
+                    pass
+
+        async def proxy(client_reader, client_writer):
+            upstream_reader, upstream_writer = await asyncio.open_connection("mineru-api", 8000)
+            try:
+                await asyncio.gather(
+                    copy_stream(client_reader, upstream_writer),
+                    copy_stream(upstream_reader, client_writer),
+                )
+            finally:
+                upstream_writer.close()
+                client_writer.close()
+                await asyncio.gather(
+                    upstream_writer.wait_closed(),
+                    client_writer.wait_closed(),
+                    return_exceptions=True,
+                )
+
+        async def main():
+            server = await asyncio.start_server(proxy, "0.0.0.0", 8000)
+            async with server:
+                await server.serve_forever()
+
+        asyncio.run(main())
+    ports:
+      - name: mineru-api
+        target: 8000
+        host_ip: 127.0.0.1
+        published: "30003"
+        protocol: tcp
+    depends_on:
+      mineru-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --show-error http://127.0.0.1:8000/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+      start_interval: 3s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges=true
+      - label=disable
+    networks:
+      - inference
+      - runtime
+
+networks:
+  runtime:
+    driver: bridge
+  inference:
+    driver: bridge
+    internal: true

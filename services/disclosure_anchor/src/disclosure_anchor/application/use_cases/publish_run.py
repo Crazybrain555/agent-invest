@@ -18,7 +18,9 @@ from disclosure_anchor.application.contracts.provider_unit import (
     provider_unit_locator_to_payload,
 )
 from disclosure_anchor.application.contracts.semantic_routes import (
-    SEMANTIC_ROUTE_RECEIPTS_FILENAME,
+    SEMANTIC_ROUTE_RECEIPTS_V1_FILENAME,
+    SEMANTIC_ROUTE_RECEIPT_V1,
+    SEMANTIC_ROUTE_RECEIPT_VERSION,
     SemanticRouteContractError,
 )
 from disclosure_anchor.application.services.provider_document_admission import (
@@ -50,7 +52,7 @@ from disclosure_anchor.domain.services.unit_hashing import (
 from disclosure_anchor.domain.value_objects.semantic_key import (
     SemanticKeyInvariantError,
     validate_optional_section_keys,
-    validate_optional_semantic_key_state,
+    validate_optional_semantic_keys,
 )
 
 
@@ -170,13 +172,37 @@ class ProviderDocumentPublicationGuard:
             )
         try:
             base_build = build_provider_units(admitted)
-            receipt_rows = self._semantic_receipts.read(
-                relpath=(
+            if run.semantic_route_receipts_relpath is not None:
+                if (
+                    run.semantic_route_receipts_contract_version
+                    != SEMANTIC_ROUTE_RECEIPT_VERSION
+                ):
+                    raise SemanticRouteContractError(
+                        "semantic receipt locator has an unsupported version"
+                    )
+                receipt_relpath = Path(run.semantic_route_receipts_relpath)
+                expected_receipt_version = SEMANTIC_ROUTE_RECEIPT_VERSION
+            else:
+                if run.semantic_route_receipts_contract_version is not None:
+                    raise SemanticRouteContractError(
+                        "semantic receipt version has no locator"
+                    )
+                receipt_relpath = (
                     Path(run.document_units_relpath).parent
-                    / SEMANTIC_ROUTE_RECEIPTS_FILENAME
-                ),
+                    / SEMANTIC_ROUTE_RECEIPTS_V1_FILENAME
+                )
+                expected_receipt_version = SEMANTIC_ROUTE_RECEIPT_V1
+            receipt_rows = self._semantic_receipts.read(
+                relpath=receipt_relpath,
                 expected_hash=run.semantic_route_receipts_hash,
             )
+            if any(
+                row.receipt.contract_version != expected_receipt_version
+                for row in receipt_rows
+            ):
+                raise SemanticRouteContractError(
+                    "semantic receipt contract differs from processing run"
+                )
             ordered = sorted(units, key=lambda item: item.order_index)
             if len(receipt_rows) != len(ordered):
                 raise SemanticRouteContractError(
@@ -636,7 +662,6 @@ def _unit_query_projection(unit: e.DocumentUnit) -> dict[str, Any]:
         payload_kind=unit.payload_kind,
         title=unit.title,
         heading_path=unit.heading_path,
-        semantic_key=unit.semantic_key,
         semantic_keys=unit.semantic_keys,
         section_keys=unit.section_keys,
         quality_status=unit.quality_status,
@@ -687,7 +712,6 @@ def _canonical_unit_hashes(unit: e.DocumentUnit) -> UnitHashes:
         payload=unit.payload,
         title=unit.title,
         heading_path=unit.heading_path,
-        semantic_key=unit.semantic_key,
         semantic_keys=unit.semantic_keys,
         section_keys=unit.section_keys,
         quality_status=unit.quality_status,
@@ -705,10 +729,7 @@ def _validate_candidate_run(
     canonical: dict[int, UnitHashes] = {}
     for unit in units:
         try:
-            validate_optional_semantic_key_state(
-                unit.semantic_key,
-                unit.semantic_keys,
-            )
+            validate_optional_semantic_keys(unit.semantic_keys)
             validate_optional_section_keys(unit.section_keys)
         except SemanticKeyInvariantError as exc:
             raise PublishRunError(

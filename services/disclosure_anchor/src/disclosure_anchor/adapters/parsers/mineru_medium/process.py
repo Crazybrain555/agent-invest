@@ -10,11 +10,17 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
+    MinerUOrchestratorError,
+    mark_mineru_orchestrator_incident,
+    wait_for_mineru_orchestrator_idle,
+)
 from disclosure_anchor.domain.errors import (
     ParserBackendUnavailableError,
     ParserBackendOverloadedError,
@@ -39,6 +45,7 @@ _PROBE_SUCCESS_AT: dict[str, float] = {}
 _PROBE_CACHE_LOCK = threading.Lock()
 _PROBE_SUCCESS_TTL_SECONDS = 60.0
 _TASK_RESULT_TIMEOUT_MARKER = "Timed out waiting for result of task"
+_REMOTE_TASK_FAILED_MARKER = "task(s) failed while processing documents"
 _LOCAL_API_FAILURE_MARKERS = (
     "Local mineru-api exited before becoming healthy.",
     "Timed out waiting for local mineru-api to become healthy.",
@@ -52,11 +59,35 @@ _BACKEND_OVERLOAD_MARKERS = (
     "RESOURCE_EXHAUSTED",
     "resource_exhausted",
 )
-_BACKEND_UNAVAILABLE_STATUS = re.compile(
-    r"Unexpected status code: \[(?:5[0-9]{2})\]"
-)
+_BACKEND_UNAVAILABLE_STATUS = re.compile(r"Unexpected status code: \[(?:5[0-9]{2})\]")
 _LOCAL_API_STARTUP_TIMEOUT_SECONDS = 120
 _TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS = 120
+_MINERU_INHERITED_ENV_KEYS = frozenset(
+    {
+        "CURL_CA_BUNDLE",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "HOME",
+        "HF_HOME",
+        "LANG",
+        "LD_LIBRARY_PATH",
+        "MINERU_MODEL_CACHE",
+        "MINERU_PROCESSING_WINDOW_SIZE",
+        "MODELSCOPE_CACHE",
+        "NO_COLOR",
+        "PATH",
+        "PYTHONIOENCODING",
+        "PYTHONUTF8",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+    }
+)
 # MinerU's task-result wait starts only after temporary API startup and upload.
 # Keep an explicit phase budget inside the outer process SLA for startup
 # (120s), its fixed submit HTTP timeouts (up to ~400s), local result download,
@@ -126,6 +157,11 @@ def _unregister_process(process: subprocess.Popen[str]) -> bool:
     return cancelled
 
 
+def _process_was_cancelled(process: subprocess.Popen[str]) -> bool:
+    with _ACTIVE_PROCESSES_LOCK:
+        return process in _CANCELLED_PROCESSES
+
+
 def terminate_active_mineru_processes(
     *, grace_seconds: float = _GRACEFUL_STOP_SECONDS
 ) -> int:
@@ -141,9 +177,7 @@ def terminate_active_mineru_processes(
     _MINERU_SHUTDOWN_REQUESTED.set()
     with _ACTIVE_PROCESSES_LOCK:
         processes = tuple(
-            process
-            for process in _ACTIVE_PROCESSES
-            if process.poll() is None
+            process for process in _ACTIVE_PROCESSES if process.poll() is None
         )
         _CANCELLED_PROCESSES.update(processes)
     terminated = 0
@@ -250,30 +284,34 @@ class MinerUProcess:
             str(options.table).lower(),
         ]
         if options.backend != "pipeline":
-            command.extend(
-                ["--image-analysis", str(options.image_analysis).lower()]
-            )
+            command.extend(["--image-analysis", str(options.image_analysis).lower()])
         if options.backend.startswith("hybrid-"):
             command.extend(["--effort", options.effort])
         if options.start_page is not None:
             command.extend(["-s", str(options.start_page)])
         if options.end_page is not None:
             command.extend(["-e", str(options.end_page)])
+        if options.api_url:
+            # MinerU 3.4.4 submits to an existing orchestration API when this
+            # exact option is present; it does not start a per-document local
+            # FastAPI process.
+            command.extend(["--api-url", options.api_url])
         if options.server_url:
-            # *-http-client backends offload VLM inference to a remote
-            # mineru-openai-server (GPU box); mineru ignores -u otherwise.
+            # With a fixed API this value is forwarded as the VLM upstream
+            # resolved by the Windows API host, not a Mac-reachable address.
             command.extend(["-u", options.server_url])
         if (
             options.backend.endswith("-http-client")
+            and options.api_url is None
             and options.http_request_concurrency is not None
         ):
             if options.http_request_concurrency < 1:
                 raise ValueError(
                     "http_request_concurrency must be positive when configured"
                 )
-            # MinerU 3.4 deliberately accepts unknown CLI options and forwards
-            # them to its temporary local mineru-api. The API normalizes this
-            # option to max_concurrency for the remote HTTP client backend.
+            # MinerU forwards this unknown option only to a temporary local
+            # mineru-api. With --api-url it is ignored rather than forwarded;
+            # fixed API concurrency is configured on that service itself.
             command.extend(
                 [
                     "--max-concurrency",
@@ -358,9 +396,7 @@ class MinerUProcess:
             stderr=stderr,
         )
 
-    def probe_server(
-        self, server_url: str, *, timeout_seconds: float = 15.0
-    ) -> None:
+    def probe_server(self, server_url: str, *, timeout_seconds: float = 15.0) -> None:
         """Fail loudly when the remote VLM backend is unreachable.
 
         The remote server is part of the parser stack for *-http-client
@@ -384,15 +420,20 @@ class MinerUProcess:
                 and time.monotonic() - cached_at < _PROBE_SUCCESS_TTL_SECONDS
             ):
                 return
-        url = server_url.rstrip("/") + "/health"
+        parsed = urllib.parse.urlsplit(server_url)
+        # OpenAI-compatible upstreams conventionally use a /v1 API base while
+        # their readiness endpoint remains at the server root. The fixed
+        # mineru-api endpoint is already root-based.
+        probe_path = parsed.path.rstrip("/")
+        if probe_path == "/v1":
+            probe_path = ""
+        url = urllib.parse.urlunsplit(parsed._replace(path=f"{probe_path}/health"))
         request = urllib.request.Request(url, method="GET")
         # The backend lives on the LAN/tailnet: never route the probe
         # through proxy env vars (a proxy that cannot reach the private
         # address would report a healthy server as an outage — the same
         # reason _env() strips proxies for the mineru subprocess).
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({})
-        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
             with opener.open(request, timeout=timeout_seconds):
                 pass
@@ -474,7 +515,9 @@ class MinerUProcess:
         # and its same-session descendants.
         try:
             process = subprocess.Popen(
-                self.command_for(input_pdf=input_pdf, output_dir=output_dir, options=options),
+                self.command_for(
+                    input_pdf=input_pdf, output_dir=output_dir, options=options
+                ),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -497,7 +540,8 @@ class MinerUProcess:
             stdout, stderr = process.communicate(timeout=communicate_timeout)
         except subprocess.TimeoutExpired as exc:
             _stop_process_group(process)
-            if cancel_at_start:
+            self._drain_external_api(options)
+            if cancel_at_start or _process_was_cancelled(process):
                 raise ParserCancelledError(
                     "MinerU cancelled by worker shutdown"
                 ) from exc
@@ -506,20 +550,21 @@ class MinerUProcess:
             ) from exc
         except BaseException:
             _stop_process_group(process)
+            self._drain_external_api(options)
             raise
         finally:
             cancelled = _unregister_process(process)
         if cancelled:
+            self._drain_external_api(options)
             raise ParserCancelledError("MinerU cancelled by worker shutdown")
         if process.returncode != 0:
+            self._drain_external_api(options)
             raw_detail = "\n".join(
                 part.strip() for part in (stdout, stderr) if part.strip()
             )
             detail = f": {raw_detail}" if raw_detail else ""
             if _TASK_RESULT_TIMEOUT_MARKER in raw_detail:
-                raise ParserTaskDeadlineError(
-                    f"MinerU task deadline exceeded{detail}"
-                )
+                raise ParserTaskDeadlineError(f"MinerU task deadline exceeded{detail}")
             if _contains_any(raw_detail, _BACKEND_OVERLOAD_MARKERS):
                 raise ParserBackendOverloadedError(
                     f"MinerU backend explicitly rejected capacity{detail}"
@@ -535,6 +580,16 @@ class MinerUProcess:
                 raise ParserLocalInvocationError(
                     f"MinerU local API failed before task admission{detail}"
                 )
+            if options.api_url is not None:
+                # The fixed API's aggregate task-failed output does not carry
+                # a proven item-local taxonomy. It can wrap GPU worker death,
+                # inference transport failure, or orchestration corruption.
+                # Treat every such failure as shared infrastructure until an
+                # exact upstream error contract supports a safe allow-list.
+                raise ParserBackendUnavailableError(
+                    "MinerU fixed API task/submit/status/result path failed"
+                    f"{detail}"
+                )
             # Unknown CLI failures default to the item failure domain. Several
             # legitimate post-admission failures (status polling, result ZIP
             # download/extraction) do not include a JSON "task_id" key; using
@@ -546,13 +601,37 @@ class MinerUProcess:
             stderr=stderr,
         )
 
+    def _drain_external_api(self, options: ParserOptions) -> None:
+        """Fence retries after local stop; MinerU exposes no cancel endpoint."""
+
+        if options.api_url is None:
+            return
+        # Publish the incident before blocking. Existing worker/admin/pipeline
+        # admission checkers become permanently invalid for their lifetime, so
+        # another completed Future cannot refill the queue while this client
+        # waits for natural drain.
+        mark_mineru_orchestrator_incident()
+        try:
+            wait_for_mineru_orchestrator_idle(
+                options.api_url,
+                timeout_seconds=float(options.api_drain_timeout_seconds),
+            )
+        except (MinerUOrchestratorError, ValueError) as exc:
+            raise ParserBackendUnavailableError(
+                "MinerU API remote task drain could not be proved"
+            ) from exc
+
     def _env(self, *, options: ParserOptions | None = None) -> dict[str, str]:
-        env = dict(os.environ)
+        # MinerU and its temporary fast_api are parser mechanisms, not service
+        # principals.  Never pass the parent worker's DB, CNINFO, admin-token,
+        # semantic-provider, or unrelated credential environment to them.
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key in _MINERU_INHERITED_ENV_KEYS or key.startswith("LC_")
+        }
         # Local validation showed httpx can fail through proxy env unless
         # socks extras are installed. MinerU uses local model cache here.
-        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-            env.pop(key, None)
-            env.pop(key.lower(), None)
         env["NO_PROXY"] = "*"
         env.update(self._extra_env)
         # The writer uses MinerU 3.4.4's official merge-on default. Never let

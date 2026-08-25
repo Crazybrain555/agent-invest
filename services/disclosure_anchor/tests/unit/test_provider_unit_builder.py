@@ -10,6 +10,7 @@ import unittest
 from disclosure_anchor.application.contracts.parser_target import ParserTargetIdentity
 from disclosure_anchor.application.contracts.provider_document import (
     ProviderArtifact,
+    ProviderBBox,
     ProviderBlock,
     ProviderDocument,
     ProviderPage,
@@ -19,6 +20,7 @@ from disclosure_anchor.application.contracts.provider_document import (
 )
 from disclosure_anchor.application.contracts.provider_document_admission import (
     AdmittedProviderDocument,
+    SourceQualityFinding,
     SourceTextReconciliation,
 )
 from disclosure_anchor.application.contracts.provider_document_envelope import (
@@ -26,7 +28,10 @@ from disclosure_anchor.application.contracts.provider_document_envelope import (
     provider_document_envelope_to_bytes,
 )
 from disclosure_anchor.application.contracts.provider_unit import (
+    ProviderSearchDestination,
     ProviderUnitLocator,
+    ProviderUnitSourceQualityFinding,
+    ProviderUnitSourceTextReconciliation,
     provider_unit_locator_from_payload,
     provider_unit_locator_to_payload,
 )
@@ -49,6 +54,181 @@ _DOCUMENT = "doc_01K00000000000000000000000"
 
 
 class ProviderUnitBuilderTests(unittest.TestCase):
+    def test_untyped_prompt_selector_stays_in_parent_locator_v8(self) -> None:
+        template = (
+            "报告期内公司经营情况的重大变化，以及报告期内发生的对公司"
+            "经营情况有重大影响和预计未来会有重大影响的事项"
+        )
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "二、分红、回购与增持"),),
+                        annotation="title",
+                        level=2,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "公司完成股份回购。"),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, template),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        3,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "□适用 √不适用"),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        4,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "三、核心竞争力分析"),),
+                        annotation="title",
+                        level=2,
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+
+        units = build_provider_units(_admitted(document)).units
+
+        self.assertEqual(len(units), 2)
+        parent_unit = units[0]
+        self.assertEqual(parent_unit.title, "二、分红、回购与增持")
+        self.assertIsNone(parent_unit.applicability)
+        self.assertIn(template, json.dumps(parent_unit.payload, ensure_ascii=False))
+        self.assertEqual(
+            parent_unit.locator.contract_version,
+            "provider_unit_locator.v8",
+        )
+        with self.assertRaisesRegex(ValueError, "heading placement"):
+            replace(
+                parent_unit.locator,
+                heading_chain=(
+                    *parent_unit.locator.heading_chain[:-1],
+                    replace(
+                        parent_unit.locator.heading_chain[-1],
+                        placement_source="statutory_template",
+                    ),
+                ),
+            )
+
+    def test_unheaded_sentence_selector_does_not_claim_applicability(
+        self,
+    ) -> None:
+        template = (
+            "公司应当根据重要性原则，说明报告期内公司经营情况的重大变化，"
+            "以及报告期内发生的对公司经营情况有重大影响和预计未来会有重大影响的事项"
+        )
+        for selector in (
+            "□适用 √不适用",
+            "□适用 √不适用 □适用 √不适用",
+            "□适用 √不适用 □",
+            "□适用 √适用",
+        ):
+            with self.subTest(selector=selector):
+                document = _document(
+                    pages=(
+                        (
+                            _block(
+                                0,
+                                0,
+                                "text",
+                                (ProviderPayload("text", None, template + selector),),
+                                annotation="paragraph",
+                            ),
+                        ),
+                    ),
+                    segments=(),
+                )
+                unit = build_provider_units(_admitted(document)).units[0]
+                self.assertIsNone(unit.applicability)
+
+    def test_delayed_table_notice_keeps_one_source_conserving_owner_unit(self) -> None:
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "项目开发情况和开发计划"),),
+                        annotation="title",
+                        level=2,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "单位：平方米"),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "特别风险提示"),),
+                        annotation="title",
+                        level=2,
+                    ),
+                    _block(
+                        3,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "上述项目开发计划可能调整。"),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        4,
+                        0,
+                        "table",
+                        (
+                            ProviderPayload(
+                                "table_body",
+                                None,
+                                "<table><tr><td>项目名称</td>"
+                                "<td>开发计划</td></tr><tr><td>A</td>"
+                                "<td>2026</td></tr></table>",
+                            ),
+                        ),
+                        annotation="table",
+                    ),
+                ),
+            ),
+            segments=(_segment(0, 0, "retained"),),
+        )
+
+        result = build_provider_units(_admitted(document))
+
+        self.assertEqual(len(result.units), 1)
+        unit = result.units[0]
+        self.assertEqual(unit.title, "项目开发情况和开发计划")
+        self.assertEqual(unit.heading_path, ("项目开发情况和开发计划",))
+        self.assertEqual(unit.payload_kind, "mixed")
+        self.assertEqual(
+            tuple(
+                source_index
+                for part in unit.locator.parts
+                for source_index in part.block_source_indices
+            ),
+            (1, 2, 3, 4),
+        )
+        self.assertEqual(unit.locator.heading_chain[-1].source_index, 0)
+
     def test_source_native_numeric_repair_is_payload_and_locator_provenance(self) -> None:
         provider_text = "年 月，本集团净利差 。"
         source_text = "2026年1-3月，本集团净利差1.77%。"
@@ -96,6 +276,86 @@ class ProviderUnitBuilderTests(unittest.TestCase):
                 replay_provider_unit_search_binding(admitted, unit, binding),
                 (source_text,),
             )
+
+    def test_source_table_quality_finding_marks_unit_and_locator_needs_review(
+        self,
+    ) -> None:
+        document = _representative_document()
+        table_block = document.blocks[3]
+        table_payload = next(
+            payload for payload in table_block.payloads if payload.field == "table_body"
+        )
+        admitted = replace(
+            _admitted(document),
+            source_quality_findings=(
+                SourceQualityFinding(
+                    source_index=3,
+                    payload_ordinal=0,
+                    raw_block_sha256=table_block.raw_item_sha256,
+                    provider_text_sha256=_sha_text(table_payload.text),
+                    source_text_sha256=_sha_text("source-native-table-text"),
+                    reason="numeric_token_mismatch",
+                ),
+            ),
+        )
+
+        unit = build_provider_units(admitted).units[1]
+
+        self.assertEqual(unit.quality_status, "needs_review")
+        self.assertEqual(
+            [item.reason for item in unit.locator.source_quality_findings],
+            ["numeric_token_mismatch"],
+        )
+        self.assertEqual(
+            provider_unit_locator_from_payload(
+                provider_unit_locator_to_payload(unit.locator)
+            ),
+            unit.locator,
+        )
+
+    def test_source_text_quality_finding_marks_unit_without_rewriting_payload(
+        self,
+    ) -> None:
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "附注 五 年度"),),
+                        annotation="paragraph",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        block = document.blocks[0]
+        admitted = replace(
+            _admitted(document),
+            source_quality_findings=(
+                SourceQualityFinding(
+                    source_index=0,
+                    payload_ordinal=0,
+                    raw_block_sha256=block.raw_item_sha256,
+                    provider_text_sha256=_sha_text("附注 五 年度"),
+                    source_text_sha256=_sha_text("附注(五)42 2025年度"),
+                    reason="native_text_omission",
+                    source_kind="source_pdf_native_text_quality.v1",
+                ),
+            ),
+        )
+
+        unit = build_provider_units(admitted).units[0]
+
+        self.assertEqual(unit.payload, {"text": "附注 五 年度"})
+        self.assertEqual(unit.quality_status, "needs_review")
+        self.assertEqual(
+            provider_unit_locator_from_payload(
+                provider_unit_locator_to_payload(unit.locator)
+            ),
+            unit.locator,
+        )
 
     def test_ancestor_source_repair_is_bound_to_descendant_heading_chain(
         self,
@@ -188,7 +448,7 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         self.assertTrue(all("kind" not in part for part in parts))
         self.assertNotIn("第一章 标题", json.dumps(section.payload, ensure_ascii=False))
         self.assertIn("□适用", json.dumps(section.payload, ensure_ascii=False))
-        self.assertEqual(section.applicability, "not_applicable")
+        self.assertIsNone(section.applicability)
 
         table_ref = section.locator.parts[1]
         self.assertEqual(table_ref.block_source_indices, (3, 5))
@@ -459,31 +719,191 @@ class ProviderUnitBuilderTests(unittest.TestCase):
 
         self.assertEqual(draft.applicability, "applicable")
 
-    def test_applicability_gold_is_exact_unique_and_disjoint(self) -> None:
-        gold_path = (
-            Path(__file__).resolve().parents[2]
-            / "docs/implementation/checks/provider-unit-applicability-gold.v1.json"
+    def test_later_child_selector_does_not_hide_substantive_parent_content(
+        self,
+    ) -> None:
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "一、研发投入"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "研发投入金额4.4亿元。"),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "（1）重大变化原因"),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        3,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "□适用√不适用"),),
+                        annotation="paragraph",
+                    ),
+                ),
+            ),
+            segments=(),
         )
-        gold = json.loads(gold_path.read_text(encoding="utf-8"))
-        expected = gold["expected"]
-        ordinary_text_null = gold["ordinary_text_null"]
 
-        expected_identities = {(row[0], row[1]) for row in expected}
-        ordinary_identities = {(row[0], row[1]) for row in ordinary_text_null}
-        self.assertEqual(gold["source_active_unit_count"], 800)
-        self.assertEqual(len(expected), 55)
-        self.assertEqual(len(expected_identities), 55)
-        self.assertEqual(
-            sum(row[2] == "applicable" for row in expected),
-            16,
+        draft = build_provider_units(_admitted(document)).units[0]
+
+        self.assertIsNone(draft.applicability)
+
+    def test_leading_parent_selector_is_not_overridden_by_later_child_selector(
+        self,
+    ) -> None:
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "一、担保情况"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "√适用□不适用"),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "报告期担保余额100万元。"),),
+                        annotation="paragraph",
+                    ),
+                    _block(
+                        3,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "□适用√不适用"),),
+                        annotation="paragraph",
+                    ),
+                ),
+            ),
+            segments=(),
         )
-        self.assertEqual(
-            sum(row[2] == "not_applicable" for row in expected),
-            39,
+
+        draft = build_provider_units(_admitted(document)).units[0]
+
+        self.assertEqual(draft.applicability, "applicable")
+
+    def test_applicability_does_not_cross_a_leading_visual_part(self) -> None:
+        artifact = ProviderArtifact(
+            role="child_visual",
+            relative_path="e_images/child.jpg",
+            sha256="sha256:" + "1" * 64,
+            size_bytes=10,
+            media_type="image/jpeg",
         )
-        self.assertEqual(len(ordinary_text_null), 14)
-        self.assertEqual(len(ordinary_identities), 14)
-        self.assertTrue(expected_identities.isdisjoint(ordinary_identities))
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "一、母项"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "image",
+                        (ProviderPayload("content", None, ""),),
+                        annotation="image",
+                        artifact_roles=(artifact.role,),
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "□适用√不适用"),),
+                        annotation="paragraph",
+                    ),
+                ),
+            ),
+            segments=(),
+            extra_artifacts=(artifact,),
+        )
+
+        draft = build_provider_units(_admitted(document)).units[0]
+
+        self.assertIsNone(draft.applicability)
+
+    def test_nonleading_prompt_or_fact_selector_does_not_claim_applicability(
+        self,
+    ) -> None:
+        def build(*body: str):  # type: ignore[no-untyped-def]
+            blocks = [
+                _block(
+                    0,
+                    0,
+                    "text",
+                    (ProviderPayload("text", None, "其他重要事项"),),
+                    annotation="title",
+                    level=1,
+                )
+            ]
+            blocks.extend(
+                _block(
+                    index,
+                    0,
+                    "text",
+                    (ProviderPayload("text", None, text),),
+                    annotation="paragraph",
+                )
+                for index, text in enumerate(body, start=1)
+            )
+            return build_provider_units(
+                _admitted(_document(pages=(tuple(blocks),), segments=()))
+            ).units[0]
+
+        for first_part in (
+            "请说明报告期内对公司经营情况有重大影响的事项",
+            "公司本期完成一项重大收购。",
+            "1、已披露且后续无变化的事项",
+            "无",
+        ):
+            with self.subTest(first_part=first_part):
+                self.assertIsNone(
+                    build(first_part, "□适用 √不适用").applicability
+                )
+
+        for body in (
+            ("请说明报告期内对公司经营情况有重大影响的事项□适用√不适用",),
+            (
+                "请说明报告期内对公司经营情况有重大影响的事项",
+                "公司本期完成一项收购。",
+                "□适用√不适用",
+            ),
+            (
+                "请说明报告期内对公司经营情况有重大影响的事项",
+                "√适用√不适用",
+            ),
+        ):
+            with self.subTest(body=body):
+                self.assertIsNone(build(*body).applicability)
 
     def test_visual_digest_changes_content_hash_without_a_search_target(self) -> None:
         first = build_provider_units(_admitted(_visual_only_document("f"))).units[0]
@@ -578,8 +998,10 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         payload = provider_unit_locator_to_payload(locator)
         payload["contract_version"] = "provider_unit_locator.v1"
         payload.pop("source_text_reconciliations")
+        payload.pop("source_quality_findings")
         for heading in cast(list[dict[str, object]], payload["heading_chain"]):
             heading.pop("payload_ordinal")
+            heading.pop("continuation_fragments")
 
         decoded = provider_unit_locator_from_payload(payload)
 
@@ -598,14 +1020,317 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         )
         payload = provider_unit_locator_to_payload(locator)
         payload["contract_version"] = "provider_unit_locator.v2"
+        payload.pop("source_quality_findings")
         for heading in cast(list[dict[str, object]], payload["heading_chain"]):
             heading.pop("payload_ordinal")
+            heading.pop("continuation_fragments")
 
         decoded = provider_unit_locator_from_payload(payload)
 
         self.assertEqual(decoded.contract_version, "provider_unit_locator.v2")
         self.assertTrue(decoded.source_text_reconciliations == ())
         self.assertTrue(all(item.payload_ordinal == 0 for item in decoded.heading_chain))
+
+    def test_locator_decoder_keeps_v3_payload_binding_read_compatibility(self) -> None:
+        locator = (
+            build_provider_units(_admitted(_representative_document())).units[1].locator
+        )
+        payload = provider_unit_locator_to_payload(locator)
+        payload["contract_version"] = "provider_unit_locator.v3"
+        payload.pop("source_quality_findings")
+        for heading in cast(list[dict[str, object]], payload["heading_chain"]):
+            heading.pop("continuation_fragments")
+
+        decoded = provider_unit_locator_from_payload(payload)
+
+        self.assertEqual(decoded.contract_version, "provider_unit_locator.v3")
+        self.assertTrue(
+            all(not item.continuation_fragments for item in decoded.heading_chain)
+        )
+
+    def test_locator_decoder_keeps_v4_native_quality_read_compatibility(self) -> None:
+        locator = (
+            build_provider_units(_admitted(_representative_document())).units[1].locator
+        )
+        payload = provider_unit_locator_to_payload(locator)
+        payload["contract_version"] = "provider_unit_locator.v4"
+
+        decoded = provider_unit_locator_from_payload(payload)
+
+        self.assertEqual(decoded.contract_version, "provider_unit_locator.v4")
+        self.assertEqual(
+            provider_unit_locator_from_payload(
+                provider_unit_locator_to_payload(decoded)
+            ),
+            decoded,
+        )
+
+    def test_locator_versions_close_heading_placement_vocabulary(self) -> None:
+        locator = (
+            build_provider_units(_admitted(_representative_document())).units[1].locator
+        )
+        heading = locator.heading_chain[-1]
+        accepted = {
+            "provider_unit_locator.v1": "numbering",
+            "provider_unit_locator.v2": "numbering",
+            "provider_unit_locator.v3": "table_container",
+            "provider_unit_locator.v4": "table_container",
+            "provider_unit_locator.v5": "table_container",
+            "provider_unit_locator.v6": "table_container",
+            "provider_unit_locator.v7": "statutory_template",
+            "provider_unit_locator.v8": "table_container",
+        }
+        for version, placement_source in accepted.items():
+            with self.subTest(version=version, accepted=placement_source):
+                candidate = replace(
+                    locator,
+                    contract_version=version,
+                    heading_chain=(
+                        *locator.heading_chain[:-1],
+                        replace(heading, placement_source=placement_source),
+                    ),
+                    source_text_reconciliations=(),
+                    source_quality_findings=(),
+                )
+                self.assertEqual(
+                    provider_unit_locator_from_payload(
+                        provider_unit_locator_to_payload(candidate)
+                    ),
+                    candidate,
+                )
+
+        v3_table_label = replace(
+            locator,
+            contract_version="provider_unit_locator.v3",
+            heading_chain=(
+                *locator.heading_chain[:-1],
+                replace(heading, placement_source="table_label"),
+            ),
+            source_text_reconciliations=(),
+            source_quality_findings=(),
+        )
+        self.assertEqual(
+            provider_unit_locator_from_payload(
+                provider_unit_locator_to_payload(v3_table_label)
+            ),
+            v3_table_label,
+        )
+
+        for version, placement_source in (
+            ("provider_unit_locator.v2", "table_label"),
+            ("provider_unit_locator.v6", "statutory_template"),
+            ("provider_unit_locator.v8", "statutory_template"),
+        ):
+            with self.subTest(version=version, rejected=placement_source):
+                with self.assertRaisesRegex(ValueError, "heading placement"):
+                    replace(
+                        locator,
+                        contract_version=version,
+                        heading_chain=(
+                            *locator.heading_chain[:-1],
+                            replace(heading, placement_source=placement_source),
+                        ),
+                        source_text_reconciliations=(),
+                        source_quality_findings=(),
+                    )
+
+        with self.assertRaisesRegex(ValueError, "heading reference"):
+            replace(heading, placement_source="future_magic")  # type: ignore[arg-type]
+
+        payload = provider_unit_locator_to_payload(locator)
+        raw_headings = cast(list[dict[str, object]], payload["heading_chain"])
+        raw_headings[-1]["placement_source"] = "future_magic"
+        with self.assertRaisesRegex(ValueError, "heading reference"):
+            provider_unit_locator_from_payload(payload)
+
+    def test_locator_versions_reject_later_native_evidence_vocabulary(self) -> None:
+        locator = (
+            build_provider_units(_admitted(_representative_document())).units[1].locator
+        )
+        digest = "sha256:" + "a" * 64
+        identifier_v1 = ProviderUnitSourceTextReconciliation(
+            source_index=0,
+            payload_ordinal=0,
+            raw_block_sha256=digest,
+            provider_text_sha256=digest,
+            source_text_sha256=digest,
+            source_kind="source_pdf_native_identifier.v1",
+        )
+        for version in ("provider_unit_locator.v2", "provider_unit_locator.v3"):
+            with self.subTest(version=version), self.assertRaisesRegex(
+                ValueError, "reconciliation kind"
+            ):
+                replace(
+                    locator,
+                    contract_version=version,
+                    source_text_reconciliations=(identifier_v1,),
+                    source_quality_findings=(),
+                )
+        self.assertEqual(
+            replace(
+                locator,
+                contract_version="provider_unit_locator.v4",
+                source_text_reconciliations=(identifier_v1,),
+            ).source_text_reconciliations,
+            (identifier_v1,),
+        )
+        with self.assertRaisesRegex(ValueError, "reconciliation kind"):
+            replace(
+                locator,
+                contract_version="provider_unit_locator.v4",
+                source_text_reconciliations=(
+                    ProviderUnitSourceTextReconciliation(
+                        source_index=0,
+                        payload_ordinal=0,
+                        raw_block_sha256=digest,
+                        provider_text_sha256=digest,
+                        source_text_sha256=digest,
+                        source_kind="source_pdf_native_identifier.v2",
+                    ),
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "quality kind"):
+            replace(
+                locator,
+                contract_version="provider_unit_locator.v4",
+                source_quality_findings=(
+                    ProviderUnitSourceQualityFinding(
+                        source_index=0,
+                        payload_ordinal=0,
+                        raw_block_sha256=digest,
+                        provider_text_sha256=digest,
+                        source_text_sha256=digest,
+                        reason="native_text_omission",
+                        source_kind="source_pdf_native_text_quality.v1",
+                    ),
+                ),
+            )
+        for source_kind, reason in (
+            (
+                "source_pdf_native_identifier_quality.v1",
+                "identifier_confusable_mismatch",
+            ),
+            ("source_pdf_native_text_quality.v2", "cjk_bracket_omission"),
+        ):
+            finding = ProviderUnitSourceQualityFinding(
+                source_index=99,
+                payload_ordinal=0,
+                raw_block_sha256=digest,
+                provider_text_sha256=digest,
+                source_text_sha256=digest,
+                reason=reason,
+                source_kind=source_kind,
+            )
+            with self.subTest(source_kind=source_kind), self.assertRaisesRegex(
+                ValueError,
+                "quality kind",
+            ):
+                replace(
+                    locator,
+                    contract_version="provider_unit_locator.v5",
+                    source_text_reconciliations=(),
+                    source_quality_findings=(finding,),
+                )
+            accepted = replace(
+                locator,
+                contract_version="provider_unit_locator.v6",
+                source_text_reconciliations=(),
+                source_quality_findings=(finding,),
+            )
+            self.assertEqual(accepted.source_quality_findings, (finding,))
+
+    def test_locator_versions_reject_later_title_fragment_search_vocabulary(
+        self,
+    ) -> None:
+        locator = (
+            build_provider_units(_admitted(_representative_document())).units[1].locator
+        )
+        binding = locator.search_targets[0]
+        fragment_binding = replace(
+            binding,
+            destination=ProviderSearchDestination(
+                kind="unit_title_fragment",
+                item_index=0,
+            ),
+        )
+
+        for version in (
+            "provider_unit_locator.v1",
+            "provider_unit_locator.v2",
+            "provider_unit_locator.v3",
+        ):
+            with self.subTest(version=version), self.assertRaisesRegex(
+                ValueError,
+                "title fragment search",
+            ):
+                replace(
+                    locator,
+                    contract_version=version,
+                    search_targets=(fragment_binding,),
+                    source_text_reconciliations=(),
+                    source_quality_findings=(),
+                )
+
+        accepted = replace(
+            locator,
+            contract_version="provider_unit_locator.v4",
+            search_targets=(fragment_binding,),
+            source_text_reconciliations=(),
+            source_quality_findings=(),
+        )
+        self.assertEqual(
+            accepted.search_targets[0].destination.kind,
+            "unit_title_fragment",
+        )
+
+        payload = provider_unit_locator_to_payload(locator)
+        payload["contract_version"] = "provider_unit_locator.v3"
+        payload.pop("source_quality_findings")
+        for heading in cast(list[dict[str, object]], payload["heading_chain"]):
+            heading.pop("continuation_fragments")
+        raw_search = cast(list[dict[str, object]], payload["search_targets"])
+        raw_destination = cast(dict[str, object], raw_search[0]["destination"])
+        raw_destination.update(
+            {
+                "field": None,
+                "item_index": 0,
+                "kind": "unit_title_fragment",
+                "part_index": None,
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "title fragment search"):
+            provider_unit_locator_from_payload(payload)
+
+    def test_locator_rejects_overlapping_repair_and_quality_evidence(self) -> None:
+        locator = (
+            build_provider_units(_admitted(_representative_document())).units[1].locator
+        )
+        digest = "sha256:" + "a" * 64
+        with self.assertRaisesRegex(ValueError, "cannot overlap"):
+            replace(
+                locator,
+                source_text_reconciliations=(
+                    ProviderUnitSourceTextReconciliation(
+                        source_index=0,
+                        payload_ordinal=0,
+                        raw_block_sha256=digest,
+                        provider_text_sha256=digest,
+                        source_text_sha256=digest,
+                        source_kind="source_pdf_native_numeric.v1",
+                    ),
+                ),
+                source_quality_findings=(
+                    ProviderUnitSourceQualityFinding(
+                        source_index=0,
+                        payload_ordinal=0,
+                        raw_block_sha256=digest,
+                        provider_text_sha256=digest,
+                        source_text_sha256=digest,
+                        reason="numeric_token_mismatch",
+                        source_kind="source_pdf_native_table_quality.v1",
+                    ),
+                ),
+            )
 
     def test_heading_only_unit_keeps_structure_without_body_duplication(self) -> None:
         document = _document(
@@ -637,6 +1362,65 @@ class ProviderUnitBuilderTests(unittest.TestCase):
             draft.locator.search_targets[0].destination.kind,
             "unit_title",
         )
+
+    def test_wrapped_heading_uses_v4_fragments_and_replays_each_source(self) -> None:
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "（七）担保情况及对债"),),
+                        annotation="title",
+                        level=2,
+                        bbox=ProviderBBox(100, 100, 900, 119),
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "券投资者权益的影响"),),
+                        annotation="paragraph",
+                        bbox=ProviderBBox(150, 127, 350, 145),
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "√适用□不适用"),),
+                        annotation="paragraph",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        admitted = _admitted(document)
+
+        draft = build_provider_units(admitted).units[0]
+
+        self.assertEqual(draft.title, "（七）担保情况及对债券投资者权益的影响")
+        self.assertEqual(draft.locator.contract_version, "provider_unit_locator.v8")
+        self.assertEqual(
+            [
+                fragment.source_index
+                for fragment in draft.locator.heading_chain[-1].continuation_fragments
+            ],
+            [1],
+        )
+        self.assertEqual(
+            [binding.destination.kind for binding in draft.locator.search_targets[:2]],
+            ["unit_title_fragment", "unit_title_fragment"],
+        )
+        self.assertNotIn("券投资者权益的影响", json.dumps(draft.payload, ensure_ascii=False))
+        self.assertEqual(
+            provider_unit_locator_from_payload(
+                provider_unit_locator_to_payload(draft.locator)
+            ),
+            draft.locator,
+        )
+        for binding in draft.locator.search_targets:
+            replay_provider_unit_search_binding(admitted, draft, binding)
 
     def test_bare_applicability_title_is_conserved_once_as_body(self) -> None:
         document = _document(
@@ -845,6 +1629,87 @@ class ProviderUnitBuilderTests(unittest.TestCase):
         self.assertEqual(draft.locator.parts[0].kind, "text")
         self.assertEqual(draft.locator.evidence_only_block_source_indices, ())
         self.assertEqual(len(draft.locator.search_targets), 1)
+
+    def test_repeated_header_bilingual_variant_is_evidence_only(self) -> None:
+        base = "3S 三生国健药业(上海)股份有限公司"
+        bilingual = base + "Sunshine Guojian Pharmaceutical(Shanghai)Co.,Ltd."
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "header",
+                        (ProviderPayload("text", None, base),),
+                        annotation="page_header",
+                        bbox=ProviderBBox(159, 52, 608, 84),
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "一、经营情况"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                ),
+                (
+                    _block(
+                        2,
+                        1,
+                        "header",
+                        (ProviderPayload("text", None, bilingual),),
+                        annotation="page_header",
+                        bbox=ProviderBBox(159, 52, 606, 83),
+                    ),
+                    _block(
+                        3,
+                        1,
+                        "text",
+                        (ProviderPayload("text", None, "本期经营稳定。"),),
+                        annotation="paragraph",
+                    ),
+                ),
+                (
+                    _block(
+                        4,
+                        2,
+                        "header",
+                        (ProviderPayload("text", None, base),),
+                        annotation="page_header",
+                        bbox=ProviderBBox(159, 52, 608, 84),
+                    ),
+                    _block(
+                        5,
+                        2,
+                        "text",
+                        (ProviderPayload("text", None, "后续说明。"),),
+                        annotation="paragraph",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+
+        result = build_provider_units(_admitted(document))
+
+        evidence_only = {
+            source_index
+            for unit in result.units
+            for source_index in unit.locator.evidence_only_block_source_indices
+        }
+        self.assertEqual(evidence_only, {0, 2, 4})
+        self.assertNotIn(
+            "Sunshine Guojian",
+            json.dumps([unit.payload for unit in result.units], ensure_ascii=False),
+        )
+        self.assertTrue(
+            all(
+                binding.source.source_index not in {0, 2, 4}
+                for unit in result.units
+                for binding in unit.locator.search_targets
+            )
+        )
 
     def test_unbound_block_is_published_and_segment_only_parts_are_not_guessed(
         self,
@@ -1311,6 +2176,7 @@ def _block(
     annotation: str | None,
     level: int | None = None,
     artifact_roles: tuple[str, ...] = (),
+    bbox: ProviderBBox | None = None,
 ) -> ProviderBlock:
     raw = json.dumps(
         {
@@ -1328,7 +2194,7 @@ def _block(
         provider_type=provider_type,
         typed_annotation=annotation,
         provider_level=level,
-        bbox=None,
+        bbox=bbox,
         payloads=payloads,
         referenced_artifact_roles=artifact_roles,
         raw_item_json=raw,

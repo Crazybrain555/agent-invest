@@ -1,11 +1,11 @@
-"""CLI for database bootstrap (roles, database, schemas, base grants).
+"""CLI for service bootstrap (roles, shared DB check, schemas, base grants).
 
 Usage:
     python -m disclosure_anchor.cli.db create
 
-``create`` is idempotent. It connects as the admin URL (a superuser on the
-``postgres`` database) to create roles and the service database, then connects to
-the service database to create schemas and schema-level grants. Migrations
+``create`` is idempotent. It connects as the admin URL to create service roles
+and verify the repository-owned ``invest_engine`` database exists, then connects
+to that shared database to create only service-owned schemas and grants. Migrations
 (``make migrate``) create the tables, views and object grants afterwards.
 """
 
@@ -45,7 +45,7 @@ def _create() -> int:
     finally:
         target_engine.dispose()
 
-    print("[OK] db-create: roles, database and schemas are present")
+    print("[OK] db-create: roles, shared database and owned schemas are present")
     return 0
 
 

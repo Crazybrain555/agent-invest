@@ -10,16 +10,19 @@ verified_at: 2026-06-29
 
 # Milestone 02: PostgreSQL 与 migrations
 
-> 实施状态（2026-06-29）：已实现并完成 Codex 独立 testing 复测。`make db-create` / `make migrate` 幂等；
+> 实施状态（2026-06-29；2026-08-23 边界校正）：已实现并完成独立复测。`make db-create` / `make migrate` 幂等；
 > `disclosure_core` / `disclosure_public` / `disclosure_ops` 三个 schema、八张 core 表、`outbox_event`、
 > `alembic_version`、五个 public view、四个角色及最小权限、单 active run 偏唯一索引均已验证；
 > repository / UnitOfWork 与 16 个集成测试通过（无 DB 环境时干净跳过）。A08-A10 保持 pass。
 > 初次独立 review 发现 migration/权限问题，已用 `0002_harden_ops_permissions` 修复；post-fix
 > 独立复查无 material findings，verdict pass，confidence high。
+> 当前仓库统一使用预先存在的共享数据库 `invest_engine`，其明确的仓库级 owner 是非登录角色
+> `invest_engine_owner`；服务 bootstrap 只验证该 owner，然后创建自有 roles/schemas。它不创建
+> database、`invest_engine_owner`，也不取得整库 ownership。
 
 ## 1. 目标
 
-建立 `disclosure_anchor` database、schema、roles、核心表、public views、outbox seq 和 repository adapter。
+在共享 `invest_engine` database 内建立服务自有 schema、roles、核心表、public views、outbox seq 和 repository adapter。
 
 ## 2. 范围
 
@@ -46,7 +49,8 @@ make db-create
 make migrate
 ```
 
-2. 创建 database：`disclosure_anchor`。
+2. 验证仓库级预先创建的共享 database `invest_engine` 由 `invest_engine_owner` 所有；服务不得创建
+   database/该 owner role，或拥有整库。
 3. 创建 schema：
 
 ```text
@@ -141,7 +145,7 @@ change_events_v1
 PostgreSQL 18 / AgentSSD pg18-main
 socket: /Volumes/AgentSSD/agent_system/postgres/sockets
 port: 55432
-database: disclosure_anchor
+database: invest_engine
 ```
 
 命令验证：

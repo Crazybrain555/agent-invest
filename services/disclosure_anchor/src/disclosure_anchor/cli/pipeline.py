@@ -11,7 +11,6 @@ import io
 import json
 from pathlib import Path
 import re
-import shutil
 import sys
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -21,7 +20,7 @@ from pydantic import ValidationError
 from disclosure_anchor.adapters.db.postgres.connection import (
     app_database_url,
     create_db_engine,
-    migration_database_url,
+    require_runtime_app_engine,
 )
 from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
 from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
@@ -31,8 +30,13 @@ from disclosure_anchor.adapters.parsers.mineru_medium.process import MinerUProce
 from disclosure_anchor.adapters.parsers.pdf_text_observation import (
     observe_pdf_text_rectangles,
 )
+from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
+    MinerUDeploymentChecker,
+    MinerUDeploymentGateError,
+)
 from disclosure_anchor.adapters.semantics.runtime import build_semantic_runtime
 from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
+from disclosure_anchor.adapters.sources.cninfo.mapper import load_class_map
 from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
@@ -40,6 +44,14 @@ from disclosure_anchor.adapters.storage.provider_document_source import (
     ProviderDocumentFileSource,
 )
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
+from disclosure_anchor.adapters.watchlist_config import (
+    DEFAULT_SCREEN_MANIFEST,
+    DEFAULT_WATCHLIST,
+    load_watchlist_snapshot,
+    screen_manifest_for_snapshot,
+    validate_screen_manifest,
+    validate_watchlist_snapshot,
+)
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.services.subject_resolver import (
@@ -74,6 +86,7 @@ from disclosure_anchor.application.use_cases.rebuild_units import (
     RebuildUnitsCommand,
 )
 from disclosure_anchor.application.use_cases.track_companies import (
+    INLINE_PROFILE_RESOLUTION_MAX,
     ProfileResolution,
     ResolveTrackedProfiles,
     TrackCompanies,
@@ -97,7 +110,11 @@ from disclosure_anchor.application.worker.locks import (
     WorkerBusyError,
     exclusive_worker_admission,
 )
-from disclosure_anchor.domain.errors import BuildUnitsError, ConfigurationError, PublishRunError
+from disclosure_anchor.domain.errors import (
+    BuildUnitsError,
+    ConfigurationError,
+    PublishRunError,
+)
 from disclosure_anchor.domain.value_objects import ReportPeriod
 from disclosure_anchor.domain.value_objects import (
     canonical_security_identity,
@@ -138,8 +155,20 @@ def _parser() -> argparse.ArgumentParser:
         help="import companies into tracked_company (DB is the source of truth; "
         "CSV is the import/seed format, idempotent)",
     )
-    track.add_argument("--file", help="watchlist CSV (default: config/watchlist.csv)")
-    track.add_argument("--codes", help="comma-separated security codes (direct adds)")
+    track_source = track.add_mutually_exclusive_group()
+    track_source.add_argument(
+        "--file",
+        type=Path,
+        help="watchlist CSV (default: config/watchlist.csv)",
+    )
+    track_source.add_argument(
+        "--codes", help="comma-separated security codes (direct adds)"
+    )
+    track.add_argument(
+        "--screen-manifest",
+        type=Path,
+        help="optional research-universe manifest bound to the exact CSV bytes",
+    )
     track.add_argument(
         "--prune-drift",
         action="store_true",
@@ -149,6 +178,11 @@ def _parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="print the reconcile plan (create/update/pause) without writing",
+    )
+    track.add_argument(
+        "--skip-profile-resolution",
+        action="store_true",
+        help="skip legacy post-commit profile lookup (always implied for file imports)",
     )
 
     track_status = subparsers.add_parser(
@@ -171,20 +205,8 @@ def _parser() -> argparse.ArgumentParser:
         help="remove companies from the pool (deletes the tracked row; "
         "company/documents stay — reversible stop is `status=paused` instead)",
     )
-    untrack.add_argument("--codes", required=True, help="comma-separated security codes")
-
-    purge = subparsers.add_parser(
-        "purge-company",
-        help="TEST-PHASE ONLY: cascade-delete ONE company (tracked row, "
-        "security, documents, runs, units, events, files) under exclusive "
-        "corpus admission",
-    )
-    purge.add_argument("--code", required=True, help="security code")
-    purge.add_argument("--exchange", help="exchange (default: inferred from code)")
-    purge.add_argument(
-        "--yes",
-        action="store_true",
-        help="confirm the destructive cascade delete",
+    untrack.add_argument(
+        "--codes", required=True, help="comma-separated security codes"
     )
 
     rebuild = subparsers.add_parser(
@@ -243,6 +265,13 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         settings = load_settings()
+        prepared_track_entries = (
+            _track_entries(args) if args.command == "track" else None
+        )
+        mineru_checker: MinerUDeploymentChecker | None = None
+        if args.command in {"parse", "process"}:
+            mineru_checker = MinerUDeploymentChecker(settings, parse_enabled=True)
+            mineru_checker.assert_admission()
         deps = _Deps(settings)
         result: Any
         if args.command == "register":
@@ -256,6 +285,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             result = deps.register().execute(_register_command(args, legal_name))
         elif args.command == "parse":
+            assert mineru_checker is not None
+            mineru_checker.assert_admission()
             with exclusive_worker_admission(deps.engine):
                 result = deps.parse().execute(
                     ParseDocumentCommand(
@@ -285,7 +316,8 @@ def main(argv: list[str] | None = None) -> int:
                 _print_failed_stage("publish", result)
                 return 1
         elif args.command == "track":
-            entries = _track_entries(args)
+            assert prepared_track_entries is not None
+            entries = prepared_track_entries
             # File-driven runs reconcile against the import file (restore
             # semantics) with full-row upserts; a pure --codes shortcut only
             # ensures membership and must not wipe curated overrides or flip
@@ -311,8 +343,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 if res.status_change:
                     print(
-                        f"[warn] track {res.security_code}: status "
-                        f"{res.status_change}",
+                        f"[warn] track {res.security_code}: status {res.status_change}",
                         file=sys.stderr,
                     )
             if args.codes:
@@ -321,10 +352,16 @@ def main(argv: list[str] | None = None) -> int:
                     "a fresh config/watchlist.csv git snapshot",
                     file=sys.stderr,
                 )
-            if not args.dry_run:
-                # On-add metadata fetch (Miniflux pattern): resolve pending
-                # legal names now when credentials allow; sync remains the
-                # fallback healer.
+            resolve_inline_profiles = (
+                not args.dry_run
+                and bool(args.codes)
+                and not args.skip_profile_resolution
+                and len(result.results) <= INLINE_PROFILE_RESOLUTION_MAX
+            )
+            if resolve_inline_profiles:
+                # Transitional compatibility for a small direct-code add only.
+                # File/bulk imports leave enrichment to the worker's audited
+                # profile path, which records source_access provenance.
                 for res in deps.resolve_profiles(
                     tuple((r.security_code, r.exchange) for r in result.results)
                 ):
@@ -335,6 +372,12 @@ def main(argv: list[str] | None = None) -> int:
                         "(profile unavailable; first sync will heal it)"
                     )
                     print(f"[note] {note}", file=sys.stderr)
+            elif not args.dry_run:
+                print(
+                    "[note] post-commit profile resolution skipped; the worker's "
+                    "audited first sync will resolve pending legal names",
+                    file=sys.stderr,
+                )
         elif args.command == "track-status":
             result = deps.track_status()
         elif args.command == "untrack":
@@ -346,18 +389,6 @@ def main(argv: list[str] | None = None) -> int:
             if not codes:
                 raise ValueError("untrack: no security codes given")
             result = deps.untrack().execute(codes)
-        elif args.command == "purge-company":
-            if not args.yes:
-                print(
-                    "refusing: purge-company cascades DB rows AND files; "
-                    "re-run with --yes (test-phase only)",
-                    file=sys.stderr,
-                )
-                return 2
-            result = deps.purge_company(
-                code=args.code,
-                exchange=args.exchange or _exchange_for_scode(args.code),
-            )
         elif args.command == "track-export":
             csv_text, exported, skipped = deps.track_export()
             for line in skipped:
@@ -400,6 +431,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         elif args.command == "process":
+            assert mineru_checker is not None
+            mineru_checker.assert_admission()
             with exclusive_worker_admission(deps.engine):
                 parse_result = deps.parse().execute(
                     ParseDocumentCommand(
@@ -436,13 +469,16 @@ def main(argv: list[str] | None = None) -> int:
         else:
             raise AssertionError(f"unhandled command: {args.command}")
     except (BuildUnitsError, PublishRunError) as exc:
-        print(json.dumps(exc.error, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+        print(
+            json.dumps(exc.error, ensure_ascii=False, sort_keys=True), file=sys.stderr
+        )
         return 1
     except CompanyNotTrackedError as exc:
         print(f"[FAIL] sync: {exc}", file=sys.stderr)
         return 2
     except (
         ConfigurationError,
+        MinerUDeploymentGateError,
         ValidationError,
         ValueError,
         WorkerBusyError,
@@ -464,6 +500,11 @@ class _Deps:
             text_reader=observe_pdf_text_rectangles,
         )
         self.engine = create_db_engine(_database_url(settings))
+        try:
+            require_runtime_app_engine(self.engine)
+        except BaseException:
+            self.engine.dispose()
+            raise
         self.uow_factory = unit_of_work_factory(self.engine)
 
     def register(self) -> RegisterLocalPdf:
@@ -477,10 +518,16 @@ class _Deps:
             backend="hybrid-http-client",
             effort="medium",
             image_analysis=False,
-            server_url=self.settings.disclosure_mineru_server_url,
-            http_request_concurrency=(
-                self.settings.mineru_http_request_concurrency
+            api_url=self.settings.disclosure_mineru_api_url,
+            api_drain_timeout_seconds=(
+                getattr(
+                    self.settings,
+                    "disclosure_mineru_api_drain_timeout_seconds",
+                    86400,
+                )
             ),
+            server_url=(self.settings.disclosure_mineru_inference_upstream_url),
+            http_request_concurrency=None,
             runtime_bundle_identity_sha256=(
                 self.settings.disclosure_mineru_runtime_bundle_identity_sha256
             ),
@@ -490,7 +537,8 @@ class _Deps:
         executable = self.settings.disclosure_mineru_bin or Path("mineru")
         parser = MinerUMediumDocumentParser(
             process=MinerUProcess(executable=executable),
-            server_url=self.settings.disclosure_mineru_server_url,
+            api_url=self.settings.disclosure_mineru_api_url,
+            server_url=(self.settings.disclosure_mineru_inference_upstream_url),
         )
         return ParseDocument(
             parser=parser,
@@ -559,156 +607,13 @@ class _Deps:
         if not (settings.cninfo_access_key and settings.cninfo_access_secret):
             return ()
         source = CninfoSource(CninfoClient.from_settings(settings))
-        return ResolveTrackedProfiles(
-            uow_factory=self.uow_factory,
-            profile_loader=source.profile_for_security,
-        ).execute(codes)
-
-    def purge_company(self, *, code: str, exchange: str) -> dict[str, Any]:
-        """TEST-PHASE corpus-gated cascade delete of one company.
-
-        File removal is best-effort (missing files are fine). The company
-        ledger row goes too — this is for undoing mistakes/test residue, not
-        an operations path.
-        """
-
-        from disclosure_anchor.application.worker.locks import (
-            exclusive_corpus_mutation,
-        )
-
-        with exclusive_corpus_mutation(self.engine):
-            return self._purge_company_exclusive(code=code, exchange=exchange)
-
-    def _purge_company_exclusive(
-        self, *, code: str, exchange: str
-    ) -> dict[str, Any]:
-        from sqlalchemy import text as sql_text
-
-        removed_files = 0
-        with self.engine.begin() as conn:
-            company_id = conn.execute(
-                sql_text(
-                    "SELECT company_id FROM disclosure_core.security "
-                    "WHERE security_code = :code AND exchange = :exchange"
-                ),
-                {"code": code, "exchange": exchange},
-            ).scalar()
-            if company_id is None:
-                raise ValueError(f"no security {code}.{exchange}")
-            relpaths = [
-                row[0]
-                for row in conn.execute(
-                    sql_text(
-                        "SELECT raw_file_relpath FROM disclosure_core.document "
-                        "WHERE company_id = :cid AND raw_file_relpath IS NOT NULL"
-                    ),
-                    {"cid": company_id},
-                )
-            ]
-            for row in conn.execute(
-                sql_text(
-                    "SELECT parser_artifact_relpath, normalized_ir_relpath, "
-                    "provider_document_relpath, document_units_relpath "
-                    "FROM disclosure_core.processing_run r "
-                    "JOIN disclosure_core.document d ON d.document_id = r.document_id "
-                    "WHERE d.company_id = :cid"
-                ),
-                {"cid": company_id},
-            ):
-                relpaths.extend(p for p in row if p)
-            counts: dict[str, int] = {}
-            conn.execute(
-                sql_text(
-                    "UPDATE disclosure_core.document "
-                    "SET current_processing_run_id = NULL WHERE company_id = :cid"
-                ),
-                {"cid": company_id},
-            )
-            for label, sql in (
-                (
-                    "outbox_events",
-                    "DELETE FROM disclosure_ops.outbox_event WHERE document_id IN "
-                    "(SELECT document_id FROM disclosure_core.document "
-                    " WHERE company_id = :cid)",
-                ),
-                (
-                    "document_units",
-                    "DELETE FROM disclosure_core.document_unit WHERE document_id IN "
-                    "(SELECT document_id FROM disclosure_core.document "
-                    " WHERE company_id = :cid)",
-                ),
-                (
-                    "processing_runs",
-                    "DELETE FROM disclosure_core.processing_run WHERE document_id IN "
-                    "(SELECT document_id FROM disclosure_core.document "
-                    " WHERE company_id = :cid)",
-                ),
-                (
-                    "documents",
-                    "DELETE FROM disclosure_core.document WHERE company_id = :cid",
-                ),
-                (
-                    "source_accesses",
-                    "DELETE FROM disclosure_core.source_access "
-                    "WHERE company_id = :cid",
-                ),
-                (
-                    # Profile fetches are recorded BEFORE subject resolution,
-                    # so their rows carry no company_id (Codex acceptance P1:
-                    # cninfo:p_stock2100 residue keyed only by query scode).
-                    "source_accesses_unlinked",
-                    "DELETE FROM disclosure_core.source_access "
-                    "WHERE company_id IS NULL "
-                    "AND (query_params->>'scode' = :code "
-                    "     OR query_params->>'security_code' = :code)",
-                ),
-                (
-                    "source_checkpoints",
-                    "DELETE FROM disclosure_core.source_checkpoint "
-                    "WHERE scope_key LIKE :cid_scope",
-                ),
-                (
-                    "tracked_companies",
-                    "DELETE FROM disclosure_core.tracked_company "
-                    "WHERE company_id = :cid",
-                ),
-                (
-                    "company_identifiers",
-                    "DELETE FROM disclosure_core.company_identifier "
-                    "WHERE company_id = :cid",
-                ),
-                (
-                    "securities",
-                    "DELETE FROM disclosure_core.security WHERE company_id = :cid",
-                ),
-                (
-                    "companies",
-                    "DELETE FROM disclosure_core.company WHERE company_id = :cid",
-                ),
-            ):
-                counts[label] = conn.execute(
-                    sql_text(sql),
-                    {
-                        "cid": company_id,
-                        "cid_scope": f"{company_id}:%",
-                        "code": code,
-                    },
-                ).rowcount
-        data_dir = self.settings.disclosure_data_root / "data"
-        for relpath in relpaths:
-            target = data_dir / relpath
-            if target.is_file():
-                target.unlink()
-                removed_files += 1
-            elif target.is_dir():
-                shutil.rmtree(target)
-                removed_files += 1
-        return {
-            "company_id": company_id,
-            "security": f"{code}.{exchange}",
-            "deleted": counts,
-            "removed_files": removed_files,
-        }
+        try:
+            return ResolveTrackedProfiles(
+                uow_factory=self.uow_factory,
+                profile_loader=source.profile_for_security,
+            ).execute(codes)
+        finally:
+            source.close()
 
     def track_status(self) -> list[dict[str, Any]]:
         """Read-only pool status: tracked config + checkpoint + pending counts."""
@@ -760,9 +665,10 @@ class _Deps:
         from sqlalchemy import text as sql_text
 
         with self.engine.connect() as conn:
-            rows = conn.execute(
-                sql_text(
-                    """
+            rows = (
+                conn.execute(
+                    sql_text(
+                        """
                     SELECT s.security_code, s.exchange, tc.status,
                            tc.created_at::date AS joined_date,
                            tc.lookback->>'days' AS lookback_days,
@@ -774,8 +680,11 @@ class _Deps:
                         ON s.security_id = tc.security_id
                      ORDER BY s.security_code
                     """
+                    )
                 )
-            ).mappings().all()
+                .mappings()
+                .all()
+            )
         return _render_watchlist_csv([dict(row) for row in rows])
 
     def sync(self, args: argparse.Namespace) -> dict[str, object]:
@@ -861,9 +770,7 @@ class _Deps:
                     - timedelta(days=self.settings.cninfo_overlap_days),
                 )
             downloads = [
-                downloader.execute(
-                    DownloadDocumentCommand(candidate=row["candidate"])
-                )
+                downloader.execute(DownloadDocumentCommand(candidate=row["candidate"]))
                 for row in pending_rows
                 if isinstance(row.get("candidate"), dict)
             ]
@@ -882,9 +789,7 @@ class _Deps:
 
 
 def _database_url(settings: Settings) -> str:
-    if settings.database_url is not None:
-        return app_database_url(settings)
-    return migration_database_url(settings)
+    return app_database_url(settings)
 
 
 def datetime_today_shanghai() -> date:
@@ -949,44 +854,55 @@ def _render_watchlist_csv(
 def _track_entries(args: argparse.Namespace) -> tuple[TrackEntry, ...]:
     entries: list[TrackEntry] = []
     if args.codes:
+        if getattr(args, "screen_manifest", None) is not None:
+            raise ValueError("track: --screen-manifest requires --file")
         for code in str(args.codes).split(","):
             code = code.strip()
             if code:
                 entries.append(
                     TrackEntry(security_code=code, exchange=_exchange_for_scode(code))
                 )
-    if args.file or not entries:
-        path = Path(args.file or "config/watchlist.csv")
-        with path.open(encoding="utf-8", newline="") as handle:
-            for row in csv.DictReader(
-                line for line in handle if not line.lstrip().startswith("#")
-            ):
-                code = (row.get("security_code") or "").strip()
-                if not code:
-                    continue
-                lookback_raw = (row.get("lookback_days") or "").strip()
-                frequency = (row.get("sync_frequency") or "").strip() or None
-                status = (row.get("status") or "").strip() or "active"
-                classes_raw = (row.get("process_classes") or "").strip()
-                process_classes = (
-                    tuple(
-                        seg.strip()
-                        for seg in classes_raw.split(";")
-                        if seg.strip()
-                    )
-                    or None
-                )
-                entries.append(
-                    TrackEntry(
-                        security_code=code,
-                        exchange=(row.get("exchange") or "").strip()
-                        or _exchange_for_scode(code),
-                        lookback_days=int(lookback_raw) if lookback_raw else None,
-                        sync_frequency=frequency,
-                        process_classes=process_classes,
-                        status=status,
-                    )
-                )
+        if not entries:
+            raise ValueError("track: --codes contains no security codes")
+        return tuple(entries)
+
+    path = Path(args.file) if args.file is not None else DEFAULT_WATCHLIST
+    snapshot = load_watchlist_snapshot(path)
+    manifest_path = screen_manifest_for_snapshot(
+        snapshot,
+        explicit_manifest=getattr(args, "screen_manifest", None),
+        default_watchlist=DEFAULT_WATCHLIST,
+        default_manifest=DEFAULT_SCREEN_MANIFEST,
+    )
+    known_classes = frozenset(load_class_map()["classes"])
+    errors = validate_watchlist_snapshot(snapshot, known_classes)
+    if manifest_path is not None:
+        errors.extend(validate_screen_manifest(snapshot, manifest_path))
+    if errors:
+        raise ValueError("watchlist validation failed:\n" + "\n".join(errors))
+
+    for row in snapshot.rows:
+        code = (row.get("security_code") or "").strip()
+        if not code:
+            continue
+        lookback_raw = (row.get("lookback_days") or "").strip()
+        frequency = (row.get("sync_frequency") or "").strip() or None
+        status = (row.get("status") or "").strip() or "active"
+        classes_raw = (row.get("process_classes") or "").strip()
+        process_classes = (
+            tuple(seg.strip() for seg in classes_raw.split(";") if seg.strip()) or None
+        )
+        entries.append(
+            TrackEntry(
+                security_code=code,
+                exchange=(row.get("exchange") or "").strip()
+                or _exchange_for_scode(code),
+                lookback_days=int(lookback_raw) if lookback_raw else None,
+                sync_frequency=frequency,
+                process_classes=process_classes,
+                status=status,
+            )
+        )
     if not entries:
         raise ValueError("watchlist is empty: nothing to track")
     return tuple(entries)

@@ -124,7 +124,7 @@ hash mismatch / 文件打不开：进入 quarantine
 PostgreSQL 18 / AgentSSD pg18-main
 socket: /Volumes/AgentSSD/agent_system/postgres/sockets
 port: 55432
-database: disclosure_anchor
+database: invest_engine
 ```
 
 命令验证：

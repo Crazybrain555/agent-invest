@@ -117,6 +117,62 @@ class SubjectResolverTests(unittest.TestCase):
         self.assertEqual(len(identifiers), 1)
         self.assertEqual(identifiers[0].company_id, company.company_id)
 
+    def test_source_bound_uscc_records_identifier_provenance(self) -> None:
+        observed_at = datetime(2026, 8, 24, tzinfo=timezone.utc)
+
+        self.resolver.resolve(
+            self.uow,
+            SubjectCandidate(
+                security_code="002484",
+                exchange="SZSE",
+                legal_name="江海股份",
+                credit_code="uscc-source",
+                identifier_source_access_id="sa_profile",
+                identifier_observed_at=observed_at,
+            ),
+        )
+
+        identifier = self.uow.company_identifiers.all()[0]
+        self.assertEqual(identifier.source_access_id, "sa_profile")
+        self.assertEqual(identifier.observed_at, observed_at)
+
+    def test_later_source_observation_heals_missing_uscc_provenance(self) -> None:
+        first = self.resolver.resolve(
+            self.uow,
+            SubjectCandidate(
+                security_code="002484",
+                exchange="SZSE",
+                legal_name="江海股份",
+                credit_code="uscc-source",
+            ),
+        )
+        observed_at = datetime(2026, 8, 24, tzinfo=timezone.utc)
+
+        self.resolver.resolve(
+            self.uow,
+            SubjectCandidate(
+                security_code="002484",
+                exchange="SZSE",
+                legal_name=first.company.legal_name,
+                credit_code="uscc-source",
+                identifier_source_access_id="sa_profile",
+                identifier_observed_at=observed_at,
+            ),
+        )
+
+        identifier = self.uow.company_identifiers.all()[0]
+        self.assertEqual(identifier.source_access_id, "sa_profile")
+        self.assertEqual(identifier.observed_at, observed_at)
+
+    def test_identifier_provenance_without_credit_code_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires a credit-code"):
+            SubjectCandidate(
+                security_code="002484",
+                exchange="SZSE",
+                legal_name="江海股份",
+                identifier_source_access_id="sa_profile",
+            )
+
     def test_identifier_legal_name_mismatch_marks_identifier_contested(self) -> None:
         company = self.uow.companies.add(
             e.Company(company_id="co_1", legal_name="Old Name")

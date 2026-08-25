@@ -32,8 +32,8 @@ implementation_style: modular_monolith_with_ports_and_adapters
 >
 > 漂移说明（2026-08-13）：payload kinds 为 text/table/qa/mixed；0034 恢复 ordered
 > semantic_keys 与 any/all recall。当前 Provider writer 只做来源绑定的受控检索路由：闭集
-> candidate + bounded chooser，不解释 claim、不改变内容/边界；证据不足时 nullable
-> semantic_key(s) 写 NULL。本文其余早期表述与 `service-purpose.md` 冲突处，以后者
+> candidate + bounded provider chain，不解释 claim、不改变内容/边界；证据不足时 nullable
+> semantic_keys 写 SQL NULL。0047 已删除冗余私有 scalar。本文其余早期表述与 `service-purpose.md` 冲突处，以后者
 > （canonical）为准。
 >
 > **结构契约覆盖（2026-07-26）**：本文后文的 publish/suppress profile、模板套话抑制、
@@ -186,7 +186,7 @@ PostgreSQL + filesystem 的结论正确。需要加强：
 
 旧版协议（v0.5 前）存在一处真实冲突（把 G0 写成“PDF + 页码 + 段落/表格位置”，并把信息单元切分全部放在 L2），**已在协议修订中收敛（现行 v0.8）**，按以下 canonical 设计落地（协议 §2.9、§3.4–§3.5、§3.10、§17.2）：
 
-- **L1 统一完成文档结构切分与载体规范化（carrier normalization），适用于全部来源**，不再以 PDF 为特例；PDF 额外包含解析，其余来源依既有结构切分；L2 直接接收 `document_unit` 进行语义处理。载体规范化只处理结构和载体（解析、按业务结构切分、表格与 Q&A 结构保留、heading_path / order_index / semantic_key / content_hash 生成、页眉页脚等稳定噪声处理），不做投资语义判断。
+- **L1 统一完成文档结构切分与载体规范化（carrier normalization），适用于全部来源**，不再以 PDF 为特例；PDF 额外包含解析，其余来源依既有结构切分；L2 直接接收 `document_unit` 进行语义处理。载体规范化只处理结构和载体（解析、按业务结构切分、表格与 Q&A 结构保留、heading_path / order_index / semantic_keys / content_hash 生成、页眉页脚等稳定噪声处理），不做投资语义判断。
 - **G0 身份锚 = 自维护原文 + 文件哈希 + 不可变 `document_unit` 快照 + 来源链**；page/bbox 仅为可选复核信息。
 - **安全红线**：L1 不得因“像套话”让可能含实质信息的内容（如“重要提示”，常含退市风险、业绩大幅变动）对下游永久不可见。可以标记质量或不为其生成 unit（原文与 parser artifact 仍保留、可重处理），但不得按标签整段清除；raw 兜底仅支持人工复核、不支持自动抽取，故不能以“可回 raw”为由清除实质板块。
 - **语义层取舍归 L2**：v0.7 已删除“A 类 / B 类清洗”的叫法，并否决“B 类语义清洗视图”这类二级资产（协议附录 B）。需按上下文判断信息价值的内容不产生独立“语义清洗后文本”，由 L2 通过高价值选择性证据化处理：证据指回不可变 unit（primary_asset_ref + exact_span），语义归一并入证据化动作。
@@ -748,8 +748,7 @@ payload_kind                 text / table / qa / mixed（0011 起，见 service-
 order_index
 heading_path
 title
-semantic_key（可空的 primary 受控 route）
-semantic_keys（可空的完整有序 route set；首项等于 semantic_key）
+semantic_keys（可空的完整有序受控 route set，至多 8 项；不另存 primary scalar）
 payload_schema_version
 payload
 content_hash
@@ -1243,16 +1242,16 @@ filing type
 
 - 明确模板废话、页眉页脚、目录点线和重复免责声明：suppress；
 - 明确由标准数据 provider 稳定覆盖的标准表：默认 suppress from published units；
-- 预测可能相关且规则不确定的内容：publish，`semantic_key = NULL`；不得用
+- 预测可能相关且规则不确定的内容：publish，`semantic_keys = NULL`；不得用
   `document_content` 或具体主题填充占位语义；
 - 结构严重损坏：review 或 unusable；
 - 不允许 LLM 作为唯一删除依据。
 
 “去掉”只表示不发布 unit；raw、parser raw、IR 和 suppression manifest 仍保留。
 
-## 10.3 semantic_key registry
+## 10.3 semantic_keys registry
 
-`semantic_key` 只能来自版本化 registry，例如：
+`semantic_keys` 中的每个 key 只能来自版本化 registry，例如：
 
 ```text
 business_overview
@@ -1270,7 +1269,7 @@ future_outlook
 - 允许为空；
 - 不允许模型自由创造不可追踪的 key；
 - 每个匹配记录 taxonomy/router/prompt version 与来源 witness；
-- 只有唯一精确来源标题可确定性落键；歧义 candidate 由闭集模型选择或弃权；
+- 只有有内容 Unit 的唯一精确来源标题可确定性落键；heading-only 只作结构锚，歧义 candidate 由闭集模型选择或弃权；
 - `document_content` 不作为公开窄 route 入库；
 - key 只是粗路由，不是事实 schema；
 - 表族晋级为标准 dataset 后，原 table unit 仍保留。
@@ -1332,7 +1331,7 @@ structure_hash
 - unit ID、processing_run_id；
 - parser version；
 - page / bbox / source locator；
-- semantic_key、quality status；
+- semantic_keys、quality status；
 - created_at 和调试 metadata。
 
 `structure_hash` 包含：
@@ -1350,7 +1349,7 @@ structure_hash
 - 保留数字、负号、括号、小数点和单位原串；
 - 只折叠确定性的 parser 空白，不做语义改写。
 
-`hash_policy_version` 必须随 unit 保存。run 的 `output_hash` 基于已发布 units 的稳定 `(content_hash, structure_hash, semantic_key, quality_status)` 有序清单生成，只表达该 profile 的发布视图。
+`hash_policy_version` 必须随 unit 保存。run 的 `output_hash` 基于已发布 units 的稳定 `(content_hash, structure_hash, semantic_keys, quality_status)` 有序清单生成，只表达该 profile 的发布视图。
 
 ## 11.3 run 级匹配与 diff
 
@@ -1380,7 +1379,7 @@ ambiguous
 
 解释：
 
-- `routing_only_changed`：semantic_key 等路由信息变化；
+- `routing_only_changed`：semantic_keys 等路由信息变化；
 - `quality_changed`：质量状态或 issue 变化；
 - `policy_visibility_changed`：candidate 内容未变，只因 profile / policy 改变而发布或抑制；
 - `removed` 只有在来源内容确实不再存在时才表示内容删除。仅仅不再发布不能伪装成公司撤回披露。
@@ -1626,7 +1625,7 @@ filing = client.filings.latest(
 units = client.units.list(
     document_id=filing.document_id,
     payload_kind="table",
-    semantic_key="receivable_aging",
+    semantic_keys_any="receivable_aging",
 )
 
 unit = client.units.get(asset_id)
@@ -1678,7 +1677,7 @@ processing_run_id
 profile
 payload_kind
 heading_path exact/prefix
-semantic_key
+semantic_keys
 title contains
 asset_id
 quality_status
@@ -1732,7 +1731,7 @@ document_unit_created      新增内容的 unit 每个 1 条（materialized，pa
 document_unit_removed      消失内容的 unit 每个 1 条（materialized，payload 携带 old_asset_id——
                            L2 持有旧 asset_id，只给 content_hash 无法撤销）
 document_unit_projection_changed
-                           内容同、投影（title/heading_path/semantic_key/quality_status）变的
+                           内容同、投影（title/heading_path/semantic_keys/quality_status）变的
                            unit 每个 1 条（materialized，携带 old/new asset_id 与 changed_fields）
 ```
 
@@ -1991,7 +1990,7 @@ processing_run(document_id, created_at desc)
 partial unique: processing_run(document_id, profile) where is_active = true
 document_unit(processing_run_id, order_index)
 document_unit(document_id, payload_kind)
-document_unit(semantic_key)
+document_unit USING GIN(semantic_keys)
 document_unit(content_hash)
 source_access(request_fingerprint, started_at desc)
 source_checkpoint(provider, scope_key)
@@ -2033,7 +2032,7 @@ disclosure_ops      outbox_event 与迁移记录
 规则：
 
 - 跨服务与 L2 只经 `disclosure_public.*_v1` 或等价 Filing API 消费，不回读私有表（协议硬边界 40）；
-- `document_units_v1` 必须保留 service-purpose §12.1 的全部 unit 级 scope keys（company_ref、security_ref、filing_type、report_period、announcement_date、payload_kind、heading_path、semantic_key、quality_status、content_hash、contract_version、producer_action_ref、source_ref、parent_ref、order_index）与 `contract_version = document_unit.v1`；
+- `document_units_v1` 必须保留 service-purpose §12.1 的全部 unit 级 scope keys（company_ref、security_ref、filing_type、report_period、announcement_date、payload_kind、heading_path、semantic_keys、quality_status、content_hash、contract_version、producer_action_ref、source_ref、parent_ref、order_index）与 `contract_version = document_unit.v1`；
 - `source_ref` 由 `source_refs_v1` / `GET /v1/units/{id}/source-ref` 派生，不建独立 source_ref 主表；
 - `asset://` URI 只在 API / MCP 序列化边界派生为 `asset_uri` 字段，不落数据库列与视图；
 - 视图破坏性变更走 v2 并行 + 弃用期（协议 §2.7）。

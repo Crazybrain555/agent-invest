@@ -4,6 +4,8 @@ from __future__ import annotations
 
 
 import argparse
+import hashlib
+import os
 import queue
 import subprocess
 from collections.abc import Callable
@@ -27,7 +29,8 @@ import sqlalchemy
 from disclosure_anchor.adapters.db.postgres.connection import (
     app_database_url,
     create_db_engine,
-    migration_database_url,
+    require_runtime_app_connection,
+    require_runtime_app_engine,
 )
 from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
 from disclosure_anchor.adapters.parsers.mineru_medium.process import (
@@ -40,6 +43,15 @@ from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
 from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
 from disclosure_anchor.adapters.parsers.pdf_text_observation import (
     observe_pdf_text_rectangles,
+)
+from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
+    MinerUDeploymentChecker,
+)
+from disclosure_anchor.adapters.runtime.worker_progress import (
+    append_worker_progress,
+    collect_worker_progress,
+    render_worker_progress,
+    render_worker_progress_json,
 )
 from disclosure_anchor.adapters.semantics.runtime import build_semantic_runtime
 from disclosure_anchor.adapters.semantics.codex_cli import (
@@ -96,12 +108,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="disclosure-anchor worker")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("once")
-    subparsers.add_parser("loop")
+    loop_parser = subparsers.add_parser("loop")
+    loop_parser.add_argument(
+        "--progress",
+        choices=("terminal", "jsonl", "off"),
+        default="terminal",
+        help="stdout rendering; durable progress JSONL is always written",
+    )
+    status_parser = subparsers.add_parser("status")
+    status_parser.add_argument(
+        "--format",
+        choices=("terminal", "json"),
+        default="terminal",
+    )
     args = parser.parse_args(argv)
 
     settings = load_settings()
+    if args.command == "status":
+        return _print_worker_status(settings, output_format=args.format)
     if args.command == "loop":
-        return run_resident_worker(settings)
+        return run_resident_worker(settings, progress_output=args.progress)
+    mineru_checker = MinerUDeploymentChecker(settings)
+    mineru_checker.assert_admission()
     _print_version_banner(settings)
     # Singleton lock on a dedicated NullPool connection: a pooled connection
     # would leak the session lock back into the pool on release (08 §2 E6).
@@ -112,13 +140,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     lock_conn = lock_engine.connect()
     try:
+        require_runtime_app_connection(lock_conn)
         acquired = lock_conn.execute(
             text("SELECT pg_try_advisory_lock(:ns, 0)"), {"ns": WORKER_NS}
         ).scalar_one()
         if not acquired:
             print(SKIP_MESSAGE)
             return 0
-        return _run_rounds(settings, rounds=1, lock_conn=lock_conn)
+        return _run_rounds(
+            settings,
+            rounds=1,
+            lock_conn=lock_conn,
+            mineru_checker=mineru_checker,
+        )
     finally:
         lock_conn.close()
         lock_engine.dispose()
@@ -129,13 +163,22 @@ def _run_rounds(
     *,
     rounds: int | None,
     lock_conn: Connection,
+    mineru_checker: MinerUDeploymentChecker | None = None,
 ) -> int:
     engine = create_db_engine(_database_url(settings))
-    deps = _deps(
-        settings,
-        engine,
-        admission_guard=lambda: _assert_singleton_or_cancel(lock_conn),
-    )
+    try:
+        require_runtime_app_engine(engine)
+        deps = _deps(
+            settings,
+            engine,
+            admission_guard=lambda: _assert_worker_admission(
+                lock_conn,
+                mineru_checker=mineru_checker,
+            ),
+        )
+    except BaseException:
+        engine.dispose()
+        raise
     stop = _StopFlag()
     stop.install()
     try:
@@ -152,9 +195,7 @@ def _run_rounds(
             if stop.is_set():
                 break
             if rounds is None:
-                _sleep_interruptible(
-                    settings.worker_loop_interval_seconds, stop=stop
-                )
+                _sleep_interruptible(settings.worker_loop_interval_seconds, stop=stop)
         return 0
     finally:
         deps.close_source()
@@ -223,9 +264,13 @@ def _exit_wedged_worker() -> None:
 
 def run_resident_worker(
     settings: Settings,
+    *,
+    progress_output: str = "terminal",
 ) -> int:
     """Run the one resident worker."""
 
+    mineru_checker = MinerUDeploymentChecker(settings)
+    mineru_checker.assert_admission()
     _print_version_banner(settings)
     lock_engine = sqlalchemy.create_engine(
         _database_url(settings),
@@ -234,13 +279,19 @@ def run_resident_worker(
     )
     lock_conn = lock_engine.connect()
     try:
+        require_runtime_app_connection(lock_conn)
         acquired = lock_conn.execute(
             text("SELECT pg_try_advisory_lock(:ns, 0)"), {"ns": WORKER_NS}
         ).scalar_one()
         if not acquired:
             print(SKIP_MESSAGE)
             return 0
-        return _run_loop(settings, lock_conn=lock_conn)
+        return _run_loop(
+            settings,
+            lock_conn=lock_conn,
+            mineru_checker=mineru_checker,
+            progress_output=progress_output,
+        )
     finally:
         lock_conn.close()
         lock_engine.dispose()
@@ -250,22 +301,41 @@ def _run_loop(
     settings: Settings,
     *,
     lock_conn: Connection,
+    mineru_checker: MinerUDeploymentChecker | None = None,
+    progress_output: str = "terminal",
 ) -> int:
     """Run a resident data plane with independent maintenance/reporting."""
 
     engine = create_db_engine(_database_url(settings))
+    try:
+        require_runtime_app_engine(engine)
+    except BaseException:
+        engine.dispose()
+        raise
     stop = _StopFlag()
     stop.install()
     base_limits = _limits(settings)
 
     def admission_guard() -> None:
-        _assert_singleton_or_cancel(lock_conn)
+        _assert_worker_admission(
+            lock_conn,
+            mineru_checker=mineru_checker,
+        )
 
-    base_deps = _deps(
-        settings,
-        engine,
-        admission_guard=admission_guard,
-    )
+    try:
+        base_deps = _deps(
+            settings,
+            engine,
+            admission_guard=admission_guard,
+        )
+    except BaseException:
+        engine.dispose()
+        raise
+    progress_scope_classes = base_deps.config.process_scope_classes
+    if progress_scope_classes is not None and not isinstance(
+        progress_scope_classes, tuple
+    ):
+        progress_scope_classes = None
     deps = base_deps
     maintenance_deps = base_deps
     maintenance_progress: list[float] | None = None
@@ -274,15 +344,11 @@ def _run_loop(
         maintenance_progress = [parse_progress[0]]
         deps = replace(
             base_deps,
-            heartbeat=lambda: parse_progress.__setitem__(
-                0, time.monotonic()
-            ),
+            heartbeat=lambda: parse_progress.__setitem__(0, time.monotonic()),
         )
         maintenance_deps = replace(
             base_deps,
-            heartbeat=lambda: maintenance_progress.__setitem__(
-                0, time.monotonic()
-            ),
+            heartbeat=lambda: maintenance_progress.__setitem__(0, time.monotonic()),
         )
         _wedge_watchdog(
             plane="parse",
@@ -296,8 +362,11 @@ def _run_loop(
         target=_report_writer,
         kwargs={
             "settings": settings,
+            "engine": engine,
             "reports": reports,
             "prune_tracker": prune_tracker,
+            "scope_classes": progress_scope_classes,
+            "progress_output": progress_output,
         },
         name="worker-reports",
     )
@@ -329,6 +398,17 @@ def _run_loop(
             terminate_active_semantic_processes()
 
     try:
+        try:
+            _emit_progress_snapshot(
+                settings=settings,
+                engine=engine,
+                scope_classes=progress_scope_classes,
+                report=None,
+                progress_output=progress_output,
+            )
+        except Exception:
+            # Observability must never become a new admission dependency.
+            traceback.print_exc()
         # Stale runs belong to a prior singleton owner. Recover them and any
         # crash leftovers exactly once before the first resident admission;
         # periodic age-based reclaim would kill legitimate >1h whole PDFs.
@@ -405,11 +485,7 @@ class _ProjectionPruneTracker:
 
     def pending_generation(self) -> int:
         with self._lock:
-            return (
-                self._generation
-                if self._generation > self._acknowledged
-                else 0
-            )
+            return self._generation if self._generation > self._acknowledged else 0
 
     def acknowledge(self, generation: int) -> None:
         with self._lock:
@@ -418,7 +494,35 @@ class _ProjectionPruneTracker:
             )
 
 
-def _emit_worker_report(settings: Settings, report: WorkerReport) -> None:
+def _emit_progress_snapshot(
+    *,
+    settings: Settings,
+    engine: Engine,
+    scope_classes: tuple[str, ...] | None,
+    report: WorkerReport | None,
+    progress_output: str,
+) -> None:
+    event = collect_worker_progress(
+        settings=settings,
+        engine=engine,
+        scope_classes=scope_classes,
+        report=report,
+    )
+    append_worker_progress(settings, event)
+    if progress_output == "terminal":
+        print(render_worker_progress(event), flush=True)
+    elif progress_output == "jsonl":
+        print(render_worker_progress_json(event), flush=True)
+
+
+def _emit_worker_report(
+    settings: Settings,
+    report: WorkerReport,
+    *,
+    engine: Engine | None = None,
+    scope_classes: tuple[str, ...] | None = None,
+    progress_output: str = "terminal",
+) -> None:
     """Serialize report side effects without making them data-plane fatal."""
 
     # Alert first, and on its own: a full/unmounted report volume is exactly
@@ -429,10 +533,23 @@ def _emit_worker_report(settings: Settings, report: WorkerReport) -> None:
         traceback.print_exc()
     try:
         _append_reports(settings, report)
-        print(render_report_section(report))
     except Exception:
         # Reporting failure must not stop a healthy resident dispatcher.
         traceback.print_exc()
+    if engine is None:
+        print(render_report_section(report), flush=True)
+        return
+    try:
+        _emit_progress_snapshot(
+            settings=settings,
+            engine=engine,
+            scope_classes=scope_classes,
+            report=report,
+            progress_output=progress_output,
+        )
+    except Exception:
+        traceback.print_exc()
+        print(render_report_section(report), flush=True)
 
 
 def _report_writer(
@@ -440,13 +557,22 @@ def _report_writer(
     settings: Settings,
     reports: queue.SimpleQueue[WorkerReport | None],
     prune_tracker: _ProjectionPruneTracker,
+    engine: Engine | None = None,
+    scope_classes: tuple[str, ...] | None = None,
+    progress_output: str = "terminal",
 ) -> None:
     while True:
         report = reports.get()
         if report is None:
             return
         prune_tracker.mark(report.runs_deactivated)
-        _emit_worker_report(settings, report)
+        _emit_worker_report(
+            settings,
+            report,
+            engine=engine,
+            scope_classes=scope_classes,
+            progress_output=progress_output,
+        )
 
 
 def _wait_while(
@@ -524,9 +650,7 @@ def _run_startup_recovery(
                 should_stop=should_stop,
                 heartbeat=deps.heartbeat,
             )
-            delay = min(
-                float(settings.worker_loop_max_interval_seconds), delay * 2
-            )
+            delay = min(float(settings.worker_loop_max_interval_seconds), delay * 2)
             continue
         reclaim_stale = False
         reports.put(report)
@@ -546,19 +670,16 @@ def _run_startup_recovery(
                 )
                 continue
             projection_recovery_pending = False
-        shared_failure = (
-            build_failures_indicate_outage(report.failures)
-            or publish_failures_indicate_outage(report.failures)
-        )
+        shared_failure = build_failures_indicate_outage(
+            report.failures
+        ) or publish_failures_indicate_outage(report.failures)
         if shared_failure:
             _wait_while(
                 delay,
                 should_stop=should_stop,
                 heartbeat=deps.heartbeat,
             )
-            delay = min(
-                float(settings.worker_loop_max_interval_seconds), delay * 2
-            )
+            delay = min(float(settings.worker_loop_max_interval_seconds), delay * 2)
             continue
         if report.built or report.published:
             delay = float(PARSE_COOLDOWN_BASE_SECONDS)
@@ -592,9 +713,7 @@ def _run_maintenance_loop(
         started_at = datetime.now(timezone.utc)
         started_monotonic = time.monotonic()
         deps.heartbeat()
-        limits = controller.effective_limits(
-            maintenance_limits, now=started_monotonic
-        )
+        limits = controller.effective_limits(maintenance_limits, now=started_monotonic)
         prune_generation = prune_tracker.pending_generation()
         round_failed = False
         try:
@@ -617,9 +736,7 @@ def _run_maintenance_loop(
         if (
             prune_generation > 0
             and not should_stop()
-            and not any(
-                failure.stage == "project" for failure in report.failures
-            )
+            and not any(failure.stage == "project" for failure in report.failures)
         ):
             prune_tracker.acknowledge(prune_generation)
         if report.downloaded:
@@ -656,9 +773,7 @@ class _AdaptiveLoopController:
     provider_error_cooldown_seconds: int = PROVIDER_ERROR_COOLDOWN_BASE_SECONDS
 
     def __post_init__(self) -> None:
-        self.idle_max_seconds = max(
-            self.idle_base_seconds, self.idle_max_seconds
-        )
+        self.idle_max_seconds = max(self.idle_base_seconds, self.idle_max_seconds)
         self.idle_delay_seconds = self.idle_base_seconds
 
     def effective_limits(self, base: WorkerLimits, *, now: float) -> WorkerLimits:
@@ -666,16 +781,15 @@ class _AdaptiveLoopController:
             base,
             sync=(
                 0
-                if now < max(
+                if now
+                < max(
                     self.sync_quota_cooldown_until,
                     self.rate_limit_cooldown_until,
                     self.provider_error_cooldown_until,
                 )
                 else base.sync
             ),
-            download=(
-                0 if now < self.provider_error_cooldown_until else base.download
-            ),
+            download=(0 if now < self.provider_error_cooldown_until else base.download),
         )
 
     def observe(self, report: WorkerReport, *, now: float) -> float:
@@ -776,9 +890,7 @@ def _source_infrastructure_outage(report: WorkerReport) -> bool:
         failure.stage == "source"
         or (
             failure.stage in {"sync", "download"}
-            and _is_provider_infrastructure_error(
-                failure.error_code, failure.retryable
-            )
+            and _is_provider_infrastructure_error(failure.error_code, failure.retryable)
         )
         for failure in report.failures
     )
@@ -790,9 +902,7 @@ def _system_failure_report(
     report = WorkerReport(started_at=started_at, duration_seconds=duration_seconds)
     report.failed = 1
     report.failures.append(
-        WorkerFailure(
-            stage="system", item_ref="round", error_code=type(exc).__name__
-        )
+        WorkerFailure(stage="system", item_ref="round", error_code=type(exc).__name__)
     )
     return report
 
@@ -819,6 +929,18 @@ def _assert_singleton_or_cancel(lock_conn: Connection) -> None:
         terminate_active_mineru_processes()
         terminate_active_semantic_processes()
         raise WorkerSingletonGuardError(str(exc)) from exc
+
+
+def _assert_worker_admission(
+    lock_conn: Connection,
+    *,
+    mineru_checker: MinerUDeploymentChecker | None,
+) -> None:
+    """Keep the singleton and current MinerU identity valid before new parses."""
+
+    _assert_singleton_or_cancel(lock_conn)
+    if mineru_checker is not None:
+        mineru_checker.assert_admission()
 
 
 def assert_worker_singleton_or_cancel(lock_conn: Connection) -> None:
@@ -868,6 +990,7 @@ def _deps(
     engine: Engine,
     *,
     admission_guard: Callable[[], None] = lambda: None,
+    process_scope_classes: tuple[str, ...] | None = None,
 ) -> WorkerDeps:
     paths = FileStorePathBuilder(settings)
     source: CninfoSource | CninfoWebIndexSource | None = None
@@ -916,7 +1039,8 @@ def _deps(
         return MinerUMediumDocumentParser(
             process=process,
             parser_version=parser_version,
-            server_url=settings.disclosure_mineru_server_url,
+            api_url=settings.disclosure_mineru_api_url,
+            server_url=settings.disclosure_mineru_inference_upstream_url,
         )
 
     provider_source = ProviderDocumentFileSource(
@@ -953,28 +1077,22 @@ def _deps(
             cninfo_oversized_kb=settings.cninfo_oversized_kb,
             initial_lookback_days=settings.disclosure_initial_lookback_days,
             backfill_max_pending_downloads=settings.disclosure_backfill_max_pending_downloads,
-            process_scope_classes=_process_scope_classes(settings),
+            process_scope_classes=(
+                _process_scope_classes(settings)
+                if process_scope_classes is None
+                else process_scope_classes
+            ),
             parse_concurrency=settings.worker_parse_concurrency,
-            parse_heavy_page_threshold=(
-                settings.worker_parse_heavy_page_threshold
-            ),
-            parse_heavy_saturated_share=(
-                settings.worker_parse_heavy_saturated_share
-            ),
-            parse_huge_page_threshold=(
-                settings.worker_parse_huge_page_threshold
-            ),
-            parse_huge_saturated_share=(
-                settings.worker_parse_huge_saturated_share
-            ),
+            parse_heavy_page_threshold=(settings.worker_parse_heavy_page_threshold),
+            parse_heavy_saturated_share=(settings.worker_parse_heavy_saturated_share),
+            parse_huge_page_threshold=(settings.worker_parse_huge_page_threshold),
+            parse_huge_saturated_share=(settings.worker_parse_huge_saturated_share),
             parse_candidate_window=settings.worker_parse_candidate_window,
             finalize_concurrency=settings.worker_finalize_concurrency,
             parse_timeout_per_page_seconds=(
                 settings.disclosure_parse_timeout_per_page_seconds
             ),
-            parse_timeout_max_seconds=(
-                settings.disclosure_parse_timeout_max_seconds
-            ),
+            parse_timeout_max_seconds=(settings.disclosure_parse_timeout_max_seconds),
             parse_runaway_timeout_seconds=(
                 settings.disclosure_parse_runaway_timeout_seconds
             ),
@@ -984,10 +1102,12 @@ def _deps(
             backend="hybrid-http-client",
             effort="medium",
             image_analysis=False,
-            server_url=settings.disclosure_mineru_server_url,
-            http_request_concurrency=(
-                settings.mineru_http_request_concurrency
+            api_url=settings.disclosure_mineru_api_url,
+            api_drain_timeout_seconds=(
+                settings.disclosure_mineru_api_drain_timeout_seconds
             ),
+            server_url=settings.disclosure_mineru_inference_upstream_url,
+            http_request_concurrency=None,
             runtime_bundle_identity_sha256=(
                 settings.disclosure_mineru_runtime_bundle_identity_sha256
             ),
@@ -1007,6 +1127,7 @@ def build_worker_dependencies(
 ) -> WorkerDeps:
     """Public composition boundary for controlled maintenance workers."""
 
+    require_runtime_app_engine(engine)
     return _deps(settings, engine, admission_guard=admission_guard)
 
 
@@ -1025,22 +1146,24 @@ def _print_version_banner(settings: Settings) -> None:
     """
 
     scope = _process_scope_classes(settings)
-    per_document_cap = settings.mineru_http_request_concurrency or 0
     line = (
         f"[versions] policy={settings.disclosure_processing_policy_path.name} "
         f"scope_classes={len(scope)} "
         f"builder_rules={PROVIDER_UNIT_BUILDER_VERSION} "
-        f"gpu_request_cap="
-        f"{settings.worker_parse_concurrency}x"
-        f"{per_document_cap}"
+        f"parse_submit_slots={settings.worker_parse_concurrency} "
+        f"gpu_request_cap={settings.disclosure_mineru_api_task_slots}x"
+        f"{settings.mineru_http_request_concurrency}="
+        f"{settings.mineru_effective_inference_request_upper_bound}"
         f"<={settings.worker_gpu_max_sequences} "
         f"parse_runaway={settings.disclosure_parse_runaway_timeout_seconds}s "
         f"resident_dispatch=continuous "
         f"report_interval={settings.worker_report_interval_seconds}s"
     )
+    engine: Engine | None = None
     try:
         engine = create_db_engine(_database_url(settings))
         with engine.connect() as conn:
+            require_runtime_app_connection(conn)
             rows = conn.execute(
                 text(
                     "SELECT rule_set, max(version) FROM "
@@ -1048,10 +1171,12 @@ def _print_version_banner(settings: Settings) -> None:
                     "ORDER BY rule_set"
                 )
             ).all()
-        engine.dispose()
         line += " " + " ".join(f"{kind}={version}" for kind, version in rows)
     except Exception as exc:  # pragma: no cover - depends on live DB
         line += f" (rule versions unavailable: {type(exc).__name__})"
+    finally:
+        if engine is not None:
+            engine.dispose()
     # flush: launchd redirects stdout to a file (block-buffered); the boot
     # banner must not sit invisible in the buffer (its whole purpose).
     print(line, flush=True)
@@ -1064,21 +1189,78 @@ def _maybe_alert(settings: Settings, report: WorkerReport) -> None:
     worker down — the report file remains the durable record.
     """
 
-    message = _alert_message(report)
+    try:
+        transition = _build_dead_letter_transition(settings)
+    except Exception:
+        traceback.print_exc()
+        transition = None
+    message = transition[0] if transition is not None else _alert_message(report)
     if message is None:
         return
     script = Path(__file__).resolve().parents[3] / "scripts" / "notify.sh"
     if not script.exists():
         return
     try:
-        subprocess.run(
+        completed = subprocess.run(
             [str(script), "worker round trouble", message],
             timeout=15,
             check=False,
             capture_output=True,
         )
+        if transition is not None and completed.returncode == 0:
+            _write_alert_fingerprint(settings, transition[1])
     except Exception:
         traceback.print_exc()
+
+
+def _build_dead_letter_transition(settings: Settings) -> tuple[str, str] | None:
+    from disclosure_anchor.application.worker.queries import build_dead_letter_ids
+
+    engine = create_db_engine(_database_url(settings))
+    try:
+        require_runtime_app_engine(engine)
+        with engine.connect() as conn:
+            run_ids = build_dead_letter_ids(
+                conn,
+                max_retries=settings.disclosure_max_build_retries,
+            )
+    finally:
+        engine.dispose()
+    fingerprint = hashlib.sha256("\n".join(run_ids).encode("utf-8")).hexdigest()
+    state_path = _alert_fingerprint_path(settings)
+    try:
+        previous = state_path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        previous = ""
+    if fingerprint == previous:
+        return None
+    if not run_ids:
+        _write_alert_fingerprint(settings, fingerprint)
+        return None
+    return (
+        f"{len(run_ids)} Unit build dead letters require operator remediation; "
+        "inspect doctor and rebuild-units",
+        fingerprint,
+    )
+
+
+def _alert_fingerprint_path(settings: Settings) -> Path:
+    return settings.disclosure_runtime_root / "alerts" / "build_deadletters.sha256"
+
+
+def _write_alert_fingerprint(settings: Settings, fingerprint: str) -> None:
+    path = _alert_fingerprint_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("w", encoding="ascii") as handle:
+            handle.write(fingerprint + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def _alert_message(report: WorkerReport) -> str | None:
@@ -1091,6 +1273,15 @@ def _alert_message(report: WorkerReport) -> str | None:
         return f"round crashed ({', '.join(codes) or 'system'}) — worker is looping without progress"
     if report.source_outage_break:
         return "source outage break (CNINFO/credentials); acquisition paused this round"
+    degraded_units = sum(
+        int(stats.get("semantic_adjudicator_unavailable_unit_count", 0) or 0)
+        for stats in report.build_stats
+    )
+    if degraded_units:
+        return (
+            f"semantic adjudicator unavailable; {degraded_units} Units were "
+            "preserved with empty direct semantic routes"
+        )
     if report.failed >= 5:
         stages = sorted({failure.stage for failure in report.failures})
         return f"{report.failed} failures in one round (stages: {', '.join(stages)})"
@@ -1120,9 +1311,7 @@ def _render_parse_quality_section(report: WorkerReport) -> str:
 
 
 def _database_url(settings: Settings) -> str:
-    if settings.database_url is not None:
-        return app_database_url(settings)
-    return migration_database_url(settings)
+    return app_database_url(settings)
 
 
 def worker_database_url(settings: Settings) -> str:
@@ -1130,6 +1319,27 @@ def worker_database_url(settings: Settings) -> str:
 
     return _database_url(settings)
 
+
+def _print_worker_status(settings: Settings, *, output_format: str) -> int:
+    """Print one read-only progress snapshot without requiring GPU admission."""
+
+    engine = create_db_engine(_database_url(settings))
+    try:
+        require_runtime_app_engine(engine)
+        event = collect_worker_progress(
+            settings=settings,
+            engine=engine,
+            scope_classes=_process_scope_classes(settings),
+        )
+    finally:
+        engine.dispose()
+    rendered = (
+        render_worker_progress_json(event)
+        if output_format == "json"
+        else render_worker_progress(event)
+    )
+    print(rendered, flush=True)
+    return 0
 
 
 if __name__ == "__main__":

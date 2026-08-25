@@ -71,7 +71,6 @@ UNIT_COLUMNS = (
     "heading_path_text",
     "title",
     "order_index",
-    "semantic_key",
     "semantic_keys",
     "section_keys",
     "payload",
@@ -100,7 +99,7 @@ UNIT_COLUMNS = (
     "trace_level",
     "raw_file_hash",
     "query_projection_hash",
-    "content_categories",
+    "body_status",
 )
 
 SOURCE_REF_COLUMNS = (
@@ -131,18 +130,6 @@ def _query_default() -> Any:
     return Query()
 
 
-def _semantic_key_query_default() -> Any:
-    if Query is None:  # pragma: no cover
-        return None
-    return Query(
-        pattern=r"^[a-z][a-z0-9_]{0,127}$",
-        description=(
-            "Lowercase ASCII controlled semantic key; recalls Units where the "
-            "key is either the primary route or a secondary semantic route."
-        ),
-    )
-
-
 def _semantic_key_list_query_default() -> Any:
     if Query is None:  # pragma: no cover
         return None
@@ -162,7 +149,6 @@ def list_document_units(
     processing_run_id: str | None = None,
     reject_superseded: bool = False,
     payload_kind: str | None = None,
-    semantic_key: Annotated[str | None, _semantic_key_query_default()] = None,
     semantic_keys_any: Annotated[str | None, _semantic_key_list_query_default()] = None,
     semantic_keys_all: Annotated[str | None, _semantic_key_list_query_default()] = None,
     section_keys_any: Annotated[str | None, _semantic_key_list_query_default()] = None,
@@ -195,7 +181,6 @@ def list_document_units(
         processing_run_id=selected_run_id,
         filters=UnitFilters(
             payload_kind=payload_kind,
-            semantic_key=_validate_semantic_key("semantic_key", semantic_key),
             semantic_keys_any=_validate_semantic_key_list(
                 "semantic_keys_any", semantic_keys_any
             ),
@@ -313,7 +298,6 @@ class UnitFilters:
         self,
         *,
         payload_kind: str | None = None,
-        semantic_key: str | None = None,
         semantic_keys_any: list[str] | None = None,
         semantic_keys_all: list[str] | None = None,
         section_keys_any: list[str] | None = None,
@@ -322,7 +306,6 @@ class UnitFilters:
         heading_prefix: list[str] | None = None,
     ) -> None:
         self.payload_kind = payload_kind
-        self.semantic_key = semantic_key
         self.semantic_keys_any = semantic_keys_any
         self.semantic_keys_all = semantic_keys_all
         self.section_keys_any = section_keys_any
@@ -488,11 +471,6 @@ def _unit_where(filters: UnitFilters) -> tuple[list[str], dict[str, Any]]:
     where: list[str] = []
     params: dict[str, Any] = {}
     _add_filter(where, params, "payload_kind", filters.payload_kind)
-    if filters.semantic_key is not None:
-        where.append(
-            "(u.semantic_key = :semantic_key OR u.semantic_keys ? :semantic_key)"
-        )
-        params["semantic_key"] = filters.semantic_key
     if filters.semantic_keys_any is not None:
         where.append("u.semantic_keys ?| CAST(:semantic_keys_any AS text[])")
         params["semantic_keys_any"] = filters.semantic_keys_any

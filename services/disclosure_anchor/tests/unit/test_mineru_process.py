@@ -22,6 +22,7 @@ from disclosure_anchor.domain.errors import (
     ParserOutputContractError,
     ParserTaskDeadlineError,
     ParserTaskError,
+    ParserTimeoutError,
     ParserVersionProbeError,
 )
 
@@ -32,13 +33,12 @@ class MinerUProcessTests(unittest.TestCase):
         mineru_process._PROBE_SUCCESS_AT.clear()
 
     def test_command_uses_the_pinned_medium_profile(self) -> None:
-        command = MinerUProcess(
-            executable=Path("/opt/mineru/bin/mineru")
-        ).command_for(
+        command = MinerUProcess(executable=Path("/opt/mineru/bin/mineru")).command_for(
             input_pdf=Path("input.pdf"),
             output_dir=Path("out"),
             options=ParserOptions(
-                server_url="http://gpu:30000",
+                api_url="http://127.0.0.1:30000",
+                server_url="http://127.0.0.1:30001/v1",
                 http_request_concurrency=3,
             ),
         )
@@ -48,32 +48,55 @@ class MinerUProcessTests(unittest.TestCase):
             ["/opt/mineru/bin/mineru", "-p", "input.pdf", "-o", "out"],
         )
         self.assertEqual(command[command.index("-m") + 1], "auto")
-        self.assertEqual(
-            command[command.index("-b") + 1], "hybrid-http-client"
-        )
+        self.assertEqual(command[command.index("-b") + 1], "hybrid-http-client")
         self.assertEqual(command[command.index("-f") + 1], "true")
         self.assertEqual(command[command.index("-t") + 1], "true")
-        self.assertEqual(command[command.index("-u") + 1], "http://gpu:30000")
-        self.assertEqual(command[command.index("--max-concurrency") + 1], "3")
+        self.assertEqual(
+            command[command.index("--api-url") + 1],
+            "http://127.0.0.1:30000",
+        )
+        self.assertEqual(
+            command[command.index("-u") + 1],
+            "http://127.0.0.1:30001/v1",
+        )
+        self.assertNotIn("--max-concurrency", command)
         self.assertEqual(command[command.index("--image-analysis") + 1], "false")
         self.assertEqual(command[command.index("--effort") + 1], "medium")
         self.assertNotIn("-s", command)
         self.assertNotIn("-e", command)
+
+        local_api_command = MinerUProcess(
+            executable=Path("/opt/mineru/bin/mineru")
+        ).command_for(
+            input_pdf=Path("input.pdf"),
+            output_dir=Path("out"),
+            options=ParserOptions(
+                server_url="http://gpu:30000",
+                http_request_concurrency=3,
+            ),
+        )
+        self.assertNotIn("--api-url", local_api_command)
+        self.assertEqual(
+            local_api_command[local_api_command.index("--max-concurrency") + 1],
+            "3",
+        )
 
     def test_medium_parser_requires_exact_version_and_server_readiness(self) -> None:
         process = mock.Mock()
         process.version.return_value = "3.4.4"
         parser = MinerUMediumDocumentParser(
             process=process,
-            server_url="http://gpu:30000",
+            api_url="http://mac-api:30000",
+            server_url="http://windows-vllm:30001/v1",
         )
-        options = ParserOptions(
-            runtime_bundle_identity_sha256=f"sha256:{'a' * 64}"
-        )
+        options = ParserOptions(runtime_bundle_identity_sha256=f"sha256:{'a' * 64}")
 
         self.assertEqual(parser.identity().version, "3.4.4")
         parser.readiness(options)
-        process.probe_server.assert_called_once_with("http://gpu:30000")
+        self.assertEqual(
+            process.probe_server.call_args_list,
+            [mock.call("http://mac-api:30000")],
+        )
 
         wrong = mock.Mock()
         wrong.version.return_value = "3.4.3"
@@ -84,6 +107,15 @@ class MinerUProcessTests(unittest.TestCase):
             MinerUMediumDocumentParser(
                 process=process,
                 parser_version="3.4.4",
+            ).readiness(options)
+        with self.assertRaisesRegex(
+            ParserOutputContractError,
+            "VLM upstream server URL",
+        ):
+            MinerUMediumDocumentParser(
+                process=process,
+                parser_version="3.4.4",
+                api_url="http://mac-api:30000",
             ).readiness(options)
 
     def test_run_aligns_deadline_and_classifies_process_failures(self) -> None:
@@ -105,7 +137,15 @@ class MinerUProcessTests(unittest.TestCase):
             with (
                 mock.patch.dict(
                     mineru_process.os.environ,
-                    {"MINERU_TABLE_MERGE_ENABLE": "0"},
+                    {
+                        "DATABASE_URL": "postgresql://secret",
+                        "CNINFO_PASSWORD": "secret",
+                        "DISCLOSURE_ADMIN_TOKEN": "secret",
+                        "MINERU_PROCESSING_WINDOW_SIZE": "16",
+                        "MINERU_TABLE_MERGE_ENABLE": "0",
+                        "PATH": "/usr/bin",
+                    },
+                    clear=True,
                 ),
                 mock.patch.object(
                     mineru_process.subprocess,
@@ -120,6 +160,11 @@ class MinerUProcessTests(unittest.TestCase):
                 )
             env = popen.call_args.kwargs["env"]
             self.assertEqual(env["MINERU_TASK_RESULT_TIMEOUT_SECONDS"], "2700")
+            self.assertEqual(env["PATH"], "/usr/bin")
+            self.assertEqual(env["MINERU_PROCESSING_WINDOW_SIZE"], "16")
+            self.assertNotIn("DATABASE_URL", env)
+            self.assertNotIn("CNINFO_PASSWORD", env)
+            self.assertNotIn("DISCLOSURE_ADMIN_TOKEN", env)
             self.assertNotIn("MINERU_TABLE_MERGE_ENABLE", env)
 
             with mock.patch.object(
@@ -191,6 +236,76 @@ class MinerUProcessTests(unittest.TestCase):
                 mock.call(43210, mineru_process.signal.SIGKILL),
             ],
         )
+
+    def test_external_timeout_drains_remote_api_before_returning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_pdf = root / "input.pdf"
+            input_pdf.write_bytes(b"%PDF")
+            process = mock.MagicMock(pid=43209, returncode=None)
+            process.communicate.side_effect = subprocess.TimeoutExpired(
+                cmd=["mineru"], timeout=1
+            )
+            process.wait.return_value = 0
+            with (
+                mock.patch.object(
+                    mineru_process.subprocess,
+                    "Popen",
+                    return_value=process,
+                ),
+                mock.patch.object(mineru_process.os, "killpg"),
+                mock.patch.object(
+                    mineru_process,
+                    "wait_for_mineru_orchestrator_idle",
+                ) as drain,
+                self.assertRaises(ParserTimeoutError),
+            ):
+                MinerUProcess(executable=Path("mineru")).run(
+                    input_pdf=input_pdf,
+                    output_dir=root / "out",
+                    options=ParserOptions(
+                        api_url="http://127.0.0.1:30002",
+                        server_url="http://mineru-openai-server:30000/v1",
+                        timeout_seconds=1,
+                        api_drain_timeout_seconds=77,
+                    ),
+                )
+            drain.assert_called_once_with(
+                "http://127.0.0.1:30002",
+                timeout_seconds=77.0,
+            )
+
+    def test_fixed_api_unknown_task_failure_is_shared_infrastructure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_pdf = root / "input.pdf"
+            input_pdf.write_bytes(b"%PDF")
+            process = mock.MagicMock(pid=43212, returncode=1)
+            process.communicate.return_value = (
+                "",
+                "1 task(s) failed while processing documents: "
+                '{"status":"failed","error":"GPU worker crashed unexpectedly"}',
+            )
+            with (
+                mock.patch.object(
+                    mineru_process.subprocess,
+                    "Popen",
+                    return_value=process,
+                ),
+                mock.patch.object(
+                    mineru_process,
+                    "wait_for_mineru_orchestrator_idle",
+                ),
+                self.assertRaises(ParserBackendUnavailableError),
+            ):
+                MinerUProcess(executable=Path("mineru")).run(
+                    input_pdf=input_pdf,
+                    output_dir=root / "out",
+                    options=ParserOptions(
+                        api_url="http://127.0.0.1:30002",
+                        server_url="http://mineru-openai-server:30000/v1",
+                    ),
+                )
 
     def test_worker_shutdown_is_not_classified_as_task_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -299,6 +414,30 @@ class MinerUProcessTests(unittest.TestCase):
             runner.probe_server("http://gpu:30000")
             runner.probe_server("http://gpu:30000")
         self.assertEqual(opener.open.call_count, 1)
+        self.assertEqual(
+            opener.open.call_args.args[0].full_url,
+            "http://gpu:30000/health",
+        )
+
+        mineru_process._PROBE_SUCCESS_AT.clear()
+        clock = iter([200.0, 200.5])
+        with (
+            mock.patch.object(
+                mineru_process.urllib.request,
+                "build_opener",
+                return_value=opener,
+            ),
+            mock.patch.object(
+                mineru_process.time,
+                "monotonic",
+                side_effect=clock,
+            ),
+        ):
+            runner.probe_server("http://windows-vllm:30001/v1")
+        self.assertEqual(
+            opener.open.call_args.args[0].full_url,
+            "http://windows-vllm:30001/health",
+        )
 
         mineru_process._PROBE_SUCCESS_AT.clear()
         opener.open.side_effect = OSError("connection refused")
@@ -310,7 +449,7 @@ class MinerUProcessTests(unittest.TestCase):
             for _ in range(2):
                 with self.assertRaises(ParserVersionProbeError):
                     runner.probe_server("http://gpu:30000")
-        self.assertEqual(opener.open.call_count, 3)
+        self.assertEqual(opener.open.call_count, 4)
 
 
 if __name__ == "__main__":

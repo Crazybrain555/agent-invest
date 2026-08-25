@@ -199,8 +199,8 @@ class WorkerConfig:
     # Legacy name: archived byte-size threshold for the HUGE lane only.
     # Large documents remain eligible and may borrow the full idle pool.
     cninfo_oversized_kb: int
-    # First-sync historical backfill (user decision: 三年是底线).
-    initial_lookback_days: int = 1095
+    # First-sync historical backfill (three years plus a 185-day safety lead).
+    initial_lookback_days: int = 1280
     # Backpressure cap for pending-download + downloaded/pending-parse work;
     # 0 disables first-sync deferral.  The env key retains its legacy name.
     backfill_max_pending_downloads: int = 2000
@@ -749,13 +749,13 @@ def _sync_window_start(
     *,
     today: date,
     overlap_days: int,
-    initial_lookback_days: int = 1095,
+    initial_lookback_days: int = 1280,
     lookback: object = None,
 ) -> date:
     if isinstance(window_end, str) and window_end:
         return date.fromisoformat(window_end) - timedelta(days=overlap_days)
     # Never synced: default historical backfill (user decision 2026-07-06,
-    # 三年是底线), with an optional per-company tracked override {"days": N}.
+    # 三年半留提前量), with an optional per-company override {"days": N}.
     days = initial_lookback_days
     if isinstance(lookback, dict):
         override = lookback.get("days")

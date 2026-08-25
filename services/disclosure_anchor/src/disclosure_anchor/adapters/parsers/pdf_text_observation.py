@@ -59,7 +59,10 @@ def observe_pdf_text_rectangles(
                     ):
                         continue
                     eligible = _eligible_text_blocks(provider_page.blocks)
-                    ambiguous = _ambiguous_source_indices(eligible)
+                    ambiguous = _ambiguous_source_indices(
+                        eligible,
+                        blockers=provider_page.blocks,
+                    )
                     text_page = page.get_textpage()
                     try:
                         for block, payload_ordinal in eligible:
@@ -97,12 +100,13 @@ def _eligible_text_blocks(
 ) -> tuple[tuple[ProviderBlock, int], ...]:
     eligible: list[tuple[ProviderBlock, int]] = []
     for block in blocks:
-        if block.provider_type != "text" or block.bbox is None:
+        if block.provider_type not in {"text", "table"} or block.bbox is None:
             continue
+        expected_field = "text" if block.provider_type == "text" else "table_body"
         ordinals = tuple(
             ordinal
             for ordinal, payload in enumerate(block.payloads)
-            if payload.field == "text"
+            if payload.field == expected_field
         )
         if len(ordinals) == 1:
             eligible.append((block, ordinals[0]))
@@ -111,14 +115,26 @@ def _eligible_text_blocks(
 
 def _ambiguous_source_indices(
     blocks: tuple[tuple[ProviderBlock, int], ...],
+    *,
+    blockers: tuple[ProviderBlock, ...],
 ) -> frozenset[int]:
     ambiguous: set[int] = set()
-    for index, (left, _ordinal) in enumerate(blocks):
+    for left, _ordinal in blocks:
         assert left.bbox is not None
-        for right, _right_ordinal in blocks[index + 1 :]:
-            assert right.bbox is not None
-            if _bbox_coverage(left.bbox, right.bbox) >= _AMBIGUOUS_BBOX_COVERAGE:
-                ambiguous.update((left.source_index, right.source_index))
+        for right in blockers:
+            if (
+                right.source_index == left.source_index
+                or right.provider_type not in {"text", "table"}
+                or right.bbox is None
+                or _bbox_coverage(left.bbox, right.bbox)
+                < _AMBIGUOUS_BBOX_COVERAGE
+            ):
+                continue
+            if (
+                left.provider_type == right.provider_type
+                or left.provider_type == "text"
+            ):
+                ambiguous.add(left.source_index)
     return frozenset(ambiguous)
 
 

@@ -14,7 +14,7 @@ import threading
 from typing import Protocol, cast
 import unicodedata
 
-RETRIEVAL_RULES_VERSION = "rp-2026.08-provider-unit-v3"
+RETRIEVAL_RULES_VERSION = "rp-2026.08-provider-unit-v5"
 
 _lock = threading.Lock()
 

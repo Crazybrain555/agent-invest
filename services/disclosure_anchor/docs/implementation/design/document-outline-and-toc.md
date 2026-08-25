@@ -4,7 +4,7 @@ project: disclosure_anchor
 title: 文件脉络与标题层级边界
 status: implemented
 revised_at: 2026-08-12
-depends_on: provider_document.v1、provider_unit.v9、06R 检索投影
+depends_on: provider_document.v1、provider_unit.v22、provider_unit_locator.v8、06R 检索投影
 ---
 
 # 文件脉络与标题层级边界

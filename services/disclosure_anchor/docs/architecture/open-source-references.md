@@ -74,7 +74,7 @@ filing = company("002484").filings(filing_type="annual_report", period="2025A").
 filing.text_units()
 filing.tables()
 filing.qa_items()
-filing.units(semantic_key="receivable_aging")
+filing.units(semantic_keys_any="receivable_aging")
 filing.units(heading_path="第三节/管理层讨论与分析")
 ```
 
@@ -195,6 +195,24 @@ URL: https://github.com/camelot-dev/camelot
 
 对 text-based PDF 表格输出 DataFrame，带 accuracy/whitespace/order/page 报告。用于第五节列出的**按需**表格复核与数字对账，不做全量逐表对账。
 
+### 14. vLLM + GPU exporters + Celery/RQ + SSE/tqdm（运行观测，只借思想）
+
+官方资料：
+
+- vLLM production metrics: https://docs.vllm.ai/en/latest/usage/metrics/
+- NVIDIA DCGM exporter: https://docs.nvidia.com/datacenter/dcgm/latest/installation/install-dcgm-exporter.html
+- Windows nvidia-smi exporter: https://github.com/utkuozdemir/nvidia_gpu_exporter
+- Celery monitoring/events: https://docs.celeryq.dev/en/stable/userguide/monitoring.html
+- RQ monitoring: https://python-rq.org/docs/monitoring/
+- WHATWG Server-Sent Events: https://html.spec.whatwg.org/dev/server-sent-events.html
+- tqdm: https://tqdm.github.io/
+
+只借四个核心思想，不引 Celery/RQ 作为第二队列：PostgreSQL 状态仍是耐久队列唯一事实源；
+像 Celery events 一样产出 append-only 进度事件；像 RQ `info` 一样提供单次只读状态；终端 renderer
+与未来 SSE/frontend adapter 消费同一版本事件；进度条只是视图，不拥有状态。vLLM 的
+running/waiting/preemption/KV 用来观察推理调度；Linux DCGM 的 `DCGM_FI_DEV_GPU_UTIL` 或 Windows
+nvidia-smi exporter 的 `nvidia_smi_utilization_gpu_ratio` 才能标为实际 GPU 利用率，两者不得混写。
+
 ---
 
 ## 不建议直接采用为主架构
@@ -280,7 +298,7 @@ REST、MCP 以后在这两个接口外加适配，不重新设计数据库。
 标准数据：dataset_registry → provider adapter（首版 Wind）→ Dataset API → source_access（+ as-of 快照）
 披露文件：巨潮公告列表 → PDF 下载 → 原文保存(+hash) → document/processing_run
         → MinerU 解析 → 切成 document_unit(text/table/qa)
-        → 可按 公司/报告期/公告类型/heading_path/semantic_key/title/asset_id 查询
+        → 可按 公司/报告期/公告类型/heading_path/semantic_keys/title/asset_id 查询
 两条路径在 L2 汇合，抽取 claim / 事件 / 口径 / 冲突。
 ```
 

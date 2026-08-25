@@ -24,6 +24,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
+import json
 from typing import Any, TypeVar
 
 from sqlalchemy import (
@@ -47,6 +49,7 @@ from disclosure_anchor.adapters.db.postgres.models import (
     ProcessingRun,
     UnitBodySearchWindow,
     UnitSearchAtom,
+    UnitSearchRowAtom,
     UnitSearchProjection,
 )
 from disclosure_anchor.adapters.retrieval import tokenizer
@@ -54,7 +57,11 @@ from disclosure_anchor.application.contracts.html_visible_text import html_visib
 from disclosure_anchor.application.contracts.provider_unit import (
     ProviderUnitSearchContractError,
 )
+from disclosure_anchor.application.services.semantic_taxonomy import (
+    load_semantic_route_taxonomy,
+)
 from disclosure_anchor.application.services.provider_unit_builder import (
+    provider_unit_search_row_atoms,
     provider_unit_search_text_values,
 )
 from disclosure_anchor.application.worker.locks import shared_corpus_mutation
@@ -62,6 +69,10 @@ from disclosure_anchor.application.worker.locks import shared_corpus_mutation
 # DML flush size inside one processing-run transaction.
 _BATCH = 1000
 _PROBE_BATCH = 256
+_EMPTY_ROW_ATOM_MANIFEST_HASH = (
+    "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5"
+    "ed12ab4d8e11ba873c2f11161202b945"
+)
 
 _UPDATE_COLUMNS = (
     "retrieval_rules_version",
@@ -73,6 +84,9 @@ _UPDATE_COLUMNS = (
     "key_tokens",
     "header_row_candidate",
     "body_search_windowed",
+    "row_atom_manifest_ready",
+    "row_atom_count",
+    "row_atom_manifest_hash",
     "built_at",
 )
 
@@ -284,10 +298,34 @@ class BuildSearchProjection:
             body_window_exists = select(UnitBodySearchWindow.asset_id).where(
                 UnitBodySearchWindow.asset_id == UnitSearchProjection.asset_id
             )
+            row_atom_count = (
+                select(func.count())
+                .select_from(UnitSearchRowAtom)
+                .where(UnitSearchRowAtom.asset_id == UnitSearchProjection.asset_id)
+                .scalar_subquery()
+            )
+            stale_row_atom_exists = select(UnitSearchRowAtom.asset_id).where(
+                UnitSearchRowAtom.asset_id == UnitSearchProjection.asset_id,
+                UnitSearchRowAtom.row_atom_manifest_hash
+                != UnitSearchProjection.row_atom_manifest_hash,
+            )
             current_projection_exists = select(UnitSearchProjection.asset_id).where(
                 UnitSearchProjection.asset_id == DocumentUnit.asset_id,
                 UnitSearchProjection.retrieval_rules_version
                 == tokenizer.RETRIEVAL_RULES_VERSION,
+                UnitSearchProjection.row_atom_manifest_ready.is_(True),
+                row_atom_count == UnitSearchProjection.row_atom_count,
+                or_(
+                    and_(
+                        UnitSearchProjection.row_atom_count == 0,
+                        UnitSearchProjection.row_atom_manifest_hash
+                        == _EMPTY_ROW_ATOM_MANIFEST_HASH,
+                    ),
+                    and_(
+                        UnitSearchProjection.row_atom_count > 0,
+                        ~stale_row_atom_exists.exists(),
+                    ),
+                ),
                 or_(
                     and_(
                         UnitSearchProjection.body_search_windowed.is_(False),
@@ -378,7 +416,20 @@ class BuildSearchProjection:
                 for row in computed_rows
                 for atom_index, atom_text in enumerate(row.pop("body_atoms"))
             ]
+            row_atom_rows = [
+                {
+                    "asset_id": str(row["asset_id"]),
+                    "row_atom_index": row_atom_index,
+                    **row_atom,
+                }
+                for row in computed_rows
+                for row_atom_index, row_atom in enumerate(
+                    row.pop("body_row_atoms")
+                )
+            ]
             prepared_rows, window_rows = _prepare_search_rows(session, computed_rows)
+            row_atom_rows = _filter_safe_row_atoms(session, row_atom_rows)
+            _attach_row_atom_manifests(prepared_rows, row_atom_rows)
             asset_ids = [str(row["asset_id"]) for row in prepared_rows]
 
             for asset_chunk in _chunked(asset_ids, _BATCH):
@@ -392,6 +443,11 @@ class BuildSearchProjection:
                         UnitSearchAtom.asset_id.in_(asset_chunk)
                     )
                 )
+                session.execute(
+                    delete(UnitSearchRowAtom).where(
+                        UnitSearchRowAtom.asset_id.in_(asset_chunk)
+                    )
+                )
             upsert_stmt = _upsert_statement()
             for row_chunk in _chunked(prepared_rows, _BATCH):
                 session.execute(upsert_stmt, list(row_chunk))
@@ -402,6 +458,11 @@ class BuildSearchProjection:
                 )
             for atom_chunk in _chunked(atom_rows, _BATCH):
                 session.execute(pg_insert(UnitSearchAtom), list(atom_chunk))
+            for row_atom_chunk in _chunked(row_atom_rows, _BATCH):
+                session.execute(
+                    pg_insert(UnitSearchRowAtom),
+                    list(row_atom_chunk),
+                )
             session.execute(
                 update(ProcessingRun)
                 .where(
@@ -703,6 +764,74 @@ def _probe_search_vector_safety(
     return [bool(result) for result in results]
 
 
+def _filter_safe_row_atoms(
+    session: Session,
+    row_atom_rows: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep only row atoms that PostgreSQL can index without physical loss.
+
+    A strict Q&A row is an optional retrieval enhancement.  The parent Unit,
+    its source leaves, and lossless body windows remain the recall fallback,
+    so an over-limit row must not abort or poison the owning processing run.
+    Stored row indices are reassigned densely per Unit after safe omission;
+    ``source_row_index`` remains the immutable table-row address.
+    """
+
+    safety = _probe_search_vector_safety(
+        session,
+        [
+            ("", "", str(row["row_tokens"]), "")
+            for row in row_atom_rows
+        ],
+    )
+    next_index_by_asset: dict[str, int] = {}
+    safe_rows: list[dict[str, Any]] = []
+    for row, safe in zip(row_atom_rows, safety, strict=True):
+        if not safe:
+            continue
+        asset_id = str(row["asset_id"])
+        row_atom_index = next_index_by_asset.get(asset_id, 0)
+        next_index_by_asset[asset_id] = row_atom_index + 1
+        safe_rows.append({**row, "row_atom_index": row_atom_index})
+    return safe_rows
+
+
+def _attach_row_atom_manifests(
+    parent_rows: Sequence[dict[str, Any]],
+    row_atom_rows: Sequence[dict[str, Any]],
+) -> None:
+    """Bind each parent and child to the exact safe row-atom set."""
+
+    rows_by_asset: dict[str, list[dict[str, Any]]] = {}
+    for row in row_atom_rows:
+        rows_by_asset.setdefault(str(row["asset_id"]), []).append(row)
+    for parent in parent_rows:
+        asset_id = str(parent["asset_id"])
+        rows = rows_by_asset.get(asset_id, [])
+        manifest_payload = [
+            {
+                "row_atom_index": int(row["row_atom_index"]),
+                "table_target_id": str(row["table_target_id"]),
+                "source_row_index": int(row["source_row_index"]),
+                "row_text": str(row["row_text"]),
+                "row_tokens": str(row["row_tokens"]),
+            }
+            for row in rows
+        ]
+        manifest_bytes = json.dumps(
+            manifest_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        manifest_hash = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+        parent["row_atom_count"] = len(rows)
+        parent["row_atom_manifest_hash"] = manifest_hash
+        parent["row_atom_manifest_ready"] = True
+        for row in rows:
+            row["row_atom_manifest_hash"] = manifest_hash
+
+
 def _upsert_statement() -> Any:
     stmt = pg_insert(UnitSearchProjection)
     excluded = stmt.excluded
@@ -710,6 +839,31 @@ def _upsert_statement() -> Any:
         index_elements=["asset_id"],
         set_={column: excluded[column] for column in _UPDATE_COLUMNS},
     )
+
+
+_ROUTE_LABEL_TOKENS: dict[str, str] | None = None
+
+
+def _route_label_tokens() -> Mapping[str, str]:
+    """Chinese canonical-label tokens per closed route key, computed once."""
+
+    global _ROUTE_LABEL_TOKENS
+    if _ROUTE_LABEL_TOKENS is None:
+        _ROUTE_LABEL_TOKENS = {
+            definition.key: tokenizer.index_word_tokens(definition.labels[0])
+            for definition in load_semantic_route_taxonomy().definitions
+        }
+    return _ROUTE_LABEL_TOKENS
+
+
+def _direct_key_tokens(semantic_keys: Sequence[str] | None) -> str:
+    keys = list(dict.fromkeys(semantic_keys or ()))
+    label_tokens: list[str] = []
+    for key in keys:
+        tokens = _route_label_tokens().get(key)
+        if tokens:
+            label_tokens.extend(tokens.split(" "))
+    return " ".join(dict.fromkeys((*keys, *label_tokens)))
 
 
 _T = TypeVar("_T")
@@ -747,6 +901,20 @@ def compute_search_projection_row(
         )
         if (normalized := tokenizer.normalize_search_text(value)).strip()
     )
+    body_row_atoms = tuple(
+        {
+            "table_target_id": atom.table_target_id,
+            "source_row_index": atom.source_row_index,
+            "row_text": tokenizer.normalize_search_text(atom.row_text),
+            "row_tokens": tokenizer.index_word_tokens(atom.row_text),
+        }
+        for atom in provider_unit_search_row_atoms(
+            payload_kind=payload_kind,
+            payload=payload or {},
+            title=title,
+            artifact_locator=artifact_locator,
+        )
+    )
     title_token_text = html_visible_text(title_text)
     path_token_text = " > ".join(
         html_visible_text(str(item)) for item in heading_path or []
@@ -762,11 +930,17 @@ def compute_search_projection_row(
         "body_tokens": tokenizer.index_word_tokens(body_token_text),
         # Private handoff to the run-atomic child insert; not a parent column.
         "body_atoms": body_atoms,
+        # Private handoff for strict, source-bound Q&A row colocation.  These
+        # derived rows never alter the Unit payload, identity, or hashes.
+        "body_row_atoms": body_row_atoms,
         # Controlled semantic routes bypass natural-language segmentation.
         # Direct Unit themes are a ranked search signal.  Structural section
         # context remains separately filterable and must not compete at the
-        # same weight in the full-text key channel.
-        "key_tokens": " ".join(dict.fromkeys(semantic_keys or ())),
+        # same weight in the full-text key channel.  Each direct key also
+        # projects its Chinese canonical label tokens so a lexical Chinese
+        # query reaches the carrier even when the label word never occurs in
+        # the Unit's own title/body (e.g. 存货 for a dotted policy child).
+        "key_tokens": _direct_key_tokens(semantic_keys),
         # Retained until the DB compatibility column is retired. New
         # projections never infer a header role from cell text.
         "header_row_candidate": False,

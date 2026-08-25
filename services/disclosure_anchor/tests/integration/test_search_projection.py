@@ -151,6 +151,8 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
         self.assertTrue(self._view_exists("unit_search_projection_v1"))
         self.assertTrue(self._view_exists("unit_body_search_windows_v1"))
         self.assertTrue(self._view_exists("unit_search_atoms_v1"))
+        self.assertTrue(self._table_exists("unit_search_row_atom"))
+        self.assertTrue(self._view_exists("unit_search_row_atoms_v1"))
         self.assertTrue(self._function_exists("search_tsvector_is_safe"))
         parent_columns = self._view_columns("unit_search_projection_v1")
         self.assertEqual(
@@ -177,6 +179,8 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
         self.assertFalse(self._view_exists("unit_search_projection_v1"))
         self.assertFalse(self._view_exists("unit_body_search_windows_v1"))
         self.assertFalse(self._view_exists("unit_search_atoms_v1"))
+        self.assertFalse(self._table_exists("unit_search_row_atom"))
+        self.assertFalse(self._view_exists("unit_search_row_atoms_v1"))
         self.assertFalse(self._function_exists("search_tsvector_is_safe"))
 
         up = self._alembic("upgrade", "head")
@@ -186,6 +190,8 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
         self.assertTrue(self._view_exists("unit_search_projection_v1"))
         self.assertTrue(self._view_exists("unit_body_search_windows_v1"))
         self.assertTrue(self._view_exists("unit_search_atoms_v1"))
+        self.assertTrue(self._table_exists("unit_search_row_atom"))
+        self.assertTrue(self._view_exists("unit_search_row_atoms_v1"))
         self.assertTrue(self._function_exists("search_tsvector_is_safe"))
         self.assertEqual(
             self._view_columns("unit_search_atoms_v1"),
@@ -197,10 +203,115 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                 "built_at",
             ],
         )
+        self.assertEqual(
+            self._view_columns("unit_search_row_atoms_v1"),
+            [
+                "asset_id",
+                "row_atom_index",
+                "table_target_id",
+                "source_row_index",
+                "row_text",
+                "retrieval_rules_version",
+                "built_at",
+                "row_search_tsv",
+            ],
+        )
+        with self.engine.connect() as conn:
+            empty_manifest_default = conn.execute(
+                text(
+                    "SELECT column_default FROM information_schema.columns "
+                    "WHERE table_schema = 'disclosure_core' "
+                    "AND table_name = 'unit_search_projection' "
+                    "AND column_name = 'row_atom_manifest_hash'"
+                )
+            ).scalar_one()
+        self.assertIn(
+            "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5"
+            "ed12ab4d8e11ba873c2f11161202b945",
+            str(empty_manifest_default),
+        )
 
     def _restore_migration_head(self) -> None:
         restored = self._alembic("upgrade", "head")
         self.assertEqual(restored.returncode, 0, restored.stderr[-500:])
+
+    def test_migration_0044_reupgrade_repairs_retained_v5_parent(self) -> None:
+        self.addCleanup(self._restore_migration_head)
+        suffix = os.urandom(4).hex()
+        ids = self._seed_two_units(suffix)
+        table = (
+            '<table><tr><td colspan="3">交流要点</td></tr>'
+            "<tr><td>序号</td><td>提问内容</td><td>回复内容</td></tr>"
+            "<tr><td>1</td><td>问题一?</td><td>回答一。</td></tr>"
+            "<tr><td>2</td><td>问题二?</td><td>回答二。</td></tr>"
+            "</table>"
+        )
+        try:
+            with Session(self.engine) as session:
+                body_unit = session.get(DocumentUnit, ids["body_hit"])
+                assert body_unit is not None
+                body_unit.payload_kind = "table"
+                body_unit.payload = {
+                    "table_body": table,
+                    "table_caption": ["交流要点"],
+                    "table_footnote": [],
+                }
+                body_unit.artifact_locator = _table_search_locator(2)
+                session.commit()
+            first = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=True)
+            )
+            self.assertEqual(first.projected, 2)
+
+            down = self._alembic("downgrade", "0043_visual_only_body_status")
+            self.assertEqual(down.returncode, 0, down.stderr[-500:])
+            up = self._alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, up.stderr[-500:])
+            with self.engine.connect() as conn:
+                pre_repair = conn.execute(
+                    text(
+                        "SELECT retrieval_rules_version, "
+                        "row_atom_manifest_ready, row_atom_count "
+                        "FROM disclosure_core.unit_search_projection "
+                        "WHERE asset_id = :asset"
+                    ),
+                    {"asset": ids["body_hit"]},
+                ).one()
+            self.assertEqual(
+                pre_repair.retrieval_rules_version,
+                tokenizer.RETRIEVAL_RULES_VERSION,
+            )
+            self.assertFalse(pre_repair.row_atom_manifest_ready)
+            self.assertEqual(pre_repair.row_atom_count, 0)
+
+            repaired = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False, prune=False)
+            )
+            self.assertEqual(repaired.projected, 2)
+            with self.engine.connect() as conn:
+                post_repair = conn.execute(
+                    text(
+                        "SELECT row_atom_manifest_ready, row_atom_count FROM "
+                        "disclosure_core.unit_search_projection "
+                        "WHERE asset_id = :asset"
+                    ),
+                    {"asset": ids["body_hit"]},
+                ).one()
+                child_count = int(
+                    conn.execute(
+                        text(
+                            "SELECT count(*) FROM "
+                            "disclosure_core.unit_search_row_atom "
+                            "WHERE asset_id = :asset"
+                        ),
+                        {"asset": ids["body_hit"]},
+                    ).scalar_one()
+                )
+            self.assertTrue(post_repair.row_atom_manifest_ready)
+            self.assertEqual(post_repair.row_atom_count, 2)
+            self.assertEqual(child_count, 2)
+        finally:
+            self._cleanup(ids)
 
     # -- full rebuild: count + ts_rank ordering + trgm substring -----------
     def test_full_rebuild_counts_ranks_title_over_body_and_trgm(self) -> None:
@@ -276,6 +387,227 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     )
                 )
             self.assertIn("ix_unit_search_atom_text_trgm", plan)
+        finally:
+            self._cleanup(ids)
+
+    def test_qa_row_atoms_require_question_and_answer_terms_in_one_source_row(self) -> None:
+        suffix = os.urandom(4).hex()
+        ids = self._seed_two_units(suffix)
+        try:
+            table = (
+                '<table><tr><td colspan="3">交流要点</td></tr>'
+                "<tr><td>序号</td><td>提问内容</td><td>回复内容</td></tr>"
+                "<tr><td>1</td><td>能繁母猪数量？</td><td>期末312.9万头。</td></tr>"
+                "<tr><td>2</td><td>AI时代如何发展？</td><td>构建产业互联平台。</td></tr>"
+                "</table>"
+            )
+            with Session(self.engine) as session:
+                body_unit = session.get(DocumentUnit, ids["body_hit"])
+                assert body_unit is not None
+                body_unit.payload_kind = "table"
+                body_unit.payload = {
+                    "table_body": table,
+                    "table_caption": ["交流要点"],
+                    "table_footnote": [],
+                }
+                body_unit.artifact_locator = _table_search_locator(2)
+                session.commit()
+            result = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=True)
+            )
+            self.assertEqual(result.projected, 2)
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT source_row_index, table_target_id, row_text "
+                        "FROM disclosure_public.unit_search_row_atoms_v1 "
+                        "WHERE asset_id = :asset ORDER BY row_atom_index"
+                    ),
+                    {"asset": ids["body_hit"]},
+                ).all()
+            self.assertEqual(
+                rows,
+                [
+                    (2, "block:2:payload:0", "1 能繁母猪数量? 期末312.9万头。"),
+                    (3, "block:2:payload:0", "2 ai时代如何发展? 构建产业互联平台。"),
+                ],
+            )
+
+            def row_hits(query: str) -> list[str]:
+                with self.engine.connect() as conn:
+                    return list(
+                        conn.execute(
+                            text(
+                                "SELECT asset_id FROM "
+                                "disclosure_public.unit_search_row_atoms_v1 "
+                                "WHERE row_search_tsv @@ to_tsquery('simple', :q) "
+                                "ORDER BY asset_id"
+                            ),
+                            {"q": tokenizer.build_search_tsquery(query)},
+                        ).scalars()
+                    )
+
+            self.assertEqual(
+                row_hits("能繁母猪 312.9万头"),
+                [ids["body_hit"]],
+            )
+            self.assertEqual(
+                row_hits("AI时代 构建产业互联平台"),
+                [ids["body_hit"]],
+            )
+            self.assertEqual(row_hits("能繁母猪 构建产业互联平台"), [])
+
+            # The private manifest makes delta's caught-up proof include the
+            # optional row children, not only their parent version.  A missing
+            # child must select and replace the complete owning run.
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "DELETE FROM disclosure_core.unit_search_row_atom "
+                        "WHERE asset_id = :asset AND row_atom_index = 1"
+                    ),
+                    {"asset": ids["body_hit"]},
+                )
+            repaired = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False, prune=False)
+            )
+            self.assertEqual(repaired.projected, 2)
+            with self.engine.connect() as conn:
+                repaired_rows = conn.execute(
+                    text(
+                        "SELECT row_atom_index, source_row_index FROM "
+                        "disclosure_core.unit_search_row_atom "
+                        "WHERE asset_id = :asset ORDER BY row_atom_index"
+                    ),
+                    {"asset": ids["body_hit"]},
+                ).all()
+            self.assertEqual(repaired_rows, [(0, 2), (1, 3)])
+
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE disclosure_core.unit_search_row_atom SET "
+                        "row_atom_manifest_hash = :stale "
+                        "WHERE asset_id = :asset AND row_atom_index = 1"
+                    ),
+                    {
+                        "asset": ids["body_hit"],
+                        "stale": "sha256:" + "0" * 64,
+                    },
+                )
+            stale_repaired = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False, prune=False)
+            )
+            self.assertEqual(stale_repaired.projected, 2)
+
+            with self.engine.begin() as conn:
+                manifest_hash = conn.execute(
+                    text(
+                        "SELECT row_atom_manifest_hash FROM "
+                        "disclosure_core.unit_search_projection "
+                        "WHERE asset_id = :asset"
+                    ),
+                    {"asset": ids["body_hit"]},
+                ).scalar_one()
+                conn.execute(
+                    text(
+                        "INSERT INTO disclosure_core.unit_search_row_atom "
+                        "(asset_id, row_atom_index, table_target_id, "
+                        "source_row_index, row_text, row_tokens, "
+                        "row_atom_manifest_hash) VALUES "
+                        "(:asset, 2, 'extra-target', 99, 'extra row', "
+                        "'extra row', :manifest_hash)"
+                    ),
+                    {
+                        "asset": ids["body_hit"],
+                        "manifest_hash": manifest_hash,
+                    },
+                )
+            extra_repaired = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False, prune=False)
+            )
+            self.assertEqual(extra_repaired.projected, 2)
+            with self.engine.connect() as conn:
+                final_child_count = int(
+                    conn.execute(
+                        text(
+                            "SELECT count(*) FROM "
+                            "disclosure_core.unit_search_row_atom "
+                            "WHERE asset_id = :asset"
+                        ),
+                        {"asset": ids["body_hit"]},
+                    ).scalar_one()
+                )
+            self.assertEqual(final_child_count, 2)
+        finally:
+            self._cleanup(ids)
+
+    def test_unsafe_qa_row_atom_is_omitted_while_parent_windows_remain(self) -> None:
+        suffix = os.urandom(4).hex()
+        ids = self._seed_two_units(suffix)
+        oversized_answer = " ".join(
+            f"rowlexeme{index}" for index in range(16_384)
+        )
+        table = (
+            '<table><tr><td colspan="3">交流要点</td></tr>'
+            "<tr><td>序号</td><td>提问内容</td><td>回复内容</td></tr>"
+            f"<tr><td>1</td><td>超长问题?</td><td>{oversized_answer}</td></tr>"
+            "</table>"
+        )
+        try:
+            with Session(self.engine) as session:
+                body_unit = session.get(DocumentUnit, ids["body_hit"])
+                assert body_unit is not None
+                body_unit.payload_kind = "table"
+                body_unit.payload = {
+                    "table_body": table,
+                    "table_caption": ["交流要点"],
+                    "table_footnote": [],
+                }
+                body_unit.artifact_locator = _table_search_locator(2)
+                session.commit()
+
+            result = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=True)
+            )
+            self.assertEqual(result.projected, 2)
+            self.assertEqual(result.failures, ())
+            with self.engine.connect() as conn:
+                parent = conn.execute(
+                    text(
+                        "SELECT body_search_windowed FROM "
+                        "disclosure_core.unit_search_projection "
+                        "WHERE asset_id = :asset"
+                    ),
+                    {"asset": ids["body_hit"]},
+                ).one()
+                window_count = int(
+                    conn.execute(
+                        text(
+                            "SELECT count(*) FROM "
+                            "disclosure_core.unit_body_search_window "
+                            "WHERE asset_id = :asset"
+                        ),
+                        {"asset": ids["body_hit"]},
+                    ).scalar_one()
+                )
+                row_atom_count = int(
+                    conn.execute(
+                        text(
+                            "SELECT count(*) FROM "
+                            "disclosure_core.unit_search_row_atom "
+                            "WHERE asset_id = :asset"
+                        ),
+                        {"asset": ids["body_hit"]},
+                    ).scalar_one()
+                )
+            self.assertTrue(parent.body_search_windowed)
+            self.assertGreaterEqual(window_count, 2)
+            self.assertEqual(row_atom_count, 0)
+            quiet = BuildSearchProjection(engine=self.engine).execute(
+                BuildSearchProjectionCommand(full=False, prune=False)
+            )
+            self.assertEqual(quiet.projected, 0)
         finally:
             self._cleanup(ids)
 
@@ -466,6 +798,27 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
             self.assertEqual(second.deleted, 0)
             self.assertEqual(second.skipped, 0)
             self.assertEqual(self._projection_count(), 2)
+            with self.engine.connect() as conn:
+                empty_row_manifests = set(
+                    conn.execute(
+                        text(
+                            "SELECT row_atom_manifest_hash FROM "
+                            "disclosure_core.unit_search_projection "
+                            "WHERE asset_id IN (:a, :b)"
+                        ),
+                        {
+                            "a": ids_map["title_hit"],
+                            "b": ids_map["body_hit"],
+                        },
+                    ).scalars()
+                )
+            self.assertEqual(
+                empty_row_manifests,
+                {
+                    "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5"
+                    "ed12ab4d8e11ba873c2f11161202b945"
+                },
+            )
 
             # A non-windowed parent with a leftover child is not a closed
             # projection. Delta must select the owning run and replace it,
@@ -1042,7 +1395,6 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     order_index=1,
                     payload={"text": "期末余额说明"},
                     content_hash=f"h1_{suffix}",
-                    semantic_key="receivable_aging",
                     semantic_keys=["receivable_aging"],
                     artifact_locator=_text_search_locator(1),
                 )
@@ -1058,7 +1410,6 @@ class SearchProjectionIntegrationTests(unittest.TestCase):
                     order_index=2,
                     payload={"text": "应收账款"},
                     content_hash=f"h2_{suffix}",
-                    semantic_key="credit_impairment_loss",
                     semantic_keys=["credit_impairment_loss"],
                     artifact_locator=_text_search_locator(2),
                 )

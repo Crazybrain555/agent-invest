@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +53,16 @@ def _ordered_string_list(value: object, *, field: str) -> list[str]:
     return value
 
 
+def _normalized_entropy(counts: Mapping[Any, int]) -> float:
+    total = sum(counts.values())
+    if total == 0 or len(counts) <= 1:
+        return 0.0
+    entropy = -sum(
+        (count / total) * math.log(count / total) for count in counts.values()
+    )
+    return round(entropy / math.log(len(counts)), 6)
+
+
 def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any]:
     if evaluation.get("contract_version") not in {
         "semantic_route_model_eval.v1",
@@ -80,6 +92,10 @@ def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any
     decision_sources: Counter[str] = Counter()
     route_cardinality: Counter[int] = Counter()
     section_cardinality: Counter[int] = Counter()
+    direct_key_frequency: Counter[str] = Counter()
+    section_key_frequency: Counter[str] = Counter()
+    section_array_frequency: Counter[tuple[str, ...]] = Counter()
+    partition: Counter[str] = Counter()
     coverage_by_type: dict[str, Counter[str]] = defaultdict(Counter)
     for row in row_by_identity.values():
         source = row.get("decision_source")
@@ -93,6 +109,21 @@ def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any
         decision_sources[source] += 1
         route_cardinality[len(keys)] += 1
         section_cardinality[len(section_keys)] += 1
+        direct_key_frequency.update(keys)
+        section_key_frequency.update(section_keys)
+        if section_keys:
+            section_array_frequency[tuple(section_keys)] += 1
+        partition[
+            (
+                "both"
+                if keys and section_keys
+                else "direct_only"
+                if keys
+                else "section_only"
+                if section_keys
+                else "neither"
+            )
+        ] += 1
         coverage_by_type[filing_type]["rows"] += 1
         coverage_by_type[filing_type]["routed" if keys else "null"] += 1
         coverage_by_type[filing_type][
@@ -184,17 +215,17 @@ def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any
             )
             actual_set = set(actual)
             actual_section_set = set(actual_sections)
-            if expected is not None and actual_set != set(expected):
-                reasons.append("exact_route_set_differs")
+            if expected is not None and actual != expected:
+                reasons.append("exact_route_order_differs")
             if not set(required).issubset(actual_set):
                 reasons.append("required_route_missing")
             if set(forbidden) & actual_set:
                 reasons.append("forbidden_route_selected")
             if (
                 expected_sections is not None
-                and actual_section_set != set(expected_sections)
+                and actual_sections != expected_sections
             ):
-                reasons.append("exact_section_set_differs")
+                reasons.append("exact_section_order_differs")
             if not set(required_sections).issubset(actual_section_set):
                 reasons.append("required_section_missing")
             if set(forbidden_sections) & actual_section_set:
@@ -228,6 +259,14 @@ def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any
         if row.get("semantic_keys") or row.get("section_keys")
     )
     row_count = len(row_by_identity)
+    direct_assignments = sum(size * count for size, count in route_cardinality.items())
+    section_assignments = sum(
+        size * count for size, count in section_cardinality.items()
+    )
+    multi_direct = sum(
+        count for size, count in route_cardinality.items() if size > 1
+    )
+    top_section_rows = max(section_key_frequency.values(), default=0)
     return {
         "contract_version": "semantic_route_gold_review.v1",
         "evaluation_id": evaluation.get("evaluation_id"),
@@ -250,6 +289,64 @@ def review(*, evaluation: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any
             "retrievable_rate": (
                 round(retrievable / row_count, 6) if row_count else 0.0
             ),
+            "partition": {
+                key: partition[key]
+                for key in ("direct_only", "section_only", "both", "neither")
+            },
+            "direct": {
+                "routed_rows": routed,
+                "null_rows": row_count - routed,
+                "assignments": direct_assignments,
+                "distinct_keys": len(direct_key_frequency),
+                "multi_key_rows": multi_direct,
+                "multi_key_rate": (
+                    round(multi_direct / row_count, 6) if row_count else 0.0
+                ),
+                "mean_keys_per_row": (
+                    round(direct_assignments / row_count, 6) if row_count else 0.0
+                ),
+                "mean_keys_per_routed_row": (
+                    round(direct_assignments / routed, 6) if routed else 0.0
+                ),
+                "key_assignment_entropy": _normalized_entropy(
+                    direct_key_frequency
+                ),
+                "top_keys": [
+                    {"key": key, "rows": count}
+                    for key, count in direct_key_frequency.most_common(20)
+                ],
+            },
+            "section": {
+                "routed_rows": section_routed,
+                "null_rows": row_count - section_routed,
+                "assignments": section_assignments,
+                "distinct_keys": len(section_key_frequency),
+                "distinct_arrays": len(section_array_frequency),
+                "mean_keys_per_row": (
+                    round(section_assignments / row_count, 6)
+                    if row_count
+                    else 0.0
+                ),
+                "mean_keys_per_routed_row": (
+                    round(section_assignments / section_routed, 6)
+                    if section_routed
+                    else 0.0
+                ),
+                "top_key_row_share": (
+                    round(top_section_rows / row_count, 6) if row_count else 0.0
+                ),
+                "key_assignment_entropy": _normalized_entropy(
+                    section_key_frequency
+                ),
+                "top_keys": [
+                    {"key": key, "rows": count}
+                    for key, count in section_key_frequency.most_common(20)
+                ],
+                "top_arrays": [
+                    {"keys": list(keys), "rows": count}
+                    for keys, count in section_array_frequency.most_common(20)
+                ],
+            },
             "decision_sources": dict(sorted(decision_sources.items())),
             "route_cardinality": {
                 str(size): count for size, count in sorted(route_cardinality.items())

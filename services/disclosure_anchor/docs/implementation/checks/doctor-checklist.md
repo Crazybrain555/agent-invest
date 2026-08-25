@@ -70,10 +70,14 @@ MODELSCOPE_CACHE 指向外置盘
                                 所选 primary artifact 与 artifact_hash 匹配
   failed run    → 只要求结构化 error 存在（合法 JSON），不报 artifact 缺失
   unit_build_status='succeeded' → document_units_relpath 存在且快照哈希与 DB 聚合一致
+  receipt v2 → relpath/version/hash/逐行闭合 contract、Unit count 与 semantic summary 一致
+  unit_build_status='failed' → unit_build_error 是 SQL object，且进入 retry/dead-letter 可见面
+  active semantic_adjudication_status='degraded_unavailable' → WARN，不得以 parse success 掩盖
 抽样 document_unit.artifact_locator 是否可回指
 每个 document 最多一个 current active run
 outbox seq 单调递增（空洞 → WARN）
 stale running run（超龄阈值经 queries.py helper 施加）→ WARN
+Unit build retrying / dead letters → WARN / FAIL；修复入口为显式 rebuild-units
 孤儿 raw/artifact 文件 → 报告不报错（05-S8 的 FS-先行 orphan 是合法状态）
 ```
 
@@ -89,4 +93,5 @@ FAIL/WARN 封闭分级表与退出码以 **milestone 08 §3.6 为唯一权威**
 [WARN] stale running run: processing_run_id=..., age=...
 ```
 
-doctor 失败时不得自动修复数据。自动修复必须单独命令，并需要显式确认。
+doctor 还必须确认 `DATABASE_URL` 当前用户是非 superuser `disclosure_app`；migration owner DSN
+不得作为 worker/pipeline 回退。doctor 失败时不得自动修复数据。自动修复必须单独命令，并需要显式确认。

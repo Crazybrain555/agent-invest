@@ -140,6 +140,9 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
             "provider_document.v1.json",
             "derived/document_unit_snapshots/doc/active/document_units.v1.jsonl",
             "sha256:" + "a" * 64,
+            "derived/document_unit_snapshots/doc/active/"
+            "semantic_route_receipts.v2.jsonl",
+            "semantic_route_receipt.v2",
         )
         inactive = (
             "parser_artifacts/cninfo/000001/doc/inactive",
@@ -148,6 +151,8 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
             "provider_document.v1.json",
             "derived/document_unit_snapshots/doc/inactive/document_units.v1.jsonl",
             "sha256:" + "b" * 64,
+            None,
+            None,
         )
         conn = MagicMock()
         conn.execute.return_value = [active, inactive]
@@ -171,7 +176,7 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
                 active[3],
                 inactive[3],
                 "derived/document_unit_snapshots/doc/active/"
-                "semantic_route_receipts.v1.jsonl",
+                "semantic_route_receipts.v2.jsonl",
                 "derived/document_unit_snapshots/doc/inactive/"
                 "semantic_route_receipts.v1.jsonl",
             },
@@ -180,7 +185,7 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
             self._file(relpath)
         self._file(
             "derived/document_unit_snapshots/doc/active/"
-            "semantic_route_receipts.v1.jsonl"
+            "semantic_route_receipts.v2.jsonl"
         )
         self._file(
             "derived/document_unit_snapshots/doc/inactive/"
@@ -203,7 +208,7 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
             "derived/document_unit_snapshots/doc/run/document_units.v1.jsonl"
         )
         conn = MagicMock()
-        conn.execute.return_value = [(None, None, None, units_relpath, None)]
+        conn.execute.return_value = [(None, None, None, units_relpath, None, None, None)]
         receipt = self._file(
             "derived/document_unit_snapshots/doc/run/"
             "semantic_route_receipts.v1.jsonl"

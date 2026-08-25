@@ -16,6 +16,7 @@ from disclosure_anchor.adapters.db.postgres.connection import (
     app_database_url,
     create_db_engine,
     reader_database_url,
+    require_runtime_reader_engine,
 )
 from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
 from disclosure_anchor.adapters.runtime.doctor import (
@@ -50,14 +51,16 @@ def create_app(settings: Settings | None = None, *, validate_runtime: bool = Tru
     elif resolved_settings.database_url is not None:
         app_engine = create_db_engine(app_database_url(resolved_settings))
 
-    if resolved_settings.disclosure_reader_database_url is not None:
-        reader_url = reader_database_url(resolved_settings)
-        if app_engine is not None and reader_url == app_database_url(resolved_settings):
-            reader_engine = app_engine
-        else:
-            reader_engine = create_db_engine(reader_url)
-    else:
-        reader_engine = app_engine
+    if app_engine is not None:
+        try:
+            reader_engine = create_db_engine(reader_database_url(resolved_settings))
+            if validate_runtime:
+                require_runtime_reader_engine(reader_engine)
+        except BaseException:
+            if reader_engine is not None:
+                reader_engine.dispose()
+            app_engine.dispose()
+            raise
 
     app = FastAPI(title="disclosure_anchor", version="0.1.0")
     install_error_handlers(app)

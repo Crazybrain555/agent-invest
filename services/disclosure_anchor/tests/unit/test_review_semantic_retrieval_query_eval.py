@@ -61,9 +61,56 @@ class ReviewSemanticRetrievalQueryEvalTests(unittest.TestCase):
         self.assertTrue(result["query_hash_bound"])
         self.assertEqual(result["metrics"]["grade3_recall_at_20"], 1.0)
         self.assertEqual(result["metrics"]["narrow_returned_precision_at_5"], 1.0)
+        self.assertIn("without_section", result["ablation_metrics"])
+        self.assertIn("without_section", result["contribution_delta_from_full"])
         broad = result["results"][1]
         self.assertEqual(broad["top"][0]["unit_index"], 2)
         self.assertNotIn(["pid", 3], broad["ablations"]["without_neighbors"])
+
+    def test_section_only_query_reports_positive_section_contribution(self) -> None:
+        evaluation = _evaluation()
+        evaluation["rows"][3]["section_keys"] = ["governance"]
+        gold = {
+            "contract_version": "semantic_retrieval_query_gold.v4",
+            "_about": "section ablation contribution test",
+            "evaluation_id": "eval",
+            "taxonomy_version": "taxonomy",
+            "router_version": "router",
+            "judged_units": [
+                ["pid", 0, _HASH, _CONTENT_HASH],
+                ["pid", 3, _HASH, _CONTENT_HASH],
+            ],
+            "thresholds": _permissive_thresholds(),
+            "cases": [
+                _case("narrow", "收入", qrels=[["pid", 0, 3]]),
+                _case(
+                    "broad",
+                    "结构定位",
+                    qrels=[["pid", 3, 3]],
+                    section_keys_any=["governance"],
+                ),
+            ],
+        }
+
+        result = review(
+            evaluation=evaluation,
+            gold=gold,
+            search_rows=_search_rows(),
+        )
+
+        broad = result["results"][1]
+        self.assertEqual(broad["metrics"]["ndcg_at_10"], 1.0)
+        self.assertEqual(
+            broad["ablation_metrics"]["without_section"]["ndcg_at_10"],
+            0.0,
+        )
+        self.assertEqual(result["contributed_case_count"]["without_section"], 1)
+        self.assertGreater(
+            result["contribution_delta_from_full"]["without_section"][
+                "ndcg_at_10"
+            ],
+            0.0,
+        )
 
     def test_graded_review_rejects_stale_live_projection(self) -> None:
         search_rows = _search_rows()
@@ -93,6 +140,35 @@ class ReviewSemanticRetrievalQueryEvalTests(unittest.TestCase):
                         "max_grade0_top5": 5,
                         "max_mechanical_top10": 10,
                     },
+                    "cases": [
+                        _case("narrow", "收入", qrels=[["pid", 0, 3]]),
+                        _case("broad", "风险", qrels=[["pid", 2, 3]]),
+                    ],
+                },
+                search_rows=search_rows,
+            )
+
+    def test_graded_review_rejects_heading_only_direct_route(self) -> None:
+        search_rows = _search_rows()
+        search_rows[("pid", 0)]["body_status"] = "heading_only"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "non-content Units cannot carry direct semantic keys",
+        ):
+            review(
+                evaluation=_evaluation(),
+                gold={
+                    "contract_version": "semantic_retrieval_query_gold.v4",
+                    "_about": "body-status invariant test",
+                    "evaluation_id": "eval",
+                    "taxonomy_version": "taxonomy",
+                    "router_version": "router",
+                    "judged_units": [
+                        ["pid", 0, _HASH, _CONTENT_HASH],
+                        ["pid", 2, _HASH, _CONTENT_HASH],
+                    ],
+                    "thresholds": _permissive_thresholds(),
                     "cases": [
                         _case("narrow", "收入", qrels=[["pid", 0, 3]]),
                         _case("broad", "风险", qrels=[["pid", 2, 3]]),
@@ -188,7 +264,8 @@ class ReviewSemanticRetrievalQueryEvalTests(unittest.TestCase):
         )
         search_rows = _search_rows()
         search_rows[("pid", 4)] = {
-            "contract_version": "document_unit.v2",
+            "contract_version": "document_unit.v1",
+            "body_status": "content",
             "content_hash": _CONTENT_HASH,
             "query_projection_hash": _HASH,
             "title_text": "其他正文",
@@ -234,11 +311,11 @@ class ReviewSemanticRetrievalQueryEvalTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["metrics"]["grade2_recall_at_20"], 0.5)
         self.assertEqual(result["results"][0]["top"][0]["unit_index"], 0)
 
-    def test_graded_review_rejects_deprecated_unit_surface(self) -> None:
+    def test_graded_review_rejects_noncanonical_unit_surface(self) -> None:
         search_rows = _search_rows()
-        search_rows[("pid", 0)]["contract_version"] = "document_unit.v1"
+        search_rows[("pid", 0)]["contract_version"] = "document_unit.v2"
 
-        with self.assertRaisesRegex(ValueError, "not from document_unit.v2"):
+        with self.assertRaisesRegex(ValueError, "not from document_unit.v1"):
             review(
                 evaluation=_evaluation(),
                 gold={
@@ -500,7 +577,8 @@ def _evaluation() -> dict[str, object]:
 def _search_rows() -> dict[tuple[str, int], dict[str, object]]:
     return {
         ("pid", 0): {
-            "contract_version": "document_unit.v2",
+            "contract_version": "document_unit.v1",
+            "body_status": "content",
             "content_hash": _CONTENT_HASH,
             "query_projection_hash": _HASH,
             "title_text": "营业收入",
@@ -509,7 +587,8 @@ def _search_rows() -> dict[tuple[str, int], dict[str, object]]:
             "atom_text": "营业收入增长",
         },
         ("pid", 1): {
-            "contract_version": "document_unit.v2",
+            "contract_version": "document_unit.v1",
+            "body_status": "content",
             "content_hash": _CONTENT_HASH,
             "query_projection_hash": _HASH,
             "title_text": "目录",
@@ -518,7 +597,8 @@ def _search_rows() -> dict[tuple[str, int], dict[str, object]]:
             "atom_text": "",
         },
         ("pid", 2): {
-            "contract_version": "document_unit.v2",
+            "contract_version": "document_unit.v1",
+            "body_status": "content",
             "content_hash": _CONTENT_HASH,
             "query_projection_hash": _HASH,
             "title_text": "风险管理",
@@ -527,7 +607,8 @@ def _search_rows() -> dict[tuple[str, int], dict[str, object]]:
             "atom_text": "",
         },
         ("pid", 3): {
-            "contract_version": "document_unit.v2",
+            "contract_version": "document_unit.v1",
+            "body_status": "content",
             "content_hash": _CONTENT_HASH,
             "query_projection_hash": _HASH,
             "title_text": "应对措施",

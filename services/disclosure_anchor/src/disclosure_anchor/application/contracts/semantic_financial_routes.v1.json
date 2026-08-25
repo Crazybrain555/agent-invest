@@ -1,6 +1,6 @@
 {
-  "version": "semantic-financial-2026-08-r21",
-  "_about": "受控财务披露主题路由词表。labels 来自证监会财务报告一般规定、年报固定章节与银行定期报告监管章节；授权标准化标题精确命中、闭集候选生成，以及正文中指标名紧接数值或变化结果的 Unit 直接主题。历史、风险、条件、计划和因果属于 L2 模态，不抹掉该主题；无相邻主题证据的宽泛数字仍不授权。context_container_keys 仅允许已接受 heading_path 的精确结构上下文进入独立 section_keys。",
+  "version": "semantic-financial-2026-08-r34",
+  "_about": "受控财务披露主题路由词表。labels 来自证监会财务报告一般规定、年报固定章节与银行定期报告监管章节；授权标准化标题精确命中、闭集候选生成，以及正文中指标名紧接数值或变化结果的 Unit 直接主题。历史、风险、条件、计划和因果属于 L2 模态，不抹掉该主题；无相邻主题证据的宽泛数字仍不授权。任何同 scope 的精确 accepted heading_path 可进入独立 section_keys；context_container_keys 只标识不参与直接主题候选的纯结构容器。",
   "exclusive_container_keys": [
     "balance_sheet",
     "balance_sheet_parent",
@@ -33,6 +33,8 @@
     "interests_in_other_entities",
     "internal_control",
     "investment_analysis",
+    "major_contracts",
+    "non_fundraising_usage",
     "parent_company_notes",
     "related_party_note",
     "risk_management",
@@ -47,8 +49,112 @@
         "governance",
         "environment_social"
       ]
+    },
+    {
+      "label": "公司简介和主要财务指标",
+      "keys": [
+        "company_profile",
+        "company_profile_metrics"
+      ]
+    },
+    {
+      "label": "合并和公司资产负债表",
+      "keys": [
+        "balance_sheet",
+        "balance_sheet_parent"
+      ]
+    },
+    {
+      "label": "合并和银行资产负债表",
+      "keys": [
+        "balance_sheet",
+        "balance_sheet_parent"
+      ]
+    },
+    {
+      "label": "合并和公司利润表",
+      "keys": [
+        "income_statement",
+        "income_statement_parent"
+      ]
+    },
+    {
+      "label": "合并和银行利润表",
+      "keys": [
+        "income_statement",
+        "income_statement_parent"
+      ]
+    },
+    {
+      "label": "合并和公司现金流量表",
+      "keys": [
+        "cash_flow_statement",
+        "cash_flow_statement_parent"
+      ]
+    },
+    {
+      "label": "合并和银行现金流量表",
+      "keys": [
+        "cash_flow_statement",
+        "cash_flow_statement_parent"
+      ]
+    },
+    {
+      "label": "合并和公司所有者权益变动表",
+      "keys": [
+        "equity_statement",
+        "equity_statement_parent"
+      ]
+    },
+    {
+      "label": "合并和公司股东权益变动表",
+      "keys": [
+        "equity_statement",
+        "equity_statement_parent"
+      ]
+    },
+    {
+      "label": "合并和银行所有者权益变动表",
+      "keys": [
+        "equity_statement",
+        "equity_statement_parent"
+      ]
+    },
+    {
+      "label": "合并和银行股东权益变动表",
+      "keys": [
+        "equity_statement",
+        "equity_statement_parent"
+      ]
     }
   ],
+  "composite_direct_labels": [
+    {
+      "label": "存贷款情况",
+      "keys": [
+        "bank_customer_deposits",
+        "bank_loans_advances"
+      ]
+    },
+    {
+      "label": "存、贷款情况",
+      "keys": [
+        "bank_customer_deposits",
+        "bank_loans_advances"
+      ]
+    }
+  ],
+  "event_scope_extensions": {
+    "accounting_changes": [
+      "risk_alert"
+    ],
+    "asset_impairment_loss": [
+      "risk_alert"
+    ],
+    "credit_impairment_loss": [
+      "risk_alert"
+    ]
+  },
   "quantitative_topic_keys": [
     "accounts_payable",
     "accounts_receivable",
@@ -58,6 +164,7 @@
     "asset_impairment_loss",
     "bank_asset_securitization_exposure",
     "bank_capital_adequacy",
+    "bank_regulatory_indicators",
     "bank_customer_deposits",
     "bank_derivatives",
     "bank_fee_commission_income",
@@ -179,6 +286,9 @@
       ],
       "aliases": [
         "应收票据及应收账款"
+      ],
+      "heading_aliases": [
+        "期末公司已背书或贴现且在资产负债表日尚未到期的应收票据"
       ]
     },
     "accounts_receivable": {
@@ -222,6 +332,18 @@
       ],
       "aliases": [
         "存货跌价准备的确认标准和计提方法"
+      ],
+      "heading_aliases": [
+        "存货分析",
+        "存货明细表",
+        "存货可变现净值",
+        "房地产开发项目存货的减值",
+        "按照组合计提存货跌价准备的组合类别及确定依据、不同类别存货可变现净值的确定依据",
+        "存货类别、发出计价方法、盘存制度、低值易耗品和包装物的摊销方法",
+        "存货类别",
+        "发出存货的计价方法",
+        "存货的盘存制度",
+        "低值易耗品和包装物的摊销方法"
       ]
     },
     "held_for_sale": {
@@ -229,7 +351,11 @@
         "持有待售资产",
         "持有待售负债"
       ],
-      "aliases": []
+      "aliases": [],
+      "heading_aliases": [
+        "持有待售的非流动资产或处置组",
+        "划分为持有待售的非流动资产或处置组的确认标准和会计处理方法"
+      ]
     },
     "noncurrent_due_within_one_year": {
       "names": [
@@ -311,7 +437,9 @@
       "names": [
         "生产性生物资产"
       ],
-      "aliases": []
+      "aliases": [
+        "消耗性生物资产"
+      ]
     },
     "borrowing_costs": {
       "names": [
@@ -335,7 +463,10 @@
       "names": [
         "无形资产"
       ],
-      "aliases": []
+      "aliases": [],
+      "heading_aliases": [
+        "土地使用权"
+      ]
     },
     "development_expenditure": {
       "names": [
@@ -378,6 +509,9 @@
       "aliases": [
         "所有权或使用权受限的资产",
         "主要资产被查封、扣押、冻结的情况"
+      ],
+      "heading_aliases": [
+        "截至报告期末主要资产受限情况"
       ]
     },
     "short_term_borrowings": {
@@ -453,6 +587,10 @@
         "职工薪酬",
         "短期薪酬的会计处理方法",
         "离职后福利的会计处理方法"
+      ],
+      "heading_aliases": [
+        "辞退福利的会计处理方法",
+        "其他长期职工福利的会计处理方法"
       ]
     },
     "taxes_payable": {
@@ -528,6 +666,10 @@
         "优先股股东情况",
         "截至报告期末的优先股股东数量及持股情况",
         "优先股赎回情况"
+      ],
+      "heading_aliases": [
+        "优先股相关情况",
+        "公司优先股股东总数及前10名优先股股东持股情况表"
       ]
     },
     "capital_reserve": {
@@ -582,8 +724,17 @@
         "收入确认和计量的会计政策"
       ],
       "aliases": [
+        "收入确认和计量所采用的会计政策",
         "收入确认政策",
-        "收入"
+        "收入",
+        "销售产品",
+        "提供劳务",
+        "合同成本",
+        "合同履约成本"
+      ],
+      "heading_aliases": [
+        "收入的确认",
+        "附有产品质量保证的销售"
       ]
     },
     "taxes_and_surcharges": {
@@ -618,7 +769,11 @@
         "研发费用",
         "研发投入"
       ],
-      "aliases": []
+      "aliases": [],
+      "heading_aliases": [
+        "研究开发费用加计扣除",
+        "研发费用加计扣除"
+      ]
     },
     "other_income": {
       "names": [
@@ -648,14 +803,18 @@
       "names": [
         "信用减值损失"
       ],
-      "aliases": []
+      "aliases": [],
+      "heading_aliases": [
+        "信用减值准备"
+      ]
     },
     "asset_impairment_loss": {
       "names": [
         "资产减值损失"
       ],
       "aliases": [
-        "资产减值准备"
+        "资产减值准备",
+        "长期资产减值"
       ]
     },
     "asset_disposal_income": {
@@ -758,7 +917,8 @@
         "编制基础"
       ],
       "aliases": [
-        "持续经营"
+        "持续经营",
+        "与持续经营相关的重大不确定性"
       ]
     },
     "accounting_policies": {
@@ -782,6 +942,11 @@
       "aliases": [
         "重要会计政策和会计估计的变更",
         "前期差错更正"
+      ],
+      "heading_aliases": [
+        "会计政策变更的情况",
+        "变更前后采用的会计政策",
+        "本次会计政策变更对公司的影响"
       ]
     },
     "tax_items": {
@@ -800,9 +965,14 @@
         "合并范围变更"
       ],
       "aliases": [
+        "合并财务报表的编制方法",
         "非同一控制下企业合并",
         "同一控制下企业合并",
         "丧失子公司控制权"
+      ],
+      "heading_aliases": [
+        "控制的判断标准和合并财务报表的编制方法",
+        "与上年度财务报告相比，合并报表范围发生变化的情况说明"
       ]
     },
     "interests_in_other_entities": {
@@ -810,9 +980,13 @@
         "在其他主体中的权益"
       ],
       "aliases": [
+        "在合营企业或联营企业中的权益",
         "企业集团的构成",
         "重要非全资子公司",
         "合营企业和联营企业"
+      ],
+      "heading_aliases": [
+        "重要非全资子公司的主要财务信息"
       ]
     },
     "government_grants": {
@@ -838,7 +1012,24 @@
       ],
       "aliases": [
         "金融工具",
-        "金融资产和金融负债的抵销"
+        "金融资产和金融负债的抵销",
+        "金融资产的分类、确认与计量",
+        "以摊余成本计量的金融资产",
+        "金融资产的转移",
+        "财务担保合同",
+        "套期会计"
+      ],
+      "heading_aliases": [
+        "金融资产的分类",
+        "因转移而终止确认的金融资产",
+        "继续涉入的转移金融资产",
+        "金融负债",
+        "权益工具",
+        "金融负债和权益工具的分类",
+        "金融负债的分类 确认与计量",
+        "金融负债的分类、确认及计量",
+        "金融负债的终止确认",
+        "其他金融负债"
       ]
     },
     "fair_value_disclosure": {
@@ -848,7 +1039,13 @@
       ],
       "aliases": [
         "金融工具的公允价值",
+        "公允价值计量项目",
         "公允价值计量项目相关情况及持有外币金融资产和金融负债情况"
+      ],
+      "heading_aliases": [
+        "持有外币金融资产和金融负债情况",
+        "未以公允价值计量的金融资产和金融负债的公允价值情况",
+        "不以公允价值计量的金融资产和金融负债的公允价值情况"
       ]
     },
     "related_party_note": {
@@ -875,7 +1072,8 @@
       ],
       "aliases": [
         "重大承诺事项",
-        "重要承诺事项"
+        "重要承诺事项",
+        "或有负债"
       ]
     },
     "post_balance_sheet_events": {
@@ -884,6 +1082,9 @@
       ],
       "aliases": [
         "日后事项"
+      ],
+      "heading_aliases": [
+        "其他资产负债表日后事项说明"
       ]
     },
     "director_indemnity_insurance": {
@@ -901,6 +1102,7 @@
         "外币货币性项目"
       ],
       "aliases": [
+        "外币业务",
         "外币货币性资产",
         "外币货币性负债"
       ]
@@ -910,6 +1112,7 @@
         "外币财务报表折算差额"
       ],
       "aliases": [
+        "外币业务和外币报表折算",
         "外币报表折算差额",
         "外币财务报表折算",
         "境外经营财务报表折算"
@@ -923,7 +1126,11 @@
         "关联租赁情况",
         "经营租赁",
         "融资租赁",
+        "短期租赁和低价值资产租赁",
         "作为出租方租赁的分类标准和会计处理方法"
+      ],
+      "heading_aliases": [
+        "租赁情况"
       ]
     },
     "parent_company_notes": {
@@ -950,6 +1157,7 @@
       ],
       "aliases": [
         "加权平均净资产收益率",
+        "平均净资产收益率",
         "净资产收益率及每股收益"
       ]
     },
@@ -958,9 +1166,13 @@
         "审计报告",
         "审计意见"
       ],
-      "aliases": [
+      "aliases": []
+    },
+    "key_audit_matters": {
+      "names": [
         "关键审计事项"
-      ]
+      ],
+      "aliases": []
     },
     "important_notice": {
       "names": [
@@ -981,7 +1193,9 @@
         "财务概要",
         "财务业绩摘要",
         "会计数据和财务指标摘要",
-        "分季度主要财务指标"
+        "分季度主要财务指标",
+        "关键指标",
+        "补充财务比率"
       ]
     },
     "business_review": {
@@ -1010,6 +1224,9 @@
       ],
       "aliases": [
         "报告期内公司从事的业务情况"
+      ],
+      "heading_aliases": [
+        "主营业务情况"
       ]
     },
     "core_competitiveness": {
@@ -1027,6 +1244,9 @@
       "aliases": [
         "经营情况分析",
         "经营和财务状况分析"
+      ],
+      "heading_aliases": [
+        "经营情况的讨论与分析"
       ]
     },
     "customer_concentration": {
@@ -1072,6 +1292,9 @@
         "资产负债表分析",
         "资产及负债状况",
         "资产负债情况分析"
+      ],
+      "heading_aliases": [
+        "资产、负债情况分析"
       ]
     },
     "investment_analysis": {
@@ -1080,6 +1303,7 @@
       ],
       "aliases": [
         "公司投资情况",
+        "对外股权投资总体分析",
         "重大的股权投资",
         "重大的非股权投资",
         "以公允价值计量的金融资产"
@@ -1102,6 +1326,9 @@
         "主要控股、参股公司分析",
         "主要控股、参股企业分析",
         "主要子公司及对公司净利润影响达10%以上的参股公司情况"
+      ],
+      "heading_aliases": [
+        "重要非全资子公司的主要财务信息"
       ]
     },
     "structured_entities": {
@@ -1120,6 +1347,9 @@
         "未来发展的展望",
         "发展战略",
         "经营计划"
+      ],
+      "heading_aliases": [
+        "未来发展展望"
       ]
     },
     "governance": {
@@ -1162,10 +1392,17 @@
       ],
       "aliases": [
         "社会责任",
+        "社会责任情况",
         "环境保护",
         "乡村振兴",
+        "巩固拓展脱贫攻坚成果、乡村振兴的情况",
         "环境信息",
+        "环境信息披露情况",
         "环境、社会与治理情况综述"
+      ],
+      "heading_aliases": [
+        "ESG",
+        "纳入环境信息依法披露企业名单的上市公司及其主要子公司的环境信息情况"
       ]
     },
     "important_matters": {
@@ -1174,6 +1411,30 @@
       ],
       "aliases": [
         "公司子公司重大事项"
+      ]
+    },
+    "controlling_shareholder_profile": {
+      "names": [
+        "控股股东及实际控制人情况"
+      ],
+      "aliases": [
+        "控股股东情况",
+        "实际控制人情况"
+      ],
+      "heading_aliases": [
+        "控股股东或实际控制人变更情况"
+      ]
+    },
+    "share_pledge": {
+      "names": [
+        "股份质押"
+      ],
+      "aliases": [
+        "股权质押",
+        "累计质押股份"
+      ],
+      "heading_aliases": [
+        "控股股东股份质押情况"
       ]
     },
     "share_changes": {
@@ -1189,6 +1450,12 @@
         "普通股股东情况",
         "普通股股东总数及前十名股东持股情况",
         "普通股股东总数及前10名股东持股情况"
+      ],
+      "heading_aliases": [
+        "公司股东数量及持股情况",
+        "前10名股东持股情况表",
+        "前十名股东持股情况表",
+        "普通股股东和表决权恢复的优先股股东数量及前10名股东持股情况表"
       ]
     },
     "bonds_section": {
@@ -1201,6 +1468,93 @@
         "可转换公司债券",
         "债券",
         "债券偿还"
+      ],
+      "heading_aliases": [
+        "在半年度报告批准报出日存续的债券情况"
+      ]
+    },
+    "non_fundraising_usage": {
+      "names": [
+        "非募集资金使用情况"
+      ],
+      "aliases": [
+        "非募集资金投资情况"
+      ]
+    },
+    "major_contracts": {
+      "names": [
+        "重大合同及其履行情况"
+      ],
+      "aliases": [
+        "重大合同履行情况"
+      ]
+    },
+    "listed_securities_transactions": {
+      "names": [
+        "购买、出售或赎回本公司之上市证券"
+      ],
+      "aliases": [
+        "购买、出售或赎回上市证券"
+      ]
+    },
+    "securities_issuance_in_period": {
+      "names": [
+        "报告期内证券发行情况"
+      ],
+      "aliases": [
+        "报告期内证券发行与上市情况"
+      ]
+    },
+    "share_buyback_implementation": {
+      "names": [
+        "股份回购在报告期的具体实施情况"
+      ],
+      "aliases": [
+        "报告期内股份回购实施情况"
+      ]
+    },
+    "public_float_statement": {
+      "names": [
+        "公众持股量说明"
+      ],
+      "aliases": [
+        "关于公众持股量的说明"
+      ],
+      "heading_aliases": [
+        "按照《联交所上市规则》关于公众持股量的说明"
+      ]
+    },
+    "bond_option_investor_protection": {
+      "names": [
+        "发行人或投资者选择权条款、投资者保护条款的触发和执行情况"
+      ],
+      "aliases": [
+        "投资者保护条款的触发和执行情况"
+      ]
+    },
+    "bond_credit_rating_change": {
+      "names": [
+        "报告期内信用评级结果调整情况"
+      ],
+      "aliases": [
+        "信用评级结果调整情况"
+      ]
+    },
+    "bond_repayment_safeguards": {
+      "names": [
+        "担保情况、偿债计划及其他偿债保障措施在报告期内的执行情况和变化情况及对债券投资者权益的影响"
+      ],
+      "aliases": [
+        "偿债计划及偿债保障措施",
+        "偿债保障措施"
+      ]
+    },
+    "bond_major_loss_trigger": {
+      "names": [
+        "报告期内合并报表范围亏损超过上年末净资产10%"
+      ],
+      "aliases": [
+        "合并报表范围亏损超过上年末净资产10%"
       ]
     },
     "financial_report_chapter": {
@@ -1226,8 +1580,13 @@
         "内部控制"
       ],
       "aliases": [
+        "报告期内的内部控制制度建设及实施情况",
+        "内控评价报告",
         "内部控制评价报告",
         "内部控制审计报告"
+      ],
+      "heading_aliases": [
+        "内部控制评价报告或内部控制审计报告"
       ]
     },
     "fundraising_usage": {
@@ -1236,6 +1595,14 @@
       ],
       "aliases": [
         "募集资金总体使用情况"
+      ],
+      "heading_aliases": [
+        "募集资金使用进展说明",
+        "募集资金整体使用情况",
+        "募集资金明细使用情况",
+        "超募资金明细使用情况",
+        "报告期内募集资金使用的其他情况",
+        "中介机构对募集资金存储与使用情况核查异常的相关情况说明"
       ]
     },
     "balance_sheet": {
@@ -1338,6 +1705,14 @@
       "aliases": [
         "独立情况",
         "五分开"
+      ],
+      "heading_aliases": [
+        "关于保持公司独立性的承诺",
+        "上市公司的人员独立",
+        "上市公司的财务独立",
+        "上市公司的机构独立",
+        "上市公司的业务独立",
+        "上市公司的资产独立"
       ]
     },
     "horizontal_competition": {
@@ -1374,7 +1749,10 @@
         "年度内召开的股东大会情况",
         "股东大会情况"
       ],
-      "aliases": []
+      "aliases": [],
+      "heading_aliases": [
+        "本报告期股东会情况"
+      ]
     },
     "investor_reception": {
       "names": [
@@ -1391,7 +1769,8 @@
         "市值管理"
       ],
       "aliases": [
-        "估值提升计划"
+        "估值提升计划",
+        "市值管理制度和估值提升计划的制定落实情况"
       ]
     },
     "quality_return_plan": {
@@ -1520,6 +1899,10 @@
         "资产质量展望和应对措施",
         "重组贷款情况",
         "按五级分类划分的贷款分布情况"
+      ],
+      "heading_aliases": [
+        "资产质量",
+        "按产品类型划分的贷款和垫款资产质量情况"
       ]
     },
     "bank_loan_loss_allowance": {
@@ -1543,12 +1926,30 @@
         "权重法下资本充足率"
       ]
     },
+    "bank_regulatory_indicators": {
+      "names": [
+        "银行监管指标"
+      ],
+      "aliases": [],
+      "heading_aliases": [
+        "主要监管指标",
+        "补充监管指标",
+        "杠杆率"
+      ]
+    },
     "credit_risk": {
       "names": [
         "信用风险"
       ],
       "aliases": [
-        "信用风险暴露余额"
+        "信用风险暴露余额",
+        "预期信用损失",
+        "已发生信用减值的金融资产"
+      ],
+      "heading_aliases": [
+        "按照单项计提坏账准备的单项计提判断标准",
+        "按照单项计提坏账准备的认定单项计提判断标准",
+        "按照组合计提坏账准备的组合类别及确定依据"
       ]
     },
     "liquidity_risk": {
@@ -1609,6 +2010,9 @@
       ],
       "aliases": [
         "经营分部"
+      ],
+      "heading_aliases": [
+        "报告分部的财务信息"
       ]
     },
     "accounting_standard_differences": {
@@ -1633,6 +2037,10 @@
       ],
       "aliases": [
         "逾期未偿债务"
+      ],
+      "heading_aliases": [
+        "逾期未偿还债券",
+        "报告期末除债券外的有息债务逾期情况"
       ]
     },
     "comparative_information": {
@@ -1647,6 +2055,9 @@
       ],
       "aliases": [
         "财务报表批准"
+      ],
+      "heading_aliases": [
+        "财务报表批准报出日"
       ]
     },
     "supplementary_financial_information": {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -10,21 +11,29 @@ from unittest.mock import patch
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.semantic_route_store import (
     SemanticRouteFileCache,
+    SemanticRouteGroupFileCache,
     SemanticRouteReceiptStore,
 )
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_FALLBACK_KEY,
+    SEMANTIC_FAILOVER_POLICY_VERSION,
+    SEMANTIC_ROUTE_RECEIPT_VERSION,
     SEMANTIC_ROUTER_VERSION,
+    SemanticAdjudicationReceipt,
     SemanticAdjudicatorMetadata,
     SemanticAdjudicationDecision,
     SemanticAdjudicatedRoute,
+    SemanticProviderIdentity,
+    SemanticProviderAttempt,
     SemanticRouteContractError,
     SemanticRouteEvidence,
     SemanticRouteEvidenceKind,
     SemanticRouteReceipt,
     SemanticRouteReceiptRow,
+    semantic_route_receipt_row_to_payload,
 )
 from disclosure_anchor.application.ports.semantic_routes import (
+    SemanticAdjudicationCacheEntry,
     SemanticRouteReceiptStoreError,
 )
 
@@ -136,6 +145,112 @@ class SemanticRouteReceiptStoreTests(unittest.TestCase):
                 rows,
             )
 
+    def test_receipt_sidecar_round_trips_v2_provider_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _Paths(Path(tmp))
+            store = SemanticRouteReceiptStore(
+                paths=paths,  # type: ignore[arg-type]
+                artifacts=ArtifactStore(paths),  # type: ignore[arg-type]
+            )
+            identity = _group_entry().provider
+            response_hash = "sha256:" + "e" * 64
+            attempt = SemanticProviderAttempt(
+                ordinal=1,
+                provider=identity,
+                outcome="succeeded",
+                cache_key="sha256:" + "a" * 64,
+                response_sha256=response_hash,
+            )
+            receipt = SemanticRouteReceipt(
+                contract_version=SEMANTIC_ROUTE_RECEIPT_VERSION,
+                taxonomy_version="semantic-test.v1",
+                router_version=SEMANTIC_ROUTER_VERSION,
+                input_hash="sha256:" + "1" * 64,
+                candidate_keys=("forecast_summary",),
+                semantic_keys=("forecast_summary",),
+                decision_source="model",
+                evidence=(
+                    SemanticRouteEvidence(
+                        key="forecast_summary",
+                        kinds=("model_adjudicated",),
+                        source_ids=("u0:title",),
+                    ),
+                ),
+                adjudication=SemanticAdjudicationReceipt(
+                    policy_version=SEMANTIC_FAILOVER_POLICY_VERSION,
+                    group_hash="sha256:" + "b" * 64,
+                    attempts=(attempt,),
+                    actual_result_attempt=1,
+                    actual_result_identity=identity,
+                    group_response_sha256=response_hash,
+                ),
+            )
+            rows = (
+                SemanticRouteReceiptRow(
+                    asset_id="asset_1",
+                    order_index=1,
+                    receipt=receipt,
+                ),
+            )
+
+            result = store.write(
+                relpath=Path("derived/test/semantic_route_receipts.v2.jsonl"),
+                rows=rows,
+            )
+
+            self.assertEqual(
+                store.read(
+                    relpath=Path("derived/test/semantic_route_receipts.v2.jsonl"),
+                    expected_hash=result.artifact_hash,
+                ),
+                rows,
+            )
+
+    def test_receipt_sidecar_reads_historical_router_but_rejects_bad_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _Paths(Path(tmp))
+            store = SemanticRouteReceiptStore(
+                paths=paths,  # type: ignore[arg-type]
+                artifacts=ArtifactStore(paths),  # type: ignore[arg-type]
+            )
+            row = SemanticRouteReceiptRow(
+                asset_id="asset_1",
+                order_index=1,
+                receipt=SemanticRouteReceipt(
+                    contract_version=SEMANTIC_ROUTE_RECEIPT_VERSION,
+                    taxonomy_version="semantic-test.v1",
+                    router_version="semantic_router.v98",
+                    input_hash="sha256:" + "1" * 64,
+                    candidate_keys=(),
+                    semantic_keys=(),
+                    decision_source="fallback",
+                    evidence=(),
+                ),
+            )
+            relpath = Path("derived/test/historical-v2.jsonl")
+            payload = semantic_route_receipt_row_to_payload(row)
+            raw = (json.dumps(payload, sort_keys=True) + "\n").encode()
+            paths.data_path(relpath).parent.mkdir(parents=True)
+            paths.data_path(relpath).write_bytes(raw)
+            digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+
+            self.assertEqual(store.read(relpath=relpath, expected_hash=digest), (row,))
+
+            for invalid in ("semantic_router.v0", "semantic_router.v01", "v98"):
+                with self.subTest(invalid=invalid):
+                    bad = json.loads(raw)
+                    bad["semantic_route"]["router_version"] = invalid
+                    bad_raw = (json.dumps(bad, sort_keys=True) + "\n").encode()
+                    paths.data_path(relpath).write_bytes(bad_raw)
+                    bad_hash = "sha256:" + hashlib.sha256(bad_raw).hexdigest()
+                    with self.assertRaisesRegex(
+                        SemanticRouteContractError,
+                        "identity is invalid",
+                    ):
+                        store.read(relpath=relpath, expected_hash=bad_hash)
+
     def test_receipt_sidecar_rejects_noncontiguous_rows_and_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = _Paths(Path(tmp))
@@ -208,6 +323,89 @@ class SemanticRouteFileCacheTests(unittest.TestCase):
                 self.assertRaisesRegex(OSError, "unavailable"),
             ):
                 cache.get("sha256:" + "a" * 64)
+
+
+def _group_entry(*, response_hash: str | None = None) -> SemanticAdjudicationCacheEntry:
+    key = "sha256:" + "a" * 64
+    return SemanticAdjudicationCacheEntry(
+        cache_key=key,
+        group_hash="sha256:" + "b" * 64,
+        provider=SemanticProviderIdentity(
+            provider_id="luna-primary",
+            provider="openai",
+            adapter_kind="codex_cli",
+            adapter_version="codex_cli.v4",
+            canonical_model="gpt-5.6-luna",
+            inference_profile="low",
+            prompt_version="semantic-test.v1",
+            prompt_sha256="sha256:" + "c" * 64,
+            output_schema_version="semantic-schema.test",
+            output_schema_sha256="sha256:" + "d" * 64,
+        ),
+        decisions=(
+            SemanticAdjudicationDecision(
+                unit_index=3,
+                routes=(
+                    SemanticAdjudicatedRoute(
+                        key="revenue_and_cost",
+                        support_ids=("u3:title",),
+                    ),
+                ),
+            ),
+        ),
+        response_sha256=response_hash or ("sha256:" + "e" * 64),
+    )
+
+
+class SemanticRouteGroupFileCacheTests(unittest.TestCase):
+    def test_group_cache_round_trips_and_rejects_nondeterminism(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SemanticRouteGroupFileCache(Path(tmp))
+            entry = _group_entry()
+
+            self.assertIsNone(cache.get(entry.cache_key))
+            cache.put(entry)
+            self.assertEqual(cache.get(entry.cache_key), entry)
+            cache.put(entry)
+            with self.assertRaisesRegex(SemanticRouteContractError, "nondeterministic"):
+                cache.put(_group_entry(response_hash="sha256:" + "f" * 64))
+
+    def test_malformed_bytes_are_quarantined_and_recomputed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = SemanticRouteGroupFileCache(root)
+            entry = _group_entry()
+            path = root / "aa" / f"{'a' * 64}.json"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"not-json")
+
+            self.assertIsNone(cache.get(entry.cache_key))
+            self.assertFalse(path.exists())
+            quarantined = tuple(path.parent.glob(f"{path.name}.corrupt.*"))
+            self.assertEqual(len(quarantined), 1)
+            cache.put(entry)
+            self.assertEqual(cache.get(entry.cache_key), entry)
+
+    def test_symlink_and_identity_conflict_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = SemanticRouteGroupFileCache(root)
+            entry = _group_entry()
+            target = root / "target.json"
+            target.write_text("{}", encoding="utf-8")
+            path = root / "aa" / f"{'a' * 64}.json"
+            path.parent.mkdir(parents=True)
+            path.symlink_to(target)
+            with self.assertRaisesRegex(SemanticRouteContractError, "unsafe"):
+                cache.get(entry.cache_key)
+
+            path.unlink()
+            cache.put(entry)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["cache_key"] = "sha256:" + "f" * 64
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(SemanticRouteContractError, "key drifted"):
+                cache.get(entry.cache_key)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import http.client
 import tempfile
@@ -7,16 +8,23 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from disclosure_anchor.adapters.db.postgres.connection import (
+    RuntimeDatabaseIdentity,
+    require_runtime_app_connection,
+    require_runtime_reader_connection,
+)
 from disclosure_anchor.adapters.runtime.doctor import (
     CheckResult,
     _check_unit_snapshot_aggregate,
     _invalid_process_class_overrides,
+    _semantic_receipt_check,
     mineru_remote_inference_check,
     inventory_orphan_files,
     running_run_liveness_checks,
     run_doctor,
     run_startup_preflight,
 )
+from disclosure_anchor.domain.errors import ConfigurationError
 from disclosure_anchor.domain.services.unit_hashing import content_hash_aggregate
 from disclosure_anchor.settings import SENTINEL_NAME, Settings
 from tests.unit._env import without_db_env
@@ -51,10 +59,211 @@ def _create_roots(root: Path) -> None:
 
 
 class DoctorTests(unittest.TestCase):
+    def test_doctor_verifies_hash_bound_historical_semantic_receipt(self) -> None:
+        payload = {
+            "asset_id": "asset_1",
+            "order_index": 1,
+            "semantic_route": {
+                "adjudication": None,
+                "candidate_keys": [],
+                "contract_version": "semantic_route_receipt.v2",
+                "decision_source": "fallback",
+                "evidence": [],
+                "input_hash": "sha256:" + "1" * 64,
+                "router_version": "semantic_router.v98",
+                "selected_keys": [],
+                "taxonomy_version": "semantic-taxonomy-2026-08-r62",
+            },
+        }
+        raw = (json.dumps(payload, sort_keys=True) + "\n").encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            relpath = Path("derived/test/historical-semantic-receipt.v2.jsonl")
+            path = root / "services" / "disclosure_anchor" / "data" / relpath
+            path.parent.mkdir(parents=True)
+            path.write_bytes(raw)
+
+            result = _semantic_receipt_check(
+                settings=_settings(root),
+                object_id="run_historical",
+                relpath=str(relpath),
+                contract_version="semantic_route_receipt.v2",
+                expected_hash="sha256:" + hashlib.sha256(raw).hexdigest(),
+                semantic_status="not_required",
+                expected_degraded_count=0,
+                summary={"status": "not_required"},
+            )
+
+        self.assertEqual(result.status, "PASS")
+        self.assertIn("verified", result.message)
+
+    def test_runtime_identity_requires_direct_non_superuser_app_login(self) -> None:
+        cases = (
+            (
+                {
+                    "database_name": "other_db",
+                    "session_role": "disclosure_app",
+                    "current_role": "disclosure_app",
+                    "session_superuser": False,
+                    "current_superuser": False,
+                },
+                "database must be invest_engine",
+            ),
+            (
+                {
+                    "database_name": "invest_engine",
+                    "session_role": "postgres",
+                    "current_role": "disclosure_app",
+                    "session_superuser": True,
+                    "current_superuser": False,
+                },
+                "session_user/current_user must both be disclosure_app",
+            ),
+            (
+                {
+                    "database_name": "invest_engine",
+                    "session_role": "disclosure_app",
+                    "current_role": "disclosure_app",
+                    "session_superuser": True,
+                    "current_superuser": False,
+                },
+                "must not be superuser",
+            ),
+        )
+        for row, message in cases:
+            with self.subTest(row=row):
+                connection = MagicMock()
+                connection.execute.return_value.mappings.return_value.one.return_value = row
+                with self.assertRaisesRegex(ConfigurationError, message):
+                    require_runtime_app_connection(connection)
+
+    def test_runtime_identity_accepts_only_exact_app_identity(self) -> None:
+        connection = MagicMock()
+        connection.execute.return_value.mappings.return_value.one.return_value = {
+            "database_name": "invest_engine",
+            "session_role": "disclosure_app",
+            "current_role": "disclosure_app",
+            "session_superuser": False,
+            "current_superuser": False,
+        }
+
+        identity = require_runtime_app_connection(connection)
+
+        self.assertEqual(identity.database_name, "invest_engine")
+        query = str(connection.execute.call_args.args[0])
+        self.assertIn("current_database()", query)
+        self.assertIn("session_user", query)
+        self.assertIn("current_user", query)
+        self.assertIn("pg_roles", query)
+
+    def test_runtime_reader_identity_requires_direct_non_superuser_reader_login(
+        self,
+    ) -> None:
+        cases = (
+            (
+                {
+                    "database_name": "other_db",
+                    "session_role": "disclosure_reader",
+                    "current_role": "disclosure_reader",
+                    "session_superuser": False,
+                    "current_superuser": False,
+                },
+                "database must be invest_engine",
+            ),
+            (
+                {
+                    "database_name": "invest_engine",
+                    "session_role": "disclosure_app",
+                    "current_role": "disclosure_reader",
+                    "session_superuser": False,
+                    "current_superuser": False,
+                },
+                "session_user/current_user must both be disclosure_reader",
+            ),
+            (
+                {
+                    "database_name": "invest_engine",
+                    "session_role": "disclosure_reader",
+                    "current_role": "disclosure_reader",
+                    "session_superuser": True,
+                    "current_superuser": False,
+                },
+                "must not be superuser",
+            ),
+        )
+        for row, message in cases:
+            with self.subTest(row=row):
+                connection = MagicMock()
+                connection.execute.return_value.mappings.return_value.one.return_value = row
+                with self.assertRaisesRegex(ConfigurationError, message):
+                    require_runtime_reader_connection(connection)
+
+    def test_runtime_reader_identity_accepts_only_exact_reader_identity(self) -> None:
+        connection = MagicMock()
+        connection.execute.return_value.mappings.return_value.one.return_value = {
+            "database_name": "invest_engine",
+            "session_role": "disclosure_reader",
+            "current_role": "disclosure_reader",
+            "session_superuser": False,
+            "current_superuser": False,
+        }
+
+        identity = require_runtime_reader_connection(connection)
+
+        self.assertEqual(identity.session_role, "disclosure_reader")
+
+    def test_doctor_reports_runtime_role_violation(self) -> None:
+        connection = MagicMock()
+        connection.execute.return_value.scalar_one_or_none.return_value = "0050"
+        engine = MagicMock()
+        engine.connect.return_value.__enter__.return_value = connection
+        identity = RuntimeDatabaseIdentity(
+            database_name="invest_engine",
+            session_role="postgres",
+            current_role="disclosure_app",
+            session_superuser=True,
+            current_superuser=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            with (
+                patch(
+                    "disclosure_anchor.adapters.runtime.doctor."
+                    "inspect_runtime_database_identity",
+                    return_value=identity,
+                ),
+                patch(
+                    "disclosure_anchor.adapters.runtime.doctor."
+                    "single_migration_head",
+                    return_value="0050",
+                ),
+                patch(
+                    "disclosure_anchor.adapters.runtime.doctor."
+                    "_classification_rules_check",
+                    return_value=CheckResult("rules", "PASS", "ok"),
+                ),
+            ):
+                report = run_startup_preflight(
+                    _settings(
+                        root,
+                        database_url="postgresql+psycopg://app/db",
+                    ),
+                    engine=engine,
+                )
+
+        role_check = next(
+            item for item in report.results if item.name == "runtime DB role"
+        )
+        self.assertEqual(role_check.status, "FAIL")
+        self.assertIn("postgres/disclosure_app", role_check.message)
+
     def test_mineru_remote_inference_check_exercises_image_completion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = _settings(Path(tmp)).model_copy(
-                update={"disclosure_mineru_server_url": "http://gpu:30000"}
+                update={"disclosure_mineru_observability_url": "http://gpu:30000"}
             )
         models = MagicMock()
         models.__enter__.return_value.read.return_value = json.dumps(
@@ -62,13 +271,20 @@ class DoctorTests(unittest.TestCase):
         ).encode()
         completion = MagicMock()
         completion.__enter__.return_value.read.return_value = json.dumps(
-            {"choices": [{"finish_reason": "stop"}]}
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "M7"},
+                    }
+                ]
+            }
         ).encode()
         opener = MagicMock()
         opener.open.side_effect = [models, completion]
 
         with patch(
-            "disclosure_anchor.adapters.runtime.doctor.urllib.request.build_opener",
+            "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
             return_value=opener,
         ):
             result = mineru_remote_inference_check(settings)
@@ -85,7 +301,7 @@ class DoctorTests(unittest.TestCase):
     def test_mineru_remote_inference_check_fails_on_remote_5xx(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = _settings(Path(tmp)).model_copy(
-                update={"disclosure_mineru_server_url": "http://gpu:30000"}
+                update={"disclosure_mineru_observability_url": "http://gpu:30000"}
             )
         opener = MagicMock()
         opener.open.side_effect = urllib.error.HTTPError(
@@ -97,7 +313,7 @@ class DoctorTests(unittest.TestCase):
         )
 
         with patch(
-            "disclosure_anchor.adapters.runtime.doctor.urllib.request.build_opener",
+            "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
             return_value=opener,
         ):
             result = mineru_remote_inference_check(settings)
@@ -109,13 +325,13 @@ class DoctorTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = _settings(Path(tmp)).model_copy(
-                update={"disclosure_mineru_server_url": "http://gpu:30000"}
+                update={"disclosure_mineru_observability_url": "http://gpu:30000"}
             )
         opener = MagicMock()
         opener.open.side_effect = http.client.BadStatusLine("partial response")
 
         with patch(
-            "disclosure_anchor.adapters.runtime.doctor.urllib.request.build_opener",
+            "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
             return_value=opener,
         ):
             result = mineru_remote_inference_check(settings)
@@ -125,7 +341,7 @@ class DoctorTests(unittest.TestCase):
     def test_mineru_remote_inference_check_accepts_v1_api_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = _settings(Path(tmp)).model_copy(
-                update={"disclosure_mineru_server_url": "http://gpu:30000/v1"}
+                update={"disclosure_mineru_observability_url": "http://gpu:30000/v1"}
             )
         models = MagicMock()
         models.__enter__.return_value.read.return_value = json.dumps(
@@ -133,13 +349,20 @@ class DoctorTests(unittest.TestCase):
         ).encode()
         completion = MagicMock()
         completion.__enter__.return_value.read.return_value = json.dumps(
-            {"choices": [{"finish_reason": "stop"}]}
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "M7"},
+                    }
+                ]
+            }
         ).encode()
         opener = MagicMock()
         opener.open.side_effect = [models, completion]
 
         with patch(
-            "disclosure_anchor.adapters.runtime.doctor.urllib.request.build_opener",
+            "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
             return_value=opener,
         ):
             result = mineru_remote_inference_check(settings)
@@ -214,7 +437,12 @@ class DoctorTests(unittest.TestCase):
         with without_db_env(), tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _create_roots(root)
-            report = run_doctor(_settings(root))
+            report = run_doctor(
+                _settings(
+                    root,
+                    reader_database_url="postgresql+psycopg://reader/db",
+                )
+            )
         result = next(item for item in report.results if item.name == "mineru orphans")
 
         self.assertEqual(result.status, "PASS")
@@ -303,7 +531,12 @@ class DoctorTests(unittest.TestCase):
         with without_db_env(), tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _create_roots(root)
-            report = run_doctor(_settings(root))
+            report = run_doctor(
+                _settings(
+                    root,
+                    reader_database_url="postgresql+psycopg://reader/db",
+                )
+            )
             self.assertTrue(report.ok, report.results)
             self.assertIn(
                 "raw archive filesystem",
@@ -323,7 +556,7 @@ class DoctorTests(unittest.TestCase):
             failed = {result.name for result in report.results if not result.ok}
             self.assertIn("DATABASE_URL", failed)
 
-    def test_startup_preflight_warns_when_reader_url_falls_back_to_app_url(self) -> None:
+    def test_startup_preflight_fails_when_reader_url_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch(
             "disclosure_anchor.adapters.runtime.doctor._database_ping_and_migration_checks",
             return_value=[],
@@ -334,13 +567,13 @@ class DoctorTests(unittest.TestCase):
                 _settings(root, database_url="postgresql+psycopg://app/db"),
                 engine=object(),  # type: ignore[arg-type]
             )
-        warnings = {
+        failures = {
             result.name: result.message
             for result in report.results
-            if result.status == "WARN"
+            if result.status == "FAIL"
         }
-        self.assertIn("DISCLOSURE_READER_DATABASE_URL", warnings)
-        self.assertIn("DATABASE_URL fallback", warnings["DISCLOSURE_READER_DATABASE_URL"])
+        self.assertIn("DISCLOSURE_READER_DATABASE_URL", failures)
+        self.assertIn("exact reader role", failures["DISCLOSURE_READER_DATABASE_URL"])
 
     def test_startup_preflight_passes_reader_url_when_configured(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch(

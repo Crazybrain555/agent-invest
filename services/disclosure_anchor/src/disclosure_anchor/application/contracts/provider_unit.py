@@ -22,21 +22,189 @@ from disclosure_anchor.application.contracts.retrieval_primary import (
 from disclosure_anchor.domain.value_objects.semantic_key import (
     SemanticKeyInvariantError,
     validate_optional_section_keys,
-    validate_optional_semantic_key_state,
+    validate_optional_semantic_keys,
 )
 
 
 LEGACY_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v1"
 SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v2"
-PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v3"
+PAYLOAD_BOUND_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v3"
+NATIVE_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v4"
+TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v5"
+IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v6"
+STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v7"
+PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v8"
 SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS = frozenset(
     {
         LEGACY_PROVIDER_UNIT_LOCATOR_VERSION,
         SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION,
+        PAYLOAD_BOUND_PROVIDER_UNIT_LOCATOR_VERSION,
+        NATIVE_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
+        TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
+        IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
+        STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION,
         PROVIDER_UNIT_LOCATOR_VERSION,
     }
 )
-PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v9"
+PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v22"
+
+_SOURCE_REPAIR_LOCATOR_VERSIONS = frozenset(
+    {
+        SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION,
+        PAYLOAD_BOUND_PROVIDER_UNIT_LOCATOR_VERSION,
+        NATIVE_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
+        TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
+        IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
+        STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION,
+        PROVIDER_UNIT_LOCATOR_VERSION,
+    }
+)
+_PAYLOAD_BOUND_LOCATOR_VERSIONS = frozenset(
+    {
+        PAYLOAD_BOUND_PROVIDER_UNIT_LOCATOR_VERSION,
+        NATIVE_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
+        TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
+        IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
+        STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION,
+        PROVIDER_UNIT_LOCATOR_VERSION,
+    }
+)
+_CONTINUATION_FRAGMENT_LOCATOR_VERSIONS = frozenset(
+    {
+        NATIVE_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
+        TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
+        IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION,
+        STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION,
+        PROVIDER_UNIT_LOCATOR_VERSION,
+    }
+)
+_TITLE_FRAGMENT_SEARCH_LOCATOR_VERSIONS = _CONTINUATION_FRAGMENT_LOCATOR_VERSIONS
+_QUALITY_FINDING_LOCATOR_VERSIONS = _CONTINUATION_FRAGMENT_LOCATOR_VERSIONS
+_SOURCE_RECONCILIATION_KINDS_BY_LOCATOR_VERSION = {
+    LEGACY_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(),
+    SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {"source_pdf_native_numeric.v1"}
+    ),
+    PAYLOAD_BOUND_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {"source_pdf_native_numeric.v1"}
+    ),
+    NATIVE_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {
+            "source_pdf_native_numeric.v1",
+            "source_pdf_native_identifier.v1",
+        }
+    ),
+    TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {
+            "source_pdf_native_numeric.v1",
+            "source_pdf_native_identifier.v1",
+            "source_pdf_native_identifier.v2",
+        }
+    ),
+    IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {
+            "source_pdf_native_numeric.v1",
+            "source_pdf_native_identifier.v1",
+            "source_pdf_native_identifier.v2",
+        }
+    ),
+    STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {
+            "source_pdf_native_numeric.v1",
+            "source_pdf_native_identifier.v1",
+            "source_pdf_native_identifier.v2",
+        }
+    ),
+    PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {
+            "source_pdf_native_numeric.v1",
+            "source_pdf_native_identifier.v1",
+            "source_pdf_native_identifier.v2",
+        }
+    ),
+}
+_SOURCE_QUALITY_KINDS_BY_LOCATOR_VERSION = {
+    LEGACY_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(),
+    SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(),
+    PAYLOAD_BOUND_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(),
+    NATIVE_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {"source_pdf_native_table_quality.v1"}
+    ),
+    TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {
+            "source_pdf_native_table_quality.v1",
+            "source_pdf_native_text_quality.v1",
+        }
+    ),
+    IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {
+            "source_pdf_native_table_quality.v1",
+            "source_pdf_native_text_quality.v1",
+            "source_pdf_native_identifier_quality.v1",
+            "source_pdf_native_text_quality.v2",
+        }
+    ),
+    STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {
+            "source_pdf_native_table_quality.v1",
+            "source_pdf_native_text_quality.v1",
+            "source_pdf_native_identifier_quality.v1",
+            "source_pdf_native_text_quality.v2",
+        }
+    ),
+    PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {
+            "source_pdf_native_table_quality.v1",
+            "source_pdf_native_text_quality.v1",
+            "source_pdf_native_identifier_quality.v1",
+            "source_pdf_native_text_quality.v2",
+        }
+    ),
+}
+
+_BASE_HEADING_PLACEMENT_SOURCES = frozenset(
+    {
+        "bookmark",
+        "printed_toc",
+        "numbering",
+        "pdf_style",
+        "provider",
+        "provider_style",
+        "flattened",
+    }
+)
+_HEADING_PLACEMENT_SOURCES_BY_LOCATOR_VERSION = {
+    LEGACY_PROVIDER_UNIT_LOCATOR_VERSION: _BASE_HEADING_PLACEMENT_SOURCES,
+    SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION: _BASE_HEADING_PLACEMENT_SOURCES,
+    PAYLOAD_BOUND_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        (*_BASE_HEADING_PLACEMENT_SOURCES, "table_label", "table_container")
+    ),
+    NATIVE_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        (*_BASE_HEADING_PLACEMENT_SOURCES, "table_label", "table_container")
+    ),
+    TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        (*_BASE_HEADING_PLACEMENT_SOURCES, "table_label", "table_container")
+    ),
+    IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        (*_BASE_HEADING_PLACEMENT_SOURCES, "table_label", "table_container")
+    ),
+    STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        (
+            *_BASE_HEADING_PLACEMENT_SOURCES,
+            "table_label",
+            "table_container",
+            "statutory_template",
+        )
+    ),
+    PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        (*_BASE_HEADING_PLACEMENT_SOURCES, "table_label", "table_container")
+    ),
+}
+_ALL_HEADING_PLACEMENT_SOURCES = frozenset(
+    source
+    for sources in _HEADING_PLACEMENT_SOURCES_BY_LOCATOR_VERSION.values()
+    for source in sources
+)
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -45,6 +213,7 @@ ProviderUnitPartKind = Literal["text", "table", "visual"]
 ProviderUnitApplicability = Literal["applicable", "not_applicable"]
 ProviderSearchDestinationKind = Literal[
     "unit_title",
+    "unit_title_fragment",
     "unit_payload",
     "mixed_part",
 ]
@@ -55,6 +224,18 @@ class ProviderUnitSearchContractError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderUnitHeadingFragmentRef:
+    """One additional source occurrence in a wrapped Unit heading."""
+
+    source_index: int
+    payload_ordinal: int
+
+    def __post_init__(self) -> None:
+        if min(self.source_index, self.payload_ordinal) < 0:
+            raise ValueError("provider unit heading fragment is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderUnitHeadingRef:
     """One source heading in a Unit's root-to-leaf path."""
 
@@ -62,15 +243,25 @@ class ProviderUnitHeadingRef:
     source_index: int
     payload_ordinal: int
     placement_source: HeadingPlacementSource
+    continuation_fragments: tuple[ProviderUnitHeadingFragmentRef, ...] = ()
 
     def __post_init__(self) -> None:
         if (
             not self.heading_id
             or self.source_index < 0
             or self.payload_ordinal < 0
-            or not self.placement_source
+            or self.placement_source not in _ALL_HEADING_PLACEMENT_SOURCES
         ):
             raise ValueError("provider unit heading reference is invalid")
+        fragment_sources = [
+            item.source_index for item in self.continuation_fragments
+        ]
+        if (
+            fragment_sources != sorted(fragment_sources)
+            or len(fragment_sources) != len(set(fragment_sources))
+            or any(source_index <= self.source_index for source_index in fragment_sources)
+        ):
+            raise ValueError("provider unit heading fragments are invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +315,16 @@ class ProviderSearchDestination:
             ):
                 raise ValueError("unit title destination cannot claim payload fields")
             return
+        if self.kind == "unit_title_fragment":
+            if (
+                self.part_index is not None
+                or self.field is not None
+                or self.item_index is None
+            ):
+                raise ValueError("unit title fragment destination is invalid")
+            if self.item_index < 0:
+                raise ValueError("unit title fragment index cannot be negative")
+            return
         if not self.field:
             raise ValueError("provider search payload destination needs a field")
         if self.item_index is not None and self.item_index < 0:
@@ -163,7 +364,7 @@ class ProviderUnitEvidenceArtifact:
 
 @dataclass(frozen=True, slots=True)
 class ProviderUnitSourceTextReconciliation:
-    """Path-free provenance for one native-PDF numeric text correction."""
+    """Path-free provenance for one source-bound native-PDF text correction."""
 
     source_index: int
     payload_ordinal: int
@@ -175,7 +376,11 @@ class ProviderUnitSourceTextReconciliation:
     def __post_init__(self) -> None:
         if min(self.source_index, self.payload_ordinal) < 0:
             raise ValueError("provider Unit source reconciliation index is invalid")
-        if self.source_kind != "source_pdf_native_numeric.v1":
+        if self.source_kind not in {
+            "source_pdf_native_numeric.v1",
+            "source_pdf_native_identifier.v1",
+            "source_pdf_native_identifier.v2",
+        }:
             raise ValueError("provider Unit source reconciliation kind is unsupported")
         if not all(
             _SHA256_RE.fullmatch(value)
@@ -186,6 +391,46 @@ class ProviderUnitSourceTextReconciliation:
             )
         ):
             raise ValueError("provider Unit source reconciliation hash is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderUnitSourceQualityFinding:
+    """Path-free provenance for a native-PDF quality mismatch."""
+
+    source_index: int
+    payload_ordinal: int
+    raw_block_sha256: str
+    provider_text_sha256: str
+    source_text_sha256: str
+    reason: str
+    source_kind: str
+
+    def __post_init__(self) -> None:
+        if min(self.source_index, self.payload_ordinal) < 0:
+            raise ValueError("provider Unit quality finding index is invalid")
+        allowed_reasons = {
+            "source_pdf_native_table_quality.v1": {
+                "empty_table_tail",
+                "malformed_numeric_grouping",
+                "numeric_token_mismatch",
+            },
+            "source_pdf_native_text_quality.v1": {"native_text_omission"},
+            "source_pdf_native_identifier_quality.v1": {
+                "identifier_confusable_mismatch"
+            },
+            "source_pdf_native_text_quality.v2": {"cjk_bracket_omission"},
+        }
+        if self.reason not in allowed_reasons.get(self.source_kind, set()):
+            raise ValueError("provider Unit quality finding reason is unsupported")
+        if not all(
+            _SHA256_RE.fullmatch(value)
+            for value in (
+                self.raw_block_sha256,
+                self.provider_text_sha256,
+                self.source_text_sha256,
+            )
+        ):
+            raise ValueError("provider Unit quality finding hash is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +448,7 @@ class ProviderUnitLocator:
     source_text_reconciliations: tuple[
         ProviderUnitSourceTextReconciliation, ...
     ] = ()
+    source_quality_findings: tuple[ProviderUnitSourceQualityFinding, ...] = ()
     contract_version: str = PROVIDER_UNIT_LOCATOR_VERSION
 
     def __post_init__(self) -> None:
@@ -210,9 +456,29 @@ class ProviderUnitLocator:
             raise ValueError("provider unit locator version is unsupported")
         if (
             self.contract_version == LEGACY_PROVIDER_UNIT_LOCATOR_VERSION
-            and self.source_text_reconciliations
+            and (self.source_text_reconciliations or self.source_quality_findings)
         ):
             raise ValueError("legacy provider unit locator cannot claim source repairs")
+        if self.contract_version not in _QUALITY_FINDING_LOCATOR_VERSIONS and self.source_quality_findings:
+            raise ValueError("legacy provider unit locator cannot claim quality findings")
+        allowed_reconciliation_kinds = (
+            _SOURCE_RECONCILIATION_KINDS_BY_LOCATOR_VERSION[self.contract_version]
+        )
+        if any(
+            item.source_kind not in allowed_reconciliation_kinds
+            for item in self.source_text_reconciliations
+        ):
+            raise ValueError(
+                "provider unit locator version cannot claim reconciliation kind"
+            )
+        allowed_quality_kinds = _SOURCE_QUALITY_KINDS_BY_LOCATOR_VERSION[
+            self.contract_version
+        ]
+        if any(
+            item.source_kind not in allowed_quality_kinds
+            for item in self.source_quality_findings
+        ):
+            raise ValueError("provider unit locator version cannot claim quality kind")
         if not _SHA256_RE.fullmatch(self.provider_document_sha256):
             raise ValueError("provider unit locator hash must be canonical")
         if self.unit_index < 0:
@@ -227,6 +493,23 @@ class ProviderUnitLocator:
         search_ids = [binding.source.target_id for binding in self.search_targets]
         if len(search_ids) != len(set(search_ids)):
             raise ValueError("provider unit locator cannot repeat a search target")
+        if self.contract_version not in _TITLE_FRAGMENT_SEARCH_LOCATOR_VERSIONS and any(
+            binding.destination.kind == "unit_title_fragment"
+            for binding in self.search_targets
+        ):
+            raise ValueError(
+                "provider unit locator version cannot claim title fragment search"
+            )
+        allowed_placement_sources = _HEADING_PLACEMENT_SOURCES_BY_LOCATOR_VERSION[
+            self.contract_version
+        ]
+        if any(
+            heading.placement_source not in allowed_placement_sources
+            for heading in self.heading_chain
+        ):
+            raise ValueError(
+                "provider unit locator version cannot claim heading placement"
+            )
         evidence_hashes = [artifact.sha256 for artifact in self.evidence_artifacts]
         if len(evidence_hashes) != len(set(evidence_hashes)):
             raise ValueError("provider unit locator cannot repeat evidence bytes")
@@ -239,6 +522,20 @@ class ProviderUnitLocator:
         ) != len(set(reconciliation_ids)):
             raise ValueError(
                 "provider unit source reconciliations must be unique and ordered"
+            )
+        finding_ids = [
+            (item.source_index, item.payload_ordinal)
+            for item in self.source_quality_findings
+        ]
+        if finding_ids != sorted(finding_ids) or len(finding_ids) != len(
+            set(finding_ids)
+        ):
+            raise ValueError(
+                "provider unit source quality findings must be unique and ordered"
+            )
+        if set(reconciliation_ids) & set(finding_ids):
+            raise ValueError(
+                "provider unit reconciliation and quality finding cannot overlap"
             )
         if any(
             part.part.block_source_index is None
@@ -259,7 +556,6 @@ class ProviderUnitDraft:
     title: str | None
     heading_path: tuple[str, ...]
     section_keys: tuple[str, ...] | None
-    semantic_key: str | None
     semantic_keys: tuple[str, ...] | None
     applicability: ProviderUnitApplicability | None
     quality_status: str
@@ -285,8 +581,7 @@ class ProviderUnitDraft:
             validate_optional_section_keys(
                 list(self.section_keys) if self.section_keys is not None else None,
             )
-            validate_optional_semantic_key_state(
-                self.semantic_key,
+            validate_optional_semantic_keys(
                 list(self.semantic_keys) if self.semantic_keys is not None else None,
             )
         except SemanticKeyInvariantError as exc:
@@ -302,6 +597,12 @@ class ProviderUnitDraft:
         ):
             if not _SHA256_RE.fullmatch(value):
                 raise ValueError("provider unit hashes must be canonical")
+
+    @property
+    def semantic_key(self) -> str | None:
+        """Derived legacy lead used only by old hash/snapshot diagnostics."""
+
+        return self.semantic_keys[0] if self.semantic_keys else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,7 +650,21 @@ def provider_unit_locator_to_payload(
                 "source_index": heading.source_index,
                 **(
                     {"payload_ordinal": heading.payload_ordinal}
-                    if locator.contract_version == PROVIDER_UNIT_LOCATOR_VERSION
+                    if locator.contract_version in _PAYLOAD_BOUND_LOCATOR_VERSIONS
+                    else {}
+                ),
+                **(
+                    {
+                        "continuation_fragments": [
+                            {
+                                "payload_ordinal": fragment.payload_ordinal,
+                                "source_index": fragment.source_index,
+                            }
+                            for fragment in heading.continuation_fragments
+                        ]
+                    }
+                    if locator.contract_version
+                    in _CONTINUATION_FRAGMENT_LOCATOR_VERSIONS
                     else {}
                 ),
             }
@@ -407,10 +722,7 @@ def provider_unit_locator_to_payload(
             for binding in locator.search_targets
         ],
     }
-    if locator.contract_version in {
-        SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION,
-        PROVIDER_UNIT_LOCATOR_VERSION,
-    }:
+    if locator.contract_version in _SOURCE_REPAIR_LOCATOR_VERSIONS:
         payload["source_text_reconciliations"] = [
             {
                 "payload_ordinal": item.payload_ordinal,
@@ -421,6 +733,19 @@ def provider_unit_locator_to_payload(
                 "source_text_sha256": item.source_text_sha256,
             }
             for item in locator.source_text_reconciliations
+        ]
+    if locator.contract_version in _QUALITY_FINDING_LOCATOR_VERSIONS:
+        payload["source_quality_findings"] = [
+            {
+                "payload_ordinal": item.payload_ordinal,
+                "provider_text_sha256": item.provider_text_sha256,
+                "raw_block_sha256": item.raw_block_sha256,
+                "reason": item.reason,
+                "source_index": item.source_index,
+                "source_kind": item.source_kind,
+                "source_text_sha256": item.source_text_sha256,
+            }
+            for item in locator.source_quality_findings
         ]
     return payload
 
@@ -442,13 +767,12 @@ def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
         "evidence_artifacts",
         "search_targets",
     }
-    if version in {
-        SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION,
-        PROVIDER_UNIT_LOCATOR_VERSION,
-    }:
+    if version in _SOURCE_REPAIR_LOCATOR_VERSIONS:
         base_fields.add("source_text_reconciliations")
     elif version != LEGACY_PROVIDER_UNIT_LOCATOR_VERSION:
         raise ValueError("provider unit locator version is unsupported")
+    if version in _QUALITY_FINDING_LOCATOR_VERSIONS:
+        base_fields.add("source_quality_findings")
     root = _closed_mapping(
         payload,
         fields=base_fields,
@@ -485,11 +809,18 @@ def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
                 label="source text reconciliations",
             )
         )
-        if version
-        in {
-            SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION,
-            PROVIDER_UNIT_LOCATOR_VERSION,
-        }
+        if version in _SOURCE_REPAIR_LOCATOR_VERSIONS
+        else ()
+    )
+    quality_findings = (
+        tuple(
+            _source_quality_finding_from_payload(item)
+            for item in _array(
+                root["source_quality_findings"],
+                label="source quality findings",
+            )
+        )
+        if version in _QUALITY_FINDING_LOCATOR_VERSIONS
         else ()
     )
     return ProviderUnitLocator(
@@ -508,6 +839,7 @@ def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
         unbound_table_parts=unbound,
         evidence_artifacts=evidence,
         source_text_reconciliations=reconciliations,
+        source_quality_findings=quality_findings,
         search_targets=search,
     )
 
@@ -518,8 +850,10 @@ def _heading_from_payload(
     version: object,
 ) -> ProviderUnitHeadingRef:
     fields = {"heading_id", "placement_source", "source_index"}
-    if version == PROVIDER_UNIT_LOCATOR_VERSION:
+    if version in _PAYLOAD_BOUND_LOCATOR_VERSIONS:
         fields.add("payload_ordinal")
+    if version in _CONTINUATION_FRAGMENT_LOCATOR_VERSIONS:
+        fields.add("continuation_fragments")
     item = _closed_mapping(
         payload,
         fields=fields,
@@ -530,12 +864,40 @@ def _heading_from_payload(
         source_index=_integer(item["source_index"], label="heading source index"),
         payload_ordinal=(
             _integer(item["payload_ordinal"], label="heading payload ordinal")
-            if version == PROVIDER_UNIT_LOCATOR_VERSION
+            if version in _PAYLOAD_BOUND_LOCATOR_VERSIONS
             else 0
         ),
         placement_source=cast(
             HeadingPlacementSource,
             _text(item["placement_source"], label="heading placement source"),
+        ),
+        continuation_fragments=(
+            tuple(
+                _heading_fragment_from_payload(fragment)
+                for fragment in _array(
+                    item["continuation_fragments"],
+                    label="heading continuation fragments",
+                )
+            )
+            if version in _CONTINUATION_FRAGMENT_LOCATOR_VERSIONS
+            else ()
+        ),
+    )
+
+
+def _heading_fragment_from_payload(
+    payload: object,
+) -> ProviderUnitHeadingFragmentRef:
+    item = _closed_mapping(
+        payload,
+        fields={"payload_ordinal", "source_index"},
+        label="provider Unit heading fragment",
+    )
+    return ProviderUnitHeadingFragmentRef(
+        source_index=_integer(item["source_index"], label="fragment source index"),
+        payload_ordinal=_integer(
+            item["payload_ordinal"],
+            label="fragment payload ordinal",
         ),
     )
 
@@ -644,6 +1006,39 @@ def _source_text_reconciliation_from_payload(
     )
 
 
+def _source_quality_finding_from_payload(
+    payload: object,
+) -> ProviderUnitSourceQualityFinding:
+    item = _closed_mapping(
+        payload,
+        fields={
+            "payload_ordinal",
+            "provider_text_sha256",
+            "raw_block_sha256",
+            "reason",
+            "source_index",
+            "source_kind",
+            "source_text_sha256",
+        },
+        label="provider Unit source quality finding",
+    )
+    return ProviderUnitSourceQualityFinding(
+        source_index=_integer(item["source_index"], label="source index"),
+        payload_ordinal=_integer(item["payload_ordinal"], label="payload ordinal"),
+        raw_block_sha256=_text(item["raw_block_sha256"], label="block hash"),
+        provider_text_sha256=_text(
+            item["provider_text_sha256"],
+            label="provider text hash",
+        ),
+        source_text_sha256=_text(
+            item["source_text_sha256"],
+            label="source text hash",
+        ),
+        reason=_text(item["reason"], label="quality finding reason"),
+        source_kind=_text(item["source_kind"], label="source kind"),
+    )
+
+
 def _search_binding_from_payload(payload: object) -> ProviderUnitSearchBinding:
     item = _closed_mapping(
         payload,
@@ -746,8 +1141,12 @@ def _optional_text(value: object, *, label: str) -> str | None:
 
 __all__ = [
     "LEGACY_PROVIDER_UNIT_LOCATOR_VERSION",
+    "NATIVE_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION",
+    "PAYLOAD_BOUND_PROVIDER_UNIT_LOCATOR_VERSION",
     "PROVIDER_UNIT_LOCATOR_VERSION",
     "SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION",
+    "STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION",
+    "TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION",
     "PROVIDER_UNIT_BUILDER_VERSION",
     "SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS",
     "ProviderSearchDestination",
@@ -757,6 +1156,7 @@ __all__ = [
     "ProviderUnitDraft",
     "ProviderUnitEvidenceArtifact",
     "ProviderUnitHeadingRef",
+    "ProviderUnitHeadingFragmentRef",
     "ProviderUnitLocator",
     "ProviderUnitPartKind",
     "ProviderUnitPartRef",
@@ -764,6 +1164,7 @@ __all__ = [
     "ProviderUnitSearchBinding",
     "ProviderUnitSearchContractError",
     "ProviderUnitSourceTextReconciliation",
+    "ProviderUnitSourceQualityFinding",
     "provider_unit_locator_from_payload",
     "provider_unit_locator_to_payload",
 ]

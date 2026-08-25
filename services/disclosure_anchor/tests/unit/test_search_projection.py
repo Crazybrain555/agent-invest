@@ -12,9 +12,14 @@ from sqlalchemy.dialects import postgresql
 from disclosure_anchor.adapters.retrieval import tokenizer
 from disclosure_anchor.application.contracts.provider_document import ProviderPayload
 from disclosure_anchor.application.contracts.provider_unit import (
+    ProviderSearchDestination,
+    ProviderUnitLocator,
+    ProviderUnitPartRef,
+    ProviderUnitSearchBinding,
     ProviderUnitSearchContractError,
     provider_unit_locator_to_payload,
 )
+from disclosure_anchor.application.contracts.retrieval_primary import RetrievalTarget
 from disclosure_anchor.application.services.provider_unit_builder import (
     build_provider_units,
     provider_unit_search_text_values,
@@ -34,6 +39,44 @@ from tests.unit.test_provider_unit_builder import (
 
 
 _BUILT_AT = datetime(2026, 8, 12, tzinfo=timezone.utc)
+
+
+def _qa_table_locator() -> dict[str, object]:
+    target = RetrievalTarget(
+        target_id="block:0:payload:0",
+        source_index=0,
+        payload_ordinal=0,
+        field="table_body",
+        item_index=None,
+        transform="html_visible_text_segments.v1",
+        raw_block_sha256="sha256:" + "a" * 64,
+    )
+    return provider_unit_locator_to_payload(
+        ProviderUnitLocator(
+            provider_document_sha256="sha256:" + "b" * 64,
+            unit_index=0,
+            heading_chain=(),
+            parts=(
+                ProviderUnitPartRef(
+                    part_index=0,
+                    kind="table",
+                    block_source_indices=(0,),
+                ),
+            ),
+            evidence_only_block_source_indices=(),
+            unbound_table_parts=(),
+            evidence_artifacts=(),
+            search_targets=(
+                ProviderUnitSearchBinding(
+                    source=target,
+                    destination=ProviderSearchDestination(
+                        kind="unit_payload",
+                        field="table_body",
+                    ),
+                ),
+            ),
+        )
+    )
 
 
 def _heading_only_document():  # type: ignore[no-untyped-def]
@@ -180,6 +223,59 @@ class ProviderSearchTargetTests(unittest.TestCase):
                 self.assertEqual(row["body_atoms"], ())
                 self.assertEqual(row["body_tokens"], "")
 
+    def test_strict_qa_rows_add_colocation_atoms_but_keep_leaf_atoms(self) -> None:
+        table = (
+            '<table><tr><td colspan="3">交流要点</td></tr>'
+            "<tr><td>序号</td><td>提问内容</td><td>回复内容</td></tr>"
+            "<tr><td>1</td><td>能繁母猪数量？</td><td>期末312.9万头。</td></tr>"
+            "<tr><td>2</td><td>AI时代如何发展？</td><td>构建产业互联平台。</td></tr>"
+            "</table>"
+        )
+        row = compute_search_projection_row(
+            asset_id="asset_qa",
+            title=None,
+            heading_path=[],
+            payload_kind="table",
+            payload={"table_body": table},
+            semantic_keys=(),
+            artifact_locator=_qa_table_locator(),
+            built_at=_BUILT_AT,
+        )
+        self.assertEqual(len(row["body_atoms"]), 10)
+        self.assertEqual(
+            row["body_row_atoms"],
+            (
+                {
+                    "table_target_id": "block:0:payload:0",
+                    "source_row_index": 2,
+                    "row_text": "1 能繁母猪数量? 期末312.9万头。",
+                    "row_tokens": tokenizer.index_word_tokens(
+                        "1 能繁母猪数量？ 期末312.9万头。"
+                    ),
+                },
+                {
+                    "table_target_id": "block:0:payload:0",
+                    "source_row_index": 3,
+                    "row_text": "2 ai时代如何发展? 构建产业互联平台。",
+                    "row_tokens": tokenizer.index_word_tokens(
+                        "2 AI时代如何发展？ 构建产业互联平台。"
+                    ),
+                },
+            ),
+        )
+        malformed = compute_search_projection_row(
+            asset_id="asset_qa_bad",
+            title=None,
+            heading_path=[],
+            payload_kind="table",
+            payload={"table_body": table.replace("<td>2</td>", "<td>4</td>")},
+            semantic_keys=(),
+            artifact_locator=_qa_table_locator(),
+            built_at=_BUILT_AT,
+        )
+        self.assertEqual(malformed["body_row_atoms"], ())
+        self.assertEqual(len(malformed["body_atoms"]), 10)
+
     def test_word_tokens_use_visible_html_without_rewriting_atoms(self) -> None:
         title = "<sup>®</sup> BTK"
         body = "百泽安<sup>®</sup> PD-1"
@@ -287,6 +383,7 @@ class ProviderSearchTargetTests(unittest.TestCase):
                 "path_tokens",
                 "body_tokens",
                 "body_atoms",
+                "body_row_atoms",
                 "key_tokens",
                 "header_row_candidate",
                 "built_at",
@@ -294,7 +391,7 @@ class ProviderSearchTargetTests(unittest.TestCase):
         )
         self.assertEqual(
             row["retrieval_rules_version"],
-            "rp-2026.08-provider-unit-v3",
+            "rp-2026.08-provider-unit-v5",
         )
         self.assertEqual(row["key_tokens"], "")
         self.assertFalse(row["header_row_candidate"])
@@ -330,6 +427,40 @@ class ProviderSearchTargetTests(unittest.TestCase):
         )
 
         self.assertEqual(row["key_tokens"], "revenue")
+
+    def test_direct_keys_project_their_chinese_canonical_label_tokens(self) -> None:
+        draft = build_provider_units(_admitted(_representative_document())).units[1]
+        row = compute_search_projection_row(
+            asset_id="asset_labels",
+            title=draft.title,
+            heading_path=draft.heading_path,
+            payload_kind=draft.payload_kind,
+            payload=draft.payload,
+            semantic_keys=("inventory", "internal_control"),
+            artifact_locator=provider_unit_locator_to_payload(draft.locator),
+            built_at=_BUILT_AT,
+        )
+
+        tokens = row["key_tokens"].split(" ")
+        self.assertEqual(tokens[:2], ["inventory", "internal_control"])
+        self.assertIn("存货", tokens)
+        # jieba search mode splits the label into query-matching subterms.
+        self.assertIn("内部", tokens)
+        self.assertIn("控制", tokens)
+        # Section keys never gain label tokens: the structural channel stays
+        # a filter, not a competing full-text signal.
+        section_row = compute_search_projection_row(
+            asset_id="asset_labels_sections",
+            title=draft.title,
+            heading_path=draft.heading_path,
+            payload_kind=draft.payload_kind,
+            payload=draft.payload,
+            semantic_keys=(),
+            section_keys=("inventory",),
+            artifact_locator=provider_unit_locator_to_payload(draft.locator),
+            built_at=_BUILT_AT,
+        )
+        self.assertEqual(section_row["key_tokens"], "")
 
 
 if __name__ == "__main__":

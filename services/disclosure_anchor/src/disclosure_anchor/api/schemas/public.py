@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -83,9 +83,8 @@ class DocumentUnitV1(PublicModel):
     heading_path_text: str | None
     title: str | None
     order_index: int
-    semantic_key: str | None
-    semantic_keys: list[str] | None
-    section_keys: list[str] | None
+    semantic_keys: list[str]
+    section_keys: list[str]
     payload: dict[str, Any]
     content_hash: str
     structure_hash: str | None
@@ -112,7 +111,7 @@ class DocumentUnitV1(PublicModel):
     trace_level: str
     raw_file_hash: str | None
     query_projection_hash: str | None
-    content_categories: list[dict[str, Any]] | None
+    body_status: Literal["content", "heading_only", "empty"]
     asset_uri: str
     is_active_run: bool
     evidence_refs: list[EvidenceRefV1]

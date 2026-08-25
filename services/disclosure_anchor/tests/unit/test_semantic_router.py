@@ -5,23 +5,31 @@ from dataclasses import replace
 import unittest
 
 from disclosure_anchor.application.contracts.semantic_routes import (
+    SEMANTIC_FAILOVER_POLICY_VERSION,
     SEMANTIC_PROMPT_VERSION,
     SemanticAdjudicatedRoute,
     SemanticAdjudicationDecision,
     SemanticDocumentContext,
+    SemanticProviderAttempt,
+    SemanticProviderIdentity,
     SemanticRouteContractError,
     SemanticRouteDefinition,
     SemanticRouteTaxonomy,
 )
 from disclosure_anchor.application.ports.semantic_routes import (
     SemanticAdjudicationBatch,
+    SemanticAdjudicationOutcome,
     SemanticAdjudicatorIdentity,
     SemanticRouteAdjudicatorError,
 )
 from disclosure_anchor.application.services.provider_unit_builder import (
     build_provider_units,
 )
-from disclosure_anchor.application.services.semantic_router import SemanticRouter
+from disclosure_anchor.application.services.semantic_router import (
+    SemanticRouter,
+    SemanticRouteBatchResult,
+    _normalize_title,
+)
 from disclosure_anchor.application.services.semantic_taxonomy import (
     load_semantic_route_taxonomy,
 )
@@ -34,7 +42,11 @@ from tests.unit.test_provider_unit_builder import (
     _document,
     _representative_document,
 )
-from disclosure_anchor.application.contracts.provider_document import ProviderPayload
+from disclosure_anchor.application.contracts.provider_document import (
+    ProviderBBox,
+    ProviderDocument,
+    ProviderPayload,
+)
 
 
 class _MemoryCache:
@@ -71,6 +83,60 @@ class _Adjudicator:
     ) -> tuple[SemanticAdjudicationDecision, ...]:
         self.calls += 1
         return self.decide(batch)
+
+
+class _Executor:
+    def __init__(
+        self,
+        decide: Callable[
+            [SemanticAdjudicationBatch], tuple[SemanticAdjudicationDecision, ...]
+        ],
+    ) -> None:
+        self.decide = decide
+        self.calls = 0
+        self._identity = SemanticProviderIdentity(
+            provider_id="test-primary",
+            provider="test",
+            adapter_kind="test_cli",
+            adapter_version="test_cli.v1",
+            canonical_model="test-model",
+            inference_profile="low",
+            prompt_version="semantic-test-prompt.v1",
+            prompt_sha256="sha256:" + "1" * 64,
+            output_schema_version="semantic-test-schema.v1",
+            output_schema_sha256="sha256:" + "2" * 64,
+        )
+
+    @property
+    def provider_identities(self) -> tuple[SemanticProviderIdentity, ...]:
+        return (self._identity,)
+
+    def adjudicate(
+        self,
+        batch: SemanticAdjudicationBatch,
+        *,
+        group_hash: str,
+    ) -> SemanticAdjudicationOutcome:
+        self.calls += 1
+        decisions = self.decide(batch)
+        response_hash = "sha256:" + "3" * 64
+        return SemanticAdjudicationOutcome(
+            policy_version=SEMANTIC_FAILOVER_POLICY_VERSION,
+            group_hash=group_hash,
+            attempts=(
+                SemanticProviderAttempt(
+                    ordinal=1,
+                    provider=self._identity,
+                    outcome="succeeded",
+                    response_sha256=response_hash,
+                ),
+            ),
+            decisions=decisions,
+            actual_result_attempt=1,
+            actual_result_identity=self._identity,
+            group_response_sha256=response_hash,
+            degraded_unavailable=False,
+        )
 
 
 def _taxonomy() -> SemanticRouteTaxonomy:
@@ -123,6 +189,33 @@ def _drafts(title: str):  # type: ignore[no-untyped-def]
                     annotation="title",
                     level=1,
                 ),
+                _block(
+                    1,
+                    0,
+                    "text",
+                    (ProviderPayload("text", None, "正文。"),),
+                    annotation=None,
+                ),
+            ),
+        ),
+        segments=(),
+    )
+    admitted = _admitted(document)
+    return admitted, build_provider_units(admitted).units
+
+
+def _heading_only_drafts(title: str):  # type: ignore[no-untyped-def]
+    document = _document(
+        pages=(
+            (
+                _block(
+                    0,
+                    0,
+                    "text",
+                    (ProviderPayload("text", None, title),),
+                    annotation="title",
+                    level=1,
+                ),
             ),
         ),
         segments=(),
@@ -149,6 +242,99 @@ def _drafts_with_body(title: str, body: str):  # type: ignore[no-untyped-def]
                     "text",
                     (ProviderPayload("text", None, body),),
                     annotation=None,
+                ),
+            ),
+        ),
+        segments=(),
+    )
+    admitted = _admitted(document)
+    return admitted, build_provider_units(admitted).units
+
+
+def _two_model_drafts():  # type: ignore[no-untyped-def]
+    document = _document(
+        pages=(
+            (
+                _block(
+                    0,
+                    0,
+                    "text",
+                    (ProviderPayload("text", None, "业绩预告和预计业绩区间甲"),),
+                    annotation="title",
+                    level=1,
+                ),
+                _block(
+                    1,
+                    0,
+                    "text",
+                    (ProviderPayload("text", None, "业绩变动原因"),),
+                    annotation=None,
+                ),
+                _block(
+                    2,
+                    0,
+                    "text",
+                    (ProviderPayload("text", None, "业绩预告和预计业绩区间乙"),),
+                    annotation="title",
+                    level=1,
+                ),
+                _block(
+                    3,
+                    0,
+                    "text",
+                    (ProviderPayload("text", None, "业绩变动原因"),),
+                    annotation=None,
+                ),
+            ),
+        ),
+        segments=(),
+    )
+    admitted = _admitted(document)
+    return admitted, build_provider_units(admitted).units
+
+
+def _select_forecast_summary(
+    batch: SemanticAdjudicationBatch,
+) -> tuple[SemanticAdjudicationDecision, ...]:
+    return tuple(
+        SemanticAdjudicationDecision(
+            unit_index=unit.unit_index,
+            routes=(
+                SemanticAdjudicatedRoute(
+                    key="performance_forecast_summary",
+                    support_ids=next(
+                        item.source_ids
+                        for item in unit.candidates
+                        if item.key == "performance_forecast_summary"
+                    ),
+                ),
+            ),
+        )
+        for unit in batch.units
+    )
+
+
+def _drafts_with_bodies(title: str, *bodies: str):  # type: ignore[no-untyped-def]
+    document = _document(
+        pages=(
+            (
+                _block(
+                    0,
+                    0,
+                    "text",
+                    (ProviderPayload("text", None, title),),
+                    annotation="title",
+                    level=1,
+                ),
+                *(
+                    _block(
+                        index,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, body),),
+                        annotation=None,
+                    )
+                    for index, body in enumerate(bodies, start=1)
                 ),
             ),
         ),
@@ -191,6 +377,47 @@ def _drafts_with_table(title: str, table_html: str):  # type: ignore[no-untyped-
                 ),
                 _block(
                     1,
+                    0,
+                    "table",
+                    (ProviderPayload("table_body", None, table_html),),
+                    annotation=None,
+                ),
+            ),
+        ),
+        segments=(),
+    )
+    admitted = _admitted(document)
+    return admitted, build_provider_units(admitted).units
+
+
+def _drafts_with_bodies_and_table(
+    title: str,
+    bodies: tuple[str, ...],
+    table_html: str,
+):  # type: ignore[no-untyped-def]
+    document = _document(
+        pages=(
+            (
+                _block(
+                    0,
+                    0,
+                    "text",
+                    (ProviderPayload("text", None, title),),
+                    annotation="title",
+                    level=1,
+                ),
+                *(
+                    _block(
+                        index,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, body),),
+                        annotation=None,
+                    )
+                    for index, body in enumerate(bodies, start=1)
+                ),
+                _block(
+                    len(bodies) + 1,
                     0,
                     "table",
                     (ProviderPayload("table_body", None, table_html),),
@@ -295,11 +522,47 @@ class SemanticTaxonomyTests(unittest.TestCase):
     def test_packaged_taxonomy_is_closed_and_has_no_fake_fallback_route(self) -> None:
         taxonomy = load_semantic_route_taxonomy()
 
-        self.assertEqual(len(taxonomy.definitions), 307)
-        self.assertEqual(len(taxonomy.by_key()), 307)
+        self.assertEqual(len(taxonomy.definitions), 344)
+        self.assertEqual(len(taxonomy.by_key()), 344)
         self.assertNotIn(taxonomy.fallback_key, taxonomy.by_key())
         self.assertNotIn("other_information", taxonomy.by_key())
         self.assertNotIn("other_significant_events", taxonomy.by_key())
+        self.assertEqual(
+            taxonomy.by_key()["audit_opinion"].labels,
+            ("审计报告", "审计意见"),
+        )
+        self.assertEqual(
+            taxonomy.by_key()["key_audit_matters"].labels,
+            ("关键审计事项",),
+        )
+        self.assertIn(
+            "预期信用损失",
+            taxonomy.by_key()["credit_risk"].labels,
+        )
+        self.assertIn(
+            "合同履约成本",
+            taxonomy.by_key()["revenue_recognition_policy"].labels,
+        )
+        self.assertIn(
+            "权益工具",
+            taxonomy.by_key()["financial_instruments_policy"].heading_labels,
+        )
+        self.assertIn(
+            "金融负债的终止确认",
+            taxonomy.by_key()["financial_instruments_policy"].heading_labels,
+        )
+        self.assertEqual(
+            taxonomy.by_key()["transaction_share_lockup"].labels,
+            ("锁定期安排", "股份锁定安排", "股份锁定期"),
+        )
+        self.assertEqual(
+            taxonomy.by_key()["transition_period_profit_loss"].labels,
+            ("期间损益安排", "过渡期损益安排", "损益归属期间安排"),
+        )
+        self.assertEqual(
+            taxonomy.by_key()["issue_allottees"].labels,
+            ("配售对象", "发行对象", "认购对象"),
+        )
         self.assertTrue(taxonomy.by_key()["balance_sheet"].exclusive_container)
         self.assertTrue(
             taxonomy.by_key()["financial_statements_section"].exclusive_container
@@ -349,7 +612,51 @@ class SemanticTaxonomyTests(unittest.TestCase):
                 (
                     "公司治理、环境和社会",
                     ("governance", "environment_social"),
-                )
+                ),
+                (
+                    "公司简介和主要财务指标",
+                    ("company_profile", "company_profile_metrics"),
+                ),
+                (
+                    "合并和公司资产负债表",
+                    ("balance_sheet", "balance_sheet_parent"),
+                ),
+                (
+                    "合并和银行资产负债表",
+                    ("balance_sheet", "balance_sheet_parent"),
+                ),
+                (
+                    "合并和公司利润表",
+                    ("income_statement", "income_statement_parent"),
+                ),
+                (
+                    "合并和银行利润表",
+                    ("income_statement", "income_statement_parent"),
+                ),
+                (
+                    "合并和公司现金流量表",
+                    ("cash_flow_statement", "cash_flow_statement_parent"),
+                ),
+                (
+                    "合并和银行现金流量表",
+                    ("cash_flow_statement", "cash_flow_statement_parent"),
+                ),
+                (
+                    "合并和公司所有者权益变动表",
+                    ("equity_statement", "equity_statement_parent"),
+                ),
+                (
+                    "合并和公司股东权益变动表",
+                    ("equity_statement", "equity_statement_parent"),
+                ),
+                (
+                    "合并和银行所有者权益变动表",
+                    ("equity_statement", "equity_statement_parent"),
+                ),
+                (
+                    "合并和银行股东权益变动表",
+                    ("equity_statement", "equity_statement_parent"),
+                ),
             ],
         )
         self.assertFalse(taxonomy.by_key()["decision_procedures"].overview_container)
@@ -387,6 +694,14 @@ class SemanticTaxonomyTests(unittest.TestCase):
         self.assertIn(
             "performance_flash",
             taxonomy.by_key()["risk_warning"].scopes,
+        )
+        self.assertNotIn(
+            "performance_forecast",
+            taxonomy.by_key()["risk_warning"].scopes,
+        )
+        self.assertIn(
+            "风险提示",
+            taxonomy.by_key()["performance_forecast_risk"].labels,
         )
         self.assertTrue(
             {"annual_report", "semiannual_report", "quarterly_report"}.issubset(
@@ -504,7 +819,10 @@ class SemanticTaxonomyTests(unittest.TestCase):
         )
 
         self.assertEqual(result.units[0].semantic_keys, ("company_profile_metrics",))
-        self.assertEqual(result.units[0].section_keys, ("company_profile",))
+        self.assertEqual(
+            result.units[0].section_keys,
+            ("company_profile", "company_profile_metrics"),
+        )
         self.assertEqual(adjudicator.calls, 0)
 
     def test_exact_context_heading_substrings_do_not_create_direct_locks(
@@ -591,11 +909,14 @@ class SemanticTaxonomyTests(unittest.TestCase):
             drafts=drafts,
         )
 
-        self.assertEqual(result.units[0].semantic_keys, ("audit_opinion",))
+        self.assertEqual(
+            result.units[0].semantic_keys,
+            ("internal_control", "audit_opinion"),
+        )
         self.assertEqual(result.units[0].section_keys, ("internal_control",))
         self.assertEqual(adjudicator.calls, 0)
 
-    def test_internal_control_context_without_opinion_evidence_stays_section_only(
+    def test_internal_control_context_without_opinion_evidence_is_its_own_topic(
         self,
     ) -> None:
         admitted, drafts = _drafts_with_body(
@@ -620,7 +941,7 @@ class SemanticTaxonomyTests(unittest.TestCase):
             drafts=drafts,
         )
 
-        self.assertIsNone(result.units[0].semantic_keys)
+        self.assertEqual(result.units[0].semantic_keys, ("internal_control",))
         self.assertEqual(result.units[0].section_keys, ("internal_control",))
         self.assertEqual(adjudicator.calls, 0)
 
@@ -827,13 +1148,86 @@ class SemanticTaxonomyTests(unittest.TestCase):
         )
         self.assertEqual(adjudicator.calls, 0)
 
-    def test_event_section_requires_exact_heading_scope_and_unit_content(self) -> None:
-        cases = (
-            ("二、本次配股的认购方法说明", "rights_issue", True),
-            ("二、本次配股的认购方法", "annual_report", True),
-            ("二、本次配股的认购方法", "rights_issue", False),
+    def test_heading_only_restructuring_overview_is_section_context_only(self) -> None:
+        admitted, drafts = _drafts_with_parent_heading(
+            "第一节 本次交易概况",
+            "4、发行股份的种类、每股面值、上市地点",
+            "本次发行的股份种类为人民币普通股。",
         )
-        for parent, filing_type, has_content in cases:
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("exact transaction overview must be deterministic")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="restructuring_assets",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertIsNone(result.units[0].semantic_keys)
+
+        self.assertEqual(
+            result.units[0].section_keys,
+            ("restructuring_transaction_overview",),
+        )
+        self.assertFalse(result.receipts[0].candidate_keys)
+        self.assertEqual(
+            result.units[1].section_keys,
+            ("restructuring_transaction_overview",),
+        )
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_investor_protection_section_is_exact_and_scope_bound(self) -> None:
+        for filing_type, expected in (
+            ("restructuring_assets", ("investor_protection_arrangements",)),
+            ("annual_report", None),
+        ):
+            with self.subTest(filing_type=filing_type):
+                admitted, drafts = _drafts_with_parent_heading(
+                    "六、本次重组对中小投资者权益保护的安排",
+                    "（一）严格履行上市公司信息披露义务",
+                    "上市公司将继续依法及时、准确地履行信息披露义务。",
+                )
+                adjudicator = _Adjudicator(
+                    lambda _batch: self.fail(
+                        "exact investor protection section must not call model"
+                    )
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=adjudicator,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type=filing_type,
+                    ),
+                    drafts=drafts,
+                )
+
+                self.assertEqual(result.units[0].section_keys, expected)
+                self.assertEqual(result.units[1].section_keys, expected)
+                self.assertEqual(adjudicator.calls, 0)
+
+    def test_event_section_requires_exact_heading_and_scope(self) -> None:
+        cases = (
+            ("二、本次配股的认购方法说明", "rights_issue", True, None),
+            ("二、本次配股的认购方法", "annual_report", True, None),
+            (
+                "二、本次配股的认购方法",
+                "rights_issue",
+                False,
+                ("subscription_arrangements",),
+            ),
+        )
+        for parent, filing_type, has_content, expected in cases:
             with self.subTest(
                 parent=parent,
                 filing_type=filing_type,
@@ -862,9 +1256,7 @@ class SemanticTaxonomyTests(unittest.TestCase):
                     drafts=selected,
                 )
 
-                self.assertTrue(
-                    all(unit.section_keys is None for unit in result.units)
-                )
+                self.assertEqual(result.units[0].section_keys, expected)
 
     def test_restructuring_risk_keeps_directly_named_object_topic(self) -> None:
         for title, expected in (
@@ -911,24 +1303,28 @@ class SemanticTaxonomyTests(unittest.TestCase):
                 "第五节 公司治理报告暨企业管治报告",
                 "公司年度治理工作回顾",
                 ("governance",),
+                None,
             ),
             (
                 "第六节 公司治理",
                 "2025年度薪酬情况",
                 ("governance", "directors_management"),
+                ("directors_management",),
             ),
             (
                 "第三节 经营情况讨论与分析",
                 "公司面临的风险和应对措施",
                 ("business_review", "risk_management"),
+                ("risk_management", "business_risk"),
             ),
             (
                 "第六节 公司治理",
                 "审计委员会",
                 ("governance", "board_committees"),
+                ("board_committees",),
             ),
         )
-        for parent, title, expected in cases:
+        for parent, title, expected, expected_semantic in cases:
             with self.subTest(title=title):
                 admitted, drafts = _drafts_with_parent_heading(
                     parent,
@@ -953,16 +1349,11 @@ class SemanticTaxonomyTests(unittest.TestCase):
                     drafts=drafts,
                 )
 
-                expected_semantic = (
-                    ("business_risk",)
-                    if title == "公司面临的风险和应对措施"
-                    else None
-                )
                 self.assertEqual(result.units[1].semantic_keys, expected_semantic)
                 self.assertEqual(result.units[1].section_keys, expected)
                 self.assertEqual(adjudicator.calls, 0)
 
-    def test_exact_composite_heading_projects_each_section_to_content_only(
+    def test_exact_composite_heading_projects_each_section_to_anchor_and_content(
         self,
     ) -> None:
         admitted, drafts = _drafts_with_parent_heading(
@@ -984,7 +1375,10 @@ class SemanticTaxonomyTests(unittest.TestCase):
             drafts=drafts,
         )
 
-        self.assertIsNone(result.units[0].section_keys)
+        self.assertEqual(
+            result.units[0].section_keys,
+            ("governance", "environment_social"),
+        )
         self.assertEqual(
             result.units[1].section_keys,
             ("governance", "environment_social"),
@@ -1148,10 +1542,10 @@ class SemanticTaxonomyTests(unittest.TestCase):
         )
 
         self.assertEqual(result.units[0].semantic_keys, ("important_notice",))
-        self.assertIsNone(result.units[0].section_keys)
+        self.assertEqual(result.units[0].section_keys, ("important_notice",))
         self.assertEqual(adjudicator.calls, 0)
 
-    def test_ordinary_or_inexact_parent_heading_never_propagates(self) -> None:
+    def test_exact_topic_parent_is_structural_even_without_container_flag(self) -> None:
         cases = (
             ("第三节 经营情况讨论与分析", False),
             ("第三节 经营情况讨论与分析概述", True),
@@ -1197,7 +1591,10 @@ class SemanticTaxonomyTests(unittest.TestCase):
                 )
 
                 self.assertIsNone(result.units[1].semantic_key)
-                self.assertIsNone(result.units[1].section_keys)
+                self.assertEqual(
+                    result.units[1].section_keys,
+                    ("business_review",) if not context_container else None,
+                )
                 self.assertEqual(result.receipts[1].decision_source, "fallback")
 
     def test_direct_unit_route_and_section_projection_do_not_compete(self) -> None:
@@ -1349,7 +1746,7 @@ class SemanticTaxonomyTests(unittest.TestCase):
         )
         self.assertFalse(result.receipts[2].candidate_keys)
 
-    def test_heading_only_unit_does_not_inherit_context(self) -> None:
+    def test_heading_only_unit_keeps_exact_structural_context(self) -> None:
         document = _document(
             pages=(
                 (
@@ -1400,7 +1797,7 @@ class SemanticTaxonomyTests(unittest.TestCase):
         )
 
         self.assertIsNone(result.units[1].semantic_keys)
-        self.assertIsNone(result.units[1].section_keys)
+        self.assertEqual(result.units[1].section_keys, ("business_review",))
         self.assertEqual(result.receipts[1].decision_source, "fallback")
 
     def test_direct_body_evidence_precedes_similarity_only_at_candidate_cap(self) -> None:
@@ -1772,6 +2169,182 @@ class SemanticTaxonomyTests(unittest.TestCase):
         )
         self.assertTrue(candidate.locked)
         self.assertIn("source_quantitative_topic", candidate.evidence_kinds)
+
+    def test_periodic_compound_metric_fields_lock_each_direct_topic(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "总体经营情况分析",
+            (
+                "本公司平均总资产收益率(ROAA)和平均净资产收益率(ROAE)"
+                "分别为1.14%和13.48%；贷款和垫款总额74,643.73亿元，"
+                "客户存款总额99,591.97亿元。"
+            ),
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("controlled quantitative fields are closed")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某银行第一季度报告",
+                filing_type="quarterly_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertTrue(
+            {
+                "return_on_equity",
+                "bank_loans_advances",
+                "bank_customer_deposits",
+            }.issubset(result.units[0].semantic_keys or ())
+        )
+
+    def test_product_type_loan_quality_heading_is_exact_but_policy_is_not(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "本公司按产品类型划分的贷款和垫款资产质量情况",
+            "本表列示不良、关注及逾期贷款余额和比率。",
+        )
+        routed = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("the exact source heading is closed")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某银行第一季度报告",
+                filing_type="quarterly_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn("bank_loan_quality", routed.units[0].semantic_keys or ())
+
+        admitted, drafts = _drafts_with_body(
+            "按产品类型划分的贷款和垫款资产质量管理制度",
+            "本制度规定数据填报职责。",
+        )
+        negative = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda batch: tuple(
+                    SemanticAdjudicationDecision(
+                        unit_index=unit.unit_index,
+                        routes=(),
+                    )
+                    for unit in batch.units
+                )
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某银行第一季度报告",
+                filing_type="quarterly_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertNotIn("bank_loan_quality", negative.units[0].semantic_keys or ())
+
+    def test_incentive_result_table_locks_assessment_and_cancellation(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "本次限制性股票归属的具体情况",
+            (
+                "5名激励对象考核结果为不合格，可归属数量为0股。"
+                "上述未归属股份由公司予以作废。"
+            ),
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("source-bound result fields are closed")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="限制性股票归属公告",
+                filing_type="equity_incentive",
+            ),
+            drafts=drafts,
+        )
+        self.assertTrue(
+            {
+                "incentive_performance_assessment",
+                "incentive_cancellation",
+            }.issubset(result.units[0].semantic_keys or ())
+        )
+
+    def test_buyback_purpose_sentence_locks_purpose_not_funding(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "拟回购股份的用途、数量、占总股本比例和资金总额",
+            "本次回购的股份拟用于注销并减少注册资本。",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("the buyback object and purpose are closed")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="股份回购方案公告",
+                filing_type="share_buyback",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn("share_buyback_purpose", result.units[0].semantic_keys or ())
+
+        admitted, drafts = _drafts_with_body(
+            "回购资金安排",
+            "本次回购资金用于公司回购专用账户。",
+        )
+        negative = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda batch: tuple(
+                    SemanticAdjudicationDecision(
+                        unit_index=unit.unit_index,
+                        routes=(),
+                    )
+                    for unit in batch.units
+                )
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="股份回购方案公告",
+                filing_type="share_buyback",
+            ),
+            drafts=drafts,
+        )
+        self.assertNotIn("share_buyback_purpose", negative.units[0].semantic_keys or ())
+
+    def test_event_labeled_field_allows_one_current_event_prefix(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "重要内容提示",
+            "1、本次归属股票上市流通日：2026年6月2日",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("the current event field is closed")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="限制性股票归属公告",
+                filing_type="equity_incentive",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn("unlock_schedule", result.units[0].semantic_keys or ())
 
     def test_periodic_quantitative_topic_prefers_longest_controlled_field(self) -> None:
         cases = (
@@ -2422,7 +2995,7 @@ class SemanticRouterTests(unittest.TestCase):
             (
                 "风险提示",
                 "performance_forecast",
-                "risk_warning",
+                "performance_forecast_risk",
             ),
             (
                 "预计回购注销后公司股权结构的变动情况",
@@ -2590,9 +3163,6 @@ class SemanticRouterTests(unittest.TestCase):
                 "restructuring_transaction_overview",
             ),
         )
-        rule_abstain_titles = {
-            "股东信息",
-        }
         for title, filing_type, expected in cases:
             with self.subTest(title=title):
                 admitted, drafts = _drafts(title)
@@ -2632,18 +3202,11 @@ class SemanticRouterTests(unittest.TestCase):
                     drafts=drafts,
                 )
 
-                expected_keys = None if title in rule_abstain_titles else (expected,)
-                self.assertEqual(result.units[0].semantic_keys, expected_keys)
-                expected_source = (
-                    "fallback"
-                    if title == "股东信息"
-                    else (
-                        "rule_abstain"
-                        if title in rule_abstain_titles
-                        else "deterministic"
-                    )
+                self.assertEqual(result.units[0].semantic_keys, (expected,))
+                self.assertEqual(
+                    result.receipts[0].decision_source,
+                    "deterministic",
                 )
-                self.assertEqual(result.receipts[0].decision_source, expected_source)
                 self.assertEqual(adjudicator.calls, 0)
 
     def test_about_wrapper_does_not_promote_an_unrelated_notice(self) -> None:
@@ -2883,7 +3446,7 @@ class SemanticRouterTests(unittest.TestCase):
         self.assertNotIn("business_risk", routed_child.semantic_keys or ())
 
     def test_heading_only_risk_anchor_does_not_claim_business_risk_content(self) -> None:
-        admitted, drafts = _drafts("1.1市场风险")
+        admitted, drafts = _heading_only_drafts("1.1市场风险")
         result = SemanticRouter(
             taxonomy=load_semantic_route_taxonomy(),
             adjudicator=_Adjudicator(
@@ -3097,7 +3660,9 @@ class SemanticRouterTests(unittest.TestCase):
         self.assertEqual(result.units[0].semantic_keys, ("procedure",))
         self.assertEqual(result.receipts[0].decision_source, "deterministic")
 
-    def test_true_overview_body_anchor_routes_without_model(self) -> None:
+    def test_true_overview_body_anchor_can_add_labeled_secondary_with_model(
+        self,
+    ) -> None:
         admitted, drafts = _drafts_with_body(
             "重大事项提示",
             "本次回购方案的资金来源为自有资金。",
@@ -3121,9 +3686,22 @@ class SemanticRouterTests(unittest.TestCase):
             ),
         )
 
-        adjudicator = _Adjudicator(
-            lambda _batch: self.fail("body-only candidates must remain lexical")
-        )
+        def decide(batch: SemanticAdjudicationBatch):  # type: ignore[no-untyped-def]
+            unit = batch.units[0]
+            return (
+                SemanticAdjudicationDecision(
+                    unit_index=unit.unit_index,
+                    routes=tuple(
+                        SemanticAdjudicatedRoute(
+                            key=candidate.key,
+                            support_ids=candidate.source_ids,
+                        )
+                        for candidate in unit.candidates
+                    ),
+                ),
+            )
+
+        adjudicator = _Adjudicator(decide)
 
         result = SemanticRouter(
             taxonomy=taxonomy,
@@ -3138,9 +3716,12 @@ class SemanticRouterTests(unittest.TestCase):
             drafts=drafts,
         )
 
-        self.assertEqual(result.units[0].semantic_keys, ("share_buyback_plan",))
-        self.assertEqual(result.receipts[0].decision_source, "deterministic")
-        self.assertEqual(adjudicator.calls, 0)
+        self.assertEqual(
+            result.units[0].semantic_keys,
+            ("share_buyback_plan", "share_buyback_funding"),
+        )
+        self.assertEqual(result.receipts[0].decision_source, "model")
+        self.assertEqual(adjudicator.calls, 1)
 
     def test_specific_child_drops_broad_overview_before_model_admission(self) -> None:
         admitted, drafts = _drafts_with_body(
@@ -3446,7 +4027,10 @@ class SemanticRouterTests(unittest.TestCase):
                 "deterministic",
             )
 
-        self.assertEqual(routed, [("revenue_and_cost",)] * 2)
+        self.assertEqual(
+            routed,
+            [("business_review", "revenue_and_cost")] * 2,
+        )
 
     def test_periodic_directional_fact_can_lock_without_an_invented_value(
         self,
@@ -4077,6 +4661,65 @@ class SemanticRouterTests(unittest.TestCase):
         self.assertEqual(result.receipts[0].decision_source, "deterministic")
         self.assertEqual(adjudicator.calls, 0)
 
+    def test_flash_variance_template_heading_is_exact_and_scope_closed(self) -> None:
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("standard flash heading must not call model")
+        )
+        router = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        )
+        admitted, drafts = _drafts_with_body(
+            "（二）变动幅度达 30%以上指标的说明",
+            "净利润和基本每股收益变动的主要原因如下。",
+        )
+
+        result = router.route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司2022年度业绩快报公告",
+                filing_type="performance_flash",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertEqual(
+            result.units[0].semantic_keys,
+            ("performance_flash_variance",),
+        )
+        self.assertIn(
+            "performance_flash_variance",
+            result.units[0].section_keys or (),
+        )
+        self.assertEqual(result.receipts[0].decision_source, "deterministic")
+        self.assertEqual(adjudicator.calls, 0)
+
+        for title, filing_type in (
+            ("变动幅度未达30%的指标说明", "performance_flash"),
+            ("变动幅度达30%以上指标的管理制度", "performance_flash"),
+            ("变动幅度达30%以上指标的说明", "annual_report"),
+        ):
+            with self.subTest(title=title, filing_type=filing_type):
+                admitted, drafts = _drafts_with_body(title, "本段为相邻概念正文。")
+                adjacent = router.route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type=filing_type,
+                    ),
+                    drafts=drafts,
+                )
+                self.assertNotIn(
+                    "performance_flash_variance",
+                    adjacent.units[0].semantic_keys or (),
+                )
+                self.assertNotIn(
+                    "performance_flash_variance",
+                    adjacent.units[0].section_keys or (),
+                )
+        self.assertEqual(adjudicator.calls, 0)
+
     def test_exact_periodic_heading_ignores_broader_title_candidates(self) -> None:
         admitted, drafts = _drafts_with_body(
             "公允价值计量项目相关情况及持有外币金融资产和金融负债情况",
@@ -4232,6 +4875,58 @@ class SemanticRouterTests(unittest.TestCase):
         self.assertEqual(raised.exception.reason_code, "invalid_decision")
         self.assertFalse(raised.exception.retryable)
 
+    def test_legacy_retryable_adjudicator_outage_propagates_without_silent_abstention(
+        self,
+    ) -> None:
+        admitted, drafts = _drafts_with_body(
+            "业绩预告和预计业绩区间",
+            "业绩变动原因",
+        )
+
+        def unavailable(_batch: SemanticAdjudicationBatch):  # type: ignore[no-untyped-def]
+            raise SemanticRouteAdjudicatorError(
+                "quota unavailable",
+                reason_code="rate_limited",
+                retryable=True,
+            )
+
+        router = _router(_Adjudicator(unavailable))
+        context = SemanticDocumentContext(
+            title="某公司业绩预告",
+            filing_type="performance_forecast",
+        )
+        with self.assertRaises(SemanticRouteAdjudicatorError) as raised:
+            router.route(
+                admitted=admitted,
+                document=context,
+                drafts=drafts,
+            )
+
+        self.assertEqual(raised.exception.reason_code, "rate_limited")
+
+    def test_nonretryable_adjudicator_outage_still_fails_closed(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "业绩预告和预计业绩区间",
+            "业绩变动原因",
+        )
+
+        def unavailable(_batch: SemanticAdjudicationBatch):  # type: ignore[no-untyped-def]
+            raise SemanticRouteAdjudicatorError(
+                "configuration invalid",
+                reason_code="invalid_configuration",
+                retryable=False,
+            )
+
+        with self.assertRaises(SemanticRouteAdjudicatorError):
+            _router(_Adjudicator(unavailable)).route(
+                admitted=admitted,
+                document=SemanticDocumentContext(
+                    title="某公司业绩预告",
+                    filing_type="performance_forecast",
+                ),
+                drafts=drafts,
+            )
+
     def test_invalid_batched_support_is_retried_once_as_a_single_unit(self) -> None:
         admitted, drafts = _drafts_with_body(
             "业绩预告和预计业绩区间",
@@ -4350,10 +5045,126 @@ class SemanticRouterTests(unittest.TestCase):
 
         self.assertEqual(result.units[0].semantic_key, "revenue_and_cost")
         self.assertEqual(result.units[0].semantic_keys, ("revenue_and_cost",))
+        self.assertEqual(result.units[0].section_keys, ("revenue_and_cost",))
         self.assertEqual(result.receipts[0].decision_source, "deterministic")
         self.assertEqual(adjudicator.calls, 0)
 
-    def test_locked_route_does_not_call_model_for_optional_body_secondary(self) -> None:
+    def test_exact_structural_parent_and_local_body_corroborate_direct_topic(
+        self,
+    ) -> None:
+        admitted, drafts = _drafts_with_parent_heading(
+            "19、固定资产",
+            "19.2 折旧方法",
+            "固定资产采用年限平均法计提折旧。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("source-bound corroboration is deterministic")
+        )
+
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        child = result.units[1]
+        self.assertEqual(child.section_keys, ("fixed_assets",))
+        self.assertEqual(child.semantic_keys, ("fixed_assets",))
+        self.assertIn("source_section_exact", result.receipts[1].evidence[0].kinds)
+        self.assertIn("source_body_candidate", result.receipts[1].evidence[0].kinds)
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_exact_structural_parent_without_local_topic_stays_section_only(
+        self,
+    ) -> None:
+        admitted, drafts = _drafts_with_parent_heading(
+            "19、固定资产",
+            "19.2 其他说明",
+            "本节未披露其他事项。",
+        )
+
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("structure alone must not use the model")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertEqual(result.units[1].section_keys, ("fixed_assets",))
+        self.assertIsNone(result.units[1].semantic_keys)
+
+    def test_exact_own_context_heading_with_body_is_direct_and_structural(
+        self,
+    ) -> None:
+        admitted, drafts = _drafts_with_body(
+            "经营情况讨论与分析",
+            "报告期内公司继续推进主营业务经营。",
+        )
+
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail(
+                    "an exact own context heading is deterministic"
+                )
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertEqual(result.units[0].semantic_keys, ("business_review",))
+        self.assertEqual(result.units[0].section_keys, ("business_review",))
+        self.assertEqual(result.receipts[0].decision_source, "deterministic")
+
+    def test_exact_context_heading_with_mechanical_toc_stays_structural(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "第九节 财务报告",
+            "内容\n页码\n审计报告 1 - 6\n合并资产负债表 7 - 8",
+        )
+
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("a mechanical TOC must not use the model")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertIsNone(result.units[0].semantic_keys)
+        self.assertEqual(
+            result.units[0].section_keys,
+            ("financial_report_chapter",),
+        )
+
+    def test_locked_route_keeps_independently_labeled_body_secondary(self) -> None:
         admitted, drafts = _drafts_with_body("回购方案", "回购资金来源为自有资金")
         taxonomy = SemanticRouteTaxonomy(
             version="summary-secondary.v1",
@@ -4391,7 +5202,7 @@ class SemanticRouterTests(unittest.TestCase):
 
         self.assertEqual(
             result.units[0].semantic_keys,
-            ("share_buyback_plan",),
+            ("share_buyback_plan", "share_buyback_funding"),
         )
         self.assertIn(
             "share_buyback_funding",
@@ -4399,6 +5210,47 @@ class SemanticRouterTests(unittest.TestCase):
         )
         self.assertEqual(result.receipts[0].decision_source, "deterministic")
         self.assertEqual(adjudicator.calls, 0)
+
+    def test_body_reference_without_labeled_value_stays_candidate_only(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "回购方案",
+            "相关内容详见回购资金来源章节。",
+        )
+        taxonomy = SemanticRouteTaxonomy(
+            version="summary-secondary-reference.v1",
+            definitions=(
+                SemanticRouteDefinition(
+                    key="share_buyback_plan",
+                    description="股份回购方案",
+                    labels=("回购方案",),
+                    scopes=("share_buyback",),
+                ),
+                SemanticRouteDefinition(
+                    key="share_buyback_funding",
+                    description="回购资金来源",
+                    labels=("回购资金来源",),
+                    scopes=("share_buyback",),
+                ),
+            ),
+        )
+
+        result = SemanticRouter(
+            taxonomy=taxonomy,
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("a locked route must not call the model")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="回购报告书",
+                filing_type="share_buyback",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertEqual(result.units[0].semantic_keys, ("share_buyback_plan",))
+        self.assertIn("share_buyback_funding", result.receipts[0].candidate_keys)
 
     def test_scoped_controlled_title_containment_with_content_is_deterministic(
         self,
@@ -4428,8 +5280,608 @@ class SemanticRouterTests(unittest.TestCase):
         self.assertEqual(result.receipts[0].decision_source, "deterministic")
         self.assertEqual(adjudicator.calls, 0)
 
-    def test_title_only_multiple_candidates_abstain_without_model(self) -> None:
-        admitted, drafts = _drafts(
+    def test_reusable_standard_headings_lock_their_central_topic_without_model(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "11.2.3预期信用损失的确定",
+                "本集团计量预期信用损失。",
+                "annual_report",
+                "credit_risk",
+            ),
+            (
+                "-权益工具",
+                "本集团发行的权益工具按合同条款分类。",
+                "annual_report",
+                "financial_instruments_policy",
+            ),
+            (
+                "(b) 金融负债",
+                "本集团对金融负债进行初始确认和后续计量。",
+                "semiannual_report",
+                "financial_instruments_policy",
+            ),
+            (
+                "(i) 金融资产的分类",
+                "本集团依据管理业务模式划分金融资产类别。",
+                "semiannual_report",
+                "financial_instruments_policy",
+            ),
+            (
+                "7、控制的判断标准和合并财务报表的编制方法",
+                "合并财务报表抵销集团内部交易。",
+                "semiannual_report",
+                "scope_of_consolidation",
+            ),
+            (
+                "18、持有待售的非流动资产或处置组",
+                "符合条件的处置组划分为持有待售类别。",
+                "semiannual_report",
+                "held_for_sale",
+            ),
+            (
+                "（六）配售对象",
+                "本次配股向股权登记日收市后的股东配售。",
+                "rights_issue",
+                "issue_allottees",
+            ),
+            (
+                "(三) 资产、负债情况分析",
+                "本节分析报告期末主要资产和负债变化。",
+                "semiannual_report",
+                "assets_liabilities_analysis",
+            ),
+            (
+                "十二、募集资金使用进展说明",
+                "公司披露报告期募集资金使用进展。",
+                "semiannual_report",
+                "fundraising_usage",
+            ),
+            (
+                "(3) 辞退福利的会计处理方法",
+                "辞退福利在满足确认条件时计入当期损益。",
+                "semiannual_report",
+                "employee_benefits_policy",
+            ),
+            (
+                "(2) 报告分部的财务信息",
+                "本节披露各报告分部的资产、收入和经营成果。",
+                "semiannual_report",
+                "segment_information",
+            ),
+            (
+                "30.1按照业务类型披露收入确认和计量所采用的会计政策 -续",
+                "本集团按履约义务确认收入。",
+                "annual_report",
+                "revenue_recognition_policy",
+            ),
+            (
+                "22.1消耗性生物资产",
+                "消耗性生物资产按成本计量。",
+                "annual_report",
+                "biological_assets",
+            ),
+            (
+                "3、在合营企业或联营企业中的权益 -续",
+                "本集团披露合营企业和联营企业的汇总财务信息。",
+                "annual_report",
+                "interests_in_other_entities",
+            ),
+            (
+                "（二）确保本次交易的定价公平、公允",
+                "交易作价以评估值为依据。",
+                "restructuring_assets",
+                "valuation_pricing",
+            ),
+            (
+                "7、锁定期安排",
+                "交易对方取得的股份自登记日起十二个月内不转让。",
+                "restructuring_assets",
+                "transaction_share_lockup",
+            ),
+            (
+                "8、期间损益安排",
+                "损益归属期间的盈利由上市公司享有。",
+                "restructuring_assets",
+                "transition_period_profit_loss",
+            ),
+            (
+                "（2）后续安排及对本次交易的影响",
+                "本节披露后续安排及其交易影响。",
+                "restructuring_assets",
+                "transaction_impact",
+            ),
+            (
+                "①担保情况",
+                "本节列示标的公司接受担保的情况。",
+                "restructuring_assets",
+                "guarantee_overview",
+            ),
+        )
+        for title, body, filing_type, expected in cases:
+            with self.subTest(title=title):
+                admitted, drafts = _drafts_with_body(title, body)
+                adjudicator = _Adjudicator(
+                    lambda _batch: self.fail(
+                        "a reusable source heading must not need model adjudication"
+                    )
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=adjudicator,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="披露文件",
+                        filing_type=filing_type,
+                    ),
+                    drafts=drafts,
+                )
+
+                self.assertIn(expected, result.units[0].semantic_keys or ())
+                self.assertEqual(result.receipts[0].decision_source, "deterministic")
+                self.assertEqual(adjudicator.calls, 0)
+
+    def test_common_annual_template_headings_lock_direct_and_specific_section(
+        self,
+    ) -> None:
+        cases = (
+            ("“一、上市公司的人员独立", "corporate_independence"),
+            ("三、上市公司的机构独立", "corporate_independence"),
+            ("四、上市公司的业务独立", "corporate_independence"),
+            ("五、上市公司的资产独立", "corporate_independence"),
+            ("一、承诺事项履行情况", "annual_commitment_fulfillment"),
+            (
+                "（二）公司资产或项目存在盈利预测，且报告期仍处在盈利预测期间，"
+                "公司就资产或项目达到原盈利预测及其原因做出说明",
+                "asset_profit_forecast_fulfillment",
+            ),
+            (
+                "二、控股股东及其关联方对上市公司的非经营性占用资金情况",
+                "non_operating_funds_occupation",
+            ),
+            ("三、违规对外担保情况", "illegal_external_guarantees"),
+            ("三、违规担保情况", "illegal_external_guarantees"),
+            (
+                "七、与上年度财务报告相比，合并报表范围发生变化的情况说明",
+                "scope_of_consolidation",
+            ),
+            ("八、聘任、解聘会计师事务所情况", "audit_firm_engagement"),
+            (
+                "九、年度报告披露后面临暂停上市和终止上市情况",
+                "delisting_risk",
+            ),
+            ("十、破产重整相关事项", "bankruptcy_reorganization"),
+            ("十一、重大诉讼、仲裁事项", "major_litigation_arbitration"),
+            ("十二、处罚及整改情况", "regulatory_penalties_remediation"),
+            (
+                "八、上市公司及其董事、高级管理人员、控股股东、实际控制人涉嫌违法违规、受到处罚及整改情况",
+                "regulatory_penalties_remediation",
+            ),
+            (
+                "十三、公司及其第一大股东的诚信状况",
+                "controller_creditworthiness",
+            ),
+            (
+                "九、报告期内公司及其控股股东、实际控制人诚信状况的说明",
+                "controller_creditworthiness",
+            ),
+            (
+                "十四、重大收购资产事项进展情况",
+                "major_asset_acquisition_progress",
+            ),
+            (
+                "（一）与日常经营相关的关联交易",
+                "daily_related_party_transactions",
+            ),
+            (
+                "（二）资产或股权收购、出售发生的关联交易",
+                "related_party_asset_equity_transactions",
+            ),
+            (
+                "（三）共同对外投资的关联交易",
+                "related_party_joint_investments",
+            ),
+            ("（四）关联债权债务往来", "related_party_debt_dealings"),
+            (
+                "是否存在非经营性关联债权债务往来",
+                "related_party_debt_dealings",
+            ),
+            ("其他重大关联交易", "related_party_overview"),
+            ("关联担保情况", "guarantee_overview"),
+            (
+                "为其他单位提供债务担保形成的或有负债及其财务影响",
+                "guarantee_overview",
+            ),
+            (
+                "（五）与存在关联关系的财务公司的往来情况",
+                "related_finance_company_dealings",
+            ),
+            (
+                "（六）公司控股的财务公司与关联方的往来情况",
+                "related_finance_company_dealings",
+            ),
+            ("1、委托理财情况", "entrusted_wealth_management"),
+            ("2、委托贷款情况", "entrusted_loans"),
+            ("（二）非募集资金使用情况", "non_fundraising_usage"),
+            ("十六、重大合同及其履行情况", "major_contracts"),
+            (
+                "十九、购买、出售或赎回本公司之上市证券",
+                "listed_securities_transactions",
+            ),
+            ("（一）报告期内证券发行情况", "securities_issuance_in_period"),
+            (
+                "四、股份回购在报告期的具体实施情况",
+                "share_buyback_implementation",
+            ),
+            (
+                "七、按照《联交所上市规则》关于公众持股量的说明",
+                "public_float_statement",
+            ),
+            (
+                "（三）发行人或投资者选择权条款、投资者保护条款的触发和执行情况",
+                "bond_option_investor_protection",
+            ),
+            ("（六）报告期内信用评级结果调整情况", "bond_credit_rating_change"),
+            (
+                "（七）担保情况、偿债计划及其他偿债保障措施在报告期内的执行情况和变化情况及对债券投资者权益的影响",
+                "bond_repayment_safeguards",
+            ),
+            (
+                "五、报告期内合并报表范围亏损超过上年末净资产 10%",
+                "bond_major_loss_trigger",
+            ),
+            (
+                "六、报告期末除债券外的有息债务逾期情况",
+                "overdue_debt",
+            ),
+            (
+                "十三、市值管理制度和估值提升计划的制定落实情况",
+                "market_value_management",
+            ),
+            (
+                "十一、报告期内，公司及公司董事、高级管理人员受监管部门处罚等情况",
+                "regulatory_penalties_remediation",
+            ),
+            ("十七、报告期内的内部控制制度建设及实施情况", "internal_control"),
+            ("（一）内控评价报告", "internal_control"),
+            ("二十一、环境信息披露情况", "environment_social"),
+            ("二十二、社会责任情况", "environment_social"),
+            (
+                "二十三、巩固拓展脱贫攻坚成果、乡村振兴的情况",
+                "environment_social",
+            ),
+            ("（三）控股股东和实际控制人情况", "controlling_shareholder_profile"),
+            ("四、控股股东情况", "controlling_shareholder_profile"),
+            ("五、实际控制人情况", "controlling_shareholder_profile"),
+            ("（四）控股股东股份质押情况", "share_pledge"),
+            ("十九、内部控制评价报告或内部控制审计报告", "internal_control"),
+            (
+                "七、是否存在被控股股东及其他关联方非经营性占用资金情况",
+                "non_operating_funds_occupation",
+            ),
+            ("5、存货分析", "inventory"),
+            ("（3）存货明细表", "inventory"),
+            ("12、或有负债", "commitments_contingencies"),
+            ("14.1.1 存货类别", "inventory"),
+            ("14.1.2发出存货的计价方法", "inventory"),
+            ("14.1.3存货的盘存制度", "inventory"),
+            ("14.1.4低值易耗品和包装物的摊销方法", "inventory"),
+        )
+        for title, expected in cases:
+            with self.subTest(title=title, expected=expected):
+                admitted, drafts = _drafts_with_body(title, "□适用 √不适用")
+                adjudicator = _Adjudicator(
+                    lambda _batch: self.fail(
+                        "a regulated annual template heading must be deterministic"
+                    )
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=adjudicator,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司年度报告",
+                        filing_type="annual_report",
+                    ),
+                    drafts=drafts,
+                )
+
+                self.assertIn(expected, result.units[0].semantic_keys or ())
+                self.assertIn(expected, result.units[0].section_keys or ())
+                self.assertEqual(result.receipts[0].decision_source, "deterministic")
+                self.assertEqual(adjudicator.calls, 0)
+
+    def test_common_annual_template_routes_do_not_widen_to_nearby_titles(
+        self,
+    ) -> None:
+        cases = (
+            ("关于“上市公司的人员独立”的说明", "corporate_independence"),
+            ("存货管理人员培训", "inventory"),
+            ("经营性资金往来情况", "non_operating_funds_occupation"),
+            ("合规对外担保情况", "illegal_external_guarantees"),
+            ("一般合同纠纷说明", "major_litigation_arbitration"),
+            ("日常经营情况", "daily_related_party_transactions"),
+            ("资产出售事项进展", "major_asset_acquisition_progress"),
+            (
+                "其他重大关联交易",
+                "related_party_asset_equity_transactions",
+            ),
+            ("是否存在非经营性资金往来", "related_party_debt_dealings"),
+            ("其他重大关联事项说明", "related_party_overview"),
+            ("关联担保管理制度", "guarantee_overview"),
+            ("一般担保风险分析", "guarantee_overview"),
+            (
+                "与财务公司的日常沟通情况",
+                "related_finance_company_dealings",
+            ),
+            ("募集资金使用情况", "non_fundraising_usage"),
+            ("一般合同履约情况", "major_contracts"),
+            ("证券发行市场回顾", "securities_issuance_in_period"),
+            ("股份回购制度建设", "share_buyback_implementation"),
+            ("公众持股比例变化分析", "public_float_statement"),
+            ("债券信用评级机构联系人", "bond_credit_rating_change"),
+            ("偿债能力分析", "bond_repayment_safeguards"),
+            ("合并报表亏损原因分析", "bond_major_loss_trigger"),
+            ("逾期应收款情况", "overdue_debt"),
+            ("（一）股东情况表", "controlling_shareholder_profile"),
+            (
+                "普通股股东总数及前十名股东持股情况",
+                "controlling_shareholder_profile",
+            ),
+            ("主要资产被查封、扣押、冻结的情况", "share_pledge"),
+            ("八、股份冻结情况", "share_pledge"),
+            ("截至2025年12月31日，公司资产抵押或质押情况如下", "share_pledge"),
+            ("公司资产抵押及质押情况", "share_pledge"),
+            ("三、股份变动及股东情况", "controlling_shareholder_profile"),
+            ("（三）控股股东和实际控制人情况", "share_changes"),
+        )
+
+        def abstain(
+            batch: SemanticAdjudicationBatch,
+        ) -> tuple[SemanticAdjudicationDecision, ...]:
+            return tuple(
+                SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                for unit in batch.units
+            )
+
+        for title, forbidden in cases:
+            with self.subTest(title=title, forbidden=forbidden):
+                admitted, drafts = _drafts_with_body(title, "本节披露相关情况。")
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(abstain),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司年度报告",
+                        filing_type="annual_report",
+                    ),
+                    drafts=drafts,
+                )
+
+                self.assertNotIn(forbidden, result.units[0].semantic_keys or ())
+                self.assertNotIn(forbidden, result.units[0].section_keys or ())
+
+    def test_reporting_period_prefixed_template_heading_matches_whole_label(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "二、报告期内控股股东及其他关联方非经营性占用资金情况",
+                "semiannual_report",
+                "non_operating_funds_occupation",
+            ),
+            (
+                # The taxonomy only carries the bare 核心竞争力分析 label, so
+                # this held-out heading matches through the deixis branch alone.
+                "三、报告期内核心竞争力分析",
+                "semiannual_report",
+                "core_competitiveness",
+            ),
+        )
+        for title, filing_type, expected in cases:
+            with self.subTest(title=title, expected=expected):
+                admitted, drafts = _drafts_with_body(title, "□适用 √不适用")
+                adjudicator = _Adjudicator(
+                    lambda _batch: self.fail(
+                        "a period-prefixed regulated heading must be deterministic"
+                    )
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=adjudicator,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司半年度报告",
+                        filing_type=filing_type,
+                    ),
+                    drafts=drafts,
+                )
+
+                self.assertIn(expected, result.units[0].semantic_keys or ())
+                self.assertIn(expected, result.units[0].section_keys or ())
+                self.assertEqual(result.receipts[0].decision_source, "deterministic")
+                self.assertEqual(adjudicator.calls, 0)
+
+    def test_cumulative_pledge_disclosure_heading_locks_direct_topic(self) -> None:
+        # The 80%-threshold pledge disclosure is a template heading whose only
+        # controlled witness is the 累计质押 alias: a contains lock yields the
+        # direct topic while the non-exact heading legitimately stays out of
+        # section_keys.
+        admitted, drafts = _drafts_with_body(
+            "（四）公司第一大股东累计质押股份数量占其所持公司股份数量比例达到 80%",
+            "□适用 √不适用",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("a unique pledge heading must be deterministic")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertIn("share_pledge", result.units[0].semantic_keys or ())
+        self.assertEqual(result.receipts[0].decision_source, "deterministic")
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_checkbox_applicability_suffix_is_normalized_away(self) -> None:
+        # Template headings sometimes arrive with the applicability checkboxes
+        # glued onto the heading text (observed on the held-out semiannual
+        # environment chapter).  Only checkbox-marked 适用/不适用 tokens are
+        # source noise; a bare statement keeps its words.
+        glued = (
+            "四、纳入环境信息依法披露企业名单的上市公司及其主要子公司的"
+            "环境信息情况√适用 □不适用"
+        )
+        clean = "纳入环境信息依法披露企业名单的上市公司及其主要子公司的环境信息情况"
+        self.assertEqual(_normalize_title(glued), _normalize_title(clean))
+        self.assertEqual(
+            _normalize_title("五、环境保护√适用"),
+            _normalize_title("环境保护"),
+        )
+        for glyph in "√□☑☒":
+            with self.subTest(glyph=glyph):
+                self.assertEqual(
+                    _normalize_title(f"重大合同{glyph}不适用"),
+                    _normalize_title("重大合同"),
+                )
+        # A semantic core ending in 适用 loses only the checkbox token.
+        self.assertEqual(_normalize_title("适用范围□适用"), "适用范围")
+        self.assertEqual(_normalize_title("本节不适用"), "本节不适用")
+
+    def test_reporting_period_prefix_never_splits_an_unrelated_word(self) -> None:
+        def abstain(
+            batch: SemanticAdjudicationBatch,
+        ) -> tuple[SemanticAdjudicationDecision, ...]:
+            return tuple(
+                SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                for unit in batch.units
+            )
+
+        cases = (
+            # 报告期内+部控制… must not be misread as the 内部控制 heading; the
+            # remainder after the deixis is not a closed label by itself.
+            ("报告期内部控制评价情况", "internal_control"),
+            ("报告期内部控制审计报告执行情况", "internal_control"),
+        )
+        for title, forbidden in cases:
+            with self.subTest(title=title, forbidden=forbidden):
+                admitted, drafts = _drafts_with_body(title, "本节披露相关情况。")
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(abstain),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司年度报告",
+                        filing_type="annual_report",
+                    ),
+                    drafts=drafts,
+                )
+
+                self.assertNotIn(forbidden, result.units[0].semantic_keys or ())
+                self.assertNotIn(forbidden, result.units[0].section_keys or ())
+
+    def test_reporting_period_prefixed_heading_stays_scope_bound(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "二、报告期内控股股东及其他关联方非经营性占用资金情况",
+            "□适用 √不适用",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail(
+                "an out-of-scope heading must not reach the adjudicator"
+            )
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司第一季度报告",
+                filing_type="quarterly_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertIsNone(result.units[0].semantic_keys)
+        self.assertNotIn(
+            "non_operating_funds_occupation",
+            result.units[0].section_keys or (),
+        )
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_reporting_period_prefix_collision_never_locks_either_key(self) -> None:
+        taxonomy = SemanticRouteTaxonomy(
+            version="semantic-test-taxonomy.deixis.v1",
+            definitions=(
+                SemanticRouteDefinition(
+                    key="bare_topic",
+                    description="经营专项说明",
+                    labels=("经营专项说明",),
+                    scopes=("annual_report",),
+                ),
+                SemanticRouteDefinition(
+                    key="prefixed_topic",
+                    description="报告期内经营专项说明",
+                    labels=("报告期内经营专项说明",),
+                    scopes=("annual_report",),
+                ),
+            ),
+        )
+        admitted, drafts = _drafts_with_body(
+            "报告期内经营专项说明",
+            "本节披露相关情况。",
+        )
+
+        def abstain(
+            batch: SemanticAdjudicationBatch,
+        ) -> tuple[SemanticAdjudicationDecision, ...]:
+            return tuple(
+                SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                for unit in batch.units
+            )
+
+        result = SemanticRouter(
+            taxonomy=taxonomy,
+            adjudicator=_Adjudicator(abstain),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        # Both keys witness the same exact title, so neither may be uniquely
+        # locked into a deterministic route; the ambiguity stays with the
+        # bounded adjudicator, and structural section labels abstain too.
+        self.assertNotEqual(result.receipts[0].decision_source, "deterministic")
+        self.assertIsNone(result.units[0].semantic_keys)
+        self.assertIsNone(result.units[0].section_keys)
+
+    def test_heading_only_unit_has_no_direct_candidates_or_model_call(self) -> None:
+        admitted, drafts = _heading_only_drafts(
             "重大违法强制退市的终止上市风险提示公告"
         )
         adjudicator = _Adjudicator(
@@ -4450,7 +5902,8 @@ class SemanticRouterTests(unittest.TestCase):
         )
 
         self.assertIsNone(result.units[0].semantic_keys)
-        self.assertEqual(result.receipts[0].decision_source, "rule_abstain")
+        self.assertEqual(result.receipts[0].decision_source, "fallback")
+        self.assertFalse(result.receipts[0].candidate_keys)
         self.assertEqual(adjudicator.calls, 0)
 
     def test_corroborated_controlled_heading_ambiguity_uses_cached_model(self) -> None:
@@ -4495,16 +5948,98 @@ class SemanticRouterTests(unittest.TestCase):
         self.assertTrue(second.receipts[0].adjudicator.cache_hit)  # type: ignore[union-attr]
         self.assertEqual(adjudicator.calls, 1)
 
-    def test_multiple_body_phrase_candidates_do_not_call_model(self) -> None:
+    def test_periodic_closed_heading_body_conflict_can_use_bounded_model(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "收入和成本专题说明",
+            "报告期内营业利润发生重大变化。",
+        )
+        taxonomy = SemanticRouteTaxonomy(
+            version="periodic-bounded-adjudication.v1",
+            definitions=(
+                SemanticRouteDefinition(
+                    key="revenue_topic",
+                    description="营业收入主题",
+                    labels=("收入和成本专题说明",),
+                    scopes=("annual_report",),
+                    overview_container=True,
+                ),
+                SemanticRouteDefinition(
+                    key="cost_topic",
+                    description="营业成本主题",
+                    labels=("收入和成本专题说明",),
+                    scopes=("annual_report",),
+                    overview_container=True,
+                ),
+                SemanticRouteDefinition(
+                    key="profit_topic",
+                    description="营业利润主题",
+                    labels=("营业利润",),
+                    scopes=("annual_report",),
+                ),
+            ),
+        )
+
+        def decide(batch: SemanticAdjudicationBatch):  # type: ignore[no-untyped-def]
+            unit = batch.units[0]
+            profit = next(item for item in unit.candidates if item.key == "profit_topic")
+            return (
+                SemanticAdjudicationDecision(
+                    unit_index=unit.unit_index,
+                    routes=(
+                        SemanticAdjudicatedRoute(
+                            key="profit_topic",
+                            support_ids=profit.source_ids,
+                        ),
+                    ),
+                ),
+            )
+
+        adjudicator = _Adjudicator(decide)
+        result = SemanticRouter(
+            taxonomy=taxonomy,
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertEqual(result.units[0].semantic_keys, ("profit_topic",))
+        self.assertEqual(result.receipts[0].decision_source, "model")
+        self.assertEqual(adjudicator.calls, 1)
+
+    def test_multiple_body_phrase_candidates_use_bounded_model(self) -> None:
         admitted, drafts = _drafts_with_body(
             "附件",
             "业绩预告 预计业绩区间",
         )
-        adjudicator = _Adjudicator(
-            lambda _batch: self.fail(
-                "body phrase collisions are lexical evidence, not model input"
+
+        def decide(batch: SemanticAdjudicationBatch):  # type: ignore[no-untyped-def]
+            unit = batch.units[0]
+            selected = tuple(
+                SemanticAdjudicatedRoute(
+                    key=candidate.key,
+                    support_ids=candidate.source_ids,
+                )
+                for candidate in unit.candidates
+                if candidate.key
+                in {
+                    "performance_forecast_summary",
+                    "performance_forecast_range",
+                }
             )
-        )
+            return (
+                SemanticAdjudicationDecision(
+                    unit_index=unit.unit_index,
+                    routes=selected,
+                ),
+            )
+
+        adjudicator = _Adjudicator(decide)
 
         result = _router(adjudicator).route(
             admitted=admitted,
@@ -4515,9 +6050,119 @@ class SemanticRouterTests(unittest.TestCase):
             drafts=drafts,
         )
 
-        self.assertIsNone(result.units[0].semantic_keys)
-        self.assertEqual(result.receipts[0].decision_source, "rule_abstain")
-        self.assertEqual(adjudicator.calls, 0)
+        self.assertEqual(
+            result.units[0].semantic_keys,
+            ("performance_forecast_range", "performance_forecast_summary"),
+        )
+        self.assertEqual(result.receipts[0].decision_source, "model")
+        self.assertEqual(adjudicator.calls, 1)
+
+    def test_v2_receipt_replay_is_independent_of_current_batch_size(self) -> None:
+        admitted, drafts = _two_model_drafts()
+        self.assertEqual(len(drafts), 2)
+        context = SemanticDocumentContext(
+            title="某公司业绩预告",
+            filing_type="performance_forecast",
+        )
+        executor = _Executor(_select_forecast_summary)
+        routed = SemanticRouter(
+            taxonomy=_taxonomy(),
+            executor=executor,
+            batch_size=2,
+        ).route(admitted=admitted, document=context, drafts=drafts)
+
+        self.assertEqual(executor.calls, 1)
+        self.assertEqual(
+            routed.receipts[0].adjudication,
+            routed.receipts[1].adjudication,
+        )
+        for replay_batch_size in (1, 5):
+            replay_executor = _Executor(
+                lambda _batch: self.fail("replay must not invoke a provider")
+            )
+            replayed = SemanticRouter(
+                taxonomy=_taxonomy(),
+                executor=replay_executor,
+                batch_size=replay_batch_size,
+            ).replay(
+                admitted=admitted,
+                document=context,
+                drafts=drafts,
+                receipts=routed.receipts,
+            )
+            self.assertEqual(replayed.units, routed.units)
+            self.assertEqual(replay_executor.calls, 0)
+
+    def test_v2_receipt_replay_rejects_tampered_group_membership(self) -> None:
+        admitted, drafts = _two_model_drafts()
+        context = SemanticDocumentContext(
+            title="某公司业绩预告",
+            filing_type="performance_forecast",
+        )
+        router = SemanticRouter(
+            taxonomy=_taxonomy(),
+            executor=_Executor(_select_forecast_summary),
+            batch_size=1,
+        )
+        routed = router.route(admitted=admitted, document=context, drafts=drafts)
+        first_adjudication = routed.receipts[0].adjudication
+        self.assertIsNotNone(first_adjudication)
+        tampered = (
+            routed.receipts[0],
+            replace(routed.receipts[1], adjudication=first_adjudication),
+        )
+
+        with self.assertRaisesRegex(
+            SemanticRouteContractError,
+            "group membership or order drifted",
+        ):
+            router.replay(
+                admitted=admitted,
+                document=context,
+                drafts=drafts,
+                receipts=tampered,
+            )
+
+    def test_v2_receipt_replay_rejects_member_lineage_drift(self) -> None:
+        admitted, drafts = _two_model_drafts()
+        context = SemanticDocumentContext(
+            title="某公司业绩预告",
+            filing_type="performance_forecast",
+        )
+        router = SemanticRouter(
+            taxonomy=_taxonomy(),
+            executor=_Executor(_select_forecast_summary),
+            batch_size=2,
+        )
+        routed = router.route(admitted=admitted, document=context, drafts=drafts)
+        second_adjudication = routed.receipts[1].adjudication
+        self.assertIsNotNone(second_adjudication)
+        assert second_adjudication is not None
+        changed_hash = "sha256:" + "4" * 64
+        changed_attempt = replace(
+            second_adjudication.attempts[0],
+            response_sha256=changed_hash,
+        )
+        changed_adjudication = replace(
+            second_adjudication,
+            attempts=(changed_attempt,),
+            group_response_sha256=changed_hash,
+        )
+        tampered = (
+            routed.receipts[0],
+            replace(routed.receipts[1], adjudication=changed_adjudication),
+        )
+
+        with self.assertRaisesRegex(
+            SemanticRouteContractError,
+            "group lineage differs",
+        ):
+            router.replay(
+                admitted=admitted,
+                document=context,
+                drafts=drafts,
+                receipts=tampered,
+            )
 
     def test_cache_identity_binds_the_complete_fixed_model_group(self) -> None:
         document = _document(
@@ -4752,6 +6397,36 @@ class SemanticRouterTests(unittest.TestCase):
             )
         self.assertEqual(adjudicator.calls, 1)
 
+    def test_publish_replay_rejects_structurally_readable_historical_router(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "业绩预告和预计业绩区间",
+            "业绩变动原因",
+        )
+        adjudicator = _Adjudicator(
+            lambda batch: tuple(
+                SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                for unit in batch.units
+            )
+        )
+        router = _router(adjudicator)
+        context = SemanticDocumentContext(
+            title="某公司业绩预告",
+            filing_type="performance_forecast",
+        )
+        routed = router.route(admitted=admitted, document=context, drafts=drafts)
+        historical = tuple(
+            replace(receipt, router_version="semantic_router.v98")
+            for receipt in routed.receipts
+        )
+
+        with self.assertRaisesRegex(SemanticRouteContractError, "router is stale"):
+            router.replay(
+                admitted=admitted,
+                document=context,
+                drafts=drafts,
+                receipts=historical,
+            )
+
     def test_publish_replay_uses_frozen_model_identity_after_config_upgrade(self) -> None:
         admitted, drafts = _drafts_with_body(
             "业绩预告和预计业绩区间",
@@ -4854,6 +6529,2728 @@ class SemanticRouterTests(unittest.TestCase):
                 drafts=drafts,
                 receipts=routed.receipts,
             )
+
+
+    def test_truthfulness_boilerplate_cannot_make_a_title_direct(self) -> None:
+        guarantees = (
+            (
+                "本公司及董事会全体成员保证信息披露内容的真实、准确、完整，"
+                "没有虚假记载、误导性陈述或重大遗漏。"
+            ),
+            (
+                "本公司董事会及全体董事保证本公告内容不存在任何虚假记载、"
+                "误导性陈述或者重大遗漏，并对其内容的真实性、准确性和完整性"
+                "依法承担法律责任。"
+            ),
+        )
+        for guarantee in guarantees:
+            with self.subTest(guarantee=guarantee):
+                admitted, drafts = _drafts_with_body(
+                    "关于以集中竞价交易方式回购A股股份的回购报告书",
+                    guarantee,
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda _batch: self.fail(
+                            "truthfulness boilerplate must not route"
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="关于以集中竞价交易方式回购A股股份的回购报告书",
+                        filing_type="share_buyback",
+                    ),
+                    drafts=drafts,
+                )
+
+                self.assertIsNone(result.units[0].semantic_keys)
+                self.assertFalse(result.receipts[0].candidate_keys)
+                self.assertEqual(result.receipts[0].decision_source, "fallback")
+
+        admitted, drafts = _drafts_with_body(
+            "2026年7月份销售简报",
+            guarantees[0] + "本月销售商品猪666.1万头，销售均价为10.64元/公斤。",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("substantive title carrier is deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="2026年7月份销售简报",
+                filing_type="operating_data",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn("operating_metrics", result.units[0].semantic_keys or ())
+
+        admitted, drafts = _drafts_with_table(
+            "2026年7月份销售简报",
+            f"<table><tr><td>{guarantees[0]}</td></tr></table>",
+        )
+        table_only = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("table boilerplate must not route")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="2026年7月份销售简报",
+                filing_type="operating_data",
+            ),
+            drafts=drafts,
+        )
+        self.assertIsNone(table_only.units[0].semantic_keys)
+
+        admitted, drafts = _drafts_with_table(
+            "2026年7月份销售简报",
+            (
+                f"<table><tr><td>{guarantees[0]}</td></tr>"
+                "<tr><td>本月销售商品猪666.1万头</td></tr></table>"
+            ),
+        )
+        substantive_table = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("substantive table is deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="2026年7月份销售简报",
+                filing_type="operating_data",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn("operating_metrics", substantive_table.units[0].semantic_keys or ())
+
+        admitted, drafts = _drafts_with_table(
+            "关于以集中竞价交易方式回购A股股份的回购报告书",
+            (
+                "<table><tr><td>证券代码</td><td>600028</td></tr>"
+                "<tr><td>证券简称</td><td>中国石化</td></tr>"
+                f"<tr><td colspan='2'>{guarantees[1]}</td></tr></table>"
+            ),
+        )
+        metadata_table = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("metadata plus boilerplate must not route")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="share_buyback",
+            ),
+            drafts=drafts,
+        )
+        self.assertIsNone(metadata_table.units[0].semantic_keys)
+
+        admitted, drafts = _drafts_with_table(
+            "关于以集中竞价交易方式回购A股股份的回购报告书",
+            (
+                "<table><tr><td>回购金额</td><td>1,000万元</td></tr>"
+                f"<tr><td colspan='2'>{guarantees[1]}</td></tr></table>"
+            ),
+        )
+        factual_table = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("factual cover field is deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="share_buyback",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn("share_buyback_plan", factual_table.units[0].semantic_keys or ())
+
+    def test_page_carryover_metadata_cannot_make_a_continuation_direct(self) -> None:
+        cases = (
+            (
+                "审计报告 - 续",
+                ("德师报(审)字(26)第 P05529 号", "(第 2 页，共 6 页)"),
+                "audit_opinion",
+            ),
+            (
+                "四、关键审计事项 -续",
+                ("(第 4 页，共 6 页)",),
+                "key_audit_matters",
+            ),
+        )
+        for title, bodies, forbidden in cases:
+            with self.subTest(title=title):
+                admitted, drafts = _drafts_with_bodies(title, *bodies)
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda _batch: self.fail(
+                            "page carryover metadata must not route"
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司年度报告",
+                        filing_type="annual_report",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertNotIn(forbidden, result.units[0].semantic_keys or ())
+                self.assertFalse(result.receipts[0].candidate_keys)
+
+        admitted, drafts = _drafts_with_bodies(
+            "审计报告 - 续",
+            "德师报(审)字(26)第 P05529 号",
+            "我们认为财务报表在所有重大方面公允反映了财务状况。",
+        )
+        substantive = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("substantive audit text is deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn("audit_opinion", substantive.units[0].semantic_keys or ())
+
+    def test_interest_bearing_debt_structure_table_is_deterministic(self) -> None:
+        admitted, drafts = _drafts_with_table(
+            "（2）有息负债及结构",
+            (
+                "<table><tr><td>融资途径</td><td>融资余额</td><td>期限结构</td></tr>"
+                "<tr><td>银行贷款</td><td>25,778.74</td>"
+                "<td>短期借款、一年内到期的非流动负债、长期借款</td></tr>"
+                "<tr><td>债券</td><td>2,936.02</td><td>应付债券</td></tr>"
+                "<tr><td>其他借款</td><td>7,133.56</td>"
+                "<td>其他应付款、其他非流动负债</td></tr></table>"
+            ),
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("structured debt facts must not call model")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertEqual(
+            set(result.units[0].semantic_keys or ()),
+            {
+                "bonds_payable",
+                "long_term_borrowings",
+                "noncurrent_due_within_one_year",
+                "other_noncurrent_liabilities",
+                "other_payables",
+                "short_term_borrowings",
+            },
+        )
+        self.assertEqual(result.receipts[0].decision_source, "deterministic")
+        self.assertEqual(adjudicator.calls, 0)
+
+        admitted, drafts = _drafts_with_table(
+            "（2）有息负债及结构",
+            "<table><tr><td>融资途径</td><td>融资余额</td></tr>"
+            "<tr><td>债券</td><td>详见应付债券附注第2页</td></tr></table>",
+        )
+        no_structure_header = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda batch: tuple(
+                    SemanticAdjudicationDecision(
+                        unit_index=unit.unit_index,
+                        routes=(),
+                    )
+                    for unit in batch.units
+                )
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertNotEqual(
+            no_structure_header.receipts[0].decision_source,
+            "deterministic",
+        )
+
+        admitted, drafts = _drafts_with_table(
+            "（2）有息负债及结构",
+            "<table><tr><td>长期借款管理制度</td><td>第2号</td></tr>"
+            "<tr><td>是否涉及短期借款政策</td><td>1</td></tr></table>",
+        )
+        policy_table = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda batch: tuple(
+                    SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                    for unit in batch.units
+                )
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertNotEqual(policy_table.receipts[0].decision_source, "deterministic")
+
+    def test_governance_duties_do_not_become_current_plans(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "（二）董事会及管理层的职责",
+            "董事会负责决定经营计划和投资方案，制订利润分配方案。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("governance duties must remain lexical")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertIsNone(result.units[0].semantic_keys)
+        self.assertEqual(result.receipts[0].decision_source, "fallback")
+        self.assertEqual(adjudicator.calls, 0)
+
+        admitted, drafts = _drafts_with_body(
+            "（二）董事会及管理层的职责",
+            "董事会负责制订利润分配方案；公司已审议通过本年度利润分配方案。",
+        )
+        mixed = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda batch: tuple(
+                    SemanticAdjudicationDecision(
+                        unit_index=unit.unit_index,
+                        routes=(),
+                    )
+                    for unit in batch.units
+                )
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn("profit_distribution_plan", mixed.receipts[0].candidate_keys)
+
+        admitted, drafts = _drafts_with_body(
+            "（二）董事会及管理层的职责",
+            "董事会负责制订利润分配方案，并已审议通过本年度利润分配方案。",
+        )
+        comma_mixed = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda batch: tuple(
+                    SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                    for unit in batch.units
+                )
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn(
+            "profit_distribution_plan",
+            comma_mixed.receipts[0].candidate_keys,
+        )
+
+        admitted, drafts = _drafts_with_body(
+            "（二）董事会及管理层的职责",
+            "董事会负责制订利润分配方案且公司已制定本年度利润分配方案。",
+        )
+        conjunction_mixed = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda batch: tuple(
+                    SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                    for unit in batch.units
+                )
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn(
+            "profit_distribution_plan",
+            conjunction_mixed.receipts[0].candidate_keys,
+        )
+
+    def test_accounting_definition_and_treatment_are_direct_topics(self) -> None:
+        cases = (
+            (
+                "33、所得税",
+                "所得税费用包括当期所得税和递延所得税。",
+                {"deferred_tax", "income_tax_expense"},
+            ),
+            (
+                "34.1.5 租赁变更",
+                "本集团重新计量租赁负债，并相应调减使用权资产的账面价值。",
+                {"lease_liabilities", "right_of_use_assets"},
+            ),
+        )
+        for title, body, expected in cases:
+            with self.subTest(title=title):
+                admitted, drafts = _drafts_with_parent_heading(
+                    "(三)重要会计政策和会计估计",
+                    title,
+                    body,
+                )
+                adjudicator = _Adjudicator(
+                    lambda _batch: self.fail(
+                        "accounting relation facts must not call model"
+                    )
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=adjudicator,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司年度报告",
+                        filing_type="annual_report",
+                    ),
+                    drafts=drafts,
+                )
+
+                self.assertEqual(set(result.units[1].semantic_keys or ()), expected)
+                self.assertEqual(
+                    result.receipts[1].decision_source,
+                    "deterministic",
+                )
+                self.assertEqual(adjudicator.calls, 0)
+
+        admitted, drafts = _drafts_with_parent_heading(
+            "(三)重要会计政策和会计估计",
+            "24、长期资产减值",
+            "本集团检查采用成本模式计量的投资性房地产、固定资产、在建工程、使用权资产是否减值。",
+        )
+        generic_list = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("exact impairment heading is deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertEqual(generic_list.units[1].semantic_keys, ("asset_impairment_loss",))
+
+        admitted, drafts = _drafts_with_parent_heading(
+            "(三)重要会计政策和会计估计",
+            "24、长期资产减值",
+            (
+                "本集团在每一个资产负债表日检查长期股权投资、采用成本模式计量的"
+                "投资性房地产、固定资产、在建工程、使用权资产、采用成本模式计量的"
+                "生产性生物资产是否存在可能发生减值的迹象。"
+            ),
+        )
+        long_asset_list = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("exact impairment heading is deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertEqual(
+            long_asset_list.units[1].semantic_keys,
+            ("asset_impairment_loss",),
+        )
+
+        for connector in (
+            "和",
+            "及",
+            "与",
+            "以及",
+            "或",
+            "/",
+            "／",
+            "并",
+            "同",
+        ):
+            with self.subTest(asset_list_connector=connector):
+                admitted, drafts = _drafts_with_parent_heading(
+                    "(三)重要会计政策和会计估计",
+                    "24、长期资产减值",
+                    (
+                        "本集团检查固定资产、使用权资产"
+                        f"{connector}采用成本模式计量的生产性生物资产是否减值。"
+                    ),
+                )
+                list_variant = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda _batch: self.fail(
+                            "exact impairment heading is deterministic"
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司年度报告",
+                        filing_type="annual_report",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertEqual(
+                    list_variant.units[1].semantic_keys,
+                    ("asset_impairment_loss",),
+                )
+
+        for body in (
+            "调整租赁负债和使用权资产。",
+            "同时调整租赁负债及使用权资产。",
+            "对租赁负债与使用权资产进行相应调整。",
+            "租赁负债和使用权资产均相应调整。",
+            "分别调减使用权资产和租赁负债。",
+            "重新计量租赁负债并相应调减使用权资产。",
+            "无需调整租赁负债和使用权资产。",
+        ):
+            with self.subTest(collective_lease_action=body):
+                admitted, drafts = _drafts_with_parent_heading(
+                    "(三)重要会计政策和会计估计",
+                    "其他说明",
+                    body,
+                )
+                collective = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda _batch: self.fail(
+                            "controlled collective lease relation is deterministic"
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司年度报告",
+                        filing_type="annual_report",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertEqual(
+                    set(collective.units[1].semantic_keys or ()),
+                    {"lease_liabilities", "right_of_use_assets"},
+                )
+
+        admitted, drafts = _drafts_with_parent_heading(
+            "(三)重要会计政策和会计估计",
+            "其他说明",
+            "对使用权资产及其累计折旧相应调整。",
+        )
+        same_object_extension = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("same-object extension is deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertEqual(
+            same_object_extension.units[1].semantic_keys,
+            ("right_of_use_assets",),
+        )
+
+        for body in (
+            "调整不属于租赁负债和使用权资产的固定资产。",
+            "调整固定资产而非租赁负债和使用权资产。",
+            "除租赁负债和使用权资产外固定资产进行调整。",
+            "租赁负债和使用权资产以外的固定资产进行调整。",
+            "租赁负债和使用权资产用于说明固定资产调整。",
+            "该事项不属于使用权资产的调整。",
+            "该事项并非使用权资产的调整。",
+            "该事项不是使用权资产的调整。",
+            "该事项是与使用权资产无关的调整。",
+            "调整范围不包括使用权资产。",
+            "与使用权资产相比固定资产调整幅度更高。",
+            "使用权资产高于调整后的固定资产。",
+            "使用权资产的定义不包括调整后的固定资产。",
+            "租赁负债和使用权资产的定义不包括调整后的固定资产。",
+        ):
+            with self.subTest(collective_lease_negative=body):
+                admitted, drafts = _drafts_with_parent_heading(
+                    "(三)重要会计政策和会计估计",
+                    "其他说明",
+                    body,
+                )
+                negative = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda batch: tuple(
+                            SemanticAdjudicationDecision(
+                                unit_index=unit.unit_index,
+                                routes=(),
+                            )
+                            for unit in batch.units
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司年度报告",
+                        filing_type="annual_report",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertNotEqual(
+                    negative.receipts[1].decision_source,
+                    "deterministic",
+                )
+
+        for body in (
+            "本集团未确认使用权资产。",
+            "使用权资产无需调整。",
+        ):
+            with self.subTest(negative_accounting_fact=body):
+                admitted, drafts = _drafts_with_parent_heading(
+                    "(三)重要会计政策和会计估计",
+                    "其他说明",
+                    body,
+                )
+                negative_fact = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda _batch: self.fail(
+                            "negative accounting fact is still a direct topic"
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司年度报告",
+                        filing_type="annual_report",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertEqual(
+                    negative_fact.units[1].semantic_keys,
+                    ("right_of_use_assets",),
+                )
+
+        for body in (
+            "调整事项详见租赁负债会计政策。",
+            "所得税费用包括项目详见递延所得税附注。",
+            "所得税费用由递延所得税附注解释。",
+            "调整事项请见附注，租赁负债和使用权资产列示于附注。",
+            "租赁负债的调整见本财务报表附注三。",
+            "使用权资产计量情况见第十节。",
+            "租赁负债的计量列示于本财务报表附注三。",
+            "使用权资产计量情况见上述附注。",
+        ):
+            with self.subTest(cross_reference=body):
+                admitted, drafts = _drafts_with_parent_heading(
+                    "(三)重要会计政策和会计估计",
+                    "其他说明",
+                    body,
+                )
+                cross_reference = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda batch: tuple(
+                            SemanticAdjudicationDecision(
+                                unit_index=unit.unit_index,
+                                routes=(),
+                            )
+                            for unit in batch.units
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司年度报告",
+                        filing_type="annual_report",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertNotEqual(
+                    cross_reference.receipts[1].decision_source,
+                    "deterministic",
+                )
+
+        for body, expected in (
+            (
+                "所得税费用主要包括当期所得税和递延所得税。",
+                {"deferred_tax", "income_tax_expense"},
+            ),
+            (
+                "所得税费用由当期所得税和递延所得税组成。",
+                {"deferred_tax", "income_tax_expense"},
+            ),
+            (
+                "所得税费用主要由当期所得税和递延所得税构成。",
+                {"deferred_tax", "income_tax_expense"},
+            ),
+            (
+                "当期所得税和递延所得税共同构成所得税费用。",
+                {"deferred_tax", "income_tax_expense"},
+            ),
+            (
+                "所得税费用包括当期所得税，同时包括递延所得税。",
+                {"deferred_tax", "income_tax_expense"},
+            ),
+            (
+                "所得税费用包括当期所得税，并且包括递延所得税。",
+                {"deferred_tax", "income_tax_expense"},
+            ),
+            (
+                "租赁负债按变更后付款额重新计量，并相应调整使用权资产。",
+                {"lease_liabilities", "right_of_use_assets"},
+            ),
+            (
+                "使用权资产账面价值相应调减，租赁负债相应减少。",
+                {"lease_liabilities", "right_of_use_assets"},
+            ),
+            (
+                "本集团重新计量租赁负债，相关金额列示于本财务报表附注三。",
+                {"lease_liabilities"},
+            ),
+            (
+                "所得税费用包括当期所得税和递延所得税，相关金额列示于本财务报表附注三。",
+                {"deferred_tax", "income_tax_expense"},
+            ),
+        ):
+            with self.subTest(accounting_variant=body):
+                admitted, drafts = _drafts_with_parent_heading(
+                    "(三)重要会计政策和会计估计",
+                    "其他说明",
+                    body,
+                )
+                relation = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda _batch: self.fail(
+                            "direct accounting treatment must not call model"
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司年度报告",
+                        filing_type="annual_report",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertEqual(set(relation.units[1].semantic_keys or ()), expected)
+
+    def test_key_audit_selection_procedure_is_direct_but_report_reference_is_not(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "七、注册会计师对财务报表审计的责任 -续",
+            "我们确定哪些事项最为重要，因而构成关键审计事项。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("KAM procedure must not call model")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司年度报告",
+                filing_type="annual_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertEqual(result.units[0].semantic_keys, ("key_audit_matters",))
+        self.assertEqual(result.receipts[0].decision_source, "deterministic")
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_buyback_result_notice_window_is_not_a_result_or_capital_change(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "相关主体在回购期间的增减持计划",
+            "自首次披露回购事项之日起至披露回购结果暨股份变动公告期间不得减持。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("notice window must remain lexical")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="关于回购股份方案的公告",
+                filing_type="share_buyback",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertNotIn("share_buyback_completion", result.units[0].semantic_keys or ())
+        self.assertNotIn("share_capital_change", result.units[0].semantic_keys or ())
+        self.assertEqual(result.receipts[0].decision_source, "rule_abstain")
+        self.assertEqual(adjudicator.calls, 0)
+
+        admitted, drafts = _drafts_with_body(
+            "相关主体在回购期间的增减持计划",
+            "自首次披露回购事项之日起至披露回购结果和股份变动公告期间不得减持。",
+        )
+        conjunction_variant_adjudicator = _Adjudicator(
+            lambda _batch: self.fail("normalized notice-window synonym is lexical")
+        )
+        conjunction_variant = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=conjunction_variant_adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="关于回购股份方案的公告",
+                filing_type="share_buyback",
+            ),
+            drafts=drafts,
+        )
+        self.assertEqual(
+            conjunction_variant.receipts[0].decision_source,
+            "rule_abstain",
+        )
+        self.assertEqual(conjunction_variant_adjudicator.calls, 0)
+
+        admitted, drafts = _drafts_with_body(
+            "相关主体在回购期间的增减持计划",
+            (
+                "自首次披露回购事项之日起至披露回购结果暨股份变动公告期间不得减持；"
+                "本次回购已完成并导致股份变动。"
+            ),
+        )
+        mixed = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda batch: tuple(
+                    SemanticAdjudicationDecision(
+                        unit_index=unit.unit_index,
+                        routes=(),
+                    )
+                    for unit in batch.units
+                )
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="关于回购股份方案的公告",
+                filing_type="share_buyback",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn("share_buyback_completion", mixed.receipts[0].candidate_keys)
+        self.assertIn("share_capital_change", mixed.receipts[0].candidate_keys)
+
+        admitted, drafts = _drafts_with_body(
+            "相关主体在回购期间的增减持计划",
+            (
+                "自首次披露回购事项之日起至披露回购结果暨股份变动公告期间不得减持，"
+                "本次回购已完成并导致股份变动。"
+            ),
+        )
+        comma_mixed = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda batch: tuple(
+                    SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                    for unit in batch.units
+                )
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="关于回购股份方案的公告",
+                filing_type="share_buyback",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn(
+            "share_buyback_completion",
+            comma_mixed.receipts[0].candidate_keys,
+        )
+        self.assertIn("share_capital_change", comma_mixed.receipts[0].candidate_keys)
+
+        admitted, drafts = _drafts_with_body(
+            "相关主体在回购期间的增减持计划",
+            (
+                "自首次披露回购事项之日起至披露回购结果暨股份变动公告期间不得减持且"
+                "本次回购已完成并导致股份变动。"
+            ),
+        )
+        conjunction_mixed = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda batch: tuple(
+                    SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                    for unit in batch.units
+                )
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="关于回购股份方案的公告",
+                filing_type="share_buyback",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn(
+            "share_capital_change",
+            conjunction_mixed.receipts[0].candidate_keys,
+        )
+
+    def test_correction_title_keeps_overview_and_underlying_shareholder_event(
+        self,
+    ) -> None:
+        admitted, drafts = _drafts_with_body(
+            "赛力斯集团股份有限公司关于公司董事、高级管理人员及骨干团队增持A股及H股股份结果的更正公告",
+            "更正后：增持股数为1,000万股。",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("anchored correction title is deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="关于股份增持结果的更正公告",
+                filing_type="correction_supplement",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertEqual(result.units[0].semantic_key, "correction_overview")
+        self.assertIn("shareholder_change", result.units[0].semantic_keys or ())
+        self.assertIn("corrected_data", result.units[0].semantic_keys or ())
+
+        admitted, drafts = _drafts_with_body(
+            "某公司关于产品库存增加结果的更正公告",
+            "原公告中的产品库存有误，更正后为100件。",
+        )
+        negative = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("anchored non-shareholder correction is deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="correction_supplement",
+            ),
+            drafts=drafts,
+        )
+        self.assertNotIn("shareholder_change", negative.units[0].semantic_keys or ())
+
+        admitted, drafts = _drafts_with_body(
+            "某公司关于股东增持可转换公司债券结果的更正公告",
+            "更正后：股东增持可转换公司债券1,000张。",
+        )
+        bond_negative = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda batch: tuple(
+                    SemanticAdjudicationDecision(
+                        unit_index=unit.unit_index,
+                        routes=(),
+                    )
+                    for unit in batch.units
+                )
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="correction_supplement",
+            ),
+            drafts=drafts,
+        )
+        self.assertNotIn(
+            "shareholder_change",
+            bond_negative.units[0].semantic_keys or (),
+        )
+
+    def test_new_exact_route_labels_are_scope_bound(self) -> None:
+        cases = (
+            ("7、转股起止日期", "convertible_bond", "conversion_terms"),
+            ("二、回购方案的主要内容", "share_buyback", "share_buyback_plan"),
+            ("4、ESG", "annual_report", "environment_social"),
+            (
+                "2、房地产开发项目存货的减值",
+                "annual_report",
+                "inventory",
+            ),
+            (
+                "(iv) 存货可变现净值",
+                "semiannual_report",
+                "inventory",
+            ),
+            (
+                "(1)未决诉讼仲裁形成的或有负债及其财务影响",
+                "annual_report",
+                "major_litigation_arbitration",
+            ),
+        )
+        for title, filing_type, expected in cases:
+            with self.subTest(title=title, expected=expected):
+                admitted, drafts = _drafts_with_body(title, "本节披露相关具体事实。")
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda _batch: self.fail("exact title must be deterministic")
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type=filing_type,
+                    ),
+                    drafts=drafts,
+                )
+                self.assertIn(expected, result.units[0].semantic_keys or ())
+                self.assertIn(expected, result.units[0].section_keys or ())
+
+        for title, filing_type, forbidden in (
+            ("转股起止日期管理制度", "convertible_bond", "conversion_terms"),
+            ("回购方案实施进展", "share_buyback", "share_buyback_plan"),
+            ("ESG培训安排", "annual_report", "environment_social"),
+            ("房地产开发项目进度", "annual_report", "inventory"),
+            ("存货可变现净值管理制度", "semiannual_report", "inventory"),
+            ("一般未决诉讼事项", "annual_report", "major_litigation_arbitration"),
+        ):
+            with self.subTest(title=title, forbidden=forbidden):
+                admitted, drafts = _drafts_with_body(title, "本节披露相邻事项。")
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda batch: tuple(
+                            SemanticAdjudicationDecision(
+                                unit_index=unit.unit_index,
+                                routes=(),
+                            )
+                            for unit in batch.units
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type=filing_type,
+                    ),
+                    drafts=drafts,
+                )
+                self.assertNotIn(forbidden, result.units[0].semantic_keys or ())
+                self.assertNotIn(forbidden, result.units[0].section_keys or ())
+
+        admitted, drafts = _drafts_with_body(
+            "一、可转换公司债券基本概况",
+            "7、转股起止日期：2022年2月21日起至2027年8月15日止。",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("typed conversion field is deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="convertible_bond",
+            ),
+            drafts=drafts,
+        )
+        self.assertIn("conversion_terms", result.units[0].semantic_keys or ())
+
+    def test_convertible_bond_fields_use_closed_factual_witnesses(self) -> None:
+        cases = (
+            (
+                "特别提示",
+                "5、“牧原转债”票面利率：第一年0.20%，第二年0.40%。",
+                {"interest_terms"},
+            ),
+            (
+                "一、可转换公司债券基本概况",
+                "13、担保情况：本次发行的可转换公司债券不提供担保。",
+                {"bond_guarantee_terms"},
+            ),
+            (
+                "一、可转换公司债券基本概况",
+                "14、“牧原转债”信用评级：主体AAA，债项AAA，展望稳定。",
+                {"bond_credit_rating"},
+            ),
+            (
+                "二、本期付息方案",
+                (
+                    "个人投资者债券利息所得税由公司按20%代扣代缴；"
+                    "合格境外机构投资者暂免征收，其他持有人自行缴纳。"
+                ),
+                {"bond_interest_tax"},
+            ),
+            (
+                "（3）付息方式",
+                "④应付税项由持有人承担。",
+                {"bond_interest_tax"},
+            ),
+        )
+        for title, body, expected in cases:
+            with self.subTest(title=title, expected=expected):
+                admitted, drafts = _drafts_with_body(title, body)
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda _batch: self.fail("closed bond field is deterministic")
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type="convertible_bond",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertTrue(expected.issubset(result.units[0].semantic_keys or ()))
+
+        for body, forbidden in (
+            ("公司预计“牧原转债”票面利率可能调整。", "interest_terms"),
+            ("担保情况管理制度由公司董事会审议。", "bond_guarantee_terms"),
+            ("债券信用评级机构联系人为张某。", "bond_credit_rating"),
+            ("本期每10张债券派发利息15元（含税）。", "bond_interest_tax"),
+        ):
+            with self.subTest(body=body, forbidden=forbidden):
+                admitted, drafts = _drafts_with_body("本期付息相关说明", body)
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda batch: tuple(
+                            SemanticAdjudicationDecision(
+                                unit_index=unit.unit_index,
+                                routes=(),
+                            )
+                            for unit in batch.units
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type="convertible_bond",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertNotIn(forbidden, result.units[0].semantic_keys or ())
+
+    def test_annual_incentive_nonimplementation_sets_topic_without_inventing_applicability(
+        self,
+    ) -> None:
+        admitted, drafts = _drafts_with_body(
+            "十五、公司股权激励计划、员工持股计划或其他员工激励措施的实施情况",
+            "本公司于报告期内未实施股权激励计划、员工持股计划或其他员工激励措施。",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("exact annual incentive title is deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(title=None, filing_type="annual_report"),
+            drafts=drafts,
+        )
+
+        self.assertEqual(result.units[0].semantic_keys, ("incentive_implementation",))
+        self.assertIsNone(result.units[0].applicability)
+
+        admitted, drafts = _drafts_with_body(
+            "员工激励措施培训情况",
+            "公司未实施本次员工培训计划。",
+        )
+        negative = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("nearby heading must abstain")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(title=None, filing_type="annual_report"),
+            drafts=drafts,
+        )
+        self.assertNotIn("incentive_implementation", negative.units[0].semantic_keys or ())
+        self.assertIsNone(negative.units[0].applicability)
+
+    def test_litigation_route_preserves_source_checkbox_applicability(
+        self,
+    ) -> None:
+        admitted, drafts = _drafts_with_bodies(
+            "十一、重大诉讼、仲裁事项",
+            "□适用 √不适用",
+            (
+                "本报告期公司无单一诉讼达到重大的事项，"
+                "但累计诉讼金额达到披露要求，公司已披露累计诉讼情况公告。"
+            ),
+        )
+        self.assertEqual(drafts[0].applicability, "not_applicable")
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("exact litigation title is deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(title=None, filing_type="annual_report"),
+            drafts=drafts,
+        )
+
+        self.assertIn("major_litigation_arbitration", result.units[0].semantic_keys or ())
+        self.assertEqual(result.units[0].applicability, "not_applicable")
+
+        admitted, drafts = _drafts_with_bodies(
+            "十一、重大诉讼、仲裁事项",
+            "□适用 √不适用",
+            "本报告期公司不存在重大诉讼或仲裁。",
+        )
+        negative = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("exact litigation title is deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(title=None, filing_type="annual_report"),
+            drafts=drafts,
+        )
+        self.assertEqual(negative.units[0].applicability, "not_applicable")
+
+    def test_long_report_semantic_witnesses_are_closed_and_deterministic(
+        self,
+    ) -> None:
+        no_call = _Adjudicator(
+            lambda _batch: self.fail("closed long-report witnesses are deterministic")
+        )
+
+        admitted, drafts = _drafts_with_body(
+            "金融负债的分类、确认及计量",
+            "本节规定金融负债的初始确认、后续计量和终止确认。",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=no_call,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="semiannual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertEqual(
+            result.units[0].semantic_keys,
+            ("financial_instruments_policy",),
+        )
+
+        admitted, drafts = _drafts_with_body(
+            "研究开发费用加计扣除",
+            "研发费用按规定加计扣除；形成无形资产的，按200%税前摊销。",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=no_call,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="semiannual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertEqual(result.units[0].semantic_keys, ("rd_expenses",))
+
+        admitted, drafts = _drafts_with_body(
+            "市值管理",
+            "公司将市值管理作为系统性工程，注销回购股份以提升股东的每股收益。",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=no_call,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="semiannual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertTrue(
+            {"market_value_management", "earnings_per_share"}.issubset(
+                result.units[0].semantic_keys or ()
+            )
+        )
+
+        admitted, drafts = _drafts_with_bodies(
+            "利润表及现金流量表相关科目变动分析表",
+            "销售费用变动原因说明：销售规模增加。",
+            "管理费用变动原因说明：管理投入增加。",
+            "财务费用变动原因说明：汇兑损益变化。",
+            "研发费用变动原因说明：研发投入增加。",
+            "营业收入变动原因说明：产品销量增加。",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=no_call,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="semiannual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertEqual(
+            set(result.units[0].semantic_keys or ()),
+            {
+                "admin_expenses",
+                "finance_expenses",
+                "rd_expenses",
+                "revenue_and_cost",
+                "selling_expenses",
+            },
+        )
+
+    def test_ragged_table_header_cannot_lock_a_financial_route(self) -> None:
+        ragged = (
+            "<table><tr><td>营业收入</td><td>本期数</td><td>上期数</td></tr>"
+            "<tr><td>甲</td><td>1</td><td>2</td></tr>"
+            "<tr><td>乙</td><td>3</td></tr></table>"
+        )
+        admitted, drafts = _drafts_with_table("经营情况", ragged)
+        abstain = _Adjudicator(
+            lambda batch: tuple(
+                SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                for unit in batch.units
+            )
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=abstain,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="semiannual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertNotIn("revenue_and_cost", result.units[0].semantic_keys or ())
+
+    def test_malformed_table_grammar_cannot_lock_financial_routes(self) -> None:
+        malformed_tables = (
+            "<table><tfoot><tr><td>营业收入</td><td>100</td></tr></tfoot>"
+            "<tfoot><tr><td>研发费用</td><td>20</td></tr></tfoot></table>",
+            "<table><div><tr><td>营业收入</td><td>100</td></tr>"
+            "<tr><td>研发费用</td><td>20</td></tr></div></table>",
+        )
+        for malformed in malformed_tables:
+            with self.subTest(malformed=malformed):
+                admitted, drafts = _drafts_with_table("经营情况", malformed)
+                no_call = _Adjudicator(
+                    lambda _batch: self.fail(
+                        "malformed table text must not require adjudication"
+                    )
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=no_call,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title=None,
+                        filing_type="semiannual_report",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertEqual(result.units[0].semantic_keys, None)
+                self.assertEqual(result.receipts[0].decision_source, "rule_abstain")
+                self.assertEqual(no_call.calls, 0)
+                self.assertEqual(
+                    result.units[0].payload.get("table_body"),
+                    malformed,
+                )
+
+    def test_materiality_and_closed_tables_do_not_require_model_adjudication(
+        self,
+    ) -> None:
+        no_call = _Adjudicator(
+            lambda _batch: self.fail("closed table semantics are deterministic")
+        )
+        admitted, drafts = _drafts_with_bodies_and_table(
+            "5、重要性标准确定方法和选择依据",
+            (
+                "√适用 □不适用",
+                "在判断重要性时，本集团从项目性质和金额两方面予以判断。",
+            ),
+            "<table><tr><td>项目</td><td>重要性标准</td></tr>"
+            "<tr><td>重要的资本化研发项目</td>"
+            "<td>金额占研发支出10%以上</td></tr></table>",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=no_call,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="semiannual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertIsNone(result.units[0].semantic_keys)
+
+        admitted, drafts = _drafts_with_bodies_and_table(
+            "5、重要性标准确定方法和选择依据",
+            ("在判断重要性时，本集团从项目性质和金额两方面予以判断。",),
+            "<table><tr><td>项目</td><td>重要性标准</td></tr>"
+            "<tr><td>营业收入</td><td>金额超过1000万元</td></tr>"
+            "<tr><td>研发费用</td><td>金额超过500万元</td></tr></table>",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=no_call,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="semiannual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertIsNone(result.units[0].semantic_keys)
+
+        admitted, drafts = _drafts_with_bodies_and_table(
+            "重要非全资子公司的主要财务信息",
+            ("（5）结构化主体的相关情况：", "□适用 √不适用"),
+            '<table><tr><td rowspan="2">子公司名称</td>'
+            '<td colspan="2">本期发生额</td></tr>'
+            "<tr><td>营业收入</td><td>净利润</td></tr>"
+            "<tr><td>甲公司</td><td>100</td><td>20</td></tr></table>",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=no_call,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="semiannual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertTrue(
+            {
+                "interests_in_other_entities",
+                "subsidiaries_analysis",
+                "structured_entities",
+                "revenue_and_cost",
+            }.issubset(result.units[0].semantic_keys or ())
+        )
+
+        admitted, drafts = _drafts_with_table(
+            "购销商品、提供和接受劳务的关联交易",
+            "<table><tr><td>关联方</td><td>关联交易内容</td>"
+            "<td>本期发生额</td><td>上期发生额</td></tr>"
+            "<tr><td>东风汽车财务有限公司</td><td>利息收入</td>"
+            "<td></td><td>11.31</td></tr>"
+            "<tr><td>某融资租赁有限公司</td><td>出售商品、提供劳务</td>"
+            "<td>22,979.38</td><td>2,477.00</td></tr></table>",
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=no_call,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="semiannual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertTrue(
+            {"daily_related_party_transactions", "interest_income"}.issubset(
+                result.units[0].semantic_keys or ()
+            )
+        )
+        self.assertNotIn(
+            "revenue_recognition_policy",
+            result.units[0].semantic_keys or (),
+        )
+        self.assertNotIn("lease_note", result.units[0].semantic_keys or ())
+
+    def test_foreign_numbered_page_footnote_is_not_direct_semantic_evidence(
+        self,
+    ) -> None:
+        document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "现金储备"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (
+                            ProviderPayload(
+                                "text",
+                                None,
+                                "现金储备超过731.5亿元<sup>2</sup>。",
+                            ),
+                        ),
+                        annotation=None,
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "其他指标"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        3,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "其他指标保持稳定。"),),
+                        annotation=None,
+                    ),
+                    _block(
+                        4,
+                        0,
+                        "page_footnote",
+                        (
+                            ProviderPayload(
+                                "text",
+                                None,
+                                (
+                                    "<sup>2</sup>现金储备包含货币资金、"
+                                    "交易性金融资产。"
+                                ),
+                            ),
+                        ),
+                        annotation="page_footnote",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        admitted = _admitted(document)
+        drafts = build_provider_units(admitted).units
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("a foreign numbered footnote is related-only")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="semiannual_report",
+            ),
+            drafts=drafts,
+        )
+        self.assertEqual(len(result.units), 2)
+        self.assertNotIn(
+            "monetary_funds",
+            result.units[1].semantic_keys or (),
+        )
+        self.assertNotIn(
+            "trading_financial_assets",
+            result.units[1].semantic_keys or (),
+        )
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_numbered_page_footnote_requires_an_owned_antecedent(
+        self,
+    ) -> None:
+        context = SemanticDocumentContext(title=None, filing_type="semiannual_report")
+        footnote = (
+            "<sup>2</sup>现金储备包含货币资金、交易性金融资产。"
+        )
+
+        def route(document: ProviderDocument) -> tuple[SemanticRouteBatchResult, int]:
+            admitted = _admitted(document)
+            drafts = build_provider_units(admitted).units
+            def decide(
+                batch: SemanticAdjudicationBatch,
+            ) -> tuple[SemanticAdjudicationDecision, ...]:
+                return tuple(
+                    SemanticAdjudicationDecision(
+                        unit_index=unit.unit_index,
+                        routes=tuple(
+                            SemanticAdjudicatedRoute(
+                                key=candidate.key,
+                                support_ids=candidate.source_ids,
+                            )
+                            for candidate in unit.candidates
+                            if candidate.key
+                            in {"monetary_funds", "trading_financial_assets"}
+                        ),
+                    )
+                    for unit in batch.units
+                )
+            adjudicator = _Adjudicator(decide)
+            result = SemanticRouter(
+                taxonomy=load_semantic_route_taxonomy(),
+                adjudicator=adjudicator,
+                cache=_MemoryCache(),
+            ).route(
+                admitted=admitted,
+                document=context,
+                drafts=drafts,
+            )
+            return result, adjudicator.calls
+
+        owned_document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "其他指标<sup>2</sup>"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "page_footnote",
+                        (ProviderPayload("text", None, footnote),),
+                        annotation="page_footnote",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        result, _ = route(owned_document)
+        self.assertIn(
+            "trading_financial_assets",
+            result.units[0].semantic_keys or (),
+        )
+
+        wrapped_document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "（七）担保情况及对债"),),
+                        annotation="title",
+                        level=2,
+                        bbox=ProviderBBox(100, 100, 900, 119),
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (
+                            ProviderPayload(
+                                "text",
+                                None,
+                                "券投资者权益<sup>2</sup>的影响",
+                            ),
+                        ),
+                        annotation="paragraph",
+                        bbox=ProviderBBox(150, 127, 390, 145),
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "page_footnote",
+                        (ProviderPayload("text", None, footnote),),
+                        annotation="page_footnote",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        admitted = _admitted(wrapped_document)
+        draft = build_provider_units(admitted).units[0]
+        result, _ = route(wrapped_document)
+        self.assertEqual(
+            [
+                fragment.source_index
+                for fragment in draft.locator.heading_chain[-1].continuation_fragments
+            ],
+            [1],
+        )
+        self.assertIn(
+            "trading_financial_assets",
+            result.units[0].semantic_keys or (),
+        )
+
+        foreign_document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "现金储备<sup>2</sup>"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "流动性<sup>2</sup>"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "其他指标"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        3,
+                        0,
+                        "page_footnote",
+                        (ProviderPayload("text", None, footnote),),
+                        annotation="page_footnote",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        result, _ = route(foreign_document)
+        self.assertNotIn(
+            "trading_financial_assets",
+            result.units[-1].semantic_keys or (),
+        )
+
+        mixed_document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "现金储备<sup>2</sup>"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "其他指标<sup>2</sup>"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "page_footnote",
+                        (ProviderPayload("text", None, footnote),),
+                        annotation="page_footnote",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        result, _ = route(mixed_document)
+        self.assertIn(
+            "trading_financial_assets",
+            result.units[-1].semantic_keys or (),
+        )
+
+        no_antecedent_document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "其他指标"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "page_footnote",
+                        (ProviderPayload("text", None, footnote),),
+                        annotation="page_footnote",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        result, calls = route(no_antecedent_document)
+        self.assertNotIn("monetary_funds", result.units[0].semantic_keys or ())
+        self.assertNotIn(
+            "trading_financial_assets",
+            result.units[0].semantic_keys or (),
+        )
+        self.assertEqual(calls, 0)
+
+        unnumbered_document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (ProviderPayload("text", None, "其他指标"),),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "page_footnote",
+                        (
+                            ProviderPayload(
+                                "text",
+                                None,
+                                "现金储备包含货币资金、交易性金融资产。",
+                            ),
+                        ),
+                        annotation="page_footnote",
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        result, _ = route(unnumbered_document)
+        self.assertIn(
+            "trading_financial_assets",
+            result.units[0].semantic_keys or (),
+        )
+
+    def test_cross_reference_carrier_must_end_at_the_citation_target(self) -> None:
+        pure_references = (
+            "关于其他重要事项，详见公司2026年半年度报告全文。",
+            (
+                "关于其他重要事项，详见公司2026年半年度报告全文"
+                "（公告编号：2026-001）。"
+            ),
+            "关于其他重要事项，详见《关于完成重大资产收购的公告》。",
+            (
+                "关于其他重要事项，详见"
+                "《关于完成重大资产收购，更正相关事项的公告》。"
+            ),
+            (
+                "关于其他重要事项，详见"
+                "《关于完成重大资产收购；更正相关事项的公告》。"
+            ),
+        )
+        for body in pure_references:
+            with self.subTest(pure_reference=body):
+                admitted, drafts = _drafts_with_parent_heading(
+                    "第六节 重要事项",
+                    "其他重要事项",
+                    body,
+                )
+                adjudicator = _Adjudicator(
+                    lambda _batch: self.fail(
+                        "a pure cross-reference carrier must not call the model"
+                    )
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=adjudicator,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司2026年半年度报告",
+                        filing_type="semiannual_report",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertIsNone(result.units[1].semantic_keys)
+                self.assertEqual(adjudicator.calls, 0)
+
+        factual_tails = (
+            (
+                "详见公司2026年半年度报告全文，"
+                "其中公司本期完成重大资产收购。"
+            ),
+            (
+                "关于其他重要事项，详见公司2026年半年度报告全文，"
+                "公司本期完成重大资产收购。"
+            ),
+            "公司本期完成重大资产收购具体情况详见相关公告全文。",
+            (
+                "公司本期完成重大资产收购具体情况详见"
+                "《关于完成重大资产收购的公告》。"
+            ),
+            (
+                "公司本期完成重大资产收购具体情况详见"
+                "“关于完成重大资产收购的公告”。"
+            ),
+            (
+                "公司本期完成重大资产收购具体内容参见"
+                "《关于本次重大资产收购完成的公告》"
+                "（公告编号：2026-001）。"
+            ),
+            (
+                "公司本期完成重大资产收购具体情况详见"
+                "《关于完成重大资产收购，更正相关事项的公告》。"
+            ),
+            (
+                "公司本期完成重大资产收购具体情况详见"
+                "《关于完成重大资产收购；更正相关事项的公告》。"
+            ),
+        )
+        for body in factual_tails:
+            with self.subTest(factual_tail=body):
+                admitted, drafts = _drafts_with_parent_heading(
+                    "第六节 重要事项",
+                    "其他重要事项",
+                    body,
+                )
+                adjudicator = _Adjudicator(
+                    lambda _batch: self.fail(
+                        "an exact important-matters fact is deterministic"
+                    )
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=adjudicator,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司2026年半年度报告",
+                        filing_type="semiannual_report",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertEqual(
+                    result.units[1].semantic_keys,
+                    ("major_asset_acquisition_progress",),
+                )
+                self.assertEqual(adjudicator.calls, 0)
+
+        for filing_type in ("risk_alert", "share_buyback", "other"):
+            with self.subTest(out_of_scope=filing_type):
+                admitted, drafts = _drafts_with_parent_heading(
+                    "第六节 重要事项",
+                    "其他重要事项",
+                    "公司本期完成重大资产收购。",
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda batch: tuple(
+                            SemanticAdjudicationDecision(
+                                unit_index=unit.unit_index,
+                                routes=(),
+                            )
+                            for unit in batch.units
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司公告",
+                        filing_type=filing_type,
+                    ),
+                    drafts=drafts,
+                )
+                self.assertNotIn(
+                    "major_asset_acquisition_progress",
+                    result.units[1].semantic_keys or (),
+                )
+
+        for body in (
+            "公司协助客户完成重大资产收购。",
+            "公司完成重大资产收购前期准备工作。",
+        ):
+            with self.subTest(non_issuer_or_incomplete=body):
+                admitted, drafts = _drafts_with_parent_heading(
+                    "第六节 重要事项",
+                    "其他重要事项",
+                    body,
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda batch: tuple(
+                            SemanticAdjudicationDecision(
+                                unit_index=unit.unit_index,
+                                routes=(),
+                            )
+                            for unit in batch.units
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司2026年半年度报告",
+                        filing_type="semiannual_report",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertNotIn(
+                    "major_asset_acquisition_progress",
+                    result.units[1].semantic_keys or (),
+                )
+
+        quoted_notice_titles = (
+            (
+                "详见公司《关于完成重大资产收购的公告》，"
+                "公司董事会今日召开会议。"
+            ),
+            (
+                "公司已披露《关于完成重大资产收购的公告》，"
+                "本期无其他重大事项。"
+            ),
+            "详见《关于完成重大资产收购的公告。",
+        )
+        for body in quoted_notice_titles:
+            with self.subTest(quoted_notice_title=body):
+                admitted, drafts = _drafts_with_parent_heading(
+                    "第六节 重要事项",
+                    "其他重要事项",
+                    body,
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda batch: tuple(
+                            SemanticAdjudicationDecision(
+                                unit_index=unit.unit_index,
+                                routes=(),
+                            )
+                            for unit in batch.units
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司2026年半年度报告",
+                        filing_type="semiannual_report",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertNotIn(
+                    "major_asset_acquisition_progress",
+                    result.units[1].semantic_keys or (),
+                )
+
+    def test_forecast_range_table_requires_typed_period_and_numeric_range(self) -> None:
+        positive_table = (
+            "<table><tr><td>项目</td><td>本报告期</td><td>上年同期</td></tr>"
+            "<tr><td>归属于上市公司股东的净利润</td>"
+            "<td>盈利：351万元-474万元</td><td>盈利：12,665.43万元</td>"
+            "</tr></table>"
+        )
+        admitted, drafts = _drafts_with_table(
+            "2、预计的经营业绩：同向下降",
+            positive_table,
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("typed forecast ranges are deterministic")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司半年度业绩预告",
+                filing_type="performance_forecast",
+            ),
+            drafts=drafts,
+        )
+        self.assertEqual(
+            result.units[0].semantic_keys,
+            ("performance_forecast_range",),
+        )
+        self.assertEqual(result.receipts[0].decision_source, "deterministic")
+        self.assertEqual(adjudicator.calls, 0)
+
+        for filing_type, table_html in (
+            (
+                "performance_forecast",
+                positive_table.replace("351万元-474万元", "351万元"),
+            ),
+            ("semiannual_report", positive_table),
+            (
+                "performance_forecast",
+                positive_table.replace("351万元-474万元", "2023年-2024年"),
+            ),
+        ):
+            with self.subTest(filing_type=filing_type):
+                admitted, drafts = _drafts_with_table(
+                    "预计的经营业绩说明",
+                    table_html,
+                )
+                negative = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda _batch: self.fail(
+                            "an unqualified forecast table must not call a model"
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司报告",
+                        filing_type=filing_type,
+                    ),
+                    drafts=drafts,
+                )
+                self.assertNotIn(
+                    "performance_forecast_range",
+                    negative.units[0].semantic_keys or (),
+                )
+
+        split_document = _document(
+            pages=(
+                (
+                    _block(
+                        0,
+                        0,
+                        "text",
+                        (
+                            ProviderPayload(
+                                "text",
+                                None,
+                                "2、预计的经营业绩：同向下降",
+                            ),
+                        ),
+                        annotation="title",
+                        level=1,
+                    ),
+                    _block(
+                        1,
+                        0,
+                        "table",
+                        (
+                            ProviderPayload(
+                                "table_body",
+                                None,
+                                (
+                                    "<table><tr><td>项目</td><td>本报告期</td>"
+                                    "</tr><tr><td>净利润</td><td>351万元</td>"
+                                    "</tr></table>"
+                                ),
+                            ),
+                        ),
+                        annotation=None,
+                    ),
+                    _block(
+                        2,
+                        0,
+                        "table",
+                        (
+                            ProviderPayload(
+                                "table_body",
+                                None,
+                                (
+                                    "<table><tr><td>其他项目</td>"
+                                    "<td>351万元-474万元</td></tr></table>"
+                                ),
+                            ),
+                        ),
+                        annotation=None,
+                    ),
+                ),
+            ),
+            segments=(),
+        )
+        split_admitted = _admitted(split_document)
+        split_drafts = build_provider_units(split_admitted).units
+        self.assertEqual(len(split_drafts), 1)
+        split_result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("separate tables cannot corroborate")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=split_admitted,
+            document=SemanticDocumentContext(
+                title="某公司业绩预告",
+                filing_type="performance_forecast",
+            ),
+            drafts=split_drafts,
+        )
+        self.assertNotIn(
+            "performance_forecast_range",
+            split_result.units[0].semantic_keys or (),
+        )
+
+    def test_forecast_accountant_firm_heading_is_a_scoped_risk_role(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "二、与会计师事务所沟通情况",
+            "本次业绩预告相关财务数据未经注册会计师审计。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("an exact forecast role is deterministic")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司业绩预告",
+                filing_type="performance_forecast",
+            ),
+            drafts=drafts,
+        )
+        self.assertEqual(
+            result.units[0].semantic_keys,
+            ("performance_forecast_risk",),
+        )
+        self.assertEqual(adjudicator.calls, 0)
+
+        admitted, drafts = _drafts_with_body(
+            "会计师事务所沟通管理制度",
+            "本制度规定年度沟通流程。",
+        )
+        negative = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("a management policy stays lexical")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司业绩预告",
+                filing_type="performance_forecast",
+            ),
+            drafts=drafts,
+        )
+        self.assertNotIn(
+            "performance_forecast_risk",
+            negative.units[0].semantic_keys or (),
+        )
+
+    def test_credit_impairment_preparation_is_an_exact_heading_alias(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "1．信用减值准备",
+            "本期按预期信用损失模型计提336,717.80元并转回1,197,181.15元。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("the exact preparation heading is deterministic")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司计提减值准备公告",
+                filing_type="risk_alert",
+            ),
+            drafts=drafts,
+        )
+        self.assertEqual(result.units[0].semantic_keys, ("credit_impairment_loss",))
+        self.assertEqual(
+            result.units[0].section_keys,
+            ("credit_impairment_loss",),
+        )
+        self.assertEqual(adjudicator.calls, 0)
+
+        for title in ("信用减值准备管理制度", "坏账准备"):
+            with self.subTest(title=title):
+                admitted, drafts = _drafts_with_body(title, "本制度自发布之日起施行。")
+                negative = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda _batch: self.fail("adjacent concepts stay lexical")
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司风险提示公告",
+                        filing_type="risk_alert",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertNotIn(
+                    "credit_impairment_loss",
+                    negative.units[0].semantic_keys or (),
+                )
+
+    def test_incentive_quantity_price_adjustment_requires_local_change_facts(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "三、《关于调整2020年股票期权激励计划授予数量及授予价格的公告》更正情况",
+            (
+                "更正前：股票期权总量由30.4万份调整为36.76万份，"
+                "授予价格由10元/股调整为9.81291元/股；"
+                "更正后：股票期权总量由30.4万份调整为35.488万份，"
+                "授予价格由10元/股调整为7.01元/股。"
+            ),
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("independent adjustment facts are deterministic")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司股权激励更正公告",
+                filing_type="equity_incentive",
+            ),
+            drafts=drafts,
+        )
+        self.assertEqual(result.units[0].semantic_keys, ("incentive_adjustment",))
+        self.assertEqual(adjudicator.calls, 0)
+
+        negatives = (
+            (
+                "关于股票期权激励计划授予数量及授予价格的公告",
+                "本次授予数量为30万份，授予价格为10元/股。",
+            ),
+            (
+                "关于调整股票期权激励计划授予数量及授予价格的公告",
+                "具体内容详见同日披露的调整公告。",
+            ),
+            (
+                "法律意见书",
+                "律师认为本次调整已获得必要授权。",
+            ),
+        )
+        for title, body in negatives:
+            with self.subTest(title=title):
+                admitted, drafts = _drafts_with_body(title, body)
+                negative = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda _batch: self.fail(
+                            "an unsupported adjustment must stay lexical"
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司股权激励公告",
+                        filing_type="equity_incentive",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertNotIn(
+                    "incentive_adjustment",
+                    negative.units[0].semantic_keys or (),
+                )
+
+    def test_major_contract_amount_and_risk_routes_are_scope_bound(self) -> None:
+        cases = (
+            (
+                "1、排他性许可协议",
+                (
+                    "本次交易对价包括首付款42,000万元及后续权利金，"
+                    "权利金金额为净销售额的15%。"
+                ),
+                "contract_value",
+            ),
+            ("（1）首付款", "首付款合计42,000万元。", "contract_value"),
+            ("（2）权利金", "权利金金额为净销售额的15%。", "contract_value"),
+            ("八、风险提示", "合同履行尚需审批，结果存在不确定性。", "contract_risk"),
+        )
+        for title, body, expected in cases:
+            with self.subTest(title=title):
+                admitted, drafts = _drafts_with_body(title, body)
+                adjudicator = _Adjudicator(
+                    lambda _batch: self.fail("closed contract facts are deterministic")
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=adjudicator,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司签署重大合同公告",
+                        filing_type="major_contract",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertIn(expected, result.units[0].semantic_keys or ())
+                self.assertEqual(adjudicator.calls, 0)
+
+        admitted, drafts = _drafts_with_body(
+            "八、风险提示",
+            "公司经营存在一般市场风险。",
+        )
+        out_of_scope = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("out-of-scope risk headings stay lexical")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司其他公告",
+                filing_type="other",
+            ),
+            drafts=drafts,
+        )
+        self.assertNotIn("contract_risk", out_of_scope.units[0].semantic_keys or ())
+
+        value_negatives = (
+            (
+                "major_contract",
+                "排他性许可协议",
+                "首付款支付义务由双方另行约定。",
+            ),
+            (
+                "major_contract",
+                "排他性许可协议",
+                "首付款逾期违约金为5万元。",
+            ),
+            (
+                "major_contract",
+                "排他性许可协议",
+                "首付款逾期利息为5%。",
+            ),
+            (
+                "major_contract",
+                "排他性许可协议",
+                "具体首付款42,000万元详见《许可协议》。",
+            ),
+            (
+                "other",
+                "合作安排",
+                "本次交易对价包括首付款42,000万元及后续权利金。",
+            ),
+        )
+        for filing_type, title, body in value_negatives:
+            with self.subTest(value_negative=(filing_type, title)):
+                admitted, drafts = _drafts_with_body(title, body)
+                negative = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda _batch: self.fail(
+                            "unsupported or out-of-scope amounts stay lexical"
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司公告",
+                        filing_type=filing_type,
+                    ),
+                    drafts=drafts,
+                )
+                self.assertNotIn(
+                    "contract_value",
+                    negative.units[0].semantic_keys or (),
+                )
+
+    def test_transaction_pricing_requires_heading_and_local_pricing_evidence(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "（一）许可协议定价情况",
+            "经采用收益法评估，评估值为42,000万元并作为作价依据。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("source-bound transaction pricing is deterministic")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司关联交易公告",
+                filing_type="major_contract",
+            ),
+            drafts=drafts,
+        )
+        self.assertEqual(
+            result.units[0].semantic_keys,
+            ("transaction_pricing_basis",),
+        )
+        self.assertEqual(adjudicator.calls, 0)
+
+        admitted, drafts = _drafts_with_body(
+            "许可协议定价情况",
+            "具体内容详见《资产评估报告》。",
+        )
+        negative = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("a pricing cross-reference stays lexical")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司关联交易公告",
+                filing_type="major_contract",
+            ),
+            drafts=drafts,
+        )
+        self.assertNotIn(
+            "transaction_pricing_basis",
+            negative.units[0].semantic_keys or (),
+        )
+
+    def test_title_bound_internal_pricing_reference_is_not_direct(self) -> None:
+        admitted, drafts = _drafts_with_body(
+            "四、关联交易的定价政策及定价依据",
+            (
+                "定价政策及定价依据详见下文"
+                "“五、关联交易协议的主要内容之（二）之3.认购价格”。"
+            ),
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("a pure internal reference stays lexical")
+        )
+
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司向特定对象发行股票暨关联交易公告",
+                filing_type="additional_issuance",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertIsNone(result.units[0].semantic_keys)
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_internal_pricing_reference_with_local_fact_remains_direct(self) -> None:
+        bodies = (
+            "定价政策及定价依据详见下文“认购价格为7.01元/股”。",
+            (
+                "定价政策及定价依据详见下文"
+                "“五、关联交易协议的主要内容之（二）之3.认购价格”，"
+                "本次发行价格不低于定价基准日前二十个交易日交易均价的80%。"
+            ),
+            (
+                "定价政策及定价依据详见下文"
+                "“五、关联交易协议的主要内容之（二）之3.认购价格”，"
+                "本次交易定价公平合理。"
+            ),
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                admitted, drafts = _drafts_with_body(
+                    "四、关联交易的定价政策及定价依据",
+                    body,
+                )
+                adjudicator = _Adjudicator(
+                    lambda _batch: self.fail("the exact factual heading is closed")
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=adjudicator,
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(
+                        title="某公司向特定对象发行股票暨关联交易公告",
+                        filing_type="additional_issuance",
+                    ),
+                    drafts=drafts,
+                )
+                self.assertEqual(
+                    result.units[0].semantic_keys,
+                    ("transaction_pricing_basis",),
+                )
+                self.assertEqual(adjudicator.calls, 0)
+
+    def test_named_agreement_contents_is_structural_context_not_fake_direct(self) -> None:
+        admitted, drafts = _drafts_with_parent_heading(
+            "三、《排他性许可协议》、《知识产权转让合同》主要内容",
+            "（一）排他性许可协议",
+            "许可区域为中国大陆地区及美国区域。",
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("agreement context is deterministic structure")
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司签署重大合同公告",
+                filing_type="major_contract",
+            ),
+            drafts=drafts,
+        )
+        self.assertIsNone(result.units[0].semantic_keys)
+        self.assertEqual(
+            result.units[0].section_keys,
+            ("transaction_agreement_terms",),
+        )
+        self.assertEqual(
+            result.units[1].section_keys,
+            ("transaction_agreement_terms",),
+        )
+        self.assertEqual(adjudicator.calls, 0)
+
+        admitted, drafts = _drafts_with_parent_heading(
+            "《风险管理制度》主要内容",
+            "适用范围",
+            "本制度适用于公司各部门。",
+        )
+        negative = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("a management policy is not an agreement")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title="某公司制度公告",
+                filing_type="other",
+            ),
+            drafts=drafts,
+        )
+        self.assertNotIn(
+            "transaction_agreement_terms",
+            negative.units[0].section_keys or (),
+        )
+        self.assertNotIn(
+            "transaction_agreement_terms",
+            negative.units[1].section_keys or (),
+        )
 
 
 if __name__ == "__main__":
