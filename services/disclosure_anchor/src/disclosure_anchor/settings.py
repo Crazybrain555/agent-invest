@@ -215,10 +215,14 @@ class Settings(BaseSettings):
     )
     # These are service-side limits of the attested Windows orchestrator.
     # They are not CLI fan-out controls: MinerU ignores the CLI's unknown
-    # --max-concurrency option when --api-url selects an existing API.
+    # --max-concurrency option when --api-url selects an existing API.  The
+    # task-slot value is machine-profile configuration, but it is accepted
+    # only when the exact runtime manifest, live health and load receipts bind
+    # the same value.  The 30 GiB Windows Docker profile defaults to one after
+    # a real mixed annual-report run proved that three can OOM the API.
     disclosure_mineru_api_task_slots: int = Field(
-        default=3,
-        ge=3,
+        default=1,
+        ge=1,
         le=3,
         validation_alias=AliasChoices(
             "DISCLOSURE_MINERU_API_TASK_SLOTS",
@@ -339,15 +343,25 @@ class Settings(BaseSettings):
             "disclosure_mineru_staged_load_confirmation_receipt",
         ),
     )
-    # Hash of the operator-selected, multipage representative PDF used by both
-    # independent 4/8/16 deployment rehearsals.  The receipt cannot choose its
-    # own oracle: resident admission compares both runs with this pinned value.
-    disclosure_mineru_staged_input_sha256: Optional[str] = Field(
+    # Hash of the canonical evidence for the ordered, heterogeneous real-PDF
+    # corpus used by both independent 4/8/16 deployment rehearsals.  This is a
+    # new contract: legacy single-PDF receipt hashes are deliberately rejected.
+    disclosure_mineru_staged_corpus_sha256: Optional[str] = Field(
         default=None,
         pattern=r"^sha256:[a-f0-9]{64}$",
         validation_alias=AliasChoices(
-            "DISCLOSURE_MINERU_STAGED_INPUT_SHA256",
-            "disclosure_mineru_staged_input_sha256",
+            "DISCLOSURE_MINERU_STAGED_CORPUS_SHA256",
+            "disclosure_mineru_staged_corpus_sha256",
+        ),
+    )
+    # Operator-calibrated free-memory reserve for the current Docker VM.  Zero
+    # means unconfigured and is rejected by the parse-capable deployment gate.
+    disclosure_mineru_docker_memory_reserve_bytes: int = Field(
+        default=0,
+        ge=0,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_DOCKER_MEMORY_RESERVE_BYTES",
+            "disclosure_mineru_docker_memory_reserve_bytes",
         ),
     )
     disclosure_mineru_canary_max_age_seconds: int = Field(
@@ -599,11 +613,25 @@ class Settings(BaseSettings):
             "WORKER_PARSE_CONCURRENCY", "worker_parse_concurrency"
         ),
     )
+    # Local whole-document clients that may be submitted but not terminal.
+    # PostgreSQL/local admission retains the backlog. MinerU has no remote
+    # cancel endpoint, so this must not exceed active API task slots: otherwise
+    # queued work can begin after a host-safety failure closes admission.
+    # Huge/unknown PDFs are further forced to exclusive admission.
+    worker_mineru_client_outstanding_window: int = Field(
+        default=1,
+        ge=1,
+        le=16,
+        validation_alias=AliasChoices(
+            "WORKER_MINERU_CLIENT_OUTSTANDING_WINDOW",
+            "worker_mineru_client_outstanding_window",
+        ),
+    )
     # One document-level slot fans out into many page/block HTTP requests
     # inside MinerU. Bound the aggregate request fan-out independently from
     # document concurrency; production divides this budget across slots.
     worker_gpu_request_budget: int = Field(
-        default=21,
+        default=7,
         ge=1,
         validation_alias=AliasChoices(
             "WORKER_GPU_REQUEST_BUDGET", "worker_gpu_request_budget"
@@ -791,9 +819,7 @@ class Settings(BaseSettings):
                 or "." in upstream_host
                 or upstream_host in {"localhost", "host.docker.internal"}
                 or not all(
-                    character.islower()
-                    or character.isdigit()
-                    or character == "-"
+                    character.islower() or character.isdigit() or character == "-"
                     for character in upstream_host
                 )
             ):
@@ -829,6 +855,15 @@ class Settings(BaseSettings):
                 "WORKER_GPU_REQUEST_BUDGET must equal the attested "
                 "MinerU API task-slots x inference-concurrency envelope"
             )
+        if (
+            self.worker_mineru_client_outstanding_window
+            > self.disclosure_mineru_api_task_slots
+        ):
+            raise ValueError(
+                "WORKER_MINERU_CLIENT_OUTSTANDING_WINDOW must not exceed "
+                "the attested MinerU API task slots while remote cancellation "
+                "is unavailable"
+            )
         if self.worker_parse_concurrency > 1:
             if not self.disclosure_mineru_backend.endswith("-http-client"):
                 raise ValueError(
@@ -839,11 +874,6 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "WORKER_PARSE_CONCURRENCY > 1 requires the complete "
                     "MinerU fixed-API topology"
-                )
-            if self.worker_gpu_request_budget < self.worker_parse_concurrency:
-                raise ValueError(
-                    "WORKER_GPU_REQUEST_BUDGET must provide at least one "
-                    "request per parse slot"
                 )
         if (
             self.worker_parse_huge_page_threshold

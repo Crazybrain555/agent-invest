@@ -104,6 +104,24 @@ class AdaptiveLoopControllerTests(unittest.TestCase):
         self.assertEqual(cooled.download, 0)
         self.assertEqual(cooled.parse, 50)
 
+        local = _report(failed=1, downloaded=1)
+        local.failures.append(
+            WorkerFailure(
+                "download",
+                "provider_doc_1",
+                "DB_POOL_EXHAUSTED",
+                True,
+            )
+        )
+        local_controller = worker_cli._AdaptiveLoopController(900, 1800)
+        self.assertEqual(local_controller.observe(local, now=20.0), 60)
+        self.assertEqual(
+            local_controller.effective_limits(self.limits, now=21.0),
+            self.limits,
+        )
+        self.assertFalse(worker_cli._source_infrastructure_outage(local))
+        self.assertTrue(worker_cli._local_infrastructure_outage(local))
+
     def test_system_errors_exponentially_back_off(self) -> None:
         self.assertEqual(self.controller.system_error_delay(), 60)
         self.assertEqual(self.controller.system_error_delay(), 120)
@@ -322,7 +340,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                     "http://mineru-openai-server:30000/v1"
                 ),
                 worker_parse_concurrency=16,
-                worker_gpu_request_budget=21,
+                worker_gpu_request_budget=7,
                 worker_gpu_max_sequences=128,
             )
             with mock.patch.object(
@@ -344,6 +362,11 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         )
         self.assertIsNone(deps.parser_options.http_request_concurrency)
         self.assertEqual(deps.config.parse_runaway_timeout_seconds, 86400)
+        self.assertEqual(deps.config.mineru_client_outstanding_window, 1)
+        pool_budget = worker_cli.worker_database_pool_budget(settings)
+        self.assertEqual(pool_budget.pool_size, 7)
+        self.assertEqual(pool_budget.max_overflow, 3)
+        self.assertEqual(pool_budget.total_connections, 10)
         with mock.patch.object(worker_cli, "_exit_wedged_worker") as exit_worker:
             deps.on_parse_runaway("doc_wedged")
         exit_worker.assert_called_once_with()
@@ -546,10 +569,9 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         lock_conn.close.assert_called_once_with()
         lock_engine.dispose.assert_called_once_with()
 
-    def test_once_mineru_gate_fails_before_database_connection(self) -> None:
+    def test_once_static_mineru_gate_fails_before_database_connection(self) -> None:
         settings = mock.MagicMock()
-        checker = mock.MagicMock(spec=worker_cli.MinerUDeploymentChecker)
-        checker.assert_admission.side_effect = MinerUDeploymentGateError(
+        gate_error = MinerUDeploymentGateError(
             "GPU identity unavailable"
         )
 
@@ -558,14 +580,13 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             mock.patch.object(
                 worker_cli,
                 "MinerUDeploymentChecker",
-                return_value=checker,
+                side_effect=gate_error,
             ),
             mock.patch.object(worker_cli.sqlalchemy, "create_engine") as create_engine,
             self.assertRaisesRegex(MinerUDeploymentGateError, "identity unavailable"),
         ):
             worker_cli.main(["once"])
 
-        checker.assert_admission.assert_called_once_with()
         create_engine.assert_not_called()
 
     def test_worker_admission_checks_lock_before_live_mineru(self) -> None:
@@ -623,9 +644,16 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
     def test_work_engine_identity_failure_disposes_before_dependency_build(
         self,
     ) -> None:
+        settings = mock.MagicMock(
+            worker_parse_concurrency=16,
+            worker_mineru_client_outstanding_window=3,
+            worker_finalize_concurrency=2,
+        )
         engine = mock.MagicMock()
         with (
-            mock.patch.object(worker_cli, "create_db_engine", return_value=engine),
+            mock.patch.object(
+                worker_cli, "create_db_engine", return_value=engine
+            ) as create_engine,
             mock.patch.object(
                 worker_cli,
                 "require_runtime_app_engine",
@@ -635,12 +663,17 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             self.assertRaisesRegex(ConfigurationError, "unsafe role"),
         ):
             worker_cli._run_rounds(
-                mock.MagicMock(),
+                settings,
                 rounds=1,
                 lock_conn=mock.MagicMock(),
             )
 
         deps.assert_not_called()
+        create_engine.assert_called_once_with(
+            worker_cli._database_url(settings),
+            pool_size=9,
+            max_overflow=5,
+        )
         engine.dispose.assert_called_once_with()
 
     def test_alert_message_triggers_on_outage_and_failure_burst(self) -> None:

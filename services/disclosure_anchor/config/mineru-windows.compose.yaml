@@ -49,13 +49,18 @@ services:
       - inference
 
   mineru-api:
-    image: mineru@sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458
+    image: agent-invest/mineru-api:3.4.4-heap-return-v1
     pull_policy: never
     container_name: mineru-api
     restart: always
     environment:
       MINERU_MODEL_SOURCE: local
-      MINERU_API_MAX_CONCURRENT_REQUESTS: "3"
+      # Exact-source MinerU 3.4.4 compatibility layer. The derived image
+      # refuses an unset/unknown value and the attestor binds the live hook.
+      MINERU_MALLOC_TRIM: "1"
+      # Current 30 GiB Docker Desktop profile.  Slots 2/3 require a distinct
+      # attested compose identity and two heterogeneous load receipts.
+      MINERU_API_MAX_CONCURRENT_REQUESTS: "1"
       MINERU_PROCESSING_WINDOW_SIZE: "16"
       MINERU_API_OUTPUT_ROOT: /var/lib/mineru-api-output
       MINERU_API_TASK_RETENTION_SECONDS: "600"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr
+from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
 import hashlib
 from io import StringIO
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 import stat
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 from unittest.mock import MagicMock, patch
@@ -24,7 +26,95 @@ from disclosure_anchor.adapters.runtime.mineru_process_isolation import (
 )
 
 
+def _host_capacity_sample(
+    *,
+    container_id_suffix: str = "1",
+    available_bytes: int = 8192,
+) -> dict[str, object]:
+    containers = []
+    for index, name in enumerate(
+        ("mineru-api", "mineru-api-proxy", "mineru-openai-server"),
+        start=1,
+    ):
+        containers.append(
+            {
+                "name": name,
+                "id": (str(index) if container_id_suffix == "1" else container_id_suffix)
+                * 64,
+                "started_at_utc": "2026-08-25T00:00:00+00:00",
+                "restart_count": 0,
+                "oom_killed": False,
+                "exit_code": 0,
+                "running": True,
+                "status": "running",
+                "health": "healthy",
+                "pid": 100 + index,
+                "memory_current_bytes": 2048,
+                "memory_max_bytes": None,
+                "memory_events": {"oom": 0, "oom_kill": 0, "high": 0},
+                "pid1_rss_bytes": 1024,
+                "pid1_rss_hwm_bytes": 2048,
+                "docker_vm_memory_total_bytes": 16384,
+                "docker_vm_memory_available_bytes": available_bytes,
+            }
+        )
+    return {
+        "schema": "mineru-host-capacity-sample.v1",
+        "observed_at_utc": "2026-08-25T00:00:01+00:00",
+        "collector_path": staged.MINERU_WINDOWS_COLLECTOR_PATH,
+        "collector_sha256": "sha256:" + "f" * 64,
+        "windows_node_identity_sha256": "sha256:" + "0" * 64,
+        "containers": containers,
+    }
+
+
 class MinerUStagedLoadTests(unittest.TestCase):
+    @staticmethod
+    def _corpus(count: int = 16) -> tuple[staged.FrozenCorpusInput, ...]:
+        return tuple(
+            staged.FrozenCorpusInput(
+                logical_name=f"real-{index:02d}.pdf",
+                payload=f"pdf-{index}".encode(),
+                digest=hashlib.sha256(f"pdf-{index}".encode()).hexdigest(),
+                page_count=600
+                if index == count
+                else (100 if index == count - 1 else 7),
+                workload_class=(
+                    "huge"
+                    if index == count
+                    else ("heavy" if index == count - 1 else "regular")
+                ),
+            )
+            for index in range(1, count + 1)
+        )
+
+    @classmethod
+    def _corpus_fixture(
+        cls, identity: str
+    ) -> tuple[tuple[staged.FrozenCorpusInput, ...], dict[str, object]]:
+        corpus = cls._corpus()
+        return corpus, {
+            "profile": "operator_frozen_heterogeneous_v2",
+            "logical_name": "corpus.json",
+            "sha256": identity,
+            "bytes": sum(len(item.payload) for item in corpus),
+            "minimum_required_pages": 7,
+            "documents": [item.evidence() for item in corpus],
+        }
+
+    @staticmethod
+    def _host_observer_files(root: Path) -> tuple[Path, Path]:
+        identity = root / "observer-key"
+        known_hosts = root / "observer-known-hosts"
+        identity.write_text("private-key", encoding="utf-8")
+        known_hosts.write_text(
+            "100.64.0.1 ssh-ed25519 a2V5\n",
+            encoding="utf-8",
+        )
+        identity.chmod(0o600)
+        known_hosts.chmod(0o600)
+        return identity, known_hosts
+
     @staticmethod
     def _metrics_response(payload: bytes) -> MagicMock:
         response = MagicMock()
@@ -56,21 +146,16 @@ vllm:gpu_cache_usage_perc 0.1
             processing_tasks=processing,
             completed_tasks=completed,
             failed_tasks=failed,
-            max_concurrent_requests=3,
+            max_concurrent_requests=1,
             processing_window_size=16,
-            task_retention_seconds=86400,
-            task_cleanup_interval_seconds=300,
+            task_retention_seconds=600,
+            task_cleanup_interval_seconds=30,
         )
 
     def test_fixed_envelope_has_no_operator_stage_override(self) -> None:
-        self.assertEqual(staged.STAGE_DOCUMENT_CONCURRENCIES, (4, 8, 16))
-        self.assertEqual(staged.ORCHESTRATOR_TASK_CONCURRENCY, 3)
+        self.assertEqual(staged.STAGE_DOCUMENT_COUNTS, (4, 8, 16))
         self.assertEqual(staged.ORCHESTRATOR_INFERENCE_CONCURRENCY, 7)
-        self.assertEqual(staged.EFFECTIVE_INFERENCE_REQUEST_UPPER_BOUND, 21)
-        self.assertEqual(
-            staged.STAGE_EFFECTIVE_INFERENCE_REQUEST_UPPER_BOUNDS,
-            (21, 21, 21),
-        )
+        self.assertEqual(staged.RECEIPT_SCHEMA, "mineru_staged_load_receipt.v5")
 
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             staged._parse_args(
@@ -79,9 +164,9 @@ vllm:gpu_cache_usage_perc 0.1
                     "manifest.json",
                     "--receipt-out",
                     "receipt.json",
-                    "--input",
-                    "frozen.pdf",
-                    "--expected-input-sha256",
+                    "--corpus-manifest",
+                    "corpus.json",
+                    "--expected-corpus-sha256",
                     "a" * 64,
                     "--stages",
                     "32",
@@ -95,10 +180,434 @@ vllm:gpu_cache_usage_perc 0.1
             calls.append(concurrency)
             return {"status": "fail" if concurrency == 8 else "pass"}
 
-        result = staged.execute_fixed_stage_sequence(run)
+        staged.execute_fixed_stage_sequence(run)
 
         self.assertEqual(calls, [4, 8])
-        self.assertEqual([item["status"] for item in result], ["pass", "fail"])
+
+    def test_each_stage_selects_an_exact_heterogeneous_set(self) -> None:
+        # Keep both non-regular strata strictly beyond the largest stage
+        # prefix.  This prevents a future stage-16-only regression back to
+        # ``corpus[:document_count]`` from passing the selector contract.
+        corpus = self._corpus(count=18)
+
+        for document_count in staged.STAGE_DOCUMENT_COUNTS:
+            with self.subTest(document_count=document_count):
+                selected = staged._select_stage_inputs(
+                    corpus,
+                    document_count=document_count,
+                )
+                self.assertEqual(len(selected), document_count)
+                self.assertEqual(len({item.digest for item in selected}), document_count)
+                self.assertEqual(
+                    {item.workload_class for item in selected[:3]},
+                    {"regular", "heavy", "huge"},
+                )
+                expected_names = ["real-01.pdf", "real-17.pdf", "real-18.pdf"] + [
+                    f"real-{index:02d}.pdf"
+                    for index in range(2, document_count - 1)
+                ]
+                self.assertEqual(
+                    [item.logical_name for item in selected],
+                    expected_names,
+                )
+                expected_by_name = {item.logical_name: item.digest for item in corpus}
+                self.assertEqual(
+                    [item.digest for item in selected],
+                    [expected_by_name[name] for name in expected_names],
+                )
+
+        with self.assertRaisesRegex(ValueError, "no huge PDF"):
+            staged._select_stage_inputs(
+                corpus[:-1],
+                document_count=4,
+            )
+
+    def test_stage_admission_caps_clients_and_keeps_huge_exclusive(self) -> None:
+        admission = staged._StageAdmission(outstanding_window=2)
+        state_lock = threading.Lock()
+        active = 0
+        huge_active = False
+        violations: list[str] = []
+
+        def operation(workload_class: str) -> dict[str, object]:
+            def inner() -> dict[str, object]:
+                nonlocal active, huge_active
+                with state_lock:
+                    if workload_class == "huge" and active != 0:
+                        violations.append("huge-overlapped")
+                    if workload_class != "huge" and huge_active:
+                        violations.append("regular-overlapped-huge")
+                    active += 1
+                    huge_active = workload_class == "huge"
+                time.sleep(0.01)
+                with state_lock:
+                    active -= 1
+                    if workload_class == "huge":
+                        huge_active = False
+                return {"status": "pass"}
+
+            return admission.run(
+                workload_class=workload_class,
+                operation=inner,
+            )
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            futures = [
+                executor.submit(operation, workload_class)
+                for workload_class in (
+                    "regular",
+                    "heavy",
+                    "huge",
+                    "regular",
+                    "heavy",
+                    "regular",
+                )
+            ]
+            for future in futures:
+                self.assertEqual(future.result(), {"status": "pass"})
+
+        self.assertEqual(violations, [])
+        self.assertLessEqual(admission.peak, 2)
+
+    def test_stage_admission_reaches_window_before_huge_can_enter(self) -> None:
+        admission = staged._StageAdmission(outstanding_window=2)
+        both_non_huge_entered = threading.Barrier(3, timeout=1)
+        release_non_huge = threading.Event()
+        huge_entered = threading.Event()
+        release_huge = threading.Event()
+
+        def non_huge(workload_class: str) -> dict[str, object]:
+            return admission.run(
+                workload_class=workload_class,
+                operation=lambda: _hold_non_huge(),
+            )
+
+        def _hold_non_huge() -> dict[str, object]:
+            both_non_huge_entered.wait()
+            self.assertTrue(release_non_huge.wait(timeout=1))
+            return {"status": "pass"}
+
+        def hold_huge() -> dict[str, object]:
+            huge_entered.set()
+            self.assertTrue(release_huge.wait(timeout=1))
+            return {"status": "pass"}
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            regular = executor.submit(non_huge, "regular")
+            heavy = executor.submit(non_huge, "heavy")
+            both_non_huge_entered.wait()
+            huge = executor.submit(
+                admission.run,
+                workload_class="huge",
+                operation=hold_huge,
+            )
+            self.assertFalse(huge_entered.wait(timeout=0.05))
+            self.assertEqual(admission.peak, 2)
+            release_non_huge.set()
+            self.assertTrue(huge_entered.wait(timeout=1))
+            release_huge.set()
+            self.assertEqual(regular.result(), {"status": "pass"})
+            self.assertEqual(heavy.result(), {"status": "pass"})
+            self.assertEqual(huge.result(), {"status": "pass"})
+
+    def test_stage_admission_releases_after_exception_and_close_wakes_waiter(
+        self,
+    ) -> None:
+        admission = staged._StageAdmission(outstanding_window=1)
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            admission.run(
+                workload_class="regular",
+                operation=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+            )
+        self.assertEqual(
+            admission.run(
+                workload_class="regular",
+                operation=lambda: {"status": "pass"},
+            ),
+            {"status": "pass"},
+        )
+
+        occupied = threading.Event()
+        release = threading.Event()
+        waiter_done = threading.Event()
+        waiter_errors: list[type[BaseException]] = []
+
+        def hold() -> dict[str, object]:
+            occupied.set()
+            self.assertTrue(release.wait(timeout=1))
+            return {"status": "pass"}
+
+        holder = threading.Thread(
+            target=lambda: admission.run(workload_class="regular", operation=hold)
+        )
+        holder.start()
+        self.assertTrue(occupied.wait(timeout=1))
+
+        def wait_for_slot() -> None:
+            try:
+                admission.run(
+                    workload_class="regular",
+                    operation=lambda: {"status": "unexpected"},
+                )
+            except BaseException as exc:  # test captures the exact wake-up path
+                waiter_errors.append(type(exc))
+            finally:
+                waiter_done.set()
+
+        waiter = threading.Thread(target=wait_for_slot)
+        waiter.start()
+        admission.close()
+        self.assertTrue(waiter_done.wait(timeout=1))
+        release.set()
+        holder.join(timeout=1)
+        waiter.join(timeout=1)
+        self.assertEqual(waiter_errors, [staged._StageAdmissionClosedError])
+
+    def test_stage_admission_rechecks_latched_failure_before_next_submit(
+        self,
+    ) -> None:
+        abort_latch = staged._StageAbortLatch()
+        admission = staged._StageAdmission(
+            outstanding_window=1,
+            abort_latch=abort_latch,
+        )
+        occupied = threading.Event()
+        release = threading.Event()
+        violating_sample_committed = threading.Event()
+        allow_failure_publish = threading.Event()
+        second_operation_called = threading.Event()
+        samples = [
+            _host_capacity_sample(available_bytes=8192),
+            _host_capacity_sample(available_bytes=1024),
+            _host_capacity_sample(available_bytes=6144),
+        ]
+        monitor = staged._HostCapacityMonitor(
+            sampler=lambda: staged._validate_host_capacity_sample(
+                samples.pop(0),
+                expected_collector_sha256="sha256:" + "f" * 64,
+                expected_windows_node_identity_sha256="sha256:" + "0" * 64,
+                docker_memory_reserve_bytes=4096,
+            ),
+            collector_sha256="sha256:" + "f" * 64,
+            windows_node_identity_sha256="sha256:" + "0" * 64,
+            docker_memory_reserve_bytes=4096,
+            abort_latch=abort_latch,
+            sample_interval_seconds=3600,
+        )
+        monitor.start()
+        append_trusted_sample_locked = monitor._append_trusted_sample_locked
+
+        def append_then_pause(
+            sample: dict[str, object],
+            *,
+            observed_seconds: float,
+        ) -> int:
+            sample_index = append_trusted_sample_locked(
+                sample,
+                observed_seconds=observed_seconds,
+            )
+            if sample["containers"][0]["docker_vm_memory_available_bytes"] == 1024:  # type: ignore[index]
+                violating_sample_committed.set()
+                self.assertTrue(allow_failure_publish.wait(timeout=1))
+            return sample_index
+
+        def hold() -> dict[str, object]:
+            occupied.set()
+            self.assertTrue(release.wait(timeout=1))
+            return {"status": "pass"}
+
+        try:
+            with (
+                patch.object(
+                    monitor,
+                    "_append_trusted_sample_locked",
+                    side_effect=append_then_pause,
+                ),
+                ThreadPoolExecutor(max_workers=3) as executor,
+            ):
+                first = executor.submit(
+                    admission.run,
+                    workload_class="regular",
+                    operation=hold,
+                )
+                self.assertTrue(occupied.wait(timeout=1))
+                second = executor.submit(
+                    admission.run,
+                    workload_class="regular",
+                    operation=lambda: (
+                        second_operation_called.set() or {"status": "unexpected"}
+                    ),
+                )
+                sampler = executor.submit(monitor._sample_once)
+                self.assertTrue(violating_sample_committed.wait(timeout=1))
+                release.set()
+                self.assertFalse(second_operation_called.wait(timeout=0.05))
+                allow_failure_publish.set()
+
+                sampler.result()
+                self.assertEqual(first.result(), {"status": "pass"})
+                with self.assertRaisesRegex(
+                    staged._StageAdmissionClosedError,
+                    "host_capacity_violation",
+                ):
+                    second.result()
+        finally:
+            allow_failure_publish.set()
+            release.set()
+            monitor.stop()
+
+        self.assertFalse(second_operation_called.is_set())
+        self.assertEqual(admission.peak, 1)
+        self.assertEqual(len(monitor.evidence()["violations"]), 1)
+
+    def test_host_capacity_sample_preserves_trusted_safety_violations(
+        self,
+    ) -> None:
+        valid = _host_capacity_sample()
+        observed = staged._validate_host_capacity_sample(
+            valid,
+            expected_collector_sha256="sha256:" + "f" * 64,
+            expected_windows_node_identity_sha256="sha256:" + "0" * 64,
+            docker_memory_reserve_bytes=4096,
+        )
+        self.assertEqual(len(observed["containers"]), 3)
+
+        for field, value in (
+            ("restart_count", 1),
+            ("oom_killed", True),
+            ("docker_vm_memory_available_bytes", 1024),
+        ):
+            sample = _host_capacity_sample()
+            sample["containers"][0][field] = value  # type: ignore[index]
+            with self.subTest(field=field), self.assertRaises(
+                staged._TrustedHostCapacityViolation
+            ) as raised:
+                staged._validate_host_capacity_sample(
+                    sample,
+                    expected_collector_sha256="sha256:" + "f" * 64,
+                    expected_windows_node_identity_sha256="sha256:" + "0" * 64,
+                    docker_memory_reserve_bytes=4096,
+                )
+            self.assertEqual(len(raised.exception.sample["containers"]), 3)
+
+    def test_host_capacity_monitor_keeps_violating_and_drain_samples(self) -> None:
+        samples = [
+            _host_capacity_sample(),
+            _host_capacity_sample(available_bytes=1024),
+            _host_capacity_sample(available_bytes=6144),
+        ]
+        monitor = staged._HostCapacityMonitor(
+            sampler=lambda: staged._validate_host_capacity_sample(
+                samples.pop(0),
+                expected_collector_sha256="sha256:" + "f" * 64,
+                expected_windows_node_identity_sha256="sha256:" + "0" * 64,
+                docker_memory_reserve_bytes=4096,
+            ),
+            collector_sha256="sha256:" + "f" * 64,
+            windows_node_identity_sha256="sha256:" + "0" * 64,
+            docker_memory_reserve_bytes=4096,
+            sample_interval_seconds=3600,
+        )
+
+        monitor.start()
+        monitor._sample_once()
+        self.assertIn("docker_vm_memory_reserve_crossed", str(monitor.failure))
+        monitor.stop()
+        evidence = monitor.evidence()
+
+        self.assertEqual(evidence["schema"], "mineru-host-capacity-evidence.v2")
+        self.assertEqual(len(evidence["samples"]), 3)
+        self.assertEqual(len(evidence["violations"]), 1)
+        self.assertEqual(evidence["sampling_failures"], [])
+        self.assertEqual(
+            evidence["summary"]["min_docker_vm_memory_available_bytes"],
+            1024,
+        )
+
+    def test_host_capacity_monitor_keeps_sampling_after_malformed_payload(self) -> None:
+        malformed = _host_capacity_sample()
+        del malformed["containers"]
+        samples = [
+            _host_capacity_sample(available_bytes=8192),
+            malformed,
+            _host_capacity_sample(available_bytes=6144),
+        ]
+
+        def sample() -> dict[str, object]:
+            return staged._validate_host_capacity_sample(
+                samples.pop(0),
+                expected_collector_sha256="sha256:" + "f" * 64,
+                expected_windows_node_identity_sha256="sha256:" + "0" * 64,
+                docker_memory_reserve_bytes=4096,
+            )
+
+        monitor = staged._HostCapacityMonitor(
+            sampler=sample,
+            collector_sha256="sha256:" + "f" * 64,
+            windows_node_identity_sha256="sha256:" + "0" * 64,
+            docker_memory_reserve_bytes=4096,
+            sample_interval_seconds=3600,
+        )
+
+        monitor.start()
+        monitor._sample_once()
+        monitor.stop()
+        evidence = monitor.evidence()
+
+        self.assertEqual(evidence["status"], "fail")
+        self.assertIn("host_capacity_sample_failed", str(evidence["failure"]))
+        self.assertEqual(len(evidence["samples"]), 2)
+        self.assertEqual(len(evidence["sampling_failures"]), 1)
+        self.assertEqual(evidence["violations"], [])
+        self.assertEqual(
+            evidence["summary"]["min_docker_vm_memory_available_bytes"],
+            6144,
+        )
+
+    def test_host_capacity_monitor_binds_epoch_and_has_pre_post_samples(self) -> None:
+        samples = [_host_capacity_sample(), _host_capacity_sample()]
+        monitor = staged._HostCapacityMonitor(
+            sampler=lambda: samples.pop(0),
+            collector_sha256="sha256:" + "f" * 64,
+            windows_node_identity_sha256="sha256:" + "0" * 64,
+            docker_memory_reserve_bytes=4096,
+            sample_interval_seconds=3600,
+        )
+
+        monitor.start()
+        monitor.stop()
+        evidence = monitor.evidence()
+
+        self.assertEqual(evidence["status"], "pass")
+        self.assertEqual(evidence["summary"]["sample_count"], 2)
+
+        changed = [_host_capacity_sample(), _host_capacity_sample(container_id_suffix="a")]
+        monitor = staged._HostCapacityMonitor(
+            sampler=lambda: changed.pop(0),
+            collector_sha256="sha256:" + "f" * 64,
+            windows_node_identity_sha256="sha256:" + "0" * 64,
+            docker_memory_reserve_bytes=4096,
+            sample_interval_seconds=3600,
+        )
+        monitor.start()
+        monitor.stop()
+        self.assertEqual(monitor.failure, "host_capacity_epoch_changed")
+
+        collector_source = (
+            Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "windows"
+            / "collect_mineru_runtime.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "$probeCode | & docker exec -i $name /usr/bin/python3.12 -I -",
+            collector_source,
+        )
+        self.assertNotIn("-I -c $probeCode", collector_source)
 
     def test_metrics_parser_aggregates_labels_and_accepts_kv_alias(self) -> None:
         sample = staged.parse_vllm_metrics(
@@ -223,14 +732,10 @@ vllm:gpu_cache_usage_perc 0.5
     def test_metrics_monitor_tolerates_only_one_transport_sample_failure(self) -> None:
         monitor = staged._MetricsMonitor(
             sampler=MagicMock(
-                side_effect=staged.MetricsTransportUnavailableError(
-                    "budget exhausted"
-                )
+                side_effect=staged.MetricsTransportUnavailableError("budget exhausted")
             ),
             expected_preemptions=0,
-            monotonic_clock=MagicMock(
-                side_effect=(0.0, 1.0, 2.0, 3.0, 4.0)
-            ),
+            monotonic_clock=MagicMock(side_effect=(0.0, 1.0, 2.0, 3.0, 4.0)),
         )
 
         self.assertTrue(monitor._observe_once())
@@ -265,9 +770,7 @@ vllm:gpu_cache_usage_perc 0.5
                 )
             ),
             expected_preemptions=0,
-            monotonic_clock=MagicMock(
-                side_effect=(0.0, 1.0, 2.0, 3.0, 4.0)
-            ),
+            monotonic_clock=MagicMock(side_effect=(0.0, 1.0, 2.0, 3.0, 4.0)),
         )
 
         self.assertTrue(monitor._observe_once())
@@ -319,9 +822,7 @@ vllm:gpu_cache_usage_perc 0.5
                 )
             ),
             expected_preemptions=0,
-            monotonic_clock=MagicMock(
-                side_effect=(0.0, 1.0, 2.0, 3.0, 4.0)
-            ),
+            monotonic_clock=MagicMock(side_effect=(0.0, 1.0, 2.0, 3.0, 4.0)),
         )
         self.assertTrue(monitor._observe_once())
         monitor._thread_started = True
@@ -341,9 +842,7 @@ vllm:gpu_cache_usage_perc 0.5
                 side_effect=staged.MetricsTransportUnavailableError("transport gap")
             ),
             expected_preemptions=0,
-            monotonic_clock=MagicMock(
-                side_effect=(0.0, 1.0, 2.0, 3.0, 4.0)
-            ),
+            monotonic_clock=MagicMock(side_effect=(0.0, 1.0, 2.0, 3.0, 4.0)),
         )
         self.assertTrue(monitor._observe_once())
         monitor._thread_started = True
@@ -484,65 +983,106 @@ vllm:gpu_cache_usage_perc 0.5
         self.assertEqual(len(summary["sampling_failures"]), 1)
         self.assertEqual(summary["terminal_sample_observed_seconds"], 6.0)
 
-    def test_orchestrator_evidence_requires_queue_for_8_and_exact_deltas(self) -> None:
-        baseline = self._health(completed=100, failed=2)
+    def test_orchestrator_evidence_accepts_retained_gauge_cleanup(self) -> None:
+        baseline = self._health(completed=2, failed=2)
         processing_only = (
-            staged.OrchestratorSample(0.1, 0, 3, 100, 2),
+            staged.OrchestratorSample(0.1, 0, 1, 2, 2),
+            staged.OrchestratorSample(0.2, 0, 1, 1, 1),
+            staged.OrchestratorSample(0.3, 0, 1, 0, 0),
         )
-        terminal = self._health(completed=108, failed=2)
+        terminal = self._health(completed=1, failed=0)
 
-        self.assertEqual(
+        self.assertIsNone(
             staged._orchestrator_evidence_failure(
-                concurrency=8,
                 baseline=baseline,
                 samples=processing_only,
                 terminal=terminal,
-            ),
-            "orchestrator_queue_not_observed",
+                task_slots=1,
+                client_outstanding_window=1,
+            )
         )
         with_queue = (
             *processing_only,
-            staged.OrchestratorSample(0.2, 5, 3, 100, 2),
+            staged.OrchestratorSample(0.2, 1, 1, 100, 2),
         )
-        self.assertIsNone(
+        self.assertEqual(
             staged._orchestrator_evidence_failure(
-                concurrency=8,
                 baseline=baseline,
                 samples=with_queue,
                 terminal=terminal,
-            )
-        )
-        self.assertEqual(
-            staged._orchestrator_evidence_failure(
-                concurrency=8,
-                baseline=baseline,
-                samples=with_queue,
-                terminal=self._health(completed=107, failed=2),
+                task_slots=1,
+                client_outstanding_window=1,
             ),
-            "orchestrator_completed_delta_mismatch",
-        )
-        self.assertEqual(
-            staged._orchestrator_evidence_failure(
-                concurrency=8,
-                baseline=baseline,
-                samples=with_queue,
-                terminal=self._health(completed=108, failed=3),
-            ),
-            "orchestrator_failed_delta_changed",
+            "orchestrator_active_exceeded_client_window",
         )
 
-    def test_orchestrator_monitor_fails_closed_above_three_processing(self) -> None:
+        summary = staged._orchestrator_summary(
+            baseline=baseline,
+            samples=processing_only,
+            terminal=terminal,
+            preflight_drain_seconds=0.0,
+            terminal_drain_seconds=0.5,
+        )
+        self.assertEqual(
+            summary["task_registry_semantics"],
+            "retained-terminal-gauges.v1",
+        )
+        self.assertNotIn("completed_delta", summary)
+        self.assertNotIn("failed_delta", summary)
+        self.assertEqual(summary["range"]["completed_tasks"], {"min": 0, "max": 2})
+        self.assertEqual(summary["range"]["failed_tasks"], {"min": 0, "max": 2})
+
+    def test_orchestrator_evidence_still_requires_idle_boundaries(self) -> None:
+        processing = (staged.OrchestratorSample(0.1, 0, 1, 0, 0),)
+        self.assertEqual(
+            staged._orchestrator_evidence_failure(
+                baseline=self._health(processing=1),
+                samples=processing,
+                terminal=self._health(),
+                task_slots=1,
+                client_outstanding_window=1,
+            ),
+            "orchestrator_baseline_not_idle",
+        )
+        self.assertEqual(
+            staged._orchestrator_evidence_failure(
+                baseline=self._health(),
+                samples=processing,
+                terminal=self._health(processing=1),
+                task_slots=1,
+                client_outstanding_window=1,
+            ),
+            "orchestrator_terminal_not_idle",
+        )
+
+    def test_orchestrator_monitor_fails_closed_above_attested_processing(self) -> None:
         monitor = staged._OrchestratorMonitor(
-            sampler=lambda: self._health(processing=4),
+            sampler=lambda: self._health(processing=2),
+            task_slots=1,
+            client_outstanding_window=2,
         )
 
         monitor._run()
 
         self.assertEqual(
             monitor.failure,
-            "orchestrator_processing_exceeded_3",
+            "orchestrator_processing_exceeded_attested_slots",
         )
-        self.assertEqual(monitor.samples[0].processing_tasks, 4)
+        self.assertEqual(monitor.samples[0].processing_tasks, 2)
+
+    def test_orchestrator_monitor_rejects_active_above_client_window(self) -> None:
+        monitor = staged._OrchestratorMonitor(
+            sampler=lambda: self._health(queued=2, processing=1),
+            task_slots=1,
+            client_outstanding_window=2,
+        )
+
+        monitor._run()
+
+        self.assertEqual(
+            monitor.failure,
+            "orchestrator_active_exceeded_client_window",
+        )
 
     def test_unapproved_stage_is_rejected_before_metrics_or_parse(self) -> None:
         sampled = False
@@ -555,11 +1095,9 @@ vllm:gpu_cache_usage_perc 0.5
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(ValueError, "not an approved stage"):
                 staged._run_stage(
-                    concurrency=32,
+                    document_count=32,
                     run_root=Path(tmp),
-                    input_bytes=b"pdf",
-                    input_digest=hashlib.sha256(b"pdf").hexdigest(),
-                    input_logical_name="frozen.pdf",
+                    corpus=self._corpus(),
                     mineru_bin=Path("/unused/mineru"),
                     api_url="http://unused-api",
                     inference_upstream_url="http://unused-upstream/v1",
@@ -569,6 +1107,7 @@ vllm:gpu_cache_usage_perc 0.5
                     metrics_sampler=sample,
                     orchestrator_sampler=lambda: self._health(),
                     orchestrator_idle_waiter=lambda: (self._health(), 0.0),
+                    task_slots=1,
                 )
         self.assertFalse(sampled)
 
@@ -576,11 +1115,9 @@ vllm:gpu_cache_usage_perc 0.5
         health = self._health(completed=10)
         with tempfile.TemporaryDirectory() as tmp:
             result = staged._run_stage(
-                concurrency=4,
+                document_count=4,
                 run_root=Path(tmp),
-                input_bytes=b"pdf",
-                input_digest=hashlib.sha256(b"pdf").hexdigest(),
-                input_logical_name="frozen.pdf",
+                corpus=self._corpus(),
                 mineru_bin=Path("/unused/mineru"),
                 api_url="http://unused-api",
                 inference_upstream_url="http://unused-upstream/v1",
@@ -590,12 +1127,11 @@ vllm:gpu_cache_usage_perc 0.5
                 metrics_sampler=lambda: staged.MetricsSample(0, 0, 0, 4, 0),
                 orchestrator_sampler=lambda: health,
                 orchestrator_idle_waiter=lambda: (health, 0.0),
+                task_slots=1,
             )
 
         self.assertEqual(result["status"], "fail")
-        self.assertEqual(
-            result["failure"], "preemption_counter_changed_between_stages"
-        )
+        self.assertEqual(result["failure"], "preemption_counter_changed_between_stages")
         self.assertEqual(result["documents"], [])
 
     def test_real_parser_path_receives_fixed_api_and_internal_upstream(self) -> None:
@@ -648,9 +1184,7 @@ vllm:gpu_cache_usage_perc 0.5
         self.assertEqual(result["status"], "pass")
         self.assertEqual(observed["bytes"], input_bytes)
         self.assertEqual(observed["api_url"], "http://127.0.0.1:30000")
-        self.assertEqual(
-            observed["server_url"], "http://mineru-vllm:30000/v1"
-        )
+        self.assertEqual(observed["server_url"], "http://mineru-vllm:30000/v1")
         self.assertIsNone(observed["concurrency"])
         self.assertEqual(observed["runtime_identity"], "sha256:" + "a" * 64)
         self.assertEqual(observed["source_sha256"], f"sha256:{digest}")
@@ -764,11 +1298,9 @@ vllm:gpu_cache_usage_perc 0.5
             ),
         ):
             result = staged._run_stage(
-                concurrency=4,
+                document_count=4,
                 run_root=Path(tmp),
-                input_bytes=b"pdf",
-                input_digest=hashlib.sha256(b"pdf").hexdigest(),
-                input_logical_name="frozen.pdf",
+                corpus=self._corpus(),
                 mineru_bin=Path("/unused/mineru"),
                 api_url="http://unused-api",
                 inference_upstream_url="http://unused-upstream/v1",
@@ -778,6 +1310,7 @@ vllm:gpu_cache_usage_perc 0.5
                 metrics_sampler=lambda: metrics,
                 orchestrator_sampler=lambda: health,
                 orchestrator_idle_waiter=idle_waiter,
+                task_slots=1,
             )
 
         statuses = [item["status"] for item in result["documents"]]
@@ -813,7 +1346,9 @@ vllm:gpu_cache_usage_perc 0.5
                 staged._write_new_json(receipt, {"status": "fail"})
             self.assertEqual(receipt.read_bytes(), first_bytes)
 
-    def test_operational_failure_writes_fail_receipt_without_remote_access(self) -> None:
+    def test_operational_failure_writes_fail_receipt_without_remote_access(
+        self,
+    ) -> None:
         input_bytes = b"%PDF-1.4 frozen fixture"
         input_sha = "sha256:" + hashlib.sha256(input_bytes).hexdigest()
         runtime_identity = "sha256:" + "a" * 64
@@ -821,11 +1356,14 @@ vllm:gpu_cache_usage_perc 0.5
             root = Path(tmp)
             fixture = root / "fixture.pdf"
             fixture.write_bytes(input_bytes)
+            corpus_manifest = root / "corpus.json"
+            corpus_manifest.write_text("{}", encoding="utf-8")
             mineru = root / "mineru"
             mineru.write_text("executable", encoding="utf-8")
             manifest = root / "manifest.json"
             manifest.write_text("{}", encoding="utf-8")
             receipt = root / "receipt.json"
+            observer_identity, observer_known_hosts = self._host_observer_files(root)
             client = SimpleNamespace(
                 package_set_sha256="sha256:" + "b" * 64,
                 content_package_versions={},
@@ -836,7 +1374,14 @@ vllm:gpu_cache_usage_perc 0.5
                 patch.object(staged, "process_snapshot", return_value={}),
                 patch.object(staged, "_wait_for_process_cleanup", return_value={}),
                 patch.object(staged, "client_bundle_identity", return_value=client),
-                patch.object(staged, "writer_code_digest", return_value="sha256:" + "c" * 64),
+                patch.object(
+                    staged,
+                    "_load_frozen_corpus",
+                    return_value=self._corpus_fixture(input_sha),
+                ),
+                patch.object(
+                    staged, "writer_code_digest", return_value="sha256:" + "c" * 64
+                ),
                 patch.object(
                     staged,
                     "verify_runtime_manifest_payload",
@@ -849,9 +1394,9 @@ vllm:gpu_cache_usage_perc 0.5
                         str(manifest),
                         "--receipt-out",
                         str(receipt),
-                        "--input",
-                        str(fixture),
-                        "--expected-input-sha256",
+                        "--corpus-manifest",
+                        str(corpus_manifest),
+                        "--expected-corpus-sha256",
                         input_sha,
                         "--mineru-bin",
                         str(mineru),
@@ -863,13 +1408,23 @@ vllm:gpu_cache_usage_perc 0.5
                         "http://unused-upstream/v1",
                         "--runtime-bundle-identity",
                         runtime_identity,
+                        "--host-observer-ssh-host",
+                        "100.64.0.1",
+                        "--host-observer-ssh-user",
+                        "operator",
+                        "--host-observer-identity-file",
+                        str(observer_identity),
+                        "--host-observer-known-hosts-file",
+                        str(observer_known_hosts),
+                        "--docker-memory-reserve-bytes",
+                        "1024",
                     ]
                 )
 
             payload = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(result, 2)
             self.assertEqual(payload["status"], "fail")
-            self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v2")
+            self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v5")
             self.assertEqual(
                 payload["topology"]["api_endpoint_sha256"],
                 "sha256:" + hashlib.sha256(b"http://unused-api").hexdigest(),
@@ -879,7 +1434,64 @@ vllm:gpu_cache_usage_perc 0.5
             self.assertIn("manifest drift", payload["failure"])
             self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o600)
 
-    def test_main_routes_three_urls_and_emits_fixed_api_v2_receipt(self) -> None:
+    def test_preflight_failures_write_new_private_receipts(self) -> None:
+        for case in ("missing_bin", "bad_window", "invalid_corpus"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                mineru = root / "mineru"
+                if case != "missing_bin":
+                    mineru.write_text("executable", encoding="utf-8")
+                corpus = root / "corpus.json"
+                corpus.write_text("{}", encoding="utf-8")
+                manifest = root / "manifest.json"
+                manifest.write_text("{}", encoding="utf-8")
+                receipt = root / "receipt.json"
+                identity, known_hosts = self._host_observer_files(root)
+                arguments = [
+                    "--runtime-manifest",
+                    str(manifest),
+                    "--receipt-out",
+                    str(receipt),
+                    "--corpus-manifest",
+                    str(corpus),
+                    "--expected-corpus-sha256",
+                    "sha256:" + "a" * 64,
+                    "--mineru-bin",
+                    str(mineru),
+                    "--api-url",
+                    "http://unused-api",
+                    "--observability-url",
+                    "http://unused-observability/v1",
+                    "--inference-upstream-url",
+                    "http://unused-upstream/v1",
+                    "--runtime-bundle-identity",
+                    "sha256:" + "b" * 64,
+                    "--host-observer-ssh-host",
+                    "100.64.0.1",
+                    "--host-observer-ssh-user",
+                    "operator",
+                    "--host-observer-identity-file",
+                    str(identity),
+                    "--host-observer-known-hosts-file",
+                    str(known_hosts),
+                    "--docker-memory-reserve-bytes",
+                    "1024",
+                ]
+                window = "15" if case == "bad_window" else "16"
+                with patch.dict(
+                    os.environ,
+                    {"MINERU_PROCESSING_WINDOW_SIZE": window},
+                ):
+                    result = staged.main(arguments)
+
+                payload = json.loads(receipt.read_text(encoding="utf-8"))
+                self.assertEqual(result, 2)
+                self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v5")
+                self.assertEqual(payload["status"], "fail")
+                self.assertEqual(payload["failure_phase"], "preflight_configuration")
+                self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o600)
+
+    def test_main_routes_three_urls_and_emits_staged_v5_receipt(self) -> None:
         input_bytes = b"%PDF-1.4 frozen fixture"
         input_sha = "sha256:" + hashlib.sha256(input_bytes).hexdigest()
         runtime_identity = "sha256:" + "a" * 64
@@ -887,26 +1499,33 @@ vllm:gpu_cache_usage_perc 0.5
         observability_url = "http://127.0.0.1:30002/v1"
         inference_upstream_url = "http://mineru-vllm:30000/v1"
         topology = {
-            name: "sha256:"
-            + hashlib.sha256(url.rstrip("/").encode()).hexdigest()
+            name: "sha256:" + hashlib.sha256(url.rstrip("/").encode()).hexdigest()
             for name, url in {
                 "api_endpoint_sha256": api_url,
                 "observability_endpoint_sha256": observability_url,
                 "inference_upstream_sha256": inference_upstream_url,
             }.items()
         }
+        topology.update(
+            {
+                "windows_collector_path": staged.MINERU_WINDOWS_COLLECTOR_PATH,
+                "windows_collector_sha256": "sha256:" + "f" * 64,
+                "windows_node_identity_sha256": "sha256:" + "0" * 64,
+            }
+        )
         verified = SimpleNamespace(
             manifest={
                 "topology": topology,
                 "orchestrator": {
-                    "task_retention_seconds": 86400,
-                    "task_cleanup_interval_seconds": 300,
+                    "task_retention_seconds": 600,
+                    "task_cleanup_interval_seconds": 30,
                 },
             },
             identity_sha256=runtime_identity,
             orchestrator_identity_sha256="sha256:" + "d" * 64,
             provider_identity_sha256="sha256:" + "e" * 64,
             served_model_id="mineru-model",
+            max_concurrent_requests=1,
         )
         metrics = staged.MetricsSample(0, 0, 0, 0, 0)
         health = self._health()
@@ -914,11 +1533,14 @@ vllm:gpu_cache_usage_perc 0.5
             root = Path(tmp)
             fixture = root / "fixture.pdf"
             fixture.write_bytes(input_bytes)
+            corpus_manifest = root / "corpus.json"
+            corpus_manifest.write_text("{}", encoding="utf-8")
             mineru = root / "mineru"
             mineru.write_text("executable", encoding="utf-8")
             manifest = root / "manifest.json"
             manifest.write_text("{}", encoding="utf-8")
             receipt = root / "receipt.json"
+            observer_identity, observer_known_hosts = self._host_observer_files(root)
             client = SimpleNamespace(
                 package_set_sha256="sha256:" + "b" * 64,
                 content_package_versions={},
@@ -926,18 +1548,30 @@ vllm:gpu_cache_usage_perc 0.5
             run_stage = MagicMock(
                 side_effect=lambda **kwargs: {
                     "status": "pass",
-                    "client_document_concurrency": kwargs["concurrency"],
+                    "stage_document_count": kwargs["document_count"],
                 }
             )
             metrics_fetch = MagicMock(return_value=metrics)
             health_fetch = MagicMock(return_value=health)
             idle_waiter = MagicMock(return_value=(health, 0.0))
+            host_monitor = MagicMock()
+            host_monitor.failure = None
+            host_monitor.evidence.return_value = {
+                "schema": "mineru-host-capacity-evidence.v2",
+                "status": "pass",
+                "failure": None,
+            }
             with (
                 patch.dict(os.environ, {"MINERU_PROCESSING_WINDOW_SIZE": "16"}),
                 patch.object(staged, "mineru_api_temp_dirs", return_value=set()),
                 patch.object(staged, "process_snapshot", return_value={}),
                 patch.object(staged, "_wait_for_process_cleanup", return_value={}),
                 patch.object(staged, "client_bundle_identity", return_value=client),
+                patch.object(
+                    staged,
+                    "_load_frozen_corpus",
+                    return_value=self._corpus_fixture(input_sha),
+                ),
                 patch.object(
                     staged,
                     "writer_code_digest",
@@ -961,6 +1595,11 @@ vllm:gpu_cache_usage_perc 0.5
                     idle_waiter,
                 ),
                 patch.object(staged, "_run_stage", run_stage),
+                patch.object(
+                    staged,
+                    "_HostCapacityMonitor",
+                    return_value=host_monitor,
+                ),
             ):
                 result = staged.main(
                     [
@@ -968,9 +1607,9 @@ vllm:gpu_cache_usage_perc 0.5
                         str(manifest),
                         "--receipt-out",
                         str(receipt),
-                        "--input",
-                        str(fixture),
-                        "--expected-input-sha256",
+                        "--corpus-manifest",
+                        str(corpus_manifest),
+                        "--expected-corpus-sha256",
                         input_sha,
                         "--mineru-bin",
                         str(mineru),
@@ -982,6 +1621,16 @@ vllm:gpu_cache_usage_perc 0.5
                         inference_upstream_url,
                         "--runtime-bundle-identity",
                         runtime_identity,
+                        "--host-observer-ssh-host",
+                        "100.64.0.1",
+                        "--host-observer-ssh-user",
+                        "operator",
+                        "--host-observer-identity-file",
+                        str(observer_identity),
+                        "--host-observer-known-hosts-file",
+                        str(observer_known_hosts),
+                        "--docker-memory-reserve-bytes",
+                        "1024",
                     ]
                 )
                 first_call = run_stage.call_args_list[0].kwargs
@@ -1001,22 +1650,57 @@ vllm:gpu_cache_usage_perc 0.5
                 first_call["inference_upstream_url"],
                 inference_upstream_url,
             )
-            self.assertEqual(metrics_fetch.call_args_list[-1].args, (observability_url,))
+            self.assertEqual(
+                metrics_fetch.call_args_list[-1].args, (observability_url,)
+            )
             self.assertEqual(health_fetch.call_args.args, (api_url,))
             self.assertEqual(idle_waiter.call_args.args, (api_url,))
+            self.assertEqual(
+                health_fetch.call_args.kwargs,
+                {
+                    "expected_task_slots": 1,
+                    "expected_task_retention_seconds": 600,
+                    "expected_cleanup_interval_seconds": 30,
+                },
+            )
+            self.assertEqual(
+                {
+                    key: idle_waiter.call_args.kwargs[key]
+                    for key in (
+                        "expected_task_slots",
+                        "expected_task_retention_seconds",
+                        "expected_cleanup_interval_seconds",
+                    )
+                },
+                {
+                    "expected_task_slots": 1,
+                    "expected_task_retention_seconds": 600,
+                    "expected_cleanup_interval_seconds": 30,
+                },
+            )
             payload = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "pass")
-            self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v2")
-            self.assertEqual(payload["topology"], topology)
+            self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v5")
             self.assertEqual(
-                payload["fixed_stage_client_document_concurrency"],
+                payload["topology"],
+                {
+                    key: topology[key]
+                    for key in (
+                        "api_endpoint_sha256",
+                        "observability_endpoint_sha256",
+                        "inference_upstream_sha256",
+                    )
+                },
+            )
+            self.assertEqual(
+                payload["fixed_stage_document_counts"],
                 [4, 8, 16],
             )
-            self.assertEqual(payload["orchestrator_task_concurrency"], 3)
+            self.assertEqual(payload["orchestrator_task_concurrency"], 1)
             self.assertEqual(payload["orchestrator_inference_concurrency"], 7)
             self.assertEqual(
                 payload["effective_inference_request_upper_bound"],
-                21,
+                7,
             )
 
 

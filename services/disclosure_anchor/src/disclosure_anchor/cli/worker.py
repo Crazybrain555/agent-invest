@@ -68,7 +68,6 @@ from disclosure_anchor.adapters.storage.provider_document_source import (
 )
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
 from disclosure_anchor.application.dto.worker_report import (
-    WorkerFailure,
     WorkerLimits,
     WorkerReport,
 )
@@ -82,6 +81,7 @@ from disclosure_anchor.application.worker.worker import (
     WorkerConfig,
     WorkerDeps,
     WorkerAdmissionUnavailableError,
+    _failure_from_exception,
     _is_provider_infrastructure_error,
     build_failures_indicate_outage,
     publish_failures_indicate_outage,
@@ -100,10 +100,62 @@ RATE_LIMIT_COOLDOWN_MAX_SECONDS = 600
 SYNC_COOLDOWN_MAX_SECONDS = 7200
 PARSE_COOLDOWN_BASE_SECONDS = 120
 PROVIDER_ERROR_COOLDOWN_BASE_SECONDS = 60
+# Every active parse/finalize owns one session-level document lease for its
+# whole lifecycle and may briefly need a second connection for its transaction
+# UoW.  The maintenance download path also owns a corpus-writer lease while
+# its registration/failure UoW is active; the resident coordinator and report
+# plane may each perform an independent query at the same time.  These are
+# architecture bounds, not machine-specific tuning values.
+WORKER_DB_CONTROL_CONNECTIONS = 4
 
 
 class WorkerSingletonGuardError(RuntimeError):
     """The process-lifetime singleton session can no longer be trusted."""
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerDatabasePoolBudget:
+    """QueuePool budget derived from the worker's configured concurrency."""
+
+    pool_size: int
+    max_overflow: int
+
+    @property
+    def total_connections(self) -> int:
+        return self.pool_size + self.max_overflow
+
+
+def worker_database_pool_budget(settings: Settings) -> WorkerDatabasePoolBudget:
+    """Cover every intentional concurrent checkout without a fixed machine size.
+
+    ``pool_size`` retains the long-lived producer leases plus four control
+    checkouts: maintenance's nested registration, the resident coordinator,
+    and the report plane. ``max_overflow`` covers one short transaction
+    connection per active parse/finalize and is discarded when the burst ends.
+    """
+
+    parse = max(
+        1,
+        min(
+            int(settings.worker_parse_concurrency),
+            int(settings.worker_mineru_client_outstanding_window),
+        ),
+    )
+    finalize = max(1, int(settings.worker_finalize_concurrency))
+    active_documents = parse + finalize
+    return WorkerDatabasePoolBudget(
+        pool_size=active_documents + WORKER_DB_CONTROL_CONNECTIONS,
+        max_overflow=active_documents,
+    )
+
+
+def _create_worker_db_engine(settings: Settings) -> Engine:
+    budget = worker_database_pool_budget(settings)
+    return create_db_engine(
+        _database_url(settings),
+        pool_size=budget.pool_size,
+        max_overflow=budget.max_overflow,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -130,8 +182,10 @@ def main(argv: list[str] | None = None) -> int:
         return _print_worker_status(settings, output_format=args.format)
     if args.command == "loop":
         return run_resident_worker(settings, progress_output=args.progress)
+    # Construction verifies immutable/static deployment evidence before any DB
+    # access. The first live probe belongs inside the singleton-owned round so a
+    # transient outage becomes a durable admission failure report.
     mineru_checker = MinerUDeploymentChecker(settings)
-    mineru_checker.assert_admission()
     _print_version_banner(settings)
     # Singleton lock on a dedicated NullPool connection: a pooled connection
     # would leak the session lock back into the pool on release (08 §2 E6).
@@ -167,7 +221,7 @@ def _run_rounds(
     lock_conn: Connection,
     mineru_checker: MinerUDeploymentChecker | None = None,
 ) -> int:
-    engine = create_db_engine(_database_url(settings))
+    engine = _create_worker_db_engine(settings)
     try:
         require_runtime_app_engine(engine)
         deps = _deps(
@@ -271,8 +325,10 @@ def run_resident_worker(
 ) -> int:
     """Run the one resident worker."""
 
+    # As in once mode, static identity is checked here; live availability is
+    # checked by the resident admission controller after singleton ownership
+    # and reporting are established.
     mineru_checker = MinerUDeploymentChecker(settings)
-    mineru_checker.assert_admission()
     _print_version_banner(settings)
     lock_engine = sqlalchemy.create_engine(
         _database_url(settings),
@@ -308,7 +364,7 @@ def _run_loop(
 ) -> int:
     """Run a resident data plane with independent maintenance/reporting."""
 
-    engine = create_db_engine(_database_url(settings))
+    engine = _create_worker_db_engine(settings)
     try:
         require_runtime_app_engine(engine)
     except BaseException:
@@ -824,6 +880,12 @@ class _AdaptiveLoopController:
                 self.idle_max_seconds,
                 self.provider_error_cooldown_seconds * 2,
             )
+        elif _local_infrastructure_outage(report):
+            # A worker-pool/DB capacity fault is not a CNINFO outage. Even if
+            # earlier items made progress, pause before touching the DB again.
+            self.idle_delay_seconds = self.idle_base_seconds
+            self.item_failure_delay_seconds = SYSTEM_ERROR_BASE_SECONDS
+            return float(SYSTEM_ERROR_BASE_SECONDS)
         elif report.synced_companies:
             self.quota_cooldown_seconds = SYNC_COOLDOWN_BASE_SECONDS
             # Decay instead of reset: inside a long provider throttle window
@@ -902,13 +964,20 @@ def _source_infrastructure_outage(report: WorkerReport) -> bool:
     )
 
 
+def _local_infrastructure_outage(report: WorkerReport) -> bool:
+    return any(
+        failure.error_code == "DB_POOL_EXHAUSTED"
+        for failure in report.failures
+    )
+
+
 def _system_failure_report(
     *, started_at: datetime, duration_seconds: float, exc: Exception
 ) -> WorkerReport:
     report = WorkerReport(started_at=started_at, duration_seconds=duration_seconds)
     report.failed = 1
     report.failures.append(
-        WorkerFailure(stage="system", item_ref="round", error_code=type(exc).__name__)
+        _failure_from_exception(stage="system", item_ref="round", exc=exc)
     )
     return report
 
@@ -1093,6 +1162,9 @@ def _deps(
                 else process_scope_classes
             ),
             parse_concurrency=settings.worker_parse_concurrency,
+            mineru_client_outstanding_window=(
+                settings.worker_mineru_client_outstanding_window
+            ),
             parse_heavy_page_threshold=(settings.worker_parse_heavy_page_threshold),
             parse_heavy_saturated_share=(settings.worker_parse_heavy_saturated_share),
             parse_huge_page_threshold=(settings.worker_parse_huge_page_threshold),
@@ -1161,7 +1233,8 @@ def _print_version_banner(settings: Settings) -> None:
         f"[versions] policy={settings.disclosure_processing_policy_path.name} "
         f"scope_classes={len(scope)} "
         f"builder_rules={PROVIDER_UNIT_BUILDER_VERSION} "
-        f"parse_submit_slots={settings.worker_parse_concurrency} "
+        f"parse_workers={settings.worker_parse_concurrency} "
+        f"api_outstanding={settings.worker_mineru_client_outstanding_window} "
         f"gpu_request_cap={settings.disclosure_mineru_api_task_slots}x"
         f"{settings.mineru_http_request_concurrency}="
         f"{settings.mineru_effective_inference_request_upper_bound}"
@@ -1169,6 +1242,8 @@ def _print_version_banner(settings: Settings) -> None:
         f"parse_runaway={settings.disclosure_parse_runaway_timeout_seconds}s "
         f"resident_dispatch=continuous "
         f"report_interval={settings.worker_report_interval_seconds}s"
+        f" db_pool={worker_database_pool_budget(settings).pool_size}+"
+        f"{worker_database_pool_budget(settings).max_overflow}"
     )
     engine: Engine | None = None
     try:

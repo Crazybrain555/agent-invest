@@ -38,6 +38,7 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     writer_code_digest,
 )
 from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
+    MinerUOrchestratorHealth,
     fetch_mineru_orchestrator_health,
 )
 from disclosure_anchor.adapters.runtime.mineru_process_isolation import (
@@ -50,7 +51,8 @@ from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.domain.errors import DisclosureAnchorError
 
 
-RECEIPT_SCHEMA = "mineru_smoke_receipt.v2"
+RECEIPT_SCHEMA = "mineru_smoke_receipt.v4"
+TASK_REGISTRY_SEMANTICS = "retained-terminal-gauges.v1"
 DEFAULT_INPUT = (
     Path(__file__).resolve().parents[1]
     / "tests"
@@ -72,6 +74,23 @@ def _normalize_sha256(value: str, *, label: str) -> str:
     if match is None:
         raise ValueError(f"{label} must be a canonical SHA-256")
     return match.group(1)
+
+
+def _smoke_orchestrator_evidence(
+    before: MinerUOrchestratorHealth,
+    after: MinerUOrchestratorHealth,
+) -> dict[str, object]:
+    if before.active_tasks != 0:
+        raise ValueError("MinerU API must be idle before smoke")
+    if after.active_tasks != 0:
+        raise ValueError("MinerU API must be idle after smoke")
+    return {
+        "task_registry_semantics": TASK_REGISTRY_SEMANTICS,
+        "before": before.as_dict(),
+        "after": after.as_dict(),
+        "terminal_active_tasks": 0,
+        "stop_semantics": "drain-not-cancel.v1",
+    }
 
 
 def _runtime_manifest(
@@ -99,9 +118,7 @@ def _runtime_manifest(
 
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode(
-        "utf-8"
-    )
+    encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "wb") as handle:
@@ -367,10 +384,15 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
     except (OSError, json.JSONDecodeError, ValueError, RuntimeError) as exc:
-        raise SystemExit(f"[abort] MinerU bootstrap identity/canary failed: {exc}") from exc
+        raise SystemExit(
+            f"[abort] MinerU bootstrap identity/canary failed: {exc}"
+        ) from exc
 
     api_before = fetch_mineru_orchestrator_health(
         api_url,
+        expected_task_slots=int(
+            runtime_manifest["orchestrator"]["max_concurrent_requests"]
+        ),
         expected_task_retention_seconds=int(
             runtime_manifest["orchestrator"]["task_retention_seconds"]
         ),
@@ -425,7 +447,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("provider smoke returned no pages")
             if provider_document.parser_version != "3.4.4":
                 raise ValueError("provider smoke parser version drifted")
-            if provider_document.backend != "hybrid" or provider_document.effort != "medium":
+            if (
+                provider_document.backend != "hybrid"
+                or provider_document.effort != "medium"
+            ):
                 raise ValueError("provider smoke target drifted from Hybrid-medium")
             provider_evidence = {
                 "target_identity": result.target_identity.to_payload(),
@@ -466,15 +491,14 @@ def main(argv: list[str] | None = None) -> int:
 
     api_after = fetch_mineru_orchestrator_health(
         api_url,
+        expected_task_slots=api_before.max_concurrent_requests,
         expected_task_retention_seconds=api_before.task_retention_seconds,
         expected_cleanup_interval_seconds=api_before.task_cleanup_interval_seconds,
     )
-    if (
-        api_after.active_tasks != 0
-        or api_after.completed_tasks != api_before.completed_tasks + 1
-        or api_after.failed_tasks != api_before.failed_tasks
-    ):
-        raise SystemExit("[abort] MinerU API smoke task accounting drifted")
+    try:
+        orchestrator_evidence = _smoke_orchestrator_evidence(api_before, api_after)
+    except ValueError as exc:
+        raise SystemExit(f"[abort] {exc}") from exc
 
     canary_cache = canary.cache_payload(
         observability_url=observability_url,
@@ -509,26 +533,17 @@ def main(argv: list[str] | None = None) -> int:
             "orchestrator_runtime_identity_sha256": orchestrator_identity,
             "provider_runtime_identity_sha256": remote_identity,
             "served_model_id": canary.model_id,
+            "orchestrator_task_slots": api_before.max_concurrent_requests,
         },
         "topology": {
-            "api_endpoint_sha256": "sha256:" + _sha256(
-                api_url.rstrip("/").encode("utf-8")
-            ),
-            "observability_endpoint_sha256": "sha256:" + _sha256(
-                observability_url.rstrip("/").encode("utf-8")
-            ),
-            "inference_upstream_sha256": "sha256:" + _sha256(
-                inference_upstream_url.rstrip("/").encode("utf-8")
-            ),
+            "api_endpoint_sha256": "sha256:"
+            + _sha256(api_url.rstrip("/").encode("utf-8")),
+            "observability_endpoint_sha256": "sha256:"
+            + _sha256(observability_url.rstrip("/").encode("utf-8")),
+            "inference_upstream_sha256": "sha256:"
+            + _sha256(inference_upstream_url.rstrip("/").encode("utf-8")),
         },
-        "orchestrator": {
-            "before": api_before.as_dict(),
-            "after": api_after.as_dict(),
-            "completed_delta": 1,
-            "failed_delta": 0,
-            "terminal_active_tasks": 0,
-            "stop_semantics": "drain-not-cancel.v1",
-        },
+        "orchestrator": orchestrator_evidence,
         "runtime_manifest": runtime_manifest,
         "canary": canary_cache,
         "provider": provider_evidence,

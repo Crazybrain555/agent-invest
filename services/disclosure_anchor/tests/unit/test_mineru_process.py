@@ -356,6 +356,44 @@ class MinerUProcessTests(unittest.TestCase):
                     ),
                 )
 
+    def test_drain_failure_retains_bounded_primary_cli_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_pdf = root / "input.pdf"
+            input_pdf.write_bytes(b"%PDF")
+            raw = "1 task(s) failed: GPU worker crashed token=top-secret " + "x" * 400
+            process = mock.MagicMock(pid=43213, returncode=1)
+            process.communicate.return_value = ("", raw)
+            with (
+                mock.patch.object(
+                    mineru_process.subprocess,
+                    "Popen",
+                    return_value=process,
+                ),
+                mock.patch.object(
+                    mineru_process,
+                    "wait_for_mineru_orchestrator_idle",
+                    side_effect=MinerUOrchestratorError("health transport failed"),
+                ),
+                self.assertRaises(ParserBackendUnavailableError) as raised,
+            ):
+                MinerUProcess(executable=Path("mineru")).run(
+                    input_pdf=input_pdf,
+                    output_dir=root / "out",
+                    options=ParserOptions(
+                        api_url="http://127.0.0.1:30002",
+                        server_url="http://mineru-openai-server:30000/v1",
+                    ),
+                )
+
+        message = str(raised.exception)
+        self.assertIn("primary_type=ParserBackendUnavailableError", message)
+        self.assertIn("GPU worker crashed", message)
+        self.assertIn("cli_sha256=", message)
+        self.assertIn("...[truncated]", message)
+        self.assertIn("remote task drain could not be proved", message)
+        self.assertNotIn("top-secret", message)
+
     def test_worker_shutdown_is_not_classified_as_task_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

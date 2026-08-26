@@ -93,7 +93,7 @@
   },
   "tests/unit/test_attest_mineru_remote_runtime.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 6
   },
   "tests/unit/test_audit_live_unit_replay.py": {
    "private_imports": [],
@@ -238,7 +238,11 @@
   },
   "tests/unit/test_mineru_deployment_gate.py": {
    "private_imports": [],
-   "tests": 26
+   "tests": 32
+  },
+  "tests/unit/test_mineru_heap_trim_compat.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
@@ -254,11 +258,11 @@
   },
   "tests/unit/test_mineru_process.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 12
   },
   "tests/unit/test_mineru_smoke.py": {
    "private_imports": [],
-   "tests": 5
+   "tests": 6
   },
   "tests/unit/test_mineru_ssh_tunnel.py": {
    "private_imports": [],
@@ -266,7 +270,7 @@
   },
   "tests/unit/test_mineru_staged_load.py": {
    "private_imports": [],
-   "tests": 35
+   "tests": 47
   },
   "tests/unit/test_normalized_ir_v4_evidence.py": {
    "private_imports": [],
@@ -418,7 +422,7 @@
    "private_imports": [
     "_sync_window_start"
    ],
-   "tests": 61
+   "tests": 63
   }
  },
  "schema": "test-composition-ledger.v1"

@@ -74,6 +74,11 @@ class SettingsTests(unittest.TestCase):
                 {"WORKER_REPORT_INTERVAL_SECONDS": "0"},
                 {"MINERU_PROCESSING_WINDOW_SIZE": "32"},
                 {"DISCLOSURE_MINERU_LIVE_PROBE_INTERVAL_SECONDS": "0"},
+                {"DISCLOSURE_MINERU_API_TASK_SLOTS": "4"},
+                {
+                    "DISCLOSURE_MINERU_API_TASK_SLOTS": "2",
+                    "WORKER_GPU_REQUEST_BUDGET": "7",
+                },
             ):
                 with (
                     self.subTest(extra=extra),
@@ -95,12 +100,28 @@ class SettingsTests(unittest.TestCase):
                 settings = load_settings()
 
         self.assertEqual(settings.worker_parse_concurrency, 8)
-        self.assertEqual(settings.worker_gpu_request_budget, 21)
+        self.assertEqual(settings.worker_gpu_request_budget, 7)
         self.assertEqual(settings.worker_gpu_max_sequences, 128)
         self.assertEqual(settings.mineru_http_request_concurrency, 7)
-        self.assertEqual(settings.mineru_effective_inference_request_upper_bound, 21)
+        self.assertEqual(settings.mineru_effective_inference_request_upper_bound, 7)
         self.assertEqual(settings.worker_parse_heavy_page_threshold, 80)
         self.assertEqual(settings.worker_parse_huge_page_threshold, 500)
+
+        with patch.dict(
+            os.environ,
+            {
+                **base,
+                "WORKER_PARSE_CONCURRENCY": "16",
+                "DISCLOSURE_MINERU_BACKEND": "hybrid-http-client",
+                "DISCLOSURE_MINERU_API_TASK_SLOTS": "2",
+                "WORKER_GPU_REQUEST_BUDGET": "14",
+                **_mineru_topology(),
+            },
+            clear=True,
+        ):
+            two_slot = load_settings()
+        self.assertEqual(two_slot.disclosure_mineru_api_task_slots, 2)
+        self.assertEqual(two_slot.mineru_effective_inference_request_upper_bound, 14)
 
     def test_loads_required_environment(self) -> None:
         with (
@@ -146,15 +167,42 @@ class SettingsTests(unittest.TestCase):
 
     def test_mineru_topology_rejects_ambiguous_or_exposed_urls(self) -> None:
         invalid_overrides = (
-            {**_mineru_topology(), "DISCLOSURE_MINERU_API_URL": "http://100.64.0.1:30002"},
-            {**_mineru_topology(), "DISCLOSURE_MINERU_API_URL": "http://user@127.0.0.1:30002"},
-            {**_mineru_topology(), "DISCLOSURE_MINERU_API_URL": "http://127.0.0.1:30002/v1"},
-            {**_mineru_topology(), "DISCLOSURE_MINERU_OBSERVABILITY_URL": "http://100.64.0.1:30001/v1"},
-            {**_mineru_topology(), "DISCLOSURE_MINERU_OBSERVABILITY_URL": "http://127.0.0.1:30001"},
-            {**_mineru_topology(), "DISCLOSURE_MINERU_OBSERVABILITY_URL": "http://127.0.0.1:30001/v1?x=1"},
-            {**_mineru_topology(), "DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL": "http://mineru-openai-server:30000/other"},
-            {**_mineru_topology(), "DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL": "http://127.0.0.1:30000/v1"},
-            {**_mineru_topology(), "DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL": "http://vllm.example.com:30000/v1"},
+            {
+                **_mineru_topology(),
+                "DISCLOSURE_MINERU_API_URL": "http://100.64.0.1:30002",
+            },
+            {
+                **_mineru_topology(),
+                "DISCLOSURE_MINERU_API_URL": "http://user@127.0.0.1:30002",
+            },
+            {
+                **_mineru_topology(),
+                "DISCLOSURE_MINERU_API_URL": "http://127.0.0.1:30002/v1",
+            },
+            {
+                **_mineru_topology(),
+                "DISCLOSURE_MINERU_OBSERVABILITY_URL": "http://100.64.0.1:30001/v1",
+            },
+            {
+                **_mineru_topology(),
+                "DISCLOSURE_MINERU_OBSERVABILITY_URL": "http://127.0.0.1:30001",
+            },
+            {
+                **_mineru_topology(),
+                "DISCLOSURE_MINERU_OBSERVABILITY_URL": "http://127.0.0.1:30001/v1?x=1",
+            },
+            {
+                **_mineru_topology(),
+                "DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL": "http://mineru-openai-server:30000/other",
+            },
+            {
+                **_mineru_topology(),
+                "DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL": "http://127.0.0.1:30000/v1",
+            },
+            {
+                **_mineru_topology(),
+                "DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL": "http://vllm.example.com:30000/v1",
+            },
             {**_mineru_topology(), "DISCLOSURE_MINERU_API_TASK_SLOTS": "4"},
             {**_mineru_topology(), "DISCLOSURE_MINERU_API_INFERENCE_CONCURRENCY": "8"},
         )
@@ -194,9 +242,7 @@ class SettingsTests(unittest.TestCase):
                 os.environ,
                 {
                     **base,
-                    "DISCLOSURE_GPU_METRICS_URL": (
-                        "http://127.0.0.1:30004/metrics"
-                    ),
+                    "DISCLOSURE_GPU_METRICS_URL": ("http://127.0.0.1:30004/metrics"),
                 },
                 clear=True,
             ):

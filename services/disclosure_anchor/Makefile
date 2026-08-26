@@ -223,18 +223,29 @@ mineru-smoke:
 		$(if $(EXPECTED_SHA256),--expected-input-sha256 "$(EXPECTED_SHA256)")
 
 # DB/queue-free fixed-API load gate. Stages are intentionally not configurable:
-# 4/8/16 clients submit documents to 3 API task slots; each active task has a
-# service-side inference cap of 7, so the active upper bound remains 21.
+# 4/8/16 documents use a single API-facing outstanding submission; huge inputs
+# remain exclusive. A pinned process-external observer proves epoch/OOM/RSS/memory.
 mineru-staged-load:
-	@test -n "$(RUNTIME_MANIFEST)" || (echo 'usage: make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json INPUT=/path/frozen-multipage.pdf EXPECTED_SHA256=<sha256> RECEIPT=/path/new-receipt.json [WORK_ROOT=/private/scratch TIMEOUT_SECONDS=1800]' && exit 2)
-	@test -n "$(INPUT)" || (echo 'mineru-staged-load: INPUT is required' && exit 2)
-	@test -n "$(EXPECTED_SHA256)" || (echo 'mineru-staged-load: EXPECTED_SHA256 is required' && exit 2)
+	@test -n "$(RUNTIME_MANIFEST)" || (echo 'usage: make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json CORPUS_MANIFEST=/path/frozen-corpus.json EXPECTED_CORPUS_SHA256=<sha256> RECEIPT=/path/new-receipt.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts DOCKER_MEMORY_RESERVE_BYTES=<bytes> [WORK_ROOT=/private/scratch TIMEOUT_SECONDS=1800]' && exit 2)
+	@test -n "$(CORPUS_MANIFEST)" || (echo 'mineru-staged-load: CORPUS_MANIFEST is required' && exit 2)
+	@test -n "$(EXPECTED_CORPUS_SHA256)" || (echo 'mineru-staged-load: EXPECTED_CORPUS_SHA256 is required' && exit 2)
 	@test -n "$(RECEIPT)" || (echo 'mineru-staged-load: RECEIPT is required' && exit 2)
+	@test -n "$(SSH_HOST)" || (echo 'mineru-staged-load: SSH_HOST is required' && exit 2)
+	@test -n "$(SSH_USER)" || (echo 'mineru-staged-load: SSH_USER is required' && exit 2)
+	@test -n "$(SSH_IDENTITY)" || (echo 'mineru-staged-load: SSH_IDENTITY is required' && exit 2)
+	@test -n "$(SSH_KNOWN_HOSTS)" || (echo 'mineru-staged-load: SSH_KNOWN_HOSTS is required' && exit 2)
+	@test -n "$(DOCKER_MEMORY_RESERVE_BYTES)" || (echo 'mineru-staged-load: DOCKER_MEMORY_RESERVE_BYTES is required' && exit 2)
 	$(WITH_WORKER_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/mineru_staged_load.py \
 		--runtime-manifest "$(RUNTIME_MANIFEST)" \
-		--input "$(INPUT)" \
-		--expected-input-sha256 "$(EXPECTED_SHA256)" \
+		--corpus-manifest "$(CORPUS_MANIFEST)" \
+		--expected-corpus-sha256 "$(EXPECTED_CORPUS_SHA256)" \
 		--receipt-out "$(RECEIPT)" \
+		--host-observer-ssh-host "$(SSH_HOST)" \
+		--host-observer-ssh-user "$(SSH_USER)" \
+		--host-observer-ssh-port "$(SSH_PORT)" \
+		--host-observer-identity-file "$(SSH_IDENTITY)" \
+		--host-observer-known-hosts-file "$(SSH_KNOWN_HOSTS)" \
+		--docker-memory-reserve-bytes "$(DOCKER_MEMORY_RESERVE_BYTES)" \
 		$(if $(WORK_ROOT),--work-root "$(WORK_ROOT)") \
 		$(if $(TIMEOUT_SECONDS),--timeout-seconds "$(TIMEOUT_SECONDS)")
 
@@ -246,7 +257,7 @@ mineru-tunnel-status:
 install-mineru-tunnel:
 	@./scripts/install_mineru_tunnel_launchd.sh
 
-# Read-only v3 attestation uses the operator identity because it executes the
+# Read-only v5 attestation uses the operator identity because it executes the
 # fixed PowerShell collector. It must never use the forwarding-only tunnel key.
 mineru-remote-attest:
 	@test -n "$(MINERU_BIN)" || { echo 'MINERU_BIN is required' >&2; exit 64; }
@@ -265,6 +276,9 @@ mineru-remote-attest:
 		--known-hosts-file "$(SSH_KNOWN_HOSTS)" \
 		--expected-compose "$(CURDIR)/config/mineru-windows.compose.yaml" \
 		--collector-source "$(CURDIR)/scripts/windows/collect_mineru_runtime.ps1" \
+		--compat-patcher-source "$(CURDIR)/scripts/windows/mineru_heap_trim_compat/patch_mineru_344.py" \
+		--compat-dockerfile-source "$(CURDIR)/scripts/windows/mineru_heap_trim_compat/Dockerfile" \
+		$(if $(REMOTE_COLLECTOR_PATH),--remote-collector-path "$(REMOTE_COLLECTOR_PATH)") \
 		--manifest-out "$(MANIFEST)" \
 		--observation-out "$(OBSERVATION)"
 

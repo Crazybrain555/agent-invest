@@ -7,6 +7,8 @@ from datetime import date, timedelta, datetime, timezone
 import unittest
 from unittest import mock
 
+from sqlalchemy.exc import TimeoutError as SqlAlchemyTimeoutError
+
 from disclosure_anchor.application.dto.worker_report import WorkerFailure, WorkerLimits
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.worker import worker as worker_module
@@ -74,7 +76,7 @@ def _deps() -> WorkerDeps:
         artifact_store=mock.MagicMock(),
         provider_source=mock.MagicMock(),
         source_factory=lambda: mock.MagicMock(),
-        profile_loader_factory=lambda source: (lambda code: None),
+        profile_loader_factory=lambda source: lambda code: None,
         parser_factory=lambda: mock.MagicMock(),
         semantic_router=mock.MagicMock(),
         semantic_receipts=mock.MagicMock(),
@@ -97,9 +99,7 @@ class StableHashTests(unittest.TestCase):
         low = next(
             f"doc_{i}" for i in range(10000) if zlib.crc32(f"doc_{i}".encode()) < 2**31
         )
-        self.assertEqual(
-            stable_document_hash(high), zlib.crc32(high.encode()) - 2**32
-        )
+        self.assertEqual(stable_document_hash(high), zlib.crc32(high.encode()) - 2**32)
         self.assertLess(stable_document_hash(high), 0)
         self.assertEqual(stable_document_hash(low), zlib.crc32(low.encode()))
         for value in (high, low, "doc_01KWSGSEQQ23R18VG6ER9ZPSGG"):
@@ -134,6 +134,8 @@ class SemanticBuildControlTests(unittest.TestCase):
                 )
             )
         )
+
+
 class SyncWindowStartTests(unittest.TestCase):
     def test_existing_cursor_looks_back_overlap_days(self) -> None:
         self.assertEqual(
@@ -156,16 +158,22 @@ class SyncWindowStartTests(unittest.TestCase):
     def test_missing_cursor_honors_per_company_lookback_override(self) -> None:
         self.assertEqual(
             _sync_window_start(
-                None, today=date(2026, 7, 6), overlap_days=7,
-                initial_lookback_days=1095, lookback={"days": 30},
+                None,
+                today=date(2026, 7, 6),
+                overlap_days=7,
+                initial_lookback_days=1095,
+                lookback={"days": 30},
             ),
             date(2026, 6, 6),
         )
         # Malformed override falls back to the default, never crashes.
         self.assertEqual(
             _sync_window_start(
-                None, today=date(2026, 7, 6), overlap_days=7,
-                initial_lookback_days=10, lookback={"days": "soon"},
+                None,
+                today=date(2026, 7, 6),
+                overlap_days=7,
+                initial_lookback_days=10,
+                lookback={"days": "soon"},
             ),
             date(2026, 6, 26),
         )
@@ -188,9 +196,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
     def test_direct_parse_stage_never_opens_a_second_count_batch(self) -> None:
         deps = _deps()
-        report = worker_module.WorkerReport(
-            started_at=datetime.now(timezone.utc)
-        )
+        report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
         with mock.patch.object(
             worker_module,
             "_parse_one_batch",
@@ -209,9 +215,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
     def test_closed_resident_admission_exits_before_queue_io(self) -> None:
         deps = _deps()
-        report = worker_module.WorkerReport(
-            started_at=datetime.now(timezone.utc)
-        )
+        report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
         with mock.patch.object(
             worker_module.queries,
             "pending_parse",
@@ -280,9 +284,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             mock.patch.object(
                 worker_module.queries, "reclaim_stale_runs", return_value=0
             ),
-            mock.patch.object(
-                worker_module.queries, "sync_due", side_effect=_sync_due
-            ),
+            mock.patch.object(worker_module.queries, "sync_due", side_effect=_sync_due),
             mock.patch.object(
                 worker_module.queries,
                 "pending_parse",
@@ -316,7 +318,9 @@ class RunOnceSchedulingTests(unittest.TestCase):
         built = mock.MagicMock(status="succeeded", build_stats=None)
         published = mock.MagicMock(status="published")
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
             mock.patch.object(
                 worker_module.queries,
                 "sync_due",
@@ -366,7 +370,9 @@ class RunOnceSchedulingTests(unittest.TestCase):
         built = mock.MagicMock(status="succeeded", build_stats=None)
         published = mock.MagicMock(status="published")
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
             mock.patch.object(
                 worker_module.queries,
                 "sync_due",
@@ -409,16 +415,20 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self,
     ) -> None:
         deps = _deps()
+        object.__setattr__(deps, "page_counter", lambda _path: 250)
+        deps.path_builder.data_path.side_effect = lambda relpath: relpath
         pending = [
             {
                 "document_id": "doc_small",
                 "oversized": True,  # stale legacy metadata must be ignored
                 "raw_byte_count": 512 * 1024,
+                "raw_file_relpath": "doc_small.pdf",
             },
             {
                 "document_id": "doc_big",
                 "oversized": False,
                 "raw_byte_count": 11 * 1024 * 1024,
+                "raw_file_relpath": "doc_big.pdf",
             },
         ]
 
@@ -457,8 +467,12 @@ class RunOnceSchedulingTests(unittest.TestCase):
         ]
         good = mock.MagicMock(status="succeeded", processing_run_id="run_good")
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=2),
-            mock.patch.object(worker_module.queries, "pending_parse", return_value=pending),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=2
+            ),
+            mock.patch.object(
+                worker_module.queries, "pending_parse", return_value=pending
+            ),
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
             mock.patch.object(worker_module, "BuildUnits") as build_cls,
             mock.patch.object(worker_module, "PublishRun") as publish_cls,
@@ -483,15 +497,29 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self.assertEqual(report.failures[0].stage, "parse")
         self.assertEqual(report.failures[0].item_ref, "doc_bad")
         self.assertEqual(report.failures[0].error_code, "RuntimeError")
+        self.assertEqual(report.failures[0].message, "boom")
+        failure = worker_module._failure_from_exception(
+            stage="parse",
+            item_ref="doc_waiting",
+            exc=SqlAlchemyTimeoutError("QueuePool limit reached after 30 seconds"),
+        )
+
+        self.assertEqual(failure.error_code, "DB_POOL_EXHAUSTED")
+        self.assertTrue(failure.retryable)
+        self.assertIn("QueuePool limit reached", failure.message or "")
+        self.assertIn(
+            failure.error_code,
+            worker_module.PARSER_CONTROL_ERROR_CODES,
+        )
 
     def test_item_local_publish_error_does_not_stop_parse_refill(self) -> None:
         deps = _deps()
-        parsed = mock.MagicMock(
-            status="succeeded", processing_run_id="run_partial"
-        )
+        parsed = mock.MagicMock(status="succeeded", processing_run_id="run_partial")
         built = mock.MagicMock(status="succeeded", build_stats=None)
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
             mock.patch.object(
                 worker_module.queries,
                 "pending_parse",
@@ -545,6 +573,36 @@ class RunOnceSchedulingTests(unittest.TestCase):
             "RUN_OUTPUT_CONTRACT_UNSUPPORTED",
         )
 
+        pool_report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
+        with (
+            mock.patch.object(
+                worker_module.queries,
+                "pending_publish",
+                return_value=[
+                    {"processing_run_id": "run_pool_1"},
+                    {"processing_run_id": "run_pool_2"},
+                ],
+            ),
+            mock.patch.object(worker_module, "PublishRun") as publish_cls,
+        ):
+            publish_cls.return_value.execute.side_effect = SqlAlchemyTimeoutError(
+                "QueuePool limit reached after 30 seconds"
+            )
+            worker_module._publish_stage(
+                pool_report,
+                deps,
+                limit=2,
+                should_stop=lambda: False,
+            )
+
+        publish_cls.return_value.execute.assert_called_once()
+        self.assertEqual(pool_report.failures[0].error_code, "DB_POOL_EXHAUSTED")
+        self.assertTrue(pool_report.failures[0].retryable)
+        self.assertIn("QueuePool limit reached", pool_report.failures[0].message or "")
+        self.assertTrue(
+            worker_module.publish_failures_indicate_outage(pool_report.failures)
+        )
+
     def test_stop_submits_at_most_parse_concurrency(self) -> None:
         import threading
 
@@ -565,8 +623,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
         )
         stop = threading.Event()
         pending = [
-            {"document_id": f"doc_{index}", "oversized": False}
-            for index in range(20)
+            {"document_id": f"doc_{index}", "oversized": False} for index in range(20)
         ]
 
         def stop_after_start(_deps, _item):  # noqa: ANN001, ANN202
@@ -574,8 +631,12 @@ class RunOnceSchedulingTests(unittest.TestCase):
             return worker_module._DocOutcome()
 
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
-            mock.patch.object(worker_module.queries, "pending_parse", return_value=pending),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "pending_parse", return_value=pending
+            ),
             mock.patch.object(
                 worker_module, "_parse_one_document", side_effect=stop_after_start
             ) as process_one,
@@ -605,15 +666,18 @@ class RunOnceSchedulingTests(unittest.TestCase):
             ),
         )
         pending = [
-            {"document_id": f"doc_{index}", "oversized": False}
-            for index in range(20)
+            {"document_id": f"doc_{index}", "oversized": False} for index in range(20)
         ]
         parser = mock.MagicMock()
         parser.identity.side_effect = ParserVersionProbeError("mineru missing")
         object.__setattr__(deps, "parser_factory", lambda: parser)
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
-            mock.patch.object(worker_module.queries, "pending_parse", return_value=pending),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "pending_parse", return_value=pending
+            ),
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
             mock.patch.object(
                 worker_module,
@@ -637,12 +701,15 @@ class RunOnceSchedulingTests(unittest.TestCase):
     def test_build_failure_stops_parse_refill(self) -> None:
         deps = _deps()
         pending = [
-            {"document_id": f"doc_{index}", "oversized": False}
-            for index in range(3)
+            {"document_id": f"doc_{index}", "oversized": False} for index in range(3)
         ]
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
-            mock.patch.object(worker_module.queries, "pending_parse", return_value=pending),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "pending_parse", return_value=pending
+            ),
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
             mock.patch.object(worker_module, "BuildUnits") as build_cls,
         ):
@@ -662,15 +729,42 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self.assertEqual(report.parsed, 2)
         self.assertEqual(report.failures[0].stage, "build")
 
+        pool_report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
+        with (
+            mock.patch.object(
+                worker_module.queries,
+                "pending_build",
+                return_value=[{"processing_run_id": "run_pool"}],
+            ),
+            mock.patch.object(worker_module, "BuildUnits") as build_cls,
+        ):
+            build_cls.return_value.execute.side_effect = SqlAlchemyTimeoutError(
+                "QueuePool limit reached after 30 seconds"
+            )
+            worker_module._build_stage(
+                pool_report,
+                deps,
+                limit=1,
+                should_stop=lambda: False,
+            )
+
+        self.assertEqual(pool_report.failures[0].error_code, "DB_POOL_EXHAUSTED")
+        self.assertTrue(pool_report.failures[0].retryable)
+        self.assertIn("QueuePool limit reached", pool_report.failures[0].message or "")
+        self.assertTrue(build_failures_indicate_outage(pool_report.failures))
+
     def test_item_local_build_failure_does_not_stop_parse_refill(self) -> None:
         deps = _deps()
         pending = [
-            {"document_id": f"doc_{index}", "oversized": False}
-            for index in range(3)
+            {"document_id": f"doc_{index}", "oversized": False} for index in range(3)
         ]
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
-            mock.patch.object(worker_module.queries, "pending_parse", return_value=pending),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "pending_parse", return_value=pending
+            ),
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
             mock.patch.object(worker_module, "BuildUnits") as build_cls,
         ):
@@ -711,8 +805,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             ),
         )
         pending = [
-            {"document_id": f"doc_{index}", "oversized": False}
-            for index in range(20)
+            {"document_id": f"doc_{index}", "oversized": False} for index in range(20)
         ]
         first_failure_reported = threading.Event()
         build_call_lock = threading.Lock()
@@ -732,14 +825,13 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
         def emit(report: worker_module.WorkerReport) -> None:
             emitted.append(report)
-            if any(
-                failure.error_code == "RuntimeError"
-                for failure in report.failures
-            ):
+            if any(failure.error_code == "RuntimeError" for failure in report.failures):
                 first_failure_reported.set()
 
         with (
-            mock.patch.object(worker_module.queries, "pending_parse", return_value=pending),
+            mock.patch.object(
+                worker_module.queries, "pending_parse", return_value=pending
+            ),
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
             mock.patch.object(worker_module, "BuildUnits") as build_cls,
         ):
@@ -747,9 +839,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 status="succeeded", processing_run_id="run_unknown"
             )
             build_cls.return_value.execute.side_effect = build
-            report = worker_module.WorkerReport(
-                started_at=datetime.now(timezone.utc)
-            )
+            report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
             result = worker_module._parse_one_batch(
                 report,
                 deps,
@@ -791,6 +881,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 cninfo_max_retries=3,
                 cninfo_oversized_kb=10240,
                 parse_concurrency=3,
+                mineru_client_outstanding_window=3,
                 parse_heavy_page_threshold=200,
                 parse_heavy_saturated_share=2,
                 parse_huge_page_threshold=350,
@@ -806,7 +897,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             lambda path: {
                 "heavy_1.pdf": 300,
                 "heavy_2.pdf": 250,
-                "heavy_3.pdf": 400,
+                "heavy_3.pdf": 300,
                 "regular_1.pdf": 20,
                 "regular_2.pdf": 80,
             }[path.name],
@@ -835,9 +926,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
         def blocking_execute(command):  # noqa: ANN001, ANN202
             with lock:
                 first_wave.append(command.document_id)
-                observed_timeouts[command.document_id] = (
-                    command.options.timeout_seconds
-                )
+                observed_timeouts[command.document_id] = command.options.timeout_seconds
                 position = len(first_wave)
             if position <= 3:
                 barrier.wait()
@@ -846,8 +935,12 @@ class RunOnceSchedulingTests(unittest.TestCase):
             )
 
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
-            mock.patch.object(worker_module.queries, "pending_parse", return_value=pending),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "pending_parse", return_value=pending
+            ),
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
             mock.patch.object(worker_module, "BuildUnits") as build_cls,
             mock.patch.object(worker_module, "PublishRun") as publish_cls,
@@ -865,8 +958,10 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
         first = set(first_wave[:3])
         self.assertIn("doc_regular_1", first)
-        self.assertEqual(len(first & {"doc_heavy_1", "doc_heavy_2"}), 1)
-        self.assertIn("doc_heavy_3", first)
+        self.assertEqual(
+            len(first & {"doc_heavy_1", "doc_heavy_2", "doc_heavy_3"}),
+            2,
+        )
         self.assertEqual(observed_timeouts["doc_heavy_1"], 20000)
         self.assertEqual(observed_timeouts["doc_heavy_2"], 20000)
         self.assertEqual(observed_timeouts["doc_heavy_3"], 20000)
@@ -877,14 +972,80 @@ class RunOnceSchedulingTests(unittest.TestCase):
         }
         self.assertEqual(expected_by_id["doc_regular_1"], 1800)
         self.assertEqual(expected_by_id["doc_heavy_1"], 3600)
-        self.assertEqual(expected_by_id["doc_heavy_3"], 4800)
+        self.assertEqual(expected_by_id["doc_heavy_3"], 3600)
         self.assertEqual(report.parse_peak_inflight, 3)
-        self.assertEqual(report.parse_heavy_dispatched, 2)
-        self.assertEqual(report.parse_huge_dispatched, 1)
+        self.assertEqual(report.parse_heavy_dispatched, 3)
+        self.assertEqual(report.parse_huge_dispatched, 0)
         self.assertEqual(report.parse_regular_dispatched, 2)
         self.assertEqual(report.parsed, 5)
         self.assertEqual(report.built, 5)
         self.assertEqual(report.published, 5)
+        self.assertEqual(report.failed, 0)
+
+    def test_huge_document_is_exclusive_against_regular_work(self) -> None:
+        import threading
+
+        deps = _deps()
+        object.__setattr__(
+            deps,
+            "config",
+            replace(deps.config, parse_concurrency=3),
+        )
+        object.__setattr__(
+            deps,
+            "page_counter",
+            lambda path: {"huge.pdf": 600, "regular.pdf": 20}[path.name],
+        )
+        deps.path_builder.data_path.side_effect = lambda relpath: relpath
+        huge_finished = threading.Event()
+
+        def execute(command):  # noqa: ANN001, ANN202
+            if command.document_id == "doc_huge":
+                huge_finished.set()
+            else:
+                self.assertTrue(huge_finished.is_set())
+            return mock.MagicMock(
+                status="succeeded",
+                processing_run_id=f"run_{command.document_id}",
+            )
+
+        pending = [
+            {
+                "document_id": "doc_huge",
+                "raw_file_relpath": "huge.pdf",
+            },
+            {
+                "document_id": "doc_regular",
+                "raw_file_relpath": "regular.pdf",
+            },
+        ]
+        with (
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "pending_parse", return_value=pending
+            ),
+            mock.patch.object(worker_module, "ParseDocument") as parse_cls,
+            mock.patch.object(worker_module, "BuildUnits") as build_cls,
+            mock.patch.object(worker_module, "PublishRun") as publish_cls,
+        ):
+            parse_cls.return_value.execute.side_effect = execute
+            build_cls.return_value.execute.return_value = mock.MagicMock(
+                status="succeeded", build_stats=None
+            )
+            publish_cls.return_value.execute.return_value = mock.MagicMock(
+                status="published"
+            )
+            report = run_once(
+                WorkerLimits(sync=0, download=0, parse=2, build=0, publish=0),
+                deps,
+            )
+
+        self.assertEqual(report.parse_huge_dispatched, 1)
+        self.assertEqual(report.parse_regular_dispatched, 1)
+        self.assertEqual(report.parse_peak_inflight, 1)
+        self.assertEqual(report.parsed, 2)
         self.assertEqual(report.failed, 0)
 
     def test_parse_lane_quotas_are_fair_and_work_conserving(self) -> None:
@@ -916,9 +1077,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             {heavy: 15, huge: 1},
         )
         self.assertEqual(
-            worker_module._parse_lane_caps(
-                ready=(huge,), capacity=16, config=config
-            ),
+            worker_module._parse_lane_caps(ready=(huge,), capacity=16, config=config),
             {huge: 16},
         )
         self.assertEqual(
@@ -944,6 +1103,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 cninfo_max_retries=3,
                 cninfo_oversized_kb=10240,
                 parse_concurrency=2,
+                mineru_client_outstanding_window=2,
                 parse_candidate_window=2,
                 finalize_concurrency=2,
             ),
@@ -994,9 +1154,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             publish_cls.return_value.execute.return_value = mock.MagicMock(
                 status="published", superseded_run_id=None
             )
-            report = worker_module.WorkerReport(
-                started_at=datetime.now(timezone.utc)
-            )
+            report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
             result = worker_module._parse_one_batch(
                 report,
                 deps,
@@ -1055,11 +1213,9 @@ class RunOnceSchedulingTests(unittest.TestCase):
             mock.patch.object(worker_module, "BuildUnits") as build_cls,
             mock.patch.object(worker_module, "PublishRun") as publish_cls,
         ):
-            parse_cls.return_value.execute.side_effect = (
-                lambda command: mock.MagicMock(
-                    status="succeeded",
-                    processing_run_id=f"run_{command.document_id}",
-                )
+            parse_cls.return_value.execute.side_effect = lambda command: mock.MagicMock(
+                status="succeeded",
+                processing_run_id=f"run_{command.document_id}",
             )
             build_cls.return_value.execute.return_value = mock.MagicMock(
                 status="succeeded", build_stats=None
@@ -1067,9 +1223,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             publish_cls.return_value.execute.return_value = mock.MagicMock(
                 status="published", superseded_run_id=None
             )
-            report = worker_module.WorkerReport(
-                started_at=datetime.now(timezone.utc)
-            )
+            report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
             result = worker_module._parse_one_batch(
                 report,
                 deps,
@@ -1132,9 +1286,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             publish_cls.return_value.execute.return_value = mock.MagicMock(
                 status="published", superseded_run_id=None
             )
-            report = worker_module.WorkerReport(
-                started_at=datetime.now(timezone.utc)
-            )
+            report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
             result = worker_module._parse_one_batch(
                 report,
                 deps,
@@ -1250,9 +1402,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 side_effect=controlled_wait,
             ),
         ):
-            report = worker_module.WorkerReport(
-                started_at=datetime.now(timezone.utc)
-            )
+            report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
             result = worker_module._parse_one_batch(
                 report,
                 deps,
@@ -1279,10 +1429,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             ["unavailable", "unavailable", "available"],
         )
         self.assertEqual(
-            [
-                item.admission_consecutive_failures
-                for item in admission_reports
-            ],
+            [item.admission_consecutive_failures for item in admission_reports],
             [1, 2, 2],
         )
         self.assertTrue(all(item.failed == 0 for item in admission_reports))
@@ -1293,11 +1440,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
         object.__setattr__(
             deps,
             "admission_guard",
-            mock.Mock(
-                side_effect=RuntimeError(
-                    "served MinerU model identity drifted"
-                )
-            ),
+            mock.Mock(side_effect=RuntimeError("served MinerU model identity drifted")),
         )
         emitted: list[worker_module.WorkerReport] = []
         controller = worker_module._ResidentAdmissionController(
@@ -1329,6 +1472,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 cninfo_max_retries=3,
                 cninfo_oversized_kb=10240,
                 parse_concurrency=2,
+                mineru_client_outstanding_window=2,
                 parse_heavy_page_threshold=80,
                 parse_huge_page_threshold=500,
                 parse_candidate_window=10,
@@ -1377,14 +1521,10 @@ class RunOnceSchedulingTests(unittest.TestCase):
             mock.patch.object(
                 worker_module,
                 "_finalize_one_document",
-                return_value=worker_module._DocOutcome(
-                    built=True, published=True
-                ),
+                return_value=worker_module._DocOutcome(built=True, published=True),
             ),
         ):
-            report = worker_module.WorkerReport(
-                started_at=datetime.now(timezone.utc)
-            )
+            report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
             result = worker_module._parse_one_batch(
                 report,
                 deps,
@@ -1403,9 +1543,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self.assertEqual(sum(item.parsed for item in emitted), 3)
         self.assertEqual(sum(item.built for item in emitted), 3)
         self.assertEqual(sum(item.published for item in emitted), 3)
-        self.assertEqual(
-            sum(item.parse_heavy_dispatched for item in emitted), 3
-        )
+        self.assertEqual(sum(item.parse_heavy_dispatched for item in emitted), 3)
         self.assertEqual(
             [item.as_dict() for item in emitted],
             frozen,
@@ -1424,6 +1562,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             replace(
                 deps.config,
                 parse_concurrency=2,
+                mineru_client_outstanding_window=2,
                 finalize_concurrency=1,
                 parse_candidate_window=4,
             ),
@@ -1533,9 +1672,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 side_effect=controlled_wait,
             ),
         ):
-            report = worker_module.WorkerReport(
-                started_at=datetime.now(timezone.utc)
-            )
+            report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
             result = worker_module._parse_one_batch(
                 report,
                 deps,
@@ -1552,9 +1689,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
         self.assertEqual(result, "done")
         self.assertGreaterEqual(build_query.call_count, 1)
-        self.assertCountEqual(
-            finalized, ["run_tick", "run_race", "run_old"]
-        )
+        self.assertCountEqual(finalized, ["run_tick", "run_race", "run_old"])
         self.assertEqual(len(finalized), 3)
         self.assertEqual(sum(item.built for item in emitted), 3)
         self.assertEqual(sum(item.published for item in emitted), 3)
@@ -1653,9 +1788,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             stop.set()
 
         with (
-            mock.patch.object(
-                worker_module, "_parse_one_batch", return_value="done"
-            ),
+            mock.patch.object(worker_module, "_parse_one_batch", return_value="done"),
             mock.patch.object(
                 worker_module, "_build_stage", side_effect=build_stage
             ) as build_mock,
@@ -1688,9 +1821,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
         recovery_calls = 0
 
         def parse_batch(*_args: object, **_kwargs: object) -> str:
-            parse_index = sum(
-                event.startswith("parse") for event in events
-            ) + 1
+            parse_index = sum(event.startswith("parse") for event in events) + 1
             events.append(f"parse{parse_index}")
             if parse_index == 1:
                 return "halt"
@@ -1740,6 +1871,59 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
         self.assertEqual(events, ["parse1", "probe1", "probe2", "parse2"])
 
+        # A queue-read pool timeout occurs outside the item loop. It must use
+        # the same typed mapper and keep resident admission closed until a
+        # later clean recovery probe completes.
+        stop = threading.Event()
+        events = []
+        emitted = []
+        recovery_calls = 0
+
+        def parse_after_pool(*_args: object, **_kwargs: object) -> str:
+            parse_index = sum(event.startswith("parse") for event in events) + 1
+            events.append(f"parse{parse_index}")
+            if parse_index == 1:
+                return "halt"
+            stop.set()
+            return "done"
+
+        def recovery_pool_timeout(*_args: object, **_kwargs: object) -> None:
+            nonlocal recovery_calls
+            recovery_calls += 1
+            events.append(f"probe{recovery_calls}")
+            if recovery_calls == 1:
+                raise SqlAlchemyTimeoutError("QueuePool limit reached after 30 seconds")
+
+        with (
+            mock.patch.object(
+                worker_module,
+                "_parse_one_batch",
+                side_effect=parse_after_pool,
+            ),
+            mock.patch.object(
+                worker_module,
+                "_build_stage",
+                side_effect=recovery_pool_timeout,
+            ),
+            mock.patch.object(worker_module, "_publish_stage"),
+        ):
+            worker_module.run_resident_parse(
+                deps,
+                limit=1,
+                should_stop=stop.is_set,
+                report_interval_seconds=60.0,
+                emit_report=emitted.append,
+                build_recovery_limit=2,
+                publish_recovery_limit=2,
+                idle_poll_seconds=60.0,
+                outage_backoff_initial_seconds=0.001,
+                outage_backoff_max_seconds=0.002,
+            )
+
+        self.assertEqual(events, ["parse1", "probe1", "probe2", "parse2"])
+        self.assertEqual(emitted[0].failures[0].error_code, "DB_POOL_EXHAUSTED")
+        self.assertTrue(emitted[0].failures[0].retryable)
+
     def test_retryable_parse_reenters_after_bounded_other_work(self) -> None:
         deps = _deps()
         object.__setattr__(
@@ -1761,9 +1945,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
         exact_retry_queries: list[tuple[str, ...]] = []
         admission_open = True
 
-        def pending_parse(
-            *_args: object, **kwargs: object
-        ) -> list[dict[str, object]]:
+        def pending_parse(*_args: object, **kwargs: object) -> list[dict[str, object]]:
             limit = int(kwargs["limit"])
             query_limits.append(limit)
             exact_ids = kwargs.get("document_ids")
@@ -1779,17 +1961,11 @@ class RunOnceSchedulingTests(unittest.TestCase):
                     if document_id in pending_ids
                 ][:limit]
             after = kwargs.get("after_document_id")
-            start = (
-                int(str(after).removeprefix("doc_")) + 1
-                if after is not None
-                else 0
-            )
+            start = int(str(after).removeprefix("doc_")) + 1 if after is not None else 0
             # Model a queue whose ULID-ordered tail keeps growing at least as
             # fast as consumption: the forward scan is always a full page and
             # therefore can never rely on reaching an empty tail to wrap.
-            eligible = [
-                f"doc_{index:03d}" for index in range(start, start + limit)
-            ]
+            eligible = [f"doc_{index:03d}" for index in range(start, start + limit)]
             return [
                 {
                     "document_id": document_id,
@@ -1835,14 +2011,10 @@ class RunOnceSchedulingTests(unittest.TestCase):
             mock.patch.object(
                 worker_module,
                 "_finalize_one_document",
-                return_value=worker_module._DocOutcome(
-                    built=True, published=True
-                ),
+                return_value=worker_module._DocOutcome(built=True, published=True),
             ),
         ):
-            report = worker_module.WorkerReport(
-                started_at=datetime.now(timezone.utc)
-            )
+            report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
             result = worker_module._parse_one_batch(
                 report,
                 deps,
@@ -1932,9 +2104,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             publish_cls.return_value.execute.return_value = mock.MagicMock(
                 status="published", superseded_run_id=None
             )
-            report = worker_module.WorkerReport(
-                started_at=datetime.now(timezone.utc)
-            )
+            report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
             result = worker_module._parse_one_batch(
                 report,
                 deps,
@@ -1967,9 +2137,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             ),
         )
         parser = mock.MagicMock()
-        parser.readiness.side_effect = ParserVersionProbeError(
-            "backend unavailable"
-        )
+        parser.readiness.side_effect = ParserVersionProbeError("backend unavailable")
         object.__setattr__(deps, "parser_factory", lambda: parser)
 
         with (
@@ -1985,9 +2153,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 0.0,
             ),
         ):
-            report = worker_module.WorkerReport(
-                started_at=datetime.now(timezone.utc)
-            )
+            report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
             result = worker_module._parse_one_batch(
                 report,
                 deps,
@@ -2016,6 +2182,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             replace(
                 deps.config,
                 parse_concurrency=2,
+                mineru_client_outstanding_window=2,
                 parse_candidate_window=10,
             ),
         )
@@ -2046,13 +2213,23 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
         parser.readiness.side_effect = readiness
         object.__setattr__(deps, "parser_factory", lambda: parser)
+        object.__setattr__(deps, "page_counter", lambda _path: 10)
+        deps.path_builder.data_path.side_effect = lambda relpath: relpath
         with (
             mock.patch.object(
                 worker_module.queries,
                 "pending_parse",
                 return_value=[
-                    {"document_id": "doc_0", "oversized": False},
-                    {"document_id": "doc_1", "oversized": False},
+                    {
+                        "document_id": "doc_0",
+                        "oversized": False,
+                        "raw_file_relpath": "doc_0.pdf",
+                    },
+                    {
+                        "document_id": "doc_1",
+                        "oversized": False,
+                        "raw_file_relpath": "doc_1.pdf",
+                    },
                 ],
             ),
             mock.patch.object(
@@ -2066,9 +2243,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 60.0,
             ),
         ):
-            report = worker_module.WorkerReport(
-                started_at=datetime.now(timezone.utc)
-            )
+            report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
             result = worker_module._parse_one_batch(
                 report,
                 deps,
@@ -2128,9 +2303,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
         def recording_wait(*args: object, **kwargs: object) -> object:
             timeout = kwargs.get("timeout")
-            wait_timeouts.append(
-                float(timeout) if timeout is not None else None
-            )
+            wait_timeouts.append(float(timeout) if timeout is not None else None)
             return real_wait(*args, **kwargs)
 
         parser.readiness.side_effect = readiness
@@ -2203,9 +2376,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             ),
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
         ):
-            report = worker_module.WorkerReport(
-                started_at=datetime.now(timezone.utc)
-            )
+            report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
             with self.assertRaisesRegex(RuntimeError, "singleton lost"):
                 worker_module._parse_one_batch(
                     report,
@@ -2217,6 +2388,74 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
         guard.assert_called_once_with()
         parse_cls.return_value.execute.assert_not_called()
+
+    def test_direct_typed_admission_outage_drains_and_returns_report(self) -> None:
+        deps = _deps()
+        object.__setattr__(
+            deps,
+            "config",
+            replace(
+                deps.config,
+                parse_concurrency=1,
+                finalize_concurrency=1,
+                parse_candidate_window=10,
+            ),
+        )
+        guard = mock.Mock(
+            side_effect=[
+                None,
+                worker_module.WorkerAdmissionUnavailableError(
+                    "MinerU API incident drain is still in progress"
+                ),
+            ]
+        )
+        object.__setattr__(deps, "admission_guard", guard)
+
+        with (
+            mock.patch.object(
+                worker_module.queries,
+                "pending_parse",
+                return_value=[
+                    {"document_id": "doc_0", "oversized": False},
+                    {"document_id": "doc_1", "oversized": False},
+                ],
+            ),
+            mock.patch.object(
+                worker_module,
+                "_parse_one_document",
+                return_value=worker_module._DocOutcome(
+                    parsed=True,
+                    processing_run_id="run_doc_0",
+                ),
+            ) as parse_one,
+            mock.patch.object(
+                worker_module,
+                "_finalize_one_document",
+                return_value=worker_module._DocOutcome(
+                    built=True,
+                    published=True,
+                ),
+            ) as finalize_one,
+        ):
+            report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
+            result = worker_module._parse_one_batch(
+                report,
+                deps,
+                limit=2,
+                should_stop=lambda: False,
+                keep_refilling=None,
+            )
+
+        self.assertEqual(result, "halt")
+        self.assertEqual(report.parsed, 1)
+        self.assertEqual(report.built, 1)
+        self.assertEqual(report.published, 1)
+        self.assertEqual(report.admission_status, "unavailable")
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(report.failures[0].stage, "admission")
+        self.assertTrue(report.failures[0].retryable)
+        self.assertEqual(parse_one.call_count, 1)
+        self.assertEqual(finalize_one.call_count, 1)
 
     def test_long_parse_warns_at_soft_envelope_and_keeps_heartbeating(self) -> None:
         import threading
@@ -2284,9 +2523,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                     worker_module.LOGGER.name, level="WARNING"
                 ) as captured:
                     report = run_once(
-                        WorkerLimits(
-                            sync=0, download=0, parse=1, build=0, publish=0
-                        ),
+                        WorkerLimits(sync=0, download=0, parse=1, build=0, publish=0),
                         deps,
                     )
         finally:
@@ -2318,15 +2555,16 @@ class RunOnceSchedulingTests(unittest.TestCase):
             replace(
                 deps.config,
                 parse_concurrency=3,
+                mineru_client_outstanding_window=3,
                 parse_runaway_timeout_seconds=0,
             ),
         )
         release_stuck = threading.Event()
         release_raced = threading.Event()
-        runaway = mock.Mock(
-            side_effect=lambda _document_id: release_stuck.set()
-        )
+        runaway = mock.Mock(side_effect=lambda _document_id: release_stuck.set())
         object.__setattr__(deps, "on_parse_runaway", runaway)
+        object.__setattr__(deps, "page_counter", lambda _path: 10)
+        deps.path_builder.data_path.side_effect = lambda relpath: relpath
 
         def execute(command):  # noqa: ANN001, ANN202
             if command.document_id == "doc_stuck":
@@ -2345,9 +2583,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             nonlocal wait_calls
             wait_calls += 1
             if wait_calls > 1 and not release_stuck.is_set():
-                raise AssertionError(
-                    "an expired parse was hidden by a completed peer"
-                )
+                raise AssertionError("an expired parse was hidden by a completed peer")
             completed, not_done = real_wait(*args, **kwargs)
             if wait_calls == 1:
                 # Simulate a future that finishes after wait() captured its
@@ -2369,9 +2605,18 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 worker_module.queries,
                 "pending_parse",
                 return_value=[
-                    {"document_id": "doc_stuck"},
-                    {"document_id": "doc_peer"},
-                    {"document_id": "doc_raced"},
+                    {
+                        "document_id": "doc_stuck",
+                        "raw_file_relpath": "doc_stuck.pdf",
+                    },
+                    {
+                        "document_id": "doc_peer",
+                        "raw_file_relpath": "doc_peer.pdf",
+                    },
+                    {
+                        "document_id": "doc_raced",
+                        "raw_file_relpath": "doc_raced.pdf",
+                    },
                 ],
             ),
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
@@ -2388,9 +2633,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 status="published"
             )
             report = run_once(
-                WorkerLimits(
-                    sync=0, download=0, parse=3, build=0, publish=0
-                ),
+                WorkerLimits(sync=0, download=0, parse=3, build=0, publish=0),
                 deps,
             )
 
@@ -2406,7 +2649,9 @@ class RunOnceSchedulingTests(unittest.TestCase):
             error={"error_code": "OUTPUT_CONTRACT", "retryable": False},
         )
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
             mock.patch.object(
                 worker_module.queries,
                 "pending_parse",
@@ -2440,21 +2685,32 @@ if __name__ == "__main__":
 
 
 class SyncStageProtectionTests(unittest.TestCase):
-    def _run_sync(self, due, *, processing_backlog=0, sync_side_effect=None,
-                  backfill_cap=2000):
+    def _run_sync(
+        self, due, *, processing_backlog=0, sync_side_effect=None, backfill_cap=2000
+    ):
         for index, row in enumerate(due):
             row.setdefault("tracked_company_id", f"tc_{index}")
             row.setdefault("company_id", f"co_{index}")
             row.setdefault("security_id", f"sec_{index}")
         deps = _deps()
-        object.__setattr__(deps, "config", WorkerConfig(
-            max_parse_retries=3, max_build_retries=3,
-            stale_run_threshold_seconds=3600, sync_interval_seconds=86400,
-            cninfo_overlap_days=7, cninfo_max_retries=3, cninfo_oversized_kb=10240,
-            backfill_max_pending_downloads=backfill_cap,
-        ))
+        object.__setattr__(
+            deps,
+            "config",
+            WorkerConfig(
+                max_parse_retries=3,
+                max_build_retries=3,
+                stale_run_threshold_seconds=3600,
+                sync_interval_seconds=86400,
+                cninfo_overlap_days=7,
+                cninfo_max_retries=3,
+                cninfo_oversized_kb=10240,
+                backfill_max_pending_downloads=backfill_cap,
+            ),
+        )
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
             mock.patch.object(worker_module.queries, "sync_due", return_value=due),
             mock.patch.object(
                 worker_module.queries,
@@ -2529,7 +2785,9 @@ class SyncStageProtectionTests(unittest.TestCase):
             for index in range(1, 4)
         ]
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
             mock.patch.object(worker_module.queries, "sync_due", return_value=due),
             mock.patch.object(worker_module.queries, "pending_downloads") as downloads,
             mock.patch.object(worker_module, "SyncDisclosureIndex") as sync_cls,
@@ -2560,8 +2818,12 @@ class SyncStageProtectionTests(unittest.TestCase):
             quarantine_reason=None,
         )
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
-            mock.patch.object(worker_module.queries, "pending_downloads", return_value=pending),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
+            mock.patch.object(
+                worker_module.queries, "pending_downloads", return_value=pending
+            ),
             mock.patch.object(worker_module, "DownloadDocument") as download_cls,
         ):
             download_cls.return_value.execute.return_value = failed
@@ -2572,6 +2834,59 @@ class SyncStageProtectionTests(unittest.TestCase):
 
         self.assertTrue(report.source_outage_break)
         download_cls.return_value.execute.assert_called_once()
+
+        pool_report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
+        source = mock.MagicMock()
+        with (
+            mock.patch.object(
+                worker_module.queries,
+                "pending_downloads",
+                return_value=pending,
+            ),
+            mock.patch.object(worker_module, "DownloadDocument") as download_cls,
+        ):
+            download_cls.return_value.execute.side_effect = SqlAlchemyTimeoutError(
+                "QueuePool limit reached after 30 seconds"
+            )
+            worker_module._download_stage(
+                pool_report,
+                deps,
+                source,
+                limit=3,
+                should_stop=lambda: False,
+            )
+
+        self.assertFalse(pool_report.source_outage_break)
+        self.assertTrue(worker_module._has_local_infrastructure_failure(pool_report))
+        download_cls.return_value.execute.assert_called_once()
+        self.assertEqual(pool_report.failures[0].error_code, "DB_POOL_EXHAUSTED")
+        self.assertTrue(pool_report.failures[0].retryable)
+        self.assertIn("QueuePool limit reached", pool_report.failures[0].message or "")
+
+        with (
+            mock.patch.object(
+                worker_module.queries,
+                "reclaim_stale_runs",
+                return_value=0,
+            ),
+            mock.patch.object(
+                worker_module.queries,
+                "pending_downloads",
+                side_effect=SqlAlchemyTimeoutError("QueuePool queue read timed out"),
+            ),
+        ):
+            outer_report = run_once(
+                WorkerLimits(sync=0, download=3, parse=0, build=0, publish=0),
+                deps,
+            )
+
+        self.assertFalse(outer_report.source_outage_break)
+        self.assertEqual(outer_report.failures[0].stage, "source_local")
+        self.assertEqual(
+            outer_report.failures[0].error_code,
+            "DB_POOL_EXHAUSTED",
+        )
+        self.assertTrue(outer_report.failures[0].retryable)
 
     def test_quota_break_skips_download_api_for_current_round(self) -> None:
         class _Quota(Exception):
@@ -2589,7 +2904,9 @@ class SyncStageProtectionTests(unittest.TestCase):
             }
         ]
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
             mock.patch.object(worker_module.queries, "sync_due", return_value=due),
             mock.patch.object(worker_module.queries, "pending_downloads") as downloads,
             mock.patch.object(worker_module, "SyncDisclosureIndex") as sync_cls,
@@ -2603,12 +2920,22 @@ class SyncStageProtectionTests(unittest.TestCase):
         self.assertTrue(report.sync_quota_break)
         downloads.assert_not_called()
 
-    def test_never_synced_company_deferred_when_processing_backlog_saturated(self) -> None:
+    def test_never_synced_company_deferred_when_processing_backlog_saturated(
+        self,
+    ) -> None:
         due = [
-            {"security_code": "000001", "exchange": "SZSE",
-             "window_end": None, "last_synced_at": None},
-            {"security_code": "600519", "exchange": "SSE",
-             "window_end": "2026-07-01", "last_synced_at": "2026-07-01"},
+            {
+                "security_code": "000001",
+                "exchange": "SZSE",
+                "window_end": None,
+                "last_synced_at": None,
+            },
+            {
+                "security_code": "600519",
+                "exchange": "SSE",
+                "window_end": "2026-07-01",
+                "last_synced_at": "2026-07-01",
+            },
         ]
         report, sync_cls = self._run_sync(due, processing_backlog=5000)
 
@@ -2649,7 +2976,9 @@ class SyncStageProtectionTests(unittest.TestCase):
                 security_id=f"sec_refresh_{index}",
             )
         with (
-            mock.patch.object(worker_module.queries, "reclaim_stale_runs", return_value=0),
+            mock.patch.object(
+                worker_module.queries, "reclaim_stale_runs", return_value=0
+            ),
             mock.patch.object(worker_module.queries, "sync_due", return_value=due),
             mock.patch.object(
                 worker_module.queries,
@@ -3213,9 +3542,7 @@ class ProjectStageTests(unittest.TestCase):
 
     def test_prune_gate_set_when_publish_supersedes(self) -> None:
         deps = _deps()
-        superseding = mock.MagicMock(
-            status="published", superseded_run_id="run_old"
-        )
+        superseding = mock.MagicMock(status="published", superseded_run_id="run_old")
         with (
             mock.patch.object(
                 worker_module.queries, "reclaim_stale_runs", return_value=0

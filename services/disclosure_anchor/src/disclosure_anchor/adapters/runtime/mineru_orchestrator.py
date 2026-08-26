@@ -14,7 +14,8 @@ import urllib.request
 
 MINERU_API_VERSION = "3.4.4"
 MINERU_API_PROTOCOL_VERSION = 2
-MINERU_API_TASK_SLOTS = 3
+MINERU_API_DEFAULT_TASK_SLOTS = 1
+MINERU_API_MAX_SUPPORTED_TASK_SLOTS = 3
 MINERU_API_INFERENCE_CONCURRENCY = 7
 MINERU_API_PROCESSING_WINDOW_SIZE = 16
 MINERU_API_TASK_RETENTION_SECONDS = 600
@@ -99,16 +100,14 @@ class MinerUOrchestratorHealth:
         return self.queued_tasks + self.processing_tasks
 
     def as_dict(self) -> dict[str, Any]:
-        return {
-            field: getattr(self, field)
-            for field in self.__dataclass_fields__
-        }
+        return {field: getattr(self, field) for field in self.__dataclass_fields__}
 
 
 def fetch_mineru_orchestrator_health(
     api_url: str,
     *,
     timeout_seconds: float = 15.0,
+    expected_task_slots: int | None = None,
     expected_task_retention_seconds: int | None = MINERU_API_TASK_RETENTION_SECONDS,
     expected_cleanup_interval_seconds: int | None = MINERU_API_CLEANUP_INTERVAL_SECONDS,
 ) -> MinerUOrchestratorHealth:
@@ -175,7 +174,12 @@ def fetch_mineru_orchestrator_health(
         raise MinerUOrchestratorError("MinerU API version drifted")
     if health.protocol_version != MINERU_API_PROTOCOL_VERSION:
         raise MinerUOrchestratorError("MinerU API protocol drifted")
-    if health.max_concurrent_requests != MINERU_API_TASK_SLOTS:
+    if not (1 <= health.max_concurrent_requests <= MINERU_API_MAX_SUPPORTED_TASK_SLOTS):
+        raise MinerUOrchestratorError("MinerU API task-slot limit is unsupported")
+    if (
+        expected_task_slots is not None
+        and health.max_concurrent_requests != expected_task_slots
+    ):
         raise MinerUOrchestratorError("MinerU API task-slot limit drifted")
     if health.processing_window_size != MINERU_API_PROCESSING_WINDOW_SIZE:
         raise MinerUOrchestratorError("MinerU API processing window drifted")
@@ -194,8 +198,7 @@ def fetch_mineru_orchestrator_health(
         raise MinerUOrchestratorError("MinerU API task retention drifted")
     if (
         expected_cleanup_interval_seconds is not None
-        and health.task_cleanup_interval_seconds
-        != expected_cleanup_interval_seconds
+        and health.task_cleanup_interval_seconds != expected_cleanup_interval_seconds
     ):
         raise MinerUOrchestratorError("MinerU API cleanup interval drifted")
     return health
@@ -206,6 +209,7 @@ def wait_for_mineru_orchestrator_idle(
     *,
     timeout_seconds: float,
     poll_seconds: float = 1.0,
+    expected_task_slots: int | None = None,
     expected_task_retention_seconds: int | None = MINERU_API_TASK_RETENTION_SECONDS,
     expected_cleanup_interval_seconds: int | None = MINERU_API_CLEANUP_INTERVAL_SECONDS,
 ) -> tuple[MinerUOrchestratorHealth, float]:
@@ -219,6 +223,7 @@ def wait_for_mineru_orchestrator_idle(
         health = fetch_mineru_orchestrator_health(
             api_url,
             timeout_seconds=min(15.0, max(0.1, deadline - time.monotonic())),
+            expected_task_slots=expected_task_slots,
             expected_task_retention_seconds=expected_task_retention_seconds,
             expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
         )
@@ -236,7 +241,8 @@ __all__ = [
     "MINERU_API_INFERENCE_CONCURRENCY",
     "MINERU_API_PROCESSING_WINDOW_SIZE",
     "MINERU_API_PROTOCOL_VERSION",
-    "MINERU_API_TASK_SLOTS",
+    "MINERU_API_DEFAULT_TASK_SLOTS",
+    "MINERU_API_MAX_SUPPORTED_TASK_SLOTS",
     "MINERU_API_TASK_RETENTION_SECONDS",
     "MINERU_API_CLEANUP_INTERVAL_SECONDS",
     "MINERU_API_VERSION",

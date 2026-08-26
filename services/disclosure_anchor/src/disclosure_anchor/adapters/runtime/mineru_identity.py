@@ -12,10 +12,11 @@ from pathlib import Path
 from typing import Any
 
 
-RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v3"
+RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v5"
 MINERU_PROCESSING_WINDOW_SIZE = 16
 MINERU_API_PROTOCOL_VERSION = 2
-MINERU_API_MAX_CONCURRENT_REQUESTS = 3
+MINERU_API_DEFAULT_TASK_SLOTS = 1
+MINERU_API_MAX_SUPPORTED_TASK_SLOTS = 3
 MINERU_API_INFERENCE_MAX_CONCURRENCY = 7
 MINERU_API_TASK_RETENTION_SECONDS = 600
 MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS = 30
@@ -23,6 +24,11 @@ MINERU_API_OUTPUT_ROOT_POLICY = "dedicated-scratch-retention.v1"
 MINERU_API_TRANSPORT_PROFILE = "pinned-ssh-local-forward.v1"
 MINERU_API_EXPOSURE_POLICY = "windows-loopback-only.v1"
 MINERU_API_EGRESS_POLICY = "dedicated-internal-vllm-only.v1"
+MINERU_HEAP_RETURN_POLICY = "glibc-malloc-trim-per-window.v1"
+MINERU_WINDOWS_COMPOSE_PATH = r"C:\ProgramData\compose.tailnet.yaml"
+MINERU_WINDOWS_COLLECTOR_PATH = (
+    r"C:\ProgramData\agent-invest\mineru-runtime-v5\collect_mineru_runtime.ps1"
+)
 MINERU_SMOKE_INPUT_NAME = "sample_announcement.pdf"
 MINERU_SMOKE_INPUT_SHA256 = (
     "sha256:863da8f0e9aba6a19b9cb697265d4898fccaa4f5f457a93f5cc0c847b398e93f"
@@ -56,10 +62,13 @@ _CLIENT_MANIFEST_FIELDS = {
 }
 _ORCHESTRATOR_MANIFEST_FIELDS = {
     "container_image_digest",
+    "base_container_image_digest",
     "content_environment_sha256",
     "service_config_sha256",
     "mount_policy_sha256",
     "network_policy_sha256",
+    "heap_return_compatibility_sha256",
+    "heap_return_policy",
     "mineru_version",
     "api_protocol_version",
     "max_concurrent_requests",
@@ -91,6 +100,10 @@ _TOPOLOGY_MANIFEST_FIELDS = {
     "inference_upstream_sha256",
     "ssh_host_key_sha256",
     "windows_node_identity_sha256",
+    "windows_compose_path",
+    "windows_compose_sha256",
+    "windows_collector_path",
+    "windows_collector_sha256",
 }
 _CREDENTIAL_COMMAND_FLAGS = {
     "--access-token",
@@ -131,6 +144,7 @@ class VerifiedMinerURuntimeManifest:
     orchestrator_identity_sha256: str
     provider_identity_sha256: str
     served_model_id: str
+    max_concurrent_requests: int
 
 
 def canonical_payload_sha256(payload: object) -> str:
@@ -294,6 +308,7 @@ def verify_runtime_manifest_payload(
         orchestrator_identity_sha256=canonical_payload_sha256(orchestrator),
         provider_identity_sha256=canonical_payload_sha256(inference_server),
         served_model_id=served_model_id,
+        max_concurrent_requests=int(orchestrator["max_concurrent_requests"]),
     )
 
 
@@ -306,24 +321,40 @@ def _verify_orchestrator_manifest(
         orchestrator.get("container_image_digest"),
         label="orchestrator image digest",
     )
+    _require_sha256(
+        orchestrator.get("base_container_image_digest"),
+        label="orchestrator base image digest",
+    )
     for field in (
         "content_environment_sha256",
         "service_config_sha256",
         "mount_policy_sha256",
         "network_policy_sha256",
+        "heap_return_compatibility_sha256",
     ):
         _require_sha256(
             orchestrator.get(field),
             label=f"orchestrator {field}",
         )
+    if orchestrator.get("heap_return_policy") != MINERU_HEAP_RETURN_POLICY:
+        raise ValueError("runtime manifest orchestrator heap-return policy drifted")
     if (
         orchestrator.get("mineru_version")
         != MINERU_CONTENT_PACKAGE_VERSIONS["mineru_version"]
     ):
         raise ValueError("runtime manifest orchestrator MinerU version drifted")
+    task_slots = orchestrator.get("max_concurrent_requests")
+    if (
+        isinstance(task_slots, bool)
+        or not isinstance(task_slots, int)
+        or not 1 <= task_slots <= MINERU_API_MAX_SUPPORTED_TASK_SLOTS
+    ):
+        raise ValueError(
+            "runtime manifest orchestrator max_concurrent_requests must be "
+            f"between 1 and {MINERU_API_MAX_SUPPORTED_TASK_SLOTS}"
+        )
     fixed_values = {
         "api_protocol_version": MINERU_API_PROTOCOL_VERSION,
-        "max_concurrent_requests": MINERU_API_MAX_CONCURRENT_REQUESTS,
         "inference_max_concurrency": MINERU_API_INFERENCE_MAX_CONCURRENCY,
         "processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
         "task_retention_seconds": MINERU_API_TASK_RETENTION_SECONDS,
@@ -352,9 +383,7 @@ def _verify_orchestrator_manifest(
         "--max-concurrency",
         component="orchestrator",
     ) != str(MINERU_API_INFERENCE_MAX_CONCURRENCY):
-        raise ValueError(
-            "runtime manifest orchestrator must pin max_concurrency=7"
-        )
+        raise ValueError("runtime manifest orchestrator must pin max_concurrency=7")
 
 
 def _verify_inference_server_manifest(inference_server: dict[str, Any]) -> None:
@@ -364,10 +393,12 @@ def _verify_inference_server_manifest(inference_server: dict[str, Any]) -> None:
     )
     for field in ("model_repository", "served_model_id", "vllm_version"):
         value = inference_server.get(field)
-        if not isinstance(value, str) or not value or value.lower() in {"main", "latest"}:
-            raise ValueError(
-                f"runtime manifest inference-server {field} is not pinned"
-            )
+        if (
+            not isinstance(value, str)
+            or not value
+            or value.lower() in {"main", "latest"}
+        ):
+            raise ValueError(f"runtime manifest inference-server {field} is not pinned")
     revision = inference_server.get("model_snapshot_revision")
     if not isinstance(revision, str) or _REVISION_RE.fullmatch(revision) is None:
         raise ValueError(
@@ -391,20 +422,25 @@ def _verify_inference_server_manifest(inference_server: dict[str, Any]) -> None:
     )
     if command[0] != "mineru-openai-server":
         raise ValueError(
-            "runtime manifest inference-server command is not "
-            "mineru-openai-server"
+            "runtime manifest inference-server command is not mineru-openai-server"
         )
-    if _unique_flag_value(
-        command,
-        "--max-num-seqs",
-        component="inference-server",
-    ) != "128":
+    if (
+        _unique_flag_value(
+            command,
+            "--max-num-seqs",
+            component="inference-server",
+        )
+        != "128"
+    ):
         raise ValueError("runtime manifest must pin max_num_seqs=128")
-    if _unique_flag_value(
-        command,
-        "--mm-processor-cache-gb",
-        component="inference-server",
-    ) != "0":
+    if (
+        _unique_flag_value(
+            command,
+            "--mm-processor-cache-gb",
+            component="inference-server",
+        )
+        != "0"
+    ):
         raise ValueError("runtime manifest must pin mm_processor_cache_gb=0")
 
 
@@ -423,8 +459,14 @@ def _verify_topology_manifest(topology: dict[str, Any]) -> None:
         "inference_upstream_sha256",
         "ssh_host_key_sha256",
         "windows_node_identity_sha256",
+        "windows_compose_sha256",
+        "windows_collector_sha256",
     ):
         _require_sha256(topology.get(field), label=f"topology {field}")
+    if topology.get("windows_compose_path") != MINERU_WINDOWS_COMPOSE_PATH:
+        raise ValueError("runtime manifest Windows compose path drifted")
+    if topology.get("windows_collector_path") != MINERU_WINDOWS_COLLECTOR_PATH:
+        raise ValueError("runtime manifest Windows collector path drifted")
 
 
 def _require_sha256(value: object, *, label: str) -> str:
@@ -478,14 +520,11 @@ def _unique_flag_value(
     positions = [index for index, value in enumerate(command) if value == flag]
     if len(positions) != 1 or positions[0] + 1 >= len(command):
         raise ValueError(
-            f"runtime manifest {component} {flag} must occur exactly once "
-            "with a value"
+            f"runtime manifest {component} {flag} must occur exactly once with a value"
         )
     value = command[positions[0] + 1]
     if value.startswith("-"):
-        raise ValueError(
-            f"runtime manifest {component} {flag} value is invalid"
-        )
+        raise ValueError(f"runtime manifest {component} {flag} value is invalid")
     return value
 
 
@@ -501,16 +540,20 @@ __all__ = [
     "MINERU_API_EGRESS_POLICY",
     "MINERU_API_EXPOSURE_POLICY",
     "MINERU_API_INFERENCE_MAX_CONCURRENCY",
-    "MINERU_API_MAX_CONCURRENT_REQUESTS",
+    "MINERU_API_DEFAULT_TASK_SLOTS",
+    "MINERU_API_MAX_SUPPORTED_TASK_SLOTS",
     "MINERU_API_OUTPUT_ROOT_POLICY",
     "MINERU_API_PROTOCOL_VERSION",
     "MINERU_API_TASK_RETENTION_SECONDS",
     "MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS",
     "MINERU_API_TRANSPORT_PROFILE",
     "MINERU_CONTENT_PACKAGE_VERSIONS",
+    "MINERU_HEAP_RETURN_POLICY",
     "MINERU_PROCESSING_WINDOW_SIZE",
     "MINERU_SMOKE_INPUT_NAME",
     "MINERU_SMOKE_INPUT_SHA256",
+    "MINERU_WINDOWS_COLLECTOR_PATH",
+    "MINERU_WINDOWS_COMPOSE_PATH",
     "RUNTIME_MANIFEST_CONTRACT",
     "MinerUClientIdentity",
     "VerifiedMinerURuntimeManifest",

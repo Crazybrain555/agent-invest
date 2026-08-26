@@ -1,4 +1,4 @@
-"""Closed MinerU runtime-bundle v3 identity regressions."""
+"""Closed MinerU runtime-bundle v5 identity regressions."""
 
 from __future__ import annotations
 
@@ -9,12 +9,15 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_EGRESS_POLICY,
     MINERU_API_EXPOSURE_POLICY,
     MINERU_API_INFERENCE_MAX_CONCURRENCY,
-    MINERU_API_MAX_CONCURRENT_REQUESTS,
+    MINERU_API_DEFAULT_TASK_SLOTS,
     MINERU_API_OUTPUT_ROOT_POLICY,
     MINERU_API_PROTOCOL_VERSION,
     MINERU_API_TRANSPORT_PROFILE,
     MINERU_CONTENT_PACKAGE_VERSIONS,
+    MINERU_HEAP_RETURN_POLICY,
     MINERU_PROCESSING_WINDOW_SIZE,
+    MINERU_WINDOWS_COLLECTOR_PATH,
+    MINERU_WINDOWS_COMPOSE_PATH,
     RUNTIME_MANIFEST_CONTRACT,
     MinerUClientIdentity,
     canonical_payload_sha256,
@@ -48,13 +51,16 @@ def _manifest() -> dict[str, object]:
         },
         "orchestrator": {
             "container_image_digest": _sha("3"),
+            "base_container_image_digest": _sha("2"),
             "content_environment_sha256": _sha("4"),
             "service_config_sha256": _sha("5"),
             "mount_policy_sha256": _sha("6"),
             "network_policy_sha256": _sha("7"),
+            "heap_return_compatibility_sha256": _sha("8"),
+            "heap_return_policy": MINERU_HEAP_RETURN_POLICY,
             "mineru_version": "3.4.4",
             "api_protocol_version": MINERU_API_PROTOCOL_VERSION,
-            "max_concurrent_requests": MINERU_API_MAX_CONCURRENT_REQUESTS,
+            "max_concurrent_requests": MINERU_API_DEFAULT_TASK_SLOTS,
             "inference_max_concurrency": MINERU_API_INFERENCE_MAX_CONCURRENCY,
             "processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
             "task_retention_seconds": 600,
@@ -102,6 +108,10 @@ def _manifest() -> dict[str, object]:
             "inference_upstream_sha256": _sha("d"),
             "ssh_host_key_sha256": _sha("e"),
             "windows_node_identity_sha256": _sha("f"),
+            "windows_compose_path": MINERU_WINDOWS_COMPOSE_PATH,
+            "windows_compose_sha256": _sha("0"),
+            "windows_collector_path": MINERU_WINDOWS_COLLECTOR_PATH,
+            "windows_collector_sha256": _sha("1"),
         },
     }
 
@@ -122,12 +132,13 @@ def _verify(manifest: dict[str, object]):  # type: ignore[no-untyped-def]
     )
 
 
-class MinerURuntimeIdentityV3Tests(unittest.TestCase):
-    def test_valid_v3_closes_all_three_runtime_roles_and_topology(self) -> None:
+class MinerURuntimeIdentityV5Tests(unittest.TestCase):
+    def test_valid_v5_closes_all_three_runtime_roles_and_topology(self) -> None:
         manifest = _manifest()
         verified = _verify(manifest)
 
         self.assertEqual(verified.manifest, manifest)
+        self.assertEqual(verified.max_concurrent_requests, 1)
         self.assertEqual(verified.identity_sha256, canonical_payload_sha256(manifest))
         self.assertEqual(
             verified.orchestrator_identity_sha256,
@@ -187,7 +198,7 @@ class MinerURuntimeIdentityV3Tests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _verify(manifest)
 
-    def test_orchestrator_fixed_capacity_contract_is_exact(self) -> None:
+    def test_orchestrator_bounded_capacity_and_fixed_content_contract(self) -> None:
         mutations = {
             "mineru_version": "3.4.5",
             "api_protocol_version": 3,
@@ -204,6 +215,13 @@ class MinerURuntimeIdentityV3Tests(unittest.TestCase):
                 orchestrator[field] = value
                 with self.assertRaises(ValueError):
                     _verify(manifest)
+
+        for task_slots in (1, 2, 3):
+            manifest = _manifest()
+            orchestrator = manifest["orchestrator"]
+            assert isinstance(orchestrator, dict)
+            orchestrator["max_concurrent_requests"] = task_slots
+            self.assertEqual(_verify(manifest).max_concurrent_requests, task_slots)
 
     def test_orchestrator_expected_window_argument_is_also_fixed(self) -> None:
         manifest = _manifest()
@@ -257,9 +275,11 @@ class MinerURuntimeIdentityV3Tests(unittest.TestCase):
     def test_orchestrator_and_topology_hashes_are_immutable(self) -> None:
         targets = (
             ("orchestrator", "container_image_digest"),
+            ("orchestrator", "base_container_image_digest"),
             ("orchestrator", "service_config_sha256"),
             ("orchestrator", "mount_policy_sha256"),
             ("orchestrator", "network_policy_sha256"),
+            ("orchestrator", "heap_return_compatibility_sha256"),
             ("topology", "api_endpoint_sha256"),
             ("topology", "observability_endpoint_sha256"),
             ("topology", "inference_upstream_sha256"),

@@ -8,10 +8,46 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from scripts.mineru_smoke import run_cli
+from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
+    MinerUOrchestratorHealth,
+)
+from scripts.mineru_smoke import (
+    RECEIPT_SCHEMA,
+    _smoke_orchestrator_evidence,
+    run_cli,
+)
 
 
 class MinerUSmokeCliReceiptTests(unittest.TestCase):
+    def test_v4_evidence_accepts_retained_gauge_cleanup_without_deltas(self) -> None:
+        def health(*, completed: int, failed: int) -> MinerUOrchestratorHealth:
+            return MinerUOrchestratorHealth(
+                status="healthy",
+                version="3.4.4",
+                protocol_version=2,
+                queued_tasks=0,
+                processing_tasks=0,
+                completed_tasks=completed,
+                failed_tasks=failed,
+                max_concurrent_requests=1,
+                processing_window_size=16,
+                task_retention_seconds=600,
+                task_cleanup_interval_seconds=30,
+            )
+
+        evidence = _smoke_orchestrator_evidence(
+            health(completed=2, failed=1),
+            health(completed=0, failed=0),
+        )
+
+        self.assertEqual(RECEIPT_SCHEMA, "mineru_smoke_receipt.v4")
+        self.assertEqual(
+            evidence["task_registry_semantics"],
+            "retained-terminal-gauges.v1",
+        )
+        self.assertNotIn("completed_delta", evidence)
+        self.assertNotIn("failed_delta", evidence)
+
     def test_operational_abort_writes_new_redacted_failure_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch(
             "scripts.mineru_smoke.main",

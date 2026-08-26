@@ -2,17 +2,49 @@
 param(
     [Parameter(Mandatory = $true)][string]$ComposeSource,
     [Parameter(Mandatory = $true)][string]$CollectorSource,
+    [Parameter(Mandatory = $true)][string]$CompatDockerfileSource,
+    [Parameter(Mandatory = $true)][string]$CompatPatcherSource,
     [string]$ComposeTarget = "C:\ProgramData\compose.tailnet.yaml",
-    [string]$CollectorTarget = "C:\ProgramData\agent-invest\mineru\collect_mineru_runtime.ps1",
-    [string]$ReceiptTarget = "C:\ProgramData\agent-invest\mineru\install-receipt.json",
+    [string]$CollectorTarget = "C:\ProgramData\agent-invest\mineru-runtime-v5\collect_mineru_runtime.ps1",
+    [string]$ReceiptTarget = "C:\ProgramData\agent-invest\mineru-runtime-v5\install-receipt.json",
     [string]$OutputRoot = "C:\ProgramData\agent-invest\mineru-api-output",
     [string]$ExpectedRepoDigest = "mineru@sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458",
-    [string]$ExpectedImageId = "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458"
+    [string]$ExpectedImageId = "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458",
+    [ValidateRange(1, 3)][int]$ExpectedApiTaskSlots = 1
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $ProjectName = "mineru-tailnet"
+$ApiCompatImage = "agent-invest/mineru-api:3.4.4-heap-return-v1"
+$ApiCompatBuildTag = "agent-invest/mineru-api:build-$([Guid]::NewGuid().ToString('N'))"
+$HeapReturnPolicy = "glibc-malloc-trim-per-window.v1"
+$RequiredComposeTarget = "C:\ProgramData\compose.tailnet.yaml"
+$RequiredCollectorTarget = "C:\ProgramData\agent-invest\mineru-runtime-v5\collect_mineru_runtime.ps1"
+$RequiredReceiptTarget = "C:\ProgramData\agent-invest\mineru-runtime-v5\install-receipt.json"
+$ExpectedApiCompatImageId = $null
+$OldApiCompatImageId = $null
+$CompatBuildTagCreated = $false
+$CompatTagSwitched = $false
+if (
+    -not [string]::Equals(
+        [IO.Path]::GetFullPath($ComposeTarget),
+        $RequiredComposeTarget,
+        [StringComparison]::OrdinalIgnoreCase
+    ) -or
+    -not [string]::Equals(
+        [IO.Path]::GetFullPath($CollectorTarget),
+        $RequiredCollectorTarget,
+        [StringComparison]::OrdinalIgnoreCase
+    ) -or
+    -not [string]::Equals(
+        [IO.Path]::GetFullPath($ReceiptTarget),
+        $RequiredReceiptTarget,
+        [StringComparison]::OrdinalIgnoreCase
+    )
+) {
+    throw "MinerU deployment targets must use the exact active compose and versioned v5 evidence paths"
+}
 $MutationStarted = $false
 $DeploymentAttempted = $false
 $ComposeBackupCreated = $false
@@ -37,6 +69,28 @@ function Invoke-Docker {
     return $output
 }
 
+function Get-OptionalImageId {
+    param([Parameter(Mandatory = $true)][string]$Reference)
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "SilentlyContinue"
+        $output = @(& docker image inspect --format "{{.Id}}" $Reference 2>$null)
+        $inspectExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($inspectExitCode -eq 1) { return $null }
+    if ($inspectExitCode -ne 0 -or $output.Count -ne 1) {
+        throw "cannot inspect optional Docker image reference $Reference"
+    }
+    $imageId = ([string]$output[0]).Trim()
+    if ($imageId -notmatch '^sha256:[a-f0-9]{64}$') {
+        throw "Docker image reference $Reference returned an invalid image ID"
+    }
+    return $imageId
+}
+
 function Write-Utf8NoBom {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -44,6 +98,35 @@ function Write-Utf8NoBom {
     )
     $encoding = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($Path, $Value, $encoding)
+}
+
+function Assert-TargetWritable {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $stream = [IO.File]::Open(
+            $Path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::Read
+        )
+        $stream.Dispose()
+        return
+    }
+    $parent = Split-Path -Parent $Path
+    $probe = Join-Path $parent (".mineru-write-probe-" + [Guid]::NewGuid().ToString("N"))
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open(
+            $probe,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if (Test-Path -LiteralPath $probe) { Remove-Item -LiteralPath $probe -Force }
+    }
 }
 
 function Get-Sha256Text {
@@ -116,6 +199,20 @@ function Assert-SinglePort {
     }
 }
 
+function Assert-NoPublishedPort {
+    param(
+        [Parameter(Mandatory = $true)][object]$Container,
+        [Parameter(Mandatory = $true)][string]$ContainerPort
+    )
+    $bindings = @(
+        $Container.NetworkSettings.Ports.$ContainerPort |
+            Where-Object { $null -ne $_ }
+    )
+    if ($bindings.Count -ne 0) {
+        throw "$($Container.Name) must not publish $ContainerPort"
+    }
+}
+
 function Assert-ExactCommand {
     param(
         [Parameter(Mandatory = $true)][object]$Container,
@@ -156,7 +253,9 @@ function Assert-VllmIdle {
 function Capture-OldRuntimeState {
     $allNames = @(Invoke-Docker -Arguments @("ps", "--all", "--format", "{{.Names}}"))
     $script:OldProjectContainers = @(
-        $allNames | Where-Object { $_ -in @("mineru-api", "mineru-openai-server") }
+        $allNames | Where-Object {
+            $_ -in @("mineru-api", "mineru-api-proxy", "mineru-openai-server")
+        }
     )
     $script:OldRunningContainers = @()
     foreach ($name in $script:OldProjectContainers) {
@@ -175,7 +274,20 @@ function Capture-OldRuntimeState {
         $oldHealth = Invoke-RestMethod -Uri "http://127.0.0.1:30003/health" -TimeoutSec 15
         Assert-IdleHealth -Health $oldHealth -Label "old MinerU API"
         $oldApi = (Invoke-Docker -Arguments @("inspect", "mineru-api")) | ConvertFrom-Json
-        Assert-SinglePort -Container $oldApi -ContainerPort "8000/tcp" -HostPort "30003"
+        if ($script:OldProjectContainers -contains "mineru-api-proxy") {
+            if ($script:OldRunningContainers -notcontains "mineru-api-proxy") {
+                throw "old MinerU API proxy exists but is not running"
+            }
+            $oldProxy = (Invoke-Docker -Arguments @(
+                "inspect", "mineru-api-proxy"
+            )) | ConvertFrom-Json
+            Assert-NoPublishedPort -Container $oldApi -ContainerPort "8000/tcp"
+            Assert-SinglePort -Container $oldProxy -ContainerPort "8000/tcp" -HostPort "30003"
+        }
+        else {
+            # One-time migration compatibility for the pre-proxy topology.
+            Assert-SinglePort -Container $oldApi -ContainerPort "8000/tcp" -HostPort "30003"
+        }
     }
     if ($script:OldProjectContainers -contains "mineru-openai-server") {
         if ($script:OldRunningContainers -contains "mineru-openai-server") {
@@ -236,13 +348,21 @@ function Get-ValidatedRuntime {
     $proxy = $proxy[0]
     $inference = $inference[0]
 
-    foreach ($container in @($api, $proxy, $inference)) {
+    if (
+        [string]$api.Config.Image -ne $ApiCompatImage -or
+        [string]$api.Image -ne $ExpectedApiCompatImageId
+    ) {
+        throw "MinerU API compatibility image reference or ID drifted"
+    }
+    foreach ($container in @($proxy, $inference)) {
         if (
             [string]$container.Config.Image -ne $ExpectedRepoDigest -or
             [string]$container.Image -ne $ExpectedImageId
         ) {
-            throw "$($container.Name) image reference or image ID drifted"
+            throw "$($container.Name) base image reference or image ID drifted"
         }
+    }
+    foreach ($container in @($api, $proxy, $inference)) {
         if (
             [string]$container.HostConfig.RestartPolicy.Name -ne "always" -or
             [int]$container.HostConfig.RestartPolicy.MaximumRetryCount -ne 0 -or
@@ -250,6 +370,9 @@ function Get-ValidatedRuntime {
         ) {
             throw "$($container.Name) restart or health policy drifted"
         }
+    }
+    if (@($api.Config.Env) -notcontains "MINERU_MALLOC_TRIM=1") {
+        throw "MinerU API heap-return compatibility switch is not enabled"
     }
 
     $apiPortBindings = @(
@@ -328,7 +451,7 @@ function Get-ValidatedRuntime {
     if (
         [string]$health.version -ne "3.4.4" -or
         [int]$health.protocol_version -ne 2 -or
-        [int]$health.max_concurrent_requests -ne 3 -or
+        [int]$health.max_concurrent_requests -ne $ExpectedApiTaskSlots -or
         [int]$health.processing_window_size -ne 16 -or
         [int]$health.task_retention_seconds -ne 600 -or
         [int]$health.task_cleanup_interval_seconds -ne 30
@@ -376,6 +499,82 @@ function Get-ValidatedRuntime {
     }
 }
 
+function Build-ValidatedApiCompatImage {
+    $dockerfile = [IO.Path]::GetFullPath($CompatDockerfileSource)
+    $patcher = [IO.Path]::GetFullPath($CompatPatcherSource)
+    $context = Split-Path -Parent $dockerfile
+    if (
+        -not [string]::Equals(
+            $context,
+            (Split-Path -Parent $patcher),
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        (Split-Path -Leaf $dockerfile) -ne "Dockerfile" -or
+        (Split-Path -Leaf $patcher) -ne "patch_mineru_344.py"
+    ) {
+        throw "MinerU compatibility Dockerfile and patcher must share one exact build context"
+    }
+    $patcherSha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $patcher).Hash.ToLowerInvariant())"
+    $dockerfileSha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $dockerfile).Hash.ToLowerInvariant())"
+    Invoke-Docker -Arguments @(
+        "build", "--pull=false", "--file", $dockerfile,
+        "--tag", $ApiCompatBuildTag,
+        "--build-arg", "COMPAT_PATCHER_SHA256=$patcherSha256",
+        "--build-arg", "COMPAT_DOCKERFILE_SHA256=$dockerfileSha256",
+        $context
+    ) | Out-Null
+    $script:CompatBuildTagCreated = $true
+    $inspect = (Invoke-Docker -Arguments @("image", "inspect", $ApiCompatBuildTag)) |
+        ConvertFrom-Json
+    if (@($inspect).Count -ne 1) {
+        throw "MinerU API compatibility image is not uniquely inspectable"
+    }
+    $image = $inspect[0]
+    if (
+        [string]$image.Config.Labels."io.agent-invest.mineru.base-image-digest" -ne
+            $ExpectedImageId -or
+        [string]$image.Config.Labels."io.agent-invest.mineru.compatibility-policy" -ne
+            $HeapReturnPolicy -or
+        [string]$image.Config.Labels."io.agent-invest.mineru.compatibility-patcher-sha256" -ne
+            $patcherSha256 -or
+        [string]$image.Config.Labels."io.agent-invest.mineru.compatibility-dockerfile-sha256" -ne
+            $dockerfileSha256 -or
+        @($image.Config.Env) -notcontains "MINERU_MALLOC_TRIM=1"
+    ) {
+        throw "MinerU API compatibility image labels or environment drifted"
+    }
+    $script:ExpectedApiCompatImageId = [string]$image.Id
+    if ($ExpectedApiCompatImageId -notmatch '^sha256:[a-f0-9]{64}$') {
+        throw "MinerU API compatibility image ID is invalid"
+    }
+    return [ordered]@{
+        image = $ApiCompatImage
+        image_id = $ExpectedApiCompatImageId
+        policy = $HeapReturnPolicy
+        patcher_sha256 = $patcherSha256
+        dockerfile_sha256 = $dockerfileSha256
+    }
+}
+
+function Remove-CompatBuildTag {
+    if ($CompatBuildTagCreated) {
+        Invoke-Docker -Arguments @("image", "rm", $ApiCompatBuildTag) | Out-Null
+        $script:CompatBuildTagCreated = $false
+    }
+}
+
+function Restore-ApiCompatTag {
+    if (-not $CompatTagSwitched) { return }
+    if ($null -ne $OldApiCompatImageId) {
+        Invoke-Docker -Arguments @("tag", $OldApiCompatImageId, $ApiCompatImage) |
+            Out-Null
+    }
+    else {
+        Invoke-Docker -Arguments @("image", "rm", $ApiCompatImage) | Out-Null
+    }
+    $script:CompatTagSwitched = $false
+}
+
 function Restore-PreviousDeployment {
     if ($ComposeExisted -and $ComposeBackupCreated) {
         Copy-Item -LiteralPath $ComposeBackup -Destination $ComposeTarget -Force
@@ -395,6 +594,8 @@ function Restore-PreviousDeployment {
     elseif (Test-Path -LiteralPath $ReceiptTarget) {
         Remove-Item -LiteralPath $ReceiptTarget -Force
     }
+
+    Restore-ApiCompatTag
 
     if ($ComposeExisted) {
         if ($OldProjectContainers.Count -eq 0) {
@@ -432,10 +633,14 @@ function Restore-PreviousDeployment {
             }
         }
     }
+    Remove-CompatBuildTag
 }
 
 try {
-    foreach ($source in @($ComposeSource, $CollectorSource)) {
+    foreach ($source in @(
+        $ComposeSource, $CollectorSource, $CompatDockerfileSource,
+        $CompatPatcherSource
+    )) {
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
             throw "required deployment source is missing: $source"
         }
@@ -455,7 +660,6 @@ try {
     }
 
     Capture-OldRuntimeState
-
     foreach ($directory in @(
         (Split-Path -Parent $ComposeTarget), (Split-Path -Parent $CollectorTarget),
         (Split-Path -Parent $ReceiptTarget), $OutputRoot
@@ -464,9 +668,14 @@ try {
             New-Item -ItemType Directory -Path $directory -Force | Out-Null
         }
     }
+    foreach ($target in @($ComposeTarget, $CollectorTarget, $ReceiptTarget)) {
+        Assert-TargetWritable -Path $target
+    }
     if (@(Get-ChildItem -LiteralPath $OutputRoot -Recurse -File -Force).Count -ne 0) {
         throw "output root must be empty before installation"
     }
+    $OldApiCompatImageId = Get-OptionalImageId -Reference $ApiCompatImage
+    $compatImage = Build-ValidatedApiCompatImage
     if ($ComposeExisted) {
         Copy-Item -LiteralPath $ComposeTarget -Destination $ComposeBackup
         $ComposeBackupCreated = $true
@@ -481,6 +690,13 @@ try {
     }
 
     $MutationStarted = $true
+    Invoke-Docker -Arguments @(
+        "tag", $ExpectedApiCompatImageId, $ApiCompatImage
+    ) | Out-Null
+    $CompatTagSwitched = $true
+    if ((Get-OptionalImageId -Reference $ApiCompatImage) -ne $ExpectedApiCompatImageId) {
+        throw "MinerU API compatibility publish tag did not bind the built image ID"
+    }
     Copy-Item -LiteralPath $ComposeSource -Destination $ComposeTarget -Force
     Copy-Item -LiteralPath $CollectorSource -Destination $CollectorTarget -Force
     if (
@@ -505,19 +721,21 @@ try {
         throw "formal runtime collector did not return one observation"
     }
     $collectorObservation = ([string]$collectorOutput[0]) | ConvertFrom-Json
-    if ([string]$collectorObservation.schema -ne "mineru-windows-runtime-observation.v2") {
+    if ([string]$collectorObservation.schema -ne "mineru-windows-runtime-observation.v3") {
         throw "formal runtime collector contract drifted"
     }
+    Remove-CompatBuildTag
     $receipt = [ordered]@{
-        schema = "mineru-windows-install-receipt.v1"
+        schema = "mineru-windows-install-receipt.v2"
         installed_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         success = $true
         compose_path = $ComposeTarget
         compose_sha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeTarget).Hash.ToLowerInvariant())"
         collector_path = $CollectorTarget
         collector_sha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $CollectorTarget).Hash.ToLowerInvariant())"
-        repo_digest = $ExpectedRepoDigest
-        image_id = $ExpectedImageId
+        base_repo_digest = $ExpectedRepoDigest
+        base_image_id = $ExpectedImageId
+        api_compatibility_image = $compatImage
         compose_backup = if ($ComposeExisted) { $ComposeBackup } else { $null }
         collector_backup = if ($CollectorExisted) { $CollectorBackup } else { $null }
         collector_observation_schema = [string]$collectorObservation.schema
@@ -530,6 +748,12 @@ try {
 catch {
     $originalError = $_.Exception.Message
     if (-not $MutationStarted) {
+        $cleanupError = $null
+        try { Remove-CompatBuildTag }
+        catch { $cleanupError = $_.Exception.Message }
+        if ($null -ne $cleanupError) {
+            throw "installation preflight failed: $originalError; temporary image cleanup also failed: $cleanupError"
+        }
         throw "installation preflight failed before runtime mutation: $originalError"
     }
     $rollbackError = $null

@@ -298,7 +298,11 @@ def vllm_metrics_snapshot(payload: bytes) -> dict[str, Any]:
     }
 
 
-def mineru_api_health_snapshot(payload: bytes) -> dict[str, Any]:
+def mineru_api_health_snapshot(
+    payload: bytes,
+    *,
+    expected_task_slots: int | None = None,
+) -> dict[str, Any]:
     """Parse the exact MinerU 3.4.4 orchestration health contract."""
 
     try:
@@ -311,7 +315,11 @@ def mineru_api_health_snapshot(payload: bytes) -> dict[str, Any]:
         decoded.get("status") != "healthy"
         or decoded.get("version") != "3.4.4"
         or decoded.get("protocol_version") != 2
-        or decoded.get("max_concurrent_requests") != 3
+        or not 1 <= decoded.get("max_concurrent_requests", 0) <= 3
+        or (
+            expected_task_slots is not None
+            and decoded.get("max_concurrent_requests") != expected_task_slots
+        )
         or decoded.get("processing_window_size") != 16
         or decoded.get("task_retention_seconds") != 600
         or decoded.get("task_cleanup_interval_seconds") != 30
@@ -555,7 +563,10 @@ def collect_worker_progress(
         "latest_interval": report.as_dict() if report is not None else None,
         "orchestration": _probe_snapshot(
             url=api_health_url,
-            parser=mineru_api_health_snapshot,
+            parser=lambda payload: mineru_api_health_snapshot(
+                payload,
+                expected_task_slots=settings.disclosure_mineru_api_task_slots,
+            ),
             timeout_seconds=settings.worker_progress_metrics_timeout_seconds,
             source="mineru_api_health",
             contract_failure_reason="api_contract_unsatisfied",

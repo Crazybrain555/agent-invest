@@ -507,6 +507,41 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
         self.assertEqual(caught.exception.reason_code, "invalid_runtime_protocol")
         self.assertFalse(caught.exception.retryable)
 
+        sensitive_value = "sensitive-provider-payload"
+        sensitive_key = "Sensitive Provider Key"
+        event = {
+            "type": "Runtime Notice With Secret",
+            sensitive_key: sensitive_value,
+        }
+        raw_event = json.dumps(event)
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = CodexCliSemanticAdjudicator(
+                executable=Path("/opt/codex"),
+                runtime_tmp_root=Path(tmp),
+            )
+            with (
+                mock.patch(
+                    "disclosure_anchor.adapters.semantics.codex_cli._run_process",
+                    return_value=subprocess.CompletedProcess(
+                        ["codex"], 1, raw_event, "API Error: 429 Too Many Requests"
+                    ),
+                ),
+                self.assertRaises(SemanticRouteAdjudicatorError) as caught_unknown,
+            ):
+                adapter.adjudicate(_batch())
+
+        message = str(caught_unknown.exception)
+        self.assertEqual(
+            caught_unknown.exception.reason_code,
+            "invalid_runtime_protocol",
+        )
+        self.assertFalse(caught_unknown.exception.retryable)
+        self.assertIn("event_sha256=", message)
+        self.assertIn("type=sha256:", message)
+        self.assertIn("keys=", message)
+        self.assertNotIn(sensitive_key, message)
+        self.assertNotIn(sensitive_value, message)
+
     def test_unsupported_output_schema_is_controlled_and_nonretryable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             adapter = CodexCliSemanticAdjudicator(
@@ -636,15 +671,27 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
                         }
                     ),
                     "forbidden_tool_call",
+                    None,
                 ),
                 (
                     '{"type":"item.completed","item":{'
                     '"type":"mcp_tool_call","type":"agent_message",'
                     '"text":"safe"}}',
                     "invalid_runtime_protocol",
+                    None,
+                ),
+                (
+                    json.dumps(
+                        {
+                            "type": "runtime.notice",
+                            "detail": "sensitive-provider-payload",
+                        }
+                    ),
+                    "invalid_runtime_protocol",
+                    "type=runtime.notice keys=detail,type",
                 ),
             )
-            for stdout, reason_code in event_streams:
+            for stdout, reason_code, diagnostic in event_streams:
                 def run(*, args, **_kwargs):  # type: ignore[no-untyped-def]
                     result_path = Path(
                         args[args.index("--output-last-message") + 1]
@@ -668,6 +715,12 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
 
                 self.assertEqual(caught.exception.reason_code, reason_code)
                 self.assertFalse(caught.exception.retryable)
+                if diagnostic is not None:
+                    self.assertIn(diagnostic, str(caught.exception))
+                    self.assertIn("event_sha256=", str(caught.exception))
+                    self.assertNotIn(
+                        "sensitive-provider-payload", str(caught.exception)
+                    )
 
     def test_exact_disabled_code_mode_receipt_is_nonfatal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

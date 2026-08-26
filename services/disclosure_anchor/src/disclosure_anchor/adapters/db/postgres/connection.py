@@ -170,13 +170,29 @@ def create_db_engine(
     set_role: Optional[str] = None,
     echo: bool = False,
     autocommit: bool = False,
+    pool_size: int | None = None,
+    max_overflow: int | None = None,
+    pool_timeout: float | None = None,
 ) -> Engine:
     """Create an engine. When ``set_role`` is given, every new connection runs
     ``SET ROLE`` so objects are created/owned by that role rather than the
     connecting login (used for migrations and owner-scoped writes). Use
     ``autocommit`` for cluster-level bootstrap statements."""
 
+    if pool_size is not None and pool_size <= 0:
+        raise ConfigurationError("database pool_size must be positive")
+    if max_overflow is not None and max_overflow < 0:
+        raise ConfigurationError("database max_overflow cannot be negative")
+    if pool_timeout is not None and pool_timeout <= 0:
+        raise ConfigurationError("database pool_timeout must be positive")
+
     kwargs: dict[str, object] = {"echo": echo, "future": True, "pool_pre_ping": True}
+    if pool_size is not None:
+        kwargs["pool_size"] = pool_size
+    if max_overflow is not None:
+        kwargs["max_overflow"] = max_overflow
+    if pool_timeout is not None:
+        kwargs["pool_timeout"] = pool_timeout
     if autocommit:
         kwargs["isolation_level"] = "AUTOCOMMIT"
     engine = create_engine(url, **kwargs)

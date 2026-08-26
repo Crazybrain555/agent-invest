@@ -9,6 +9,7 @@ temporary state, and writes one new-only private receipt.
 from __future__ import annotations
 
 import argparse
+import base64
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -18,7 +19,10 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
+import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -34,13 +38,14 @@ from disclosure_anchor.adapters.parsers.mineru_medium import (
 from disclosure_anchor.adapters.parsers.mineru_medium.process import (
     terminate_active_mineru_processes,
 )
+from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
 from disclosure_anchor.adapters.runtime.mineru_canary import (
     probe_mineru_served_model,
 )
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_INFERENCE_MAX_CONCURRENCY,
-    MINERU_API_MAX_CONCURRENT_REQUESTS,
     MINERU_PROCESSING_WINDOW_SIZE,
+    MINERU_WINDOWS_COLLECTOR_PATH,
     client_bundle_identity,
     verify_runtime_manifest_payload,
     writer_code_digest,
@@ -59,23 +64,19 @@ from disclosure_anchor.adapters.runtime.mineru_process_isolation import (
 from disclosure_anchor.application.ports.parser import ParserOptions
 
 
-RECEIPT_SCHEMA = "mineru_staged_load_receipt.v2"
-STAGE_DOCUMENT_CONCURRENCIES = (4, 8, 16)
-ORCHESTRATOR_TASK_CONCURRENCY = MINERU_API_MAX_CONCURRENT_REQUESTS
+RECEIPT_SCHEMA = "mineru_staged_load_receipt.v5"
+TASK_REGISTRY_SEMANTICS = "retained-terminal-gauges.v1"
+STAGE_DOCUMENT_COUNTS = (4, 8, 16)
 ORCHESTRATOR_INFERENCE_CONCURRENCY = MINERU_API_INFERENCE_MAX_CONCURRENCY
-EFFECTIVE_INFERENCE_REQUEST_UPPER_BOUND = (
-    ORCHESTRATOR_TASK_CONCURRENCY * ORCHESTRATOR_INFERENCE_CONCURRENCY
-)
-STAGE_EFFECTIVE_INFERENCE_REQUEST_UPPER_BOUNDS = tuple(
-    min(concurrency, ORCHESTRATOR_TASK_CONCURRENCY)
-    * ORCHESTRATOR_INFERENCE_CONCURRENCY
-    for concurrency in STAGE_DOCUMENT_CONCURRENCIES
-)
 MINIMUM_INPUT_PAGES = 7
+MINIMUM_CORPUS_DOCUMENTS = 16
+CORPUS_SCHEMA = "mineru_staged_corpus.v1"
 WAITING_ABORT_THRESHOLD = 64.0
 WAITING_ABORT_SECONDS = 30.0
 METRICS_SAMPLE_INTERVAL_SECONDS = 1.0
 ORCHESTRATOR_SAMPLE_INTERVAL_SECONDS = 0.25
+HOST_CAPACITY_SAMPLE_INTERVAL_SECONDS = 5.0
+HOST_CAPACITY_MAX_SAMPLE_GAP_SECONDS = 15.0
 METRICS_LOGICAL_SAMPLE_TIMEOUT_SECONDS = 10.0
 METRICS_TRANSPORT_ATTEMPT_TIMEOUT_SECONDS = 4.5
 METRICS_TRANSPORT_ATTEMPTS = 2
@@ -83,6 +84,13 @@ MAX_TOLERATED_METRICS_SAMPLE_FAILURES_PER_STAGE = 1
 _MAX_METRICS_BYTES = 2 * 1024 * 1024
 _MAX_SAFE_DETAIL_CHARS = 500
 _SAFE_DETAIL_TRUNCATION_MARKER = " ...[middle truncated]... "
+_HOST_CONTAINER_NAMES = {
+    "mineru-api",
+    "mineru-api-proxy",
+    "mineru-openai-server",
+}
+_SSH_HOST_RE = re.compile(r"^(?!-)[A-Za-z0-9.-]+$")
+_SSH_USER_RE = re.compile(r"^(?!-)[A-Za-z0-9_.-]+$")
 _METRIC_ALIASES = {
     "running": {
         "vllm:num_requests_running",
@@ -121,6 +129,668 @@ class MetricsSample:
             "preemptions": self.preemptions,
             "kv_cache": self.kv_cache,
         }
+
+
+@dataclass(frozen=True)
+class FrozenCorpusInput:
+    logical_name: str
+    payload: bytes
+    digest: str
+    page_count: int
+    workload_class: str
+
+    def evidence(self) -> dict[str, object]:
+        return {
+            "logical_name": self.logical_name,
+            "sha256": f"sha256:{self.digest}",
+            "bytes": len(self.payload),
+            "page_count": self.page_count,
+            "workload_class": self.workload_class,
+        }
+
+
+class _StageAbortLatch:
+    """Linearize monitor failure publication with API admission grants."""
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition(threading.RLock())
+        self._reason: str | None = None
+
+    @property
+    def reason(self) -> str | None:
+        with self.condition:
+            return self._reason
+
+    def reason_locked(self) -> str | None:
+        """Return the reason while the shared condition is already held."""
+
+        return self._reason
+
+    def publish_locked(self, reason: str) -> None:
+        """Publish one sticky reason while the shared condition is held."""
+
+        self._reason = self._reason or reason
+        self.condition.notify_all()
+
+    def publish(self, reason: str) -> None:
+        with self.condition:
+            self.publish_locked(reason)
+
+
+class _StageAdmission:
+    """Bound API-facing clients while making huge work exclusive."""
+
+    def __init__(
+        self,
+        *,
+        outstanding_window: int,
+        abort_latch: _StageAbortLatch | None = None,
+    ) -> None:
+        if outstanding_window < 1:
+            raise ValueError("client outstanding window must be positive")
+        self._window = outstanding_window
+        self._abort_latch = abort_latch or _StageAbortLatch()
+        self._condition = self._abort_latch.condition
+        self._active = 0
+        self._huge_active = False
+        self._closed = False
+        self._peak = 0
+
+    @property
+    def peak(self) -> int:
+        with self._condition:
+            return self._peak
+
+    def run(
+        self,
+        *,
+        workload_class: str,
+        operation: Callable[[], dict[str, Any]],
+        abort_reason: Callable[[], str | None] = lambda: None,
+    ) -> dict[str, Any]:
+        exclusive = workload_class == "huge"
+        with self._condition:
+            self._condition.wait_for(
+                lambda: self._closed
+                or self._abort_latch.reason_locked() is not None
+                or (
+                    self._active == 0
+                    if exclusive
+                    else not self._huge_active and self._active < self._window
+                )
+            )
+            latched_failure = self._abort_latch.reason_locked()
+            if self._closed or latched_failure is not None:
+                self._closed = True
+                raise _StageAdmissionClosedError(
+                    "stage admission closed after an earlier failure"
+                    + (
+                        f": {_safe_detail(latched_failure)}"
+                        if latched_failure is not None
+                        else ""
+                    )
+                )
+            # A monitor can latch failure while this caller is waiting for the
+            # prior document to release the only local slot.  Re-check that
+            # latch while still holding the admission condition so the waiter
+            # cannot turn a newly freed token into another remote submission
+            # before the coordinator's polling loop calls ``close()``.
+            failure = abort_reason()
+            if failure is not None:
+                self._abort_latch.publish_locked(failure)
+                self._closed = True
+                self._condition.notify_all()
+                raise _StageAdmissionClosedError(
+                    "stage admission closed by a latched monitor failure: "
+                    f"{_safe_detail(failure)}"
+                )
+            self._active += 1
+            self._huge_active = exclusive
+            self._peak = max(self._peak, self._active)
+        try:
+            return operation()
+        finally:
+            with self._condition:
+                self._active -= 1
+                if exclusive:
+                    self._huge_active = False
+                self._condition.notify_all()
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+
+class _StageAdmissionClosedError(RuntimeError):
+    """A queued stage document was cancelled after a peer failed."""
+
+
+def _private_host_observer_file(path: Path, *, label: str) -> None:
+    metadata = path.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+    ):
+        raise ValueError(f"{label} must be an owner-only 0600 regular file")
+
+
+def _host_observer_ssh_base(
+    *,
+    host: str,
+    user: str,
+    port: int,
+    identity_file: Path,
+    known_hosts_file: Path,
+) -> list[str]:
+    if (
+        _SSH_HOST_RE.fullmatch(host) is None
+        or _SSH_USER_RE.fullmatch(user) is None
+        or port != 22
+    ):
+        raise ValueError("host observer SSH destination is invalid")
+    _private_host_observer_file(identity_file, label="host observer SSH identity")
+    _private_host_observer_file(
+        known_hosts_file,
+        label="host observer known_hosts",
+    )
+    lines = [
+        line.strip()
+        for line in known_hosts_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if len(lines) != 1:
+        raise ValueError("host observer known_hosts must contain one pinned key")
+    fields = lines[0].split()
+    if len(fields) != 3 or fields[0] != host or fields[1] != "ssh-ed25519":
+        raise ValueError("host observer known_hosts does not pin the exact host")
+    try:
+        base64.b64decode(fields[2], validate=True)
+    except ValueError as exc:
+        raise ValueError("host observer key is not canonical base64") from exc
+    return [
+        "/usr/bin/ssh",
+        "-F",
+        "/dev/null",
+        "-i",
+        str(identity_file),
+        "-p",
+        str(port),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        f"UserKnownHostsFile={known_hosts_file}",
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
+        "-o",
+        "UpdateHostKeys=no",
+        "-o",
+        "CheckHostIP=no",
+        "-o",
+        "ConnectTimeout=15",
+        "--",
+        f"{user}@{host}",
+    ]
+
+
+def _positive_int(value: object, *, label: str, allow_zero: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"host capacity {label} is invalid")
+    minimum = 0 if allow_zero else 1
+    if value < minimum:
+        raise ValueError(f"host capacity {label} is invalid")
+    return value
+
+
+class _TrustedHostCapacityViolation(ValueError):
+    """Safety violation carried with a structurally trusted collector sample."""
+
+    def __init__(self, reason: str, *, sample: dict[str, Any]) -> None:
+        super().__init__(reason)
+        self.sample = sample
+
+
+def _validate_host_capacity_sample(
+    payload: object,
+    *,
+    expected_collector_sha256: str,
+    expected_windows_node_identity_sha256: str,
+    docker_memory_reserve_bytes: int,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema",
+        "observed_at_utc",
+        "collector_path",
+        "collector_sha256",
+        "windows_node_identity_sha256",
+        "containers",
+    }:
+        raise ValueError("host capacity sample fields drifted")
+    if (
+        payload.get("schema") != "mineru-host-capacity-sample.v1"
+        or payload.get("collector_path") != MINERU_WINDOWS_COLLECTOR_PATH
+        or payload.get("collector_sha256") != expected_collector_sha256
+        or payload.get("windows_node_identity_sha256")
+        != expected_windows_node_identity_sha256
+    ):
+        raise ValueError("host capacity sample identity drifted")
+    observed_at = payload.get("observed_at_utc")
+    try:
+        parsed_observed_at = datetime.fromisoformat(str(observed_at).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("host capacity timestamp is invalid") from exc
+    if parsed_observed_at.tzinfo is None:
+        raise ValueError("host capacity timestamp is not aware")
+    containers = payload.get("containers")
+    if not isinstance(containers, list) or len(containers) != 3:
+        raise ValueError("host capacity container set is incomplete")
+    normalized: list[dict[str, Any]] = []
+    safety_violations: list[str] = []
+    names: set[str] = set()
+    for item in containers:
+        if not isinstance(item, dict) or set(item) != {
+            "name",
+            "id",
+            "started_at_utc",
+            "restart_count",
+            "oom_killed",
+            "exit_code",
+            "running",
+            "status",
+            "health",
+            "pid",
+            "memory_current_bytes",
+            "memory_max_bytes",
+            "memory_events",
+            "pid1_rss_bytes",
+            "pid1_rss_hwm_bytes",
+            "docker_vm_memory_total_bytes",
+            "docker_vm_memory_available_bytes",
+        }:
+            raise ValueError("host capacity container fields drifted")
+        name = item.get("name")
+        container_id = item.get("id")
+        if (
+            not isinstance(name, str)
+            or name in names
+            or not isinstance(container_id, str)
+            or re.fullmatch(r"[a-f0-9]{64}", container_id) is None
+        ):
+            raise ValueError("host capacity container identity is invalid")
+        restart_count = _positive_int(
+            item.get("restart_count"),
+            label="restart_count",
+            allow_zero=True,
+        )
+        exit_code = _positive_int(
+            item.get("exit_code"),
+            label="exit_code",
+            allow_zero=True,
+        )
+        oom_killed = item.get("oom_killed")
+        running = item.get("running")
+        status = item.get("status")
+        health = item.get("health")
+        if (
+            not isinstance(oom_killed, bool)
+            or not isinstance(running, bool)
+            or not isinstance(status, str)
+            or not isinstance(health, str)
+        ):
+            raise ValueError("host capacity container state fields are invalid")
+        if (
+            restart_count != 0
+            or oom_killed
+            or exit_code != 0
+            or not running
+            or status != "running"
+            or health != "healthy"
+        ):
+            safety_violations.append(f"{name}:container_state_unsafe")
+        try:
+            started_at = datetime.fromisoformat(
+                str(item.get("started_at_utc")).replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError("host capacity container epoch is invalid") from exc
+        if started_at.tzinfo is None:
+            raise ValueError("host capacity container epoch is not aware")
+        memory_current = _positive_int(
+            item.get("memory_current_bytes"),
+            label="memory_current_bytes",
+            allow_zero=True,
+        )
+        memory_max_value = item.get("memory_max_bytes")
+        memory_max = (
+            None
+            if memory_max_value is None
+            else _positive_int(memory_max_value, label="memory_max_bytes")
+        )
+        if memory_max is not None and memory_current > memory_max:
+            raise ValueError("host capacity cgroup memory exceeds its limit")
+        rss = _positive_int(
+            item.get("pid1_rss_bytes"),
+            label="pid1_rss_bytes",
+            allow_zero=True,
+        )
+        rss_hwm = _positive_int(
+            item.get("pid1_rss_hwm_bytes"),
+            label="pid1_rss_hwm_bytes",
+            allow_zero=True,
+        )
+        if rss_hwm < rss:
+            raise ValueError("host capacity RSS high-water mark is invalid")
+        vm_total = _positive_int(
+            item.get("docker_vm_memory_total_bytes"),
+            label="docker_vm_memory_total_bytes",
+        )
+        vm_available = _positive_int(
+            item.get("docker_vm_memory_available_bytes"),
+            label="docker_vm_memory_available_bytes",
+        )
+        if vm_available > vm_total:
+            raise ValueError("host capacity Docker VM memory values are invalid")
+        if vm_available < docker_memory_reserve_bytes:
+            safety_violations.append(f"{name}:docker_vm_memory_reserve_crossed")
+        events = item.get("memory_events")
+        if (
+            not isinstance(events, dict)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in events.values()
+            )
+        ):
+            raise ValueError("host capacity cgroup OOM evidence is invalid")
+        if events.get("oom") != 0 or events.get("oom_kill") != 0:
+            safety_violations.append(f"{name}:cgroup_oom_observed")
+        _positive_int(item.get("pid"), label="pid")
+        names.add(name)
+        normalized.append(dict(item))
+    if names != _HOST_CONTAINER_NAMES:
+        raise ValueError("host capacity container identities drifted")
+    result = dict(payload)
+    result["containers"] = sorted(normalized, key=lambda item: str(item["name"]))
+    if safety_violations:
+        raise _TrustedHostCapacityViolation(
+            ";".join(sorted(set(safety_violations))),
+            sample=result,
+        )
+    return result
+
+
+def _fetch_host_capacity_sample(
+    ssh_command: list[str],
+    *,
+    expected_collector_sha256: str,
+    expected_windows_node_identity_sha256: str,
+    docker_memory_reserve_bytes: int,
+) -> dict[str, Any]:
+    completed = subprocess.run(
+        [
+            *ssh_command,
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            MINERU_WINDOWS_COLLECTOR_PATH,
+            "-CapacitySample",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("host capacity sample is not JSON") from exc
+    return _validate_host_capacity_sample(
+        payload,
+        expected_collector_sha256=expected_collector_sha256,
+        expected_windows_node_identity_sha256=(
+            expected_windows_node_identity_sha256
+        ),
+        docker_memory_reserve_bytes=docker_memory_reserve_bytes,
+    )
+
+
+class _HostCapacityMonitor:
+    """Process-external Docker epoch/OOM/RSS observer for one whole replay."""
+
+    def __init__(
+        self,
+        *,
+        sampler: Callable[[], dict[str, Any]],
+        collector_sha256: str,
+        windows_node_identity_sha256: str,
+        docker_memory_reserve_bytes: int,
+        abort_latch: _StageAbortLatch | None = None,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+        sample_interval_seconds: float = HOST_CAPACITY_SAMPLE_INTERVAL_SECONDS,
+    ) -> None:
+        self._sampler = sampler
+        self._collector_sha256 = collector_sha256
+        self._node_identity = windows_node_identity_sha256
+        self._reserve = docker_memory_reserve_bytes
+        self._abort_latch = abort_latch or _StageAbortLatch()
+        self._clock = monotonic_clock
+        self._interval = sample_interval_seconds
+        self._max_gap = max(
+            HOST_CAPACITY_MAX_SAMPLE_GAP_SECONDS,
+            sample_interval_seconds * 3,
+        )
+        self._started = monotonic_clock()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._samples: list[dict[str, Any]] = []
+        self._violations: list[dict[str, Any]] = []
+        self._sampling_failures: list[dict[str, Any]] = []
+        self._epochs: dict[str, tuple[str, str]] | None = None
+        self._failure: str | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def failure(self) -> str | None:
+        with self._lock:
+            return self._failure
+
+    def start(self) -> None:
+        self._sample_once()
+        if self.failure is not None:
+            raise RuntimeError(self.failure)
+        self._thread = threading.Thread(
+            target=self._run,
+            name="mineru-host-capacity-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=35)
+            if self._thread.is_alive():
+                self._record_failure("host_capacity_monitor_did_not_stop")
+                return
+        self._sample_once()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            self._sample_once()
+
+    def _record_failure(self, failure: str) -> None:
+        with self._abort_latch.condition:
+            with self._lock:
+                self._failure = self._failure or failure
+                published = self._failure
+            self._abort_latch.publish_locked(published)
+
+    def _sample_once(self) -> None:
+        observed_seconds = max(0.0, self._clock() - self._started)
+        try:
+            sample = dict(self._sampler())
+        except _TrustedHostCapacityViolation as exc:
+            failure = f"host_capacity_violation:{_safe_detail(str(exc))}"
+            with self._abort_latch.condition:
+                with self._lock:
+                    sample_index = self._append_trusted_sample_locked(
+                        dict(exc.sample),
+                        observed_seconds=observed_seconds,
+                    )
+                    self._violations.append(
+                        {
+                            "observed_seconds": round(observed_seconds, 6),
+                            "sample_index": sample_index,
+                            "failure": failure,
+                        }
+                    )
+                    self._failure = self._failure or failure
+                    published = self._failure
+                self._abort_latch.publish_locked(published)
+        except Exception as exc:
+            failure = (
+                "host_capacity_sample_failed:"
+                f"{type(exc).__name__}:{_safe_detail(str(exc))}"
+            )
+            with self._abort_latch.condition:
+                with self._lock:
+                    self._sampling_failures.append(
+                        {
+                            "observed_seconds": round(observed_seconds, 6),
+                            "failure": failure,
+                        }
+                    )
+                    self._failure = self._failure or failure
+                    published = self._failure
+                self._abort_latch.publish_locked(published)
+        else:
+            self._append_trusted_sample(
+                sample,
+                observed_seconds=observed_seconds,
+            )
+
+    def _append_trusted_sample(
+        self,
+        sample: dict[str, Any],
+        *,
+        observed_seconds: float,
+    ) -> int:
+        with self._abort_latch.condition:
+            with self._lock:
+                sample_index = self._append_trusted_sample_locked(
+                    sample,
+                    observed_seconds=observed_seconds,
+                )
+                failure = self._failure
+            if failure is not None:
+                self._abort_latch.publish_locked(failure)
+            return sample_index
+
+    def _append_trusted_sample_locked(
+        self,
+        sample: dict[str, Any],
+        *,
+        observed_seconds: float,
+    ) -> int:
+        sample["observed_seconds"] = round(observed_seconds, 6)
+        epochs = {
+            str(item["name"]): (
+                str(item["id"]),
+                str(item["started_at_utc"]),
+            )
+            for item in sample["containers"]
+        }
+        if self._samples:
+            gap = observed_seconds - float(self._samples[-1]["observed_seconds"])
+            if gap > self._max_gap:
+                self._failure = self._failure or "host_capacity_sample_gap"
+        if self._epochs is None:
+            self._epochs = epochs
+        elif epochs != self._epochs:
+            self._failure = self._failure or "host_capacity_epoch_changed"
+        self._samples.append(sample)
+        return len(self._samples) - 1
+
+    def evidence(self) -> dict[str, Any]:
+        with self._lock:
+            samples = [dict(item) for item in self._samples]
+            violations = [dict(item) for item in self._violations]
+            sampling_failures = [dict(item) for item in self._sampling_failures]
+            failure = self._failure
+        max_api_rss = 0
+        min_vm_available: int | None = None
+        for sample in samples:
+            for container in sample["containers"]:
+                available = int(container["docker_vm_memory_available_bytes"])
+                min_vm_available = (
+                    available
+                    if min_vm_available is None
+                    else min(min_vm_available, available)
+                )
+                if container["name"] == "mineru-api":
+                    max_api_rss = max(max_api_rss, int(container["pid1_rss_hwm_bytes"]))
+        return {
+            "schema": "mineru-host-capacity-evidence.v2",
+            "status": "pass" if failure is None and len(samples) >= 2 else "fail",
+            "failure": failure or (None if len(samples) >= 2 else "too_few_samples"),
+            "sample_interval_seconds": self._interval,
+            "max_sample_gap_seconds": self._max_gap,
+            "docker_memory_reserve_bytes": self._reserve,
+            "collector_path": MINERU_WINDOWS_COLLECTOR_PATH,
+            "collector_sha256": self._collector_sha256,
+            "windows_node_identity_sha256": self._node_identity,
+            "samples": samples,
+            "violations": violations,
+            "sampling_failures": sampling_failures,
+            "summary": {
+                "sample_count": len(samples),
+                "max_api_pid1_rss_hwm_bytes": max_api_rss,
+                "min_docker_vm_memory_available_bytes": min_vm_available,
+            },
+        }
+
+
+def _select_stage_inputs(
+    corpus: tuple[FrozenCorpusInput, ...],
+    *,
+    document_count: int,
+) -> tuple[FrozenCorpusInput, ...]:
+    if document_count not in STAGE_DOCUMENT_COUNTS:
+        raise ValueError("MinerU staged document count is not approved")
+    if len(corpus) < document_count:
+        raise ValueError("MinerU staged corpus is smaller than the requested stage")
+    selected: list[FrozenCorpusInput] = []
+    selected_hashes: set[str] = set()
+    for workload_class in ("regular", "heavy", "huge"):
+        item = next(
+            (
+                candidate
+                for candidate in corpus
+                if candidate.workload_class == workload_class
+            ),
+            None,
+        )
+        if item is None:
+            raise ValueError(f"staged corpus has no {workload_class} PDF")
+        selected.append(item)
+        selected_hashes.add(item.digest)
+    for item in corpus:
+        if len(selected) >= document_count:
+            break
+        if item.digest not in selected_hashes:
+            selected.append(item)
+            selected_hashes.add(item.digest)
+    if len(selected) != document_count:
+        raise ValueError("staged corpus cannot fill the exact selected set")
+    return tuple(selected)
 
 
 @dataclass(frozen=True)
@@ -181,10 +851,14 @@ class _OrchestratorMonitor:
         self,
         *,
         sampler: Callable[[], MinerUOrchestratorHealth],
+        task_slots: int,
+        client_outstanding_window: int,
         monotonic_clock: Callable[[], float] = time.monotonic,
         sample_interval_seconds: float = ORCHESTRATOR_SAMPLE_INTERVAL_SECONDS,
     ) -> None:
         self._sampler = sampler
+        self._task_slots = task_slots
+        self._client_outstanding_window = client_outstanding_window
         self._monotonic_clock = monotonic_clock
         self._sample_interval_seconds = sample_interval_seconds
         self._started = monotonic_clock()
@@ -233,11 +907,15 @@ class _OrchestratorMonitor:
                         self._monotonic_clock() - self._started,
                     ),
                 )
-                failure = (
-                    "orchestrator_processing_exceeded_3"
-                    if sample.processing_tasks > ORCHESTRATOR_TASK_CONCURRENCY
-                    else None
-                )
+                if sample.processing_tasks > self._task_slots:
+                    failure = "orchestrator_processing_exceeded_attested_slots"
+                elif (
+                    sample.queued_tasks + sample.processing_tasks
+                    > self._client_outstanding_window
+                ):
+                    failure = "orchestrator_active_exceeded_client_window"
+                else:
+                    failure = None
                 with self._lock:
                     self._samples.append(sample)
                     if failure is not None:
@@ -378,8 +1056,7 @@ class _MetricsMonitor:
         except Exception as exc:
             with self._lock:
                 self._failure = (
-                    "metrics_unavailable:"
-                    f"{type(exc).__name__}:{_safe_detail(str(exc))}"
+                    f"metrics_unavailable:{type(exc).__name__}:{_safe_detail(str(exc))}"
                 )
             return False
 
@@ -495,8 +1172,8 @@ def execute_fixed_stage_sequence(
     stage_runner: Callable[[int], dict[str, Any]],
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    for concurrency in STAGE_DOCUMENT_CONCURRENCIES:
-        result = stage_runner(concurrency)
+    for document_count in STAGE_DOCUMENT_COUNTS:
+        result = stage_runner(document_count)
         results.append(result)
         if result.get("status") != "pass":
             break
@@ -505,11 +1182,9 @@ def execute_fixed_stage_sequence(
 
 def _run_stage(
     *,
-    concurrency: int,
+    document_count: int,
     run_root: Path,
-    input_bytes: bytes,
-    input_digest: str,
-    input_logical_name: str,
+    corpus: tuple[FrozenCorpusInput, ...],
     mineru_bin: Path,
     api_url: str,
     inference_upstream_url: str,
@@ -518,12 +1193,23 @@ def _run_stage(
     expected_preemptions: float,
     metrics_sampler: Callable[[], MetricsSample],
     orchestrator_sampler: Callable[[], MinerUOrchestratorHealth],
-    orchestrator_idle_waiter: Callable[
-        [], tuple[MinerUOrchestratorHealth, float]
-    ],
+    orchestrator_idle_waiter: Callable[[], tuple[MinerUOrchestratorHealth, float]],
+    task_slots: int,
+    host_failure: Callable[[], str | None] = lambda: None,
+    abort_latch: _StageAbortLatch | None = None,
 ) -> dict[str, Any]:
-    if concurrency not in STAGE_DOCUMENT_CONCURRENCIES:
+    if document_count not in STAGE_DOCUMENT_COUNTS:
         raise ValueError("MinerU staged load concurrency is not an approved stage")
+    stage_inputs = _select_stage_inputs(corpus, document_count=document_count)
+    # The MinerU async API has no remote cancellation endpoint.  Keep any
+    # backlog in local durable/admission state so a host-safety failure cannot
+    # leave a queued remote document starting after admission closes.
+    client_outstanding_window = min(document_count, task_slots)
+    stage_abort_latch = abort_latch or _StageAbortLatch()
+    admission = _StageAdmission(
+        outstanding_window=client_outstanding_window,
+        abort_latch=stage_abort_latch,
+    )
     stage_started = time.monotonic()
     orchestrator_baseline, preflight_drain_seconds = orchestrator_idle_waiter()
     if orchestrator_baseline.active_tasks != 0:
@@ -531,35 +1217,53 @@ def _run_stage(
     metrics_baseline = metrics_sampler()
     if metrics_baseline.preemptions != expected_preemptions:
         return _stage_preflight_failure(
-            concurrency=concurrency,
+            concurrency=document_count,
             started=stage_started,
             metrics_baseline=metrics_baseline,
             orchestrator_baseline=orchestrator_baseline,
             preflight_drain_seconds=preflight_drain_seconds,
             failure="preemption_counter_changed_between_stages",
+            task_slots=task_slots,
         )
     if metrics_baseline.running != 0 or metrics_baseline.waiting != 0:
         return _stage_preflight_failure(
-            concurrency=concurrency,
+            concurrency=document_count,
             started=stage_started,
             metrics_baseline=metrics_baseline,
             orchestrator_baseline=orchestrator_baseline,
             preflight_drain_seconds=preflight_drain_seconds,
             failure="stage_remote_baseline_not_idle",
+            task_slots=task_slots,
         )
     metrics_monitor = _MetricsMonitor(
         sampler=metrics_sampler,
         expected_preemptions=expected_preemptions,
     )
-    orchestrator_monitor = _OrchestratorMonitor(sampler=orchestrator_sampler)
+    orchestrator_monitor = _OrchestratorMonitor(
+        sampler=orchestrator_sampler,
+        task_slots=task_slots,
+        client_outstanding_window=client_outstanding_window,
+    )
+
+    def current_abort_reason() -> str | None:
+        failure = stage_abort_latch.reason or (
+            metrics_monitor.failure
+            or orchestrator_monitor.failure
+            or host_failure()
+        )
+        if failure is not None:
+            stage_abort_latch.publish(failure)
+        return stage_abort_latch.reason
+
     outcomes: dict[int, dict[str, Any]] = {
         index: {
             "copy_index": index,
-            "logical_name": f"{input_logical_name}.copy-{index:02d}",
-            "input_sha256": f"sha256:{input_digest}",
+            "logical_name": stage_input.logical_name,
+            "input_sha256": f"sha256:{stage_input.digest}",
+            "workload_class": stage_input.workload_class,
             "status": "not_started",
         }
-        for index in range(1, concurrency + 1)
+        for index, stage_input in enumerate(stage_inputs, start=1)
     }
     failure: str | None = None
     orchestrator_terminal: MinerUOrchestratorHealth | None = None
@@ -568,37 +1272,38 @@ def _run_stage(
     api_temp_before = mineru_api_temp_dirs()
     try:
         with tempfile.TemporaryDirectory(
-            prefix=f"stage-{concurrency:02d}-",
+            prefix=f"stage-{document_count:02d}-",
             dir=run_root,
         ) as tmp:
             stage_tree = Path(tmp)
             metrics_monitor.start()
             orchestrator_monitor.start()
             with ThreadPoolExecutor(
-                max_workers=concurrency,
-                thread_name_prefix=f"mineru-stage-{concurrency}",
+                max_workers=document_count,
+                thread_name_prefix=f"mineru-stage-{document_count}",
             ) as executor:
                 futures: dict[Future[dict[str, Any]], int] = {
                     executor.submit(
-                        _parse_frozen_copy,
+                        _parse_admitted_copy,
+                        admission=admission,
+                        abort_reason=current_abort_reason,
+                        workload_class=stage_input.workload_class,
                         copy_index=index,
                         stage_root=stage_tree,
-                        input_bytes=input_bytes,
-                        input_digest=input_digest,
-                        input_logical_name=input_logical_name,
+                        input_bytes=stage_input.payload,
+                        input_digest=stage_input.digest,
+                        input_logical_name=stage_input.logical_name,
                         mineru_bin=mineru_bin,
                         api_url=api_url,
                         inference_upstream_url=inference_upstream_url,
                         runtime_identity=runtime_identity,
                         timeout_seconds=timeout_seconds,
                     ): index
-                    for index in range(1, concurrency + 1)
+                    for index, stage_input in enumerate(stage_inputs, start=1)
                 }
                 pending = set(futures)
                 while pending:
-                    monitor_failure = (
-                        metrics_monitor.failure or orchestrator_monitor.failure
-                    )
+                    monitor_failure = current_abort_reason()
                     if monitor_failure is not None:
                         failure = monitor_failure
                         break
@@ -611,19 +1316,40 @@ def _run_stage(
                         index = futures[future]
                         try:
                             outcome = future.result()
+                        except _StageAdmissionClosedError as exc:
+                            outcome = _failed_document_outcome(
+                                index,
+                                stage_inputs[index - 1].digest,
+                                exc,
+                                input_logical_name=(
+                                    stage_inputs[index - 1].logical_name
+                                ),
+                                workload_class=(
+                                    stage_inputs[index - 1].workload_class
+                                ),
+                            )
+                            outcome["status"] = "cancelled_after_stage_abort"
+                            outcome["failure_class"] = "stage_abort"
                         except Exception as exc:
                             outcome = _failed_document_outcome(
                                 index,
-                                input_digest,
+                                stage_inputs[index - 1].digest,
                                 exc,
-                                input_logical_name=input_logical_name,
+                                input_logical_name=(
+                                    stage_inputs[index - 1].logical_name
+                                ),
+                                workload_class=(
+                                    stage_inputs[index - 1].workload_class
+                                ),
                             )
                         outcomes[index] = outcome
-                        if outcome["status"] != "pass" and failure is None:
+                        if outcome["status"] == "fail" and failure is None:
                             failure = str(outcome["failure_class"])
                     if failure is not None:
+                        admission.close()
                         break
                 if failure is not None:
+                    admission.close()
                     for future in pending:
                         future.cancel()
                     terminate_active_mineru_processes()
@@ -638,9 +1364,10 @@ def _run_stage(
                 if not future.done():
                     outcomes[index] = _failed_document_outcome(
                         index,
-                        input_digest,
+                        stage_inputs[index - 1].digest,
                         RuntimeError("stage future unresolved after executor shutdown"),
-                        input_logical_name=input_logical_name,
+                        input_logical_name=stage_inputs[index - 1].logical_name,
+                        workload_class=stage_inputs[index - 1].workload_class,
                     )
                     failure = failure or "stage_future_unresolved"
                     continue
@@ -648,27 +1375,33 @@ def _run_stage(
                     continue
                 try:
                     outcome = future.result()
+                except _StageAdmissionClosedError as exc:
+                    outcome = _failed_document_outcome(
+                        index,
+                        stage_inputs[index - 1].digest,
+                        exc,
+                        input_logical_name=stage_inputs[index - 1].logical_name,
+                        workload_class=stage_inputs[index - 1].workload_class,
+                    )
+                    outcome["status"] = "cancelled_after_stage_abort"
+                    outcome["failure_class"] = "stage_abort"
                 except Exception as exc:
                     outcome = _failed_document_outcome(
                         index,
-                        input_digest,
+                        stage_inputs[index - 1].digest,
                         exc,
-                        input_logical_name=input_logical_name,
+                        input_logical_name=stage_inputs[index - 1].logical_name,
+                        workload_class=stage_inputs[index - 1].workload_class,
                     )
-                if (
-                    failure is not None
-                    and outcome.get("failure_detail", "").startswith(
-                        "ParserCancelledError:"
-                    )
+                if failure is not None and outcome.get("failure_detail", "").startswith(
+                    "ParserCancelledError:"
                 ):
                     outcome["status"] = "cancelled_after_stage_abort"
                     outcome["failure_class"] = "stage_abort"
                 outcomes[index] = outcome
     finally:
         try:
-            orchestrator_terminal, terminal_drain_seconds = (
-                orchestrator_idle_waiter()
-            )
+            orchestrator_terminal, terminal_drain_seconds = orchestrator_idle_waiter()
         except Exception as exc:
             failure = failure or (
                 "orchestrator_terminal_drain_failed:"
@@ -694,8 +1427,7 @@ def _run_stage(
         remaining_processes = {}
         new_api_temp_dirs = set()
         cleanup_observation_error = (
-            "cleanup_observation_failed:"
-            f"{type(exc).__name__}:{_safe_detail(str(exc))}"
+            f"cleanup_observation_failed:{type(exc).__name__}:{_safe_detail(str(exc))}"
         )
     metrics_samples = metrics_monitor.samples
     if metrics_monitor.failure is not None and failure is None:
@@ -723,19 +1455,25 @@ def _run_stage(
     ):
         failure = "stage_metrics_observed_no_load_activity"
     orchestrator_failure = _orchestrator_evidence_failure(
-        concurrency=concurrency,
         baseline=orchestrator_baseline,
         samples=orchestrator_monitor.samples,
         terminal=orchestrator_terminal,
+        task_slots=task_slots,
+        client_outstanding_window=client_outstanding_window,
     )
     if failure is None and orchestrator_failure is not None:
         failure = orchestrator_failure
     return {
-        "client_document_concurrency": concurrency,
-        "orchestrator_task_concurrency": ORCHESTRATOR_TASK_CONCURRENCY,
+        "stage_document_count": document_count,
+        "client_outstanding_window": client_outstanding_window,
+        "peak_client_outstanding": admission.peak,
+        "selection_profile": "per_stage_regular_heavy_huge.v1",
+        "orchestrator_task_concurrency": task_slots,
         "orchestrator_inference_concurrency": ORCHESTRATOR_INFERENCE_CONCURRENCY,
         "effective_inference_request_upper_bound": (
-            EFFECTIVE_INFERENCE_REQUEST_UPPER_BOUND
+            task_slots * ORCHESTRATOR_INFERENCE_CONCURRENCY
+            if task_slots is not None
+            else None
         ),
         "status": "pass" if failure is None else "fail",
         "failure": failure,
@@ -775,13 +1513,17 @@ def _stage_preflight_failure(
     orchestrator_baseline: MinerUOrchestratorHealth,
     preflight_drain_seconds: float,
     failure: str,
+    task_slots: int,
 ) -> dict[str, Any]:
     return {
-        "client_document_concurrency": concurrency,
-        "orchestrator_task_concurrency": ORCHESTRATOR_TASK_CONCURRENCY,
+        "stage_document_count": concurrency,
+        "client_outstanding_window": min(concurrency, task_slots),
+        "peak_client_outstanding": 0,
+        "selection_profile": "per_stage_regular_heavy_huge.v1",
+        "orchestrator_task_concurrency": task_slots,
         "orchestrator_inference_concurrency": ORCHESTRATOR_INFERENCE_CONCURRENCY,
         "effective_inference_request_upper_bound": (
-            EFFECTIVE_INFERENCE_REQUEST_UPPER_BOUND
+            task_slots * ORCHESTRATOR_INFERENCE_CONCURRENCY
         ),
         "status": "fail",
         "failure": failure,
@@ -804,6 +1546,42 @@ def _stage_preflight_failure(
             "observation_error": None,
         },
     }
+
+
+def _parse_admitted_copy(
+    *,
+    admission: _StageAdmission,
+    abort_reason: Callable[[], str | None],
+    workload_class: str,
+    copy_index: int,
+    stage_root: Path,
+    input_bytes: bytes,
+    input_digest: str,
+    input_logical_name: str,
+    mineru_bin: Path,
+    api_url: str,
+    inference_upstream_url: str,
+    runtime_identity: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    outcome = admission.run(
+        workload_class=workload_class,
+        abort_reason=abort_reason,
+        operation=lambda: _parse_frozen_copy(
+            copy_index=copy_index,
+            stage_root=stage_root,
+            input_bytes=input_bytes,
+            input_digest=input_digest,
+            input_logical_name=input_logical_name,
+            mineru_bin=mineru_bin,
+            api_url=api_url,
+            inference_upstream_url=inference_upstream_url,
+            runtime_identity=runtime_identity,
+            timeout_seconds=timeout_seconds,
+        ),
+    )
+    outcome["workload_class"] = workload_class
+    return outcome
 
 
 def _parse_frozen_copy(
@@ -857,14 +1635,13 @@ def _parse_frozen_copy(
         provider = result.provider_document
         if len(provider.pages) < MINIMUM_INPUT_PAGES:
             raise ValueError(
-                "staged-load input must produce at least "
-                f"{MINIMUM_INPUT_PAGES} pages"
+                f"staged-load input must produce at least {MINIMUM_INPUT_PAGES} pages"
             )
         if provider.parser_version != "3.4.4":
             raise ValueError("staged-load parser version drifted")
         return {
             "copy_index": copy_index,
-            "logical_name": f"{input_logical_name}.copy-{copy_index:02d}",
+            "logical_name": input_logical_name,
             "input_sha256": f"sha256:{input_digest}",
             "status": "pass",
             "elapsed_seconds": round(time.monotonic() - started, 3),
@@ -888,13 +1665,14 @@ def _failed_document_outcome(
     exc: Exception,
     *,
     input_logical_name: str = "frozen-input.pdf",
+    workload_class: str | None = None,
     started: float | None = None,
 ) -> dict[str, Any]:
     raw_detail = f"{type(exc).__name__}:{' '.join(str(exc).split())}"
     detail = _safe_detail(raw_detail)
-    return {
+    outcome = {
         "copy_index": copy_index,
-        "logical_name": f"{input_logical_name}.copy-{copy_index:02d}",
+        "logical_name": input_logical_name,
         "input_sha256": f"sha256:{input_digest}",
         "status": "fail",
         # Classify the complete normalized diagnostic before rendering the
@@ -910,6 +1688,9 @@ def _failed_document_outcome(
             round(time.monotonic() - started, 3) if started is not None else None
         ),
     }
+    if workload_class is not None:
+        outcome["workload_class"] = workload_class
+    return outcome
 
 
 def _classify_failure(detail: str) -> str:
@@ -926,7 +1707,9 @@ def _classify_failure(detail: str) -> str:
         ("http error 5", "remote_5xx"),
         ("status code: [5", "remote_5xx"),
     )
-    return next((label for marker, label in markers if marker in lowered), "parse_failure")
+    return next(
+        (label for marker, label in markers if marker in lowered), "parse_failure"
+    )
 
 
 def _metrics_summary(
@@ -961,42 +1744,39 @@ def _metrics_summary(
             for name in ("running", "waiting", "preemptions", "kv_cache")
         },
         "percentiles": {
-            f"{name}_p95": p95(name)
-            for name in ("running", "waiting", "kv_cache")
+            f"{name}_p95": p95(name) for name in ("running", "waiting", "kv_cache")
         },
     }
 
 
 def _orchestrator_evidence_failure(
     *,
-    concurrency: int,
     baseline: MinerUOrchestratorHealth,
     samples: tuple[OrchestratorSample, ...],
     terminal: MinerUOrchestratorHealth | None,
+    task_slots: int,
+    client_outstanding_window: int,
 ) -> str | None:
+    if baseline.active_tasks != 0:
+        return "orchestrator_baseline_not_idle"
     if terminal is None:
         return "orchestrator_terminal_health_missing"
     if terminal.active_tasks != 0:
         return "orchestrator_terminal_not_idle"
-    if terminal.completed_tasks - baseline.completed_tasks != concurrency:
-        return "orchestrator_completed_delta_mismatch"
-    if terminal.failed_tasks - baseline.failed_tasks != 0:
-        return "orchestrator_failed_delta_changed"
     observed = (
         OrchestratorSample.from_health(baseline, observed_seconds=0.0),
         *samples,
         OrchestratorSample.from_health(terminal, observed_seconds=0.0),
     )
-    if max(sample.processing_tasks for sample in observed) > (
-        ORCHESTRATOR_TASK_CONCURRENCY
+    if max(sample.processing_tasks for sample in observed) > task_slots:
+        return "orchestrator_processing_exceeded_attested_slots"
+    if (
+        max(sample.queued_tasks + sample.processing_tasks for sample in observed)
+        > client_outstanding_window
     ):
-        return "orchestrator_processing_exceeded_3"
+        return "orchestrator_active_exceeded_client_window"
     if not samples or max(sample.processing_tasks for sample in samples) == 0:
         return "orchestrator_observed_no_processing_activity"
-    if concurrency in (8, 16) and max(
-        sample.queued_tasks for sample in samples
-    ) == 0:
-        return "orchestrator_queue_not_observed"
     return None
 
 
@@ -1017,26 +1797,15 @@ def _orchestrator_summary(
             *observed,
             OrchestratorSample.from_health(
                 terminal,
-                observed_seconds=(
-                    samples[-1].observed_seconds if samples else 0.0
-                ),
+                observed_seconds=(samples[-1].observed_seconds if samples else 0.0),
             ),
         )
     return {
+        "task_registry_semantics": TASK_REGISTRY_SEMANTICS,
         "baseline": baseline.as_dict(),
         "samples": [sample.to_payload() for sample in samples],
         "sample_count": len(samples),
         "terminal": terminal.as_dict() if terminal is not None else None,
-        "completed_delta": (
-            terminal.completed_tasks - baseline.completed_tasks
-            if terminal is not None
-            else None
-        ),
-        "failed_delta": (
-            terminal.failed_tasks - baseline.failed_tasks
-            if terminal is not None
-            else None
-        ),
         "terminal_active_tasks": (
             terminal.active_tasks if terminal is not None else None
         ),
@@ -1143,12 +1912,111 @@ def _verify_endpoint_identity(
         raise ValueError(f"runtime manifest topology {field} drifted")
 
 
+def _workload_class(page_count: int) -> str:
+    if page_count >= 500:
+        return "huge"
+    if page_count >= 80:
+        return "heavy"
+    return "regular"
+
+
+def _load_frozen_corpus(
+    manifest_path: Path,
+    *,
+    expected_identity_sha256: str,
+) -> tuple[tuple[FrozenCorpusInput, ...], dict[str, object]]:
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("frozen corpus manifest is missing or unsafe")
+    payload = json.loads(manifest_path.read_bytes())
+    if not isinstance(payload, dict) or set(payload) != {"schema", "documents"}:
+        raise ValueError("frozen corpus manifest fields are not closed")
+    if payload.get("schema") != CORPUS_SCHEMA:
+        raise ValueError(f"frozen corpus schema must be {CORPUS_SCHEMA}")
+    documents = payload.get("documents")
+    if not isinstance(documents, list) or len(documents) < MINIMUM_CORPUS_DOCUMENTS:
+        raise ValueError(
+            f"frozen corpus requires at least {MINIMUM_CORPUS_DOCUMENTS} documents"
+        )
+    frozen: list[FrozenCorpusInput] = []
+    seen_names: set[str] = set()
+    seen_hashes: set[str] = set()
+    for index, item in enumerate(documents, start=1):
+        if not isinstance(item, dict) or set(item) != {
+            "logical_name",
+            "path",
+            "sha256",
+        }:
+            raise ValueError(f"frozen corpus document {index} fields drifted")
+        logical_name = item.get("logical_name")
+        path_value = item.get("path")
+        sha256_value = item.get("sha256")
+        if (
+            not isinstance(logical_name, str)
+            or not logical_name
+            or "/" in logical_name
+            or "\\" in logical_name
+            or not isinstance(path_value, str)
+            or not path_value
+            or not isinstance(sha256_value, str)
+        ):
+            raise ValueError(f"frozen corpus document {index} is invalid")
+        path = Path(path_value)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"frozen corpus document {index} is missing or unsafe")
+        content = path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        if _normalized_sha256(sha256_value) != digest:
+            raise ValueError(f"frozen corpus document {index} hash drifted")
+        if logical_name in seen_names or digest in seen_hashes:
+            raise ValueError("frozen corpus names and hashes must be unique")
+        page_count = count_pdf_pages(path)
+        if page_count < 1:
+            raise ValueError(f"frozen corpus document {index} has no pages")
+        seen_names.add(logical_name)
+        seen_hashes.add(digest)
+        frozen.append(
+            FrozenCorpusInput(
+                logical_name=logical_name,
+                payload=content,
+                digest=digest,
+                page_count=page_count,
+                workload_class=_workload_class(page_count),
+            )
+        )
+    classes = {item.workload_class for item in frozen}
+    if not {"regular", "heavy", "huge"}.issubset(classes):
+        raise ValueError("frozen corpus must include regular, heavy and huge PDFs")
+    canonical_documents = [item.evidence() for item in frozen]
+    canonical = {"schema": CORPUS_SCHEMA, "documents": canonical_documents}
+    identity = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                canonical,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    if _normalized_sha256(expected_identity_sha256) != identity.removeprefix("sha256:"):
+        raise ValueError("frozen corpus identity drifted")
+    return tuple(frozen), {
+        "profile": "operator_frozen_heterogeneous_v2",
+        "logical_name": manifest_path.name,
+        "sha256": identity,
+        "bytes": sum(len(item.payload) for item in frozen),
+        "minimum_required_pages": MINIMUM_INPUT_PAGES,
+        "documents": canonical_documents,
+    }
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="mineru_staged_load", description=__doc__)
     parser.add_argument("--runtime-manifest", type=Path, required=True)
     parser.add_argument("--receipt-out", type=Path, required=True)
-    parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--expected-input-sha256", required=True)
+    parser.add_argument("--corpus-manifest", type=Path, required=True)
+    parser.add_argument("--expected-corpus-sha256", required=True)
     parser.add_argument("--mineru-bin", type=Path)
     parser.add_argument("--api-url")
     parser.add_argument("--observability-url")
@@ -1156,13 +2024,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--runtime-bundle-identity")
     parser.add_argument("--work-root", type=Path)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--host-observer-ssh-host")
+    parser.add_argument("--host-observer-ssh-user")
+    parser.add_argument("--host-observer-ssh-port", type=int, default=22)
+    parser.add_argument("--host-observer-identity-file", type=Path)
+    parser.add_argument("--host-observer-known-hosts-file", type=Path)
+    parser.add_argument("--docker-memory-reserve-bytes", type=int)
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv)
-    if args.receipt_out.exists() or args.receipt_out.is_symlink():
-        raise SystemExit(f"[abort] output already exists; stale evidence: {args.receipt_out}")
+def _resolve_staged_preflight(
+    args: argparse.Namespace,
+) -> tuple[
+    Path,
+    str,
+    str,
+    str,
+    str,
+    tuple[FrozenCorpusInput, ...],
+    dict[str, object],
+]:
     mineru_bin = args.mineru_bin or (
         Path(value) if (value := os.environ.get("DISCLOSURE_MINERU_BIN")) else None
     )
@@ -1177,27 +2058,59 @@ def main(argv: list[str] | None = None) -> int:
         "DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256"
     )
     if mineru_bin is None or not mineru_bin.is_file():
-        raise SystemExit("[abort] DISCLOSURE_MINERU_BIN is missing or not a file")
+        raise ValueError("DISCLOSURE_MINERU_BIN is missing or not a file")
     if not api_url or not observability_url or not inference_upstream_url:
-        raise SystemExit("[abort] complete MinerU fixed-API topology is required")
+        raise ValueError("complete MinerU fixed-API topology is required")
     if not _is_prefixed_sha256(runtime_identity):
-        raise SystemExit("[abort] runtime bundle identity is missing or invalid")
+        raise ValueError("runtime bundle identity is missing or invalid")
     if args.work_root is not None and not args.work_root.is_dir():
-        raise SystemExit(f"[abort] work-root is not a directory: {args.work_root}")
+        raise ValueError(f"work-root is not a directory: {args.work_root}")
     if args.timeout_seconds < 1:
-        raise SystemExit("[abort] timeout-seconds must be positive")
+        raise ValueError("timeout-seconds must be positive")
+    if (
+        not args.host_observer_ssh_host
+        or not args.host_observer_ssh_user
+        or args.host_observer_identity_file is None
+        or args.host_observer_known_hosts_file is None
+        or isinstance(args.docker_memory_reserve_bytes, bool)
+        or not isinstance(args.docker_memory_reserve_bytes, int)
+        or args.docker_memory_reserve_bytes < 1
+    ):
+        raise ValueError(
+            "pinned host observer SSH and a positive Docker memory reserve are required"
+        )
     if os.environ.get("MINERU_PROCESSING_WINDOW_SIZE") != str(
         MINERU_PROCESSING_WINDOW_SIZE
     ):
-        raise SystemExit("[abort] MINERU_PROCESSING_WINDOW_SIZE must be 16")
-    if args.input.is_symlink() or not args.input.is_file():
-        raise SystemExit(f"[abort] frozen input is missing or unsafe: {args.input}")
-    input_bytes = args.input.read_bytes()
-    input_digest = hashlib.sha256(input_bytes).hexdigest()
-    if _normalized_sha256(args.expected_input_sha256) != input_digest:
-        raise SystemExit("[abort] frozen input hash drifted")
-    input_sha256 = f"sha256:{input_digest}"
+        raise ValueError("MINERU_PROCESSING_WINDOW_SIZE must be 16")
+    try:
+        corpus, corpus_evidence = _load_frozen_corpus(
+            args.corpus_manifest,
+            expected_identity_sha256=args.expected_corpus_sha256,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"frozen heterogeneous corpus is invalid: {exc}") from exc
+    assert isinstance(api_url, str)
+    assert isinstance(observability_url, str)
+    assert isinstance(inference_upstream_url, str)
+    assert isinstance(runtime_identity, str)
+    return (
+        mineru_bin,
+        api_url,
+        observability_url,
+        inference_upstream_url,
+        runtime_identity,
+        corpus,
+        corpus_evidence,
+    )
 
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    if args.receipt_out.exists() or args.receipt_out.is_symlink():
+        raise SystemExit(
+            f"[abort] output already exists; stale evidence: {args.receipt_out}"
+        )
     started = time.monotonic()
     started_at = datetime.now(UTC).isoformat()
     stage_results: list[dict[str, Any]] = []
@@ -1211,7 +2124,30 @@ def main(argv: list[str] | None = None) -> int:
     cleanup_observation_error: str | None = None
     api_temp_dirs_created = 0
     api_temp_cleanup_errors: list[str] = []
+    task_slots: int | None = None
+    mineru_bin: Path | None = None
+    api_url: str | None = None
+    observability_url: str | None = None
+    inference_upstream_url: str | None = None
+    runtime_identity: str | None = None
+    corpus: tuple[FrozenCorpusInput, ...] = ()
+    corpus_evidence: dict[str, object] = {}
+    failure_phase = "preflight_configuration"
+    runtime_cleanup_armed = False
+    host_monitor: _HostCapacityMonitor | None = None
+    run_abort_latch = _StageAbortLatch()
+    host_capacity_evidence: dict[str, Any] = {}
     try:
+        (
+            mineru_bin,
+            api_url,
+            observability_url,
+            inference_upstream_url,
+            runtime_identity,
+            corpus,
+            corpus_evidence,
+        ) = _resolve_staged_preflight(args)
+        failure_phase = "runtime_preflight"
         api_temp_before = mineru_api_temp_dirs()
         if api_temp_before:
             raise RuntimeError(
@@ -1226,6 +2162,8 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(
                 f"pre-existing MinerU processes require cleanup: {sorted(existing_mineru)}"
             )
+        runtime_cleanup_armed = True
+        failure_phase = "runtime_identity"
         local_client = client_bundle_identity(mineru_bin)
         code_digest = writer_code_digest()
         manifest_payload = json.loads(args.runtime_manifest.read_bytes())
@@ -1252,7 +2190,35 @@ def main(argv: list[str] | None = None) -> int:
             field="inference_upstream_sha256",
             url=inference_upstream_url,
         )
+        collector_sha256 = topology["windows_collector_sha256"]
+        windows_node_identity_sha256 = topology[
+            "windows_node_identity_sha256"
+        ]
+        ssh_command = _host_observer_ssh_base(
+            host=args.host_observer_ssh_host,
+            user=args.host_observer_ssh_user,
+            port=args.host_observer_ssh_port,
+            identity_file=args.host_observer_identity_file,
+            known_hosts_file=args.host_observer_known_hosts_file,
+        )
+        host_monitor = _HostCapacityMonitor(
+            sampler=lambda: _fetch_host_capacity_sample(
+                ssh_command,
+                expected_collector_sha256=collector_sha256,
+                expected_windows_node_identity_sha256=(
+                    windows_node_identity_sha256
+                ),
+                docker_memory_reserve_bytes=args.docker_memory_reserve_bytes,
+            ),
+            collector_sha256=collector_sha256,
+            windows_node_identity_sha256=windows_node_identity_sha256,
+            docker_memory_reserve_bytes=args.docker_memory_reserve_bytes,
+            abort_latch=run_abort_latch,
+        )
+        failure_phase = "host_capacity_observer"
+        host_monitor.start()
         orchestrator_manifest = verified.manifest["orchestrator"]
+        task_slots = verified.max_concurrent_requests
         expected_task_retention_seconds = int(
             orchestrator_manifest["task_retention_seconds"]
         )
@@ -1277,90 +2243,100 @@ def main(argv: list[str] | None = None) -> int:
             ),
             "provider_runtime_identity_sha256": verified.provider_identity_sha256,
             "served_model_id": verified.served_model_id,
+            "orchestrator_task_slots": task_slots,
         }
+        failure_phase = "staged_load"
         with tempfile.TemporaryDirectory(
             prefix="disclosure-mineru-staged-load-",
             dir=args.work_root,
         ) as tmp:
             run_tree = Path(tmp)
             stage_results = execute_fixed_stage_sequence(
-                lambda concurrency: _run_stage(
-                    concurrency=concurrency,
+                lambda document_count: _run_stage(
+                    document_count=document_count,
                     run_root=run_tree,
-                    input_bytes=input_bytes,
-                    input_digest=input_digest,
-                    input_logical_name=args.input.name,
+                    corpus=corpus,
                     mineru_bin=mineru_bin,
                     api_url=api_url,
                     inference_upstream_url=inference_upstream_url,
                     runtime_identity=str(runtime_identity),
                     timeout_seconds=args.timeout_seconds,
+                    task_slots=task_slots,
                     expected_preemptions=global_metrics_baseline.preemptions,
                     metrics_sampler=lambda: fetch_vllm_metrics(observability_url),
-                    orchestrator_sampler=lambda: (
-                        fetch_mineru_orchestrator_health(
-                            api_url,
-                            expected_task_retention_seconds=(
-                                expected_task_retention_seconds
-                            ),
-                            expected_cleanup_interval_seconds=(
-                                expected_cleanup_interval_seconds
-                            ),
-                        )
+                    orchestrator_sampler=lambda: fetch_mineru_orchestrator_health(
+                        api_url,
+                        expected_task_slots=task_slots,
+                        expected_task_retention_seconds=(
+                            expected_task_retention_seconds
+                        ),
+                        expected_cleanup_interval_seconds=(
+                            expected_cleanup_interval_seconds
+                        ),
                     ),
-                    orchestrator_idle_waiter=lambda: (
-                        wait_for_mineru_orchestrator_idle(
-                            api_url,
-                            timeout_seconds=args.timeout_seconds,
-                            expected_task_retention_seconds=(
-                                expected_task_retention_seconds
-                            ),
-                            expected_cleanup_interval_seconds=(
-                                expected_cleanup_interval_seconds
-                            ),
-                        )
+                    orchestrator_idle_waiter=lambda: wait_for_mineru_orchestrator_idle(
+                        api_url,
+                        timeout_seconds=args.timeout_seconds,
+                        expected_task_slots=task_slots,
+                        expected_task_retention_seconds=(
+                            expected_task_retention_seconds
+                        ),
+                        expected_cleanup_interval_seconds=(
+                            expected_cleanup_interval_seconds
+                        ),
                     ),
+                    host_failure=lambda: host_monitor.failure,
+                    abort_latch=run_abort_latch,
                 )
             )
-        if len(stage_results) != len(STAGE_DOCUMENT_CONCURRENCIES) or any(
+        if len(stage_results) != len(STAGE_DOCUMENT_COUNTS) or any(
             result.get("status") != "pass" for result in stage_results
         ):
             failure = "staged_load_stopped_before_all_fixed_stages_passed"
+        else:
+            failure_phase = "complete"
     except Exception as exc:
         failure = f"{type(exc).__name__}:{_safe_detail(str(exc))}"
     finally:
-        try:
-            remaining_processes = _wait_for_process_cleanup()
-            if remaining_processes:
-                terminate_active_mineru_processes()
+        if host_monitor is not None:
+            host_monitor.stop()
+            host_capacity_evidence = host_monitor.evidence()
+            if host_capacity_evidence.get("status") != "pass":
+                failure_phase = "host_capacity_observer"
+                failure = failure or str(host_capacity_evidence.get("failure"))
+        if runtime_cleanup_armed:
+            try:
                 remaining_processes = _wait_for_process_cleanup()
-            created_api_temp_dirs = mineru_api_temp_dirs() - api_temp_before
-            api_temp_dirs_created = len(created_api_temp_dirs)
-            if not remaining_processes:
-                api_temp_cleanup_errors = _remove_api_temp_dirs(
-                    created_api_temp_dirs
+                if remaining_processes:
+                    terminate_active_mineru_processes()
+                    remaining_processes = _wait_for_process_cleanup()
+                created_api_temp_dirs = mineru_api_temp_dirs() - api_temp_before
+                api_temp_dirs_created = len(created_api_temp_dirs)
+                if not remaining_processes:
+                    api_temp_cleanup_errors = _remove_api_temp_dirs(
+                        created_api_temp_dirs
+                    )
+                new_api_temp_dirs = mineru_api_temp_dirs() - api_temp_before
+                temporary_tree_removed = run_tree is None or not run_tree.exists()
+            except Exception as exc:
+                cleanup_observation_error = (
+                    "cleanup_observation_failed:"
+                    f"{type(exc).__name__}:{_safe_detail(str(exc))}"
                 )
-            new_api_temp_dirs = mineru_api_temp_dirs() - api_temp_before
-            temporary_tree_removed = run_tree is None or not run_tree.exists()
-        except Exception as exc:
-            cleanup_observation_error = (
-                "cleanup_observation_failed:"
-                f"{type(exc).__name__}:{_safe_detail(str(exc))}"
-            )
-            failure = failure or cleanup_observation_error
-        if (
-            remaining_processes
-            or new_api_temp_dirs
-            or api_temp_cleanup_errors
-            or not temporary_tree_removed
-        ):
-            cleanup_failure = (
-                f"cleanup_failed:pids={sorted(remaining_processes)}:"
-                f"temp_dirs={len(new_api_temp_dirs)}:"
-                f"temp_cleanup_errors={len(api_temp_cleanup_errors)}:"
-                f"tree={temporary_tree_removed}"
-            )
-            failure = failure or cleanup_failure
+                failure = failure or cleanup_observation_error
+            if (
+                remaining_processes
+                or new_api_temp_dirs
+                or api_temp_cleanup_errors
+                or not temporary_tree_removed
+            ):
+                cleanup_failure = (
+                    f"cleanup_failed:pids={sorted(remaining_processes)}:"
+                    f"temp_dirs={len(new_api_temp_dirs)}:"
+                    f"temp_cleanup_errors={len(api_temp_cleanup_errors)}:"
+                    f"tree={temporary_tree_removed}"
+                )
+                failure = failure or cleanup_failure
 
     receipt_status = "pass" if failure is None else "fail"
     receipt = {
@@ -1371,34 +2347,36 @@ def main(argv: list[str] | None = None) -> int:
         "finished_at_utc": datetime.now(UTC).isoformat(),
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "topology": {
-            "api_endpoint_sha256": "sha256:" + _endpoint_sha256(api_url),
+            "api_endpoint_sha256": (
+                "sha256:" + _endpoint_sha256(api_url) if api_url else None
+            ),
             "observability_endpoint_sha256": (
                 "sha256:" + _endpoint_sha256(observability_url)
+                if observability_url
+                else None
             ),
             "inference_upstream_sha256": (
                 "sha256:" + _endpoint_sha256(inference_upstream_url)
+                if inference_upstream_url
+                else None
             ),
         },
         "database_access": "none",
         "queue_access": "none",
-        "fixed_stage_client_document_concurrency": list(
-            STAGE_DOCUMENT_CONCURRENCIES
-        ),
-        "orchestrator_task_concurrency": ORCHESTRATOR_TASK_CONCURRENCY,
+        "fixed_stage_document_counts": list(STAGE_DOCUMENT_COUNTS),
+        "orchestrator_task_concurrency": task_slots,
         "orchestrator_inference_concurrency": ORCHESTRATOR_INFERENCE_CONCURRENCY,
         "effective_inference_request_upper_bound": (
-            EFFECTIVE_INFERENCE_REQUEST_UPPER_BOUND
+            task_slots * ORCHESTRATOR_INFERENCE_CONCURRENCY
+            if task_slots is not None
+            else None
         ),
-        "input": {
-            "profile": "operator_frozen_representative_v1",
-            "logical_name": args.input.name,
-            "sha256": input_sha256,
-            "bytes": len(input_bytes),
-            "minimum_required_pages": MINIMUM_INPUT_PAGES,
-        },
+        "input": corpus_evidence,
         "identity": identity_payload,
+        "host_capacity": host_capacity_evidence,
         "stages": stage_results,
         "failure": failure,
+        "failure_phase": failure_phase if failure is not None else None,
         "cleanup": {
             "external_api_temp_dirs_created": api_temp_dirs_created,
             "external_api_temp_dirs_after": len(new_api_temp_dirs),
@@ -1411,7 +2389,7 @@ def main(argv: list[str] | None = None) -> int:
     _write_new_json(args.receipt_out, receipt)
     print(
         f"mineru-staged-load: {receipt_status.upper()} "
-        f"stages={len(stage_results)}/{len(STAGE_DOCUMENT_CONCURRENCIES)} "
+        f"stages={len(stage_results)}/{len(STAGE_DOCUMENT_COUNTS)} "
         f"receipt={args.receipt_out}"
     )
     return 0 if failure is None else 2
@@ -1421,17 +2399,19 @@ def _is_prefixed_sha256(value: object) -> bool:
     if not isinstance(value, str) or not value.startswith("sha256:"):
         return False
     digest = value.removeprefix("sha256:")
-    return len(digest) == 64 and all(character in "0123456789abcdef" for character in digest)
+    return len(digest) == 64 and all(
+        character in "0123456789abcdef" for character in digest
+    )
 
 
 def _normalized_sha256(value: object) -> str:
     if not isinstance(value, str):
-        raise SystemExit("[abort] expected input SHA-256 is invalid")
+        raise ValueError("expected input SHA-256 is invalid")
     digest = value.removeprefix("sha256:")
     if len(digest) != 64 or any(
         character not in "0123456789abcdef" for character in digest
     ):
-        raise SystemExit("[abort] expected input SHA-256 is invalid")
+        raise ValueError("expected input SHA-256 is invalid")
     return digest
 
 

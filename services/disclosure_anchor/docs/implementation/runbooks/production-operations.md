@@ -109,8 +109,9 @@ bootout 新 job、恢复旧 plist 和原 disabled 状态。恢复后用上面两
 
 parser target 契约要求 `DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256`
 （否则 parse 在 parser_identity 阶段 fail loud）。它必须来自 operator/provider 保存于仓外的
-canonical runtime manifest v3，分别绑定本地 client、固定 MinerU API orchestrator、vLLM inference
-server 与网络 topology。它至少包含两个 immutable image digest、模型仓库与不可变 revision、served
+canonical runtime manifest v5，分别绑定本地 client、固定 MinerU API orchestrator、vLLM inference
+server 与网络 topology。它至少包含 derived API image、原始 base image 和 inference image 三个
+immutable digest、模型仓库与不可变 revision、served
 model ID、两侧配置/env/mount/network policy hash，以及 pinned SSH host-key 与 Windows node identity；以 sorted-key、
 UTF-8、无多余空白的 canonical JSON 对 `manifest` 对象计算 hash 后
 写入 worker.env。`scripts/attest_mineru_runtime.py --mineru-bin "$DISCLOSURE_MINERU_BIN"`
@@ -123,8 +124,8 @@ fresh deployment 必须先在 worker/GC 保持 unloaded + persistently disabled 
 
 ```bash
 make mineru-smoke \
-  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v3.json \
-  RECEIPT=/private/path/mineru-smoke-receipt.v2.json \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v5.json \
+  RECEIPT=/private/path/mineru-smoke-receipt.v4.json \
   CANARY_CACHE=/private/path/mineru-canary.v2.json
 ```
 
@@ -133,9 +134,10 @@ make mineru-smoke \
 固定页窗口与 writer code digest，以及远端 immutable
 API image/config/env/mount/network、inference image/model/config/env、live served model ID、唯一出现的
 `max_num_seqs=128` 与 `mm_processor_cache_gb=0`，并要求 API health 固定为 MinerU 3.4.4/protocol 2、
-task slots=3、window=16、retention=600s、cleanup=30s。它连续三次走 96×48 `M7` PNG 的精确 OCR
+task slots 必须等于 manifest/worker profile（当前 30 GiB Windows profile 为 1）、window=16、retention=600s、cleanup=30s。它连续三次走 96×48 `M7` PNG 的精确 OCR
 多模态请求，再通过固定 API 对冻结单页 PDF 跑一次官方 full-PDF Hybrid-medium writer/artifact reader。
-API 完成数必须恰好 +1、失败数不变且终态 queued=processing=0。独立 `TMPDIR`、MinerU 进程和
+API before/after 必须原样保留 retained terminal gauges 且两端 queued=processing=0；smoke 成功由
+official writer、ProviderDocument 和清理证据证明，不对 completed/failed 人口 gauge 做差值推断。独立 `TMPDIR`、MinerU 进程和
 外部 `mineru-api-client-*` 差集
 必须在 PASS 前都证明为零，只保留新建且路径不同的显式 receipt/cache；已有输出路径会 fail closed，
 不能覆盖旧 PASS。smoke 成功只产生 bootstrap 证据，此时仍不得启动 worker；先继续完成下述
@@ -152,61 +154,107 @@ cache 代替。租约只裁决一次 process composition，避免一个健康多
 owner 退出后仍须重新证明 API idle、精确模型身份和稳定 incident generation 才能恢复。transport、
 408/429/500/502/503/504 与截断响应进入有界退避；4xx/501、schema/version/capacity/model drift 仍
 fail closed。这些 live probe 不是逐文档 full OCR，也不能替代部署 smoke。
-v3 manifest 是闭合字段合同且会内嵌到 mode 0600 的私有 receipt；其中只能存不可变身份、hash 与
+v5 manifest 是闭合字段合同且会内嵌到 mode 0600 的私有 receipt；其中只能存不可变身份、hash 与
 非秘密启动参数，command 出现 credential flag 会 fail closed，原始 token/密码不得进入 manifest。
+
+MinerU 3.4.4 在 WSL/FastAPI 连续处理大 PDF 后可能把已经 free 的 glibc arena 长期保留在 API
+PID1 RSS；本机真实 heavy 文档已复现该行为，与上游
+[issue #5313](https://github.com/opendatalab/MinerU/issues/5313) 的现场一致。当前使用一个临时、
+精确源码兼容层，而不是复制未合并的 [PR #5354](https://github.com/opendatalab/MinerU/pull/5354)：
+derived image 固定 base digest、MinerU 版本和三个源文件 preimage hash，只在每个处理窗口及文档
+final cleanup 后显式调用 glibc `malloc_trim(0)`；开关必须为闭合值，启用时缺少 glibc/hook 会
+fail loud。collector、install receipt 和 manifest v5 同时绑定 patcher/Dockerfile hash、derived
+image ID、base digest、策略名、patched source hash 与 live hook；任一漂移都拒绝准入。它不改变
+解析语义、页窗口或并发，只把 allocator 可归还的空闲页返还给 OS；上游正式修复合并并通过同一
+held-out 验收后，应删除这个兼容层而不是永久形成私有 fork。
+
+首次安装或兼容层字节变化时，先把 compose、collector、`Dockerfile` 和 patcher 四份已审阅
+文件复制到 Windows 同一临时发布目录，再在 worker/GC disabled、API/vLLM idle、旧证据已保存的
+条件下运行版本化安装器：
+
+```powershell
+& C:\path\to\install_mineru_fixed_api.ps1 `
+  -ComposeSource C:\path\to\release\mineru-windows.compose.yaml `
+  -CollectorSource C:\path\to\release\collect_mineru_runtime.ps1 `
+  -CompatDockerfileSource C:\path\to\release\mineru_heap_trim_compat\Dockerfile `
+  -CompatPatcherSource C:\path\to\release\mineru_heap_trim_compat\patch_mineru_344.py
+```
+
+安装器在改 live compose 前先校验 base image、旧 API/vLLM idle、四个 source、compose config，
+并以 `--pull=false` 构建和验证唯一临时 tag；完成 target writable/output-root 预检并保存旧
+stable tag→image ID 后，才把固定发布 tag 原子指向新 image。随后只写固定 compose 以及
+`C:\ProgramData\agent-invest\mineru-runtime-v5\` 下的 collector/receipt。任何部署后 identity、
+health、网络、egress、空 output-root 或 formal collector 校验失败都会恢复旧 tag 映射、旧 compose、
+旧 collector、旧 receipt 和旧容器运行态，并删除临时 tag。不要手工把 v5 reader 改回兼容任意历史路径，也不要在同一次处置中
+重启 Docker Desktop、Windows、Tailscale 或 v2rayN。
 
 bootstrap 与 steady state 是两个独立 profile：bootstrap 不启动 resident worker、不开放 queue
 admission；steady state 只在当前 runtime smoke 与两次相互独立的完整 staged load 通过后使用已验证
 包络。当前候选 steady 参数是 `WORKER_BATCH_SYNC=13`、download/parse=`50/50`、
 backfill waterline=`2000`、loop=`900..1800`、document concurrency=`16`、GPU budget/max-seq=
-`21/128`、API task slots/inference cap=`3/7`、finalize=`2`、regular/heavy/huge=`11/4/1`、oversized=`10240 KiB`、
+`7/128`、API task slots/inference cap=`1/7`、worker client outstanding window=`1`、finalize=`2`、oversized=`10240 KiB`、
 soft parse expected=`3600s`。任何新 OOM/EngineCore death、429/5xx、持续 preemption 或 vLLM
-waiting≥64 持续 30 秒都停止 staged load；不能据一次利用率截图扩大 16 submitted / 21 active / 128 seq。
+waiting≥64 持续 30 秒都停止 staged load；不能据一次利用率截图扩大 1 outstanding / 7 active / 128 seq。
 
-在同一 v3 manifest 的 smoke PASS 后、启动任何 producer 前，显式运行固定 staged-load gate：
+在同一 v5 manifest 的 smoke PASS 后、启动任何 producer 前，显式运行固定 staged-load gate：
 
 ```bash
 make mineru-staged-load \
-  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v3.json \
-  INPUT=/private/path/frozen-representative-multipage.pdf \
-  EXPECTED_SHA256=<reviewed-sha256> \
-  RECEIPT=/private/path/mineru-staged-load-receipt.v2.json \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v5.json \
+  CORPUS_MANIFEST=/private/path/frozen-real-pdf-corpus.v1.json \
+  EXPECTED_CORPUS_SHA256=<reviewed-canonical-corpus-sha256> \
+  RECEIPT=/private/path/mineru-staged-load-receipt.v5.json \
+  SSH_HOST=<pinned-windows-host> SSH_USER=<operator> \
+  SSH_IDENTITY=/private/path/operator-key \
+  SSH_KNOWN_HOSTS=/private/path/known_hosts \
+  DOCKER_MEMORY_RESERVE_BYTES=<operator-calibrated-bytes> \
   WORK_ROOT=/private/disposable-scratch
 
 # 第一轮完整 PASS 后，用不存在的新路径原样再运行一次：
 make mineru-staged-load \
-  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v3.json \
-  INPUT=/private/path/frozen-representative-multipage.pdf \
-  EXPECTED_SHA256=<same-reviewed-sha256> \
-  RECEIPT=/private/path/mineru-staged-load-confirmation-receipt.v2.json \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v5.json \
+  CORPUS_MANIFEST=/private/path/frozen-real-pdf-corpus.v1.json \
+  EXPECTED_CORPUS_SHA256=<same-reviewed-canonical-corpus-sha256> \
+  RECEIPT=/private/path/mineru-staged-load-confirmation-receipt.v5.json \
+  SSH_HOST=<same-pinned-windows-host> SSH_USER=<same-operator> \
+  SSH_IDENTITY=/private/path/operator-key \
+  SSH_KNOWN_HOSTS=/private/path/known_hosts \
+  DOCKER_MEMORY_RESERVE_BYTES=<same-operator-calibrated-bytes> \
   WORK_ROOT=/private/disposable-scratch
 ```
 
-该入口没有自定义 stage 参数，固定按 4、8、16 份同一份已审阅、精确 SHA 绑定的代表性 PDF
-复制件运行真实 official writer；输入解析结果少于 7 页会 FAIL，单页 smoke fixture 不能冒充
-负载验证。4/8/16 是 client 同时提交的文档数，不是 active GPU 请求数；固定 API 只允许 3 个 processing
-tasks，每个 active task 的 server-side inference cap 是 7，因此三阶段的 active upper bound 始终为 21，
-其余文档在 API 队列等待。启动前会拒绝 active worker/pipeline producer、MinerU 残留进程和
-`mineru-api-client-*` 残留目录，核对 v3 manifest、
+该入口没有自定义 stage 参数，固定按 4、8、16 份真实 PDF 运行 official writer。每个 stage 都从
+冻结 corpus 机械选出 regular、heavy、huge 各至少一份，再按 corpus 顺序补足精确集合。corpus
+至少包含 16 个不同 SHA，且必须同时覆盖 regular（<80 页）、heavy（80–499 页）和 huge（≥500 页）；
+单页 smoke fixture 或重复同一 PDF 不能冒充负载验证。4/8/16 是每阶段处理的文档总数，不是同时
+提交数；客户端 API-facing outstanding 固定为 `min(stage count, task slots)`（当前为 1），huge/未知页数任务
+独占该窗口。其余 backlog 只保留在 durable queue，不预先提交到 process-local API registry。固定 API 的 processing task 上限来自 v5 manifest（当前为 1），每个 active task 的
+server-side inference cap 是 7，因此当前 active upper bound 为 7。
+启动前会拒绝 active worker/pipeline producer、MinerU 残留进程和 `mineru-api-client-*` 残留目录，核对 v5 manifest、
 本地 client/content packages、writer code、window=16、provider runtime 与 served model，并先探测
-`/v1/models` 和 `/metrics`。每阶段运行中及结束时都采样 running、waiting、preemptions、KV cache；
+`/v1/models` 和 `/metrics`。同一版本化远端 collector 还会在整轮前、中、后每 5 秒从进程外采样三只
+容器的 ID/StartedAt/restart/OOM/exit、cgroup memory、PID1 RSS/HWM 与 Docker VM available memory；
+epoch 变化、restart/OOM、15 秒以上采样缺口或跌破 operator-calibrated reserve 均 fail closed。
+每阶段运行中及结束时都采样 running、waiting、preemptions、KV cache；
 每个逻辑 metrics 样本只对 transport failure 允许在同一 10 秒总预算内做两次最长 4.5 秒尝试；HTTP
 429/5xx、响应超限、缺字段或非法值不重试。两次 transport 尝试都失败只形成一个 transport-only
 sample gap。当上一成功样本 waiting<64 时，每阶段最多记录并容忍一个实际持续不超过 10 秒的中途
 gap；第二个 gap、waiting 已达 64 后的任何 gap、超过 10 秒的 gap 或终样本 gap 都立即 FAIL。
 PASS receipt 必须原样保留 gap 的时间/时长，并证明其后有更晚的成功终样本供 admission 复核。
-同时连续采样 API `/health`：processing 不得超过 3，8/16 阶段必须真实观察到 queue，terminal 的
-completed delta 必须精确等于 4/8/16、failed delta 必须为 0，并在每阶段结束前自然 drain 到
-queued=processing=0。API 没有 cancel endpoint；本地中止后只能关闭新 admission、终止本地 CLI 并等待
+同时连续采样 API `/health`：processing 不得超过 attested task slots；window=1 时不要求人为制造 process-local queue。
+`completed_tasks`/`failed_tasks` 是保留期内 terminal registry 的人口 gauge，可随 600 秒 retention/30 秒
+cleanup 合法下降；v5 receipt 原样保留 baseline/samples/terminal 与 min/max，但禁止把它们解释为累计任务账。
+每份输入是否成功改由 exact input SHA、official writer 零退出、完整源/输出页数相等和 provider bundle hash
+逐文档证明；每阶段仍必须自然 drain 到 queued=processing=0。API 没有 cancel endpoint；本地中止后只能关闭新 admission、终止本地 CLI 并等待
 远端自然 drain。无法证明 drain 就 FAIL，不能重启服务、进入下一阶段或把 receipt 用于 admission。
 metrics 持续不可用、waiting≥64 连续 30 秒、preemption counter 任意变化，以及任一解析失败、429/5xx、
 overload、OOM 或 EngineCore failure 都立即 FAIL，清理本地子进程/临时目录且不进入下一阶段。
 每阶段 receipt 除 min/max 外还保留 running/waiting/KV 的 p95；当前只作容量诊断，不在没有现场
 证据时把历史经验阈值升级成正确性门禁。
-receipt 必须是不存在的新路径，按 mode 0600 创建；每一轮 PASS 必须同时有三阶段完整结果、精确 API
-任务账和零清理残留；两轮必须是时间上相继、路径不同的完整运行，
+receipt 必须是不存在的新路径，按 mode 0600 创建；每一轮 PASS 必须同时有三阶段完整逐文档结果、
+retained-gauge 原始观测和零清理残留；两轮必须是时间上相继、路径不同的完整运行，
 FAIL receipt 不能用于开启 steady state。parse-capable worker/pipeline/admin 会在连 DB 前重算并核验
-这个 PASS 的 runtime/client/code、代表性输入、逐阶段/逐文档、metrics、时间与 cleanup；路径缺失、
+这个 PASS 的 runtime/client/code、异构 corpus、逐阶段/逐文档、metrics、时间与 cleanup；路径缺失、
 证据漂移或早于对应 smoke 一律拒绝入场。该命令声明 database/queue access 均为 none；不得与 worker、
 pipeline 或 API producer 并行执行，也不得将其输出目录指向 AgentSSD 的正式 derived root。
 

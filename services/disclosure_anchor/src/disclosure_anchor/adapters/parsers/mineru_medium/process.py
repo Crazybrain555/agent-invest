@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -100,6 +101,10 @@ _CLICK_VERSION_OUTPUT = re.compile(
     r"^[^,\r\n]+, version "
     r"(?P<version>[0-9]+(?:\.[0-9]+)*(?:[A-Za-z0-9.+_-]*)?)$"
 )
+_FAILURE_DETAIL_MAX_CHARS = 240
+_CREDENTIAL_VALUE = re.compile(
+    r"(?i)(api[-_]?key|authorization|password|secret|token)(\s*[:=]\s*)(\S+)"
+)
 
 
 def _task_result_timeout_seconds(outer_timeout_seconds: int) -> int:
@@ -123,6 +128,18 @@ def _task_result_timeout_seconds(outer_timeout_seconds: int) -> int:
 
 def _contains_any(value: str, markers: tuple[str, ...]) -> bool:
     return any(marker in value for marker in markers)
+
+
+def _bounded_cli_failure_detail(value: str) -> str:
+    """Return reviewable, bounded diagnostics without durable credentials."""
+
+    digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+    normalized = " ".join(value.split())
+    normalized = _CREDENTIAL_VALUE.sub(r"\1\2<redacted>", normalized)
+    if len(normalized) > _FAILURE_DETAIL_MAX_CHARS:
+        normalized = normalized[:_FAILURE_DETAIL_MAX_CHARS] + "...[truncated]"
+    excerpt = normalized or "<empty>"
+    return f"cli_excerpt={excerpt!r} cli_sha256={digest} cli_chars={len(value)}"
 
 
 def _parse_cli_version_output(output: str) -> str:
@@ -541,61 +558,76 @@ class MinerUProcess:
             stdout, stderr = process.communicate(timeout=communicate_timeout)
         except subprocess.TimeoutExpired as exc:
             _stop_process_group(process)
-            self._drain_external_api(options)
             if cancel_at_start or _process_was_cancelled(process):
-                raise ParserCancelledError(
+                primary: BaseException = ParserCancelledError(
                     "MinerU cancelled by worker shutdown"
-                ) from exc
-            raise ParserTimeoutError(
-                f"MinerU timed out after {options.timeout_seconds}s"
-            ) from exc
-        except BaseException:
+                )
+            else:
+                primary = ParserTimeoutError(
+                    f"MinerU timed out after {options.timeout_seconds}s"
+                )
+            self._raise_after_external_api_drain(
+                options,
+                primary=primary,
+                original_cause=exc,
+            )
+        except BaseException as exc:
             _stop_process_group(process)
-            self._drain_external_api(options)
-            raise
+            self._raise_after_external_api_drain(
+                options,
+                primary=exc,
+                original_cause=exc.__cause__,
+            )
         finally:
             cancelled = _unregister_process(process)
         if cancelled:
-            self._drain_external_api(options)
-            raise ParserCancelledError("MinerU cancelled by worker shutdown")
+            self._raise_after_external_api_drain(
+                options,
+                primary=ParserCancelledError("MinerU cancelled by worker shutdown"),
+            )
         if process.returncode != 0:
-            self._drain_external_api(options)
             raw_detail = "\n".join(
                 part.strip() for part in (stdout, stderr) if part.strip()
             )
-            detail = f": {raw_detail}" if raw_detail else ""
+            detail = f": {_bounded_cli_failure_detail(raw_detail)}"
             if _TASK_RESULT_TIMEOUT_MARKER in raw_detail:
-                raise ParserTaskDeadlineError(f"MinerU task deadline exceeded{detail}")
-            if _contains_any(raw_detail, _BACKEND_OVERLOAD_MARKERS):
-                raise ParserBackendOverloadedError(
+                primary_error: BaseException = ParserTaskDeadlineError(
+                    f"MinerU task deadline exceeded{detail}"
+                )
+            elif _contains_any(raw_detail, _BACKEND_OVERLOAD_MARKERS):
+                primary_error = ParserBackendOverloadedError(
                     f"MinerU backend explicitly rejected capacity{detail}"
                 )
-            if _BACKEND_UNAVAILABLE_STATUS.search(raw_detail) is not None:
+            elif _BACKEND_UNAVAILABLE_STATUS.search(raw_detail) is not None:
                 # The remote OpenAI-compatible VLM service owns a 5xx. It is
                 # shared infrastructure, not evidence that this PDF is bad.
                 # Let the worker's parser-backend circuit pause admissions.
-                raise ParserBackendUnavailableError(
+                primary_error = ParserBackendUnavailableError(
                     f"MinerU backend failed an inference request{detail}"
                 )
-            if _contains_any(raw_detail, _LOCAL_API_FAILURE_MARKERS):
-                raise ParserLocalInvocationError(
+            elif _contains_any(raw_detail, _LOCAL_API_FAILURE_MARKERS):
+                primary_error = ParserLocalInvocationError(
                     f"MinerU local API failed before task admission{detail}"
                 )
-            if options.api_url is not None:
+            elif options.api_url is not None:
                 # The fixed API's aggregate task-failed output does not carry
                 # a proven item-local taxonomy. It can wrap GPU worker death,
                 # inference transport failure, or orchestration corruption.
                 # Treat every such failure as shared infrastructure until an
                 # exact upstream error contract supports a safe allow-list.
-                raise ParserBackendUnavailableError(
-                    "MinerU fixed API task/submit/status/result path failed"
-                    f"{detail}"
+                primary_error = ParserBackendUnavailableError(
+                    f"MinerU fixed API task/submit/status/result path failed{detail}"
                 )
-            # Unknown CLI failures default to the item failure domain. Several
-            # legitimate post-admission failures (status polling, result ZIP
-            # download/extraction) do not include a JSON "task_id" key; using
-            # its presence as an admission oracle would halt unrelated work.
-            raise ParserTaskError(f"MinerU task failed{detail}")
+            else:
+                # Unknown CLI failures default to the item failure domain.
+                # Several legitimate post-admission failures (status polling,
+                # result ZIP download/extraction) do not include a JSON
+                # "task_id" key; its presence is not an admission oracle.
+                primary_error = ParserTaskError(f"MinerU task failed{detail}")
+            self._raise_after_external_api_drain(
+                options,
+                primary=primary_error,
+            )
         return MinerUProcessResult(
             output_dir=output_dir,
             stdout=stdout,
@@ -622,6 +654,32 @@ class MinerUProcess:
             ) from exc
         finally:
             finish_mineru_orchestrator_incident(incident_token)
+
+    def _raise_after_external_api_drain(
+        self,
+        options: ParserOptions,
+        *,
+        primary: BaseException,
+        original_cause: BaseException | None = None,
+    ) -> None:
+        """Drain fail-closed while retaining the first failure in storage."""
+
+        try:
+            self._drain_external_api(options)
+        except ParserBackendUnavailableError as drain_error:
+            # The remote service is now unproved, so infrastructure remains
+            # the final classification.  Include the already-sanitized first
+            # failure in the durable string instead of replacing it with the
+            # secondary drain probe failure as the old order did.
+            raise ParserBackendUnavailableError(
+                "MinerU primary failure was followed by an unproved remote "
+                f"drain; primary_type={type(primary).__name__} "
+                f"primary={str(primary)[:360]!r}; "
+                f"drain={str(drain_error)[:120]!r}"
+            ) from drain_error
+        if original_cause is not None and primary is not original_cause:
+            raise primary from original_cause
+        raise primary
 
     def _env(self, *, options: ParserOptions | None = None) -> dict[str, str]:
         # MinerU and its temporary fast_api are parser mechanisms, not service

@@ -268,6 +268,42 @@ def _run_process(
     return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
 
+_PROTOCOL_TOKEN_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+
+
+def _protocol_token(value: object) -> str:
+    """Expose protocol vocabulary, never provider/model payload text."""
+
+    if value is None:
+        return "absent"
+    if isinstance(value, str) and _PROTOCOL_TOKEN_RE.fullmatch(value):
+        return value
+    encoded = str(value).encode("utf-8", errors="replace")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _event_shape_message(
+    *, raw_line: str, event: dict[str, object], line_number: int
+) -> str:
+    """Return a durable, content-free fingerprint for unknown JSONL events."""
+
+    item = event.get("item")
+    item_type = item.get("type") if isinstance(item, dict) else None
+    item_keys = sorted(
+        _protocol_token(key) for key in item
+    ) if isinstance(item, dict) else []
+    event_keys = sorted(_protocol_token(key) for key in event)
+    return (
+        "Codex semantic event stream contains an unsupported event: "
+        f"line={line_number} type={_protocol_token(event.get('type'))} "
+        f"keys={','.join(event_keys)} "
+        f"item_type={_protocol_token(item_type)} "
+        f"item_keys={','.join(item_keys)} "
+        "event_sha256="
+        + hashlib.sha256(raw_line.encode("utf-8")).hexdigest()
+    )
+
+
 def _validate_event_stream(stdout: str, stderr: str) -> None:
     """Reject any tool attempt or unrecognized Codex automation event."""
 
@@ -278,7 +314,7 @@ def _validate_event_stream(stdout: str, stderr: str) -> None:
             retryable=False,
         )
     disabled_code_mode_warnings = 0
-    for raw_line in stdout.splitlines():
+    for line_number, raw_line in enumerate(stdout.splitlines(), start=1):
         if not raw_line.strip():
             continue
         try:
@@ -323,7 +359,11 @@ def _validate_event_stream(stdout: str, stderr: str) -> None:
                 retryable=False,
             )
         raise SemanticRouteAdjudicatorError(
-            "Codex semantic event stream contains an unsupported event",
+            _event_shape_message(
+                raw_line=raw_line,
+                event=event,
+                line_number=line_number,
+            ),
             reason_code="invalid_runtime_protocol",
             retryable=False,
         )
@@ -339,7 +379,7 @@ def _nonzero_event_error_messages(stdout: str, stderr: str) -> tuple[str, ...]:
             retryable=False,
         )
     messages: list[str] = []
-    for raw_line in stdout.splitlines():
+    for line_number, raw_line in enumerate(stdout.splitlines(), start=1):
         if not raw_line.strip():
             continue
         try:
@@ -479,7 +519,11 @@ def _nonzero_event_error_messages(stdout: str, stderr: str) -> tuple[str, ...]:
             messages.append(message)
             continue
         raise SemanticRouteAdjudicatorError(
-            "Codex semantic event stream contains an unsupported event",
+            _event_shape_message(
+                raw_line=raw_line,
+                event=event,
+                line_number=line_number,
+            ),
             reason_code="invalid_runtime_protocol",
             retryable=False,
         )

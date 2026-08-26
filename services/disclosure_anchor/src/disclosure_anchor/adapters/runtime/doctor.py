@@ -140,6 +140,7 @@ def mineru_orchestrator_check(settings: Settings) -> CheckResult:
     try:
         health = fetch_mineru_orchestrator_health(
             api_url,
+            expected_task_slots=settings.disclosure_mineru_api_task_slots,
             expected_task_retention_seconds=(
                 settings.disclosure_mineru_api_task_retention_seconds
             ),

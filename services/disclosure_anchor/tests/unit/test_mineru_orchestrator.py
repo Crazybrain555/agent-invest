@@ -49,11 +49,25 @@ class MinerUOrchestratorTests(unittest.TestCase):
         ):
             health = fetch_mineru_orchestrator_health(
                 "http://127.0.0.1:30002",
+                expected_task_slots=3,
                 expected_task_retention_seconds=600,
                 expected_cleanup_interval_seconds=30,
             )
         self.assertEqual(health.active_tasks, 0)
         self.assertEqual(health.max_concurrent_requests, 3)
+
+        opener.open.return_value = _Response(_payload(max_concurrent_requests=2))
+        with (
+            patch(
+                "disclosure_anchor.adapters.runtime.mineru_orchestrator.urllib.request.build_opener",
+                return_value=opener,
+            ),
+            self.assertRaisesRegex(MinerUOrchestratorError, "task-slot limit drifted"),
+        ):
+            fetch_mineru_orchestrator_health(
+                "http://127.0.0.1:30002",
+                expected_task_slots=1,
+            )
 
         for overrides in (
             {"version": "3.4.5"},

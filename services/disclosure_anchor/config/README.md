@@ -67,7 +67,7 @@
 | DISCLOSURE_MINERU_API_URL | — | Mac→固定 MinerU API；只接受 loopback SSH forward，API 不得暴露到 Funnel/LAN |
 | DISCLOSURE_MINERU_OBSERVABILITY_URL | — | Mac→vLLM `/v1` observation/canary/metrics endpoint；与 API URL 分离 |
 | DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL | — | Windows API container→vLLM 的内部 Docker URL；Mac 不直接探测该 hostname |
-| DISCLOSURE_MINERU_API_TASK_SLOTS / API_INFERENCE_CONCURRENCY | 3 / 7 | API 同时 processing 文档上限与每 active task 的服务端 inference cap；active upper bound 固定 21 |
+| DISCLOSURE_MINERU_API_TASK_SLOTS / API_INFERENCE_CONCURRENCY | 1 / 7 | 当前 30 GiB Windows profile 的 whole-PDF task 上限与每 task inference cap；1–3 可配置但必须重新 attestation + 两轮异构验证，不能只改 env |
 | DISCLOSURE_GPU_METRICS_URL | — | 可选真实 GPU exporter `/metrics`；Linux 用 DCGM，Windows 用受限 SSH loopback 的 pinned nvidia-smi exporter；未配置时明确 unavailable |
 | DISCLOSURE_GPU_EXPECTED_UUID | — | Windows exporter 观测到的唯一 GPU UUID；与安装 receipt 绑定，跨 UUID 指标或换卡会降级为 unavailable |
 | DISCLOSURE_DCGM_METRICS_URL | — | 旧 DCGM-only 兼容别名；若与通用 URL 同时配置必须完全相同 |
@@ -81,7 +81,7 @@
 | WORKER_BATCH_DOWNLOAD | 50 | 每轮下载上限；下载只把工作从 pending-download 搬到 pending-parse，总在途水位避免 GPU 故障时 raw 无界增长 |
 | WORKER_BATCH_PARSE | 50 | 仅为直接 `worker once` 的单轮文档上限；production resident 常驻补槽，不把该数当报告/排空边界 |
 | WORKER_PARSE_CONCURRENCY | 16（生产模板） | 文档槽，不是 GPU 请求数；本地 CPU backend 必须设 1 |
-| WORKER_GPU_REQUEST_BUDGET / MAX_SEQUENCES | 21 / 128 | resident worker 稳态 active 包络；最多提交 16 文档，但 API 同时只处理 3 个，其余排队 |
+| WORKER_GPU_REQUEST_BUDGET / MAX_SEQUENCES | 7 / 128 | resident worker 稳态 active inference 包络；本地候选可达 16 文档，但 API-facing outstanding 固定为 1，其余只留在 PostgreSQL durable queue |
 | WORKER_PARSE_*_PAGE_THRESHOLD / SATURATED_SHARE | 80/4、500/1 | regular/heavy/huge 名义份额；lane 空闲时允许借用 |
 | CNINFO_OVERSIZED_KB | 10240 | 兼容旧名；以归档 actual byte_count 判定 HUGE lane，不是下载/解析上限 |
 | WORKER_PARSE_CANDIDATE_WINDOW | 1000 | 每次公平选择的候选前缀；不是第二份耐久队列 |
@@ -91,9 +91,10 @@
 | DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS | 86400 | 极端 live-but-stuck 进程保护；整本文档默认可运行 24 小时 |
 | WORKER_LOOP_INTERVAL_SECONDS / MAX | 900 / 1800 | acquisition/project maintenance 的空闲/故障退避；parse 空队列由下载事件或 5 秒 fail-safe poll 唤醒 |
 | MINERU_PROCESSING_WINDOW_SIZE | 16 | GPU 页窗口红线（round22h OOM 后定案） |
-| DISCLOSURE_MINERU_SMOKE_RECEIPT / CANARY_CACHE | — | runtime bundle v3 的 DB-free smoke/canary v2 PASS 对；resident 在连 DB 前强制校验 |
-| DISCLOSURE_MINERU_STAGED_LOAD_RECEIPT / STAGED_LOAD_CONFIRMATION_RECEIPT | — | 同一 persistent identity 的两次独立完整 4/8/16 client-submit PASS；逐阶段验证 API 3-slot queue、精确完成账与自然 drain |
-| DISCLOSURE_MINERU_STAGED_INPUT_SHA256 | — | 两次 staged run 共用的 representative multipage PDF 固定 hash |
+| DISCLOSURE_MINERU_SMOKE_RECEIPT / CANARY_CACHE | — | runtime bundle v5 的 DB-free smoke/canary v2 PASS 对；resident 在连 DB 前强制校验 |
+| DISCLOSURE_MINERU_STAGED_LOAD_RECEIPT / STAGED_LOAD_CONFIRMATION_RECEIPT | — | 同一 persistent identity 和真实异构 corpus 的两次独立完整 4/8/16 文档回放 PASS；客户端 API-facing window 固定为 1、huge 独占，并从进程外持续验证容器 epoch/restart/OOM/RSS/Docker VM 内存 |
+| DISCLOSURE_MINERU_STAGED_CORPUS_SHA256 | — | 两次 staged run 共用、至少 16 个不同 hash 且覆盖 regular/heavy/huge 的有序真实 PDF corpus 身份 |
+| DISCLOSURE_MINERU_DOCKER_MEMORY_RESERVE_BYTES | 0（未配置） | 当前 Docker VM 的 operator-calibrated 最低可用内存；parse-capable gate 要求正值，不能写死为跨机器常量 |
 | DISCLOSURE_MINERU_CANARY_MAX_AGE_SECONDS | 2592000 | 静态 smoke/staged-load 的进程启动租约（30 天）；启动后每 300 秒继续核 live API/model，incident 立即关闭 admission |
 | DISCLOSURE_MINERU_LIVE_PROBE_INTERVAL_SECONDS | 300 | parse admission 限频复核 `/v1/models` 唯一 served-model；首次入场必查 |
 | CNINFO_* | — | 凭据（只进环境，绝不进仓） |
@@ -110,8 +111,8 @@ make track-export OUT=/timestamped/path/watchlist.csv  # DB 池子 → 独立复
 make track-status          # 全池状态 + 每公司生效配置与来源层
 make mineru-smoke RUNTIME_MANIFEST=/path/runtime.json RECEIPT=/path/receipt.json CANARY_CACHE=/path/canary.json
                            # 无 DB/队列/业务凭据下传：三次多模态 canary + 固定单页 full-PDF，进程/临时树差集归零
-make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json INPUT=/path/frozen-multipage.pdf EXPECTED_SHA256=<sha256> RECEIPT=/path/new-load-receipt.json
-                           # smoke PASS 后固定 4/8/16 client submit；3×7=21 active；输入至少7页；API账/metrics/失败/清理任一越界立即停止；需用新路径完整再跑一次
+make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json CORPUS_MANIFEST=/path/frozen-corpus.json EXPECTED_CORPUS_SHA256=<sha256> RECEIPT=/path/new-load-receipt.v5.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts DOCKER_MEMORY_RESERVE_BYTES=<bytes>
+                           # smoke PASS 后固定4/8/16文档数；API-facing window=1、huge独占；每阶段都含regular/heavy/huge；API/vLLM/外部Docker epoch-OOM-RSS-memory/清理任一越界立即停止
 make worker-once           # 手动跑一轮（同步→下载→解析→切分→发布）
 make worker-loop           # 常驻自适应排水；积压时零等待，空闲时 15→30 分钟退避
 make worker-status         # 单次只读快照：公司/文档两条进度、队列、当前任务、vLLM 与真实 GPU exporter

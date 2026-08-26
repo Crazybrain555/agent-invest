@@ -329,6 +329,24 @@ class WorkerProgressTests(unittest.TestCase):
         self.assertEqual(observed["queued_tasks"], 2)
         self.assertEqual(observed["processing_tasks"], 2)
         self.assertEqual(observed["max_concurrent_requests"], 3)
+        for task_slots in (1, 2, 3):
+            accepted = {
+                **payload,
+                "max_concurrent_requests": task_slots,
+                "processing_tasks": min(2, task_slots),
+            }
+            self.assertEqual(
+                mineru_api_health_snapshot(
+                    json.dumps(accepted).encode(),
+                    expected_task_slots=task_slots,
+                )["max_concurrent_requests"],
+                task_slots,
+            )
+        with self.assertRaises(ValueError):
+            mineru_api_health_snapshot(
+                _api_health_payload(),
+                expected_task_slots=1,
+            )
         for mutation in (
             {"version": "3.4.3"},
             {"protocol_version": 1},
@@ -409,6 +427,8 @@ class WorkerProgressTests(unittest.TestCase):
             base_settings = _settings(
                 Path(tmp),
                 disclosure_gpu_metrics_url="http://127.0.0.1:30004/metrics",
+                disclosure_mineru_api_task_slots=3,
+                worker_gpu_request_budget=21,
             )
             settings = self._with_progress_urls(
                 base_settings,

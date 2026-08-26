@@ -24,6 +24,8 @@ from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_CONTENT_PACKAGE_VERSIONS,
     MINERU_PROCESSING_WINDOW_SIZE,
+    MINERU_WINDOWS_COLLECTOR_PATH,
+    MINERU_WINDOWS_COMPOSE_PATH,
     MINERU_SMOKE_INPUT_NAME,
     MINERU_SMOKE_INPUT_SHA256,
     MinerUClientIdentity,
@@ -94,13 +96,16 @@ class MinerUDeploymentGateTests(unittest.TestCase):
         }
         orchestrator = {
             "container_image_digest": "sha256:" + "6" * 64,
+            "base_container_image_digest": "sha256:" + "5" * 64,
             "content_environment_sha256": "sha256:" + "7" * 64,
             "service_config_sha256": "sha256:" + "8" * 64,
             "mount_policy_sha256": "sha256:" + "9" * 64,
             "network_policy_sha256": "sha256:" + "a" * 64,
+            "heap_return_compatibility_sha256": "sha256:" + "f" * 64,
+            "heap_return_policy": "glibc-malloc-trim-per-window.v1",
             "mineru_version": "3.4.4",
             "api_protocol_version": 2,
-            "max_concurrent_requests": 3,
+            "max_concurrent_requests": 1,
             "inference_max_concurrency": 7,
             "processing_window_size": 16,
             "task_retention_seconds": 600,
@@ -121,9 +126,13 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             ),
             "ssh_host_key_sha256": "sha256:" + "b" * 64,
             "windows_node_identity_sha256": "sha256:" + "c" * 64,
+            "windows_compose_path": MINERU_WINDOWS_COMPOSE_PATH,
+            "windows_compose_sha256": "sha256:" + "d" * 64,
+            "windows_collector_path": MINERU_WINDOWS_COLLECTOR_PATH,
+            "windows_collector_sha256": "sha256:" + "e" * 64,
         }
         manifest = {
-            "contract_version": "mineru-runtime-bundle.v3",
+            "contract_version": "mineru-runtime-bundle.v5",
             "client": {
                 "package_set_sha256": LOCAL_DIGEST,
                 "writer_code_sha256": CODE_DIGEST,
@@ -158,7 +167,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             runtime_bundle_identity_sha256=runtime_identity,
         )
         receipt = {
-            "schema": "mineru_smoke_receipt.v2",
+            "schema": "mineru_smoke_receipt.v4",
             "status": "pass",
             "started_at_utc": smoke_started_at.isoformat(),
             "finished_at_utc": smoke_finished_at.isoformat(),
@@ -182,6 +191,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 ),
                 "provider_runtime_identity_sha256": canonical_payload_sha256(server),
                 "served_model_id": MODEL_ID,
+                "orchestrator_task_slots": 1,
             },
             "runtime_manifest": manifest,
             "canary": cache,
@@ -194,10 +204,9 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 )
             },
             "orchestrator": {
+                "task_registry_semantics": "retained-terminal-gauges.v1",
                 "before": api_health(completed=10),
                 "after": api_health(completed=11),
-                "completed_delta": 1,
-                "failed_delta": 0,
                 "terminal_active_tasks": 0,
                 "stop_semantics": "drain-not-cancel.v1",
             },
@@ -225,8 +234,36 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "temporary_tree_removed": True,
             "observation_error": None,
         }
+        corpus_documents = [
+            {
+                "logical_name": f"real-{index:02d}.pdf",
+                "sha256": f"sha256:{index:064x}",
+                "bytes": 1024 + index,
+                "page_count": 600 if index == 16 else (100 if index == 15 else 7),
+                "workload_class": (
+                    "huge" if index == 16 else ("heavy" if index == 15 else "regular")
+                ),
+            }
+            for index in range(1, 17)
+        ]
+
+        def selected_stage_documents(count: int) -> list[dict[str, object]]:
+            selected = [
+                corpus_documents[0],
+                corpus_documents[14],
+                corpus_documents[15],
+            ]
+            selected_hashes = {str(item["sha256"]) for item in selected}
+            for item in corpus_documents:
+                if len(selected) >= count:
+                    break
+                if str(item["sha256"]) not in selected_hashes:
+                    selected.append(item)
+                    selected_hashes.add(str(item["sha256"]))
+            return selected
+
         staged_load = {
-            "schema": "mineru_staged_load_receipt.v2",
+            "schema": "mineru_staged_load_receipt.v5",
             "execution_id": "11111111-1111-4111-8111-111111111111",
             "status": "pass",
             "failure": None,
@@ -236,24 +273,29 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "topology": receipt["topology"],
             "database_access": "none",
             "queue_access": "none",
-            "fixed_stage_client_document_concurrency": [4, 8, 16],
-            "orchestrator_task_concurrency": 3,
+            "fixed_stage_document_counts": [4, 8, 16],
+            "orchestrator_task_concurrency": 1,
             "orchestrator_inference_concurrency": 7,
-            "effective_inference_request_upper_bound": 21,
+            "effective_inference_request_upper_bound": 7,
             "input": {
-                "profile": "operator_frozen_representative_v1",
-                "logical_name": "representative.pdf",
+                "profile": "operator_frozen_heterogeneous_v2",
+                "logical_name": "real-corpus.json",
                 "sha256": staged_input_sha256,
-                "bytes": 1024,
+                "bytes": sum(int(item["bytes"]) for item in corpus_documents),
                 "minimum_required_pages": 7,
+                "documents": corpus_documents,
             },
             "identity": receipt["identity"],
+            "host_capacity": host_capacity_evidence(),
             "stages": [
                 {
-                    "client_document_concurrency": concurrency,
-                    "orchestrator_task_concurrency": 3,
+                    "stage_document_count": document_count,
+                    "client_outstanding_window": 1,
+                    "peak_client_outstanding": 1,
+                    "selection_profile": "per_stage_regular_heavy_huge.v1",
+                    "orchestrator_task_concurrency": 1,
                     "orchestrator_inference_concurrency": 7,
-                    "effective_inference_request_upper_bound": 21,
+                    "effective_inference_request_upper_bound": 7,
                     "status": "pass",
                     "failure": None,
                     "elapsed_seconds": 2.0,
@@ -261,11 +303,18 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                         {
                             "copy_index": copy_index,
                             "status": "pass",
-                            "input_sha256": staged_input_sha256,
-                            "page_count": 7,
+                            "logical_name": document["logical_name"],
+                            "input_sha256": document["sha256"],
+                            "page_count": document["page_count"],
+                            "block_count": 2,
+                            "elapsed_seconds": 1.0,
+                            "workload_class": document["workload_class"],
                             "provider_bundle_sha256": "sha256:" + "6" * 64,
                         }
-                        for copy_index in range(1, concurrency + 1)
+                        for copy_index, document in enumerate(
+                            selected_stage_documents(document_count),
+                            start=1,
+                        )
                     ],
                     "metrics": {
                         "sample_count": 1,
@@ -290,12 +339,12 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                         },
                     },
                     "orchestrator": staged_orchestrator_evidence(
-                        concurrency=concurrency,
+                        concurrency=document_count,
                         completed_before=20 + sum((4, 8, 16)[:stage_index]),
                     ),
                     "cleanup": staged_cleanup,
                 }
-                for stage_index, concurrency in enumerate((4, 8, 16))
+                for stage_index, document_count in enumerate((4, 8, 16))
             ],
             "cleanup": staged_cleanup,
         }
@@ -303,9 +352,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
         receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
         staged_load_path.write_text(json.dumps(staged_load), encoding="utf-8")
         staged_confirmation = json.loads(json.dumps(staged_load))
-        staged_confirmation["execution_id"] = (
-            "22222222-2222-4222-8222-222222222222"
-        )
+        staged_confirmation["execution_id"] = "22222222-2222-4222-8222-222222222222"
         staged_confirmation["started_at_utc"] = (
             passed_at - timedelta(seconds=16)
         ).isoformat()
@@ -313,8 +360,8 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             passed_at - timedelta(seconds=6)
         ).isoformat()
         staged_confirmation["elapsed_seconds"] = 10.0
-        # The persistent API counters cannot roll back between independent
-        # executions.  The first run completed 4 + 8 + 16 = 28 tasks.
+        # Retained terminal populations may differ between executions; keep a
+        # distinct valid fixture so the default pair exercises that freedom.
         for stage in staged_confirmation["stages"]:
             orchestrator = stage["orchestrator"]
             for sample_name in ("baseline", "terminal"):
@@ -351,9 +398,11 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             disclosure_mineru_staged_load_confirmation_receipt=(
                 staged_confirmation_path
             ),
-            disclosure_mineru_staged_input_sha256=staged_input_sha256,
+            disclosure_mineru_staged_corpus_sha256=staged_input_sha256,
+            disclosure_mineru_docker_memory_reserve_bytes=1024,
             worker_parse_concurrency=16,
-            worker_gpu_request_budget=21,
+            worker_mineru_client_outstanding_window=1,
+            worker_gpu_request_budget=7,
             worker_gpu_max_sequences=128,
         )
         return settings, receipt_path, cache_path, client
@@ -435,7 +484,69 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             ):
                 require_mineru_deployment_gate(settings)
 
-    def test_staged_input_is_pinned_and_shared_by_both_runs(self) -> None:
+    def test_evidence_size_limits_are_type_specific_and_bounded(self) -> None:
+        for setting_name, label in (
+            ("disclosure_mineru_staged_load_receipt", "staged-load receipt"),
+            (
+                "disclosure_mineru_staged_load_confirmation_receipt",
+                "staged-load confirmation receipt",
+            ),
+        ):
+            with (
+                self.subTest(setting_name=setting_name),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                settings, _, _, client = self._fixture(
+                    Path(tmp), passed_at=datetime.now(UTC)
+                )
+                staged_path = getattr(settings, setting_name)
+                assert staged_path is not None
+                with staged_path.open("ab") as output:
+                    output.write(b" " * (2 * 1024 * 1024))
+                client_patch, code_patch = self._identity_patches(client)
+                with client_patch, code_patch:
+                    require_mineru_deployment_gate(settings)
+
+                with staged_path.open("ab") as output:
+                    output.truncate(64 * 1024 * 1024 + 1)
+                client_patch, code_patch = self._identity_patches(client)
+                with (
+                    client_patch,
+                    code_patch,
+                    self.assertRaisesRegex(
+                        MinerUDeploymentGateError,
+                        f"{label} exceeds the size limit",
+                    ),
+                ):
+                    require_mineru_deployment_gate(settings)
+
+        for setting_name, label in (
+            ("disclosure_mineru_smoke_receipt", "smoke receipt"),
+            ("disclosure_mineru_canary_cache", "canary cache"),
+        ):
+            with (
+                self.subTest(setting_name=setting_name),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                settings, _, _, client = self._fixture(
+                    Path(tmp), passed_at=datetime.now(UTC)
+                )
+                evidence_path = getattr(settings, setting_name)
+                assert evidence_path is not None
+                with evidence_path.open("ab") as output:
+                    output.truncate(2 * 1024 * 1024 + 1)
+                client_patch, code_patch = self._identity_patches(client)
+                with (
+                    client_patch,
+                    code_patch,
+                    self.assertRaisesRegex(
+                        MinerUDeploymentGateError,
+                        f"{label} exceeds the size limit",
+                    ),
+                ):
+                    require_mineru_deployment_gate(settings)
+
+    def test_staged_corpus_is_pinned_and_shared_by_both_runs(self) -> None:
         for tamper in ("configured_hash", "confirmation_input"):
             with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as tmp:
                 settings, _, _, client = self._fixture(
@@ -444,7 +555,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 if tamper == "configured_hash":
                     settings = settings.model_copy(
                         update={
-                            "disclosure_mineru_staged_input_sha256": (
+                            "disclosure_mineru_staged_corpus_sha256": (
                                 "sha256:" + "0" * 64
                             )
                         }
@@ -487,7 +598,70 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             ):
                 require_mineru_deployment_gate(settings)
 
-    def test_staged_api_counters_are_continuous_between_stages(self) -> None:
+    def test_smoke_accepts_retained_gauge_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, receipt_path, _, client = self._fixture(
+                Path(tmp), passed_at=datetime.now(UTC)
+            )
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["orchestrator"]["before"] = api_health(completed=2, failed=1)
+            receipt["orchestrator"]["after"] = api_health(completed=0, failed=0)
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            receipt_path.chmod(0o600)
+            client_patch, code_patch = self._identity_patches(client)
+            with client_patch, code_patch:
+                require_mineru_deployment_gate(settings)
+
+    def test_smoke_rejects_legacy_or_mixed_semantics(self) -> None:
+        for tamper, expected in (
+            ("legacy", "legacy cumulative-gauge smoke receipt"),
+            ("wrong_semantics", "smoke API evidence"),
+            ("delta_field", "smoke API evidence"),
+        ):
+            with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as tmp:
+                settings, receipt_path, _, client = self._fixture(
+                    Path(tmp), passed_at=datetime.now(UTC)
+                )
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if tamper == "legacy":
+                    receipt["schema"] = "mineru_smoke_receipt.v3"
+                elif tamper == "wrong_semantics":
+                    receipt["orchestrator"]["task_registry_semantics"] = "counter.v1"
+                else:
+                    receipt["orchestrator"]["completed_delta"] = 1
+                receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                receipt_path.chmod(0o600)
+                client_patch, code_patch = self._identity_patches(client)
+                with (
+                    client_patch,
+                    code_patch,
+                    self.assertRaisesRegex(MinerUDeploymentGateError, expected),
+                ):
+                    require_mineru_deployment_gate(settings)
+
+    def test_staged_rejects_legacy_receipt_without_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, _, _, client = self._fixture(
+                Path(tmp), passed_at=datetime.now(UTC)
+            )
+            staged_path = settings.disclosure_mineru_staged_load_receipt
+            assert staged_path is not None
+            staged = json.loads(staged_path.read_text(encoding="utf-8"))
+            staged["schema"] = "mineru_staged_load_receipt.v4"
+            staged_path.write_text(json.dumps(staged), encoding="utf-8")
+            staged_path.chmod(0o600)
+            client_patch, code_patch = self._identity_patches(client)
+            with (
+                client_patch,
+                code_patch,
+                self.assertRaisesRegex(
+                    MinerUDeploymentGateError,
+                    "legacy cumulative-gauge staged-load receipt",
+                ),
+            ):
+                require_mineru_deployment_gate(settings)
+
+    def test_staged_api_retained_gauges_may_change_between_stages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings, _, _, client = self._fixture(
                 Path(tmp), passed_at=datetime.now(UTC)
@@ -504,14 +678,10 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             staged_path.write_text(json.dumps(staged), encoding="utf-8")
             staged_path.chmod(0o600)
             client_patch, code_patch = self._identity_patches(client)
-            with (
-                client_patch,
-                code_patch,
-                self.assertRaisesRegex(MinerUDeploymentGateError, "discontinuous"),
-            ):
+            with client_patch, code_patch:
                 require_mineru_deployment_gate(settings)
 
-    def test_staged_api_counters_are_continuous_between_runs(self) -> None:
+    def test_staged_api_retained_gauges_may_change_between_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings, _, _, client = self._fixture(
                 Path(tmp), passed_at=datetime.now(UTC)
@@ -520,9 +690,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 settings.disclosure_mineru_staged_load_confirmation_receipt
             )
             assert confirmation_path is not None
-            confirmation = json.loads(
-                confirmation_path.read_text(encoding="utf-8")
-            )
+            confirmation = json.loads(confirmation_path.read_text(encoding="utf-8"))
             for stage in confirmation["stages"]:
                 orchestrator = stage["orchestrator"]
                 for sample_name in ("baseline", "terminal"):
@@ -531,16 +699,46 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                     sample["completed_tasks"] -= 28
                 orchestrator["range"]["completed_tasks"]["min"] -= 28
                 orchestrator["range"]["completed_tasks"]["max"] -= 28
-            confirmation_path.write_text(
-                json.dumps(confirmation), encoding="utf-8"
-            )
+            confirmation_path.write_text(json.dumps(confirmation), encoding="utf-8")
             confirmation_path.chmod(0o600)
             client_patch, code_patch = self._identity_patches(client)
-            with (
-                client_patch,
-                code_patch,
-                self.assertRaisesRegex(MinerUDeploymentGateError, "between runs"),
-            ):
+            with client_patch, code_patch:
+                require_mineru_deployment_gate(settings)
+
+    def test_staged_api_retained_gauges_may_decrease_within_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, _, _, client = self._fixture(
+                Path(tmp), passed_at=datetime.now(UTC)
+            )
+            staged_path = settings.disclosure_mineru_staged_load_receipt
+            assert staged_path is not None
+            staged = json.loads(staged_path.read_text(encoding="utf-8"))
+            evidence = staged["stages"][1]["orchestrator"]
+            evidence["baseline"] = api_health(completed=2, failed=2)
+            evidence["samples"] = [
+                {
+                    "observed_seconds": 0.25,
+                    "queued_tasks": 0,
+                    "processing_tasks": 1,
+                    "completed_tasks": 1,
+                    "failed_tasks": 1,
+                },
+                {
+                    "observed_seconds": 0.5,
+                    "queued_tasks": 0,
+                    "processing_tasks": 1,
+                    "completed_tasks": 0,
+                    "failed_tasks": 0,
+                },
+            ]
+            evidence["sample_count"] = 2
+            evidence["terminal"] = api_health(completed=1, failed=0)
+            evidence["range"]["completed_tasks"] = {"min": 0, "max": 2}
+            evidence["range"]["failed_tasks"] = {"min": 0, "max": 2}
+            staged_path.write_text(json.dumps(staged), encoding="utf-8")
+            staged_path.chmod(0o600)
+            client_patch, code_patch = self._identity_patches(client)
+            with client_patch, code_patch:
                 require_mineru_deployment_gate(settings)
 
     def test_receipt_elapsed_must_cover_positive_stage_time(self) -> None:
@@ -566,7 +764,6 @@ class MinerUDeploymentGateTests(unittest.TestCase):
         unsafe_profiles = (
             (17, 21, 128),
             (16, 128, 128),
-            (1, 7, 128),
             (16, 21, 127),
         )
         for concurrency, budget, max_sequences in unsafe_profiles:
@@ -594,7 +791,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                     code_patch,
                     self.assertRaisesRegex(
                         MinerUDeploymentGateError,
-                        "staged 16-submit/3x7-active envelope",
+                        "staged 16-document/bounded-client/attested-active envelope",
                     ),
                 ):
                     require_mineru_deployment_gate(settings)
@@ -606,7 +803,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             settings = settings.model_copy(
                 update={
                     "worker_parse_concurrency": 8,
-                    "worker_gpu_request_budget": 21,
+                    "worker_gpu_request_budget": 7,
                 }
             )
             client_patch, code_patch = self._identity_patches(client)
@@ -625,9 +822,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 if tamper == "status":
                     staged["status"] = "fail"
                 else:
-                    staged["topology"]["api_endpoint_sha256"] = (
-                        "sha256:" + "0" * 64
-                    )
+                    staged["topology"]["api_endpoint_sha256"] = "sha256:" + "0" * 64
                 staged_path.write_text(json.dumps(staged), encoding="utf-8")
                 client_patch, code_patch = self._identity_patches(client)
 
@@ -647,6 +842,15 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             ("sampling_prefix", "metrics"),
             ("sampling_duration", "metrics"),
             ("terminal_before_gap", "metrics"),
+            ("document_status", "document evidence"),
+            ("logical_name", "document evidence"),
+            ("input_sha", "document evidence"),
+            ("page_count", "document evidence"),
+            ("missing_block_count", "document evidence"),
+            ("block_count_type", "document evidence"),
+            ("elapsed_negative", "document evidence"),
+            ("unexpected_document_field", "document evidence"),
+            ("bundle_hash", "document evidence"),
             ("copy_index", "document evidence"),
         ):
             with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as tmp:
@@ -657,9 +861,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 staged_path = settings.disclosure_mineru_staged_load_receipt
                 staged = json.loads(staged_path.read_text(encoding="utf-8"))
                 if tamper == "metrics":
-                    staged["stages"][0]["metrics"]["range"]["preemptions"][
-                        "max"
-                    ] = 1
+                    staged["stages"][0]["metrics"]["range"]["preemptions"]["max"] = 1
                 elif tamper == "activity":
                     staged["stages"][0]["metrics"]["range"]["running"]["max"] = 0
                 elif tamper == "busy_baseline":
@@ -701,6 +903,28 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                             "failure": "MetricsTransportUnavailableError:timeout",
                         }
                     ]
+                elif tamper == "document_status":
+                    staged["stages"][0]["documents"][0]["status"] = "fail"
+                elif tamper == "logical_name":
+                    staged["stages"][0]["documents"][0]["logical_name"] = "other.pdf"
+                elif tamper == "input_sha":
+                    staged["stages"][0]["documents"][0]["input_sha256"] = (
+                        "sha256:" + "0" * 64
+                    )
+                elif tamper == "page_count":
+                    staged["stages"][0]["documents"][0]["page_count"] += 1
+                elif tamper == "missing_block_count":
+                    del staged["stages"][0]["documents"][0]["block_count"]
+                elif tamper == "block_count_type":
+                    staged["stages"][0]["documents"][0]["block_count"] = "2"
+                elif tamper == "elapsed_negative":
+                    staged["stages"][0]["documents"][0]["elapsed_seconds"] = -1
+                elif tamper == "unexpected_document_field":
+                    staged["stages"][0]["documents"][0]["extra"] = "unexpected"
+                elif tamper == "bundle_hash":
+                    staged["stages"][0]["documents"][0]["provider_bundle_sha256"] = (
+                        "not-a-hash"
+                    )
                 else:
                     staged["stages"][0]["documents"][0]["copy_index"] = 2
                 staged_path.write_text(json.dumps(staged), encoding="utf-8")
@@ -717,9 +941,11 @@ class MinerUDeploymentGateTests(unittest.TestCase):
         for tamper in (
             "processing_above_limit",
             "active_above_window",
-            "queue_not_observed",
-            "completed_delta",
-            "failed_delta",
+            "wrong_semantics",
+            "unexpected_field",
+            "negative_gauge",
+            "boolean_gauge",
+            "no_processing",
             "terminal_busy",
             "range",
             "sample_count",
@@ -735,15 +961,19 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 if tamper == "processing_above_limit":
                     evidence["samples"][0]["processing_tasks"] = 4
                 elif tamper == "active_above_window":
-                    evidence["samples"][0]["queued_tasks"] = 100
-                    evidence["range"]["queued_tasks"]["max"] = 100
-                elif tamper == "queue_not_observed":
-                    evidence["samples"][0]["queued_tasks"] = 0
-                    evidence["range"]["queued_tasks"]["max"] = 0
-                elif tamper == "completed_delta":
+                    evidence["samples"][0]["queued_tasks"] = 2
+                    evidence["range"]["queued_tasks"]["max"] = 2
+                elif tamper == "wrong_semantics":
+                    evidence["task_registry_semantics"] = "cumulative-counters.v1"
+                elif tamper == "unexpected_field":
                     evidence["completed_delta"] = 7
-                elif tamper == "failed_delta":
-                    evidence["failed_delta"] = 1
+                elif tamper == "negative_gauge":
+                    evidence["samples"][0]["completed_tasks"] = -1
+                elif tamper == "boolean_gauge":
+                    evidence["samples"][0]["failed_tasks"] = False
+                elif tamper == "no_processing":
+                    evidence["samples"][0]["processing_tasks"] = 0
+                    evidence["range"]["processing_tasks"]["max"] = 0
                 elif tamper == "terminal_busy":
                     evidence["terminal"]["processing_tasks"] = 1
                 elif tamper == "range":
@@ -758,6 +988,68 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                     self.assertRaisesRegex(
                         MinerUDeploymentGateError,
                         "staged-load API",
+                    ),
+                ):
+                    require_mineru_deployment_gate(settings)
+
+    def test_staged_load_host_capacity_evidence_is_recomputed(self) -> None:
+        # /proc/meminfo is read independently inside each container. Safe
+        # MemAvailable values may differ slightly even though MemTotal and
+        # the Docker VM identity are the same; the gate must recompute the
+        # minimum rather than require byte-for-byte equality.
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, _, _, client = self._fixture(
+                Path(tmp), passed_at=datetime.now(UTC)
+            )
+            evidence_paths = (
+                settings.disclosure_mineru_staged_load_receipt,
+                settings.disclosure_mineru_staged_load_confirmation_receipt,
+            )
+            for evidence_path in evidence_paths:
+                assert evidence_path is not None
+                staged = json.loads(evidence_path.read_text(encoding="utf-8"))
+                for sample in staged["host_capacity"]["samples"]:
+                    for index, container in enumerate(sample["containers"]):
+                        container["docker_vm_memory_available_bytes"] = (
+                            16384 - index * 4096
+                        )
+                staged["host_capacity"]["summary"][
+                    "min_docker_vm_memory_available_bytes"
+                ] = 8192
+                evidence_path.write_text(json.dumps(staged), encoding="utf-8")
+            client_patch, code_patch = self._identity_patches(client)
+            with client_patch, code_patch:
+                require_mineru_deployment_gate(settings)
+
+        for tamper in ("restart", "oom", "reserve", "gap", "epoch"):
+            with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as tmp:
+                settings, _, _, client = self._fixture(
+                    Path(tmp), passed_at=datetime.now(UTC)
+                )
+                assert settings.disclosure_mineru_staged_load_receipt is not None
+                staged_path = settings.disclosure_mineru_staged_load_receipt
+                staged = json.loads(staged_path.read_text(encoding="utf-8"))
+                host = staged["host_capacity"]
+                if tamper == "restart":
+                    host["samples"][1]["containers"][0]["restart_count"] = 1
+                elif tamper == "oom":
+                    host["samples"][1]["containers"][0]["memory_events"]["oom_kill"] = 1
+                elif tamper == "reserve":
+                    host["samples"][1]["containers"][0][
+                        "docker_vm_memory_available_bytes"
+                    ] = 512
+                elif tamper == "gap":
+                    host["samples"][1]["observed_seconds"] = 20.0
+                else:
+                    host["samples"][1]["containers"][0]["id"] = "a" * 64
+                staged_path.write_text(json.dumps(staged), encoding="utf-8")
+                client_patch, code_patch = self._identity_patches(client)
+                with (
+                    client_patch,
+                    code_patch,
+                    self.assertRaisesRegex(
+                        MinerUDeploymentGateError,
+                        "host-capacity",
                     ),
                 ):
                     require_mineru_deployment_gate(settings)
@@ -1125,7 +1417,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 modelscope_cache=root / "shared" / "modelscope",
                 worker_batch_parse=0,
                 worker_parse_concurrency=1,
-                worker_gpu_request_budget=21,
+                worker_gpu_request_budget=7,
                 worker_gpu_max_sequences=128,
             )
             require_mineru_deployment_gate(settings)
@@ -1164,7 +1456,7 @@ def api_health(
         "processing_tasks": processing,
         "completed_tasks": completed,
         "failed_tasks": failed,
-        "max_concurrent_requests": 3,
+        "max_concurrent_requests": 1,
         "processing_window_size": 16,
         "task_retention_seconds": 600,
         "task_cleanup_interval_seconds": 30,
@@ -1178,12 +1470,14 @@ def orchestrator_health(
     processing: int = 0,
     failed: int = 0,
 ) -> MinerUOrchestratorHealth:
-    return MinerUOrchestratorHealth(**api_health(
-        completed=completed,
-        queued=queued,
-        processing=processing,
-        failed=failed,
-    ))
+    return MinerUOrchestratorHealth(
+        **api_health(
+            completed=completed,
+            queued=queued,
+            processing=processing,
+            failed=failed,
+        )
+    )
 
 
 def staged_orchestrator_evidence(
@@ -1191,33 +1485,97 @@ def staged_orchestrator_evidence(
     concurrency: int,
     completed_before: int,
 ) -> dict[str, object]:
-    queued = max(0, concurrency - 3)
+    queued = 0
     sample = {
         "observed_seconds": 0.25,
         "queued_tasks": queued,
-        "processing_tasks": 3,
+        "processing_tasks": 1,
         "completed_tasks": completed_before,
         "failed_tasks": 0,
     }
     return {
+        "task_registry_semantics": "retained-terminal-gauges.v1",
         "baseline": api_health(completed=completed_before),
         "samples": [sample],
         "sample_count": 1,
         "terminal": api_health(completed=completed_before + concurrency),
-        "completed_delta": concurrency,
-        "failed_delta": 0,
         "terminal_active_tasks": 0,
         "preflight_drain_seconds": 0.0,
         "terminal_drain_seconds": 0.5,
         "stop_semantics": "drain-not-cancel.v1",
         "range": {
             "queued_tasks": {"min": 0, "max": queued},
-            "processing_tasks": {"min": 0, "max": 3},
+            "processing_tasks": {"min": 0, "max": 1},
             "completed_tasks": {
                 "min": completed_before,
                 "max": completed_before + concurrency,
             },
             "failed_tasks": {"min": 0, "max": 0},
+        },
+    }
+
+
+def host_capacity_evidence() -> dict[str, object]:
+    started_at = "2026-08-25T00:00:00+00:00"
+
+    def container(name: str, character: str) -> dict[str, object]:
+        return {
+            "name": name,
+            "id": character * 64,
+            "started_at_utc": started_at,
+            "restart_count": 0,
+            "oom_killed": False,
+            "exit_code": 0,
+            "running": True,
+            "status": "running",
+            "health": "healthy",
+            "pid": 100,
+            "memory_current_bytes": 2048,
+            "memory_max_bytes": None,
+            "memory_events": {"oom": 0, "oom_kill": 0, "high": 0},
+            "pid1_rss_bytes": 1024,
+            "pid1_rss_hwm_bytes": 2048,
+            "docker_vm_memory_total_bytes": 32768,
+            "docker_vm_memory_available_bytes": 16384,
+        }
+
+    samples = []
+    for observed_seconds, observed_at in (
+        (0.0, "2026-08-25T00:00:01+00:00"),
+        (9.0, "2026-08-25T00:00:10+00:00"),
+    ):
+        samples.append(
+            {
+                "schema": "mineru-host-capacity-sample.v1",
+                "observed_at_utc": observed_at,
+                "collector_path": MINERU_WINDOWS_COLLECTOR_PATH,
+                "collector_sha256": "sha256:" + "e" * 64,
+                "windows_node_identity_sha256": "sha256:" + "c" * 64,
+                "containers": [
+                    container("mineru-api", "1"),
+                    container("mineru-api-proxy", "2"),
+                    container("mineru-openai-server", "3"),
+                ],
+                "observed_seconds": observed_seconds,
+            }
+        )
+    return {
+        "schema": "mineru-host-capacity-evidence.v2",
+        "status": "pass",
+        "failure": None,
+        "sample_interval_seconds": 5.0,
+        "max_sample_gap_seconds": 15.0,
+        "docker_memory_reserve_bytes": 1024,
+        "collector_path": MINERU_WINDOWS_COLLECTOR_PATH,
+        "collector_sha256": "sha256:" + "e" * 64,
+        "windows_node_identity_sha256": "sha256:" + "c" * 64,
+        "samples": samples,
+        "violations": [],
+        "sampling_failures": [],
+        "summary": {
+            "sample_count": 2,
+            "max_api_pid1_rss_hwm_bytes": 2048,
+            "min_docker_vm_memory_available_bytes": 16384,
         },
     }
 

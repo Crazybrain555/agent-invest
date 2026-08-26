@@ -22,6 +22,8 @@ from disclosure_anchor.adapters.runtime.mineru_canary import (
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_CONTENT_PACKAGE_VERSIONS,
     MINERU_PROCESSING_WINDOW_SIZE,
+    MINERU_WINDOWS_COLLECTOR_PATH,
+    MINERU_WINDOWS_COMPOSE_PATH,
     MinerUClientIdentity,
     client_bundle_identity,
 )
@@ -50,7 +52,7 @@ def _manifest(*, duplicate_max_num_seqs: bool = False) -> dict[str, object]:
         command.extend(["--max-num-seqs", "4096"])
     command.extend(["--mm-processor-cache-gb", "0"])
     return {
-        "contract_version": "mineru-runtime-bundle.v3",
+        "contract_version": "mineru-runtime-bundle.v5",
         "client": {
             "package_set_sha256": _LOCAL_DIGEST,
             "writer_code_sha256": _CODE_DIGEST,
@@ -58,10 +60,13 @@ def _manifest(*, duplicate_max_num_seqs: bool = False) -> dict[str, object]:
         },
         "orchestrator": {
             "container_image_digest": "sha256:" + "1" * 64,
+            "base_container_image_digest": "sha256:" + "0" * 64,
             "content_environment_sha256": "sha256:" + "2" * 64,
             "service_config_sha256": "sha256:" + "3" * 64,
             "mount_policy_sha256": "sha256:" + "4" * 64,
             "network_policy_sha256": "sha256:" + "5" * 64,
+            "heap_return_compatibility_sha256": "sha256:" + "6" * 64,
+            "heap_return_policy": "glibc-malloc-trim-per-window.v1",
             "mineru_version": "3.4.4",
             "api_protocol_version": 2,
             "max_concurrent_requests": 3,
@@ -93,6 +98,10 @@ def _manifest(*, duplicate_max_num_seqs: bool = False) -> dict[str, object]:
             "inference_upstream_sha256": "sha256:" + "8" * 64,
             "ssh_host_key_sha256": "sha256:" + "9" * 64,
             "windows_node_identity_sha256": "sha256:" + "a" * 64,
+            "windows_compose_path": MINERU_WINDOWS_COMPOSE_PATH,
+            "windows_compose_sha256": "sha256:" + "b" * 64,
+            "windows_collector_path": MINERU_WINDOWS_COLLECTOR_PATH,
+            "windows_collector_sha256": "sha256:" + "c" * 64,
         },
     }
 

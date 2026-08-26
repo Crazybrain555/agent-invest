@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$ComposePath = "C:\ProgramData\compose.tailnet.yaml",
-    [string]$OutputRoot = "C:\ProgramData\agent-invest\mineru-api-output"
+    [string]$OutputRoot = "C:\ProgramData\agent-invest\mineru-api-output",
+    [switch]$CapacitySample
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,6 +16,101 @@ function Get-Sha256Text {
     finally { $algorithm.Dispose() }
     $hex = -join ($hash | ForEach-Object { $_.ToString("x2") })
     return "sha256:$hex"
+}
+
+function Get-ContainerCapacitySample {
+    param([Parameter(Mandatory = $true)][object]$Container)
+    $name = ([string]$Container.Name).TrimStart("/")
+    $probeCode = @'
+import json
+from pathlib import Path
+
+def text(path):
+    return Path(path).read_text(encoding="utf-8").strip()
+
+def bounded(path):
+    value = text(path)
+    return None if value == "max" else int(value)
+
+status = {}
+for line in text("/proc/1/status").splitlines():
+    if ":" in line:
+        key, value = line.split(":", 1)
+        status[key] = value.strip()
+
+events = {}
+for line in text("/sys/fs/cgroup/memory.events").splitlines():
+    key, value = line.split()
+    events[key] = int(value)
+
+meminfo = {}
+for line in text("/proc/meminfo").splitlines():
+    if ":" in line:
+        key, value = line.split(":", 1)
+        meminfo[key] = int(value.strip().split()[0]) * 1024
+
+def status_bytes(key):
+    value = status.get(key, "0 kB").split()[0]
+    return int(value) * 1024
+
+print(json.dumps({
+    "memory_current_bytes": int(text("/sys/fs/cgroup/memory.current")),
+    "memory_max_bytes": bounded("/sys/fs/cgroup/memory.max"),
+    "memory_events": events,
+    "pid1_rss_bytes": status_bytes("VmRSS"),
+    "pid1_rss_hwm_bytes": status_bytes("VmHWM"),
+    "docker_vm_memory_total_bytes": meminfo.get("MemTotal", 0),
+    "docker_vm_memory_available_bytes": meminfo.get("MemAvailable", 0),
+}, separators=(",", ":")))
+'@
+    $probeJson = @(
+        $probeCode | & docker exec -i $name /usr/bin/python3.12 -I -
+    )
+    if ($LASTEXITCODE -ne 0 -or $probeJson.Count -ne 1) {
+        throw "cannot sample cgroup and RSS for $name"
+    }
+    $probe = ([string]$probeJson[0]) | ConvertFrom-Json
+    return [ordered]@{
+        name = $name
+        id = [string]$Container.Id
+        started_at_utc = [string]$Container.State.StartedAt
+        restart_count = [int]$Container.RestartCount
+        oom_killed = [bool]$Container.State.OOMKilled
+        exit_code = [int]$Container.State.ExitCode
+        running = [bool]$Container.State.Running
+        status = [string]$Container.State.Status
+        health = [string]$Container.State.Health.Status
+        pid = [int]$Container.State.Pid
+        memory_current_bytes = [long]$probe.memory_current_bytes
+        memory_max_bytes = if ($null -eq $probe.memory_max_bytes) { $null } else { [long]$probe.memory_max_bytes }
+        memory_events = $probe.memory_events
+        pid1_rss_bytes = [long]$probe.pid1_rss_bytes
+        pid1_rss_hwm_bytes = [long]$probe.pid1_rss_hwm_bytes
+        docker_vm_memory_total_bytes = [long]$probe.docker_vm_memory_total_bytes
+        docker_vm_memory_available_bytes = [long]$probe.docker_vm_memory_available_bytes
+    }
+}
+
+if ($CapacitySample) {
+    $capacityInspect = docker inspect mineru-api mineru-api-proxy mineru-openai-server | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or @($capacityInspect).Count -ne 3) {
+        throw "cannot inspect all MinerU containers for capacity sampling"
+    }
+    $machineGuid = (Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Cryptography" -Name MachineGuid).MachineGuid
+    $capacityResult = [ordered]@{
+        schema = "mineru-host-capacity-sample.v1"
+        observed_at_utc = (Get-Date).ToUniversalTime().ToString("o")
+        collector_path = $PSCommandPath
+        collector_sha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $PSCommandPath).Hash.ToLowerInvariant())"
+        windows_node_identity_sha256 = Get-Sha256Text -Value ([string]$machineGuid).Trim().ToLowerInvariant()
+        containers = @(
+            $capacityInspect |
+                Sort-Object { ([string]$_.Name).TrimStart("/") } |
+                ForEach-Object { Get-ContainerCapacitySample -Container $_ }
+        )
+    }
+    $capacityResult | ConvertTo-Json -Depth 20 -Compress
+    exit 0
 }
 
 function Convert-EnvironmentToMap {
@@ -91,28 +187,86 @@ $vllm = $inspect | Where-Object { $_.Name -eq "/mineru-openai-server" }
 if ($null -eq $api -or $null -eq $proxy -or $null -eq $vllm) {
     throw "MinerU container identities drifted"
 }
-$imageInspect = docker image inspect ([string]$api.Config.Image) | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0 -or @($imageInspect).Count -ne 1) {
-    throw "cannot inspect the pinned MinerU image environment"
+$apiImageInspect = docker image inspect ([string]$api.Config.Image) | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or @($apiImageInspect).Count -ne 1) {
+    throw "cannot inspect the pinned MinerU API compatibility image"
 }
-$imageEnvironment = @($imageInspect[0].Config.Env)
+$baseImageInspect = docker image inspect ([string]$vllm.Config.Image) | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or @($baseImageInspect).Count -ne 1) {
+    throw "cannot inspect the pinned MinerU base image"
+}
+$apiImageEnvironment = @($apiImageInspect[0].Config.Env)
+$baseImageEnvironment = @($baseImageInspect[0].Config.Env)
 
 $apiAllowedEnvironment = @(
     "MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS", "MINERU_API_DISABLE_ACCESS_LOG",
     "MINERU_API_ENABLE_FASTAPI_DOCS", "MINERU_API_MAX_CONCURRENT_REQUESTS",
     "MINERU_API_OUTPUT_ROOT", "MINERU_API_TASK_RETENTION_SECONDS",
-    "MINERU_MODEL_SOURCE", "MINERU_PROCESSING_WINDOW_SIZE"
+    "MINERU_MALLOC_TRIM", "MINERU_MODEL_SOURCE", "MINERU_PROCESSING_WINDOW_SIZE"
 )
 $vllmAllowedEnvironment = @("MINERU_MODEL_SOURCE")
 $apiEnvironment = Select-ExactEnvironment -ActualValues @($api.Config.Env) `
-    -ImageValues $imageEnvironment `
+    -ImageValues $apiImageEnvironment `
     -ResolvedValues $configObject.services."mineru-api".environment -AllowedNames $apiAllowedEnvironment
 $vllmEnvironment = Select-ExactEnvironment -ActualValues @($vllm.Config.Env) `
-    -ImageValues $imageEnvironment `
+    -ImageValues $baseImageEnvironment `
     -ResolvedValues $configObject.services."mineru-openai-server".environment -AllowedNames $vllmAllowedEnvironment
 $emptyEnvironment = [pscustomobject]@{}
 $proxyEnvironment = Select-ExactEnvironment -ActualValues @($proxy.Config.Env) `
-    -ImageValues $imageEnvironment -ResolvedValues $emptyEnvironment -AllowedNames @()
+    -ImageValues $baseImageEnvironment -ResolvedValues $emptyEnvironment -AllowedNames @()
+
+$compatProbeCode = @'
+import hashlib
+import importlib.metadata
+import json
+from pathlib import Path
+
+from mineru.utils.model_utils import is_heap_trim_enabled
+
+paths = (
+    "mineru/backend/vlm/vlm_analyze.py",
+    "mineru/backend/hybrid/hybrid_analyze.py",
+    "mineru/utils/model_utils.py",
+)
+root = Path("/usr/local/lib/python3.12/dist-packages")
+marker = json.loads(
+    Path("/opt/agent-invest/mineru-heap-return-v1/compatibility.json")
+    .read_text(encoding="utf-8")
+)
+print(json.dumps({
+    "marker": marker,
+    "actual_source_sha256": {
+        path: "sha256:" + hashlib.sha256((root / path).read_bytes()).hexdigest()
+        for path in paths
+    },
+    "heap_trim_enabled": is_heap_trim_enabled(),
+    "mineru_version": importlib.metadata.version("mineru"),
+}, sort_keys=True, separators=(",", ":")))
+'@
+$compatProbeOutput = @(
+    $compatProbeCode | & docker exec -i mineru-api /usr/bin/python3.12 -I -
+)
+if ($LASTEXITCODE -ne 0 -or $compatProbeOutput.Count -ne 1) {
+    throw "cannot measure the live MinerU heap-return compatibility layer"
+}
+$compatProbe = ([string]$compatProbeOutput[0]) | ConvertFrom-Json
+if ([string]$compatProbe.mineru_version -ne "3.4.4") {
+    throw "live MinerU API version drifted"
+}
+$compatLabelNames = @(
+    "io.agent-invest.mineru.base-image-digest",
+    "io.agent-invest.mineru.compatibility-policy",
+    "io.agent-invest.mineru.compatibility-patcher-sha256",
+    "io.agent-invest.mineru.compatibility-dockerfile-sha256"
+)
+$compatLabels = [ordered]@{}
+foreach ($name in $compatLabelNames) {
+    $value = $apiImageInspect[0].Config.Labels.$name
+    if ([string]::IsNullOrWhiteSpace([string]$value)) {
+        throw "MinerU API compatibility image label is missing: $name"
+    }
+    $compatLabels[$name] = [string]$value
+}
 
 $health = Invoke-RestMethod -Uri "http://127.0.0.1:30003/health" -TimeoutSec 15
 $models = Invoke-RestMethod -Uri "http://127.0.0.1:30001/v1/models" -TimeoutSec 30
@@ -176,7 +330,7 @@ if ($inferenceNetwork.Count -ne 1 -or $runtimeNetwork.Count -ne 1) {
 }
 
 $result = [ordered]@{
-    schema = "mineru-windows-runtime-observation.v2"
+    schema = "mineru-windows-runtime-observation.v3"
     observed_at_utc = (Get-Date).ToUniversalTime().ToString("o")
     collector_path = $PSCommandPath
     collector_sha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $PSCommandPath).Hash.ToLowerInvariant())"
@@ -196,6 +350,12 @@ $result = [ordered]@{
         port = if ($apiPort.Count -eq 1) { $apiPort[0] } else { $null }
         restart_policy = $api.HostConfig.RestartPolicy; health_state = [string]$api.State.Health.Status
         external_tcp_egress_blocked = $externalTcpEgressBlocked
+    }
+    api_compatibility = [ordered]@{
+        marker = $compatProbe.marker
+        actual_source_sha256 = $compatProbe.actual_source_sha256
+        heap_trim_enabled = [bool]$compatProbe.heap_trim_enabled
+        image_labels = $compatLabels
     }
     proxy = [ordered]@{
         image = [string]$proxy.Config.Image; image_id = [string]$proxy.Image

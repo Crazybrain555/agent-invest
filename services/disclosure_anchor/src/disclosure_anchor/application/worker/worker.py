@@ -24,6 +24,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import TimeoutError as SqlAlchemyTimeoutError
 
 from disclosure_anchor.application.dto.worker_report import (
     WorkerFailure,
@@ -136,6 +137,7 @@ PARSER_CONTROL_ERROR_CODES = frozenset(
         "InterfaceError",
         "OSError",
         "OperationalError",
+        "DB_POOL_EXHAUSTED",
     }
 )
 PROVIDER_INFRASTRUCTURE_ERROR_CODES = frozenset(
@@ -161,6 +163,7 @@ BUILD_INFRASTRUCTURE_ERROR_CODES = frozenset(
         "IR_READ_FAILED",
         "OSError",
         "OperationalError",
+        "DB_POOL_EXHAUSTED",
         "SEMANTIC_ROUTE_ADJUDICATION_FAILED",
         "SEMANTIC_ROUTE_ADJUDICATION_UNAVAILABLE",
     }
@@ -217,6 +220,9 @@ class WorkerConfig:
     # Raise with the *-http-client backends: local work is HTTP waiting and
     # the GPU server batches requests; keep small for local CPU backends.
     parse_concurrency: int = 1
+    # API-facing whole-document clients. PostgreSQL holds all remaining work;
+    # the production composition binds this to the machine profile.
+    mineru_client_outstanding_window: int = 1
     # Cost-aware bulkheads. Mixed queues reserve most slots for regular PDFs,
     # while heavy/huge lanes keep nominal shares and borrow idle capacity.
     parse_heavy_page_threshold: int = 80
@@ -285,9 +291,7 @@ class WorkerDeps:
     ownership_guard: Callable[[], None] = lambda: None
 
 
-def _merge_acquisition_report(
-    report: WorkerReport, acquisition: WorkerReport
-) -> None:
+def _merge_acquisition_report(report: WorkerReport, acquisition: WorkerReport) -> None:
     """Fold the acquisition thread's sub-report into the round report."""
 
     report.synced_companies += acquisition.synced_companies
@@ -295,12 +299,8 @@ def _merge_acquisition_report(
     report.downloaded += acquisition.downloaded
     report.deferred_backfill += acquisition.deferred_backfill
     report.failed += acquisition.failed
-    report.sync_quota_break = (
-        report.sync_quota_break or acquisition.sync_quota_break
-    )
-    report.sync_rate_limited = (
-        report.sync_rate_limited or acquisition.sync_rate_limited
-    )
+    report.sync_quota_break = report.sync_quota_break or acquisition.sync_quota_break
+    report.sync_rate_limited = report.sync_rate_limited or acquisition.sync_rate_limited
     report.source_outage_break = (
         report.source_outage_break or acquisition.source_outage_break
     )
@@ -397,6 +397,7 @@ def run_once(
                         limits.download > 0
                         and not acquisition.sync_quota_break
                         and not acquisition.source_outage_break
+                        and not _has_local_infrastructure_failure(acquisition)
                         and not should_stop()
                     ):
                         source = _download_stage(
@@ -426,17 +427,17 @@ def run_once(
                     # and triggered the wrong backoff (round23).
                     acquisition.failed += 1
                     acquisition.failures.append(
-                        WorkerFailure(
+                        _failure_from_exception(
                             stage="source_local",
                             item_ref="worker",
-                            error_code=type(exc).__name__,
-                            message=str(exc)[:500],
+                            exc=exc,
                         )
                     )
                 if (
                     stop_acquiring()
                     or acquisition.sync_quota_break
                     or acquisition.source_outage_break
+                    or _has_local_infrastructure_failure(acquisition)
                 ):
                     return
                 if limits.acquisition_seconds <= 0:
@@ -532,9 +533,7 @@ def _sync_stage(
             conn, interval_seconds=deps.config.sync_interval_seconds, limit=limit
         )
     if attempted is not None:
-        due = [
-            row for row in due if str(row.get("company_id")) not in attempted
-        ]
+        due = [row for row in due if str(row.get("company_id")) not in attempted]
     if not due:
         return source
     source = source or deps.source_factory()
@@ -584,12 +583,10 @@ def _sync_stage(
             # sync is atomic, therefore one company's set may cross the mark.
             if processing_backlog_now is None:
                 with deps.engine.connect() as conn:
-                    processing_backlog_now = (
-                        queries.pending_processing_backlog_count(
-                            conn,
-                            max_retries=deps.config.cninfo_max_retries,
-                            scope_classes=deps.config.process_scope_classes,
-                        )
+                    processing_backlog_now = queries.pending_processing_backlog_count(
+                        conn,
+                        max_retries=deps.config.cninfo_max_retries,
+                        scope_classes=deps.config.process_scope_classes,
                     )
             if processing_backlog_now >= deps.config.backfill_max_pending_downloads:
                 report.deferred_backfill += 1
@@ -637,6 +634,10 @@ def _sync_stage(
                 # Round-level breaker (edgartools guidance: stop, do not keep
                 # burning quota); remaining companies stay due for next round.
                 report.sync_quota_break = True
+                return source
+            if error_code == "DB_POOL_EXHAUSTED":
+                # Local DB capacity is not CNINFO downtime. Stop acquisition
+                # and let the controller use its local-failure backoff.
                 return source
             if _is_provider_infrastructure_error(error_code, retryable):
                 # A retryable provider outage is batch-wide, not 13/50
@@ -735,6 +736,8 @@ def _source_error_details(exc: BaseException) -> tuple[str, bool | None]:
     fallback = type(exc).__name__
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        if isinstance(current, SqlAlchemyTimeoutError):
+            return "DB_POOL_EXHAUSTED", True
         error_code = getattr(current, "error_code", None)
         if isinstance(error_code, str) and error_code:
             retryable = getattr(current, "retryable", None)
@@ -743,14 +746,18 @@ def _source_error_details(exc: BaseException) -> tuple[str, bool | None]:
     return fallback, None
 
 
-def _is_provider_infrastructure_error(
-    error_code: str, retryable: bool | None
-) -> bool:
+def _is_provider_infrastructure_error(error_code: str, retryable: bool | None) -> bool:
     return retryable is True and (
         error_code in PROVIDER_INFRASTRUCTURE_ERROR_CODES
         or error_code.startswith("http_5")
         or error_code == "http_429"
     )
+
+
+def _has_local_infrastructure_failure(report: WorkerReport) -> bool:
+    """Keep local DB capacity failures distinct from a provider outage."""
+
+    return any(failure.error_code == "DB_POOL_EXHAUSTED" for failure in report.failures)
 
 
 def _sync_window_start(
@@ -811,9 +818,7 @@ def _download_stage(
             )
             continue
         try:
-            result = downloader.execute(
-                DownloadDocumentCommand(candidate=candidate)
-            )
+            result = downloader.execute(DownloadDocumentCommand(candidate=candidate))
         except Exception as exc:
             error_code, retryable = _source_error_details(exc)
             report.failed += 1
@@ -823,8 +828,11 @@ def _download_stage(
                     item_ref=item_ref,
                     error_code=error_code,
                     retryable=retryable,
+                    message=str(exc)[:500],
                 )
             )
+            if error_code == "DB_POOL_EXHAUSTED":
+                return source
             if _is_provider_infrastructure_error(error_code, retryable):
                 report.source_outage_break = True
                 return source
@@ -846,6 +854,8 @@ def _download_stage(
                     retryable=result.retryable,
                 )
             )
+            if result.error_code == "DB_POOL_EXHAUSTED":
+                return source
             if _is_provider_infrastructure_error(
                 result.error_code or "", result.retryable
             ):
@@ -916,6 +926,40 @@ class _ResidentParseHooks:
     admission_retry_remaining: Callable[[], float] = lambda: 0.0
 
 
+def _failure_from_exception(
+    *,
+    stage: str,
+    item_ref: str,
+    exc: Exception,
+) -> WorkerFailure:
+    """Preserve typed infrastructure detail at the thread-pool boundary."""
+
+    structured_error = getattr(exc, "error", None)
+    if isinstance(structured_error, dict):
+        retryable_value = structured_error.get("retryable")
+        return WorkerFailure(
+            stage=stage,
+            item_ref=item_ref,
+            error_code=_error_code(structured_error),
+            retryable=(bool(retryable_value) if retryable_value is not None else None),
+            message=str(structured_error.get("message") or str(exc))[:500],
+        )
+    if isinstance(exc, SqlAlchemyTimeoutError):
+        return WorkerFailure(
+            stage=stage,
+            item_ref=item_ref,
+            error_code="DB_POOL_EXHAUSTED",
+            retryable=True,
+            message=str(exc)[:500],
+        )
+    return WorkerFailure(
+        stage=stage,
+        item_ref=item_ref,
+        error_code=type(exc).__name__,
+        message=str(exc)[:500],
+    )
+
+
 class _ResidentAdmissionController:
     """Pause only new parse admission across typed live-service outages."""
 
@@ -965,9 +1009,7 @@ class _ResidentAdmissionController:
                     admission_status="unavailable",
                     admission_reason=self._latest_reason,
                     admission_first_failure_at=self._first_failure_at,
-                    admission_consecutive_failures=(
-                        self._consecutive_failures
-                    ),
+                    admission_consecutive_failures=(self._consecutive_failures),
                     admission_next_probe_at=next_probe_at,
                     failures=[
                         WorkerFailure(
@@ -1000,15 +1042,12 @@ class _ResidentAdmissionController:
                     admission_status="available",
                     admission_reason=None,
                     admission_first_failure_at=self._first_failure_at,
-                    admission_consecutive_failures=(
-                        self._consecutive_failures
-                    ),
+                    admission_consecutive_failures=(self._consecutive_failures),
                     admission_next_probe_at=None,
                 )
             )
             LOGGER.info(
-                "MinerU live admission recovered after %s consecutive "
-                "failure(s)",
+                "MinerU live admission recovered after %s consecutive failure(s)",
                 self._consecutive_failures,
             )
         self._delay_seconds = self._initial_backoff_seconds
@@ -1067,7 +1106,7 @@ def _parse_lane(item: _ParseWorkItem, config: WorkerConfig) -> _ParseLane:
     ):
         return _ParseLane.HUGE
     if item.page_count is None:
-        return _ParseLane.HEAVY
+        return _ParseLane.HUGE
     if item.page_count >= config.parse_huge_page_threshold:
         return _ParseLane.HUGE
     if item.page_count >= config.parse_heavy_page_threshold:
@@ -1132,9 +1171,7 @@ def _parse_expected_seconds(deps: WorkerDeps, item: _ParseWorkItem) -> int:
     )
 
 
-def _parse_one_document(
-    deps: WorkerDeps, item: _ParseWorkItem
-) -> _DocOutcome:
+def _parse_one_document(deps: WorkerDeps, item: _ParseWorkItem) -> _DocOutcome:
     """Parse one whole PDF; downstream build/publish uses a separate pool."""
 
     outcome = _DocOutcome()
@@ -1182,15 +1219,10 @@ def _parse_one_document(
         outcome.parsed = True
         outcome.processing_run_id = parse_result.processing_run_id
     except Exception as exc:
-        structured_error = getattr(exc, "error", None)
-        outcome.failure = WorkerFailure(
+        outcome.failure = _failure_from_exception(
             stage="parse",
             item_ref=document_id,
-            error_code=(
-                _error_code(structured_error)
-                if isinstance(structured_error, dict)
-                else type(exc).__name__
-            ),
+            exc=exc,
         )
     return outcome
 
@@ -1216,9 +1248,7 @@ def _finalize_one_document(
             ),
             semantic_router=deps.semantic_router,
             semantic_receipts=deps.semantic_receipts,
-        ).execute(
-            BuildUnitsCommand(processing_run_id=processing_run_id)
-        )
+        ).execute(BuildUnitsCommand(processing_run_id=processing_run_id))
         if build_result.status != "succeeded":
             structured_error = build_result.error
             outcome.failure = WorkerFailure(
@@ -1242,22 +1272,10 @@ def _finalize_one_document(
         if build_result.build_stats:
             outcome.build_stats = dict(build_result.build_stats)
     except Exception as exc:
-        structured_error = getattr(exc, "error", None)
-        outcome.failure = WorkerFailure(
+        outcome.failure = _failure_from_exception(
             stage=stage,
             item_ref=document_id,
-            error_code=(
-                _error_code(structured_error)
-                if isinstance(structured_error, dict)
-                else type(exc).__name__
-            ),
-            retryable=(
-                bool(structured_error.get("retryable"))
-                if isinstance(structured_error, dict)
-                and structured_error.get("retryable") is not None
-                else None
-            ),
-            message=str(exc)[:500],
+            exc=exc,
         )
         return outcome
 
@@ -1292,9 +1310,7 @@ def _publish_one_document(
                 semantic_router=deps.semantic_router,
                 semantic_receipts=deps.semantic_receipts,
             ),
-        ).execute(
-            PublishRunCommand(processing_run_id=processing_run_id)
-        )
+        ).execute(PublishRunCommand(processing_run_id=processing_run_id))
         if publish_result.status != "published":
             outcome.failure = WorkerFailure(
                 stage="publish",
@@ -1305,22 +1321,10 @@ def _publish_one_document(
         outcome.published = True
         outcome.superseded_run = publish_result.superseded_run_id is not None
     except Exception as exc:
-        structured_error = getattr(exc, "error", None)
-        outcome.failure = WorkerFailure(
+        outcome.failure = _failure_from_exception(
             stage="publish",
             item_ref=document_id,
-            error_code=(
-                _error_code(structured_error)
-                if isinstance(structured_error, dict)
-                else type(exc).__name__
-            ),
-            retryable=(
-                bool(structured_error.get("retryable"))
-                if isinstance(structured_error, dict)
-                and structured_error.get("retryable") is not None
-                else None
-            ),
-            message=str(exc)[:500],
+            exc=exc,
         )
     return outcome
 
@@ -1395,19 +1399,12 @@ def publish_failures_indicate_outage(
     """Keep deterministic publication poison local to its processing run."""
 
     publish_codes = [
-        failure.error_code
-        for failure in failures
-        if failure.stage == "publish"
+        failure.error_code for failure in failures if failure.stage == "publish"
     ]
-    if any(
-        code in PUBLISH_INFRASTRUCTURE_ERROR_CODES
-        for code in publish_codes
-    ):
+    if any(code in PUBLISH_INFRASTRUCTURE_ERROR_CODES for code in publish_codes):
         return True
     unknown_counts = Counter(
-        code
-        for code in publish_codes
-        if code not in PUBLISH_ITEM_LOCAL_ERROR_CODES
+        code for code in publish_codes if code not in PUBLISH_ITEM_LOCAL_ERROR_CODES
     )
     return any(count >= 2 for count in unknown_counts.values())
 
@@ -1417,10 +1414,7 @@ def _halts_parse_refill(
 ) -> bool:
     failure = outcome.failure
     return failure is not None and (
-        (
-            failure.stage == "publish"
-            and publish_failures_indicate_outage(failures)
-        )
+        (failure.stage == "publish" and publish_failures_indicate_outage(failures))
         or (failure.stage == "build" and build_failures_indicate_outage(failures))
         or (
             failure.stage == "parse"
@@ -1522,9 +1516,7 @@ def run_resident_parse(
         raise ValueError("idle_poll_seconds must be positive")
     if outage_backoff_initial_seconds <= 0:
         raise ValueError("outage_backoff_initial_seconds must be positive")
-    if limit > 0 and (
-        build_recovery_limit <= 0 or publish_recovery_limit <= 0
-    ):
+    if limit > 0 and (build_recovery_limit <= 0 or publish_recovery_limit <= 0):
         raise ValueError(
             "resident parse requires positive build and publish recovery "
             "limits so shared downstream recovery can be proven before "
@@ -1590,16 +1582,13 @@ def run_resident_parse(
             unhandled_outage = True
             recovery_report.failed += 1
             recovery_report.failures.append(
-                WorkerFailure(
+                _failure_from_exception(
                     stage="build",
                     item_ref="resident_finalize_recovery",
-                    error_code=type(exc).__name__,
-                    message=str(exc)[:500],
+                    exc=exc,
                 )
             )
-        recovery_report.duration_seconds = (
-            time.monotonic() - started_monotonic
-        )
+        recovery_report.duration_seconds = time.monotonic() - started_monotonic
         if _report_has_observations(recovery_report):
             emit_report(recovery_report)
         return unhandled_outage or (
@@ -1635,9 +1624,7 @@ def run_resident_parse(
                 emit_report=emit_report,
                 build_recovery_limit=max(0, build_recovery_limit),
                 publish_recovery_limit=max(0, publish_recovery_limit),
-                admission_backoff_initial_seconds=(
-                    outage_backoff_initial_seconds
-                ),
+                admission_backoff_initial_seconds=(outage_backoff_initial_seconds),
                 admission_backoff_max_seconds=outage_backoff_max_seconds,
                 admission_ready=admission.ready,
                 admission_retry_remaining=admission.retry_remaining,
@@ -1751,9 +1738,7 @@ def _parse_one_batch(
                     document_ids=tuple(due_retry_ids),
                 )
             selected.extend(due_rows)
-            selected_ids.update(
-                str(row["document_id"]) for row in due_rows
-            )
+            selected_ids.update(str(row["document_id"]) for row in due_rows)
         scan_start = candidate_cursor
         wrapped = scan_start is None
         while len(selected) < candidate_limit:
@@ -1776,10 +1761,7 @@ def _parse_one_batch(
             for row in page:
                 document_id = str(row["document_id"])
                 last_examined_id = document_id
-                if (
-                    document_id in known_ids
-                    or document_id in selected_ids
-                ):
+                if document_id in known_ids or document_id in selected_ids:
                     continue
                 selected.append(row)
                 selected_ids.add(document_id)
@@ -1817,17 +1799,13 @@ def _parse_one_batch(
                 readiness(deps.parser_options)
         except (ParserVersionProbeError, ParserOutputContractError) as exc:
             retryable = isinstance(exc, ParserVersionProbeError)
-            already_recorded = (
-                readiness_failures >= PARSER_READINESS_FAILURE_THRESHOLD
-            )
+            already_recorded = readiness_failures >= PARSER_READINESS_FAILURE_THRESHOLD
             readiness_failures = (
                 readiness_failures + 1
                 if retryable
                 else PARSER_READINESS_FAILURE_THRESHOLD
             )
-            readiness_retry_at = (
-                time.monotonic() + PARSER_READINESS_RETRY_SECONDS
-            )
+            readiness_retry_at = time.monotonic() + PARSER_READINESS_RETRY_SECONDS
             LOGGER.warning(
                 "MinerU readiness probe failed (%s/%s); admission paused: %s",
                 readiness_failures,
@@ -1867,7 +1845,13 @@ def _parse_one_batch(
     if not work_items:
         return "empty"
 
-    concurrency = max(1, deps.config.parse_concurrency)
+    concurrency = max(
+        1,
+        min(
+            deps.config.parse_concurrency,
+            deps.config.mineru_client_outstanding_window,
+        ),
+    )
     queued = {lane: deque[_ParseWorkItem]() for lane in _ParseLane}
     input_order: dict[str, int] = {}
     sequence = 0
@@ -1918,6 +1902,30 @@ def _parse_one_batch(
             readiness_deferred = False
             admission_deferred = False
 
+        def record_direct_admission_unavailable(
+            exc: WorkerAdmissionUnavailableError,
+        ) -> None:
+            """Close a bounded once wave without losing its durable report."""
+
+            if report.admission_status == "unavailable":
+                return
+            reason = str(exc)[:500]
+            report.admission_status = "unavailable"
+            report.admission_reason = reason
+            report.admission_first_failure_at = deps.clock()
+            report.admission_consecutive_failures = 1
+            report.failed += 1
+            report.failures.append(
+                WorkerFailure(
+                    stage="admission",
+                    item_ref="mineru_live_probe",
+                    error_code=type(exc).__name__,
+                    retryable=True,
+                    message=reason,
+                )
+            )
+            halt_admission()
+
         def rotate_report(*, force: bool = False) -> None:
             nonlocal report, report_started_monotonic, report_due_monotonic
             if resident_hooks is None:
@@ -1939,9 +1947,7 @@ def _parse_one_batch(
                 report.parse_peak_inflight = len(parse_futures)
                 resident_hooks.emit_report(completed_report)
             report_started_monotonic = now
-            report_due_monotonic = (
-                now + resident_hooks.report_interval_seconds
-            )
+            report_due_monotonic = now + resident_hooks.report_interval_seconds
 
         def outcome_halts_admission(outcome: _DocOutcome) -> bool:
             failure = outcome.failure
@@ -1950,8 +1956,7 @@ def _parse_one_batch(
             now = time.monotonic()
             while (
                 control_failures
-                and now - control_failures[0][0]
-                > DOWNSTREAM_CONTROL_EVIDENCE_SECONDS
+                and now - control_failures[0][0] > DOWNSTREAM_CONTROL_EVIDENCE_SECONDS
             ):
                 control_failures.popleft()
             if failure.stage in {"build", "publish"}:
@@ -1968,9 +1973,7 @@ def _parse_one_batch(
                 return
             available = max(
                 0,
-                finalize_backlog_limit
-                - len(parse_futures)
-                - len(finalize_futures),
+                finalize_backlog_limit - len(parse_futures) - len(finalize_futures),
             )
             if available <= 0:
                 return
@@ -1984,15 +1987,10 @@ def _parse_one_batch(
             # does not know that run id yet. Exclude every document still
             # registered in either pool.
             active_document_ids = {
-                admitted.item.document_id
-                for admitted in parse_futures.values()
-            } | {
-                item.document_id for item in finalize_futures.values()
-            }
+                admitted.item.document_id for admitted in parse_futures.values()
+            } | {item.document_id for item in finalize_futures.values()}
             try:
-                build_limit = min(
-                    available, resident_hooks.build_recovery_limit
-                )
+                build_limit = min(available, resident_hooks.build_recovery_limit)
                 with deps.engine.connect() as conn:
                     pending_build = (
                         queries.pending_build(
@@ -2008,10 +2006,7 @@ def _parse_one_batch(
                         break
                     run_id = str(row["processing_run_id"])
                     document_id = str(row["document_id"])
-                    if (
-                        run_id in active_run_ids
-                        or document_id in active_document_ids
-                    ):
+                    if run_id in active_run_ids or document_id in active_document_ids:
                         continue
                     finalize_futures[
                         finalize_pool.submit(
@@ -2029,9 +2024,7 @@ def _parse_one_batch(
                     available -= 1
                     build_limit -= 1
 
-                publish_limit = min(
-                    available, resident_hooks.publish_recovery_limit
-                )
+                publish_limit = min(available, resident_hooks.publish_recovery_limit)
                 with deps.engine.connect() as conn:
                     pending_publish = (
                         queries.pending_publish(
@@ -2046,10 +2039,7 @@ def _parse_one_batch(
                         break
                     run_id = str(row["processing_run_id"])
                     document_id = str(row["document_id"])
-                    if (
-                        run_id in active_run_ids
-                        or document_id in active_document_ids
-                    ):
+                    if run_id in active_run_ids or document_id in active_document_ids:
                         continue
                     finalize_futures[
                         finalize_pool.submit(
@@ -2068,11 +2058,10 @@ def _parse_one_batch(
                     publish_limit -= 1
             except Exception as exc:
                 failure = _DocOutcome(
-                    failure=WorkerFailure(
+                    failure=_failure_from_exception(
                         stage="build",
                         item_ref="resident_finalize_recovery",
-                        error_code=type(exc).__name__,
-                        message=str(exc)[:500],
+                        exc=exc,
                     )
                 )
                 _fold_outcome(report, failure)
@@ -2090,23 +2079,27 @@ def _parse_one_batch(
             if not rolling_admission and dispatched >= limit:
                 return False
             allowed_lanes = tuple(_ParseLane)
-            ready = tuple(
-                lane for lane in allowed_lanes if queued[lane]
-            )
-            if (
-                not ready
-                and rolling_admission
-                and admission_open()
-            ):
+            ready = tuple(lane for lane in allowed_lanes if queued[lane])
+            if not ready and rolling_admission and admission_open():
                 new_items = dequeue()
                 enqueue(new_items)
-                ready = tuple(
-                    lane for lane in allowed_lanes if queued[lane]
+                ready = tuple(lane for lane in allowed_lanes if queued[lane])
+            if lane_inflight[_ParseLane.HUGE] > 0:
+                return False
+            if ready:
+                oldest_lane = min(
+                    ready,
+                    key=lambda candidate: input_order[
+                        queued[candidate][0].document_id
+                    ],
                 )
+                # Huge and unknown PDFs are exclusive. If one is next in FIFO
+                # order, drain already admitted regular/heavy work rather than
+                # continually bypassing it with newer cheap documents.
+                if oldest_lane == _ParseLane.HUGE and parse_futures:
+                    return False
             occupied_elsewhere = sum(
-                lane_inflight[lane]
-                for lane in _ParseLane
-                if lane not in ready
+                lane_inflight[lane] for lane in _ParseLane if lane not in ready
             )
             caps = _parse_lane_caps(
                 ready=ready,
@@ -2114,36 +2107,29 @@ def _parse_one_batch(
                 config=deps.config,
             )
             eligible = tuple(
-                lane
-                for lane in ready
-                if lane_inflight[lane] < caps.get(lane, 0)
+                lane for lane in ready if lane_inflight[lane] < caps.get(lane, 0)
             )
             if not eligible:
                 return False
             lane = min(
                 eligible,
-                key=lambda candidate: input_order[
-                    queued[candidate][0].document_id
-                ],
+                key=lambda candidate: input_order[queued[candidate][0].document_id],
             )
+            if lane == _ParseLane.HUGE and parse_futures:
+                return False
             item = queued[lane].popleft()
             input_order.pop(item.document_id, None)
             expected_seconds = _parse_expected_seconds(deps, item)
             admitted_at = time.monotonic()
             future = parse_pool.submit(_parse_one_document, deps, item)
-            parse_futures[future] = (
-                _InFlightParse(
-                    item=item,
-                    lane=lane,
-                    expected_seconds=expected_seconds,
-                    expected_until_monotonic=(
-                        admitted_at + expected_seconds
-                    ),
-                    runaway_until_monotonic=(
-                        admitted_at
-                        + deps.config.parse_runaway_timeout_seconds
-                    ),
-                )
+            parse_futures[future] = _InFlightParse(
+                item=item,
+                lane=lane,
+                expected_seconds=expected_seconds,
+                expected_until_monotonic=(admitted_at + expected_seconds),
+                runaway_until_monotonic=(
+                    admitted_at + deps.config.parse_runaway_timeout_seconds
+                ),
             )
             lane_inflight[lane] += 1
             dispatched += 1
@@ -2165,14 +2151,8 @@ def _parse_one_batch(
             if (
                 halt_refill
                 or should_stop()
-                or (
-                    rolling_admission
-                    and not admission_open()
-                )
-                or (
-                    not rolling_admission
-                    and dispatched >= limit
-                )
+                or (rolling_admission and not admission_open())
+                or (not rolling_admission and dispatched >= limit)
             ):
                 # A deferred probe is meaningful only while admission can
                 # still resume. Closing the window or halting must not leave
@@ -2186,11 +2166,15 @@ def _parse_one_batch(
                     return
                 admission_deferred = False
             else:
-                deps.admission_guard()
-            if (
-                readiness_deferred
-                and time.monotonic() < readiness_retry_at
-            ):
+                try:
+                    deps.admission_guard()
+                except WorkerAdmissionUnavailableError as exc:
+                    # Direct/once mode has no resident admission controller.
+                    # Stop only new submissions, then let the existing pools
+                    # drain/fold so the caller can append an honest report.
+                    record_direct_admission_unavailable(exc)
+                    return
+            if readiness_deferred and time.monotonic() < readiness_retry_at:
                 return
             # One coordinator owns admission health. MinerU caches successful
             # remote probes for 60 seconds, so this is cheap, but every refill
@@ -2207,8 +2191,7 @@ def _parse_one_batch(
             while (
                 not halt_refill
                 and len(parse_futures) < concurrency
-                and len(parse_futures) + len(finalize_futures)
-                < finalize_backlog_limit
+                and len(parse_futures) + len(finalize_futures) < finalize_backlog_limit
                 and submit_one()
             ):
                 pass
@@ -2228,10 +2211,7 @@ def _parse_one_batch(
                 if should_stop():
                     halt_admission()
                     break
-                if (
-                    rolling_admission
-                    and not admission_open()
-                ):
+                if rolling_admission and not admission_open():
                     readiness_deferred = False
                     admission_deferred = False
                     break
@@ -2324,7 +2304,10 @@ def _parse_one_batch(
                     if not resident_hooks.admission_ready():
                         admission_deferred = True
                 else:
-                    deps.admission_guard()
+                    try:
+                        deps.admission_guard()
+                    except WorkerAdmissionUnavailableError as exc:
+                        record_direct_admission_unavailable(exc)
                 if (
                     not admission_deferred
                     and readiness_deferred
@@ -2348,18 +2331,15 @@ def _parse_one_batch(
                     outcome = future.result()
                 except Exception as exc:  # defensive boundary around a worker future
                     outcome = _DocOutcome(
-                        failure=WorkerFailure(
+                        failure=_failure_from_exception(
                             stage="parse",
                             item_ref=admitted.item.document_id,
-                            error_code=type(exc).__name__,
+                            exc=exc,
                         )
                     )
                 _fold_outcome(report, outcome)
                 deps.heartbeat()
-                if (
-                    outcome.parsed
-                    and outcome.processing_run_id is not None
-                ):
+                if outcome.parsed and outcome.processing_run_id is not None:
                     processing_run_id = outcome.processing_run_id
                     finalize_futures[
                         finalize_pool.submit(
@@ -2379,18 +2359,11 @@ def _parse_one_batch(
                     successful_history.append(admitted.item.document_id)
                     while len(successful_history) > candidate_limit:
                         known_ids.discard(successful_history.popleft())
-                elif (
-                    outcome.failure is not None
-                    and outcome.failure.stage == "parse"
-                ):
+                elif outcome.failure is not None and outcome.failure.stage == "parse":
                     if outcome.failure.retryable is False:
-                        successful_history.append(
-                            admitted.item.document_id
-                        )
+                        successful_history.append(admitted.item.document_id)
                         while len(successful_history) > candidate_limit:
-                            known_ids.discard(
-                                successful_history.popleft()
-                            )
+                            known_ids.discard(successful_history.popleft())
                     else:
                         # Retry after one fixed candidate window worth of
                         # other admissions. This is bounded, work-based
@@ -2411,10 +2384,10 @@ def _parse_one_batch(
                     outcome = future.result()
                 except Exception as exc:
                     outcome = _DocOutcome(
-                        failure=WorkerFailure(
+                        failure=_failure_from_exception(
                             stage="build",
                             item_ref=finalized.document_id,
-                            error_code=type(exc).__name__,
+                            exc=exc,
                         )
                     )
                 _fold_outcome(report, outcome)
@@ -2464,17 +2437,9 @@ def _build_stage(
         try:
             result = use_case.execute(BuildUnitsCommand(processing_run_id=run_id))
         except Exception as exc:
-            structured_error = getattr(exc, "error", None)
-            error_code = (
-                _error_code(structured_error)
-                if isinstance(structured_error, dict)
-                else type(exc).__name__
-            )
             report.failed += 1
             report.failures.append(
-                WorkerFailure(
-                    stage="build", item_ref=run_id, error_code=error_code
-                )
+                _failure_from_exception(stage="build", item_ref=run_id, exc=exc)
             )
             if build_failures_indicate_outage(report.failures):
                 return
@@ -2526,26 +2491,12 @@ def _publish_stage(
             # Continue with the rest of the batch: a single deterministically
             # failing run must not head-of-line block every other document's
             # publish round after round (round23).
-            structured_error = getattr(exc, "error", None)
-            error_code = (
-                _error_code(structured_error)
-                if isinstance(structured_error, dict)
-                else type(exc).__name__
-            )
             report.failed += 1
             report.failures.append(
-                WorkerFailure(
-                    stage="publish",
-                    item_ref=run_id,
-                    error_code=error_code,
-                    retryable=(
-                        bool(structured_error.get("retryable"))
-                        if isinstance(structured_error, dict)
-                        else None
-                    ),
-                    message=str(exc)[:500],
-                )
+                _failure_from_exception(stage="publish", item_ref=run_id, exc=exc)
             )
+            if publish_failures_indicate_outage(report.failures):
+                return
             continue
         if result.status == "published":
             report.published += 1
@@ -2590,11 +2541,10 @@ def _project_stage(
     except Exception as exc:
         report.failed += 1
         report.failures.append(
-            WorkerFailure(
+            _failure_from_exception(
                 stage="project",
                 item_ref="search_projection",
-                error_code=type(exc).__name__,
-                message=str(exc)[:500],
+                exc=exc,
             )
         )
         return
@@ -2646,8 +2596,7 @@ def render_report_section(report: WorkerReport) -> str:
             if report.admission_first_failure_at is not None
             else "None"
         ),
-        "- admission_consecutive_failures: "
-        f"{report.admission_consecutive_failures}",
+        f"- admission_consecutive_failures: {report.admission_consecutive_failures}",
         "- admission_next_probe_at: "
         + (
             report.admission_next_probe_at.isoformat()

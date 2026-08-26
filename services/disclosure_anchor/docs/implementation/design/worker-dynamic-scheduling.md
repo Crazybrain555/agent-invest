@@ -166,7 +166,7 @@ request broker 或内部 window 失败续跑 checkpoint；alpha 不进入本轮�
 
 | 成熟实现 | 官方机制 | 本系统采用的原则 | 没有照搬的部分 |
 |---|---|---|---|
-| [MinerU](https://github.com/opendatalab/MinerU/blob/mineru-3.4.0-released/docs/en/usage/quick_usage.md) | 临时 API、显式 `max_concurrency`、整本文档输出 | 在官方请求入口设硬上限；保留 whole-PDF 语义 | 不 patch MinerU 内部，不把 processing window 当可恢复外部分片 |
+| [MinerU](https://github.com/opendatalab/MinerU/blob/mineru-3.4.0-released/docs/en/usage/quick_usage.md) | 临时 API、显式 `max_concurrency`、整本文档输出 | 在官方请求入口设硬上限；保留 whole-PDF 语义 | 不做解析语义私有 fork；临时 exact-source allocator 兼容层须独立绑定并可删除；不把 processing window 当可恢复外部分片 |
 | [vLLM](https://docs.vllm.ai/en/stable/) / [SchedulerConfig](https://docs.vllm.ai/en/stable/api/vllm/config/scheduler/) | continuous batching；`max_num_seqs` 限每轮处理 sequence 数 | 客户端平滑、有界地供给，动态合批交给 vLLM | 不把 waiting queue 当 admission control，不靠提交海量请求“喂满”GPU |
 | [Docling pipeline](https://docling-project.github.io/docling/reference/pipeline_options/) | OCR/layout/table 分阶段 batch；bounded queue 满时上游阻塞；`document_timeout=None` 默认不强杀 | 页/阶段窗口限制工作集，总时长只是可选业务策略 | 不把 Docling 的 partial-success timeout 套到 MinerU 原子整本产物 |
 | [Celery optimization](https://docs.celeryq.dev/en/latest/userguide/optimizing.html) | 长短任务使用分别配置的 worker/queue；长任务 prefetch multiplier 取 1；resident consumer 持续取任务 | 大小 lane；执行槽空一个才取一个；监控/事件周期不结束 consumer 生命周期 | 不引入 Redis/RabbitMQ 或第二份任务真相 |
@@ -191,20 +191,23 @@ request broker 或内部 window 失败续跑 checkpoint；alpha 不进入本轮�
 
 ## 4. 针对本系统的动态调度闭环
 
-### 4.1 GPU 请求层：固定 API 的 21/128 静态安全包络
+### 4.1 GPU 请求层：固定 API 的 7/128 静态安全包络
 
 生产配置的文档槽仍为 16，但请求安全边界独立配置：
 
 ```text
 WORKER_GPU_MAX_SEQUENCES=128
-WORKER_GPU_REQUEST_BUDGET=21
+WORKER_GPU_REQUEST_BUDGET=7
 WORKER_PARSE_CONCURRENCY=16
-固定 MinerU API 文档 task slots = 3
+WORKER_MINERU_CLIENT_OUTSTANDING_WINDOW=1
+固定 MinerU API 文档 task slots = 1
 每个 active task 的 service-side VLM max-concurrency = 7
-worker 正常稳态 active upper bound: 3 × 7 = 21 < 128
+worker 正常稳态 active upper bound: 1 × 7 = 7 < 128
 ```
 
-16 是 client 可同时提交的文档数，不是 active GPU 请求数；超过 3 个的文档在固定 API 队列等待。
+16 是本地候选/线程配置上限，不再等于 API-facing 并发。实际 client outstanding 取 client window
+与 attested task slots 的较小值，当前为 1；API 未提供 cancel，durable backlog 因此只留在
+PostgreSQL，不预先进入 process-local task registry。huge 与未知页数任务独占窗口。
 该式只证明**单 persistent API identity 的配置上界**：
 
 - `max_num_seqs=128` 仍须在发布时从远端启动配置或等价运营证据复核；当前 metrics
@@ -223,7 +226,7 @@ admin/pipeline 在执行前还必须取得与 resident worker 相同的 PostgreS
 lock；拿不到就 fail closed（admin 409 / CLI busy），从而当前单机部署不会同时出现两个仓内
 生产者。resident 在每次补槽和最长 30 秒的等待边界复核同一 lock session；失锁先终止本进程
 MinerU，再禁止新准入。它仍不是分布式 fencing。若未来需要多 worker 或允许其他服务直连
-GPU，届时应把 21 的 active budget 上移到统一 gateway/Envoy/Ray 类 admission 层，而不是继续加本地
+GPU，届时应把 active budget 上移到统一 gateway/Envoy/Ray 类 admission 层，而不是继续加本地
 semaphore。
 
 ### 4.2 文档层：三 lane、名义份额与借用
@@ -233,8 +236,8 @@ semaphore。
 | lane | 默认范围 | 三类都饱和、16 槽时的名义份额 |
 |---|---:|---:|
 | regular | `<80` 页 | 11 |
-| heavy | `80–499` 页，或页数探测失败 | 4 |
-| huge | `>=500` 页，或归档实测字节超过兼容阈值 | 1 |
+| heavy | `80–499` 页 | 4 |
+| huge | `>=500` 页、页数未知，或归档实测字节超过兼容阈值 | 1 |
 
 候选按 `document_id` 取前 1,000。实盘快照中该前缀同时含 regular/heavy，但这是观测，
 不是全 backlog 的保证；名义份额与借用只在当前候选窗口内成立。每次选取遵守：
@@ -244,7 +247,7 @@ semaphore。
 - lane 均有任务时，regular/heavy/huge 保留名义份额；
 - 任一 lane 为空，其他 lane 立即借用其空槽；
 - 同一 lane 内保留 DB 候选顺序；
-- unknown 进入 heavy，避免未知成本冒充短公告；
+- unknown 进入 huge 并独占，避免未知成本冒充普通长公告；
 - 不按 document id、发行人、标题或失败样本特判。
 
 若 A/B 观测到候选窗口长期 `regular=0`，再把页数/成本持久化并改为 per-lane keyset
@@ -253,14 +256,14 @@ semaphore。
 这就是本系统的“动态”：动态选择下一份 whole PDF，并在 lane 之间借用空闲文档槽；
 GPU 请求总预算本身保持静态。必须诚实记录一个当前 MinerU 3.4 的能力缺口：
 
-- 21 由固定 API 的 `3 task slots × 7 inference concurrency` 形成保守配置上界；
+- 7 由固定 API 的 `1 task slot × 7 inference concurrency` 形成保守配置上界；
 - 固定 API 共享文档任务 semaphore，但内层 `aio_batch_two_step_extract()` 仍为每个 active task
   创建私有 semaphore，因此它不是 GPU 请求级的全局 work-conserving token pool；
-- 这正是 processing 必须固定不超过 3、8/16 阶段必须观察到 queue、vLLM 与 API 指标必须分开
+- 这正是 processing 必须固定不超过 1、客户端 outstanding 必须不超过 1、无需为测试人为制造 process-local queue、vLLM 与 API 指标必须分开
   记录的原因；
 - `mineru-router` 只按整任务负载在多个 API/GPU 间选 upstream，单 GPU 不提供内层请求借用。
 
-所以静态 21 是当前待 commissioning 的保守边界，不应冒充最终共享 broker。真正尾部借满需要 MinerU
+所以静态 7 是当前 slots=1 commissioning 的保守边界，不应冒充最终共享 broker。真正尾部借满需要 MinerU
 上游把 app-scoped semaphore 传到所有 VLM client 调用，或在统一 GPU 请求入口使用成熟的
 有界、公平 admission gateway；不能靠再提高每文档并发或手写裸 semaphore 代理替代。
 
@@ -275,7 +278,7 @@ resident 仍在 acquisition/report deadline 到期时停止 admission 并排空�
   PostgreSQL pending_parse
         │  1000 候选、三 lane 名义份额 + 空槽借用
         ▼
-  parse pool（16，完成一个立即补一个）
+  本地候选/线程池（配置上限 16；当前 API-facing 提交窗口 1）
         │ parse 成功即释放 GPU 文档槽
         ▼
   同一 finalize coordinator / bounded pool
@@ -304,6 +307,13 @@ maintenance thread                 report writer thread
   后才完成 deactivation，或提交后立刻崩溃，易失的进程内 prune 信号也不会跨重启丢失；
 - parse 成功即释放 lane/GPU 槽；`parse_futures + finalize_futures` 最多
   `2 × parse_concurrency`，避免把瓶颈搬成无界 finalize 内存队列；
+- PostgreSQL QueuePool 不使用 SQLAlchemy 的固定默认 `5+10`。每个 active parse/finalize 在完整
+  document producer lease 期间持有一条 session connection，并可能短暂再取一条 transaction
+  connection；因此 worker 从当前 `parse_concurrency + finalize_concurrency` 动态派生
+  `pool_size=(active documents + 4 control checkouts)`、`max_overflow=active documents`。四条
+  control 容量覆盖 maintenance 持有 corpus-writer lease 时的嵌套 registration/failure UoW、
+  resident coordinator 与 report snapshot 的合法并发；默认 16+2 即 `22+18=40`，overflow 在
+  突发结束后释放；改变并发或机器配置时不需要同步修改第二个常量；
 - build/publish 只有**同一个 coordinator**准入：正常 run 直接进入 finalize pool；
   周期报告安全点从 DB 有界 seed crash/瞬时失败 leftovers，并按 run id 排除 active future；
   队列尾部则在没有 parse pool 活跃时做一轮有界补漏。不会并行启动第二个 BuildUnits consumer；
@@ -483,7 +493,7 @@ artifact、overlap/context、deterministic merge、exactly-once commit，以及�
 
 | 风险/入口 | 当前任务分支 | 边界或待验证项 |
 |---|---|---|
-| resident worker 内层请求扇出 | 固定 API `3 task slots × 7 inference=21`，16 只是 client submit slots | commissioning 必须从 runtime v3 manifest、API health 与两轮 4/8/16 receipt 核对 |
+| resident worker 内层请求扇出 | 固定 API `1 task slot × 7 inference=7`，16 是本地候选上限，实际 client outstanding=1 | commissioning 必须从 runtime v5 manifest、API health、heap-return compatibility、外部 Docker epoch/OOM/RSS/memory 与两轮 4/8/16 文档 receipt 核对 |
 | admin 与 pipeline 并发绕行 | 已统一 cap，并用同一 PostgreSQL advisory lock 排他 | 仓外直连 GPU 的客户端不受控 |
 | 大小不一导致短任务饥饿 | 已有 regular/heavy/huge 名义份额和借用 | 页数只是初始代理；历史 GPU 秒 EWMA 尚未引入 |
 | 固定 200 / 一小时 round 批尾 | resident 常驻补槽；`WORKER_BATCH_PARSE` 仅约束 once；报告快照不排空 | 需 A/B 验证 3–10 分钟尾部及 2026-07-26 的 deadline 长谷是否消失 |
@@ -496,7 +506,7 @@ artifact、overlap/context、deterministic merge、exactly-once commit，以及�
 | provider 大小提示混合单位 | 不再写/读取 `oversized` 准入键；使用归档实测 `byte_count` 只决定 HUGE lane | 旧 89 份全部恢复准入；无需重新下载 |
 | health 抖动毁掉成功产物 | readiness 前置，成功后不再探活判废 | 已上线验证产物不被判废 |
 | 单次 readiness 假阴性停止整轮 | 连续失败阈值 3；阈值前暂停 5 秒并在原 dispatcher 恢复 | 21:08 重启后已观测一次失败、随后继续 refill；仍需完整 A/B 窗 |
-| 文档级 AIMD 锯齿 | 已删除容量 AIMD；只有明确 overload 才停 refill/cooldown | 静态 21 是否最优需用 API queue、vLLM queue/KV 与吞吐数据判断 |
+| 文档级 AIMD 锯齿 | 已删除容量 AIMD；只有明确 overload 才停 refill/cooldown | 当前 Windows whole-task slots=1、inference cap=7；升档必须用新身份和异构 corpus 证明 |
 | 重启孤儿与新临时目录 | 已 SIGINT cleanup、35s grace、90s launchd exit window | 历史 131 目录不会自动清除 |
 | 外部分片语义损坏 | resident 不自动分页/拼接；全部 29,777 份 built IR 审计 `full_pdf=false=0`；显式页段在 build 与独立 publish provenance 两处 fail closed | 不外推成 MinerU 全部语义绝对正确 |
 
@@ -521,7 +531,9 @@ MinerU 3.4 的 API 与 router 仍没有提供该原语：
 - 裸 HTTP semaphore 代理若没有取消释放、有界队列、按文档公平、指标和故障隔离，会新增
   更危险的死锁/泄漏面。
 
-因此当前固定 `3×7=21` 保守 active 包络，并把“MinerU app-scoped shared VLM semaphore 或成熟
+2026-08-25 的真实混合年报轮证明 `3×7` 并不保守：`mineru-api` 在三个 whole-PDF task
+同时持有完整 pipeline 内存工作集时被 Docker OOM 杀死（exit 137），而 vLLM 容器未重启。
+当前 30 GiB Docker profile 因此固定为 `1×7=7`，并把“MinerU app-scoped shared VLM semaphore 或成熟
 admission gateway”记录为明确结构升级，而不是继续堆本地 timeout/并发补丁。优先推动
 上游透传现有 `MinerUClient` semaphore 参数；只有无法采用上游且 A/B 证明尾部空谷在大量
 backlog 下仍有物质影响时，才实现独立、可测试的 gateway。
@@ -545,7 +557,8 @@ control plane 会制造第二任务真相，而不能自动解决错误的请求
 ### 7.5 盲目继续提高 API task slots 或 inference concurrency
 
 拒绝。现场高峰已是 `running≈128 + waiting 数百`；提高 16 只会扩大临时进程、内存和请求
-洪峰。先验证 21 静态 active 包络下的稳定吞吐，再根据 A/B 决定是否调整。
+洪峰。task slots 1→2 必须生成新的 runtime v5 identity，并用两个独立的真实异构
+regular/heavy/huge 4/8/16 corpus receipt 证明；旧凭证一律失效。
 
 ## 8. 重启与生产 A/B 验收
 
@@ -568,8 +581,8 @@ control plane 会制造第二任务真相，而不能自动解决错误的请求
 
 - startup banner 必须同时打印
   `resident_dispatch=continuous report_interval=300s` 与
-  `parse_submit_slots=16 gpu_request_cap=3x7=21<=128`；
-- runtime v3 manifest 与 API `/health` 必须同时证明 task slots=3、inference concurrency=7、
+  `parse_submit_slots=16 gpu_request_cap=1x7=7<=128`；
+- runtime v5 manifest 与 API `/health` 必须同时证明 task slots=1、inference concurrency=7、
   window=16、retention=600、cleanup=30；client `--api-url` 模式不得再声称本地
   `--max-concurrency` 控制远端；
 - singleton advisory lock 只有一个持有者；
@@ -590,7 +603,7 @@ control plane 会制造第二任务真相，而不能自动解决错误的请求
 
 发布成立需要同时满足：
 
-1. runtime identity、API health 与单生产者边界证明 worker active 配置上界不超过 21；
+1. runtime identity、API health 与单生产者边界证明 worker active 配置上界不超过 7；
 2. 有大量 eligible backlog 时，不再重复出现旧基线的 3–10 分钟固定 200 批尾低谷；
 3. vLLM waiting、queue time、KV/preemption 相比旧基线实质下降，且没有新 OOM；
 4. 普通公告不再被 500+ 页车队长期饿死，huge 仍能借空槽持续前进；
@@ -599,7 +612,7 @@ control plane 会制造第二任务真相，而不能自动解决错误的请求
 7. 若任一项缺证据，报告为“部署完成、A/B 未通过/未完成”，不能写“根治完成”。
 
 参数调整顺序固定为：先查 API identity/queue 与第二生产者，再查 vLLM waiting/KV/preemption，
-再查 lane/finalize backlog；只有证据指向容量边界时才改 3×7、lane 份额或 finalize=2。不得回到
+再查 lane/finalize backlog；只有新 runtime identity 与异构容量证据同时闭合时才改 1×7、lane 份额或 finalize=2。不得回到
 “看到锯齿就加并发/加 timeout/恢复 AIMD”的补丁循环。
 
 ## 9. 保留的历史事故证据
