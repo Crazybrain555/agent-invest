@@ -1,5 +1,9 @@
 {
  "files": {
+  "tests/contract/test_capacity_json_schemas.py": {
+   "private_imports": [],
+   "tests": 2
+  },
   "tests/contract/test_filing_api_contracts.py": {
    "private_imports": [],
    "tests": 5
@@ -106,6 +110,32 @@
   "tests/unit/test_build_units.py": {
    "private_imports": [],
    "tests": 11
+  },
+  "tests/unit/test_capacity_aggregation.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_capacity_cli.py": {
+   "private_imports": [
+    "_settings"
+   ],
+   "tests": 3
+  },
+  "tests/unit/test_capacity_host_observer.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_capacity_observer.py": {
+   "private_imports": [],
+   "tests": 11
+  },
+  "tests/unit/test_capacity_runtime_identity.py": {
+   "private_imports": [],
+   "tests": 2
+  },
+  "tests/unit/test_capacity_sources.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/unit/test_cninfo_client.py": {
    "private_imports": [],
@@ -282,7 +312,7 @@
   },
   "tests/unit/test_path_builder.py": {
    "private_imports": [],
-   "tests": 6
+   "tests": 8
   },
   "tests/unit/test_pending_download_predicate.py": {
    "private_imports": [

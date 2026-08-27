@@ -1,0 +1,205 @@
+{
+  "$defs": {
+    "CapacityArtifactDigests": {
+      "additionalProperties": false,
+      "properties": {
+        "interval_chain_head_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Interval Chain Head Sha256"
+        },
+        "intervals_sha256": {
+          "title": "Intervals Sha256",
+          "type": "string"
+        },
+        "raw_chain_head_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Raw Chain Head Sha256"
+        },
+        "raw_samples_sha256": {
+          "title": "Raw Samples Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "raw_samples_sha256",
+        "intervals_sha256",
+        "raw_chain_head_sha256",
+        "interval_chain_head_sha256"
+      ],
+      "title": "CapacityArtifactDigests",
+      "type": "object"
+    },
+    "CapacitySourceCounts": {
+      "additionalProperties": false,
+      "properties": {
+        "api": {
+          "minimum": 0,
+          "title": "Api",
+          "type": "integer"
+        },
+        "gpu": {
+          "minimum": 0,
+          "title": "Gpu",
+          "type": "integer"
+        },
+        "host": {
+          "minimum": 0,
+          "title": "Host",
+          "type": "integer"
+        },
+        "vllm": {
+          "minimum": 0,
+          "title": "Vllm",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "api",
+        "gpu",
+        "host",
+        "vllm"
+      ],
+      "title": "CapacitySourceCounts",
+      "type": "object"
+    }
+  },
+  "$id": "https://agent-invest.local/contracts/operational/capacity-observation-run.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "activation_authorized": {
+      "const": false,
+      "default": false,
+      "title": "Activation Authorized",
+      "type": "boolean"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/CapacityArtifactDigests"
+    },
+    "complete_interval_count": {
+      "minimum": 0,
+      "title": "Complete Interval Count",
+      "type": "integer"
+    },
+    "contract_version": {
+      "const": "capacity_observation.run.v1",
+      "default": "capacity_observation.run.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "duration_seconds": {
+      "exclusiveMinimum": 0,
+      "title": "Duration Seconds",
+      "type": "number"
+    },
+    "finished_at_utc": {
+      "format": "date-time",
+      "title": "Finished At Utc",
+      "type": "string"
+    },
+    "incomplete_interval_count": {
+      "minimum": 0,
+      "title": "Incomplete Interval Count",
+      "type": "integer"
+    },
+    "interval_count": {
+      "minimum": 1,
+      "title": "Interval Count",
+      "type": "integer"
+    },
+    "interval_seconds": {
+      "exclusiveMinimum": 0,
+      "title": "Interval Seconds",
+      "type": "number"
+    },
+    "observer_source_sha256": {
+      "title": "Observer Source Sha256",
+      "type": "string"
+    },
+    "raw_sample_count": {
+      "minimum": 0,
+      "title": "Raw Sample Count",
+      "type": "integer"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "runtime_bundle_identity_sha256": {
+      "title": "Runtime Bundle Identity Sha256",
+      "type": "string"
+    },
+    "safety_violations": {
+      "items": {
+        "enum": [
+          "api_identity_drift",
+          "host_cgroup_oom_observed",
+          "host_container_epoch_changed",
+          "host_container_state_unsafe",
+          "host_counter_reset",
+          "host_memory_reserve_crossed",
+          "vllm_counter_reset"
+        ],
+        "type": "string"
+      },
+      "title": "Safety Violations",
+      "type": "array"
+    },
+    "source_sample_counts": {
+      "$ref": "#/$defs/CapacitySourceCounts"
+    },
+    "started_at_utc": {
+      "format": "date-time",
+      "title": "Started At Utc",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "complete",
+        "incomplete",
+        "unsafe"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "unsafe_interval_count": {
+      "minimum": 0,
+      "title": "Unsafe Interval Count",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "run_id",
+    "runtime_bundle_identity_sha256",
+    "observer_source_sha256",
+    "started_at_utc",
+    "finished_at_utc",
+    "duration_seconds",
+    "interval_seconds",
+    "status",
+    "raw_sample_count",
+    "interval_count",
+    "complete_interval_count",
+    "incomplete_interval_count",
+    "unsafe_interval_count",
+    "source_sample_counts",
+    "safety_violations",
+    "artifacts"
+  ],
+  "title": "CapacityObservationRun",
+  "type": "object"
+}

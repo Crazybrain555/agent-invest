@@ -29,7 +29,7 @@ WITH_WORKER_ENV = set -a; [ -r "$(DISCLOSURE_ENV_DIR)/worker.env" ] && . "$(DISC
 	lint typecheck agent-check api archive pg-init pg-start pg-stop \
 	pg-status db-create migrate register parse build-units publish process rebuild-units rebuild-search-projection load-rules config-check track track-status track-export untrack sync worker-once worker-loop doctor-full \
 	worker-status worker-restart mineru-smoke mineru-staged-load mineru-tunnel-status install-mineru-tunnel mineru-remote-attest mineru-admission gc-orphans audit-unmapped-codes audit-weekly install-ops-launchd \
-	generate-current-source-replay audit-live-unit-replay
+	generate-current-source-replay audit-live-unit-replay capacity-observe capacity-verify capacity-summary
 
 doctor:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -248,6 +248,36 @@ mineru-staged-load:
 		--docker-memory-reserve-bytes "$(DOCKER_MEMORY_RESERVE_BYTES)" \
 		$(if $(WORK_ROOT),--work-root "$(WORK_ROOT)") \
 		$(if $(TIMEOUT_SECONDS),--timeout-seconds "$(TIMEOUT_SECONDS)")
+
+# DB-free and data-plane-independent capacity observation. It only reads the
+# exact attested API/vLLM/GPU/host surfaces and writes private replay evidence
+# under DISCLOSURE_RUNTIME_ROOT/reports/capacity/<run-id>/.
+capacity-observe:
+	@test -n "$(RUNTIME_MANIFEST)" || (echo 'capacity-observe: RUNTIME_MANIFEST is required' && exit 2)
+	@test -n "$(DURATION_SECONDS)" || (echo 'capacity-observe: DURATION_SECONDS is required' && exit 2)
+	@test -n "$(SSH_HOST)" || (echo 'capacity-observe: SSH_HOST is required' && exit 2)
+	@test -n "$(SSH_USER)" || (echo 'capacity-observe: SSH_USER is required' && exit 2)
+	@test -n "$(SSH_IDENTITY)" || (echo 'capacity-observe: SSH_IDENTITY is required' && exit 2)
+	@test -n "$(SSH_KNOWN_HOSTS)" || (echo 'capacity-observe: SSH_KNOWN_HOSTS is required' && exit 2)
+	$(WITH_WORKER_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.capacity observe \
+		--runtime-manifest "$(RUNTIME_MANIFEST)" \
+		--duration-seconds "$(DURATION_SECONDS)" \
+		$(if $(INTERVAL_SECONDS),--interval-seconds "$(INTERVAL_SECONDS)") \
+		--host-observer-ssh-host "$(SSH_HOST)" \
+		--host-observer-ssh-user "$(SSH_USER)" \
+		--host-observer-ssh-port "$(SSH_PORT)" \
+		--host-observer-identity-file "$(SSH_IDENTITY)" \
+		--host-observer-known-hosts-file "$(SSH_KNOWN_HOSTS)" \
+		$(if $(RUN_ID),--run-id "$(RUN_ID)")
+
+capacity-verify:
+	@test -n "$(RUN_ID)" || (echo 'capacity-verify: RUN_ID is required' && exit 2)
+	$(WITH_WORKER_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.capacity verify \
+		--run-id "$(RUN_ID)" $(if $(filter YES,$(REQUIRE_COMPLETE)),--require-complete)
+
+capacity-summary:
+	@test -n "$(RUN_ID)" || (echo 'capacity-summary: RUN_ID is required' && exit 2)
+	$(WITH_WORKER_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.capacity summarize --run-id "$(RUN_ID)"
 
 # Fixed API transport is a separate LaunchAgent from the worker. It may stay
 # resident while the worker is unloaded, but never exposes a non-loopback port.

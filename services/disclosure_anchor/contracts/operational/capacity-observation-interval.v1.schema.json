@@ -1,0 +1,533 @@
+{
+  "$defs": {
+    "ApiIntervalMetrics": {
+      "additionalProperties": false,
+      "properties": {
+        "completed_tasks_gauge": {
+          "$ref": "#/$defs/MetricAggregate"
+        },
+        "failed_tasks_gauge": {
+          "$ref": "#/$defs/MetricAggregate"
+        },
+        "idle_task_seconds": {
+          "minimum": 0,
+          "title": "Idle Task Seconds",
+          "type": "number"
+        },
+        "processing_task_seconds": {
+          "minimum": 0,
+          "title": "Processing Task Seconds",
+          "type": "number"
+        },
+        "processing_tasks": {
+          "$ref": "#/$defs/MetricAggregate"
+        },
+        "queued_task_seconds": {
+          "minimum": 0,
+          "title": "Queued Task Seconds",
+          "type": "number"
+        },
+        "queued_tasks": {
+          "$ref": "#/$defs/MetricAggregate"
+        },
+        "task_slots": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Slots"
+        }
+      },
+      "required": [
+        "queued_tasks",
+        "processing_tasks",
+        "completed_tasks_gauge",
+        "failed_tasks_gauge",
+        "processing_task_seconds",
+        "queued_task_seconds",
+        "idle_task_seconds"
+      ],
+      "title": "ApiIntervalMetrics",
+      "type": "object"
+    },
+    "CapacityCoverageSet": {
+      "additionalProperties": false,
+      "properties": {
+        "api": {
+          "$ref": "#/$defs/CoverageEvidence"
+        },
+        "gpu": {
+          "$ref": "#/$defs/CoverageEvidence"
+        },
+        "host": {
+          "$ref": "#/$defs/CoverageEvidence"
+        },
+        "vllm": {
+          "$ref": "#/$defs/CoverageEvidence"
+        }
+      },
+      "required": [
+        "api",
+        "gpu",
+        "host",
+        "vllm"
+      ],
+      "title": "CapacityCoverageSet",
+      "type": "object"
+    },
+    "CoverageEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_max_gap_seconds": {
+          "exclusiveMinimum": 0,
+          "title": "Allowed Max Gap Seconds",
+          "type": "number"
+        },
+        "coverage_ratio": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Coverage Ratio",
+          "type": "number"
+        },
+        "covered_seconds": {
+          "minimum": 0,
+          "title": "Covered Seconds",
+          "type": "number"
+        },
+        "expected_samples": {
+          "minimum": 1,
+          "title": "Expected Samples",
+          "type": "integer"
+        },
+        "max_gap_seconds": {
+          "minimum": 0,
+          "title": "Max Gap Seconds",
+          "type": "number"
+        },
+        "reason_code": {
+          "anyOf": [
+            {
+              "enum": [
+                "boundary_sample_unavailable",
+                "coverage_below_threshold",
+                "max_gap_exceeded",
+                "no_samples"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason Code"
+        },
+        "required_ratio": {
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Required Ratio",
+          "type": "number"
+        },
+        "status": {
+          "enum": [
+            "complete",
+            "incomplete"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "valid_samples": {
+          "minimum": 0,
+          "title": "Valid Samples",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "status",
+        "valid_samples",
+        "expected_samples",
+        "covered_seconds",
+        "coverage_ratio",
+        "required_ratio",
+        "max_gap_seconds",
+        "allowed_max_gap_seconds",
+        "reason_code"
+      ],
+      "title": "CoverageEvidence",
+      "type": "object"
+    },
+    "GpuIntervalMetrics": {
+      "additionalProperties": false,
+      "properties": {
+        "framebuffer_free_bytes": {
+          "$ref": "#/$defs/MetricAggregate"
+        },
+        "framebuffer_used_bytes": {
+          "$ref": "#/$defs/MetricAggregate"
+        },
+        "gpu_utilization_pct": {
+          "$ref": "#/$defs/MetricAggregate"
+        },
+        "power_usage_watts": {
+          "$ref": "#/$defs/MetricAggregate"
+        },
+        "temperature_celsius": {
+          "$ref": "#/$defs/MetricAggregate"
+        }
+      },
+      "required": [
+        "gpu_utilization_pct",
+        "framebuffer_used_bytes",
+        "framebuffer_free_bytes",
+        "power_usage_watts",
+        "temperature_celsius"
+      ],
+      "title": "GpuIntervalMetrics",
+      "type": "object"
+    },
+    "HostIntervalMetrics": {
+      "additionalProperties": false,
+      "properties": {
+        "api_pid1_rss_bytes": {
+          "$ref": "#/$defs/MetricAggregate"
+        },
+        "api_pid1_rss_hwm_bytes": {
+          "$ref": "#/$defs/MetricAggregate"
+        },
+        "cgroup_high_delta": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cgroup High Delta"
+        },
+        "cgroup_oom_delta": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cgroup Oom Delta"
+        },
+        "cgroup_oom_kill_delta": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cgroup Oom Kill Delta"
+        },
+        "container_epoch_changed": {
+          "title": "Container Epoch Changed",
+          "type": "boolean"
+        },
+        "counter_epoch_valid": {
+          "title": "Counter Epoch Valid",
+          "type": "boolean"
+        },
+        "docker_vm_memory_available_bytes": {
+          "$ref": "#/$defs/MetricAggregate"
+        },
+        "memory_reserve_crossed_seconds": {
+          "minimum": 0,
+          "title": "Memory Reserve Crossed Seconds",
+          "type": "number"
+        },
+        "restart_delta": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Restart Delta"
+        }
+      },
+      "required": [
+        "docker_vm_memory_available_bytes",
+        "api_pid1_rss_bytes",
+        "api_pid1_rss_hwm_bytes",
+        "memory_reserve_crossed_seconds",
+        "counter_epoch_valid",
+        "container_epoch_changed"
+      ],
+      "title": "HostIntervalMetrics",
+      "type": "object"
+    },
+    "MetricAggregate": {
+      "additionalProperties": false,
+      "properties": {
+        "current": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Current"
+        },
+        "maximum": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Maximum"
+        },
+        "minimum": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Minimum"
+        },
+        "observed_seconds": {
+          "minimum": 0,
+          "title": "Observed Seconds",
+          "type": "number"
+        },
+        "time_weighted_mean": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Time Weighted Mean"
+        },
+        "time_weighted_p50": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Time Weighted P50"
+        },
+        "time_weighted_p95": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Time Weighted P95"
+        }
+      },
+      "required": [
+        "current",
+        "minimum",
+        "maximum",
+        "time_weighted_mean",
+        "time_weighted_p50",
+        "time_weighted_p95",
+        "observed_seconds"
+      ],
+      "title": "MetricAggregate",
+      "type": "object"
+    },
+    "VllmIntervalMetrics": {
+      "additionalProperties": false,
+      "properties": {
+        "counter_epoch_valid": {
+          "title": "Counter Epoch Valid",
+          "type": "boolean"
+        },
+        "kv_cache_usage_ratio": {
+          "$ref": "#/$defs/MetricAggregate"
+        },
+        "preemptions_delta": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Preemptions Delta"
+        },
+        "requests_running": {
+          "$ref": "#/$defs/MetricAggregate"
+        },
+        "requests_waiting": {
+          "$ref": "#/$defs/MetricAggregate"
+        }
+      },
+      "required": [
+        "requests_running",
+        "requests_waiting",
+        "kv_cache_usage_ratio",
+        "counter_epoch_valid"
+      ],
+      "title": "VllmIntervalMetrics",
+      "type": "object"
+    }
+  },
+  "$id": "https://agent-invest.local/contracts/operational/capacity-observation-interval.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "api": {
+      "$ref": "#/$defs/ApiIntervalMetrics"
+    },
+    "contract_version": {
+      "const": "capacity_observation.interval.v1",
+      "default": "capacity_observation.interval.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "coverage": {
+      "$ref": "#/$defs/CapacityCoverageSet"
+    },
+    "gpu": {
+      "$ref": "#/$defs/GpuIntervalMetrics"
+    },
+    "host": {
+      "$ref": "#/$defs/HostIntervalMetrics"
+    },
+    "interval_index": {
+      "minimum": 0,
+      "title": "Interval Index",
+      "type": "integer"
+    },
+    "monotonic_end_seconds": {
+      "exclusiveMinimum": 0,
+      "title": "Monotonic End Seconds",
+      "type": "number"
+    },
+    "monotonic_start_seconds": {
+      "minimum": 0,
+      "title": "Monotonic Start Seconds",
+      "type": "number"
+    },
+    "observed_at_utc": {
+      "format": "date-time",
+      "title": "Observed At Utc",
+      "type": "string"
+    },
+    "observer_source_sha256": {
+      "title": "Observer Source Sha256",
+      "type": "string"
+    },
+    "previous_record_sha256": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Previous Record Sha256"
+    },
+    "record_sha256": {
+      "title": "Record Sha256",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "runtime_bundle_identity_sha256": {
+      "title": "Runtime Bundle Identity Sha256",
+      "type": "string"
+    },
+    "safety_violations": {
+      "items": {
+        "enum": [
+          "api_identity_drift",
+          "host_cgroup_oom_observed",
+          "host_container_epoch_changed",
+          "host_container_state_unsafe",
+          "host_counter_reset",
+          "host_memory_reserve_crossed",
+          "vllm_counter_reset"
+        ],
+        "type": "string"
+      },
+      "title": "Safety Violations",
+      "type": "array"
+    },
+    "status": {
+      "enum": [
+        "complete",
+        "incomplete",
+        "unsafe"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "vllm": {
+      "$ref": "#/$defs/VllmIntervalMetrics"
+    },
+    "wall_seconds": {
+      "exclusiveMinimum": 0,
+      "title": "Wall Seconds",
+      "type": "number"
+    }
+  },
+  "required": [
+    "run_id",
+    "interval_index",
+    "previous_record_sha256",
+    "record_sha256",
+    "runtime_bundle_identity_sha256",
+    "observer_source_sha256",
+    "observed_at_utc",
+    "monotonic_start_seconds",
+    "monotonic_end_seconds",
+    "wall_seconds",
+    "status",
+    "coverage",
+    "api",
+    "gpu",
+    "host",
+    "vllm",
+    "safety_violations"
+  ],
+  "title": "CapacityObservationInterval",
+  "type": "object"
+}

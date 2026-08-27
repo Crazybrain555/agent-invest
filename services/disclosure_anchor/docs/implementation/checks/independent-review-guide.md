@@ -67,6 +67,14 @@ event_key_map 不得作为当前审查对象，现状勘误见 retrieval 设计�
    live 查询范围必须从 replay 的完整 provider-document 集合机械派生，并读取这些 provider 的全部
    active Units（不得只按 expected identity join，也不得无条件扫描其他 provider）；receipt 绑定排序后的
    provider 集合哈希、各 active run ID 与同一只读 repeatable-read snapshot，额外/缺失 unit_index 均失败。
+8. Capacity Observation 审查必须绑定 exact-current source 和一个完整 run 目录。reviewer 先机械检查
+   三个文件的 0600/single-link/size、raw/interval sequence 与 hash chain、runtime/source identity，
+   确认 runtime/source 都是 configured exact-current，并从 run 参数机械推导 interval 几何与 UTC；
+   再独立按 `design/capacity-observation.md` 的 left baseline + `(start,end]` transition、half-open gauge、max-gap、coverage 和 weighted
+   quantile 定义从 raw 重算所有 interval，最后重建 run receipt；结果须与 `make capacity-verify
+   RUN_ID=<uuid>` 一致。供应商或模型名不是产品正确性的依赖。没有 raw samples、只给 aggregate、
+   用 completed/failed gauge 算 delta、把缺失当零，或从无 phase evidence 推导 overlap opportunity，
+   都必须 STOP。该审查只判断 evidence，不得因此改变 1×7 或操作 worker/Windows 服务。
 
 ## 1. 表字段 review（逐表逐列，问四个问题）
 

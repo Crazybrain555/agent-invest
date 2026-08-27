@@ -174,6 +174,18 @@ exchange、board、日期、市值下限、5,548 行审计闭合与 V10 变更�
 生成器。完整来源/投影证明必须运行上述 `cmp`、核对四个已固定 SHA，并检查完整 selection audit；
 不能把 `config-check` 单独理解为前瞻治理和行业证据已经补齐。
 
+## Passive capacity observation
+
+Auto Capacity 当前只有旁路 Observation v1，没有动态 selector/actuator。它复用 machine-local
+`worker.env` 中已存在的 API/vLLM/GPU URL、runtime bundle identity、GPU UUID、MinerU client 和
+Docker memory reserve；不新增数据库 DSN，也不在 tracked config 写 SSH host/user/key。
+
+Operator 运行时显式传入 v5 `RUNTIME_MANIFEST`、`DURATION_SECONDS` 和与 staged load 相同的
+`SSH_HOST` / `SSH_USER` / `SSH_IDENTITY` / `SSH_KNOWN_HOSTS`。这些参数只用于 pinned read-only
+collector；端点、hostname、username 与 container ID 不进入 evidence。命令和复算方法见
+`docs/implementation/runbooks/production-operations.md` §1.1d，设计见
+`docs/implementation/design/capacity-observation.md`。
+
 历史 V10 的 assemble/build 脚本都使用 mode 0444 的 new-only 输出。若要刷新公开来源，必须先把新日期目录作为独立目标运行
 `scripts/fetch_research_watchlist_inputs.py --output <new-sources-dir>`，再人工核验完整来源回执；不能覆盖
 当前冻结证据，也不能在一次“重建”里静默联网换观察时点。

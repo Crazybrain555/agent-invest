@@ -210,6 +210,39 @@ class FileStorePathBuilder:
             raise PathSafetyError(f"runtime tmp path escapes root: {path}")
         return path
 
+    def runtime_capacity_observation_path(
+        self,
+        *,
+        run_id: str,
+        artifact: str,
+    ) -> Path:
+        """Return one closed operational-evidence path under the runtime root."""
+
+        artifact_names = {
+            "intervals": "intervals.v1.jsonl",
+            "raw_samples": "raw-samples.v1.jsonl",
+            "run": "run.v1.json",
+        }
+        try:
+            filename = artifact_names[artifact]
+        except KeyError as exc:
+            raise PathSafetyError("unknown capacity observation artifact") from exc
+        capacity_root = self._settings.disclosure_runtime_root / "reports" / "capacity"
+        path = capacity_root / _safe_component(run_id, label="capacity_run_id") / filename
+        for existing_parent in (
+            self._settings.disclosure_runtime_root,
+            self._settings.disclosure_runtime_root / "reports",
+            capacity_root,
+            path.parent,
+        ):
+            if existing_parent.is_symlink():
+                raise PathSafetyError(
+                    f"capacity observation parent is a symlink: {existing_parent}"
+                )
+        if not _is_relative_to(path, capacity_root):
+            raise PathSafetyError(f"capacity observation path escapes root: {path}")
+        return path
+
     def runtime_quarantine_path(
         self,
         *,

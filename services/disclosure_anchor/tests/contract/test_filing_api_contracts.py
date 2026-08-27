@@ -111,6 +111,7 @@ class FilingApiContractsTests(unittest.TestCase):
                     PUBLIC_MODELS_ROOT / f"{name}.v1.json"
                     for name in sorted(PUBLIC_MODELS)
                 ),
+                *sorted((CONTRACTS_ROOT / "operational").glob("*.json")),
             ]
             for expected in expected_paths:
                 actual = output_root / expected.relative_to(CONTRACTS_ROOT)

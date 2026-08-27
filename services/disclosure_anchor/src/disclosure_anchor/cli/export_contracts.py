@@ -17,6 +17,9 @@ from disclosure_anchor.api.schemas.public import (
     SourceRefV1,
     TrackedCompanyV1,
 )
+from disclosure_anchor.application.contracts.capacity import (
+    operational_schema_documents,
+)
 from disclosure_anchor.main import create_app
 from disclosure_anchor.settings import Settings
 
@@ -50,6 +53,16 @@ def export_contracts(output_root: Path = DEFAULT_CONTRACTS_ROOT) -> list[Path]:
     for name, model in PUBLIC_MODELS.items():
         path = public_models_root / f"{name}.v1.json"
         schema = model.model_json_schema()
+        path.write_text(
+            json.dumps(schema, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        written.append(path)
+
+    operational_root = output_root / "operational"
+    operational_root.mkdir(parents=True, exist_ok=True)
+    for filename, schema in sorted(operational_schema_documents().items()):
+        path = operational_root / filename
         path.write_text(
             json.dumps(schema, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
             encoding="utf-8",

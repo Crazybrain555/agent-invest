@@ -16,6 +16,7 @@
 - `checks/fixture-and-test-policy.md`：真实样本、合成测试和 provider opt-in gate。
 - `runbooks/production-operations.md`：当前 worker、doctor、GC 与迁移操作。
 - `design/worker-dynamic-scheduling.md`：resident worker 机制。
+- `design/capacity-observation.md`：旁路、只读、可重放的 MinerU/GPU Observation v1；不含 Advisor/selector/actuator。
 - `design/retrieval-and-semantic-keys.md`：检索投影当前契约及其历史演变。
 - `design/semantic-adjudication-runtime.md`：Luna/Sonnet 可配置 provider 链、availability-only
   failover、v2 cache/receipt、终态与修复纪律。
@@ -36,6 +37,7 @@ docs/implementation/
     classification-facets-and-derived-views.md
     watchlist-operations.md
     worker-dynamic-scheduling.md
+    capacity-observation.md
   milestones/
     02-postgres-and-migrations.md
     03-filestore-and-raw-archive.md

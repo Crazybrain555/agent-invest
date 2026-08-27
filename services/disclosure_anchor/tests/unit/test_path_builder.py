@@ -80,6 +80,49 @@ class PathBuilderTests(unittest.TestCase):
                 settings.disclosure_runtime_root / "tmp" / "probe.json",
             )
 
+    def test_capacity_observation_paths_are_closed_under_runtime_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(Path(tmp))
+            builder = FileStorePathBuilder(settings)
+            run_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            self.assertEqual(
+                builder.runtime_capacity_observation_path(
+                    run_id=run_id,
+                    artifact="run",
+                ),
+                settings.disclosure_runtime_root
+                / "reports"
+                / "capacity"
+                / run_id
+                / "run.v1.json",
+            )
+            for run_value, artifact in (
+                ("../escape", "run"),
+                (run_id, "unknown"),
+            ):
+                with self.assertRaises(PathSafetyError):
+                    builder.runtime_capacity_observation_path(
+                        run_id=run_value,
+                        artifact=artifact,
+                    )
+
+    def test_capacity_observation_path_rejects_parent_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(Path(tmp))
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            settings.disclosure_runtime_root.mkdir(parents=True)
+            (settings.disclosure_runtime_root / "reports").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+
+            with self.assertRaises(PathSafetyError):
+                FileStorePathBuilder(settings).runtime_capacity_observation_path(
+                    run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    artifact="run",
+                )
+
     def test_rejects_unsafe_components(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             builder = FileStorePathBuilder(_settings(Path(tmp)))

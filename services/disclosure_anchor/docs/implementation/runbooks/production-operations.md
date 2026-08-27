@@ -293,6 +293,42 @@ endpoint 不可达与 metric contract 不满足。
 返回 500；关闭该 cache 后同一页窗口与完整文档重放恢复。这个参数是运行时身份的一部分，
 不能只在手工 compose 中修改而继续沿用旧 digest。
 
+### 1.1d Passive capacity observation
+
+需要判断 GPU duty、vLLM waiting/KV、API active/idle 与 Windows/Docker memory 时，使用独立的
+Observation v1，不提高 `WORKER_REPORT_INTERVAL_SECONDS`，也不从 `worker_progress.v2` 的文档/队列
+字段推断 capacity。Observation 不连数据库、不控制 worker、不改变 current `1×7`：
+
+```bash
+make capacity-observe \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v5.json \
+  DURATION_SECONDS=3600 \
+  SSH_HOST=<pinned-host> SSH_USER=<operator-user> \
+  SSH_IDENTITY=/private/path/operator-key \
+  SSH_KNOWN_HOSTS=/private/path/known_hosts
+```
+
+可选 `INTERVAL_SECONDS` 默认 60；`RUN_ID` 仅接受 canonical UUID，省略时自动生成。运行前会用 pinned
+local MinerU client、writer code、configured runtime bundle digest、task slots 和三个 endpoint digest
+复核 v5 manifest，再验证 operator SSH key/known_hosts 是 owner-only 0600，且 known_hosts 内
+Ed25519 key blob 的 SHA-256 与 manifest topology 完全一致。Observation v1 只接受当前 commissioned、
+UUID-pinned 的单卡 nvidia-smi exporter；API/vLLM/GPU 每秒采样，host 每
+5 秒采样；任何 sampler 故障只让 evidence `incomplete`，不得中止数据面。安全事件让 receipt
+`unsafe`，但本命令仍不执行 actuator。
+
+输出固定在 `$DISCLOSURE_RUNTIME_ROOT/reports/capacity/<run-id>/`。机械复算：
+
+```bash
+make capacity-verify RUN_ID=<uuid> REQUIRE_COMPLETE=YES
+make capacity-summary RUN_ID=<uuid>
+```
+
+`capacity-verify` 不读取数据库或远端端点；它要求 receipt 的 runtime/source identity 等于当前
+configured/exact-current identity，再从 owner-owned mode 0600 raw JSONL 按 run 参数机械推导区间并
+重建 interval 与 final receipt，检查 hash chain、UTC、边界和文件 SHA。`REQUIRE_COMPLETE=YES` 才把 incomplete/unsafe 映射为非零退出；不带该项
+时仅验证“失败证据本身是否完整可信”。详细契约、coverage 和隐私边界见
+`../design/capacity-observation.md`。
+
 ### 1.2 批量重解析与派生重置
 
 旧 NormalizedIR corpus reset/exact replay 工具已经删除：它维护第二套 manifest、备份、调度和状态分类，并会把旧 writer 重新引入生产入口。当前没有 production 数据；开发期需要重放时，使用明确的 document 列表走正常 Provider writer，先在仓外保留原 PDF 与 provider artifact，再由 operator 单独授权 DB/AgentSSD 变更。
