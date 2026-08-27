@@ -166,6 +166,41 @@ class CapacitySourcesTests(unittest.TestCase):
                 expected_device_uuid="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             )
 
+    def test_cross_host_gpu_timestamp_has_bounded_future_skew(self) -> None:
+        with patch.object(sources.time, "time", return_value=999.75):
+            observed = sources._gpu_values(
+                _gpu_payload(),
+                expected_device_uuid="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            )
+        progress_observed = progress.nvidia_smi_metrics_snapshot(
+            _gpu_payload(),
+            now_timestamp=999.75,
+            expected_device_uuid="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        )
+
+        self.assertEqual(observed.gpu_utilization_pct, 87.5)
+        self.assertEqual(progress_observed["sample_age_seconds"], 0.0)
+        for now_timestamp in (998.99, 1030.01):
+            with self.subTest(now_timestamp=now_timestamp), patch.object(
+                sources.time,
+                "time",
+                return_value=now_timestamp,
+            ), self.assertRaises(ValueError):
+                sources._gpu_values(
+                    _gpu_payload(),
+                    expected_device_uuid=(
+                        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+                    ),
+                )
+            with self.assertRaises(ValueError):
+                progress.nvidia_smi_metrics_snapshot(
+                    _gpu_payload(),
+                    now_timestamp=now_timestamp,
+                    expected_device_uuid=(
+                        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+                    ),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

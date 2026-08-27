@@ -28,6 +28,10 @@ profile、selector、actuator、AIMD/PID 或任何 live knob mutation。现有 `
 | pinned nvidia-smi exporter | 1 s | 99% | 5 s | commissioned 单卡的 kernel-busy utilization、显存、功耗、温度；GPU UUID 只保存 SHA-256 |
 | pinned Windows collector | 5 s | 100% | 15 s | container epoch digest、restart/OOM/cgroup events、API RSS/HWM、Docker VM memory |
 
+Windows exporter 的 `last_collect_success_timestamp_seconds` 来自远端整数 Unix 秒。freshness 允许最多
+1 秒跨机未来时钟偏差并把显示 age 钳为 0；超过 1 秒的未来时间、超过 30 秒的陈旧 sample 或
+`last_collect_success != 1` 仍然 fail-closed。该容差是采样契约，不是性能调参旋钮。
+
 采样调度使用 monotonic clock。延迟后从“当前时点 + cadence”继续，不补发 catch-up burst。
 run 边界前先取一次 host sample，再并发取 API/vLLM/GPU boundary sample，随后才启动 monotonic
 denominator；这样首段有左边界证据，又不会让慢 SSH 把快速指标伪装成刚采到。运行中每个 source

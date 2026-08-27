@@ -286,6 +286,8 @@ loopback-only 的 nvidia-smi exporter，再经专用 SSH LocalForward 暴露给 
 不得停止健康数据面。
 事件含进程实例 ID 与单调 sequence/event ID，消费方可区分 worker 重启和事件缺口；探针失败区分
 endpoint 不可达与 metric contract 不满足。
+Windows exporter freshness 使用远端整数 Unix 秒，允许最多 1 秒跨机未来偏差；更大的时钟漂移、
+超过 30 秒的旧 sample 或 collection failure 仍显示 unavailable，不得用最近值填补。
 
 当前 vLLM 0.21 MinerU2.5-Pro 服务还必须把
 `--mm-processor-cache-gb 0` 纳入远端容器命令和上述 manifest。2026-08-13 的 221 页半年度

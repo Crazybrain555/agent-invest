@@ -278,6 +278,12 @@ class WorkerProgressTests(unittest.TestCase):
         self.assertEqual(observed["framebuffer_free_mib_total"], 7456.0)
         self.assertEqual(observed["power_usage_watts_total"], 245.5)
         self.assertEqual(observed["temperature_celsius_max"], 67.0)
+        near_future = nvidia_smi_metrics_snapshot(
+            payload,
+            now_timestamp=999.75,
+            expected_device_uuid="GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        )
+        self.assertEqual(near_future["sample_age_seconds"], 0.0)
         with patch(
             "disclosure_anchor.adapters.runtime.worker_progress.time.time",
             return_value=1005,

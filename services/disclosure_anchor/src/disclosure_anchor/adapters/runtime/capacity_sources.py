@@ -16,6 +16,9 @@ from disclosure_anchor.application.contracts.capacity import (
     GpuSampleValues,
     VllmSampleValues,
 )
+from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import (
+    nvidia_smi_sample_age_seconds,
+)
 
 
 MAX_API_HEALTH_BYTES = 64 * 1024
@@ -294,7 +297,10 @@ def _gpu_values(payload: bytes, *, expected_device_uuid: str) -> GpuSampleValues
     }
     if values["success"] != (1.0,) or len(values["timestamp"]) != 1:
         raise ValueError("nvidia-smi exporter collection is unsuccessful")
-    sample_age = time.time() - values["timestamp"][0]
+    nvidia_smi_sample_age_seconds(
+        now_timestamp=time.time(),
+        success_timestamp=values["timestamp"][0],
+    )
     utilization = values["utilization"]
     used = values["used_bytes"]
     free = values["free_bytes"]
@@ -302,9 +308,7 @@ def _gpu_values(payload: bytes, *, expected_device_uuid: str) -> GpuSampleValues
     power = values["power"]
     temperature = values["temperature"]
     if (
-        sample_age < 0
-        or sample_age > 30
-        or len(utilization) != 1
+        len(utilization) != 1
         or not 0 <= utilization[0] <= 1
         or len(used) != 1
         or len(free) != 1

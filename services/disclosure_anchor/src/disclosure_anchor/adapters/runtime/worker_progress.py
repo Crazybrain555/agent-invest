@@ -11,6 +11,10 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+
+from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import (
+    nvidia_smi_sample_age_seconds,
+)
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,7 +79,6 @@ NVIDIA_SMI_METRIC_NAMES = {
         "nvidia_smi_last_collect_success_timestamp_seconds",
     ),
 }
-NVIDIA_SMI_MAX_SAMPLE_AGE_SECONDS = 30
 NVIDIA_SMI_DEVICE_METRICS = (
     "nvidia_smi_gpu_info",
     "nvidia_smi_utilization_gpu_ratio",
@@ -416,9 +419,10 @@ def nvidia_smi_metrics_snapshot(
         raise ValueError("nvidia-smi exporter collection is not successful")
     if len(timestamps) != 1:
         raise ValueError("nvidia-smi exporter collection timestamp is missing")
-    sample_age = (now_timestamp if now_timestamp is not None else time.time()) - timestamps[0]
-    if sample_age < 0 or sample_age > NVIDIA_SMI_MAX_SAMPLE_AGE_SECONDS:
-        raise ValueError("nvidia-smi exporter sample is stale")
+    sample_age = nvidia_smi_sample_age_seconds(
+        now_timestamp=(now_timestamp if now_timestamp is not None else time.time()),
+        success_timestamp=timestamps[0],
+    )
     if len(utilization) != 1 or not 0 <= utilization[0] <= 1:
         raise ValueError("nvidia-smi exporter GPU identity or utilization is invalid")
 

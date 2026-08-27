@@ -21,6 +21,7 @@ import uuid
 import disclosure_anchor.adapters.runtime as runtime_package_module
 import disclosure_anchor.adapters.runtime.capacity_runtime_identity as capacity_runtime_identity_module
 import disclosure_anchor.adapters.runtime.capacity_sources as capacity_sources_module
+import disclosure_anchor.adapters.runtime.gpu_telemetry_freshness as gpu_freshness_module
 import disclosure_anchor.adapters.runtime.mineru_identity as mineru_identity_module
 import disclosure_anchor.adapters.runtime.mineru_host_capacity_observer as host_module
 import disclosure_anchor.adapters.storage.path_builder as path_builder_module
@@ -202,6 +203,7 @@ def observer_source_sha256() -> str:
         capacity_contract_module,
         capacity_runtime_identity_module,
         capacity_sources_module,
+        gpu_freshness_module,
         host_module,
         mineru_identity_module,
         path_builder_module,

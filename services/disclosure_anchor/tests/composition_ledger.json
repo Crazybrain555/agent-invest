@@ -135,7 +135,7 @@
   },
   "tests/unit/test_capacity_sources.py": {
    "private_imports": [],
-   "tests": 3
+   "tests": 4
   },
   "tests/unit/test_cninfo_client.py": {
    "private_imports": [],
