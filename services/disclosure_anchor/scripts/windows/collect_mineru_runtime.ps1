@@ -14,6 +14,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$DockerCommand = (
+    Get-Command docker.exe -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1 -ExpandProperty Source
+)
+if (
+    [string]::IsNullOrWhiteSpace($DockerCommand) -or
+    [IO.Path]::GetExtension($DockerCommand) -ine ".exe" -or
+    -not (Test-Path -LiteralPath $DockerCommand -PathType Leaf)
+) {
+    throw "Docker CLI must resolve to one executable application"
+}
 
 if ($CapacitySample -and $PhaseTrace) {
     throw "capacity sampling and phase-trace capture are mutually exclusive"
@@ -82,7 +93,7 @@ print(json.dumps({
 }, separators=(",", ":")))
 '@
     $probeJson = @(
-        $probeCode | & docker exec -i $name /usr/bin/python3.12 -I -
+        $probeCode | & $DockerCommand exec -i $name /usr/bin/python3.12 -I -
     )
     if ($LASTEXITCODE -ne 0 -or $probeJson.Count -ne 1) {
         throw "cannot sample cgroup and RSS for $name"
@@ -110,7 +121,7 @@ print(json.dumps({
 }
 
 if ($CapacitySample) {
-    $capacityInspect = docker inspect mineru-api mineru-api-proxy mineru-openai-server | ConvertFrom-Json
+    $capacityInspect = & $DockerCommand inspect mineru-api mineru-api-proxy mineru-openai-server | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or @($capacityInspect).Count -ne 3) {
         throw "cannot inspect all MinerU containers for capacity sampling"
     }
@@ -214,7 +225,7 @@ if ($PhaseTrace) {
         throw "phase-trace capture bounds must be increasing UTC within six hours"
     }
 
-    $traceInspect = @(docker inspect mineru-api | ConvertFrom-Json)
+    $traceInspect = @(& $DockerCommand inspect mineru-api | ConvertFrom-Json)
     if ($LASTEXITCODE -ne 0 -or $traceInspect.Count -ne 1) {
         throw "cannot inspect MinerU API for phase-trace capture"
     }
@@ -263,7 +274,7 @@ print(json.dumps({
 }, sort_keys=True, separators=(",", ":")))
 '@
     $profileProbeOutput = @(
-        $profileProbeCode | & docker exec -i mineru-api /usr/bin/python3.12 -I -
+        $profileProbeCode | & $DockerCommand exec -i mineru-api /usr/bin/python3.12 -I -
     )
     if ($LASTEXITCODE -ne 0 -or $profileProbeOutput.Count -ne 1) {
         throw "cannot bind the active MinerU phase-trace profile"
@@ -278,7 +289,7 @@ print(json.dumps({
     }
 
     $rawLogLines = @(
-        & docker logs --since ($since.ToString("o")) --until ($until.ToString("o")) `
+        & $DockerCommand logs --since ($since.ToString("o")) --until ($until.ToString("o")) `
             mineru-api 2>&1 | ForEach-Object { [string]$_ }
     )
     if ($LASTEXITCODE -ne 0) {
@@ -338,10 +349,10 @@ print(json.dumps({
 }
 
 if (-not (Test-Path -LiteralPath $ComposePath -PathType Leaf)) { throw "compose file is missing" }
-$resolvedConfig = & docker compose --project-name mineru-tailnet --file $ComposePath config --format json
+$resolvedConfig = & $DockerCommand compose --project-name mineru-tailnet --file $ComposePath config --format json
 if ($LASTEXITCODE -ne 0) { throw "cannot resolve MinerU compose configuration" }
 $configObject = $resolvedConfig | ConvertFrom-Json
-$inspect = docker inspect mineru-api mineru-api-proxy mineru-openai-server | ConvertFrom-Json
+$inspect = & $DockerCommand inspect mineru-api mineru-api-proxy mineru-openai-server | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0 -or $inspect.Count -ne 3) { throw "cannot inspect all MinerU containers" }
 $api = $inspect | Where-Object { $_.Name -eq "/mineru-api" }
 $proxy = $inspect | Where-Object { $_.Name -eq "/mineru-api-proxy" }
@@ -349,11 +360,11 @@ $vllm = $inspect | Where-Object { $_.Name -eq "/mineru-openai-server" }
 if ($null -eq $api -or $null -eq $proxy -or $null -eq $vllm) {
     throw "MinerU container identities drifted"
 }
-$apiImageInspect = docker image inspect ([string]$api.Config.Image) | ConvertFrom-Json
+$apiImageInspect = & $DockerCommand image inspect ([string]$api.Config.Image) | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0 -or @($apiImageInspect).Count -ne 1) {
     throw "cannot inspect the pinned MinerU API compatibility image"
 }
-$baseImageInspect = docker image inspect ([string]$vllm.Config.Image) | ConvertFrom-Json
+$baseImageInspect = & $DockerCommand image inspect ([string]$vllm.Config.Image) | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0 -or @($baseImageInspect).Count -ne 1) {
     throw "cannot inspect the pinned MinerU base image"
 }
@@ -418,7 +429,7 @@ print(json.dumps({
 }, sort_keys=True, separators=(",", ":")))
 '@
 $compatProbeOutput = @(
-    $compatProbeCode | & docker exec -i mineru-api /usr/bin/python3.12 -I -
+    $compatProbeCode | & $DockerCommand exec -i mineru-api /usr/bin/python3.12 -I -
 )
 if ($LASTEXITCODE -ne 0 -or $compatProbeOutput.Count -ne 1) {
     throw "cannot measure the live MinerU heap-return compatibility layer"
@@ -455,7 +466,7 @@ if ($revision -ne "bff20d4ae2bf202df9f45284b4d43681555a97ed") {
 }
 
 $vllmVersionOutput = @(
-    & docker exec mineru-openai-server /usr/bin/python3.12 -I -c `
+    & $DockerCommand exec mineru-openai-server /usr/bin/python3.12 -I -c `
         "import importlib.metadata; print(importlib.metadata.version('vllm'))"
 )
 if ($LASTEXITCODE -ne 0 -or $vllmVersionOutput.Count -ne 1) {
@@ -465,7 +476,7 @@ $vllmVersion = ([string]$vllmVersionOutput[0]).Trim()
 if ($vllmVersion -ne "0.21.0") { throw "live vLLM package version drifted" }
 
 $egressOutput = @(
-    & docker exec mineru-api /usr/bin/python3.12 -I -c `
+    & $DockerCommand exec mineru-api /usr/bin/python3.12 -I -c `
         "import socket,sys;`ntry:`n socket.create_connection(('1.1.1.1',443),2); print('MINERU_EGRESS_OPEN'); sys.exit(0)`nexcept (TimeoutError,ConnectionRefusedError,OSError) as exc:`n print('MINERU_EGRESS_BLOCKED:'+type(exc).__name__); sys.exit(42)" 2>$null
 )
 $externalTcpEgressBlocked = (
@@ -494,7 +505,7 @@ $apiPort = @(
 )
 $proxyPort = @($proxy.NetworkSettings.Ports."8000/tcp")
 $vllmPort = @($vllm.NetworkSettings.Ports."30000/tcp")
-$networkInspect = docker network inspect mineru-tailnet_inference mineru-tailnet_runtime | ConvertFrom-Json
+$networkInspect = & $DockerCommand network inspect mineru-tailnet_inference mineru-tailnet_runtime | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0 -or @($networkInspect).Count -ne 2) {
     throw "cannot inspect the live MinerU Docker networks"
 }

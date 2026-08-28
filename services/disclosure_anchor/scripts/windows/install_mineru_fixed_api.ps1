@@ -17,6 +17,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$DockerCommand = (
+    Get-Command docker.exe -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1 -ExpandProperty Source
+)
+if (
+    [string]::IsNullOrWhiteSpace($DockerCommand) -or
+    [IO.Path]::GetExtension($DockerCommand) -ine ".exe" -or
+    -not (Test-Path -LiteralPath $DockerCommand -PathType Leaf)
+) {
+    throw "Docker CLI must resolve to one executable application"
+}
 $ProjectName = "mineru-tailnet"
 $ApiCompatImage = "agent-invest/mineru-api:3.4.4-capacity-v1"
 $ApiCompatBuildTag = "agent-invest/mineru-api:build-$([Guid]::NewGuid().ToString('N'))"
@@ -79,7 +90,7 @@ elseif (-not [string]::IsNullOrEmpty($CampaignApiCompatImageId)) {
 
 function Invoke-Docker {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
-    $output = & docker @Arguments
+    $output = & $DockerCommand @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "docker command failed: docker $($Arguments -join ' ')"
     }
@@ -91,7 +102,7 @@ function Get-OptionalImageId {
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "SilentlyContinue"
-        $output = @(& docker image inspect --format "{{.Id}}" $Reference 2>$null)
+        $output = @(& $DockerCommand image inspect --format "{{.Id}}" $Reference 2>$null)
         $inspectExitCode = $LASTEXITCODE
     }
     finally {
@@ -234,7 +245,7 @@ function Assert-IdleHealth {
 
 function Assert-ExternalEgressBlocked {
     $egressOutput = @(
-        & docker exec mineru-api /usr/bin/python3.12 -I -c `
+        & $DockerCommand exec mineru-api /usr/bin/python3.12 -I -c `
             "import socket,sys;`ntry:`n socket.create_connection(('1.1.1.1',443),2); print('MINERU_EGRESS_OPEN'); sys.exit(0)`nexcept (TimeoutError,ConnectionRefusedError,OSError) as exc:`n print('MINERU_EGRESS_BLOCKED:'+type(exc).__name__); sys.exit(42)" 2>$null
     )
     if (
@@ -652,7 +663,7 @@ function Get-ValidatedRuntime {
     }
 
     $vllmVersion = @(
-        & docker exec mineru-openai-server /usr/bin/python3.12 -I -c `
+        & $DockerCommand exec mineru-openai-server /usr/bin/python3.12 -I -c `
             "import importlib.metadata; print(importlib.metadata.version('vllm'))"
     )
     if (

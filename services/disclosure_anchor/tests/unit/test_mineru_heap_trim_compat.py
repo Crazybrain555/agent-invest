@@ -1391,6 +1391,12 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             installer,
         )
         self.assertIn("function Get-StableServiceEpochs", installer)
+        self.assertIn("Get-Command docker.exe -CommandType Application", installer)
+        self.assertIn("Get-Command docker.exe -CommandType Application", collector)
+        self.assertIn("& $DockerCommand", installer)
+        self.assertIn("& $DockerCommand", collector)
+        self.assertNotIn("& docker ", installer)
+        self.assertNotIn("& docker ", collector)
         self.assertIn("function Assert-StableServiceEpochs", installer)
         self.assertIn("Get-ValidatedPublishedApiCompatImage", installer)
         self.assertIn('"build", "--pull=false", "--provenance=false"', installer)

@@ -722,7 +722,7 @@ vllm:gpu_cache_usage_perc 0.1
             / "collect_mineru_runtime.ps1"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            "$probeCode | & docker exec -i $name /usr/bin/python3.12 -I -",
+            "$probeCode | & $DockerCommand exec -i $name /usr/bin/python3.12 -I -",
             collector_source,
         )
         self.assertNotIn("-I -c $probeCode", collector_source)
