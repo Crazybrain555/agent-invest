@@ -722,9 +722,10 @@ vllm:gpu_cache_usage_perc 0.1
             / "collect_mineru_runtime.ps1"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            "$probeCode | & $DockerCommand exec -i $name /usr/bin/python3.12 -I -",
+            '"exec", "-i", $name, "/usr/bin/python3.12", "-I", "-"',
             collector_source,
         )
+        self.assertIn("-StandardInput $probeCode", collector_source)
         self.assertNotIn("-I -c $probeCode", collector_source)
 
     def test_metrics_parser_aggregates_labels_and_accepts_kv_alias(self) -> None:

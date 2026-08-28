@@ -26,6 +26,137 @@ if (
     throw "Docker CLI must resolve to one executable application"
 }
 
+# BEGIN MINERU NATIVE PROCESS V1
+function ConvertTo-WindowsCommandLineArgument {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') {
+        return $Value
+    }
+    $builder = New-Object Text.StringBuilder
+    [void]$builder.Append('"')
+    [int]$backslashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashes += 1
+            continue
+        }
+        if ($character -eq '"') {
+            [void]$builder.Append(('\' * (($backslashes * 2) + 1)))
+            [void]$builder.Append('"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) {
+            [void]$builder.Append(('\' * $backslashes))
+            $backslashes = 0
+        }
+        [void]$builder.Append($character)
+    }
+    if ($backslashes -gt 0) {
+        [void]$builder.Append(('\' * ($backslashes * 2)))
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function ConvertFrom-NativeProcessText {
+    param([AllowEmptyString()][string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) { return @() }
+    $trimmed = $Value.TrimEnd([char[]]@("`r", "`n"))
+    if ([string]::IsNullOrEmpty($trimmed)) { return @() }
+    return @($trimmed -split "`r?`n")
+}
+
+function Invoke-NativeProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Arguments,
+        [AllowNull()][string]$StandardInput = $null
+    )
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = (@(
+        $Arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument -Value $_ }
+    ) -join " ")
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.RedirectStandardInput = $null -ne $StandardInput
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    $startInfo.StandardOutputEncoding = $utf8
+    $startInfo.StandardErrorEncoding = $utf8
+
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $startInfo
+    $started = $false
+    try {
+        $started = $process.Start()
+        if (-not $started) { throw "native process did not start: $FilePath" }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if ($null -ne $StandardInput) {
+            $inputBytes = [Text.Encoding]::UTF8.GetBytes($StandardInput)
+            $process.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)
+            $process.StandardInput.BaseStream.Flush()
+            $process.StandardInput.Close()
+        }
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        return [pscustomobject]@{
+            ExitCode = [int]$process.ExitCode
+            StandardOutput = [string]$stdout
+            StandardError = [string]$stderr
+        }
+    }
+    catch {
+        $originalError = $_
+        if ($started) {
+            try {
+                if (-not $process.HasExited) { $process.Kill() }
+                $process.WaitForExit()
+            }
+            catch {
+                # Cleanup is best-effort; preserve the original process error.
+            }
+        }
+        throw $originalError
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Invoke-DockerProcess {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [AllowNull()][string]$StandardInput = $null,
+        [int[]]$AllowedExitCodes = @(0)
+    )
+    $result = Invoke-NativeProcess -FilePath $DockerCommand -Arguments $Arguments `
+        -StandardInput $StandardInput
+    if ($AllowedExitCodes -notcontains $result.ExitCode) {
+        $detail = ([string]$result.StandardError).Trim()
+        if ([string]::IsNullOrWhiteSpace($detail)) {
+            $detail = ([string]$result.StandardOutput).Trim()
+        }
+        if ($detail.Length -gt 4096) { $detail = $detail.Substring(0, 4096) }
+        throw (
+            "docker command failed with exit code $($result.ExitCode): docker " +
+            "$($Arguments -join ' ')`n$detail"
+        ).TrimEnd()
+    }
+    return $result
+}
+
+function Invoke-Docker {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    $result = Invoke-DockerProcess -Arguments $Arguments
+    return @(ConvertFrom-NativeProcessText -Value $result.StandardOutput)
+}
+# END MINERU NATIVE PROCESS V1
+
 if ($CapacitySample -and $PhaseTrace) {
     throw "capacity sampling and phase-trace capture are mutually exclusive"
 }
@@ -92,10 +223,13 @@ print(json.dumps({
     "docker_vm_memory_available_bytes": meminfo.get("MemAvailable", 0),
 }, separators=(",", ":")))
 '@
+    $probeResult = Invoke-DockerProcess -Arguments @(
+        "exec", "-i", $name, "/usr/bin/python3.12", "-I", "-"
+    ) -StandardInput $probeCode
     $probeJson = @(
-        $probeCode | & $DockerCommand exec -i $name /usr/bin/python3.12 -I -
+        ConvertFrom-NativeProcessText -Value $probeResult.StandardOutput
     )
-    if ($LASTEXITCODE -ne 0 -or $probeJson.Count -ne 1) {
+    if ($probeJson.Count -ne 1) {
         throw "cannot sample cgroup and RSS for $name"
     }
     $probe = ([string]$probeJson[0]) | ConvertFrom-Json
@@ -121,8 +255,10 @@ print(json.dumps({
 }
 
 if ($CapacitySample) {
-    $capacityInspect = & $DockerCommand inspect mineru-api mineru-api-proxy mineru-openai-server | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0 -or @($capacityInspect).Count -ne 3) {
+    $capacityInspect = Invoke-Docker -Arguments @(
+        "inspect", "mineru-api", "mineru-api-proxy", "mineru-openai-server"
+    ) | ConvertFrom-Json
+    if (@($capacityInspect).Count -ne 3) {
         throw "cannot inspect all MinerU containers for capacity sampling"
     }
     $machineGuid = (Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Cryptography" -Name MachineGuid).MachineGuid
@@ -225,8 +361,10 @@ if ($PhaseTrace) {
         throw "phase-trace capture bounds must be increasing UTC within six hours"
     }
 
-    $traceInspect = @(& $DockerCommand inspect mineru-api | ConvertFrom-Json)
-    if ($LASTEXITCODE -ne 0 -or $traceInspect.Count -ne 1) {
+    $traceInspect = @(
+        Invoke-Docker -Arguments @("inspect", "mineru-api") | ConvertFrom-Json
+    )
+    if ($traceInspect.Count -ne 1) {
         throw "cannot inspect MinerU API for phase-trace capture"
     }
     $traceContainer = $traceInspect[0]
@@ -273,10 +411,13 @@ print(json.dumps({
     "phase_trace_enabled": is_phase_trace_enabled(),
 }, sort_keys=True, separators=(",", ":")))
 '@
+    $profileProbeResult = Invoke-DockerProcess -Arguments @(
+        "exec", "-i", "mineru-api", "/usr/bin/python3.12", "-I", "-"
+    ) -StandardInput $profileProbeCode
     $profileProbeOutput = @(
-        $profileProbeCode | & $DockerCommand exec -i mineru-api /usr/bin/python3.12 -I -
+        ConvertFrom-NativeProcessText -Value $profileProbeResult.StandardOutput
     )
-    if ($LASTEXITCODE -ne 0 -or $profileProbeOutput.Count -ne 1) {
+    if ($profileProbeOutput.Count -ne 1) {
         throw "cannot bind the active MinerU phase-trace profile"
     }
     $profileProbe = ([string]$profileProbeOutput[0]) | ConvertFrom-Json
@@ -288,13 +429,21 @@ print(json.dumps({
         throw "active MinerU phase-trace profile drifted"
     }
 
-    $rawLogLines = @(
-        & $DockerCommand logs --since ($since.ToString("o")) --until ($until.ToString("o")) `
-            mineru-api 2>&1 | ForEach-Object { [string]$_ }
+    $logResult = Invoke-DockerProcess -Arguments @(
+        "logs", "--since", $since.ToString("o"), "--until", $until.ToString("o"),
+        "mineru-api"
     )
-    if ($LASTEXITCODE -ne 0) {
-        throw "cannot read bounded MinerU API logs"
+    $stdoutLogLines = @(
+        ConvertFrom-NativeProcessText -Value $logResult.StandardOutput
+    )
+    if (@($stdoutLogLines | Where-Object {
+        $_.StartsWith("MINERU_PHASE_TRACE ")
+    }).Count -ne 0) {
+        throw "MinerU phase trace drifted from the exact stderr stream"
     }
+    $rawLogLines = @(
+        ConvertFrom-NativeProcessText -Value $logResult.StandardError
+    )
     $traceLines = @(
         $rawLogLines | Where-Object { $_.StartsWith("MINERU_PHASE_TRACE ") }
     )
@@ -349,23 +498,31 @@ print(json.dumps({
 }
 
 if (-not (Test-Path -LiteralPath $ComposePath -PathType Leaf)) { throw "compose file is missing" }
-$resolvedConfig = & $DockerCommand compose --project-name mineru-tailnet --file $ComposePath config --format json
-if ($LASTEXITCODE -ne 0) { throw "cannot resolve MinerU compose configuration" }
+$resolvedConfig = Invoke-Docker -Arguments @(
+    "compose", "--project-name", "mineru-tailnet", "--file", $ComposePath,
+    "config", "--format", "json"
+)
 $configObject = $resolvedConfig | ConvertFrom-Json
-$inspect = & $DockerCommand inspect mineru-api mineru-api-proxy mineru-openai-server | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0 -or $inspect.Count -ne 3) { throw "cannot inspect all MinerU containers" }
+$inspect = Invoke-Docker -Arguments @(
+    "inspect", "mineru-api", "mineru-api-proxy", "mineru-openai-server"
+) | ConvertFrom-Json
+if ($inspect.Count -ne 3) { throw "cannot inspect all MinerU containers" }
 $api = $inspect | Where-Object { $_.Name -eq "/mineru-api" }
 $proxy = $inspect | Where-Object { $_.Name -eq "/mineru-api-proxy" }
 $vllm = $inspect | Where-Object { $_.Name -eq "/mineru-openai-server" }
 if ($null -eq $api -or $null -eq $proxy -or $null -eq $vllm) {
     throw "MinerU container identities drifted"
 }
-$apiImageInspect = & $DockerCommand image inspect ([string]$api.Config.Image) | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0 -or @($apiImageInspect).Count -ne 1) {
+$apiImageInspect = Invoke-Docker -Arguments @(
+    "image", "inspect", [string]$api.Config.Image
+) | ConvertFrom-Json
+if (@($apiImageInspect).Count -ne 1) {
     throw "cannot inspect the pinned MinerU API compatibility image"
 }
-$baseImageInspect = & $DockerCommand image inspect ([string]$vllm.Config.Image) | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0 -or @($baseImageInspect).Count -ne 1) {
+$baseImageInspect = Invoke-Docker -Arguments @(
+    "image", "inspect", [string]$vllm.Config.Image
+) | ConvertFrom-Json
+if (@($baseImageInspect).Count -ne 1) {
     throw "cannot inspect the pinned MinerU base image"
 }
 $apiImageEnvironment = @($apiImageInspect[0].Config.Env)
@@ -428,10 +585,13 @@ print(json.dumps({
     "mineru_version": importlib.metadata.version("mineru"),
 }, sort_keys=True, separators=(",", ":")))
 '@
+$compatProbeResult = Invoke-DockerProcess -Arguments @(
+    "exec", "-i", "mineru-api", "/usr/bin/python3.12", "-I", "-"
+) -StandardInput $compatProbeCode
 $compatProbeOutput = @(
-    $compatProbeCode | & $DockerCommand exec -i mineru-api /usr/bin/python3.12 -I -
+    ConvertFrom-NativeProcessText -Value $compatProbeResult.StandardOutput
 )
-if ($LASTEXITCODE -ne 0 -or $compatProbeOutput.Count -ne 1) {
+if ($compatProbeOutput.Count -ne 1) {
     throw "cannot measure the live MinerU heap-return compatibility layer"
 }
 $compatProbe = ([string]$compatProbeOutput[0]) | ConvertFrom-Json
@@ -465,22 +625,25 @@ if ($revision -ne "bff20d4ae2bf202df9f45284b4d43681555a97ed") {
     throw "served model revision drifted"
 }
 
-$vllmVersionOutput = @(
-    & $DockerCommand exec mineru-openai-server /usr/bin/python3.12 -I -c `
-        "import importlib.metadata; print(importlib.metadata.version('vllm'))"
-)
-if ($LASTEXITCODE -ne 0 -or $vllmVersionOutput.Count -ne 1) {
+$vllmVersionOutput = @(Invoke-Docker -Arguments @(
+    "exec", "mineru-openai-server", "/usr/bin/python3.12", "-I", "-c",
+    "import importlib.metadata; print(importlib.metadata.version('vllm'))"
+))
+if ($vllmVersionOutput.Count -ne 1) {
     throw "cannot measure the live vLLM package version"
 }
 $vllmVersion = ([string]$vllmVersionOutput[0]).Trim()
 if ($vllmVersion -ne "0.21.0") { throw "live vLLM package version drifted" }
 
+$egressResult = Invoke-DockerProcess -Arguments @(
+    "exec", "mineru-api", "/usr/bin/python3.12", "-I", "-c",
+    "import socket,sys;`ntry:`n socket.create_connection(('1.1.1.1',443),2); print('MINERU_EGRESS_OPEN'); sys.exit(0)`nexcept (TimeoutError,ConnectionRefusedError,OSError) as exc:`n print('MINERU_EGRESS_BLOCKED:'+type(exc).__name__); sys.exit(42)"
+) -AllowedExitCodes @(42)
 $egressOutput = @(
-    & $DockerCommand exec mineru-api /usr/bin/python3.12 -I -c `
-        "import socket,sys;`ntry:`n socket.create_connection(('1.1.1.1',443),2); print('MINERU_EGRESS_OPEN'); sys.exit(0)`nexcept (TimeoutError,ConnectionRefusedError,OSError) as exc:`n print('MINERU_EGRESS_BLOCKED:'+type(exc).__name__); sys.exit(42)" 2>$null
+    ConvertFrom-NativeProcessText -Value $egressResult.StandardOutput
 )
 $externalTcpEgressBlocked = (
-    $LASTEXITCODE -eq 42 -and $egressOutput.Count -eq 1 -and
+    $egressOutput.Count -eq 1 -and
     ([string]$egressOutput[0]).Trim() -match '^MINERU_EGRESS_BLOCKED:(TimeoutError|ConnectionRefusedError|OSError)$'
 )
 if (-not $externalTcpEgressBlocked) {
@@ -505,8 +668,10 @@ $apiPort = @(
 )
 $proxyPort = @($proxy.NetworkSettings.Ports."8000/tcp")
 $vllmPort = @($vllm.NetworkSettings.Ports."30000/tcp")
-$networkInspect = & $DockerCommand network inspect mineru-tailnet_inference mineru-tailnet_runtime | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0 -or @($networkInspect).Count -ne 2) {
+$networkInspect = Invoke-Docker -Arguments @(
+    "network", "inspect", "mineru-tailnet_inference", "mineru-tailnet_runtime"
+) | ConvertFrom-Json
+if (@($networkInspect).Count -ne 2) {
     throw "cannot inspect the live MinerU Docker networks"
 }
 $inferenceNetwork = @($networkInspect | Where-Object { $_.Name -eq "mineru-tailnet_inference" })

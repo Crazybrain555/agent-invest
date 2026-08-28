@@ -187,6 +187,9 @@ stable tag→image ID 后，才把固定发布 tag 原子指向新 image。随�
 health、网络、egress、空 output-root 或 formal collector 校验失败都会恢复旧 tag 映射、旧 compose、
 旧 collector、旧 receipt 和旧容器运行态，并删除临时 tag。不要手工把 v6 reader 改回兼容任意历史路径，也不要在同一次处置中
 重启 Docker Desktop、Windows、Tailscale 或 v2rayN。
+安装器与 collector 在 Windows PowerShell 5.1 中通过同一 `System.Diagnostics.Process` 调用层取得
+显式 `ExitCode/stdout/stderr`，并并行排空双流、以 UTF-8 字节写入 `docker exec -i`；不得改回依赖
+`$LASTEXITCODE` 的调用运算符，也不得跳过 exact source preflight。
 
 bootstrap 与 steady state 是两个独立 profile：bootstrap 不启动 resident worker、不开放 queue
 admission；steady state 只在当前 runtime smoke 与两次相互独立的完整 staged load 通过后使用已验证

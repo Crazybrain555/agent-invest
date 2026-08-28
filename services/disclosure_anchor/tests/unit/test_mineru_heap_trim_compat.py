@@ -1393,8 +1393,39 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("function Get-StableServiceEpochs", installer)
         self.assertIn("Get-Command docker.exe -CommandType Application", installer)
         self.assertIn("Get-Command docker.exe -CommandType Application", collector)
-        self.assertIn("& $DockerCommand", installer)
-        self.assertIn("& $DockerCommand", collector)
+        helper_start = "# BEGIN MINERU NATIVE PROCESS V1"
+        helper_end = "# END MINERU NATIVE PROCESS V1"
+        installer_helper = installer[
+            installer.index(helper_start) : installer.index(helper_end) + len(helper_end)
+        ]
+        collector_helper = collector[
+            collector.index(helper_start) : collector.index(helper_end) + len(helper_end)
+        ]
+        self.assertEqual(installer_helper, collector_helper)
+        self.assertIn("function Invoke-NativeProcess", installer_helper)
+        self.assertIn("Diagnostics.ProcessStartInfo", installer_helper)
+        self.assertIn("$process.ExitCode", installer_helper)
+        self.assertIn("$process.StandardOutput.ReadToEndAsync()", installer_helper)
+        self.assertIn("$process.StandardError.ReadToEndAsync()", installer_helper)
+        self.assertLess(
+            installer_helper.index("$process.StandardOutput.ReadToEndAsync()"),
+            installer_helper.index("$process.WaitForExit()"),
+        )
+        self.assertLess(
+            installer_helper.index("$process.StandardError.ReadToEndAsync()"),
+            installer_helper.index("$process.WaitForExit()"),
+        )
+        self.assertIn("$process.StandardInput.BaseStream.Write", installer_helper)
+        self.assertIn("[Text.Encoding]::UTF8.GetBytes($StandardInput)", installer_helper)
+        self.assertIn("# Cleanup is best-effort; preserve the original process error.", installer_helper)
+        self.assertIn("throw $originalError", installer_helper)
+        self.assertIn("ConvertTo-WindowsCommandLineArgument", installer_helper)
+        self.assertNotIn(".ArgumentList", installer_helper)
+        self.assertNotIn("Start-Process", installer_helper)
+        self.assertNotIn("$LASTEXITCODE", installer)
+        self.assertNotIn("$LASTEXITCODE", collector)
+        self.assertNotIn("& $DockerCommand", installer)
+        self.assertNotIn("& $DockerCommand", collector)
         self.assertNotIn("& docker ", installer)
         self.assertNotIn("& docker ", collector)
         self.assertIn("function Assert-StableServiceEpochs", installer)
@@ -1402,11 +1433,27 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn('"build", "--pull=false", "--provenance=false"', installer)
         self.assertIn('"--tag", $ApiCompatBuildTag', installer)
         self.assertIn("$OldApiCompatImageId = Get-OptionalImageId", installer)
-        self.assertIn('$ErrorActionPreference = "SilentlyContinue"', installer)
-        self.assertIn("$inspectExitCode = $LASTEXITCODE", installer)
         self.assertIn(
-            "$ErrorActionPreference = $previousErrorActionPreference",
+            ") -AllowedExitCodes @(0, 1)",
             installer,
+        )
+        self.assertIn("No such image: .+$", installer)
+        self.assertIn(
+            "cannot inspect optional Docker image reference $($Reference):",
+            installer,
+        )
+        self.assertIn(") -AllowedExitCodes @(42)", installer)
+        self.assertIn(") -AllowedExitCodes @(42)", collector)
+        self.assertIn("-StandardInput $probeCode", collector)
+        self.assertIn("-StandardInput $profileProbeCode", collector)
+        self.assertIn("-StandardInput $compatProbeCode", collector)
+        self.assertIn(
+            "MinerU phase trace drifted from the exact stderr stream",
+            collector,
+        )
+        self.assertIn(
+            "ConvertFrom-NativeProcessText -Value $logResult.StandardError",
+            collector,
         )
         self.assertIn("function Restore-ApiCompatTag", installer)
         self.assertIn('"tag", $OldApiCompatImageId, $ApiCompatImage', installer)

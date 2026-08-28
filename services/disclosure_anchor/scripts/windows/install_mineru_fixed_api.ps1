@@ -28,6 +28,138 @@ if (
 ) {
     throw "Docker CLI must resolve to one executable application"
 }
+
+# BEGIN MINERU NATIVE PROCESS V1
+function ConvertTo-WindowsCommandLineArgument {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') {
+        return $Value
+    }
+    $builder = New-Object Text.StringBuilder
+    [void]$builder.Append('"')
+    [int]$backslashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashes += 1
+            continue
+        }
+        if ($character -eq '"') {
+            [void]$builder.Append(('\' * (($backslashes * 2) + 1)))
+            [void]$builder.Append('"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) {
+            [void]$builder.Append(('\' * $backslashes))
+            $backslashes = 0
+        }
+        [void]$builder.Append($character)
+    }
+    if ($backslashes -gt 0) {
+        [void]$builder.Append(('\' * ($backslashes * 2)))
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function ConvertFrom-NativeProcessText {
+    param([AllowEmptyString()][string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) { return @() }
+    $trimmed = $Value.TrimEnd([char[]]@("`r", "`n"))
+    if ([string]::IsNullOrEmpty($trimmed)) { return @() }
+    return @($trimmed -split "`r?`n")
+}
+
+function Invoke-NativeProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Arguments,
+        [AllowNull()][string]$StandardInput = $null
+    )
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = (@(
+        $Arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument -Value $_ }
+    ) -join " ")
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.RedirectStandardInput = $null -ne $StandardInput
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    $startInfo.StandardOutputEncoding = $utf8
+    $startInfo.StandardErrorEncoding = $utf8
+
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $startInfo
+    $started = $false
+    try {
+        $started = $process.Start()
+        if (-not $started) { throw "native process did not start: $FilePath" }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if ($null -ne $StandardInput) {
+            $inputBytes = [Text.Encoding]::UTF8.GetBytes($StandardInput)
+            $process.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)
+            $process.StandardInput.BaseStream.Flush()
+            $process.StandardInput.Close()
+        }
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        return [pscustomobject]@{
+            ExitCode = [int]$process.ExitCode
+            StandardOutput = [string]$stdout
+            StandardError = [string]$stderr
+        }
+    }
+    catch {
+        $originalError = $_
+        if ($started) {
+            try {
+                if (-not $process.HasExited) { $process.Kill() }
+                $process.WaitForExit()
+            }
+            catch {
+                # Cleanup is best-effort; preserve the original process error.
+            }
+        }
+        throw $originalError
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Invoke-DockerProcess {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [AllowNull()][string]$StandardInput = $null,
+        [int[]]$AllowedExitCodes = @(0)
+    )
+    $result = Invoke-NativeProcess -FilePath $DockerCommand -Arguments $Arguments `
+        -StandardInput $StandardInput
+    if ($AllowedExitCodes -notcontains $result.ExitCode) {
+        $detail = ([string]$result.StandardError).Trim()
+        if ([string]::IsNullOrWhiteSpace($detail)) {
+            $detail = ([string]$result.StandardOutput).Trim()
+        }
+        if ($detail.Length -gt 4096) { $detail = $detail.Substring(0, 4096) }
+        throw (
+            "docker command failed with exit code $($result.ExitCode): docker " +
+            "$($Arguments -join ' ')`n$detail"
+        ).TrimEnd()
+    }
+    return $result
+}
+
+function Invoke-Docker {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    $result = Invoke-DockerProcess -Arguments $Arguments
+    return @(ConvertFrom-NativeProcessText -Value $result.StandardOutput)
+}
+# END MINERU NATIVE PROCESS V1
+
 $ProjectName = "mineru-tailnet"
 $ApiCompatImage = "agent-invest/mineru-api:3.4.4-capacity-v1"
 $ApiCompatBuildTag = "agent-invest/mineru-api:build-$([Guid]::NewGuid().ToString('N'))"
@@ -88,28 +220,23 @@ elseif (-not [string]::IsNullOrEmpty($CampaignApiCompatImageId)) {
     throw "campaign API compatibility image ID is valid only in reuse mode"
 }
 
-function Invoke-Docker {
-    param([Parameter(Mandatory = $true)][string[]]$Arguments)
-    $output = & $DockerCommand @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "docker command failed: docker $($Arguments -join ' ')"
-    }
-    return $output
-}
-
 function Get-OptionalImageId {
     param([Parameter(Mandatory = $true)][string]$Reference)
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "SilentlyContinue"
-        $output = @(& $DockerCommand image inspect --format "{{.Id}}" $Reference 2>$null)
-        $inspectExitCode = $LASTEXITCODE
+    $result = Invoke-DockerProcess -Arguments @(
+        "image", "inspect", "--format", "{{.Id}}", $Reference
+    ) -AllowedExitCodes @(0, 1)
+    if ($result.ExitCode -eq 1) {
+        $missingDetail = ([string]$result.StandardError).Trim()
+        if (
+            [string]::IsNullOrWhiteSpace([string]$result.StandardOutput) -and
+            $missingDetail -match '^(Error response from daemon: )?No such image: .+$'
+        ) {
+            return $null
+        }
+        throw "cannot inspect optional Docker image reference $($Reference): $missingDetail"
     }
-    finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    if ($inspectExitCode -eq 1) { return $null }
-    if ($inspectExitCode -ne 0 -or $output.Count -ne 1) {
+    $output = @(ConvertFrom-NativeProcessText -Value $result.StandardOutput)
+    if ($output.Count -ne 1) {
         throw "cannot inspect optional Docker image reference $Reference"
     }
     $imageId = ([string]$output[0]).Trim()
@@ -244,12 +371,15 @@ function Assert-IdleHealth {
 }
 
 function Assert-ExternalEgressBlocked {
+    $egressResult = Invoke-DockerProcess -Arguments @(
+        "exec", "mineru-api", "/usr/bin/python3.12", "-I", "-c",
+        "import socket,sys;`ntry:`n socket.create_connection(('1.1.1.1',443),2); print('MINERU_EGRESS_OPEN'); sys.exit(0)`nexcept (TimeoutError,ConnectionRefusedError,OSError) as exc:`n print('MINERU_EGRESS_BLOCKED:'+type(exc).__name__); sys.exit(42)"
+    ) -AllowedExitCodes @(42)
     $egressOutput = @(
-        & $DockerCommand exec mineru-api /usr/bin/python3.12 -I -c `
-            "import socket,sys;`ntry:`n socket.create_connection(('1.1.1.1',443),2); print('MINERU_EGRESS_OPEN'); sys.exit(0)`nexcept (TimeoutError,ConnectionRefusedError,OSError) as exc:`n print('MINERU_EGRESS_BLOCKED:'+type(exc).__name__); sys.exit(42)" 2>$null
+        ConvertFrom-NativeProcessText -Value $egressResult.StandardOutput
     )
     if (
-        $LASTEXITCODE -ne 42 -or $egressOutput.Count -ne 1 -or
+        $egressOutput.Count -ne 1 -or
         ([string]$egressOutput[0]).Trim() -notmatch
             '^MINERU_EGRESS_BLOCKED:(TimeoutError|ConnectionRefusedError|OSError)$'
     ) {
@@ -662,12 +792,12 @@ function Get-ValidatedRuntime {
         throw "served model identity drifted"
     }
 
-    $vllmVersion = @(
-        & $DockerCommand exec mineru-openai-server /usr/bin/python3.12 -I -c `
-            "import importlib.metadata; print(importlib.metadata.version('vllm'))"
-    )
+    $vllmVersion = @(Invoke-Docker -Arguments @(
+        "exec", "mineru-openai-server", "/usr/bin/python3.12", "-I", "-c",
+        "import importlib.metadata; print(importlib.metadata.version('vllm'))"
+    ))
     if (
-        $LASTEXITCODE -ne 0 -or $vllmVersion.Count -ne 1 -or
+        $vllmVersion.Count -ne 1 -or
         ([string]$vllmVersion[0]).Trim() -ne "0.21.0"
     ) {
         throw "live vLLM package version drifted"
