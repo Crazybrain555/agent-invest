@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 import unittest
 
 from scripts.collect_mineru_phase_trace import _receipt_identity
@@ -67,6 +68,18 @@ def _receipt() -> dict[str, object]:
 
 
 class CollectMineruPhaseTraceTests(unittest.TestCase):
+    def test_make_target_uses_import_safe_module_entrypoint(self) -> None:
+        makefile = Path("Makefile").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "$(PYTHON) -m scripts.collect_mineru_phase_trace",
+            makefile,
+        )
+        self.assertNotIn(
+            "$(PYTHON) scripts/collect_mineru_phase_trace.py",
+            makefile,
+        )
+
     def test_receipt_identity_closes_epoch_and_document_page_counts(self) -> None:
         (
             started,

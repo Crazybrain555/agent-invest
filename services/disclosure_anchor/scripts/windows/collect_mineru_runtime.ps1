@@ -366,6 +366,46 @@ function Select-ExactEnvironment {
     return $selected
 }
 
+# BEGIN MINERU PHASE TRACE LINE EXTRACTION V1
+function Get-MineruPhaseTraceLines {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$RawLines,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("stdout", "stderr")]
+        [string]$Stream
+    )
+    $tracePrefix = "MINERU_PHASE_TRACE "
+    $traceLines = @(
+        foreach ($rawValue in $RawLines) {
+            if ($null -eq $rawValue -or $rawValue.GetType() -ne [string]) {
+                throw "phase-trace log stream contains a non-string line"
+            }
+            $rawLine = [string]$rawValue
+            $prefixIndex = $rawLine.IndexOf(
+                $tracePrefix,
+                [StringComparison]::Ordinal
+            )
+            if ($prefixIndex -lt 0) { continue }
+            if ($Stream -ne "stderr") {
+                throw "MinerU phase trace drifted from the exact stderr stream"
+            }
+            if (
+                $prefixIndex -ne $rawLine.LastIndexOf(
+                    $tracePrefix,
+                    [StringComparison]::Ordinal
+                )
+            ) {
+                throw "phase-trace log line contains multiple event prefixes"
+            }
+            $rawLine.Substring($prefixIndex)
+        }
+    )
+    return @($traceLines)
+}
+# END MINERU PHASE TRACE LINE EXTRACTION V1
+
 if ($PhaseTrace) {
     if (
         [string]::IsNullOrWhiteSpace($TraceSinceUtc) -or
@@ -462,16 +502,13 @@ print(json.dumps({
     $stdoutLogLines = @(
         ConvertFrom-NativeProcessText -Value $logResult.StandardOutput
     )
-    if (@($stdoutLogLines | Where-Object {
-        $_.StartsWith("MINERU_PHASE_TRACE ")
-    }).Count -ne 0) {
-        throw "MinerU phase trace drifted from the exact stderr stream"
-    }
+    Get-MineruPhaseTraceLines -RawLines $stdoutLogLines -Stream "stdout" |
+        Out-Null
     $rawLogLines = @(
         ConvertFrom-NativeProcessText -Value $logResult.StandardError
     )
     $traceLines = @(
-        $rawLogLines | Where-Object { $_.StartsWith("MINERU_PHASE_TRACE ") }
+        Get-MineruPhaseTraceLines -RawLines $rawLogLines -Stream "stderr"
     )
     if ($traceLines.Count -eq 0 -or $traceLines.Count -gt $MaxTraceLines) {
         throw "phase-trace line count is empty or exceeds its bound"

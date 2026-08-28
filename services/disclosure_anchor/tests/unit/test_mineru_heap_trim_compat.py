@@ -1499,6 +1499,31 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             collector,
         )
         self.assertIn(
+            "function Get-MineruPhaseTraceLines",
+            collector,
+        )
+        self.assertIn('[ValidateSet("stdout", "stderr")]', collector)
+        self.assertIn("$rawValue.GetType() -ne [string]", collector)
+        self.assertIn("[StringComparison]::Ordinal", collector)
+        self.assertIn(
+            "$prefixIndex -ne $rawLine.LastIndexOf(",
+            collector,
+        )
+        self.assertIn(
+            'throw "phase-trace log line contains multiple event prefixes"',
+            collector,
+        )
+        self.assertIn("$rawLine.Substring($prefixIndex)", collector)
+        self.assertIn(
+            'Get-MineruPhaseTraceLines -RawLines $stdoutLogLines -Stream "stdout"',
+            collector,
+        )
+        self.assertIn(
+            'Get-MineruPhaseTraceLines -RawLines $rawLogLines -Stream "stderr"',
+            collector,
+        )
+        self.assertNotIn('.StartsWith("MINERU_PHASE_TRACE ")', collector)
+        self.assertIn(
             "ConvertFrom-NativeProcessText -Value $logResult.StandardError",
             collector,
         )
@@ -1541,6 +1566,20 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("mineru-capacity-v1/compatibility.json", collector)
         self.assertIn("actual_source_sha256", collector)
         self.assertIn("heap_trim_enabled", collector)
+
+    def test_windows_phase_trace_extraction_smoke_covers_stream_boundaries(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        smoke = (
+            root / "tests" / "windows" / "test_mineru_phase_trace_line_extraction.ps1"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("MINERU PHASE TRACE LINE EXTRACTION V1", smoke)
+        self.assertIn("column-zero phase trace did not round trip", smoke)
+        self.assertIn("embedded phase trace did not canonicalize", smoke)
+        self.assertIn("ordinary stderr was treated as a phase trace", smoke)
+        self.assertIn("multiple phase-trace prefixes were accepted", smoke)
+        self.assertIn("stdout phase-trace placement was accepted", smoke)
+        self.assertIn("non-string log line was accepted", smoke)
 
 
 if __name__ == "__main__":

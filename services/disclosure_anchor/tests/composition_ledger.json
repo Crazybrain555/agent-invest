@@ -161,7 +161,7 @@
   },
   "tests/unit/test_collect_mineru_phase_trace.py": {
    "private_imports": [],
-   "tests": 2
+   "tests": 3
   },
   "tests/unit/test_config_check.py": {
    "private_imports": [],
@@ -284,7 +284,7 @@
   },
   "tests/unit/test_mineru_heap_trim_compat.py": {
    "private_imports": [],
-   "tests": 16
+   "tests": 17
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],

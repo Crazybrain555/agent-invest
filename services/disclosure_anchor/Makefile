@@ -260,7 +260,7 @@ mineru-phase-trace-capture:
 	@test -n "$(SSH_USER)" || (echo 'mineru-phase-trace-capture: SSH_USER is required' && exit 2)
 	@test -n "$(SSH_IDENTITY)" || (echo 'mineru-phase-trace-capture: SSH_IDENTITY is required' && exit 2)
 	@test -n "$(SSH_KNOWN_HOSTS)" || (echo 'mineru-phase-trace-capture: SSH_KNOWN_HOSTS is required' && exit 2)
-	$(WITH_WORKER_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/collect_mineru_phase_trace.py \
+	$(WITH_WORKER_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m scripts.collect_mineru_phase_trace \
 		--staged-load-receipt "$(STAGED_RECEIPT)" \
 		--capacity-mode "$(CAPACITY_MODE)" \
 		--profile-sha256 "$(PROFILE_SHA256)" \
