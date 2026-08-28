@@ -73,7 +73,7 @@ function ConvertFrom-NativeProcessText {
 function Invoke-NativeProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Arguments,
         [AllowNull()][string]$StandardInput = $null
     )
     $startInfo = New-Object Diagnostics.ProcessStartInfo
@@ -133,7 +133,7 @@ function Invoke-NativeProcess {
 
 function Invoke-DockerProcess {
     param(
-        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string[]]$Arguments,
         [AllowNull()][string]$StandardInput = $null,
         [int[]]$AllowedExitCodes = @(0)
     )
@@ -154,7 +154,9 @@ function Invoke-DockerProcess {
 }
 
 function Invoke-Docker {
-    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string[]]$Arguments
+    )
     $result = Invoke-DockerProcess -Arguments $Arguments
     return @(ConvertFrom-NativeProcessText -Value $result.StandardOutput)
 }

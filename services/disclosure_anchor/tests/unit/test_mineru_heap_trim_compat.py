@@ -1420,6 +1420,28 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("# Cleanup is best-effort; preserve the original process error.", installer_helper)
         self.assertIn("throw $originalError", installer_helper)
         self.assertIn("ConvertTo-WindowsCommandLineArgument", installer_helper)
+        native_signature = installer_helper[
+            installer_helper.index("function Invoke-NativeProcess") :
+            installer_helper.index("$startInfo = New-Object Diagnostics.ProcessStartInfo")
+        ]
+        docker_process_signature = installer_helper[
+            installer_helper.index("function Invoke-DockerProcess") :
+            installer_helper.index("$result = Invoke-NativeProcess")
+        ]
+        docker_signature = installer_helper[
+            installer_helper.index("function Invoke-Docker {") :
+            installer_helper.index("$result = Invoke-DockerProcess -Arguments $Arguments")
+        ]
+        self.assertIn(
+            "[AllowEmptyCollection()][AllowEmptyString()][string[]]$Arguments",
+            native_signature,
+        )
+        self.assertNotIn("[AllowEmptyCollection()]", docker_process_signature)
+        self.assertIn(
+            "[AllowEmptyString()][string[]]$Arguments", docker_process_signature
+        )
+        self.assertNotIn("[AllowEmptyCollection()]", docker_signature)
+        self.assertIn("[AllowEmptyString()][string[]]$Arguments", docker_signature)
         self.assertNotIn(".ArgumentList", installer_helper)
         self.assertNotIn("Start-Process", installer_helper)
         self.assertNotIn("$LASTEXITCODE", installer)
