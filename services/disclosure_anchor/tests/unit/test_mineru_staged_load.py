@@ -612,6 +612,37 @@ vllm:gpu_cache_usage_perc 0.1
                 )
             self.assertEqual(len(raised.exception.sample["containers"]), 3)
 
+    def test_host_collector_only_classifies_ssh_255_as_transport(self) -> None:
+        with (
+            patch.object(
+                staged.subprocess,
+                "run",
+                side_effect=staged.subprocess.CalledProcessError(255, ["ssh"]),
+            ),
+            self.assertRaises(staged._HostCapacityTransportUnavailableError),
+        ):
+            staged._fetch_host_capacity_sample(
+                ["/usr/bin/ssh"],
+                expected_collector_sha256="sha256:" + "f" * 64,
+                expected_windows_node_identity_sha256="sha256:" + "0" * 64,
+                docker_memory_reserve_bytes=4096,
+            )
+
+        with (
+            patch.object(
+                staged.subprocess,
+                "run",
+                side_effect=staged.subprocess.CalledProcessError(1, ["ssh"]),
+            ),
+            self.assertRaisesRegex(RuntimeError, "collector command failed"),
+        ):
+            staged._fetch_host_capacity_sample(
+                ["/usr/bin/ssh"],
+                expected_collector_sha256="sha256:" + "f" * 64,
+                expected_windows_node_identity_sha256="sha256:" + "0" * 64,
+                docker_memory_reserve_bytes=4096,
+            )
+
     def test_host_capacity_monitor_keeps_violating_and_drain_samples(self) -> None:
         samples = [
             _host_capacity_sample(),
@@ -684,6 +715,139 @@ vllm:gpu_cache_usage_perc 0.1
         self.assertEqual(
             evidence["summary"]["min_docker_vm_memory_available_bytes"],
             6144,
+        )
+
+    def test_host_capacity_transport_gap_recovers_inside_fifteen_seconds(
+        self,
+    ) -> None:
+        now = [0.0]
+        calls = [0]
+
+        def sample() -> dict[str, object]:
+            calls[0] += 1
+            if calls[0] == 2:
+                raise staged._HostCapacityTransportUnavailableError(
+                    "temporary SSH path loss"
+                )
+            return _host_capacity_sample(available_bytes=8192)
+
+        monitor = staged._HostCapacityMonitor(
+            sampler=sample,
+            collector_sha256="sha256:" + "f" * 64,
+            windows_node_identity_sha256="sha256:" + "0" * 64,
+            docker_memory_reserve_bytes=4096,
+            monotonic_clock=lambda: now[0],
+            sample_interval_seconds=3600,
+        )
+
+        monitor.start()
+        now[0] = 5.0
+        monitor._sample_once()
+        self.assertIsNone(monitor.failure)
+        self.assertEqual(
+            monitor.admission_stop_reason,
+            "host_capacity_observation_incomplete",
+        )
+        now[0] = 10.0
+        monitor._sample_once()
+        now[0] = 11.0
+        monitor.stop()
+        evidence = monitor.evidence()
+
+        self.assertIsNone(monitor.failure)
+        self.assertEqual(len(evidence["sampling_failures"]), 1)
+        self.assertEqual(evidence["status"], "fail")
+        self.assertEqual(
+            evidence["failure"],
+            "host_capacity_observation_incomplete",
+        )
+
+    def test_host_capacity_transport_gap_over_fifteen_seconds_is_hard(
+        self,
+    ) -> None:
+        now = [0.0]
+        calls = [0]
+
+        def sample() -> dict[str, object]:
+            calls[0] += 1
+            if calls[0] == 2:
+                raise staged._HostCapacityTransportUnavailableError(
+                    "persistent SSH path loss"
+                )
+            return _host_capacity_sample(available_bytes=8192)
+
+        monitor = staged._HostCapacityMonitor(
+            sampler=sample,
+            collector_sha256="sha256:" + "f" * 64,
+            windows_node_identity_sha256="sha256:" + "0" * 64,
+            docker_memory_reserve_bytes=4096,
+            monotonic_clock=lambda: now[0],
+            sample_interval_seconds=5,
+        )
+
+        monitor.start()
+        now[0] = 16.0
+        monitor._sample_once()
+        self.assertEqual(monitor.failure, "host_capacity_sample_gap")
+        now[0] = 17.0
+        monitor.stop()
+
+    def test_orchestrator_transport_gap_recovers_without_hard_failure(self) -> None:
+        now = [0.0]
+        samples: list[object] = [
+            staged.MinerUOrchestratorUnavailableError("temporary route loss"),
+            self._health(processing=1),
+        ]
+
+        def sample() -> staged.MinerUOrchestratorHealth:
+            item = samples.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            assert isinstance(item, staged.MinerUOrchestratorHealth)
+            return item
+
+        monitor = staged._OrchestratorMonitor(
+            sampler=sample,
+            task_slots=1,
+            client_outstanding_window=1,
+            monotonic_clock=lambda: now[0],
+        )
+
+        now[0] = 1.0
+        self.assertTrue(monitor._observe_once())
+        self.assertIsNone(monitor.failure)
+        self.assertEqual(
+            monitor.admission_stop_reason,
+            "orchestrator_observation_incomplete",
+        )
+        now[0] = 2.0
+        self.assertTrue(monitor._observe_once())
+        self.assertIsNone(monitor.failure)
+        self.assertEqual(len(monitor.samples), 1)
+        self.assertEqual(len(monitor.sampling_failures), 1)
+        self.assertEqual(
+            monitor.evidence_failure,
+            "orchestrator_observation_incomplete",
+        )
+
+    def test_orchestrator_contract_and_slot_violations_remain_hard(self) -> None:
+        invalid = staged._OrchestratorMonitor(
+            sampler=lambda: (_ for _ in ()).throw(ValueError("contract drift")),
+            task_slots=1,
+            client_outstanding_window=1,
+        )
+        self.assertFalse(invalid._observe_once())
+        self.assertIn("orchestrator_health_invalid", str(invalid.failure))
+
+        slots = staged._OrchestratorMonitor(
+            sampler=lambda: self._health(processing=2),
+            task_slots=1,
+            client_outstanding_window=2,
+        )
+        self.assertFalse(slots._observe_once())
+        self.assertEqual(
+            slots.failure,
+            "orchestrator_processing_exceeded_attested_slots",
         )
 
     def test_host_capacity_monitor_binds_epoch_and_has_pre_post_samples(self) -> None:
@@ -1557,6 +1721,387 @@ vllm:gpu_cache_usage_perc 0.5
             ["pass"] * 4,
         )
         terminate.assert_not_called()
+
+    def test_orchestrator_gap_closes_future_admission_but_natural_drains_owner(
+        self,
+    ) -> None:
+        active_started = threading.Event()
+        release_owner = threading.Event()
+        health = self._health()
+        active_health = self._health(processing=1)
+        metrics = staged.MetricsSample(0, 0, 0, 0, 0)
+
+        class GapMonitor:
+            failure = None
+            evidence_failure = "orchestrator_observation_incomplete"
+            samples = (staged.OrchestratorSample(0.1, 0, 1, 0, 0),)
+            sampling_failures = (
+                staged.OrchestratorSamplingFailure(
+                    0.2,
+                    0.01,
+                    "MinerUOrchestratorUnavailableError:route loss",
+                ),
+            )
+
+            @property
+            def admission_stop_reason(self) -> str | None:
+                if active_started.is_set():
+                    release_owner.set()
+                    return "orchestrator_observation_incomplete"
+                return None
+
+            @property
+            def observation_stop_reason(self) -> str | None:
+                return self.admission_stop_reason
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def evidence(self) -> dict[str, object]:
+                return {
+                    "profile": staged.ORCHESTRATOR_OBSERVER_PROFILE,
+                    "state": "CLOSED",
+                    "observation_complete": False,
+                    "hard_failure": None,
+                    "admission_stop_reason": (
+                        "orchestrator_observation_incomplete"
+                    ),
+                    "transitions": [
+                        {
+                            "from": "STARTING",
+                            "to": "DEGRADED_TRANSPORT",
+                            "reason": "orchestrator_transport_unavailable",
+                            "observed_seconds": 0.2,
+                        },
+                        {
+                            "from": "DEGRADED_TRANSPORT",
+                            "to": "CLOSED",
+                            "reason": "monitor_stopped",
+                            "observed_seconds": 1.0,
+                        },
+                    ],
+                }
+
+        def parse(*, copy_index: int, **_kwargs: object) -> dict[str, object]:
+            self.assertEqual(copy_index, 1)
+            active_started.set()
+            self.assertTrue(release_owner.wait(timeout=2))
+            return {
+                "copy_index": 1,
+                "logical_name": "copy-1.pdf",
+                "input_sha256": "sha256:" + "1" * 64,
+                "status": "pass",
+                "elapsed_seconds": 1.0,
+                "page_count": 7,
+                "block_count": 1,
+                "provider_bundle_sha256": "sha256:" + "a" * 64,
+            }
+
+        terminate = MagicMock(return_value=0)
+        idle_waiter = MagicMock(
+            side_effect=((health, 0.0), (health, 0.5))
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(staged, "_OrchestratorMonitor", return_value=GapMonitor()),
+            patch.object(staged, "_parse_frozen_copy", side_effect=parse),
+            patch.object(staged, "mineru_api_temp_dirs", return_value=set()),
+            patch.object(staged, "_wait_for_process_cleanup", return_value={}),
+            patch.object(staged, "terminate_active_mineru_processes", terminate),
+        ):
+            result = staged._run_stage(
+                document_count=4,
+                run_root=Path(tmp),
+                corpus=self._corpus(),
+                mineru_bin=Path("/unused/mineru"),
+                api_url="http://unused-api",
+                inference_upstream_url="http://unused-upstream/v1",
+                runtime_identity="sha256:" + "a" * 64,
+                timeout_seconds=1,
+                expected_preemptions=0,
+                metrics_sampler=lambda: metrics,
+                orchestrator_sampler=lambda: active_health,
+                orchestrator_idle_waiter=idle_waiter,
+                task_slots=1,
+            )
+
+        self.assertEqual(result["failure"], "orchestrator_observation_incomplete")
+        self.assertEqual(
+            [item["status"] for item in result["documents"]],
+            ["pass"] + [staged.NOT_ADMITTED_ATOMIC_ABORT] * 3,
+        )
+        self.assertEqual(result["orchestrator"]["terminal_active_tasks"], 0)
+        self.assertEqual(idle_waiter.call_count, 2)
+        terminate.assert_not_called()
+
+    def test_hard_monitor_failure_terminates_cli_then_proves_remote_drain(
+        self,
+    ) -> None:
+        active_started = threading.Event()
+        release_owner = threading.Event()
+        health = self._health()
+        metrics = staged.MetricsSample(0, 0, 0, 0, 0)
+
+        class HardMonitor:
+            evidence_failure = None
+            samples = (staged.OrchestratorSample(0.1, 0, 1, 0, 0),)
+            sampling_failures: tuple[object, ...] = ()
+
+            @property
+            def failure(self) -> str | None:
+                if active_started.is_set():
+                    return "orchestrator_processing_exceeded_attested_slots"
+                return None
+
+            @property
+            def observation_stop_reason(self) -> None:
+                return None
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def evidence(self) -> dict[str, object]:
+                return {
+                    "profile": staged.ORCHESTRATOR_OBSERVER_PROFILE,
+                    "state": "CLOSED",
+                    "observation_complete": False,
+                    "hard_failure": (
+                        "orchestrator_processing_exceeded_attested_slots"
+                    ),
+                    "admission_stop_reason": None,
+                    "transitions": [],
+                }
+
+        def parse(*, copy_index: int, **_kwargs: object) -> dict[str, object]:
+            self.assertEqual(copy_index, 1)
+            active_started.set()
+            self.assertTrue(release_owner.wait(timeout=2))
+            return {
+                "copy_index": 1,
+                "logical_name": "copy-1.pdf",
+                "input_sha256": "sha256:" + "1" * 64,
+                "status": "pass",
+                "elapsed_seconds": 1.0,
+                "page_count": 7,
+                "block_count": 1,
+                "provider_bundle_sha256": "sha256:" + "a" * 64,
+            }
+
+        def terminate(*_args: object, **_kwargs: object) -> int:
+            release_owner.set()
+            return 1
+
+        idle_waiter = MagicMock(side_effect=((health, 0.0), (health, 0.5)))
+        terminate_mock = MagicMock(side_effect=terminate)
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(staged, "_OrchestratorMonitor", return_value=HardMonitor()),
+            patch.object(staged, "_parse_frozen_copy", side_effect=parse),
+            patch.object(staged, "mineru_api_temp_dirs", return_value=set()),
+            patch.object(staged, "_wait_for_process_cleanup", return_value={}),
+            patch.object(
+                staged,
+                "terminate_active_mineru_processes",
+                terminate_mock,
+            ),
+        ):
+            result = staged._run_stage(
+                document_count=4,
+                run_root=Path(tmp),
+                corpus=self._corpus(),
+                mineru_bin=Path("/unused/mineru"),
+                api_url="http://unused-api",
+                inference_upstream_url="http://unused-upstream/v1",
+                runtime_identity="sha256:" + "a" * 64,
+                timeout_seconds=1,
+                expected_preemptions=0,
+                metrics_sampler=lambda: metrics,
+                orchestrator_sampler=lambda: health,
+                orchestrator_idle_waiter=idle_waiter,
+                task_slots=1,
+            )
+
+        self.assertEqual(
+            result["failure"],
+            "orchestrator_processing_exceeded_attested_slots",
+        )
+        terminate_mock.assert_called_once()
+        self.assertEqual(idle_waiter.call_count, 2)
+        self.assertEqual(result["orchestrator"]["terminal_active_tasks"], 0)
+
+    def test_observer_gap_escalating_to_hard_terminates_blocked_owner(
+        self,
+    ) -> None:
+        active_started = threading.Event()
+        observer_reported = threading.Event()
+        release_owner = threading.Event()
+        health = self._health()
+        metrics = staged.MetricsSample(0, 0, 0, 0, 0)
+
+        class EscalatingMonitor:
+            evidence_failure = None
+            samples = (staged.OrchestratorSample(0.1, 0, 1, 0, 0),)
+            sampling_failures = (
+                staged.OrchestratorSamplingFailure(
+                    0.2,
+                    0.01,
+                    "MinerUOrchestratorUnavailableError:route loss",
+                ),
+            )
+
+            @property
+            def failure(self) -> str | None:
+                if observer_reported.is_set():
+                    return "orchestrator_processing_exceeded_attested_slots"
+                return None
+
+            @property
+            def observation_stop_reason(self) -> str | None:
+                if active_started.is_set():
+                    observer_reported.set()
+                    return "orchestrator_observation_incomplete"
+                return None
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def evidence(self) -> dict[str, object]:
+                return {
+                    "profile": staged.ORCHESTRATOR_OBSERVER_PROFILE,
+                    "state": "CLOSED",
+                    "observation_complete": False,
+                    "hard_failure": (
+                        "orchestrator_processing_exceeded_attested_slots"
+                    ),
+                    "admission_stop_reason": (
+                        "orchestrator_observation_incomplete"
+                    ),
+                    "transitions": [],
+                }
+
+        def parse(*, copy_index: int, **_kwargs: object) -> dict[str, object]:
+            self.assertEqual(copy_index, 1)
+            active_started.set()
+            self.assertTrue(release_owner.wait(timeout=2))
+            return {
+                "copy_index": 1,
+                "logical_name": "copy-1.pdf",
+                "input_sha256": "sha256:" + "1" * 64,
+                "status": "pass",
+                "elapsed_seconds": 1.0,
+                "page_count": 7,
+                "block_count": 1,
+                "provider_bundle_sha256": "sha256:" + "a" * 64,
+            }
+
+        def terminate(*_args: object, **_kwargs: object) -> int:
+            self.assertTrue(observer_reported.is_set())
+            release_owner.set()
+            return 1
+
+        idle_waiter = MagicMock(side_effect=((health, 0.0), (health, 0.5)))
+        terminate_mock = MagicMock(side_effect=terminate)
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                staged,
+                "_OrchestratorMonitor",
+                return_value=EscalatingMonitor(),
+            ),
+            patch.object(staged, "_parse_frozen_copy", side_effect=parse),
+            patch.object(staged, "mineru_api_temp_dirs", return_value=set()),
+            patch.object(staged, "_wait_for_process_cleanup", return_value={}),
+            patch.object(
+                staged,
+                "terminate_active_mineru_processes",
+                terminate_mock,
+            ),
+        ):
+            result = staged._run_stage(
+                document_count=4,
+                run_root=Path(tmp),
+                corpus=self._corpus(),
+                mineru_bin=Path("/unused/mineru"),
+                api_url="http://unused-api",
+                inference_upstream_url="http://unused-upstream/v1",
+                runtime_identity="sha256:" + "a" * 64,
+                timeout_seconds=1,
+                expected_preemptions=0,
+                metrics_sampler=lambda: metrics,
+                orchestrator_sampler=lambda: health,
+                orchestrator_idle_waiter=idle_waiter,
+                task_slots=1,
+            )
+
+        self.assertEqual(
+            result["failure"],
+            "orchestrator_processing_exceeded_attested_slots",
+        )
+        terminate_mock.assert_called_once()
+        self.assertEqual(
+            [item["status"] for item in result["documents"]],
+            ["pass"] + [staged.NOT_ADMITTED_ATOMIC_ABORT] * 3,
+        )
+        self.assertEqual(result["orchestrator"]["terminal_active_tasks"], 0)
+
+    def test_stage_cannot_close_as_drained_without_terminal_idle_proof(self) -> None:
+        health = self._health()
+        active_health = self._health(processing=1)
+        metrics = staged.MetricsSample(0, 0, 0, 0, 0)
+
+        def parse(*, copy_index: int, **_kwargs: object) -> dict[str, object]:
+            return {
+                "copy_index": copy_index,
+                "logical_name": f"copy-{copy_index}.pdf",
+                "input_sha256": "sha256:" + f"{copy_index:064x}",
+                "status": "pass",
+                "elapsed_seconds": 1.0,
+                "page_count": 7,
+                "block_count": 1,
+                "provider_bundle_sha256": "sha256:" + "a" * 64,
+            }
+
+        idle_waiter = MagicMock(
+            side_effect=(
+                (health, 0.0),
+                RuntimeError("terminal drain unproved"),
+            )
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(staged, "_parse_frozen_copy", side_effect=parse),
+            patch.object(staged, "mineru_api_temp_dirs", return_value=set()),
+            patch.object(staged, "_wait_for_process_cleanup", return_value={}),
+        ):
+            result = staged._run_stage(
+                document_count=4,
+                run_root=Path(tmp),
+                corpus=self._corpus(),
+                mineru_bin=Path("/unused/mineru"),
+                api_url="http://unused-api",
+                inference_upstream_url="http://unused-upstream/v1",
+                runtime_identity="sha256:" + "a" * 64,
+                timeout_seconds=1,
+                expected_preemptions=0,
+                metrics_sampler=lambda: metrics,
+                orchestrator_sampler=lambda: active_health,
+                orchestrator_idle_waiter=idle_waiter,
+                task_slots=1,
+            )
+
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("orchestrator_terminal_drain_failed", result["failure"])
+        self.assertIsNone(result["orchestrator"]["terminal"])
+        self.assertIsNone(result["orchestrator"]["terminal_active_tasks"])
 
     def test_process_snapshot_classifiers_reject_producers_and_mineru(self) -> None:
         processes = {

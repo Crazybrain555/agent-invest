@@ -52,6 +52,7 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
 )
 from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
     MinerUOrchestratorHealth,
+    MinerUOrchestratorUnavailableError,
     fetch_mineru_orchestrator_health,
     wait_for_mineru_orchestrator_idle,
 )
@@ -69,6 +70,7 @@ RECEIPT_SCHEMA_VERSION = 6
 ADMISSION_ORDER_PROFILE = "copy-index-fifo.v1"
 NOT_ADMITTED_ATOMIC_ABORT = "not_admitted_atomic_abort"
 METRICS_OBSERVER_PROFILE = "metrics-observer.v1"
+ORCHESTRATOR_OBSERVER_PROFILE = "orchestrator-observer.v1"
 TASK_REGISTRY_SEMANTICS = "retained-terminal-gauges.v1"
 STAGE_DOCUMENT_COUNTS = (4, 8, 16)
 ORCHESTRATOR_INFERENCE_CONCURRENCY = MINERU_API_INFERENCE_MAX_CONCURRENCY
@@ -439,6 +441,10 @@ class _TrustedHostCapacityViolation(ValueError):
         self.sample = sample
 
 
+class _HostCapacityTransportUnavailableError(RuntimeError):
+    """The pinned Windows collector could not be reached for one sample."""
+
+
 def _validate_host_capacity_sample(
     payload: object,
     *,
@@ -614,23 +620,36 @@ def _fetch_host_capacity_sample(
     expected_windows_node_identity_sha256: str,
     docker_memory_reserve_bytes: int,
 ) -> dict[str, Any]:
-    completed = subprocess.run(
-        [
-            *ssh_command,
-            "powershell",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            MINERU_WINDOWS_COLLECTOR_PATH,
-            "-CapacitySample",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                *ssh_command,
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                MINERU_WINDOWS_COLLECTOR_PATH,
+                "-CapacitySample",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _HostCapacityTransportUnavailableError(
+            "pinned Windows host-capacity collector transport failed"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == 255:
+            raise _HostCapacityTransportUnavailableError(
+                "pinned Windows host-capacity collector transport failed"
+            ) from exc
+        raise RuntimeError(
+            "pinned Windows host-capacity collector command failed"
+        ) from exc
     try:
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
@@ -678,6 +697,7 @@ class _HostCapacityMonitor:
         self._sampling_failures: list[dict[str, Any]] = []
         self._epochs: dict[str, tuple[str, str]] | None = None
         self._failure: str | None = None
+        self._admission_stop_reason: str | None = None
         self._thread: threading.Thread | None = None
 
     @property
@@ -685,10 +705,27 @@ class _HostCapacityMonitor:
         with self._lock:
             return self._failure
 
+    @property
+    def admission_stop_reason(self) -> str | None:
+        with self._lock:
+            return self._failure or self._admission_stop_reason
+
+    @property
+    def observation_stop_reason(self) -> str | None:
+        with self._lock:
+            return self._admission_stop_reason
+
     def start(self) -> None:
         self._sample_once()
-        if self.failure is not None:
-            raise RuntimeError(self.failure)
+        with self._lock:
+            initial_failure = self._failure or (
+                "host_capacity_initial_sample_unavailable"
+                if not self._samples
+                else None
+            )
+        if initial_failure is not None:
+            self._record_failure(initial_failure)
+            raise RuntimeError(initial_failure)
         self._thread = threading.Thread(
             target=self._run,
             name="mineru-host-capacity-monitor",
@@ -737,6 +774,35 @@ class _HostCapacityMonitor:
                     )
                     self._failure = self._failure or failure
                     published = self._failure
+                self._abort_latch.publish_locked(published)
+        except _HostCapacityTransportUnavailableError as exc:
+            failure = (
+                "host_capacity_transport_unavailable:"
+                f"{type(exc).__name__}:{_safe_detail(str(exc))}"
+            )
+            with self._abort_latch.condition:
+                with self._lock:
+                    self._sampling_failures.append(
+                        {
+                            "observed_seconds": round(observed_seconds, 6),
+                            "failure": failure,
+                        }
+                    )
+                    self._admission_stop_reason = (
+                        self._admission_stop_reason
+                        or "host_capacity_observation_incomplete"
+                    )
+                    last_trusted_seconds = (
+                        float(self._samples[-1]["observed_seconds"])
+                        if self._samples
+                        else None
+                    )
+                    if (
+                        last_trusted_seconds is not None
+                        and observed_seconds - last_trusted_seconds > self._max_gap
+                    ):
+                        self._failure = self._failure or "host_capacity_sample_gap"
+                    published = self._failure or self._admission_stop_reason
                 self._abort_latch.publish_locked(published)
         except Exception as exc:
             failure = (
@@ -808,6 +874,7 @@ class _HostCapacityMonitor:
             violations = [dict(item) for item in self._violations]
             sampling_failures = [dict(item) for item in self._sampling_failures]
             failure = self._failure
+            admission_stop_reason = self._admission_stop_reason
         max_api_rss = 0
         min_vm_available: int | None = None
         for sample in samples:
@@ -822,8 +889,17 @@ class _HostCapacityMonitor:
                     max_api_rss = max(max_api_rss, int(container["pid1_rss_hwm_bytes"]))
         return {
             "schema": "mineru-host-capacity-evidence.v2",
-            "status": "pass" if failure is None and len(samples) >= 2 else "fail",
-            "failure": failure or (None if len(samples) >= 2 else "too_few_samples"),
+            "status": (
+                "pass"
+                if failure is None
+                and admission_stop_reason is None
+                and not sampling_failures
+                and len(samples) >= 2
+                else "fail"
+            ),
+            "failure": failure
+            or admission_stop_reason
+            or (None if len(samples) >= 2 else "too_few_samples"),
             "sample_interval_seconds": self._interval,
             "max_sample_gap_seconds": self._max_gap,
             "docker_memory_reserve_bytes": self._reserve,
@@ -895,6 +971,20 @@ class MetricsTransportUnavailableError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class OrchestratorSamplingFailure:
+    observed_seconds: float
+    duration_seconds: float
+    failure: str
+
+    def to_payload(self) -> dict[str, float | str]:
+        return {
+            "observed_seconds": round(self.observed_seconds, 6),
+            "duration_seconds": round(self.duration_seconds, 6),
+            "failure": self.failure,
+        }
+
+
+@dataclass(frozen=True)
 class OrchestratorSample:
     observed_seconds: float
     queued_tasks: int
@@ -936,12 +1026,14 @@ class _OrchestratorMonitor:
         sampler: Callable[[], MinerUOrchestratorHealth],
         task_slots: int,
         client_outstanding_window: int,
+        abort_latch: _StageAbortLatch | None = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
         sample_interval_seconds: float = ORCHESTRATOR_SAMPLE_INTERVAL_SECONDS,
     ) -> None:
         self._sampler = sampler
         self._task_slots = task_slots
         self._client_outstanding_window = client_outstanding_window
+        self._abort_latch = abort_latch or _StageAbortLatch()
         self._monotonic_clock = monotonic_clock
         self._sample_interval_seconds = sample_interval_seconds
         self._started = monotonic_clock()
@@ -953,7 +1045,11 @@ class _OrchestratorMonitor:
         )
         self._lock = threading.Lock()
         self._samples: list[OrchestratorSample] = []
+        self._sampling_failures: list[OrchestratorSamplingFailure] = []
         self._failure: str | None = None
+        self._admission_stop_reason: str | None = None
+        self._state = "STARTING"
+        self._transitions: list[dict[str, object]] = []
         self._thread_started = False
 
     def start(self) -> None:
@@ -966,8 +1062,17 @@ class _OrchestratorMonitor:
         self._stop.set()
         self._thread.join(timeout=max(16.0, self._sample_interval_seconds * 2))
         if self._thread.is_alive():
-            with self._lock:
-                self._failure = self._failure or "orchestrator_monitor_did_not_stop"
+            self._publish_hard_failure("orchestrator_monitor_did_not_stop")
+            return
+        with self._lock:
+            self._transition_locked(
+                "CLOSED",
+                reason="monitor_stopped",
+                observed_seconds=max(
+                    0.0,
+                    self._monotonic_clock() - self._started,
+                ),
+            )
 
     @property
     def failure(self) -> str | None:
@@ -979,40 +1084,154 @@ class _OrchestratorMonitor:
         with self._lock:
             return tuple(self._samples)
 
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                health = self._sampler()
-                sample = OrchestratorSample.from_health(
-                    health,
+    @property
+    def sampling_failures(self) -> tuple[OrchestratorSamplingFailure, ...]:
+        with self._lock:
+            return tuple(self._sampling_failures)
+
+    @property
+    def admission_stop_reason(self) -> str | None:
+        with self._lock:
+            return self._failure or self._admission_stop_reason
+
+    @property
+    def observation_stop_reason(self) -> str | None:
+        with self._lock:
+            return self._admission_stop_reason
+
+    @property
+    def evidence_failure(self) -> str | None:
+        with self._lock:
+            if self._failure is not None:
+                return None
+            if self._sampling_failures:
+                return "orchestrator_observation_incomplete"
+            return None
+
+    def evidence(self) -> dict[str, object]:
+        with self._lock:
+            complete = bool(
+                self._state == "CLOSED"
+                and self._failure is None
+                and not self._sampling_failures
+            )
+            return {
+                "profile": ORCHESTRATOR_OBSERVER_PROFILE,
+                "state": self._state,
+                "observation_complete": complete,
+                "hard_failure": self._failure,
+                "admission_stop_reason": self._admission_stop_reason,
+                "transitions": [dict(item) for item in self._transitions],
+            }
+
+    def _transition_locked(
+        self,
+        state: str,
+        *,
+        reason: str,
+        observed_seconds: float,
+    ) -> None:
+        if state == self._state:
+            return
+        previous = self._state
+        self._state = state
+        self._transitions.append(
+            {
+                "from": previous,
+                "to": state,
+                "reason": reason,
+                "observed_seconds": round(observed_seconds, 6),
+            }
+        )
+
+    def _publish_hard_failure(self, failure: str) -> None:
+        with self._abort_latch.condition:
+            with self._lock:
+                self._failure = self._failure or failure
+                self._transition_locked(
+                    "CLOSED",
+                    reason=self._failure,
                     observed_seconds=max(
                         0.0,
                         self._monotonic_clock() - self._started,
                     ),
                 )
-                if sample.processing_tasks > self._task_slots:
-                    failure = "orchestrator_processing_exceeded_attested_slots"
-                elif (
-                    sample.queued_tasks + sample.processing_tasks
-                    > self._client_outstanding_window
-                ):
-                    failure = "orchestrator_active_exceeded_client_window"
-                else:
-                    failure = None
-                with self._lock:
-                    self._samples.append(sample)
-                    if failure is not None:
-                        self._failure = failure
-                if failure is not None:
-                    return
-            except Exception as exc:
-                with self._lock:
-                    self._failure = (
-                        "orchestrator_health_unavailable:"
-                        f"{type(exc).__name__}:{_safe_detail(str(exc))}"
-                    )
+                published = self._failure
+            self._abort_latch.publish_locked(published)
+
+    def _record_transport_failure(
+        self,
+        exc: MinerUOrchestratorUnavailableError,
+        *,
+        sample_started: float,
+    ) -> None:
+        now = self._monotonic_clock()
+        observed = OrchestratorSamplingFailure(
+            observed_seconds=max(0.0, now - self._started),
+            duration_seconds=max(0.0, now - sample_started),
+            failure=f"{type(exc).__name__}:{_safe_detail(str(exc))}",
+        )
+        with self._abort_latch.condition:
+            with self._lock:
+                self._sampling_failures.append(observed)
+                self._admission_stop_reason = (
+                    self._admission_stop_reason
+                    or "orchestrator_observation_incomplete"
+                )
+                self._transition_locked(
+                    "DEGRADED_TRANSPORT",
+                    reason="orchestrator_transport_unavailable",
+                    observed_seconds=observed.observed_seconds,
+                )
+                published = self._admission_stop_reason
+            self._abort_latch.publish_locked(published)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if not self._observe_once():
                 return
             self._stop.wait(self._sample_interval_seconds)
+
+    def _observe_once(self) -> bool:
+        sample_started = self._monotonic_clock()
+        try:
+            health = self._sampler()
+            sample = OrchestratorSample.from_health(
+                health,
+                observed_seconds=max(
+                    0.0,
+                    self._monotonic_clock() - self._started,
+                ),
+            )
+            if sample.processing_tasks > self._task_slots:
+                failure = "orchestrator_processing_exceeded_attested_slots"
+            elif (
+                sample.queued_tasks + sample.processing_tasks
+                > self._client_outstanding_window
+            ):
+                failure = "orchestrator_active_exceeded_client_window"
+            else:
+                failure = None
+            with self._lock:
+                self._samples.append(sample)
+                self._transition_locked(
+                    "HEALTHY" if failure is None else "CLOSED",
+                    reason=(failure or "valid_orchestrator_sample"),
+                    observed_seconds=sample.observed_seconds,
+                )
+            if failure is not None:
+                self._publish_hard_failure(failure)
+                return False
+            return True
+        except MinerUOrchestratorUnavailableError as exc:
+            self._record_transport_failure(exc, sample_started=sample_started)
+            return True
+        except Exception as exc:
+            self._publish_hard_failure(
+                "orchestrator_health_invalid:"
+                f"{type(exc).__name__}:{_safe_detail(str(exc))}"
+            )
+            return False
 
 
 class _MetricsMonitor:
@@ -1351,6 +1570,7 @@ def _run_stage(
     orchestrator_idle_waiter: Callable[[], tuple[MinerUOrchestratorHealth, float]],
     task_slots: int,
     host_failure: Callable[[], str | None] = lambda: None,
+    host_observation_stop: Callable[[], str | None] = lambda: None,
     abort_latch: _StageAbortLatch | None = None,
 ) -> dict[str, Any]:
     if document_count not in STAGE_DOCUMENT_COUNTS:
@@ -1399,14 +1619,26 @@ def _run_stage(
         sampler=orchestrator_sampler,
         task_slots=task_slots,
         client_outstanding_window=client_outstanding_window,
+        abort_latch=stage_abort_latch,
     )
 
-    def current_abort_reason() -> str | None:
-        failure = stage_abort_latch.reason or (
+    def current_monitor_stop() -> tuple[str | None, bool]:
+        hard_failure = (
             metrics_monitor.failure
             or orchestrator_monitor.failure
             or host_failure()
         )
+        if hard_failure is not None:
+            return hard_failure, True
+        observation_stop = (
+            orchestrator_monitor.observation_stop_reason
+            or host_observation_stop()
+        )
+        return observation_stop, False
+
+    def current_abort_reason() -> str | None:
+        monitor_reason, _monitor_is_hard = current_monitor_stop()
+        failure = stage_abort_latch.reason or monitor_reason
         if failure is not None:
             stage_abort_latch.publish(failure)
         return stage_abort_latch.reason
@@ -1422,6 +1654,7 @@ def _run_stage(
         for index, stage_input in enumerate(stage_inputs, start=1)
     }
     failure: str | None = None
+    failure_origin: str | None = None
     orchestrator_terminal: MinerUOrchestratorHealth | None = None
     terminal_drain_seconds: float | None = None
     stage_tree: Path | None = None
@@ -1458,11 +1691,26 @@ def _run_stage(
                     for index, stage_input in enumerate(stage_inputs, start=1)
                 }
                 pending = set(futures)
+                admission_closed = False
+                local_termination_requested = False
                 while pending:
-                    monitor_failure = current_abort_reason()
+                    monitor_failure, monitor_is_hard = current_monitor_stop()
                     if monitor_failure is not None:
-                        failure = monitor_failure
-                        break
+                        stage_abort_latch.publish(monitor_failure)
+                        if monitor_is_hard:
+                            failure = monitor_failure
+                            failure_origin = "monitor_hard"
+                        elif failure is None:
+                            failure = monitor_failure
+                            failure_origin = "monitor_observer"
+                        if not admission_closed:
+                            admission.close()
+                            admission_closed = True
+                            for future in pending:
+                                future.cancel()
+                        if monitor_is_hard and not local_termination_requested:
+                            terminate_active_mineru_processes()
+                            local_termination_requested = True
                     done, pending = wait(
                         pending,
                         timeout=0.25,
@@ -1499,16 +1747,20 @@ def _run_stage(
                                 ),
                             )
                         outcomes[index] = outcome
-                        if outcome["status"] == "fail" and failure is None:
+                        if outcome["status"] == "fail" and failure_origin in {
+                            None,
+                            "monitor_observer",
+                        }:
                             failure = str(outcome["failure_class"])
-                    if failure is not None:
+                            failure_origin = "document"
+                            if not local_termination_requested:
+                                terminate_active_mineru_processes()
+                                local_termination_requested = True
+                    if failure is not None and not admission_closed:
                         admission.close()
-                        break
-                if failure is not None:
-                    admission.close()
-                    for future in pending:
-                        future.cancel()
-                    terminate_active_mineru_processes()
+                        admission_closed = True
+                        for future in pending:
+                            future.cancel()
             admission.close()
             # ThreadPoolExecutor.__exit__ waits for every running future.  Read
             # terminal states only after that boundary; sampling them inside
@@ -1608,6 +1860,7 @@ def _run_stage(
     orchestrator_failure = _orchestrator_evidence_failure(
         baseline=orchestrator_baseline,
         samples=orchestrator_monitor.samples,
+        sampling_failures=orchestrator_monitor.sampling_failures,
         terminal=orchestrator_terminal,
         task_slots=task_slots,
         client_outstanding_window=client_outstanding_window,
@@ -1615,15 +1868,16 @@ def _run_stage(
     if failure is None and orchestrator_failure is not None:
         failure = orchestrator_failure
     operational_failure = failure
+    orchestrator_evidence_failure = orchestrator_monitor.evidence_failure
     metrics_evidence_failure = metrics_monitor.evidence_failure
     if (
         metrics_evidence_failure is None
         and not _metrics_prove_staged_activity(metrics_baseline, metrics_samples)
     ):
         metrics_evidence_failure = "stage_metrics_observed_no_load_activity"
-    if operational_failure is not None:
-        terminate_active_mineru_processes()
-    elif metrics_evidence_failure is not None:
+    if operational_failure is None and orchestrator_evidence_failure is not None:
+        failure = orchestrator_evidence_failure
+    elif operational_failure is None and metrics_evidence_failure is not None:
         # Observation evidence is intentionally not a data-plane actuator.
         # The complete stage still drains normally, but this receipt cannot
         # commission or activate a profile.
@@ -1661,9 +1915,11 @@ def _run_stage(
         "orchestrator": _orchestrator_summary(
             baseline=orchestrator_baseline,
             samples=orchestrator_monitor.samples,
+            sampling_failures=orchestrator_monitor.sampling_failures,
             terminal=orchestrator_terminal,
             preflight_drain_seconds=preflight_drain_seconds,
             terminal_drain_seconds=terminal_drain_seconds,
+            observer=orchestrator_monitor.evidence(),
         ),
         "cleanup": {
             "temporary_tree_removed": cleanup_ok,
@@ -1954,10 +2210,13 @@ def _orchestrator_evidence_failure(
     *,
     baseline: MinerUOrchestratorHealth,
     samples: tuple[OrchestratorSample, ...],
+    sampling_failures: tuple[OrchestratorSamplingFailure, ...] = (),
     terminal: MinerUOrchestratorHealth | None,
     task_slots: int,
     client_outstanding_window: int,
 ) -> str | None:
+    if sampling_failures:
+        return "orchestrator_observation_incomplete"
     if baseline.active_tasks != 0:
         return "orchestrator_baseline_not_idle"
     if terminal is None:
@@ -1985,9 +2244,11 @@ def _orchestrator_summary(
     *,
     baseline: MinerUOrchestratorHealth,
     samples: tuple[OrchestratorSample, ...],
+    sampling_failures: tuple[OrchestratorSamplingFailure, ...] = (),
     terminal: MinerUOrchestratorHealth | None,
     preflight_drain_seconds: float,
     terminal_drain_seconds: float | None,
+    observer: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     observed = (
         OrchestratorSample.from_health(baseline, observed_seconds=0.0),
@@ -2006,6 +2267,8 @@ def _orchestrator_summary(
         "baseline": baseline.as_dict(),
         "samples": [sample.to_payload() for sample in samples],
         "sample_count": len(samples),
+        "sampling_failures": [item.to_payload() for item in sampling_failures],
+        "observer": observer,
         "terminal": terminal.as_dict() if terminal is not None else None,
         "terminal_active_tasks": (
             terminal.active_tasks if terminal is not None else None
@@ -2487,6 +2750,9 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                     ),
                     host_failure=lambda: host_monitor.failure,
+                    host_observation_stop=lambda: (
+                        host_monitor.observation_stop_reason
+                    ),
                     abort_latch=run_abort_latch,
                 )
             )

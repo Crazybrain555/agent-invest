@@ -1028,6 +1028,8 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "terminal_busy",
             "range",
             "sample_count",
+            "sampling_gap",
+            "observer_incomplete",
         ):
             with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as tmp:
                 settings, _, _, client = self._fixture(
@@ -1057,8 +1059,20 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                     evidence["terminal"]["processing_tasks"] = 1
                 elif tamper == "range":
                     evidence["range"]["processing_tasks"]["max"] = 2
-                else:
+                elif tamper == "sample_count":
                     evidence["sample_count"] = 2
+                elif tamper == "sampling_gap":
+                    evidence["sampling_failures"] = [
+                        {
+                            "observed_seconds": 0.3,
+                            "duration_seconds": 0.1,
+                            "failure": (
+                                "MinerUOrchestratorUnavailableError:route loss"
+                            ),
+                        }
+                    ]
+                else:
+                    evidence["observer"]["observation_complete"] = False
                 staged_path.write_text(json.dumps(staged), encoding="utf-8")
                 client_patch, code_patch = self._identity_patches(client)
                 with (
@@ -1577,6 +1591,28 @@ def staged_orchestrator_evidence(
         "baseline": api_health(completed=completed_before),
         "samples": [sample],
         "sample_count": 1,
+        "sampling_failures": [],
+        "observer": {
+            "profile": "orchestrator-observer.v1",
+            "state": "CLOSED",
+            "observation_complete": True,
+            "hard_failure": None,
+            "admission_stop_reason": None,
+            "transitions": [
+                {
+                    "from": "STARTING",
+                    "to": "HEALTHY",
+                    "reason": "valid_orchestrator_sample",
+                    "observed_seconds": 0.25,
+                },
+                {
+                    "from": "HEALTHY",
+                    "to": "CLOSED",
+                    "reason": "monitor_stopped",
+                    "observed_seconds": 0.5,
+                },
+            ],
+        },
         "terminal": api_health(completed=completed_before + concurrency),
         "terminal_active_tasks": 0,
         "preflight_drain_seconds": 0.0,

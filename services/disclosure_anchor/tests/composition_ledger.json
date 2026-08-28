@@ -276,7 +276,7 @@
   },
   "tests/unit/test_mineru_capacity_commissioning.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 12
   },
   "tests/unit/test_mineru_deployment_gate.py": {
    "private_imports": [],
@@ -296,7 +296,7 @@
   },
   "tests/unit/test_mineru_orchestrator.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 7
   },
   "tests/unit/test_mineru_process.py": {
    "private_imports": [],
@@ -312,7 +312,7 @@
   },
   "tests/unit/test_mineru_staged_load.py": {
    "private_imports": [],
-   "tests": 50
+   "tests": 59
   },
   "tests/unit/test_normalized_ir_v4_evidence.py": {
    "private_imports": [],

@@ -117,6 +117,72 @@ class MinerUOrchestratorTests(unittest.TestCase):
         self.assertEqual(health.active_tasks, 0)
         self.assertEqual(opener.open.call_count, 3)
 
+    def test_wait_for_idle_retries_transport_until_processing_then_idle(self) -> None:
+        processing = Mock(active_tasks=1)
+        idle = Mock(active_tasks=0)
+        fetch = Mock(
+            side_effect=(
+                MinerUOrchestratorUnavailableError("temporary route loss"),
+                processing,
+                idle,
+            )
+        )
+        with (
+            patch(
+                "disclosure_anchor.adapters.runtime.mineru_orchestrator.fetch_mineru_orchestrator_health",
+                fetch,
+            ),
+            patch(
+                "disclosure_anchor.adapters.runtime.mineru_orchestrator.time.sleep"
+            ),
+        ):
+            health, _duration = wait_for_mineru_orchestrator_idle(
+                "http://127.0.0.1:30002",
+                timeout_seconds=10,
+                poll_seconds=0.01,
+            )
+
+        self.assertIs(health, idle)
+        self.assertEqual(fetch.call_count, 3)
+
+    def test_wait_for_idle_permanent_transport_loss_exhausts_one_deadline(
+        self,
+    ) -> None:
+        fetch = Mock(
+            side_effect=MinerUOrchestratorUnavailableError("route unavailable")
+        )
+        with (
+            patch(
+                "disclosure_anchor.adapters.runtime.mineru_orchestrator.fetch_mineru_orchestrator_health",
+                fetch,
+            ),
+            self.assertRaisesRegex(
+                MinerUOrchestratorError,
+                "transport-unproved|queued/processing drain",
+            ),
+        ):
+            wait_for_mineru_orchestrator_idle(
+                "http://127.0.0.1:30002",
+                timeout_seconds=0.01,
+                poll_seconds=0.001,
+            )
+        self.assertGreater(fetch.call_count, 1)
+
+    def test_wait_for_idle_does_not_retry_strict_contract_failure(self) -> None:
+        fetch = Mock(side_effect=MinerUOrchestratorError("protocol drifted"))
+        with (
+            patch(
+                "disclosure_anchor.adapters.runtime.mineru_orchestrator.fetch_mineru_orchestrator_health",
+                fetch,
+            ),
+            self.assertRaisesRegex(MinerUOrchestratorError, "protocol drifted"),
+        ):
+            wait_for_mineru_orchestrator_idle(
+                "http://127.0.0.1:30002",
+                timeout_seconds=10,
+            )
+        fetch.assert_called_once()
+
     def test_health_probe_classifies_http_statuses(self) -> None:
         opener = Mock()
         with patch(

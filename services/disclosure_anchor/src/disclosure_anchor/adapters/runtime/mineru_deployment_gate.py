@@ -1320,6 +1320,8 @@ def verify_staged_load_orchestrator_evidence(
         "baseline",
         "samples",
         "sample_count",
+        "sampling_failures",
+        "observer",
         "terminal",
         "terminal_active_tasks",
         "preflight_drain_seconds",
@@ -1334,6 +1336,70 @@ def verify_staged_load_orchestrator_evidence(
     samples = value.get("samples")
     if not isinstance(samples, list) or not samples:
         raise MinerUDeploymentGateError("MinerU staged-load API samples are incomplete")
+    if value.get("sampling_failures") != []:
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load API observation has transport gaps"
+        )
+    observer = value.get("observer")
+    if not isinstance(observer, dict) or set(observer) != {
+        "profile",
+        "state",
+        "observation_complete",
+        "hard_failure",
+        "admission_stop_reason",
+        "transitions",
+    }:
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load API observer evidence is invalid"
+        )
+    transitions = observer.get("transitions")
+    if (
+        observer.get("profile") != "orchestrator-observer.v1"
+        or observer.get("state") != "CLOSED"
+        or observer.get("observation_complete") is not True
+        or observer.get("hard_failure") is not None
+        or observer.get("admission_stop_reason") is not None
+        or not isinstance(transitions, list)
+        or not transitions
+    ):
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load API observer did not close cleanly"
+        )
+    expected_from = "STARTING"
+    previous_transition_seconds = -1.0
+    saw_healthy = False
+    for transition in transitions:
+        if not isinstance(transition, dict) or set(transition) != {
+            "from",
+            "to",
+            "reason",
+            "observed_seconds",
+        }:
+            raise MinerUDeploymentGateError(
+                "MinerU staged-load API observer transition drifted"
+            )
+        transition_seconds = _nonnegative_finite_value(
+            transition.get("observed_seconds")
+        )
+        if (
+            transition.get("from") != expected_from
+            or transition.get("to") not in {"HEALTHY", "CLOSED"}
+            or not isinstance(transition.get("reason"), str)
+            or not transition.get("reason")
+            or transition_seconds is None
+            or transition_seconds < previous_transition_seconds
+            or transition_seconds > stage_elapsed_seconds
+        ):
+            raise MinerUDeploymentGateError(
+                "MinerU staged-load API observer transition is invalid"
+            )
+        expected_from = str(transition["to"])
+        saw_healthy = saw_healthy or expected_from == "HEALTHY"
+        previous_transition_seconds = transition_seconds
+    if expected_from != "CLOSED" or not saw_healthy:
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load API observer terminal state is missing"
+        )
     normalized_samples: list[dict[str, int | float]] = []
     previous_observed_seconds = -1.0
     for sample in samples:

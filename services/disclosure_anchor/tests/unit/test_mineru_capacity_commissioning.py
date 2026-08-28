@@ -112,6 +112,28 @@ def _orchestrator(*, count: int, completed_before: int) -> dict[str, object]:
         "baseline": _api_health(completed=completed_before),
         "samples": [sample],
         "sample_count": 1,
+        "sampling_failures": [],
+        "observer": {
+            "profile": "orchestrator-observer.v1",
+            "state": "CLOSED",
+            "observation_complete": True,
+            "hard_failure": None,
+            "admission_stop_reason": None,
+            "transitions": [
+                {
+                    "from": "STARTING",
+                    "to": "HEALTHY",
+                    "reason": "valid_orchestrator_sample",
+                    "observed_seconds": 0.25,
+                },
+                {
+                    "from": "HEALTHY",
+                    "to": "CLOSED",
+                    "reason": "monitor_stopped",
+                    "observed_seconds": 0.5,
+                },
+            ],
+        },
         "terminal": _api_health(completed=completed_before + count),
         "terminal_active_tasks": 0,
         "preflight_drain_seconds": 0.0,
@@ -663,6 +685,36 @@ class MineruCapacityCommissioningTests(unittest.TestCase):
                             minimum_improvement_basis_points=500,
                             maximum_repeat_spread_basis_points=300,
                         )
+
+    def test_orchestrator_sampling_gap_cannot_enter_commissioning(self) -> None:
+        arms = self._arms()
+        arms[0][0]["stages"][0]["orchestrator"]["sampling_failures"] = [
+            {
+                "observed_seconds": 0.3,
+                "duration_seconds": 0.1,
+                "failure": "MinerUOrchestratorUnavailableError:route loss",
+            }
+        ]
+        with patch(
+            "disclosure_anchor.adapters.runtime.mineru_capacity_commissioning."
+            "summarize_phase_trace_capture",
+            side_effect=self._summary,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "orchestrator evidence is not proved",
+            ):
+                evaluate_capacity_commissioning(
+                    arms,
+                    expected_legacy_profile_sha256=_LEGACY_SHA,
+                    expected_candidate_profile_sha256=_CANDIDATE_SHA,
+                    expected_collector_sha256=_COLLECTOR_SHA,
+                    expected_collector_path=MINERU_WINDOWS_COLLECTOR_PATH,
+                    expected_docker_memory_reserve_bytes=_MEMORY_RESERVE_BYTES,
+                    expected_windows_node_identity_sha256=_NODE_SHA,
+                    minimum_improvement_basis_points=500,
+                    maximum_repeat_spread_basis_points=300,
+                )
 
     def test_retained_terminal_gauges_may_expire_during_an_arm(self) -> None:
         arms = self._arms()

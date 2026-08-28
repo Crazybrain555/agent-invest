@@ -247,11 +247,18 @@ sample gap。transport-only gap 只把 observer 切到 `DEGRADED_TRANSPORT`，�
 不能进入 commissioning；它与 OOM/restart/reserve/preemption 等 operational failure 的区别仅是不得因此
 杀死健康解析进程或丢弃已完成输出，不是降低 promotion 门槛。
 同时连续采样 API `/health`：processing 不得超过 attested task slots；window=1 时不要求人为制造 process-local queue。
+一次可分类为 `MinerUOrchestratorUnavailableError` 的 transport gap 只记录
+`DEGRADED_TRANSPORT`、关闭后续 admission 并继续当前 owner 的自然 drain；恢复后的样本必须原样保留，
+但该阶段仍是 evidence-incomplete。health JSON/identity/slot/window 的严格合同错误仍是 operational failure。
 `completed_tasks`/`failed_tasks` 是保留期内 terminal registry 的人口 gauge，可随 600 秒 retention/30 秒
 cleanup 合法下降；v6 receipt 原样保留 baseline/samples/terminal 与 min/max，但禁止把它们解释为累计任务账。
+修复前缺少 orchestrator observer/sampling-failure 固定字段的旧 v6 receipt 只可用于 RCA；exact-current
+deployment/commissioning verifier 会拒绝其 shape，不能用于 catalog、Auto 或 worker admission。
 每份输入是否成功改由 exact input SHA、official writer 零退出、完整源/输出页数相等和 provider bundle hash
-逐文档证明；每阶段仍必须自然 drain 到 queued=processing=0。API 没有 cancel endpoint；本地中止后只能关闭新 admission、终止本地 CLI 并等待
-远端自然 drain。无法证明 drain 就 FAIL，不能重启服务、进入下一阶段或把 receipt 用于 admission。
+逐文档证明；每阶段仍必须自然 drain 到 queued=processing=0。API 没有 cancel endpoint；observer-only
+failure 只能关闭新 admission，不能终止当前本地 CLI 来冒充远端 cancel。文档自身失败或 operator 本地中止
+可以终止本地 CLI，但两种路径都必须在同一 deadline 内容忍短暂 health transport failure，并等待远端自然
+drain。无法证明 drain 就 FAIL，不能重启服务、进入下一阶段或把 receipt 用于 admission。
 metrics 持续不可用、waiting≥64 连续 30 秒、preemption counter 任意变化，以及任一解析失败、429/5xx、
 overload、OOM 或 EngineCore failure 都立即 FAIL，清理本地子进程/临时目录且不进入下一阶段。
 每阶段 receipt 除 min/max 外还保留 running/waiting/KV 的 p95；当前只作容量诊断，不在没有现场

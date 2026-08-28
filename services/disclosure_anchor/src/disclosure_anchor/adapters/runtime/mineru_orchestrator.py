@@ -220,13 +220,27 @@ def wait_for_mineru_orchestrator_idle(
     started = time.monotonic()
     deadline = started + timeout_seconds
     while True:
-        health = fetch_mineru_orchestrator_health(
-            api_url,
-            timeout_seconds=min(15.0, max(0.1, deadline - time.monotonic())),
-            expected_task_slots=expected_task_slots,
-            expected_task_retention_seconds=expected_task_retention_seconds,
-            expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
-        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise MinerUOrchestratorError(
+                "MinerU API did not prove queued/processing drain before deadline"
+            )
+        try:
+            health = fetch_mineru_orchestrator_health(
+                api_url,
+                timeout_seconds=min(15.0, max(0.1, remaining)),
+                expected_task_slots=expected_task_slots,
+                expected_task_retention_seconds=expected_task_retention_seconds,
+                expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
+            )
+        except MinerUOrchestratorUnavailableError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MinerUOrchestratorError(
+                    "MinerU API drain remained transport-unproved before deadline"
+                ) from exc
+            time.sleep(min(poll_seconds, remaining))
+            continue
         if health.active_tasks == 0:
             return health, time.monotonic() - started
         remaining = deadline - time.monotonic()
