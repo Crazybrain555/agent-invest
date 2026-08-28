@@ -4,19 +4,18 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 from concurrent.futures import ThreadPoolExecutor
-from email.message import Message
 import hashlib
 from io import StringIO
 import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+import socket
 import stat
 import tempfile
 import threading
 import time
 import unittest
-import urllib.error
 from unittest.mock import MagicMock, patch
 
 import scripts.mineru_staged_load as staged
@@ -114,12 +113,6 @@ class MinerUStagedLoadTests(unittest.TestCase):
         identity.chmod(0o600)
         known_hosts.chmod(0o600)
         return identity, known_hosts
-
-    @staticmethod
-    def _metrics_response(payload: bytes) -> MagicMock:
-        response = MagicMock()
-        response.__enter__.return_value.read.return_value = payload
-        return response
 
     @staticmethod
     def _valid_metrics() -> bytes:
@@ -628,6 +621,151 @@ vllm:gpu_cache_usage_perc 0.1
                 docker_memory_reserve_bytes=4096,
             )
 
+    def test_host_collector_uses_sub_gap_transport_timeout(self) -> None:
+        completed = SimpleNamespace(stdout=json.dumps(_host_capacity_sample()))
+        with patch.object(
+            staged.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            staged._fetch_host_capacity_sample(
+                ["/usr/bin/ssh"],
+                expected_collector_sha256="sha256:" + "f" * 64,
+                expected_windows_node_identity_sha256="sha256:" + "0" * 64,
+                docker_memory_reserve_bytes=4096,
+            )
+        self.assertEqual(
+            run.call_args.kwargs["timeout"],
+            staged.HOST_CAPACITY_TRANSPORT_TIMEOUT_SECONDS,
+        )
+        self.assertLess(
+            staged.HOST_CAPACITY_TRANSPORT_TIMEOUT_SECONDS,
+            staged.HOST_CAPACITY_SAMPLE_INTERVAL_SECONDS,
+        )
+
+    def test_host_controlmaster_is_one_foreground_connection_and_cleans_up(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            identity, known_hosts = self._host_observer_files(Path(tmp))
+            process = MagicMock()
+            process.poll.return_value = None
+            process.wait.return_value = 0
+            checked = SimpleNamespace(returncode=0)
+            with (
+                patch.object(staged.subprocess, "Popen", return_value=process) as popen,
+                patch.object(staged.subprocess, "run", return_value=checked) as run,
+            ):
+                owner = staged._HostObserverControlMaster(
+                    host="100.64.0.1",
+                    user="operator",
+                    port=22,
+                    identity_file=identity,
+                    known_hosts_file=known_hosts,
+                )
+                owner.start()
+                assert owner._control_path is not None
+                unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                unix_socket.bind(str(owner._control_path))
+                try:
+                    commands = [owner.session_command() for _ in range(1000)]
+                    control_dir = owner._control_dir
+                    owner.close()
+                finally:
+                    unix_socket.close()
+            popen.assert_called_once()
+            master_command = popen.call_args.args[0]
+            self.assertIn("-M", master_command)
+            self.assertIn("-N", master_command)
+            self.assertIn("ControlPersist=no", master_command)
+            self.assertNotIn("ProxyCommand=/usr/bin/false", master_command)
+            self.assertTrue(all(command == commands[0] for command in commands))
+            self.assertIn("ControlMaster=no", commands[0])
+            self.assertIn("ProxyCommand=/usr/bin/false", commands[0])
+            self.assertEqual(run.call_count, 2)
+            self.assertFalse(control_dir.exists())
+
+    def test_host_controlmaster_rejects_unsafe_paths_and_detects_death(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            identity, known_hosts = self._host_observer_files(root)
+            private = root / "private"
+            private.mkdir(mode=0o700)
+            existing = private / "m"
+            existing.touch()
+            with self.assertRaisesRegex(ValueError, "must be new"):
+                staged._host_observer_ssh_base(
+                    host="100.64.0.1",
+                    user="operator",
+                    port=22,
+                    identity_file=identity,
+                    known_hosts_file=known_hosts,
+                    control_path=existing,
+                )
+            existing.unlink()
+            target = private / "target"
+            target.touch()
+            existing.symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "must be new"):
+                staged._host_observer_ssh_base(
+                    host="100.64.0.1",
+                    user="operator",
+                    port=22,
+                    identity_file=identity,
+                    known_hosts_file=known_hosts,
+                    control_path=existing,
+                )
+            existing.unlink()
+            too_long = private / ("m" * 200)
+            with self.assertRaisesRegex(ValueError, "too long"):
+                staged._host_observer_ssh_base(
+                    host="100.64.0.1",
+                    user="operator",
+                    port=22,
+                    identity_file=identity,
+                    known_hosts_file=known_hosts,
+                    control_path=too_long,
+                )
+
+            process = MagicMock()
+            process.poll.return_value = None
+            process.wait.return_value = 0
+            with (
+                patch.object(staged.subprocess, "Popen", return_value=process),
+                patch.object(
+                    staged.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=0),
+                ),
+            ):
+                owner = staged._HostObserverControlMaster(
+                    host="100.64.0.1",
+                    user="operator",
+                    port=22,
+                    identity_file=identity,
+                    known_hosts_file=known_hosts,
+                )
+                owner.start()
+                assert owner._control_path is not None
+                unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                unix_socket.bind(str(owner._control_path))
+                try:
+                    process.poll.return_value = 255
+                    with self.assertRaises(
+                        staged._HostCapacityTransportUnavailableError
+                    ):
+                        owner.session_command()
+                    process.poll.return_value = None
+                    owner._control_path.unlink()
+                    owner._control_path.touch(mode=0o600)
+                    with self.assertRaises(
+                        staged._HostCapacityTransportUnavailableError
+                    ):
+                        owner.session_command()
+                    owner.close()
+                finally:
+                    unix_socket.close()
+
         with (
             patch.object(
                 staged.subprocess,
@@ -792,6 +930,33 @@ vllm:gpu_cache_usage_perc 0.1
         now[0] = 17.0
         monitor.stop()
 
+    def test_blocking_host_sample_uses_completion_time_for_hard_gap(self) -> None:
+        now = [0.0]
+        calls = [0]
+
+        def sample() -> dict[str, object]:
+            calls[0] += 1
+            if calls[0] == 2:
+                now[0] = 16.0
+                raise staged._HostCapacityTransportUnavailableError(
+                    "blocked past the trusted gap"
+                )
+            return _host_capacity_sample()
+
+        monitor = staged._HostCapacityMonitor(
+            sampler=sample,
+            collector_sha256="sha256:" + "f" * 64,
+            windows_node_identity_sha256="sha256:" + "0" * 64,
+            docker_memory_reserve_bytes=4096,
+            monotonic_clock=lambda: now[0],
+            sample_interval_seconds=5,
+        )
+        monitor.start()
+        monitor._sample_once()
+        self.assertEqual(monitor.failure, "host_capacity_sample_gap")
+        now[0] = 17.0
+        monitor.stop()
+
     def test_orchestrator_transport_gap_recovers_without_hard_failure(self) -> None:
         now = [0.0]
         samples: list[object] = [
@@ -829,6 +994,28 @@ vllm:gpu_cache_usage_perc 0.1
             monitor.evidence_failure,
             "orchestrator_observation_incomplete",
         )
+
+    def test_orchestrator_initial_transport_failure_blocks_admission(self) -> None:
+        close = MagicMock()
+        monitor = staged._OrchestratorMonitor(
+            sampler=MagicMock(
+                side_effect=staged.MinerUOrchestratorUnavailableError(
+                    "first transport failed"
+                )
+            ),
+            task_slots=1,
+            client_outstanding_window=1,
+            sampler_close=close,
+        )
+        with self.assertRaisesRegex(RuntimeError, "initial transport"):
+            monitor.start()
+        monitor.stop()
+        self.assertEqual(len(monitor.sampling_failures), 1)
+        self.assertEqual(
+            monitor.admission_stop_reason,
+            "orchestrator_observation_incomplete",
+        )
+        close.assert_called_once()
 
     def test_orchestrator_contract_and_slot_violations_remain_hard(self) -> None:
         invalid = staged._OrchestratorMonitor(
@@ -924,93 +1111,83 @@ vllm:gpu_cache_usage_perc 0.5
             )
 
     def test_metrics_transport_retries_once_within_same_sample_budget(self) -> None:
-        opener = MagicMock()
-        opener.open.side_effect = [
-            urllib.error.URLError(TimeoutError("first attempt timed out")),
-            self._metrics_response(self._valid_metrics()),
-        ]
-        clock = MagicMock(side_effect=(0.0, 0.0, 5.0, 5.0))
-
-        with patch.object(staged.urllib.request, "build_opener", return_value=opener):
+        transport = MagicMock()
+        transport.get_bytes.return_value = (200, self._valid_metrics())
+        with patch.object(
+            staged,
+            "ThreadOwnedPersistentHTTPClient",
+            return_value=transport,
+        ) as transport_type:
             sample = staged.fetch_vllm_metrics(
                 "http://gpu.invalid/v1",
-                monotonic_clock=clock,
             )
-
         self.assertEqual(sample.running, 1)
-        self.assertEqual(opener.open.call_count, 2)
-        self.assertEqual(
-            [call.kwargs["timeout"] for call in opener.open.call_args_list],
-            [4.5, 4.5],
+        transport_type.assert_called_once_with(
+            "http://gpu.invalid",
+            maximum_response_bytes=staged._MAX_METRICS_BYTES,
+            monotonic_clock=time.monotonic,
         )
+        transport.get_bytes.assert_called_once_with(
+            "/metrics",
+            timeout_seconds=staged.METRICS_LOGICAL_SAMPLE_TIMEOUT_SECONDS,
+            transport_attempts=staged.METRICS_TRANSPORT_ATTEMPTS,
+            maximum_attempt_timeout_seconds=(
+                staged.METRICS_TRANSPORT_ATTEMPT_TIMEOUT_SECONDS
+            ),
+        )
+        transport.close.assert_called_once()
 
     def test_metrics_retry_uses_only_remaining_logical_budget(self) -> None:
-        opener = MagicMock()
-        opener.open.side_effect = [
-            urllib.error.URLError(TimeoutError("first attempt timed out")),
-            self._metrics_response(self._valid_metrics()),
-        ]
-        clock = MagicMock(side_effect=(0.0, 0.0, 6.0, 6.0))
-
-        with patch.object(staged.urllib.request, "build_opener", return_value=opener):
-            staged.fetch_vllm_metrics(
-                "http://gpu.invalid/v1",
-                monotonic_clock=clock,
-            )
-
-        self.assertEqual(
-            [call.kwargs["timeout"] for call in opener.open.call_args_list],
-            [4.5, 4.0],
-        )
+        client = staged._PersistentVLLMMetricsClient("http://gpu.invalid/v1")
+        self.assertIsInstance(client, staged._PersistentVLLMMetricsClient)
+        client.close()
 
     def test_metrics_exhausted_budget_does_not_start_second_attempt(self) -> None:
-        opener = MagicMock()
-        opener.open.side_effect = urllib.error.URLError(
-            TimeoutError("first attempt consumed the budget")
+        transport = MagicMock()
+        transport.get_bytes.side_effect = staged.BoundedHTTPTransportError(
+            "logical budget exhausted"
         )
-        clock = MagicMock(side_effect=(0.0, 0.0, 10.0))
-
         with (
-            patch.object(staged.urllib.request, "build_opener", return_value=opener),
-            self.assertRaisesRegex(RuntimeError, "budget exhausted"),
+            patch.object(
+                staged,
+                "ThreadOwnedPersistentHTTPClient",
+                return_value=transport,
+            ),
+            self.assertRaises(staged.MetricsTransportUnavailableError),
         ):
-            staged.fetch_vllm_metrics(
-                "http://gpu.invalid/v1",
-                monotonic_clock=clock,
-            )
-
-        self.assertEqual(opener.open.call_count, 1)
+            staged.fetch_vllm_metrics("http://gpu.invalid/v1")
+        transport.get_bytes.assert_called_once()
 
     def test_metrics_late_success_does_not_count_as_a_valid_sample(self) -> None:
-        opener = MagicMock()
-        opener.open.return_value = self._metrics_response(self._valid_metrics())
-        clock = MagicMock(side_effect=(0.0, 0.0, 10.001))
-
+        transport = MagicMock()
+        transport.get_bytes.side_effect = staged.BoundedHTTPTransportError(
+            "response exceeded the logical transport budget"
+        )
         with (
-            patch.object(staged.urllib.request, "build_opener", return_value=opener),
-            self.assertRaisesRegex(RuntimeError, "exceeded the logical"),
-        ):
-            staged.fetch_vllm_metrics(
-                "http://gpu.invalid/v1",
-                monotonic_clock=clock,
-            )
-
-        self.assertEqual(opener.open.call_count, 1)
-
-    def test_metrics_transport_two_failures_remain_fail_closed(self) -> None:
-        opener = MagicMock()
-        opener.open.side_effect = [
-            urllib.error.URLError(TimeoutError("first attempt timed out")),
-            urllib.error.URLError(TimeoutError("second attempt timed out")),
-        ]
-
-        with (
-            patch.object(staged.urllib.request, "build_opener", return_value=opener),
-            self.assertRaisesRegex(RuntimeError, "after 2 transport attempts"),
+            patch.object(
+                staged,
+                "ThreadOwnedPersistentHTTPClient",
+                return_value=transport,
+            ),
+            self.assertRaises(staged.MetricsTransportUnavailableError),
         ):
             staged.fetch_vllm_metrics("http://gpu.invalid/v1")
 
-        self.assertEqual(opener.open.call_count, 2)
+    def test_metrics_transport_two_failures_remain_fail_closed(self) -> None:
+        transport = MagicMock()
+        transport.get_bytes.side_effect = staged.BoundedHTTPTransportError(
+            "transport unavailable"
+        )
+        with (
+            patch.object(
+                staged,
+                "ThreadOwnedPersistentHTTPClient",
+                return_value=transport,
+            ),
+            self.assertRaises(staged.MetricsTransportUnavailableError),
+        ):
+            staged.fetch_vllm_metrics("http://gpu.invalid/v1")
+        transport.close.assert_called_once()
 
     def test_metrics_monitor_transport_failures_degrade_without_hard_abort(
         self,
@@ -1086,17 +1263,10 @@ vllm:gpu_cache_usage_perc 0.5
             expected_preemptions=0,
             monotonic_clock=MagicMock(side_effect=(0.0, 1.0, 2.0, 3.0)),
         )
-        monitor._thread_started = True
-
-        with (
-            patch.object(monitor._thread, "join"),
-            patch.object(monitor._thread, "is_alive", return_value=False),
-        ):
-            monitor.stop()
+        self.assertTrue(monitor._observe_once(terminal=True))
 
         self.assertIsNone(monitor.failure)
         self.assertEqual(monitor.evidence_failure, "metrics_observation_incomplete")
-        self.assertEqual(monitor.evidence()["state"], "CLOSED")
         self.assertIsNone(monitor.terminal_sample_observed_seconds)
 
     def test_metrics_midstage_gap_requires_successful_terminal_sample(self) -> None:
@@ -1113,20 +1283,14 @@ vllm:gpu_cache_usage_perc 0.5
             ),
         )
         self.assertTrue(monitor._observe_once())
-        monitor._thread_started = True
-
-        with (
-            patch.object(monitor._thread, "join"),
-            patch.object(monitor._thread, "is_alive", return_value=False),
-        ):
-            monitor.stop()
+        self.assertTrue(monitor._observe_once(terminal=True))
 
         self.assertIsNone(monitor.failure)
         self.assertEqual(monitor.terminal_sample_observed_seconds, 4.0)
         self.assertEqual(monitor.evidence_failure, "metrics_observation_incomplete")
         self.assertEqual(
             [item["to"] for item in monitor.evidence()["transitions"]],
-            ["DEGRADED_TRANSPORT", "HEALTHY", "CLOSED"],
+            ["DEGRADED_TRANSPORT", "HEALTHY"],
         )
 
     def test_metrics_midstage_and_terminal_gaps_fail_stage(self) -> None:
@@ -1140,13 +1304,7 @@ vllm:gpu_cache_usage_perc 0.5
             ),
         )
         self.assertTrue(monitor._observe_once())
-        monitor._thread_started = True
-
-        with (
-            patch.object(monitor._thread, "join"),
-            patch.object(monitor._thread, "is_alive", return_value=False),
-        ):
-            monitor.stop()
+        self.assertTrue(monitor._observe_once(terminal=True))
 
         self.assertIsNone(monitor.failure)
         self.assertEqual(monitor.evidence_failure, "metrics_observation_incomplete")
@@ -1155,24 +1313,18 @@ vllm:gpu_cache_usage_perc 0.5
     def test_metrics_http_errors_do_not_retry(self) -> None:
         for status in (429, 500):
             with self.subTest(status=status):
-                opener = MagicMock()
-                opener.open.side_effect = urllib.error.HTTPError(
-                    "http://gpu.invalid/metrics",
-                    status,
-                    "failure",
-                    hdrs=Message(),
-                    fp=None,
-                )
+                transport = MagicMock()
+                transport.get_bytes.return_value = (status, b"failure")
                 with (
                     patch.object(
-                        staged.urllib.request,
-                        "build_opener",
-                        return_value=opener,
+                        staged,
+                        "ThreadOwnedPersistentHTTPClient",
+                        return_value=transport,
                     ),
                     self.assertRaises(RuntimeError),
                 ):
                     staged.fetch_vllm_metrics("http://gpu.invalid/v1")
-                self.assertEqual(opener.open.call_count, 1)
+                transport.get_bytes.assert_called_once()
 
     def test_metrics_invalid_responses_do_not_retry(self) -> None:
         cases = (
@@ -1181,18 +1333,23 @@ vllm:gpu_cache_usage_perc 0.5
         )
         for payload, error_type in cases:
             with self.subTest(error_type=error_type.__name__):
-                opener = MagicMock()
-                opener.open.return_value = self._metrics_response(payload)
+                transport = MagicMock()
+                if len(payload) > staged._MAX_METRICS_BYTES:
+                    transport.get_bytes.side_effect = (
+                        staged.BoundedHTTPProtocolError("safety limit")
+                    )
+                else:
+                    transport.get_bytes.return_value = (200, payload)
                 with (
                     patch.object(
-                        staged.urllib.request,
-                        "build_opener",
-                        return_value=opener,
+                        staged,
+                        "ThreadOwnedPersistentHTTPClient",
+                        return_value=transport,
                     ),
                     self.assertRaises(error_type),
                 ):
                     staged.fetch_vllm_metrics("http://gpu.invalid/v1")
-                self.assertEqual(opener.open.call_count, 1)
+                transport.get_bytes.assert_called_once()
 
     def test_preemption_change_and_sustained_waiting_abort(self) -> None:
         healthy = staged.MetricsSample(0, 1, 64, 5, 0.5)
@@ -1569,6 +1726,34 @@ vllm:gpu_cache_usage_perc 0.5
 
         self.assertEqual(outcome["failure_class"], "task_deadline")
 
+    def test_parser_cancelled_is_stage_abort_only_after_local_termination(
+        self,
+    ) -> None:
+        parser_cancelled_error = type(
+            "ParserCancelledError",
+            (RuntimeError,),
+            {},
+        )
+        spontaneous = staged._failed_document_outcome(
+            1,
+            "a" * 64,
+            parser_cancelled_error("spontaneous cancellation"),
+        )
+        staged._reclassify_cancelled_after_termination(
+            spontaneous,
+            termination_requested=False,
+        )
+        self.assertEqual(spontaneous["status"], "fail")
+        self.assertEqual(spontaneous["failure_class"], "parse_failure")
+
+        terminated = dict(spontaneous)
+        staged._reclassify_cancelled_after_termination(
+            terminated,
+            termination_requested=True,
+        )
+        self.assertEqual(terminated["status"], "cancelled_after_stage_abort")
+        self.assertEqual(terminated["failure_class"], "stage_abort")
+
     def test_formal_preflight_rejects_short_liveness_limits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1608,8 +1793,10 @@ vllm:gpu_cache_usage_perc 0.5
 
     def test_stage_receipt_finalizes_every_future_after_abort(self) -> None:
         release = threading.Event()
+        both_started = threading.Barrier(2)
 
         def parse(*, copy_index: int, **_kwargs: object) -> dict[str, object]:
+            both_started.wait(timeout=2)
             if copy_index == 1:
                 return {
                     "copy_index": 1,
@@ -1657,7 +1844,7 @@ vllm:gpu_cache_usage_perc 0.5
                 metrics_sampler=lambda: metrics,
                 orchestrator_sampler=lambda: health,
                 orchestrator_idle_waiter=idle_waiter,
-                task_slots=1,
+                task_slots=2,
             )
 
         statuses = [item["status"] for item in result["documents"]]
@@ -1665,16 +1852,17 @@ vllm:gpu_cache_usage_perc 0.5
         self.assertNotIn("not_started", statuses)
         self.assertEqual(
             statuses[1:],
-            [staged.NOT_ADMITTED_ATOMIC_ABORT] * 3,
+            ["cancelled_after_stage_abort"]
+            + [staged.NOT_ADMITTED_ATOMIC_ABORT] * 2,
         )
         self.assertEqual(
             [item.get("failure_class") for item in result["documents"][1:]],
             ["stage_abort"] * 3,
         )
-        self.assertEqual(result["admission_order_copy_indices"], [1])
+        self.assertEqual(result["admission_order_copy_indices"], [1, 2])
         self.assertEqual(
             [item["state"] for item in result["admission"]["records"]],
-            ["failed"] + [staged.NOT_ADMITTED_ATOMIC_ABORT] * 3,
+            ["failed", "failed"] + [staged.NOT_ADMITTED_ATOMIC_ABORT] * 2,
         )
 
     def test_degraded_metrics_evidence_does_not_terminate_completed_stage(
@@ -2391,7 +2579,8 @@ vllm:gpu_cache_usage_perc 0.5
                 }
             )
             metrics_fetch = MagicMock(return_value=metrics)
-            health_fetch = MagicMock(return_value=health)
+            health_client = MagicMock()
+            health_client.fetch.return_value = health
             idle_waiter = MagicMock(return_value=(health, 0.0))
             host_monitor = MagicMock()
             host_monitor.failure = None
@@ -2425,8 +2614,8 @@ vllm:gpu_cache_usage_perc 0.5
                 patch.object(staged, "fetch_vllm_metrics", metrics_fetch),
                 patch.object(
                     staged,
-                    "fetch_mineru_orchestrator_health",
-                    health_fetch,
+                    "MinerUOrchestratorHealthClient",
+                    return_value=health_client,
                 ),
                 patch.object(
                     staged,
@@ -2439,6 +2628,7 @@ vllm:gpu_cache_usage_perc 0.5
                     "_HostCapacityMonitor",
                     return_value=host_monitor,
                 ),
+                patch.object(staged, "_HostObserverControlMaster"),
             ):
                 result = staged.main(
                     [
@@ -2497,10 +2687,9 @@ vllm:gpu_cache_usage_perc 0.5
             self.assertEqual(
                 metrics_fetch.call_args_list[-1].args, (observability_url,)
             )
-            self.assertEqual(health_fetch.call_args.args, (api_url,))
             self.assertEqual(idle_waiter.call_args.args, (api_url,))
             self.assertEqual(
-                health_fetch.call_args.kwargs,
+                health_client.fetch.call_args.kwargs,
                 {
                     "expected_task_slots": 1,
                     "expected_task_retention_seconds": 600,

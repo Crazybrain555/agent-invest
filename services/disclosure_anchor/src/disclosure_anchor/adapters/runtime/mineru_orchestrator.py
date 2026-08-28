@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import http.client
 import json
 import threading
 import time
 from typing import Any
-import urllib.error
-import urllib.request
+
+from disclosure_anchor.adapters.runtime.bounded_http import (
+    BoundedHTTPProtocolError,
+    BoundedHTTPTransportError,
+    ThreadOwnedPersistentHTTPClient,
+)
 
 
 MINERU_API_VERSION = "3.4.4"
@@ -33,6 +36,61 @@ class MinerUOrchestratorError(RuntimeError):
 
 class MinerUOrchestratorUnavailableError(MinerUOrchestratorError):
     """The dedicated API endpoint was temporarily unreachable."""
+
+
+class MinerUOrchestratorHealthClient:
+    """Thread-owned persistent client for strict MinerU health samples."""
+
+    def __init__(self, api_url: str) -> None:
+        self._transport = ThreadOwnedPersistentHTTPClient(
+            api_url.rstrip("/"),
+            maximum_response_bytes=MAX_HEALTH_BYTES,
+        )
+
+    def fetch(
+        self,
+        *,
+        timeout_seconds: float = 15.0,
+        expected_task_slots: int | None = None,
+        expected_task_retention_seconds: int | None = (
+            MINERU_API_TASK_RETENTION_SECONDS
+        ),
+        expected_cleanup_interval_seconds: int | None = (
+            MINERU_API_CLEANUP_INTERVAL_SECONDS
+        ),
+    ) -> "MinerUOrchestratorHealth":
+        try:
+            status, payload = self._transport.get_bytes(
+                "/health",
+                timeout_seconds=timeout_seconds,
+                transport_attempts=1,
+                maximum_attempt_timeout_seconds=min(4.5, timeout_seconds),
+            )
+        except BoundedHTTPTransportError as exc:
+            raise MinerUOrchestratorUnavailableError(
+                "MinerU API health endpoint unavailable"
+            ) from exc
+        except BoundedHTTPProtocolError as exc:
+            raise MinerUOrchestratorError(
+                "MinerU API health response violates the transport contract"
+            ) from exc
+        if status in _RETRYABLE_HTTP_STATUS_CODES:
+            raise MinerUOrchestratorUnavailableError(
+                "MinerU API health endpoint temporarily rejected the probe"
+            )
+        if not 200 <= status < 300:
+            raise MinerUOrchestratorError(
+                f"MinerU API health endpoint returned non-retryable HTTP {status}"
+            )
+        return _decode_mineru_orchestrator_health(
+            payload,
+            expected_task_slots=expected_task_slots,
+            expected_task_retention_seconds=expected_task_retention_seconds,
+            expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
+        )
+
+    def close(self) -> None:
+        self._transport.close()
 
 
 @dataclass(frozen=True)
@@ -112,36 +170,25 @@ def fetch_mineru_orchestrator_health(
     expected_cleanup_interval_seconds: int | None = MINERU_API_CLEANUP_INTERVAL_SECONDS,
 ) -> MinerUOrchestratorHealth:
     """Fetch one bounded strict `/health` sample without proxy inheritance."""
-
-    url = api_url.rstrip("/") + "/health"
-    request = urllib.request.Request(
-        url,
-        headers={"Accept": "application/json", "User-Agent": "disclosure-anchor/1"},
-        method="GET",
-    )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    client = MinerUOrchestratorHealthClient(api_url)
     try:
-        with opener.open(request, timeout=timeout_seconds) as response:
-            payload = response.read(MAX_HEALTH_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        if exc.code in _RETRYABLE_HTTP_STATUS_CODES:
-            raise MinerUOrchestratorUnavailableError(
-                "MinerU API health endpoint temporarily rejected the probe"
-            ) from exc
-        raise MinerUOrchestratorError(
-            f"MinerU API health endpoint returned non-retryable HTTP {exc.code}"
-        ) from exc
-    except (
-        OSError,
-        TimeoutError,
-        http.client.HTTPException,
-        urllib.error.URLError,
-    ) as exc:
-        raise MinerUOrchestratorUnavailableError(
-            "MinerU API health endpoint unavailable"
-        ) from exc
-    if len(payload) > MAX_HEALTH_BYTES:
-        raise MinerUOrchestratorError("MinerU API health response exceeds safety limit")
+        return client.fetch(
+            timeout_seconds=timeout_seconds,
+            expected_task_slots=expected_task_slots,
+            expected_task_retention_seconds=expected_task_retention_seconds,
+            expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
+        )
+    finally:
+        client.close()
+
+
+def _decode_mineru_orchestrator_health(
+    payload: bytes,
+    *,
+    expected_task_slots: int | None,
+    expected_task_retention_seconds: int | None,
+    expected_cleanup_interval_seconds: int | None,
+) -> MinerUOrchestratorHealth:
     try:
         decoded = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -219,36 +266,43 @@ def wait_for_mineru_orchestrator_idle(
         raise ValueError("MinerU API drain timing must be positive")
     started = time.monotonic()
     deadline = started + timeout_seconds
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise MinerUOrchestratorError(
-                "MinerU API did not prove queued/processing drain before deadline"
-            )
-        try:
-            health = fetch_mineru_orchestrator_health(
-                api_url,
-                timeout_seconds=min(15.0, max(0.1, remaining)),
-                expected_task_slots=expected_task_slots,
-                expected_task_retention_seconds=expected_task_retention_seconds,
-                expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
-            )
-        except MinerUOrchestratorUnavailableError as exc:
+    client = MinerUOrchestratorHealthClient(api_url)
+    try:
+        while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise MinerUOrchestratorError(
-                    "MinerU API drain remained transport-unproved before deadline"
-                ) from exc
+                    "MinerU API did not prove queued/processing drain before deadline"
+                )
+            try:
+                health = client.fetch(
+                    timeout_seconds=min(15.0, max(0.1, remaining)),
+                    expected_task_slots=expected_task_slots,
+                    expected_task_retention_seconds=(
+                        expected_task_retention_seconds
+                    ),
+                    expected_cleanup_interval_seconds=(
+                        expected_cleanup_interval_seconds
+                    ),
+                )
+            except MinerUOrchestratorUnavailableError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MinerUOrchestratorError(
+                        "MinerU API drain remained transport-unproved before deadline"
+                    ) from exc
+                time.sleep(min(poll_seconds, remaining))
+                continue
+            if health.active_tasks == 0:
+                return health, time.monotonic() - started
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MinerUOrchestratorError(
+                    "MinerU API did not drain queued/processing tasks before deadline"
+                )
             time.sleep(min(poll_seconds, remaining))
-            continue
-        if health.active_tasks == 0:
-            return health, time.monotonic() - started
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise MinerUOrchestratorError(
-                "MinerU API did not drain queued/processing tasks before deadline"
-            )
-        time.sleep(min(poll_seconds, remaining))
+    finally:
+        client.close()
 
 
 __all__ = [
@@ -262,6 +316,7 @@ __all__ = [
     "MINERU_API_VERSION",
     "MinerUOrchestratorError",
     "MinerUOrchestratorHealth",
+    "MinerUOrchestratorHealthClient",
     "MinerUOrchestratorIncidentState",
     "MinerUOrchestratorUnavailableError",
     "fetch_mineru_orchestrator_health",

@@ -14,6 +14,7 @@ EVALUATOR_COMPONENT_PATHS: Final = (
     "scripts/collect_mineru_phase_trace.py",
     "scripts/evaluate_mineru_capacity_commissioning.py",
     "scripts/mineru_staged_load.py",
+    "src/disclosure_anchor/adapters/runtime/bounded_http.py",
     "src/disclosure_anchor/adapters/runtime/mineru_capacity_commissioning.py",
     "src/disclosure_anchor/adapters/runtime/mineru_capacity_evaluator_identity.py",
     "src/disclosure_anchor/adapters/runtime/mineru_deployment_gate.py",

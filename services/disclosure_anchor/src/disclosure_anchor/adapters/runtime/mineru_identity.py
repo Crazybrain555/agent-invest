@@ -126,6 +126,7 @@ _WRITER_CODE_RELPATHS = (
     "src/disclosure_anchor/adapters/parsers/mineru_medium/artifacts.py",
     "src/disclosure_anchor/adapters/parsers/mineru_medium/parser.py",
     "src/disclosure_anchor/adapters/parsers/mineru_medium/process.py",
+    "src/disclosure_anchor/adapters/runtime/bounded_http.py",
     "src/disclosure_anchor/adapters/runtime/mineru_canary.py",
     "src/disclosure_anchor/adapters/runtime/mineru_deployment_gate.py",
     "src/disclosure_anchor/adapters/runtime/mineru_identity.py",

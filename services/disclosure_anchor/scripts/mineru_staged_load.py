@@ -27,8 +27,6 @@ import tempfile
 import threading
 import time
 from typing import Any
-import urllib.error
-import urllib.request
 import uuid
 
 from disclosure_anchor.adapters.parsers.mineru_medium import (
@@ -53,9 +51,14 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
 )
 from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
     MinerUOrchestratorHealth,
+    MinerUOrchestratorHealthClient,
     MinerUOrchestratorUnavailableError,
-    fetch_mineru_orchestrator_health,
     wait_for_mineru_orchestrator_idle,
+)
+from disclosure_anchor.adapters.runtime.bounded_http import (
+    BoundedHTTPProtocolError,
+    BoundedHTTPTransportError,
+    ThreadOwnedPersistentHTTPClient,
 )
 from disclosure_anchor.adapters.runtime.mineru_process_isolation import (
     active_disclosure_producers,
@@ -85,6 +88,7 @@ METRICS_SAMPLE_INTERVAL_SECONDS = 1.0
 ORCHESTRATOR_SAMPLE_INTERVAL_SECONDS = 0.25
 HOST_CAPACITY_SAMPLE_INTERVAL_SECONDS = 5.0
 HOST_CAPACITY_MAX_SAMPLE_GAP_SECONDS = 15.0
+HOST_CAPACITY_TRANSPORT_TIMEOUT_SECONDS = 4.5
 METRICS_LOGICAL_SAMPLE_TIMEOUT_SECONDS = 10.0
 METRICS_TRANSPORT_ATTEMPT_TIMEOUT_SECONDS = 4.5
 METRICS_TRANSPORT_ATTEMPTS = 2
@@ -371,6 +375,7 @@ def _host_observer_ssh_base(
     port: int,
     identity_file: Path,
     known_hosts_file: Path,
+    control_path: Path | None = None,
 ) -> list[str]:
     if (
         _SSH_HOST_RE.fullmatch(host) is None
@@ -397,7 +402,7 @@ def _host_observer_ssh_base(
         base64.b64decode(fields[2], validate=True)
     except ValueError as exc:
         raise ValueError("host observer key is not canonical base64") from exc
-    return [
+    command = [
         "/usr/bin/ssh",
         "-F",
         "/dev/null",
@@ -421,9 +426,189 @@ def _host_observer_ssh_base(
         "CheckHostIP=no",
         "-o",
         "ConnectTimeout=15",
-        "--",
-        f"{user}@{host}",
     ]
+    if control_path is not None:
+        encoded = os.fsencode(control_path)
+        if len(encoded) > 90:
+            raise ValueError("host observer SSH ControlPath is too long")
+        if control_path.exists() or control_path.is_symlink():
+            raise ValueError("host observer SSH ControlPath must be new")
+        parent = control_path.parent
+        metadata = parent.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != os.getuid()
+            or parent.is_symlink()
+        ):
+            raise ValueError("host observer SSH control directory is not private")
+        command.extend(["-S", str(control_path)])
+    command.extend(["--", f"{user}@{host}"])
+    return command
+
+
+class _HostObserverControlMaster:
+    """Own one foreground pinned OpenSSH connection for the whole campaign."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        user: str,
+        port: int,
+        identity_file: Path,
+        known_hosts_file: Path,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._host = host
+        self._user = user
+        self._port = port
+        self._identity_file = identity_file
+        self._known_hosts_file = known_hosts_file
+        self._clock = monotonic_clock
+        self._control_dir: Path | None = None
+        self._control_path: Path | None = None
+        self._base: list[str] | None = None
+        self._process: subprocess.Popen[bytes] | None = None
+
+    def start(self) -> None:
+        if self._process is not None or self._control_dir is not None:
+            raise RuntimeError("host observer SSH ControlMaster already started")
+        control_dir = Path(tempfile.mkdtemp(prefix="da-ssh-", dir="/tmp"))
+        control_dir.chmod(0o700)
+        control_path = control_dir / "m"
+        self._control_dir = control_dir
+        self._control_path = control_path
+        try:
+            base = _host_observer_ssh_base(
+                host=self._host,
+                user=self._user,
+                port=self._port,
+                identity_file=self._identity_file,
+                known_hosts_file=self._known_hosts_file,
+                control_path=control_path,
+            )
+            self._base = base
+            master_command = [
+                *base[:-2],
+                "-M",
+                "-N",
+                "-T",
+                "-o",
+                "ControlPersist=no",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
+                *base[-2:],
+            ]
+            self._process = subprocess.Popen(
+                master_command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            deadline = self._clock() + 15.0
+            while True:
+                if self._process.poll() is not None:
+                    raise RuntimeError(
+                        "host observer SSH ControlMaster exited during startup"
+                    )
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "host observer SSH ControlMaster startup timed out"
+                    )
+                checked = subprocess.run(
+                    [*base[:-2], "-O", "check", *base[-2:]],
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=min(HOST_CAPACITY_TRANSPORT_TIMEOUT_SECONDS, remaining),
+                )
+                if checked.returncode == 0:
+                    return
+                time.sleep(min(0.1, max(0.0, remaining)))
+        except Exception:
+            self.close()
+            raise
+
+    def session_command(self) -> list[str]:
+        if self._process is None or self._base is None or self._control_path is None:
+            raise _HostCapacityTransportUnavailableError(
+                "pinned Windows host-capacity ControlMaster is unavailable"
+            )
+        try:
+            metadata = self._control_path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise _HostCapacityTransportUnavailableError(
+                "pinned Windows host-capacity ControlMaster is unavailable"
+            ) from exc
+        if (
+            self._process.poll() is not None
+            or not stat.S_ISSOCK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or self._control_path.is_symlink()
+        ):
+            raise _HostCapacityTransportUnavailableError(
+                "pinned Windows host-capacity ControlMaster is unavailable"
+            )
+        return [
+            *self._base[:-2],
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ProxyCommand=/usr/bin/false",
+            *self._base[-2:],
+        ]
+
+    def close(self) -> None:
+        process = self._process
+        base = self._base
+        if process is not None and base is not None and process.poll() is None:
+            try:
+                subprocess.run(
+                    [*base[:-2], "-O", "exit", *base[-2:]],
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=HOST_CAPACITY_TRANSPORT_TIMEOUT_SECONDS,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5.0)
+        control_dir = self._control_dir
+        if control_dir is not None and control_dir.exists():
+            metadata = control_dir.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+                or metadata.st_uid != os.getuid()
+                or control_dir.is_symlink()
+            ):
+                raise RuntimeError("host observer SSH control directory drifted")
+            for child in control_dir.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    raise RuntimeError(
+                        "host observer SSH control directory contains a directory"
+                    )
+                child.unlink(missing_ok=True)
+            control_dir.rmdir()
+        self._process = None
+        self._base = None
+        self._control_path = None
+        self._control_dir = None
 
 
 def _positive_int(value: object, *, label: str, allow_zero: bool = False) -> int:
@@ -638,7 +823,7 @@ def _fetch_host_capacity_sample(
             check=True,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=HOST_CAPACITY_TRANSPORT_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
         raise _HostCapacityTransportUnavailableError(
@@ -745,8 +930,13 @@ class _HostCapacityMonitor:
         self._sample_once()
 
     def _run(self) -> None:
-        while not self._stop.wait(self._interval):
+        next_sample = self._clock() + self._interval
+        while not self._stop.wait(max(0.0, next_sample - self._clock())):
             self._sample_once()
+            next_sample += self._interval
+            now = self._clock()
+            while next_sample <= now:
+                next_sample += self._interval
 
     def _record_failure(self, failure: str) -> None:
         with self._abort_latch.condition:
@@ -756,10 +946,10 @@ class _HostCapacityMonitor:
             self._abort_latch.publish_locked(published)
 
     def _sample_once(self) -> None:
-        observed_seconds = max(0.0, self._clock() - self._started)
         try:
             sample = dict(self._sampler())
         except _TrustedHostCapacityViolation as exc:
+            observed_seconds = max(0.0, self._clock() - self._started)
             failure = f"host_capacity_violation:{_safe_detail(str(exc))}"
             with self._abort_latch.condition:
                 with self._lock:
@@ -778,6 +968,7 @@ class _HostCapacityMonitor:
                     published = self._failure
                 self._abort_latch.publish_locked(published)
         except _HostCapacityTransportUnavailableError as exc:
+            observed_seconds = max(0.0, self._clock() - self._started)
             failure = (
                 "host_capacity_transport_unavailable:"
                 f"{type(exc).__name__}:{_safe_detail(str(exc))}"
@@ -807,6 +998,7 @@ class _HostCapacityMonitor:
                     published = self._failure or self._admission_stop_reason
                 self._abort_latch.publish_locked(published)
         except Exception as exc:
+            observed_seconds = max(0.0, self._clock() - self._started)
             failure = (
                 "host_capacity_sample_failed:"
                 f"{type(exc).__name__}:{_safe_detail(str(exc))}"
@@ -823,6 +1015,7 @@ class _HostCapacityMonitor:
                     published = self._failure
                 self._abort_latch.publish_locked(published)
         else:
+            observed_seconds = max(0.0, self._clock() - self._started)
             self._append_trusted_sample(
                 sample,
                 observed_seconds=observed_seconds,
@@ -1031,6 +1224,7 @@ class _OrchestratorMonitor:
         abort_latch: _StageAbortLatch | None = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
         sample_interval_seconds: float = ORCHESTRATOR_SAMPLE_INTERVAL_SECONDS,
+        sampler_close: Callable[[], None] | None = None,
     ) -> None:
         self._sampler = sampler
         self._task_slots = task_slots
@@ -1038,6 +1232,7 @@ class _OrchestratorMonitor:
         self._abort_latch = abort_latch or _StageAbortLatch()
         self._monotonic_clock = monotonic_clock
         self._sample_interval_seconds = sample_interval_seconds
+        self._sampler_close = sampler_close
         self._started = monotonic_clock()
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -1053,10 +1248,22 @@ class _OrchestratorMonitor:
         self._state = "STARTING"
         self._transitions: list[dict[str, object]] = []
         self._thread_started = False
+        self._ready = threading.Event()
 
     def start(self) -> None:
         self._thread.start()
         self._thread_started = True
+        if not self._ready.wait(timeout=max(16.0, self._sample_interval_seconds * 2)):
+            self._publish_hard_failure("orchestrator_monitor_initial_sample_timeout")
+            raise RuntimeError("orchestrator monitor initial sample timed out")
+        with self._lock:
+            initial_failure = self._failure
+            initial_transport_failure = bool(self._sampling_failures)
+            has_sample = bool(self._samples)
+        if initial_failure is not None:
+            raise RuntimeError(initial_failure)
+        if initial_transport_failure or not has_sample:
+            raise RuntimeError("orchestrator initial transport sample unavailable")
 
     def stop(self) -> None:
         if not self._thread_started:
@@ -1189,10 +1396,29 @@ class _OrchestratorMonitor:
             self._abort_latch.publish_locked(published)
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            if not self._observe_once():
-                return
-            self._stop.wait(self._sample_interval_seconds)
+        try:
+            keep_sampling = self._observe_once()
+            self._ready.set()
+            next_sample = self._monotonic_clock() + self._sample_interval_seconds
+            while keep_sampling and not self._stop.is_set():
+                if self._stop.wait(
+                    max(0.0, next_sample - self._monotonic_clock())
+                ):
+                    break
+                keep_sampling = self._observe_once()
+                next_sample += self._sample_interval_seconds
+                now = self._monotonic_clock()
+                while next_sample <= now:
+                    next_sample += self._sample_interval_seconds
+        finally:
+            self._ready.set()
+            if self._sampler_close is not None:
+                try:
+                    self._sampler_close()
+                except Exception:
+                    self._publish_hard_failure(
+                        "orchestrator_monitor_transport_close_failed"
+                    )
 
     def _observe_once(self) -> bool:
         sample_started = self._monotonic_clock()
@@ -1244,11 +1470,13 @@ class _MetricsMonitor:
         expected_preemptions: float,
         monotonic_clock: Callable[[], float] = time.monotonic,
         sample_interval_seconds: float = METRICS_SAMPLE_INTERVAL_SECONDS,
+        sampler_close: Callable[[], None] | None = None,
     ) -> None:
         self._sampler = sampler
         self._expected_preemptions = expected_preemptions
         self._monotonic_clock = monotonic_clock
         self._sample_interval_seconds = sample_interval_seconds
+        self._sampler_close = sampler_close
         self._started = monotonic_clock()
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -1265,10 +1493,23 @@ class _MetricsMonitor:
         self._waiting_since: float | None = None
         self._terminal_sample_observed_seconds: float | None = None
         self._thread_started = False
+        self._ready = threading.Event()
 
     def start(self) -> None:
         self._thread.start()
         self._thread_started = True
+        if not self._ready.wait(timeout=max(12.0, self._sample_interval_seconds * 2)):
+            with self._lock:
+                self._failure = self._failure or "metrics_monitor_initial_sample_timeout"
+            raise RuntimeError("metrics monitor initial sample timed out")
+        with self._lock:
+            initial_failure = self._failure
+            initial_transport_failure = bool(self._sampling_failures)
+            has_sample = bool(self._samples)
+        if initial_failure is not None:
+            raise RuntimeError(initial_failure)
+        if initial_transport_failure or not has_sample:
+            raise RuntimeError("metrics initial transport sample unavailable")
 
     def stop(self) -> None:
         if not self._thread_started:
@@ -1287,8 +1528,6 @@ class _MetricsMonitor:
                     ),
                 )
             return
-        if self.failure is None:
-            self._observe_once(terminal=True)
         with self._lock:
             self._transition_locked(
                 "CLOSED",
@@ -1365,10 +1604,32 @@ class _MetricsMonitor:
         )
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            if not self._observe_once():
-                return
-            self._stop.wait(self._sample_interval_seconds)
+        try:
+            keep_sampling = self._observe_once()
+            self._ready.set()
+            next_sample = self._monotonic_clock() + self._sample_interval_seconds
+            while keep_sampling and not self._stop.is_set():
+                if self._stop.wait(
+                    max(0.0, next_sample - self._monotonic_clock())
+                ):
+                    break
+                keep_sampling = self._observe_once()
+                next_sample += self._sample_interval_seconds
+                now = self._monotonic_clock()
+                while next_sample <= now:
+                    next_sample += self._sample_interval_seconds
+            if self._stop.is_set() and self.failure is None:
+                self._observe_once(terminal=True)
+        finally:
+            self._ready.set()
+            if self._sampler_close is not None:
+                try:
+                    self._sampler_close()
+                except Exception:
+                    with self._lock:
+                        self._failure = (
+                            self._failure or "metrics_monitor_transport_close_failed"
+                        )
 
     def _observe_once(
         self,
@@ -1500,48 +1761,63 @@ def metric_abort_reason(
     return None, waiting_since
 
 
+class _PersistentVLLMMetricsClient:
+    """Thread-owned persistent transport for bounded vLLM metrics samples."""
+
+    def __init__(
+        self,
+        server_url: str,
+        *,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        root = server_url.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[:-3].rstrip("/")
+        self._clock = monotonic_clock
+        self._transport = ThreadOwnedPersistentHTTPClient(
+            root,
+            maximum_response_bytes=_MAX_METRICS_BYTES,
+            monotonic_clock=monotonic_clock,
+        )
+
+    def fetch(self) -> MetricsSample:
+        try:
+            status, payload = self._transport.get_bytes(
+                "/metrics",
+                timeout_seconds=METRICS_LOGICAL_SAMPLE_TIMEOUT_SECONDS,
+                transport_attempts=METRICS_TRANSPORT_ATTEMPTS,
+                maximum_attempt_timeout_seconds=(
+                    METRICS_TRANSPORT_ATTEMPT_TIMEOUT_SECONDS
+                ),
+            )
+        except BoundedHTTPTransportError as exc:
+            raise MetricsTransportUnavailableError(
+                "cannot read vLLM metrics inside the logical transport budget"
+            ) from exc
+        except BoundedHTTPProtocolError as exc:
+            raise RuntimeError("vLLM metrics response violates safety limits") from exc
+        if not 200 <= status < 300:
+            raise RuntimeError(f"cannot read vLLM metrics: HTTP {status}")
+        sample = parse_vllm_metrics(payload)
+        return sample
+
+    def close(self) -> None:
+        self._transport.close()
+
+
 def fetch_vllm_metrics(
     server_url: str,
     *,
     monotonic_clock: Callable[[], float] = time.monotonic,
 ) -> MetricsSample:
-    root = server_url.rstrip("/")
-    if root.endswith("/v1"):
-        root = root[:-3].rstrip("/")
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    maximum_attempt_timeout = METRICS_TRANSPORT_ATTEMPT_TIMEOUT_SECONDS
-    deadline = monotonic_clock() + METRICS_LOGICAL_SAMPLE_TIMEOUT_SECONDS
-    last_transport_error: BaseException | None = None
-    for attempt in range(1, METRICS_TRANSPORT_ATTEMPTS + 1):
-        remaining_seconds = deadline - monotonic_clock()
-        if remaining_seconds <= 0:
-            raise MetricsTransportUnavailableError(
-                "cannot read vLLM metrics: logical transport budget exhausted "
-                f"after {attempt - 1} attempts"
-            ) from last_transport_error
-        attempt_timeout = min(maximum_attempt_timeout, remaining_seconds)
-        try:
-            with opener.open(root + "/metrics", timeout=attempt_timeout) as response:
-                payload = response.read(_MAX_METRICS_BYTES + 1)
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"cannot read vLLM metrics: {exc}") from exc
-        except (OSError, TimeoutError, urllib.error.URLError) as exc:
-            last_transport_error = exc
-            if attempt == METRICS_TRANSPORT_ATTEMPTS:
-                raise MetricsTransportUnavailableError(
-                    "cannot read vLLM metrics after "
-                    f"{METRICS_TRANSPORT_ATTEMPTS} transport attempts: {exc}"
-                ) from exc
-            continue
-        if not isinstance(payload, bytes) or len(payload) > _MAX_METRICS_BYTES:
-            raise RuntimeError("vLLM metrics response exceeds the safety limit")
-        sample = parse_vllm_metrics(payload)
-        if monotonic_clock() > deadline:
-            raise MetricsTransportUnavailableError(
-                "vLLM metrics response exceeded the logical transport budget"
-            )
-        return sample
-    raise AssertionError("unreachable vLLM metrics transport loop")
+    client = _PersistentVLLMMetricsClient(
+        server_url,
+        monotonic_clock=monotonic_clock,
+    )
+    try:
+        return client.fetch()
+    finally:
+        client.close()
 
 
 def execute_fixed_stage_sequence(
@@ -1554,6 +1830,20 @@ def execute_fixed_stage_sequence(
         if result.get("status") != "pass":
             break
     return results
+
+
+def _reclassify_cancelled_after_termination(
+    outcome: dict[str, Any],
+    *,
+    termination_requested: bool,
+) -> None:
+    """Attach stage-abort causality only after the coordinator terminated."""
+
+    if termination_requested and outcome.get("failure_detail", "").startswith(
+        "ParserCancelledError:"
+    ):
+        outcome["status"] = "cancelled_after_stage_abort"
+        outcome["failure_class"] = "stage_abort"
 
 
 def _run_stage(
@@ -1572,6 +1862,9 @@ def _run_stage(
     orchestrator_sampler: Callable[[], MinerUOrchestratorHealth],
     orchestrator_idle_waiter: Callable[[], tuple[MinerUOrchestratorHealth, float]],
     task_slots: int,
+    metrics_monitor_sampler: Callable[[], MetricsSample] | None = None,
+    metrics_monitor_close: Callable[[], None] | None = None,
+    orchestrator_monitor_close: Callable[[], None] | None = None,
     host_failure: Callable[[], str | None] = lambda: None,
     host_observation_stop: Callable[[], str | None] = lambda: None,
     abort_latch: _StageAbortLatch | None = None,
@@ -1615,14 +1908,16 @@ def _run_stage(
             task_slots=task_slots,
         )
     metrics_monitor = _MetricsMonitor(
-        sampler=metrics_sampler,
+        sampler=metrics_monitor_sampler or metrics_sampler,
         expected_preemptions=expected_preemptions,
+        sampler_close=metrics_monitor_close,
     )
     orchestrator_monitor = _OrchestratorMonitor(
         sampler=orchestrator_sampler,
         task_slots=task_slots,
         client_outstanding_window=client_outstanding_window,
         abort_latch=stage_abort_latch,
+        sampler_close=orchestrator_monitor_close,
     )
 
     def current_monitor_stop() -> tuple[str | None, bool]:
@@ -1722,7 +2017,9 @@ def _run_stage(
                         timeout=0.25,
                         return_when=FIRST_COMPLETED,
                     )
-                    for future in done:
+                    termination_requested_before_batch = local_termination_requested
+                    batch_requires_termination = False
+                    for future in sorted(done, key=lambda item: futures[item]):
                         index = futures[future]
                         try:
                             outcome = future.result()
@@ -1752,6 +2049,12 @@ def _run_stage(
                                     stage_inputs[index - 1].workload_class
                                 ),
                             )
+                        _reclassify_cancelled_after_termination(
+                            outcome,
+                            termination_requested=(
+                                termination_requested_before_batch
+                            ),
+                        )
                         outcomes[index] = outcome
                         if outcome["status"] == "fail" and failure_origin in {
                             None,
@@ -1759,9 +2062,10 @@ def _run_stage(
                         }:
                             failure = str(outcome["failure_class"])
                             failure_origin = "document"
-                            if not local_termination_requested:
-                                terminate_active_mineru_processes()
-                                local_termination_requested = True
+                            batch_requires_termination = True
+                    if batch_requires_termination and not local_termination_requested:
+                        terminate_active_mineru_processes()
+                        local_termination_requested = True
                     if failure is not None and not admission_closed:
                         admission.close()
                         admission_closed = True
@@ -1809,11 +2113,10 @@ def _run_stage(
                         input_logical_name=stage_inputs[index - 1].logical_name,
                         workload_class=stage_inputs[index - 1].workload_class,
                     )
-                if failure is not None and outcome.get("failure_detail", "").startswith(
-                    "ParserCancelledError:"
-                ):
-                    outcome["status"] = "cancelled_after_stage_abort"
-                    outcome["failure_class"] = "stage_abort"
+                _reclassify_cancelled_after_termination(
+                    outcome,
+                    termination_requested=local_termination_requested,
+                )
                 outcomes[index] = outcome
     finally:
         try:
@@ -1823,8 +2126,17 @@ def _run_stage(
                 "orchestrator_terminal_drain_failed:"
                 f"{type(exc).__name__}:{_safe_detail(str(exc))}"
             )
-        orchestrator_monitor.stop()
-        metrics_monitor.stop()
+        for monitor_name, monitor_stop in (
+            ("orchestrator", orchestrator_monitor.stop),
+            ("metrics", metrics_monitor.stop),
+        ):
+            try:
+                monitor_stop()
+            except Exception as exc:
+                failure = failure or (
+                    f"{monitor_name}_monitor_cleanup_failed:"
+                    f"{type(exc).__name__}:{_safe_detail(str(exc))}"
+                )
     cleanup_ok = stage_tree is not None and not stage_tree.exists()
     cleanup_observation_error: str | None = None
     api_temp_dirs_created = 0
@@ -2633,6 +2945,7 @@ def main(argv: list[str] | None = None) -> int:
     failure_phase = "preflight_configuration"
     runtime_cleanup_armed = False
     host_monitor: _HostCapacityMonitor | None = None
+    host_transport: _HostObserverControlMaster | None = None
     run_abort_latch = _StageAbortLatch()
     host_capacity_evidence: dict[str, Any] = {}
     try:
@@ -2692,16 +3005,18 @@ def main(argv: list[str] | None = None) -> int:
         windows_node_identity_sha256 = topology[
             "windows_node_identity_sha256"
         ]
-        ssh_command = _host_observer_ssh_base(
+        failure_phase = "host_capacity_observer"
+        host_transport = _HostObserverControlMaster(
             host=args.host_observer_ssh_host,
             user=args.host_observer_ssh_user,
             port=args.host_observer_ssh_port,
             identity_file=args.host_observer_identity_file,
             known_hosts_file=args.host_observer_known_hosts_file,
         )
+        host_transport.start()
         host_monitor = _HostCapacityMonitor(
             sampler=lambda: _fetch_host_capacity_sample(
-                ssh_command,
+                host_transport.session_command(),
                 expected_collector_sha256=collector_sha256,
                 expected_windows_node_identity_sha256=(
                     windows_node_identity_sha256
@@ -2713,7 +3028,6 @@ def main(argv: list[str] | None = None) -> int:
             docker_memory_reserve_bytes=args.docker_memory_reserve_bytes,
             abort_latch=run_abort_latch,
         )
-        failure_phase = "host_capacity_observer"
         host_monitor.start()
         orchestrator_manifest = verified.manifest["orchestrator"]
         task_slots = verified.max_concurrent_requests
@@ -2749,8 +3063,15 @@ def main(argv: list[str] | None = None) -> int:
             dir=args.work_root,
         ) as tmp:
             run_tree = Path(tmp)
-            stage_results = execute_fixed_stage_sequence(
-                lambda document_count: _run_stage(
+            def run_persistent_stage(document_count: int) -> dict[str, Any]:
+                metrics_monitor_client = _PersistentVLLMMetricsClient(
+                    observability_url
+                )
+                orchestrator_monitor_client = MinerUOrchestratorHealthClient(
+                    api_url
+                )
+                try:
+                    return _run_stage(
                     document_count=document_count,
                     run_root=run_tree,
                     corpus=corpus,
@@ -2765,8 +3086,9 @@ def main(argv: list[str] | None = None) -> int:
                     task_slots=task_slots,
                     expected_preemptions=global_metrics_baseline.preemptions,
                     metrics_sampler=lambda: fetch_vllm_metrics(observability_url),
-                    orchestrator_sampler=lambda: fetch_mineru_orchestrator_health(
-                        api_url,
+                    metrics_monitor_sampler=metrics_monitor_client.fetch,
+                    metrics_monitor_close=metrics_monitor_client.close,
+                    orchestrator_sampler=lambda: orchestrator_monitor_client.fetch(
                         expected_task_slots=task_slots,
                         expected_task_retention_seconds=(
                             expected_task_retention_seconds
@@ -2774,6 +3096,9 @@ def main(argv: list[str] | None = None) -> int:
                         expected_cleanup_interval_seconds=(
                             expected_cleanup_interval_seconds
                         ),
+                    ),
+                    orchestrator_monitor_close=(
+                        orchestrator_monitor_client.close
                     ),
                     orchestrator_idle_waiter=lambda: wait_for_mineru_orchestrator_idle(
                         api_url,
@@ -2791,8 +3116,23 @@ def main(argv: list[str] | None = None) -> int:
                         host_monitor.observation_stop_reason
                     ),
                     abort_latch=run_abort_latch,
-                )
-            )
+                    )
+                finally:
+                    close_error: Exception | None = None
+                    for close_client in (
+                        metrics_monitor_client.close,
+                        orchestrator_monitor_client.close,
+                    ):
+                        try:
+                            close_client()
+                        except Exception as exc:
+                            close_error = close_error or exc
+                    if close_error is not None:
+                        raise RuntimeError(
+                            "persistent observer transport cleanup failed"
+                        ) from close_error
+
+            stage_results = execute_fixed_stage_sequence(run_persistent_stage)
         if len(stage_results) != len(STAGE_DOCUMENT_COUNTS) or any(
             result.get("status") != "pass" for result in stage_results
         ):
@@ -2808,6 +3148,15 @@ def main(argv: list[str] | None = None) -> int:
             if host_capacity_evidence.get("status") != "pass":
                 failure_phase = "host_capacity_observer"
                 failure = failure or str(host_capacity_evidence.get("failure"))
+        if host_transport is not None:
+            try:
+                host_transport.close()
+            except Exception as exc:
+                failure_phase = "host_capacity_observer"
+                failure = failure or (
+                    "host_capacity_transport_cleanup_failed:"
+                    f"{type(exc).__name__}:{_safe_detail(str(exc))}"
+                )
         if runtime_cleanup_armed:
             try:
                 remaining_processes = _wait_for_process_cleanup()

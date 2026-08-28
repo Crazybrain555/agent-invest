@@ -103,6 +103,10 @@
    "private_imports": [],
    "tests": 17
   },
+  "tests/unit/test_bounded_http.py": {
+   "private_imports": [],
+   "tests": 15
+  },
   "tests/unit/test_build_mineru_capacity_catalog.py": {
    "private_imports": [],
    "tests": 3
@@ -288,7 +292,7 @@
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
-   "tests": 13
+   "tests": 14
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],
@@ -296,7 +300,7 @@
   },
   "tests/unit/test_mineru_orchestrator.py": {
    "private_imports": [],
-   "tests": 7
+   "tests": 8
   },
   "tests/unit/test_mineru_process.py": {
    "private_imports": [],
@@ -312,7 +316,7 @@
   },
   "tests/unit/test_mineru_staged_load.py": {
    "private_imports": [],
-   "tests": 61
+   "tests": 67
   },
   "tests/unit/test_normalized_ir_v4_evidence.py": {
    "private_imports": [],
