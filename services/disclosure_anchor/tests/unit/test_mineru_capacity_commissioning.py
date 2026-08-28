@@ -261,6 +261,11 @@ def _receipt(
         "orchestrator_task_concurrency": 1,
         "orchestrator_inference_concurrency": 7,
         "effective_inference_request_upper_bound": 7,
+        "safety_limits": {
+            "profile": "whole-document-runaway-and-drain.v1",
+            "document_runaway_timeout_seconds": 86400,
+            "api_drain_timeout_seconds": 86400,
+        },
         "started_at_utc": started_at.isoformat(),
         "finished_at_utc": finished_at.isoformat(),
         "elapsed_seconds": elapsed_seconds,
@@ -715,6 +720,48 @@ class MineruCapacityCommissioningTests(unittest.TestCase):
                     minimum_improvement_basis_points=500,
                     maximum_repeat_spread_basis_points=300,
                 )
+
+    def test_safety_limits_must_be_safe_and_identical_across_arms(self) -> None:
+        with patch(
+            "disclosure_anchor.adapters.runtime.mineru_capacity_commissioning."
+            "summarize_phase_trace_capture",
+            side_effect=self._summary,
+        ):
+            for tamper, expected in (
+                ("short_document", "staged-load arm is not PASS"),
+                ("short_drain", "staged-load arm is not PASS"),
+                ("drift", "safety limits drifted"),
+            ):
+                with self.subTest(tamper=tamper):
+                    arms = self._arms()
+                    if tamper == "short_document":
+                        arms[0][0]["safety_limits"][
+                            "document_runaway_timeout_seconds"
+                        ] = 1800
+                    elif tamper == "short_drain":
+                        arms[0][0]["safety_limits"][
+                            "api_drain_timeout_seconds"
+                        ] = 1800
+                    else:
+                        arms[1][0]["safety_limits"][
+                            "api_drain_timeout_seconds"
+                        ] = 172800
+                    with self.assertRaisesRegex(ValueError, expected):
+                        evaluate_capacity_commissioning(
+                            arms,
+                            expected_legacy_profile_sha256=_LEGACY_SHA,
+                            expected_candidate_profile_sha256=_CANDIDATE_SHA,
+                            expected_collector_sha256=_COLLECTOR_SHA,
+                            expected_collector_path=(
+                                MINERU_WINDOWS_COLLECTOR_PATH
+                            ),
+                            expected_docker_memory_reserve_bytes=(
+                                _MEMORY_RESERVE_BYTES
+                            ),
+                            expected_windows_node_identity_sha256=_NODE_SHA,
+                            minimum_improvement_basis_points=500,
+                            maximum_repeat_spread_basis_points=300,
+                        )
 
     def test_retained_terminal_gauges_may_expire_during_an_arm(self) -> None:
         arms = self._arms()

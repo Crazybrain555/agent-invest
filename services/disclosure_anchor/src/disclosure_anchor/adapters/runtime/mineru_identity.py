@@ -20,6 +20,11 @@ MINERU_API_MAX_SUPPORTED_TASK_SLOTS = 3
 MINERU_API_INFERENCE_MAX_CONCURRENCY = 7
 MINERU_API_TASK_RETENTION_SECONDS = 600
 MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS = 30
+# Formal whole-document load evidence must exercise the same liveness-only
+# boundary as the resident worker.  This is deliberately not a throughput
+# tuning knob: healthy large PDFs are allowed to finish while the independent
+# host/orchestrator observers retain authority to stop unsafe work.
+MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS = 86400
 MINERU_API_OUTPUT_ROOT_POLICY = "dedicated-scratch-retention.v1"
 MINERU_API_TRANSPORT_PROFILE = "pinned-ssh-local-forward.v1"
 MINERU_API_EXPOSURE_POLICY = "windows-loopback-only.v1"

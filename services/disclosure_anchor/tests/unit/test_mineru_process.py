@@ -180,6 +180,10 @@ class MinerUProcessTests(unittest.TestCase):
             self.assertEqual(mineru_process._task_result_timeout_seconds(600), 450)
             self.assertEqual(mineru_process._task_result_timeout_seconds(900), 675)
             self.assertEqual(mineru_process._task_result_timeout_seconds(901), 676)
+            self.assertEqual(
+                mineru_process._task_result_timeout_seconds(86400),
+                84600,
+            )
 
             succeeded = mock.Mock(pid=101, returncode=0)
             succeeded.communicate.return_value = ("ok", "")

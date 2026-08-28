@@ -211,6 +211,8 @@ make mineru-staged-load \
   SSH_IDENTITY=/private/path/operator-key \
   SSH_KNOWN_HOSTS=/private/path/known_hosts \
   DOCKER_MEMORY_RESERVE_BYTES=<operator-calibrated-bytes> \
+  DOCUMENT_RUNAWAY_TIMEOUT_SECONDS=86400 \
+  API_DRAIN_TIMEOUT_SECONDS=86400 \
   WORK_ROOT=/private/disposable-scratch
 
 # 第一轮完整 PASS 后，用不存在的新路径原样再运行一次：
@@ -223,10 +225,17 @@ make mineru-staged-load \
   SSH_IDENTITY=/private/path/operator-key \
   SSH_KNOWN_HOSTS=/private/path/known_hosts \
   DOCKER_MEMORY_RESERVE_BYTES=<same-operator-calibrated-bytes> \
+  DOCUMENT_RUNAWAY_TIMEOUT_SECONDS=86400 \
+  API_DRAIN_TIMEOUT_SECONDS=86400 \
   WORK_ROOT=/private/disposable-scratch
 ```
 
-该入口没有自定义 stage 参数，固定按 4、8、16 份真实 PDF 运行 official writer。每个 stage 都从
+该入口没有自定义 stage 参数，固定按 4、8、16 份真实 PDF 运行 official writer。两个 86400s
+值是 whole-document runaway 与远端自然 drain 的灾难保险，不是吞吐调参或普通 SLA；formal gate
+拒绝更小的值，并把两者写入 exact receipt。正常慢文档不得仅因耗时越过 soft expected 而失败。
+若私有环境把任一对应 setting 提高到 86400s 以上，命令必须传入与当前 settings 完全相同的两个值；
+deployment gate 不接受“测试边界”和“实际 worker 边界”漂移。
+每个 stage 都从
 冻结 corpus 机械选出 regular、heavy、huge 各至少一份，再按 corpus 顺序补足精确集合。corpus
 至少包含 16 个不同 SHA，且必须同时覆盖 regular（<80 页）、heavy（80–499 页）和 huge（≥500 页）；
 单页 smoke fixture 或重复同一 PDF 不能冒充负载验证。4/8/16 是每阶段处理的文档总数，不是同时

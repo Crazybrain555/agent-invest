@@ -226,7 +226,8 @@ mineru-smoke:
 # 4/8/16 documents use a single API-facing outstanding submission; huge inputs
 # remain exclusive. A pinned process-external observer proves epoch/OOM/RSS/memory.
 mineru-staged-load:
-	@test -n "$(RUNTIME_MANIFEST)" || (echo 'usage: make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json CORPUS_MANIFEST=/path/frozen-corpus.json EXPECTED_CORPUS_SHA256=<sha256> RECEIPT=/path/new-receipt.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts DOCKER_MEMORY_RESERVE_BYTES=<bytes> [WORK_ROOT=/private/scratch TIMEOUT_SECONDS=1800]' && exit 2)
+	@test -n "$(RUNTIME_MANIFEST)" || (echo 'usage: make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json CORPUS_MANIFEST=/path/frozen-corpus.json EXPECTED_CORPUS_SHA256=<sha256> RECEIPT=/path/new-receipt.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts DOCKER_MEMORY_RESERVE_BYTES=<bytes> [WORK_ROOT=/private/scratch DOCUMENT_RUNAWAY_TIMEOUT_SECONDS=86400 API_DRAIN_TIMEOUT_SECONDS=86400]' && exit 2)
+	@test -z "$(TIMEOUT_SECONDS)" || (echo 'mineru-staged-load: TIMEOUT_SECONDS is obsolete; use the two explicit safety-limit variables' && exit 2)
 	@test -n "$(CORPUS_MANIFEST)" || (echo 'mineru-staged-load: CORPUS_MANIFEST is required' && exit 2)
 	@test -n "$(EXPECTED_CORPUS_SHA256)" || (echo 'mineru-staged-load: EXPECTED_CORPUS_SHA256 is required' && exit 2)
 	@test -n "$(RECEIPT)" || (echo 'mineru-staged-load: RECEIPT is required' && exit 2)
@@ -247,7 +248,8 @@ mineru-staged-load:
 		--host-observer-known-hosts-file "$(SSH_KNOWN_HOSTS)" \
 		--docker-memory-reserve-bytes "$(DOCKER_MEMORY_RESERVE_BYTES)" \
 		$(if $(WORK_ROOT),--work-root "$(WORK_ROOT)") \
-		$(if $(TIMEOUT_SECONDS),--timeout-seconds "$(TIMEOUT_SECONDS)")
+		--document-runaway-timeout-seconds "$(or $(DOCUMENT_RUNAWAY_TIMEOUT_SECONDS),86400)" \
+		--api-drain-timeout-seconds "$(or $(API_DRAIN_TIMEOUT_SECONDS),86400)"
 
 # Capture only strict content-free phase lines for one already-finished staged
 # arm, bound them to its external host/container epoch, and prove page closure.

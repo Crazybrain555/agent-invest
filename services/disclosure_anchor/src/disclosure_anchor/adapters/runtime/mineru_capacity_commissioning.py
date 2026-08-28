@@ -23,6 +23,7 @@ from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     verify_staged_load_orchestrator_evidence,
 )
 from disclosure_anchor.adapters.runtime.mineru_identity import (
+    MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS,
     MINERU_WINDOWS_COLLECTOR_PATH,
 )
 
@@ -61,6 +62,7 @@ CAPACITY_COMMISSIONING_FIELDS: Final = frozenset(
 )
 _STAGED_LOAD_SCHEMA = "mineru_staged_load_receipt.v6"
 _STAGED_LOAD_SCHEMA_VERSION = 6
+_STAGED_LOAD_SAFETY_LIMITS_PROFILE = "whole-document-runaway-and-drain.v1"
 _STAGE_COUNTS = (4, 8, 16)
 _SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 _TIMELINE_TOLERANCE_SECONDS = 0.050
@@ -85,6 +87,7 @@ class _ArmEvidence:
     stable_container_epochs: Mapping[str, tuple[str, str]]
     api_image_id: str
     memory_reserve_bytes: int
+    safety_limits: Mapping[str, object]
     started_at: datetime
 
 
@@ -132,6 +135,14 @@ def _positive_integer(value: object, *, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"capacity commissioning {label} is invalid")
     return value
+
+
+def _is_safe_staged_timeout(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and value >= MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS
+    )
 
 
 def _pages_per_host_hour_milli(*, pages: int, elapsed_seconds: float) -> int:
@@ -278,6 +289,7 @@ def _arm_evidence(
     expected_docker_memory_reserve_bytes: int,
     expected_collector_path: str,
 ) -> _ArmEvidence:
+    safety_limits = receipt.get("safety_limits")
     if (
         receipt.get("schema") != _STAGED_LOAD_SCHEMA
         or receipt.get("receipt_schema_version") != _STAGED_LOAD_SCHEMA_VERSION
@@ -289,6 +301,20 @@ def _arm_evidence(
         or receipt.get("orchestrator_task_concurrency") != 1
         or receipt.get("orchestrator_inference_concurrency") != 7
         or receipt.get("effective_inference_request_upper_bound") != 7
+        or not isinstance(safety_limits, dict)
+        or set(safety_limits)
+        != {
+            "profile",
+            "document_runaway_timeout_seconds",
+            "api_drain_timeout_seconds",
+        }
+        or safety_limits.get("profile") != _STAGED_LOAD_SAFETY_LIMITS_PROFILE
+        or not _is_safe_staged_timeout(
+            safety_limits.get("document_runaway_timeout_seconds")
+        )
+        or not _is_safe_staged_timeout(
+            safety_limits.get("api_drain_timeout_seconds")
+        )
         or not _cleanup_is_closed(receipt.get("cleanup"))
     ):
         raise ValueError("capacity commissioning staged-load arm is not PASS")
@@ -461,6 +487,7 @@ def _arm_evidence(
         stable_container_epochs=epochs,
         api_image_id=capture.container_image_id,
         memory_reserve_bytes=expected_docker_memory_reserve_bytes,
+        safety_limits=safety_limits,
         started_at=started,
     )
 
@@ -550,6 +577,8 @@ def evaluate_capacity_commissioning(
         raise ValueError("capacity commissioning API image drifted")
     if len({item.memory_reserve_bytes for item in evidence}) != 1:
         raise ValueError("capacity commissioning memory reserve drifted")
+    if len({_canonical(item.safety_limits) for item in evidence}) != 1:
+        raise ValueError("capacity commissioning safety limits drifted")
     stable_identity_fields = (
         "local_client_identity_sha256",
         "local_content_package_versions",

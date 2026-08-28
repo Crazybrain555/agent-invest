@@ -14,6 +14,7 @@ import stat
 import subprocess
 
 from disclosure_anchor.adapters.runtime.mineru_identity import (
+    MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS,
     MINERU_WINDOWS_COLLECTOR_PATH,
 )
 from disclosure_anchor.adapters.runtime.mineru_phase_trace_capture import (
@@ -64,9 +65,18 @@ def _utc(value: object, *, label: str) -> datetime:
     return parsed
 
 
+def _safe_staged_timeout(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and value >= MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS
+    )
+
+
 def _receipt_identity(
     receipt: object,
 ) -> tuple[datetime, datetime, str, str, str, int, int]:
+    safety_limits = receipt.get("safety_limits") if isinstance(receipt, dict) else None
     if (
         not isinstance(receipt, dict)
         or receipt.get("schema") != "mineru_staged_load_receipt.v6"
@@ -76,6 +86,21 @@ def _receipt_identity(
         or receipt.get("database_access") != "none"
         or receipt.get("queue_access") != "none"
         or receipt.get("fixed_stage_document_counts") != list(_STAGE_COUNTS)
+        or not isinstance(safety_limits, dict)
+        or set(safety_limits)
+        != {
+            "profile",
+            "document_runaway_timeout_seconds",
+            "api_drain_timeout_seconds",
+        }
+        or safety_limits.get("profile")
+        != "whole-document-runaway-and-drain.v1"
+        or not _safe_staged_timeout(
+            safety_limits.get("document_runaway_timeout_seconds")
+        )
+        or not _safe_staged_timeout(
+            safety_limits.get("api_drain_timeout_seconds")
+        )
     ):
         raise ValueError("staged-load receipt is not PASS")
     started = _utc(receipt.get("started_at_utc"), label="staged-load start")

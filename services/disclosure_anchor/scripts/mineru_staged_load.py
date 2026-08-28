@@ -45,6 +45,7 @@ from disclosure_anchor.adapters.runtime.mineru_canary import (
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_INFERENCE_MAX_CONCURRENCY,
     MINERU_PROCESSING_WINDOW_SIZE,
+    MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS,
     MINERU_WINDOWS_COLLECTOR_PATH,
     client_bundle_identity,
     verify_runtime_manifest_payload,
@@ -74,6 +75,7 @@ ORCHESTRATOR_OBSERVER_PROFILE = "orchestrator-observer.v1"
 TASK_REGISTRY_SEMANTICS = "retained-terminal-gauges.v1"
 STAGE_DOCUMENT_COUNTS = (4, 8, 16)
 ORCHESTRATOR_INFERENCE_CONCURRENCY = MINERU_API_INFERENCE_MAX_CONCURRENCY
+SAFETY_LIMITS_PROFILE = "whole-document-runaway-and-drain.v1"
 MINIMUM_INPUT_PAGES = 7
 MINIMUM_CORPUS_DOCUMENTS = 16
 CORPUS_SCHEMA = "mineru_staged_corpus.v1"
@@ -1563,7 +1565,8 @@ def _run_stage(
     api_url: str,
     inference_upstream_url: str,
     runtime_identity: str,
-    timeout_seconds: int,
+    document_runaway_timeout_seconds: int,
+    api_drain_timeout_seconds: int,
     expected_preemptions: float,
     metrics_sampler: Callable[[], MetricsSample],
     orchestrator_sampler: Callable[[], MinerUOrchestratorHealth],
@@ -1686,7 +1689,10 @@ def _run_stage(
                         api_url=api_url,
                         inference_upstream_url=inference_upstream_url,
                         runtime_identity=runtime_identity,
-                        timeout_seconds=timeout_seconds,
+                        document_runaway_timeout_seconds=(
+                            document_runaway_timeout_seconds
+                        ),
+                        api_drain_timeout_seconds=api_drain_timeout_seconds,
                     ): index
                     for index, stage_input in enumerate(stage_inputs, start=1)
                 }
@@ -2016,7 +2022,8 @@ def _parse_admitted_copy(
     api_url: str,
     inference_upstream_url: str,
     runtime_identity: str,
-    timeout_seconds: int,
+    document_runaway_timeout_seconds: int,
+    api_drain_timeout_seconds: int,
 ) -> dict[str, Any]:
     outcome = admission.run(
         copy_index=copy_index,
@@ -2032,7 +2039,10 @@ def _parse_admitted_copy(
             api_url=api_url,
             inference_upstream_url=inference_upstream_url,
             runtime_identity=runtime_identity,
-            timeout_seconds=timeout_seconds,
+            document_runaway_timeout_seconds=(
+                document_runaway_timeout_seconds
+            ),
+            api_drain_timeout_seconds=api_drain_timeout_seconds,
         ),
     )
     outcome["workload_class"] = workload_class
@@ -2050,7 +2060,8 @@ def _parse_frozen_copy(
     api_url: str,
     inference_upstream_url: str,
     runtime_identity: str,
-    timeout_seconds: int,
+    document_runaway_timeout_seconds: int,
+    api_drain_timeout_seconds: int,
 ) -> dict[str, Any]:
     started = time.monotonic()
     document_root = stage_root / f"copy-{copy_index:02d}"
@@ -2078,9 +2089,9 @@ def _parse_frozen_copy(
             input_pdf=source,
             output_dir=document_root / "output",
             options=ParserOptions(
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=document_runaway_timeout_seconds,
                 api_url=api_url,
-                api_drain_timeout_seconds=timeout_seconds,
+                api_drain_timeout_seconds=api_drain_timeout_seconds,
                 server_url=inference_upstream_url,
                 http_request_concurrency=None,
                 runtime_bundle_identity_sha256=runtime_identity,
@@ -2151,6 +2162,8 @@ def _failed_document_outcome(
 def _classify_failure(detail: str) -> str:
     lowered = detail.lower()
     markers = (
+        ("parsertaskdeadlineerror", "task_deadline"),
+        ("task deadline exceeded", "task_deadline"),
         ("429", "overload_429"),
         ("resource_exhausted", "overload_resource_exhausted"),
         ("overload", "overload"),
@@ -2487,7 +2500,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--inference-upstream-url")
     parser.add_argument("--runtime-bundle-identity")
     parser.add_argument("--work-root", type=Path)
-    parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument(
+        "--document-runaway-timeout-seconds",
+        type=int,
+        default=MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS,
+    )
+    parser.add_argument(
+        "--api-drain-timeout-seconds",
+        type=int,
+        default=MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS,
+    )
     parser.add_argument("--host-observer-ssh-host")
     parser.add_argument("--host-observer-ssh-user")
     parser.add_argument("--host-observer-ssh-port", type=int, default=22)
@@ -2529,8 +2551,20 @@ def _resolve_staged_preflight(
         raise ValueError("runtime bundle identity is missing or invalid")
     if args.work_root is not None and not args.work_root.is_dir():
         raise ValueError(f"work-root is not a directory: {args.work_root}")
-    if args.timeout_seconds < 1:
-        raise ValueError("timeout-seconds must be positive")
+    if (
+        args.document_runaway_timeout_seconds
+        < MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS
+    ):
+        raise ValueError(
+            "document-runaway-timeout-seconds is below the formal safety minimum"
+        )
+    if (
+        args.api_drain_timeout_seconds
+        < MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS
+    ):
+        raise ValueError(
+            "api-drain-timeout-seconds is below the formal safety minimum"
+        )
     if (
         not args.host_observer_ssh_host
         or not args.host_observer_ssh_user
@@ -2724,7 +2758,10 @@ def main(argv: list[str] | None = None) -> int:
                     api_url=api_url,
                     inference_upstream_url=inference_upstream_url,
                     runtime_identity=str(runtime_identity),
-                    timeout_seconds=args.timeout_seconds,
+                    document_runaway_timeout_seconds=(
+                        args.document_runaway_timeout_seconds
+                    ),
+                    api_drain_timeout_seconds=args.api_drain_timeout_seconds,
                     task_slots=task_slots,
                     expected_preemptions=global_metrics_baseline.preemptions,
                     metrics_sampler=lambda: fetch_vllm_metrics(observability_url),
@@ -2740,7 +2777,7 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     orchestrator_idle_waiter=lambda: wait_for_mineru_orchestrator_idle(
                         api_url,
-                        timeout_seconds=args.timeout_seconds,
+                        timeout_seconds=args.api_drain_timeout_seconds,
                         expected_task_slots=task_slots,
                         expected_task_retention_seconds=(
                             expected_task_retention_seconds
@@ -2839,6 +2876,13 @@ def main(argv: list[str] | None = None) -> int:
             if task_slots is not None
             else None
         ),
+        "safety_limits": {
+            "profile": SAFETY_LIMITS_PROFILE,
+            "document_runaway_timeout_seconds": (
+                args.document_runaway_timeout_seconds
+            ),
+            "api_drain_timeout_seconds": args.api_drain_timeout_seconds,
+        },
         "input": corpus_evidence,
         "identity": identity_payload,
         "host_capacity": host_capacity_evidence,

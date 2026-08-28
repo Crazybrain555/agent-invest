@@ -149,6 +149,9 @@ duty、waiting/KV 只用于定位瓶颈。任何 OOM、restart、preemption、ho
 
 四个 arm 必须使用同一 frozen heterogeneous corpus、同一顺序、同一 node/model/client/writer、
 同一 API image 和稳定 proxy/vLLM epoch：A1 legacy → B1 candidate → B2 candidate → A2 legacy。
+四份 staged receipt 还必须绑定同一 `whole-document-runaway-and-drain.v1` safety limits；document
+runaway 与 API drain 均不得低于 86400s。它们只防 live-but-never-return/无法证明 drain，不参与候选
+吞吐调参；任何缺失、缩短或 arm 间漂移都在算 throughput 前 fail closed。
 兼容镜像的重复本机构建显式关闭 BuildKit provenance attestation；源码、base digest、Dockerfile/patcher
 hash、镜像 labels/marker 和 live runtime attestation 仍逐次校验。原因是 provenance manifest 带执行期
 元数据，会让相同业务 manifest/config 的外层 OCI index digest 跨构建漂移。该项只硬化首次构建，

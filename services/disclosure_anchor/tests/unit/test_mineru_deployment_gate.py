@@ -279,6 +279,11 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "orchestrator_task_concurrency": 1,
             "orchestrator_inference_concurrency": 7,
             "effective_inference_request_upper_bound": 7,
+            "safety_limits": {
+                "profile": "whole-document-runaway-and-drain.v1",
+                "document_runaway_timeout_seconds": 86400,
+                "api_drain_timeout_seconds": 86400,
+            },
             "input": {
                 "profile": "operator_frozen_heterogeneous_v2",
                 "logical_name": "real-corpus.json",
@@ -725,6 +730,43 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 self.assertRaisesRegex(MinerUDeploymentGateError, "not PASS"),
             ):
                 require_mineru_deployment_gate(settings)
+
+    def test_staged_rejects_missing_or_drifted_safety_limits(self) -> None:
+        for tamper in (
+            "missing",
+            "short_document",
+            "short_drain",
+            "different",
+        ):
+            with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as tmp:
+                settings, _, _, client = self._fixture(
+                    Path(tmp), passed_at=datetime.now(UTC)
+                )
+                staged_path = settings.disclosure_mineru_staged_load_receipt
+                assert staged_path is not None
+                staged = json.loads(staged_path.read_text(encoding="utf-8"))
+                if tamper == "missing":
+                    staged.pop("safety_limits")
+                elif tamper == "short_document":
+                    staged["safety_limits"][
+                        "document_runaway_timeout_seconds"
+                    ] = 1800
+                elif tamper == "short_drain":
+                    staged["safety_limits"]["api_drain_timeout_seconds"] = 1800
+                else:
+                    staged["safety_limits"]["api_drain_timeout_seconds"] = 172800
+                staged_path.write_text(json.dumps(staged), encoding="utf-8")
+                staged_path.chmod(0o600)
+                client_patch, code_patch = self._identity_patches(client)
+                with (
+                    client_patch,
+                    code_patch,
+                    self.assertRaisesRegex(
+                        MinerUDeploymentGateError,
+                        "safety limits drifted",
+                    ),
+                ):
+                    require_mineru_deployment_gate(settings)
 
     def test_staged_api_retained_gauges_may_change_between_stages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

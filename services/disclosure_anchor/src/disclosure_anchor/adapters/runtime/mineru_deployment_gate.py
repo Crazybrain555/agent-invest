@@ -31,6 +31,7 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_PROCESSING_WINDOW_SIZE,
     MINERU_SMOKE_INPUT_NAME,
     MINERU_SMOKE_INPUT_SHA256,
+    MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS,
     client_bundle_identity,
     verify_runtime_manifest_payload,
     writer_code_digest,
@@ -52,6 +53,7 @@ _RECEIPT_SCHEMA = "mineru_smoke_receipt.v4"
 _STAGED_LOAD_RECEIPT_SCHEMA = "mineru_staged_load_receipt.v6"
 _STAGED_LOAD_RECEIPT_SCHEMA_VERSION = 6
 _STAGED_LOAD_ADMISSION_PROFILE = "copy-index-fifo.v1"
+_STAGED_LOAD_SAFETY_LIMITS_PROFILE = "whole-document-runaway-and-drain.v1"
 _TASK_REGISTRY_SEMANTICS = "retained-terminal-gauges.v1"
 _DEPLOYMENT_INPUT_PROFILE = "deployment_frozen_v1"
 _STAGED_LOAD_INPUT_PROFILE = "operator_frozen_heterogeneous_v2"
@@ -566,6 +568,12 @@ def verify_mineru_deployment_gate(
         max_age_seconds=settings.disclosure_mineru_canary_max_age_seconds,
         expected_input_sha256=staged_input_sha256,
         task_slots=settings.disclosure_mineru_api_task_slots,
+        expected_document_runaway_timeout_seconds=(
+            settings.disclosure_parse_runaway_timeout_seconds
+        ),
+        expected_api_drain_timeout_seconds=(
+            settings.disclosure_mineru_api_drain_timeout_seconds
+        ),
         expected_host_identity=host_identity,
     )
     first_staged_finished = _required_aware_timestamp(
@@ -586,6 +594,12 @@ def verify_mineru_deployment_gate(
         expected_input=first_staged_input,
         expected_input_sha256=staged_input_sha256,
         task_slots=settings.disclosure_mineru_api_task_slots,
+        expected_document_runaway_timeout_seconds=(
+            settings.disclosure_parse_runaway_timeout_seconds
+        ),
+        expected_api_drain_timeout_seconds=(
+            settings.disclosure_mineru_api_drain_timeout_seconds
+        ),
         expected_host_identity=host_identity,
         expected_host_epochs=first_host_epochs,
     )
@@ -707,6 +721,8 @@ def _verify_staged_load_receipt(
     expected_input_sha256: str,
     expected_input: dict[str, object] | None = None,
     task_slots: int,
+    expected_document_runaway_timeout_seconds: int,
+    expected_api_drain_timeout_seconds: int,
     expected_host_identity: dict[str, object],
     expected_host_epochs: dict[str, tuple[str, str]] | None = None,
 ) -> tuple[
@@ -717,6 +733,22 @@ def _verify_staged_load_receipt(
     effective_inference_request_upper_bound = (
         task_slots * MINERU_API_INFERENCE_MAX_CONCURRENCY
     )
+    if (
+        expected_document_runaway_timeout_seconds
+        < MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS
+        or expected_api_drain_timeout_seconds
+        < MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS
+    ):
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load configured safety limit is below policy"
+        )
+    expected_safety_limits = {
+        "profile": _STAGED_LOAD_SAFETY_LIMITS_PROFILE,
+        "document_runaway_timeout_seconds": (
+            expected_document_runaway_timeout_seconds
+        ),
+        "api_drain_timeout_seconds": expected_api_drain_timeout_seconds,
+    }
     if receipt.get("schema") == "mineru_staged_load_receipt.v4":
         raise MinerUDeploymentGateError(
             "legacy cumulative-gauge staged-load receipt; regenerate under "
@@ -755,6 +787,10 @@ def _verify_staged_load_receipt(
     ):
         raise MinerUDeploymentGateError(
             "MinerU staged-load identity or endpoint drifted"
+        )
+    if receipt.get("safety_limits") != expected_safety_limits:
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load safety limits drifted"
         )
 
     input_evidence = receipt.get("input")

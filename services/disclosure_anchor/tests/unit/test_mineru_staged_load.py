@@ -1398,7 +1398,8 @@ vllm:gpu_cache_usage_perc 0.5
                     api_url="http://unused-api",
                     inference_upstream_url="http://unused-upstream/v1",
                     runtime_identity="sha256:" + "a" * 64,
-                    timeout_seconds=1,
+                    document_runaway_timeout_seconds=1,
+                    api_drain_timeout_seconds=1,
                     expected_preemptions=0,
                     metrics_sampler=sample,
                     orchestrator_sampler=lambda: self._health(),
@@ -1418,7 +1419,8 @@ vllm:gpu_cache_usage_perc 0.5
                 api_url="http://unused-api",
                 inference_upstream_url="http://unused-upstream/v1",
                 runtime_identity="sha256:" + "a" * 64,
-                timeout_seconds=1,
+                document_runaway_timeout_seconds=1,
+                api_drain_timeout_seconds=1,
                 expected_preemptions=3,
                 metrics_sampler=lambda: staged.MetricsSample(0, 0, 0, 4, 0),
                 orchestrator_sampler=lambda: health,
@@ -1474,7 +1476,8 @@ vllm:gpu_cache_usage_perc 0.5
                     api_url="http://127.0.0.1:30000",
                     inference_upstream_url="http://mineru-vllm:30000/v1",
                     runtime_identity="sha256:" + "a" * 64,
-                    timeout_seconds=30,
+                    document_runaway_timeout_seconds=30,
+                    api_drain_timeout_seconds=30,
                 )
 
         self.assertEqual(result["status"], "pass")
@@ -1517,7 +1520,8 @@ vllm:gpu_cache_usage_perc 0.5
                 api_url="http://127.0.0.1:30000",
                 inference_upstream_url="http://mineru-vllm:30000/v1",
                 runtime_identity="sha256:" + "a" * 64,
-                timeout_seconds=30,
+                document_runaway_timeout_seconds=30,
+                api_drain_timeout_seconds=30,
             )
 
         self.assertEqual(result["status"], "fail")
@@ -1555,6 +1559,52 @@ vllm:gpu_cache_usage_perc 0.5
             outcome["failure_detail_sha256"],
             r"^sha256:[a-f0-9]{64}$",
         )
+
+    def test_task_deadline_has_exact_failure_class(self) -> None:
+        outcome = staged._failed_document_outcome(
+            1,
+            "a" * 64,
+            RuntimeError("ParserTaskDeadlineError: MinerU task deadline exceeded"),
+        )
+
+        self.assertEqual(outcome["failure_class"], "task_deadline")
+
+    def test_formal_preflight_rejects_short_liveness_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mineru = root / "mineru"
+            mineru.write_text("executable", encoding="utf-8")
+            common = {
+                "mineru_bin": mineru,
+                "api_url": "http://127.0.0.1:30000",
+                "observability_url": "http://127.0.0.1:30002/v1",
+                "inference_upstream_url": "http://mineru-vllm:30000/v1",
+                "runtime_bundle_identity": "sha256:" + "a" * 64,
+                "work_root": root,
+                "host_observer_ssh_host": "host",
+                "host_observer_ssh_user": "operator",
+                "host_observer_identity_file": root / "identity",
+                "host_observer_known_hosts_file": root / "known-hosts",
+                "docker_memory_reserve_bytes": 1024,
+                "corpus_manifest": root / "corpus.json",
+                "expected_corpus_sha256": "sha256:" + "b" * 64,
+            }
+            for field in (
+                "document_runaway_timeout_seconds",
+                "api_drain_timeout_seconds",
+            ):
+                values = {
+                    "document_runaway_timeout_seconds": 86400,
+                    "api_drain_timeout_seconds": 86400,
+                }
+                values[field] = 86399
+                with self.subTest(field=field), self.assertRaisesRegex(
+                    ValueError,
+                    "below the formal safety minimum",
+                ):
+                    staged._resolve_staged_preflight(
+                        SimpleNamespace(**common, **values)
+                    )
 
     def test_stage_receipt_finalizes_every_future_after_abort(self) -> None:
         release = threading.Event()
@@ -1601,7 +1651,8 @@ vllm:gpu_cache_usage_perc 0.5
                 api_url="http://unused-api",
                 inference_upstream_url="http://unused-upstream/v1",
                 runtime_identity="sha256:" + "a" * 64,
-                timeout_seconds=1,
+                document_runaway_timeout_seconds=1,
+                api_drain_timeout_seconds=1,
                 expected_preemptions=0,
                 metrics_sampler=lambda: metrics,
                 orchestrator_sampler=lambda: health,
@@ -1705,7 +1756,8 @@ vllm:gpu_cache_usage_perc 0.5
                 api_url="http://unused-api",
                 inference_upstream_url="http://unused-upstream/v1",
                 runtime_identity="sha256:" + "a" * 64,
-                timeout_seconds=1,
+                document_runaway_timeout_seconds=1,
+                api_drain_timeout_seconds=1,
                 expected_preemptions=0,
                 metrics_sampler=lambda: baseline,
                 orchestrator_sampler=lambda: health,
@@ -1820,7 +1872,8 @@ vllm:gpu_cache_usage_perc 0.5
                 api_url="http://unused-api",
                 inference_upstream_url="http://unused-upstream/v1",
                 runtime_identity="sha256:" + "a" * 64,
-                timeout_seconds=1,
+                document_runaway_timeout_seconds=1,
+                api_drain_timeout_seconds=1,
                 expected_preemptions=0,
                 metrics_sampler=lambda: metrics,
                 orchestrator_sampler=lambda: active_health,
@@ -1919,7 +1972,8 @@ vllm:gpu_cache_usage_perc 0.5
                 api_url="http://unused-api",
                 inference_upstream_url="http://unused-upstream/v1",
                 runtime_identity="sha256:" + "a" * 64,
-                timeout_seconds=1,
+                document_runaway_timeout_seconds=1,
+                api_drain_timeout_seconds=1,
                 expected_preemptions=0,
                 metrics_sampler=lambda: metrics,
                 orchestrator_sampler=lambda: health,
@@ -2034,7 +2088,8 @@ vllm:gpu_cache_usage_perc 0.5
                 api_url="http://unused-api",
                 inference_upstream_url="http://unused-upstream/v1",
                 runtime_identity="sha256:" + "a" * 64,
-                timeout_seconds=1,
+                document_runaway_timeout_seconds=1,
+                api_drain_timeout_seconds=1,
                 expected_preemptions=0,
                 metrics_sampler=lambda: metrics,
                 orchestrator_sampler=lambda: health,
@@ -2090,7 +2145,8 @@ vllm:gpu_cache_usage_perc 0.5
                 api_url="http://unused-api",
                 inference_upstream_url="http://unused-upstream/v1",
                 runtime_identity="sha256:" + "a" * 64,
-                timeout_seconds=1,
+                document_runaway_timeout_seconds=1,
+                api_drain_timeout_seconds=1,
                 expected_preemptions=0,
                 metrics_sampler=lambda: metrics,
                 orchestrator_sampler=lambda: active_health,
@@ -2430,6 +2486,11 @@ vllm:gpu_cache_usage_perc 0.5
             self.assertEqual(run_stage.call_count, 3)
             self.assertEqual(first_call["api_url"], api_url)
             self.assertEqual(
+                first_call["document_runaway_timeout_seconds"],
+                86400,
+            )
+            self.assertEqual(first_call["api_drain_timeout_seconds"], 86400)
+            self.assertEqual(
                 first_call["inference_upstream_url"],
                 inference_upstream_url,
             )
@@ -2461,6 +2522,7 @@ vllm:gpu_cache_usage_perc 0.5
                     "expected_cleanup_interval_seconds": 30,
                 },
             )
+            self.assertEqual(idle_waiter.call_args.kwargs["timeout_seconds"], 86400)
             payload = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "pass")
             self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v6")
@@ -2485,6 +2547,14 @@ vllm:gpu_cache_usage_perc 0.5
             self.assertEqual(
                 payload["effective_inference_request_upper_bound"],
                 7,
+            )
+            self.assertEqual(
+                payload["safety_limits"],
+                {
+                    "profile": "whole-document-runaway-and-drain.v1",
+                    "document_runaway_timeout_seconds": 86400,
+                    "api_drain_timeout_seconds": 86400,
+                },
             )
 
 

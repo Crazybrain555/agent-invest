@@ -35,6 +35,11 @@ def _receipt() -> dict[str, object]:
         "database_access": "none",
         "queue_access": "none",
         "fixed_stage_document_counts": [4, 8, 16],
+        "safety_limits": {
+            "profile": "whole-document-runaway-and-drain.v1",
+            "document_runaway_timeout_seconds": 86400,
+            "api_drain_timeout_seconds": 86400,
+        },
         "started_at_utc": "2026-08-27T01:00:00+00:00",
         "finished_at_utc": "2026-08-27T01:30:00+00:00",
         "host_capacity": {
@@ -104,6 +109,23 @@ class CollectMineruPhaseTraceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "epoch changed"):
             _receipt_identity(receipt)
+
+    def test_receipt_identity_rejects_unbound_or_short_safety_limits(self) -> None:
+        for tamper in ("missing", "short_document", "short_drain"):
+            receipt = deepcopy(_receipt())
+            if tamper == "missing":
+                receipt.pop("safety_limits")
+            elif tamper == "short_document":
+                receipt["safety_limits"][
+                    "document_runaway_timeout_seconds"
+                ] = 1800
+            else:
+                receipt["safety_limits"]["api_drain_timeout_seconds"] = 1800
+            with self.subTest(tamper=tamper), self.assertRaisesRegex(
+                ValueError,
+                "not PASS",
+            ):
+                _receipt_identity(receipt)
 
 
 if __name__ == "__main__":
