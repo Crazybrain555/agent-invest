@@ -2,13 +2,14 @@
 
 ## 1. 决议
 
-当前只实现 **Observation v1**：在已经 commissioned 的 MinerU `1 task × inner 7` 外侧，旁路、
-只读地观察 API、vLLM、GPU exporter 和 Windows/Docker host。它不接数据库、不读取文档内容、
-不改变 worker admission，也没有选择、推荐或激活配置的权限。
+**Observation v1 本身仍是纯旁路**：在 MinerU 外侧只读观察 API、vLLM、GPU exporter 和
+Windows/Docker host。它不接数据库、不读取文档内容、不改变 worker admission，也没有选择、推荐
+或激活配置的权限。
 
-当前明确不做：DB backlog/page sampler、业务 pages/hour、phase/overlap 归因、Advisor、capacity
-profile、selector、actuator、AIMD/PID 或任何 live knob mutation。现有 `1×7`、window 16、
-`max_num_seqs=128` 和 runtime bundle v5 身份不因本功能改变。
+另有一条与 Observation 严格分离、默认关闭的 **Capacity Pipeline / Commissioning** 路径，见
+§5。它只在受控试验中打开 content-free phase trace 和候选 profile；不会把 Observation receipt
+变成 actuator，也不做 AIMD/PID 或运行中文件/环境变量 mutation。生产当前 `1×7`、window 16、
+`max_num_seqs=128` 仍须由 exact runtime bundle 身份证明；候选没有通过 A-B-B-A 就不能进入 Auto。
 
 这样收窄有五个事实依据：
 
@@ -93,7 +94,7 @@ Observer failure 只拒绝 observation evidence，不能停止 worker、MinerU �
 
 首个真实资格顺序：
 
-1. 当前 v5 `1×7` 不变，observer 旁路运行；
+1. 当前 v6 `1×7` 不变，observer 旁路运行；
 2. 完成 resident baseline，`make capacity-verify ... REQUIRE_COMPLETE=YES`；
 3. 本地与独立 reviewer 从 raw 重算 interval/run 一致；
 4. 再依据 baseline variance 决定是否值得新增 phase event 或离线 Advisor。
@@ -101,3 +102,107 @@ Observer failure 只拒绝 observation evidence，不能停止 worker、MinerU �
 24h、候选 token budget、1×8、双 task/global 7 与收益阈值都不能在 baseline 之前写成假精确门槛。
 raw evidence 默认至少保留到独立复算结束；baseline/experiment 建议保留 30 天。清理必须是显式 operator
 动作，Observation/worker 不自动 prune。
+
+## 5. Capacity Pipeline 与离线 Auto commissioning
+
+### 5.1 借鉴边界
+
+本实现复用了成熟系统的机制，而不引入它们的 control plane：
+
+- [PaddleOCR-VL/PaddleX](https://paddlepaddle.github.io/PaddleX/3.5/en/pipeline_usage/tutorials/ocr_pipelines/PaddleOCR-VL.html)
+  的 `use_queues` 将 PDF 渲染、layout 与 VLM 分阶段异步执行；本地对应 A(render/layout) →
+  B(vLLM) → C(postprocess/append)，但仍是单进程、同文档、有序提交；
+- [NVIDIA DALI](https://docs.nvidia.com/deeplearning/dali/main-user-guide/docs/advanced_topics_performance_tuning.html)
+  默认 shallow prefetch depth=2，并明确指出加深队列会增加内存；本地固定 depth=1、最多两个
+  resident window，只用实际可测的 decoded bytes 和 page credits，不伪造 working-memory 精度；
+- [Ray Data](https://docs.ray.io/en/latest/data/data-internals.html) 的就绪/背压思想映射为
+  C→B→A 的释放优先级和原子 credits；不新增第二 durable queue；
+- [Triton Model Analyzer](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/model_analyzer/README.html)
+  的 constrained configuration search 映射为冻结语料 A-B-B-A；本地不做 live hill-climb；
+- vLLM 继续拥有 GPU request continuous batching，文档 pipeline 不实现第二个 GPU batcher。
+
+因此优化目标不是瞬时 GPU 100%，而是安全条件下的 verified pages/host-hour；VLM supply gap、GPU
+duty、waiting/KV 只用于定位瓶颈。任何 OOM、restart、preemption、host reserve crossing、结果 hash
+变化、trace/fallback 缺口都会先否决候选。
+
+### 5.2 运行时不变量
+
+- `MINERU_CAPACITY_MODE` 只接受 `legacy|candidate|auto`；正常构建默认 `legacy`；
+- profile 是 canonical `mineru-execution-profile.v2`，hash 绑定 window、depth、resident pages、
+  source/document envelope、inner concurrency 与 vLLM capacity；文档 admission 后不可变；
+- `candidate` 只用于受控试验；profile 本身不携带自声明授权位。`auto` 只接纳 canonical
+  `mineru-capacity-catalog.v1` 精确绑定 profile、COMMISSION receipt/evaluator 与当前 runtime
+  compatibility fingerprint 的文档，其余配置缺失或漂移一律 fail closed；
+- commissioning receipt 闭合 exact evaluation、8 份 arm 输入 hash、collector identity 与当前 evaluator
+  bundle；bundle 机械哈希 CLI、staged-load、phase capture、commissioning、deployment gate 和 identity
+  的 9 个源文件。catalog builder 会从当前字节重算 bundle 并要求完全相等，防止旧 evaluator receipt
+  在代码漂移后继续授权；这是一条 trusted-operator 的 reproducibility gate，不冒充对有本机写权限者的
+  密码学签名；
+- Auto 候选只有在首个可观察 append 之前、所有 task/owner/credits 已 drain 时才可整文档回退一次；
+  append boundary 原子关闭后任何错误都 fail-visible，绝不混合 candidate/legacy 输出；
+- phase trace 禁止路径、PDF hash、文档 ID 和内容，只记录 opaque process/trace identity、页面范围、
+  profile hash、单调区间与 decoded-credit 证据；完整 DAG 必须绑定外部 attested profile hash；
+- host memory 安全由外部 5 秒 Docker/cgroup observer 和 reserve 硬门证明。内部没有可验证的实际
+  working-set 数值，所以不输出一个由 page 数估算的“observed working bytes”。
+
+### 5.3 A-B-B-A 机械晋升
+
+四个 arm 必须使用同一 frozen heterogeneous corpus、同一顺序、同一 node/model/client/writer、
+同一 API image 和稳定 proxy/vLLM epoch：A1 legacy → B1 candidate → B2 candidate → A2 legacy。
+兼容镜像的重复本机构建显式关闭 BuildKit provenance attestation；源码、base digest、Dockerfile/patcher
+hash、镜像 labels/marker 和 live runtime attestation 仍逐次校验。原因是 provenance manifest 带执行期
+元数据，会让相同业务 manifest/config 的外层 OCI index digest 跨构建漂移。该项只硬化首次构建，
+不替代 campaign identity：A1 前必须外部冻结完整 API image ID；所有 arm 切换显式传入该 ID，安装器
+复用正式 tag、禁止 build/tag/image-rm，只以 `--no-build --no-deps --force-recreate mineru-api` 定向重建
+API，并在前后机械证明 proxy/vLLM 的 container ID、StartedAt 和 image ID 完全不变。
+每个 arm 运行既有 `make mineru-staged-load`，随后用对应 receipt 的 UTC/host epoch 只采集严格
+`MINERU_PHASE_TRACE ` 行：
+
+```bash
+make mineru-phase-trace-capture \
+  STAGED_RECEIPT=/private/arm.json CAPACITY_MODE=candidate \
+  PROFILE_SHA256=sha256:<profile> CAPTURE=/private/arm.trace.json \
+  SSH_HOST=<pinned-host> SSH_USER=<operator-user> \
+  SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts
+```
+
+采集器在 Windows 先过滤日志，再传回 Mac；非 trace 日志不会进入 evidence。它限制 6 小时、
+100,000 行、64 MiB，绑定 collector hash、node、container ID/start/restart/OOM、capacity mode 和
+profile hash，并在落盘前复算每个 document DAG、overlap、document/page conservation。
+
+四组完成后运行：
+
+```bash
+make capacity-commission \
+  A1_RECEIPT=/private/a1.json A1_CAPTURE=/private/a1.trace.json \
+  B1_RECEIPT=/private/b1.json B1_CAPTURE=/private/b1.trace.json \
+  B2_RECEIPT=/private/b2.json B2_CAPTURE=/private/b2.trace.json \
+  A2_RECEIPT=/private/a2.json A2_CAPTURE=/private/a2.trace.json \
+  LEGACY_PROFILE_SHA256=sha256:<legacy> \
+  CANDIDATE_PROFILE_SHA256=sha256:<candidate> \
+  WINDOWS_NODE_IDENTITY_SHA256=sha256:<node> \
+  DOCKER_MEMORY_RESERVE_BYTES=7516192768 \
+  MINIMUM_IMPROVEMENT_BASIS_POINTS=500 \
+  MAXIMUM_REPEAT_SPREAD_BASIS_POINTS=300 \
+  RECEIPT=/private/new-capacity-commissioning.json
+```
+
+本机本轮在 A1 前预声明 `minimum improvement=500 bps`、`maximum within-mode repeat spread=300 bps`；
+值进入 v2 receipt，不能看完结果后降低。机械式同时要求 `min(B1,B2)>max(A1,A2)`、候选相对收益
+至少达到 500 bps、A 与 B 各自重复离散都不超过 300 bps，而且候选绝对收益必须大于 A/B 两组中
+较大的实测重复噪声。分母直接使用已验证的 UTC span；receipt 的 monotonic elapsed 与该 span 必须在
+50 ms 内一致，否则 STOP。速率用 decimal/fixed-point 计算，避免容差制造假收益或跨运行时浮点漂移。
+
+四 arm 必须从 UTC 证明真实、非重叠的 A1→B1→B2→A2 顺序；source identity、page count、block
+count 逐项相等，28 个 staged documents 与 trace 页数守恒。每次 provider bundle SHA 必须自身合法并
+留证，但 bundle 容器可含执行期 provenance，不能要求跨执行字节相等。本 RTX 5080 policy 还显式
+绑定 7 GiB Docker reserve 与 versioned collector path/hash；commissioning 复用完整 host verifier，
+重算 5 s cadence、15 s max gap、UTC/observed seconds、VM total、summary、epoch、OOM/restart 与 reserve。
+metrics 必须没有 sampling gap/preemption，并满足 waiting peak<32、waiting p95≤10、KV peak<0.90、
+terminal drain≤120 s。API completed/failed 是 600 s retained terminal gauges，只验证 exact range、两端
+idle、真实 processing activity 与 drain，绝不把它们误作累计任务 delta；逐文档 PASS 才是完成证明。
+
+输出 `profile_commissioning_authorized=true` 只允许 operator 用 `make capacity-catalog` 生成一个
+new-only、canonical、hash-bound catalog；它不自动改 compose、不重启服务、不启动 worker。Auto
+仍需把 catalog 从版本化 Windows runtime 路径只读挂载、重新 exact runtime v6 attestation，并通过
+fallback/cancellation smoke。

@@ -1,4 +1,4 @@
-"""Build a v5 manifest from a live, pinned-SSH Windows observation."""
+"""Build a v6 manifest from a live, pinned-SSH Windows observation."""
 
 from __future__ import annotations
 
@@ -41,8 +41,9 @@ EXPECTED_REPO_DIGEST = (
 EXPECTED_IMAGE_ID = (
     "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458"
 )
-EXPECTED_API_COMPAT_IMAGE = "agent-invest/mineru-api:3.4.4-heap-return-v1"
-EXPECTED_COMPAT_MARKER_SCHEMA = "mineru-heap-return-compatibility.v1"
+EXPECTED_API_COMPAT_IMAGE = "agent-invest/mineru-api:3.4.4-capacity-v1"
+EXPECTED_COMPAT_MARKER_SCHEMA = "mineru-runtime-compatibility.v2"
+EXPECTED_CAPACITY_POLICY = "bounded-two-window-capacity-pipeline.v2"
 EXPECTED_COMPAT_PREIMAGES = {
     "mineru/backend/vlm/vlm_analyze.py": (
         "sha256:0fadf7a94ae702861b4a1fa7f42358c6687cfc63fbe322c004fb1d3248658390"
@@ -56,13 +57,20 @@ EXPECTED_COMPAT_PREIMAGES = {
 }
 COMPAT_LABEL_KEYS = {
     "io.agent-invest.mineru.base-image-digest",
+    "io.agent-invest.mineru.capacity-policy",
     "io.agent-invest.mineru.compatibility-policy",
     "io.agent-invest.mineru.compatibility-patcher-sha256",
     "io.agent-invest.mineru.compatibility-dockerfile-sha256",
 }
 API_ENV_KEYS = {
+    "MINERU_CAPACITY_CATALOG_PATH",
+    "MINERU_CAPACITY_CATALOG_SHA256",
+    "MINERU_CAPACITY_MODE",
+    "MINERU_CAPACITY_PROFILE_JSON",
+    "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256",
     "MINERU_MODEL_SOURCE",
     "MINERU_MALLOC_TRIM",
+    "MINERU_PHASE_TRACE",
     "MINERU_API_MAX_CONCURRENT_REQUESTS",
     "MINERU_PROCESSING_WINDOW_SIZE",
     "MINERU_API_OUTPUT_ROOT",
@@ -96,6 +104,9 @@ EXPECTED_INFERENCE_COMMAND = [
 EXPECTED_COMPOSE_PATH = MINERU_WINDOWS_COMPOSE_PATH
 EXPECTED_COLLECTOR_PATH = MINERU_WINDOWS_COLLECTOR_PATH
 EXPECTED_OUTPUT_ROOT = r"C:\ProgramData\agent-invest\mineru-api-output"
+EXPECTED_CAPACITY_CATALOG_SOURCE = (
+    r"C:\ProgramData\agent-invest\mineru-runtime-v6\mineru-capacity-catalog.v1.json"
+)
 EXPECTED_MODEL_REPOSITORY = "opendatalab/MinerU2.5-Pro-2605-1.2B"
 EXPECTED_MODEL_REVISION = "bff20d4ae2bf202df9f45284b4d43681555a97ed"
 EXPECTED_PROXY_CODE_SHA256 = (
@@ -104,6 +115,20 @@ EXPECTED_PROXY_CODE_SHA256 = (
 SSH_HOST_RE = re.compile(r"^(?!-)[A-Za-z0-9.-]+$")
 SSH_USER_RE = re.compile(r"^(?!-)[A-Za-z0-9_.-]+$")
 SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
+CAPACITY_PROFILE_FIELDS = {
+    "inner_inference_concurrency",
+    "max_document_pages",
+    "max_resident_pages",
+    "max_source_pdf_bytes",
+    "min_document_pages",
+    "pipeline_depth",
+    "profile_id",
+    "schema",
+    "vllm_max_num_seqs",
+    "window_size",
+}
+CAPACITY_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+CAPACITY_MAX_PAGE_PIXEL_BYTES = 3500 * 3500 * 4
 
 
 def _windows_path(value: object) -> str:
@@ -190,6 +215,137 @@ def _endpoint_sha256(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.rstrip("/").encode()).hexdigest()
 
 
+def _capacity_integer(value: object, *, label: str, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"remote capacity profile {label} is invalid")
+    return value
+
+
+def _expected_capacity_runtime(environment: dict[str, str]) -> dict[str, Any]:
+    mode = environment.get("MINERU_CAPACITY_MODE")
+    if mode not in {"legacy", "candidate", "auto"}:
+        raise ValueError("remote API capacity mode is not closed")
+    configured_window_size = int(environment["MINERU_PROCESSING_WINDOW_SIZE"])
+    if configured_window_size <= 0:
+        raise ValueError("remote API processing window is invalid")
+    catalog_path = environment.get("MINERU_CAPACITY_CATALOG_PATH", "")
+    catalog_sha256 = environment.get("MINERU_CAPACITY_CATALOG_SHA256", "")
+    runtime_compatibility_sha256 = environment.get(
+        "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256",
+        "",
+    )
+    if mode == "auto":
+        if (
+            not catalog_path.startswith("/")
+            or SHA256_RE.fullmatch(catalog_sha256) is None
+            or SHA256_RE.fullmatch(runtime_compatibility_sha256) is None
+        ):
+            raise ValueError("remote API Auto catalog identity is incomplete")
+    elif any((catalog_path, catalog_sha256, runtime_compatibility_sha256)):
+        raise ValueError("remote API Auto catalog authority leaked into non-Auto mode")
+    try:
+        payload = json.loads(environment["MINERU_CAPACITY_PROFILE_JSON"])
+    except (KeyError, json.JSONDecodeError) as exc:
+        raise ValueError("remote API capacity profile JSON is invalid") from exc
+    if not isinstance(payload, dict) or set(payload) != CAPACITY_PROFILE_FIELDS:
+        raise ValueError("remote API capacity profile fields drifted")
+    if payload.get("schema") != "mineru-execution-profile.v2":
+        raise ValueError("remote API capacity profile schema drifted")
+    profile_id = payload.get("profile_id")
+    if not isinstance(profile_id, str):
+        raise ValueError("remote API capacity profile identity is invalid")
+    if CAPACITY_PROFILE_ID_RE.fullmatch(profile_id) is None:
+        raise ValueError("remote API capacity profile identity is invalid")
+    window_size = _capacity_integer(
+        payload.get("window_size"), label="window_size", minimum=1
+    )
+    pipeline_depth = _capacity_integer(
+        payload.get("pipeline_depth"), label="pipeline_depth", minimum=1
+    )
+    max_resident_pages = _capacity_integer(
+        payload.get("max_resident_pages"), label="max_resident_pages", minimum=1
+    )
+    min_document_pages = _capacity_integer(
+        payload.get("min_document_pages"), label="min_document_pages", minimum=2
+    )
+    max_document_pages = _capacity_integer(
+        payload.get("max_document_pages"),
+        label="max_document_pages",
+        minimum=min_document_pages,
+    )
+    max_source_pdf_bytes = _capacity_integer(
+        payload.get("max_source_pdf_bytes"),
+        label="max_source_pdf_bytes",
+        minimum=1,
+    )
+    inner_inference_concurrency = _capacity_integer(
+        payload.get("inner_inference_concurrency"),
+        label="inner_inference_concurrency",
+        minimum=1,
+    )
+    vllm_max_num_seqs = _capacity_integer(
+        payload.get("vllm_max_num_seqs"),
+        label="vllm_max_num_seqs",
+        minimum=inner_inference_concurrency,
+    )
+    if (
+        pipeline_depth != 1
+        or window_size * (pipeline_depth + 1) > max_resident_pages
+        or max_resident_pages > configured_window_size
+        or min_document_pages <= window_size
+    ):
+        raise ValueError("remote API capacity profile exceeds its legacy envelope")
+    profile_sha256 = "sha256:" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    legacy_payload = {
+        "inner_inference_concurrency": 7,
+        "max_document_pages": 2147483647,
+        "max_resident_pages": configured_window_size,
+        "max_source_pdf_bytes": 9223372036854775807,
+        "min_document_pages": 0,
+        "pipeline_depth": 0,
+        "profile_id": f"legacy-w{configured_window_size}-d0",
+        "schema": "mineru-execution-profile.v2",
+        "vllm_max_num_seqs": 128,
+        "window_size": configured_window_size,
+    }
+    legacy_profile_sha256 = "sha256:" + hashlib.sha256(
+        json.dumps(
+            legacy_payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    candidate_profile = {
+        "auto_catalog_sha256": (
+            environment.get("MINERU_CAPACITY_CATALOG_SHA256")
+            if mode == "auto"
+            else None
+        ),
+        "inner_inference_concurrency": inner_inference_concurrency,
+        "max_document_pages": max_document_pages,
+        "max_resident_decoded_bytes": (
+            max_resident_pages * CAPACITY_MAX_PAGE_PIXEL_BYTES
+        ),
+        "max_resident_pages": max_resident_pages,
+        "max_source_pdf_bytes": max_source_pdf_bytes,
+        "min_document_pages": min_document_pages,
+        "pipeline_depth": pipeline_depth,
+        "pipeline_mode": "depth1",
+        "profile_id": profile_id,
+        "profile_sha256": profile_sha256,
+        "vllm_max_num_seqs": vllm_max_num_seqs,
+        "window_size": window_size,
+    }
+    return {
+        "candidate_profile": candidate_profile,
+        "configured_window_size": configured_window_size,
+        "legacy_profile_sha256": legacy_profile_sha256,
+        "mode": mode,
+        "nonlegacy_admission_enabled": mode in {"candidate", "auto"},
+        "schema": "mineru-capacity-runtime.v1",
+    }
+
+
 def _verify_api_compatibility(
     value: object,
     *,
@@ -199,7 +355,9 @@ def _verify_api_compatibility(
     if not isinstance(value, dict) or set(value) != {
         "marker",
         "actual_source_sha256",
+        "capacity_runtime",
         "heap_trim_enabled",
+        "phase_trace_enabled",
         "image_labels",
     }:
         raise ValueError("remote API compatibility evidence fields drifted")
@@ -211,6 +369,7 @@ def _verify_api_compatibility(
         or set(marker) != {
             "schema",
             "policy",
+            "capacity_policy",
             "mineru_version",
             "base_image_digest",
             "patcher_sha256",
@@ -226,6 +385,7 @@ def _verify_api_compatibility(
     if (
         marker.get("schema") != EXPECTED_COMPAT_MARKER_SCHEMA
         or marker.get("policy") != MINERU_HEAP_RETURN_POLICY
+        or marker.get("capacity_policy") != EXPECTED_CAPACITY_POLICY
         or marker.get("mineru_version") != "3.4.4"
         or marker.get("base_image_digest") != EXPECTED_IMAGE_ID
         or marker.get("patcher_sha256") != expected_patcher_sha256
@@ -234,11 +394,14 @@ def _verify_api_compatibility(
         or set(patched) != set(EXPECTED_COMPAT_PREIMAGES)
         or actual != patched
         or any(SHA256_RE.fullmatch(str(item)) is None for item in patched.values())
+        or not isinstance(value.get("capacity_runtime"), dict)
         or value.get("heap_trim_enabled") is not True
+        or not isinstance(value.get("phase_trace_enabled"), bool)
     ):
         raise ValueError("remote API heap-return marker or source bytes drifted")
     if labels != {
         "io.agent-invest.mineru.base-image-digest": EXPECTED_IMAGE_ID,
+        "io.agent-invest.mineru.capacity-policy": EXPECTED_CAPACITY_POLICY,
         "io.agent-invest.mineru.compatibility-policy": MINERU_HEAP_RETURN_POLICY,
         "io.agent-invest.mineru.compatibility-patcher-sha256": (
             expected_patcher_sha256
@@ -368,17 +531,43 @@ def build_manifest(
         raise ValueError("remote MinerU container health is not healthy")
     if api.get("external_tcp_egress_blocked") is not True:
         raise ValueError("remote MinerU API external egress was not disproved")
+    api_environment = _environment(api.get("environment"), allowlist=API_ENV_KEYS)
     mounts = api.get("mounts")
-    if (
-        not isinstance(mounts, list)
-        or len(mounts) != 1
-        or mounts[0].get("Type") != "bind"
-        or _windows_path(mounts[0].get("Source")) != _windows_path(EXPECTED_OUTPUT_ROOT)
-        or mounts[0].get("Destination") != "/var/lib/mineru-api-output"
-        or mounts[0].get("RW") is not True
-        or proxy.get("mounts") != []
-        or inference.get("mounts") != []
+    if not isinstance(mounts, list):
+        raise ValueError("remote MinerU mount policy drifted")
+    mount_by_destination = {
+        item.get("Destination"): item
+        for item in mounts
+        if isinstance(item, dict) and isinstance(item.get("Destination"), str)
+    }
+    capacity_mode = api_environment["MINERU_CAPACITY_MODE"]
+    expected_destinations = {"/var/lib/mineru-api-output"}
+    if capacity_mode == "auto":
+        expected_destinations.add(api_environment["MINERU_CAPACITY_CATALOG_PATH"])
+    if set(mount_by_destination) != expected_destinations or len(mounts) != len(
+        expected_destinations
     ):
+        raise ValueError("remote MinerU mount policy drifted")
+    output_mount = mount_by_destination["/var/lib/mineru-api-output"]
+    if (
+        output_mount.get("Type") != "bind"
+        or _windows_path(output_mount.get("Source"))
+        != _windows_path(EXPECTED_OUTPUT_ROOT)
+        or output_mount.get("RW") is not True
+    ):
+        raise ValueError("remote MinerU mount policy drifted")
+    if capacity_mode == "auto":
+        catalog_mount = mount_by_destination[
+            api_environment["MINERU_CAPACITY_CATALOG_PATH"]
+        ]
+        if (
+            catalog_mount.get("Type") != "bind"
+            or _windows_path(catalog_mount.get("Source"))
+            != _windows_path(EXPECTED_CAPACITY_CATALOG_SOURCE)
+            or catalog_mount.get("RW") is not False
+        ):
+            raise ValueError("remote MinerU Auto catalog mount is not exact read-only")
+    if proxy.get("mounts") != [] or inference.get("mounts") != []:
         raise ValueError("remote MinerU mount policy drifted")
     output_root = observation.get("output_root")
     if (
@@ -402,7 +591,6 @@ def build_manifest(
     ):
         raise ValueError("remote served model or vLLM identity drifted")
 
-    api_environment = _environment(api.get("environment"), allowlist=API_ENV_KEYS)
     inference_environment = _environment(
         inference.get("environment"), allowlist=INFERENCE_ENV_KEYS
     )
@@ -412,6 +600,21 @@ def build_manifest(
         raise ValueError("remote API environment and health task slots drifted")
     if api_environment.get("MINERU_MALLOC_TRIM") != "1":
         raise ValueError("remote API heap-return switch is not enabled")
+    expected_capacity_runtime = _expected_capacity_runtime(api_environment)
+    if compatibility.get("capacity_runtime") != expected_capacity_runtime:
+        raise ValueError("remote API capacity observation and environment drifted")
+    candidate_profile = expected_capacity_runtime["candidate_profile"]
+    if (
+        candidate_profile["inner_inference_concurrency"]
+        != MINERU_API_INFERENCE_MAX_CONCURRENCY
+        or candidate_profile["vllm_max_num_seqs"] != 128
+    ):
+        raise ValueError("remote API capacity profile and service commands drifted")
+    phase_trace_value = api_environment.get("MINERU_PHASE_TRACE")
+    if phase_trace_value not in {"0", "1"}:
+        raise ValueError("remote API phase-trace switch is not closed")
+    if compatibility.get("phase_trace_enabled") is not (phase_trace_value == "1"):
+        raise ValueError("remote API phase-trace observation and environment drifted")
     client = client_bundle_identity(mineru_bin)
     code_digest = writer_code_digest()
     api_command = _command(api)
@@ -422,6 +625,30 @@ def build_manifest(
         or inference_command != EXPECTED_INFERENCE_COMMAND
     ):
         raise ValueError("remote MinerU command drifted")
+    capacity_runtime_compatibility_sha256 = canonical_payload_sha256(
+        {
+            "api_command": api_command,
+            "api_image_id": api.get("image_id"),
+            "base_image_id": EXPECTED_IMAGE_ID,
+            "compatibility_labels": compatibility.get("image_labels"),
+            "inference_command": inference_command,
+            "inference_concurrency": MINERU_API_INFERENCE_MAX_CONCURRENCY,
+            "model_repository": served_model.get("repository"),
+            "model_revision": served_model.get("revision"),
+            "processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
+            "task_slots": task_slots,
+            "vllm_max_num_seqs": 128,
+            "vllm_version": served_model.get("vllm_version"),
+        }
+    )
+    if (
+        expected_capacity_runtime["mode"] == "auto"
+        and api_environment[
+            "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256"
+        ]
+        != capacity_runtime_compatibility_sha256
+    ):
+        raise ValueError("remote API Auto runtime compatibility identity drifted")
     if (
         len(proxy_command) != 4
         or proxy_command[:3] != ["/usr/bin/python3.12", "-I", "-c"]
@@ -479,6 +706,9 @@ def build_manifest(
             "task_cleanup_interval_seconds": MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS,
             "output_root_policy": MINERU_API_OUTPUT_ROOT_POLICY,
             "command": api_command,
+            "capacity_runtime_compatibility_sha256": (
+                capacity_runtime_compatibility_sha256
+            ),
         },
         "inference_server": {
             "container_image_digest": EXPECTED_REPO_DIGEST.removeprefix("mineru@"),

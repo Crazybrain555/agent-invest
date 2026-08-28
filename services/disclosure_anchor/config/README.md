@@ -91,7 +91,7 @@
 | DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS | 86400 | 极端 live-but-stuck 进程保护；整本文档默认可运行 24 小时 |
 | WORKER_LOOP_INTERVAL_SECONDS / MAX | 900 / 1800 | acquisition/project maintenance 的空闲/故障退避；parse 空队列由下载事件或 5 秒 fail-safe poll 唤醒 |
 | MINERU_PROCESSING_WINDOW_SIZE | 16 | GPU 页窗口红线（round22h OOM 后定案） |
-| DISCLOSURE_MINERU_SMOKE_RECEIPT / CANARY_CACHE | — | runtime bundle v5 的 DB-free smoke/canary v2 PASS 对；resident 在连 DB 前强制校验 |
+| DISCLOSURE_MINERU_SMOKE_RECEIPT / CANARY_CACHE | — | runtime bundle v6 的 DB-free smoke/canary v2 PASS 对；resident 在连 DB 前强制校验 |
 | DISCLOSURE_MINERU_STAGED_LOAD_RECEIPT / STAGED_LOAD_CONFIRMATION_RECEIPT | — | 同一 persistent identity 和真实异构 corpus 的两次独立完整 4/8/16 文档回放 PASS；客户端 API-facing window 固定为 1、huge 独占，并从进程外持续验证容器 epoch/restart/OOM/RSS/Docker VM 内存 |
 | DISCLOSURE_MINERU_STAGED_CORPUS_SHA256 | — | 两次 staged run 共用、至少 16 个不同 hash 且覆盖 regular/heavy/huge 的有序真实 PDF corpus 身份 |
 | DISCLOSURE_MINERU_DOCKER_MEMORY_RESERVE_BYTES | 0（未配置） | 当前 Docker VM 的 operator-calibrated 最低可用内存；parse-capable gate 要求正值，不能写死为跨机器常量 |
@@ -111,7 +111,7 @@ make track-export OUT=/timestamped/path/watchlist.csv  # DB 池子 → 独立复
 make track-status          # 全池状态 + 每公司生效配置与来源层
 make mineru-smoke RUNTIME_MANIFEST=/path/runtime.json RECEIPT=/path/receipt.json CANARY_CACHE=/path/canary.json
                            # 无 DB/队列/业务凭据下传：三次多模态 canary + 固定单页 full-PDF，进程/临时树差集归零
-make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json CORPUS_MANIFEST=/path/frozen-corpus.json EXPECTED_CORPUS_SHA256=<sha256> RECEIPT=/path/new-load-receipt.v5.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts DOCKER_MEMORY_RESERVE_BYTES=<bytes>
+make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json CORPUS_MANIFEST=/path/frozen-corpus.json EXPECTED_CORPUS_SHA256=<sha256> RECEIPT=/path/new-load-receipt.v6.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts DOCKER_MEMORY_RESERVE_BYTES=<bytes>
                            # smoke PASS 后固定4/8/16文档数；API-facing window=1、huge独占；每阶段都含regular/heavy/huge；API/vLLM/外部Docker epoch-OOM-RSS-memory/清理任一越界立即停止
 make worker-once           # 手动跑一轮（同步→下载→解析→切分→发布）
 make worker-loop           # 常驻自适应排水；积压时零等待，空闲时 15→30 分钟退避
@@ -174,13 +174,15 @@ exchange、board、日期、市值下限、5,548 行审计闭合与 V10 变更�
 生成器。完整来源/投影证明必须运行上述 `cmp`、核对四个已固定 SHA，并检查完整 selection audit；
 不能把 `config-check` 单独理解为前瞻治理和行业证据已经补齐。
 
-## Passive capacity observation
+## Capacity observation 与默认关闭的 Auto profile
 
-Auto Capacity 当前只有旁路 Observation v1，没有动态 selector/actuator。它复用 machine-local
-`worker.env` 中已存在的 API/vLLM/GPU URL、runtime bundle identity、GPU UUID、MinerU client 和
-Docker memory reserve；不新增数据库 DSN，也不在 tracked config 写 SSH host/user/key。
+Observation v1 仍只有旁路采样权限。另有默认 `legacy` 的 exact-source capacity pipeline：受控
+`candidate` 试验按文档 admission 冻结 profile；`auto` 只选择经过 A-B-B-A receipt 晋升且在页面/源文件
+envelope 内的 profile，不能在运行中改 knob。两条路径都复用 machine-local `worker.env` 中已存在的
+API/vLLM/GPU URL、runtime bundle identity、GPU UUID、MinerU client 和 Docker memory reserve；
+不新增数据库 DSN，也不在 tracked config 写 SSH host/user/key。
 
-Operator 运行时显式传入 v5 `RUNTIME_MANIFEST`、`DURATION_SECONDS` 和与 staged load 相同的
+Operator 运行时显式传入 v6 `RUNTIME_MANIFEST`、`DURATION_SECONDS` 和与 staged load 相同的
 `SSH_HOST` / `SSH_USER` / `SSH_IDENTITY` / `SSH_KNOWN_HOSTS`。这些参数只用于 pinned read-only
 collector；端点、hostname、username 与 container ID 不进入 evidence。命令和复算方法见
 `docs/implementation/runbooks/production-operations.md` §1.1d，设计见

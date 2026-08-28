@@ -49,7 +49,7 @@ services:
       - inference
 
   mineru-api:
-    image: agent-invest/mineru-api:3.4.4-heap-return-v1
+    image: agent-invest/mineru-api:3.4.4-capacity-v1
     pull_policy: never
     container_name: mineru-api
     restart: always
@@ -58,6 +58,22 @@ services:
       # Exact-source MinerU 3.4.4 compatibility layer. The derived image
       # refuses an unset/unknown value and the attestor binds the live hook.
       MINERU_MALLOC_TRIM: "1"
+      # Content-free timing is enabled only for controlled capacity trials;
+      # the normal runtime stays off and its effective value is attested.
+      MINERU_PHASE_TRACE: "0"
+      # Only an operator may switch this immutable per-process value to auto,
+      # after commissioning, a new attestation and fallback/cancellation smoke.
+      # A running document never changes its active window or residency plan.
+      MINERU_CAPACITY_MODE: legacy
+      # Present while default-off so the exact candidate bytes can be built,
+      # attested and A/B tested. Auto additionally requires a canonical,
+      # hash-bound commissioning catalog mounted read-only at runtime.
+      MINERU_CAPACITY_PROFILE_JSON: '{"inner_inference_concurrency":7,"max_document_pages":10000,"max_resident_pages":16,"max_source_pdf_bytes":1073741824,"min_document_pages":9,"pipeline_depth":1,"profile_id":"rtx5080-w8-d1-c7-s128-v1","schema":"mineru-execution-profile.v2","vllm_max_num_seqs":128,"window_size":8}'
+      # Empty outside Auto. A commissioned deployment supplies an absolute
+      # read-only mount path plus the exact catalog and runtime fingerprints.
+      MINERU_CAPACITY_CATALOG_PATH: ""
+      MINERU_CAPACITY_CATALOG_SHA256: ""
+      MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256: ""
       # Current 30 GiB Docker Desktop profile.  Slots 2/3 require a distinct
       # attested compose identity and two heterogeneous load receipts.
       MINERU_API_MAX_CONCURRENT_REQUESTS: "1"

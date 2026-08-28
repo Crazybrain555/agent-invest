@@ -1,8 +1,9 @@
-"""Remote MinerU v4 attestation unit tests; no SSH/GPU access."""
+"""Remote MinerU v6 attestation unit tests; no SSH/GPU access."""
 
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 import tempfile
 from typing import Any
@@ -13,6 +14,7 @@ import yaml
 
 from scripts.attest_mineru_remote_runtime import (
     EXPECTED_API_COMPAT_IMAGE,
+    EXPECTED_CAPACITY_CATALOG_SOURCE,
     EXPECTED_COLLECTOR_PATH,
     EXPECTED_COMPAT_PREIMAGES,
     EXPECTED_IMAGE_ID,
@@ -20,6 +22,7 @@ from scripts.attest_mineru_remote_runtime import (
     EXPECTED_REPO_DIGEST,
     _known_host_key_sha256,
     _canonical_remote_collector_path,
+    _expected_capacity_runtime,
     _read_remote_file,
     _ssh_base,
     build_manifest,
@@ -43,9 +46,31 @@ API_IMAGE_ID = "sha256:" + "a" * 64
 
 
 def _observation() -> dict[str, Any]:
+    capacity_profile = json.dumps(
+        {
+            "inner_inference_concurrency": 7,
+            "max_document_pages": 10000,
+            "max_resident_pages": 16,
+            "max_source_pdf_bytes": 1073741824,
+            "min_document_pages": 9,
+            "pipeline_depth": 1,
+            "profile_id": "rtx5080-w8-d1-c7-s128-v1",
+            "schema": "mineru-execution-profile.v2",
+            "vllm_max_num_seqs": 128,
+            "window_size": 8,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     api_environment = [
+        "MINERU_CAPACITY_CATALOG_PATH=",
+        "MINERU_CAPACITY_CATALOG_SHA256=",
+        "MINERU_CAPACITY_MODE=legacy",
+        f"MINERU_CAPACITY_PROFILE_JSON={capacity_profile}",
+        "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256=",
         "MINERU_MODEL_SOURCE=local",
         "MINERU_MALLOC_TRIM=1",
+        "MINERU_PHASE_TRACE=0",
         "MINERU_API_MAX_CONCURRENT_REQUESTS=1",
         "MINERU_PROCESSING_WINDOW_SIZE=16",
         "MINERU_API_OUTPUT_ROOT=/var/lib/mineru-api-output",
@@ -54,6 +79,9 @@ def _observation() -> dict[str, Any]:
         "MINERU_API_DISABLE_ACCESS_LOG=true",
         "MINERU_API_ENABLE_FASTAPI_DOCS=false",
     ]
+    api_environment_map = {
+        item.partition("=")[0]: item.partition("=")[2] for item in api_environment
+    }
     return {
         "schema": "mineru-windows-runtime-observation.v3",
         "collector_path": EXPECTED_COLLECTOR_PATH,
@@ -87,10 +115,7 @@ def _observation() -> dict[str, Any]:
                 "--max-concurrency",
                 "7",
             ],
-            "environment": {
-                item.partition("=")[0]: item.partition("=")[2]
-                for item in api_environment
-            },
+            "environment": api_environment_map,
             "mounts": [
                 {
                     "Type": "bind",
@@ -108,8 +133,9 @@ def _observation() -> dict[str, Any]:
         },
         "api_compatibility": {
             "marker": {
-                "schema": "mineru-heap-return-compatibility.v1",
+                "schema": "mineru-runtime-compatibility.v2",
                 "policy": "glibc-malloc-trim-per-window.v1",
+                "capacity_policy": "bounded-two-window-capacity-pipeline.v2",
                 "mineru_version": "3.4.4",
                 "base_image_digest": EXPECTED_IMAGE_ID,
                 "patcher_sha256": PATCHER_DIGEST,
@@ -123,6 +149,7 @@ def _observation() -> dict[str, Any]:
                     )
                 },
             },
+            "capacity_runtime": _expected_capacity_runtime(api_environment_map),
             "actual_source_sha256": {
                 path: "sha256:" + character * 64
                 for path, character in zip(
@@ -132,8 +159,12 @@ def _observation() -> dict[str, Any]:
                 )
             },
             "heap_trim_enabled": True,
+            "phase_trace_enabled": False,
             "image_labels": {
                 "io.agent-invest.mineru.base-image-digest": EXPECTED_IMAGE_ID,
+                "io.agent-invest.mineru.capacity-policy": (
+                    "bounded-two-window-capacity-pipeline.v2"
+                ),
                 "io.agent-invest.mineru.compatibility-policy": (
                     "glibc-malloc-trim-per-window.v1"
                 ),
@@ -272,6 +303,67 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
             "sha256:" + "7" * 64,
         )
 
+    def test_auto_catalog_requires_exact_read_only_mount(self) -> None:
+        observation = _observation()
+        build_arguments = {
+            "mineru_bin": Path("/private/mineru"),
+            "ssh_host_key_sha256": "sha256:" + "6" * 64,
+            "api_url": "http://127.0.0.1:30002",
+            "observability_url": "http://127.0.0.1:30001/v1",
+            "inference_upstream_url": "http://mineru-openai-server:30000/v1",
+            "expected_compose_sha256": "sha256:" + "3" * 64,
+            "expected_collector_sha256": "sha256:" + "7" * 64,
+            "expected_compat_patcher_sha256": PATCHER_DIGEST,
+            "expected_compat_dockerfile_sha256": DOCKERFILE_DIGEST,
+        }
+        with (
+            patch(
+                "scripts.attest_mineru_remote_runtime.client_bundle_identity",
+                return_value=CLIENT,
+            ),
+            patch(
+                "scripts.attest_mineru_remote_runtime.writer_code_digest",
+                return_value=CODE_DIGEST,
+            ),
+        ):
+            legacy = build_manifest(observation, **build_arguments)
+            runtime_sha256 = legacy["manifest"]["orchestrator"][
+                "capacity_runtime_compatibility_sha256"
+            ]
+            catalog_path = "/run/agent-invest/mineru-capacity-catalog.v1.json"
+            environment = observation["api"]["environment"]
+            environment.update(
+                {
+                    "MINERU_CAPACITY_MODE": "auto",
+                    "MINERU_CAPACITY_CATALOG_PATH": catalog_path,
+                    "MINERU_CAPACITY_CATALOG_SHA256": "sha256:" + "e" * 64,
+                    "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256": runtime_sha256,
+                }
+            )
+            observation["api"]["mounts"].append(
+                {
+                    "Type": "bind",
+                    "Source": EXPECTED_CAPACITY_CATALOG_SOURCE,
+                    "Destination": catalog_path,
+                    "RW": False,
+                    "Propagation": "rprivate",
+                }
+            )
+            observation["api_compatibility"]["capacity_runtime"] = (
+                _expected_capacity_runtime(environment)
+            )
+            auto = build_manifest(observation, **build_arguments)
+            self.assertEqual(
+                auto["manifest"]["orchestrator"][
+                    "capacity_runtime_compatibility_sha256"
+                ],
+                runtime_sha256,
+            )
+
+            observation["api"]["mounts"][1]["RW"] = True
+            with self.assertRaisesRegex(ValueError, "exact read-only"):
+                build_manifest(observation, **build_arguments)
+
     def test_build_manifest_rejects_exposed_or_busy_remote(self) -> None:
         for tamper in (
             "network",
@@ -283,6 +375,7 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
             "model",
             "vllm",
             "compatibility",
+            "capacity_profile",
         ):
             with self.subTest(tamper=tamper):
                 observation = _observation()
@@ -304,6 +397,19 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
                     )
                 elif tamper == "vllm":
                     observation["served_model"]["vllm_version"] = "99.0"
+                elif tamper == "capacity_profile":
+                    profile = json.loads(
+                        observation["api"]["environment"][
+                            "MINERU_CAPACITY_PROFILE_JSON"
+                        ]
+                    )
+                    profile["inner_inference_concurrency"] = 6
+                    observation["api"]["environment"][
+                        "MINERU_CAPACITY_PROFILE_JSON"
+                    ] = json.dumps(profile, sort_keys=True, separators=(",", ":"))
+                    observation["api_compatibility"]["capacity_runtime"] = (
+                        _expected_capacity_runtime(observation["api"]["environment"])
+                    )
                 else:
                     observation["api_compatibility"]["heap_trim_enabled"] = False
                 with (
@@ -373,8 +479,8 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
         )
         for value in (
             r"\\server\share\collect_mineru_runtime.ps1",
-            r"\\?\C:\ProgramData\agent-invest\mineru-runtime-v5\collect_mineru_runtime.ps1",
-            r"C:\ProgramData\agent-invest\mineru-runtime-v5\..\collect_mineru_runtime.ps1",
+            r"\\?\C:\ProgramData\agent-invest\mineru-runtime-v6\collect_mineru_runtime.ps1",
+            r"C:\ProgramData\agent-invest\mineru-runtime-v6\..\collect_mineru_runtime.ps1",
             EXPECTED_COLLECTOR_PATH + ":evil",
             r"C:\ProgramData\agent-invest\mineru\collect_mineru_runtime.ps1",
         ):

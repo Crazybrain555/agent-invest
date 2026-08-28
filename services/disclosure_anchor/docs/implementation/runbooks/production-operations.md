@@ -109,7 +109,7 @@ bootout 新 job、恢复旧 plist 和原 disabled 状态。恢复后用上面两
 
 parser target 契约要求 `DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256`
 （否则 parse 在 parser_identity 阶段 fail loud）。它必须来自 operator/provider 保存于仓外的
-canonical runtime manifest v5，分别绑定本地 client、固定 MinerU API orchestrator、vLLM inference
+canonical runtime manifest v6，分别绑定本地 client、固定 MinerU API orchestrator、vLLM inference
 server 与网络 topology。它至少包含 derived API image、原始 base image 和 inference image 三个
 immutable digest、模型仓库与不可变 revision、served
 model ID、两侧配置/env/mount/network policy hash，以及 pinned SSH host-key 与 Windows node identity；以 sorted-key、
@@ -124,7 +124,7 @@ fresh deployment 必须先在 worker/GC 保持 unloaded + persistently disabled 
 
 ```bash
 make mineru-smoke \
-  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v5.json \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v6.json \
   RECEIPT=/private/path/mineru-smoke-receipt.v4.json \
   CANARY_CACHE=/private/path/mineru-canary.v2.json
 ```
@@ -154,7 +154,7 @@ cache 代替。租约只裁决一次 process composition，避免一个健康多
 owner 退出后仍须重新证明 API idle、精确模型身份和稳定 incident generation 才能恢复。transport、
 408/429/500/502/503/504 与截断响应进入有界退避；4xx/501、schema/version/capacity/model drift 仍
 fail closed。这些 live probe 不是逐文档 full OCR，也不能替代部署 smoke。
-v5 manifest 是闭合字段合同且会内嵌到 mode 0600 的私有 receipt；其中只能存不可变身份、hash 与
+v6 manifest 是闭合字段合同且会内嵌到 mode 0600 的私有 receipt；其中只能存不可变身份、hash 与
 非秘密启动参数，command 出现 credential flag 会 fail closed，原始 token/密码不得进入 manifest。
 
 MinerU 3.4.4 在 WSL/FastAPI 连续处理大 PDF 后可能把已经 free 的 glibc arena 长期保留在 API
@@ -163,7 +163,7 @@ PID1 RSS；本机真实 heavy 文档已复现该行为，与上游
 精确源码兼容层，而不是复制未合并的 [PR #5354](https://github.com/opendatalab/MinerU/pull/5354)：
 derived image 固定 base digest、MinerU 版本和三个源文件 preimage hash，只在每个处理窗口及文档
 final cleanup 后显式调用 glibc `malloc_trim(0)`；开关必须为闭合值，启用时缺少 glibc/hook 会
-fail loud。collector、install receipt 和 manifest v5 同时绑定 patcher/Dockerfile hash、derived
+fail loud。collector、install receipt 和 manifest v6 同时绑定 patcher/Dockerfile hash、derived
 image ID、base digest、策略名、patched source hash 与 live hook；任一漂移都拒绝准入。它不改变
 解析语义、页窗口或并发，只把 allocator 可归还的空闲页返还给 OS；上游正式修复合并并通过同一
 held-out 验收后，应删除这个兼容层而不是永久形成私有 fork。
@@ -183,9 +183,9 @@ held-out 验收后，应删除这个兼容层而不是永久形成私有 fork。
 安装器在改 live compose 前先校验 base image、旧 API/vLLM idle、四个 source、compose config，
 并以 `--pull=false` 构建和验证唯一临时 tag；完成 target writable/output-root 预检并保存旧
 stable tag→image ID 后，才把固定发布 tag 原子指向新 image。随后只写固定 compose 以及
-`C:\ProgramData\agent-invest\mineru-runtime-v5\` 下的 collector/receipt。任何部署后 identity、
+`C:\ProgramData\agent-invest\mineru-runtime-v6\` 下的 collector/receipt。任何部署后 identity、
 health、网络、egress、空 output-root 或 formal collector 校验失败都会恢复旧 tag 映射、旧 compose、
-旧 collector、旧 receipt 和旧容器运行态，并删除临时 tag。不要手工把 v5 reader 改回兼容任意历史路径，也不要在同一次处置中
+旧 collector、旧 receipt 和旧容器运行态，并删除临时 tag。不要手工把 v6 reader 改回兼容任意历史路径，也不要在同一次处置中
 重启 Docker Desktop、Windows、Tailscale 或 v2rayN。
 
 bootstrap 与 steady state 是两个独立 profile：bootstrap 不启动 resident worker、不开放 queue
@@ -196,14 +196,14 @@ backfill waterline=`2000`、loop=`900..1800`、document concurrency=`16`、GPU b
 soft parse expected=`3600s`。任何新 OOM/EngineCore death、429/5xx、持续 preemption 或 vLLM
 waiting≥64 持续 30 秒都停止 staged load；不能据一次利用率截图扩大 1 outstanding / 7 active / 128 seq。
 
-在同一 v5 manifest 的 smoke PASS 后、启动任何 producer 前，显式运行固定 staged-load gate：
+在同一 v6 manifest 的 smoke PASS 后、启动任何 producer 前，显式运行固定 staged-load gate：
 
 ```bash
 make mineru-staged-load \
-  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v5.json \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v6.json \
   CORPUS_MANIFEST=/private/path/frozen-real-pdf-corpus.v1.json \
   EXPECTED_CORPUS_SHA256=<reviewed-canonical-corpus-sha256> \
-  RECEIPT=/private/path/mineru-staged-load-receipt.v5.json \
+  RECEIPT=/private/path/mineru-staged-load-receipt.v6.json \
   SSH_HOST=<pinned-windows-host> SSH_USER=<operator> \
   SSH_IDENTITY=/private/path/operator-key \
   SSH_KNOWN_HOSTS=/private/path/known_hosts \
@@ -212,10 +212,10 @@ make mineru-staged-load \
 
 # 第一轮完整 PASS 后，用不存在的新路径原样再运行一次：
 make mineru-staged-load \
-  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v5.json \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v6.json \
   CORPUS_MANIFEST=/private/path/frozen-real-pdf-corpus.v1.json \
   EXPECTED_CORPUS_SHA256=<same-reviewed-canonical-corpus-sha256> \
-  RECEIPT=/private/path/mineru-staged-load-confirmation-receipt.v5.json \
+  RECEIPT=/private/path/mineru-staged-load-confirmation-receipt.v6.json \
   SSH_HOST=<same-pinned-windows-host> SSH_USER=<same-operator> \
   SSH_IDENTITY=/private/path/operator-key \
   SSH_KNOWN_HOSTS=/private/path/known_hosts \
@@ -228,9 +228,9 @@ make mineru-staged-load \
 至少包含 16 个不同 SHA，且必须同时覆盖 regular（<80 页）、heavy（80–499 页）和 huge（≥500 页）；
 单页 smoke fixture 或重复同一 PDF 不能冒充负载验证。4/8/16 是每阶段处理的文档总数，不是同时
 提交数；客户端 API-facing outstanding 固定为 `min(stage count, task slots)`（当前为 1），huge/未知页数任务
-独占该窗口。其余 backlog 只保留在 durable queue，不预先提交到 process-local API registry。固定 API 的 processing task 上限来自 v5 manifest（当前为 1），每个 active task 的
+独占该窗口。其余 backlog 只保留在 durable queue，不预先提交到 process-local API registry。固定 API 的 processing task 上限来自 v6 manifest（当前为 1），每个 active task 的
 server-side inference cap 是 7，因此当前 active upper bound 为 7。
-启动前会拒绝 active worker/pipeline producer、MinerU 残留进程和 `mineru-api-client-*` 残留目录，核对 v5 manifest、
+启动前会拒绝 active worker/pipeline producer、MinerU 残留进程和 `mineru-api-client-*` 残留目录，核对 v6 manifest、
 本地 client/content packages、writer code、window=16、provider runtime 与 served model，并先探测
 `/v1/models` 和 `/metrics`。同一版本化远端 collector 还会在整轮前、中、后每 5 秒从进程外采样三只
 容器的 ID/StartedAt/restart/OOM/exit、cgroup memory、PID1 RSS/HWM 与 Docker VM available memory；
@@ -238,12 +238,14 @@ epoch 变化、restart/OOM、15 秒以上采样缺口或跌破 operator-calibrat
 每阶段运行中及结束时都采样 running、waiting、preemptions、KV cache；
 每个逻辑 metrics 样本只对 transport failure 允许在同一 10 秒总预算内做两次最长 4.5 秒尝试；HTTP
 429/5xx、响应超限、缺字段或非法值不重试。两次 transport 尝试都失败只形成一个 transport-only
-sample gap。当上一成功样本 waiting<64 时，每阶段最多记录并容忍一个实际持续不超过 10 秒的中途
-gap；第二个 gap、waiting 已达 64 后的任何 gap、超过 10 秒的 gap 或终样本 gap 都立即 FAIL。
-PASS receipt 必须原样保留 gap 的时间/时长，并证明其后有更晚的成功终样本供 admission 复核。
+sample gap。transport-only gap 只把 observer 切到 `DEGRADED_TRANSPORT`，不会终止仍健康的 MinerU
+数据面；阶段继续自然 drain，并原样记录 gap 与后续恢复。由于 gap 期间无法证明 waiting/preemption/KV
+安全，任意 sampling failure 或缺失终样本都会把该阶段判为 evidence-incomplete，不能形成 PASS receipt、
+不能进入 commissioning；它与 OOM/restart/reserve/preemption 等 operational failure 的区别仅是不得因此
+杀死健康解析进程或丢弃已完成输出，不是降低 promotion 门槛。
 同时连续采样 API `/health`：processing 不得超过 attested task slots；window=1 时不要求人为制造 process-local queue。
 `completed_tasks`/`failed_tasks` 是保留期内 terminal registry 的人口 gauge，可随 600 秒 retention/30 秒
-cleanup 合法下降；v5 receipt 原样保留 baseline/samples/terminal 与 min/max，但禁止把它们解释为累计任务账。
+cleanup 合法下降；v6 receipt 原样保留 baseline/samples/terminal 与 min/max，但禁止把它们解释为累计任务账。
 每份输入是否成功改由 exact input SHA、official writer 零退出、完整源/输出页数相等和 provider bundle hash
 逐文档证明；每阶段仍必须自然 drain 到 queued=processing=0。API 没有 cancel endpoint；本地中止后只能关闭新 admission、终止本地 CLI 并等待
 远端自然 drain。无法证明 drain 就 FAIL，不能重启服务、进入下一阶段或把 receipt 用于 admission。
@@ -303,7 +305,7 @@ Observation v1，不提高 `WORKER_REPORT_INTERVAL_SECONDS`，也不从 `worker_
 
 ```bash
 make capacity-observe \
-  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v5.json \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v6.json \
   DURATION_SECONDS=3600 \
   SSH_HOST=<pinned-host> SSH_USER=<operator-user> \
   SSH_IDENTITY=/private/path/operator-key \
@@ -312,7 +314,7 @@ make capacity-observe \
 
 可选 `INTERVAL_SECONDS` 默认 60；`RUN_ID` 仅接受 canonical UUID，省略时自动生成。运行前会用 pinned
 local MinerU client、writer code、configured runtime bundle digest、task slots 和三个 endpoint digest
-复核 v5 manifest，再验证 operator SSH key/known_hosts 是 owner-only 0600，且 known_hosts 内
+复核 v6 manifest，再验证 operator SSH key/known_hosts 是 owner-only 0600，且 known_hosts 内
 Ed25519 key blob 的 SHA-256 与 manifest topology 完全一致。Observation v1 只接受当前 commissioned、
 UUID-pinned 的单卡 nvidia-smi exporter；API/vLLM/GPU 每秒采样，host 每
 5 秒采样；任何 sampler 故障只让 evidence `incomplete`，不得中止数据面。安全事件让 receipt
@@ -330,6 +332,61 @@ configured/exact-current identity，再从 owner-owned mode 0600 raw JSONL 按 r
 重建 interval 与 final receipt，检查 hash chain、UTC、边界和文件 SHA。`REQUIRE_COMPLETE=YES` 才把 incomplete/unsafe 映射为非零退出；不带该项
 时仅验证“失败证据本身是否完整可信”。详细契约、coverage 和隐私边界见
 `../design/capacity-observation.md`。
+
+### 1.1e Default-off capacity profile commissioning
+
+Capacity pipeline 的构建默认必须保持 `MINERU_CAPACITY_MODE=legacy`、`MINERU_PHASE_TRACE=0`，
+candidate profile 使用 exact `mineru-execution-profile.v2` 且不携带授权位。先部署并重新生成 exact runtime v6 attestation；这一步只证明新 image
+bytes 可运行，不能启用 Auto。受控试验期间 worker 必须卸载、API/vLLM idle、没有第二 producer；每次
+compose mode/profile 变化都要新 runtime manifest，不能拿上一 arm 的身份运行下一 arm。
+
+试验顺序固定 A1 legacy → B1 candidate → B2 candidate → A2 legacy。四次都对同一 frozen
+regular/heavy/huge corpus 运行 §1.1c 的 `make mineru-staged-load`，每次完成后立即采集：
+
+安装器在每个 arm 仍重做 exact-source/image 校验，但构建命令固定 `--provenance=false`。不得删掉该项：
+默认 BuildKit provenance manifest 含执行期元数据，会让相同业务镜像的外层 OCI index ID 跨构建变化；
+该项不单独证明“同一 API image”。A1 前必须冻结完整 campaign image ID，四个 arm 和最终 default
+恢复都以安装器的 `-ReuseCurrentPublishedImage -CampaignApiCompatImageId sha256:<exact-id>` 路径切换。
+该路径 mutation 前要求正式 tag、当前 API 容器和完整 live compatibility proof 都等于冻结 ID；它完全
+跳过 build/tag/image-rm，只定向执行 `mineru-api` 的 `--no-build --no-deps --force-recreate`，并在成功和
+rollback 两条路径证明 proxy/vLLM 的 container ID、StartedAt、image ID 不变。供应链证明由固定 base
+digest、Dockerfile/patcher hash、镜像 labels/marker、安装回执和每 arm 的 runtime v6 attestation 闭合。
+
+```bash
+make mineru-phase-trace-capture \
+  STAGED_RECEIPT=/private/<arm>.json \
+  CAPACITY_MODE=<legacy-or-candidate> \
+  PROFILE_SHA256=sha256:<active-profile> \
+  CAPTURE=/private/<arm>.trace.json \
+  SSH_HOST=<pinned-host> SSH_USER=<operator-user> \
+  SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts
+```
+
+采集命令从 staged receipt 取得 UTC 边界、collector/node/API container epoch，Windows 端只返回
+严格 `MINERU_PHASE_TRACE ` 行。Mac 在写 0600 new-only capture 前要求所有 document trace 成功闭合；
+candidate 还必须有 A/B 与 B/C overlap，且 document/page 总数与 staged receipt 相等。任何 fallback、
+error trace、profile mismatch、restart/OOM 或日志缺口都会非零退出。
+
+四 arm 闭合后运行 `make capacity-commission`（完整参数见 design §5.3 或 `make -n`）。机械门同时要求：
+
+- frozen input、endpoint topology、model/client/writer 与 proxy/vLLM epoch 不变；
+- UTC 证明真实非重叠 A1→B1→B2→A2；page/block/source identity 跨 arm 相等；每 arm 的
+  provider bundle SHA 自身合法但不要求 bundle 容器跨执行字节相等；
+- 本机 A1 前固定 `DOCKER_MEMORY_RESERVE_BYTES=7516192768`（7 GiB）；完整 host verifier 重算
+  collector path/hash、5 s cadence/15 s gap、VM total/available、summary、epoch、OOM/restart 与 reserve；
+- sampling、preemption、waiting/KV、API exact retained-gauge range/idle/activity/drain 与 cleanup 全部安全；
+  completed/failed gauge 可因 600 s retention 自然减少，不作为任务累计账；
+- A1 前冻结 `MINIMUM_IMPROVEMENT_BASIS_POINTS=500`、
+  `MAXIMUM_REPEAT_SPREAD_BASIS_POINTS=300`；`min(B)>max(A)`、最低收益、重复稳定性和实测噪声
+  四门同时成立。
+
+`COMMISSION` v2 receipt 只给出 `profile_commissioning_authorized=true`，不授权 Auto、也不执行部署。
+Operator 不得重写已验证的 profile；必须把 candidate arm 使用的 exact v2 profile 原样交给
+`make capacity-catalog`，绑定 exact COMMISSION receipt、evaluator 与 runtime compatibility。Auto compose
+只能把 `C:\ProgramData\agent-invest\mineru-runtime-v6\mineru-capacity-catalog.v1.json` 只读挂载到
+`MINERU_CAPACITY_CATALOG_PATH`；安装器和 v6 attestor 会同时核对 host source、container destination、
+`RW=false` 与 catalog hash。重新 attest 后，还要在 `auto` 下通过 fallback/cancellation smoke，才可按
+§8 启 worker。`STOP`、证据不可比或任一 hard gate 失败时保持 legacy；不得降低门槛或用 GPU 峰值截图替代。
 
 ### 1.2 批量重解析与派生重置
 

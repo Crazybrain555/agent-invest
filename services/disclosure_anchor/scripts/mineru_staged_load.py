@@ -64,7 +64,11 @@ from disclosure_anchor.adapters.runtime.mineru_process_isolation import (
 from disclosure_anchor.application.ports.parser import ParserOptions
 
 
-RECEIPT_SCHEMA = "mineru_staged_load_receipt.v5"
+RECEIPT_SCHEMA = "mineru_staged_load_receipt.v6"
+RECEIPT_SCHEMA_VERSION = 6
+ADMISSION_ORDER_PROFILE = "copy-index-fifo.v1"
+NOT_ADMITTED_ATOMIC_ABORT = "not_admitted_atomic_abort"
+METRICS_OBSERVER_PROFILE = "metrics-observer.v1"
 TASK_REGISTRY_SEMANTICS = "retained-terminal-gauges.v1"
 STAGE_DOCUMENT_COUNTS = (4, 8, 16)
 ORCHESTRATOR_INFERENCE_CONCURRENCY = MINERU_API_INFERENCE_MAX_CONCURRENCY
@@ -178,19 +182,29 @@ class _StageAbortLatch:
 
 
 class _StageAdmission:
-    """Bound API-facing clients while making huge work exclusive."""
+    """Own one deterministic FIFO admission order and atomic abort closure."""
 
     def __init__(
         self,
         *,
         outstanding_window: int,
+        copy_indices: tuple[int, ...],
         abort_latch: _StageAbortLatch | None = None,
     ) -> None:
         if outstanding_window < 1:
             raise ValueError("client outstanding window must be positive")
+        if copy_indices != tuple(range(1, len(copy_indices) + 1)):
+            raise ValueError("stage copy indices must be contiguous and one-based")
+        if not copy_indices:
+            raise ValueError("stage admission requires at least one copy index")
         self._window = outstanding_window
+        self._copy_indices = copy_indices
         self._abort_latch = abort_latch or _StageAbortLatch()
         self._condition = self._abort_latch.condition
+        self._pending = list(copy_indices)
+        self._states = {copy_index: "pending" for copy_index in copy_indices}
+        self._ordinals: dict[int, int] = {}
+        self._admission_order: list[int] = []
         self._active = 0
         self._huge_active = False
         self._closed = False
@@ -201,34 +215,67 @@ class _StageAdmission:
         with self._condition:
             return self._peak
 
+    def evidence(self) -> dict[str, object]:
+        with self._condition:
+            return {
+                "profile": ADMISSION_ORDER_PROFILE,
+                "expected_copy_indices": list(self._copy_indices),
+                "admission_order_copy_indices": list(self._admission_order),
+                "records": [
+                    {
+                        "copy_index": copy_index,
+                        "admission_ordinal": self._ordinals.get(copy_index),
+                        "state": self._states[copy_index],
+                    }
+                    for copy_index in self._copy_indices
+                ],
+                "closed": self._closed,
+                "abort_reason": self._abort_latch.reason_locked(),
+            }
+
+    def _close_locked(self) -> None:
+        self._closed = True
+        for copy_index in self._pending:
+            self._states[copy_index] = NOT_ADMITTED_ATOMIC_ABORT
+        self._pending.clear()
+        self._condition.notify_all()
+
     def run(
         self,
         *,
+        copy_index: int,
         workload_class: str,
         operation: Callable[[], dict[str, Any]],
         abort_reason: Callable[[], str | None] = lambda: None,
     ) -> dict[str, Any]:
+        if copy_index not in self._states:
+            raise ValueError("copy index is outside the frozen stage order")
         exclusive = workload_class == "huge"
         with self._condition:
             self._condition.wait_for(
                 lambda: self._closed
                 or self._abort_latch.reason_locked() is not None
                 or (
-                    self._active == 0
-                    if exclusive
-                    else not self._huge_active and self._active < self._window
+                    self._pending
+                    and self._pending[0] == copy_index
+                    and (
+                        self._active == 0
+                        if exclusive
+                        else not self._huge_active and self._active < self._window
+                    )
                 )
             )
             latched_failure = self._abort_latch.reason_locked()
             if self._closed or latched_failure is not None:
-                self._closed = True
+                self._close_locked()
                 raise _StageAdmissionClosedError(
                     "stage admission closed after an earlier failure"
                     + (
                         f": {_safe_detail(latched_failure)}"
                         if latched_failure is not None
                         else ""
-                    )
+                    ),
+                    copy_index=copy_index,
                 )
             # A monitor can latch failure while this caller is waiting for the
             # prior document to release the only local slot.  Re-check that
@@ -238,32 +285,68 @@ class _StageAdmission:
             failure = abort_reason()
             if failure is not None:
                 self._abort_latch.publish_locked(failure)
-                self._closed = True
-                self._condition.notify_all()
+                self._close_locked()
                 raise _StageAdmissionClosedError(
                     "stage admission closed by a latched monitor failure: "
-                    f"{_safe_detail(failure)}"
+                    f"{_safe_detail(failure)}",
+                    copy_index=copy_index,
                 )
+            if not self._pending or self._pending[0] != copy_index:
+                raise RuntimeError("stage admission FIFO ownership drifted")
+            self._pending.pop(0)
+            self._states[copy_index] = "admitted"
+            self._ordinals[copy_index] = len(self._admission_order)
+            self._admission_order.append(copy_index)
             self._active += 1
             self._huge_active = exclusive
             self._peak = max(self._peak, self._active)
+        operation_error: Exception | None = None
+        outcome: dict[str, Any] | None = None
         try:
-            return operation()
-        finally:
-            with self._condition:
-                self._active -= 1
-                if exclusive:
-                    self._huge_active = False
+            outcome = operation()
+        except Exception as exc:
+            operation_error = exc
+        with self._condition:
+            self._active -= 1
+            if exclusive:
+                self._huge_active = False
+            if operation_error is not None:
+                self._states[copy_index] = "failed"
+                self._abort_latch.publish_locked(
+                    f"document_operation_exception:{copy_index}:"
+                    f"{type(operation_error).__name__}"
+                )
+                self._close_locked()
+            elif outcome is None or outcome.get("status") != "pass":
+                self._states[copy_index] = "failed"
+                failure_class = (
+                    outcome.get("failure_class", "unknown")
+                    if outcome is not None
+                    else "missing_outcome"
+                )
+                self._abort_latch.publish_locked(
+                    f"document_failed:{copy_index}:{_safe_detail(str(failure_class))}"
+                )
+                self._close_locked()
+            else:
+                self._states[copy_index] = "completed"
                 self._condition.notify_all()
+        if operation_error is not None:
+            raise operation_error
+        assert outcome is not None
+        return outcome
 
     def close(self) -> None:
         with self._condition:
-            self._closed = True
-            self._condition.notify_all()
+            self._close_locked()
 
 
 class _StageAdmissionClosedError(RuntimeError):
     """A queued stage document was cancelled after a peer failed."""
+
+    def __init__(self, message: str, *, copy_index: int) -> None:
+        super().__init__(message)
+        self.copy_index = copy_index
 
 
 def _private_host_observer_file(path: Path, *, label: str) -> None:
@@ -956,6 +1039,8 @@ class _MetricsMonitor:
         self._samples: list[MetricsSample] = []
         self._sampling_failures: list[MetricsSamplingFailure] = []
         self._failure: str | None = None
+        self._state = "STARTING"
+        self._transitions: list[dict[str, object]] = []
         self._waiting_since: float | None = None
         self._terminal_sample_observed_seconds: float | None = None
         self._thread_started = False
@@ -972,9 +1057,26 @@ class _MetricsMonitor:
         if self._thread.is_alive():
             with self._lock:
                 self._failure = self._failure or "metrics_monitor_did_not_stop"
+                self._transition_locked(
+                    "CLOSED",
+                    reason="monitor_thread_did_not_stop",
+                    observed_seconds=max(
+                        0.0,
+                        self._monotonic_clock() - self._started,
+                    ),
+                )
             return
         if self.failure is None:
-            self._observe_once(allow_transport_gap=False, terminal=True)
+            self._observe_once(terminal=True)
+        with self._lock:
+            self._transition_locked(
+                "CLOSED",
+                reason="monitor_stopped",
+                observed_seconds=max(
+                    0.0,
+                    self._monotonic_clock() - self._started,
+                ),
+            )
 
     @property
     def failure(self) -> str | None:
@@ -996,6 +1098,51 @@ class _MetricsMonitor:
         with self._lock:
             return self._terminal_sample_observed_seconds
 
+    @property
+    def evidence_failure(self) -> str | None:
+        with self._lock:
+            if self._failure is not None:
+                return None
+            if self._sampling_failures or self._terminal_sample_observed_seconds is None:
+                return "metrics_observation_incomplete"
+            return None
+
+    def evidence(self) -> dict[str, object]:
+        with self._lock:
+            complete = bool(
+                self._state == "CLOSED"
+                and self._failure is None
+                and not self._sampling_failures
+                and self._terminal_sample_observed_seconds is not None
+            )
+            return {
+                "profile": METRICS_OBSERVER_PROFILE,
+                "state": self._state,
+                "observation_complete": complete,
+                "hard_failure": self._failure,
+                "transitions": [dict(item) for item in self._transitions],
+            }
+
+    def _transition_locked(
+        self,
+        state: str,
+        *,
+        reason: str,
+        observed_seconds: float,
+    ) -> None:
+        if state == self._state:
+            return
+        previous = self._state
+        self._state = state
+        self._transitions.append(
+            {
+                "from": previous,
+                "to": state,
+                "reason": reason,
+                "observed_seconds": round(observed_seconds, 6),
+            }
+        )
+
     def _run(self) -> None:
         while not self._stop.is_set():
             if not self._observe_once():
@@ -1005,7 +1152,6 @@ class _MetricsMonitor:
     def _observe_once(
         self,
         *,
-        allow_transport_gap: bool = True,
         terminal: bool = False,
     ) -> bool:
         sample_started = self._monotonic_clock()
@@ -1028,6 +1174,11 @@ class _MetricsMonitor:
             with self._lock:
                 self._waiting_since = waiting_since
                 self._samples.append(sample)
+                self._transition_locked(
+                    "HEALTHY",
+                    reason="valid_metrics_sample",
+                    observed_seconds=sample.observed_seconds,
+                )
                 if terminal:
                     self._terminal_sample_observed_seconds = sample.observed_seconds
                 if failure is not None:
@@ -1042,23 +1193,27 @@ class _MetricsMonitor:
             )
             with self._lock:
                 self._sampling_failures.append(observed)
-                unsafe_to_tolerate = (
-                    not allow_transport_gap
-                    or observed.duration_seconds
-                    > METRICS_LOGICAL_SAMPLE_TIMEOUT_SECONDS
-                    or self._waiting_since is not None
-                    or len(self._sampling_failures)
-                    > MAX_TOLERATED_METRICS_SAMPLE_FAILURES_PER_STAGE
+                self._transition_locked(
+                    "DEGRADED_TRANSPORT",
+                    reason="metrics_transport_unavailable",
+                    observed_seconds=observed.observed_seconds,
                 )
-                if unsafe_to_tolerate:
-                    self._failure = f"metrics_unavailable:{observed.failure}"
-            return not unsafe_to_tolerate
+            return True
         except Exception as exc:
+            now = self._monotonic_clock()
+            observed = MetricsSamplingFailure(
+                observed_seconds=max(0.0, now - self._started),
+                duration_seconds=max(0.0, now - sample_started),
+                failure=f"{type(exc).__name__}:{_safe_detail(str(exc))}",
+            )
             with self._lock:
-                self._failure = (
-                    f"metrics_unavailable:{type(exc).__name__}:{_safe_detail(str(exc))}"
+                self._sampling_failures.append(observed)
+                self._transition_locked(
+                    "DEGRADED_TRANSPORT",
+                    reason="metrics_payload_invalid",
+                    observed_seconds=observed.observed_seconds,
                 )
-            return False
+            return True
 
 
 def parse_vllm_metrics(payload: bytes) -> MetricsSample:
@@ -1208,6 +1363,7 @@ def _run_stage(
     stage_abort_latch = abort_latch or _StageAbortLatch()
     admission = _StageAdmission(
         outstanding_window=client_outstanding_window,
+        copy_indices=tuple(range(1, document_count + 1)),
         abort_latch=stage_abort_latch,
     )
     stage_started = time.monotonic()
@@ -1328,7 +1484,7 @@ def _run_stage(
                                     stage_inputs[index - 1].workload_class
                                 ),
                             )
-                            outcome["status"] = "cancelled_after_stage_abort"
+                            outcome["status"] = NOT_ADMITTED_ATOMIC_ABORT
                             outcome["failure_class"] = "stage_abort"
                         except Exception as exc:
                             outcome = _failed_document_outcome(
@@ -1353,13 +1509,15 @@ def _run_stage(
                     for future in pending:
                         future.cancel()
                     terminate_active_mineru_processes()
+            admission.close()
             # ThreadPoolExecutor.__exit__ waits for every running future.  Read
             # terminal states only after that boundary; sampling them inside
             # the context can leave a completed/cancelled document recorded as
             # ``not_started`` in the immutable receipt.
             for future, index in futures.items():
                 if future.cancelled():
-                    outcomes[index]["status"] = "cancelled_after_stage_abort"
+                    outcomes[index]["status"] = NOT_ADMITTED_ATOMIC_ABORT
+                    outcomes[index]["failure_class"] = "stage_abort"
                     continue
                 if not future.done():
                     outcomes[index] = _failed_document_outcome(
@@ -1383,7 +1541,7 @@ def _run_stage(
                         input_logical_name=stage_inputs[index - 1].logical_name,
                         workload_class=stage_inputs[index - 1].workload_class,
                     )
-                    outcome["status"] = "cancelled_after_stage_abort"
+                    outcome["status"] = NOT_ADMITTED_ATOMIC_ABORT
                     outcome["failure_class"] = "stage_abort"
                 except Exception as exc:
                     outcome = _failed_document_outcome(
@@ -1445,15 +1603,8 @@ def _run_stage(
             f"stage_cleanup_failed:pids={sorted(remaining_processes)}:"
             f"temp_dirs={len(new_api_temp_dirs)}"
         )
-    if failure is not None:
-        terminate_active_mineru_processes()
     if failure is None and any(item["status"] != "pass" for item in outcomes.values()):
         failure = "stage_document_incomplete"
-    if failure is None and not _metrics_prove_staged_activity(
-        metrics_baseline,
-        metrics_samples,
-    ):
-        failure = "stage_metrics_observed_no_load_activity"
     orchestrator_failure = _orchestrator_evidence_failure(
         baseline=orchestrator_baseline,
         samples=orchestrator_monitor.samples,
@@ -1463,10 +1614,29 @@ def _run_stage(
     )
     if failure is None and orchestrator_failure is not None:
         failure = orchestrator_failure
+    operational_failure = failure
+    metrics_evidence_failure = metrics_monitor.evidence_failure
+    if (
+        metrics_evidence_failure is None
+        and not _metrics_prove_staged_activity(metrics_baseline, metrics_samples)
+    ):
+        metrics_evidence_failure = "stage_metrics_observed_no_load_activity"
+    if operational_failure is not None:
+        terminate_active_mineru_processes()
+    elif metrics_evidence_failure is not None:
+        # Observation evidence is intentionally not a data-plane actuator.
+        # The complete stage still drains normally, but this receipt cannot
+        # commission or activate a profile.
+        failure = metrics_evidence_failure
     return {
         "stage_document_count": document_count,
         "client_outstanding_window": client_outstanding_window,
         "peak_client_outstanding": admission.peak,
+        "admission_order_profile": ADMISSION_ORDER_PROFILE,
+        "admission_order_copy_indices": admission.evidence()[
+            "admission_order_copy_indices"
+        ],
+        "admission": admission.evidence(),
         "selection_profile": "per_stage_regular_heavy_huge.v1",
         "orchestrator_task_concurrency": task_slots,
         "orchestrator_inference_concurrency": ORCHESTRATOR_INFERENCE_CONCURRENCY,
@@ -1486,6 +1656,7 @@ def _run_stage(
             terminal_sample_observed_seconds=(
                 metrics_monitor.terminal_sample_observed_seconds
             ),
+            observer=metrics_monitor.evidence(),
         ),
         "orchestrator": _orchestrator_summary(
             baseline=orchestrator_baseline,
@@ -1519,6 +1690,23 @@ def _stage_preflight_failure(
         "stage_document_count": concurrency,
         "client_outstanding_window": min(concurrency, task_slots),
         "peak_client_outstanding": 0,
+        "admission_order_profile": ADMISSION_ORDER_PROFILE,
+        "admission_order_copy_indices": [],
+        "admission": {
+            "profile": ADMISSION_ORDER_PROFILE,
+            "expected_copy_indices": list(range(1, concurrency + 1)),
+            "admission_order_copy_indices": [],
+            "records": [
+                {
+                    "copy_index": copy_index,
+                    "admission_ordinal": None,
+                    "state": NOT_ADMITTED_ATOMIC_ABORT,
+                }
+                for copy_index in range(1, concurrency + 1)
+            ],
+            "closed": True,
+            "abort_reason": failure,
+        },
         "selection_profile": "per_stage_regular_heavy_huge.v1",
         "orchestrator_task_concurrency": task_slots,
         "orchestrator_inference_concurrency": ORCHESTRATOR_INFERENCE_CONCURRENCY,
@@ -1529,7 +1717,17 @@ def _stage_preflight_failure(
         "failure": failure,
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "documents": [],
-        "metrics": _metrics_summary(metrics_baseline, ()),
+        "metrics": _metrics_summary(
+            metrics_baseline,
+            (),
+            observer={
+                "profile": METRICS_OBSERVER_PROFILE,
+                "state": "CLOSED",
+                "observation_complete": False,
+                "hard_failure": None,
+                "transitions": [],
+            },
+        ),
         "orchestrator": _orchestrator_summary(
             baseline=orchestrator_baseline,
             samples=(),
@@ -1565,6 +1763,7 @@ def _parse_admitted_copy(
     timeout_seconds: int,
 ) -> dict[str, Any]:
     outcome = admission.run(
+        copy_index=copy_index,
         workload_class=workload_class,
         abort_reason=abort_reason,
         operation=lambda: _parse_frozen_copy(
@@ -1718,6 +1917,7 @@ def _metrics_summary(
     sampling_failures: tuple[MetricsSamplingFailure, ...] = (),
     *,
     terminal_sample_observed_seconds: float | None = None,
+    observer: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     observed = (baseline, *samples)
     distribution = samples or (baseline,)
@@ -1736,6 +1936,7 @@ def _metrics_summary(
             if terminal_sample_observed_seconds is not None
             else None
         ),
+        "observer": observer,
         "range": {
             name: {
                 "min": min(getattr(item, name) for item in observed),
@@ -2341,6 +2542,7 @@ def main(argv: list[str] | None = None) -> int:
     receipt_status = "pass" if failure is None else "fail"
     receipt = {
         "schema": RECEIPT_SCHEMA,
+        "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
         "execution_id": str(uuid.uuid4()),
         "status": receipt_status,
         "started_at_utc": started_at,

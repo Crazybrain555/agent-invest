@@ -52,7 +52,7 @@ def _manifest(*, duplicate_max_num_seqs: bool = False) -> dict[str, object]:
         command.extend(["--max-num-seqs", "4096"])
     command.extend(["--mm-processor-cache-gb", "0"])
     return {
-        "contract_version": "mineru-runtime-bundle.v5",
+        "contract_version": "mineru-runtime-bundle.v6",
         "client": {
             "package_set_sha256": _LOCAL_DIGEST,
             "writer_code_sha256": _CODE_DIGEST,
@@ -66,6 +66,7 @@ def _manifest(*, duplicate_max_num_seqs: bool = False) -> dict[str, object]:
             "mount_policy_sha256": "sha256:" + "4" * 64,
             "network_policy_sha256": "sha256:" + "5" * 64,
             "heap_return_compatibility_sha256": "sha256:" + "6" * 64,
+            "capacity_runtime_compatibility_sha256": "sha256:" + "7" * 64,
             "heap_return_policy": "glibc-malloc-trim-per-window.v1",
             "mineru_version": "3.4.4",
             "api_protocol_version": 2,

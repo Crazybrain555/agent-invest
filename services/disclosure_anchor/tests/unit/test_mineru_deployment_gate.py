@@ -102,6 +102,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "mount_policy_sha256": "sha256:" + "9" * 64,
             "network_policy_sha256": "sha256:" + "a" * 64,
             "heap_return_compatibility_sha256": "sha256:" + "f" * 64,
+            "capacity_runtime_compatibility_sha256": "sha256:" + "0" * 64,
             "heap_return_policy": "glibc-malloc-trim-per-window.v1",
             "mineru_version": "3.4.4",
             "api_protocol_version": 2,
@@ -132,7 +133,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "windows_collector_sha256": "sha256:" + "e" * 64,
         }
         manifest = {
-            "contract_version": "mineru-runtime-bundle.v5",
+            "contract_version": "mineru-runtime-bundle.v6",
             "client": {
                 "package_set_sha256": LOCAL_DIGEST,
                 "writer_code_sha256": CODE_DIGEST,
@@ -263,7 +264,8 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             return selected
 
         staged_load = {
-            "schema": "mineru_staged_load_receipt.v5",
+            "schema": "mineru_staged_load_receipt.v6",
+            "receipt_schema_version": 6,
             "execution_id": "11111111-1111-4111-8111-111111111111",
             "status": "pass",
             "failure": None,
@@ -292,6 +294,29 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                     "stage_document_count": document_count,
                     "client_outstanding_window": 1,
                     "peak_client_outstanding": 1,
+                    "admission_order_profile": "copy-index-fifo.v1",
+                    "admission_order_copy_indices": list(
+                        range(1, document_count + 1)
+                    ),
+                    "admission": {
+                        "profile": "copy-index-fifo.v1",
+                        "expected_copy_indices": list(
+                            range(1, document_count + 1)
+                        ),
+                        "admission_order_copy_indices": list(
+                            range(1, document_count + 1)
+                        ),
+                        "records": [
+                            {
+                                "copy_index": index,
+                                "admission_ordinal": index - 1,
+                                "state": "completed",
+                            }
+                            for index in range(1, document_count + 1)
+                        ],
+                        "closed": True,
+                        "abort_reason": None,
+                    },
                     "selection_profile": "per_stage_regular_heavy_huge.v1",
                     "orchestrator_task_concurrency": 1,
                     "orchestrator_inference_concurrency": 7,
@@ -320,6 +345,26 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                         "sample_count": 1,
                         "sampling_failures": [],
                         "terminal_sample_observed_seconds": 1.0,
+                        "observer": {
+                            "profile": "metrics-observer.v1",
+                            "state": "CLOSED",
+                            "observation_complete": True,
+                            "hard_failure": None,
+                            "transitions": [
+                                {
+                                    "from": "STARTING",
+                                    "to": "HEALTHY",
+                                    "reason": "valid_metrics_sample",
+                                    "observed_seconds": 0.0,
+                                },
+                                {
+                                    "from": "HEALTHY",
+                                    "to": "CLOSED",
+                                    "reason": "monitor_stopped",
+                                    "observed_seconds": 1.0,
+                                },
+                            ],
+                        },
                         "baseline": {
                             "running": 0,
                             "waiting": 0,
@@ -661,6 +706,26 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             ):
                 require_mineru_deployment_gate(settings)
 
+    def test_staged_rejects_v5_receipt_for_new_commissioning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, _, _, client = self._fixture(
+                Path(tmp), passed_at=datetime.now(UTC)
+            )
+            staged_path = settings.disclosure_mineru_staged_load_receipt
+            assert staged_path is not None
+            staged = json.loads(staged_path.read_text(encoding="utf-8"))
+            staged["schema"] = "mineru_staged_load_receipt.v5"
+            staged["receipt_schema_version"] = 5
+            staged_path.write_text(json.dumps(staged), encoding="utf-8")
+            staged_path.chmod(0o600)
+            client_patch, code_patch = self._identity_patches(client)
+            with (
+                client_patch,
+                code_patch,
+                self.assertRaisesRegex(MinerUDeploymentGateError, "not PASS"),
+            ):
+                require_mineru_deployment_gate(settings)
+
     def test_staged_api_retained_gauges_may_change_between_stages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings, _, _, client = self._fixture(
@@ -842,6 +907,10 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             ("sampling_prefix", "metrics"),
             ("sampling_duration", "metrics"),
             ("terminal_before_gap", "metrics"),
+            ("admission_profile", "FIFO admission"),
+            ("admission_order", "FIFO admission"),
+            ("admission_ordinal", "FIFO admission"),
+            ("admission_missing_copy", "FIFO admission"),
             ("document_status", "document evidence"),
             ("logical_name", "document evidence"),
             ("input_sha", "document evidence"),
@@ -903,6 +972,16 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                             "failure": "MetricsTransportUnavailableError:timeout",
                         }
                     ]
+                elif tamper == "admission_profile":
+                    staged["stages"][0]["admission_order_profile"] = "other"
+                elif tamper == "admission_order":
+                    staged["stages"][0]["admission_order_copy_indices"] = [2, 1, 3, 4]
+                elif tamper == "admission_ordinal":
+                    staged["stages"][0]["admission"]["records"][1][
+                        "admission_ordinal"
+                    ] = 0
+                elif tamper == "admission_missing_copy":
+                    staged["stages"][0]["admission"]["records"].pop()
                 elif tamper == "document_status":
                     staged["stages"][0]["documents"][0]["status"] = "fail"
                 elif tamper == "logical_name":

@@ -155,7 +155,8 @@ vllm:gpu_cache_usage_perc 0.1
     def test_fixed_envelope_has_no_operator_stage_override(self) -> None:
         self.assertEqual(staged.STAGE_DOCUMENT_COUNTS, (4, 8, 16))
         self.assertEqual(staged.ORCHESTRATOR_INFERENCE_CONCURRENCY, 7)
-        self.assertEqual(staged.RECEIPT_SCHEMA, "mineru_staged_load_receipt.v5")
+        self.assertEqual(staged.RECEIPT_SCHEMA, "mineru_staged_load_receipt.v6")
+        self.assertEqual(staged.RECEIPT_SCHEMA_VERSION, 6)
 
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             staged._parse_args(
@@ -223,13 +224,16 @@ vllm:gpu_cache_usage_perc 0.1
             )
 
     def test_stage_admission_caps_clients_and_keeps_huge_exclusive(self) -> None:
-        admission = staged._StageAdmission(outstanding_window=2)
+        admission = staged._StageAdmission(
+            outstanding_window=2,
+            copy_indices=(1, 2, 3, 4, 5, 6),
+        )
         state_lock = threading.Lock()
         active = 0
         huge_active = False
         violations: list[str] = []
 
-        def operation(workload_class: str) -> dict[str, object]:
+        def operation(copy_index: int, workload_class: str) -> dict[str, object]:
             def inner() -> dict[str, object]:
                 nonlocal active, huge_active
                 with state_lock:
@@ -247,6 +251,7 @@ vllm:gpu_cache_usage_perc 0.1
                 return {"status": "pass"}
 
             return admission.run(
+                copy_index=copy_index,
                 workload_class=workload_class,
                 operation=inner,
             )
@@ -255,14 +260,17 @@ vllm:gpu_cache_usage_perc 0.1
 
         with ThreadPoolExecutor(max_workers=6) as executor:
             futures = [
-                executor.submit(operation, workload_class)
-                for workload_class in (
-                    "regular",
-                    "heavy",
-                    "huge",
-                    "regular",
-                    "heavy",
-                    "regular",
+                executor.submit(operation, copy_index, workload_class)
+                for copy_index, workload_class in enumerate(
+                    (
+                        "regular",
+                        "heavy",
+                        "huge",
+                        "regular",
+                        "heavy",
+                        "regular",
+                    ),
+                    start=1,
                 )
             ]
             for future in futures:
@@ -270,16 +278,24 @@ vllm:gpu_cache_usage_perc 0.1
 
         self.assertEqual(violations, [])
         self.assertLessEqual(admission.peak, 2)
+        self.assertEqual(
+            admission.evidence()["admission_order_copy_indices"],
+            [1, 2, 3, 4, 5, 6],
+        )
 
     def test_stage_admission_reaches_window_before_huge_can_enter(self) -> None:
-        admission = staged._StageAdmission(outstanding_window=2)
+        admission = staged._StageAdmission(
+            outstanding_window=2,
+            copy_indices=(1, 2, 3),
+        )
         both_non_huge_entered = threading.Barrier(3, timeout=1)
         release_non_huge = threading.Event()
         huge_entered = threading.Event()
         release_huge = threading.Event()
 
-        def non_huge(workload_class: str) -> dict[str, object]:
+        def non_huge(copy_index: int, workload_class: str) -> dict[str, object]:
             return admission.run(
+                copy_index=copy_index,
                 workload_class=workload_class,
                 operation=lambda: _hold_non_huge(),
             )
@@ -297,11 +313,12 @@ vllm:gpu_cache_usage_perc 0.1
         from concurrent.futures import ThreadPoolExecutor
 
         with ThreadPoolExecutor(max_workers=3) as executor:
-            regular = executor.submit(non_huge, "regular")
-            heavy = executor.submit(non_huge, "heavy")
+            regular = executor.submit(non_huge, 1, "regular")
+            heavy = executor.submit(non_huge, 2, "heavy")
             both_non_huge_entered.wait()
             huge = executor.submit(
                 admission.run,
+                copy_index=3,
                 workload_class="huge",
                 operation=hold_huge,
             )
@@ -314,23 +331,116 @@ vllm:gpu_cache_usage_perc 0.1
             self.assertEqual(heavy.result(), {"status": "pass"})
             self.assertEqual(huge.result(), {"status": "pass"})
 
+    def test_stage_admission_is_fifo_under_reverse_thread_start(self) -> None:
+        admission = staged._StageAdmission(
+            outstanding_window=2,
+            copy_indices=(1, 2, 3, 4, 5, 6),
+        )
+
+        def run(copy_index: int) -> dict[str, object]:
+            return admission.run(
+                copy_index=copy_index,
+                workload_class="regular",
+                operation=lambda: ({"status": "pass"}),
+            )
+
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            futures = [executor.submit(run, index) for index in range(6, 0, -1)]
+            for future in futures:
+                self.assertEqual(future.result(), {"status": "pass"})
+        admission.close()
+
+        evidence = admission.evidence()
+        self.assertEqual(evidence["admission_order_copy_indices"], [1, 2, 3, 4, 5, 6])
+        self.assertEqual(
+            [record["admission_ordinal"] for record in evidence["records"]],
+            list(range(6)),
+        )
+
+    def test_stage_admission_huge_fifo_head_blocks_later_regular(self) -> None:
+        admission = staged._StageAdmission(
+            outstanding_window=2,
+            copy_indices=(1, 2, 3),
+        )
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        huge_entered = threading.Event()
+        release_huge = threading.Event()
+        later_regular_entered = threading.Event()
+
+        def first() -> dict[str, object]:
+            first_entered.set()
+            self.assertTrue(release_first.wait(timeout=1))
+            return {"status": "pass"}
+
+        def huge() -> dict[str, object]:
+            huge_entered.set()
+            self.assertTrue(release_huge.wait(timeout=1))
+            return {"status": "pass"}
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            first_future = executor.submit(
+                admission.run,
+                copy_index=1,
+                workload_class="regular",
+                operation=first,
+            )
+            self.assertTrue(first_entered.wait(timeout=1))
+            later_future = executor.submit(
+                admission.run,
+                copy_index=3,
+                workload_class="regular",
+                operation=lambda: (
+                    later_regular_entered.set() or {"status": "pass"}
+                ),
+            )
+            huge_future = executor.submit(
+                admission.run,
+                copy_index=2,
+                workload_class="huge",
+                operation=huge,
+            )
+            release_first.set()
+            self.assertTrue(huge_entered.wait(timeout=1))
+            self.assertFalse(later_regular_entered.wait(timeout=0.05))
+            release_huge.set()
+            self.assertEqual(first_future.result(), {"status": "pass"})
+            self.assertEqual(huge_future.result(), {"status": "pass"})
+            self.assertEqual(later_future.result(), {"status": "pass"})
+
+        admission.close()
+        self.assertEqual(
+            admission.evidence()["admission_order_copy_indices"],
+            [1, 2, 3],
+        )
+
     def test_stage_admission_releases_after_exception_and_close_wakes_waiter(
         self,
     ) -> None:
-        admission = staged._StageAdmission(outstanding_window=1)
+        admission = staged._StageAdmission(
+            outstanding_window=1,
+            copy_indices=(1, 2),
+        )
         with self.assertRaisesRegex(RuntimeError, "boom"):
             admission.run(
+                copy_index=1,
                 workload_class="regular",
                 operation=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
             )
-        self.assertEqual(
+        with self.assertRaisesRegex(
+            staged._StageAdmissionClosedError,
+            "earlier failure",
+        ):
             admission.run(
+                copy_index=2,
                 workload_class="regular",
                 operation=lambda: {"status": "pass"},
-            ),
-            {"status": "pass"},
-        )
+            )
 
+        admission = staged._StageAdmission(
+            outstanding_window=1,
+            copy_indices=(1, 2),
+        )
         occupied = threading.Event()
         release = threading.Event()
         waiter_done = threading.Event()
@@ -342,7 +452,11 @@ vllm:gpu_cache_usage_perc 0.1
             return {"status": "pass"}
 
         holder = threading.Thread(
-            target=lambda: admission.run(workload_class="regular", operation=hold)
+            target=lambda: admission.run(
+                copy_index=1,
+                workload_class="regular",
+                operation=hold,
+            )
         )
         holder.start()
         self.assertTrue(occupied.wait(timeout=1))
@@ -350,6 +464,7 @@ vllm:gpu_cache_usage_perc 0.1
         def wait_for_slot() -> None:
             try:
                 admission.run(
+                    copy_index=2,
                     workload_class="regular",
                     operation=lambda: {"status": "unexpected"},
                 )
@@ -373,6 +488,7 @@ vllm:gpu_cache_usage_perc 0.1
         abort_latch = staged._StageAbortLatch()
         admission = staged._StageAdmission(
             outstanding_window=1,
+            copy_indices=(1, 2),
             abort_latch=abort_latch,
         )
         occupied = threading.Event()
@@ -431,12 +547,14 @@ vllm:gpu_cache_usage_perc 0.1
             ):
                 first = executor.submit(
                     admission.run,
+                    copy_index=1,
                     workload_class="regular",
                     operation=hold,
                 )
                 self.assertTrue(occupied.wait(timeout=1))
                 second = executor.submit(
                     admission.run,
+                    copy_index=2,
                     workload_class="regular",
                     operation=lambda: (
                         second_operation_called.set() or {"status": "unexpected"}
@@ -729,7 +847,9 @@ vllm:gpu_cache_usage_perc 0.5
 
         self.assertEqual(opener.open.call_count, 2)
 
-    def test_metrics_monitor_tolerates_only_one_transport_sample_failure(self) -> None:
+    def test_metrics_monitor_transport_failures_degrade_without_hard_abort(
+        self,
+    ) -> None:
         monitor = staged._MetricsMonitor(
             sampler=MagicMock(
                 side_effect=staged.MetricsTransportUnavailableError("budget exhausted")
@@ -741,27 +861,24 @@ vllm:gpu_cache_usage_perc 0.5
         self.assertTrue(monitor._observe_once())
         self.assertIsNone(monitor.failure)
         self.assertEqual(len(monitor.sampling_failures), 1)
-        self.assertFalse(monitor._observe_once())
-        self.assertEqual(
-            monitor.failure,
-            "metrics_unavailable:MetricsTransportUnavailableError:budget exhausted",
-        )
+        self.assertTrue(monitor._observe_once())
+        self.assertIsNone(monitor.failure)
+        self.assertEqual(len(monitor.sampling_failures), 2)
+        self.assertEqual(monitor.evidence()["state"], "DEGRADED_TRANSPORT")
 
-    def test_metrics_monitor_does_not_tolerate_invalid_metrics(self) -> None:
+    def test_metrics_monitor_invalid_payload_degrades_evidence(self) -> None:
         monitor = staged._MetricsMonitor(
             sampler=MagicMock(side_effect=ValueError("missing required signals")),
             expected_preemptions=0,
-            monotonic_clock=MagicMock(side_effect=(0.0, 1.0)),
+            monotonic_clock=MagicMock(side_effect=(0.0, 1.0, 2.0)),
         )
 
-        self.assertFalse(monitor._observe_once())
-        self.assertEqual(
-            monitor.failure,
-            "metrics_unavailable:ValueError:missing required signals",
-        )
-        self.assertEqual(monitor.sampling_failures, ())
+        self.assertTrue(monitor._observe_once())
+        self.assertIsNone(monitor.failure)
+        self.assertEqual(len(monitor.sampling_failures), 1)
+        self.assertEqual(monitor.evidence()["state"], "DEGRADED_TRANSPORT")
 
-    def test_metrics_monitor_does_not_tolerate_outage_after_high_waiting(self) -> None:
+    def test_metrics_monitor_gap_does_not_invent_waiting_safety_evidence(self) -> None:
         monitor = staged._MetricsMonitor(
             sampler=MagicMock(
                 side_effect=(
@@ -774,10 +891,11 @@ vllm:gpu_cache_usage_perc 0.5
         )
 
         self.assertTrue(monitor._observe_once())
-        self.assertFalse(monitor._observe_once())
-        self.assertIsNotNone(monitor.failure)
+        self.assertTrue(monitor._observe_once())
+        self.assertIsNone(monitor.failure)
+        self.assertEqual(monitor.evidence()["state"], "DEGRADED_TRANSPORT")
 
-    def test_metrics_monitor_rejects_a_gap_longer_than_logical_budget(self) -> None:
+    def test_metrics_monitor_long_gap_degrades_without_data_plane_abort(self) -> None:
         monitor = staged._MetricsMonitor(
             sampler=MagicMock(
                 side_effect=staged.MetricsTransportUnavailableError(
@@ -788,9 +906,10 @@ vllm:gpu_cache_usage_perc 0.5
             monotonic_clock=MagicMock(side_effect=(0.0, 1.0, 12.0)),
         )
 
-        self.assertFalse(monitor._observe_once())
-        self.assertIsNotNone(monitor.failure)
+        self.assertTrue(monitor._observe_once())
+        self.assertIsNone(monitor.failure)
         self.assertEqual(monitor.sampling_failures[0].duration_seconds, 11.0)
+        self.assertEqual(monitor.evidence()["state"], "DEGRADED_TRANSPORT")
 
     def test_metrics_terminal_sample_transport_gap_is_never_tolerated(self) -> None:
         monitor = staged._MetricsMonitor(
@@ -800,7 +919,7 @@ vllm:gpu_cache_usage_perc 0.5
                 )
             ),
             expected_preemptions=0,
-            monotonic_clock=MagicMock(side_effect=(0.0, 1.0, 2.0)),
+            monotonic_clock=MagicMock(side_effect=(0.0, 1.0, 2.0, 3.0)),
         )
         monitor._thread_started = True
 
@@ -810,7 +929,9 @@ vllm:gpu_cache_usage_perc 0.5
         ):
             monitor.stop()
 
-        self.assertIsNotNone(monitor.failure)
+        self.assertIsNone(monitor.failure)
+        self.assertEqual(monitor.evidence_failure, "metrics_observation_incomplete")
+        self.assertEqual(monitor.evidence()["state"], "CLOSED")
         self.assertIsNone(monitor.terminal_sample_observed_seconds)
 
     def test_metrics_midstage_gap_requires_successful_terminal_sample(self) -> None:
@@ -822,7 +943,9 @@ vllm:gpu_cache_usage_perc 0.5
                 )
             ),
             expected_preemptions=0,
-            monotonic_clock=MagicMock(side_effect=(0.0, 1.0, 2.0, 3.0, 4.0)),
+            monotonic_clock=MagicMock(
+                side_effect=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+            ),
         )
         self.assertTrue(monitor._observe_once())
         monitor._thread_started = True
@@ -835,6 +958,11 @@ vllm:gpu_cache_usage_perc 0.5
 
         self.assertIsNone(monitor.failure)
         self.assertEqual(monitor.terminal_sample_observed_seconds, 4.0)
+        self.assertEqual(monitor.evidence_failure, "metrics_observation_incomplete")
+        self.assertEqual(
+            [item["to"] for item in monitor.evidence()["transitions"]],
+            ["DEGRADED_TRANSPORT", "HEALTHY", "CLOSED"],
+        )
 
     def test_metrics_midstage_and_terminal_gaps_fail_stage(self) -> None:
         monitor = staged._MetricsMonitor(
@@ -842,7 +970,9 @@ vllm:gpu_cache_usage_perc 0.5
                 side_effect=staged.MetricsTransportUnavailableError("transport gap")
             ),
             expected_preemptions=0,
-            monotonic_clock=MagicMock(side_effect=(0.0, 1.0, 2.0, 3.0, 4.0)),
+            monotonic_clock=MagicMock(
+                side_effect=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+            ),
         )
         self.assertTrue(monitor._observe_once())
         monitor._thread_started = True
@@ -853,7 +983,8 @@ vllm:gpu_cache_usage_perc 0.5
         ):
             monitor.stop()
 
-        self.assertIsNotNone(monitor.failure)
+        self.assertIsNone(monitor.failure)
+        self.assertEqual(monitor.evidence_failure, "metrics_observation_incomplete")
         self.assertIsNone(monitor.terminal_sample_observed_seconds)
 
     def test_metrics_http_errors_do_not_retry(self) -> None:
@@ -1316,11 +1447,115 @@ vllm:gpu_cache_usage_perc 0.5
         statuses = [item["status"] for item in result["documents"]]
         self.assertEqual(statuses[0], "fail")
         self.assertNotIn("not_started", statuses)
-        self.assertEqual(statuses[1:], ["cancelled_after_stage_abort"] * 3)
+        self.assertEqual(
+            statuses[1:],
+            [staged.NOT_ADMITTED_ATOMIC_ABORT] * 3,
+        )
         self.assertEqual(
             [item.get("failure_class") for item in result["documents"][1:]],
             ["stage_abort"] * 3,
         )
+        self.assertEqual(result["admission_order_copy_indices"], [1])
+        self.assertEqual(
+            [item["state"] for item in result["admission"]["records"]],
+            ["failed"] + [staged.NOT_ADMITTED_ATOMIC_ABORT] * 3,
+        )
+
+    def test_degraded_metrics_evidence_does_not_terminate_completed_stage(
+        self,
+    ) -> None:
+        baseline = staged.MetricsSample(0, 0, 0, 0, 0)
+        active = staged.MetricsSample(1, 1, 0, 0, 0.1)
+        health = self._health()
+
+        class DegradedMetricsMonitor:
+            failure = None
+            evidence_failure = "metrics_observation_incomplete"
+            samples = (active,)
+            sampling_failures = (
+                staged.MetricsSamplingFailure(1, 9.0, "timeout-1"),
+                staged.MetricsSamplingFailure(10, 9.0, "timeout-2"),
+            )
+            terminal_sample_observed_seconds = None
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def evidence(self) -> dict[str, object]:
+                return {
+                    "profile": staged.METRICS_OBSERVER_PROFILE,
+                    "state": "CLOSED",
+                    "observation_complete": False,
+                    "hard_failure": None,
+                    "transitions": [
+                        {
+                            "from": "STARTING",
+                            "to": "DEGRADED_TRANSPORT",
+                            "reason": "metrics_transport_unavailable",
+                            "observed_seconds": 1.0,
+                        },
+                        {
+                            "from": "DEGRADED_TRANSPORT",
+                            "to": "CLOSED",
+                            "reason": "monitor_stopped",
+                            "observed_seconds": 20.0,
+                        },
+                    ],
+                }
+
+        def parse(*, copy_index: int, **_kwargs: object) -> dict[str, object]:
+            return {
+                "copy_index": copy_index,
+                "logical_name": f"copy-{copy_index}.pdf",
+                "input_sha256": "sha256:" + f"{copy_index:064x}",
+                "status": "pass",
+                "elapsed_seconds": 1.0,
+                "page_count": 7,
+                "block_count": 1,
+                "provider_bundle_sha256": "sha256:" + "a" * 64,
+            }
+
+        terminate = MagicMock(return_value=0)
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(staged, "_MetricsMonitor", return_value=DegradedMetricsMonitor()),
+            patch.object(staged, "_parse_frozen_copy", side_effect=parse),
+            patch.object(staged, "_orchestrator_evidence_failure", return_value=None),
+            patch.object(staged, "mineru_api_temp_dirs", return_value=set()),
+            patch.object(staged, "_wait_for_process_cleanup", return_value={}),
+            patch.object(
+                staged,
+                "terminate_active_mineru_processes",
+                terminate,
+            ),
+        ):
+            result = staged._run_stage(
+                document_count=4,
+                run_root=Path(tmp),
+                corpus=self._corpus(),
+                mineru_bin=Path("/unused/mineru"),
+                api_url="http://unused-api",
+                inference_upstream_url="http://unused-upstream/v1",
+                runtime_identity="sha256:" + "a" * 64,
+                timeout_seconds=1,
+                expected_preemptions=0,
+                metrics_sampler=lambda: baseline,
+                orchestrator_sampler=lambda: health,
+                orchestrator_idle_waiter=MagicMock(
+                    side_effect=((health, 0.0), (health, 0.0))
+                ),
+                task_slots=1,
+            )
+
+        self.assertEqual(result["failure"], "metrics_observation_incomplete")
+        self.assertEqual(
+            [item["status"] for item in result["documents"]],
+            ["pass"] * 4,
+        )
+        terminate.assert_not_called()
 
     def test_process_snapshot_classifiers_reject_producers_and_mineru(self) -> None:
         processes = {
@@ -1424,7 +1659,8 @@ vllm:gpu_cache_usage_perc 0.5
             payload = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(result, 2)
             self.assertEqual(payload["status"], "fail")
-            self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v5")
+            self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v6")
+            self.assertEqual(payload["receipt_schema_version"], 6)
             self.assertEqual(
                 payload["topology"]["api_endpoint_sha256"],
                 "sha256:" + hashlib.sha256(b"http://unused-api").hexdigest(),
@@ -1486,12 +1722,13 @@ vllm:gpu_cache_usage_perc 0.5
 
                 payload = json.loads(receipt.read_text(encoding="utf-8"))
                 self.assertEqual(result, 2)
-                self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v5")
+                self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v6")
+                self.assertEqual(payload["receipt_schema_version"], 6)
                 self.assertEqual(payload["status"], "fail")
                 self.assertEqual(payload["failure_phase"], "preflight_configuration")
                 self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o600)
 
-    def test_main_routes_three_urls_and_emits_staged_v5_receipt(self) -> None:
+    def test_main_routes_three_urls_and_emits_staged_v6_receipt(self) -> None:
         input_bytes = b"%PDF-1.4 frozen fixture"
         input_sha = "sha256:" + hashlib.sha256(input_bytes).hexdigest()
         runtime_identity = "sha256:" + "a" * 64
@@ -1680,7 +1917,8 @@ vllm:gpu_cache_usage_perc 0.5
             )
             payload = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "pass")
-            self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v5")
+            self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v6")
+            self.assertEqual(payload["receipt_schema_version"], 6)
             self.assertEqual(
                 payload["topology"],
                 {

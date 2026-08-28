@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
@@ -49,7 +49,9 @@ from disclosure_anchor.settings import Settings
 
 
 _RECEIPT_SCHEMA = "mineru_smoke_receipt.v4"
-_STAGED_LOAD_RECEIPT_SCHEMA = "mineru_staged_load_receipt.v5"
+_STAGED_LOAD_RECEIPT_SCHEMA = "mineru_staged_load_receipt.v6"
+_STAGED_LOAD_RECEIPT_SCHEMA_VERSION = 6
+_STAGED_LOAD_ADMISSION_PROFILE = "copy-index-fifo.v1"
 _TASK_REGISTRY_SEMANTICS = "retained-terminal-gauges.v1"
 _DEPLOYMENT_INPUT_PROFILE = "deployment_frozen_v1"
 _STAGED_LOAD_INPUT_PROFILE = "operator_frozen_heterogeneous_v2"
@@ -67,7 +69,7 @@ _STAGED_DOCUMENT_EVIDENCE_FIELDS = {
     "workload_class",
 }
 _MAX_EVIDENCE_BYTES = 2 * 1024 * 1024
-# Staged v5 deliberately retains 0.25 s orchestrator, 1 s vLLM, and 5 s
+# Staged v6 deliberately retains 0.25 s orchestrator, 1 s vLLM, and 5 s
 # process-external host samples across the full 4/8/16 real-PDF rehearsal.
 # A valid run is therefore materially larger than the compact smoke/cache
 # evidence.  Keep the broader allowance type-specific and bounded; the same
@@ -534,7 +536,7 @@ def verify_mineru_deployment_gate(
         smoke_elapsed is None
         or not smoke_started_at < smoke_finished_at <= current_utc
         or not smoke_started_at <= passed_at <= smoke_finished_at
-        or not _elapsed_matches_timeline(
+        or not elapsed_matches_timeline(
             smoke_elapsed,
             started_at=smoke_started_at,
             finished_at=smoke_finished_at,
@@ -647,6 +649,53 @@ def _expected_stage_documents(
     return selected
 
 
+def verify_staged_load_admission_evidence(
+    stage: Mapping[str, object],
+    *,
+    document_count: int,
+) -> None:
+    """Prove that a PASS stage admitted every copy in its frozen FIFO order."""
+
+    expected = list(range(1, document_count + 1))
+    admission = stage.get("admission")
+    records = admission.get("records") if isinstance(admission, dict) else None
+    if (
+        stage.get("admission_order_profile") != _STAGED_LOAD_ADMISSION_PROFILE
+        or stage.get("admission_order_copy_indices") != expected
+        or not isinstance(admission, dict)
+        or set(admission)
+        != {
+            "profile",
+            "expected_copy_indices",
+            "admission_order_copy_indices",
+            "records",
+            "closed",
+            "abort_reason",
+        }
+        or admission.get("profile") != _STAGED_LOAD_ADMISSION_PROFILE
+        or admission.get("expected_copy_indices") != expected
+        or admission.get("admission_order_copy_indices") != expected
+        or admission.get("closed") is not True
+        or admission.get("abort_reason") is not None
+        or not isinstance(records, list)
+        or len(records) != document_count
+    ):
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load FIFO admission evidence is invalid"
+        )
+    for ordinal, record in enumerate(records):
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"copy_index", "admission_ordinal", "state"}
+            or record.get("copy_index") != ordinal + 1
+            or record.get("admission_ordinal") != ordinal
+            or record.get("state") != "completed"
+        ):
+            raise MinerUDeploymentGateError(
+                "MinerU staged-load FIFO admission record is invalid"
+            )
+
+
 def _verify_staged_load_receipt(
     receipt: dict[str, Any],
     *,
@@ -675,6 +724,8 @@ def _verify_staged_load_receipt(
         )
     if (
         receipt.get("schema") != _STAGED_LOAD_RECEIPT_SCHEMA
+        or receipt.get("receipt_schema_version")
+        != _STAGED_LOAD_RECEIPT_SCHEMA_VERSION
         or receipt.get("status") != "pass"
         or receipt.get("failure") is not None
     ):
@@ -814,6 +865,10 @@ def _verify_staged_load_receipt(
             or stage_elapsed <= 0
         ):
             raise MinerUDeploymentGateError("MinerU staged-load stage drifted")
+        verify_staged_load_admission_evidence(
+            stage,
+            document_count=document_count,
+        )
         total_stage_elapsed += stage_elapsed
         documents = stage.get("documents")
         if not isinstance(documents, list) or len(documents) != document_count:
@@ -857,7 +912,7 @@ def _verify_staged_load_receipt(
             or not isinstance(metrics.get("baseline"), dict)
             or not isinstance(metrics.get("range"), dict)
             or not isinstance(metrics.get("percentiles"), dict)
-            or not _metrics_payload_is_proved(
+            or not staged_load_metrics_are_proved(
                 metrics,
                 stage_elapsed_seconds=stage_elapsed,
             )
@@ -875,7 +930,7 @@ def _verify_staged_load_receipt(
             raise MinerUDeploymentGateError(
                 "MinerU staged-load preemption baseline changed between stages"
             )
-        _verify_staged_orchestrator(
+        verify_staged_load_orchestrator_evidence(
             stage.get("orchestrator"),
             stage_elapsed_seconds=stage_elapsed,
             task_slots=task_slots,
@@ -899,7 +954,7 @@ def _verify_staged_load_receipt(
     age = (current_utc - finished_at).total_seconds()
     if (
         not smoke_finished_at < started_at < finished_at <= current_utc
-        or not _elapsed_matches_timeline(
+        or not elapsed_matches_timeline(
             elapsed_seconds,
             started_at=started_at,
             finished_at=finished_at,
@@ -909,7 +964,7 @@ def _verify_staged_load_receipt(
         raise MinerUDeploymentGateError("MinerU smoke/staged-load timeline is invalid")
     if age < 0 or age > max_age_seconds:
         raise MinerUDeploymentGateError("MinerU staged-load receipt is stale")
-    host_epochs = _verify_host_capacity_evidence(
+    host_epochs = verify_host_capacity_evidence(
         receipt.get("host_capacity"),
         expected_identity=expected_host_identity,
         receipt_elapsed_seconds=elapsed_seconds,
@@ -922,7 +977,7 @@ def _verify_staged_load_receipt(
     )
 
 
-def _verify_host_capacity_evidence(
+def verify_host_capacity_evidence(
     value: object,
     *,
     expected_identity: dict[str, object],
@@ -1253,7 +1308,7 @@ def _verify_smoke_orchestrator(
         raise MinerUDeploymentGateError("MinerU smoke API evidence was not proved")
 
 
-def _verify_staged_orchestrator(
+def verify_staged_load_orchestrator_evidence(
     value: object,
     *,
     stage_elapsed_seconds: float,
@@ -1422,7 +1477,7 @@ def _endpoint_sha256(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.rstrip("/").encode("utf-8")).hexdigest()
 
 
-def _elapsed_matches_timeline(
+def elapsed_matches_timeline(
     elapsed_seconds: float,
     *,
     started_at: datetime,
@@ -1448,7 +1503,7 @@ def _cleanup_is_proved(value: object) -> bool:
     )
 
 
-def _metrics_payload_is_proved(
+def staged_load_metrics_are_proved(
     metrics: dict[str, Any],
     *,
     stage_elapsed_seconds: float,
@@ -1457,6 +1512,8 @@ def _metrics_payload_is_proved(
     ranges = metrics.get("range")
     percentiles = metrics.get("percentiles")
     sampling_failures = metrics.get("sampling_failures")
+    observer = metrics.get("observer")
+    transitions = observer.get("transitions") if isinstance(observer, dict) else None
     assert isinstance(baseline, dict)
     assert isinstance(ranges, dict)
     assert isinstance(percentiles, dict)
@@ -1467,27 +1524,51 @@ def _metrics_payload_is_proved(
         terminal_sample is None
         or terminal_sample > stage_elapsed_seconds
         or not isinstance(sampling_failures, list)
-        or len(sampling_failures) > 1
-        or any(
-            not isinstance(item, dict)
-            or (
-                observed_seconds := _nonnegative_finite_value(
-                    item.get("observed_seconds")
-                )
-            )
-            is None
-            or observed_seconds >= terminal_sample
-            or (
-                duration_seconds := _nonnegative_finite_value(
-                    item.get("duration_seconds")
-                )
-            )
-            is None
-            or duration_seconds > 10.0
-            or not isinstance(item.get("failure"), str)
-            or not item["failure"].startswith("MetricsTransportUnavailableError:")
-            for item in sampling_failures
+        or sampling_failures != []
+        or not isinstance(observer, dict)
+        or set(observer)
+        != {
+            "profile",
+            "state",
+            "observation_complete",
+            "hard_failure",
+            "transitions",
+        }
+        or observer.get("profile") != "metrics-observer.v1"
+        or observer.get("state") != "CLOSED"
+        or observer.get("observation_complete") is not True
+        or observer.get("hard_failure") is not None
+        or not isinstance(transitions, list)
+    ):
+        return False
+    observer_state = "STARTING"
+    transition_seconds = -1.0
+    observed_states: list[str] = []
+    assert isinstance(transitions, list)
+    for transition in transitions:
+        observed_seconds = (
+            _nonnegative_finite_value(transition.get("observed_seconds"))
+            if isinstance(transition, dict)
+            else None
         )
+        if (
+            not isinstance(transition, dict)
+            or set(transition) != {"from", "to", "reason", "observed_seconds"}
+            or transition.get("from") != observer_state
+            or transition.get("to")
+            not in {"HEALTHY", "DEGRADED_TRANSPORT", "CLOSED"}
+            or not isinstance(transition.get("reason"), str)
+            or not transition["reason"]
+            or observed_seconds is None
+            or observed_seconds < transition_seconds
+        ):
+            return False
+        observer_state = str(transition["to"])
+        transition_seconds = observed_seconds
+        observed_states.append(observer_state)
+    if (
+        observer_state != "CLOSED"
+        or observed_states != ["HEALTHY", "CLOSED"]
     ):
         return False
     normalized: dict[str, tuple[float, float, float]] = {}

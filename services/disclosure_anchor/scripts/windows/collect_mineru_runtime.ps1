@@ -2,11 +2,29 @@
 param(
     [string]$ComposePath = "C:\ProgramData\compose.tailnet.yaml",
     [string]$OutputRoot = "C:\ProgramData\agent-invest\mineru-api-output",
-    [switch]$CapacitySample
+    [switch]$CapacitySample,
+    [switch]$PhaseTrace,
+    [string]$TraceSinceUtc = "",
+    [string]$TraceUntilUtc = "",
+    [ValidateSet("legacy", "candidate")][string]$ExpectedCapacityMode = "legacy",
+    [string]$ExpectedProfileSha256 = "",
+    [ValidateRange(1, 200000)][int]$MaxTraceLines = 100000,
+    [ValidateRange(1024, 268435456)][int]$MaxTraceBytes = 67108864
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+
+if ($CapacitySample -and $PhaseTrace) {
+    throw "capacity sampling and phase-trace capture are mutually exclusive"
+}
+if (-not $PhaseTrace -and (
+    -not [string]::IsNullOrWhiteSpace($TraceSinceUtc) -or
+    -not [string]::IsNullOrWhiteSpace($TraceUntilUtc) -or
+    -not [string]::IsNullOrWhiteSpace($ExpectedProfileSha256)
+)) {
+    throw "phase-trace arguments require -PhaseTrace"
+}
 
 function Get-Sha256Text {
     param([Parameter(Mandatory = $true)][string]$Value)
@@ -175,6 +193,150 @@ function Select-ExactEnvironment {
     return $selected
 }
 
+if ($PhaseTrace) {
+    if (
+        [string]::IsNullOrWhiteSpace($TraceSinceUtc) -or
+        [string]::IsNullOrWhiteSpace($TraceUntilUtc) -or
+        $ExpectedProfileSha256 -notmatch '^sha256:[a-f0-9]{64}$'
+    ) {
+        throw "phase-trace capture requires UTC bounds and one profile hash"
+    }
+    $style = [Globalization.DateTimeStyles]::RoundtripKind
+    $culture = [Globalization.CultureInfo]::InvariantCulture
+    $since = [DateTimeOffset]::Parse($TraceSinceUtc, $culture, $style)
+    $until = [DateTimeOffset]::Parse($TraceUntilUtc, $culture, $style)
+    if (
+        $since.Offset -ne [TimeSpan]::Zero -or
+        $until.Offset -ne [TimeSpan]::Zero -or
+        $until -le $since -or
+        ($until - $since).TotalHours -gt 6
+    ) {
+        throw "phase-trace capture bounds must be increasing UTC within six hours"
+    }
+
+    $traceInspect = @(docker inspect mineru-api | ConvertFrom-Json)
+    if ($LASTEXITCODE -ne 0 -or $traceInspect.Count -ne 1) {
+        throw "cannot inspect MinerU API for phase-trace capture"
+    }
+    $traceContainer = $traceInspect[0]
+    if (
+        -not [bool]$traceContainer.State.Running -or
+        [string]$traceContainer.State.Health.Status -ne "healthy" -or
+        [int]$traceContainer.RestartCount -ne 0 -or
+        [bool]$traceContainer.State.OOMKilled
+    ) {
+        throw "MinerU API is not a clean phase-trace source"
+    }
+    $traceEnvironment = Convert-EnvironmentToMap -Values @($traceContainer.Config.Env)
+    $traceSwitch = ([string]$traceEnvironment["MINERU_PHASE_TRACE"]).Trim().ToLowerInvariant()
+    if ($traceSwitch -notin @("1", "true", "yes", "on")) {
+        throw "MinerU phase trace is not enabled"
+    }
+    if ([string]$traceEnvironment["MINERU_CAPACITY_MODE"] -ne $ExpectedCapacityMode) {
+        throw "MinerU capacity mode drifted during phase-trace capture"
+    }
+
+    $profileProbeCode = @'
+import json
+import os
+from mineru.utils.model_utils import (
+    capacity_runtime_status,
+    is_phase_trace_enabled,
+    legacy_capacity_execution_profile,
+)
+
+window_size = int(os.environ["MINERU_PROCESSING_WINDOW_SIZE"])
+runtime = capacity_runtime_status(window_size)
+if runtime["mode"] == "legacy":
+    active_profile_sha256 = legacy_capacity_execution_profile(
+        window_size
+    ).profile_sha256
+else:
+    candidate = runtime["candidate_profile"]
+    if candidate is None or not runtime["nonlegacy_admission_enabled"]:
+        raise RuntimeError("candidate admission is not enabled")
+    active_profile_sha256 = candidate["profile_sha256"]
+print(json.dumps({
+    "active_profile_sha256": active_profile_sha256,
+    "capacity_mode": runtime["mode"],
+    "phase_trace_enabled": is_phase_trace_enabled(),
+}, sort_keys=True, separators=(",", ":")))
+'@
+    $profileProbeOutput = @(
+        $profileProbeCode | & docker exec -i mineru-api /usr/bin/python3.12 -I -
+    )
+    if ($LASTEXITCODE -ne 0 -or $profileProbeOutput.Count -ne 1) {
+        throw "cannot bind the active MinerU phase-trace profile"
+    }
+    $profileProbe = ([string]$profileProbeOutput[0]) | ConvertFrom-Json
+    if (
+        -not [bool]$profileProbe.phase_trace_enabled -or
+        [string]$profileProbe.capacity_mode -ne $ExpectedCapacityMode -or
+        [string]$profileProbe.active_profile_sha256 -ne $ExpectedProfileSha256
+    ) {
+        throw "active MinerU phase-trace profile drifted"
+    }
+
+    $rawLogLines = @(
+        & docker logs --since ($since.ToString("o")) --until ($until.ToString("o")) `
+            mineru-api 2>&1 | ForEach-Object { [string]$_ }
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "cannot read bounded MinerU API logs"
+    }
+    $traceLines = @(
+        $rawLogLines | Where-Object { $_.StartsWith("MINERU_PHASE_TRACE ") }
+    )
+    if ($traceLines.Count -eq 0 -or $traceLines.Count -gt $MaxTraceLines) {
+        throw "phase-trace line count is empty or exceeds its bound"
+    }
+    [long]$traceByteCount = 0
+    foreach ($line in $traceLines) {
+        $traceByteCount += [Text.Encoding]::UTF8.GetByteCount($line) + 1
+        if ($traceByteCount -gt $MaxTraceBytes) {
+            throw "phase-trace bytes exceed their bound"
+        }
+        $event = $line.Substring("MINERU_PHASE_TRACE ".Length) | ConvertFrom-Json
+        if (
+            [string]$event.schema -ne "mineru-phase-trace.v2" -or
+            [string]$event.profile_sha256 -ne $ExpectedProfileSha256
+        ) {
+            throw "phase-trace event identity drifted"
+        }
+    }
+    $traceText = ($traceLines -join "`n") + "`n"
+    $machineGuid = (Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Cryptography" -Name MachineGuid).MachineGuid
+    $traceResult = [ordered]@{
+        schema = "mineru-phase-trace-capture.v1"
+        collected_at_utc = (Get-Date).ToUniversalTime().ToString("o")
+        collector_path = $PSCommandPath
+        collector_sha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $PSCommandPath).Hash.ToLowerInvariant())"
+        windows_node_identity_sha256 = Get-Sha256Text -Value ([string]$machineGuid).Trim().ToLowerInvariant()
+        since_utc = $since.ToUniversalTime().ToString("o")
+        until_utc = $until.ToUniversalTime().ToString("o")
+        capacity_mode = $ExpectedCapacityMode
+        active_profile_sha256 = $ExpectedProfileSha256
+        container = [ordered]@{
+            name = ([string]$traceContainer.Name).TrimStart("/")
+            id = [string]$traceContainer.Id
+            image = [string]$traceContainer.Config.Image
+            image_id = [string]$traceContainer.Image
+            started_at_utc = [string]$traceContainer.State.StartedAt
+            restart_count = [int]$traceContainer.RestartCount
+            oom_killed = [bool]$traceContainer.State.OOMKilled
+            running = [bool]$traceContainer.State.Running
+            status = [string]$traceContainer.State.Status
+            health = [string]$traceContainer.State.Health.Status
+        }
+        line_count = $traceLines.Count
+        trace_bytes = $traceByteCount
+        trace_lines_sha256 = Get-Sha256Text -Value $traceText
+        lines = $traceLines
+    }
+    $traceResult | ConvertTo-Json -Depth 20 -Compress
+    exit 0
+}
+
 if (-not (Test-Path -LiteralPath $ComposePath -PathType Leaf)) { throw "compose file is missing" }
 $resolvedConfig = & docker compose --project-name mineru-tailnet --file $ComposePath config --format json
 if ($LASTEXITCODE -ne 0) { throw "cannot resolve MinerU compose configuration" }
@@ -202,7 +364,10 @@ $apiAllowedEnvironment = @(
     "MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS", "MINERU_API_DISABLE_ACCESS_LOG",
     "MINERU_API_ENABLE_FASTAPI_DOCS", "MINERU_API_MAX_CONCURRENT_REQUESTS",
     "MINERU_API_OUTPUT_ROOT", "MINERU_API_TASK_RETENTION_SECONDS",
-    "MINERU_MALLOC_TRIM", "MINERU_MODEL_SOURCE", "MINERU_PROCESSING_WINDOW_SIZE"
+    "MINERU_CAPACITY_CATALOG_PATH", "MINERU_CAPACITY_CATALOG_SHA256",
+    "MINERU_CAPACITY_MODE", "MINERU_CAPACITY_PROFILE_JSON",
+    "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256", "MINERU_MALLOC_TRIM",
+    "MINERU_MODEL_SOURCE", "MINERU_PHASE_TRACE", "MINERU_PROCESSING_WINDOW_SIZE"
 )
 $vllmAllowedEnvironment = @("MINERU_MODEL_SOURCE")
 $apiEnvironment = Select-ExactEnvironment -ActualValues @($api.Config.Env) `
@@ -219,9 +384,14 @@ $compatProbeCode = @'
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 
-from mineru.utils.model_utils import is_heap_trim_enabled
+from mineru.utils.model_utils import (
+    capacity_runtime_status,
+    is_heap_trim_enabled,
+    is_phase_trace_enabled,
+)
 
 paths = (
     "mineru/backend/vlm/vlm_analyze.py",
@@ -230,7 +400,7 @@ paths = (
 )
 root = Path("/usr/local/lib/python3.12/dist-packages")
 marker = json.loads(
-    Path("/opt/agent-invest/mineru-heap-return-v1/compatibility.json")
+    Path("/opt/agent-invest/mineru-capacity-v1/compatibility.json")
     .read_text(encoding="utf-8")
 )
 print(json.dumps({
@@ -240,6 +410,10 @@ print(json.dumps({
         for path in paths
     },
     "heap_trim_enabled": is_heap_trim_enabled(),
+    "capacity_runtime": capacity_runtime_status(
+        int(os.environ["MINERU_PROCESSING_WINDOW_SIZE"])
+    ),
+    "phase_trace_enabled": is_phase_trace_enabled(),
     "mineru_version": importlib.metadata.version("mineru"),
 }, sort_keys=True, separators=(",", ":")))
 '@
@@ -255,6 +429,7 @@ if ([string]$compatProbe.mineru_version -ne "3.4.4") {
 }
 $compatLabelNames = @(
     "io.agent-invest.mineru.base-image-digest",
+    "io.agent-invest.mineru.capacity-policy",
     "io.agent-invest.mineru.compatibility-policy",
     "io.agent-invest.mineru.compatibility-patcher-sha256",
     "io.agent-invest.mineru.compatibility-dockerfile-sha256"
@@ -354,7 +529,9 @@ $result = [ordered]@{
     api_compatibility = [ordered]@{
         marker = $compatProbe.marker
         actual_source_sha256 = $compatProbe.actual_source_sha256
+        capacity_runtime = $compatProbe.capacity_runtime
         heap_trim_enabled = [bool]$compatProbe.heap_trim_enabled
+        phase_trace_enabled = [bool]$compatProbe.phase_trace_enabled
         image_labels = $compatLabels
     }
     proxy = [ordered]@{

@@ -1,4 +1,4 @@
-"""Closed MinerU runtime-bundle v5 identity regressions."""
+"""Closed MinerU runtime-bundle v6 identity regressions."""
 
 from __future__ import annotations
 
@@ -57,6 +57,7 @@ def _manifest() -> dict[str, object]:
             "mount_policy_sha256": _sha("6"),
             "network_policy_sha256": _sha("7"),
             "heap_return_compatibility_sha256": _sha("8"),
+            "capacity_runtime_compatibility_sha256": _sha("9"),
             "heap_return_policy": MINERU_HEAP_RETURN_POLICY,
             "mineru_version": "3.4.4",
             "api_protocol_version": MINERU_API_PROTOCOL_VERSION,
@@ -132,8 +133,8 @@ def _verify(manifest: dict[str, object]):  # type: ignore[no-untyped-def]
     )
 
 
-class MinerURuntimeIdentityV5Tests(unittest.TestCase):
-    def test_valid_v5_closes_all_three_runtime_roles_and_topology(self) -> None:
+class MinerURuntimeIdentityV6Tests(unittest.TestCase):
+    def test_valid_v6_closes_all_three_runtime_roles_and_topology(self) -> None:
         manifest = _manifest()
         verified = _verify(manifest)
 

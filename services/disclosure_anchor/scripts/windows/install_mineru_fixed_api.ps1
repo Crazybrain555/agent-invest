@@ -5,23 +5,27 @@ param(
     [Parameter(Mandatory = $true)][string]$CompatDockerfileSource,
     [Parameter(Mandatory = $true)][string]$CompatPatcherSource,
     [string]$ComposeTarget = "C:\ProgramData\compose.tailnet.yaml",
-    [string]$CollectorTarget = "C:\ProgramData\agent-invest\mineru-runtime-v5\collect_mineru_runtime.ps1",
-    [string]$ReceiptTarget = "C:\ProgramData\agent-invest\mineru-runtime-v5\install-receipt.json",
+    [string]$CollectorTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\collect_mineru_runtime.ps1",
+    [string]$ReceiptTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\install-receipt.json",
     [string]$OutputRoot = "C:\ProgramData\agent-invest\mineru-api-output",
     [string]$ExpectedRepoDigest = "mineru@sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458",
     [string]$ExpectedImageId = "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458",
+    [switch]$ReuseCurrentPublishedImage,
+    [string]$CampaignApiCompatImageId = "",
     [ValidateRange(1, 3)][int]$ExpectedApiTaskSlots = 1
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $ProjectName = "mineru-tailnet"
-$ApiCompatImage = "agent-invest/mineru-api:3.4.4-heap-return-v1"
+$ApiCompatImage = "agent-invest/mineru-api:3.4.4-capacity-v1"
 $ApiCompatBuildTag = "agent-invest/mineru-api:build-$([Guid]::NewGuid().ToString('N'))"
 $HeapReturnPolicy = "glibc-malloc-trim-per-window.v1"
+$CapacityPolicy = "bounded-two-window-capacity-pipeline.v2"
 $RequiredComposeTarget = "C:\ProgramData\compose.tailnet.yaml"
-$RequiredCollectorTarget = "C:\ProgramData\agent-invest\mineru-runtime-v5\collect_mineru_runtime.ps1"
-$RequiredReceiptTarget = "C:\ProgramData\agent-invest\mineru-runtime-v5\install-receipt.json"
+$RequiredCollectorTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\collect_mineru_runtime.ps1"
+$RequiredReceiptTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\install-receipt.json"
+$RequiredCapacityCatalogSource = "C:\ProgramData\agent-invest\mineru-runtime-v6\mineru-capacity-catalog.v1.json"
 $ExpectedApiCompatImageId = $null
 $OldApiCompatImageId = $null
 $CompatBuildTagCreated = $false
@@ -43,7 +47,7 @@ if (
         [StringComparison]::OrdinalIgnoreCase
     )
 ) {
-    throw "MinerU deployment targets must use the exact active compose and versioned v5 evidence paths"
+    throw "MinerU deployment targets must use the exact active compose and versioned v6 evidence paths"
 }
 $MutationStarted = $false
 $DeploymentAttempted = $false
@@ -52,6 +56,7 @@ $CollectorBackupCreated = $false
 $ReceiptBackupCreated = $false
 $OldProjectContainers = @()
 $OldRunningContainers = @()
+$StableServiceEpochs = $null
 $ComposeExisted = Test-Path -LiteralPath $ComposeTarget -PathType Leaf
 $CollectorExisted = Test-Path -LiteralPath $CollectorTarget -PathType Leaf
 $ReceiptExisted = Test-Path -LiteralPath $ReceiptTarget -PathType Leaf
@@ -59,6 +64,18 @@ $Timestamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
 $ComposeBackup = "$ComposeTarget.pre-fixed-api-$Timestamp.bak"
 $CollectorBackup = "$CollectorTarget.pre-fixed-api-$Timestamp.bak"
 $ReceiptBackup = "$ReceiptTarget.pre-fixed-api-$Timestamp.bak"
+if ($ReuseCurrentPublishedImage) {
+    if ($CampaignApiCompatImageId -notmatch '^sha256:[a-f0-9]{64}$') {
+        throw "reuse mode requires one canonical campaign API compatibility image ID"
+    }
+    if (-not $ComposeExisted -or -not $CollectorExisted -or -not $ReceiptExisted) {
+        throw "reuse mode requires one complete existing deployment"
+    }
+    $ExpectedApiCompatImageId = $CampaignApiCompatImageId
+}
+elseif (-not [string]::IsNullOrEmpty($CampaignApiCompatImageId)) {
+    throw "campaign API compatibility image ID is valid only in reuse mode"
+}
 
 function Invoke-Docker {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
@@ -89,6 +106,52 @@ function Get-OptionalImageId {
         throw "Docker image reference $Reference returned an invalid image ID"
     }
     return $imageId
+}
+
+function Get-StableServiceEpochs {
+    $inspect = (Invoke-Docker -Arguments @(
+        "inspect", "mineru-api-proxy", "mineru-openai-server"
+    )) | ConvertFrom-Json
+    if (@($inspect).Count -ne 2) {
+        throw "stable MinerU services were not uniquely inspectable"
+    }
+    $result = [ordered]@{}
+    foreach ($name in @("mineru-api-proxy", "mineru-openai-server")) {
+        $container = @($inspect | Where-Object { $_.Name -eq "/$name" })
+        if ($container.Count -ne 1) {
+            throw "stable MinerU service $name was not unique"
+        }
+        $container = $container[0]
+        if (
+            -not [bool]$container.State.Running -or
+            [string]$container.State.Health.Status -ne "healthy" -or
+            [int]$container.RestartCount -ne 0 -or
+            [bool]$container.State.OOMKilled -or
+            [string]$container.Id -notmatch '^[a-f0-9]{64}$' -or
+            [string]$container.Image -notmatch '^sha256:[a-f0-9]{64}$' -or
+            [string]::IsNullOrWhiteSpace([string]$container.State.StartedAt)
+        ) {
+            throw "stable MinerU service $name has an invalid epoch"
+        }
+        $result[$name] = [ordered]@{
+            container_id = [string]$container.Id
+            started_at = [string]$container.State.StartedAt
+            image_id = [string]$container.Image
+        }
+    }
+    return $result
+}
+
+function Assert-StableServiceEpochs {
+    param([Parameter(Mandatory = $true)][object]$Expected)
+    $actual = Get-StableServiceEpochs
+    foreach ($name in @("mineru-api-proxy", "mineru-openai-server")) {
+        foreach ($field in @("container_id", "started_at", "image_id")) {
+            if ([string]$actual[$name][$field] -ne [string]$Expected[$name][$field]) {
+                throw "stable MinerU service $name $field changed during API-only deployment"
+            }
+        }
+    }
 }
 
 function Write-Utf8NoBom {
@@ -298,6 +361,18 @@ function Capture-OldRuntimeState {
             Assert-VllmIdle
         }
     }
+    if ($ReuseCurrentPublishedImage) {
+        $required = @("mineru-api", "mineru-api-proxy", "mineru-openai-server")
+        if (
+            (@($script:OldProjectContainers | Sort-Object) -join ",") -ne
+                (@($required | Sort-Object) -join ",") -or
+            (@($script:OldRunningContainers | Sort-Object) -join ",") -ne
+                (@($required | Sort-Object) -join ",")
+        ) {
+            throw "reuse mode requires exactly three running MinerU containers"
+        }
+        $script:StableServiceEpochs = Get-StableServiceEpochs
+    }
 }
 
 function Wait-Healthy {
@@ -374,6 +449,88 @@ function Get-ValidatedRuntime {
     if (@($api.Config.Env) -notcontains "MINERU_MALLOC_TRIM=1") {
         throw "MinerU API heap-return compatibility switch is not enabled"
     }
+    $capacityModeEnvironment = @(
+        $api.Config.Env | Where-Object { $_ -like "MINERU_CAPACITY_MODE=*" }
+    )
+    if (
+        $capacityModeEnvironment.Count -ne 1 -or
+        $capacityModeEnvironment[0] -notin @(
+            "MINERU_CAPACITY_MODE=legacy", "MINERU_CAPACITY_MODE=candidate",
+            "MINERU_CAPACITY_MODE=auto"
+        )
+    ) {
+        throw "MinerU API capacity mode is not closed"
+    }
+    $capacityProfileEnvironment = @(
+        $api.Config.Env | Where-Object { $_ -like "MINERU_CAPACITY_PROFILE_JSON=*" }
+    )
+    if ($capacityProfileEnvironment.Count -ne 1) {
+        throw "MinerU API capacity profile is not unique"
+    }
+    try {
+        $capacityProfile = (
+            $capacityProfileEnvironment[0].Substring(
+                "MINERU_CAPACITY_PROFILE_JSON=".Length
+            ) | ConvertFrom-Json
+        )
+    }
+    catch {
+        throw "MinerU API capacity profile JSON is invalid"
+    }
+    $capacityProfileFields = @($capacityProfile.PSObject.Properties.Name | Sort-Object)
+    $expectedCapacityProfileFields = @(
+        "inner_inference_concurrency", "max_document_pages",
+        "max_resident_pages", "max_source_pdf_bytes", "min_document_pages",
+        "pipeline_depth", "profile_id", "schema", "vllm_max_num_seqs", "window_size"
+    ) | Sort-Object
+    if (
+        ($capacityProfileFields -join ",") -ne
+            ($expectedCapacityProfileFields -join ",") -or
+        [string]$capacityProfile.schema -ne "mineru-execution-profile.v2"
+    ) {
+        throw "MinerU API capacity profile contract drifted"
+    }
+    $capacityCatalogNames = @(
+        "MINERU_CAPACITY_CATALOG_PATH",
+        "MINERU_CAPACITY_CATALOG_SHA256",
+        "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256"
+    )
+    $capacityCatalogEnvironment = @{}
+    foreach ($name in $capacityCatalogNames) {
+        $matches = @($api.Config.Env | Where-Object { $_ -like "$name=*" })
+        if ($matches.Count -ne 1) {
+            throw "MinerU API Auto capacity catalog environment is not unique"
+        }
+        $capacityCatalogEnvironment[$name] = $matches[0].Substring($name.Length + 1)
+    }
+    $capacityMode = $capacityModeEnvironment[0].Substring(
+        "MINERU_CAPACITY_MODE=".Length
+    )
+    if ($capacityMode -eq "auto") {
+        if (
+            -not $capacityCatalogEnvironment["MINERU_CAPACITY_CATALOG_PATH"].StartsWith("/") -or
+            $capacityCatalogEnvironment["MINERU_CAPACITY_CATALOG_SHA256"] -notmatch '^sha256:[a-f0-9]{64}$' -or
+            $capacityCatalogEnvironment["MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256"] -notmatch '^sha256:[a-f0-9]{64}$'
+        ) {
+            throw "MinerU API Auto capacity catalog identity is incomplete"
+        }
+    }
+    elseif (
+        $capacityCatalogEnvironment["MINERU_CAPACITY_CATALOG_PATH"] -ne "" -or
+        $capacityCatalogEnvironment["MINERU_CAPACITY_CATALOG_SHA256"] -ne "" -or
+        $capacityCatalogEnvironment["MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256"] -ne ""
+    ) {
+        throw "MinerU API Auto capacity catalog leaked into non-Auto mode"
+    }
+    $phaseTraceEnvironment = @(
+        $api.Config.Env | Where-Object { $_ -like "MINERU_PHASE_TRACE=*" }
+    )
+    if (
+        $phaseTraceEnvironment.Count -ne 1 -or
+        $phaseTraceEnvironment[0] -notin @("MINERU_PHASE_TRACE=0", "MINERU_PHASE_TRACE=1")
+    ) {
+        throw "MinerU API phase-trace switch is not closed"
+    }
 
     $apiPortBindings = @(
         $api.NetworkSettings.Ports."8000/tcp" |
@@ -430,16 +587,40 @@ function Get-ValidatedRuntime {
     }
 
     $apiMounts = @($api.Mounts)
+    $expectedMountCount = if ($capacityMode -eq "auto") { 2 } else { 1 }
+    $outputMount = @(
+        $apiMounts | Where-Object {
+            [string]$_.Destination -eq "/var/lib/mineru-api-output"
+        }
+    )
     if (
-        $apiMounts.Count -ne 1 -or [string]$apiMounts[0].Type -ne "bind" -or
-        [string]$apiMounts[0].Destination -ne "/var/lib/mineru-api-output" -or
-        [bool]$apiMounts[0].RW -ne $true -or
-        [IO.Path]::GetFullPath([string]$apiMounts[0].Source) -ine
+        $apiMounts.Count -ne $expectedMountCount -or
+        $outputMount.Count -ne 1 -or
+        [string]$outputMount[0].Type -ne "bind" -or
+        [bool]$outputMount[0].RW -ne $true -or
+        [IO.Path]::GetFullPath([string]$outputMount[0].Source) -ine
             [IO.Path]::GetFullPath($OutputRoot) -or
         @($proxy.Mounts | Where-Object { $_.Type -ne "tmpfs" }).Count -ne 0 -or
         @($inference.Mounts).Count -ne 0
     ) {
         throw "MinerU mount policy drifted"
+    }
+    if ($capacityMode -eq "auto") {
+        $catalogMount = @(
+            $apiMounts | Where-Object {
+                [string]$_.Destination -eq
+                    $capacityCatalogEnvironment["MINERU_CAPACITY_CATALOG_PATH"]
+            }
+        )
+        if (
+            $catalogMount.Count -ne 1 -or
+            [string]$catalogMount[0].Type -ne "bind" -or
+            [bool]$catalogMount[0].RW -ne $false -or
+            [IO.Path]::GetFullPath([string]$catalogMount[0].Source) -ine
+                [IO.Path]::GetFullPath($RequiredCapacityCatalogSource)
+        ) {
+            throw "MinerU Auto catalog mount is not exact read-only"
+        }
     }
 
     Assert-RequiredProperties -Value $health -Names @(
@@ -499,7 +680,7 @@ function Get-ValidatedRuntime {
     }
 }
 
-function Build-ValidatedApiCompatImage {
+function Get-ApiCompatBuildIdentity {
     $dockerfile = [IO.Path]::GetFullPath($CompatDockerfileSource)
     $patcher = [IO.Path]::GetFullPath($CompatPatcherSource)
     $context = Split-Path -Parent $dockerfile
@@ -516,44 +697,87 @@ function Build-ValidatedApiCompatImage {
     }
     $patcherSha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $patcher).Hash.ToLowerInvariant())"
     $dockerfileSha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $dockerfile).Hash.ToLowerInvariant())"
-    Invoke-Docker -Arguments @(
-        "build", "--pull=false", "--file", $dockerfile,
-        "--tag", $ApiCompatBuildTag,
-        "--build-arg", "COMPAT_PATCHER_SHA256=$patcherSha256",
-        "--build-arg", "COMPAT_DOCKERFILE_SHA256=$dockerfileSha256",
-        $context
-    ) | Out-Null
-    $script:CompatBuildTagCreated = $true
-    $inspect = (Invoke-Docker -Arguments @("image", "inspect", $ApiCompatBuildTag)) |
+    return [ordered]@{
+        dockerfile = $dockerfile
+        patcher = $patcher
+        context = $context
+        patcher_sha256 = $patcherSha256
+        dockerfile_sha256 = $dockerfileSha256
+    }
+}
+
+function Get-ValidatedApiCompatImage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Reference,
+        [Parameter(Mandatory = $true)][string]$RequiredImageId,
+        [Parameter(Mandatory = $true)][object]$BuildIdentity
+    )
+    if ($RequiredImageId -notmatch '^sha256:[a-f0-9]{64}$') {
+        throw "MinerU API compatibility image ID is invalid"
+    }
+    $inspect = (Invoke-Docker -Arguments @("image", "inspect", $Reference)) |
         ConvertFrom-Json
-    if (@($inspect).Count -ne 1) {
-        throw "MinerU API compatibility image is not uniquely inspectable"
+    if (
+        @($inspect).Count -ne 1 -or
+        [string]$inspect[0].Id -ne $RequiredImageId
+    ) {
+        throw "MinerU API compatibility image is not uniquely bound to the required ID"
     }
     $image = $inspect[0]
     if (
         [string]$image.Config.Labels."io.agent-invest.mineru.base-image-digest" -ne
             $ExpectedImageId -or
+        [string]$image.Config.Labels."io.agent-invest.mineru.capacity-policy" -ne
+            $CapacityPolicy -or
         [string]$image.Config.Labels."io.agent-invest.mineru.compatibility-policy" -ne
             $HeapReturnPolicy -or
         [string]$image.Config.Labels."io.agent-invest.mineru.compatibility-patcher-sha256" -ne
-            $patcherSha256 -or
+            [string]$BuildIdentity.patcher_sha256 -or
         [string]$image.Config.Labels."io.agent-invest.mineru.compatibility-dockerfile-sha256" -ne
-            $dockerfileSha256 -or
-        @($image.Config.Env) -notcontains "MINERU_MALLOC_TRIM=1"
+            [string]$BuildIdentity.dockerfile_sha256 -or
+        @($image.Config.Env) -notcontains "MINERU_MALLOC_TRIM=1" -or
+        @($image.Config.Env) -notcontains "MINERU_PHASE_TRACE=0" -or
+        @($image.Config.Env) -notcontains "MINERU_CAPACITY_MODE=legacy"
     ) {
         throw "MinerU API compatibility image labels or environment drifted"
     }
-    $script:ExpectedApiCompatImageId = [string]$image.Id
+    return [ordered]@{
+        image = $ApiCompatImage
+        image_id = $RequiredImageId
+        policy = $HeapReturnPolicy
+        capacity_policy = $CapacityPolicy
+        patcher_sha256 = [string]$BuildIdentity.patcher_sha256
+        dockerfile_sha256 = [string]$BuildIdentity.dockerfile_sha256
+    }
+}
+
+function Build-ValidatedApiCompatImage {
+    $identity = Get-ApiCompatBuildIdentity
+    Invoke-Docker -Arguments @(
+        "build", "--pull=false", "--provenance=false", "--file",
+        [string]$identity.dockerfile,
+        "--tag", $ApiCompatBuildTag,
+        "--build-arg", "COMPAT_PATCHER_SHA256=$($identity.patcher_sha256)",
+        "--build-arg", "COMPAT_DOCKERFILE_SHA256=$($identity.dockerfile_sha256)",
+        [string]$identity.context
+    ) | Out-Null
+    $script:CompatBuildTagCreated = $true
+    $script:ExpectedApiCompatImageId = Get-OptionalImageId -Reference $ApiCompatBuildTag
     if ($ExpectedApiCompatImageId -notmatch '^sha256:[a-f0-9]{64}$') {
         throw "MinerU API compatibility image ID is invalid"
     }
-    return [ordered]@{
-        image = $ApiCompatImage
-        image_id = $ExpectedApiCompatImageId
-        policy = $HeapReturnPolicy
-        patcher_sha256 = $patcherSha256
-        dockerfile_sha256 = $dockerfileSha256
+    return (Get-ValidatedApiCompatImage -Reference $ApiCompatBuildTag `
+        -RequiredImageId $ExpectedApiCompatImageId -BuildIdentity $identity)
+}
+
+function Get-ValidatedPublishedApiCompatImage {
+    $identity = Get-ApiCompatBuildIdentity
+    $publishedImageId = Get-OptionalImageId -Reference $ApiCompatImage
+    if ($publishedImageId -ne $CampaignApiCompatImageId) {
+        throw "published MinerU API compatibility tag does not match campaign image ID"
     }
+    return (Get-ValidatedApiCompatImage -Reference $ApiCompatImage `
+        -RequiredImageId $CampaignApiCompatImageId -BuildIdentity $identity)
 }
 
 function Remove-CompatBuildTag {
@@ -593,6 +817,24 @@ function Restore-PreviousDeployment {
     }
     elseif (Test-Path -LiteralPath $ReceiptTarget) {
         Remove-Item -LiteralPath $ReceiptTarget -Force
+    }
+
+    if ($ReuseCurrentPublishedImage) {
+        if ((Get-OptionalImageId -Reference $ApiCompatImage) -ne $CampaignApiCompatImageId) {
+            throw "campaign image tag drifted before API-only rollback"
+        }
+        Invoke-Docker -Arguments @(
+            "compose", "--project-name", $ProjectName, "--file", $ComposeTarget,
+            "up", "--detach", "--no-build", "--no-deps", "--force-recreate",
+            "mineru-api"
+        ) | Out-Null
+        Get-ValidatedRuntime | Out-Null
+        Assert-StableServiceEpochs -Expected $StableServiceEpochs
+        if ((Get-OptionalImageId -Reference $ApiCompatImage) -ne $CampaignApiCompatImageId) {
+            throw "campaign image tag drifted during API-only rollback"
+        }
+        Remove-CompatBuildTag
+        return
     }
 
     Restore-ApiCompatTag
@@ -674,8 +916,15 @@ try {
     if (@(Get-ChildItem -LiteralPath $OutputRoot -Recurse -File -Force).Count -ne 0) {
         throw "output root must be empty before installation"
     }
-    $OldApiCompatImageId = Get-OptionalImageId -Reference $ApiCompatImage
-    $compatImage = Build-ValidatedApiCompatImage
+    if ($ReuseCurrentPublishedImage) {
+        $compatImage = Get-ValidatedPublishedApiCompatImage
+        Get-ValidatedRuntime | Out-Null
+        Assert-StableServiceEpochs -Expected $StableServiceEpochs
+    }
+    else {
+        $OldApiCompatImageId = Get-OptionalImageId -Reference $ApiCompatImage
+        $compatImage = Build-ValidatedApiCompatImage
+    }
     if ($ComposeExisted) {
         Copy-Item -LiteralPath $ComposeTarget -Destination $ComposeBackup
         $ComposeBackupCreated = $true
@@ -690,12 +939,14 @@ try {
     }
 
     $MutationStarted = $true
-    Invoke-Docker -Arguments @(
-        "tag", $ExpectedApiCompatImageId, $ApiCompatImage
-    ) | Out-Null
-    $CompatTagSwitched = $true
-    if ((Get-OptionalImageId -Reference $ApiCompatImage) -ne $ExpectedApiCompatImageId) {
-        throw "MinerU API compatibility publish tag did not bind the built image ID"
+    if (-not $ReuseCurrentPublishedImage) {
+        Invoke-Docker -Arguments @(
+            "tag", $ExpectedApiCompatImageId, $ApiCompatImage
+        ) | Out-Null
+        $CompatTagSwitched = $true
+        if ((Get-OptionalImageId -Reference $ApiCompatImage) -ne $ExpectedApiCompatImageId) {
+            throw "MinerU API compatibility publish tag did not bind the built image ID"
+        }
     }
     Copy-Item -LiteralPath $ComposeSource -Destination $ComposeTarget -Force
     Copy-Item -LiteralPath $CollectorSource -Destination $CollectorTarget -Force
@@ -709,11 +960,26 @@ try {
     }
 
     $DeploymentAttempted = $true
-    Invoke-Docker -Arguments @(
-        "compose", "--project-name", $ProjectName, "--file", $ComposeTarget,
-        "up", "--detach", "--remove-orphans"
-    ) | Out-Null
+    if ($ReuseCurrentPublishedImage) {
+        Invoke-Docker -Arguments @(
+            "compose", "--project-name", $ProjectName, "--file", $ComposeTarget,
+            "up", "--detach", "--no-build", "--no-deps", "--force-recreate",
+            "mineru-api"
+        ) | Out-Null
+    }
+    else {
+        Invoke-Docker -Arguments @(
+            "compose", "--project-name", $ProjectName, "--file", $ComposeTarget,
+            "up", "--detach", "--remove-orphans"
+        ) | Out-Null
+    }
     $runtime = Get-ValidatedRuntime
+    if ($ReuseCurrentPublishedImage) {
+        Assert-StableServiceEpochs -Expected $StableServiceEpochs
+        if ((Get-OptionalImageId -Reference $ApiCompatImage) -ne $CampaignApiCompatImageId) {
+            throw "campaign image tag drifted during API-only deployment"
+        }
+    }
     $collectorOutput = @(
         & $CollectorTarget -ComposePath $ComposeTarget -OutputRoot $OutputRoot
     )

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v5"
+RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v6"
 MINERU_PROCESSING_WINDOW_SIZE = 16
 MINERU_API_PROTOCOL_VERSION = 2
 MINERU_API_DEFAULT_TASK_SLOTS = 1
@@ -27,7 +27,7 @@ MINERU_API_EGRESS_POLICY = "dedicated-internal-vllm-only.v1"
 MINERU_HEAP_RETURN_POLICY = "glibc-malloc-trim-per-window.v1"
 MINERU_WINDOWS_COMPOSE_PATH = r"C:\ProgramData\compose.tailnet.yaml"
 MINERU_WINDOWS_COLLECTOR_PATH = (
-    r"C:\ProgramData\agent-invest\mineru-runtime-v5\collect_mineru_runtime.ps1"
+    r"C:\ProgramData\agent-invest\mineru-runtime-v6\collect_mineru_runtime.ps1"
 )
 MINERU_SMOKE_INPUT_NAME = "sample_announcement.pdf"
 MINERU_SMOKE_INPUT_SHA256 = (
@@ -68,6 +68,7 @@ _ORCHESTRATOR_MANIFEST_FIELDS = {
     "mount_policy_sha256",
     "network_policy_sha256",
     "heap_return_compatibility_sha256",
+    "capacity_runtime_compatibility_sha256",
     "heap_return_policy",
     "mineru_version",
     "api_protocol_version",
@@ -331,6 +332,7 @@ def _verify_orchestrator_manifest(
         "mount_policy_sha256",
         "network_policy_sha256",
         "heap_return_compatibility_sha256",
+        "capacity_runtime_compatibility_sha256",
     ):
         _require_sha256(
             orchestrator.get(field),
