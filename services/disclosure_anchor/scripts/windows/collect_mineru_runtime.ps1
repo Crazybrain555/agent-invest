@@ -67,12 +67,34 @@ function ConvertFrom-NativeProcessText {
     return @($trimmed -split "`r?`n")
 }
 
+function Assert-NativeProcessArguments {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [object[]]$Arguments
+    )
+    for ($index = 0; $index -lt $Arguments.Count; $index++) {
+        $argument = $Arguments[$index]
+        if ($null -eq $argument) {
+            throw "native process argument $index must not be null"
+        }
+        if ($argument.GetType() -ne [string]) {
+            throw (
+                "native process argument $index must be a string; actual type: " +
+                $argument.GetType().FullName
+            )
+        }
+    }
+}
+
 function Invoke-NativeProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][object[]]$Arguments,
         [AllowNull()][string]$StandardInput = $null
     )
+    Assert-NativeProcessArguments -Arguments $Arguments
     $startInfo = New-Object Diagnostics.ProcessStartInfo
     $startInfo.FileName = $FilePath
     $startInfo.Arguments = (@(
@@ -130,10 +152,11 @@ function Invoke-NativeProcess {
 
 function Invoke-DockerProcess {
     param(
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][object[]]$Arguments,
         [AllowNull()][string]$StandardInput = $null,
         [int[]]$AllowedExitCodes = @(0)
     )
+    Assert-NativeProcessArguments -Arguments $Arguments
     $result = Invoke-NativeProcess -FilePath $DockerCommand -Arguments $Arguments `
         -StandardInput $StandardInput
     if ($AllowedExitCodes -notcontains $result.ExitCode) {
@@ -152,8 +175,9 @@ function Invoke-DockerProcess {
 
 function Invoke-Docker {
     param(
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string[]]$Arguments
+        [Parameter(Mandatory = $true)][AllowEmptyString()][object[]]$Arguments
     )
+    Assert-NativeProcessArguments -Arguments $Arguments
     $result = Invoke-DockerProcess -Arguments $Arguments
     return @(ConvertFrom-NativeProcessText -Value $result.StandardOutput)
 }

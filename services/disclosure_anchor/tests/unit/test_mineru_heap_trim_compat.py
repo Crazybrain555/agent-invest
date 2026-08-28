@@ -1420,6 +1420,10 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("# Cleanup is best-effort; preserve the original process error.", installer_helper)
         self.assertIn("throw $originalError", installer_helper)
         self.assertIn("ConvertTo-WindowsCommandLineArgument", installer_helper)
+        self.assertIn("function Assert-NativeProcessArguments", installer_helper)
+        self.assertIn("$null -eq $argument", installer_helper)
+        self.assertIn("$argument.GetType() -ne [string]", installer_helper)
+        self.assertNotIn("[string[]]$Arguments", installer_helper)
         native_signature = installer_helper[
             installer_helper.index("function Invoke-NativeProcess") :
             installer_helper.index("$startInfo = New-Object Diagnostics.ProcessStartInfo")
@@ -1433,15 +1437,36 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             installer_helper.index("$result = Invoke-DockerProcess -Arguments $Arguments")
         ]
         self.assertIn(
-            "[AllowEmptyCollection()][AllowEmptyString()][string[]]$Arguments",
+            "[AllowEmptyCollection()][AllowEmptyString()][object[]]$Arguments",
             native_signature,
         )
         self.assertNotIn("[AllowEmptyCollection()]", docker_process_signature)
         self.assertIn(
-            "[AllowEmptyString()][string[]]$Arguments", docker_process_signature
+            "[AllowEmptyString()][object[]]$Arguments", docker_process_signature
         )
         self.assertNotIn("[AllowEmptyCollection()]", docker_signature)
-        self.assertIn("[AllowEmptyString()][string[]]$Arguments", docker_signature)
+        self.assertIn("[AllowEmptyString()][object[]]$Arguments", docker_signature)
+        self.assertLess(
+            installer_helper.index(
+                "Assert-NativeProcessArguments",
+                installer_helper.index("function Invoke-NativeProcess"),
+            ),
+            installer_helper.index("$startInfo = New-Object"),
+        )
+        self.assertLess(
+            installer_helper.index(
+                "Assert-NativeProcessArguments",
+                installer_helper.index("function Invoke-DockerProcess"),
+            ),
+            installer_helper.index("$result = Invoke-NativeProcess"),
+        )
+        self.assertLess(
+            installer_helper.index(
+                "Assert-NativeProcessArguments",
+                installer_helper.index("function Invoke-Docker {"),
+            ),
+            installer_helper.index("$result = Invoke-DockerProcess"),
+        )
         self.assertNotIn(".ArgumentList", installer_helper)
         self.assertNotIn("Start-Process", installer_helper)
         self.assertNotIn("$LASTEXITCODE", installer)
