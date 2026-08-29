@@ -296,7 +296,7 @@
   },
   "tests/unit/test_mineru_heap_trim_compat.py": {
    "private_imports": [],
-   "tests": 21
+   "tests": 20
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],

@@ -7,9 +7,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from disclosure_anchor.adapters.runtime.mineru_identity import (
-    canonical_payload_sha256,
+from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
+    MinerUDeploymentGateError,
+    VerifiedMinerUHeldoutValidation,
 )
 from scripts.build_mineru_validation_receipt import build_receipt
 from scripts.collect_mineru_phase_trace import _validation_identity
@@ -42,41 +44,37 @@ class CollectMineruPhaseTraceTests(unittest.TestCase):
         )
 
     def test_identity_conserves_validation_documents_and_pages(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            value = _validation_identity(self._validation(Path(tmp)))
+        now = datetime.now(UTC)
+        verified = VerifiedMinerUHeldoutValidation(
+            started_at_utc=now - timedelta(seconds=10),
+            finished_at_utc=now - timedelta(seconds=5),
+            runtime_identity_sha256="sha256:" + "1" * 64,
+            collector_sha256="sha256:" + "2" * 64,
+            windows_node_identity_sha256="sha256:" + "3" * 64,
+            api_container_id="5" * 64,
+            document_count=2,
+            page_count=7,
+        )
+        with patch(
+            "scripts.collect_mineru_phase_trace."
+            "verify_mineru_heldout_validation",
+            return_value=verified,
+        ) as shared:
+            value = _validation_identity({}, contract={})
 
         self.assertEqual(value[6], 2)
         self.assertEqual(value[7], 7)
         self.assertRegex(value[2], r"^sha256:[a-f0-9]{64}$")
         self.assertEqual(value[5], "5" * 64)
+        shared.assert_called_once_with({})
 
-    def test_hash_epoch_and_page_drift_fail_closed(self) -> None:
-        for tamper in ("hash", "epoch", "page"):
-            with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as tmp:
-                receipt = self._validation(Path(tmp))
-                if tamper == "hash":
-                    receipt["documents"][0]["receipt"]["provider"][
-                        "page_count"
-                    ] += 1
-                elif tamper == "epoch":
-                    after = receipt["epoch_after"]
-                    after["receipt"]["service_epoch"]["api_container_id"] = "6" * 64
-                    after["receipt"]["service_epoch_sha256"] = (
-                        canonical_payload_sha256(
-                            after["receipt"]["service_epoch"]
-                        )
-                    )
-                    after["receipt_sha256"] = canonical_payload_sha256(
-                        after["receipt"]
-                    )
-                else:
-                    document = receipt["documents"][0]
-                    document["receipt"]["provider"]["page_count"] += 1
-                    document["receipt_sha256"] = canonical_payload_sha256(
-                        document["receipt"]
-                    )
-                with self.assertRaises(ValueError):
-                    _validation_identity(receipt)
+    def test_shared_validation_failure_is_fail_closed(self) -> None:
+        with patch(
+            "scripts.collect_mineru_phase_trace."
+            "verify_mineru_heldout_validation",
+            side_effect=MinerUDeploymentGateError("page drift"),
+        ), self.assertRaisesRegex(ValueError, "page drift"):
+            _validation_identity({}, contract={})
 
     def test_serialized_receipt_contains_no_document_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

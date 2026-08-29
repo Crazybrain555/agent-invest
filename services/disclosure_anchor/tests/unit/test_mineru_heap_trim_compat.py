@@ -771,23 +771,13 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertEqual(patched_hybrid.count('"window_layout",'), 4)
         self.assertEqual(patched_hybrid.count('"window_postprocess",'), 4)
         self.assertEqual(patched_hybrid.count('"window_total",'), 3)
-        self.assertIn("except CapacityCandidateFallback:", patched_hybrid)
-        self.assertIn('middle_json.get("pdf_info")', patched_hybrid)
-        self.assertIn("allow_auto_fallback=allow_auto_fallback", patched_hybrid)
+        self.assertNotIn("CapacityCandidateFallback", patched_hybrid)
+        self.assertNotIn("allow_auto_fallback", patched_hybrid)
         capacity_helper = patched_hybrid[
             patched_hybrid.index("async def _aio_run_hybrid_capacity_pipeline(") :
             patched_hybrid.index("async def aio_doc_analyze(")
         ]
-        self.assertLess(
-            capacity_helper.index("fallback_gate.close_before_output()"),
-            capacity_helper.index("model_list.extend(window_model_list)"),
-        )
-        self.assertIn(
-            'credit_lease is None\n                    or (\n'
-            '                        resources_released\n'
-            '                        and credit_lease.state == "released"',
-            capacity_helper,
-        )
+        self.assertIn("model_list.extend(window_model_list)", capacity_helper)
 
     def test_phase_trace_is_default_off_content_free_and_strictly_closed(self) -> None:
         source = (
@@ -1414,36 +1404,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
-    def test_fallback_gate_closes_atomically_before_candidate_output(self) -> None:
-        source = (
-            "import math\nimport os\nimport time\nimport gc\n"
-            "\ndef clean_memory(device='cuda'):\n    gc.collect()\n"
-        )
-        namespace: dict[str, object] = {}
-        exec(
-            compile(
-                patch_source("mineru/utils/model_utils.py", source),
-                "patched-model-utils.py",
-                "exec",
-            ),
-            namespace,
-        )
-        fallback_type = namespace["CapacityCandidateFallback"]
-        gate = namespace["CapacityFallbackGate"](True)
-        claimed = gate.claim("pre-append failure", RuntimeError("boom"))
-        self.assertIsInstance(claimed, fallback_type)
-        with self.assertRaises(fallback_type) as raised:
-            gate.close_before_output()
-        self.assertIs(raised.exception, claimed)
-
-        closed_gate = namespace["CapacityFallbackGate"](True)
-        closed_gate.close_before_output()
-        self.assertFalse(closed_gate.is_open)
-        self.assertIsNone(
-            closed_gate.claim("too late", RuntimeError("after append boundary"))
-        )
-
-    def test_render_failure_releases_credit_before_whole_document_fallback(
+    def test_render_failure_releases_credit_without_document_fallback(
         self,
     ) -> None:
         model_utils_source = (
@@ -1542,8 +1503,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             )
 
         async def exercise() -> None:
-            fallback_type = runtime["CapacityCandidateFallback"]
-            with self.assertRaises(fallback_type) as raised:
+            with self.assertRaises(RuntimeError):
                 await helper_namespace["_aio_run_hybrid_capacity_pipeline"](
                     pdf_bytes=b"pdf",
                     pdf_doc=object(),
@@ -1561,9 +1521,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                     a_owner=asyncio.Lock(),
                     c_owner=asyncio.Lock(),
                     execution_profile=profile,
-                    allow_auto_fallback=True,
                 )
-            self.assertIsInstance(raised.exception.__cause__, RuntimeError)
 
         asyncio.run(exercise())
         self.assertEqual(render_states, ["leased"])

@@ -874,31 +874,6 @@ class CapacityCreditBank:
             raise RuntimeError("capacity document leases did not close")
 
 
-class CapacityCandidateFallback(RuntimeError):
-    """Signal a drained, pre-append Auto candidate failure safe to replay."""
-
-
-class CapacityFallbackGate:
-    """Atomically separate safe replay from the first observable mutation."""
-
-    def __init__(self, enabled: bool) -> None:
-        self.enabled = bool(enabled)
-        self.is_open = self.enabled
-        self.claimed = None
-
-    def claim(self, message: str, primary):
-        if not self.is_open or not isinstance(primary, Exception):
-            return None
-        if self.claimed is None:
-            self.claimed = CapacityCandidateFallback(message)
-        return self.claimed
-
-    def close_before_output(self) -> None:
-        if self.claimed is not None:
-            raise self.claimed
-        self.is_open = False
-
-
 class MinerUPhaseTrace:
     """Emit content-free interval events that remain valid under overlap."""
 
@@ -1833,9 +1808,7 @@ def trim_process_heap() -> bool:
             source,
             "from mineru.utils.model_utils import clean_memory, crop_img, get_vram\n",
             "from mineru.utils.model_utils import (\n"
-            "    CapacityCandidateFallback,\n"
             "    CapacityCreditBank,\n"
-            "    capacity_mode,\n"
             "    clean_memory,\n"
             "    crop_img,\n"
             "    get_vram,\n"
@@ -1915,7 +1888,6 @@ def trim_process_heap() -> bool:
     a_owner,
     c_owner,
     execution_profile,
-    allow_auto_fallback,
 ):
     """Run a two-window, ordered A/B/C pipeline inside one whole PDF."""
     model_list = []
@@ -1923,7 +1895,6 @@ def trim_process_heap() -> bool:
     progress_bar = None
     last_append_end_time = None
     expected_append_index = 0
-    fallback_gate = CapacityFallbackGate(allow_auto_fallback)
     credit_bank = CapacityCreditBank(execution_profile)
     windows = tuple(
         (
@@ -2150,24 +2121,6 @@ def trim_process_heap() -> bool:
                         window=trace_window,
                         credit_lease=credit_lease,
                     )
-            fallback_safe = bool(
-                expected_append_index == 0
-                and fallback_gate.is_open
-                and allow_auto_fallback
-                and isinstance(primary, Exception)
-                and (
-                    credit_lease is None
-                    or (
-                        resources_released
-                        and credit_lease.state == "released"
-                    )
-                )
-            )
-            if fallback_safe:
-                raise fallback_gate.claim(
-                    "Auto candidate preparation failed before the first append",
-                    primary,
-                ) from primary
             raise
 
     async def infer(prepared, inference_started):
@@ -2207,13 +2160,7 @@ def trim_process_heap() -> bool:
                         )
                     )
             raise ValueError(f"Unsupported hybrid effort: {effort}")
-        except Exception as primary:
-            fallback = fallback_gate.claim(
-                "Auto candidate inference failed before the first append",
-                primary,
-            )
-            if fallback is not None:
-                raise fallback from primary
+        except Exception:
             raise
 
     async def commit(prepared, window_model_list) -> None:
@@ -2265,15 +2212,6 @@ def trim_process_heap() -> bool:
                     outcome="error",
                     credit_lease=prepared["credit_lease"],
                 )
-                if (
-                    fallback_gate.is_open
-                    and allow_auto_fallback
-                    and isinstance(primary, Exception)
-                ):
-                    raise fallback_gate.claim(
-                        "Auto candidate postprocess failed before the first append",
-                        primary,
-                    ) from primary
                 raise
             phase_trace.complete(
                 "window_postprocess",
@@ -2284,7 +2222,6 @@ def trim_process_heap() -> bool:
             # No await is permitted between this close and the first mutation.
             # The event loop therefore cannot misclassify a speculative failure
             # as pre-append after candidate output becomes observable.
-            fallback_gate.close_before_output()
             hybrid_pipeline_model = pipeline_model
             if prepared["window_index"] != expected_append_index:
                 raise RuntimeError("capacity pipeline append order drifted")
@@ -2341,17 +2278,13 @@ def trim_process_heap() -> bool:
 
     infer_start = time.time()
     try:
-        try:
-            await run_bounded_ordered_pipeline(
-                windows,
-                prepare=prepare,
-                infer=infer,
-                commit=commit,
-                release=release,
-            )
-        except CapacityCandidateFallback:
-            credit_bank.assert_fully_released()
-            raise
+        await run_bounded_ordered_pipeline(
+            windows,
+            prepare=prepare,
+            infer=infer,
+            commit=commit,
+            release=release,
+        )
         credit_bank.assert_fully_released()
     finally:
         if progress_bar is not None:
@@ -2580,92 +2513,51 @@ def trim_process_heap() -> bool:
             "        phase_trace.document_started()\n\n"
             "        if execution_profile.pipeline_mode == \"depth1\":\n"
             "            a_owner, c_owner = process_capacity_stage_gates()\n"
-            "            allow_auto_fallback = capacity_mode() == \"auto\"\n"
-            "            try:\n"
-            "                model_list, hybrid_pipeline_model = (\n"
-            "                    await _aio_run_hybrid_capacity_pipeline(\n"
-            "                        pdf_bytes=pdf_bytes,\n"
-            "                        pdf_doc=pdf_doc,\n"
-            "                        image_writer=image_writer,\n"
-            "                        predictor=predictor,\n"
-            "                        middle_json=middle_json,\n"
-            "                        page_count=page_count,\n"
-            "                        effective_window_size=effective_window_size,\n"
-            "                        phase_trace=phase_trace,\n"
-            "                        inline_formula_enable=inline_formula_enable,\n"
-            "                        batch_ratio=batch_ratio,\n"
-            "                        ocr_enable=_ocr_enable,\n"
-            "                        effort=effort,\n"
-            "                        effective_image_analysis=effective_image_analysis,\n"
-            "                        a_owner=a_owner,\n"
-            "                        c_owner=c_owner,\n"
-            "                        execution_profile=execution_profile,\n"
-            "                        allow_auto_fallback=allow_auto_fallback,\n"
-            "                    )\n"
-            "                )\n"
-            "            except CapacityCandidateFallback:\n"
-            "                if not allow_auto_fallback:\n"
-            "                    raise\n"
-            "                if middle_json.get(\"pdf_info\"):\n"
-            "                    raise RuntimeError(\n"
-            "                        \"Auto fallback observed candidate output\"\n"
-            "                    )\n"
-            "                phase_trace.document_failed()\n"
-            "                execution_profile = legacy_capacity_execution_profile(\n"
-            "                    configured_window_size\n"
-            "                )\n"
-            "                active_window_size = execution_profile.window_size\n"
-            "                effective_window_size = (\n"
-            "                    min(page_count, active_window_size) if page_count else 0\n"
-            "                )\n"
-            "                total_windows = (\n"
-            "                    (page_count + effective_window_size - 1)\n"
-            "                    // effective_window_size\n"
-            "                    if effective_window_size\n"
-            "                    else 0\n"
-            "                )\n"
-            "                phase_trace = new_phase_trace(\n"
-            "                    backend=\"hybrid\",\n"
+            "            model_list, hybrid_pipeline_model = (\n"
+            "                await _aio_run_hybrid_capacity_pipeline(\n"
+            "                    pdf_bytes=pdf_bytes,\n"
+            "                    pdf_doc=pdf_doc,\n"
+            "                    image_writer=image_writer,\n"
+            "                    predictor=predictor,\n"
+            "                    middle_json=middle_json,\n"
             "                    page_count=page_count,\n"
-            "                    window_size=active_window_size,\n"
-            "                    total_windows=total_windows,\n"
+            "                    effective_window_size=effective_window_size,\n"
+            "                    phase_trace=phase_trace,\n"
+            "                    inline_formula_enable=inline_formula_enable,\n"
+            "                    batch_ratio=batch_ratio,\n"
+            "                    ocr_enable=_ocr_enable,\n"
+            "                    effort=effort,\n"
+            "                    effective_image_analysis=effective_image_analysis,\n"
+            "                    a_owner=a_owner,\n"
+            "                    c_owner=c_owner,\n"
             "                    execution_profile=execution_profile,\n"
-            "                    source_pdf_bytes=len(pdf_bytes),\n"
-            "                    hybrid_batch_ratio_requested=batch_ratio_requested,\n"
-            "                    hybrid_batch_ratio_effective=batch_ratio,\n"
-            "                    hybrid_batch_ratio_ocr_override=batch_ratio_ocr_override,\n"
             "                )\n"
-            "                phase_trace.document_started()\n"
-            "                logger.warning(\n"
-            "                    \"Auto capacity candidate failed before append; \"\n"
-            "                    \"replaying this document with the legacy profile\"\n"
+            "            )\n"
+            "            finalize_started_ns = phase_trace.start()\n"
+            "            if client_side_output_generation:\n"
+            "                await run_native_owned(\n"
+            "                    c_owner,\n"
+            "                    apply_server_side_postprocess,\n"
+            "                    middle_json[\"pdf_info\"],\n"
+            "                    hybrid_pipeline_model,\n"
+            "                    _ocr_enable,\n"
             "                )\n"
             "            else:\n"
-            "                finalize_started_ns = phase_trace.start()\n"
-            "                if client_side_output_generation:\n"
-            "                    await run_native_owned(\n"
-            "                        c_owner,\n"
-            "                        apply_server_side_postprocess,\n"
-            "                        middle_json[\"pdf_info\"],\n"
-            "                        hybrid_pipeline_model,\n"
-            "                        _ocr_enable,\n"
-            "                    )\n"
-            "                else:\n"
-            "                    await run_native_owned(\n"
-            "                        c_owner,\n"
-            "                        finalize_middle_json,\n"
-            "                        middle_json[\"pdf_info\"],\n"
-            "                        hybrid_pipeline_model,\n"
-            "                        _ocr_enable,\n"
-            "                        effort=effort,\n"
-            "                    )\n"
-            "                phase_trace.complete(\"document_finalize\", finalize_started_ns)\n"
-            "                close_pdfium_document(pdf_doc)\n"
-            "                doc_closed = True\n"
-            "                clean_memory(device)\n"
-            "                phase_trace.document_completed()\n"
-            "                trim_process_heap()\n"
-            "                return middle_json, model_list\n\n"
+            "                await run_native_owned(\n"
+            "                    c_owner,\n"
+            "                    finalize_middle_json,\n"
+            "                    middle_json[\"pdf_info\"],\n"
+            "                    hybrid_pipeline_model,\n"
+            "                    _ocr_enable,\n"
+            "                    effort=effort,\n"
+            "                )\n"
+            "            phase_trace.complete(\"document_finalize\", finalize_started_ns)\n"
+            "            close_pdfium_document(pdf_doc)\n"
+            "            doc_closed = True\n"
+            "            clean_memory(device)\n"
+            "            phase_trace.document_completed()\n"
+            "            trim_process_heap()\n"
+            "            return middle_json, model_list\n\n"
             "        infer_start = time.time()\n",
             count=2,
             occurrence=1,

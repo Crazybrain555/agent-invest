@@ -132,6 +132,18 @@ class VerifiedMinerUDeployment:
             )
 
 
+@dataclass(frozen=True)
+class VerifiedMinerUHeldoutValidation:
+    started_at_utc: datetime
+    finished_at_utc: datetime
+    runtime_identity_sha256: str
+    collector_sha256: str
+    windows_node_identity_sha256: str
+    api_container_id: str
+    document_count: int
+    page_count: int
+
+
 class MinerUDeploymentChecker:
     """Thread-safe static proof plus rate-limited live admission checks."""
 
@@ -406,7 +418,7 @@ def verify_mineru_deployment_gate(
         expected_cache=cache,
         **contract,
     )
-    _verify_heldout_validation(validation, **contract)
+    verify_mineru_heldout_validation(validation, **contract)
     passed_at = _required_aware_timestamp(
         cache.get("passed_at_utc"), label="MinerU canary"
     )
@@ -428,10 +440,10 @@ def verify_mineru_deployment_gate(
     return evidence
 
 
-def _verify_heldout_validation(
+def verify_mineru_heldout_validation(
     value: object,
     **smoke_contract: Any,
-) -> None:
+) -> VerifiedMinerUHeldoutValidation:
     required = {
         "schema",
         "status",
@@ -477,6 +489,7 @@ def _verify_heldout_validation(
     source_identities: set[str] = set()
     earliest_start: datetime | None = None
     latest_finish: datetime | None = None
+    page_count = 0
     for index, item in enumerate(documents):
         if not isinstance(item, dict) or set(item) != {
             "receipt_sha256",
@@ -508,18 +521,21 @@ def _verify_heldout_validation(
                 "MinerU held-out validation repeats a source PDF"
             )
         source_identities.add(source_identity)
+        input_evidence = receipt["input"]
+        assert isinstance(input_evidence, dict)
+        page_count += int(input_evidence["page_count"])
         earliest_start = (
             started_at if earliest_start is None else min(earliest_start, started_at)
         )
         latest_finish = (
             finished_at if latest_finish is None else max(latest_finish, finished_at)
         )
-    before_identity, before_time = _verify_epoch_wrapper(
+    before_identity, before_time, before_epoch = _verify_epoch_wrapper(
         value.get("epoch_before"),
         runtime_identity=smoke_contract["runtime_identity"],
         label="before",
     )
-    after_identity, after_time = _verify_epoch_wrapper(
+    after_identity, after_time, _after_epoch = _verify_epoch_wrapper(
         value.get("epoch_after"),
         runtime_identity=smoke_contract["runtime_identity"],
         label="after",
@@ -534,6 +550,18 @@ def _verify_heldout_validation(
         raise MinerUDeploymentGateError(
             "MinerU held-out validation epoch/timeline is invalid"
         )
+    return VerifiedMinerUHeldoutValidation(
+        started_at_utc=earliest_start,
+        finished_at_utc=latest_finish,
+        runtime_identity_sha256=smoke_contract["runtime_identity"],
+        collector_sha256=str(before_epoch["collector_sha256"]),
+        windows_node_identity_sha256=str(
+            before_epoch["windows_node_identity_sha256"]
+        ),
+        api_container_id=str(before_epoch["api_container_id"]),
+        document_count=document_count,
+        page_count=page_count,
+    )
 
 
 def _verify_epoch_wrapper(
@@ -541,7 +569,7 @@ def _verify_epoch_wrapper(
     *,
     runtime_identity: str,
     label: str,
-) -> tuple[str, datetime]:
+) -> tuple[str, datetime, dict[str, Any]]:
     if not isinstance(value, dict) or set(value) != {
         "receipt_sha256",
         "source_bytes_sha256",
@@ -599,8 +627,12 @@ def _verify_epoch_wrapper(
         or safety != expected_safety
     ):
         raise MinerUDeploymentGateError(f"MinerU {label} epoch is not clean PASS")
-    return str(receipt["service_epoch_sha256"]), _required_aware_timestamp(
-        receipt.get("created_at_utc"), label=f"MinerU {label} epoch creation"
+    return (
+        str(receipt["service_epoch_sha256"]),
+        _required_aware_timestamp(
+            receipt.get("created_at_utc"), label=f"MinerU {label} epoch creation"
+        ),
+        epoch,
     )
 
 
@@ -891,6 +923,8 @@ __all__ = [
     "MinerUDeploymentGateError",
     "MinerUDeploymentUnavailableError",
     "VerifiedMinerUDeployment",
+    "VerifiedMinerUHeldoutValidation",
     "require_mineru_deployment_gate",
     "verify_mineru_deployment_gate",
+    "verify_mineru_heldout_validation",
 ]

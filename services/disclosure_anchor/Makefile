@@ -256,6 +256,11 @@ mineru-validation-receipt:
 mineru-phase-trace-capture:
 	@test -n "$(VALIDATION_RECEIPT)" || (echo 'mineru-phase-trace-capture: VALIDATION_RECEIPT is required' && exit 2)
 	@test -n "$(RUNTIME_MANIFEST)" || (echo 'mineru-phase-trace-capture: RUNTIME_MANIFEST is required' && exit 2)
+	@test -n "$(MINERU_BIN)" || (echo 'mineru-phase-trace-capture: MINERU_BIN is required' && exit 2)
+	@test -n "$(API_URL)" || (echo 'mineru-phase-trace-capture: API_URL is required' && exit 2)
+	@test -n "$(OBSERVABILITY_URL)" || (echo 'mineru-phase-trace-capture: OBSERVABILITY_URL is required' && exit 2)
+	@test -n "$(INFERENCE_UPSTREAM_URL)" || (echo 'mineru-phase-trace-capture: INFERENCE_UPSTREAM_URL is required' && exit 2)
+	@test -n "$(RUNTIME_BUNDLE_IDENTITY)" || (echo 'mineru-phase-trace-capture: RUNTIME_BUNDLE_IDENTITY is required' && exit 2)
 	@test -n "$(CAPACITY_MODE)" || (echo 'mineru-phase-trace-capture: CAPACITY_MODE is required' && exit 2)
 	@test -n "$(PROFILE_SHA256)" || (echo 'mineru-phase-trace-capture: PROFILE_SHA256 is required' && exit 2)
 	@test -n "$(PROFILE)" || (echo 'mineru-phase-trace-capture: PROFILE is required' && exit 2)
@@ -266,6 +271,10 @@ mineru-phase-trace-capture:
 	@test -n "$(SSH_KNOWN_HOSTS)" || (echo 'mineru-phase-trace-capture: SSH_KNOWN_HOSTS is required' && exit 2)
 	$(WITH_WORKER_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m scripts.collect_mineru_phase_trace \
 		--validation-receipt "$(VALIDATION_RECEIPT)" --runtime-manifest "$(RUNTIME_MANIFEST)" \
+		--mineru-bin "$(MINERU_BIN)" --api-url "$(API_URL)" \
+		--observability-url "$(OBSERVABILITY_URL)" \
+		--inference-upstream-url "$(INFERENCE_UPSTREAM_URL)" \
+		--runtime-bundle-identity "$(RUNTIME_BUNDLE_IDENTITY)" \
 		--capacity-mode "$(CAPACITY_MODE)" --profile "$(PROFILE)" --profile-sha256 "$(PROFILE_SHA256)" \
 		--ssh-host "$(SSH_HOST)" --ssh-user "$(SSH_USER)" --ssh-port "$(SSH_PORT)" \
 		--ssh-identity "$(SSH_IDENTITY)" --ssh-known-hosts "$(SSH_KNOWN_HOSTS)" \
