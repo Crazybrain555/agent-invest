@@ -62,12 +62,24 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
         )
 
     def _receipt(self, *, attempt_id: str | None = None, owner: str = "owner-1"):
+        token = b"terminal-resume-token"
         return encode_terminal_receipt(TerminalReceipt(
             attempt_identity=attempt_id or self.attempt_id, fence_identity="fence-1",
             source_pdf_sha256=_sha("a"), artifact_owner_identity=owner,
             artifact_byte_count=10, artifact_sha256=_sha("e"),
-            resume_token_sha256=_sha("f"),
+            resume_token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
         ))
+
+    def _terminal_secret(
+        self, *, attempt_id: str | None = None, token: bytes = b"terminal-resume-token"
+    ) -> RemoteParseResumeSecret:
+        return RemoteParseResumeSecret(
+            attempt_id=attempt_id or self.attempt_id,
+            secret_kind="terminal",
+            token_bytes=token,
+            token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+            token_byte_count=len(token),
+        )
 
     def _seed_attempt_state(self, state: str, attempt_id: str) -> RemoteParseAttempt:
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
@@ -86,6 +98,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                     expected_version=current.row_version,
                     remote_task_identity="task-" + attempt_id,
                     receipt=self._receipt(attempt_id=attempt_id),
+                    terminal_secret=self._terminal_secret(attempt_id=attempt_id),
                 )
             for next_state in {
                 "materializing": ("materializing",),
@@ -119,6 +132,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                 attempt_id=self.attempt_id, fence_identity="fence-1",
                 expected_version=submitted.row_version,
                 remote_task_identity="task-1", receipt=receipt,
+                terminal_secret=self._terminal_secret(),
             )
             uow.commit()
         self.assertEqual(won.state, "remote_terminal")
@@ -127,6 +141,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                 attempt_id=self.attempt_id, fence_identity="fence-1",
                 expected_version=submitted.row_version,
                 remote_task_identity="task-1", receipt=receipt,
+                terminal_secret=self._terminal_secret(),
             )
             self.assertEqual(replay.terminal_receipt_sha256, receipt.sha256)
             with self.assertRaises(RemoteParseCheckpointConflict):
@@ -134,6 +149,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                     attempt_id=self.attempt_id, fence_identity="fence-1",
                     expected_version=submitted.row_version,
                     remote_task_identity="task-1", receipt=self._receipt(owner="other"),
+                    terminal_secret=self._terminal_secret(),
                 )
             with self.assertRaises(RemoteParseCheckpointConflict):
                 uow.remote_parse_attempts.transition(
@@ -158,6 +174,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                     attempt_id=self.attempt_id, fence_identity="fence-1",
                     expected_version=submitted.row_version,
                     remote_task_identity="task-1", receipt=receipt,
+                    terminal_secret=self._terminal_secret(),
                 )
                 uow.commit()
                 return result.terminal_receipt_sha256 or ""
@@ -165,6 +182,80 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = tuple(pool.map(lambda _index: checkpoint(), range(2)))
         self.assertEqual(results, (receipt.sha256, receipt.sha256))
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            self.assertEqual(
+                uow.remote_parse_attempts.get_secret(self.attempt_id, "terminal"),
+                self._terminal_secret(),
+            )
+
+    def test_terminal_checkpoint_requires_matching_private_secret(self) -> None:
+        submitted = self._seed_attempt_state("submitted", self.attempt_id)
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            with self.assertRaisesRegex(RemoteParseCheckpointConflict, "private resume"):
+                uow.remote_parse_attempts.checkpoint_terminal(
+                    attempt_id=self.attempt_id,
+                    fence_identity="fence-1",
+                    expected_version=submitted.row_version,
+                    remote_task_identity="task-" + self.attempt_id,
+                    receipt=self._receipt(),
+                    terminal_secret=None,  # type: ignore[arg-type]
+                )
+            with self.assertRaisesRegex(RemoteParseCheckpointConflict, "private resume"):
+                uow.remote_parse_attempts.checkpoint_terminal(
+                    attempt_id=self.attempt_id,
+                    fence_identity="fence-1",
+                    expected_version=submitted.row_version,
+                    remote_task_identity="task-" + self.attempt_id,
+                    receipt=self._receipt(),
+                    terminal_secret=self._terminal_secret(token=b"wrong-token"),
+                )
+            self.assertIsNone(
+                uow.remote_parse_attempts.get_secret(self.attempt_id, "terminal")
+            )
+
+    def test_terminal_checkpoint_and_secret_roll_back_together(self) -> None:
+        submitted = self._seed_attempt_state("submitted", self.attempt_id)
+        with self.assertRaisesRegex(RuntimeError, "force rollback"):
+            with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+                uow.remote_parse_attempts.checkpoint_terminal(
+                    attempt_id=self.attempt_id,
+                    fence_identity="fence-1",
+                    expected_version=submitted.row_version,
+                    remote_task_identity="task-" + self.attempt_id,
+                    receipt=self._receipt(),
+                    terminal_secret=self._terminal_secret(),
+                )
+                raise RuntimeError("force rollback")
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            current = uow.remote_parse_attempts.get(self.attempt_id)
+            assert current is not None
+            self.assertEqual(current.state, "submitted")
+            self.assertIsNone(
+                uow.remote_parse_attempts.get_secret(self.attempt_id, "terminal")
+            )
+
+    def test_caught_terminal_cas_conflict_cannot_commit_secret_alone(self) -> None:
+        submitted = self._seed_attempt_state("submitted", self.attempt_id)
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            with self.assertRaisesRegex(
+                RemoteParseCheckpointConflict, "first-terminal-wins"
+            ):
+                uow.remote_parse_attempts.checkpoint_terminal(
+                    attempt_id=self.attempt_id,
+                    fence_identity="fence-1",
+                    expected_version=submitted.row_version,
+                    remote_task_identity="wrong-task",
+                    receipt=self._receipt(),
+                    terminal_secret=self._terminal_secret(),
+                )
+            uow.commit()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            current = uow.remote_parse_attempts.get(self.attempt_id)
+            assert current is not None
+            self.assertEqual(current.state, "submitted")
+            self.assertIsNone(
+                uow.remote_parse_attempts.get_secret(self.attempt_id, "terminal")
+            )
 
     def test_partial_unique_current_and_private_acl(self) -> None:
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
@@ -268,6 +359,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                 expected_version=current.row_version,
                 remote_task_identity="task-" + self.attempt_id,
                 receipt=forged,
+                terminal_secret=self._terminal_secret(),
             )
 
     def test_loaded_projection_must_match_canonical_receipt(self) -> None:
@@ -302,6 +394,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                 expected_version=1,
                 remote_task_identity="task-" + self.attempt_id,
                 receipt=self._receipt(),
+                terminal_secret=self._terminal_secret(),
             )
             self.assertEqual(replay.row_version, failed.row_version)
             self.assertEqual(replay.state, "local_failed")

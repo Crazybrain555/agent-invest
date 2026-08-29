@@ -750,47 +750,63 @@ class RemoteParseAttemptRepository:
 
     def checkpoint_terminal(self, *, attempt_id: str, fence_identity: str,
                             expected_version: int, remote_task_identity: str,
-                            receipt: EncodedTerminalReceipt) -> RemoteParseAttempt:
+                            receipt: EncodedTerminalReceipt,
+                            terminal_secret: RemoteParseResumeSecret) -> RemoteParseAttempt:
         validated = decode_terminal_receipt(receipt.exact_bytes)
         if validated != receipt:
             raise RemoteParseCheckpointConflict("terminal receipt envelope is not self-consistent")
         terminal = validated.receipt
         if terminal.attempt_identity != attempt_id or terminal.fence_identity != fence_identity:
             raise RemoteParseCheckpointConflict("terminal receipt attempt/fence drifted")
-        values = {
-            "state": "remote_terminal", "row_version": expected_version + 1,
-            "terminal_receipt_sha256": validated.sha256,
-            "terminal_receipt_bytes": validated.exact_bytes,
-            "terminal_receipt_byte_count": validated.byte_count,
-            "result_owner_identity": terminal.artifact_owner_identity,
-            "result_artifact_sha256": terminal.artifact_sha256,
-            "result_artifact_bytes": terminal.artifact_byte_count,
-            "updated_at": sa.func.now(),
-        }
-        won = self._session.execute(
-            sa.update(models.RemoteParseAttempt).where(
-                models.RemoteParseAttempt.attempt_id == attempt_id,
-                models.RemoteParseAttempt.fence_identity == fence_identity,
-                models.RemoteParseAttempt.state == "submitted",
-                models.RemoteParseAttempt.row_version == expected_version,
-                models.RemoteParseAttempt.remote_task_identity == remote_task_identity,
-                models.RemoteParseAttempt.source_pdf_sha256 == terminal.source_pdf_sha256,
-            ).values(**values).returning(models.RemoteParseAttempt.attempt_id)
-        ).scalar_one_or_none()
-        row = self._session.get(models.RemoteParseAttempt, attempt_id, populate_existing=True)
-        if row is None:
-            raise RemoteParseCheckpointConflict("terminal checkpoint attempt is absent")
-        if won is None and not (
-            row.fence_identity == fence_identity
-            and row.state in {
-                "remote_terminal", "materializing", "local_materialized",
-                "finish_committed", "acked", "local_failed", "superseded",
-            }
-            and row.remote_task_identity == remote_task_identity
-            and row.terminal_receipt_sha256 == validated.sha256
-            and bytes(row.terminal_receipt_bytes or b"") == validated.exact_bytes
+        if (
+            not isinstance(terminal_secret, RemoteParseResumeSecret)
+            or terminal_secret.attempt_id != attempt_id
+            or terminal_secret.secret_kind != "terminal"
+            or terminal_secret.token_sha256 != terminal.resume_token_sha256
         ):
-            raise RemoteParseCheckpointConflict("conflicting terminal checkpoint lost first-terminal-wins")
+            raise RemoteParseCheckpointConflict(
+                "terminal receipt/private resume token identity drifted"
+            )
+        with self._session.begin_nested():
+            self.put_secret(terminal_secret)
+            values = {
+                "state": "remote_terminal", "row_version": expected_version + 1,
+                "terminal_receipt_sha256": validated.sha256,
+                "terminal_receipt_bytes": validated.exact_bytes,
+                "terminal_receipt_byte_count": validated.byte_count,
+                "result_owner_identity": terminal.artifact_owner_identity,
+                "result_artifact_sha256": terminal.artifact_sha256,
+                "result_artifact_bytes": terminal.artifact_byte_count,
+                "updated_at": sa.func.now(),
+            }
+            won = self._session.execute(
+                sa.update(models.RemoteParseAttempt).where(
+                    models.RemoteParseAttempt.attempt_id == attempt_id,
+                    models.RemoteParseAttempt.fence_identity == fence_identity,
+                    models.RemoteParseAttempt.state == "submitted",
+                    models.RemoteParseAttempt.row_version == expected_version,
+                    models.RemoteParseAttempt.remote_task_identity == remote_task_identity,
+                    models.RemoteParseAttempt.source_pdf_sha256 == terminal.source_pdf_sha256,
+                ).values(**values).returning(models.RemoteParseAttempt.attempt_id)
+            ).scalar_one_or_none()
+            row = self._session.get(
+                models.RemoteParseAttempt, attempt_id, populate_existing=True
+            )
+            if row is None:
+                raise RemoteParseCheckpointConflict("terminal checkpoint attempt is absent")
+            if won is None and not (
+                row.fence_identity == fence_identity
+                and row.state in {
+                    "remote_terminal", "materializing", "local_materialized",
+                    "finish_committed", "acked", "local_failed", "superseded",
+                }
+                and row.remote_task_identity == remote_task_identity
+                and row.terminal_receipt_sha256 == validated.sha256
+                and bytes(row.terminal_receipt_bytes or b"") == validated.exact_bytes
+            ):
+                raise RemoteParseCheckpointConflict(
+                    "conflicting terminal checkpoint lost first-terminal-wins"
+                )
         return _remote_attempt_entity(row)
 
     def put_secret(self, secret: RemoteParseResumeSecret) -> None:

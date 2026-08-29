@@ -172,10 +172,19 @@ class RemoteParseResumeSecret:
     token_byte_count: int
 
     def __post_init__(self) -> None:
-        if not self.token_bytes or len(self.token_bytes) > 65536:
+        if not isinstance(self.attempt_id, str) or not self.attempt_id.strip():
+            raise ValueError("invalid resume token attempt id")
+        if self.secret_kind not in {"submission", "terminal", "ack"}:
+            raise ValueError("invalid resume token secret kind")
+        if type(self.token_bytes) is not bytes or not self.token_bytes or len(self.token_bytes) > 65536:
             raise ValueError("resume token bytes are outside the private envelope")
         expected = "sha256:" + hashlib.sha256(self.token_bytes).hexdigest()
-        if self.token_sha256 != expected or self.token_byte_count != len(self.token_bytes):
+        if (
+            self.token_sha256 != expected
+            or isinstance(self.token_byte_count, bool)
+            or not isinstance(self.token_byte_count, int)
+            or self.token_byte_count != len(self.token_bytes)
+        ):
             raise ValueError("resume token identity differs from exact bytes")
 
 

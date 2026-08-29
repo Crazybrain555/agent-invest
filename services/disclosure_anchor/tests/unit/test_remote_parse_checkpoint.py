@@ -86,6 +86,33 @@ class RemoteParseCheckpointContractTests(unittest.TestCase):
                 token_sha256=SHA_A,
                 token_byte_count=len(token),
             )
+        for invalid_kind in ("", "other"):
+            with self.subTest(secret_kind=invalid_kind), self.assertRaisesRegex(
+                ValueError, "secret kind"
+            ):
+                RemoteParseResumeSecret(
+                    attempt_id="attempt_1",
+                    secret_kind=invalid_kind,  # type: ignore[arg-type]
+                    token_bytes=token,
+                    token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+                    token_byte_count=len(token),
+                )
+        with self.assertRaisesRegex(ValueError, "private envelope"):
+            RemoteParseResumeSecret(
+                attempt_id="attempt_1",
+                secret_kind="terminal",
+                token_bytes=bytearray(token),  # type: ignore[arg-type]
+                token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+                token_byte_count=len(token),
+            )
+        with self.assertRaisesRegex(ValueError, "identity differs"):
+            RemoteParseResumeSecret(
+                attempt_id="attempt_1",
+                secret_kind="terminal",
+                token_bytes=token,
+                token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+                token_byte_count=True,
+            )
 
 
 if __name__ == "__main__":

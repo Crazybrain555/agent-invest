@@ -122,6 +122,7 @@ class RemoteParseAttemptRepository(Protocol):
     def checkpoint_terminal(
         self, *, attempt_id: str, fence_identity: str, expected_version: int,
         remote_task_identity: str, receipt: EncodedTerminalReceipt,
+        terminal_secret: RemoteParseResumeSecret,
     ) -> RemoteParseAttempt: ...
     def put_secret(self, secret: RemoteParseResumeSecret) -> None: ...
     def get_secret(
