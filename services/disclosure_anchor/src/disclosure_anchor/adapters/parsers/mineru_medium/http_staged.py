@@ -39,6 +39,7 @@ _POLL_SECONDS = 1.0
 _MAX_RESULT_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_ZIP_MEMBERS = 100_000
 _MAX_UNCOMPRESSED_BYTES = 16 * 1024 * 1024 * 1024
+_MAX_WIRE_JSON_BYTES = 1024 * 1024
 
 
 def _fail(message: str) -> ParserOutputContractError:
@@ -299,15 +300,28 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         if owner != expected_owner:
             raise _fail("retained result owner is not canonical")
         if self._task.task_protocol_v2:
-            if payload.get("task_protocol_schema") != "mineru-task-protocol.v2":
-                raise _fail("task protocol v2 status identity is absent")
+            expected_idempotency = hashlib.sha256(
+                f"{self._task.source_pdf_sha256}\0{self._task.attempt_identity}\0"
+                f"{self._task.fence_identity}".encode()
+            ).hexdigest()
+            expected_protocol = {
+                "task_protocol_schema": "mineru-task-protocol.v2",
+                "protocol_state": "completed",
+                "idempotency_key": expected_idempotency,
+                "attempt_identity": self._task.attempt_identity,
+                "fence_identity": self._task.fence_identity,
+            }
+            if any(payload.get(key) != value for key, value in expected_protocol.items()):
+                raise _fail("task protocol v2 status identity drifted")
             lease = client.post(
                 f"{self._task.base_url}/tasks/{self._task.task_id}/lease"
             )
             if lease.status_code != 200:
                 raise _fail(f"result lease returned HTTP {lease.status_code}")
             lease_payload = _closed_json(
-                lease, required={"schema", "task_id", "lease_until_unix"}
+                lease,
+                required={"schema", "task_id", "lease_until_unix"},
+                allowed={"schema", "task_id", "lease_until_unix"},
             )
             if (
                 lease_payload.get("schema") != "mineru-task-protocol.v2"
@@ -466,16 +480,6 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                 resolved_spool.unlink(missing_ok=True)
             raise
         resolved_spool.unlink(missing_ok=True)
-        if self._task.task_protocol_v2:
-            with self._client(30.0) as client:
-                acknowledgement = client.post(
-                    f"{self._task.base_url}/tasks/{self._task.task_id}/ack"
-                )
-            if acknowledgement.status_code != 200:
-                shutil.rmtree(output_dir, ignore_errors=True)
-                raise _fail(
-                    f"result acknowledgement returned HTTP {acknowledgement.status_code}"
-                )
         target_identity = ParserTargetIdentity(
             name="MinerU",
             package_version="3.4.4",
@@ -497,6 +501,37 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             artifact_root=self._reader.locate_artifact_root(output_dir),
             provider_document=provider_document,
         )
+
+    def acknowledge_after_finish_committed(
+        self, *, receipt: RemoteArtifactReceipt, checkpoint_state: str
+    ) -> None:
+        if checkpoint_state != "finish_committed":
+            raise _fail("remote ACK requires a durable finish_committed checkpoint")
+        task, _spool_path, artifact_sha256 = _Task.from_token(receipt.resume_token)
+        if task != self._task or artifact_sha256 != receipt.artifact_sha256:
+            raise _fail("remote ACK receipt ownership drifted")
+        if not self._task.task_protocol_v2:
+            return
+        with self._client(30.0) as client:
+            response = client.post(
+                f"{self._task.base_url}/tasks/{self._task.task_id}/ack"
+            )
+            if response.status_code not in {200, 204}:
+                raise _fail(
+                    f"result acknowledgement returned HTTP {response.status_code}"
+                )
+            if response.status_code == 200:
+                payload = _closed_json(
+                    response,
+                    required={"schema", "task_id", "status"},
+                    allowed={"schema", "task_id", "status"},
+                )
+                if set(payload) != {"schema", "task_id", "status"} or payload != {
+                    "schema": "mineru-task-protocol.v2",
+                    "task_id": self._task.task_id,
+                    "status": "consumed",
+                }:
+                    raise _fail("result acknowledgement identity drifted")
 
     def _download_retained_result(self, receipt: RemoteArtifactReceipt) -> Path:
         self._spool_root.mkdir(parents=True, exist_ok=True)
@@ -660,6 +695,7 @@ class MinerUHttpStagedParser:
                     "agent_fence_identity": fence_identity,
                 }
             )
+        reconciled = False
         try:
             with (
                 httpx.Client(
@@ -682,18 +718,41 @@ class MinerUHttpStagedParser:
                     response = client.get(
                         f"{self._api_url}/tasks/by-idempotency/{idempotency_key}"
                     )
+                    reconciled = True
         finally:
             snapshot.unlink(missing_ok=True)
-        if response.status_code != 202:
+        expected_status = 200 if reconciled else 202
+        if response.status_code != expected_status:
             raise _fail(f"submit returned HTTP {response.status_code}")
+        submit_allowed = {
+            "task_id", "status", "backend", "file_names", "created_at",
+            "started_at", "completed_at", "error", "status_url", "result_url",
+            "queued_ahead", "task_protocol_schema", "idempotency_key",
+            "attempt_identity", "fence_identity", "result_artifact_schema",
+            "result_artifact_sha256", "result_artifact_bytes",
+            "result_artifact_owner", "protocol_state",
+        }
         payload = _closed_json(
-            response, required={"task_id", "status_url", "result_url"}
+            response,
+            required={"task_id", "status_url", "result_url"},
+            allowed=submit_allowed if self._task_protocol_v2 else None,
         )
         if not all(
             isinstance(payload[key], str)
             for key in ("task_id", "status_url", "result_url")
         ):
             raise _fail("submit identities are not strings")
+        if self._task_protocol_v2:
+            expected_identity = {
+                "task_protocol_schema": "mineru-task-protocol.v2",
+                "idempotency_key": idempotency_key,
+                "attempt_identity": attempt_identity,
+                "fence_identity": fence_identity,
+            }
+            if any(
+                payload.get(key) != value for key, value in expected_identity.items()
+            ):
+                raise _fail("submit/reconcile protocol identity drifted")
         task = _Task(
             base_url=self._api_url,
             task_id=payload["task_id"],
@@ -740,13 +799,35 @@ class MinerUHttpStagedParser:
         )
 
 
-def _closed_json(response: httpx.Response, *, required: set[str]) -> dict[str, Any]:
+def _closed_json(
+    response: httpx.Response,
+    *,
+    required: set[str],
+    allowed: set[str] | None = None,
+) -> dict[str, Any]:
+    if len(response.content) > _MAX_WIRE_JSON_BYTES:
+        raise _fail("response JSON exceeds the closed wire envelope")
+    def closed_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise _fail("response JSON contains duplicate fields")
+            value[key] = item
+        return value
     try:
-        payload = response.json()
-    except (ValueError, json.JSONDecodeError) as exc:
+        payload = json.loads(
+            response.content,
+            object_pairs_hook=closed_object,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                _fail(f"response JSON contains non-finite value {value}")
+            ),
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
         raise _fail("response is not JSON") from exc
     if not isinstance(payload, dict) or not required.issubset(payload):
         raise _fail("response JSON shape is invalid")
+    if allowed is not None and not set(payload).issubset(allowed):
+        raise _fail("response JSON fields are not closed")
     return payload
 
 

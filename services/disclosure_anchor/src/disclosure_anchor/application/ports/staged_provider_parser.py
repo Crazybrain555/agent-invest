@@ -73,6 +73,11 @@ class RemoteProviderParseHandle(Protocol):
     def cancel_and_drain(self) -> None:
         """Close admission and prove the accepted remote task terminal."""
 
+    def acknowledge_after_finish_committed(
+        self, *, receipt: RemoteArtifactReceipt, checkpoint_state: str
+    ) -> None:
+        """ACK only after the durable DB checkpoint is exactly finish_committed."""
+
 
 class StagedProviderDocumentParserPort(Protocol):
     """Capability port; absence keeps the existing synchronous parser path."""

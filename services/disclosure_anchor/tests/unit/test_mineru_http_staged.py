@@ -98,6 +98,10 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                         "task_id": "task-1",
                         "status_url": "/tasks/task-1",
                         "result_url": "/tasks/task-1/result",
+                        "task_protocol_schema": "mineru-task-protocol.v2",
+                        "idempotency_key": idempotency_key,
+                        "attempt_identity": "attempt-1",
+                        "fence_identity": "fence-1",
                     },
                 )
             if request.url.path == "/tasks/task-1":
@@ -122,6 +126,9 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             source = Path(directory) / "input.pdf"
             source.write_bytes(b"%PDF-stage")
             source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+            idempotency_key = hashlib.sha256(
+                f"{source_sha256}\0attempt-1\0fence-1".encode()
+            ).hexdigest()
             handle = parser.begin_remote_parse(
                 input_pdf=source,
                 options=PINNED_OPTIONS,
@@ -164,6 +171,10 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                         "task_id": "task-1",
                         "status_url": "/tasks/task-1",
                         "result_url": "/tasks/task-1/result",
+                        "task_protocol_schema": "mineru-task-protocol.v2",
+                        "idempotency_key": idempotency_key,
+                        "attempt_identity": "attempt-1",
+                        "fence_identity": "fence-1",
                     },
                 )
             if request.method == "GET":
@@ -172,10 +183,23 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     json={
                         "status": "completed",
                         "task_protocol_schema": "mineru-task-protocol.v2",
+                        "protocol_state": "completed",
+                        "idempotency_key": idempotency_key,
+                        "attempt_identity": "attempt-1",
+                        "fence_identity": "fence-1",
                         "result_artifact_schema": "mineru-retained-result.v1",
                         "result_artifact_sha256": artifact_sha256,
                         "result_artifact_bytes": artifact_bytes,
                         "result_artifact_owner": owner,
+                    },
+                )
+            if request.url.path.endswith("/ack"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "schema": "mineru-task-protocol.v2",
+                        "task_id": "task-1",
+                        "status": "consumed",
                     },
                 )
             return httpx.Response(
@@ -191,6 +215,9 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             source = Path(directory) / "input.pdf"
             source.write_bytes(b"%PDF-stage")
             source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+            idempotency_key = hashlib.sha256(
+                f"{source_sha256}\0attempt-1\0fence-1".encode()
+            ).hexdigest()
             parser = MinerUHttpStagedParser(
                 api_url="http://mineru.test:30000",
                 server_url="http://vlm.test:30000/v1",
@@ -198,15 +225,60 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 transport=httpx.MockTransport(handler),
                 task_protocol_v2=True,
             )
-            receipt = parser.begin_remote_parse(
+            handle = parser.begin_remote_parse(
                 input_pdf=source,
                 options=PINNED_OPTIONS,
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
-            ).wait_terminal()
+            )
+            receipt = handle.wait_terminal()
+            with self.assertRaisesRegex(
+                ParserOutputContractError, "finish_committed"
+            ):
+                handle.acknowledge_after_finish_committed(
+                    receipt=receipt, checkpoint_state="local_materialized"
+                )
+            handle.acknowledge_after_finish_committed(
+                receipt=receipt, checkpoint_state="finish_committed"
+            )
+            handle.acknowledge_after_finish_committed(
+                receipt=receipt, checkpoint_state="finish_committed"
+            )
         self.assertEqual(receipt.artifact_sha256, artifact_sha256)
-        self.assertEqual(calls[-1], "POST /tasks/task-1/lease")
+        self.assertEqual(calls.count("POST /tasks/task-1/ack"), 2)
+
+    def test_v2_rejects_duplicate_submit_wire_fields(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                202,
+                content=(
+                    b'{"task_id":"task-1","task_id":"task-2",'
+                    b'"status_url":"/tasks/task-1",'
+                    b'"result_url":"/tasks/task-1/result"}'
+                ),
+                headers={"content-type": "application/json"},
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.pdf"
+            source.write_bytes(b"%PDF-stage")
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+                transport=httpx.MockTransport(handler),
+                task_protocol_v2=True,
+            )
+            with self.assertRaisesRegex(ParserOutputContractError, "duplicate"):
+                parser.begin_remote_parse(
+                    input_pdf=source,
+                    options=PINNED_OPTIONS,
+                    source_pdf_sha256="sha256:"
+                    + hashlib.sha256(source.read_bytes()).hexdigest(),
+                    attempt_identity="attempt-1",
+                    fence_identity="fence-1",
+                )
 
     def test_submit_rejects_cross_origin_result_url(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:

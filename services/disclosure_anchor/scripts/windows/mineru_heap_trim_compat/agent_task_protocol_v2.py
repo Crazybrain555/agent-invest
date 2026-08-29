@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import shutil
+import stat
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
@@ -38,6 +41,81 @@ class DurableTaskRecord:
     active_readers: int = 0
     error: str | None = None
     task_payload: dict[str, Any] | None = None
+    reserved_result_bytes: int = 0
+    recovery_generation: int = 1
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.idempotency_key,
+            self.task_id,
+            self.attempt_identity,
+            self.fence_identity,
+        ):
+            if not isinstance(value, str) or not value or len(value) > 1024:
+                raise TaskProtocolConflict("task registry identity is invalid")
+        if (
+            not isinstance(self.active_readers, int)
+            or isinstance(self.active_readers, bool)
+            or self.active_readers < 0
+        ):
+            raise TaskProtocolConflict("task registry reader count is invalid")
+        if (
+            not isinstance(self.reserved_result_bytes, int)
+            or isinstance(self.reserved_result_bytes, bool)
+            or self.reserved_result_bytes < 0
+        ):
+            raise TaskProtocolConflict("task registry reservation is invalid")
+        if self.result_bytes is not None and (
+            not isinstance(self.result_bytes, int)
+            or isinstance(self.result_bytes, bool)
+            or self.result_bytes < 1
+        ):
+            raise TaskProtocolConflict("task registry result bytes are invalid")
+        if (
+            not isinstance(self.recovery_generation, int)
+            or isinstance(self.recovery_generation, bool)
+            or self.recovery_generation < 1
+        ):
+            raise TaskProtocolConflict("task recovery generation is invalid")
+        if self.lease_until_unix is not None and (
+            isinstance(self.lease_until_unix, bool)
+            or not isinstance(self.lease_until_unix, (int, float))
+        ):
+            raise TaskProtocolConflict("task registry lease is invalid")
+        if self.error is not None and not isinstance(self.error, str):
+            raise TaskProtocolConflict("task registry error is invalid")
+        if self.task_payload is not None and not isinstance(self.task_payload, dict):
+            raise TaskProtocolConflict("task registry payload is invalid")
+        identities = (self.result_sha256, self.result_owner)
+        if any(value is not None for value in identities) and not all(
+            isinstance(value, str)
+            and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value)
+            for value in identities
+        ):
+            raise TaskProtocolConflict("task registry result identity is invalid")
+        has_result_identity = all(
+            value is not None
+            for value in (
+                self.result_sha256,
+                self.result_bytes,
+                self.result_owner,
+            )
+        )
+        if self.state in {"completed", "consumed"} and not has_result_identity:
+            raise TaskProtocolConflict("terminal task result identity is incomplete")
+        if self.state == "completed" and not isinstance(self.result_path, str):
+            raise TaskProtocolConflict("completed task result path is absent")
+        if self.state not in {"completed", "consumed"} and any(
+            value is not None
+            for value in (
+                self.result_path,
+                self.result_sha256,
+                self.result_bytes,
+                self.result_owner,
+            )
+        ):
+            raise TaskProtocolConflict("non-result task contains result identity")
 
 
 class DurableTaskRegistry:
@@ -115,6 +193,13 @@ class DurableTaskRegistry:
     def recoverable_payloads(self) -> tuple[dict[str, Any], ...]:
         with self._lock:
             recoverable = []
+            abandoned = [
+                key
+                for key, record in self._records.items()
+                if record.state == "pending" and record.task_payload is None
+            ]
+            for key in abandoned:
+                del self._records[key]
             for record in self._records.values():
                 if record.state in {"pending", "processing", "finalizing"}:
                     # A partially allocated request without a bound upload/output
@@ -125,6 +210,9 @@ class DurableTaskRegistry:
                         )
                     if record.state in {"processing", "finalizing"}:
                         record.state = "pending"
+                        record.reserved_result_bytes = 0
+                        record.recovery_generation += 1
+                        self._prepare_clean_replay(record)
                 if record.task_payload is not None and record.state != "consumed":
                     recovered = dict(record.task_payload)
                     recovered["status"] = (
@@ -140,6 +228,33 @@ class DurableTaskRegistry:
                     recoverable.append(recovered)
             self._persist()
             return tuple(recoverable)
+
+    def _prepare_clean_replay(self, record: DurableTaskRecord) -> None:
+        payload = record.task_payload or {}
+        output_value = payload.get("output_dir")
+        uploads_value = payload.get("uploads")
+        if not isinstance(output_value, str) or not isinstance(uploads_value, list):
+            raise TaskProtocolConflict("restart replay paths are absent")
+        output = Path(output_value).resolve()
+        upload_root = (output / "uploads").resolve()
+        for value in uploads_value:
+            if not isinstance(value, str):
+                raise TaskProtocolConflict("restart upload path is invalid")
+            path = Path(value)
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or path.resolve().parent != upload_root
+            ):
+                raise TaskProtocolConflict("restart upload snapshot identity drifted")
+        for child in output.iterdir():
+            if child.resolve() == upload_root:
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
 
     def abandon_unbound(self, idempotency_key: str) -> None:
         """Remove only a reservation that never acquired durable task ownership."""
@@ -161,6 +276,7 @@ class DurableTaskRegistry:
                 raise TaskProtocolConflict("terminal task cannot fail again")
             record.state = "failed"
             record.error = error
+            record.reserved_result_bytes = 0
             self._persist()
 
     def transition(self, idempotency_key: str, target: TaskState) -> None:
@@ -179,6 +295,8 @@ class DurableTaskRegistry:
                     f"invalid task transition {record.state}->{target}"
                 )
             record.state = target
+            if target == "failed":
+                record.reserved_result_bytes = 0
             self._persist()
 
     def complete(
@@ -190,21 +308,54 @@ class DurableTaskRegistry:
         result_bytes: int,
         result_owner: str,
     ) -> None:
-        if result_bytes < 1 or len(result_sha256) != 64 or len(result_owner) != 64:
+        if (
+            isinstance(result_bytes, bool)
+            or not isinstance(result_bytes, int)
+            or result_bytes < 1
+            or any(
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+                for value in (result_sha256, result_owner)
+            )
+        ):
             raise ValueError("result identity is invalid")
         with self._lock:
             record = self._required(idempotency_key)
             if record.state != "finalizing":
                 raise TaskProtocolConflict("only finalizing tasks may complete")
-            projected = self.unacked_result_bytes + result_bytes
-            if projected > self._limit:
-                raise TaskProtocolConflict("unacked result byte capacity exhausted")
+            if result_bytes > record.reserved_result_bytes:
+                raise TaskProtocolConflict("result exceeded its reserved byte envelope")
             record.result_path = str(result_path)
             record.result_sha256 = result_sha256
             record.result_bytes = result_bytes
             record.result_owner = result_owner
             record.state = "completed"
+            record.reserved_result_bytes = 0
             self._persist()
+
+    def reserve_finalizer(self, idempotency_key: str, *, byte_budget: int) -> None:
+        if (
+            isinstance(byte_budget, bool)
+            or not isinstance(byte_budget, int)
+            or byte_budget < 1
+        ):
+            raise ValueError("finalizer byte reservation must be a positive integer")
+        with self._lock:
+            record = self._required(idempotency_key)
+            if record.state != "finalizing" or record.reserved_result_bytes:
+                raise TaskProtocolConflict("finalizer reservation state is invalid")
+            if (
+                self.unacked_result_bytes + self.reserved_result_bytes + byte_budget
+                > self._limit
+            ):
+                raise TaskProtocolConflict("unacked result byte capacity exhausted")
+            record.reserved_result_bytes = byte_budget
+            self._persist()
+
+    @property
+    def reserved_result_bytes(self) -> int:
+        return sum(record.reserved_result_bytes for record in self._records.values())
 
     @property
     def unacked_result_bytes(self) -> int:
@@ -255,6 +406,8 @@ class DurableTaskRegistry:
     def acknowledge(self, idempotency_key: str) -> None:
         with self._lock:
             record = self._required(idempotency_key)
+            if record.state == "consumed":
+                return
             if record.state != "completed" or record.active_readers:
                 raise TaskProtocolConflict(
                     "result cannot be ACKed while unavailable/in use"
@@ -269,13 +422,16 @@ class DurableTaskRegistry:
                 for key, record in self._records.items()
                 if record.state == "consumed" and record.active_readers == 0
             ]
+            cleaned = 0
             for key in removable:
-                record = self._records.pop(key)
+                record = self._records[key]
                 if record.result_path:
                     unlink(Path(record.result_path))
-            if removable:
+                    record.result_path = None
+                    cleaned += 1
+            if cleaned:
                 self._persist()
-            return len(removable)
+            return cleaned
 
     def _required(self, key: str) -> DurableTaskRecord:
         try:
@@ -286,20 +442,85 @@ class DurableTaskRegistry:
     def _load(self) -> dict[str, DurableTaskRecord]:
         if not self._path.exists():
             return {}
-        payload = json.loads(self._path.read_text())
+        metadata = self._path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > 16 * 1024 * 1024
+        ):
+            raise TaskProtocolConflict("task registry file identity is unsafe")
+        raw = self._path.read_bytes()
+
+        def closed_object(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise TaskProtocolConflict(
+                        "task registry contains duplicate fields"
+                    )
+                value[key] = item
+            return value
+
+        payload = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=closed_object,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                TaskProtocolConflict(f"non-finite registry value: {value}")
+            ),
+        )
         if (
             not isinstance(payload, dict)
+            or set(payload) != {"schema", "records"}
             or payload.get("schema") != "mineru-task-registry.v2"
         ):
             raise TaskProtocolConflict("task registry schema is invalid")
         records = payload.get("records")
         if not isinstance(records, list):
             raise TaskProtocolConflict("task registry records are invalid")
-        loaded = {
-            item["idempotency_key"]: DurableTaskRecord(**item) for item in records
-        }
+        expected = {item.name for item in fields(DurableTaskRecord)}
+        if any(not isinstance(item, dict) or set(item) != expected for item in records):
+            raise TaskProtocolConflict("task registry record fields are not closed")
+        loaded = {}
+        task_ids = set()
+        for item in records:
+            record = DurableTaskRecord(**item)
+            if record.idempotency_key in loaded or record.task_id in task_ids:
+                raise TaskProtocolConflict("task registry identities are not unique")
+            if record.state not in {
+                "pending",
+                "processing",
+                "finalizing",
+                "completed",
+                "failed",
+                "consumed",
+            }:
+                raise TaskProtocolConflict("task registry state is invalid")
+            loaded[record.idempotency_key] = record
+            task_ids.add(record.task_id)
         for record in loaded.values():
             record.active_readers = 0
+            if record.state == "completed":
+                result_path = Path(record.result_path or "")
+                metadata = result_path.lstat()
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise TaskProtocolConflict("retained result file identity is unsafe")
+                digest = hashlib.sha256()
+                total = 0
+                with result_path.open("rb") as source:
+                    while chunk := source.read(1024 * 1024):
+                        digest.update(chunk)
+                        total += len(chunk)
+                expected_owner = hashlib.sha256(
+                    f"{record.task_id}\0{digest.hexdigest()}\0{total}".encode()
+                ).hexdigest()
+                if (
+                    digest.hexdigest() != record.result_sha256
+                    or total != record.result_bytes
+                    or expected_owner != record.result_owner
+                ):
+                    raise TaskProtocolConflict("retained result identity drifted")
         return loaded
 
     def _persist(self) -> None:
@@ -325,6 +546,7 @@ class DurableTaskRegistry:
         temporary = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "wb") as target:
+                os.fchmod(target.fileno(), 0o600)
                 target.write(payload)
                 target.flush()
                 os.fsync(target.fileno())
@@ -341,11 +563,18 @@ class DurableTaskRegistry:
 class SplitTaskExecutor:
     """Separate parse and finalizer credits with explicit state transitions."""
 
-    def __init__(self, *, parse_slots: int, finalizer_slots: int) -> None:
+    def __init__(
+        self,
+        *,
+        parse_slots: int,
+        finalizer_slots: int,
+        result_reservation_bytes: int = 268435456,
+    ) -> None:
         if parse_slots < 1 or finalizer_slots < 1:
             raise ValueError("executor slots must be positive")
         self._parse = asyncio.Semaphore(parse_slots)
         self._finalize = asyncio.Semaphore(finalizer_slots)
+        self._result_reservation_bytes = result_reservation_bytes
 
     async def run(
         self,
@@ -360,6 +589,7 @@ class SplitTaskExecutor:
             async with self._parse:
                 await parse()
             registry.transition(key, "finalizing")
+            registry.reserve_finalizer(key, byte_budget=self._result_reservation_bytes)
             async with self._finalize:
                 path, digest, byte_count, owner = await finalize()
             registry.complete(

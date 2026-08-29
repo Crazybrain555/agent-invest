@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
+import os
 import sys
 import tempfile
 import time
@@ -70,12 +72,19 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             registry.bind_task_payload("key", {"task_id": "task-key"})
             registry.transition("key", "processing")
             registry.transition("key", "finalizing")
+            registry.reserve_finalizer("key", byte_budget=12)
+            result = root / "result.zip"
+            result.write_bytes(b"result-bytes")
+            result_sha256 = hashlib.sha256(b"result-bytes").hexdigest()
+            result_owner = hashlib.sha256(
+                f"task-key\0{result_sha256}\0{len(b'result-bytes')}".encode()
+            ).hexdigest()
             registry.complete(
                 "key",
-                result_path=root / "result.zip",
-                result_sha256="a" * 64,
-                result_bytes=12,
-                result_owner="b" * 64,
+                result_path=result,
+                result_sha256=result_sha256,
+                result_bytes=len(b"result-bytes"),
+                result_owner=result_owner,
             )
             recovered = self._registry(root).get("key")
             self.assertIsNotNone(recovered)
@@ -84,7 +93,7 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             self.assertEqual(recovered.result_bytes, 12)
             payload = self._registry(root).recoverable_payloads()[0]
             self.assertEqual(payload["status"], "completed")
-            self.assertEqual(payload["result_artifact_sha256"], "a" * 64)
+            self.assertEqual(payload["result_artifact_sha256"], result_sha256)
 
     def test_lease_reader_blocks_ack_and_cleanup_until_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -93,6 +102,7 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             self._create(registry)
             registry.transition("key", "processing")
             registry.transition("key", "finalizing")
+            registry.reserve_finalizer("key", byte_budget=6)
             result = root / "result.zip"
             result.write_bytes(b"result")
             registry.complete(
@@ -118,6 +128,7 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             self._create(registry)
             registry.transition("key", "processing")
             registry.transition("key", "finalizing")
+            registry.reserve_finalizer("key", byte_budget=6)
             result = root / "result.zip"
             result.write_bytes(b"result")
             registry.complete(
@@ -135,6 +146,48 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             self.assertIsNotNone(record)
             self.assertEqual(record.state, "completed")
 
+    def test_ack_is_idempotent_and_cleanup_failure_keeps_tombstone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(root)
+            self._create(registry)
+            registry.transition("key", "processing")
+            registry.transition("key", "finalizing")
+            registry.reserve_finalizer("key", byte_budget=6)
+            result = root / "result.zip"
+            result.write_bytes(b"result")
+            registry.complete(
+                "key",
+                result_path=result,
+                result_sha256="a" * 64,
+                result_bytes=6,
+                result_owner="b" * 64,
+            )
+            registry.acknowledge("key")
+            registry.acknowledge("key")
+            with self.assertRaisesRegex(OSError, "blocked"):
+                registry.cleanup_consumed(
+                    lambda _path: (_ for _ in ()).throw(OSError("blocked"))
+                )
+            self.assertEqual(registry.get("key").state, "consumed")  # type: ignore[union-attr]
+            self.assertEqual(registry.cleanup_consumed(Path.unlink), 1)
+            self.assertIsNotNone(registry.get("key"))
+
+    def test_registry_rejects_unsafe_mode_and_duplicate_json_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "registry.json"
+            path.write_text(
+                '{"schema":"mineru-task-registry.v2","schema":"x","records":[]}'
+            )
+            os.chmod(path, 0o600)
+            with self.assertRaisesRegex(TaskProtocolConflict, "duplicate"):
+                self._registry(root)
+            path.write_text('{"schema":"mineru-task-registry.v2","records":[]}')
+            os.chmod(path, 0o644)
+            with self.assertRaisesRegex(TaskProtocolConflict, "unsafe"):
+                self._registry(root)
+
     def test_unacked_result_bytes_apply_backpressure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -143,6 +196,7 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
                 self._create(registry, key)
                 registry.transition(key, "processing")
                 registry.transition(key, "finalizing")
+            registry.reserve_finalizer("a", byte_budget=7)
             registry.complete(
                 "a",
                 result_path=root / "a",
@@ -151,13 +205,7 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
                 result_owner="b" * 64,
             )
             with self.assertRaisesRegex(TaskProtocolConflict, "capacity exhausted"):
-                registry.complete(
-                    "b",
-                    result_path=root / "b",
-                    result_sha256="c" * 64,
-                    result_bytes=4,
-                    result_owner="d" * 64,
-                )
+                registry.reserve_finalizer("b", byte_budget=4)
 
     def test_parse_credit_is_released_while_previous_finalizer_waits(self) -> None:
         async def exercise() -> None:
@@ -165,7 +213,9 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
                 registry = self._registry(Path(directory), limit=100)
                 self._create(registry, "a")
                 self._create(registry, "b")
-                executor = SplitTaskExecutor(parse_slots=1, finalizer_slots=1)
+                executor = SplitTaskExecutor(
+                    parse_slots=1, finalizer_slots=1, result_reservation_bytes=2
+                )
                 finalizer_release = asyncio.Event()
                 second_parse_started = asyncio.Event()
 
@@ -208,9 +258,21 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             root = Path(directory)
             registry = self._registry(root)
             self._create(registry)
+            output = root / "task-key"
+            uploads = output / "uploads"
+            uploads.mkdir(parents=True)
+            upload = uploads / "input.pdf"
+            upload.write_bytes(b"pdf")
+            partial = output / "partial"
+            partial.mkdir()
+            (partial / "stale").write_bytes(b"stale")
             registry.bind_task_payload(
                 "key",
-                {"task_id": "task-key", "output_dir": "task-key"},
+                {
+                    "task_id": "task-key",
+                    "output_dir": str(output),
+                    "uploads": [str(upload)],
+                },
             )
             registry.transition("key", "processing")
             recovered_registry = self._registry(root)
@@ -220,6 +282,8 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             self.assertIsNotNone(record)
             assert record is not None
             self.assertEqual(record.state, "pending")
+            self.assertEqual(record.recovery_generation, 2)
+            self.assertFalse(partial.exists())
             by_task = recovered_registry.get_by_task_id("task-key")
             self.assertIsNotNone(by_task)
             assert by_task is not None
