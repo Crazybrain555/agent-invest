@@ -25,6 +25,10 @@ def _coverage(start: datetime, finish: datetime, *, profile: str = HASHES[2], co
         boot_identity_sha256=HASHES[5],
         gpu_exporter_process_epoch_sha256=HASHES[3],
         host_exporter_process_epoch_sha256=HASHES[4],
+        gpu_exporter_source_sha256=HASHES[4],
+        host_exporter_source_sha256=HASHES[5],
+        gpu_device_identity_sha256=HASHES[3],
+        parent_cgroup_epoch_sha256=HASHES[4],
         runtime_bundle_identity_sha256=HASHES[1],
         process_profile_sha256=profile,
         observer_process_epoch_sha256=HASHES[3],
@@ -97,6 +101,45 @@ class FullHostHourKpiTests(unittest.TestCase):
             self.assertFalse(result.complete)
             self.assertIsNone(result.host_unique_durable_pages)
             self.assertTrue(any(reason in item for item in result.incomplete_reasons))
+
+    def test_overlap_nested_same_start_and_outside_spans_fail_closed(self) -> None:
+        invalid_coverages = (
+            (
+                _coverage(START, START + timedelta(minutes=40)),
+                _coverage(START + timedelta(minutes=30), START + timedelta(hours=1)),
+            ),
+            (
+                _coverage(START, START + timedelta(hours=1)),
+                _coverage(START + timedelta(minutes=10), START + timedelta(minutes=20)),
+            ),
+            (
+                _coverage(START, START + timedelta(minutes=30)),
+                _coverage(START, START + timedelta(hours=1)),
+            ),
+            (_coverage(START - timedelta(seconds=1), START + timedelta(hours=1)),),
+        )
+        for coverage in invalid_coverages:
+            result = aggregate_full_gpu_host_hour(
+                hour_started_at_utc=START,
+                coverage=coverage,
+                publish_evidence=(),
+                publish_history_scan_complete=True,
+            )
+            self.assertFalse(result.complete)
+
+    def test_hardware_or_exporter_source_drift_is_incomplete(self) -> None:
+        second = _coverage(START + timedelta(minutes=30), START + timedelta(hours=1))
+        drifted = second.model_copy(
+            update={"gpu_device_identity_sha256": "sha256:" + "9" * 64}
+        )
+        result = aggregate_full_gpu_host_hour(
+            hour_started_at_utc=START,
+            coverage=(_coverage(START, START + timedelta(minutes=30)), drifted),
+            publish_evidence=(),
+            publish_history_scan_complete=True,
+        )
+        self.assertFalse(result.complete)
+        self.assertIn("resident_hardware_identity_drift", result.incomplete_reasons)
 
     def test_profile_change_keeps_host_goodput_but_disables_profile_comparison(self) -> None:
         result = aggregate_full_gpu_host_hour(

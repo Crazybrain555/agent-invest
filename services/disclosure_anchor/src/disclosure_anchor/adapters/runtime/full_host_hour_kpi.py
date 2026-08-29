@@ -47,6 +47,22 @@ def verified_coverage_from_observer_artifacts(
         or gpu.boot_identity_sha256 != host.boot_identity_sha256
     ):
         raise ValueError("sealed exporter lanes disagree on host or boot identity")
+    gpu_devices = {
+        frame.gpu.values.device_identity_sha256
+        for frame in result.frames
+        if frame.lane == "gpu_fast"
+        and frame.gpu.status == "supported"
+        and frame.gpu.values is not None
+    }
+    cgroup_epochs = {
+        frame.host_cgroup.values.parent_cgroup_epoch_sha256
+        for frame in result.frames
+        if frame.lane == "host_slow"
+        and frame.host_cgroup.status == "supported"
+        and frame.host_cgroup.values is not None
+    }
+    if len(gpu_devices) != 1 or len(cgroup_epochs) != 1:
+        raise ValueError("sealed observer evidence lacks one stable GPU/cgroup identity")
     return VerifiedTelemetryCoverage(
         started_at_utc=result.receipt.started_at_utc,
         finished_at_utc=result.receipt.finished_at_utc,
@@ -54,6 +70,10 @@ def verified_coverage_from_observer_artifacts(
         boot_identity_sha256=gpu.boot_identity_sha256,
         gpu_exporter_process_epoch_sha256=gpu.exporter_process_epoch_sha256,
         host_exporter_process_epoch_sha256=host.exporter_process_epoch_sha256,
+        gpu_exporter_source_sha256=gpu.exporter_source_sha256,
+        host_exporter_source_sha256=host.exporter_source_sha256,
+        gpu_device_identity_sha256=next(iter(gpu_devices)),
+        parent_cgroup_epoch_sha256=next(iter(cgroup_epochs)),
         runtime_bundle_identity_sha256=result.receipt.runtime_bundle_identity_sha256,
         process_profile_sha256=result.receipt.process_profile.process_profile_sha256,
         observer_process_epoch_sha256=result.receipt.process_profile.process_epoch_sha256,

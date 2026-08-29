@@ -31,12 +31,20 @@ def aggregate_full_gpu_host_hour(
     host_identity: str | None = None
     boot_identity: str | None = None
     exporter_epochs: tuple[str, str] | None = None
+    hardware_identity: tuple[str, str, str, str] | None = None
     profiles: set[str] = set()
     runtimes: set[str] = set()
     for span in spans:
-        if span.started_at_utc > cursor:
+        if not (
+            hour_started_at_utc
+            <= span.started_at_utc
+            < span.finished_at_utc
+            <= hour_finished
+        ):
+            reasons.add("host_assignment_coverage_outside_hour")
+        if span.started_at_utc != cursor:
             reasons.add("host_assignment_coverage_gap_or_overlap")
-        cursor = max(cursor, span.finished_at_utc)
+        cursor = span.finished_at_utc
         if host_identity is None:
             host_identity = span.host_assignment_identity_sha256
         elif host_identity != span.host_assignment_identity_sha256:
@@ -53,6 +61,16 @@ def aggregate_full_gpu_host_hour(
             exporter_epochs = span_exporter_epochs
         elif exporter_epochs != span_exporter_epochs:
             reasons.add("resident_exporter_epoch_drift")
+        span_hardware = (
+            span.gpu_exporter_source_sha256,
+            span.host_exporter_source_sha256,
+            span.gpu_device_identity_sha256,
+            span.parent_cgroup_epoch_sha256,
+        )
+        if hardware_identity is None:
+            hardware_identity = span_hardware
+        elif hardware_identity != span_hardware:
+            reasons.add("resident_hardware_identity_drift")
         profiles.add(span.process_profile_sha256)
         runtimes.add(span.runtime_bundle_identity_sha256)
         if span.status != "complete" or not span.gpu_lane_complete or not span.host_lane_complete:

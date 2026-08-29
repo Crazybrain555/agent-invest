@@ -249,7 +249,7 @@
   },
   "tests/unit/test_full_host_hour_kpi.py": {
    "private_imports": [],
-   "tests": 7
+   "tests": 9
   },
   "tests/unit/test_gc_orphan_artifacts.py": {
    "private_imports": [],
@@ -474,7 +474,7 @@
   },
   "tests/unit/test_synchronized_telemetry_observer.py": {
    "private_imports": [],
-   "tests": 42
+   "tests": 43
   },
   "tests/unit/test_track_companies.py": {
    "private_imports": [],
@@ -498,7 +498,7 @@
   },
   "tests/unit/test_windows_resident_telemetry.py": {
    "private_imports": [],
-   "tests": 7
+   "tests": 8
   },
   "tests/unit/test_worker_cli.py": {
    "private_imports": [],

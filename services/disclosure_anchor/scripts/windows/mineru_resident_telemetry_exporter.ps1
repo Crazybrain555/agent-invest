@@ -1,12 +1,16 @@
 param(
     [Parameter(Mandatory = $true)][ValidateSet('gpu_fast', 'host_slow')][string]$Lane,
     [Parameter(Mandatory = $true)][ValidateRange(250, 1000)][int]$CadenceMilliseconds,
-    [Parameter(Mandatory = $true)][ValidateRange(1024, 65536)][int]$Port,
+    [Parameter(Mandatory = $true)][ValidateRange(1024, 65535)][int]$Port,
     [Parameter(Mandatory = $true)][string]$IdentityJsonPath
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if (($Lane -eq 'host_slow' -and $CadenceMilliseconds -ne 1000) -or
+    ($Lane -eq 'gpu_fast' -and $CadenceMilliseconds -notin @(250, 500))) {
+    throw 'lane/cadence combination is invalid'
+}
 
 # Runtime-unverified/default-off source.  The backend is loaded exactly once.  The
 # sampling loop itself never starts powershell/ssh/docker/wsl/nvidia-smi or any
@@ -91,7 +95,7 @@ try {
                 }
             } catch {
                 $unsupported = [ordered]@{
-                    reason = 'collector_backend_error'
+                    reason = 'collector_unsupported'
                     status = 'unsupported'
                     values = $null
                 }

@@ -1,12 +1,16 @@
 param(
     [Parameter(Mandatory = $true)][string]$ExporterPath,
     [Parameter(Mandatory = $true)][ValidateSet('gpu_fast', 'host_slow')][string]$Lane,
-    [Parameter(Mandatory = $true)][int]$CadenceMilliseconds,
-    [Parameter(Mandatory = $true)][int]$Port,
+    [Parameter(Mandatory = $true)][ValidateSet(250, 500, 1000)][int]$CadenceMilliseconds,
+    [Parameter(Mandatory = $true)][ValidateRange(1024, 65535)][int]$Port,
     [Parameter(Mandatory = $true)][string]$IdentityJsonPath
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if (($Lane -eq 'host_slow' -and $CadenceMilliseconds -ne 1000) -or
+    ($Lane -eq 'gpu_fast' -and $CadenceMilliseconds -notin @(250, 500))) {
+    throw 'lane/cadence combination is invalid'
+}
 # Default-off/runtime-unverified. The child starts suspended and enters the
 # kill-on-close Job before its first instruction. Real PS5.1 testing remains an
 # activation gate.

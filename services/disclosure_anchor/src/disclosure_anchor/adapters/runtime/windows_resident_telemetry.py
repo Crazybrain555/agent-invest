@@ -27,6 +27,7 @@ from disclosure_anchor.application.ports.synchronized_telemetry import (
     HostLaneSnapshot,
     ResidentTelemetryCollectorSpec,
     TelemetrySampleIdentity,
+    TelemetrySnapshotContinuityLost,
     TelemetrySnapshotDeadline,
     TelemetrySnapshotDeadlineExceeded,
     TelemetrySnapshotTransportUnavailable,
@@ -59,12 +60,17 @@ class WindowsResidentTelemetrySampler:
         self._last_wire_monotonic_ns: int | None = None
         self._last_wire_observed_at: datetime | None = None
         self._identity: ResidentIdentity | None = None
+        self._terminal_continuity_lost = False
 
     @property
     def collector_identity_sha256(self) -> str:
         return self._config.collector_identity_sha256
 
     def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot | HostLaneSnapshot:
+        if self._terminal_continuity_lost:
+            raise TelemetrySnapshotContinuityLost(
+                "resident exporter sequence continuity was already lost"
+            )
         remaining = (deadline.monotonic_ns - time.monotonic_ns()) / 1_000_000_000
         if remaining <= 0:
             raise TelemetrySnapshotDeadlineExceeded("snapshot deadline already expired")
@@ -78,6 +84,12 @@ class WindowsResidentTelemetrySampler:
             raise TelemetrySnapshotTransportUnavailable(str(exc)) from exc
         except BoundedHTTPProtocolError:
             raise
+        if status == 409:
+            self._terminal_continuity_lost = True
+            self.close()
+            raise TelemetrySnapshotContinuityLost(
+                "resident exporter no longer retains the exact next sequence"
+            )
         if status != 200:
             raise TelemetrySnapshotTransportUnavailable(
                 f"resident exporter returned HTTP {status}"

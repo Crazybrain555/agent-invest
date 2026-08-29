@@ -55,6 +55,10 @@ class TelemetrySnapshotTransportUnavailable(ConnectionError):
     """The already-resident collector transport is unavailable."""
 
 
+class TelemetrySnapshotContinuityLost(RuntimeError):
+    """The exporter no longer retains the exact next sequence; restart the run."""
+
+
 @dataclass(frozen=True, slots=True)
 class ResidentTelemetryCollectorSpec:
     """Spawn-safe closed factory contract; no live sampler object crosses spawn."""
@@ -99,6 +103,7 @@ __all__ = [
     "HostTelemetrySamplerPort",
     "ResidentTelemetryCollectorSpec",
     "TelemetrySampleIdentity",
+    "TelemetrySnapshotContinuityLost",
     "TelemetrySnapshotDeadline",
     "TelemetrySnapshotDeadlineExceeded",
     "TelemetrySnapshotTransportUnavailable",

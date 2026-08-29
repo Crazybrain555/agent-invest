@@ -51,6 +51,7 @@ from disclosure_anchor.application.ports.synchronized_telemetry import (
     TelemetrySampleIdentity,
     TelemetrySnapshotDeadline,
     TelemetrySnapshotDeadlineExceeded,
+    TelemetrySnapshotContinuityLost,
     TelemetrySnapshotTransportUnavailable,
 )
 
@@ -334,6 +335,9 @@ class _ResidentSamplerProcess:
                 raise TelemetrySnapshotDeadlineExceeded(str(payload))
             if kind == "transport":
                 raise TelemetrySnapshotTransportUnavailable(str(payload))
+            if kind == "continuity":
+                self._terminate()
+                raise TelemetrySnapshotContinuityLost(str(payload))
             if kind == "assertion":
                 raise AssertionError(str(payload))
             if kind == "capability":
@@ -496,6 +500,8 @@ def _resident_sampler_main(
                 connection.send(("deadline", str(exc)))
             except TelemetrySnapshotTransportUnavailable as exc:
                 connection.send(("transport", str(exc)))
+            except TelemetrySnapshotContinuityLost as exc:
+                connection.send(("continuity", str(exc)))
             except AssertionError as exc:
                 connection.send(("assertion", str(exc)))
             except BaseException as exc:
@@ -1419,6 +1425,19 @@ def _run_lane(
                     reason="endpoint_unreachable",
                 )
                 termination.mark("sampler_or_transport_shutdown")
+                internal_stop.set()
+            except TelemetrySnapshotContinuityLost:
+                finished = monotonic_ns()
+                pending = _unsupported_pending(
+                    lane=lane,
+                    scheduled=scheduled,
+                    started=started,
+                    finished=finished,
+                    observed_at=observed_at,
+                    reason="identity_drift",
+                )
+                safety_drifts.add("identity_drift")
+                termination.mark("identity_drift")
                 internal_stop.set()
             if not _publish_pending(
                 mailbox=mailbox,

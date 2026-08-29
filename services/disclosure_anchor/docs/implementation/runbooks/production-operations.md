@@ -345,6 +345,10 @@ configured/exact-current identity，再从 owner-owned mode 0600 raw JSONL 按 r
 启动、安装或接入现有 worker。激活前必须在同一 exact source identity 下完成 Windows PowerShell 5.1、
 Job Object 树归属、无 per-tick helper、GPU 250--500 ms、host/queue 1 s、exporter+observer 总 CPU 开销、
 断线/重启和完整 UTC 3600 秒门禁；任何 unsupported/gap/stale 都只能生成 incomplete evidence。
+此外必须先新增 installer-owned 的原子 private identity artifact：绑定 exact exporter/supervisor source SHA、
+host assignment、boot、runtime/profile/clock/exporter process epoch 与端口拓扑；installer/attester 必须机械
+验证同一字节和 supported backend 后才能产生 activation receipt。当前 installer 没有这个闭包，因此
+resident 代码在 tree-wide executable caller closure 下保持不可达。
 
 默认构建和部署只提供单一串行执行身份，并保持 `MINERU_PHASE_TRACE=0`、
 `MINERU_API_MAX_CONCURRENT_REQUESTS=1`、`MINERU_API_MAX_PENDING_TASKS=1`。旧的双模式、并行候选 profile

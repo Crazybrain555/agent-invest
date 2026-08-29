@@ -15,6 +15,7 @@ from disclosure_anchor.adapters.runtime.windows_resident_telemetry import (
 from disclosure_anchor.application.contracts.windows_resident_telemetry import ResidentIdentity
 from disclosure_anchor.application.ports.synchronized_telemetry import (
     TelemetrySnapshotDeadline,
+    TelemetrySnapshotContinuityLost,
 )
 
 
@@ -178,6 +179,23 @@ class WindowsResidentTelemetryTests(unittest.TestCase):
             self._sampler().snapshot(
                 deadline=TelemetrySnapshotDeadline(time.monotonic_ns() + 500_000_000)
             )
+
+    def test_sequence_checkpoint_loss_is_terminal_without_third_get(self) -> None:
+        _Handler.payloads = [_payload(1), _payload(3)]
+        sampler = self._sampler()
+        sampler.snapshot(
+            deadline=TelemetrySnapshotDeadline(time.monotonic_ns() + 2_000_000_000)
+        )
+        _Handler.status = 409
+        with self.assertRaises(TelemetrySnapshotContinuityLost):
+            sampler.snapshot(
+                deadline=TelemetrySnapshotDeadline(time.monotonic_ns() + 2_000_000_000)
+            )
+        with self.assertRaises(TelemetrySnapshotContinuityLost):
+            sampler.snapshot(
+                deadline=TelemetrySnapshotDeadline(time.monotonic_ns() + 2_000_000_000)
+            )
+        self.assertEqual(_Handler.requests, 2)
         _Handler.declared_length = None
         _Handler.status = 503
         _Handler.payloads = [_payload(1)]
@@ -229,6 +247,22 @@ class WindowsResidentTelemetryTests(unittest.TestCase):
             )
         )
         self.assertNotIn("start_mineru_resident_telemetry", active_surfaces)
+        executable_surface = "\n".join(
+            path.read_text(errors="replace")
+            for parent in (root / "src", root / "scripts")
+            for path in parent.rglob("*")
+            if path.is_file()
+            and path.suffix in {".py", ".ps1"}
+            and path.name not in {
+                "mineru_resident_telemetry_exporter.ps1",
+                "start_mineru_resident_telemetry.ps1",
+                "windows_resident_telemetry.py",
+                "full_host_hour_kpi.py",
+            }
+        )
+        self.assertNotIn("mineru_resident_telemetry", executable_surface)
+        self.assertIn("ValidateRange(1024, 65535)", supervisor)
+        self.assertIn("$PSHOME, 'powershell.exe'", supervisor)
 
 
 if __name__ == "__main__":

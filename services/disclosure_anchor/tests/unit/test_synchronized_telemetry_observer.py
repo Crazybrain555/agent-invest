@@ -51,6 +51,7 @@ from disclosure_anchor.application.ports.synchronized_telemetry import (
     TelemetrySampleIdentity,
     TelemetrySnapshotDeadline,
     TelemetrySnapshotDeadlineExceeded,
+    TelemetrySnapshotContinuityLost,
     TelemetrySnapshotTransportUnavailable,
 )
 
@@ -281,6 +282,12 @@ class _ProgrammingErrorSampler:
         raise AssertionError("collector programming defect")
 
 
+class _ContinuityLostSampler:
+    collector_identity_sha256 = COLLECTOR_ID
+    def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
+        raise TelemetrySnapshotContinuityLost("exporter sequence checkpoint lost")
+
+
 class _ForeverHangSampler:
     collector_identity_sha256 = COLLECTOR_ID
     def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
@@ -360,6 +367,8 @@ def _test_collector_factory(config: dict[str, object]) -> object:
         return _DeadlineSampler()
     if mode == "programming_error":
         return _ProgrammingErrorSampler()
+    if mode == "continuity_lost":
+        return _ContinuityLostSampler()
     if mode == "hang":
         return _ForeverHangSampler()
     if mode == "late":
@@ -415,6 +424,7 @@ def _spec_for_sampler(value: object | None, *, lane: str) -> ResidentTelemetryCo
         _DelayedFailingSampler: "delayed_transport_failure",
         _DeadlineSampler: "deadline",
         _ProgrammingErrorSampler: "programming_error",
+        _ContinuityLostSampler: "continuity_lost",
         _ForeverHangSampler: "hang",
         _LateSampler: "late",
     }
@@ -584,6 +594,17 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
                     duration=0.4,
                 )
             self.assertIsInstance(caught.exception.__cause__, AssertionError)
+
+    def test_sequence_continuity_loss_survives_ipc_and_stops_the_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self._run(
+                Path(temporary) / "continuity-lost",
+                gpu_sampler=_ContinuityLostSampler(),
+                duration=1.0,
+            )
+            self.assertEqual(result.receipt.status, "unsafe")
+            self.assertEqual(result.receipt.termination_reason, "identity_drift")
+            self.assertIn("identity_drift", result.receipt.safety_drift_reasons)
 
     def test_internal_stop_wakes_other_lane_without_extra_sample(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

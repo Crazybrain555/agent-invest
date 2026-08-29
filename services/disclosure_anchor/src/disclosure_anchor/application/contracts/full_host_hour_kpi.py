@@ -35,6 +35,10 @@ class VerifiedTelemetryCoverage(_Closed):
     boot_identity_sha256: str
     gpu_exporter_process_epoch_sha256: str
     host_exporter_process_epoch_sha256: str
+    gpu_exporter_source_sha256: str
+    host_exporter_source_sha256: str
+    gpu_device_identity_sha256: str
+    parent_cgroup_epoch_sha256: str
     runtime_bundle_identity_sha256: str
     process_profile_sha256: str
     observer_process_epoch_sha256: str
@@ -58,6 +62,10 @@ class VerifiedTelemetryCoverage(_Closed):
             "boot_identity_sha256",
             "gpu_exporter_process_epoch_sha256",
             "host_exporter_process_epoch_sha256",
+            "gpu_exporter_source_sha256",
+            "host_exporter_source_sha256",
+            "gpu_device_identity_sha256",
+            "parent_cgroup_epoch_sha256",
             "runtime_bundle_identity_sha256",
             "process_profile_sha256",
             "observer_process_epoch_sha256",
@@ -146,6 +154,7 @@ IncompleteReason = Literal[
     "publish_history_scan_incomplete",
     "publish_page_count_conflict",
     "resident_exporter_epoch_drift",
+    "resident_hardware_identity_drift",
     "telemetry_coverage_incomplete",
 ]
 
