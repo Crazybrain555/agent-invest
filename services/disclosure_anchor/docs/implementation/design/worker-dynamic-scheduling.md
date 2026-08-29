@@ -317,6 +317,16 @@ maintenance thread                 report writer thread
   whole-document admission credit；Mac download/verify/provider-envelope/atomic write/finish-run 进入独立
   local pump，并由独立 local item + result-byte credits 背压。receipt checkpoint 失败、local persist
   失败或 restart 恢复失败都保持可见，绝不能把 remote terminal 提升为 succeeded run；
+
+Pinned MinerU 3.4.4 的 `/tasks` staged HTTP 机制实现在
+`adapters/parsers/mineru_medium/http_staged.py`：提交、terminal 轮询、同源 result-owner/字节回执和
+本地安全 ZIP materialize 是分开的，客户端显式 `trust_env=False`，durable resume token 不进入
+`repr`。它仍是 default-off capability：现有 `ParseDocument.execute()` 用一个 producer lease 包围
+prepare、同步 parser、本地原子写和 finish-run，而 stale-run reclaim 会直接终结遗留 `running`
+记录。在加入私有 durable checkpoint 路径、reclaim-before-resume 顺序和重新取得 lease 后的
+attempt/fence CAS 之前，worker 不得把该 capability 接成生产路径；否则进程重启会丢失已完成的
+远端结果，或者把旧 attempt 写进新 run。此限制不需要新增公开 DB contract，但需要一个明确的
+私有 checkpoint/recovery adapter，不能用内存映射代替。
 - 当前 MinerU 3.4.4 CLI 的 `--api-url` 路径把 submit/status/terminal、result ZIP 下载/解压绑定在
   同一个 CLI process return 中，没有可证明的提前 terminal/result-owner 回调。因此 production adapter
   仍走 legacy synchronous port；`BoundedTwoStageParserPump` 只在 adapter 实现

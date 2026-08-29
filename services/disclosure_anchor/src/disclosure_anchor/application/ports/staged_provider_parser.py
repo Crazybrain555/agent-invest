@@ -7,7 +7,7 @@ local download and persistence.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -23,6 +23,8 @@ class RemoteArtifactReceipt:
     fence_identity: str
     artifact_owner_identity: str
     artifact_byte_count: int
+    source_pdf_sha256: str = ""
+    resume_token: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         if not all(
@@ -36,6 +38,8 @@ class RemoteArtifactReceipt:
             raise ValueError("remote artifact identities must be non-empty")
         if self.artifact_byte_count < 0:
             raise ValueError("remote artifact byte count must be non-negative")
+        if self.source_pdf_sha256 and len(self.source_pdf_sha256) != 64:
+            raise ValueError("remote source identity must be sha256")
 
 
 class RemoteProviderParseHandle(Protocol):
@@ -66,6 +70,8 @@ class StagedProviderDocumentParserPort(Protocol):
         input_pdf: Path,
         options: ParserOptions,
         source_pdf_sha256: str,
+        attempt_identity: str,
+        fence_identity: str,
     ) -> RemoteProviderParseHandle:
         ...
 
