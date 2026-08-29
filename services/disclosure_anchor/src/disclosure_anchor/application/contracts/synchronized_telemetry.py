@@ -1095,12 +1095,6 @@ def validate_frame_sequence(
 ) -> None:
     if not frames:
         raise ValueError("telemetry frame sequence is empty")
-    previous_started = -1
-    lane_previous: dict[TelemetryLane, SynchronizedTelemetryFrame] = {}
-    lane_frames: dict[TelemetryLane, list[SynchronizedTelemetryFrame]] = {
-        "gpu_fast": [],
-        "host_slow": [],
-    }
     for sequence, frame in enumerate(frames):
         if frame.sequence != sequence or frame.run_id != receipt.run_id:
             raise ValueError("telemetry frame sequence or run identity drifted")
@@ -1137,94 +1131,14 @@ def validate_frame_sequence(
         )
         if wall_error_ns > allowed_wall_error_ns:
             raise ValueError("telemetry frame wall and monotonic clocks diverged")
-        if frame.clock.started_monotonic_ns < previous_started:
-            raise ValueError("telemetry frames are not monotonic")
-        previous = lane_previous.get(frame.lane)
-        if previous is None:
-            if frame.quality.status != "first":
-                raise ValueError("first lane frame is not marked first")
-        else:
-            observed_ns = (
-                frame.clock.started_monotonic_ns
-                - previous.clock.started_monotonic_ns
-            )
-            observed_ms = observed_ns / 1_000_000
-            if frame.quality.observed_interval_ms is None or not math.isclose(
-                frame.quality.observed_interval_ms,
-                observed_ms,
-                abs_tol=0.001,
-            ):
-                raise ValueError("observed lane interval differs from clock")
-            nominal_ns = frame.quality.nominal_interval_ms * 1_000_000
-            scheduled_ns = (
-                frame.clock.scheduled_monotonic_ns
-                - previous.clock.scheduled_monotonic_ns
-            )
-            if scheduled_ns < nominal_ns or scheduled_ns % nominal_ns:
-                raise ValueError("telemetry lane absolute schedule drifted")
-            expected_missed = scheduled_ns // nominal_ns - 1
-            expected_status = "late" if expected_missed else "on_time"
-            if (
-                frame.quality.missed_deadlines != expected_missed
-                or frame.quality.status != expected_status
-            ):
-                raise ValueError("telemetry lane deadline evidence differs from clock")
-        lane_previous[frame.lane] = frame
-        lane_frames[frame.lane].append(frame)
-        previous_started = frame.clock.started_monotonic_ns
+    expected_quality, unsupported_observation_count = derive_frame_evidence(
+        frames,
+        started_monotonic_ns=receipt.started_monotonic_ns,
+        finished_monotonic_ns=receipt.finished_monotonic_ns,
+    )
     receipt_quality = {item.lane: item for item in receipt.lane_quality}
-    unsupported_observation_count = 0
-    for lane, frames_in_lane in lane_frames.items():
-        if not frames_in_lane:
-            raise ValueError(f"telemetry {lane} lane is empty")
-        required_statuses = (
-            [(frame.gpu.status,) for frame in frames_in_lane]
-            if lane == "gpu_fast"
-            else [
-                (
-                    frame.api_process.status,
-                    frame.host_cgroup.status,
-                    frame.queue_vllm.status,
-                )
-                for frame in frames_in_lane
-            ]
-        )
-        unsupported_observation_count += sum(
-            status == "unsupported"
-            for statuses in required_statuses
-            for status in statuses
-        )
-        supported_frame_count = sum(
-            all(status == "supported" for status in statuses)
-            for statuses in required_statuses
-        )
-        starts = [frame.clock.started_monotonic_ns for frame in frames_in_lane]
-        gaps_ns = [starts[0] - receipt.started_monotonic_ns]
-        gaps_ns.extend(right - left for left, right in zip(starts, starts[1:]))
-        gaps_ns.append(receipt.finished_monotonic_ns - starts[-1])
-        scheduled = [
-            frame.clock.scheduled_monotonic_ns for frame in frames_in_lane
-        ]
-        schedule_gaps_ns = [scheduled[0] - receipt.started_monotonic_ns]
-        schedule_gaps_ns.extend(
-            right - left for left, right in zip(scheduled, scheduled[1:])
-        )
-        schedule_gaps_ns.append(receipt.finished_monotonic_ns - scheduled[-1])
-        nominal_ns = frames_in_lane[0].quality.nominal_interval_ms * 1_000_000
-        expected_missed_deadlines = sum(
-            max(0, (gap_ns - 1) // nominal_ns) for gap_ns in schedule_gaps_ns
-        )
-        expected = LaneQualitySummary(
-            lane=lane,
-            nominal_interval_ms=frames_in_lane[0].quality.nominal_interval_ms,
-            sample_count=len(frames_in_lane),
-            maximum_gap_ms=max(gaps_ns) / 1_000_000,
-            late_sample_count=sum(
-                frame.quality.status == "late" for frame in frames_in_lane
-            ),
-            missed_deadline_count=expected_missed_deadlines,
-            supported_frame_count=supported_frame_count,
-        )
+    for expected in expected_quality:
+        lane = expected.lane
         if receipt_quality[lane] != expected:
             raise ValueError(f"telemetry {lane} lane quality receipt drifted")
     if receipt.unsupported_observation_count != unsupported_observation_count:

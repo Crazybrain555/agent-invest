@@ -199,6 +199,12 @@ class _FailingSampler:
         raise ConnectionError("not evidence-safe to expose")
 
 
+class _DelayedFailingSampler:
+    def sample(self) -> GpuLaneSnapshot:
+        time.sleep(0.3)
+        raise ConnectionError("not evidence-safe to expose")
+
+
 class SynchronizedTelemetryObserverTests(unittest.TestCase):
     def _run(
         self,
@@ -317,6 +323,22 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
                 run_id=result.receipt.run_id,
             )
 
+    def test_internal_stop_wakes_other_lane_without_extra_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            host = _Sampler(_host_snapshot())
+            result = self._run(
+                Path(temporary) / "telemetry",
+                gpu_sampler=_DelayedFailingSampler(),
+                host_sampler=host,
+                duration=2,
+            )
+
+            self.assertEqual(
+                result.receipt.termination_reason,
+                "sampler_or_transport_shutdown",
+            )
+            self.assertEqual(len(host.started), 1)
+
     def test_pre_cancelled_run_seals_incomplete_receipt_for_both_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             cancel = threading.Event()
@@ -330,6 +352,37 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
             self.assertEqual(result.receipt.status, "incomplete")
             self.assertEqual(result.receipt.termination_reason, "cancelled")
             self.assertEqual({frame.lane for frame in result.frames}, {"gpu_fast", "host_slow"})
+
+    def test_duration_shorter_than_host_period_still_covers_both_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self._run(
+                Path(temporary) / "telemetry",
+                duration=0.08,
+            )
+
+            self.assertEqual(result.receipt.status, "complete")
+            self.assertEqual(
+                {frame.lane for frame in result.frames},
+                {"gpu_fast", "host_slow"},
+            )
+
+    def test_cancel_during_first_sample_drains_and_seals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cancel = threading.Event()
+            timer = threading.Timer(0.05, cancel.set)
+            timer.start()
+            try:
+                result = self._run(
+                    Path(temporary) / "telemetry",
+                    gpu_sampler=_Sampler(_gpu_snapshot(), delay=0.2),
+                    duration=1,
+                    cancel_event=cancel,
+                )
+            finally:
+                timer.cancel()
+
+            self.assertEqual(result.receipt.termination_reason, "cancelled")
+            self.assertEqual(result.receipt.status, "incomplete")
 
     def test_identity_drift_is_unsafe_and_stops_both_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -398,6 +451,19 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
             run_dir = root / "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
             self.assertTrue((run_dir / "frames.v1.jsonl").exists())
             self.assertFalse((run_dir / "receipt.v1.json").exists())
+
+    def test_frame_fsync_failure_is_failed_evidence_and_does_not_mask_cause(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "telemetry"
+            with patch(
+                "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer.os.fsync",
+                side_effect=[None, None, OSError("fsync failed"), None],
+            ):
+                with self.assertRaisesRegex(
+                    SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"
+                ) as caught:
+                    self._run(root, duration=0.08)
+            self.assertIsInstance(caught.exception.__cause__, OSError)
 
     def test_existing_run_and_symlink_root_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

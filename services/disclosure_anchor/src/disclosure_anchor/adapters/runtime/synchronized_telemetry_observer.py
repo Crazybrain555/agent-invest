@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from enum import Enum
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -151,25 +152,34 @@ class _FrameWriter:
         limits: SynchronizedObserverLimits,
     ) -> None:
         self._limits = limits
-        self._root_fd = _open_or_create_private_directory(artifact_root)
+        self._root_fd: int | None = _open_or_create_private_directory(artifact_root)
         try:
             os.mkdir(run_id, mode=0o700, dir_fd=self._root_fd)
             os.fsync(self._root_fd)
-            self._run_fd = os.open(
+            self._run_fd: int | None = os.open(
                 run_id,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                 dir_fd=self._root_fd,
             )
         except Exception:
-            os.close(self._root_fd)
+            _close_descriptor(self._root_fd)
+            self._root_fd = None
             raise
         self.run_directory = artifact_root / run_id
-        _validate_private_directory_fd(self._run_fd, label="telemetry run")
+        if self._run_fd is None:
+            raise SynchronizedTelemetryEvidenceError(
+                "telemetry run descriptor is unavailable"
+            )
         try:
-            self._frames_fd = _open_new_private_at(self._run_fd, FRAME_FILENAME)
+            _validate_private_directory_fd(self._run_fd, label="telemetry run")
+            self._frames_fd: int | None = _open_new_private_at(
+                self._run_fd, FRAME_FILENAME
+            )
         except Exception:
-            os.close(self._run_fd)
-            os.close(self._root_fd)
+            _close_descriptor(self._run_fd)
+            _close_descriptor(self._root_fd)
+            self._run_fd = None
+            self._root_fd = None
             raise
         self._frame_hash = hashlib.sha256()
         self._frame_count = 0
@@ -180,6 +190,10 @@ class _FrameWriter:
     def append(self, frame: SynchronizedTelemetryFrame) -> None:
         if self._frames_closed:
             raise SynchronizedTelemetryEvidenceError("telemetry frame stream is closed")
+        if self._frames_fd is None:
+            raise SynchronizedTelemetryEvidenceError(
+                "telemetry frame descriptor is unavailable"
+            )
         payload = _canonical_json_bytes(frame.model_dump(mode="json")) + b"\n"
         if (
             len(payload) > self._limits.maximum_frame_record_bytes
@@ -196,8 +210,13 @@ class _FrameWriter:
     def close_frames(self) -> str:
         if self._frames_closed:
             raise SynchronizedTelemetryEvidenceError("telemetry frame stream already closed")
+        if self._frames_fd is None or self._run_fd is None:
+            raise SynchronizedTelemetryEvidenceError(
+                "telemetry frame seal descriptors are unavailable"
+            )
         os.fsync(self._frames_fd)
         os.close(self._frames_fd)
+        self._frames_fd = None
         self._frames_closed = True
         os.fsync(self._run_fd)
         return "sha256:" + self._frame_hash.hexdigest()
@@ -206,6 +225,10 @@ class _FrameWriter:
         if not self._frames_closed:
             raise SynchronizedTelemetryEvidenceError(
                 "telemetry receipt cannot precede the frame seal"
+            )
+        if self._run_fd is None or self._root_fd is None:
+            raise SynchronizedTelemetryEvidenceError(
+                "telemetry receipt descriptors are unavailable"
             )
         payload = _canonical_json_bytes(receipt.model_dump(mode="json"))
         if len(payload) > self._limits.maximum_receipt_bytes:
@@ -218,21 +241,31 @@ class _FrameWriter:
             os.close(descriptor)
         os.fsync(self._run_fd)
         os.close(self._run_fd)
-        os.fsync(self._root_fd)
-        os.close(self._root_fd)
+        self._run_fd = None
+        try:
+            os.fsync(self._root_fd)
+        finally:
+            os.close(self._root_fd)
+            self._root_fd = None
         self._closed = True
 
     def abort(self) -> None:
         if self._closed:
             return
-        if not self._frames_closed:
+        if not self._frames_closed and self._frames_fd is not None:
             try:
-                os.fsync(self._frames_fd)
+                try:
+                    os.fsync(self._frames_fd)
+                except OSError:
+                    pass
             finally:
-                os.close(self._frames_fd)
+                _close_descriptor(self._frames_fd)
+                self._frames_fd = None
             self._frames_closed = True
-        os.close(self._run_fd)
-        os.close(self._root_fd)
+        _close_descriptor(self._run_fd)
+        _close_descriptor(self._root_fd)
+        self._run_fd = None
+        self._root_fd = None
         self._closed = True
 
 
@@ -279,7 +312,7 @@ def run_synchronized_telemetry_observer(
     state = ObserverState.INIT
     if not 250 <= gpu_interval_ms <= 500:
         raise ValueError("GPU telemetry cadence must be 250-500ms")
-    if not duration_seconds > 0:
+    if not math.isfinite(duration_seconds) or not duration_seconds > 0:
         raise ValueError("telemetry duration must be positive")
     resolved_run_id = str(uuid.UUID(run_id)) if run_id is not None else str(uuid.uuid4())
     if resolved_run_id != (run_id or resolved_run_id):
@@ -310,12 +343,20 @@ def run_synchronized_telemetry_observer(
             done=threading.Event(),
         ),
     }
-    start_wall = utc_now()
-    _require_utc(start_wall)
-    start_monotonic = monotonic_ns()
-    process_cpu_started = process_cpu_ns()
-    end_deadline = start_monotonic + int(duration_seconds * 1_000_000_000)
-    observer_source = synchronized_observer_source_sha256()
+    try:
+        start_wall = utc_now()
+        _require_utc(start_wall)
+        start_monotonic = monotonic_ns()
+        process_cpu_started = process_cpu_ns()
+        end_deadline = start_monotonic + int(duration_seconds * 1_000_000_000)
+        observer_source = synchronized_observer_source_sha256()
+    except BaseException as exc:
+        writer.abort()
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise SynchronizedTelemetryEvidenceError(
+            "synchronized telemetry evidence failed in FAILED_EVIDENCE"
+        ) from exc
     expected_identity = TelemetrySampleIdentity(
         runtime_bundle_identity_sha256=(
             process_profile.runtime_bundle_identity_sha256
@@ -378,9 +419,11 @@ def run_synchronized_telemetry_observer(
     ]
     frames: list[SynchronizedTelemetryFrame] = []
     state = ObserverState.RUNNING
-    for thread in threads:
-        thread.start()
+    started_threads: list[threading.Thread] = []
     try:
+        for thread in threads:
+            thread.start()
+            started_threads.append(thread)
         _merge_lane_mailboxes(
             mailboxes=mailboxes,
             condition=condition,
@@ -394,7 +437,7 @@ def run_synchronized_telemetry_observer(
             gpu_interval_ms=gpu_interval_ms,
         )
         state = ObserverState.DRAINING
-        for thread in threads:
+        for thread in started_threads:
             thread.join()
         finish_monotonic = max(
             monotonic_ns(),
@@ -473,7 +516,7 @@ def run_synchronized_telemetry_observer(
     except BaseException as exc:
         state = ObserverState.FAILED_EVIDENCE
         internal_stop.set()
-        for thread in threads:
+        for thread in started_threads:
             thread.join()
         writer.abort()
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -585,6 +628,8 @@ def _run_lane(
                 monotonic_ns=monotonic_ns,
             ):
                 termination.mark("cancelled")
+                break
+            if internal_stop.is_set():
                 break
             started = monotonic_ns()
             observed_at = utc_now()
@@ -973,10 +1018,21 @@ def _require_utc(value: datetime) -> None:
 
 
 def _open_or_create_private_directory(path: Path) -> int:
+    created = False
+    parent_descriptor = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
     try:
-        os.mkdir(path, mode=0o700)
-    except FileExistsError:
-        pass
+        try:
+            os.mkdir(path.name, mode=0o700, dir_fd=parent_descriptor)
+            created = True
+        except FileExistsError:
+            pass
+        if created:
+            os.fsync(parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
     return _open_existing_private_directory(path, label="telemetry root")
 
 
@@ -1063,6 +1119,15 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         if written <= 0:
             raise OSError("telemetry artifact write made no progress")
         view = view[written:]
+
+
+def _close_descriptor(descriptor: int | None) -> None:
+    if descriptor is None:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
 
 
 __all__ = [
