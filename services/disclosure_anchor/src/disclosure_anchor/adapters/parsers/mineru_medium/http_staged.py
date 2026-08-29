@@ -189,11 +189,22 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
     def _wait_terminal_once(self) -> RemoteArtifactReceipt:
         timeout = float(self._options.timeout_seconds or 3600)
         deadline = time.monotonic() + timeout
+        retry_delay = 0.25
         with self._client(min(30.0, timeout)) as client:
             while time.monotonic() < deadline:
-                response = client.get(self._task.status_url)
+                try:
+                    response = client.get(self._task.status_url)
+                except httpx.TransportError:
+                    self._stop.wait(min(retry_delay, max(0.0, deadline - time.monotonic())))
+                    retry_delay = min(5.0, retry_delay * 2)
+                    continue
+                if 500 <= response.status_code <= 599:
+                    self._stop.wait(min(retry_delay, max(0.0, deadline - time.monotonic())))
+                    retry_delay = min(5.0, retry_delay * 2)
+                    continue
                 if response.status_code != 200:
                     raise _fail(f"status returned HTTP {response.status_code}")
+                retry_delay = 0.25
                 payload = _closed_json(response, required={"status"})
                 status_value = payload["status"]
                 if status_value in {"pending", "processing"}:
@@ -369,6 +380,11 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             _safe_extract(resolved_spool, staging)
             _fsync_tree(staging)
             os.replace(staging, output_dir)
+            parent_fd = os.open(output_dir.parent, os.O_RDONLY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
             staging = output_dir.parent / f".{output_dir.name}-promoted"
         except BaseException:
             if spool_path is None:
@@ -450,6 +466,19 @@ class MinerUHttpStagedParser:
         _identity(fence_identity, "fence identity")
         if not source_pdf_sha256.startswith("sha256:") or len(source_pdf_sha256) != 71:
             raise _fail("source identity is not canonical sha256")
+        if (
+            options.backend != "hybrid-http-client"
+            or options.method != "auto"
+            or options.language != "ch"
+            or not options.formula
+            or not options.table
+            or options.effective_effort != "medium"
+            or options.effective_image_analysis
+            or options.start_page is not None
+            or options.end_page is not None
+            or not options.runtime_bundle_identity_sha256
+        ):
+            raise _fail("request is outside the pinned full-PDF Medium profile")
         self._spool_root.mkdir(parents=True, exist_ok=True)
         before = input_pdf.stat()
         digest = hashlib.sha256()
@@ -561,11 +590,13 @@ def _fsync_tree(root: Path) -> None:
         if path.is_file():
             with path.open("rb") as source:
                 os.fsync(source.fileno())
-    directory_fd = os.open(root, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    directories = [path for path in root.rglob("*") if path.is_dir()]
+    for directory in (*reversed(directories), root):
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 __all__ = ["MinerUHttpRemoteHandle", "MinerUHttpStagedParser"]

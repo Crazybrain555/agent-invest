@@ -20,6 +20,8 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
 )
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
+PINNED_OPTIONS = ParserOptions(runtime_bundle_identity_sha256="sha256:" + "a" * 64)
+
 
 class _Reader:
     def read(self, output_dir: Path, *, source_pdf_sha256: str) -> object:
@@ -105,7 +107,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
             handle = parser.begin_remote_parse(
                 input_pdf=source,
-                options=ParserOptions(),
+                options=PINNED_OPTIONS,
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
@@ -117,7 +119,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
         self.assertNotIn("task-1", repr(receipt))
         resumed = parser.resume_remote_parse(
             receipt=receipt,
-            options=ParserOptions(),
+            options=PINNED_OPTIONS,
         )
         self.assertIsNotNone(resumed)
         self.assertEqual(result_gets, 1)
@@ -148,7 +150,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             ):
                 parser.begin_remote_parse(
                     input_pdf=source,
-                    options=ParserOptions(),
+                    options=PINNED_OPTIONS,
                     source_pdf_sha256="sha256:" + hashlib.sha256(source.read_bytes()).hexdigest(),
                     attempt_identity="attempt-1",
                     fence_identity="fence-1",
@@ -160,7 +162,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 directory,
                 self._zip([("result.txt", b"ok")]),
             )
-            parser.begin_remote_parse(input_pdf=source, options=ParserOptions(), source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
+            parser.begin_remote_parse(input_pdf=source, options=PINNED_OPTIONS, source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
         body = submissions[0]
         self.assertIn(b'name="effort"\r\n\r\nmedium', body)
         self.assertIn(b'name="image_analysis"\r\n\r\nfalse', body)
@@ -170,7 +172,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
         result = self._zip([("result.txt", b"one")])
         with tempfile.TemporaryDirectory() as directory:
             parser, source, source_sha256, _ = self._completed_parser(directory, result)
-            handle = parser.begin_remote_parse(input_pdf=source, options=ParserOptions(), source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
+            handle = parser.begin_remote_parse(input_pdf=source, options=PINNED_OPTIONS, source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
             receipt = handle.wait_terminal()
             spool = next((Path(directory) / "spool").glob("*.zip"))
             content = bytearray(spool.read_bytes())
@@ -237,7 +239,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             source.write_bytes(b"%PDF-stage")
             source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
             parser = MinerUHttpStagedParser(api_url="http://mineru.test:30000", server_url="http://vlm.test:30000/v1", spool_root=Path(directory) / "spool", transport=httpx.MockTransport(handler))
-            handle = parser.begin_remote_parse(input_pdf=source, options=ParserOptions(), source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
+            handle = parser.begin_remote_parse(input_pdf=source, options=PINNED_OPTIONS, source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
             with ThreadPoolExecutor(max_workers=2) as pool:
                 wait_future = pool.submit(handle.wait_terminal)
                 drain_future = pool.submit(handle.cancel_and_drain)
@@ -253,7 +255,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
         ):
             with self.subTest(kind=result[:12]), tempfile.TemporaryDirectory() as directory:
                 parser, source, source_sha256, _ = self._completed_parser(directory, result)
-                handle = parser.begin_remote_parse(input_pdf=source, options=ParserOptions(), source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
+                handle = parser.begin_remote_parse(input_pdf=source, options=PINNED_OPTIONS, source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
                 receipt = handle.wait_terminal()
                 output = Path(directory) / "out"
                 with self.assertRaisesRegex(ParserOutputContractError, "unsafe ZIP"):
