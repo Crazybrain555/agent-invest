@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -14,7 +15,11 @@ from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     VerifiedMinerUHeldoutValidation,
 )
 from scripts.build_mineru_validation_receipt import build_receipt
-from scripts.collect_mineru_phase_trace import _validation_identity
+from scripts.collect_mineru_phase_trace import (
+    _read_regular,
+    _validation_identity,
+    _write_new_private,
+)
 from tests.unit.test_build_mineru_validation_receipt import (
     _epoch,
     _smoke,
@@ -82,6 +87,49 @@ class CollectMineruPhaseTraceTests(unittest.TestCase):
 
         self.assertNotIn("markdown", encoded)
         self.assertNotIn("text_content", encoded)
+
+    def test_regular_reader_rejects_same_size_overwrite_with_restored_mtime(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "evidence.json"
+            path.write_bytes(b'{"value":"aaaa"}')
+            path.chmod(0o600)
+            original_times = path.stat()
+            real_fstat = os.fstat
+            calls = 0
+
+            def overwriting_fstat(descriptor: int) -> os.stat_result:
+                nonlocal calls
+                metadata = real_fstat(descriptor)
+                calls += 1
+                if calls == 1:
+                    path.write_bytes(b'{"value":"bbbb"}')
+                    os.utime(
+                        path,
+                        ns=(original_times.st_atime_ns, original_times.st_mtime_ns),
+                    )
+                return metadata
+
+            with patch(
+                "scripts.collect_mineru_phase_trace.os.fstat",
+                side_effect=overwriting_fstat,
+            ), self.assertRaisesRegex(ValueError, "changed while reading"):
+                _read_regular(path, label="evidence", maximum_bytes=1024)
+
+    def test_capture_writer_fsyncs_parent_and_preserves_fsync_error(self) -> None:
+        original = OSError("parent fsync failed")
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "capture.jsonl"
+            with patch(
+                "scripts.collect_mineru_phase_trace.os.fsync",
+                side_effect=(None, original),
+            ) as fsync, self.assertRaises(OSError) as caught:
+                _write_new_private(output, b"capture")
+
+            self.assertIs(caught.exception, original)
+            self.assertEqual(fsync.call_count, 2)
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

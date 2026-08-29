@@ -16,6 +16,7 @@ from scripts.mineru_smoke import (
     RECEIPT_SCHEMA,
     _snapshot_pdf,
     _smoke_orchestrator_evidence,
+    _write_json,
     run_cli,
 )
 
@@ -60,6 +61,45 @@ class MinerUSmokeCliReceiptTests(unittest.TestCase):
             with patch("scripts.mineru_smoke.os.fstat", side_effect=changing_fstat):
                 with self.assertRaisesRegex(ValueError, "changed while snapshotting"):
                     _snapshot_pdf(raced, work_root=None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            raced = Path(tmp) / "source.pdf"
+            raced.write_bytes(source.read_bytes())
+            original_times = raced.stat()
+            real_fstat = os.fstat
+            calls = 0
+
+            def same_size_overwrite(descriptor: int) -> os.stat_result:
+                nonlocal calls
+                value = real_fstat(descriptor)
+                calls += 1
+                if calls == 1:
+                    payload = raced.read_bytes()
+                    raced.write_bytes(bytes([payload[0] ^ 1]) + payload[1:])
+                    os.utime(
+                        raced,
+                        ns=(original_times.st_atime_ns, original_times.st_mtime_ns),
+                    )
+                return value
+
+            with patch(
+                "scripts.mineru_smoke.os.fstat", side_effect=same_size_overwrite
+            ), self.assertRaisesRegex(ValueError, "changed while snapshotting"):
+                _snapshot_pdf(raced, work_root=None)
+
+    def test_json_writer_fsyncs_parent_and_preserves_fsync_error(self) -> None:
+        original = OSError("parent fsync failed")
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "receipt.json"
+            with patch(
+                "scripts.mineru_smoke.os.fsync",
+                side_effect=(None, original),
+            ) as fsync, self.assertRaises(OSError) as caught:
+                _write_json(output, {"status": "pass"})
+
+            self.assertIs(caught.exception, original)
+            self.assertEqual(fsync.call_count, 2)
+            self.assertFalse(output.exists())
 
     def test_v5_evidence_accepts_retained_gauge_cleanup_without_deltas(self) -> None:
         def health(*, completed: int, failed: int) -> MinerUOrchestratorHealth:

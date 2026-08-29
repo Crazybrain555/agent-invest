@@ -67,6 +67,7 @@ def _read_regular(path: Path, *, label: str, maximum_bytes: int) -> bytes:
         metadata.st_nlink,
         metadata.st_size,
         metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
     ) != (
         after.st_dev,
         after.st_ino,
@@ -75,6 +76,7 @@ def _read_regular(path: Path, *, label: str, maximum_bytes: int) -> bytes:
         after.st_nlink,
         after.st_size,
         after.st_mtime_ns,
+        after.st_ctime_ns,
     ):
         raise ValueError(f"{label} changed while reading")
     return payload
@@ -117,8 +119,19 @@ def _write_new_private(path: Path, payload: bytes) -> None:
                 handle.write(b"\n")
             handle.flush()
             os.fsync(handle.fileno())
+        parent = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
     except BaseException:
-        path.unlink(missing_ok=True)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
 
 

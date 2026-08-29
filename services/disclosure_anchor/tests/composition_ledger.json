@@ -169,7 +169,7 @@
   },
   "tests/unit/test_collect_mineru_phase_trace.py": {
    "private_imports": [],
-   "tests": 3
+   "tests": 5
   },
   "tests/unit/test_config_check.py": {
    "private_imports": [],
@@ -316,7 +316,7 @@
   },
   "tests/unit/test_mineru_smoke.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 9
   },
   "tests/unit/test_mineru_ssh_tunnel.py": {
    "private_imports": [],

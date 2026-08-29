@@ -120,7 +120,9 @@ def _snapshot_pdf(
         finally:
             os.close(output)
         after = os.fstat(descriptor)
-        def identity(item: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+        def identity(
+            item: os.stat_result,
+        ) -> tuple[int, int, int, int, int, int, int, int]:
             return (
                 item.st_dev,
                 item.st_ino,
@@ -129,6 +131,7 @@ def _snapshot_pdf(
                 item.st_nlink,
                 item.st_size,
                 item.st_mtime_ns,
+                item.st_ctime_ns,
             )
         if copied != before.st_size or identity(before) != identity(after):
             raise ValueError("smoke input changed while snapshotting")
@@ -195,8 +198,19 @@ def _write_json(path: Path, payload: object) -> None:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        parent = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
     except BaseException:
-        path.unlink(missing_ok=True)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
 
 
