@@ -458,7 +458,7 @@
   },
   "tests/unit/test_synchronized_telemetry_observer.py": {
    "private_imports": [],
-   "tests": 24
+   "tests": 30
   },
   "tests/unit/test_track_companies.py": {
    "private_imports": [],

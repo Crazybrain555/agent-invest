@@ -5,18 +5,23 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from dataclasses import replace
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import stat
 import tempfile
 import threading
 import time
+import subprocess
+import sys
+from typing import Any
 import unittest
 from unittest.mock import patch
 
 from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
     ObserverState,
     SynchronizedObserverLimits,
+    SynchronizedObserverResult,
     SynchronizedTelemetryEvidenceError,
     run_synchronized_telemetry_observer,
     verify_synchronized_telemetry_observer,
@@ -42,6 +47,7 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
 from disclosure_anchor.application.ports.synchronized_telemetry import (
     GpuLaneSnapshot,
     HostLaneSnapshot,
+    ResidentTelemetryCollectorSpec,
     TelemetrySampleIdentity,
     TelemetrySnapshotDeadline,
     TelemetrySnapshotDeadlineExceeded,
@@ -53,6 +59,7 @@ HASH_A = "sha256:" + "a" * 64
 HASH_B = "sha256:" + "b" * 64
 HASH_C = "sha256:" + "c" * 64
 HASH_D = "sha256:" + "d" * 64
+COLLECTOR_ID = "sha256:" + "e" * 64
 
 
 def _profile() -> ProcessProfileLifecycle:
@@ -187,6 +194,7 @@ def _host_snapshot() -> HostLaneSnapshot:
 
 
 class _Sampler:
+    collector_identity_sha256 = COLLECTOR_ID
     def __init__(self, value: object, *, delay: float = 0) -> None:
         self.value = value
         self.delay = delay
@@ -200,48 +208,145 @@ class _Sampler:
 
 
 class _FailingSampler:
+    collector_identity_sha256 = COLLECTOR_ID
     def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
         raise TelemetrySnapshotTransportUnavailable("not evidence-safe to expose")
 
 
 class _DelayedFailingSampler:
+    collector_identity_sha256 = COLLECTOR_ID
     def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
         time.sleep(0.3)
         raise TelemetrySnapshotTransportUnavailable("not evidence-safe to expose")
 
 
 class _DeadlineSampler:
+    collector_identity_sha256 = COLLECTOR_ID
     def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
         self.deadline = deadline
         raise TelemetrySnapshotDeadlineExceeded("resident snapshot deadline")
 
 
 class _ProgrammingErrorSampler:
+    collector_identity_sha256 = COLLECTOR_ID
     def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
         raise AssertionError("collector programming defect")
 
 
 class _ForeverHangSampler:
+    collector_identity_sha256 = COLLECTOR_ID
     def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
         while True:
             time.sleep(60)
 
 
 class _LateSampler:
+    collector_identity_sha256 = COLLECTOR_ID
     def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
         time.sleep(0.4)
         return _gpu_snapshot()
 
 
 class _HostSequenceSampler:
-    def __init__(self, values: list[HostLaneSnapshot]) -> None:
+    collector_identity_sha256 = COLLECTOR_ID
+
+    def __init__(self, values: list[HostLaneSnapshot], *, scenario: str) -> None:
         self.values = values
+        self.scenario = scenario
         self.index = 0
 
     def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> HostLaneSnapshot:
         value = self.values[min(self.index, len(self.values) - 1)]
         self.index += 1
         return value
+
+
+def _test_collector_factory(config: dict[str, object]) -> object:
+    lane = config["lane"]
+    mode = config.get("mode", "normal")
+    if mode == "factory_failure":
+        raise RuntimeError("factory bootstrap failed")
+    if mode == "slow_startup":
+        startup_delay = config.get("startup_delay", 0.2)
+        assert isinstance(startup_delay, (int, float))
+        time.sleep(float(startup_delay))
+    if mode == "spawn_descendant":
+        child = multiprocessing.get_context("spawn").Process(target=_descendant_sleep)
+        child.start()
+    if mode == "transport_failure":
+        return _FailingSampler()
+    if mode == "delayed_transport_failure":
+        return _DelayedFailingSampler()
+    if mode == "deadline":
+        return _DeadlineSampler()
+    if mode == "programming_error":
+        return _ProgrammingErrorSampler()
+    if mode == "hang":
+        return _ForeverHangSampler()
+    if mode == "late":
+        return _LateSampler()
+    if mode in {"counter_regression", "oom_increment"}:
+        baseline = _host_snapshot()
+        if mode == "counter_regression":
+            assert baseline.api_process.values is not None
+            changed = replace(
+                baseline,
+                api_process=baseline.api_process.model_copy(
+                    update={"values": baseline.api_process.values.model_copy(update={"cpu_user_ns_total": 0})}
+                ),
+            )
+        else:
+            assert baseline.host_cgroup.values is not None
+            events = baseline.host_cgroup.values.memory_events.model_copy(update={"oom_total": 1})
+            changed = replace(
+                baseline,
+                host_cgroup=baseline.host_cgroup.model_copy(
+                    update={"values": baseline.host_cgroup.values.model_copy(update={"memory_events": events})}
+                ),
+            )
+        return _HostSequenceSampler([baseline, changed], scenario=str(mode))
+    snapshot = _gpu_snapshot(runtime=str(config.get("runtime", HASH_A))) if lane == "gpu" else _host_snapshot()
+    delay = config.get("delay", 0)
+    assert isinstance(delay, (int, float))
+    return _Sampler(snapshot, delay=float(delay))
+
+
+def _descendant_sleep() -> None:
+    time.sleep(60)
+
+
+def _collector_spec(*, lane: str, mode: str = "normal", **config: object) -> ResidentTelemetryCollectorSpec:
+    payload = {"lane": lane, "mode": mode, **config}
+    return ResidentTelemetryCollectorSpec(
+        factory_module=__name__,
+        factory_qualname="_test_collector_factory",
+        canonical_config_json=json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(),
+        expected_collector_identity_sha256=COLLECTOR_ID,
+    )
+
+
+def _spec_for_sampler(value: object | None, *, lane: str) -> ResidentTelemetryCollectorSpec:
+    if value is None:
+        return _collector_spec(lane=lane)
+    if isinstance(value, _Sampler):
+        runtime = value.value.identity.runtime_bundle_identity_sha256 if isinstance(value.value, GpuLaneSnapshot) else HASH_A
+        return _collector_spec(lane=lane, delay=value.delay, runtime=runtime)
+    modes = {
+        _FailingSampler: "transport_failure",
+        _DelayedFailingSampler: "delayed_transport_failure",
+        _DeadlineSampler: "deadline",
+        _ProgrammingErrorSampler: "programming_error",
+        _ForeverHangSampler: "hang",
+        _LateSampler: "late",
+    }
+    for kind, mode in modes.items():
+        if isinstance(value, kind):
+            return _collector_spec(lane=lane, mode=mode)
+    if isinstance(value, _HostSequenceSampler):
+        return _collector_spec(lane=lane, mode=value.scenario)
+    if isinstance(value, ResidentTelemetryCollectorSpec):
+        return value
+    raise TypeError(f"unknown test collector {type(value).__name__}")
 
 
 class SynchronizedTelemetryObserverTests(unittest.TestCase):
@@ -255,12 +360,12 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
         cancel_event: threading.Event | None = None,
         limits: SynchronizedObserverLimits | None = None,
         run_id: str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-    ):
+    ) -> SynchronizedObserverResult:
         return run_synchronized_telemetry_observer(
             artifact_root=root,
             process_profile=_profile(),
-            gpu_sampler=gpu_sampler or _Sampler(_gpu_snapshot()),  # type: ignore[arg-type]
-            host_sampler=host_sampler or _Sampler(_host_snapshot()),  # type: ignore[arg-type]
+            gpu_collector=_spec_for_sampler(gpu_sampler, lane="gpu"),
+            host_collector=_spec_for_sampler(host_sampler, lane="host"),
             duration_seconds=duration,
             cancel_event=cancel_event,
             limits=limits,
@@ -274,7 +379,7 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
             result = self._run(root)
 
             self.assertEqual(result.state, ObserverState.SEALED)
-            self.assertIn(result.receipt.status, {"complete", "incomplete"})
+            self.assertEqual(result.receipt.status, "complete")
             self.assertEqual(result.receipt.termination_reason, "duration_elapsed")
             replay = verify_synchronized_telemetry_observer(
                 artifact_root=root,
@@ -438,11 +543,132 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
                 duration=0.08,
             )
 
-            self.assertIn(result.receipt.status, {"complete", "incomplete"})
+            self.assertEqual(result.receipt.status, "complete")
             self.assertEqual(
                 {frame.lane for frame in result.frames},
                 {"gpu_fast", "host_slow"},
             )
+
+    def test_both_collectors_ready_before_clock_freeze(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            started = time.monotonic()
+            result = self._run(
+                Path(temporary) / "telemetry",
+                gpu_sampler=_collector_spec(
+                    lane="gpu", mode="slow_startup", startup_delay=0.25
+                ),
+                host_sampler=_collector_spec(
+                    lane="host", mode="slow_startup", startup_delay=0.25
+                ),
+                duration=0.08,
+            )
+            self.assertGreater(time.monotonic() - started, 0.5)
+            self.assertEqual(result.receipt.status, "complete")
+            self.assertGreaterEqual(
+                min(frame.clock.started_monotonic_ns for frame in result.frames),
+                result.receipt.started_monotonic_ns,
+            )
+
+    def test_factory_and_pickle_startup_failures_cleanup_all_children(self) -> None:
+        baseline = {child.pid for child in multiprocessing.active_children()}
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"):
+                self._run(
+                    Path(temporary) / "factory",
+                    gpu_sampler=_collector_spec(lane="gpu", mode="factory_failure"),
+                    duration=0.1,
+                )
+        invalid = object.__new__(ResidentTelemetryCollectorSpec)
+        object.__setattr__(invalid, "factory_module", __name__)
+        object.__setattr__(invalid, "factory_qualname", "_test_collector_factory")
+        object.__setattr__(invalid, "canonical_config_json", threading.Lock())
+        object.__setattr__(invalid, "expected_collector_identity_sha256", COLLECTOR_ID)
+        object.__setattr__(invalid, "descendants_capability", "forbidden")
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"):
+                self._run(
+                    Path(temporary) / "pickle",
+                    gpu_sampler=invalid,
+                    duration=0.1,
+                )
+        self.assertEqual(
+            {child.pid for child in multiprocessing.active_children()}, baseline
+        )
+
+    def test_descendant_capability_violation_is_failed_evidence(self) -> None:
+        baseline = {child.pid for child in multiprocessing.active_children()}
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"):
+                self._run(
+                    Path(temporary) / "telemetry",
+                    gpu_sampler=_collector_spec(lane="gpu", mode="spawn_descendant"),
+                    duration=0.1,
+                )
+        self.assertEqual(
+            {child.pid for child in multiprocessing.active_children()}, baseline
+        )
+
+    def test_twenty_runs_do_not_leak_file_descriptors_or_children(self) -> None:
+        before_fds = len(os.listdir("/dev/fd"))
+        before_children = {child.pid for child in multiprocessing.active_children()}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "telemetry"
+            for index in range(20):
+                result = self._run(
+                    root,
+                    duration=0.02,
+                    run_id=f"00000000-0000-4000-8000-{index:012x}",
+                )
+                self.assertEqual(result.receipt.status, "complete")
+        self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
+        self.assertEqual(
+            {child.pid for child in multiprocessing.active_children()}, before_children
+        )
+
+    def test_spawn_safe_main_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            script = Path(temporary) / "spawn_smoke.py"
+            script.write_text(
+                """
+from pathlib import Path
+import tempfile
+from tests.unit.test_synchronized_telemetry_observer import (
+    _collector_spec, _profile,
+)
+from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
+    run_synchronized_telemetry_observer,
+)
+
+if __name__ == '__main__':
+    with tempfile.TemporaryDirectory() as temporary:
+        result = run_synchronized_telemetry_observer(
+            artifact_root=Path(temporary) / 'telemetry',
+            process_profile=_profile(),
+            gpu_collector=_collector_spec(lane='gpu'),
+            host_collector=_collector_spec(lane='host'),
+            duration_seconds=0.08,
+            process_cpu_ns=lambda: 0,
+        )
+        print(result.receipt.status)
+""".lstrip(),
+                encoding="utf-8",
+            )
+            environment = dict(os.environ)
+            service_root = Path(__file__).resolve().parents[2]
+            environment["PYTHONPATH"] = os.pathsep.join(
+                (str(service_root), str(service_root / "src"))
+            )
+            completed = subprocess.run(
+                [sys.executable, str(script)],
+                cwd=service_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "complete")
 
     def test_forever_hang_is_killed_at_deadline_without_orphan_process(self) -> None:
         before = {process.pid for process in __import__("multiprocessing").active_children()}
@@ -540,7 +766,7 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             result = self._run(
                 Path(temporary) / "regression",
-                host_sampler=_HostSequenceSampler([baseline, regressed]),
+                host_sampler=_HostSequenceSampler([baseline, regressed], scenario="counter_regression"),
                 duration=1.2,
             )
             self.assertEqual(result.receipt.status, "unsafe")
@@ -561,7 +787,7 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             result = self._run(
                 Path(temporary) / "oom",
-                host_sampler=_HostSequenceSampler([baseline, oom]),
+                host_sampler=_HostSequenceSampler([baseline, oom], scenario="oom_increment"),
                 duration=1.2,
             )
             self.assertEqual(result.receipt.status, "unsafe")
@@ -616,7 +842,7 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
                 fromlist=["_FrameWriter"],
             )._FrameWriter.replay_unsealed
 
-            def tamper_then_replay(writer):
+            def tamper_then_replay(writer: Any) -> Any:
                 path = writer.run_directory / "frames.v2.jsonl"
                 path.write_bytes(path.read_bytes().replace(b'"sequence":0', b'"sequence":9', 1))
                 os.chmod(path, 0o600)
@@ -638,7 +864,7 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
             )
             original = module._FrameWriter.write_seal
 
-            def write_then_modify(writer, seal):
+            def write_then_modify(writer: Any, seal: Any) -> None:
                 original(writer, seal)
                 path = writer.run_directory / "seal.v2.json"
                 path.write_bytes(path.read_bytes() + b" ")
@@ -647,6 +873,42 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
             with patch(
                 "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer._FrameWriter.write_seal",
                 new=write_then_modify,
+            ):
+                with self.assertRaisesRegex(SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"):
+                    self._run(root, duration=0.3)
+
+    def test_atomic_seal_name_replace_before_first_same_fd_stat_is_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "telemetry"
+            module = __import__(
+                "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer",
+                fromlist=["_FrameWriter"],
+            )
+            original = module._FrameWriter._bind_written_descriptor
+
+            def replace_before_bind(
+                writer: Any,
+                filename: str,
+                descriptor: int,
+                *,
+                maximum_bytes: int,
+            ) -> Any:
+                if filename == "seal.v2.json":
+                    path = writer.run_directory / filename
+                    replacement = writer.run_directory / "seal-replacement.tmp"
+                    replacement.write_bytes(path.read_bytes())
+                    os.chmod(replacement, 0o600)
+                    os.replace(replacement, path)
+                return original(
+                    writer,
+                    filename,
+                    descriptor,
+                    maximum_bytes=maximum_bytes,
+                )
+
+            with patch(
+                "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer._FrameWriter._bind_written_descriptor",
+                new=replace_before_bind,
             ):
                 with self.assertRaisesRegex(SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"):
                     self._run(root, duration=0.3)
@@ -661,7 +923,7 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
             with self.subTest(replace_root=replace_root), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary) / "telemetry"
 
-                def write_then_replace(writer, seal):
+                def write_then_replace(writer: Any, seal: Any) -> None:
                     original(writer, seal)
                     if replace_root:
                         moved = root.with_name("telemetry-moved")

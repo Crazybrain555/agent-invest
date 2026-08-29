@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 import hashlib
+import importlib
 import json
 import math
 import multiprocessing
@@ -17,6 +18,7 @@ from multiprocessing.connection import Connection
 import os
 from pathlib import Path
 import queue
+import signal
 import stat
 import threading
 import time
@@ -43,9 +45,8 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
 )
 from disclosure_anchor.application.ports.synchronized_telemetry import (
     GpuLaneSnapshot,
-    GpuTelemetrySamplerPort,
     HostLaneSnapshot,
-    HostTelemetrySamplerPort,
+    ResidentTelemetryCollectorSpec,
     TelemetrySampleIdentity,
     TelemetrySnapshotDeadline,
     TelemetrySnapshotDeadlineExceeded,
@@ -198,18 +199,54 @@ class _InvocationCancelled(Exception):
 class _ResidentSamplerProcess:
     """One owned resident sampler process with a killable request transport."""
 
-    def __init__(self, sampler: object, *, label: str) -> None:
+    def __init__(self, spec: ResidentTelemetryCollectorSpec, *, label: str) -> None:
         context = multiprocessing.get_context("spawn")
         parent, child = context.Pipe(duplex=True)
         self._connection: Connection | None = parent
+        self._process_group_ready = False
+        self._started = False
+        self._process_closed = False
         self._process = context.Process(
             target=_resident_sampler_main,
-            args=(child, sampler),
+            args=(
+                child,
+                spec.factory_module,
+                spec.factory_qualname,
+                spec.canonical_config_json,
+            ),
             name=f"synchronized-telemetry-{label}-collector",
             daemon=False,
         )
-        self._process.start()
-        child.close()
+        try:
+            self._process.start()
+            self._started = True
+            child.close()
+            if not parent.poll(5.0):
+                raise TelemetrySnapshotTransportUnavailable(
+                    "resident collector READY handshake timed out"
+                )
+            kind, payload = parent.recv()
+            if kind != "ready":
+                self._process_group_ready = os.name == "posix"
+                raise TelemetrySnapshotTransportUnavailable(
+                    f"resident collector bootstrap failed: {payload}"
+                )
+            identity, process_group_ready, descendants = payload
+            self._process_group_ready = bool(process_group_ready)
+            if identity != spec.expected_collector_identity_sha256:
+                raise TelemetrySnapshotTransportUnavailable(
+                    "resident collector identity handshake drifted"
+                )
+            if descendants:
+                raise TelemetrySnapshotTransportUnavailable(
+                    "resident collector violated no-descendants capability"
+                )
+        except BaseException:
+            child.close()
+            self._terminate()
+            parent.close()
+            self._connection = None
+            raise
 
     def snapshot(
         self,
@@ -219,7 +256,7 @@ class _ResidentSamplerProcess:
         monotonic_ns: Callable[[], int],
     ) -> GpuLaneSnapshot | HostLaneSnapshot:
         connection = self._connection
-        if connection is None or not self._process.is_alive():
+        if connection is None or not self._started or not self._process.is_alive():
             raise TelemetrySnapshotTransportUnavailable("resident collector is unavailable")
         connection.send(("snapshot", deadline))
         while True:
@@ -250,42 +287,97 @@ class _ResidentSamplerProcess:
                 raise TelemetrySnapshotTransportUnavailable(str(payload))
             if kind == "assertion":
                 raise AssertionError(str(payload))
+            if kind == "capability":
+                self._terminate()
+                raise RuntimeError(f"resident collector capability violation: {payload}")
             raise RuntimeError(f"resident collector program error: {payload}")
 
     def close(self) -> None:
         connection = self._connection
-        if connection is not None and self._process.is_alive():
+        if connection is not None and self._started and self._process.is_alive():
             try:
                 connection.send(("close", None))
             except (BrokenPipeError, EOFError, OSError):
                 pass
             self._process.join(timeout=0.25)
-        if self._process.is_alive():
+        if self._started and self._process.is_alive():
             self._terminate()
         if connection is not None:
             connection.close()
             self._connection = None
+        self._close_process_handle()
 
     def _terminate(self) -> None:
+        if not self._started:
+            return
         if self._process.is_alive():
-            self._process.terminate()
+            if os.name == "posix" and self._process_group_ready and self._process.pid:
+                try:
+                    os.killpg(self._process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                self._process.terminate()
             self._process.join(timeout=1)
         if self._process.is_alive():
-            self._process.kill()
+            if os.name == "posix" and self._process_group_ready and self._process.pid:
+                try:
+                    os.killpg(self._process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                self._process.kill()
             self._process.join(timeout=1)
         if self._process.is_alive():
             raise SynchronizedTelemetryEvidenceError("resident collector did not terminate")
 
+    def _close_process_handle(self) -> None:
+        if self._process_closed or not self._started or self._process.is_alive():
+            return
+        self._process.close()
+        self._process_closed = True
 
-def _resident_sampler_main(connection: Connection, sampler: object) -> None:
+
+def _resident_sampler_main(
+    connection: Connection,
+    factory_module: str,
+    factory_qualname: str,
+    canonical_config_json: bytes,
+) -> None:
     try:
+        process_group_ready = False
+        if os.name == "posix":
+            os.setsid()
+            process_group_ready = True
+        config = parse_canonical_json_artifact(
+            canonical_config_json,
+            label="collector config",
+            maximum_bytes=64 * 1024,
+        )
+        if not isinstance(config, dict):
+            raise ValueError("collector config must be an object")
+        factory: object = importlib.import_module(factory_module)
+        for component in factory_qualname.split("."):
+            if component == "<locals>":
+                raise ValueError("collector factory must be top-level")
+            factory = getattr(factory, component)
+        sampler = factory(config)  # type: ignore[operator]
+        identity = getattr(sampler, "collector_identity_sha256", None)
+        if not isinstance(identity, str):
+            raise ValueError("collector factory omitted identity")
+        descendants = tuple(child.pid for child in multiprocessing.active_children())
+        connection.send(("ready", (identity, process_group_ready, descendants)))
         while True:
             command, payload = connection.recv()
             if command == "close":
                 return
             try:
-                value = sampler.snapshot(deadline=payload)  # type: ignore[attr-defined]
-                connection.send(("ok", value))
+                value = sampler.snapshot(deadline=payload)
+                descendants = tuple(child.pid for child in multiprocessing.active_children())
+                if descendants:
+                    connection.send(("capability", descendants))
+                else:
+                    connection.send(("ok", value))
             except TelemetrySnapshotDeadlineExceeded as exc:
                 connection.send(("deadline", str(exc)))
             except TelemetrySnapshotTransportUnavailable as exc:
@@ -296,6 +388,11 @@ def _resident_sampler_main(connection: Connection, sampler: object) -> None:
                 connection.send(("program", f"{type(exc).__name__}: {exc}"))
     except (EOFError, BrokenPipeError, OSError):
         return
+    except BaseException as exc:
+        try:
+            connection.send(("bootstrap_error", f"{type(exc).__name__}: {exc}"))
+        except (EOFError, BrokenPipeError, OSError):
+            pass
     finally:
         connection.close()
 
@@ -354,6 +451,7 @@ class _FrameWriter:
         self._frames_closed = False
         self._closed = False
         self._artifact_stats: dict[str, _ArtifactStat] = {}
+        self._artifact_fds: dict[str, int] = {FRAME_FILENAME: self._frames_fd}
 
     def append(self, frame: SynchronizedTelemetryFrameV2) -> None:
         if self._frames_closed:
@@ -383,13 +481,16 @@ class _FrameWriter:
                 "telemetry frame seal descriptors are unavailable"
             )
         os.fsync(self._frames_fd)
-        os.close(self._frames_fd)
-        self._frames_fd = None
         self._frames_closed = True
         os.fsync(self._run_fd)
-        self._artifact_stats[FRAME_FILENAME] = _private_file_stat_at(
-            self._run_fd, FRAME_FILENAME, maximum_bytes=self._limits.maximum_frame_file_bytes
+        payload, metadata = self._bind_written_descriptor(
+            FRAME_FILENAME,
+            self._frames_fd,
+            maximum_bytes=self._limits.maximum_frame_file_bytes,
         )
+        if "sha256:" + hashlib.sha256(payload).hexdigest() != "sha256:" + self._frame_hash.hexdigest():
+            raise SynchronizedTelemetryEvidenceError("telemetry frame write bytes drifted")
+        self._artifact_stats[FRAME_FILENAME] = metadata
         return "sha256:" + self._frame_hash.hexdigest()
 
     def write_receipt(self, receipt: SynchronizedTelemetryReceiptV2) -> bytes:
@@ -405,16 +506,19 @@ class _FrameWriter:
         if len(payload) > self._limits.maximum_receipt_bytes:
             raise _ArtifactBoundExceeded("telemetry receipt exceeds its bound")
         descriptor = _open_new_private_at(self._run_fd, RECEIPT_FILENAME)
-        try:
-            _write_all(descriptor, payload)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        self._artifact_fds[RECEIPT_FILENAME] = descriptor
         os.fsync(self._run_fd)
         os.fsync(self._root_fd)
-        self._artifact_stats[RECEIPT_FILENAME] = _private_file_stat_at(
-            self._run_fd, RECEIPT_FILENAME, maximum_bytes=self._limits.maximum_receipt_bytes
+        observed, metadata = self._bind_written_descriptor(
+            RECEIPT_FILENAME,
+            descriptor,
+            maximum_bytes=self._limits.maximum_receipt_bytes,
         )
+        if observed != payload:
+            raise SynchronizedTelemetryEvidenceError("telemetry receipt write bytes drifted")
+        self._artifact_stats[RECEIPT_FILENAME] = metadata
         return payload
 
     def replay_unsealed(
@@ -423,11 +527,7 @@ class _FrameWriter:
         if self._run_fd is None:
             raise SynchronizedTelemetryEvidenceError("telemetry run descriptor is unavailable")
         self._validate_anchors()
-        return _replay_artifacts_at(
-            self._run_fd,
-            expect_seal=False,
-            expected_stats=self._artifact_stats,
-        )[:2]
+        return self._replay_open_descriptors(expect_seal=False)[:2]
 
     def write_seal(self, seal: SynchronizedTelemetrySealV2) -> None:
         if self._run_fd is None or self._root_fd is None:
@@ -436,26 +536,30 @@ class _FrameWriter:
         if len(payload) > self._limits.maximum_receipt_bytes:
             raise _ArtifactBoundExceeded("telemetry seal exceeds its bound")
         descriptor = _open_new_private_at(self._run_fd, SEAL_FILENAME)
-        try:
-            _write_all(descriptor, payload)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        self._artifact_fds[SEAL_FILENAME] = descriptor
         os.fsync(self._run_fd)
         os.fsync(self._root_fd)
-        self._artifact_stats[SEAL_FILENAME] = _private_file_stat_at(
-            self._run_fd, SEAL_FILENAME, maximum_bytes=self._limits.maximum_receipt_bytes
+        observed, metadata = self._bind_written_descriptor(
+            SEAL_FILENAME,
+            descriptor,
+            maximum_bytes=self._limits.maximum_receipt_bytes,
         )
+        if observed != payload:
+            raise SynchronizedTelemetryEvidenceError("telemetry seal write bytes drifted")
+        parsed = SynchronizedTelemetrySealV2.model_validate(
+            parse_canonical_json_artifact(observed, label="seal", maximum_bytes=MAX_RECEIPT_BYTES)
+        )
+        if parsed != seal:
+            raise SynchronizedTelemetryEvidenceError("telemetry seal parsed bytes drifted")
+        self._artifact_stats[SEAL_FILENAME] = metadata
 
     def replay_sealed(self) -> SynchronizedObserverResult:
         if self._run_fd is None:
             raise SynchronizedTelemetryEvidenceError("telemetry run descriptor is unavailable")
         self._validate_anchors()
-        frames, receipt, seal = _replay_artifacts_at(
-            self._run_fd,
-            expect_seal=True,
-            expected_stats=self._artifact_stats,
-        )
+        frames, receipt, seal = self._replay_open_descriptors(expect_seal=True)
         if seal is None:
             raise SynchronizedTelemetryEvidenceError("telemetry seal is missing")
         if receipt.run_id != self._run_id:
@@ -472,6 +576,69 @@ class _FrameWriter:
         self._close_success()
         return result
 
+    def _bind_written_descriptor(
+        self, filename: str, descriptor: int, *, maximum_bytes: int
+    ) -> tuple[bytes, _ArtifactStat]:
+        payload, metadata = _read_private_descriptor(
+            descriptor, maximum_bytes=maximum_bytes
+        )
+        if self._run_fd is None:
+            raise SynchronizedTelemetryEvidenceError("telemetry run descriptor is unavailable")
+        named = _private_file_stat_at(
+            self._run_fd, filename, maximum_bytes=maximum_bytes
+        )
+        if named != metadata:
+            raise SynchronizedTelemetryEvidenceError(
+                "telemetry artifact name no longer identifies its write descriptor"
+            )
+        return payload, metadata
+
+    def _replay_open_descriptors(
+        self, *, expect_seal: bool
+    ) -> tuple[
+        tuple[SynchronizedTelemetryFrameV2, ...],
+        SynchronizedTelemetryReceiptV2,
+        SynchronizedTelemetrySealV2 | None,
+    ]:
+        if self._run_fd is None:
+            raise SynchronizedTelemetryEvidenceError("telemetry run descriptor is unavailable")
+        expected_names = [FRAME_FILENAME, RECEIPT_FILENAME]
+        if expect_seal:
+            expected_names.append(SEAL_FILENAME)
+        names_before = sorted(os.listdir(self._run_fd))
+        if names_before != sorted(expected_names):
+            raise SynchronizedTelemetryEvidenceError("telemetry run artifact set drifted")
+        payloads: dict[str, bytes] = {}
+        for filename in expected_names:
+            descriptor = self._artifact_fds[filename]
+            maximum = (
+                self._limits.maximum_frame_file_bytes
+                if filename == FRAME_FILENAME
+                else self._limits.maximum_receipt_bytes
+            )
+            payload, metadata = _read_private_descriptor(
+                descriptor,
+                maximum_bytes=maximum,
+                expected_stat=self._artifact_stats[filename],
+            )
+            named = _private_file_stat_at(
+                self._run_fd, filename, maximum_bytes=maximum
+            )
+            if named != metadata:
+                raise SynchronizedTelemetryEvidenceError(
+                    "telemetry artifact name drifted from its write descriptor"
+                )
+            payloads[filename] = payload
+        if sorted(os.listdir(self._run_fd)) != names_before:
+            raise SynchronizedTelemetryEvidenceError(
+                "telemetry run directory changed during descriptor replay"
+            )
+        return _parse_replay_payloads(
+            payloads[FRAME_FILENAME],
+            payloads[RECEIPT_FILENAME],
+            payloads.get(SEAL_FILENAME),
+        )
+
     def _validate_anchors(self) -> None:
         if self._parent_fd is None or self._root_fd is None or self._run_fd is None:
             raise SynchronizedTelemetryEvidenceError("telemetry anchor descriptors are unavailable")
@@ -481,6 +648,10 @@ class _FrameWriter:
             raise SynchronizedTelemetryEvidenceError("telemetry directory anchor was replaced")
 
     def _close_success(self) -> None:
+        for descriptor in self._artifact_fds.values():
+            _close_descriptor(descriptor)
+        self._artifact_fds.clear()
+        self._frames_fd = None
         _close_descriptor(self._run_fd)
         _close_descriptor(self._root_fd)
         _close_descriptor(self._parent_fd)
@@ -502,6 +673,10 @@ class _FrameWriter:
                 _close_descriptor(self._frames_fd)
                 self._frames_fd = None
             self._frames_closed = True
+        for descriptor in self._artifact_fds.values():
+            _close_descriptor(descriptor)
+        self._artifact_fds.clear()
+        self._frames_fd = None
         _close_descriptor(self._run_fd)
         _close_descriptor(self._root_fd)
         _close_descriptor(self._parent_fd)
@@ -538,8 +713,8 @@ def run_synchronized_telemetry_observer(
     *,
     artifact_root: Path,
     process_profile: contract_module.ProcessProfileLifecycle,
-    gpu_sampler: GpuTelemetrySamplerPort,
-    host_sampler: HostTelemetrySamplerPort,
+    gpu_collector: ResidentTelemetryCollectorSpec,
+    host_collector: ResidentTelemetryCollectorSpec,
     duration_seconds: float,
     gpu_interval_ms: int = 250,
     run_id: str | None = None,
@@ -587,6 +762,21 @@ def run_synchronized_telemetry_observer(
             done=threading.Event(),
         ),
     }
+    invocations: list[_ResidentSamplerProcess] = []
+    try:
+        gpu_invocation = _ResidentSamplerProcess(gpu_collector, label="gpu-fast")
+        invocations.append(gpu_invocation)
+        host_invocation = _ResidentSamplerProcess(host_collector, label="host-slow")
+        invocations.append(host_invocation)
+    except BaseException as exc:
+        for invocation in invocations:
+            invocation.close()
+        writer.abort()
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise SynchronizedTelemetryEvidenceError(
+            "synchronized telemetry evidence failed in FAILED_EVIDENCE"
+        ) from exc
     try:
         start_wall = utc_now()
         _require_utc(start_wall)
@@ -595,6 +785,8 @@ def run_synchronized_telemetry_observer(
         end_deadline = start_monotonic + int(duration_seconds * 1_000_000_000)
         observer_source = synchronized_observer_source_sha256()
     except BaseException as exc:
+        for invocation in invocations:
+            invocation.close()
         writer.abort()
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
@@ -611,21 +803,6 @@ def run_synchronized_telemetry_observer(
     frozen_gpu_identity: list[str | None] = [None]
     frozen_cgroup_identity: list[str | None] = [None]
     identity_lock = threading.Lock()
-    invocations: list[_ResidentSamplerProcess] = []
-    try:
-        gpu_invocation = _ResidentSamplerProcess(gpu_sampler, label="gpu-fast")
-        invocations.append(gpu_invocation)
-        host_invocation = _ResidentSamplerProcess(host_sampler, label="host-slow")
-        invocations.append(host_invocation)
-    except BaseException as exc:
-        for invocation in invocations:
-            invocation.close()
-        writer.abort()
-        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-            raise
-        raise SynchronizedTelemetryEvidenceError(
-            "synchronized telemetry evidence failed in FAILED_EVIDENCE"
-        ) from exc
     threads = [
         threading.Thread(
             target=_run_lane,
@@ -864,6 +1041,29 @@ def _replay_artifacts_at(
         maximum_bytes=MAX_RECEIPT_BYTES,
         expected_stat=(expected_stats or {}).get(RECEIPT_FILENAME),
     )
+    seal_payload = None
+    if expect_seal:
+        seal_payload = _read_private_file_at(
+            run_fd,
+            SEAL_FILENAME,
+            maximum_bytes=MAX_RECEIPT_BYTES,
+            expected_stat=(expected_stats or {}).get(SEAL_FILENAME),
+        )
+    result = _parse_replay_payloads(frames_payload, receipt_payload, seal_payload)
+    if sorted(os.listdir(run_fd)) != names_before:
+        raise ValueError("telemetry run directory changed during replay")
+    return result
+
+
+def _parse_replay_payloads(
+    frames_payload: bytes,
+    receipt_payload: bytes,
+    seal_payload: bytes | None,
+) -> tuple[
+    tuple[SynchronizedTelemetryFrameV2, ...],
+    SynchronizedTelemetryReceiptV2,
+    SynchronizedTelemetrySealV2 | None,
+]:
     frame_values = parse_canonical_jsonl_artifact(
         frames_payload,
         label="frames",
@@ -880,13 +1080,7 @@ def _replay_artifacts_at(
         raise ValueError("telemetry frames artifact hash drifted")
     validate_synchronized_telemetry_v2(frames, receipt=receipt)
     seal: SynchronizedTelemetrySealV2 | None = None
-    if expect_seal:
-        seal_payload = _read_private_file_at(
-            run_fd,
-            SEAL_FILENAME,
-            maximum_bytes=MAX_RECEIPT_BYTES,
-            expected_stat=(expected_stats or {}).get(SEAL_FILENAME),
-        )
+    if seal_payload is not None:
         seal = SynchronizedTelemetrySealV2.model_validate(
             parse_canonical_json_artifact(seal_payload, label="seal", maximum_bytes=MAX_RECEIPT_BYTES)
         )
@@ -898,8 +1092,6 @@ def _replay_artifacts_at(
         expected_status = "unsafe" if receipt.status == "unsafe" or seal.preseal_observer_cpu_ns / seal.sampling_elapsed_ns_denominator > 0.02 else receipt.status
         if seal.receipt_status != receipt.status or seal.status != expected_status:
             raise ValueError("telemetry seal status drifted")
-    if sorted(os.listdir(run_fd)) != names_before:
-        raise ValueError("telemetry run directory changed during replay")
     return frames, receipt, seal
 
 
@@ -1527,7 +1719,7 @@ def _directory_stat_at(
 def _open_new_private_at(directory_fd: int, filename: str) -> int:
     descriptor = os.open(
         filename,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
         0o600,
         dir_fd=directory_fd,
     )
@@ -1579,6 +1771,32 @@ def _read_private_file_at(
         return b"".join(chunks)
     finally:
         os.close(descriptor)
+
+
+def _read_private_descriptor(
+    descriptor: int,
+    *,
+    maximum_bytes: int,
+    expected_stat: _ArtifactStat | None = None,
+) -> tuple[bytes, _ArtifactStat]:
+    before = _artifact_stat_fd(descriptor, maximum_bytes=maximum_bytes)
+    if expected_stat is not None and before != expected_stat:
+        raise ValueError("telemetry write descriptor metadata drifted")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    remaining = before.size
+    chunks: list[bytes] = []
+    while remaining:
+        chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+        if not chunk:
+            raise ValueError("telemetry write descriptor changed while being read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(descriptor, 1):
+        raise ValueError("telemetry write descriptor grew while being read")
+    after = _artifact_stat_fd(descriptor, maximum_bytes=maximum_bytes)
+    if after != before or (expected_stat is not None and after != expected_stat):
+        raise ValueError("telemetry write descriptor changed while being read")
+    return b"".join(chunks), after
 
 
 def _private_file_stat_at(

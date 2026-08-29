@@ -52,12 +52,22 @@ derive、receipt validate/write 以及 mandatory pre-seal replay，但不声称�
 seal 本身不把自己的 bytes 纳入自引用 attestation。receipt 的 closed safety drift 分别记录
 `epoch_drift`、其他 identity drift、累计计数回退和 OOM/OOM-kill 增量；`epoch_changed` 只代表第一类。
 
-注入 sampler 不是在 lane 中直接调用的任意远端请求。每 lane 由一个单 owner、跨 tick 常驻的 collector
-subprocess 和一条 duplex transport 承载；外层携带绝对 monotonic deadline 并可关闭 transport、terminate
+父进程只接受 `ResidentTelemetryCollectorSpec`：top-level factory 的 module/qualname、bounded canonical JSON
+config、expected collector identity 和显式 `descendants_capability=forbidden`。live sampler object 绝不跨 spawn；
+child import factory 并在自身构造 sampler，完成 READY/identity/no-descendants handshake 后，父进程才冻结
+start wall/monotonic/end deadline。任一 pickle、spawn、pipe、factory 或 READY 失败均关闭两端并 terminate+join。
+
+每 lane 由一个单 owner、跨 tick 常驻的 collector subprocess 和一条 duplex transport 承载；外层携带
+绝对 monotonic deadline 并可关闭 transport、terminate
 并 join 整个 collector。忽略 deadline、永久 hang、late return 或 cancel 都必须 bounded return，且不得遗留
 每 tick thread/process。只有 typed deadline/transport failure 可投影成 unsupported；assertion、类型错
 误和其他程序缺陷必须传播到 `FAILED_EVIDENCE`。每帧 lane ownership 也是闭合的：GPU lane 的 host/queue
 观测，以及 host lane 的 GPU 观测，必须严格为 `unsupported/not_due_at_this_tick`。
+
+collector factory 合同禁止创建任何 descendant。core 在 READY 与每次 snapshot 后检查 Python child 集合；
+POSIX child 进入独立 process group，失败/cancel/deadline 时整组终止以覆盖 native descendant。该检测不是
+Windows Job Object 的替代：真实 Windows/PowerShell 5.1 collector 接入前必须有 Job Object 硬门禁和真实
+spawn smoke；本地纯 Python spawn smoke 只证明当前 core/factory wire contract 可重建。
 
 每 lane mailbox 有独立固定上限且 producer 永不因另一 lane 或 writer backpressure 阻塞；显式 start token
 和 monotonic watermark 决定 merge 是否可安全前进，不等待一个尚不存在的未来 head。overflow 丢弃
