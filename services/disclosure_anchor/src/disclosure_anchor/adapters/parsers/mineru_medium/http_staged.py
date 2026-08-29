@@ -77,11 +77,12 @@ class _Task:
     source_pdf_sha256: str
     attempt_identity: str
     fence_identity: str
+    task_protocol_v2: bool = False
 
     def token(self, *, spool_path: Path | None, artifact_sha256: str) -> str:
         raw = json.dumps(
             {
-                "v": 1,
+                "v": 2,
                 "base_url": self.base_url,
                 "task_id": self.task_id,
                 "status_url": self.status_url,
@@ -91,6 +92,7 @@ class _Task:
                 "fence_identity": self.fence_identity,
                 "spool_path": "" if spool_path is None else str(spool_path),
                 "artifact_sha256": artifact_sha256,
+                "task_protocol_v2": self.task_protocol_v2,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -103,31 +105,35 @@ class _Task:
             payload = json.loads(base64.b64decode(token, altchars=b"-_", validate=True))
         except (ValueError, json.JSONDecodeError) as exc:
             raise _fail("invalid durable resume token") from exc
-        if (
-            not isinstance(payload, dict)
-            or set(payload)
-            != {
-                "v",
-                "base_url",
-                "task_id",
-                "status_url",
-                "result_url",
-                "source_pdf_sha256",
-                "attempt_identity",
-                "fence_identity",
-                "spool_path",
-                "artifact_sha256",
-            }
-            or payload["v"] != 1
-        ):
+        if not isinstance(payload, dict) or payload.get("v") not in {1, 2}:
+            raise _fail("invalid durable resume token shape")
+        expected = {
+            "v",
+            "base_url",
+            "task_id",
+            "status_url",
+            "result_url",
+            "source_pdf_sha256",
+            "attempt_identity",
+            "fence_identity",
+            "spool_path",
+            "artifact_sha256",
+        }
+        if payload["v"] == 2:
+            expected.add("task_protocol_v2")
+        if set(payload) != expected:
             raise _fail("invalid durable resume token shape")
         values = {
             key: payload[key]
             for key in payload
-            if key not in {"v", "spool_path", "artifact_sha256"}
+            if key not in {"v", "spool_path", "artifact_sha256", "task_protocol_v2"}
         }
         if not all(isinstance(value, str) for value in values.values()):
             raise _fail("invalid durable resume token values")
+        protocol_v2 = payload.get("task_protocol_v2", False)
+        if not isinstance(protocol_v2, bool):
+            raise _fail("invalid durable resume token values")
+        values["task_protocol_v2"] = protocol_v2
         task = cls(**values)
         task.validate()
         artifact_sha256 = payload["artifact_sha256"]
@@ -235,7 +241,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                     continue
                 if status_value != "completed":
                     raise _fail(f"remote task terminated as {status_value!r}")
-                retained = self._retained_receipt(payload)
+                retained = self._retained_receipt(payload, client=client)
                 if retained is not None:
                     return retained
                 return self._spool_result(client)
@@ -253,7 +259,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             status_value = _closed_json(response, required={"status"})["status"]
             if status_value == "completed":
                 retained = self._retained_receipt(
-                    _closed_json(response, required={"status"})
+                    _closed_json(response, required={"status"}), client=client
                 )
                 if retained is not None:
                     return retained
@@ -266,6 +272,8 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
     def _retained_receipt(
         self,
         payload: dict[str, Any],
+        *,
+        client: httpx.Client,
     ) -> RemoteArtifactReceipt | None:
         if "result_artifact_schema" not in payload:
             return None
@@ -290,6 +298,23 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         ).hexdigest()
         if owner != expected_owner:
             raise _fail("retained result owner is not canonical")
+        if self._task.task_protocol_v2:
+            if payload.get("task_protocol_schema") != "mineru-task-protocol.v2":
+                raise _fail("task protocol v2 status identity is absent")
+            lease = client.post(
+                f"{self._task.base_url}/tasks/{self._task.task_id}/lease"
+            )
+            if lease.status_code != 200:
+                raise _fail(f"result lease returned HTTP {lease.status_code}")
+            lease_payload = _closed_json(
+                lease, required={"schema", "task_id", "lease_until_unix"}
+            )
+            if (
+                lease_payload.get("schema") != "mineru-task-protocol.v2"
+                or lease_payload.get("task_id") != self._task.task_id
+                or not isinstance(lease_payload.get("lease_until_unix"), (int, float))
+            ):
+                raise _fail("result lease identity drifted")
         return RemoteArtifactReceipt(
             attempt_identity=self._task.attempt_identity,
             fence_identity=self._task.fence_identity,
@@ -441,6 +466,16 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                 resolved_spool.unlink(missing_ok=True)
             raise
         resolved_spool.unlink(missing_ok=True)
+        if self._task.task_protocol_v2:
+            with self._client(30.0) as client:
+                acknowledgement = client.post(
+                    f"{self._task.base_url}/tasks/{self._task.task_id}/ack"
+                )
+            if acknowledgement.status_code != 200:
+                shutil.rmtree(output_dir, ignore_errors=True)
+                raise _fail(
+                    f"result acknowledgement returned HTTP {acknowledgement.status_code}"
+                )
         target_identity = ParserTargetIdentity(
             name="MinerU",
             package_version="3.4.4",
@@ -635,11 +670,18 @@ class MinerUHttpStagedParser:
                 ) as client,
                 snapshot.open("rb") as source,
             ):
-                response = client.post(
-                    f"{self._api_url}/tasks",
-                    data=data,
-                    files={"files": (input_pdf.name, source, "application/pdf")},
-                )
+                try:
+                    response = client.post(
+                        f"{self._api_url}/tasks",
+                        data=data,
+                        files={"files": (input_pdf.name, source, "application/pdf")},
+                    )
+                except httpx.TransportError:
+                    if not self._task_protocol_v2:
+                        raise
+                    response = client.get(
+                        f"{self._api_url}/tasks/by-idempotency/{idempotency_key}"
+                    )
         finally:
             snapshot.unlink(missing_ok=True)
         if response.status_code != 202:
@@ -664,6 +706,7 @@ class MinerUHttpStagedParser:
             source_pdf_sha256=source_pdf_sha256,
             attempt_identity=attempt_identity,
             fence_identity=fence_identity,
+            task_protocol_v2=self._task_protocol_v2,
         )
         return MinerUHttpRemoteHandle(
             task=task,

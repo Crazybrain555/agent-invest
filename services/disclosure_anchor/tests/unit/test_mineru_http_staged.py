@@ -58,18 +58,35 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             if request.method == "POST":
                 submissions.append(request.read())
-                return httpx.Response(202, json={"task_id": "task-1", "status_url": "/tasks/task-1", "result_url": result_url})
+                return httpx.Response(
+                    202,
+                    json={
+                        "task_id": "task-1",
+                        "status_url": "/tasks/task-1",
+                        "result_url": result_url,
+                    },
+                )
             if request.url.path == "/tasks/task-1":
                 return httpx.Response(200, json={"status": "completed"})
-            return httpx.Response(200, headers={"content-type": "application/zip"}, content=result)
+            return httpx.Response(
+                200, headers={"content-type": "application/zip"}, content=result
+            )
 
         source = Path(directory) / "input.pdf"
         source.write_bytes(b"%PDF-stage")
         source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
-        parser = MinerUHttpStagedParser(api_url="http://mineru.test:30000", server_url="http://vlm.test:30000/v1", spool_root=Path(directory) / "spool", reader=_Reader(), transport=httpx.MockTransport(handler))  # type: ignore[arg-type]
+        parser = MinerUHttpStagedParser(
+            api_url="http://mineru.test:30000",
+            server_url="http://vlm.test:30000/v1",
+            spool_root=Path(directory) / "spool",
+            reader=_Reader(),
+            transport=httpx.MockTransport(handler),
+        )  # type: ignore[arg-type]
         return parser, source, source_sha256, submissions
 
-    def test_terminal_receipt_is_resumable_without_downloading_result_body(self) -> None:
+    def test_terminal_receipt_is_resumable_without_downloading_result_body(
+        self,
+    ) -> None:
         result_gets = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -124,6 +141,73 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
         self.assertIsNotNone(resumed)
         self.assertEqual(result_gets, 1)
 
+    def test_v2_submission_binds_identities_and_leases_before_credit_return(
+        self,
+    ) -> None:
+        calls: list[str] = []
+        artifact_sha256 = "a" * 64
+        artifact_bytes = 17
+        owner = hashlib.sha256(
+            f"task-1\0{artifact_sha256}\0{artifact_bytes}".encode()
+        ).hexdigest()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(f"{request.method} {request.url.path}")
+            if request.method == "POST" and request.url.path == "/tasks":
+                body = request.read()
+                self.assertIn(b"agent_idempotency_key", body)
+                self.assertIn(b"attempt-1", body)
+                self.assertIn(b"fence-1", body)
+                return httpx.Response(
+                    202,
+                    json={
+                        "task_id": "task-1",
+                        "status_url": "/tasks/task-1",
+                        "result_url": "/tasks/task-1/result",
+                    },
+                )
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "completed",
+                        "task_protocol_schema": "mineru-task-protocol.v2",
+                        "result_artifact_schema": "mineru-retained-result.v1",
+                        "result_artifact_sha256": artifact_sha256,
+                        "result_artifact_bytes": artifact_bytes,
+                        "result_artifact_owner": owner,
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "schema": "mineru-task-protocol.v2",
+                    "task_id": "task-1",
+                    "lease_until_unix": 9999999999.0,
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.pdf"
+            source.write_bytes(b"%PDF-stage")
+            source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+                transport=httpx.MockTransport(handler),
+                task_protocol_v2=True,
+            )
+            receipt = parser.begin_remote_parse(
+                input_pdf=source,
+                options=PINNED_OPTIONS,
+                source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1",
+                fence_identity="fence-1",
+            ).wait_terminal()
+        self.assertEqual(receipt.artifact_sha256, artifact_sha256)
+        self.assertEqual(calls[-1], "POST /tasks/task-1/lease")
+
     def test_submit_rejects_cross_origin_result_url(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -151,7 +235,8 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 parser.begin_remote_parse(
                     input_pdf=source,
                     options=PINNED_OPTIONS,
-                    source_pdf_sha256="sha256:" + hashlib.sha256(source.read_bytes()).hexdigest(),
+                    source_pdf_sha256="sha256:"
+                    + hashlib.sha256(source.read_bytes()).hexdigest(),
                     attempt_identity="attempt-1",
                     fence_identity="fence-1",
                 )
@@ -162,7 +247,13 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 directory,
                 self._zip([("result.txt", b"ok")]),
             )
-            parser.begin_remote_parse(input_pdf=source, options=PINNED_OPTIONS, source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
+            parser.begin_remote_parse(
+                input_pdf=source,
+                options=PINNED_OPTIONS,
+                source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1",
+                fence_identity="fence-1",
+            )
         body = submissions[0]
         self.assertIn(b'name="effort"\r\n\r\nmedium', body)
         self.assertIn(b'name="image_analysis"\r\n\r\nfalse', body)
@@ -172,26 +263,50 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
         result = self._zip([("result.txt", b"one")])
         with tempfile.TemporaryDirectory() as directory:
             parser, source, source_sha256, _ = self._completed_parser(directory, result)
-            handle = parser.begin_remote_parse(input_pdf=source, options=PINNED_OPTIONS, source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
+            handle = parser.begin_remote_parse(
+                input_pdf=source,
+                options=PINNED_OPTIONS,
+                source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1",
+                fence_identity="fence-1",
+            )
             receipt = handle.wait_terminal()
             spool = next((Path(directory) / "spool").glob("*.zip"))
             content = bytearray(spool.read_bytes())
             content[-1] ^= 1
             spool.write_bytes(content)
             with self.assertRaisesRegex(ParserOutputContractError, "identity drifted"):
-                handle.materialize(receipt=receipt, output_dir=Path(directory) / "out", source_pdf_sha256=source_sha256)
+                handle.materialize(
+                    receipt=receipt,
+                    output_dir=Path(directory) / "out",
+                    source_pdf_sha256=source_sha256,
+                )
             self.assertFalse((Path(directory) / "out").exists())
 
     def test_materialize_atomically_promotes_verified_spool(self) -> None:
         result_zip = self._zip([("document/result.txt", b"verified")])
         with tempfile.TemporaryDirectory() as directory:
-            parser, source, source_sha256, _ = self._completed_parser(directory, result_zip)
-            handle = parser.begin_remote_parse(input_pdf=source, options=ParserOptions(runtime_bundle_identity_sha256="sha256:" + "a" * 64), source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
+            parser, source, source_sha256, _ = self._completed_parser(
+                directory, result_zip
+            )
+            handle = parser.begin_remote_parse(
+                input_pdf=source,
+                options=ParserOptions(
+                    runtime_bundle_identity_sha256="sha256:" + "a" * 64
+                ),
+                source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1",
+                fence_identity="fence-1",
+            )
             receipt = handle.wait_terminal()
             output = Path(directory) / "out"
-            parsed = handle.materialize(receipt=receipt, output_dir=output, source_pdf_sha256=source_sha256)
+            parsed = handle.materialize(
+                receipt=receipt, output_dir=output, source_pdf_sha256=source_sha256
+            )
             self.assertEqual(parsed.artifact_root, output)
-            self.assertEqual((output / "document" / "result.txt").read_bytes(), b"verified")
+            self.assertEqual(
+                (output / "document" / "result.txt").read_bytes(), b"verified"
+            )
 
     def test_retained_capability_returns_credit_before_result_download(self) -> None:
         result_zip = self._zip([("document/result.txt", b"retained")])
@@ -204,21 +319,63 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             nonlocal result_gets
             if request.method == "POST":
-                return httpx.Response(202, json={"task_id": "task-1", "status_url": "/tasks/task-1", "result_url": "/tasks/task-1/result"})
+                return httpx.Response(
+                    202,
+                    json={
+                        "task_id": "task-1",
+                        "status_url": "/tasks/task-1",
+                        "result_url": "/tasks/task-1/result",
+                    },
+                )
             if request.url.path == "/tasks/task-1":
-                return httpx.Response(200, json={"status": "completed", "result_artifact_schema": "mineru-retained-result.v1", "result_artifact_sha256": artifact_sha256, "result_artifact_bytes": len(result_zip), "result_artifact_owner": owner})
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "completed",
+                        "result_artifact_schema": "mineru-retained-result.v1",
+                        "result_artifact_sha256": artifact_sha256,
+                        "result_artifact_bytes": len(result_zip),
+                        "result_artifact_owner": owner,
+                    },
+                )
             result_gets += 1
-            return httpx.Response(200, headers={"content-type": "application/zip", "x-mineru-result-sha256": artifact_sha256, "x-mineru-result-owner": owner}, content=result_zip)
+            return httpx.Response(
+                200,
+                headers={
+                    "content-type": "application/zip",
+                    "x-mineru-result-sha256": artifact_sha256,
+                    "x-mineru-result-owner": owner,
+                },
+                content=result_zip,
+            )
 
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "input.pdf"
             source.write_bytes(b"%PDF-stage")
             source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
-            parser = MinerUHttpStagedParser(api_url="http://mineru.test:30000", server_url="http://vlm.test:30000/v1", spool_root=Path(directory) / "spool", reader=_Reader(), transport=httpx.MockTransport(handler))  # type: ignore[arg-type]
-            handle = parser.begin_remote_parse(input_pdf=source, options=ParserOptions(runtime_bundle_identity_sha256="sha256:" + "a" * 64), source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+                reader=_Reader(),
+                transport=httpx.MockTransport(handler),
+            )  # type: ignore[arg-type]
+            handle = parser.begin_remote_parse(
+                input_pdf=source,
+                options=ParserOptions(
+                    runtime_bundle_identity_sha256="sha256:" + "a" * 64
+                ),
+                source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1",
+                fence_identity="fence-1",
+            )
             receipt = handle.wait_terminal()
             self.assertEqual(result_gets, 0)
-            handle.materialize(receipt=receipt, output_dir=Path(directory) / "out", source_pdf_sha256=source_sha256)
+            handle.materialize(
+                receipt=receipt,
+                output_dir=Path(directory) / "out",
+                source_pdf_sha256=source_sha256,
+            )
             self.assertEqual(result_gets, 1)
 
     def test_wait_and_cancel_share_exactly_one_terminal_spool(self) -> None:
@@ -228,18 +385,38 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             nonlocal result_gets
             if request.method == "POST":
-                return httpx.Response(202, json={"task_id": "task-1", "status_url": "/tasks/task-1", "result_url": "/tasks/task-1/result"})
+                return httpx.Response(
+                    202,
+                    json={
+                        "task_id": "task-1",
+                        "status_url": "/tasks/task-1",
+                        "result_url": "/tasks/task-1/result",
+                    },
+                )
             if request.url.path == "/tasks/task-1":
                 return httpx.Response(200, json={"status": "completed"})
             result_gets += 1
-            return httpx.Response(200, headers={"content-type": "application/zip"}, content=result_zip)
+            return httpx.Response(
+                200, headers={"content-type": "application/zip"}, content=result_zip
+            )
 
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "input.pdf"
             source.write_bytes(b"%PDF-stage")
             source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
-            parser = MinerUHttpStagedParser(api_url="http://mineru.test:30000", server_url="http://vlm.test:30000/v1", spool_root=Path(directory) / "spool", transport=httpx.MockTransport(handler))
-            handle = parser.begin_remote_parse(input_pdf=source, options=PINNED_OPTIONS, source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+                transport=httpx.MockTransport(handler),
+            )
+            handle = parser.begin_remote_parse(
+                input_pdf=source,
+                options=PINNED_OPTIONS,
+                source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1",
+                fence_identity="fence-1",
+            )
             with ThreadPoolExecutor(max_workers=2) as pool:
                 wait_future = pool.submit(handle.wait_terminal)
                 drain_future = pool.submit(handle.cancel_and_drain)
@@ -253,18 +430,39 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             self._zip([("../escape", b"bad")]),
             self._zip([("link", b"target")], symlink=True),
         ):
-            with self.subTest(kind=result[:12]), tempfile.TemporaryDirectory() as directory:
-                parser, source, source_sha256, _ = self._completed_parser(directory, result)
-                handle = parser.begin_remote_parse(input_pdf=source, options=PINNED_OPTIONS, source_pdf_sha256=source_sha256, attempt_identity="attempt-1", fence_identity="fence-1")
+            with (
+                self.subTest(kind=result[:12]),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                parser, source, source_sha256, _ = self._completed_parser(
+                    directory, result
+                )
+                handle = parser.begin_remote_parse(
+                    input_pdf=source,
+                    options=PINNED_OPTIONS,
+                    source_pdf_sha256=source_sha256,
+                    attempt_identity="attempt-1",
+                    fence_identity="fence-1",
+                )
                 receipt = handle.wait_terminal()
                 output = Path(directory) / "out"
                 with self.assertRaisesRegex(ParserOutputContractError, "unsafe ZIP"):
-                    handle.materialize(receipt=receipt, output_dir=output, source_pdf_sha256=source_sha256)
+                    handle.materialize(
+                        receipt=receipt,
+                        output_dir=output,
+                        source_pdf_sha256=source_sha256,
+                    )
                 self.assertFalse(output.exists())
 
     def test_receipt_rejects_non_hex_source_identity(self) -> None:
         with self.assertRaisesRegex(ValueError, "canonical sha256"):
-            RemoteArtifactReceipt(attempt_identity="a", fence_identity="f", artifact_owner_identity="o", artifact_byte_count=1, source_pdf_sha256="sha256:" + "Z" * 64)
+            RemoteArtifactReceipt(
+                attempt_identity="a",
+                fence_identity="f",
+                artifact_owner_identity="o",
+                artifact_byte_count=1,
+                source_pdf_sha256="sha256:" + "Z" * 64,
+            )
 
 
 if __name__ == "__main__":
