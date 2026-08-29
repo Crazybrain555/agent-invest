@@ -16,7 +16,7 @@ $helperStart = $beginIndex + $beginMarker.Length
 $helper = $source.Substring($helperStart, $endIndex - $helperStart)
 Invoke-Expression $helper
 
-$event = 'MINERU_PHASE_TRACE {"schema":"mineru-phase-trace.v3"}'
+$event = 'MINERU_PHASE_TRACE {"schema":"mineru-phase-trace.v4"}'
 $columnZero = @(Get-MineruPhaseTraceLines -RawLines @($event) -Stream "stderr")
 if ($columnZero.Count -ne 1 -or $columnZero[0] -ne $event) {
     throw "column-zero phase trace did not round trip"

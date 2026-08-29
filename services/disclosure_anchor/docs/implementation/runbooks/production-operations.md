@@ -349,7 +349,8 @@ runtime/profile identity，并重新通过 multimodal canary、epoch、OOM/resta
 
 - 使用独立 held-out 完整真实 PDF，覆盖 regular/heavy/huge、OCR、表格/公式、跨页结构和
   controlled failure；单轮目标 10--20 分钟，不机械重复数小时 baseline；
-- 先做一个短串行 anchor；只有 measurement path/epoch 漂移或噪声超过门槛才重跑；
+- 仅当 current synchronized evidence 缺失、超过允许时效、无法与当前 epoch 对齐，或噪声导致证据
+  不可用时，才补采一个短串行 anchor；已有可用 current evidence 时不得机械重跑；
 - 先在单 task slot 下隔离 sweep effective hybrid ratio `1/2/4/8`，再一次只改变 slots、pending、window、
   C-stage 或 credit envelope 的一个相邻值；不得预设某个候选是局部最优；
 - 全程用 synchronized telemetry 记录 GPU 250--500 ms、host/queue 1 s、phase transition 与 durable commit；

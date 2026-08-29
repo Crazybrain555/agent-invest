@@ -121,7 +121,7 @@ def _digest(payload: bytes) -> str:
 
 def _capture(event: MineruPhaseEvent) -> tuple[MineruPhaseTraceCapture, bytes]:
     line = "MINERU_PHASE_TRACE " + json.dumps(
-        {"schema": "mineru-phase-trace.v3", **asdict(event)},
+        {"schema": "mineru-phase-trace.v4", **asdict(event)},
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -147,7 +147,7 @@ def _capture(event: MineruPhaseEvent) -> tuple[MineruPhaseTraceCapture, bytes]:
             },
             "line_count": 1,
             "lines": [line],
-            "schema": "mineru-phase-trace-capture.v1",
+            "schema": "mineru-phase-trace-capture.v2",
             "since_utc": START.isoformat(),
             "trace_bytes": len(trace),
             "trace_lines_sha256": _digest(trace),

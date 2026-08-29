@@ -20,6 +20,7 @@ from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     verify_mineru_heldout_validation,
 )
 from disclosure_anchor.adapters.runtime.mineru_identity import (
+    MINERU_PROCESSING_WINDOW_SIZE,
     MINERU_WINDOWS_COLLECTOR_PATH,
     canonical_payload_sha256,
     client_bundle_identity,
@@ -158,12 +159,13 @@ def main(argv: list[str] | None = None) -> int:
     args = _args(argv)
     profile = {
         "inner_inference_concurrency": 7,
+        "owner_task_slots": 1,
         "pipeline_depth": 0,
         "pipeline_mode": "serial",
-        "profile_id": "serial-w16",
+        "profile_id": f"serial-w{MINERU_PROCESSING_WINDOW_SIZE}",
         "schema": "mineru-serial-execution-profile.v1",
         "vllm_max_num_seqs": 128,
-        "window_size": 16,
+        "window_size": MINERU_PROCESSING_WINDOW_SIZE,
     }
     profile_sha256 = canonical_payload_sha256(profile)
     receipt = strict_json_loads(
@@ -180,9 +182,14 @@ def main(argv: list[str] | None = None) -> int:
         manifest_wrapper,
         configured_identity=args.runtime_bundle_identity,
         local_client_identity=local_client,
-        local_processing_window_size=16,
+        local_processing_window_size=MINERU_PROCESSING_WINDOW_SIZE,
         local_writer_code_digest=local_writer,
     )
+    if (
+        verified_manifest.max_concurrent_requests != 1
+        or verified_manifest.max_pending_tasks != 1
+    ):
+        raise ValueError("serial phase trace requires task_slots=pending=1")
     manifest = verified_manifest.manifest
     topology = manifest.get("topology")
     if not isinstance(topology, dict):
@@ -204,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
             "local_content_package_versions": dict(
                 local_client.content_package_versions
             ),
-            "local_processing_window_size": 16,
+            "local_processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
             "local_writer_code_sha256": local_writer,
             "runtime_manifest_identity_sha256": args.runtime_bundle_identity,
             "orchestrator_runtime_identity_sha256": (

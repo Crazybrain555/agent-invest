@@ -462,7 +462,9 @@ active_profile_sha256 = serial_execution_profile(window_size).profile_sha256
 print(json.dumps({
     "active_profile_sha256": active_profile_sha256,
     "execution_mode": runtime["mode"],
+    "max_pending_tasks": int(os.environ["MINERU_API_MAX_PENDING_TASKS"]),
     "phase_trace_enabled": is_phase_trace_enabled(),
+    "task_slots": int(os.environ["MINERU_API_MAX_CONCURRENT_REQUESTS"]),
 }, sort_keys=True, separators=(",", ":")))
 '@
     $profileProbeResult = Invoke-DockerProcess -Arguments @(
@@ -477,6 +479,8 @@ print(json.dumps({
     $profileProbe = ([string]$profileProbeOutput[0]) | ConvertFrom-Json
     if (
         -not [bool]$profileProbe.phase_trace_enabled -or
+        [int]$profileProbe.task_slots -ne 1 -or
+        [int]$profileProbe.max_pending_tasks -ne 1 -or
         [string]$profileProbe.execution_mode -ne $ExpectedExecutionMode -or
         [string]$profileProbe.active_profile_sha256 -ne $ExpectedProfileSha256
     ) {
@@ -509,7 +513,7 @@ print(json.dumps({
         }
         $event = $line.Substring("MINERU_PHASE_TRACE ".Length) | ConvertFrom-Json
         if (
-            [string]$event.schema -ne "mineru-phase-trace.v3" -or
+            [string]$event.schema -ne "mineru-phase-trace.v4" -or
             [string]$event.profile_sha256 -ne $ExpectedProfileSha256
         ) {
             throw "phase-trace event identity drifted"
@@ -518,7 +522,7 @@ print(json.dumps({
     $traceText = ($traceLines -join "`n") + "`n"
     $machineGuid = (Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Cryptography" -Name MachineGuid).MachineGuid
     $traceResult = [ordered]@{
-        schema = "mineru-phase-trace-capture.v1"
+        schema = "mineru-phase-trace-capture.v2"
         collected_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         collector_path = $PSCommandPath
         collector_sha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $PSCommandPath).Hash.ToLowerInvariant())"

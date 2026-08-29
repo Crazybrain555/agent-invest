@@ -17,8 +17,6 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_EGRESS_POLICY,
     MINERU_API_EXPOSURE_POLICY,
     MINERU_API_INFERENCE_MAX_CONCURRENCY,
-    MINERU_API_MAX_SUPPORTED_TASK_SLOTS,
-    MINERU_API_MAX_SUPPORTED_PENDING_TASKS,
     MINERU_API_OUTPUT_ROOT_POLICY,
     MINERU_API_PROTOCOL_VERSION,
     MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS,
@@ -45,7 +43,7 @@ EXPECTED_IMAGE_ID = (
     "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458"
 )
 EXPECTED_API_COMPAT_IMAGE = "agent-invest/mineru-api:3.4.4-serial-v1"
-EXPECTED_COMPAT_MARKER_SCHEMA = "mineru-runtime-compatibility.v4"
+EXPECTED_COMPAT_MARKER_SCHEMA = "mineru-runtime-compatibility.v5"
 EXPECTED_CAPACITY_POLICY = "single-owner-serial-mineru.v1"
 EXPECTED_COMPAT_PREIMAGES = {
     "mineru/cli/fast_api.py": (
@@ -217,6 +215,7 @@ def _expected_serial_runtime(environment: dict[str, str]) -> dict[str, Any]:
         raise ValueError("remote API processing window is invalid")
     payload = {
         "inner_inference_concurrency": 7,
+        "owner_task_slots": 1,
         "pipeline_depth": 0,
         "pipeline_mode": "serial",
         "profile_id": f"serial-w{configured_window_size}",
@@ -230,6 +229,7 @@ def _expected_serial_runtime(environment: dict[str, str]) -> dict[str, Any]:
     return {
         "configured_window_size": configured_window_size,
         "mode": "serial",
+        "owner_task_slots": 1,
         "profile_sha256": profile_sha256,
         "schema": "mineru-serial-runtime.v1",
     }
@@ -373,13 +373,14 @@ def build_manifest(
         or health.get("protocol_version") != MINERU_API_PROTOCOL_VERSION
         or isinstance(task_slots, bool)
         or not isinstance(task_slots, int)
-        or not 1 <= task_slots <= MINERU_API_MAX_SUPPORTED_TASK_SLOTS
+        or task_slots != 1
         or isinstance(pending_requested, bool)
         or not isinstance(pending_requested, int)
         or isinstance(pending_effective, bool)
         or not isinstance(pending_effective, int)
         or pending_requested != pending_effective
-        or not task_slots <= pending_effective <= MINERU_API_MAX_SUPPORTED_PENDING_TASKS
+        or pending_requested != 1
+        or pending_effective != 1
         or health.get("processing_window_size") != MINERU_PROCESSING_WINDOW_SIZE
         or health.get("task_retention_seconds") != MINERU_API_TASK_RETENTION_SECONDS
         or health.get("task_cleanup_interval_seconds")
@@ -487,11 +488,9 @@ def build_manifest(
     )
     if _environment(proxy.get("environment"), allowlist=set()) != {}:
         raise ValueError("remote API proxy environment drifted")
-    if api_environment.get("MINERU_API_MAX_CONCURRENT_REQUESTS") != str(task_slots):
+    if api_environment.get("MINERU_API_MAX_CONCURRENT_REQUESTS") != "1":
         raise ValueError("remote API environment and health task slots drifted")
-    if api_environment.get("MINERU_API_MAX_PENDING_TASKS") != str(
-        pending_requested
-    ):
+    if api_environment.get("MINERU_API_MAX_PENDING_TASKS") != "1":
         raise ValueError("remote API environment and health pending depth drifted")
     if (
         compatibility.get("max_pending_tasks_requested") != pending_requested

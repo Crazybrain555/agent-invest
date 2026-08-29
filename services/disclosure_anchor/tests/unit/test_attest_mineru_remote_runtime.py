@@ -113,7 +113,7 @@ def _observation() -> dict[str, Any]:
         },
         "api_compatibility": {
             "marker": {
-                "schema": "mineru-runtime-compatibility.v4",
+                "schema": "mineru-runtime-compatibility.v5",
                 "policy": "glibc-malloc-trim-per-window.v1",
                 "capacity_policy": "single-owner-serial-mineru.v1",
                 "mineru_version": "3.4.4",
@@ -302,6 +302,7 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
             "vllm",
             "compatibility",
             "serial_runtime",
+            "task_slots_drift",
             "pending_health_drift",
             "pending_compatibility_drift",
         ):
@@ -329,6 +330,8 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
                     observation["api_compatibility"]["capacity_runtime"][
                         "profile_sha256"
                     ] = "sha256:" + "0" * 64
+                elif tamper == "task_slots_drift":
+                    observation["api_health"]["max_concurrent_requests"] = 2
                 elif tamper == "pending_health_drift":
                     observation["api_health"]["max_pending_tasks_effective"] = 2
                 elif tamper == "pending_compatibility_drift":

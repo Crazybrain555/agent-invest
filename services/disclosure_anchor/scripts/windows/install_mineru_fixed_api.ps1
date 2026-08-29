@@ -12,14 +12,14 @@ param(
     [string]$ExpectedImageId = "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458",
     [switch]$ReuseCurrentPublishedImage,
     [string]$CampaignApiCompatImageId = "",
-    [ValidateRange(1, 3)][int]$ExpectedApiTaskSlots = 1,
-    [ValidateSet(1, 2, 3, 4, 6, 8)][int]$ExpectedApiMaxPendingTasks = 1
+    [ValidateSet(1)][int]$ExpectedApiTaskSlots = 1,
+    [ValidateSet(1)][int]$ExpectedApiMaxPendingTasks = 1
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-if ($ExpectedApiMaxPendingTasks -lt $ExpectedApiTaskSlots) {
-    throw "ExpectedApiMaxPendingTasks must be >= ExpectedApiTaskSlots"
+if ($ExpectedApiTaskSlots -ne 1 -or $ExpectedApiMaxPendingTasks -ne 1) {
+    throw "serial MinerU requires task slots and pending depth to both equal 1"
 }
 $DockerCommand = (
     Get-Command docker.exe -CommandType Application -ErrorAction Stop |

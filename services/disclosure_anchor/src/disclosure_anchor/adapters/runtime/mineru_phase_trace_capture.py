@@ -33,8 +33,8 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
 )
 
 
-PHASE_TRACE_CAPTURE_SCHEMA: Final = "mineru-phase-trace-capture.v1"
-PHASE_TRACE_CAPTURE_SUMMARY_SCHEMA: Final = "mineru-phase-trace-capture-summary.v1"
+PHASE_TRACE_CAPTURE_SCHEMA: Final = "mineru-phase-trace-capture.v2"
+PHASE_TRACE_CAPTURE_SUMMARY_SCHEMA: Final = "mineru-phase-trace-capture-summary.v2"
 _SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 _CONTAINER_ID_RE = re.compile(r"^[a-f0-9]{64}$")
 _MAX_TRACE_LINES = 200_000

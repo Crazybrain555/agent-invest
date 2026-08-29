@@ -221,13 +221,17 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "    return _configured_max_concurrent_requests\n\n\n"
             "def get_task_retention_seconds() -> int:\n",
             "def get_max_concurrent_requests() -> int:\n"
-            "    return _configured_max_concurrent_requests\n\n\n"
+            "    if _configured_max_concurrent_requests != 1:\n"
+            "        raise RuntimeError(\n"
+            "            \"serial MinerU requires exactly one active task slot\"\n"
+            "        )\n"
+            "    return 1\n\n\n"
             "def get_max_pending_tasks() -> int:\n"
             "    raw = os.getenv(\"MINERU_API_MAX_PENDING_TASKS\")\n"
-            "    if raw not in {\"1\", \"2\", \"3\", \"4\", \"6\", \"8\"}:\n"
+            "    if raw != \"1\":\n"
             "        raise RuntimeError(\n"
             "            \"MINERU_API_MAX_PENDING_TASKS must be explicitly configured \"\n"
-            "            \"to one of {1,2,3,4,6,8}\"\n"
+            "            \"to 1 for serial execution\"\n"
             "        )\n"
             "    requested = int(raw)\n"
             "    if requested < get_max_concurrent_requests():\n"
@@ -399,18 +403,15 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             label="model-utils imports",
         )
         helper = '''_PHASE_TRACE_PREFIX = "MINERU_PHASE_TRACE "
-_PHASE_TRACE_SCHEMA = "mineru-phase-trace.v3"
+_PHASE_TRACE_SCHEMA = "mineru-phase-trace.v4"
 _PHASE_TRACE_BACKENDS = frozenset({"hybrid", "vlm"})
 _PHASE_TRACE_PIPELINE_MODES = frozenset({"serial"})
 _PHASE_TRACE_PHASES = frozenset({
     "document",
     "document_finalize",
     "window_append",
-    "window_b_queue_wait",
-    "window_credit_wait",
     "window_layout",
     "window_postprocess",
-    "window_release",
     "window_render",
     "window_total",
     "window_vlm",
@@ -499,6 +500,7 @@ def serial_execution_profile(configured_window_size: int) -> SerialExecutionProf
     )
     payload = {
         "inner_inference_concurrency": 7,
+        "owner_task_slots": 1,
         "pipeline_depth": 0,
         "pipeline_mode": "serial",
         "profile_id": f"serial-w{configured_window_size}",
@@ -523,22 +525,10 @@ def serial_runtime_status(configured_window_size: int) -> dict:
     return {
         "configured_window_size": profile.window_size,
         "mode": "serial",
+        "owner_task_slots": 1,
         "profile_sha256": profile.profile_sha256,
         "schema": "mineru-serial-runtime.v1",
     }
-
-
-_PROCESS_STAGE_GATES = {}
-
-
-def process_stage_gates():
-    """Return distinct process-global A and C owners for the active loop."""
-    loop = asyncio.get_running_loop()
-    gates = _PROCESS_STAGE_GATES.get(loop)
-    if gates is None:
-        gates = (asyncio.Lock(), asyncio.Lock())
-        _PROCESS_STAGE_GATES[loop] = gates
-    return gates
 
 
 class MinerUPhaseTrace:
@@ -1005,7 +995,6 @@ def trim_process_heap() -> bool:
             "    drain_owned_awaitable,\n"
             "    serial_execution_profile,\n"
             "    new_phase_trace,\n"
-            "    process_stage_gates,\n"
             "    trim_process_heap,\n"
             ")\n\n"
             "from ...utils.enum_class import ImageType\n",
@@ -1039,7 +1028,6 @@ def trim_process_heap() -> bool:
             "    *,\n"
             "    phase_trace=None,\n"
             "    trace_window=None,\n"
-            "    trace_credit_lease=None,\n"
             "):\n"
             "    phase_started_ns = phase_trace.start() if phase_trace is not None else 0\n"
             "    outcome = \"success\"\n"
@@ -1060,7 +1048,6 @@ def trim_process_heap() -> bool:
             "                phase_started_ns,\n"
             "                window=trace_window,\n"
             "                outcome=outcome,\n"
-            "                credit_lease=trace_credit_lease,\n"
             "            )\n\n\n"
             "@asynccontextmanager\n"
             "async def aio_predictor_execution_guard(\n"
@@ -1068,15 +1055,8 @@ def trim_process_heap() -> bool:
             "    *,\n"
             "    phase_trace=None,\n"
             "    trace_window=None,\n"
-            "    trace_ready_ns=None,\n"
-            "    trace_credit_lease=None,\n"
             "):\n"
-            "    phase_started_ns = (\n"
-            "        phase_trace.start()\n"
-            "        if phase_trace is not None and trace_ready_ns is None\n"
-            "        else 0\n"
-            "    )\n"
-            "    queue_wait_completed = False\n"
+            "    phase_started_ns = phase_trace.start() if phase_trace is not None else 0\n"
             "    outcome = \"success\"\n"
             "    lock = getattr(predictor, \"_mineru_execution_lock\", None)\n"
             "    lock_acquired = False\n"
@@ -1089,30 +1069,9 @@ def trim_process_heap() -> bool:
             "                ),\n"
             "            )\n"
             "            lock_acquired = True\n"
-            "        if phase_trace is not None and trace_ready_ns is not None:\n"
-            "            phase_trace.complete(\n"
-            "                \"window_b_queue_wait\",\n"
-            "                trace_ready_ns,\n"
-            "                window=trace_window,\n"
-            "                credit_lease=trace_credit_lease,\n"
-            "            )\n"
-            "            queue_wait_completed = True\n"
-            "            phase_started_ns = phase_trace.start()\n"
             "        yield\n"
             "    except BaseException:\n"
             "        outcome = \"error\"\n"
-            "        if (\n"
-            "            phase_trace is not None\n"
-            "            and trace_ready_ns is not None\n"
-            "            and not queue_wait_completed\n"
-            "        ):\n"
-            "            phase_trace.complete(\n"
-            "                \"window_b_queue_wait\",\n"
-            "                trace_ready_ns,\n"
-            "                window=trace_window,\n"
-            "                outcome=\"error\",\n"
-            "                credit_lease=trace_credit_lease,\n"
-            "            )\n"
             "        raise\n"
             "    finally:\n"
             "        if lock_acquired:\n"
@@ -1123,7 +1082,6 @@ def trim_process_heap() -> bool:
             "                phase_started_ns,\n"
             "                window=trace_window,\n"
             "                outcome=outcome,\n"
-            "                credit_lease=trace_credit_lease,\n"
             "            )\n",
             count=1,
             label="VLM predictor phase",
@@ -1827,7 +1785,7 @@ def apply_patch(
 
     patcher_sha256 = _sha256(Path(__file__).read_bytes())
     marker: dict[str, object] = {
-        "schema": "mineru-runtime-compatibility.v4",
+        "schema": "mineru-runtime-compatibility.v5",
         "policy": POLICY,
         "capacity_policy": CAPACITY_POLICY,
         "mineru_version": MINERU_VERSION,

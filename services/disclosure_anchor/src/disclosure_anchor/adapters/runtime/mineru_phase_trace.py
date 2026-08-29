@@ -9,7 +9,7 @@ from typing import Final, Iterable
 
 
 PHASE_TRACE_PREFIX: Final = "MINERU_PHASE_TRACE "
-PHASE_TRACE_SCHEMA: Final = "mineru-phase-trace.v3"
+PHASE_TRACE_SCHEMA: Final = "mineru-phase-trace.v4"
 _HEX32_RE = re.compile(r"^[a-f0-9]{32}$")
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -19,12 +19,9 @@ _PIPELINE_MODES = frozenset({"serial"})
 _WINDOW_PHASES = frozenset(
     {
         "window_append",
-        "window_b_queue_wait",
-        "window_credit_wait",
         "window_layout",
         "window_postprocess",
         "window_render",
-        "window_release",
         "window_total",
         "window_vlm",
     }
@@ -735,7 +732,7 @@ def summarize_complete_phase_trace(
         "pipeline_mode": first.pipeline_mode,
         "profile_id": first.profile_id,
         "profile_sha256": first.profile_sha256,
-        "schema": "mineru-phase-trace-summary.v1",
+        "schema": "mineru-phase-trace-summary.v2",
         "source_pdf_bytes": first.source_pdf_bytes,
         "total_windows": first.total_windows,
         "vlm_active_ns": vlm_active_ns,

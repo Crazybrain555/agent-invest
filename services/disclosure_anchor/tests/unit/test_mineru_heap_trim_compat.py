@@ -486,7 +486,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             self.assertEqual(limiter.active, 0)
             self.assertEqual(limiter.semaphore._value, 2)
 
-        with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "2"}):
+        with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "1"}):
             asyncio.run(exercise())
         self.assertIn("async with limiter:", patched)
         self.assertNotIn("async with semaphore:\n            response = await client.post", patched)
@@ -587,12 +587,14 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             await manager.submit(first)
             while first.status != "processing":
                 await asyncio.sleep(0)
-            second = task("second")
-            await manager.submit(second)
             with self.assertRaises(HTTPExceptionStub) as full:
-                await manager.submit(task("third"))
+                await manager.submit(task("second"))
             self.assertEqual(full.exception.status_code, 429)
             first.release.set()
+            while first.status != "completed":
+                await asyncio.sleep(0)
+            second = task("second")
+            await manager.submit(second)
             while second.status != "processing":
                 await asyncio.sleep(0)
             second.release.set()
@@ -604,15 +606,15 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                 await manager.submit(task("fourth"))
             self.assertEqual(closed.exception.status_code, 503)
 
-        with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "2"}):
+        with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "1"}):
             asyncio.run(exercise())
 
         get_pending = namespace["get_max_pending_tasks"]
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(RuntimeError, "explicitly configured"):
                 get_pending()
-        with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "5"}):
-            with self.assertRaisesRegex(RuntimeError, "one of"):
+        with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "2"}):
+            with self.assertRaisesRegex(RuntimeError, "serial execution"):
                 get_pending()
 
     def test_preimages_match_the_reproduced_deployed_344_sources(self) -> None:
@@ -1094,7 +1096,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("mineru-runtime-v6", installer)
         self.assertNotIn("versioned v4 evidence paths", installer)
         self.assertIn('schema = "mineru-windows-runtime-observation.v3"', collector)
-        self.assertIn('schema = "mineru-phase-trace-capture.v1"', collector)
+        self.assertIn('schema = "mineru-phase-trace-capture.v2"', collector)
         self.assertIn("$traceLines.Count -gt $MaxTraceLines", collector)
         self.assertIn("$traceByteCount -gt $MaxTraceBytes", collector)
         self.assertIn("active_profile_sha256", collector)

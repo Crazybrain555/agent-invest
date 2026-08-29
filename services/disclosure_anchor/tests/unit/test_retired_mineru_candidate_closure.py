@@ -30,6 +30,11 @@ class RetiredMineruCandidateClosureTests(unittest.TestCase):
             "Capacity" + "CreditBank",
             "run_bounded_ordered_" + "pipeline",
             "_aio_run_hybrid_capacity_" + "pipeline",
+            "window_b_" + "queue_wait",
+            "window_credit_" + "wait",
+            "window_" + "release",
+            "trace_ready_" + "ns",
+            "process_stage_" + "gates",
             '"legacy", "' + "candidate" + '"',
             '"legacy"' + "|" + '"candidate"',
         )
