@@ -292,6 +292,14 @@ class PublishEvidenceRepo:
         return evidence
 
 
+class RemoteParseAttemptRepo:
+    def __init__(self) -> None:
+        self.current_by_document: dict[str, object] = {}
+
+    def get_current_for_document(self, document_id: str) -> object | None:
+        return self.current_by_document.get(document_id)
+
+
 class FakeUnitOfWork:
     def __init__(self) -> None:
         self.companies = CompanyRepo()
@@ -303,6 +311,7 @@ class FakeUnitOfWork:
         self.documents = DocumentRepo()
         self.source_accesses.documents = self.documents
         self.processing_runs = ProcessingRunRepo()
+        self.remote_parse_attempts = RemoteParseAttemptRepo()
         self.document_units = DocumentUnitRepo()
         self.document_units.processing_runs = self.processing_runs
         self.outbox = OutboxRepo()

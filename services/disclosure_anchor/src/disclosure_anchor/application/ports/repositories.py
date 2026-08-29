@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from typing import Optional, Protocol
 
 from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
+    EncodedCheckpointReceipt,
     EncodedTerminalReceipt,
     RemoteParseAttempt,
     RemoteParseResumeSecret,
@@ -114,22 +115,58 @@ class ProcessingRunRepository(Protocol):
 
 
 class RemoteParseAttemptRepository(Protocol):
-    def add(self, attempt: RemoteParseAttempt) -> RemoteParseAttempt: ...
+    def add(
+        self, attempt: RemoteParseAttempt,
+        submission_secret: RemoteParseResumeSecret,
+    ) -> RemoteParseAttempt: ...
     def get(self, attempt_id: str) -> Optional[RemoteParseAttempt]: ...
+    def get_current_for_document(
+        self, document_id: str
+    ) -> Optional[RemoteParseAttempt]: ...
+    def list_recoverable(
+        self, *, after_attempt_id: str | None, limit: int
+    ) -> list[RemoteParseAttempt]: ...
+    def claim_recovery(
+        self, *, attempt_id: str, fence_identity: str, expected_version: int,
+        owner_identity: str, lease_seconds: int,
+    ) -> RemoteParseAttempt: ...
+    def renew_recovery_claim(
+        self, *, attempt_id: str, fence_identity: str, owner_identity: str,
+        claim_generation: int, lease_seconds: int,
+    ) -> RemoteParseAttempt: ...
     def checkpoint_submitted(
         self, *, attempt_id: str, fence_identity: str, expected_version: int,
-        remote_task_identity: str,
+        remote_task_identity: str, receipt: EncodedCheckpointReceipt,
+        accepted_secret: RemoteParseResumeSecret,
+        claim_owner_identity: str, claim_generation: int,
     ) -> RemoteParseAttempt: ...
     def transition(
         self, *, attempt_id: str, fence_identity: str, expected_state: str,
-        expected_version: int, next_state: str,
+        expected_version: int, next_state: str, claim_owner_identity: str,
+        claim_generation: int,
     ) -> RemoteParseAttempt: ...
     def checkpoint_terminal(
         self, *, attempt_id: str, fence_identity: str, expected_version: int,
         remote_task_identity: str, receipt: EncodedTerminalReceipt,
-        terminal_secret: RemoteParseResumeSecret,
+        terminal_secret: RemoteParseResumeSecret, claim_owner_identity: str,
+        claim_generation: int,
     ) -> RemoteParseAttempt: ...
-    def put_secret(self, secret: RemoteParseResumeSecret) -> None: ...
+    def checkpoint_local(
+        self, *, attempt_id: str, fence_identity: str, expected_version: int,
+        claim_owner_identity: str, claim_generation: int,
+        receipt: EncodedCheckpointReceipt,
+    ) -> RemoteParseAttempt: ...
+    def fail_run_and_checkpoint(
+        self, *, document_id: str, processing_run_id: str,
+        attempt_id: str, fence_identity: str, expected_state: str,
+        expected_version: int, claim_owner_identity: str, claim_generation: int,
+        receipt: EncodedCheckpointReceipt,
+    ) -> RemoteParseAttempt: ...
+    def finish_run_and_checkpoint(
+        self, *, finished_run: ProcessingRun, attempt_id: str,
+        fence_identity: str, expected_version: int, claim_owner_identity: str,
+        claim_generation: int,
+    ) -> RemoteParseAttempt: ...
     def get_secret(
         self, attempt_id: str, secret_kind: str
     ) -> Optional[RemoteParseResumeSecret]: ...

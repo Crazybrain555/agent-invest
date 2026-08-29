@@ -1182,7 +1182,13 @@ def reclaim_stale_runs(conn: Connection, *, threshold_seconds: int) -> int:
                          '"retry_budget_class"\\:"infrastructure"}}'::jsonb
              WHERE processing_run_id IN (
                  SELECT processing_run_id FROM {OPS_SCHEMA}.stale_running_run_v1
-                  WHERE started_at < now() - make_interval(secs => :threshold))
+                  WHERE started_at < now() - make_interval(secs => :threshold)
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM {OPS_SCHEMA}.remote_parse_attempt AS staged
+                         WHERE staged.processing_run_id = stale_running_run_v1.processing_run_id
+                           AND staged.is_current
+                    ))
             """
         ),
         {"threshold": threshold_seconds},

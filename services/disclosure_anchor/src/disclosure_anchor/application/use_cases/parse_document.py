@@ -273,6 +273,10 @@ class ParseDocument:
             # outbox insert, which inverted the order and could deadlock
             # against a concurrent finisher on the same document.
             maybe_lock_document(uow, document_id)
+            if uow.remote_parse_attempts.get_current_for_document(document_id) is not None:
+                raise ParseDocumentError(
+                    "document has a current staged remote parse attempt"
+                )
             security = (
                 uow.securities.get(document.security_id)
                 if document.security_id is not None

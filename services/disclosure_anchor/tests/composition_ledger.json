@@ -62,7 +62,7 @@
   },
   "tests/integration/test_remote_parse_checkpoint.py": {
    "private_imports": [],
-   "tests": 13
+   "tests": 11
   },
   "tests/integration/test_repository_uow.py": {
    "private_imports": [],
@@ -420,7 +420,7 @@
   },
   "tests/unit/test_remote_parse_checkpoint.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 6
   },
   "tests/unit/test_retired_mineru_candidate_closure.py": {
    "private_imports": [],
