@@ -19,7 +19,7 @@ from scripts import freeze_mineru_campaign_epoch as freeze
 class FreezeMineruCampaignEpochTests(unittest.TestCase):
     def _runtime_manifest(self, root: Path) -> Path:
         manifest = {
-            "contract_version": "mineru-runtime-bundle.v6",
+            "contract_version": "mineru-runtime-bundle.v7",
             "topology": {
                 "windows_collector_sha256": "sha256:" + "a" * 64,
                 "windows_node_identity_sha256": "sha256:" + "b" * 64,

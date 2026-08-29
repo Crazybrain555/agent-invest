@@ -12,12 +12,14 @@ from pathlib import Path
 from typing import Any
 
 
-RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v6"
+RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v7"
 MINERU_PROCESSING_WINDOW_SIZE = 16
 MINERU_API_PROTOCOL_VERSION = 2
 MINERU_API_DEFAULT_TASK_SLOTS = 1
 MINERU_API_MAX_SUPPORTED_TASK_SLOTS = 3
 MINERU_API_INFERENCE_MAX_CONCURRENCY = 7
+MINERU_HYBRID_BATCH_RATIO = 1
+MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED = True
 MINERU_API_TASK_RETENTION_SECONDS = 600
 MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS = 30
 # Formal whole-document load evidence must exercise the same liveness-only
@@ -79,6 +81,8 @@ _ORCHESTRATOR_MANIFEST_FIELDS = {
     "api_protocol_version",
     "max_concurrent_requests",
     "inference_max_concurrency",
+    "hybrid_batch_ratio",
+    "pipeline_inference_locks",
     "processing_window_size",
     "task_retention_seconds",
     "task_cleanup_interval_seconds",
@@ -364,6 +368,7 @@ def _verify_orchestrator_manifest(
     fixed_values = {
         "api_protocol_version": MINERU_API_PROTOCOL_VERSION,
         "inference_max_concurrency": MINERU_API_INFERENCE_MAX_CONCURRENCY,
+        "hybrid_batch_ratio": MINERU_HYBRID_BATCH_RATIO,
         "processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
         "task_retention_seconds": MINERU_API_TASK_RETENTION_SECONDS,
         "task_cleanup_interval_seconds": MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS,
@@ -374,6 +379,10 @@ def _verify_orchestrator_manifest(
             raise ValueError(
                 f"runtime manifest orchestrator {field} must be {expected}"
             )
+    if orchestrator.get("pipeline_inference_locks") is not True:
+        raise ValueError(
+            "runtime manifest orchestrator pipeline_inference_locks must be True"
+        )
     if expected_processing_window_size != MINERU_PROCESSING_WINDOW_SIZE:
         raise ValueError(
             "local expected MinerU processing window drifted from the v3 contract"
@@ -557,6 +566,8 @@ __all__ = [
     "MINERU_API_TRANSPORT_PROFILE",
     "MINERU_CONTENT_PACKAGE_VERSIONS",
     "MINERU_HEAP_RETURN_POLICY",
+    "MINERU_HYBRID_BATCH_RATIO",
+    "MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED",
     "MINERU_PROCESSING_WINDOW_SIZE",
     "MINERU_SMOKE_INPUT_NAME",
     "MINERU_SMOKE_INPUT_SHA256",

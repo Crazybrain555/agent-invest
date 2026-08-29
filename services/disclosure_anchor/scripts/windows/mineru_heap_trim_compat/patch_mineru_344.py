@@ -18,16 +18,20 @@ from typing import Final
 
 
 MINERU_VERSION: Final = "3.4.4"
+MINERU_VL_UTILS_VERSION: Final = "1.0.5"
 BASE_IMAGE_DIGEST: Final = (
     "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458"
 )
 POLICY: Final = "glibc-malloc-trim-per-window.v1"
-CAPACITY_POLICY: Final = "bounded-two-window-capacity-pipeline.v2"
+CAPACITY_POLICY: Final = "process-global-mineru-coordinator.v3"
 SITE_PACKAGES: Final = Path("/usr/local/lib/python3.12/dist-packages")
 MARKER_PATH: Final = Path(
     "/opt/agent-invest/mineru-capacity-v1/compatibility.json"
 )
 TARGET_PREIMAGE_SHA256: Final = {
+    "mineru/cli/fast_api.py": (
+        "f7f233d86ae0f5aab6ffe5d8eccef4344c968aeaf879563dae99d4875057ee39"
+    ),
     "mineru/backend/vlm/vlm_analyze.py": (
         "0fadf7a94ae702861b4a1fa7f42358c6687cfc63fbe322c004fb1d3248658390"
     ),
@@ -36,6 +40,12 @@ TARGET_PREIMAGE_SHA256: Final = {
     ),
     "mineru/utils/model_utils.py": (
         "7662656c5c406ab704065b8a3a6e662b662b0bb877b76b08c7d8a8a7eaf9c109"
+    ),
+    "mineru_vl_utils/post_process/cross_page_table.py": (
+        "97581c69b92ae80df2a11f3dc986f329b26edca5af57e6052929aeadefab898f"
+    ),
+    "mineru_vl_utils/vlm_client/http_client.py": (
+        "afe42d8a5e310d27cb0173abf4d59ed6197bc0b60a0258f321a6cdedd07c6ba7"
     ),
 }
 
@@ -80,8 +90,259 @@ def _replace_exact_occurrence(
     return source[:start] + new + source[start + len(old) :]
 
 
+def _replace_exact_span(
+    source: str,
+    start_marker: str,
+    end_marker: str,
+    replacement: str,
+    *,
+    label: str,
+) -> str:
+    if source.count(start_marker) != 1 or source.count(end_marker) != 1:
+        raise RuntimeError(f"{label} patch span drifted")
+    start = source.index(start_marker)
+    end = source.index(end_marker, start)
+    return source[:start] + replacement + source[end:]
+
+
 def patch_source(relative_path: str, source: str) -> str:
     """Return the deterministic patched source for one exact MinerU module."""
+
+    if relative_path == "mineru_vl_utils/vlm_client/http_client.py":
+        limiter = '''
+
+class _ProcessAsyncRequestLimiter:
+    """One final-POST concurrency owner shared by every client on one loop."""
+
+    def __init__(self, capacity: int) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise RuntimeError("global VLM request concurrency is invalid")
+        self.capacity = capacity
+        self.semaphore = asyncio.Semaphore(capacity)
+        self.active = 0
+        self.peak = 0
+
+    async def __aenter__(self):
+        await self.semaphore.acquire()
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _traceback) -> None:
+        if self.active < 1:
+            raise RuntimeError("global VLM request limiter underflowed")
+        self.active -= 1
+        self.semaphore.release()
+
+
+_PROCESS_ASYNC_REQUEST_LIMITERS = {}
+
+
+def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter:
+    loop = asyncio.get_running_loop()
+    limiter = _PROCESS_ASYNC_REQUEST_LIMITERS.get(loop)
+    if limiter is None:
+        limiter = _ProcessAsyncRequestLimiter(capacity)
+        _PROCESS_ASYNC_REQUEST_LIMITERS[loop] = limiter
+    elif limiter.capacity != capacity:
+        raise RuntimeError("global VLM request concurrency drifted within one process")
+    return limiter
+'''
+        source = _replace_exact(
+            source,
+            "\n\nclass HTTPMethod(str, Enum):\n",
+            limiter + "\n\nclass HTTPMethod(str, Enum):\n",
+            count=1,
+            label="HTTP global request limiter",
+        )
+        return _replace_exact(
+            source,
+            "        client = await self._aio_client()\n"
+            "        response = await client.post(self.chat_url, json=request_body)\n",
+            "        client = await self._aio_client()\n"
+            "        limiter = _process_async_request_limiter(self.max_concurrency)\n"
+            "        async with limiter:\n"
+            "            response = await client.post(self.chat_url, json=request_body)\n",
+            count=1,
+            label="HTTP final async POST ownership",
+        )
+
+    if relative_path == "mineru_vl_utils/post_process/cross_page_table.py":
+        source = _replace_exact(
+            source,
+            "    if len(tasks) != len(responses):\n"
+            "        logger.warning(\n"
+            "            \"Task/response count mismatch: {} tasks but {} responses, skipping merge results\",\n"
+            "            len(tasks), len(responses),\n"
+            "        )\n"
+            "        return\n",
+            "    if len(tasks) != len(responses):\n"
+            "        raise RuntimeError(\n"
+            "            \"cross-page table task/response count mismatch: \"\n"
+            "            f\"{len(tasks)} tasks but {len(responses)} responses\"\n"
+            "        )\n",
+            count=1,
+            label="cross-page response cardinality",
+        )
+        source = _replace_exact(
+            source,
+            "    prompts = [t.prompt for t in tasks]\n"
+            "    try:\n"
+            "        responses = batch_predict_fn(prompts)\n"
+            "    except Exception as e:\n"
+            "        logger.warning(\"VLM batch predict failed for cross-page table merge: {}\", e)\n"
+            "        return\n\n"
+            "    _apply_merge_results(results, tasks, responses)\n",
+            "    prompts = [t.prompt for t in tasks]\n"
+            "    responses = batch_predict_fn(prompts)\n"
+            "    _apply_merge_results(results, tasks, responses)\n",
+            count=1,
+            label="cross-page synchronous failure visibility",
+        )
+        return _replace_exact(
+            source,
+            "    prompts = [t.prompt for t in tasks]\n"
+            "    try:\n"
+            "        responses = await aio_batch_predict_fn(prompts)\n"
+            "    except Exception as e:\n"
+            "        logger.warning(\"VLM batch predict failed for cross-page table merge: {}\", e)\n"
+            "        return\n\n"
+            "    _apply_merge_results(results, tasks, responses)\n",
+            "    prompts = [t.prompt for t in tasks]\n"
+            "    responses = await aio_batch_predict_fn(prompts)\n"
+            "    _apply_merge_results(results, tasks, responses)\n",
+            count=1,
+            label="cross-page asynchronous failure visibility",
+        )
+
+    if relative_path == "mineru/cli/fast_api.py":
+        source = _replace_exact(
+            source,
+            "        self.queue: asyncio.Queue[str] = asyncio.Queue()\n",
+            "        self.max_nonterminal_tasks = get_max_concurrent_requests()\n"
+            "        self.queue: asyncio.Queue[str] = asyncio.Queue(\n"
+            "            maxsize=self.max_nonterminal_tasks\n"
+            "        )\n",
+            count=1,
+            label="FastAPI bounded task queue",
+        )
+        source = _replace_exact(
+            source,
+            "    async def shutdown(self) -> None:\n"
+            "        self.is_shutting_down = True\n"
+            "        self._wake_waiters()\n"
+            "        if self.dispatcher_task is not None:\n"
+            "            self.dispatcher_task.cancel()\n"
+            "            with suppress(asyncio.CancelledError):\n"
+            "                await self.dispatcher_task\n"
+            "            self.dispatcher_task = None\n"
+            "        if self.cleanup_task is not None:\n"
+            "            self.cleanup_task.cancel()\n"
+            "            with suppress(asyncio.CancelledError):\n"
+            "                await self.cleanup_task\n"
+            "            self.cleanup_task = None\n\n"
+            "        pending = list(self.active_tasks)\n"
+            "        for processor in pending:\n"
+            "            processor.cancel()\n"
+            "        if pending:\n"
+            "            await asyncio.gather(*pending, return_exceptions=True)\n"
+            "        self.active_tasks.clear()\n\n"
+            "    async def submit(self, task: AsyncParseTask) -> None:\n"
+            "        task.submit_order = self._next_submit_order\n"
+            "        self._next_submit_order += 1\n"
+            "        self.tasks[task.task_id] = task\n"
+            "        self.task_events[task.task_id] = asyncio.Event()\n"
+            "        await self.queue.put(task.task_id)\n",
+            "    async def shutdown(self) -> None:\n"
+            "        self.is_shutting_down = True\n"
+            "        self._wake_waiters()\n"
+            "        await self.queue.join()\n"
+            "        pending = tuple(self.active_tasks)\n"
+            "        if pending:\n"
+            "            await asyncio.gather(*pending)\n"
+            "        nonterminal = [\n"
+            "            task.task_id for task in self.tasks.values()\n"
+            "            if not is_task_terminal(task.status)\n"
+            "        ]\n"
+            "        if nonterminal:\n"
+            "            raise RuntimeError(\n"
+            "                \"accepted tasks did not reach terminal state during shutdown\"\n"
+            "            )\n"
+            "        if self.dispatcher_task is not None:\n"
+            "            self.dispatcher_task.cancel()\n"
+            "            with suppress(asyncio.CancelledError):\n"
+            "                await self.dispatcher_task\n"
+            "            self.dispatcher_task = None\n"
+            "        if self.cleanup_task is not None:\n"
+            "            self.cleanup_task.cancel()\n"
+            "            with suppress(asyncio.CancelledError):\n"
+            "                await self.cleanup_task\n"
+            "            self.cleanup_task = None\n"
+            "        self.active_tasks.clear()\n\n"
+            "    async def submit(self, task: AsyncParseTask) -> None:\n"
+            "        if self.is_shutting_down:\n"
+            "            raise HTTPException(\n"
+            "                status_code=503, detail=\"Task manager is shutting down\"\n"
+            "            )\n"
+            "        nonterminal = sum(\n"
+            "            not is_task_terminal(item.status) for item in self.tasks.values()\n"
+            "        )\n"
+            "        if nonterminal >= self.max_nonterminal_tasks:\n"
+            "            raise HTTPException(\n"
+            "                status_code=429, detail=\"Task admission capacity exhausted\"\n"
+            "            )\n"
+            "        task.submit_order = self._next_submit_order\n"
+            "        self._next_submit_order += 1\n"
+            "        self.tasks[task.task_id] = task\n"
+            "        self.task_events[task.task_id] = asyncio.Event()\n"
+            "        try:\n"
+            "            self.queue.put_nowait(task.task_id)\n"
+            "        except asyncio.QueueFull as exc:\n"
+            "            self.tasks.pop(task.task_id, None)\n"
+            "            self.task_events.pop(task.task_id, None)\n"
+            "            raise HTTPException(\n"
+            "                status_code=429, detail=\"Task admission queue is full\"\n"
+            "            ) from exc\n",
+            count=1,
+            label="FastAPI admission and quiescent shutdown",
+        )
+        source = _replace_exact(
+            source,
+            "                processor.add_done_callback(self._on_processor_done)\n"
+            "                self.queue.task_done()\n",
+            "                processor.add_done_callback(self._on_processor_done)\n",
+            count=1,
+            label="FastAPI queue completion ownership",
+        )
+        return _replace_exact(
+            source,
+            "        except asyncio.CancelledError:\n"
+            "            raise\n"
+            "        except Exception as exc:\n"
+            "            task.status = TASK_FAILED\n"
+            "            task.error = str(exc)\n"
+            "            task.completed_at = utc_now_iso()\n"
+            "            self._signal_task_event(task_id)\n"
+            "            logger.exception(f\"Async task failed: {task_id}\")\n\n"
+            "    async def _run_task(self, task: AsyncParseTask) -> None:\n",
+            "        except asyncio.CancelledError:\n"
+            "            task.status = TASK_FAILED\n"
+            "            task.error = \"Task processor was cancelled\"\n"
+            "            task.completed_at = utc_now_iso()\n"
+            "            self._signal_task_event(task_id)\n"
+            "            raise\n"
+            "        except Exception as exc:\n"
+            "            task.status = TASK_FAILED\n"
+            "            task.error = str(exc)\n"
+            "            task.completed_at = utc_now_iso()\n"
+            "            self._signal_task_event(task_id)\n"
+            "            logger.exception(f\"Async task failed: {task_id}\")\n"
+            "        finally:\n"
+            "            self.queue.task_done()\n\n"
+            "    async def _run_task(self, task: AsyncParseTask) -> None:\n",
+            count=1,
+            label="FastAPI terminal processor completion",
+        )
 
     if relative_path == "mineru/utils/model_utils.py":
         source = _replace_exact(
@@ -105,7 +366,7 @@ def patch_source(relative_path: str, source: str) -> str:
             label="model-utils imports",
         )
         helper = '''_PHASE_TRACE_PREFIX = "MINERU_PHASE_TRACE "
-_PHASE_TRACE_SCHEMA = "mineru-phase-trace.v2"
+_PHASE_TRACE_SCHEMA = "mineru-phase-trace.v3"
 _PHASE_TRACE_BACKENDS = frozenset({"hybrid", "vlm"})
 _PHASE_TRACE_PIPELINE_MODES = frozenset({"legacy", "depth1"})
 _PHASE_TRACE_PHASES = frozenset({
@@ -257,6 +518,10 @@ class CapacityExecutionProfile:
     @property
     def max_resident_decoded_bytes(self) -> int:
         return self.max_resident_pages * _CAPACITY_MAX_PAGE_PIXEL_BYTES
+
+    @property
+    def max_resident_windows(self) -> int:
+        return self.pipeline_depth + 1 if self.pipeline_depth else 1
 
 def _legacy_execution_profile(configured_window_size: int) -> CapacityExecutionProfile:
     configured_window_size = _capacity_integer(
@@ -545,24 +810,66 @@ def select_capacity_execution_profile(
 
 @dataclass
 class CapacityCreditLease:
+    owner_id: str
     page_count: int
+    reserved_windows: int
     reserved_decoded_bytes: int
+    resident_windows_after_acquire: int
     resident_pages_after_acquire: int
     resident_decoded_bytes_after_acquire: int
     actual_decoded_bytes: int = 0
     state: str = "leased"
 
 
+class _ProcessCapacityPool:
+    """One vector/page/decoded-byte envelope shared by all documents."""
+
+    def __init__(self, profile: CapacityExecutionProfile) -> None:
+        self.profile_sha256 = profile.profile_sha256
+        self.max_windows = profile.max_resident_windows
+        self.max_pages = profile.max_resident_pages
+        self.max_decoded_bytes = profile.max_resident_decoded_bytes
+        self.available_windows = self.max_windows
+        self.available_pages = self.max_pages
+        self.available_decoded_bytes = self.max_decoded_bytes
+        self.condition = asyncio.Condition()
+
+
+_PROCESS_CAPACITY_POOLS = {}
+_PROCESS_STAGE_GATES = {}
+
+
+def _process_capacity_pool(profile: CapacityExecutionProfile) -> _ProcessCapacityPool:
+    loop = asyncio.get_running_loop()
+    pool = _PROCESS_CAPACITY_POOLS.get(loop)
+    if pool is None:
+        pool = _ProcessCapacityPool(profile)
+        _PROCESS_CAPACITY_POOLS[loop] = pool
+    elif pool.profile_sha256 != profile.profile_sha256:
+        raise RuntimeError("process capacity profile drifted while work is resident")
+    return pool
+
+
+def process_capacity_stage_gates():
+    """Return distinct process-global A and C owners for the active loop."""
+    loop = asyncio.get_running_loop()
+    gates = _PROCESS_STAGE_GATES.get(loop)
+    if gates is None:
+        gates = (asyncio.Lock(), asyncio.Lock())
+        _PROCESS_STAGE_GATES[loop] = gates
+    return gates
+
+
 class CapacityCreditBank:
-    """Atomic page/pixel credit bank for one immutable document profile."""
+    """Per-document lease owner backed by one process-global credit pool."""
 
     def __init__(self, profile: CapacityExecutionProfile) -> None:
         if profile.pipeline_mode != "depth1":
             raise RuntimeError("capacity credit bank requires a depth-one profile")
         self.profile = profile
-        self.available_pages = profile.max_resident_pages
-        self.available_decoded_bytes = profile.max_resident_decoded_bytes
-        self.condition = asyncio.Condition()
+        self.owner_id = uuid.uuid4().hex
+        self.pool = _process_capacity_pool(profile)
+        self.active_lease_ids = set()
 
     async def acquire(self, page_count: int) -> CapacityCreditLease:
         page_count = _capacity_integer(page_count, label="lease_page_count", minimum=1)
@@ -572,33 +879,42 @@ class CapacityCreditBank:
             or decoded_bytes > self.profile.max_resident_decoded_bytes
         ):
             raise RuntimeError("capacity lease exceeds its immutable profile")
-        async with self.condition:
-            await self.condition.wait_for(
+        async with self.pool.condition:
+            await self.pool.condition.wait_for(
                 lambda: (
-                    self.available_pages >= page_count
-                    and self.available_decoded_bytes >= decoded_bytes
+                    self.pool.available_windows >= 1
+                    and self.pool.available_pages >= page_count
+                    and self.pool.available_decoded_bytes >= decoded_bytes
                 )
             )
-            self.available_pages -= page_count
-            self.available_decoded_bytes -= decoded_bytes
-            return CapacityCreditLease(
+            self.pool.available_windows -= 1
+            self.pool.available_pages -= page_count
+            self.pool.available_decoded_bytes -= decoded_bytes
+            lease = CapacityCreditLease(
+                owner_id=self.owner_id,
                 page_count=page_count,
+                reserved_windows=1,
                 reserved_decoded_bytes=decoded_bytes,
+                resident_windows_after_acquire=(
+                    self.pool.max_windows - self.pool.available_windows
+                ),
                 resident_pages_after_acquire=(
-                    self.profile.max_resident_pages - self.available_pages
+                    self.pool.max_pages - self.pool.available_pages
                 ),
                 resident_decoded_bytes_after_acquire=(
-                    self.profile.max_resident_decoded_bytes
-                    - self.available_decoded_bytes
+                    self.pool.max_decoded_bytes
+                    - self.pool.available_decoded_bytes
                 ),
             )
+            self.active_lease_ids.add(id(lease))
+            return lease
 
     def record_actual_decoded_bytes(
         self,
         lease: CapacityCreditLease,
         actual_decoded_bytes: int,
     ) -> None:
-        if lease.state != "leased":
+        if lease.owner_id != self.owner_id or lease.state != "leased":
             raise RuntimeError("capacity lease is not active")
         actual_decoded_bytes = _capacity_integer(
             actual_decoded_bytes,
@@ -609,28 +925,32 @@ class CapacityCreditBank:
         lease.actual_decoded_bytes = actual_decoded_bytes
 
     async def release(self, lease: CapacityCreditLease) -> None:
-        if lease.state != "leased":
+        if (
+            lease.owner_id != self.owner_id
+            or id(lease) not in self.active_lease_ids
+            or lease.state != "leased"
+        ):
             raise RuntimeError("capacity lease release state is invalid")
-        async with self.condition:
+        async with self.pool.condition:
             if (
-                self.available_pages + lease.page_count
-                > self.profile.max_resident_pages
-                or self.available_decoded_bytes + lease.reserved_decoded_bytes
-                > self.profile.max_resident_decoded_bytes
+                self.pool.available_windows + lease.reserved_windows
+                > self.pool.max_windows
+                or self.pool.available_pages + lease.page_count
+                > self.pool.max_pages
+                or self.pool.available_decoded_bytes + lease.reserved_decoded_bytes
+                > self.pool.max_decoded_bytes
             ):
                 raise RuntimeError("capacity credit bank overflowed")
-            self.available_pages += lease.page_count
-            self.available_decoded_bytes += lease.reserved_decoded_bytes
+            self.pool.available_windows += lease.reserved_windows
+            self.pool.available_pages += lease.page_count
+            self.pool.available_decoded_bytes += lease.reserved_decoded_bytes
+            self.active_lease_ids.remove(id(lease))
             lease.state = "released"
-            self.condition.notify_all()
+            self.pool.condition.notify_all()
 
     def assert_fully_released(self) -> None:
-        if (
-            self.available_pages != self.profile.max_resident_pages
-            or self.available_decoded_bytes
-            != self.profile.max_resident_decoded_bytes
-        ):
-            raise RuntimeError("capacity credit bank did not close")
+        if self.active_lease_ids:
+            raise RuntimeError("capacity document leases did not close")
 
 
 class CapacityCandidateFallback(RuntimeError):
@@ -670,6 +990,9 @@ class MinerUPhaseTrace:
         total_windows: int,
         execution_profile: CapacityExecutionProfile,
         source_pdf_bytes: int,
+        hybrid_batch_ratio_requested=None,
+        hybrid_batch_ratio_effective=None,
+        hybrid_batch_ratio_ocr_override=None,
     ) -> None:
         if backend not in _PHASE_TRACE_BACKENDS:
             raise RuntimeError("phase trace backend is unsupported")
@@ -716,6 +1039,7 @@ class MinerUPhaseTrace:
         self.pipeline_depth = execution_profile.pipeline_depth
         self.source_pdf_bytes = source_pdf_bytes
         self.max_resident_pages = execution_profile.max_resident_pages
+        self.max_resident_windows = execution_profile.max_resident_windows
         self.max_resident_decoded_bytes = (
             execution_profile.max_resident_decoded_bytes
         )
@@ -723,6 +1047,46 @@ class MinerUPhaseTrace:
             execution_profile.inner_inference_concurrency
         )
         self.vllm_max_num_seqs = execution_profile.vllm_max_num_seqs
+        ratio_values = (
+            hybrid_batch_ratio_requested,
+            hybrid_batch_ratio_effective,
+        )
+        if backend == "hybrid":
+            if (
+                any(value not in {1, 2, 4, 8} for value in ratio_values)
+                or not isinstance(hybrid_batch_ratio_ocr_override, bool)
+                or (
+                    hybrid_batch_ratio_ocr_override
+                    and hybrid_batch_ratio_effective != 1
+                )
+                or (
+                    not hybrid_batch_ratio_ocr_override
+                    and hybrid_batch_ratio_effective
+                    != hybrid_batch_ratio_requested
+                )
+            ):
+                raise RuntimeError("phase trace hybrid batch ratio is invalid")
+        elif any(value is not None for value in (*ratio_values, hybrid_batch_ratio_ocr_override)):
+            raise RuntimeError("VLM phase trace unexpectedly has a hybrid batch ratio")
+        self.hybrid_batch_ratio_requested = hybrid_batch_ratio_requested
+        self.hybrid_batch_ratio_effective = hybrid_batch_ratio_effective
+        self.hybrid_batch_ratio_ocr_override = hybrid_batch_ratio_ocr_override
+        self.hybrid_layout_batch_cap = (
+            min(8, hybrid_batch_ratio_effective)
+            if hybrid_batch_ratio_effective is not None
+            else None
+        )
+        self.hybrid_mfr_batch_cap = (
+            hybrid_batch_ratio_effective * 16
+            if hybrid_batch_ratio_effective is not None
+            else None
+        )
+        self.hybrid_ocr_det_batch_cap = (
+            hybrid_batch_ratio_effective * 8
+            if hybrid_batch_ratio_effective is not None
+            else None
+        )
+        self.hybrid_table_orientation_batch_cap = self.hybrid_ocr_det_batch_cap
         self.trace_id = uuid.uuid4().hex
         self.sequence = 0
         self.document_started_ns = 0
@@ -750,13 +1114,18 @@ class MinerUPhaseTrace:
             window_index, page_start, page_end_exclusive = window
             window_page_count = page_end_exclusive - page_start
         if credit_lease is None:
-            reserved_decoded_bytes = None
+            reserved_windows = reserved_decoded_bytes = None
             actual_decoded_bytes = resident_pages_after_acquire = None
+            resident_windows_after_acquire = None
             resident_decoded_bytes_after_acquire = None
         else:
+            reserved_windows = credit_lease.reserved_windows
             reserved_decoded_bytes = credit_lease.reserved_decoded_bytes
             actual_decoded_bytes = credit_lease.actual_decoded_bytes
             resident_pages_after_acquire = credit_lease.resident_pages_after_acquire
+            resident_windows_after_acquire = (
+                credit_lease.resident_windows_after_acquire
+            )
             resident_decoded_bytes_after_acquire = (
                 credit_lease.resident_decoded_bytes_after_acquire
             )
@@ -769,9 +1138,19 @@ class MinerUPhaseTrace:
                 "duration_ns": ended_ns - started_ns,
                 "ended_monotonic_ns": ended_ns,
                 "event": event,
+                "hybrid_batch_ratio_effective": self.hybrid_batch_ratio_effective,
+                "hybrid_batch_ratio_ocr_override": self.hybrid_batch_ratio_ocr_override,
+                "hybrid_batch_ratio_requested": self.hybrid_batch_ratio_requested,
+                "hybrid_layout_batch_cap": self.hybrid_layout_batch_cap,
+                "hybrid_mfr_batch_cap": self.hybrid_mfr_batch_cap,
+                "hybrid_ocr_det_batch_cap": self.hybrid_ocr_det_batch_cap,
+                "hybrid_table_orientation_batch_cap": (
+                    self.hybrid_table_orientation_batch_cap
+                ),
                 "inner_inference_concurrency": self.inner_inference_concurrency,
                 "max_resident_decoded_bytes": self.max_resident_decoded_bytes,
                 "max_resident_pages": self.max_resident_pages,
+                "max_resident_windows": self.max_resident_windows,
                 "outcome": outcome,
                 "page_count": self.page_count,
                 "page_end_exclusive": page_end_exclusive,
@@ -783,10 +1162,12 @@ class MinerUPhaseTrace:
                 "profile_id": self.profile_id,
                 "profile_sha256": self.profile_sha256,
                 "reserved_decoded_bytes": reserved_decoded_bytes,
+                "reserved_windows": reserved_windows,
                 "resident_decoded_bytes_after_acquire": (
                     resident_decoded_bytes_after_acquire
                 ),
                 "resident_pages_after_acquire": resident_pages_after_acquire,
+                "resident_windows_after_acquire": resident_windows_after_acquire,
                 "schema": _PHASE_TRACE_SCHEMA,
                 "sequence": self.sequence,
                 "started_monotonic_ns": started_ns,
@@ -1207,6 +1588,7 @@ def trim_process_heap() -> bool:
             "    drain_owned_awaitable,\n"
             "    legacy_capacity_execution_profile,\n"
             "    new_phase_trace,\n"
+            "    process_capacity_stage_gates,\n"
             "    trim_process_heap,\n"
             ")\n\n"
             "from ...utils.enum_class import ImageType\n",
@@ -1561,6 +1943,40 @@ def trim_process_heap() -> bool:
             count=1,
             label="Hybrid import",
         )
+        source = _replace_exact_span(
+            source,
+            "def get_batch_ratio(device):\n",
+            "\n\ndef _close_images(images_list):\n",
+            '''def get_batch_ratio(_device):
+    """Return one explicit, closed-set process batch ratio."""
+    raw_value = os.getenv("MINERU_HYBRID_BATCH_RATIO")
+    if raw_value is None:
+        raise RuntimeError("MINERU_HYBRID_BATCH_RATIO must be explicitly configured")
+    normalized = raw_value.strip()
+    if normalized not in {"1", "2", "4", "8"}:
+        raise RuntimeError("MINERU_HYBRID_BATCH_RATIO must be one of 1,2,4,8")
+    batch_ratio = int(normalized)
+    logger.info(f"hybrid batch ratio (explicit): {batch_ratio}")
+    return batch_ratio
+''',
+            label="Hybrid strict batch ratio",
+        )
+        source = _replace_exact(
+            source,
+            "        rotate_labels = table_orientation_cls_model.batch_predict(\n"
+            "            table_inputs,\n"
+            "            det_batch_size=max(1, batch_ratio * OCR_DET_BASE_BATCH_SIZE),\n"
+            "            tqdm_enable=True,\n"
+            "        )\n",
+            "        rotate_labels = run_ocr_inference(\n"
+            "            table_orientation_cls_model.batch_predict,\n"
+            "            table_inputs,\n"
+            "            det_batch_size=max(1, batch_ratio * OCR_DET_BASE_BATCH_SIZE),\n"
+            "            tqdm_enable=True,\n"
+            "        )\n",
+            count=1,
+            label="Hybrid table-orientation model gate",
+        )
         source = _replace_exact(
             source,
             "    model_list = []\n"
@@ -1588,7 +2004,8 @@ def trim_process_heap() -> bool:
     ocr_enable,
     effort,
     effective_image_analysis,
-    native_owner,
+    a_owner,
+    c_owner,
     execution_profile,
     allow_auto_fallback,
 ):
@@ -1684,7 +2101,7 @@ def trim_process_heap() -> bool:
             render_started_ns = phase_trace.start()
             try:
                 images_list = await run_async_owned(
-                    native_owner,
+                    a_owner,
                     lambda: aio_load_images_from_pdf_bytes_range(
                         pdf_bytes,
                         start_page_id=window_start,
@@ -1725,7 +2142,7 @@ def trim_process_heap() -> bool:
             layout_started_ns = phase_trace.start()
             try:
                 images_layout_res, pipeline_model = await run_native_owned(
-                    native_owner,
+                    a_owner,
                     _predict_layout_for_window,
                     images_pil_list,
                     inline_formula_enable,
@@ -1735,7 +2152,7 @@ def trim_process_heap() -> bool:
                 vlm_blocks_list = None
                 if effort == "medium":
                     await run_native_owned(
-                        native_owner,
+                        a_owner,
                         _apply_medium_table_orientation_labels,
                         images_pil_list,
                         images_layout_res,
@@ -1906,7 +2323,7 @@ def trim_process_heap() -> bool:
                     optimize_hybrid_formula_number_blocks(window_model_list)
                 if ocr_enable:
                     await run_native_owned(
-                        native_owner,
+                        c_owner,
                         _apply_vlm_ocr_det_sidecars_for_window,
                         images_pil_list,
                         window_model_list,
@@ -1916,7 +2333,7 @@ def trim_process_heap() -> bool:
                     )
                 else:
                     window_model_list = await run_native_owned(
-                        native_owner,
+                        c_owner,
                         _process_ocr_and_formulas,
                         images_pil_list,
                         window_model_list,
@@ -1926,7 +2343,7 @@ def trim_process_heap() -> bool:
                         hybrid_pipeline_model=pipeline_model,
                     )
                 await run_native_owned(
-                    native_owner,
+                    c_owner,
                     _apply_layout_title_split,
                     window_model_list,
                     images_layout_res,
@@ -2200,6 +2617,9 @@ def trim_process_heap() -> bool:
             "            f'Hybrid processing-window run. page_count={page_count}, '\n"
             "            f'window_size={configured_window_size}, total_windows={total_windows}'\n"
             "        )\n"
+            "        batch_ratio_requested = get_batch_ratio(device)\n"
+            "        batch_ratio_ocr_override = bool(_ocr_enable)\n"
+            "        batch_ratio = 1 if batch_ratio_ocr_override else batch_ratio_requested\n"
             "        phase_trace = new_phase_trace(\n"
             "            backend=\"hybrid\",\n"
             "            page_count=page_count,\n"
@@ -2207,9 +2627,11 @@ def trim_process_heap() -> bool:
             "            total_windows=total_windows,\n"
             "            execution_profile=execution_profile,\n"
             "            source_pdf_bytes=len(pdf_bytes),\n"
+            "            hybrid_batch_ratio_requested=batch_ratio_requested,\n"
+            "            hybrid_batch_ratio_effective=batch_ratio,\n"
+            "            hybrid_batch_ratio_ocr_override=batch_ratio_ocr_override,\n"
             "        )\n"
-            "        phase_trace.document_started()\n\n"
-            "        batch_ratio = get_batch_ratio(device) if not _ocr_enable else 1\n",
+            "        phase_trace.document_started()\n",
             count=2,
             occurrence=0,
             label="Hybrid synchronous document phase start",
@@ -2225,6 +2647,9 @@ def trim_process_heap() -> bool:
             "            f'Hybrid processing-window run. page_count={page_count}, '\n"
             "            f'window_size={configured_window_size}, total_windows={total_windows}'\n"
             "        )\n"
+            "        batch_ratio_requested = get_batch_ratio(device)\n"
+            "        batch_ratio_ocr_override = bool(_ocr_enable)\n"
+            "        batch_ratio = 1 if batch_ratio_ocr_override else batch_ratio_requested\n"
             "        phase_trace = new_phase_trace(\n"
             "            backend=\"hybrid\",\n"
             "            page_count=page_count,\n"
@@ -2232,19 +2657,21 @@ def trim_process_heap() -> bool:
             "            total_windows=total_windows,\n"
             "            execution_profile=execution_profile,\n"
             "            source_pdf_bytes=len(pdf_bytes),\n"
+            "            hybrid_batch_ratio_requested=batch_ratio_requested,\n"
+            "            hybrid_batch_ratio_effective=batch_ratio,\n"
+            "            hybrid_batch_ratio_ocr_override=batch_ratio_ocr_override,\n"
             "        )\n"
-            "        phase_trace.document_started()\n\n"
-            "        batch_ratio = get_batch_ratio(device) if not _ocr_enable else 1\n",
+            "        phase_trace.document_started()\n",
             count=1,
             label="Hybrid asynchronous document phase start",
         )
         source = _replace_exact_occurrence(
             source,
-            "        batch_ratio = get_batch_ratio(device) if not _ocr_enable else 1\n\n"
+            "        phase_trace.document_started()\n\n"
             "        infer_start = time.time()\n",
-            "        batch_ratio = get_batch_ratio(device) if not _ocr_enable else 1\n\n"
+            "        phase_trace.document_started()\n\n"
             "        if execution_profile.pipeline_mode == \"depth1\":\n"
-            "            native_owner = asyncio.Lock()\n"
+            "            a_owner, c_owner = process_capacity_stage_gates()\n"
             "            allow_auto_fallback = capacity_mode() == \"auto\"\n"
             "            try:\n"
             "                model_list, hybrid_pipeline_model = (\n"
@@ -2262,7 +2689,8 @@ def trim_process_heap() -> bool:
             "                        ocr_enable=_ocr_enable,\n"
             "                        effort=effort,\n"
             "                        effective_image_analysis=effective_image_analysis,\n"
-            "                        native_owner=native_owner,\n"
+            "                        a_owner=a_owner,\n"
+            "                        c_owner=c_owner,\n"
             "                        execution_profile=execution_profile,\n"
             "                        allow_auto_fallback=allow_auto_fallback,\n"
             "                    )\n"
@@ -2295,6 +2723,9 @@ def trim_process_heap() -> bool:
             "                    total_windows=total_windows,\n"
             "                    execution_profile=execution_profile,\n"
             "                    source_pdf_bytes=len(pdf_bytes),\n"
+            "                    hybrid_batch_ratio_requested=batch_ratio_requested,\n"
+            "                    hybrid_batch_ratio_effective=batch_ratio,\n"
+            "                    hybrid_batch_ratio_ocr_override=batch_ratio_ocr_override,\n"
             "                )\n"
             "                phase_trace.document_started()\n"
             "                logger.warning(\n"
@@ -2305,7 +2736,7 @@ def trim_process_heap() -> bool:
             "                finalize_started_ns = phase_trace.start()\n"
             "                if client_side_output_generation:\n"
             "                    await run_native_owned(\n"
-            "                        native_owner,\n"
+            "                        c_owner,\n"
             "                        apply_server_side_postprocess,\n"
             "                        middle_json[\"pdf_info\"],\n"
             "                        hybrid_pipeline_model,\n"
@@ -2313,7 +2744,7 @@ def trim_process_heap() -> bool:
             "                    )\n"
             "                else:\n"
             "                    await run_native_owned(\n"
-            "                        native_owner,\n"
+            "                        c_owner,\n"
             "                        finalize_middle_json,\n"
             "                        middle_json[\"pdf_info\"],\n"
             "                        hybrid_pipeline_model,\n"
@@ -2529,6 +2960,10 @@ def apply_patch(
 
     if metadata.version("mineru") != MINERU_VERSION:
         raise RuntimeError(f"MinerU must be exactly {MINERU_VERSION}")
+    if metadata.version("mineru-vl-utils") != MINERU_VL_UTILS_VERSION:
+        raise RuntimeError(
+            f"mineru-vl-utils must be exactly {MINERU_VL_UTILS_VERSION}"
+        )
     original: dict[str, bytes] = {}
     for relative_path, expected in TARGET_PREIMAGE_SHA256.items():
         payload = (site_packages / relative_path).read_bytes()
@@ -2542,7 +2977,9 @@ def apply_patch(
     patched: dict[str, bytes] = {}
     for relative_path, payload in original.items():
         text = payload.decode("utf-8")
-        updated = patch_source(relative_path, text).encode("utf-8")
+        updated_text = patch_source(relative_path, text)
+        compile(updated_text, relative_path, "exec")
+        updated = updated_text.encode("utf-8")
         if updated == payload:
             raise RuntimeError(f"{relative_path} patch made no change")
         patched[relative_path] = updated
@@ -2554,10 +2991,11 @@ def apply_patch(
 
     patcher_sha256 = _sha256(Path(__file__).read_bytes())
     marker: dict[str, object] = {
-        "schema": "mineru-runtime-compatibility.v2",
+        "schema": "mineru-runtime-compatibility.v3",
         "policy": POLICY,
         "capacity_policy": CAPACITY_POLICY,
         "mineru_version": MINERU_VERSION,
+        "mineru_vl_utils_version": MINERU_VL_UTILS_VERSION,
         "base_image_digest": BASE_IMAGE_DIGEST,
         "patcher_sha256": patcher_sha256,
         "preimage_sha256": {

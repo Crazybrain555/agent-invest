@@ -58,6 +58,25 @@ async def aio_predictor_execution_guard(predictor: MinerUClient):
 
 _RUNTIME_COMPATIBILITY_SHA256 = "sha256:" + "9" * 64
 
+_HYBRID_COORDINATOR_FIXTURE = '''def _apply_medium_table_orientation_labels():
+    try:
+        rotate_labels = table_orientation_cls_model.batch_predict(
+            table_inputs,
+            det_batch_size=max(1, batch_ratio * OCR_DET_BASE_BATCH_SIZE),
+            tqdm_enable=True,
+        )
+    except Exception:
+        return None
+
+
+def get_batch_ratio(device):
+    return 1
+
+
+def _close_images(images_list):
+    return None
+'''
+
 
 def _candidate_profile_json() -> str:
     return json.dumps(
@@ -107,6 +126,168 @@ def _capacity_catalog_environment(root: Path, raw_profile: str) -> dict[str, str
     }
 
 
+def _http_client_fixture() -> str:
+    return '''import asyncio
+
+
+class HTTPMethod(str, Enum):
+    pass
+
+
+class HttpVlmClient:
+    async def _aio_client(self):
+        return self.client
+
+    async def aio_predict(self, image, prompt="", sampling_params=None, priority=None):
+        image, image_format = image, "png"
+        request_body = {}
+        if self.debug:
+            pass
+        client = await self._aio_client()
+        response = await client.post(self.chat_url, json=request_body)
+        response_data = self.get_response_data(response)
+        if self.debug:
+            pass
+        return self.get_response_content(response_data)
+'''
+
+
+def _cross_page_fixture() -> str:
+    return '''def _apply_merge_results(results, tasks, responses):
+    if len(tasks) != len(responses):
+        logger.warning(
+            "Task/response count mismatch: {} tasks but {} responses, skipping merge results",
+            len(tasks), len(responses),
+        )
+        return
+    for task, response in zip(tasks, responses):
+        pass
+
+
+def detect_cross_page_cell_merge(results, batch_predict_fn):
+    tasks = [object()]
+    prompts = [t.prompt for t in tasks]
+    try:
+        responses = batch_predict_fn(prompts)
+    except Exception as e:
+        logger.warning("VLM batch predict failed for cross-page table merge: {}", e)
+        return
+
+    _apply_merge_results(results, tasks, responses)
+
+
+async def aio_detect_cross_page_cell_merge(results, aio_batch_predict_fn):
+    tasks = [object()]
+    prompts = [t.prompt for t in tasks]
+    try:
+        responses = await aio_batch_predict_fn(prompts)
+    except Exception as e:
+        logger.warning("VLM batch predict failed for cross-page table merge: {}", e)
+        return
+
+    _apply_merge_results(results, tasks, responses)
+'''
+
+
+def _fast_api_fixture() -> str:
+    return '''class AsyncTaskManager:
+    def __init__(self, fastapi_app: FastAPI):
+        self.app = fastapi_app
+        self.tasks = {}
+        self.task_events = {}
+        self.queue: asyncio.Queue[str] = asyncio.Queue()
+        self.dispatcher_task = None
+        self.cleanup_task = None
+        self.active_tasks = set()
+        self.last_worker_error = None
+        self.is_shutting_down = False
+        self.task_retention_seconds = get_task_retention_seconds()
+        self.task_cleanup_interval_seconds = get_task_cleanup_interval_seconds()
+        self.manager_wakeup = asyncio.Event()
+        self._next_submit_order = 1
+
+    async def start(self):
+        self.is_shutting_down = False
+        self.dispatcher_task = asyncio.create_task(self._dispatcher_loop())
+
+    async def shutdown(self) -> None:
+        self.is_shutting_down = True
+        self._wake_waiters()
+        if self.dispatcher_task is not None:
+            self.dispatcher_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.dispatcher_task
+            self.dispatcher_task = None
+        if self.cleanup_task is not None:
+            self.cleanup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.cleanup_task
+            self.cleanup_task = None
+
+        pending = list(self.active_tasks)
+        for processor in pending:
+            processor.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self.active_tasks.clear()
+
+    async def submit(self, task: AsyncParseTask) -> None:
+        task.submit_order = self._next_submit_order
+        self._next_submit_order += 1
+        self.tasks[task.task_id] = task
+        self.task_events[task.task_id] = asyncio.Event()
+        await self.queue.put(task.task_id)
+
+    def _wake_waiters(self):
+        self.manager_wakeup.set()
+
+    def _signal_task_event(self, task_id):
+        self.task_events[task_id].set()
+
+    async def _dispatcher_loop(self) -> None:
+        try:
+            while True:
+                task_id = await self.queue.get()
+                processor = asyncio.create_task(
+                    self._process_task(task_id),
+                    name=f"mineru-fastapi-task-{task_id}",
+                )
+                self.active_tasks.add(processor)
+                processor.add_done_callback(self._on_processor_done)
+                self.queue.task_done()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.last_worker_error = str(exc)
+            self._wake_waiters()
+            logger.exception("Async task dispatcher crashed")
+            raise
+
+    def _on_processor_done(self, processor):
+        self.active_tasks.discard(processor)
+
+    async def _process_task(self, task_id: str) -> None:
+        task = self.tasks.get(task_id)
+        if task is None:
+            return
+
+        try:
+            await self._run_task(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            task.status = TASK_FAILED
+            task.error = str(exc)
+            task.completed_at = utc_now_iso()
+            self._signal_task_event(task_id)
+            logger.exception(f"Async task failed: {task_id}")
+
+    async def _run_task(self, task: AsyncParseTask) -> None:
+        task.status = TASK_PROCESSING
+        await task.release.wait()
+        task.status = TASK_COMPLETED
+        self._signal_task_event(task.task_id)
+'''
 def _vlm_document_fixture(*, asynchronous: bool) -> str:
     render = (
         "                images_list = await aio_load_images_from_pdf_bytes_range(\n"
@@ -303,10 +484,226 @@ def _hybrid_document_fixture(*, asynchronous: bool) -> str:
 
 
 class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
+    def test_final_post_limiter_is_process_shared_drift_closed_and_cancel_safe(self) -> None:
+        patched = patch_source(
+            "mineru_vl_utils/vlm_client/http_client.py",
+            _http_client_fixture(),
+        )
+        start = patched.index("class _ProcessAsyncRequestLimiter:")
+        end = patched.index("class HTTPMethod", start)
+        namespace: dict[str, object] = {"asyncio": asyncio}
+        exec(compile(patched[start:end], "http-limiter.py", "exec"), namespace)
+
+        async def exercise() -> None:
+            limiter = namespace["_process_async_request_limiter"](2)
+            self.assertIs(limiter, namespace["_process_async_request_limiter"](2))
+            with self.assertRaisesRegex(RuntimeError, "drifted"):
+                namespace["_process_async_request_limiter"](3)
+            outer = asyncio.Semaphore(2)
+            self.assertIsNot(outer, limiter.semaphore)
+            release = asyncio.Event()
+
+            async def hold() -> None:
+                async with limiter:
+                    await release.wait()
+
+            holders = [asyncio.create_task(hold()) for _ in range(2)]
+            while limiter.active != 2:
+                await asyncio.sleep(0)
+            waiter = asyncio.create_task(hold())
+            await asyncio.sleep(0)
+            waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+            self.assertEqual(limiter.active, 2)
+            self.assertEqual(limiter.peak, 2)
+            release.set()
+            await asyncio.gather(*holders)
+            self.assertEqual(limiter.active, 0)
+            self.assertEqual(limiter.semaphore._value, 2)
+
+        asyncio.run(exercise())
+        self.assertIn("async with limiter:", patched)
+        self.assertNotIn("async with semaphore:\n            response = await client.post", patched)
+
+    def test_process_credit_pool_is_shared_across_documents_and_stage_gates_split(self) -> None:
+        source = (
+            "import math\nimport os\nimport time\nimport gc\n"
+            "\ndef clean_memory(device='cuda'):\n    gc.collect()\n"
+        )
+        namespace: dict[str, object] = {}
+        exec(
+            compile(
+                patch_source("mineru/utils/model_utils.py", source),
+                "patched-model-utils.py",
+                "exec",
+            ),
+            namespace,
+        )
+
+        async def exercise() -> None:
+            profile = namespace["CapacityExecutionProfile"](
+                profile_id="candidate-w2-d1",
+                profile_sha256="sha256:" + "a" * 64,
+                pipeline_mode="depth1",
+                pipeline_depth=1,
+                window_size=2,
+                max_resident_pages=4,
+                max_source_pdf_bytes=10000,
+                min_document_pages=3,
+                max_document_pages=100,
+                inner_inference_concurrency=2,
+                vllm_max_num_seqs=8,
+            )
+            first = namespace["CapacityCreditBank"](profile)
+            second = namespace["CapacityCreditBank"](profile)
+            first_lease = await first.acquire(2)
+            second_lease = await second.acquire(2)
+            self.assertIs(first.pool, second.pool)
+            self.assertEqual(second_lease.resident_windows_after_acquire, 2)
+            self.assertEqual(second_lease.resident_pages_after_acquire, 4)
+            blocked = asyncio.create_task(first.acquire(1))
+            await asyncio.sleep(0)
+            self.assertFalse(blocked.done())
+            await first.release(first_lease)
+            third_lease = await blocked
+            await first.release(third_lease)
+            await second.release(second_lease)
+            first.assert_fully_released()
+            second.assert_fully_released()
+            a_gate, c_gate = namespace["process_capacity_stage_gates"]()
+            same_a, same_c = namespace["process_capacity_stage_gates"]()
+            self.assertIs(a_gate, same_a)
+            self.assertIs(c_gate, same_c)
+            self.assertIsNot(a_gate, c_gate)
+            await a_gate.acquire()
+            same_stage = asyncio.create_task(same_a.acquire())
+            other_stage = asyncio.create_task(c_gate.acquire())
+            await asyncio.sleep(0)
+            self.assertFalse(same_stage.done())
+            self.assertTrue(other_stage.done())
+            c_gate.release()
+            a_gate.release()
+            await same_stage
+            same_a.release()
+
+        asyncio.run(exercise())
+
+    def test_cross_page_transport_and_cardinality_fail_visible(self) -> None:
+        patched = patch_source(
+            "mineru_vl_utils/post_process/cross_page_table.py",
+            _cross_page_fixture(),
+        )
+        self.assertNotIn("VLM batch predict failed", patched)
+        self.assertIn("responses = batch_predict_fn(prompts)", patched)
+        self.assertIn("responses = await aio_batch_predict_fn(prompts)", patched)
+        start = patched.index("def _apply_merge_results")
+        end = patched.index("def detect_cross_page_cell_merge", start)
+        namespace: dict[str, object] = {}
+        exec(compile(patched[start:end], "cross-page.py", "exec"), namespace)
+        with self.assertRaisesRegex(RuntimeError, "count mismatch"):
+            namespace["_apply_merge_results"]([], [object()], [])
+
+    def test_hybrid_batch_ratio_is_strict_and_orientation_uses_model_gate(self) -> None:
+        source = (
+            "from mineru.utils.model_utils import clean_memory, crop_img, get_vram\n"
+            + _HYBRID_COORDINATOR_FIXTURE
+            + _hybrid_document_fixture(asynchronous=False)
+            + "async def aio_doc_analyze(\n"
+            + _hybrid_document_fixture(asynchronous=True)
+        )
+        patched = patch_source("mineru/backend/hybrid/hybrid_analyze.py", source)
+        self.assertIn("MINERU_HYBRID_BATCH_RATIO must be explicitly configured", patched)
+        self.assertIn('normalized not in {"1", "2", "4", "8"}', patched)
+        self.assertIn("rotate_labels = run_ocr_inference(", patched)
+        self.assertIn("hybrid_batch_ratio_requested=batch_ratio_requested", patched)
+        self.assertIn("a_owner, c_owner = process_capacity_stage_gates()", patched)
+        ratio_start = patched.index("def get_batch_ratio(_device):")
+        ratio_end = patched.index("def _close_images", ratio_start)
+
+        class RatioLogger:
+            def info(self, _message: str) -> None:
+                return None
+
+        namespace = {"os": os, "logger": RatioLogger()}
+        exec(compile(patched[ratio_start:ratio_end], "ratio.py", "exec"), namespace)
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "explicitly configured"):
+                namespace["get_batch_ratio"]("cpu")
+        with patch.dict(os.environ, {"MINERU_HYBRID_BATCH_RATIO": "3"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "one of"):
+                namespace["get_batch_ratio"]("cpu")
+        with patch.dict(os.environ, {"MINERU_HYBRID_BATCH_RATIO": "8"}, clear=True):
+            self.assertEqual(namespace["get_batch_ratio"]("cpu"), 8)
+
+    def test_fast_api_bounds_nonterminal_admission_and_drains_to_terminal(self) -> None:
+        patched = patch_source("mineru/cli/fast_api.py", _fast_api_fixture())
+
+        class HTTPExceptionStub(Exception):
+            def __init__(self, *, status_code: int, detail: str) -> None:
+                super().__init__(detail)
+                self.status_code = status_code
+
+        class LoggerStub:
+            def exception(self, _message: str) -> None:
+                return None
+
+        namespace: dict[str, object] = {
+            "asyncio": asyncio,
+            "suppress": __import__("contextlib").suppress,
+            "HTTPException": HTTPExceptionStub,
+            "FastAPI": object,
+            "AsyncParseTask": object,
+            "TASK_PENDING": "pending",
+            "TASK_PROCESSING": "processing",
+            "TASK_COMPLETED": "completed",
+            "TASK_FAILED": "failed",
+            "get_max_concurrent_requests": lambda: 1,
+            "get_task_retention_seconds": lambda: 0,
+            "get_task_cleanup_interval_seconds": lambda: 0,
+            "is_task_terminal": lambda status: status in {"completed", "failed"},
+            "utc_now_iso": lambda: "now",
+            "logger": LoggerStub(),
+        }
+        exec(compile(patched, "fast-api.py", "exec"), namespace)
+
+        async def exercise() -> None:
+            manager = namespace["AsyncTaskManager"](object())
+            await manager.start()
+
+            def task(task_id: str):
+                value = type("Task", (), {})()
+                value.task_id = task_id
+                value.status = "pending"
+                value.release = asyncio.Event()
+                value.error = None
+                value.completed_at = None
+                return value
+
+            first = task("first")
+            await manager.submit(first)
+            while first.status != "processing":
+                await asyncio.sleep(0)
+            with self.assertRaises(HTTPExceptionStub) as full:
+                await manager.submit(task("second"))
+            self.assertEqual(full.exception.status_code, 429)
+            first.release.set()
+            await manager.shutdown()
+            self.assertEqual(first.status, "completed")
+            self.assertEqual(manager.queue._unfinished_tasks, 0)
+            with self.assertRaises(HTTPExceptionStub) as closed:
+                await manager.submit(task("third"))
+            self.assertEqual(closed.exception.status_code, 503)
+
+        asyncio.run(exercise())
+
     def test_preimages_match_the_reproduced_deployed_344_sources(self) -> None:
         self.assertEqual(
             TARGET_PREIMAGE_SHA256,
             {
+                "mineru/cli/fast_api.py": (
+                    "f7f233d86ae0f5aab6ffe5d8eccef4344c968aeaf879563dae99d4875057ee39"
+                ),
                 "mineru/backend/vlm/vlm_analyze.py": (
                     "0fadf7a94ae702861b4a1fa7f42358c6687cfc63fbe322c004fb1d3248658390"
                 ),
@@ -315,6 +712,12 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                 ),
                 "mineru/utils/model_utils.py": (
                     "7662656c5c406ab704065b8a3a6e662b662b0bb877b76b08c7d8a8a7eaf9c109"
+                ),
+                "mineru_vl_utils/post_process/cross_page_table.py": (
+                    "97581c69b92ae80df2a11f3dc986f329b26edca5af57e6052929aeadefab898f"
+                ),
+                "mineru_vl_utils/vlm_client/http_client.py": (
+                    "afe42d8a5e310d27cb0173abf4d59ed6197bc0b60a0258f321a6cdedd07c6ba7"
                 ),
             },
         )
@@ -343,6 +746,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         )
         hybrid = (
             "from mineru.utils.model_utils import clean_memory, crop_img, get_vram\n"
+            + _HYBRID_COORDINATOR_FIXTURE
             + _hybrid_document_fixture(asynchronous=False)
             + "async def aio_doc_analyze(\n"
             + _hybrid_document_fixture(asynchronous=True)
@@ -415,6 +819,9 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                 total_windows=1,
                 execution_profile=execution_profile,
                 source_pdf_bytes=1234,
+                hybrid_batch_ratio_requested=4,
+                hybrid_batch_ratio_effective=4,
+                hybrid_batch_ratio_ocr_override=False,
             )
             trace.document_started()
             window = trace.window(
@@ -600,6 +1007,9 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                 total_windows=3,
                 execution_profile=profile,
                 source_pdf_bytes=1234,
+                hybrid_batch_ratio_requested=4,
+                hybrid_batch_ratio_effective=4,
+                hybrid_batch_ratio_ocr_override=False,
             )
             trace.document_started()
 
@@ -1142,6 +1552,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         )
         hybrid_source = (
             "from mineru.utils.model_utils import clean_memory, crop_img, get_vram\n"
+            + _HYBRID_COORDINATOR_FIXTURE
             + _hybrid_document_fixture(asynchronous=False)
             + "async def aio_doc_analyze(\n"
             + _hybrid_document_fixture(asynchronous=True)
@@ -1241,7 +1652,8 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                     ocr_enable=False,
                     effort="medium",
                     effective_image_analysis=False,
-                    native_owner=asyncio.Lock(),
+                    a_owner=asyncio.Lock(),
+                    c_owner=asyncio.Lock(),
                     execution_profile=profile,
                     allow_auto_fallback=True,
                 )
@@ -1366,7 +1778,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("ENV MINERU_PHASE_TRACE=0", dockerfile)
         self.assertIn("ENV MINERU_CAPACITY_MODE=legacy", dockerfile)
         self.assertIn(
-            'io.agent-invest.mineru.capacity-policy="bounded-two-window-capacity-pipeline.v2"',
+            'io.agent-invest.mineru.capacity-policy="process-global-mineru-coordinator.v3"',
             dockerfile,
         )
         self.assertIn("COMPAT_PATCHER_SHA256", dockerfile)

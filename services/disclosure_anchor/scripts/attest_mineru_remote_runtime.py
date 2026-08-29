@@ -1,4 +1,4 @@
-"""Build a v6 manifest from a live, pinned-SSH Windows observation."""
+"""Build a v7 manifest from a live, pinned-SSH Windows observation."""
 
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_TASK_RETENTION_SECONDS,
     MINERU_API_TRANSPORT_PROFILE,
     MINERU_HEAP_RETURN_POLICY,
+    MINERU_HYBRID_BATCH_RATIO,
+    MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED,
     MINERU_PROCESSING_WINDOW_SIZE,
     MINERU_WINDOWS_COLLECTOR_PATH,
     MINERU_WINDOWS_COMPOSE_PATH,
@@ -41,10 +43,13 @@ EXPECTED_REPO_DIGEST = (
 EXPECTED_IMAGE_ID = (
     "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458"
 )
-EXPECTED_API_COMPAT_IMAGE = "agent-invest/mineru-api:3.4.4-capacity-v1"
-EXPECTED_COMPAT_MARKER_SCHEMA = "mineru-runtime-compatibility.v2"
-EXPECTED_CAPACITY_POLICY = "bounded-two-window-capacity-pipeline.v2"
+EXPECTED_API_COMPAT_IMAGE = "agent-invest/mineru-api:3.4.4-capacity-v2"
+EXPECTED_COMPAT_MARKER_SCHEMA = "mineru-runtime-compatibility.v3"
+EXPECTED_CAPACITY_POLICY = "process-global-mineru-coordinator.v3"
 EXPECTED_COMPAT_PREIMAGES = {
+    "mineru/cli/fast_api.py": (
+        "sha256:f7f233d86ae0f5aab6ffe5d8eccef4344c968aeaf879563dae99d4875057ee39"
+    ),
     "mineru/backend/vlm/vlm_analyze.py": (
         "sha256:0fadf7a94ae702861b4a1fa7f42358c6687cfc63fbe322c004fb1d3248658390"
     ),
@@ -53,6 +58,12 @@ EXPECTED_COMPAT_PREIMAGES = {
     ),
     "mineru/utils/model_utils.py": (
         "sha256:7662656c5c406ab704065b8a3a6e662b662b0bb877b76b08c7d8a8a7eaf9c109"
+    ),
+    "mineru_vl_utils/post_process/cross_page_table.py": (
+        "sha256:97581c69b92ae80df2a11f3dc986f329b26edca5af57e6052929aeadefab898f"
+    ),
+    "mineru_vl_utils/vlm_client/http_client.py": (
+        "sha256:afe42d8a5e310d27cb0173abf4d59ed6197bc0b60a0258f321a6cdedd07c6ba7"
     ),
 }
 COMPAT_LABEL_KEYS = {
@@ -78,6 +89,8 @@ API_ENV_KEYS = {
     "MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS",
     "MINERU_API_DISABLE_ACCESS_LOG",
     "MINERU_API_ENABLE_FASTAPI_DOCS",
+    "MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS",
+    "MINERU_HYBRID_BATCH_RATIO",
 }
 INFERENCE_ENV_KEYS = {"MINERU_MODEL_SOURCE"}
 EXPECTED_API_COMMAND = [
@@ -358,6 +371,8 @@ def _verify_api_compatibility(
         "capacity_runtime",
         "heap_trim_enabled",
         "phase_trace_enabled",
+        "hybrid_batch_ratio_requested",
+        "pipeline_inference_locks_enabled",
         "image_labels",
     }:
         raise ValueError("remote API compatibility evidence fields drifted")
@@ -371,6 +386,7 @@ def _verify_api_compatibility(
             "policy",
             "capacity_policy",
             "mineru_version",
+            "mineru_vl_utils_version",
             "base_image_digest",
             "patcher_sha256",
             "preimage_sha256",
@@ -387,6 +403,7 @@ def _verify_api_compatibility(
         or marker.get("policy") != MINERU_HEAP_RETURN_POLICY
         or marker.get("capacity_policy") != EXPECTED_CAPACITY_POLICY
         or marker.get("mineru_version") != "3.4.4"
+        or marker.get("mineru_vl_utils_version") != "1.0.5"
         or marker.get("base_image_digest") != EXPECTED_IMAGE_ID
         or marker.get("patcher_sha256") != expected_patcher_sha256
         or marker.get("preimage_sha256") != EXPECTED_COMPAT_PREIMAGES
@@ -397,6 +414,8 @@ def _verify_api_compatibility(
         or not isinstance(value.get("capacity_runtime"), dict)
         or value.get("heap_trim_enabled") is not True
         or not isinstance(value.get("phase_trace_enabled"), bool)
+        or value.get("hybrid_batch_ratio_requested") not in {1, 2, 4, 8}
+        or value.get("pipeline_inference_locks_enabled") is not True
     ):
         raise ValueError("remote API heap-return marker or source bytes drifted")
     if labels != {
@@ -600,6 +619,13 @@ def build_manifest(
         raise ValueError("remote API environment and health task slots drifted")
     if api_environment.get("MINERU_MALLOC_TRIM") != "1":
         raise ValueError("remote API heap-return switch is not enabled")
+    if api_environment.get("MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS") != "1":
+        raise ValueError("remote API pipeline inference locks are not enabled")
+    ratio_raw = api_environment.get("MINERU_HYBRID_BATCH_RATIO")
+    if ratio_raw not in {"1", "2", "4", "8"}:
+        raise ValueError("remote API hybrid batch ratio is not closed")
+    if compatibility.get("hybrid_batch_ratio_requested") != int(ratio_raw):
+        raise ValueError("remote API hybrid batch ratio observation drifted")
     expected_capacity_runtime = _expected_capacity_runtime(api_environment)
     if compatibility.get("capacity_runtime") != expected_capacity_runtime:
         raise ValueError("remote API capacity observation and environment drifted")
@@ -636,6 +662,8 @@ def build_manifest(
             "model_repository": served_model.get("repository"),
             "model_revision": served_model.get("revision"),
             "processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
+            "hybrid_batch_ratio": MINERU_HYBRID_BATCH_RATIO,
+            "pipeline_inference_locks": MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED,
             "task_slots": task_slots,
             "vllm_max_num_seqs": 128,
             "vllm_version": served_model.get("vllm_version"),
@@ -701,6 +729,8 @@ def build_manifest(
             "api_protocol_version": MINERU_API_PROTOCOL_VERSION,
             "max_concurrent_requests": task_slots,
             "inference_max_concurrency": MINERU_API_INFERENCE_MAX_CONCURRENCY,
+            "hybrid_batch_ratio": MINERU_HYBRID_BATCH_RATIO,
+            "pipeline_inference_locks": MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED,
             "processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
             "task_retention_seconds": MINERU_API_TASK_RETENTION_SECONDS,
             "task_cleanup_interval_seconds": MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS,

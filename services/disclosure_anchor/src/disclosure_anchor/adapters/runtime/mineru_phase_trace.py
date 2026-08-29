@@ -9,7 +9,7 @@ from typing import Final, Iterable
 
 
 PHASE_TRACE_PREFIX: Final = "MINERU_PHASE_TRACE "
-PHASE_TRACE_SCHEMA: Final = "mineru-phase-trace.v2"
+PHASE_TRACE_SCHEMA: Final = "mineru-phase-trace.v3"
 _HEX32_RE = re.compile(r"^[a-f0-9]{32}$")
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -38,9 +38,17 @@ _FIELDS = frozenset(
         "duration_ns",
         "ended_monotonic_ns",
         "event",
+        "hybrid_batch_ratio_effective",
+        "hybrid_batch_ratio_ocr_override",
+        "hybrid_batch_ratio_requested",
+        "hybrid_layout_batch_cap",
+        "hybrid_mfr_batch_cap",
+        "hybrid_ocr_det_batch_cap",
+        "hybrid_table_orientation_batch_cap",
         "inner_inference_concurrency",
         "max_resident_decoded_bytes",
         "max_resident_pages",
+        "max_resident_windows",
         "outcome",
         "page_count",
         "page_end_exclusive",
@@ -52,8 +60,10 @@ _FIELDS = frozenset(
         "profile_id",
         "profile_sha256",
         "reserved_decoded_bytes",
+        "reserved_windows",
         "resident_decoded_bytes_after_acquire",
         "resident_pages_after_acquire",
+        "resident_windows_after_acquire",
         "schema",
         "sequence",
         "started_monotonic_ns",
@@ -76,9 +86,17 @@ class MineruPhaseEvent:
     duration_ns: int
     ended_monotonic_ns: int
     event: str
+    hybrid_batch_ratio_effective: int | None
+    hybrid_batch_ratio_ocr_override: bool | None
+    hybrid_batch_ratio_requested: int | None
+    hybrid_layout_batch_cap: int | None
+    hybrid_mfr_batch_cap: int | None
+    hybrid_ocr_det_batch_cap: int | None
+    hybrid_table_orientation_batch_cap: int | None
     inner_inference_concurrency: int
     max_resident_decoded_bytes: int
     max_resident_pages: int
+    max_resident_windows: int
     outcome: str
     page_count: int
     page_end_exclusive: int | None
@@ -90,8 +108,10 @@ class MineruPhaseEvent:
     profile_id: str
     profile_sha256: str
     reserved_decoded_bytes: int | None
+    reserved_windows: int | None
     resident_decoded_bytes_after_acquire: int | None
     resident_pages_after_acquire: int | None
+    resident_windows_after_acquire: int | None
     sequence: int
     started_monotonic_ns: int
     source_pdf_bytes: int
@@ -113,6 +133,12 @@ def _nullable_integer(value: object, *, label: str) -> int | None:
     if value is None:
         return None
     return _integer(value, label=label)
+
+
+def _nullable_boolean(value: object, *, label: str) -> bool | None:
+    if value is None or isinstance(value, bool):
+        return value
+    raise ValueError(f"phase trace {label} is invalid")
 
 
 def _text(value: object, *, label: str) -> str:
@@ -199,6 +225,11 @@ def parse_phase_trace_line(line: str) -> MineruPhaseEvent:
     max_resident_pages = _integer(
         payload.get("max_resident_pages"), label="max_resident_pages", minimum=1
     )
+    max_resident_windows = _integer(
+        payload.get("max_resident_windows"),
+        label="max_resident_windows",
+        minimum=1,
+    )
     max_resident_decoded_bytes = _integer(
         payload.get("max_resident_decoded_bytes"),
         label="max_resident_decoded_bytes",
@@ -214,6 +245,58 @@ def parse_phase_trace_line(line: str) -> MineruPhaseEvent:
     )
     if vllm_max_num_seqs < inner_inference_concurrency:
         raise ValueError("phase trace VLM capacity is invalid")
+    ratio_requested = _nullable_integer(
+        payload.get("hybrid_batch_ratio_requested"),
+        label="hybrid_batch_ratio_requested",
+    )
+    ratio_effective = _nullable_integer(
+        payload.get("hybrid_batch_ratio_effective"),
+        label="hybrid_batch_ratio_effective",
+    )
+    ratio_ocr_override = _nullable_boolean(
+        payload.get("hybrid_batch_ratio_ocr_override"),
+        label="hybrid_batch_ratio_ocr_override",
+    )
+    layout_cap = _nullable_integer(
+        payload.get("hybrid_layout_batch_cap"),
+        label="hybrid_layout_batch_cap",
+    )
+    mfr_cap = _nullable_integer(
+        payload.get("hybrid_mfr_batch_cap"),
+        label="hybrid_mfr_batch_cap",
+    )
+    ocr_cap = _nullable_integer(
+        payload.get("hybrid_ocr_det_batch_cap"),
+        label="hybrid_ocr_det_batch_cap",
+    )
+    orientation_cap = _nullable_integer(
+        payload.get("hybrid_table_orientation_batch_cap"),
+        label="hybrid_table_orientation_batch_cap",
+    )
+    ratio_fields = (
+        ratio_requested,
+        ratio_effective,
+        ratio_ocr_override,
+        layout_cap,
+        mfr_cap,
+        ocr_cap,
+        orientation_cap,
+    )
+    if backend == "hybrid":
+        if (
+            ratio_requested not in {1, 2, 4, 8}
+            or ratio_effective not in {1, 2, 4, 8}
+            or not isinstance(ratio_ocr_override, bool)
+            or layout_cap != min(8, ratio_effective)
+            or mfr_cap != ratio_effective * 16
+            or ocr_cap != ratio_effective * 8
+            or orientation_cap != ocr_cap
+            or (ratio_ocr_override and ratio_effective != 1)
+            or (not ratio_ocr_override and ratio_effective != ratio_requested)
+        ):
+            raise ValueError("phase trace hybrid batch ratio drifted")
+    elif any(value is not None for value in ratio_fields):
+        raise ValueError("VLM phase trace unexpectedly has hybrid batch fields")
     append_index = _nullable_integer(payload.get("append_index"), label="append_index")
     window_index = _nullable_integer(payload.get("window_index"), label="window_index")
     page_start = _nullable_integer(payload.get("page_start"), label="page_start")
@@ -229,6 +312,9 @@ def parse_phase_trace_line(line: str) -> MineruPhaseEvent:
     reserved_decoded_bytes = _nullable_integer(
         payload.get("reserved_decoded_bytes"), label="reserved_decoded_bytes"
     )
+    reserved_windows = _nullable_integer(
+        payload.get("reserved_windows"), label="reserved_windows"
+    )
     resident_decoded_bytes_after_acquire = _nullable_integer(
         payload.get("resident_decoded_bytes_after_acquire"),
         label="resident_decoded_bytes_after_acquire",
@@ -236,6 +322,10 @@ def parse_phase_trace_line(line: str) -> MineruPhaseEvent:
     resident_pages_after_acquire = _nullable_integer(
         payload.get("resident_pages_after_acquire"),
         label="resident_pages_after_acquire",
+    )
+    resident_windows_after_acquire = _nullable_integer(
+        payload.get("resident_windows_after_acquire"),
+        label="resident_windows_after_acquire",
     )
     window_values = (
         window_index,
@@ -298,20 +388,30 @@ def parse_phase_trace_line(line: str) -> MineruPhaseEvent:
     credit_values = (
         actual_decoded_bytes,
         reserved_decoded_bytes,
+        reserved_windows,
         resident_decoded_bytes_after_acquire,
         resident_pages_after_acquire,
+        resident_windows_after_acquire,
     )
     all_credit_null = all(value is None for value in credit_values)
     all_credit_present = all(value is not None for value in credit_values)
     if not (all_credit_null or all_credit_present):
         raise ValueError("phase trace credit fields are partially null")
     if pipeline_mode == "legacy":
-        if pipeline_depth != 0 or max_resident_pages != window_size:
+        if (
+            pipeline_depth != 0
+            or max_resident_pages != window_size
+            or max_resident_windows != 1
+        ):
             raise ValueError("phase trace legacy profile is invalid")
         if not all_credit_null:
             raise ValueError("phase trace legacy event unexpectedly owns credits")
     else:
-        if pipeline_depth != 1 or max_resident_pages < window_size * 2:
+        if (
+            pipeline_depth != 1
+            or max_resident_pages < window_size * 2
+            or max_resident_windows != pipeline_depth + 1
+        ):
             raise ValueError("phase trace depth-one profile is invalid")
         candidate_window_event = event == "interval_complete" and has_window
         unacquired_credit_error = (
@@ -328,10 +428,14 @@ def parse_phase_trace_line(line: str) -> MineruPhaseEvent:
             assert reserved_decoded_bytes is not None
             assert resident_decoded_bytes_after_acquire is not None
             assert resident_pages_after_acquire is not None
+            assert reserved_windows is not None
+            assert resident_windows_after_acquire is not None
             if (
                 actual_decoded_bytes > reserved_decoded_bytes
                 or reserved_decoded_bytes > max_resident_decoded_bytes
                 or resident_pages_after_acquire > max_resident_pages
+                or reserved_windows != 1
+                or resident_windows_after_acquire > max_resident_windows
                 or resident_decoded_bytes_after_acquire
                 > max_resident_decoded_bytes
                 or (
@@ -348,9 +452,17 @@ def parse_phase_trace_line(line: str) -> MineruPhaseEvent:
         duration_ns=duration_ns,
         ended_monotonic_ns=ended_monotonic_ns,
         event=event,
+        hybrid_batch_ratio_effective=ratio_effective,
+        hybrid_batch_ratio_ocr_override=ratio_ocr_override,
+        hybrid_batch_ratio_requested=ratio_requested,
+        hybrid_layout_batch_cap=layout_cap,
+        hybrid_mfr_batch_cap=mfr_cap,
+        hybrid_ocr_det_batch_cap=ocr_cap,
+        hybrid_table_orientation_batch_cap=orientation_cap,
         inner_inference_concurrency=inner_inference_concurrency,
         max_resident_decoded_bytes=max_resident_decoded_bytes,
         max_resident_pages=max_resident_pages,
+        max_resident_windows=max_resident_windows,
         outcome=outcome,
         page_count=page_count,
         page_end_exclusive=page_end_exclusive,
@@ -362,8 +474,10 @@ def parse_phase_trace_line(line: str) -> MineruPhaseEvent:
         profile_id=profile_id,
         profile_sha256=profile_sha256,
         reserved_decoded_bytes=reserved_decoded_bytes,
+        reserved_windows=reserved_windows,
         resident_decoded_bytes_after_acquire=resident_decoded_bytes_after_acquire,
         resident_pages_after_acquire=resident_pages_after_acquire,
+        resident_windows_after_acquire=resident_windows_after_acquire,
         sequence=sequence,
         started_monotonic_ns=started_monotonic_ns,
         source_pdf_bytes=source_pdf_bytes,
@@ -421,9 +535,17 @@ def validate_complete_phase_trace(
         first.window_size,
         first.total_windows,
         first.max_resident_pages,
+        first.max_resident_windows,
         first.max_resident_decoded_bytes,
         first.inner_inference_concurrency,
         first.vllm_max_num_seqs,
+        first.hybrid_batch_ratio_requested,
+        first.hybrid_batch_ratio_effective,
+        first.hybrid_batch_ratio_ocr_override,
+        first.hybrid_layout_batch_cap,
+        first.hybrid_mfr_batch_cap,
+        first.hybrid_ocr_det_batch_cap,
+        first.hybrid_table_orientation_batch_cap,
     )
     if any(
         (
@@ -439,9 +561,17 @@ def validate_complete_phase_trace(
             event.window_size,
             event.total_windows,
             event.max_resident_pages,
+            event.max_resident_windows,
             event.max_resident_decoded_bytes,
             event.inner_inference_concurrency,
             event.vllm_max_num_seqs,
+            event.hybrid_batch_ratio_requested,
+            event.hybrid_batch_ratio_effective,
+            event.hybrid_batch_ratio_ocr_override,
+            event.hybrid_layout_batch_cap,
+            event.hybrid_mfr_batch_cap,
+            event.hybrid_ocr_det_batch_cap,
+            event.hybrid_table_orientation_batch_cap,
         )
         != identity
         for event in ordered

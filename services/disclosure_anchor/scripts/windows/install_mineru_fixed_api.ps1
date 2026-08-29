@@ -187,10 +187,10 @@ function Invoke-Docker {
 # END MINERU NATIVE PROCESS V1
 
 $ProjectName = "mineru-tailnet"
-$ApiCompatImage = "agent-invest/mineru-api:3.4.4-capacity-v1"
+$ApiCompatImage = "agent-invest/mineru-api:3.4.4-capacity-v2"
 $ApiCompatBuildTag = "agent-invest/mineru-api:build-$([Guid]::NewGuid().ToString('N'))"
 $HeapReturnPolicy = "glibc-malloc-trim-per-window.v1"
-$CapacityPolicy = "bounded-two-window-capacity-pipeline.v2"
+$CapacityPolicy = "process-global-mineru-coordinator.v3"
 $RequiredComposeTarget = "C:\ProgramData\compose.tailnet.yaml"
 $RequiredCollectorTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\collect_mineru_runtime.ps1"
 $RequiredReceiptTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\install-receipt.json"

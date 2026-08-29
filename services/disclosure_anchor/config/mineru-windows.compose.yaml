@@ -49,7 +49,7 @@ services:
       - inference
 
   mineru-api:
-    image: agent-invest/mineru-api:3.4.4-capacity-v1
+    image: agent-invest/mineru-api:3.4.4-capacity-v2
     pull_policy: never
     container_name: mineru-api
     restart: always
@@ -61,6 +61,12 @@ services:
       # Content-free timing is enabled only for controlled capacity trials;
       # the normal runtime stays off and its effective value is attested.
       MINERU_PHASE_TRACE: "0"
+      # The C/S API cannot infer this from the remote GPU. Keep the process
+      # value explicit, closed and identity-bound; OCR documents resolve to 1.
+      MINERU_HYBRID_BATCH_RATIO: "1"
+      # Shared pipeline model objects are process-scoped. Their native locks
+      # remain enabled even while the externally admitted task slot stays 1.
+      MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS: "1"
       # Only an operator may switch this immutable per-process value to auto,
       # after commissioning, a new attestation and fallback/cancellation smoke.
       # A running document never changes its active window or residency plan.

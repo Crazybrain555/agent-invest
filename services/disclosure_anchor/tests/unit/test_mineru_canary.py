@@ -55,7 +55,7 @@ def _manifest(*, duplicate_max_num_seqs: bool = False) -> dict[str, object]:
         command.extend(["--max-num-seqs", "4096"])
     command.extend(["--mm-processor-cache-gb", "0"])
     return {
-        "contract_version": "mineru-runtime-bundle.v6",
+        "contract_version": "mineru-runtime-bundle.v7",
         "client": {
             "package_set_sha256": _LOCAL_DIGEST,
             "writer_code_sha256": _CODE_DIGEST,
@@ -75,6 +75,8 @@ def _manifest(*, duplicate_max_num_seqs: bool = False) -> dict[str, object]:
             "api_protocol_version": 2,
             "max_concurrent_requests": 3,
             "inference_max_concurrency": 7,
+            "hybrid_batch_ratio": 1,
+            "pipeline_inference_locks": True,
             "processing_window_size": 16,
             "task_retention_seconds": 600,
             "task_cleanup_interval_seconds": 30,

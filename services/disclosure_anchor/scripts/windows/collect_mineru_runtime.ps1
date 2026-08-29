@@ -521,7 +521,7 @@ print(json.dumps({
         }
         $event = $line.Substring("MINERU_PHASE_TRACE ".Length) | ConvertFrom-Json
         if (
-            [string]$event.schema -ne "mineru-phase-trace.v2" -or
+            [string]$event.schema -ne "mineru-phase-trace.v3" -or
             [string]$event.profile_sha256 -ne $ExpectedProfileSha256
         ) {
             throw "phase-trace event identity drifted"
@@ -598,6 +598,7 @@ $apiAllowedEnvironment = @(
     "MINERU_CAPACITY_CATALOG_PATH", "MINERU_CAPACITY_CATALOG_SHA256",
     "MINERU_CAPACITY_MODE", "MINERU_CAPACITY_PROFILE_JSON",
     "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256", "MINERU_MALLOC_TRIM",
+    "MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS", "MINERU_HYBRID_BATCH_RATIO",
     "MINERU_MODEL_SOURCE", "MINERU_PHASE_TRACE", "MINERU_PROCESSING_WINDOW_SIZE"
 )
 $vllmAllowedEnvironment = @("MINERU_MODEL_SOURCE")
@@ -623,11 +624,15 @@ from mineru.utils.model_utils import (
     is_heap_trim_enabled,
     is_phase_trace_enabled,
 )
+from mineru.backend.pipeline.model_init import PIPELINE_INFERENCE_LOCKS_ENABLED
 
 paths = (
     "mineru/backend/vlm/vlm_analyze.py",
     "mineru/backend/hybrid/hybrid_analyze.py",
+    "mineru/cli/fast_api.py",
     "mineru/utils/model_utils.py",
+    "mineru_vl_utils/post_process/cross_page_table.py",
+    "mineru_vl_utils/vlm_client/http_client.py",
 )
 root = Path("/usr/local/lib/python3.12/dist-packages")
 marker = json.loads(
@@ -645,7 +650,10 @@ print(json.dumps({
         int(os.environ["MINERU_PROCESSING_WINDOW_SIZE"])
     ),
     "phase_trace_enabled": is_phase_trace_enabled(),
+    "hybrid_batch_ratio_requested": int(os.environ["MINERU_HYBRID_BATCH_RATIO"]),
+    "pipeline_inference_locks_enabled": PIPELINE_INFERENCE_LOCKS_ENABLED,
     "mineru_version": importlib.metadata.version("mineru"),
+    "mineru_vl_utils_version": importlib.metadata.version("mineru-vl-utils"),
 }, sort_keys=True, separators=(",", ":")))
 '@
 $compatProbeResult = Invoke-DockerProcess -Arguments @(
@@ -660,6 +668,9 @@ if ($compatProbeOutput.Count -ne 1) {
 $compatProbe = ([string]$compatProbeOutput[0]) | ConvertFrom-Json
 if ([string]$compatProbe.mineru_version -ne "3.4.4") {
     throw "live MinerU API version drifted"
+}
+if ([string]$compatProbe.mineru_vl_utils_version -ne "1.0.5") {
+    throw "live mineru-vl-utils version drifted"
 }
 $compatLabelNames = @(
     "io.agent-invest.mineru.base-image-digest",

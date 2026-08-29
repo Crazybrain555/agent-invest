@@ -1,4 +1,4 @@
-"""Closed MinerU runtime-bundle v6 identity regressions."""
+"""Closed MinerU runtime-bundle v7 identity regressions."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_TRANSPORT_PROFILE,
     MINERU_CONTENT_PACKAGE_VERSIONS,
     MINERU_HEAP_RETURN_POLICY,
+    MINERU_HYBRID_BATCH_RATIO,
+    MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED,
     MINERU_PROCESSING_WINDOW_SIZE,
     MINERU_WINDOWS_COLLECTOR_PATH,
     MINERU_WINDOWS_COMPOSE_PATH,
@@ -69,6 +71,8 @@ def _manifest() -> dict[str, object]:
             "api_protocol_version": MINERU_API_PROTOCOL_VERSION,
             "max_concurrent_requests": MINERU_API_DEFAULT_TASK_SLOTS,
             "inference_max_concurrency": MINERU_API_INFERENCE_MAX_CONCURRENCY,
+            "hybrid_batch_ratio": MINERU_HYBRID_BATCH_RATIO,
+            "pipeline_inference_locks": MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED,
             "processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
             "task_retention_seconds": 600,
             "task_cleanup_interval_seconds": 30,

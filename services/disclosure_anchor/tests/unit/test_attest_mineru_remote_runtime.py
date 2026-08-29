@@ -1,4 +1,4 @@
-"""Remote MinerU v6 attestation unit tests; no SSH/GPU access."""
+"""Remote MinerU v7 attestation unit tests; no SSH/GPU access."""
 
 from __future__ import annotations
 
@@ -71,6 +71,8 @@ def _observation() -> dict[str, Any]:
         "MINERU_MODEL_SOURCE=local",
         "MINERU_MALLOC_TRIM=1",
         "MINERU_PHASE_TRACE=0",
+        "MINERU_HYBRID_BATCH_RATIO=1",
+        "MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS=1",
         "MINERU_API_MAX_CONCURRENT_REQUESTS=1",
         "MINERU_PROCESSING_WINDOW_SIZE=16",
         "MINERU_API_OUTPUT_ROOT=/var/lib/mineru-api-output",
@@ -133,10 +135,11 @@ def _observation() -> dict[str, Any]:
         },
         "api_compatibility": {
             "marker": {
-                "schema": "mineru-runtime-compatibility.v2",
+                "schema": "mineru-runtime-compatibility.v3",
                 "policy": "glibc-malloc-trim-per-window.v1",
-                "capacity_policy": "bounded-two-window-capacity-pipeline.v2",
+                "capacity_policy": "process-global-mineru-coordinator.v3",
                 "mineru_version": "3.4.4",
+                "mineru_vl_utils_version": "1.0.5",
                 "base_image_digest": EXPECTED_IMAGE_ID,
                 "patcher_sha256": PATCHER_DIGEST,
                 "preimage_sha256": EXPECTED_COMPAT_PREIMAGES,
@@ -144,7 +147,7 @@ def _observation() -> dict[str, Any]:
                     path: "sha256:" + character * 64
                     for path, character in zip(
                         EXPECTED_COMPAT_PREIMAGES,
-                        ("b", "c", "d"),
+                        ("b", "c", "d", "e", "f", "1"),
                         strict=True,
                     )
                 },
@@ -154,16 +157,18 @@ def _observation() -> dict[str, Any]:
                 path: "sha256:" + character * 64
                 for path, character in zip(
                     EXPECTED_COMPAT_PREIMAGES,
-                    ("b", "c", "d"),
+                    ("b", "c", "d", "e", "f", "1"),
                     strict=True,
                 )
             },
             "heap_trim_enabled": True,
             "phase_trace_enabled": False,
+            "hybrid_batch_ratio_requested": 1,
+            "pipeline_inference_locks_enabled": True,
             "image_labels": {
                 "io.agent-invest.mineru.base-image-digest": EXPECTED_IMAGE_ID,
                 "io.agent-invest.mineru.capacity-policy": (
-                    "bounded-two-window-capacity-pipeline.v2"
+                    "process-global-mineru-coordinator.v3"
                 ),
                 "io.agent-invest.mineru.compatibility-policy": (
                     "glibc-malloc-trim-per-window.v1"
