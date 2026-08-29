@@ -321,10 +321,12 @@ maintenance thread                 report writer thread
 Pinned MinerU 3.4.4 的 `/tasks` staged HTTP 机制实现在
 `adapters/parsers/mineru_medium/http_staged.py`：提交、terminal 轮询、同源 result 和本地安全 ZIP
 materialize 是分开的，客户端显式 `trust_env=False`，durable resume token 不进入 `repr`。Exact
-FastAPI 每次 result GET 都重建临时 ZIP，FileResponse ETag 不是不可变版本；所以当前安全 fallback
-必须在 terminal stage 完整 spool 一次并绑定 bytes+SHA-256，remote credit 只能在 spool 完成后归还。
-未来若 Windows exact-source patch 在 completed 边界生成 retained immutable ZIP 并把 owner/bytes/SHA-256
-加入 status contract，才可把 remote credit 提前到纯 terminal 边界。它仍是 default-off capability：
+FastAPI 原版每次 result GET 都重建临时 ZIP，FileResponse ETag 不是不可变版本。Windows exact-source
+compatibility v5 因此在 completed 前只生成一次 task-owned retained ZIP，把 owner/bytes/SHA-256 加入
+`mineru-retained-result.v1` status contract，result endpoint 在 retention 内只 serve 同一文件；expiry、
+shutdown 和失败路径清理它。Mac adapter 看到该 capability 时在纯 terminal 边界归还 remote credit，
+materialize 下载后重算 bytes/SHA-256；旧 API 缺少 capability 时仍使用 terminal-stage spool fallback。
+它仍是 default-off capability：
 现有 `ParseDocument.execute()` 用一个 producer lease 包围
 prepare、同步 parser、本地原子写和 finish-run，而 stale-run reclaim 会直接终结遗留 `running`
 记录。在加入私有 durable checkpoint 路径、reclaim-before-resume 顺序和重新取得 lease 后的
