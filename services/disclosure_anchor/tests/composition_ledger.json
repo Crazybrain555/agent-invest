@@ -58,7 +58,7 @@
   },
   "tests/integration/test_remote_parse_checkpoint.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 10
   },
   "tests/integration/test_repository_uow.py": {
    "private_imports": [],
@@ -280,7 +280,7 @@
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
-   "tests": 22
+   "tests": 23
   },
   "tests/unit/test_mineru_canary.py": {
    "private_imports": [],
@@ -388,7 +388,7 @@
   },
   "tests/unit/test_remote_parse_checkpoint.py": {
    "private_imports": [],
-   "tests": 3
+   "tests": 4
   },
   "tests/unit/test_retrieval_primary.py": {
    "private_imports": [],

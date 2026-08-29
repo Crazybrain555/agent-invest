@@ -111,9 +111,13 @@ class ProcessingRunRepository(Protocol):
 class RemoteParseAttemptRepository(Protocol):
     def add(self, attempt: RemoteParseAttempt) -> RemoteParseAttempt: ...
     def get(self, attempt_id: str) -> Optional[RemoteParseAttempt]: ...
+    def checkpoint_submitted(
+        self, *, attempt_id: str, fence_identity: str, expected_version: int,
+        remote_task_identity: str,
+    ) -> RemoteParseAttempt: ...
     def transition(
         self, *, attempt_id: str, fence_identity: str, expected_state: str,
-        expected_version: int, next_state: str, remote_task_identity: str | None = None,
+        expected_version: int, next_state: str,
     ) -> RemoteParseAttempt: ...
     def checkpoint_terminal(
         self, *, attempt_id: str, fence_identity: str, expected_version: int,

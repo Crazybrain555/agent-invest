@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import replace
 import unittest
+from dataclasses import replace
 
 from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
+    EncodedTerminalReceipt,
     RemoteParseResumeSecret,
     TerminalReceipt,
     decode_terminal_receipt,
     encode_terminal_receipt,
 )
-
 
 SHA_A = "sha256:" + "a" * 64
 SHA_B = "sha256:" + "b" * 64
@@ -53,6 +53,20 @@ class RemoteParseCheckpointContractTests(unittest.TestCase):
             decode_terminal_receipt(encoded.replace(b'"artifact_byte_count":123', b'"artifact_byte_count":NaN'))
         with self.assertRaisesRegex(ValueError, "canonical artifact SHA"):
             replace(_receipt(), artifact_sha256="sha256:BAD")
+
+    def test_encoded_receipt_cannot_be_forged_from_inconsistent_fields(self) -> None:
+        encoded = encode_terminal_receipt(_receipt())
+        with self.assertRaisesRegex(ValueError, "SHA differs"):
+            replace(encoded, sha256=SHA_A)
+        with self.assertRaisesRegex(ValueError, "byte count differs"):
+            replace(encoded, byte_count=encoded.byte_count + 1)
+        with self.assertRaisesRegex(ValueError, "projection differs"):
+            EncodedTerminalReceipt(
+                receipt=replace(_receipt(), artifact_owner_identity="other"),
+                exact_bytes=encoded.exact_bytes,
+                sha256=encoded.sha256,
+                byte_count=encoded.byte_count,
+            )
 
     def test_secret_repr_omits_bytes_and_identity_is_exact(self) -> None:
         token = b"opaque-private-resume-token"

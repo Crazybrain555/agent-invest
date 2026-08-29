@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import importlib
-from pathlib import Path
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from disclosure_anchor.adapters.db.postgres.migration_state import (
@@ -28,11 +28,12 @@ class MigrationStateTests(unittest.TestCase):
         self.assertEqual(len(heads), 1)
         self.assertEqual(single_migration_head(), heads[0])
 
+    def test_0053_is_adjacent_to_0052(self) -> None:
         migration = importlib.import_module(
             "disclosure_anchor.adapters.db.postgres.migrations.versions."
             "0053_remote_parse_checkpoint"
         )
-        self.assertEqual(heads[0], migration.revision)
+        self.assertEqual(migration.revision, "0053_remote_parse_checkpoint")
         self.assertEqual(
             migration.down_revision,
             "0052_publish_kpi_indexes",

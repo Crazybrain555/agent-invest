@@ -29,7 +29,6 @@ NONFINAL_STATES = frozenset(
 FINAL_STATES = frozenset({"acked", "remote_failed", "local_failed", "superseded"})
 ALLOWED_TRANSITIONS = frozenset(
     {
-        ("prepared", "submitted"),
         ("prepared", "remote_failed"),
         ("prepared", "superseded"),
         ("submitted", "remote_failed"),
@@ -101,6 +100,19 @@ class EncodedTerminalReceipt:
     sha256: str
     byte_count: int
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.exact_bytes, bytes):
+            raise ValueError("terminal receipt exact bytes must be bytes")
+        if not self.exact_bytes or len(self.exact_bytes) > 65536:
+            raise ValueError("terminal receipt bytes are outside the closed envelope")
+        if isinstance(self.byte_count, bool) or self.byte_count != len(self.exact_bytes):
+            raise ValueError("terminal receipt byte count differs from exact bytes")
+        expected_sha = "sha256:" + hashlib.sha256(self.exact_bytes).hexdigest()
+        if self.sha256 != expected_sha:
+            raise ValueError("terminal receipt SHA differs from exact bytes")
+        if self.exact_bytes != _canonical_terminal_receipt_bytes(self.receipt):
+            raise ValueError("terminal receipt projection differs from exact bytes")
+
 
 @dataclass(frozen=True, slots=True)
 class RemoteParseAttempt:
@@ -167,7 +179,7 @@ class RemoteParseResumeSecret:
             raise ValueError("resume token identity differs from exact bytes")
 
 
-def encode_terminal_receipt(receipt: TerminalReceipt) -> EncodedTerminalReceipt:
+def _canonical_terminal_receipt_bytes(receipt: TerminalReceipt) -> bytes:
     payload = {
         "schema": "remote_parse_terminal_receipt.v1",
         "attempt_identity": receipt.attempt_identity,
@@ -178,9 +190,13 @@ def encode_terminal_receipt(receipt: TerminalReceipt) -> EncodedTerminalReceipt:
         "artifact_sha256": receipt.artifact_sha256,
         "resume_token_sha256": receipt.resume_token_sha256,
     }
-    exact = json.dumps(
+    return json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
+
+
+def encode_terminal_receipt(receipt: TerminalReceipt) -> EncodedTerminalReceipt:
+    exact = _canonical_terminal_receipt_bytes(receipt)
     return EncodedTerminalReceipt(
         receipt=receipt,
         exact_bytes=exact,
