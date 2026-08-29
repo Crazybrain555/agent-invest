@@ -56,6 +56,10 @@
    "private_imports": [],
    "tests": 13
   },
+  "tests/integration/test_remote_parse_checkpoint.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/integration/test_repository_uow.py": {
    "private_imports": [],
    "tests": 4
@@ -381,6 +385,10 @@
   "tests/unit/test_register_document.py": {
    "private_imports": [],
    "tests": 11
+  },
+  "tests/unit/test_remote_parse_checkpoint.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/unit/test_retrieval_primary.py": {
    "private_imports": [],

@@ -18,8 +18,10 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -34,6 +36,66 @@ from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA, OPS_SCHEM
 
 class Base(DeclarativeBase):
     pass
+
+
+class RemoteParseAttempt(Base):
+    __tablename__ = "remote_parse_attempt"
+    __table_args__ = (
+        CheckConstraint("attempt_generation >= 1 AND row_version >= 0", name="ck_remote_parse_attempt_versions"),
+        CheckConstraint("source_pdf_sha256 ~ '^sha256:[0-9a-f]{64}$' AND parser_target_sha256 ~ '^sha256:[0-9a-f]{64}$' AND request_sha256 ~ '^sha256:[0-9a-f]{64}$' AND runtime_epoch_sha256 ~ '^sha256:[0-9a-f]{64}$'", name="ck_remote_parse_attempt_hashes"),
+        CheckConstraint("state IN ('prepared','submitted','remote_terminal','materializing','local_materialized','finish_committed','acked','remote_failed','local_failed','superseded')", name="ck_remote_parse_attempt_state"),
+        CheckConstraint("(state IN ('remote_terminal','materializing','local_materialized','finish_committed','acked') AND remote_task_identity IS NOT NULL AND terminal_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND terminal_receipt_bytes IS NOT NULL AND terminal_receipt_byte_count = octet_length(terminal_receipt_bytes) AND terminal_receipt_byte_count > 0 AND result_owner_identity IS NOT NULL AND result_artifact_sha256 ~ '^sha256:[0-9a-f]{64}$' AND result_artifact_bytes > 0) OR (state NOT IN ('remote_terminal','materializing','local_materialized','finish_committed','acked') AND terminal_receipt_sha256 IS NULL AND terminal_receipt_bytes IS NULL AND terminal_receipt_byte_count IS NULL AND result_owner_identity IS NULL AND result_artifact_sha256 IS NULL AND result_artifact_bytes IS NULL)", name="ck_remote_parse_attempt_terminal_shape"),
+        ForeignKeyConstraint(
+            ["processing_run_id", "document_id", "source_pdf_sha256"],
+            [
+                f"{CORE_SCHEMA}.processing_run.processing_run_id",
+                f"{CORE_SCHEMA}.processing_run.document_id",
+                f"{CORE_SCHEMA}.processing_run.input_raw_file_hash",
+            ],
+            name="fk_remote_parse_attempt_run_owner",
+            ondelete="CASCADE",
+        ),
+        Index("uq_remote_parse_attempt_current_document", "document_id", unique=True, postgresql_where=text("is_current")),
+        Index("ix_remote_parse_attempt_recovery", "state", "updated_at", "attempt_id"),
+        {"schema": OPS_SCHEMA},
+    )
+    attempt_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    processing_run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    document_id: Mapped[str] = mapped_column(ForeignKey(f"{CORE_SCHEMA}.document.document_id", ondelete="CASCADE"), nullable=False)
+    attempt_generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    fence_identity: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_pdf_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    parser_target_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    request_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    runtime_epoch_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    client_submit_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    row_version: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    remote_task_identity: Mapped[Optional[str]] = mapped_column(String(1024))
+    terminal_receipt_sha256: Mapped[Optional[str]] = mapped_column(String(71))
+    terminal_receipt_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary)
+    terminal_receipt_byte_count: Mapped[Optional[int]] = mapped_column(Integer)
+    result_owner_identity: Mapped[Optional[str]] = mapped_column(String(1024))
+    result_artifact_sha256: Mapped[Optional[str]] = mapped_column(String(71))
+    result_artifact_bytes: Mapped[Optional[int]] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class RemoteParseResumeSecret(Base):
+    __tablename__ = "remote_parse_resume_secret"
+    __table_args__ = (
+        CheckConstraint("secret_kind IN ('submission','terminal','ack')", name="ck_remote_parse_resume_secret_kind"),
+        CheckConstraint("token_sha256 ~ '^sha256:[0-9a-f]{64}$' AND token_byte_count = octet_length(token_bytes) AND token_byte_count BETWEEN 1 AND 65536", name="ck_remote_parse_resume_secret_identity"),
+        {"schema": OPS_SCHEMA},
+    )
+    attempt_id: Mapped[str] = mapped_column(ForeignKey(f"{OPS_SCHEMA}.remote_parse_attempt.attempt_id", ondelete="CASCADE"), primary_key=True)
+    secret_kind: Mapped[str] = mapped_column(String(16), primary_key=True)
+    token_bytes: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    token_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    token_byte_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class Company(Base):
@@ -356,6 +418,12 @@ class Document(Base):
 class ProcessingRun(Base):
     __tablename__ = "processing_run"
     __table_args__ = (
+        UniqueConstraint(
+            "processing_run_id",
+            "document_id",
+            "input_raw_file_hash",
+            name="uq_processing_run_remote_attempt_owner",
+        ),
         CheckConstraint(
             "unit_build_status IN ('not_started','running','succeeded','failed')",
             name="ck_processing_run_unit_build_status",

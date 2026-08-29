@@ -10,6 +10,12 @@ from collections.abc import Sequence
 
 from typing import Optional, Protocol
 
+from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
+    EncodedTerminalReceipt,
+    RemoteParseAttempt,
+    RemoteParseResumeSecret,
+)
+
 from disclosure_anchor.domain.entities import (
     Company,
     CompanyIdentifier,
@@ -100,6 +106,23 @@ class ProcessingRunRepository(Protocol):
         self, document_id: str
     ) -> Optional[ProcessingRun]: ...
     def update(self, run: ProcessingRun) -> ProcessingRun: ...
+
+
+class RemoteParseAttemptRepository(Protocol):
+    def add(self, attempt: RemoteParseAttempt) -> RemoteParseAttempt: ...
+    def get(self, attempt_id: str) -> Optional[RemoteParseAttempt]: ...
+    def transition(
+        self, *, attempt_id: str, fence_identity: str, expected_state: str,
+        expected_version: int, next_state: str, remote_task_identity: str | None = None,
+    ) -> RemoteParseAttempt: ...
+    def checkpoint_terminal(
+        self, *, attempt_id: str, fence_identity: str, expected_version: int,
+        remote_task_identity: str, receipt: EncodedTerminalReceipt,
+    ) -> RemoteParseAttempt: ...
+    def put_secret(self, secret: RemoteParseResumeSecret) -> None: ...
+    def get_secret(
+        self, attempt_id: str, secret_kind: str
+    ) -> Optional[RemoteParseResumeSecret]: ...
 
 
 class DocumentUnitRepository(Protocol):

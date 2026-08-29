@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+import hashlib
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+
+from disclosure_anchor.adapters.db.postgres.schema import (
+    APP_ROLE,
+    FUTURE_L2_READER_ROLE,
+    READER_ROLE,
+)
+from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
+from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
+    RemoteParseAttempt,
+    RemoteParseCheckpointConflict,
+    RemoteParseResumeSecret,
+    TerminalReceipt,
+    encode_terminal_receipt,
+)
+from disclosure_anchor.domain import ids
+from tests.integration._support import engine_or_skip
+
+
+def _sha(char: str) -> str:
+    return "sha256:" + char * 64
+
+
+class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = engine_or_skip()
+        self.document_id = ids.new_document_id()
+        self.run_id = ids.new_processing_run_id()
+        self.attempt_id = "rpa_" + ids.new_ulid()
+        with self.engine.begin() as conn:
+            conn.execute(text("INSERT INTO disclosure_core.document (document_id,status) VALUES (:d,'registered')"), {"d": self.document_id})
+            conn.execute(text("INSERT INTO disclosure_core.processing_run (processing_run_id,document_id,artifact_owner_processing_run_id,run_kind,status,input_raw_file_hash,provider_document_relpath) VALUES (:r,:d,:r,'parse','running',:h,'derived/checkpoint/provider.json')"), {"r": self.run_id, "d": self.document_id, "h": _sha("a")})
+
+    def tearDown(self) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(text("DELETE FROM disclosure_core.processing_run WHERE processing_run_id=:r"), {"r": self.run_id})
+            conn.execute(text("DELETE FROM disclosure_core.document WHERE document_id=:d"), {"d": self.document_id})
+        self.engine.dispose()
+
+    def _attempt(self, *, attempt_id: str | None = None, fence: str = "fence-1") -> RemoteParseAttempt:
+        return RemoteParseAttempt(
+            attempt_id=attempt_id or self.attempt_id,
+            processing_run_id=self.run_id,
+            document_id=self.document_id,
+            attempt_generation=1,
+            fence_identity=fence,
+            source_pdf_sha256=_sha("a"),
+            parser_target_sha256=_sha("b"),
+            request_sha256=_sha("c"),
+            runtime_epoch_sha256=_sha("d"),
+            client_submit_key="submit-" + (attempt_id or self.attempt_id),
+        )
+
+    def _receipt(self, *, owner: str = "owner-1"):
+        return encode_terminal_receipt(TerminalReceipt(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            source_pdf_sha256=_sha("a"), artifact_owner_identity=owner,
+            artifact_byte_count=10, artifact_sha256=_sha("e"),
+            resume_token_sha256=_sha("f"),
+        ))
+
+    def test_cas_first_terminal_wins_idempotently_and_rejects_old_fence(self) -> None:
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            created = uow.remote_parse_attempts.add(self._attempt())
+            submitted = uow.remote_parse_attempts.transition(
+                attempt_id=created.attempt_id, fence_identity="fence-1",
+                expected_state="prepared", expected_version=0,
+                next_state="submitted", remote_task_identity="task-1",
+            )
+            uow.commit()
+        receipt = self._receipt()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            won = uow.remote_parse_attempts.checkpoint_terminal(
+                attempt_id=self.attempt_id, fence_identity="fence-1",
+                expected_version=submitted.row_version,
+                remote_task_identity="task-1", receipt=receipt,
+            )
+            uow.commit()
+        self.assertEqual(won.state, "remote_terminal")
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            replay = uow.remote_parse_attempts.checkpoint_terminal(
+                attempt_id=self.attempt_id, fence_identity="fence-1",
+                expected_version=submitted.row_version,
+                remote_task_identity="task-1", receipt=receipt,
+            )
+            self.assertEqual(replay.terminal_receipt_sha256, receipt.sha256)
+            with self.assertRaises(RemoteParseCheckpointConflict):
+                uow.remote_parse_attempts.checkpoint_terminal(
+                    attempt_id=self.attempt_id, fence_identity="fence-1",
+                    expected_version=submitted.row_version,
+                    remote_task_identity="task-1", receipt=self._receipt(owner="other"),
+                )
+            with self.assertRaises(RemoteParseCheckpointConflict):
+                uow.remote_parse_attempts.transition(
+                    attempt_id=self.attempt_id, fence_identity="old-fence",
+                    expected_state="remote_terminal", expected_version=won.row_version,
+                    next_state="materializing",
+                )
+
+    def test_concurrent_identical_terminal_checkpoint_has_one_state_and_no_conflict(self) -> None:
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            created = uow.remote_parse_attempts.add(self._attempt())
+            submitted = uow.remote_parse_attempts.transition(
+                attempt_id=created.attempt_id, fence_identity="fence-1",
+                expected_state="prepared", expected_version=0,
+                next_state="submitted", remote_task_identity="task-1",
+            )
+            uow.commit()
+        receipt = self._receipt()
+
+        def checkpoint() -> str:
+            with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+                result = uow.remote_parse_attempts.checkpoint_terminal(
+                    attempt_id=self.attempt_id, fence_identity="fence-1",
+                    expected_version=submitted.row_version,
+                    remote_task_identity="task-1", receipt=receipt,
+                )
+                uow.commit()
+                return result.terminal_receipt_sha256 or ""
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = tuple(pool.map(lambda _index: checkpoint(), range(2)))
+        self.assertEqual(results, (receipt.sha256, receipt.sha256))
+
+    def test_partial_unique_current_and_private_acl(self) -> None:
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            uow.remote_parse_attempts.add(self._attempt())
+            with self.assertRaises(IntegrityError):
+                uow.remote_parse_attempts.add(self._attempt(attempt_id="rpa_" + ids.new_ulid(), fence="fence-2"))
+        with self.engine.connect() as conn:
+            for role in (READER_ROLE, FUTURE_L2_READER_ROLE):
+                self.assertFalse(conn.execute(text("SELECT has_table_privilege(:r,'disclosure_ops.remote_parse_attempt','SELECT')"), {"r": role}).scalar_one())
+                self.assertFalse(conn.execute(text("SELECT has_table_privilege(:r,'disclosure_ops.remote_parse_resume_secret','SELECT')"), {"r": role}).scalar_one())
+            self.assertTrue(conn.execute(text("SELECT has_table_privilege(:r,'disclosure_ops.remote_parse_attempt','SELECT,INSERT,UPDATE,DELETE')"), {"r": APP_ROLE}).scalar_one())
+
+    def test_private_secret_is_exact_first_write_wins(self) -> None:
+        token = b"opaque-resume-token"
+        secret = RemoteParseResumeSecret(
+            attempt_id=self.attempt_id,
+            secret_kind="submission",
+            token_bytes=token,
+            token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+            token_byte_count=len(token),
+        )
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            uow.remote_parse_attempts.add(self._attempt())
+            uow.remote_parse_attempts.put_secret(secret)
+            uow.remote_parse_attempts.put_secret(secret)
+            loaded = uow.remote_parse_attempts.get_secret(
+                self.attempt_id, "submission"
+            )
+            self.assertEqual(loaded, secret)
+            other = b"conflicting-token"
+            with self.assertRaises(RemoteParseCheckpointConflict):
+                uow.remote_parse_attempts.put_secret(
+                    RemoteParseResumeSecret(
+                        attempt_id=self.attempt_id,
+                        secret_kind="submission",
+                        token_bytes=other,
+                        token_sha256="sha256:" + hashlib.sha256(other).hexdigest(),
+                        token_byte_count=len(other),
+                    )
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

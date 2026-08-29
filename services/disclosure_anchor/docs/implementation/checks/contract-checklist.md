@@ -243,6 +243,16 @@ at-least-once 投递 + 消费端幂等（重复投递不产生重复消费效果
 
 ## 6. 契约变更记录（append-only）
 
+2026-08-30（0053 私有 staged parse checkpoint）——不改变 public view/API/change feed：
+
+```text
+disclosure_ops.remote_parse_attempt 保存 processing-run 外部 attempt、fence/version CAS、canonical terminal
+receipt bytes/hash/length 与 result owner；每 document 最多一个 current non-final attempt。
+disclosure_ops.remote_parse_resume_secret 单独保存 opaque submission/terminal/ACK token exact bytes identity；
+reader/L2 无 schema/table 权限，token 不进公开契约、outbox、日志或 repr。
+同一 terminal receipt 重放幂等；不同 receipt、旧 fence/version 或非法 state transition fail closed。
+```
+
 2026-07-14（round23 上线加固）——公开读契约新增，随 `export_contracts` 重导：
 
 ```text

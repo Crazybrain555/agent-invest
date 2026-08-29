@@ -23,6 +23,7 @@ from disclosure_anchor.adapters.db.postgres.repositories import (
     DocumentUnitRepository,
     OutboxRepository,
     ProcessingRunRepository,
+    RemoteParseAttemptRepository,
     SecurityRepository,
     SourceAccessRepository,
     SourceCheckpointRepository,
@@ -44,6 +45,7 @@ class SqlAlchemyUnitOfWork:
     source_checkpoints: ports_repos.SourceCheckpointRepository
     documents: ports_repos.DocumentRepository
     processing_runs: ports_repos.ProcessingRunRepository
+    remote_parse_attempts: ports_repos.RemoteParseAttemptRepository
     document_units: ports_repos.DocumentUnitRepository
     outbox: ports_repos.OutboxRepository
 
@@ -124,6 +126,7 @@ class SqlAlchemyUnitOfWork:
         self.source_checkpoints = SourceCheckpointRepository(session)
         self.documents = DocumentRepository(session)
         self.processing_runs = ProcessingRunRepository(session)
+        self.remote_parse_attempts = RemoteParseAttemptRepository(session)
         self.document_units = DocumentUnitRepository(session)
         self.outbox = OutboxRepository(session)
 

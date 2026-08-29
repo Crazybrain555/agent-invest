@@ -16,6 +16,7 @@ from disclosure_anchor.application.ports.repositories import (
     DocumentUnitRepository,
     OutboxRepository,
     ProcessingRunRepository,
+    RemoteParseAttemptRepository,
     SecurityRepository,
     SourceAccessRepository,
     SourceCheckpointRepository,
@@ -33,6 +34,7 @@ class UnitOfWork(Protocol):
     source_checkpoints: SourceCheckpointRepository
     documents: DocumentRepository
     processing_runs: ProcessingRunRepository
+    remote_parse_attempts: RemoteParseAttemptRepository
     document_units: DocumentUnitRepository
     outbox: OutboxRepository
 
