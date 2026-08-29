@@ -34,6 +34,7 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
     PhaseClockBinding,
     PressureLine,
     PressureSample,
+    ProgressEvent,
     ProcessProfileLifecycle,
     ProcessProfileParameters,
     QueueVllmObservation,
@@ -453,7 +454,8 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
             observed_at_utc=START,
             monotonic_ns=10,
             blocked_reason="gpu_input_starved",
-            blocked_duration_ns=100,
+            blocked_interval_started_monotonic_ns=0,
+            blocked_duration_ns=10,
         )
         committed = DurablePageCommitEvent(
             run_id=RUN_ID,
@@ -575,12 +577,13 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
         wrong_clock_progress = BlockedProgressEvent(
             run_id=RUN_ID,
             sequence=0,
-            process_epoch_sha256=HASH,
+            process_epoch_sha256=HASH_C,
             process_profile_sha256=HASH_B,
             clock_domain_identity_sha256=HASH,
             observed_at_utc=START,
             monotonic_ns=1_000_000_000,
             blocked_reason="gpu_input_starved",
+            blocked_interval_started_monotonic_ns=999_999_900,
             blocked_duration_ns=100,
         )
         with self.assertRaisesRegex(ValueError, "progress and phase clocks"):
@@ -593,6 +596,172 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
                 telemetry_receipt_sha256=HASH_B,
                 phase_clock_binding=correct_binding,
             )
+        wrong_identity_progress = wrong_clock_progress.model_copy(
+            update={
+                "process_epoch_sha256": HASH,
+                "clock_domain_identity_sha256": HASH_C,
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "process/profile identity"):
+            summarize_synchronized_phase_capture(
+                capture,
+                telemetry_receipt=_receipt(),
+                telemetry_frames=_complete_frames(),
+                progress_events=(wrong_identity_progress,),
+                phase_capture_sha256=HASH,
+                telemetry_receipt_sha256=HASH_B,
+                phase_clock_binding=correct_binding,
+            )
+
+    def test_phase_summary_rejects_duplicate_or_unclosed_progress(self) -> None:
+        process_epoch = "d" * 32
+        event = MineruPhaseEvent(
+            append_index=None,
+            actual_decoded_bytes=None,
+            backend="hybrid",
+            duration_ns=1_500_000_000,
+            ended_monotonic_ns=1_750_000_000,
+            event="document_end",
+            inner_inference_concurrency=7,
+            max_resident_decoded_bytes=1,
+            max_resident_pages=16,
+            outcome="success",
+            page_count=1,
+            page_end_exclusive=None,
+            page_start=None,
+            phase="document",
+            pipeline_depth=0,
+            pipeline_mode="legacy",
+            process_epoch=process_epoch,
+            profile_id="legacy",
+            profile_sha256=HASH_B,
+            reserved_decoded_bytes=None,
+            resident_decoded_bytes_after_acquire=None,
+            resident_pages_after_acquire=None,
+            sequence=1,
+            started_monotonic_ns=250_000_000,
+            source_pdf_bytes=1,
+            total_windows=1,
+            trace_id="e" * 32,
+            window_index=None,
+            window_page_count=None,
+            window_size=16,
+            vllm_max_num_seqs=128,
+        )
+        capture = MineruPhaseTraceCapture(
+            active_profile_sha256=HASH_B,
+            capacity_mode="legacy",
+            collected_at_utc=START.isoformat(),
+            collector_path=r"C:\\collector.ps1",
+            collector_sha256=HASH,
+            container_id="f" * 64,
+            container_image="mineru-api",
+            container_image_id=HASH,
+            container_started_at_utc=START.isoformat(),
+            line_count=1,
+            lines_sha256=HASH,
+            since_utc=START.isoformat(),
+            trace_bytes=1,
+            until_utc=(START + timedelta(seconds=2)).isoformat(),
+            windows_node_identity_sha256=HASH,
+            events=(event,),
+        )
+        binding = PhaseClockBinding(
+            phase_process_epoch=process_epoch,
+            clock_domain_identity_sha256=HASH_C,
+            binding_artifact_sha256=HASH,
+        )
+
+        def summarize(progress_events: tuple[ProgressEvent, ...]) -> None:
+            summarize_synchronized_phase_capture(
+                capture,
+                telemetry_receipt=_receipt(),
+                telemetry_frames=_complete_frames(),
+                progress_events=progress_events,
+                phase_capture_sha256=HASH,
+                telemetry_receipt_sha256=HASH_B,
+                phase_clock_binding=binding,
+            )
+
+        def committed(
+            *, sequence: int, source: str, cumulative: int, monotonic_ns: int
+        ) -> DurablePageCommitEvent:
+            return DurablePageCommitEvent(
+                run_id=RUN_ID,
+                sequence=sequence,
+                process_epoch_sha256=HASH_C,
+                process_profile_sha256=HASH_B,
+                clock_domain_identity_sha256=HASH_C,
+                observed_at_utc=START,
+                monotonic_ns=monotonic_ns,
+                source_identity_sha256=source,
+                committed_source_pages=1,
+                cumulative_unique_source_pages=cumulative,
+                commit_latency_ns=1,
+            )
+
+        with self.assertRaisesRegex(ValueError, "source identity repeats"):
+            summarize(
+                (
+                    committed(
+                        sequence=0,
+                        source=HASH,
+                        cumulative=1,
+                        monotonic_ns=500_000_000,
+                    ),
+                    committed(
+                        sequence=1,
+                        source=HASH,
+                        cumulative=2,
+                        monotonic_ns=600_000_000,
+                    ),
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "cumulative count drifted"):
+            summarize(
+                (
+                    committed(
+                        sequence=0,
+                        source=HASH,
+                        cumulative=1,
+                        monotonic_ns=500_000_000,
+                    ),
+                    committed(
+                        sequence=1,
+                        source=HASH_B,
+                        cumulative=3,
+                        monotonic_ns=600_000_000,
+                    ),
+                )
+            )
+        blocked = (
+            BlockedProgressEvent(
+                run_id=RUN_ID,
+                sequence=0,
+                process_epoch_sha256=HASH_C,
+                process_profile_sha256=HASH_B,
+                clock_domain_identity_sha256=HASH_C,
+                observed_at_utc=START,
+                monotonic_ns=600_000_000,
+                blocked_reason="gpu_input_starved",
+                blocked_interval_started_monotonic_ns=400_000_000,
+                blocked_duration_ns=200_000_000,
+            ),
+            BlockedProgressEvent(
+                run_id=RUN_ID,
+                sequence=1,
+                process_epoch_sha256=HASH_C,
+                process_profile_sha256=HASH_B,
+                clock_domain_identity_sha256=HASH_C,
+                observed_at_utc=START,
+                monotonic_ns=700_000_000,
+                blocked_reason="host_memory_pressure",
+                blocked_interval_started_monotonic_ns=500_000_000,
+                blocked_duration_ns=200_000_000,
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "intervals overlap"):
+            summarize(blocked)
 
 
 if __name__ == "__main__":

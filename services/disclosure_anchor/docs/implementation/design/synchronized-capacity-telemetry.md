@@ -55,6 +55,9 @@ progress contract 只暴露两类事件：带 `blocked_reason` 的阻塞区间�
 task ID。每个 progress event 显式绑定自身 clock domain；Mac worker 发出的事件不能直接与 Windows
 phase monotonic 比较。phase summary 只有在完整 trace、同 clock domain 的绑定、两条 lane 覆盖、严格递增事件和
 receipt identity 全部闭合时生成；否则独立保存 trace 与 telemetry，禁止声称 synchronized coverage。
+progress 还必须绑定 receipt 的 process epoch/profile。durable commit 的 source identity 在同一 run
+只能出现一次，累计页数必须严格等于前累计加本次 delta；blocked event 携带闭合的起止 monotonic
+区间，重叠区间或跨 phase 边界区间不得相加，避免把同时发生的多个阻塞原因重复计时。
 
 receipt 的 lane sample count、边界/相邻最大 gap、late、missed deadline、supported frame 和 required
 unsupported observation 数必须从 frames 机械重算。`gpu_fast` 只以 GPU observation 为 required；

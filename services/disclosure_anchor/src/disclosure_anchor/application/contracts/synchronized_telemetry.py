@@ -605,7 +605,18 @@ class _ProgressBase(_FrozenModel):
 class BlockedProgressEvent(_ProgressBase):
     event_type: Literal["blocked"] = "blocked"
     blocked_reason: BlockedReason
+    blocked_interval_started_monotonic_ns: int = Field(ge=0)
     blocked_duration_ns: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _check_interval(self) -> "BlockedProgressEvent":
+        if (
+            self.blocked_interval_started_monotonic_ns > self.monotonic_ns
+            or self.blocked_duration_ns
+            != self.monotonic_ns - self.blocked_interval_started_monotonic_ns
+        ):
+            raise ValueError("blocked interval duration is not closed")
+        return self
 
 
 class DurablePageCommitEvent(_ProgressBase):

@@ -427,24 +427,61 @@ def summarize_synchronized_phase_capture(
         raise ValueError("phase interval lacks synchronized telemetry coverage")
     blocked_duration = 0
     committed_pages = 0
-    previous_progress_sequence = -1
-    for event in progress_events:
+    previous_progress_monotonic_ns = -1
+    previous_blocked_finish_ns = -1
+    cumulative_unique_source_pages = 0
+    seen_source_identities: set[str] = set()
+    for expected_sequence, event in enumerate(progress_events):
         if event.run_id != telemetry_receipt.run_id:
             raise ValueError("progress event run identity drifted")
+        if (
+            event.process_epoch_sha256
+            != telemetry_receipt.process_profile.process_epoch_sha256
+            or event.process_profile_sha256
+            != telemetry_receipt.process_profile.process_profile_sha256
+        ):
+            raise ValueError("progress event process/profile identity drifted")
         if (
             event.clock_domain_identity_sha256
             != telemetry_receipt.clock_domain_identity_sha256
         ):
             raise ValueError("progress and phase clocks are not comparable")
-        if event.sequence <= previous_progress_sequence:
-            raise ValueError("progress event sequence is not increasing")
-        previous_progress_sequence = event.sequence
-        if not phase_start <= event.monotonic_ns <= phase_finish:
-            continue
+        if event.sequence != expected_sequence:
+            raise ValueError("progress event sequence is not contiguous")
+        if event.monotonic_ns < previous_progress_monotonic_ns:
+            raise ValueError("progress event monotonic order drifted")
+        previous_progress_monotonic_ns = event.monotonic_ns
         if isinstance(event, BlockedProgressEvent):
-            blocked_duration += event.blocked_duration_ns
+            if (
+                event.blocked_interval_started_monotonic_ns
+                < previous_blocked_finish_ns
+            ):
+                raise ValueError("blocked progress intervals overlap")
+            previous_blocked_finish_ns = event.monotonic_ns
+            overlaps_phase = (
+                event.monotonic_ns >= phase_start
+                and event.blocked_interval_started_monotonic_ns <= phase_finish
+            )
+            inside_phase = (
+                phase_start <= event.blocked_interval_started_monotonic_ns
+                and event.monotonic_ns <= phase_finish
+            )
+            if overlaps_phase and not inside_phase:
+                raise ValueError("blocked progress interval crosses phase boundary")
+            if inside_phase:
+                blocked_duration += event.blocked_duration_ns
         elif isinstance(event, DurablePageCommitEvent):
-            committed_pages += event.committed_source_pages
+            if event.source_identity_sha256 in seen_source_identities:
+                raise ValueError("durable source identity repeats within run")
+            seen_source_identities.add(event.source_identity_sha256)
+            cumulative_unique_source_pages += event.committed_source_pages
+            if (
+                event.cumulative_unique_source_pages
+                != cumulative_unique_source_pages
+            ):
+                raise ValueError("durable page cumulative count drifted")
+            if phase_start <= event.monotonic_ns <= phase_finish:
+                committed_pages += event.committed_source_pages
     return SynchronizedPhaseSummary(
         runtime_bundle_identity_sha256=(
             telemetry_receipt.runtime_bundle_identity_sha256

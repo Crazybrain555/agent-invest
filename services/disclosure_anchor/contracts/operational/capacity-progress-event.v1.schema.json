@@ -8,6 +8,11 @@
           "title": "Blocked Duration Ns",
           "type": "integer"
         },
+        "blocked_interval_started_monotonic_ns": {
+          "minimum": 0,
+          "title": "Blocked Interval Started Monotonic Ns",
+          "type": "integer"
+        },
         "blocked_reason": {
           "enum": [
             "api_pending_limit",
@@ -75,6 +80,7 @@
         "observed_at_utc",
         "monotonic_ns",
         "blocked_reason",
+        "blocked_interval_started_monotonic_ns",
         "blocked_duration_ns"
       ],
       "title": "BlockedProgressEvent",
