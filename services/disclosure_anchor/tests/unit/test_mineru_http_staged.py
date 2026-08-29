@@ -280,6 +280,60 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     fence_identity="fence-1",
                 )
 
+    def test_v2_accepts_identity_bound_existing_post_200(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.pdf"
+            source.write_bytes(b"%PDF-stage")
+            source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+            key = hashlib.sha256(
+                f"{source_sha256}\0attempt-1\0fence-1".encode()
+            ).hexdigest()
+
+            def handler(_request: httpx.Request) -> httpx.Response:
+                return httpx.Response(200, json={
+                    "task_id": "task-1", "status_url": "/tasks/task-1",
+                    "result_url": "/tasks/task-1/result",
+                    "task_protocol_schema": "mineru-task-protocol.v2",
+                    "idempotency_key": key, "attempt_identity": "attempt-1",
+                    "fence_identity": "fence-1",
+                })
+
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+                transport=httpx.MockTransport(handler), task_protocol_v2=True,
+            )
+            handle = parser.begin_remote_parse(
+                input_pdf=source, options=PINNED_OPTIONS,
+                source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1", fence_identity="fence-1",
+            )
+            self.assertIsNotNone(handle)
+
+    def test_v2_rejects_wire_json_before_exceeding_bound(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                202, content=b"{" + b" " * (1024 * 1024) + b"}",
+                headers={"content-type": "application/json"},
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.pdf"
+            source.write_bytes(b"%PDF-stage")
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+                transport=httpx.MockTransport(handler), task_protocol_v2=True,
+            )
+            with self.assertRaisesRegex(ParserOutputContractError, "wire envelope"):
+                parser.begin_remote_parse(
+                    input_pdf=source, options=PINNED_OPTIONS,
+                    source_pdf_sha256="sha256:" + hashlib.sha256(source.read_bytes()).hexdigest(),
+                    attempt_identity="attempt-1", fence_identity="fence-1",
+                )
+
     def test_submit_rejects_cross_origin_result_url(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(

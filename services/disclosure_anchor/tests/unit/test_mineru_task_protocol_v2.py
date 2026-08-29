@@ -69,7 +69,19 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             root = Path(directory)
             registry = self._registry(root)
             self._create(registry)
-            registry.bind_task_payload("key", {"task_id": "task-key"})
+            output = root / "task-key"
+            uploads = output / "uploads"
+            uploads.mkdir(parents=True)
+            upload = uploads / "input.pdf"
+            upload.write_bytes(b"pdf")
+            registry.bind_task_payload(
+                "key",
+                {
+                    "task_id": "task-key",
+                    "output_dir": str(output),
+                    "uploads": [str(upload)],
+                },
+            )
             registry.transition("key", "processing")
             registry.transition("key", "finalizing")
             registry.reserve_finalizer("key", byte_budget=12)
@@ -188,6 +200,16 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             with self.assertRaisesRegex(TaskProtocolConflict, "unsafe"):
                 self._registry(root)
 
+    def test_registry_open_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target.json"
+            target.write_text('{"schema":"mineru-task-registry.v2","records":[]}')
+            target.chmod(0o600)
+            (root / "registry.json").symlink_to(target)
+            with self.assertRaises(OSError):
+                self._registry(root)
+
     def test_unacked_result_bytes_apply_backpressure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -206,6 +228,63 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             )
             with self.assertRaisesRegex(TaskProtocolConflict, "capacity exhausted"):
                 registry.reserve_finalizer("b", byte_budget=4)
+
+    def test_consumed_bytes_remain_charged_until_unlink_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(root, limit=10)
+            self._create(registry)
+            registry.transition("key", "processing")
+            registry.transition("key", "finalizing")
+            registry.reserve_finalizer("key", byte_budget=6)
+            result = root / "result.zip"
+            result.write_bytes(b"result")
+            registry.complete(
+                "key", result_path=result, result_sha256="a" * 64,
+                result_bytes=6, result_owner="b" * 64,
+            )
+            registry.acknowledge("key")
+            self.assertEqual(registry.unacked_result_bytes, 6)
+            registry.cleanup_consumed(Path.unlink)
+            self.assertEqual(registry.unacked_result_bytes, 0)
+
+    def test_restart_rejects_upload_content_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(root)
+            self._create(registry)
+            output = root / "task-key"
+            uploads = output / "uploads"
+            uploads.mkdir(parents=True)
+            upload = uploads / "input.pdf"
+            upload.write_bytes(b"abc")
+            registry.bind_task_payload(
+                "key", {"task_id": "task-key", "output_dir": str(output),
+                        "uploads": [str(upload)]},
+            )
+            registry.transition("key", "processing")
+            upload.write_bytes(b"xyz")
+            with self.assertRaisesRegex(TaskProtocolConflict, "identity drifted"):
+                self._registry(root).recoverable_payloads()
+
+    def test_restart_cleanup_rejects_symlink_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(root)
+            self._create(registry)
+            output = root / "task-key"
+            uploads = output / "uploads"
+            uploads.mkdir(parents=True)
+            upload = uploads / "input.pdf"
+            upload.write_bytes(b"abc")
+            registry.bind_task_payload(
+                "key", {"task_id": "task-key", "output_dir": str(output),
+                        "uploads": [str(upload)]},
+            )
+            registry.transition("key", "processing")
+            (output / "escape").symlink_to(root)
+            with self.assertRaisesRegex(TaskProtocolConflict, "escaped"):
+                self._registry(root).recoverable_payloads()
 
     def test_parse_credit_is_released_while_previous_finalizer_waits(self) -> None:
         async def exercise() -> None:
@@ -263,9 +342,6 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             uploads.mkdir(parents=True)
             upload = uploads / "input.pdf"
             upload.write_bytes(b"pdf")
-            partial = output / "partial"
-            partial.mkdir()
-            (partial / "stale").write_bytes(b"stale")
             registry.bind_task_payload(
                 "key",
                 {
@@ -274,6 +350,9 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
                     "uploads": [str(upload)],
                 },
             )
+            partial = output / "partial"
+            partial.mkdir()
+            (partial / "stale").write_bytes(b"stale")
             registry.transition("key", "processing")
             recovered_registry = self._registry(root)
             payloads = recovered_registry.recoverable_payloads()

@@ -216,7 +216,8 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         with self._client(min(30.0, timeout)) as client:
             while time.monotonic() < deadline:
                 try:
-                    response = client.get(self._task.status_url)
+                    request = client.build_request("GET", self._task.status_url)
+                    response = client.send(request, stream=True)
                 except httpx.TransportError:
                     self._stop.wait(
                         min(retry_delay, max(0.0, deadline - time.monotonic()))
@@ -224,15 +225,20 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                     retry_delay = min(5.0, retry_delay * 2)
                     continue
                 if 500 <= response.status_code <= 599:
+                    response.close()
                     self._stop.wait(
                         min(retry_delay, max(0.0, deadline - time.monotonic()))
                     )
                     retry_delay = min(5.0, retry_delay * 2)
                     continue
                 if response.status_code != 200:
+                    response.close()
                     raise _fail(f"status returned HTTP {response.status_code}")
                 retry_delay = 0.25
-                payload = _closed_json(response, required={"status"})
+                try:
+                    payload = _closed_json(response, required={"status"})
+                finally:
+                    response.close()
                 status_value = payload["status"]
                 if status_value in {"pending", "processing"}:
                     if self._stop.wait(
@@ -254,14 +260,13 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             time.monotonic() + float(self._options.api_drain_timeout_seconds),
         )
         while time.monotonic() < drain_deadline:
-            response = client.get(self._task.status_url)
-            if response.status_code != 200:
-                raise _fail(f"drain status returned HTTP {response.status_code}")
-            status_value = _closed_json(response, required={"status"})["status"]
+            with client.stream("GET", self._task.status_url) as response:
+                if response.status_code != 200:
+                    raise _fail(f"drain status returned HTTP {response.status_code}")
+                payload = _closed_json(response, required={"status"})
+            status_value = payload["status"]
             if status_value == "completed":
-                retained = self._retained_receipt(
-                    _closed_json(response, required={"status"}), client=client
-                )
+                retained = self._retained_receipt(payload, client=client)
                 if retained is not None:
                     return retained
                 return self._spool_result(client)
@@ -313,16 +318,16 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             }
             if any(payload.get(key) != value for key, value in expected_protocol.items()):
                 raise _fail("task protocol v2 status identity drifted")
-            lease = client.post(
-                f"{self._task.base_url}/tasks/{self._task.task_id}/lease"
-            )
-            if lease.status_code != 200:
-                raise _fail(f"result lease returned HTTP {lease.status_code}")
-            lease_payload = _closed_json(
-                lease,
-                required={"schema", "task_id", "lease_until_unix"},
-                allowed={"schema", "task_id", "lease_until_unix"},
-            )
+            with client.stream(
+                "POST", f"{self._task.base_url}/tasks/{self._task.task_id}/lease"
+            ) as lease:
+                if lease.status_code != 200:
+                    raise _fail(f"result lease returned HTTP {lease.status_code}")
+                lease_payload = _closed_json(
+                    lease,
+                    required={"schema", "task_id", "lease_until_unix"},
+                    allowed={"schema", "task_id", "lease_until_unix"},
+                )
             if (
                 lease_payload.get("schema") != "mineru-task-protocol.v2"
                 or lease_payload.get("task_id") != self._task.task_id
@@ -513,19 +518,19 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         if not self._task.task_protocol_v2:
             return
         with self._client(30.0) as client:
-            response = client.post(
-                f"{self._task.base_url}/tasks/{self._task.task_id}/ack"
-            )
-            if response.status_code not in {200, 204}:
-                raise _fail(
-                    f"result acknowledgement returned HTTP {response.status_code}"
-                )
-            if response.status_code == 200:
-                payload = _closed_json(
+            with client.stream(
+                "POST", f"{self._task.base_url}/tasks/{self._task.task_id}/ack"
+            ) as response:
+                if response.status_code not in {200, 204}:
+                    raise _fail(
+                        f"result acknowledgement returned HTTP {response.status_code}"
+                    )
+                payload = None if response.status_code == 204 else _closed_json(
                     response,
                     required={"schema", "task_id", "status"},
                     allowed={"schema", "task_id", "status"},
                 )
+            if payload is not None:
                 if set(payload) != {"schema", "task_id", "status"} or payload != {
                     "schema": "mineru-task-protocol.v2",
                     "task_id": self._task.task_id,
@@ -630,7 +635,11 @@ class MinerUHttpStagedParser:
         ):
             raise _fail("request is outside the pinned full-PDF Medium profile")
         self._spool_root.mkdir(parents=True, exist_ok=True)
-        before = input_pdf.stat()
+        source_fd = os.open(input_pdf, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            os.close(source_fd)
+            raise _fail("source PDF identity is unsafe")
         digest = hashlib.sha256()
         snapshot_fd, snapshot_name = tempfile.mkstemp(
             prefix=".upload-",
@@ -639,8 +648,8 @@ class MinerUHttpStagedParser:
         )
         snapshot = Path(snapshot_name)
         try:
-            with input_pdf.open("rb") as source, os.fdopen(snapshot_fd, "wb") as target:
-                while chunk := source.read(1024 * 1024):
+            with os.fdopen(snapshot_fd, "wb") as target:
+                while chunk := os.read(source_fd, 1024 * 1024):
                     digest.update(chunk)
                     target.write(chunk)
                 target.flush()
@@ -652,13 +661,16 @@ class MinerUHttpStagedParser:
                 pass
             snapshot.unlink(missing_ok=True)
             raise
-        after = input_pdf.stat()
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-        ):
+        finally:
+            after = os.fstat(source_fd)
+            os.close(source_fd)
+        def identity(value: os.stat_result) -> tuple[int, ...]:
+            return (
+                value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                value.st_nlink, value.st_size, value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+        if identity(before) != identity(after):
             snapshot.unlink(missing_ok=True)
             raise _fail("source changed while hashing")
         if "sha256:" + digest.hexdigest() != source_pdf_sha256:
@@ -695,6 +707,14 @@ class MinerUHttpStagedParser:
                     "agent_fence_identity": fence_identity,
                 }
             )
+        submit_allowed = {
+            "task_id", "status", "backend", "file_names", "created_at",
+            "started_at", "completed_at", "error", "status_url", "result_url",
+            "queued_ahead", "task_protocol_schema", "idempotency_key",
+            "attempt_identity", "fence_identity", "result_artifact_schema",
+            "result_artifact_sha256", "result_artifact_bytes",
+            "result_artifact_owner", "protocol_state",
+        }
         reconciled = False
         try:
             with (
@@ -707,36 +727,35 @@ class MinerUHttpStagedParser:
                 snapshot.open("rb") as source,
             ):
                 try:
-                    response = client.post(
-                        f"{self._api_url}/tasks",
-                        data=data,
+                    request = client.build_request(
+                        "POST", f"{self._api_url}/tasks", data=data,
                         files={"files": (input_pdf.name, source, "application/pdf")},
                     )
+                    response = client.send(request, stream=True)
                 except httpx.TransportError:
                     if not self._task_protocol_v2:
                         raise
-                    response = client.get(
-                        f"{self._api_url}/tasks/by-idempotency/{idempotency_key}"
+                    request = client.build_request(
+                        "GET", f"{self._api_url}/tasks/by-idempotency/{idempotency_key}"
                     )
+                    response = client.send(request, stream=True)
                     reconciled = True
+                expected_statuses = (
+                    {200} if reconciled
+                    else ({200, 202} if self._task_protocol_v2 else {202})
+                )
+                try:
+                    if response.status_code not in expected_statuses:
+                        raise _fail(f"submit returned HTTP {response.status_code}")
+                    payload = _closed_json(
+                        response,
+                        required={"task_id", "status_url", "result_url"},
+                        allowed=submit_allowed if self._task_protocol_v2 else None,
+                    )
+                finally:
+                    response.close()
         finally:
             snapshot.unlink(missing_ok=True)
-        expected_status = 200 if reconciled else 202
-        if response.status_code != expected_status:
-            raise _fail(f"submit returned HTTP {response.status_code}")
-        submit_allowed = {
-            "task_id", "status", "backend", "file_names", "created_at",
-            "started_at", "completed_at", "error", "status_url", "result_url",
-            "queued_ahead", "task_protocol_schema", "idempotency_key",
-            "attempt_identity", "fence_identity", "result_artifact_schema",
-            "result_artifact_sha256", "result_artifact_bytes",
-            "result_artifact_owner", "protocol_state",
-        }
-        payload = _closed_json(
-            response,
-            required={"task_id", "status_url", "result_url"},
-            allowed=submit_allowed if self._task_protocol_v2 else None,
-        )
         if not all(
             isinstance(payload[key], str)
             for key in ("task_id", "status_url", "result_url")
@@ -805,8 +824,14 @@ def _closed_json(
     required: set[str],
     allowed: set[str] | None = None,
 ) -> dict[str, Any]:
-    if len(response.content) > _MAX_WIRE_JSON_BYTES:
-        raise _fail("response JSON exceeds the closed wire envelope")
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_bytes():
+        total += len(chunk)
+        if total > _MAX_WIRE_JSON_BYTES:
+            raise _fail("response JSON exceeds the closed wire envelope")
+        chunks.append(chunk)
+    content = b"".join(chunks)
     def closed_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         value: dict[str, Any] = {}
         for key, item in pairs:
@@ -816,7 +841,7 @@ def _closed_json(
         return value
     try:
         payload = json.loads(
-            response.content,
+            content,
             object_pairs_hook=closed_object,
             parse_constant=lambda value: (_ for _ in ()).throw(
                 _fail(f"response JSON contains non-finite value {value}")

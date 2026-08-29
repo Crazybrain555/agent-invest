@@ -20,6 +20,9 @@ from typing import Any, Literal
 TaskState = Literal[
     "pending", "processing", "finalizing", "completed", "failed", "consumed"
 ]
+_MAX_REGISTRY_BYTES = 16 * 1024 * 1024
+_MAX_RECORDS = 128
+_MAX_TASK_PAYLOAD_BYTES = 64 * 1024
 
 
 class TaskProtocolConflict(RuntimeError):
@@ -51,7 +54,7 @@ class DurableTaskRecord:
             self.attempt_identity,
             self.fence_identity,
         ):
-            if not isinstance(value, str) or not value or len(value) > 1024:
+            if not isinstance(value, str) or not value or len(value) > 256:
                 raise TaskProtocolConflict("task registry identity is invalid")
         if (
             not isinstance(self.active_readers, int)
@@ -151,6 +154,8 @@ class DurableTaskRegistry:
                         "idempotency key was reused with different attempt/fence"
                     )
                 return existing, False
+            if len(self._records) >= _MAX_RECORDS:
+                raise TaskProtocolConflict("task registry tombstone capacity exhausted")
             record = DurableTaskRecord(
                 idempotency_key=idempotency_key,
                 task_id=task_id,
@@ -185,6 +190,40 @@ class DurableTaskRegistry:
             raise TypeError("task payload must be one JSON object")
         with self._lock:
             record = self._required(idempotency_key)
+            if normalized.get("task_id") != record.task_id:
+                raise TaskProtocolConflict("task payload identity drifted")
+            output_value = normalized.get("output_dir")
+            uploads_value = normalized.get("uploads")
+            if not isinstance(output_value, str) or not isinstance(uploads_value, list):
+                raise TaskProtocolConflict("task payload ownership paths are absent")
+            output = Path(output_value)
+            output_meta = output.lstat()
+            if (
+                output.name != record.task_id
+                or not stat.S_ISDIR(output_meta.st_mode)
+                or output_meta.st_uid != os.getuid()
+            ):
+                raise TaskProtocolConflict("task output root identity is unsafe")
+            upload_root = output / "uploads"
+            if set(output.iterdir()) != {upload_root}:
+                raise TaskProtocolConflict(
+                    "task root contained data before generation ownership began"
+                )
+            upload_identities = [
+                self._stable_file_identity(Path(value), parent=upload_root)
+                for value in uploads_value
+                if isinstance(value, str)
+            ]
+            if len(upload_identities) != len(uploads_value):
+                raise TaskProtocolConflict("task upload paths are invalid")
+            normalized["_agent_protocol"] = {
+                "schema": "mineru-task-payload-owner.v1",
+                "task_root": str(output.resolve()),
+                "generation": record.recovery_generation,
+                "uploads": upload_identities,
+            }
+            if len(json.dumps(normalized, sort_keys=True).encode()) > _MAX_TASK_PAYLOAD_BYTES:
+                raise TaskProtocolConflict("task payload exceeds the closed envelope")
             if record.task_payload is not None and record.task_payload != normalized:
                 raise TaskProtocolConflict("task payload drifted after allocation")
             record.task_payload = normalized
@@ -215,6 +254,7 @@ class DurableTaskRegistry:
                         self._prepare_clean_replay(record)
                 if record.task_payload is not None and record.state != "consumed":
                     recovered = dict(record.task_payload)
+                    recovered.pop("_agent_protocol", None)
                     recovered["status"] = (
                         "pending"
                         if record.state in {"pending", "processing", "finalizing"}
@@ -235,26 +275,70 @@ class DurableTaskRegistry:
         uploads_value = payload.get("uploads")
         if not isinstance(output_value, str) or not isinstance(uploads_value, list):
             raise TaskProtocolConflict("restart replay paths are absent")
-        output = Path(output_value).resolve()
-        upload_root = (output / "uploads").resolve()
-        for value in uploads_value:
-            if not isinstance(value, str):
-                raise TaskProtocolConflict("restart upload path is invalid")
-            path = Path(value)
-            metadata = path.lstat()
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_nlink != 1
-                or path.resolve().parent != upload_root
-            ):
-                raise TaskProtocolConflict("restart upload snapshot identity drifted")
+        protocol = payload.get("_agent_protocol")
+        if not isinstance(protocol, dict) or protocol.get("schema") != "mineru-task-payload-owner.v1":
+            raise TaskProtocolConflict("restart task ownership receipt is absent")
+        output = Path(output_value)
+        output_meta = output.lstat()
+        if (
+            output.name != record.task_id
+            or str(output.resolve()) != protocol.get("task_root")
+            or not stat.S_ISDIR(output_meta.st_mode)
+            or output_meta.st_uid != os.getuid()
+        ):
+            raise TaskProtocolConflict("restart task root identity drifted")
+        upload_root = output / "uploads"
+        expected_uploads = protocol.get("uploads")
+        if not isinstance(expected_uploads, list) or len(expected_uploads) != len(uploads_value):
+            raise TaskProtocolConflict("restart upload receipt drifted")
+        observed = [
+            self._stable_file_identity(Path(value), parent=upload_root)
+            for value in uploads_value
+            if isinstance(value, str)
+        ]
+        if observed != expected_uploads:
+            raise TaskProtocolConflict("restart upload snapshot identity drifted")
         for child in output.iterdir():
-            if child.resolve() == upload_root:
+            if child == upload_root:
                 continue
-            if child.is_dir() and not child.is_symlink():
+            child_meta = child.lstat()
+            if child.is_symlink() or child.parent != output:
+                raise TaskProtocolConflict("restart cleanup target escaped task root")
+            if stat.S_ISDIR(child_meta.st_mode):
                 shutil.rmtree(child)
             else:
                 child.unlink()
+        protocol["generation"] = record.recovery_generation
+
+    @staticmethod
+    def _stable_file_identity(path: Path, *, parent: Path) -> dict[str, Any]:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or before.st_nlink != 1
+                or path.resolve().parent != parent.resolve()
+            ):
+                raise TaskProtocolConflict("task upload snapshot identity is unsafe")
+            digest = hashlib.sha256()
+            total = 0
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+                total += len(chunk)
+            after = os.fstat(descriptor)
+            def identity(value):
+                return (
+                    value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                    value.st_nlink, value.st_size, value.st_mtime_ns,
+                    value.st_ctime_ns,
+                )
+            if total != before.st_size or identity(before) != identity(after):
+                raise TaskProtocolConflict("task upload changed while hashing")
+            return {"path": str(path.resolve()), "bytes": total, "sha256": digest.hexdigest()}
+        finally:
+            os.close(descriptor)
 
     def abandon_unbound(self, idempotency_key: str) -> None:
         """Remove only a reservation that never acquired durable task ownership."""
@@ -362,7 +446,7 @@ class DurableTaskRegistry:
         return sum(
             record.result_bytes or 0
             for record in self._records.values()
-            if record.state == "completed"
+            if record.state in {"completed", "consumed"} and record.result_path
         )
 
     def lease(self, idempotency_key: str, *, seconds: float) -> float:
@@ -428,6 +512,10 @@ class DurableTaskRegistry:
                 if record.result_path:
                     unlink(Path(record.result_path))
                     record.result_path = None
+                    record.task_payload = None
+                    record.lease_until_unix = None
+                    record.error = None
+                    record.reserved_result_bytes = 0
                     cleaned += 1
             if cleaned:
                 self._persist()
@@ -440,18 +528,42 @@ class DurableTaskRegistry:
             raise TaskProtocolConflict("task is unknown") from exc
 
     def _load(self) -> dict[str, DurableTaskRecord]:
-        if not self._path.exists():
+        try:
+            descriptor = os.open(
+                self._path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            )
+        except FileNotFoundError:
             return {}
-        metadata = self._path.lstat()
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
-            or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-            or metadata.st_size > 16 * 1024 * 1024
-        ):
-            raise TaskProtocolConflict("task registry file identity is unsafe")
-        raw = self._path.read_bytes()
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or not 0 < metadata.st_size <= _MAX_REGISTRY_BYTES
+            ):
+                raise TaskProtocolConflict("task registry file identity is unsafe")
+            chunks = []
+            remaining = _MAX_REGISTRY_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            after = os.fstat(descriptor)
+            def identity(value):
+                return (
+                    value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                    value.st_nlink, value.st_size, value.st_mtime_ns,
+                    value.st_ctime_ns,
+                )
+            if len(raw) != metadata.st_size or identity(metadata) != identity(after):
+                raise TaskProtocolConflict("task registry changed while reading")
+        finally:
+            os.close(descriptor)
 
         def closed_object(pairs):
             value = {}
@@ -477,7 +589,7 @@ class DurableTaskRegistry:
         ):
             raise TaskProtocolConflict("task registry schema is invalid")
         records = payload.get("records")
-        if not isinstance(records, list):
+        if not isinstance(records, list) or len(records) > _MAX_RECORDS:
             raise TaskProtocolConflict("task registry records are invalid")
         expected = {item.name for item in fields(DurableTaskRecord)}
         if any(not isinstance(item, dict) or set(item) != expected for item in records):
@@ -501,7 +613,7 @@ class DurableTaskRegistry:
             task_ids.add(record.task_id)
         for record in loaded.values():
             record.active_readers = 0
-            if record.state == "completed":
+            if record.state in {"completed", "consumed"} and record.result_path:
                 result_path = Path(record.result_path or "")
                 metadata = result_path.lstat()
                 if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
@@ -538,6 +650,8 @@ class DurableTaskRegistry:
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
+        if len(payload) > _MAX_REGISTRY_BYTES:
+            raise TaskProtocolConflict("task registry exceeds the closed envelope")
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{self._path.name}-",
             suffix=".tmp",
