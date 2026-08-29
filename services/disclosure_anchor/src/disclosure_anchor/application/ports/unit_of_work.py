@@ -16,6 +16,7 @@ from disclosure_anchor.application.ports.repositories import (
     DocumentUnitRepository,
     OutboxRepository,
     ProcessingRunRepository,
+    PublishEvidenceRepository,
     RemoteParseAttemptRepository,
     SecurityRepository,
     SourceAccessRepository,
@@ -37,6 +38,7 @@ class UnitOfWork(Protocol):
     remote_parse_attempts: RemoteParseAttemptRepository
     document_units: DocumentUnitRepository
     outbox: OutboxRepository
+    publish_evidence: PublishEvidenceRepository
 
     def __enter__(self) -> "UnitOfWork": ...
     def __exit__(

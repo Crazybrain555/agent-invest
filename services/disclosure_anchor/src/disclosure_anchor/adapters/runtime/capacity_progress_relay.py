@@ -14,6 +14,11 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from disclosure_anchor.application.contracts.synchronized_telemetry import ProgressEvent
+from disclosure_anchor.application.contracts.publish_evidence_ledger import (
+    EncodedProgressRelayCheckpoint,
+    ProgressRelayResume,
+    canonical_resume_bytes,
+)
 from disclosure_anchor.application.services.capacity_progress_replay import replay_capacity_progress
 
 
@@ -32,57 +37,6 @@ _FORBIDDEN_KEYS = frozenset(
         "hostname",
     }
 )
-_MAX_RELAY_SOURCES = 8192
-
-
-class ProgressRelayResume(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    contract_version: Literal["mineru.capacity-progress-relay-resume.v1"] = (
-        "mineru.capacity-progress-relay-resume.v1"
-    )
-    run_id: str
-    process_epoch_sha256: str
-    runtime_bundle_identity_sha256: str
-    process_profile_sha256: str
-    clock_domain_identity_sha256: str
-    next_sequence: int
-    cumulative_unique_source_pages: int
-    durable_sources: tuple[tuple[str, str, int], ...]
-    previous_checkpoint_sha256: str | None = None
-
-    @model_validator(mode="after")
-    def _closed_resume(self) -> "ProgressRelayResume":
-        if self.next_sequence < 0 or self.cumulative_unique_source_pages < 0:
-            raise ValueError("progress resume counters are negative")
-        for name in (
-            "process_epoch_sha256",
-            "runtime_bundle_identity_sha256",
-            "process_profile_sha256",
-            "clock_domain_identity_sha256",
-        ):
-            value = getattr(self, name)
-            if len(value) != 71 or not value.startswith("sha256:") or any(character not in "0123456789abcdef" for character in value[7:]):
-                raise ValueError(f"{name} is invalid")
-        if self.previous_checkpoint_sha256 is not None:
-            value = self.previous_checkpoint_sha256
-            if len(value) != 71 or not value.startswith("sha256:") or any(
-                character not in "0123456789abcdef" for character in value[7:]
-            ):
-                raise ValueError("previous checkpoint hash is invalid")
-        for source, profile, pages in self.durable_sources:
-            if (
-                len(source) != 71
-                or not source.startswith("sha256:")
-                or any(character not in "0123456789abcdef" for character in source[7:])
-                or isinstance(pages, bool)
-                or pages < 1
-            ):
-                raise ValueError("durable relay source evidence is invalid")
-            if profile != self.process_profile_sha256:
-                raise ValueError("durable relay source profile drifted")
-        return self
-
-
 class ContentFreeProgressSnapshot(BaseModel):
     """A closed UI/agent projection with counts only, never work identities."""
 
@@ -162,8 +116,6 @@ def encode_capacity_progress_jsonl(
         initial_cumulative_unique_pages=preceding,
         prior_durable_sources=prior_sources,
     )
-    if len(replay.durable_sources) > _MAX_RELAY_SOURCES:
-        raise ValueError("capacity progress relay source bound exceeded")
     dumped = [event.model_dump(mode="json") for event in events]
     for value in dumped:
         leaked = _FORBIDDEN_KEYS.intersection(value)
@@ -189,13 +141,25 @@ def encode_capacity_progress_jsonl(
 
 
 def _resume_bytes(resume: ProgressRelayResume) -> bytes:
-    return json.dumps(
-        resume.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
-    ).encode()
+    return canonical_resume_bytes(resume)
 
 
 def _resume_hash(resume: ProgressRelayResume) -> str:
     return "sha256:" + hashlib.sha256(_resume_bytes(resume)).hexdigest()
+
+
+def encode_anchored_progress_relay_head(
+    *, relay_id: str, row_version: int, resume: ProgressRelayResume
+) -> EncodedProgressRelayCheckpoint:
+    payload = _resume_bytes(resume)
+    return EncodedProgressRelayCheckpoint(
+        relay_id=relay_id,
+        row_version=row_version,
+        previous_checkpoint_sha256=resume.previous_checkpoint_sha256,
+        checkpoint_sha256="sha256:" + hashlib.sha256(payload).hexdigest(),
+        checkpoint_bytes=payload,
+        checkpoint_byte_count=len(payload),
+    )
 
 
 def write_progress_relay_checkpoint(path: Path, resume: ProgressRelayResume) -> str:
@@ -292,6 +256,7 @@ __all__ = [
     "ContentFreeProgressSnapshot",
     "ProgressRelayResume",
     "encode_capacity_progress_jsonl",
+    "encode_anchored_progress_relay_head",
     "encode_content_free_progress_snapshot",
     "read_progress_relay_checkpoint",
     "write_progress_relay_checkpoint",

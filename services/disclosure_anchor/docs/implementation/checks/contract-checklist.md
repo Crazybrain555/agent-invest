@@ -243,6 +243,18 @@ at-least-once 投递 + 消费端幂等（重复投递不产生重复消费效果
 
 ## 6. 契约变更记录（append-only）
 
+2026-08-30（0054 私有 publish evidence ledger）——不改变 public view/API/change feed：
+
+```text
+disclosure_ops.durable_publish_base 与 PublishRun 在同一事务写入 run/document/source/page 和
+precommit 下界；first durable source 只按不可变 ledger_seq 的完整历史推导，不信 caller 标志。
+disclosure_ops.durable_publish_supplement append-only 保存 verified observer receipt/seal 锚点和
+postcommit durable-observed 上界；冲突永久保留并令 replay incomplete。上下界跨 UTC 小时或 host/profile
+coverage span 时两个受影响小时都 incomplete，绝不猜测 commit instant。0054 前历史 outbox 不自动升级。
+disclosure_ops.progress_relay_head 保存 strict canonical resume bytes/hash/length 和 predecessor CAS 链；
+relay id 绑定 run UUID + process epoch，任意回滚、重复 source、非排序或累计页数不闭合都 fail closed。
+```
+
 2026-08-30（0053 私有 staged parse checkpoint）——不改变 public view/API/change feed：
 
 ```text

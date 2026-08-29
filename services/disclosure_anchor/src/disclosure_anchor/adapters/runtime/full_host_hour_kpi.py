@@ -77,6 +77,7 @@ def verified_coverage_from_observer_artifacts(
         runtime_bundle_identity_sha256=result.receipt.runtime_bundle_identity_sha256,
         process_profile_sha256=result.receipt.process_profile.process_profile_sha256,
         observer_process_epoch_sha256=result.receipt.process_profile.process_epoch_sha256,
+        observer_run_id=result.receipt.run_id,
         receipt_sha256=_canonical_hash(result.receipt.model_dump(mode="json")),
         seal_sha256=_canonical_hash(result.seal.model_dump(mode="json")),
         status=result.evidence_status,

@@ -924,6 +924,70 @@ def durable_publish_kpi_events(
     return [dict(row) for row in rows]
 
 
+def durable_publish_ledger_rows(
+    conn: Connection,
+    *,
+    started_at: datetime,
+    finished_at: datetime,
+) -> list[dict[str, Any]]:
+    """Replay first-source private evidence; legacy outbox rows never enter."""
+
+    rows = conn.execute(
+        text(
+            f"""
+            WITH source_shape AS (
+                SELECT source_identity_sha256,
+                       count(DISTINCT source_page_count) AS source_page_variants
+                  FROM {OPS_SCHEMA}.durable_publish_base
+                 GROUP BY source_identity_sha256
+            ), ranked AS (
+                SELECT b.*,
+                       row_number() OVER (
+                           PARTITION BY source_identity_sha256
+                           ORDER BY ledger_seq
+                       ) AS source_rank,
+                       shape.source_page_variants
+                  FROM {OPS_SCHEMA}.durable_publish_base b
+                  JOIN source_shape shape USING (source_identity_sha256)
+            )
+            SELECT b.processing_run_id, b.document_id,
+                   b.source_identity_sha256, b.source_page_count,
+                   b.publish_precommit_at, b.source_page_variants,
+                   s.supplement_id, s.host_assignment_identity_sha256,
+                   s.boot_identity_sha256, s.runtime_bundle_identity_sha256,
+                   s.process_profile_sha256, s.observer_run_id,
+                   s.observer_receipt_sha256, s.observer_seal_sha256,
+                   s.observer_contract_version, s.publish_durable_observed_at,
+                   s.source_identity_sha256 AS supplement_source_identity_sha256,
+                   s.source_page_count AS supplement_source_page_count,
+                   s.publish_precommit_at AS supplement_publish_precommit_at
+              FROM ranked b
+              LEFT JOIN {OPS_SCHEMA}.durable_publish_supplement s
+                ON s.processing_run_id = b.processing_run_id
+             WHERE b.source_rank = 1
+               AND b.publish_precommit_at < :finished_at
+               AND (
+                    NOT EXISTS (
+                        SELECT 1
+                          FROM {OPS_SCHEMA}.durable_publish_supplement pending_bound
+                         WHERE pending_bound.processing_run_id = b.processing_run_id
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                          FROM {OPS_SCHEMA}.durable_publish_supplement intersecting_bound
+                         WHERE intersecting_bound.processing_run_id = b.processing_run_id
+                           AND intersecting_bound.publish_durable_observed_at >= :started_at
+                    )
+               )
+             ORDER BY b.ledger_seq,
+                      s.created_at, s.supplement_id
+            """
+        ),
+        {"started_at": started_at, "finished_at": finished_at},
+    ).mappings()
+    return [dict(row) for row in rows]
+
+
 def pending_publish_kpi_backfill(conn: Connection, *, limit: int) -> list[dict[str, Any]]:
     rows = conn.execute(
         text(

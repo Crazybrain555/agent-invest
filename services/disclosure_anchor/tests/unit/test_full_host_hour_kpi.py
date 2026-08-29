@@ -17,7 +17,12 @@ START = datetime(2026, 8, 30, 8, tzinfo=timezone.utc)
 HASHES = ["sha256:" + character * 64 for character in "abcdef"]
 
 
-def _coverage(start: datetime, finish: datetime, *, profile: str = HASHES[2], complete: bool = True):
+def _coverage(
+    start: datetime, finish: datetime, *, profile: str = HASHES[2],
+    complete: bool = True,
+    observer_run_id: str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    receipt_sha256: str = HASHES[4], seal_sha256: str = HASHES[5],
+):
     return VerifiedTelemetryCoverage(
         started_at_utc=start,
         finished_at_utc=finish,
@@ -32,8 +37,9 @@ def _coverage(start: datetime, finish: datetime, *, profile: str = HASHES[2], co
         runtime_bundle_identity_sha256=HASHES[1],
         process_profile_sha256=profile,
         observer_process_epoch_sha256=HASHES[3],
-        receipt_sha256=HASHES[4],
-        seal_sha256=HASHES[5],
+        observer_run_id=observer_run_id,
+        receipt_sha256=receipt_sha256,
+        seal_sha256=seal_sha256,
         status="complete" if complete else "incomplete",
         gpu_lane_complete=complete,
         host_lane_complete=complete,
@@ -43,16 +49,25 @@ def _coverage(start: datetime, finish: datetime, *, profile: str = HASHES[2], co
     )
 
 
-def _publish(*, source: str, profile: str = HASHES[2], pages: int | None = 5, committed: datetime = START, status: str = "complete"):
+def _publish(
+    *, source: str, profile: str = HASHES[2], pages: int | None = 5,
+    committed: datetime = START, durable_observed: datetime | None = None,
+    status: str = "complete",
+):
     return DurableProfilePageEvidence(
         source_identity_sha256=source,
         host_assignment_identity_sha256=HASHES[0] if status == "complete" else None,
         boot_identity_sha256=HASHES[5] if status == "complete" else None,
         runtime_bundle_identity_sha256=HASHES[1] if status == "complete" else None,
         process_profile_sha256=profile if status == "complete" else None,
+        observer_run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" if status == "complete" else None,
+        observer_receipt_sha256=HASHES[4] if status == "complete" else None,
+        observer_seal_sha256=HASHES[5] if status == "complete" else None,
         source_page_count=pages if status == "complete" else None,
-        publish_committed_at_utc=committed,
-        evidence_observed_at_utc=committed + timedelta(hours=3),
+        publish_precommit_at_utc=committed,
+        publish_durable_observed_at_utc=(
+            durable_observed or committed + timedelta(seconds=1)
+        ),
         status=status,
         first_durable_publish=True if status == "complete" else None,
     )
@@ -141,6 +156,26 @@ class FullHostHourKpiTests(unittest.TestCase):
         self.assertFalse(result.complete)
         self.assertIn("resident_hardware_identity_drift", result.incomplete_reasons)
 
+    def test_publish_observer_run_receipt_and_seal_must_match_owner(self) -> None:
+        source = "sha256:" + "7" * 64
+        mismatches = (
+            {"observer_run_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"},
+            {"receipt_sha256": "sha256:" + "7" * 64},
+            {"seal_sha256": "sha256:" + "8" * 64},
+        )
+        for changes in mismatches:
+            result = aggregate_full_gpu_host_hour(
+                hour_started_at_utc=START,
+                coverage=(_coverage(START, START + timedelta(hours=1), **changes),),
+                publish_evidence=(_publish(source=source),),
+                publish_history_scan_complete=True,
+            )
+            self.assertFalse(result.complete)
+            self.assertIn(
+                "publish_evidence_host_runtime_profile_mismatch",
+                result.incomplete_reasons,
+            )
+
     def test_profile_change_keeps_host_goodput_but_disables_profile_comparison(self) -> None:
         result = aggregate_full_gpu_host_hour(
             hour_started_at_utc=START,
@@ -195,8 +230,8 @@ class FullHostHourKpiTests(unittest.TestCase):
             publish_evidence=(evidence,),
             publish_history_scan_complete=True,
         )
-        self.assertTrue(result.complete)
-        self.assertEqual(result.host_unique_durable_pages, 5)
+        self.assertFalse(result.complete)
+        self.assertIn("publish_evidence_incomplete_or_conflicted", result.incomplete_reasons)
 
     def test_incomplete_publish_scan_cannot_claim_zero_goodput(self) -> None:
         result = aggregate_full_gpu_host_hour(
@@ -207,6 +242,25 @@ class FullHostHourKpiTests(unittest.TestCase):
         )
         self.assertFalse(result.complete)
         self.assertIn("publish_history_scan_incomplete", result.incomplete_reasons)
+
+    def test_cross_hour_commit_interval_makes_both_hours_incomplete(self) -> None:
+        evidence = _publish(
+            source="sha256:" + "7" * 64,
+            committed=START + timedelta(minutes=59, seconds=59),
+            durable_observed=START + timedelta(hours=1, seconds=1),
+        )
+        for hour_start in (START, START + timedelta(hours=1)):
+            result = aggregate_full_gpu_host_hour(
+                hour_started_at_utc=hour_start,
+                coverage=(_coverage(hour_start, hour_start + timedelta(hours=1)),),
+                publish_evidence=(evidence,),
+                publish_history_scan_complete=True,
+            )
+            self.assertFalse(result.complete)
+            self.assertIn(
+                "publish_evidence_incomplete_or_conflicted",
+                result.incomplete_reasons,
+            )
 
     def test_legacy_outbox_without_runtime_profile_is_explicitly_incomplete(self) -> None:
         evidence = project_publish_payload_for_host_hour(

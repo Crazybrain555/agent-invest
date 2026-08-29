@@ -22,6 +22,7 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    Sequence,
     String,
     Text,
     UniqueConstraint,
@@ -36,6 +37,11 @@ from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA, OPS_SCHEM
 
 class Base(DeclarativeBase):
     pass
+
+
+durable_publish_ledger_seq = Sequence(
+    "durable_publish_ledger_seq", schema=OPS_SCHEMA
+)
 
 
 class RemoteParseAttempt(Base):
@@ -100,6 +106,81 @@ class RemoteParseResumeSecret(Base):
     token_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
     token_byte_count: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class DurablePublishBase(Base):
+    __tablename__ = "durable_publish_base"
+    __table_args__ = (
+        CheckConstraint("source_identity_sha256 ~ '^sha256:[0-9a-f]{64}$'", name="ck_durable_publish_base_source"),
+        CheckConstraint("source_page_count > 0", name="ck_durable_publish_base_pages"),
+        ForeignKeyConstraint(
+            ["processing_run_id", "document_id"],
+            [f"{CORE_SCHEMA}.processing_run.processing_run_id", f"{CORE_SCHEMA}.processing_run.document_id"],
+            name="fk_durable_publish_base_run_owner", ondelete="RESTRICT",
+        ),
+        Index("ix_durable_publish_base_source_order", "source_identity_sha256", "ledger_seq"),
+        Index("ix_durable_publish_base_commit", "publish_precommit_at", "ledger_seq"),
+        {"schema": OPS_SCHEMA},
+    )
+    ledger_seq: Mapped[int] = mapped_column(
+        BigInteger,
+        durable_publish_ledger_seq,
+        server_default=durable_publish_ledger_seq.next_value(),
+        nullable=False,
+        unique=True,
+    )
+    processing_run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    document_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_identity_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    source_page_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    publish_precommit_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class DurablePublishSupplement(Base):
+    __tablename__ = "durable_publish_supplement"
+    __table_args__ = (
+        CheckConstraint("source_identity_sha256 ~ '^sha256:[0-9a-f]{64}$' AND host_assignment_identity_sha256 ~ '^sha256:[0-9a-f]{64}$' AND boot_identity_sha256 ~ '^sha256:[0-9a-f]{64}$' AND runtime_bundle_identity_sha256 ~ '^sha256:[0-9a-f]{64}$' AND process_profile_sha256 ~ '^sha256:[0-9a-f]{64}$' AND observer_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND observer_seal_sha256 ~ '^sha256:[0-9a-f]{64}$'", name="ck_durable_publish_supplement_hashes"),
+        CheckConstraint("source_page_count > 0", name="ck_durable_publish_supplement_pages"),
+        CheckConstraint("publish_durable_observed_at >= publish_precommit_at", name="ck_durable_publish_supplement_time"),
+        CheckConstraint("observer_contract_version = 'mineru.synchronized-telemetry-receipt.v2'", name="ck_durable_publish_supplement_contract"),
+        CheckConstraint("observer_run_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'", name="ck_durable_publish_supplement_observer_run"),
+        CheckConstraint("supplement_id ~ '^pes_[0-9A-HJKMNP-TV-Z]{26}$'", name="ck_durable_publish_supplement_id"),
+        Index("ix_durable_publish_supplement_run", "processing_run_id", "created_at", "supplement_id"),
+        {"schema": OPS_SCHEMA},
+    )
+    supplement_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    processing_run_id: Mapped[str] = mapped_column(ForeignKey(f"{OPS_SCHEMA}.durable_publish_base.processing_run_id", ondelete="RESTRICT"), nullable=False)
+    source_identity_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    source_page_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    publish_precommit_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    host_assignment_identity_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    boot_identity_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    runtime_bundle_identity_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    process_profile_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    observer_run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    observer_receipt_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    observer_seal_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    observer_contract_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    publish_durable_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ProgressRelayHead(Base):
+    __tablename__ = "progress_relay_head"
+    __table_args__ = (
+        CheckConstraint("row_version >= 0 AND ((row_version = 0 AND previous_checkpoint_sha256 IS NULL) OR (row_version > 0 AND previous_checkpoint_sha256 ~ '^sha256:[0-9a-f]{64}$'))", name="ck_progress_relay_head_version"),
+        CheckConstraint("checkpoint_sha256 ~ '^sha256:[0-9a-f]{64}$' AND checkpoint_byte_count = octet_length(checkpoint_bytes) AND checkpoint_byte_count BETWEEN 1 AND 1048576", name="ck_progress_relay_head_identity"),
+        CheckConstraint("relay_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}:sha256:[0-9a-f]{64}$'", name="ck_progress_relay_head_relay_id"),
+        {"schema": OPS_SCHEMA},
+    )
+    relay_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    row_version: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    previous_checkpoint_sha256: Mapped[Optional[str]] = mapped_column(String(71))
+    checkpoint_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    checkpoint_bytes: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    checkpoint_byte_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
 
 class Company(Base):
@@ -422,6 +503,10 @@ class Document(Base):
 class ProcessingRun(Base):
     __tablename__ = "processing_run"
     __table_args__ = (
+        UniqueConstraint(
+            "processing_run_id", "document_id",
+            name="uq_processing_run_publish_evidence_owner",
+        ),
         UniqueConstraint(
             "processing_run_id",
             "document_id",

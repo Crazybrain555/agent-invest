@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import re
+import uuid
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -42,6 +43,7 @@ class VerifiedTelemetryCoverage(_Closed):
     runtime_bundle_identity_sha256: str
     process_profile_sha256: str
     observer_process_epoch_sha256: str
+    observer_run_id: str
     receipt_sha256: str
     seal_sha256: str
     status: str
@@ -82,6 +84,12 @@ class VerifiedTelemetryCoverage(_Closed):
             self.exporter_overhead_attestation_sha256 is not None
         ):
             raise ValueError("exporter overhead status lacks an anchored attestation")
+        try:
+            observer_run = uuid.UUID(self.observer_run_id)
+        except ValueError as exc:
+            raise ValueError("observer_run_id is not a UUID") from exc
+        if str(observer_run) != self.observer_run_id or observer_run.variant != uuid.RFC_4122:
+            raise ValueError("observer_run_id is not canonical")
         if self.status not in {"complete", "incomplete", "unsafe"}:
             raise ValueError("coverage status is invalid")
         return self
@@ -93,9 +101,12 @@ class DurableProfilePageEvidence(_Closed):
     boot_identity_sha256: str | None
     runtime_bundle_identity_sha256: str | None
     process_profile_sha256: str | None
+    observer_run_id: str | None = None
+    observer_receipt_sha256: str | None = None
+    observer_seal_sha256: str | None = None
     source_page_count: int | None = Field(default=None, ge=1)
-    publish_committed_at_utc: datetime
-    evidence_observed_at_utc: datetime
+    publish_precommit_at_utc: datetime
+    publish_durable_observed_at_utc: datetime
     status: str
     first_durable_publish: bool | None
 
@@ -110,9 +121,20 @@ class DurableProfilePageEvidence(_Closed):
             _hash(self.host_assignment_identity_sha256, "host_assignment_identity_sha256")
         if self.boot_identity_sha256 is not None:
             _hash(self.boot_identity_sha256, "boot_identity_sha256")
-        _utc(self.publish_committed_at_utc, "publish_committed_at_utc")
-        _utc(self.evidence_observed_at_utc, "evidence_observed_at_utc")
-        if self.evidence_observed_at_utc < self.publish_committed_at_utc:
+        if self.observer_receipt_sha256 is not None:
+            _hash(self.observer_receipt_sha256, "observer_receipt_sha256")
+        if self.observer_seal_sha256 is not None:
+            _hash(self.observer_seal_sha256, "observer_seal_sha256")
+        if self.observer_run_id is not None:
+            try:
+                observer_run = uuid.UUID(self.observer_run_id)
+            except ValueError as exc:
+                raise ValueError("observer_run_id is not a UUID") from exc
+            if str(observer_run) != self.observer_run_id or observer_run.variant != uuid.RFC_4122:
+                raise ValueError("observer_run_id is not canonical")
+        _utc(self.publish_precommit_at_utc, "publish_precommit_at_utc")
+        _utc(self.publish_durable_observed_at_utc, "publish_durable_observed_at_utc")
+        if self.publish_durable_observed_at_utc < self.publish_precommit_at_utc:
             raise ValueError("publish evidence cannot be observed before commit")
         if self.status not in {"complete", "incomplete", "conflict"}:
             raise ValueError("publish evidence status is invalid")
@@ -123,6 +145,9 @@ class DurableProfilePageEvidence(_Closed):
             or self.process_profile_sha256 is None
             or self.source_page_count is None
             or self.first_durable_publish is not True
+            or self.observer_run_id is None
+            or self.observer_receipt_sha256 is None
+            or self.observer_seal_sha256 is None
         ):
             raise ValueError("complete publish evidence requires runtime, profile and page count")
         if self.status != "complete" and any(
@@ -134,6 +159,9 @@ class DurableProfilePageEvidence(_Closed):
                 self.process_profile_sha256,
                 self.source_page_count,
                 self.first_durable_publish,
+                self.observer_run_id,
+                self.observer_receipt_sha256,
+                self.observer_seal_sha256,
             )
         ):
             raise ValueError("incomplete/conflict evidence cannot carry trusted projections")

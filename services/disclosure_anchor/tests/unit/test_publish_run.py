@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import inspect
 import unittest
 
 from disclosure_anchor.application.contracts.provider_document_admission import (
@@ -280,6 +281,13 @@ def _provider_guard_fixture() -> tuple[
 
 
 class PublishRunTests(unittest.TestCase):
+    def test_outbox_lock_is_acquired_before_publish_evidence_locks(self) -> None:
+        source = inspect.getsource(PublishRun.execute)
+        self.assertLess(
+            source.index("outbox_events.processing_run_published("),
+            source.index("uow.publish_evidence.add_base("),
+        )
+
     def test_provider_guard_replays_every_persisted_field(self) -> None:
         guard, run, document, units = _provider_guard_fixture()
 

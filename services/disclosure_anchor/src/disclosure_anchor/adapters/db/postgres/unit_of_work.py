@@ -23,6 +23,7 @@ from disclosure_anchor.adapters.db.postgres.repositories import (
     DocumentUnitRepository,
     OutboxRepository,
     ProcessingRunRepository,
+    PublishEvidenceRepository,
     RemoteParseAttemptRepository,
     SecurityRepository,
     SourceAccessRepository,
@@ -48,6 +49,7 @@ class SqlAlchemyUnitOfWork:
     remote_parse_attempts: ports_repos.RemoteParseAttemptRepository
     document_units: ports_repos.DocumentUnitRepository
     outbox: ports_repos.OutboxRepository
+    publish_evidence: ports_repos.PublishEvidenceRepository
 
     def __init__(
         self,
@@ -129,6 +131,7 @@ class SqlAlchemyUnitOfWork:
         self.remote_parse_attempts = RemoteParseAttemptRepository(session)
         self.document_units = DocumentUnitRepository(session)
         self.outbox = OutboxRepository(session)
+        self.publish_evidence = PublishEvidenceRepository(session)
 
     # -- transaction control ------------------------------------------------
     @property

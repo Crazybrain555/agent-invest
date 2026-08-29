@@ -8,7 +8,7 @@ the transaction boundary.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import date
+from datetime import date, timezone
 import json
 from typing import Any, Optional, cast
 
@@ -25,6 +25,12 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     RemoteParseCheckpointConflict,
     RemoteParseResumeSecret,
     decode_terminal_receipt,
+)
+from disclosure_anchor.application.contracts.publish_evidence_ledger import (
+    DurablePublishBaseEvidence,
+    DurablePublishSupplementEvidence,
+    EncodedProgressRelayCheckpoint,
+    PublishEvidenceConflict,
 )
 from disclosure_anchor.adapters.db.postgres.classification_refresh import (
     refresh_document_classification,
@@ -1001,3 +1007,118 @@ class OutboxRepository:
             .one_or_none()
         )
         return mappers.outbox_event_to_entity(row) if row is not None else None
+
+
+class PublishEvidenceRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add_base(self, evidence: DurablePublishBaseEvidence) -> DurablePublishBaseEvidence:
+        # Source order is the numerator order.  Hold this xact-scoped lock
+        # through commit so ledger_seq allocation cannot race ahead of the
+        # first durable commit for the same raw source.  Every caller acquires
+        # source before run to keep the lock order deterministic.
+        self._session.execute(
+            sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"durable-publish-source:{evidence.source_identity_sha256}"},
+        )
+        self._session.execute(
+            sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"durable-publish-base:{evidence.processing_run_id}"},
+        )
+        existing = self._session.get(models.DurablePublishBase, evidence.processing_run_id)
+        if existing is not None:
+            loaded = self._base(existing)
+            if loaded != evidence:
+                raise PublishEvidenceConflict("durable publish base conflicts with first write")
+            return loaded
+        self._session.add(models.DurablePublishBase(**evidence.model_dump()))
+        self._session.flush()
+        return evidence
+
+    def append_supplement(
+        self, evidence: DurablePublishSupplementEvidence
+    ) -> DurablePublishSupplementEvidence:
+        self._session.execute(
+            sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"durable-publish-supplement:{evidence.supplement_id}"},
+        )
+        existing = self._session.get(models.DurablePublishSupplement, evidence.supplement_id)
+        if existing is not None:
+            loaded = self._supplement(existing)
+            if loaded != evidence:
+                raise PublishEvidenceConflict("publish supplement id conflicts with first write")
+            return loaded
+        base = self._session.get(models.DurablePublishBase, evidence.processing_run_id)
+        if base is None:
+            raise PublishEvidenceConflict("publish supplement has no durable base")
+        self._session.add(models.DurablePublishSupplement(**evidence.model_dump()))
+        self._session.flush()
+        return evidence
+
+    def latest_relay_head(self, relay_id: str) -> Optional[EncodedProgressRelayCheckpoint]:
+        row = (
+            self._session.query(models.ProgressRelayHead)
+            .filter(models.ProgressRelayHead.relay_id == relay_id)
+            .order_by(models.ProgressRelayHead.row_version.desc())
+            .first()
+        )
+        return self._head(row) if row is not None else None
+
+    def append_relay_head(
+        self, checkpoint: EncodedProgressRelayCheckpoint
+    ) -> EncodedProgressRelayCheckpoint:
+        self._session.execute(
+            sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:relay_id, 0))"),
+            {"relay_id": checkpoint.relay_id},
+        )
+        latest = (
+            self._session.query(models.ProgressRelayHead)
+            .filter(models.ProgressRelayHead.relay_id == checkpoint.relay_id)
+            .order_by(models.ProgressRelayHead.row_version.desc())
+            .with_for_update()
+            .first()
+        )
+        existing = self._session.get(
+            models.ProgressRelayHead, (checkpoint.relay_id, checkpoint.row_version)
+        )
+        if existing is not None:
+            loaded = self._head(existing)
+            if loaded != checkpoint:
+                raise PublishEvidenceConflict("relay head version conflicts with first write")
+            return loaded
+        expected_version = 0 if latest is None else latest.row_version + 1
+        expected_previous = None if latest is None else latest.checkpoint_sha256
+        if (
+            checkpoint.row_version != expected_version
+            or checkpoint.previous_checkpoint_sha256 != expected_previous
+        ):
+            raise PublishEvidenceConflict("relay head CAS predecessor mismatch")
+        self._session.add(models.ProgressRelayHead(**checkpoint.model_dump()))
+        self._session.flush()
+        return checkpoint
+
+    @staticmethod
+    def _base(row: models.DurablePublishBase) -> DurablePublishBaseEvidence:
+        values = {
+            name: getattr(row, name) for name in DurablePublishBaseEvidence.model_fields
+        }
+        values["publish_precommit_at"] = values["publish_precommit_at"].astimezone(
+            timezone.utc
+        )
+        return DurablePublishBaseEvidence.model_validate(values)
+
+    @staticmethod
+    def _supplement(row: models.DurablePublishSupplement) -> DurablePublishSupplementEvidence:
+        values = {
+            name: getattr(row, name) for name in DurablePublishSupplementEvidence.model_fields
+        }
+        for name in ("publish_precommit_at", "publish_durable_observed_at"):
+            values[name] = values[name].astimezone(timezone.utc)
+        return DurablePublishSupplementEvidence.model_validate(values)
+
+    @staticmethod
+    def _head(row: models.ProgressRelayHead) -> EncodedProgressRelayCheckpoint:
+        return EncodedProgressRelayCheckpoint.model_validate({
+            name: getattr(row, name) for name in EncodedProgressRelayCheckpoint.model_fields
+        })

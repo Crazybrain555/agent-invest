@@ -279,6 +279,19 @@ class OutboxRepo(_Repo[e.OutboxEvent]):
         return super().add(item)
 
 
+class PublishEvidenceRepo:
+    def __init__(self) -> None:
+        self.bases: dict[str, object] = {}
+
+    def add_base(self, evidence: object) -> object:
+        run_id = str(getattr(evidence, "processing_run_id"))
+        previous = self.bases.get(run_id)
+        if previous is not None and previous != evidence:
+            raise ValueError("publish evidence conflict")
+        self.bases[run_id] = evidence
+        return evidence
+
+
 class FakeUnitOfWork:
     def __init__(self) -> None:
         self.companies = CompanyRepo()
@@ -293,6 +306,7 @@ class FakeUnitOfWork:
         self.document_units = DocumentUnitRepo()
         self.document_units.processing_runs = self.processing_runs
         self.outbox = OutboxRepo()
+        self.publish_evidence = PublishEvidenceRepo()
         self.commit_count = 0
         self.rollback_count = 0
 

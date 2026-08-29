@@ -13,6 +13,9 @@ from disclosure_anchor.application.contracts.provider_document_admission import 
     AdmittedProviderDocument,
     ProviderDocumentAdmissionError,
 )
+from disclosure_anchor.application.contracts.publish_evidence_ledger import (
+    DurablePublishBaseEvidence,
+)
 from disclosure_anchor.application.contracts.provider_unit import (
     PROVIDER_UNIT_BUILDER_VERSION,
     ProviderUnitDraft,
@@ -516,6 +519,9 @@ class PublishRun:
                 old_run=old_run,
                 diff=diff,
             )
+            # OutboxRepository takes the global outbox xact lock.  Acquire it
+            # before the source/run evidence locks on every publish path so a
+            # diff and no-diff publish cannot invert the lock order.
             uow.outbox.add(
                 outbox_events.processing_run_published(
                     document_id=document.document_id,
@@ -535,6 +541,15 @@ class PublishRun:
                     source_page_count=admitted.envelope.source_pdf_page_count,
                     publish_committed_at=now,
                     occurred_at=now,
+                )
+            )
+            uow.publish_evidence.add_base(
+                DurablePublishBaseEvidence(
+                    processing_run_id=run.processing_run_id,
+                    document_id=document.document_id,
+                    source_identity_sha256=admitted.envelope.input_raw_file_hash,
+                    source_page_count=admitted.envelope.source_pdf_page_count,
+                    publish_precommit_at=now,
                 )
             )
             uow.commit()

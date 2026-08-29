@@ -39,6 +39,14 @@ class MigrationStateTests(unittest.TestCase):
             "0052_publish_kpi_indexes",
         )
 
+    def test_0054_is_adjacent_to_0053(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0054_publish_evidence_ledger"
+        )
+        self.assertEqual(migration.revision, "0054_publish_evidence_ledger")
+        self.assertEqual(migration.down_revision, "0053_remote_parse_checkpoint")
+
     def test_0051_binds_only_first_later_exact_uscc_observation(self) -> None:
         migration = importlib.import_module(
             "disclosure_anchor.adapters.db.postgres.migrations.versions."

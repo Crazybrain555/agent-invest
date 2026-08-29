@@ -15,6 +15,11 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     RemoteParseAttempt,
     RemoteParseResumeSecret,
 )
+from disclosure_anchor.application.contracts.publish_evidence_ledger import (
+    DurablePublishBaseEvidence,
+    DurablePublishSupplementEvidence,
+    EncodedProgressRelayCheckpoint,
+)
 
 from disclosure_anchor.domain.entities import (
     Company,
@@ -141,3 +146,14 @@ class DocumentUnitRepository(Protocol):
 class OutboxRepository(Protocol):
     def add(self, event: OutboxEvent) -> OutboxEvent: ...
     def get(self, event_id: str) -> Optional[OutboxEvent]: ...
+
+
+class PublishEvidenceRepository(Protocol):
+    def add_base(self, evidence: DurablePublishBaseEvidence) -> DurablePublishBaseEvidence: ...
+    def append_supplement(
+        self, evidence: DurablePublishSupplementEvidence
+    ) -> DurablePublishSupplementEvidence: ...
+    def append_relay_head(
+        self, checkpoint: EncodedProgressRelayCheckpoint
+    ) -> EncodedProgressRelayCheckpoint: ...
+    def latest_relay_head(self, relay_id: str) -> Optional[EncodedProgressRelayCheckpoint]: ...

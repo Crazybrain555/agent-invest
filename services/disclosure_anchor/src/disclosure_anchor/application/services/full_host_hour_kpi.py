@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 
 from disclosure_anchor.application.contracts.full_host_hour_kpi import (
@@ -86,7 +86,16 @@ def aggregate_full_gpu_host_hour(
     evidence_profiles: set[str] = set()
     conflicted: set[str] = set()
     for evidence in publish_evidence:
-        if not (hour_started_at_utc <= evidence.publish_committed_at_utc < hour_finished):
+        if (
+            evidence.publish_durable_observed_at_utc < hour_started_at_utc
+            or evidence.publish_precommit_at_utc >= hour_finished
+        ):
+            continue
+        if not (
+            hour_started_at_utc <= evidence.publish_precommit_at_utc
+            and evidence.publish_durable_observed_at_utc < hour_finished
+        ):
+            reasons.add("publish_evidence_incomplete_or_conflicted")
             continue
         if (
             evidence.status != "complete"
@@ -101,8 +110,8 @@ def aggregate_full_gpu_host_hour(
             span
             for span in spans
             if span.started_at_utc
-            <= evidence.publish_committed_at_utc
-            < span.finished_at_utc
+            <= evidence.publish_precommit_at_utc
+            and evidence.publish_durable_observed_at_utc < span.finished_at_utc
         ]
         if len(matching_spans) != 1:
             reasons.add("publish_evidence_has_no_unique_host_span")
@@ -115,6 +124,9 @@ def aggregate_full_gpu_host_hour(
             or evidence.runtime_bundle_identity_sha256
             != owner.runtime_bundle_identity_sha256
             or evidence.process_profile_sha256 != owner.process_profile_sha256
+            or evidence.observer_run_id != owner.observer_run_id
+            or evidence.observer_receipt_sha256 != owner.receipt_sha256
+            or evidence.observer_seal_sha256 != owner.seal_sha256
         ):
             reasons.add("publish_evidence_host_runtime_profile_mismatch")
             continue
@@ -188,29 +200,135 @@ def project_publish_payload_for_host_hour(
         raise ValueError("publish evidence event kind is invalid")
     if event_kind == "processing_run_published" and committed_at != occurred_at_utc:
         committed_at = None
-    complete = (
-        isinstance(pages, int)
-        and not isinstance(pages, bool)
-        and pages > 0
-        and isinstance(runtime, str)
-        and isinstance(profile, str)
-        and isinstance(host_assignment, str)
-        and isinstance(boot, str)
-        and committed_at is not None
-        and payload.get("is_first_durable_publish") is True
-    )
+    # Public/legacy outbox payloads are not atomically joined to a sealed
+    # observer receipt.  Even apparently complete fields remain untrusted;
+    # only the private ledger replay below can close this evidence.
+    complete = False
     return DurableProfilePageEvidence(
         source_identity_sha256=source,
         host_assignment_identity_sha256=host_assignment if complete else None,
         boot_identity_sha256=boot if complete else None,
         runtime_bundle_identity_sha256=runtime if complete else None,
         process_profile_sha256=profile if complete else None,
+        observer_run_id=None,
+        observer_receipt_sha256=None,
+        observer_seal_sha256=None,
         source_page_count=pages if complete else None,
-        publish_committed_at_utc=committed_at or occurred_at_utc,
-        evidence_observed_at_utc=evidence_observed_at_utc,
+        publish_precommit_at_utc=committed_at or occurred_at_utc,
+        publish_durable_observed_at_utc=evidence_observed_at_utc,
         status="complete" if complete else "incomplete",
         first_durable_publish=True if complete else None,
     )
 
 
-__all__ = ["aggregate_full_gpu_host_hour", "project_publish_payload_for_host_hour"]
+def reconcile_private_publish_ledger_rows(
+    rows: Iterable[Mapping[str, Any]],
+) -> tuple[DurableProfilePageEvidence, ...]:
+    """Close base+supplement facts selected by the full-history first-source query."""
+
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        run_id = row.get("processing_run_id")
+        if not isinstance(run_id, str):
+            raise ValueError("private publish ledger row lacks processing run identity")
+        grouped.setdefault(run_id, []).append(row)
+    evidence: list[DurableProfilePageEvidence] = []
+    for run_id in sorted(grouped):
+        group = grouped[run_id]
+        first = group[0]
+        source = first.get("source_identity_sha256")
+        pages = first.get("source_page_count")
+        committed = first.get("publish_precommit_at")
+        if isinstance(committed, datetime):
+            committed = committed.astimezone(timezone.utc)
+        if (
+            not isinstance(source, str)
+            or isinstance(pages, bool)
+            or not isinstance(pages, int)
+            or pages < 1
+            or not isinstance(committed, datetime)
+        ):
+            raise ValueError("private publish base projection is invalid")
+        status = "incomplete"
+        observed = committed
+        projection: tuple[str, str, str, str, str, str, str] | None = None
+        conflict = first.get("source_page_variants") != 1
+        for row in group:
+            if (
+                row.get("source_identity_sha256") != source
+                or row.get("source_page_count") != pages
+                or row.get("publish_precommit_at") != committed
+            ):
+                conflict = True
+            supplement_id = row.get("supplement_id")
+            if supplement_id is None:
+                continue
+            if not isinstance(supplement_id, str):
+                conflict = True
+                continue
+            candidate = (
+                row.get("host_assignment_identity_sha256"),
+                row.get("boot_identity_sha256"),
+                row.get("runtime_bundle_identity_sha256"),
+                row.get("process_profile_sha256"),
+                row.get("observer_run_id"),
+                row.get("observer_receipt_sha256"),
+                row.get("observer_seal_sha256"),
+            )
+            supplement_observed = row.get("publish_durable_observed_at")
+            if isinstance(supplement_observed, datetime):
+                supplement_observed = supplement_observed.astimezone(timezone.utc)
+            supplement_precommit = row.get("supplement_publish_precommit_at")
+            if isinstance(supplement_precommit, datetime):
+                supplement_precommit = supplement_precommit.astimezone(timezone.utc)
+            if (
+                row.get("supplement_source_identity_sha256") != source
+                or row.get("supplement_source_page_count") != pages
+                or supplement_precommit != committed
+                or row.get("observer_contract_version")
+                != "mineru.synchronized-telemetry-receipt.v2"
+                or not all(isinstance(value, str) for value in candidate)
+                or not isinstance(supplement_observed, datetime)
+                or supplement_observed < committed
+            ):
+                conflict = True
+                continue
+            typed = (
+                str(candidate[0]), str(candidate[1]), str(candidate[2]),
+                str(candidate[3]), str(candidate[4]), str(candidate[5]),
+                str(candidate[6]),
+            )
+            if projection is not None and projection != typed:
+                conflict = True
+            projection = typed  # identical repeated supplements remain auditable/idempotent
+            observed = max(observed, supplement_observed)
+        if conflict:
+            status = "conflict"
+            projection = None
+        elif projection is not None:
+            status = "complete"
+        evidence.append(
+            DurableProfilePageEvidence(
+                source_identity_sha256=source,
+                host_assignment_identity_sha256=projection[0] if projection else None,
+                boot_identity_sha256=projection[1] if projection else None,
+                runtime_bundle_identity_sha256=projection[2] if projection else None,
+                process_profile_sha256=projection[3] if projection else None,
+                observer_run_id=projection[4] if projection else None,
+                observer_receipt_sha256=projection[5] if projection else None,
+                observer_seal_sha256=projection[6] if projection else None,
+                source_page_count=pages if projection else None,
+                publish_precommit_at_utc=committed,
+                publish_durable_observed_at_utc=observed,
+                status=status,
+                first_durable_publish=True if projection else None,
+            )
+        )
+    return tuple(evidence)
+
+
+__all__ = [
+    "aggregate_full_gpu_host_hour",
+    "project_publish_payload_for_host_hour",
+    "reconcile_private_publish_ledger_rows",
+]
