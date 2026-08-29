@@ -1,4 +1,4 @@
-"""Closed MinerU runtime-bundle v7 identity regressions."""
+"""Closed MinerU runtime-bundle v8 identity regressions."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from disclosure_anchor.adapters.runtime import mineru_capacity_evaluator_identity
 from disclosure_anchor.adapters.runtime import mineru_identity
 
 from disclosure_anchor.adapters.runtime.mineru_identity import (
@@ -408,19 +407,12 @@ class MinerURuntimeIdentityV6Tests(unittest.TestCase):
                 local_writer_code_digest=CODE_DIGEST,
             )
 
-    def test_bounded_http_bytes_change_writer_and_evaluator_identities(self) -> None:
+    def test_bounded_http_bytes_change_writer_identity(self) -> None:
         relative = "src/disclosure_anchor/adapters/runtime/bounded_http.py"
         self.assertIn(relative, mineru_identity._WRITER_CODE_RELPATHS)
-        self.assertIn(
-            relative,
-            mineru_capacity_evaluator_identity.EVALUATOR_COMPONENT_PATHS,
-        )
         with tempfile.TemporaryDirectory() as tmp:
             service_root = Path(tmp) / "service"
-            all_paths = set(mineru_identity._WRITER_CODE_RELPATHS) | set(
-                mineru_capacity_evaluator_identity.EVALUATOR_COMPONENT_PATHS
-            )
-            for relpath in all_paths:
+            for relpath in mineru_identity._WRITER_CODE_RELPATHS:
                 path = service_root / relpath
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(f"source:{relpath}".encode())
@@ -434,16 +426,9 @@ class MinerURuntimeIdentityV6Tests(unittest.TestCase):
                 str(fake_identity_file),
             ):
                 writer_before = mineru_identity.writer_code_digest()
-                evaluator_before = mineru_capacity_evaluator_identity.commissioning_evaluator_identity(
-                    service_root=service_root
-                )["bundle_sha256"]
                 (service_root / relative).write_bytes(b"changed transport bytes")
                 writer_after = mineru_identity.writer_code_digest()
-                evaluator_after = mineru_capacity_evaluator_identity.commissioning_evaluator_identity(
-                    service_root=service_root
-                )["bundle_sha256"]
             self.assertNotEqual(writer_before, writer_after)
-            self.assertNotEqual(evaluator_before, evaluator_after)
 
 
 if __name__ == "__main__":

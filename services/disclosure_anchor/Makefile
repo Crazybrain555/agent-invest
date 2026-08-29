@@ -29,7 +29,7 @@ WITH_WORKER_ENV = set -a; [ -r "$(DISCLOSURE_ENV_DIR)/worker.env" ] && . "$(DISC
 	lint typecheck agent-check api archive pg-init pg-start pg-stop \
 	pg-status db-create migrate register parse build-units publish process rebuild-units rebuild-search-projection load-rules config-check track track-status track-export untrack sync worker-once worker-loop doctor-full \
 	worker-status worker-restart mineru-smoke mineru-campaign-epoch-freeze mineru-staged-load mineru-phase-trace-capture mineru-tunnel-status install-mineru-tunnel mineru-remote-attest mineru-admission gc-orphans audit-unmapped-codes audit-weekly install-ops-launchd \
-	generate-current-source-replay audit-live-unit-replay capacity-observe capacity-verify capacity-summary capacity-commission capacity-catalog
+	generate-current-source-replay audit-live-unit-replay capacity-observe capacity-verify capacity-summary
 
 doctor:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.doctor
@@ -286,36 +286,6 @@ mineru-phase-trace-capture:
 		--ssh-host "$(SSH_HOST)" --ssh-user "$(SSH_USER)" --ssh-port "$(SSH_PORT)" \
 		--ssh-identity "$(SSH_IDENTITY)" --ssh-known-hosts "$(SSH_KNOWN_HOSTS)" \
 		--capture-out "$(CAPTURE)"
-
-# Offline constrained search verdict. The immutable profile is commissionable
-# only when its repeated gain clears the predeclared materiality/noise policy.
-capacity-commission:
-	@for name in A1_RECEIPT A1_CAPTURE B1_RECEIPT B1_CAPTURE B2_RECEIPT B2_CAPTURE A2_RECEIPT A2_CAPTURE LEGACY_PROFILE_SHA256 CANDIDATE_PROFILE_SHA256 WINDOWS_NODE_IDENTITY_SHA256 DOCKER_MEMORY_RESERVE_BYTES MINIMUM_IMPROVEMENT_BASIS_POINTS MAXIMUM_REPEAT_SPREAD_BASIS_POINTS RECEIPT; do \
-		eval "value=\$$$${name}"; [ -n "$$value" ] || { echo "capacity-commission: $$name is required" >&2; exit 2; }; \
-	done
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/evaluate_mineru_capacity_commissioning.py \
-		--a1-receipt "$(A1_RECEIPT)" --a1-capture "$(A1_CAPTURE)" \
-		--b1-receipt "$(B1_RECEIPT)" --b1-capture "$(B1_CAPTURE)" \
-		--b2-receipt "$(B2_RECEIPT)" --b2-capture "$(B2_CAPTURE)" \
-		--a2-receipt "$(A2_RECEIPT)" --a2-capture "$(A2_CAPTURE)" \
-		--legacy-profile-sha256 "$(LEGACY_PROFILE_SHA256)" \
-		--candidate-profile-sha256 "$(CANDIDATE_PROFILE_SHA256)" \
-		--windows-node-identity-sha256 "$(WINDOWS_NODE_IDENTITY_SHA256)" \
-		--docker-memory-reserve-bytes "$(DOCKER_MEMORY_RESERVE_BYTES)" \
-		--minimum-improvement-basis-points "$(MINIMUM_IMPROVEMENT_BASIS_POINTS)" \
-		--maximum-repeat-spread-basis-points "$(MAXIMUM_REPEAT_SPREAD_BASIS_POINTS)" \
-		--receipt-out "$(RECEIPT)"
-
-# Generate the only Auto-admission sidecar from an exact COMMISSION receipt.
-capacity-catalog:
-	@for name in COMMISSIONING_RECEIPT CAPACITY_PROFILE RUNTIME_COMPATIBILITY_SHA256 CATALOG; do \
-		eval "value=\$$$${name}"; [ -n "$$value" ] || { echo "capacity-catalog: $$name is required" >&2; exit 2; }; \
-	done
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/build_mineru_capacity_catalog.py \
-		--commissioning-receipt "$(COMMISSIONING_RECEIPT)" \
-		--profile "$(CAPACITY_PROFILE)" \
-		--runtime-compatibility-sha256 "$(RUNTIME_COMPATIBILITY_SHA256)" \
-		--catalog-out "$(CATALOG)"
 
 # DB-free and data-plane-independent capacity observation. It only reads the
 # exact attested API/vLLM/GPU/host surfaces and writes private replay evidence

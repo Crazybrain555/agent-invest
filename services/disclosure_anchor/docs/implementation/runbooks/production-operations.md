@@ -382,61 +382,35 @@ configured/exact-current identity，再从 owner-owned mode 0600 raw JSONL 按 r
 
 ### 1.1e Default-off capacity profile commissioning
 
-Capacity pipeline 的构建默认必须保持 `MINERU_CAPACITY_MODE=legacy`、`MINERU_PHASE_TRACE=0`，
-candidate profile 使用 exact `mineru-execution-profile.v2` 且不携带授权位。先部署并重新生成 exact runtime v6 attestation；这一步只证明新 image
-bytes 可运行，不能启用 Auto。受控试验期间 worker 必须卸载、API/vLLM idle、没有第二 producer；每次
-compose mode/profile 变化都要新 runtime manifest，不能拿上一 arm 的身份运行下一 arm。
+当前操作真相以 `../design/mineru-throughput-scheduler.md` 为准。旧的固定
+`A1 -> B1 -> B2 -> A2`、固定 4/8/16 capacity search、固定 7 GiB reserve、旧 evaluator 与 catalog
+builder 已从仓库删除；不得从历史提交恢复为操作入口。新同步 telemetry runner 与容量搜索 receipt
+尚未完成前，本节的运行结论是 `STOP`。
 
-试验顺序固定 A1 legacy → B1 candidate → B2 candidate → A2 legacy。A1 前按上文只冻结一次
-campaign epoch，四个 arm 必须传入同一个 `EXPECTED_CAMPAIGN_EPOCH_SHA256`；任一 proxy/vLLM
-StartedAt/ID 漂移立即作废整轮。四次都对同一 frozen regular/heavy/huge corpus 运行上文的
-`make mineru-staged-load`，每次完成后立即采集：
+默认构建和部署仍必须保持 `MINERU_CAPACITY_MODE=legacy`、`MINERU_PHASE_TRACE=0`、
+`MINERU_API_MAX_CONCURRENT_REQUESTS=1`、`MINERU_API_MAX_PENDING_TASKS=1`。合入的调度代码和 candidate
+profile 不代表已启用；任何 process-startup 参数变化都要求先完全 quiesce，产生新的 exact runtime/profile
+identity，并重新通过 multimodal canary、epoch、OOM/restart 和 drain 门。
 
-安装器在每个 arm 仍重做 exact-source/image 校验，但构建命令固定 `--provenance=false`。不得删掉该项：
-默认 BuildKit provenance manifest 含执行期元数据，会让相同业务镜像的外层 OCI index ID 跨构建变化；
-该项不单独证明“同一 API image”。A1 前必须冻结完整 campaign image ID，四个 arm 和最终 default
-恢复都以安装器的 `-ReuseCurrentPublishedImage -CampaignApiCompatImageId sha256:<exact-id>` 路径切换。
-该路径 mutation 前要求正式 tag、当前 API 容器和完整 live compatibility proof 都等于冻结 ID；它完全
-跳过 build/tag/image-rm，只定向执行 `mineru-api` 的 `--no-build --no-deps --force-recreate`，并在成功和
-rollback 两条路径证明 proxy/vLLM 的 container ID、StartedAt、image ID 不变。供应链证明由固定 base
-digest、Dockerfile/patcher hash、镜像 labels/marker、安装回执和每 arm 的 runtime v6 attestation 闭合。
+新的受控容量搜索必须满足：
 
-```bash
-make mineru-phase-trace-capture \
-  STAGED_RECEIPT=/private/<arm>.json \
-  CAPACITY_MODE=<legacy-or-candidate> \
-  PROFILE_SHA256=sha256:<active-profile> \
-  CAPTURE=/private/<arm>.trace.json \
-  SSH_HOST=<pinned-host> SSH_USER=<operator-user> \
-  SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts
-```
+- 使用未参与旧 A1 的 held-out 完整真实 PDF，覆盖 regular/heavy/huge、OCR、表格/公式、跨页结构和
+  controlled failure；单轮目标 10--20 分钟，不机械重复数小时 baseline；
+- 先做一个短 legacy anchor；只有 measurement path/epoch 漂移或噪声超过门槛才重跑；
+- 先在单 task slot 下隔离 sweep effective hybrid ratio `1/2/4/8`，再一次只改变 slots、pending、window、
+  C-stage 或 credit envelope 的一个相邻值；不得预设某个 B1/B2 是局部最优；
+- 全程用 synchronized telemetry 记录 GPU 250--500 ms、host/queue 1 s、phase transition 与 durable commit；
+  主指标是同一完整 GPU-host wall span 内按 source identity 去重、成功整文档发布的页数/小时；
+- Docker/WSL/CPU/GPU 各资源域使用实测 baseline、active leases 和动态 guard；7 GiB 不是下限或目标；
+- 任一 source/page/structure closure、顺序、fallback、OOM、restart、epoch、credit、drain 或 telemetry
+  completeness 失败立即停止该 setting；GPU 峰值或均值本身不能宣告胜出；
+- 连续相邻提高已进入证据定义的平台期，或 backlog-rich 时 GPU/CPU 已稳定工作且没有可调度 ready
+  work 被闲置，即停止搜索并冻结 practical winner。Auto 只能在另行验证的 catalog 内选择，不能在线试错。
 
-采集命令从 staged receipt 取得 UTC 边界、collector/node/API container epoch，Windows 端只返回
-严格 `MINERU_PHASE_TRACE ` 行。Mac 在写 0600 new-only capture 前要求所有 document trace 成功闭合；
-candidate 还必须有 A/B 与 B/C overlap，且 document/page 总数与 staged receipt 相等。任何 fallback、
-error trace、profile mismatch、restart/OOM 或日志缺口都会非零退出。
-
-四 arm 闭合后运行 `make capacity-commission`（完整参数见 design §5.3 或 `make -n`）。机械门同时要求：
-
-- frozen input、endpoint topology、model/client/writer 与 proxy/vLLM epoch 不变；每个 arm 的 pre/post
-  direct multimodal canary 均 PASS 且 host sample 完整包围两个 canary；
-- UTC 证明真实非重叠 A1→B1→B2→A2；page/block/source identity 跨 arm 相等；每 arm 的
-  provider bundle SHA 自身合法但不要求 bundle 容器跨执行字节相等；
-- 本机 A1 前固定 `DOCKER_MEMORY_RESERVE_BYTES=7516192768`（7 GiB）；完整 host verifier 重算
-  collector path/hash、5 s cadence/15 s gap、VM total/available、summary、epoch、OOM/restart 与 reserve；
-- sampling、preemption、waiting/KV、API exact retained-gauge range/idle/activity/drain 与 cleanup 全部安全；
-  completed/failed gauge 可因 600 s retention 自然减少，不作为任务累计账；
-- A1 前冻结 `MINIMUM_IMPROVEMENT_BASIS_POINTS=500`、
-  `MAXIMUM_REPEAT_SPREAD_BASIS_POINTS=300`；`min(B)>max(A)`、最低收益、重复稳定性和实测噪声
-  四门同时成立。
-
-`COMMISSION` v2 receipt 只给出 `profile_commissioning_authorized=true`，不授权 Auto、也不执行部署。
-Operator 不得重写已验证的 profile；必须把 candidate arm 使用的 exact v2 profile 原样交给
-`make capacity-catalog`，绑定 exact COMMISSION receipt、evaluator 与 runtime compatibility。Auto compose
-只能把 `C:\ProgramData\agent-invest\mineru-runtime-v6\mineru-capacity-catalog.v1.json` 只读挂载到
-`MINERU_CAPACITY_CATALOG_PATH`；安装器和 v6 attestor 会同时核对 host source、container destination、
-`RW=false` 与 catalog hash。重新 attest 后，还要在 `auto` 下通过 fallback/cancellation smoke，才可按
-§8 启 worker。`STOP`、证据不可比或任一 hard gate 失败时保持 legacy；不得降低门槛或用 GPU 峰值截图替代。
+安装器仍必须以 `--provenance=false` 构建并闭合 base digest、Dockerfile/patcher hash、image
+labels/marker、安装 receipt 与 runtime attestation。复用已发布镜像时，只允许既有
+`-ReuseCurrentPublishedImage -CampaignApiCompatImageId sha256:<exact-id>` 路径，并必须证明 proxy/vLLM
+container ID、StartedAt 与 image ID 均未改变。以上供应链约束不等于吞吐 profile 已获授权。
 
 ### 1.2 批量重解析与派生重置
 

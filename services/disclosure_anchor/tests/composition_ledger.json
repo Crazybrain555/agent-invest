@@ -107,10 +107,6 @@
    "private_imports": [],
    "tests": 18
   },
-  "tests/unit/test_build_mineru_capacity_catalog.py": {
-   "private_imports": [],
-   "tests": 3
-  },
   "tests/unit/test_build_research_watchlist.py": {
    "private_imports": [],
    "tests": 25
@@ -281,10 +277,6 @@
   "tests/unit/test_mineru_canary.py": {
    "private_imports": [],
    "tests": 17
-  },
-  "tests/unit/test_mineru_capacity_commissioning.py": {
-   "private_imports": [],
-   "tests": 15
   },
   "tests/unit/test_mineru_deployment_gate.py": {
    "private_imports": [],

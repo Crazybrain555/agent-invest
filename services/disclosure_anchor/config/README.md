@@ -178,11 +178,13 @@ exchange、board、日期、市值下限、5,548 行审计闭合与 V10 变更�
 
 ## Capacity observation 与默认关闭的 Auto profile
 
-Observation v1 仍只有旁路采样权限。另有默认 `legacy` 的 exact-source capacity pipeline：受控
-`candidate` 试验按文档 admission 冻结 profile；`auto` 只选择经过 A-B-B-A receipt 晋升且在页面/源文件
-envelope 内的 profile，不能在运行中改 knob。两条路径都复用 machine-local `worker.env` 中已存在的
-API/vLLM/GPU URL、runtime bundle identity、GPU UUID、MinerU client 和 Docker memory reserve；
-不新增数据库 DSN，也不在 tracked config 写 SSH host/user/key。
+Observation v1 仍只有旁路采样权限。默认 `legacy` 的 exact-source capacity runtime 可以读取已验证的
+profile catalog，但旧 A-B-B-A evaluator/catalog builder 已删除；在新的 synchronized telemetry、短时
+held-out 搜索和 profile receipt 落地前，`candidate`/`auto` 均未获运行授权。Document profile 在 admission
+冻结，process profile 只能在完全 quiescent 时切换；运行中不能修改 startup knob。旁路采样复用
+machine-local `worker.env` 中已有 API/vLLM/GPU URL、runtime bundle identity、GPU UUID 与 MinerU client；
+内存安全余量来自分资源域的实测动态 guard，不再使用固定 Docker reserve。tracked config 不写 SSH
+host/user/key，也不新增数据库 DSN。
 
 Operator 运行时显式传入 v6 `RUNTIME_MANIFEST`、`DURATION_SECONDS` 和与 staged load 相同的
 `SSH_HOST` / `SSH_USER` / `SSH_IDENTITY` / `SSH_KNOWN_HOSTS`。这些参数只用于 pinned read-only
