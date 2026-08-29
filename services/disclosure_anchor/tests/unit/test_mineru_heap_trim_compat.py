@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import redirect_stderr
+import hashlib
 import io
 import json
 import os
@@ -134,7 +135,10 @@ async def aio_detect_cross_page_cell_merge(results, aio_batch_predict_fn):
 
 
 def _fast_api_fixture() -> str:
-    return '''from mineru.utils.config_reader import get_processing_window_size
+    return '''from mineru.utils.config_reader import (
+    get_max_concurrent_requests as read_max_concurrent_requests,
+    get_processing_window_size,
+)
 
 _configured_max_concurrent_requests = 1
 
@@ -250,7 +254,7 @@ def health_payload(task_manager):
     return {
         "max_concurrent_requests": get_max_concurrent_requests(),
         "processing_window_size": get_processing_window_size(
-            default=16
+            default=DEFAULT_PROCESSING_WINDOW_SIZE
         ),
     }
 '''
@@ -543,7 +547,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
 
     def test_fast_api_bounds_nonterminal_admission_and_drains_to_terminal(self) -> None:
         patched = patch_source("mineru/cli/fast_api.py", _fast_api_fixture())
-        patched = patched.split("\n", 1)[1]
+        patched = patched.split("\n\n", 1)[1]
 
         class HTTPExceptionStub(Exception):
             def __init__(self, *, status_code: int, detail: str) -> None:
@@ -646,6 +650,33 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                 ),
             },
         )
+
+        fixture_root = (
+            Path(__file__).parents[1] / "fixtures" / "mineru_344_preimages"
+        )
+        patched_sources: dict[str, str] = {}
+        for relative_path, expected_sha256 in TARGET_PREIMAGE_SHA256.items():
+            with self.subTest(relative_path=relative_path):
+                payload = (fixture_root / relative_path).read_bytes()
+                self.assertEqual(hashlib.sha256(payload).hexdigest(), expected_sha256)
+                source = payload.decode("utf-8")
+                patched = patch_source(relative_path, source)
+                compile(patched, relative_path, "exec")
+                patched_sources[relative_path] = patched
+
+        fast_api = patched_sources["mineru/cli/fast_api.py"]
+        vlm = patched_sources["mineru/backend/vlm/vlm_analyze.py"]
+        hybrid = patched_sources["mineru/backend/hybrid/hybrid_analyze.py"]
+        self.assertEqual(fast_api.count("strict_processing_window_size()"), 1)
+        self.assertEqual(vlm.count("strict_processing_window_size()"), 2)
+        self.assertEqual(hybrid.count("strict_processing_window_size()"), 2)
+        for patched in (fast_api, vlm, hybrid):
+            self.assertNotIn("get_processing_window_size(default=64)", patched)
+            self.assertNotIn(
+                "get_processing_window_size(\n"
+                "            default=DEFAULT_PROCESSING_WINDOW_SIZE",
+                patched,
+            )
 
     def test_model_utils_hook_is_explicit_guarded_and_fail_visible(self) -> None:
         source = (

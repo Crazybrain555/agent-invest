@@ -44,6 +44,7 @@ where = ["src"]
 [tool.ruff]
 target-version = "py311"
 src = ["src", "tests"]
+extend-exclude = ["tests/fixtures/mineru_344_preimages"]
 
 [tool.mypy]
 python_version = "3.11"

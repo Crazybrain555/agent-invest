@@ -217,7 +217,13 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
     if relative_path == "mineru/cli/fast_api.py":
         source = _replace_exact(
             source,
-            "from mineru.utils.config_reader import get_processing_window_size\n",
+            "from mineru.utils.config_reader import (\n"
+            "    get_max_concurrent_requests as read_max_concurrent_requests,\n"
+            "    get_processing_window_size,\n"
+            ")\n",
+            "from mineru.utils.config_reader import (\n"
+            "    get_max_concurrent_requests as read_max_concurrent_requests,\n"
+            ")\n"
             "from mineru.utils.model_utils import strict_processing_window_size\n",
             count=1,
             label="FastAPI strict processing window import",
@@ -381,7 +387,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             source,
             "        \"max_concurrent_requests\": get_max_concurrent_requests(),\n"
             "        \"processing_window_size\": get_processing_window_size(\n"
-            "            default=16\n"
+            "            default=DEFAULT_PROCESSING_WINDOW_SIZE\n"
             "        ),\n",
             "        \"max_concurrent_requests\": get_max_concurrent_requests(),\n"
             "        \"max_pending_tasks_requested\": get_max_pending_tasks(),\n"
